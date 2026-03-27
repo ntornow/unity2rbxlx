@@ -599,6 +599,72 @@ class TestValidatorStructuralFixes:
         fixed, _ = validate_and_fix("test", source)
         assert 'table.find(items, x)' in fixed
 
+    def test_local_inside_table_literal(self):
+        """C# enum + class fields mixed in table → close table before locals."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local State = {\n    Default = 0,\n    Engaged = 1,\n\n    local rotate = true\n    local speed = 125\n}'
+        fixed, _ = validate_and_fix("test", source)
+        # Table should close before local declarations (with -- enum marker)
+        assert '} -- enum' in fixed, f"Table should have '}} -- enum' closing, got:\n{fixed}"
+        # local declarations should come after the table close
+        assert 'local rotate = true' in fixed
+        # The stale } at the end should be removed (only the -- enum one remains)
+        lines = fixed.split('\n')
+        brace_lines = [l for l in lines if '}' in l]
+        assert len(brace_lines) == 1, f"Should have exactly one line with }}, got {brace_lines}"
+
+    def test_bare_method_in_for_in(self):
+        """for _, t in :GetDescendants do → script.Parent:GetDescendants()."""
+        from converter.luau_validator import validate_and_fix
+        source = 'for _, t in :GetDescendants do\n    print(t)\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'script.Parent:GetDescendants()' in fixed
+
+    def test_method_without_parens_in_for_in(self):
+        """for _, t in obj:GetChildren do → obj:GetChildren()."""
+        from converter.luau_validator import validate_and_fix
+        source = 'for _, t in obj:GetChildren do\n    print(t)\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'obj:GetChildren()' in fixed
+
+    def test_extra_paren_after_table(self):
+        """originalStructure = {}) → originalStructure = {}."""
+        from converter.luau_validator import validate_and_fix
+        source = 'originalStructure = {})'
+        fixed, _ = validate_and_fix("test", source)
+        assert fixed.strip() == 'originalStructure = {}'
+
+    def test_forward_reference(self):
+        """local hasKey = gotKey (where gotKey defined later) → nil."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local hasKey = gotKey\nlocal gotKey = nil'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'hasKey = nil' in fixed
+        assert 'forward ref' in fixed
+
+    def test_bare_method_in_for_in_with_malformed_parens(self):
+        """for _, t in :Method( do) → script.Parent:Method() do."""
+        from converter.luau_validator import validate_and_fix
+        source = 'for _, t in :GetDescendants( do)\n    print(t)\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'script.Parent:GetDescendants() do' in fixed
+
+    def test_list_init_nested_parens(self):
+        """--[[ new List ]] (obj:GetDescendants()) → {} (not {})."""
+        from converter.luau_validator import validate_and_fix
+        source = 'x = --[[ new List ]] (script.Parent:GetDescendants())'
+        fixed, _ = validate_and_fix("test", source)
+        assert '= {}' in fixed
+        assert '})' not in fixed
+
+    def test_table_close_preserved(self):
+        """Table-closing } should not be converted to end."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local State = {\n    A = 0,\n    B = 1,\n}\nlocal x = 1'
+        fixed, _ = validate_and_fix("test", source)
+        assert '}' in fixed, "Table closing } should be preserved"
+        assert 'A = 0' in fixed
+
 
 class TestNewTranspilerFeatures:
     """Tests for newly added transpiler features."""

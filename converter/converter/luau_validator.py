@@ -3277,6 +3277,150 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
     """Fix structural Luau syntax issues: else if, ++/--, type declarations, etc."""
     original = source
 
+    # Fix `local` declarations inside table literals (from C# enum + class fields mixing)
+    # Pattern: table literal `{` is open, then a line has `local varName = ...` inside it
+    # Strategy: rewrite the table open line to include closing, move locals outside
+    # We detect the pattern and rewrite the opening `= {` to include all valid entries
+    # then close the table, followed by the local declarations
+    if re.search(r'^\s+local\s+\w+\s*=', source, re.MULTILINE):
+        lines = source.split('\n')
+        new_lines_tbl = []
+        in_table = False
+        table_indent = 0
+        table_entries = []
+        table_open_line = None
+        table_close_needed = False
+        for li, line in enumerate(lines):
+            stripped = line.strip()
+            # Detect table opening: `local TableName = {` or `Name = {`
+            if not in_table and re.match(r'^(\s*)(?:local\s+)?\w+\s*=\s*\{\s*$', line):
+                # Look ahead: does this table contain `local` declarations?
+                has_local_inside = False
+                for fwd in range(li + 1, min(li + 30, len(lines))):
+                    fwd_s = lines[fwd].strip()
+                    if re.match(r'local\s+\w+\s*=', fwd_s):
+                        has_local_inside = True
+                        break
+                    if fwd_s == '}' or fwd_s == '},':
+                        break
+                if has_local_inside:
+                    in_table = True
+                    table_indent = len(line) - len(line.lstrip())
+                    table_open_line = line
+                    table_entries = []
+                    continue  # Don't add yet; we'll rebuild
+                else:
+                    new_lines_tbl.append(line)
+                    continue
+            if table_close_needed and (stripped == '}' or stripped == '},'):
+                table_close_needed = False
+                continue  # Skip the stale closing brace
+            elif in_table:
+                if re.match(r'^\s+local\s+\w+\s*=', line) or re.match(r'^\s*local\s+\w+\s*=', line):
+                    # First local: emit the table with entries, then close it
+                    if table_entries:
+                        # Remove trailing comma from last entry
+                        last = table_entries[-1].rstrip()
+                        if last.endswith(','):
+                            table_entries[-1] = last
+                        new_lines_tbl.append(table_open_line)
+                        new_lines_tbl.extend(table_entries)
+                        new_lines_tbl.append(' ' * table_indent + '} -- enum')
+                    else:
+                        # No valid entries — just `local X = {}`
+                        new_lines_tbl.append(table_open_line.rstrip()[:-1] + '{}')
+                    in_table = False
+                    table_close_needed = True
+                    new_lines_tbl.append(line)
+                    fixes.append("Closed table literal before `local` declarations")
+                    continue
+                elif stripped == '}' or stripped == '},':
+                    # Normal table close
+                    new_lines_tbl.append(table_open_line)
+                    new_lines_tbl.extend(table_entries)
+                    new_lines_tbl.append(line)
+                    in_table = False
+                    continue
+                else:
+                    # A table entry (or comment/blank line inside table)
+                    table_entries.append(line)
+                    continue
+            new_lines_tbl.append(line)
+        # If we're still in a table at EOF (missing close), emit what we have
+        if in_table:
+            new_lines_tbl.append(table_open_line)
+            new_lines_tbl.extend(table_entries)
+        if new_lines_tbl != lines:
+            source = '\n'.join(new_lines_tbl)
+
+    # Fix bare `:Method` in for-in loops: `for _, t in :GetDescendants do`
+    # → `for _, t in script.Parent:GetDescendants() do`
+    # Also handles malformed: `for _, t in :Method( do)` → `for _, t in script.Parent:Method() do`
+    if re.search(r'\bin\s+:', source):
+        source = re.sub(
+            r'\bin\s+:(\w+)\s+do',
+            r'in script.Parent:\1() do',
+            source,
+        )
+        source = re.sub(
+            r'\bin\s+:(\w+)\(\)',
+            r'in script.Parent:\1()',
+            source,
+        )
+        # Fix malformed: `in :Method( do)` → `in script.Parent:Method() do`
+        source = re.sub(
+            r'\bin\s+:(\w+)\(\s*do\)',
+            r'in script.Parent:\1() do',
+            source,
+        )
+        fixes.append("Fixed bare ':Method' in for-in → script.Parent:Method()")
+
+    # Fix bare `:Method` without parentheses in for-in: `for _, t in obj:GetDescendants do`
+    # → `for _, t in obj:GetDescendants() do`
+    if re.search(r'\bin\s+\w+:\w+\s+do', source):
+        source = re.sub(
+            r'\bin\s+(\w+(?:\.\w+)*:\w+)\s+do',
+            r'in \1() do',
+            source,
+        )
+        fixes.append("Added missing () to method call in for-in loop")
+
+    # Fix extra `)` after table/value assignments: `= {})` → `= {}`
+    if re.search(r'=\s*\{\s*\}\)', source):
+        source = re.sub(r'(=\s*\{\s*\})\)', r'\1', source)
+        fixes.append("Fixed extra ')' after table assignment")
+
+    # Fix forward references: `local x = undefinedVar` where var is defined later
+    # Common pattern from C# property backing fields: `local hasKey = gotKey` before `local gotKey`
+    # → `local hasKey = nil -- gotKey`
+    lines_fr = source.split('\n')
+    # Collect all `local varName` definitions and their line numbers
+    local_defs = {}
+    for li, line in enumerate(lines_fr):
+        m = re.match(r'^\s*local\s+(\w+)\s*=', line)
+        if m:
+            local_defs[m.group(1)] = li
+    # Check for forward references
+    new_lines_fr = []
+    for li, line in enumerate(lines_fr):
+        m = re.match(r'^(\s*local\s+\w+\s*=\s*)(\w+)\s*$', line)
+        if m:
+            ref_var = m.group(2)
+            # Is ref_var a local defined LATER in the file (forward reference)?
+            if ref_var in local_defs and local_defs[ref_var] > li:
+                # Also check it's not a known global/builtin
+                if ref_var not in ('nil', 'true', 'false', 'math', 'string', 'table',
+                                   'game', 'workspace', 'script', 'Instance', 'Vector3',
+                                   'Vector2', 'CFrame', 'Color3', 'Enum', 'task', 'require',
+                                   'tostring', 'tonumber', 'type', 'typeof', 'print', 'warn',
+                                   'error', 'pairs', 'ipairs', 'next', 'select', 'unpack',
+                                   'pcall', 'xpcall', 'coroutine', 'bit32', 'os', 'debug'):
+                    line = f'{m.group(1)}nil -- {ref_var} (forward ref)'
+                    fixes.append(f"Fixed forward reference: {ref_var}")
+        new_lines_fr.append(line)
+    if new_lines_fr != lines_fr:
+        source = '\n'.join(new_lines_fr)
+
     # Fix 'else if' → 'elseif' (Luau keyword)
     if 'else if ' in source:
         source = re.sub(r'\belse\s+if\b', 'elseif', source)
@@ -3689,9 +3833,10 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
         fixes.append("Fixed unassigned CFrame.new → position offset")
 
     # Fix malformed list initialization: "--[[ new List ]] (N)" or "--[[ new List ]] ({...})" → "{}"
+    # Also handles nested parens like "--[[ new List ]] (script.Parent:GetDescendants())"
     if '--[[ new List ]]' in source or '--[[ new HashSet ]]' in source:
         source = re.sub(
-            r'--\[\[\s*new\s+(?:List|HashSet)\s*\]\]\s*\([^)]*\)',
+            r'--\[\[\s*new\s+(?:List|HashSet)\s*\]\]\s*\((?:[^()]*\([^)]*\))*[^)]*\)',
             '{}',
             source,
         )
@@ -3925,9 +4070,28 @@ def _fix_missing_end_keywords(name: str, source: str, fixes: list[str]) -> str:
                 continue
 
         # Fix "};" or stray "}" that wasn't converted to "end"
+        # But skip `}` that close table literals (preceded by table entry lines like `Key = Value,`)
         if stripped == '}' or stripped == '};':
+            # Check if this closes a table literal by looking back for table entries
+            is_table_close = False
             indent = len(lines[i]) - len(lines[i].lstrip())
-            result.append(' ' * indent + 'end')
+            for back_idx in range(len(result) - 1, max(len(result) - 20, -1), -1):
+                back_line = result[back_idx].strip()
+                if not back_line or back_line.startswith('--'):
+                    continue  # skip blanks/comments
+                # Table entry patterns: `Key = Value,` or `Value,` or `[expr] = value,`
+                if re.match(r'^\w+\s*=\s*.+,?\s*$', back_line) and 'local ' not in back_line:
+                    is_table_close = True
+                    break
+                # Table opening: `= {` at same or lower indent
+                if back_line.endswith('= {') or back_line.endswith('= {},'):
+                    is_table_close = True
+                    break
+                break  # First meaningful non-blank line doesn't look like a table
+            if is_table_close:
+                result.append(lines[i])  # Keep the `}` as-is (table close)
+            else:
+                result.append(' ' * indent + 'end')
             i += 1
             continue
 
