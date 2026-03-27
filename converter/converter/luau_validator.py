@@ -2165,36 +2165,7 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             source = re.sub(r'(\w+)\.EnsureCapacity\(', r'-- \1.EnsureCapacity(', source)
         fixes.append("Commented out StringBuilder usage (not available in Luau)")
 
-    # `continue` keyword → restructure with if/end wrap
-    # Luau doesn't have `continue` — wrap remaining loop body in `if` instead
-    if re.search(r'^\s*continue\s*$', source, re.MULTILINE):
-        lines = source.split('\n')
-        new_lines = []
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            stripped = line.strip()
-            if stripped == 'continue':
-                # Replace with `-- continue` comment (loop restructuring is too complex for regex)
-                indent = line[:len(line) - len(line.lstrip())]
-                new_lines.append(f'{indent}-- continue (Luau: restructure loop to avoid)')
-                fixes.append("Commented out `continue` (not valid in Luau)")
-            elif stripped.startswith('if ') and stripped.endswith('continue end'):
-                # Single-line: `if cond then continue end` → skip by negating
-                # Extract condition
-                m = re.match(r'^(\s*)if\s+(.+?)\s+then\s+continue\s+end\s*$', line)
-                if m:
-                    indent, cond = m.group(1), m.group(2)
-                    # Negate the condition to skip the rest of the loop body?
-                    # Actually, just comment it out for now
-                    new_lines.append(f'{indent}-- if {cond} then continue end (Luau: restructure)')
-                    fixes.append("Commented out `continue` pattern (not valid in Luau)")
-                else:
-                    new_lines.append(line)
-            else:
-                new_lines.append(line)
-            i += 1
-        source = '\n'.join(new_lines)
+    # `continue` keyword: valid in Roblox Luau (added 2021) — no fix needed
 
     # Fix 'require(expr or nil)' → safe require with nil check
     if 'or nil)' in source and 'require(' in source:

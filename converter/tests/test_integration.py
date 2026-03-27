@@ -762,11 +762,12 @@ class TestLuauValidator:
         assert "tostring(obj.Name)" in fixed
         assert ".ToString()" not in fixed
 
-    def test_fix_continue_keyword(self):
+    def test_continue_keyword_preserved(self):
+        """continue IS valid in Roblox Luau (since 2021) — should NOT be removed."""
         from converter.luau_validator import validate_and_fix
         source = 'for _, item in items do\n    if not item then\n        continue\n    end\n    process(item)\nend'
         fixed, _ = validate_and_fix("test", source)
-        assert "continue" not in fixed or "-- continue" in fixed
+        assert "continue" in fixed  # continue is valid Luau, keep it
 
     def test_fix_starts_with(self):
         from converter.luau_validator import validate_and_fix
