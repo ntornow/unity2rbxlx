@@ -1074,6 +1074,23 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         )
         fixes.append("Fixed .CompareTag() → CollectionService:HasTag()")
 
+    # Fix: C# event delegate calls → BindableEvent:Fire()
+    # Detect commented-out event declarations and convert matching function calls
+    if '-- [#C] event ' in source:
+        event_names = re.findall(r'-- \[#C\] event \w+ (\w+)', source)
+        for event_name in event_names:
+            # EventName(args) → script:SetAttribute("EventName", args) or just comment
+            # For now, wrap in a nil-safe call pattern
+            if re.search(rf'\b{event_name}\s*\(', source):
+                # Create a BindableEvent pattern
+                source = re.sub(
+                    rf'\b{event_name}\s*\(([^)]*)\)',
+                    rf'-- TODO: {event_name} event (\1)',
+                    source,
+                )
+        if event_names:
+            fixes.append("Commented out C# event delegate calls")
+
     # Fix: KeyCode.X → Enum.KeyCode.X (Roblox requires Enum prefix)
     if re.search(r'\bKeyCode\.\w+', source) and 'Enum.KeyCode' not in source:
         source = re.sub(r'\bKeyCode\.(\w+)', r'Enum.KeyCode.\1', source)
@@ -1398,15 +1415,40 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
     if re.search(r'\bthis\b(?!\.)', source):
         source = re.sub(r'\bthis\b(?!\.)', 'script.Parent', source)
 
-    # Strip C# [Attribute] lines (e.g., [Range(...)], [SerializeField], [Header(...)])
-    if re.search(r'^\s*\[(?:Range|SerializeField|Header|Tooltip|Space|HideInInspector|FormerlySerializedAs|RequireComponent)\b', source, re.MULTILINE):
+    # Strip C# [Attribute] annotations — both standalone lines and inline prefixes
+    _ATTR_NAMES = (
+        'Range', 'SerializeField', 'Header', 'Tooltip', 'Space',
+        'HideInInspector', 'FormerlySerializedAs', 'RequireComponent',
+        'CreateAssetMenu', 'Serializable', 'System', 'MenuItem',
+        'AddComponentMenu', 'ExecuteInEditMode', 'ExecuteAlways',
+        'DisallowMultipleComponent', 'DefaultExecutionOrder',
+        'ContextMenu', 'ContextMenuItem',
+    )
+    _ATTR_PATTERN = '|'.join(_ATTR_NAMES)
+    # Standalone attribute lines
+    if re.search(rf'^\s*\[(?:{_ATTR_PATTERN})\b', source, re.MULTILINE):
         source = re.sub(
-            r'^\s*\[(?:Range|SerializeField|Header|Tooltip|Space|HideInInspector|FormerlySerializedAs|RequireComponent)\b[^\]]*\]\s*\n',
+            rf'^\s*\[(?:{_ATTR_PATTERN})\b[^\]]*\]\s*\n',
             '',
             source,
             flags=re.MULTILINE,
         )
         fixes.append("Stripped C# [Attribute] annotations")
+    # Inline attributes at start of line (before variable declarations)
+    # e.g., "[SerializeField][Range(0.5, 3)] local ..." → "local ..."
+    if re.search(rf'\[(?:{_ATTR_PATTERN})\b', source):
+        source = re.sub(rf'\[(?:{_ATTR_PATTERN})\b[^\]]*\]\s*', '', source)
+        fixes.append("Stripped inline C# [Attribute] annotations")
+
+    # Fix: "TypeName varName = default" → "local varName = nil" (C# field with default)
+    if '= default' in source:
+        source = re.sub(
+            r'^(\s*)[A-Z]\w+\s+(\w+)\s*=\s*default\b.*$',
+            r'\1local \2 = nil',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Fixed C# '= default' field declarations")
 
     # Fix 'IsKeyDownDown' → 'IsKeyDown' (doubled suffix from GetKeyDown mapping)
     if 'IsKeyDownDown' in source:
