@@ -186,9 +186,33 @@ def _convert_ui_element(node: SceneNode) -> RbxUIElement | None:
                     element_class = "ImageLabel"
                 ui_properties.update(props)
 
-    # Check for Button component override.
-    if any("Button" in c.component_type for c in node.components):
-        element_class = "TextButton"
+    # Check for Button component override and extract onClick handlers.
+    # Unity Button is a MonoBehaviour — identified by m_OnClick or m_Interactable fields.
+    on_click_handlers = []
+    for comp in node.components:
+        is_button = (
+            "Button" in comp.component_type or
+            ("MonoBehaviour" in comp.component_type and "m_OnClick" in comp.properties)
+        )
+        if is_button:
+            element_class = "TextButton"
+            # Extract m_OnClick persistent calls
+            on_click = comp.properties.get("m_OnClick", {})
+            persistent_calls = on_click.get("m_PersistentCalls", {})
+            calls = persistent_calls.get("m_Calls", [])
+            if isinstance(calls, list):
+                for call in calls:
+                    if isinstance(call, dict):
+                        method = call.get("m_MethodName", "")
+                        call_state = int(call.get("m_CallState", 0))
+                        if method and call_state >= 2:  # RuntimeOnly or EditorAndRuntime
+                            target_ref = call.get("m_Target", {})
+                            target_id = target_ref.get("fileID", "") if isinstance(target_ref, dict) else ""
+                            on_click_handlers.append({
+                                "method": method,
+                                "target_file_id": str(target_id),
+                            })
+                            log.info("  [%s] Button onClick: %s (target %s)", node.name, method, target_id)
 
     # Extract position and size from RectTransform.
     position, size = _extract_rect_transform(
@@ -202,7 +226,12 @@ def _convert_ui_element(node: SceneNode) -> RbxUIElement | None:
         position=position,
         size=size,
         visible=node.active,
+        on_click_handlers=on_click_handlers,
     )
+    # Store onClick method names as attributes for script wiring
+    if on_click_handlers:
+        methods = ",".join(h["method"] for h in on_click_handlers)
+        element.attributes["_OnClick"] = methods
 
     # Extract type-specific properties.
     if element_class in ("TextLabel", "TextButton"):

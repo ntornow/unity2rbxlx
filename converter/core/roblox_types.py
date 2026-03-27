@@ -124,6 +124,8 @@ class RbxUIElement:
     layout_cell_size: tuple[int, int] = (100, 100)  # For UIGridLayout
     layout_h_alignment: str = "Left"  # Left, Center, Right
     layout_v_alignment: str = "Top"  # Top, Center, Bottom
+    attributes: dict[str, Any] = field(default_factory=dict)
+    on_click_handlers: list[dict[str, str]] = field(default_factory=list)  # [{method: str, target_name: str}]
 
 
 @dataclass

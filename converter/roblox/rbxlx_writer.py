@@ -8,6 +8,7 @@ representation, producing a valid Roblox Studio-loadable document.
 from __future__ import annotations
 
 import base64
+import logging
 import struct
 import xml.etree.ElementTree as ET
 import xml.dom.minidom
@@ -38,6 +39,8 @@ from core.roblox_types import (
     RbxVideoFrame,
 )
 from core.coordinate_system import quaternion_to_rotation_matrix
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -580,10 +583,80 @@ def _make_ui_element(parent_xml: ET.Element, elem: RbxUIElement) -> None:
         _add_token(layout_props, "HorizontalAlignment", h_map.get(h_align, 0))
         _add_token(layout_props, "VerticalAlignment", v_map.get(v_align, 0))
 
+    # Serialize attributes (e.g., _OnClick for button event handlers)
+    elem_attrs = getattr(elem, "attributes", None) or {}
+    if elem_attrs:
+        encoded = _encode_attributes(elem_attrs)
+        attr_elem = ET.SubElement(props, "BinaryString", name="AttributesSerialize")
+        attr_elem.text = encoded
+
     # Recurse into children
     children = getattr(elem, "children", None) or []
     for child in children:
         _make_ui_element(item, child)
+
+
+def _generate_ui_event_script(screen_guis: list) -> str | None:
+    """Generate a LocalScript that wires up Button onClick events.
+
+    Scans all ScreenGui elements for TextButtons with _OnClick attributes
+    and generates Activated:Connect() handlers.
+    """
+    handlers = []
+
+    def _scan_element(element, path: str):
+        name = getattr(element, "name", "")
+        cls = getattr(element, "class_name", "")
+        current_path = f'{path}:FindFirstChild("{name}")'
+        on_click = (getattr(element, "attributes", {}) or {}).get("_OnClick", "")
+        if cls == "TextButton" and on_click:
+            for method in on_click.split(","):
+                method = method.strip()
+                if method:
+                    handlers.append((current_path, method, name))
+        for child in getattr(element, "children", []) or []:
+            _scan_element(child, current_path)
+
+    for sg in screen_guis:
+        sg_name = getattr(sg, "name", "ScreenGui")
+        sg_path = f'script.Parent:FindFirstChild("{sg_name}")'
+        for elem in getattr(sg, "elements", []) or []:
+            _scan_element(elem, sg_path)
+
+    if not handlers:
+        return None
+
+    lines = [
+        "-- Auto-generated UI event wiring script",
+        "-- Connects Unity Button onClick events to Roblox TextButton.Activated",
+        "",
+        "local gui = script.Parent",
+        "",
+        "task.wait(0.1) -- Wait for GUI to load",
+        "",
+    ]
+
+    for path, method, button_name in handlers:
+        lines.extend([
+            f'-- Button: {button_name} → {method}()',
+            f'local btn_{method} = {path}',
+            f'if btn_{method} and btn_{method}:IsA("TextButton") then',
+            f'    btn_{method}.Activated:Connect(function()',
+            f'        -- TODO: Wire to {method}() function from converted scripts',
+            f'        print("[UI] {button_name} clicked → {method}()")',
+            f'        local handler = script.Parent:FindFirstChild("{method}", true)',
+            f'        if handler and handler:IsA("ModuleScript") then',
+            f'            local ok, mod = pcall(require, handler)',
+            f'            if ok and type(mod) == "table" and mod.{method} then',
+            f'                mod.{method}()',
+            f'            end',
+            f'        end',
+            f'    end)',
+            f'end',
+            '',
+        ])
+
+    return "\n".join(lines)
 
 
 def _generate_water_fill_script(water_regions: list) -> str:
@@ -1208,6 +1281,15 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, Any]:
         for child in children:
             _make_ui_element(sg_item, child)
             stats["ui_elements"] += 1
+
+    # Generate UI event wiring script if any buttons have onClick handlers
+    ui_event_source = _generate_ui_event_script(screen_guis)
+    if ui_event_source:
+        ui_script_item, ui_script_props = _make_item(starter_gui, "LocalScript", "UIEventWiring")
+        _add_protected_string(ui_script_props, "Source", ui_event_source)
+        stats["scripts"] = stats.get("scripts", 0) + 1
+        log.info("Injected UIEventWiring LocalScript for %d button handlers",
+                 ui_event_source.count("Activated:Connect"))
 
     # ---- ServerStorage (prefab templates) --------------------------------
     prefabs = getattr(place, "prefabs", None) or []

@@ -96,6 +96,28 @@ class TestRbxlxWriter:
         content = output.read_text()
         assert "ScreenGui" in content
 
+    def test_button_onclick_event_wiring(self, tmp_path):
+        from roblox.rbxlx_writer import write_rbxlx
+        btn = RbxUIElement(
+            class_name="TextButton",
+            name="StartBtn",
+            text="Start",
+            size=(0, 200, 0, 50),
+            on_click_handlers=[{"method": "StartGame", "target_file_id": "123"}],
+            attributes={"_OnClick": "StartGame"},
+        )
+        gui = RbxScreenGui(
+            name="MenuUI",
+            elements=[btn],
+        )
+        place = RbxPlace(screen_guis=[gui])
+        output = tmp_path / "test.rbxlx"
+        write_rbxlx(place, output)
+        content = output.read_text()
+        assert "UIEventWiring" in content
+        assert "StartGame" in content
+        assert "Activated:Connect" in content
+
     def test_cframe_serialization(self, tmp_path):
         from roblox.rbxlx_writer import write_rbxlx
         part = RbxPart(
