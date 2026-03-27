@@ -2347,3 +2347,25 @@ class TestValidatorNewFixes:
         luau, _, _ = _rule_based_transpile(source, API_CALL_MAP)
         # The (0) should NOT be treated as a ternary condition
         assert 'if (0) then' not in luau
+
+    def test_eof_end_appending(self):
+        """Missing end at EOF gets appended."""
+        from converter.luau_validator import validate_and_fix
+        source = (
+            'local function foo()\n'
+            '    local function bar()\n'
+            '        print("nested")\n'
+            '    end\n'
+        )
+        fixed, fixes = validate_and_fix("test", source)
+        # foo() was never closed — should append end at EOF
+        assert fixed.rstrip().endswith('end')
+        assert fixed.count('end') >= 2
+
+    def test_broken_table_find_lambda(self):
+        """Malformed table.find lambda gets restructured."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if (table.find(items, function(x) ~= nil) return x=="GasCan" end)) then'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'function(x) return x=="GasCan" end)' in fixed
+        assert '~= nil' in fixed
