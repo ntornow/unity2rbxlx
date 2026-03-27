@@ -1063,8 +1063,11 @@ def _rule_based_transpile(
         # Handles complex conditions like (a > b), a == b, etc.
         # Match: condition ? true_expr : false_expr
         # The condition can be: parenthesized expr, comparison, or simple word
+        # IMPORTANT: Only match (cond) ? when:
+        # 1. cond doesn't contain commas (those are function args, not conditions)
+        # 2. The ( is NOT preceded by a word char (to avoid matching func(0) ?)
         converted = re.sub(
-            r"\(([^)]+)\)\s*\?\s*([^:]+):\s*(.+?)(?=\s*$|\s*;)",
+            r"(?<!\w)\(([^),]+)\)\s*\?\s*([^:]+):\s*(.+?)(?=\s*$|\s*;)",
             r"(if (\1) then \2 else \3)",
             converted,
         )
@@ -1073,7 +1076,6 @@ def _rule_based_transpile(
             r"(if \1 then \2 else \3)",
             converted,
         )
-
         # try/catch -> pcall
         converted = re.sub(r"\btry\s*\{?\s*$", "local ok, err = pcall(function()", converted)
         converted = re.sub(r"\bcatch\s*\(\s*\w+\s+(\w+)\s*\)\s*\{?\s*$",

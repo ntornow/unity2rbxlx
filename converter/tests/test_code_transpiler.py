@@ -2232,3 +2232,118 @@ class TestValidatorNewFixes:
         source = 'local function Initialize(inst, Dictionary<Instance, dict)\nend'
         fixed, _ = validate_and_fix("test", source)
         assert 'Dictionary<' not in fixed
+
+    def test_math_lerp_to_utility(self):
+        """math.lerp → mathLerp utility function."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local x = math.lerp(a, b, t)'
+        fixed, fixes = validate_and_fix("test", source)
+        assert 'mathLerp(a, b, t)' in fixed
+        assert 'math.lerp' not in fixed
+        assert 'local function mathLerp' in fixed
+
+    def test_renderer_visible_to_enabled(self):
+        """.Visible → .Enabled for Renderer objects."""
+        from converter.luau_validator import validate_and_fix
+        source = 'systemRenderer.Visible = not systemRenderer.Visible'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'systemRenderer.Enabled = not systemRenderer.Enabled' in fixed
+        assert '.Visible' not in fixed
+
+    def test_emission_visible_to_enabled(self):
+        """.Visible → .Enabled for emission/particle objects."""
+        from converter.luau_validator import validate_and_fix
+        source = 'emission.Visible = false'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'emission.Enabled = false' in fixed
+
+    def test_connect_closure_nested_if(self):
+        """Connect(function) with nested ifs gets end)."""
+        from converter.luau_validator import validate_and_fix
+        source = (
+            'script.Parent.Touched:Connect(function(otherPart)\n'
+            '    if true then\n'
+            '        if true then\n'
+            '            print("hi")\n'
+            '        end\n'
+            '    end\n'
+            'end\n'
+        )
+        fixed, _ = validate_and_fix("test", source)
+        assert fixed.rstrip().endswith('end)')
+
+    def test_connect_closure_missing_end(self):
+        """Connect(function) with missing end still gets end)."""
+        from converter.luau_validator import validate_and_fix
+        source = (
+            'script.Parent.Touched:Connect(function(otherPart)\n'
+            '    if true then\n'
+            '        print("hi")\n'
+            '    end\n'
+            'end\n'
+        )
+        fixed, _ = validate_and_fix("test", source)
+        assert 'end)' in fixed
+
+    def test_ternary_inside_function_call(self):
+        """Ternary inside function call args gets properly converted."""
+        from converter.luau_validator import validate_and_fix
+        source = 'x = mathLerp(a, func(0) ? maxVal : minVal, dt)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '?' not in fixed
+        assert '(if func(0) then maxVal else minVal)' in fixed
+
+    def test_tab_normalization(self):
+        """Tabs are normalized to spaces in block analysis."""
+        from converter.luau_validator import validate_and_fix
+        source = 'for _, v in items do\n\t\tprint(v)\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert '\t' not in fixed
+        assert 'for _, v in items do' in fixed
+        assert 'end' in fixed
+
+    def test_excess_end_removal(self):
+        """Excess end/end) at negative depth are removed."""
+        from converter.luau_validator import validate_and_fix
+        source = (
+            'RunService.Heartbeat:Connect(function(dt)\n'
+            '    print(dt)\n'
+            'end)\n'
+            'end)\n'
+            'print("done")\n'
+        )
+        fixed, _ = validate_and_fix("test", source)
+        assert fixed.count('end)') == 1
+
+    def test_multiline_if_then_depth(self):
+        """Multi-line if where then is on continuation line."""
+        from converter.luau_validator import validate_and_fix
+        source = (
+            'local function test()\n'
+            '    if condition1 or\n'
+            '        condition2 then\n'
+            '        print("yes")\n'
+            '    end\n'
+            'end\n'
+        )
+        fixed, _ = validate_and_fix("test", source)
+        # Should be balanced — no extra end inserted
+        assert fixed.count('end') == 2  # one for if, one for function
+
+    def test_utility_function_no_double_paren(self):
+        """Utility function API mappings don't produce double parens."""
+        from converter.code_transpiler import _rule_based_transpile
+        from converter.api_mappings import API_CALL_MAP
+        source = 'float angle = Vector3.SignedAngle(a, b, c);'
+        luau, _, _ = _rule_based_transpile(source, API_CALL_MAP)
+        assert 'vec3SignedAngle((' not in luau
+        assert 'vec3SignedAngle(a' in luau
+
+    def test_ternary_not_matching_func_call_parens(self):
+        """Ternary regex doesn't match (0) from function calls."""
+        from converter.code_transpiler import _rule_based_transpile
+        from converter.api_mappings import API_CALL_MAP
+        source = 'x = Mathf.Lerp(m_Power, Input.GetMouseButton(0) ? maxPower : minPower, dt);'
+        luau, _, _ = _rule_based_transpile(source, API_CALL_MAP)
+        # The (0) should NOT be treated as a ternary condition
+        assert 'if (0) then' not in luau

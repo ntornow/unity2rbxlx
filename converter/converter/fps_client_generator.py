@@ -567,8 +567,7 @@ local function findSpawnPoint()
     -- Fallback: look for parts named "SpawnPoint" or with IsSpawnPoint attribute
     for _, obj in ipairs(workspace:GetDescendants()) do
         if obj:IsA("BasePart") then
-            if obj:GetAttribute("IsSpawnPoint") or
-               string.find(string.lower(obj.Name), "spawn") then
+            if obj:GetAttribute("IsSpawnPoint") or string.find(string.lower(obj.Name), "spawn") then
                 return obj.CFrame + Vector3.new(0, 3, 0)
             end
         end

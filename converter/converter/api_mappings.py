@@ -106,7 +106,7 @@ API_CALL_MAP: dict[str, str] = {
     "Mathf.Clamp01": "math.clamp",
     "Mathf.Floor": "math.floor",
     "Mathf.FloorToInt": "math.floor",
-    "Mathf.Lerp": "math.lerp",
+    "Mathf.Lerp": "mathLerp",  # handled by UTILITY_FUNCTIONS
     "Mathf.Max": "math.max",
     "Mathf.Min": "math.min",
     "Mathf.Pow": "math.pow",
@@ -146,10 +146,10 @@ API_CALL_MAP: dict[str, str] = {
     "Vector3.Angle": "math.acos",
     "Vector3.MoveTowards": ":Lerp",
     "Vector3.ClampMagnitude": ".Unit",
-    "Vector3.SignedAngle": "vec3SignedAngle(",  # handled by UTILITY_FUNCTIONS
-    "Vector3.ProjectOnPlane": "vec3ProjectOnPlane(",  # handled by UTILITY_FUNCTIONS
-    "Vector3.Project": "vec3Project(",  # handled by UTILITY_FUNCTIONS
-    "Vector3.Reflect": "vec3Reflect(",  # handled by UTILITY_FUNCTIONS
+    "Vector3.SignedAngle": "vec3SignedAngle",  # handled by UTILITY_FUNCTIONS
+    "Vector3.ProjectOnPlane": "vec3ProjectOnPlane",  # handled by UTILITY_FUNCTIONS
+    "Vector3.Project": "vec3Project",  # handled by UTILITY_FUNCTIONS
+    "Vector3.Reflect": "vec3Reflect",  # handled by UTILITY_FUNCTIONS
     "Vector3.SmoothDamp": ":Lerp",
     "new Vector3": "Vector3.new",
     # -- Vector2 --
@@ -718,6 +718,10 @@ SERVICE_IMPORTS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 UTILITY_FUNCTIONS: dict[str, str] = {
+    "mathLerp": """\
+local function mathLerp(a, b, t)
+\treturn a + (b - a) * math.clamp(t, 0, 1)
+end""",
     "mathRepeat": """\
 local function mathRepeat(t, length)
 \treturn t - math.floor(t / length) * length

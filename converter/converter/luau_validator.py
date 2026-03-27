@@ -36,6 +36,116 @@ def _split_top_level(s: str) -> list[str]:
     return parts
 
 
+def _fix_ternary_in_line(line: str) -> str:
+    """Fix C# ternary `cond ? true_expr : false_expr` in a single line.
+
+    Scans for `?` that appears outside strings and parentheses,
+    then finds the matching `:` to form `(if cond then true else false)`.
+    Handles function calls with nested parens as conditions.
+    """
+    # Find all ? positions (not inside strings)
+    in_string = False
+    string_char = ''
+    paren_depth = 0
+    q_positions = []
+    for i, c in enumerate(line):
+        if in_string:
+            if c == string_char and (i == 0 or line[i-1] != '\\'):
+                in_string = False
+            continue
+        if c in ('"', "'"):
+            in_string = True
+            string_char = c
+            continue
+        if c == '(':
+            paren_depth += 1
+        elif c == ')':
+            paren_depth -= 1
+        elif c == '?' and paren_depth >= 0:
+            # Check it's ` ? ` (with spaces, not ?. or ??)
+            if i > 0 and i < len(line) - 1 and line[i-1] == ' ' and line[i+1] == ' ':
+                q_positions.append(i)
+
+    if not q_positions:
+        return line
+
+    # Process the LAST ternary first (to preserve positions)
+    for q_pos in reversed(q_positions):
+        # Find the condition: everything before ` ? ` back to the start of the expression
+        # Walk backwards from q_pos-1 to find where the condition starts
+        # The condition ends at q_pos-1 (the space before ?)
+
+        # Find matching ` : ` after ` ? `
+        colon_pos = None
+        depth = 0
+        for j in range(q_pos + 2, len(line)):
+            c = line[j]
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+                if depth < 0:
+                    break  # We've gone past the enclosing parens
+            elif c == ':' and depth == 0 and j > 0 and line[j-1] == ' ' and j < len(line) - 1 and line[j+1] == ' ':
+                colon_pos = j
+                break
+
+        if colon_pos is None:
+            continue
+
+        # Find the end of false_expr: next comma or closing paren at same depth, or end of line
+        end_pos = len(line)
+        depth = 0
+        for j in range(colon_pos + 2, len(line)):
+            c = line[j]
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                if depth == 0:
+                    end_pos = j
+                    break
+                depth -= 1
+            elif c == ',' and depth == 0:
+                end_pos = j
+                break
+
+        # Find the start of the condition: walk backwards from q_pos
+        # The condition is the expression before ` ? `
+        # Walk back past balanced parens, words, dots, colons
+        start_pos = q_pos - 1  # skip the space before ?
+        while start_pos > 0 and line[start_pos - 1] == ' ':
+            start_pos -= 1  # skip extra spaces
+        # Now walk back to find where the condition expression starts
+        depth = 0
+        cond_start = start_pos
+        for j in range(start_pos - 1, -1, -1):
+            c = line[j]
+            if c == ')':
+                depth += 1
+            elif c == '(':
+                if depth == 0:
+                    cond_start = j + 1
+                    break
+                depth -= 1
+            elif c == ',' and depth == 0:
+                cond_start = j + 1
+                break
+            elif c in (' ', '=') and depth == 0:
+                cond_start = j + 1
+                break
+            cond_start = j
+
+        cond = line[cond_start:q_pos - 1].strip()
+        true_expr = line[q_pos + 2:colon_pos - 1].strip()
+        false_expr = line[colon_pos + 2:end_pos].strip()
+
+        if cond and true_expr and false_expr:
+            replacement = f'(if {cond} then {true_expr} else {false_expr})'
+            line = line[:cond_start] + replacement + line[end_pos:]
+
+    return line
+
+
 def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
     """Validate and fix common Luau issues in a transpiled script.
 
@@ -1573,20 +1683,25 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
 
     # Fix remaining C# ternary operators: `condition ? a : b` → `if condition then a else b`
     # This catches ternaries the transpiler missed (e.g., function call conditions)
-    # Only match after `= ` to avoid mismatching other patterns
-    if ' ? ' in source and ' : ' in source:
-        def _fix_remaining_ternary(m):
-            assign = m.group(1)
-            cond = m.group(2).strip()
-            true_expr = m.group(3).strip()
-            false_expr = m.group(4).strip()
-            return f'{assign}(if {cond} then {true_expr} else {false_expr})'
-        source = re.sub(
-            r'(=\s+)(\S+(?:\([^)]*\))?)\s+\?\s+([^:?]+?)\s+:\s+(\S+)',
-            _fix_remaining_ternary,
-            source,
-        )
-        fixes.append("Fixed remaining C# ternary operators")
+    # Uses line-by-line scanning to find `?` and `:` outside strings
+    if ' ? ' in source:
+        lines = source.split('\n')
+        result_lines = []
+        ternary_fixed = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('--') or ' ? ' not in line:
+                result_lines.append(line)
+                continue
+            # Find the ternary ? and : in the line (outside strings)
+            # Scan for balanced ? : pattern
+            new_line = _fix_ternary_in_line(line)
+            if new_line != line:
+                ternary_fixed = True
+            result_lines.append(new_line)
+        if ternary_fixed:
+            source = '\n'.join(result_lines)
+            fixes.append("Fixed remaining C# ternary operators")
 
     # Fix broken ternary patterns from C# `condition ? a : b` conversion failures
     # Pattern 1: `expr > (if VALUE then A else B)` → `(if expr > VALUE then A else B)`
@@ -1693,6 +1808,20 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         source = re.sub(r'(\w*[Ll]ight\w*)\.Visible\b', r'\1.Enabled', source)
         # m_Collider.Visible → .CanCollide (colliders don't have Visible)
         source = re.sub(r'(\w*[Cc]ollider\w*)\.Visible\b', r'\1.CanCollide', source)
+        # Renderer/emission/system.Visible → .Enabled (Roblox uses .Enabled for ParticleEmitter, etc.)
+        source = re.sub(r'(\w*[Rr]enderer\w*)\.Visible\b', r'\1.Enabled', source)
+        source = re.sub(r'(\w*[Ee]mission\w*)\.Visible\b', r'\1.Enabled', source)
+        source = re.sub(r'(\w*[Ss]ystem\w*)\.Visible\b', r'\1.Enabled', source)
+        # Generic fallback: any remaining .Visible on non-GUI objects → .Enabled
+        # (Roblox GuiObjects do have .Visible, but most other objects use .Enabled)
+        source = re.sub(r'(\w+)\.Visible\b(?!\s*=\s*["\'])', lambda m: (
+            m.group(0) if any(kw in m.group(1).lower() for kw in ('gui', 'frame', 'label', 'button', 'text', 'image', 'scroll'))
+            else f'{m.group(1)}.Enabled'
+        ), source)
+
+    # Fix math.lerp → mathLerp (math.lerp doesn't exist in Roblox Luau)
+    if 'math.lerp' in source:
+        source = source.replace('math.lerp', 'mathLerp')
 
     # Fix .RemoveRange(start, count) → loop with table.remove
     if '.RemoveRange(' in source:
@@ -2235,6 +2364,8 @@ def _fix_missing_end_keywords(name: str, source: str, fixes: list[str]) -> str:
     and ensures each has a matching `end` (or `until` for repeat).
     Also fixes stray `else` after `end` and stray closing braces.
     """
+    # Normalize tabs to spaces (mixed tabs/spaces break indentation analysis)
+    source = source.replace('\t', '    ')
     lines = source.split('\n')
     result = []
     original = source
@@ -2270,46 +2401,7 @@ def _fix_missing_end_keywords(name: str, source: str, fixes: list[str]) -> str:
 
     source = '\n'.join(result)
 
-    # Pass 1b: fix `end` → `end)` for `:Connect(function(` blocks
-    # When a line has `:Connect(function(...)`, the block-closing `end` must be `end)`
-    if ':Connect(function(' in source:
-        lines2 = source.split('\n')
-        connect_stack = []  # stack of (indent_level, depth) for Connect(function blocks
-        depth = 0
-        result2 = []
-        for line in lines2:
-            stripped = line.strip()
-            indent = len(line) - len(line.lstrip()) if line.strip() else -1
-            # Count nested block depth
-            if not stripped.startswith('--'):
-                if re.search(r'\bfunction\s*[\w.:(]', stripped):
-                    if not (stripped.endswith(' end') or stripped.endswith('\tend')):
-                        depth += 1
-                if re.match(r'(?:if|elseif)\b.+\bthen\s*$', stripped):
-                    depth += 1
-                if re.match(r'for\b.+\bdo\s*$', stripped):
-                    depth += 1
-                if re.match(r'while\b.+\bdo\s*$', stripped):
-                    depth += 1
-            # Check if this opens a Connect(function block
-            if re.search(r':Connect\(function\s*\(', stripped):
-                connect_stack.append(depth)  # record depth at open
-            # Check if this is a bare `end` that should close a Connect(function block
-            # depth matches the depth when Connect was opened (function already counted)
-            if stripped == 'end' and connect_stack and depth == connect_stack[-1]:
-                connect_stack.pop()
-                ws = line[:indent] if indent >= 0 else ''
-                result2.append(ws + 'end)')
-                depth -= 1
-                continue
-            # Update depth for closers
-            if not stripped.startswith('--'):
-                if stripped == 'end' or stripped.startswith('end)'):
-                    depth -= 1
-                if re.match(r'until\b', stripped):
-                    depth -= 1
-            result2.append(line)
-        source = '\n'.join(result2)
+    # Pass 1b: placeholder — Connect end) fix moved to after structural fixes
 
     # Second pass: fix single-statement if/then blocks missing 'end'
     # Pattern: "if COND then" on one line, single statement on next line,
@@ -2322,10 +2414,164 @@ def _fix_missing_end_keywords(name: str, source: str, fixes: list[str]) -> str:
     # remove trailing `end` lines from the bottom of the script
     source = _remove_excess_trailing_ends(source, fixes)
 
+    # Final pass: fix `end` → `end)` for `:Connect(function(` blocks
+    # Uses indentation matching: the closing `end` for a Connect(function block
+    # should be at the same indent level as the Connect line's body indent minus one level
+    source = _fix_connect_closures(source, fixes)
+
+    # Post-Connect pass: remove any remaining excess end/end) keywords
+    # This catches cases where Connect fix preserved end) from AI output
+    # that creates negative block balance
+    source = _remove_excess_end_keywords(source, fixes)
+
     if source != original:
         fixes.append("Fixed missing end keywords / stray braces")
 
     return source
+
+
+def _remove_excess_end_keywords(source: str, fixes: list[str]) -> str:
+    """Remove excess `end` or `end)` keywords that create negative block depth.
+
+    Uses depth tracking to find `end`/`end)` lines where depth goes negative.
+    These are orphaned closers from C# class/namespace braces or duplicate
+    AI-generated closers.
+    """
+    lines = source.split('\n')
+    depth = 0
+    lines_to_remove = []
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith('--') or not stripped:
+            continue
+
+        # Count block openers
+        if re.search(r'\bfunction\s*[\w.:(]', stripped):
+            if not (stripped.endswith(' end') or stripped.endswith('\tend')):
+                depth += 1
+        if re.match(r'(?:if|elseif)\b.+\bthen\s*$', stripped) or (
+                re.search(r'\bthen\s*$', stripped) and not re.match(r'(?:if|elseif)\b', stripped)
+                and not re.search(r'\bfunction\b', stripped)):
+            depth += 1
+        if re.match(r'for\b.+\bdo\s*$', stripped):
+            depth += 1
+        if re.match(r'while\b.+\bdo\s*$', stripped):
+            depth += 1
+        if stripped == 'repeat':
+            depth += 1
+
+        # Count closers — mark for removal if depth would go negative
+        if stripped == 'end' or stripped.startswith('end)'):
+            depth -= 1
+            if depth < 0:
+                lines_to_remove.append(i)
+                depth = 0  # Reset to prevent cascade
+        if re.match(r'until\b', stripped):
+            depth -= 1
+
+    if lines_to_remove:
+        for idx in reversed(lines_to_remove):
+            lines.pop(idx)
+        fixes.append(f"Removed {len(lines_to_remove)} excess end keyword(s)")
+
+    return '\n'.join(lines)
+
+
+def _fix_connect_closures(source: str, fixes: list[str]) -> str:
+    """Fix bare `end` → `end)` for :Connect(function() blocks.
+
+    Uses a two-pass approach:
+    1. Find all :Connect(function( lines and record their indent
+    2. For each Connect opener, find the last bare `end` at the same indent
+       level (before the next non-blank non-comment line at same/lower indent
+       that isn't `end`) and convert it to `end)`
+
+    This runs after all structural fixes so the block structure is stable.
+    """
+    if ':Connect(function(' not in source:
+        return source
+
+    lines = source.split('\n')
+    # Find all Connect(function( openers with their line index and indent
+    connect_openers = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if re.search(r':Connect\(function\s*\(', stripped):
+            indent = len(line) - len(line.lstrip())
+            connect_openers.append((i, indent))
+
+    if not connect_openers:
+        return source
+
+    # For each Connect opener, scan forward to find the matching `end`
+    # that should become `end)`. The function body is indented deeper than
+    # the Connect line. The matching `end` is the `end` at the Connect line's
+    # indent level (or the body indent level, whichever is the function close).
+    #
+    # Strategy: track block nesting from the Connect line. The function's
+    # closing `end` is when we return to the same nesting depth we had
+    # at the Connect line (just the function block).
+    ends_to_fix = set()  # line indices where `end` should become `end)`
+
+    for open_idx, open_indent in connect_openers:
+        # Find the matching end for the function opened by this Connect
+        # We scan forward, tracking function depth (function opens +1, end -1)
+        depth = 0
+        found = False
+        for j in range(open_idx, len(lines)):
+            stripped = lines[j].strip()
+            if stripped.startswith('--') or not stripped:
+                continue
+
+            # Count block openers
+            if re.search(r'\bfunction\s*[\w.:(]', stripped):
+                if not (stripped.endswith(' end') or stripped.endswith('\tend')):
+                    depth += 1
+            elif re.match(r'(?:if|elseif)\b.+\bthen\s*$', stripped) or (
+                    re.search(r'\bthen\s*$', stripped) and not re.match(r'(?:if|elseif)\b', stripped)
+                    and not re.search(r'\bfunction\b', stripped)):
+                depth += 1
+            elif re.match(r'for\b.+\bdo\s*$', stripped):
+                depth += 1
+            elif re.match(r'while\b.+\bdo\s*$', stripped):
+                depth += 1
+            elif stripped == 'repeat':
+                depth += 1
+
+            # Count block closers
+            if stripped == 'end' or stripped.startswith('end)'):
+                depth -= 1
+                if depth == 0:
+                    # This `end` closes the function opened by Connect
+                    if stripped == 'end':
+                        ends_to_fix.add(j)
+                    found = True
+                    break
+            elif re.match(r'until\b', stripped):
+                depth -= 1
+
+        # If no matching end found and depth > 0, the function body is missing
+        # its closing end. Add one at the appropriate indent level.
+        if not found and depth > 0:
+            # Insert `end)` after the last non-empty line before EOF or next Connect
+            insert_idx = len(lines)
+            for j in range(len(lines) - 1, open_idx, -1):
+                if lines[j].strip():
+                    insert_idx = j + 1
+                    break
+            lines.insert(insert_idx, ' ' * (open_indent) + 'end)')
+            # Don't add to ends_to_fix since we inserted it directly
+
+    # Apply fixes
+    if ends_to_fix:
+        for idx in sorted(ends_to_fix):
+            line = lines[idx]
+            indent = len(line) - len(line.lstrip()) if line.strip() else 0
+            lines[idx] = ' ' * indent + 'end)'
+        fixes.append(f"Fixed {len(ends_to_fix)} Connect(function) closure(s): end → end)")
+
+    return '\n'.join(lines)
 
 
 def _remove_excess_trailing_ends(source: str, fixes: list[str]) -> str:
@@ -2348,7 +2594,9 @@ def _remove_excess_trailing_ends(source: str, fixes: list[str]) -> str:
             # Only count as opener if line does NOT also end with 'end'
             if not stripped.endswith(' end') and not stripped.endswith('\tend'):
                 depth += 1
-        if re.match(r'(?:if|elseif)\b.+\bthen\s*$', stripped):
+        if re.match(r'(?:if|elseif)\b.+\bthen\s*$', stripped) or (
+                re.search(r'\bthen\s*$', stripped) and not re.match(r'(?:if|elseif)\b', stripped)
+                and not re.search(r'\bfunction\b', stripped)):
             depth += 1
         if re.match(r'for\b.+\bdo\s*$', stripped):
             depth += 1
@@ -2375,7 +2623,8 @@ def _remove_excess_trailing_ends(source: str, fixes: list[str]) -> str:
             idx -= 1
         if idx < 0:
             break
-        if lines[idx].strip() == 'end':
+        trailing = lines[idx].strip()
+        if trailing == 'end' or trailing == 'end)':
             lines.pop(idx)
             removed += 1
         else:
@@ -2414,7 +2663,10 @@ def _insert_missing_ends_for_single_statement_blocks(source: str, fixes: list[st
         if stripped.startswith('--'):
             return None
         # "if ... then" (not single-line if...then...end)
+        # Also handle continuation lines where `then` appears on next line of multi-line if
         if re.match(r'(?:if|elseif)\b.+\bthen\s*$', stripped):
+            return 'if'
+        if re.search(r'\bthen\s*$', stripped) and not re.match(r'(?:if|elseif)\b', stripped) and not re.search(r'\bfunction\b', stripped):
             return 'if'
         if stripped == 'else':
             return 'else'
