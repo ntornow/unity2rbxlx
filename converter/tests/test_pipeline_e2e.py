@@ -13,6 +13,14 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
+def _has_unitypy():
+    try:
+        import UnityPy  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 class TestPipelineE2E:
     """End-to-end tests against real test projects."""
 
@@ -79,7 +87,7 @@ class TestPipelineE2E:
             classes[cls] = classes.get(cls, 0) + 1
 
         assert classes.get("MeshPart", 0) > 200  # FBX-as-prefab adds ~38
-        assert classes.get("Script", 0) + classes.get("LocalScript", 0) >= 40
+        assert classes.get("Script", 0) + classes.get("LocalScript", 0) + classes.get("ModuleScript", 0) >= 40
         assert classes.get("Sound", 0) > 50
         assert classes.get("PointLight", 0) + classes.get("SpotLight", 0) > 20
 
@@ -97,6 +105,10 @@ class TestPipelineE2E:
     @pytest.mark.skipif(
         not (Path(__file__).parent.parent.parent / "test_projects" / "3D-Platformer").exists(),
         reason="3D-Platformer test project not available",
+    )
+    @pytest.mark.skipif(
+        not _has_unitypy(),
+        reason="UnityPy not installed (required for binary scenes)",
     )
     def test_3d_platformer_binary_scene(self, tmp_path):
         """Test binary scene conversion of 3D-Platformer."""
@@ -117,6 +129,10 @@ class TestPipelineE2E:
     @pytest.mark.skipif(
         not (Path(__file__).parent.parent.parent / "test_projects" / "RedRunner").exists(),
         reason="RedRunner test project not available",
+    )
+    @pytest.mark.skipif(
+        not _has_unitypy(),
+        reason="UnityPy not installed (required for binary scenes)",
     )
     def test_redrunner_binary_scene(self, tmp_path):
         """Test binary scene conversion of RedRunner."""

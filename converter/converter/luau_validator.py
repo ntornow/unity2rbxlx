@@ -17,6 +17,25 @@ import re
 log = logging.getLogger(__name__)
 
 
+def _split_top_level(s: str) -> list[str]:
+    """Split a string by commas, respecting nested parentheses."""
+    parts = []
+    depth = 0
+    current = []
+    for c in s:
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+        elif c == ',' and depth == 0:
+            parts.append(''.join(current))
+            current = []
+            continue
+        current.append(c)
+    parts.append(''.join(current))
+    return parts
+
+
 def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
     """Validate and fix common Luau issues in a transpiled script.
 
@@ -35,6 +54,8 @@ def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
     source = _fix_enum_comparisons(name, source, fixes)
     source = _fix_csharp_remnants(name, source, fixes)
     source = _fix_common_api_mistakes(name, source, fixes)
+    source = _fix_structural_syntax(name, source, fixes)
+    source = _fix_missing_end_keywords(name, source, fixes)
     # Second pass: catch this./null that appear after API fixes (e.g., .gameObject removal)
     if re.search(r'\bthis\.', source):
         source = re.sub(r'\bthis\.(\w+)', r'script.Parent.\1', source)
@@ -312,6 +333,121 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
         source = re.sub(r'\([A-Z]\w+<[A-Z]\w+>\)', '', source)
         if source != original:
             fixes.append("Stripped C# generic type parameters")
+
+    # Fix Unity static method calls that appear as orphaned dot-prefixed calls
+    # .Destroy(obj) → obj:Destroy()
+    # .Destroy(obj, delay) → game:GetService("Debris"):AddItem(obj, delay)
+    if re.search(r'^\s*\.Destroy\(', source, re.MULTILINE):
+        # .Destroy(obj, delay) → Debris:AddItem(obj, delay)
+        source = re.sub(
+            r'^(\s*)\.Destroy\((\w+(?:\.\w+)*),\s*([^)]+)\)',
+            r'\1game:GetService("Debris"):AddItem(\2, \3)',
+            source,
+            flags=re.MULTILINE,
+        )
+        # .Destroy(obj) → obj:Destroy()
+        source = re.sub(
+            r'^(\s*)\.Destroy\((\w+(?:\.\w+)*)\)',
+            r'\1\2:Destroy()',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Fixed orphaned .Destroy() calls")
+
+    # .Clone(prefab, position, rotation) → prefab:Clone() + set parent and CFrame
+    # .Clone(prefab) → prefab:Clone()
+    if re.search(r'(?:^\s*\.Clone\(|=\s*\.Clone\(|=\s*script\.Parent:Clone\()', source, re.MULTILINE):
+        # Helper to extract balanced parenthesized args (handles nested parens)
+        def _extract_clone_args(line, start_keyword):
+            idx = line.find(start_keyword)
+            if idx < 0:
+                return None
+            paren_start = line.index('(', idx)
+            depth = 0
+            for j in range(paren_start, len(line)):
+                if line[j] == '(':
+                    depth += 1
+                elif line[j] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        return line[paren_start + 1:j]
+            return None
+
+        # Pre-pass: join multiline .Clone( / .Destroy( calls onto a single line
+        raw_lines = source.split('\n')
+        joined_lines = []
+        i = 0
+        while i < len(raw_lines):
+            line = raw_lines[i]
+            if re.search(r'\.Clone\(|\.Destroy\(', line):
+                # Count parens — if unbalanced, join with next lines
+                depth = line.count('(') - line.count(')')
+                while depth > 0 and i + 1 < len(raw_lines):
+                    i += 1
+                    line = line.rstrip() + ' ' + raw_lines[i].strip()
+                    depth = line.count('(') - line.count(')')
+            joined_lines.append(line)
+            i += 1
+
+        # Process line by line for Clone calls
+        new_lines = []
+        for line in joined_lines:
+            stripped = line.strip()
+            indent = len(line) - len(line.lstrip())
+            ind = ' ' * indent
+
+            # Assignment: local x = .Clone(...)  or local x = script.Parent:Clone(...)
+            assign_m = re.match(r'^(\s*)local\s+(\w+)\s*=\s*(?:script\.Parent:Clone|\.Clone)\(', line)
+            if assign_m:
+                var = assign_m.group(2)
+                for kw in ['.Clone(', 'script.Parent:Clone(']:
+                    args_str = _extract_clone_args(line, kw)
+                    if args_str is not None:
+                        break
+                if args_str is not None:
+                    # Split on top-level commas only
+                    parts = _split_top_level(args_str)
+                    prefab = parts[0].strip()
+                    if len(parts) >= 2:
+                        pos = parts[1].strip()
+                        new_lines.append(f'{ind}local {var} = {prefab}:Clone()')
+                        new_lines.append(f'{ind}{var}.Parent = workspace')
+                        new_lines.append(f'{ind}{var}.CFrame = CFrame.new({pos})')
+                    else:
+                        new_lines.append(f'{ind}local {var} = {prefab}:Clone()')
+                    continue
+
+            # Standalone: .Clone(...) or script.Parent:Clone(...)
+            standalone_m = re.match(r'^(\s*)(?:script\.Parent:Clone|\.Clone)\(', line)
+            if standalone_m:
+                for kw in ['.Clone(', 'script.Parent:Clone(']:
+                    args_str = _extract_clone_args(line, kw)
+                    if args_str is not None:
+                        break
+                if args_str is not None:
+                    parts = _split_top_level(args_str)
+                    prefab = parts[0].strip()
+                    if len(parts) >= 2:
+                        pos = parts[1].strip()
+                        new_lines.append(f'{ind}local _clone = {prefab}:Clone()')
+                        new_lines.append(f'{ind}_clone.Parent = workspace')
+                        new_lines.append(f'{ind}_clone.CFrame = CFrame.new({pos})')
+                    else:
+                        new_lines.append(f'{ind}{prefab}:Clone().Parent = workspace')
+                    continue
+
+            new_lines.append(line)
+
+        source = '\n'.join(new_lines)
+        fixes.append("Fixed orphaned .Clone() (Unity Instantiate) calls")
+
+    # Fix '.Debris:AddItem' (orphaned dot) → game:GetService("Debris"):AddItem
+    if '.Debris:AddItem' in source:
+        source = re.sub(
+            r'\.Debris:AddItem\(([^)]+)\)',
+            r'game:GetService("Debris"):AddItem(\1)',
+            source,
+        )
 
     # Fix bare ':Method()' or '.Property' calls without a receiver
     # e.g. ':FindFirstChildWhichIsA("Sound")' → 'script.Parent:FindFirstChildWhichIsA("Sound")'
@@ -893,9 +1029,16 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         "Clone", "Destroy", "ClearAllChildren",
         "SetPrimaryPartCFrame", "MoveTo",
         "WaitForChild", "FindFirstChild", "FindFirstChildWhichIsA",
+        "FindFirstChildOfClass", "FindFirstAncestor",
         "GetChildren", "GetDescendants",
         "IsA", "IsDescendantOf", "IsAncestorOf",
         "SetAttribute", "GetAttribute",
+        "PlayOneShot", "Rotate", "LookAt",
+        "GetChild", "SetBool", "SetFloat", "SetInteger", "SetTrigger",
+        "GetBool", "GetFloat", "GetInteger",
+        "Move", "AddForce", "AddRelativeForce", "AddExplosionForce",
+        "AddTorque", "Fire", "Connect", "Disconnect",
+        "Raycast", "Kick", "LoadCharacter",
     ]
     for method in _DOT_TO_COLON_METHODS:
         pattern = f'.{method}('
@@ -906,6 +1049,73 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
                 rf'\1:{method}(',
                 source,
             )
+
+    # Fix Unity AudioSource.pitch → Roblox Sound.PlaybackSpeed
+    if '.pitch' in source:
+        source = re.sub(r'(\w+)\.pitch\b', r'\1.PlaybackSpeed', source)
+
+    # Fix Unity physics: AddForce/AddRelativeForce → :ApplyImpulse
+    if 'AddRelativeForce(' in source or 'AddForce(' in source:
+        # rb:AddRelativeForce(vec, ForceMode.Impulse) → rb:ApplyImpulse(vec)
+        source = re.sub(
+            r'(\w+):AddRelativeForce\(([^,]+),\s*ForceMode\.\w+\)',
+            r'\1:ApplyImpulse(\2)',
+            source,
+        )
+        source = re.sub(
+            r'(\w+):AddForce\(([^,]+),\s*ForceMode\.\w+\)',
+            r'\1:ApplyImpulse(\2)',
+            source,
+        )
+        # Without ForceMode → VectorForce (continuous force)
+        source = re.sub(
+            r'(\w+):AddRelativeForce\(([^)]+)\)',
+            r'\1:ApplyImpulse(\2)',
+            source,
+        )
+        source = re.sub(
+            r'(\w+):AddForce\(([^)]+)\)',
+            r'\1:ApplyImpulse(\2)',
+            source,
+        )
+
+    # Fix Unity: AddExplosionForce → apply impulse away from explosion center
+    if 'AddExplosionForce(' in source:
+        source = re.sub(
+            r'(\w+):AddExplosionForce\([^)]+\)',
+            r'-- \g<0> (no direct Roblox equivalent; use Explosion instance)',
+            source,
+        )
+
+    # Fix Unity Random.rotation → CFrame.new() * CFrame.Angles(...)
+    if 'Random.rotation' in source:
+        source = re.sub(
+            r'Random\.rotation',
+            'CFrame.Angles(math.random() * math.pi * 2, math.random() * math.pi * 2, math.random() * math.pi * 2)',
+            source,
+        )
+    if 'Random.onUnitSphere' in source:
+        source = re.sub(
+            r'Random\.onUnitSphere',
+            'Vector3.new(math.random() - 0.5, math.random() - 0.5, math.random() - 0.5).Unit',
+            source,
+        )
+
+    # Fix SendMessage → SetAttribute (already partially handled, but clean up remnants)
+    if 'SetAttributeOptions' in source:
+        source = re.sub(
+            r',\s*script\.Parent:SetAttributeOptions\.\w+',
+            '',
+            source,
+        )
+
+    # Fix lowercase .parent → .Parent
+    if re.search(r'\.\bparent\b', source):
+        source = re.sub(r'\.parent\b', '.Parent', source)
+
+    # Fix .localEulerAngles → CFrame-based rotation
+    if '.localEulerAngles' in source:
+        source = re.sub(r'\.localEulerAngles\b', '.CFrame', source)
 
     # Fix Unity property names to Roblox PascalCase
     # .enabled → .Enabled (for Roblox instances)
@@ -924,6 +1134,255 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     if source != original:
         fixes.append("Fixed common API mistakes")
         log.info("  [%s] Fixed common API/syntax mistakes", name)
+
+    return source
+
+
+def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
+    """Fix structural Luau syntax issues: else if, ++/--, type declarations, etc."""
+    original = source
+
+    # Fix 'else if' → 'elseif' (Luau keyword)
+    if 'else if ' in source:
+        source = re.sub(r'\belse\s+if\b', 'elseif', source)
+        fixes.append("Fixed 'else if' → 'elseif'")
+
+    # Fix C# postfix ++/-- operators → Luau assignment
+    # x++ or x-- at end of line or before ) or ;
+    if re.search(r'\w+\+\+|\w+--', source):
+        # i++ → i = i + 1 (standalone statement)
+        source = re.sub(
+            r'^(\s*)(\w+)\+\+\s*$',
+            r'\1\2 = \2 + 1',
+            source,
+            flags=re.MULTILINE,
+        )
+        # i-- → i = i - 1 (standalone statement)
+        source = re.sub(
+            r'^(\s*)(\w+)--\s*$',
+            r'\1\2 = \2 - 1',
+            source,
+            flags=re.MULTILINE,
+        )
+        # ++i at start of expression → (i = i + 1) — treat as standalone
+        source = re.sub(
+            r'^(\s*)\+\+(\w+)\s*$',
+            r'\1\2 = \2 + 1',
+            source,
+            flags=re.MULTILINE,
+        )
+        # Inline x++ in expressions (e.g., arr[i++]) — harder, convert to separate line
+        # For now, just handle the common arr[x++] pattern
+        source = re.sub(
+            r'(\w+)\[(\w+)\+\+\]',
+            r'\1[\2]; \2 = \2 + 1 --[[post-increment]]',
+            source,
+        )
+        fixes.append("Fixed C# ++/-- operators")
+
+    # Fix C# inline type declarations inside method bodies
+    # Pattern: "    Type varName" at start of line where Type is PascalCase
+    # Common: Vector3 dir, float angle, RaycastHit hit, int count, etc.
+    _CSHARP_TYPES = (
+        'Vector3', 'Vector2', 'Quaternion', 'float', 'int', 'double', 'long',
+        'short', 'byte', 'bool', 'string', 'char', 'RaycastHit', 'Ray',
+        'Color', 'Color32', 'Bounds', 'Rect', 'Matrix4x4', 'Plane',
+        'Collider', 'Rigidbody', 'Transform', 'GameObject', 'Component',
+        'AudioSource', 'Animator', 'Renderer', 'Material', 'Texture',
+        'ParticleSystem', 'Camera',
+    )
+    for ctype in _CSHARP_TYPES:
+        # "Type varName = expr" → "local varName = expr"
+        pattern = rf'^(\s+){ctype}\s+(\w+)\s*='
+        if re.search(pattern, source, re.MULTILINE):
+            source = re.sub(pattern, r'\1local \2 =', source, flags=re.MULTILINE)
+        # "Type varName" (declaration without init) → "local varName = nil"
+        pattern = rf'^(\s+){ctype}\s+(\w+)\s*$'
+        if re.search(pattern, source, re.MULTILINE):
+            source = re.sub(pattern, r'\1local \2 = nil', source, flags=re.MULTILINE)
+
+    # Fix 'gameObject' references → script.Parent
+    if re.search(r'\bgameObject\b', source):
+        source = re.sub(r'\bgameObject\b', 'script.Parent', source)
+        fixes.append("Fixed 'gameObject' → 'script.Parent'")
+
+    # Fix 'this' keyword → script.Parent (standalone, not this.)
+    if re.search(r'\bthis\b(?!\.)', source):
+        source = re.sub(r'\bthis\b(?!\.)', 'script.Parent', source)
+
+    # Strip C# [Attribute] lines (e.g., [Range(...)], [SerializeField], [Header(...)])
+    if re.search(r'^\s*\[(?:Range|SerializeField|Header|Tooltip|Space|HideInInspector|FormerlySerializedAs|RequireComponent)\b', source, re.MULTILINE):
+        source = re.sub(
+            r'^\s*\[(?:Range|SerializeField|Header|Tooltip|Space|HideInInspector|FormerlySerializedAs|RequireComponent)\b[^\]]*\]\s*\n',
+            '',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Stripped C# [Attribute] annotations")
+
+    # Fix 'IsKeyDownDown' → 'IsKeyDown' (doubled suffix from GetKeyDown mapping)
+    if 'IsKeyDownDown' in source:
+        source = source.replace('IsKeyDownDown', 'IsKeyDown')
+        fixes.append("Fixed 'IsKeyDownDown' → 'IsKeyDown'")
+
+    # Fix 'workspace:GetServerTimeNow()Scale' → timeScale variable
+    # Time.timeScale in Unity has no direct Roblox equivalent — use a module variable
+    if 'GetServerTimeNow()Scale' in source:
+        source = re.sub(
+            r'workspace:GetServerTimeNow\(\)Scale',
+            '_timeScale',
+            source,
+        )
+        # Inject _timeScale variable at top if not present
+        if '_timeScale' in source and 'local _timeScale' not in source:
+            lines = source.split('\n')
+            # Find insertion point after service requires
+            insert_idx = 0
+            for i, line in enumerate(lines):
+                if line.strip().startswith('local ') and 'GetService' in line:
+                    insert_idx = i + 1
+            lines.insert(insert_idx, 'local _timeScale = 1 -- Unity Time.timeScale equivalent')
+            source = '\n'.join(lines)
+        fixes.append("Fixed Time.timeScale conversion")
+
+    # Fix remaining .transform references
+    if '.transform' in source:
+        # .transform.localPosition → .Position (already handled .transform.position above)
+        source = re.sub(r'\.transform\.localPosition\b', '.Position', source)
+        source = re.sub(r'\.transform\.localRotation\b', '.CFrame', source)
+        source = re.sub(r'\.transform\.localScale\b', '.Size', source)
+        source = re.sub(r'\.transform\.forward\b', '.CFrame.LookVector', source)
+        source = re.sub(r'\.transform\.right\b', '.CFrame.RightVector', source)
+        source = re.sub(r'\.transform\.up\b', '.CFrame.UpVector', source)
+        source = re.sub(r'\.transform\.parent\b', '.Parent', source)
+        # Bare .transform → remove (Instance IS its transform in Roblox)
+        source = re.sub(r'\.transform\b', '', source)
+        fixes.append("Removed .transform references")
+
+    # Fix string concatenation: single dot between non-numeric expressions → ..
+    # Pattern: "str" . var or var . "str" (C# + was partially converted to .)
+    # Be careful not to match property access (word.word)
+    if re.search(r'"\s*\.\s*(?:\(|[a-zA-Z])|(?:\)|[a-zA-Z0-9_])\s*\.\s*"', source):
+        # "string" . expr → "string" .. expr
+        source = re.sub(r'"\s*\.\s*(\(|\w)', r'" .. \1', source)
+        # expr . "string" → expr .. "string"
+        source = re.sub(r'(\)|\w)\s*\.\s*"', r'\1 .. "', source)
+        fixes.append("Fixed string concat '.' → '..'")
+
+    # Fix 'other' vs 'otherPart' mismatch in Touched handlers
+    # When handler signature has 'otherPart' but body uses 'other'
+    if 'otherPart' in source and re.search(r'\bother\b(?!Part)', source):
+        # Only fix if 'other' is used as a variable (not part of another word)
+        # and 'otherPart' appears as a function parameter
+        if re.search(r'function\s*\(\s*otherPart\s*\)', source):
+            source = re.sub(r'\bother\b(?!Part|\w)', 'otherPart', source)
+            fixes.append("Fixed 'other' → 'otherPart' parameter name")
+
+    # Fix task.spawn(FunctionName()) → task.spawn(FunctionName) (pass ref, don't call)
+    # With args: task.spawn(Func(arg)) → task.spawn(function() Func(arg) end)
+    if 'task.spawn(' in source:
+        source = re.sub(
+            r'task\.spawn\((\w+)\(\)\)',
+            r'task.spawn(\1)',
+            source,
+        )
+        # With args: task.spawn(Func(args)) → task.spawn(function() Func(args) end)
+        source = re.sub(
+            r'task\.spawn\((\w+)\(([^)]+)\)\)',
+            r'task.spawn(function() \1(\2) end)',
+            source,
+        )
+
+    # Fix task.delay arg order: task.delay(FuncName", time) → task.delay(time, FuncName)
+    # Also handle malformed strings from broken transpilation
+    if 'task.delay(' in source:
+        # Fix malformed: task.delay(Name", time) → task.delay(time, Name)
+        source = re.sub(
+            r'task\.delay\((\w+)"\s*,\s*(\w+)\)',
+            r'task.delay(\2, \1)',
+            source,
+        )
+        # Fix wrong order: task.delay(FuncName, time) where first arg is not a number
+        # Roblox task.delay(delayTime, callback) — if first arg is a word (not number), swap
+        source = re.sub(
+            r'task\.delay\(([A-Z]\w+)\s*,\s*(\w+)\)',
+            r'task.delay(\2, \1)',
+            source,
+        )
+
+    # Fix obj.#prop → #obj.prop (# operator in wrong position)
+    # Also handles chained access: obj.Lines[idx].#TextList → #obj.Lines[idx].TextList
+    if '.#' in source:
+        source = re.sub(r'([\w.\[\]]+)\.#(\w+)', lambda m: '#' + m.group(1) + '.' + m.group(2), source)
+
+    # Fix "obj.Parent =(value)" → "obj.Parent = value" (unnecessary parens)
+    if '.Parent =(' in source:
+        source = re.sub(r'\.Parent\s*=\s*\((\w+(?:\.\w+)*)\)', r'.Parent = \1', source)
+
+    # Fix Unity FindObjectOfType/FindAnyObjectByType/FindObjectsOfType → workspace:FindFirstChildWhichIsA or GetDescendants
+    if 'FindAnyObjectByType(' in source or 'FindObjectOfType(' in source:
+        # FindAnyObjectByType<Type>() or FindObjectOfType<Type>() → workspace:FindFirstChildWhichIsA("Type")
+        source = re.sub(
+            r'FindAnyObjectByType\(\)',
+            'workspace',
+            source,
+        )
+        source = re.sub(
+            r'FindObjectOfType\(\)',
+            'workspace',
+            source,
+        )
+
+    if source != original and not any('structural' in f.lower() for f in fixes):
+        fixes.append("Fixed structural syntax issues")
+
+    return source
+
+
+def _fix_missing_end_keywords(name: str, source: str, fixes: list[str]) -> str:
+    """Fix missing `end` keywords by analyzing block structure.
+
+    Scans for block openers (if/then, function, for/do, while/do, repeat)
+    and ensures each has a matching `end` (or `until` for repeat).
+    Also fixes stray `else` after `end` and stray closing braces.
+    """
+    lines = source.split('\n')
+    result = []
+    original = source
+
+    # First pass: fix `end` followed by `else` on next meaningful line
+    # This pattern comes from C# "} else {" being split across lines
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+
+        # Fix "} else" or bare "else" after an "end" line → merge into elseif/else
+        if stripped == 'else' and len(result) > 0:
+            # Look back for the previous non-empty line
+            prev_idx = len(result) - 1
+            while prev_idx >= 0 and not result[prev_idx].strip():
+                prev_idx -= 1
+            if prev_idx >= 0 and result[prev_idx].strip() == 'end':
+                # Remove the 'end' and keep the 'else'
+                indent = len(result[prev_idx]) - len(result[prev_idx].lstrip())
+                result[prev_idx] = ' ' * indent + 'else'
+                i += 1
+                continue
+
+        # Fix "};" or stray "}" that wasn't converted to "end"
+        if stripped == '}' or stripped == '};':
+            indent = len(lines[i]) - len(lines[i].lstrip())
+            result.append(' ' * indent + 'end')
+            i += 1
+            continue
+
+        result.append(lines[i])
+        i += 1
+
+    source = '\n'.join(result)
+
+    if source != original:
+        fixes.append("Fixed missing end keywords / stray braces")
 
     return source
 

@@ -372,6 +372,187 @@ class TestLuauValidatorCSharpRemnants:
         assert ":Fire(" in fixed
 
 
+class TestValidatorStructuralFixes:
+    """Test structural syntax fixes: else if, ++/--, type decls, etc."""
+
+    def test_else_if_to_elseif(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'if x then\n    print(1)\nelse if y then\n    print(2)\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'elseif y then' in fixed
+        assert 'else if' not in fixed
+
+    def test_postfix_increment(self):
+        from converter.luau_validator import validate_and_fix
+        source = '    count++\n'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'count = count + 1' in fixed
+        assert '++' not in fixed
+
+    def test_postfix_decrement(self):
+        from converter.luau_validator import validate_and_fix
+        source = '    health--\n'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'health = health - 1' in fixed
+
+    def test_csharp_type_declaration_with_init(self):
+        from converter.luau_validator import validate_and_fix
+        source = '    Vector3 dir = target - origin'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'local dir = target - origin' in fixed
+        assert 'Vector3' not in fixed
+
+    def test_csharp_type_declaration_bare(self):
+        from converter.luau_validator import validate_and_fix
+        source = '    RaycastHit hit'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'local hit = nil' in fixed
+
+    def test_gameobject_to_script_parent(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'gameObject:Destroy()'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'script.Parent' in fixed
+
+    def test_this_to_script_parent(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'print(this)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'script.Parent' in fixed
+
+    def test_iskeydowndown_fix(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'UserInputService:IsKeyDownDown(Enum.KeyCode.W)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'IsKeyDown' in fixed
+        assert 'IsKeyDownDown' not in fixed
+
+    def test_timescale_fix(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'workspace:GetServerTimeNow()Scale = 0'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'GetServerTimeNow()Scale' not in fixed
+        assert '_timeScale' in fixed
+
+    def test_transform_removal(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local pos = obj.transform.position\nlocal fwd = obj.transform.forward'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.transform' not in fixed
+        assert '.Position' in fixed
+
+    def test_attribute_stripping(self):
+        from converter.luau_validator import validate_and_fix
+        source = '    [Range(-45, -15)]\n    local angle = 0'
+        fixed, _ = validate_and_fix("test", source)
+        assert '[Range' not in fixed
+        assert 'local angle = 0' in fixed
+
+    def test_orphaned_destroy_simple(self):
+        from converter.luau_validator import validate_and_fix
+        source = '    .Destroy(obj)\n'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'obj:Destroy()' in fixed
+
+    def test_orphaned_destroy_with_delay(self):
+        from converter.luau_validator import validate_and_fix
+        source = '    .Destroy(obj, 0.5)\n'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'Debris' in fixed
+        assert 'AddItem' in fixed
+
+    def test_orphaned_clone_with_position(self):
+        from converter.luau_validator import validate_and_fix
+        source = '    .Clone(prefab, pos, CFrame.new())\n'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'prefab:Clone()' in fixed
+        assert '.Parent = workspace' in fixed
+        assert 'CFrame.new(pos)' in fixed
+
+    def test_orphaned_clone_multiline(self):
+        from converter.luau_validator import validate_and_fix
+        source = '    .Clone(explosionPrefab, col.contacts[0].point,\n                CFrame.lookAt(col.contacts[0].normal))\n'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'explosionPrefab:Clone()' in fixed
+
+    def test_pitch_to_playbackspeed(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'source.pitch = math.random(0.8, 1.2)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'PlaybackSpeed' in fixed
+        assert '.pitch' not in fixed
+
+    def test_addforce_to_applyimpulse(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'rb:AddRelativeForce(Vector3.zAxis * force, ForceMode.Impulse)'
+        fixed, _ = validate_and_fix("test", source)
+        assert ':ApplyImpulse(' in fixed
+        assert 'ForceMode' not in fixed
+
+    def test_random_rotation(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local rot = Random.rotation'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'CFrame.Angles' in fixed
+
+    def test_stray_brace_to_end(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'if x then\n    print(1)\n}'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'end' in fixed
+        assert '}' not in fixed
+
+    def test_end_else_merge(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'if x then\n    print(1)\nend\nelse\n    print(2)\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'end\nelse' not in fixed
+        assert 'else\n' in fixed
+
+    def test_other_to_otherpart(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'function(otherPart)\n    if other.tag == "Player" then\n    end\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'otherPart.tag' in fixed
+
+    def test_dot_to_colon_playoneshot(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'source.PlayOneShot(clip)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'source:PlayOneShot(clip)' in fixed
+
+    def test_lowercase_parent_fix(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'fire.parent = workspace'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.Parent' in fixed
+
+    def test_task_spawn_no_call(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'task.spawn(DefaultUpdate())'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'task.spawn(DefaultUpdate)' in fixed
+
+    def test_task_spawn_with_args_wraps_closure(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'task.spawn(EngagedUpdate(hit))'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'function()' in fixed
+        assert 'EngagedUpdate(hit)' in fixed
+
+    def test_task_delay_arg_order(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'task.delay(Explode", explodeTime)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'task.delay(explodeTime, Explode)' in fixed
+
+    def test_hash_operator_fix(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'if col.#contacts > 0 then\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert '#col.contacts' in fixed
+
+
 class TestNewTranspilerFeatures:
     """Tests for newly added transpiler features."""
 
