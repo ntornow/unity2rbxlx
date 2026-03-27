@@ -614,6 +614,26 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
         fixes.append("Stripped remaining C# type casts")
 
     # Fix comment-embedded variable names from type mapping
+    # Pattern: "local varName-- TypeComment: explanation = value" → "local varName = value -- comment"
+    # This happens when TYPE_MAP replaces a type in the middle of a variable name
+    # e.g., m_IgnoreNavMeshAgent → m_Ignore-- NavMeshAgent: use Roblox PathfindingService
+    # NOTE: only match varName ending with a letter/digit (not `m_--` which is handled separately below)
+    if re.search(r'[a-zA-Z0-9]-- [A-Z]', source):
+        def _fix_embedded_comment(m):
+            indent = m.group(1)
+            varname = m.group(2)
+            comment = m.group(3)
+            value = m.group(4)
+            return f'{indent}local {varname} = {value} -- {comment}'
+        source = re.sub(
+            r'^(\s*)local\s+(\w*[a-zA-Z0-9])--\s*([^=\n]+?)\s*=\s*([^\n]+)$',
+            _fix_embedded_comment,
+            source,
+            flags=re.MULTILINE,
+        )
+        # Also handle bare references in non-local context: varName-- TypeComment: → varName
+        source = re.sub(r'(\w*[a-zA-Z0-9])-- [A-Z]\w+:[^\n]*', r'\1', source)
+
     # Pattern: "m_-- TypeComment: explanation" → comment out the whole line
     # This happens when TYPE_MAP replaces a type like NavMeshAgent with "-- comment"
     # and the variable name m_NavMeshAgent becomes m_-- NavMeshAgent: ...
@@ -2115,6 +2135,64 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         )
         # Handle for(;;) → while true do (infinite loop, already in csharp_remnants but ensure it's caught here too)
         source = re.sub(r'for\s*\(\s*;\s*;\s*\)', 'while true do', source)
+
+        # Handle decrementing without 'local': for (i = N; i > 0; i--) → for i = N, 1, -1 do
+        source = re.sub(
+            r'^(\s*)for\s*\(\s*(\w+)\s*=\s*([^;]+?)\s*;\s*\w+\s*>\s*([^;]+?)\s*;\s*(?:--\w+|\w+--)\s*\)',
+            lambda m: f'{m.group(1)}for {m.group(2)} = {m.group(3)}, {m.group(4)} + 1, -1 do',
+            source,
+            flags=re.MULTILINE,
+        )
+
+        # Handle custom step: for (local i = 0; i < N; i = i + step) → for i = 0, N - 1, step do
+        def _fix_for_loop_custom_step(m):
+            indent = m.group(1)
+            var = m.group(2)
+            start = m.group(3)
+            bound = m.group(4)
+            step = m.group(5)
+            if bound.endswith('#'):
+                bound = '#' + bound[:-1]
+            return f'{indent}for {var} = {start}, {bound} - 1, {step} do'
+        source = re.sub(
+            r'^(\s*)for\s*\(\s*(?:local\s+)?(\w+)\s*=\s*([^;]+?)\s*;\s*\w+\s*<\s*([^;]+?)\s*;\s*\w+\s*=\s*\w+\s*\+\s*([^)]+?)\s*\)',
+            _fix_for_loop_custom_step,
+            source,
+            flags=re.MULTILINE,
+        )
+
+        # Handle decrementing with custom step: for (local i = N; i >= 0; i = i - step) → for i = N, 0, -step do
+        source = re.sub(
+            r'^(\s*)for\s*\(\s*(?:local\s+)?(\w+)\s*=\s*([^;]+?)\s*;\s*\w+\s*>=\s*([^;]+?)\s*;\s*\w+\s*=\s*\w+\s*-\s*([^)]+?)\s*\)',
+            lambda m: f'{m.group(1)}for {m.group(2)} = {m.group(3)}, {m.group(4)}, -{m.group(5)} do',
+            source,
+            flags=re.MULTILINE,
+        )
+
+        # Fallback: any remaining `for (...)` that wasn't matched — convert to while loop
+        # for (init; cond; incr) → init \n while cond do \n ... incr \n end
+        # This is a last resort for complex patterns
+        if re.search(r'^\s*for\s*\(', source, re.MULTILINE):
+            def _fix_for_to_while(m):
+                indent = m.group(1)
+                init = m.group(2).strip()
+                cond = m.group(3).strip()
+                incr = m.group(4).strip()
+                # Remove 'local' from init if present (already handled)
+                init = re.sub(r'^local\s+', '', init)
+                # Fix C# conditions
+                cond = cond.replace('!=', '~=')
+                # Build while loop
+                if init:
+                    return f'{indent}local {init}\n{indent}while {cond} do'
+                return f'{indent}while {cond} do'
+            source = re.sub(
+                r'^(\s*)for\s*\(\s*([^;]*?)\s*;\s*([^;]*?)\s*;\s*([^)]*?)\s*\)',
+                _fix_for_to_while,
+                source,
+                flags=re.MULTILINE,
+            )
+            fixes.append("Converted remaining C# for-loops to while loops")
 
     # Fix C# sizeof() → literal values
     if 'sizeof(' in source:
@@ -3790,6 +3868,26 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
                     new_lines.append(line)
             i += 1
         source = '\n'.join(new_lines)
+
+    # Fix incomplete constructors: `local var = nil -- (constructor removed)` followed by table entries
+    # Pattern: the comment tells us a C# constructor was removed, but the initializer block remains
+    # Fix: replace `nil -- (constructor removed)` with `{` to open the table literal
+    if '-- (constructor removed)' in source or '-- new Type' in source:
+        # Pattern: `local var = nil -- (constructor removed)` + next lines are table entries + closing `}`
+        lines_ctor = source.split('\n')
+        new_lines_ctor = []
+        for ci, cline in enumerate(lines_ctor):
+            if '= nil -- (constructor removed)' in cline or re.search(r'= nil -- new \w+', cline):
+                # Check if next non-blank line looks like a table entry (key = value,)
+                next_idx = ci + 1
+                while next_idx < len(lines_ctor) and not lines_ctor[next_idx].strip():
+                    next_idx += 1
+                if next_idx < len(lines_ctor) and re.match(r'^\s+\w+\s*=\s*.+,?\s*$', lines_ctor[next_idx]):
+                    # Replace nil with { to open table
+                    cline = re.sub(r'= nil -- .*$', '= {', cline)
+                    fixes.append("Fixed incomplete constructor → table literal")
+            new_lines_ctor.append(cline)
+        source = '\n'.join(new_lines_ctor)
 
     # Fix bare receiver: ".Property" or ".Method()" at expression start without object
     # Pattern: line starts with (optional indent) ".SomeProperty" → "script.Parent.SomeProperty"

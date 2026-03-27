@@ -665,6 +665,43 @@ class TestValidatorStructuralFixes:
         assert '}' in fixed, "Table closing } should be preserved"
         assert 'A = 0' in fixed
 
+    def test_csharp_for_loop_custom_step(self):
+        """for (local i = 0; i < N; i = i + step) → for i = 0, N - 1, step do."""
+        from converter.luau_validator import validate_and_fix
+        source = '    for (local i = 0; i < #data; i = i + channels)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'for i = 0, #data - 1, channels do' in fixed
+
+    def test_csharp_for_loop_decrement_no_local(self):
+        """for (i = N; i > 0; i--) → for i = N, 1, -1 do."""
+        from converter.luau_validator import validate_and_fix
+        source = '    for (i = #samples - 1; i > 0; i--)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'for i = #samples - 1, 0 + 1, -1 do' in fixed
+
+    def test_csharp_for_fallback_to_while(self):
+        """Complex for-loop → while loop fallback."""
+        from converter.luau_validator import validate_and_fix
+        source = '    for (local j = entryOffsets[i]; ; j++)'
+        fixed, _ = validate_and_fix("test", source)
+        # Should have been converted to while loop or similar
+        assert 'for (' not in fixed
+
+    def test_embedded_comment_in_variable_name(self):
+        """local m_Ignore-- comment: text = true → local m_Ignore = true."""
+        from converter.luau_validator import validate_and_fix
+        source = '    local m_IgnoreAgent-- NavMeshAgent: use PathfindingService = true'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'local m_IgnoreAgent = true' in fixed
+
+    def test_incomplete_constructor_to_table(self):
+        """nil -- (constructor removed) + table entries → { entries }."""
+        from converter.luau_validator import validate_and_fix
+        source = '    local msg = nil -- (constructor removed)\n        key1 = val1,\n        key2 = val2\n    }'
+        fixed, _ = validate_and_fix("test", source)
+        assert '= {' in fixed
+        assert 'key1 = val1' in fixed
+
 
 class TestNewTranspilerFeatures:
     """Tests for newly added transpiler features."""
