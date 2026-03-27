@@ -3410,29 +3410,58 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     # Fix CFrame.Angles(Vector3) → CFrame.Angles(vec.X, vec.Y, vec.Z)
     # CFrame.Angles takes 3 numbers, not a Vector3
     if 'CFrame.Angles(' in source:
-        def _fix_cframe_angles(m):
-            arg = m.group(1).strip()
-            # If it's already 3 comma-separated args, leave it
-            depth = 0
-            commas = 0
-            for c in arg:
-                if c == '(':
+        def _fix_cframe_angles_in_line(line):
+            idx = line.find('CFrame.Angles(')
+            if idx < 0:
+                return line
+            start = idx + len('CFrame.Angles(')
+            # Find matching closing paren
+            depth = 1
+            pos = start
+            while pos < len(line) and depth > 0:
+                if line[pos] == '(':
                     depth += 1
-                elif c == ')':
+                elif line[pos] == ')':
                     depth -= 1
-                elif c == ',' and depth == 0:
+                pos += 1
+            if depth != 0:
+                return line  # Unbalanced, skip
+            args_str = line[start:pos - 1].strip()
+            # Count commas at top level
+            d = 0
+            commas = 0
+            for c in args_str:
+                if c == '(':
+                    d += 1
+                elif c == ')':
+                    d -= 1
+                elif c == ',' and d == 0:
                     commas += 1
             if commas >= 2:
-                return m.group(0)  # Already has 3+ args
-            if commas == 0 and arg:
-                # Single vector arg: CFrame.Angles(vec) → CFrame.Angles(vec.X, vec.Y, vec.Z)
-                # But only if it looks like a vector expression (not already a number)
-                if re.match(r'^[\d.\-]+$', arg):
-                    return m.group(0)  # It's a single number, leave it
-                return f'CFrame.Angles(math.rad({arg}.X), math.rad({arg}.Y), math.rad({arg}.Z))'
-            return m.group(0)
-        source = re.sub(r'CFrame\.Angles\(([^)]+)\)', _fix_cframe_angles, source)
-        fixes.append("Fixed CFrame.Angles(Vector3) → CFrame.Angles(vec.X, vec.Y, vec.Z)")
+                return line  # Already has 3+ args
+            if commas == 0 and args_str:
+                # Single arg: check if it's a number
+                if re.match(r'^[\d.\-]+$', args_str):
+                    return line
+                # Single vector arg → expand to .X, .Y, .Z
+                replacement = f'CFrame.Angles(math.rad({args_str}.X), math.rad({args_str}.Y), math.rad({args_str}.Z))'
+                return line[:idx] + replacement + line[pos:]
+            return line
+
+        lines = source.split('\n')
+        new_lines = []
+        changed = False
+        for line in lines:
+            if 'CFrame.Angles(' in line and not line.strip().startswith('--'):
+                new_line = _fix_cframe_angles_in_line(line)
+                if new_line != line:
+                    changed = True
+                new_lines.append(new_line)
+            else:
+                new_lines.append(line)
+        if changed:
+            source = '\n'.join(new_lines)
+            fixes.append("Fixed CFrame.Angles(Vector3) → CFrame.Angles(vec.X, vec.Y, vec.Z)")
 
     # Fix uninitialized `dt` in while loops: add `local dt = 0` before loop
     # Pattern: `while ... do ... dt ... dt = task.wait() ... end` where dt is used before assignment
@@ -4618,7 +4647,8 @@ def _append_missing_trailing_ends(source: str, fixes: list[str]) -> str:
         if stripped.startswith('--'):
             continue
         if re.search(r'\bfunction\s*[\w.:(]', stripped):
-            if not (stripped.endswith(' end') or stripped.endswith('\tend')):
+            # Skip single-line functions: function() ... end or function() ... end)
+            if not re.search(r'\bend\)?[,;]?\s*$', stripped):
                 depth += 1
         if re.match(r'(?:if|elseif)\b.+\bthen\s*$', stripped) or (
                 re.search(r'\bthen\s*$', stripped) and not re.match(r'(?:if|elseif)\b', stripped)
@@ -4662,7 +4692,8 @@ def _remove_excess_end_keywords(source: str, fixes: list[str]) -> str:
 
         # Count block openers
         if re.search(r'\bfunction\s*[\w.:(]', stripped):
-            if not (stripped.endswith(' end') or stripped.endswith('\tend')):
+            # Skip single-line functions: function() ... end or function() ... end)
+            if not re.search(r'\bend\)?[,;]?\s*$', stripped):
                 depth += 1
         if re.match(r'(?:if|elseif)\b.+\bthen\s*$', stripped) or (
                 re.search(r'\bthen\s*$', stripped) and not re.match(r'(?:if|elseif)\b', stripped)
@@ -4740,7 +4771,7 @@ def _fix_connect_closures(source: str, fixes: list[str]) -> str:
 
             # Count block openers
             if re.search(r'\bfunction\s*[\w.:(]', stripped):
-                if not (stripped.endswith(' end') or stripped.endswith('\tend')):
+                if not re.search(r'\bend\)?[,;]?\s*$', stripped):
                     depth += 1
             elif re.match(r'(?:if|elseif)\b.+\bthen\s*$', stripped) or (
                     re.search(r'\bthen\s*$', stripped) and not re.match(r'(?:if|elseif)\b', stripped)
