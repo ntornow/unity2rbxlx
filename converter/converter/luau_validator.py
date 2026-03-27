@@ -830,8 +830,10 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         source = re.sub(r'\.transform\.', '.', source)
 
     # Clean up double dots from .gameObject/.transform removal
+    # Only fix word..word (property access), NOT string concatenation (expr .. expr)
     if '..' in source:
-        source = re.sub(r'(?<!\.)\.\.(?!\.)', '.', source)
+        # word..Word (no spaces) → word.Word (property access double-dot)
+        source = re.sub(r'(\w)\.\.([A-Za-z_])', r'\1.\2', source)
 
     # Fix: Animator.StringToHash("Name") → "Name" (Roblox uses strings, not hashes)
     if "StringToHash" in source:
@@ -1353,6 +1355,32 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
             source,
             flags=re.MULTILINE,
         )
+
+    # Fix undefined 'part' receiver → script.Parent in event handlers
+    # 'part' is a common C# variable from GetComponent<Collider>() that doesn't exist in Luau
+    if re.search(r'\bpart\.(Touched|TouchEnded|ChildAdded|ChildRemoved|Changed)\b', source):
+        # Only replace if 'part' is not defined as a local variable
+        if not re.search(r'\blocal\s+part\b', source):
+            source = re.sub(
+                r'\bpart\.(Touched|TouchEnded|ChildAdded|ChildRemoved|Changed)\b',
+                r'script.Parent.\1',
+                source,
+            )
+            fixes.append("Fixed undefined 'part' → 'script.Parent' in event handlers")
+
+    # Fix comparison operator followed by unnecessary parens: ==("value") → == "value"
+    if re.search(r'(==|~=)\s*\(("[^"]*")\)', source):
+        source = re.sub(r'(==|~=)\s*\(("[^"]*")\)', r'\1 \2', source)
+        fixes.append("Fixed operator parens: ==('value') → == 'value'")
+
+    # Fix .Exists(predicate) → table.find pattern
+    if '.Exists(' in source:
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.Exists\(([^)]+)\)',
+            r'(table.find(\1, \2) ~= nil)',
+            source,
+        )
+        fixes.append("Fixed .Exists() → table.find()")
 
     # Fix "obj.Parent =(value)" → "obj.Parent = value" (unnecessary parens)
     if '.Parent =(' in source:

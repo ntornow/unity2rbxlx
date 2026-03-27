@@ -1,4 +1,4 @@
-"""Tests for component_converter.py -- collider, light, audio, rigidbody conversion."""
+"""Tests for component_converter.py -- collider, light, audio, rigidbody, joint, trail, video conversion."""
 
 import pytest
 from converter.component_converter import (
@@ -6,6 +6,13 @@ from converter.component_converter import (
     convert_light,
     convert_audio,
     convert_rigidbody,
+    convert_joint,
+    convert_trail_renderer,
+    convert_line_renderer,
+    convert_video_player,
+    convert_reverb_zone,
+    convert_reverb_filter,
+    convert_particle_system,
 )
 
 
@@ -218,3 +225,224 @@ class TestRigidbody:
         props = {"m_IsKinematic": 0}
         anchored, can_collide = convert_rigidbody(props)
         assert anchored is False
+
+
+class TestAudioConversion:
+    """Tests for AudioSource → RbxSound conversion."""
+
+    def test_default_audio(self):
+        """Default properties should produce a valid RbxSound."""
+        props = {}
+        sound = convert_audio(props)
+        assert sound is not None
+        assert sound.volume == 1.0
+        assert sound.playback_speed == 1.0
+        assert sound.looped is False
+        assert sound.playing is True  # PlayOnAwake defaults to 1
+
+    def test_volume_clamp(self):
+        """Volume should clamp to [0, 10]."""
+        props = {"m_Volume": 15.0}
+        sound = convert_audio(props)
+        assert sound.volume == 10.0
+
+    def test_pitch_to_playback_speed(self):
+        props = {"m_Pitch": 2.5}
+        sound = convert_audio(props)
+        assert sound.playback_speed == 2.5
+
+    def test_loop_and_play_on_awake(self):
+        props = {"m_Loop": 1, "m_PlayOnAwake": 0}
+        sound = convert_audio(props)
+        assert sound.looped is True
+        assert sound.playing is False
+
+    def test_rolloff_distances(self):
+        props = {"m_MinDistance": 5.0, "m_MaxDistance": 100.0}
+        sound = convert_audio(props)
+        assert sound.roll_off_min_distance == 5.0
+        assert sound.roll_off_max_distance == 100.0
+
+
+class TestJointConversion:
+    """Tests for Unity joint → RbxConstraint conversion."""
+
+    def test_fixed_joint(self):
+        props = {}
+        constraint = convert_joint("FixedJoint", props)
+        assert constraint is not None
+        assert constraint.constraint_type == "WeldConstraint"
+
+    def test_hinge_joint_with_limits(self):
+        props = {
+            "m_UseLimits": 1,
+            "m_Limits": {"min": -30.0, "max": 60.0},
+        }
+        constraint = convert_joint("HingeJoint", props)
+        assert constraint is not None
+        assert constraint.constraint_type == "HingeConstraint"
+        assert constraint.limits_enabled is True
+        assert constraint.lower_angle == -30.0
+        assert constraint.upper_angle == 60.0
+
+    def test_spring_joint(self):
+        props = {"m_Spring": 100.0, "m_Damper": 10.0, "m_MaxDistance": 5.0}
+        constraint = convert_joint("SpringJoint", props)
+        assert constraint is not None
+        assert constraint.constraint_type == "SpringConstraint"
+        assert constraint.stiffness == 100.0
+        assert constraint.damping == 10.0
+
+    def test_character_joint(self):
+        props = {"m_TwistLimitSpring": {"limit": 90.0}}
+        constraint = convert_joint("CharacterJoint", props)
+        assert constraint is not None
+        assert constraint.constraint_type == "BallSocketConstraint"
+        assert constraint.twist_limits_enabled is True
+
+    def test_connected_body_reference(self):
+        props = {"m_ConnectedBody": {"fileID": 12345}}
+        constraint = convert_joint("FixedJoint", props)
+        assert constraint.connected_body_file_id == "12345"
+
+    def test_unknown_joint_returns_none(self):
+        constraint = convert_joint("UnknownJoint", {})
+        assert constraint is None
+
+
+class TestTrailRendererConversion:
+    """Tests for TrailRenderer → RbxTrail conversion."""
+
+    def test_default_trail(self):
+        props = {}
+        trail = convert_trail_renderer(props)
+        assert trail is not None
+        assert trail.lifetime == 2.0
+
+    def test_trail_with_properties(self):
+        props = {"m_Time": 5.0, "m_MinVertexDistance": 0.5}
+        trail = convert_trail_renderer(props)
+        assert trail.lifetime == 5.0
+        assert trail.min_length == 0.5
+
+    def test_trail_color_extraction(self):
+        props = {
+            "m_Colors": {
+                "color0": {"r": 1.0, "g": 0.0, "b": 0.0, "a": 0.8}
+            }
+        }
+        trail = convert_trail_renderer(props)
+        assert trail.color == (1.0, 0.0, 0.0)
+        assert abs(trail.transparency - 0.2) < 0.01
+
+
+class TestLineRendererConversion:
+    """Tests for LineRenderer → RbxBeam conversion."""
+
+    def test_default_beam(self):
+        props = {}
+        beam = convert_line_renderer(props)
+        assert beam is not None
+        assert beam.segments >= 1
+
+    def test_beam_widths(self):
+        props = {"m_Parameters": {"m_StartWidth": 2.0, "m_EndWidth": 0.5}}
+        beam = convert_line_renderer(props)
+        assert beam.width0 == 2.0
+        assert beam.width1 == 0.5
+
+    def test_beam_color(self):
+        props = {
+            "m_Parameters": {
+                "m_StartColor": {"r": 0.0, "g": 1.0, "b": 0.0, "a": 1.0}
+            }
+        }
+        beam = convert_line_renderer(props)
+        assert beam.color == (0.0, 1.0, 0.0)
+
+
+class TestVideoPlayerConversion:
+    """Tests for VideoPlayer → RbxVideoFrame conversion."""
+
+    def test_default_video(self):
+        props = {}
+        video = convert_video_player(props)
+        assert video is not None
+        assert video.playing is True  # PlayOnAwake=1 default
+
+    def test_video_with_url(self):
+        props = {"m_Url": "http://example.com/video.mp4", "m_Looping": 1}
+        video = convert_video_player(props)
+        assert video.video == "http://example.com/video.mp4"
+        assert video.looped is True
+
+    def test_video_volume_list(self):
+        props = {"m_DirectAudioVolume": [0.8]}
+        video = convert_video_player(props)
+        assert video.volume == 0.8
+
+    def test_video_volume_clamp(self):
+        props = {"m_DirectAudioVolume": 15.0}
+        video = convert_video_player(props)
+        assert video.volume == 10.0
+
+
+class TestReverbConversion:
+    """Tests for AudioReverbZone/Filter → RbxReverbSoundEffect conversion."""
+
+    def test_reverb_zone_basic(self):
+        props = {"m_ReverbPreset": 1, "m_MinDistance": 5.0, "m_MaxDistance": 10.0}
+        reverb = convert_reverb_zone(props)
+        assert reverb is not None
+        assert reverb.min_distance > 0
+
+    def test_reverb_zone_off_preset(self):
+        props = {"m_ReverbPreset": 27}
+        reverb = convert_reverb_zone(props)
+        assert reverb is None
+
+    def test_reverb_filter_custom_preset(self):
+        props = {
+            "m_ReverbPreset": 26,
+            "m_DecayTime": 3.0,
+            "m_Density": 0.8,
+            "m_Diffusion": 0.5,
+        }
+        reverb = convert_reverb_filter(props)
+        assert reverb is not None
+        assert reverb.decay_time == 3.0
+        assert reverb.density == 0.8
+        assert reverb.diffusion == 0.5
+
+    def test_reverb_filter_off_preset(self):
+        props = {"m_ReverbPreset": 27}
+        reverb = convert_reverb_filter(props)
+        assert reverb is None
+
+
+class TestParticleSystemConversion:
+    """Tests for ParticleSystem → RbxParticleEmitter conversion."""
+
+    def test_default_particle(self):
+        props = {}
+        particle = convert_particle_system(props)
+        assert particle is not None
+
+    def test_particle_lifetime(self):
+        props = {
+            "startLifetime": {"minMaxState": 0, "scalar": 3.0},
+        }
+        particle = convert_particle_system(props)
+        assert particle is not None
+        assert particle.lifetime_max == 3.0
+
+    def test_particle_emission_rate(self):
+        props = {
+            "EmissionModule": {
+                "enabled": 1,
+                "rateOverTime": {"scalar": 50.0},
+            }
+        }
+        particle = convert_particle_system(props)
+        assert particle is not None
+        assert particle.rate == 50.0

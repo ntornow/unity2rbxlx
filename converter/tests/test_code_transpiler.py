@@ -553,6 +553,51 @@ class TestValidatorStructuralFixes:
         assert '#col.contacts' in fixed
 
 
+    def test_double_dot_property_access_fix(self):
+        """Double-dot from .gameObject/.transform removal becomes single dot."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local dir = other..Position - tBase.Position'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'other.Position' in fixed
+        assert '..' not in fixed or '"..' in fixed  # no double-dot in property access
+
+    def test_double_dot_preserves_string_concat(self):
+        """String concat .. must NOT be changed to single dot."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local msg = "hello" .. " " .. name'
+        fixed, _ = validate_and_fix("test", source)
+        assert '" .. "' in fixed  # concat preserved
+
+    def test_undefined_part_receiver_touched(self):
+        """Undefined 'part' in Touched handler → script.Parent."""
+        from converter.luau_validator import validate_and_fix
+        source = 'part.Touched:Connect(function(otherPart)\n    print(otherPart)\nend)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'script.Parent.Touched' in fixed
+
+    def test_defined_part_receiver_not_changed(self):
+        """If 'part' is locally defined, don't replace it."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local part = workspace.Door\npart.Touched:Connect(function(otherPart)\n    print(otherPart)\nend)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'part.Touched' in fixed  # should NOT replace
+
+    def test_operator_paren_fix(self):
+        """==("value") → == "value"."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if other:GetAttribute(\'Tag\') ==("Player") then\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert '== "Player"' in fixed
+        assert '==("Player")' not in fixed
+
+    def test_exists_to_table_find(self):
+        """.Exists(pred) → table.find pattern."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if items.Exists(x) then\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'table.find(items, x)' in fixed
+
+
 class TestNewTranspilerFeatures:
     """Tests for newly added transpiler features."""
 
