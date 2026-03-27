@@ -910,8 +910,13 @@ script.Disabled = true
         # (after require injection, reclassification, and all other post-processing)
         scripts_dir = self.output_dir / "scripts"
         for s in self.state.rbx_place.scripts:
+            # Check both direct and animations subdirectory
             luau_path = scripts_dir / f"{s.name}.luau"
-            luau_path.write_text(s.source, encoding="utf-8")
+            anim_path = scripts_dir / "animations" / f"{s.name}.luau"
+            if anim_path.exists():
+                anim_path.write_text(s.source, encoding="utf-8")
+            elif luau_path.exists() or not (scripts_dir / "animations").exists():
+                luau_path.write_text(s.source, encoding="utf-8")
 
         # Write the RBXLX file.
         import config as _cfg_mod
