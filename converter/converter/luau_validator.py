@@ -183,6 +183,18 @@ def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
             r'\1.CFrame = CFrame.lookAt(\1.Position, \2)',
             source,
         )
+    # Second pass: script.Parent:Dot(a, b) may be introduced by bare receiver fixes
+    if 'script.Parent:Dot(' in source:
+        source = re.sub(
+            r'script\.Parent:Dot\((\.[\w.]+),\s*([^)]+)\)',
+            r'script.Parent\1:Dot(\2)',
+            source,
+        )
+        source = re.sub(
+            r'script\.Parent:Dot\((\w+(?:\.\w+)*),\s*([^)]+)\)',
+            r'\1:Dot(\2)',
+            source,
+        )
     source = _fix_startup_race_conditions(name, source, fixes)
     source = _inject_utility_functions(name, source, fixes)
 
@@ -560,6 +572,126 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
     if '()()' in source:
         source = re.sub(r'\(\)\(\)', '()', source)
         fixes.append("Fixed double invocation ()()")
+
+    # Fix :Destroy()(obj) pattern — misplaced receiver
+    if re.search(r':Destroy\(\)\((\w+)', source):
+        source = re.sub(r':Destroy\(\)\((\w+(?:\.\w+)*)\)', r' \1:Destroy()', source)
+        fixes.append("Fixed :Destroy()(obj) → obj:Destroy()")
+
+    # Strip C# float/double/decimal literal suffixes: 1.0F, 2f, 3.5d, 0.1m, 1L, 2UL
+    # Must run BEFORE other numeric processing
+    if re.search(r'\d[fFdDmM]\b', source):
+        source = re.sub(r'(\d)[fFdDmM]\b', r'\1', source)
+        fixes.append("Stripped C# numeric type suffixes (F/f/d/D/m/M)")
+
+    # Fix C# shorthand float literals without leading zero: .02 → 0.02, .5 → 0.5
+    # These come from C# like `.02f` where the `f` suffix is stripped leaving `.02`
+    # The bare receiver fix would otherwise turn these into `script.Parent.02`
+    if re.search(r'(?<=[=\s,(\[+\-*/])\.(\d)', source):
+        source = re.sub(r'(?<=[=\s,(\[+\-*/])\.(\d)', r'0.\1', source)
+        fixes.append("Added leading zero to C# shorthand float literals (.NN → 0.NN)")
+
+    # Fix broken numeric property access: script.Parent.02 → 0.02
+    # These come from C# float literals like 0.02f where the "0." is stripped
+    if re.search(r'script\.Parent\.(\d)', source):
+        source = re.sub(
+            r'script\.Parent\.(\d+)\b',
+            r'0.\1',
+            source,
+        )
+        fixes.append("Fixed broken numeric property access (script.Parent.NN → 0.NN)")
+
+    # Fix C# math methods that don't exist in Luau
+    # math.roundToInt → math.round, math.floorToInt → math.floor, math.ceilToInt → math.ceil
+    if 'ToInt' in source:
+        source = re.sub(r'math\.roundToInt\b', 'math.round', source)
+        source = re.sub(r'math\.floorToInt\b', 'math.floor', source)
+        source = re.sub(r'math\.ceilToInt\b', 'math.ceil', source)
+        fixes.append("Fixed C# math ToInt methods → Luau equivalents")
+
+    # Fix .Sort() with .CompareTo() → table.sort with Luau comparison
+    # Pattern: objectives.Sort((function(A, B) return A.Name.CompareTo(B.Name end))
+    if '.CompareTo(' in source:
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.Sort\(\(function\((\w+),\s*(\w+)\)\s*return\s+\2\.(\w+)\.CompareTo\(\3\.(\w+)\s*end\)\)',
+            r'table.sort(\1, function(\2, \3) return \2.\4 < \3.\5 end)',
+            source,
+        )
+        # Standalone .CompareTo fallback
+        source = re.sub(r'(\w+(?:\.\w+)*)\.CompareTo\(([^)]+)\)', r'((\1 < \2) and -1 or ((\1 == \2) and 0 or 1))', source)
+        fixes.append("Fixed .CompareTo() → Luau comparison")
+
+    # Comment out Unity-only enum references that have no Roblox equivalent
+    _UNITY_ONLY_ENUMS = (
+        'ForceMode', 'AnimatorUpdateMode', 'RigidbodyInterpolation',
+        'QueryTriggerInteraction', 'ForceMode2D', 'CollisionDetectionMode',
+        'RigidbodyConstraints', 'AnimatorCullingMode',
+    )
+    for enum_name in _UNITY_ONLY_ENUMS:
+        if enum_name in source:
+            # If it's a standalone argument like ForceMode.Impulse, remove it
+            source = re.sub(
+                rf',\s*{enum_name}\.\w+\)',
+                ')',
+                source,
+            )
+            # If it's an assignment like m_Rigidbody.interpolation = RigidbodyInterpolation.Interpolate
+            source = re.sub(
+                rf'^(\s*).*=\s*{enum_name}\.\w+\s*$',
+                rf'\1-- [Unity] removed {enum_name} assignment (no Roblox equivalent)',
+                source,
+                flags=re.MULTILINE,
+            )
+            fixes.append(f"Removed Unity-only {enum_name} enum references")
+
+    # Comment out Matrix4x4 operations (no Roblox equivalent)
+    if 'Matrix4x4' in source:
+        source = re.sub(
+            r'^(\s*)(.+Matrix4x4\..+)$',
+            r'\1-- [Unity] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        # Also comment out reflectionMat.mNN assignments (matrix element access)
+        source = re.sub(
+            r'^(\s*)(reflectionMat\.m\d\d\s*=.+)$',
+            r'\1-- [Unity] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out Matrix4x4 operations (no Roblox equivalent)")
+
+    # Fix bare :Dot() without receiver → Vector3 dot product
+    # Pattern: -:Dot(normal, pos) → -normal:Dot(pos)
+    # Also handles :Dot(.CFrame.RightVector, dir) where first arg starts with dot
+    if re.search(r'[^.\w]:Dot\(', source):
+        # First arg may start with dot (bare property from .transform removal)
+        source = re.sub(
+            r'([^.\w]):Dot\((\.[\w.]+),\s*([^)]+)\)',
+            r'\1script.Parent\2:Dot(\3)',
+            source,
+        )
+        source = re.sub(
+            r'([^.\w]):Dot\((\w+(?:\.\w+)*),\s*([^)]+)\)',
+            r'\1\2:Dot(\3)',
+            source,
+        )
+        fixes.append("Fixed bare :Dot() → receiver:Dot()")
+
+    # Fix script.Parent:Dot() → Vector3.new():Dot() pattern
+    # script.Parent:Dot(vec1, vec2) → vec1:Dot(vec2)
+    if 'script.Parent:Dot(' in source:
+        source = re.sub(
+            r'script\.Parent:Dot\((\.[\w.]+),\s*([^)]+)\)',
+            r'script.Parent\1:Dot(\2)',
+            source,
+        )
+        source = re.sub(
+            r'script\.Parent:Dot\((\w+(?:\.\w+)*),\s*([^)]+)\)',
+            r'\1:Dot(\2)',
+            source,
+        )
+        fixes.append("Fixed script.Parent:Dot(a, b) → a:Dot(b)")
 
     # Comment out remaining C# class declarations
     source = re.sub(r'^([^\S\n]*)class\s+\w+.*$', r'\1-- \g<0>', source, flags=re.MULTILINE)
@@ -1112,6 +1244,99 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     if '..' in source:
         # word..Word or ]..Word (no spaces) → word.Word / ].Word (property access double-dot)
         source = re.sub(r'([\w\]\)])\.\.([A-Za-z_])', r'\1.\2', source)
+
+    # Fix Unity Vector3 property names → Roblox equivalents
+    # .normalized → .Unit (Roblox property for unit vector)
+    if '.normalized' in source:
+        source = re.sub(r'\.normalized\b', '.Unit', source)
+        fixes.append("Fixed .normalized → .Unit")
+    # .magnitude → .Magnitude (case fix)
+    if re.search(r'\.magnitude\b(?![\s]*=)', source):
+        source = re.sub(r'\.magnitude\b', '.Magnitude', source)
+        fixes.append("Fixed .magnitude → .Magnitude")
+    # .sqrMagnitude → custom expression (no Roblox equivalent)
+    # obj.sqrMagnitude → obj:Dot(obj) (Vector3:Dot returns dot product, which equals squared magnitude for self)
+    if '.sqrMagnitude' in source:
+        # Standalone: obj.sqrMagnitude → obj:Dot(obj)
+        def _fix_sqr_mag(m):
+            obj = m.group(1)
+            return f'{obj}:Dot({obj})'
+        source = re.sub(r'([\w.]+(?:\([^)]*\))?)\.sqrMagnitude\b', _fix_sqr_mag, source)
+        fixes.append("Fixed .sqrMagnitude → :Dot(self)")
+
+    # Fix .eulerAngles → CFrame:ToEulerAnglesXYZ() approximation
+    if '.eulerAngles' in source:
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.eulerAngles\b',
+            r'Vector3.new(\1.CFrame:ToEulerAnglesXYZ())',
+            source,
+        )
+        fixes.append("Fixed .eulerAngles → CFrame:ToEulerAnglesXYZ()")
+
+    # Fix .localPosition → .Position (Roblox parts use Position relative to parent in most cases)
+    if '.localPosition' in source:
+        source = re.sub(r'\.localPosition\b', '.Position', source)
+        fixes.append("Fixed .localPosition → .Position")
+
+    # Fix .localScale → .Size (approximate mapping)
+    if '.localScale' in source:
+        source = re.sub(r'\.localScale\b', '.Size', source)
+        fixes.append("Fixed .localScale → .Size")
+
+    # Fix .localRotation → .CFrame (approximate)
+    if '.localRotation' in source:
+        source = re.sub(r'\.localRotation\b', '.CFrame', source)
+        fixes.append("Fixed .localRotation → .CFrame")
+
+    # Fix .SetParent(parent) → .Parent = parent
+    if '.SetParent(' in source:
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.SetParent\((\w+(?:\.\w+)*)\)',
+            r'\1.Parent = \2',
+            source,
+        )
+        # SetParent(parent, worldPositionStays) → .Parent = parent
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.SetParent\((\w+(?:\.\w+)*),\s*\w+\)',
+            r'\1.Parent = \2',
+            source,
+        )
+        fixes.append("Fixed .SetParent() → .Parent assignment")
+
+    # Fix .childCount → #:GetChildren()
+    if '.childCount' in source:
+        source = re.sub(r'(\w+(?:\.\w+)*)\.childCount\b', r'#\1:GetChildren()', source)
+        fixes.append("Fixed .childCount → #:GetChildren()")
+
+    # Fix .GetSiblingIndex() → table.find(parent:GetChildren(), obj)
+    if '.GetSiblingIndex' in source:
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.GetSiblingIndex\(\)',
+            r'(table.find(\1.Parent:GetChildren(), \1) or 1)',
+            source,
+        )
+        fixes.append("Fixed .GetSiblingIndex() → table.find")
+
+    # Fix .SetAsLastSibling() → reparent to same parent (Roblox auto-reorders)
+    if '.SetAsLastSibling' in source:
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.SetAsLastSibling\(\)',
+            r'-- SetAsLastSibling: Roblox auto-orders children',
+            source,
+        )
+
+    # Fix .isKinematic → .Anchored (Roblox equivalent)
+    if '.isKinematic' in source:
+        source = re.sub(r'\.isKinematic\b', '.Anchored', source)
+        fixes.append("Fixed .isKinematic → .Anchored")
+
+    # Fix Physics.AllLayers/DefaultRaycastLayers → remove (Roblox checks all by default)
+    if 'Physics.' in source:
+        source = re.sub(r',\s*Physics\.AllLayers\b', '', source)
+        source = re.sub(r',\s*Physics\.DefaultRaycastLayers\b', '', source)
+        source = re.sub(r'\bPhysics\.OverlapSphere\(([^,]+),\s*([^)]+)\)',
+                        r'workspace:GetPartBoundsInRadius(\1, \2)', source)
+        fixes.append("Fixed Physics.* API calls")
 
     # Fix: Animator.StringToHash("Name") → "Name" (Roblox uses strings, not hashes)
     if "StringToHash" in source:
@@ -1878,6 +2103,43 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         source = re.sub(r'(\w+)\.task\.delay\(\)', r'task.defer(\1)', source)
         fixes.append("Fixed .task.delay() → task.defer()")
 
+    # Comment out Unity-only graphics/rendering API calls
+    _UNITY_RENDER_APIS = (
+        'Graphics.DrawMesh', 'Graphics.DrawMeshInstanced', 'Graphics.Blit',
+        'Shader.SetGlobal', 'Shader.Find', 'Shader.PropertyToID',
+        'GL.PushMatrix', 'GL.PopMatrix', 'GL.LoadOrtho', 'GL.Begin', 'GL.End',
+        'RenderTexture.active', 'Camera.main.targetTexture',
+    )
+    _rendered = False
+    for api in _UNITY_RENDER_APIS:
+        if api in source:
+            source = re.sub(
+                rf'^(\s*)(.*{re.escape(api)}.*)$',
+                r'\1-- [Unity render] \2',
+                source,
+                flags=re.MULTILINE,
+            )
+            _rendered = True
+    if _rendered:
+        fixes.append("Commented out Unity-only rendering API calls")
+
+    # Fix .Sort() method → table.sort()
+    if '.Sort(' in source:
+        # Simple case: arr.Sort() → table.sort(arr)
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.Sort\(\)\s*$',
+            r'table.sort(\1)',
+            source,
+            flags=re.MULTILINE,
+        )
+        # With comparison function: arr.Sort(function...) → table.sort(arr, function...)
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.Sort\((function\(.+)',
+            r'table.sort(\1, \2',
+            source,
+        )
+        fixes.append("Fixed .Sort() → table.sort()")
+
     if source != original:
         fixes.append("Fixed common API mistakes")
         log.info("  [%s] Fixed common API/syntax mistakes", name)
@@ -2278,11 +2540,22 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
         )
         fixes.append("Fixed list initialization → {}")
 
+    # Fix C# new[] { ... } array initializer → { ... }
+    if 'new[]' in source:
+        source = re.sub(r'\bnew\[\]\s*\{', '{', source)
+        fixes.append("Fixed C# new[] array initializer")
+
     # Fix bare `new Namespace.Type()` → `{}` (C# constructor that leaked through)
     if re.search(r'\bnew\s+[A-Z]', source):
         source = re.sub(
             r'\bnew\s+[\w.]+(?:Dictionary|List|HashSet|Queue|Stack|ArrayList)\s*\(\)',
             '{}',
+            source,
+        )
+        # new Type{...} (object initializer without parens) → {...}
+        source = re.sub(
+            r'\bnew\s+[\w.]+\s*\{',
+            '{',
             source,
         )
         # new Type() for other types → nil
@@ -2354,6 +2627,77 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
     # Fix: "while .Property" (bare receiver in while condition)
     if re.search(r'\bwhile\s+\.', source):
         source = re.sub(r'\bwhile\s+\.([\w.]+)', r'while script.Parent.\1', source)
+
+    # Fix single-line C# if statements: "if (cond) stmt" → "if cond then stmt end"
+    # Pattern: line starts with 'if' + parenthesized condition + non-then statement
+    # e.g. "if (x > 0) return false" → "if (x > 0) then return false end"
+    # Uses balanced paren matching to avoid matching incomplete conditions
+    new_lines_slif = []
+    for line in source.split('\n'):
+        stripped = line.strip()
+        if stripped.startswith('if ') or stripped.startswith('if('):
+            m = re.match(r'^(\s*)if\s*\(', line)
+            if m and ' then ' not in stripped and not stripped.endswith('then'):
+                # Find the matching close paren
+                start_idx = line.index('(')
+                depth = 0
+                close_idx = -1
+                for ci in range(start_idx, len(line)):
+                    if line[ci] == '(':
+                        depth += 1
+                    elif line[ci] == ')':
+                        depth -= 1
+                        if depth == 0:
+                            close_idx = ci
+                            break
+                if close_idx > 0 and close_idx < len(line) - 1:
+                    # There's content after the closing paren
+                    after = line[close_idx + 1:].strip()
+                    if after and not after.startswith('then') and not after.startswith('--'):
+                        indent = m.group(1)
+                        cond = line[start_idx:close_idx + 1]
+                        line = f'{indent}if {cond} then {after} end'
+                        fixes.append("Fixed single-line C# if statements (added then/end)")
+        new_lines_slif.append(line)
+    source = '\n'.join(new_lines_slif)
+
+    # Fix missing 'then' after if/elseif conditions
+    # Pattern: "if <condition>\n    <statement>" → "if <condition> then\n    <statement>"
+    # This happens when C# code like "if (cond)\n    stmt;" has its braces removed but no 'then' added
+    new_lines_mt = []
+    lines_mt = source.split('\n')
+    for i, line in enumerate(lines_mt):
+        stripped = line.strip()
+        # Check if line starts with 'if' or 'elseif' but doesn't end with 'then', 'do', or contain 'then' anywhere
+        if re.match(r'^(if|elseif)\b', stripped) and not stripped.startswith('--'):
+            # Skip lines that already have 'then' or are complete
+            if ' then' not in stripped and not stripped.endswith('then'):
+                # Check if a continuation line has 'then' (multiline condition)
+                has_then_below = False
+                for j in range(i + 1, min(i + 5, len(lines_mt))):
+                    next_s = lines_mt[j].strip()
+                    if next_s and ' then' in next_s or next_s.endswith('then'):
+                        has_then_below = True
+                        break
+                    # If this non-empty line is NOT a continuation (not indented more), stop
+                    if next_s and not next_s.startswith('--'):
+                        curr_indent = len(line) - len(line.lstrip())
+                        next_indent = len(lines_mt[j]) - len(lines_mt[j].lstrip())
+                        if next_indent <= curr_indent:
+                            break
+                if not has_then_below:
+                    # Check if the next non-empty line is indented (suggesting it's the body)
+                    for j in range(i + 1, min(i + 3, len(lines_mt))):
+                        next_s = lines_mt[j].strip()
+                        if next_s and not next_s.startswith('--'):
+                            curr_indent = len(line) - len(line.lstrip())
+                            next_indent = len(lines_mt[j]) - len(lines_mt[j].lstrip())
+                            if next_indent > curr_indent:
+                                line = line.rstrip() + ' then'
+                                fixes.append("Added missing 'then' after if/elseif")
+                            break
+        new_lines_mt.append(line)
+    source = '\n'.join(new_lines_mt)
 
     # Fix missing 'end' after if/elseif blocks
     # Detect pattern: if block that transitions to unindented code without closing 'end'

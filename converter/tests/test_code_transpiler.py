@@ -1999,7 +1999,7 @@ class TestValidatorNewFixes:
         source = 'if workspace:Raycast(tBase.Position, dir.normalized, hit, sightRadius) then'
         fixed, _ = validate_and_fix("test", source)
         assert 'tBase.Position' in fixed
-        assert 'dir.normalized * sightRadius' in fixed
+        assert 'dir.Unit * sightRadius' in fixed
 
     def test_math_acos_two_args(self):
         """math.acos(a, b) → math.deg(math.acos(a.Unit:Dot(b.Unit)))."""
@@ -2036,7 +2036,7 @@ class TestValidatorNewFixes:
         source = 'local ray = Ray.new(cam.Position, dir.normalized)'
         fixed, _ = validate_and_fix("test", source)
         assert 'Origin = cam.Position' in fixed
-        assert 'Direction = dir.normalized' in fixed
+        assert 'Direction = dir.Unit' in fixed
         assert 'Ray.new' not in fixed
 
     def test_getchild_zero_based(self):
@@ -2369,3 +2369,264 @@ class TestValidatorNewFixes:
         fixed, _ = validate_and_fix("test", source)
         assert 'function(x) return x=="GasCan" end)' in fixed
         assert '~= nil' in fixed
+
+
+class TestValidatorBatch11:
+    """Tests for batch 11 validator fixes: float literals, math methods,
+    Matrix4x4, Unity enums, :Dot(), .CompareTo(), etc."""
+
+    def test_csharp_float_suffix_stripped(self):
+        """C# float literal suffixes (F, f, d, D) are stripped."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local x = 1.0F\nlocal y = 2F * 3.5f\nlocal z = 0.07F'
+        fixed, fixes = validate_and_fix("test", source)
+        assert '1.0F' not in fixed
+        assert '2F' not in fixed
+        assert '3.5f' not in fixed
+        assert '0.07F' not in fixed
+        assert '1.0' in fixed
+        assert '3.5' in fixed
+
+    def test_broken_numeric_property_access(self):
+        """script.Parent.02 → 0.02."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local step = script.Parent.02\nlocal y = script.Parent.033'
+        fixed, fixes = validate_and_fix("test", source)
+        assert 'script.Parent.02' not in fixed
+        assert '0.02' in fixed
+        assert '0.033' in fixed
+
+    def test_math_round_to_int(self):
+        """math.roundToInt → math.round, etc."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local a = math.roundToInt(x)\nlocal b = math.floorToInt(y)\nlocal c = math.ceilToInt(z)'
+        fixed, fixes = validate_and_fix("test", source)
+        assert 'math.round(x)' in fixed
+        assert 'math.floor(y)' in fixed
+        assert 'math.ceil(z)' in fixed
+        assert 'ToInt' not in fixed
+
+    def test_compare_to_sort(self):
+        """.Sort with .CompareTo → table.sort with Luau comparison."""
+        from converter.luau_validator import validate_and_fix
+        source = 'objectives.Sort((function(A, B) return A.Name.CompareTo(B.Name end))'
+        fixed, fixes = validate_and_fix("test", source)
+        assert 'table.sort(objectives' in fixed
+        assert '.CompareTo' not in fixed
+
+    def test_unity_enum_removal(self):
+        """Unity-only enum references are removed."""
+        from converter.luau_validator import validate_and_fix
+        source = (
+            'local x = m_Rigidbody.interpolation = RigidbodyInterpolation.Interpolate\n'
+            'rb:ApplyImpulse(force, ForceMode.Impulse)\n'
+            'local m = m_Animator.updateMode = AnimatorUpdateMode.AnimatePhysics\n'
+        )
+        fixed, fixes = validate_and_fix("test", source)
+        assert 'RigidbodyInterpolation' not in fixed or '-- [Unity]' in fixed
+        assert 'ForceMode.Impulse)' not in fixed
+        assert 'rb:ApplyImpulse(force)' in fixed
+
+    def test_matrix4x4_commented_out(self):
+        """Matrix4x4 operations are commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = (
+            '    local m = Matrix4x4.TRS(pos, rot, scale)\n'
+            '    reflectionMat.m00 = (1 - 2 * plane[0])\n'
+            '    reflectionMat.m01 = (-2 * plane[0] * plane[1])\n'
+        )
+        fixed, fixes = validate_and_fix("test", source)
+        assert '-- [Unity]' in fixed
+        assert 'Matrix4x4' in fixed  # Still present in comment
+
+    def test_bare_dot_fixed(self):
+        """Bare :Dot(a, b) → a:Dot(b)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local d = -:Dot(normal, pos)'
+        fixed, fixes = validate_and_fix("test", source)
+        assert ':Dot(normal, pos)' not in fixed or 'normal:Dot(pos)' in fixed
+
+    def test_script_parent_dot(self):
+        """script.Parent:Dot(a, b) → a:Dot(b)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local d = script.Parent:Dot(Vector3.yAxis, msg.direction)'
+        fixed, fixes = validate_and_fix("test", source)
+        assert 'Vector3.yAxis:Dot(msg.direction)' in fixed
+
+    def test_destroy_obj_pattern(self):
+        """:Destroy()(obj) → obj:Destroy()."""
+        from converter.luau_validator import validate_and_fix
+        source = ':Destroy()(reflectionTexture)'
+        fixed, fixes = validate_and_fix("test", source)
+        assert 'reflectionTexture:Destroy()' in fixed
+
+    def test_missing_then_inserted(self):
+        """Missing 'then' after if condition gets added."""
+        from converter.luau_validator import validate_and_fix
+        source = (
+            'if (x > 0)\n'
+            '    print("yes")\n'
+            'end\n'
+        )
+        fixed, fixes = validate_and_fix("test", source)
+        assert 'then' in fixed
+
+    def test_missing_then_not_added_to_multiline(self):
+        """Don't add 'then' if continuation line already has it."""
+        from converter.luau_validator import validate_and_fix
+        source = (
+            'if condition1 or\n'
+            '    condition2 then\n'
+            '    print("yes")\n'
+            'end\n'
+        )
+        fixed, fixes = validate_and_fix("test", source)
+        # Should NOT have double 'then'
+        assert 'or then' not in fixed
+
+    def test_sort_method(self):
+        """.Sort() → table.sort()."""
+        from converter.luau_validator import validate_and_fix
+        source = 'items.Sort()\n'
+        fixed, fixes = validate_and_fix("test", source)
+        assert 'table.sort(items)' in fixed
+
+    def test_graphics_draw_mesh_commented(self):
+        """Unity Graphics.DrawMesh is commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '    Graphics.DrawMesh(mesh, matrix, material, layer)\n'
+        fixed, fixes = validate_and_fix("test", source)
+        assert '-- [Unity render]' in fixed
+
+    def test_shader_set_global_commented(self):
+        """Unity Shader.SetGlobal* is commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '    Shader.SetGlobalMatrix("_Matrix", m)\n'
+        fixed, fixes = validate_and_fix("test", source)
+        assert '-- [Unity render]' in fixed
+
+
+class TestValidatorBatch12:
+    """Tests for batch 12: Vector3 property fixes, shorthand floats."""
+
+    def test_normalized_to_unit(self):
+        """.normalized → .Unit."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local d = dir.normalized * speed'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.Unit' in fixed
+        assert '.normalized' not in fixed
+
+    def test_magnitude_case_fix(self):
+        """.magnitude → .Magnitude."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local d = vec.magnitude'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.Magnitude' in fixed
+        assert '.magnitude' not in fixed
+
+    def test_sqr_magnitude(self):
+        """.sqrMagnitude → :Dot(self)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if vec.sqrMagnitude > 1 then'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.sqrMagnitude' not in fixed
+        assert 'vec:Dot(vec)' in fixed
+
+    def test_euler_angles(self):
+        """.eulerAngles → CFrame:ToEulerAnglesXYZ()."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local angles = obj.eulerAngles'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.eulerAngles' not in fixed
+        assert 'ToEulerAnglesXYZ' in fixed
+
+    def test_local_position(self):
+        """.localPosition → .Position."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local p = obj.localPosition'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.Position' in fixed
+        assert '.localPosition' not in fixed
+
+    def test_local_scale(self):
+        """.localScale → .Size."""
+        from converter.luau_validator import validate_and_fix
+        source = 'obj.localScale = Vector3.new(1, 1, 1)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.Size' in fixed
+        assert '.localScale' not in fixed
+
+    def test_shorthand_float_leading_zero(self):
+        """.02 shorthand float gets leading zero."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local x = .02\nlocal y = .5'
+        fixed, _ = validate_and_fix("test", source)
+        assert '0.02' in fixed
+        assert '0.5' in fixed
+
+    def test_single_line_if_then_end(self):
+        """Single-line C# if: 'if (cond) stmt' → 'if (cond) then stmt end'."""
+        from converter.luau_validator import validate_and_fix
+        source = '    if (not eventFired) task.defer(OnComplete)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'then' in fixed
+        assert 'end' in fixed
+        assert 'task.defer(OnComplete)' in fixed
+
+    def test_single_line_if_return(self):
+        """Single-line C# if with return."""
+        from converter.luau_validator import validate_and_fix
+        source = '    if (objectives[i].name == name) return false'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'then return false end' in fixed
+
+    def test_single_line_if_no_false_match(self):
+        """Don't match already-complete if statements."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if (x > 0) then print("yes") end'
+        fixed, _ = validate_and_fix("test", source)
+        assert fixed.count('then') == 1  # Not doubled
+
+    def test_set_parent(self):
+        """.SetParent(parent) → .Parent = parent."""
+        from converter.luau_validator import validate_and_fix
+        source = 'obj.SetParent(workspace)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.Parent = workspace' in fixed
+
+    def test_child_count(self):
+        """.childCount → #:GetChildren()."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local n = obj.childCount'
+        fixed, _ = validate_and_fix("test", source)
+        assert '#obj:GetChildren()' in fixed
+
+    def test_get_sibling_index(self):
+        """.GetSiblingIndex() → table.find."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local idx = obj.GetSiblingIndex()'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'table.find' in fixed
+
+    def test_is_kinematic(self):
+        """.isKinematic → .Anchored."""
+        from converter.luau_validator import validate_and_fix
+        source = 'm_Rigidbody.isKinematic = true'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.Anchored = true' in fixed
+
+    def test_physics_overlap_sphere(self):
+        """Physics.OverlapSphere → workspace:GetPartBoundsInRadius."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local cols = Physics.OverlapSphere(pos, radius)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'workspace:GetPartBoundsInRadius(pos, radius)' in fixed
+
+    def test_new_array_initializer(self):
+        """C# new[] { ... } → { ... }."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local arr = new[] { 1, 2, 3 }'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'new[]' not in fixed
+        assert '{ 1, 2, 3 }' in fixed
