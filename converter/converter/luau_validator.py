@@ -1148,6 +1148,37 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     # Fix: obj.name (lowercase) → obj.Name
     if re.search(r'\w\.name\b', source):
         source = re.sub(r'(\w)\.name\b(?!\s*\()', r'\1.Name', source)
+    # Fix: obj.value (lowercase) → obj.Value
+    if re.search(r'\w\.value\b', source):
+        source = re.sub(r'(\w)\.value\b(?!\s*\()', r'\1.Value', source)
+
+    # Fix Unity Raycast API → Roblox Raycast API
+    # Unity: workspace:Raycast(ray, hit, range) → Roblox: workspace:Raycast(origin, direction * range)
+    # Unity: workspace:Raycast(origin, direction, hit, range) → Roblox: workspace:Raycast(origin, direction * range)
+    if 'Raycast(' in source:
+        # Pattern: workspace:Raycast(ray, hit, range) → local hit = workspace:Raycast(ray.Origin, ray.Direction * range)
+        source = re.sub(
+            r'(\w+):Raycast\((\w+),\s*(\w+),\s*(\w+)\)',
+            r'\1:Raycast(\2.Origin, \2.Direction * \4)',
+            source,
+        )
+        # Pattern: workspace:Raycast(origin, direction, hit, range) → workspace:Raycast(origin, direction * range)
+        source = re.sub(
+            r'(\w+):Raycast\(([^,]+),\s*([^,]+),\s*(\w+),\s*(\w+)\)',
+            r'\1:Raycast(\2, \3 * \5)',
+            source,
+        )
+        fixes.append("Fixed Raycast API signature (Unity → Roblox)")
+
+    # Fix math.acos with 2 args → dot product first
+    # Unity: Vector3.Angle(a, b) → math.acos(a:Dot(b) / (a.Magnitude * b.Magnitude))
+    if 'math.acos(' in source:
+        source = re.sub(
+            r'math\.acos\((\w+(?:\.\w+)*),\s*(\w+(?:\.\w+)*)\)',
+            r'math.deg(math.acos(\1.Unit:Dot(\2.Unit)))',
+            source,
+        )
+        fixes.append("Fixed math.acos(a, b) → dot product pattern")
 
     # Fix: += / -= / *= / /= operators (not valid in Luau)
     # Handles both simple vars and property access (obj.prop += expr)

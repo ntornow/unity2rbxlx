@@ -1975,3 +1975,36 @@ class TestValidatorNewFixes:
         for line in fixed.split('\n'):
             if line.strip().startswith('using '):
                 assert False, f"Bare using statement remains: {line}"
+
+    def test_value_property_capitalization(self):
+        """obj.value → obj.Value (Roblox PascalCase)."""
+        from converter.luau_validator import validate_and_fix
+        source = '    health.value = percentage'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.Value' in fixed
+        assert '.value' not in fixed
+
+    def test_raycast_api_3args(self):
+        """workspace:Raycast(ray, hit, range) → workspace:Raycast(ray.Origin, ray.Direction * range)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if workspace:Raycast(ray, hit, shootRange) then'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'ray.Origin' in fixed
+        assert 'ray.Direction' in fixed
+        assert 'shootRange' in fixed
+
+    def test_raycast_api_4args(self):
+        """workspace:Raycast(origin, dir, hit, range) → workspace:Raycast(origin, dir * range)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if workspace:Raycast(tBase.Position, dir.normalized, hit, sightRadius) then'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'tBase.Position' in fixed
+        assert 'dir.normalized * sightRadius' in fixed
+
+    def test_math_acos_two_args(self):
+        """math.acos(a, b) → math.deg(math.acos(a.Unit:Dot(b.Unit)))."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local angle = math.acos(dir, tBase.forward)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'dir.Unit:Dot(tBase.forward.Unit)' in fixed
+        assert 'math.deg' in fixed
