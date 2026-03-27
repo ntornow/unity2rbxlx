@@ -140,7 +140,7 @@ def _add_cframe(parent: ET.Element, name: str, cf: RbxCFrame) -> ET.Element:
 def _add_color3uint8(parent: ET.Element, name: str, r: int, g: int, b: int) -> ET.Element:
     """Pack RGB into a single uint32 and emit ``<Color3uint8>``."""
     packed = (r & 0xFF) << 16 | (g & 0xFF) << 8 | (b & 0xFF)
-    elem = ET.SubElement(parent, "Color3uint8", name="Color3uint8")
+    elem = ET.SubElement(parent, "Color3uint8", name=name)
     elem.text = str(packed)
     return elem
 

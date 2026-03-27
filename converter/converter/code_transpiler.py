@@ -826,6 +826,7 @@ def _rule_based_transpile(
         converted = re.sub(r"(\d+(?:\.\d+)?)f\b", r"\1", converted)
 
         # for loop: must run BEFORE variable declaration regex (which would convert "int i = 0")
+        # Pattern: for (int i = START; i < END; i++) → for i = START, END-1 do
         m_for = re.match(
             r"(\s*)for\s*\(\s*(?:int|var)?\s*(\w+)\s*=\s*(\d+)\s*;\s*\2\s*<\s*(\w+(?:\.\w+)?)\s*;\s*\2\+\+\s*\)",
             converted,
@@ -833,6 +834,7 @@ def _rule_based_transpile(
         if m_for:
             converted = f"{m_for.group(1)}for {m_for.group(2)} = {m_for.group(3)}, {m_for.group(4)}-1 do"
         if not m_for:
+            # Pattern: for (int i = 0; i <= END; i++) → for i = 0, END do
             m_for_le = re.match(
                 r"(\s*)for\s*\(\s*(?:int|var)?\s*(\w+)\s*=\s*(\d+)\s*;\s*\2\s*<=\s*(\w+(?:\.\w+)?)\s*;\s*\2\+\+\s*\)",
                 converted,
@@ -841,12 +843,49 @@ def _rule_based_transpile(
                 converted = f"{m_for_le.group(1)}for {m_for_le.group(2)} = {m_for_le.group(3)}, {m_for_le.group(4)} do"
                 m_for = m_for_le
         if not m_for:
+            # Pattern: for (int i = START; i >= END; i--) → for i = START, END, -1 do
             m_for_dec = re.match(
                 r"(\s*)for\s*\(\s*(?:int|var)?\s*(\w+)\s*=\s*(\w+(?:\.\w+)?)\s*;\s*\2\s*>=\s*(\d+)\s*;\s*\2--\s*\)",
                 converted,
             )
             if m_for_dec:
                 converted = f"{m_for_dec.group(1)}for {m_for_dec.group(2)} = {m_for_dec.group(3)}, {m_for_dec.group(4)}, -1 do"
+        if not m_for:
+            # Expression-based init: for (int i = expr; i < END; i++) → for i = expr, END-1 do
+            m_for_expr = re.match(
+                r"(\s*)for\s*\(\s*(?:int|var)?\s*(\w+)\s*=\s*([^;]+?)\s*;\s*\2\s*<\s*([^;]+?)\s*;\s*\2\+\+\s*\)",
+                converted,
+            )
+            if m_for_expr:
+                converted = f"{m_for_expr.group(1)}for {m_for_expr.group(2)} = {m_for_expr.group(3)}, {m_for_expr.group(4)}-1 do"
+                m_for = m_for_expr
+        if not m_for:
+            # Expression-based decrement: for (int i = expr; i >= END; i--) → for i = expr, END, -1 do
+            m_for_expr_dec = re.match(
+                r"(\s*)for\s*\(\s*(?:int|var)?\s*(\w+)\s*=\s*([^;]+?)\s*;\s*\2\s*>=\s*([^;]+?)\s*;\s*\2--\s*\)",
+                converted,
+            )
+            if m_for_expr_dec:
+                converted = f"{m_for_expr_dec.group(1)}for {m_for_expr_dec.group(2)} = {m_for_expr_dec.group(3)}, {m_for_expr_dec.group(4)}, -1 do"
+                m_for = m_for_expr_dec
+        if not m_for:
+            # Custom step: for (int i = START; i < END; i += STEP) → for i = START, END-1, STEP do
+            m_for_step = re.match(
+                r"(\s*)for\s*\(\s*(?:int|var)?\s*(\w+)\s*=\s*([^;]+?)\s*;\s*\2\s*<\s*([^;]+?)\s*;\s*\2\s*\+=\s*(\d+)\s*\)",
+                converted,
+            )
+            if m_for_step:
+                converted = f"{m_for_step.group(1)}for {m_for_step.group(2)} = {m_for_step.group(3)}, {m_for_step.group(4)}-1, {m_for_step.group(5)} do"
+                m_for = m_for_step
+        if not m_for:
+            # Custom negative step: for (int i = START; i > END; i -= STEP) → for i = START, END+1, -STEP do
+            m_for_neg_step = re.match(
+                r"(\s*)for\s*\(\s*(?:int|var)?\s*(\w+)\s*=\s*([^;]+?)\s*;\s*\2\s*>\s*([^;]+?)\s*;\s*\2\s*-=\s*(\d+)\s*\)",
+                converted,
+            )
+            if m_for_neg_step:
+                converted = f"{m_for_neg_step.group(1)}for {m_for_neg_step.group(2)} = {m_for_neg_step.group(3)}, {m_for_neg_step.group(4)}+1, -{m_for_neg_step.group(5)} do"
+                m_for = m_for_neg_step
 
         # C# variable declarations with types -> local
         # "Type varName = value" -> "local varName = value"
@@ -868,6 +907,20 @@ def _rule_based_transpile(
         # Array types: "Type[] varName = ..." -> "local varName = ..."
         converted = re.sub(
             r"\b\w+\[\]\s+(\w+)\s*=",
+            r"local \1 =",
+            converted,
+        )
+        # Generic types: "List<T> varName = ..." -> "local varName = ..."
+        converted = re.sub(
+            r"\b\w+<[^>]+>\s+(\w+)\s*=",
+            r"local \1 =",
+            converted,
+        )
+        # Custom PascalCase types: "MyClass varName = ..." -> "local varName = ..."
+        # Only match UpperCamelCase identifiers followed by a lowercase variable name
+        # to avoid false positives with Luau keywords or function calls.
+        converted = re.sub(
+            r"\b(?!local\b|return\b|function\b|if\b|else\b|end\b|for\b|while\b|repeat\b|until\b|then\b|do\b|not\b|and\b|or\b|true\b|false\b|nil\b)[A-Z]\w+\s+([a-z]\w*)\s*=",
             r"local \1 =",
             converted,
         )
@@ -920,6 +973,25 @@ def _rule_based_transpile(
         )
 
         # Lambda expressions: x => expr → function(x) return expr end
+        # Multi-line lambda with block: (x, y) => { → function(x, y)
+        # Use lookbehind for ( to avoid consuming the outer call paren
+        converted = re.sub(
+            r'(?<=\()(\w+(?:\s*,\s*\w+)*)\)\s*=>\s*\{',
+            r'function(\1)',
+            converted,
+        )
+        # Single-param block lambda: x => { → function(x)
+        converted = re.sub(
+            r'\b(\w+)\s*=>\s*\{',
+            r'function(\1)',
+            converted,
+        )
+        # Multi-param expression lambda: (x, y) => expr → function(x, y) return expr end
+        converted = re.sub(
+            r'(?<=\()(\w+(?:\s*,\s*\w+)*)\)\s*=>\s*([^,\){]+?)(?=\s*[,\)])',
+            r'function(\1) return \2 end',
+            converted,
+        )
         # Simple single-param: x => x.Name → function(x) return x.Name end
         converted = re.sub(
             r'\b(\w+)\s*=>\s*([^,\)]+?)(?=\s*[,\)])',
@@ -932,9 +1004,17 @@ def _rule_based_transpile(
         # as Type -> (remove)
         converted = re.sub(r"\s+as\s+\w+", "", converted)
 
-        # Ternary: a ? b : c -> if a then b else c (simple cases)
+        # Ternary: a ? b : c -> if a then b else c
+        # Handles complex conditions like (a > b), a == b, etc.
+        # Match: condition ? true_expr : false_expr
+        # The condition can be: parenthesized expr, comparison, or simple word
         converted = re.sub(
-            r"(\w+)\s*\?\s*([^:]+):\s*(.+?)(?=\s*$|\s*;)",
+            r"\(([^)]+)\)\s*\?\s*([^:]+):\s*(.+?)(?=\s*$|\s*;)",
+            r"(if (\1) then \2 else \3)",
+            converted,
+        )
+        converted = re.sub(
+            r"(\w+(?:\.\w+)*(?:\s*[<>=!~]+\s*\w+(?:\.\w+)*)?)\s*\?\s*([^:]+):\s*(.+?)(?=\s*$|\s*;)",
             r"(if \1 then \2 else \3)",
             converted,
         )

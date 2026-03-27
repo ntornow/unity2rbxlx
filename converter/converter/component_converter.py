@@ -181,12 +181,40 @@ def convert_audio(
 # Collider conversion
 # ---------------------------------------------------------------------------
 
+def _extract_collider_center(properties: dict[str, Any]) -> tuple[float, float, float]:
+    """Extract collider center offset in studs (Unity m_Center → Roblox offset).
+
+    Unity colliders can have a non-zero center offset from the GameObject's
+    transform.  This offset needs to be applied to the Part's CFrame position.
+    Returns (dx, dy, dz) in studs with Roblox coordinate conventions (Z negated).
+    """
+    import config
+
+    center = properties.get("m_Center", {})
+    if not isinstance(center, dict):
+        return (0.0, 0.0, 0.0)
+
+    cx = float(center.get("x", 0.0))
+    cy = float(center.get("y", 0.0))
+    cz = float(center.get("z", 0.0))
+
+    if cx == 0.0 and cy == 0.0 and cz == 0.0:
+        return (0.0, 0.0, 0.0)
+
+    # Convert to studs and negate Z for Roblox coordinate system
+    return (
+        cx * config.STUDS_PER_METER,
+        cy * config.STUDS_PER_METER,
+        -cz * config.STUDS_PER_METER,
+    )
+
+
 def convert_collider(
     component_type: str,
     properties: dict[str, Any],
     current_size: tuple[float, float, float],
-) -> tuple[tuple[float, float, float], bool]:
-    """Convert a Unity Collider component to adjusted size and collision flag.
+) -> tuple[tuple[float, float, float], bool, tuple[float, float, float]]:
+    """Convert a Unity Collider component to adjusted size, collision flag, and center offset.
 
     Unity colliders adjust the effective bounding volume:
         BoxCollider     -> adjust size by center + size
@@ -199,38 +227,43 @@ def convert_collider(
         current_size: The current part size (x, y, z).
 
     Returns:
-        Tuple of (adjusted_size, can_collide).
+        Tuple of (adjusted_size, can_collide, center_offset_studs).
+        center_offset_studs is (dx, dy, dz) in Roblox coordinates.
     """
     is_trigger = bool(int(properties.get("m_IsTrigger", 0)))
     can_collide = not is_trigger  # Triggers don't collide.
+    no_offset = (0.0, 0.0, 0.0)
 
     if component_type == "BoxCollider":
-        return _convert_box_collider(properties, current_size), can_collide
+        center = _extract_collider_center(properties)
+        return _convert_box_collider(properties, current_size), can_collide, center
 
     elif component_type == "SphereCollider":
-        return _convert_sphere_collider(properties, current_size), can_collide
+        center = _extract_collider_center(properties)
+        return _convert_sphere_collider(properties, current_size), can_collide, center
 
     elif component_type == "CapsuleCollider":
-        return _convert_capsule_collider(properties, current_size), can_collide
+        center = _extract_collider_center(properties)
+        return _convert_capsule_collider(properties, current_size), can_collide, center
 
     elif component_type == "MeshCollider":
         # MeshCollider uses the mesh shape; size stays the same.
-        return current_size, can_collide
+        return current_size, can_collide, no_offset
 
     # 2D colliders: convert to thin 3D equivalents
     elif component_type == "BoxCollider2D":
-        return _convert_box_collider_2d(properties, current_size), can_collide
+        return _convert_box_collider_2d(properties, current_size), can_collide, no_offset
 
     elif component_type in ("CircleCollider2D", "CapsuleCollider2D"):
-        return _convert_circle_collider_2d(properties, current_size), can_collide
+        return _convert_circle_collider_2d(properties, current_size), can_collide, no_offset
 
     elif component_type in ("PolygonCollider2D", "EdgeCollider2D"):
         # Complex 2D shapes: keep current size (can't easily approximate)
-        return current_size, can_collide
+        return current_size, can_collide, no_offset
 
     else:
         log.warning("Unknown collider type: %s", component_type)
-        return current_size, can_collide
+        return current_size, can_collide, no_offset
 
 
 def _convert_box_collider(

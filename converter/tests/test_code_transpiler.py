@@ -861,3 +861,105 @@ class TestPropertyBodies:
         result = _preprocess_multiline_constructs(csharp)
         assert "local Speed" in result or "get_Speed" in result
         assert "m_Speed" in result
+
+
+class TestGenericTypeDeclarations:
+    """Test that generic/custom type variable declarations get 'local' prefix."""
+
+    def test_generic_list_type(self):
+        from converter.code_transpiler import _rule_based_transpile
+        luau, _, _ = _rule_based_transpile("List<int> numbers = {1, 2, 3};")
+        assert "local numbers" in luau
+
+    def test_generic_dictionary_type(self):
+        from converter.code_transpiler import _rule_based_transpile
+        luau, _, _ = _rule_based_transpile("Dictionary<string, int> map = {};")
+        assert "local map" in luau
+
+    def test_custom_class_type(self):
+        from converter.code_transpiler import _rule_based_transpile
+        luau, _, _ = _rule_based_transpile("PlayerController controller = GetComponent();")
+        assert "local controller" in luau
+
+    def test_does_not_match_keywords(self):
+        from converter.code_transpiler import _rule_based_transpile
+        luau, _, _ = _rule_based_transpile("return value")
+        assert "local value" not in luau
+
+
+class TestComplexForLoops:
+    """Test enhanced for-loop pattern matching."""
+
+    def test_expression_init_for(self):
+        from converter.code_transpiler import _rule_based_transpile
+        luau, _, _ = _rule_based_transpile("for (int i = arr.Length - 1; i < count; i++)")
+        assert "for i = arr.Length - 1" in luau or "for i =" in luau
+
+    def test_step_for(self):
+        from converter.code_transpiler import _rule_based_transpile
+        luau, _, _ = _rule_based_transpile("for (int i = 0; i < 10; i += 2)")
+        assert "2 do" in luau
+
+    def test_negative_step_for(self):
+        from converter.code_transpiler import _rule_based_transpile
+        luau, _, _ = _rule_based_transpile("for (int i = 10; i > 0; i -= 2)")
+        assert "-2 do" in luau
+
+    def test_expression_decrement_for(self):
+        from converter.code_transpiler import _rule_based_transpile
+        luau, _, _ = _rule_based_transpile("for (int i = items.Count - 1; i >= 0; i--)")
+        assert "for i = items.Count - 1" in luau or "for i =" in luau
+        assert "-1 do" in luau
+
+
+class TestTernaryOperator:
+    """Test ternary operator conversion."""
+
+    def test_simple_ternary(self):
+        from converter.code_transpiler import _rule_based_transpile
+        luau, _, _ = _rule_based_transpile("result = isReady ? value1 : value2;")
+        assert "if" in luau and "then" in luau and "else" in luau
+
+    def test_parenthesized_condition_ternary(self):
+        from converter.code_transpiler import _rule_based_transpile
+        luau, _, _ = _rule_based_transpile("result = (a > b) ? x : y;")
+        assert "if" in luau and "then" in luau and "else" in luau
+
+
+class TestMultiLineLambda:
+    """Test multi-line lambda expression conversion."""
+
+    def test_block_lambda_multi_param(self):
+        from converter.code_transpiler import _rule_based_transpile
+        luau, _, _ = _rule_based_transpile("items.ForEach((x, y) => {")
+        assert "function(x, y)" in luau
+        assert "=>" not in luau
+
+    def test_block_lambda_single_param(self):
+        from converter.code_transpiler import _rule_based_transpile
+        luau, _, _ = _rule_based_transpile("items.ForEach(item => {")
+        assert "function(item)" in luau
+        assert "=>" not in luau
+
+    def test_multi_param_expression_lambda(self):
+        from converter.code_transpiler import _rule_based_transpile
+        luau, _, _ = _rule_based_transpile("items.Sort((a, b) => a.Name)")
+        assert "function(a, b)" in luau
+
+
+class TestStringGsubEscaping:
+    """Test string.gsub pattern escaping in validator."""
+
+    def test_dot_escaping(self):
+        from converter.luau_validator import _fix_csharp_remnants
+        source = 'local result = string.gsub(str, ".", "_")'
+        fixes = []
+        result = _fix_csharp_remnants("test", source, fixes)
+        assert '"%."' in result
+
+    def test_no_escaping_for_plain(self):
+        from converter.luau_validator import _fix_csharp_remnants
+        source = 'local result = string.gsub(str, "hello", "world")'
+        fixes = []
+        result = _fix_csharp_remnants("test", source, fixes)
+        assert '"hello"' in result

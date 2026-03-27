@@ -441,6 +441,30 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
         )
         fixes.append("Converted DOTween calls to TweenService:Create")
 
+    # Fix string.gsub literal patterns: string.gsub(s, ".", repl) → escape Lua pattern chars
+    # C# string.Replace does literal replacement, but Luau string.gsub uses patterns.
+    # Escape Lua pattern magic characters: ( ) . % + - * ? [ ] ^ $
+    if 'string.gsub(' in source:
+        _LUA_MAGIC = set('().%+-*?[]^$')
+
+        def _escape_gsub_literal(m):
+            full = m.group(0)
+            pattern_str = m.group(1)
+            if any(c in _LUA_MAGIC for c in pattern_str):
+                escaped = ''
+                for c in pattern_str:
+                    if c in _LUA_MAGIC:
+                        escaped += '%' + c
+                    else:
+                        escaped += c
+                return full.replace(f'"{pattern_str}"', f'"{escaped}"')
+            return full
+        source = re.sub(
+            r'string\.gsub\([^,]+,\s*"([^"]+)"',
+            _escape_gsub_literal,
+            source,
+        )
+
     if source != original and not fixes:
         fixes.append("Fixed C# syntax remnants")
 

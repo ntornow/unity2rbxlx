@@ -360,10 +360,6 @@ API_CALL_MAP: dict[str, str] = {
     # -- Misc --
     "Application.targetFrameRate": "-- targetFrameRate: no equivalent",
     "Application.persistentDataPath": "-- persistentDataPath: use DataStoreService",
-    "Application.isPlaying": "-- isPlaying: always true at runtime",
-    "Application.platform": "-- platform: use UserInputService:GetPlatform()",
-    "Application.Quit": "-- Quit: no equivalent",
-    "Resources.Load": "-- Resources.Load: use ReplicatedStorage:FindFirstChild",
     "Addressables.LoadAssetAsync": "-- Addressables: use ReplicatedStorage:WaitForChild",
     "Object.FindObjectOfType": "-- FindObjectOfType: use workspace:FindFirstChildOfClass",
     "Object.FindObjectsOfType": "-- FindObjectsOfType: use workspace:GetDescendants()",

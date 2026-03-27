@@ -921,7 +921,7 @@ def _process_components(
             else:
                 # Apply each collider against the original size to avoid
                 # compounding when multiple colliders exist on one node.
-                adjusted_size, can_collide = convert_collider(
+                adjusted_size, can_collide, center_offset = convert_collider(
                     ct, comp.properties, original_size,
                 )
                 # Keep the largest result across all physical colliders
@@ -931,6 +931,11 @@ def _process_components(
                     max(part.size[2], adjusted_size[2]),
                 )
                 part.can_collide = can_collide
+                # Apply collider center offset to part CFrame position
+                if center_offset != (0.0, 0.0, 0.0):
+                    part.cframe.x += center_offset[0]
+                    part.cframe.y += center_offset[1]
+                    part.cframe.z += center_offset[2]
 
         # -- Rigidbody / Rigidbody2D --
         elif ct in ("Rigidbody", "Rigidbody2D"):

@@ -15,14 +15,14 @@ class TestBoxCollider:
     def test_default_box_collider(self):
         """Default BoxCollider m_Size=(1,1,1) should not shrink the part."""
         props = {"m_Size": {"x": 1, "y": 1, "z": 1}, "m_IsTrigger": 0}
-        size, can_collide = convert_collider("BoxCollider", props, (3.571, 3.571, 3.571))
+        size, can_collide, _offset = convert_collider("BoxCollider", props, (3.571, 3.571, 3.571))
         assert can_collide is True
         assert all(s >= 3.5 for s in size)
 
     def test_large_box_collider(self):
         """Large BoxCollider should expand part size."""
         props = {"m_Size": {"x": 10, "y": 5, "z": 10}, "m_IsTrigger": 0}
-        size, can_collide = convert_collider("BoxCollider", props, (2.0, 2.0, 2.0))
+        size, can_collide, _offset = convert_collider("BoxCollider", props, (2.0, 2.0, 2.0))
         # 10 * 3.571 = 35.71
         assert size[0] > 30
         assert size[1] > 15
@@ -30,22 +30,47 @@ class TestBoxCollider:
     def test_trigger_collider(self):
         """Trigger colliders should set can_collide=False."""
         props = {"m_Size": {"x": 1, "y": 1, "z": 1}, "m_IsTrigger": 1}
-        size, can_collide = convert_collider("BoxCollider", props, (5.0, 5.0, 5.0))
+        size, can_collide, _offset = convert_collider("BoxCollider", props, (5.0, 5.0, 5.0))
         assert can_collide is False
 
     def test_collider_uses_studs(self):
         """Collider m_Size should be converted from meters to studs."""
         import config
         props = {"m_Size": {"x": 2, "y": 3, "z": 2}, "m_IsTrigger": 0}
-        size, _ = convert_collider("BoxCollider", props, (1.0, 1.0, 1.0))
+        size, _, _offset = convert_collider("BoxCollider", props, (1.0, 1.0, 1.0))
         assert abs(size[0] - 2 * config.STUDS_PER_METER) < 0.1 or size[0] >= 2 * config.STUDS_PER_METER
+
+
+    def test_collider_center_offset(self):
+        """BoxCollider with non-zero m_Center should return center offset in studs."""
+        import config
+        props = {
+            "m_Size": {"x": 1, "y": 1, "z": 1},
+            "m_Center": {"x": 1.0, "y": 2.0, "z": 3.0},
+            "m_IsTrigger": 0,
+        }
+        _size, _can_collide, offset = convert_collider("BoxCollider", props, (3.571, 3.571, 3.571))
+        assert abs(offset[0] - 1.0 * config.STUDS_PER_METER) < 0.01
+        assert abs(offset[1] - 2.0 * config.STUDS_PER_METER) < 0.01
+        # Z is negated for Roblox coordinate system
+        assert abs(offset[2] - (-3.0 * config.STUDS_PER_METER)) < 0.01
+
+    def test_collider_zero_center(self):
+        """BoxCollider with zero m_Center should return zero offset."""
+        props = {
+            "m_Size": {"x": 1, "y": 1, "z": 1},
+            "m_Center": {"x": 0, "y": 0, "z": 0},
+            "m_IsTrigger": 0,
+        }
+        _size, _can_collide, offset = convert_collider("BoxCollider", props, (3.571, 3.571, 3.571))
+        assert offset == (0.0, 0.0, 0.0)
 
 
 class TestSphereCollider:
     def test_sphere_collider(self):
         """SphereCollider should create uniform size from radius."""
         props = {"m_Radius": 2.0, "m_IsTrigger": 0}
-        size, can_collide = convert_collider("SphereCollider", props, (1.0, 1.0, 1.0))
+        size, can_collide, _offset = convert_collider("SphereCollider", props, (1.0, 1.0, 1.0))
         # 2.0 * 2 * 3.571 = 14.28
         assert all(s > 14 for s in size)
         assert can_collide is True
@@ -55,7 +80,7 @@ class TestCapsuleCollider:
     def test_capsule_y_axis(self):
         """CapsuleCollider direction=1 should be tall on Y."""
         props = {"m_Radius": 0.5, "m_Height": 3.0, "m_Direction": 1, "m_IsTrigger": 0}
-        size, _ = convert_collider("CapsuleCollider", props, (1.0, 1.0, 1.0))
+        size, _, _offset = convert_collider("CapsuleCollider", props, (1.0, 1.0, 1.0))
         assert size[1] > size[0]  # Y should be tallest
 
 
@@ -63,7 +88,7 @@ class TestMeshCollider:
     def test_mesh_collider_preserves_size(self):
         """MeshCollider should not change size."""
         props = {"m_IsTrigger": 0}
-        size, can_collide = convert_collider("MeshCollider", props, (5.0, 10.0, 5.0))
+        size, can_collide, _offset = convert_collider("MeshCollider", props, (5.0, 10.0, 5.0))
         assert size == (5.0, 10.0, 5.0)
         assert can_collide is True
 
