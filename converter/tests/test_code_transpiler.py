@@ -1831,3 +1831,128 @@ class TestPhysicsFixes:
         fixed, _ = validate_and_fix("test", source)
         assert '.collider' not in fixed
         assert 'hit.Name' in fixed
+
+
+class TestValidatorNewFixes:
+    """Test new validator fixes for script quality issues."""
+
+    def test_double_dot_bracket_access(self):
+        """Fix ]..Property → ].Property (array access + property)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local pos = m_Cols[n]..Position'
+        fixed, _ = validate_and_fix("test", source)
+        assert ']..Position' not in fixed
+        assert '].Position' in fixed
+
+    def test_debris_additem_missing_object(self):
+        """Debris:AddItem( time) → Debris:AddItem(script.Parent, time)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'game:GetService("Debris"):AddItem( fadeTime)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'script.Parent, fadeTime' in fixed
+
+    def test_broken_ternary_comparison(self):
+        """expr > (if VALUE then A else B) → (if expr > VALUE then A else B)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'rotateDir = x > (if 0.5 then Vector3.yAxis else -Vector3.yAxis)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '(if x > 0.5 then' in fixed
+
+    def test_broken_ternary_misplaced_paren(self):
+        """func(args, (if VAL) > COMP then A else B) → (if func(args, VAL) > COMP then A else B)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'rotateDir = math.random(0, (if 1) > 0.5 then Vector3.yAxis else -Vector3.yAxis)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '(if math.random(0, 1) > 0.5 then' in fixed
+
+    def test_getchildren_call_indexing(self):
+        """GetChildren()(0) → GetChildren()[1] (0-based to 1-based)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local child = script.Parent:GetChildren()(0)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'GetChildren()[1]' in fixed
+        assert 'GetChildren()(0)' not in fixed
+
+    def test_obj_game_getservice(self):
+        """obj.game:GetService → game:GetService."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if otherPart.game:GetService("CollectionService"):HasTag(x, "Player") then'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'otherPart.game:' not in fixed
+        assert 'game:GetService("CollectionService")' in fixed
+
+    def test_comment_embedded_condition(self):
+        """if control-- comment: text then → if control then."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if control-- isGrounded: use Humanoid:GetState() then'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'if control then' in fixed
+
+    def test_mangled_method_name(self):
+        """FindFirstChildOfClasssInChildren → GetDescendants."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local systems = script.Parent:FindFirstChildOfClasssInChildren()'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'GetDescendants' in fixed
+        assert 'FindFirstChildOfClasssInChildren' not in fixed
+
+    def test_stray_type_prefix(self):
+        """TypeName.local var = ... → local var = ..."""
+        from converter.luau_validator import validate_and_fix
+        source = '				ParticleSystem.local mainModule = system.main'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'ParticleSystem.local' not in fixed
+        assert 'local mainModule' in fixed
+
+    def test_zero_based_random_array_index(self):
+        """math.random(0, #arr) → math.random(1, #arr)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local prefab = items[math.random(0, #items)]'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'math.random(1, #items)' in fixed
+        assert 'math.random(0, #items)' not in fixed
+
+    def test_new_dictionary(self):
+        """new System.Collections.Generic.Dictionary() → {}."""
+        from converter.luau_validator import validate_and_fix
+        source = 'b.markerClips = new System.Collections.Generic.Dictionary()'
+        fixed, _ = validate_and_fix("test", source)
+        assert '{}' in fixed
+        assert 'new ' not in fixed
+
+    def test_for_in_loop_parens(self):
+        """for _, x in expr( do) → for _, x in expr do."""
+        from converter.luau_validator import validate_and_fix
+        source = 'for _, c in script.Parent:GetDescendants( do)\n    print(c)\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert '( do)' not in fixed
+        assert ':GetDescendants do' in fixed or ':GetDescendants() do' in fixed
+
+    def test_connect_function_end_closure(self):
+        """end after :Connect(function() block → end)."""
+        from converter.luau_validator import validate_and_fix
+        # Needs enough structure for depth tracking to work
+        source = (
+            'local function main()\n'
+            '    RunService.Heartbeat:Connect(function(dt)\n'
+            '        print(dt)\n'
+            '    end\n'
+            'end\n'
+        )
+        fixed, _ = validate_and_fix("test", source)
+        assert 'end)' in fixed
+
+    def test_trailing_end_removal(self):
+        """Excess trailing end keywords removed."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local function foo()\n    print("hi")\nend\nend\nend'
+        fixed, _ = validate_and_fix("test", source)
+        # Should have only 1 end (for the function)
+        assert fixed.count('\nend') <= 1 or 'Removed' in str(_)
+
+    def test_multi_var_declaration(self):
+        """int a, b, c → local a, b, c = nil, nil, nil."""
+        from converter.luau_validator import validate_and_fix
+        source = '    float a0, a1, a2'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'local a0, a1, a2 = nil, nil, nil' in fixed

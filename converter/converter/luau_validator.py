@@ -538,6 +538,15 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
             source,
         )
 
+    # Fix Debris:AddItem with missing object argument (only has delay)
+    # Pattern: Debris:AddItem( time) or Debris:AddItem(time) where time is a single number/variable
+    if 'Debris' in source and 'AddItem' in source:
+        source = re.sub(
+            r'(game:GetService\("Debris"\):AddItem\()\s+(\w+)\)',
+            r'\1script.Parent, \2)',
+            source,
+        )
+
     # Fix bare ':Method()' or '.Property' calls without a receiver
     # e.g. ':FindFirstChildWhichIsA("Sound")' → 'script.Parent:FindFirstChildWhichIsA("Sound")'
     # Only match at the start of an expression (after =, return, (, or start of line with indent)
@@ -922,8 +931,8 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     # Clean up double dots from .gameObject/.transform removal
     # Only fix word..word (property access), NOT string concatenation (expr .. expr)
     if '..' in source:
-        # word..Word (no spaces) → word.Word (property access double-dot)
-        source = re.sub(r'(\w)\.\.([A-Za-z_])', r'\1.\2', source)
+        # word..Word or ]..Word (no spaces) → word.Word / ].Word (property access double-dot)
+        source = re.sub(r'([\w\]\)])\.\.([A-Za-z_])', r'\1.\2', source)
 
     # Fix: Animator.StringToHash("Name") → "Name" (Roblox uses strings, not hashes)
     if "StringToHash" in source:
@@ -1336,6 +1345,90 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         )
         fixes.append("Fixed unsafe require(... or nil) pattern")
 
+    # Fix broken ternary patterns from C# `condition ? a : b` conversion failures
+    # Pattern 1: `expr > (if VALUE then A else B)` → `(if expr > VALUE then A else B)`
+    if re.search(r'[><=~]+\s*\(if\s+', source):
+        source = re.sub(
+            r'(\S+)\s*([><=~]+)\s*\(if\s+(\S+)\s+then\s+(.+?)\s+else\s+(.+?)\)',
+            r'(if \1 \2 \3 then \4 else \5)',
+            source,
+        )
+        fixes.append("Fixed broken ternary expression")
+    # Pattern 2: `func(args, (if VAL) > COMP then A else B)` — paren around 'if VAL' closed too early
+    # e.g. `math.random(0, (if 1) > 0.5 then A else B)` → `(if math.random(0, 1) > 0.5 then A else B)`
+    if re.search(r'\(if\s+\S+\)\s*[><=~]', source):
+        lines = source.split('\n')
+        new_lines = []
+        for line in lines:
+            m = re.search(r'(=\s*)(.*?)\(if\s+(\S+)\)\s*([><=~]+)\s*(\S+)\s+then\s+(.+?)\s+else\s+(.+)', line)
+            if m:
+                indent_assign = m.group(1)
+                func_prefix = m.group(2)
+                val = m.group(3)
+                op = m.group(4)
+                comp = m.group(5)
+                true_expr = m.group(6)
+                false_expr = m.group(7).rstrip(')')
+                full_expr = func_prefix + val + ')'
+                start = line[:m.start()]
+                line = '%s%s(if %s %s %s then %s else %s)' % (
+                    start, indent_assign, full_expr, op, comp, true_expr, false_expr)
+            new_lines.append(line)
+        source = '\n'.join(new_lines)
+        fixes.append("Fixed broken ternary with misplaced paren")
+
+    # Fix GetChildren()(N) → GetChildren()[N+1] (function call result indexed like function call)
+    if 'GetChildren()(' in source:
+        def _fix_getchildren_idx(m):
+            idx = m.group(1)
+            try:
+                return 'GetChildren()[%d]' % (int(idx) + 1)
+            except ValueError:
+                return 'GetChildren()[%s + 1]' % idx
+        source = re.sub(r'GetChildren\(\)\((\w+)\)', _fix_getchildren_idx, source)
+        fixes.append("Fixed GetChildren()(N) → GetChildren()[N+1]")
+
+    # Fix obj.game:GetService → game:GetService (stray object prefix before game:)
+    if re.search(r'\w+\.game:GetService', source):
+        source = re.sub(r'\w+\.game:GetService', 'game:GetService', source)
+        fixes.append("Fixed obj.game:GetService → game:GetService")
+
+    # Fix comment-embedded conditions: `if control-- comment: text then` → `if control then`
+    if re.search(r'if\s+\w+--\s+\w+', source):
+        source = re.sub(
+            r'if\s+(\w+)--\s+[^\n]*?\s+then',
+            r'if \1 then',
+            source,
+        )
+        fixes.append("Fixed comment-embedded condition")
+
+    # Fix mangled method names from transpilation
+    if 'FindFirstChildOfClasssInChildren' in source:
+        source = source.replace(
+            'FindFirstChildOfClasssInChildren',
+            'GetDescendants',
+        )
+        fixes.append("Fixed mangled FindFirstChildOfClasssInChildren → GetDescendants")
+
+    # Fix stray type prefixes: `TypeName.local varName = ...` → `local varName = ...`
+    if re.search(r'^\s*\w+\.local\s+', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s*)\w+\.local\s+(\w+)',
+            r'\1local \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Fixed stray type prefix before local declaration")
+
+    # Fix 0-based array indexing with math.random: `arr[math.random(0, #arr)]` → `arr[math.random(1, #arr)]`
+    if 'math.random(0,' in source:
+        source = re.sub(
+            r'math\.random\(0,\s*#(\w+)\)',
+            r'math.random(1, #\1)',
+            source,
+        )
+        fixes.append("Fixed 0-based math.random to 1-based for array indexing")
+
     if source != original:
         fixes.append("Fixed common API mistakes")
         log.info("  [%s] Fixed common API/syntax mistakes", name)
@@ -1401,6 +1494,16 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
         pattern = rf'^(\s+){ctype}\s+(\w+)\s*='
         if re.search(pattern, source, re.MULTILINE):
             source = re.sub(pattern, r'\1local \2 =', source, flags=re.MULTILINE)
+        # "Type var1, var2, var3" (multi-variable declaration) → "local var1, var2, var3 = nil, nil, nil"
+        pattern = rf'^(\s+){ctype}\s+(\w+(?:\s*,\s*\w+)+)\s*$'
+        if re.search(pattern, source, re.MULTILINE):
+            def _multi_var_decl(m):
+                indent = m.group(1)
+                vars_str = m.group(2)
+                var_names = [v.strip() for v in vars_str.split(',')]
+                nils = ', '.join(['nil'] * len(var_names))
+                return f'{indent}local {", ".join(var_names)} = {nils}'
+            source = re.sub(pattern, _multi_var_decl, source, flags=re.MULTILINE)
         # "Type varName" (declaration without init) → "local varName = nil"
         pattern = rf'^(\s+){ctype}\s+(\w+)\s*$'
         if re.search(pattern, source, re.MULTILINE):
@@ -1561,6 +1664,17 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
         )
         fixes.append("Converted C# property getters to Luau functions")
 
+    # Comment out remaining C# property declarations with get/set that couldn't be parsed
+    # These have comment interruptions or complex patterns the regex above can't handle
+    if re.search(r'^\s*(?:bool|int|float|string|[\w.]+)\s+\w.*\{\s*get\s*[\{;]', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s*)((?:bool|int|float|string|[\w.]+)\s+\w.*\{\s*get\s*[\{;].*)$',
+            r'\1-- [#C] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out unparseable C# property declarations")
+
     # Fix C# expression-bodied members: "Type Name => expr" → "local function get_Name() return expr end"
     # Also handles: "local Name => expr" (from pre-processing)
     if '=>' in source:
@@ -1706,6 +1820,60 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
         )
         fixes.append("Fixed list initialization → {}")
 
+    # Fix bare `new Namespace.Type()` → `{}` (C# constructor that leaked through)
+    if re.search(r'\bnew\s+[A-Z]', source):
+        source = re.sub(
+            r'\bnew\s+[\w.]+(?:Dictionary|List|HashSet|Queue|Stack|ArrayList)\s*\(\)',
+            '{}',
+            source,
+        )
+        # new Type() for other types → nil
+        source = re.sub(
+            r'\bnew\s+[\w.]+\s*\(\)',
+            'nil --[[ new instance ]]',
+            source,
+        )
+        fixes.append("Fixed bare C# new constructor")
+
+    # Fix malformed for-in loops: `for _, x in expr( do)` → `for _, x in expr do`
+    # Caused by C# foreach parentheses partially surviving conversion
+    if '( do)' in source:
+        source = re.sub(r'\(\s*do\)', ' do', source)
+        fixes.append("Fixed malformed for-in loop parentheses")
+
+    # Remove orphaned `end` after Start/Awake comment markers
+    # Pattern: "-- Start: runs..." or "-- Awake: runs..." followed by code lines then bare `end`
+    # The `end` is from the C# method closing brace and has no matching opener
+    if '-- Start: runs' in source or '-- Awake: runs' in source:
+        lines_tmp = source.split('\n')
+        new_lines_tmp = []
+        in_startup_block = False
+        for i, line in enumerate(lines_tmp):
+            stripped = line.strip()
+            if '-- Start: runs' in stripped or '-- Awake: runs' in stripped:
+                in_startup_block = True
+                new_lines_tmp.append(line)
+                continue
+            if in_startup_block and stripped == 'end':
+                # Check if next non-empty line is NOT indented more (i.e., this end closes the method)
+                next_indent = -1
+                for j in range(i + 1, len(lines_tmp)):
+                    ns = lines_tmp[j].strip()
+                    if ns and not ns.startswith('--'):
+                        next_indent = len(lines_tmp[j]) - len(lines_tmp[j].lstrip())
+                        break
+                curr_indent = len(line) - len(line.lstrip())
+                if next_indent <= curr_indent:
+                    # This `end` closes the startup method — skip it
+                    in_startup_block = False
+                    continue
+            if in_startup_block and stripped and not stripped.startswith('--'):
+                # We're in a startup block with real code — don't auto-skip
+                pass
+            new_lines_tmp.append(line)
+        source = '\n'.join(new_lines_tmp)
+        fixes.append("Removed orphaned end after Start/Awake block")
+
     # Fix "obj.Parent =(expr; expr2)" (from C# inline post-increment in assignment)
     # Pattern: "x.Parent =(y; z = z + 1 --[[post-increment]])"
     if re.search(r'\.Parent\s*=\s*\([^;]+;', source):
@@ -1791,14 +1959,120 @@ def _fix_missing_end_keywords(name: str, source: str, fixes: list[str]) -> str:
 
     source = '\n'.join(result)
 
+    # Pass 1b: fix `end` → `end)` for `:Connect(function(` blocks
+    # When a line has `:Connect(function(...)`, the block-closing `end` must be `end)`
+    if ':Connect(function(' in source:
+        lines2 = source.split('\n')
+        connect_stack = []  # stack of (indent_level, depth) for Connect(function blocks
+        depth = 0
+        result2 = []
+        for line in lines2:
+            stripped = line.strip()
+            indent = len(line) - len(line.lstrip()) if line.strip() else -1
+            # Count nested block depth
+            if not stripped.startswith('--'):
+                if re.search(r'\bfunction\s*[\w.:(]', stripped):
+                    if not (stripped.endswith(' end') or stripped.endswith('\tend')):
+                        depth += 1
+                if re.match(r'(?:if|elseif)\b.+\bthen\s*$', stripped):
+                    depth += 1
+                if re.match(r'for\b.+\bdo\s*$', stripped):
+                    depth += 1
+                if re.match(r'while\b.+\bdo\s*$', stripped):
+                    depth += 1
+            # Check if this opens a Connect(function block
+            if re.search(r':Connect\(function\s*\(', stripped):
+                connect_stack.append(depth)  # record depth at open
+            # Check if this is a bare `end` that should close a Connect(function block
+            # depth matches the depth when Connect was opened (function already counted)
+            if stripped == 'end' and connect_stack and depth == connect_stack[-1]:
+                connect_stack.pop()
+                ws = line[:indent] if indent >= 0 else ''
+                result2.append(ws + 'end)')
+                depth -= 1
+                continue
+            # Update depth for closers
+            if not stripped.startswith('--'):
+                if stripped == 'end' or stripped.startswith('end)'):
+                    depth -= 1
+                if re.match(r'until\b', stripped):
+                    depth -= 1
+            result2.append(line)
+        source = '\n'.join(result2)
+
     # Second pass: fix single-statement if/then blocks missing 'end'
     # Pattern: "if COND then" on one line, single statement on next line,
     # then a line at same or lower indent that is NOT end/else/elseif
     # → insert 'end' after the single statement
     source = _insert_missing_ends_for_single_statement_blocks(source, fixes)
 
+    # Third pass: remove excess trailing `end` keywords from C# class closing braces
+    # Count block openers vs closers — if there are more `end` than openers,
+    # remove trailing `end` lines from the bottom of the script
+    source = _remove_excess_trailing_ends(source, fixes)
+
     if source != original:
         fixes.append("Fixed missing end keywords / stray braces")
+
+    return source
+
+
+def _remove_excess_trailing_ends(source: str, fixes: list[str]) -> str:
+    """Remove excess `end` keywords from the end of a script.
+
+    C# class/namespace/method closing braces `}` get converted to `end` but
+    have no matching block opener. Uses a stack-based approach to count
+    actual block depth and removes orphaned trailing `end` keywords.
+    """
+    lines = source.split('\n')
+
+    # Stack-based block depth tracking
+    depth = 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('--'):
+            continue
+        # Count block openers (skip single-line definitions like "function() ... end")
+        if re.search(r'\bfunction\s*[\w.:(]', stripped):
+            # Only count as opener if line does NOT also end with 'end'
+            if not stripped.endswith(' end') and not stripped.endswith('\tend'):
+                depth += 1
+        if re.match(r'(?:if|elseif)\b.+\bthen\s*$', stripped):
+            depth += 1
+        if re.match(r'for\b.+\bdo\s*$', stripped):
+            depth += 1
+        if re.match(r'while\b.+\bdo\s*$', stripped):
+            depth += 1
+        if stripped == 'repeat':
+            depth += 1
+        # Count closers (standalone end, end), end),)
+        if stripped == 'end' or stripped.startswith('end)'):
+            depth -= 1
+        if re.match(r'until\b', stripped):
+            depth -= 1
+
+    # If depth is negative, we have more closers than openers
+    excess = -depth
+    if excess <= 0:
+        return source
+
+    # Remove excess trailing `end` lines from the bottom
+    removed = 0
+    while removed < excess and lines:
+        idx = len(lines) - 1
+        while idx >= 0 and not lines[idx].strip():
+            idx -= 1
+        if idx < 0:
+            break
+        if lines[idx].strip() == 'end':
+            lines.pop(idx)
+            removed += 1
+        else:
+            break
+
+    if removed > 0:
+        fixes.append(f"Removed {removed} excess trailing 'end' keywords")
+        return '\n'.join(lines)
 
     return source
 

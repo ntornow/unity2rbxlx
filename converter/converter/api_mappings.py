@@ -488,7 +488,7 @@ API_CALL_MAP: dict[str, str] = {
     "GameObject.Instantiate": ":Clone()",
     "Invoke(": "task.delay(",
     # -- Destroy with delay --
-    "Destroy(gameObject,": "Debris:AddItem(",
+    "Destroy(gameObject,": "Debris:AddItem(script.Parent,",
     "Destroy(this.gameObject,": "Debris:AddItem(script.Parent,",
     # -- Array/Collection operations --
     "Array.Resize": "-- Array.Resize: tables resize automatically in Luau",
