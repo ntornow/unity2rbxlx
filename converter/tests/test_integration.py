@@ -803,6 +803,12 @@ class TestLuauValidator:
         assert "tonumber" in fixed
         assert "TryParse" not in fixed
 
+    def test_fix_dt_in_task_wait_loop(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'while running do\n    pos = pos + vel * dt\n    task.wait()\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert "dt = task.wait()" in fixed
+
 
 class TestMeshSizing:
     """Tests for mesh size computation."""

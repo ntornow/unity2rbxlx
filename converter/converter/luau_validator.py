@@ -2403,6 +2403,38 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         )
         fixes.append("Fixed .Sort() → table.sort()")
 
+    # Fix `dt` usage in task.wait() loops: `task.wait()` → `dt = task.wait()`
+    # When `dt` is used in a while/for loop that has task.wait(), the dt should come
+    # from task.wait()'s return value (not from RunService callback parameter)
+    if 'task.wait()' in source and re.search(r'\bdt\b', source):
+        lines = source.split('\n')
+        in_loop = False
+        loop_uses_dt = False
+        loop_start = -1
+        new_lines = []
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith('--'):
+                new_lines.append(line)
+                continue
+            # Detect while/for loops
+            if re.search(r'\b(while|for)\b.*\bdo\b', stripped):
+                in_loop = True
+                loop_start = i
+                loop_uses_dt = False
+            if in_loop and re.search(r'\bdt\b', stripped) and 'task.wait' not in stripped:
+                loop_uses_dt = True
+            # Replace task.wait() with dt = task.wait() in loops that use dt
+            if in_loop and stripped == 'task.wait()' and loop_uses_dt:
+                indent = line[:len(line) - len(line.lstrip())]
+                new_lines.append(f'{indent}dt = task.wait()')
+                fixes.append("Fixed task.wait() → dt = task.wait() in loop using dt")
+            else:
+                new_lines.append(line)
+            if stripped == 'end' and in_loop:
+                in_loop = False
+        source = '\n'.join(new_lines)
+
     if source != original:
         fixes.append("Fixed common API mistakes")
         log.info("  [%s] Fixed common API/syntax mistakes", name)
