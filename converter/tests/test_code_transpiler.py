@@ -1956,3 +1956,22 @@ class TestValidatorNewFixes:
         source = '    float a0, a1, a2'
         fixed, _ = validate_and_fix("test", source)
         assert 'local a0, a1, a2 = nil, nil, nil' in fixed
+
+    def test_remaining_csharp_ternary(self):
+        """condition() ? a : b → (if condition() then a else b)."""
+        from converter.luau_validator import validate_and_fix
+        source = '    state = ShouldTransition() ? _targetState : nil'
+        fixed, _ = validate_and_fix("test", source)
+        assert '(if ShouldTransition() then _targetState else nil)' in fixed
+        assert '?' not in fixed
+
+    def test_using_after_blank_line(self):
+        """using System after blank line gets commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local x = 1\n\nusing System\n-- using System.Collections;'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- using System' in fixed
+        # Should not have bare 'using System'
+        for line in fixed.split('\n'):
+            if line.strip().startswith('using '):
+                assert False, f"Bare using statement remains: {line}"

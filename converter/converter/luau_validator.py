@@ -1346,11 +1346,29 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         )
         fixes.append("Fixed unsafe require(... or nil) pattern")
 
+    # Fix remaining C# ternary operators: `condition ? a : b` → `if condition then a else b`
+    # This catches ternaries the transpiler missed (e.g., function call conditions)
+    # Only match after `= ` to avoid mismatching other patterns
+    if ' ? ' in source and ' : ' in source:
+        def _fix_remaining_ternary(m):
+            assign = m.group(1)
+            cond = m.group(2).strip()
+            true_expr = m.group(3).strip()
+            false_expr = m.group(4).strip()
+            return f'{assign}(if {cond} then {true_expr} else {false_expr})'
+        source = re.sub(
+            r'(=\s+)(\S+(?:\([^)]*\))?)\s+\?\s+([^:?]+?)\s+:\s+(\S+)',
+            _fix_remaining_ternary,
+            source,
+        )
+        fixes.append("Fixed remaining C# ternary operators")
+
     # Fix broken ternary patterns from C# `condition ? a : b` conversion failures
     # Pattern 1: `expr > (if VALUE then A else B)` → `(if expr > VALUE then A else B)`
-    if re.search(r'[><=~]+\s*\(if\s+', source):
+    # Only match actual comparison operators (>=, <=, ==, ~=, >, <), NOT assignment (=)
+    if re.search(r'(?:>=|<=|==|~=|[><])\s*\(if\s+', source):
         source = re.sub(
-            r'(\S+)\s*([><=~]+)\s*\(if\s+(\S+)\s+then\s+(.+?)\s+else\s+(.+?)\)',
+            r'(\S+)\s*(>=|<=|==|~=|[><])\s*\(if\s+(\S+)\s+then\s+(.+?)\s+else\s+(.+?)\)',
             r'(if \1 \2 \3 then \4 else \5)',
             source,
         )
