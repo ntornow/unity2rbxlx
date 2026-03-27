@@ -2056,6 +2056,79 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
 
     # (.ToString() already handled earlier in the function)
 
+    # .StartsWith("str") → string.sub(var, 1, #"str") == "str"
+    if '.StartsWith(' in source:
+        def _fix_startswith(m):
+            var, arg = m.group(1), m.group(2)
+            return f'string.sub({var}, 1, #{arg}) == {arg}'
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.StartsWith\(("[^"]*")\)',
+            _fix_startswith,
+            source,
+        )
+        fixes.append("Fixed .StartsWith() → string.sub comparison")
+
+    # .EndsWith("str") → string.sub(var, -#"str") == "str"
+    if '.EndsWith(' in source:
+        def _fix_endswith(m):
+            var, arg = m.group(1), m.group(2)
+            return f'string.sub({var}, -#{arg}) == {arg}'
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.EndsWith\(("[^"]*")\)',
+            _fix_endswith,
+            source,
+        )
+        fixes.append("Fixed .EndsWith() → string.sub comparison")
+
+    # .Substring(start) → string.sub(var, start + 1) (0-based → 1-based)
+    # .Substring(start, length) → string.sub(var, start + 1, start + length)
+    if '.Substring(' in source:
+        # Two-arg: .Substring(start, length)
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.Substring\((\w+),\s*(\w+)\)',
+            r'string.sub(\1, \2 + 1, \2 + \3)',
+            source,
+        )
+        # One-arg: .Substring(start)
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.Substring\((\w+)\)',
+            r'string.sub(\1, \2 + 1)',
+            source,
+        )
+        fixes.append("Fixed .Substring() → string.sub()")
+
+    # .Trim() → string.match(var, "^%s*(.-)%s*$") or var:match(...)
+    if '.Trim()' in source:
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.Trim\(\)',
+            r'string.match(\1, "^%%s*(.-)%%s*$")',
+            source,
+        )
+        fixes.append("Fixed .Trim() → string.match trim pattern")
+
+    # int.Parse(x) / float.Parse(x) → tonumber(x)
+    if '.Parse(' in source:
+        source = re.sub(r'\b(?:int|float|double|long|short|byte|ushort|uint|ulong)\.Parse\(([^)]+)\)', r'tonumber(\1)', source)
+        fixes.append("Fixed Type.Parse() → tonumber()")
+
+    # int.TryParse(x, out var) → tonumber(x) pattern
+    if '.TryParse(' in source:
+        source = re.sub(
+            r'\b(?:int|float|double)\.TryParse\(([^,]+),\s*(?:out\s+)?(\w+)\)',
+            r'\2 = tonumber(\1); \2 ~= nil',
+            source,
+        )
+        fixes.append("Fixed Type.TryParse() → tonumber()")
+
+    # StringBuilder → table.concat pattern (comment out broken usages)
+    if 'StringBuilder' in source:
+        source = re.sub(r'^\s*StringBuilder\s+\w+.*$', lambda m: f'-- {m.group(0).strip()} (no StringBuilder in Luau)', source, flags=re.MULTILINE)
+        if '.AppendFormat(' in source or '.Append(' in source:
+            source = re.sub(r'(\w+)\.AppendFormat\(', r'-- \1.AppendFormat(', source)
+            source = re.sub(r'(\w+)\.Append\(', r'-- \1.Append(', source)
+            source = re.sub(r'(\w+)\.EnsureCapacity\(', r'-- \1.EnsureCapacity(', source)
+        fixes.append("Commented out StringBuilder usage (not available in Luau)")
+
     # `continue` keyword → restructure with if/end wrap
     # Luau doesn't have `continue` — wrap remaining loop body in `if` instead
     if re.search(r'^\s*continue\s*$', source, re.MULTILINE):

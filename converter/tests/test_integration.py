@@ -768,6 +768,41 @@ class TestLuauValidator:
         fixed, _ = validate_and_fix("test", source)
         assert "continue" not in fixed or "-- continue" in fixed
 
+    def test_fix_starts_with(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'if line.StartsWith("#") then'
+        fixed, _ = validate_and_fix("test", source)
+        assert "string.sub" in fixed
+        assert ".StartsWith" not in fixed
+
+    def test_fix_substring(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local cmd = msg.Substring(1, length)'
+        fixed, _ = validate_and_fix("test", source)
+        assert "string.sub" in fixed
+        assert ".Substring" not in fixed
+
+    def test_fix_trim(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local cleaned = text.Trim()'
+        fixed, _ = validate_and_fix("test", source)
+        assert "string.match" in fixed
+        assert ".Trim()" not in fixed
+
+    def test_fix_int_parse(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local n = int.Parse(input)'
+        fixed, _ = validate_and_fix("test", source)
+        assert "tonumber(input)" in fixed
+        assert "int.Parse" not in fixed
+
+    def test_fix_int_tryparse(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'if int.TryParse(str, out result) then'
+        fixed, _ = validate_and_fix("test", source)
+        assert "tonumber" in fixed
+        assert "TryParse" not in fixed
+
 
 class TestMeshSizing:
     """Tests for mesh size computation."""
