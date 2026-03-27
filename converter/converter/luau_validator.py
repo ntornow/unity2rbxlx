@@ -267,6 +267,69 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
     """Fix C# syntax remnants that sometimes survive AI transpilation."""
     original = source
 
+    # Strip BOM characters
+    source = source.replace('\ufeff', '')
+
+    # Comment out remaining C# class declarations
+    source = re.sub(r'^(\s*)class\s+\w+.*$', r'\1-- \g<0>', source, flags=re.MULTILINE)
+
+    # Comment out bare 'using' statements (C# imports without -- prefix)
+    source = re.sub(r'^(\s*)using\s+\w+', r'-- \g<0>', source, flags=re.MULTILINE)
+
+    # Comment out 'namespace' declarations
+    source = re.sub(r'^(\s*)namespace\s+\w+', r'-- \g<0>', source, flags=re.MULTILINE)
+
+    # Comment out 'base.Method()' calls (C# base class calls)
+    if 'base.' in source:
+        source = re.sub(r'^(\s*)base\.(\w+)', r'\1-- base.\2', source, flags=re.MULTILINE)
+
+    # Strip C# generic type parameters from method calls and expressions
+    # e.g. :FindFirstChildOfClass<Player>() → :FindFirstChildOfClass("Player")
+    #       GetComponent<Rigidbody>() → FindFirstChildWhichIsA("Rigidbody")
+    if '<' in source and '>' in source:
+        # Convert GetComponent<Type>() → :FindFirstChildWhichIsA("Type")
+        source = re.sub(
+            r'(?::|\.)GetComponent<(\w+)>\s*\(\)',
+            r':FindFirstChildWhichIsA("\1")',
+            source,
+        )
+        # Convert :FindFirstChildOfClass<Type>() → :FindFirstChildWhichIsA("Type")
+        source = re.sub(
+            r':FindFirstChildOfClass<(\w+)>\s*\(\)',
+            r':FindFirstChildWhichIsA("\1")',
+            source,
+        )
+        # Strip remaining generic type parameters from method calls: Method<Type>(...) → Method(...)
+        source = re.sub(r'(\w+)<[A-Z]\w+(?:,\s*[A-Z]\w+)*>\s*\(', r'\1(', source)
+        # Strip generic type in static method calls: Foo<Bar>.Method() → Foo.Method()
+        source = re.sub(r'(\w+)<[A-Z]\w+(?:,\s*[A-Z]\w+)*>\.', r'\1.', source)
+        # Strip generic type after parens: ():GetDescendants()<Type>() → :GetDescendants()
+        source = re.sub(r'\(\)<[A-Z]\w+>\(\)', '()', source)
+        # Strip C# type casts with generics: (TypeName<T>)expr → expr
+        source = re.sub(r'\([A-Z]\w+<[A-Z]\w+>\)', '', source)
+        if source != original:
+            fixes.append("Stripped C# generic type parameters")
+
+    # Fix bare ':Method()' or '.Property' calls without a receiver
+    # e.g. ':FindFirstChildWhichIsA("Sound")' → 'script.Parent:FindFirstChildWhichIsA("Sound")'
+    # Only match at the start of an expression (after =, return, (, or start of line with indent)
+    if re.search(r'(?:^|=|return|\()\s*:', source, re.MULTILINE):
+        source = re.sub(
+            r'((?:^|=|return\s|,|\()\s*):(\w+)',
+            r'\1script.Parent:\2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Added 'script.Parent' receiver to bare method calls")
+
+    # Fix bare '.Property' access without a receiver (e.g., '.Position')
+    if re.search(r'(?:^|=|return|\()\s*\.(?!\.)', source, re.MULTILINE):
+        source = re.sub(
+            r'((?:=|return\s|,|\()\s*)\.(\w+)',
+            r'\1script.Parent.\2',
+            source,
+        )
+
     # Fix 'this.' prefix (C# self-reference, not valid in Luau)
     if re.search(r'\bthis\.', source):
         source = re.sub(r'\bthis\.(\w+)', r'script.Parent.\1', source)
@@ -559,12 +622,18 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
     # Fix string.gsub literal patterns: string.gsub(s, ".", repl) → escape Lua pattern chars
     # C# string.Replace does literal replacement, but Luau string.gsub uses patterns.
     # Escape Lua pattern magic characters: ( ) . % + - * ? [ ] ^ $
+    # BUT: skip if the pattern already contains Lua pattern sequences (%s, %d, %w, etc.)
+    # which indicates it's an intentional Lua pattern, not a literal from string.Replace.
     if 'string.gsub(' in source:
         _LUA_MAGIC = set('().%+-*?[]^$')
 
         def _escape_gsub_literal(m):
             full = m.group(0)
             pattern_str = m.group(1)
+            # If pattern already contains Lua pattern classes (%s, %d, %w, %a, etc.)
+            # or anchors used as patterns (^, $), it's already a proper Lua pattern
+            if re.search(r'%[sdwalpucx]', pattern_str) or pattern_str.startswith('^') or pattern_str.endswith('$'):
+                return full
             if any(c in _LUA_MAGIC for c in pattern_str):
                 escaped = ''
                 for c in pattern_str:
@@ -579,6 +648,14 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
             _escape_gsub_literal,
             source,
         )
+
+    # Fix .Find("name") → :FindFirstChild("name") (Unity Transform.Find)
+    if '.Find(' in source:
+        source = re.sub(r'\.Find\(("?[^)"]+\s*"?)\)', r':FindFirstChild(\1)', source)
+
+    # Fix '.:Method()' → ':Method()' (dangling dot before colon method)
+    if '.:' in source:
+        source = re.sub(r'\.:(\w+)', r':\1', source)
 
     # Fix SetActive: obj.SetActive(bool) → setActive(obj, bool)
     # This provides proper recursive enable/disable for the hierarchy
@@ -706,6 +783,32 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             )
 
     # string.pack/string.unpack ARE available in Roblox Luau — no warning needed
+
+    # Fix Unity method calls that use dot instead of colon syntax
+    # These are common methods that must use : in Luau
+    _DOT_TO_COLON_METHODS = [
+        "Play", "Stop", "Pause", "Resume",
+        "Clone", "Destroy", "ClearAllChildren",
+        "SetPrimaryPartCFrame", "MoveTo",
+        "WaitForChild", "FindFirstChild", "FindFirstChildWhichIsA",
+        "GetChildren", "GetDescendants",
+        "IsA", "IsDescendantOf", "IsAncestorOf",
+        "SetAttribute", "GetAttribute",
+    ]
+    for method in _DOT_TO_COLON_METHODS:
+        pattern = f'.{method}('
+        if pattern in source:
+            # Fix when preceded by a word character or closing paren/bracket (receiver)
+            source = re.sub(
+                rf'([\w\)\]])\.\b{method}\b\(',
+                rf'\1:{method}(',
+                source,
+            )
+
+    # Fix Unity property names to Roblox PascalCase
+    # .enabled → .Enabled (for Roblox instances)
+    if '.enabled' in source:
+        source = re.sub(r'\.enabled\b', '.Enabled', source)
 
     # Fix 'require(expr or nil)' → safe require with nil check
     if 'or nil)' in source and 'require(' in source:

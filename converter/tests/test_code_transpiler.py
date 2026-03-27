@@ -964,6 +964,82 @@ class TestStringGsubEscaping:
         result = _fix_csharp_remnants("test", source, fixes)
         assert '"hello"' in result
 
+    def test_no_double_escaping_lua_patterns(self):
+        """Lua pattern classes like %s, %d should NOT be escaped."""
+        from converter.luau_validator import _fix_csharp_remnants
+        # Leading whitespace pattern
+        source = 'local result = string.gsub(name, "^%s+", "")'
+        fixes = []
+        result = _fix_csharp_remnants("test", source, fixes)
+        assert '"^%s+"' in result  # Should be preserved, not double-escaped
+
+    def test_no_double_escaping_trailing_whitespace(self):
+        """Trailing whitespace pattern %s+$ should be preserved."""
+        from converter.luau_validator import _fix_csharp_remnants
+        source = 'local result = string.gsub(name, "%s+$", "")'
+        fixes = []
+        result = _fix_csharp_remnants("test", source, fixes)
+        assert '"%s+$"' in result  # Should be preserved
+
+    def test_no_double_escaping_digit_pattern(self):
+        """Digit pattern %d+ should be preserved."""
+        from converter.luau_validator import _fix_csharp_remnants
+        source = 'local result = string.gsub(str, "%d+", "NUM")'
+        fixes = []
+        result = _fix_csharp_remnants("test", source, fixes)
+        assert '"%d+"' in result
+
+
+class TestGenericTypeStripping:
+    """Test C# generic type parameter stripping in validator."""
+
+    def test_getcomponent_generic(self):
+        from converter.luau_validator import _fix_csharp_remnants
+        source = 'local rb = obj:GetComponent<Rigidbody>()'
+        fixes = []
+        result = _fix_csharp_remnants("test", source, fixes)
+        assert ':FindFirstChildWhichIsA("Rigidbody")' in result
+
+    def test_find_first_child_of_class_generic(self):
+        from converter.luau_validator import _fix_csharp_remnants
+        source = 'local player = other:FindFirstChildOfClass<Player>()'
+        fixes = []
+        result = _fix_csharp_remnants("test", source, fixes)
+        assert ':FindFirstChildWhichIsA("Player")' in result
+
+    def test_generic_method_call(self):
+        from converter.luau_validator import _fix_csharp_remnants
+        source = 'local items = GetAll<ItemData>()'
+        fixes = []
+        result = _fix_csharp_remnants("test", source, fixes)
+        assert 'GetAll(' in result
+        assert '<ItemData>' not in result
+
+
+class TestBareReceiverFix:
+    """Test bare :Method() and .Property without receiver."""
+
+    def test_bare_method_call(self):
+        from converter.luau_validator import _fix_csharp_remnants
+        source = 'local snd = :FindFirstChildWhichIsA("Sound")'
+        fixes = []
+        result = _fix_csharp_remnants("test", source, fixes)
+        assert 'script.Parent:FindFirstChildWhichIsA("Sound")' in result
+
+    def test_bare_method_in_return(self):
+        from converter.luau_validator import _fix_csharp_remnants
+        source = 'return :FindFirstChild("Weapon")'
+        fixes = []
+        result = _fix_csharp_remnants("test", source, fixes)
+        assert 'script.Parent:FindFirstChild("Weapon")' in result
+
+    def test_bare_method_indented(self):
+        from converter.luau_validator import _fix_csharp_remnants
+        source = '        :FindFirstChildWhichIsA("Sound"):Play()'
+        fixes = []
+        result = _fix_csharp_remnants("test", source, fixes)
+        assert 'script.Parent:FindFirstChildWhichIsA("Sound")' in result
+
 
 class TestSetActiveConversion:
     """Test SetActive → recursive setActive utility function."""

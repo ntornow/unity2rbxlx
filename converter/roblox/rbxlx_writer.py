@@ -973,42 +973,69 @@ def _pretty_xml(root: ET.Element) -> str:
 
     result = "\n".join(lines)
 
-    # Wrap ProtectedString content in CDATA, undoing XML escaping
+    # Wrap ProtectedString and BinaryString content in CDATA, undoing XML escaping
     # that minidom applied to the script source text.
-    import re
+    # Uses a scan-based approach instead of regex to avoid issues with non-greedy
+    # matching across many elements with multiline content.
     import html
 
-    def _cdata_wrap(m: re.Match) -> str:
-        tag_open = m.group(1)
-        content = m.group(2)
-        tag_close = m.group(3)
-        # Undo XML entity escaping inside CDATA (minidom escaped our Luau source)
-        content = html.unescape(content)
-        return f"{tag_open}<![CDATA[{content}]]>{tag_close}"
-
-    result = re.sub(
-        r"(<ProtectedString[^>]*>)(.*?)(</ProtectedString>)",
-        _cdata_wrap,
-        result,
-        flags=re.DOTALL,
-    )
-
-    # Also wrap BinaryString content in CDATA (required for SmoothGrid etc.)
-    def _cdata_wrap_binary(m: re.Match) -> str:
-        tag_open = m.group(1)
-        content = m.group(2)
-        tag_close = m.group(3)
-        content = html.unescape(content)
-        return f"{tag_open}<![CDATA[{content}]]>{tag_close}"
-
-    result = re.sub(
-        r"(<BinaryString[^>]*>)(.*?)(</BinaryString>)",
-        _cdata_wrap_binary,
-        result,
-        flags=re.DOTALL,
-    )
+    result = _wrap_elements_in_cdata(result, "ProtectedString")
+    result = _wrap_elements_in_cdata(result, "BinaryString")
 
     return result
+
+
+def _wrap_elements_in_cdata(xml_str: str, tag_name: str) -> str:
+    """Wrap all <tagName>content</tagName> elements in CDATA sections.
+
+    Uses a forward scan to find matched open/close tags robustly,
+    avoiding regex backtracking issues with large multiline content.
+    """
+    import html
+    open_tag = f"<{tag_name} "
+    close_tag = f"</{tag_name}>"
+    parts: list[str] = []
+    pos = 0
+
+    while pos < len(xml_str):
+        # Find next opening tag
+        open_idx = xml_str.find(open_tag, pos)
+        if open_idx < 0:
+            parts.append(xml_str[pos:])
+            break
+
+        # Find the end of the opening tag (the >)
+        tag_end = xml_str.find(">", open_idx)
+        if tag_end < 0:
+            parts.append(xml_str[pos:])
+            break
+
+        # Check for self-closing tag
+        if xml_str[tag_end - 1] == "/":
+            # Self-closing: <TagName .../> — keep as-is
+            parts.append(xml_str[pos:tag_end + 1])
+            pos = tag_end + 1
+            continue
+
+        # Find matching close tag
+        close_idx = xml_str.find(close_tag, tag_end + 1)
+        if close_idx < 0:
+            # No close tag found — keep as-is (shouldn't happen in valid XML)
+            parts.append(xml_str[pos:tag_end + 1])
+            pos = tag_end + 1
+            continue
+
+        # Extract pieces
+        before = xml_str[pos:tag_end + 1]  # Everything up to and including >
+        content = xml_str[tag_end + 1:close_idx]
+        # Undo XML entity escaping inside CDATA (minidom escaped our source)
+        content = html.unescape(content)
+        # Escape any ]]> in content to prevent breaking CDATA
+        content = content.replace("]]>", "]]]]><![CDATA[>")
+        parts.append(f"{before}<![CDATA[{content}]]>{close_tag}")
+        pos = close_idx + len(close_tag)
+
+    return "".join(parts)
 
 
 def _count_parts(part: RbxPart) -> int:

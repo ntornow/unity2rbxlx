@@ -13,11 +13,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import config as _config
 from config import (
     ANTHROPIC_API_KEY,
     OUTPUT_DIR,
     RBXLX_OUTPUT_FILENAME,
-    USE_AI_TRANSPILATION,
 )
 from core.conversion_context import ConversionContext
 from core.unity_types import (
@@ -517,7 +517,7 @@ class Pipeline:
         self.state.transpilation_result = transpile_scripts(
             unity_project_path=self.unity_project_path,
             script_infos=script_infos,
-            use_ai=USE_AI_TRANSPILATION,
+            use_ai=_config.USE_AI_TRANSPILATION,
             api_key=ANTHROPIC_API_KEY,
         )
         self.ctx.transpiled_scripts = self.state.transpilation_result.total_transpiled

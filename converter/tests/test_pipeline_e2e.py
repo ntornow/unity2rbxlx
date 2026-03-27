@@ -238,3 +238,50 @@ class TestPipelineE2E:
         # Should detect UOP1_Project and produce output
         assert pipeline.context.converted_parts > 0
         assert pipeline.context.transpiled_scripts > 0
+
+    @pytest.mark.skipif(
+        not (Path(__file__).parent.parent.parent / "test_projects" / "BossRoom").exists(),
+        reason="BossRoom test project not available",
+    )
+    def test_bossroom_converts(self, tmp_path):
+        """Test BossRoom networking project converts without errors."""
+        from converter.pipeline import Pipeline
+        import xml.etree.ElementTree as ET
+
+        project = Path(__file__).parent.parent.parent / "test_projects" / "BossRoom"
+        pipeline = Pipeline(
+            unity_project_path=project,
+            output_dir=tmp_path,
+            skip_upload=True,
+        )
+        pipeline.run_all()
+
+        assert pipeline.context.transpiled_scripts > 100
+        # Validate the XML is well-formed
+        rbxlx = tmp_path / "converted_place.rbxlx"
+        assert rbxlx.exists()
+        tree = ET.parse(rbxlx)
+        assert tree.getroot().tag == "roblox"
+
+    @pytest.mark.skipif(
+        not (Path(__file__).parent.parent.parent / "test_projects" / "BoatAttack").exists(),
+        reason="BoatAttack test project not available",
+    )
+    def test_boatattack_converts(self, tmp_path):
+        """Test BoatAttack URP project converts without errors."""
+        from converter.pipeline import Pipeline
+        import xml.etree.ElementTree as ET
+
+        project = Path(__file__).parent.parent.parent / "test_projects" / "BoatAttack"
+        pipeline = Pipeline(
+            unity_project_path=project,
+            output_dir=tmp_path,
+            skip_upload=True,
+        )
+        pipeline.run_all()
+
+        assert pipeline.context.transpiled_scripts > 30
+        rbxlx = tmp_path / "converted_place.rbxlx"
+        assert rbxlx.exists()
+        tree = ET.parse(rbxlx)
+        assert tree.getroot().tag == "roblox"

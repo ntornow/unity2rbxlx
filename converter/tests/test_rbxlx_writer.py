@@ -126,3 +126,41 @@ class TestRbxlxWriter:
         output = tmp_path / "test.rbxlx"
         result = write_rbxlx(place, output)
         assert result["parts_written"] == 2
+
+    def test_cdata_wrapping_all_scripts(self, tmp_path):
+        """All ProtectedString elements must have CDATA wrapping for valid XML."""
+        from roblox.rbxlx_writer import write_rbxlx
+        scripts = []
+        for i in range(5):
+            scripts.append(RbxScript(
+                name=f"Script{i}",
+                source=f'local x = {i}\nprint("hello <world>")\n-- comment',
+                script_type="Script",
+            ))
+        place = RbxPlace(scripts=scripts)
+        output = tmp_path / "test.rbxlx"
+        write_rbxlx(place, output)
+        content = output.read_text()
+        # All ProtectedString elements should have CDATA
+        import re
+        opens = re.findall(r'<ProtectedString[^/][^>]*>', content)
+        cdatas = re.findall(r'<!\[CDATA\[', content)
+        assert len(opens) == len(cdatas), f"ProtectedString count ({len(opens)}) != CDATA count ({len(cdatas)})"
+        # Verify valid XML
+        tree = ET.parse(output)
+        assert tree.getroot().tag == "roblox"
+
+    def test_cdata_wrapping_with_special_chars(self, tmp_path):
+        """Scripts with XML-special characters must be properly CDATA-wrapped."""
+        from roblox.rbxlx_writer import write_rbxlx
+        scripts = [RbxScript(
+            name="SpecialChars",
+            source='local s = "<color=blue>test</color>"\nlocal t = "a > b & c < d"',
+            script_type="Script",
+        )]
+        place = RbxPlace(scripts=scripts)
+        output = tmp_path / "test.rbxlx"
+        write_rbxlx(place, output)
+        # Verify valid XML
+        tree = ET.parse(output)
+        assert tree.getroot().tag == "roblox"
