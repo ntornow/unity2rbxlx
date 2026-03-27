@@ -36,6 +36,7 @@ def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
     source = _fix_csharp_remnants(name, source, fixes)
     source = _fix_common_api_mistakes(name, source, fixes)
     source = _fix_startup_race_conditions(name, source, fixes)
+    source = _inject_utility_functions(name, source, fixes)
 
     return source, fixes
 
@@ -465,6 +466,16 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
             source,
         )
 
+    # Fix SetActive: obj.SetActive(bool) → setActive(obj, bool)
+    # This provides proper recursive enable/disable for the hierarchy
+    if '.SetActive(' in source:
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.SetActive\(([^)]+)\)',
+            r'setActive(\1, \2)',
+            source,
+        )
+        fixes.append("Fixed SetActive to use recursive setActive()")
+
     if source != original and not fixes:
         fixes.append("Fixed C# syntax remnants")
 
@@ -749,3 +760,38 @@ def _format_spec_to_lua(spec: str) -> str:
     if spec.upper().startswith("E"):
         return "%e"
     return "%s"
+
+
+def _inject_utility_functions(name: str, source: str, fixes: list[str]) -> str:
+    """Inject utility function definitions if they are used but not defined.
+
+    The transpiler normally handles utility injection, but the validator may
+    introduce calls to utility functions (e.g. setActive) after transpilation.
+    This pass ensures those functions are defined.
+    """
+    from converter.api_mappings import UTILITY_FUNCTIONS
+
+    for func_name, func_body in UTILITY_FUNCTIONS.items():
+        # Check if the function is called but not defined in the source
+        call_pattern = func_name + "("
+        def_pattern = f"local function {func_name}("
+        if call_pattern in source and def_pattern not in source:
+            # Inject at the top of the file, after service requires
+            lines = source.split("\n")
+            insert_idx = 0
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped.startswith("local ") and "GetService" in stripped:
+                    insert_idx = i + 1
+                elif stripped.startswith("--") or stripped == "":
+                    if i == insert_idx:
+                        insert_idx = i + 1
+                elif insert_idx > 0:
+                    break
+            lines.insert(insert_idx, "")
+            lines.insert(insert_idx + 1, func_body)
+            lines.insert(insert_idx + 2, "")
+            source = "\n".join(lines)
+            fixes.append(f"Injected utility function {func_name}")
+
+    return source

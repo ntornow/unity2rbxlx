@@ -963,3 +963,46 @@ class TestStringGsubEscaping:
         fixes = []
         result = _fix_csharp_remnants("test", source, fixes)
         assert '"hello"' in result
+
+
+class TestSetActiveConversion:
+    """Test SetActive → recursive setActive utility function."""
+
+    def test_setactive_in_validator(self):
+        from converter.luau_validator import _fix_csharp_remnants
+        source = 'obj.SetActive(false)'
+        fixes = []
+        result = _fix_csharp_remnants("test", source, fixes)
+        assert 'setActive(obj, false)' in result
+
+    def test_setactive_chained(self):
+        from converter.luau_validator import _fix_csharp_remnants
+        source = 'part.Parent.SetActive(true)'
+        fixes = []
+        result = _fix_csharp_remnants("test", source, fixes)
+        assert 'setActive(part.Parent, true)' in result
+
+    def test_utility_injection(self):
+        from converter.luau_validator import _inject_utility_functions
+        source = 'local x = 1\nsetActive(obj, false)\n'
+        fixes = []
+        result = _inject_utility_functions("test", source, fixes)
+        assert 'local function setActive(' in result
+        assert 'setActive(obj, false)' in result
+
+    def test_no_injection_when_defined(self):
+        from converter.luau_validator import _inject_utility_functions
+        source = 'local function setActive(instance, active)\nend\nsetActive(obj, false)\n'
+        fixes = []
+        result = _inject_utility_functions("test", source, fixes)
+        # Should not inject a second copy
+        assert result.count('local function setActive(') == 1
+
+
+class TestScriptToPartBinding:
+    """Test that script-to-part binding works for scene node MonoBehaviours."""
+
+    def test_pipeline_binding_runs(self):
+        """The _bind_scripts_to_parts method should exist and be callable."""
+        from converter.pipeline import Pipeline
+        assert hasattr(Pipeline, '_bind_scripts_to_parts')

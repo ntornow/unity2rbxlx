@@ -656,6 +656,12 @@ class Pipeline:
         if fixes:
             log.info("[write_output] Reclassified %d scripts based on require() dependencies", fixes)
 
+        # Bind scripts to their target parts using _ScriptClass attributes.
+        # In Unity, MonoBehaviours are children of GameObjects. We replicate
+        # this by placing scripts as children of their target parts, which
+        # allows scripts to use script.Parent to reference their part.
+        self._bind_scripts_to_parts()
+
         # Auto-generate collision group setup if Unity layers are used.
         from converter.fps_client_generator import generate_collision_group_script
         has_layers = False
@@ -921,6 +927,67 @@ script.Disabled = true
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _bind_scripts_to_parts(self) -> None:
+        """Bind transpiled scripts to their target parts using _ScriptClass attributes.
+
+        In Unity, MonoBehaviour scripts are children of GameObjects. This method
+        replicates that by moving scripts from the global place.scripts list to
+        part.scripts, so they become children in the rbxlx hierarchy.
+
+        Scripts placed as children of parts can use `script.Parent` to reference
+        their target part directly — matching Unity's MonoBehaviour pattern.
+        """
+        from core.roblox_types import RbxScript
+
+        # Build index: script class name → RbxScript
+        script_by_name: dict[str, RbxScript] = {}
+        for s in self.state.rbx_place.scripts:
+            script_by_name[s.name] = s
+
+        # Walk all parts to find _ScriptClass attributes
+        bound_count = 0
+        bound_script_names: set[str] = set()
+
+        def _bind_to_tree(parts: list) -> None:
+            nonlocal bound_count
+            for part in parts:
+                # Check for _ScriptClass attribute (set by MonoBehaviour extraction)
+                script_classes = set()
+                for key, value in (getattr(part, "attributes", None) or {}).items():
+                    if key == "_ScriptClass" and isinstance(value, str):
+                        script_classes.add(value)
+
+                # Also check for multiple MonoBehaviours stored as _ScriptClass_N
+                for key in list((getattr(part, "attributes", None) or {}).keys()):
+                    if key.startswith("_ScriptClass"):
+                        val = part.attributes[key]
+                        if isinstance(val, str):
+                            script_classes.add(val)
+
+                for class_name in script_classes:
+                    if class_name in script_by_name and class_name not in bound_script_names:
+                        script = script_by_name[class_name]
+                        # Only bind Server scripts and LocalScripts to parts
+                        # ModuleScripts stay in ReplicatedStorage for require()
+                        if script.script_type != "ModuleScript":
+                            part.scripts.append(script)
+                            bound_script_names.add(class_name)
+                            bound_count += 1
+
+                # Recurse into children
+                if getattr(part, "children", None):
+                    _bind_to_tree(part.children)
+
+        _bind_to_tree(self.state.rbx_place.workspace_parts or [])
+
+        # Remove bound scripts from the global list (they're now part children)
+        if bound_script_names:
+            self.state.rbx_place.scripts = [
+                s for s in self.state.rbx_place.scripts
+                if s.name not in bound_script_names
+            ]
+            log.info("[write_output] Bound %d scripts to their target parts", bound_count)
 
     def _inject_runtime_modules(self) -> None:
         """Inject runtime library ModuleScripts when relevant features are detected.

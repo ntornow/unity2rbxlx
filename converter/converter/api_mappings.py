@@ -32,8 +32,8 @@ API_CALL_MAP: dict[str, str] = {
     "DontDestroyOnLoad": "-- DontDestroyOnLoad: parent to ReplicatedStorage",
     "SendMessage": ":SetAttribute",  # Approximate: use attributes for inter-component comms
     "BroadcastMessage": ":SetAttribute",  # Approximate
-    "gameObject.SetActive(false)": "Transparency = 1; CanCollide = false",
-    "gameObject.SetActive(true)": "Transparency = 0; CanCollide = true",
+    "gameObject.SetActive(false)": "setActive(script.Parent, false)",
+    "gameObject.SetActive(true)": "setActive(script.Parent, true)",
     ".activeSelf": ":GetAttribute('Active') ~= false",
     ".activeInHierarchy": ":GetAttribute('Active') ~= false",
     "gameObject.name": ".Name",
@@ -489,8 +489,6 @@ API_CALL_MAP: dict[str, str] = {
     "FindObjectOfType": "workspace:FindFirstChildOfClass",
     "FindObjectsOfType": "workspace:GetDescendants()",
     "GameObject.Instantiate": ":Clone()",
-    ".SetActive(false)": ".Transparency = 1; .CanCollide = false",
-    ".SetActive(true)": ".Transparency = 0; .CanCollide = true",
     "Invoke(": "task.delay(",
     # -- Destroy with delay --
     "Destroy(gameObject,": "Debris:AddItem(",
@@ -924,5 +922,23 @@ end""",
     "vec3Reflect": """\
 local function vec3Reflect(direction, normal)
 \treturn direction - 2 * direction:Dot(normal) * normal
+end""",
+    "setActive": """\
+local function setActive(instance, active)
+\tif not instance then return end
+\tif instance:IsA("BasePart") then
+\t\tinstance.Transparency = active and 0 or 1
+\t\tinstance.CanCollide = active
+\tend
+\tfor _, child in instance:GetDescendants() do
+\t\tif child:IsA("BasePart") then
+\t\t\tchild.Transparency = active and 0 or 1
+\t\t\tchild.CanCollide = active
+\t\telseif child:IsA("ParticleEmitter") or child:IsA("Light") or child:IsA("BillboardGui") or child:IsA("SurfaceGui") then
+\t\t\tchild.Enabled = active
+\t\telseif child:IsA("Sound") then
+\t\t\tif not active and child.Playing then child:Stop() end
+\t\tend
+\tend
 end""",
 }
