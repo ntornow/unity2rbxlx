@@ -828,7 +828,7 @@ def _rule_based_transpile(
 
         # -- C# method signatures -> convert to local function --
         m_method = re.match(
-            r"^\s*(?:public|private|protected|internal)?\s*(?:static\s+)?(?:void|bool|int|float|double|string|IEnumerator|[\w<>\[\]]+)\s+(\w+)\s*\(([^)]*)\)\s*\{?\s*$",
+            r"^\s*(?:public|private|protected|internal)?\s*(?:static\s+)?(?:override\s+)?(?:virtual\s+)?(?:async\s+)?(?:void|bool|int|float|double|string|IEnumerator|Task|[\w<>\[\].]+)\s+(\w+)\s*\(\s*([^)]*)\)\s*\{?\s*$",
             stripped,
         )
         if m_method and m_method.group(1) not in ("if", "while", "for", "switch", "catch"):

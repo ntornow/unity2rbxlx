@@ -1315,6 +1315,45 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
     if '.#' in source:
         source = re.sub(r'([\w.\[\]]+)\.#(\w+)', lambda m: '#' + m.group(1) + '.' + m.group(2), source)
 
+    # Fix C# single-line property getters:
+    # "Type Name { get { return expr; } }" → "local function get_Name() return expr end"
+    if '{ get {' in source:
+        def _fix_property_getter(m):
+            indent = m.group(1)
+            name = m.group(2).lstrip('.')
+            expr = m.group(3).strip().rstrip(';')
+            return f'{indent}local function get_{name}() return {expr} end'
+        source = re.sub(
+            r'^(\s*)(?:[\w.]+\s+)?\.?(\w+)\s*\{\s*get\s*\{\s*return\s+(.+?)\s*;?\s*\}\s*(?:set\s*\{[^}]*\}\s*)?\}',
+            _fix_property_getter,
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Converted C# property getters to Luau functions")
+
+    # Fix C# expression-bodied members: "Type Name => expr" → "local function get_Name() return expr end"
+    # Also handles: "local Name => expr" (from pre-processing)
+    if '=>' in source:
+        def _fix_expr_body(m):
+            indent = m.group(1)
+            name = m.group(2)
+            expr = m.group(3).strip().rstrip(';')
+            return f'{indent}local function get_{name}() return {expr} end'
+        # "-- [#C] Type Name => expr" or "-- [#C] local Name => expr"
+        source = re.sub(
+            r'^(\s*)-- \[#C\]\s*(?:[\w.]+\s+)?(?:local\s+)?(\w+)\s+=>\s+(.+)$',
+            _fix_expr_body,
+            source,
+            flags=re.MULTILINE,
+        )
+        # Uncommented: "Type Name => expr" or "local Name => expr"
+        source = re.sub(
+            r'^(\s*)(?:[\w.]+\s+)?(?:local\s+)?(\w+)\s+=>\s+(.+)$',
+            _fix_expr_body,
+            source,
+            flags=re.MULTILINE,
+        )
+
     # Fix "obj.Parent =(value)" → "obj.Parent = value" (unnecessary parens)
     if '.Parent =(' in source:
         source = re.sub(r'\.Parent\s*=\s*\((\w+(?:\.\w+)*)\)', r'.Parent = \1', source)
