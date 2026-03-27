@@ -610,6 +610,10 @@ class Pipeline:
 
         # Write transpiled scripts to output directory AND add to RbxPlace.
         scripts_dir = self.output_dir / "scripts"
+        # Clean old scripts from previous runs to avoid stale files
+        if scripts_dir.exists():
+            import shutil
+            shutil.rmtree(scripts_dir)
         scripts_dir.mkdir(parents=True, exist_ok=True)
 
         if self.state.transpilation_result:
@@ -889,6 +893,13 @@ script.Disabled = true
             ))
             log.info("[write_output] MeshLoader script embedded for %d mesh assets",
                      sum(1 for p in self.ctx.uploaded_assets if Path(p).suffix.lower() in ('.fbx', '.obj')))
+
+        # Final write: ensure .luau files on disk match the fully processed sources
+        # (after require injection, reclassification, and all other post-processing)
+        scripts_dir = self.output_dir / "scripts"
+        for s in self.state.rbx_place.scripts:
+            luau_path = scripts_dir / f"{s.name}.luau"
+            luau_path.write_text(s.source, encoding="utf-8")
 
         # Write the RBXLX file.
         import config as _cfg_mod

@@ -384,13 +384,14 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
         fixes.append("Fixed C# tuple unpacking")
 
     # Comment out remaining C# class declarations
-    source = re.sub(r'^(\s*)class\s+\w+.*$', r'\1-- \g<0>', source, flags=re.MULTILINE)
+    source = re.sub(r'^([^\S\n]*)class\s+\w+.*$', r'\1-- \g<0>', source, flags=re.MULTILINE)
 
     # Comment out bare 'using' statements (C# imports without -- prefix)
-    source = re.sub(r'^(\s*)using\s+\w+', r'-- \g<0>', source, flags=re.MULTILINE)
+    # Use [^\S\n]* instead of \s* to avoid matching across newlines
+    source = re.sub(r'^([^\S\n]*)using\s+\w+', r'-- \g<0>', source, flags=re.MULTILINE)
 
     # Comment out 'namespace' declarations
-    source = re.sub(r'^(\s*)namespace\s+\w+', r'-- \g<0>', source, flags=re.MULTILINE)
+    source = re.sub(r'^([^\S\n]*)namespace\s+\w+', r'-- \g<0>', source, flags=re.MULTILINE)
 
     # Comment out 'base.Method()' calls (C# base class calls)
     if 'base.' in source:
