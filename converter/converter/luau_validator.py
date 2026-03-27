@@ -2078,12 +2078,69 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
                 bound = '#' + bound[:-1]
             return f'{indent}for {var} = {start}, {bound} - 1 do'
 
+        # Match both prefix ++i and postfix i++
         source = re.sub(
-            r'^(\s*)for\s*\(\s*local\s+(\w+)\s*=\s*(\w+)\s*;\s*\w+\s*<\s*([^;]+?)\s*;\s*\+\+\w+\s*\)',
+            r'^(\s*)for\s*\(\s*local\s+(\w+)\s*=\s*(\w+)\s*;\s*\w+\s*<\s*([^;]+?)\s*;\s*(?:\+\+\w+|\w+\+\+)\s*\)',
             _fix_for_loop,
             source,
             flags=re.MULTILINE,
         )
+        # Also handle <= bound: for (local i = 0; i <= N; ++i/i++) → for i = 0, N do
+        def _fix_for_loop_le(m: re.Match) -> str:
+            indent = m.group(1)
+            var = m.group(2)
+            start = m.group(3)
+            bound = m.group(4)
+            if bound.endswith('#'):
+                bound = '#' + bound[:-1]
+            return f'{indent}for {var} = {start}, {bound} do'
+        source = re.sub(
+            r'^(\s*)for\s*\(\s*local\s+(\w+)\s*=\s*(\w+)\s*;\s*\w+\s*<=\s*([^;]+?)\s*;\s*(?:\+\+\w+|\w+\+\+)\s*\)',
+            _fix_for_loop_le,
+            source,
+            flags=re.MULTILINE,
+        )
+        # Handle decrementing: for (local i = N; i >= 0; i--/--i) → for i = N, 0, -1 do
+        def _fix_for_loop_dec(m: re.Match) -> str:
+            indent = m.group(1)
+            var = m.group(2)
+            start = m.group(3)
+            bound = m.group(4)
+            return f'{indent}for {var} = {start}, {bound}, -1 do'
+        source = re.sub(
+            r'^(\s*)for\s*\(\s*local\s+(\w+)\s*=\s*([^;]+?)\s*;\s*\w+\s*>=\s*([^;]+?)\s*;\s*(?:--\w+|\w+--)\s*\)',
+            _fix_for_loop_dec,
+            source,
+            flags=re.MULTILINE,
+        )
+        # Handle for(;;) → while true do (infinite loop, already in csharp_remnants but ensure it's caught here too)
+        source = re.sub(r'for\s*\(\s*;\s*;\s*\)', 'while true do', source)
+
+    # Fix C# sizeof() → literal values
+    if 'sizeof(' in source:
+        source = re.sub(r'\bsizeof\(int\)', '4', source)
+        source = re.sub(r'\bsizeof\(float\)', '4', source)
+        source = re.sub(r'\bsizeof\(double\)', '8', source)
+        source = re.sub(r'\bsizeof\(byte\)', '1', source)
+        source = re.sub(r'\bsizeof\(short\)', '2', source)
+        source = re.sub(r'\bsizeof\(long\)', '8', source)
+        source = re.sub(r'\bsizeof\(\w+\)', '4', source)  # fallback
+        fixes.append("Fixed sizeof() → literal values")
+
+    # Fix C# && → and (Luau boolean operator)
+    if '&&' in source:
+        source = re.sub(r'&&', ' and ', source)
+        fixes.append("Fixed C# && → and")
+
+    # Fix C# || → or (Luau boolean operator)
+    if '||' in source:
+        source = re.sub(r'\|\|', ' or ', source)
+        fixes.append("Fixed C# || → or")
+
+    # Fix C# !(expr) → not (expr) (Luau negation)
+    if '!(' in source:
+        source = re.sub(r'!\(', 'not (', source)
+        fixes.append("Fixed C# !(expr) → not (expr)")
 
     # Fix: semicolons at end of statements
     if ";" in source:
@@ -3631,10 +3688,10 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
         )
         fixes.append("Fixed unassigned CFrame.new → position offset")
 
-    # Fix malformed list initialization: "--[[ new List ]] (N)" → "{}"
-    if '--[[ new List ]]' in source:
+    # Fix malformed list initialization: "--[[ new List ]] (N)" or "--[[ new List ]] ({...})" → "{}"
+    if '--[[ new List ]]' in source or '--[[ new HashSet ]]' in source:
         source = re.sub(
-            r'--\[\[\s*new\s+List\s*\]\]\s*\(\d*\)',
+            r'--\[\[\s*new\s+(?:List|HashSet)\s*\]\]\s*\([^)]*\)',
             '{}',
             source,
         )
@@ -3647,8 +3704,10 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
 
     # Fix bare `new Namespace.Type()` → `{}` (C# constructor that leaked through)
     if re.search(r'\bnew\s+[A-Z]', source):
+        # new Dictionary<K,V>(...) / new List<T>(...) / new HashSet<T>(...) → {}
+        # Use (?:<.*?>)? for nested generics like Dictionary<string, List<int>>
         source = re.sub(
-            r'\bnew\s+[\w.]+(?:Dictionary|List|HashSet|Queue|Stack|ArrayList)\s*\(\)',
+            r'\bnew\s+[\w.]*(?:Dictionary|List|HashSet|Queue|Stack|ArrayList)(?:<.+?>)?\s*\([^)]*\)',
             '{}',
             source,
         )
@@ -3663,6 +3722,20 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
             r'\bnew\s+[\w.]+\s*\(\)',
             'nil --[[ new instance ]]',
             source,
+        )
+        # `return new TypeName` (no parens or braces) → `return {}`
+        source = re.sub(
+            r'\breturn\s+new\s+[A-Z]\w+\s*$',
+            'return {}',
+            source,
+            flags=re.MULTILINE,
+        )
+        # `= new TypeName` at end of line (no parens/braces) → `= {}`
+        source = re.sub(
+            r'=\s*new\s+[A-Z][\w.]+\s*$',
+            '= {}',
+            source,
+            flags=re.MULTILINE,
         )
         fixes.append("Fixed bare C# new constructor")
 

@@ -3187,3 +3187,85 @@ class TestValidatorBatch18:
         source = '    ++zoomSelector\n    --zoomSelector'
         fixed, _ = validate_and_fix("test", source)
         assert 'zoomSelector = zoomSelector - 1' in fixed
+
+
+class TestValidatorBatch19:
+    """Tests for batch 19: new constructor expansion, for-loop variants, sizeof, &&/||."""
+
+    def test_new_dictionary_generic(self):
+        """new Dictionary<K,V>() → {}."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local d = new Dictionary<string, List<int>>()'
+        fixed, _ = validate_and_fix("test", source)
+        assert '{}' in fixed
+        assert 'Dictionary' not in fixed
+
+    def test_return_new_type(self):
+        """return new SyncData → return {}."""
+        from converter.luau_validator import validate_and_fix
+        source = '    return new SyncData'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'return {}' in fixed
+
+    def test_for_loop_postfix_increment(self):
+        """for (local i = 0; i < N; i++) → for i = ..., ... do."""
+        from converter.luau_validator import validate_and_fix
+        source = 'for (local i = 0; i < count; i++)'
+        fixed, _ = validate_and_fix("test", source)
+        # May be 0-based or 1-based depending on later fix passes
+        assert 'for i =' in fixed
+        assert 'do' in fixed
+        assert 'i++' not in fixed
+
+    def test_for_loop_decrement(self):
+        """for (local i = N; i >= 0; i--) → for i = N, 0, -1 do."""
+        from converter.luau_validator import validate_and_fix
+        source = 'for (local i = 10; i >= 0; i--)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'for i = 10, 0, -1 do' in fixed
+
+    def test_sizeof_int(self):
+        """sizeof(int) → 4."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local size = sizeof(int)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '4' in fixed
+        assert 'sizeof' not in fixed
+
+    def test_and_operator(self):
+        """&& → and."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if x ~= nil && y > 0 then'
+        fixed, _ = validate_and_fix("test", source)
+        assert ' and ' in fixed
+        assert '&&' not in fixed
+
+    def test_or_operator(self):
+        """|| → or."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if x == nil || y == nil then'
+        fixed, _ = validate_and_fix("test", source)
+        assert ' or ' in fixed
+        assert '||' not in fixed
+
+    def test_not_paren(self):
+        """!(expr) → not (expr)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if !(IsBankAvailable(bankIndex)) then'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'not (' in fixed
+        assert '!(' not in fixed
+
+    def test_new_with_angle_brackets_and_args(self):
+        """new List<int>({ -1 }) → {}."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local items = new List<int>({ -1 })'
+        fixed, _ = validate_and_fix("test", source)
+        assert '{}' in fixed
+
+    def test_assign_new_type_eol(self):
+        """= new Vehicle.VehicleInput → = {}."""
+        from converter.luau_validator import validate_and_fix
+        source = '    m_vehicle.Input = new Vehicle.VehicleInput'
+        fixed, _ = validate_and_fix("test", source)
+        assert '= {}' in fixed
