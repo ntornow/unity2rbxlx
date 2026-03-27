@@ -817,6 +817,13 @@ class TestLuauValidator:
         assert 'get_audio' not in fixed
         assert any("Inlined" in f for f in fixes)
 
+    def test_fix_unity_class_names(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local audio = script.Parent:FindFirstChildWhichIsA("AudioSource")'
+        fixed, _ = validate_and_fix("test", source)
+        assert '"Sound"' in fixed
+        assert '"AudioSource"' not in fixed
+
 
 class TestMeshSizing:
     """Tests for mesh size computation."""

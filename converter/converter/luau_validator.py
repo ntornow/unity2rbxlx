@@ -2056,6 +2056,26 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
 
     # (.ToString() already handled earlier in the function)
 
+    # Fix Unity class names in FindFirstChildWhichIsA/FindFirstChildOfClass → Roblox class names
+    _UNITY_TO_ROBLOX_CLASS = {
+        'AudioSource': 'Sound',
+        'AudioListener': 'SoundGroup',
+        'CharacterController': 'Humanoid',
+        'Animator': 'AnimationController',
+        'Rigidbody': 'BasePart',
+        'MeshRenderer': 'MeshPart',
+        'MeshFilter': 'MeshPart',
+        'SkinnedMeshRenderer': 'MeshPart',
+        'SphereCollider': 'BasePart',
+        'BoxCollider': 'BasePart',
+        'CapsuleCollider': 'BasePart',
+        'Renderer': 'BasePart',
+    }
+    for unity_cls, rblx_cls in _UNITY_TO_ROBLOX_CLASS.items():
+        if f'"{unity_cls}"' in source:
+            source = source.replace(f'"{unity_cls}"', f'"{rblx_cls}"')
+            fixes.append(f"Fixed Unity class '{unity_cls}' → Roblox '{rblx_cls}'")
+
     # .StartsWith("str") → string.sub(var, 1, #"str") == "str"
     if '.StartsWith(' in source:
         def _fix_startswith(m):
