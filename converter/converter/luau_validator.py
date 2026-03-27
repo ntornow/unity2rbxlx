@@ -1814,10 +1814,19 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         source = re.sub(r'(\w*[Ss]ystem\w*)\.Visible\b', r'\1.Enabled', source)
         # Generic fallback: any remaining .Visible on non-GUI objects → .Enabled
         # (Roblox GuiObjects do have .Visible, but most other objects use .Enabled)
-        source = re.sub(r'(\w+)\.Visible\b(?!\s*=\s*["\'])', lambda m: (
-            m.group(0) if any(kw in m.group(1).lower() for kw in ('gui', 'frame', 'label', 'button', 'text', 'image', 'scroll'))
-            else f'{m.group(1)}.Enabled'
-        ), source)
+        # Match after word chars or closing parens/brackets
+        def _fix_visible(m):
+            prefix = m.group(1)
+            # Check if the context suggests a GUI object
+            gui_keywords = ('gui', 'frame', 'label', 'button', 'text', 'image', 'scroll', 'menu', 'pause', 'hud', 'ui', 'canvas', 'panel')
+            # Get the full line context for better detection
+            start = m.start()
+            line_start = m.string.rfind('\n', 0, start) + 1
+            line = m.string[line_start:m.string.find('\n', start) if '\n' in m.string[start:] else len(m.string)]
+            if any(kw in line.lower() for kw in gui_keywords):
+                return m.group(0)
+            return f'{prefix}.Enabled'
+        source = re.sub(r'([\w\)\]]+)\.Visible\b', _fix_visible, source)
 
     # Fix math.lerp → mathLerp (math.lerp doesn't exist in Roblox Luau)
     if 'math.lerp' in source:
@@ -2163,6 +2172,15 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
             source,
         )
         fixes.append("Fixed .Exists() → table.find()")
+
+    # Fix malformed table.find lambda: `table.find(tbl, function(x) ~= nil) return expr end)`
+    # → `table.find(tbl, function(x) return expr end) ~= nil`
+    if 'table.find' in source and 'function(' in source:
+        source = re.sub(
+            r'table\.find\(([^,]+),\s*function\((\w+)\)\s*~=\s*nil\)\s*return\s+(.+?)\s+end\)\)',
+            r'(table.find(\1, function(\2) return \3 end) ~= nil)',
+            source,
+        )
 
     # Fix "obj.Parent =(value)" → "obj.Parent = value" (unnecessary parens)
     if '.Parent =(' in source:
