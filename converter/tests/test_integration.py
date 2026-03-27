@@ -748,6 +748,26 @@ class TestLuauValidator:
         assert "local delay" in fixed
         assert "WaitForSeconds" not in fixed
 
+    def test_fix_string_empty(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local text = string.Empty'
+        fixed, _ = validate_and_fix("test", source)
+        assert '""' in fixed
+        assert "string.Empty" not in fixed
+
+    def test_fix_tostring_method(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local s = obj.Name.ToString()'
+        fixed, _ = validate_and_fix("test", source)
+        assert "tostring(obj.Name)" in fixed
+        assert ".ToString()" not in fixed
+
+    def test_fix_continue_keyword(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'for _, item in items do\n    if not item then\n        continue\n    end\n    process(item)\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert "continue" not in fixed or "-- continue" in fixed
+
 
 class TestMeshSizing:
     """Tests for mesh size computation."""

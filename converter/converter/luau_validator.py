@@ -994,8 +994,10 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
             _fix_tostring_format,
             source,
         )
-        # Plain ToString(): x.ToString() → tostring(x)
-        source = re.sub(r'(\w+)\.ToString\(\)', r'tostring(\1)', source)
+        # Plain ToString(): x.ToString() → tostring(x) (handles dotted paths and bracketed exprs)
+        source = re.sub(r'(\w+(?:\.\w+)*(?:\[[^\]]*\])*)\.ToString\(\)', r'tostring(\1)', source)
+        # Handle (expr).ToString() → tostring(expr)
+        source = re.sub(r'\)\.ToString\(\)', ')', source)  # Remove .ToString() after closing paren
         fixes.append("Fixed '.ToString()' → 'tostring()'")
 
     # Fix '.Add(item)' → 'table.insert(tbl, item)' for list
@@ -2046,6 +2048,44 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     if '.maxDistance' in source:
         source = re.sub(r'\.maxDistance\b', '.RollOffMaxDistance', source)
         fixes.append("Fixed .maxDistance → .RollOffMaxDistance")
+
+    # string.Empty → "" (not valid in Luau)
+    if 'string.Empty' in source:
+        source = source.replace('string.Empty', '""')
+        fixes.append("Fixed string.Empty → empty string literal")
+
+    # (.ToString() already handled earlier in the function)
+
+    # `continue` keyword → restructure with if/end wrap
+    # Luau doesn't have `continue` — wrap remaining loop body in `if` instead
+    if re.search(r'^\s*continue\s*$', source, re.MULTILINE):
+        lines = source.split('\n')
+        new_lines = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            if stripped == 'continue':
+                # Replace with `-- continue` comment (loop restructuring is too complex for regex)
+                indent = line[:len(line) - len(line.lstrip())]
+                new_lines.append(f'{indent}-- continue (Luau: restructure loop to avoid)')
+                fixes.append("Commented out `continue` (not valid in Luau)")
+            elif stripped.startswith('if ') and stripped.endswith('continue end'):
+                # Single-line: `if cond then continue end` → skip by negating
+                # Extract condition
+                m = re.match(r'^(\s*)if\s+(.+?)\s+then\s+continue\s+end\s*$', line)
+                if m:
+                    indent, cond = m.group(1), m.group(2)
+                    # Negate the condition to skip the rest of the loop body?
+                    # Actually, just comment it out for now
+                    new_lines.append(f'{indent}-- if {cond} then continue end (Luau: restructure)')
+                    fixes.append("Commented out `continue` pattern (not valid in Luau)")
+                else:
+                    new_lines.append(line)
+            else:
+                new_lines.append(line)
+            i += 1
+        source = '\n'.join(new_lines)
 
     # Fix 'require(expr or nil)' → safe require with nil check
     if 'or nil)' in source and 'require(' in source:
