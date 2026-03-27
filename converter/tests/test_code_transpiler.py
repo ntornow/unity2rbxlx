@@ -1801,3 +1801,33 @@ class TestBlockBalanceFix:
 end'''
         fixed, _ = validate_and_fix("test", source)
         assert fixed.count('end') == 1
+
+
+class TestPhysicsFixes:
+    """Test Rigidbody/physics conversion fixes."""
+
+    def test_attached_rigidbody_removed(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'if col.attachedRigidbody ~= nil then'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'attachedRigidbody' not in fixed
+        assert 'col ~= nil' in fixed
+
+    def test_velocity_to_assembly(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local vel = obj.velocity'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'AssemblyLinearVelocity' in fixed
+
+    def test_add_force_at_position(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'rb.AddForceAtPosition(force, pos)'
+        fixed, _ = validate_and_fix("test", source)
+        assert ':ApplyImpulseAtPosition(' in fixed
+
+    def test_collider_removed(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local tag = hit.collider.Name'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.collider' not in fixed
+        assert 'hit.Name' in fixed

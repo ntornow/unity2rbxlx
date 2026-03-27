@@ -1084,6 +1084,36 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         source = source.replace('workspace.Current:', 'workspace.CurrentCamera:')
         fixes.append("Fixed workspace.Current → workspace.CurrentCamera")
 
+    # Fix: .attachedRigidbody → the part itself (Roblox parts have built-in physics)
+    if 'attachedRigidbody' in source:
+        # obj.attachedRigidbody → obj (Roblox parts ARE their own rigidbodies)
+        source = re.sub(r'(\w+)\.attachedRigidbody\b', r'\1', source)
+        fixes.append("Fixed .attachedRigidbody → part itself")
+
+    # Fix: .velocity → .AssemblyLinearVelocity (Roblox physics property)
+    if re.search(r'\w\.velocity\b', source):
+        source = re.sub(r'(\w)\.velocity\b', r'\1.AssemblyLinearVelocity', source)
+
+    # Fix: .angularVelocity → .AssemblyAngularVelocity
+    if '.angularVelocity' in source:
+        source = re.sub(r'\.angularVelocity\b', '.AssemblyAngularVelocity', source)
+
+    # Fix: .AddForceAtPosition → :ApplyImpulseAtPosition
+    if '.AddForceAtPosition(' in source:
+        source = re.sub(r'(\w+)\.AddForceAtPosition\(', r'\1:ApplyImpulseAtPosition(', source)
+
+    # Fix: .collider (Unity) → the part itself (Roblox Touched gives the part directly)
+    if '.collider' in source:
+        source = re.sub(r'(\w+)\.collider\b', r'\1', source)
+        fixes.append("Fixed .collider → part itself")
+
+    # Fix: FindFirstChildWhichIsA("Rigidbody") → nil (parts don't have child Rigidbody)
+    if 'FindFirstChildWhichIsA("Rigidbody")' in source:
+        source = source.replace(
+            ':FindFirstChildWhichIsA("Rigidbody")',
+            ' -- Roblox parts have built-in physics'
+        )
+
     # Fix: obj.position (lowercase) → obj.Position (Roblox PascalCase)
     # Only fix after word characters (instance access), not after Random/static types
     if '.position' in source:
