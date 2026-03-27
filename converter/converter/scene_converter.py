@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -147,6 +148,14 @@ _SILENT_SKIP_TYPES = {
     "NavMeshObstacle",
     "EventSystem", "StandaloneInputModule", "GraphicRaycaster",
     "PlayableDirector",  # Timeline → handled via API mappings in transpiled scripts
+    # UI types handled by ui_translator or with no Roblox equivalent
+    "Mask", "RectMask2D", "CanvasGroup", "AspectRatioFitter",
+    "ContentSizeFitter", "LayoutElement",
+    # Rendering/sorting types with no direct Roblox equivalent
+    "SortingGroup", "LightProbeProxyVolume", "ParticleSystemRenderer",
+    "SpriteAtlas", "SpriteMask",
+    # 2D tilemap (no Roblox equivalent)
+    "Tilemap", "TilemapRenderer", "TilemapCollider2D", "CompositeCollider2D",
 }
 
 _NAVMESH_TYPES = {"NavMeshAgent"}
@@ -791,18 +800,16 @@ def _convert_node(
             if result:
                 part.size, part.initial_size = result
                 sized = True
-        # Fallback: use FBX import scale × unity scale when native sizes unavailable.
-        # This gives a reasonable estimate even without the resolve step.
+        # Fallback: use unity scale as meters when native sizes unavailable.
+        # Without the actual mesh bounding box from Roblox LoadAsset, we assume
+        # the mesh occupies roughly unity_scale meters in each dimension.
+        # This gives reasonable part sizes (a 1x1x1 Unity object → 3.57 studs).
         if not sized and guid_index and node.mesh_guid:
-            import_scale = _get_fbx_import_scale(node.mesh_guid, guid_index)
-            unit_ratio = _get_fbx_unit_ratio(node.mesh_guid, guid_index)
-            scale_factor = import_scale * unit_ratio * config.STUDS_PER_METER
             sx, sy, sz = node.scale
-            # Use unity localScale as the base dimension (in meters), then convert
             part.size = (
-                abs(sx) * scale_factor,
-                abs(sy) * scale_factor,
-                abs(sz) * scale_factor,
+                max(0.05, abs(sx) * config.STUDS_PER_METER),
+                max(0.05, abs(sy) * config.STUDS_PER_METER),
+                max(0.05, abs(sz) * config.STUDS_PER_METER),
             )
         # Set TextureID from embedded FBX texture if available
         tex_id = _resolve_mesh_texture_id(node.mesh_guid, guid_index)
@@ -2227,11 +2234,14 @@ def _convert_prefab_instance(
                 if result:
                     part.size, part.initial_size = result
                     sized = True
-            if not sized and guid_index:
-                import_scale = _get_fbx_import_scale(root.mesh_guid, guid_index)
-                unit_ratio = _get_fbx_unit_ratio(root.mesh_guid, guid_index)
-                sf = import_scale * unit_ratio * config.STUDS_PER_METER
-                part.size = (abs(combined_scale[0]) * sf, abs(combined_scale[1]) * sf, abs(combined_scale[2]) * sf)
+            if not sized:
+                # Without native sizes, assume mesh occupies unity_scale meters
+                sf = config.STUDS_PER_METER
+                part.size = (
+                    max(0.05, abs(combined_scale[0]) * sf),
+                    max(0.05, abs(combined_scale[1]) * sf),
+                    max(0.05, abs(combined_scale[2]) * sf),
+                )
             # Set TextureID from embedded FBX texture if available
             tex_id = _resolve_mesh_texture_id(root.mesh_guid, guid_index)
             if tex_id:
@@ -2401,11 +2411,14 @@ def _convert_prefab_node(
             if result:
                 part.size, part.initial_size = result
                 sized = True
-        if not sized and guid_index:
-            import_scale = _get_fbx_import_scale(node.mesh_guid, guid_index)
-            unit_ratio = _get_fbx_unit_ratio(node.mesh_guid, guid_index)
-            sf = import_scale * unit_ratio * config.STUDS_PER_METER
-            part.size = (abs(local_scl[0]) * sf, abs(local_scl[1]) * sf, abs(local_scl[2]) * sf)
+        if not sized:
+            # Without native sizes, assume mesh occupies unity_scale meters
+            sf = config.STUDS_PER_METER
+            part.size = (
+                max(0.05, abs(local_scl[0]) * sf),
+                max(0.05, abs(local_scl[1]) * sf),
+                max(0.05, abs(local_scl[2]) * sf),
+            )
         # Set TextureID from embedded FBX texture if available
         tex_id = _resolve_mesh_texture_id(node.mesh_guid, guid_index)
         if tex_id:

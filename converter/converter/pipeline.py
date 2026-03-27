@@ -54,6 +54,7 @@ class PipelineState:
     animation_result: Any = None
     rbx_place: RbxPlace | None = None
     prefab_library: Any = None
+    dependency_map: dict[str, list[str]] = field(default_factory=dict)
 
 
 class Pipeline:
@@ -501,6 +502,18 @@ class Pipeline:
             log.info("[transpile_scripts] No runtime scripts found")
             return
 
+        # Build cross-script dependency map from type references
+        project_classes = {si.class_name for si in script_infos if si.class_name}
+        for si in script_infos:
+            if si.class_name and si.referenced_types:
+                deps = [t for t in si.referenced_types if t in project_classes and t != si.class_name]
+                if deps:
+                    self.state.dependency_map[si.class_name] = deps
+        if self.state.dependency_map:
+            total_deps = sum(len(v) for v in self.state.dependency_map.values())
+            log.info("[transpile_scripts] Built dependency map: %d scripts with %d cross-references",
+                     len(self.state.dependency_map), total_deps)
+
         self.state.transpilation_result = transpile_scripts(
             unity_project_path=self.unity_project_path,
             script_infos=script_infos,
@@ -649,6 +662,22 @@ class Pipeline:
         )
         if rewrites:
             log.info("[write_output] Rewrote asset references in %d scripts", rewrites)
+
+        # Inject require() calls for cross-script class dependencies.
+        if self.state.dependency_map and self.state.rbx_place.scripts:
+            from converter.script_coherence import inject_require_calls
+            injected = inject_require_calls(
+                self.state.rbx_place.scripts,
+                self.state.dependency_map,
+            )
+            if injected:
+                log.info("[write_output] Injected %d cross-script require() calls", injected)
+                # Re-write .luau files to disk with injected requires
+                scripts_dir = self.output_dir / "scripts"
+                for s in self.state.rbx_place.scripts:
+                    luau_path = scripts_dir / f"{s.name}.luau"
+                    if luau_path.exists():
+                        luau_path.write_text(s.source, encoding="utf-8")
 
         # Post-transpilation: fix script types based on cross-script dependencies.
         from converter.script_coherence import fix_require_classifications

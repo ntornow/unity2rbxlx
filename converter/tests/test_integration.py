@@ -502,6 +502,33 @@ class TestLuauValidator:
         # The print after the block should remain
         assert 'print("done")' in fixed
 
+    def test_runtime_script_source_variable_commented(self):
+        """When .Source = varName, the variable's multiline string def should also be commented."""
+        from converter.luau_validator import validate_and_fix
+        source = (
+            'local shakeSource = [[\n'
+            'local camera = workspace.CurrentCamera\n'
+            'print("shaking")\n'
+            ']]\n'
+            '\n'
+            'local function setup()\n'
+            '  local s = Instance.new("LocalScript")\n'
+            '  s.Name = "Shaker"\n'
+            '  s.Source = shakeSource\n'
+            '  s.Parent = game.StarterPlayer\n'
+            'end\n'
+            'setup()'
+        )
+        fixed, fixes = validate_and_fix("test", source)
+        # The multiline string variable should be commented out
+        for line in fixed.split("\n"):
+            stripped = line.strip()
+            if stripped == "]]":
+                assert False, "Dangling ]] found — source variable should be commented out"
+        # The setup() call after the block should remain
+        assert 'setup()' in fixed
+        assert "DISABLED" in fixed
+
     def test_valid_code_unchanged(self):
         from converter.luau_validator import validate_and_fix
         source = "local x = 1\nprint(x)"

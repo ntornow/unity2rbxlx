@@ -224,6 +224,8 @@ def _preprocess_multiline_constructs(source: str) -> str:
     source = _preprocess_null_conditional(source)
     source = _preprocess_is_type_check(source)
     source = _preprocess_async_await(source)
+    source = _preprocess_using_blocks(source)
+    source = _preprocess_lock_blocks(source)
     return source
 
 
@@ -591,6 +593,41 @@ def _preprocess_async_await(source: str) -> str:
     return source
 
 
+def _preprocess_using_blocks(source: str) -> str:
+    """Strip C# 'using' resource disposal blocks.
+
+    using (var x = new Something()) { ... } → var x = new Something(); ...
+    Luau has no IDisposable; just inline the variable and body.
+    """
+    lines = source.split("\n")
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        # Match: using (var/Type name = expr) {
+        m = re.match(r'^(\s*)using\s*\((.+)\)\s*\{\s*$', line)
+        if m:
+            indent = m.group(1)
+            inner = m.group(2).strip()
+            result.append(f"{indent}{inner}")
+            result.append(f"{indent}do")
+            continue
+        # using var x = expr; (C# 8 simplified using declaration)
+        if re.match(r'^\s*using\s+var\s+', stripped):
+            result.append(line.replace('using ', '', 1))
+            continue
+        result.append(line)
+    return "\n".join(result)
+
+
+def _preprocess_lock_blocks(source: str) -> str:
+    """Strip C# lock statements (Luau is single-threaded).
+
+    lock (obj) { ... } → { ... }
+    """
+    source = re.sub(r'\block\s*\([^)]*\)\s*\{', '{', source)
+    return source
+
+
 # ---------------------------------------------------------------------------
 # Rule-based transpilation
 # ---------------------------------------------------------------------------
@@ -636,8 +673,8 @@ def _rule_based_transpile(
 
         total_code_lines += 1
 
-        # -- Remove using statements --
-        if stripped.startswith("using "):
+        # -- Remove using import statements (not 'using' blocks which are preprocessed) --
+        if stripped.startswith("using ") and not stripped.startswith("using ("):
             output_lines.append(f"-- {stripped}")
             matched_patterns += 1
             continue
@@ -965,6 +1002,12 @@ def _rule_based_transpile(
         # nameof(X) → "X" (C# compile-time string of identifier)
         converted = re.sub(r'\bnameof\s*\(\s*([\w.]+)\s*\)', r'"\1"', converted)
 
+        # C# typeof(Type) → "Type" (reflection type object → string name)
+        converted = re.sub(r'\btypeof\s*\(\s*([A-Z]\w*)\s*\)', r'"\1"', converted)
+
+        # C# default(Type) → nil (default value expression)
+        converted = re.sub(r'\bdefault\s*\(\s*\w+\s*\)', 'nil', converted)
+
         # Null-coalescing: expr ?? fallback → (if expr ~= nil then expr else fallback)
         converted = re.sub(
             r'(\w+)\s*\?\?\s*([^;,\)]+)',
@@ -999,8 +1042,20 @@ def _rule_based_transpile(
             converted,
         )
 
-        # C# cast: (Type)expr -> expr
-        converted = re.sub(r"\((?:int|float|double|bool|string)\)\s*", "", converted)
+        # C# cast: (Type)expr -> expr (primitive + numeric + common Unity types)
+        # Cast must be followed by a word char or ( — not by ) ; , or EOL
+        converted = re.sub(
+            r"\((?:int|uint|float|double|decimal|bool|string|byte|sbyte"
+            r"|short|ushort|long|ulong|char|object)\)"
+            r"(?=\s*[\w(])",
+            "", converted,
+        )
+        # PascalCase type casts: (Transform)obj, (Collider)hit
+        # More restrictive: must be preceded by = or , or ( and followed by word
+        converted = re.sub(
+            r"(?<=[=(,\s])\(([A-Z]\w*)\)(?=\s*\w)",
+            "", converted,
+        )
         # as Type -> (remove)
         converted = re.sub(r"\s+as\s+\w+", "", converted)
 

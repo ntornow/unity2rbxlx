@@ -427,11 +427,8 @@ API_CALL_MAP: dict[str, str] = {
     "Math.Sqrt": "math.sqrt",
     "Math.PI": "math.pi",
     # -- Array/List --
-    ".Add(": "table.insert(",
-    ".Remove(": "table.remove(",
-    ".RemoveAt(": "table.remove(",
-    ".Insert(": "table.insert(",
-    ".IndexOf(": "table.find(",
+    # .Add/.Remove/.RemoveAt/.Insert/.IndexOf handled by luau_validator regex
+    # (simple string replacement can't restructure obj.Method(arg) → func(obj, arg))
     ".Reverse()": "-- Reverse: reverse table in-place",
     ".Sort()": "table.sort",
     # ContainsKey and TryGetValue handled by luau_validator, not here

@@ -55,6 +55,89 @@ _SERVER_ONLY_PATTERNS = [
 ]
 
 
+def inject_require_calls(
+    scripts: list[RbxScript],
+    dependency_map: dict[str, list[str]],
+) -> int:
+    """Inject require() calls for cross-script dependencies.
+
+    For each script that references other project classes, adds require()
+    calls at the top and ensures the referenced scripts are ModuleScripts
+    with a proper return statement.
+
+    Args:
+        scripts: All transpiled scripts.
+        dependency_map: class_name -> [referenced_class_names] from analyzer.
+
+    Returns:
+        Number of require() calls injected.
+    """
+    injected = 0
+    script_by_class: dict[str, RbxScript] = {}
+    for s in scripts:
+        # Use the script name (which comes from the C# class name)
+        script_by_class[s.name] = s
+
+    for s in scripts:
+        deps = dependency_map.get(s.name, [])
+        if not deps:
+            continue
+
+        # Find which dependencies are actual project scripts
+        requires_to_add: list[str] = []
+        for dep in deps:
+            if dep in script_by_class and dep != s.name:
+                # Check if already required
+                if f'"{dep}"' not in s.source or 'require(' not in s.source:
+                    requires_to_add.append(dep)
+
+        if not requires_to_add:
+            continue
+
+        # Build require() block
+        require_lines = []
+        for dep in sorted(set(requires_to_add)):
+            target = script_by_class[dep]
+            # Ensure the target is a ModuleScript
+            if target.script_type != "ModuleScript":
+                old_type = target.script_type
+                target.script_type = "ModuleScript"
+                log.info("  Reclassified '%s' from %s to ModuleScript (required by '%s')",
+                         dep, old_type, s.name)
+                # Add return statement if missing
+                stripped_source = target.source.rstrip()
+                if not stripped_source.endswith(f"return {dep}"):
+                    # Wrap the script in a module table pattern
+                    target.source = stripped_source + f"\n\nreturn {dep}\n"
+
+            require_lines.append(
+                f'local {dep} = require(game:GetService("ReplicatedStorage")'
+                f':FindFirstChild("{dep}", true))'
+            )
+
+        if require_lines:
+            # Insert after any existing service declarations at the top
+            lines = s.source.split("\n")
+            insert_idx = 0
+            for i, line in enumerate(lines):
+                if line.strip().startswith("local ") and "GetService" in line:
+                    insert_idx = i + 1
+                elif line.strip() == "" and insert_idx > 0:
+                    insert_idx = i + 1
+                    break
+                elif insert_idx == 0 and line.strip() and not line.strip().startswith("--"):
+                    break
+
+            # Add requires
+            require_block = "\n".join(require_lines) + "\n"
+            lines.insert(insert_idx, require_block)
+            s.source = "\n".join(lines)
+            injected += len(require_lines)
+            log.info("  Injected %d require() calls into '%s'", len(require_lines), s.name)
+
+    return injected
+
+
 def fix_require_classifications(scripts: list[RbxScript]) -> int:
     """Reclassify scripts that are require()'d by other scripts as ModuleScripts.
 

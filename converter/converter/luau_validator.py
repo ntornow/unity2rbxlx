@@ -145,30 +145,56 @@ def _fix_runtime_script_creation(name: str, source: str, fixes: list[str]) -> st
 
     In Roblox, you can't create Script/LocalScript at runtime and set .Source.
     Comments out the entire block including multi-line string contents.
+    Also comments out variables holding source code assigned via multiline strings
+    that are later used in .Source assignments.
     """
     if not re.search(r'Instance\.new\(\s*["\'](?:Module|Local)?Script["\']\s*\)', source):
         return source
     if not re.search(r'\.Source\s*=', source):
         return source
 
+    # First pass: collect variable names used in .Source = varName assignments
+    source_var_names: set[str] = set()
+    for m in re.finditer(r'\.Source\s*=\s*(\w+)\s*$', source, re.MULTILINE):
+        source_var_names.add(m.group(1))
+
     lines = source.split("\n")
-    result = []
+    result: list[str] = []
     in_script_creation = False
     in_multiline_string = False
-    multiline_closer = None
-    script_var = None
+    in_source_var_string = False  # Track multiline strings for source variables
+    multiline_closer: str | None = None
+    script_var: str | None = None
 
     for line in lines:
         stripped = line.strip()
         indent = len(line) - len(line.lstrip())
 
         # If inside a multi-line string, comment everything until the closer
-        if in_multiline_string:
+        if in_multiline_string or in_source_var_string:
             result.append(f"{' ' * indent}-- {stripped}")
             if multiline_closer and multiline_closer in stripped:
                 in_multiline_string = False
+                in_source_var_string = False
                 multiline_closer = None
             continue
+
+        # Check for variable definitions that hold source code in multiline strings
+        # e.g.: local clientShakeSource = [[
+        if source_var_names:
+            var_ml_match = re.match(
+                r'local\s+(\w+)\s*=\s*(\[=*\[)', stripped
+            )
+            if var_ml_match and var_ml_match.group(1) in source_var_names:
+                opener = var_ml_match.group(2)
+                eq_count = opener.count("=")
+                closer = "]" + "=" * eq_count + "]"
+                result.append(f"{' ' * indent}-- [DISABLED: source code variable for runtime script]")
+                result.append(f"{' ' * indent}-- {stripped}")
+                if closer not in stripped:
+                    in_source_var_string = True
+                    multiline_closer = closer
+                continue
 
         # Detect start of script creation
         m = re.search(r'local\s+(\w+)\s*=\s*Instance\.new\(\s*["\'](?:Module|Local)?Script["\']\s*\)', stripped)
@@ -360,6 +386,61 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
         source = re.sub(r'(\w+)\.ToString\(\)', r'tostring(\1)', source)
         fixes.append("Fixed '.ToString()' → 'tostring()'")
 
+    # Fix '.Add(item)' → 'table.insert(tbl, item)' for list
+    # Fix '.Add(key, value)' → 'tbl[key] = value' for dictionary
+    if '.Add(' in source:
+        def _fix_add(m: re.Match) -> str:
+            obj = m.group(1)
+            args = m.group(2)
+            # If args contains a comma, treat as dict.Add(key, value)
+            if ',' in args:
+                parts = args.split(',', 1)
+                return f'{obj}[{parts[0].strip()}] = {parts[1].strip()}'
+            # Otherwise it's list.Add(item)
+            return f'table.insert({obj}, {args})'
+        source = re.sub(
+            r'(\w+)\.Add\(([^)]+)\)',
+            _fix_add,
+            source,
+        )
+        fixes.append("Fixed '.Add()' → 'table.insert()' or dict assignment")
+
+    # Fix '.Remove(item)' → 'table.remove(tbl, table.find(tbl, item))'
+    if '.Remove(' in source and '.RemoveAt(' not in source:
+        source = re.sub(
+            r'(\w+)\.Remove\(([^)]+)\)',
+            r'table.remove(\1, table.find(\1, \2))',
+            source,
+        )
+        fixes.append("Fixed '.Remove()' → 'table.remove()'")
+
+    # Fix '.RemoveAt(idx)' → 'table.remove(tbl, idx + 1)' (0-based → 1-based)
+    if '.RemoveAt(' in source:
+        source = re.sub(
+            r'(\w+)\.RemoveAt\(([^)]+)\)',
+            r'table.remove(\1, \2 + 1)',
+            source,
+        )
+        fixes.append("Fixed '.RemoveAt()' → 'table.remove()'")
+
+    # Fix '.Insert(idx, item)' → 'table.insert(tbl, idx + 1, item)'
+    if '.Insert(' in source:
+        source = re.sub(
+            r'(\w+)\.Insert\(([^,]+),\s*([^)]+)\)',
+            r'table.insert(\1, \2 + 1, \3)',
+            source,
+        )
+        fixes.append("Fixed '.Insert()' → 'table.insert()'")
+
+    # Fix '.IndexOf(item)' → 'table.find(tbl, item)'
+    if '.IndexOf(' in source:
+        source = re.sub(
+            r'(\w+)\.IndexOf\(([^)]+)\)',
+            r'(table.find(\1, \2) or 0) - 1',
+            source,
+        )
+        fixes.append("Fixed '.IndexOf()' → 'table.find()'")
+
     # Fix '.ContainsKey(key)' → '[key] ~= nil'
     if '.ContainsKey(' in source:
         source = re.sub(
@@ -402,7 +483,13 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
 
     # Fix '?.Invoke(' (C# null-conditional event invoke → :Fire())
     if '?.Invoke(' in source or '.Invoke(' in source:
-        source = re.sub(r'(\w+)\?\.Invoke\(', r'if \1 then \1:Fire(', source)
+        # Null-conditional: obj?.Invoke(args) → if obj then obj:Fire(args) end
+        source = re.sub(
+            r'(\w+)\?\.Invoke\(([^)]*)\)',
+            r'if \1 then \1:Fire(\2) end',
+            source,
+        )
+        # Regular: obj.Invoke(args) → obj:Fire(args)
         source = re.sub(r'(\w+)\.Invoke\(([^)]*)\)', r'\1:Fire(\2)', source)
         fixes.append("Fixed event '.Invoke()' → ':Fire()'")
 
@@ -618,19 +705,16 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
                 f"Instance.new('{new}') -- was {old} (deprecated)",
             )
 
-    # Fix: string.unpack → buffer-based alternative (not available in Roblox Luau)
-    if "string.unpack(" in source:
+    # string.pack/string.unpack ARE available in Roblox Luau — no warning needed
+
+    # Fix 'require(expr or nil)' → safe require with nil check
+    if 'or nil)' in source and 'require(' in source:
         source = re.sub(
-            r'string\.unpack\(',
-            '-- [WARNING: string.unpack not available in Roblox] string.unpack(',
+            r'require\(([^)]+)\s+or\s+nil\)',
+            r'(function() local m = \1; if m then return require(m) end; return nil end)()',
             source,
         )
-    if "string.pack(" in source:
-        source = re.sub(
-            r'string\.pack\(',
-            '-- [WARNING: string.pack not available in Roblox] string.pack(',
-            source,
-        )
+        fixes.append("Fixed unsafe require(... or nil) pattern")
 
     if source != original:
         fixes.append("Fixed common API mistakes")

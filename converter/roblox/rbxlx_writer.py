@@ -147,9 +147,10 @@ def _add_color3uint8(parent: ET.Element, name: str, r: int, g: int, b: int) -> E
 
 def _add_color3(parent: ET.Element, name: str, r: float, g: float, b: float) -> ET.Element:
     c = ET.SubElement(parent, "Color3", name=name)
-    ET.SubElement(c, "R").text = str(r)
-    ET.SubElement(c, "G").text = str(g)
-    ET.SubElement(c, "B").text = str(b)
+    # Clamp to valid 0-1 range (Unity HDR colors can exceed 1.0)
+    ET.SubElement(c, "R").text = str(max(0.0, min(1.0, r)))
+    ET.SubElement(c, "G").text = str(max(0.0, min(1.0, g)))
+    ET.SubElement(c, "B").text = str(max(0.0, min(1.0, b)))
     return c
 
 

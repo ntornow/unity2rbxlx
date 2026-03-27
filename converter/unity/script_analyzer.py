@@ -57,6 +57,7 @@ class ScriptInfo:
     is_editor_script: bool = False
     is_test_script: bool = False
     suggested_type: str = "Script"  # Script, LocalScript, ModuleScript
+    referenced_types: list[str] = field(default_factory=list)  # Project types used
 
 
 def analyze_script(script_path: str | Path) -> ScriptInfo:
@@ -91,6 +92,59 @@ def analyze_script(script_path: str | Path) -> ScriptInfo:
     info.serialized_fields = [
         (m.group(1), m.group(2)) for m in _RE_SERIALIZED_FIELD.finditer(source)
     ]
+
+    # Extract type references (field types, method parameter types, etc.)
+    # Matches PascalCase identifiers used as types in declarations
+    _type_refs: set[str] = set()
+    # Field declarations: Type fieldName; or [Attr] Type fieldName;
+    for m2 in re.finditer(r'(?:private|public|protected|internal)\s+(?:readonly\s+)?([A-Z]\w+)\s+\w+', source):
+        _type_refs.add(m2.group(1))
+    # Serialized fields: [SerializeField] Type name
+    for ft, _ in info.serialized_fields:
+        if ft and ft[0].isupper():
+            _type_refs.add(ft)
+    # Constructor calls: new TypeName(
+    for m2 in re.finditer(r'\bnew\s+([A-Z]\w+)\s*\(', source):
+        _type_refs.add(m2.group(1))
+    # Generic type args: List<TypeName>, Dictionary<K, TypeName>
+    for m2 in re.finditer(r'<\s*([A-Z]\w+)', source):
+        _type_refs.add(m2.group(1))
+    # Method parameters: (TypeName param, ...)
+    for m2 in re.finditer(r'[,(]\s*([A-Z]\w+)\s+\w+', source):
+        _type_refs.add(m2.group(1))
+    # Base class
+    if info.base_class:
+        _type_refs.add(info.base_class)
+    # Remove common Unity/C# types that aren't project-local
+    _BUILTIN_TYPES = {
+        "MonoBehaviour", "ScriptableObject", "Component", "GameObject", "Transform",
+        "Vector2", "Vector3", "Vector4", "Quaternion", "Color", "Color32", "Rect",
+        "Mathf", "Math", "Debug", "String", "Int32", "Single", "Boolean", "Object",
+        "List", "Dictionary", "HashSet", "Queue", "Stack", "Array", "IEnumerator",
+        "Action", "Func", "Task", "IEnumerable", "IList", "IDictionary",
+        "Coroutine", "WaitForSeconds", "YieldInstruction",
+        "Rigidbody", "Rigidbody2D", "Collider", "Collider2D", "BoxCollider",
+        "SphereCollider", "CapsuleCollider", "MeshCollider", "CharacterController",
+        "Camera", "Light", "AudioSource", "AudioClip", "Animator", "Animation",
+        "SpriteRenderer", "MeshRenderer", "MeshFilter", "Renderer", "Material",
+        "Texture", "Texture2D", "Sprite", "RenderTexture",
+        "ParticleSystem", "TrailRenderer", "LineRenderer",
+        "Canvas", "Image", "Text", "Button", "Slider", "Toggle", "InputField",
+        "RectTransform", "LayoutGroup", "VerticalLayoutGroup", "HorizontalLayoutGroup",
+        "EventSystem", "PointerEventData", "BaseEventData",
+        "NavMeshAgent", "NavMeshPath",
+        "SceneManager", "Scene", "Application", "Resources", "PlayerPrefs",
+        "Physics", "Physics2D", "RaycastHit", "RaycastHit2D", "LayerMask",
+        "Input", "KeyCode", "Cursor", "Screen", "SystemInfo",
+        "TextMeshPro", "TextMeshProUGUI", "TMP_Text",
+        "NetworkBehaviour", "ClientRpc", "ServerRpc", "Command",
+        "UnityEvent", "UnityAction",
+        "Enum", "Attribute", "Exception", "EventArgs", "Type",
+        "SerializeField", "Header", "Tooltip", "Range", "Space",
+        "Editor", "EditorWindow", "PropertyDrawer", "CustomEditor",
+        "Void", "Float", "Int", "Bool", "Byte",
+    }
+    info.referenced_types = sorted(_type_refs - _BUILTIN_TYPES - {info.class_name})
 
     # Classify script type
     if info.base_class in ("Editor", "EditorWindow", "PropertyDrawer"):

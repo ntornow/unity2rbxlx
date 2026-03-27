@@ -1035,6 +1035,172 @@ class TestStringFormatPlaceholders:
         assert '"%s has %d items"' in result
 
 
+class TestCollectionMethodFixes:
+    """Test that C# collection methods are properly converted to Luau table operations."""
+
+    def test_list_add(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'inventory.Add(item)'
+        fixed, fixes = validate_and_fix("test", source)
+        assert "table.insert(inventory, item)" in fixed
+
+    def test_list_remove(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'items.Remove(target)'
+        fixed, fixes = validate_and_fix("test", source)
+        assert "table.remove(items, table.find(items, target))" in fixed
+
+    def test_list_remove_at(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'items.RemoveAt(idx)'
+        fixed, fixes = validate_and_fix("test", source)
+        assert "table.remove(items, idx + 1)" in fixed
+
+    def test_list_insert(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'items.Insert(0, newItem)'
+        fixed, fixes = validate_and_fix("test", source)
+        assert "table.insert(items, 0 + 1, newItem)" in fixed
+
+    def test_list_index_of(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local idx = items.IndexOf(target)'
+        fixed, fixes = validate_and_fix("test", source)
+        assert "table.find(items, target)" in fixed
+
+    def test_add_multiple_in_sequence(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'inventory.Add(rock)\ninventory.Add(sweet)\ninventory.Add(item)'
+        fixed, fixes = validate_and_fix("test", source)
+        assert fixed.count("table.insert(inventory,") == 3
+        assert ".Add(" not in fixed
+
+    def test_dict_add_two_args(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'dict.Add(key, value)'
+        fixed, fixes = validate_and_fix("test", source)
+        assert "dict[key] = value" in fixed
+        assert "table.insert" not in fixed
+
+    def test_null_invoke_has_end(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'myEvent?.Invoke(arg1, arg2)'
+        fixed, fixes = validate_and_fix("test", source)
+        assert "if myEvent then" in fixed
+        assert ":Fire(arg1, arg2)" in fixed
+        assert "end" in fixed
+
+
+class TestExpandedTranspilerFeatures:
+    """Test newly added transpiler features: casts, typeof, using, lock, default."""
+
+    def test_uint_cast_stripped(self):
+        from converter.code_transpiler import _rule_based_transpile
+        luau, _, _ = _rule_based_transpile('local x = (uint)value;')
+        assert '(uint)' not in luau
+        assert 'value' in luau
+
+    def test_byte_cast_stripped(self):
+        from converter.code_transpiler import _rule_based_transpile
+        luau, _, _ = _rule_based_transpile('local b = (byte)data;')
+        assert '(byte)' not in luau
+
+    def test_unity_type_cast_stripped(self):
+        from converter.code_transpiler import _rule_based_transpile
+        luau, _, _ = _rule_based_transpile('local t = (Transform)component;')
+        assert '(Transform)' not in luau
+
+    def test_typeof_class_to_string(self):
+        from converter.code_transpiler import _rule_based_transpile
+        luau, _, _ = _rule_based_transpile('local t = typeof(PlayerController);')
+        assert '"PlayerController"' in luau
+        assert 'typeof(' not in luau
+
+    def test_typeof_preserves_luau_typeof(self):
+        """Luau's typeof(obj) (lowercase argument) should not be converted."""
+        from converter.code_transpiler import _rule_based_transpile
+        luau, _, _ = _rule_based_transpile('if typeof(obj) == "string" then')
+        # Luau typeof with lowercase arg should remain
+        assert 'typeof(obj)' in luau
+
+    def test_default_type(self):
+        from converter.code_transpiler import _rule_based_transpile
+        luau, _, _ = _rule_based_transpile('local v = default(Vector3);')
+        assert 'nil' in luau
+        assert 'default(' not in luau
+
+    def test_using_block_stripped(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'using (var stream = new FileStream("a.txt")) {\nstream.Read();\n}'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert 'using' not in luau
+
+    def test_lock_block_stripped(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'lock (syncRoot) {\nx = 1;\n}'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert 'lock' not in luau
+        assert 'x = 1' in luau
+
+
+class TestDependencyInjection:
+    """Test cross-script require() injection."""
+
+    def test_inject_require_calls(self):
+        from converter.script_coherence import inject_require_calls
+        from core.roblox_types import RbxScript
+        script_a = RbxScript(
+            name="PlayerController",
+            source="local Players = game:GetService('Players')\nlocal speed = 10\n",
+            script_type="Script",
+        )
+        script_b = RbxScript(
+            name="InputReader",
+            source="local UIS = game:GetService('UserInputService')\nlocal InputReader = {}\nreturn InputReader\n",
+            script_type="ModuleScript",
+        )
+        dep_map = {"PlayerController": ["InputReader"]}
+        injected = inject_require_calls([script_a, script_b], dep_map)
+        assert injected == 1
+        assert 'require(' in script_a.source
+        assert 'InputReader' in script_a.source
+
+    def test_inject_reclassifies_target(self):
+        from converter.script_coherence import inject_require_calls
+        from core.roblox_types import RbxScript
+        script_a = RbxScript(name="A", source="local x = 1\n", script_type="Script")
+        script_b = RbxScript(name="B", source="local y = 2\n", script_type="Script")
+        dep_map = {"A": ["B"]}
+        inject_require_calls([script_a, script_b], dep_map)
+        assert script_b.script_type == "ModuleScript"
+        assert "return B" in script_b.source
+
+    def test_no_self_require(self):
+        from converter.script_coherence import inject_require_calls
+        from core.roblox_types import RbxScript
+        script_a = RbxScript(name="A", source="local x = 1\n", script_type="Script")
+        dep_map = {"A": ["A"]}
+        injected = inject_require_calls([script_a], dep_map)
+        assert injected == 0
+
+    def test_analyzer_extracts_references(self):
+        from unity.script_analyzer import analyze_script
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.cs', delete=False) as f:
+            f.write('public class Foo : MonoBehaviour {\n')
+            f.write('  private InputReader _reader;\n')
+            f.write('  private QuestManager _quests;\n')
+            f.write('  void Start() { }\n')
+            f.write('}\n')
+            f.flush()
+            info = analyze_script(f.name)
+        os.unlink(f.name)
+        assert 'InputReader' in info.referenced_types
+        assert 'QuestManager' in info.referenced_types
+        assert 'MonoBehaviour' not in info.referenced_types
+        assert 'Foo' not in info.referenced_types
+
+
 class TestScriptToPartBinding:
     """Test that script-to-part binding works for scene node MonoBehaviours."""
 

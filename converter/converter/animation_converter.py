@@ -53,6 +53,17 @@ class AnimCurve:
 
 
 @dataclass
+@dataclass
+class AnimEvent:
+    """An event in a Unity AnimationClip."""
+    time: float
+    function_name: str
+    int_parameter: int = 0
+    float_parameter: float = 0.0
+    string_parameter: str = ""
+
+
+@dataclass
 class AnimClip:
     """A parsed Unity AnimationClip."""
     name: str
@@ -60,6 +71,7 @@ class AnimClip:
     loop: bool  # m_LoopTime
     sample_rate: float  # m_SampleRate
     curves: list[AnimCurve] = field(default_factory=list)
+    events: list[AnimEvent] = field(default_factory=list)
     source_path: Path | None = None
 
 
@@ -207,6 +219,20 @@ def _parse_clip_body(body: dict[str, Any], source_path: Path) -> AnimClip:
         curve = _parse_vector_curve(curve_data, "scale")
         if curve:
             clip.curves.append(curve)
+
+    # Parse animation events
+    for event_data in body.get("m_Events", []) or []:
+        if not isinstance(event_data, dict):
+            continue
+        func_name = event_data.get("functionName", "")
+        if func_name:
+            clip.events.append(AnimEvent(
+                time=float(event_data.get("time", 0)),
+                function_name=func_name,
+                int_parameter=int(event_data.get("intParameter", 0)),
+                float_parameter=float(event_data.get("floatParameter", 0)),
+                string_parameter=event_data.get("stringParameter", ""),
+            ))
 
     return clip
 
@@ -374,6 +400,36 @@ def parse_controller_file(controller_path: Path) -> AnimatorController | None:
         clip_guid = ""
         if isinstance(motion_ref, dict):
             clip_guid = motion_ref.get("guid", "")
+            # If no GUID, the motion might be a BlendTree (local fileID reference)
+            if not clip_guid:
+                motion_fid = str(motion_ref.get("fileID", ""))
+                if motion_fid and motion_fid in docs_by_fid:
+                    bt_cid, bt_body = docs_by_fid[motion_fid]
+                    if bt_cid == 206:  # BlendTree classID
+                        # Extract the first child motion's clip GUID as fallback
+                        children = bt_body.get("m_Childs", []) or []
+                        for child in children:
+                            if not isinstance(child, dict):
+                                continue
+                            child_motion = child.get("m_Motion", {})
+                            if isinstance(child_motion, dict):
+                                child_guid = child_motion.get("guid", "")
+                                if child_guid:
+                                    clip_guid = child_guid
+                                    break
+                                # Nested BlendTree: try its children too
+                                nested_fid = str(child_motion.get("fileID", ""))
+                                if nested_fid and nested_fid in docs_by_fid:
+                                    n_cid, n_body = docs_by_fid[nested_fid]
+                                    if n_cid == 206:
+                                        for nc in (n_body.get("m_Childs", []) or []):
+                                            if isinstance(nc, dict):
+                                                nm = nc.get("m_Motion", {})
+                                                if isinstance(nm, dict) and nm.get("guid"):
+                                                    clip_guid = nm["guid"]
+                                                    break
+                                    if clip_guid:
+                                        break
 
         state = AnimState(
             name=body.get("m_Name", ""),
@@ -595,6 +651,25 @@ def generate_tween_script(
         lines.append(f"\tif {safe_var} then")
         _generate_curves_code(lines, curves, safe_var, clip, indent=2)
         lines.append(f"\tend")
+
+    # Fire animation events at their scheduled times
+    if clip.events:
+        lines.append("")
+        lines.append("\t-- Animation events")
+        for event in sorted(clip.events, key=lambda e: e.time):
+            delay = max(0, event.time)
+            if event.string_parameter:
+                lines.append(f'\ttask.delay({delay:.3f}, function() '
+                             f'if target:FindFirstChild("{event.function_name}") then '
+                             f'target:FindFirstChild("{event.function_name}"):Fire("{event.string_parameter}") end end)')
+            elif event.int_parameter:
+                lines.append(f'\ttask.delay({delay:.3f}, function() '
+                             f'if target:FindFirstChild("{event.function_name}") then '
+                             f'target:FindFirstChild("{event.function_name}"):Fire({event.int_parameter}) end end)')
+            else:
+                lines.append(f'\ttask.delay({delay:.3f}, function() '
+                             f'if target:FindFirstChild("{event.function_name}") then '
+                             f'target:FindFirstChild("{event.function_name}"):Fire() end end)')
 
     lines.append("end")
     lines.append("")
