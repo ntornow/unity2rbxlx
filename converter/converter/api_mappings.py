@@ -251,6 +251,18 @@ API_CALL_MAP: dict[str, str] = {
     # (stripping generic types). Don't replace inline — it breaks lines.
     ".Clear()": "table.clear",
     "foreach": "for _, v in",
+    # Queue
+    ".Enqueue(": "table.insert(",
+    ".Dequeue()": "table.remove(, 1)",  # post-processed by validator to fix syntax
+    ".Peek()": "[1]",  # post-processed by validator
+    # Stack
+    ".Push(": "table.insert(",
+    ".Pop()": "table.remove(, #)",  # post-processed by validator to fix syntax
+    # LinkedList
+    ".AddLast(": "table.insert(",
+    ".AddFirst(": "table.insert(, 1, ",  # post-processed
+    ".RemoveFirst()": "table.remove(, 1)",
+    ".RemoveLast()": "table.remove(, #)",
     # -- TextMeshPro --
     "TextMeshProUGUI": "TextLabel",
     "TextMeshPro": "TextLabel",
@@ -259,16 +271,10 @@ API_CALL_MAP: dict[str, str] = {
     ".SetText(": ".Text =",
     # -- DOTween --
     "DOTween.To": "TweenService:Create",
-    ".DOMove(": "-- DOMove: use TweenService:Create(part, info, {Position = target})",
-    ".DORotate(": "-- DORotate: use TweenService:Create(part, info, {CFrame = target})",
-    ".DOScale(": "-- DOScale: use TweenService:Create(part, info, {Size = target})",
-    ".DOFade(": "-- DOFade: use TweenService:Create(part, info, {Transparency = target})",
-    ".DOColor(": "-- DOColor: use TweenService:Create(part, info, {Color = target})",
-    ".DOLocalMove(": "-- DOLocalMove: use TweenService:Create with relative CFrame",
-    ".DOKill(": "-- DOKill: cancel tween",
-    ".SetEase(": "-- SetEase: use TweenInfo EasingStyle",
-    ".SetDelay(": "-- SetDelay: use TweenInfo DelayTime",
-    ".SetLoops(": "-- SetLoops: use TweenInfo RepeatCount",
+    ".DOKill(": "-- DOKill: cancel active tween",
+    ".SetEase(": "-- SetEase: use TweenInfo.new(duration, Enum.EasingStyle.Quad)",
+    ".SetDelay(": "-- SetDelay: use task.delay(seconds, function()",
+    ".SetLoops(": "-- SetLoops: use TweenInfo RepeatCount parameter",
     # -- Timeline / Playable Director --
     "PlayableDirector": "-- PlayableDirector: use animation scripts or TweenService sequences",
     "playableDirector.Play()": "-- PlayableDirector.Play: trigger animation sequence",
@@ -276,7 +282,7 @@ API_CALL_MAP: dict[str, str] = {
     "playableDirector.Pause()": "-- PlayableDirector.Pause: pause animation sequence",
     "PlayableDirector.played": "-- PlayableDirector.played: use BindableEvent for sequence start",
     "PlayableDirector.stopped": "-- PlayableDirector.stopped: use BindableEvent for sequence end",
-    ".OnComplete(": "-- OnComplete: use Tween.Completed:Connect()",
+    ".OnComplete(": ".Completed:Connect(",
     # -- NavMesh --
     "NavMeshAgent": "-- NavMeshAgent: use Roblox PathfindingService",
     "NavMesh.CalculatePath": "PathfindingService:CreatePath()",
@@ -301,22 +307,22 @@ API_CALL_MAP: dict[str, str] = {
     "await UniTask.Delay": "task.wait",
     "await UniTask.Yield()": "task.wait()",
     # -- LINQ --
-    ".Where(": "-- Where: use manual loop filter",
-    ".Select(": "-- Select: use manual loop map",
-    ".FirstOrDefault(": "-- FirstOrDefault: use manual find",
-    ".First(": "-- First: use manual find",
-    ".Any(": "-- Any: use manual loop check",
-    ".All(": "-- All: use manual loop check",
-    ".OrderBy(": "-- OrderBy: use table.sort",
-    ".OrderByDescending(": "-- OrderByDescending: use table.sort with reverse",
-    ".ToList()": "-- ToList: already a table",
-    ".ToArray()": "-- ToArray: already a table",
-    ".Sum(": "-- Sum: use manual loop accumulator",
-    ".Max(": "-- Max: use math.max in loop",
-    ".Min(": "-- Min: use math.min in loop",
-    ".Count(": "-- Count: use # operator or manual loop",
-    ".Distinct()": "-- Distinct: use dictionary-based dedup",
-    ".GroupBy(": "-- GroupBy: use manual dictionary grouping",
+    ".Where(": "linqWhere(",  # handled by UTILITY_FUNCTIONS
+    ".Select(": "linqSelect(",  # handled by UTILITY_FUNCTIONS
+    ".FirstOrDefault(": "linqFirstOrDefault(",  # handled by UTILITY_FUNCTIONS
+    ".First(": "linqFirst(",  # handled by UTILITY_FUNCTIONS
+    ".Any(": "linqAny(",  # handled by UTILITY_FUNCTIONS
+    ".All(": "linqAll(",  # handled by UTILITY_FUNCTIONS
+    ".OrderBy(": "linqOrderBy(",  # handled by UTILITY_FUNCTIONS
+    ".OrderByDescending(": "linqOrderByDesc(",  # handled by UTILITY_FUNCTIONS
+    ".ToList()": "",  # already a table in Luau
+    ".ToArray()": "",  # already a table in Luau
+    ".Sum(": "linqSum(",  # handled by UTILITY_FUNCTIONS
+    ".Max(": "linqMax(",  # handled by UTILITY_FUNCTIONS
+    ".Min(": "linqMin(",  # handled by UTILITY_FUNCTIONS
+    ".Count(": "linqCount(",  # handled by UTILITY_FUNCTIONS
+    ".Distinct()": "linqDistinct(",  # handled by UTILITY_FUNCTIONS
+    ".GroupBy(": "-- GroupBy: use manual dictionary grouping with for loop",
     # -- Cinemachine --
     "CinemachineVirtualCamera": "-- CinemachineVirtualCamera: configure workspace.CurrentCamera",
     "CinemachineBrain": "-- CinemachineBrain: use workspace.CurrentCamera",
@@ -358,12 +364,12 @@ API_CALL_MAP: dict[str, str] = {
     # Note: "event Action<" is handled by the sanitizer, not here
     # to avoid conflicts with the "Action<" mapping
     # -- Mathf additional --
-    "Mathf.Repeat": "-- Mathf.Repeat: use val % length",
-    "Mathf.DeltaAngle": "-- Mathf.DeltaAngle: compute angular difference",
-    "Mathf.LerpAngle": "-- Mathf.LerpAngle: interpolate angles",
-    "Mathf.InverseLerp": "-- Mathf.InverseLerp: (value - a) / (b - a)",
-    "Mathf.SmoothStep": "-- Mathf.SmoothStep: use TweenService easing",
-    "Mathf.Approximately": "-- Mathf.Approximately: math.abs(a-b) < 0.001",
+    "Mathf.Repeat": "mathRepeat",  # handled by UTILITY_FUNCTIONS
+    "Mathf.DeltaAngle": "mathDeltaAngle",  # handled by UTILITY_FUNCTIONS
+    "Mathf.LerpAngle": "mathLerpAngle",  # handled by UTILITY_FUNCTIONS
+    "Mathf.InverseLerp": "mathInverseLerp",  # handled by UTILITY_FUNCTIONS
+    "Mathf.SmoothStep": "mathSmoothStep",  # handled by UTILITY_FUNCTIONS
+    "Mathf.Approximately": "mathApproximately",  # handled by UTILITY_FUNCTIONS
     "Mathf.NegativeInfinity": "-math.huge",
     "Mathf.Epsilon": "1e-7",
     "Mathf.NextPowerOfTwo": "-- NextPowerOfTwo: use bit32 operations",
@@ -644,4 +650,149 @@ SERVICE_IMPORTS: dict[str, str] = {
     "TextService": 'local TextService = game:GetService("TextService")',
     "Debris": 'local Debris = game:GetService("Debris")',
     "ContentProvider": 'local ContentProvider = game:GetService("ContentProvider")',
+}
+
+
+# ---------------------------------------------------------------------------
+# UTILITY_FUNCTIONS: Luau helpers injected when certain Mathf mappings are used
+# ---------------------------------------------------------------------------
+
+UTILITY_FUNCTIONS: dict[str, str] = {
+    "mathRepeat": """\
+local function mathRepeat(t, length)
+\treturn t - math.floor(t / length) * length
+end""",
+    "mathDeltaAngle": """\
+local function mathDeltaAngle(current, target)
+\tlocal d = mathRepeat(target - current, 360)
+\tif d > 180 then d = d - 360 end
+\treturn d
+end""",
+    "mathLerpAngle": """\
+local function mathLerpAngle(a, b, t)
+\tlocal d = mathDeltaAngle(a, b)
+\treturn a + d * math.clamp(t, 0, 1)
+end""",
+    "mathInverseLerp": """\
+local function mathInverseLerp(a, b, value)
+\tif a ~= b then return math.clamp((value - a) / (b - a), 0, 1) end
+\treturn 0
+end""",
+    "mathSmoothStep": """\
+local function mathSmoothStep(from, to, t)
+\tt = math.clamp(t, 0, 1)
+\tt = t * t * (3 - 2 * t)
+\treturn from + (to - from) * t
+end""",
+    "mathApproximately": """\
+local function mathApproximately(a, b)
+\treturn math.abs(a - b) < 1e-6
+end""",
+    # LINQ utility functions
+    "linqWhere": """\
+local function linqWhere(tbl, predicate)
+\tlocal result = {}
+\tfor _, v in tbl do
+\t\tif predicate(v) then table.insert(result, v) end
+\tend
+\treturn result
+end""",
+    "linqSelect": """\
+local function linqSelect(tbl, selector)
+\tlocal result = {}
+\tfor _, v in tbl do
+\t\ttable.insert(result, selector(v))
+\tend
+\treturn result
+end""",
+    "linqFirstOrDefault": """\
+local function linqFirstOrDefault(tbl, predicate)
+\tif not predicate then return tbl[1] end
+\tfor _, v in tbl do
+\t\tif predicate(v) then return v end
+\tend
+\treturn nil
+end""",
+    "linqFirst": """\
+local function linqFirst(tbl, predicate)
+\tif not predicate then return tbl[1] end
+\tfor _, v in tbl do
+\t\tif predicate(v) then return v end
+\tend
+\terror("Sequence contains no matching element")
+end""",
+    "linqAny": """\
+local function linqAny(tbl, predicate)
+\tif not predicate then return #tbl > 0 end
+\tfor _, v in tbl do
+\t\tif predicate(v) then return true end
+\tend
+\treturn false
+end""",
+    "linqAll": """\
+local function linqAll(tbl, predicate)
+\tfor _, v in tbl do
+\t\tif not predicate(v) then return false end
+\tend
+\treturn true
+end""",
+    "linqOrderBy": """\
+local function linqOrderBy(tbl, keySelector)
+\tlocal copy = table.clone(tbl)
+\ttable.sort(copy, function(a, b) return keySelector(a) < keySelector(b) end)
+\treturn copy
+end""",
+    "linqOrderByDesc": """\
+local function linqOrderByDesc(tbl, keySelector)
+\tlocal copy = table.clone(tbl)
+\ttable.sort(copy, function(a, b) return keySelector(a) > keySelector(b) end)
+\treturn copy
+end""",
+    "linqSum": """\
+local function linqSum(tbl, selector)
+\tlocal total = 0
+\tfor _, v in tbl do
+\t\ttotal = total + (if selector then selector(v) else v)
+\tend
+\treturn total
+end""",
+    "linqMax": """\
+local function linqMax(tbl, selector)
+\tlocal best = -math.huge
+\tfor _, v in tbl do
+\t\tlocal val = if selector then selector(v) else v
+\t\tif val > best then best = val end
+\tend
+\treturn best
+end""",
+    "linqMin": """\
+local function linqMin(tbl, selector)
+\tlocal best = math.huge
+\tfor _, v in tbl do
+\t\tlocal val = if selector then selector(v) else v
+\t\tif val < best then best = val end
+\tend
+\treturn best
+end""",
+    "linqCount": """\
+local function linqCount(tbl, predicate)
+\tif not predicate then return #tbl end
+\tlocal count = 0
+\tfor _, v in tbl do
+\t\tif predicate(v) then count = count + 1 end
+\tend
+\treturn count
+end""",
+    "linqDistinct": """\
+local function linqDistinct(tbl)
+\tlocal seen = {}
+\tlocal result = {}
+\tfor _, v in tbl do
+\t\tif not seen[v] then
+\t\t\tseen[v] = true
+\t\t\ttable.insert(result, v)
+\t\tend
+\tend
+\treturn result
+end""",
 }

@@ -30,6 +30,7 @@ from converter.api_mappings import (
     LIFECYCLE_MAP,
     SERVICE_IMPORTS,
     TYPE_MAP,
+    UTILITY_FUNCTIONS,
 )
 
 log = logging.getLogger(__name__)
@@ -457,6 +458,16 @@ def _rule_based_transpile(
         converted = re.sub(r"\bnew\s+\w+\[\]\s*", "", converted)
         # List/Dict initialization: "new List<T>()" → "{}"
         converted = re.sub(r"\bnew\s+\w+<[^>]+>\(\)", "{}", converted)
+        # Dict initializer: "new Dictionary<K,V> { { "key", val }, ... }" → { ["key"] = val, ... }
+        converted = re.sub(
+            r'\bnew\s+Dictionary<[^>]+>\s*\{',
+            '{',
+            converted,
+        )
+        # List initializer: "new List<T> { a, b, c }" → "{ a, b, c }"
+        converted = re.sub(r'\bnew\s+List<[^>]+>\s*\{', '{', converted)
+        # HashSet initializer: "new HashSet<T> { a, b }" → "{ a, b }"
+        converted = re.sub(r'\bnew\s+HashSet<[^>]+>\s*\{', '{', converted)
         converted = re.sub(r"\bnew\s+(Vector3|Vector2|Color|CFrame|Ray)\(", r"\1.new(", converted)
         converted = re.sub(r"\bnew\s+\w+\(", "(", converted)  # other constructors
 
@@ -464,6 +475,24 @@ def _rule_based_transpile(
         converted = re.sub(r'@"', '"', converted)
         # C# params keyword → strip
         converted = re.sub(r'\bparams\s+', '', converted)
+
+        # nameof(X) → "X" (C# compile-time string of identifier)
+        converted = re.sub(r'\bnameof\s*\(\s*([\w.]+)\s*\)', r'"\1"', converted)
+
+        # Null-coalescing: expr ?? fallback → (if expr ~= nil then expr else fallback)
+        converted = re.sub(
+            r'(\w+)\s*\?\?\s*([^;,\)]+)',
+            r'(if \1 ~= nil then \1 else \2)',
+            converted,
+        )
+
+        # Lambda expressions: x => expr → function(x) return expr end
+        # Simple single-param: x => x.Name → function(x) return x.Name end
+        converted = re.sub(
+            r'\b(\w+)\s*=>\s*([^,\)]+?)(?=\s*[,\)])',
+            r'function(\1) return \2 end',
+            converted,
+        )
 
         # C# cast: (Type)expr -> expr
         converted = re.sub(r"\((?:int|float|double|bool|string)\)\s*", "", converted)
@@ -580,6 +609,24 @@ def _rule_based_transpile(
             if svc in SERVICE_IMPORTS:
                 header_lines.append(SERVICE_IMPORTS[svc])
         header_lines.append("")
+
+    # Inject utility functions for Mathf helpers that are used in the output
+    joined_output = "\n".join(output_lines)
+    utils_needed: list[str] = []
+    for func_name in UTILITY_FUNCTIONS:
+        if func_name + "(" in joined_output:
+            utils_needed.append(func_name)
+    # mathDeltaAngle and mathLerpAngle depend on mathRepeat
+    if ("mathDeltaAngle" in utils_needed or "mathLerpAngle" in utils_needed) and "mathRepeat" not in utils_needed:
+        utils_needed.insert(0, "mathRepeat")
+    if "mathLerpAngle" in utils_needed and "mathDeltaAngle" not in utils_needed:
+        utils_needed.insert(0 if "mathRepeat" not in utils_needed else 1, "mathDeltaAngle")
+    if utils_needed:
+        header_lines.append("-- Math utility functions")
+        for func_name in utils_needed:
+            if func_name in UTILITY_FUNCTIONS:
+                header_lines.append(UTILITY_FUNCTIONS[func_name])
+                header_lines.append("")
 
     luau_source = "\n".join(header_lines + output_lines)
 

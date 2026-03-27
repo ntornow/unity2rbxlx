@@ -345,11 +345,96 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
         )
         fixes.append("Fixed '.TryGetValue()' → direct table access")
 
+    # Fix Queue.Dequeue()/Stack.Pop() broken syntax from API map
+    # Pattern: "var = tbl.table.remove(, 1)" → "var = table.remove(tbl, 1)"
+    if 'table.remove(, 1)' in source or 'table.remove(, #)' in source:
+        # Fix Dequeue: x = queue.table.remove(, 1) → x = table.remove(queue, 1)
+        source = re.sub(
+            r'(\w+)\.table\.remove\(\s*,\s*1\s*\)',
+            r'table.remove(\1, 1)',
+            source,
+        )
+        # Fix Pop: x = stack.table.remove(, #) → x = table.remove(stack, #stack)
+        source = re.sub(
+            r'(\w+)\.table\.remove\(\s*,\s*#\s*\)',
+            r'table.remove(\1, #\1)',
+            source,
+        )
+        fixes.append("Fixed Queue.Dequeue/Stack.Pop syntax")
+
+    # Fix Peek: tbl.[1] or tbl[1] patterns from API map
+    if '.[1]' in source:
+        source = re.sub(r'(\w+)\.\[1\]', r'\1[1]', source)
+        fixes.append("Fixed Queue.Peek syntax")
+
     # Fix '?.Invoke(' (C# null-conditional event invoke → :Fire())
     if '?.Invoke(' in source or '.Invoke(' in source:
         source = re.sub(r'(\w+)\?\.Invoke\(', r'if \1 then \1:Fire(', source)
         source = re.sub(r'(\w+)\.Invoke\(([^)]*)\)', r'\1:Fire(\2)', source)
         fixes.append("Fixed event '.Invoke()' → ':Fire()'")
+
+    # Fix event += handler → event:Connect(handler)
+    if re.search(r'\w+\s*\+=\s*\w+', source) and not re.search(r'\w+\s*\+=\s*\d', source):
+        # Only convert += where both sides are identifiers (event subscription pattern)
+        # Skip numeric += (already handled by compound assignment fix)
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\s*\+=\s*(\w+)\s*$',
+            lambda m: (
+                f'{m.group(1)}:Connect({m.group(2)})'
+                if any(kw in m.group(1) for kw in ('Changed', 'Event', 'Signal', 'Touched', 'Added', 'Removing', 'Died', 'Activated', 'Clicked'))
+                else f'{m.group(1)} = {m.group(1)} + {m.group(2)}'
+            ),
+            source,
+            flags=re.MULTILINE,
+        )
+
+    # Fix event -= handler → comment (disconnection needs stored connection)
+    if re.search(r'\w+\s*-=\s*\w+\s*$', source, re.MULTILINE):
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\s*-=\s*(\w+)\s*$',
+            lambda m: (
+                f'-- {m.group(1)} -= {m.group(2)} (store connection from :Connect to disconnect)'
+                if any(kw in m.group(1) for kw in ('Changed', 'Event', 'Signal', 'Touched', 'Added', 'Removing', 'Died', 'Activated', 'Clicked'))
+                else f'{m.group(1)} = {m.group(1)} - {m.group(2)}'
+            ),
+            source,
+            flags=re.MULTILINE,
+        )
+
+    # Fix DOTween method calls → TweenService:Create
+    if '.DOMove(' in source or '.DORotate(' in source or '.DOScale(' in source or '.DOFade(' in source or '.DOColor(' in source or '.DOLocalMove(' in source:
+        # obj.DOMove(target, duration) → TweenService:Create(obj, TweenInfo.new(duration), {Position = target}):Play()
+        source = re.sub(
+            r'(\w+)\.DOMove\(([^,]+),\s*([^)]+)\)',
+            r'TweenService:Create(\1, TweenInfo.new(\3), {Position = \2}):Play()',
+            source,
+        )
+        source = re.sub(
+            r'(\w+)\.DOLocalMove\(([^,]+),\s*([^)]+)\)',
+            r'TweenService:Create(\1, TweenInfo.new(\3), {Position = \2}):Play()',
+            source,
+        )
+        source = re.sub(
+            r'(\w+)\.DORotate\(([^,]+),\s*([^)]+)\)',
+            r'TweenService:Create(\1, TweenInfo.new(\3), {CFrame = CFrame.fromEulerAnglesXYZ(math.rad(\2.X), math.rad(\2.Y), math.rad(\2.Z))}):Play()',
+            source,
+        )
+        source = re.sub(
+            r'(\w+)\.DOScale\(([^,]+),\s*([^)]+)\)',
+            r'TweenService:Create(\1, TweenInfo.new(\3), {Size = \2}):Play()',
+            source,
+        )
+        source = re.sub(
+            r'(\w+)\.DOFade\(([^,]+),\s*([^)]+)\)',
+            r'TweenService:Create(\1, TweenInfo.new(\3), {Transparency = 1 - \2}):Play()',
+            source,
+        )
+        source = re.sub(
+            r'(\w+)\.DOColor\(([^,]+),\s*([^)]+)\)',
+            r'TweenService:Create(\1, TweenInfo.new(\3), {Color = \2}):Play()',
+            source,
+        )
+        fixes.append("Converted DOTween calls to TweenService:Create")
 
     if source != original and not fixes:
         fixes.append("Fixed C# syntax remnants")

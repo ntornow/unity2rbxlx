@@ -370,3 +370,194 @@ class TestLuauValidatorCSharpRemnants:
         source = 'OnDeath.Invoke(player)'
         fixed, fixes = validate_and_fix("test", source)
         assert ":Fire(" in fixed
+
+
+class TestNewTranspilerFeatures:
+    """Tests for newly added transpiler features."""
+
+    def test_nameof_expression(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'Debug.Log(nameof(health));'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert '"health"' in luau
+
+    def test_nameof_dotted(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'string name = nameof(MyClass.Property);'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert '"MyClass.Property"' in luau
+
+    def test_null_coalescing(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'var result = value ?? fallback;'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "~= nil" in luau
+        assert "value" in luau
+        assert "fallback" in luau
+
+    def test_dictionary_initializer(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'var dict = new Dictionary<string, int> { "a", 1 };'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "Dictionary" not in luau or "-- " in luau
+        assert "{" in luau
+
+    def test_list_initializer(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'var items = new List<int> { 1, 2, 3 };'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "List" not in luau or "-- " in luau
+        assert "{ 1, 2, 3 }" in luau
+
+    def test_hashset_initializer(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'var set = new HashSet<string> { "a", "b" };'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "HashSet" not in luau or "-- " in luau
+
+    def test_queue_enqueue(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'queue.Enqueue(item);'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "table.insert(" in luau
+
+    def test_stack_push(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'stack.Push(item);'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "table.insert(" in luau
+
+    def test_mathf_repeat(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'float r = Mathf.Repeat(t, length);'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "mathRepeat(" in luau
+
+    def test_mathf_approximately(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'if (Mathf.Approximately(a, b))'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "mathApproximately(" in luau
+
+    def test_mathf_utility_functions_injected(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'float r = Mathf.Repeat(t, length);'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "local function mathRepeat(" in luau
+
+    def test_mathf_delta_angle_deps(self):
+        """mathDeltaAngle depends on mathRepeat — both should be injected."""
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'float d = Mathf.DeltaAngle(current, target);'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "local function mathDeltaAngle(" in luau
+        assert "local function mathRepeat(" in luau
+
+    def test_dotween_domove(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'part.DOMove(targetPos, 1.5)'
+        fixed, fixes = validate_and_fix("test", source)
+        assert "TweenService:Create(" in fixed
+        assert "Position" in fixed
+
+    def test_dotween_doscale(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'obj.DOScale(newSize, 0.5)'
+        fixed, fixes = validate_and_fix("test", source)
+        assert "TweenService:Create(" in fixed
+        assert "Size" in fixed
+
+    def test_dotween_dofade(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'part.DOFade(0, 2.0)'
+        fixed, fixes = validate_and_fix("test", source)
+        assert "TweenService:Create(" in fixed
+        assert "Transparency" in fixed
+
+    def test_queue_dequeue_fix(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local item = queue.table.remove(, 1)'
+        fixed, fixes = validate_and_fix("test", source)
+        assert "table.remove(queue, 1)" in fixed
+
+    def test_stack_pop_fix(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local item = stack.table.remove(, #)'
+        fixed, fixes = validate_and_fix("test", source)
+        assert "table.remove(stack, #stack)" in fixed
+
+    def test_event_connect_touched(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'part.Touched += onTouch'
+        fixed, fixes = validate_and_fix("test", source)
+        assert ":Connect(" in fixed
+
+    def test_mathf_inverselerp(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'float t = Mathf.InverseLerp(a, b, value);'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "mathInverseLerp(" in luau
+        assert "local function mathInverseLerp(" in luau
+
+    def test_lambda_expression(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'var result = items.Where(x => x.Health > 0);'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "function(x)" in luau
+        assert "return" in luau
+
+    def test_linq_where_utility_injected(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'var alive = enemies.Where(x => x.Health > 0);'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "linqWhere(" in luau
+        assert "local function linqWhere(" in luau
+
+    def test_linq_select(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'var names = items.Select(x => x.Name);'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "linqSelect(" in luau
+        assert "local function linqSelect(" in luau
+
+    def test_linq_any(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'bool hasEnemy = enemies.Any(x => x.IsAlive);'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "linqAny(" in luau
+
+    def test_linq_first_or_default(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'var item = items.FirstOrDefault(x => x.Active);'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "linqFirstOrDefault(" in luau
+
+    def test_linq_order_by(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'var sorted = items.OrderBy(x => x.Priority);'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "linqOrderBy(" in luau
+
+    def test_linq_sum(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'int total = items.Sum(x => x.Value);'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "linqSum(" in luau
+
+    def test_linq_tolist_removed(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'var list = items.ToList();'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "ToList" not in luau
+
+    def test_linq_distinct(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'var unique = items.Distinct();'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "linqDistinct(" in luau
+
+    def test_oncomplete_tween(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'tween.OnComplete(Finish);'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "Completed:Connect(" in luau
