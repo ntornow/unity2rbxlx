@@ -2834,6 +2834,133 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             new_lines.append(line)
     source = '\n'.join(new_lines)
 
+    # Fix FindFirstChildOfClassInChildren → GetDescendants loop or FindFirstDescendant
+    if 'FindFirstChildOfClassInChildren' in source:
+        # Pattern with type arg: obj:FindFirstChildOfClassInChildren("Type") → find in descendants
+        source = re.sub(
+            r'(\w+(?:\.\w+)*):FindFirstChildOfClassInChildren\(([^)]+)\)',
+            r'\1:FindFirstDescendant(\2)',
+            source,
+        )
+        # Pattern without args: obj:FindFirstChildOfClassInChildren() → obj:GetDescendants()[1]
+        source = re.sub(
+            r'(\w+(?:\.\w+)*):FindFirstChildOfClassInChildren\(\)',
+            r'\1:FindFirstChildOfClass("BasePart")',
+            source,
+        )
+        fixes.append("Fixed FindFirstChildOfClassInChildren → FindFirstDescendant/FindFirstChildOfClass")
+
+    # Comment out Unity rendering APIs (GL, Graphics, Shader.Set*, RenderTexture)
+    # These have no Roblox equivalent
+    if re.search(r'\bGL\.\w+|Graphics\.Draw|Shader\.Set|RenderTexture\.\w+', source):
+        source = re.sub(
+            r'^(\s*)(?!--)(.+?(?:\bGL\.\w+|Graphics\.Draw\w+|Shader\.Set\w+|RenderTexture\.\w+).*)$',
+            r'\1-- [Unity render] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out Unity rendering APIs (GL/Graphics/Shader/RenderTexture)")
+
+    # Comment out QualitySettings (Unity-only)
+    if 'QualitySettings' in source:
+        source = re.sub(
+            r'^(\s*)(?!--)(.+?QualitySettings\.\w+.*)$',
+            r'\1-- [Unity] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out QualitySettings (Unity-only)")
+
+    # Fix .collider → the part itself (in Roblox, collision events give the BasePart directly)
+    if '.collider' in source:
+        # otherPart.collider → otherPart
+        source = re.sub(r'(\w+)\.collider(?:Component)?\b', r'\1', source)
+        fixes.append("Fixed .collider → part itself")
+
+    # Fix .contacts[N].normal/.point → raycast-based alternative
+    if '.contacts' in source:
+        # col.contacts[0].normal → hit.Normal (from raycast)
+        source = re.sub(r'(\w+)\.contacts\[\d+\]\.normal', r'\1.Normal or Vector3.yAxis', source)
+        source = re.sub(r'(\w+)\.contacts\[\d+\]\.point', r'\1.Position', source)
+        # #col.contacts → 1 (simplify to single contact)
+        source = re.sub(r'#(\w+)\.contacts', '1', source)
+        fixes.append("Fixed .contacts[N] → simplified contact data")
+
+    # Fix .relativeVelocity → velocity difference
+    if '.relativeVelocity' in source:
+        source = re.sub(
+            r'(\w+)\.relativeVelocity\b',
+            r'\1.AssemblyLinearVelocity',
+            source,
+        )
+        fixes.append("Fixed .relativeVelocity → .AssemblyLinearVelocity")
+
+    # Fix Animator.deltaPosition/deltaRotation → nil (no Roblox equivalent)
+    if 'deltaPosition' in source or 'deltaRotation' in source:
+        source = re.sub(r'(\w+(?:\.\w+)*)\.deltaPosition\b', r'Vector3.zero', source)
+        source = re.sub(r'(\w+(?:\.\w+)*)\.deltaRotation\b', r'CFrame.identity', source)
+        fixes.append("Fixed Animator delta properties → zero values")
+
+    # Fix Rigidbody.MovePosition/MoveRotation
+    if '.MovePosition(' in source:
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.MovePosition\(([^)]+)\)',
+            r'\1.Position = \2',
+            source,
+        )
+        fixes.append("Fixed .MovePosition() → .Position assignment")
+    if '.MoveRotation(' in source:
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.MoveRotation\(([^)]+)\)',
+            r'\1.CFrame = \2',
+            source,
+        )
+        fixes.append("Fixed .MoveRotation() → .CFrame assignment")
+
+    # Fix SweepTest → Raycast approximation
+    if '.SweepTest(' in source:
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.SweepTest\(([^,]+),\s*(\w+),\s*([^)]+)\)',
+            r'workspace:Raycast(\1.Position, \2 * \4)',
+            source,
+        )
+        fixes.append("Fixed SweepTest → workspace:Raycast")
+
+    # Fix .material property access (not directly available in Roblox)
+    if re.search(r'\.material\b(?!\w)', source):
+        # obj.material.color → obj.Color
+        source = re.sub(r'(\w+)\.material\.color\b', r'\1.Color', source)
+        # obj.material.SetFloat/GetFloat etc → comment out
+        source = re.sub(
+            r'^(\s*)(?!--)(.+\.material\.\w+\(.+)$',
+            r'\1-- [Unity material] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        # Standalone material assignment → comment
+        source = re.sub(r'(\w+)\.material\b', r'\1 --[[.material]]', source)
+        fixes.append("Fixed .material property access")
+
+    # Fix GetInstanceID() → tostring(obj) (unique identifier)
+    if 'GetInstanceID' in source:
+        source = re.sub(r'(\w+(?:\.\w+)*):?\.?GetInstanceID\(\)', r'tostring(\1)', source)
+        fixes.append("Fixed GetInstanceID() → tostring()")
+
+    # Comment out SceneLinkedSMB calls (Unity state machine behaviour, not in Roblox)
+    if 'SceneLinkedSMB' in source and not re.search(r'--.*SceneLinkedSMB', source):
+        source = re.sub(
+            r'^(\s*)(?!--)(.+SceneLinkedSMB\.\w+.*)$',
+            r'\1-- [Unity SMB] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out SceneLinkedSMB calls (Unity state machine)")
+
+    # Fix animator.speed property (not in Roblox)
+    if 'animator.speed' in source:
+        source = re.sub(r'(\w+)\.animator\.speed\s*=\s*([^\n]+)', r'-- animator.speed = \2 (not in Roblox)', source)
+        fixes.append("Commented out animator.speed assignment")
+
     if source != original:
         fixes.append("Fixed common API mistakes")
         log.info("  [%s] Fixed common API/syntax mistakes", name)

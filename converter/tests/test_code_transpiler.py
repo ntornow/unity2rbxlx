@@ -2888,3 +2888,85 @@ class TestValidatorBatch15:
         source = 'player.PlayRandomClip(surface, bankId: (if speed < 4 then 0 else 1))'
         fixed, _ = validate_and_fix("test", source)
         assert 'bankId:' not in fixed
+
+
+class TestValidatorBatch16:
+    """Tests for round 3 fixes: Unity APIs, rendering, collision, etc."""
+
+    def test_find_first_child_of_class_in_children(self):
+        """FindFirstChildOfClassInChildren() → FindFirstChildOfClass."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local ctrl = script.Parent:FindFirstChildOfClassInChildren()'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'FindFirstChildOfClassInChildren' not in fixed
+        assert 'FindFirstChildOfClass' in fixed
+
+    def test_gl_api_commented(self):
+        """GL.invertCulling → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '    GL.invertCulling = true'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [Unity render]' in fixed
+
+    def test_quality_settings_commented(self):
+        """QualitySettings.pixelLightCount → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '    QualitySettings.pixelLightCount = 0'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [Unity]' in fixed
+
+    def test_collider_property(self):
+        """.collider → part itself."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local part = hit.collider'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.collider' not in fixed
+
+    def test_contacts_normal(self):
+        """.contacts[0].normal → .Normal."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local n = col.contacts[0].normal'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.Normal' in fixed
+
+    def test_relative_velocity(self):
+        """.relativeVelocity → .AssemblyLinearVelocity."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local vel = col.relativeVelocity'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.AssemblyLinearVelocity' in fixed
+
+    def test_delta_position(self):
+        """.deltaPosition → Vector3.zero."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local dp = m_Animator.deltaPosition'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'Vector3.zero' in fixed
+
+    def test_move_position(self):
+        """.MovePosition(pos) → .Position = pos."""
+        from converter.luau_validator import validate_and_fix
+        source = 'rb.MovePosition(newPos)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.Position = newPos' in fixed
+
+    def test_sweep_test(self):
+        """SweepTest → workspace:Raycast."""
+        from converter.luau_validator import validate_and_fix
+        source = 'm_Rigidbody.SweepTest(dir, hit, dist)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'workspace:Raycast' in fixed
+
+    def test_get_instance_id(self):
+        """GetInstanceID() → tostring()."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local id = cam:GetInstanceID()'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'tostring(cam)' in fixed
+
+    def test_scene_linked_smb_commented(self):
+        """SceneLinkedSMB.Initialise → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '    SceneLinkedSMB.Initialise(m_Animator, script.Parent)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [Unity SMB]' in fixed
