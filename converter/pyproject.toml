@@ -1,0 +1,27 @@
+[project]
+name = "unity-roblox-converter"
+version = "0.1.0"
+description = "Convert Unity game projects into playable Roblox experiences"
+requires-python = ">=3.11"
+dependencies = [
+    "pyyaml>=6.0",
+    "click>=8.0",
+    "Pillow>=10.0",
+    "trimesh>=4.0",
+    "scikit-image>=0.21",
+    "requests>=2.31",
+    "anthropic>=0.40",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[project.scripts]
+unity2roblox = "cli:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"

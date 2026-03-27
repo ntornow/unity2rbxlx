@@ -1,0 +1,33 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1001 &900
+PrefabInstance:
+  m_SourcePrefab: {fileID: 100100000, guid: aabbccdd11223344aabbccdd11223344, type: 3}
+  m_Modification:
+    m_TransformParent: {fileID: 0}
+    m_Modifications:
+    - target: {fileID: 100, guid: aabbccdd11223344aabbccdd11223344, type: 3}
+      propertyPath: m_Name
+      value: VariantPrefab
+      objectReference: {fileID: 0}
+    - target: {fileID: 101, guid: aabbccdd11223344aabbccdd11223344, type: 3}
+      propertyPath: m_LocalPosition.x
+      value: 5
+      objectReference: {fileID: 0}
+    - target: {fileID: 101, guid: aabbccdd11223344aabbccdd11223344, type: 3}
+      propertyPath: m_LocalPosition.y
+      value: 10
+      objectReference: {fileID: 0}
+    - target: {fileID: 101, guid: aabbccdd11223344aabbccdd11223344, type: 3}
+      propertyPath: m_LocalScale.x
+      value: 2
+      objectReference: {fileID: 0}
+    - target: {fileID: 101, guid: aabbccdd11223344aabbccdd11223344, type: 3}
+      propertyPath: m_LocalScale.y
+      value: 2
+      objectReference: {fileID: 0}
+    - target: {fileID: 101, guid: aabbccdd11223344aabbccdd11223344, type: 3}
+      propertyPath: m_LocalScale.z
+      value: 2
+      objectReference: {fileID: 0}
+    m_RemovedComponents: []

@@ -1,0 +1,551 @@
+"""
+luau_validator.py -- Post-transpilation validation and fixup for Luau scripts.
+
+Catches common AI transpilation mistakes that would cause runtime errors:
+1. Leading prose/markdown that leaked through code fence stripping
+2. Setting plugin-only or read-only properties (StreamingEnabled, Source, etc.)
+3. Runtime Instance.new("LocalScript"/"Script") with .Source assignment
+4. EnumItem comparison without .Value
+5. Other known Roblox API misuse patterns
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+
+log = logging.getLogger(__name__)
+
+
+def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
+    """Validate and fix common Luau issues in a transpiled script.
+
+    Args:
+        name: Script name (for logging).
+        source: Luau source code.
+
+    Returns:
+        Tuple of (fixed_source, list_of_fixes_applied).
+    """
+    fixes: list[str] = []
+
+    source = _strip_leading_prose(name, source, fixes)
+    source = _fix_plugin_only_properties(name, source, fixes)
+    source = _fix_runtime_script_creation(name, source, fixes)
+    source = _fix_enum_comparisons(name, source, fixes)
+    source = _fix_csharp_remnants(name, source, fixes)
+    source = _fix_common_api_mistakes(name, source, fixes)
+    source = _fix_startup_race_conditions(name, source, fixes)
+
+    return source, fixes
+
+
+def _strip_leading_prose(name: str, source: str, fixes: list[str]) -> str:
+    """Remove any non-Luau prose at the start of the script.
+
+    AI sometimes outputs explanatory text before the actual code.
+    Valid Luau starts with: --, local, return, if, for, while, do, function,
+    print, warn, error, task, game, workspace, script, require, or a bare identifier.
+    """
+    lines = source.split("\n")
+    first_code_line = 0
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Check if this line looks like valid Luau (not English prose)
+        is_luau = (
+            stripped.startswith("--") or
+            stripped.startswith("local ") or
+            stripped.startswith("return ") or
+            stripped.startswith("if ") or
+            stripped.startswith("for ") or
+            stripped.startswith("while ") or
+            stripped.startswith("do") or
+            stripped.startswith("function ") or
+            stripped.startswith("print(") or
+            stripped.startswith("warn(") or
+            stripped.startswith("error(") or
+            stripped.startswith("task.") or
+            stripped.startswith("game:") or
+            stripped.startswith("workspace") or
+            stripped.startswith("script") or
+            stripped.startswith("require(")
+        )
+        if is_luau:
+            first_code_line = i
+            break
+        # If it contains English prose markers, skip it
+        if (re.search(r"['\u2018\u2019]s\b", stripped) or  # possessives
+            re.search(r'\b(Here|Now|This|The|I |Note|Below|Above)\b', stripped) or
+            stripped.endswith(":") or
+            stripped.endswith(".") and not stripped.endswith("end.") or
+            "converted" in stripped.lower() or
+            "script" in stripped.lower() and "=" not in stripped):
+            continue
+        # Otherwise, assume it's code (identifier = ..., function call, etc.)
+        first_code_line = i
+        break
+
+    if first_code_line > 0:
+        removed = lines[:first_code_line]
+        source = "\n".join(lines[first_code_line:])
+        fixes.append(f"Stripped {first_code_line} lines of leading prose")
+        log.info("  [%s] Stripped %d lines of leading prose", name, first_code_line)
+
+    return source
+
+
+def _fix_plugin_only_properties(name: str, source: str, fixes: list[str]) -> str:
+    """Comment out lines that set plugin-only or read-only properties."""
+    # Properties that can't be set from scripts at runtime
+    plugin_only = [
+        r'workspace\.StreamingEnabled\s*=',
+        r'workspace\.StreamingMinRadius\s*=',
+        r'workspace\.StreamingTargetRadius\s*=',
+        r'\.Source\s*=\s*\[',    # Setting .Source on a script instance
+        r'\.Source\s*=\s*"',     # Setting .Source on a script instance
+        r'\.Source\s*=\s*\[\[',  # Setting .Source with multi-line string
+    ]
+
+    lines = source.split("\n")
+    result = []
+    fixed_count = 0
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("--"):
+            result.append(line)
+            continue
+
+        commented = False
+        for pattern in plugin_only:
+            if re.search(pattern, stripped):
+                indent = len(line) - len(line.lstrip())
+                result.append(f"{' ' * indent}-- [DISABLED: plugin-only property] {stripped}")
+                commented = True
+                fixed_count += 1
+                break
+
+        if not commented:
+            result.append(line)
+
+    if fixed_count:
+        source = "\n".join(result)
+        fixes.append(f"Commented out {fixed_count} plugin-only property assignments")
+        log.info("  [%s] Commented out %d plugin-only property assignments", name, fixed_count)
+
+    return source
+
+
+def _fix_runtime_script_creation(name: str, source: str, fixes: list[str]) -> str:
+    """Replace runtime Instance.new('LocalScript'/'Script') patterns.
+
+    In Roblox, you can't create Script/LocalScript at runtime and set .Source.
+    Comments out the entire block including multi-line string contents.
+    """
+    if not re.search(r'Instance\.new\(\s*["\'](?:Local)?Script["\']\s*\)', source):
+        return source
+    if not re.search(r'\.Source\s*=', source):
+        return source
+
+    lines = source.split("\n")
+    result = []
+    in_script_creation = False
+    in_multiline_string = False
+    multiline_closer = None
+    script_var = None
+
+    for line in lines:
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip())
+
+        # If inside a multi-line string, comment everything until the closer
+        if in_multiline_string:
+            result.append(f"{' ' * indent}-- {stripped}")
+            if multiline_closer and multiline_closer in stripped:
+                in_multiline_string = False
+                multiline_closer = None
+            continue
+
+        # Detect start of script creation
+        m = re.search(r'local\s+(\w+)\s*=\s*Instance\.new\(\s*["\'](?:Local)?Script["\']\s*\)', stripped)
+        if m:
+            script_var = m.group(1)
+            in_script_creation = True
+            result.append(f"{' ' * indent}-- [DISABLED: cannot create scripts at runtime in Roblox]")
+            result.append(f"{' ' * indent}-- {stripped}")
+            continue
+
+        # If tracking a script variable, comment out its property sets
+        if in_script_creation and script_var and re.match(rf'^[\s]*{re.escape(script_var)}[\.\[]', stripped):
+            result.append(f"{' ' * indent}-- {stripped}")
+
+            # Check for multi-line string opener: [==[ or [=[ or [[
+            ml_match = re.search(r'\[=*\[', stripped)
+            if ml_match:
+                opener = ml_match.group(0)
+                # Compute the matching closer
+                eq_count = opener.count("=")
+                closer = "]" + "=" * eq_count + "]"
+                if closer not in stripped:  # String doesn't close on same line
+                    in_multiline_string = True
+                    multiline_closer = closer
+
+            # Check if this is the .Parent assignment (end of creation block)
+            if f"{script_var}.Parent" in stripped:
+                in_script_creation = False
+                script_var = None
+            continue
+
+        result.append(line)
+
+    source = "\n".join(result)
+    fixes.append("Disabled runtime script creation (not supported in Roblox)")
+    log.info("  [%s] Disabled runtime script creation", name)
+    return source
+
+
+def _fix_enum_comparisons(name: str, source: str, fixes: list[str]) -> str:
+    """Fix comparisons of EnumItems with numbers.
+
+    SavedQualityLevel returns an EnumItem, not a number.
+    """
+    # Pattern: variable >= NUMBER or variable <= NUMBER where variable is likely an EnumItem
+    enum_properties = [
+        "SavedQualityLevel",
+        "QualityLevel",
+    ]
+
+    for prop in enum_properties:
+        if prop in source:
+            # Find the variable that holds this property
+            m = re.search(rf'local\s+(\w+)\s*=.*{prop}', source)
+            if m:
+                var = m.group(1)
+                # Replace comparisons: var >= N -> var.Value >= N, var <= N -> var.Value <= N
+                source = re.sub(
+                    rf'\b{re.escape(var)}\s*(>=|<=|>|<|==|~=)\s*(\d+)',
+                    rf'{var}.Value \1 \2',
+                    source,
+                )
+                fixes.append(f"Fixed EnumItem comparison for {prop}")
+                log.info("  [%s] Fixed EnumItem comparison for %s", name, prop)
+
+    return source
+
+
+def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
+    """Fix C# syntax remnants that sometimes survive AI transpilation."""
+    original = source
+
+    # Fix 'this.' prefix (C# self-reference, not valid in Luau)
+    if re.search(r'\bthis\.', source):
+        source = re.sub(r'\bthis\.(\w+)', r'script.Parent.\1', source)
+        fixes.append("Replaced 'this.' with 'script.Parent.'")
+        log.info("  [%s] Replaced 'this.' with 'script.Parent.'", name)
+
+    # Fix 'null' keyword (C# null, Luau uses 'nil')
+    if re.search(r'\bnull\b', source):
+        source = re.sub(r'\bnull\b', 'nil', source)
+        fixes.append("Replaced 'null' with 'nil'")
+        log.info("  [%s] Replaced 'null' with 'nil'", name)
+
+    # Fix 'true'/'false' with wrong case (C# True/False)
+    if re.search(r'\bTrue\b', source):
+        source = re.sub(r'\bTrue\b', 'true', source)
+        fixes.append("Fixed 'True' → 'true'")
+    if re.search(r'\bFalse\b', source):
+        source = re.sub(r'\bFalse\b', 'false', source)
+        fixes.append("Fixed 'False' → 'false'")
+
+    # Fix 'void' return type annotation (C# remnant)
+    source = re.sub(r'\bvoid\s+function\b', 'function', source)
+
+    # Fix C# string interpolation $"..." that leaked through
+    if re.search(r'\$"[^"]*\{', source):
+        # Convert $"text {var}" to string.format("text %s", var)
+        # This is a best-effort fix for simple cases
+        def _fix_interpolation(m):
+            s = m.group(0)[2:-1]  # strip $" and "
+            parts = re.split(r'\{(\w+)\}', s)
+            fmt_str = ""
+            args = []
+            for i, p in enumerate(parts):
+                if i % 2 == 0:
+                    fmt_str += p
+                else:
+                    fmt_str += "%s"
+                    args.append(p)
+            if args:
+                return f'string.format("{fmt_str}", {", ".join(args)})'
+            return f'"{fmt_str}"'
+        source = re.sub(r'\$"[^"]*"', _fix_interpolation, source)
+        fixes.append("Converted C# string interpolation to string.format")
+
+    # Fix 'typeof(X)' (C# type check, no Luau equivalent — use typeof() Luau builtin or string)
+    if re.search(r'\btypeof\s*\(\s*\w+\s*\)', source):
+        # typeof(SomeType) in C# → "SomeType" in Luau (as a string for comparison)
+        # But Luau has typeof() for runtime type checking, so context matters
+        # Common pattern: typeof(X) == typeof(Y) → just compare types as strings
+        source = re.sub(
+            r'\btypeof\s*\(\s*(\w+)\s*\)\s*==\s*typeof\s*\(\s*(\w+)\s*\)',
+            r'typeof(\1) == typeof(\2)',
+            source,
+        )
+        # Standalone typeof(Type) where Type is a C# class → "Type" string
+        source = re.sub(
+            r'\btypeof\s*\(\s*([A-Z]\w+)\s*\)',
+            r'"\1"',
+            source,
+        )
+        fixes.append("Fixed 'typeof()' C# type expressions")
+
+    # Fix '.Length' on strings/arrays (C# → Luau #)
+    if '.Length' in source:
+        # string.Length or array.Length → #string or #array
+        source = re.sub(r'(\w+)\.Length\b', r'#\1', source)
+        fixes.append("Fixed '.Length' → '#' operator")
+
+    # Fix '.Count' on collections (C# → Luau #)
+    if re.search(r'\w+\.Count\b', source):
+        source = re.sub(r'(\w+)\.Count\b', r'#\1', source)
+        fixes.append("Fixed '.Count' → '#' operator")
+
+    # Fix '.Contains()' (C# → table.find or string.find)
+    if '.Contains(' in source:
+        source = re.sub(
+            r'(\w+)\.Contains\(([^)]+)\)',
+            r'table.find(\1, \2)',
+            source,
+        )
+        fixes.append("Fixed '.Contains()' → 'table.find()'")
+
+    # Fix '.ToString()' (C# → tostring())
+    if '.ToString()' in source:
+        source = re.sub(r'(\w+)\.ToString\(\)', r'tostring(\1)', source)
+        fixes.append("Fixed '.ToString()' → 'tostring()'")
+
+    # Fix '.ContainsKey(key)' → '[key] ~= nil'
+    if '.ContainsKey(' in source:
+        source = re.sub(
+            r'(\w+)\.ContainsKey\(([^)]+)\)',
+            r'\1[\2] ~= nil',
+            source,
+        )
+        fixes.append("Fixed '.ContainsKey()' → '[] ~= nil'")
+
+    # Fix '.TryGetValue(key, out val)' → 'val = tbl[key]'
+    if '.TryGetValue(' in source:
+        source = re.sub(
+            r'(\w+)\.TryGetValue\(([^,]+),\s*(?:out\s+)?(\w+)\)',
+            r'\3 = \1[\2]',
+            source,
+        )
+        fixes.append("Fixed '.TryGetValue()' → direct table access")
+
+    # Fix '?.Invoke(' (C# null-conditional event invoke → :Fire())
+    if '?.Invoke(' in source or '.Invoke(' in source:
+        source = re.sub(r'(\w+)\?\.Invoke\(', r'if \1 then \1:Fire(', source)
+        source = re.sub(r'(\w+)\.Invoke\(([^)]*)\)', r'\1:Fire(\2)', source)
+        fixes.append("Fixed event '.Invoke()' → ':Fire()'")
+
+    if source != original and not fixes:
+        fixes.append("Fixed C# syntax remnants")
+
+    return source
+
+
+def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
+    """Fix common Roblox API mistakes in transpiled scripts."""
+    original = source
+
+    # Fix: .gameObject (C# Unity API) → the part itself or .Parent
+    if ".gameObject" in source:
+        # In Roblox, the equivalent of gameObject is usually the Part itself
+        source = re.sub(r'(\w+)\.gameObject\b', r'\1', source)
+
+    # Fix: .transform.position (Unity) → .Position (Roblox)
+    if ".transform.position" in source:
+        source = re.sub(r'\.transform\.position\b', '.Position', source)
+    if ".transform.rotation" in source:
+        source = re.sub(r'\.transform\.rotation\b', '.CFrame', source)
+
+    # Fix: GetComponent<X>() (C# generic) → :FindFirstChildOfClass("X")
+    if "GetComponent<" in source:
+        source = re.sub(
+            r'(\w+):?\.?GetComponent<(\w+)>\(\)',
+            r'\1:FindFirstChildOfClass("\2")',
+            source,
+        )
+
+    # Fix: .SetActive(false/true) (Unity) → set properties
+    if ".SetActive(" in source:
+        source = re.sub(
+            r'(\w+)\.SetActive\(\s*false\s*\)',
+            r'if \1:IsA("BasePart") then \1.Transparency = 1; \1.CanCollide = false end',
+            source,
+        )
+        source = re.sub(
+            r'(\w+)\.SetActive\(\s*true\s*\)',
+            r'if \1:IsA("BasePart") then \1.Transparency = 0; \1.CanCollide = true end',
+            source,
+        )
+
+    # Fix: Destroy() without colon (C# method call syntax)
+    if re.search(r'\w+\.Destroy\(\)', source):
+        source = re.sub(r'(\w+)\.Destroy\(\)', r'\1:Destroy()', source)
+
+    # Fix: new Vector3(...) → Vector3.new(...)
+    if "new Vector3(" in source:
+        source = re.sub(r'\bnew\s+Vector3\(', 'Vector3.new(', source)
+    if "new CFrame(" in source:
+        source = re.sub(r'\bnew\s+CFrame\(', 'CFrame.new(', source)
+    if "new Color3(" in source:
+        source = re.sub(r'\bnew\s+Color3\(', 'Color3.new(', source)
+    if "new Instance(" in source:
+        source = re.sub(r'\bnew\s+Instance\(', 'Instance.new(', source)
+
+    # Fix: += / -= / *= / /= operators (not valid in Luau)
+    # Handles both simple vars and property access (obj.prop += expr)
+    if re.search(r'\+=', source):
+        source = re.sub(r'([\w.]+)\s*\+=\s*(.+)', r'\1 = \1 + \2', source)
+    if re.search(r'-=', source):
+        source = re.sub(r'([\w.]+)\s*-=\s*(.+)', r'\1 = \1 - \2', source)
+    if re.search(r'\*=', source):
+        source = re.sub(r'([\w.]+)\s*\*=\s*(.+)', r'\1 = \1 * \2', source)
+    if re.search(r'/=', source):
+        source = re.sub(r'([\w.]+)\s*/=\s*(.+)', r'\1 = \1 / \2', source)
+
+    # Fix: semicolons at end of statements
+    if ";" in source:
+        # Remove trailing semicolons but not within strings
+        lines = source.split("\n")
+        result = []
+        for line in lines:
+            s = line.rstrip()
+            if s.endswith(";") and not s.strip().startswith("--"):
+                # Don't remove semicolons inside string literals
+                quote_count = s.count('"') - s.count('\\"')
+                if quote_count % 2 == 0:  # Not inside a string
+                    s = s[:-1].rstrip()
+            result.append(s)
+        source = "\n".join(result)
+
+    if source != original:
+        fixes.append("Fixed common API mistakes")
+        log.info("  [%s] Fixed common API/syntax mistakes", name)
+
+    return source
+
+
+def _fix_startup_race_conditions(name: str, source: str, fixes: list[str]) -> str:
+    """Add startup delay for scripts that immediately scan workspace.
+
+    Scripts using workspace:GetDescendants() at the top level (not inside
+    a function or event handler) may run before the workspace is fully loaded.
+    Adding task.wait() ensures parts have loaded before scanning.
+    """
+    if "GetDescendants()" not in source:
+        return source
+
+    # Check if there's already a task.wait before the GetDescendants call
+    lines = source.split("\n")
+    needs_fix = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if "GetDescendants()" in stripped:
+            # Check if this is at the top level (not inside a function body)
+            # Simple heuristic: look at indentation level
+            indent = len(line) - len(line.lstrip())
+            if indent == 0:
+                # Top-level GetDescendants — check for task.wait in preceding lines
+                preceding = "\n".join(lines[max(0, i - 5):i])
+                if "task.wait" not in preceding and "task.defer" not in preceding:
+                    needs_fix = True
+            break
+
+    if needs_fix:
+        # Insert task.wait(1) before the first GetDescendants call
+        result_lines = []
+        inserted = False
+        for line in lines:
+            if "GetDescendants()" in line and not inserted:
+                result_lines.append("-- Wait for workspace to fully load before scanning")
+                result_lines.append("task.wait(1)")
+                result_lines.append("")
+                inserted = True
+            result_lines.append(line)
+        source = "\n".join(result_lines)
+        fixes.append("Added startup delay before workspace:GetDescendants()")
+        log.info("  [%s] Added startup delay before GetDescendants", name)
+
+    return source
+
+
+def fix_gameplay_patterns(name: str, source: str) -> tuple[str, list[str]]:
+    """Fix common gameplay script patterns for converter compatibility.
+
+    Patches:
+    1. Pickup detection: use IsPickup attribute + name pattern instead of exact name match
+    2. Pickup collection: destroy parent Model, use ItemType attribute
+    3. Placeholder sound IDs
+    """
+    fixes = []
+    original = source
+
+    # Fix pickup detection: obj.Name == "Pickup" → attribute/pattern match
+    if 'obj.Name == "Pickup"' in source:
+        source = source.replace(
+            'obj.Name == "Pickup" and obj:IsA("BasePart")',
+            'obj:IsA("BasePart") and (obj:GetAttribute("IsPickup") or string.find(string.lower(obj.Name), "pickup"))'
+        )
+        source = source.replace(
+            'obj.Name == "Pickup"',
+            '(obj:GetAttribute("IsPickup") or string.find(string.lower(obj.Name), "pickup"))'
+        )
+        fixes.append("Fixed pickup detection to use attribute/pattern matching")
+
+    # Fix item name extraction for PickupTouchDetector
+    if 'local itemName = part.Name' in source and 'IsPickup' not in source:
+        source = source.replace(
+            'local itemName = part.Name',
+            'local itemName = part:GetAttribute("ItemType") or part.Name\n\tif itemName == "PickupTouchDetector" and part.Parent then\n\t\titemName = part.Parent.Name:gsub("Pickup", ""):gsub("pickup", "")\n\t\tif itemName == "" then itemName = "Generic" end\n\tend'
+        )
+        fixes.append("Fixed item name to use ItemType attribute")
+
+    # Fix pickup destruction to destroy parent Model
+    if 'part:Destroy()' in source and 'setupPickup' in source:
+        source = source.replace(
+            'part:Destroy()',
+            'if part.Parent and part.Parent:IsA("Model") then part.Parent:Destroy() else part:Destroy() end'
+        )
+        fixes.append("Fixed pickup destruction to remove parent Model")
+
+    # Remove placeholder sound IDs
+    if 'rbxassetid://1905339338' in source:
+        source = source.replace('"rbxassetid://1905339338"', '"rbxassetid://"')
+        fixes.append("Removed placeholder sound ID")
+
+    # Fix exact name matching for common prefab instances that get numbered
+    # Unity instances: "Turret", "Turret (1)", "Turret (14)" etc.
+    # Replace obj.Name == "X" with string.find(obj.Name, "^X") for common patterns
+    import re
+    for pattern_name in ["Turret", "Mine", "SpawnPoint", "HostilePlane", "Machine"]:
+        exact = f'obj.Name == "{pattern_name}"'
+        if exact in source:
+            source = source.replace(exact, f'string.find(obj.Name, "^{pattern_name}")')
+            fixes.append(f"Fixed {pattern_name} detection to match numbered instances")
+
+    # Fix Door trigger detection: "DoorTrigger" may actually be "trigger" or "base"
+    if 'obj.Name == "DoorTrigger"' in source:
+        source = source.replace(
+            'obj.Name == "DoorTrigger"',
+            '(obj.Name == "DoorTrigger" or obj.Name == "trigger" or obj.Name == "base")'
+        )
+        fixes.append("Fixed door trigger detection to match actual part names")
+
+    if source != original:
+        return source, fixes
+    return source, []

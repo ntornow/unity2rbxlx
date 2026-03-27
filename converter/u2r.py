@@ -1,0 +1,556 @@
+"""
+u2r.py -- Click-based CLI for the Unity -> Roblox converter.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import click
+
+from utils.logging_config import setup_logging
+
+
+@click.group()
+@click.option("--verbose", "-v", is_flag=True, help="Enable debug logging")
+def main(verbose: bool) -> None:
+    """Unity to Roblox Game Converter."""
+    setup_logging(level="DEBUG" if verbose else "INFO")
+
+
+def _resolve_credential(
+    cli_value: str | None,
+    env_var: str,
+    filename: str,
+    project_path: Path,
+) -> str | None:
+    """Resolve a credential from CLI arg, env var, or file autodiscovery.
+
+    The CLI value can be a literal string or a path to a file containing the value.
+    Falls back to environment variable, then searches common directories for a file.
+    """
+    import os
+
+    # 1. CLI argument: could be a literal value or a file path
+    if cli_value:
+        p = Path(cli_value)
+        if p.is_file():
+            return p.read_text().strip()
+        return cli_value.strip()
+
+    # 2. Environment variable
+    val = os.environ.get(env_var, "")
+    if val:
+        return val.strip()
+
+    # 3. Auto-discover file in common locations
+    for search_dir in [project_path.parent, project_path.parent.parent, Path.cwd()]:
+        fp = search_dir / filename
+        if fp.exists():
+            return fp.read_text().strip()
+
+    return None
+
+
+@main.command()
+@click.argument("unity_project", type=click.Path(exists=True))
+@click.option("--output", "-o", type=click.Path(), default="./output",
+              help="Output directory")
+@click.option("--scene", "-s", type=str, default=None,
+              help="Scene to convert (path, or 'all' for every scene)")
+@click.option("--phase", type=str, default=None,
+              help="Resume from a specific phase")
+@click.option("--no-upload", is_flag=True, help="Skip asset upload")
+@click.option("--no-ai", is_flag=True, help="Disable AI transpilation")
+@click.option("--api-key", type=str, default=None,
+              help="Roblox Open Cloud API key (string or path to file)")
+@click.option("--creator-id", type=str, default=None,
+              help="Roblox Creator ID (number or path to file)")
+def convert(
+    unity_project: str,
+    output: str,
+    scene: str | None,
+    phase: str | None,
+    no_upload: bool,
+    no_ai: bool,
+    api_key: str | None,
+    creator_id: str | None,
+) -> None:
+    """Convert a Unity project to a Roblox experience.
+
+    Examples:
+
+      python u2r.py convert path/to/UnityProject -o ./output
+
+      python u2r.py convert path/to/UnityProject -o ./output --api-key YOUR_KEY --creator-id 12345
+
+      python u2r.py convert path/to/UnityProject -o ./output --api-key ./apikey --creator-id ./creator_id
+    """
+    import config
+    from converter.pipeline import Pipeline
+
+    project_path = Path(unity_project).resolve()
+    output_path = Path(output).resolve()
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Load API key: from --api-key (string or file), env var, or auto-discover
+    import os
+    resolved_key = _resolve_credential(api_key, "ROBLOX_API_KEY", "apikey", project_path)
+    if resolved_key:
+        config.ROBLOX_API_KEY = resolved_key
+
+    # Load creator ID: from --creator-id (string or file), env var, or auto-discover
+    resolved_cid = _resolve_credential(creator_id, "ROBLOX_CREATOR_ID", "creator_id", project_path)
+    if resolved_cid:
+        config.ROBLOX_CREATOR_ID = int(resolved_cid)
+
+    if no_ai:
+        config.USE_AI_TRANSPILATION = False
+
+    pipeline = Pipeline(
+        unity_project_path=project_path,
+        output_dir=output_path,
+        skip_upload=no_upload,
+    )
+
+    # Load previously uploaded assets if available
+    uploaded_file = output_path / "uploaded_assets.json"
+    if uploaded_file.exists():
+        import json
+        pipeline.context.uploaded_assets = json.loads(uploaded_file.read_text())
+        click.echo(f"Loaded {len(pipeline.context.uploaded_assets)} previously uploaded assets")
+
+    if scene and scene.lower() == "all":
+        # Multi-scene mode: convert all scenes in the project
+        pipeline.run_all_scenes()
+        click.echo(f"\nMulti-scene conversion complete. Output: {output_path}")
+        for scene_name, stats in pipeline.context.scenes_metadata.items():
+            click.echo(f"  {scene_name}: {stats.get('parts', 0)} parts, {stats.get('scripts', 0)} scripts")
+        click.echo(f"\n  Total scenes converted: {len(pipeline.context.scenes_metadata)}")
+        return
+
+    if scene:
+        pipeline.context.selected_scene = scene
+
+    if phase:
+        pipeline.resume(phase)
+    else:
+        pipeline.run_all()
+
+    click.echo(f"\nConversion complete. Output: {output_path}")
+    click.echo(f"  Scene: {Path(pipeline.context.selected_scene).name}")
+    click.echo(f"  Parts: {pipeline.context.converted_parts}")
+    click.echo(f"  Scripts: {pipeline.context.transpiled_scripts}")
+    click.echo(f"  Materials: {pipeline.context.converted_materials}/{pipeline.context.total_materials}")
+    if pipeline.context.total_animations:
+        click.echo(f"  Animations: {pipeline.context.converted_animations} scripts from {pipeline.context.total_animations} clips")
+    uploaded = len(pipeline.context.uploaded_assets)
+    errors = len(pipeline.context.asset_upload_errors)
+    if uploaded or errors:
+        click.echo(f"  Assets uploaded: {uploaded} ({errors} errors)")
+    if pipeline.context.warnings:
+        click.echo(f"  Warnings: {len(pipeline.context.warnings)}")
+    click.echo(f"\n  To validate: python u2r.py validate {output_path / 'converted_place.rbxlx'}")
+
+
+@main.command()
+@click.argument("unity_project", type=click.Path(exists=True))
+def analyze(unity_project: str) -> None:
+    """Analyze a Unity project without converting."""
+    from unity.scene_parser import parse_scene
+    from unity.prefab_parser import parse_prefabs
+    from unity.guid_resolver import build_guid_index
+    from unity.asset_extractor import extract_assets
+    from unity.script_analyzer import analyze_all_scripts
+    from unity.yaml_parser import is_text_yaml
+
+    project = Path(unity_project).resolve()
+    # Auto-detect nested Unity project root
+    if not (project / "Assets").is_dir():
+        for child in project.iterdir():
+            if child.is_dir() and (child / "Assets").is_dir():
+                click.echo(f"Auto-detected Unity project root: {child.name}")
+                project = child
+                break
+    click.echo(f"Analyzing: {project}")
+
+    # GUID index
+    guid_index = build_guid_index(project)
+    click.echo(f"\nGUID Index: {guid_index.total_resolved} entries")
+    if guid_index.duplicate_guids:
+        click.echo(f"  Duplicate GUIDs: {len(guid_index.duplicate_guids)}")
+
+    # Assets
+    manifest = extract_assets(project, guid_index)
+    click.echo(f"\nAssets: {len(manifest.assets)} files ({manifest.total_size_bytes / 1024 / 1024:.1f} MB)")
+    for kind, assets in sorted(manifest.by_kind.items()):
+        click.echo(f"  {kind}: {len(assets)}")
+
+    # Scenes
+    scenes = list((project / "Assets").rglob("*.unity")) if (project / "Assets").exists() else []
+    click.echo(f"\nScenes: {len(scenes)}")
+    for s in scenes:
+        is_text = is_text_yaml(s)
+        status = "text YAML" if is_text else "BINARY (requires UnityPy)"
+        click.echo(f"  {s.relative_to(project)}: {status}")
+        if is_text:
+            parsed = parse_scene(s)
+            click.echo(f"    Roots: {len(parsed.roots)}, Total nodes: {len(parsed.all_nodes)}")
+            click.echo(f"    Meshes: {len(parsed.referenced_mesh_guids)}, "
+                       f"Materials: {len(parsed.referenced_material_guids)}")
+            click.echo(f"    Prefab instances: {len(parsed.prefab_instances)}")
+        else:
+            try:
+                from unity.binary_scene_parser import parse_binary_scene
+                parsed = parse_binary_scene(s)
+                click.echo(f"    Roots: {len(parsed.roots)}, Total nodes: {len(parsed.all_nodes)}")
+            except Exception:
+                click.echo(f"    (could not parse - install UnityPy)")
+
+    # Prefabs
+    library = parse_prefabs(project)
+    click.echo(f"\nPrefabs: {len(library.prefabs)}")
+
+    # Scripts
+    scripts = analyze_all_scripts(project)
+    click.echo(f"\nScripts: {len(scripts)}")
+    type_counts: dict[str, int] = {}
+    for s in scripts:
+        type_counts[s.suggested_type] = type_counts.get(s.suggested_type, 0) + 1
+    for t, c in sorted(type_counts.items()):
+        click.echo(f"  {t}: {c}")
+
+
+@main.command()
+@click.argument("rbxlx_file", type=click.Path(exists=True))
+def validate(rbxlx_file: str) -> None:
+    """Validate a generated .rbxlx file for Roblox compatibility."""
+    import xml.etree.ElementTree as ET
+
+    rbxlx_path = Path(rbxlx_file)
+    click.echo(f"Validating: {rbxlx_path}")
+
+    try:
+        tree = ET.parse(str(rbxlx_path))
+    except ET.ParseError as e:
+        click.echo(f"  ERROR: Invalid XML: {e}", err=True)
+        return
+
+    root = tree.getroot()
+    if root.tag != "roblox":
+        click.echo(f"  ERROR: Root element is '{root.tag}', expected 'roblox'", err=True)
+        return
+
+    # Count elements
+    stats: dict[str, int] = {}
+    for item in tree.iter("Item"):
+        cls = item.get("class", "")
+        stats[cls] = stats.get(cls, 0) + 1
+
+    # Check for invalid classes
+    valid_classes = {
+        # Services
+        "Workspace", "Terrain", "Lighting", "ServerScriptService",
+        "ReplicatedStorage", "ServerStorage",
+        "StarterGui", "StarterPlayer", "StarterPlayerScripts", "StarterCharacterScripts",
+        # Core instances
+        "Part", "MeshPart", "Model", "SpawnLocation", "Camera",
+        # Lights
+        "PointLight", "SpotLight", "SurfaceLight",
+        # Audio
+        "Sound",
+        # Scripts
+        "Script", "LocalScript", "ModuleScript",
+        # UI
+        "ScreenGui", "Frame", "TextLabel", "TextButton", "ImageLabel", "ImageButton",
+        "UIListLayout", "UIGridLayout",
+        # Appearance
+        "SurfaceAppearance", "Sky",
+        # Events
+        "RemoteEvent", "RemoteFunction", "BindableEvent",
+        # Effects
+        "ParticleEmitter", "Fire", "Smoke", "Sparkles", "Highlight",
+        "Trail", "Beam", "Attachment",
+        "BloomEffect", "ColorCorrectionEffect", "DepthOfFieldEffect",
+        "SunRaysEffect", "Atmosphere",
+        # Physics
+        "WeldConstraint", "HingeConstraint", "SpringConstraint",
+        "BallSocketConstraint",
+    }
+    invalid = {cls for cls in stats if cls not in valid_classes}
+
+    # Check for local file paths
+    local_paths = 0
+    for item in tree.iter("Content"):
+        url = item.find("url")
+        if url is not None and url.text and "/" in url.text and "rbxassetid" not in url.text:
+            local_paths += 1
+
+    # Check for string Materials (should be tokens)
+    string_mats = sum(1 for e in tree.iter("string") if e.get("name") == "Material")
+
+    # Check MeshParts for missing MeshId
+    mesh_parts_total = 0
+    mesh_parts_with_id = 0
+    for item in tree.iter("Item"):
+        if item.get("class") == "MeshPart":
+            mesh_parts_total += 1
+            props = item.find("Properties")
+            if props is not None:
+                for content in props.iter("Content"):
+                    if content.get("name") == "MeshId":
+                        url_el = content.find("url")
+                        if url_el is not None and url_el.text and "rbxassetid" in url_el.text:
+                            mesh_parts_with_id += 1
+                            break
+
+    mesh_parts_missing = mesh_parts_total - mesh_parts_with_id
+
+    # Count SurfaceAppearances with actual textures
+    sa_total = stats.get("SurfaceAppearance", 0)
+    sa_with_textures = 0
+    for item in tree.iter("Item"):
+        if item.get("class") == "SurfaceAppearance":
+            props = item.find("Properties")
+            if props is not None:
+                for content in props.iter("Content"):
+                    url_el = content.find("url")
+                    if url_el is not None and url_el.text and "rbxassetid" in url_el.text:
+                        sa_with_textures += 1
+                        break
+
+    # Results
+    total = sum(stats.values())
+    issues = len(invalid) + local_paths + string_mats
+
+    click.echo(f"\n  Total elements: {total}")
+    click.echo(f"  Parts: {stats.get('Part', 0)}")
+    click.echo(f"  MeshParts: {stats.get('MeshPart', 0)}")
+    click.echo(f"  Models: {stats.get('Model', 0)}")
+    click.echo(f"  Scripts: {stats.get('Script', 0) + stats.get('LocalScript', 0) + stats.get('ModuleScript', 0)}")
+    click.echo(f"  SurfaceAppearances: {sa_total} ({sa_with_textures} with textures)")
+    click.echo(f"  Sounds: {stats.get('Sound', 0)}")
+    click.echo(f"  Lights: {stats.get('PointLight', 0) + stats.get('SpotLight', 0)}")
+    click.echo(f"  Sky: {stats.get('Sky', 0)}")
+
+    # Warnings (not errors, but helpful)
+    warnings = []
+    if mesh_parts_missing > 0:
+        warnings.append(f"    {mesh_parts_missing}/{mesh_parts_total} MeshParts missing MeshId (need asset upload + resolution)")
+    if sa_total == 0 and mesh_parts_total > 0:
+        warnings.append(f"    No SurfaceAppearances (need asset upload for textures)")
+    if stats.get("Sky", 0) == 0:
+        warnings.append(f"    No Sky (need skybox texture upload)")
+
+    if issues == 0 and not warnings:
+        click.echo(f"\n  ✓ No issues found")
+    elif issues == 0 and warnings:
+        click.echo(f"\n  ✓ No errors found")
+        click.echo(f"\n  Warnings ({len(warnings)}):")
+        for w in warnings:
+            click.echo(w)
+    else:
+        click.echo(f"\n  Issues found: {issues}")
+        if invalid:
+            click.echo(f"    Invalid classes: {invalid}")
+        if local_paths:
+            click.echo(f"    Local file paths: {local_paths}")
+        if string_mats:
+            click.echo(f"    String materials (should be tokens): {string_mats}")
+        if warnings:
+            click.echo(f"\n  Warnings ({len(warnings)}):")
+            for w in warnings:
+                click.echo(w)
+
+
+@main.command()
+@click.argument("output_dir", type=click.Path(exists=True))
+def resolve(output_dir: str) -> None:
+    """Generate Studio resolution scripts for uploaded assets.
+
+    After uploading assets, run this command to generate Luau scripts
+    that resolve Model IDs → real MeshIds and Decal IDs → Image IDs.
+    Execute these in Roblox Studio's command bar.
+    """
+    import json
+    from roblox.studio_resolver import (
+        generate_mesh_resolution_luau,
+        generate_texture_resolution_luau,
+    )
+
+    out = Path(output_dir)
+    ctx_path = out / "conversion_context.json"
+    if not ctx_path.exists():
+        click.echo("Error: conversion_context.json not found. Run 'convert' first.", err=True)
+        return
+
+    ctx = json.loads(ctx_path.read_text())
+    uploaded = ctx.get("uploaded_assets", {})
+    if not uploaded:
+        click.echo("No uploaded assets found. Run conversion with --api-key-file first.")
+        return
+
+    mesh_count = sum(1 for p in uploaded if p.lower().endswith(('.fbx', '.obj')))
+    tex_count = sum(1 for p in uploaded if p.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tga', '.psd')))
+
+    click.echo(f"Uploaded assets: {len(uploaded)} ({mesh_count} meshes, {tex_count} textures)")
+
+    # Generate mesh resolution scripts
+    mesh_scripts = generate_mesh_resolution_luau(uploaded, batch_size=20)
+    for i, script in enumerate(mesh_scripts):
+        script_path = out / f"resolve_meshes_{i+1}.luau"
+        script_path.write_text(script, encoding="utf-8")
+    if mesh_scripts:
+        click.echo(f"Generated {len(mesh_scripts)} mesh resolution script(s)")
+
+    # Generate texture resolution scripts
+    tex_scripts = generate_texture_resolution_luau(uploaded, batch_size=20)
+    for i, script in enumerate(tex_scripts):
+        script_path = out / f"resolve_textures_{i+1}.luau"
+        script_path.write_text(script, encoding="utf-8")
+    if tex_scripts:
+        click.echo(f"Generated {len(tex_scripts)} texture resolution script(s)")
+
+    if not mesh_scripts and not tex_scripts:
+        click.echo("No resolution scripts needed.")
+        return
+
+    click.echo(f"\nNext steps:")
+    click.echo(f"  1. Open the converted place in Roblox Studio")
+    click.echo(f"  2. Open the Command Bar (View > Command Bar)")
+    click.echo(f"  3. Run each resolve_*.luau script and save the output")
+    click.echo(f"  4. Update conversion_context.json with the resolved data")
+    click.echo(f"  5. Re-run: python u2r.py convert <project> -o {output_dir} --phase convert_scene")
+
+
+@main.command()
+@click.argument("unity_project", type=click.Path(exists=True))
+@click.option("--output", "-o", type=click.Path(), default="./output")
+@click.option("--scene", type=str, default=None, help="Scene path relative to project")
+def compare(unity_project: str, output: str, scene: str | None) -> None:
+    """Run comparison between Unity and Roblox versions.
+
+    Generates a state comparison report between the Unity project and its
+    converted Roblox place. If --scene is specified, parses that scene for
+    camera info and object counts.
+    """
+    from pathlib import Path
+    import json
+
+    project_path = Path(unity_project).resolve()
+    output_path = Path(output).resolve()
+    comparison_dir = output_path / "comparison"
+    comparison_dir.mkdir(parents=True, exist_ok=True)
+
+    # Find the scene to compare
+    if scene is None:
+        scenes = list(project_path.glob("**/*.unity"))
+        yaml_scenes = [s for s in scenes if _is_text_yaml(s)]
+        if yaml_scenes:
+            scene_file = yaml_scenes[0]
+            scene = str(scene_file.relative_to(project_path))
+        else:
+            click.echo("No text YAML scenes found in project")
+            return
+    else:
+        scene_file = project_path / scene
+
+    click.echo(f"Comparing: {scene}")
+
+    # Parse Unity scene
+    try:
+        from unity.scene_parser import parse_scene
+        parsed = parse_scene(scene_file)
+
+        unity_stats = {
+            "roots": len(parsed.roots),
+            "total_nodes": len(parsed.all_nodes),
+            "prefab_instances": len(parsed.prefab_instances),
+            "materials": len(parsed.referenced_material_guids),
+            "meshes": len(parsed.referenced_mesh_guids),
+        }
+
+        # Count components
+        comp_counts: dict[str, int] = {}
+        def _count_comps(node):
+            for comp in node.components:
+                ct = comp.component_type
+                comp_counts[ct] = comp_counts.get(ct, 0) + 1
+            for child in node.children:
+                _count_comps(child)
+        for root in parsed.roots:
+            _count_comps(root)
+        unity_stats["components"] = comp_counts
+
+        # Camera info
+        from comparison.screenshot_capture import get_scene_camera_info
+        cam_info = get_scene_camera_info(project_path, scene)
+        if cam_info:
+            unity_stats["camera"] = cam_info
+            click.echo(f"  Camera: {cam_info['name']} at {cam_info['position']}")
+
+        click.echo(f"  Nodes: {unity_stats['total_nodes']}")
+        click.echo(f"  Prefab instances: {unity_stats['prefab_instances']}")
+        click.echo(f"  Materials: {unity_stats['materials']}")
+        click.echo(f"  Meshes: {unity_stats['meshes']}")
+        click.echo(f"  Components: {dict(sorted(comp_counts.items()))}")
+
+    except Exception as exc:
+        click.echo(f"  Failed to parse scene: {exc}")
+        unity_stats = {"error": str(exc)}
+
+    # Check for converted rbxlx
+    rbxlx = output_path / "converted_place.rbxlx"
+    roblox_stats: dict = {}
+    if rbxlx.exists():
+        click.echo(f"\nConverted place: {rbxlx}")
+        try:
+            import xml.etree.ElementTree as ET
+            tree = ET.parse(rbxlx)
+            root = tree.getroot()
+
+            class_counts: dict[str, int] = {}
+            for item in root.iter("Item"):
+                cls = item.get("class", "Unknown")
+                class_counts[cls] = class_counts.get(cls, 0) + 1
+
+            roblox_stats["classes"] = class_counts
+            total_parts = class_counts.get("Part", 0) + class_counts.get("MeshPart", 0)
+            click.echo(f"  Total parts: {total_parts}")
+            click.echo(f"  Models: {class_counts.get('Model', 0)}")
+            click.echo(f"  Scripts: {class_counts.get('Script', 0)}")
+            click.echo(f"  LocalScripts: {class_counts.get('LocalScript', 0)}")
+            click.echo(f"  Lights: {class_counts.get('PointLight', 0) + class_counts.get('SpotLight', 0)}")
+            click.echo(f"  Sounds: {class_counts.get('Sound', 0)}")
+
+        except Exception as exc:
+            click.echo(f"  Failed to parse rbxlx: {exc}")
+            roblox_stats = {"error": str(exc)}
+    else:
+        click.echo(f"\nNo converted place found at {rbxlx}")
+        click.echo("Run: python u2r.py convert <project> -o <output> first")
+
+    # Save comparison report
+    report = {
+        "scene": scene,
+        "unity": unity_stats,
+        "roblox": roblox_stats,
+    }
+    report_path = comparison_dir / "state_comparison.json"
+    report_path.write_text(json.dumps(report, indent=2, default=str))
+    click.echo(f"\nReport saved: {report_path}")
+
+
+def _is_text_yaml(path: Path) -> bool:
+    """Check if a .unity file is text YAML format."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            header = f.read(50)
+            return header.startswith("%YAML")
+    except Exception:
+        return False
+
+
+if __name__ == "__main__":
+    main()

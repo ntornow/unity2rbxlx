@@ -1,0 +1,107 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!29 &1
+OcclusionCullingSettings:
+  m_ObjectHideFlags: 0
+--- !u!104 &2
+RenderSettings:
+  m_Fog: 0
+  m_FogColor: {r: 0.5, g: 0.5, b: 0.5, a: 1}
+  m_FogMode: 3
+  m_AmbientSkyColor: {r: 0.212, g: 0.227, b: 0.259, a: 1}
+  m_SkyboxMaterial: {fileID: 0}
+--- !u!1 &100
+GameObject:
+  m_Name: MainCamera
+  m_IsActive: 1
+  m_Layer: 0
+  m_TagString: MainCamera
+  m_Component:
+  - component: {fileID: 101}
+  - component: {fileID: 102}
+--- !u!4 &101
+Transform:
+  m_GameObject: {fileID: 100}
+  m_LocalPosition: {x: 0, y: 1, z: -10}
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_Father: {fileID: 0}
+--- !u!20 &102
+Camera:
+  m_GameObject: {fileID: 100}
+  field of view: 60
+  near clip plane: 0.3
+  far clip plane: 1000
+--- !u!1 &200
+GameObject:
+  m_Name: Cube
+  m_IsActive: 1
+  m_Layer: 0
+  m_TagString: Untagged
+--- !u!4 &201
+Transform:
+  m_GameObject: {fileID: 200}
+  m_LocalPosition: {x: 2, y: 0.5, z: 3}
+  m_LocalRotation: {x: 0, y: 0.7071068, z: 0, w: 0.7071068}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_Father: {fileID: 0}
+--- !u!33 &202
+MeshFilter:
+  m_GameObject: {fileID: 200}
+  m_Mesh: {fileID: 10202, guid: 0000000000000000e000000000000000, type: 0}
+--- !u!23 &203
+MeshRenderer:
+  m_GameObject: {fileID: 200}
+  m_Materials:
+  - {fileID: 2100000, guid: abcdef1234567890abcdef1234567890, type: 2}
+--- !u!65 &204
+BoxCollider:
+  m_GameObject: {fileID: 200}
+  m_Size: {x: 1, y: 1, z: 1}
+  m_Center: {x: 0, y: 0, z: 0}
+--- !u!1 &300
+GameObject:
+  m_Name: PointLight
+  m_IsActive: 1
+  m_Layer: 0
+  m_TagString: Untagged
+--- !u!4 &301
+Transform:
+  m_GameObject: {fileID: 300}
+  m_LocalPosition: {x: 0, y: 3, z: 0}
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_Father: {fileID: 0}
+--- !u!108 &302
+Light:
+  m_GameObject: {fileID: 300}
+  m_Type: 2
+  m_Color: {r: 1, g: 0.95, b: 0.84, a: 1}
+  m_Intensity: 1
+  m_Range: 10
+--- !u!1 &400
+GameObject:
+  m_Name: Parent
+  m_IsActive: 1
+  m_Layer: 0
+  m_TagString: Untagged
+--- !u!4 &401
+Transform:
+  m_GameObject: {fileID: 400}
+  m_LocalPosition: {x: 5, y: 0, z: 0}
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_Father: {fileID: 0}
+--- !u!1 &500
+GameObject:
+  m_Name: Child
+  m_IsActive: 1
+  m_Layer: 0
+  m_TagString: Untagged
+--- !u!4 &501
+Transform:
+  m_GameObject: {fileID: 500}
+  m_LocalPosition: {x: 1, y: 2, z: 3}
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalScale: {x: 0.5, y: 0.5, z: 0.5}
+  m_Father: {fileID: 401}

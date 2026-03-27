@@ -1,0 +1,899 @@
+"""
+Tests for the animation converter module.
+
+Tests cover:
+  - .anim file parsing (position, rotation, euler, scale curves)
+  - .controller file parsing (states, transitions, parameters)
+  - Keyframe simplification
+  - Luau TweenService code generation
+  - Project-level animation discovery
+  - Integration with the pipeline
+"""
+
+from __future__ import annotations
+
+import textwrap
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from converter.animation_converter import (
+    AnimClip,
+    AnimCondition,
+    AnimCurve,
+    AnimKeyframe,
+    AnimParameter,
+    AnimState,
+    AnimTransition,
+    AnimatorController,
+    AnimationConversionResult,
+    parse_anim_file,
+    parse_controller_file,
+    simplify_keyframes,
+    generate_tween_script,
+    discover_animations,
+    convert_animations,
+    _quat_to_euler_degrees,
+)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures -- minimal .anim and .controller YAML content
+# ---------------------------------------------------------------------------
+
+MINIMAL_ANIM_YAML = """\
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!74 &7400000
+AnimationClip:
+  m_ObjectHideFlags: 0
+  m_Name: test_open
+  m_PositionCurves:
+  - curve:
+      serializedVersion: 2
+      m_Curve:
+      - serializedVersion: 3
+        time: 0
+        value: {x: 0, y: 0, z: 0}
+        inSlope: {x: 0, y: 0, z: 0}
+        outSlope: {x: 0, y: 0, z: 0}
+      - serializedVersion: 3
+        time: 1
+        value: {x: 0, y: 4, z: 0}
+        inSlope: {x: 0, y: 0, z: 0}
+        outSlope: {x: 0, y: 0, z: 0}
+      m_PreInfinity: 2
+      m_PostInfinity: 2
+    path: ''
+  m_RotationCurves: []
+  m_EulerCurves: []
+  m_ScaleCurves: []
+  m_SampleRate: 60
+  m_AnimationClipSettings:
+    serializedVersion: 2
+    m_StartTime: 0
+    m_StopTime: 1
+    m_LoopTime: 0
+"""
+
+ROTATION_ANIM_YAML = """\
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!74 &7400000
+AnimationClip:
+  m_ObjectHideFlags: 0
+  m_Name: test_rotate
+  m_PositionCurves: []
+  m_RotationCurves:
+  - curve:
+      serializedVersion: 2
+      m_Curve:
+      - serializedVersion: 3
+        time: 0
+        value: {x: 0, y: 0, z: 0, w: 1}
+      - serializedVersion: 3
+        time: 2
+        value: {x: 0, y: 0.7071068, z: 0, w: 0.7071068}
+      m_PreInfinity: 2
+      m_PostInfinity: 2
+    path: ''
+  m_EulerCurves: []
+  m_ScaleCurves: []
+  m_SampleRate: 60
+  m_AnimationClipSettings:
+    serializedVersion: 2
+    m_StartTime: 0
+    m_StopTime: 2
+    m_LoopTime: 1
+"""
+
+SCALE_ANIM_YAML = """\
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!74 &7400000
+AnimationClip:
+  m_ObjectHideFlags: 0
+  m_Name: test_scale
+  m_PositionCurves: []
+  m_RotationCurves: []
+  m_EulerCurves: []
+  m_ScaleCurves:
+  - curve:
+      serializedVersion: 2
+      m_Curve:
+      - serializedVersion: 3
+        time: 0
+        value: {x: 1, y: 1, z: 1}
+      - serializedVersion: 3
+        time: 0.5
+        value: {x: 2, y: 2, z: 2}
+      m_PreInfinity: 2
+      m_PostInfinity: 2
+    path: ''
+  m_SampleRate: 60
+  m_AnimationClipSettings:
+    serializedVersion: 2
+    m_StartTime: 0
+    m_StopTime: 0.5
+    m_LoopTime: 0
+"""
+
+CHILD_PATH_ANIM_YAML = """\
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!74 &7400000
+AnimationClip:
+  m_ObjectHideFlags: 0
+  m_Name: test_child
+  m_PositionCurves:
+  - curve:
+      serializedVersion: 2
+      m_Curve:
+      - serializedVersion: 3
+        time: 0
+        value: {x: 0, y: 0, z: 2}
+      - serializedVersion: 3
+        time: 1
+        value: {x: 0, y: 0, z: -2}
+      m_PreInfinity: 2
+      m_PostInfinity: 2
+    path: Base10/Box1
+  m_RotationCurves: []
+  m_EulerCurves: []
+  m_ScaleCurves: []
+  m_SampleRate: 60
+  m_AnimationClipSettings:
+    serializedVersion: 2
+    m_StartTime: 0
+    m_StopTime: 1
+    m_LoopTime: 0
+"""
+
+MINIMAL_CONTROLLER_YAML = """\
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!91 &9100000
+AnimatorController:
+  m_ObjectHideFlags: 0
+  m_Name: TestController
+  m_AnimatorParameters:
+  - m_Name: open
+    m_Type: 4
+    m_DefaultFloat: 0
+    m_DefaultInt: 0
+    m_DefaultBool: 0
+  m_AnimatorLayers:
+  - serializedVersion: 5
+    m_Name: Base Layer
+    m_StateMachine: {fileID: 110747030}
+--- !u!1101 &110115666
+AnimatorStateTransition:
+  m_ObjectHideFlags: 1
+  m_Name: Opened
+  m_Conditions:
+  - m_ConditionMode: 1
+    m_ConditionEvent: open
+    m_EventTreshold: 0
+  m_DstState: {fileID: 110220728}
+  serializedVersion: 3
+  m_TransitionDuration: 0.1
+  m_HasExitTime: 0
+  m_ExitTime: 0.9
+--- !u!1102 &110218898
+AnimatorState:
+  serializedVersion: 6
+  m_ObjectHideFlags: 1
+  m_Name: Idle
+  m_Speed: 1
+  m_Transitions:
+  - {fileID: 110115666}
+  m_Motion: {fileID: 0}
+--- !u!1102 &110220728
+AnimatorState:
+  serializedVersion: 6
+  m_ObjectHideFlags: 1
+  m_Name: open
+  m_Speed: 1
+  m_Transitions: []
+  m_Motion: {fileID: 7400000, guid: 788698ac0388d224ca96f4fc598e0f1d, type: 2}
+--- !u!1107 &110747030
+AnimatorStateMachine:
+  serializedVersion: 6
+  m_ObjectHideFlags: 1
+  m_Name: Base Layer
+  m_ChildStates:
+  - serializedVersion: 1
+    m_State: {fileID: 110218898}
+  - serializedVersion: 1
+    m_State: {fileID: 110220728}
+  m_DefaultState: {fileID: 110218898}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Test .anim parsing
+# ---------------------------------------------------------------------------
+
+class TestAnimParsing:
+    """Tests for parsing Unity .anim files."""
+
+    def test_parse_position_anim(self, tmp_path: Path) -> None:
+        """Parse a simple position animation with 2 keyframes."""
+        anim_file = tmp_path / "open.anim"
+        anim_file.write_text(MINIMAL_ANIM_YAML, encoding="utf-8")
+
+        clip = parse_anim_file(anim_file)
+
+        assert clip is not None
+        assert clip.name == "test_open"
+        assert clip.duration == pytest.approx(1.0)
+        assert clip.loop is False
+        assert clip.sample_rate == 60.0
+        assert len(clip.curves) == 1
+
+        curve = clip.curves[0]
+        assert curve.property_type == "position"
+        assert curve.path == ""
+        assert len(curve.keyframes) == 2
+
+        kf0 = curve.keyframes[0]
+        assert kf0.time == pytest.approx(0.0)
+        assert kf0.value == pytest.approx((0.0, 0.0, 0.0))
+
+        kf1 = curve.keyframes[1]
+        assert kf1.time == pytest.approx(1.0)
+        assert kf1.value == pytest.approx((0.0, 4.0, 0.0))
+
+    def test_parse_rotation_anim(self, tmp_path: Path) -> None:
+        """Parse a quaternion rotation animation."""
+        anim_file = tmp_path / "rotate.anim"
+        anim_file.write_text(ROTATION_ANIM_YAML, encoding="utf-8")
+
+        clip = parse_anim_file(anim_file)
+
+        assert clip is not None
+        assert clip.name == "test_rotate"
+        assert clip.duration == pytest.approx(2.0)
+        assert clip.loop is True
+        assert len(clip.curves) == 1
+
+        curve = clip.curves[0]
+        assert curve.property_type == "rotation"
+        assert len(curve.keyframes) == 2
+
+        kf0 = curve.keyframes[0]
+        assert kf0.value == pytest.approx((0.0, 0.0, 0.0, 1.0))
+
+        kf1 = curve.keyframes[1]
+        assert kf1.value == pytest.approx((0.0, 0.7071068, 0.0, 0.7071068), abs=1e-5)
+
+    def test_parse_scale_anim(self, tmp_path: Path) -> None:
+        """Parse a scale animation."""
+        anim_file = tmp_path / "scale.anim"
+        anim_file.write_text(SCALE_ANIM_YAML, encoding="utf-8")
+
+        clip = parse_anim_file(anim_file)
+
+        assert clip is not None
+        assert clip.name == "test_scale"
+        assert clip.duration == pytest.approx(0.5)
+        assert len(clip.curves) == 1
+        assert clip.curves[0].property_type == "scale"
+        assert len(clip.curves[0].keyframes) == 2
+
+    def test_parse_child_path_anim(self, tmp_path: Path) -> None:
+        """Parse an animation that targets a child object by path."""
+        anim_file = tmp_path / "child.anim"
+        anim_file.write_text(CHILD_PATH_ANIM_YAML, encoding="utf-8")
+
+        clip = parse_anim_file(anim_file)
+
+        assert clip is not None
+        assert clip.name == "test_child"
+        assert len(clip.curves) == 1
+        assert clip.curves[0].path == "Base10/Box1"
+
+    def test_parse_nonexistent_file(self, tmp_path: Path) -> None:
+        """Return None for a nonexistent file."""
+        clip = parse_anim_file(tmp_path / "nonexistent.anim")
+        assert clip is None
+
+    def test_parse_empty_curves(self, tmp_path: Path) -> None:
+        """Handle anim files with no curves gracefully."""
+        yaml_content = """\
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!74 &7400000
+AnimationClip:
+  m_Name: empty
+  m_PositionCurves: []
+  m_RotationCurves: []
+  m_EulerCurves: []
+  m_ScaleCurves: []
+  m_SampleRate: 60
+  m_AnimationClipSettings:
+    m_StartTime: 0
+    m_StopTime: 1
+    m_LoopTime: 0
+"""
+        anim_file = tmp_path / "empty.anim"
+        anim_file.write_text(yaml_content, encoding="utf-8")
+
+        clip = parse_anim_file(anim_file)
+        assert clip is not None
+        assert clip.name == "empty"
+        assert len(clip.curves) == 0
+
+
+# ---------------------------------------------------------------------------
+# Test .controller parsing
+# ---------------------------------------------------------------------------
+
+class TestControllerParsing:
+    """Tests for parsing Unity .controller files."""
+
+    def test_parse_controller(self, tmp_path: Path) -> None:
+        """Parse a controller with parameters, states, and transitions."""
+        ctrl_file = tmp_path / "door.controller"
+        ctrl_file.write_text(MINIMAL_CONTROLLER_YAML, encoding="utf-8")
+
+        ctrl = parse_controller_file(ctrl_file)
+
+        assert ctrl is not None
+        assert ctrl.name == "TestController"
+
+        # Parameters
+        assert len(ctrl.parameters) == 1
+        assert ctrl.parameters[0].name == "open"
+        assert ctrl.parameters[0].param_type == 4  # Bool
+
+        # States
+        assert len(ctrl.states) == 2
+        state_names = {s.name for s in ctrl.states}
+        assert "Idle" in state_names
+        assert "open" in state_names
+
+        # Default state
+        assert ctrl.default_state_file_id == "110218898"
+
+        # Transitions on Idle state
+        idle_state = next(s for s in ctrl.states if s.name == "Idle")
+        assert len(idle_state.transitions) == 1
+
+        trans = idle_state.transitions[0]
+        assert trans.name == "Opened"
+        assert trans.dst_state_file_id == "110220728"
+        assert len(trans.conditions) == 1
+        assert trans.conditions[0].parameter == "open"
+        assert trans.conditions[0].mode == 1  # If (true)
+
+        # Open state has the clip GUID
+        open_state = next(s for s in ctrl.states if s.name == "open")
+        assert open_state.clip_guid == "788698ac0388d224ca96f4fc598e0f1d"
+
+    def test_parse_controller_nonexistent(self, tmp_path: Path) -> None:
+        """Return None for a nonexistent controller file."""
+        ctrl = parse_controller_file(tmp_path / "nonexistent.controller")
+        assert ctrl is None
+
+
+# ---------------------------------------------------------------------------
+# Test keyframe simplification
+# ---------------------------------------------------------------------------
+
+class TestKeyframeSimplification:
+    """Tests for the simplify_keyframes function."""
+
+    def test_no_simplification_needed(self) -> None:
+        """Keep all keyframes when count is below max."""
+        keyframes = [
+            AnimKeyframe(time=0.0, value=(0.0, 0.0, 0.0)),
+            AnimKeyframe(time=0.5, value=(0.0, 2.0, 0.0)),
+            AnimKeyframe(time=1.0, value=(0.0, 4.0, 0.0)),
+        ]
+        result = simplify_keyframes(keyframes, max_count=10)
+        assert len(result) == 3
+
+    def test_simplification_reduces_count(self) -> None:
+        """Reduce a large number of keyframes to max_count."""
+        keyframes = [
+            AnimKeyframe(time=i * 0.01, value=(0.0, float(i), 0.0))
+            for i in range(100)
+        ]
+        result = simplify_keyframes(keyframes, max_count=10)
+        assert len(result) == 10
+
+    def test_simplification_keeps_first_and_last(self) -> None:
+        """Always keep the first and last keyframes."""
+        keyframes = [
+            AnimKeyframe(time=i * 0.01, value=(0.0, float(i), 0.0))
+            for i in range(50)
+        ]
+        result = simplify_keyframes(keyframes, max_count=5)
+        assert result[0].time == keyframes[0].time
+        assert result[-1].time == keyframes[-1].time
+
+    def test_simplification_two_keyframes(self) -> None:
+        """With max_count=2, only keep first and last."""
+        keyframes = [
+            AnimKeyframe(time=i * 0.1, value=(0.0, float(i), 0.0))
+            for i in range(20)
+        ]
+        result = simplify_keyframes(keyframes, max_count=2)
+        assert len(result) == 2
+        assert result[0] is keyframes[0]
+        assert result[1] is keyframes[-1]
+
+    def test_simplification_empty_input(self) -> None:
+        """Handle empty input."""
+        result = simplify_keyframes([], max_count=10)
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# Test Luau code generation
+# ---------------------------------------------------------------------------
+
+class TestLuauGeneration:
+    """Tests for Luau TweenService code generation."""
+
+    def test_generate_position_tween(self) -> None:
+        """Generate a simple position tween script."""
+        clip = AnimClip(
+            name="open",
+            duration=1.0,
+            loop=False,
+            sample_rate=60,
+            curves=[AnimCurve(
+                property_type="position",
+                path="",
+                keyframes=[
+                    AnimKeyframe(time=0.0, value=(0.0, 0.0, 0.0)),
+                    AnimKeyframe(time=1.0, value=(0.0, 4.0, 0.0)),
+                ],
+            )],
+        )
+
+        luau = generate_tween_script(clip)
+
+        assert "TweenService" in luau
+        assert "local target" in luau
+        assert "playAnimation" in luau
+        assert "Position" in luau
+        assert "Vector3.new" in luau
+        # Should contain the Y offset of 4
+        assert "4.0000" in luau
+
+    def test_generate_rotation_tween(self) -> None:
+        """Generate a rotation tween script from quaternion keyframes."""
+        clip = AnimClip(
+            name="rotate",
+            duration=2.0,
+            loop=True,
+            sample_rate=60,
+            curves=[AnimCurve(
+                property_type="rotation",
+                path="",
+                keyframes=[
+                    AnimKeyframe(time=0.0, value=(0.0, 0.0, 0.0, 1.0)),
+                    AnimKeyframe(time=2.0, value=(0.0, 0.7071, 0.0, 0.7071)),
+                ],
+            )],
+        )
+
+        luau = generate_tween_script(clip)
+
+        assert "TweenService" in luau
+        assert "CFrame" in luau
+        assert "math.rad" in luau
+        assert "while true do" in luau  # Looping animation
+
+    def test_generate_scale_tween(self) -> None:
+        """Generate a scale tween script."""
+        clip = AnimClip(
+            name="grow",
+            duration=0.5,
+            loop=False,
+            sample_rate=60,
+            curves=[AnimCurve(
+                property_type="scale",
+                path="",
+                keyframes=[
+                    AnimKeyframe(time=0.0, value=(1.0, 1.0, 1.0)),
+                    AnimKeyframe(time=0.5, value=(2.0, 2.0, 2.0)),
+                ],
+            )],
+        )
+
+        luau = generate_tween_script(clip)
+
+        assert "Size" in luau
+        assert "baseSize" in luau
+
+    def test_generate_child_path_tween(self) -> None:
+        """Generate tweens targeting a child object via path."""
+        clip = AnimClip(
+            name="child_move",
+            duration=1.0,
+            loop=False,
+            sample_rate=60,
+            curves=[AnimCurve(
+                property_type="position",
+                path="Base10/Box1",
+                keyframes=[
+                    AnimKeyframe(time=0.0, value=(0.0, 0.0, 2.0)),
+                    AnimKeyframe(time=1.0, value=(0.0, 0.0, -2.0)),
+                ],
+            )],
+        )
+
+        luau = generate_tween_script(clip)
+
+        assert "FindFirstChild" in luau
+        assert '"Base10"' in luau
+        assert '"Box1"' in luau
+
+    def test_generate_with_bool_parameter(self) -> None:
+        """Generate parameter-driven animation (like door open/close)."""
+        clip = AnimClip(
+            name="open",
+            duration=1.0,
+            loop=False,
+            sample_rate=60,
+            curves=[AnimCurve(
+                property_type="position",
+                path="",
+                keyframes=[
+                    AnimKeyframe(time=0.0, value=(0.0, 0.0, 0.0)),
+                    AnimKeyframe(time=1.0, value=(0.0, 4.0, 0.0)),
+                ],
+            )],
+        )
+
+        controller = AnimatorController(
+            name="door",
+            parameters=[AnimParameter(name="open", param_type=4)],
+        )
+
+        luau = generate_tween_script(clip, controller=controller)
+
+        assert "GetAttributeChangedSignal" in luau
+        assert '"open"' in luau
+        assert "SetAttribute" in luau
+
+    def test_generate_with_int_parameter(self) -> None:
+        """Generate animation driven by an int parameter."""
+        clip = AnimClip(
+            name="holder1",
+            duration=1.0,
+            loop=False,
+            sample_rate=60,
+            curves=[AnimCurve(
+                property_type="position",
+                path="",
+                keyframes=[
+                    AnimKeyframe(time=0.0, value=(0.0, 0.0, 0.0)),
+                    AnimKeyframe(time=1.0, value=(1.0, 0.0, 0.0)),
+                ],
+            )],
+        )
+
+        controller = AnimatorController(
+            name="PlaneHolder",
+            parameters=[AnimParameter(name="actionNumber", param_type=3)],
+        )
+
+        luau = generate_tween_script(clip, controller=controller)
+
+        assert "GetAttributeChangedSignal" in luau
+        assert '"actionNumber"' in luau
+
+    def test_generate_empty_clip(self) -> None:
+        """Return empty string for a clip with no curves."""
+        clip = AnimClip(name="empty", duration=1.0, loop=False, sample_rate=60)
+        luau = generate_tween_script(clip)
+        assert luau == ""
+
+    def test_generate_single_keyframe_curve(self) -> None:
+        """Skip curves with only one keyframe (no motion)."""
+        clip = AnimClip(
+            name="static",
+            duration=1.0,
+            loop=False,
+            sample_rate=60,
+            curves=[AnimCurve(
+                property_type="position",
+                path="",
+                keyframes=[AnimKeyframe(time=0.0, value=(0.0, 0.0, 0.0))],
+            )],
+        )
+
+        luau = generate_tween_script(clip)
+        # Script should be generated but won't have any tween calls
+        # (the curve has only 1 keyframe, so no tween is generated)
+        assert "playAnimation" in luau
+
+
+# ---------------------------------------------------------------------------
+# Test quaternion-to-Euler conversion
+# ---------------------------------------------------------------------------
+
+class TestQuaternionToEuler:
+    """Tests for quaternion to Euler angle conversion."""
+
+    def test_identity_quaternion(self) -> None:
+        """Identity quaternion -> zero Euler angles."""
+        ex, ey, ez = _quat_to_euler_degrees(0, 0, 0, 1)
+        assert abs(ex) < 0.01
+        assert abs(ey) < 0.01
+        assert abs(ez) < 0.01
+
+    def test_90_degree_y_rotation(self) -> None:
+        """90-degree rotation around Y axis."""
+        import math
+        # Quaternion for 90 deg around Y: (0, sin(45), 0, cos(45))
+        s = math.sin(math.radians(45))
+        c = math.cos(math.radians(45))
+        ex, ey, ez = _quat_to_euler_degrees(0, s, 0, c)
+        assert abs(ey - 90.0) < 0.5
+
+
+# ---------------------------------------------------------------------------
+# Test project-level discovery
+# ---------------------------------------------------------------------------
+
+class TestAnimationDiscovery:
+    """Tests for project-level animation discovery."""
+
+    def test_discover_in_empty_project(self, tmp_path: Path) -> None:
+        """Return empty lists for a project with no Assets folder."""
+        clips, controllers = discover_animations(tmp_path)
+        assert clips == []
+        assert controllers == []
+
+    def test_discover_with_anim_files(self, tmp_path: Path) -> None:
+        """Discover .anim files in a project."""
+        assets = tmp_path / "Assets" / "Animations"
+        assets.mkdir(parents=True)
+
+        (assets / "open.anim").write_text(MINIMAL_ANIM_YAML, encoding="utf-8")
+        (assets / "rotate.anim").write_text(ROTATION_ANIM_YAML, encoding="utf-8")
+
+        clips, controllers = discover_animations(tmp_path)
+
+        assert len(clips) == 2
+        assert len(controllers) == 0
+        clip_names = {c.name for c in clips}
+        assert "test_open" in clip_names
+        assert "test_rotate" in clip_names
+
+    def test_discover_with_controller_files(self, tmp_path: Path) -> None:
+        """Discover .controller files in a project."""
+        assets = tmp_path / "Assets" / "Animations"
+        assets.mkdir(parents=True)
+
+        (assets / "door.controller").write_text(MINIMAL_CONTROLLER_YAML, encoding="utf-8")
+
+        clips, controllers = discover_animations(tmp_path)
+
+        assert len(clips) == 0
+        assert len(controllers) == 1
+        assert controllers[0].name == "TestController"
+
+    def test_convert_animations_generates_scripts(self, tmp_path: Path) -> None:
+        """convert_animations generates Luau scripts for standalone clips."""
+        assets = tmp_path / "Assets" / "Animations"
+        assets.mkdir(parents=True)
+
+        (assets / "open.anim").write_text(MINIMAL_ANIM_YAML, encoding="utf-8")
+
+        result = convert_animations(tmp_path)
+
+        assert result.total_clips == 1
+        assert result.total_controllers == 0
+        # Standalone clip (not referenced by controller) should generate a script
+        assert result.total_scripts_generated == 1
+        assert len(result.generated_scripts) == 1
+
+        script_name, luau_source = result.generated_scripts[0]
+        assert "Anim_test_open" in script_name
+        assert "TweenService" in luau_source
+
+
+# ---------------------------------------------------------------------------
+# Test integration with real SimpleFPS .anim files (if available)
+# ---------------------------------------------------------------------------
+
+class TestRealAnimFiles:
+    """Integration tests using actual SimpleFPS animation files."""
+
+    SIMPLE_FPS_PATH = Path(__file__).parent.parent.parent / "test_projects" / "SimpleFPS"
+
+    @pytest.fixture
+    def skip_if_no_simplefps(self) -> None:
+        if not self.SIMPLE_FPS_PATH.exists():
+            pytest.skip("SimpleFPS test project not available")
+
+    def test_parse_door_open_anim(self, skip_if_no_simplefps: None) -> None:
+        """Parse the actual door open.anim file from SimpleFPS."""
+        anim_path = self.SIMPLE_FPS_PATH / "Assets/AssetPack/SciFi_Door/Animation/open.anim"
+        clip = parse_anim_file(anim_path)
+
+        assert clip is not None
+        assert clip.name == "open"
+        assert clip.duration == pytest.approx(1.0)
+        assert clip.loop is False
+        assert len(clip.curves) >= 1  # At least position curve
+
+        # The door opens by moving Y +4
+        pos_curve = next(c for c in clip.curves if c.property_type == "position")
+        assert len(pos_curve.keyframes) == 2
+        assert pos_curve.keyframes[1].value[1] == pytest.approx(4.0)
+
+    def test_parse_door_close_anim(self, skip_if_no_simplefps: None) -> None:
+        """Parse the actual door close.anim file."""
+        anim_path = self.SIMPLE_FPS_PATH / "Assets/AssetPack/SciFi_Door/Animation/close.anim"
+        clip = parse_anim_file(anim_path)
+
+        assert clip is not None
+        assert clip.name == "close"
+        assert clip.loop is True  # close.anim has m_LoopTime: 1
+
+        pos_curve = next(c for c in clip.curves if c.property_type == "position")
+        # Starts at Y=4, ends at Y=0
+        assert pos_curve.keyframes[0].value[1] == pytest.approx(4.0)
+        assert pos_curve.keyframes[1].value[1] == pytest.approx(0.0)
+
+    def test_parse_door_controller(self, skip_if_no_simplefps: None) -> None:
+        """Parse the actual door.controller file."""
+        ctrl_path = self.SIMPLE_FPS_PATH / "Assets/AssetPack/SciFi_Door/Animation/door.controller"
+        ctrl = parse_controller_file(ctrl_path)
+
+        assert ctrl is not None
+        assert ctrl.name == "door"
+        assert len(ctrl.parameters) == 1
+        assert ctrl.parameters[0].name == "open"
+        assert ctrl.parameters[0].param_type == 4  # Bool
+
+        # Should have Idle, open, close states
+        state_names = {s.name for s in ctrl.states}
+        assert "Idle" in state_names
+        assert "open" in state_names
+        assert "close" in state_names
+
+    def test_parse_hostile_plane_controller(self, skip_if_no_simplefps: None) -> None:
+        """Parse the HostilePlane.controller file (single auto-play state)."""
+        ctrl_path = self.SIMPLE_FPS_PATH / "Assets/Animations/HostilePlane/HostilePlane.controller"
+        ctrl = parse_controller_file(ctrl_path)
+
+        assert ctrl is not None
+        assert ctrl.name == "HostilePlane"
+        assert len(ctrl.parameters) == 0
+        assert len(ctrl.states) == 1
+        assert ctrl.states[0].name == "Flying"
+
+    def test_parse_plane_holder_controller(self, skip_if_no_simplefps: None) -> None:
+        """Parse PlaneHolder.controller (int parameter, multiple states)."""
+        ctrl_path = self.SIMPLE_FPS_PATH / "Assets/Animations/PlaneHolder/PlaneHolder.controller"
+        ctrl = parse_controller_file(ctrl_path)
+
+        assert ctrl is not None
+        assert ctrl.name == "PlaneHolder"
+        assert len(ctrl.parameters) == 1
+        assert ctrl.parameters[0].name == "actionNumber"
+        assert ctrl.parameters[0].param_type == 3  # Int
+
+        state_names = {s.name for s in ctrl.states}
+        assert "holder1" in state_names
+        assert "holder2" in state_names
+        assert "holder3" in state_names
+        assert "Idle" in state_names
+
+    def test_parse_holder1_anim(self, skip_if_no_simplefps: None) -> None:
+        """Parse holder1.anim which targets child objects by path."""
+        anim_path = self.SIMPLE_FPS_PATH / "Assets/Animations/PlaneHolder/holder1.anim"
+        clip = parse_anim_file(anim_path)
+
+        assert clip is not None
+        assert clip.name == "holder1"
+        # This anim has position curves with paths like "Base10/Box1"
+        assert len(clip.curves) >= 1
+        # At least some curves should target child objects
+        child_curves = [c for c in clip.curves if c.path]
+        assert len(child_curves) >= 1
+
+    def test_generate_door_animation_script(self, skip_if_no_simplefps: None) -> None:
+        """Generate a complete door animation script."""
+        anim_path = self.SIMPLE_FPS_PATH / "Assets/AssetPack/SciFi_Door/Animation/open.anim"
+        ctrl_path = self.SIMPLE_FPS_PATH / "Assets/AssetPack/SciFi_Door/Animation/door.controller"
+
+        clip = parse_anim_file(anim_path)
+        ctrl = parse_controller_file(ctrl_path)
+
+        assert clip is not None
+        assert ctrl is not None
+
+        luau = generate_tween_script(clip, controller=ctrl)
+
+        assert "TweenService" in luau
+        assert "playAnimation" in luau
+        assert "open" in luau  # parameter name
+        assert "GetAttributeChangedSignal" in luau
+
+    def test_full_project_discovery(self, skip_if_no_simplefps: None) -> None:
+        """Discover all animations in the SimpleFPS project."""
+        clips, controllers = discover_animations(self.SIMPLE_FPS_PATH)
+
+        # SimpleFPS has: open.anim, close.anim, fly.anim, Flying.anim,
+        #                holder1.anim, holder2.anim, holder3.anim
+        assert len(clips) >= 7
+
+        # Controllers: door.controller, HostilePlane.controller,
+        #              PlaneHolder.controller, Plane Flying.controller
+        assert len(controllers) >= 4
+
+    def test_full_project_conversion(self, skip_if_no_simplefps: None) -> None:
+        """Run full animation conversion on SimpleFPS project."""
+        from unity.guid_resolver import build_guid_index
+
+        guid_index = build_guid_index(self.SIMPLE_FPS_PATH)
+        result = convert_animations(self.SIMPLE_FPS_PATH, guid_index=guid_index)
+
+        assert result.total_clips >= 7
+        assert result.total_controllers >= 4
+        # Should generate at least some scripts
+        assert result.total_scripts_generated >= 1
+
+
+# ---------------------------------------------------------------------------
+# Test pipeline integration
+# ---------------------------------------------------------------------------
+
+class TestPipelineIntegration:
+    """Tests for animation converter integration with the pipeline."""
+
+    def test_pipeline_has_convert_animations_phase(self) -> None:
+        """The pipeline includes the convert_animations phase."""
+        from converter.pipeline import PHASES
+        assert "convert_animations" in PHASES
+        # Should be after transpile_scripts and before convert_scene
+        idx = PHASES.index("convert_animations")
+        assert PHASES[idx - 1] == "transpile_scripts"
+        assert PHASES[idx + 1] == "convert_scene"
+
+    def test_conversion_context_has_animation_fields(self) -> None:
+        """ConversionContext tracks animation stats."""
+        from core.conversion_context import ConversionContext
+        ctx = ConversionContext()
+        assert hasattr(ctx, "total_animations")
+        assert hasattr(ctx, "converted_animations")
+        assert ctx.total_animations == 0
+        assert ctx.converted_animations == 0
+
+    def test_pipeline_state_has_animation_result(self) -> None:
+        """PipelineState has an animation_result field."""
+        from converter.pipeline import PipelineState
+        state = PipelineState()
+        assert hasattr(state, "animation_result")
+        assert state.animation_result is None

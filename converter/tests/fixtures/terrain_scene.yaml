@@ -1,0 +1,69 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!104 &2
+RenderSettings:
+  m_Fog: 0
+  m_AmbientSkyColor: {r: 0.5, g: 0.5, b: 0.5, a: 1}
+  m_SkyboxMaterial: {fileID: 0}
+--- !u!1 &100
+GameObject:
+  m_Name: MainCamera
+  m_IsActive: 1
+  m_Layer: 0
+  m_TagString: MainCamera
+--- !u!4 &101
+Transform:
+  m_GameObject: {fileID: 100}
+  m_LocalPosition: {x: 50, y: 20, z: -50}
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_Father: {fileID: 0}
+--- !u!20 &102
+Camera:
+  m_GameObject: {fileID: 100}
+  field of view: 60
+  near clip plane: 0.3
+  far clip plane: 1000
+--- !u!1 &600
+GameObject:
+  m_Name: Terrain
+  m_IsActive: 1
+  m_Layer: 0
+  m_TagString: Untagged
+--- !u!4 &601
+Transform:
+  m_GameObject: {fileID: 600}
+  m_LocalPosition: {x: -500, y: 0, z: -500}
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_Father: {fileID: 0}
+--- !u!218 &602
+Terrain:
+  m_GameObject: {fileID: 600}
+  m_Enabled: 1
+  m_TerrainData: {fileID: 15600000, guid: efeec9bb5989ceb4d9a65574d8454d3a, type: 2}
+  m_TreeDistance: 2000
+  m_HeightmapPixelError: 5
+  m_DrawHeightmap: 1
+--- !u!154 &603
+TerrainCollider:
+  m_GameObject: {fileID: 600}
+  m_Enabled: 1
+  m_TerrainData: {fileID: 15600000, guid: efeec9bb5989ceb4d9a65574d8454d3a, type: 2}
+--- !u!1 &700
+GameObject:
+  m_Name: Cube
+  m_IsActive: 1
+  m_Layer: 0
+  m_TagString: Untagged
+--- !u!4 &701
+Transform:
+  m_GameObject: {fileID: 700}
+  m_LocalPosition: {x: 10, y: 5, z: 10}
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalScale: {x: 2, y: 2, z: 2}
+  m_Father: {fileID: 0}
+--- !u!33 &702
+MeshFilter:
+  m_GameObject: {fileID: 700}
+  m_Mesh: {fileID: 10202, guid: 0000000000000000e000000000000000, type: 0}

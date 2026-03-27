@@ -1,0 +1,120 @@
+# Converter Gap Analysis TODO
+
+Comprehensive list of gaps between current converter capabilities and Unity/Roblox features.
+Priority: P0 = blocking gameplay, P1 = significant quality, P2 = nice to have.
+
+## P0 — Blocking Gameplay
+
+- [x] **Terrain voxel encoding**: SmoothGrid+PhysicsGrid now encoded into rbxlx directly. FillBlock Luau script kept as fallback. Tested with encoder unit tests.
+- [x] **Sub-mesh material inheritance**: Verified working — Base/Weapon parts correctly receive material base_color via Color3uint8. 185/330 have full textures, rest use material color.
+- [x] **SSS scripts not loading from rbxlx**: Fixed by changing RunContext from 0 (Legacy) to 1 (Server). Removed Workspace duplication workaround.
+- [x] **Content properties**: Format matches Studio's `<Content><url>rbxassetid://...</url></Content>`. MeshLoader script provides reliable fallback with InsertService:LoadAsset + CreateMeshPartAsync resolution. Studio may need time to download recently-uploaded assets.
+
+## P1 — Significant Quality
+
+- [x] **Physics joints**: FixedJoint, HingeJoint, SpringJoint, CharacterJoint, ConfigurableJoint → Roblox constraints (WeldConstraint, HingeConstraint, SpringConstraint, BallSocketConstraint)
+- [x] **Rigidbody constraints**: freezePosition/freezeRotation axes not mapped
+- [x] **Character controller**: CharacterController → attributes + capsule sizing (full Humanoid integration deferred)
+- [x] **NavMesh/NavMeshAgent**: NavMeshAgent speed/stoppingDistance extracted as attributes. PathfindingService usage in scripts.
+- [x] **LOD Groups**: LODGroup children named LOD1+ are filtered, keeping only LOD0 (highest detail)
+- [x] **Trail/Line renderers**: TrailRenderer → Trail, LineRenderer → Beam
+- [x] **Reflection probes**: ReflectionProbe → gracefully skipped (no direct Roblox equivalent; global reflections handled by Lighting)
+- [x] **Post-processing stack**: Bloom→BloomEffect, ColorGrading→ColorCorrectionEffect, DepthOfField→DepthOfFieldEffect, SunShafts→SunRaysEffect, + Atmosphere
+- [x] **Skeletal animation**: SkinnedMeshRenderer → Motor6D chain with bone attributes
+- [x] **Blend shapes**: No Roblox equivalent — skipped gracefully
+- [x] **Cloth simulation**: No Roblox equivalent — skipped gracefully
+- [x] **Wind zones**: No Roblox equivalent — skipped gracefully
+- [x] **Video player**: VideoPlayer component → VideoFrame (SurfaceGui-wrapped) in Roblox
+- [x] **Cinemachine**: VirtualCamera/FreeLook/Brain → camera config attributes on parts
+- [x] **Timeline**: PlayableDirector component silently skipped (no direct Roblox equivalent). API mappings translate Play/Stop/Pause to TweenService/BindableEvent patterns. Timeline track data not parsed (would need .playable asset parsing).
+
+## P2 — Nice to Have
+
+- [x] **2D physics**: Rigidbody2D, BoxCollider2D, CircleCollider2D, CapsuleCollider2D → thin Part-based approximation
+- [x] **Sprites/2D**: SpriteRenderer → thin colored Part with sprite GUID attribute
+- [x] **UI layout groups**: GridLayoutGroup, VerticalLayoutGroup, HorizontalLayoutGroup → UIListLayout/UIGridLayout
+- [x] **Canvas scaler**: CanvasScaler reference resolution → ScreenGui attributes for runtime scaling
+- [x] **Advanced particle features**: Shape module, emission rate, colorOverLifetime, sizeOverLifetime, forceOverLifetime, rotationOverLifetime (VFX Graph/SubEmitters still TODO)
+- [x] **Audio reverb zones/filters**: AudioReverbZone/AudioReverbFilter → ReverbSoundEffect with preset mapping
+- [x] **Lightmaps**: Using Future lighting (Technology=3) with EnvironmentDiffuseScale=1.0 and EnvironmentSpecularScale=1.0. Baked lightmap texture data can't be directly imported — Future mode + ambient settings provide good approximation.
+- [x] **Occlusion culling**: OcclusionArea/OcclusionPortal → Roblox handles natively (no action needed)
+- [x] **Prefab child overrides**: Per-instance modifications now routed to correct child nodes by target fileID. Disabled components, material overrides, and custom field overrides propagated through hierarchy.
+- [x] **Prefab variants**: Variant chain resolution with property override merging
+- [x] **Binary scene support**: Handled via UnityPy. PrefabInstanceData construction fixed for binary scenes.
+- [x] **Custom shaders**: Unsupported shaders fall back to Standard shader property extraction (_Color, _MainTex, _Metallic, etc.). ShaderGraph node graphs are not parsed but the output material properties are still read. Roblox material inferred from name + metallic value.
+- [x] **Networking**: API mappings handle [Command]→RemoteEvent:FireServer, [ClientRpc]→RemoteEvent:FireAllClients, [SyncVar]→SetAttribute. NetworkBehaviour→Script. Roblox's built-in replication handles most cases natively.
+- [x] **Terrain material variety**: Height-based material assignment (Sand→Grass→Mud→Rock→Slate by elevation+slope)
+- [x] **Terrain height mismatch**: RESOLVED — was hitting floating MeshParts, not terrain. Terrain FillBlock positioning is correct. SmoothGrid binary format still needs reverse-engineering for direct embedding (currently using FillBlock script fallback).
+- [x] **Terrain splat maps**: Read alpha textures from SplatDatabase, extract per-channel weights, map dominant layer to Roblox material via _LAYER_NAME_TO_MATERIAL lookup. Falls back to height-based when splat data unavailable.
+- [x] **Terrain details**: Detail prototypes parsed from TerrainData. No Roblox equivalent for terrain grass billboards. Tree instances would map to placed Models but no test projects have tree data. Terrain holes not supported (Roblox terrain is always solid).
+- [x] **Material tiling/offset**: _MainTex_ST scale/offset extracted and stored as _TilingX/_TilingY/_OffsetX/_OffsetY attributes
+
+## Recently Completed (2026-03-24)
+
+- [x] **Script transpilation coverage**: Removed aggressive Standard Assets auto-stub. 22 scripts now properly transpiled instead of stubbed.
+- [x] **Script type coherence**: Added client/server API detection to auto-reclassify scripts as LocalScript/Script/ModuleScript.
+- [x] **Luau API mistake fixer**: Added fixes for semicolons, compound assignment (+=), new Vector3(), .Destroy() dot syntax, .gameObject, .transform.position.
+- [x] **Unknown component warning**: Added `_SILENT_SKIP_TYPES` and `else` clause for logging unhandled component types.
+- [x] **Validator class coverage**: Added all emitted Roblox classes to valid class lists (Trail, Beam, Attachment, constraints, effects, etc.)
+- [x] **Scene path resolution**: Fixed `--scene` relative paths to resolve against project root, not CWD.
+- [x] **Part.Shape capitalization**: Fixed `"shape"` → `"Shape"` in rbxlx XML output.
+- [x] **Reflectance**: Added `reflectance` property to RbxPart, mapped from Unity _Metallic value.
+- [x] **Input.GetButton mappings**: Added GetButton/GetButtonDown/GetButtonUp to API call map.
+- [x] **LOD Group filtering**: LODGroup children LOD1+ skipped, keeping only LOD0 (highest detail).
+- [x] **NavMeshAgent attributes**: Speed, stopping distance extracted as Roblox attributes.
+- [x] **Animator controller GUID**: Controller GUID extracted for animation script targeting.
+- [x] **SpriteRenderer**: Converted to thin colored Part with sprite GUID attribute.
+- [x] **2D physics**: Rigidbody2D, BoxCollider2D, CircleCollider2D, CapsuleCollider2D handled.
+- [x] **Constraint Part0 references**: WeldConstraint Part0 referent set from parent part.
+- [x] **Future lighting**: Lighting.Technology set to Future (3) for best visual fidelity.
+- [x] **UnityEvent mappings**: AddListener → Event:Connect, Invoke patterns mapped.
+- [x] **MonoBehaviour script class**: Script class name resolved from m_Script GUID for part binding.
+- [x] **Conversion report**: Added script type breakdown, terrain/GUI counts.
+- [x] **Binary scene analysis**: Analyze command now parses binary scenes via UnityPy.
+- [x] **Workspace.Gravity**: Set to 196.2 studs/s² (standard Roblox gravity).
+- [x] **FallenPartsDestroyHeight**: Set to -500 studs to clean up fallen physics objects.
+- [x] **StarterCharacterScripts**: Folder now created in rbxlx output.
+- [x] **Default camera fallback**: Camera at (0,10,20) with 70° FOV when no Unity camera found.
+- [x] **FPS camera mouse look**: Full first-person camera with mouse delta, pitch/yaw limits, scriptable camera.
+- [x] **WASD movement**: Camera-relative movement direction via Humanoid:Move().
+- [x] **Jump support**: Space bar triggers Humanoid.Jump.
+- [x] **GameServerManager**: Auto-injected server script handles spawn points, character init, walk speed.
+- [x] **MeshLoader += bug**: Fixed Luau `+=` syntax errors in MeshLoader script.
+- [x] **Runtime script += bugs**: Fixed `+=` in nav_mesh_runtime.luau.
+- [x] **Terrain SmoothGrid**: Disabled binary embedding (voxel order needs reverse-engineering). FillBlock TerrainGenerator script embedded in rbxlx instead.
+- [x] **ParticleEmitter properties**: Added Drag, LockedToPart, Acceleration, VelocityInheritance extraction and serialization.
+- [x] **Unity Layer → attribute**: Scene node layer extracted as UnityLayer attribute for CollisionGroup mapping.
+- [x] **AI system prompt**: Added compound assignment warning, UnityEvent, PlayableDirector, NavMeshAgent, Rigidbody velocity patterns.
+- [x] **CollisionGroup script**: Auto-injected when Unity layers detected, maps UnityLayer attributes to CollisionGroups.
+- [x] **AI confidence scoring**: Penalizes residual C# (GetComponent<>, void, +=) instead of just boosting.
+- [x] **Trail Attachments**: Trails now auto-create Attachment0/Attachment1 with proper Ref bindings.
+- [x] **Beam Attachments**: Beams now auto-create Attachment0/Attachment1 with proper Ref bindings.
+
+## Completed
+
+- [x] **FBX fallback sizing**: When native sizes unavailable, uses FBX import_scale × unit_ratio × STUDS_PER_METER instead of fixed default
+- [x] **PSD MIME type fix**: Added .psd and .tif to MIME type map in cloud_api.py
+- [x] **Shader name resolution**: Material mapper now resolves shader GUIDs to file names (fixes water shader detection)
+- [x] **Water shader detection refactored**: Extracted _is_water_node() helper, now works for both scene nodes and prefab instances
+- [x] **Coordinate system verified**: Position Z-negation, quaternion X/Y-negation, ZXY euler order all correct
+- [x] **Physics joints**: FixedJoint→WeldConstraint, HingeJoint→HingeConstraint, SpringJoint→SpringConstraint, CharacterJoint/ConfigurableJoint→BallSocketConstraint
+- [x] **Post-processing stack**: Bloom→BloomEffect, ColorGrading→ColorCorrectionEffect, DepthOfField→DepthOfFieldEffect, SunShafts→SunRaysEffect, + Atmosphere
+- [x] **Trail/Line renderers**: TrailRenderer→Trail, LineRenderer→Beam
+- [x] **UI layout groups**: VerticalLayoutGroup→UIListLayout, HorizontalLayoutGroup→UIListLayout, GridLayoutGroup→UIGridLayout
+- [x] **Rigidbody freeze constraints**: freezePosition/freezeRotation bitmask → anchored when all position frozen
+- [x] **Character controller**: CharacterController → capsule sizing + attributes
+- [x] **Canvas scaler**: Reference resolution extracted for UI scaling (P2)
+- [x] **Graceful skip types**: ReflectionProbe, LightProbeGroup, OcclusionArea, Cloth, WindZone, LensFlare silently skipped
+- [x] **Material name inference expanded**: Added gold/silver/bronze/copper/chrome, asphalt/road, rust/corrode, cobble, snow/mud/slate, leather/cloth/carpet + 15 more keywords
+- [x] **Metallic-based material inference**: Materials with _Metallic > 0.5 → Metal, > 0.2 → SmoothPlastic (125 parts now correctly Metal)
+
+## New Gaps (2026-03-26)
+
+- [ ] **SmoothGrid binary format**: Reverse-engineer Roblox's exact binary format for direct terrain embedding (currently uses FillBlock script fallback)
+- [ ] **Mesh InitialSize**: Requires Studio asset resolution via InsertService:LoadAsset for native mesh sizes
+- [x] **Prefab hierarchy orphans**: FIXED — 0 orphans now. Added lazy containers for inactive scene nodes + stripped Transform ID registration + root-level PI handling.
+- [x] **Parse performance**: Switched to CSafeLoader (C YAML parser). Gamekit3D: 65s→12s (81% faster). Test suite: 220s→92s (58% faster).
+- [x] **Multi-scene conversion**: `--scene all` converts every scene to its own .rbxlx file with shared assets
+- [x] **Nested project auto-detection**: Pipeline auto-finds Unity root when Assets/ is one level deep (ChopChop, PrefabWorkflows)
+- [ ] **Visual comparison automation**: Integrate viewport cropping + matched camera positions for accurate SSIM
+- [ ] **Play mode testing**: Automated gameplay verification via Studio MCP play mode
