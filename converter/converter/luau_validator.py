@@ -35,6 +35,9 @@ def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
     source = _fix_enum_comparisons(name, source, fixes)
     source = _fix_csharp_remnants(name, source, fixes)
     source = _fix_common_api_mistakes(name, source, fixes)
+    # Second pass: catch this./null that appear after API fixes (e.g., .gameObject removal)
+    if re.search(r'\bthis\.', source):
+        source = re.sub(r'\bthis\.(\w+)', r'script.Parent.\1', source)
     source = _fix_startup_race_conditions(name, source, fixes)
     source = _inject_utility_functions(name, source, fixes)
 
@@ -682,11 +685,17 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         # In Roblox, the equivalent of gameObject is usually the Part itself
         source = re.sub(r'(\w+)\.gameObject\b', r'\1', source)
 
-    # Fix: .transform.position (Unity) → .Position (Roblox)
+    # Fix: .transform (Unity) → remove (Roblox parts have Position/CFrame directly)
     if ".transform.position" in source:
         source = re.sub(r'\.transform\.position\b', '.Position', source)
     if ".transform.rotation" in source:
         source = re.sub(r'\.transform\.rotation\b', '.CFrame', source)
+    if ".transform." in source:
+        source = re.sub(r'\.transform\.', '.', source)
+
+    # Clean up double dots from .gameObject/.transform removal
+    if '..' in source:
+        source = re.sub(r'(?<!\.)\.\.(?!\.)', '.', source)
 
     # Fix: Animator.StringToHash("Name") → "Name" (Roblox uses strings, not hashes)
     if "StringToHash" in source:
