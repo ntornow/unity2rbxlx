@@ -140,6 +140,11 @@ def convert_to_png(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Skip if already converted and newer than source
+    if output_path.exists() and output_path.stat().st_mtime >= image_path.stat().st_mtime:
+        logger.debug("Reusing cached PNG: %s", output_path.name)
+        return output_path
+
     img = Image.open(image_path)
     if img.mode == "RGBA":
         img.save(output_path, "PNG")

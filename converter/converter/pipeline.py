@@ -400,7 +400,7 @@ class Pipeline:
                 else:
                     log.warning("[upload_assets]   FAILED: %s  (source: %s)", name, rel)
                     self.ctx.asset_upload_errors.append(rel)
-                time.sleep(1.0)  # Rate limit buffer (conservative)
+                time.sleep(0.3)  # Rate limit (Roblox Open Cloud allows ~60 req/min)
 
         log.info("[upload_assets] %d assets uploaded, %d errors",
                  len(uploaded), len(self.ctx.asset_upload_errors))
