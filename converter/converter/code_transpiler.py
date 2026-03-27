@@ -1043,23 +1043,35 @@ def _rule_based_transpile(
                 header_lines.append(SERVICE_IMPORTS[svc])
         header_lines.append("")
 
-    # Inject utility functions for Mathf helpers that are used in the output
+    # Inject utility functions that are used in the output
     joined_output = "\n".join(output_lines)
     utils_needed: list[str] = []
     for func_name in UTILITY_FUNCTIONS:
         if func_name + "(" in joined_output:
             utils_needed.append(func_name)
-    # mathDeltaAngle and mathLerpAngle depend on mathRepeat
+    # Dependency resolution: mathDeltaAngle and mathLerpAngle depend on mathRepeat
     if ("mathDeltaAngle" in utils_needed or "mathLerpAngle" in utils_needed) and "mathRepeat" not in utils_needed:
         utils_needed.insert(0, "mathRepeat")
     if "mathLerpAngle" in utils_needed and "mathDeltaAngle" not in utils_needed:
         utils_needed.insert(0 if "mathRepeat" not in utils_needed else 1, "mathDeltaAngle")
     if utils_needed:
-        header_lines.append("-- Math utility functions")
-        for func_name in utils_needed:
-            if func_name in UTILITY_FUNCTIONS:
-                header_lines.append(UTILITY_FUNCTIONS[func_name])
-                header_lines.append("")
+        # Group utilities by category for readability
+        math_utils = [u for u in utils_needed if u.startswith("math")]
+        linq_utils = [u for u in utils_needed if u.startswith("linq")]
+        vec3_utils = [u for u in utils_needed if u.startswith("vec3")]
+        other_utils = [u for u in utils_needed if u not in math_utils + linq_utils + vec3_utils]
+        for label, group in [
+            ("-- Math utility functions", math_utils),
+            ("-- LINQ utility functions", linq_utils),
+            ("-- Vector3 utility functions", vec3_utils),
+            ("-- Utility functions", other_utils),
+        ]:
+            if group:
+                header_lines.append(label)
+                for func_name in group:
+                    if func_name in UTILITY_FUNCTIONS:
+                        header_lines.append(UTILITY_FUNCTIONS[func_name])
+                        header_lines.append("")
 
     luau_source = "\n".join(header_lines + output_lines)
 
