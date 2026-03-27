@@ -521,7 +521,7 @@ class TestValidatorStructuralFixes:
         from converter.luau_validator import validate_and_fix
         source = 'source.PlayOneShot(clip)'
         fixed, _ = validate_and_fix("test", source)
-        assert 'source:PlayOneShot(clip)' in fixed
+        assert 'source:Play()' in fixed  # PlayOneShot converted to :Play()
 
     def test_lowercase_parent_fix(self):
         from converter.luau_validator import validate_and_fix

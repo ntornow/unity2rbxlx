@@ -2076,6 +2076,22 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             source = source.replace(f'"{unity_cls}"', f'"{rblx_cls}"')
             fixes.append(f"Fixed Unity class '{unity_cls}' → Roblox '{rblx_cls}'")
 
+    # :PlayOneShot(clip, volume) → :Play() (Unity AudioSource method → Roblox Sound)
+    if ':PlayOneShot(' in source:
+        # With volume: source:PlayOneShot(clip, volume) → source.Volume = volume; source:Play()
+        source = re.sub(
+            r'(\w+):PlayOneShot\([^,]+,\s*([^)]+)\)',
+            r'\1.Volume = \2; \1:Play()',
+            source,
+        )
+        # Without volume: source:PlayOneShot(clip) → source:Play()
+        source = re.sub(
+            r'(\w+):PlayOneShot\([^)]*\)',
+            r'\1:Play()',
+            source,
+        )
+        fixes.append("Fixed :PlayOneShot() → :Play()")
+
     # .StartsWith("str") → string.sub(var, 1, #"str") == "str"
     if '.StartsWith(' in source:
         def _fix_startswith(m):
