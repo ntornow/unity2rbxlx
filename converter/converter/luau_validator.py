@@ -30,8 +30,8 @@ def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
     fixes: list[str] = []
 
     source = _strip_leading_prose(name, source, fixes)
-    source = _fix_plugin_only_properties(name, source, fixes)
     source = _fix_runtime_script_creation(name, source, fixes)
+    source = _fix_plugin_only_properties(name, source, fixes)
     source = _fix_enum_comparisons(name, source, fixes)
     source = _fix_csharp_remnants(name, source, fixes)
     source = _fix_common_api_mistakes(name, source, fixes)
@@ -145,7 +145,7 @@ def _fix_runtime_script_creation(name: str, source: str, fixes: list[str]) -> st
     In Roblox, you can't create Script/LocalScript at runtime and set .Source.
     Comments out the entire block including multi-line string contents.
     """
-    if not re.search(r'Instance\.new\(\s*["\'](?:Local)?Script["\']\s*\)', source):
+    if not re.search(r'Instance\.new\(\s*["\'](?:Module|Local)?Script["\']\s*\)', source):
         return source
     if not re.search(r'\.Source\s*=', source):
         return source
@@ -170,7 +170,7 @@ def _fix_runtime_script_creation(name: str, source: str, fixes: list[str]) -> st
             continue
 
         # Detect start of script creation
-        m = re.search(r'local\s+(\w+)\s*=\s*Instance\.new\(\s*["\'](?:Local)?Script["\']\s*\)', stripped)
+        m = re.search(r'local\s+(\w+)\s*=\s*Instance\.new\(\s*["\'](?:Module|Local)?Script["\']\s*\)', stripped)
         if m:
             script_var = m.group(1)
             in_script_creation = True
@@ -462,6 +462,14 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     if ".transform.rotation" in source:
         source = re.sub(r'\.transform\.rotation\b', '.CFrame', source)
 
+    # Fix: Animator.StringToHash("Name") → "Name" (Roblox uses strings, not hashes)
+    if "StringToHash" in source:
+        source = re.sub(
+            r'Animator\.StringToHash\(\s*("(?:[^"\\]|\\.)*")\s*\)',
+            r'\1',
+            source,
+        )
+
     # Fix: GetComponent<X>() (C# generic) → :FindFirstChildOfClass("X")
     if "GetComponent<" in source:
         source = re.sub(
@@ -522,6 +530,56 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
                     s = s[:-1].rstrip()
             result.append(s)
         source = "\n".join(result)
+
+    # Fix: "not expr == value" → "expr ~= value" (Luau precedence bug)
+    # In Luau, `not x == y` parses as `(not x) == y`, not `not (x == y)`.
+    # The correct form is `x ~= y`.
+    if "not " in source:
+        source = re.sub(
+            r'\bnot\s+([\w.:]+(?:\([^)]*\))?)\s*==\s*("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|\w+)',
+            r'\1 ~= \2',
+            source,
+        )
+        # Also fix: "not expr ~= value" → "expr == value"
+        source = re.sub(
+            r'\bnot\s+([\w.:]+(?:\([^)]*\))?)\s*~=\s*("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|\w+)',
+            r'\1 == \2',
+            source,
+        )
+
+    # Fix: Deprecated BodyMovers → modern equivalents
+    deprecated_body_movers = {
+        "BodyVelocity": "LinearVelocity",
+        "BodyGyro": "AlignOrientation",
+        "BodyPosition": "AlignPosition",
+        "BodyForce": "VectorForce",
+        "BodyThrust": "VectorForce",
+        "BodyAngularVelocity": "AngularVelocity",
+    }
+    for old, new in deprecated_body_movers.items():
+        if f'Instance.new("{old}"' in source or f"Instance.new('{old}'" in source:
+            source = source.replace(
+                f'Instance.new("{old}")',
+                f'Instance.new("{new}") -- was {old} (deprecated)',
+            )
+            source = source.replace(
+                f"Instance.new('{old}')",
+                f"Instance.new('{new}') -- was {old} (deprecated)",
+            )
+
+    # Fix: string.unpack → buffer-based alternative (not available in Roblox Luau)
+    if "string.unpack(" in source:
+        source = re.sub(
+            r'string\.unpack\(',
+            '-- [WARNING: string.unpack not available in Roblox] string.unpack(',
+            source,
+        )
+    if "string.pack(" in source:
+        source = re.sub(
+            r'string\.pack\(',
+            '-- [WARNING: string.pack not available in Roblox] string.pack(',
+            source,
+        )
 
     if source != original:
         fixes.append("Fixed common API mistakes")

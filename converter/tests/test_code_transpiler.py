@@ -747,6 +747,110 @@ class TestStringInterpolation:
         assert "maxHp" in luau
 
 
+class TestAsyncAwait:
+    """Tests for async/await conversion."""
+
+    def test_async_task_stripped(self):
+        from converter.code_transpiler import _preprocess_async_await
+        csharp = "async Task DoSomething() {"
+        result = _preprocess_async_await(csharp)
+        assert "async" not in result
+        assert "Task" not in result
+        assert "DoSomething" in result
+
+    def test_await_task_delay(self):
+        from converter.code_transpiler import _preprocess_async_await
+        csharp = "await Task.Delay(1000);"
+        result = _preprocess_async_await(csharp)
+        assert "task.wait(1.0)" in result or "task.wait(1000 / 1000)" in result
+
+    def test_await_task_yield(self):
+        from converter.code_transpiler import _preprocess_async_await
+        csharp = "await Task.Yield();"
+        result = _preprocess_async_await(csharp)
+        assert "task.wait()" in result
+
+    def test_await_generic_stripped(self):
+        from converter.code_transpiler import _preprocess_async_await
+        csharp = "var result = await SomeAsyncMethod();"
+        result = _preprocess_async_await(csharp)
+        assert "await" not in result
+        assert "SomeAsyncMethod()" in result
+
+    def test_async_void_stripped(self):
+        from converter.code_transpiler import _preprocess_async_await
+        csharp = "async void OnButtonClick() {"
+        result = _preprocess_async_await(csharp)
+        assert "async" not in result
+        assert "void" not in result
+        assert "OnButtonClick" in result
+
+
+class TestConditionalCompilation:
+    """Tests for #if UNITY_EDITOR stripping."""
+
+    def test_strip_unity_editor_block(self):
+        from converter.code_transpiler import _preprocess_conditional_compilation
+        csharp = """int x = 1;
+#if UNITY_EDITOR
+int editorOnly = 2;
+Debug.Log("editor");
+#endif
+int y = 3;"""
+        result = _preprocess_conditional_compilation(csharp)
+        assert "editorOnly" not in result
+        assert "x = 1" in result
+        assert "y = 3" in result
+
+    def test_keep_else_block(self):
+        from converter.code_transpiler import _preprocess_conditional_compilation
+        csharp = """#if UNITY_EDITOR
+EditorDoSomething();
+#else
+RuntimeDoSomething();
+#endif"""
+        result = _preprocess_conditional_compilation(csharp)
+        assert "EditorDoSomething" not in result
+        assert "RuntimeDoSomething" in result
+
+    def test_nested_ifdefs(self):
+        from converter.code_transpiler import _preprocess_conditional_compilation
+        csharp = """#if UNITY_EDITOR
+#if UNITY_EDITOR_WIN
+WinOnly();
+#endif
+EditorCode();
+#endif
+RuntimeCode();"""
+        result = _preprocess_conditional_compilation(csharp)
+        assert "WinOnly" not in result
+        assert "EditorCode" not in result
+        assert "RuntimeCode" in result
+
+    def test_negated_ifdef_keeps_block(self):
+        from converter.code_transpiler import _preprocess_conditional_compilation
+        csharp = """Begin();
+#if !UNITY_EDITOR
+RuntimeCode();
+#else
+EditorCode();
+#endif
+End();"""
+        result = _preprocess_conditional_compilation(csharp)
+        assert "RuntimeCode" in result
+        assert "EditorCode" not in result
+        assert "Begin" in result
+        assert "End" in result
+
+    def test_keep_unknown_symbols(self):
+        from converter.code_transpiler import _preprocess_conditional_compilation
+        csharp = """#if MY_CUSTOM_FLAG
+CustomCode();
+#endif"""
+        result = _preprocess_conditional_compilation(csharp)
+        assert "CustomCode" in result
+
+
 class TestPropertyBodies:
     def test_simple_getter(self):
         from converter.code_transpiler import _preprocess_multiline_constructs

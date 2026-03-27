@@ -216,13 +216,114 @@ def _preprocess_multiline_constructs(source: str) -> str:
     Handles: multi-line enums, property get/set bodies, out parameters,
     yield return, null-conditional chains, is-type patterns.
     """
+    source = _preprocess_conditional_compilation(source)
     source = _preprocess_multiline_enums(source)
     source = _preprocess_property_bodies(source)
     source = _preprocess_out_params(source)
     source = _preprocess_yield_return(source)
     source = _preprocess_null_conditional(source)
     source = _preprocess_is_type_check(source)
+    source = _preprocess_async_await(source)
     return source
+
+
+def _preprocess_conditional_compilation(source: str) -> str:
+    """Strip #if UNITY_EDITOR / #if UNITY_STANDALONE blocks entirely.
+
+    These blocks contain editor-only or platform-specific code that won't
+    work in Roblox. We keep the #else/#elif content (if any) as fallback.
+    """
+    # Symbols that should be stripped (editor/platform-specific)
+    strip_symbols = {
+        "UNITY_EDITOR", "UNITY_EDITOR_WIN", "UNITY_EDITOR_OSX",
+        "UNITY_STANDALONE", "UNITY_STANDALONE_WIN", "UNITY_STANDALONE_OSX",
+        "UNITY_ANDROID", "UNITY_IOS", "UNITY_WEBGL",
+        "UNITY_PS4", "UNITY_PS5", "UNITY_XBOXONE", "UNITY_SWITCH",
+        "DEBUG", "DEVELOPMENT_BUILD",
+    }
+
+    lines = source.split("\n")
+    result = []
+    skip_depth = 0  # depth of nested #if blocks we're skipping
+    # Stack tracks whether each nesting level has a "skip else" flag
+    # When we see #if !UNITY_EDITOR, we keep the block but need to skip #else
+    skip_else_stack: list[bool] = []
+
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped.startswith("#if ") or stripped.startswith("#if\t"):
+            raw_symbol = stripped[4:].strip()
+            negated = raw_symbol.startswith("!")
+            symbol = raw_symbol.lstrip("!").strip()
+
+            if skip_depth > 0:
+                # Already skipping — increase depth
+                skip_depth += 1
+                skip_else_stack.append(False)
+                continue
+
+            if symbol in strip_symbols:
+                if negated:
+                    # #if !UNITY_EDITOR → keep block, skip #else
+                    skip_else_stack.append(True)  # mark: skip the else
+                    continue
+                else:
+                    # #if UNITY_EDITOR → skip block, keep #else
+                    skip_depth = 1
+                    skip_else_stack.append(False)
+                    continue
+
+            # Keep #if blocks for unknown symbols (comment them)
+            skip_else_stack.append(False)
+            result.append(line)
+            continue
+
+        if stripped == "#else":
+            if skip_depth == 1:
+                # We were skipping the #if block, now keep the #else content
+                skip_depth = 0
+                continue
+            if skip_depth > 1:
+                continue
+            # Check if we need to skip the else (negated #if)
+            if skip_else_stack and skip_else_stack[-1]:
+                skip_depth = 1
+                continue
+            result.append(line)
+            continue
+
+        if stripped.startswith("#elif"):
+            if skip_depth == 1:
+                # Treat as end of stripped block, keep elif content
+                skip_depth = 0
+                continue
+            if skip_depth > 1:
+                continue
+            # Negated blocks: skip elif too
+            if skip_else_stack and skip_else_stack[-1]:
+                skip_depth = 1
+                continue
+            result.append(line)
+            continue
+
+        if stripped == "#endif":
+            if skip_depth > 0:
+                skip_depth -= 1
+                if skip_else_stack:
+                    skip_else_stack.pop()
+                continue
+            if skip_else_stack:
+                skip_else_stack.pop()
+            # Don't add the #endif line to output
+            continue
+
+        if skip_depth > 0:
+            continue
+
+        result.append(line)
+
+    return "\n".join(result)
 
 
 def _preprocess_multiline_enums(source: str) -> str:
@@ -447,6 +548,46 @@ def _preprocess_is_type_check(source: str) -> str:
         r'typeof(\1) == "\2"',
         source,
     )
+    return source
+
+
+def _preprocess_async_await(source: str) -> str:
+    """Convert C# async/await patterns to Luau task.spawn equivalents.
+
+    async Task MethodName() → function MethodName()
+    async void MethodName() → function MethodName()
+    await Task.Delay(ms) → task.wait(ms/1000)
+    await Task.Yield() → task.wait()
+    await someTask → someTask (strip await, it's already sync in Luau)
+    """
+    # Strip 'async' keyword from method declarations
+    source = re.sub(r'\basync\s+Task(?:<\w+>)?\s+', '', source)
+    source = re.sub(r'\basync\s+void\s+', '', source)
+    source = re.sub(r'\basync\s+', '', source)
+
+    # await Task.Delay(ms) → task.wait(ms/1000)
+    def _convert_delay(m: re.Match) -> str:
+        ms = m.group(1).strip()
+        try:
+            val = float(ms)
+            return f"task.wait({val / 1000})"
+        except ValueError:
+            return f"task.wait({ms} / 1000)"
+
+    source = re.sub(r'\bawait\s+Task\.Delay\((.+?)\)', _convert_delay, source)
+
+    # await Task.Yield() → task.wait()
+    source = re.sub(r'\bawait\s+Task\.Yield\(\)', 'task.wait()', source)
+
+    # await UniTask.Delay(ms) → task.wait(ms/1000)
+    source = re.sub(r'\bawait\s+UniTask\.Delay\((.+?)\)', _convert_delay, source)
+
+    # await UniTask.Yield() → task.wait()
+    source = re.sub(r'\bawait\s+UniTask\.Yield\(\)', 'task.wait()', source)
+
+    # Generic await expr → expr (strip await keyword)
+    source = re.sub(r'\bawait\s+', '', source)
+
     return source
 
 

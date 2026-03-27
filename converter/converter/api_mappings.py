@@ -146,10 +146,10 @@ API_CALL_MAP: dict[str, str] = {
     "Vector3.Angle": "math.acos",
     "Vector3.MoveTowards": ":Lerp",
     "Vector3.ClampMagnitude": ".Unit",
-    "Vector3.SignedAngle": "-- SignedAngle: compute via atan2(cross.Y, dot)",
-    "Vector3.ProjectOnPlane": "-- ProjectOnPlane: v - normal * v:Dot(normal)",
-    "Vector3.Project": "-- Project: use dot product projection",
-    "Vector3.Reflect": "-- Reflect: d - 2 * n:Dot(d) * n",
+    "Vector3.SignedAngle": "vec3SignedAngle(",  # handled by UTILITY_FUNCTIONS
+    "Vector3.ProjectOnPlane": "vec3ProjectOnPlane(",  # handled by UTILITY_FUNCTIONS
+    "Vector3.Project": "vec3Project(",  # handled by UTILITY_FUNCTIONS
+    "Vector3.Reflect": "vec3Reflect(",  # handled by UTILITY_FUNCTIONS
     "Vector3.SmoothDamp": ":Lerp",
     "new Vector3": "Vector3.new",
     # -- Vector2 --
@@ -215,6 +215,7 @@ API_CALL_MAP: dict[str, str] = {
     "AudioSource.loop": ".Looped",
     "AudioSource.isPlaying": ".IsPlaying",
     # -- Animation --
+    "Animator.StringToHash": "-- StringToHash: use string name directly as attribute key",
     "Animator.SetBool": ":SetAttribute",
     "Animator.SetFloat": ":SetAttribute",
     "Animator.SetInteger": ":SetAttribute",
@@ -336,7 +337,13 @@ API_CALL_MAP: dict[str, str] = {
     ".Min(": "linqMin(",  # handled by UTILITY_FUNCTIONS
     ".Count(": "linqCount(",  # handled by UTILITY_FUNCTIONS
     ".Distinct()": "linqDistinct(",  # handled by UTILITY_FUNCTIONS
-    ".GroupBy(": "-- GroupBy: use manual dictionary grouping with for loop",
+    ".GroupBy(": "linqGroupBy(",  # handled by UTILITY_FUNCTIONS
+    ".SelectMany(": "linqSelectMany(",  # handled by UTILITY_FUNCTIONS
+    ".Take(": "linqTake(",  # handled by UTILITY_FUNCTIONS
+    ".Skip(": "linqSkip(",  # handled by UTILITY_FUNCTIONS
+    ".Aggregate(": "linqAggregate(",  # handled by UTILITY_FUNCTIONS
+    ".Last(": "linqLast(",  # handled by UTILITY_FUNCTIONS
+    ".LastOrDefault(": "linqLastOrDefault(",  # handled by UTILITY_FUNCTIONS
     # -- Cinemachine --
     "CinemachineVirtualCamera": "-- CinemachineVirtualCamera: configure workspace.CurrentCamera",
     "CinemachineBrain": "-- CinemachineBrain: use workspace.CurrentCamera",
@@ -830,5 +837,96 @@ local function linqDistinct(tbl)
 \t\tend
 \tend
 \treturn result
+end""",
+    "linqGroupBy": """\
+local function linqGroupBy(tbl, keySelector)
+\tlocal groups = {}
+\tlocal order = {}
+\tfor _, v in tbl do
+\t\tlocal key = keySelector(v)
+\t\tif not groups[key] then
+\t\t\tgroups[key] = {}
+\t\t\ttable.insert(order, key)
+\t\tend
+\t\ttable.insert(groups[key], v)
+\tend
+\tlocal result = {}
+\tfor _, key in order do
+\t\ttable.insert(result, {Key = key, Values = groups[key]})
+\tend
+\treturn result
+end""",
+    "linqSelectMany": """\
+local function linqSelectMany(tbl, selector)
+\tlocal result = {}
+\tfor _, v in tbl do
+\t\tlocal inner = selector(v)
+\t\tfor _, item in inner do
+\t\t\ttable.insert(result, item)
+\t\tend
+\tend
+\treturn result
+end""",
+    "linqTake": """\
+local function linqTake(tbl, count)
+\tlocal result = {}
+\tfor i = 1, math.min(count, #tbl) do
+\t\ttable.insert(result, tbl[i])
+\tend
+\treturn result
+end""",
+    "linqSkip": """\
+local function linqSkip(tbl, count)
+\tlocal result = {}
+\tfor i = count + 1, #tbl do
+\t\ttable.insert(result, tbl[i])
+\tend
+\treturn result
+end""",
+    "linqAggregate": """\
+local function linqAggregate(tbl, seed, func)
+\tlocal acc = seed
+\tfor _, v in tbl do
+\t\tacc = func(acc, v)
+\tend
+\treturn acc
+end""",
+    "linqLast": """\
+local function linqLast(tbl, predicate)
+\tif not predicate then return tbl[#tbl] end
+\tfor i = #tbl, 1, -1 do
+\t\tif predicate(tbl[i]) then return tbl[i] end
+\tend
+\terror("Sequence contains no matching element")
+end""",
+    "linqLastOrDefault": """\
+local function linqLastOrDefault(tbl, predicate)
+\tif not predicate then return tbl[#tbl] end
+\tfor i = #tbl, 1, -1 do
+\t\tif predicate(tbl[i]) then return tbl[i] end
+\tend
+\treturn nil
+end""",
+    # Vector3 utility functions
+    "vec3SignedAngle": """\
+local function vec3SignedAngle(from, to, axis)
+\tlocal cross = from:Cross(to)
+\tlocal angle = math.atan2(cross.Magnitude, from:Dot(to))
+\tif cross:Dot(axis) < 0 then angle = -angle end
+\treturn math.deg(angle)
+end""",
+    "vec3ProjectOnPlane": """\
+local function vec3ProjectOnPlane(vector, planeNormal)
+\treturn vector - planeNormal * vector:Dot(planeNormal)
+end""",
+    "vec3Project": """\
+local function vec3Project(vector, onNormal)
+\tlocal sqrMag = onNormal:Dot(onNormal)
+\tif sqrMag < 1e-15 then return Vector3.zero end
+\treturn onNormal * (vector:Dot(onNormal) / sqrMag)
+end""",
+    "vec3Reflect": """\
+local function vec3Reflect(direction, normal)
+\treturn direction - 2 * direction:Dot(normal) * normal
 end""",
 }

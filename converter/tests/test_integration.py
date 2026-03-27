@@ -479,12 +479,67 @@ class TestLuauValidator:
         fixed, fixes = validate_and_fix("test", source)
         assert "DISABLED" in fixed
 
+    def test_runtime_modulescript_creation_disabled(self):
+        """Instance.new('ModuleScript') with .Source should be fully commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = (
+            'local m = Instance.new("ModuleScript")\n'
+            'm.Name = "Config"\n'
+            'm.Source = [[\n'
+            'local Config = {}\n'
+            'return Config\n'
+            ']]\n'
+            'm.Parent = game.ReplicatedStorage\n'
+            'print("done")'
+        )
+        fixed, fixes = validate_and_fix("test", source)
+        assert "cannot create scripts at runtime" in fixed
+        # The closing ]] should be commented out, not left dangling
+        for line in fixed.split("\n"):
+            stripped = line.strip()
+            if stripped == "]]":
+                assert False, "Dangling ]] found — should be commented out"
+        # The print after the block should remain
+        assert 'print("done")' in fixed
+
     def test_valid_code_unchanged(self):
         from converter.luau_validator import validate_and_fix
         source = "local x = 1\nprint(x)"
         fixed, fixes = validate_and_fix("test", source)
         assert fixed == source
         assert len(fixes) == 0
+
+    def test_fix_string_to_hash(self):
+        """Animator.StringToHash('Name') should be replaced with just 'Name'."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local hash = Animator.StringToHash("Running")\nmodel:SetAttribute(hash, true)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'local hash = "Running"' in fixed
+        assert "StringToHash" not in fixed
+
+    def test_fix_deprecated_body_movers(self):
+        """BodyVelocity/BodyGyro should be replaced with modern equivalents."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local bv = Instance.new("BodyVelocity")\nlocal bg = Instance.new("BodyGyro")'
+        fixed, fixes = validate_and_fix("test", source)
+        assert "LinearVelocity" in fixed
+        assert "AlignOrientation" in fixed
+        assert "BodyVelocity" not in fixed.replace("-- was BodyVelocity", "")
+        assert "BodyGyro" not in fixed.replace("-- was BodyGyro", "")
+
+    def test_fix_not_equality_precedence(self):
+        """'not x == y' should become 'x ~= y' (Luau precedence bug)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if not message:sub(1, 1) == "/" then return end'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'message:sub(1, 1) ~= "/"' in fixed
+
+    def test_fix_not_inequality_precedence(self):
+        """'not x ~= y' should become 'x == y'."""
+        from converter.luau_validator import validate_and_fix
+        source = "if not value ~= nil then return end"
+        fixed, _ = validate_and_fix("test", source)
+        assert "value == nil" in fixed
 
     def test_fix_semicolons(self):
         from converter.luau_validator import validate_and_fix
