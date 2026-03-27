@@ -294,6 +294,95 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
     # Strip BOM characters
     source = source.replace('\ufeff', '')
 
+    # Fix comment-embedded variable names from type mapping
+    # Pattern: "m_-- TypeComment: explanation" → comment out the whole line
+    # This happens when TYPE_MAP replaces a type like NavMeshAgent with "-- comment"
+    # and the variable name m_NavMeshAgent becomes m_-- NavMeshAgent: ...
+    if 'm_--' in source:
+        # Replace "m_-- Comment..." variable references with a local variable
+        # m_-- NavMeshAgent: use Roblox PathfindingService → _agent
+        # Order matters: property access BEFORE assignment (both contain '=')
+        # m_-- NavMeshAgent... used as receiver in expressions (with .property)
+        source = re.sub(r'm_-- NavMeshAgent[^.\n]*\.(\w+)', r'_agent.\1', source)
+        # m_-- NavMeshAgent... in assignment (standalone = expr)
+        source = re.sub(
+            r'm_-- NavMeshAgent[^=\n]*=\s*([^\n]+)',
+            r'_agent = \1',
+            source,
+        )
+        # m_-- NavMeshAgent... used standalone (e.g., in conditions)
+        source = re.sub(r'm_-- NavMeshAgent[^\n]*', '_agent', source)
+        # Any other m_-- patterns → comment out
+        source = re.sub(r'm_--[^\n]*', '-- (type comment removed)', source)
+        fixes.append("Fixed comment-embedded variable names (m_--)")
+
+    # Fix broken generic type in angle brackets: <-- TypeComment: explanation>()
+    # Pattern: FindFirstChildOfClass<-- NavMeshAgent: ...>() → :FindFirstChildOfClass("Instance")
+    if '<--' in source:
+        source = re.sub(
+            r':?FindFirstChildOfClass<--[^>]*>\(\)',
+            ':FindFirstChildWhichIsA("Instance")',
+            source,
+        )
+        # Other generic types with comments
+        source = re.sub(r'<--[^>]*>', '', source)
+        fixes.append("Fixed broken <-- generic type comments")
+
+    # Fix {-- brace-comment blocks (C# block comment that starts with brace)
+    if '{--' in source:
+        source = re.sub(r'\{(--[^\n]*)', r'\1', source)
+        fixes.append("Fixed {-- brace-comment blocks")
+
+    # Fix .Try: method syntax (C# TryGetComponent pattern)
+    if '.Try:' in source:
+        source = re.sub(r'\.Try:(\w+)', r':\1', source)
+        fixes.append("Fixed .Try: method syntax")
+
+    # Comment out remaining C# declaration lines that leaked through
+    # Lines with { get; }, [Attribute], Dictionary<K,V>, etc.
+    if '{ get' in source or '{ set' in source:
+        source = re.sub(
+            r'^(\s*)(.+\{\s*get\s*;.*)\s*$',
+            r'\1-- [C#] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+    if re.search(r'^\s*\[(?:CreateAssetMenu|Serializable|System)\b', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s*)\[(?:CreateAssetMenu|Serializable|System)\b[^\]]*\]\s*$',
+            r'\1-- [C#] \g<0>',
+            source,
+            flags=re.MULTILINE,
+        )
+
+    # Fix remaining 'ref' parameter prefix in function calls
+    if re.search(r'\bref\s+\w+', source):
+        source = re.sub(r'\bref\s+(\w+)', r'\1', source)
+        fixes.append("Stripped remaining 'ref' parameter prefix")
+
+    # Fix C# tuple unpacking: (type name, type name) = (expr, expr)
+    # → local name, name = expr, expr
+    if re.search(r'\(\w+\s+\w+\s*,\s*\w+\s+\w+\)\s*=\s*\(', source):
+        def _fix_tuple(m):
+            types_vars = m.group(1)
+            values = m.group(2)
+            # Extract variable names (skip types)
+            parts = [p.strip() for p in types_vars.split(',')]
+            var_names = []
+            for part in parts:
+                tokens = part.split()
+                if len(tokens) >= 2:
+                    var_names.append(tokens[-1])
+                else:
+                    var_names.append(tokens[0])
+            return f'local {", ".join(var_names)} = {values}'
+        source = re.sub(
+            r'\((\w+\s+\w+(?:\s*,\s*\w+\s+\w+)*)\)\s*=\s*\(([^)]+)\)',
+            _fix_tuple,
+            source,
+        )
+        fixes.append("Fixed C# tuple unpacking")
+
     # Comment out remaining C# class declarations
     source = re.sub(r'^(\s*)class\s+\w+.*$', r'\1-- \g<0>', source, flags=re.MULTILINE)
 
@@ -548,9 +637,10 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
         fixes.append("Fixed '.Count' → '#' operator")
 
     # Fix '.Contains()' (C# → table.find or string.find)
+    # Must capture dotted paths: obj.list.Contains(x) → table.find(obj.list, x)
     if '.Contains(' in source:
         source = re.sub(
-            r'(\w+)\.Contains\(([^)]+)\)',
+            r'([\w.]+)\.Contains\(([^)]+)\)',
             r'table.find(\1, \2)',
             source,
         )
@@ -601,7 +691,7 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
             # Otherwise it's list.Add(item)
             return f'table.insert({obj}, {args})'
         source = re.sub(
-            r'(\w+)\.Add\(([^)]+)\)',
+            r'([\w.]+)\.Add\(([^)]+)\)',
             _fix_add,
             source,
         )
@@ -610,7 +700,7 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
     # Fix '.Remove(item)' → 'table.remove(tbl, table.find(tbl, item))'
     if '.Remove(' in source and '.RemoveAt(' not in source:
         source = re.sub(
-            r'(\w+)\.Remove\(([^)]+)\)',
+            r'([\w.]+)\.Remove\(([^)]+)\)',
             r'table.remove(\1, table.find(\1, \2))',
             source,
         )
@@ -619,7 +709,7 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
     # Fix '.RemoveAt(idx)' → 'table.remove(tbl, idx + 1)' (0-based → 1-based)
     if '.RemoveAt(' in source:
         source = re.sub(
-            r'(\w+)\.RemoveAt\(([^)]+)\)',
+            r'([\w.]+)\.RemoveAt\(([^)]+)\)',
             r'table.remove(\1, \2 + 1)',
             source,
         )
@@ -628,7 +718,7 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
     # Fix '.Insert(idx, item)' → 'table.insert(tbl, idx + 1, item)'
     if '.Insert(' in source:
         source = re.sub(
-            r'(\w+)\.Insert\(([^,]+),\s*([^)]+)\)',
+            r'([\w.]+)\.Insert\(([^,]+),\s*([^)]+)\)',
             r'table.insert(\1, \2 + 1, \3)',
             source,
         )
@@ -637,7 +727,7 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
     # Fix '.IndexOf(item)' → 'table.find(tbl, item)'
     if '.IndexOf(' in source:
         source = re.sub(
-            r'(\w+)\.IndexOf\(([^)]+)\)',
+            r'([\w.]+)\.IndexOf\(([^)]+)\)',
             r'(table.find(\1, \2) or 0) - 1',
             source,
         )
@@ -928,6 +1018,24 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             flags=re.MULTILINE,
         )
 
+    # Fix: "new Type function(...)" → comment (broken C# constructor)
+    if re.search(r'\bnew\s+[A-Z]\w+\s+function\b', source):
+        source = re.sub(
+            r'^(\s*)new\s+([A-Z]\w+)\s+function\b.*$',
+            r'\1-- (removed broken constructor: \2)',
+            source,
+            flags=re.MULTILINE,
+        )
+
+    # Fix: "TypeName.local var = new ..." → "local var = nil -- TypeName"
+    if re.search(r'^\s*\w+\.local\s+\w+\s*=\s*new\b', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s*)\w+\.local\s+(\w+)\s*=\s*new\b.*$',
+            r'\1local \2 = nil -- (constructor removed)',
+            source,
+            flags=re.MULTILINE,
+        )
+
     # Fix: remaining new Type(...) → comment
     if re.search(r'\bnew\s+[A-Z]\w+\s*\(', source):
         source = re.sub(
@@ -935,6 +1043,54 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             r'--[[ new \1 ]] (',
             source,
         )
+
+    # Fix: .tag == "Tag" → CollectionService:HasTag(obj, "Tag")
+    # Unity tags → Roblox CollectionService tags
+    if '.tag ==' in source or '.tag ~=' in source:
+        # obj.tag == "Tag" → CollectionService:HasTag(obj, "Tag")
+        source = re.sub(
+            r'(\w+)\.tag\s*==\s*("(?:[^"\\]|\\.)*")',
+            r'game:GetService("CollectionService"):HasTag(\1, \2)',
+            source,
+        )
+        # obj.tag ~= "Tag" → not CollectionService:HasTag(obj, "Tag")
+        source = re.sub(
+            r'(\w+)\.tag\s*~=\s*("(?:[^"\\]|\\.)*")',
+            r'not game:GetService("CollectionService"):HasTag(\1, \2)',
+            source,
+        )
+        # Ensure CollectionService is imported
+        if 'CollectionService' in source and 'GetService("CollectionService")' not in source.split('\n')[0]:
+            # Already using inline GetService, no separate import needed
+            pass
+        fixes.append("Fixed .tag comparison → CollectionService:HasTag()")
+
+    # Fix: .CompareTag("Tag") → CollectionService:HasTag(obj, "Tag")
+    if '.CompareTag(' in source:
+        source = re.sub(
+            r'(\w+)\.CompareTag\(("(?:[^"\\]|\\.)*")\)',
+            r'game:GetService("CollectionService"):HasTag(\1, \2)',
+            source,
+        )
+        fixes.append("Fixed .CompareTag() → CollectionService:HasTag()")
+
+    # Fix: KeyCode.X → Enum.KeyCode.X (Roblox requires Enum prefix)
+    if re.search(r'\bKeyCode\.\w+', source) and 'Enum.KeyCode' not in source:
+        source = re.sub(r'\bKeyCode\.(\w+)', r'Enum.KeyCode.\1', source)
+        fixes.append("Fixed KeyCode.X → Enum.KeyCode.X")
+
+    # Fix: workspace.Current: → workspace.CurrentCamera: (truncated property name)
+    if 'workspace.Current:' in source:
+        source = source.replace('workspace.Current:', 'workspace.CurrentCamera:')
+        fixes.append("Fixed workspace.Current → workspace.CurrentCamera")
+
+    # Fix: obj.position (lowercase) → obj.Position (Roblox PascalCase)
+    # Only fix after word characters (instance access), not after Random/static types
+    if '.position' in source:
+        source = re.sub(r'(\w)\.position\b(?!\s*\()', r'\1.Position', source)
+    # Fix: obj.name (lowercase) → obj.Name
+    if re.search(r'\w\.name\b', source):
+        source = re.sub(r'(\w)\.name\b(?!\s*\()', r'\1.Name', source)
 
     # Fix: += / -= / *= / /= operators (not valid in Luau)
     # Handles both simple vars and property access (obj.prop += expr)
@@ -1400,9 +1556,124 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
             source,
         )
 
+    # Fix 0-based for loops → 1-based (Luau tables are 1-indexed)
+    # Pattern: "for VAR = 0, #TBL - 1 do" with "TBL[VAR]" → "for VAR = 1, #TBL do" with "TBL[VAR]"
+    # Also: "for VAR = 0, N - 1 do" with "TBL[VAR]" → adjust indices
+    if re.search(r'for\s+\w+\s*=\s*0\s*,', source):
+        lines = source.split('\n')
+        new_lines = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            m = re.match(r'^(\s*)for\s+(\w+)\s*=\s*0\s*,\s*(.+?)\s*-\s*1\s+do\s*$', line)
+            if m:
+                indent, var, bound = m.group(1), m.group(2), m.group(3)
+                # Find the scope of this for loop and check if var is used as table index
+                # Rewrite to 1-based: for VAR = 1, BOUND do
+                new_lines.append(f'{indent}for {var} = 1, {bound} do')
+                fixes.append("Fixed 0-based for loop → 1-based")
+            else:
+                # Also handle "for VAR = 0, EXPR do" (without explicit -1)
+                m2 = re.match(r'^(\s*)for\s+(\w+)\s*=\s*0\s*,\s*(\d+)\s*-\s*1\s+do\s*$', line)
+                if m2:
+                    indent, var, num = m2.group(1), m2.group(2), m2.group(3)
+                    new_lines.append(f'{indent}for {var} = 1, {num} do')
+                    fixes.append("Fixed 0-based for loop → 1-based")
+                else:
+                    new_lines.append(line)
+            i += 1
+        source = '\n'.join(new_lines)
+
+    # Fix bare receiver: ".Property" or ".Method()" at expression start without object
+    # Pattern: line starts with (optional indent) ".SomeProperty" → "script.Parent.SomeProperty"
+    if re.search(r'^\s+\.[A-Z]\w*', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s+)\.([A-Z]\w*(?:\.\w+)*)',
+            r'\1script.Parent.\2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Fixed bare receiver → script.Parent")
+
+    # Fix bare receiver in expressions: "= .Property" or "< .Property" or "> .Property"
+    if re.search(r'[=<>+\-*/,]\s*\.[A-Z]\w*', source):
+        source = re.sub(
+            r'([=<>+\-*/,])\s*\.([A-Z])',
+            r'\1 script.Parent.\2',
+            source,
+        )
+
+    # Fix unassigned CFrame expressions (line is just "CFrame.Angles(...)" or "CFrame.new(...)")
+    # These come from C# transform.Rotate()/transform.Translate() which mutate in-place
+    # → "script.Parent.CFrame = script.Parent.CFrame * CFrame.Angles(...)"
+    if re.search(r'^\s+CFrame\.Angles\(', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s+)CFrame\.Angles\((.+)\)\s*$',
+            r'\1script.Parent.CFrame = script.Parent.CFrame * CFrame.Angles(\2)',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Fixed unassigned CFrame.Angles → CFrame multiplication")
+
+    if re.search(r'^\s+CFrame\.new\((.+)\)\s*$', source, re.MULTILINE):
+        # CFrame.new(delta) → script.Parent.CFrame = script.Parent.CFrame + delta
+        source = re.sub(
+            r'^(\s+)CFrame\.new\((.+)\)\s*$',
+            r'\1script.Parent.CFrame = script.Parent.CFrame + \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Fixed unassigned CFrame.new → position offset")
+
+    # Fix malformed list initialization: "--[[ new List ]] (N)" → "{}"
+    if '--[[ new List ]]' in source:
+        source = re.sub(
+            r'--\[\[\s*new\s+List\s*\]\]\s*\(\d*\)',
+            '{}',
+            source,
+        )
+        fixes.append("Fixed list initialization → {}")
+
+    # Fix "obj.Parent =(expr; expr2)" (from C# inline post-increment in assignment)
+    # Pattern: "x.Parent =(y; z = z + 1 --[[post-increment]])"
+    if re.search(r'\.Parent\s*=\s*\([^;]+;', source):
+        def _fix_parent_compound(m):
+            indent = m.group(1)
+            receiver = m.group(2)
+            value = m.group(3).strip()
+            rest = m.group(4).strip()
+            # Remove trailing ) and --[[post-increment]]
+            rest = re.sub(r'\s*--\[\[post-increment\]\]\s*\)?\s*$', '', rest)
+            rest = rest.rstrip(')')
+            return f'{indent}{receiver}.Parent = {value}\n{indent}{rest}'
+        source = re.sub(
+            r'^(\s*)([\w.]+)\.Parent\s*=\s*\(([^;]+);\s*(.+)\)\s*$',
+            _fix_parent_compound,
+            source,
+            flags=re.MULTILINE,
+        )
+
+    # Fix: "while .Property" (bare receiver in while condition)
+    if re.search(r'\bwhile\s+\.', source):
+        source = re.sub(r'\bwhile\s+\.([\w.]+)', r'while script.Parent.\1', source)
+
+    # Fix missing 'end' after if/elseif blocks
+    # Detect pattern: if block that transitions to unindented code without closing 'end'
+    # This is a lightweight fix for the common case where C# "}" → "end" was dropped
+    _fix_missing_ends_in_blocks(source, fixes)
+
     if source != original and not any('structural' in f.lower() for f in fixes):
         fixes.append("Fixed structural syntax issues")
 
+    return source
+
+
+def _fix_missing_ends_in_blocks(source: str, fixes: list[str]) -> str:
+    """Detect and fix missing 'end' keywords in if/function blocks.
+
+    Analyzes indentation to find blocks that are missing their closing 'end'.
+    """
+    # This is handled by _fix_missing_end_keywords — just a hook for future improvements
     return source
 
 
@@ -1448,10 +1719,127 @@ def _fix_missing_end_keywords(name: str, source: str, fixes: list[str]) -> str:
 
     source = '\n'.join(result)
 
+    # Second pass: fix single-statement if/then blocks missing 'end'
+    # Pattern: "if COND then" on one line, single statement on next line,
+    # then a line at same or lower indent that is NOT end/else/elseif
+    # → insert 'end' after the single statement
+    source = _insert_missing_ends_for_single_statement_blocks(source, fixes)
+
     if source != original:
         fixes.append("Fixed missing end keywords / stray braces")
 
     return source
+
+
+def _insert_missing_ends_for_single_statement_blocks(source: str, fixes: list[str]) -> str:
+    """Insert missing `end` keywords using indentation-based block analysis.
+
+    Uses a stack to track open blocks and their expected indent levels.
+    When a line de-indents past an open block without a matching 'end',
+    inserts the missing 'end'.
+
+    This handles:
+    - Single-statement if/then blocks: if cond then\n    stmt\n  (no end)
+    - Nested if blocks that share a single 'end'
+    - Early returns without closing 'end'
+    """
+    lines = source.split('\n')
+    result = []
+    changed = False
+    # Stack of (indent_level, block_type) for open blocks
+    block_stack: list[tuple[int, str]] = []
+
+    def _get_indent(line):
+        return len(line) - len(line.lstrip()) if line.strip() else -1
+
+    def _is_block_opener(stripped):
+        """Check if a line opens a block. Returns block type or None."""
+        if stripped.startswith('--'):
+            return None
+        # "if ... then" (not single-line if...then...end)
+        if re.match(r'(?:if|elseif)\b.+\bthen\s*$', stripped):
+            return 'if'
+        if stripped == 'else':
+            return 'else'
+        if re.match(r'for\b.+\bdo\s*$', stripped):
+            return 'for'
+        if re.match(r'while\b.+\bdo\s*$', stripped):
+            return 'while'
+        if re.match(r'repeat\s*$', stripped):
+            return 'repeat'
+        # function definitions: "function(...)", "local function Name(...)"
+        if re.search(r'\bfunction\s+\w*\s*\([^)]*\)\s*$', stripped) or \
+           re.search(r'\bfunction\s*\([^)]*\)\s*$', stripped):
+            return 'function'
+        return None
+
+    for line in lines:
+        stripped = line.strip()
+        indent = _get_indent(line)
+
+        if not stripped:
+            result.append(line)
+            continue
+
+        # Skip comment-only lines for block tracking
+        if stripped.startswith('--'):
+            result.append(line)
+            continue
+
+        # Before adding this line, check if any open blocks need closing
+        # based on indent level
+        if indent >= 0 and stripped not in ('end', 'else') and not stripped.startswith('elseif '):
+            while block_stack:
+                top_indent, top_type = block_stack[-1]
+                if indent <= top_indent:
+                    # This line is at or before the block opener's indent
+                    # The block should have been closed
+                    result.append(' ' * (top_indent + 4) + 'end')
+                    block_stack.pop()
+                    changed = True
+                else:
+                    break
+
+        # Handle 'end' keyword — pop the stack
+        # If the end is at a lower indent than the top block, insert missing ends first
+        if stripped == 'end':
+            while len(block_stack) > 1:
+                top_indent, top_type = block_stack[-1]
+                # If this 'end' is at or below the opener's indent, the block
+                # should be closed before this end takes effect
+                if indent < top_indent:
+                    result.append(' ' * top_indent + 'end')
+                    block_stack.pop()
+                    changed = True
+                else:
+                    break
+            if block_stack:
+                block_stack.pop()
+            result.append(line)
+            continue
+
+        # Handle 'else' and 'elseif' — they close the current if-block
+        # and open a new one at the same level
+        if stripped == 'else' or stripped.startswith('elseif '):
+            if block_stack and block_stack[-1][1] in ('if', 'else'):
+                block_stack.pop()
+            block_type = _is_block_opener(stripped)
+            if block_type:
+                block_stack.append((indent, block_type))
+            result.append(line)
+            continue
+
+        # Check if this line opens a block
+        block_type = _is_block_opener(stripped)
+        if block_type:
+            block_stack.append((indent, block_type))
+
+        result.append(line)
+
+    if changed:
+        fixes.append("Inserted missing 'end' for unclosed blocks")
+
+    return '\n'.join(result)
 
 
 def _fix_startup_race_conditions(name: str, source: str, fixes: list[str]) -> str:

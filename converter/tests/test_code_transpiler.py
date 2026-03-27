@@ -513,7 +513,9 @@ class TestValidatorStructuralFixes:
         from converter.luau_validator import validate_and_fix
         source = 'function(otherPart)\n    if other.tag == "Player" then\n    end\nend'
         fixed, _ = validate_and_fix("test", source)
-        assert 'otherPart.tag' in fixed
+        # 'other' should be replaced with 'otherPart', and .tag → CollectionService:HasTag
+        assert 'otherPart' in fixed
+        assert 'HasTag' in fixed
 
     def test_dot_to_colon_playoneshot(self):
         from converter.luau_validator import validate_and_fix
@@ -1510,3 +1512,292 @@ class TestScriptToPartBinding:
         """The _bind_scripts_to_parts method should exist and be callable."""
         from converter.pipeline import Pipeline
         assert hasattr(Pipeline, '_bind_scripts_to_parts')
+
+
+class TestZeroBasedLoopFix:
+    """Test 0-based for loop → 1-based conversion."""
+
+    def test_simple_zero_based_loop(self):
+        from converter.luau_validator import validate_and_fix
+        source = '    for i = 0, #items - 1 do\n        items[i] = 1\n    end'
+        fixed, fixes = validate_and_fix("test", source)
+        assert 'for i = 1, #items do' in fixed
+
+    def test_numeric_zero_based_loop(self):
+        from converter.luau_validator import validate_and_fix
+        source = '    for i = 0, 4 - 1 do\n        arr[i] = 1\n    end'
+        fixed, fixes = validate_and_fix("test", source)
+        assert 'for i = 1, 4 do' in fixed
+
+    def test_preserves_non_zero_loop(self):
+        from converter.luau_validator import validate_and_fix
+        source = '    for i = 1, #items do\n        items[i] = 1\n    end'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'for i = 1, #items do' in fixed
+
+
+class TestBareReceiverFixes:
+    """Test bare receiver → script.Parent fixes."""
+
+    def test_bare_property_at_line_start(self):
+        from converter.luau_validator import validate_and_fix
+        source = '    .Position = Vector3.new(1, 2, 3)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'script.Parent.Position' in fixed
+
+    def test_bare_property_after_operator(self):
+        from converter.luau_validator import validate_and_fix
+        source = '    local x = .Position.y'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'script.Parent.Position' in fixed
+
+    def test_while_bare_receiver(self):
+        from converter.luau_validator import validate_and_fix
+        source = '    while .Position.y > 5 do\n        task.wait()\n    end'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'while script.Parent.Position.y' in fixed
+
+
+class TestUnassignedCFrameFix:
+    """Test unassigned CFrame expressions → proper mutations."""
+
+    def test_cframe_angles_standalone(self):
+        from converter.luau_validator import validate_and_fix
+        source = '        CFrame.Angles(Vector3.yAxis * dt * speed)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'script.Parent.CFrame = script.Parent.CFrame * CFrame.Angles(' in fixed
+
+    def test_cframe_new_standalone(self):
+        from converter.luau_validator import validate_and_fix
+        source = '        CFrame.new(-Vector3.yAxis / 2 * dt)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'script.Parent.CFrame = script.Parent.CFrame + ' in fixed
+
+    def test_cframe_angles_in_assignment_preserved(self):
+        from converter.luau_validator import validate_and_fix
+        source = '        local rot = CFrame.Angles(1, 2, 3)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'local rot = CFrame.Angles(' in fixed
+
+
+class TestKeyCodeFix:
+    """Test KeyCode.X → Enum.KeyCode.X conversion."""
+
+    def test_keycode_escape(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'if UserInputService:IsKeyDown(KeyCode.Escape) then'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'Enum.KeyCode.Escape' in fixed
+
+    def test_enum_keycode_not_doubled(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'if UserInputService:IsKeyDown(Enum.KeyCode.Escape) then'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'Enum.Enum.KeyCode' not in fixed
+
+    def test_multiple_keycodes(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'KeyCode.F1 KeyCode.F2 KeyCode.Space'
+        fixed, _ = validate_and_fix("test", source)
+        assert fixed.count('Enum.KeyCode') == 3
+
+
+class TestListInitFix:
+    """Test list initialization fix."""
+
+    def test_new_list_comment_to_table(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local items = --[[ new List ]] (4)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'local items = {}' in fixed
+
+
+class TestDottedPathContains:
+    """Test that dotted paths work correctly with .Contains() etc."""
+
+    def test_dotted_contains(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'player.hasItems.Contains(itemName)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'table.find(player.hasItems, itemName)' in fixed
+
+    def test_dotted_add(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'player.items.Add(item)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'table.insert(player.items, item)' in fixed
+
+
+class TestMissingEndInsertion:
+    """Test insertion of missing 'end' for single-statement if blocks."""
+
+    def test_if_return_missing_end(self):
+        from converter.luau_validator import validate_and_fix
+        source = '    if x then\n        return\n\n    y = 1'
+        fixed, _ = validate_and_fix("test", source)
+        # Should have 'end' between return and y = 1
+        lines = fixed.split('\n')
+        found_end_after_return = False
+        saw_return = False
+        for line in lines:
+            if 'return' in line:
+                saw_return = True
+            if saw_return and line.strip() == 'end':
+                found_end_after_return = True
+                break
+        assert found_end_after_return
+
+    def test_if_single_statement_missing_end(self):
+        from converter.luau_validator import validate_and_fix
+        source = '    if x > 5 then\n        x = 5\n\n    y = x + 1'
+        fixed, _ = validate_and_fix("test", source)
+        lines = fixed.split('\n')
+        found_end = False
+        for line in lines:
+            if line.strip() == 'end':
+                found_end = True
+                break
+        assert found_end
+
+
+class TestPositionCasingFix:
+    """Test .position → .Position PascalCase conversion."""
+
+    def test_position_lowercase(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local pos = obj.position'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'obj.Position' in fixed
+
+    def test_name_lowercase(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local n = part.name'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'part.Name' in fixed
+
+    def test_workspace_current_camera(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'workspace.Current:ScreenPointToRay(args)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'workspace.CurrentCamera:ScreenPointToRay' in fixed
+
+
+class TestCommentEmbeddedVarFix:
+    """Test fixing comment-embedded variable names from type mapping."""
+
+    def test_m_navmeshagent_assignment(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'm_-- NavMeshAgent: use Roblox PathfindingService = script.Parent:FindFirstChildOfClass()'
+        fixed, _ = validate_and_fix("test", source)
+        assert '_agent' in fixed
+        assert 'm_--' not in fixed
+
+    def test_m_navmeshagent_property_access(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'm_-- NavMeshAgent: use Roblox PathfindingService.speed = 5'
+        fixed, _ = validate_and_fix("test", source)
+        assert '_agent.speed' in fixed
+
+    def test_broken_generic_angle_bracket(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'x = script.Parent:FindFirstChildOfClass<-- NavMeshAgent: use Roblox PathfindingService>()'
+        fixed, _ = validate_and_fix("test", source)
+        assert '<--' not in fixed
+        assert 'FindFirstChildWhichIsA("Instance")' in fixed
+
+    def test_brace_comment_block(self):
+        from converter.luau_validator import validate_and_fix
+        source = '{--ignore damage if already dead\n    return\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert '{--' not in fixed
+        assert '--ignore' in fixed
+
+    def test_try_method_syntax(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'if obj.Try:FindFirstChild("x") then'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.Try:' not in fixed
+        assert ':FindFirstChild' in fixed
+
+    def test_ref_parameter_stripped(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'SetVelocity(ref velocity.x, input.x)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'ref ' not in fixed
+        assert 'velocity.x' in fixed
+
+    def test_tuple_unpacking(self):
+        from converter.luau_validator import validate_and_fix
+        source = '(float absVel, float absInput) = (math.abs(x), math.abs(y))'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'local absVel, absInput' in fixed
+        assert 'float' not in fixed
+
+
+class TestTagComparison:
+    """Test .tag == → CollectionService:HasTag() conversion."""
+
+    def test_tag_equals(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'if obj.tag == "Player" then'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'HasTag(obj, "Player")' in fixed
+        assert '.tag ==' not in fixed
+
+    def test_tag_not_equals(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'if obj.tag ~= "Enemy" then'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'not game:GetService("CollectionService"):HasTag(obj, "Enemy")' in fixed
+
+    def test_compare_tag(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'if obj.CompareTag("Player") then'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'HasTag(obj, "Player")' in fixed
+
+
+class TestBlockBalanceFix:
+    """Test stack-based block balance fix for missing end keywords."""
+
+    def test_nested_if_missing_end(self):
+        from converter.luau_validator import validate_and_fix
+        source = '''script.Parent.Touched:Connect(function(otherPart)
+        if otherPart.tag == "Player" then
+            if otherPart.hasKey then
+                ToggleDoor(true)
+    end'''
+        fixed, _ = validate_and_fix("test", source)
+        # Should have 3 'end' keywords (inner if, outer if, function)
+        assert fixed.count('end') >= 3
+
+    def test_function_with_if_elseif_missing_end(self):
+        from converter.luau_validator import validate_and_fix
+        source = '''    local function Bypass()
+        if x then
+            a = 1
+        elseif y then
+            b = 2
+    end'''
+        fixed, _ = validate_and_fix("test", source)
+        # Should have separate end for if chain and function
+        assert fixed.count('end') >= 2
+
+    def test_single_statement_if_missing_end(self):
+        from converter.luau_validator import validate_and_fix
+        source = '''    local function Test()
+        if x > 5 then
+            x = 5
+        y = x + 1
+    end'''
+        fixed, _ = validate_and_fix("test", source)
+        # The 'if' should get its own 'end' before 'y = x + 1'
+        assert fixed.count('end') >= 2
+
+    def test_balanced_code_unchanged(self):
+        from converter.luau_validator import validate_and_fix
+        source = '''if x then
+    y = 1
+end'''
+        fixed, _ = validate_and_fix("test", source)
+        assert fixed.count('end') == 1
