@@ -1658,9 +1658,15 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     # Pattern: EventName = EventName + FunctionName
     if re.search(r'(\w+)\s*=\s*\1\s*\+\s*(\w+)\s*$', source, re.MULTILINE):
         _event_words = {'Update', 'Changed', 'Event', 'Callback', 'Handler',
-                        'Click', 'Touched', 'Health', 'Ammo', 'Death', 'Spawn'}
+                        'Click', 'Touched', 'Death', 'Spawn'}
+        # Words that suggest numeric variable, NOT event (avoid false positives)
+        _numeric_prefixes = {'cur', 'max', 'min', 'total', 'count', 'num', 'sum'}
         def _fix_event_sub(m):
             indent, event, handler = m.group(1), m.group(2), m.group(3)
+            # Skip if variable looks like a numeric counter (e.g. curHealth, maxAmmo)
+            lower_event = event.lower()
+            if any(lower_event.startswith(p) for p in _numeric_prefixes):
+                return m.group(0)
             if any(w in event for w in _event_words):
                 return f'{indent}{event}:Connect({handler})'
             return m.group(0)
@@ -1671,6 +1677,45 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             flags=re.MULTILINE,
         )
         fixes.append("Fixed event += subscription → :Connect()")
+
+    # Fix: Input.GetAxis("AxisName") → proper Roblox input API
+    # Also clean up broken GetGamepadState(...)("AxisName") from old API mapping
+    if 'GetAxis' in source or 'GetGamepadState' in source:
+        # Map axis names to proper Roblox input calls
+        _axis_map = {
+            'MouseX': 'UserInputService:GetMouseDelta().X',
+            'MouseY': 'UserInputService:GetMouseDelta().Y',
+            'Mouse X': 'UserInputService:GetMouseDelta().X',
+            'Mouse Y': 'UserInputService:GetMouseDelta().Y',
+            'Horizontal': '((UserInputService:IsKeyDown(Enum.KeyCode.D) and 1 or 0) - (UserInputService:IsKeyDown(Enum.KeyCode.A) and 1 or 0))',
+            'Vertical': '((UserInputService:IsKeyDown(Enum.KeyCode.W) and 1 or 0) - (UserInputService:IsKeyDown(Enum.KeyCode.S) and 1 or 0))',
+            'Mouse ScrollWheel': 'UserInputService:GetMouseDelta().Y',
+        }
+        # Fix broken GetGamepadState(...)("AxisName") pattern
+        for axis_name, replacement in _axis_map.items():
+            source = source.replace(
+                f'UserInputService:GetGamepadState(Enum.UserInputType.Gamepad1)("{axis_name}")',
+                replacement,
+            )
+        # Fix -- Input.GetAxis("AxisName") comments from API mapping
+        for axis_name, replacement in _axis_map.items():
+            source = re.sub(
+                rf'-- Input\.GetAxis\("{re.escape(axis_name)}"\)',
+                replacement,
+                source,
+            )
+        # Generic fallback for other axis names
+        source = re.sub(
+            r'UserInputService:GetGamepadState\(Enum\.UserInputType\.Gamepad1\)\("([^"]+)"\)',
+            r'0 -- Input.GetAxis("\1") not mapped',
+            source,
+        )
+        source = re.sub(
+            r'-- Input\.GetAxis\("([^"]+)"\)',
+            r'0 -- Input.GetAxis("\1") not mapped',
+            source,
+        )
+        fixes.append("Fixed Input.GetAxis() → proper Roblox input API")
 
     # Fix: .setActive(obj, bool) called as method → setActive(obj, bool) function call
     if '.setActive(' in source:
@@ -1825,9 +1870,26 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
                 source,
             )
 
-    # Fix Unity AudioSource.pitch → Roblox Sound.PlaybackSpeed
+    # Fix Unity AudioSource properties → Roblox Sound properties
     if '.pitch' in source:
         source = re.sub(r'(\w+)\.pitch\b', r'\1.PlaybackSpeed', source)
+    if '.volume' in source:
+        source = re.sub(r'\.volume\b', '.Volume', source)
+        fixes.append("Fixed .volume → .Volume")
+    if '.loop' in source:
+        source = re.sub(r'\.loop\b', '.Looped', source)
+        fixes.append("Fixed .loop → .Looped")
+    if '.isPlaying' in source:
+        source = re.sub(r'\.isPlaying\b', '.IsPlaying', source)
+        fixes.append("Fixed .isPlaying → .IsPlaying")
+    # .clip.length → .TimeLength (audio clip duration)
+    if '.clip.length' in source:
+        source = re.sub(r'(\w+)\.clip\.length\b', r'\1.TimeLength', source)
+        fixes.append("Fixed .clip.length → .TimeLength")
+    # .clip = value → .SoundId = value (audio clip assignment)
+    if '.clip' in source:
+        source = re.sub(r'\.clip\b', '.SoundId', source)
+        fixes.append("Fixed .clip → .SoundId")
 
     # Fix Unity physics: AddForce/AddRelativeForce → :ApplyImpulse
     if 'AddRelativeForce(' in source or 'AddForce(' in source:
@@ -1896,6 +1958,94 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     # .enabled → .Enabled (for Roblox instances)
     if '.enabled' in source:
         source = re.sub(r'\.enabled\b', '.Enabled', source)
+
+    # .intensity → .Brightness (Unity Light.intensity → Roblox Light.Brightness)
+    if '.intensity' in source:
+        source = re.sub(r'\.intensity\b', '.Brightness', source)
+        fixes.append("Fixed .intensity → .Brightness")
+
+    # RunService.Stepped → RunService.Heartbeat (Stepped has different signature, Heartbeat is standard)
+    if 'RunService.Stepped' in source:
+        source = source.replace('RunService.Stepped', 'RunService.Heartbeat')
+        fixes.append("Fixed RunService.Stepped → RunService.Heartbeat")
+
+    # .CFrame.Position = value → .Position = value (CFrame.Position is read-only)
+    if '.CFrame.Position =' in source:
+        source = re.sub(r'(\w[\w.\[\]]*?)\.CFrame\.Position\s*=', r'\1.Position =', source)
+        fixes.append("Fixed .CFrame.Position assignment → .Position")
+
+    # .color → .Color (Unity Light/UI color property)
+    if re.search(r'\.\bcolor\b', source):
+        source = re.sub(r'\.color\b', '.Color', source)
+        fixes.append("Fixed .color → .Color")
+
+    # math.clamp01(x) → math.clamp(x, 0, 1) (not a Luau function)
+    if 'math.clamp01(' in source:
+        source = re.sub(r'math\.clamp01\(([^)]+)\)', r'math.clamp(\1, 0, 1)', source)
+        fixes.append("Fixed math.clamp01() → math.clamp(x, 0, 1)")
+
+    # GameObject:Destroy(obj, delay) → Debris:AddItem(obj, delay) / obj:Destroy()
+    if 'GameObject:Destroy(' in source:
+        # With delay: Debris:AddItem(obj, delay)
+        source = re.sub(
+            r'GameObject:Destroy\(([^,]+),\s*([^)]+)\)',
+            r'game:GetService("Debris"):AddItem(\1, \2)',
+            source,
+        )
+        # Without delay: obj:Destroy()
+        source = re.sub(
+            r'GameObject:Destroy\(([^)]+)\)',
+            r'\1:Destroy()',
+            source,
+        )
+        fixes.append("Fixed GameObject:Destroy() → :Destroy() / Debris:AddItem()")
+
+    # FindFirstChildObjectOfType() → FindFirstChildOfClass("Instance") (invalid method)
+    if 'FindFirstChildObjectOfType(' in source:
+        source = re.sub(
+            r':FindFirstChildObjectOfType\(\)',
+            ':FindFirstChildWhichIsA("Instance")',
+            source,
+        )
+        source = re.sub(
+            r':FindFirstChildObjectOfType\(([^)]+)\)',
+            r':FindFirstChildWhichIsA(\1)',
+            source,
+        )
+        fixes.append("Fixed FindFirstChildObjectOfType → FindFirstChildWhichIsA")
+
+    # .PlayDelayed(delay) → task.delay(delay, function() obj:Play() end)
+    if '.PlayDelayed(' in source:
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.PlayDelayed\(([^)]+)\)',
+            r'task.delay(\2, function() \1:Play() end)',
+            source,
+        )
+        fixes.append("Fixed .PlayDelayed() → task.delay + :Play()")
+
+    # float.IsNaN(x) → (x ~= x) (NaN check in Luau)
+    if 'float.IsNaN(' in source or 'float.IsInfinity(' in source:
+        source = re.sub(r'float\.IsNaN\(([^)]+)\)', r'(\1 ~= \1)', source)
+        source = re.sub(r'float\.IsInfinity\(([^)]+)\)', r'(\1 == math.huge or \1 == -math.huge)', source)
+        fixes.append("Fixed float.IsNaN/IsInfinity → Luau equivalents")
+
+    # Color.Lerp(a, b, t) → a:Lerp(b, t) (Roblox Color3:Lerp)
+    if 'Color.Lerp(' in source:
+        source = re.sub(r'Color\.Lerp\(([^,]+),\s*([^,]+),\s*([^)]+)\)', r'\1:Lerp(\2, \3)', source)
+        fixes.append("Fixed Color.Lerp() → :Lerp()")
+
+    # GetPartBoundsInRadiusNonAlloc → GetPartBoundsInRadius (NonAlloc not needed in Luau)
+    if 'NonAlloc(' in source:
+        source = source.replace('GetPartBoundsInRadiusNonAlloc', 'GetPartBoundsInRadius')
+        source = source.replace('RaycastNonAlloc', 'Raycast')
+        source = source.replace('SphereCastNonAlloc', 'SphereCast')
+        source = source.replace('OverlapSphereNonAlloc', 'GetPartBoundsInRadius')
+        fixes.append("Fixed NonAlloc methods → standard methods")
+
+    # .maxDistance → .RollOffMaxDistance (Unity AudioSource.maxDistance → Roblox Sound)
+    if '.maxDistance' in source:
+        source = re.sub(r'\.maxDistance\b', '.RollOffMaxDistance', source)
+        fixes.append("Fixed .maxDistance → .RollOffMaxDistance")
 
     # Fix 'require(expr or nil)' → safe require with nil check
     if 'or nil)' in source and 'require(' in source:
@@ -2198,7 +2348,12 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
         'Color', 'Color32', 'Bounds', 'Rect', 'Matrix4x4', 'Plane',
         'Collider', 'Rigidbody', 'Transform', 'GameObject', 'Component',
         'AudioSource', 'Animator', 'Renderer', 'Material', 'Texture',
-        'ParticleSystem', 'Camera',
+        'ParticleSystem', 'Camera', 'WaitForSeconds', 'WaitForEndOfFrame',
+        'WaitForFixedUpdate', 'WaitUntil', 'Coroutine', 'IEnumerator',
+        'NavMeshAgent', 'NavMeshPath', 'CharacterController',
+        'BoxCollider', 'SphereCollider', 'CapsuleCollider', 'MeshCollider',
+        'Light', 'SpriteRenderer', 'Image', 'Text', 'Button',
+        'RectTransform', 'Canvas', 'CanvasGroup',
     )
     for ctype in _CSHARP_TYPES:
         # "Type varName = expr" → "local varName = expr"

@@ -599,6 +599,155 @@ class TestLuauValidator:
         fixed, _ = validate_and_fix("test", source)
         assert "gameObject" not in fixed
 
+    def test_fix_intensity_to_brightness(self):
+        from converter.luau_validator import validate_and_fix
+        source = "m_Light.intensity = 2 * math.noise(x)"
+        fixed, fixes = validate_and_fix("test", source)
+        assert ".Brightness" in fixed
+        assert ".intensity" not in fixed
+
+    def test_fix_input_getaxis_mouse(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local x = UserInputService:GetGamepadState(Enum.UserInputType.Gamepad1)("MouseX")'
+        fixed, fixes = validate_and_fix("test", source)
+        assert "GetMouseDelta().X" in fixed
+        assert "GetGamepadState" not in fixed
+
+    def test_fix_input_getaxis_horizontal(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local h = UserInputService:GetGamepadState(Enum.UserInputType.Gamepad1)("Horizontal")'
+        fixed, fixes = validate_and_fix("test", source)
+        assert "IsKeyDown" in fixed
+        assert "GetGamepadState" not in fixed
+
+    def test_event_subscription_numeric_not_converted(self):
+        """curHealth = curHealth + healAmount should NOT become curHealth:Connect(healAmount)."""
+        from converter.luau_validator import validate_and_fix
+        source = "curHealth = curHealth + healAmount"
+        fixed, _ = validate_and_fix("test", source)
+        assert ":Connect(" not in fixed
+        assert "curHealth = curHealth + healAmount" in fixed
+
+    def test_event_subscription_actual_event(self):
+        """HealthUpdate = HealthUpdate + handler SHOULD become HealthUpdate:Connect(handler)."""
+        from converter.luau_validator import validate_and_fix
+        source = "HealthUpdate = HealthUpdate + UpdateHealth"
+        fixed, _ = validate_and_fix("test", source)
+        assert ":Connect(UpdateHealth)" in fixed
+
+    def test_fix_cframe_position_assignment(self):
+        from converter.luau_validator import validate_and_fix
+        source = "script.Parent.CFrame.Position = Vector3.new(0, 0, 0)"
+        fixed, fixes = validate_and_fix("test", source)
+        assert ".CFrame.Position =" not in fixed
+        assert "script.Parent.Position =" in fixed
+
+    def test_fix_audio_volume(self):
+        from converter.luau_validator import validate_and_fix
+        source = "audio.volume = 0.5"
+        fixed, _ = validate_and_fix("test", source)
+        assert ".Volume" in fixed
+        assert ".volume" not in fixed
+
+    def test_fix_audio_loop(self):
+        from converter.luau_validator import validate_and_fix
+        source = "audio.loop = true"
+        fixed, _ = validate_and_fix("test", source)
+        assert ".Looped" in fixed
+        assert ".loop " not in fixed
+
+    def test_fix_audio_clip_length(self):
+        from converter.luau_validator import validate_and_fix
+        source = "local dur = audio.clip.length"
+        fixed, _ = validate_and_fix("test", source)
+        assert "audio.TimeLength" in fixed
+
+    def test_fix_audio_is_playing(self):
+        from converter.luau_validator import validate_and_fix
+        source = "if audio.isPlaying then"
+        fixed, _ = validate_and_fix("test", source)
+        assert ".IsPlaying" in fixed
+
+    def test_fix_runservice_stepped(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'RunService.Stepped:Connect(function(dt)\n\tprint(dt)\nend)'
+        fixed, _ = validate_and_fix("test", source)
+        assert "RunService.Heartbeat" in fixed
+        assert "RunService.Stepped" not in fixed
+
+    def test_fix_math_clamp01(self):
+        from converter.luau_validator import validate_and_fix
+        source = "local x = math.clamp01(value)"
+        fixed, _ = validate_and_fix("test", source)
+        assert "math.clamp(value, 0, 1)" in fixed
+        assert "clamp01" not in fixed
+
+    def test_fix_gameobject_destroy_with_delay(self):
+        from converter.luau_validator import validate_and_fix
+        source = "GameObject:Destroy(obj, 2.0)"
+        fixed, _ = validate_and_fix("test", source)
+        assert "Debris" in fixed
+        assert "AddItem" in fixed
+
+    def test_fix_gameobject_destroy_no_delay(self):
+        from converter.luau_validator import validate_and_fix
+        source = "GameObject:Destroy(obj)"
+        fixed, _ = validate_and_fix("test", source)
+        assert "obj:Destroy()" in fixed
+
+    def test_fix_play_delayed(self):
+        from converter.luau_validator import validate_and_fix
+        source = "audio.PlayDelayed(0.5)"
+        fixed, _ = validate_and_fix("test", source)
+        assert "task.delay" in fixed
+        assert ":Play()" in fixed
+
+    def test_fix_color_lowercase(self):
+        from converter.luau_validator import validate_and_fix
+        source = "light.color = Color.new(1, 0, 0)"
+        fixed, _ = validate_and_fix("test", source)
+        assert ".Color" in fixed
+        assert ".color" not in fixed
+
+    def test_fix_find_first_child_object_of_type(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'workspace:FindFirstChildObjectOfType()'
+        fixed, _ = validate_and_fix("test", source)
+        assert "FindFirstChildWhichIsA" in fixed
+
+    def test_fix_float_isnan(self):
+        from converter.luau_validator import validate_and_fix
+        source = "local smp = (if float.IsNaN(x1) then 0 else x1)"
+        fixed, _ = validate_and_fix("test", source)
+        assert "(x1 ~= x1)" in fixed
+        assert "float.IsNaN" not in fixed
+
+    def test_fix_color_lerp(self):
+        from converter.luau_validator import validate_and_fix
+        source = "light.Color = Color.Lerp(colorA, colorB, t)"
+        fixed, _ = validate_and_fix("test", source)
+        assert "colorA:Lerp(colorB, t)" in fixed
+
+    def test_fix_nonalloc_methods(self):
+        from converter.luau_validator import validate_and_fix
+        source = "workspace:GetPartBoundsInRadiusNonAlloc(pos, radius, results)"
+        fixed, _ = validate_and_fix("test", source)
+        assert "GetPartBoundsInRadius(" in fixed
+        assert "NonAlloc" not in fixed
+
+    def test_fix_max_distance(self):
+        from converter.luau_validator import validate_and_fix
+        source = "audio.maxDistance = 50"
+        fixed, _ = validate_and_fix("test", source)
+        assert ".RollOffMaxDistance" in fixed
+
+    def test_fix_waitforseconds_type_decl(self):
+        from converter.luau_validator import validate_and_fix
+        source = "        WaitForSeconds delay"
+        fixed, _ = validate_and_fix("test", source)
+        assert "local delay" in fixed
+        assert "WaitForSeconds" not in fixed
+
 
 class TestMeshSizing:
     """Tests for mesh size computation."""

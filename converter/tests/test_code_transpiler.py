@@ -2058,7 +2058,7 @@ class TestValidatorNewFixes:
         from converter.luau_validator import validate_and_fix
         source = '    Gizmos.color = Color.new(0, 1, 0)\n    Gizmos.DrawLine(a, b)'
         fixed, _ = validate_and_fix("test", source)
-        assert '-- Gizmos.color' in fixed
+        assert '-- Gizmos.' in fixed  # .color may become .Color before commenting
         assert '-- Gizmos.DrawLine' in fixed
 
     def test_text_property_casing(self):

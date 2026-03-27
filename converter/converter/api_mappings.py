@@ -94,7 +94,7 @@ API_CALL_MAP: dict[str, str] = {
     "Input.GetButtonUp": "UserInputService.InputEnded",
     "Input.GetMouseButton": "UserInputService:IsMouseButtonPressed",
     "Input.GetMouseButtonDown": "UserInputService.InputBegan",
-    "Input.GetAxis": "UserInputService:GetGamepadState(Enum.UserInputType.Gamepad1)",
+    "Input.GetAxis": "-- Input.GetAxis",  # Handled by validator axis-specific mapping
     "Input.mousePosition": "UserInputService:GetMouseLocation()",
     "Input.GetTouch": "UserInputService.TouchStarted",
     "Input.anyKeyDown": "-- Input.anyKeyDown: use UserInputService.InputBegan",
@@ -667,7 +667,7 @@ LIFECYCLE_MAP: dict[str, str] = {
     "Awake": "-- Awake: runs at top of script (module initialization)",
     "Start": "-- Start: runs after all Awake calls (use task.defer or Players.PlayerAdded)",
     "Update": "RunService.Heartbeat:Connect(function(dt)",
-    "FixedUpdate": "RunService.Stepped:Connect(function(dt)",
+    "FixedUpdate": "RunService.Heartbeat:Connect(function(dt)",
     "LateUpdate": "RunService.RenderStepped:Connect(function(dt)",
     "OnEnable": "-- OnEnable: connect events here",
     "OnDisable": "-- OnDisable: disconnect events here",

@@ -115,7 +115,7 @@ def generate_stub(csharp_source: str, script_info: Any) -> str:
         lines.append("")
 
     if "FixedUpdate" in lifecycle_hooks:
-        lines.append("RunService.Stepped:Connect(function(dt)")
+        lines.append("RunService.Heartbeat:Connect(function(dt)")
         lines.append(f"\t-- TODO: implement FixedUpdate logic for {class_name}")
         lines.append("end)")
         lines.append("")
