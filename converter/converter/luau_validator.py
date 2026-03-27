@@ -800,6 +800,30 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     if re.search(r'/=', source):
         source = re.sub(r'([\w.]+)\s*/=\s*(.+)', r'\1 = \1 / \2', source)
 
+    # Fix: postfix # operator → prefix # (arr# → #arr, from C# .Length conversion)
+    if re.search(r'\w#(?!\w)', source):
+        source = re.sub(r'(\w+)#(?!\w)', r'#\1', source)
+
+    # Fix: C# for loops → Luau for loops
+    # for (local i = 0; i < N; ++i) → for i = 0, N - 1 do
+    if 'for (' in source:
+        def _fix_for_loop(m: re.Match) -> str:
+            indent = m.group(1)
+            var = m.group(2)
+            start = m.group(3)
+            bound = m.group(4)
+            # Fix postfix # operator: arr# → #arr
+            if bound.endswith('#'):
+                bound = '#' + bound[:-1]
+            return f'{indent}for {var} = {start}, {bound} - 1 do'
+
+        source = re.sub(
+            r'^(\s*)for\s*\(\s*local\s+(\w+)\s*=\s*(\w+)\s*;\s*\w+\s*<\s*([^;]+?)\s*;\s*\+\+\w+\s*\)',
+            _fix_for_loop,
+            source,
+            flags=re.MULTILINE,
+        )
+
     # Fix: semicolons at end of statements
     if ";" in source:
         # Remove trailing semicolons but not within strings
