@@ -1698,6 +1698,10 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     if re.search(r'\bnew\s+\w+\[\]\s*\{', source):
         source = re.sub(r'\bnew\s+\w+\[\]\s*\{', '{', source)
 
+    # Fix: `new -- Comment (...)` → `nil -- Comment` (type was replaced by comment)
+    if 'new --' in source:
+        source = re.sub(r'\bnew\s+(-- [^\n]*?)\s*\([^)]*\)', r'nil \1', source)
+
     # Fix: new Type(...) for non-Roblox types → comment or strip
     # new GameObject("name") → Instance.new("Part"); part.Name = "name"
     if 'new GameObject(' in source:
