@@ -1353,9 +1353,8 @@ def _has_syntax_errors(luau_source: str) -> bool:
         # C# generic types in code (not comments)
         elif re.search(r"<\w+>", s) and "FindFirstChild" not in s:
             error_lines += 1
-        # Stray 'end' after variable declaration (from C# property getters)
-        elif s == "end" and code_lines < 15:
-            # Early 'end' is suspicious
+        # Stray 'end' at the very start (from C# property getters) — only if first 3 code lines
+        elif s == "end" and code_lines < 4:
             error_lines += 1
         # C# if without 'then'
         elif re.match(r"if\s*\(.+\)\s*$", s) and "then" not in s:
@@ -1364,11 +1363,11 @@ def _has_syntax_errors(luau_source: str) -> bool:
         elif re.search(r"\.\w+\(.*\)\.\w+\(", s) and ":" not in s:
             error_lines += 1
 
-    # If more than 20% of code lines have issues, it's broken
-    if code_lines > 0 and error_lines / code_lines > 0.15:
+    # If more than 25% of code lines have issues, it's broken
+    if code_lines > 0 and error_lines / code_lines > 0.25:
         return True
-    # Or if there are any hard errors
-    if error_lines > 2:
+    # Or if there are many hard errors (allow some from C# brace remnants)
+    if error_lines > 4:
         return True
     return False
 
