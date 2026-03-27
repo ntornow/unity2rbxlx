@@ -2006,5 +2006,229 @@ class TestValidatorNewFixes:
         from converter.luau_validator import validate_and_fix
         source = 'local angle = math.acos(dir, tBase.forward)'
         fixed, _ = validate_and_fix("test", source)
-        assert 'dir.Unit:Dot(tBase.forward.Unit)' in fixed
+        assert 'dir.Unit:Dot(tBase.CFrame.LookVector.Unit)' in fixed
         assert 'math.deg' in fixed
+
+    def test_bare_forward_to_lookvector(self):
+        """obj.forward → obj.CFrame.LookVector."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local dir = tBase.forward.Unit'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'tBase.CFrame.LookVector.Unit' in fixed
+
+    def test_bare_right_to_rightvector(self):
+        """obj.right → obj.CFrame.RightVector."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local side = cam.right'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'cam.CFrame.RightVector' in fixed
+
+    def test_bare_up_to_upvector(self):
+        """obj.up → obj.CFrame.UpVector."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local y = part.up'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'part.CFrame.UpVector' in fixed
+
+    def test_ray_new_to_table(self):
+        """Ray.new(origin, dir) → {Origin=, Direction=}."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local ray = Ray.new(cam.Position, dir.normalized)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'Origin = cam.Position' in fixed
+        assert 'Direction = dir.normalized' in fixed
+        assert 'Ray.new' not in fixed
+
+    def test_getchild_zero_based(self):
+        """:GetChild(0) → :GetChildren()[1]."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local w = tBase:GetChild(0)'
+        fixed, _ = validate_and_fix("test", source)
+        assert ':GetChildren()[1]' in fixed
+
+    def test_getchild_variable_index(self):
+        """:GetChild(n) → :GetChildren()[n + 1]."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local c = obj:GetChild(idx)'
+        fixed, _ = validate_and_fix("test", source)
+        assert ':GetChildren()[idx + 1]' in fixed
+
+    def test_gizmos_commented_out(self):
+        """Gizmos.* lines → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '    Gizmos.color = Color.new(0, 1, 0)\n    Gizmos.DrawLine(a, b)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- Gizmos.color' in fixed
+        assert '-- Gizmos.DrawLine' in fixed
+
+    def test_text_property_casing(self):
+        """.text → .Text for UI elements."""
+        from converter.luau_validator import validate_and_fix
+        source = 'label.text = "hello"'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'label.Text' in fixed
+
+    def test_text_after_paren(self):
+        """).text → ).Text."""
+        from converter.luau_validator import validate_and_fix
+        source = 'obj:FindFirstChild("X").text = "hi"'
+        fixed, _ = validate_and_fix("test", source)
+        assert ').Text' in fixed
+
+    def test_rotation_to_cframe(self):
+        """.rotation → .CFrame (except Random.rotation)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'part.rotation = CFrame.new()'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'part.CFrame' in fixed
+
+    def test_random_rotation_preserved(self):
+        """Random.rotation should NOT become Random.CFrame."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local rot = Random.rotation'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'Random.rotation' in fixed or 'CFrame.Angles' in fixed
+
+    def test_point_to_object_space(self):
+        """:PointToObjectSpace → .CFrame:PointToObjectSpace."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local p = part:PointToObjectSpace(pos)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'part.CFrame:PointToObjectSpace(pos)' in fixed
+
+    def test_lerp_on_script_parent(self):
+        """script.Parent:Lerp → script.Parent.CFrame:Lerp."""
+        from converter.luau_validator import validate_and_fix
+        source = 'script.Parent:Lerp(target, 0.5)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'script.Parent.CFrame:Lerp(target, 0.5)' in fixed
+
+    def test_rotate_to_cframe(self):
+        """:Rotate(dir, speed) → CFrame rotation."""
+        from converter.luau_validator import validate_and_fix
+        source = 'tBase:Rotate(rotateDir, dt * rotationSpeed)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'CFrame' in fixed
+        assert ':Rotate(' not in fixed
+
+    def test_lookat_to_cframe_lookat(self):
+        """:LookAt(target) → CFrame.lookAt."""
+        from converter.luau_validator import validate_and_fix
+        source = 'tWeapon:LookAt(target)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'CFrame.lookAt' in fixed
+        assert 'tWeapon.Position' in fixed
+
+    def test_type_tostring(self):
+        """Player.tostring(x) → tostring(x)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'label.Text = Player.tostring(maxAmmo)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'tostring(maxAmmo)' in fixed
+        assert 'Player.tostring' not in fixed
+
+    def test_math_deg_1_fix(self):
+        """math.deg(1) → 180/math.pi."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local angle = math.atan2(x, z) * math.deg(1)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '(180 / math.pi)' in fixed
+        assert 'math.deg(1)' not in fixed
+
+    def test_setactive_method_to_function(self):
+        """.setActive(obj, bool) → setActive(obj, bool) function call."""
+        from converter.luau_validator import validate_and_fix
+        source = 'controls.setActive(script.Parent, true)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'setActive(script.Parent, true)' in fixed
+
+    def test_float_positive_infinity(self):
+        """float.PositiveInfinity → math.huge."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local dist = float.PositiveInfinity'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'math.huge' in fixed
+        assert 'float.PositiveInfinity' not in fixed
+
+    def test_float_negative_infinity(self):
+        """float.NegativeInfinity → -math.huge."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local min = float.NegativeInfinity'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-math.huge' in fixed
+
+    def test_float_max_value(self):
+        """float.MaxValue → math.huge."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local max = float.MaxValue'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'math.huge' in fixed
+
+    def test_dont_destroy_on_load(self):
+        """DontDestroyOnLoad → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '    DontDestroyOnLoad(script.Parent)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'DontDestroyOnLoad' in fixed
+        assert '--' in fixed
+
+    def test_dont_destroy_dotted(self):
+        """Dont.DestroyOnLoad → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = 'Dont.DestroyOnLoad(script.Parent)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '--' in fixed
+
+    def test_double_invocation(self):
+        """obj:Play()() → obj:Play()."""
+        from converter.luau_validator import validate_and_fix
+        source = 'm_AnimationTrack:Play()()'
+        fixed, _ = validate_and_fix("test", source)
+        assert ':Play()' in fixed
+        assert '()()' not in fixed
+
+    def test_syncvar_attribute_stripped(self):
+        """[SyncVar(...)] stripped from code."""
+        from converter.luau_validator import validate_and_fix
+        source = '[SyncVar(hook="Net_OnIdChanged")] local m_net_pedId = -1'
+        fixed, _ = validate_and_fix("test", source)
+        assert '[SyncVar' not in fixed
+        assert 'local m_net_pedId = -1' in fixed
+
+    def test_watched_attribute_stripped(self):
+        """[Watched] stripped from code."""
+        from converter.luau_validator import validate_and_fix
+        source = '[Watched] local DragScale = 1 / 100'
+        fixed, _ = validate_and_fix("test", source)
+        assert '[Watched]' not in fixed
+        assert 'local DragScale = 1 / 100' in fixed
+
+    def test_anonymous_object_syntax(self):
+        """() { → { (table literal)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'table.insert(states, () { position = p, rotation = r })'
+        fixed, _ = validate_and_fix("test", source)
+        assert '() {' not in fixed
+        assert '{ position = p' in fixed
+
+    def test_light_visible_to_enabled(self):
+        """.Visible → .Enabled for Light objects."""
+        from converter.luau_validator import validate_and_fix
+        source = 'staffLight.Visible = true'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'staffLight.Enabled = true' in fixed
+
+    def test_remove_range(self):
+        """.RemoveRange → table.remove loop."""
+        from converter.luau_validator import validate_and_fix
+        source = 'savedStates.RemoveRange(0, count)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'table.remove' in fixed
+        assert '.RemoveRange' not in fixed
+
+    def test_generic_in_function_params(self):
+        """Generic types stripped from function parameters."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local function Initialize(inst, Dictionary<Instance, dict)\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'Dictionary<' not in fixed

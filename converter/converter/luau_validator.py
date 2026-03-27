@@ -56,9 +56,23 @@ def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
     source = _fix_common_api_mistakes(name, source, fixes)
     source = _fix_structural_syntax(name, source, fixes)
     source = _fix_missing_end_keywords(name, source, fixes)
-    # Second pass: catch this./null that appear after API fixes (e.g., .gameObject removal)
+    # Second pass: catch patterns introduced by structural fixes
     if re.search(r'\bthis\.', source):
         source = re.sub(r'\bthis\.(\w+)', r'script.Parent.\1', source)
+    # Second pass: :GetChild/:LookAt may appear from property getter expansion
+    if ':GetChild(' in source:
+        def _fix_get_child2(m):
+            obj, idx = m.group(1), m.group(2).strip()
+            if idx.isdigit():
+                return f'{obj}:GetChildren()[{int(idx) + 1}]'
+            return f'{obj}:GetChildren()[{idx} + 1]'
+        source = re.sub(r'(\w+):GetChild\(([^)]+)\)', _fix_get_child2, source)
+    if ':LookAt(' in source:
+        source = re.sub(
+            r'(\w+(?:\.\w+)*):LookAt\(([^)]+)\)',
+            r'\1.CFrame = CFrame.lookAt(\1.Position, \2)',
+            source,
+        )
     source = _fix_startup_race_conditions(name, source, fixes)
     source = _inject_utility_functions(name, source, fixes)
 
@@ -382,6 +396,60 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
             source,
         )
         fixes.append("Fixed C# tuple unpacking")
+
+    # Strip C# attributes that leaked into code (not comments)
+    # [SyncVar(...)], [Watched], [Command], [ClientRpc], [Server], etc.
+    _CSHARP_ATTRS = (
+        'SyncVar', 'Watched', 'Command', 'ClientRpc', 'Server',
+        'TargetRpc', 'SyncObject', 'ShowInInspector', 'PropertySpace',
+        'PropertyOrder', 'InfoBox', 'FoldoutGroup', 'BoxGroup',
+        'Tooltip', 'HideIf', 'ShowIf', 'OnValueChanged',
+    )
+    if re.search(r'^\s*\[(?:' + '|'.join(_CSHARP_ATTRS) + r')\b', source, re.MULTILINE):
+        source = re.sub(
+            r'^\s*\[(?:' + '|'.join(_CSHARP_ATTRS) + r')\b[^\]]*\]\s*',
+            '',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Stripped C# networking/editor attributes")
+
+    # Fix malformed SetAttribute with type: `SetAttribute Type varName` → `SetAttribute("varName", nil)`
+    if re.search(r':SetAttribute\s+\w+\s+\w+', source):
+        source = re.sub(
+            r':SetAttribute\s+\w+\s+(\w+)\s*$',
+            r':SetAttribute("\1", nil)',
+            source,
+            flags=re.MULTILINE,
+        )
+        # Also: SetAttribute local varName = expr → local varName = expr
+        source = re.sub(
+            r':SetAttribute\s+local\s+(\w+)\s*=\s*(.+)$',
+            r'-- SetAttribute mapped\nlocal \1 = \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Fixed malformed SetAttribute patterns")
+
+    # Fix DontDestroyOnLoad → comment (no Roblox equivalent, instances persist by default)
+    if 'DontDestroyOnLoad' in source or 'Dont.DestroyOnLoad' in source:
+        source = re.sub(
+            r'^(\s*)(?:DontDestroyOnLoad|Dont\.DestroyOnLoad)\s*\([^)]*\).*$',
+            r'\1-- DontDestroyOnLoad not needed (Roblox instances persist)',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Removed DontDestroyOnLoad (not needed in Roblox)")
+
+    # Fix () { anonymous object/lambda syntax → {} table literal
+    if re.search(r'\(\)\s*\{', source):
+        source = re.sub(r'\(\)\s*\{', '{', source)
+        fixes.append("Fixed () { anonymous object → table literal")
+
+    # Fix .Play()() and similar double-invocation patterns
+    if '()()' in source:
+        source = re.sub(r'\(\)\(\)', '()', source)
+        fixes.append("Fixed double invocation ()()")
 
     # Comment out remaining C# class declarations
     source = re.sub(r'^([^\S\n]*)class\s+\w+.*$', r'\1-- \g<0>', source, flags=re.MULTILINE)
@@ -1151,6 +1219,132 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     # Fix: obj.value (lowercase) → obj.Value
     if re.search(r'\w\.value\b', source):
         source = re.sub(r'(\w)\.value\b(?!\s*\()', r'\1.Value', source)
+    # Fix: .text (lowercase) → .Text (Roblox PascalCase for TextLabel/TextButton)
+    if '.text' in source:
+        source = re.sub(r'([\w\)])\.text\b(?!\s*\()', r'\1.Text', source)
+    # Fix: .rotation (C#) → .CFrame (Roblox uses CFrame for orientation)
+    # Exclude Random.rotation (handled separately as CFrame.Angles conversion)
+    if '.rotation' in source:
+        def _fix_rotation(m):
+            prefix = m.group(1)
+            if prefix == 'Random':
+                return m.group(0)  # keep Random.rotation intact
+            return prefix + '.CFrame'
+        source = re.sub(r'(\w+)\.rotation\b(?!\s*\()', _fix_rotation, source)
+
+    # Fix: bare .forward/.right/.up → .CFrame.LookVector etc.
+    # (after .transform stripping, these may remain without .transform prefix)
+    if '.forward' in source:
+        source = re.sub(r'(\w)\.forward\b(?!\s*\()', r'\1.CFrame.LookVector', source)
+    if re.search(r'\w\.right\b', source):
+        source = re.sub(r'(\w)\.right\b(?!\s*\()', r'\1.CFrame.RightVector', source)
+    if re.search(r'\w\.up\b', source):
+        source = re.sub(r'(\w)\.up\b(?!\s*\()', r'\1.CFrame.UpVector', source)
+
+    # Fix: Ray.new(...) → just use origin/direction directly for workspace:Raycast
+    # Ray.new is not a valid Roblox constructor
+    if 'Ray.new(' in source:
+        # local ray = Ray.new(origin, direction) → remove and use origin/direction directly
+        # For now, comment out Ray.new and leave a note
+        source = re.sub(
+            r'\bRay\.new\(([^,]+),\s*([^)]+)\)',
+            r'{Origin = \1, Direction = \2}',
+            source,
+        )
+        fixes.append("Fixed Ray.new() → table with Origin/Direction")
+
+    # Fix: :GetChild(n) → :GetChildren()[n+1] (Unity 0-based, Roblox 1-based)
+    if ':GetChild(' in source:
+        def _fix_get_child(m):
+            obj = m.group(1)
+            idx = m.group(2).strip()
+            if idx.isdigit():
+                return f'{obj}:GetChildren()[{int(idx) + 1}]'
+            else:
+                return f'{obj}:GetChildren()[{idx} + 1]'
+        source = re.sub(r'(\w+):GetChild\(([^)]+)\)', _fix_get_child, source)
+        fixes.append("Fixed :GetChild(n) → :GetChildren()[n+1]")
+
+    # Fix: Gizmos.* → comment out (Unity editor-only debug drawing)
+    if 'Gizmos.' in source:
+        source = re.sub(r'^(\s*)(Gizmos\.\w+.*)$', r'\1-- \2 (Unity editor only)', source, flags=re.MULTILINE)
+        fixes.append("Commented out Gizmos.* calls (Unity editor only)")
+
+    # Fix: :PointToObjectSpace(pos) → .CFrame:PointToObjectSpace(pos)
+    if ':PointToObjectSpace(' in source:
+        source = re.sub(r'(\w+):PointToObjectSpace\(', r'\1.CFrame:PointToObjectSpace(', source)
+        # Avoid double .CFrame.CFrame
+        source = source.replace('.CFrame.CFrame:', '.CFrame:')
+        fixes.append("Fixed :PointToObjectSpace → .CFrame:PointToObjectSpace")
+    if ':PointToWorldSpace(' in source:
+        source = re.sub(r'(\w+):PointToWorldSpace\(', r'\1.CFrame:PointToWorldSpace(', source)
+        source = source.replace('.CFrame.CFrame:', '.CFrame:')
+        fixes.append("Fixed :PointToWorldSpace → .CFrame:PointToWorldSpace")
+
+    # Fix: part:Lerp(target, alpha) → part.CFrame:Lerp(target, alpha)
+    # Only for non-CFrame/Vector3 receivers (those already have :Lerp)
+    if ':Lerp(' in source:
+        source = re.sub(
+            r'(script\.Parent):Lerp\(',
+            r'\1.CFrame:Lerp(',
+            source,
+        )
+        fixes.append("Fixed :Lerp() → .CFrame:Lerp()")
+
+    # Fix: part:Rotate(axis, angle) → part.CFrame = part.CFrame * CFrame.Angles(...)
+    if ':Rotate(' in source:
+        def _fix_rotate(m):
+            obj = m.group(1)
+            args = m.group(2)
+            return f'{obj}.CFrame = {obj}.CFrame * CFrame.Angles(0, math.rad({args}), 0) -- :Rotate'
+        source = re.sub(r'(\w+(?:\.\w+)*):Rotate\(([^)]+)\)', _fix_rotate, source)
+        fixes.append("Fixed :Rotate() → CFrame rotation")
+
+    # Fix: part:LookAt(target) → part.CFrame = CFrame.lookAt(part.Position, target)
+    if ':LookAt(' in source:
+        source = re.sub(
+            r'(\w+(?:\.\w+)*):LookAt\(([^)]+)\)',
+            r'\1.CFrame = CFrame.lookAt(\1.Position, \2)',
+            source,
+        )
+        fixes.append("Fixed :LookAt() → CFrame.lookAt()")
+
+    # Fix: Type.tostring(x) → tostring(x) (wrong class prefix)
+    if re.search(r'\w+\.tostring\(', source):
+        source = re.sub(r'\w+\.tostring\(', 'tostring(', source)
+        fixes.append("Fixed Type.tostring() → tostring()")
+
+    # Fix: math.deg(1) → math.pi/180 (wrong conversion factor)
+    if 'math.deg(1)' in source:
+        source = source.replace('math.deg(1)', '(180 / math.pi)')
+        fixes.append("Fixed math.deg(1) → 180/math.pi")
+
+    # Fix: event subscription with arithmetic: event = event + handler → event:Connect(handler)
+    # Pattern: EventName = EventName + FunctionName
+    if re.search(r'(\w+)\s*=\s*\1\s*\+\s*(\w+)\s*$', source, re.MULTILINE):
+        _event_words = {'Update', 'Changed', 'Event', 'Callback', 'Handler',
+                        'Click', 'Touched', 'Health', 'Ammo', 'Death', 'Spawn'}
+        def _fix_event_sub(m):
+            indent, event, handler = m.group(1), m.group(2), m.group(3)
+            if any(w in event for w in _event_words):
+                return f'{indent}{event}:Connect({handler})'
+            return m.group(0)
+        source = re.sub(
+            r'^(\s*)(\w+)\s*=\s*\2\s*\+\s*(\w+)\s*$',
+            _fix_event_sub,
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Fixed event += subscription → :Connect()")
+
+    # Fix: .setActive(obj, bool) called as method → setActive(obj, bool) function call
+    if '.setActive(' in source:
+        source = re.sub(
+            r'(\w+(?:\.\w+)*):?\.setActive\(([^,]+),\s*([^)]+)\)',
+            r'setActive(\2, \3)',
+            source,
+        )
+        fixes.append("Fixed .setActive() method call → function call")
 
     # Fix Unity Raycast API → Roblox Raycast API
     # Unity: workspace:Raycast(ray, hit, range) → Roblox: workspace:Raycast(origin, direction * range)
@@ -1478,6 +1672,73 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             source,
         )
         fixes.append("Fixed 0-based math.random to 1-based for array indexing")
+
+    # Fix float.PositiveInfinity/NegativeInfinity/MaxValue → math.huge
+    if 'float.' in source:
+        source = re.sub(r'\bfloat\.PositiveInfinity\b', 'math.huge', source)
+        source = re.sub(r'\bfloat\.NegativeInfinity\b', '-math.huge', source)
+        source = re.sub(r'\bfloat\.MaxValue\b', 'math.huge', source)
+        source = re.sub(r'\bfloat\.MinValue\b', '-math.huge', source)
+        source = re.sub(r'\bfloat\.Epsilon\b', '1e-7', source)
+    if 'int.MaxValue' in source:
+        source = source.replace('int.MaxValue', '2147483647')
+    if 'int.MinValue' in source:
+        source = source.replace('int.MinValue', '-2147483648')
+
+    # Fix .Visible → .Enabled for Roblox Lights and .Visible → .Visible for GuiObjects (already correct)
+    # In Roblox, Light objects use .Enabled, not .Visible
+    # Pattern: obj that looks like a light (contains "Light", "light") .Visible → .Enabled
+    if '.Visible' in source:
+        # staffLight.Visible, m_Light.Visible → .Enabled
+        source = re.sub(r'(\w*[Ll]ight\w*)\.Visible\b', r'\1.Enabled', source)
+        # m_Collider.Visible → .CanCollide (colliders don't have Visible)
+        source = re.sub(r'(\w*[Cc]ollider\w*)\.Visible\b', r'\1.CanCollide', source)
+
+    # Fix .RemoveRange(start, count) → loop with table.remove
+    if '.RemoveRange(' in source:
+        source = re.sub(
+            r'(\w+)\.RemoveRange\(([^,]+),\s*([^)]+)\)',
+            r'for _i = 1, \3 do table.remove(\1, \2 + 1) end -- RemoveRange',
+            source,
+        )
+        fixes.append("Fixed .RemoveRange() → table.remove loop")
+
+    # Fix .FindFirstChildOfClassOrThrow() → :FindFirstChildOfClass() (non-standard API)
+    if 'FindFirstChildOfClassOrThrow' in source:
+        source = source.replace('FindFirstChildOfClassOrThrow', 'FindFirstChildOfClass')
+        fixes.append("Fixed FindFirstChildOfClassOrThrow → FindFirstChildOfClass")
+
+    # Fix C# generic types in function parameters:
+    # function Name(Dictionary<K,V> param) → function Name(param)
+    # function Name(SyncDictionary<K, op, key, item) → function Name(op, key, item)
+    if re.search(r'function\s+\w*\([^)]*<', source):
+        # Strip type<generic> with closing >: Type<A,B> param → param
+        source = re.sub(
+            r'(\bfunction\s+\w*\([^)]*?)\w+<[^>]*>\s*(\w+)',
+            r'\1\2',
+            source,
+        )
+        # Strip type< without closing > (broken generics): Type<A, param) → param)
+        source = re.sub(
+            r'\w+<\w+(?:,\s*)?(?=\w+\))',
+            '',
+            source,
+        )
+        fixes.append("Stripped generic types from function parameters")
+
+    # Fix C# reflection APIs that don't exist in Luau
+    if '.GetFields()' in source or '.GetType()' in source:
+        source = re.sub(r'^(\s*).*\.GetFields\(\).*$', r'\1-- (C# reflection removed)', source, flags=re.MULTILINE)
+        source = re.sub(r'^(\s*).*\.GetCustomAttributes\(.*$', r'\1-- (C# reflection removed)', source, flags=re.MULTILINE)
+        # GetType().Name → typeof(obj)
+        source = re.sub(r'(\w+)\.GetType\(\)\.Name\b', r'typeof(\1)', source)
+        source = re.sub(r'(\w+)\.GetType\(\)', r'typeof(\1)', source)
+        fixes.append("Removed C# reflection API calls")
+
+    # Fix .task.delay() pattern (broken event invocation)
+    if '.task.delay()' in source:
+        source = re.sub(r'(\w+)\.task\.delay\(\)', r'task.defer(\1)', source)
+        fixes.append("Fixed .task.delay() → task.defer()")
 
     if source != original:
         fixes.append("Fixed common API mistakes")
