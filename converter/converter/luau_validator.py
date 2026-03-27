@@ -2403,6 +2403,37 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         )
         fixes.append("Fixed .Sort() → table.sort()")
 
+    # Fix C# property getter pattern: inline simple getters
+    # Pattern: `local VAR = nil` followed by `local function get_VAR() return EXPR end`
+    # Replace VAR = nil with VAR = EXPR (inline the getter)
+    if 'local function get_' in source:
+        lines = source.split('\n')
+        new_lines = []
+        skip_next = False
+        for i, line in enumerate(lines):
+            if skip_next:
+                skip_next = False
+                continue
+            stripped = line.strip()
+            # Look for: local VAR = nil [-- comment]
+            m_nil = re.match(r'^(\s*)local\s+(\w+)\s*=\s*nil\b.*$', line)
+            if m_nil and i + 1 < len(lines):
+                indent, var_name = m_nil.group(1), m_nil.group(2)
+                next_line = lines[i + 1].strip()
+                # Check if next line is: local function get_VAR() return EXPR end
+                m_getter = re.match(
+                    rf'local\s+function\s+get_{re.escape(var_name)}\(\)\s*return\s+(.+?)\s+end$',
+                    next_line,
+                )
+                if m_getter:
+                    expr = m_getter.group(1)
+                    new_lines.append(f'{indent}local {var_name} = {expr}')
+                    skip_next = True  # Skip the getter function line
+                    fixes.append(f"Inlined property getter for '{var_name}'")
+                    continue
+            new_lines.append(line)
+        source = '\n'.join(new_lines)
+
     # Fix `dt` usage in task.wait() loops: `task.wait()` → `dt = task.wait()`
     # When `dt` is used in a while/for loop that has task.wait(), the dt should come
     # from task.wait()'s return value (not from RunService callback parameter)

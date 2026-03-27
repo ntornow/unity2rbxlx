@@ -809,6 +809,14 @@ class TestLuauValidator:
         fixed, _ = validate_and_fix("test", source)
         assert "dt = task.wait()" in fixed
 
+    def test_fix_property_getter_inline(self):
+        from converter.luau_validator import validate_and_fix
+        source = '    local audio = nil -- AudioSource\n    local function get_audio() return script.Parent:FindFirstChildWhichIsA("Sound") end'
+        fixed, fixes = validate_and_fix("test", source)
+        assert 'local audio = script.Parent:FindFirstChildWhichIsA("Sound")' in fixed
+        assert 'get_audio' not in fixed
+        assert any("Inlined" in f for f in fixes)
+
 
 class TestMeshSizing:
     """Tests for mesh size computation."""
