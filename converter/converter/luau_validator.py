@@ -489,6 +489,15 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
         'AnimatorStateInfo', 'Material', 'Checkpoint',
         'RandomAudioPlayer', 'CameraSettings', 'MeleeWeapon',
         'Damageable', 'MaterialPropertyBlock',
+        'NavMeshData', 'NavMeshDataInstance', 'NavMeshBuildSettings',
+        'NavMeshBuildMarkup', 'NavMeshBuildSource',
+        'CharacterController', 'Animator', 'ParticleSystem',
+        'AudioClip', 'AudioMixer', 'AudioMixerGroup',
+        'Transform', 'GameObject', 'Camera',
+        'Coroutine', 'WaitForSeconds', 'IEnumerator',
+        'Texture2D', 'RenderTexture', 'Sprite', 'Mesh',
+        'System', 'Type', 'List', 'Array', 'HashSet',
+        'Dictionary', 'Queue', 'Stack',
     )
     _type_pattern = '|'.join(re.escape(t) for t in _CSHARP_FIELD_TYPES)
     if re.search(rf'^\s*(?:{_type_pattern})\s+\w', source, re.MULTILINE):
@@ -1394,6 +1403,115 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
         )
         fixes.append("Fixed SetActive to use recursive setActive()")
 
+    # Fix `workspace:GetServerTimeNow()AsDouble` → `workspace:GetServerTimeNow()`
+    # `.AsDouble` / `.AsFloat` / `.TotalSeconds` are C# DateTime/TimeSpan properties
+    if re.search(r'GetServerTimeNow\(\)\w', source):
+        source = re.sub(r'GetServerTimeNow\(\)(AsDouble|AsFloat|TotalSeconds|SinceLevelLoad)\b', 'GetServerTimeNow()', source)
+        fixes.append("Fixed GetServerTimeNow()AsDouble → GetServerTimeNow()")
+
+    # Fix `error(new) System.XxxException("msg")` → `error("msg")`
+    if 'error(new)' in source:
+        source = re.sub(
+            r'error\(new\)\s*System\.\w+Exception\(([^)]*)\)',
+            r'error(\1)',
+            source,
+        )
+        fixes.append("Fixed error(new) System.Exception → error()")
+
+    # Fix C# `/* */` block comments → Luau `--[[ ]]`
+    if '/*' in source:
+        source = re.sub(r'/\*', '--[[', source)
+        source = re.sub(r'\*/', ']]', source)
+        fixes.append("Fixed C# /* */ block comments → --[[ ]]")
+
+    # Fix `catch (System.Exception e)` after pcall → proper error handling
+    if 'catch (' in source:
+        source = re.sub(
+            r'\)\s*\n\s*catch\s*\([^)]*\)\s*\n',
+            ')\nif not ok then\n',
+            source,
+        )
+        fixes.append("Fixed catch block → pcall error handling")
+
+    # Fix `Math.IEEERemainder(x, y)` → `x % y` (Luau modulo)
+    if 'Math.IEEERemainder' in source:
+        source = re.sub(
+            r'Math\.IEEERemainder\(([^,]+),\s*([^)]+)\)',
+            r'(\1) % (\2)',
+            source,
+        )
+        fixes.append("Fixed Math.IEEERemainder → modulo %")
+
+    # Fix Unity Material API calls: mat.GetVector/GetFloat/GetColor → stub values
+    # Only match material-related variable names to avoid clobbering Animator.GetFloat → GetAttribute
+    _MAT_VARS = r'(?:mat|material|m_Material|m_Mat|sharedMaterial|baseMaterial)'
+    if re.search(rf'{_MAT_VARS}[.:]\bGet(?:Vector|Float|Color|Int|Texture)\b\(', source):
+        source = re.sub(rf'({_MAT_VARS})[.:]GetVector\([^)]*\)', 'Vector3.zero', source)
+        source = re.sub(rf'({_MAT_VARS})[.:]GetFloat\([^)]*\)', '1.0', source)
+        source = re.sub(rf'({_MAT_VARS})[.:]GetColor\([^)]*\)', 'Color3.new(1, 1, 1)', source)
+        source = re.sub(rf'({_MAT_VARS})[.:]GetInt\([^)]*\)', '0', source)
+        source = re.sub(rf'({_MAT_VARS})[.:]GetTexture\([^)]*\)', 'nil', source)
+        fixes.append("Fixed Unity Material Get* API calls → stub values")
+
+    # Fix bare tuple assignment: `local x = (a, b, c, d)` → `local x = {a, b, c, d}`
+    # C# Vector4 / tuple pattern where parentheses contain comma-separated values
+    if re.search(r'=\s*\(\w+\.\w+,\s*\w+', source):
+        source = re.sub(
+            r'=\s*\((\w+\.\w+(?:,\s*\w+\.\w+)+(?:,\s*\w+)?)\)',
+            r'= {\1}',
+            source,
+        )
+        fixes.append("Fixed bare tuple (a, b, c) → {a, b, c}")
+
+    # Fix undefined `col` variable → `otherPart` (C# `Collision col` parameter)
+    # Only when: (1) `col` is not locally defined, (2) there's a Touched handler in the script,
+    # (3) `col` is not a function parameter
+    if (re.search(r'\bcol\b(?=[\.:])(?!.*--)', source)
+            and 'local col' not in source
+            and 'Touched' in source
+            and not re.search(r'function\s*\([^)]*\bcol\b[^)]*\)', source)):
+        source = re.sub(r'\bcol\b(?=[\.:])(?!.*--)', 'otherPart', source)
+        fixes.append("Fixed undefined 'col' variable → 'otherPart'")
+
+    # Fix `--variable` prefix decrement that becomes a comment in Luau
+    # Pattern: `--varName` at start of line (standalone) — this is a prefix decrement, not a comment
+    # But only if it matches a known pattern like `--zoomSelector` (preceded by `++zoomSelector`)
+    if re.search(r'^\s*--(\w+)\s*$', source, re.MULTILINE):
+        # Check if there's a corresponding `++var` pattern nearby (confirms it's a pre-decrement)
+        lines = source.split('\n')
+        new_lines = []
+        for line in lines:
+            m = re.match(r'^(\s*)--(\w+)\s*$', line)
+            if m and f'++{m.group(2)}' in source:
+                # This is a pre-decrement, not a comment
+                new_lines.append(f'{m.group(1)}{m.group(2)} = {m.group(2)} - 1')
+            else:
+                new_lines.append(line)
+        if new_lines != lines:
+            source = '\n'.join(new_lines)
+            fixes.append("Fixed --variable prefix decrement (was parsed as comment)")
+
+    # Fix `: base(...)` C# constructor chaining → comment out
+    if re.search(r'^\s*:\s*base\s*\(', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s*):\s*base\s*\([^)]*\)\s*$',
+            r'\1-- [C#] base constructor call removed',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out C# base() constructor calls")
+
+    # Fix `for (; ;)` → `while true do` (C# infinite loop)
+    if 'for (; ;' in source or 'for (;;' in source:
+        source = re.sub(r'for\s*\(\s*;\s*;\s*\)', 'while true do', source)
+        fixes.append("Fixed for(;;) → while true do")
+
+    # Fix `nil` as function parameter name → `_param`
+    if re.search(r'function\s+\w+\(nil\)', source) or re.search(r'function\s*\(nil\)', source):
+        source = re.sub(r'function\s+(\w+)\(nil\)', r'function \1(_param)', source)
+        source = re.sub(r'function\s*\(nil\)', r'function(_param)', source)
+        fixes.append("Fixed nil as function parameter name → _param")
+
     if source != original and not fixes:
         fixes.append("Fixed C# syntax remnants")
 
@@ -2037,13 +2155,17 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         "Move", "AddForce", "AddRelativeForce", "AddExplosionForce",
         "AddTorque", "Fire", "Connect", "Disconnect",
         "Raycast", "Kick", "LoadCharacter",
+        "PlayRandomClip", "ApplyImpulse", "ApplyImpulseAtPosition",
+        "GetPartBoundsInRadius", "GetPartBoundsInBox",
+        "PointToObjectSpace", "PointToWorldSpace",
+        "FindFirstDescendant", "HasTag",
     ]
     for method in _DOT_TO_COLON_METHODS:
-        pattern = f'.{method}('
-        if pattern in source:
+        if f'.{method}' in source:
             # Fix when preceded by a word character or closing paren/bracket (receiver)
+            # Allow optional whitespace before `(` to catch `.Method (` patterns
             source = re.sub(
-                rf'([\w\)\]])\.\b{method}\b\(',
+                rf'([\w\)\]])\.\b{method}\b\s*\(',
                 rf'\1:{method}(',
                 source,
             )
@@ -2245,6 +2367,7 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         'SphereCollider': 'BasePart',
         'BoxCollider': 'BasePart',
         'CapsuleCollider': 'BasePart',
+        'Collider': 'BasePart',
         'Renderer': 'BasePart',
     }
     for unity_cls, rblx_cls in _UNITY_TO_ROBLOX_CLASS.items():
@@ -2996,6 +3119,96 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         source = re.sub(r'(\w+)\.animator\.speed\s*=\s*([^\n]+)', r'-- animator.speed = \2 (not in Roblox)', source)
         fixes.append("Commented out animator.speed assignment")
 
+    # Fix Vector3 immutable component assignment: vec.y = 0 → vec = Vector3.new(vec.X, 0, vec.Z)
+    # Roblox Vector3 is immutable — cannot set individual components
+    if re.search(r'\w+\.[xyzXYZ]\s*=\s*', source):
+        def _fix_vec_component(m):
+            indent = m.group(1)
+            obj = m.group(2)
+            comp = m.group(3).lower()
+            val = m.group(4).rstrip()
+            if comp == 'x':
+                return f'{indent}{obj} = Vector3.new({val}, {obj}.Y, {obj}.Z)'
+            elif comp == 'y':
+                return f'{indent}{obj} = Vector3.new({obj}.X, {val}, {obj}.Z)'
+            else:  # z
+                return f'{indent}{obj} = Vector3.new({obj}.X, {obj}.Y, {val})'
+        source = re.sub(
+            r'^(\s*)([\w.]+(?:\[[\w.]+\])?)\.([xyzXYZ])\s*=\s*([^\n]+)$',
+            _fix_vec_component,
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Fixed Vector3 immutable component assignment → Vector3.new()")
+
+    # Fix bare constructor `= ()` patterns from stripped `new Type()` calls
+    if re.search(r'=\s*\(\)\s*$', source, re.MULTILINE):
+        source = re.sub(r'=\s*\(\)\s*$', '= nil', source, flags=re.MULTILINE)
+        fixes.append("Fixed bare constructor = () → = nil")
+
+    # Fix Unity Color constants → Roblox Color3
+    _COLOR_CONSTANTS = {
+        'Color.clear': 'Color3.new(0, 0, 0)',
+        'Color.white': 'Color3.new(1, 1, 1)',
+        'Color.black': 'Color3.new(0, 0, 0)',
+        'Color.red': 'Color3.new(1, 0, 0)',
+        'Color.green': 'Color3.new(0, 1, 0)',
+        'Color.blue': 'Color3.new(0, 0, 1)',
+        'Color.yellow': 'Color3.new(1, 1, 0)',
+        'Color.cyan': 'Color3.new(0, 1, 1)',
+        'Color.magenta': 'Color3.new(1, 0, 1)',
+        'Color.gray': 'Color3.new(0.5, 0.5, 0.5)',
+        'Color.grey': 'Color3.new(0.5, 0.5, 0.5)',
+    }
+    for unity_color, rblx_color in _COLOR_CONSTANTS.items():
+        if unity_color in source:
+            source = source.replace(unity_color, rblx_color)
+            fixes.append(f"Fixed {unity_color} → {rblx_color}")
+
+    # Comment out C# LayerMask bitwise operations (not applicable in Roblox)
+    # Pattern: `layers.Value & 1 << otherPart.CollisionGroup` or similar bitshift mask checks
+    if re.search(r'&\s*1\s*<<|<<\s*\d+\s*&|LayerMask', source):
+        source = re.sub(
+            r'^(\s*)(?!--)(.+(?:&\s*1\s*<<|<<\s*\d+\s*&).+)$',
+            r'\1-- [Unity LayerMask] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        # Comment out LayerMask.NameToLayer/GetMask calls
+        source = re.sub(
+            r'^(\s*)(?!--)(.+LayerMask\.\w+.*)$',
+            r'\1-- [Unity LayerMask] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out Unity LayerMask bitwise operations")
+
+    # Fix undefined `collider` variable in Touched handlers → `otherPart`
+    # This happens when C# `Collision collision` / `Collider collider` params survive
+    # Only replace when `collider` is NOT locally defined
+    if 'collider' in source and 'local collider' not in source:
+        # Replace standalone `collider.` and `collider:` references with `otherPart.` / `otherPart:`
+        source = re.sub(r'\bcollider\b(?=[\.:])(?!.*--)', 'otherPart', source)
+        # In function params, `collider` is valid — only replace in body references
+        fixes.append("Fixed undefined 'collider' variable → 'otherPart'")
+
+    # Fix Debug.DrawRay / Debug.DrawLine (editor-only, not in Roblox)
+    if 'Debug.Draw' in source:
+        source = re.sub(
+            r'^(\s*)(?!--)(.*Debug\.Draw\w+\(.*)$',
+            r'\1-- [Unity editor] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out Debug.Draw* calls")
+
+    # Fix m_MonoBehaviour undefined variable (Unity SceneLinkedSMB pattern)
+    # In Roblox, this is the parent behavior script — lookup via FindFirstChild
+    if 'm_MonoBehaviour' in source and 'local m_MonoBehaviour' not in source:
+        # Inject a local lookup at the top of the script
+        source = f'local m_MonoBehaviour = script.Parent:FindFirstChildWhichIsA("ModuleScript") or script.Parent\n' + source
+        fixes.append("Injected m_MonoBehaviour lookup for SceneLinkedSMB pattern")
+
     if source != original:
         fixes.append("Fixed common API mistakes")
         log.info("  [%s] Fixed common API/syntax mistakes", name)
@@ -3011,6 +3224,32 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
     if 'else if ' in source:
         source = re.sub(r'\belse\s+if\b', 'elseif', source)
         fixes.append("Fixed 'else if' → 'elseif'")
+
+    # Fix `end` immediately before `elseif` or `else` (from C# `} else if {` / `} else {`)
+    # Line-based approach: find `end` lines followed by `elseif`/`else` lines and remove the `end`
+    lines = source.split('\n')
+    new_lines = []
+    i = 0
+    end_else_fixed = False
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if stripped == 'end' and i + 1 < len(lines):
+            next_stripped = lines[i + 1].lstrip()
+            if next_stripped.startswith('elseif ') or next_stripped.startswith('elseif(') or next_stripped == 'else' or next_stripped.startswith('else ') or next_stripped.startswith('else\n'):
+                # Skip this `end` line — the elseif/else continues the block
+                end_else_fixed = True
+                i += 1
+                continue
+        new_lines.append(lines[i])
+        i += 1
+    if end_else_fixed:
+        source = '\n'.join(new_lines)
+        fixes.append("Fixed end before elseif/else → merged")
+
+    # Strip stray `{` braces at start of line (C# block openers that survived conversion)
+    if re.search(r'^\s*\{\s*$', source, re.MULTILINE):
+        source = re.sub(r'^\s*\{\s*$', '', source, flags=re.MULTILINE)
+        fixes.append("Stripped stray { braces")
 
     # Fix C# postfix ++/-- operators → Luau assignment
     # x++ or x-- at end of line or before ) or ;

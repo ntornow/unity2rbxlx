@@ -2970,3 +2970,220 @@ class TestValidatorBatch16:
         source = '    SceneLinkedSMB.Initialise(m_Animator, script.Parent)'
         fixed, _ = validate_and_fix("test", source)
         assert '-- [Unity SMB]' in fixed
+
+
+class TestValidatorBatch17:
+    """Tests for batch 17 fixes: Vector3 immutable, bare constructors, end/elseif, etc."""
+
+    def test_vector3_y_assignment(self):
+        """vec.y = 0 → vec = Vector3.new(vec.X, 0, vec.Z)."""
+        from converter.luau_validator import validate_and_fix
+        source = '    pushForce.y = 0'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.y = 0' not in fixed
+        assert 'Vector3.new(pushForce.X, 0, pushForce.Z)' in fixed
+
+    def test_vector3_x_assignment(self):
+        """vec.x = val → vec = Vector3.new(val, vec.Y, vec.Z)."""
+        from converter.luau_validator import validate_and_fix
+        source = '    dir.x = speed * dt'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.x = ' not in fixed
+        assert 'Vector3.new(speed * dt, dir.Y, dir.Z)' in fixed
+
+    def test_vector3_z_assignment(self):
+        """vec.z = val → vec = Vector3.new(vec.X, vec.Y, val)."""
+        from converter.luau_validator import validate_and_fix
+        source = '    pos.z = 10'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'Vector3.new(pos.X, pos.Y, 10)' in fixed
+
+    def test_bare_constructor(self):
+        """= () → = nil."""
+        from converter.luau_validator import validate_and_fix
+        source = 'm_PropertyBlock = ()'
+        fixed, _ = validate_and_fix("test", source)
+        assert '= nil' in fixed
+        assert '= ()' not in fixed
+
+    def test_end_before_elseif(self):
+        """end followed by elseif → elseif (merged)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if x then\n    foo()\nend\nelseif y then\n    bar()\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'end\nelseif' not in fixed
+        assert 'elseif y then' in fixed
+
+    def test_end_before_else(self):
+        """end followed by else → else (merged)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if x then\n    foo()\nend\nelse\n    bar()\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'end\nelse' not in fixed
+        assert 'else' in fixed
+
+    def test_collider_to_basepart(self):
+        """FindFirstChildWhichIsA("Collider") → "BasePart"."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local c = script.Parent:FindFirstChildWhichIsA("Collider")'
+        fixed, _ = validate_and_fix("test", source)
+        assert '"BasePart"' in fixed
+        assert '"Collider"' not in fixed
+
+    def test_color_constants(self):
+        """Color.white/black/clear → Color3.new(...)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local c = Color.white\nlocal d = Color.clear'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'Color3.new(1, 1, 1)' in fixed
+        assert 'Color3.new(0, 0, 0)' in fixed
+
+    def test_layermask_commented(self):
+        """LayerMask bitwise ops → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '    if 0 ~= (layers.Value & 1 << otherPart.CollisionGroup) then'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [Unity LayerMask]' in fixed
+
+    def test_dot_to_colon_with_space(self):
+        """obj.PlayRandomClip () → obj:PlayRandomClip()."""
+        from converter.luau_validator import validate_and_fix
+        source = 'hitAudio.PlayRandomClip ()'
+        fixed, _ = validate_and_fix("test", source)
+        assert ':PlayRandomClip(' in fixed
+        assert '.PlayRandomClip' not in fixed
+
+    def test_stray_brace(self):
+        """Stray { on its own line → removed."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if x then\n{\n    foo()\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert '\n{\n' not in fixed
+
+    def test_collider_to_otherpart(self):
+        """Undefined collider variable → otherPart."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if collider.Name == "Player" then\n    collider:Destroy()\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'otherPart.Name' in fixed
+        assert 'otherPart:Destroy' in fixed
+
+    def test_debug_draw_commented(self):
+        """Debug.DrawRay → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '    Debug.DrawRay(origin, direction, Color3.new(1,0,0))'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [Unity editor]' in fixed
+
+    def test_m_monobehaviour_injected(self):
+        """m_MonoBehaviour → local lookup injected."""
+        from converter.luau_validator import validate_and_fix
+        source = 'm_MonoBehaviour.controller.ClearForce()'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'local m_MonoBehaviour = script.Parent:FindFirstChildWhichIsA' in fixed
+
+    def test_expanded_type_stripping(self):
+        """NavMeshData, ParticleSystem etc. → local var = nil."""
+        from converter.luau_validator import validate_and_fix
+        source = '    NavMeshData m_NavMeshData'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'local m_NavMeshData' in fixed
+        assert 'NavMeshData m_NavMeshData' not in fixed
+
+    def test_color_red_green_blue(self):
+        """Color.red/green/blue → Color3.new(...)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local r = Color.red\nlocal g = Color.green\nlocal b = Color.blue'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'Color3.new(1, 0, 0)' in fixed
+        assert 'Color3.new(0, 1, 0)' in fixed
+        assert 'Color3.new(0, 0, 1)' in fixed
+
+
+class TestValidatorBatch18:
+    """Tests for batch 18: C# remnant fixes, material APIs, block comments, etc."""
+
+    def test_get_server_time_now_as_double(self):
+        """workspace:GetServerTimeNow()AsDouble → workspace:GetServerTimeNow()."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local t = workspace:GetServerTimeNow()AsDouble'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'GetServerTimeNow()' in fixed
+        assert 'AsDouble' not in fixed
+
+    def test_get_server_time_now_since_level_load(self):
+        """workspace:GetServerTimeNow()SinceLevelLoad → workspace:GetServerTimeNow()."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local t = workspace:GetServerTimeNow()SinceLevelLoad / 20.0'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'GetServerTimeNow() / 20.0' in fixed
+
+    def test_error_new_system_exception(self):
+        """error(new) System.ArgumentException("msg") → error("msg")."""
+        from converter.luau_validator import validate_and_fix
+        source = 'error(new) System.ArgumentException("Command handler must be provided")'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'error("Command handler must be provided")' in fixed
+        assert 'System' not in fixed
+
+    def test_block_comment_conversion(self):
+        """C# /* */ → Luau --[[ ]]."""
+        from converter.luau_validator import validate_and_fix
+        source = '/* this is a comment */'
+        fixed, _ = validate_and_fix("test", source)
+        assert '--[[' in fixed
+        assert ']]' in fixed
+        assert '/*' not in fixed
+
+    def test_math_ieee_remainder(self):
+        """Math.IEEERemainder(x, y) → x % y."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local result = Math.IEEERemainder(waveSpeed * t, 1.0)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '% (1.0)' in fixed
+        assert 'IEEERemainder' not in fixed
+
+    def test_material_get_vector(self):
+        """material.GetVector("name") → Vector3.zero."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local waveSpeed = material.GetVector("WaveSpeed")'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'Vector3.zero' in fixed
+
+    def test_material_get_float(self):
+        """material:GetFloat("name") → 1.0."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local waveScale = material:GetFloat("_WaveScale")'
+        fixed, _ = validate_and_fix("test", source)
+        assert '1.0' in fixed
+
+    def test_for_infinite_loop(self):
+        """for (;;) → while true do."""
+        from converter.luau_validator import validate_and_fix
+        source = 'for (; ; )\n    foo()\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'while true do' in fixed
+        assert 'for' not in fixed
+
+    def test_nil_param_name(self):
+        """function Foo(nil) → function Foo(_param)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local function GetClampedZoomSelector(nil)\n    return 0\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert '_param' in fixed
+        assert 'function GetClampedZoomSelector(nil)' not in fixed
+
+    def test_base_constructor_call(self):
+        """: base(header, stream) → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '    : base(header, stream)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'base constructor' in fixed
+        assert ': base(header' not in fixed
+
+    def test_prefix_decrement_as_comment(self):
+        """--zoomSelector (with matching ++) → zoomSelector = zoomSelector - 1."""
+        from converter.luau_validator import validate_and_fix
+        source = '    ++zoomSelector\n    --zoomSelector'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'zoomSelector = zoomSelector - 1' in fixed
