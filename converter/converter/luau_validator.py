@@ -3648,6 +3648,36 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
         source = source.replace('IsKeyDownDown', 'IsKeyDown')
         fixes.append("Fixed 'IsKeyDownDown' → 'IsKeyDown'")
 
+    # Fix Unity input axis names passed to IsKeyDown (should be Enum.KeyCode or proper Roblox API)
+    # Unity: Input.GetButton("Jump") → Roblox: UserInputService:IsKeyDown(Enum.KeyCode.Space)
+    _UNITY_INPUT_MAP = {
+        '"Jump"': 'Enum.KeyCode.Space',
+        '"Fire"': 'Enum.UserInputType.MouseButton1',
+        '"Fire1"': 'Enum.UserInputType.MouseButton1',
+        '"Fire2"': 'Enum.UserInputType.MouseButton2',
+        '"Fire3"': 'Enum.UserInputType.MouseButton3',
+        '"Cancel"': 'Enum.KeyCode.Escape',
+        '"Submit"': 'Enum.KeyCode.Return',
+        '"Use"': 'Enum.KeyCode.E',
+        '"Brake"': 'Enum.KeyCode.Space',
+        '"RB"': 'Enum.KeyCode.LeftShift',
+        '"Crouch"': 'Enum.KeyCode.LeftControl',
+        '"Sprint"': 'Enum.KeyCode.LeftShift',
+    }
+    for unity_name, roblox_key in _UNITY_INPUT_MAP.items():
+        if unity_name in source:
+            # IsKeyDown("Jump") → IsKeyDown(Enum.KeyCode.Space)
+            # But for MouseButton types, use IsMouseButtonPressed instead
+            if 'MouseButton' in roblox_key:
+                button_num = roblox_key.split('MouseButton')[-1]
+                source = source.replace(
+                    f'IsKeyDown({unity_name})',
+                    f'IsMouseButtonPressed({roblox_key})',
+                )
+            else:
+                source = source.replace(f'IsKeyDown({unity_name})', f'IsKeyDown({roblox_key})')
+            fixes.append(f"Fixed Unity input {unity_name} → {roblox_key}")
+
     # Fix 'workspace:GetServerTimeNow()Scale' → timeScale variable
     # Time.timeScale in Unity has no direct Roblox equivalent — use a module variable
     if 'GetServerTimeNow()Scale' in source:

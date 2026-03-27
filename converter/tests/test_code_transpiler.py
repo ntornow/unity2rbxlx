@@ -702,6 +702,22 @@ class TestValidatorStructuralFixes:
         assert '= {' in fixed
         assert 'key1 = val1' in fixed
 
+    def test_unity_input_jump_to_space(self):
+        """IsKeyDown("Jump") → IsKeyDown(Enum.KeyCode.Space)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if UserInputService:IsKeyDown("Jump") then'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'Enum.KeyCode.Space' in fixed
+        assert '"Jump"' not in fixed
+
+    def test_unity_input_fire_to_mouse(self):
+        """IsKeyDown("Fire") → IsMouseButtonPressed(Enum.UserInputType.MouseButton1)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if UserInputService:IsKeyDown("Fire") then'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'IsMouseButtonPressed' in fixed
+        assert '"Fire"' not in fixed
+
 
 class TestNewTranspilerFeatures:
     """Tests for newly added transpiler features."""
