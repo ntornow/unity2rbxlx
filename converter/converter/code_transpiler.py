@@ -207,6 +207,250 @@ def transpile_scripts(
 
 
 # ---------------------------------------------------------------------------
+# Multi-line construct preprocessing
+# ---------------------------------------------------------------------------
+
+def _preprocess_multiline_constructs(source: str) -> str:
+    """Pre-process multi-line C# constructs before line-by-line transpilation.
+
+    Handles: multi-line enums, property get/set bodies, out parameters,
+    yield return, null-conditional chains, is-type patterns.
+    """
+    source = _preprocess_multiline_enums(source)
+    source = _preprocess_property_bodies(source)
+    source = _preprocess_out_params(source)
+    source = _preprocess_yield_return(source)
+    source = _preprocess_null_conditional(source)
+    source = _preprocess_is_type_check(source)
+    return source
+
+
+def _preprocess_multiline_enums(source: str) -> str:
+    """Convert multi-line enum declarations to single-line for the line parser."""
+    result = []
+    lines = source.split("\n")
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        # Match enum declaration: "enum Name {" or "[public] enum Name {"
+        m = re.match(r'^(\s*)(?:public\s+|private\s+|protected\s+|internal\s+)?enum\s+(\w+)\s*\{?\s*$', lines[i])
+        if m:
+            indent = m.group(1)
+            enum_name = m.group(2)
+            members = []
+            i += 1
+            # Skip opening brace if on next line
+            if i < len(lines) and lines[i].strip() == "{":
+                i += 1
+            # Collect members until closing brace
+            while i < len(lines):
+                s = lines[i].strip()
+                if s == "}" or s == "};":
+                    break
+                if s and not s.startswith("//") and not s.startswith("["):
+                    # Clean up trailing commas
+                    s = s.rstrip(",").strip()
+                    if s:
+                        members.append(s)
+                i += 1
+            # Emit as single-line enum that the line parser can handle
+            members_str = ", ".join(members)
+            result.append(f"{indent}enum {enum_name} {{{members_str}}}")
+            i += 1  # skip closing brace
+            continue
+        result.append(lines[i])
+        i += 1
+    return "\n".join(result)
+
+
+def _preprocess_property_bodies(source: str) -> str:
+    """Convert C# properties with get/set bodies to Luau getter/setter functions."""
+    lines = source.split("\n")
+    result = []
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        # Match property declaration with body: "public Type Name {"
+        # but NOT auto-properties (those have get; set; on the same line)
+        m = re.match(
+            r'^(\s*)(?:public|private|protected|internal)\s+(?:static\s+)?(?:override\s+)?'
+            r'(\w+(?:<[\w,\s]+>)?(?:\?)?)\s+(\w+)\s*$',
+            lines[i],
+        )
+        if m and i + 1 < len(lines) and lines[i + 1].strip() == "{":
+            indent = m.group(1)
+            prop_type = m.group(2)
+            prop_name = m.group(3)
+            # Look ahead for get/set
+            j = i + 2
+            brace_depth = 1
+            has_get_body = False
+            has_set_body = False
+            get_body_lines = []
+            set_body_lines = []
+            current_accessor = None
+            accessor_depth = 0
+
+            while j < len(lines) and brace_depth > 0:
+                s = lines[j].strip()
+                if s.startswith("get"):
+                    has_get_body = True
+                    current_accessor = "get"
+                    accessor_depth = 0
+                    if "{" in s:
+                        accessor_depth += s.count("{") - s.count("}")
+                        # Single-line get: "get { return x; }"
+                        body_match = re.search(r'get\s*\{\s*return\s+(.+?)\s*;\s*\}', s)
+                        if body_match:
+                            get_body_lines.append(body_match.group(1))
+                            current_accessor = None
+                    j += 1
+                    continue
+                elif s.startswith("set"):
+                    has_set_body = True
+                    current_accessor = "set"
+                    accessor_depth = 0
+                    if "{" in s:
+                        accessor_depth += s.count("{") - s.count("}")
+                    j += 1
+                    continue
+
+                if current_accessor:
+                    accessor_depth += s.count("{") - s.count("}")
+                    if accessor_depth <= 0:
+                        current_accessor = None
+                    elif current_accessor == "get":
+                        body = re.sub(r'\breturn\s+', '', s).rstrip(";").strip()
+                        if body and body != "{" and body != "}":
+                            get_body_lines.append(body)
+                    j += 1
+                    continue
+
+                brace_depth += s.count("{") - s.count("}")
+                j += 1
+
+            if has_get_body or has_set_body:
+                # Emit as a local variable with comment
+                result.append(f"{indent}local {prop_name} = nil -- {prop_type} property")
+                if get_body_lines:
+                    getter_expr = get_body_lines[0] if len(get_body_lines) == 1 else "nil"
+                    result.append(f"{indent}local function get_{prop_name}() return {getter_expr} end")
+                i = j
+                continue
+
+        result.append(lines[i])
+        i += 1
+    return "\n".join(result)
+
+
+def _preprocess_out_params(source: str) -> str:
+    """Handle C# out parameters.
+
+    - Strip 'out' keyword from method parameter declarations
+    - Convert 'out var x' and 'out Type x' in call sites to just 'x'
+    - Handle common patterns like Physics.Raycast(... out hit)
+    """
+    # Strip 'out' from method call arguments: Method(a, out var x) → Method(a, x)
+    source = re.sub(r'\bout\s+var\s+(\w+)', r'\1', source)
+    source = re.sub(r'\bout\s+\w+\s+(\w+)', r'\1', source)
+    # Strip bare 'out' before variable: Method(a, out x) → Method(a, x)
+    source = re.sub(r'\bout\s+(\w+)(?=\s*[,\)])', r'\1', source)
+    # Strip 'ref' keyword similarly
+    source = re.sub(r'\bref\s+(\w+)(?=\s*[,\)])', r'\1', source)
+    return source
+
+
+def _preprocess_yield_return(source: str) -> str:
+    """Convert yield return patterns to task.wait equivalents."""
+    # yield return new WaitForSeconds(N) → task.wait(N)
+    source = re.sub(
+        r'\byield\s+return\s+new\s+WaitForSeconds\s*\(([^)]+)\)',
+        r'task.wait(\1)',
+        source,
+    )
+    # yield return new WaitForEndOfFrame() → task.wait()
+    source = re.sub(
+        r'\byield\s+return\s+new\s+WaitForEndOfFrame\s*\(\s*\)',
+        'task.wait()',
+        source,
+    )
+    # yield return new WaitForFixedUpdate() → task.wait()
+    source = re.sub(
+        r'\byield\s+return\s+new\s+WaitForFixedUpdate\s*\(\s*\)',
+        'task.wait()',
+        source,
+    )
+    # yield return new WaitUntil(() => condition) → repeat task.wait() until condition
+    source = re.sub(
+        r'\byield\s+return\s+new\s+WaitUntil\s*\(\s*\(\)\s*=>\s*(.+?)\s*\)',
+        r'repeat task.wait() until \1',
+        source,
+    )
+    # yield return null → task.wait()
+    source = re.sub(r'\byield\s+return\s+null\s*;?', 'task.wait()', source)
+    # yield break → return
+    source = re.sub(r'\byield\s+break\s*;?', 'return', source)
+    # Generic yield return expr → task.wait()
+    source = re.sub(r'\byield\s+return\s+[^;]+;?', 'task.wait()', source)
+    return source
+
+
+def _preprocess_null_conditional(source: str) -> str:
+    """Decompose ?. null-conditional chains to nil-check patterns.
+
+    obj?.Property → (obj and obj.Property or nil)
+    obj?.Method() → if obj then obj:Method() end
+    """
+    # Simple property access: obj?.Property (not followed by ( )
+    # Convert to: (obj and obj.Property or nil)
+    source = re.sub(
+        r'(\w+)\?\.([\w]+)(?!\s*\()',
+        r'(\1 and \1.\2 or nil)',
+        source,
+    )
+    # Method call: obj?.Method(args) → if obj then obj.Method(args) end
+    # This is harder in-line; convert to a safe-call pattern
+    source = re.sub(
+        r'(\w+)\?\.([\w]+)\(([^)]*)\)',
+        r'(if \1 then \1.\2(\3) else nil)',
+        source,
+    )
+    # Null-coalescing assignment: x ??= expr → if x == nil then x = expr end
+    source = re.sub(
+        r'(\w+)\s*\?\?=\s*([^;]+);?',
+        r'if \1 == nil then \1 = \2 end',
+        source,
+    )
+    return source
+
+
+def _preprocess_is_type_check(source: str) -> str:
+    """Convert C# 'is' type-check patterns to Luau equivalents.
+
+    obj is Type → obj:IsA("Type") (for Unity/Roblox types)
+    obj is null → obj == nil
+    obj is not null → obj ~= nil
+    """
+    # is not null → ~= nil
+    source = re.sub(r'(\w+)\s+is\s+not\s+null\b', r'\1 ~= nil', source)
+    # is null → == nil
+    source = re.sub(r'(\w+)\s+is\s+null\b', r'\1 == nil', source)
+    # is Type varName (pattern matching) → typeof(obj) == "Type" and assign
+    source = re.sub(
+        r'(\w+)\s+is\s+([A-Z]\w+)\s+(\w+)',
+        r'\1 ~= nil and typeof(\1) == "\2" -- local \3 = \1',
+        source,
+    )
+    # Simple is Type (without variable binding)
+    source = re.sub(
+        r'(\w+)\s+is\s+([A-Z]\w+)\b(?!\s+\w)',
+        r'typeof(\1) == "\2"',
+        source,
+    )
+    return source
+
+
+# ---------------------------------------------------------------------------
 # Rule-based transpilation
 # ---------------------------------------------------------------------------
 
@@ -226,11 +470,20 @@ def _rule_based_transpile(
     if api_mappings is None:
         api_mappings = API_CALL_MAP
     warnings: list[str] = []
+
+    # Pre-process: handle multi-line constructs before line-by-line pass
+    csharp_source = _preprocess_multiline_constructs(csharp_source)
+
     lines = csharp_source.split("\n")
     output_lines: list[str] = []
     services_needed: set[str] = set()
     matched_patterns = 0
     total_code_lines = 0
+
+    # Stateful tracking for switch/case blocks
+    in_switch = False
+    switch_var = ""
+    first_case = True
 
     for line in lines:
         stripped = line.strip()
@@ -313,6 +566,45 @@ def _rule_based_transpile(
             output_lines.append(f"-- {stripped}")
             matched_patterns += 1
             continue
+
+        # -- Switch/case stateful conversion --
+        m_switch = re.match(r"^\s*switch\s*\((.+)\)\s*\{?\s*$", stripped)
+        if m_switch:
+            in_switch = True
+            switch_var = m_switch.group(1).strip()
+            first_case = True
+            matched_patterns += 1
+            continue
+
+        if in_switch:
+            # case "value": or case EnumValue: or case 0:
+            m_case = re.match(r'^\s*case\s+(.+?):\s*$', stripped)
+            if m_case:
+                case_val = m_case.group(1).strip()
+                indent = len(line) - len(line.lstrip())
+                if first_case:
+                    output_lines.append(f"{' ' * indent}if {switch_var} == {case_val} then")
+                    first_case = False
+                else:
+                    output_lines.append(f"{' ' * indent}elseif {switch_var} == {case_val} then")
+                matched_patterns += 1
+                continue
+            if re.match(r'^\s*default\s*:\s*$', stripped):
+                indent = len(line) - len(line.lstrip())
+                output_lines.append(f"{' ' * indent}else")
+                matched_patterns += 1
+                continue
+            if stripped == "break" or stripped == "break;":
+                matched_patterns += 1
+                continue
+            # End of switch block
+            if stripped == "}" or stripped == "end":
+                in_switch = False
+                switch_var = ""
+                first_case = True
+                output_lines.append(f"{' ' * (len(line) - len(line.lstrip()))}end")
+                matched_patterns += 1
+                continue
 
         # -- C# property get/set blocks -> skip --
         if re.match(r"^\s*(?:get|set)\s*\{", stripped):
@@ -513,12 +805,12 @@ def _rule_based_transpile(
         converted = re.sub(r"\bcatch\s*\{?\s*$", "end)\nif not ok then", converted)
         converted = re.sub(r"\bfinally\s*\{?\s*$", "end -- finally", converted)
 
-        # switch/case -> if/elseif (basic)
-        converted = re.sub(r"\bswitch\s*\((\w+)\)\s*\{?", r"-- switch \1", converted)
-        converted = re.sub(r'\bcase\s+"([^"]+)":', r'if \1 == "\1" then -- case', converted)
-        converted = re.sub(r"\bcase\s+(\w+):", r"if \1 then -- case", converted)
-        converted = re.sub(r"\bdefault:", "else -- default", converted)
-        converted = re.sub(r"\bbreak\s*$", "", converted)
+        # switch/case handled by stateful converter above; catch any remaining
+        # bare break statements from switch blocks
+        if stripped == "break" or stripped == "break;":
+            if in_switch:
+                matched_patterns += 1
+                continue
 
         # foreach: "foreach (Type item in collection)" -> "for _, item in collection do"
         # Also handles generic types: "foreach (KeyValuePair<X,Y> item in collection)"
@@ -682,10 +974,10 @@ def _sanitize_luau(source: str) -> str:
         # Lines starting with C# type annotations without local
         if re.match(r"^\s*(void|int|float|double|bool|string|char|byte|short|long|uint|ulong)\s+\w+\s*\(", stripped):
             is_invalid = True
-        # C# switch/case with braces
-        if re.match(r"^\s*switch\s*\(", stripped):
+        # C# switch/case with braces (only if not already converted)
+        if re.match(r"^\s*switch\s*\(", stripped) and "-- switch" not in stripped:
             is_invalid = True
-        if re.match(r"^\s*case\s+.+:", stripped) and "-- case" not in stripped:
+        if re.match(r"^\s*case\s+.+:", stripped) and "then" not in stripped and "-- " not in stripped:
             is_invalid = True
         # Stray semicolons on their own
         if stripped == ";":
@@ -792,13 +1084,92 @@ def _has_syntax_errors(luau_source: str) -> bool:
 
 
 def _convert_interpolated_string(content: str) -> str:
-    """Convert C# interpolated string content to string.format."""
+    """Convert C# interpolated string content to string.format.
+
+    Handles format specifiers: {value:F2} → %.2f, {n:N0} → %d, {x:X} → %x, etc.
+    """
     parts = re.findall(r"\{([^}]+)\}", content)
     if not parts:
         return f'"{content}"'
-    fmt = re.sub(r"\{[^}]+\}", "%s", content)
-    args = ", ".join(f"tostring({p})" for p in parts)
-    return f'string.format("{fmt}", {args})'
+
+    # Build format string and argument list
+    fmt_parts = []
+    arg_list = []
+    last_end = 0
+
+    for m in re.finditer(r"\{([^}]+)\}", content):
+        fmt_parts.append(content[last_end:m.start()])
+        expr = m.group(1)
+        last_end = m.end()
+
+        # Check for format specifier: "expr:spec"
+        if ":" in expr:
+            var, spec = expr.split(":", 1)
+            fmt_spec = _csharp_format_to_lua(spec)
+            fmt_parts.append(fmt_spec)
+            arg_list.append(var.strip())
+        else:
+            fmt_parts.append("%s")
+            arg_list.append(f"tostring({expr.strip()})")
+
+    fmt_parts.append(content[last_end:])
+    fmt_str = "".join(fmt_parts)
+    args = ", ".join(arg_list)
+    return f'string.format("{fmt_str}", {args})'
+
+
+def _csharp_format_to_lua(spec: str) -> str:
+    """Convert C# format specifier to Lua string.format specifier.
+
+    F2 → %.2f, N0 → %d, X → %x, D3 → %03d, P → %.0f%%, etc.
+    """
+    spec = spec.strip()
+    s_upper = spec.upper()
+
+    # Fixed-point: F, F2, F3 → %.Nf
+    m = re.match(r'^[Ff](\d*)$', spec)
+    if m:
+        decimals = m.group(1) or "2"
+        return f"%.{decimals}f"
+
+    # Number with grouping: N, N0, N2 → %.Nf (no grouping in Lua)
+    m = re.match(r'^[Nn](\d*)$', spec)
+    if m:
+        decimals = m.group(1) or "2"
+        if decimals == "0":
+            return "%d"
+        return f"%.{decimals}f"
+
+    # Decimal: D, D3 → %d or %03d
+    m = re.match(r'^[Dd](\d*)$', spec)
+    if m:
+        width = m.group(1)
+        if width:
+            return f"%0{width}d"
+        return "%d"
+
+    # Hex: X, X2 → %x, %02x
+    m = re.match(r'^[Xx](\d*)$', spec)
+    if m:
+        width = m.group(1)
+        if width:
+            return f"%0{width}x"
+        return "%x"
+
+    # Percent: P, P0 → multiply by 100 and add %
+    m = re.match(r'^[Pp](\d*)$', spec)
+    if m:
+        decimals = m.group(1) or "0"
+        return f"%.{decimals}f%%"
+
+    # General: G, E → %g, %e
+    if s_upper.startswith("G"):
+        return "%g"
+    if s_upper.startswith("E"):
+        return "%e"
+
+    # Default: just use %s
+    return "%s"
 
 
 # ---------------------------------------------------------------------------

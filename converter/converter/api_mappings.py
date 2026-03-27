@@ -63,6 +63,13 @@ API_CALL_MAP: dict[str, str] = {
     "transform.LookAt": "CFrame.lookAt",
     "transform.TransformPoint": ":PointToWorldSpace",
     "transform.InverseTransformPoint": ":PointToObjectSpace",
+    "transform.TransformDirection": ".CFrame:VectorToWorldSpace",
+    "transform.InverseTransformDirection": ".CFrame:VectorToObjectSpace",
+    "transform.TransformVector": ".CFrame:VectorToWorldSpace",
+    "transform.localToWorldMatrix": ".CFrame",
+    "transform.worldToLocalMatrix": ".CFrame:Inverse()",
+    "transform.lossyScale": ".Size",
+    "transform.root": ":FindFirstAncestorOfClass('Model') or script.Parent",
     # -- GetComponent --
     "GetComponent": ":FindFirstChildOfClass",
     "GetComponentInChildren": ":FindFirstChildOfClass",
@@ -210,8 +217,15 @@ API_CALL_MAP: dict[str, str] = {
     # -- Animation --
     "Animator.SetBool": ":SetAttribute",
     "Animator.SetFloat": ":SetAttribute",
+    "Animator.SetInteger": ":SetAttribute",
+    "Animator.GetBool": ":GetAttribute",
+    "Animator.GetFloat": ":GetAttribute",
+    "Animator.GetInteger": ":GetAttribute",
     "Animator.SetTrigger": "AnimationTrack:Play()",
+    "Animator.ResetTrigger": "-- ResetTrigger: animation state reset",
     "Animator.Play": "AnimationTrack:Play()",
+    "Animator.CrossFade": "AnimationTrack:Play()",
+    "Animator.CrossFadeInFixedTime": "AnimationTrack:Play()",
     "Animation.Play": "AnimationTrack:Play()",
     # -- Camera --
     "Camera.main": "workspace.CurrentCamera",
@@ -453,6 +467,28 @@ API_CALL_MAP: dict[str, str] = {
     "PlayerPrefs.SetString": "-- PlayerPrefs: use DataStoreService",
     "PlayerPrefs.Save": "-- PlayerPrefs.Save: DataStore saves automatically",
     "PlayerPrefs.DeleteAll": "-- PlayerPrefs.DeleteAll: clear DataStore",
+    # -- CharacterController --
+    ".isGrounded": "-- isGrounded: use Humanoid:GetState() == Enum.HumanoidStateType.Running",
+    "CharacterController.Move": "Humanoid:Move",
+    "CharacterController.SimpleMove": "Humanoid:Move",
+    # -- Physics cast additional --
+    "Physics.SphereCastAll": "workspace:Spherecast",
+    "Physics.BoxCast": "workspace:Blockcast",
+    "Physics.BoxCastAll": "workspace:Blockcast",
+    "Physics.CapsuleCast": "workspace:Spherecast",
+    # -- Renderer --
+    ".material.color": ".Color",
+    ".material.mainTexture": "-- mainTexture: use SurfaceAppearance",
+    ".sharedMaterial": "-- sharedMaterial: use part properties",
+    ".materials": "-- materials: use SurfaceAppearance",
+    ".enabled": ".Visible",
+    # -- Misc additional --
+    "FindObjectOfType": "workspace:FindFirstChildOfClass",
+    "FindObjectsOfType": "workspace:GetDescendants()",
+    "GameObject.Instantiate": ":Clone()",
+    ".SetActive(false)": ".Transparency = 1; .CanCollide = false",
+    ".SetActive(true)": ".Transparency = 0; .CanCollide = true",
+    "Invoke(": "task.delay(",
     # -- Destroy with delay --
     "Destroy(gameObject,": "Debris:AddItem(",
     "Destroy(this.gameObject,": "Debris:AddItem(script.Parent,",

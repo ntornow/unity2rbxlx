@@ -265,19 +265,24 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
 
     # Fix C# string interpolation $"..." that leaked through
     if re.search(r'\$"[^"]*\{', source):
-        # Convert $"text {var}" to string.format("text %s", var)
-        # This is a best-effort fix for simple cases
+        # Convert $"text {var}" or $"text {var:F2}" to string.format
         def _fix_interpolation(m):
             s = m.group(0)[2:-1]  # strip $" and "
-            parts = re.split(r'\{(\w+)\}', s)
+            parts = re.split(r'\{([^}]+)\}', s)
             fmt_str = ""
             args = []
             for i, p in enumerate(parts):
                 if i % 2 == 0:
                     fmt_str += p
                 else:
-                    fmt_str += "%s"
-                    args.append(p)
+                    # Handle format specifiers: {var:F2} → var with %.2f
+                    if ":" in p:
+                        var, spec = p.split(":", 1)
+                        fmt_str += _format_spec_to_lua(spec)
+                        args.append(var.strip())
+                    else:
+                        fmt_str += "%s"
+                        args.append(f"tostring({p.strip()})")
             if args:
                 return f'string.format("{fmt_str}", {", ".join(args)})'
             return f'"{fmt_str}"'
@@ -634,3 +639,31 @@ def fix_gameplay_patterns(name: str, source: str) -> tuple[str, list[str]]:
     if source != original:
         return source, fixes
     return source, []
+
+
+def _format_spec_to_lua(spec: str) -> str:
+    """Convert C# format specifier to Lua string.format specifier."""
+    spec = spec.strip()
+    m = re.match(r'^[Ff](\d*)$', spec)
+    if m:
+        return f"%.{m.group(1) or '2'}f"
+    m = re.match(r'^[Nn](\d*)$', spec)
+    if m:
+        d = m.group(1) or "2"
+        return "%d" if d == "0" else f"%.{d}f"
+    m = re.match(r'^[Dd](\d*)$', spec)
+    if m:
+        w = m.group(1)
+        return f"%0{w}d" if w else "%d"
+    m = re.match(r'^[Xx](\d*)$', spec)
+    if m:
+        w = m.group(1)
+        return f"%0{w}x" if w else "%x"
+    m = re.match(r'^[Pp](\d*)$', spec)
+    if m:
+        return f"%.{m.group(1) or '0'}f%%"
+    if spec.upper().startswith("G"):
+        return "%g"
+    if spec.upper().startswith("E"):
+        return "%e"
+    return "%s"

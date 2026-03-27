@@ -561,3 +561,199 @@ class TestNewTranspilerFeatures:
         csharp = 'tween.OnComplete(Finish);'
         luau, _, _ = _rule_based_transpile(csharp)
         assert "Completed:Connect(" in luau
+
+
+class TestSwitchCase:
+    def test_simple_switch(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = """
+switch (type) {
+    case 0:
+        DoA();
+        break;
+    case 1:
+        DoB();
+        break;
+    default:
+        DoC();
+        break;
+}"""
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "if type == 0 then" in luau
+        assert "elseif type == 1 then" in luau
+        assert "else" in luau
+        assert "end" in luau
+        assert "break" not in luau or "-- " in luau
+
+    def test_string_case(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = """
+switch (name) {
+    case "fire":
+        PlayFire();
+        break;
+    case "water":
+        PlayWater();
+        break;
+}"""
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert 'if name == "fire" then' in luau
+        assert 'elseif name == "water" then' in luau
+
+
+class TestMultiLineEnum:
+    def test_multiline_enum(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = """
+public enum ModulationType
+{
+    Sine,
+    Triangle,
+    Perlin,
+    Random
+}"""
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "ModulationType" in luau
+        assert "Sine" in luau
+        assert "Random" in luau
+
+    def test_enum_with_values(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = """
+enum State
+{
+    Idle = 0,
+    Running = 1,
+    Dead = 2
+}"""
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "Idle = 0" in luau
+        assert "Running = 1" in luau
+        assert "Dead = 2" in luau
+
+
+class TestOutParameters:
+    def test_out_var(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'dict.TryGetValue(key, out var value);'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "out" not in luau or "-- " in luau
+
+    def test_out_type(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'Physics.Raycast(origin, direction, out RaycastHit hit, distance);'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "out" not in luau or "-- " in luau
+
+    def test_ref_param(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'void DoSomething(ref int x) {'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "ref" not in luau or "-- " in luau
+
+
+class TestYieldReturn:
+    def test_wait_for_seconds(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'yield return new WaitForSeconds(2.5f);'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "task.wait(" in luau
+        assert "yield" not in luau
+
+    def test_yield_null(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'yield return null;'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "task.wait()" in luau
+
+    def test_yield_break(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'yield break;'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "return" in luau
+        assert "yield" not in luau
+
+
+class TestNullConditional:
+    def test_property_access(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'var name = obj?.Name;'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "?" not in luau or "-- " in luau
+        assert "obj" in luau
+        assert "nil" in luau
+
+    def test_null_coalescing_assignment(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'cache ??= new List<int>();'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "if cache == nil" in luau or "cache" in luau
+
+
+class TestIsTypeCheck:
+    def test_is_null(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'if (obj is null) return;'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "== nil" in luau
+        assert " is " not in luau or "-- " in luau
+
+    def test_is_not_null(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'if (obj is not null) DoSomething();'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "~= nil" in luau
+
+    def test_is_type(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'if (comp is BoxCollider) return;'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "BoxCollider" in luau
+        assert "typeof" in luau or "IsA" in luau
+
+
+class TestStringInterpolation:
+    def test_format_specifier_f2(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'string s = $"Value: {health:F2}";'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "%.2f" in luau
+        assert "health" in luau
+
+    def test_format_specifier_n0(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'string s = $"Score: {score:N0}";'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "%d" in luau
+
+    def test_format_specifier_d3(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'string s = $"ID: {id:D3}";'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "%03d" in luau
+
+    def test_format_specifier_x(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'string s = $"Hex: {val:X}";'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "%x" in luau
+
+    def test_mixed_format(self):
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'string s = $"HP: {hp:F1}/{maxHp}";'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "%.1f" in luau
+        assert "hp" in luau
+        assert "maxHp" in luau
+
+
+class TestPropertyBodies:
+    def test_simple_getter(self):
+        from converter.code_transpiler import _preprocess_multiline_constructs
+        csharp = """public float Speed
+{
+    get { return m_Speed; }
+}"""
+        result = _preprocess_multiline_constructs(csharp)
+        assert "local Speed" in result or "get_Speed" in result
+        assert "m_Speed" in result
