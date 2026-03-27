@@ -894,6 +894,18 @@ script.Disabled = true
             log.info("[write_output] MeshLoader script embedded for %d mesh assets",
                      sum(1 for p in self.ctx.uploaded_assets if Path(p).suffix.lower() in ('.fbx', '.obj')))
 
+        # Final validation pass: apply validator fixes to all scripts one last time
+        # (catches patterns introduced by require injection, reclassification, etc.)
+        from converter.luau_validator import validate_and_fix
+        final_fixes = 0
+        for s in self.state.rbx_place.scripts:
+            fixed_source, fixes = validate_and_fix(s.name, s.source)
+            if fixes:
+                s.source = fixed_source
+                final_fixes += len(fixes)
+        if final_fixes:
+            log.info("[write_output] Final validation pass applied %d fixes", final_fixes)
+
         # Final write: ensure .luau files on disk match the fully processed sources
         # (after require injection, reclassification, and all other post-processing)
         scripts_dir = self.output_dir / "scripts"

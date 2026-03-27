@@ -3388,3 +3388,207 @@ class TestValidatorBatch19:
         source = '    m_vehicle.Input = new Vehicle.VehicleInput'
         fixed, _ = validate_and_fix("test", source)
         assert '= {}' in fixed
+
+    # --- New fixes: systemic Luau quality issues ---
+
+    def test_workspace_gravity_dot(self):
+        """workspace.Gravity:Dot() → Vector3 form."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local d = toTarget:Dot(workspace.Gravity)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'Vector3.new(0, -workspace.Gravity, 0)' in fixed
+
+    def test_workspace_gravity_vector_arithmetic(self):
+        """workspace.Gravity * dt in vector context → Vector3."""
+        from converter.luau_validator import validate_and_fix
+        source = 'm_ExternalForce = m_ExternalForce + workspace.Gravity * dt'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'Vector3.new(0, -workspace.Gravity, 0)' in fixed
+
+    def test_cframe_lookat_single_arg(self):
+        """CFrame.lookAt(dir) → CFrame.lookAt(origin, origin + dir)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'obj.CFrame = CFrame.lookAt(forward)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'script.Parent.Position' in fixed
+        assert 'script.Parent.Position + forward' in fixed
+
+    def test_cframe_lookat_two_args_unchanged(self):
+        """CFrame.lookAt(pos, target) should not be changed."""
+        from converter.luau_validator import validate_and_fix
+        source = 'obj.CFrame = CFrame.lookAt(pos, target)'
+        fixed, _ = validate_and_fix("test", source)
+        assert fixed.strip() == source.strip()
+
+    def test_and_then_fix(self):
+        """'and then' at line break → 'then'."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if a > 0 and then\n    doSomething()\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'and then' not in fixed
+        assert 'then' in fixed
+
+    def test_incomplete_bitshift(self):
+        """1 << -- comment → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local layer = 1 << -- LayerMask: use CollisionGroups'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [Unity LayerMask]' in fixed
+
+    def test_incomplete_assignment_comment(self):
+        """var = -- comment: text → var = nil -- comment."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local speed = -- PlayerInput: use UserInputService'
+        fixed, _ = validate_and_fix("test", source)
+        assert '= nil' in fixed
+
+    def test_ternary_assignment_eq(self):
+        """(if x = val then → (if x == val then."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local y = (if x = true then 1 else 0)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '==' in fixed
+
+    def test_animator_state_info_commented(self):
+        """GetCurrentAnimatorStateInfo → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local info = m_Animator.GetCurrentAnimatorStateInfo(0)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [Unity Animator]' in fixed
+
+    def test_short_name_hash_commented(self):
+        """.shortNameHash → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if info.shortNameHash == hashIdle then'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [Unity Animator]' in fixed
+
+    def test_warp_to_position(self):
+        """.Warp(pos) → .Position = pos."""
+        from converter.luau_validator import validate_and_fix
+        source = '_agent.Warp(m_Rigidbody.Position)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.Position = m_Rigidbody.Position' in fixed
+
+    def test_cframe_identity(self):
+        """CFrame.identity → CFrame.new()."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local cf = CFrame.identity'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'CFrame.new()' in fixed
+
+    def test_reset_path_commented(self):
+        """.ResetPath() → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '_agent.ResetPath()'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [Unity NavMesh]' in fixed
+
+    def test_set_color_commented(self):
+        """Material .SetColor() → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = 'mat.SetColor("_Color2", Color3.new(1, 0, 0))'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [Unity Material]' in fixed
+
+    def test_vector3_new_array(self):
+        """Vector3.new[N] → table.create(N)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'm_WorldDirection = Vector3.new[arcsCount]'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'table.create(arcsCount' in fixed
+
+    def test_undefined_controller_fix(self):
+        """controller → m_Controller when undefined."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local m_Controller = nil\ncontroller.grounded = true'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'm_Controller.grounded' in fixed
+
+    def test_non_alloc_methods(self):
+        """GetPartBoundsInRadiusNonAlloc → GetPartBoundsInRadius."""
+        from converter.luau_validator import validate_and_fix
+        source = 'workspace:GetPartBoundsInRadiusNonAlloc(pos, r, cache)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'GetPartBoundsInRadius(' in fixed
+        assert 'NonAlloc' not in fixed
+
+    def test_contacts_commented(self):
+        """Unity .contacts → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '    local count = collision.contacts.length'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [Unity Collision]' in fixed or 'contacts' not in fixed.replace('--', '')
+
+    def test_render_texture_commented(self):
+        """RenderTexture → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '    local rt = RenderTexture.new(w, h, 16)'
+        fixed, _ = validate_and_fix("test", source)
+        # May be caught by [Unity render] or [Unity camera] - either is valid
+        assert '--' in fixed and 'RenderTexture' in fixed
+
+    def test_tuple_to_table(self):
+        """(a, b, c, d) assignment → {a, b, c, d}."""
+        from converter.luau_validator import validate_and_fix
+        source = '    local blendedRotation = (0, 0, 0, 0)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '{0, 0, 0, 0}' in fixed
+
+    def test_tuple_with_expressions(self):
+        """(expr, expr) assignment → {expr, expr}."""
+        from converter.luau_validator import validate_and_fix
+        source = '    local bounds = (script.Parent.Position, Vector3.zero)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '{script.Parent.Position, Vector3.zero}' in fixed
+
+    def test_message_type_to_string(self):
+        """MessageType.DEAD → "DEAD"."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if msg == MessageType.DEAD then'
+        fixed, _ = validate_and_fix("test", source)
+        assert '"DEAD"' in fixed
+
+    def test_continue_preserved(self):
+        """continue is valid Luau — should be preserved."""
+        from converter.luau_validator import validate_and_fix
+        source = '    for i = 1, 10 do\n        continue\n    end'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'continue' in fixed
+        assert '-- continue' not in fixed
+
+    def test_projection_matrix_commented(self):
+        """.projectionMatrix → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '    cam.projectionMatrix = matrix'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [Unity camera]' in fixed
+
+    def test_null_coalescing_complex(self):
+        """Complex ?? expression → or-pattern."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local data = obj.GetData(key) ?? ""'
+        fixed, _ = validate_and_fix("test", source)
+        assert '??' not in fixed
+        assert 'or ""' in fixed
+
+    def test_cframe_angles_vector(self):
+        """CFrame.Angles(vector) → CFrame.Angles(vec.X, vec.Y, vec.Z)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'obj.CFrame = obj.CFrame * CFrame.Angles(rotAxis * speed)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.X)' in fixed or '.X,' in fixed
+
+    def test_cframe_angles_three_args_unchanged(self):
+        """CFrame.Angles(x, y, z) should not be changed."""
+        from converter.luau_validator import validate_and_fix
+        source = 'obj.CFrame = CFrame.Angles(0, math.rad(90), 0)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'CFrame.Angles(0, math.rad(90), 0)' in fixed
+
+    def test_dt_initialization(self):
+        """dt used before task.wait() → initialized before loop."""
+        from converter.luau_validator import validate_and_fix
+        source = 'while true do\n    pos = pos + dir * dt\n    dt = task.wait()\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'local dt = 0' in fixed

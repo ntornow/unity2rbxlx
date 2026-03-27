@@ -213,6 +213,16 @@ def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
             r'\1:Dot(\2)',
             source,
         )
+    # Final pass: fix `and then` patterns that may have been introduced by structural fixes
+    if re.search(r'\band\s+then\s*\n', source):
+        source = re.sub(
+            r'\band\s+then\s*\n(\s+)(.*?\))\s*$',
+            r'and\n\1\2 then',
+            source,
+            flags=re.MULTILINE,
+        )
+    if re.search(r'\band\s+then\b', source):
+        source = re.sub(r'\band\s+then\b', 'then', source)
     source = _fix_startup_race_conditions(name, source, fixes)
     source = _inject_utility_functions(name, source, fixes)
 
@@ -1474,12 +1484,22 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
         fixes.append("Fixed Unity Material Get* API calls → stub values")
 
     # Fix bare tuple assignment: `local x = (a, b, c, d)` → `local x = {a, b, c, d}`
-    # C# Vector4 / tuple pattern where parentheses contain comma-separated values
-    if re.search(r'=\s*\(\w+\.\w+,\s*\w+', source):
+    # C# constructor/tuple pattern where parentheses contain comma-separated values
+    # Matches: = (expr, expr, ...) at end of line or followed by closing paren
+    if re.search(r'=\s*\([^)]*,', source):
+        def _fix_tuple_assign(m):
+            indent = m.group(1)
+            lhs = m.group(2)
+            contents = m.group(3)
+            # Only convert if there are commas (multi-value tuple)
+            if ',' in contents:
+                return f'{indent}{lhs} = {{{contents}}}'
+            return m.group(0)
         source = re.sub(
-            r'=\s*\((\w+\.\w+(?:,\s*\w+\.\w+)+(?:,\s*\w+)?)\)',
-            r'= {\1}',
+            r'^(\s*)((?:local\s+)?\w+(?:\.\w+)*)\s*=\s*\(([^)]+(?:,[^)]+)+)\)\s*$',
+            _fix_tuple_assign,
             source,
+            flags=re.MULTILINE,
         )
         fixes.append("Fixed bare tuple (a, b, c) → {a, b, c}")
 
@@ -2442,6 +2462,13 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
 
     # .CFrame.Position = value → .Position = value (CFrame.Position is read-only)
     if '.CFrame.Position =' in source:
+        # Handle bare receiver: line starting with `.CFrame.Position =`
+        source = re.sub(
+            r'^(\s*)\.CFrame\.Position\s*=',
+            r'\1script.Parent.Position =',
+            source,
+            flags=re.MULTILINE,
+        )
         source = re.sub(r'(\w[\w.\[\]]*?)\.CFrame\.Position\s*=', r'\1.Position =', source)
         fixes.append("Fixed .CFrame.Position assignment → .Position")
 
@@ -3379,6 +3406,287 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         # Inject a local lookup at the top of the script
         source = f'local m_MonoBehaviour = script.Parent:FindFirstChildWhichIsA("ModuleScript") or script.Parent\n' + source
         fixes.append("Injected m_MonoBehaviour lookup for SceneLinkedSMB pattern")
+
+    # Fix CFrame.Angles(Vector3) → CFrame.Angles(vec.X, vec.Y, vec.Z)
+    # CFrame.Angles takes 3 numbers, not a Vector3
+    if 'CFrame.Angles(' in source:
+        def _fix_cframe_angles(m):
+            arg = m.group(1).strip()
+            # If it's already 3 comma-separated args, leave it
+            depth = 0
+            commas = 0
+            for c in arg:
+                if c == '(':
+                    depth += 1
+                elif c == ')':
+                    depth -= 1
+                elif c == ',' and depth == 0:
+                    commas += 1
+            if commas >= 2:
+                return m.group(0)  # Already has 3+ args
+            if commas == 0 and arg:
+                # Single vector arg: CFrame.Angles(vec) → CFrame.Angles(vec.X, vec.Y, vec.Z)
+                # But only if it looks like a vector expression (not already a number)
+                if re.match(r'^[\d.\-]+$', arg):
+                    return m.group(0)  # It's a single number, leave it
+                return f'CFrame.Angles(math.rad({arg}.X), math.rad({arg}.Y), math.rad({arg}.Z))'
+            return m.group(0)
+        source = re.sub(r'CFrame\.Angles\(([^)]+)\)', _fix_cframe_angles, source)
+        fixes.append("Fixed CFrame.Angles(Vector3) → CFrame.Angles(vec.X, vec.Y, vec.Z)")
+
+    # Fix uninitialized `dt` in while loops: add `local dt = 0` before loop
+    # Pattern: `while ... do ... dt ... dt = task.wait() ... end` where dt is used before assignment
+    if 'dt = task.wait()' in source and 'local dt' not in source:
+        lines = source.split('\n')
+        new_lines = []
+        dt_initialized = False
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            # If we see a while/for loop, check if dt is used before assignment in it
+            if (stripped.startswith('while ') or stripped.startswith('for ')):
+                uses_dt_before_assign = False
+                for j in range(i + 1, min(i + 20, len(lines))):
+                    fwd = lines[j].strip()
+                    if fwd == 'end':
+                        break
+                    if 'dt = task.wait()' in fwd:
+                        break
+                    if re.search(r'\bdt\b', fwd) and not fwd.startswith('--'):
+                        uses_dt_before_assign = True
+                        break
+                if uses_dt_before_assign:
+                    indent = len(line) - len(line.lstrip())
+                    if not dt_initialized:
+                        new_lines.append(' ' * indent + 'local dt = 0')
+                        dt_initialized = True
+                    else:
+                        new_lines.append(' ' * indent + 'dt = 0')
+            new_lines.append(line)
+        if dt_initialized:
+            source = '\n'.join(new_lines)
+            fixes.append("Added dt initialization before while loop")
+
+    # Fix workspace.Gravity used as Vector3 (it's a number in Roblox)
+    # workspace.Gravity:Dot(...) or workspace.Gravity * Vector3 or + workspace.Gravity etc.
+    if 'workspace.Gravity' in source:
+        # :Dot() on Gravity → Vector3 context
+        source = re.sub(
+            r'workspace\.Gravity:Dot\(([^)]+)\)',
+            r'Vector3.new(0, -workspace.Gravity, 0):Dot(\1)',
+            source,
+        )
+        # workspace.Gravity * scalar_or_vec (not just single number)
+        source = re.sub(
+            r'workspace\.Gravity\s*\*\s*workspace\.Gravity\b',
+            'workspace.Gravity * workspace.Gravity',  # number * number is fine
+            source,
+        )
+        # vec + workspace.Gravity or vec - workspace.Gravity (vector arithmetic context)
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\s*\+\s*workspace\.Gravity\s*\*\s*(\w+)\b',
+            r'\1 + Vector3.new(0, -workspace.Gravity, 0) * \2',
+            source,
+        )
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\s*-\s*workspace\.Gravity\s*\*\s*(\w+)\b',
+            r'\1 - Vector3.new(0, -workspace.Gravity, 0) * \2',
+            source,
+        )
+        # toTarget:Dot(workspace.Gravity) → toTarget:Dot(Vector3.new(0, -workspace.Gravity, 0))
+        source = re.sub(
+            r':Dot\(workspace\.Gravity\)',
+            ':Dot(Vector3.new(0, -workspace.Gravity, 0))',
+            source,
+        )
+        fixes.append("Fixed workspace.Gravity used as Vector3 → Vector3.new(0, -workspace.Gravity, 0)")
+
+    # Fix CFrame.lookAt with single arg → needs (origin, target)
+    # CFrame.lookAt(dir) → CFrame.lookAt(script.Parent.Position, script.Parent.Position + dir)
+    if 'CFrame.lookAt(' in source:
+        def _fix_cframe_lookat(m):
+            args = m.group(1).strip()
+            # Count commas outside parens to see if it's already 2+ args
+            depth = 0
+            commas = 0
+            for c in args:
+                if c == '(':
+                    depth += 1
+                elif c == ')':
+                    depth -= 1
+                elif c == ',' and depth == 0:
+                    commas += 1
+            if commas == 0:
+                # Single arg — wrap with origin
+                return f'CFrame.lookAt(script.Parent.Position, script.Parent.Position + {args})'
+            return m.group(0)  # Already has 2+ args
+        source = re.sub(r'CFrame\.lookAt\(([^)]+)\)', _fix_cframe_lookat, source)
+        fixes.append("Fixed CFrame.lookAt(single_arg) → CFrame.lookAt(origin, origin + dir)")
+
+    # Fix `and then` at line breaks (multi-line conditions)
+    # Pattern 1: `if (cond1 and then\n    cond2)` → `if (cond1 and\n    cond2) then`
+    if re.search(r'\band\s+then\s*\n', source):
+        # Multi-line: `and then\n    cond)` → `and\n    cond) then`
+        source = re.sub(
+            r'\band\s+then\s*\n(\s+)(.*?\))\s*$',
+            r'and\n\1\2 then',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Fixed multi-line 'and then' → joined condition with 'then' at end")
+    # Pattern 2: single-line `and then` (no continuation)
+    if re.search(r'\band\s+then\b', source):
+        source = re.sub(r'\band\s+then\b', 'then', source)
+        fixes.append("Fixed 'and then' → 'then' in conditions")
+
+    # Fix incomplete bit-shift expressions: `1 << -- comment`
+    if re.search(r'1\s*<<\s*--', source):
+        source = re.sub(
+            r'^(\s*)(.+1\s*<<\s*--.*)$',
+            r'\1-- [Unity LayerMask] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out incomplete bit-shift expressions")
+
+    # Fix incomplete assignment from comment: `var = -- comment: text`
+    # where var is assigned a comment (the expression was lost)
+    if re.search(r'=\s*--\s*\w+:', source):
+        def _fix_incomplete_assign(m):
+            indent = m.group(1)
+            var = m.group(2)
+            comment = m.group(3)
+            return f'{indent}{var} = nil {comment}'
+        source = re.sub(
+            r'^(\s*)(local\s+\w+|[\w.]+)\s*=\s*(--\s*\w+:.*)$',
+            _fix_incomplete_assign,
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Fixed incomplete assignment = -- comment → = nil -- comment")
+
+    # Fix assignment = inside if-ternary: (if x = val then → (if x == val then
+    if re.search(r'\(if\s+\w+\s*=\s*(?!.*==)', source):
+        source = re.sub(
+            r'\(if\s+(\w+)\s*=\s*(?!=)',
+            r'(if \1 == ',
+            source,
+        )
+        fixes.append("Fixed assignment = inside if-ternary → ==")
+
+    # Fix `GetPartBoundsInRadiusNonAlloc` / `GetPartBoundsInBoxNonAlloc` → remove NonAlloc
+    if 'NonAlloc' in source:
+        source = re.sub(r'(GetPartBoundsIn(?:Radius|Box))NonAlloc', r'\1', source)
+        fixes.append("Fixed NonAlloc methods → standard Roblox equivalents")
+
+    # Fix Animator API remnants: GetCurrentAnimatorStateInfo, GetNextAnimatorStateInfo, IsInTransition
+    # These are Unity Animator APIs with no Roblox equivalent
+    if 'AnimatorStateInfo' in source or 'IsInTransition' in source or 'shortNameHash' in source or 'tagHash' in source or 'normalizedTime' in source:
+        source = re.sub(
+            r'^(\s*)(?!--)(.+(?:GetCurrentAnimatorStateInfo|GetNextAnimatorStateInfo|IsInTransition)\(.*)$',
+            r'\1-- [Unity Animator] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        # Also comment out lines referencing .shortNameHash, .tagHash, .normalizedTime
+        source = re.sub(
+            r'^(\s*)(?!--)(.+\.(?:shortNameHash|tagHash|normalizedTime)\b.*)$',
+            r'\1-- [Unity Animator] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out Unity Animator state info API calls")
+
+    # Fix .Warp() (Unity NavMeshAgent) → .Position = (teleport)
+    if '.Warp(' in source:
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.Warp\(([^)]+)\)',
+            r'\1.Position = \2',
+            source,
+        )
+        fixes.append("Fixed .Warp() → .Position = (NavMeshAgent teleport)")
+
+    # Fix CFrame.identity → CFrame.new() (Roblox equivalent)
+    if 'CFrame.identity' in source:
+        source = source.replace('CFrame.identity', 'CFrame.new()')
+        fixes.append("Fixed CFrame.identity → CFrame.new()")
+
+    # Fix .ResetPath() (Unity NavMeshAgent) → comment out
+    if '.ResetPath()' in source:
+        source = re.sub(
+            r'^(\s*)(?!--)(.+\.ResetPath\(\).*)$',
+            r'\1-- [Unity NavMesh] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out .ResetPath() (Unity NavMesh)")
+
+    # Fix .SetColor/.GetColor/.SetVector/.GetVector (Unity Material API)
+    if re.search(r'\.(SetColor|GetColor|SetVector|GetVector|SetTexture|GetTexture)\(', source):
+        source = re.sub(
+            r'^(\s*)(?!--)(.+\.(?:SetColor|GetColor|SetVector|GetVector|SetTexture|GetTexture)\(.*)$',
+            r'\1-- [Unity Material] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out Unity Material Set/Get API calls")
+
+    # Fix `Vector3.new[N]` (C# array constructor) → `table.create(N)`
+    if re.search(r'Vector3\.new\[\w+\]', source):
+        source = re.sub(r'Vector3\.new\[(\w+)\]', r'table.create(\1, Vector3.zero)', source)
+        fixes.append("Fixed Vector3.new[N] → table.create(N)")
+
+    # Fix undefined `controller` variable → `m_Controller`
+    if re.search(r'\bcontroller\b', source) and 'local controller' not in source and 'm_Controller' in source:
+        source = re.sub(r'\bcontroller\b(?=[\.:[\s])', 'm_Controller', source)
+        fixes.append("Fixed undefined 'controller' → 'm_Controller'")
+
+    # Fix .contacts (Unity Collision.contacts) → not available in Roblox
+    if '.contacts' in source:
+        source = re.sub(
+            r'^(\s*)(?!--)(.+\.contacts\b.*)$',
+            r'\1-- [Unity Collision] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out .contacts (Unity Collision API)")
+
+    # Fix remaining RenderTexture references in active code
+    if re.search(r'(?:^[^-]*RenderTexture|\.worldToCameraMatrix|\.projectionMatrix|\.CalculateObliqueMatrix|\.depthTextureMode|\.renderingPath|\.cullingMask|\.targetTexture|\.clearFlags)', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s*)(?!--)(.+(?:RenderTexture|\.worldToCameraMatrix|\.projectionMatrix|\.CalculateObliqueMatrix|\.depthTextureMode|\.renderingPath|\.cullingMask|\.targetTexture|\.clearFlags)\b.*)$',
+            r'\1-- [Unity camera] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out Unity camera/render API remnants")
+
+    # Note: `continue` IS valid in Roblox Luau (supported since 2020)
+    # No fix needed for continue statements
+
+    # Fix remaining C# null-coalescing ?? operator
+    # expr ?? fallback → (expr ~= nil and expr) or fallback
+    if '??' in source:
+        def _fix_null_coalesce(m):
+            lhs = m.group(1).strip()
+            rhs = m.group(2).strip()
+            # Simple form for short expressions
+            return f'({lhs} ~= nil and {lhs} or {rhs})'
+        source = re.sub(
+            r'([^\n=]+?)\s*\?\?\s*([^\n,;]+)',
+            _fix_null_coalesce,
+            source,
+        )
+        fixes.append("Fixed C# ?? null-coalescing → Luau or-pattern")
+
+    # Fix MessageType enum references → string constants
+    # MessageType.DEAD → "DEAD", MessageType.DAMAGED → "DAMAGED" etc.
+    if 'MessageType.' in source:
+        source = re.sub(r'\bMessageType\.(\w+)', r'"\1"', source)
+        fixes.append("Fixed MessageType.X → string constants")
+
+    # Fix Message.MessageType.X → string constants
+    if 'Message.MessageType.' in source:
+        source = re.sub(r'\bMessage\.MessageType\.(\w+)', r'"\1"', source)
 
     if source != original:
         fixes.append("Fixed common API mistakes")
