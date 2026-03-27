@@ -2946,6 +2946,41 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         source = re.sub(r'(\w+(?:\.\w+)*):?\.?GetInstanceID\(\)', r'tostring(\1)', source)
         fixes.append("Fixed GetInstanceID() → tostring()")
 
+    # Comment out Unity camera rendering properties (not in Roblox)
+    _UNITY_CAMERA_PROPS = (
+        'projectionMatrix', 'worldToCameraMatrix', 'cullingMask', 'targetTexture',
+        'depthTextureMode', 'renderingPath', 'clearFlags', 'ResetWorldToCameraMatrix',
+        'CalculateObliqueMatrix', 'pixelRect', 'aspect',
+    )
+    for prop in _UNITY_CAMERA_PROPS:
+        if prop in source:
+            # Comment out lines with these properties (assignment or access)
+            source = re.sub(
+                rf'^(\s*)(?!--)(.+\.{prop}\b.*)$',
+                rf'\1-- [Unity camera] \2',
+                source,
+                flags=re.MULTILINE,
+            )
+    if 'CameraClearFlags' in source:
+        source = re.sub(
+            r'^(\s*)(?!--)(.+CameraClearFlags\.\w+.*)$',
+            r'\1-- [Unity camera] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out Unity camera rendering properties")
+
+    # Fix comment-embedded property access: obj-- comment: text.Method() → comment the whole line
+    # Pattern: obj:FindFirstChildWhichIsA("BasePart")-- sharedMaterial: ...SetTexture(...)
+    if '-- sharedMaterial' in source:
+        source = re.sub(
+            r'^(\s*)(.+-- sharedMaterial:.+)$',
+            r'\1-- [Unity material] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out sharedMaterial access lines")
+
     # Comment out SceneLinkedSMB calls (Unity state machine behaviour, not in Roblox)
     if 'SceneLinkedSMB' in source and not re.search(r'--.*SceneLinkedSMB', source):
         source = re.sub(
