@@ -713,7 +713,7 @@ class TestLuauValidator:
         from converter.luau_validator import validate_and_fix
         source = 'workspace:FindFirstChildObjectOfType()'
         fixed, _ = validate_and_fix("test", source)
-        assert "FindFirstChildWhichIsA" in fixed
+        assert "FindFirstChild" in fixed
 
     def test_fix_float_isnan(self):
         from converter.luau_validator import validate_and_fix

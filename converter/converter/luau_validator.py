@@ -183,6 +183,24 @@ def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
             r'\1.CFrame = CFrame.lookAt(\1.Position, \2)',
             source,
         )
+    # Second pass: CFrame.LookVector/UpVector/RightVector assignments introduced by structural fixes
+    if re.search(r'\.CFrame\.(?:LookVector|UpVector|RightVector)\s*=', source):
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.CFrame\.LookVector\s*=\s*([^\n]+)',
+            r'\1.CFrame = CFrame.lookAt(\1.Position, \1.Position + \2)',
+            source,
+        )
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.CFrame\.UpVector\s*=\s*([^\n]+)',
+            r'-- UpVector assignment: \1.CFrame = CFrame.lookAt(\1.Position, \1.Position + \2)',
+            source,
+        )
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.CFrame\.RightVector\s*=\s*([^\n]+)',
+            r'-- RightVector: \1.CFrame rotation (manual construction needed)',
+            source,
+        )
+        fixes.append("Fixed read-only CFrame vector assignments (second pass)")
     # Second pass: script.Parent:Dot(a, b) may be introduced by bare receiver fixes
     if 'script.Parent:Dot(' in source:
         source = re.sub(
@@ -430,6 +448,162 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
     # Strip BOM characters
     source = source.replace('\ufeff', '')
 
+    # Fix incomplete assignments where RHS is a comment from API mapping
+    # Pattern: `local x = -- StringToHash: use string name...` → extract string arg or use nil
+    # This happens when API_CALL_MAP maps a call to a comment string
+    if re.search(r'local\s+\w+\s*=\s*--', source):
+        # StringToHash specifically: try to extract the original string argument
+        # local m_HashFoo = -- StringToHash: use string name directly as attribute key
+        # The variable name often encodes the hash name: m_Hash<Name> → "Name"
+        def _fix_hash_assignment(m):
+            indent, varname, comment = m.group(1), m.group(2), m.group(3)
+            # Try to extract name from variable: m_HashFoo → "Foo", hash_Foo → "Foo"
+            hash_m = re.search(r'[Hh]ash_?([A-Z]\w*)', varname)
+            if hash_m:
+                return f'{indent}local {varname} = "{hash_m.group(1)}" {comment}'
+            # Fallback: use variable name as string
+            return f'{indent}local {varname} = "{varname}" {comment}'
+        source = re.sub(
+            r'^(\s*)local\s+(\w+)\s*=\s*(-- StringToHash[^\n]*)$',
+            _fix_hash_assignment,
+            source,
+            flags=re.MULTILINE,
+        )
+        # Generic: local x = -- any comment → local x = nil -- comment
+        source = re.sub(
+            r'^(\s*local\s+\w+\s*=\s*)(-- .*)$',
+            r'\1nil \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Fixed incomplete 'local x = -- comment' assignments")
+
+    # Fix C# typed field declarations that leaked through transpilation
+    # Patterns: `bool canAttack;`, `float m_Speed;`, `Type varName;`, `Type varName`
+    # Also handles: `UnityEvent OnDeath, OnDamage, OnHit`
+    _CSHARP_FIELD_TYPES = (
+        'bool', 'int', 'float', 'double', 'string', 'char', 'byte', 'short',
+        'long', 'uint', 'ulong', 'ushort', 'decimal', 'void',
+        'Vector3', 'Vector2', 'Quaternion', 'Color', 'Rect',
+        'UnityEvent', 'Action', 'Func',
+        'AnimatorStateInfo', 'Material', 'Checkpoint',
+        'RandomAudioPlayer', 'CameraSettings', 'MeleeWeapon',
+        'Damageable', 'MaterialPropertyBlock',
+    )
+    _type_pattern = '|'.join(re.escape(t) for t in _CSHARP_FIELD_TYPES)
+    if re.search(rf'^\s*(?:{_type_pattern})\s+\w', source, re.MULTILINE):
+        # Multi-variable: `UnityEvent OnDeath, OnDamage` → `local OnDeath, OnDamage = nil, nil`
+        def _fix_typed_field(m):
+            indent = m.group(1)
+            varlist = m.group(3)
+            names = [n.strip().rstrip(';') for n in varlist.split(',') if n.strip()]
+            nils = ', '.join(['nil'] * len(names))
+            return f'{indent}local {", ".join(names)} = {nils}'
+        source = re.sub(
+            rf'^(\s*)(?:{_type_pattern})(?:\.\w+)?\s+((\w+(?:\s*,\s*\w+)*))\s*;?\s*(--.*)?$',
+            lambda m: _fix_typed_field(m) + (f'  {m.group(4)}' if m.group(4) else ''),
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Fixed C# typed field declarations → local")
+
+    # Fix C# `|=` compound bitwise OR (not valid in Luau)
+    # `x |= expr` → `x = x or (expr)` (boolean context) or bit32.bor for numeric
+    if '|=' in source:
+        source = re.sub(
+            r'(\w+)\s*\|=\s*(.+)',
+            r'\1 = \1 or (\2)',
+            source,
+        )
+        fixes.append("Fixed |= compound bitwise OR → or")
+
+    # Fix default parameter values in function signatures (not valid in Luau)
+    # `local function Foo(defaultValue)` where defaultValue is a literal
+    # Pattern: function Name(true), function Name(false), function Name(0), function Name(Type.Value)
+    if re.search(r'local function \w+\([^)]*(?:true|false|\d+|[A-Z]\w+\.\w+)\)', source):
+        def _fix_default_params(m):
+            full = m.group(0)
+            func_prefix = full[:full.index('(')]
+            params_str = full[full.index('(') + 1:full.rindex(')')]
+            fixed_params = []
+            for p in params_str.split(','):
+                p = p.strip()
+                # If the param is a literal (true/false/number/Enum.Value), replace with generic name
+                if re.match(r'^(true|false|\d+(\.\d+)?|[A-Z]\w+\.\w+)$', p):
+                    fixed_params.append('_defaultParam')
+                else:
+                    fixed_params.append(p)
+            return f'{func_prefix}({", ".join(fixed_params)})'
+        source = re.sub(
+            r'local function \w+\([^)]*(?:true|false|\d+|[A-Z]\w+\.\w+)[^)]*\)',
+            _fix_default_params,
+            source,
+        )
+        fixes.append("Fixed default parameter values in function signatures")
+
+    # Fix `m_:SetAttribute(...)` — missing receiver before colon
+    # This comes from Animator.SetBool/SetFloat mapping where the animator variable was mangled
+    if 'm_:' in source:
+        source = re.sub(r'\bm_:(\w+)', r'script.Parent:\1', source)
+        fixes.append("Fixed m_: missing receiver → script.Parent:")
+
+    # Fix mangled table operations: `vartable.clear`, `vartable.insert(...)`, `vartable.remove(...)`
+    # Pattern: `inventoryItemstable.clear` should be `table.clear(inventoryItems)`
+    if 'table.clear' in source or 'table.insert' in source or 'table.remove' in source:
+        # Fix: vartable.clear → table.clear(var)
+        source = re.sub(
+            r'(\w+)table\.clear\b',
+            r'table.clear(\1)',
+            source,
+        )
+        # Fix: vartable.insert(args) → table.insert(var, args)
+        source = re.sub(
+            r'(\w+)table\.insert\(([^)]*)\)',
+            r'table.insert(\1, \2)',
+            source,
+        )
+        # Fix: vartable.remove(args) → table.remove(var, args)
+        source = re.sub(
+            r'(\w+)table\.remove\(([^)]*)\)',
+            r'table.remove(\1, \2)',
+            source,
+        )
+        fixes.append("Fixed mangled table operations (vartable.X → table.X(var))")
+
+    # Fix `.Parent =(nil, true)` and `.Parent =(parent, false)` — broken SetParent conversion
+    # Unity SetParent(parent, worldPositionStays) → Roblox .Parent = parent
+    if re.search(r'\.Parent\s*=\s*\(', source):
+        source = re.sub(
+            r'\.Parent\s*=\s*\((\w+(?:\.\w+)*),\s*(?:true|false)\)',
+            r'.Parent = \1',
+            source,
+        )
+        # .Parent =(nil, true) → .Parent = nil
+        source = re.sub(
+            r'\.Parent\s*=\s*\(nil,\s*(?:true|false)\)',
+            '.Parent = nil',
+            source,
+        )
+        fixes.append("Fixed .Parent =(val, bool) → .Parent = val")
+
+    # Fix remaining C# cast syntax: (TypeName)expr → expr
+    # Only match PascalCase type names to avoid catching Luau parenthesized expressions
+    _CAST_TYPES = (
+        'Damageable', 'DamageMessage', 'PlayerController', 'EnemyController',
+        'Transform', 'GameObject', 'Component', 'MonoBehaviour',
+        'Collider', 'Rigidbody', 'Renderer', 'AudioSource',
+        'Animator', 'Camera', 'Light', 'Image', 'Button', 'Text',
+        'RaycastHit', 'ContactPoint', 'Collision',
+    )
+    _cast_pattern = '|'.join(_CAST_TYPES)
+    if re.search(rf'\((?:{_cast_pattern})(?:\.\w+)?\)', source):
+        source = re.sub(
+            rf'\(({_cast_pattern})(?:\.\w+)?\)\s*',
+            '',
+            source,
+        )
+        fixes.append("Stripped remaining C# type casts")
+
     # Fix comment-embedded variable names from type mapping
     # Pattern: "m_-- TypeComment: explanation" → comment out the whole line
     # This happens when TYPE_MAP replaces a type like NavMeshAgent with "-- comment"
@@ -569,8 +743,10 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
         fixes.append("Fixed () { anonymous object → table literal")
 
     # Fix .Play()() and similar double-invocation patterns
-    if '()()' in source:
-        source = re.sub(r'\(\)\(\)', '()', source)
+    # Also handles Play()(args) → Play(args)
+    # BUT skip GetChildren()(N) which is handled separately as array indexing
+    if '()(' in source:
+        source = re.sub(r'(?<!GetChildren)(?<!Destroy)\(\)\(([^)]*)\)', r'(\1)', source)
         fixes.append("Fixed double invocation ()()")
 
     # Fix :Destroy()(obj) pattern — misplaced receiver
@@ -2472,6 +2648,191 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             if stripped == 'end' and in_loop:
                 in_loop = False
         source = '\n'.join(new_lines)
+
+    # Fix read-only CFrame property assignments (LookVector, UpVector, RightVector)
+    # obj.CFrame.LookVector = dir → obj.CFrame = CFrame.lookAt(obj.Position, obj.Position + dir)
+    if re.search(r'\.CFrame\.(?:LookVector|UpVector|RightVector)\s*=', source):
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.CFrame\.LookVector\s*=\s*([^\n]+)',
+            r'\1.CFrame = CFrame.lookAt(\1.Position, \1.Position + \2)',
+            source,
+        )
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.CFrame\.UpVector\s*=\s*([^\n]+)',
+            r'-- UpVector assignment: \1.CFrame = CFrame.lookAt(\1.Position, \1.Position + \2)',
+            source,
+        )
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.CFrame\.RightVector\s*=\s*([^\n]+)',
+            r'-- RightVector assignment: \1.CFrame rotation would need manual construction',
+            source,
+        )
+        fixes.append("Fixed read-only CFrame vector property assignments")
+
+    # Fix .Normalize() → .Unit (Vector3 is immutable in Roblox, no Normalize method)
+    if '.Normalize()' in source:
+        # obj.Normalize() used as statement → obj = obj.Unit
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.Normalize\(\)',
+            r'\1 = \1.Unit',
+            source,
+        )
+        fixes.append("Fixed .Normalize() → .Unit assignment")
+
+    # Fix FindFirstChildWhichIsA("Instance") → more meaningful default
+    # "Instance" matches any child, which is meaningless. Use context to pick better type.
+    if 'FindFirstChildWhichIsA("Instance")' in source:
+        # If context mentions Animator/Animation → "AnimationController"
+        # For NavMeshAgent → "Humanoid"
+        # For Cinemachine → "Camera"
+        # Default: just remove the filter and use FindFirstChild or GetChildren
+        source = re.sub(
+            r':FindFirstChildWhichIsA\("Instance"\)',
+            ':FindFirstChildOfClass("BasePart")',
+            source,
+        )
+        fixes.append("Fixed FindFirstChildWhichIsA('Instance') → meaningful type")
+
+    # Fix .isTrigger assignment (not a Roblox property)
+    if '.isTrigger' in source:
+        source = re.sub(r'(\w+)\.isTrigger\s*=\s*true', r'\1.CanCollide = false', source)
+        source = re.sub(r'(\w+)\.isTrigger\s*=\s*false', r'\1.CanCollide = true', source)
+        source = re.sub(r'(\w+)\.isTrigger\b', r'(not \1.CanCollide)', source)
+        fixes.append("Fixed .isTrigger → .CanCollide")
+
+    # Fix .useGravity (not a Roblox property, Roblox uses Anchored)
+    if '.useGravity' in source:
+        source = re.sub(r'(\w+)\.useGravity\s*=\s*false', r'\1.Anchored = true', source)
+        source = re.sub(r'(\w+)\.useGravity\s*=\s*true', r'\1.Anchored = false', source)
+        fixes.append("Fixed .useGravity → .Anchored")
+
+    # Fix .detectCollisions (not a Roblox property)
+    if '.detectCollisions' in source:
+        source = re.sub(r'(\w+)\.detectCollisions\s*=\s*(true|false)', r'\1.CanCollide = \2', source)
+        fixes.append("Fixed .detectCollisions → .CanCollide")
+
+    # Fix Debug.DrawLine/DrawRay (Unity editor-only, not in Roblox)
+    if 'Debug.Draw' in source:
+        source = re.sub(r'^(\s*)Debug\.Draw\w+\([^)]*\).*$', r'\1-- [Unity editor] \g<0>', source, flags=re.MULTILINE)
+        fixes.append("Commented out Debug.Draw* calls")
+
+    # Fix workspace.Gravity usage (it's a number in Roblox, not a Vector3)
+    if 'workspace.Gravity:' in source:
+        source = re.sub(r'workspace\.Gravity:Dot\(workspace\.Gravity\)', 'workspace.Gravity * workspace.Gravity', source)
+        source = re.sub(r'workspace\.Gravity:(\w+)', r'Vector3.new(0, -workspace.Gravity, 0):\1', source)
+        fixes.append("Fixed workspace.Gravity (number, not Vector3)")
+
+    # Fix Raycast with wrong arg count (Unity signature vs Roblox)
+    # Unity: Physics.Raycast(origin, dir, hit, dist, mask) → workspace:Raycast(origin, dir * dist, params)
+    if 'workspace:Raycast(' in source:
+        # Fix calls with too many args (5+) — Unity pattern
+        def _fix_raycast(m):
+            args = m.group(1)
+            parts = [a.strip() for a in args.split(',')]
+            if len(parts) >= 4:
+                origin = parts[0]
+                direction = parts[1]
+                dist = parts[3] if len(parts) > 3 and re.match(r'[\w.]+$', parts[3]) else None
+                if dist:
+                    return f'workspace:Raycast({origin}, {direction} * {dist})'
+                return f'workspace:Raycast({origin}, {direction})'
+            return m.group(0)
+        source = re.sub(
+            r'workspace:Raycast\(([^)]+,[^)]+,[^)]+,[^)]+(?:,[^)]+)?)\)',
+            _fix_raycast,
+            source,
+        )
+
+    # Fix Camera.current → workspace.CurrentCamera
+    if 'Camera.current' in source:
+        source = re.sub(r'\bCamera\.current\b', 'workspace.CurrentCamera', source)
+        fixes.append("Fixed Camera.current → workspace.CurrentCamera")
+
+    # Fix Animator API methods → Roblox equivalents
+    # animator:SetBool(hash, val) → obj:SetAttribute(hash, val)
+    # animator:SetFloat(hash, val) → obj:SetAttribute(hash, val)
+    # animator:SetTrigger(hash) → obj:SetAttribute(hash, true)
+    # animator:GetBool(hash) → obj:GetAttribute(hash)
+    # animator:GetFloat(hash) → obj:GetAttribute(hash)
+    if re.search(r':Set(?:Bool|Float|Integer|Trigger)\(', source):
+        source = re.sub(r'(\w+(?:\.\w+)*):SetBool\((\w+),\s*([^)]+)\)', r'\1:SetAttribute(\2, \3)', source)
+        source = re.sub(r'(\w+(?:\.\w+)*):SetFloat\((\w+),\s*([^)]+)\)', r'\1:SetAttribute(\2, \3)', source)
+        source = re.sub(r'(\w+(?:\.\w+)*):SetInteger\((\w+),\s*([^)]+)\)', r'\1:SetAttribute(\2, \3)', source)
+        source = re.sub(r'(\w+(?:\.\w+)*):SetTrigger\((\w+)\)', r'\1:SetAttribute(\2, true)', source)
+        fixes.append("Fixed Animator Set* methods → SetAttribute")
+    if re.search(r':Get(?:Bool|Float|Integer)\(', source):
+        source = re.sub(r'(\w+(?:\.\w+)*):GetBool\((\w+)\)', r'\1:GetAttribute(\2)', source)
+        source = re.sub(r'(\w+(?:\.\w+)*):GetFloat\((\w+)\)', r'\1:GetAttribute(\2)', source)
+        source = re.sub(r'(\w+(?:\.\w+)*):GetInteger\((\w+)\)', r'\1:GetAttribute(\2)', source)
+        fixes.append("Fixed Animator Get* methods → GetAttribute")
+
+    # Fix remaining bare `transform` variable → script.Parent
+    # Only when 'transform' is used as a receiver (not defined locally)
+    if re.search(r'\btransform\b', source) and 'local transform' not in source:
+        source = re.sub(r'\btransform\b(?=\s*[.:])', 'script.Parent', source)
+        source = re.sub(r'\btransform\b(?=\s*[,)])', 'script.Parent', source)
+        fixes.append("Fixed bare 'transform' → 'script.Parent'")
+
+    # Fix leading dot+space before method calls: `. obj:Method()` → `obj:Method()`
+    if re.search(r'^\s*\.\s+\w', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s*)\.\s+(\w)',
+            r'\1\2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Fixed leading dot+space before method calls")
+
+    # Fix comment-embedded conditions: `expr-- comment: text or then` → `expr then`
+    # These come from API mappings that return comments, embedded in conditions
+    if re.search(r'--[^-\n]*(?:or|and)\s+then\b', source):
+        source = re.sub(
+            r'--[^\n]*?(?=\s+or\s+then\b)',
+            '',
+            source,
+        )
+        # Also clean up orphaned `or then` at end of if conditions
+        source = re.sub(r'\s+or\s+then\b', ' then', source)
+        fixes.append("Fixed comment-embedded conditions")
+
+    # Fix broken ternary: `local (if x = cond then A else B)` → `local x = (if cond then A else B)`
+    if re.search(r'local\s+\(if\s+\w+\s*=', source):
+        source = re.sub(
+            r'local\s+\(if\s+(\w+)\s*=\s*(\w+)\s+then\s+(.+?)\s+else\s+(.+?)\)',
+            r'local \1 = (if \2 then \3 else \4)',
+            source,
+        )
+        fixes.append("Fixed broken ternary assignment syntax")
+
+    # Fix `.updatePosition`, `.updateRotation` (NavMeshAgent properties, not in Roblox)
+    if '.updatePosition' in source or '.updateRotation' in source:
+        source = re.sub(r'\w+\.updatePosition\s*=\s*(true|false)', r'-- updatePosition = \1 (not in Roblox)', source)
+        source = re.sub(r'\w+\.updateRotation\s*=\s*(true|false)', r'-- updateRotation = \1 (not in Roblox)', source)
+        fixes.append("Commented out NavMeshAgent update flags")
+
+    # Fix named parameters: `func(arg, name: value)` → `func(arg, value)`
+    # C# named argument syntax is not valid in Luau
+    if re.search(r'\w+:\s*\(if\b', source):
+        source = re.sub(r'(\w+):\s*(\(if\b)', r'\2', source)
+        fixes.append("Stripped C# named parameter syntax")
+
+    # Fix stray `break` outside loops (from switch/case conversion)
+    # Only remove `break` that isn't inside a for/while/repeat block
+    lines = source.split('\n')
+    new_lines = []
+    loop_depth = 0
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r'\b(for|while|repeat)\b', stripped):
+            loop_depth += 1
+        if stripped == 'end' and loop_depth > 0:
+            loop_depth -= 1
+        if stripped == 'break' and loop_depth == 0:
+            new_lines.append(line.replace('break', '-- break (removed, not in loop)'))
+            fixes.append("Removed stray break outside loop")
+        else:
+            new_lines.append(line)
+    source = '\n'.join(new_lines)
 
     if source != original:
         fixes.append("Fixed common API mistakes")

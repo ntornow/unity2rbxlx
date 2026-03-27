@@ -1703,7 +1703,7 @@ class TestCommentEmbeddedVarFix:
         source = 'x = script.Parent:FindFirstChildOfClass<-- NavMeshAgent: use Roblox PathfindingService>()'
         fixed, _ = validate_and_fix("test", source)
         assert '<--' not in fixed
-        assert 'FindFirstChildWhichIsA("Instance")' in fixed
+        assert 'FindFirstChildOfClass("BasePart")' in fixed
 
     def test_brace_comment_block(self):
         from converter.luau_validator import validate_and_fix
@@ -2630,3 +2630,261 @@ class TestValidatorBatch12:
         fixed, _ = validate_and_fix("test", source)
         assert 'new[]' not in fixed
         assert '{ 1, 2, 3 }' in fixed
+
+
+class TestValidatorBatch14:
+    """Tests for new validator fixes: StringToHash, typed fields, |=, etc."""
+
+    def test_incomplete_assignment_stringtohash(self):
+        """local x = -- StringToHash comment → extract name from variable."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local m_HashAirborneVerticalSpeed = -- StringToHash: use string name directly as attribute key'
+        fixed, _ = validate_and_fix("test", source)
+        assert '= --' not in fixed or '= nil --' in fixed
+        assert '"AirborneVerticalSpeed"' in fixed
+
+    def test_incomplete_assignment_generic_comment(self):
+        """local x = -- some comment → local x = nil -- some comment."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local myVar = -- frameCount: no direct Roblox equivalent'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'local myVar = nil -- frameCount' in fixed
+
+    def test_typed_field_bool(self):
+        """bool canAttack; → local canAttack = nil."""
+        from converter.luau_validator import validate_and_fix
+        source = '    bool canAttack;'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'local canAttack = nil' in fixed
+        assert 'bool' not in fixed
+
+    def test_typed_field_float_with_comment(self):
+        """float m_Speed;  -- comment → local m_Speed = nil  -- comment."""
+        from converter.luau_validator import validate_and_fix
+        source = '    float m_Speed;  -- How fast'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'local m_Speed = nil' in fixed
+        assert '-- How fast' in fixed
+
+    def test_typed_field_multi_variable(self):
+        """UnityEvent OnDeath, OnDamage → local OnDeath, OnDamage = nil, nil."""
+        from converter.luau_validator import validate_and_fix
+        source = '    UnityEvent OnDeath, OnDamage'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'local OnDeath, OnDamage = nil, nil' in fixed
+
+    def test_bitwise_or_equals(self):
+        """|= operator → or expression."""
+        from converter.luau_validator import validate_and_fix
+        source = 'inputBlocked |= m_NextState'
+        fixed, _ = validate_and_fix("test", source)
+        assert '|=' not in fixed
+        assert 'inputBlocked = inputBlocked or (m_NextState)' in fixed
+
+    def test_default_param_bool(self):
+        """function Foo(true) → function Foo(_defaultParam)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local function Detect(detector, true)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'true)' not in fixed or 'true' in fixed.split('(')[0]
+
+    def test_missing_receiver_m_colon(self):
+        """m_:SetAttribute() → script.Parent:SetAttribute()."""
+        from converter.luau_validator import validate_and_fix
+        source = 'm_:SetAttribute("speed", 10)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'm_:' not in fixed
+        assert 'script.Parent:SetAttribute("speed", 10)' in fixed
+
+    def test_double_invocation_with_args(self):
+        """Play()(hash) → Play(hash)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'm_AnimationTrack:Play()(m_HashMeleeAttack)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '()(' not in fixed
+        assert ':Play(m_HashMeleeAttack)' in fixed
+
+    def test_mangled_table_clear(self):
+        """vartable.clear → table.clear(var)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'inventoryItemstable.clear'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'table.clear(inventoryItems)' in fixed
+
+    def test_mangled_table_insert(self):
+        """vartable.insert(x) → table.insert(var, x)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'm_FreeIdxtable.insert(i)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'table.insert(m_FreeIdx, i)' in fixed
+
+    def test_parent_setparent_conversion(self):
+        """.Parent =(nil, true) → .Parent = nil."""
+        from converter.luau_validator import validate_and_fix
+        source = 'obj.Parent =(nil, true)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.Parent = nil' in fixed
+
+    def test_parent_setparent_with_object(self):
+        """.Parent =(workspace, false) → .Parent = workspace."""
+        from converter.luau_validator import validate_and_fix
+        source = 'obj.Parent =(workspace, false)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.Parent = workspace' in fixed
+
+    def test_csharp_cast_strip(self):
+        """(Damageable.DamageMessage)data → data."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local damageData = (Damageable.DamageMessage)data'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'Damageable.DamageMessage' not in fixed
+        assert 'damageData' in fixed
+
+    def test_cframe_lookvector_assignment(self):
+        """CFrame.LookVector = dir → CFrame.lookAt()."""
+        from converter.luau_validator import validate_and_fix
+        source = 'script.Parent.CFrame.LookVector = -pushForce.Unit'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'CFrame.LookVector =' not in fixed
+        assert 'CFrame.lookAt' in fixed
+
+    def test_cframe_lookvector_from_forward(self):
+        """.forward = dir (via structural fix) → CFrame.lookAt()."""
+        from converter.luau_validator import validate_and_fix
+        source = 'script.Parent.transform.forward = -pushForce.Unit'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'CFrame.LookVector =' not in fixed
+        assert 'CFrame.lookAt' in fixed
+
+    def test_normalize_to_unit(self):
+        """.Normalize() → .Unit assignment."""
+        from converter.luau_validator import validate_and_fix
+        source = 'moveInput.Normalize()'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.Normalize()' not in fixed
+        assert '.Unit' in fixed
+
+    def test_find_first_child_instance(self):
+        """FindFirstChildWhichIsA("Instance") → FindFirstChildOfClass("BasePart")."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local x = script.Parent:FindFirstChildWhichIsA("Instance")'
+        fixed, _ = validate_and_fix("test", source)
+        assert '"Instance"' not in fixed
+        assert 'FindFirstChildOfClass("BasePart")' in fixed
+
+    def test_is_trigger_true(self):
+        """.isTrigger = true → .CanCollide = false."""
+        from converter.luau_validator import validate_and_fix
+        source = 'collider.isTrigger = true'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.CanCollide = false' in fixed
+
+    def test_use_gravity_false(self):
+        """.useGravity = false → .Anchored = true."""
+        from converter.luau_validator import validate_and_fix
+        source = 'm_Rigidbody.useGravity = false'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.Anchored = true' in fixed
+
+    def test_detect_collisions(self):
+        """.detectCollisions = false → .CanCollide = false."""
+        from converter.luau_validator import validate_and_fix
+        source = 'm_Rigidbody.detectCollisions = false'
+        fixed, _ = validate_and_fix("test", source)
+        assert '.CanCollide = false' in fixed
+
+    def test_debug_draw_commented(self):
+        """Debug.DrawLine(...) → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '    Debug.DrawLine(pos, target, Color3.new(1,0,0))'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [Unity editor]' in fixed
+
+    def test_workspace_gravity_dot(self):
+        """workspace.Gravity:Dot() → numeric multiplication."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local g2 = workspace.Gravity:Dot(workspace.Gravity)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'workspace.Gravity * workspace.Gravity' in fixed
+
+
+class TestValidatorBatch15:
+    """Tests for round 2 fixes: Camera.current, Animator API, transform, etc."""
+
+    def test_camera_current(self):
+        """Camera.current → workspace.CurrentCamera."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local cam = Camera.current'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'workspace.CurrentCamera' in fixed
+
+    def test_animator_set_bool(self):
+        """animator:SetBool(hash, val) → :SetAttribute(hash, val)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'm_Animator:SetBool(hashGrounded, true)'
+        fixed, _ = validate_and_fix("test", source)
+        assert ':SetAttribute(hashGrounded, true)' in fixed
+
+    def test_animator_set_trigger(self):
+        """animator:SetTrigger(hash) → :SetAttribute(hash, true)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'm_Animator:SetTrigger(hashSpotted)'
+        fixed, _ = validate_and_fix("test", source)
+        assert ':SetAttribute(hashSpotted, true)' in fixed
+
+    def test_animator_get_bool(self):
+        """animator:GetBool(hash) → :GetAttribute(hash)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local grounded = m_Animator:GetBool(hashGrounded)'
+        fixed, _ = validate_and_fix("test", source)
+        assert ':GetAttribute(hashGrounded)' in fixed
+
+    def test_bare_transform_receiver(self):
+        """transform.Position → script.Parent.Position."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local pos = transform.Position'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'script.Parent.Position' in fixed
+
+    def test_bare_transform_method(self):
+        """transform:FindFirstChild() → script.Parent:FindFirstChild()."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local child = transform:FindFirstChild("x")'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'script.Parent:FindFirstChild("x")' in fixed
+
+    def test_bare_transform_preserves_local(self):
+        """local transform = ... should not be replaced."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local transform = script.Parent\nlocal pos = transform.Position'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'local transform = script.Parent' in fixed
+
+    def test_leading_dot_space(self):
+        """. obj:Destroy() → obj:Destroy()."""
+        from converter.luau_validator import validate_and_fix
+        source = '    . m_Texture:Destroy()'
+        fixed, _ = validate_and_fix("test", source)
+        assert '. m_Texture' not in fixed
+        assert 'm_Texture:Destroy()' in fixed
+
+    def test_broken_ternary_assignment(self):
+        """local (if x = cond then A else B) → local x = (if cond then A else B)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local (if acceleration = IsMoveInput then fast else slow)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'local acceleration = (if IsMoveInput then fast else slow)' in fixed
+
+    def test_update_position_commented(self):
+        """.updatePosition = false → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '_agent.updatePosition = false'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- updatePosition' in fixed
+
+    def test_named_parameter_stripped(self):
+        """func(arg, name: (if ...)) → func(arg, (if ...))."""
+        from converter.luau_validator import validate_and_fix
+        source = 'player.PlayRandomClip(surface, bankId: (if speed < 4 then 0 else 1))'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'bankId:' not in fixed
