@@ -2085,6 +2085,28 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     if re.search(r'\w#(?!\w)', source):
         source = re.sub(r'(\w+)#(?!\w)', r'#\1', source)
 
+    # Pre-process: join multi-line C# for-loops into single lines
+    # Pattern: `for (` without closing `)` → join with next lines until `)` found
+    if 'for (' in source:
+        lines_ml = source.split('\n')
+        new_lines_ml = []
+        i_ml = 0
+        while i_ml < len(lines_ml):
+            line = lines_ml[i_ml]
+            if re.match(r'^\s*for\s*\(', line) and ')' not in line:
+                # Join subsequent lines until we find the closing )
+                joined = line.rstrip()
+                for j_ml in range(i_ml + 1, min(i_ml + 5, len(lines_ml))):
+                    joined += ' ' + lines_ml[j_ml].strip()
+                    if ')' in lines_ml[j_ml]:
+                        i_ml = j_ml
+                        break
+                new_lines_ml.append(joined)
+            else:
+                new_lines_ml.append(line)
+            i_ml += 1
+        source = '\n'.join(new_lines_ml)
+
     # Fix: C# for loops → Luau for loops
     # for (local i = 0; i < N; ++i) → for i = 0, N - 1 do
     if 'for (' in source:
@@ -2193,6 +2215,16 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
                 flags=re.MULTILINE,
             )
             fixes.append("Converted remaining C# for-loops to while loops")
+
+        # Final fallback: comment out any remaining `for (...)` that couldn't be converted
+        if re.search(r'^\s*for\s*\(', source, re.MULTILINE):
+            source = re.sub(
+                r'^(\s*)for\s*\([^)]*\)',
+                r'\1-- [C# for-loop] while true do -- TODO: manual conversion needed',
+                source,
+                flags=re.MULTILINE,
+            )
+            fixes.append("Commented out unparseable C# for-loops")
 
     # Fix C# sizeof() → literal values
     if 'sizeof(' in source:
