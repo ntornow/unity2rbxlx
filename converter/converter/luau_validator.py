@@ -300,7 +300,7 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
             source,
         )
         # Strip remaining generic type parameters from method calls: Method<Type>(...) → Method(...)
-        source = re.sub(r'(\w+)<[A-Z]\w+(?:,\s*[A-Z]\w+)*>\s*\(', r'\1(', source)
+        source = re.sub(r'(\w+)<\w+(?:,\s*\w+)*>\s*\(', r'\1(', source)
         # Strip generic type in static method calls: Foo<Bar>.Method() → Foo.Method()
         source = re.sub(r'(\w+)<[A-Z]\w+(?:,\s*[A-Z]\w+)*>\.', r'\1.', source)
         # Strip generic type after parens: ():GetDescendants()<Type>() → :GetDescendants()
@@ -710,15 +710,84 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     if re.search(r'\w+\.Destroy\(\)', source):
         source = re.sub(r'(\w+)\.Destroy\(\)', r'\1:Destroy()', source)
 
-    # Fix: new Vector3(...) → Vector3.new(...)
-    if "new Vector3(" in source:
-        source = re.sub(r'\bnew\s+Vector3\(', 'Vector3.new(', source)
-    if "new CFrame(" in source:
-        source = re.sub(r'\bnew\s+CFrame\(', 'CFrame.new(', source)
-    if "new Color3(" in source:
-        source = re.sub(r'\bnew\s+Color3\(', 'Color3.new(', source)
-    if "new Instance(" in source:
-        source = re.sub(r'\bnew\s+Instance\(', 'Instance.new(', source)
+    # Fix: new Vector3(...) → Vector3.new(...) and other Roblox types
+    _ROBLOX_NEW_TYPES = [
+        "Vector3", "Vector2", "CFrame", "Color3", "Color3uint8",
+        "UDim2", "UDim", "Rect", "Ray", "Region3", "Instance",
+        "NumberSequence", "NumberSequenceKeypoint", "ColorSequence",
+        "ColorSequenceKeypoint", "NumberRange", "BrickColor",
+        "TweenInfo", "OverlapParams", "RaycastParams",
+    ]
+    for rtype in _ROBLOX_NEW_TYPES:
+        if f"new {rtype}(" in source:
+            source = re.sub(rf'\bnew\s+{rtype}\(', f'{rtype}.new(', source)
+
+    # Fix: new Type[N] (C# array) → table.create(N) or {}
+    if re.search(r'\bnew\s+\w+\[\d+\]', source):
+        source = re.sub(r'\bnew\s+\w+\[(\d+)\]', r'table.create(\1)', source)
+    if re.search(r'\bnew\s+\w+\[0\]', source):
+        source = re.sub(r'\bnew\s+\w+\[0\]', '{}', source)
+
+    # Fix: new Type[] {...} (C# array initializer) → {...}
+    if re.search(r'\bnew\s+\w+\[\]\s*\{', source):
+        source = re.sub(r'\bnew\s+\w+\[\]\s*\{', '{', source)
+
+    # Fix: new Type(...) for non-Roblox types → comment or strip
+    # new GameObject("name") → Instance.new("Part"); part.Name = "name"
+    if 'new GameObject(' in source:
+        source = re.sub(
+            r'\bnew\s+GameObject\s*\(\s*("(?:[^"\\]|\\.)*")\s*\)',
+            r'Instance.new("Part") -- Name: \1',
+            source,
+        )
+        source = re.sub(r'\bnew\s+GameObject\s*\(\)', 'Instance.new("Part")', source)
+
+    # Fix: new Type.SubType(...) → comment (dotted type names)
+    if re.search(r'\bnew\s+\w+\.\w+\s*[\(\[]', source):
+        source = re.sub(
+            r'\bnew\s+(\w+\.\w+)\s*\(',
+            r'--[[ new \1 ]] (',
+            source,
+        )
+        source = re.sub(
+            r'\bnew\s+\w+\.\w+\s*\[([^\]]+)\]',
+            r'table.create(\1)',
+            source,
+        )
+
+    # Fix: new Type[expr] where expr uses # (postfix in C#, prefix in Luau)
+    # e.g., new Animator[keyNames#] → table.create(#keyNames)
+    if re.search(r'\bnew\s+\w+\[\w+#\]', source):
+        source = re.sub(
+            r'\bnew\s+\w+\[(\w+)#\]',
+            r'table.create(#\1)',
+            source,
+        )
+
+    # Fix: new Type[expr] for remaining array patterns with complex expressions
+    if re.search(r'\bnew\s+\w+\[[^\]]+\]', source):
+        source = re.sub(
+            r'\bnew\s+\w+\[([^\]]+)\]',
+            r'table.create(\1)',
+            source,
+        )
+
+    # Fix: "new Type variable" (C# field declaration with 'new' modifier) → "local variable = nil -- Type"
+    if re.search(r'^\s*new\s+[A-Z]\w+\s+\w+\s*$', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s*)new\s+([A-Z]\w+)\s+(\w+)\s*$',
+            r'\1local \3 = nil -- \2',
+            source,
+            flags=re.MULTILINE,
+        )
+
+    # Fix: remaining new Type(...) → comment
+    if re.search(r'\bnew\s+[A-Z]\w+\s*\(', source):
+        source = re.sub(
+            r'\bnew\s+([A-Z]\w+)\s*\(',
+            r'--[[ new \1 ]] (',
+            source,
+        )
 
     # Fix: += / -= / *= / /= operators (not valid in Luau)
     # Handles both simple vars and property access (obj.prop += expr)
