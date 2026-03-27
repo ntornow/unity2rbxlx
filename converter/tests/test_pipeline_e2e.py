@@ -301,3 +301,26 @@ class TestPipelineE2E:
         assert rbxlx.exists()
         tree = ET.parse(rbxlx)
         assert tree.getroot().tag == "roblox"
+
+    @pytest.mark.skipif(
+        not (Path(__file__).parent.parent.parent / "test_projects" / "SanAndreasUnity").exists(),
+        reason="SanAndreasUnity test project not available",
+    )
+    def test_sanandreas_converts(self, tmp_path):
+        """Test SanAndreasUnity (270+ scripts, complex patterns) converts without errors."""
+        from converter.pipeline import Pipeline
+        import xml.etree.ElementTree as ET
+
+        project = Path(__file__).parent.parent.parent / "test_projects" / "SanAndreasUnity"
+        pipeline = Pipeline(
+            unity_project_path=project,
+            output_dir=tmp_path,
+            skip_upload=True,
+        )
+        pipeline.run_all()
+
+        assert pipeline.context.transpiled_scripts > 200
+        rbxlx = tmp_path / "converted_place.rbxlx"
+        assert rbxlx.exists()
+        tree = ET.parse(rbxlx)
+        assert tree.getroot().tag == "roblox"
