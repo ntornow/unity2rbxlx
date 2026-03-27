@@ -493,6 +493,32 @@ API_CALL_MAP: dict[str, str] = {
     # -- Destroy with delay --
     "Destroy(gameObject,": "Debris:AddItem(",
     "Destroy(this.gameObject,": "Debris:AddItem(script.Parent,",
+    # -- Array/Collection operations --
+    "Array.Resize": "-- Array.Resize: tables resize automatically in Luau",
+    "Array.Copy": "table.move",
+    "Array.IndexOf": "table.find",
+    "Array.Sort": "table.sort",
+    "Array.Clear": "table.clear",
+    "Array.Reverse": "-- Array.Reverse: use for loop to reverse table",
+    # -- String path operations --
+    "Path.Combine": "-- Path.Combine: use .. to concatenate paths",
+    "Path.GetFileName": "string.match",
+    "Path.GetExtension": "string.match",
+    "Path.GetDirectoryName": "string.match",
+    # -- ExecuteEvents (Unity UI event system) --
+    "ExecuteEvents.Execute": "-- ExecuteEvents: use Roblox event system",
+    "ExecuteEvents.ExecuteHierarchy": "-- ExecuteEvents: use Roblox event system",
+    # -- LayoutRebuilder --
+    "LayoutRebuilder.MarkLayoutForRebuild": "-- LayoutRebuilder: UI auto-sizes in Roblox",
+    "LayoutRebuilder.ForceRebuildLayoutImmediate": "-- LayoutRebuilder: UI auto-sizes in Roblox",
+    # -- EditorGUILayout / GUI (strip editor-only code) --
+    "EditorGUI.": "-- EditorGUI: editor-only",
+    "EditorGUILayout.": "-- EditorGUILayout: editor-only",
+    "GUILayout.": "-- GUILayout: editor-only",
+    "GUI.Button(": "-- GUI.Button: editor-only",
+    # -- Shader --
+    "Shader.PropertyToID": "-- Shader.PropertyToID: no equivalent",
+    "Shader.Find": "-- Shader.Find: no equivalent",
 }
 
 
@@ -571,7 +597,7 @@ TYPE_MAP: dict[str, str] = {
     "Image": "ImageLabel",
     "Button": "TextButton",
     "Slider": "Frame",
-    "Toggle": "Frame",
+    "Toggle": "TextButton",
     "InputField": "TextBox",
     "Dropdown": "Frame",
     "ScrollRect": "ScrollingFrame",

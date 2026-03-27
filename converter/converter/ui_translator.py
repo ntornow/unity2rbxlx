@@ -25,7 +25,7 @@ _UI_CLASS_MAP: dict[str, str] = {
     "Image": "ImageLabel",
     "RawImage": "ImageLabel",
     "Button": "TextButton",
-    "Toggle": "Frame",
+    "Toggle": "TextButton",
     "Slider": "Frame",
     "Scrollbar": "Frame",
     "InputField": "TextBox",

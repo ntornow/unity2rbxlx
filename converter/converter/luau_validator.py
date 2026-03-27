@@ -513,18 +513,7 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             source,
         )
 
-    # Fix: .SetActive(false/true) (Unity) → set properties
-    if ".SetActive(" in source:
-        source = re.sub(
-            r'(\w+)\.SetActive\(\s*false\s*\)',
-            r'if \1:IsA("BasePart") then \1.Transparency = 1; \1.CanCollide = false end',
-            source,
-        )
-        source = re.sub(
-            r'(\w+)\.SetActive\(\s*true\s*\)',
-            r'if \1:IsA("BasePart") then \1.Transparency = 0; \1.CanCollide = true end',
-            source,
-        )
+    # Note: .SetActive() is now handled in _fix_csharp_remnants using recursive setActive()
 
     # Fix: Destroy() without colon (C# method call syntax)
     if re.search(r'\w+\.Destroy\(\)', source):
