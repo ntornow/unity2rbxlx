@@ -2442,8 +2442,51 @@ def _fix_missing_end_keywords(name: str, source: str, fixes: list[str]) -> str:
     # that creates negative block balance
     source = _remove_excess_end_keywords(source, fixes)
 
+    # Append missing `end` keywords at EOF if block depth is positive
+    source = _append_missing_trailing_ends(source, fixes)
+
     if source != original:
         fixes.append("Fixed missing end keywords / stray braces")
+
+    return source
+
+
+def _append_missing_trailing_ends(source: str, fixes: list[str]) -> str:
+    """Append missing `end` keywords at the end of a script.
+
+    If the script ends with positive block depth (more openers than closers),
+    append the needed `end` keywords. This is a safe fallback since unclosed
+    blocks at EOF will always cause syntax errors.
+    """
+    lines = source.split('\n')
+    depth = 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('--'):
+            continue
+        if re.search(r'\bfunction\s*[\w.:(]', stripped):
+            if not (stripped.endswith(' end') or stripped.endswith('\tend')):
+                depth += 1
+        if re.match(r'(?:if|elseif)\b.+\bthen\s*$', stripped) or (
+                re.search(r'\bthen\s*$', stripped) and not re.match(r'(?:if|elseif)\b', stripped)
+                and not re.search(r'\bfunction\b', stripped)):
+            depth += 1
+        if re.match(r'for\b.+\bdo\s*$', stripped):
+            depth += 1
+        if re.match(r'while\b.+\bdo\s*$', stripped):
+            depth += 1
+        if stripped == 'repeat':
+            depth += 1
+        if stripped == 'end' or stripped.startswith('end)'):
+            depth -= 1
+        if re.match(r'until\b', stripped):
+            depth -= 1
+
+    if depth > 0:
+        for _ in range(depth):
+            lines.append('end')
+        fixes.append(f"Appended {depth} missing 'end' keyword(s) at EOF")
+        return '\n'.join(lines)
 
     return source
 
