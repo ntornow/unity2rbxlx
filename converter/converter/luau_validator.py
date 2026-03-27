@@ -328,8 +328,35 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
         )
         fixes.append("Fixed '.Contains()' → 'table.find()'")
 
+    # Fix string.format with C# positional placeholders: {0}, {1} → %s
+    if 'string.format(' in source and re.search(r'\{\d+\}', source):
+        def _fix_csharp_format_string(m):
+            full = m.group(0)
+            fmt = m.group(1)
+            # Replace {0}, {1}, {0:F2} etc. with %s
+            fixed_fmt = re.sub(r'\{(\d+)(?::[^}]+)?\}', '%s', fmt)
+            return full.replace(f'"{fmt}"', f'"{fixed_fmt}"')
+        source = re.sub(
+            r'string\.format\(\s*"([^"]*\{\d+\}[^"]*)"',
+            _fix_csharp_format_string,
+            source,
+        )
+        fixes.append("Fixed C# string.Format positional placeholders to %s")
+
     # Fix '.ToString()' (C# → tostring())
-    if '.ToString()' in source:
+    if '.ToString(' in source:
+        # ToString with format specifier: x.ToString("F2") → string.format("%.2f", x)
+        def _fix_tostring_format(m):
+            var = m.group(1)
+            spec = m.group(2)
+            fmt = _format_spec_to_lua(spec)
+            return f'string.format("{fmt}", {var})'
+        source = re.sub(
+            r'(\w+)\.ToString\(\s*"([^"]+)"\s*\)',
+            _fix_tostring_format,
+            source,
+        )
+        # Plain ToString(): x.ToString() → tostring(x)
         source = re.sub(r'(\w+)\.ToString\(\)', r'tostring(\1)', source)
         fixes.append("Fixed '.ToString()' → 'tostring()'")
 

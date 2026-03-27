@@ -999,6 +999,42 @@ class TestSetActiveConversion:
         assert result.count('local function setActive(') == 1
 
 
+class TestToStringWithFormat:
+    """Test ToString with format specifier conversion."""
+
+    def test_tostring_format_f2(self):
+        from converter.luau_validator import _fix_csharp_remnants
+        source = 'local s = value.ToString("F2")'
+        fixes = []
+        result = _fix_csharp_remnants("test", source, fixes)
+        assert 'string.format("%.2f", value)' in result
+
+    def test_tostring_plain(self):
+        from converter.luau_validator import _fix_csharp_remnants
+        source = 'local s = value.ToString()'
+        fixes = []
+        result = _fix_csharp_remnants("test", source, fixes)
+        assert 'tostring(value)' in result
+
+
+class TestStringFormatPlaceholders:
+    """Test C# string.Format positional placeholder conversion."""
+
+    def test_positional_placeholders(self):
+        from converter.luau_validator import _fix_csharp_remnants
+        source = 'local s = string.format("{0} has {1} items", name, count)'
+        fixes = []
+        result = _fix_csharp_remnants("test", source, fixes)
+        assert '"%s has %s items"' in result
+
+    def test_no_false_positive(self):
+        from converter.luau_validator import _fix_csharp_remnants
+        source = 'local s = string.format("%s has %d items", name, count)'
+        fixes = []
+        result = _fix_csharp_remnants("test", source, fixes)
+        assert '"%s has %d items"' in result
+
+
 class TestScriptToPartBinding:
     """Test that script-to-part binding works for scene node MonoBehaviours."""
 
