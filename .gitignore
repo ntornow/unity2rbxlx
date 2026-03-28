@@ -20,6 +20,7 @@ converter/output/
 
 # Cache
 .cache/
+**/.cache/
 
 # OS
 .DS_Store
