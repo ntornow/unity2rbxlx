@@ -3811,8 +3811,8 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         fixes.append("Fixed Vector3 immutable component assignment → Vector3.new()")
 
     # Fix bare constructor `= ()` patterns from stripped `new Type()` calls
-    if re.search(r'=\s*\(\)\s*$', source, re.MULTILINE):
-        source = re.sub(r'=\s*\(\)\s*$', '= nil', source, flags=re.MULTILINE)
+    if re.search(r'=\s*\(\)', source):
+        source = re.sub(r'=\s*\(\)(\s*;?\s*(?:--.*)?)?$', r'= nil\1', source, flags=re.MULTILINE)
         fixes.append("Fixed bare constructor = () → = nil")
     # Fix `--[[ new Type ]] ()` → `nil` (commented constructor leaving bare parens)
     if '--[[ new ' in source:
@@ -3842,12 +3842,17 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             source = source.replace(unity_color, rblx_color)
             fixes.append(f"Fixed {unity_color} → {rblx_color}")
 
-    # Comment out C# LayerMask bitwise operations (not applicable in Roblox)
-    # Pattern: `layers.Value & 1 << otherPart.CollisionGroup` or similar bitshift mask checks
-    if re.search(r'&\s*1\s*<<|<<\s*\d+\s*&|1\s*<<\s*\w.*&|LayerMask', source):
+    # Comment out C# bitwise operations (not valid in Roblox Luau)
+    # Patterns: `1 << N`, `x & 1 << y`, bitshift in expressions
+    if re.search(r'\d\s*<<\s*\d|\w\s*<<\s*\w|&\s*1\s*<<|LayerMask', source):
+        # Lines with bitshift operators (digit/word << digit/word)
+        def _comment_bitwise(m):
+            if m.group(2).strip().startswith('--'):
+                return m.group(0)  # Already a comment
+            return f'{m.group(1)}-- [C# bitwise] {m.group(2)}'
         source = re.sub(
-            r'^(\s*)(?!--)(.+(?:&\s*1\s*<<|<<\s*\d+\s*&|1\s*<<\s*\w+[^&\n]*&).+)$',
-            r'\1-- [Unity LayerMask] \2',
+            r'^(\s*)(.+\w\s*<<\s*\w.*)$',
+            _comment_bitwise,
             source,
             flags=re.MULTILINE,
         )
@@ -5312,6 +5317,12 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
     if re.search(r'^\s*\{\s*$', source, re.MULTILINE):
         source = re.sub(r'^\s*\{\s*$', '', source, flags=re.MULTILINE)
         fixes.append("Stripped stray { braces")
+
+    # Strip inline `{ ` after `then` / `do` (C# block opener inside Luau control flow)
+    # e.g., `if (cond) then { return false end` → `if (cond) then return false end`
+    if re.search(r'\b(?:then|do)\s*\{', source):
+        source = re.sub(r'\b(then|do)\s*\{\s*', r'\1 ', source)
+        fixes.append("Stripped inline { after then/do")
 
     # Fix C# postfix ++/-- operators → Luau assignment
     # x++ or x-- at end of line or before ) or ;

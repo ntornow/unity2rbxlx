@@ -3257,7 +3257,7 @@ class TestValidatorBatch17:
         from converter.luau_validator import validate_and_fix
         source = '    if 0 ~= (layers.Value & 1 << otherPart.CollisionGroup) then'
         fixed, _ = validate_and_fix("test", source)
-        assert '-- [Unity LayerMask]' in fixed
+        assert '-- [Unity LayerMask]' in fixed or '-- [C# bitwise]' in fixed
 
     def test_dot_to_colon_with_space(self):
         """obj.PlayRandomClip () → obj:PlayRandomClip()."""
@@ -3528,7 +3528,7 @@ class TestValidatorBatch19:
         from converter.luau_validator import validate_and_fix
         source = 'local layer = 1 << -- LayerMask: use CollisionGroups'
         fixed, _ = validate_and_fix("test", source)
-        assert '-- [Unity LayerMask]' in fixed
+        assert '-- [Unity LayerMask]' in fixed or '-- [C# bitwise]' in fixed
 
     def test_incomplete_assignment_comment(self):
         """var = -- comment: text → var = nil -- comment."""
