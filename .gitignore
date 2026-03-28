@@ -18,6 +18,9 @@ venv/
 # Converter output (generated, large)
 converter/output/
 
+# Cache
+.cache/
+
 # OS
 .DS_Store
 Thumbs.db
