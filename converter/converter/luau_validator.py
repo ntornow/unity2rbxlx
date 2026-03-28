@@ -5324,6 +5324,17 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
         source = re.sub(r'\b(then|do)\s*\{\s*', r'\1 ', source)
         fixes.append("Stripped inline { after then/do")
 
+    # Strip inline `; }` (C# semicolon + brace from block closer)
+    if '; }' in source:
+        source = re.sub(r';\s*\}\s*(?=--|\s*$)', ' ', source)
+        fixes.append("Stripped inline ; } patterns")
+
+    # Fix double-paren function calls: `Method((args))` → `Method(args)`
+    # From C# tuple arguments: `Publish(new Tuple(a, b))` → `Publish((a, b))` → `Publish(a, b)`
+    if re.search(r'\w\(\(', source):
+        source = re.sub(r'(\w)\(\(([^)]*)\)\)', r'\1(\2)', source)
+        fixes.append("Stripped inline { after then/do")
+
     # Fix C# postfix ++/-- operators → Luau assignment
     # x++ or x-- at end of line or before ) or ;
     if re.search(r'\w+\+\+|\w+--', source):
