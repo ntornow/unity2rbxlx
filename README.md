@@ -13,7 +13,6 @@ Converts Unity game projects into Roblox `.rbxlx` place files. Uses Python to or
 ## Prerequisites
 
 - **Python 3.11+**
-- **Node.js** (for npm dependencies)
 - **Claude CLI** (`claude`) -- used for AI-assisted C# to Luau transpilation
 - **Roblox Open Cloud API key** -- for asset uploads ([create one here](https://create.roblox.com/credentials))
 - **Roblox Studio** -- for opening converted files and resolving uploaded asset IDs
@@ -28,10 +27,6 @@ cd unity2rbxlx
 # Install Python dependencies
 cd converter
 pip install -e ".[dev]"
-cd ..
-
-# Install Node dependencies
-npm install
 ```
 
 ### Credentials
