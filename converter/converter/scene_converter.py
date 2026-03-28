@@ -811,6 +811,18 @@ def _convert_node(
                 max(0.05, abs(sy) * config.STUDS_PER_METER),
                 max(0.05, abs(sz) * config.STUDS_PER_METER),
             )
+        # Store Unity scale + import scale for MeshLoader runtime sizing.
+        # MeshLoader uses: finalSize = InitialSize * scaleFactor * (scaleX, scaleY, scaleZ)
+        if has_mesh and node.mesh_guid and guid_index:
+            sx, sy, sz = node.scale
+            if not hasattr(part, "attributes") or part.attributes is None:
+                part.attributes = {}
+            import_scale = _get_fbx_import_scale(node.mesh_guid, guid_index)
+            unit_ratio = _get_fbx_unit_ratio(node.mesh_guid, guid_index)
+            scale_factor = import_scale * unit_ratio * config.STUDS_PER_METER
+            part.attributes["_ScaleX"] = abs(sx) * scale_factor
+            part.attributes["_ScaleY"] = abs(sy) * scale_factor
+            part.attributes["_ScaleZ"] = abs(sz) * scale_factor
         # Set TextureID from embedded FBX texture if available
         tex_id = _resolve_mesh_texture_id(node.mesh_guid, guid_index)
         if tex_id:

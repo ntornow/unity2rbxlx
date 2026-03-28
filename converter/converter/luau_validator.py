@@ -247,6 +247,87 @@ def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
             prev_was_comment_continuing = False
     source = '\n'.join(new_lines_cont)
 
+    # Comment out orphaned end when a block-opening statement was auto-commented
+    # Strategy: match indent of `-- [tag] if/using` with the next `end` at same indent
+    # The indent match ensures we remove the correct `end` for the commented block
+    lines_iffix = source.split('\n')
+    new_lines_iffix = []
+    changed_iffix = False
+    i = 0
+    while i < len(lines_iffix):
+        stripped = lines_iffix[i].strip()
+        comment_indent = len(lines_iffix[i]) - len(lines_iffix[i].lstrip())
+        is_commented_block_opener = (
+            stripped.startswith('--') and
+            re.search(r'\[(?:Unity|broken|C#|#C)', stripped) and
+            (re.search(r'\bif\b.*\bthen\b', stripped) or
+             re.search(r'\busing\b\s*\(', stripped))
+        )
+        if is_commented_block_opener:
+            new_lines_iffix.append(lines_iffix[i])
+            j = i + 1
+            found_end = False
+            pending_lines = []
+            while j < len(lines_iffix) and j - i <= 10:
+                inner = lines_iffix[j].strip()
+                end_indent = len(lines_iffix[j]) - len(lines_iffix[j].lstrip())
+                if inner == 'end' and end_indent == comment_indent:
+                    # Same indent — check if a real block opener above needs this end
+                    # Scan backwards from comment to find unclosed real openers at same indent
+                    has_unclosed_real = False
+                    rdepth = 0
+                    for k in range(i - 1, max(i - 20, -1), -1):
+                        kl = lines_iffix[k].strip()
+                        ki = len(lines_iffix[k]) - len(lines_iffix[k].lstrip())
+                        if kl.startswith('--') or not kl:
+                            continue
+                        if ki == comment_indent and (kl == 'end' or kl.startswith('end ')):
+                            rdepth += 1  # this end closes an opener above
+                        if ki == comment_indent and re.search(
+                            r'\b(?:if\b.*\bthen|for\b.*\bdo|while\b.*\bdo|repeat\b)', kl):
+                            if rdepth > 0:
+                                rdepth -= 1
+                            else:
+                                has_unclosed_real = True
+                                break
+                        if ki < comment_indent:
+                            break  # went to shallower indent, stop
+                    # Also check forward: are there real block openers between comment and end?
+                    if not has_unclosed_real:
+                        for pl in pending_lines:
+                            pls = pl.strip()
+                            if not pls.startswith('--') and pls:
+                                if re.search(r'\b(?:if\b.*\bthen|for\b.*\bdo|while\b.*\bdo|function\b)', pls):
+                                    has_unclosed_real = True
+                                    break
+                    if not has_unclosed_real:
+                        for pl in pending_lines:
+                            new_lines_iffix.append(pl)
+                        indent_str = lines_iffix[j][:end_indent]
+                        new_lines_iffix.append(f'{indent_str}-- [orphaned end] end')
+                        j += 1
+                        found_end = True
+                        changed_iffix = True
+                    break
+                elif inner == 'end' and end_indent < comment_indent:
+                    # End at shallower indent → belongs to enclosing block, stop
+                    break
+                else:
+                    pending_lines.append(lines_iffix[j])
+                    j += 1
+            if not found_end:
+                for pl in pending_lines:
+                    new_lines_iffix.append(pl)
+                i += 1 + len(pending_lines)
+            else:
+                i = j
+        else:
+            new_lines_iffix.append(lines_iffix[i])
+            i += 1
+    if changed_iffix:
+        source = '\n'.join(new_lines_iffix)
+        fixes.append("Commented out orphaned end from commented-out block opener")
+
     source = _fix_startup_race_conditions(name, source, fixes)
     source = _inject_utility_functions(name, source, fixes)
 
@@ -618,6 +699,17 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
             source,
         )
         fixes.append("Fixed |= compound bitwise OR → or")
+
+    # Fix `local function Keyframe(number, ...)` — broken constructor from new Keyframe(...)
+    # Must run BEFORE default-params fix which would replace the numbers
+    if re.search(r'local function Keyframe\(\d', source):
+        source = re.sub(
+            r'^(\s*)local function Keyframe\(\d.*$',
+            lambda m: f'{m.group(1)}-- [Unity Keyframe] {m.group(0).strip()}',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out broken Keyframe constructor")
 
     # Fix default parameter values in function signatures (not valid in Luau)
     # `local function Foo(defaultValue)` where defaultValue is a literal
@@ -1541,6 +1633,10 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
     if re.search(r'GetServerTimeNow\(\)\w', source):
         source = re.sub(r'GetServerTimeNow\(\)(AsDouble|AsFloat|TotalSeconds|SinceLevelLoad)\b', 'GetServerTimeNow()', source)
         fixes.append("Fixed GetServerTimeNow()AsDouble → GetServerTimeNow()")
+    # Fix `GetServerTimeNow(, ...)` → `GetServerTimeNow(), ...` (broken arg list from API replacement)
+    if 'GetServerTimeNow(,' in source:
+        source = source.replace('GetServerTimeNow(,', 'GetServerTimeNow(),')
+        fixes.append("Fixed GetServerTimeNow(, → GetServerTimeNow(),")
 
     # Fix `error(new) System.XxxException("msg")` → `error("msg")`
     if 'error(new)' in source:
@@ -3113,6 +3209,17 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     if 'math.lerp' in source:
         source = source.replace('math.lerp', 'mathLerp')
 
+    # Fix .RemoveAll(predicate) → filter in-place
+    # C# List<T>.RemoveAll takes a Predicate<T> — complex to convert, comment out
+    if '.RemoveAll(' in source:
+        source = re.sub(
+            r'^(\s*)(.+)\.RemoveAll\(.*$',
+            r'\1-- [C# RemoveAll] \2.RemoveAll(...)',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out .RemoveAll() (C# List predicate)")
+
     # Fix .RemoveRange(start, count) → loop with table.remove
     if '.RemoveRange(' in source:
         source = re.sub(
@@ -3121,6 +3228,17 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             source,
         )
         fixes.append("Fixed .RemoveRange() → table.remove loop")
+
+    # Fix AnimationCurve.* → commented out (Unity-specific, no Roblox equivalent)
+    if 'AnimationCurve.' in source:
+        source = re.sub(
+            r'^(\s*)(local\s+\w+\s*=\s*)?AnimationCurve\.\w+\([^)]*\)\s*$',
+            lambda m: f'{m.group(1)}-- [Unity AnimationCurve] {m.group(0).strip()}',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out AnimationCurve calls")
+
 
     # Fix .FindFirstChildOfClassOrThrow() → :FindFirstChildOfClass() (non-standard API)
     if 'FindFirstChildOfClassOrThrow' in source:
@@ -3424,6 +3542,15 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     # C# named argument syntax is not valid in Luau
     if re.search(r'\w+:\s*\(if\b', source):
         source = re.sub(r'(\w+):\s*(\(if\b)', r'\2', source)
+        fixes.append("Stripped C# named parameter syntax")
+    # General C# named arguments: `, name: value` or `(name: value` → strip name:
+    if re.search(r'[,(]\s*[a-z]\w*:\s+\w', source):
+        def _strip_named_arg(line):
+            s = line.strip()
+            if s.startswith('--') or '= {' in line or s.startswith('{'):
+                return line
+            return re.sub(r'([,(]\s*)\b([a-z]\w*):\s+', r'\1', line)
+        source = '\n'.join(_strip_named_arg(l) for l in source.split('\n'))
         fixes.append("Stripped C# named parameter syntax")
 
     # Fix stray `break` outside loops (from switch/case conversion)
@@ -4726,11 +4853,11 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         source = re.sub(r'([,(]\s*)\+([a-zA-Z_])', r'\1\2', source)
         fixes.append("Fixed unary + operator (not valid in Luau)")
 
-    # Fix: `if -- comment ... then` (comment embedded in if-condition)
+    # Fix: `if -- comment ... then` or `if (-- comment` (comment embedded in if-condition)
     # The whole condition is broken — comment out the line
-    if re.search(r'\bif\s+--\s', source):
+    if re.search(r'\bif\s+\(?--\s', source):
         source = re.sub(
-            r'^(\s*)if\s+--\s.*$',
+            r'^(\s*)if\s+\(?--\s.*$',
             lambda m: f'{m.group(1)}-- [broken condition] {m.group(0).strip()}',
             source,
             flags=re.MULTILINE,
@@ -5186,6 +5313,19 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
     if re.search(r'\bthis\b(?!\.)', source):
         source = re.sub(r'\bthis\b(?!\.)', 'script.Parent', source)
 
+    # Second pass: fix script.Parent as function parameter (after gameObject/this→script.Parent)
+    if 'script.Parent)' in source or 'script.Parent,' in source:
+        def _fix_sp_param(m):
+            prefix = m.group(1)
+            params = m.group(2)
+            params = re.sub(r'\bscript\.Parent\b', 'obj', params)
+            return f'{prefix}{params})'
+        source = re.sub(
+            r'((?:local\s+)?function\s+\w+\()([^)]*\bscript\.Parent\b[^)]*)\)',
+            _fix_sp_param,
+            source,
+        )
+
     # Strip C# [Attribute] annotations — both standalone lines and inline prefixes
     _ATTR_NAMES = (
         'Range', 'SerializeField', 'Header', 'Tooltip', 'Space',
@@ -5210,6 +5350,25 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
     if re.search(rf'\[(?:{_ATTR_PATTERN})\b', source):
         source = re.sub(rf'\[(?:{_ATTR_PATTERN})\b[^\]]*\]\s*', '', source)
         fixes.append("Stripped inline C# [Attribute] annotations")
+
+    # Fix `local script.Parent = ...` → remove (invalid; script.Parent already exists)
+    if 'local script.Parent' in source:
+        source = re.sub(
+            r'^\s*local script\.Parent\s*=.*$',
+            '',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Removed invalid 'local script.Parent' declaration")
+
+    # Fix stray `. method()` (dot-space-method from mangled output)
+    if re.search(r'\.\s+\w+[:(]', source):
+        source = re.sub(
+            r'then\s+\.\s+(\w+)',
+            r'then \1',
+            source,
+        )
+        fixes.append("Fixed stray dot-space before method call")
 
     # Fix: "TypeName varName = default" → "local varName = nil" (C# field with default)
     if '= default' in source:

@@ -953,6 +953,19 @@ def _make_lighting(lighting_item: ET.Element, config: RbxLightingConfig) -> None
     _add_float(props, "EnvironmentDiffuseScale", 1.0)
     _add_float(props, "EnvironmentSpecularScale", 1.0)
 
+    # Add Atmosphere for outdoor scenes (reduces default Roblox haze)
+    atmo_item, atmo_props = _make_item(lighting, "Atmosphere", "Atmosphere")
+    atmo_cfg = getattr(config, "atmosphere_density", None)
+    density = atmo_cfg if atmo_cfg is not None else 0.3
+    _add_float(atmo_props, "Density", density)
+    _add_float(atmo_props, "Offset", getattr(config, "atmosphere_offset", 0.25))
+    _add_color3(atmo_props, "Color",
+                *getattr(config, "atmosphere_color", (0.68, 0.75, 0.85))[:3])
+    _add_color3(atmo_props, "Decay",
+                *getattr(config, "atmosphere_decay_color", (0.93, 0.73, 0.47))[:3])
+    _add_float(atmo_props, "Glare", getattr(config, "atmosphere_glare", 0.0))
+    _add_float(atmo_props, "Haze", getattr(config, "atmosphere_haze", 0.0))
+
 
 def _make_skybox(parent_xml: ET.Element, skybox: RbxSkyboxConfig) -> None:
     """Add a Sky object under Lighting."""

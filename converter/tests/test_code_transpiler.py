@@ -4169,3 +4169,48 @@ class TestValidatorBatch18:
         assert 'task.spawn' in fixed
         assert 'task.wait(2)' in fixed
         assert 'task.wait(1)' in fixed
+
+    def test_script_parent_param_after_gameobject_replacement(self):
+        """script.Parent as function param (from gameObject→script.Parent) is fixed."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local function Dummy(gameObject)\n    if gameObject == nil then return end\n    return gameObject'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'function Dummy(obj)' in fixed
+        assert 'script.Parent' not in fixed.split('\n')[0]
+
+    def test_named_parameter_stripping(self):
+        """C# named parameters `name: value` stripped from function calls."""
+        from converter.luau_validator import validate_and_fix
+        source = '    clip = InternalPlayRandomClip(nil, bankId: 0)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'bankId:' not in fixed
+        assert 'InternalPlayRandomClip(nil, 0)' in fixed
+
+    def test_broken_if_paren_comment(self):
+        """if (-- comment) is commented out as broken condition."""
+        from converter.luau_validator import validate_and_fix
+        source = '    if (-- (type comment removed)\n        continue'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [broken condition]' in fixed
+
+    def test_remove_all_commented(self):
+        """.RemoveAll(predicate) is commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '    modifiers.RemoveAll(function(x) return not x.isActiveAndEnabled end)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [C# RemoveAll]' in fixed
+
+    def test_animation_curve_commented(self):
+        """AnimationCurve.* calls are commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '    local m_LinearCurve = AnimationCurve.Linear(0, 0, 1, 1)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [Unity AnimationCurve]' in fixed
+
+    def test_broken_keyframe_constructor(self):
+        """Broken local function Keyframe(number, ...) commented out or fixed."""
+        from converter.luau_validator import validate_and_fix
+        source = '        local function Keyframe(1, 1, 0, 0)\n            end'
+        fixed, _ = validate_and_fix("test", source)
+        # Either commented out as Unity Keyframe or params replaced with _defaultParam
+        assert '-- [Unity Keyframe]' in fixed or 'Keyframe(1' not in fixed
