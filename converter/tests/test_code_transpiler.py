@@ -2404,6 +2404,101 @@ class TestValidatorNewFixes:
         fixed, _ = validate_and_fix("test", source)
         assert 'end)' in fixed
 
+    def test_connect_closure_swapped_end(self):
+        """end) at wrong depth gets swapped with end."""
+        from converter.luau_validator import validate_and_fix
+        source = (
+            'workspace.DescendantAdded:Connect(function(obj)\n'
+            '    if obj:IsA("BasePart") then\n'
+            '        task.defer(setup, obj)\n'
+            'end)\n'
+            'end\n'
+        )
+        fixed, _ = validate_and_fix("test", source)
+        lines = fixed.rstrip().split('\n')
+        # end should close the if, end) should close the Connect function
+        assert lines[-1].strip() == 'end)'
+        assert lines[-2].strip() == 'end'
+
+    def test_endparen_recognized_as_closer(self):
+        """end) is recognized as block closer in missing-end analysis."""
+        from converter.luau_validator import validate_and_fix
+        source = (
+            'workspace.DescendantAdded:Connect(function(obj)\n'
+            '    if obj:IsA("BasePart") then\n'
+            '        task.defer(setup, obj)\n'
+            '    end\n'
+            'end)\n'
+        )
+        fixed, _ = validate_and_fix("test", source)
+        # Count end lines (not substrings)
+        end_lines = [l.strip() for l in fixed.split('\n') if l.strip() in ('end', 'end)')]
+        assert len(end_lines) == 2
+
+    def test_elseif_depth_tracking(self):
+        """elseif doesn't inflate block depth."""
+        from converter.luau_validator import validate_and_fix
+        source = (
+            'local function foo(obj)\n'
+            '    if obj:IsA("A") then\n'
+            '        print("a")\n'
+            '    elseif obj:IsA("B") then\n'
+            '        print("b")\n'
+            '    end\n'
+            'end\n'
+            '\n'
+            'workspace.DescendantAdded:Connect(function(obj)\n'
+            '    task.defer(foo, obj)\n'
+            'end)\n'
+        )
+        fixed, _ = validate_and_fix("test", source)
+        # Should not have trailing orphaned end
+        assert fixed.rstrip().endswith('end)')
+
+    def test_undefined_module_return(self):
+        """Scripts ending with return ClassName get table definition added."""
+        from converter.luau_validator import validate_and_fix
+        source = (
+            'local Players = game:GetService("Players")\n'
+            '\n'
+            'local function doStuff()\n'
+            '    print("hi")\n'
+            'end\n'
+            '\n'
+            'return MyModule\n'
+        )
+        fixed, _ = validate_and_fix("test", source)
+        assert 'local MyModule = {}' in fixed
+        assert fixed.index('local MyModule = {}') < fixed.index('return MyModule')
+
+    def test_magnitude_method_to_property(self):
+        """Magnitude() as method call → .Magnitude property."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local dist = (pos1 - pos2):Magnitude()'
+        fixed, _ = validate_and_fix("test", source)
+        assert ':Magnitude()' not in fixed
+        assert '.Magnitude' in fixed
+
+    def test_raycast_broken_origin_direction(self):
+        """Raycast with .Origin/.Direction on Vector3 gets fixed."""
+        from converter.luau_validator import validate_and_fix
+        source = (
+            'local origin = camera.CFrame.Position\n'
+            'local direction = camera.CFrame.LookVector * 100\n'
+            'local result = workspace:Raycast(origin.Origin, origin.Direction * rayParams)\n'
+        )
+        fixed, _ = validate_and_fix("test", source)
+        assert '.Origin' not in fixed
+        assert '.Direction' not in fixed
+        assert 'Raycast(origin, direction, rayParams)' in fixed
+
+    def test_raycast_skips_rayparams_second_arg(self):
+        """Raycast(origin, rayParams, x) is NOT wrongly converted."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local result = workspace:Raycast(origin, rayParams, dist)\n'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'origin.Origin' not in fixed
+
     def test_ternary_inside_function_call(self):
         """Ternary inside function call args gets properly converted."""
         from converter.luau_validator import validate_and_fix

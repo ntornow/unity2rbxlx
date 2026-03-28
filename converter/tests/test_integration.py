@@ -896,11 +896,13 @@ class TestCLIPipeline:
     def test_convert_command(self, tmp_path):
         """Test the full convert command."""
         import subprocess, sys
+        converter_dir = str(Path(__file__).resolve().parent.parent)
         result = subprocess.run(
             [sys.executable, "u2r.py", "convert", str(SIMPLEFPS_DIR),
              "-o", str(tmp_path / "output"), "--no-upload"],
             capture_output=True, text=True,
             timeout=120,
+            cwd=converter_dir,
         )
         assert result.returncode == 0
         assert "Conversion complete" in result.stdout
@@ -910,12 +912,14 @@ class TestCLIPipeline:
     def test_validate_command(self, tmp_path):
         """Test the validate command on a fresh conversion."""
         import subprocess, sys
+        converter_dir = str(Path(__file__).resolve().parent.parent)
         # Convert first
         subprocess.run(
             [sys.executable, "u2r.py", "convert", str(SIMPLEFPS_DIR),
              "-o", str(tmp_path / "output"), "--no-upload"],
             capture_output=True, text=True,
             timeout=120,
+            cwd=converter_dir,
         )
         # Then validate
         rbxlx = tmp_path / "output" / "converted_place.rbxlx"
@@ -923,6 +927,7 @@ class TestCLIPipeline:
             [sys.executable, "u2r.py", "validate", str(rbxlx)],
             capture_output=True, text=True,
             timeout=30,
+            cwd=converter_dir,
         )
         assert result.returncode == 0
         assert "No issues found" in result.stdout or "No errors found" in result.stdout

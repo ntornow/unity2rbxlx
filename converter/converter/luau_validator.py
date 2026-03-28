@@ -166,6 +166,7 @@ def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
     source = _fix_common_api_mistakes(name, source, fixes)
     source = _fix_structural_syntax(name, source, fixes)
     source = _fix_missing_end_keywords(name, source, fixes)
+    source = _fix_undefined_module_return(name, source, fixes)
     # Second pass: catch patterns introduced by structural fixes
     if re.search(r'\bthis\.', source):
         source = re.sub(r'\bthis\.(\w+)', r'script.Parent.\1', source)
@@ -1586,6 +1587,14 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     if '.normalized' in source:
         source = re.sub(r'\.normalized\b', '.Unit', source)
         fixes.append("Fixed .normalized → .Unit")
+    # :Magnitude() → .Magnitude (property, not method)
+    if ':Magnitude()' in source:
+        source = source.replace(':Magnitude()', '.Magnitude')
+        fixes.append("Fixed :Magnitude() → .Magnitude (property, not method)")
+    # .Magnitude() → .Magnitude (not a function call)
+    if '.Magnitude()' in source:
+        source = source.replace('.Magnitude()', '.Magnitude')
+        fixes.append("Fixed .Magnitude() → .Magnitude (property, not method)")
     # .magnitude → .Magnitude (case fix)
     if re.search(r'\.magnitude\b(?![\s]*=)', source):
         source = re.sub(r'\.magnitude\b', '.Magnitude', source)
@@ -2070,16 +2079,38 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     # Unity: workspace:Raycast(ray, hit, range) → Roblox: workspace:Raycast(origin, direction * range)
     # Unity: workspace:Raycast(origin, direction, hit, range) → Roblox: workspace:Raycast(origin, direction * range)
     if 'Raycast(' in source:
-        # Pattern: workspace:Raycast(ray, hit, range) → local hit = workspace:Raycast(ray.Origin, ray.Direction * range)
+        # Pattern: workspace:Raycast(ray, hit, range) → workspace:Raycast(ray.Origin, ray.Direction * range)
+        # But skip if the second arg is 'rayParams' or ends with 'Params' (already Roblox format)
+        def _fix_raycast_3arg(m):
+            obj, a, b, c = m.group(1), m.group(2), m.group(3), m.group(4)
+            if b.endswith('Params') or b == 'rayParams':
+                return m.group(0)  # Already Roblox format
+            return f'{obj}:Raycast({a}.Origin, {a}.Direction * {c})'
         source = re.sub(
             r'(\w+):Raycast\((\w+),\s*(\w+),\s*(\w+)\)',
-            r'\1:Raycast(\2.Origin, \2.Direction * \4)',
+            _fix_raycast_3arg,
             source,
         )
         # Pattern: workspace:Raycast(origin, direction, hit, range) → workspace:Raycast(origin, direction * range)
         source = re.sub(
             r'(\w+):Raycast\(([^,]+),\s*([^,]+),\s*(\w+),\s*(\w+)\)',
             r'\1:Raycast(\2, \3 * \5)',
+            source,
+        )
+        # Fix broken pattern: Raycast(x.Origin, x.Direction * params)
+        # where x is a Vector3 (not a Ray) — the .Origin/.Direction fields don't exist
+        # Look for a 'direction' variable defined nearby and use it
+        def _fix_broken_ray_fields(m):
+            full = m.group(0)
+            var = m.group(1)
+            params = m.group(2)
+            # Check if 'direction' is defined in the source
+            if re.search(r'\blocal\s+direction\b', source):
+                return f':Raycast({var}, direction, {params})'
+            return full  # Can't fix safely
+        source = re.sub(
+            r':Raycast\((\w+)\.Origin,\s*\1\.Direction\s*\*\s*(\w+)\)',
+            _fix_broken_ray_fields,
             source,
         )
         fixes.append("Fixed Raycast API signature (Unity → Roblox)")
@@ -4538,6 +4569,49 @@ def _fix_missing_ends_in_blocks(source: str, fixes: list[str]) -> str:
     return source
 
 
+def _fix_undefined_module_return(name: str, source: str, fixes: list[str]) -> str:
+    """Add module table definition when script returns an undefined name.
+
+    If a script ends with `return ClassName` but never defines `local ClassName`,
+    insert `local ClassName = {}` after the service/require declarations at the top.
+    """
+    lines = source.rstrip().split('\n')
+    # Find last non-empty, non-comment line
+    return_name = None
+    for line in reversed(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith('--'):
+            continue
+        m = re.match(r'^return\s+([A-Z]\w+)\s*$', stripped)
+        if m:
+            return_name = m.group(1)
+        break
+
+    if not return_name:
+        return source
+
+    # Check if the name is already defined
+    if re.search(rf'\blocal\s+{re.escape(return_name)}\s*=', source):
+        return source
+
+    # Insert table definition after service/require declarations
+    src_lines = source.split('\n')
+    insert_idx = 0
+    for i, line in enumerate(src_lines):
+        ls = line.strip()
+        if ls.startswith('local ') and ('GetService' in ls or 'require' in ls):
+            insert_idx = i + 1
+        elif ls == '' and insert_idx > 0:
+            insert_idx = i + 1
+            break
+        elif insert_idx == 0 and ls and not ls.startswith('--'):
+            break
+
+    src_lines.insert(insert_idx, f'local {return_name} = {{}}\n')
+    fixes.append(f"Added module table definition for '{return_name}'")
+    return '\n'.join(src_lines)
+
+
 def _fix_missing_end_keywords(name: str, source: str, fixes: list[str]) -> str:
     """Fix missing `end` keywords by analyzing block structure.
 
@@ -4650,7 +4724,7 @@ def _append_missing_trailing_ends(source: str, fixes: list[str]) -> str:
             # Skip single-line functions: function() ... end or function() ... end)
             if not re.search(r'\bend\)?[,;]?\s*$', stripped):
                 depth += 1
-        if re.match(r'(?:if|elseif)\b.+\bthen\s*$', stripped) or (
+        if re.match(r'if\b.+\bthen\s*$', stripped) or (
                 re.search(r'\bthen\s*$', stripped) and not re.match(r'(?:if|elseif)\b', stripped)
                 and not re.search(r'\bfunction\b', stripped)):
             depth += 1
@@ -4695,7 +4769,7 @@ def _remove_excess_end_keywords(source: str, fixes: list[str]) -> str:
             # Skip single-line functions: function() ... end or function() ... end)
             if not re.search(r'\bend\)?[,;]?\s*$', stripped):
                 depth += 1
-        if re.match(r'(?:if|elseif)\b.+\bthen\s*$', stripped) or (
+        if re.match(r'if\b.+\bthen\s*$', stripped) or (
                 re.search(r'\bthen\s*$', stripped) and not re.match(r'(?:if|elseif)\b', stripped)
                 and not re.search(r'\bfunction\b', stripped)):
             depth += 1
@@ -4757,13 +4831,16 @@ def _fix_connect_closures(source: str, fixes: list[str]) -> str:
     # Strategy: track block nesting from the Connect line. The function's
     # closing `end` is when we return to the same nesting depth we had
     # at the Connect line (just the function block).
-    ends_to_fix = set()  # line indices where `end` should become `end)`
+    ends_to_fix = {}  # line index → target string ('end)' or 'end')
 
     for open_idx, open_indent in connect_openers:
         # Find the matching end for the function opened by this Connect
-        # We scan forward, tracking function depth (function opens +1, end -1)
+        # We scan forward, tracking block depth. The function's closing end
+        # is when depth returns to 0. Any end) at depth > 0 is wrong (should
+        # be bare end), and the closer at depth 0 should be end).
         depth = 0
         found = False
+        inner_ends = []  # track (line_idx, current_text) for closers at depth > 0
         for j in range(open_idx, len(lines)):
             stripped = lines[j].strip()
             if stripped.startswith('--') or not stripped:
@@ -4773,7 +4850,7 @@ def _fix_connect_closures(source: str, fixes: list[str]) -> str:
             if re.search(r'\bfunction\s*[\w.:(]', stripped):
                 if not re.search(r'\bend\)?[,;]?\s*$', stripped):
                     depth += 1
-            elif re.match(r'(?:if|elseif)\b.+\bthen\s*$', stripped) or (
+            elif re.match(r'if\b.+\bthen\s*$', stripped) or (
                     re.search(r'\bthen\s*$', stripped) and not re.match(r'(?:if|elseif)\b', stripped)
                     and not re.search(r'\bfunction\b', stripped)):
                 depth += 1
@@ -4788,33 +4865,41 @@ def _fix_connect_closures(source: str, fixes: list[str]) -> str:
             if stripped == 'end' or stripped.startswith('end)'):
                 depth -= 1
                 if depth == 0:
-                    # This `end` closes the function opened by Connect
+                    # This closer should be end) (closes the Connect function)
                     if stripped == 'end':
-                        ends_to_fix.add(j)
+                        ends_to_fix[j] = 'end)'
                     found = True
                     break
+                else:
+                    # This closer is inside the function body — should be bare end
+                    if stripped.startswith('end)') and stripped != 'end':
+                        inner_ends.append(j)
             elif re.match(r'until\b', stripped):
                 depth -= 1
 
-        # If no matching end found and depth > 0, the function body is missing
-        # its closing end. Add one at the appropriate indent level.
+        # Fix inner end) → end (these close if/for/while blocks, not the function)
+        for idx in inner_ends:
+            ends_to_fix[idx] = 'end'
+
+        # If no matching end found and depth > 0, insert end)
         if not found and depth > 0:
-            # Insert `end)` after the last non-empty line before EOF or next Connect
             insert_idx = len(lines)
             for j in range(len(lines) - 1, open_idx, -1):
                 if lines[j].strip():
                     insert_idx = j + 1
                     break
             lines.insert(insert_idx, ' ' * (open_indent) + 'end)')
-            # Don't add to ends_to_fix since we inserted it directly
 
     # Apply fixes
+    fix_count = 0
     if ends_to_fix:
         for idx in sorted(ends_to_fix):
             line = lines[idx]
             indent = len(line) - len(line.lstrip()) if line.strip() else 0
-            lines[idx] = ' ' * indent + 'end)'
-        fixes.append(f"Fixed {len(ends_to_fix)} Connect(function) closure(s): end → end)")
+            target = ends_to_fix[idx]
+            lines[idx] = ' ' * indent + target
+            fix_count += 1
+        fixes.append(f"Fixed {fix_count} Connect(function) closure(s): corrected end/end) placement")
 
     return '\n'.join(lines)
 
@@ -4839,7 +4924,7 @@ def _remove_excess_trailing_ends(source: str, fixes: list[str]) -> str:
             # Only count as opener if line does NOT also end with 'end'
             if not stripped.endswith(' end') and not stripped.endswith('\tend'):
                 depth += 1
-        if re.match(r'(?:if|elseif)\b.+\bthen\s*$', stripped) or (
+        if re.match(r'if\b.+\bthen\s*$', stripped) or (
                 re.search(r'\bthen\s*$', stripped) and not re.match(r'(?:if|elseif)\b', stripped)
                 and not re.search(r'\bfunction\b', stripped)):
             depth += 1
@@ -4942,7 +5027,8 @@ def _insert_missing_ends_for_single_statement_blocks(source: str, fixes: list[st
 
         # Before adding this line, check if any open blocks need closing
         # based on indent level
-        if indent >= 0 and stripped not in ('end', 'else') and not stripped.startswith('elseif '):
+        is_closer = stripped == 'end' or stripped.startswith('end)')
+        if indent >= 0 and not is_closer and stripped not in ('else',) and not stripped.startswith('elseif '):
             while block_stack:
                 top_indent, top_type = block_stack[-1]
                 if indent <= top_indent:
@@ -4954,9 +5040,9 @@ def _insert_missing_ends_for_single_statement_blocks(source: str, fixes: list[st
                 else:
                     break
 
-        # Handle 'end' keyword — pop the stack
+        # Handle 'end' or 'end)' keyword — pop the stack
         # If the end is at a lower indent than the top block, insert missing ends first
-        if stripped == 'end':
+        if is_closer:
             while len(block_stack) > 1:
                 top_indent, top_type = block_stack[-1]
                 # If this 'end' is at or below the opener's indent, the block

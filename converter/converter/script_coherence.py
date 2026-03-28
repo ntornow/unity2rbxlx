@@ -109,6 +109,23 @@ def inject_require_calls(
                 if not stripped_source.endswith(f"return {dep}"):
                     # Wrap the script in a module table pattern
                     target.source = stripped_source + f"\n\nreturn {dep}\n"
+                # Add module table definition if missing
+                if f"local {dep} = " not in target.source:
+                    # Insert after service declarations at the top
+                    tgt_lines = target.source.split("\n")
+                    tgt_insert = 0
+                    for ti, tl in enumerate(tgt_lines):
+                        if tl.strip().startswith("local ") and "GetService" in tl:
+                            tgt_insert = ti + 1
+                        elif tl.strip().startswith("local ") and "require" in tl:
+                            tgt_insert = ti + 1
+                        elif tl.strip() == "" and tgt_insert > 0:
+                            tgt_insert = ti + 1
+                            break
+                        elif tgt_insert == 0 and tl.strip() and not tl.strip().startswith("--"):
+                            break
+                    tgt_lines.insert(tgt_insert, f"\nlocal {dep} = {{}}\n")
+                    target.source = "\n".join(tgt_lines)
 
             require_lines.append(
                 f'local {dep} = require(game:GetService("ReplicatedStorage")'
