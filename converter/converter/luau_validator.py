@@ -5336,10 +5336,10 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
         'ContextMenu', 'ContextMenuItem',
     )
     _ATTR_PATTERN = '|'.join(_ATTR_NAMES)
-    # Standalone attribute lines
-    if re.search(rf'^\s*\[(?:{_ATTR_PATTERN})\b', source, re.MULTILINE):
+    # Standalone attribute lines (with optional namespace prefix like UnityEngine.Serialization.)
+    if re.search(rf'^\s*\[(?:[\w.]*\.)?(?:{_ATTR_PATTERN})\b', source, re.MULTILINE):
         source = re.sub(
-            rf'^\s*\[(?:{_ATTR_PATTERN})\b[^\]]*\]\s*\n',
+            rf'^\s*\[(?:[\w.]*\.)?(?:{_ATTR_PATTERN})\b[^\]]*\]\s*\n',
             '',
             source,
             flags=re.MULTILINE,
@@ -5347,8 +5347,8 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
         fixes.append("Stripped C# [Attribute] annotations")
     # Inline attributes at start of line (before variable declarations)
     # e.g., "[SerializeField][Range(0.5, 3)] local ..." → "local ..."
-    if re.search(rf'\[(?:{_ATTR_PATTERN})\b', source):
-        source = re.sub(rf'\[(?:{_ATTR_PATTERN})\b[^\]]*\]\s*', '', source)
+    if re.search(rf'\[(?:[\w.]*\.)?(?:{_ATTR_PATTERN})\b', source):
+        source = re.sub(rf'\[(?:[\w.]*\.)?(?:{_ATTR_PATTERN})\b[^\]]*\]\s*', '', source)
         fixes.append("Stripped inline C# [Attribute] annotations")
 
     # Fix `local script.Parent = ...` → remove (invalid; script.Parent already exists)
@@ -5369,6 +5369,37 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
             source,
         )
         fixes.append("Fixed stray dot-space before method call")
+
+    # Comment out broken C# override property patterns:
+    # `ClassName function(_x) return (ClassName end)base.Property;`
+    if re.search(r'\w+ function\(\w+\) return \(', source):
+        source = re.sub(
+            r'^(\s*)\w+ function\(\w+\) return \(.*$',
+            r'\1-- [C# override property] (removed)',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out broken C# override property patterns")
+
+    # Comment out C# interface method declarations: `T Create()`, `T Request()`
+    if re.search(r'^\s+[A-Z]\w*\s+\w+\(\)\s*$', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s+)([A-Z]\w*\s+\w+\(\))\s*$',
+            r'\1-- [C# interface] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out C# interface method declarations")
+
+    # Comment out C# operator overloads: `local operator ==(Type x, Type y)`
+    if 'operator ==' in source or 'operator !=' in source:
+        source = re.sub(
+            r'^(\s*)local operator\s*[!=]=.*$',
+            r'\1-- [C# operator] (removed)',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out C# operator overloads")
 
     # Fix: "TypeName varName = default" → "local varName = nil" (C# field with default)
     if '= default' in source:

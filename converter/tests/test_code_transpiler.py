@@ -4214,3 +4214,31 @@ class TestValidatorBatch18:
         fixed, _ = validate_and_fix("test", source)
         # Either commented out as Unity Keyframe or params replaced with _defaultParam
         assert '-- [Unity Keyframe]' in fixed or 'Keyframe(1' not in fixed
+
+    def test_override_property_commented(self):
+        """Broken C# override property pattern is commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '    AnimatorParameterActionSO function(_originSO) return (AnimatorParameterActionSO end)base.OriginSO;'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [C# override property]' in fixed
+
+    def test_interface_method_commented(self):
+        """C# interface method declarations are commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '        T Create()\n        T Request()'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [C# interface]' in fixed
+
+    def test_operator_overload_commented(self):
+        """C# operator overloads are commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '        local operator ==(AudioCueKey x, AudioCueKey y)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [C# operator]' in fixed
+
+    def test_namespaced_attribute_stripped(self):
+        """C# attributes with namespace prefix are stripped."""
+        from converter.luau_validator import validate_and_fix
+        source = '    [UnityEngine.Serialization.FormerlySerializedAs("_x")] GameState gs'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'FormerlySerializedAs' not in fixed
