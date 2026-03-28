@@ -6042,6 +6042,28 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
     if source != original and not any('structural' in f.lower() for f in fixes):
         fixes.append("Fixed structural syntax issues")
 
+    # Strip trailing `)` from lines with unbalanced parentheses (run last)
+    # e.g., `return x==y)` → `return x==y`
+    def _fix_unbal_parens(line):
+        s = line.strip()
+        if not s or s.startswith('--') or s.startswith('end'):
+            return line
+        opens = s.count('(')
+        closes = s.count(')')
+        if closes > opens and (s.endswith(')') or s.endswith(') then') or s.endswith(') do')):
+            for _ in range(closes - opens):
+                idx = s.rfind(')')
+                if idx >= 0:
+                    s = s[:idx] + s[idx+1:]
+            indent = line[:len(line) - len(line.lstrip())]
+            return indent + s
+        return line
+    new_lines_paren = [_fix_unbal_parens(l) for l in source.split('\n')]
+    new_source_paren = '\n'.join(new_lines_paren)
+    if new_source_paren != source:
+        source = new_source_paren
+        fixes.append("Fixed unbalanced trailing parentheses")
+
     return source
 
 
