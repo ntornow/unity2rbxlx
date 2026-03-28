@@ -35,5 +35,8 @@ node_modules/
 *.swp
 *.swo
 
+# Claude Code
+CLAUDE.md
+
 # Scripts
 busybee
