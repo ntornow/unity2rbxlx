@@ -1,0 +1,29 @@
+# Secrets and credentials
+apikey
+creator_id
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Converter output (generated, large)
+converter/output/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
