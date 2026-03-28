@@ -85,6 +85,7 @@ def transpile_scripts(
     script_infos: list[Any],
     use_ai: bool = True,
     api_key: str = "",
+    max_concurrent: int = 10,
 ) -> TranspilationResult:
     """Transpile a list of C# scripts to Luau.
 
@@ -93,12 +94,18 @@ def transpile_scripts(
         script_infos: List of ScriptInfo objects from the script analyzer.
         use_ai: Whether to attempt AI transpilation for low-confidence scripts.
         api_key: Anthropic API key (required if use_ai is True).
+        max_concurrent: Max concurrent API calls for AI transpilation.
 
     Returns:
         TranspilationResult with all transpiled scripts and summary counts.
     """
     result = TranspilationResult()
 
+    # Build project context for AI transpilation
+    project_context = _build_project_context(script_infos)
+
+    # Phase 1: Classify scripts and read source
+    pending_scripts: list[tuple[Any, str, str]] = []  # (info, csharp_source, script_type)
     for info in script_infos:
         script_path = info.path
         try:
@@ -124,40 +131,76 @@ def transpile_scripts(
             log.info("  %s: auto-stubbed (visual/rendering only)", script_path.name)
             continue
 
-        # Determine script type from analyzer.
         script_type = _classify_script_type(csharp_source, info)
+        pending_scripts.append((info, csharp_source, script_type))
 
-        luau = ""
-        confidence = 0.0
-        warnings: list[str] = []
-        strategy = "rule_based"
+    # Phase 2: AI transpilation (concurrent for API, serial for CLI)
+    ai_results: dict[str, tuple[str, float, list[str]]] = {}  # class_name → (luau, confidence, warnings)
 
-        # Try AI first if enabled (produces much better Luau)
-        if use_ai:
-            backend = _find_transpiler() if not api_key else "anthropic_api"
-            try:
-                if backend == "claude_cli":
-                    luau, confidence, warnings = _claude_cli_transpile(
-                        csharp_source, class_name=info.class_name, script_type=script_type,
-                    )
-                    strategy = "ai"
-                    result.total_ai += 1
-                    log.info("  %s: transpiled via Claude CLI (confidence %.2f)",
-                             script_path.name, confidence)
-                elif backend == "anthropic_api" and api_key:
-                    luau, confidence, warnings = _ai_transpile(
+    if use_ai and pending_scripts:
+        backend = _find_transpiler() if not api_key else "anthropic_api"
+
+        if backend == "anthropic_api" and api_key and len(pending_scripts) > 1:
+            # Concurrent API calls for better throughput
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            futures = {}
+            with ThreadPoolExecutor(max_workers=min(max_concurrent, len(pending_scripts))) as executor:
+                for info, csharp_source, script_type in pending_scripts:
+                    future = executor.submit(
+                        _ai_transpile,
                         csharp_source, api_key, ANTHROPIC_MODEL,
+                        class_name=info.class_name,
+                        script_type=script_type,
+                        project_context=project_context,
                     )
-                    strategy = "ai"
+                    futures[future] = info
+                for future in as_completed(futures):
+                    info = futures[future]
+                    try:
+                        luau, confidence, warnings = future.result()
+                        ai_results[info.class_name or str(info.path)] = (luau, confidence, warnings)
+                        result.total_ai += 1
+                        log.info("  %s: transpiled via Anthropic API (confidence %.2f)",
+                                 info.path.name, confidence)
+                    except Exception as exc:
+                        log.warning("AI transpilation failed for %s: %s",
+                                    info.path.name, exc)
+        else:
+            # Serial transpilation (CLI or single script)
+            for info, csharp_source, script_type in pending_scripts:
+                try:
+                    if backend == "claude_cli":
+                        luau, confidence, warnings = _claude_cli_transpile(
+                            csharp_source,
+                            class_name=info.class_name,
+                            script_type=script_type,
+                            project_context=project_context,
+                        )
+                    elif backend == "anthropic_api" and api_key:
+                        luau, confidence, warnings = _ai_transpile(
+                            csharp_source, api_key, ANTHROPIC_MODEL,
+                            class_name=info.class_name,
+                            script_type=script_type,
+                            project_context=project_context,
+                        )
+                    else:
+                        continue
+                    ai_results[info.class_name or str(info.path)] = (luau, confidence, warnings)
                     result.total_ai += 1
-                    log.info("  %s: transpiled via Anthropic API (confidence %.2f)",
-                             script_path.name, confidence)
-            except Exception as exc:
-                log.warning("AI transpilation failed for %s: %s, falling back to rule-based",
-                            script_path.name, exc)
-                warnings.append(f"AI transpilation failed: {exc}")
-                luau = ""
-                confidence = 0.0
+                    log.info("  %s: transpiled via %s (confidence %.2f)",
+                             info.path.name, backend, confidence)
+                except Exception as exc:
+                    log.warning("AI transpilation failed for %s: %s, falling back to rule-based",
+                                info.path.name, exc)
+
+    # Phase 3: Assemble results, falling back to rule-based where AI didn't produce output
+    for info, csharp_source, script_type in pending_scripts:
+        key = info.class_name or str(info.path)
+        luau, confidence, warnings, strategy = "", 0.0, [], "rule_based"
+
+        if key in ai_results:
+            luau, confidence, warnings = ai_results[key]
+            strategy = "ai"
 
         # Fall back to rule-based if AI didn't run or failed
         if not luau or confidence < 0.1:
@@ -177,10 +220,10 @@ def transpile_scripts(
         # Flag for manual review if confidence is still low.
         flagged = confidence < TRANSPILATION_CONFIDENCE_THRESHOLD
 
-        output_filename = script_path.stem + ".luau"
+        output_filename = info.path.stem + ".luau"
 
         ts = TranspiledScript(
-            source_path=str(script_path),
+            source_path=str(info.path),
             output_filename=output_filename,
             csharp_source=csharp_source,
             luau_source=luau,
@@ -204,6 +247,34 @@ def transpile_scripts(
         result.total_failed,
     )
     return result
+
+
+def _build_project_context(script_infos: list[Any]) -> str:
+    """Build a concise project context string for AI transpilation.
+
+    Includes the list of project classes and their base types / interfaces
+    so the AI understands cross-script relationships.
+    """
+    # Collect class names and their types
+    classes = []
+    for si in script_infos:
+        if si.class_name:
+            base = ""
+            if hasattr(si, 'base_class') and si.base_class:
+                base = f" : {si.base_class}"
+            classes.append(f"  - {si.class_name}{base}")
+
+    if not classes:
+        return ""
+
+    # Cap at a reasonable size to fit in context window
+    if len(classes) > 100:
+        classes = classes[:100]
+        classes.append(f"  - ... and {len(script_infos) - 100} more")
+
+    lines = ["Project classes (other scripts in this game — reference by name with require()):"]
+    lines.extend(classes)
+    return '\n'.join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -504,18 +575,17 @@ def _preprocess_null_conditional(source: str) -> str:
     obj?.Property → (obj and obj.Property or nil)
     obj?.Method() → if obj then obj:Method() end
     """
-    # Simple property access: obj?.Property (not followed by ( )
-    # Convert to: (obj and obj.Property or nil)
-    source = re.sub(
-        r'(\w+)\?\.([\w]+)(?!\s*\()',
-        r'(\1 and \1.\2 or nil)',
-        source,
-    )
-    # Method call: obj?.Method(args) → if obj then obj.Method(args) end
-    # This is harder in-line; convert to a safe-call pattern
+    # Method call FIRST (more specific): obj?.Method(args) → if obj then obj.Method(args) end
     source = re.sub(
         r'(\w+)\?\.([\w]+)\(([^)]*)\)',
         r'(if \1 then \1.\2(\3) else nil)',
+        source,
+    )
+    # Simple property access: obj?.Property (not followed by ( or word char)
+    # Convert to: (obj and obj.Property or nil)
+    source = re.sub(
+        r'(\w+)\?\.([\w]+)\b(?!\s*\()',
+        r'(\1 and \1.\2 or nil)',
         source,
     )
     # Null-coalescing assignment: x ??= expr → if x == nil then x = expr end
@@ -1466,104 +1536,185 @@ def _csharp_format_to_lua(spec: str) -> str:
 # ---------------------------------------------------------------------------
 
 _AI_SYSTEM_PROMPT = """\
-You are an expert Unity C# to Roblox Luau transpiler. Convert the given script to idiomatic, RUNNABLE Roblox Luau. The output MUST parse and execute without errors.
+You are an expert Unity C# to Roblox Luau transpiler. Convert the given C# script to idiomatic, RUNNABLE Roblox Luau code. The output MUST parse with luau-analyze and execute without errors.
 
-Architecture:
-- Server scripts live in ServerScriptService. Client scripts (using Input, Camera, LocalPlayer) are LocalScripts in StarterPlayerScripts.
-- script.Parent is the service container, NOT a part. Do NOT use script.Parent to get a part.
-- Find target parts using workspace:FindFirstChild("PartName", true) or workspace:GetDescendants().
-- CRITICAL: If a script manages MULTIPLE objects of the same type (e.g. all Pickups, all Mines, all Turrets, all SpawnPoints, all Doors), you MUST loop over workspace:GetDescendants() and call a setup function for EACH matching instance. Do NOT use FindFirstChild for these - it only returns one. Use this pattern:
-  local function setupThing(thing) ... end
-  for _, obj in workspace:GetDescendants() do
-    if obj.Name == "ThingName" and obj:IsA("BasePart") then setupThing(obj) end
-  end
-  workspace.DescendantAdded:Connect(function(obj)
-    if obj.Name == "ThingName" and obj:IsA("BasePart") then task.defer(setupThing, obj) end
-  end)
-- IMPORTANT: The converter sets gameplay attributes on prefab instances. Use BOTH attribute checks AND name pattern matching for robust detection:
-  - Pickups: check obj:GetAttribute("IsPickup") == true OR string.find(string.lower(obj.Name), "pickup"). The attribute "ItemType" contains the pickup type (e.g. "Rifle", "Health", "Ammo").
-  - SpawnPoints: check obj:GetAttribute("IsSpawnPoint") == true OR string.find(string.lower(obj.Name), "spawnpoint") OR obj.Name == "SpawnPoint".
-  - Mines: check obj:GetAttribute("IsMine") == true OR string.find(string.lower(obj.Name), "mine").
-  - Pickup Models contain a transparent "PickupTouchDetector" Part with IsPickup=true and ItemType attribute.
-  - When collecting a pickup, destroy the parent Model (not just the touch detector): if part.Parent:IsA("Model") then part.Parent:Destroy()
-  - Use obj:GetAttribute("ItemType") to get the pickup type (e.g., "Rifle", "Health", "Ammo").
-  Example pickup detection pattern:
-  local function isPickup(obj)
-      if obj:GetAttribute("IsPickup") then return true end
-      if obj:IsA("BasePart") and string.find(string.lower(obj.Name), "pickup") then return true end
-      return false
-  end
-  -- When handling pickup collection:
-  local itemType = part:GetAttribute("ItemType") or part.Parent.Name:gsub("Pickup", "")
-  if part.Parent and part.Parent:IsA("Model") then part.Parent:Destroy() else part:Destroy() end
+CRITICAL: Output ONLY valid Luau code. No markdown fences. No explanations. No prose.
 
-Cross-Script Communication (CRITICAL - all scripts MUST follow these conventions):
-- Player state is stored as Attributes on the CHARACTER MODEL (not the Player object):
-  character:SetAttribute("HasKey", true/false)
-  character:SetAttribute("HasWeapon", true/false)
-  character:SetAttribute("HasItem_Battery", true/false)
-  character:SetAttribute("HasItem_SmallBattery", true/false)
-  character:SetAttribute("HasItem_MediumBattery", true/false)
-  character:SetAttribute("HasItem_GasCan", true/false)
-- Scripts that CHECK player items must use character:GetAttribute("HasItem_" .. itemName)
-- Scripts that CHECK player key must use character:GetAttribute("HasKey")
-- RemoteEvents for HUD updates go in ReplicatedStorage with EXACT names:
-  "HealthUpdate" (server->client: fires with curHealth number)
-  "AmmoUpdate" (server->client: fires with curAmmo number)
-  "ItemUpdate" (server->client: fires with itemName string)
-  "PlayerShoot" (client->server: fires with origin Vector3, direction Vector3)
-  "PlayerGetItem" (client->server: fires with itemName string)
-- Player health/ammo are managed SERVER-SIDE. The server Player script tracks per-player state.
-- The client sends input events (shoot, pickup) via RemoteEvents. The server validates and applies changes.
-- Turret/Mine/Pickup damage to player: use a BindableEvent "PlayerTakeDamage" in ReplicatedStorage.
+## Roblox Architecture
 
-Mouse/Cursor:
-- Do NOT set MouseBehavior or MouseIconEnabled in this script at all. Mouse locking is handled by a separate menu/UI system. Simply omit any Cursor.lockState or Cursor.visible conversion entirely — do not generate any mouse lock code.
+Scripts run in these containers:
+- **Server Scripts**: ServerScriptService (game logic, physics, damage, spawning)
+- **LocalScripts**: StarterPlayerScripts / StarterGui (input, camera, UI, HUD)
+- **ModuleScripts**: ReplicatedStorage (shared libraries, data, utility classes)
 
-API Conversions:
-- Debug.Log -> print, Debug.LogWarning/Error -> warn
-- MonoBehaviour lifecycle: Awake/Start -> top-level code, Update -> RunService.Heartbeat:Connect
-- Physics.Raycast -> workspace:Raycast(origin, direction * distance, RaycastParams.new())
-- Instantiate(prefab) -> prefab:Clone(), Destroy(obj) -> obj:Destroy()
-- GetComponent<T>() -> :FindFirstChildOfClass("T")
-- transform.position -> part.Position, transform.rotation -> part.CFrame
-- Input.GetKey -> UserInputService:IsKeyDown, Camera.main -> workspace.CurrentCamera
-- Vector3/Vector2 -> same in Luau, Quaternion -> CFrame, Color -> Color3
-- Time.deltaTime -> dt parameter from Heartbeat callback
-- StartCoroutine -> task.spawn, yield return new WaitForSeconds(n) -> task.wait(n)
-- foreach (Type x in collection) -> for _, x in collection do
-- null -> nil, != -> ~=, && -> and, || -> or, ! -> not
-- Mathf.X -> math.x (lowercase)
-- OnCollisionEnter/OnTriggerEnter -> part.Touched:Connect(function(otherPart) ... end)
-- SceneManager.LoadScene -> TeleportService:TeleportAsync(game.PlaceId, players)
+Script context: `script.Parent` is the service container. Find game objects via:
+- `workspace:FindFirstChild("Name", true)` for a specific object
+- `workspace:GetDescendants()` loop for multiple objects of the same type
+- `game:GetService("CollectionService"):GetTagged("Tag")` for tagged objects
 
-Additional API patterns:
-- UnityEvent.AddListener(callback) -> event.Event:Connect(callback)
-- UnityEvent.Invoke() -> event:Fire()
-- SendMessage("MethodName") -> part:SetAttribute("MethodName", true) (use attributes for inter-component comms)
-- PlayableDirector.Play() -> trigger animation sequence via BindableEvent
-- Input.GetButton/GetButtonDown -> UserInputService:IsKeyDown / InputBegan
-- gameObject.SetActive(false) -> set Transparency=1, CanCollide=false
-- GetComponent<Rigidbody>().velocity -> part.AssemblyLinearVelocity
-- Rigidbody.AddForce -> part:ApplyImpulse(force) or part.AssemblyLinearVelocity += force
-- NavMeshAgent.SetDestination -> use PathfindingService:CreatePath() (require NavAgent module)
+## Unity → Roblox API Mapping
 
-Critical Luau syntax rules:
-- NO braces {} for blocks, use then/do/end
+Lifecycle:
+- Awake/Start → top-level initialization code
+- Update → `RunService.Heartbeat:Connect(function(dt) ... end)`
+- FixedUpdate → `RunService.Heartbeat:Connect(function(dt) ... end)`
+- OnDestroy → `script.Destroying:Connect(function() ... end)` or Maid pattern
+- OnEnable/OnDisable → manual enable/disable via attributes
+- OnCollisionEnter/OnTriggerEnter → `part.Touched:Connect(function(otherPart) ... end)`
+
+Core:
+- `Debug.Log/LogWarning/LogError` → `print` / `warn`
+- `Instantiate(prefab)` → `prefab:Clone(); clone.Parent = workspace`
+- `Destroy(obj)` / `Destroy(obj, delay)` → `obj:Destroy()` / `game:GetService("Debris"):AddItem(obj, delay)`
+- `GetComponent<T>()` → `:FindFirstChildWhichIsA("T")`
+- `transform.position` → `part.Position`, `transform.rotation` → `part.CFrame`
+- `transform.forward/right/up` → `part.CFrame.LookVector/RightVector/UpVector`
+- `transform.localScale` → `part.Size`
+- `gameObject.SetActive(false)` → set `Transparency=1, CanCollide=false` (or use recursive helper)
+- `gameObject` / `this` → `script.Parent` (the part/model the script is parented to)
+
+Input:
+- `Input.GetKey/GetKeyDown/GetKeyUp` → `UserInputService:IsKeyDown(Enum.KeyCode.X)`
+- `Input.GetMouseButton` → `UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)`
+- `Input.GetAxis("Horizontal"/"Vertical")` → poll WASD keys manually
+- `Camera.main` → `workspace.CurrentCamera`
+
+Physics:
+- `Physics.Raycast(origin, dir, dist)` → `workspace:Raycast(origin, dir * dist, RaycastParams.new())`
+- `Rigidbody.velocity` → `part.AssemblyLinearVelocity`
+- `Rigidbody.AddForce` → `part:ApplyImpulse(force)`
+- `Rigidbody.isKinematic` → `part.Anchored`
+- `Physics.OverlapSphere` → `workspace:GetPartBoundsInRadius(center, radius)`
+
+Events & Communication:
+- `UnityEvent.AddListener(cb)` → `event:Connect(cb)`
+- `event?.Invoke(args)` → `if event then event:Fire(args) end`
+- `SendMessage("Method")` → `part:SetAttribute("Method", true)` (use Attributes for inter-component communication)
+- `StartCoroutine(Func())` → `task.spawn(Func)`
+- `yield return new WaitForSeconds(n)` → `task.wait(n)`
+- `yield return null` → `task.wait()`
+
+Networking (for multiplayer Unity games):
+- `[Command]` methods → `RemoteEvent:FireServer()`
+- `[ClientRpc]` methods → `RemoteEvent:FireAllClients()`
+- `[SyncVar]` fields → `SetAttribute()`/`GetAttribute()` with `GetAttributeChangedSignal()`
+- `NetworkBehaviour` → Script with RemoteEvent-based communication
+
+Navigation:
+- `NavMeshAgent.SetDestination(pos)` → `PathfindingService:CreatePath():ComputeAsync(start, pos)`
+- `NavMeshAgent.speed/stoppingDistance` → store as attributes, use in movement logic
+
+Animation:
+- `Animator.SetBool/SetFloat/SetInteger/SetTrigger` → `humanoid:SetAttribute("ParamName", value)`
+- `Animator.Play("StateName")` → `animTrack:Play()`
+
+Audio:
+- `AudioSource.Play()` → `sound:Play()`
+- `AudioSource.clip` → `sound.SoundId`
+- `AudioSource.volume/pitch/loop` → `sound.Volume/PlaybackSpeed/Looped`
+
+String Operations:
+- `string.Format("{0} {1}", a, b)` → `string.format("%s %s", a, b)`
+- `$"text {expr}"` → `string.format("text %s", tostring(expr))` or `"text " .. tostring(expr)`
+- `.StartsWith("s")` → `string.sub(var, 1, #"s") == "s"`
+- `.EndsWith("s")` → `string.sub(var, -#"s") == "s"`
+- `.Substring(start, len)` → `string.sub(var, start+1, start+len)` (0→1 indexing)
+- `.Trim()` → `string.match(var, "^%s*(.-)%s*$")`
+- `.Contains("s")` → `string.find(var, "s") ~= nil`
+- `.Split(char)` → `string.split(var, char)`
+
+Collections:
+- `List<T>` / `T[]` → Luau table `{}`
+- `.Add(x)` → `table.insert(tbl, x)`
+- `.Remove(x)` → `table.remove(tbl, table.find(tbl, x))`
+- `.Contains(x)` → `table.find(tbl, x) ~= nil`
+- `.Count` / `.Length` → `#tbl`
+- `Dictionary<K,V>` → Luau table `{}`
+- `.ContainsKey(k)` → `tbl[k] ~= nil`
+- `.TryGetValue(k, out v)` → `local v = tbl[k]; if v ~= nil then`
+- `foreach (var x in coll)` → `for _, x in coll do`
+- LINQ methods → implement inline: `.Where` → filter loop, `.Select` → map loop, `.Any` → find loop
+
+Math:
+- `Mathf.X` → `math.x` (lowercase: `math.abs`, `math.floor`, `math.clamp`, etc.)
+- `Mathf.Lerp(a,b,t)` → `a + (b - a) * t`
+- `Mathf.Infinity` → `math.huge`
+- `Random.Range(a,b)` → `math.random(a, b)` (integers) or `math.random() * (b-a) + a` (floats)
+- `Vector3.Distance(a,b)` → `(a - b).Magnitude`
+- `Vector3.Dot(a,b)` → `a:Dot(b)`
+- `Vector3.Cross(a,b)` → `a:Cross(b)`
+- `Vector3.normalized` → `vec.Unit`
+- `Vector3.magnitude` → `vec.Magnitude`
+- `Quaternion.Euler(x,y,z)` → `CFrame.Angles(math.rad(x), math.rad(y), math.rad(z))`
+- `Quaternion.LookRotation(fwd)` → `CFrame.lookAt(pos, pos + fwd)`
+
+## Luau Syntax Rules (MUST follow exactly)
+
+- NO `{}` for blocks — use `then`/`do`/`end`
 - NO semicolons
-- NO type annotations - use 'local x = 5'
-- NO access modifiers
-- NO compound assignment operators (+=, -=, *=) - use x = x + 1
-- Functions: 'local function name(args)' not 'void name(args)'
-- if/elseif/else/end
-- Comments: -- not //
-- String concat: .. not +
-- Not equal: ~= not !=
-- Array length: #array not array.Length
-- Ternary: if cond then a else b (inline, no ? :)
-- for i = 0, n-1 do (not for(int i=0; i<n; i++))
+- NO type annotations — `local x = 5` not `int x = 5`
+- NO access modifiers (`public`, `private`, `protected`, `static`)
+- NO compound assignment — `x = x + 1` not `x += 1`
+- NO C# operators: `&&` → `and`, `||` → `or`, `!expr` → `not expr`, `!=` → `~=`
+- NO `null` — use `nil`
+- Functions: `local function name(args) ... end`
+- String concatenation: `..` not `+`
+- Array length: `#arr` not `arr.Length`
+- Ternary: `if cond then a else b` (Luau if-expression, not `? :`)
+- For loops: `for i = 0, n-1 do` not `for(int i=0; i<n; i++)`
+- For-each: `for _, x in items do` not `foreach (var x in items)`
+- Comments: `--` not `//`
+- Block comments: `--[[ ]]` not `/* */`
+- Tables are 1-indexed (convert 0-based C# indexing to 1-based)
+- `continue` IS valid in Roblox Luau
+- Bitwise ops: use `bit32.band()`, `bit32.bor()`, `bit32.lshift()`, `bit32.rshift()`
 
-Output ONLY valid Luau code. No markdown fences. No explanations.
+## Script Structure Pattern
+
+For a typical MonoBehaviour conversion, produce:
+
+```
+-- Services
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+-- (only import services actually used)
+
+-- Module (if this is a shared class used by other scripts)
+local ClassName = {}
+
+-- Configuration (from serialized fields)
+local speed = 10
+local maxHealth = 100
+
+-- State
+local currentHealth = maxHealth
+
+-- Functions (from C# methods)
+local function takeDamage(amount)
+    currentHealth = currentHealth - amount
+    if currentHealth <= 0 then
+        -- handle death
+    end
+end
+
+-- Lifecycle
+RunService.Heartbeat:Connect(function(dt)
+    -- Update logic
+end)
+
+return ClassName  -- (only for ModuleScripts)
+```
+
+## Important Notes
+- Convert the ENTIRE script faithfully. Do not skip methods or simplify logic.
+- Preserve all game logic, conditions, and calculations.
+- If a Unity API has no Roblox equivalent, comment it out with `-- [Unity-only] original code`.
+- Do NOT add explanatory comments unless the conversion is non-obvious.
+- Do NOT stub or skip complex methods — convert them fully.
+- Interfaces/abstract classes → ModuleScript with table of functions.
+- Enums → table with named numeric values: `local MyEnum = { ValueA = 0, ValueB = 1 }`.
+- C# events → BindableEvent or simple callback tables.
+- C# properties with getters/setters → local variables with getter/setter functions if logic exists, otherwise just local variables.
 """
 
 
@@ -1571,6 +1722,9 @@ def _ai_transpile(
     csharp_source: str,
     api_key: str,
     model: str,
+    class_name: str = "",
+    script_type: str = "Script",
+    project_context: str = "",
 ) -> tuple[str, float, list[str]]:
     """Transpile C# source to Luau using the Claude API.
 
@@ -1578,6 +1732,9 @@ def _ai_transpile(
         csharp_source: The C# source code.
         api_key: Anthropic API key.
         model: Model identifier.
+        class_name: Name of the C# class being transpiled.
+        script_type: Target script type (Script, LocalScript, ModuleScript).
+        project_context: Additional context about the project (classes, dependencies).
 
     Returns:
         Tuple of (luau_source, confidence, warnings).
@@ -1588,7 +1745,7 @@ def _ai_transpile(
     warnings: list[str] = []
 
     # Check cache first.
-    cache_key = _cache_key(csharp_source, model)
+    cache_key = _cache_key(csharp_source + class_name + script_type + project_context, model)
     cached = _load_cache(cache_key)
     if cached is not None:
         log.debug("AI transpilation cache hit for %s", cache_key[:12])
@@ -1605,6 +1762,20 @@ def _ai_transpile(
 
     client = anthropic.Anthropic(api_key=api_key)
 
+    # Build the user message with context
+    user_msg = ""
+    if class_name:
+        user_msg += f"Class: `{class_name}`\n"
+    if script_type == "LocalScript":
+        user_msg += "Target: **LocalScript** (client-side only — no server APIs).\n"
+    elif script_type == "ModuleScript":
+        user_msg += "Target: **ModuleScript** (shared library — must return a table).\n"
+    else:
+        user_msg += "Target: **Server Script**.\n"
+    if project_context:
+        user_msg += f"\n{project_context}\n"
+    user_msg += f"\nConvert this Unity C# script to Roblox Luau:\n\n```csharp\n{csharp_source}\n```"
+
     try:
         response = client.messages.create(
             model=model,
@@ -1613,7 +1784,7 @@ def _ai_transpile(
             messages=[
                 {
                     "role": "user",
-                    "content": f"Convert this Unity C# script to Roblox Luau:\n\n```csharp\n{csharp_source}\n```",
+                    "content": user_msg,
                 },
             ],
         )
@@ -1698,6 +1869,7 @@ def _claude_cli_transpile(
     csharp_source: str,
     class_name: str = "",
     script_type: str = "Script",
+    project_context: str = "",
 ) -> tuple[str, float, list[str]]:
     """Transpile C# to Luau by invoking Claude Code CLI.
 
@@ -1713,7 +1885,7 @@ def _claude_cli_transpile(
     warnings: list[str] = []
 
     # Check cache first (include class_name and script_type in key).
-    cache_key = _cache_key(csharp_source + class_name + script_type, "claude-cli-v2")
+    cache_key = _cache_key(csharp_source + class_name + script_type + project_context, "claude-cli-v3")
     cached = _load_cache(cache_key)
     if cached is not None:
         log.debug("Claude CLI cache hit for %s", cache_key[:12])
@@ -1724,15 +1896,18 @@ def _claude_cli_transpile(
     if not claude_path:
         raise RuntimeError("'claude' CLI not found on PATH")
 
-    # Add context about this specific script
+    # Build context about this script and project
     context = ""
     if class_name:
-        context += f"\nThis script is class '{class_name}'."
+        context += f"\nClass: `{class_name}`."
     if script_type == "LocalScript":
-        context += "\nThis must be a LocalScript (runs on the client). Do NOT use server-only APIs like RemoteEvent:FireClient or game:GetService('ServerStorage'). Use only client APIs."
+        context += "\nTarget: **LocalScript** (client-side only — no server APIs)."
+    elif script_type == "ModuleScript":
+        context += "\nTarget: **ModuleScript** (must return a table)."
     else:
-        context += "\nThis is a server Script in ServerScriptService."
-    context += f"\nTo find game objects this script should control, search workspace:GetDescendants() for parts/models with relevant names."
+        context += "\nTarget: **Server Script**."
+    if project_context:
+        context += f"\n{project_context}"
 
     prompt = (
         f"{_AI_SYSTEM_PROMPT}\n{context}\n\n"

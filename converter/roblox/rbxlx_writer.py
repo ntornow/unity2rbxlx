@@ -1179,9 +1179,7 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, Any]:
                 sg_el = ET.SubElement(terrain_props, "BinaryString", name="SmoothGrid")
                 sg_el.text = sg
                 log.info("Embedded SmoothGrid terrain data (%d chars base64)", len(sg))
-            if pg:
-                pg_el = ET.SubElement(terrain_props, "BinaryString", name="PhysicsGrid")
-                pg_el.text = pg
+            # PhysicsGrid omitted — Roblox regenerates it from SmoothGrid
 
     lighting = _make_service(root, "Lighting")
     server_script_service = _make_service(root, "ServerScriptService")

@@ -1561,6 +1561,27 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
         source = re.sub(r'(\w+)\.Invoke\(([^)]*)\)', r'\1:Fire(\2)', source)
         fixes.append("Fixed event '.Invoke()' → ':Fire()'")
 
+    # Fix broken null-conditional method calls from transpiler word-boundary backtrack
+    # Pattern: (obj and obj.PARTIAL or nil)REST(args) → if obj then obj:PARTIALREST(args) end
+    # This happens when the property regex steals chars from the method name
+    if ' or nil)' in source and re.search(r'\(\w+ and \w+\.\w+ or nil\)\w+\(', source):
+        def _fix_broken_null_cond(m):
+            obj = m.group(1)
+            partial = m.group(2)
+            rest = m.group(3)
+            args = m.group(4)
+            method = partial + rest
+            # Invoke → Fire (Roblox event pattern)
+            if method == 'Invoke':
+                return f'if {obj} then {obj}:Fire({args}) end'
+            return f'if {obj} then {obj}:{method}({args}) end'
+        source = re.sub(
+            r'\((\w+) and \1\.(\w+) or nil\)(\w+)\(([^)]*)\)',
+            _fix_broken_null_cond,
+            source,
+        )
+        fixes.append("Fixed broken null-conditional method pattern")
+
     # Fix event += handler → event:Connect(handler)
     if re.search(r'\w+\s*\+=\s*\w+', source) and not re.search(r'\w+\s*\+=\s*\d', source):
         # Only convert += where both sides are identifiers (event subscription pattern)
@@ -3887,6 +3908,18 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             flags=re.MULTILINE,
         )
         fixes.append("Commented out Unity LayerMask bitwise operations")
+
+    # Comment out C# bitwise AND expressions: `(flags & Enum.Value) == Enum.Value`
+    # Roblox Luau doesn't have a `&` operator; these are typically C# flag checks
+    # Only match `&` surrounded by spaces (not `&` in strings/URLs)
+    if re.search(r'\w\s+&\s+\w', source):
+        source = re.sub(
+            r'^(\s*)(?!--)(.+\w\s+&\s+\w.*)$',
+            lambda m: m.group(0) if m.group(2).strip().startswith('--') else f'{m.group(1)}-- [C# bitwise] {m.group(2)}',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out C# bitwise AND operations")
 
     # Fix undefined `collider` variable in Touched handlers → `otherPart`
     # This happens when C# `Collision collision` / `Collider collider` params survive

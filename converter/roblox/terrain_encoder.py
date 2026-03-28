@@ -218,12 +218,11 @@ def encode_smooth_grid(
         return (h00 * (1 - fx) * (1 - fz) + h10 * fx * (1 - fz) +
                 h01 * (1 - fx) * fz + h11 * fx * fz) * max_height_studs
 
-    # SmoothGrid v1 format (reverse-engineered from Studio-saved terrain):
+    # SmoothGrid v1 format (confirmed working with Roblox Studio):
     #   2-byte global header: version(1) + chunk_pow(5)
     #   Per chunk:
-    #     12-byte delta-encoded chunk coordinates (MSB-interleaved int32 dx,dy,dz)
+    #     12-byte ABSOLUTE chunk coordinates (MSB-interleaved int32 x,y,z)
     #     RLE-encoded voxel data for 32^3 = 32768 voxels
-    #   Chunk order: X outermost, Y middle, Z innermost
     #   Voxel order within chunk: X innermost (index = x + y*32 + z*1024)
 
     chunk_size = 32
@@ -271,17 +270,16 @@ def encode_smooth_grid(
                 mat = _height_based_material(norm_h, slope, max_height_studs)
             return (mat, occ_byte)
 
-    def _encode_chunk_coord_delta(dx: int, dy: int, dz: int) -> bytes:
-        """Encode 3 int32 deltas as 12 MSB-interleaved bytes."""
-        # Convert to unsigned 32-bit for byte extraction
-        def _to_u32(v: int) -> int:
+    def _make_chunk_header(cx: int, cy: int, cz: int) -> bytes:
+        """12-byte absolute chunk coordinates, MSB-interleaved int32."""
+        def _u32(v: int) -> int:
             return v & 0xFFFFFFFF
-        udx, udy, udz = _to_u32(dx), _to_u32(dy), _to_u32(dz)
+        ux, uy, uz = _u32(cx), _u32(cy), _u32(cz)
         return bytes([
-            (udx >> 24) & 0xFF, (udy >> 24) & 0xFF, (udz >> 24) & 0xFF,
-            (udx >> 16) & 0xFF, (udy >> 16) & 0xFF, (udz >> 16) & 0xFF,
-            (udx >> 8) & 0xFF,  (udy >> 8) & 0xFF,  (udz >> 8) & 0xFF,
-            udx & 0xFF,         udy & 0xFF,         udz & 0xFF,
+            (ux >> 24) & 0xFF, (uy >> 24) & 0xFF, (uz >> 24) & 0xFF,
+            (ux >> 16) & 0xFF, (uy >> 16) & 0xFF, (uz >> 16) & 0xFF,
+            (ux >> 8) & 0xFF,  (uy >> 8) & 0xFF,  (uz >> 8) & 0xFF,
+            ux & 0xFF,         uy & 0xFF,         uz & 0xFF,
         ])
 
     def _rle_encode_chunk(chunk_voxels: list[tuple[int, int]]) -> bytearray:
@@ -312,36 +310,38 @@ def encode_smooth_grid(
             i += run
         return out
 
-    # Build output
+    # Build output: header + per-chunk (coord_header + RLE data)
     buf = bytearray()
     buf.append(1)  # version
     buf.append(5)  # chunk_pow = 2^5 = 32
 
-    prev_cx, prev_cy, prev_cz = 0, 0, 0
     total_voxels = 0
     chunk_count = 0
 
-    # Chunk iteration: X outermost, Y middle, Z innermost
     for cx in range(chunks_x):
-        for cy in range(chunks_y):
-            for cz in range(chunks_z):
-                # Delta-encoded chunk coordinates
-                dx = cx - prev_cx
-                dy = cy - prev_cy
-                dz = cz - prev_cz
-                buf.extend(_encode_chunk_coord_delta(dx, dy, dz))
-                prev_cx, prev_cy, prev_cz = cx, cy, cz
-
-                # Collect voxels in X-innermost order: index = x + y*32 + z*1024
+        for cz in range(chunks_z):
+            for cy in range(chunks_y):
+                # Collect voxels: X innermost (index = x + y*32 + z*1024)
                 chunk_voxels = []
+                has_non_air = False
                 for lz in range(chunk_size):
                     for ly in range(chunk_size):
                         for lx in range(chunk_size):
                             gx = cx * chunk_size + lx
                             gy = cy * chunk_size + ly
                             gz = cz * chunk_size + lz
-                            chunk_voxels.append(_get_material(gx, gy, gz))
+                            v = _get_material(gx, gy, gz)
+                            chunk_voxels.append(v)
+                            if v[0] != MATERIAL_AIR:
+                                has_non_air = True
 
+                # Only include chunks with non-air voxels (sparse format)
+                if not has_non_air:
+                    continue
+
+                # Z is negated for Unity→Roblox coordinate conversion.
+                # Chunk at grid index cz maps to world Z = -(cz+1) in chunk coords.
+                buf.extend(_make_chunk_header(cx, cy, -(cz + 1)))
                 buf.extend(_rle_encode_chunk(chunk_voxels))
                 total_voxels += len(chunk_voxels)
                 chunk_count += 1
