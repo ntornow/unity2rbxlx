@@ -537,6 +537,16 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
         )
         fixes.append("Fixed incomplete 'local x = -- comment' assignments")
 
+    # Fix comment inside bracket access: `lookup[-- comment(expr)]` → `lookup[expr]`
+    # Happens when StringToHash or similar was mapped to a comment inside brackets
+    if re.search(r'\[-- \w+.*\(', source):
+        source = re.sub(
+            r'\[-- [^\n]*?\(([^)]+)\)\]',
+            r'[\1]',
+            source,
+        )
+        fixes.append("Fixed comment inside bracket access")
+
     # Fix C# typed field declarations that leaked through transpilation
     # Patterns: `bool canAttack;`, `float m_Speed;`, `Type varName;`, `Type varName`
     # Also handles: `UnityEvent OnDeath, OnDamage, OnHit`
@@ -574,6 +584,29 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
             flags=re.MULTILINE,
         )
         fixes.append("Fixed C# typed field declarations → local")
+
+    # Fix C# multi-variable init on one line: `local x1 = 0, x2 = 0, y1 = 0`
+    # → separate declarations: `local x1 = 0\nlocal x2 = 0\nlocal y1 = 0`
+    if re.search(r'^\s*local\s+\w+\s*=\s*\S+,\s*\w+\s*=', source, re.MULTILINE):
+        def _split_multi_init(m):
+            indent = m.group(1)
+            rest = m.group(2)
+            # Split on ", varname =" pattern
+            parts = re.split(r',\s*(?=\w+\s*=)', rest)
+            lines = []
+            for part in parts:
+                part = part.strip()
+                if '=' in part:
+                    lines.append(f'{indent}local {part}')
+                else:
+                    lines.append(f'{indent}local {part} = nil')
+            return '\n'.join(lines)
+        source = re.sub(
+            r'^(\s*)local\s+(\w+\s*=\s*\S+(?:,\s*\w+\s*=\s*\S+)+)\s*$',
+            _split_multi_init,
+            source,
+            flags=re.MULTILINE,
+        )
 
     # Fix C# `|=` compound bitwise OR (not valid in Luau)
     # `x |= expr` → `x = x or (expr)` (boolean context) or bit32.bor for numeric
@@ -1817,9 +1850,22 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         fixes.append("Fixed Physics.* API calls")
 
     # Fix: Animator.StringToHash("Name") → "Name" (Roblox uses strings, not hashes)
+    # Also handle StringToHash(variable) → variable
     if "StringToHash" in source:
         source = re.sub(
             r'Animator\.StringToHash\(\s*("(?:[^"\\]|\\.)*")\s*\)',
+            r'\1',
+            source,
+        )
+        # Handle non-literal args: StringToHash(expr) → expr
+        source = re.sub(
+            r'Animator\.StringToHash\(([^)]+)\)',
+            r'\1',
+            source,
+        )
+        # Also handle bare StringToHash without Animator prefix
+        source = re.sub(
+            r'(?<!\w)StringToHash\(([^)]+)\)',
             r'\1',
             source,
         )
@@ -2019,11 +2065,12 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         source = re.sub(r'(\w+)\.collider\b', r'\1', source)
         fixes.append("Fixed .collider → part itself")
 
-    # Fix: FindFirstChildWhichIsA("Rigidbody") → nil (parts don't have child Rigidbody)
+    # Fix: FindFirstChildWhichIsA("Rigidbody") → part itself (Roblox parts are their own physics)
+    # e.g. obj:FindFirstChildWhichIsA("Rigidbody").Anchored = true → obj.Anchored = true
     if 'FindFirstChildWhichIsA("Rigidbody")' in source:
         source = source.replace(
             ':FindFirstChildWhichIsA("Rigidbody")',
-            ' -- Roblox parts have built-in physics'
+            ''
         )
 
     # Fix: obj.position (lowercase) → obj.Position (Roblox PascalCase)
@@ -2447,11 +2494,16 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         result = []
         for line in lines:
             s = line.rstrip()
-            if s.endswith(";") and not s.strip().startswith("--"):
-                # Don't remove semicolons inside string literals
+            if not s.strip().startswith("--"):
+                # Don't modify inside string literals
                 quote_count = s.count('"') - s.count('\\"')
                 if quote_count % 2 == 0:  # Not inside a string
-                    s = s[:-1].rstrip()
+                    # Handle "stmt;    }" pattern — strip semicollon + trailing brace
+                    m_semi_brace = re.match(r'^(.*\S)\s*;\s*\}\s*$', s)
+                    if m_semi_brace:
+                        s = m_semi_brace.group(1)
+                    elif s.endswith(";"):
+                        s = s[:-1].rstrip()
             result.append(s)
         source = "\n".join(result)
 
@@ -2684,6 +2736,42 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             source,
         )
         fixes.append("Fixed .PlayDelayed() → task.delay + :Play()")
+
+    # InvokeRepeating("method", delay, interval) → task.spawn repeating loop
+    if 'InvokeRepeating(' in source:
+        def _fix_invoke_repeating(m):
+            indent = m.group(1) or ''
+            receiver = m.group(2) or ''
+            args = m.group(3)
+            # Try to parse args: "methodName", delay, interval
+            parts = [p.strip() for p in args.split(',')]
+            if len(parts) >= 3:
+                method = parts[0].strip('"').strip("'")
+                delay = parts[1]
+                interval = parts[2]
+                return (f'{indent}task.spawn(function()\n'
+                        f'{indent}    task.wait({delay})\n'
+                        f'{indent}    while true do\n'
+                        f'{indent}        if {receiver or "script.Parent"} and {receiver or "script.Parent"}.Parent then\n'
+                        f'{indent}            -- {method}()\n'
+                        f'{indent}        end\n'
+                        f'{indent}        task.wait({interval})\n'
+                        f'{indent}    end\n'
+                        f'{indent}end)')
+            return m.group(0)
+        source = re.sub(
+            r'^(\s*)(?:(\w+(?:\.\w+)*)[\.:])?\s*InvokeRepeating\(([^)]+)\)',
+            _fix_invoke_repeating,
+            source,
+            flags=re.MULTILINE,
+        )
+        # Also handle bare -- InvokeRepeating: comment pattern (from prior conversions)
+        source = re.sub(
+            r'-- InvokeRepeating: use task\.spawn with while loop and task\.wait"([^"]*)"',
+            r'-- InvokeRepeating: \1 (use task.spawn loop)',
+            source,
+        )
+        fixes.append("Fixed InvokeRepeating → task.spawn loop")
 
     # float.IsNaN(x) → (x ~= x) (NaN check in Luau)
     if 'float.IsNaN(' in source or 'float.IsInfinity(' in source:
@@ -4039,21 +4127,19 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
 
     # Fix assignment = in if conditions (should be ==)
     # Pattern: `if count = expr then` → `if count == expr then`
+    # Also handles if-expressions: `(if x = y then a else b)` → `(if x == y then a else b)`
     # Only match single `=` not preceded by `~`, `<`, `>`, `=` and not followed by `=`
     if re.search(r'\bif\b.*[^~<>=!]=(?!=)', source):
         def _fix_if_assign(line):
-            if not re.match(r'\s*if\b', line):
-                return line
-            # Find the condition between `if` and `then`
-            m = re.match(r'(\s*if\s*\(?)(.+?)(\s*then\b.*)', line)
-            if not m:
-                return line
-            cond = m.group(2)
-            # Replace single = with == (not <=, >=, ~=, ==)
-            fixed_cond = re.sub(r'(?<![~<>=!])=(?!=)', ' == ', cond)
-            if fixed_cond != cond:
-                return m.group(1) + fixed_cond + m.group(3)
-            return line
+            # Find all `if ... then` patterns in the line (both statement and expression)
+            result = line
+            for m in re.finditer(r'(\bif\s*\(?)(.+?)(\s*then\b)', result):
+                cond = m.group(2)
+                # Replace single = with == (not <=, >=, ~=, ==)
+                fixed_cond = re.sub(r'(?<![~<>=!])=(?!=)', ' == ', cond)
+                if fixed_cond != cond:
+                    result = result[:m.start(2)] + fixed_cond + result[m.end(2):]
+            return result
         lines = source.split('\n')
         new_lines = [_fix_if_assign(l) for l in lines]
         if new_lines != lines:
@@ -4298,8 +4384,24 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
                     and not stripped.endswith('do') and not stripped.endswith('then')):
                 indent = line[:len(line) - len(line.lstrip())]
                 line = f'{indent}-- [prose] {stripped}'
+            # Also catch lines that are parenthesized prose: "(e.g. some text)"
+            elif (stripped.startswith('(') and len(words) >= 3
+                    and re.match(r'^\((?:e\.g\.|i\.e\.|note|N\.B\.)', stripped, re.IGNORECASE)):
+                indent = line[:len(line) - len(line.lstrip())]
+                line = f'{indent}-- [prose] {stripped}'
         new_lines_prose.append(line)
     source = '\n'.join(new_lines_prose)
+
+    # Fix standalone if-expressions: `(if cond then a else b)` on their own line → comment out
+    # These are ternary results that lost their assignment target during conversion
+    if re.search(r'^\s+\(if\b', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s+)(\(if\b.+\belse\b.+\))\s*$',
+            r'\1-- [dead code] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out standalone if-expressions (dead code)")
 
     # Fix C# PascalCase type + variable: `LineRenderer LR` or `BatchProcessor s_Instance`
     # where first word is PascalCase and second is a valid identifier (any case)
@@ -4343,10 +4445,18 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             flags=re.MULTILINE,
         )
 
-    # Fix C# `where T : Base` generic constraints
-    if re.search(r'^\s+where\s+\w+\s*:', source, re.MULTILINE):
+    # Fix C# `where T : Base` generic constraints (standalone or on method declaration line)
+    if 'where ' in source and re.search(r'\bwhere\s+\w+\s*:', source):
+        # Standalone: `where T : Base` on its own line
         source = re.sub(
             r'^(\s+)(where\s+\w+\s*:.*)$',
+            r'\1-- [C#] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        # On a method/type line: `bool Method() where T : Base`
+        source = re.sub(
+            r'^(\s+)(.*\)\s+where\s+\w+\s*:.*)$',
             r'\1-- [C#] \2',
             source,
             flags=re.MULTILINE,
@@ -4376,9 +4486,9 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         source = re.sub(r'\(Data<\w+>\)(\w+)', r'\1', source)
 
     # Fix `string script.Parent[string key]` (C# indexer) → comment out
-    if re.search(r'^\s+string\s+script\.Parent\[', source, re.MULTILINE):
+    if re.search(r'^\s+string\s+script\.Parent\s*\[', source, re.MULTILINE):
         source = re.sub(
-            r'^(\s+)(string\s+script\.Parent\[.+\].*)$',
+            r'^(\s+)(string\s+script\.Parent\s*\[.+\].*)$',
             r'\1-- [C#] \2',
             source,
             flags=re.MULTILINE,
@@ -4505,7 +4615,8 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
 
     # Fix bare `:Method` without parentheses in for-in: `for _, t in obj:GetDescendants do`
     # → `for _, t in obj:GetDescendants() do`
-    if re.search(r'\bin\s+\w+:\w+\s+do', source):
+    # Also handles dotted paths: `script.Parent:GetDescendants do`
+    if re.search(r'\bin\s+\w+[\w.:]*:\w+\s+do', source):
         source = re.sub(
             r'\bin\s+(\w+(?:\.\w+)*:\w+)\s+do',
             r'in \1() do',

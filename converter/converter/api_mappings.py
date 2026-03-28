@@ -84,7 +84,7 @@ API_CALL_MAP: dict[str, str] = {
     "Time.timeScale": "workspace:SetAttribute('TimeScale', 1)",
     "Time.unscaledDeltaTime": "dt",
     "Time.realtimeSinceStartup": "os.clock()",
-    "Time.frameCount": "-- frameCount: no direct Roblox equivalent",
+    "Time.frameCount": "math.floor(tick() * 60)",  # Approximate frame counter
     # -- Input --
     "Input.GetKey": "UserInputService:IsKeyDown",
     "Input.GetKeyDown": "UserInputService.InputBegan",
@@ -215,7 +215,7 @@ API_CALL_MAP: dict[str, str] = {
     "AudioSource.loop": ".Looped",
     "AudioSource.isPlaying": ".IsPlaying",
     # -- Animation --
-    "Animator.StringToHash": "-- StringToHash: use string name directly as attribute key",
+    # Animator.StringToHash handled by validator (extracts string argument directly)
     "Animator.SetBool": ":SetAttribute",
     "Animator.SetFloat": ":SetAttribute",
     "Animator.SetInteger": ":SetAttribute",
@@ -368,7 +368,7 @@ API_CALL_MAP: dict[str, str] = {
     "WaitUntil": "-- WaitUntil: use while loop with task.wait()",
     "WaitWhile": "-- WaitWhile: use while loop with task.wait()",
     "Invoke(\"": "task.delay(",  # MonoBehaviour.Invoke("method", delay)
-    "InvokeRepeating(": "-- InvokeRepeating: use task.spawn with while loop and task.wait",
+    # InvokeRepeating handled by validator (needs arg parsing)
     "CancelInvoke": "-- CancelInvoke: cancel spawned task",
     # -- UnityEvent --
     ".AddListener(": ".Event:Connect(",
@@ -376,7 +376,7 @@ API_CALL_MAP: dict[str, str] = {
     ".RemoveAllListeners()": "-- RemoveAllListeners: disconnect all connections",
     # -- System.Action / delegates --
     "Action<": "-- Action: use function type",
-    "Func<": "-- Func: use function type",
+    # Func<> handled by validator generic type stripping
     # -- Events / Delegates --
     # Note: "event Action<" is handled by the sanitizer, not here
     # to avoid conflicts with the "Action<" mapping
@@ -438,8 +438,8 @@ API_CALL_MAP: dict[str, str] = {
     ".GetHashCode()": "-- GetHashCode: no equivalent",
     ".GetType()": "typeof",
     # -- Cursor --
-    "Cursor.lockState": "-- Cursor.lockState: use UserInputService.MouseBehavior",
-    "Cursor.visible": "-- Cursor.visible: use UserInputService.MouseIconEnabled",
+    "Cursor.lockState": "UserInputService.MouseBehavior",
+    "Cursor.visible": "UserInputService.MouseIconEnabled",
     "CursorLockMode.Locked": "Enum.MouseBehavior.LockCenter",
     "CursorLockMode.None": "Enum.MouseBehavior.Default",
     "CursorLockMode.Confined": "Enum.MouseBehavior.LockCurrentPosition",

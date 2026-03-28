@@ -4055,3 +4055,117 @@ return X'''
         for i, line in enumerate(lines):
             if line == 'return X' and i > 0:
                 assert lines[i-1] != 'end', "Orphaned end before return should be removed"
+
+
+class TestValidatorBatch18:
+    """Tests for semicolons+braces, Rigidbody removal, StringToHash, prose, etc."""
+
+    def test_semicolon_brace_removal(self):
+        """stmt;    } → stmt (remove semicolon and trailing brace)."""
+        from converter.luau_validator import validate_and_fix
+        source = '    local function CreatePlayable(graph)\n        return playable;    }\n    end'
+        fixed, _ = validate_and_fix("test", source)
+        assert ';}' not in fixed
+        assert 'return playable' in fixed
+        assert 'return playable;' not in fixed
+
+    def test_rigidbody_find_removal(self):
+        """FindFirstChildWhichIsA("Rigidbody") → removed (part is its own physics)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'script.Parent:FindFirstChildWhichIsA("Rigidbody").Anchored = true'
+        fixed, _ = validate_and_fix("test", source)
+        assert ':FindFirstChildWhichIsA("Rigidbody")' not in fixed
+        assert '.Anchored = true' in fixed
+
+    def test_string_to_hash_passthrough(self):
+        """Animator.StringToHash(expr) → expr directly."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local hash = Animator.StringToHash("Attack")'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'StringToHash' not in fixed
+        assert '"Attack"' in fixed
+
+    def test_string_to_hash_variable_arg(self):
+        """StringToHash(variable) → variable."""
+        from converter.luau_validator import validate_and_fix
+        source = 'lookup[StringToHash(eventName)] = events[i]'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'StringToHash' not in fixed
+        assert 'lookup[eventName]' in fixed
+
+    def test_comment_in_bracket_access(self):
+        """lookup[-- comment(expr)] → lookup[expr]."""
+        from converter.luau_validator import validate_and_fix
+        source = 'm_EventLookup[-- StringToHash: use string name directly as attribute key(events[i].eventName)] = events[i]'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'm_EventLookup[events[i].eventName]' in fixed
+
+    def test_prose_eg_commented(self):
+        """Lines starting with (e.g. ...) are commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '(e.g. the Enemy layer does not collide with the Player layer)'
+        fixed, _ = validate_and_fix("test", source)
+        assert fixed.strip().startswith('--')
+
+    def test_if_expression_equals_fix(self):
+        """if-expression with = → == in condition."""
+        from converter.luau_validator import validate_and_fix
+        source = '(if input.Volume = target then a else b)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '==' in fixed
+        assert 'input.Volume  ==  target' in fixed or 'input.Volume == target' in fixed
+
+    def test_standalone_if_expression_commented(self):
+        """Standalone (if cond then a else b) → commented as dead code."""
+        from converter.luau_validator import validate_and_fix
+        source = '    (if state == inverted then not state else state)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [dead code]' in fixed
+
+    def test_cursor_lockstate_mapping(self):
+        """Cursor.lockState → UserInputService.MouseBehavior (not a comment)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'UserInputService.MouseBehavior' in fixed
+        assert '-- Cursor' not in fixed
+
+    def test_for_in_dotted_path_parens(self):
+        """for _, r in script.Parent:GetDescendants do → ... do (add parens)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'for _, r in script.Parent:GetDescendants do\n    print(r)\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'GetDescendants()' in fixed
+
+    def test_indexer_with_space_commented(self):
+        """string script.Parent [string key] → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '        string script.Parent [string key]'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [C#]' in fixed
+
+    def test_multi_variable_init_split(self):
+        """local x1 = 0, x2 = 0 → separate local declarations."""
+        from converter.luau_validator import validate_and_fix
+        source = '    local x1 = 0, x2 = 0, y1 = 0, y2 = 0'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'local x1 = 0' in fixed
+        assert 'local x2 = 0' in fixed
+        assert 'local y1 = 0' in fixed
+        assert 'local y2 = 0' in fixed
+
+    def test_where_constraint_on_method_line(self):
+        """bool Method() where T : Base → commented."""
+        from converter.luau_validator import validate_and_fix
+        source = '        bool RepresentsState() where T : IState'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [C#]' in fixed
+
+    def test_invoke_repeating_conversion(self):
+        """InvokeRepeating('method', delay, interval) → task.spawn loop."""
+        from converter.luau_validator import validate_and_fix
+        source = '    InvokeRepeating("CheckArea", 1, 2)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'task.spawn' in fixed
+        assert 'task.wait(2)' in fixed
+        assert 'task.wait(1)' in fixed
