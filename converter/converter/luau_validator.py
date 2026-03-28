@@ -666,6 +666,29 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
             flags=re.MULTILINE,
         )
         fixes.append("Fixed C# typed field declarations → local")
+    # Also handle `Type var = expr` (with assignment)
+    if re.search(rf'^\s*(?:{_type_pattern})\??\s+\w+\s*=', source, re.MULTILINE):
+        source = re.sub(
+            rf'^(\s*)(?:{_type_pattern})\??\s+(\w+)\s*=\s*(.+)$',
+            r'\1local \2 = \3',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Fixed C# typed declarations with assignment → local")
+    # Handle nullable types: `Type? var` or `Type? var = expr`
+    if re.search(r'^\s*[A-Z]\w+\?\s+\w+', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s*)[A-Z]\w+\?\s+(\w+)\s*$',
+            r'\1local \2 = nil',
+            source,
+            flags=re.MULTILINE,
+        )
+        source = re.sub(
+            r'^(\s*)[A-Z]\w+\?\s+(\w+)\s*=\s*(.+)$',
+            r'\1local \2 = \3',
+            source,
+            flags=re.MULTILINE,
+        )
 
     # Fix C# multi-variable init on one line: `local x1 = 0, x2 = 0, y1 = 0`
     # → separate declarations: `local x1 = 0\nlocal x2 = 0\nlocal y1 = 0`
