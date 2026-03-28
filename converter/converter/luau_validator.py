@@ -2622,6 +2622,9 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
                         s = m_semi_brace.group(1)
                     elif s.endswith(";"):
                         s = s[:-1].rstrip()
+                    # Strip trailing colon from broken ternary: `expr() :` → `expr()`
+                    if s.rstrip().endswith(' :') or s.rstrip().endswith('\t:'):
+                        s = s.rstrip()[:-1].rstrip()
             result.append(s)
         source = "\n".join(result)
 
@@ -4549,8 +4552,27 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
                     and re.match(r'^\((?:e\.g\.|i\.e\.|note|N\.B\.)', stripped, re.IGNORECASE)):
                 indent = line[:len(line) - len(line.lstrip())]
                 line = f'{indent}-- [prose] {stripped}'
+            # Catch enum prose: `lowercase words with spaces = number,` (C# enum comment leak)
+            # Requires at least 2 space-separated words before `=` to avoid catching table entries
+            elif (len(words) >= 4 and words[0][0].islower() and words[0].isalpha()
+                    and re.match(r'^[a-z]+\s+[a-z]+\s+.*= \d+,?\s*$', stripped)):
+                indent = line[:len(line) - len(line.lstrip())]
+                line = f'{indent}-- [enum prose] {stripped}'
         new_lines_prose.append(line)
     source = '\n'.join(new_lines_prose)
+
+    # Fix bare variable names on their own line (from API mapping stripping method calls)
+    # e.g., `_agent` on its own line after `.SetDestination(...)` was removed
+    if re.search(r'^\s+_?\w+\s*$', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s+)(_?\w+)\s*$',
+            lambda m: (m.group(0) if m.group(2) in ('end', 'else', 'return', 'break', 'continue',
+                                                      'true', 'false', 'nil', 'do', 'then', 'repeat')
+                        or m.group(2).startswith('--')
+                        else f'{m.group(1)}-- [bare var] {m.group(2)}'),
+            source,
+            flags=re.MULTILINE,
+        )
 
     # Fix standalone if-expressions: `(if cond then a else b)` on their own line → comment out
     # These are ternary results that lost their assignment target during conversion
@@ -4682,6 +4704,17 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         source = re.sub(
             r'^(\s*)(\w+\s+-- \w+.*\.(?:Anchored|Enabled|Position|Size)\s*=.*)$',
             r'\1-- [mangled] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+
+    # Fix `.-- comment` breaking expressions (property access turned into comment)
+    # e.g., `obj[i].-- TabClicked = TabClicked - ChangeTab ...`
+    if re.search(r'\w\.\s*-- \w+', source):
+        source = re.sub(
+            r'^(\s*)(.+\w\.\s*-- \w+.*)$',
+            lambda m: (m.group(0) if m.group(2).strip().startswith('--') else
+                       f'{m.group(1)}-- [mangled property] {m.group(2).strip()}'),
             source,
             flags=re.MULTILINE,
         )
@@ -5084,6 +5117,14 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     # Fix: C# Unicode escape `\uXXXX` → Luau `\u{XXXX}`
     if '\\u' in source:
         source = re.sub(r'\\u([0-9a-fA-F]{4})', r'\\u{\1}', source)
+
+    # Comment out TeleportService calls (server-only API, usually in client scripts)
+    if 'TeleportService' in source:
+        source = re.sub(
+            r'^(\s*)(.*TeleportService\s*[:\.].*)',
+            r'\1-- [server-only] \2',
+            source, flags=re.MULTILINE,
+        )
 
     if source != original:
         fixes.append("Fixed common API mistakes")
