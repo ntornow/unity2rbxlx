@@ -6096,8 +6096,14 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
         s = line.strip()
         if not s or s.startswith('--') or s.startswith('end'):
             return line
+        # Skip continuation lines (from multi-line expressions)
+        if s.startswith('"') or s.startswith("'") or s.startswith('and ') or s.startswith('or '):
+            return line
         opens = s.count('(')
         closes = s.count(')')
+        # Only fix if the line itself has at least one `(` (not a pure continuation)
+        if opens == 0 and closes > 0:
+            return line  # Continuation line, don't strip
         if closes > opens and (s.endswith(')') or s.endswith(') then') or s.endswith(') do')):
             for _ in range(closes - opens):
                 idx = s.rfind(')')
