@@ -2435,6 +2435,33 @@ class TestValidatorNewFixes:
         end_lines = [l.strip() for l in fixed.split('\n') if l.strip() in ('end', 'end)')]
         assert len(end_lines) == 2
 
+    def test_task_delay_closure_end(self):
+        """task.delay(time, function() gets end) closure fix."""
+        from converter.luau_validator import validate_and_fix
+        source = (
+            'task.delay(5, function()\n'
+            '    for _, player in Players:GetPlayers() do\n'
+            '        player:LoadCharacter()\n'
+            '    end\n'
+            'end\n'
+        )
+        fixed, _ = validate_and_fix("test", source)
+        lines = [l.strip() for l in fixed.rstrip().split('\n') if l.strip()]
+        # The last line should be end) to close task.delay callback
+        assert lines[-1] == 'end)'
+
+    def test_task_spawn_closure_end(self):
+        """task.spawn(function() gets end) closure fix."""
+        from converter.luau_validator import validate_and_fix
+        source = (
+            'task.spawn(function()\n'
+            '    print("hello")\n'
+            'end\n'
+        )
+        fixed, _ = validate_and_fix("test", source)
+        lines = [l.strip() for l in fixed.rstrip().split('\n') if l.strip()]
+        assert lines[-1] == 'end)'
+
     def test_elseif_depth_tracking(self):
         """elseif doesn't inflate block depth."""
         from converter.luau_validator import validate_and_fix

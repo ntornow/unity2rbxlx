@@ -242,83 +242,60 @@ def generate_terrain_luau(
             row.append(round(height_studs, 1))
         height_rows.append(row)
 
-    # Generate Luau script
+    # Generate Luau script using string-encoded sparse height data.
+    # A nested table literal hits Luau parser limits (~150 rows), so we
+    # encode non-zero columns as a semicolon-separated string of "x,z,h"
+    # triplets and decode at runtime.  This keeps the script under 200KB
+    # even for large terrains (vs 80KB+ nested tables that fail to parse).
+    sparse_entries = []
+    for sz in range(samples_z):
+        for sx in range(samples_x):
+            h = height_rows[sz][sx]
+            if h > 0.5:
+                sparse_entries.append(f"{sx},{sz},{h}")
+
+    data_str = ";".join(sparse_entries)
+
     lines = [
         "-- Auto-generated terrain from Unity heightmap",
         f"-- Original size: {width:.0f}x{max_height:.0f}x{length:.0f} meters",
         f"-- Roblox size: {width_studs:.0f}x{max_height_studs:.0f}x{length_studs:.0f} studs",
-        f"-- Voxel grid: {samples_x}x{samples_z} columns",
+        f"-- Sparse entries: {len(sparse_entries)} non-zero columns",
         "",
-        "local terrain = workspace.Terrain",
-        f"local material = Enum.Material.{material}",
+        "local t = workspace.Terrain",
         f"local VOXEL = {VOXEL}",
-        f"local originX = {rx}",
-        f"local originY = {ry}",
-        f"local originZ = {rz}",
+        f"local oX = {rx}",
+        f"local oY = {ry}",
+        f"local oZ = {rz}",
+        f"local maxH = {max_height_studs:.1f}",
         "",
-        "-- Height data (row-major, Z then X)",
-        "local heightData = {",
-    ]
-
-    for row in height_rows:
-        lines.append("    {" + ",".join(str(h) for h in row) + "},")
-    lines.append("}")
-
-    lines.extend([
-        "",
-        "-- Clear existing terrain",
-        "terrain:Clear()",
-        "",
-        "-- Height-based material selection (approximates Unity terrain layers)",
-        "local function getMaterial(h, maxH)",
-        "    local norm = h / maxH",
-        "    if norm < 0.15 then return Enum.Material.Sand end",
-        "    if norm < 0.35 then return Enum.Material.Grass end",
-        "    if norm < 0.60 then return Enum.Material.Ground end",
-        "    if norm < 0.85 then return Enum.Material.Rock end",
+        "local function gM(h)",
+        "    local n = h / maxH",
+        "    if n < 0.15 then return Enum.Material.Sand end",
+        "    if n < 0.35 then return Enum.Material.Grass end",
+        "    if n < 0.60 then return Enum.Material.Ground end",
+        "    if n < 0.85 then return Enum.Material.Rock end",
         "    return Enum.Material.Slate",
         "end",
         "",
-        f"local maxHeight = {max_height_studs:.1f}",
+        "t:Clear()",
         "",
-        "-- Fill terrain columns",
-        "local total = 0",
-        "for z = 1, #heightData do",
-        "    for x = 1, #heightData[z] do",
-        "        local h = heightData[z][x]",
-        "        if h > 0.5 then",
-        "            local worldX = originX + (x - 1) * VOXEL",
-        "            local worldZ = originZ - (z - 1) * VOXEL  -- Z negated for Roblox",
-        "            local halfH = h / 2",
-        "            local cf = CFrame.new(worldX, originY + halfH, worldZ)",
-        "            local size = Vector3.new(VOXEL, h, VOXEL)",
-        "            local mat = getMaterial(h, maxHeight)",
-        "            terrain:FillBlock(cf, size, mat)",
-        "            total = total + 1",
-        "        end",
-        "    end",
-        "    if z % 10 == 0 then",
-        "        task.wait()",
+        f'local data = "{data_str}"',
+        "",
+        "local count = 0",
+        'for entry in string.gmatch(data, "[^;]+") do',
+        '    local x, z, h = string.match(entry, "(%d+),(%d+),([%d%.]+)")',
+        '    x = tonumber(x); z = tonumber(z); h = tonumber(h)',
+        "    if x and z and h then",
+        "        local wx = oX + x * VOXEL",
+        "        local wz = oZ - z * VOXEL",
+        "        t:FillBlock(CFrame.new(wx, oY + h/2, wz), Vector3.new(VOXEL, h, VOXEL), gM(h))",
+        "        count = count + 1",
+        "        if count % 500 == 0 then task.wait() end",
         "    end",
         "end",
         "",
-        "-- Fill water at sea level where there is no land",
-        "local waterLevel = 2  -- studs (shallow water surface)",
-        "local waterCount = 0",
-        "for z = 1, #heightData do",
-        "    for x = 1, #heightData[z] do",
-        "        local h = heightData[z][x]",
-        "        if h < 0.5 then",
-        "            local worldX = originX + (x - 1) * VOXEL",
-        "            local worldZ = originZ - (z - 1) * VOXEL",
-        "            terrain:FillBlock(CFrame.new(worldX, originY + waterLevel/2, worldZ), Vector3.new(VOXEL, waterLevel, VOXEL), Enum.Material.Water)",
-        "            waterCount = waterCount + 1",
-        "        end",
-        "    end",
-        "    if z % 10 == 0 then task.wait() end",
-        "end",
-        "",
-        'print("Terrain generated: " .. total .. " land columns, " .. waterCount .. " water columns")',
-    ])
+        'print("Terrain generated: " .. count .. " land columns")',
+    ]
 
     return "\n".join(lines)

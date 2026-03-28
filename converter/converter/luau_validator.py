@@ -6448,25 +6448,35 @@ def _remove_excess_end_keywords(source: str, fixes: list[str]) -> str:
 
 
 def _fix_connect_closures(source: str, fixes: list[str]) -> str:
-    """Fix bare `end` → `end)` for :Connect(function() blocks.
+    """Fix bare `end` → `end)` for callback-function blocks.
+
+    Handles :Connect(function(), task.delay(time, function(), task.spawn(function(),
+    and task.defer(function() patterns.
 
     Uses a two-pass approach:
-    1. Find all :Connect(function( lines and record their indent
-    2. For each Connect opener, find the last bare `end` at the same indent
-       level (before the next non-blank non-comment line at same/lower indent
-       that isn't `end`) and convert it to `end)`
+    1. Find all callback-function( lines and record their indent
+    2. For each opener, find the matching `end` via depth tracking
+       and convert it to `end)`
 
     This runs after all structural fixes so the block structure is stable.
     """
-    if ':Connect(function(' not in source:
+    # Quick check: does the source contain any callback-function patterns?
+    has_connect = ':Connect(function(' in source
+    has_task = re.search(r'task\.(delay|spawn|defer)\(.*function\s*\(', source) is not None
+    if not has_connect and not has_task:
         return source
 
     lines = source.split('\n')
-    # Find all Connect(function( openers with their line index and indent
+    # Find all callback-function openers with their line index and indent
+    # Matches: :Connect(function(, task.delay(time, function(, task.spawn(function(, task.defer(function(
+    callback_pattern = re.compile(r'(?::Connect\(function\s*\(|task\.(?:delay|spawn|defer)\(.*function\s*\()')
     connect_openers = []
     for i, line in enumerate(lines):
         stripped = line.strip()
-        if re.search(r':Connect\(function\s*\(', stripped):
+        if callback_pattern.search(stripped):
+            # Skip single-line callbacks (function(...) ... end) on same line
+            if re.search(r'\bend\)\s*$', stripped):
+                continue
             indent = len(line) - len(line.lstrip())
             connect_openers.append((i, indent))
 

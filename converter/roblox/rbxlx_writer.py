@@ -954,7 +954,7 @@ def _make_lighting(lighting_item: ET.Element, config: RbxLightingConfig) -> None
     _add_float(props, "EnvironmentSpecularScale", 1.0)
 
     # Add Atmosphere for outdoor scenes (reduces default Roblox haze)
-    atmo_item, atmo_props = _make_item(lighting, "Atmosphere", "Atmosphere")
+    atmo_item, atmo_props = _make_item(lighting_item, "Atmosphere", "Atmosphere")
     atmo_cfg = getattr(config, "atmosphere_density", None)
     density = atmo_cfg if atmo_cfg is not None else 0.3
     _add_float(atmo_props, "Density", density)
@@ -1167,16 +1167,21 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, Any]:
         _add_float(ws_props, "FallenPartsDestroyHeight", -500.0)  # Clean up fallen parts
 
     # ---- Terrain -----------------------------------------------------------
-    # SmoothGrid binary encoding requires exact match of Roblox's internal
-    # voxel order. Until fully reverse-engineered, terrain is generated at
-    # runtime via the embedded TerrainGenerator script (FillBlock approach).
     terrains: list = getattr(place, "terrains", None) or []
     water_regions: list = getattr(place, "water_regions", None) or []
     if terrains or water_regions:
-        _make_item(workspace, "Terrain", "Terrain")
-        # SmoothGrid binary embedding disabled — the format has additional
-        # header fields beyond version+chunk_size that need reverse-engineering.
-        # Terrain is generated at runtime via the embedded TerrainGenerator script.
+        terrain_item, terrain_props = _make_item(workspace, "Terrain", "Terrain")
+        # Embed SmoothGrid binary data if available (baked terrain)
+        for t in terrains:
+            sg = getattr(t, "smooth_grid", None)
+            pg = getattr(t, "physics_grid", None)
+            if sg:
+                sg_el = ET.SubElement(terrain_props, "BinaryString", name="SmoothGrid")
+                sg_el.text = sg
+                log.info("Embedded SmoothGrid terrain data (%d chars base64)", len(sg))
+            if pg:
+                pg_el = ET.SubElement(terrain_props, "BinaryString", name="PhysicsGrid")
+                pg_el.text = pg
 
     lighting = _make_service(root, "Lighting")
     server_script_service = _make_service(root, "ServerScriptService")

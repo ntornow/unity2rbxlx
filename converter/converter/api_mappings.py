@@ -202,7 +202,7 @@ API_CALL_MAP: dict[str, str] = {
     "yield return new WaitForEndOfFrame": "task.wait()",
     "yield return new WaitForFixedUpdate": "task.wait()",
     # -- Scene --
-    "SceneManager.LoadScene": "TeleportService:Teleport",
+    "SceneManager.LoadScene": "-- SceneManager.LoadScene: not available in Roblox (single-place)",
     "SceneManager.GetActiveScene": "game.PlaceId",
     # -- Audio --
     "AudioSource.Play": ":Play()",
@@ -455,8 +455,8 @@ API_CALL_MAP: dict[str, str] = {
     # -- Resources --
     "Resources.Load": "-- Resources.Load: use game.ReplicatedStorage:FindFirstChild",
     # -- SceneManager --
-    "SceneManager.LoadScene": "game:GetService('TeleportService'):Teleport",
-    "SceneManager.LoadSceneAsync": "game:GetService('TeleportService'):TeleportAsync",
+    "SceneManager.LoadScene": "-- SceneManager.LoadScene: not available in Roblox (single-place)",
+    "SceneManager.LoadSceneAsync": "-- SceneManager.LoadSceneAsync: not available in Roblox (single-place)",
     "SceneManager.GetActiveScene": "-- GetActiveScene: use game.PlaceId",
     # -- PlayerPrefs --
     "PlayerPrefs.GetFloat": "-- PlayerPrefs: use DataStoreService or Player:GetAttribute",

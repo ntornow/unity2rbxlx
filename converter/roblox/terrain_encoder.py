@@ -218,132 +218,136 @@ def encode_smooth_grid(
         return (h00 * (1 - fx) * (1 - fz) + h10 * fx * (1 - fz) +
                 h01 * (1 - fx) * fz + h11 * fx * fz) * max_height_studs
 
-    # Collect voxels chunk by chunk.
-    # Each chunk is exactly 32x32x32 voxels.
-    # Chunks are iterated in X, Z, Y order (outer to inner).
-    # Within a chunk, voxels are iterated in X, Z, Y order.
-    # This matches Roblox's SmoothGrid deserialization order.
+    # SmoothGrid v1 format (reverse-engineered from Studio-saved terrain):
+    #   2-byte global header: version(1) + chunk_pow(5)
+    #   Per chunk:
+    #     12-byte delta-encoded chunk coordinates (MSB-interleaved int32 dx,dy,dz)
+    #     RLE-encoded voxel data for 32^3 = 32768 voxels
+    #   Chunk order: X outermost, Y middle, Z innermost
+    #   Voxel order within chunk: X innermost (index = x + y*32 + z*1024)
+
     chunk_size = 32
-    # Pad grid to exact chunk multiples
-    padded_x = int(math.ceil(grid_x / chunk_size)) * chunk_size
-    padded_y = int(math.ceil(grid_y / chunk_size)) * chunk_size
-    padded_z = int(math.ceil(grid_z / chunk_size)) * chunk_size
-    chunks_x = padded_x // chunk_size
-    chunks_y = padded_y // chunk_size
-    chunks_z = padded_z // chunk_size
+    chunks_x = int(math.ceil(grid_x / chunk_size))
+    chunks_y = int(math.ceil(grid_y / chunk_size))
+    chunks_z = int(math.ceil(grid_z / chunk_size))
 
-    voxels = []
+    def _get_material(gx: int, gy: int, gz: int) -> tuple[int, int]:
+        """Return (material, occupancy) for global voxel position."""
+        if gx >= grid_x or gy >= grid_y or gz >= grid_z:
+            return (MATERIAL_AIR, 0)
+        h_studs = sample_height(gx * VOXEL_SIZE, gz * VOXEL_SIZE)
+        voxel_bottom = gy * VOXEL_SIZE
+        voxel_top = voxel_bottom + VOXEL_SIZE
+        if voxel_top <= h_studs:
+            if splat_alphas and splat_resolution > 0:
+                mat = _splat_based_material(
+                    splat_alphas, splat_resolution,
+                    layer_names or [], gx * VOXEL_SIZE, gz * VOXEL_SIZE,
+                    width_studs, length_studs,
+                )
+            else:
+                norm_h = h_studs / max_height_studs if max_height_studs > 0 else 0
+                h_dx = abs(sample_height((gx + 1) * VOXEL_SIZE, gz * VOXEL_SIZE) - h_studs)
+                h_dz = abs(sample_height(gx * VOXEL_SIZE, (gz + 1) * VOXEL_SIZE) - h_studs)
+                slope = max(h_dx, h_dz) / VOXEL_SIZE
+                mat = _height_based_material(norm_h, slope, max_height_studs)
+            return (mat, 255)
+        elif voxel_bottom >= h_studs:
+            return (MATERIAL_AIR, 0)
+        else:
+            occ = (h_studs - voxel_bottom) / VOXEL_SIZE
+            occ_byte = max(0, min(255, int(occ * 255)))
+            if splat_alphas and splat_resolution > 0:
+                mat = _splat_based_material(
+                    splat_alphas, splat_resolution,
+                    layer_names or [], gx * VOXEL_SIZE, gz * VOXEL_SIZE,
+                    width_studs, length_studs,
+                )
+            else:
+                norm_h = h_studs / max_height_studs if max_height_studs > 0 else 0
+                h_dx = abs(sample_height((gx + 1) * VOXEL_SIZE, gz * VOXEL_SIZE) - h_studs)
+                h_dz = abs(sample_height(gx * VOXEL_SIZE, (gz + 1) * VOXEL_SIZE) - h_studs)
+                slope = max(h_dx, h_dz) / VOXEL_SIZE
+                mat = _height_based_material(norm_h, slope, max_height_studs)
+            return (mat, occ_byte)
 
+    def _encode_chunk_coord_delta(dx: int, dy: int, dz: int) -> bytes:
+        """Encode 3 int32 deltas as 12 MSB-interleaved bytes."""
+        # Convert to unsigned 32-bit for byte extraction
+        def _to_u32(v: int) -> int:
+            return v & 0xFFFFFFFF
+        udx, udy, udz = _to_u32(dx), _to_u32(dy), _to_u32(dz)
+        return bytes([
+            (udx >> 24) & 0xFF, (udy >> 24) & 0xFF, (udz >> 24) & 0xFF,
+            (udx >> 16) & 0xFF, (udy >> 16) & 0xFF, (udz >> 16) & 0xFF,
+            (udx >> 8) & 0xFF,  (udy >> 8) & 0xFF,  (udz >> 8) & 0xFF,
+            udx & 0xFF,         udy & 0xFF,         udz & 0xFF,
+        ])
+
+    def _rle_encode_chunk(chunk_voxels: list[tuple[int, int]]) -> bytearray:
+        """RLE-encode exactly 32^3 voxels for one chunk."""
+        out = bytearray()
+        i = 0
+        while i < len(chunk_voxels):
+            mat, occ = chunk_voxels[i]
+            remaining = len(chunk_voxels) - i
+            max_run = min(256, remaining)
+            run = 1
+            while (run < max_run and
+                   chunk_voxels[i + run][0] == mat and
+                   chunk_voxels[i + run][1] == occ):
+                run += 1
+            has_occ = (mat != MATERIAL_AIR)
+            has_run = (run > 1)
+            header = mat & 0x3F
+            if has_occ:
+                header |= 0x40
+            if has_run:
+                header |= 0x80
+            out.append(header)
+            if has_occ:
+                out.append(occ)
+            if has_run:
+                out.append(run - 1)
+            i += run
+        return out
+
+    # Build output
+    buf = bytearray()
+    buf.append(1)  # version
+    buf.append(5)  # chunk_pow = 2^5 = 32
+
+    prev_cx, prev_cy, prev_cz = 0, 0, 0
+    total_voxels = 0
+    chunk_count = 0
+
+    # Chunk iteration: X outermost, Y middle, Z innermost
     for cx in range(chunks_x):
-        for cz in range(chunks_z):
-            for cy in range(chunks_y):
-                for lx in range(chunk_size):
-                    for lz in range(chunk_size):
-                        for ly in range(chunk_size):
+        for cy in range(chunks_y):
+            for cz in range(chunks_z):
+                # Delta-encoded chunk coordinates
+                dx = cx - prev_cx
+                dy = cy - prev_cy
+                dz = cz - prev_cz
+                buf.extend(_encode_chunk_coord_delta(dx, dy, dz))
+                prev_cx, prev_cy, prev_cz = cx, cy, cz
+
+                # Collect voxels in X-innermost order: index = x + y*32 + z*1024
+                chunk_voxels = []
+                for lz in range(chunk_size):
+                    for ly in range(chunk_size):
+                        for lx in range(chunk_size):
                             gx = cx * chunk_size + lx
                             gy = cy * chunk_size + ly
                             gz = cz * chunk_size + lz
+                            chunk_voxels.append(_get_material(gx, gy, gz))
 
-                            if gx >= grid_x or gy >= grid_y or gz >= grid_z:
-                                voxels.append((MATERIAL_AIR, 0))
-                                continue
+                buf.extend(_rle_encode_chunk(chunk_voxels))
+                total_voxels += len(chunk_voxels)
+                chunk_count += 1
 
-                            # Sample height — Z is negated because Roblox uses
-                            # the Unity→Roblox coordinate conversion (Z flip).
-                            # The SmoothGrid voxels at negative gz map to positive
-                            # Unity Z (since the grid covers both + and - coordinates).
-                            # We sample at the absolute voxel position since the
-                            # heightmap lookup uses normalized UV in [0,1].
-                            h_studs = sample_height(gx * VOXEL_SIZE, gz * VOXEL_SIZE)
-                            voxel_bottom = gy * VOXEL_SIZE
-                            voxel_top = voxel_bottom + VOXEL_SIZE
-
-                            if voxel_top <= h_studs:
-                                # Fully solid voxel — pick material
-                                if splat_alphas and splat_resolution > 0:
-                                    # Use splat map for pixel-accurate material
-                                    world_x = gx * VOXEL_SIZE
-                                    world_z = gz * VOXEL_SIZE
-                                    mat = _splat_based_material(
-                                        splat_alphas, splat_resolution,
-                                        layer_names or [], world_x, world_z,
-                                        width_studs, length_studs,
-                                    )
-                                else:
-                                    norm_h = h_studs / max_height_studs if max_height_studs > 0 else 0
-                                    h_dx = abs(sample_height((gx + 1) * VOXEL_SIZE, gz * VOXEL_SIZE) - h_studs)
-                                    h_dz = abs(sample_height(gx * VOXEL_SIZE, (gz + 1) * VOXEL_SIZE) - h_studs)
-                                    slope = max(h_dx, h_dz) / VOXEL_SIZE
-                                    mat = _height_based_material(norm_h, slope, max_height_studs)
-                                voxels.append((mat, 255))
-                            elif voxel_bottom >= h_studs:
-                                voxels.append((MATERIAL_AIR, 0))
-                            else:
-                                occ = (h_studs - voxel_bottom) / VOXEL_SIZE
-                                occ_byte = max(0, min(255, int(occ * 255)))
-                                if splat_alphas and splat_resolution > 0:
-                                    world_x = gx * VOXEL_SIZE
-                                    world_z = gz * VOXEL_SIZE
-                                    mat = _splat_based_material(
-                                        splat_alphas, splat_resolution,
-                                        layer_names or [], world_x, world_z,
-                                        width_studs, length_studs,
-                                    )
-                                else:
-                                    norm_h = h_studs / max_height_studs if max_height_studs > 0 else 0
-                                    h_dx = abs(sample_height((gx + 1) * VOXEL_SIZE, gz * VOXEL_SIZE) - h_studs)
-                                    h_dz = abs(sample_height(gx * VOXEL_SIZE, (gz + 1) * VOXEL_SIZE) - h_studs)
-                                    slope = max(h_dx, h_dz) / VOXEL_SIZE
-                                    mat = _height_based_material(norm_h, slope, max_height_studs)
-                                voxels.append((mat, occ_byte))
-
-    # RLE encode
-    buf = bytearray()
-    buf.append(1)  # version
-    buf.append(5)  # chunk size = 2^5 = 32
-
-    # RLE encode with strict chunk boundary enforcement.
-    # Roblox tolerates tiny overflow (~12 cells) but rejects >~20.
-    # We strictly prevent runs from crossing chunk boundaries.
-    vpchunk = chunk_size ** 3  # 32768
-    i = 0
-    voxel_count = 0
-
-    while i < len(voxels):
-        mat, occ = voxels[i]
-
-        # Remaining voxels before the next chunk boundary
-        remaining_in_chunk = vpchunk - (voxel_count % vpchunk)
-        # Strictly cap run to not cross boundary
-        max_run = min(256, remaining_in_chunk)
-
-        run = 1
-        while (i + run < len(voxels) and run < max_run and
-               voxels[i + run][0] == mat and voxels[i + run][1] == occ):
-            run += 1
-
-        # Encode header byte: has_run(bit7) | has_occ(bit6) | material(bits 5-0)
-        has_occ = (mat != MATERIAL_AIR)
-        has_run = (run > 1)
-
-        header = mat & 0x3F
-        if has_occ:
-            header |= 0x40
-        if has_run:
-            header |= 0x80
-
-        buf.append(header)
-
-        if has_occ:
-            buf.append(occ)
-
-        if has_run:
-            buf.append(run - 1)
-
-        i += run
-        voxel_count += run
-
-    log.info("SmoothGrid: %d voxels -> %d bytes encoded", len(voxels), len(buf))
+    log.info("SmoothGrid: %d chunks, %d voxels -> %d bytes encoded",
+             chunk_count, total_voxels, len(buf))
     return base64.b64encode(bytes(buf)).decode('ascii')
 
 

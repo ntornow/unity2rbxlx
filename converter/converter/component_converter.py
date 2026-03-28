@@ -489,6 +489,11 @@ def convert_particle_system(properties: dict[str, Any]) -> RbxParticleEmitter | 
     # Main module (nested under various keys depending on Unity version)
     main = properties
 
+    # playOnAwake: if false, the emitter should start disabled
+    play_on_awake = main.get("playOnAwake", main.get("m_PlayOnAwake", 1))
+    if not bool(int(play_on_awake)):
+        emitter.enabled = False
+
     # Emission rate
     emission = main.get("EmissionModule", main.get("emission", {}))
     if isinstance(emission, dict):
