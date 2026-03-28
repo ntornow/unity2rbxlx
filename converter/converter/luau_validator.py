@@ -167,6 +167,7 @@ def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
     source = _fix_structural_syntax(name, source, fixes)
     source = _fix_missing_end_keywords(name, source, fixes)
     source = _fix_undefined_module_return(name, source, fixes)
+    source = _fix_missing_module_return(name, source, fixes)
     # Second pass: catch patterns introduced by structural fixes
     if re.search(r'\bthis\.', source):
         source = re.sub(r'\bthis\.(\w+)', r'script.Parent.\1', source)
@@ -1222,6 +1223,9 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
         def _fix_add(m: re.Match) -> str:
             obj = m.group(1)
             args = m.group(2)
+            # If args contains `{`, it's a table literal — use table.insert (don't split on comma)
+            if '{' in args:
+                return f'table.insert({obj}, {args})'
             # If args contains a comma, treat as dict.Add(key, value)
             if ',' in args:
                 parts = args.split(',', 1)
@@ -1865,8 +1869,8 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
 
     # Fix: .attachedRigidbody → the part itself (Roblox parts have built-in physics)
     if 'attachedRigidbody' in source:
-        # obj.attachedRigidbody → obj (Roblox parts ARE their own rigidbodies)
-        source = re.sub(r'(\w+)\.attachedRigidbody\b', r'\1', source)
+        # obj.attachedRigidbody, arr[n].attachedRigidbody → obj, arr[n]
+        source = re.sub(r'([\w.\[\]]+)\.attachedRigidbody\b', r'\1', source)
         fixes.append("Fixed .attachedRigidbody → part itself")
 
     # Fix: .velocity → .AssemblyLinearVelocity (Roblox physics property)
@@ -3322,7 +3326,7 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         )
         fixes.append("Commented out Unity camera rendering properties")
 
-    # Fix comment-embedded property access: obj-- comment: text.Method() → comment the whole line
+    # Fix comment-embedded property access: obj-- comment: text → comment/fix the whole line
     # Pattern: obj:FindFirstChildWhichIsA("BasePart")-- sharedMaterial: ...SetTexture(...)
     if '-- sharedMaterial' in source:
         source = re.sub(
@@ -3332,6 +3336,26 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             flags=re.MULTILINE,
         )
         fixes.append("Commented out sharedMaterial access lines")
+
+    # Fix inline `-- materials: use SurfaceAppearance` comment breaking expressions
+    # Pattern: `renderer-- materials: use SurfaceAppearance` or `renderer-- materials: use SurfaceAppearance[1]`
+    # These come from API_CALL_MAP mapping `.materials` → comment
+    if '-- materials:' in source:
+        # Assignment: `var = expr-- materials:...` → comment whole line
+        source = re.sub(
+            r'^(\s*)(\S.+)-- materials: use SurfaceAppearance(\[?\d*\]?)(.*)$',
+            r'\1-- [Unity materials] \2\4',
+            source,
+            flags=re.MULTILINE,
+        )
+        # for-in loops: `for _, x in expr-- materials:... do` → comment whole line
+        source = re.sub(
+            r'^(\s*for\b.+)-- materials:[^\n]+$',
+            r'\1-- [Unity materials] (commented out)',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Fixed inline -- materials: comment breaking expressions")
 
     # Comment out SceneLinkedSMB calls (Unity state machine behaviour, not in Roblox)
     if 'SceneLinkedSMB' in source and not re.search(r'--.*SceneLinkedSMB', source):
@@ -3347,6 +3371,17 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     if 'animator.speed' in source:
         source = re.sub(r'(\w+)\.animator\.speed\s*=\s*([^\n]+)', r'-- animator.speed = \2 (not in Roblox)', source)
         fixes.append("Commented out animator.speed assignment")
+
+    # Fix Vector3 lowercase component access: .x → .X, .y → .Y, .z → .Z
+    # Roblox Vector3/CFrame uses uppercase .X .Y .Z
+    # Only convert when preceded by word char (not `max.y` style false positives)
+    # Skip common false positives: .xy, .xyz, text, index, hex patterns
+    if re.search(r'\w\.[xyz]\b', source):
+        # Fix obj.x/y/z at end of line or before operators/close-parens
+        source = re.sub(r'(\w)\.(x)\b(?!\w)', r'\1.X', source)
+        source = re.sub(r'(\w)\.(y)\b(?!\w)', r'\1.Y', source)
+        source = re.sub(r'(\w)\.(z)\b(?!\w)', r'\1.Z', source)
+        fixes.append("Fixed lowercase .x/.y/.z → .X/.Y/.Z (Roblox PascalCase)")
 
     # Fix Vector3 immutable component assignment: vec.y = 0 → vec = Vector3.new(vec.X, 0, vec.Z)
     # Roblox Vector3 is immutable — cannot set individual components
@@ -3748,6 +3783,247 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     if 'Message.MessageType.' in source:
         source = re.sub(r'\bMessage\.MessageType\.(\w+)', r'"\1"', source)
 
+    # Fix broken table insertion: `tbl[{ key = val] = key2 = val2 }` → `table.insert(tbl, { key = val, key2 = val2 })`
+    # This happens when .Add({key=val, key2=val2}) is misinterpreted as dict.Add(key, val)
+    if re.search(r'\w+\[\{[^}]*\]\s*=\s*\w+\s*=', source):
+        def _fix_broken_table_insert(m):
+            tbl = m.group(1)
+            content = m.group(2)
+            # The pattern is: tbl[{ a = b] = c = d }
+            # Fix: extract all key=value pairs and form proper table.insert
+            # Replace `] = ` with `, ` to rejoin the table literal
+            content = re.sub(r'\]\s*=\s*', ', ', content)
+            return f'table.insert({tbl}, {{ {content} }})'
+        source = re.sub(
+            r'(\w+)\[\{\s*([^}]+)\}',
+            _fix_broken_table_insert,
+            source,
+        )
+        fixes.append("Fixed broken table insertion pattern")
+
+    # Fix broken RemoveRange in for loop: `for _i = 1, math.max(0, #arr - N do table.remove...`
+    # The `do` ended up inside the math.max call
+    if re.search(r'math\.max\([^)]*\bdo\b', source):
+        source = re.sub(
+            r'for\s+\w+\s*=\s*1,\s*math\.max\(0,\s*#(\w+)\s*-\s*(\d+)\s+do\s+table\.remove\(\1,\s*\d+\s*\+\s*\d+\)\s*end\s*(--.*)?',
+            lambda m: f'for _i = 1, math.max(0, #{m.group(1)} - {m.group(2)}) do table.remove({m.group(1)}, 1) end {m.group(3) or ""}',
+            source,
+        )
+        fixes.append("Fixed broken RemoveRange for-loop")
+
+    # Fix `not expr ~= nil` → `expr == nil` (Luau precedence bug: not binds tighter than ~=)
+    if 'not ' in source and '~= nil' in source:
+        source = re.sub(
+            r'\bnot\s+([\w.\[\]()]+)\s*~=\s*nil\b',
+            r'\1 == nil',
+            source,
+        )
+        fixes.append("Fixed 'not x ~= nil' → 'x == nil' (precedence)")
+
+    # Fix `end` used as variable name (Luau reserved word)
+    # Pattern: `local end = expr` → `local endPos = expr`, `start, end` → `start, endPos`
+    if re.search(r'\blocal\s+end\s*=', source):
+        source = re.sub(r'\blocal\s+end\s*=', 'local endPos =', source)
+        source = re.sub(r'\bend\b(?=\s*[,\)\]])', 'endPos', source)
+        # Fix references to `end` used as a value (not keyword)
+        # Only in contexts where it's clearly a variable: end.X, end.Y, (start, end, ...)
+        source = re.sub(r'(?<=,\s)end(?=\s*[,\)])', 'endPos', source)
+        source = re.sub(r'\bend\.([A-Z])', r'endPos.\1', source)
+        fixes.append("Fixed 'end' used as variable name (reserved word) → endPos")
+
+    # Fix trailing commas in function calls: func(a, b,) → func(a, b)
+    if ',)' in source:
+        source = re.sub(r',\s*\)', ')', source)
+        fixes.append("Fixed trailing commas in function calls")
+
+    # Fix assignment = in if conditions (should be ==)
+    # Pattern: `if count = expr then` → `if count == expr then`
+    # Only match single `=` not preceded by `~`, `<`, `>`, `=` and not followed by `=`
+    if re.search(r'\bif\b.*[^~<>=!]=(?!=)', source):
+        def _fix_if_assign(line):
+            if not re.match(r'\s*if\b', line):
+                return line
+            # Find the condition between `if` and `then`
+            m = re.match(r'(\s*if\s*\(?)(.+?)(\s*then\b.*)', line)
+            if not m:
+                return line
+            cond = m.group(2)
+            # Replace single = with == (not <=, >=, ~=, ==)
+            fixed_cond = re.sub(r'(?<![~<>=!])=(?!=)', ' == ', cond)
+            if fixed_cond != cond:
+                return m.group(1) + fixed_cond + m.group(3)
+            return line
+        lines = source.split('\n')
+        new_lines = [_fix_if_assign(l) for l in lines]
+        if new_lines != lines:
+            source = '\n'.join(new_lines)
+            fixes.append("Fixed assignment = in if conditions → ==")
+
+    # Fix math.random(0, #arr) → math.random(1, #arr) for 1-based Luau indexing
+    if 'math.random(0,' in source:
+        source = re.sub(r'math\.random\(0,\s*#', 'math.random(1, #', source)
+        fixes.append("Fixed math.random(0, #arr) → math.random(1, #arr) (1-based)")
+
+    # Fix .Set() on Vector2/Vector3 (immutable in Roblox)
+    # Pattern: m_Movement.Set(x, y) → m_Movement = Vector2.new(x, y)
+    if '.Set(' in source:
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.Set\(([^,]+),\s*([^,\)]+)\)',
+            r'\1 = Vector2.new(\2, \3)',
+            source,
+        )
+        source = re.sub(
+            r'(\w+(?:\.\w+)*)\.Set\(([^,]+),\s*([^,]+),\s*([^,\)]+)\)',
+            r'\1 = Vector3.new(\2, \3, \4)',
+            source,
+        )
+        fixes.append("Fixed .Set() → Vector assignment (immutable in Roblox)")
+
+    # Fix C# [Attribute] brackets on code lines
+    # Pattern: `[HelpBox] local x = ...` → `local x = ...`, `[Range(0,1)]` → strip
+    if re.search(r'^\s*\[\w+', source, re.MULTILINE):
+        # Standalone attribute line: `[SerializeField]` → remove
+        source = re.sub(
+            r'^\s*\[(?:SerializeField|Header|Range|Tooltip|HideInInspector|FormerlySerializedAs|'
+            r'HelpBox|Space|Min|Max|CreateAssetMenu|RequireComponent|DisallowMultipleComponent|'
+            r'AddComponentMenu|ExecuteInEditMode|ExecuteAlways)\b[^\]]*\]\s*\n',
+            '',
+            source,
+            flags=re.MULTILINE,
+        )
+        # Inline attribute before declaration: `[HelpBox] local x` → `local x`
+        source = re.sub(
+            r'^\s*\[\w+(?:\([^\)]*\))?\]\s*(local\s)',
+            r'\1',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Stripped C# [Attribute] brackets")
+
+    # Fix Unity API remnants
+    # .bounds.size → .Size (Roblox Part property)
+    if '.bounds.size' in source:
+        source = re.sub(r'(\w+(?:\.\w+)*)\.bounds\.size\b', r'\1.Size', source)
+        fixes.append("Fixed .bounds.size → .Size")
+    if '.bounds.center' in source:
+        source = re.sub(r'(\w+(?:\.\w+)*)\.bounds\.center\b', r'\1.Position', source)
+        fixes.append("Fixed .bounds.center → .Position")
+    if '.bounds.extents' in source:
+        source = re.sub(r'(\w+(?:\.\w+)*)\.bounds\.extents\b', r'(\1.Size / 2)', source)
+        fixes.append("Fixed .bounds.extents → Size/2")
+
+    # .attachedRigidbody → the part itself (Roblox parts are their own physics bodies)
+    # Handles: obj.attachedRigidbody, arr[n].attachedRigidbody, obj.prop.attachedRigidbody
+    if '.attachedRigidbody' in source:
+        source = re.sub(r'([\w.\[\]]+)\.attachedRigidbody\b', r'\1', source)
+        fixes.append("Fixed .attachedRigidbody → part itself")
+
+    # .AddRelativeTorque() → comment out (no direct equivalent)
+    if 'AddRelativeTorque' in source:
+        source = re.sub(
+            r'^(\s*)(\S.*\.AddRelativeTorque\(.+)$',
+            r'\1-- [Unity physics] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out .AddRelativeTorque (no Roblox equivalent)")
+
+    # .center and .radius on collider-like objects (Unity physics properties)
+    if re.search(r'\.center\b', source) and re.search(r'm_Sphere|m_Capsule|m_Box|collider', source):
+        source = re.sub(r'([\w.\[\]]+)\.center\b', r'\1.Position', source)
+        source = re.sub(r'([\w.\[\]]+)\.radius\b', r'\1.Size.X / 2', source)
+        fixes.append("Fixed .center/.radius → .Position/.Size")
+
+    # .GetPropertyBlock / .SetPropertyBlock → comment out (no Roblox equivalent)
+    if 'PropertyBlock' in source:
+        source = re.sub(
+            r'^(\s*)(\S.*(?:Get|Set)PropertyBlock\(.+)$',
+            r'\1-- [Unity material] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out PropertyBlock access (no Roblox equivalent)")
+
+    # .isTrigger → .CanCollide = false context
+    if '.isTrigger' in source:
+        source = re.sub(r'(\w+(?:\.\w+)*)\.isTrigger\s*=\s*true', r'\1.CanCollide = false', source)
+        source = re.sub(r'(\w+(?:\.\w+)*)\.isTrigger\s*=\s*false', r'\1.CanCollide = true', source)
+        source = re.sub(r'(\w+(?:\.\w+)*)\.isTrigger\b', r'(not \1.CanCollide)', source)
+        fixes.append("Fixed .isTrigger → CanCollide")
+
+    # CFrame.Angles with exactly 2 args (axis, speed) → proper 3-arg form
+    # Pattern: CFrame.Angles(axis, speed * dt) where axis is a variable → expand to 3-arg
+    # Only match when first arg is a word (variable), not a number or expression
+    # This avoids matching already-correct 3-arg calls like CFrame.Angles(0, math.rad(90), 0)
+    if re.search(r'CFrame\.Angles\([a-zA-Z_]\w*,\s*[^,\)]+\)', source):
+        def _fix_cframe_angles_2arg(m):
+            full = m.group(0)
+            # Count commas at top-level (outside parens) to verify exactly 2 args
+            depth = 0
+            commas = 0
+            for c in full[len('CFrame.Angles('):-1]:
+                if c == '(':
+                    depth += 1
+                elif c == ')':
+                    depth -= 1
+                elif c == ',' and depth == 0:
+                    commas += 1
+            if commas != 1:
+                return full  # 3+ args, leave alone
+            axis, speed = m.group(1).strip(), m.group(2).strip()
+            return f'CFrame.Angles({axis}.X * {speed}, {axis}.Y * {speed}, {axis}.Z * {speed})'
+        source = re.sub(
+            r'CFrame\.Angles\(([a-zA-Z_]\w*),\s*([^,\)]+)\)',
+            _fix_cframe_angles_2arg,
+            source,
+        )
+        fixes.append("Fixed CFrame.Angles(axis, speed) → 3-arg form")
+
+    # Humanoid:Move() doesn't exist — should use :MoveTo() for position or Humanoid.MoveDirection for direction
+    # Pattern: control:Move(moveDirection * speed * dt) → control.MoveDirection = moveDirection
+    if ':Move(' in source:
+        source = re.sub(
+            r'(\w+):Move\(([^)]+)\)',
+            r'\1.MoveDirection = \2',
+            source,
+        )
+        fixes.append("Fixed :Move() → .MoveDirection (Humanoid)")
+
+    # .time property on VFX/particle instances → comment out
+    if re.search(r'\w+\.time\s*=\s*[\d.]', source):
+        source = re.sub(
+            r'^(\s*)(\w+\.time\s*=\s*[\d.]+.*)$',
+            r'\1-- [Unity VFX] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+
+    # Object:Clone(prefab) → prefab:Clone()
+    if re.search(r'\w+:Clone\(\w+\)', source):
+        source = re.sub(
+            r'(\w+):Clone\((\w+)\)',
+            r'\2:Clone()',
+            source,
+        )
+        fixes.append("Fixed Object:Clone(prefab) → prefab:Clone()")
+
+    # C# remaining type declarations that slip through
+    # Pattern: `SceneTransitionDestination.DestinationTag varName` → `local varName = nil`
+    _EXTRA_TYPES = (
+        'SceneTransitionDestination', 'InventoryController', 'Collision',
+        'RaycastHit', 'ContactPoint', 'Collider', 'Renderer', 'Rigidbody',
+        'LayerMask', 'Vector4', 'Matrix4x4', 'Bounds', 'Ray',
+    )
+    _extra_type_pat = '|'.join(re.escape(t) for t in _EXTRA_TYPES)
+    if re.search(rf'\b(?:{_extra_type_pat})(?:\.\w+)*\s+\w+\s*[;=\n]', source):
+        source = re.sub(
+            rf'^(\s*)(?:{_extra_type_pat})(?:\.\w+)*\s+(\w+)\s*;?\s*$',
+            r'\1local \2 = nil',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Fixed remaining C# type declarations → local")
+
     if source != original:
         fixes.append("Fixed common API mistakes")
         log.info("  [%s] Fixed common API/syntax mistakes", name)
@@ -4067,6 +4343,13 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
         '"RB"': 'Enum.KeyCode.LeftShift',
         '"Crouch"': 'Enum.KeyCode.LeftControl',
         '"Sprint"': 'Enum.KeyCode.LeftShift',
+        '"Pause"': 'Enum.KeyCode.P',
+        '"Menu"': 'Enum.KeyCode.Escape',
+        '"Interact"': 'Enum.KeyCode.E',
+        '"Reload"': 'Enum.KeyCode.R',
+        '"Inventory"': 'Enum.KeyCode.I',
+        '"Map"': 'Enum.KeyCode.M',
+        '"Tab"': 'Enum.KeyCode.Tab',
     }
     for unity_name, roblox_key in _UNITY_INPUT_MAP.items():
         if unity_name in source:
@@ -4081,6 +4364,19 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
             else:
                 source = source.replace(f'IsKeyDown({unity_name})', f'IsKeyDown({roblox_key})')
             fixes.append(f"Fixed Unity input {unity_name} → {roblox_key}")
+
+    # Catch-all: any remaining IsKeyDown("StringName") → Enum.KeyCode.StringName
+    # This handles unmapped Unity input axis names
+    if re.search(r'IsKeyDown\s*\("(\w+)"\)', source):
+        def _fix_string_keydown(m):
+            name = m.group(1)
+            return f'IsKeyDown(Enum.KeyCode.{name})'
+        source = re.sub(
+            r'IsKeyDown\s*\("(\w+)"\)',
+            _fix_string_keydown,
+            source,
+        )
+        fixes.append("Fixed string-based IsKeyDown → Enum.KeyCode")
 
     # Fix 'workspace:GetServerTimeNow()Scale' → timeScale variable
     # Time.timeScale in Unity has no direct Roblox equivalent — use a module variable
@@ -4610,6 +4906,55 @@ def _fix_undefined_module_return(name: str, source: str, fixes: list[str]) -> st
     src_lines.insert(insert_idx, f'local {return_name} = {{}}\n')
     fixes.append(f"Added module table definition for '{return_name}'")
     return '\n'.join(src_lines)
+
+
+def _fix_missing_module_return(name: str, source: str, fixes: list[str]) -> str:
+    """Add `return ClassName` to scripts that define a module table but never return it.
+
+    Pattern: `local ClassName = {}` at top, but no `return ClassName` at end.
+    Prefers the class that matches the script name.
+    """
+    # Check if there's already a module-level return at the end
+    # (return ClassName, not return from inside a function)
+    last_lines = source.rstrip().split('\n')
+    for line in reversed(last_lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith('--'):
+            continue
+        if stripped == 'end':
+            break  # Last real line is `end` — likely a function closer, not a module return
+        m_ret = re.match(r'^return\s+([A-Z]\w+)\s*$', stripped)
+        if m_ret:
+            return source  # Already has a proper module return
+        if stripped.startswith('return '):
+            break  # Has a return but not a module-level one (e.g., inside a function)
+        break
+
+    # Find all `local Name = {}` near the top (within first 50 lines)
+    candidates = []
+    for line in source.split('\n')[:50]:
+        m = re.match(r'^local\s+([A-Z]\w+)\s*=\s*\{\s*\}\s*$', line.strip())
+        if m:
+            candidates.append(m.group(1))
+
+    if not candidates:
+        return source
+
+    # Prefer the one matching the script name
+    # Script name is the filename without .luau
+    script_name = name.replace('.luau', '').replace('.lua', '')
+    module_name = None
+    for c in candidates:
+        if c == script_name:
+            module_name = c
+            break
+    if not module_name:
+        module_name = candidates[0]  # Fallback to first
+
+    # Add return at the end
+    source = source.rstrip() + f'\n\nreturn {module_name}\n'
+    fixes.append(f"Added missing 'return {module_name}' for module script")
+    return source
 
 
 def _fix_missing_end_keywords(name: str, source: str, fixes: list[str]) -> str:

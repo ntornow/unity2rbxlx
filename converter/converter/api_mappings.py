@@ -125,7 +125,7 @@ API_CALL_MAP: dict[str, str] = {
     "Mathf.Infinity": "math.huge",
     "Mathf.Deg2Rad": "math.rad(1)",
     "Mathf.Rad2Deg": "math.deg(1)",
-    "Mathf.MoveTowards": "math.clamp",
+    "Mathf.MoveTowards": "mathMoveTowards",  # handled by UTILITY_FUNCTIONS
     "Mathf.SmoothDamp": "TweenService:Create",
     "Mathf.PingPong": "math.abs",
     "Mathf.PerlinNoise": "math.noise",
@@ -144,7 +144,7 @@ API_CALL_MAP: dict[str, str] = {
     "Vector3.Cross": ":Cross",
     "Vector3.Dot": ":Dot",
     "Vector3.Angle": "math.acos",
-    "Vector3.MoveTowards": ":Lerp",
+    "Vector3.MoveTowards": "vec3MoveTowards",  # handled by UTILITY_FUNCTIONS
     "Vector3.ClampMagnitude": ".Unit",
     "Vector3.SignedAngle": "vec3SignedAngle",  # handled by UTILITY_FUNCTIONS
     "Vector3.ProjectOnPlane": "vec3ProjectOnPlane",  # handled by UTILITY_FUNCTIONS
@@ -751,6 +751,18 @@ end""",
     "mathApproximately": """\
 local function mathApproximately(a, b)
 \treturn math.abs(a - b) < 1e-6
+end""",
+    "mathMoveTowards": """\
+local function mathMoveTowards(current, target, maxDelta)
+\tif math.abs(target - current) <= maxDelta then return target end
+\treturn current + math.sign(target - current) * maxDelta
+end""",
+    "vec3MoveTowards": """\
+local function vec3MoveTowards(current, target, maxDistanceDelta)
+\tlocal diff = target - current
+\tlocal dist = diff.Magnitude
+\tif dist <= maxDistanceDelta or dist < 1e-6 then return target end
+\treturn current + diff / dist * maxDistanceDelta
 end""",
     # LINQ utility functions
     "linqWhere": """\

@@ -1674,7 +1674,7 @@ class TestBareReceiverFixes:
         from converter.luau_validator import validate_and_fix
         source = '    while .Position.y > 5 do\n        task.wait()\n    end'
         fixed, _ = validate_and_fix("test", source)
-        assert 'while script.Parent.Position.y' in fixed
+        assert 'while script.Parent.Position.Y' in fixed
 
 
 class TestUnassignedCFrameFix:
@@ -1843,7 +1843,7 @@ class TestCommentEmbeddedVarFix:
         source = 'SetVelocity(ref velocity.x, input.x)'
         fixed, _ = validate_and_fix("test", source)
         assert 'ref ' not in fixed
-        assert 'velocity.x' in fixed
+        assert 'velocity.X' in fixed
 
     def test_tuple_unpacking(self):
         from converter.luau_validator import validate_and_fix
@@ -3687,3 +3687,240 @@ class TestValidatorBatch19:
         source = 'while true do\n    pos = pos + dir * dt\n    dt = task.wait()\nend'
         fixed, _ = validate_and_fix("test", source)
         assert 'local dt = 0' in fixed
+
+
+class TestValidatorBatch20:
+    """Tests for batch 20 validator fixes."""
+
+    def test_inline_materials_comment_assignment(self):
+        """Inline -- materials: comment on assignment line → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '    m_CoreMaterial = coreRenderer-- materials: use SurfaceAppearance[1]'
+        fixed, fixes = validate_and_fix("test", source)
+        assert '-- [Unity material' in fixed or 'materials' not in fixed.split('--')[0]
+
+    def test_inline_materials_comment_for_loop(self):
+        """Inline -- materials: comment in for loop → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '    for _, material in overrides[i]-- materials: use SurfaceAppearance do'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [Unity material' in fixed or fixed.lstrip().startswith('--')
+
+    def test_end_reserved_word_variable(self):
+        """local end = expr → local endPos = expr."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local end = Vector3.zAxis\nlocal pos = start:Lerp(end, t)'
+        fixed, fixes = validate_and_fix("test", source)
+        assert 'local endPos' in fixed
+        assert 'local end ' not in fixed
+
+    def test_trailing_comma_in_function_call(self):
+        """func(a, b,) → func(a, b)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'workspace:Raycast(origin, dir, dist,)'
+        fixed, _ = validate_and_fix("test", source)
+        assert ',)' not in fixed
+        assert 'dist)' in fixed
+
+    def test_assignment_in_if_condition(self):
+        """if count = value then → if count == value then."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if count = collections[name] then\n    print(count)\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert '==' in fixed
+        # Ensure we didn't break assignment lines
+        assert 'if count ==' in fixed or 'count  == ' in fixed
+
+    def test_assignment_in_if_no_false_positive(self):
+        """if x == y then should not be changed."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if x == y then\n    print(x)\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'x == y' in fixed
+
+    def test_math_random_zero_base(self):
+        """math.random(0, #arr) → math.random(1, #arr)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local idx = math.random(0, #clips)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'math.random(1, #clips)' in fixed
+
+    def test_vector_set_2arg(self):
+        """.Set(x, y) on Vector2 → Vector2.new assignment."""
+        from converter.luau_validator import validate_and_fix
+        source = 'm_Movement.Set(h, v)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'Vector2.new(h, v)' in fixed
+
+    def test_vector_set_3arg(self):
+        """.Set(x, y, z) on Vector3 → Vector3.new assignment."""
+        from converter.luau_validator import validate_and_fix
+        source = 'position.Set(x, y, z)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'Vector3.new(x, y, z)' in fixed
+
+    def test_csharp_attribute_strip(self):
+        """[HelpBox] before declaration → stripped."""
+        from converter.luau_validator import validate_and_fix
+        source = '[HelpBox] local helpString = "test"'
+        fixed, _ = validate_and_fix("test", source)
+        assert '[HelpBox]' not in fixed
+        assert 'local helpString' in fixed
+
+    def test_bounds_size(self):
+        """.bounds.size → .Size."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local s = m_Renderer.bounds.size'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'm_Renderer.Size' in fixed
+
+    def test_bounds_center(self):
+        """.bounds.center → .Position."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local c = m_Renderer.bounds.center'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'm_Renderer.Position' in fixed
+
+    def test_attached_rigidbody(self):
+        """.attachedRigidbody → part itself."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local rb = col.attachedRigidbody'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'col' in fixed
+        assert 'attachedRigidbody' not in fixed
+
+    def test_is_trigger_assignment(self):
+        """.isTrigger = true → .CanCollide = false."""
+        from converter.luau_validator import validate_and_fix
+        source = 'part.isTrigger = true'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'CanCollide = false' in fixed
+
+    def test_cframe_angles_2arg(self):
+        """CFrame.Angles(axis, speed) → expanded 3-arg form."""
+        from converter.luau_validator import validate_and_fix
+        source = 'script.Parent.CFrame = script.Parent.CFrame * CFrame.Angles(axis, speed * dt)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'axis.X' in fixed
+        assert 'axis.Y' in fixed
+        assert 'axis.Z' in fixed
+
+    def test_humanoid_move_to_direction(self):
+        """:Move(dir) → .MoveDirection = dir."""
+        from converter.luau_validator import validate_and_fix
+        source = 'control:Move(moveDirection * speed)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'MoveDirection' in fixed
+        assert ':Move(' not in fixed
+
+    def test_object_clone_with_arg(self):
+        """obj:Clone(prefab) → prefab:Clone()."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local copy = pool:Clone(prefab)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'prefab:Clone()' in fixed
+
+    def test_property_block_commented(self):
+        """GetPropertyBlock/SetPropertyBlock → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '    m_Renderer.GetPropertyBlock(m_Block)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [Unity material]' in fixed
+
+    def test_math_move_towards_mapping(self):
+        """Mathf.MoveTowards should map to mathMoveTowards utility."""
+        from converter.api_mappings import API_CALL_MAP
+        assert API_CALL_MAP["Mathf.MoveTowards"] == "mathMoveTowards"
+
+    def test_vec3_move_towards_mapping(self):
+        """Vector3.MoveTowards should map to vec3MoveTowards utility."""
+        from converter.api_mappings import API_CALL_MAP
+        assert API_CALL_MAP["Vector3.MoveTowards"] == "vec3MoveTowards"
+
+    def test_math_move_towards_utility(self):
+        """mathMoveTowards utility function exists."""
+        from converter.api_mappings import UTILITY_FUNCTIONS
+        assert "mathMoveTowards" in UTILITY_FUNCTIONS
+        assert "math.sign" in UTILITY_FUNCTIONS["mathMoveTowards"]
+
+    def test_vec3_move_towards_utility(self):
+        """vec3MoveTowards utility function exists."""
+        from converter.api_mappings import UTILITY_FUNCTIONS
+        assert "vec3MoveTowards" in UTILITY_FUNCTIONS
+        assert "Magnitude" in UTILITY_FUNCTIONS["vec3MoveTowards"]
+
+    def test_broken_table_insertion(self):
+        """Broken table insertion tbl[{k=v] = k2 = v2} → table.insert."""
+        from converter.luau_validator import validate_and_fix
+        source = 'savedStates[{ position = player.Position] = rotation = player.CFrame }'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'table.insert(savedStates' in fixed
+        assert 'position = player.Position' in fixed
+        assert 'rotation = player.CFrame' in fixed
+
+    def test_broken_removerange_for_loop(self):
+        """RemoveRange for-loop with do inside math.max → fixed."""
+        from converter.luau_validator import validate_and_fix
+        source = 'for _i = 1, math.max(0, #savedStates - 8 do table.remove(savedStates, 0 + 1) end -- RemoveRange)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'math.max(0, #savedStates - 8)' in fixed
+        assert 'table.remove(savedStates, 1)' in fixed
+
+    def test_pause_input_mapping(self):
+        """IsKeyDown("Pause") → IsKeyDown(Enum.KeyCode.P)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'm_Pause = UserInputService:IsKeyDown("Pause")'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'Enum.KeyCode.P' in fixed
+
+    def test_generic_string_keydown(self):
+        """IsKeyDown("SomeName") → IsKeyDown(Enum.KeyCode.SomeName)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local x = UserInputService:IsKeyDown("Pickup")'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'Enum.KeyCode.Pickup' in fixed
+        assert '"Pickup"' not in fixed
+
+    def test_add_with_table_literal(self):
+        """.Add({key=val}) should produce table.insert, not dict assignment."""
+        from converter.luau_validator import validate_and_fix
+        source = 'list.Add({name = "test", value = 42})'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'table.insert(list' in fixed
+
+    def test_missing_module_return(self):
+        """Module script with local Name = {} should get return Name appended."""
+        from converter.luau_validator import validate_and_fix
+        source = '-- class Foo\nlocal Foo = {}\nlocal x = 1\n'
+        fixed, fixes = validate_and_fix("test", source)
+        assert 'return Foo' in fixed
+
+    def test_module_return_not_duplicated(self):
+        """Module script that already has return Name should not get duplicate."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local Foo = {}\nlocal x = 1\nreturn Foo\n'
+        fixed, _ = validate_and_fix("test", source)
+        assert fixed.count('return Foo') == 1
+
+    def test_module_return_prefers_script_name(self):
+        """When multiple local X = {} exist, prefer the one matching script name."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local Helper = {}\nlocal GameManager = {}\n'
+        fixed, _ = validate_and_fix("GameManager", source)
+        assert 'return GameManager' in fixed
+
+    def test_not_neq_nil_precedence_fix(self):
+        """not expr ~= nil → expr == nil (precedence bug)."""
+        from converter.luau_validator import validate_and_fix
+        source = 'if not m_Cameras[cam] ~= nil then\n    m_Cameras[cam] = false\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'm_Cameras[cam] == nil' in fixed
+        assert 'not' not in fixed.split('then')[0]
+
+    def test_attached_rigidbody_bracket_access(self):
+        """.attachedRigidbody on bracket-accessed array → stripped."""
+        from converter.luau_validator import validate_and_fix
+        source = 'm_Cols[n].attachedRigidbody:ApplyImpulse(force)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'attachedRigidbody' not in fixed
+        assert 'm_Cols[n]:ApplyImpulse(force)' in fixed
