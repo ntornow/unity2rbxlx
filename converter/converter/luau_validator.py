@@ -803,7 +803,7 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
     # This happens when TYPE_MAP replaces a type in the middle of a variable name
     # e.g., m_IgnoreNavMeshAgent → m_Ignore-- NavMeshAgent: use Roblox PathfindingService
     # NOTE: only match varName ending with a letter/digit (not `m_--` which is handled separately below)
-    if re.search(r'[a-zA-Z0-9]-- [A-Z]', source):
+    if re.search(r'[a-zA-Z0-9]-- [A-Z]', source) or re.search(r'\w+--\s*\w[^=\n]*=\s*\w', source):
         def _fix_embedded_comment(m):
             indent = m.group(1)
             varname = m.group(2)
@@ -816,7 +816,17 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
             source,
             flags=re.MULTILINE,
         )
+        # Handle: `_var-- comment: text = value` (non-local, with assignment)
+        # e.g., `_agent-- isStopped: track manually = false`
+        # Exclude m_-- which is handled by a separate dedicated handler below
+        source = re.sub(
+            r'^(\s*)(\w+[a-zA-Z0-9])--\s*\w[^=\n]*=\s*([^\n]+)$',
+            r'\1\2 = \3 -- (property comment removed)',
+            source,
+            flags=re.MULTILINE,
+        )
         # Also handle bare references in non-local context: varName-- TypeComment: → varName
+        # Only uppercase type names to avoid catching lowercase properties in conditions
         source = re.sub(r'(\w*[a-zA-Z0-9])-- [A-Z]\w+:[^\n]*', r'\1', source)
 
     # Pattern: "m_-- TypeComment: explanation" → comment out the whole line
@@ -839,6 +849,17 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
         # Any other m_-- patterns → comment out
         source = re.sub(r'm_--[^\n]*', '-- (type comment removed)', source)
         fixes.append("Fixed comment-embedded variable names (m_--)")
+
+    # Fix `_-- Comment: text` pattern (underscore + comment from method mapping)
+    # e.g., `_-- PlayableDirector.Play: trigger animation sequence`
+    if re.search(r'^\s+_-- ', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s+)_-- (.*)$',
+            r'\1-- \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Fixed _-- comment pattern")
 
     # Fix broken generic type in angle brackets: <-- TypeComment: explanation>()
     # Pattern: FindFirstChildOfClass<-- NavMeshAgent: ...>() → :FindFirstChildOfClass("Instance")
@@ -3820,9 +3841,9 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
 
     # Comment out C# LayerMask bitwise operations (not applicable in Roblox)
     # Pattern: `layers.Value & 1 << otherPart.CollisionGroup` or similar bitshift mask checks
-    if re.search(r'&\s*1\s*<<|<<\s*\d+\s*&|LayerMask', source):
+    if re.search(r'&\s*1\s*<<|<<\s*\d+\s*&|1\s*<<\s*\w.*&|LayerMask', source):
         source = re.sub(
-            r'^(\s*)(?!--)(.+(?:&\s*1\s*<<|<<\s*\d+\s*&).+)$',
+            r'^(\s*)(?!--)(.+(?:&\s*1\s*<<|<<\s*\d+\s*&|1\s*<<\s*\w+[^&\n]*&).+)$',
             r'\1-- [Unity LayerMask] \2',
             source,
             flags=re.MULTILINE,
@@ -4031,6 +4052,17 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             flags=re.MULTILINE,
         )
         fixes.append("Commented out incomplete bit-shift expressions")
+
+    # Fix if-condition with RHS in comment: `if expr == -- comment ... then`
+    # The `then` is inside the comment, so the if has no then keyword
+    if re.search(r'\bif\b.*==\s*--.*\bthen\b', source):
+        source = re.sub(
+            r'^(\s*)if\b.*==\s*--.*\bthen\b.*$',
+            lambda m: f'{m.group(1)}-- [broken comparison] {m.group(0).strip()}',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out if-condition with comparison RHS in comment")
 
     # Fix incomplete assignment from comment: `var = -- comment: text`
     # where var is assigned a comment (the expression was lost)
@@ -4629,6 +4661,11 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     # Fix C# cast: `(TypeName)expr` on assignment → just `expr`
     if re.search(r'\(Data<\w+>\)', source):
         source = re.sub(r'\(Data<\w+>\)(\w+)', r'\1', source)
+    # General PascalCase cast: `(PascalCaseType)expr` → `expr`
+    # Only in if-conditions and assignments, not standalone parens
+    if re.search(r'\([A-Z][a-zA-Z]+\)\w', source):
+        source = re.sub(r'\(([A-Z][a-zA-Z]+)\)(\w)', r'\2', source)
+        fixes.append("Stripped C# type casts")
 
     # Fix `string script.Parent[string key]` (C# indexer) → comment out
     if re.search(r'^\s+string\s+script\.Parent\s*\[', source, re.MULTILINE):
