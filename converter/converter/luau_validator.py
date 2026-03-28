@@ -4453,6 +4453,16 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             flags=re.MULTILINE,
         )
 
+    # Fix C# attribute brackets without parens followed by type declaration:
+    # `[ReadOnly] Damageable currentTarget;` or `[TextArea] string description`
+    if re.search(r'^\s+\[\w+\]\s+\w', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s+)(\[\w+\]\s+.*)$',
+            r'\1-- [C# attribute] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+
     # Fix C# `where T : Base` generic constraints (standalone or on method declaration line)
     if 'where ' in source and re.search(r'\bwhere\s+\w+\s*:', source):
         # Standalone: `where T : Base` on its own line
@@ -4902,6 +4912,14 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         if new_source != source:
             source = new_source
             fixes.append("Fixed broken new GameObject constructor patterns")
+
+    # Fix: C# `//` comments → Luau `--` comments
+    if '//' in source:
+        source = re.sub(r'^(\s*)//(.*)', r'\1--\2', source, flags=re.MULTILINE)
+
+    # Fix: C# Unicode escape `\uXXXX` → Luau `\u{XXXX}`
+    if '\\u' in source:
+        source = re.sub(r'\\u([0-9a-fA-F]{4})', r'\\u{\1}', source)
 
     if source != original:
         fixes.append("Fixed common API mistakes")
