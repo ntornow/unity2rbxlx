@@ -4275,6 +4275,10 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     if ',)' in source:
         source = re.sub(r',\s*\)', ')', source)
         fixes.append("Fixed trailing commas in function calls")
+    # Fix trailing comma on variable declaration: `local x = 5,` → `local x = 5`
+    if re.search(r'local \w+ = .+,\s*$', source, re.MULTILINE):
+        source = re.sub(r'^(\s*local \w+ = .+?),\s*$', r'\1', source, flags=re.MULTILINE)
+        fixes.append("Fixed trailing comma on local declaration")
 
     # Fix `table.remove(arr, , #)` → `table.remove(arr, #arr)` (pop last)
     if 'table.remove(' in source and ', , #)' in source:
@@ -5317,6 +5321,27 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
     if re.search(r'^\s*\{\s*$', source, re.MULTILINE):
         source = re.sub(r'^\s*\{\s*$', '', source, flags=re.MULTILINE)
         fixes.append("Stripped stray { braces")
+    # Strip standalone `}` but NOT `} -- enum/class` or inside tables
+    if re.search(r'^\s*\}\s*$', source, re.MULTILINE):
+        # Only strip if not preceded by a table entry (key = value,)
+        lines_brace = source.split('\n')
+        new_lines_brace = []
+        for idx_b, bl in enumerate(lines_brace):
+            if bl.strip() == '}':
+                # Check if preceded by table-like entries
+                prev_is_table = False
+                for k in range(idx_b - 1, max(idx_b - 5, -1), -1):
+                    pk = lines_brace[k].strip()
+                    if not pk or pk.startswith('--'):
+                        continue
+                    if re.match(r'\w+\s*=\s*.+,\s*$', pk) or pk.endswith(','):
+                        prev_is_table = True
+                    break
+                if not prev_is_table:
+                    new_lines_brace.append('')
+                    continue
+            new_lines_brace.append(bl)
+        source = '\n'.join(new_lines_brace)
 
     # Strip inline `{ ` after `then` / `do` (C# block opener inside Luau control flow)
     # e.g., `if (cond) then { return false end` → `if (cond) then return false end`
