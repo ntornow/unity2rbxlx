@@ -826,6 +826,91 @@ class TestLuauValidator:
         assert '"AudioSource"' not in fixed
 
 
+    def test_fix_script_parent_as_param(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local function Dummy(script.Parent)\n    return script.Parent.Name\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert "function Dummy(obj)" in fixed
+        assert "script.Parent" not in fixed.split("(")[0]  # not in param list
+
+    def test_fix_script_parent_as_param_with_others(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local function Contains(layers, script.Parent)\n    return layers\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert "function Contains(layers, obj)" in fixed
+
+    def test_fix_unary_plus(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local v = Vector3.new(+x, -y, +z)'
+        fixed, _ = validate_and_fix("test", source)
+        assert "Vector3.new(x, -y, z)" in fixed
+        assert "+x" not in fixed
+
+    def test_fix_multiline_string(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local helpString = "\nRemember to do something\n"'
+        fixed, _ = validate_and_fix("test", source)
+        assert "-- [multiline string]" in fixed
+
+    def test_fix_incomplete_table_constructor(self):
+        from converter.luau_validator import validate_and_fix
+        source = '    local msg = nil\n        amount = 5,\n        name = "test",\n    }'
+        fixed, _ = validate_and_fix("test", source)
+        assert "msg = {" in fixed
+        assert "amount = 5" in fixed
+        assert "name = \"test\"" in fixed
+
+    def test_fix_if_condition_with_comment(self):
+        from converter.luau_validator import validate_and_fix
+        source = '    if -- LayerMask: use CollisionGroups == "Default" then\n        x = 1\n    end'
+        fixed, _ = validate_and_fix("test", source)
+        assert "-- [broken condition]" in fixed
+
+    def test_fix_if_expr_parens(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local x = dt * (if (func(arg)) then 10 else 3)'
+        fixed, _ = validate_and_fix("test", source)
+        assert "(if func(arg) then 10 else 3)" in fixed
+
+    def test_fix_if_expr_simple_parens_preserved(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local x = (if (a > b) then 1 else 0)'
+        fixed, _ = validate_and_fix("test", source)
+        # Simple condition parens should be preserved
+        assert "(if (a > b) then" in fixed or "(if a > b then" in fixed
+
+    def test_fix_or_then_broken_condition(self):
+        from converter.luau_validator import validate_and_fix
+        source = '    if x == 1 or then\n        y == 2)\n        doStuff()\n    end'
+        fixed, _ = validate_and_fix("test", source)
+        assert "-- [broken condition]" in fixed
+
+    def test_fix_broken_comparison_greater_then(self):
+        from converter.luau_validator import validate_and_fix
+        source = '    if value > then\n        otherValue)\n        doStuff()\n    end'
+        fixed, _ = validate_and_fix("test", source)
+        assert "-- [broken comparison]" in fixed
+
+    def test_fix_matrix_setcolumn(self):
+        from converter.luau_validator import validate_and_fix
+        source = '    mat.SetColumn(0, x)\n    mat.SetColumn(1, y)'
+        fixed, _ = validate_and_fix("test", source)
+        assert "-- [Unity Matrix]" in fixed
+
+    def test_fix_play_clip_at_point(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'audio:Play()ClipAtPoint(clip, pos)'
+        fixed, _ = validate_and_fix("test", source)
+        assert ":Play()" in fixed
+        assert "ClipAtPoint" not in fixed
+
+    def test_fix_chained_assignment(self):
+        from converter.luau_validator import validate_and_fix
+        source = '    clip = clips[fxName] = AudioClip.Create("test")'
+        fixed, _ = validate_and_fix("test", source)
+        assert "-- [C# chained assignment]" in fixed or "-- [Unity AudioClip]" in fixed
+
+
 class TestMeshSizing:
     """Tests for mesh size computation."""
 

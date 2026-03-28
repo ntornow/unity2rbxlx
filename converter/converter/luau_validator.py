@@ -166,6 +166,7 @@ def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
     source = _fix_common_api_mistakes(name, source, fixes)
     source = _fix_structural_syntax(name, source, fixes)
     source = _fix_missing_end_keywords(name, source, fixes)
+    source = _fix_missing_function_end(name, source, fixes)
     source = _fix_undefined_module_return(name, source, fixes)
     source = _fix_missing_module_return(name, source, fixes)
     # Second pass: catch patterns introduced by structural fixes
@@ -4404,22 +4405,28 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         fixes.append("Commented out standalone if-expressions (dead code)")
 
     # Fix C# PascalCase type + variable: `LineRenderer LR` or `BatchProcessor s_Instance`
+    # Also handles: `PathMovementData _pathMovementData = nil` (with assignment)
     # where first word is PascalCase and second is a valid identifier (any case)
-    if re.search(r'^\s+[A-Z]\w+\s+\w+\s*$', source, re.MULTILINE):
+    _LUAU_KEYWORDS = {'local', 'function', 'return', 'if', 'for', 'while', 'end',
+                      'else', 'elseif', 'then', 'do', 'repeat', 'until', 'not',
+                      'and', 'or', 'true', 'false', 'nil', 'script', 'game',
+                      'workspace', 'task', 'table', 'math', 'string', 'Vector3',
+                      'Vector2', 'CFrame', 'Color3', 'Enum', 'Instance', 'require'}
+    if re.search(r'^\s+[A-Z]\w+\s+\w+', source, re.MULTILINE):
         def _fix_pascal_decl(m):
             indent = m.group(1)
             type_name = m.group(2)
             var_name = m.group(3)
-            # Skip if it looks like a Luau statement (function, return, if, etc.)
-            if type_name.lower() in ('local', 'function', 'return', 'if', 'for', 'while', 'end',
-                                      'else', 'elseif', 'then', 'do', 'repeat', 'until', 'not',
-                                      'and', 'or', 'true', 'false', 'nil', 'script', 'game',
-                                      'workspace', 'task', 'table', 'math', 'string', 'Vector3',
-                                      'Vector2', 'CFrame', 'Color3', 'Enum', 'Instance', 'require'):
+            assign = m.group(4) or ''
+            # Skip if it looks like a Luau statement
+            if type_name.lower() in _LUAU_KEYWORDS:
                 return m.group(0)
+            if assign.strip():
+                # Has assignment: `Type var = expr` → `local var = expr`
+                return f'{indent}local {var_name} {assign.strip()}'
             return f'{indent}local {var_name} = nil'
         source = re.sub(
-            r'^(\s+)([A-Z]\w+)\s+(\w+)\s*$',
+            r'^(\s+)([A-Z]\w+)\s+(\w+)((?:\s*=\s*.+)?)\s*$',
             _fix_pascal_decl,
             source,
             flags=re.MULTILINE,
@@ -4428,9 +4435,10 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
 
     # Fix PascalCase.PascalCase type + variable: `Gamekit3.PlayerController player`
     # Also handles multi-dot: `Gamekit3.InventoryController.InventoryChecker inventoryCheck`
-    if re.search(r'^\s+[A-Z]\w+(?:\.\w+)+\s+\w+\s*$', source, re.MULTILINE):
+    # And with assignment: `Vehicle.SeatAlignment align = nil`
+    if re.search(r'^\s+[A-Z]\w+(?:\.\w+)+\s+\w+', source, re.MULTILINE):
         source = re.sub(
-            r'^(\s+)[A-Z]\w+(?:\.\w+)+\s+(\w+)\s*$',
+            r'^(\s+)[A-Z]\w+(?:\.\w+)+\s+(\w+)(?:\s*=\s*.+)?\s*$',
             r'\1local \2 = nil',
             source,
             flags=re.MULTILINE,
@@ -4503,6 +4511,397 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             source,
             flags=re.MULTILINE,
         )
+
+    # Fix: script.Parent as function parameter name (from C# extension method `this` param)
+    # `function Foo(script.Parent)` → `function Foo(obj)`
+    # `function Foo(script.Parent, x, y)` → `function Foo(obj, x, y)`
+    # `function Foo(layers, script.Parent)` → `function Foo(layers, obj)`
+    if 'script.Parent)' in source or 'script.Parent,' in source:
+        def _fix_script_parent_param(m):
+            prefix = m.group(1)
+            params = m.group(2)
+            # Replace script.Parent with obj in parameter list
+            params = re.sub(r'\bscript\.Parent\b', 'obj', params)
+            return f'{prefix}{params})'
+        source = re.sub(
+            r'((?:local\s+)?function\s+\w+\()([^)]*\bscript\.Parent\b[^)]*)\)',
+            _fix_script_parent_param,
+            source,
+        )
+
+    # Fix: broken comparison `> then` / `< then` where RHS leaked to next line
+    # `if expr > then\n    value)` → comment out (broken expression)
+    if re.search(r'[><!]=?\s+then\s*$', source, re.MULTILINE):
+        lines = source.split('\n')
+        result = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            # Match: `if ... > then` or `... >= then` etc (comparison missing RHS)
+            if re.search(r'(?:>|<|>=|<=|==|~=)\s+then\s*$', line.rstrip()):
+                indent = len(line) - len(line.lstrip())
+                pad = ' ' * indent
+                result.append(f'{pad}-- [broken comparison] {line.strip()}')
+                # Also comment following continuation line(s) that were the leaked RHS
+                while i + 1 < len(lines):
+                    next_line = lines[i + 1]
+                    next_stripped = next_line.strip()
+                    # continuation: indented value ending with ) or just a value
+                    if next_stripped and not next_stripped.startswith('--') and not re.match(r'(?:local|if|for|while|function|end|else|elseif|return)\b', next_stripped):
+                        next_indent = len(next_line) - len(next_line.lstrip())
+                        if next_indent > indent:
+                            result.append(f'{" " * next_indent}-- [broken comparison] {next_stripped}')
+                            i += 1
+                            continue
+                    break
+            else:
+                result.append(line)
+            i += 1
+        new_source = '\n'.join(result)
+        if new_source != source:
+            source = new_source
+            fixes.append("Fixed broken comparison with missing RHS")
+
+    # Fix: multiline C# string literal (unclosed quote)
+    # `local helpString = "` followed by text on next lines then `"`
+    # → comment out the whole thing
+    if re.search(r'local\s+\w+\s*=\s*"[^"]*$', source, re.MULTILINE):
+        lines = source.split('\n')
+        result = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            # Detect: `local var = "something` without closing quote
+            if re.match(r'\s*local\s+\w+\s*=\s*"[^"]*$', line):
+                indent = len(line) - len(line.lstrip())
+                pad = ' ' * indent
+                result.append(f'{pad}-- [multiline string] {stripped}')
+                # Comment out lines until closing quote found
+                while i + 1 < len(lines):
+                    i += 1
+                    next_line = lines[i]
+                    next_stripped = next_line.strip()
+                    next_indent = len(next_line) - len(next_line.lstrip()) if next_line.strip() else indent
+                    result.append(f'{" " * next_indent}-- [multiline string] {next_stripped}')
+                    if '"' in next_stripped:
+                        break
+            else:
+                result.append(line)
+            i += 1
+        new_source = '\n'.join(result)
+        if new_source != source:
+            source = new_source
+            fixes.append("Fixed multiline C# string literals")
+
+    # Fix: broken `or` / `and` on continuation line without proper context
+    # `if (condition\n     or  condition2)` → join lines
+    # Pattern: line ends with incomplete condition, next line starts with `or` or `and`
+    if re.search(r'^\s+or\s+', source, re.MULTILINE):
+        lines = source.split('\n')
+        result = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            # Check if next line starts with `or ` or `and ` (continuation)
+            if i + 1 < len(lines):
+                next_stripped = lines[i + 1].strip()
+                if re.match(r'^(?:or|and)\s+', next_stripped):
+                    # Check if current line is an if/elseif condition or assignment
+                    cur_stripped = line.rstrip()
+                    # If current line ends with an incomplete expression (no `then`, no `do`, no `)`)
+                    if (re.search(r'(?:if|elseif|while)\s.*[^)]\s*$', cur_stripped) or
+                        cur_stripped.endswith('PathPartial') or
+                        cur_stripped.endswith('PathInvalid') or
+                        re.search(r'==\s*\w+\s*$', cur_stripped)):
+                        # Join the continuation line
+                        joined = line.rstrip() + ' ' + next_stripped
+                        result.append(joined)
+                        i += 2
+                        continue
+            result.append(line)
+            i += 1
+        new_source = '\n'.join(result)
+        if new_source != source:
+            source = new_source
+            fixes.append("Fixed broken or/and continuation lines")
+
+    # Fix: incomplete table constructor: `local msg = nil` followed by `key = value,` lines then `}`
+    # From C# `var msg = new DamageMessage { amount = 1, ... }`
+    # Pattern: `local var = nil` then indented `key = val,` lines then `}`
+    if re.search(r'local\s+\w+\s*=\s*nil\s*$', source, re.MULTILINE):
+        lines = source.split('\n')
+        result = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            # Detect: `local var = nil`
+            m_nil = re.match(r'^(\s*)(local\s+(\w+)\s*=\s*)nil\s*$', line)
+            if m_nil and i + 1 < len(lines):
+                # Look ahead for table entry pattern (key = value,)
+                next_stripped = lines[i + 1].strip()
+                if re.match(r'\w+\s*=\s*.+[,]?\s*$', next_stripped) and not re.match(r'local\s+', next_stripped):
+                    # Collect table entries
+                    indent = m_nil.group(1)
+                    var_decl = m_nil.group(2)
+                    entries = []
+                    j = i + 1
+                    while j < len(lines):
+                        entry_stripped = lines[j].strip()
+                        if entry_stripped == '}' or entry_stripped == '},':
+                            j += 1
+                            break
+                        if re.match(r'\w+\s*=\s*.+', entry_stripped):
+                            entries.append(entry_stripped.rstrip(','))
+                            j += 1
+                        else:
+                            break
+                    if entries:
+                        # Build table literal
+                        result.append(f'{indent}{var_decl}{{')
+                        entry_indent = indent + '    '
+                        for k, entry in enumerate(entries):
+                            comma = ',' if k < len(entries) - 1 else ''
+                            result.append(f'{entry_indent}{entry}{comma}')
+                        result.append(f'{indent}}}')
+                        i = j
+                        continue
+            result.append(line)
+            i += 1
+        new_source = '\n'.join(result)
+        if new_source != source:
+            source = new_source
+            fixes.append("Fixed incomplete table constructors")
+
+    # Fix: `= new[]` C# array initializer over multiple lines → `= { values }`
+    if '= new[]' in source:
+        lines = source.split('\n')
+        result = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if '= new[]' in line:
+                indent_m = re.match(r'^(\s*)', line)
+                indent = indent_m.group(1) if indent_m else ''
+                # Replace `new[]` with `{`
+                new_line = line.replace('= new[]', '= {')
+                result.append(new_line)
+                # Collect entries until blank line or less-indented line
+                while i + 1 < len(lines):
+                    next_line = lines[i + 1]
+                    next_stripped = next_line.strip()
+                    if not next_stripped:
+                        # Close the table before blank line
+                        result.append(f'{indent}}}')
+                        break
+                    next_indent = len(next_line) - len(next_line.lstrip())
+                    if next_indent <= len(indent):
+                        result.append(f'{indent}}}')
+                        break
+                    result.append(next_line)
+                    i += 1
+            else:
+                result.append(line)
+            i += 1
+        new_source = '\n'.join(result)
+        if new_source != source:
+            source = new_source
+            fixes.append("Fixed C# new[] array initializer → table literal")
+
+    # Fix: C# unary + operator (not valid in Luau)
+    # `Vector3.new(+x, -y, +z)` → `Vector3.new(x, -y, z)`
+    # Pattern: `(+var` or `,+var` or `, +var` (after opening paren or comma)
+    if re.search(r'[,(]\s*\+[a-zA-Z_]', source):
+        source = re.sub(r'([,(]\s*)\+([a-zA-Z_])', r'\1\2', source)
+        fixes.append("Fixed unary + operator (not valid in Luau)")
+
+    # Fix: `if -- comment ... then` (comment embedded in if-condition)
+    # The whole condition is broken — comment out the line
+    if re.search(r'\bif\s+--\s', source):
+        source = re.sub(
+            r'^(\s*)if\s+--\s.*$',
+            lambda m: f'{m.group(1)}-- [broken condition] {m.group(0).strip()}',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Fixed if-condition with embedded comment")
+
+    # Fix: `:Method()` at start of expression (bare colon method after comma/space)
+    # `360 / :GetChildren()` → `360 / #script.Parent:GetChildren()`
+    # `:Cross(x, y)` → `script.Parent.CFrame.RightVector:Cross(x, y)` (too specific, just prepend script.Parent)
+    if re.search(r'(?:^|[\s,/\*\+\-=\(]):\w+\(', source, re.MULTILINE):
+        # Match bare `:Method()` that's not preceded by a word char or `)`
+        source = re.sub(
+            r'(?<![)\w])(:(?:GetChildren|GetDescendants)\(\))',
+            r'script.Parent\1',
+            source,
+        )
+        source = re.sub(
+            r'(?<![)\w])(:Cross\()',
+            r'Vector3.zero\1',
+            source,
+        )
+
+    # Fix: `{ --comment` on its own as stray brace (C# block opener with comment)
+    # Only when it's the start of a line (not inside an expression)
+    if re.search(r'^\s*\{\s*--', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s*)\{\s*(--.*)',
+            r'\1\2',
+            source,
+            flags=re.MULTILINE,
+        )
+
+    # Fix: `clips[key] = expr` as RHS of another assignment
+    # `clip = clips[fxName] = AudioClip.Create(...)` → comment (C# chained assignment)
+    if re.search(r'=\s*\w+\[.+\]\s*=\s*\w', source):
+        source = re.sub(
+            r'^(\s*)(\w+\s*=\s*\w+\[.+?\]\s*=\s*.+)$',
+            r'\1-- [C# chained assignment] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+
+    # Fix: `.SetColumn`/`.SetRow` (Matrix4x4 method) → comment out
+    if '.SetColumn(' in source or '.SetRow(' in source:
+        source = re.sub(
+            r'^(\s*)(\w+\.Set(?:Column|Row)\(.*)$',
+            r'\1-- [Unity Matrix] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+
+    # Fix: `(if (func(...)) then` → `(if func(...) then` (extra parens break Luau if-expression)
+    # Only strip when the condition contains a function call (with nested parens), since
+    # `(if (simple_cond) then` is valid Luau but `(if (func(args)) then` confuses the parser
+    if '(if (' in source:
+        def _fix_if_expr_parens(m):
+            full = m.group(0)
+            prefix = m.group(1)  # `(if `
+            rest = m.group(2)    # `(cond) then ...`
+            # Find matching closing paren for the outer condition parens
+            depth = 0
+            for idx, ch in enumerate(rest):
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                    if depth == 0:
+                        inner_cond = rest[1:idx]
+                        # Only strip if inner condition has nested parens (function call)
+                        if '(' in inner_cond:
+                            after = rest[idx+1:]
+                            return f'{prefix}{inner_cond}{after}'
+                        return full  # simple condition, leave as-is
+            return full
+        source = re.sub(r'(\(if\s+)(\((?:[^()]*|\([^()]*\))*\)\s+then\b)', _fix_if_expr_parens, source)
+
+    # Fix: `or then` at end of if-condition (broken multi-line condition)
+    # `elseif (... or then\n  continuation)` → comment out broken line + continuation
+    if ' or then' in source:
+        lines = source.split('\n')
+        result = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if ' or then' in line:
+                indent = len(line) - len(line.lstrip())
+                pad = ' ' * indent
+                result.append(f'{pad}-- [broken condition] {line.strip()}')
+                # Comment continuation lines
+                while i + 1 < len(lines):
+                    next_line = lines[i + 1]
+                    next_stripped = next_line.strip()
+                    next_indent = len(next_line) - len(next_line.lstrip()) if next_stripped else 0
+                    if next_stripped and next_indent > indent and not re.match(r'(?:local|if|for|while|function|end|else|elseif|return)\b', next_stripped):
+                        result.append(f'{" " * next_indent}-- [broken condition] {next_stripped}')
+                        i += 1
+                    else:
+                        break
+            else:
+                result.append(line)
+            i += 1
+        source = '\n'.join(result)
+
+    # Fix: `.SetData(` / `.GetData(` (Unity AudioClip methods) → comment out
+    if '.SetData(' in source or '.GetData(' in source:
+        source = re.sub(
+            r'^(\s*)(.+\.(?:Set|Get)Data\(.*)$',
+            r'\1-- [Unity AudioClip] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+
+    # Fix: `AudioClip.Create(` → comment out (Unity-only)
+    if 'AudioClip.Create(' in source:
+        source = re.sub(
+            r'^(\s*)(.+AudioClip\.Create\(.*)$',
+            r'\1-- [Unity AudioClip] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+
+    # Fix: `:Play()ClipAtPoint(` → `:Play()` (broken method chain)
+    if ':Play()ClipAtPoint(' in source:
+        source = re.sub(r':Play\(\)ClipAtPoint\([^)]*\)', ':Play()', source)
+
+    # Fix: broken `new GameObject("name", ...)` → string assignment
+    # Pattern: `local go = ("string" .. expr .. "string"\n "extra", "args")`
+    # The extra component type args from C# constructor leak as dangling strings
+    if re.search(r'local\s+go\s*=\s*\(?"', source):
+        lines = source.split('\n')
+        result = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            # Detect: `local go = ("string ...` without closing `)` on same line
+            m_go = re.match(r'^(\s*)(local\s+go\s*=\s*)\((".*\.\.\s*\w+)\s*$', line)
+            if m_go:
+                indent = m_go.group(1)
+                decl = m_go.group(2)
+                expr = m_go.group(3)
+                result.append(f'{indent}{decl}{expr}')
+                # Skip continuation lines that are part of the constructor args
+                while i + 1 < len(lines):
+                    next_stripped = lines[i + 1].strip()
+                    if next_stripped.startswith('"') or next_stripped.startswith("'"):
+                        i += 1
+                        continue
+                    elif next_stripped.startswith('(') and '"' in next_stripped:
+                        i += 1
+                        continue
+                    break
+            else:
+                # Also fix: `local go =\n    ("string...)` split across lines
+                m_go2 = re.match(r'^(\s*)(local\s+go\s*=)\s*$', line)
+                if m_go2 and i + 1 < len(lines):
+                    next_stripped = lines[i + 1].strip()
+                    if next_stripped.startswith('("') and '..' in next_stripped:
+                        indent = m_go2.group(1)
+                        decl = m_go2.group(2)
+                        # Remove leading `(` from string expression
+                        expr = next_stripped[1:]  # strip the `(`
+                        # Remove trailing `)` if present
+                        expr = re.sub(r'\)\s*$', '', expr)
+                        result.append(f'{indent}{decl} {expr}')
+                        i += 1  # skip the `("string...` line
+                        # Skip further continuation lines
+                        while i + 1 < len(lines):
+                            cont = lines[i + 1].strip()
+                            if cont.startswith('"') or (cont.startswith('(') and '"' in cont):
+                                i += 1
+                                continue
+                            break
+                    else:
+                        result.append(line)
+                else:
+                    result.append(line)
+            i += 1
+        new_source = '\n'.join(result)
+        if new_source != source:
+            source = new_source
+            fixes.append("Fixed broken new GameObject constructor patterns")
 
     if source != original:
         fixes.append("Fixed common API mistakes")
@@ -4967,9 +5366,10 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
 
     # Comment out remaining C# property declarations with get/set that couldn't be parsed
     # These have comment interruptions or complex patterns the regex above can't handle
-    if re.search(r'^\s*(?:bool|int|float|string|[\w.]+)\s+\w.*\{\s*get\s*[\{;]', source, re.MULTILINE):
+    # Also handles: `Type Name { function(get) return ...` (from transpiler's property conversion)
+    if re.search(r'^\s*(?:bool|int|float|string|[\w.]+)\s+\w.*\{\s*(?:get\s*[\{;]|function\(get\))', source, re.MULTILINE):
         source = re.sub(
-            r'^(\s*)((?:bool|int|float|string|[\w.]+)\s+\w.*\{\s*get\s*[\{;].*)$',
+            r'^(\s*)((?:bool|int|float|string|[\w.]+)\s+\w.*\{\s*(?:get\s*[\{;]|function\(get\)).*)$',
             r'\1-- [#C] \2',
             source,
             flags=re.MULTILINE,
@@ -5344,6 +5744,42 @@ def _fix_missing_ends_in_blocks(source: str, fixes: list[str]) -> str:
     """
     # This is handled by _fix_missing_end_keywords — just a hook for future improvements
     return source
+
+
+def _fix_missing_function_end(name: str, source: str, fixes: list[str]) -> str:
+    """Insert missing `end` between consecutive local functions.
+
+    When a function ends with `return` but has no closing `end`, and the next
+    `local function` starts at same or lesser indentation, insert `end`.
+    Runs AFTER _fix_missing_end_keywords to avoid being removed by excess-end logic.
+    """
+    if not re.search(r'return\s+\w+.*\n(?:\s*\n)*\s*local\s+function\s+', source):
+        return source
+
+    lines = source.split('\n')
+    result = []
+    for i, line in enumerate(lines):
+        result.append(line)
+        if re.match(r'\s+return\s+\w+', line):
+            j = i + 1
+            has_end_between = False
+            while j < len(lines) and lines[j].strip() == '':
+                j += 1
+            # Check if there's an `end` between return and next function
+            if j < len(lines) and lines[j].strip() == 'end':
+                has_end_between = True
+                j += 1
+                while j < len(lines) and lines[j].strip() == '':
+                    j += 1
+            if not has_end_between and j < len(lines) and re.match(r'\s+local\s+function\s+', lines[j]):
+                ret_indent = len(line) - len(line.lstrip())
+                func_indent = len(lines[j]) - len(lines[j].lstrip())
+                if func_indent <= ret_indent:
+                    result.append(f'{" " * func_indent}end')
+    new_source = '\n'.join(result)
+    if new_source != source:
+        fixes.append("Fixed missing function end before next local function")
+    return new_source
 
 
 def _fix_undefined_module_return(name: str, source: str, fixes: list[str]) -> str:
