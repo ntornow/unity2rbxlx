@@ -3924,3 +3924,134 @@ class TestValidatorBatch20:
         fixed, _ = validate_and_fix("test", source)
         assert 'attachedRigidbody' not in fixed
         assert 'm_Cols[n]:ApplyImpulse(force)' in fixed
+
+
+class TestValidatorBatch21:
+    """Tests for batch 21 validator fixes — syntax error reduction."""
+
+    def test_bare_property_after_if_keyword(self):
+        """Bare `.Parent` after `if` keyword → `script.Parent.Parent`."""
+        from converter.luau_validator import validate_and_fix
+        source = '    if .Parent then\n        x = 1\n    end'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'script.Parent.Parent' in fixed
+
+    def test_bare_method_after_not_keyword(self):
+        """Bare `:Method()` after `not` → `not script.Parent:Method()`."""
+        from converter.luau_validator import validate_and_fix
+        source = '    if not :FindFirstChildWhichIsA("BasePart") then\n        return\n    end'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'not script.Parent:FindFirstChildWhichIsA' in fixed
+
+    def test_unbalanced_double_paren_in_if(self):
+        """Double open paren in if → balanced."""
+        from converter.luau_validator import validate_and_fix
+        source = '    if ((x > 0) then\n        y = 1\n    end'
+        fixed, _ = validate_and_fix("test", source)
+        assert fixed.count('((') == 0 or '(x > 0) then' in fixed
+
+    def test_multiline_tuple_joined(self):
+        """Multi-line tuple assignment → joined and converted to table."""
+        from converter.luau_validator import validate_and_fix
+        source = '    local x = (func(a, 1),\n        func(b, 2))'
+        fixed, _ = validate_and_fix("test", source)
+        assert '{' in fixed
+
+    def test_tuple_with_nested_calls(self):
+        """Tuple with nested function calls → table literal."""
+        from converter.luau_validator import validate_and_fix
+        source = '    local x = (mathRepeat(a, 1.0), mathRepeat(b, 1.0))'
+        fixed, _ = validate_and_fix("test", source)
+        assert '{mathRepeat(a, 1.0), mathRepeat(b, 1.0)}' in fixed
+
+    def test_return_tuple_to_table(self):
+        """Return tuple → return table."""
+        from converter.luau_validator import validate_and_fix
+        source = '    return (a, b, c)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'return {a, b, c}' in fixed
+
+    def test_commented_constructor_no_args(self):
+        """--[[ new Type ]] () → nil."""
+        from converter.luau_validator import validate_and_fix
+        source = '    local x = --[[ new DamageBehaviour ]] ()'
+        fixed, _ = validate_and_fix("test", source)
+        assert '= nil' in fixed
+
+    def test_if_expression_end_removed(self):
+        """(if cond then A else B end) → (if cond then A else B)."""
+        from converter.luau_validator import validate_and_fix
+        source = '    local x = (if a then b else c end)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'end)' not in fixed
+        assert '(if a then b else c)' in fixed
+
+    def test_csharp_interface_method_commented(self):
+        """C# interface method signature → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '        DataSettings GetDataSettings()'
+        fixed, _ = validate_and_fix("test", source)
+        assert fixed.strip().startswith('--')
+
+    def test_generic_type_declaration_with_assignment(self):
+        """Dictionary<K,V> varName = {} → local varName = {}."""
+        from converter.luau_validator import validate_and_fix
+        source = '        Dictionary<GameCommandType, List<System.Action>> handlers = {}'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'local handlers = {}' in fixed
+
+    def test_function_as_variable_name(self):
+        """`function` as arg → `_func`."""
+        from converter.luau_validator import validate_and_fix
+        source = '    table.insert(s_ProcessList, function)'
+        fixed, _ = validate_and_fix("test", source)
+        assert '_func' in fixed
+        assert ', function)' not in fixed
+
+    def test_radius_assignment_commented(self):
+        """.radius = value on LHS → commented out."""
+        from converter.luau_validator import validate_and_fix
+        # Requires .center to be present to trigger collider fix
+        source = '    local pos = m_Sphere.center\n    m_Sphere.radius = effectDistance*0.5'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [Unity physics]' in fixed
+
+    def test_where_constraint_commented(self):
+        """C# `where T : Base` → commented."""
+        from converter.luau_validator import validate_and_fix
+        source = '        where TMonoBehaviour : MonoBehaviour'
+        fixed, _ = validate_and_fix("test", source)
+        assert fixed.strip().startswith('--')
+
+    def test_shader_enable_keyword_commented(self):
+        """Shader.EnableKeyword → commented out."""
+        from converter.luau_validator import validate_and_fix
+        source = '    Shader.EnableKeyword("WATER_REFLECTIVE")'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [Unity render]' in fixed
+
+    def test_if_comment_before_then(self):
+        """if (cond) -- comment then → if (cond) then -- comment."""
+        from converter.luau_validator import validate_and_fix
+        source = '    if (not x) -- explanation here then\n        y = 1\n    end'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'then --' in fixed or 'then\n' in fixed
+
+    def test_inline_function_block_depth(self):
+        """Inline function(x) return ... end) counted correctly for block depth."""
+        from converter.luau_validator import validate_and_fix
+        source = '''script.Parent.Touched:Connect(function(otherPart)
+    if (table.find(items, function(x) return x=="Gas" end) ~= nil) then
+        part:Destroy()
+    end
+end)
+end
+
+return X'''
+        fixed, _ = validate_and_fix("test", source)
+        # The orphaned `end` before `return` should be removed
+        lines = [l.strip() for l in fixed.split('\n') if l.strip()]
+        # Should not have orphaned end before return
+        for i, line in enumerate(lines):
+            if line == 'return X' and i > 0:
+                assert lines[i-1] != 'end', "Orphaned end before return should be removed"

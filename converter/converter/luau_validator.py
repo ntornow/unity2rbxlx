@@ -225,6 +225,27 @@ def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
         )
     if re.search(r'\band\s+then\b', source):
         source = re.sub(r'\band\s+then\b', 'then', source)
+    # Comment out orphaned continuation lines from multi-line expressions
+    # where the first line was commented out (e.g., `-- [Unity] if ... or\n  not expr)`)
+    new_lines_cont = []
+    prev_was_comment_continuing = False
+    for line in source.split('\n'):
+        stripped = line.strip()
+        if prev_was_comment_continuing:
+            # This line is a continuation — comment it out too
+            indent = line[:len(line) - len(line.lstrip())]
+            new_lines_cont.append(f'{indent}-- [continuation] {stripped}')
+            # Check if this continuation also continues (ends with `or`/`and` before `)`)
+            prev_was_comment_continuing = bool(re.search(r'\b(?:or|and)\s*$', stripped))
+        else:
+            new_lines_cont.append(line)
+        # Check if current (original) line is a comment that ends with `or` or `and`
+        if stripped.startswith('--') and re.search(r'\b(?:or|and)\s*$', stripped):
+            prev_was_comment_continuing = True
+        elif not prev_was_comment_continuing:
+            prev_was_comment_continuing = False
+    source = '\n'.join(new_lines_cont)
+
     source = _fix_startup_race_conditions(name, source, fixes)
     source = _inject_utility_functions(name, source, fixes)
 
@@ -459,6 +480,32 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
 
     # Strip BOM characters
     source = source.replace('\ufeff', '')
+
+    # Join multi-line C# ternary: `expr)\n    ? value_a\n    : value_b` → single line
+    if re.search(r'^\s+\?\s+\w', source, re.MULTILINE):
+        lines_tern = source.split('\n')
+        new_lines_tern = []
+        i_tern = 0
+        while i_tern < len(lines_tern):
+            line_t = lines_tern[i_tern]
+            # Check if next line starts with `? ` (C# ternary continuation)
+            if (i_tern + 1 < len(lines_tern)
+                    and re.match(r'^\s+\?\s+', lines_tern[i_tern + 1])):
+                # Join this line + ? line + : line
+                joined = line_t.rstrip()
+                i_tern += 1
+                while i_tern < len(lines_tern):
+                    cont = lines_tern[i_tern].strip()
+                    if cont.startswith('?') or cont.startswith(':'):
+                        joined = joined + ' ' + cont
+                        i_tern += 1
+                    else:
+                        break
+                new_lines_tern.append(joined)
+            else:
+                new_lines_tern.append(line_t)
+                i_tern += 1
+        source = '\n'.join(new_lines_tern)
 
     # Fix incomplete assignments where RHS is a comment from API mapping
     # Pattern: `local x = -- StringToHash: use string name...` → extract string arg or use nil
@@ -1078,6 +1125,7 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
     # Fix bare ':Method()' or '.Property' calls without a receiver
     # e.g. ':FindFirstChildWhichIsA("Sound")' → 'script.Parent:FindFirstChildWhichIsA("Sound")'
     # Only match at the start of an expression (after =, return, (, or start of line with indent)
+    # Also after keywords: if, not, or, and, while, elseif
     if re.search(r'(?:^|=|return|\()\s*:', source, re.MULTILINE):
         source = re.sub(
             r'((?:^|=|return\s|,|\()\s*):(\w+)',
@@ -1086,6 +1134,14 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
             flags=re.MULTILINE,
         )
         fixes.append("Added 'script.Parent' receiver to bare method calls")
+    # Bare ':Method()' after keywords (if, not, or, and, while, elseif)
+    if re.search(r'\b(?:if|not|or|and|while|elseif)\s+:', source):
+        source = re.sub(
+            r'(\b(?:if|not|or|and|while|elseif)\s+):(\w+)',
+            r'\1script.Parent:\2',
+            source,
+        )
+        fixes.append("Added 'script.Parent' receiver to bare method calls after keywords")
 
     # Fix bare '.Property' access without a receiver (e.g., '.Position')
     if re.search(r'(?:^|=|return|\()\s*\.(?!\.)', source, re.MULTILINE):
@@ -1094,6 +1150,14 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
             r'\1script.Parent.\2',
             source,
         )
+    # Bare '.Property' after keywords (if, not, or, and, while, elseif)
+    if re.search(r'\b(?:if|not|or|and|while|elseif)\s+\.[A-Za-z]', source):
+        source = re.sub(
+            r'(\b(?:if|not|or|and|while|elseif)\s+)\.([A-Za-z]\w*)',
+            r'\1script.Parent.\2',
+            source,
+        )
+        fixes.append("Added 'script.Parent' receiver to bare property after keyword")
 
     # Fix 'this.' prefix (C# self-reference, not valid in Luau)
     if re.search(r'\bthis\.', source):
@@ -1488,25 +1552,90 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
         source = re.sub(rf'({_MAT_VARS})[.:]GetTexture\([^)]*\)', 'nil', source)
         fixes.append("Fixed Unity Material Get* API calls → stub values")
 
+    # Join multi-line tuple assignments: `= (\nexpr,\nexpr)` → single line
+    # Uses paren depth tracking to handle nested function calls like (func(a), func(b))
+    lines_tup = source.split('\n')
+    new_lines_tup = []
+    i_tup = 0
+    while i_tup < len(lines_tup):
+        line_t = lines_tup[i_tup]
+        # Check if line has `= (` or `return (` where parens don't balance on this line
+        m_tup = re.search(r'(?:=|return)\s*\(', line_t)
+        if m_tup and '-- ' not in line_t[:m_tup.start()]:
+            # Count paren depth from the opening paren
+            depth = 0
+            for ch in line_t[m_tup.start():]:
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+            if depth > 0 and (line_t.rstrip().endswith(',') or line_t.rstrip().endswith('(')):
+                # Multi-line tuple — join continuation lines until balanced
+                joined = line_t
+                i_tup += 1
+                while i_tup < len(lines_tup) and depth > 0:
+                    continuation = lines_tup[i_tup].strip()
+                    joined = joined.rstrip() + ' ' + continuation
+                    for ch in continuation:
+                        if ch == '(':
+                            depth += 1
+                        elif ch == ')':
+                            depth -= 1
+                    i_tup += 1
+                new_lines_tup.append(joined)
+                continue
+        new_lines_tup.append(line_t)
+        i_tup += 1
+    source = '\n'.join(new_lines_tup)
+
     # Fix bare tuple assignment: `local x = (a, b, c, d)` → `local x = {a, b, c, d}`
-    # C# constructor/tuple pattern where parentheses contain comma-separated values
-    # Matches: = (expr, expr, ...) at end of line or followed by closing paren
-    if re.search(r'=\s*\([^)]*,', source):
-        def _fix_tuple_assign(m):
-            indent = m.group(1)
-            lhs = m.group(2)
-            contents = m.group(3)
-            # Only convert if there are commas (multi-value tuple)
-            if ',' in contents:
-                return f'{indent}{lhs} = {{{contents}}}'
-            return m.group(0)
-        source = re.sub(
-            r'^(\s*)((?:local\s+)?\w+(?:\.\w+)*)\s*=\s*\(([^)]+(?:,[^)]+)+)\)\s*$',
-            _fix_tuple_assign,
-            source,
-            flags=re.MULTILINE,
-        )
-        fixes.append("Fixed bare tuple (a, b, c) → {a, b, c}")
+    # Uses balanced paren matching to handle nested function calls like (func(a), func(b))
+    def _fix_tuple_line(line):
+        """Convert tuple assignment/return on a single line using balanced paren matching."""
+        # Match `= (` or `return (`
+        m_eq = re.match(r'^(\s*)((?:local\s+)?\w+(?:\.\w+)*)\s*=\s*\(', line)
+        m_ret = re.match(r'^(\s*)return\s*\(', line) if not m_eq else None
+        if not m_eq and not m_ret:
+            return line
+        m = m_eq or m_ret
+        # Find the opening paren position
+        start = line.index('(', m.start())
+        # Walk to find the matching close paren
+        depth = 0
+        has_comma_at_top = False
+        for i in range(start, len(line)):
+            ch = line[i]
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth == 0:
+                    contents = line[start + 1:i]
+                    # Check for commas at top-level depth
+                    d2 = 0
+                    for c2 in contents:
+                        if c2 == '(':
+                            d2 += 1
+                        elif c2 == ')':
+                            d2 -= 1
+                        elif c2 == ',' and d2 == 0:
+                            has_comma_at_top = True
+                            break
+                    if has_comma_at_top:
+                        # Replace outer parens with braces
+                        return line[:start] + '{' + contents + '}' + line[i + 1:]
+                    break
+            elif ch == ',':
+                if depth == 1:
+                    has_comma_at_top = True
+        return line
+    new_lines_tuple = []
+    for line in source.split('\n'):
+        stripped = line.strip()
+        if ('= (' in line or stripped.startswith('return (')) and ',' in line:
+            line = _fix_tuple_line(line)
+        new_lines_tuple.append(line)
+    source = '\n'.join(new_lines_tuple)
 
     # Fix undefined `col` variable → `otherPart` (C# `Collision col` parameter)
     # Only when: (1) `col` is not locally defined, (2) there's a Touched handler in the script,
@@ -2763,6 +2892,12 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         source = '\n'.join(new_lines)
         fixes.append("Fixed broken ternary with misplaced paren")
 
+    # Fix `(if ... then ... else ... end)` → `(if ... then ... else ...)`
+    # Luau if-expressions don't use `end`
+    if re.search(r'\(if\b.+\belse\b.+\bend\)', source):
+        source = re.sub(r'\(if\b(.+?)\belse\b(.+?)\s+end\)', r'(if\1else\2)', source)
+        fixes.append("Removed `end` from if-expression (ternary)")
+
     # Fix GetChildren()(N) → GetChildren()[N+1] (function call result indexed like function call)
     if 'GetChildren()(' in source:
         def _fix_getchildren_idx(m):
@@ -2787,6 +2922,36 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             source,
         )
         fixes.append("Fixed comment-embedded condition")
+    # Fix `if (expr) -- comment then` → `if (expr) then -- comment`
+    if re.search(r'if\s+\(.+\)\s+--\s+.+\s+then\s*$', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s*if\s+\(.+?\))\s+--(.*?)\s+then\s*$',
+            r'\1 then --\2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Fixed if-condition with comment before then")
+
+    # Fix unbalanced parens in if-conditions: `if ((expr) then` → `if (expr) then`
+    # Count open/close parens between 'if' and 'then' and remove excess opening parens
+    new_lines_pbal = []
+    for line in source.split('\n'):
+        stripped = line.strip()
+        if stripped.startswith('if ') and ' then' in stripped:
+            # Extract the condition part between 'if' and 'then'
+            m_pbal = re.match(r'^(\s*if\s+)(.*?)(\s+then.*)$', line)
+            if m_pbal:
+                cond = m_pbal.group(2)
+                opens = cond.count('(')
+                closes = cond.count(')')
+                # Remove excess leading '(' to balance
+                while opens > closes and cond.startswith('('):
+                    cond = cond[1:]
+                    opens -= 1
+                if opens != m_pbal.group(2).count('('):
+                    line = m_pbal.group(1) + cond + m_pbal.group(3)
+        new_lines_pbal.append(line)
+    source = '\n'.join(new_lines_pbal)
 
     # Fix mangled method names from transpilation
     if 'FindFirstChildOfClasssInChildren' in source:
@@ -3206,11 +3371,11 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         )
         fixes.append("Fixed FindFirstChildOfClassInChildren → FindFirstDescendant/FindFirstChildOfClass")
 
-    # Comment out Unity rendering APIs (GL, Graphics, Shader.Set*, RenderTexture)
+    # Comment out Unity rendering APIs (GL, Graphics, Shader.*, RenderTexture)
     # These have no Roblox equivalent
-    if re.search(r'\bGL\.\w+|Graphics\.Draw|Shader\.Set|RenderTexture\.\w+', source):
+    if re.search(r'\bGL\.\w+|Graphics\.Draw|Shader\.\w+|RenderTexture\.\w+', source):
         source = re.sub(
-            r'^(\s*)(?!--)(.+?(?:\bGL\.\w+|Graphics\.Draw\w+|Shader\.Set\w+|RenderTexture\.\w+).*)$',
+            r'^(\s*)(?!--)(.+?(?:\bGL\.\w+|Graphics\.Draw\w+|Shader\.\w+|RenderTexture\.\w+).*)$',
             r'\1-- [Unity render] \2',
             source,
             flags=re.MULTILINE,
@@ -3409,6 +3574,14 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     if re.search(r'=\s*\(\)\s*$', source, re.MULTILINE):
         source = re.sub(r'=\s*\(\)\s*$', '= nil', source, flags=re.MULTILINE)
         fixes.append("Fixed bare constructor = () → = nil")
+    # Fix `--[[ new Type ]] ()` → `nil` (commented constructor leaving bare parens)
+    if '--[[ new ' in source:
+        # No-arg constructor: `--[[ new Type ]] ()` → `nil`
+        source = re.sub(r'--\[\[.*?new\s+\w+.*?\]\]\s*\(\)', 'nil', source)
+        # List/collection with args: `--[[ new List ]] (expr)` → `{}`
+        source = re.sub(r'--\[\[.*?new\s+(?:List|Dictionary|HashSet|Queue|Stack)\s*\]\]\s*\([^)]*\)', '{}', source)
+        # Strip remaining `--[[ new Type ]]` leaving just the args (handled by other fixers)
+        source = re.sub(r'--\[\[.*?new\s+\w+[\w.]*\s*\]\]\s*', '', source)
 
     # Fix Unity Color constants → Roblox Color3
     _COLOR_CONSTANTS = {
@@ -3831,10 +4004,38 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         source = re.sub(r'\bend\.([A-Z])', r'endPos.\1', source)
         fixes.append("Fixed 'end' used as variable name (reserved word) → endPos")
 
+    # Fix `function` used as variable name (reserved word) → `_func`
+    # Pattern: `table.insert(list, function)`, `RegisterBatchFunction(function)`
+    if re.search(r'[,(]\s*function\s*[,)\]]', source):
+        source = re.sub(r'([,(]\s*)function(\s*[,)\]])', r'\1_func\2', source)
+    if re.search(r'local function \w+\([^)]*\bfunction\b[^)]*\)', source):
+        source = re.sub(
+            r'(local function \w+\([^)]*)\bfunction\b([^)]*\))',
+            r'\1_func\2',
+            source,
+        )
+
     # Fix trailing commas in function calls: func(a, b,) → func(a, b)
     if ',)' in source:
         source = re.sub(r',\s*\)', ')', source)
         fixes.append("Fixed trailing commas in function calls")
+
+    # Fix `table.remove(arr, , #)` → `table.remove(arr, #arr)` (pop last)
+    if 'table.remove(' in source and ', , #)' in source:
+        source = re.sub(
+            r'table\.remove\((\w+),\s*,\s*#\)',
+            r'table.remove(\1, #\1)',
+            source,
+        )
+        fixes.append("Fixed table.remove(arr, , #) → table.remove(arr, #arr)")
+
+    # Fix mismatched bracket/paren: `arr[idx).#prop]` → `arr[idx].prop` or `#arr[idx].prop`
+    if re.search(r'\w+\[[^]]*\)\.#\w+\]', source):
+        source = re.sub(
+            r'(\w+\[[^]]*?)\)\.#(\w+)\]',
+            r'#\1].\2',
+            source,
+        )
 
     # Fix assignment = in if conditions (should be ==)
     # Pattern: `if count = expr then` → `if count == expr then`
@@ -3931,6 +4132,23 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     # .center and .radius on collider-like objects (Unity physics properties)
     if re.search(r'\.center\b', source) and re.search(r'm_Sphere|m_Capsule|m_Box|collider', source):
         source = re.sub(r'([\w.\[\]]+)\.center\b', r'\1.Position', source)
+        # .radius = value → .Size = Vector3.new(value*2, value*2, value*2) (assignment context)
+        def _fix_radius(m):
+            line = m.group(0)
+            obj = m.group(1)
+            # Check if this is an assignment (radius on LHS)
+            after = line[m.end(1) + len('.radius'):]
+            if re.match(r'\s*=\s*', after.lstrip()) or re.match(r'\s*\*\s*[\d.]+\s*=', after.lstrip()):
+                # Assignment to .radius → comment out (read-only in Roblox)
+                return f'-- [Unity physics] {line}'
+            return line.replace(f'{obj}.radius', f'{obj}.Size.X / 2')
+        # Handle radius in assignment context vs read context separately
+        source = re.sub(
+            r'^(\s*)([\w.\[\]]+)\.radius\b\s*(?:\*\s*[\d.]+\s*)?=\s*[^\n]+$',
+            r'\1-- [Unity physics] \2.radius assignment (read-only in Roblox)',
+            source,
+            flags=re.MULTILINE,
+        )
         source = re.sub(r'([\w.\[\]]+)\.radius\b', r'\1.Size.X / 2', source)
         fixes.append("Fixed .center/.radius → .Position/.Size")
 
@@ -4023,6 +4241,158 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             flags=re.MULTILINE,
         )
         fixes.append("Fixed remaining C# type declarations → local")
+
+    # Fix C# interface method signatures: `TypeName MethodName(params)` with no body
+    # These are bare method declarations (abstract/interface) that should be commented out
+    # Pattern: PascalCase type, PascalCase method, optional parens, no assignment/local/function/return
+    if re.search(r'^\s+[A-Z]\w+(?:<[^>]+>)?\s+[A-Z]\w+\s*\([^)]*\)\s*$', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s+)([A-Z]\w+(?:<[^>]+>)?\s+[A-Z]\w+\s*\([^)]*\))\s*$',
+            r'\1-- [C#] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out C# interface method signatures")
+
+    # Fix C# generic type declarations: `Dictionary<K,V> varName = expr`
+    # or `List<Type> varName = expr` or nested `Dictionary<K, List<V>>` → `local varName = expr`
+    if re.search(r'^\s+\w+<.+>\s+\w+\s*=', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s+)\w+<.+>\s+(\w+)\s*=\s*(.+)$',
+            r'\1local \2 = \3',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Fixed C# generic type declarations → local")
+    # Also handle generic type variable without assignment: `List<Type> varName;` or `List<Type> varName`
+    if re.search(r'^\s+\w+<.+>\s+\w+\s*;?\s*$', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s+)\w+<.+>\s+(\w+)\s*;?\s*$',
+            r'\1local \2 = nil',
+            source,
+            flags=re.MULTILINE,
+        )
+    # C# generic array: `Type<T>[] varName = expr` → `local varName = expr`
+    if re.search(r'^\s+\w+<.+>\[\]\s+\w+\s*=', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s+)\w+<.+>\[\]\s+(\w+)\s*=\s*(.+)$',
+            r'\1local \2 = \3',
+            source,
+            flags=re.MULTILINE,
+        )
+
+    # Fix bare English text (no Luau keywords) that leaked as non-comment lines
+    # Pattern: line starts with a capital letter, contains spaces, and has no Luau keywords
+    _LUAU_KEYWORDS = {'local', 'function', 'if', 'then', 'else', 'elseif', 'end', 'for', 'while',
+                      'do', 'repeat', 'until', 'return', 'break', 'continue', 'in', 'not', 'and', 'or',
+                      'true', 'false', 'nil', 'script', 'game', 'workspace', 'task'}
+    new_lines_prose = []
+    for line in source.split('\n'):
+        stripped = line.strip()
+        if stripped and not stripped.startswith('--') and not stripped.startswith('local '):
+            words = stripped.split()
+            if (len(words) >= 4
+                    and words[0][0].isupper()
+                    and not any(w in _LUAU_KEYWORDS for w in words[:3])
+                    and '=' not in stripped and '(' not in stripped and ':' not in stripped
+                    and not stripped.endswith('do') and not stripped.endswith('then')):
+                indent = line[:len(line) - len(line.lstrip())]
+                line = f'{indent}-- [prose] {stripped}'
+        new_lines_prose.append(line)
+    source = '\n'.join(new_lines_prose)
+
+    # Fix C# PascalCase type + variable: `LineRenderer LR` or `BatchProcessor s_Instance`
+    # where first word is PascalCase and second is a valid identifier (any case)
+    if re.search(r'^\s+[A-Z]\w+\s+\w+\s*$', source, re.MULTILINE):
+        def _fix_pascal_decl(m):
+            indent = m.group(1)
+            type_name = m.group(2)
+            var_name = m.group(3)
+            # Skip if it looks like a Luau statement (function, return, if, etc.)
+            if type_name.lower() in ('local', 'function', 'return', 'if', 'for', 'while', 'end',
+                                      'else', 'elseif', 'then', 'do', 'repeat', 'until', 'not',
+                                      'and', 'or', 'true', 'false', 'nil', 'script', 'game',
+                                      'workspace', 'task', 'table', 'math', 'string', 'Vector3',
+                                      'Vector2', 'CFrame', 'Color3', 'Enum', 'Instance', 'require'):
+                return m.group(0)
+            return f'{indent}local {var_name} = nil'
+        source = re.sub(
+            r'^(\s+)([A-Z]\w+)\s+(\w+)\s*$',
+            _fix_pascal_decl,
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Fixed C# typed declarations with PascalCase type → local")
+
+    # Fix PascalCase.PascalCase type + variable: `Gamekit3.PlayerController player`
+    # Also handles multi-dot: `Gamekit3.InventoryController.InventoryChecker inventoryCheck`
+    if re.search(r'^\s+[A-Z]\w+(?:\.\w+)+\s+\w+\s*$', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s+)[A-Z]\w+(?:\.\w+)+\s+(\w+)\s*$',
+            r'\1local \2 = nil',
+            source,
+            flags=re.MULTILINE,
+        )
+
+    # Fix C# attribute brackets: `[AddComponentMenu(...)]`, `[Instance.newMenu(...)]` etc.
+    if re.search(r'^\s+\[\w+[\w.]*\s*\(', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s+)(\[\w+[\w.]*\s*\([^\]]*\]\s*)$',
+            r'\1-- [C# attribute] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+
+    # Fix C# `where T : Base` generic constraints
+    if re.search(r'^\s+where\s+\w+\s*:', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s+)(where\s+\w+\s*:.*)$',
+            r'\1-- [C#] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+
+    # Fix C# `&=` bitwise AND assignment (not valid in Luau)
+    if '&=' in source:
+        source = re.sub(
+            r'^(\s*)(\w+)\s*&=\s*(.+)$',
+            r'\1\2 = \2 and \3',
+            source,
+            flags=re.MULTILINE,
+        )
+
+    # Fix C# bitwise OR `|` in assignments (not valid Luau without bit32)
+    # Pattern: `varName = EnumA | EnumB` → commented out
+    if re.search(r'=\s*\w+\.\w+\s*\|\s*\w+\.\w+', source):
+        source = re.sub(
+            r'^(\s*)(local\s+\w+\s*=\s*\w+\.\w+\s*(?:\|\s*\w+\.\w+\s*)+)$',
+            r'\1-- [C#] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+
+    # Fix C# cast: `(TypeName)expr` on assignment → just `expr`
+    if re.search(r'\(Data<\w+>\)', source):
+        source = re.sub(r'\(Data<\w+>\)(\w+)', r'\1', source)
+
+    # Fix `string script.Parent[string key]` (C# indexer) → comment out
+    if re.search(r'^\s+string\s+script\.Parent\[', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s+)(string\s+script\.Parent\[.+\].*)$',
+            r'\1-- [C#] \2',
+            source,
+            flags=re.MULTILINE,
+        )
+
+    # Fix mangled inline comments breaking expressions:
+    # `obj -- comment.Property = value` → `-- [mangled] obj -- comment.Property = value`
+    if re.search(r'\w+\s+-- \w+.*\.(?:Anchored|Enabled|Position|Size)\s*=', source):
+        source = re.sub(
+            r'^(\s*)(\w+\s+-- \w+.*\.(?:Anchored|Enabled|Position|Size)\s*=.*)$',
+            r'\1-- [mangled] \2',
+            source,
+            flags=re.MULTILINE,
+        )
 
     if source != original:
         fixes.append("Fixed common API mistakes")
@@ -5066,9 +5436,10 @@ def _append_missing_trailing_ends(source: str, fixes: list[str]) -> str:
         if stripped.startswith('--'):
             continue
         if re.search(r'\bfunction\s*[\w.:(]', stripped):
-            # Skip single-line functions: function() ... end or function() ... end)
-            if not re.search(r'\bend\)?[,;]?\s*$', stripped):
-                depth += 1
+            # Count function openers vs end closers on this line
+            func_count = len(re.findall(r'\bfunction\s*[\w.:(]', stripped))
+            end_count_inline = len(re.findall(r'\bend\b', stripped))
+            depth += max(0, func_count - end_count_inline)
         if re.match(r'if\b.+\bthen\s*$', stripped) or (
                 re.search(r'\bthen\s*$', stripped) and not re.match(r'(?:if|elseif)\b', stripped)
                 and not re.search(r'\bfunction\b', stripped)):
@@ -5111,9 +5482,12 @@ def _remove_excess_end_keywords(source: str, fixes: list[str]) -> str:
 
         # Count block openers
         if re.search(r'\bfunction\s*[\w.:(]', stripped):
-            # Skip single-line functions: function() ... end or function() ... end)
-            if not re.search(r'\bend\)?[,;]?\s*$', stripped):
-                depth += 1
+            # Skip single-line functions: function() ... end anywhere on the same line
+            # Count function openers vs end closers on this line
+            func_count = len(re.findall(r'\bfunction\s*[\w.:(]', stripped))
+            end_count = len(re.findall(r'\bend\b', stripped))
+            # Only count as opener if functions outnumber ends on this line
+            depth += max(0, func_count - end_count)
         if re.match(r'if\b.+\bthen\s*$', stripped) or (
                 re.search(r'\bthen\s*$', stripped) and not re.match(r'(?:if|elseif)\b', stripped)
                 and not re.search(r'\bfunction\b', stripped)):
@@ -5266,9 +5640,10 @@ def _remove_excess_trailing_ends(source: str, fixes: list[str]) -> str:
             continue
         # Count block openers (skip single-line definitions like "function() ... end")
         if re.search(r'\bfunction\s*[\w.:(]', stripped):
-            # Only count as opener if line does NOT also end with 'end'
-            if not stripped.endswith(' end') and not stripped.endswith('\tend'):
-                depth += 1
+            # Count function openers vs end closers on this line
+            func_count = len(re.findall(r'\bfunction\s*[\w.:(]', stripped))
+            end_count_inline = len(re.findall(r'\bend\b', stripped))
+            depth += max(0, func_count - end_count_inline)
         if re.match(r'if\b.+\bthen\s*$', stripped) or (
                 re.search(r'\bthen\s*$', stripped) and not re.match(r'(?:if|elseif)\b', stripped)
                 and not re.search(r'\bfunction\b', stripped)):
