@@ -804,10 +804,26 @@ class Pipeline:
         if side_effect_modules:
             bootstrap_lines = ['-- Auto-generated bootstrap: require modules with side-effects']
             bootstrap_lines.append('local RS = game:GetService("ReplicatedStorage")')
-            for mod in side_effect_modules:
-                bootstrap_lines.append(
-                    f'require(RS:WaitForChild("{mod}", 10))'
-                )
+            bootstrap_lines.append('')
+            # If any module uses Scriptable camera (FPS-style), set it up before requiring
+            has_camera_control = any(
+                'camera.CFrame' in s.source or 'CurrentCamera' in s.source
+                for s in self.state.rbx_place.scripts
+                if s.name in side_effect_modules
+            )
+            if has_camera_control:
+                bootstrap_lines.append('-- Set camera to Scriptable so game scripts can control it')
+                bootstrap_lines.append('local camera = workspace.CurrentCamera')
+                bootstrap_lines.append('camera.CameraType = Enum.CameraType.Scriptable')
+                bootstrap_lines.append('')
+            for i, mod in enumerate(side_effect_modules):
+                var = f'mod{i}'
+                bootstrap_lines.append(f'local {var} = RS:WaitForChild("{mod}", 10)')
+                bootstrap_lines.append(f'if {var} then')
+                bootstrap_lines.append(f'    local ok{i}, err{i} = pcall(require, {var})')
+                bootstrap_lines.append(f'    if not ok{i} then warn("[Bootstrap] {mod}: " .. tostring(err{i})) end')
+                bootstrap_lines.append(f'end')
+                bootstrap_lines.append('')
             from core.roblox_types import RbxScript
             self.state.rbx_place.scripts.append(RbxScript(
                 name="ClientBootstrap",

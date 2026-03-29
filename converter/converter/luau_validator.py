@@ -4514,6 +4514,38 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     # Humanoid:Move() is valid in Roblox — takes (moveDirection: Vector3, relativeToCamera?: bool)
     # No fix needed; the transpiler emits correct :Move() calls.
 
+    # Fix camera that reads its own position instead of following the character head.
+    # In Unity, camera position is auto-updated by parent transform. In Roblox, we need
+    # to explicitly track the character head position.
+    # Pattern: camera.CFrame = CFrame.new(camera.CFrame.Position) * ...
+    # Fix:     camera.CFrame = CFrame.new(headPos) * ...  (with head lookup)
+    if 'CFrame.new(camera.CFrame.Position)' in source:
+        # Insert head position helper before the function that uses it
+        head_helper = (
+            '\n-- Head-follow camera (Roblox needs explicit positioning unlike Unity)\n'
+            'local function _getHeadPos()\n'
+            '    local Players = game:GetService("Players")\n'
+            '    local lp = Players.LocalPlayer\n'
+            '    if lp and lp.Character then\n'
+            '        local head = lp.Character:FindFirstChild("Head")\n'
+            '        if head then return head.Position + Vector3.new(0, 0.5, 0) end\n'
+            '    end\n'
+            '    return camera.CFrame.Position\n'
+            'end\n'
+        )
+        # Insert helper before first function that uses camera.CFrame.Position
+        insert_pos = source.find('camera.CFrame = CFrame.new(camera.CFrame.Position)')
+        # Find the start of the enclosing function
+        func_start = source.rfind('\nlocal function', 0, insert_pos)
+        if func_start > 0:
+            source = source[:func_start] + head_helper + source[func_start:]
+        # Replace the pattern
+        source = source.replace(
+            'CFrame.new(camera.CFrame.Position)',
+            'CFrame.new(_getHeadPos())',
+        )
+        fixes.append("Fixed camera to follow character head position")
+
     # .time property on VFX/particle instances → comment out
     if re.search(r'\w+\.time\s*=\s*[\d.]', source):
         source = re.sub(
