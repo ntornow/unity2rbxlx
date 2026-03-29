@@ -1578,6 +1578,11 @@ Input:
 - `Input.GetMouseButton` → `UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)`
 - `Input.GetAxis("Horizontal"/"Vertical")` → poll WASD keys manually
 - `Camera.main` → `workspace.CurrentCamera`
+- **IMPORTANT**: Roblox reserves Escape key for the system menu. Do NOT use `Enum.KeyCode.Escape` for pause menus. Use `Enum.KeyCode.P` or `Enum.KeyCode.Tab` instead, or remove ESC handlers entirely.
+
+UI:
+- Unity Canvas GameObjects become Roblox ScreenGuis. When a script references its own Canvas, find it via `playerGui:FindFirstChildOfClass("ScreenGui")` or by the Canvas's actual name — NOT by the script's class name.
+- `Camera.CameraType` must be `Enum.CameraType.Scriptable` before script-controlled camera works.
 
 Physics:
 - `Physics.Raycast(origin, dir, dist)` → `workspace:Raycast(origin, dir * dist, RaycastParams.new())`

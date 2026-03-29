@@ -4514,6 +4514,18 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     # Humanoid:Move() is valid in Roblox — takes (moveDirection: Vector3, relativeToCamera?: bool)
     # No fix needed; the transpiler emits correct :Move() calls.
 
+    # Fix PlayerGui:WaitForChild("ScriptName") — in Unity the script references
+    # its own Canvas/GameObject by class name, but in Roblox the ScreenGui may
+    # have a different name. Replace with FindFirstChildOfClass("ScreenGui").
+    _sname = name.replace('.luau', '').replace('.lua', '')
+    if re.search(r'PlayerGui.*:WaitForChild\(["\']' + re.escape(_sname) + r'["\']\)', source):
+        source = re.sub(
+            r':WaitForChild\(["\']' + re.escape(_sname) + r'["\'](?:,\s*\d+)?\)',
+            ':FindFirstChildOfClass("ScreenGui")',
+            source,
+        )
+        fixes.append("Fixed self-referencing WaitForChild to FindFirstChildOfClass")
+
     # Fix camera that reads its own position instead of following the character head.
     # In Unity, camera position is auto-updated by parent transform. In Roblox, we need
     # to explicitly track the character head position.
