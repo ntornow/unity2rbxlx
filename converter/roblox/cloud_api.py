@@ -54,7 +54,7 @@ def _handle_rate_limit(response: requests.Response) -> None:
 def _poll_operation(
     operation_id: str,
     api_key: str,
-    max_polls: int = 20,
+    max_polls: int = 60,
     poll_interval: float = 2.0,
 ) -> str | None:
     """Poll an async operation until done, return the asset ID."""
