@@ -784,6 +784,39 @@ class Pipeline:
             self.state.rbx_place.scripts.append(generate_game_server_script())
             log.info("[write_output] Injected GameServerManager script")
 
+        # Bootstrap: generate a LocalScript that requires ModuleScripts with
+        # side-effects (RenderStepped/Heartbeat connections, mouse lock, etc.)
+        # These modules need to be required at startup to activate their logic.
+        import re as _re
+        _side_effect_patterns = [
+            r'RenderStepped:Connect',
+            r'Heartbeat:Connect',
+            r'MouseBehavior\s*=\s*Enum\.MouseBehavior\.LockCenter',
+            r'InputBegan:Connect',
+        ]
+        side_effect_modules = []
+        for s in self.state.rbx_place.scripts:
+            if s.script_type != "ModuleScript":
+                continue
+            if any(_re.search(p, s.source) for p in _side_effect_patterns):
+                side_effect_modules.append(s.name)
+
+        if side_effect_modules:
+            bootstrap_lines = ['-- Auto-generated bootstrap: require modules with side-effects']
+            bootstrap_lines.append('local RS = game:GetService("ReplicatedStorage")')
+            for mod in side_effect_modules:
+                bootstrap_lines.append(
+                    f'require(RS:WaitForChild("{mod}", 10))'
+                )
+            from core.roblox_types import RbxScript
+            self.state.rbx_place.scripts.append(RbxScript(
+                name="ClientBootstrap",
+                source="\n".join(bootstrap_lines),
+                script_type="LocalScript",
+            ))
+            log.info("[write_output] Bootstrap LocalScript requires %d side-effect modules: %s",
+                     len(side_effect_modules), ", ".join(side_effect_modules))
+
         # Auto-generate client scripts and HUD for FPS-style games.
         from converter.fps_client_generator import inject_fps_scripts
         fps_added = inject_fps_scripts(self.state.rbx_place)
