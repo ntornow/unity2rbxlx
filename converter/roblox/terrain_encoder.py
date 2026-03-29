@@ -367,10 +367,9 @@ def encode_smooth_grid(
                 if not has_non_air:
                     continue
 
-                # Chunk coords map directly to world: (cx, cy, cz)
-                # The Y/Z axis swap only applies to voxels WITHIN the chunk,
-                # not to chunk coordinates themselves.
-                coord = (cx, cy, cz)
+                # Chunk coords in world space. Negate cz to match Roblox's
+                # coordinate system (Unity Z+ → Roblox Z-).
+                coord = (cx, cy, -(cz + 1))
                 pending_chunks.append((coord, _rle_encode_chunk(chunk_voxels)))
 
     # Sort chunks

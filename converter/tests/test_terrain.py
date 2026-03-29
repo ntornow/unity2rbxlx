@@ -305,7 +305,7 @@ class TestSmoothGridBinaryFormat:
         assert data[1] == 5, "Chunk power must be 5 (2^5=32)"
 
     def test_chunk_coord_at_origin(self):
-        """Single-chunk terrain at origin should have chunk coord (0,0,0)."""
+        """Single-chunk terrain at origin should have chunk Z negated (Unity→Roblox)."""
         from roblox.terrain_encoder import encode_smooth_grid
         import base64
 
@@ -315,7 +315,8 @@ class TestSmoothGridBinaryFormat:
             encode_smooth_grid(heights, 3, (1.0, 20.0, 1.0))
         )
         coord = self._decode_chunk_header(data, 2)
-        assert coord == (0, 0, 0), f"First chunk at origin should be (0,0,0), got {coord}"
+        # Z is negated: chunk 0 in Unity → chunk -1 in Roblox
+        assert coord == (0, 0, -1), f"First chunk should have Z=-1 (negated), got {coord}"
 
     def test_rle_decodes_to_32768_voxels(self):
         """Each chunk must contain exactly 32^3 = 32768 voxels when decoded."""
