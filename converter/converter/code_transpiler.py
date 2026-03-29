@@ -1582,7 +1582,16 @@ Input:
 
 UI:
 - Unity Canvas GameObjects become Roblox ScreenGuis. When a script references its own Canvas, find it via `playerGui:FindFirstChildOfClass("ScreenGui")` or by the Canvas's actual name — NOT by the script's class name.
-- `Camera.CameraType` must be `Enum.CameraType.Scriptable` before script-controlled camera works.
+
+Camera (FPS/First-Person):
+- Set `camera.CameraType = Enum.CameraType.Scriptable` before controlling the camera
+- **CRITICAL**: In Unity, the camera is a child of the player and auto-follows position/rotation. In Roblox, the camera is INDEPENDENT — you must explicitly position it at the character's head every frame.
+- Use `character:FindFirstChild("Head").Position + Vector3.new(0, 0.5, 0)` for camera position
+- Track yaw (mouse X) and pitch (mouse Y) as separate angles, combine into camera CFrame:
+  `camera.CFrame = CFrame.new(headPos) * CFrame.Angles(0, yawAngle, 0) * CFrame.Angles(pitchAngle, 0, 0)`
+- Do NOT modify `rootPart.CFrame` for rotation — this conflicts with Roblox's Humanoid movement controller
+- For camera-relative movement, compute direction from camera yaw:
+  `local moveDir = (CFrame.Angles(0, yawAngle, 0) * inputDir).Unit; humanoid:Move(moveDir)`
 
 Physics:
 - `Physics.Raycast(origin, dir, dist)` → `workspace:Raycast(origin, dir * dist, RaycastParams.new())`
@@ -1749,8 +1758,9 @@ def _ai_transpile(
     """
     warnings: list[str] = []
 
-    # Check cache first.
-    cache_key = _cache_key(csharp_source + class_name + script_type + project_context, model)
+    # Check cache first (include system prompt hash so prompt changes invalidate cache).
+    _prompt_hash = hashlib.sha256(_AI_SYSTEM_PROMPT.encode()).hexdigest()[:16]
+    cache_key = _cache_key(csharp_source + class_name + script_type + project_context + _prompt_hash, model)
     cached = _load_cache(cache_key)
     if cached is not None:
         log.debug("AI transpilation cache hit for %s", cache_key[:12])
@@ -1889,8 +1899,9 @@ def _claude_cli_transpile(
 
     warnings: list[str] = []
 
-    # Check cache first (include class_name and script_type in key).
-    cache_key = _cache_key(csharp_source + class_name + script_type + project_context, "claude-cli-v3")
+    # Check cache first (include class_name, script_type, and system prompt hash in key).
+    _prompt_hash = hashlib.sha256(_AI_SYSTEM_PROMPT.encode()).hexdigest()[:16]
+    cache_key = _cache_key(csharp_source + class_name + script_type + project_context + _prompt_hash, "claude-cli-v4")
     cached = _load_cache(cache_key)
     if cached is not None:
         log.debug("Claude CLI cache hit for %s", cache_key[:12])

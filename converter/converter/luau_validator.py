@@ -4514,66 +4514,8 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     # Humanoid:Move() is valid in Roblox — takes (moveDirection: Vector3, relativeToCamera?: bool)
     # No fix needed; the transpiler emits correct :Move() calls.
 
-    # Fix PlayerGui:WaitForChild("ScriptName") — in Unity the script references
-    # its own Canvas/GameObject by class name, but in Roblox the ScreenGui may
-    # have a different name. Replace with FindFirstChildOfClass("ScreenGui").
-    _sname = name.replace('.luau', '').replace('.lua', '')
-    if re.search(r'PlayerGui.*:WaitForChild\(["\']' + re.escape(_sname) + r'["\']\)', source):
-        source = re.sub(
-            r':WaitForChild\(["\']' + re.escape(_sname) + r'["\'](?:,\s*\d+)?\)',
-            ':FindFirstChildOfClass("ScreenGui")',
-            source,
-        )
-        fixes.append("Fixed self-referencing WaitForChild to FindFirstChildOfClass")
-
-    # Fix FPS camera system for Unity→Roblox.
-    # Unity: camera is child of player transform, auto-follows position/rotation.
-    # Roblox: camera is independent, must be explicitly positioned at head with
-    #         proper yaw (from rootPart) + pitch (from mouse Y).
-    # Also fix movement: rootPart.CFrame rotation conflicts with Humanoid controller.
-    # Replace with camera-yaw-based movement via Humanoid:Move().
-    if 'CFrame.new(camera.CFrame.Position)' in source and 'RenderStepped' in source:
-        # Replace the rotate function with a proper FPS camera implementation
-        # that combines yaw + pitch and positions at the character head.
-        rotate_pattern = (
-            r'(?:-- Head-follow camera.*?end\n)?'  # optional helper from previous fix
-            r'local function rotate\(dt\).*?end'
-        )
-        fps_rotate = (
-            '-- FPS camera: position at head, yaw from mouse X, pitch from mouse Y\n'
-            'local _yawAngle = 0\n'
-            'local function rotate(dt)\n'
-            '    local mouseDelta = UserInputService:GetMouseDelta()\n'
-            '    _yawAngle = _yawAngle - mouseDelta.X * sensitivity * dt\n'
-            '    camRotationX = math.clamp(camRotationX - mouseDelta.Y * sensitivity * dt, minAngle, maxAngle)\n'
-            '\n'
-            '    local head = character:FindFirstChild("Head")\n'
-            '    if not head then return end\n'
-            '    local headPos = head.Position + Vector3.new(0, 0.5, 0)\n'
-            '    camera.CFrame = CFrame.new(headPos)\n'
-            '        * CFrame.Angles(0, math.rad(_yawAngle), 0)\n'
-            '        * CFrame.Angles(math.rad(camRotationX), 0, 0)\n'
-            'end'
-        )
-        new_source = re.sub(rotate_pattern, fps_rotate, source, count=1, flags=re.DOTALL)
-
-        # Replace rootPart.CFrame rotation (fights with Humanoid) with no-op
-        new_source = re.sub(
-            r'^\s*rootPart\.CFrame\s*=\s*rootPart\.CFrame\s*\*\s*CFrame\.Angles.*$',
-            '    -- [removed: rootPart rotation conflicts with Humanoid controller]',
-            new_source,
-            flags=re.MULTILINE,
-        )
-
-        # Replace rootPart.CFrame:VectorToWorldSpace with camera-yaw-relative direction
-        new_source = new_source.replace(
-            'rootPart.CFrame:VectorToWorldSpace(inputDir)',
-            '(CFrame.Angles(0, math.rad(_yawAngle), 0) * inputDir).Unit',
-        )
-
-        if new_source != source:
-            source = new_source
-            fixes.append("Rewrote FPS camera/movement for Roblox (head-follow + camera-yaw movement)")
+    # Camera and movement fixes are handled by the AI transpiler prompt.
+    # See code_transpiler.py _AI_SYSTEM_PROMPT for ESC key, camera, and UI guidance.
 
     # .time property on VFX/particle instances → comment out
     if re.search(r'\w+\.time\s*=\s*[\d.]', source):
