@@ -827,6 +827,7 @@ def _make_part(parent_xml: ET.Element, part: RbxPart) -> None:
     if ufid and str(ufid) in _unity_fid_to_referent:
         item.set("referent", _unity_fid_to_referent[str(ufid)])
 
+    if part_class != "Model":
         # CFrame
         if hasattr(part, "cframe") and part.cframe:
             _add_cframe(props, "CFrame", part.cframe)
