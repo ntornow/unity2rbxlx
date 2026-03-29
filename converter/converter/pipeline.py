@@ -844,13 +844,13 @@ class Pipeline:
                             self.state.rbx_place.scripts.append(terrain_script)
                             log.info("[write_output] TerrainGenerator script embedded in rbxlx")
 
-        # Generate MeshLoader script to load meshes and textures at runtime.
-        # Studio can't load Content properties (MeshId, ColorMap) from rbxlx,
-        # so we store them as attributes and use CreateMeshPartAsync at startup.
+        # Generate MeshLoader script to load meshes at runtime.
+        # Uploaded mesh Model IDs need InsertService resolution to get real MeshIds.
+        # Textures are uploaded as Image type and work directly — no resolution needed.
         if self.ctx.uploaded_assets:
             from core.roblox_types import RbxScript
-            mesh_loader = '''-- Auto-generated mesh and texture loader
--- Resolves Model IDs → real MeshIds, Decal IDs → Image IDs, then rebuilds MeshParts
+            mesh_loader = '''-- Auto-generated mesh loader
+-- Resolves Model IDs → real MeshIds, then rebuilds MeshParts with proper meshes
 if script:GetAttribute("MeshesLoaded") then return end
 
 local AssetService = game:GetService("AssetService")
@@ -858,13 +858,10 @@ local InsertService = game:GetService("InsertService")
 local loaded = 0
 local failed = 0
 
--- Step 1: Collect unique Model IDs (meshes) and Decal IDs (textures) to resolve
+-- Step 1: Collect unique Model IDs to resolve
 local modelToMesh = {}
-local decalToImage = {}
 local uniqueMeshIds = {}
-local uniqueTexIds = {}
 local meshIdSet = {}
-local texIdSet = {}
 
 for _, part in workspace:GetDescendants() do
     if part:IsA("MeshPart") then
@@ -873,18 +870,10 @@ for _, part in workspace:GetDescendants() do
             meshIdSet[mid] = true
             table.insert(uniqueMeshIds, mid)
         end
-        -- Collect texture Decal IDs from SurfaceAppearance attributes
-        for _, attrName in {"_ColorMap", "_NormalMap", "_MetalnessMap", "_RoughnessMap"} do
-            local texUrl = part:GetAttribute(attrName)
-            if texUrl and not texIdSet[texUrl] then
-                texIdSet[texUrl] = true
-                table.insert(uniqueTexIds, texUrl)
-            end
-        end
     end
 end
 
--- Step 2a: Resolve Model IDs → real MeshIds via InsertService:LoadAsset
+-- Step 2: Resolve Model IDs → real MeshIds via InsertService:LoadAsset
 local meshResolved = 0
 for _, modelUrl in uniqueMeshIds do
     local numId = tonumber(modelUrl:match("(%d+)"))
@@ -908,33 +897,6 @@ for _, modelUrl in uniqueMeshIds do
 end
 print(string.format("MeshLoader: resolved %d/%d mesh Model IDs", meshResolved, #uniqueMeshIds))
 
--- Step 2b: Resolve Decal IDs → Image IDs via InsertService:LoadAsset
-local texResolved = 0
-for _, decalUrl in uniqueTexIds do
-    local numId = tonumber(decalUrl:match("(%d+)"))
-    if numId then
-        local ok, model = pcall(function() return InsertService:LoadAsset(numId) end)
-        if ok and model then
-            for _, desc in model:GetDescendants() do
-                if desc:IsA("Decal") and desc.Texture ~= "" then
-                    decalToImage[decalUrl] = desc.Texture
-                    texResolved = texResolved + 1
-                    break
-                end
-            end
-            model:Destroy()
-        end
-    end
-    task.wait()
-end
-print(string.format("MeshLoader: resolved %d/%d texture Decal IDs", texResolved, #uniqueTexIds))
-
--- Helper to resolve a texture URL (Decal→Image or passthrough)
-local function resolveTexture(url)
-    if not url then return nil end
-    return decalToImage[url] or url
-end
-
 -- Step 3: Replace placeholder MeshParts with real meshes
 for _, part in workspace:GetDescendants() do
     if part:IsA("MeshPart") and part:GetAttribute("_MeshId") then
@@ -955,8 +917,6 @@ for _, part in workspace:GetDescendants() do
             newPart.CastShadow = part.CastShadow
 
             -- Compute proper size using stored scale attributes
-            -- _ScaleX/Y/Z = unityScale * importScale * unitRatio * STUDS_PER_METER
-            -- finalSize = InitialSize * scalePerAxis
             local scaleX = part:GetAttribute("_ScaleX")
             local scaleY = part:GetAttribute("_ScaleY")
             local scaleZ = part:GetAttribute("_ScaleZ")
@@ -968,7 +928,7 @@ for _, part in workspace:GetDescendants() do
                     init.Z * scaleZ
                 )
             else
-                newPart.Size = part.Size  -- Fallback to old size
+                newPart.Size = part.Size
             end
 
             -- Copy non-internal attributes
@@ -978,41 +938,9 @@ for _, part in workspace:GetDescendants() do
                 end
             end
 
-            -- Apply SurfaceAppearance with resolved Image IDs (not Decal IDs)
-            local colorMap = resolveTexture(part:GetAttribute("_ColorMap"))
-            if colorMap then
-                local sa = Instance.new("SurfaceAppearance")
-                sa.ColorMap = colorMap
-                local normalMap = resolveTexture(part:GetAttribute("_NormalMap"))
-                if normalMap then sa.NormalMap = normalMap end
-                local metalnessMap = resolveTexture(part:GetAttribute("_MetalnessMap"))
-                if metalnessMap then sa.MetalnessMap = metalnessMap end
-                local roughnessMap = resolveTexture(part:GetAttribute("_RoughnessMap"))
-                if roughnessMap then sa.RoughnessMap = roughnessMap end
-                sa.Parent = newPart
-            else
-                -- Reparent existing SurfaceAppearance children
-                for _, child in part:GetChildren() do
-                    if child:IsA("SurfaceAppearance") then
-                        -- Also resolve textures on existing SA
-                        if child.ColorMap ~= "" then
-                            local resolved = resolveTexture(child.ColorMap)
-                            if resolved then child.ColorMap = resolved end
-                        end
-                        if child.NormalMap ~= "" then
-                            local resolved = resolveTexture(child.NormalMap)
-                            if resolved then child.NormalMap = resolved end
-                        end
-                    end
-                    pcall(function() child.Parent = newPart end)
-                end
-            end
-
-            -- Reparent non-SA children
+            -- Reparent all children (SurfaceAppearance, scripts, etc.)
             for _, child in part:GetChildren() do
-                if not child:IsA("SurfaceAppearance") then
-                    pcall(function() child.Parent = newPart end)
-                end
+                pcall(function() child.Parent = newPart end)
             end
 
             newPart.Parent = part.Parent
@@ -1023,22 +951,6 @@ for _, part in workspace:GetDescendants() do
         end
 
         if loaded % 20 == 0 then task.wait() end
-    end
-end
-
--- Step 4: Fix SurfaceAppearance textures on non-mesh parts too (regular Parts)
-for _, part in workspace:GetDescendants() do
-    if part:IsA("BasePart") then
-        for _, child in part:GetChildren() do
-            if child:IsA("SurfaceAppearance") then
-                if child.ColorMap ~= "" and decalToImage[child.ColorMap] then
-                    child.ColorMap = decalToImage[child.ColorMap]
-                end
-                if child.NormalMap ~= "" and decalToImage[child.NormalMap] then
-                    child.NormalMap = decalToImage[child.NormalMap]
-                end
-            end
-        end
     end
 end
 
