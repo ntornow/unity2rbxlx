@@ -189,13 +189,16 @@ def upload_image(
     name: str = "Image",
     description: str = "",
 ) -> str | None:
-    """Upload an image (Decal) to Roblox.
+    """Upload an image to Roblox using the 'Image' asset type.
 
-    Returns the asset ID string on success, or ``None`` on failure.
+    Returns the Image asset ID string on success, or ``None`` on failure.
+    The returned ID is directly usable in SurfaceAppearance (ColorMap, NormalMap,
+    etc.) without needing InsertService resolution — unlike 'Decal' uploads which
+    return Decal IDs that must be resolved to Image IDs.
     """
     return _upload_asset(
         file_path, api_key, creator_id, creator_type,
-        asset_type="Decal",
+        asset_type="Image",
         name=name,
         description=description,
     )
