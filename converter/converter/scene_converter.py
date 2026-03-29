@@ -591,7 +591,14 @@ def convert_scene(
         scene_node = transform_to_node.get(tfm_id)
         if scene_node is None:
             return None
-        container = RbxPart(name=scene_node.name, class_name="Model")
+        # Create container with the scene node's world position so child
+        # prefab instances can compose their local position with the parent's.
+        rx, ry, rz = unity_to_roblox_pos(*scene_node.position)
+        container = RbxPart(
+            name=scene_node.name,
+            class_name="Model",
+            cframe=RbxCFrame(x=rx, y=ry, z=rz),
+        )
         _inactive_containers[tfm_id] = container
         transform_to_rbx[tfm_id] = container
         # Try to parent this container under its own parent scene node
@@ -649,6 +656,27 @@ def convert_scene(
                             # Check if parent is an unconverted scene node
                             parent_rbx = _ensure_inactive_container(tp)
                         if parent_rbx is not None:
+                            # Compose parent world position with prefab local positions.
+                            # Roblox CFrames in rbxlx are world-space, so all parts
+                            # in the hierarchy need the parent's position added.
+                            if hasattr(parent_rbx, 'cframe') and parent_rbx.cframe:
+                                px = parent_rbx.cframe.x or 0
+                                py = parent_rbx.cframe.y or 0
+                                pz = parent_rbx.cframe.z or 0
+                                def _offset_parts(parts, dx, dy, dz):
+                                    for part in parts:
+                                        if hasattr(part, 'cframe') and part.cframe:
+                                            part.cframe = RbxCFrame(
+                                                x=(part.cframe.x or 0) + dx,
+                                                y=(part.cframe.y or 0) + dy,
+                                                z=(part.cframe.z or 0) + dz,
+                                                r00=part.cframe.r00, r01=part.cframe.r01, r02=part.cframe.r02,
+                                                r10=part.cframe.r10, r11=part.cframe.r11, r12=part.cframe.r12,
+                                                r20=part.cframe.r20, r21=part.cframe.r21, r22=part.cframe.r22,
+                                            )
+                                        if hasattr(part, 'children') and part.children:
+                                            _offset_parts(part.children, dx, dy, dz)
+                                _offset_parts(pi_parts, px, py, pz)
                             parent_rbx.children.extend(pi_parts)
                             parented += len(pi_parts)
                         else:
