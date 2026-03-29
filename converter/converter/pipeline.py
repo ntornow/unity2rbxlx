@@ -337,6 +337,44 @@ class Pipeline:
             self.state.asset_manifest.total_size_bytes / (1024 * 1024),
         )
 
+        # Pre-compute FBX bounding boxes via trimesh for InitialSize fallback.
+        # This runs only when mesh_native_sizes (from Studio resolution) are
+        # not yet available, so the convert_scene phase has real geometry data
+        # instead of assuming every mesh is a 1-unit cube.
+        if not self.ctx.mesh_native_sizes:
+            self._compute_fbx_bounding_boxes()
+
+    def _compute_fbx_bounding_boxes(self) -> None:
+        """Scan all mesh assets and compute bounding boxes via trimesh."""
+        manifest = self.state.asset_manifest
+        if not manifest:
+            return
+
+        from converter.mesh_processor import get_mesh_info
+
+        mesh_assets = [a for a in manifest.assets if a.kind == "mesh"]
+        if not mesh_assets:
+            return
+
+        computed = 0
+        for asset in mesh_assets:
+            rel_key = str(asset.relative_path)
+            # Skip if already computed (e.g. from a resumed context)
+            if rel_key in self.ctx.fbx_bounding_boxes:
+                computed += 1
+                continue
+            info = get_mesh_info(asset.path)
+            bbox = info.get("bounding_box")
+            if bbox and isinstance(bbox, tuple) and len(bbox) == 3:
+                # Only store non-trivial bounding boxes (not the 1,1,1 fallback)
+                if not (bbox[0] == 1.0 and bbox[1] == 1.0 and bbox[2] == 1.0
+                        and info.get("face_count", 0) == 0):
+                    self.ctx.fbx_bounding_boxes[rel_key] = list(bbox)
+                    computed += 1
+
+        if computed:
+            log.info("[extract_assets] Computed FBX bounding boxes for %d meshes", computed)
+
     def upload_assets(self) -> None:
         """Phase 3: Upload all assets (textures, meshes, audio) to Roblox."""
         if self.skip_upload:
@@ -468,8 +506,9 @@ class Pipeline:
                         try:
                             png_tmp = output.parent / (source.stem + "_tmp.png")
                             actual_source = convert_to_png(source, png_tmp)
-                        except Exception:
-                            pass  # Fall through to try with original
+                        except Exception as conv_exc:
+                            log.warning("[convert_materials] Failed to convert %s to PNG, trying original: %s",
+                                        source.name, conv_exc)
                     if op.operation == "extract_r":
                         extract_channel(actual_source, "R", output)
                     elif op.operation == "invert_a":
@@ -575,6 +614,14 @@ class Pipeline:
         # Load mesh hierarchies from context (populated by Studio resolution)
         mesh_hierarchies = getattr(self.ctx, "mesh_hierarchies", None) or {}
 
+        # Load FBX bounding boxes (fallback for InitialSize when Studio not available)
+        fbx_bounding_boxes: dict[str, tuple[float, float, float]] = {}
+        raw_bboxes = getattr(self.ctx, "fbx_bounding_boxes", None)
+        if isinstance(raw_bboxes, dict):
+            for k, v in raw_bboxes.items():
+                if isinstance(v, (list, tuple)) and len(v) == 3:
+                    fbx_bounding_boxes[k] = tuple(v)
+
         self.state.rbx_place = convert_scene(
             parsed_scene=self.state.parsed_scene,
             guid_index=self.state.guid_index,
@@ -584,6 +631,7 @@ class Pipeline:
             mesh_native_sizes=mesh_native_sizes,
             mesh_texture_ids=mesh_texture_ids,
             mesh_hierarchies=mesh_hierarchies,
+            fbx_bounding_boxes=fbx_bounding_boxes,
         )
         # Count all parts recursively (including nested prefab children)
         def _count_parts(parts):
@@ -656,6 +704,22 @@ class Pipeline:
                 ))
             log.info("[write_output] Wrote %d animation scripts",
                      len(self.state.animation_result.generated_scripts))
+
+        # Write animation data ModuleScripts to ReplicatedStorage.
+        if self.state.animation_result and self.state.animation_result.animation_data_modules:
+            from core.roblox_types import RbxScript
+            anim_data_dir = scripts_dir / "animation_data"
+            anim_data_dir.mkdir(parents=True, exist_ok=True)
+            for module_name, module_source in self.state.animation_result.animation_data_modules:
+                out_path = anim_data_dir / f"{module_name}.luau"
+                out_path.write_text(module_source, encoding="utf-8")
+                self.state.rbx_place.scripts.append(RbxScript(
+                    name=module_name,
+                    source=module_source,
+                    script_type="ModuleScript",
+                ))
+            log.info("[write_output] Wrote %d animation data modules",
+                     len(self.state.animation_result.animation_data_modules))
 
         # Post-transpilation: rewrite asset references in scripts.
         from converter.script_asset_rewriter import rewrite_asset_references
@@ -1064,10 +1128,14 @@ script.Disabled = true
                 "materials": f"{self.ctx.converted_materials}/{self.ctx.total_materials}",
                 "animations": self.ctx.converted_animations,
                 "uploaded_assets": len(self.ctx.uploaded_assets),
+                "upload_errors": len(self.ctx.asset_upload_errors),
                 "terrains": len(self.state.rbx_place.terrains),
                 "screen_guis": len(self.state.rbx_place.screen_guis),
+                "streaming_enabled": self.ctx.converted_parts > 5000,
             },
             "elements": result,
+            "errors": self.ctx.errors,
+            "upload_errors": self.ctx.asset_upload_errors[:20],  # Cap for readability
             "needs_resolution": len(self.ctx.uploaded_assets) > 0 and not self.ctx.mesh_native_sizes,
         }
         report_path = self.output_dir / "conversion_report.json"
@@ -1127,6 +1195,8 @@ script.Disabled = true
                             part.scripts.append(script)
                             bound_script_names.add(class_name)
                             bound_count += 1
+                            log.debug("[write_output]   Bound '%s' to part '%s'",
+                                      class_name, part.name)
 
                 # Recurse into children
                 if getattr(part, "children", None):
@@ -1141,6 +1211,35 @@ script.Disabled = true
                 if s.name not in bound_script_names
             ]
             log.info("[write_output] Bound %d scripts to their target parts", bound_count)
+
+        # Disable unbound scripts that depend on script.Parent being a Part/Light/etc.
+        # These scripts are prefab components that couldn't be bound to parts.
+        # In SSS/RS, script.Parent is the service itself, so Position/CFrame/etc. will crash.
+        import re
+        _parent_part_patterns = [
+            r'script\.Parent\.Position',
+            r'script\.Parent\.CFrame',
+            r'script\.Parent:FindFirstChild',
+            r'script\.Parent\.Touched',
+            r'script\.Parent\.AssemblyLinearVelocity',
+            r'local \w+ = script\.Parent\b',  # alias like `local part = script.Parent`
+        ]
+        disabled_count = 0
+        for s in list(self.state.rbx_place.scripts):
+            if s.script_type == "ModuleScript":
+                continue
+            needs_parent_part = any(
+                re.search(pat, s.source) for pat in _parent_part_patterns
+            )
+            if needs_parent_part:
+                # Wrap script with a parent type check
+                guard = ('-- Guard: this script expects script.Parent to be a BasePart\n'
+                         'if not script.Parent:IsA("BasePart") then return end\n\n')
+                s.source = guard + s.source
+                disabled_count += 1
+                log.debug("[write_output]   Added parent guard to '%s'", s.name)
+        if disabled_count:
+            log.info("[write_output] Added BasePart parent guards to %d unbound scripts", disabled_count)
 
     def _inject_runtime_modules(self) -> None:
         """Inject runtime library ModuleScripts when relevant features are detected.
@@ -1159,9 +1258,11 @@ script.Disabled = true
         has_animator = False
         has_navmesh = False
         has_character_controller = False
+        has_cinemachine = False
+        has_sub_emitters = False
 
         def _scan_parts(parts):
-            nonlocal has_animator, has_navmesh, has_character_controller
+            nonlocal has_animator, has_navmesh, has_character_controller, has_cinemachine, has_sub_emitters
             for part in parts:
                 attrs = getattr(part, "attributes", {})
                 if attrs.get("HasAnimator"):
@@ -1170,6 +1271,13 @@ script.Disabled = true
                     has_navmesh = True
                 if attrs.get("_HasCharacterController"):
                     has_character_controller = True
+                if attrs.get("CinemachineVCam"):
+                    has_cinemachine = True
+                # Check particle emitters for sub-emitter attributes
+                for pe in getattr(part, "particle_emitters", None) or []:
+                    pe_attrs = getattr(pe, "attributes", {})
+                    if pe_attrs.get("_HasSubEmitters"):
+                        has_sub_emitters = True
                 children = getattr(part, "children", None) or []
                 if children:
                     _scan_parts(children)
@@ -1188,6 +1296,21 @@ script.Disabled = true
             modules_to_inject.append(("EventSystem", "event_system.luau"))
         if has_character_controller:
             modules_to_inject.append(("CharacterBridge", "physics_bridge.luau"))
+        if has_sub_emitters:
+            modules_to_inject.append(("SubEmitterRuntime", "sub_emitter_runtime.luau"))
+        if has_cinemachine:
+            # Cinemachine is a LocalScript (runs on client for camera control)
+            cinemachine_path = runtime_dir / "cinemachine_runtime.luau"
+            if cinemachine_path.exists():
+                source = cinemachine_path.read_text(encoding="utf-8")
+                existing = [s for s in self.state.rbx_place.scripts if s.name == "CinemachineRuntime"]
+                if not existing:
+                    self.state.rbx_place.scripts.append(RbxScript(
+                        name="CinemachineRuntime",
+                        source=source,
+                        script_type="LocalScript",
+                    ))
+                    injected += 1
 
         for module_name, filename in modules_to_inject:
             module_path = runtime_dir / filename

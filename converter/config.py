@@ -28,7 +28,7 @@ STUDIO_PATH: Path = Path(
 
 ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL: str = "claude-sonnet-4-6"
-ANTHROPIC_MAX_TOKENS: int = 16384
+ANTHROPIC_MAX_TOKENS: int = int(os.environ.get("ANTHROPIC_MAX_TOKENS", "16384"))
 
 # ---------------------------------------------------------------------------
 # Asset extraction options
@@ -96,7 +96,7 @@ MAX_SCENE_DEPTH: int = 64
 # ---------------------------------------------------------------------------
 
 USE_AI_TRANSPILATION: bool = True  # Always use AI as primary, rule-based as fallback
-TRANSPILATION_CONFIDENCE_THRESHOLD: float = 0.7
+TRANSPILATION_CONFIDENCE_THRESHOLD: float = float(os.environ.get("TRANSPILATION_CONFIDENCE_THRESHOLD", "0.7"))
 AI_TRANSPILE_FIRST: bool = True  # Try AI before rule-based
 
 # ---------------------------------------------------------------------------

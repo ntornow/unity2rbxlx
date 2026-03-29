@@ -110,7 +110,7 @@ Priority: P0 = blocking gameplay, P1 = significant quality, P2 = nice to have.
 
 ## New Gaps (2026-03-26)
 
-- [ ] **SmoothGrid binary format**: Reverse-engineer Roblox's exact binary format for direct terrain embedding (currently uses FillBlock script fallback)
+- [x] **SmoothGrid binary format**: Fully reverse-engineered — 6-bit material + optional occupancy + RLE, axis swap (SmoothGrid Z = world Y), all 22 material IDs confirmed. Encoder implemented in terrain_encoder.py. FillBlock script kept as fallback.
 - [ ] **Mesh InitialSize**: Requires Studio asset resolution via InsertService:LoadAsset for native mesh sizes
 - [x] **Prefab hierarchy orphans**: FIXED — 0 orphans now. Added lazy containers for inactive scene nodes + stripped Transform ID registration + root-level PI handling.
 - [x] **Parse performance**: Switched to CSafeLoader (C YAML parser). Gamekit3D: 65s→12s (81% faster). Test suite: 220s→92s (58% faster).
@@ -118,3 +118,66 @@ Priority: P0 = blocking gameplay, P1 = significant quality, P2 = nice to have.
 - [x] **Nested project auto-detection**: Pipeline auto-finds Unity root when Assets/ is one level deep (ChopChop, PrefabWorkflows)
 - [ ] **Visual comparison automation**: Integrate viewport cropping + matched camera positions for accurate SSIM
 - [ ] **Play mode testing**: Automated gameplay verification via Studio MCP play mode
+
+## New Gaps (2026-03-28)
+
+- [x] **Rigidbody physics properties**: Mass/drag/angularDrag extracted → CustomPhysicalProperties (density/friction/elasticity). Rigidbody2D m_LinearDrag + m_GravityScale also handled.
+- [x] **MeshCollider CollisionFidelity**: m_Convex → Hull, non-convex → PreciseConvexDecomposition. Serialized in rbxlx.
+- [x] **Silent PSD/TGA conversion errors**: Bare `except: pass` replaced with log.warning.
+- [x] **Cinemachine camera runtime**: New cinemachine_runtime.luau — reads VCam attributes, does camera follow/look-at/FOV transitions. Auto-injected when CinemachineVCam detected.
+- [x] **Test suite performance**: Slow tests (CLI subprocess + full Gamekit3D conversion) marked @slow. Fast suite: 872 tests in 9.4s. Full suite: 888 tests in 65s.
+
+## Remaining Open Items
+
+### Not Yet Implemented (genuine gaps)
+- [x] **Tilemap/TilemapRenderer**: Tiles converted to thin Parts in a grid with cell sizing, tile colors, sprite GUIDs. TilemapRenderer properties extracted.
+- [ ] **Font upload**: Not supported by Roblox Open Cloud API. UI text uses default Roblox font.
+- [ ] **Video upload**: Not supported by Roblox Open Cloud API. VideoFrame component works but needs manual video ID.
+
+### Fixed (2026-03-28 continued)
+- [x] **Skeletal animation bone resolution**: Motor6D now creates actual bone Parts with proper Part0/Part1 Ref links (was string-only names)
+- [x] **Cross-scene constraint linking**: Pre-pass assigns referents from unity_file_id, constraints resolve Part1 via global mapping
+- [x] **Animator state machine**: Controllers with 2+ states and transitions → unified state machine script with parameter-driven transitions, trigger reset, exit-time support
+- [x] **VFX SubEmitters**: New sub_emitter_runtime.luau handles Birth/Death/Collision triggers with burst effects, auto-injected when _HasSubEmitters detected
+
+### Fixed (2026-03-29)
+- [x] **Sprite atlas cropping**: .meta sprite rects parsed (x,y,w,h), SurfaceGui+ImageLabel with ImageRectOffset/Size for atlas sprites. Decal fallback for full textures.
+- [x] **API mappings**: 5 comment-only entries replaced with actual code (navMeshAgent.speed, SetDestination, isStopped, ResetTrigger, Quaternion.FromToRotation). 2 new utility functions (navMoveTo, quatFromToRotation).
+- [x] **Animation data export**: export_controller_json + export_clip_keyframes wired into pipeline. Generates AnimationData_{name} ModuleScripts in ReplicatedStorage. Animator runtime has TweenService-based bone animation fallback.
+- [x] **NavMeshObstacle**: Now extracted with shape/size/carve attributes instead of silently skipped.
+- [x] **CanvasGroup**: Alpha → _GroupTransparency, Interactable → _GroupInteractable attributes.
+- [x] **ContentSizeFitter**: HorizontalFit/VerticalFit stored as _AutoSizeH/_AutoSizeV attributes.
+- [x] **AspectRatioFitter**: AspectRatio + AspectMode stored as attributes.
+- [x] **PlayableDirector**: Timeline properties extracted (AutoPlay, Loop, Duration, AssetGuid) instead of silently skipped.
+- [x] **Post-processing**: Vignette, AmbientOcclusion, MotionBlur, ChromaticAberration extracted from URP Volume settings.
+- [x] **Emission materials**: _EmissionColor → Neon material + emission color applied to part.
+- [x] **Roughness maps**: Standalone _RoughnessMap/_SmoothnessMap fallback in material mapper.
+- [x] **Default SpawnLocation**: Auto-created (invisible) if no SpawnLocation exists in scene.
+- [x] **CollectionService tags**: Unity m_TagString → Roblox Tags property (BinaryString).
+- [x] **CollisionGroups**: Unity layer → Roblox CollisionGroup string (UnityLayerN).
+- [x] **CastShadow**: Unity MeshRenderer m_CastShadows=0 → Roblox CastShadow=false.
+- [x] **MonoBehaviour field extraction**: m_ prefix fields now extracted (was filtered), GameServerManager reads MaxHealth/maxHitPoints → Humanoid health.
+- [x] **WheelCollider**: Converted to cylinder Part with radius-based sizing.
+- [x] **Cross-script duplicate warning**: Logs when two scripts share a class name.
+- [x] **YAML error logging**: Malformed documents now warn instead of silently dropping.
+
+### Fixed (2026-03-29 continued)
+- [x] **SmoothGrid terrain verified**: Loaded in Studio — terrain renders correctly with proper materials and height. 17 new byte-level validation tests added.
+- [x] **Mesh InitialSize fallback**: trimesh-based FBX bounding box extraction. 3-tier sizing: Studio-resolved → FBX bbox → naive estimate.
+- [x] **Visual comparison**: Pure-numpy SSIM (no skimage), camera coordinate matching, `compare --visual` CLI command. 13 tests.
+- [x] **Multi-MonoBehaviour binding**: `_ScriptClass` now uses numbered attributes so all scripts on a GameObject get bound (was only keeping last one).
+- [x] **Client-only require propagation**: Scripts requiring modules with client APIs auto-reclassified to LocalScript.
+- [x] **Humanoid:Move()**: Removed incorrect validator rewrite of `:Move()` → `.MoveDirection =` (MoveDirection is read-only).
+- [x] **Trailing comma after bare-var comments**: Fixed syntax error in `CFrame.Angles(x, y, -- [bare var] 0)` pattern.
+- [x] **BasePart parent guards**: Unbound prefab scripts get `IsA("BasePart")` guard to prevent SSS crashes.
+- [x] **SpawnPoint → SpawnLocation**: Unity SpawnPoint objects now convert to Roblox SpawnLocation class with correct positions.
+
+### Remaining
+- [ ] **Prefab child MonoBehaviour binding**: Scripts on child nodes within prefab hierarchies don't get `_ScriptClass` set (get parent guards instead)
+
+### Deferred (no Roblox equivalent)
+- Cloth simulation → silently skipped
+- Wind zones → silently skipped
+- Blend shapes → silently skipped
+- Reflection probes → silently skipped (Future lighting compensates)
+- Light probes → silently skipped (Future lighting compensates)

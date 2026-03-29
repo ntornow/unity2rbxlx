@@ -14,8 +14,11 @@ error recovery, and extraction helpers.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 import yaml
 try:
@@ -225,7 +228,9 @@ def parse_documents(raw_text: str) -> list[tuple[int, str, dict]]:
             continue
         try:
             parsed = yaml.load(chunk, Loader=_YamlLoader)
-        except yaml.YAMLError:
+        except yaml.YAMLError as exc:
+            log.warning("YAML parse error in document %d (data may be lost): %s",
+                        len(docs), str(exc)[:200])
             docs.append(None)
             continue
         docs.append(parsed)

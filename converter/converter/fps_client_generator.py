@@ -601,6 +601,20 @@ local function onPlayerAdded(player)
                         if jumpHeight then
                             humanoid.JumpHeight = jumpHeight
                         end
+                        local slopeAngle = obj:GetAttribute("_MaxSlopeAngle")
+                        if slopeAngle then
+                            humanoid.MaxSlopeAngle = slopeAngle
+                        end
+                        local hipHeight = obj:GetAttribute("_HipHeight")
+                        if hipHeight then
+                            humanoid.HipHeight = hipHeight
+                        end
+                        -- Check for health data from converted MonoBehaviour
+                        local maxHealth = obj:GetAttribute("MaxHealth") or obj:GetAttribute("maxHitPoints") or obj:GetAttribute("MaxHP")
+                        if maxHealth and maxHealth > 0 then
+                            humanoid.MaxHealth = maxHealth
+                            humanoid.Health = maxHealth
+                        end
                         break
                     end
                 end

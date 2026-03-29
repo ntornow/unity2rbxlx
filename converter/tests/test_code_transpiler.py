@@ -3832,13 +3832,12 @@ class TestValidatorBatch20:
         assert 'axis.Y' in fixed
         assert 'axis.Z' in fixed
 
-    def test_humanoid_move_to_direction(self):
-        """:Move(dir) → .MoveDirection = dir."""
+    def test_humanoid_move_preserved(self):
+        """Humanoid:Move(dir) is valid Roblox API — should not be rewritten."""
         from converter.luau_validator import validate_and_fix
         source = 'control:Move(moveDirection * speed)'
         fixed, _ = validate_and_fix("test", source)
-        assert 'MoveDirection' in fixed
-        assert ':Move(' not in fixed
+        assert ':Move(' in fixed
 
     def test_object_clone_with_arg(self):
         """obj:Clone(prefab) → prefab:Clone()."""

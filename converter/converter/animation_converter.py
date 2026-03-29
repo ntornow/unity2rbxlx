@@ -20,6 +20,7 @@ of keyframes), we sample at reduced keyframe density and use sequential tweens.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 from dataclasses import dataclass, field
@@ -130,6 +131,7 @@ class AnimationConversionResult:
     clips: list[AnimClip] = field(default_factory=list)
     controllers: list[AnimatorController] = field(default_factory=list)
     generated_scripts: list[tuple[str, str]] = field(default_factory=list)  # (name, luau_source)
+    animation_data_modules: list[tuple[str, str]] = field(default_factory=list)  # (name, luau_source)
     total_clips: int = 0
     total_controllers: int = 0
     total_scripts_generated: int = 0
@@ -877,6 +879,288 @@ def _generate_parameter_driven_playback(
 
 
 # ---------------------------------------------------------------------------
+# Unified state machine script generation
+# ---------------------------------------------------------------------------
+
+def generate_state_machine_script(
+    controller: AnimatorController,
+    clips_by_guid: dict[str, AnimClip],
+    game_object_name: str = "",
+) -> str:
+    """Generate a unified Luau state machine script for an AnimatorController.
+
+    Instead of separate scripts per clip, this generates a single script that:
+    - Defines all animation states with their clip playback
+    - Evaluates transition conditions each frame
+    - Switches states based on parameter values
+    - Supports exit-time transitions (play clip, then auto-transition)
+
+    Args:
+        controller: The parsed AnimatorController.
+        clips_by_guid: Dict mapping clip GUID to AnimClip.
+        game_object_name: Name of the target Roblox part/model.
+
+    Returns:
+        Luau source code as a string, or "" if no usable states.
+    """
+    # Build state info with resolved clips
+    states_with_clips: list[tuple[AnimState, AnimClip | None]] = []
+    state_by_fid: dict[str, AnimState] = {}
+    for state in controller.states:
+        clip = clips_by_guid.get(state.clip_guid)
+        states_with_clips.append((state, clip))
+        state_by_fid[state.file_id] = state
+
+    if not states_with_clips:
+        return ""
+
+    # Find default state
+    default_state = None
+    for state, clip in states_with_clips:
+        if state.file_id == controller.default_state_file_id:
+            default_state = state
+            break
+    if default_state is None and states_with_clips:
+        default_state = states_with_clips[0][0]
+
+    lines: list[str] = []
+    lines.append("-- Auto-generated Animator State Machine")
+    lines.append(f"-- Controller: {controller.name}")
+    lines.append(f"-- States: {len(states_with_clips)}, Parameters: {len(controller.parameters)}")
+    lines.append("")
+    lines.append('local TweenService = game:GetService("TweenService")')
+    lines.append('local RunService = game:GetService("RunService")')
+    lines.append("")
+
+    # Find target
+    target_name = game_object_name or controller.name
+    lines.append(f'local target = workspace:FindFirstChild("{target_name}", true)')
+    lines.append("if not target then return end")
+    lines.append("if target:IsA('Model') then")
+    lines.append("    target = target.PrimaryPart or target:FindFirstChildWhichIsA('BasePart') or target")
+    lines.append("end")
+    lines.append("")
+
+    # Initialize parameters as attributes on the target
+    lines.append("-- Initialize parameters")
+    for param in controller.parameters:
+        if param.param_type == 4:  # Bool
+            lines.append(f'target:SetAttribute("{param.name}", {str(param.default_bool).lower()})')
+        elif param.param_type == 1:  # Float
+            lines.append(f'target:SetAttribute("{param.name}", {param.default_float})')
+        elif param.param_type == 3:  # Int
+            lines.append(f'target:SetAttribute("{param.name}", {param.default_int})')
+        elif param.param_type == 9:  # Trigger
+            lines.append(f'target:SetAttribute("{param.name}", false)')
+    lines.append("")
+
+    # Define state play functions
+    for state, clip in states_with_clips:
+        safe_name = state.name.replace(" ", "_").replace("-", "_")
+        if clip and clip.curves:
+            lines.append(f"local function play_{safe_name}()")
+            lines.append(f"\t-- Play animation: {clip.name} ({clip.duration:.2f}s)")
+            # Generate simplified tween for the first position/rotation curve
+            for curve in clip.curves[:3]:  # Limit to 3 curves per state
+                simplified = simplify_keyframes(curve.keyframes, max_count=5)
+                if len(simplified) >= 2:
+                    if curve.property_type == "position":
+                        kf = simplified[-1]
+                        lines.append(f"\tlocal info = TweenInfo.new({clip.duration:.2f})")
+                        lines.append(f"\tlocal tween = TweenService:Create(target, info, {{")
+                        lines.append(f"\t\tPosition = target.Position + Vector3.new({kf.value[0]:.3f}, {kf.value[1]:.3f}, {-kf.value[2]:.3f})")
+                        lines.append(f"\t}})")
+                        lines.append(f"\ttween:Play()")
+                        lines.append(f"\ttween.Completed:Wait()")
+            if not clip.curves:
+                lines.append(f"\ttask.wait({clip.duration:.2f})")
+            lines.append("end")
+        else:
+            lines.append(f"local function play_{safe_name}()")
+            lines.append(f"\ttask.wait(0.1) -- No animation data")
+            lines.append("end")
+        lines.append("")
+
+    # State machine loop
+    lines.append(f'local currentState = "{default_state.name if default_state else ""}"')
+    lines.append("")
+    lines.append("local function checkTransitions()")
+
+    for state, clip in states_with_clips:
+        safe_name = state.name.replace(" ", "_").replace("-", "_")
+        prefix = "if" if state == states_with_clips[0][0] else "elseif"
+        lines.append(f'\t{prefix} currentState == "{state.name}" then')
+
+        for trans in state.transitions:
+            dst_state = state_by_fid.get(trans.dst_state_file_id)
+            if not dst_state:
+                continue
+
+            if trans.conditions:
+                cond_parts = []
+                for cond in trans.conditions:
+                    attr_get = f'target:GetAttribute("{cond.parameter}")'
+                    if cond.mode == 1:  # If (true)
+                        cond_parts.append(f"{attr_get} == true")
+                    elif cond.mode == 2:  # IfNot (false)
+                        cond_parts.append(f"{attr_get} == false")
+                    elif cond.mode == 3:  # Greater
+                        cond_parts.append(f"({attr_get} or 0) > {cond.threshold}")
+                    elif cond.mode == 4:  # Less
+                        cond_parts.append(f"({attr_get} or 0) < {cond.threshold}")
+                    elif cond.mode == 6:  # Equals
+                        cond_parts.append(f"({attr_get} or 0) == {cond.threshold}")
+                    elif cond.mode == 7:  # NotEqual
+                        cond_parts.append(f"({attr_get} or 0) ~= {cond.threshold}")
+
+                if cond_parts:
+                    cond_str = " and ".join(cond_parts)
+                    lines.append(f'\t\tif {cond_str} then')
+                    lines.append(f'\t\t\tcurrentState = "{dst_state.name}"')
+                    # Reset triggers
+                    for cond in trans.conditions:
+                        param = next((p for p in controller.parameters if p.name == cond.parameter), None)
+                        if param and param.param_type == 9:  # Trigger
+                            lines.append(f'\t\t\ttarget:SetAttribute("{cond.parameter}", false)')
+                    lines.append(f"\t\t\treturn true")
+                    lines.append(f"\t\tend")
+            elif trans.has_exit_time:
+                lines.append(f'\t\t-- Auto-transition after exit time')
+                lines.append(f'\t\tcurrentState = "{dst_state.name}"')
+                lines.append(f"\t\treturn true")
+
+    if states_with_clips:
+        lines.append("\tend")
+    lines.append("\treturn false")
+    lines.append("end")
+    lines.append("")
+
+    # Main loop
+    lines.append("-- State machine main loop")
+    lines.append("while true do")
+    for state, clip in states_with_clips:
+        safe_name = state.name.replace(" ", "_").replace("-", "_")
+        prefix = "if" if state == states_with_clips[0][0] else "elseif"
+        lines.append(f'\t{prefix} currentState == "{state.name}" then')
+        lines.append(f"\t\tplay_{safe_name}()")
+    if states_with_clips:
+        lines.append("\tend")
+    lines.append("\tcheckTransitions()")
+    lines.append("\ttask.wait()")
+    lines.append("end")
+
+    return "\n".join(lines) + "\n"
+
+
+def export_controller_json(controller: AnimatorController) -> dict[str, Any]:
+    """Export an AnimatorController as a JSON-serializable dict for the runtime.
+
+    The animator_runtime.luau expects this format for state machine evaluation.
+    """
+    states = []
+    for state in controller.states:
+        transitions = []
+        for trans in state.transitions:
+            conditions = []
+            for cond in trans.conditions:
+                mode_names = {1: "If", 2: "IfNot", 3: "Greater", 4: "Less", 6: "Equals", 7: "NotEqual"}
+                conditions.append({
+                    "parameter": cond.parameter,
+                    "mode": mode_names.get(cond.mode, "If"),
+                    "threshold": cond.threshold,
+                })
+            transitions.append({
+                "destination": "",  # Filled below from file_id resolution
+                "dst_file_id": trans.dst_state_file_id,
+                "conditions": conditions,
+                "duration": trans.transition_duration,
+                "hasExitTime": trans.has_exit_time,
+                "exitTime": trans.exit_time,
+            })
+        states.append({
+            "name": state.name,
+            "motion": state.name,  # Use state name as motion key
+            "speed": state.speed,
+            "transitions": transitions,
+        })
+
+    # Resolve transition destination names from file_id
+    state_name_by_fid = {s.file_id: s.name for s in controller.states}
+    for state_data in states:
+        for trans in state_data["transitions"]:
+            trans["destination"] = state_name_by_fid.get(trans.pop("dst_file_id", ""), "")
+
+    parameters = []
+    for param in controller.parameters:
+        type_names = {1: "Float", 3: "Int", 4: "Bool", 9: "Trigger"}
+        default_val: Any = 0
+        if param.param_type == 4:
+            default_val = param.default_bool
+        elif param.param_type == 1:
+            default_val = param.default_float
+        elif param.param_type == 3:
+            default_val = param.default_int
+        parameters.append({
+            "name": param.name,
+            "type": type_names.get(param.param_type, "Float"),
+            "defaultValue": default_val,
+        })
+
+    return {
+        "name": controller.name,
+        "states": states,
+        "parameters": parameters,
+        "defaultState": state_name_by_fid.get(controller.default_state_file_id, ""),
+    }
+
+
+def export_clip_keyframes(clip: AnimClip) -> dict[str, Any]:
+    """Export a clip's keyframes as a JSON-serializable dict for runtime playback.
+
+    Returns a dict with:
+        duration: float
+        bones: { boneName: [ {time, cf: {x,y,z,rx,ry,rz}} ] }
+    """
+    bones: dict[str, list[dict]] = {}
+
+    for curve in clip.curves:
+        bone_name = curve.path.split("/")[-1] if curve.path else "Root"
+        if bone_name not in bones:
+            bones[bone_name] = []
+
+        for kf in simplify_keyframes(curve.keyframes, max_count=10):
+            entry: dict[str, Any] = {"time": round(kf.time, 3)}
+            cf: dict[str, float] = {}
+
+            if curve.property_type == "position":
+                cf["x"] = round(kf.value[0], 4)
+                cf["y"] = round(kf.value[1], 4)
+                cf["z"] = round(-kf.value[2], 4)  # Unity→Roblox Z negation
+            elif curve.property_type == "euler":
+                cf["rx"] = round(kf.value[0], 2)
+                cf["ry"] = round(kf.value[1], 2)
+                cf["rz"] = round(-kf.value[2], 2)
+            elif curve.property_type == "rotation":
+                # Convert quaternion to euler
+                ex, ey, ez = _quat_to_euler_degrees(*kf.value[:4])
+                cf["rx"] = round(ex, 2)
+                cf["ry"] = round(ey, 2)
+                cf["rz"] = round(-ez, 2)
+            elif curve.property_type == "scale":
+                cf["sx"] = round(kf.value[0], 4)
+                cf["sy"] = round(kf.value[1], 4)
+                cf["sz"] = round(kf.value[2], 4)
+
+            entry["cf"] = cf
+            bones[bone_name].append(entry)
+
+    return {
+        "duration": round(clip.duration, 3),
+        "bones": bones,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Project-level animation discovery and conversion
 # ---------------------------------------------------------------------------
 
@@ -947,10 +1231,13 @@ def convert_animations(
     clip_by_path: dict[str, AnimClip] = {}
     for clip in clips:
         if clip.source_path:
-            clip_by_path[str(clip.source_path)] = clip
+            # Use resolve() to normalize symlinks (e.g. /var -> /private/var on macOS)
+            clip_by_path[str(clip.source_path.resolve())] = clip
 
     # For each controller, find associated clips and generate scripts
     for ctrl in controllers:
+        # Build clips_by_guid for this controller
+        clips_by_guid: dict[str, AnimClip] = {}
         ctrl_clips: list[AnimClip] = []
 
         for state in ctrl.states:
@@ -960,26 +1247,62 @@ def convert_animations(
             # Try to resolve the clip GUID to a path
             if guid_index:
                 clip_path = guid_index.resolve(state.clip_guid)
-                if clip_path and str(clip_path) in clip_by_path:
-                    ctrl_clips.append(clip_by_path[str(clip_path)])
+                if clip_path:
+                    resolved_key = str(clip_path.resolve())
+                    if resolved_key in clip_by_path:
+                        clip = clip_by_path[resolved_key]
+                        ctrl_clips.append(clip)
+                        clips_by_guid[state.clip_guid] = clip
 
         if not ctrl_clips:
             continue
 
-        # Generate a combined script for all clips in this controller
-        for clip in ctrl_clips:
-            if not clip.curves:
-                continue
-
-            script_name = f"Anim_{ctrl.name}_{clip.name}"
-            luau_source = generate_tween_script(
-                clip=clip,
-                game_object_name=ctrl.name,
+        # Use unified state machine for controllers with transitions
+        has_transitions = any(s.transitions for s in ctrl.states)
+        if has_transitions and len(ctrl.states) >= 2:
+            script_name = f"Anim_{ctrl.name}_StateMachine"
+            luau_source = generate_state_machine_script(
                 controller=ctrl,
+                clips_by_guid=clips_by_guid,
+                game_object_name=ctrl.name,
             )
-
             if luau_source:
                 result.generated_scripts.append((script_name, luau_source))
+        else:
+            # Simple controller: generate per-clip scripts
+            for clip in ctrl_clips:
+                if not clip.curves:
+                    continue
+
+                script_name = f"Anim_{ctrl.name}_{clip.name}"
+                luau_source = generate_tween_script(
+                    clip=clip,
+                    game_object_name=ctrl.name,
+                    controller=ctrl,
+                )
+
+                if luau_source:
+                    result.generated_scripts.append((script_name, luau_source))
+
+        # Export controller JSON and keyframe data as a ModuleScript
+        controller_data = export_controller_json(ctrl)
+        keyframes: dict[str, Any] = {}
+        for clip in ctrl_clips:
+            keyframes[clip.name] = export_clip_keyframes(clip)
+        combined = {
+            "controller": controller_data,
+            "keyframes": keyframes,
+        }
+        module_name = f"AnimationData_{ctrl.name}"
+        json_str = json.dumps(combined, indent=2)
+        module_source = (
+            f"-- Auto-generated animation data for {ctrl.name}\n"
+            f"-- Used by animator_runtime.luau LoadKeyframes()\n"
+            f"local data = game:GetService(\"HttpService\")"
+            f":JSONDecode([==[{json_str}]==])\n"
+            f"return data\n"
+        )
+        result.animation_data_modules.append((module_name, module_source))
 
     # Also generate scripts for standalone clips not referenced by any controller
     referenced_clips: set[str] = set()
@@ -988,10 +1311,10 @@ def convert_animations(
             if state.clip_guid and guid_index:
                 clip_path = guid_index.resolve(state.clip_guid)
                 if clip_path:
-                    referenced_clips.add(str(clip_path))
+                    referenced_clips.add(str(clip_path.resolve()))
 
     for clip in clips:
-        if clip.source_path and str(clip.source_path) not in referenced_clips:
+        if clip.source_path and str(clip.source_path.resolve()) not in referenced_clips:
             if not clip.curves:
                 continue
             script_name = f"Anim_{clip.name}"

@@ -106,3 +106,111 @@ def build_guid_index(unity_project_path: str | Path) -> GuidIndex:
              len(index.orphan_metas), len(index.parse_errors))
 
     return index
+
+
+# ---------------------------------------------------------------------------
+# Sprite atlas rect parsing
+# ---------------------------------------------------------------------------
+
+# Regex patterns to extract sprite rects from .meta TextureImporter sections.
+# Each sprite entry has an internalID and rect {x, y, width, height}.
+_RE_INTERNAL_ID = re.compile(r"^\s*internalID:\s*(\d+)\s*$", re.MULTILINE)
+_RE_RECT_FIELD = re.compile(
+    r"^\s*rect:\s*$\n"
+    r"(?:\s*serializedVersion:\s*\d+\s*$\n)?"
+    r"\s*x:\s*([\d.eE+-]+)\s*$\n"
+    r"\s*y:\s*([\d.eE+-]+)\s*$\n"
+    r"\s*width:\s*([\d.eE+-]+)\s*$\n"
+    r"\s*height:\s*([\d.eE+-]+)\s*$",
+    re.MULTILINE,
+)
+
+
+def parse_sprite_rects(meta_path: Path) -> dict[str, tuple[float, float, float, float]]:
+    """Parse sprite rects from a texture's .meta file.
+
+    Returns a dict mapping internalID (as string) to (x, y, width, height).
+    The internalID corresponds to the fileID in m_Sprite references.
+    Returns empty dict if the file has no sprite sheet data.
+    """
+    try:
+        text = meta_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+
+    # Find the spriteSheet section
+    sheet_idx = text.find("spriteSheet:")
+    if sheet_idx < 0:
+        return {}
+
+    # Find the sprites list within the spriteSheet section
+    sprites_idx = text.find("sprites:", sheet_idx)
+    if sprites_idx < 0:
+        return {}
+
+    # Extract sprite entries -- each starts with "- serializedVersion:" or "- name:"
+    # and contains rect and internalID fields
+    result: dict[str, tuple[float, float, float, float]] = {}
+
+    # Split into individual sprite blocks (delimited by "    - " at sprite level)
+    # Find the end of the sprites list (next top-level key at same or less indent)
+    sprite_section = text[sprites_idx:]
+    # The sprites list ends at the next key at spriteSheet indent level
+    # (outline:, customData:, etc.)
+    lines = sprite_section.split("\n")
+    sprite_blocks: list[str] = []
+    current_block: list[str] = []
+    in_sprites = False
+
+    for i, line in enumerate(lines):
+        if i == 0:
+            # "sprites:" header line -- check for empty list "sprites: []"
+            if "[]" in line:
+                return {}
+            in_sprites = True
+            continue
+        if not in_sprites:
+            continue
+        # Detect end of sprites list: a line at same or lesser indent that isn't
+        # part of a sprite entry (not starting with spaces + -)
+        stripped = line.rstrip()
+        if stripped and not stripped.startswith(" ") and not stripped.startswith("-"):
+            break
+        # New sprite entry starts with "    -" (list item marker)
+        if re.match(r"^\s{4}-\s", line) or re.match(r"^\s{2}-\s", line):
+            if current_block:
+                sprite_blocks.append("\n".join(current_block))
+            current_block = [line]
+        elif current_block:
+            current_block.append(line)
+    if current_block:
+        sprite_blocks.append("\n".join(current_block))
+
+    for block in sprite_blocks:
+        # Extract internalID
+        id_match = _RE_INTERNAL_ID.search(block)
+        if not id_match:
+            continue
+        internal_id = id_match.group(1)
+
+        # Extract rect
+        rect_match = _RE_RECT_FIELD.search(block)
+        if not rect_match:
+            # Try inline rect format: rect: {x: 0, y: 0, width: 128, height: 128}
+            inline_match = re.search(
+                r"rect:\s*\{[^}]*x:\s*([\d.eE+-]+)[^}]*y:\s*([\d.eE+-]+)"
+                r"[^}]*width:\s*([\d.eE+-]+)[^}]*height:\s*([\d.eE+-]+)",
+                block,
+            )
+            if inline_match:
+                x, y, w, h = (float(inline_match.group(i)) for i in range(1, 5))
+                result[internal_id] = (x, y, w, h)
+            continue
+
+        x = float(rect_match.group(1))
+        y = float(rect_match.group(2))
+        w = float(rect_match.group(3))
+        h = float(rect_match.group(4))
+        result[internal_id] = (x, y, w, h)
+
+    return result

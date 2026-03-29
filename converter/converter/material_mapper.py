@@ -61,6 +61,8 @@ class MaterialMapping:
     metallic: float = 0.0  # Unity _Metallic value (0-1)
     tiling: tuple[float, float] | None = None  # (scaleX, scaleY) from _MainTex_ST
     offset: tuple[float, float] | None = None  # (offsetX, offsetY) from _MainTex_ST
+    emission_color: tuple[float, float, float] | None = None  # Unity _EmissionColor (r,g,b)
+    is_emissive: bool = False  # True if material has emission
 
 
 def _resolve_texture_url(
@@ -276,6 +278,24 @@ def _parse_material(
                 channel="A",
             ))
 
+    # Standalone roughness/smoothness maps (some shaders use these separately)
+    if not metallic_tex:
+        for rough_key in ("_RoughnessMap", "_RoughnessTex", "_SmoothnessMap"):
+            rough_tex = tex_envs.get(rough_key)
+            if rough_tex:
+                rough_path = _resolve_texture(rough_tex, guid_index)
+                if rough_path:
+                    rough_out = textures_dir / f"{mat_path.stem}_roughness.png"
+                    # Smoothness maps need inversion; roughness maps are direct copy
+                    op = "invert_a" if "Smoothness" in rough_key else "copy"
+                    mapping.roughness_map_path = str(rough_out)
+                    mapping.texture_operations.append(TextureOperation(
+                        source_path=str(rough_path),
+                        output_path=str(rough_out),
+                        operation=op,
+                    ))
+                    break
+
     # Fallback: if no metallic map, check for _Metallic float.
     metallic_val = floats.get("_Metallic", 0.0)
     mapping.metallic = float(metallic_val)
@@ -298,8 +318,32 @@ def _parse_material(
                     "Manual review recommended."
                 )
 
+    # Emission: _EmissionColor with non-zero RGB → emissive material
+    colors = mat_data.get("m_Colors", {})
+    if isinstance(colors, dict):
+        emission = colors.get("_EmissionColor", {})
+        if isinstance(emission, dict):
+            er = float(emission.get("r", 0.0))
+            eg = float(emission.get("g", 0.0))
+            eb = float(emission.get("b", 0.0))
+            if er > 0.01 or eg > 0.01 or eb > 0.01:
+                mapping.emission_color = (er, eg, eb)
+                mapping.is_emissive = True
+    # Also check normalized colors structure
+    norm_colors = _normalize_colors(mat_data.get("m_SavedProperties", {}).get("m_Colors", []))
+    if "_EmissionColor" in norm_colors and not mapping.is_emissive:
+        em = norm_colors["_EmissionColor"]
+        er, eg, eb = float(em.get("r", 0)), float(em.get("g", 0)), float(em.get("b", 0))
+        if er > 0.01 or eg > 0.01 or eb > 0.01:
+            mapping.emission_color = (er, eg, eb)
+            mapping.is_emissive = True
+
     # Infer Roblox material from material name keywords
     mapping.roblox_material = _infer_roblox_material(mapping.material_name)
+
+    # Emissive materials → Neon (overrides other material inference)
+    if mapping.is_emissive:
+        mapping.roblox_material = "Neon"
 
     # If the name-based inference didn't find anything, use metallic value
     if mapping.roblox_material == "Plastic":

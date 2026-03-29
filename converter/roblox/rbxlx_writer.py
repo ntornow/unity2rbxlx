@@ -52,6 +52,11 @@ def _ref_id() -> str:
     return f"RBX{uuid4().hex[:32].upper()}"
 
 
+# Maps Unity fileID → Roblox referent for constraint Part1 resolution.
+# Populated during _make_part, consumed during _make_constraint.
+_unity_fid_to_referent: dict[str, str] = {}
+
+
 def _quat_to_rotation_matrix(
     qx: float, qy: float, qz: float, qw: float
 ) -> tuple[float, float, float, float, float, float, float, float, float]:
@@ -396,9 +401,8 @@ def _make_constraint(parent_xml: ET.Element, constraint: RbxConstraint,
                      parent_referent: str = "") -> None:
     """Serialize a physics constraint (WeldConstraint, HingeConstraint, etc.).
 
-    Part0 is set to the parent part (via referent). Part1 requires the connected
-    body's referent, which may not be available at write time. Roblox auto-infers
-    Part0 from the constraint's parent if it's a BasePart.
+    Part0 is set to the parent part (via referent). Part1 is resolved from
+    the connected_body_file_id using the global _unity_fid_to_referent mapping.
     """
     ctype = constraint.constraint_type
     item, props = _make_item(parent_xml, ctype, ctype)
@@ -407,6 +411,14 @@ def _make_constraint(parent_xml: ET.Element, constraint: RbxConstraint,
     if parent_referent:
         ref0 = ET.SubElement(props, "Ref", name="Part0")
         ref0.text = parent_referent
+
+    # Part1 reference (the connected body, resolved from Unity fileID)
+    connected_fid = getattr(constraint, "connected_body_file_id", "")
+    if connected_fid:
+        part1_ref = _unity_fid_to_referent.get(connected_fid, "")
+        if part1_ref:
+            ref1 = ET.SubElement(props, "Ref", name="Part1")
+            ref1.text = part1_ref
 
     if ctype == "HingeConstraint":
         _add_bool(props, "LimitsEnabled", constraint.limits_enabled)
@@ -425,31 +437,78 @@ def _make_constraint(parent_xml: ET.Element, constraint: RbxConstraint,
             _add_float(props, "UpperAngle", constraint.upper_twist_angle)
 
 
-def _make_motor6d(parent_xml: ET.Element, motor6d: "RbxMotor6D",
-                  parent_referent: str = "") -> None:
-    """Serialize a Motor6D joint for skeletal animation.
+def _make_bone_parts_and_motor6ds(
+    parent_xml: ET.Element,
+    motor6ds: list["RbxMotor6D"],
+    parent_referent: str = "",
+) -> None:
+    """Create bone Parts and Motor6D joints for skeletal animation.
 
-    Motor6D connects Part0 (parent bone) to Part1 (child bone) with
-    C0/C1 CFrame offsets defining the joint position relative to each part.
+    Creates small transparent Parts for each bone as children of the mesh part,
+    then creates Motor6D joints with proper Part0/Part1 Ref links. This is how
+    Roblox character rigs work — each bone is a real Part with Motor6D connecting
+    the hierarchy.
 
-    Part0 is set to the parent part's referent. Part1 resolution requires
-    the connected part's referent, which may not be available at write time;
-    Roblox can resolve by name at runtime via the bone attributes.
+    Args:
+        parent_xml: The parent MeshPart's XML element.
+        motor6ds: List of Motor6D joints defining the bone chain.
+        parent_referent: Referent ID of the parent MeshPart.
     """
-    item, props = _make_item(parent_xml, "Motor6D", motor6d.name)
+    if not motor6ds:
+        return
 
-    # Part0 reference (the owning/parent bone part)
-    if parent_referent:
+    # Create a bone Part for each unique bone name, track referent IDs
+    bone_referents: dict[str, str] = {}
+    # The mesh root part itself is available as parent_referent
+    # Collect all unique bone names (both Part0 and Part1)
+    bone_names: set[str] = set()
+    for m in motor6ds:
+        if m.part1_name:
+            bone_names.add(m.part1_name)
+        # Part0 names that aren't the root mesh need bone parts too
+        if m.part0_name and m.part0_name != "HumanoidRootPart":
+            bone_names.add(m.part0_name)
+
+    # Create a tiny transparent Part for each bone
+    for bone_name in sorted(bone_names):
+        ref_id = _ref_id()
+        bone_referents[bone_name] = ref_id
+
+        bone_item = ET.SubElement(parent_xml, "Item")
+        bone_item.set("class", "Part")
+        bone_item.set("referent", ref_id)
+        bone_props = ET.SubElement(bone_item, "Properties")
+        _add_string(bone_props, "Name", bone_name)
+        _add_float(bone_props, "Transparency", 1.0)
+        _add_bool(bone_props, "CanCollide", False)
+        _add_bool(bone_props, "CanQuery", False)
+        _add_bool(bone_props, "Anchored", False)
+        _add_bool(bone_props, "Massless", True)
+        _add_vector3(bone_props, "Size", 0.2, 0.2, 0.2)
+        _add_token(bone_props, "TopSurface", 0)
+        _add_token(bone_props, "BottomSurface", 0)
+
+    # "HumanoidRootPart" maps to the parent mesh part
+    bone_referents["HumanoidRootPart"] = parent_referent
+
+    # Create Motor6D joints
+    for m in motor6ds:
+        item, props = _make_item(parent_xml, "Motor6D", m.name)
+
+        # Part0 reference
+        p0_ref = bone_referents.get(m.part0_name, parent_referent)
         ref0 = ET.SubElement(props, "Ref", name="Part0")
-        ref0.text = parent_referent
+        ref0.text = p0_ref
 
-    # C0 and C1 transforms
-    _add_cframe(props, "C0", motor6d.c0)
-    _add_cframe(props, "C1", motor6d.c1)
+        # Part1 reference
+        p1_ref = bone_referents.get(m.part1_name, "")
+        if p1_ref:
+            ref1 = ET.SubElement(props, "Ref", name="Part1")
+            ref1.text = p1_ref
 
-    # Store part names as string properties for runtime resolution
-    _add_string(props, "Part0Internal", motor6d.part0_name)
-    _add_string(props, "Part1Internal", motor6d.part1_name)
+        # C0 and C1 transforms
+        _add_cframe(props, "C0", m.c0)
+        _add_cframe(props, "C1", m.c1)
 
 
 def _make_trail(parent_xml: ET.Element, trail: RbxTrail) -> None:
@@ -763,6 +822,11 @@ def _make_part(parent_xml: ET.Element, part: RbxPart) -> None:
     else:
         item, props = _make_item(parent_xml, part_class, name)
 
+    # Use pre-registered referent for this part if available (for constraint linking)
+    ufid = getattr(part, "unity_file_id", None)
+    if ufid and str(ufid) in _unity_fid_to_referent:
+        item.set("referent", _unity_fid_to_referent[str(ufid)])
+
         # CFrame
         if hasattr(part, "cframe") and part.cframe:
             _add_cframe(props, "CFrame", part.cframe)
@@ -814,6 +878,52 @@ def _make_part(parent_xml: ET.Element, part: RbxPart) -> None:
         if hasattr(part, "can_collide"):
             _add_bool(props, "CanCollide", part.can_collide)
 
+        # CanQuery (default True — only write if False to save space)
+        can_query = getattr(part, "can_query", True)
+        if not can_query:
+            _add_bool(props, "CanQuery", False)
+
+        # CanTouch (default True — only write if False)
+        can_touch = getattr(part, "can_touch", True)
+        if not can_touch:
+            _add_bool(props, "CanTouch", False)
+
+        # CastShadow (default True — only write if False)
+        cast_shadow = getattr(part, "cast_shadow", True)
+        if not cast_shadow:
+            _add_bool(props, "CastShadow", False)
+
+        # Massless (default False — only write if True)
+        massless = getattr(part, "massless", False)
+        if massless:
+            _add_bool(props, "Massless", True)
+
+        # CollectionService Tags from Unity m_TagString
+        part_attrs = getattr(part, "attributes", {}) or {}
+        unity_tag = part_attrs.get("Tag", "")
+        if unity_tag and unity_tag != "Untagged":
+            # Roblox Tags property is a BinaryString containing the tag name
+            tags_elem = ET.SubElement(props, "BinaryString", name="Tags")
+            tags_elem.text = unity_tag
+
+        # CollisionGroup from Unity layer
+        unity_layer = part_attrs.get("UnityLayer", 0)
+        if unity_layer and int(unity_layer) != 0:
+            _add_string(props, "CollisionGroup", f"UnityLayer{int(unity_layer)}")
+
+        # CustomPhysicalProperties
+        cpp = getattr(part, "custom_physical_properties", None)
+        if cpp is not None:
+            density, friction, elasticity, friction_w, elasticity_w = cpp
+            cpp_elem = ET.SubElement(props, "CustomPhysicalProperties",
+                                     name="CustomPhysicalProperties")
+            ET.SubElement(cpp_elem, "CustomPhysics").text = "true"
+            ET.SubElement(cpp_elem, "Density").text = f"{density:.4f}"
+            ET.SubElement(cpp_elem, "Friction").text = f"{friction:.4f}"
+            ET.SubElement(cpp_elem, "Elasticity").text = f"{elasticity:.4f}"
+            ET.SubElement(cpp_elem, "FrictionWeight").text = f"{friction_w:.4f}"
+            ET.SubElement(cpp_elem, "ElasticityWeight").text = f"{elasticity_w:.4f}"
+
         # Smooth surfaces (avoid default studs)
         _add_token(props, "TopSurface", 0)     # Smooth
         _add_token(props, "BottomSurface", 0)   # Smooth
@@ -826,6 +936,11 @@ def _make_part(parent_xml: ET.Element, part: RbxPart) -> None:
         # Shape (for basic Parts: 1=Ball, 2=Block, 3=Cylinder)
         if part_class == "Part" and hasattr(part, "shape") and part.shape is not None:
             _add_token(props, "Shape", part.shape)
+
+        # CollisionFidelity for MeshParts with MeshCollider
+        coll_fid = getattr(part, "collision_fidelity", None)
+        if coll_fid is not None and part_class == "MeshPart":
+            _add_token(props, "CollisionFidelity", coll_fid)
 
         # MeshId and InitialSize for MeshPart
         if part_class == "MeshPart" and hasattr(part, "mesh_id") and part.mesh_id:
@@ -882,6 +997,52 @@ def _make_part(parent_xml: ET.Element, part: RbxPart) -> None:
     if sa is not None and part_class == "MeshPart":
         _make_surface_appearance(item, sa)
 
+    # Sprite texture → Decal (full image) or SurfaceGui>ImageLabel (atlas crop)
+    sprite_tex = all_attrs.get("_SpriteTextureId", "")
+    if sprite_tex and "rbxassetid" in sprite_tex:
+        has_rect = all(
+            k in all_attrs for k in ("_SpriteRectX", "_SpriteRectY", "_SpriteRectW", "_SpriteRectH")
+        )
+        if has_rect:
+            # Atlas sprite: use SurfaceGui > ImageLabel with ImageRectOffset/Size
+            rx = float(all_attrs["_SpriteRectX"])
+            ry = float(all_attrs["_SpriteRectY"])
+            rw = float(all_attrs["_SpriteRectW"])
+            rh = float(all_attrs["_SpriteRectH"])
+            for face_name in ("Front", "Back"):
+                sg_item, sg_props = _make_item(item, "SurfaceGui", f"SpriteSurfaceGui{face_name}")
+                _add_token(sg_props, "Face", 5 if face_name == "Front" else 2)
+                # SizingMode = 2 (FixedSize) -- not needed, default works fine
+                # Canvas size matches the sprite rect so the image fills the surface
+                canvas = ET.SubElement(sg_props, "UDim2", name="CanvasSize")
+                ET.SubElement(canvas, "XS").text = "0"
+                ET.SubElement(canvas, "XO").text = str(int(rw))
+                ET.SubElement(canvas, "YS").text = "0"
+                ET.SubElement(canvas, "YO").text = str(int(rh))
+
+                il_item, il_props = _make_item(sg_item, "ImageLabel", f"SpriteImage{face_name}")
+                _add_content(il_props, "Image", sprite_tex)
+                _add_float(il_props, "BackgroundTransparency", 1.0)
+                # Fill the SurfaceGui
+                size = ET.SubElement(il_props, "UDim2", name="Size")
+                ET.SubElement(size, "XS").text = "1"
+                ET.SubElement(size, "XO").text = "0"
+                ET.SubElement(size, "YS").text = "1"
+                ET.SubElement(size, "YO").text = "0"
+                # ImageRectOffset and ImageRectSize as Vector2
+                offset_v = ET.SubElement(il_props, "Vector2", name="ImageRectOffset")
+                ET.SubElement(offset_v, "X").text = str(rx)
+                ET.SubElement(offset_v, "Y").text = str(ry)
+                rect_size_v = ET.SubElement(il_props, "Vector2", name="ImageRectSize")
+                ET.SubElement(rect_size_v, "X").text = str(rw)
+                ET.SubElement(rect_size_v, "Y").text = str(rh)
+        else:
+            # Full sprite (no atlas): use simple Decal
+            for face_name, face_val in [("Front", 5), ("Back", 2)]:
+                decal_item, decal_props = _make_item(item, "Decal", f"SpriteDecal{face_name}")
+                _add_content(decal_props, "Texture", sprite_tex)
+                _add_token(decal_props, "Face", face_val)
+
     for light in getattr(part, "lights", None) or []:
         _make_light(item, light)
 
@@ -894,8 +1055,9 @@ def _make_part(parent_xml: ET.Element, part: RbxPart) -> None:
     for constraint in getattr(part, "constraints", None) or []:
         _make_constraint(item, constraint, parent_referent=item.get("referent", ""))
 
-    for motor6d in getattr(part, "motor6ds", None) or []:
-        _make_motor6d(item, motor6d, parent_referent=item.get("referent", ""))
+    motor6ds_list = getattr(part, "motor6ds", None) or []
+    if motor6ds_list:
+        _make_bone_parts_and_motor6ds(item, motor6ds_list, parent_referent=item.get("referent", ""))
 
     for trail in getattr(part, "trails", None) or []:
         _make_trail(item, trail)
@@ -1026,6 +1188,13 @@ def _make_post_processing(lighting_item: ET.Element, pp: RbxPostProcessing) -> N
         _add_float(props, "Glare", pp.atmosphere_glare)
         _add_float(props, "Haze", pp.atmosphere_haze)
 
+    # Extra PP attributes (no direct Roblox equivalent — store for scripts/plugins)
+    pp_attrs = getattr(pp, "attributes", {})
+    if pp_attrs:
+        lighting_props = lighting_item.find("Properties")
+        if lighting_props is not None:
+            _write_attributes(lighting_props, pp_attrs)
+
 
 def _make_camera(workspace_item: ET.Element, camera: RbxCameraConfig) -> None:
     """Add a Camera item under Workspace."""
@@ -1142,6 +1311,18 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, Any]:
     Returns a statistics dictionary with counts of serialized elements:
     ``{"parts", "scripts", "lights", "sounds", "ui_elements"}``.
     """
+    # Reset and pre-populate unity fileID → referent mapping
+    # Pre-pass assigns referents so constraints can resolve Part1 before
+    # the target part is serialized (avoids ordering dependency).
+    _unity_fid_to_referent.clear()
+    def _pre_register(parts: list) -> None:
+        for p in parts:
+            ufid = getattr(p, "unity_file_id", None)
+            if ufid:
+                _unity_fid_to_referent[str(ufid)] = _ref_id()
+            _pre_register(getattr(p, "children", None) or [])
+    _pre_register(getattr(place, "workspace_parts", None) or [])
+
     stats: dict[str, int] = {
         "parts_written": 0,
         "scripts_written": 0,
@@ -1162,7 +1343,19 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, Any]:
     workspace = _make_service(root, "Workspace")
     ws_props = workspace.find("Properties")
     if ws_props is not None:
-        _add_bool(ws_props, "StreamingEnabled", False)
+        # Enable streaming for large scenes (>5000 parts) for better performance
+        def _count_workspace_parts(parts: list) -> int:
+            total = 0
+            for p in parts:
+                total += 1
+                total += _count_workspace_parts(getattr(p, "children", None) or [])
+            return total
+        part_count = _count_workspace_parts(getattr(place, "workspace_parts", None) or [])
+        streaming = part_count > 5000
+        _add_bool(ws_props, "StreamingEnabled", streaming)
+        if streaming:
+            # StreamingIntegrityMode: 1=PauseOutsideLoadedArea (safest)
+            _add_token(ws_props, "StreamingIntegrityMode", 1)
         _add_float(ws_props, "Gravity", 196.2)  # Standard Roblox gravity (9.81 m/s²)
         _add_float(ws_props, "FallenPartsDestroyHeight", -500.0)  # Clean up fallen parts
 
@@ -1171,7 +1364,22 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, Any]:
     water_regions: list = getattr(place, "water_regions", None) or []
     if terrains or water_regions:
         terrain_item, terrain_props = _make_item(workspace, "Terrain", "Terrain")
-        # Embed SmoothGrid binary data if available (baked terrain)
+        # Terrain properties required for Studio to load voxel data
+        ET.SubElement(terrain_props, "bool", name="Decoration").text = "false"
+        # MaterialColors: default color palette (from Studio reference)
+        mc_el = ET.SubElement(terrain_props, "BinaryString", name="MaterialColors")
+        mc_el.text = "AAAAAAAAan8/P39rf2Y/ilY+j35fi21PZmxvZbDqw8faiVpHOi4kHh4lZlw76JxKc3trhHtagcLgc4RKxr21zq2UlJSM"
+        ET.SubElement(terrain_props, "bool", name="SmoothVoxelsUpgraded").text = "false"
+        # Water properties
+        wc = ET.SubElement(terrain_props, "Color3", name="WaterColor")
+        ET.SubElement(wc, "R").text = "0.05"
+        ET.SubElement(wc, "G").text = "0.33"
+        ET.SubElement(wc, "B").text = "0.36"
+        ET.SubElement(terrain_props, "float", name="WaterReflectance").text = "1"
+        ET.SubElement(terrain_props, "float", name="WaterTransparency").text = "0.3"
+        ET.SubElement(terrain_props, "float", name="WaterWaveSize").text = "0.15"
+        ET.SubElement(terrain_props, "float", name="WaterWaveSpeed").text = "10"
+        # Embed SmoothGrid and PhysicsGrid binary data
         for t in terrains:
             sg = getattr(t, "smooth_grid", None)
             pg = getattr(t, "physics_grid", None)
@@ -1179,11 +1387,26 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, Any]:
                 sg_el = ET.SubElement(terrain_props, "BinaryString", name="SmoothGrid")
                 sg_el.text = sg
                 log.info("Embedded SmoothGrid terrain data (%d chars base64)", len(sg))
-            # PhysicsGrid omitted — Roblox regenerates it from SmoothGrid
+            # Always write PhysicsGrid — use provided or default
+            pg_el = ET.SubElement(terrain_props, "BinaryString", name="PhysicsGrid")
+            from roblox.terrain_encoder import encode_physics_grid
+            pg_el.text = pg if pg else encode_physics_grid()
 
     lighting = _make_service(root, "Lighting")
     server_script_service = _make_service(root, "ServerScriptService")
     starter_player = _make_service(root, "StarterPlayer")
+    sp_props = starter_player.find("Properties")
+    if sp_props is not None:
+        # Apply camera settings from Unity scene
+        cam = getattr(place, "camera", None)
+        if cam:
+            fov = getattr(cam, "field_of_view", 70)
+            if fov and fov != 70:
+                _add_float(sp_props, "CameraMaxZoomDistance", max(128, fov * 2))
+            # Near/far clip from Unity camera
+            near_clip = getattr(cam, "near_clip", 0.3)
+            if near_clip and near_clip > 0.3:
+                _add_float(sp_props, "CameraMinZoomDistance", near_clip)
     starter_player_scripts_item, _ = _make_item(starter_player, "StarterPlayerScripts", "StarterPlayerScripts")
     starter_char_scripts_item, _ = _make_item(starter_player, "StarterCharacterScripts", "StarterCharacterScripts")
     starter_gui = _make_service(root, "StarterGui")
@@ -1195,6 +1418,32 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, Any]:
     for part in parts:
         _make_part(workspace, part)
         stats["parts_written"] += _count_parts(part)
+
+    # ---- Default SpawnLocation if none exists ---------------------------
+    def _has_spawn(parts_list: list) -> bool:
+        for p in parts_list:
+            if getattr(p, "name", "") == "SpawnLocation":
+                return True
+            if getattr(p, "class_name", "") == "SpawnLocation":
+                return True
+            if _has_spawn(getattr(p, "children", None) or []):
+                return True
+        return False
+
+    if not _has_spawn(parts):
+        # Create a spawn location above the scene center
+        spawn_item, spawn_props = _make_item(workspace, "SpawnLocation", "SpawnLocation")
+        _add_string(spawn_props, "Name", "SpawnLocation")
+        _add_vector3(spawn_props, "Size", 6, 1, 6)
+        _add_cframe(spawn_props, "CFrame", RbxCFrame(x=0, y=5, z=0))
+        _add_bool(spawn_props, "Anchored", True)
+        _add_float(spawn_props, "Transparency", 1.0)  # Invisible
+        _add_bool(spawn_props, "CanCollide", False)
+        _add_int(spawn_props, "Duration", 0)
+        _add_bool(spawn_props, "Neutral", True)
+        _add_token(spawn_props, "TopSurface", 0)
+        _add_token(spawn_props, "BottomSurface", 0)
+        stats["parts_written"] += 1
 
     # ---- Camera ----------------------------------------------------------
     camera_config: RbxCameraConfig | None = getattr(place, "camera", None)

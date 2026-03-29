@@ -4511,15 +4511,8 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         )
         fixes.append("Fixed CFrame.Angles(axis, speed) → 3-arg form")
 
-    # Humanoid:Move() doesn't exist — should use :MoveTo() for position or Humanoid.MoveDirection for direction
-    # Pattern: control:Move(moveDirection * speed * dt) → control.MoveDirection = moveDirection
-    if ':Move(' in source:
-        source = re.sub(
-            r'(\w+):Move\(([^)]+)\)',
-            r'\1.MoveDirection = \2',
-            source,
-        )
-        fixes.append("Fixed :Move() → .MoveDirection (Humanoid)")
+    # Humanoid:Move() is valid in Roblox — takes (moveDirection: Vector3, relativeToCamera?: bool)
+    # No fix needed; the transpiler emits correct :Move() calls.
 
     # .time property on VFX/particle instances → comment out
     if re.search(r'\w+\.time\s*=\s*[\d.]', source):
@@ -5196,6 +5189,145 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         log.info("  [%s] Fixed common API/syntax mistakes", name)
 
     return source
+
+
+def _fix_end_closing_table(source: str, fixes: list[str]) -> str:
+    """Fix `end` or `end,` used to close table literals instead of `}` or `},`.
+
+    The AI transpiler sometimes uses `end` to close both a table literal and its
+    enclosing function block, but Luau requires `}` for tables.
+
+    Handles three patterns:
+    1. `end` on its own line after table entries → `}` + `end` (close table, then function)
+    2. `end,` inside a table (meant to close a nested table entry) → `},`
+    3. Table containing a `function()...end` followed by `end,` → `},`
+    """
+    lines = source.split('\n')
+    changed = False
+
+    # Track open braces to know when we're inside a table literal
+    # Use a stack: each entry is the line index of the `{`
+    brace_stack: list[int] = []
+    new_lines = []
+
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip()) if stripped else 0
+
+        # Track open braces (table openers)
+        # Count { and } on this line (ignoring strings)
+        no_str = re.sub(r'"[^"]*"', '""', stripped)
+        no_str = re.sub(r"'[^']*'", "''", no_str)
+
+        # Handle `end,` — if we're inside a table literal AND there's no unclosed
+        # function definition above, this should be `},` (table entry close).
+        # But if there IS an unclosed function, `end,` is valid Luau (closes the
+        # function as a table value, e.g., `Key = function() ... end,`).
+        if re.match(r'^end,\s*$', stripped) or re.match(r'^end,\s*--', stripped):
+            if _is_inside_table_context(lines, idx) and not _has_unclosed_function_above(lines, idx):
+                suffix = stripped[3:]  # everything after 'end' (the comma + possible comment)
+                new_lines.append(line[:indent] + '}' + suffix)
+                changed = True
+                continue
+
+        # Handle standalone `end` that should be `}` (closes table) + `end` (closes function)
+        if stripped == 'end':
+            # Look backwards for context
+            prev_idx = idx - 1
+            while prev_idx >= 0 and (not lines[prev_idx].strip() or lines[prev_idx].strip().startswith('--')):
+                prev_idx -= 1
+            if prev_idx >= 0:
+                prev_stripped = lines[prev_idx].strip()
+                # Previous line ends with comma → likely a table entry
+                is_after_table_entry = prev_stripped.endswith(',') or prev_stripped.endswith('},')
+                # Previous line is `end` closing an inner function inside a table
+                is_after_inner_end = prev_stripped == 'end'
+
+                if is_after_table_entry or is_after_inner_end:
+                    # Verify there's an unclosed `{` at this indent level or shallower
+                    open_brace_indent = _find_unclosed_brace_indent(lines, idx)
+                    if open_brace_indent is not None and open_brace_indent <= indent:
+                        # This `end` closes both the table and the enclosing function.
+                        # Replace with `}` to close the table.
+                        # The _append_missing_trailing_ends pass will add the missing
+                        # function `end` later if needed.
+                        new_lines.append(line[:indent] + '}')
+                        changed = True
+                        continue
+
+        new_lines.append(line)
+
+    if changed:
+        fixes.append("Fixed table literal closed with 'end' instead of '}'")
+        return '\n'.join(new_lines)
+    return source
+
+
+def _is_inside_table_context(lines: list[str], idx: int) -> bool:
+    """Check if line at idx is inside an open table literal by counting braces."""
+    depth = 0
+    for i in range(idx - 1, max(idx - 100, -1), -1):
+        s = lines[i].strip()
+        if s.startswith('--'):
+            continue
+        no_str = re.sub(r'"[^"]*"', '""', s)
+        no_str = re.sub(r"'[^']*'", "''", no_str)
+        depth += no_str.count('}') - no_str.count('{')
+        if depth < 0:
+            return True  # There's an unclosed `{`
+        # Stop at function/block boundaries
+        if re.match(r'^(?:local\s+)?function\b', s) and '{' not in s:
+            break
+    return False
+
+
+def _find_unclosed_brace_indent(lines: list[str], idx: int) -> int | None:
+    """Find the indent of the nearest unclosed `{` above idx, or None."""
+    depth = 0
+    for i in range(idx - 1, max(idx - 100, -1), -1):
+        s = lines[i].strip()
+        if s.startswith('--'):
+            continue
+        no_str = re.sub(r'"[^"]*"', '""', s)
+        no_str = re.sub(r"'[^']*'", "''", no_str)
+        for c in reversed(no_str):
+            if c == '}':
+                depth += 1
+            elif c == '{':
+                if depth == 0:
+                    return len(lines[i]) - len(lines[i].lstrip())
+                depth -= 1
+        # Stop at top-level function boundaries
+        if re.match(r'^(?:local\s+)?function\b', s) and '{' not in s:
+            break
+    return None
+
+
+def _has_unclosed_function_above(lines: list[str], idx: int) -> bool:
+    """Check if there's an unclosed `function` definition above idx within the table.
+
+    Walks backwards counting function openers and end closers.
+    Returns True if there's a function with no matching end.
+    """
+    func_depth = 0
+    for i in range(idx - 1, max(idx - 100, -1), -1):
+        s = lines[i].strip()
+        if s.startswith('--'):
+            continue
+        # Count end keywords (closers)
+        if re.match(r'^end\b', s):
+            func_depth += 1
+        # Count function openers
+        if re.search(r'\bfunction\s*\(', s) or re.search(r'\bfunction\s+\w', s):
+            if func_depth > 0:
+                func_depth -= 1
+            else:
+                return True  # Unclosed function found
+        # Stop at table opener line (we don't look past the current table)
+        no_str = re.sub(r'"[^"]*"', '""', s)
+        if '{' in no_str and no_str.count('{') > no_str.count('}'):
+            break
+    return False
 
 
 def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
@@ -6151,6 +6283,77 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
         source = new_source_paren
         fixes.append("Fixed unbalanced trailing parentheses")
 
+    # --- Fix table literals closed with `end` instead of `}` ---
+    # Pattern: `return {` or `local X = {` followed by table entries, then `end`
+    # instead of `}`.  The `end` is meant to close both the table AND the enclosing
+    # function, but Luau needs `}` for the table and a separate `end` for the function.
+    # Also handles `end,` inside tables (should be `},`).
+    source = _fix_end_closing_table(source, fixes)
+
+    # --- Fix trailing comma before `)` from bare-var comment removal ---
+    # Pattern: `(arg1, arg2, )` or `(arg1, arg2,\n  )` from commented-out args
+    if re.search(r',\s*\)', source):
+        source = re.sub(r',(\s*)\)', r'\1)', source)
+        fixes.append("Fixed trailing comma before closing parenthesis")
+
+    # Also handle: trailing comma followed by comment-only lines before `)`
+    # e.g., `y,\n    -- [bare var] 0\n)`
+    if re.search(r',\s*\n(?:\s*--[^\n]*\n)*\s*\)', source):
+        source = re.sub(
+            r',(\s*\n(?:\s*--[^\n]*\n)*\s*\))',
+            r'\1',
+            source,
+        )
+        fixes.append("Fixed trailing comma before comment + closing paren")
+
+    # --- Fix assignment to function call result (L-value error) ---
+    # Pattern: `SomeFunc(args) = value` — invalid, comment it out
+    # Uses a line-by-line approach to handle nested parens properly.
+    lines_lv = source.split('\n')
+    new_lines_lv = []
+    changed_lv = False
+    for lv_line in lines_lv:
+        lv_stripped = lv_line.strip()
+        if lv_stripped and not lv_stripped.startswith('--'):
+            # Check for pattern: identifier.method(anything) = value
+            # by finding the first `(`, matching to its `)`, then checking for ` = `
+            m_lv = re.match(r'^(\s*)(\w+[\w.:]*)\(', lv_line)
+            if m_lv:
+                start = m_lv.end() - 1  # position of `(`
+                depth_lv = 0
+                end_paren = None
+                for ci in range(start, len(lv_line)):
+                    if lv_line[ci] == '(':
+                        depth_lv += 1
+                    elif lv_line[ci] == ')':
+                        depth_lv -= 1
+                        if depth_lv == 0:
+                            end_paren = ci
+                            break
+                if end_paren is not None:
+                    after = lv_line[end_paren + 1:].lstrip()
+                    if after.startswith('=') and not after.startswith('=='):
+                        indent_lv = m_lv.group(1)
+                        new_lines_lv.append(f'{indent_lv}-- [invalid L-value] {lv_stripped}')
+                        changed_lv = True
+                        fixes.append("Commented out assignment to function call result")
+                        continue
+        new_lines_lv.append(lv_line)
+    if changed_lv:
+        source = '\n'.join(new_lines_lv)
+
+    # --- Fix `function table.remove(ClassName, ...)` broken declaration ---
+    # AI sometimes wraps the unregister/remove call as a function declaration
+    # Pattern: `function table.remove(X, table.find(X, ...))` → normal function
+    if 'function table.remove(' in source or 'function table.insert(' in source:
+        source = re.sub(
+            r'^(\s*)function\s+table\.(?:remove|insert)\((\w+),\s*table\.find\([^)]+\)\)',
+            r'\1function \2.Unregister()',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Fixed broken function table.remove declaration")
+
     return source
 
 
@@ -6337,8 +6540,26 @@ def _fix_missing_end_keywords(name: str, source: str, fixes: list[str]) -> str:
                 if re.match(r'^\w+\s*=\s*.+,?\s*$', back_line) and 'local ' not in back_line:
                     is_table_close = True
                     break
+                # Array-style table entries: lines ending with `,` that look like
+                # function calls, string literals, numbers, or closing braces
+                if back_line.endswith(',') and (
+                    re.match(r'^[\w.]+\(', back_line) or  # func(args),
+                    re.match(r'^[\'"{\d]', back_line) or  # string/table/number,
+                    back_line.endswith('},')               # nested table },
+                ):
+                    is_table_close = True
+                    break
+                # Also use brace counting: if there's an unclosed `{` above, it's a table
+                if back_line.endswith(','):
+                    if _is_inside_table_context(result, len(result)):
+                        is_table_close = True
+                        break
                 # Table opening: `= {` at same or lower indent
                 if back_line.endswith('= {') or back_line.endswith('= {},'):
+                    is_table_close = True
+                    break
+                # `return {` at same or lower indent
+                if back_line == 'return {' or back_line.endswith('return {'):
                     is_table_close = True
                     break
                 break  # First meaningful non-blank line doesn't look like a table
@@ -6753,8 +6974,15 @@ def _insert_missing_ends_for_single_statement_blocks(source: str, fixes: list[st
             continue
 
         # Handle 'else' and 'elseif' — they close the current if-block
-        # and open a new one at the same level
+        # and open a new one at the same level.
+        # First, close any deeper nested blocks that are still open (missing `end`).
         if stripped == 'else' or stripped.startswith('elseif '):
+            # Close all blocks on the stack that are deeper than this else/elseif
+            while block_stack and block_stack[-1][0] > indent:
+                top_indent, _top_type = block_stack[-1]
+                result.append(' ' * top_indent + 'end')
+                block_stack.pop()
+                changed = True
             if block_stack and block_stack[-1][1] in ('if', 'else'):
                 block_stack.pop()
             block_type = _is_block_opener(stripped)

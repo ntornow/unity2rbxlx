@@ -34,6 +34,9 @@ from converter.animation_converter import (
     generate_tween_script,
     discover_animations,
     convert_animations,
+    generate_state_machine_script,
+    export_controller_json,
+    export_clip_keyframes,
     _quat_to_euler_degrees,
 )
 
@@ -897,3 +900,295 @@ class TestPipelineIntegration:
         state = PipelineState()
         assert hasattr(state, "animation_result")
         assert state.animation_result is None
+
+
+class TestStateMachineGeneration:
+    """Tests for unified state machine script generation."""
+
+    def _make_controller_with_transitions(self) -> tuple[AnimatorController, dict[str, AnimClip]]:
+        """Create a controller with Idle→Walk→Run states and transitions."""
+        idle = AnimState(
+            name="Idle", file_id="100",
+            clip_guid="guid_idle", speed=1.0,
+            transitions=[
+                AnimTransition(
+                    name="IdleToWalk", dst_state_file_id="200",
+                    conditions=[AnimCondition(parameter="Speed", mode=3, threshold=0.1)],
+                ),
+            ],
+        )
+        walk = AnimState(
+            name="Walk", file_id="200",
+            clip_guid="guid_walk", speed=1.0,
+            transitions=[
+                AnimTransition(
+                    name="WalkToRun", dst_state_file_id="300",
+                    conditions=[AnimCondition(parameter="Speed", mode=3, threshold=5.0)],
+                ),
+                AnimTransition(
+                    name="WalkToIdle", dst_state_file_id="100",
+                    conditions=[AnimCondition(parameter="Speed", mode=4, threshold=0.1)],
+                ),
+            ],
+        )
+        run = AnimState(
+            name="Run", file_id="300",
+            clip_guid="guid_run", speed=1.5,
+            transitions=[
+                AnimTransition(
+                    name="RunToWalk", dst_state_file_id="200",
+                    conditions=[AnimCondition(parameter="Speed", mode=4, threshold=5.0)],
+                ),
+            ],
+        )
+        ctrl = AnimatorController(
+            name="CharacterAnimator",
+            parameters=[
+                AnimParameter(name="Speed", param_type=1, default_float=0.0),
+                AnimParameter(name="IsGrounded", param_type=4, default_bool=True),
+            ],
+            states=[idle, walk, run],
+            default_state_file_id="100",
+        )
+        clips = {
+            "guid_idle": AnimClip(name="Idle", duration=1.0, loop=True, sample_rate=30),
+            "guid_walk": AnimClip(name="Walk", duration=0.8, loop=True, sample_rate=30),
+            "guid_run": AnimClip(name="Run", duration=0.5, loop=True, sample_rate=30),
+        }
+        return ctrl, clips
+
+    def test_state_machine_generates_output(self) -> None:
+        """State machine script should be generated for controllers with transitions."""
+        ctrl, clips = self._make_controller_with_transitions()
+        source = generate_state_machine_script(ctrl, clips, "Player")
+        assert source
+        assert "State Machine" in source
+        assert "CharacterAnimator" in source
+
+    def test_state_machine_has_all_states(self) -> None:
+        """All states should appear in the generated script."""
+        ctrl, clips = self._make_controller_with_transitions()
+        source = generate_state_machine_script(ctrl, clips)
+        assert "Idle" in source
+        assert "Walk" in source
+        assert "Run" in source
+
+    def test_state_machine_initializes_parameters(self) -> None:
+        """Parameters should be initialized as attributes."""
+        ctrl, clips = self._make_controller_with_transitions()
+        source = generate_state_machine_script(ctrl, clips)
+        assert 'SetAttribute("Speed"' in source
+        assert 'SetAttribute("IsGrounded"' in source
+
+    def test_state_machine_has_transitions(self) -> None:
+        """Transition conditions should appear in the script."""
+        ctrl, clips = self._make_controller_with_transitions()
+        source = generate_state_machine_script(ctrl, clips)
+        assert 'GetAttribute("Speed")' in source
+        assert "> 0.1" in source or "> 5" in source
+
+    def test_state_machine_default_state(self) -> None:
+        """Default state should be set to the controller's default."""
+        ctrl, clips = self._make_controller_with_transitions()
+        source = generate_state_machine_script(ctrl, clips)
+        assert 'currentState = "Idle"' in source
+
+    def test_state_machine_trigger_reset(self) -> None:
+        """Trigger parameters should be reset after firing."""
+        ctrl = AnimatorController(
+            name="DoorCtrl",
+            parameters=[AnimParameter(name="Open", param_type=9)],
+            states=[
+                AnimState(name="Closed", file_id="1", clip_guid="g1", transitions=[
+                    AnimTransition(name="t", dst_state_file_id="2",
+                                   conditions=[AnimCondition(parameter="Open", mode=1)]),
+                ]),
+                AnimState(name="Opened", file_id="2", clip_guid="g2"),
+            ],
+            default_state_file_id="1",
+        )
+        clips = {
+            "g1": AnimClip(name="Close", duration=0.5, loop=False, sample_rate=30),
+            "g2": AnimClip(name="Open", duration=0.5, loop=False, sample_rate=30),
+        }
+        source = generate_state_machine_script(ctrl, clips)
+        # Trigger should be reset to false after transition
+        assert 'SetAttribute("Open", false)' in source
+
+
+# ---------------------------------------------------------------------------
+# Animation data export (controller JSON + keyframe data)
+# ---------------------------------------------------------------------------
+
+class TestAnimationDataExport:
+    """Tests for export_controller_json, export_clip_keyframes, and
+    animation_data_modules on AnimationConversionResult."""
+
+    def _make_controller_with_clip(self):
+        clip = AnimClip(
+            name="Walk",
+            duration=1.0,
+            loop=True,
+            sample_rate=30,
+            curves=[
+                AnimCurve(
+                    path="Hips",
+                    property_type="position",
+                    keyframes=[
+                        AnimKeyframe(time=0.0, value=(0.0, 0.0, 0.0)),
+                        AnimKeyframe(time=1.0, value=(1.0, 2.0, 3.0)),
+                    ],
+                ),
+            ],
+        )
+        ctrl = AnimatorController(
+            name="HumanoidCtrl",
+            states=[
+                AnimState(name="Idle", file_id="1", clip_guid="g1"),
+                AnimState(name="Walking", file_id="2", clip_guid="g2",
+                          transitions=[
+                              AnimTransition(
+                                  name="t", dst_state_file_id="1",
+                                  conditions=[AnimCondition(parameter="Speed", mode=4, threshold=0.1)],
+                              ),
+                          ]),
+            ],
+            parameters=[
+                AnimParameter(name="Speed", param_type=1, default_float=0.0),
+            ],
+            default_state_file_id="1",
+        )
+        return ctrl, clip
+
+    def test_export_controller_json(self):
+        """export_controller_json returns correct state machine structure."""
+        ctrl, _ = self._make_controller_with_clip()
+        data = export_controller_json(ctrl)
+        assert data["name"] == "HumanoidCtrl"
+        assert len(data["states"]) == 2
+        assert data["defaultState"] == "Idle"
+        assert data["parameters"][0]["name"] == "Speed"
+        assert data["parameters"][0]["type"] == "Float"
+        # Transition destination should be resolved
+        walking = [s for s in data["states"] if s["name"] == "Walking"][0]
+        assert walking["transitions"][0]["destination"] == "Idle"
+
+    def test_export_clip_keyframes(self):
+        """export_clip_keyframes returns bone keyframe data."""
+        _, clip = self._make_controller_with_clip()
+        data = export_clip_keyframes(clip)
+        assert data["duration"] == 1.0
+        assert "Hips" in data["bones"]
+        frames = data["bones"]["Hips"]
+        assert len(frames) == 2
+        assert frames[0]["time"] == 0.0
+        assert frames[1]["cf"]["x"] == 1.0
+        # Z should be negated (Unity -> Roblox)
+        assert frames[1]["cf"]["z"] == -3.0
+
+    def test_animation_data_modules_generated(self):
+        """convert_animations populates animation_data_modules for controllers with clips."""
+        import json
+        import tempfile, os
+
+        ctrl, clip = self._make_controller_with_clip()
+
+        # Create a minimal project structure with an .anim and .controller
+        with tempfile.TemporaryDirectory() as tmpdir:
+            assets = Path(tmpdir) / "Assets" / "Animations"
+            assets.mkdir(parents=True)
+
+            # Write a minimal .anim file
+            anim_yaml = textwrap.dedent(f"""\
+                %YAML 1.1
+                %TAG !u! tag:unity3d.com,2011:
+                --- !u!74 &7400000
+                AnimationClip:
+                  m_ObjectHideFlags: 0
+                  m_Name: Walk
+                  m_PositionCurves:
+                  - curve:
+                      serializedVersion: 2
+                      m_Curve:
+                      - serializedVersion: 3
+                        time: 0
+                        value: {{x: 0, y: 0, z: 0}}
+                        inSlope: {{x: 0, y: 0, z: 0}}
+                        outSlope: {{x: 0, y: 0, z: 0}}
+                      - serializedVersion: 3
+                        time: 1
+                        value: {{x: 1, y: 2, z: 3}}
+                        inSlope: {{x: 0, y: 0, z: 0}}
+                        outSlope: {{x: 0, y: 0, z: 0}}
+                    path: Hips
+                  m_RotationCurves: []
+                  m_EulerCurves: []
+                  m_ScaleCurves: []
+                  m_AnimationClipSettings:
+                    serializedVersion: 2
+                    m_LoopTime: 1
+                    m_StopTime: 1
+            """)
+            anim_path = assets / "Walk.anim"
+            anim_path.write_text(anim_yaml)
+
+            # Write a .anim.meta to give it a GUID
+            meta = textwrap.dedent("""\
+                fileFormatVersion: 2
+                guid: abcd1234abcd1234abcd1234abcd1234
+            """)
+            (assets / "Walk.anim.meta").write_text(meta)
+
+            # Write a minimal .controller file referencing the clip
+            ctrl_yaml = textwrap.dedent("""\
+                %YAML 1.1
+                %TAG !u! tag:unity3d.com,2011:
+                --- !u!91 &9100000
+                AnimatorController:
+                  m_ObjectHideFlags: 0
+                  m_Name: HumanoidCtrl
+                  m_AnimatorParameters:
+                  - m_Name: Speed
+                    m_Type: 1
+                    m_DefaultFloat: 0
+                    m_DefaultInt: 0
+                    m_DefaultBool: 0
+                  m_AnimatorLayers:
+                  - serializedVersion: 5
+                    m_Name: Base Layer
+                    m_StateMachine:
+                      fileID: 300
+                --- !u!1107 &300
+                AnimatorStateMachine:
+                  m_ChildStates:
+                  - serializedVersion: 1
+                    m_State:
+                      fileID: 400
+                  m_DefaultState:
+                    fileID: 400
+                --- !u!1102 &400
+                AnimatorState:
+                  m_Name: Walk
+                  m_Motion:
+                    fileID: 7400000
+                    guid: abcd1234abcd1234abcd1234abcd1234
+                    type: 2
+                  m_Speed: 1
+                  m_Transitions: []
+            """)
+            ctrl_path = assets / "HumanoidCtrl.controller"
+            ctrl_path.write_text(ctrl_yaml)
+
+            from unity.guid_resolver import build_guid_index
+            guid_index = build_guid_index(Path(tmpdir))
+            result = convert_animations(Path(tmpdir), guid_index=guid_index)
+
+            # Should have generated at least one animation data module
+            assert len(result.animation_data_modules) >= 1
+            module_name, module_source = result.animation_data_modules[0]
+            assert module_name.startswith("AnimationData_")
+            assert "HumanoidCtrl" in module_name
+            # Module should contain valid JSON inside the Luau source
+            assert "JSONDecode" in module_source
+            assert "controller" in module_source
+            assert "keyframes" in module_source

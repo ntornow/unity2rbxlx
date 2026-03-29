@@ -110,6 +110,7 @@ _AUDIO_TYPES = {"AudioSource"}
 
 # Component types that indicate a collider.
 _COLLIDER_TYPES = {"BoxCollider", "SphereCollider", "CapsuleCollider", "MeshCollider",
+                   "WheelCollider",
                    "BoxCollider2D", "CircleCollider2D", "CapsuleCollider2D", "PolygonCollider2D",
                    "EdgeCollider2D"}
 
@@ -145,20 +146,19 @@ _SILENT_SKIP_TYPES = {
     "Terrain", "TerrainCollider", "Canvas", "CanvasScaler",
     "Animator", "Animation",
     "AudioListener", "GUILayer", "FlareLayer",
-    "NavMeshObstacle",
     "EventSystem", "StandaloneInputModule", "GraphicRaycaster",
-    "PlayableDirector",  # Timeline → handled via API mappings in transpiled scripts
     # UI types handled by ui_translator or with no Roblox equivalent
-    "Mask", "RectMask2D", "CanvasGroup", "AspectRatioFitter",
-    "ContentSizeFitter", "LayoutElement",
+    "Mask", "RectMask2D",  # No direct Roblox equivalent for masking
+    "LayoutElement",  # UI layout hints — stored as part attrs if needed
     # Rendering/sorting types with no direct Roblox equivalent
     "SortingGroup", "LightProbeProxyVolume", "ParticleSystemRenderer",
     "SpriteAtlas", "SpriteMask",
-    # 2D tilemap (no Roblox equivalent)
-    "Tilemap", "TilemapRenderer", "TilemapCollider2D", "CompositeCollider2D",
+    # 2D tilemap colliders (tilemap itself is now converted)
+    "TilemapCollider2D", "CompositeCollider2D",
 }
 
 _NAVMESH_TYPES = {"NavMeshAgent"}
+_NAVMESH_OBSTACLE_TYPES = {"NavMeshObstacle"}
 
 # Character controller
 _CHARACTER_CONTROLLER_TYPES = {"CharacterController"}
@@ -168,15 +168,6 @@ _LOD_TYPES = {"LODGroup"}
 
 # Unity built-in primitive mesh fileIDs -> (Roblox Part.Shape enum, flatten_y).
 # Shape enum: 0=Ball, 1=Block, 2=Cylinder, 3=Wedge
-# Default assumed native mesh extent (in FBX units).  Most 3D assets are
-# authored at real-world scale: a 1m crate is ~100 FBX units (cm).  Unity's
-# default FBX import globalScale is 0.01 (1 FBX cm → 0.01 Unity meters),
-# meaning a 100-FBX-unit crate becomes 1 Unity unit = 1 Roblox stud.
-# However, many asset packs use globalScale=0.1 or 1.0.
-# We multiply (Unity_scale × import_scale × _NATIVE_MESH_EXTENT) to get studs.
-# Since we can't parse FBX vertex bounds, we assume typical meshes span
-# ~100 FBX units (1m at default import scale).
-_NATIVE_MESH_EXTENT = 100.0  # approximate FBX-unit span of a typical mesh
 
 # Module-level storage for mesh native sizes (set during convert_scene)
 _mesh_native_sizes: dict[str, tuple[float, float, float]] = {}
@@ -187,6 +178,10 @@ _mesh_texture_ids: dict[str, str] = {}
 # Module-level storage for mesh hierarchies (set during convert_scene)
 # Maps FBX path -> list of sub-mesh dicts with {name, meshId, size, position, textureId}
 _mesh_hierarchies: dict[str, list[dict]] = {}
+
+# Module-level storage for FBX bounding boxes (trimesh fallback for InitialSize)
+# Maps relative asset path -> (width, height, depth) in FBX file units
+_fbx_bounding_boxes: dict[str, tuple[float, float, float]] = {}
 
 # Module-level collector for water regions discovered during node conversion.
 # Populated by _convert_node / _convert_prefab_instance, consumed by convert_scene.
@@ -363,6 +358,61 @@ def _compute_mesh_size(
 
     return None
 
+
+def _compute_mesh_size_from_fbx_bbox(
+    unity_scale: tuple[float, float, float],
+    mesh_guid: str,
+    guid_index: GuidIndex,
+) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
+    """Estimate Roblox MeshPart Size and InitialSize from FBX bounding box data.
+
+    When Studio asset resolution is unavailable, we use trimesh-computed bounding
+    boxes as an approximation for InitialSize.  Roblox imports FBX vertex
+    positions directly, so the bounding box of the FBX geometry (in file units)
+    closely matches what Roblox reports as InitialSize (in studs).
+
+    The formula mirrors _compute_mesh_size:
+        InitialSize ≈ fbx_bounding_box  (FBX file units ≈ Roblox studs)
+        Size = InitialSize × import_scale × unit_ratio × STUDS_PER_METER × unity_scale
+
+    Returns (size, initial_size) or None if no bounding box is available.
+    """
+    if not _fbx_bounding_boxes:
+        return None
+
+    asset_path = guid_index.resolve(mesh_guid)
+    if not asset_path:
+        return None
+
+    relative = guid_index.resolve_relative(mesh_guid)
+    bbox = None
+    for key in [str(relative), str(asset_path)] if relative else [str(asset_path)]:
+        if key in _fbx_bounding_boxes:
+            bbox = _fbx_bounding_boxes[key]
+            break
+
+    if bbox is None:
+        return None
+
+    import_scale = _get_fbx_import_scale(mesh_guid, guid_index)
+    unit_ratio = _get_fbx_unit_ratio(mesh_guid, guid_index)
+
+    # FBX bbox is in file units.  Roblox's InitialSize for an uploaded FBX
+    # equals the raw vertex bounding box, so bbox ≈ InitialSize in studs.
+    initial_size = (bbox[0], bbox[1], bbox[2])
+
+    # Size = how we want Roblox to render the mesh.
+    # Roblox applies Size/InitialSize as the visual scale factor.
+    # We want: visual_scale = import_scale × unit_ratio × STUDS_PER_METER × unity_scale
+    scale_factor = import_scale * unit_ratio * config.STUDS_PER_METER
+    size = (
+        abs(unity_scale[0]) * initial_size[0] * scale_factor,
+        abs(unity_scale[1]) * initial_size[1] * scale_factor,
+        abs(unity_scale[2]) * initial_size[2] * scale_factor,
+    )
+    return size, initial_size
+
+
 _UNITY_BUILTIN_MESH_SHAPES: dict[str, tuple[int, bool]] = {
     "10202": (1, False),    # Cube -> Block
     "10206": (2, False),    # Cylinder -> Cylinder
@@ -382,6 +432,7 @@ def convert_scene(
     mesh_native_sizes: dict[str, tuple[float, float, float]] | None = None,
     mesh_texture_ids: dict[str, str] | None = None,
     mesh_hierarchies: dict[str, list[dict]] | None = None,
+    fbx_bounding_boxes: dict[str, tuple[float, float, float]] | None = None,
 ) -> RbxPlace:
     """Convert a parsed Unity scene to a Roblox place hierarchy.
 
@@ -393,6 +444,7 @@ def convert_scene(
         uploaded_assets: Local path -> rbxassetid URL dict for uploaded meshes.
         mesh_native_sizes: FBX path -> (x, y, z) native mesh size in Roblox studs.
         mesh_texture_ids: FBX path -> rbxassetid:// URL for embedded mesh textures.
+        fbx_bounding_boxes: Relative path -> (w, h, d) in FBX file units from trimesh.
 
     Returns:
         An RbxPlace with workspace parts, lighting, camera, and scripts.
@@ -410,8 +462,15 @@ def convert_scene(
     global _mesh_native_sizes
     _mesh_native_sizes = mesh_native_sizes or {}
     if not _mesh_native_sizes:
-        log.warning("No mesh native sizes available — mesh sizing will use fallback estimates. "
-                    "Run Studio asset resolution for accurate sizing.")
+        log.warning("No mesh native sizes available — mesh sizing will use FBX bounding box fallback. "
+                    "Run Studio asset resolution for exact sizing.")
+
+    # Set module-level FBX bounding boxes for InitialSize fallback
+    global _fbx_bounding_boxes
+    _fbx_bounding_boxes = fbx_bounding_boxes or {}
+    if _fbx_bounding_boxes and not _mesh_native_sizes:
+        log.info("Using FBX bounding boxes for %d meshes as InitialSize fallback",
+                 len(_fbx_bounding_boxes))
 
     # Set module-level mesh texture IDs for use by _resolve_mesh_texture_id
     global _mesh_texture_ids
@@ -800,10 +859,13 @@ def _convert_node(
             if result:
                 part.size, part.initial_size = result
                 sized = True
-        # Fallback: use unity scale as meters when native sizes unavailable.
-        # Without the actual mesh bounding box from Roblox LoadAsset, we assume
-        # the mesh occupies roughly unity_scale meters in each dimension.
-        # This gives reasonable part sizes (a 1x1x1 Unity object → 3.57 studs).
+        # Fallback 1: use FBX bounding box from trimesh as InitialSize estimate.
+        if not sized and guid_index and node.mesh_guid:
+            result = _compute_mesh_size_from_fbx_bbox(node.scale, node.mesh_guid, guid_index)
+            if result:
+                part.size, part.initial_size = result
+                sized = True
+        # Fallback 2: use unity scale as meters when no geometry data available.
         if not sized and guid_index and node.mesh_guid:
             sx, sy, sz = node.scale
             part.size = (
@@ -935,8 +997,9 @@ def _process_components(
         elif ct in _COLLIDER_TYPES:
             is_trigger = bool(int(comp.properties.get("m_IsTrigger", 0)))
             if is_trigger:
-                # Trigger colliders are detection zones — don't expand part size
+                # Trigger colliders are detection zones — don't collide but remain queryable
                 part.can_collide = False
+                part.can_query = True  # Spatial queries (Touched events) still work
             else:
                 # Apply each collider against the original size to avoid
                 # compounding when multiple colliders exist on one node.
@@ -955,6 +1018,16 @@ def _process_components(
                     part.cframe.x += center_offset[0]
                     part.cframe.y += center_offset[1]
                     part.cframe.z += center_offset[2]
+
+                # MeshCollider → set CollisionFidelity based on convex flag
+                if ct == "MeshCollider":
+                    is_convex = bool(int(comp.properties.get("m_Convex", 0)))
+                    # Hull for convex, PreciseConvexDecomposition for non-convex
+                    part.collision_fidelity = 1 if is_convex else 3
+
+                # WheelCollider → Cylinder shape
+                if ct == "WheelCollider":
+                    part.shape = 2  # Cylinder
 
         # -- Rigidbody / Rigidbody2D --
         elif ct in ("Rigidbody", "Rigidbody2D"):
@@ -1016,24 +1089,67 @@ def _process_components(
             if video_frame is not None:
                 part.video_frames.append(video_frame)
 
+        # -- AspectRatioFitter: store aspect ratio for UI layout --
+        elif ct == "AspectRatioFitter":
+            aspect_mode = int(comp.properties.get("m_AspectMode", 0))
+            # 0=None, 1=WidthControlsHeight, 2=HeightControlsWidth, 3=FitInParent, 4=EnvelopeParent
+            if aspect_mode > 0:
+                ratio = float(comp.properties.get("m_AspectRatio", 1.0))
+                part.attributes["_AspectRatio"] = round(ratio, 4)
+                part.attributes["_AspectMode"] = aspect_mode
+
+        # -- ContentSizeFitter: auto-size UI elements --
+        elif ct == "ContentSizeFitter":
+            # 0=Unconstrained, 1=MinSize, 2=PreferredSize
+            h_fit = int(comp.properties.get("m_HorizontalFit", 0))
+            v_fit = int(comp.properties.get("m_VerticalFit", 0))
+            if h_fit > 0 or v_fit > 0:
+                part.attributes["_AutoSizeH"] = h_fit
+                part.attributes["_AutoSizeV"] = v_fit
+
+        # -- CanvasGroup: UI alpha/interactability --
+        elif ct == "CanvasGroup":
+            alpha = float(comp.properties.get("m_Alpha", 1.0))
+            if alpha < 1.0:
+                part.attributes["_GroupTransparency"] = round(1.0 - alpha, 3)
+            interactable = bool(int(comp.properties.get("m_Interactable", 1)))
+            if not interactable:
+                part.attributes["_GroupInteractable"] = False
+
         # -- Components with no Roblox equivalent (skip gracefully) --
         elif ct in _SKIP_TYPES:
             pass  # Intentionally skipped
 
-        # -- LODGroup: mark for LOD child filtering --
+        # -- LODGroup: mark for LOD child filtering + extract distances --
         elif ct in _LOD_TYPES:
             # Flag this node so child conversion skips lower LOD levels
             part.attributes["_HasLODGroup"] = True
+            # Extract LOD transition heights for runtime quality hints
+            lods = comp.properties.get("m_LODs", [])
+            if isinstance(lods, list) and lods:
+                transitions = []
+                for lod_data in lods:
+                    if isinstance(lod_data, dict):
+                        height = float(lod_data.get("screenRelativeTransitionHeight", 0.5))
+                        transitions.append(height)
+                if transitions:
+                    part.attributes["_LODTransitions"] = ",".join(f"{t:.3f}" for t in transitions)
 
-        # -- CharacterController: mark as having character controller --
+        # -- CharacterController: map to Humanoid properties --
         elif ct in _CHARACTER_CONTROLLER_TYPES:
-            # Store character controller properties as attributes
             import config
             height = float(comp.properties.get("m_Height", 2.0))
             radius = float(comp.properties.get("m_Radius", 0.5))
+            step_offset = float(comp.properties.get("m_StepOffset", 0.3))
+            slope_limit = float(comp.properties.get("m_SlopeLimit", 45.0))
+            skin_width = float(comp.properties.get("m_SkinWidth", 0.08))
+            # Convert Unity move speed (m/s) to Roblox WalkSpeed (studs/s)
+            # Unity CharacterController doesn't store speed directly, scripts set it
             part.attributes["_HasCharacterController"] = True
             part.attributes["_WalkSpeed"] = 16.0  # Default Roblox walk speed
-            part.attributes["_JumpHeight"] = float(comp.properties.get("m_StepOffset", 0.3)) * config.STUDS_PER_METER
+            part.attributes["_JumpHeight"] = step_offset * config.STUDS_PER_METER
+            part.attributes["_MaxSlopeAngle"] = slope_limit
+            part.attributes["_HipHeight"] = (height / 2) * config.STUDS_PER_METER
             # Adjust part size to capsule dimensions
             diameter = radius * 2 * config.STUDS_PER_METER
             part.size = (diameter, height * config.STUDS_PER_METER, diameter)
@@ -1057,8 +1173,65 @@ def _process_components(
             sprite_ref = comp.properties.get("m_Sprite", {})
             if isinstance(sprite_ref, dict):
                 sprite_guid = sprite_ref.get("guid", "")
+                sprite_file_id = str(sprite_ref.get("fileID", ""))
                 if sprite_guid and sprite_guid != "0" * 32:
                     part.attributes["_SpriteGuid"] = sprite_guid
+                    # Resolve sprite texture: GUID → asset path → uploaded URL
+                    # Store as _SpriteTextureId for Decal rendering
+                    if guid_index and uploaded_assets:
+                        sprite_path = guid_index.resolve(sprite_guid)
+                        if sprite_path:
+                            sprite_rel = guid_index.resolve_relative(sprite_guid)
+                            for candidate in [str(sprite_path), str(sprite_rel) if sprite_rel else ""]:
+                                if candidate and candidate in uploaded_assets:
+                                    part.attributes["_SpriteTextureId"] = uploaded_assets[candidate]
+                                    break
+                    # Look up sprite rect from texture .meta file for atlas cropping
+                    if guid_index and sprite_file_id:
+                        sprite_path = guid_index.resolve(sprite_guid)
+                        if sprite_path:
+                            meta_path = Path(str(sprite_path) + ".meta")
+                            if meta_path.exists():
+                                from unity.guid_resolver import parse_sprite_rects
+                                rects = parse_sprite_rects(meta_path)
+                                if sprite_file_id in rects:
+                                    rx, ry, rw, rh = rects[sprite_file_id]
+                                    part.attributes["_SpriteRectX"] = rx
+                                    part.attributes["_SpriteRectY"] = ry
+                                    part.attributes["_SpriteRectW"] = rw
+                                    part.attributes["_SpriteRectH"] = rh
+
+        # -- Tilemap: convert tiles to child Parts --
+        elif ct == "Tilemap":
+            from converter.component_converter import convert_tilemap
+            tile_parts = convert_tilemap(comp.properties)
+            if tile_parts:
+                # Wrap tiles in a Folder-like Model
+                folder = RbxPart(
+                    name="TilemapTiles",
+                    class_name="Model",
+                    anchored=True,
+                    children=tile_parts,
+                )
+                folder.attributes["_IsTilemap"] = True
+                part.children.append(folder)
+            else:
+                # Even with no tiles, mark as tilemap
+                part.attributes["_IsTilemap"] = True
+                grid_size = comp.properties.get("m_Size", {})
+                if isinstance(grid_size, dict):
+                    gx = int(float(grid_size.get("x", 0)))
+                    gy = int(float(grid_size.get("y", 0)))
+                    if gx > 0:
+                        part.attributes["_TilemapGridWidth"] = gx
+                    if gy > 0:
+                        part.attributes["_TilemapGridHeight"] = gy
+
+        # -- TilemapRenderer: store sort/render attributes --
+        elif ct == "TilemapRenderer":
+            from converter.component_converter import convert_tilemap_renderer
+            attrs = convert_tilemap_renderer(comp.properties)
+            part.attributes.update(attrs)
 
         # -- Cinemachine: store camera config as attributes --
         elif ct in CINEMACHINE_VIRTUAL_CAMERA_TYPES:
@@ -1082,6 +1255,47 @@ def _process_components(
             stopping_dist = float(comp.properties.get("m_StoppingDistance", 0.0))
             part.attributes["_StoppingDistance"] = stopping_dist * config.STUDS_PER_METER
             part.anchored = False  # NavMesh agents need physics
+
+        # -- PlayableDirector: Timeline playback --
+        elif ct == "PlayableDirector":
+            part.attributes["_HasTimeline"] = True
+            # m_InitialState: 0=Paused, 1=Playing
+            initial_state = int(comp.properties.get("m_InitialState", 0))
+            if initial_state == 1:
+                part.attributes["_TimelineAutoPlay"] = True
+            # m_WrapMode: 0=Hold, 1=Loop, 2=None
+            wrap_mode = int(comp.properties.get("m_WrapMode", 0))
+            if wrap_mode == 1:
+                part.attributes["_TimelineLoop"] = True
+            # m_Duration
+            duration = comp.properties.get("m_Duration", None)
+            if duration is not None:
+                part.attributes["_TimelineDuration"] = float(duration)
+            # Resolve PlayableAsset GUID for reference
+            playable_ref = comp.properties.get("m_PlayableAsset", {})
+            if isinstance(playable_ref, dict):
+                playable_guid = playable_ref.get("guid", "")
+                if playable_guid:
+                    part.attributes["_TimelineAssetGuid"] = playable_guid
+
+        # -- NavMeshObstacle: mark as pathfinding obstacle --
+        elif ct in _NAVMESH_OBSTACLE_TYPES:
+            import config
+            part.attributes["_NavMeshObstacle"] = True
+            # Extract obstacle shape and size
+            obstacle_shape = int(comp.properties.get("m_Shape", 0))  # 0=Capsule, 1=Box
+            if obstacle_shape == 1:  # Box
+                box_size = comp.properties.get("m_Size", {})
+                if isinstance(box_size, dict):
+                    ox = float(box_size.get("x", 1.0)) * config.STUDS_PER_METER
+                    oy = float(box_size.get("y", 1.0)) * config.STUDS_PER_METER
+                    oz = float(box_size.get("z", 1.0)) * config.STUDS_PER_METER
+                    part.attributes["_ObstacleSize"] = f"{ox:.1f},{oy:.1f},{oz:.1f}"
+            carve = bool(int(comp.properties.get("m_Carve", 0)))
+            if carve:
+                part.attributes["_ObstacleCarves"] = True
+            # Obstacles should block pathfinding — CanCollide ensures this
+            part.can_collide = True
 
         # -- SkinnedMeshRenderer: extract bone hierarchy as Motor6D joints --
         elif ct == "SkinnedMeshRenderer":
@@ -1107,11 +1321,25 @@ def _process_components(
     # Rigidbody with isKinematic -> anchored (script-driven movement).
     # Rigidbody without isKinematic -> not anchored (physics-driven).
     if has_rigidbody:
-        anchored, can_collide = convert_rigidbody(rigidbody_props)
+        anchored, can_collide, custom_phys = convert_rigidbody(rigidbody_props)
         part.anchored = anchored
         # Only override can_collide if rigidbody says so.
         if not can_collide:
             part.can_collide = can_collide
+        if custom_phys is not None:
+            part.custom_physical_properties = custom_phys
+        # Store useGravity as attribute if disabled (scripts may need it)
+        # Rigidbody: m_UseGravity (bool), Rigidbody2D: m_GravityScale (float)
+        if "m_GravityScale" in rigidbody_props:
+            gravity_scale = float(rigidbody_props.get("m_GravityScale", 1.0))
+            if gravity_scale != 1.0:
+                part.attributes["GravityScale"] = gravity_scale
+            if gravity_scale == 0.0:
+                part.attributes["UseGravity"] = False
+        else:
+            use_gravity = bool(int(rigidbody_props.get("m_UseGravity", 1)))
+            if not use_gravity:
+                part.attributes["UseGravity"] = False
     else:
         part.anchored = True
 
@@ -1242,6 +1470,16 @@ _MONO_SYSTEM_PROPS = frozenset({
     "m_Script", "m_Name", "m_EditorClassIdentifier", "serializedVersion",
     "m_IncludeLayers", "m_ExcludeLayers", "m_LayerOverridePriority",
     "m_Material", "m_ProvidesContacts",
+    # Unity EventSystem/InputModule fields (not useful in Roblox)
+    "m_SendPointerHoverToParent", "m_ForceModuleActive",
+    "m_HorizontalAxis", "m_VerticalAxis", "m_SubmitButton", "m_CancelButton",
+    "m_InputActionsPerSecond", "m_RepeatDelay", "m_DragThreshold",
+    "m_sendNavigationEvents", "m_firstSelectedGameObject",
+    # Also skip these by their no-prefix variants
+    "SendPointerHoverToParent", "ForceModuleActive",
+    "HorizontalAxis", "VerticalAxis", "SubmitButton", "CancelButton",
+    "InputActionsPerSecond", "RepeatDelay", "DragThreshold",
+    "sendNavigationEvents", "firstSelectedGameObject",
 })
 
 
@@ -1257,25 +1495,39 @@ def _extract_monobehaviour_attributes(
     Object references and complex types are skipped.
     """
     # Resolve script class name from m_Script GUID
+    # Use numbered attributes (_ScriptClass, _ScriptClass_1, _ScriptClass_2, ...)
+    # so multiple MonoBehaviours on the same GameObject all get bound.
     script_ref = properties.get("m_Script", {})
     if isinstance(script_ref, dict) and guid_index:
         script_guid = script_ref.get("guid", "")
         if script_guid:
             script_path = guid_index.resolve(script_guid)
             if script_path and script_path.suffix == ".cs":
-                part.attributes["_ScriptClass"] = script_path.stem
+                class_name = script_path.stem
+                if "_ScriptClass" not in part.attributes:
+                    part.attributes["_ScriptClass"] = class_name
+                else:
+                    # Find next available numbered slot
+                    idx = 1
+                    while f"_ScriptClass_{idx}" in part.attributes:
+                        idx += 1
+                    part.attributes[f"_ScriptClass_{idx}"] = class_name
 
     for key, value in properties.items():
-        if key in _MONO_SYSTEM_PROPS or key.startswith("m_"):
+        if key in _MONO_SYSTEM_PROPS:
             continue
 
         # Only extract simple types that map to Roblox attributes
         if isinstance(value, (int, float)):
-            part.attributes[key] = value
+            # Strip m_ prefix for cleaner attribute names
+            attr_name = key[2:] if key.startswith("m_") else key
+            part.attributes[attr_name] = value
         elif isinstance(value, str) and len(value) < 100:
-            part.attributes[key] = value
+            attr_name = key[2:] if key.startswith("m_") else key
+            part.attributes[attr_name] = value
         elif isinstance(value, bool):
-            part.attributes[key] = value
+            attr_name = key[2:] if key.startswith("m_") else key
+            part.attributes[attr_name] = value
 
 
 # ---------------------------------------------------------------------------
@@ -1401,6 +1653,11 @@ def _apply_materials(
         if comp.component_type not in ("MeshRenderer", "SkinnedMeshRenderer"):
             continue
 
+        # Extract CastShadow from m_CastShadows: 0=Off, 1=On, 2=TwoSided, 3=ShadowsOnly
+        cast_shadows = int(comp.properties.get("m_CastShadows", 1))
+        if cast_shadows == 0:
+            part.cast_shadow = False
+
         mat_refs = comp.properties.get("m_Materials", [])
         if not mat_refs:
             continue
@@ -1443,6 +1700,13 @@ def _apply_materials(
         metallic = getattr(mapping, "metallic", 0.0)
         if metallic and float(metallic) > 0.1:
             part.reflectance = min(1.0, float(metallic) * 0.5)
+
+        # Apply emission color (glowing materials)
+        if getattr(mapping, "is_emissive", False):
+            emission = getattr(mapping, "emission_color", None)
+            if emission:
+                # Clamp HDR emission to 0-1 range
+                part.color = (min(1.0, emission[0]), min(1.0, emission[1]), min(1.0, emission[2]))
 
         # Store texture tiling/offset as attributes for custom shaders
         tiling = getattr(mapping, "tiling", None)
@@ -1811,7 +2075,8 @@ def _apply_gameplay_attributes(part: RbxPart, name: str) -> None:
 
     if 'spawnpoint' in name_lower or 'spawn_point' in name_lower:
         part.attributes['IsSpawnPoint'] = True
-        log.debug('SpawnPoint detected: %s', name)
+        part.class_name = 'SpawnLocation'
+        log.debug('SpawnPoint detected: %s → SpawnLocation', name)
 
     if 'mine' in name_lower and 'pickup' not in name_lower:
         part.attributes['IsMine'] = True
@@ -1916,11 +2181,16 @@ def _convert_fbx_prefab_instance(
         if result:
             mesh_size, mesh_init = result
     elif mesh_guid and guid_index:
-        # Fallback: use FBX import scale when native sizes unavailable
-        import_scale = _get_fbx_import_scale(mesh_guid, guid_index)
-        unit_ratio = _get_fbx_unit_ratio(mesh_guid, guid_index)
-        sf = import_scale * unit_ratio * config.STUDS_PER_METER
-        mesh_size = (combined_scale[0] * sf, combined_scale[1] * sf, combined_scale[2] * sf)
+        # Fallback 1: use FBX bounding box from trimesh
+        result = _compute_mesh_size_from_fbx_bbox(combined_scale, mesh_guid, guid_index)
+        if result:
+            mesh_size, mesh_init = result
+        else:
+            # Fallback 2: use FBX import scale without geometry data
+            import_scale = _get_fbx_import_scale(mesh_guid, guid_index)
+            unit_ratio = _get_fbx_unit_ratio(mesh_guid, guid_index)
+            sf = import_scale * unit_ratio * config.STUDS_PER_METER
+            mesh_size = (combined_scale[0] * sf, combined_scale[1] * sf, combined_scale[2] * sf)
 
     # Infer Roblox material from the FBX filename
     from converter.material_mapper import _infer_roblox_material
@@ -2246,8 +2516,14 @@ def _convert_prefab_instance(
                 if result:
                     part.size, part.initial_size = result
                     sized = True
+            if not sized and guid_index:
+                # Fallback 1: use FBX bounding box from trimesh
+                result = _compute_mesh_size_from_fbx_bbox(combined_scale, root.mesh_guid, guid_index)
+                if result:
+                    part.size, part.initial_size = result
+                    sized = True
             if not sized:
-                # Without native sizes, assume mesh occupies unity_scale meters
+                # Fallback 2: assume mesh occupies unity_scale meters
                 sf = config.STUDS_PER_METER
                 part.size = (
                     max(0.05, abs(combined_scale[0]) * sf),
@@ -2423,8 +2699,14 @@ def _convert_prefab_node(
             if result:
                 part.size, part.initial_size = result
                 sized = True
+        if not sized and guid_index:
+            # Fallback 1: use FBX bounding box from trimesh
+            result = _compute_mesh_size_from_fbx_bbox(local_scl, node.mesh_guid, guid_index)
+            if result:
+                part.size, part.initial_size = result
+                sized = True
         if not sized:
-            # Without native sizes, assume mesh occupies unity_scale meters
+            # Fallback 2: assume mesh occupies unity_scale meters
             sf = config.STUDS_PER_METER
             part.size = (
                 max(0.05, abs(local_scl[0]) * sf),
@@ -2655,17 +2937,27 @@ def _add_floor_and_spawn(place: RbxPlace) -> None:
         # Use terrain Y for floor reference.
         floor_y = place.terrains[0].position[1] - 1
 
-    # SpawnLocation at center, at median Y + 3 studs (where most geometry is)
-    spawn_y = max(median_y + 3, floor_y + 3)
-    spawn = RbxPart(
-        name="SpawnLocation",
-        class_name="Part",
-        cframe=RbxCFrame(x=center_x, y=spawn_y, z=center_z),
-        size=(6, 1, 6),
-        transparency=1.0,
-        anchored=True,
-    )
-    place.workspace_parts.append(spawn)
+    # Check if scene already has SpawnLocation parts (from Unity SpawnPoint objects)
+    def _has_spawn_location(parts):
+        for p in parts:
+            if p.class_name == 'SpawnLocation':
+                return True
+            if getattr(p, 'children', None) and _has_spawn_location(p.children):
+                return True
+        return False
+
+    if not _has_spawn_location(place.workspace_parts or []):
+        # No Unity spawn points found — create a default SpawnLocation
+        spawn_y = max(median_y + 3, floor_y + 3)
+        spawn = RbxPart(
+            name="SpawnLocation",
+            class_name="SpawnLocation",
+            cframe=RbxCFrame(x=center_x, y=spawn_y, z=center_z),
+            size=(6, 1, 6),
+            transparency=1.0,
+            anchored=True,
+        )
+        place.workspace_parts.append(spawn)
 
     # Add a large invisible floor for collision while terrain generates.
     # Terrain is created at runtime by TerrainGenerator script, but the
@@ -2690,8 +2982,7 @@ def _add_floor_and_spawn(place: RbxPlace) -> None:
         place.workspace_parts.append(ground)
 
     if has_terrain:
-        log.info("Terrain-based spawn at (%.0f, %.1f, %.0f) [%d terrains, %d parts]",
-                 center_x, spawn_y, center_z, len(place.terrains), n)
+        log.info("Scene setup complete [%d terrains, %d parts]", len(place.terrains), n)
     else:
-        log.info("Auto-generated floor at y=%.1f (%.0fx%.0f) and SpawnLocation at (%.0f, %.1f, %.0f) [median_y=%.1f, %d parts]",
-                 floor_y, width, depth, center_x, spawn_y, center_z, median_y, n)
+        log.info("Auto-generated floor at y=%.1f (%.0fx%.0f) [median_y=%.1f, %d parts]",
+                 floor_y, width, depth, median_y, n)

@@ -13,7 +13,7 @@ from typing import Any
 
 from core.roblox_types import (
     RbxBeam, RbxCameraConfig, RbxCFrame, RbxConstraint, RbxLight,
-    RbxMotor6D, RbxParticleEmitter, RbxPostProcessing,
+    RbxMotor6D, RbxPart, RbxParticleEmitter, RbxPostProcessing,
     RbxReverbSoundEffect, RbxSound, RbxTerrain, RbxTrail,
     RbxVideoFrame,
 )
@@ -261,6 +261,14 @@ def convert_collider(
         # Complex 2D shapes: keep current size (can't easily approximate)
         return current_size, can_collide, no_offset
 
+    elif component_type == "WheelCollider":
+        # WheelCollider for vehicles — approximate as cylinder
+        import config
+        radius = float(properties.get("m_Radius", 0.5)) * config.STUDS_PER_METER
+        diameter = radius * 2
+        # WheelCollider is round — use diameter for all dimensions
+        return (diameter, diameter, diameter), can_collide, no_offset
+
     else:
         log.warning("Unknown collider type: %s", component_type)
         return current_size, can_collide, no_offset
@@ -379,8 +387,8 @@ def _convert_circle_collider_2d(
 
 def convert_rigidbody(
     properties: dict[str, Any],
-) -> tuple[bool, bool]:
-    """Convert a Unity Rigidbody component to anchored/canCollide flags.
+) -> tuple[bool, bool, tuple[float, float, float, float, float] | None]:
+    """Convert a Unity Rigidbody component to anchored/canCollide/physics properties.
 
     Anchoring logic:
         isKinematic = True  -> anchored = True  (script-driven movement)
@@ -391,11 +399,18 @@ def convert_rigidbody(
         bit 1: FreezePositionX, bit 2: FreezePositionY, bit 3: FreezePositionZ
         bit 4: FreezeRotationX, bit 5: FreezeRotationY, bit 6: FreezeRotationZ
 
+    Physics property mapping:
+        Unity mass (kg) -> Roblox density via mass / volume
+        Unity drag -> Roblox friction approximation (0=frictionless, higher=more friction)
+        Unity useGravity=false -> store as attribute for script use
+
     Args:
         properties: Raw component properties.
 
     Returns:
-        Tuple of (anchored, can_collide).
+        Tuple of (anchored, can_collide, custom_physical_properties).
+        custom_physical_properties is (density, friction, elasticity, frictionWeight, elasticityWeight)
+        or None if default physics are fine.
     """
     is_kinematic = bool(int(properties.get("m_IsKinematic", 0)))
     # Roblox: Anchored parts are not affected by physics.
@@ -415,7 +430,33 @@ def convert_rigidbody(
     if not bool(int(detect_collisions)):
         can_collide = False
 
-    return anchored, can_collide
+    # Extract physics properties for CustomPhysicalProperties
+    # Rigidbody uses m_Drag, Rigidbody2D uses m_LinearDrag
+    mass = float(properties.get("m_Mass", 1.0))
+    drag = float(properties.get("m_Drag", properties.get("m_LinearDrag", 0.0)))
+    angular_drag = float(properties.get("m_AngularDrag", 0.05))
+    use_gravity = bool(int(properties.get("m_UseGravity", 1)))
+
+    # Only set CustomPhysicalProperties if mass differs from default
+    # Roblox density default is ~0.7 (based on default Part mass/volume ratio)
+    # Unity mass is in kg; Roblox density = mass / volume (in studs³)
+    # We can't compute exact density without knowing part volume here,
+    # so we scale relative to Unity's default mass of 1.0:
+    #   mass > 1 → higher density, mass < 1 → lower density
+    # Roblox default density is 0.7, so: density = 0.7 * mass
+    custom_phys = None
+    has_non_default = (mass != 1.0 or drag > 0.01 or angular_drag > 0.06)
+    if has_non_default and not anchored:
+        density = max(0.01, 0.7 * mass)
+        # Unity drag maps loosely to Roblox friction (both resist motion)
+        # drag=0 → friction=0.3 (default), drag=1 → friction=0.7, drag=10 → friction=1.0
+        friction = min(1.0, 0.3 + drag * 0.4)
+        # Default elasticity (bounciness) — Unity PhysicMaterial handles this
+        # but we have no PhysicMaterial data here, use a reasonable default
+        elasticity = 0.5
+        custom_phys = (density, friction, elasticity, 1.0, 1.0)
+
+    return anchored, can_collide, custom_phys
 
 
 # ---------------------------------------------------------------------------
@@ -732,8 +773,9 @@ def convert_particle_system(properties: dict[str, Any]) -> RbxParticleEmitter | 
             if triggers:
                 emitter.attributes["UnitySubEmitterTriggers"] = (
                     ",".join(triggers))
-            log.info("ParticleSystem sub-emitters stored as attributes "
-                     "(would need runtime script)")
+            emitter.attributes["_HasSubEmitters"] = True
+            log.info("ParticleSystem sub-emitters: %d triggers (%s)",
+                     len(sub_list), ",".join(triggers))
 
     # Gravity modifier -> acceleration Y component
     import config
@@ -768,6 +810,194 @@ def convert_particle_system(properties: dict[str, Any]) -> RbxParticleEmitter | 
         emitter.rate = min(emitter.rate, float(max_particles))
 
     return emitter
+
+
+# ---------------------------------------------------------------------------
+# Tilemap conversion
+# ---------------------------------------------------------------------------
+
+
+def convert_tilemap(
+    properties: dict[str, Any],
+    cell_size: tuple[float, float, float] | None = None,
+) -> list[RbxPart]:
+    """Convert a Unity Tilemap component to a list of RbxParts (one per tile).
+
+    Unity Tilemap stores tile data as a grid of sprite/tile references at
+    integer positions.  Each tile becomes a thin Part positioned at the
+    corresponding grid coordinate, scaled by the cell size.
+
+    Args:
+        properties: Raw component properties from the Unity Tilemap.
+        cell_size: Override for cell size (x, y, z) in Unity units.
+            Defaults to (1, 1, 1) if not provided and not in properties.
+
+    Returns:
+        A list of RbxPart instances, one per tile.
+    """
+    import config
+
+    parts: list[RbxPart] = []
+
+    # Cell size from the Grid parent or from properties
+    if cell_size is None:
+        cs = properties.get("m_CellSize", properties.get("cellSize", {}))
+        if isinstance(cs, dict):
+            cx = float(cs.get("x", 1.0))
+            cy = float(cs.get("y", 1.0))
+            cz = float(cs.get("z", 1.0))
+            cell_size = (cx, cy, cz)
+        else:
+            cell_size = (1.0, 1.0, 1.0)
+
+    # Tile thickness in studs (tiles are flat, like sprites)
+    tile_thickness = 0.2
+
+    # Extract tile data -- Unity stores tiles in m_Tiles as a list of entries
+    tiles = properties.get("m_Tiles", [])
+    if not isinstance(tiles, list):
+        tiles = []
+
+    # Also check for m_CompressedTiles (newer Unity format)
+    if not tiles:
+        tiles = properties.get("m_CompressedTiles", [])
+        if not isinstance(tiles, list):
+            tiles = []
+
+    # Extract tile color array if available
+    tile_colors = properties.get("m_TileColorArray", properties.get("m_Colors", []))
+    if not isinstance(tile_colors, list):
+        tile_colors = []
+
+    for i, tile_entry in enumerate(tiles):
+        if not isinstance(tile_entry, dict):
+            continue
+
+        # Position: stored in first/second keys or as m_Position or position
+        pos = tile_entry.get("first", tile_entry.get("m_Position", tile_entry.get("position", {})))
+        if isinstance(pos, dict):
+            tx = int(float(pos.get("x", 0)))
+            ty = int(float(pos.get("y", 0)))
+            tz = int(float(pos.get("z", 0)))
+        else:
+            continue  # No valid position, skip
+
+        # Tile reference (sprite or tile asset)
+        tile_data = tile_entry.get("second", tile_entry.get("m_TileData", tile_entry.get("tile", {})))
+        if isinstance(tile_data, dict):
+            # Check if tile reference is null/empty
+            tile_ref = tile_data.get("m_Tile", tile_data.get("tile", tile_data))
+            if isinstance(tile_ref, dict):
+                file_id = tile_ref.get("fileID", 0)
+                if file_id == 0 and not tile_ref.get("guid"):
+                    continue  # Empty tile slot
+        elif tile_data == 0 or tile_data is None:
+            continue  # Empty tile
+
+        # Convert grid position to Roblox world coordinates
+        # Unity 2D: X is right, Y is up; Roblox: X right, Y up, -Z forward
+        stud_x = tx * cell_size[0] * config.STUDS_PER_METER
+        stud_y = ty * cell_size[1] * config.STUDS_PER_METER
+        stud_z = -(tz * cell_size[2] * config.STUDS_PER_METER)
+
+        # Size: one cell in X/Z, thin in Y (like a sprite)
+        part_sx = cell_size[0] * config.STUDS_PER_METER
+        part_sy = tile_thickness
+        part_sz = cell_size[1] * config.STUDS_PER_METER  # Y cell maps to Z depth
+
+        # Extract color if available
+        color = (0.63, 0.63, 0.63)
+        transparency = 0.0
+        if i < len(tile_colors):
+            tc = tile_colors[i]
+            if isinstance(tc, dict):
+                r = float(tc.get("r", 0.63))
+                g = float(tc.get("g", 0.63))
+                b = float(tc.get("b", 0.63))
+                a = float(tc.get("a", 1.0))
+                color = (r, g, b)
+                if a < 1.0:
+                    transparency = 1.0 - a
+
+        tile_part = RbxPart(
+            name=f"Tile_{tx}_{ty}",
+            class_name="Part",
+            cframe=RbxCFrame(x=stud_x, y=stud_y, z=stud_z),
+            size=(part_sx, part_sy, part_sz),
+            color=color,
+            transparency=transparency,
+            anchored=True,
+            can_collide=True,
+            cast_shadow=False,  # Tiles generally don't need shadow casting
+        )
+
+        # Store tile metadata as attributes
+        tile_part.attributes["_TileGridX"] = tx
+        tile_part.attributes["_TileGridY"] = ty
+        if isinstance(tile_data, dict):
+            sprite_ref = tile_data.get("m_Sprite", tile_data.get("sprite", {}))
+            if isinstance(sprite_ref, dict):
+                guid = sprite_ref.get("guid", "")
+                if guid:
+                    tile_part.attributes["_SpriteGuid"] = guid
+
+        parts.append(tile_part)
+
+    # If no explicit tile entries, check for m_Size to create a placeholder grid
+    if not parts:
+        grid_size = properties.get("m_Size", {})
+        if isinstance(grid_size, dict):
+            gx = int(float(grid_size.get("x", 0)))
+            gy = int(float(grid_size.get("y", 0)))
+            if gx > 0 and gy > 0:
+                log.info("Tilemap has m_Size %dx%d but no tile entries found; "
+                         "storing grid dimensions as attributes", gx, gy)
+
+    return parts
+
+
+def convert_tilemap_renderer(
+    properties: dict[str, Any],
+) -> dict[str, Any]:
+    """Extract TilemapRenderer properties as attributes.
+
+    TilemapRenderer controls rendering order and mode for the tilemap.
+    Since Roblox doesn't have a direct tilemap renderer, we store
+    the sort order and rendering mode as attributes for reference.
+
+    Args:
+        properties: Raw component properties from the Unity TilemapRenderer.
+
+    Returns:
+        A dict of attributes to attach to the parent part/folder.
+    """
+    attrs: dict[str, Any] = {}
+
+    # Sort order (m_SortOrder or m_SortingOrder)
+    sort_order = properties.get("m_SortingOrder",
+                                properties.get("m_SortOrder", 0))
+    attrs["_TilemapSortOrder"] = int(sort_order)
+
+    # Sorting layer
+    sorting_layer = properties.get("m_SortingLayerID",
+                                   properties.get("m_SortingLayer", 0))
+    if sorting_layer:
+        attrs["_TilemapSortingLayer"] = int(sorting_layer)
+
+    # Render mode: 0=Chunk, 1=Individual
+    mode = properties.get("m_Mode", properties.get("mode", 0))
+    attrs["_TilemapRenderMode"] = "Individual" if int(mode) == 1 else "Chunk"
+
+    # Detect tile anchor (defaults to 0.5, 0.5 for center)
+    anchor = properties.get("m_TileAnchor", {})
+    if isinstance(anchor, dict):
+        ax = float(anchor.get("x", 0.5))
+        ay = float(anchor.get("y", 0.5))
+        if abs(ax - 0.5) > 0.01 or abs(ay - 0.5) > 0.01:
+            attrs["_TilemapAnchorX"] = ax
+            attrs["_TilemapAnchorY"] = ay
+
+    return attrs
 
 
 # ---------------------------------------------------------------------------
@@ -1068,6 +1298,23 @@ def convert_post_processing(
                             elif "DepthOfField" in stype:
                                 pp.dof_enabled = True
                                 pp.dof_focus_distance = _extract_scalar(setting.get("focusDistance", {}), 10.0)
+                                found_any = True
+                            elif "Vignette" in stype:
+                                intensity = _extract_scalar(setting.get("intensity", {}), 0.0)
+                                if intensity > 0:
+                                    pp.attributes["VignetteIntensity"] = round(intensity, 3)
+                                    found_any = True
+                            elif "AmbientOcclusion" in stype or "ScreenSpaceAmbientOcclusion" in stype:
+                                pp.attributes["AmbientOcclusionEnabled"] = True
+                                ao_intensity = _extract_scalar(setting.get("intensity", {}), 1.0)
+                                pp.attributes["AmbientOcclusionIntensity"] = round(ao_intensity, 3)
+                                found_any = True
+                            elif "MotionBlur" in stype:
+                                pp.attributes["MotionBlurEnabled"] = True
+                                pp.attributes["MotionBlurIntensity"] = _extract_scalar(setting.get("intensity", {}), 0.5)
+                                found_any = True
+                            elif "ChromaticAberration" in stype:
+                                pp.attributes["ChromaticAberration"] = _extract_scalar(setting.get("intensity", {}), 0.0)
                                 found_any = True
 
     # Enable atmosphere if any post-processing is active (better visual quality)

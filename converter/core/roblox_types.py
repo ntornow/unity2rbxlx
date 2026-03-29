@@ -79,6 +79,10 @@ class RbxPart:
     reflectance: float = 0.0
     anchored: bool = True
     can_collide: bool = True
+    can_query: bool = True         # CanQuery for spatial queries (false for invisible logic parts)
+    can_touch: bool = True         # CanTouch for Touched events
+    cast_shadow: bool = True       # CastShadow for shadow rendering
+    massless: bool = False         # Massless for physics (doesn't contribute to assembly mass)
     mesh_id: str | None = None         # rbxassetid:// URL
     texture_id: str | None = None      # rbxassetid:// URL for MeshPart TextureID
     initial_size: tuple[float, float, float] | None = None  # MeshPart native mesh size
@@ -97,6 +101,10 @@ class RbxPart:
     children: list[RbxPart] = field(default_factory=list)
     scripts: list[RbxScript] = field(default_factory=list)
     attributes: dict[str, Any] = field(default_factory=dict)
+    # CustomPhysicalProperties: (density, friction, elasticity, frictionWeight, elasticityWeight)
+    custom_physical_properties: tuple[float, float, float, float, float] | None = None
+    # CollisionFidelity: 0=Default, 1=Hull, 2=Box, 3=PreciseConvexDecomposition
+    collision_fidelity: int | None = None
 
     # Source Unity node reference (for comparison)
     unity_file_id: str | None = None
@@ -291,6 +299,8 @@ class RbxPostProcessing:
     atmosphere_decay_color: tuple[float, float, float] = (0.93, 0.73, 0.47)
     atmosphere_glare: float = 0.0
     atmosphere_haze: float = 0.0
+    # Extra attributes for effects without direct Roblox equivalent
+    attributes: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

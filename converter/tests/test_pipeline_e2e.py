@@ -21,6 +21,7 @@ def _has_unitypy():
         return False
 
 
+@pytest.mark.slow
 class TestPipelineE2E:
     """End-to-end tests against real test projects."""
 

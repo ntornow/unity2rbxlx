@@ -428,12 +428,44 @@ def resolve(output_dir: str) -> None:
 @click.argument("unity_project", type=click.Path(exists=True))
 @click.option("--output", "-o", type=click.Path(), default="./output")
 @click.option("--scene", type=str, default=None, help="Scene path relative to project")
-def compare(unity_project: str, output: str, scene: str | None) -> None:
+@click.option("--visual", is_flag=True, help="Run visual comparison (capture screenshots + SSIM)")
+@click.option("--unity-screenshot", type=click.Path(), default=None,
+              help="Path to an existing Unity screenshot (skip capture)")
+@click.option("--roblox-screenshot", type=click.Path(), default=None,
+              help="Path to an existing Roblox screenshot (skip capture)")
+@click.option("--crop/--no-crop", default=True,
+              help="Crop viewport margins before SSIM (default: crop)")
+@click.option("--crop-margin", type=float, default=0.1,
+              help="Fraction of image to remove from each edge (0.0-0.5)")
+def compare(
+    unity_project: str,
+    output: str,
+    scene: str | None,
+    visual: bool,
+    unity_screenshot: str | None,
+    roblox_screenshot: str | None,
+    crop: bool,
+    crop_margin: float,
+) -> None:
     """Run comparison between Unity and Roblox versions.
 
-    Generates a state comparison report between the Unity project and its
-    converted Roblox place. If --scene is specified, parses that scene for
-    camera info and object counts.
+    Without --visual, generates a state comparison report (object counts,
+    component types, etc.) between the Unity project and its converted
+    Roblox place.
+
+    With --visual, also captures or uses provided screenshots and computes
+    SSIM (structural similarity) scores with a diff heatmap.
+
+    Examples:
+
+      python u2r.py compare path/to/UnityProject -o ./output
+
+      python u2r.py compare path/to/UnityProject -o ./output --visual
+
+      python u2r.py compare path/to/UnityProject -o ./output --visual \\
+          --unity-screenshot unity.png --roblox-screenshot roblox.png
+
+      python u2r.py compare path/to/UnityProject -o ./output --visual --no-crop
     """
     from pathlib import Path
     import json
@@ -457,6 +489,12 @@ def compare(unity_project: str, output: str, scene: str | None) -> None:
         scene_file = project_path / scene
 
     click.echo(f"Comparing: {scene}")
+
+    # ------------------------------------------------------------------
+    # State comparison (always runs)
+    # ------------------------------------------------------------------
+
+    cam_info: dict | None = None
 
     # Parse Unity scene
     try:
@@ -531,13 +569,131 @@ def compare(unity_project: str, output: str, scene: str | None) -> None:
         click.echo(f"\nNo converted place found at {rbxlx}")
         click.echo("Run: python u2r.py convert <project> -o <output> first")
 
+    # ------------------------------------------------------------------
+    # Visual comparison (--visual flag)
+    # ------------------------------------------------------------------
+
+    visual_results: dict = {}
+
+    if visual:
+        click.echo("\n--- Visual Comparison ---")
+
+        from comparison.screenshot_capture import (
+            run_unity_screenshot,
+            capture_roblox_screenshot,
+            unity_camera_to_roblox,
+        )
+        from comparison.visual_diff import compare_images
+
+        # --- Unity screenshot ---
+        unity_img_path: Path | None = None
+        if unity_screenshot:
+            unity_img_path = Path(unity_screenshot).resolve()
+            if not unity_img_path.exists():
+                click.echo(f"  Unity screenshot not found: {unity_img_path}")
+                unity_img_path = None
+            else:
+                click.echo(f"  Using Unity screenshot: {unity_img_path}")
+        else:
+            click.echo("  Capturing Unity screenshot (batch mode)...")
+            cam_pos = None
+            cam_rot = None
+            if cam_info:
+                cam_pos = cam_info.get("position")
+                cam_rot = cam_info.get("rotation_euler")
+
+            unity_img_path = run_unity_screenshot(
+                unity_project_path=project_path,
+                scene_path=scene,
+                output_path=comparison_dir / "unity_screenshot.png",
+                camera_position=cam_pos,
+                camera_rotation=cam_rot,
+            )
+            if unity_img_path:
+                click.echo(f"  Unity screenshot saved: {unity_img_path}")
+            else:
+                click.echo("  Unity screenshot capture failed (Unity Editor not found or batch mode error)")
+                click.echo("  Tip: Provide a screenshot manually with --unity-screenshot <path>")
+
+        # --- Roblox screenshot ---
+        roblox_img_path: Path | None = None
+        if roblox_screenshot:
+            roblox_img_path = Path(roblox_screenshot).resolve()
+            if not roblox_img_path.exists():
+                click.echo(f"  Roblox screenshot not found: {roblox_img_path}")
+                roblox_img_path = None
+            else:
+                click.echo(f"  Using Roblox screenshot: {roblox_img_path}")
+        else:
+            # Generate the camera positioning script for matched viewpoints
+            roblox_cam = None
+            if cam_info:
+                roblox_cam = unity_camera_to_roblox(
+                    position=cam_info["position"],
+                    rotation_euler=cam_info["rotation_euler"],
+                    fov=cam_info.get("fov", 70.0),
+                )
+                click.echo(f"  Matched camera -> Roblox pos={roblox_cam['position']}, "
+                            f"rot={roblox_cam['rotation']}, fov={roblox_cam['fov']}")
+
+            roblox_expected = capture_roblox_screenshot(
+                output_path=comparison_dir / "roblox_screenshot.png",
+                camera_position=roblox_cam["position"] if roblox_cam else None,
+                camera_rotation=roblox_cam["rotation"] if roblox_cam else None,
+                fov=roblox_cam["fov"] if roblox_cam else 70.0,
+            )
+
+            # Check if a Roblox screenshot was previously saved
+            if roblox_expected and roblox_expected.exists():
+                roblox_img_path = roblox_expected
+                click.echo(f"  Using existing Roblox screenshot: {roblox_img_path}")
+            else:
+                click.echo(f"  Roblox screenshot not yet captured.")
+                if roblox_cam:
+                    script_path = comparison_dir / "position_camera.luau"
+                    click.echo(f"  Camera script: {script_path}")
+                click.echo(f"  To capture: use mcp__Roblox_Studio__screen_capture")
+                click.echo(f"  Then save to: {roblox_expected}")
+                click.echo(f"  Or re-run with: --roblox-screenshot <path>")
+
+        # --- Compute visual diff ---
+        if unity_img_path and roblox_img_path:
+            click.echo("\n  Computing visual similarity...")
+            try:
+                visual_results = compare_images(
+                    image_a_path=unity_img_path,
+                    image_b_path=roblox_img_path,
+                    output_dir=comparison_dir,
+                    crop=crop,
+                    crop_margin=crop_margin,
+                )
+
+                click.echo(f"\n  SSIM (grayscale): {visual_results['ssim']:.4f}")
+                click.echo(f"  SSIM (RGB):       {visual_results['ssim_rgb']:.4f}")
+                click.echo(f"  Pixel diff:       {visual_results['pixel_diff_pct']:.1f}%")
+                click.echo(f"  Quality:          {visual_results['quality_label']}")
+                click.echo(f"  Heatmap:          {visual_results['heatmap_path']}")
+
+            except Exception as exc:
+                click.echo(f"  Visual comparison failed: {exc}")
+                visual_results = {"error": str(exc)}
+        elif visual:
+            click.echo("\n  Skipping SSIM: need both Unity and Roblox screenshots.")
+            click.echo("  Provide with --unity-screenshot and --roblox-screenshot")
+
+    # ------------------------------------------------------------------
     # Save comparison report
+    # ------------------------------------------------------------------
+
     report = {
         "scene": scene,
         "unity": unity_stats,
         "roblox": roblox_stats,
     }
-    report_path = comparison_dir / "state_comparison.json"
+    if visual_results:
+        report["visual"] = visual_results
+
+    report_path = comparison_dir / "comparison_report.json"
     report_path.write_text(json.dumps(report, indent=2, default=str))
     click.echo(f"\nReport saved: {report_path}")
 

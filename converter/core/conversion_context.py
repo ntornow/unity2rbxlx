@@ -56,6 +56,10 @@ class ConversionContext:
     # fbx_path -> list of {name, meshId, size:[x,y,z], position:[x,y,z], textureId}
     mesh_hierarchies: dict[str, Any] = field(default_factory=dict)
 
+    # FBX bounding boxes computed via trimesh (fallback for InitialSize when Studio
+    # resolution is unavailable).  Maps relative asset path -> (w, h, d) in FBX units.
+    fbx_bounding_boxes: dict[str, list[float]] = field(default_factory=dict)
+
     # Multi-scene metadata: scene_name -> {parts, scripts, ...}
     scenes_metadata: dict[str, Any] = field(default_factory=dict)
 

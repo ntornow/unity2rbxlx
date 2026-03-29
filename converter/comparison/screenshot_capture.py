@@ -344,22 +344,115 @@ def _find_camera_recursive(node) -> dict | None:
     return None
 
 
-def capture_roblox_screenshot() -> Optional[Path]:
-    """Capture a screenshot from Roblox Studio via the MCP take_screenshot tool.
+def unity_camera_to_roblox(
+    position: Tuple[float, float, float],
+    rotation_euler: Tuple[float, float, float],
+    fov: float = 60.0,
+) -> dict:
+    """Convert a Unity camera pose to Roblox CFrame parameters.
 
-    Since the actual MCP call is made externally by the orchestrator, this
-    function returns a placeholder path that the caller should replace with the
-    real screenshot once the MCP tool has executed.
+    Unity is left-handed Y-up; Roblox is right-handed Y-up.
+    The Z-axis is negated for position and the rotation is adjusted accordingly.
+
+    Args:
+        position: Unity world-space (x, y, z).
+        rotation_euler: Unity euler angles in degrees (x, y, z).
+        fov: Vertical field of view in degrees.
 
     Returns:
-        A placeholder :class:`Path` pointing to the expected screenshot
-        location, or ``None`` if preconditions are not met.
+        Dict with ``position`` (x, y, z), ``rotation`` (rx, ry, rz) in Roblox
+        coordinates, and ``fov``.
     """
-    placeholder = Path("roblox_screenshot.png")
+    import math
+
+    ux, uy, uz = position
+    rx, ry, rz = rotation_euler
+
+    # Position: negate Z
+    roblox_pos = (ux, uy, -uz)
+
+    # Rotation: negate X and Y euler angles, keep Z
+    # (this is the euler-angle equivalent of the quaternion transform
+    #  used in the converter: negate qx and qy)
+    roblox_rot = (-rx, -ry, rz)
+
+    return {
+        "position": roblox_pos,
+        "rotation": roblox_rot,
+        "fov": fov,
+    }
+
+
+def generate_roblox_camera_luau(
+    position: Tuple[float, float, float],
+    rotation_euler: Tuple[float, float, float],
+    fov: float = 70.0,
+) -> str:
+    """Generate a Luau script that positions the Studio camera and takes a viewport screenshot.
+
+    The script moves workspace.CurrentCamera to the given pose and sets the FOV.
+    It returns "ok" so the caller can confirm execution succeeded.
+
+    Args:
+        position: Roblox world-space (x, y, z).
+        rotation_euler: Euler angles in degrees (x, y, z).
+        fov: Vertical field of view.
+
+    Returns:
+        Luau source code as a string.
+    """
+    px, py, pz = position
+    rx, ry, rz = rotation_euler
+    return textwrap.dedent(f"""\
+        local camera = workspace.CurrentCamera
+        camera.CameraType = Enum.CameraType.Scriptable
+        camera.FieldOfView = {fov}
+        camera.CFrame = CFrame.new({px}, {py}, {pz})
+            * CFrame.Angles(math.rad({rx}), math.rad({ry}), math.rad({rz}))
+        return "ok"
+    """)
+
+
+def capture_roblox_screenshot(
+    output_path: str | Path,
+    camera_position: Optional[Tuple[float, float, float]] = None,
+    camera_rotation: Optional[Tuple[float, float, float]] = None,
+    fov: float = 70.0,
+) -> Optional[Path]:
+    """Capture a screenshot from Roblox Studio via the MCP screen_capture tool.
+
+    This function writes the expected output path and, if camera parameters
+    are provided, generates a Luau script to position the camera first.
+
+    The actual MCP calls must be made by the orchestrator (CLI or agent).
+    This function returns the camera-positioning script (if any) and the
+    expected screenshot path.
+
+    Args:
+        output_path: Where to save the screenshot PNG.
+        camera_position: Optional Roblox-space (x, y, z) to position camera.
+        camera_rotation: Optional euler angles (rx, ry, rz) in degrees.
+        fov: Field of view in degrees.
+
+    Returns:
+        Path to the expected screenshot location.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if camera_position and camera_rotation:
+        luau_script = generate_roblox_camera_luau(camera_position, camera_rotation, fov)
+        script_path = output_path.parent / "position_camera.luau"
+        script_path.write_text(luau_script, encoding="utf-8")
+        logger.info(
+            "Camera positioning script written to %s. "
+            "Execute via mcp__Roblox_Studio__execute_luau before capture.",
+            script_path,
+        )
+
     logger.info(
-        "Roblox screenshot capture requested. "
-        "The orchestrator should invoke mcp__Roblox_Studio__screen_capture "
-        "and save the result to %s",
-        placeholder,
+        "Roblox screenshot capture requested -> %s. "
+        "Use mcp__Roblox_Studio__screen_capture to capture.",
+        output_path,
     )
-    return placeholder
+    return output_path

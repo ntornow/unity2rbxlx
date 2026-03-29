@@ -15,6 +15,10 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 TEST_PROJECTS_DIR = CONVERTER_ROOT.parent / "test_projects"
 
 
+def pytest_configure(config):
+    config.addinivalue_line("markers", "slow: marks tests as slow (deselect with '-m \"not slow\"')")
+
+
 @pytest.fixture
 def fixtures_dir() -> Path:
     return FIXTURES_DIR

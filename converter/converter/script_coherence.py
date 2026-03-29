@@ -74,9 +74,15 @@ def inject_require_calls(
     """
     injected = 0
     script_by_class: dict[str, RbxScript] = {}
+    duplicates: set[str] = set()
     for s in scripts:
         # Use the script name (which comes from the C# class name)
+        if s.name in script_by_class:
+            duplicates.add(s.name)
+            log.warning("Duplicate script class name '%s' — require() may resolve to wrong module", s.name)
         script_by_class[s.name] = s
+    if duplicates:
+        log.warning("  %d duplicate class names: %s", len(duplicates), ", ".join(sorted(duplicates)[:10]))
 
     for s in scripts:
         deps = dependency_map.get(s.name, [])
@@ -212,6 +218,63 @@ def fix_require_classifications(scripts: list[RbxScript]) -> int:
     # Scripts using client-only APIs (LocalPlayer, UserInputService) must be
     # LocalScripts. Scripts using server-only APIs must NOT be LocalScripts.
     fixes += _fix_client_server_classification(scripts)
+
+    # Pass 4: Propagate client-only classification through require chains.
+    # If script A requires module B, and B uses client-only APIs, then A must
+    # also be a LocalScript (otherwise B's LocalPlayer calls will be nil).
+    fixes += _propagate_client_classification(scripts, script_by_name)
+
+    return fixes
+
+
+def _propagate_client_classification(
+    scripts: list[RbxScript],
+    script_by_name: dict[str, RbxScript],
+) -> int:
+    """Propagate client-only requirement through require() chains.
+
+    If script A requires module B, and B uses client-only APIs (LocalPlayer, etc.),
+    then A must be a LocalScript — otherwise B's client APIs will fail at runtime.
+    """
+    # Build set of modules that use client-only APIs
+    client_modules: set[str] = set()
+    for s in scripts:
+        if s.script_type == "ModuleScript":
+            has_client = any(re.search(pat, s.source) for pat in _CLIENT_ONLY_PATTERNS)
+            if has_client:
+                client_modules.add(s.name)
+
+    if not client_modules:
+        return 0
+
+    fixes = 0
+    for s in scripts:
+        if s.script_type != "Script":
+            continue  # Only reclassify Server scripts
+        has_server = any(re.search(pat, s.source) for pat in _SERVER_ONLY_PATTERNS)
+        if has_server:
+            continue  # Don't touch scripts that use server-only APIs
+
+        # Check if this script requires any client-only module
+        # Extract all quoted strings from require() lines to find module names
+        required = set()
+        for line in s.source.split('\n'):
+            if 'require(' not in line:
+                continue
+            # Find all quoted strings in the require() call
+            for m in re.finditer(r'["\'](\w+)["\']', line):
+                required.add(m.group(1))
+            # Also match require(path.ModuleName) patterns
+            m = re.search(r'require\([^)]*\.(\w+)\s*\)', line)
+            if m:
+                required.add(m.group(1))
+
+        if required & client_modules:
+            s.script_type = "LocalScript"
+            fixes += 1
+            shared = required & client_modules
+            log.info("  Reclassified '%s' from Script to LocalScript "
+                     "(requires client-only module: %s)", s.name, ", ".join(shared))
 
     return fixes
 

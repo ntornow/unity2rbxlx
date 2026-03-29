@@ -167,7 +167,7 @@ API_CALL_MAP: dict[str, str] = {
     "Quaternion.AngleAxis": "CFrame.fromAxisAngle",
     "Quaternion.RotateTowards": ":Lerp",
     "Quaternion.Dot": "-- Quaternion.Dot: no direct CFrame equivalent",
-    "Quaternion.FromToRotation": "-- FromToRotation: compute rotation between two directions",
+    "Quaternion.FromToRotation": "quatFromToRotation",
     # -- Color --
     "Color.red": "Color3.new(1, 0, 0)",
     "Color.green": "Color3.new(0, 1, 0)",
@@ -223,7 +223,7 @@ API_CALL_MAP: dict[str, str] = {
     "Animator.GetFloat": ":GetAttribute",
     "Animator.GetInteger": ":GetAttribute",
     "Animator.SetTrigger": "AnimationTrack:Play()",
-    "Animator.ResetTrigger": "-- ResetTrigger: animation state reset",
+    "Animator.ResetTrigger": ":SetAttribute(name, false)",
     "Animator.Play": "AnimationTrack:Play()",
     "Animator.CrossFade": "AnimationTrack:Play()",
     "Animator.CrossFadeInFixedTime": "AnimationTrack:Play()",
@@ -301,11 +301,11 @@ API_CALL_MAP: dict[str, str] = {
     # -- NavMesh --
     "NavMeshAgent": "-- NavMeshAgent: use Roblox PathfindingService",
     "NavMesh.CalculatePath": "PathfindingService:CreatePath()",
-    ".SetDestination(": "-- SetDestination: use Path:ComputeAsync(target)",
+    ".SetDestination(": "navMoveTo(",
     ".remainingDistance": "-- remainingDistance: compute from waypoints",
-    ".isStopped": "-- isStopped: track manually",
-    "navMeshAgent.speed": "-- NavMeshAgent.speed: set Humanoid.WalkSpeed",
-    "agent.speed": "-- NavMeshAgent.speed: set Humanoid.WalkSpeed",
+    ".isStopped": ":GetAttribute('NavIsStopped')",
+    "navMeshAgent.speed": "humanoid.WalkSpeed",
+    "agent.speed": "humanoid.WalkSpeed",
     "NavMeshObstacle": "-- NavMeshObstacle: no direct equivalent",
     # -- New Input System --
     "InputAction": "-- InputAction: use ContextActionService or UserInputService",
@@ -961,6 +961,25 @@ end""",
     "vec3Reflect": """\
 local function vec3Reflect(direction, normal)
 \treturn direction - 2 * direction:Dot(normal) * normal
+end""",
+    "navMoveTo": """\
+local function navMoveTo(humanoid, target)
+\tlocal PathfindingService = game:GetService("PathfindingService")
+\tlocal path = PathfindingService:CreatePath()
+\tlocal root = humanoid.RootPart
+\tif not root then return end
+\tpath:ComputeAsync(root.Position, target)
+\tif path.Status == Enum.PathStatus.Success then
+\t\tlocal waypoints = path:GetWaypoints()
+\t\tfor _, waypoint in waypoints do
+\t\t\thumanoid:MoveTo(waypoint.Position)
+\t\t\thumanoid.MoveToFinished:Wait()
+\t\tend
+\tend
+end""",
+    "quatFromToRotation": """\
+local function quatFromToRotation(fromDir, toDir)
+\treturn CFrame.lookAt(Vector3.zero, toDir) * CFrame.lookAt(Vector3.zero, fromDir):Inverse()
 end""",
     "setActive": """\
 local function setActive(instance, active)

@@ -186,4 +186,82 @@ function AnimatorRuntime:LoadAnimations(animations)
 	end
 end
 
+--- Load bone keyframe data for TweenService-based animation fallback.
+--- Use this when animation asset IDs aren't available (no upload).
+--- @param keyframeData table<string, table> -- Map of motion name -> keyframe table.
+---   Keyframe table format: { bones = { boneName = { {time, cf={x,y,z,rx,ry,rz}}, ... } } }
+function AnimatorRuntime:LoadKeyframes(keyframeData)
+	self._keyframeData = keyframeData
+end
+
+--- Play a bone animation from keyframe data using TweenService.
+--- @param motionName string -- Name of the motion to play.
+--- @param model Model|BasePart -- The model containing bone Parts.
+--- @param loop boolean -- Whether to loop the animation.
+function AnimatorRuntime:_playKeyframeAnimation(motionName, model, loop)
+	local TweenService = game:GetService("TweenService")
+	if not self._keyframeData or not self._keyframeData[motionName] then
+		return
+	end
+
+	local data = self._keyframeData[motionName]
+	local bones = data.bones or {}
+	local duration = data.duration or 1
+
+	-- Stop any existing keyframe animation
+	if self._keyframeConn then
+		self._keyframeConn:Disconnect()
+		self._keyframeConn = nil
+	end
+
+	-- Find bone Parts in the model
+	local boneParts = {}
+	for _, desc in model:GetDescendants() do
+		if desc:IsA("BasePart") then
+			boneParts[desc.Name] = desc
+		end
+	end
+
+	-- Animate each bone using TweenService
+	local function playOnce()
+		for boneName, keyframes in bones do
+			local part = boneParts[boneName]
+			if not part or #keyframes < 2 then continue end
+
+			task.spawn(function()
+				for i = 2, #keyframes do
+					local prev = keyframes[i - 1]
+					local kf = keyframes[i]
+					local dt = kf.time - prev.time
+					if dt <= 0 then continue end
+
+					local cf = kf.cf
+					local targetCF = CFrame.new(cf.x or 0, cf.y or 0, cf.z or 0) *
+						CFrame.Angles(
+							math.rad(cf.rx or 0),
+							math.rad(cf.ry or 0),
+							math.rad(cf.rz or 0)
+						)
+
+					local info = TweenInfo.new(dt, Enum.EasingStyle.Linear)
+					local tween = TweenService:Create(part, info, { CFrame = targetCF })
+					tween:Play()
+					tween.Completed:Wait()
+				end
+			end)
+		end
+		task.wait(duration)
+	end
+
+	if loop then
+		task.spawn(function()
+			while self.currentState and self.currentState.motion == motionName do
+				playOnce()
+			end
+		end)
+	else
+		task.spawn(playOnce)
+	end
+end
+
 return AnimatorRuntime

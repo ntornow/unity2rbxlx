@@ -22,7 +22,7 @@ class TestRbxlxWriter:
         output = tmp_path / "test.rbxlx"
         result = write_rbxlx(place, output)
         assert output.exists()
-        assert result["parts_written"] == 0
+        assert result["parts_written"] == 1  # Default SpawnLocation auto-created
         # Verify valid XML
         tree = ET.parse(output)
         assert tree.getroot().tag == "roblox"
@@ -38,7 +38,7 @@ class TestRbxlxWriter:
         place = RbxPlace(workspace_parts=[part])
         output = tmp_path / "test.rbxlx"
         result = write_rbxlx(place, output)
-        assert result["parts_written"] == 1
+        assert result["parts_written"] == 2  # TestPart + default SpawnLocation
 
         # Check XML structure
         tree = ET.parse(output)
@@ -147,7 +147,7 @@ class TestRbxlxWriter:
         place = RbxPlace(workspace_parts=[parent])
         output = tmp_path / "test.rbxlx"
         result = write_rbxlx(place, output)
-        assert result["parts_written"] == 2
+        assert result["parts_written"] == 3  # parent + child + default SpawnLocation
 
     def test_cdata_wrapping_all_scripts(self, tmp_path):
         """All ProtectedString elements must have CDATA wrapping for valid XML."""
@@ -186,3 +186,100 @@ class TestRbxlxWriter:
         # Verify valid XML
         tree = ET.parse(output)
         assert tree.getroot().tag == "roblox"
+
+
+class TestSpriteAtlasRendering:
+    """Test sprite atlas rect → SurfaceGui > ImageLabel rendering."""
+
+    def test_sprite_with_rect_uses_surface_gui(self, tmp_path):
+        """When sprite has rect attributes, should use SurfaceGui+ImageLabel, not Decal."""
+        from roblox.rbxlx_writer import write_rbxlx
+        part = RbxPart(
+            name="AtlasSprite",
+            size=(2.0, 0.1, 2.0),
+        )
+        part.attributes["_SpriteTextureId"] = "rbxassetid://12345"
+        part.attributes["_SpriteRectX"] = 10.0
+        part.attributes["_SpriteRectY"] = 20.0
+        part.attributes["_SpriteRectW"] = 64.0
+        part.attributes["_SpriteRectH"] = 32.0
+
+        place = RbxPlace(workspace_parts=[part])
+        output = tmp_path / "test.rbxlx"
+        write_rbxlx(place, output)
+
+        tree = ET.parse(output)
+        root = tree.getroot()
+
+        # Find SurfaceGuis with SpriteSurfaceGui in name
+        surface_guis = []
+        for item in root.iter("Item"):
+            if item.get("class") == "SurfaceGui":
+                name_el = item.find("Properties/string[@name='Name']")
+                if name_el is not None and "SpriteSurfaceGui" in (name_el.text or ""):
+                    surface_guis.append(item)
+
+        assert len(surface_guis) == 2, f"Expected 2 SpriteSurfaceGuis (Front+Back), got {len(surface_guis)}"
+
+        # Check that ImageLabel children exist with correct properties
+        for sg in surface_guis:
+            image_labels = [i for i in sg.iter("Item") if i.get("class") == "ImageLabel"]
+            assert len(image_labels) == 1
+            il = image_labels[0]
+            il_props = il.find("Properties")
+
+            # Check ImageRectOffset
+            offset = il_props.find("Vector2[@name='ImageRectOffset']")
+            assert offset is not None
+            assert offset.find("X").text == "10.0"
+            assert offset.find("Y").text == "20.0"
+
+            # Check ImageRectSize
+            rect_size = il_props.find("Vector2[@name='ImageRectSize']")
+            assert rect_size is not None
+            assert rect_size.find("X").text == "64.0"
+            assert rect_size.find("Y").text == "32.0"
+
+        # Should NOT have any sprite Decals
+        sprite_decals = []
+        for item in root.iter("Item"):
+            if item.get("class") == "Decal":
+                name_el = item.find("Properties/string[@name='Name']")
+                if name_el is not None and "Sprite" in (name_el.text or ""):
+                    sprite_decals.append(item)
+        assert len(sprite_decals) == 0, "Atlas sprites should use SurfaceGui, not Decal"
+
+    def test_sprite_without_rect_uses_decal(self, tmp_path):
+        """When sprite has no rect attributes, should use Decal (full texture)."""
+        from roblox.rbxlx_writer import write_rbxlx
+        part = RbxPart(
+            name="FullSprite",
+            size=(2.0, 0.1, 2.0),
+        )
+        part.attributes["_SpriteTextureId"] = "rbxassetid://12345"
+        # No _SpriteRect* attributes
+
+        place = RbxPlace(workspace_parts=[part])
+        output = tmp_path / "test.rbxlx"
+        write_rbxlx(place, output)
+
+        tree = ET.parse(output)
+        root = tree.getroot()
+
+        # Should have Decal children
+        decals = []
+        for item in root.iter("Item"):
+            if item.get("class") == "Decal":
+                name_el = item.find("Properties/string[@name='Name']")
+                if name_el is not None and "SpriteDecal" in (name_el.text or ""):
+                    decals.append(item)
+        assert len(decals) == 2, f"Expected 2 SpriteDecals (Front+Back), got {len(decals)}"
+
+        # Should NOT have SpriteSurfaceGuis
+        surface_guis = []
+        for item in root.iter("Item"):
+            if item.get("class") == "SurfaceGui":
+                name_el = item.find("Properties/string[@name='Name']")
+                if name_el is not None and "SpriteSurfaceGui" in (name_el.text or ""):
+                    surface_guis.append(item)
+        assert len(surface_guis) == 0

@@ -218,13 +218,49 @@ class TestMaterialInference:
 class TestRigidbody:
     def test_kinematic_rigidbody(self):
         props = {"m_IsKinematic": 1}
-        anchored, can_collide = convert_rigidbody(props)
+        anchored, can_collide, custom_phys = convert_rigidbody(props)
         assert anchored is True
 
     def test_dynamic_rigidbody(self):
         props = {"m_IsKinematic": 0}
-        anchored, can_collide = convert_rigidbody(props)
+        anchored, can_collide, custom_phys = convert_rigidbody(props)
         assert anchored is False
+
+    def test_heavy_rigidbody_custom_physics(self):
+        """Heavy objects should get higher density via CustomPhysicalProperties."""
+        props = {"m_IsKinematic": 0, "m_Mass": 10.0, "m_Drag": 0.0}
+        anchored, can_collide, custom_phys = convert_rigidbody(props)
+        assert custom_phys is not None
+        density, friction, elasticity, fw, ew = custom_phys
+        assert density > 0.7  # Heavier than default
+
+    def test_light_rigidbody_custom_physics(self):
+        """Light objects should get lower density."""
+        props = {"m_IsKinematic": 0, "m_Mass": 0.1, "m_Drag": 0.0}
+        anchored, can_collide, custom_phys = convert_rigidbody(props)
+        assert custom_phys is not None
+        density = custom_phys[0]
+        assert density < 0.7  # Lighter than default
+
+    def test_default_mass_no_custom_physics(self):
+        """Default mass=1 should not create CustomPhysicalProperties."""
+        props = {"m_IsKinematic": 0, "m_Mass": 1.0, "m_Drag": 0.0, "m_AngularDrag": 0.05}
+        _, _, custom_phys = convert_rigidbody(props)
+        assert custom_phys is None
+
+    def test_drag_increases_friction(self):
+        """High drag should map to higher friction."""
+        props = {"m_IsKinematic": 0, "m_Mass": 1.0, "m_Drag": 5.0}
+        _, _, custom_phys = convert_rigidbody(props)
+        assert custom_phys is not None
+        friction = custom_phys[1]
+        assert friction > 0.3  # Higher than default
+
+    def test_frozen_constraints_anchored(self):
+        """All position axes frozen should anchor the part."""
+        props = {"m_IsKinematic": 0, "m_Constraints": 0b0000_0111}
+        anchored, _, _ = convert_rigidbody(props)
+        assert anchored is True
 
 
 class TestAudioConversion:
@@ -446,3 +482,211 @@ class TestParticleSystemConversion:
         particle = convert_particle_system(props)
         assert particle is not None
         assert particle.rate == 50.0
+
+
+class TestTilemapConversion:
+    """Tests for Tilemap → grid of RbxParts conversion."""
+
+    def test_empty_tilemap(self):
+        """Tilemap with no tiles should return empty list."""
+        from converter.component_converter import convert_tilemap
+        props = {}
+        parts = convert_tilemap(props)
+        assert parts == []
+
+    def test_tilemap_with_tiles(self):
+        """Tilemap with tile entries should produce one Part per tile."""
+        from converter.component_converter import convert_tilemap
+        import config
+        props = {
+            "m_Tiles": [
+                {
+                    "first": {"x": 0, "y": 0, "z": 0},
+                    "second": {"m_Tile": {"fileID": 11400000, "guid": "abc123"}},
+                },
+                {
+                    "first": {"x": 1, "y": 0, "z": 0},
+                    "second": {"m_Tile": {"fileID": 11400000, "guid": "abc123"}},
+                },
+                {
+                    "first": {"x": 0, "y": 1, "z": 0},
+                    "second": {"m_Tile": {"fileID": 11400000, "guid": "def456"}},
+                },
+            ],
+        }
+        parts = convert_tilemap(props)
+        assert len(parts) == 3
+        # Check positions are at grid coords * cell_size * STUDS_PER_METER
+        assert parts[0].name == "Tile_0_0"
+        assert parts[1].name == "Tile_1_0"
+        assert parts[2].name == "Tile_0_1"
+        # First tile at origin
+        assert abs(parts[0].cframe.x) < 0.01
+        assert abs(parts[0].cframe.y) < 0.01
+        # Second tile offset by 1 cell in X
+        assert abs(parts[1].cframe.x - config.STUDS_PER_METER) < 0.01
+
+    def test_tilemap_custom_cell_size(self):
+        """Tilemap with custom cell size should scale positions accordingly."""
+        from converter.component_converter import convert_tilemap
+        import config
+        props = {
+            "m_Tiles": [
+                {
+                    "first": {"x": 2, "y": 3, "z": 0},
+                    "second": {"m_Tile": {"fileID": 100, "guid": "aaa"}},
+                },
+            ],
+        }
+        cell = (0.5, 0.5, 1.0)
+        parts = convert_tilemap(cell_size=cell, properties=props)
+        assert len(parts) == 1
+        expected_x = 2 * 0.5 * config.STUDS_PER_METER
+        expected_y = 3 * 0.5 * config.STUDS_PER_METER
+        assert abs(parts[0].cframe.x - expected_x) < 0.01
+        assert abs(parts[0].cframe.y - expected_y) < 0.01
+
+    def test_tilemap_cell_size_from_properties(self):
+        """Cell size should be read from m_CellSize in properties."""
+        from converter.component_converter import convert_tilemap
+        import config
+        props = {
+            "m_CellSize": {"x": 2.0, "y": 2.0, "z": 1.0},
+            "m_Tiles": [
+                {
+                    "first": {"x": 1, "y": 0, "z": 0},
+                    "second": {"m_Tile": {"fileID": 100, "guid": "bbb"}},
+                },
+            ],
+        }
+        parts = convert_tilemap(props)
+        assert len(parts) == 1
+        expected_x = 1 * 2.0 * config.STUDS_PER_METER
+        assert abs(parts[0].cframe.x - expected_x) < 0.01
+
+    def test_tilemap_skips_empty_tiles(self):
+        """Tiles with fileID=0 and no guid should be skipped."""
+        from converter.component_converter import convert_tilemap
+        props = {
+            "m_Tiles": [
+                {
+                    "first": {"x": 0, "y": 0, "z": 0},
+                    "second": {"m_Tile": {"fileID": 0}},
+                },
+                {
+                    "first": {"x": 1, "y": 0, "z": 0},
+                    "second": {"m_Tile": {"fileID": 11400000, "guid": "abc"}},
+                },
+            ],
+        }
+        parts = convert_tilemap(props)
+        assert len(parts) == 1
+        assert parts[0].name == "Tile_1_0"
+
+    def test_tilemap_tile_attributes(self):
+        """Each tile should store grid coordinates as attributes."""
+        from converter.component_converter import convert_tilemap
+        props = {
+            "m_Tiles": [
+                {
+                    "first": {"x": 5, "y": -3, "z": 0},
+                    "second": {"m_Sprite": {"guid": "sprite123"}, "m_Tile": {"fileID": 100, "guid": "t1"}},
+                },
+            ],
+        }
+        parts = convert_tilemap(props)
+        assert len(parts) == 1
+        assert parts[0].attributes["_TileGridX"] == 5
+        assert parts[0].attributes["_TileGridY"] == -3
+
+    def test_tilemap_tile_colors(self):
+        """Tile colors from m_TileColorArray should be applied."""
+        from converter.component_converter import convert_tilemap
+        props = {
+            "m_Tiles": [
+                {
+                    "first": {"x": 0, "y": 0, "z": 0},
+                    "second": {"m_Tile": {"fileID": 100, "guid": "t1"}},
+                },
+            ],
+            "m_TileColorArray": [
+                {"r": 1.0, "g": 0.0, "b": 0.0, "a": 0.5},
+            ],
+        }
+        parts = convert_tilemap(props)
+        assert len(parts) == 1
+        assert parts[0].color == (1.0, 0.0, 0.0)
+        assert abs(parts[0].transparency - 0.5) < 0.01
+
+    def test_tilemap_parts_are_thin(self):
+        """Tile parts should be thin (like sprites)."""
+        from converter.component_converter import convert_tilemap
+        props = {
+            "m_Tiles": [
+                {
+                    "first": {"x": 0, "y": 0, "z": 0},
+                    "second": {"m_Tile": {"fileID": 100, "guid": "t1"}},
+                },
+            ],
+        }
+        parts = convert_tilemap(props)
+        assert len(parts) == 1
+        # Y dimension (thickness) should be small
+        assert parts[0].size[1] <= 0.5
+
+    def test_tilemap_parts_anchored_no_shadow(self):
+        """Tile parts should be anchored and not cast shadows."""
+        from converter.component_converter import convert_tilemap
+        props = {
+            "m_Tiles": [
+                {
+                    "first": {"x": 0, "y": 0, "z": 0},
+                    "second": {"m_Tile": {"fileID": 100, "guid": "t1"}},
+                },
+            ],
+        }
+        parts = convert_tilemap(props)
+        assert len(parts) == 1
+        assert parts[0].anchored is True
+        assert parts[0].cast_shadow is False
+
+
+class TestTilemapRendererConversion:
+    """Tests for TilemapRenderer attribute extraction."""
+
+    def test_default_renderer(self):
+        """Default TilemapRenderer should have sort order 0 and Chunk mode."""
+        from converter.component_converter import convert_tilemap_renderer
+        props = {}
+        attrs = convert_tilemap_renderer(props)
+        assert attrs["_TilemapSortOrder"] == 0
+        assert attrs["_TilemapRenderMode"] == "Chunk"
+
+    def test_sort_order(self):
+        """Sort order should be extracted from m_SortingOrder."""
+        from converter.component_converter import convert_tilemap_renderer
+        props = {"m_SortingOrder": 5}
+        attrs = convert_tilemap_renderer(props)
+        assert attrs["_TilemapSortOrder"] == 5
+
+    def test_individual_mode(self):
+        """Mode=1 should produce Individual render mode."""
+        from converter.component_converter import convert_tilemap_renderer
+        props = {"m_Mode": 1}
+        attrs = convert_tilemap_renderer(props)
+        assert attrs["_TilemapRenderMode"] == "Individual"
+
+    def test_tile_anchor(self):
+        """Non-default tile anchor should be stored."""
+        from converter.component_converter import convert_tilemap_renderer
+        props = {"m_TileAnchor": {"x": 0.0, "y": 0.0}}
+        attrs = convert_tilemap_renderer(props)
+        assert attrs["_TilemapAnchorX"] == 0.0
+        assert attrs["_TilemapAnchorY"] == 0.0
+
+    def test_default_anchor_not_stored(self):
+        """Default anchor (0.5, 0.5) should not produce extra attributes."""
+        from converter.component_converter import convert_tilemap_renderer
+        props = {"m_TileAnchor": {"x": 0.5, "y": 0.5}}
+        attrs = convert_tilemap_renderer(props)
+        assert "_TilemapAnchorX" not in attrs
