@@ -112,8 +112,13 @@ def inject_require_calls(
                          dep, old_type, s.name)
                 # Add return statement if missing
                 stripped_source = target.source.rstrip()
-                if not stripped_source.endswith(f"return {dep}"):
-                    # Wrap the script in a module table pattern
+                # Check if already ends with any return statement
+                last_lines = stripped_source.split('\n')
+                has_return = any(
+                    line.strip().startswith('return ')
+                    for line in last_lines[-3:]  # check last 3 lines
+                )
+                if not has_return:
                     target.source = stripped_source + f"\n\nreturn {dep}\n"
                 # Add module table definition if missing
                 if f"local {dep} = " not in target.source:

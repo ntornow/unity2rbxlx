@@ -1561,6 +1561,7 @@ Lifecycle:
 - OnDestroy → `script.Destroying:Connect(function() ... end)` or Maid pattern
 - OnEnable/OnDisable → manual enable/disable via attributes
 - OnCollisionEnter/OnTriggerEnter → `part.Touched:Connect(function(otherPart) ... end)`
+  **IMPORTANT**: `.Touched` only works on BasePart instances, NOT Models. If `script.Parent` is a Model, find the first BasePart child: `local part = script.Parent:FindFirstChildWhichIsA("BasePart")`
 
 Core:
 - `Debug.Log/LogWarning/LogError` → `print` / `warn`
@@ -1582,6 +1583,7 @@ Input:
 
 UI:
 - Unity Canvas GameObjects become Roblox ScreenGuis. When a script references its own Canvas, find it via `playerGui:FindFirstChildOfClass("ScreenGui")` or by the Canvas's actual name — NOT by the script's class name.
+- **NEVER** use `WaitForChild` with the script's own class name to find a ScreenGui. Use `FindFirstChildOfClass("ScreenGui")` instead. If the ScreenGui hasn't loaded yet, use `playerGui:WaitForChild("ScreenGui", 10)` with a timeout, NOT infinite yield.
 
 Camera (FPS/First-Person):
 - Set `camera.CameraType = Enum.CameraType.Scriptable` before controlling the camera
