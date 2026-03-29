@@ -20,18 +20,26 @@ from core.coordinate_system import (
 
 class TestUnityToRobloxPos:
     def test_z_negation(self):
-        assert unity_to_roblox_pos(1.0, 2.0, 3.0) == (1.0, 2.0, -3.0)
+        from config import STUDS_PER_METER as S
+        x, y, z = unity_to_roblox_pos(1.0, 2.0, 3.0)
+        assert abs(x - 1.0 * S) < 0.001
+        assert abs(y - 2.0 * S) < 0.001
+        assert abs(z - (-3.0 * S)) < 0.001
 
     def test_zero(self):
         assert unity_to_roblox_pos(0, 0, 0) == (0, 0, 0)
 
     def test_negative_z(self):
-        assert unity_to_roblox_pos(1, 2, -5) == (1, 2, 5)
+        from config import STUDS_PER_METER as S
+        x, y, z = unity_to_roblox_pos(1, 2, -5)
+        assert abs(x - 1 * S) < 0.001
+        assert abs(z - 5 * S) < 0.001
 
-    def test_preserves_xy(self):
+    def test_scales_to_studs(self):
+        from config import STUDS_PER_METER as S
         x, y, z = unity_to_roblox_pos(10, 20, 30)
-        assert x == 10
-        assert y == 20
+        assert abs(x - 10 * S) < 0.001
+        assert abs(y - 20 * S) < 0.001
 
 
 class TestUnityQuatToRobloxQuat:
@@ -90,12 +98,13 @@ class TestUnityTransformToRobloxCFrame:
         assert abs(result[3] - 1.0) < 1e-6  # R00
 
     def test_z_negation_in_cframe(self):
+        from config import STUDS_PER_METER as S
         result = unity_transform_to_roblox_cframe(
             (1, 2, 3), (0, 0, 0, 1)
         )
-        assert result[0] == 1.0   # X preserved
-        assert result[1] == 2.0   # Y preserved
-        assert result[2] == -3.0  # Z negated
+        assert abs(result[0] - 1.0 * S) < 0.001  # X scaled
+        assert abs(result[1] - 2.0 * S) < 0.001  # Y scaled
+        assert abs(result[2] - (-3.0 * S)) < 0.001  # Z negated + scaled
 
 
 class TestUnityScaleToRobloxSize:

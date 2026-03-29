@@ -16,8 +16,12 @@ import math
 def unity_to_roblox_pos(
     x: float, y: float, z: float,
 ) -> tuple[float, float, float]:
-    """Convert Unity position to Roblox position (negate Z)."""
-    return (x, y, -z)
+    """Convert Unity position (meters) to Roblox position (studs, Z-negated).
+
+    Applies STUDS_PER_METER scaling (1 Unity meter ≈ 3.571 studs).
+    """
+    from config import STUDS_PER_METER
+    return (x * STUDS_PER_METER, y * STUDS_PER_METER, -z * STUDS_PER_METER)
 
 
 def unity_quat_to_roblox_quat(
