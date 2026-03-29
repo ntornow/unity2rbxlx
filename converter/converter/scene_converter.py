@@ -873,18 +873,25 @@ def _convert_node(
                 max(0.05, abs(sy) * config.STUDS_PER_METER),
                 max(0.05, abs(sz) * config.STUDS_PER_METER),
             )
-        # Store Unity scale for MeshLoader runtime sizing.
-        # MeshLoader uses: finalSize = InitialSize * scaleX/Y/Z
-        # InitialSize from Roblox's CreateMeshPartAsync already includes the
-        # FBX import scale and unit conversion. We only need the Unity instance
-        # scale (localScale from the scene/prefab).
-        if has_mesh and node.mesh_guid and guid_index:
+        # Store scale for MeshLoader runtime sizing.
+        # Roblox's CreateMeshPartAsync returns InitialSize in raw FBX units (often cm).
+        # We need: finalSize = InitialSize * import_scale * STUDS_PER_METER * unity_scale
+        # Store the combined scale factor so MeshLoader can compute:
+        #   newPart.Size = InitialSize * _ScaleX/Y/Z
+        if has_mesh:
             sx, sy, sz = node.scale
             if not hasattr(part, "attributes") or part.attributes is None:
                 part.attributes = {}
-            part.attributes["_ScaleX"] = abs(sx)
-            part.attributes["_ScaleY"] = abs(sy)
-            part.attributes["_ScaleZ"] = abs(sz)
+            # Get FBX import scale (converts FBX units to Unity meters)
+            import_scale = 0.01  # default for cm FBX files
+            unit_ratio = 1.0
+            if node.mesh_guid and guid_index:
+                import_scale = _get_fbx_import_scale(node.mesh_guid, guid_index)
+                unit_ratio = _get_fbx_unit_ratio(node.mesh_guid, guid_index)
+            scale_factor = import_scale * unit_ratio * config.STUDS_PER_METER
+            part.attributes["_ScaleX"] = abs(sx) * scale_factor
+            part.attributes["_ScaleY"] = abs(sy) * scale_factor
+            part.attributes["_ScaleZ"] = abs(sz) * scale_factor
         # Set TextureID from embedded FBX texture if available
         tex_id = _resolve_mesh_texture_id(node.mesh_guid, guid_index)
         if tex_id:
@@ -2207,6 +2214,16 @@ def _convert_fbx_prefab_instance(
     )
     if mesh_id:
         part.mesh_id = mesh_id
+    # Store scale for MeshLoader runtime sizing
+    if mesh_guid and guid_index:
+        _imp = _get_fbx_import_scale(mesh_guid, guid_index)
+        _ur = _get_fbx_unit_ratio(mesh_guid, guid_index)
+    else:
+        _imp, _ur = 0.01, 1.0
+    _sf2 = _imp * _ur * config.STUDS_PER_METER
+    part.attributes["_ScaleX"] = abs(combined_scale[0]) * _sf2
+    part.attributes["_ScaleY"] = abs(combined_scale[1]) * _sf2
+    part.attributes["_ScaleZ"] = abs(combined_scale[2]) * _sf2
 
     return [part]
 
@@ -2508,6 +2525,13 @@ def _convert_prefab_instance(
                                         mesh_file_id=root.mesh_file_id if hasattr(root, 'mesh_file_id') else None)
             if mesh_id:
                 part.mesh_id = mesh_id
+            # Store scale attributes for MeshLoader runtime sizing
+            _imp_scale = _get_fbx_import_scale(root.mesh_guid, guid_index) if guid_index else 0.01
+            _unit_ratio = _get_fbx_unit_ratio(root.mesh_guid, guid_index) if guid_index else 1.0
+            _sf = _imp_scale * _unit_ratio * config.STUDS_PER_METER
+            part.attributes["_ScaleX"] = abs(sx) * _sf
+            part.attributes["_ScaleY"] = abs(sy) * _sf
+            part.attributes["_ScaleZ"] = abs(sz) * _sf
             # Compute mesh size from native Roblox data (requires upload + resolve)
             combined_scale = (sx, sy, sz)
             sized = False
@@ -2692,6 +2716,13 @@ def _convert_prefab_node(
                                     mesh_file_id=node.mesh_file_id if hasattr(node, 'mesh_file_id') else None)
         if mesh_id:
             part.mesh_id = mesh_id
+        # Store scale for MeshLoader runtime sizing
+        _imp3 = _get_fbx_import_scale(node.mesh_guid, guid_index) if guid_index else 0.01
+        _ur3 = _get_fbx_unit_ratio(node.mesh_guid, guid_index) if guid_index else 1.0
+        _sf3 = _imp3 * _ur3 * config.STUDS_PER_METER
+        part.attributes["_ScaleX"] = abs(local_scl[0]) * _sf3
+        part.attributes["_ScaleY"] = abs(local_scl[1]) * _sf3
+        part.attributes["_ScaleZ"] = abs(local_scl[2]) * _sf3
         # Compute mesh size from native Roblox data (requires upload + resolve)
         sized = False
         if _mesh_native_sizes and guid_index:

@@ -991,9 +991,9 @@ for _, part in workspace:GetDescendants() do
             if scaleX and scaleY and scaleZ and resolved.initialSize then
                 local init = resolved.initialSize
                 newPart.Size = Vector3.new(
-                    init.X * scaleX,
-                    init.Y * scaleY,
-                    init.Z * scaleZ
+                    init.X * math.abs(scaleX),
+                    init.Y * math.abs(scaleY),
+                    init.Z * math.abs(scaleZ)
                 )
             else
                 newPart.Size = part.Size
