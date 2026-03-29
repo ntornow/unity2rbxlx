@@ -4526,37 +4526,54 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         )
         fixes.append("Fixed self-referencing WaitForChild to FindFirstChildOfClass")
 
-    # Fix camera that reads its own position instead of following the character head.
-    # In Unity, camera position is auto-updated by parent transform. In Roblox, we need
-    # to explicitly track the character head position.
-    # Pattern: camera.CFrame = CFrame.new(camera.CFrame.Position) * ...
-    # Fix:     camera.CFrame = CFrame.new(headPos) * ...  (with head lookup)
-    if 'CFrame.new(camera.CFrame.Position)' in source:
-        # Insert head position helper before the function that uses it
-        head_helper = (
-            '\n-- Head-follow camera (Roblox needs explicit positioning unlike Unity)\n'
-            'local function _getHeadPos()\n'
-            '    local Players = game:GetService("Players")\n'
-            '    local lp = Players.LocalPlayer\n'
-            '    if lp and lp.Character then\n'
-            '        local head = lp.Character:FindFirstChild("Head")\n'
-            '        if head then return head.Position + Vector3.new(0, 0.5, 0) end\n'
-            '    end\n'
-            '    return camera.CFrame.Position\n'
-            'end\n'
+    # Fix FPS camera system for Unity→Roblox.
+    # Unity: camera is child of player transform, auto-follows position/rotation.
+    # Roblox: camera is independent, must be explicitly positioned at head with
+    #         proper yaw (from rootPart) + pitch (from mouse Y).
+    # Also fix movement: rootPart.CFrame rotation conflicts with Humanoid controller.
+    # Replace with camera-yaw-based movement via Humanoid:Move().
+    if 'CFrame.new(camera.CFrame.Position)' in source and 'RenderStepped' in source:
+        # Replace the rotate function with a proper FPS camera implementation
+        # that combines yaw + pitch and positions at the character head.
+        rotate_pattern = (
+            r'(?:-- Head-follow camera.*?end\n)?'  # optional helper from previous fix
+            r'local function rotate\(dt\).*?end'
         )
-        # Insert helper before first function that uses camera.CFrame.Position
-        insert_pos = source.find('camera.CFrame = CFrame.new(camera.CFrame.Position)')
-        # Find the start of the enclosing function
-        func_start = source.rfind('\nlocal function', 0, insert_pos)
-        if func_start > 0:
-            source = source[:func_start] + head_helper + source[func_start:]
-        # Replace the pattern
-        source = source.replace(
-            'CFrame.new(camera.CFrame.Position)',
-            'CFrame.new(_getHeadPos())',
+        fps_rotate = (
+            '-- FPS camera: position at head, yaw from mouse X, pitch from mouse Y\n'
+            'local _yawAngle = 0\n'
+            'local function rotate(dt)\n'
+            '    local mouseDelta = UserInputService:GetMouseDelta()\n'
+            '    _yawAngle = _yawAngle - mouseDelta.X * sensitivity * dt\n'
+            '    camRotationX = math.clamp(camRotationX - mouseDelta.Y * sensitivity * dt, minAngle, maxAngle)\n'
+            '\n'
+            '    local head = character:FindFirstChild("Head")\n'
+            '    if not head then return end\n'
+            '    local headPos = head.Position + Vector3.new(0, 0.5, 0)\n'
+            '    camera.CFrame = CFrame.new(headPos)\n'
+            '        * CFrame.Angles(0, math.rad(_yawAngle), 0)\n'
+            '        * CFrame.Angles(math.rad(camRotationX), 0, 0)\n'
+            'end'
         )
-        fixes.append("Fixed camera to follow character head position")
+        new_source = re.sub(rotate_pattern, fps_rotate, source, count=1, flags=re.DOTALL)
+
+        # Replace rootPart.CFrame rotation (fights with Humanoid) with no-op
+        new_source = re.sub(
+            r'^\s*rootPart\.CFrame\s*=\s*rootPart\.CFrame\s*\*\s*CFrame\.Angles.*$',
+            '    -- [removed: rootPart rotation conflicts with Humanoid controller]',
+            new_source,
+            flags=re.MULTILINE,
+        )
+
+        # Replace rootPart.CFrame:VectorToWorldSpace with camera-yaw-relative direction
+        new_source = new_source.replace(
+            'rootPart.CFrame:VectorToWorldSpace(inputDir)',
+            '(CFrame.Angles(0, math.rad(_yawAngle), 0) * inputDir).Unit',
+        )
+
+        if new_source != source:
+            source = new_source
+            fixes.append("Rewrote FPS camera/movement for Roblox (head-follow + camera-yaw movement)")
 
     # .time property on VFX/particle instances → comment out
     if re.search(r'\w+\.time\s*=\s*[\d.]', source):
