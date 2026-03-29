@@ -582,6 +582,19 @@ def convert_scene(
 
     _inactive_containers: dict[str, RbxPart] = {}  # tfm_id → lazy container
 
+    def _get_world_position(node) -> tuple[float, float, float]:
+        """Compute world position by walking the parent chain."""
+        wx, wy, wz = node.position
+        parent_fid = node.parent_file_id
+        while parent_fid and parent_fid in parsed_scene.all_nodes:
+            parent = parsed_scene.all_nodes[parent_fid]
+            px, py, pz = parent.position
+            wx += px
+            wy += py
+            wz += pz
+            parent_fid = parent.parent_file_id
+        return (wx, wy, wz)
+
     def _ensure_inactive_container(tfm_id: str) -> RbxPart | None:
         """Return (or create) a container Model for an unconverted scene node."""
         if tfm_id in transform_to_rbx:
@@ -591,9 +604,10 @@ def convert_scene(
         scene_node = transform_to_node.get(tfm_id)
         if scene_node is None:
             return None
-        # Create container with the scene node's world position so child
-        # prefab instances can compose their local position with the parent's.
-        rx, ry, rz = unity_to_roblox_pos(*scene_node.position)
+        # Create container with world position (composed from parent chain)
+        # so child prefab instances get correct absolute positions.
+        world_pos = _get_world_position(scene_node)
+        rx, ry, rz = unity_to_roblox_pos(*world_pos)
         container = RbxPart(
             name=scene_node.name,
             class_name="Model",
@@ -825,8 +839,19 @@ def _convert_node(
         log.warning("Max recursion depth reached at node '%s'", node.name)
         return None
 
-    # -- Position --
-    rx, ry, rz = unity_to_roblox_pos(*node.position)
+    # -- Position (world-space, composed from parent chain) --
+    # Scene nodes store local positions; we need to walk the parent chain
+    # to get world positions since Roblox CFrames are absolute.
+    wx, wy, wz = node.position
+    _pf = node.parent_file_id
+    _all = scene_nodes or {}
+    while _pf and _pf in _all:
+        _pn = _all[_pf]
+        wx += _pn.position[0]
+        wy += _pn.position[1]
+        wz += _pn.position[2]
+        _pf = _pn.parent_file_id
+    rx, ry, rz = unity_to_roblox_pos(wx, wy, wz)
 
     # -- Rotation --
     rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*node.rotation)
