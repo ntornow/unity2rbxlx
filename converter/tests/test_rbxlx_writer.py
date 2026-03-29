@@ -51,6 +51,40 @@ class TestRbxlxWriter:
                 break
         assert workspace is not None
 
+        # Find the TestPart and verify its properties are actually written
+        test_part = None
+        for item in root.iter("Item"):
+            if item.get("class") == "Part":
+                name_prop = item.find(".//string[@name='Name']")
+                if name_prop is not None and name_prop.text == "TestPart":
+                    test_part = item
+                    break
+        assert test_part is not None, "TestPart not found in XML"
+        props = test_part.find("Properties")
+        assert props is not None, "TestPart has no Properties element"
+
+        # CFrame must be present with correct position
+        cframe = props.find("CoordinateFrame[@name='CFrame']")
+        assert cframe is not None, "TestPart missing CFrame property"
+        assert cframe.find("X").text == "1.0" or cframe.find("X").text == "1"
+
+        # Size must be present
+        size = props.find("Vector3[@name='Size']")
+        assert size is not None, "TestPart missing Size property"
+        assert float(size.find("X").text) == 4.0
+
+        # Anchored must be present
+        anchored = props.find("bool[@name='Anchored']")
+        assert anchored is not None, "TestPart missing Anchored property"
+
+        # Color must be present
+        color = props.find("Color3uint8[@name='Color3uint8']")
+        assert color is not None, "TestPart missing Color3uint8 property"
+
+        # Smooth surfaces
+        top = props.find("token[@name='TopSurface']")
+        assert top is not None, "TestPart missing TopSurface property"
+
     def test_write_with_scripts(self, tmp_path):
         from roblox.rbxlx_writer import write_rbxlx
         script = RbxScript(
