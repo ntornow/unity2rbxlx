@@ -434,6 +434,7 @@ def execute_luau(
 
     poll_url = f"https://apis.roblox.com/cloud/v2/{task_path}"
 
+    start_time = time.time()
     for attempt in range(120):  # 5 minutes max (2.5s intervals)
         time.sleep(2.5)
         try:
@@ -449,7 +450,8 @@ def execute_luau(
             result = poll_resp.json()
             state = result.get("state", "")
             if state == "COMPLETE":
-                logger.info("Luau task completed")
+                elapsed = time.time() - start_time
+                logger.info("Luau task completed in %.1fs", elapsed)
                 return result
             if state == "FAILED":
                 error = result.get("error", {})
