@@ -275,10 +275,10 @@ def generate_place_luau(
     b.line()
 
     # --- ScreenGuis ---
+    global _ui_counter
+    _ui_counter = 0
     for gui in place.screen_guis:
-        b.line("pcall(function()")
         _emit_screen_gui(b, gui)
-        b.line("end)")
 
     # --- Terrain ---
     _emit_terrain(b, place)
@@ -819,28 +819,33 @@ def _emit_screen_gui(b: _LuauBuilder, gui: RbxScreenGui) -> None:
     b.end()
 
 
+_ui_counter = 0
+
 def _emit_ui_element(b: _LuauBuilder, elem: RbxUIElement, parent_var: str) -> None:
+    global _ui_counter
+    _ui_counter += 1
+    var = f"u{_ui_counter}"
     cls = elem.class_name or "Frame"
     b.block("do")
-    b.line(f"local u=Instance.new('{cls}')")
-    b.line(f"u.Name={_luau_str(elem.name)}")
+    b.line(f"local {var}=Instance.new('{cls}')")
+    b.line(f"{var}.Name={_luau_str(elem.name)}")
     # Position
     px = elem.position
-    b.line(f"u.Position=UDim2.new({_f(px[0])},{int(px[1])},{_f(px[2])},{int(px[3])})")
+    b.line(f"{var}.Position=UDim2.new({_f(px[0])},{int(px[1])},{_f(px[2])},{int(px[3])})")
     # Size
     sx = elem.size
-    b.line(f"u.Size=UDim2.new({_f(sx[0])},{int(sx[1])},{_f(sx[2])},{int(sx[3])})")
-    b.line(f"u.BackgroundColor3={_c3(*elem.background_color)}")
+    b.line(f"{var}.Size=UDim2.new({_f(sx[0])},{int(sx[1])},{_f(sx[2])},{int(sx[3])})")
+    b.line(f"{var}.BackgroundColor3={_c3(*elem.background_color)}")
     if elem.background_transparency > 0:
-        b.line(f"u.BackgroundTransparency={_f(elem.background_transparency)}")
+        b.line(f"{var}.BackgroundTransparency={_f(elem.background_transparency)}")
     if not elem.visible:
-        b.line("u.Visible=false")
+        b.line(f"{var}.Visible=false")
     if cls in ("TextLabel", "TextButton") and elem.text:
-        b.line(f"u.Text={_luau_str(elem.text)}")
-        b.line(f"u.TextColor3={_c3(*elem.text_color)}")
-        b.line(f"u.TextSize={elem.text_size}")
+        b.line(f"{var}.Text={_luau_str(elem.text)}")
+        b.line(f"{var}.TextColor3={_c3(*elem.text_color)}")
+        b.line(f"{var}.TextSize={elem.text_size}")
     if cls == "ImageLabel" and elem.image:
-        b.line(f"u.Image={_luau_str(elem.image)}")
+        b.line(f"{var}.Image={_luau_str(elem.image)}")
     # Layout child
     if elem.layout_type:
         b.line(f"local lay=Instance.new('{elem.layout_type}')")
@@ -853,10 +858,10 @@ def _emit_ui_element(b: _LuauBuilder, elem: RbxUIElement, parent_var: str) -> No
             cs = elem.layout_cell_size
             b.line(f"lay.CellSize=UDim2.new(0,{cs[0]},0,{cs[1]})")
             b.line(f"lay.CellPadding=UDim2.new(0,{elem.layout_padding},0,{elem.layout_padding})")
-        b.line("lay.Parent=u")
+        b.line(f"lay.Parent={var}")
     for child in elem.children:
-        _emit_ui_element(b, child, "u")
-    b.line(f"u.Parent={parent_var}")
+        _emit_ui_element(b, child, var)
+    b.line(f"{var}.Parent={parent_var}")
     b.end()
 
 
