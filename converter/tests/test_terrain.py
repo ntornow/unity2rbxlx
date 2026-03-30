@@ -635,6 +635,47 @@ class TestSmoothGridBinaryFormat:
         assert max(all_mats) == 22, f"Expected max material to be 22 (Pavement)"
 
 
+    def test_chunk_coord_with_position_offset(self):
+        """Terrain at (160, 0, -64) should offset chunk coordinates."""
+        from roblox.terrain_encoder import encode_smooth_grid
+        import base64
+
+        heights = [0.5] * 9
+        data = base64.b64decode(
+            encode_smooth_grid(heights, 3, (1.0, 20.0, 1.0),
+                               terrain_position=(160.0, 0.0, -64.0))
+        )
+        coord = self._decode_chunk_header(data, 2)
+        # With X=160 studs → chunk X = 160/128 = 1
+        # With Z=-64 studs → world voxel Z = -16, chunk Z = -16//32 = -1
+        assert coord[0] == 1, f"X chunk should be 1, got {coord[0]}"
+        assert coord[2] == -1, f"Z chunk should be -1, got {coord[2]}"
+
+    def test_terrain_position_affects_chunk_placement(self):
+        """Different positions should produce different chunk coordinates."""
+        from roblox.terrain_encoder import encode_smooth_grid
+        import base64
+
+        heights = [0.5] * 9
+        # At origin
+        data1 = base64.b64decode(
+            encode_smooth_grid(heights, 3, (1.0, 20.0, 1.0),
+                               terrain_position=(0.0, 0.0, 0.0))
+        )
+        coord1 = self._decode_chunk_header(data1, 2)
+
+        # At offset position
+        data2 = base64.b64decode(
+            encode_smooth_grid(heights, 3, (1.0, 20.0, 1.0),
+                               terrain_position=(256.0, 0.0, -128.0))
+        )
+        coord2 = self._decode_chunk_header(data2, 2)
+
+        # Chunks should be at different X positions
+        assert coord1[0] != coord2[0] or coord1[2] != coord2[2], \
+            f"Different positions should produce different chunks: {coord1} vs {coord2}"
+
+
 class TestSmoothGridInRbxlx:
     """Test that SmoothGrid terrain data is correctly embedded in rbxlx XML."""
 
