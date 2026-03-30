@@ -589,6 +589,15 @@ def _emit_attachments(b: _LuauBuilder, part: RbxPart, var: str) -> None:
         _emit_reverb(b, reverb, var)
     for vf in part.video_frames or []:
         _emit_video_frame(b, vf, var)
+    for decal in part.decals or []:
+        _emit_decal(b, decal, var)
+    # Sprite texture → Decal (from _SpriteTextureId attribute)
+    sprite_tex = (part.attributes or {}).get("_SpriteTextureId", "")
+    if sprite_tex and "rbxassetid" in sprite_tex:
+        b.line(f"do local d=Instance.new('Decal')")
+        b.line(f"d.Texture={_luau_str(sprite_tex)}")
+        b.line(f"d.Face=Enum.NormalId.Front")
+        b.line(f"d.Parent={var} end")
 
 
 def _emit_light(b: _LuauBuilder, light: RbxLight, parent_var: str) -> None:
@@ -701,6 +710,20 @@ def _emit_reverb(b: _LuauBuilder, r: "RbxReverbSoundEffect", parent_var: str) ->
     b.line(f"r.DryLevel={_f(r.dry_level)}")
     b.line(f"r.WetLevel={_f(r.wet_level)}")
     b.line(f"r.Parent={parent_var} end")
+
+
+def _emit_decal(b: _LuauBuilder, d: "RbxDecal", parent_var: str) -> None:
+    if not d.texture:
+        return
+    face_map = {"Top": "Top", "Bottom": "Bottom", "Front": "Front",
+                "Back": "Back", "Left": "Left", "Right": "Right"}
+    face = face_map.get(d.face, "Front")
+    b.line(f"do local d=Instance.new('Decal')")
+    b.line(f"d.Texture={_luau_str(d.texture)}")
+    b.line(f"d.Face=Enum.NormalId.{face}")
+    if d.transparency > 0:
+        b.line(f"d.Transparency={_f(d.transparency)}")
+    b.line(f"d.Parent={parent_var} end")
 
 
 def _emit_video_frame(b: _LuauBuilder, vf: "RbxVideoFrame", parent_var: str) -> None:

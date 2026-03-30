@@ -98,6 +98,7 @@ class RbxPart:
     motor6ds: list[RbxMotor6D] = field(default_factory=list)
     reverb_effects: list[RbxReverbSoundEffect] = field(default_factory=list)
     video_frames: list[RbxVideoFrame] = field(default_factory=list)
+    decals: list[RbxDecal] = field(default_factory=list)
     children: list[RbxPart] = field(default_factory=list)
     scripts: list[RbxScript] = field(default_factory=list)
     attributes: dict[str, Any] = field(default_factory=dict)
@@ -239,6 +240,14 @@ class RbxBeam:
     texture: str = ""
     light_emission: float = 0.0
     segments: int = 10
+
+
+@dataclass
+class RbxDecal:
+    """A Roblox Decal instance (face texture on a Part)."""
+    face: str = "Front"  # Top, Bottom, Front, Back, Left, Right
+    texture: str = ""    # rbxassetid:// URL
+    transparency: float = 0.0
 
 
 @dataclass
