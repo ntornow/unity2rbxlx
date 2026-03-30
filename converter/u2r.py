@@ -200,6 +200,11 @@ def convert(
         total_size = sum(len(c) for c in chunks)
         click.echo(f"  Script size: {total_size:,} chars ({total_size/1024:.0f} KB), {len(chunks)} chunk(s)")
 
+        # Save the script for inspection/debugging
+        script_file = output_path / "place_builder.luau"
+        script_file.write_text(chunks[0] if len(chunks) == 1 else "\n\n".join(chunks))
+        click.echo(f"  Script saved to: {script_file}")
+
         if total_size > 4_000_000:
             click.echo(f"  WARNING: Script exceeds 4MB limit. Headless execution may fail for very large projects.")
 
