@@ -1124,7 +1124,12 @@ def export_clip_keyframes(clip: AnimClip) -> dict[str, Any]:
     bones: dict[str, list[dict]] = {}
 
     for curve in clip.curves:
+        # Extract bone name from animation path (e.g., "Armature/Spine/Chest" → "Chest")
+        # Also store the full path for hierarchical lookups
         bone_name = curve.path.split("/")[-1] if curve.path else "Root"
+        # Normalize: strip common prefixes like "mixamorig:" (Mixamo rigs)
+        if ":" in bone_name:
+            bone_name = bone_name.split(":")[-1]
         if bone_name not in bones:
             bones[bone_name] = []
 

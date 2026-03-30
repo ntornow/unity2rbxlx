@@ -214,18 +214,26 @@ function AnimatorRuntime:_playKeyframeAnimation(motionName, model, loop)
 		self._keyframeConn = nil
 	end
 
-	-- Find bone Parts in the model
+	-- Find bone Parts in the model (with fuzzy name matching)
 	local boneParts = {}
+	local bonePartsLower = {} -- lowercase lookup for case-insensitive matching
 	for _, desc in model:GetDescendants() do
 		if desc:IsA("BasePart") then
 			boneParts[desc.Name] = desc
+			bonePartsLower[string.lower(desc.Name)] = desc
+			-- Also index without common prefixes (mixamorig:, Bip01, etc.)
+			local stripped = desc.Name:match(":(.+)") or desc.Name
+			if stripped ~= desc.Name then
+				boneParts[stripped] = desc
+				bonePartsLower[string.lower(stripped)] = desc
+			end
 		end
 	end
 
 	-- Animate each bone using TweenService
 	local function playOnce()
 		for boneName, keyframes in bones do
-			local part = boneParts[boneName]
+			local part = boneParts[boneName] or bonePartsLower[string.lower(boneName)]
 			if not part or #keyframes < 2 then continue end
 
 			task.spawn(function()
