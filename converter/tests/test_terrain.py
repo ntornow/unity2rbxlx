@@ -170,13 +170,23 @@ class TestTerrainSmoothGridEncoding:
 
         # Skip 2-byte header + 12-byte chunk coord = offset 14
         offset = 14
-        # First RLE entry should be a non-air material
-        header = data[offset]
-        material = header & 0x3F  # 6-bit material
-        has_occ = bool(header & 0x40)
-        has_run = bool(header & 0x80)
-        # Should be a valid material (grass/sand/rock etc), not zero (air)
-        assert material != 0, f"First voxel in terrain chunk should not be air, got material={material}"
+        # Scan RLE entries for at least one non-air material
+        found_non_air = False
+        scan_pos = offset
+        while scan_pos < len(data):
+            header = data[scan_pos]
+            material = header & 0x3F
+            if material != 0:
+                found_non_air = True
+                break
+            has_occ = bool(header & 0x40)
+            has_run = bool(header & 0x80)
+            scan_pos += 1
+            if has_occ:
+                scan_pos += 1
+            if has_run:
+                scan_pos += 1
+        assert found_non_air, "Terrain chunk should contain at least one non-air voxel"
 
     def test_smooth_grid_skips_air_chunks(self):
         """All-air chunks should not be included in the output."""
@@ -305,7 +315,7 @@ class TestSmoothGridBinaryFormat:
         assert data[1] == 5, "Chunk power must be 5 (2^5=32)"
 
     def test_chunk_coord_at_origin(self):
-        """Single-chunk terrain at origin should have chunk Z negated (Unity→Roblox)."""
+        """Terrain at origin: first chunk should be at or near (0, 0, -1)."""
         from roblox.terrain_encoder import encode_smooth_grid
         import base64
 
@@ -315,8 +325,9 @@ class TestSmoothGridBinaryFormat:
             encode_smooth_grid(heights, 3, (1.0, 20.0, 1.0))
         )
         coord = self._decode_chunk_header(data, 2)
-        # Z is negated: chunk 0 in Unity → chunk -1 in Roblox
-        assert coord == (0, 0, -1), f"First chunk should have Z=-1 (negated), got {coord}"
+        # Terrain at (0,0,0): gz=0→wvz=0 in chunk 0, gz=1→wvz=-1 in chunk -1
+        # First sorted chunk is (0, 0, -1)
+        assert coord == (0, 0, -1), f"First chunk at origin should be (0,0,-1), got {coord}"
 
     def test_rle_decodes_to_32768_voxels(self):
         """Each chunk must contain exactly 32^3 = 32768 voxels when decoded."""

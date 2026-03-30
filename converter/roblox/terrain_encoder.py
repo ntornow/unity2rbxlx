@@ -346,20 +346,44 @@ def encode_smooth_grid(
     # Voxel order: sx innermost, sy middle, sz outermost
     pending_chunks: list[tuple[tuple[int, int, int], bytearray]] = []
 
-    for cx in range(chunks_x):
-        for cz in range(chunks_z):
-            for cy in range(chunks_y):
+    # Terrain position offset in voxel units.
+    # Terrain-local voxel (gx, gy, gz) maps to world voxel:
+    #   wvx = gx + off_x
+    #   wvy = gy + off_y
+    #   wvz = off_z - gz  (Z is INVERTED: Unity Z+ → Roblox Z-)
+    off_x = round(rx / VOXEL_SIZE)
+    off_y = round(ry / VOXEL_SIZE)
+    off_z = round(rz / VOXEL_SIZE)  # negative for negative rz
+
+    # World chunk bounds containing the terrain
+    wcx_min = off_x // chunk_size
+    wcx_max = (off_x + grid_x - 1) // chunk_size
+    wcy_min = off_y // chunk_size
+    wcy_max = (off_y + grid_y - 1) // chunk_size
+    # Z: terrain extends from off_z (most positive) to off_z - grid_z + 1 (most negative)
+    wcz_min = (off_z - grid_z + 1) // chunk_size
+    wcz_max = off_z // chunk_size
+
+    for wcx in range(wcx_min, wcx_max + 1):
+        for wcz in range(wcz_min, wcz_max + 1):
+            for wcy in range(wcy_min, wcy_max + 1):
                 chunk_voxels: list[tuple[int, int]] = []
                 has_non_air = False
 
-                # sz = world Y (height), sy = world Z (depth), sx = world X
+                # sz = Y axis (height), sy = Z axis (depth), sx = X axis
                 for sz in range(chunk_size):
-                    world_y = cy * chunk_size + sz
+                    wvy = wcy * chunk_size + sz
+                    gy = wvy - off_y  # terrain-local Y
+
                     for sy in range(chunk_size):
-                        world_z = cz * chunk_size + sy
+                        wvz = wcz * chunk_size + sy
+                        gz = off_z - wvz  # terrain-local Z (INVERTED)
+
                         for sx in range(chunk_size):
-                            world_x = cx * chunk_size + sx
-                            v = _get_voxel(world_x, world_y, world_z)
+                            wvx = wcx * chunk_size + sx
+                            gx = wvx - off_x  # terrain-local X
+
+                            v = _get_voxel(gx, gy, gz)
                             chunk_voxels.append(v)
                             if v[0] != MATERIAL_AIR:
                                 has_non_air = True
@@ -367,9 +391,8 @@ def encode_smooth_grid(
                 if not has_non_air:
                     continue
 
-                # Chunk coords in world space. Negate cz to match Roblox's
-                # coordinate system (Unity Z+ → Roblox Z-).
-                coord = (cx, cy, -(cz + 1))
+                # Chunk coords are world-space (already correct)
+                coord = (wcx, wcy, wcz)
                 pending_chunks.append((coord, _rle_encode_chunk(chunk_voxels)))
 
     # Sort chunks
