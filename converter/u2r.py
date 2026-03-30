@@ -163,7 +163,7 @@ def convert(
     # Headless mesh resolution: upload → resolve meshes → download
     rbxlx_file = output_path / "converted_place.rbxlx"
     has_meshes = any(
-        p.suffix.lower() in ('.fbx', '.obj')
+        p.lower().endswith(('.fbx', '.obj'))
         for p in pipeline.context.uploaded_assets
     ) if pipeline.context.uploaded_assets else False
 
@@ -171,26 +171,25 @@ def convert(
         click.echo("\n--- Headless Mesh Resolution ---")
         from roblox.cloud_api import resolve_meshes_headless, create_experience
 
-        # Load or create universe/place IDs
+        # Load universe/place IDs from CLI args or cached file
         ids_file = output_path / "resolve_ids.json"
-        if universe_id and place_id:
-            uid, pid = universe_id, place_id
-        elif ids_file.exists():
-            import json
-            ids = json.loads(ids_file.read_text())
-            uid, pid = ids["universe_id"], ids["place_id"]
-            click.echo(f"  Reusing universe={uid} place={pid}")
-        else:
-            click.echo("  Creating Roblox experience for mesh resolution...")
-            result = create_experience(resolved_key, name="u2r Mesh Resolver")
-            if result is None:
-                click.echo("  ERROR: Failed to create experience. Use --no-resolve to skip.")
-                click.echo(f"\n  To validate: python u2r.py validate {rbxlx_file}")
-                return
-            uid, pid = result
-            import json
-            ids_file.write_text(json.dumps({"universe_id": uid, "place_id": pid}))
-            click.echo(f"  Created universe={uid} place={pid} (saved to {ids_file})")
+        uid, pid = universe_id, place_id
+        if not uid or not pid:
+            if ids_file.exists():
+                import json
+                ids = json.loads(ids_file.read_text())
+                uid, pid = ids.get("universe_id"), ids.get("place_id")
+                click.echo(f"  Reusing universe={uid} place={pid}")
+        if not uid or not pid:
+            click.echo("  No universe/place IDs found for mesh resolution.")
+            click.echo("  Create an experience at https://create.roblox.com and pass:")
+            click.echo("    --universe-id YOUR_UNIVERSE_ID --place-id YOUR_PLACE_ID")
+            click.echo("  IDs will be cached for future runs.")
+            click.echo(f"\n  To validate: python u2r.py validate {rbxlx_file}")
+            return
+        # Cache IDs for future runs
+        import json
+        ids_file.write_text(json.dumps({"universe_id": uid, "place_id": pid}))
 
         resolved_file = output_path / "resolved_place.rbxl"
         success = resolve_meshes_headless(
