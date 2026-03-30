@@ -193,15 +193,27 @@ def convert(
         import json
         ids_file.write_text(json.dumps({"universe_id": uid, "place_id": pid}))
 
-        # Generate Luau script that reconstructs the place with proper meshes
+        # Generate Luau script(s) that reconstruct the place with proper meshes
         click.echo("  Generating place reconstruction script...")
-        luau_script = generate_place_luau(pipeline.state.rbx_place)
-        click.echo(f"  Script size: {len(luau_script):,} chars ({len(luau_script)/1024:.0f} KB)")
+        from roblox.luau_place_builder import generate_place_luau_chunked
+        chunks = generate_place_luau_chunked(pipeline.state.rbx_place)
+        total_size = sum(len(c) for c in chunks)
+        click.echo(f"  Script size: {total_size:,} chars ({total_size/1024:.0f} KB), {len(chunks)} chunk(s)")
 
-        # Execute headlessly via Open Cloud Luau Execution API
-        click.echo(f"  Executing on universe={uid} place={pid}...")
-        result = execute_luau(resolved_key, uid, pid, luau_script, timeout="300s")
-        if result is not None:
+        if total_size > 4_000_000:
+            click.echo(f"  WARNING: Script exceeds 4MB limit. Headless execution may fail for very large projects.")
+
+        # Execute each chunk headlessly
+        all_ok = True
+        for i, chunk in enumerate(chunks):
+            click.echo(f"  Executing chunk {i+1}/{len(chunks)} on universe={uid} place={pid}...")
+            result = execute_luau(resolved_key, uid, pid, chunk, timeout="300s")
+            if result is None:
+                click.echo(f"  Chunk {i+1} failed.")
+                all_ok = False
+                break
+
+        if all_ok:
             click.echo("  Place published successfully!")
             click.echo(f"\n  Open in Studio: File → Open from Roblox → select the experience")
             click.echo("  Meshes render as proper 3D geometry in edit mode.")

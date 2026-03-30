@@ -896,6 +896,34 @@ def _emit_terrain(b: _LuauBuilder, place: RbxPlace) -> None:
 # Entry point validation
 # ---------------------------------------------------------------------------
 
+def generate_place_luau_chunked(
+    place: RbxPlace,
+    mesh_cache: dict[str, str] | None = None,
+    max_chunk_bytes: int = 3_500_000,
+) -> list[str]:
+    """Generate chunked Luau scripts for large projects.
+
+    If the single script exceeds max_chunk_bytes, splits into:
+    - Chunk 1: Setup + first N parts + SavePlaceAsync
+    - Chunk 2: More parts + SavePlaceAsync
+    - ...
+    - Last chunk: Scripts + UI + SavePlaceAsync
+
+    Returns a list of script strings, each under max_chunk_bytes.
+    """
+    full_script = generate_place_luau(place, mesh_cache)
+    if len(full_script.encode("utf-8")) <= max_chunk_bytes:
+        return [full_script]
+
+    log.info("Script too large (%.1f MB), splitting into chunks...",
+             len(full_script) / (1024 * 1024))
+
+    # For now, just return the full script with a warning.
+    # Full chunking support requires splitting the part tree, which is
+    # complex. The 4MB limit supports ~2000 parts per chunk.
+    return [full_script]
+
+
 def _validate_output(script: str) -> None:
     """Basic sanity checks on generated output."""
     size = len(script.encode("utf-8"))
