@@ -1045,15 +1045,18 @@ script.Disabled = true
             log.info("[write_output] MeshLoader script embedded for %d mesh assets",
                      sum(1 for p in self.ctx.uploaded_assets if Path(p).suffix.lower() in ('.fbx', '.obj')))
 
-        # Generate TerrainSnap script to adjust object Y positions to sit on terrain.
-        # The terrain encoder uses a simplified coordinate system that may not perfectly
-        # align with object world positions. This script fixes alignment at runtime.
-        if self.state.rbx_place.terrains:
+        # TerrainSnap: disabled pending terrain encoder coordinate system fix.
+        # The terrain encoder's -(cz+1) Z-axis formula creates a systematic offset
+        # between terrain voxel positions and object world positions. A proper fix
+        # requires restructuring the encoder to place chunks at world coordinates.
+        if False and self.state.rbx_place.terrains:
             from core.roblox_types import RbxScript
             terrain_snap = '''-- Auto-generated terrain snap script
--- Adjusts object Y positions to sit on the terrain surface.
+-- Computes a uniform Y offset to align objects with terrain surface.
+-- Samples small ground-level objects to find the median terrain-object gap,
+-- then shifts ALL parts by that offset (preserving relative positions).
 if script:GetAttribute("TerrainSnapDone") then return end
-task.wait(2)  -- Wait for terrain and meshes to load
+task.wait(2)
 
 local terrain = workspace:FindFirstChildOfClass("Terrain")
 if not terrain then script:SetAttribute("TerrainSnapDone", true); return end
@@ -1062,31 +1065,50 @@ local params = RaycastParams.new()
 params.FilterType = Enum.RaycastFilterType.Include
 params.FilterDescendantsInstances = {terrain}
 
-local snapped = 0
+-- Step 1: Sample small ground-level parts to compute median offset
+local offsets = {}
 for _, part in workspace:GetDescendants() do
-    if part:IsA("BasePart") and part.Anchored and part.Name ~= "GroundCollider" then
+    if part:IsA("BasePart") and part.Anchored and part.Size.Y < 10 then
         local pos = part.Position
-        -- Raycast down from above to find terrain surface
         local result = workspace:Raycast(
             Vector3.new(pos.X, 500, pos.Z),
-            Vector3.new(0, -1000, 0),
-            params
+            Vector3.new(0, -1000, 0), params
         )
         if result then
             local terrainY = result.Position.Y
-            local halfHeight = part.Size.Y / 2
-            local targetY = terrainY + halfHeight
-            local delta = math.abs(pos.Y - targetY)
-            -- Only snap if reasonably close (within 50 studs) to avoid
-            -- moving floating/elevated objects
-            if delta > 1 and delta < 50 then
-                part.CFrame = part.CFrame + Vector3.new(0, targetY - pos.Y, 0)
-                snapped = snapped + 1
+            local bottomY = pos.Y - part.Size.Y / 2
+            local gap = terrainY - bottomY
+            if math.abs(gap) < 100 then
+                table.insert(offsets, gap)
             end
         end
     end
 end
-print(string.format("TerrainSnap: adjusted %d parts", snapped))
+
+if #offsets == 0 then
+    print("TerrainSnap: no samples found")
+    script:SetAttribute("TerrainSnapDone", true); return
+end
+
+-- Compute median offset
+table.sort(offsets)
+local median = offsets[math.floor(#offsets / 2) + 1]
+
+-- Only apply if the offset is significant (> 2 studs)
+if math.abs(median) < 2 then
+    print(string.format("TerrainSnap: median offset %.1f too small, skipping", median))
+    script:SetAttribute("TerrainSnapDone", true); return
+end
+
+-- Step 2: Apply uniform offset to all anchored parts
+local shifted = 0
+for _, part in workspace:GetDescendants() do
+    if part:IsA("BasePart") and part.Anchored then
+        part.CFrame = part.CFrame + Vector3.new(0, median, 0)
+        shifted = shifted + 1
+    end
+end
+print("TerrainSnap: shifted " .. shifted .. " parts by " .. math.floor(median * 10 + 0.5) / 10 .. " studs (sampled " .. #offsets .. ")")
 script:SetAttribute("TerrainSnapDone", true)
 script.Disabled = true
 '''

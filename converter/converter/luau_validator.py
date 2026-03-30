@@ -1012,10 +1012,19 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
         source = re.sub(r':Destroy\(\)\((\w+(?:\.\w+)*)\)', r' \1:Destroy()', source)
         fixes.append("Fixed :Destroy()(obj) → obj:Destroy()")
 
-    # Strip C# float/double/decimal literal suffixes: 1.0F, 2f, 3.5d, 0.1m, 1L, 2UL
-    # Must run BEFORE other numeric processing
-    if re.search(r'\d[fFdDmM]\b', source):
-        source = re.sub(r'(\d)[fFdDmM]\b', r'\1', source)
+    # Strip C# float/double/decimal literal suffixes: 1.0F, 2f, 3.5d, 0.1m
+    # Must run BEFORE other numeric processing.
+    # Two patterns to avoid corrupting Luau format specifiers (%.1f, %d):
+    # 1. After decimal numbers: 1.0f, 3.5d, 0.07F
+    # 2. After integers preceded by whitespace/operator: 2F, 10f (not part of %2f)
+    _did_strip = False
+    if re.search(r'\d\.\d+[fFdDmM]\b', source):
+        source = re.sub(r'(\d\.\d+)[fFdDmM]\b', r'\1', source)
+        _did_strip = True
+    if re.search(r'(?<=[=\s,(*+\-/])(\d+)[fFdDmM]\b', source):
+        source = re.sub(r'(?<=[=\s,(*+\-/])(\d+)[fFdDmM]\b', r'\1', source)
+        _did_strip = True
+    if _did_strip:
         fixes.append("Stripped C# numeric type suffixes (F/f/d/D/m/M)")
 
     # Fix C# shorthand float literals without leading zero: .02 → 0.02, .5 → 0.5
