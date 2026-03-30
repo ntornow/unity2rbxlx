@@ -206,7 +206,12 @@ def convert(
         click.echo(f"  Script saved to: {script_file}")
 
         if total_size > 4_000_000:
-            click.echo(f"  WARNING: Script exceeds 4MB limit. Headless execution may fail for very large projects.")
+            click.echo(f"  WARNING: Script exceeds 4MB limit ({total_size/1024/1024:.1f} MB).")
+            click.echo("  Skipping headless execution. Use the local rbxlx with runtime MeshLoader.")
+            click.echo(f"  Script saved to: {script_file} (for manual execution in Studio)")
+            click.echo(f"\n  Local rbxlx: {rbxlx_file}")
+            click.echo(f"  To validate: python u2r.py validate {rbxlx_file}")
+            return
 
         # Execute each chunk headlessly
         all_ok = True
