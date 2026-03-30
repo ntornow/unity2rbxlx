@@ -477,7 +477,7 @@ def _emit_part(
     else:
         # Regular Part (or MeshPart without mesh URL)
         b.block("do")
-        inst_cls = "SpawnLocation" if name == "SpawnLocation" else "Part"
+        inst_cls = "SpawnLocation" if part.class_name == "SpawnLocation" else "Part"
         b.line(f"local {var}=Instance.new('{inst_cls}')")
         b.line(f"{var}.Name={_luau_str(name)}")
 
