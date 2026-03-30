@@ -552,11 +552,19 @@ def _emit_part_extras(b: _LuauBuilder, part: RbxPart, var: str) -> None:
 def _emit_surface_appearance(
     b: _LuauBuilder, sa: RbxSurfaceAppearance, parent_var: str
 ) -> None:
-    """Emit SurfaceAppearance child."""
-    b.line("pcall(function()")
+    """Emit SurfaceAppearance child with Texture fallback.
+
+    SurfaceAppearance properties (ColorMap, etc.) require Plugin capability
+    which is unavailable in headless Luau execution. Falls back to Texture
+    instances which DO work headlessly.
+    """
+    color_map = sa.color_map if sa.color_map and "rbxassetid" in sa.color_map else ""
+
+    # Try SurfaceAppearance first (works in Studio, not headless)
+    b.line("do local saOk=pcall(function()")
     b.line("local sa=Instance.new('SurfaceAppearance')")
-    if sa.color_map and "rbxassetid" in sa.color_map:
-        b.line(f"sa.ColorMap={_luau_str(sa.color_map)}")
+    if color_map:
+        b.line(f"sa.ColorMap={_luau_str(color_map)}")
     if sa.normal_map and "rbxassetid" in sa.normal_map:
         b.line(f"sa.NormalMap={_luau_str(sa.normal_map)}")
     if sa.metalness_map and "rbxassetid" in sa.metalness_map:
@@ -567,6 +575,16 @@ def _emit_surface_appearance(
         b.line(f"sa.AlphaMode=Enum.AlphaMode.{sa.alpha_mode}")
     b.line(f"sa.Parent={parent_var}")
     b.line("end)")
+    # Fallback: use Texture instances for color map (works headlessly)
+    if color_map:
+        b.line("if not saOk then")
+        b.line(f"for _,face in ipairs(Enum.NormalId:GetEnumItems()) do")
+        b.line(f"local t=Instance.new('Texture')")
+        b.line(f"t.Texture={_luau_str(color_map)}")
+        b.line(f"t.Face=face")
+        b.line(f"t.StudsPerTileU=8 t.StudsPerTileV=8")
+        b.line(f"t.Parent={parent_var}")
+        b.line("end end end")
 
 
 def _emit_attachments(b: _LuauBuilder, part: RbxPart, var: str) -> None:
