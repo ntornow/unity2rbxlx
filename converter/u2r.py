@@ -160,7 +160,8 @@ def convert(
     if pipeline.context.warnings:
         click.echo(f"  Warnings: {len(pipeline.context.warnings)}")
 
-    # Headless mesh resolution: upload → resolve meshes → download
+    # Headless place publishing: generate Luau script, execute via Open Cloud,
+    # and save the place to Roblox with proper mesh geometry embedded.
     rbxlx_file = output_path / "converted_place.rbxlx"
     has_meshes = any(
         p.lower().endswith(('.fbx', '.obj'))
@@ -168,8 +169,9 @@ def convert(
     ) if pipeline.context.uploaded_assets else False
 
     if has_meshes and not no_upload and not no_resolve and resolved_key:
-        click.echo("\n--- Headless Mesh Resolution ---")
-        from roblox.cloud_api import resolve_meshes_headless, create_experience
+        click.echo("\n--- Publishing to Roblox (headless mesh resolution) ---")
+        from roblox.cloud_api import execute_luau
+        from roblox.luau_place_builder import generate_place_luau
 
         # Load universe/place IDs from CLI args or cached file
         ids_file = output_path / "resolve_ids.json"
@@ -181,7 +183,7 @@ def convert(
                 uid, pid = ids.get("universe_id"), ids.get("place_id")
                 click.echo(f"  Reusing universe={uid} place={pid}")
         if not uid or not pid:
-            click.echo("  No universe/place IDs found for mesh resolution.")
+            click.echo("  No universe/place IDs found.")
             click.echo("  Create an experience at https://create.roblox.com and pass:")
             click.echo("    --universe-id YOUR_UNIVERSE_ID --place-id YOUR_PLACE_ID")
             click.echo("  IDs will be cached for future runs.")
@@ -191,22 +193,23 @@ def convert(
         import json
         ids_file.write_text(json.dumps({"universe_id": uid, "place_id": pid}))
 
-        resolved_file = output_path / "resolved_place.rbxl"
-        success = resolve_meshes_headless(
-            api_key=resolved_key,
-            universe_id=uid,
-            place_id=pid,
-            rbxlx_path=rbxlx_file,
-            output_path=resolved_file,
-        )
-        if success:
-            click.echo(f"\n  Resolved place: {resolved_file}")
-            click.echo("  Open this file in Studio — meshes render in edit mode.")
+        # Generate Luau script that reconstructs the place with proper meshes
+        click.echo("  Generating place reconstruction script...")
+        luau_script = generate_place_luau(pipeline.state.rbx_place)
+        click.echo(f"  Script size: {len(luau_script):,} chars ({len(luau_script)/1024:.0f} KB)")
+
+        # Execute headlessly via Open Cloud Luau Execution API
+        click.echo(f"  Executing on universe={uid} place={pid}...")
+        result = execute_luau(resolved_key, uid, pid, luau_script, timeout="300s")
+        if result is not None:
+            click.echo("  Place published successfully!")
+            click.echo(f"\n  Open in Studio: File → Open from Roblox → select the experience")
+            click.echo("  Meshes render as proper 3D geometry in edit mode.")
         else:
-            click.echo("\n  Mesh resolution failed. The rbxlx still works with runtime MeshLoader.")
-            click.echo(f"  To validate: python u2r.py validate {rbxlx_file}")
-    else:
-        click.echo(f"\n  To validate: python u2r.py validate {rbxlx_file}")
+            click.echo("\n  Headless execution failed. The rbxlx still works with runtime MeshLoader.")
+
+    click.echo(f"\n  Local rbxlx: {rbxlx_file}")
+    click.echo(f"  To validate: python u2r.py validate {rbxlx_file}")
 
 
 @main.command()
