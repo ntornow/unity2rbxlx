@@ -900,6 +900,8 @@ def _validate_output(script: str) -> None:
     """Basic sanity checks on generated output."""
     size = len(script.encode("utf-8"))
     if size > _MAX_SCRIPT_BYTES:
-        raise ValueError(
-            f"Generated script is {size / (1024 * 1024):.1f} MB, exceeds 4 MB limit"
+        log.warning(
+            "Generated script is %.1f MB, exceeds 4 MB limit. "
+            "Large projects may need multiple execution batches.",
+            size / (1024 * 1024),
         )
