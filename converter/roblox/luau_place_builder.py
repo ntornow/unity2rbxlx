@@ -570,13 +570,25 @@ def _emit_surface_appearance(
 
 
 def _emit_attachments(b: _LuauBuilder, part: RbxPart, var: str) -> None:
-    """Emit lights, sounds, particle emitters, and other child instances."""
+    """Emit lights, sounds, particle emitters, constraints, trails, beams, Motor6Ds."""
     for light in part.lights or []:
         _emit_light(b, light, var)
     for sound in part.sounds or []:
         _emit_sound(b, sound, var)
     for pe in part.particle_emitters or []:
         _emit_particle(b, pe, var)
+    for constraint in part.constraints or []:
+        _emit_constraint(b, constraint, var)
+    for trail in part.trails or []:
+        _emit_trail(b, trail, var)
+    for beam in part.beams or []:
+        _emit_beam(b, beam, var)
+    for motor in part.motor6ds or []:
+        _emit_motor6d(b, motor, var)
+    for reverb in part.reverb_effects or []:
+        _emit_reverb(b, reverb, var)
+    for vf in part.video_frames or []:
+        _emit_video_frame(b, vf, var)
 
 
 def _emit_light(b: _LuauBuilder, light: RbxLight, parent_var: str) -> None:
@@ -620,6 +632,89 @@ def _emit_particle(b: _LuauBuilder, pe: RbxParticleEmitter, parent_var: str) -> 
     if not pe.enabled:
         b.line("e.Enabled=false")
     b.line(f"e.Parent={parent_var} end")
+
+
+def _emit_constraint(b: _LuauBuilder, c: "RbxConstraint", parent_var: str) -> None:
+    ct = c.constraint_type
+    b.line(f"do local c=Instance.new('{ct}')")
+    if ct == "HingeConstraint" and c.limits_enabled:
+        b.line("c.LimitsEnabled=true")
+        b.line(f"c.LowerAngle={_f(c.lower_angle)}")
+        b.line(f"c.UpperAngle={_f(c.upper_angle)}")
+    elif ct == "SpringConstraint":
+        b.line(f"c.Stiffness={_f(c.stiffness)}")
+        b.line(f"c.Damping={_f(c.damping)}")
+        b.line(f"c.FreeLength={_f(c.free_length)}")
+    elif ct == "BallSocketConstraint" and c.twist_limits_enabled:
+        b.line("c.TwistLimitsEnabled=true")
+        b.line(f"c.UpperAngle={_f(c.upper_twist_angle)}")
+    b.line(f"c.Parent={parent_var} end")
+
+
+def _emit_trail(b: _LuauBuilder, t: "RbxTrail", parent_var: str) -> None:
+    b.line("do local t=Instance.new('Trail')")
+    b.line(f"t.Lifetime={_f(t.lifetime)}")
+    b.line(f"t.Color=ColorSequence.new({_c3(*t.color)})")
+    if t.transparency > 0:
+        b.line(f"t.Transparency=NumberSequence.new({_f(t.transparency)})")
+    b.line(f"t.MinLength={_f(t.min_length)}")
+    if t.texture and "rbxassetid" in t.texture:
+        b.line(f"t.Texture={_luau_str(t.texture)}")
+    if t.light_emission > 0:
+        b.line(f"t.LightEmission={_f(t.light_emission)}")
+    b.line(f"t.Parent={parent_var} end")
+
+
+def _emit_beam(b: _LuauBuilder, bm: "RbxBeam", parent_var: str) -> None:
+    b.line("do local b=Instance.new('Beam')")
+    b.line(f"b.Color=ColorSequence.new({_c3(*bm.color)})")
+    b.line(f"b.Width0={_f(bm.width0)}")
+    b.line(f"b.Width1={_f(bm.width1)}")
+    b.line(f"b.Segments={bm.segments}")
+    if bm.texture and "rbxassetid" in bm.texture:
+        b.line(f"b.Texture={_luau_str(bm.texture)}")
+    if bm.light_emission > 0:
+        b.line(f"b.LightEmission={_f(bm.light_emission)}")
+    b.line(f"b.Parent={parent_var} end")
+
+
+def _emit_motor6d(b: _LuauBuilder, m: "RbxMotor6D", parent_var: str) -> None:
+    b.line(f"do local m=Instance.new('Motor6D')")
+    b.line(f"m.Name={_luau_str(m.name)}")
+    # Part0/Part1 resolved by name search in parent hierarchy
+    if m.part0_name:
+        b.line(f"m.Part0={parent_var}:FindFirstChild({_luau_str(m.part0_name)},true)")
+    if m.part1_name:
+        b.line(f"m.Part1={parent_var}:FindFirstChild({_luau_str(m.part1_name)},true)")
+    cf0 = m.c0
+    b.line(f"m.C0=CFrame.new({_f(cf0.x)},{_f(cf0.y)},{_f(cf0.z)})")
+    cf1 = m.c1
+    b.line(f"m.C1=CFrame.new({_f(cf1.x)},{_f(cf1.y)},{_f(cf1.z)})")
+    b.line(f"m.Parent={parent_var} end")
+
+
+def _emit_reverb(b: _LuauBuilder, r: "RbxReverbSoundEffect", parent_var: str) -> None:
+    b.line("do local r=Instance.new('ReverbSoundEffect')")
+    b.line(f"r.DecayTime={_f(r.decay_time)}")
+    b.line(f"r.Density={_f(r.density)}")
+    b.line(f"r.Diffusion={_f(r.diffusion)}")
+    b.line(f"r.DryLevel={_f(r.dry_level)}")
+    b.line(f"r.WetLevel={_f(r.wet_level)}")
+    b.line(f"r.Parent={parent_var} end")
+
+
+def _emit_video_frame(b: _LuauBuilder, vf: "RbxVideoFrame", parent_var: str) -> None:
+    if not vf.video:
+        return
+    b.line("do local sg=Instance.new('SurfaceGui')")
+    b.line(f"sg.Parent={parent_var}")
+    b.line("local vf=Instance.new('VideoFrame')")
+    b.line(f"vf.Video={_luau_str(vf.video)}")
+    if vf.looped:
+        b.line("vf.Looped=true")
+    b.line(f"vf.Volume={_f(vf.volume)}")
+    b.line("vf.Size=UDim2.new(1,0,1,0)")
+    b.line("vf.Parent=sg end")
 
 
 # ---------------------------------------------------------------------------
@@ -728,22 +823,40 @@ def _emit_ui_element(b: _LuauBuilder, elem: RbxUIElement, parent_var: str) -> No
 # ---------------------------------------------------------------------------
 
 def _emit_terrain(b: _LuauBuilder, place: RbxPlace) -> None:
-    """Emit terrain. Skip SmoothGrid if too large (>500KB base64)."""
+    """Emit terrain generation via FillBlock calls.
+
+    Since the Luau Execution API cannot set BinaryString properties
+    (SmoothGrid), we embed the terrain generator script's FillBlock
+    calls directly. This is the same approach used by the runtime
+    TerrainGenerator script fallback.
+    """
     if not place.terrains:
         return
 
-    for t in place.terrains:
-        if not t.smooth_grid:
-            continue
-        # Check size: base64 data over ~500KB would bloat the script
-        if len(t.smooth_grid) > 500_000:
-            b.line("-- Terrain SmoothGrid too large, relying on TerrainGenerator script")
-            continue
-        # Use terrain.SmoothGrid property directly via base64 decode
-        # The Open Cloud Luau API does not support setting BinaryString directly.
-        # We skip it and rely on the TerrainGenerator fallback script.
-        b.line("-- Terrain SmoothGrid skipped (binary data not settable via Luau API)")
-        b.line("-- Use the TerrainGenerator script for runtime terrain generation")
+    # Find the TerrainGenerator script source — it contains FillBlock calls
+    terrain_script = None
+    for s in place.scripts:
+        if s.name == "TerrainGenerator":
+            terrain_script = s
+            break
+
+    if terrain_script:
+        # Extract just the terrain generation code (skip the script wrapper)
+        src = terrain_script.source
+        # The TerrainGenerator script is standalone Luau — embed it directly
+        b.line("-- Terrain generation via FillBlock")
+        b.line("do")
+        for line in src.split("\n"):
+            # Skip print statements and script attribute checks
+            stripped = line.strip()
+            if stripped.startswith("print(") or stripped.startswith("if script:"):
+                continue
+            if stripped.startswith("script:SetAttribute") or stripped.startswith("script.Disabled"):
+                continue
+            b._lines.append(line)
+        b.line("end")
+    else:
+        b.line("-- No terrain generator available")
 
 
 # ---------------------------------------------------------------------------
