@@ -454,6 +454,18 @@ def execute_luau(
             if state == "FAILED":
                 error = result.get("error", {})
                 logger.error("Luau task failed: %s", error.get("message", str(error)))
+                # Try to fetch execution logs for debugging
+                try:
+                    log_url = f"{poll_url}/logs"
+                    log_resp = requests.get(log_url, headers=_auth_headers(api_key), timeout=15)
+                    if log_resp.status_code == 200:
+                        log_data = log_resp.json()
+                        entries = log_data.get("luauExecutionSessionTaskLogs", [])
+                        for entry in entries[:5]:
+                            for msg in entry.get("messages", []):
+                                logger.error("  Luau log: %s", msg[:200])
+                except Exception:
+                    pass
                 return None
             # PROCESSING — keep polling
         except Exception as exc:
