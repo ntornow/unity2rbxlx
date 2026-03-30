@@ -63,10 +63,15 @@ def _resolve_credential(
               help="Resume from a specific phase")
 @click.option("--no-upload", is_flag=True, help="Skip asset upload")
 @click.option("--no-ai", is_flag=True, help="Disable AI transpilation")
+@click.option("--no-resolve", is_flag=True, help="Skip headless mesh resolution")
 @click.option("--api-key", type=str, default=None,
               help="Roblox Open Cloud API key (string or path to file)")
 @click.option("--creator-id", type=str, default=None,
               help="Roblox Creator ID (number or path to file)")
+@click.option("--universe-id", type=int, default=None,
+              help="Roblox Universe ID for mesh resolution (reuse across runs)")
+@click.option("--place-id", type=int, default=None,
+              help="Roblox Place ID for mesh resolution (reuse across runs)")
 def convert(
     unity_project: str,
     output: str,
@@ -74,8 +79,11 @@ def convert(
     phase: str | None,
     no_upload: bool,
     no_ai: bool,
+    no_resolve: bool,
     api_key: str | None,
     creator_id: str | None,
+    universe_id: int | None,
+    place_id: int | None,
 ) -> None:
     """Convert a Unity project to a Roblox experience.
 
@@ -151,7 +159,55 @@ def convert(
         click.echo(f"  Assets uploaded: {uploaded} ({errors} errors)")
     if pipeline.context.warnings:
         click.echo(f"  Warnings: {len(pipeline.context.warnings)}")
-    click.echo(f"\n  To validate: python u2r.py validate {output_path / 'converted_place.rbxlx'}")
+
+    # Headless mesh resolution: upload → resolve meshes → download
+    rbxlx_file = output_path / "converted_place.rbxlx"
+    has_meshes = any(
+        p.suffix.lower() in ('.fbx', '.obj')
+        for p in pipeline.context.uploaded_assets
+    ) if pipeline.context.uploaded_assets else False
+
+    if has_meshes and not no_upload and not no_resolve and resolved_key:
+        click.echo("\n--- Headless Mesh Resolution ---")
+        from roblox.cloud_api import resolve_meshes_headless, create_experience
+
+        # Load or create universe/place IDs
+        ids_file = output_path / "resolve_ids.json"
+        if universe_id and place_id:
+            uid, pid = universe_id, place_id
+        elif ids_file.exists():
+            import json
+            ids = json.loads(ids_file.read_text())
+            uid, pid = ids["universe_id"], ids["place_id"]
+            click.echo(f"  Reusing universe={uid} place={pid}")
+        else:
+            click.echo("  Creating Roblox experience for mesh resolution...")
+            result = create_experience(resolved_key, name="u2r Mesh Resolver")
+            if result is None:
+                click.echo("  ERROR: Failed to create experience. Use --no-resolve to skip.")
+                click.echo(f"\n  To validate: python u2r.py validate {rbxlx_file}")
+                return
+            uid, pid = result
+            import json
+            ids_file.write_text(json.dumps({"universe_id": uid, "place_id": pid}))
+            click.echo(f"  Created universe={uid} place={pid} (saved to {ids_file})")
+
+        resolved_file = output_path / "resolved_place.rbxl"
+        success = resolve_meshes_headless(
+            api_key=resolved_key,
+            universe_id=uid,
+            place_id=pid,
+            rbxlx_path=rbxlx_file,
+            output_path=resolved_file,
+        )
+        if success:
+            click.echo(f"\n  Resolved place: {resolved_file}")
+            click.echo("  Open this file in Studio — meshes render in edit mode.")
+        else:
+            click.echo("\n  Mesh resolution failed. The rbxlx still works with runtime MeshLoader.")
+            click.echo(f"  To validate: python u2r.py validate {rbxlx_file}")
+    else:
+        click.echo(f"\n  To validate: python u2r.py validate {rbxlx_file}")
 
 
 @main.command()

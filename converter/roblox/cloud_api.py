@@ -29,6 +29,15 @@ _PLACE_VERSION_URL = (
     "/places/{place_id}/versions"
 )
 _CREATE_EXPERIENCE_URL = "https://apis.roblox.com/universes/v1/universes/create"
+_LUAU_EXECUTION_URL = (
+    "https://apis.roblox.com/cloud/v2/universes/{universe_id}"
+    "/places/{place_id}/luau-execution-session-tasks"
+)
+_LUAU_TASK_URL = (
+    "https://apis.roblox.com/cloud/v2/universes/{universe_id}"
+    "/places/{place_id}/versions/{version_id}"
+    "/luau-execution-sessions/{session_id}/tasks/{task_id}"
+)
 
 _DEFAULT_TIMEOUT = 60  # seconds
 
@@ -355,3 +364,339 @@ def create_experience(
         response.text[:500],
     )
     return None
+
+
+# ---------------------------------------------------------------------------
+# Luau Execution API (headless script execution on published places)
+# ---------------------------------------------------------------------------
+
+def execute_luau(
+    api_key: str,
+    universe_id: int | str,
+    place_id: int | str,
+    script: str,
+    timeout: str = "300s",
+) -> dict | None:
+    """Execute a Luau script on a published Roblox place (headless).
+
+    Uses the Open Cloud Luau Execution API to run code server-side
+    without Studio. The script has access to the full DataModel including
+    AssetService, InsertService, etc.
+
+    Returns the task result dict on success, or None on failure.
+    """
+    url = _LUAU_EXECUTION_URL.format(
+        universe_id=universe_id,
+        place_id=place_id,
+    )
+
+    payload = {
+        "script": script,
+        "timeout": timeout,
+    }
+
+    try:
+        resp = requests.post(
+            url,
+            headers={
+                **_auth_headers(api_key),
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=_DEFAULT_TIMEOUT,
+        )
+    except Exception:
+        logger.exception("Failed to submit Luau execution task")
+        return None
+
+    if resp.status_code not in (200, 201):
+        logger.error(
+            "Luau execution submit failed (%d): %s",
+            resp.status_code, resp.text[:500],
+        )
+        return None
+
+    task_data = resp.json()
+    task_path = task_data.get("path", "")
+    state = task_data.get("state", "")
+    logger.info("Luau task submitted: %s (state=%s)", task_path, state)
+
+    # Poll for completion
+    if state == "COMPLETE":
+        return task_data
+
+    # Extract IDs from path for polling
+    # Path format: universes/{uid}/places/{pid}/versions/{vid}/luau-execution-sessions/{sid}/tasks/{tid}
+    parts = task_path.split("/")
+    if len(parts) < 10:
+        logger.error("Unexpected task path format: %s", task_path)
+        return None
+
+    poll_url = f"https://apis.roblox.com/cloud/v2/{task_path}"
+
+    for attempt in range(120):  # 5 minutes max (2.5s intervals)
+        time.sleep(2.5)
+        try:
+            poll_resp = requests.get(
+                poll_url,
+                headers=_auth_headers(api_key),
+                timeout=30,
+            )
+            if poll_resp.status_code != 200:
+                logger.debug("Poll attempt %d: HTTP %d", attempt, poll_resp.status_code)
+                continue
+
+            result = poll_resp.json()
+            state = result.get("state", "")
+            if state == "COMPLETE":
+                logger.info("Luau task completed")
+                return result
+            if state == "FAILED":
+                error = result.get("error", {})
+                logger.error("Luau task failed: %s", error.get("message", str(error)))
+                return None
+            # PROCESSING — keep polling
+        except Exception as exc:
+            logger.debug("Poll error: %s", exc)
+
+    logger.error("Luau task timed out after polling")
+    return None
+
+
+def execute_luau_with_binary(
+    api_key: str,
+    universe_id: int | str,
+    place_id: int | str,
+    script: str,
+    timeout: str = "300s",
+) -> bytes | None:
+    """Execute Luau with binary output enabled, return the binary data.
+
+    The script must return a LuauExecutionTaskOutput table:
+        return { BinaryOutput = buffer, ReturnValues = {...} }
+
+    Returns the binary data on success, or None on failure.
+    """
+    url = _LUAU_EXECUTION_URL.format(
+        universe_id=universe_id,
+        place_id=place_id,
+    )
+
+    payload = {
+        "script": script,
+        "timeout": timeout,
+        "enableBinaryOutput": True,
+    }
+
+    try:
+        resp = requests.post(
+            url,
+            headers={
+                **_auth_headers(api_key),
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=_DEFAULT_TIMEOUT,
+        )
+    except Exception:
+        logger.exception("Failed to submit Luau binary task")
+        return None
+
+    if resp.status_code not in (200, 201):
+        logger.error("Luau binary task submit failed (%d): %s",
+                     resp.status_code, resp.text[:500])
+        return None
+
+    task_data = resp.json()
+    task_path = task_data.get("path", "")
+    poll_url = f"https://apis.roblox.com/cloud/v2/{task_path}"
+
+    # Poll for completion
+    for attempt in range(120):
+        time.sleep(2.5)
+        try:
+            poll_resp = requests.get(poll_url, headers=_auth_headers(api_key), timeout=30)
+            if poll_resp.status_code != 200:
+                continue
+            result = poll_resp.json()
+            state = result.get("state", "")
+            if state == "COMPLETE":
+                binary_uri = result.get("output", {}).get("binaryOutputUri")
+                if binary_uri:
+                    logger.info("Downloading binary output...")
+                    dl = requests.get(binary_uri, timeout=120)
+                    if dl.status_code == 200:
+                        return dl.content
+                    logger.error("Binary download failed: %d", dl.status_code)
+                return None
+            if state == "FAILED":
+                error = result.get("error", {})
+                logger.error("Luau binary task failed: %s", error.get("message", str(error)))
+                return None
+        except Exception as exc:
+            logger.debug("Poll error: %s", exc)
+
+    logger.error("Luau binary task timed out")
+    return None
+
+
+def resolve_meshes_headless(
+    api_key: str,
+    universe_id: int | str,
+    place_id: int | str,
+    rbxlx_path: str | Path,
+    output_path: str | Path,
+) -> bool:
+    """Resolve all MeshParts in a place headlessly via Luau Execution API.
+
+    1. Uploads the rbxlx to the Roblox place
+    2. Executes Luau to replace MeshParts via CreateMeshPartAsync
+    3. Saves the place (persisting PhysicalConfigData)
+    4. Downloads the result via SerializationService binary output
+
+    The final file at output_path will have proper mesh geometry embedded.
+    """
+    rbxlx_path = Path(rbxlx_path)
+    output_path = Path(output_path)
+
+    # Step 1: Upload rbxlx
+    logger.info("Step 1: Uploading rbxlx to place %s...", place_id)
+    if not upload_place(rbxlx_path, api_key, universe_id, place_id):
+        return False
+
+    # Step 2: Execute mesh resolution + save
+    logger.info("Step 2: Resolving meshes via CreateMeshPartAsync...")
+    resolve_script = '''
+local AssetService = game:GetService("AssetService")
+local loaded = 0
+local failed = 0
+local meshCache = {}
+
+local parts = {}
+for _, d in game.Workspace:GetDescendants() do
+    if d:IsA("MeshPart") and d:GetAttribute("_MeshId") then
+        table.insert(parts, d)
+    end
+end
+
+for _, part in ipairs(parts) do
+    local meshUrl = part:GetAttribute("_MeshId")
+
+    if not meshCache[meshUrl] then
+        local ok, mp = pcall(function() return AssetService:CreateMeshPartAsync(meshUrl) end)
+        if ok then
+            meshCache[meshUrl] = { meshId = meshUrl, initialSize = mp.Size, template = mp }
+        else
+            local numId = tonumber(meshUrl:match("(%d+)"))
+            if numId then
+                local ok2, model = pcall(function()
+                    return game:GetService("InsertService"):LoadAsset(numId)
+                end)
+                if ok2 and model then
+                    for _, desc in model:GetDescendants() do
+                        if desc:IsA("MeshPart") and desc.MeshId ~= "" then
+                            local ok3, mp2 = pcall(function()
+                                return AssetService:CreateMeshPartAsync(desc.MeshId)
+                            end)
+                            if ok3 then
+                                meshCache[meshUrl] = {
+                                    meshId = desc.MeshId,
+                                    initialSize = mp2.Size,
+                                    template = mp2,
+                                }
+                            end
+                            break
+                        end
+                    end
+                    model:Destroy()
+                end
+            end
+        end
+        if not meshCache[meshUrl] then
+            meshCache[meshUrl] = false
+        end
+    end
+
+    local cached = meshCache[meshUrl]
+    if not cached then failed = failed + 1; continue end
+
+    local newPart
+    if cached.template then
+        newPart = cached.template
+        cached.template = nil
+    else
+        local ok, mp = pcall(function()
+            return AssetService:CreateMeshPartAsync(cached.meshId)
+        end)
+        if not ok then failed = failed + 1; continue end
+        newPart = mp
+    end
+
+    newPart.Name = part.Name
+    newPart.CFrame = part.CFrame
+    newPart.Anchored = part.Anchored
+    newPart.CanCollide = part.CanCollide
+    newPart.Color = part.Color
+    newPart.Material = part.Material
+    newPart.Transparency = part.Transparency
+    newPart.CastShadow = part.CastShadow
+
+    local sx = part:GetAttribute("_ScaleX")
+    local sy = part:GetAttribute("_ScaleY")
+    local sz = part:GetAttribute("_ScaleZ")
+    if sx and sy and sz then
+        newPart.Size = Vector3.new(
+            cached.initialSize.X * sx,
+            cached.initialSize.Y * sy,
+            cached.initialSize.Z * sz
+        )
+    else
+        newPart.Size = part.Size
+    end
+
+    for name, value in part:GetAttributes() do
+        if string.sub(name, 1, 1) ~= "_" then
+            newPart:SetAttribute(name, value)
+        end
+    end
+
+    for _, child in part:GetChildren() do
+        pcall(function() child.Parent = newPart end)
+    end
+
+    newPart.Parent = part.Parent
+    part:Destroy()
+    loaded = loaded + 1
+end
+
+-- Save the place with resolved meshes
+game:GetService("AssetService"):SavePlaceAsync()
+
+return string.format("Resolved %d meshes, %d failed", loaded, failed)
+'''
+    result = execute_luau(api_key, universe_id, place_id, resolve_script)
+    if result is None:
+        logger.error("Mesh resolution failed")
+        return False
+
+    output = result.get("output", {})
+    results = output.get("results", [])
+    logger.info("Mesh resolution result: %s", results)
+
+    # Step 3: Download the saved place with embedded mesh data
+    logger.info("Step 3: Downloading resolved place...")
+    download_script = '''
+local SerializationService = game:GetService("SerializationService")
+local buf = SerializationService:SerializePlaceToRBXL()
+return { BinaryOutput = buf, ReturnValues = { "ok" } }
+'''
+    place_data = execute_luau_with_binary(
+        api_key, universe_id, place_id, download_script
+    )
+    if place_data is None:
+        logger.error("Failed to download resolved place")
+        return False
+
+    output_path.write_bytes(place_data)
+    logger.info("Saved resolved place to %s (%d bytes)", output_path, len(place_data))
+    return True
