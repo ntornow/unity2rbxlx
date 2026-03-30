@@ -235,6 +235,55 @@ def convert(
 
 
 @main.command()
+@click.argument("output_dir", type=click.Path(exists=True))
+@click.option("--api-key", type=str, default=None, help="Roblox API key")
+@click.option("--universe-id", type=int, default=None)
+@click.option("--place-id", type=int, default=None)
+def publish(output_dir: str, api_key: str | None, universe_id: int | None, place_id: int | None) -> None:
+    """Publish a previously converted place to Roblox with proper meshes.
+
+    Re-publishes the place from an existing conversion output directory
+    without re-running the conversion. Useful for iterating on the Roblox
+    experience without re-converting the Unity project.
+    """
+    output_path = Path(output_dir)
+    resolved_key = _resolve_api_key(api_key)
+    if not resolved_key:
+        click.echo("ERROR: API key required. Pass --api-key or create apikey file."); return
+
+    from roblox.cloud_api import execute_luau
+    from converter.pipeline import Pipeline
+
+    # Load IDs
+    ids_file = output_path / "resolve_ids.json"
+    uid, pid = universe_id, place_id
+    if not uid or not pid:
+        if ids_file.exists():
+            import json
+            ids = json.loads(ids_file.read_text())
+            uid, pid = ids.get("universe_id"), ids.get("place_id")
+    if not uid or not pid:
+        click.echo("ERROR: --universe-id and --place-id required (or cached in resolve_ids.json)"); return
+
+    # Check for pre-generated script
+    script_file = output_path / "place_builder.luau"
+    if script_file.exists():
+        click.echo(f"Using cached script: {script_file}")
+        luau_script = script_file.read_text()
+    else:
+        click.echo("ERROR: No place_builder.luau found. Run 'convert' first."); return
+
+    click.echo(f"Script: {len(luau_script):,} chars ({len(luau_script)/1024:.0f} KB)")
+    click.echo(f"Publishing to universe={uid} place={pid}...")
+    result = execute_luau(resolved_key, uid, pid, luau_script, timeout="300s")
+    if result is not None:
+        click.echo("Place published successfully!")
+        click.echo("Open in Studio: File → Open from Roblox → select the experience")
+    else:
+        click.echo("Publication failed.")
+
+
+@main.command()
 @click.argument("unity_project", type=click.Path(exists=True))
 def analyze(unity_project: str) -> None:
     """Analyze a Unity project without converting."""
