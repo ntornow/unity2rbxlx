@@ -918,7 +918,8 @@ class Pipeline:
         if self.ctx.uploaded_assets:
             from core.roblox_types import RbxScript
             mesh_loader = '''-- Auto-generated mesh loader
--- Resolves Model IDs → real MeshIds, then rebuilds MeshParts with proper meshes
+-- Replaces placeholder MeshParts with proper mesh geometry via CreateMeshPartAsync.
+-- Handles both real MeshIds (post-resolution) and Model IDs (pre-resolution).
 if script:GetAttribute("MeshesLoaded") then return end
 
 local AssetService = game:GetService("AssetService")
@@ -926,100 +927,110 @@ local InsertService = game:GetService("InsertService")
 local loaded = 0
 local failed = 0
 
--- Step 1: Collect unique Model IDs to resolve
-local modelToMesh = {}
-local uniqueMeshIds = {}
-local meshIdSet = {}
+-- Cache: meshIdUrl → {meshId, initialSize} to avoid redundant loads
+local meshCache = {}
 
-for _, part in workspace:GetDescendants() do
-    if part:IsA("MeshPart") then
-        local mid = part:GetAttribute("_MeshId")
-        if mid and not meshIdSet[mid] then
-            meshIdSet[mid] = true
-            table.insert(uniqueMeshIds, mid)
-        end
+local function resolveMeshId(url)
+    if meshCache[url] then return meshCache[url] end
+
+    local numId = tonumber(url:match("(%d+)"))
+    if not numId then return nil end
+
+    -- Try 1: CreateMeshPartAsync directly (works for real MeshIds)
+    local ok, mp = pcall(function() return AssetService:CreateMeshPartAsync(url) end)
+    if ok and mp then
+        local entry = { meshId = url, initialSize = mp.Size, meshPart = mp }
+        meshCache[url] = entry
+        return entry
     end
-end
 
--- Step 2: Resolve Model IDs → real MeshIds via InsertService:LoadAsset
-local meshResolved = 0
-for _, modelUrl in uniqueMeshIds do
-    local numId = tonumber(modelUrl:match("(%d+)"))
-    if numId then
-        local ok, model = pcall(function() return InsertService:LoadAsset(numId) end)
-        if ok and model then
-            for _, desc in model:GetDescendants() do
-                if desc:IsA("MeshPart") and desc.MeshId ~= "" then
-                    modelToMesh[modelUrl] = {
-                        meshId = desc.MeshId,
-                        initialSize = desc.Size,
-                    }
-                    meshResolved = meshResolved + 1
-                    break
-                end
+    -- Try 2: LoadAsset (works for Model IDs that wrap a MeshPart)
+    local ok2, model = pcall(function() return InsertService:LoadAsset(numId) end)
+    if ok2 and model then
+        for _, desc in model:GetDescendants() do
+            if desc:IsA("MeshPart") and desc.MeshId ~= "" then
+                local realId = desc.MeshId
+                local entry = { meshId = realId, initialSize = desc.Size }
+                meshCache[url] = entry
+                model:Destroy()
+                return entry
             end
-            model:Destroy()
         end
+        model:Destroy()
     end
-    task.wait()
-end
-print(string.format("MeshLoader: resolved %d/%d mesh Model IDs", meshResolved, #uniqueMeshIds))
 
--- Step 3: Replace placeholder MeshParts with real meshes
+    meshCache[url] = false
+    return nil
+end
+
+-- Collect parts to process (snapshot list to avoid mutation during iteration)
+local partsToProcess = {}
 for _, part in workspace:GetDescendants() do
     if part:IsA("MeshPart") and part:GetAttribute("_MeshId") then
-        local resolved = modelToMesh[part:GetAttribute("_MeshId")]
-        if not resolved then failed = failed + 1; continue end
-
-        local ok, newPart = pcall(function()
-            return AssetService:CreateMeshPartAsync(resolved.meshId)
-        end)
-        if ok and newPart then
-            newPart.Name = part.Name
-            newPart.CFrame = part.CFrame
-            newPart.Anchored = part.Anchored
-            newPart.CanCollide = part.CanCollide
-            newPart.Color = part.Color
-            newPart.Material = part.Material
-            newPart.Transparency = part.Transparency
-            newPart.CastShadow = part.CastShadow
-
-            -- Compute proper size using stored scale attributes
-            local scaleX = part:GetAttribute("_ScaleX")
-            local scaleY = part:GetAttribute("_ScaleY")
-            local scaleZ = part:GetAttribute("_ScaleZ")
-            if scaleX and scaleY and scaleZ and resolved.initialSize then
-                local init = resolved.initialSize
-                newPart.Size = Vector3.new(
-                    init.X * math.abs(scaleX),
-                    init.Y * math.abs(scaleY),
-                    init.Z * math.abs(scaleZ)
-                )
-            else
-                newPart.Size = part.Size
-            end
-
-            -- Copy non-internal attributes
-            for name, value in pairs(part:GetAttributes()) do
-                if string.sub(name, 1, 1) ~= "_" then
-                    newPart:SetAttribute(name, value)
-                end
-            end
-
-            -- Reparent all children (SurfaceAppearance, scripts, etc.)
-            for _, child in part:GetChildren() do
-                pcall(function() child.Parent = newPart end)
-            end
-
-            newPart.Parent = part.Parent
-            part:Destroy()
-            loaded = loaded + 1
-        else
-            failed = failed + 1
-        end
-
-        if loaded % 20 == 0 then task.wait() end
+        table.insert(partsToProcess, part)
     end
+end
+
+print(string.format("MeshLoader: processing %d MeshParts", #partsToProcess))
+
+for _, part in partsToProcess do
+    if not part.Parent then continue end
+    local meshUrl = part:GetAttribute("_MeshId")
+    local resolved = resolveMeshId(meshUrl)
+    if not resolved then failed = failed + 1; continue end
+
+    -- Create the mesh part (reuse cached meshPart if first use, else create new)
+    local newPart
+    if resolved.meshPart then
+        newPart = resolved.meshPart
+        resolved.meshPart = nil  -- only reuse once
+    else
+        local ok, mp = pcall(function() return AssetService:CreateMeshPartAsync(resolved.meshId) end)
+        if not ok then failed = failed + 1; continue end
+        newPart = mp
+    end
+
+    newPart.Name = part.Name
+    newPart.CFrame = part.CFrame
+    newPart.Anchored = part.Anchored
+    newPart.CanCollide = part.CanCollide
+    newPart.Color = part.Color
+    newPart.Material = part.Material
+    newPart.Transparency = part.Transparency
+    newPart.CastShadow = part.CastShadow
+
+    -- Compute proper size using stored scale attributes
+    local scaleX = part:GetAttribute("_ScaleX")
+    local scaleY = part:GetAttribute("_ScaleY")
+    local scaleZ = part:GetAttribute("_ScaleZ")
+    if scaleX and scaleY and scaleZ then
+        local init = resolved.initialSize
+        newPart.Size = Vector3.new(
+            init.X * scaleX,
+            init.Y * scaleY,
+            init.Z * scaleZ
+        )
+    else
+        newPart.Size = part.Size
+    end
+
+    -- Copy non-internal attributes
+    for name, value in pairs(part:GetAttributes()) do
+        if string.sub(name, 1, 1) ~= "_" then
+            newPart:SetAttribute(name, value)
+        end
+    end
+
+    -- Reparent all children (SurfaceAppearance, scripts, etc.)
+    for _, child in part:GetChildren() do
+        pcall(function() child.Parent = newPart end)
+    end
+
+    newPart.Parent = part.Parent
+    part:Destroy()
+    loaded = loaded + 1
+
+    if loaded % 20 == 0 then task.wait() end
 end
 
 print(string.format("MeshLoader: %d loaded, %d failed", loaded, failed))
@@ -1033,6 +1044,58 @@ script.Disabled = true
             ))
             log.info("[write_output] MeshLoader script embedded for %d mesh assets",
                      sum(1 for p in self.ctx.uploaded_assets if Path(p).suffix.lower() in ('.fbx', '.obj')))
+
+        # Generate TerrainSnap script to adjust object Y positions to sit on terrain.
+        # The terrain encoder uses a simplified coordinate system that may not perfectly
+        # align with object world positions. This script fixes alignment at runtime.
+        if self.state.rbx_place.terrains:
+            from core.roblox_types import RbxScript
+            terrain_snap = '''-- Auto-generated terrain snap script
+-- Adjusts object Y positions to sit on the terrain surface.
+if script:GetAttribute("TerrainSnapDone") then return end
+task.wait(2)  -- Wait for terrain and meshes to load
+
+local terrain = workspace:FindFirstChildOfClass("Terrain")
+if not terrain then script:SetAttribute("TerrainSnapDone", true); return end
+
+local params = RaycastParams.new()
+params.FilterType = Enum.RaycastFilterType.Include
+params.FilterDescendantsInstances = {terrain}
+
+local snapped = 0
+for _, part in workspace:GetDescendants() do
+    if part:IsA("BasePart") and part.Anchored and part.Name ~= "GroundCollider" then
+        local pos = part.Position
+        -- Raycast down from above to find terrain surface
+        local result = workspace:Raycast(
+            Vector3.new(pos.X, 500, pos.Z),
+            Vector3.new(0, -1000, 0),
+            params
+        )
+        if result then
+            local terrainY = result.Position.Y
+            local halfHeight = part.Size.Y / 2
+            local targetY = terrainY + halfHeight
+            local delta = math.abs(pos.Y - targetY)
+            -- Only snap if reasonably close (within 50 studs) to avoid
+            -- moving floating/elevated objects
+            if delta > 1 and delta < 50 then
+                part.CFrame = part.CFrame + Vector3.new(0, targetY - pos.Y, 0)
+                snapped = snapped + 1
+            end
+        end
+    end
+end
+print(string.format("TerrainSnap: adjusted %d parts", snapped))
+script:SetAttribute("TerrainSnapDone", true)
+script.Disabled = true
+'''
+            self.state.rbx_place.scripts.append(RbxScript(
+                name="TerrainSnap",
+                source=terrain_snap,
+                script_type="Script",
+            ))
+            log.info("[write_output] TerrainSnap script embedded")
 
         # Final validation pass: apply validator fixes to all scripts one last time
         # (catches patterns introduced by require injection, reclassification, etc.)

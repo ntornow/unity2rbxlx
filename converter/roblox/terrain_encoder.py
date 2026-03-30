@@ -256,7 +256,7 @@ def encode_smooth_grid(
         occupancy: 0 = empty, 255 = fully solid.
         Surface voxels get partial occupancy for smooth edges.
         """
-        if gx >= grid_x or gy >= grid_y or gz >= grid_z:
+        if gx < 0 or gy < 0 or gz < 0 or gx >= grid_x or gy >= grid_y or gz >= grid_z:
             return (MATERIAL_AIR, 0)
 
         h_studs = sample_height(gx * VOXEL_SIZE, gz * VOXEL_SIZE)

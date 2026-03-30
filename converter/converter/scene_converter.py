@@ -186,6 +186,9 @@ _fbx_bounding_boxes: dict[str, tuple[float, float, float]] = {}
 # Module-level collector for water regions discovered during node conversion.
 # Populated by _convert_node / _convert_prefab_instance, consumed by convert_scene.
 _water_regions: list[RbxWaterRegion] = []
+# Terrain world position offset — subtracted from object positions so they
+# align with terrain encoder's (0,0,0)-based voxel grid.
+_terrain_world_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
 
 def _read_fbx_unit_scale_factors(fbx_path: Path) -> tuple[float | None, float | None]:
@@ -485,13 +488,27 @@ def convert_scene(
     from converter.ui_translator import find_canvas_nodes as _find_canvas
     canvas_node_ids = {id(n) for n in _find_canvas(parsed_scene.roots)}
 
-    # Identify Terrain nodes so we can exclude them
-    # (they're handled by _collect_terrains below).
+    # Identify Terrain nodes and compute terrain world position offset.
+    # The terrain encoder places terrain at (0,0,0) in chunk space,
+    # so object positions must be made terrain-relative to align correctly.
     terrain_node_ids: set[int] = set()
+    global _terrain_world_offset
+    _terrain_world_offset = (0.0, 0.0, 0.0)
     for node in parsed_scene.all_nodes.values():
         for comp in node.components:
             if comp.component_type in _TERRAIN_TYPES:
                 terrain_node_ids.add(id(node))
+                # Compute terrain world position by walking parent chain
+                twx, twy, twz = node.position
+                _pf = node.parent_file_id
+                while _pf and _pf in parsed_scene.all_nodes:
+                    _pn = parsed_scene.all_nodes[_pf]
+                    twx += _pn.position[0]
+                    twy += _pn.position[1]
+                    twz += _pn.position[2]
+                    _pf = _pn.parent_file_id
+                _terrain_world_offset = (twx, twy, twz)
+                log.info("Terrain world position offset: (%.1f, %.1f, %.1f)", twx, twy, twz)
 
     # Build a mapping from Transform file_id → scene node, so we can parent
     # prefab instances under their correct hierarchy container.
@@ -3070,3 +3087,4 @@ def _add_floor_and_spawn(place: RbxPlace) -> None:
     else:
         log.info("Auto-generated floor at y=%.1f (%.0fx%.0f) [median_y=%.1f, %d parts]",
                  floor_y, width, depth, median_y, n)
+
