@@ -267,7 +267,7 @@ def generate_terrain_luau(
         f"local oX = {rx}",
         f"local oY = {ry}",
         f"local oZ = {rz}",
-        f"local maxH = {max_height_studs:.1f}",
+        f"local maxH = {max(heights) * max_height_studs:.1f}",
         "",
         "local function gM(h)",
         "    local n = h / maxH",

@@ -872,7 +872,10 @@ class Pipeline:
                         terrain_data = read_unity_terrain(td_path)
                         if terrain_data:
                             from core.coordinate_system import unity_to_roblox_pos
-                            rpos = unity_to_roblox_pos(*terrain_obj.position)
+                            # Use the terrain world offset (includes parent chain)
+                            # computed during scene conversion, not just local position.
+                            from converter.scene_converter import _terrain_world_offset
+                            rpos = unity_to_roblox_pos(*_terrain_world_offset)
                             # Encode terrain voxels into rbxlx binary format
                             try:
                                 from roblox.terrain_encoder import encode_smooth_grid, encode_physics_grid
