@@ -440,21 +440,11 @@ def _emit_part(
         # Additional MeshPart properties
         _emit_part_extras(b, part, var)
 
-        # Scale attributes for mesh sizing
-        attrs = part.attributes or {}
-        scale_x = attrs.get("_ScaleX")
-        scale_y = attrs.get("_ScaleY")
-        scale_z = attrs.get("_ScaleZ")
-        if scale_x is not None or scale_y is not None or scale_z is not None:
-            # After CreateMeshPartAsync, actual mesh size is in mp.Size (= MeshSize)
-            # Final size = MeshSize * scale
-            sx = _f(scale_x) if scale_x is not None else "1"
-            sy = _f(scale_y) if scale_y is not None else "1"
-            sz_s = _f(scale_z) if scale_z is not None else "1"
-            b.line(
-                f"{var}.Size=Vector3.new("
-                f"{var}.Size.X*{sx},{var}.Size.Y*{sy},{var}.Size.Z*{sz_s})"
-            )
+        # Note: part.size already has the correct final size from the converter.
+        # The mkMesh function sets mp.Size = sz (the pre-computed size).
+        # The _ScaleX/Y/Z attributes are only used by the MeshLoader runtime
+        # fallback where mp.Size starts as MeshSize (native) and needs scaling.
+        # Here we DON'T apply _Scale — it would double the scaling.
 
         # TextureID
         if part.texture_id:
