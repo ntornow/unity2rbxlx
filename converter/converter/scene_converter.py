@@ -431,6 +431,67 @@ _UNITY_BUILTIN_MESH_SHAPES: dict[str, tuple[int, bool, tuple[float, float, float
 }
 
 
+def _compose_parts_with_parent_cframe(
+    parts: list,
+    px: float, py: float, pz: float,
+    pr00: float, pr01: float, pr02: float,
+    pr10: float, pr11: float, pr12: float,
+    pr20: float, pr21: float, pr22: float,
+    has_rotation: bool,
+) -> None:
+    """Compose parent world CFrame onto child parts (recursive).
+
+    Rotates each child's local position by the parent's rotation matrix,
+    then adds the parent's world position. Also composes rotation matrices.
+    """
+    for part in parts:
+        if hasattr(part, 'cframe') and part.cframe:
+            cx = part.cframe.x or 0
+            cy = part.cframe.y or 0
+            cz = part.cframe.z or 0
+            if has_rotation:
+                rx = pr00 * cx + pr01 * cy + pr02 * cz
+                ry = pr10 * cx + pr11 * cy + pr12 * cz
+                rz = pr20 * cx + pr21 * cy + pr22 * cz
+                cr00 = part.cframe.r00 if part.cframe.r00 is not None else 1.0
+                cr01 = part.cframe.r01 if part.cframe.r01 is not None else 0.0
+                cr02 = part.cframe.r02 if part.cframe.r02 is not None else 0.0
+                cr10 = part.cframe.r10 if part.cframe.r10 is not None else 0.0
+                cr11 = part.cframe.r11 if part.cframe.r11 is not None else 1.0
+                cr12 = part.cframe.r12 if part.cframe.r12 is not None else 0.0
+                cr20 = part.cframe.r20 if part.cframe.r20 is not None else 0.0
+                cr21 = part.cframe.r21 if part.cframe.r21 is not None else 0.0
+                cr22 = part.cframe.r22 if part.cframe.r22 is not None else 1.0
+                nr00 = pr00*cr00 + pr01*cr10 + pr02*cr20
+                nr01 = pr00*cr01 + pr01*cr11 + pr02*cr21
+                nr02 = pr00*cr02 + pr01*cr12 + pr02*cr22
+                nr10 = pr10*cr00 + pr11*cr10 + pr12*cr20
+                nr11 = pr10*cr01 + pr11*cr11 + pr12*cr21
+                nr12 = pr10*cr02 + pr11*cr12 + pr12*cr22
+                nr20 = pr20*cr00 + pr21*cr10 + pr22*cr20
+                nr21 = pr20*cr01 + pr21*cr11 + pr22*cr21
+                nr22 = pr20*cr02 + pr21*cr12 + pr22*cr22
+                part.cframe = RbxCFrame(
+                    x=px + rx, y=py + ry, z=pz + rz,
+                    r00=nr00, r01=nr01, r02=nr02,
+                    r10=nr10, r11=nr11, r12=nr12,
+                    r20=nr20, r21=nr21, r22=nr22,
+                )
+            else:
+                part.cframe = RbxCFrame(
+                    x=cx + px, y=cy + py, z=cz + pz,
+                    r00=part.cframe.r00, r01=part.cframe.r01, r02=part.cframe.r02,
+                    r10=part.cframe.r10, r11=part.cframe.r11, r12=part.cframe.r12,
+                    r20=part.cframe.r20, r21=part.cframe.r21, r22=part.cframe.r22,
+                )
+        if hasattr(part, 'children') and part.children:
+            _compose_parts_with_parent_cframe(
+                part.children, px, py, pz,
+                pr00, pr01, pr02, pr10, pr11, pr12, pr20, pr21, pr22,
+                has_rotation,
+            )
+
+
 def convert_scene(
     parsed_scene: ParsedScene,
     guid_index: GuidIndex | None = None,
@@ -717,58 +778,10 @@ def convert_scene(
                                     and abs(pr12) < 1e-6 and abs(pr20) < 1e-6 and abs(pr21) < 1e-6
                                 )
 
-                                def _compose_with_parent(parts, px, py, pz,
-                                                          pr00, pr01, pr02, pr10, pr11, pr12, pr20, pr21, pr22,
-                                                          has_rotation):
-                                    for part in parts:
-                                        if hasattr(part, 'cframe') and part.cframe:
-                                            cx = part.cframe.x or 0
-                                            cy = part.cframe.y or 0
-                                            cz = part.cframe.z or 0
-                                            if has_rotation:
-                                                # Rotate child local pos by parent rotation, then translate
-                                                rx = pr00 * cx + pr01 * cy + pr02 * cz
-                                                ry = pr10 * cx + pr11 * cy + pr12 * cz
-                                                rz = pr20 * cx + pr21 * cy + pr22 * cz
-                                                # Compose rotation matrices: parent × child
-                                                cr00 = part.cframe.r00 if part.cframe.r00 is not None else 1.0
-                                                cr01 = part.cframe.r01 if part.cframe.r01 is not None else 0.0
-                                                cr02 = part.cframe.r02 if part.cframe.r02 is not None else 0.0
-                                                cr10 = part.cframe.r10 if part.cframe.r10 is not None else 0.0
-                                                cr11 = part.cframe.r11 if part.cframe.r11 is not None else 1.0
-                                                cr12 = part.cframe.r12 if part.cframe.r12 is not None else 0.0
-                                                cr20 = part.cframe.r20 if part.cframe.r20 is not None else 0.0
-                                                cr21 = part.cframe.r21 if part.cframe.r21 is not None else 0.0
-                                                cr22 = part.cframe.r22 if part.cframe.r22 is not None else 1.0
-                                                nr00 = pr00*cr00 + pr01*cr10 + pr02*cr20
-                                                nr01 = pr00*cr01 + pr01*cr11 + pr02*cr21
-                                                nr02 = pr00*cr02 + pr01*cr12 + pr02*cr22
-                                                nr10 = pr10*cr00 + pr11*cr10 + pr12*cr20
-                                                nr11 = pr10*cr01 + pr11*cr11 + pr12*cr21
-                                                nr12 = pr10*cr02 + pr11*cr12 + pr12*cr22
-                                                nr20 = pr20*cr00 + pr21*cr10 + pr22*cr20
-                                                nr21 = pr20*cr01 + pr21*cr11 + pr22*cr21
-                                                nr22 = pr20*cr02 + pr21*cr12 + pr22*cr22
-                                                part.cframe = RbxCFrame(
-                                                    x=px + rx, y=py + ry, z=pz + rz,
-                                                    r00=nr00, r01=nr01, r02=nr02,
-                                                    r10=nr10, r11=nr11, r12=nr12,
-                                                    r20=nr20, r21=nr21, r22=nr22,
-                                                )
-                                            else:
-                                                part.cframe = RbxCFrame(
-                                                    x=cx + px, y=cy + py, z=cz + pz,
-                                                    r00=part.cframe.r00, r01=part.cframe.r01, r02=part.cframe.r02,
-                                                    r10=part.cframe.r10, r11=part.cframe.r11, r12=part.cframe.r12,
-                                                    r20=part.cframe.r20, r21=part.cframe.r21, r22=part.cframe.r22,
-                                                )
-                                        if hasattr(part, 'children') and part.children:
-                                            _compose_with_parent(part.children, px, py, pz,
-                                                                  pr00, pr01, pr02, pr10, pr11, pr12, pr20, pr21, pr22,
-                                                                  has_rotation)
-                                _compose_with_parent(pi_parts, px, py, pz,
-                                                      pr00, pr01, pr02, pr10, pr11, pr12, pr20, pr21, pr22,
-                                                      has_rotation)
+                                _compose_parts_with_parent_cframe(
+                                    pi_parts, px, py, pz,
+                                    pr00, pr01, pr02, pr10, pr11, pr12, pr20, pr21, pr22,
+                                    has_rotation)
                             parent_rbx.children.extend(pi_parts)
                             parented += len(pi_parts)
                         else:
@@ -793,6 +806,29 @@ def convert_scene(
                 parent_rbx = pi_file_id_to_rbx.get(parent_id)
 
                 if parent_rbx is not None:
+                    # Apply parent's world CFrame to child parts (same as scene-node parenting)
+                    if hasattr(parent_rbx, 'cframe') and parent_rbx.cframe:
+                        pcf = parent_rbx.cframe
+                        px = pcf.x or 0
+                        py = pcf.y or 0
+                        pz = pcf.z or 0
+                        pr00 = pcf.r00 if pcf.r00 is not None else 1.0
+                        pr01 = pcf.r01 if pcf.r01 is not None else 0.0
+                        pr02 = pcf.r02 if pcf.r02 is not None else 0.0
+                        pr10 = pcf.r10 if pcf.r10 is not None else 0.0
+                        pr11 = pcf.r11 if pcf.r11 is not None else 1.0
+                        pr12 = pcf.r12 if pcf.r12 is not None else 0.0
+                        pr20 = pcf.r20 if pcf.r20 is not None else 0.0
+                        pr21 = pcf.r21 if pcf.r21 is not None else 0.0
+                        pr22 = pcf.r22 if pcf.r22 is not None else 1.0
+                        has_rotation = not (
+                            abs(pr00 - 1) < 1e-6 and abs(pr11 - 1) < 1e-6 and abs(pr22 - 1) < 1e-6
+                            and abs(pr01) < 1e-6 and abs(pr02) < 1e-6 and abs(pr10) < 1e-6
+                            and abs(pr12) < 1e-6 and abs(pr20) < 1e-6 and abs(pr21) < 1e-6
+                        )
+                        _compose_parts_with_parent_cframe(pi_parts, px, py, pz,
+                                              pr00, pr01, pr02, pr10, pr11, pr12, pr20, pr21, pr22,
+                                              has_rotation)
                     parent_rbx.children.extend(pi_parts)
                     parented += len(pi_parts)
                     resolved_this_pass += len(pi_parts)
