@@ -998,6 +998,34 @@ def _make_part(parent_xml: ET.Element, part: RbxPart) -> None:
     if sa is not None and part_class == "MeshPart":
         _make_surface_appearance(item, sa)
 
+    # For non-MeshPart Parts with SurfaceAppearance, add Texture children.
+    # Roblox Parts don't support SurfaceAppearance but they do support
+    # Texture objects on each face, providing tiled texture rendering.
+    if sa is not None and part_class == "Part":
+        color_map = getattr(sa, "color_map", None)
+        if color_map and "rbxassetid" in color_map:
+            # Compute StudsPerTile from Unity UV tiling scale.
+            # UV scale N means the texture repeats N times across the mesh.
+            # StudsPerTile = PartSizeAlongAxis / N
+            tiling = getattr(sa, "tiling", None)
+            part_sx = part.size[0] if hasattr(part, "size") and part.size else 4.0
+            part_sz = part.size[2] if hasattr(part, "size") and part.size else 4.0
+            if tiling and tiling[0] > 0 and tiling[1] > 0:
+                studs_u = part_sx / tiling[0]
+                studs_v = part_sz / tiling[1]
+            else:
+                studs_u = part_sx  # default: 1 tile across the whole face
+                studs_v = part_sz
+            # Apply textures to all 6 faces for full coverage.
+            # NormalId enum: Right=0, Top=1, Back=2, Left=3, Bottom=4, Front=5
+            for face_enum, face_label in ((1, "Top"), (4, "Bottom"), (5, "Front"),
+                                          (2, "Back"), (0, "Right"), (3, "Left")):
+                tex_item, tex_props = _make_item(item, "Texture", f"Texture_{face_label}")
+                _add_content(tex_props, "Texture", color_map)
+                _add_token(tex_props, "Face", face_enum)
+                _add_float(tex_props, "StudsPerTileU", studs_u)
+                _add_float(tex_props, "StudsPerTileV", studs_v)
+
     # Sprite texture → Decal (full image) or SurfaceGui>ImageLabel (atlas crop)
     sprite_tex = all_attrs.get("_SpriteTextureId", "")
     if sprite_tex and "rbxassetid" in sprite_tex:
@@ -1408,6 +1436,11 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, Any]:
             near_clip = getattr(cam, "near_clip", 0.3)
             if near_clip and near_clip > 0.3:
                 _add_float(sp_props, "CameraMinZoomDistance", near_clip)
+        # Lock first-person camera for FPS games
+        if getattr(place, "is_fps_game", False):
+            _add_token(sp_props, "CameraMode", 1)  # 1 = LockFirstPerson
+            _add_float(sp_props, "CameraMinZoomDistance", 0.5)
+            _add_float(sp_props, "CameraMaxZoomDistance", 0.5)
     starter_player_scripts_item, _ = _make_item(starter_player, "StarterPlayerScripts", "StarterPlayerScripts")
     starter_char_scripts_item, _ = _make_item(starter_player, "StarterCharacterScripts", "StarterCharacterScripts")
     starter_gui = _make_service(root, "StarterGui")

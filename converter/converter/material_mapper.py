@@ -515,7 +515,7 @@ def _regex_parse_tex_envs(raw: str) -> list[dict[str, Any]]:
 
         result.append({prop_name: {"m_Texture": tex_ref}})
 
-    # New format: - _MainTex: \n m_Texture: {fileID: N, guid: HEX}
+    # New format: - _MainTex: \n m_Texture: {fileID: N, guid: HEX} \n m_Scale: {x: N, y: N} \n m_Offset: {x: N, y: N}
     if not result:
         pattern2 = r"-\s*(_\w+):\s*\n\s*m_Texture:\s*\{([^}]*)\}"
         for m in re.finditer(pattern2, raw):
@@ -528,7 +528,23 @@ def _regex_parse_tex_envs(raw: str) -> list[dict[str, Any]]:
                 tex_ref["guid"] = guid_m.group(1)
             if file_id_m:
                 tex_ref["fileID"] = int(file_id_m.group(1))
-            result.append({prop_name: {"m_Texture": tex_ref}})
+            entry: dict[str, Any] = {"m_Texture": tex_ref}
+            # Look for m_Scale and m_Offset after this tex entry
+            after = raw[m.end():]
+            scale_m = re.match(r"\s*\n\s*m_Scale:\s*\{([^}]*)\}", after)
+            if scale_m:
+                sx_m = re.search(r"x:\s*([0-9.eE+-]+)", scale_m.group(1))
+                sy_m = re.search(r"y:\s*([0-9.eE+-]+)", scale_m.group(1))
+                if sx_m and sy_m:
+                    entry["m_Scale"] = {"x": float(sx_m.group(1)), "y": float(sy_m.group(1))}
+                offset_after = after[scale_m.end():]
+                offset_m = re.match(r"\s*\n\s*m_Offset:\s*\{([^}]*)\}", offset_after)
+                if offset_m:
+                    ox_m = re.search(r"x:\s*([0-9.eE+-]+)", offset_m.group(1))
+                    oy_m = re.search(r"y:\s*([0-9.eE+-]+)", offset_m.group(1))
+                    if ox_m and oy_m:
+                        entry["m_Offset"] = {"x": float(ox_m.group(1)), "y": float(oy_m.group(1))}
+            result.append({prop_name: entry})
 
     return result
 

@@ -593,6 +593,24 @@ class Pipeline:
             log.warning("[convert_scene] No parsed scene -- skipping")
             return
 
+        # Ensure material_mappings are populated (needed when resuming from this phase)
+        if not self.state.material_mappings and self.state.guid_index:
+            log.info("[convert_scene] Re-running material mapping (skipped phase resume)")
+            from converter.material_mapper import map_materials
+            referenced_guids = set()
+            if self.state.parsed_scene:
+                referenced_guids.update(self.state.parsed_scene.referenced_material_guids)
+            if self.state.prefab_library:
+                referenced_guids.update(self.state.prefab_library.referenced_material_guids)
+            self.state.material_mappings = map_materials(
+                unity_project_path=self.unity_project_path,
+                guid_index=self.state.guid_index,
+                referenced_guids=referenced_guids,
+                output_dir=self.output_dir,
+                uploaded_assets=self.ctx.uploaded_assets,
+            )
+            log.info("[convert_scene] Loaded %d material mappings", len(self.state.material_mappings))
+
         # Load mesh native sizes if available in context
         mesh_native_sizes = {}
         raw_sizes = getattr(self.ctx, "mesh_native_sizes", None)
@@ -853,10 +871,12 @@ class Pipeline:
                      len(side_effect_modules), ", ".join(side_effect_modules))
 
         # Auto-generate client scripts and HUD for FPS-style games.
-        from converter.fps_client_generator import inject_fps_scripts
+        from converter.fps_client_generator import inject_fps_scripts, detect_fps_game
         fps_added = inject_fps_scripts(self.state.rbx_place)
         if fps_added:
             log.info("[write_output] Auto-generated %d FPS client scripts/GUIs", fps_added)
+        if detect_fps_game(self.state.rbx_place):
+            self.state.rbx_place.is_fps_game = True
 
         # Inject runtime library modules when relevant features are detected.
         self._inject_runtime_modules()

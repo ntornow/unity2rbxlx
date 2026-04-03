@@ -4268,3 +4268,119 @@ class TestValidatorBatch18:
         source = '    [UnityEngine.Serialization.FormerlySerializedAs("_x")] GameState gs'
         fixed, _ = validate_and_fix("test", source)
         assert 'FormerlySerializedAs' not in fixed
+
+
+class TestValidatorRuntimeGuards:
+    """Tests for runtime safety fixes: nil-typed variables, module scope guards,
+    block balance with trailing comments, and broken script disabling."""
+
+    def test_nil_float_initialized_to_zero(self):
+        """Variables typed as float/int/number should init to 0 instead of nil."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local m_Power = nil -- float\nlocal count = nil -- int\nlocal x = nil -- double'
+        fixed, fixes = validate_and_fix("test", source)
+        assert 'local m_Power = 0 -- float' in fixed
+        assert 'local count = 0 -- int' in fixed
+        assert 'local x = 0 -- double' in fixed
+        assert any('nil-typed' in f.lower() or 'initial' in f.lower() for f in fixes)
+
+    def test_nil_bool_initialized_to_false(self):
+        """Variables typed as bool should init to false instead of nil."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local active = nil -- bool'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'local active = false -- bool' in fixed
+
+    def test_nil_array_initialized_to_empty_table(self):
+        """Variables typed as arrays should init to {} instead of nil."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local items = nil -- ParticleSystem[]\nlocal cols = nil -- Collider[]'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'local items = {} -- ParticleSystem[]' in fixed
+        assert 'local cols = {} -- Collider[]' in fixed
+
+    def test_nil_non_typed_not_changed(self):
+        """Variables typed as objects (GameObject, Transform) stay nil."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local obj = nil -- GameObject\nlocal tr = nil -- Transform'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'local obj = nil -- GameObject' in fixed
+        assert 'local tr = nil -- Transform' in fixed
+
+    def test_module_scope_parent_guard(self):
+        """Module scripts with runtime script.Parent access get early-return guard."""
+        from converter.luau_validator import validate_and_fix
+        source = (
+            'local MyMod = {}\n'
+            'local src = script.Parent:FindFirstChildWhichIsA("Sound")\n'
+            'return MyMod\n'
+        )
+        fixed, fixes = validate_and_fix("test", source)
+        assert 'script.Parent:IsA("BasePart")' in fixed
+        assert 'return MyMod' in fixed
+
+    def test_block_depth_with_trailing_comments(self):
+        """if...then with trailing comment should be counted as block opener."""
+        from converter.luau_validator import validate_and_fix
+        source = (
+            'local function test()\n'
+            '    if x > 0 then -- check positive\n'
+            '        print("yes")\n'
+            '    end\n'
+            'end\n'
+        )
+        fixed, _ = validate_and_fix("test", source)
+        # Should remain balanced, not add extra ends
+        assert fixed.rstrip().endswith('end')
+        # Count that end count matches
+        assert fixed.count('\nend') == 2 or fixed.count('end\n') >= 2
+
+    def test_fps_camera_mode_set(self):
+        """FPS games get CameraMode = LockFirstPerson in StarterPlayer."""
+        from core.roblox_types import RbxPlace, RbxScript
+        from roblox.rbxlx_writer import write_rbxlx
+        import tempfile, xml.etree.ElementTree as ET
+        from pathlib import Path
+
+        place = RbxPlace()
+        place.is_fps_game = True
+        with tempfile.NamedTemporaryFile(suffix='.rbxlx', delete=False) as f:
+            write_rbxlx(place, Path(f.name))
+            tree = ET.parse(f.name)
+            root = tree.getroot()
+            # Find StarterPlayer and check CameraMode
+            for item in root.iter('Item'):
+                if item.get('class') == 'StarterPlayer':
+                    props = item.find('Properties')
+                    camera_mode = props.find('token[@name="CameraMode"]')
+                    assert camera_mode is not None, "CameraMode not set"
+                    assert camera_mode.text == '1', f"CameraMode should be 1, got {camera_mode.text}"
+                    break
+            else:
+                assert False, "StarterPlayer not found"
+
+    def test_fps_controller_only_matches_localscripts(self):
+        """FPS controller detection should only match LocalScripts, not ModuleScripts."""
+        from converter.fps_client_generator import _has_client_fps_controller
+        from core.roblox_types import RbxPlace, RbxScript
+
+        place = RbxPlace()
+        # ModuleScript with FPS logic should NOT count
+        place.scripts.append(RbxScript(
+            name="Player",
+            source='local UserInputService = game:GetService("UserInputService")\n'
+                   'if input.UserInputType == Enum.UserInputType.MouseButton1 then\n'
+                   '    shoot()\nend',
+            script_type="ModuleScript",
+        ))
+        assert not _has_client_fps_controller(place)
+
+        # LocalScript with same logic SHOULD count
+        place.scripts.append(RbxScript(
+            name="FPSCtrl",
+            source='local UserInputService = game:GetService("UserInputService")\n'
+                   'if input.UserInputType == Enum.UserInputType.MouseButton1 then\n'
+                   '    workspace:Raycast(origin, dir)\nend',
+            script_type="LocalScript",
+        ))
+        assert _has_client_fps_controller(place)

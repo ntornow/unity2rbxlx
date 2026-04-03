@@ -33,6 +33,7 @@ class RbxSurfaceAppearance:
     alpha_mode: str = "Overlay"        # Overlay, Transparency
     color: tuple[float, float, float] = (0.63, 0.63, 0.63)
     transparency: float = 0.0
+    tiling: tuple[float, float] | None = None  # UV scale (sx, sy) from Unity material
 
 
 @dataclass
@@ -389,3 +390,4 @@ class RbxPlace:
     terrains: list[RbxTerrain] = field(default_factory=list)
     water_regions: list[RbxWaterRegion] = field(default_factory=list)
     post_processing: RbxPostProcessing | None = None
+    is_fps_game: bool = False

@@ -24,6 +24,59 @@ def unity_to_roblox_pos(
     return (x * STUDS_PER_METER, y * STUDS_PER_METER, -z * STUDS_PER_METER)
 
 
+def _quat_multiply(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    """Multiply two quaternions (ax,ay,az,aw) * (bx,by,bz,bw)."""
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    )
+
+
+# Inverse of the -90° X rotation that FBX applies to convert Z-up meshes to Y-up.
+# Unity stores scene rotations that include this pre-rotation, but Roblox applies
+# it automatically during FBX import. We must strip it to avoid double-rotation.
+_FBX_PREROT_INV = (math.sin(math.radians(45)), 0.0, 0.0, math.cos(math.radians(45)))
+
+
+def needs_fbx_prerotation_strip(
+    qx: float, qy: float, qz: float, qw: float,
+) -> bool:
+    """Detect whether a Unity quaternion includes the FBX -90° X pre-rotation.
+
+    When a Z-up FBX mesh is imported by Unity, the rotation maps the mesh's
+    local Z axis to world Y (up).  We detect this by checking whether the
+    rotation's forward (local-Z) direction has a strong Y component.
+    """
+    # Forward Y = the Y component of where local-Z ends up in world space
+    forward_y = abs(2.0 * (qy * qz - qx * qw))
+    return forward_y > 0.9
+
+
+def strip_fbx_prerotation(
+    qx: float, qy: float, qz: float, qw: float,
+) -> tuple[float, float, float, float]:
+    """Remove the FBX -90° X pre-rotation from a Unity quaternion.
+
+    FBX meshes authored in Z-up tools (3ds Max, Blender default) include a
+    -90° X pre-rotation in the FBX root node to convert to Y-up.  Unity bakes
+    this into the scene rotation, but Roblox applies it during mesh import.
+    Stripping it avoids double-rotation (e.g. planes pointing nose-down).
+
+    Only strips when the rotation actually contains the pre-rotation
+    (detected by local-Z mapping to world-Y).
+    """
+    if not needs_fbx_prerotation_strip(qx, qy, qz, qw):
+        return (qx, qy, qz, qw)
+    return _quat_multiply((qx, qy, qz, qw), _FBX_PREROT_INV)
+
+
 def unity_quat_to_roblox_quat(
     qx: float, qy: float, qz: float, qw: float,
 ) -> tuple[float, float, float, float]:

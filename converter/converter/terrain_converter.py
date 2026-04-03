@@ -242,25 +242,92 @@ def generate_terrain_luau(
             row.append(round(height_studs, 1))
         height_rows.append(row)
 
+    # --- Splat map material lookup ---
+    # Map Unity terrain layer names to Roblox material indices.
+    # When splat_alphas are available, each column gets the material with
+    # the highest splat weight instead of a height-based fallback.
+    splat_alphas = terrain_data.get("splat_alphas")
+    splat_res = terrain_data.get("splat_resolution", 0)
+    layers = terrain_data.get("layers", [])
+
+    _LAYER_MAP = {
+        "sand": "Sand", "beach": "Sand", "desert": "Sand",
+        "grass": "Grass", "forest": "Grass", "meadow": "Grass",
+        "ground": "Ground", "dirt": "Ground", "mud": "Ground", "earth": "Ground",
+        "rock": "Rock", "stone": "Rock", "cliff": "Rock", "mountain": "Rock",
+        "snow": "Snow", "ice": "Ice",
+        "slate": "Slate", "concrete": "Slate", "asphalt": "Slate",
+    }
+
+    def _layer_to_roblox(name: str) -> str:
+        low = name.lower()
+        for key, mat in _LAYER_MAP.items():
+            if key in low:
+                return mat
+        return "Grass"  # default
+
+    # Pre-compute per-column dominant material from splat map.
+    # material_grid[sz][sx] = Roblox material name string
+    material_grid: list[list[str]] | None = None
+    if splat_alphas and splat_res > 0 and layers:
+        roblox_mats = [_layer_to_roblox(l) for l in layers]
+        n_layers = len(splat_alphas)
+        material_grid = []
+        for sz in range(samples_z):
+            row = []
+            for sx in range(samples_x):
+                # Map voxel column to splat UV
+                u = sx * VOXEL / width_studs
+                v = sz * VOXEL / length_studs
+                u = max(0.0, min(u, 1.0))
+                v = max(0.0, min(v, 1.0))
+                si = int(u * (splat_res - 1))
+                sj = int(v * (splat_res - 1))
+                si = min(si, splat_res - 1)
+                sj = min(sj, splat_res - 1)
+                idx = sj * splat_res + si
+                # Find dominant layer
+                best_val = -1.0
+                best_mat = "Grass"
+                for li in range(n_layers):
+                    if li < len(roblox_mats) and idx < len(splat_alphas[li]):
+                        val = splat_alphas[li][idx]
+                        if val > best_val:
+                            best_val = val
+                            best_mat = roblox_mats[li]
+                row.append(best_mat)
+            material_grid.append(row)
+        log.info("Splat map: %d layers (%s) → material grid %dx%d",
+                 n_layers, ", ".join(roblox_mats[:n_layers]), samples_x, samples_z)
+
     # Generate Luau script using string-encoded sparse height data.
     # A nested table literal hits Luau parser limits (~150 rows), so we
-    # encode non-zero columns as a semicolon-separated string of "x,z,h"
-    # triplets and decode at runtime.  This keeps the script under 200KB
-    # even for large terrains (vs 80KB+ nested tables that fail to parse).
+    # encode non-zero columns as a semicolon-separated string of "x,z,h[,m]"
+    # triplets and decode at runtime.
     sparse_entries = []
     for sz in range(samples_z):
         for sx in range(samples_x):
             h = height_rows[sz][sx]
             if h > 0.5:
-                sparse_entries.append(f"{sx},{sz},{h}")
+                if material_grid:
+                    mat = material_grid[sz][sx]
+                    # Encode material as single-char code
+                    mat_code = {"Sand": "S", "Grass": "G", "Ground": "D",
+                                "Rock": "R", "Slate": "T", "Snow": "N",
+                                "Ice": "I"}.get(mat, "G")
+                    sparse_entries.append(f"{sx},{sz},{h},{mat_code}")
+                else:
+                    sparse_entries.append(f"{sx},{sz},{h}")
 
     data_str = ";".join(sparse_entries)
+    has_splat = material_grid is not None
 
     lines = [
         "-- Auto-generated terrain from Unity heightmap",
         f"-- Original size: {width:.0f}x{max_height:.0f}x{length:.0f} meters",
         f"-- Roblox size: {width_studs:.0f}x{max_height_studs:.0f}x{length_studs:.0f} studs",
         f"-- Sparse entries: {len(sparse_entries)} non-zero columns",
+        f"-- Material source: {'splat map' if has_splat else 'height-based'}",
         "",
         "local t = workspace.Terrain",
         f"local VOXEL = {VOXEL}",
@@ -269,14 +336,37 @@ def generate_terrain_luau(
         f"local oZ = {rz}",
         f"local maxH = {max(heights) * max_height_studs:.1f}",
         "",
-        "local function gM(h)",
-        "    local n = h / maxH",
-        "    if n < 0.15 then return Enum.Material.Sand end",
-        "    if n < 0.35 then return Enum.Material.Grass end",
-        "    if n < 0.60 then return Enum.Material.Ground end",
-        "    if n < 0.85 then return Enum.Material.Rock end",
-        "    return Enum.Material.Slate",
-        "end",
+    ]
+
+    if has_splat:
+        lines.extend([
+            "local mats = {S=Enum.Material.Sand, G=Enum.Material.Grass, D=Enum.Material.Ground,",
+            "              R=Enum.Material.Rock, T=Enum.Material.Slate, N=Enum.Material.Snow,",
+            "              I=Enum.Material.Ice}",
+            "",
+            "local function gM(h, mc)",
+            "    if mc and mats[mc] then return mats[mc] end",
+            "    local n = h / maxH",
+            "    if n < 0.15 then return Enum.Material.Sand end",
+            "    if n < 0.35 then return Enum.Material.Grass end",
+            "    if n < 0.60 then return Enum.Material.Ground end",
+            "    if n < 0.85 then return Enum.Material.Rock end",
+            "    return Enum.Material.Slate",
+            "end",
+        ])
+    else:
+        lines.extend([
+            "local function gM(h)",
+            "    local n = h / maxH",
+            "    if n < 0.15 then return Enum.Material.Sand end",
+            "    if n < 0.35 then return Enum.Material.Grass end",
+            "    if n < 0.60 then return Enum.Material.Ground end",
+            "    if n < 0.85 then return Enum.Material.Rock end",
+            "    return Enum.Material.Slate",
+            "end",
+        ])
+
+    lines.extend([
         "",
         "t:Clear()",
         "",
@@ -284,18 +374,34 @@ def generate_terrain_luau(
         "",
         "local count = 0",
         'for entry in string.gmatch(data, "[^;]+") do',
-        '    local x, z, h = string.match(entry, "(%d+),(%d+),([%d%.]+)")',
-        '    x = tonumber(x); z = tonumber(z); h = tonumber(h)',
-        "    if x and z and h then",
-        "        local wx = oX + x * VOXEL",
-        "        local wz = oZ - z * VOXEL",
-        "        t:FillBlock(CFrame.new(wx, oY + h/2, wz), Vector3.new(VOXEL, h, VOXEL), gM(h))",
+    ])
+
+    if has_splat:
+        lines.extend([
+            '    local x, z, h, mc = string.match(entry, "(%d+),(%d+),([%d%.]+),(%a)")',
+            '    x = tonumber(x); z = tonumber(z); h = tonumber(h)',
+            "    if x and z and h then",
+            "        local wx = oX + x * VOXEL",
+            "        local wz = oZ - z * VOXEL",
+            "        t:FillBlock(CFrame.new(wx, oY + h/2, wz), Vector3.new(VOXEL, h, VOXEL), gM(h, mc))",
+        ])
+    else:
+        lines.extend([
+            '    local x, z, h = string.match(entry, "(%d+),(%d+),([%d%.]+)")',
+            '    x = tonumber(x); z = tonumber(z); h = tonumber(h)',
+            "    if x and z and h then",
+            "        local wx = oX + x * VOXEL",
+            "        local wz = oZ - z * VOXEL",
+            "        t:FillBlock(CFrame.new(wx, oY + h/2, wz), Vector3.new(VOXEL, h, VOXEL), gM(h))",
+        ])
+
+    lines.extend([
         "        count = count + 1",
         "        if count % 500 == 0 then task.wait() end",
         "    end",
         "end",
         "",
         'print("Terrain generated: " .. count .. " land columns")',
-    ]
+    ])
 
     return "\n".join(lines)

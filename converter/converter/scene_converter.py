@@ -416,13 +416,18 @@ def _compute_mesh_size_from_fbx_bbox(
     return size, initial_size
 
 
-_UNITY_BUILTIN_MESH_SHAPES: dict[str, tuple[int, bool]] = {
-    "10202": (1, False),    # Cube -> Block
-    "10206": (2, False),    # Cylinder -> Cylinder
-    "10207": (0, False),    # Sphere -> Ball
-    "10208": (2, False),    # Capsule -> Cylinder (approximation)
-    "10209": (1, True),     # Plane -> Block (flattened)
-    "10210": (1, True),     # Quad -> Block (flattened)
+# Unity built-in mesh shapes.
+# Format: fileID -> (roblox_shape_enum, flatten, base_size_meters)
+# base_size_meters is the mesh's size at Unity scale (1,1,1).
+#   Cube: 1×1×1 m, Sphere: 1×1×1 m diameter, Cylinder: 1×2×1 m,
+#   Capsule: 1×2×1 m, Plane: 10×0×10 m, Quad: 1×0×1 m.
+_UNITY_BUILTIN_MESH_SHAPES: dict[str, tuple[int, bool, tuple[float, float, float]]] = {
+    "10202": (1, False, (1.0, 1.0, 1.0)),    # Cube -> Block
+    "10206": (2, False, (1.0, 2.0, 1.0)),    # Cylinder -> Cylinder
+    "10207": (0, False, (1.0, 1.0, 1.0)),    # Sphere -> Ball
+    "10208": (2, False, (1.0, 2.0, 1.0)),    # Capsule -> Cylinder (approximation)
+    "10209": (1, True,  (10.0, 0.0, 10.0)),  # Plane -> Block (flattened)
+    "10210": (1, True,  (1.0, 0.0, 1.0)),    # Quad -> Block (flattened)
 }
 
 
@@ -687,27 +692,83 @@ def convert_scene(
                             # Check if parent is an unconverted scene node
                             parent_rbx = _ensure_inactive_container(tp)
                         if parent_rbx is not None:
-                            # Compose parent world position with prefab local positions.
-                            # Roblox CFrames in rbxlx are world-space, so all parts
-                            # in the hierarchy need the parent's position added.
+                            # Compose parent world CFrame with prefab local positions.
+                            # Roblox CFrames in rbxlx are world-space, so child parts
+                            # need their local position rotated by the parent's rotation
+                            # matrix, then translated by the parent's world position.
                             if hasattr(parent_rbx, 'cframe') and parent_rbx.cframe:
-                                px = parent_rbx.cframe.x or 0
-                                py = parent_rbx.cframe.y or 0
-                                pz = parent_rbx.cframe.z or 0
-                                def _offset_parts(parts, dx, dy, dz):
+                                pcf = parent_rbx.cframe
+                                px = pcf.x or 0
+                                py = pcf.y or 0
+                                pz = pcf.z or 0
+                                # Parent rotation matrix (row-major)
+                                pr00 = pcf.r00 if pcf.r00 is not None else 1.0
+                                pr01 = pcf.r01 if pcf.r01 is not None else 0.0
+                                pr02 = pcf.r02 if pcf.r02 is not None else 0.0
+                                pr10 = pcf.r10 if pcf.r10 is not None else 0.0
+                                pr11 = pcf.r11 if pcf.r11 is not None else 1.0
+                                pr12 = pcf.r12 if pcf.r12 is not None else 0.0
+                                pr20 = pcf.r20 if pcf.r20 is not None else 0.0
+                                pr21 = pcf.r21 if pcf.r21 is not None else 0.0
+                                pr22 = pcf.r22 if pcf.r22 is not None else 1.0
+                                has_rotation = not (
+                                    abs(pr00 - 1) < 1e-6 and abs(pr11 - 1) < 1e-6 and abs(pr22 - 1) < 1e-6
+                                    and abs(pr01) < 1e-6 and abs(pr02) < 1e-6 and abs(pr10) < 1e-6
+                                    and abs(pr12) < 1e-6 and abs(pr20) < 1e-6 and abs(pr21) < 1e-6
+                                )
+
+                                def _compose_with_parent(parts, px, py, pz,
+                                                          pr00, pr01, pr02, pr10, pr11, pr12, pr20, pr21, pr22,
+                                                          has_rotation):
                                     for part in parts:
                                         if hasattr(part, 'cframe') and part.cframe:
-                                            part.cframe = RbxCFrame(
-                                                x=(part.cframe.x or 0) + dx,
-                                                y=(part.cframe.y or 0) + dy,
-                                                z=(part.cframe.z or 0) + dz,
-                                                r00=part.cframe.r00, r01=part.cframe.r01, r02=part.cframe.r02,
-                                                r10=part.cframe.r10, r11=part.cframe.r11, r12=part.cframe.r12,
-                                                r20=part.cframe.r20, r21=part.cframe.r21, r22=part.cframe.r22,
-                                            )
+                                            cx = part.cframe.x or 0
+                                            cy = part.cframe.y or 0
+                                            cz = part.cframe.z or 0
+                                            if has_rotation:
+                                                # Rotate child local pos by parent rotation, then translate
+                                                rx = pr00 * cx + pr01 * cy + pr02 * cz
+                                                ry = pr10 * cx + pr11 * cy + pr12 * cz
+                                                rz = pr20 * cx + pr21 * cy + pr22 * cz
+                                                # Compose rotation matrices: parent × child
+                                                cr00 = part.cframe.r00 if part.cframe.r00 is not None else 1.0
+                                                cr01 = part.cframe.r01 if part.cframe.r01 is not None else 0.0
+                                                cr02 = part.cframe.r02 if part.cframe.r02 is not None else 0.0
+                                                cr10 = part.cframe.r10 if part.cframe.r10 is not None else 0.0
+                                                cr11 = part.cframe.r11 if part.cframe.r11 is not None else 1.0
+                                                cr12 = part.cframe.r12 if part.cframe.r12 is not None else 0.0
+                                                cr20 = part.cframe.r20 if part.cframe.r20 is not None else 0.0
+                                                cr21 = part.cframe.r21 if part.cframe.r21 is not None else 0.0
+                                                cr22 = part.cframe.r22 if part.cframe.r22 is not None else 1.0
+                                                nr00 = pr00*cr00 + pr01*cr10 + pr02*cr20
+                                                nr01 = pr00*cr01 + pr01*cr11 + pr02*cr21
+                                                nr02 = pr00*cr02 + pr01*cr12 + pr02*cr22
+                                                nr10 = pr10*cr00 + pr11*cr10 + pr12*cr20
+                                                nr11 = pr10*cr01 + pr11*cr11 + pr12*cr21
+                                                nr12 = pr10*cr02 + pr11*cr12 + pr12*cr22
+                                                nr20 = pr20*cr00 + pr21*cr10 + pr22*cr20
+                                                nr21 = pr20*cr01 + pr21*cr11 + pr22*cr21
+                                                nr22 = pr20*cr02 + pr21*cr12 + pr22*cr22
+                                                part.cframe = RbxCFrame(
+                                                    x=px + rx, y=py + ry, z=pz + rz,
+                                                    r00=nr00, r01=nr01, r02=nr02,
+                                                    r10=nr10, r11=nr11, r12=nr12,
+                                                    r20=nr20, r21=nr21, r22=nr22,
+                                                )
+                                            else:
+                                                part.cframe = RbxCFrame(
+                                                    x=cx + px, y=cy + py, z=cz + pz,
+                                                    r00=part.cframe.r00, r01=part.cframe.r01, r02=part.cframe.r02,
+                                                    r10=part.cframe.r10, r11=part.cframe.r11, r12=part.cframe.r12,
+                                                    r20=part.cframe.r20, r21=part.cframe.r21, r22=part.cframe.r22,
+                                                )
                                         if hasattr(part, 'children') and part.children:
-                                            _offset_parts(part.children, dx, dy, dz)
-                                _offset_parts(pi_parts, px, py, pz)
+                                            _compose_with_parent(part.children, px, py, pz,
+                                                                  pr00, pr01, pr02, pr10, pr11, pr12, pr20, pr21, pr22,
+                                                                  has_rotation)
+                                _compose_with_parent(pi_parts, px, py, pz,
+                                                      pr00, pr01, pr02, pr10, pr11, pr12, pr20, pr21, pr22,
+                                                      has_rotation)
                             parent_rbx.children.extend(pi_parts)
                             parented += len(pi_parts)
                         else:
@@ -871,7 +932,11 @@ def _convert_node(
     rx, ry, rz = unity_to_roblox_pos(wx, wy, wz)
 
     # -- Rotation --
-    rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*node.rotation)
+    quat = node.rotation
+    if node.mesh_guid:
+        from core.coordinate_system import strip_fbx_prerotation
+        quat = strip_fbx_prerotation(*quat)
+    rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*quat)
     rot = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
 
     # -- Size --
@@ -912,10 +977,14 @@ def _convert_node(
 
     # -- Primitive shape --
     if _builtin_shape:
-        shape_enum, flatten = _builtin_shape
+        shape_enum, flatten, base_meters = _builtin_shape
         part.shape = shape_enum
-        if flatten:
-            part.size = (size[0], 0.2, size[2])
+        # Apply Unity built-in mesh base size (e.g. Plane is 10×10m at scale 1)
+        sx, sy, sz = node.scale
+        bx = abs(sx) * base_meters[0] * config.STUDS_PER_METER
+        by = abs(sy) * base_meters[1] * config.STUDS_PER_METER
+        bz = abs(sz) * base_meters[2] * config.STUDS_PER_METER
+        part.size = (max(bx, 0.001), max(by, 0.001), max(bz, 0.001))
     # -- Mesh asset --
     elif has_mesh and node.mesh_guid:
         mesh_id = _resolve_mesh_id(node.mesh_guid, guid_index, uploaded_assets,
@@ -1083,12 +1152,18 @@ def _process_components(
                 adjusted_size, can_collide, center_offset = convert_collider(
                     ct, comp.properties, original_size,
                 )
-                # Keep the largest result across all physical colliders
-                part.size = (
-                    max(part.size[0], adjusted_size[0]),
-                    max(part.size[1], adjusted_size[1]),
-                    max(part.size[2], adjusted_size[2]),
-                )
+                # For MeshParts with proper mesh sizing (initial_size set),
+                # don't let collider dimensions override the visual Size —
+                # Roblox uses CollisionFidelity for MeshPart collision, not Size.
+                has_mesh_sizing = (part.class_name == "MeshPart"
+                                   and getattr(part, "initial_size", None) is not None)
+                if not has_mesh_sizing:
+                    # Keep the largest result across all physical colliders
+                    part.size = (
+                        max(part.size[0], adjusted_size[0]),
+                        max(part.size[1], adjusted_size[1]),
+                        max(part.size[2], adjusted_size[2]),
+                    )
                 part.can_collide = can_collide
                 # Apply collider center offset to part CFrame position
                 if center_offset != (0.0, 0.0, 0.0):
@@ -1758,6 +1833,7 @@ def _apply_materials(
             roughness_map=getattr(mapping, "roughness_map_path", None),
             alpha_mode=getattr(mapping, "alpha_mode", "Overlay"),
             transparency=getattr(mapping, "transparency", 0.0),
+            tiling=getattr(mapping, "tiling", None),
         )
 
         base_color = getattr(mapping, "base_color", None)
@@ -1875,6 +1951,7 @@ def _apply_prefab_materials(
             roughness_map=getattr(mapping, "roughness_map_path", None),
             alpha_mode=getattr(mapping, "alpha_mode", "Overlay"),
             transparency=getattr(mapping, "transparency", 0.0),
+            tiling=getattr(mapping, "tiling", None),
         )
 
         base_color = getattr(mapping, "base_color", None)
@@ -2231,7 +2308,9 @@ def _convert_fbx_prefab_instance(
         elif pp == "m_LocalScale.z": scl[2] = fval
 
     rx, ry, rz = unity_to_roblox_pos(*pos)
-    rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*rot)
+    from core.coordinate_system import strip_fbx_prerotation
+    stripped_rot = strip_fbx_prerotation(*rot)
+    rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*stripped_rot)
     rot_mat = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
 
     cframe = RbxCFrame(
@@ -2460,7 +2539,12 @@ def _convert_prefab_instance(
 
     # Convert transform
     rx, ry, rz = unity_to_roblox_pos(*pos)
-    rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*rot)
+    # Strip FBX pre-rotation if the root mesh has Z-up orientation baked in
+    quat_for_roblox = rot
+    if hasattr(template, 'root') and template.root and template.root.mesh_guid:
+        from core.coordinate_system import strip_fbx_prerotation
+        quat_for_roblox = list(strip_fbx_prerotation(*rot))
+    rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*quat_for_roblox)
     rot_mat = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
 
     cframe = RbxCFrame(
@@ -2486,13 +2570,75 @@ def _convert_prefab_instance(
 
     # Convert the prefab's root node into an RbxPart
     has_children = len(root.children) > 0
+    root_has_mesh = root.mesh_guid is not None
 
     if has_children:
-        part = RbxPart(
-            name=name,
-            class_name="Model",
-            cframe=cframe,
-        )
+        # When the root has both children AND a mesh, create the root as a
+        # MeshPart and parent the children under it.  MeshPart can hold child
+        # Items in rbxlx, so this preserves both the mesh geometry and the
+        # hierarchy.  If the root has no mesh, use a Model container.
+        if root_has_mesh:
+            _builtin_root = _UNITY_BUILTIN_MESH_SHAPES.get(root.mesh_file_id or "") if hasattr(root, "mesh_file_id") else None
+            if _builtin_root:
+                part = RbxPart(name=name, class_name="Part", cframe=cframe, anchored=True)
+                shape_enum, flatten, base_meters = _builtin_root
+                part.shape = shape_enum
+                root_sx = abs(root.scale[0]) if hasattr(root, "scale") else 1.0
+                root_sy = abs(root.scale[1]) if hasattr(root, "scale") else 1.0
+                root_sz = abs(root.scale[2]) if hasattr(root, "scale") else 1.0
+                sx_c = root_sx * abs(scl[0])
+                sy_c = root_sy * abs(scl[1])
+                sz_c = root_sz * abs(scl[2])
+                bx = sx_c * base_meters[0] * config.STUDS_PER_METER
+                by = sy_c * base_meters[1] * config.STUDS_PER_METER
+                bz = sz_c * base_meters[2] * config.STUDS_PER_METER
+                part.size = (max(bx, 0.001), max(by, 0.001), max(bz, 0.001))
+            else:
+                # Create root as MeshPart with proper mesh sizing
+                root_sx = abs(root.scale[0]) if hasattr(root, "scale") else 1.0
+                root_sy = abs(root.scale[1]) if hasattr(root, "scale") else 1.0
+                root_sz = abs(root.scale[2]) if hasattr(root, "scale") else 1.0
+                combined_scl = (root_sx * abs(scl[0]), root_sy * abs(scl[1]), root_sz * abs(scl[2]))
+                rbx_size = unity_scale_to_roblox_size(combined_scl)
+                part = RbxPart(name=name, class_name="MeshPart", cframe=cframe, size=rbx_size, anchored=True)
+                mesh_id = _resolve_mesh_id(root.mesh_guid, guid_index, uploaded_assets,
+                                           mesh_file_id=root.mesh_file_id if hasattr(root, 'mesh_file_id') else None)
+                if mesh_id:
+                    part.mesh_id = mesh_id
+                # Compute mesh size from native Roblox data
+                sized = False
+                if _mesh_native_sizes and guid_index:
+                    result = _compute_mesh_size(combined_scl, root.mesh_guid, guid_index, _mesh_native_sizes)
+                    if result:
+                        part.size, part.initial_size = result
+                        sized = True
+                if not sized and guid_index:
+                    result = _compute_mesh_size_from_fbx_bbox(combined_scl, root.mesh_guid, guid_index)
+                    if result:
+                        part.size, part.initial_size = result
+                        sized = True
+                if not sized:
+                    sf = config.STUDS_PER_METER
+                    part.size = (max(0.05, combined_scl[0] * sf), max(0.05, combined_scl[1] * sf), max(0.05, combined_scl[2] * sf))
+                # Store scale attributes for MeshLoader
+                _imp = _get_fbx_import_scale(root.mesh_guid, guid_index) if guid_index else 0.01
+                _ur = _get_fbx_unit_ratio(root.mesh_guid, guid_index) if guid_index else 1.0
+                _sf = _imp * _ur * config.STUDS_PER_METER
+                part.attributes["_ScaleX"] = combined_scl[0] * _sf
+                part.attributes["_ScaleY"] = combined_scl[1] * _sf
+                part.attributes["_ScaleZ"] = combined_scl[2] * _sf
+                # Set TextureID from embedded FBX texture if available
+                tex_id = _resolve_mesh_texture_id(root.mesh_guid, guid_index)
+                if tex_id:
+                    part.texture_id = tex_id
+            # Apply materials to the root MeshPart/Part
+            _apply_prefab_materials(root, part, material_mappings)
+        else:
+            part = RbxPart(
+                name=name,
+                class_name="Model",
+                cframe=cframe,
+            )
         for child in root.children:
             # Convert child prefab nodes with parent world transform
             # so positions are in world space (Roblox Models don't
@@ -2542,19 +2688,21 @@ def _convert_prefab_instance(
                             part.children.append(collider_part)
                     break
 
-        # Process root node components (lights, audio, rigidbody) and attach
-        # them to the first child BasePart since Roblox Models can't hold them.
-        if hasattr(root, 'components') and root.components and part.children:
-            # Find the first visible child Part/MeshPart
-            target_child = None
-            for child in part.children:
-                if child.class_name in ('Part', 'MeshPart') and child.transparency < 1.0:
-                    target_child = child
-                    break
-            if target_child is None and part.children:
-                target_child = part.children[0]
-            if target_child:
-                _process_components(root, target_child, guid_index=guid_index, uploaded_assets=uploaded_assets)
+        # Process root node components (lights, audio, rigidbody).
+        # When root is a MeshPart/Part, attach directly; when Model, find first child.
+        if hasattr(root, 'components') and root.components:
+            if part.class_name in ('Part', 'MeshPart'):
+                _process_components(root, part, guid_index=guid_index, uploaded_assets=uploaded_assets)
+            elif part.children:
+                target_child = None
+                for child in part.children:
+                    if child.class_name in ('Part', 'MeshPart') and child.transparency < 1.0:
+                        target_child = child
+                        break
+                if target_child is None and part.children:
+                    target_child = part.children[0]
+                if target_child:
+                    _process_components(root, target_child, guid_index=guid_index, uploaded_assets=uploaded_assets)
     else:
         # Determine size: combine prefab root scale with instance scale override
         root_sx = abs(root.scale[0]) if hasattr(root, "scale") else 1.0
@@ -2586,10 +2734,12 @@ def _convert_prefab_instance(
         )
 
         if _builtin:
-            shape_enum, flatten = _builtin
+            shape_enum, flatten, base_meters = _builtin
             part.shape = shape_enum
-            if flatten:
-                part.size = (rbx_size[0], 0.2, rbx_size[2])
+            bx = abs(sx) * base_meters[0] * config.STUDS_PER_METER
+            by = abs(sy) * base_meters[1] * config.STUDS_PER_METER
+            bz = abs(sz) * base_meters[2] * config.STUDS_PER_METER
+            part.size = (max(bx, 0.001), max(by, 0.001), max(bz, 0.001))
         elif has_mesh and root.mesh_guid:
             mesh_id = _resolve_mesh_id(root.mesh_guid, guid_index, uploaded_assets,
                                         mesh_file_id=root.mesh_file_id if hasattr(root, 'mesh_file_id') else None)
@@ -2743,7 +2893,11 @@ def _convert_prefab_node(
         local_scl = world_scl
 
     rx, ry, rz = unity_to_roblox_pos(*local_pos)
-    rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*local_rot)
+    quat_for_roblox = local_rot
+    if node.mesh_guid:
+        from core.coordinate_system import strip_fbx_prerotation
+        quat_for_roblox = strip_fbx_prerotation(*local_rot)
+    rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*quat_for_roblox)
     rot = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
 
     rbx_size = unity_scale_to_roblox_size(local_scl)
@@ -2777,10 +2931,12 @@ def _convert_prefab_node(
     )
 
     if _builtin:
-        shape_enum, flatten = _builtin
+        shape_enum, flatten, base_meters = _builtin
         part.shape = shape_enum
-        if flatten:
-            part.size = (rbx_size[0], 0.2, rbx_size[2])
+        bx = abs(local_scl[0]) * base_meters[0] * config.STUDS_PER_METER
+        by = abs(local_scl[1]) * base_meters[1] * config.STUDS_PER_METER
+        bz = abs(local_scl[2]) * base_meters[2] * config.STUDS_PER_METER
+        part.size = (max(bx, 0.001), max(by, 0.001), max(bz, 0.001))
     elif has_mesh and node.mesh_guid:
         mesh_id = _resolve_mesh_id(node.mesh_guid, guid_index, uploaded_assets,
                                     mesh_file_id=node.mesh_file_id if hasattr(node, 'mesh_file_id') else None)

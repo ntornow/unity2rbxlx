@@ -39,14 +39,15 @@ def detect_fps_game(place: RbxPlace) -> bool:
 
 
 def _has_client_fps_controller(place: RbxPlace) -> bool:
-    """Check if a client-side FPS controller already exists in the transpiled scripts.
+    """Check if a client-side FPS controller LocalScript already exists.
 
-    This happens when the AI transpiler generates a Player script that handles
-    input, shooting, and mouse lock. Check all script types — the Player script
-    may be a ModuleScript that's required by other scripts but still contains
-    the FPS controller logic.
+    Only LocalScripts auto-run on the client. ModuleScripts with FPS logic
+    won't handle input unless explicitly required by a LocalScript, so they
+    don't count as a working client controller.
     """
     for script in place.scripts:
+        if getattr(script, "script_type", "") != "LocalScript":
+            continue
         src = script.source
         if ("UserInputService" in src and "MouseButton1" in src and
                 ("Raycast" in src or "shoot" in src.lower())):

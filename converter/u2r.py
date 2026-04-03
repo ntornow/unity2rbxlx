@@ -395,7 +395,7 @@ def validate(rbxlx_file: str) -> None:
         "ScreenGui", "Frame", "TextLabel", "TextButton", "ImageLabel", "ImageButton",
         "UIListLayout", "UIGridLayout",
         # Appearance
-        "SurfaceAppearance", "Sky",
+        "SurfaceAppearance", "Texture", "Decal", "Sky",
         # Events
         "RemoteEvent", "RemoteFunction", "BindableEvent",
         # Effects

@@ -169,6 +169,8 @@ def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
     source = _fix_missing_function_end(name, source, fixes)
     source = _fix_undefined_module_return(name, source, fixes)
     source = _fix_missing_module_return(name, source, fixes)
+    source = _fix_nil_typed_variables(name, source, fixes)
+    source = _fix_module_script_parent_access(name, source, fixes)
     # Second pass: catch patterns introduced by structural fixes
     if re.search(r'\bthis\.', source):
         source = re.sub(r'\bthis\.(\w+)', r'script.Parent.\1', source)
@@ -330,6 +332,7 @@ def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
 
     source = _fix_startup_race_conditions(name, source, fixes)
     source = _inject_utility_functions(name, source, fixes)
+    source = _disable_broken_scripts(name, source, fixes)
 
     return source, fixes
 
@@ -6632,20 +6635,22 @@ def _append_missing_trailing_ends(source: str, fixes: list[str]) -> str:
         stripped = line.strip()
         if stripped.startswith('--'):
             continue
+        # Strip trailing comments for block-structure analysis
+        code_part = re.sub(r'\s*--.*$', '', stripped).rstrip()
         if re.search(r'\bfunction\s*[\w.:(]', stripped):
             # Count function openers vs end closers on this line
             func_count = len(re.findall(r'\bfunction\s*[\w.:(]', stripped))
             end_count_inline = len(re.findall(r'\bend\b', stripped))
             depth += max(0, func_count - end_count_inline)
-        if re.match(r'if\b.+\bthen\s*$', stripped) or (
-                re.search(r'\bthen\s*$', stripped) and not re.match(r'(?:if|elseif)\b', stripped)
-                and not re.search(r'\bfunction\b', stripped)):
+        if re.match(r'if\b.+\bthen\s*$', code_part) or (
+                re.search(r'\bthen\s*$', code_part) and not re.match(r'(?:if|elseif)\b', code_part)
+                and not re.search(r'\bfunction\b', code_part)):
             depth += 1
-        if re.match(r'for\b.+\bdo\s*$', stripped):
+        if re.match(r'for\b.+\bdo\s*$', code_part):
             depth += 1
-        if re.match(r'while\b.+\bdo\s*$', stripped):
+        if re.match(r'while\b.+\bdo\s*$', code_part):
             depth += 1
-        if stripped == 'repeat':
+        if code_part == 'repeat':
             depth += 1
         if stripped == 'end' or stripped.startswith('end)'):
             depth -= 1
@@ -6677,6 +6682,9 @@ def _remove_excess_end_keywords(source: str, fixes: list[str]) -> str:
         if stripped.startswith('--') or not stripped:
             continue
 
+        # Strip trailing comments for block-structure analysis
+        code_part = re.sub(r'\s*--.*$', '', stripped).rstrip()
+
         # Count block openers
         if re.search(r'\bfunction\s*[\w.:(]', stripped):
             # Skip single-line functions: function() ... end anywhere on the same line
@@ -6685,15 +6693,15 @@ def _remove_excess_end_keywords(source: str, fixes: list[str]) -> str:
             end_count = len(re.findall(r'\bend\b', stripped))
             # Only count as opener if functions outnumber ends on this line
             depth += max(0, func_count - end_count)
-        if re.match(r'if\b.+\bthen\s*$', stripped) or (
-                re.search(r'\bthen\s*$', stripped) and not re.match(r'(?:if|elseif)\b', stripped)
-                and not re.search(r'\bfunction\b', stripped)):
+        if re.match(r'if\b.+\bthen\s*$', code_part) or (
+                re.search(r'\bthen\s*$', code_part) and not re.match(r'(?:if|elseif)\b', code_part)
+                and not re.search(r'\bfunction\b', code_part)):
             depth += 1
-        if re.match(r'for\b.+\bdo\s*$', stripped):
+        if re.match(r'for\b.+\bdo\s*$', code_part):
             depth += 1
-        if re.match(r'while\b.+\bdo\s*$', stripped):
+        if re.match(r'while\b.+\bdo\s*$', code_part):
             depth += 1
-        if stripped == 'repeat':
+        if code_part == 'repeat':
             depth += 1
 
         # Count closers — mark for removal if depth would go negative
@@ -6845,21 +6853,23 @@ def _remove_excess_trailing_ends(source: str, fixes: list[str]) -> str:
         stripped = line.strip()
         if stripped.startswith('--'):
             continue
+        # Strip trailing comments for block-structure analysis
+        code_part = re.sub(r'\s*--.*$', '', stripped).rstrip()
         # Count block openers (skip single-line definitions like "function() ... end")
         if re.search(r'\bfunction\s*[\w.:(]', stripped):
             # Count function openers vs end closers on this line
             func_count = len(re.findall(r'\bfunction\s*[\w.:(]', stripped))
             end_count_inline = len(re.findall(r'\bend\b', stripped))
             depth += max(0, func_count - end_count_inline)
-        if re.match(r'if\b.+\bthen\s*$', stripped) or (
-                re.search(r'\bthen\s*$', stripped) and not re.match(r'(?:if|elseif)\b', stripped)
-                and not re.search(r'\bfunction\b', stripped)):
+        if re.match(r'if\b.+\bthen\s*$', code_part) or (
+                re.search(r'\bthen\s*$', code_part) and not re.match(r'(?:if|elseif)\b', code_part)
+                and not re.search(r'\bfunction\b', code_part)):
             depth += 1
-        if re.match(r'for\b.+\bdo\s*$', stripped):
+        if re.match(r'for\b.+\bdo\s*$', code_part):
             depth += 1
-        if re.match(r'while\b.+\bdo\s*$', stripped):
+        if re.match(r'while\b.+\bdo\s*$', code_part):
             depth += 1
-        if stripped == 'repeat':
+        if code_part == 'repeat':
             depth += 1
         # Count closers (standalone end, end), end),)
         if stripped == 'end' or stripped.startswith('end)'):
@@ -7016,6 +7026,63 @@ def _insert_missing_ends_for_single_statement_blocks(source: str, fixes: list[st
     return '\n'.join(result)
 
 
+def _disable_broken_scripts(name: str, source: str, fixes: list[str]) -> str:
+    """Disable scripts that still have block balance errors after all fixes.
+
+    Scripts that are mostly commented-out Unity rendering code (PlanarReflection,
+    Water shader systems, etc.) may have orphaned end keywords or unclosed blocks
+    that can't be automatically fixed.  Rather than letting them error at runtime,
+    wrap them in a `do return end` guard so they load silently but don't execute.
+    """
+    lines = source.split('\n')
+    depth = 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('--'):
+            continue
+        code_part = re.sub(r'\s*--.*$', '', stripped).rstrip()
+        if re.search(r'\bfunction\s*[\w.:(]', stripped):
+            fc = len(re.findall(r'\bfunction\s*[\w.:(]', stripped))
+            ec = len(re.findall(r'\bend\b', stripped))
+            depth += max(0, fc - ec)
+        if re.match(r'if\b.+\bthen\s*$', code_part):
+            depth += 1
+        if re.match(r'for\b.+\bdo\s*$', code_part):
+            depth += 1
+        if re.match(r'while\b.+\bdo\s*$', code_part):
+            depth += 1
+        if code_part == 'repeat':
+            depth += 1
+        if stripped == 'end' or stripped.startswith('end)'):
+            depth -= 1
+        if re.match(r'until\b', stripped):
+            depth -= 1
+
+    if depth != 0:
+        # Only disable ModuleScript-style scripts (return X) that have significant
+        # block imbalance.  Small imbalances in regular scripts can be tolerated
+        # (Roblox may still run partial code before erroring).
+        module_match = re.search(r'^return\s+(\w+)\s*$', source, re.MULTILINE)
+        if module_match:
+            module_name = module_match.group(1)
+            # Check if the script is mostly commented-out code (rendering/camera stubs)
+            code_lines = [l for l in lines if l.strip() and not l.strip().startswith('--')]
+            comment_lines = [l for l in lines if l.strip().startswith('--')]
+            mostly_comments = len(comment_lines) > len(code_lines)
+            if mostly_comments or abs(depth) > 2:
+                # Wrap: keep module table declaration and return, disable everything else
+                source = (
+                    f"-- [converter] Script disabled: block structure could not be auto-fixed\n"
+                    f"-- Original script had Unity rendering/camera code that doesn't translate to Roblox.\n"
+                    f"local {module_name} = {{}}\n"
+                    f"return {module_name}\n"
+                )
+                fixes.append(f"Disabled script with unbalanced blocks (depth={depth})")
+                log.warning("  [%s] Disabled script: unbalanced block depth %d after all fixes", name, depth)
+
+    return source
+
+
 def _fix_startup_race_conditions(name: str, source: str, fixes: list[str]) -> str:
     """Add startup delay for scripts that immediately scan workspace.
 
@@ -7056,6 +7123,131 @@ def _fix_startup_race_conditions(name: str, source: str, fixes: list[str]) -> st
         source = "\n".join(result_lines)
         fixes.append("Added startup delay before workspace:GetDescendants()")
         log.info("  [%s] Added startup delay before GetDescendants", name)
+
+    return source
+
+
+def _fix_nil_typed_variables(name: str, source: str, fixes: list[str]) -> str:
+    """Fix variables initialized to nil with type comments that are used in arithmetic.
+
+    The AI transpiler often emits `local x = nil -- float` or `local x = nil -- int`
+    for C# fields with no explicit initializer.  When these variables are later used
+    in arithmetic (sub, add, mul, etc.) or comparisons before being assigned, Roblox
+    throws 'attempt to perform arithmetic on nil'.
+
+    This fix initialises numeric-typed nils to 0 and bool-typed nils to false.
+    """
+    # Pattern: `local varname = nil -- float/int/number/double/single/byte/short/long`
+    # Also handle `-- AudioClip`, `-- GameObject`, `-- Transform` etc. - leave those as nil
+    numeric_types = {
+        'float', 'int', 'number', 'double', 'single', 'byte', 'short', 'long',
+        'uint', 'ushort', 'ulong', 'sbyte', 'decimal',
+    }
+    bool_types = {'bool', 'boolean'}
+
+    lines = source.split('\n')
+    changed = False
+    for i, line in enumerate(lines):
+        m = re.match(r'^(\s*local\s+\w+\s*=\s*)nil(\s*--\s*(.+))$', line)
+        if m:
+            prefix, suffix, type_hint_raw = m.group(1), m.group(2), m.group(3).strip()
+            type_hint = type_hint_raw.lower()
+            first_word = type_hint.split()[0] if type_hint else ''
+            # Check for array types: "Type[]" or "List<Type>" etc.
+            if '[]' in type_hint_raw or type_hint.startswith('list<'):
+                lines[i] = prefix + '{}' + suffix
+                changed = True
+            elif first_word in numeric_types:
+                lines[i] = prefix + '0' + suffix
+                changed = True
+            elif first_word in bool_types:
+                lines[i] = prefix + 'false' + suffix
+                changed = True
+
+    if changed:
+        source = '\n'.join(lines)
+        fixes.append("Initialized nil-typed numeric/bool variables to default values")
+
+    return source
+
+
+def _fix_module_script_parent_access(name: str, source: str, fixes: list[str]) -> str:
+    """Guard ModuleScripts that use script.Parent for runtime behavior.
+
+    ModuleScripts in ReplicatedStorage have script.Parent == ReplicatedStorage.
+    Transpiled MonoBehaviour code that connects to events (Heartbeat, Touched)
+    or accesses script.Parent properties at module scope crashes because
+    ReplicatedStorage is not a BasePart/Model.
+
+    This wraps the entire module body in an early-return guard that prevents
+    execution when the script isn't parented to a game object.
+    """
+    # Only apply to ModuleScript-style code (has `return ModuleName` at end)
+    module_match = re.search(r'^return\s+(\w+)\s*$', source, re.MULTILINE)
+    if not module_match:
+        return source
+
+    module_name = module_match.group(1)
+
+    # Check if module-scope code uses script.Parent for runtime behavior
+    has_runtime_parent = False
+    lines = source.split('\n')
+    in_function = 0
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('--'):
+            continue
+        code_part = re.sub(r'\s*--.*$', '', stripped).rstrip()
+        # Count function openers and end closers on same line
+        if re.search(r'\bfunction\s*[\w.:(]', code_part):
+            fc = len(re.findall(r'\bfunction\s*[\w.:(]', code_part))
+            ec = len(re.findall(r'\bend\b', code_part))
+            in_function += fc - ec
+        elif code_part == 'end' or code_part.startswith('end)'):
+            in_function = max(0, in_function - 1)
+        # Also count if/for/while/do blocks for depth tracking
+        if re.match(r'if\b.+\bthen\s*$', code_part):
+            in_function += 1
+        if re.match(r'for\b.+\bdo\s*$', code_part):
+            in_function += 1
+        if re.match(r'while\b.+\bdo\s*$', code_part):
+            in_function += 1
+
+        # Module scope: check for script.Parent usage in runtime code
+        if in_function == 0 and 'script.Parent' in stripped:
+            # Runtime indicators: event connections, property access, method calls
+            if any(p in stripped for p in [
+                '.Position', '.CFrame', '.Size', '.Orientation',
+                ':FindFirstChildWhichIsA', ':FindFirstChild(',
+                '.Touched:', '.Heartbeat:', '.RenderStepped:',
+                ':Connect(', ':Play(', ':Destroy()',
+            ]):
+                has_runtime_parent = True
+                break
+
+    if not has_runtime_parent:
+        return source
+
+    # Insert an early-return guard after the module table declaration
+    # This prevents all module-scope runtime code from executing when
+    # the script is in ReplicatedStorage.
+    guard = (
+        "\n-- Guard: skip runtime code if script is not parented to a game object\n"
+        "if not (script.Parent:IsA(\"BasePart\") or script.Parent:IsA(\"Model\")"
+        " or script.Parent:IsA(\"Folder\")) then\n"
+        f"    return {module_name}\n"
+        "end\n"
+    )
+
+    # Find the module table declaration line
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if re.match(r'^local\s+' + re.escape(module_name) + r'\s*=\s*\{\}', stripped):
+            lines.insert(i + 1, guard)
+            source = '\n'.join(lines)
+            fixes.append("Added ReplicatedStorage guard for module with runtime script.Parent access")
+            break
 
     return source
 

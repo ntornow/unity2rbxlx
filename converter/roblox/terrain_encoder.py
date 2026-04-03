@@ -157,9 +157,12 @@ def _splat_based_material(
     if not splat_alphas or splat_resolution <= 0:
         return MATERIAL_GRASS
 
-    # Map world position to splat UV
+    # Map world position to splat UV.
+    # The splat texture image has row 0 at the top (standard image convention),
+    # but Unity terrain Z=0 is at the bottom of the texture.  Flip V to match.
     u = max(0.0, min(1.0, world_x / terrain_width)) if terrain_width > 0 else 0.0
-    v = max(0.0, min(1.0, world_z / terrain_length)) if terrain_length > 0 else 0.0
+    v_raw = max(0.0, min(1.0, world_z / terrain_length)) if terrain_length > 0 else 0.0
+    v = 1.0 - v_raw
     sx = int(u * (splat_resolution - 1))
     sz = int(v * (splat_resolution - 1))
     idx = sz * splat_resolution + sx

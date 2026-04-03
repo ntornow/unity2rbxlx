@@ -246,7 +246,7 @@ class TestRbxlxOutputQuality:
             "PointLight", "SpotLight", "SurfaceLight", "Sound",
             "Script", "LocalScript", "ModuleScript",
             "ScreenGui", "Frame", "TextLabel", "TextButton", "ImageLabel",
-            "SurfaceAppearance", "Sky", "Camera",
+            "SurfaceAppearance", "Texture", "Decal", "Sky", "Camera",
             "Lighting", "ServerScriptService", "ReplicatedStorage", "ServerStorage",
             "StarterGui", "StarterPlayer", "StarterPlayerScripts", "StarterCharacterScripts",
             "RemoteEvent", "ParticleEmitter",
