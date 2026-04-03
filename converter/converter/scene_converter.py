@@ -901,6 +901,12 @@ def convert_scene(
     if flattened:
         log.info("Flattened %d single-child Models", flattened)
 
+    # Downgrade MeshParts with no mesh_id to small invisible Parts.
+    # This handles meshes embedded in prefabs (no FBX file to upload).
+    fixed_empty = _fix_empty_mesh_parts(place.workspace_parts)
+    if fixed_empty:
+        log.info("Downgraded %d empty MeshParts to Parts", fixed_empty)
+
     log.info(
         "Scene converted: %d top-level parts, %d screen_guis, %d terrains, %d water regions, lighting configured, camera %s",
         len(place.workspace_parts),
@@ -3147,6 +3153,26 @@ def _collect_post_processing(parsed_scene: ParsedScene, place: RbxPlace) -> None
             place.post_processing = pp
             log.info("Post-processing detected: bloom=%s, color_correction=%s, dof=%s, sun_rays=%s",
                      pp.bloom_enabled, pp.color_correction_enabled, pp.dof_enabled, pp.sun_rays_enabled)
+
+
+def _fix_empty_mesh_parts(parts: list[RbxPart]) -> int:
+    """Downgrade MeshParts that have no mesh_id to small invisible Parts.
+
+    When a mesh GUID resolves to a non-FBX file (e.g. embedded prefab mesh),
+    the MeshPart gets no mesh_id and renders as a large default block.
+    Convert these to small transparent Parts so they don't clutter the scene.
+    """
+    count = 0
+    for part in parts:
+        if part.class_name == "MeshPart" and not part.mesh_id:
+            part.class_name = "Part"
+            part.transparency = 1.0
+            part.can_collide = False
+            part.size = (1.0, 1.0, 1.0)
+            count += 1
+        if hasattr(part, 'children') and part.children:
+            count += _fix_empty_mesh_parts(part.children)
+    return count
 
 
 # ---------------------------------------------------------------------------
