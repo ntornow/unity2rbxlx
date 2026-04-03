@@ -953,25 +953,47 @@ def _convert_node(
         log.warning("Max recursion depth reached at node '%s'", node.name)
         return None
 
-    # -- Position (world-space, composed from parent chain) --
-    # Scene nodes store local positions; we need to walk the parent chain
-    # to get world positions since Roblox CFrames are absolute.
-    wx, wy, wz = node.position
-    _pf = node.parent_file_id
+    # -- Position & Rotation (world-space, composed from parent chain) --
+    # Walk the parent chain to compose world transform. Each parent's rotation
+    # must rotate the child's local position before adding the parent's position.
     _all = scene_nodes or {}
+
+    # Collect ancestors bottom-up (node -> parent -> grandparent -> ...)
+    _chain: list[SceneNode] = []
+    _pf = node.parent_file_id
     while _pf and _pf in _all:
-        _pn = _all[_pf]
-        wx += _pn.position[0]
-        wy += _pn.position[1]
-        wz += _pn.position[2]
-        _pf = _pn.parent_file_id
+        _chain.append(_all[_pf])
+        _pf = _all[_pf].parent_file_id
+
+    # Compose transforms top-down (root first): for each level,
+    # world_pos += world_rot * local_pos, world_rot *= local_rot
+    world_pos = [0.0, 0.0, 0.0]
+    world_rot = [0.0, 0.0, 0.0, 1.0]  # identity quaternion (x,y,z,w)
+    for ancestor in reversed(_chain):
+        apos = list(ancestor.position)
+        arot = list(ancestor.rotation)
+        rotated = _quat_rotate(world_rot, apos)
+        world_pos[0] += rotated[0]
+        world_pos[1] += rotated[1]
+        world_pos[2] += rotated[2]
+        world_rot = _quat_multiply(world_rot, arot)
+
+    # Apply node's own local transform
+    node_pos_rotated = _quat_rotate(world_rot, list(node.position))
+    wx = world_pos[0] + node_pos_rotated[0]
+    wy = world_pos[1] + node_pos_rotated[1]
+    wz = world_pos[2] + node_pos_rotated[2]
+    world_rot = _quat_multiply(world_rot, list(node.rotation))
+
     rx, ry, rz = unity_to_roblox_pos(wx, wy, wz)
 
     # -- Rotation --
-    quat = node.rotation
-    if node.mesh_guid:
-        from core.coordinate_system import strip_fbx_prerotation
-        quat = strip_fbx_prerotation(*quat)
+    quat = tuple(world_rot)
+    if node.mesh_guid and guid_index:
+        asset_path = guid_index.resolve(node.mesh_guid)
+        if asset_path and asset_path.suffix.lower() in ('.fbx', '.obj'):
+            from core.coordinate_system import strip_fbx_prerotation
+            quat = strip_fbx_prerotation(*quat)
     rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*quat)
     rot = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
 
