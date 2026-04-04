@@ -883,6 +883,13 @@ def convert_scene(
                 parent_rbx = pi_file_id_to_rbx.get(parent_id)
 
                 if parent_rbx is not None:
+                    # Register this PI's stripped Transform ID so deeper-nested
+                    # PIs can find it as a parent in subsequent passes.
+                    pi_file_id_to_rbx[pi.file_id] = pi_parts[0]
+                    if pi.file_id.isdigit():
+                        stripped_tfm_id = str(int(pi.file_id) + 1)
+                        pi_file_id_to_rbx[stripped_tfm_id] = pi_parts[0]
+
                     # Apply parent's world CFrame to child parts (same as scene-node parenting)
                     if hasattr(parent_rbx, 'cframe') and parent_rbx.cframe:
                         pcf = parent_rbx.cframe
