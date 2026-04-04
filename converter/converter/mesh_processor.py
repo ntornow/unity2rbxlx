@@ -191,6 +191,82 @@ def decimate_mesh(
     return out
 
 
+def read_fbx_vertex_bounds(
+    mesh_path: str | Path,
+) -> dict[str, Any] | None:
+    """Extract vertex bounding box from an FBX binary file.
+
+    Parses the raw FBX binary to find the largest "Vertices" double array
+    and computes the axis-aligned bounding box and center offset from the
+    mesh origin.  This is needed because trimesh cannot load FBX files.
+
+    Returns dict with bounding_box, center_offset, bounds_min, bounds_max,
+    or None if the file cannot be parsed.
+    """
+    import struct
+    import zlib as _zlib
+
+    path = Path(mesh_path)
+    if not path.exists():
+        return None
+
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+
+    if not data.startswith(b"Kaydara FBX Binary"):
+        return None
+
+    # Find ALL "Vertices" double arrays, pick the one with most vertices.
+    search_token = b"\x08Vertices"
+    best = None  # (vertex_count, min_pt, max_pt)
+    idx = 0
+    while True:
+        idx = data.find(search_token, idx)
+        if idx < 0:
+            break
+        prop_offset = idx + len(search_token)
+        if prop_offset >= len(data):
+            break
+        type_byte = data[prop_offset]
+        if type_byte == ord("d"):
+            try:
+                array_len, encoding, comp_len = struct.unpack_from(
+                    "<III", data, prop_offset + 1
+                )
+                if array_len >= 9 and array_len % 3 == 0:
+                    data_start = prop_offset + 1 + 12
+                    if encoding == 1:
+                        raw = _zlib.decompress(
+                            data[data_start : data_start + comp_len]
+                        )
+                    else:
+                        raw = data[data_start : data_start + array_len * 8]
+                    vals = struct.unpack(f"<{array_len}d", raw)
+                    n_verts = len(vals) // 3
+                    if best is None or n_verts > best[0]:
+                        xs, ys, zs = vals[0::3], vals[1::3], vals[2::3]
+                        best = (n_verts, (min(xs), min(ys), min(zs)),
+                                (max(xs), max(ys), max(zs)))
+            except (struct.error, _zlib.error, OverflowError):
+                pass
+        idx += 1
+
+    if best is None:
+        return None
+
+    _, min_pt, max_pt = best
+    center = tuple((a + b) / 2.0 for a, b in zip(min_pt, max_pt))
+    size = tuple(b - a for a, b in zip(min_pt, max_pt))
+    return {
+        "bounding_box": size,
+        "center_offset": center,
+        "bounds_min": min_pt,
+        "bounds_max": max_pt,
+    }
+
+
 def compute_bounding_box(mesh_path: str | Path) -> tuple[float, float, float]:
     """Compute the axis-aligned bounding box size of a mesh.
 

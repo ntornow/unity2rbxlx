@@ -191,6 +191,82 @@ _water_regions: list[RbxWaterRegion] = []
 _terrain_world_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
 
+# Cache for mesh vertical offsets: mesh_guid -> offset_studs
+_mesh_vertical_offset_cache: dict[str, float] = {}
+
+
+def _compute_mesh_vertical_offset(
+    mesh_guid: str,
+    guid_index: GuidIndex | None,
+    unity_scale_y: float = 1.0,
+) -> float:
+    """Compute the vertical offset from mesh pivot to bounding-box center.
+
+    Returns studs to ADD to Roblox Y so that objects with bottom-pivoted
+    meshes sit on surfaces instead of clipping through them.
+
+    Reads the FBX vertex data on first call per mesh, caches the result.
+    """
+    if not guid_index:
+        return 0.0
+
+    cache_key = mesh_guid + f"_{unity_scale_y:.4f}"
+    if cache_key in _mesh_vertical_offset_cache:
+        return _mesh_vertical_offset_cache[cache_key]
+
+    asset_path = guid_index.resolve(mesh_guid)
+    if not asset_path or asset_path.suffix.lower() != '.fbx':
+        _mesh_vertical_offset_cache[cache_key] = 0.0
+        return 0.0
+
+    from converter.mesh_processor import read_fbx_vertex_bounds
+    fbx_info = read_fbx_vertex_bounds(asset_path)
+    if not fbx_info:
+        _mesh_vertical_offset_cache[cache_key] = 0.0
+        return 0.0
+
+    center = fbx_info["center_offset"]
+    bmin = fbx_info["bounds_min"]
+    bmax = fbx_info["bounds_max"]
+    ranges = fbx_info["bounding_box"]
+
+    # Only apply pivot correction when the FBX origin (0,0,0) is INSIDE the
+    # bounding box.  If the origin is outside, the mesh vertices are positioned
+    # in scene space (e.g., multi-mesh FBX with sub-meshes at offsets) and the
+    # center offset is scene positioning, not a pivot-to-center correction.
+    origin_inside = all(bmin[i] <= 0.0 <= bmax[i] for i in range(3))
+    if not origin_inside:
+        _mesh_vertical_offset_cache[cache_key] = 0.0
+        return 0.0
+
+    # Identify the height axis: the axis with the highest asymmetry
+    # (pivot is closest to one end of the bounding box).
+    asymmetry = []
+    for i in range(3):
+        if ranges[i] > 1e-6:
+            asymmetry.append(abs(center[i]) / (ranges[i] / 2.0))
+        else:
+            asymmetry.append(0.0)
+
+    height_axis = asymmetry.index(max(asymmetry))
+    if asymmetry[height_axis] < 0.05:
+        _mesh_vertical_offset_cache[cache_key] = 0.0
+        return 0.0
+
+    # Sign: offset always points "up" (from pivot toward mesh center).
+    # If |min| > |max|: mesh extends more in -axis → negate center value.
+    if abs(bmin[height_axis]) > abs(bmax[height_axis]):
+        sign = -1.0
+    else:
+        sign = 1.0
+
+    import_scale = _get_fbx_import_scale(mesh_guid, guid_index)
+    offset = center[height_axis] * sign * import_scale * config.STUDS_PER_METER * abs(unity_scale_y)
+
+    _mesh_vertical_offset_cache[cache_key] = offset
+    return offset
+
+
 def _read_fbx_unit_scale_factors(fbx_path: Path) -> tuple[float | None, float | None]:
     """Read UnitScaleFactor and OriginalUnitScaleFactor from an FBX binary.
 
@@ -523,9 +599,10 @@ def convert_scene(
 
     place = RbxPlace()
 
-    # Reset module-level water region collector for this conversion run
-    global _water_regions
+    # Reset module-level caches for this conversion run
+    global _water_regions, _mesh_vertical_offset_cache
     _water_regions = []
+    _mesh_vertical_offset_cache = {}
 
     # Set module-level mesh native sizes for use by _compute_mesh_size
     global _mesh_native_sizes
@@ -1005,6 +1082,12 @@ def _convert_node(
 
     # -- Size --
     size = unity_scale_to_roblox_size(node.scale)
+
+    # -- Mesh pivot vertical correction --
+    # Roblox centers meshes in their bounding box; Unity uses the FBX origin.
+    # Shift Y up so bottom-pivoted meshes sit on surfaces correctly.
+    if node.mesh_guid and guid_index:
+        ry += _compute_mesh_vertical_offset(node.mesh_guid, guid_index, node.scale[1])
 
     # -- CFrame --
     cframe = RbxCFrame(
@@ -1574,7 +1657,7 @@ def _resolve_sub_mesh(
     Unity FBX fileIDs map to sub-mesh indices: 4300000 → index 0, 4300002 → index 1, etc.
     Returns the sub-mesh dict or None if not available.
     """
-    if not _mesh_hierarchies or not guid_index or not mesh_file_id:
+    if not _mesh_hierarchies or not guid_index:
         return None
 
     asset_path = guid_index.resolve(mesh_guid)
@@ -1587,17 +1670,20 @@ def _resolve_sub_mesh(
             sub_meshes = _mesh_hierarchies[key]
             if not sub_meshes:
                 return None
-            # Convert fileID to sub-mesh index
-            # Unity FBX mesh fileIDs: 4300000, 4300002, 4300004, ...
-            try:
-                fid = int(mesh_file_id)
-                if fid >= 4300000:
-                    idx = (fid - 4300000) // 2
-                    if 0 <= idx < len(sub_meshes):
-                        return sub_meshes[idx]
-            except (ValueError, TypeError):
-                pass
-            # Fallback: return first sub-mesh
+            # If mesh_file_id is provided, use it to select sub-mesh
+            if mesh_file_id:
+                # Convert fileID to sub-mesh index
+                # Unity FBX mesh fileIDs: 4300000, 4300002, 4300004, ...
+                try:
+                    fid = int(mesh_file_id)
+                    if fid >= 4300000:
+                        idx = (fid - 4300000) // 2
+                        if 0 <= idx < len(sub_meshes):
+                            return sub_meshes[idx]
+                except (ValueError, TypeError):
+                    pass
+            # Fallback: return first sub-mesh (works for single-mesh FBX files
+            # and when mesh_file_id is not set)
             return sub_meshes[0]
 
     return None
@@ -2377,6 +2463,11 @@ def _convert_fbx_prefab_instance(
     rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*stripped_rot)
     rot_mat = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
 
+    # Mesh pivot vertical correction
+    mesh_guid = pi.source_prefab_guid if hasattr(pi, 'source_prefab_guid') else None
+    if mesh_guid and guid_index:
+        ry += _compute_mesh_vertical_offset(mesh_guid, guid_index, scl[1])
+
     cframe = RbxCFrame(
         x=rx, y=ry, z=rz,
         r00=rot_mat[0], r01=rot_mat[1], r02=rot_mat[2],
@@ -2610,6 +2701,10 @@ def _convert_prefab_instance(
         quat_for_roblox = list(strip_fbx_prerotation(*rot))
     rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*quat_for_roblox)
     rot_mat = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
+
+    # Mesh pivot vertical correction
+    if hasattr(template, 'root') and template.root and template.root.mesh_guid and guid_index:
+        ry += _compute_mesh_vertical_offset(template.root.mesh_guid, guid_index, scl[1])
 
     cframe = RbxCFrame(
         x=rx, y=ry, z=rz,
@@ -2963,6 +3058,10 @@ def _convert_prefab_node(
         quat_for_roblox = strip_fbx_prerotation(*local_rot)
     rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*quat_for_roblox)
     rot = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
+
+    # Mesh pivot vertical correction
+    if node.mesh_guid and guid_index:
+        ry += _compute_mesh_vertical_offset(node.mesh_guid, guid_index, local_scl[1])
 
     rbx_size = unity_scale_to_roblox_size(local_scl)
 

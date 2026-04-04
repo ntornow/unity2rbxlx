@@ -345,12 +345,20 @@ class Pipeline:
             self._compute_fbx_bounding_boxes()
 
     def _compute_fbx_bounding_boxes(self) -> None:
-        """Scan all mesh assets and compute bounding boxes via trimesh."""
+        """Scan all mesh assets and compute bounding boxes.
+
+        Uses direct FBX binary parsing for .fbx files (since trimesh cannot
+        load FBX), and trimesh for other formats (.obj, .glb).
+
+        Skips FBX files whose import configuration has a non-trivial unit ratio
+        (USF ≠ OriginalUSF with useFileScale=1), as the sizing math for those
+        files produces incorrect results from raw vertex bounds.
+        """
         manifest = self.state.asset_manifest
         if not manifest:
             return
 
-        from converter.mesh_processor import get_mesh_info
+        from converter.mesh_processor import get_mesh_info, read_fbx_vertex_bounds
 
         mesh_assets = [a for a in manifest.assets if a.kind == "mesh"]
         if not mesh_assets:
@@ -359,18 +367,38 @@ class Pipeline:
         computed = 0
         for asset in mesh_assets:
             rel_key = str(asset.relative_path)
-            # Skip if already computed (e.g. from a resumed context)
             if rel_key in self.ctx.fbx_bounding_boxes:
                 computed += 1
                 continue
-            info = get_mesh_info(asset.path)
-            bbox = info.get("bounding_box")
-            if bbox and isinstance(bbox, tuple) and len(bbox) == 3:
-                # Only store non-trivial bounding boxes (not the 1,1,1 fallback)
-                if not (bbox[0] == 1.0 and bbox[1] == 1.0 and bbox[2] == 1.0
-                        and info.get("face_count", 0) == 0):
-                    self.ctx.fbx_bounding_boxes[rel_key] = list(bbox)
-                    computed += 1
+
+            bbox = None
+
+            if asset.path.suffix.lower() == ".fbx":
+                # Skip FBX files with non-trivial unit ratio — their vertex
+                # coordinates are in unexpected units that produce wrong sizes.
+                from converter.scene_converter import _get_fbx_unit_ratio
+                guid = None
+                if self.state.guid_index:
+                    guid = self.state.guid_index.guid_for_path(asset.path)
+                if guid:
+                    ratio = _get_fbx_unit_ratio(guid, self.state.guid_index)
+                    if abs(ratio - 1.0) > 0.01:
+                        continue  # skip this mesh
+
+                fbx_info = read_fbx_vertex_bounds(asset.path)
+                if fbx_info:
+                    bbox = fbx_info["bounding_box"]
+            else:
+                info = get_mesh_info(asset.path)
+                raw = info.get("bounding_box")
+                if raw and isinstance(raw, tuple) and len(raw) == 3:
+                    if not (raw[0] == 1.0 and raw[1] == 1.0 and raw[2] == 1.0
+                            and info.get("face_count", 0) == 0):
+                        bbox = raw
+
+            if bbox:
+                self.ctx.fbx_bounding_boxes[rel_key] = list(bbox)
+                computed += 1
 
         if computed:
             log.info("[extract_assets] Computed FBX bounding boxes for %d meshes", computed)

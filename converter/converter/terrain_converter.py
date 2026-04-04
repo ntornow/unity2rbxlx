@@ -74,8 +74,10 @@ def read_unity_terrain(terrain_data_path: Path) -> dict[str, Any] | None:
         max_height = scale_y
         length = (resolution - 1) * scale_z
 
-        # Normalize heights to 0-1 range (Unity stores as 16-bit unsigned)
-        max_raw = 65535.0
+        # Normalize heights to 0-1 range.  Unity stores heightmap samples as
+        # 16-bit unsigned integers but normalizes by 32768 (half the uint16 range),
+        # not 65535.  Using 65535 produces terrain at half the correct height.
+        max_raw = 32768.0
         normalized = [h / max_raw for h in raw_heights]
 
         # Extract terrain layer names and splat alpha maps
