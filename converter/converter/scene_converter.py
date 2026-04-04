@@ -1197,7 +1197,10 @@ def _convert_node(
         any(comp.component_type in ("MeshRenderer", "SkinnedMeshRenderer", "SpriteRenderer")
             for comp in node.components)
     )
-    if not has_visual and part.class_name == "Part" and not part.children:
+    if not has_visual and part.class_name == "Part":
+        # Parts without meshes or visual components are Unity containers/markers.
+        # Make invisible regardless of whether they have children (child scripts
+        # are reparented separately, so the container doesn't need to render).
         part.transparency = 1.0
         part.can_collide = False
 
@@ -3174,6 +3177,16 @@ def _convert_prefab_node(
             if comp_fid and comp_fid in disabled_components:
                 part.transparency = 1.0
                 part.can_collide = False
+
+    # Make non-visual Parts invisible (empty containers, UI markers, etc.)
+    if not has_mesh and not _builtin and part.class_name == "Part":
+        has_visual_comp = hasattr(node, 'components') and any(
+            comp.component_type in ("MeshRenderer", "SkinnedMeshRenderer", "SpriteRenderer")
+            for comp in node.components
+        )
+        if not has_visual_comp and not part.surface_appearance:
+            part.transparency = 1.0
+            part.can_collide = False
 
     # Apply materials from prefab node components (MeshRenderer/SkinnedMeshRenderer)
     _apply_prefab_materials(node, part, material_mappings)
