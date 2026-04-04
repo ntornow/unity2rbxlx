@@ -1083,12 +1083,6 @@ def _convert_node(
     # -- Size --
     size = unity_scale_to_roblox_size(node.scale)
 
-    # -- Mesh pivot vertical correction --
-    # Roblox centers meshes in their bounding box; Unity uses the FBX origin.
-    # Shift Y up so bottom-pivoted meshes sit on surfaces correctly.
-    if node.mesh_guid and guid_index:
-        ry += _compute_mesh_vertical_offset(node.mesh_guid, guid_index, node.scale[1])
-
     # -- CFrame --
     cframe = RbxCFrame(
         x=rx, y=ry, z=rz,
