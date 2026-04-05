@@ -2568,16 +2568,28 @@ def _convert_prefab_instance(
                     removed_component_ids.add(fid)
 
     # Build per-target-fileID modification map for child overrides.
-    # Modifications with no target or matching the root transform go to root.
-    # Others are grouped by target fileID for child node application.
+    # Identify the root transform target: the one that has m_RootOrder or
+    # m_LocalPosition set, matching the prefab's root Transform component.
+    # Since prefab internal fileIDs don't match scene modification target fileIDs,
+    # we identify the root target as the one whose m_LocalPosition is set
+    # alongside m_RootOrder (only the root has m_RootOrder).
     child_modifications: dict[str, list[dict]] = {}  # fileID -> [mod, ...]
-    root_transform_fid = str(template.root.file_id) if hasattr(template.root, 'file_id') else ""
+    root_target_fid = ""
+    # Find the root transform target by looking for m_RootOrder modification
+    for mod in pi.modifications:
+        if isinstance(mod, dict) and mod.get("propertyPath") == "m_RootOrder":
+            target = mod.get("target", {})
+            root_target_fid = str(target.get("fileID", "")) if isinstance(target, dict) else ""
+            break
+    # Fallback: use the prefab template's root file_id
+    if not root_target_fid:
+        root_target_fid = str(template.root.file_id) if hasattr(template.root, 'file_id') else ""
     for mod in pi.modifications:
         if not isinstance(mod, dict):
             continue
         target = mod.get("target", {})
         target_fid = str(target.get("fileID", "")) if isinstance(target, dict) else ""
-        if target_fid and target_fid != "0" and target_fid != root_transform_fid:
+        if target_fid and target_fid != "0" and target_fid != root_target_fid:
             child_modifications.setdefault(target_fid, []).append(mod)
 
     # Extract position/rotation/scale and additional properties from modifications
@@ -2655,10 +2667,24 @@ def _convert_prefab_instance(
                 pass
             continue
 
+        # Only apply position/rotation/scale from modifications targeting
+        # the root transform.  Child-targeted modifications (different fileID)
+        # must NOT override the root position — they're handled separately
+        # via child_modifications dict.
+        target = mod.get("target", {})
+        mod_target_fid = str(target.get("fileID", "")) if isinstance(target, dict) else ""
+        is_root_mod = (not mod_target_fid or mod_target_fid == "0" or
+                       mod_target_fid == root_target_fid)
+
         try:
             fval = float(val)
         except (ValueError, TypeError):
             continue
+        if not is_root_mod:
+            # Non-root transform property — skip for root extraction
+            # but still capture non-transform properties below
+            if pp.startswith("m_LocalPosition.") or pp.startswith("m_LocalRotation.") or pp.startswith("m_LocalScale."):
+                continue
         if pp == "m_LocalPosition.x":
             pos[0] = fval
         elif pp == "m_LocalPosition.y":
