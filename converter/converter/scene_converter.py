@@ -220,9 +220,10 @@ def _compute_mesh_vertical_offset(
         _mesh_vertical_offset_cache[cache_key] = 0.0
         return 0.0
 
-    # Primary: use Roblox mesh_hierarchies data (from Studio resolution).
-    # The position field gives the mesh center offset in InitialSize space.
-    # When the center position Y is near 0, no offset is needed.
+    # Primary: use Roblox mesh_hierarchies position data when the Y component
+    # is non-zero.  This gives the actual mesh center offset in Roblox's
+    # coordinate space.  For single-mesh FBX files where the mesh is centered
+    # at the model origin, position is (0,0,0) — fall through to FBX analysis.
     if _mesh_hierarchies:
         relative = guid_index.resolve_relative(mesh_guid)
         for key in ([str(relative), str(asset_path)] if relative else [str(asset_path)]):
@@ -231,16 +232,14 @@ def _compute_mesh_vertical_offset(
                 if sub_meshes:
                     pos = sub_meshes[0].get("position", [0, 0, 0])
                     center_y = pos[1] if len(pos) > 1 else 0.0
-                    if abs(center_y) < 0.5:
-                        # Center is at origin — no offset needed
-                        _mesh_vertical_offset_cache[cache_key] = 0.0
-                        return 0.0
-                    # Compute offset: center_y is in InitialSize units.
-                    # Scale by import_scale * STUDS_PER_METER to get studs.
-                    import_scale = _get_fbx_import_scale(mesh_guid, guid_index)
-                    offset = center_y * import_scale * config.STUDS_PER_METER * abs(unity_scale_y)
-                    _mesh_vertical_offset_cache[cache_key] = offset
-                    return offset
+                    if abs(center_y) > 0.5:
+                        # Non-zero center Y: use it directly
+                        import_scale = _get_fbx_import_scale(mesh_guid, guid_index)
+                        offset = center_y * import_scale * config.STUDS_PER_METER * abs(unity_scale_y)
+                        _mesh_vertical_offset_cache[cache_key] = offset
+                        return offset
+                    # Zero center Y: fall through to FBX analysis
+                break
 
     # Fallback: FBX vertex analysis (less accurate, wrong axis mapping possible)
     if asset_path.suffix.lower() != '.fbx':
