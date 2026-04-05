@@ -3112,8 +3112,17 @@ def _convert_prefab_node(
             pp[2] + rotated[2],
         ]
 
-        # Compose rotations (parent * child)
-        world_rot = _quat_multiply(pr, local_rot)
+        # Strip FBX pre-rotation from the node's OWN rotation BEFORE
+        # composing with parent.  The parent rotation may include a -90° X
+        # tilt that should be preserved (it makes objects lie horizontal).
+        # Stripping after composition would incorrectly remove this tilt.
+        node_rot = list(local_rot)
+        if node.mesh_guid:
+            from core.coordinate_system import strip_fbx_prerotation
+            node_rot = list(strip_fbx_prerotation(*local_rot))
+
+        # Compose rotations (parent * child with pre-rotation stripped)
+        world_rot = _quat_multiply(pr, node_rot)
 
         # Compose scales
         world_scl = [
@@ -3126,6 +3135,12 @@ def _convert_prefab_node(
         local_rot = world_rot
         local_scl = world_scl
 
+    else:
+        # No parent — strip pre-rotation from the node's own rotation
+        if node.mesh_guid:
+            from core.coordinate_system import strip_fbx_prerotation
+            local_rot = list(strip_fbx_prerotation(*local_rot))
+
     rx, ry, rz = unity_to_roblox_pos(*local_pos)
 
     # Mesh pivot vertical correction (same as _convert_node)
@@ -3133,9 +3148,6 @@ def _convert_prefab_node(
         ry += _compute_mesh_vertical_offset(node.mesh_guid, guid_index, local_scl[1])
 
     quat_for_roblox = local_rot
-    if node.mesh_guid:
-        from core.coordinate_system import strip_fbx_prerotation
-        quat_for_roblox = strip_fbx_prerotation(*local_rot)
     rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*quat_for_roblox)
     rot = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
 
