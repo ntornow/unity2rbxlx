@@ -671,7 +671,7 @@ shootRemote.OnServerEvent:Connect(function(player, origin, direction)
             local orig = hitPart.Color
             hitPart.Color = Color3.new(1, 0.3, 0.3)
             task.wait(0.1)
-            if hitPart.Parent then hitPart.Color = orig end
+            pcall(function() hitPart.Color = orig end)
         end)
     end
 end)
