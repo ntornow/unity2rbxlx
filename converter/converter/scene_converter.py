@@ -1893,6 +1893,66 @@ def _extract_monobehaviour_attributes(
                     )
                     part.sounds.append(sound)
 
+            elif ref_path.suffix.lower() in (".prefab", ".fbx", ".obj"):
+                # Prefab/mesh reference → create a Model child with resolved meshes.
+                # The transpiled script finds this via script.Parent:FindFirstChild("FieldName")
+                # e.g., "riflePrefab" → Model named "RiflePrefab"
+                uploaded = uploaded_assets or {}
+
+                # Resolve the prefab's mesh: for .prefab files, find the referenced FBX
+                mesh_path = ref_path
+                if ref_path.suffix.lower() == ".prefab":
+                    # Read prefab to find its mesh reference
+                    try:
+                        import re as _re
+                        prefab_text = ref_path.read_text(encoding="utf-8", errors="replace")
+                        mesh_match = _re.search(r'm_Mesh:.*?guid:\s*(\w+)', prefab_text)
+                        if mesh_match:
+                            mesh_guid_ref = mesh_match.group(1)
+                            resolved_mesh = guid_index.resolve(mesh_guid_ref)
+                            if resolved_mesh:
+                                mesh_path = resolved_mesh
+                    except Exception:
+                        pass
+
+                # Find mesh hierarchy data for this asset
+                relative_mesh = guid_index.resolve_relative_path(mesh_path) if hasattr(guid_index, 'resolve_relative_path') else None
+                mesh_key = None
+                for mkey in _mesh_hierarchies:
+                    if str(mesh_path).endswith(mkey) or (relative_mesh and str(relative_mesh) == mkey):
+                        mesh_key = mkey
+                        break
+                    # Try partial match
+                    if mesh_path.name in mkey:
+                        mesh_key = mkey
+                        break
+
+                if mesh_key and mesh_key in _mesh_hierarchies:
+                    sub_meshes = _mesh_hierarchies[mesh_key]
+                    if sub_meshes:
+                        # Create a Model containing all sub-meshes
+                        field_name = key[0].upper() + key[1:] if key else key
+                        model = RbxPart(
+                            name=field_name,
+                            class_name="Model",
+                            cframe=RbxCFrame(x=0, y=0, z=0),
+                            transparency=1.0,
+                        )
+                        for sm in sub_meshes:
+                            mesh_part = RbxPart(
+                                name=sm["name"],
+                                class_name="MeshPart",
+                                cframe=RbxCFrame(x=0, y=0, z=0),
+                                size=(sm["size"][0], sm["size"][1], sm["size"][2]),
+                            )
+                            mesh_part.mesh_id = sm["meshId"]
+                            if sm.get("textureId"):
+                                mesh_part.texture_id = sm["textureId"]
+                            model.children.append(mesh_part)
+                        part.children.append(model)
+                        log.debug("Created prefab reference '%s' with %d sub-meshes",
+                                  field_name, len(sub_meshes))
+
 
 # ---------------------------------------------------------------------------
 # Water shader detection
