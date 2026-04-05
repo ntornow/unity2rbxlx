@@ -39,19 +39,29 @@ def detect_fps_game(place: RbxPlace) -> bool:
 
 
 def _has_client_fps_controller(place: RbxPlace) -> bool:
-    """Check if a client-side FPS controller LocalScript already exists.
+    """Check if a client-side FPS controller already exists.
 
-    Only LocalScripts auto-run on the client. ModuleScripts with FPS logic
-    won't handle input unless explicitly required by a LocalScript, so they
-    don't count as a working client controller.
+    Checks both LocalScripts (auto-run) and ModuleScripts that handle
+    FPS mechanics (camera, shooting, movement). ModuleScripts count
+    because they get required by the ClientBootstrap LocalScript.
     """
     for script in place.scripts:
-        if getattr(script, "script_type", "") != "LocalScript":
-            continue
         src = script.source
-        if ("UserInputService" in src and "MouseButton1" in src and
-                ("Raycast" in src or "shoot" in src.lower())):
-            return True
+        st = getattr(script, "script_type", "")
+
+        # LocalScript with direct FPS input handling
+        if st == "LocalScript" and "UserInputService" in src and "MouseButton1" in src:
+            if "Raycast" in src or "shoot" in src.lower():
+                return True
+
+        # ModuleScript with FPS mechanics (camera + shooting + movement)
+        if st == "ModuleScript" and "RenderStepped" in src:
+            has_camera = "CameraType" in src or "updateCamera" in src
+            has_shooting = "Raycast" in src or "shoot" in src.lower()
+            has_movement = "Move(" in src or "Humanoid" in src
+            if has_camera and has_shooting and has_movement:
+                return True
+
     return False
 
 
