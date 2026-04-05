@@ -117,12 +117,47 @@ end
 
 RunService.RenderStepped:Connect(updateCamera)
 
+-- Viewmodel gun (simple block representation attached to camera)
+local gunModel = Instance.new("Part")
+gunModel.Name = "Viewmodel"
+gunModel.Size = Vector3.new(0.3, 0.3, 1.5)
+gunModel.Color = Color3.fromRGB(60, 60, 60)
+gunModel.Material = Enum.Material.Metal
+gunModel.Anchored = true
+gunModel.CanCollide = false
+gunModel.CastShadow = false
+gunModel.Parent = camera
+
+-- Muzzle flash light
+local muzzleFlash = Instance.new("PointLight")
+muzzleFlash.Color = Color3.fromRGB(255, 200, 100)
+muzzleFlash.Brightness = 3
+muzzleFlash.Range = 8
+muzzleFlash.Enabled = false
+muzzleFlash.Parent = gunModel
+
+-- Shoot sound
+local shootSound = Instance.new("Sound")
+shootSound.SoundId = "rbxasset://sounds/impact_explosion_03.mp3"
+shootSound.Volume = 0.5
+shootSound.PlaybackSpeed = 1.5
+shootSound.Parent = gunModel
+
+-- Update gun position each frame (follows camera)
+local function updateGun()
+	if not camera then return end
+	local cf = camera.CFrame
+	-- Position gun at bottom-right of view
+	gunModel.CFrame = cf * CFrame.new(0.5, -0.4, -1.2)
+end
+RunService.RenderStepped:Connect(updateGun)
+
 -- Shooting
-local SHOOT_COOLDOWN = 0.1
+local SHOOT_COOLDOWN = 0.15
 local lastShot = 0
 
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if gameProcessed then return end
+    if gameProcessed or isPaused then return end
 
     if input.UserInputType == Enum.UserInputType.MouseButton1 then
         local now = tick()
@@ -133,6 +168,14 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 
         local origin = camera.CFrame.Position
         local direction = camera.CFrame.LookVector
+
+        -- Play shoot effects
+        shootSound:Play()
+        muzzleFlash.Enabled = true
+        task.delay(0.05, function() muzzleFlash.Enabled = false end)
+
+        -- Recoil effect (brief camera kick)
+        pitchAngle = pitchAngle + math.rad(1.5)
 
         if ShootRemote then
             ShootRemote:FireServer(origin, direction)
