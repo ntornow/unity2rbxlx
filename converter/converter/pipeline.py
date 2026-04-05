@@ -34,6 +34,7 @@ PHASES: list[str] = [
     "parse",
     "extract_assets",
     "upload_assets",
+    "resolve_assets",
     "convert_materials",
     "transpile_scripts",
     "convert_animations",
@@ -611,6 +612,129 @@ class Pipeline:
             self.state.animation_result.total_controllers,
             self.state.animation_result.total_scripts_generated,
         )
+
+    def resolve_assets(self) -> None:
+        """Phase 3b: Resolve uploaded mesh Model IDs to real MeshIds + InitialSizes.
+
+        Uses the Roblox Luau Execution API to run InsertService:LoadAsset on
+        each uploaded mesh Model ID, extracting the real MeshId, InitialSize,
+        TextureID, and position data.  Results are stored in the conversion
+        context (mesh_native_sizes, mesh_hierarchies) for use by convert_scene.
+
+        Skips if mesh data is already populated (from a previous run or manual
+        resolve step).
+        """
+        if self.ctx.mesh_native_sizes and self.ctx.mesh_hierarchies:
+            log.info("[resolve_assets] Mesh resolution data already present (%d meshes) — skipping",
+                     len(self.ctx.mesh_native_sizes))
+            return
+
+        if self.skip_upload:
+            log.info("[resolve_assets] Skipping (--no-upload)")
+            return
+
+        import config
+        api_key = config.ROBLOX_API_KEY
+        universe_id = self.ctx.universe_id
+        place_id = self.ctx.place_id
+
+        if not api_key or not universe_id or not place_id:
+            log.warning("[resolve_assets] No API key or place ID — cannot resolve meshes headlessly")
+            return
+
+        # Find uploaded mesh assets (Model IDs from cloud upload)
+        mesh_assets = {k: v for k, v in self.ctx.uploaded_assets.items()
+                       if any(k.lower().endswith(ext) for ext in ('.fbx', '.obj'))}
+        if not mesh_assets:
+            log.info("[resolve_assets] No mesh assets to resolve")
+            return
+
+        log.info("[resolve_assets] Resolving %d mesh assets via Luau Execution API...", len(mesh_assets))
+
+        # Build resolve script: LoadAsset each Model ID, extract MeshPart data
+        # Process in batches to stay within script size limits
+        from roblox.cloud_api import execute_luau
+
+        batch_size = 20
+        mesh_items = list(mesh_assets.items())
+        all_results = []
+
+        for batch_start in range(0, len(mesh_items), batch_size):
+            batch = mesh_items[batch_start:batch_start + batch_size]
+            models_lua = ",\n".join(
+                f'    {{id={v.replace("rbxassetid://", "")}, path="{k}"}}'
+                for k, v in batch
+            )
+            script = f'''local InsertService = game:GetService("InsertService")
+local models = {{
+{models_lua}
+}}
+local allData = {{}}
+for _, entry in models do
+    local ok, model = pcall(InsertService.LoadAsset, InsertService, entry.id)
+    if not ok then continue end
+    for _, d in model:GetDescendants() do
+        if d:IsA("MeshPart") then
+            local sz = d.Size; local pos = d.Position
+            table.insert(allData, string.format("%s|%s|%s|%.4f,%.4f,%.4f|%.4f,%.4f,%.4f|%s",
+                entry.path, d.Name, d.MeshId, sz.X, sz.Y, sz.Z, pos.X, pos.Y, pos.Z,
+                d.TextureID ~= "" and d.TextureID or ""))
+        end
+    end
+    model:Destroy(); task.wait(0.3)
+end
+return table.concat(allData, "\\n")'''
+
+            result = execute_luau(api_key, universe_id, place_id, script)
+            if result and result.get("state") == "COMPLETE":
+                # Extract the return value from the result
+                outputs = result.get("output", {})
+                results_list = outputs.get("results", [])
+                if results_list:
+                    # The return value is in the first result
+                    ret = results_list[0]
+                    if isinstance(ret, dict):
+                        text = ret.get("value", "")
+                    else:
+                        text = str(ret)
+                    if text:
+                        all_results.extend(text.strip().split("\n"))
+                        log.info("[resolve_assets] Batch %d: resolved %d sub-meshes",
+                                 batch_start // batch_size + 1, len(text.strip().split("\n")))
+            else:
+                log.warning("[resolve_assets] Batch %d failed", batch_start // batch_size + 1)
+
+        # Parse results into mesh_native_sizes and mesh_hierarchies
+        if all_results:
+            mesh_native_sizes = {}
+            mesh_hierarchies = {}
+            for line in all_results:
+                parts = line.split("|")
+                if len(parts) < 5:
+                    continue
+                path, name, mesh_id, size_str, pos_str = parts[:5]
+                texture_id = parts[5] if len(parts) > 5 else ""
+                try:
+                    sx, sy, sz = [float(x) for x in size_str.split(",")]
+                    px, py, pz = [float(x) for x in pos_str.split(",")]
+                except (ValueError, IndexError):
+                    continue
+                if path not in mesh_native_sizes:
+                    mesh_native_sizes[path] = [sx, sy, sz]
+                if path not in mesh_hierarchies:
+                    mesh_hierarchies[path] = []
+                entry = {"name": name, "meshId": mesh_id,
+                         "size": [sx, sy, sz], "position": [px, py, pz]}
+                if texture_id:
+                    entry["textureId"] = texture_id
+                mesh_hierarchies[path].append(entry)
+
+            self.ctx.mesh_native_sizes = mesh_native_sizes
+            self.ctx.mesh_hierarchies = mesh_hierarchies
+            log.info("[resolve_assets] Resolved %d meshes (%d sub-meshes total)",
+                     len(mesh_native_sizes), sum(len(v) for v in mesh_hierarchies.values()))
+        else:
+            log.warning("[resolve_assets] No mesh resolution data obtained")
 
     def convert_scene(self) -> None:
         """Phase 5b: Convert the parsed scene hierarchy to Roblox parts."""
