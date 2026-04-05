@@ -1335,6 +1335,16 @@ script.Disabled = true
         if final_fixes:
             log.info("[write_output] Final validation pass applied %d fixes", final_fixes)
 
+        # Patch scripts that use setupSounds: also search script.Parent for
+        # Sound children (sounds from MonoBehaviour AudioClip fields are placed
+        # as children of the bound Part, not the character).
+        for s in self.state.rbx_place.scripts:
+            if "setupSounds" in s.source and "script.Parent" not in s.source:
+                s.source = s.source.replace(
+                    "setupSounds(character)",
+                    "setupSounds(character)\n    -- Also search bound Part for sounds from MonoBehaviour fields\n    if script.Parent and script.Parent:IsA(\"BasePart\") then\n        setupSounds(script.Parent)\n    end",
+                )
+
         # Final write: ensure .luau files on disk match the fully processed sources
         # (after require injection, reclassification, and all other post-processing)
         scripts_dir = self.output_dir / "scripts"
