@@ -1090,6 +1090,13 @@ def _convert_node(
     # -- Size --
     size = unity_scale_to_roblox_size(node.scale)
 
+    # -- Mesh pivot vertical correction --
+    # Roblox centers meshes in their bounding box; Unity uses the FBX origin.
+    # Only apply when the FBX origin is inside the bounding box (indicating a
+    # genuine pivot offset, not a scene-space positioned multi-mesh).
+    if node.mesh_guid and guid_index:
+        ry += _compute_mesh_vertical_offset(node.mesh_guid, guid_index, node.scale[1])
+
     # -- CFrame --
     cframe = RbxCFrame(
         x=rx, y=ry, z=rz,
@@ -2467,6 +2474,11 @@ def _convert_fbx_prefab_instance(
     rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*stripped_rot)
     rot_mat = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
 
+    # Mesh pivot vertical correction
+    mesh_guid = pi.source_prefab_guid if hasattr(pi, 'source_prefab_guid') else None
+    if mesh_guid and guid_index:
+        ry += _compute_mesh_vertical_offset(mesh_guid, guid_index, scl[1])
+
     cframe = RbxCFrame(
         x=rx, y=ry, z=rz,
         r00=rot_mat[0], r01=rot_mat[1], r02=rot_mat[2],
@@ -2746,7 +2758,9 @@ def _convert_prefab_instance(
     rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*quat_for_roblox)
     rot_mat = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
 
-
+    # Mesh pivot vertical correction
+    if hasattr(template, 'root') and template.root and template.root.mesh_guid and guid_index:
+        ry += _compute_mesh_vertical_offset(template.root.mesh_guid, guid_index, scl[1])
 
     cframe = RbxCFrame(
         x=rx, y=ry, z=rz,
@@ -3094,6 +3108,11 @@ def _convert_prefab_node(
         local_scl = world_scl
 
     rx, ry, rz = unity_to_roblox_pos(*local_pos)
+
+    # Mesh pivot vertical correction (same as _convert_node)
+    if node.mesh_guid and guid_index:
+        ry += _compute_mesh_vertical_offset(node.mesh_guid, guid_index, local_scl[1])
+
     quat_for_roblox = local_rot
     if node.mesh_guid:
         from core.coordinate_system import strip_fbx_prerotation
