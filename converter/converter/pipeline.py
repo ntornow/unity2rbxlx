@@ -1115,10 +1115,11 @@ return table.concat(allData, "\\n")'''
                             log.info("[write_output] Terrain script saved to %s (reference only)",
                                      terrain_path.name)
 
-        # Generate MeshLoader script to load meshes at runtime.
-        # Uploaded mesh Model IDs need InsertService resolution to get real MeshIds.
-        # Textures are uploaded as Image type and work directly — no resolution needed.
-        if self.ctx.uploaded_assets:
+        # MeshLoader: only inject if mesh resolution data is NOT available.
+        # When resolve_assets has run, real MeshIds are already in the rbxlx
+        # and no runtime loading is needed. The MeshLoader would actively harm
+        # rendering by replacing working meshes with potentially broken ones.
+        if self.ctx.uploaded_assets and not self.ctx.mesh_hierarchies:
             from core.roblox_types import RbxScript
             mesh_loader = '''-- Auto-generated mesh loader
 -- Replaces placeholder MeshParts with proper mesh geometry via CreateMeshPartAsync.
