@@ -50,6 +50,7 @@ class RbxLight:
 @dataclass
 class RbxSound:
     """A Roblox Sound instance."""
+    name: str = "Sound"
     sound_id: str = ""
     volume: float = 0.5
     playback_speed: float = 1.0

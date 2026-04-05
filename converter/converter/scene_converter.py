@@ -1376,7 +1376,7 @@ def _process_components(
 
         # -- MonoBehaviour: extract serialized numeric/string fields as attributes --
         elif ct == "MonoBehaviour":
-            _extract_monobehaviour_attributes(comp.properties, part, guid_index)
+            _extract_monobehaviour_attributes(comp.properties, part, guid_index, uploaded_assets)
 
         # -- Physics Joints --
         elif ct in _JOINT_TYPES:
@@ -1819,12 +1819,13 @@ def _extract_monobehaviour_attributes(
     properties: dict[str, Any],
     part: RbxPart,
     guid_index: GuidIndex | None,
+    uploaded_assets: dict[str, str] | None = None,
 ) -> None:
     """Extract serialized fields from a MonoBehaviour as Roblox attributes.
 
     Extracts simple numeric (int/float), string, and boolean values.
     Also resolves the script class name for script-to-part binding.
-    Object references and complex types are skipped.
+    AudioClip references are converted to Sound children on the part.
     """
     # Resolve script class name from m_Script GUID
     # Use numbered attributes (_ScriptClass, _ScriptClass_1, _ScriptClass_2, ...)
@@ -1851,7 +1852,6 @@ def _extract_monobehaviour_attributes(
 
         # Only extract simple types that map to Roblox attributes
         if isinstance(value, (int, float)):
-            # Strip m_ prefix for cleaner attribute names
             attr_name = key[2:] if key.startswith("m_") else key
             part.attributes[attr_name] = value
         elif isinstance(value, str) and len(value) < 100:
@@ -1860,6 +1860,38 @@ def _extract_monobehaviour_attributes(
         elif isinstance(value, bool):
             attr_name = key[2:] if key.startswith("m_") else key
             part.attributes[attr_name] = value
+        elif isinstance(value, dict) and "guid" in value and guid_index:
+            # Object reference — resolve to asset and create appropriate child.
+            # AudioClip (fileID=8300000) → Sound child
+            # Prefab/mesh reference → store as attribute for script access
+            ref_guid = value.get("guid", "")
+            ref_fid = str(value.get("fileID", ""))
+            if not ref_guid:
+                continue
+            ref_path = guid_index.resolve(ref_guid)
+            if not ref_path:
+                continue
+
+            if ref_fid == "8300000" or ref_path.suffix.lower() in (".mp3", ".wav", ".ogg"):
+                # AudioClip → create Sound child object
+                uploaded = uploaded_assets or {}
+                relative = guid_index.resolve_relative(ref_guid)
+                sound_url = None
+                for skey in [str(relative), str(ref_path)] if relative else [str(ref_path)]:
+                    if skey in uploaded:
+                        sound_url = uploaded[skey]
+                        break
+                if sound_url:
+                    # Create Sound with name matching the field
+                    # e.g., "shootSound" → Sound named "ShootSound"
+                    sound_name = key[0].upper() + key[1:] if key else key
+                    sound = RbxSound(
+                        name=sound_name,
+                        sound_id=sound_url,
+                        volume=1.0,
+                        playing=False,
+                    )
+                    part.sounds.append(sound)
 
 
 # ---------------------------------------------------------------------------
