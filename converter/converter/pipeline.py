@@ -940,28 +940,14 @@ class Pipeline:
                                 log.info("[write_output] Terrain SmoothGrid encoded for rbxlx embedding")
                             except Exception as exc:
                                 log.warning("[write_output] Failed to encode terrain SmoothGrid: %s", exc)
-                            # Generate terrain FillBlock script and embed in rbxlx
+                            # Save terrain FillBlock script as a standalone file (backup/reference).
+                            # Not injected as a runtime script since SmoothGrid binary data
+                            # is already embedded in the rbxlx — no runtime generation needed.
                             luau = generate_terrain_luau(terrain_data, rpos, voxel_size=16)
                             terrain_path = self.output_dir / "generate_terrain.luau"
                             terrain_path.write_text(luau, encoding="utf-8")
-                            log.info("[write_output] Terrain script saved to %s (%d chars)",
-                                     terrain_path.name, len(luau))
-                            # Inject as a server script so terrain generates on game start
-                            from core.roblox_types import RbxScript
-                            terrain_script = RbxScript(
-                                name="TerrainGenerator",
-                                source=(
-                                    "-- Auto-generated terrain from Unity heightmap\n"
-                                    "-- Runs once on server start, then disables itself\n"
-                                    "if script:GetAttribute('TerrainGenerated') then return end\n\n"
-                                    + luau + "\n\n"
-                                    "script:SetAttribute('TerrainGenerated', true)\n"
-                                    "script.Disabled = true\n"
-                                ),
-                                script_type="Script",
-                            )
-                            self.state.rbx_place.scripts.append(terrain_script)
-                            log.info("[write_output] TerrainGenerator script embedded in rbxlx")
+                            log.info("[write_output] Terrain script saved to %s (reference only)",
+                                     terrain_path.name)
 
         # Generate MeshLoader script to load meshes at runtime.
         # Uploaded mesh Model IDs need InsertService resolution to get real MeshIds.
