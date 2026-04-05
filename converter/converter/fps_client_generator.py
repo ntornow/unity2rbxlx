@@ -630,6 +630,73 @@ for _, player in ipairs(Players:GetPlayers()) do
     task.spawn(onPlayerAdded, player)
 end
 
+-- Create RemoteEvents for FPS mechanics
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local shootRemote = Instance.new("RemoteEvent")
+shootRemote.Name = "PlayerShoot"
+shootRemote.Parent = ReplicatedStorage
+
+local getItemRemote = Instance.new("RemoteEvent")
+getItemRemote.Name = "PlayerGetItem"
+getItemRemote.Parent = ReplicatedStorage
+
+-- Handle shooting: client sends origin + direction, server does raycast + damage
+local SHOOT_RANGE = 1000
+local SHOOT_DAMAGE = 25
+
+shootRemote.OnServerEvent:Connect(function(player, origin, direction)
+    if typeof(origin) ~= "Vector3" or typeof(direction) ~= "Vector3" then return end
+    -- Sanity: origin should be near the player
+    local char = player.Character
+    if not char then return end
+    local head = char:FindFirstChild("Head")
+    if head and (head.Position - origin).Magnitude > 20 then return end
+
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.FilterDescendantsInstances = {char}
+    local result = workspace:Raycast(origin, direction.Unit * SHOOT_RANGE, rayParams)
+
+    if result and result.Instance then
+        -- Check if we hit a humanoid (NPC or player)
+        local hitPart = result.Instance
+        local hitModel = hitPart:FindFirstAncestorOfClass("Model")
+        local hitHumanoid = hitModel and hitModel:FindFirstChildOfClass("Humanoid")
+        if hitHumanoid then
+            hitHumanoid:TakeDamage(SHOOT_DAMAGE)
+        end
+        -- Visual: brief highlight on hit part
+        task.spawn(function()
+            local orig = hitPart.Color
+            hitPart.Color = Color3.new(1, 0.3, 0.3)
+            task.wait(0.1)
+            if hitPart.Parent then hitPart.Color = orig end
+        end)
+    end
+end)
+
+-- Handle item pickup: player touches a pickup part
+getItemRemote.OnServerEvent:Connect(function(player, pickupPart)
+    if typeof(pickupPart) ~= "Instance" or not pickupPart:IsA("BasePart") then return end
+    if not pickupPart.Parent then return end
+    -- Check distance
+    local char = player.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp or (hrp.Position - pickupPart.Position).Magnitude > 20 then return end
+    -- Apply pickup effect based on name
+    local name = pickupPart.Name:lower()
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    if humanoid then
+        if name:find("health") or name:find("hp") or name:find("medkit") then
+            humanoid.Health = math.min(humanoid.Health + 25, humanoid.MaxHealth)
+        end
+    end
+    -- Remove pickup (it will respawn if ObjectResetter is active)
+    pickupPart.Parent = nil
+end)
+
 print("[GameServer] Initialized. Spawn point at", spawnCFrame.Position)
 '''
     return RbxScript(
