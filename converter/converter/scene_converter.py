@@ -2467,11 +2467,6 @@ def _convert_fbx_prefab_instance(
     rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*stripped_rot)
     rot_mat = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
 
-    # Mesh pivot vertical correction
-    mesh_guid = pi.source_prefab_guid if hasattr(pi, 'source_prefab_guid') else None
-    if mesh_guid and guid_index:
-        ry += _compute_mesh_vertical_offset(mesh_guid, guid_index, scl[1])
-
     cframe = RbxCFrame(
         x=rx, y=ry, z=rz,
         r00=rot_mat[0], r01=rot_mat[1], r02=rot_mat[2],
@@ -2575,15 +2570,32 @@ def _convert_prefab_instance(
     # alongside m_RootOrder (only the root has m_RootOrder).
     child_modifications: dict[str, list[dict]] = {}  # fileID -> [mod, ...]
     root_target_fid = ""
-    # Find the root transform target by looking for m_RootOrder modification
+    # Find the root transform target by cross-referencing m_RootOrder and
+    # m_LocalPosition modifications.  The root transform is the target that
+    # has BOTH m_RootOrder and m_LocalPosition set.  Multiple transforms may
+    # have m_RootOrder (parent and child both), so we need the intersection.
+    # When no match is found, root_target_fid stays "" and no filtering is
+    # applied (all mods treated as root mods — safe for simple prefabs).
+    root_order_targets = set()
+    position_targets = set()
     for mod in pi.modifications:
-        if isinstance(mod, dict) and mod.get("propertyPath") == "m_RootOrder":
-            target = mod.get("target", {})
-            root_target_fid = str(target.get("fileID", "")) if isinstance(target, dict) else ""
-            break
-    # Fallback: use the prefab template's root file_id
-    if not root_target_fid:
-        root_target_fid = str(template.root.file_id) if hasattr(template.root, 'file_id') else ""
+        if not isinstance(mod, dict):
+            continue
+        target = mod.get("target", {})
+        tfid = str(target.get("fileID", "")) if isinstance(target, dict) else ""
+        if not tfid or tfid == "0":
+            continue
+        if mod.get("propertyPath") == "m_RootOrder":
+            root_order_targets.add(tfid)
+        elif mod.get("propertyPath", "").startswith("m_LocalPosition."):
+            position_targets.add(tfid)
+    # The root is the target with both m_RootOrder and m_LocalPosition
+    common = root_order_targets & position_targets
+    if len(common) == 1:
+        root_target_fid = common.pop()
+    elif root_order_targets and not position_targets:
+        # No position overrides — pick any m_RootOrder target
+        root_target_fid = next(iter(root_order_targets))
     for mod in pi.modifications:
         if not isinstance(mod, dict):
             continue
@@ -2673,8 +2685,10 @@ def _convert_prefab_instance(
         # via child_modifications dict.
         target = mod.get("target", {})
         mod_target_fid = str(target.get("fileID", "")) if isinstance(target, dict) else ""
-        is_root_mod = (not mod_target_fid or mod_target_fid == "0" or
-                       mod_target_fid == root_target_fid)
+        # Only filter when root_target_fid was positively identified (via m_RootOrder).
+        # When unknown, accept all mods as root mods (safe for simple prefabs).
+        is_root_mod = (not root_target_fid or not mod_target_fid or
+                       mod_target_fid == "0" or mod_target_fid == root_target_fid)
 
         try:
             fval = float(val)
@@ -2732,9 +2746,7 @@ def _convert_prefab_instance(
     rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*quat_for_roblox)
     rot_mat = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
 
-    # Mesh pivot vertical correction
-    if hasattr(template, 'root') and template.root and template.root.mesh_guid and guid_index:
-        ry += _compute_mesh_vertical_offset(template.root.mesh_guid, guid_index, scl[1])
+
 
     cframe = RbxCFrame(
         x=rx, y=ry, z=rz,
@@ -3088,10 +3100,6 @@ def _convert_prefab_node(
         quat_for_roblox = strip_fbx_prerotation(*local_rot)
     rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*quat_for_roblox)
     rot = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
-
-    # Mesh pivot vertical correction
-    if node.mesh_guid and guid_index:
-        ry += _compute_mesh_vertical_offset(node.mesh_guid, guid_index, local_scl[1])
 
     rbx_size = unity_scale_to_roblox_size(local_scl)
 
