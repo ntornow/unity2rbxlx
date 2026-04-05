@@ -267,13 +267,12 @@ def encode_smooth_grid(
         # Unity terrain is a mesh that coexists with objects at the same Y,
         # but Roblox terrain voxels are volumetric and would occlude thin
         # objects (like floor tiles) at the exact same height.
-        # Offset terrain surface down so objects placed ON terrain in Unity
-        # render above terrain voxels in Roblox.  Unity terrain meshes don't
-        # physically occlude objects, but Roblox terrain voxels do. Objects
-        # whose meshes are centered (common) extend below their pivot point
-        # by half their height.  One full voxel offset provides enough
-        # clearance for most game objects.
-        h_studs = sample_height(gx * VOXEL_SIZE, gz * VOXEL_SIZE) - VOXEL_SIZE
+        # Offset terrain surface down by half a voxel so runway tiles and
+        # objects placed ON terrain in Unity render above terrain in Roblox.
+        # Unity terrain meshes coexist with objects visually, but Roblox
+        # terrain voxels are volumetric. Half a voxel keeps the terrain
+        # close to the correct height while preventing tile occlusion.
+        h_studs = sample_height(gx * VOXEL_SIZE, gz * VOXEL_SIZE) - VOXEL_SIZE / 2
         voxel_bottom = gy * VOXEL_SIZE
         voxel_top = voxel_bottom + VOXEL_SIZE
 
