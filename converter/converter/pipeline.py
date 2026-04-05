@@ -635,12 +635,54 @@ class Pipeline:
 
         import config
         api_key = config.ROBLOX_API_KEY
+        creator_id = str(config.ROBLOX_CREATOR_ID or "")
+
+        if not api_key or not creator_id:
+            log.warning("[resolve_assets] No API key or creator ID — cannot resolve meshes headlessly")
+            return
+
+        # Ensure we have a universe/place to execute Luau on.
         universe_id = self.ctx.universe_id
         place_id = self.ctx.place_id
 
-        if not api_key or not universe_id or not place_id:
-            log.warning("[resolve_assets] No API key or place ID — cannot resolve meshes headlessly")
-            return
+        # Try to recover IDs from a persistent cache file (survives context resets)
+        if not universe_id or not place_id:
+            ids_cache = self.output_dir / ".roblox_ids.json"
+            if ids_cache.exists():
+                import json as _json
+                try:
+                    ids = _json.loads(ids_cache.read_text())
+                    universe_id = ids.get("universe_id")
+                    place_id = ids.get("place_id")
+                    if universe_id and place_id:
+                        self.ctx.universe_id = universe_id
+                        self.ctx.place_id = place_id
+                        log.info("[resolve_assets] Recovered IDs from cache: universe=%s place=%s",
+                                 universe_id, place_id)
+                except Exception:
+                    pass
+
+        # Create experience if still missing
+        if not universe_id or not place_id:
+            from roblox.cloud_api import create_experience
+            log.info("[resolve_assets] Creating experience for headless mesh resolution...")
+            exp_name = self.state.parsed_scene.roots[0].name if self.state.parsed_scene and self.state.parsed_scene.roots else "Converted"
+            result = create_experience(api_key, exp_name)
+            if result:
+                universe_id, place_id = result
+                self.ctx.universe_id = universe_id
+                self.ctx.place_id = place_id
+                self.ctx.experience_name = exp_name
+                log.info("[resolve_assets] Created universe=%s place=%s", universe_id, place_id)
+            else:
+                log.warning("[resolve_assets] Failed to create experience — cannot resolve meshes headlessly. "
+                           "Run 'u2r.py resolve' manually after first conversion.")
+                return
+
+        # Persist IDs to cache file (survives context resets)
+        import json as _json
+        ids_cache = self.output_dir / ".roblox_ids.json"
+        ids_cache.write_text(_json.dumps({"universe_id": universe_id, "place_id": place_id}))
 
         # Find uploaded mesh assets (Model IDs from cloud upload)
         mesh_assets = {k: v for k, v in self.ctx.uploaded_assets.items()
