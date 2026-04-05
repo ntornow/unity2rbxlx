@@ -641,6 +641,15 @@ local getItemRemote = Instance.new("RemoteEvent")
 getItemRemote.Name = "PlayerGetItem"
 getItemRemote.Parent = ReplicatedStorage
 
+-- Visual hit feedback
+local function flashHitPart(part)
+    local ok, orig = pcall(function() return part.Color end)
+    if not ok then return end
+    part.Color = Color3.new(1, 0.3, 0.3)
+    task.wait(0.1)
+    pcall(function() part.Color = orig end)
+end
+
 -- Handle shooting: client sends origin + direction, server does raycast + damage
 local SHOOT_RANGE = 1000
 local SHOOT_DAMAGE = 25
@@ -666,13 +675,7 @@ shootRemote.OnServerEvent:Connect(function(player, origin, direction)
         if hitHumanoid then
             hitHumanoid:TakeDamage(SHOOT_DAMAGE)
         end
-        -- Visual: brief highlight on hit part
-        task.spawn(function()
-            local orig = hitPart.Color
-            hitPart.Color = Color3.new(1, 0.3, 0.3)
-            task.wait(0.1)
-            pcall(function() hitPart.Color = orig end)
-        end)
+        task.spawn(flashHitPart, hitPart)
     end
 end)
 
