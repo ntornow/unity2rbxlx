@@ -205,7 +205,8 @@ def _compute_mesh_vertical_offset(
     Returns studs to ADD to Roblox Y so that objects with bottom-pivoted
     meshes sit on surfaces instead of clipping through them.
 
-    Reads the FBX vertex data on first call per mesh, caches the result.
+    Uses Roblox mesh_hierarchies data when available (accurate), falling
+    back to FBX vertex analysis (approximate).
     """
     if not guid_index:
         return 0.0
@@ -215,7 +216,34 @@ def _compute_mesh_vertical_offset(
         return _mesh_vertical_offset_cache[cache_key]
 
     asset_path = guid_index.resolve(mesh_guid)
-    if not asset_path or asset_path.suffix.lower() != '.fbx':
+    if not asset_path:
+        _mesh_vertical_offset_cache[cache_key] = 0.0
+        return 0.0
+
+    # Primary: use Roblox mesh_hierarchies data (from Studio resolution).
+    # The position field gives the mesh center offset in InitialSize space.
+    # When the center position Y is near 0, no offset is needed.
+    if _mesh_hierarchies:
+        relative = guid_index.resolve_relative(mesh_guid)
+        for key in ([str(relative), str(asset_path)] if relative else [str(asset_path)]):
+            if key in _mesh_hierarchies:
+                sub_meshes = _mesh_hierarchies[key]
+                if sub_meshes:
+                    pos = sub_meshes[0].get("position", [0, 0, 0])
+                    center_y = pos[1] if len(pos) > 1 else 0.0
+                    if abs(center_y) < 0.5:
+                        # Center is at origin — no offset needed
+                        _mesh_vertical_offset_cache[cache_key] = 0.0
+                        return 0.0
+                    # Compute offset: center_y is in InitialSize units.
+                    # Scale by import_scale * STUDS_PER_METER to get studs.
+                    import_scale = _get_fbx_import_scale(mesh_guid, guid_index)
+                    offset = center_y * import_scale * config.STUDS_PER_METER * abs(unity_scale_y)
+                    _mesh_vertical_offset_cache[cache_key] = offset
+                    return offset
+
+    # Fallback: FBX vertex analysis (less accurate, wrong axis mapping possible)
+    if asset_path.suffix.lower() != '.fbx':
         _mesh_vertical_offset_cache[cache_key] = 0.0
         return 0.0
 
@@ -230,17 +258,11 @@ def _compute_mesh_vertical_offset(
     bmax = fbx_info["bounds_max"]
     ranges = fbx_info["bounding_box"]
 
-    # Only apply pivot correction when the FBX origin (0,0,0) is INSIDE the
-    # bounding box.  If the origin is outside, the mesh vertices are positioned
-    # in scene space (e.g., multi-mesh FBX with sub-meshes at offsets) and the
-    # center offset is scene positioning, not a pivot-to-center correction.
     origin_inside = all(bmin[i] <= 0.0 <= bmax[i] for i in range(3))
     if not origin_inside:
         _mesh_vertical_offset_cache[cache_key] = 0.0
         return 0.0
 
-    # Identify the height axis: the axis with the highest asymmetry
-    # (pivot is closest to one end of the bounding box).
     asymmetry = []
     for i in range(3):
         if ranges[i] > 1e-6:
@@ -253,8 +275,6 @@ def _compute_mesh_vertical_offset(
         _mesh_vertical_offset_cache[cache_key] = 0.0
         return 0.0
 
-    # Sign: offset always points "up" (from pivot toward mesh center).
-    # If |min| > |max|: mesh extends more in -axis → negate center value.
     if abs(bmin[height_axis]) > abs(bmax[height_axis]):
         sign = -1.0
     else:

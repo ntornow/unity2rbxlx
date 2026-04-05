@@ -262,13 +262,12 @@ def encode_smooth_grid(
         if gx < 0 or gy < 0 or gz < 0 or gx >= grid_x or gy >= grid_y or gz >= grid_z:
             return (MATERIAL_AIR, 0)
 
-        # Offset terrain surface down by one full voxel so that objects placed
-        # ON the terrain in Unity render fully ABOVE the terrain in Roblox.
+        # Offset terrain surface down by half a voxel so that objects placed
+        # ON the terrain in Unity render ABOVE the terrain in Roblox.
         # Unity terrain is a mesh that coexists with objects at the same Y,
-        # but Roblox terrain voxels are volumetric and would occlude objects
-        # whose bounding boxes extend below their pivot point (common for
-        # meshes with non-centered FBX origins).
-        h_studs = sample_height(gx * VOXEL_SIZE, gz * VOXEL_SIZE) - VOXEL_SIZE
+        # but Roblox terrain voxels are volumetric and would occlude thin
+        # objects (like floor tiles) at the exact same height.
+        h_studs = sample_height(gx * VOXEL_SIZE, gz * VOXEL_SIZE) - VOXEL_SIZE / 2
         voxel_bottom = gy * VOXEL_SIZE
         voxel_top = voxel_bottom + VOXEL_SIZE
 
