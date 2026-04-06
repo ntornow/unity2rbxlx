@@ -3600,11 +3600,15 @@ def _add_floor_and_spawn(place: RbxPlace) -> None:
         tcx, tcy, tcz = unity_to_roblox_pos(
             tp[0] + tw / 2, tp[1] - 0.5, tp[2] + td / 2,
         )
+        # Use 1.5x terrain size to ensure full coverage including edges
+        # where spawn points may exist beyond the terrain center
+        ground_w = tw * config.STUDS_PER_METER * 1.5
+        ground_d = td * config.STUDS_PER_METER * 1.5
         ground = RbxPart(
             name="GroundCollider",
             class_name="Part",
             cframe=RbxCFrame(x=tcx, y=tcy, z=tcz),
-            size=(tw * config.STUDS_PER_METER, 1, td * config.STUDS_PER_METER),
+            size=(ground_w, 1, ground_d),
             transparency=1.0,
             anchored=True,
             can_collide=True,
