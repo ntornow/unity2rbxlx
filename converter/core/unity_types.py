@@ -76,6 +76,7 @@ class ParsedScene:
     referenced_material_guids: set[str] = field(default_factory=set)
     referenced_mesh_guids: set[str] = field(default_factory=set)
     prefab_instances: list[PrefabInstanceData] = field(default_factory=list)
+    transform_fid_to_go_fid: dict[str, str] = field(default_factory=dict)
     skybox_material_guid: str | None = None
     render_settings: dict[str, Any] = field(default_factory=dict)
 

@@ -167,11 +167,19 @@ class TestConversionTransforms:
         total = sum(len(v) for v in data.values())
         assert total > 0, f"{project_name}: rbxlx has no parts"
 
-    def test_zero_rotation_errors(self, project_name, unity_scene, rbxlx):
-        """Every object must have correct rotation — zero errors allowed."""
-        rot_errors = verify_conversion_transforms(unity_scene, rbxlx, rot_threshold_deg=0.01)
-        assert len(rot_errors) == 0, (
-            f"{project_name}: {len(rot_errors)} objects have rotation errors:\n"
-            + "\n".join(f"  {d['name']}: {d['rot_error_deg']:.1f}° ({d.get('path','')})"
-                       for d in rot_errors[:20])
+    def test_zero_placement_errors(self, project_name, unity_scene, rbxlx):
+        """Every object must have correct position and rotation — zero errors."""
+        roblox_data = parse_rbxlx(str(rbxlx))
+        unity_data = parse_unity_scene_transforms(str(unity_scene))
+        # 0.01° rotation, 0.01m position tolerance (floating point only)
+        discrepancies = compare_transforms(
+            unity_data, roblox_data,
+            pos_threshold=0.01, rot_threshold=0.01,
+        )
+        assert len(discrepancies) == 0, (
+            f"{project_name}: {len(discrepancies)} objects have placement errors:\n"
+            + "\n".join(
+                f"  {d['name']}: pos={d['pos_error_m']:.2f}m rot={d['rot_error_deg']:.2f}° ({d.get('path','')})"
+                for d in discrepancies[:20]
+            )
         )

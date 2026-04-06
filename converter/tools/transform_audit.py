@@ -199,51 +199,52 @@ def parse_unity_scene_transforms(scene_path: str) -> dict[str, list[dict]]:
         if hasattr(node, 'file_id'):
             node_by_fid[node.file_id] = node
 
-    results = {}
+    # Build transform_fid → scene node mapping for parent lookup
+    xform_to_node = {}
+    if hasattr(parsed, 'transform_fid_to_go_fid'):
+        for xform_fid, go_fid in parsed.transform_fid_to_go_fid.items():
+            if go_fid in node_by_fid:
+                xform_to_node[str(xform_fid)] = node_by_fid[go_fid]
 
-    for node in all_nodes:
-        # Compute world transform by walking parent chain
+    def _compute_node_world_transform(node):
+        """Compute world pos/rot for a scene node by walking parent chain."""
         chain = []
         fid = getattr(node, 'parent_file_id', None)
         while fid and fid in node_by_fid:
             chain.append(node_by_fid[fid])
             fid = getattr(node_by_fid[fid], 'parent_file_id', None)
-
-        # Compose top-down
         world_pos = [0.0, 0.0, 0.0]
         world_rot = [0.0, 0.0, 0.0, 1.0]
         for ancestor in reversed(chain):
             apos = list(ancestor.position)
             arot = list(ancestor.rotation)
             rotated = quat_rotate(world_rot, apos)
-            world_pos[0] += rotated[0]
-            world_pos[1] += rotated[1]
-            world_pos[2] += rotated[2]
+            world_pos = [world_pos[0]+rotated[0], world_pos[1]+rotated[1], world_pos[2]+rotated[2]]
             world_rot = list(quat_multiply(world_rot, arot))
-
-        # Apply node's own transform
         node_rotated = quat_rotate(world_rot, list(node.position))
         wx = world_pos[0] + node_rotated[0]
         wy = world_pos[1] + node_rotated[1]
         wz = world_pos[2] + node_rotated[2]
         world_rot = list(quat_multiply(world_rot, list(node.rotation)))
+        return (wx, wy, wz), tuple(world_rot)
 
+    results = {}
+
+    for node in all_nodes:
+        wpos, wrot = _compute_node_world_transform(node)
         entry = {
             'name': node.name,
-            'unity_world_pos': (wx, wy, wz),
-            'unity_world_rot': tuple(world_rot),
+            'unity_world_pos': wpos,
+            'unity_world_rot': wrot,
             'type': 'scene_node',
         }
         results.setdefault(node.name, []).append(entry)
 
-    # Also extract prefab instance root transforms
+    # Extract prefab instance root transforms, composing with parent scene node
     for pi in parsed.prefab_instances:
-        # Extract name and transform from modifications
         pi_name = None
         pi_pos = [0.0, 0.0, 0.0]
         pi_rot = [0.0, 0.0, 0.0, 1.0]
-        parent_fid = getattr(pi, 'transform_parent_file_id', None) or \
-                     getattr(pi, 'parent_file_id', None)
 
         for mod in pi.modifications:
             if not isinstance(mod, dict):
@@ -256,55 +257,30 @@ def parse_unity_scene_transforms(scene_path: str) -> dict[str, list[dict]]:
                 fval = float(val)
             except (ValueError, TypeError):
                 continue
-            if pp == 'm_LocalPosition.x':
-                pi_pos[0] = fval
-            elif pp == 'm_LocalPosition.y':
-                pi_pos[1] = fval
-            elif pp == 'm_LocalPosition.z':
-                pi_pos[2] = fval
-            elif pp == 'm_LocalRotation.x':
-                pi_rot[0] = fval
-            elif pp == 'm_LocalRotation.y':
-                pi_rot[1] = fval
-            elif pp == 'm_LocalRotation.z':
-                pi_rot[2] = fval
-            elif pp == 'm_LocalRotation.w':
-                pi_rot[3] = fval
+            if pp == 'm_LocalPosition.x': pi_pos[0] = fval
+            elif pp == 'm_LocalPosition.y': pi_pos[1] = fval
+            elif pp == 'm_LocalPosition.z': pi_pos[2] = fval
+            elif pp == 'm_LocalRotation.x': pi_rot[0] = fval
+            elif pp == 'm_LocalRotation.y': pi_rot[1] = fval
+            elif pp == 'm_LocalRotation.z': pi_rot[2] = fval
+            elif pp == 'm_LocalRotation.w': pi_rot[3] = fval
 
         if not pi_name:
             continue
 
-        # Compute world transform: compose with parent scene node if available
+        # Find parent scene node via transform_fid → node mapping
+        parent_xform_fid = str(getattr(pi, 'transform_parent_file_id', '') or '')
+        parent_node = xform_to_node.get(parent_xform_fid)
+
         world_pos = list(pi_pos)
         world_rot = list(pi_rot)
 
-        if parent_fid and parent_fid in node_by_fid:
-            # Walk parent chain for the parent scene node
-            parent = node_by_fid[parent_fid]
-            chain = [parent]
-            fid = getattr(parent, 'parent_file_id', None)
-            while fid and fid in node_by_fid:
-                chain.append(node_by_fid[fid])
-                fid = getattr(node_by_fid[fid], 'parent_file_id', None)
-
-            # Compose parent world transform
-            p_world_pos = [0.0, 0.0, 0.0]
-            p_world_rot = [0.0, 0.0, 0.0, 1.0]
-            for ancestor in reversed(chain):
-                apos = list(ancestor.position)
-                arot = list(ancestor.rotation)
-                rotated = quat_rotate(p_world_rot, apos)
-                p_world_pos[0] += rotated[0]
-                p_world_pos[1] += rotated[1]
-                p_world_pos[2] += rotated[2]
-                p_world_rot = list(quat_multiply(p_world_rot, arot))
-
-            # Compose: world = parent_world * local
-            rotated_local = quat_rotate(p_world_rot, pi_pos)
-            world_pos = [p_world_pos[0] + rotated_local[0],
-                        p_world_pos[1] + rotated_local[1],
-                        p_world_pos[2] + rotated_local[2]]
-            world_rot = list(quat_multiply(p_world_rot, pi_rot))
+        if parent_node:
+            p_wpos, p_wrot = _compute_node_world_transform(parent_node)
+            # Also include the parent node's own transform
+            rotated_local = quat_rotate(list(p_wrot), pi_pos)
+            world_pos = [p_wpos[0]+rotated_local[0], p_wpos[1]+rotated_local[1], p_wpos[2]+rotated_local[2]]
+            world_rot = list(quat_multiply(list(p_wrot), pi_rot))
 
         entry = {
             'name': pi_name,

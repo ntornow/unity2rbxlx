@@ -125,6 +125,7 @@ def parse_scene(scene_path: str | Path) -> ParsedScene:
     xform_fid_to_go_fid: dict[str, str] = {}
     for go_fid, (xform_fid, _) in go_fid_to_transform.items():
         xform_fid_to_go_fid[xform_fid] = go_fid
+    result.transform_fid_to_go_fid = dict(xform_fid_to_go_fid)
 
     for go_fid, node in result.all_nodes.items():
         entry = go_fid_to_transform.get(go_fid)
