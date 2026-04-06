@@ -272,7 +272,13 @@ def encode_smooth_grid(
         # Unity terrain meshes coexist with objects visually, but Roblox
         # terrain voxels are volumetric. Half a voxel keeps the terrain
         # close to the correct height while preventing tile occlusion.
-        h_studs = sample_height(gx * VOXEL_SIZE, gz * VOXEL_SIZE)
+        # Lower terrain surface by 1 stud to prevent volumetric terrain
+        # voxels from occluding thin objects (tiles, floors) placed ON the
+        # terrain in Unity.  Unity terrain is a mesh that doesn't occlude
+        # objects at the same height; Roblox terrain voxels do.
+        # Use max(0, ...) to preserve terrain at sea level for collision.
+        raw_h = sample_height(gx * VOXEL_SIZE, gz * VOXEL_SIZE)
+        h_studs = max(0.0, raw_h - 1.0)
         voxel_bottom = gy * VOXEL_SIZE
         voxel_top = voxel_bottom + VOXEL_SIZE
 
