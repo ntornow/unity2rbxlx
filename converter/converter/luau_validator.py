@@ -334,6 +334,18 @@ def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
     source = _inject_utility_functions(name, source, fixes)
     source = _disable_broken_scripts(name, source, fixes)
 
+    # Remove duplicate trailing return statements
+    lines = source.rstrip().split('\n')
+    while len(lines) >= 2:
+        last = lines[-1].strip()
+        prev = lines[-2].strip()
+        if last.startswith('return ') and prev.startswith('return '):
+            lines.pop()
+            fixes.append("Removed duplicate trailing return")
+        else:
+            break
+    source = '\n'.join(lines) + '\n'
+
     return source, fixes
 
 
@@ -6811,9 +6823,12 @@ def _fix_connect_closures(source: str, fixes: list[str]) -> str:
             elif re.match(r'until\b', stripped):
                 depth -= 1
 
-        # Fix inner end) → end (these close if/for/while blocks, not the function)
-        for idx in inner_ends:
-            ends_to_fix[idx] = 'end'
+        # NOTE: Previously converted inner end) → end, assuming they close
+        # if/for/while blocks. But nested Connect(function()...end) calls
+        # also produce inner end) that IS correct. Disabling this conversion
+        # to avoid breaking nested closures.
+        # for idx in inner_ends:
+        #     ends_to_fix[idx] = 'end'
 
         # If no matching end found and depth > 0, insert end)
         if not found and depth > 0:

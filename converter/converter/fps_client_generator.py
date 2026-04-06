@@ -617,8 +617,13 @@ local function findSpawnPoint()
     local defaultSpawn = nil
 
     for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("SpawnLocation") or (obj:IsA("BasePart") and
-            (obj:GetAttribute("IsSpawnPoint") or obj.Name:lower():find("spawn"))) then
+        local isSpawn = obj:IsA("SpawnLocation")
+        if not isSpawn and obj:IsA("BasePart") then
+            if obj:GetAttribute("IsSpawnPoint") or obj.Name:lower():find("spawn") then
+                isSpawn = true
+            end
+        end
+        if isSpawn then
             if not firstSpawn then
                 firstSpawn = obj
             end
