@@ -1097,12 +1097,10 @@ def _convert_node(
     rx, ry, rz = unity_to_roblox_pos(wx, wy, wz)
 
     # -- Rotation --
+    # Scene node rotations already include any FBX pre-rotation compensation.
+    # Both Unity and Roblox handle Z-up→Y-up during FBX import, so the
+    # world rotation maps directly without stripping.
     quat = tuple(world_rot)
-    if node.mesh_guid and guid_index:
-        asset_path = guid_index.resolve(node.mesh_guid)
-        if asset_path and asset_path.suffix.lower() in ('.fbx', '.obj'):
-            from core.coordinate_system import strip_fbx_prerotation
-            quat = strip_fbx_prerotation(*quat)
     rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*quat)
     rot = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
 
@@ -3234,16 +3232,12 @@ def _convert_prefab_node(
             pp[2] + rotated[2],
         ]
 
-        # Strip FBX pre-rotation from the node's OWN rotation BEFORE
-        # composing with parent.  The parent rotation may include a -90° X
-        # tilt that should be preserved (it makes objects lie horizontal).
-        # Stripping after composition would incorrectly remove this tilt.
+        # Prefab child rotations already include any FBX pre-rotation
+        # compensation. Both Unity and Roblox handle Z-up→Y-up during FBX
+        # import, so the prefab rotation maps directly without stripping.
         node_rot = list(local_rot)
-        if node.mesh_guid:
-            from core.coordinate_system import strip_fbx_prerotation
-            node_rot = list(strip_fbx_prerotation(*local_rot))
 
-        # Compose rotations (parent * child with pre-rotation stripped)
+        # Compose rotations (parent * child)
         world_rot = _quat_multiply(pr, node_rot)
 
         # Compose scales
@@ -3258,10 +3252,8 @@ def _convert_prefab_node(
         local_scl = world_scl
 
     else:
-        # No parent — strip pre-rotation from the node's own rotation
-        if node.mesh_guid:
-            from core.coordinate_system import strip_fbx_prerotation
-            local_rot = list(strip_fbx_prerotation(*local_rot))
+        # No parent — rotation maps directly (no strip needed)
+        pass
 
     rx, ry, rz = unity_to_roblox_pos(*local_pos)
 
