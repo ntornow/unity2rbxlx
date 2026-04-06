@@ -6617,7 +6617,10 @@ def _fix_missing_end_keywords(name: str, source: str, fixes: list[str]) -> str:
     # Third pass: remove excess trailing `end` keywords from C# class closing braces
     # Count block openers vs closers — if there are more `end` than openers,
     # remove trailing `end` lines from the bottom of the script
-    source = _remove_excess_trailing_ends(source, fixes)
+    # NOTE: _remove_excess_trailing_ends disabled — its block depth counting
+    # is unreliable with complex patterns (nested closures, do blocks, etc.)
+    # and it removes valid `end` keywords, causing syntax errors.
+    # source = _remove_excess_trailing_ends(source, fixes)
 
     # Final pass: fix `end` → `end)` for `:Connect(function(` blocks
     # Uses indentation matching: the closing `end` for a Connect(function block
