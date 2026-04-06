@@ -832,11 +832,13 @@ def _make_part(parent_xml: ET.Element, part: RbxPart) -> None:
         if hasattr(part, "cframe") and part.cframe:
             _add_cframe(props, "CFrame", part.cframe)
 
-        # Size (capped at 2048 studs per axis — Roblox Studio limit)
+        # Size (capped at 2048 studs per axis for visual parts,
+        # but allow larger for invisible colliders like GroundCollider)
         if hasattr(part, "size") and part.size:
-            sx = min(2048.0, max(0.05, part.size[0]))
-            sy = min(2048.0, max(0.05, part.size[1]))
-            sz = min(2048.0, max(0.05, part.size[2]))
+            max_size = 2048.0 if (part.transparency or 0) < 1.0 else 16384.0
+            sx = min(max_size, max(0.05, part.size[0]))
+            sy = min(max_size, max(0.05, part.size[1]))
+            sz = min(max_size, max(0.05, part.size[2]))
             _add_vector3(props, "Size", sx, sy, sz)
 
         # Color
