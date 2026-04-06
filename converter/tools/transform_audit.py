@@ -305,11 +305,6 @@ def compare_transforms(
 ) -> list[dict]:
     """Compare Unity expected transforms to Roblox actual transforms.
 
-    Position comparison uses XZ distance only (ignoring Y) because Roblox
-    MeshPart.Position is at the bounding box center while Unity's is at the
-    FBX origin (typically bottom). The converter correctly applies a Y-offset
-    for this pivot difference, so Y differences are expected.
-
     Returns list of discrepancies sorted by position error (worst first).
     """
     discrepancies = []
@@ -320,6 +315,7 @@ def compare_transforms(
 
         roblox_entries = roblox_data[name]
 
+        # Match by closest position
         for ue in unity_entries:
             upos = ue['unity_world_pos']
             best_match = None
@@ -327,27 +323,24 @@ def compare_transforms(
 
             for re_entry in roblox_entries:
                 rpos = re_entry['pos_unity']
-                # Use XZ distance for matching (Y differs due to pivot offset)
-                dist_xz = math.sqrt((upos[0]-rpos[0])**2 + (upos[2]-rpos[2])**2)
-                if dist_xz < best_dist:
-                    best_dist = dist_xz
+                dist = math.sqrt(sum((a-b)**2 for a, b in zip(upos, rpos)))
+                if dist < best_dist:
+                    best_dist = dist
                     best_match = re_entry
 
             if best_match is None:
                 continue
 
-            # XZ position error (Y is expected to differ by mesh pivot offset)
-            rpos = best_match['pos_unity']
-            pos_error_xz = math.sqrt((upos[0]-rpos[0])**2 + (upos[2]-rpos[2])**2)
+            pos_error = best_dist
             rot_error = quat_angle_diff(ue['unity_world_rot'], best_match['quat_unity'])
 
-            if pos_error_xz > pos_threshold or rot_error > rot_threshold:
+            if pos_error > pos_threshold or rot_error > rot_threshold:
                 discrepancies.append({
                     'name': name,
-                    'pos_error_m': pos_error_xz,
+                    'pos_error_m': pos_error,
                     'rot_error_deg': rot_error,
                     'unity_pos': upos,
-                    'roblox_pos_as_unity': rpos,
+                    'roblox_pos_as_unity': best_match['pos_unity'],
                     'unity_rot': ue['unity_world_rot'],
                     'roblox_rot_as_unity': best_match['quat_unity'],
                     'path': best_match.get('path', ''),
