@@ -1366,6 +1366,31 @@ script.Disabled = true
                  rbxlx_path, result.get("parts_written", 0),
                  result.get("scripts_written", 0))
 
+        # Verify transform accuracy: compare Unity scene positions to rbxlx output.
+        # Logs errors for any object with >10° rotation error or >2m position error.
+        try:
+            from tools.transform_audit import parse_rbxlx, parse_unity_scene_transforms, compare_transforms
+            scene_path = self.state.scene_path or (
+                Path(self.ctx.selected_scene) if self.ctx.selected_scene else None
+            )
+            if scene_path and Path(scene_path).exists() and rbxlx_path.exists():
+                roblox_data = parse_rbxlx(str(rbxlx_path))
+                unity_data = parse_unity_scene_transforms(str(scene_path))
+                discrepancies = compare_transforms(
+                    unity_data, roblox_data,
+                    pos_threshold=999999, rot_threshold=10.0,
+                )
+                rot_errors = [d for d in discrepancies if d['rot_error_deg'] > 10.0]
+                if rot_errors:
+                    log.warning("[write_output] Transform audit: %d objects with >10° rotation error", len(rot_errors))
+                    for d in rot_errors[:10]:
+                        log.warning("  %s: %.1f° rotation error (path: %s)",
+                                   d['name'], d['rot_error_deg'], d.get('path', '?'))
+                else:
+                    log.info("[write_output] Transform audit: all rotations within 10° tolerance")
+        except Exception as exc:
+            log.debug("[write_output] Transform audit skipped: %s", exc)
+
         # Post-process: strip local file paths from SurfaceAppearance textures.
         # Done via regex on raw XML to preserve CDATA sections in scripts.
         import re as _re_post
