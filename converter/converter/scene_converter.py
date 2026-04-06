@@ -2889,13 +2889,11 @@ def _convert_prefab_instance(
 
     # Convert transform
     rx, ry, rz = unity_to_roblox_pos(*pos)
-    # .prefab instance rotations: the scene instance rotation (from modifications
-    # or prefab template default) already includes any FBX pre-rotation compensation.
-    # Both Unity and Roblox handle FBX Z-up→Y-up conversion during import, so the
-    # scene rotation maps directly to Roblox without stripping.
-    # (FBX-as-prefab instances are handled by _convert_fbx_prefab_instance which
-    # has its own strip logic.)
+    # Strip FBX pre-rotation if the root mesh has Z-up orientation baked in
     quat_for_roblox = rot
+    if hasattr(template, 'root') and template.root and template.root.mesh_guid:
+        from core.coordinate_system import strip_fbx_prerotation
+        quat_for_roblox = list(strip_fbx_prerotation(*rot))
     rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*quat_for_roblox)
     rot_mat = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
 
