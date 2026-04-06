@@ -1482,7 +1482,12 @@ def _process_components(
             # Adjust part size to capsule dimensions
             diameter = radius * 2 * config.STUDS_PER_METER
             part.size = (diameter, height * config.STUDS_PER_METER, diameter)
-            part.anchored = False  # Character controllers are physics-driven
+            # Unity CharacterController is the player avatar — Roblox handles
+            # this natively via Humanoid/StarterCharacter, so the converted Part
+            # must not block player movement.
+            part.anchored = True
+            part.can_collide = False
+            part.transparency = 1.0
 
         # -- SpriteRenderer: convert to thin Part with color --
         elif ct == "SpriteRenderer":
@@ -1938,14 +1943,37 @@ def _extract_monobehaviour_attributes(
                             cframe=RbxCFrame(x=0, y=0, z=0),
                             transparency=1.0,
                         )
+                        # Compute scale factor from FBX import settings.
+                        # sm["size"] is the native/initial size from Roblox;
+                        # we must apply globalScale * unit_ratio * STUDS_PER_METER
+                        # to get the correct visual size.
+                        import_scale = _get_fbx_import_scale(ref_guid, guid_index) if guid_index else 0.01
+                        unit_ratio = _get_fbx_unit_ratio(ref_guid, guid_index) if guid_index else 1.0
+                        # If the reference is a prefab, use the resolved mesh GUID
+                        if ref_path.suffix.lower() == ".prefab" and mesh_path != ref_path:
+                            mesh_guid_for_scale = None
+                            for g, p in guid_index._guid_to_path.items() if hasattr(guid_index, '_guid_to_path') else []:
+                                if p == mesh_path or str(p) == str(mesh_path):
+                                    mesh_guid_for_scale = g
+                                    break
+                            if mesh_guid_for_scale:
+                                import_scale = _get_fbx_import_scale(mesh_guid_for_scale, guid_index)
+                                unit_ratio = _get_fbx_unit_ratio(mesh_guid_for_scale, guid_index)
+                        scale_factor = import_scale * unit_ratio * config.STUDS_PER_METER
                         for sm in sub_meshes:
+                            native_size = (sm["size"][0], sm["size"][1], sm["size"][2])
                             mesh_part = RbxPart(
                                 name=sm["name"],
                                 class_name="MeshPart",
                                 cframe=RbxCFrame(x=0, y=0, z=0),
-                                size=(sm["size"][0], sm["size"][1], sm["size"][2]),
+                                size=(
+                                    native_size[0] * scale_factor,
+                                    native_size[1] * scale_factor,
+                                    native_size[2] * scale_factor,
+                                ),
                             )
                             mesh_part.mesh_id = sm["meshId"]
+                            mesh_part.initial_size = native_size
                             if sm.get("textureId"):
                                 mesh_part.texture_id = sm["textureId"]
                             model.children.append(mesh_part)

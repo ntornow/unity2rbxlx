@@ -1539,9 +1539,10 @@ script.Disabled = true
         has_character_controller = False
         has_cinemachine = False
         has_sub_emitters = False
+        has_pickups = False
 
         def _scan_parts(parts):
-            nonlocal has_animator, has_navmesh, has_character_controller, has_cinemachine, has_sub_emitters
+            nonlocal has_animator, has_navmesh, has_character_controller, has_cinemachine, has_sub_emitters, has_pickups
             for part in parts:
                 attrs = getattr(part, "attributes", {})
                 if attrs.get("HasAnimator"):
@@ -1552,6 +1553,8 @@ script.Disabled = true
                     has_character_controller = True
                 if attrs.get("CinemachineVCam"):
                     has_cinemachine = True
+                if attrs.get("IsPickup"):
+                    has_pickups = True
                 # Check particle emitters for sub-emitter attributes
                 for pe in getattr(part, "particle_emitters", None) or []:
                     pe_attrs = getattr(pe, "attributes", {})
@@ -1577,6 +1580,18 @@ script.Disabled = true
             modules_to_inject.append(("CharacterBridge", "physics_bridge.luau"))
         if has_sub_emitters:
             modules_to_inject.append(("SubEmitterRuntime", "sub_emitter_runtime.luau"))
+        if has_pickups:
+            pickup_path = runtime_dir / "pickup_runtime.luau"
+            if pickup_path.exists():
+                source = pickup_path.read_text(encoding="utf-8")
+                existing = [s for s in self.state.rbx_place.scripts if s.name == "PickupRuntime"]
+                if not existing:
+                    self.state.rbx_place.scripts.append(RbxScript(
+                        name="PickupRuntime",
+                        source=source,
+                        script_type="Script",
+                    ))
+                    injected += 1
         if has_cinemachine:
             # Cinemachine is a LocalScript (runs on client for camera control)
             cinemachine_path = runtime_dir / "cinemachine_runtime.luau"

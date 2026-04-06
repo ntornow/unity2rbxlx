@@ -6622,6 +6622,68 @@ def _fix_missing_end_keywords(name: str, source: str, fixes: list[str]) -> str:
     # and it removes valid `end` keywords, causing syntax errors.
     # source = _remove_excess_trailing_ends(source, fixes)
 
+    # Fix unclosed `do` blocks: scan for bare `do` lines and ensure
+    # they have a matching `end` before the next top-level statement.
+    # We track ALL block openers/closers (not just `do`) so that inner
+    # `end` keywords (e.g. closing an `if` inside a `do`) don't falsely
+    # consume the `do` block's closer.
+    lines = source.split('\n')
+    fixed_lines = []
+    do_stack = []  # (line_index, indent) of open do blocks
+    inner_depth = 0  # depth of non-do block openers inside a do block
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip()) if line.strip() else 0
+        if stripped.startswith('--'):
+            fixed_lines.append(line)
+            continue
+
+        code_part = re.sub(r'\s*--.*$', '', stripped).rstrip()
+
+        # Track do blocks and inner block openers/closers
+        if stripped == 'do':
+            do_stack.append((i, indent))
+            inner_depth = 0
+        elif do_stack:
+            # Count inner block openers (if/then, for/do, while/do, function, repeat)
+            if (re.match(r'if\b.+\bthen\s*$', code_part) or
+                    re.match(r'for\b.+\bdo\s*$', code_part) or
+                    re.match(r'while\b.+\bdo\s*$', code_part) or
+                    re.search(r'\brepeat\s*$', code_part)):
+                inner_depth += 1
+            if re.search(r'\bfunction\s*[\w.:(]', code_part):
+                func_count = len(re.findall(r'\bfunction\s*[\w.:(]', code_part))
+                end_count_inline = len(re.findall(r'\bend\b', code_part))
+                inner_depth += max(0, func_count - end_count_inline)
+            # Count closers
+            if stripped in ('end', 'end)', 'end,') or stripped.startswith('end '):
+                if inner_depth > 0:
+                    inner_depth -= 1
+                else:
+                    # This end closes the do block
+                    do_stack.pop()
+
+        # If we hit a top-level statement and there's an unclosed do block
+        # at the same or lower indent, insert end before this line.
+        # Skip when the current line is `do` (we just pushed it).
+        if (do_stack and stripped != 'do' and not stripped.startswith('end')
+                and stripped and not stripped.startswith('--')):
+            while do_stack and do_stack[-1][1] >= indent:
+                do_indent = do_stack.pop()[1]
+                fixed_lines.append(' ' * do_indent + 'end')
+                fixes.append("Added missing end for do block")
+                inner_depth = 0
+
+        fixed_lines.append(line)
+
+    # Close any remaining do blocks
+    while do_stack:
+        do_indent = do_stack.pop()[1]
+        fixed_lines.append(' ' * do_indent + 'end')
+        fixes.append("Added missing end for do block")
+
+    source = '\n'.join(fixed_lines)
+
     # Final pass: fix `end` → `end)` for `:Connect(function(` blocks
     # Uses indentation matching: the closing `end` for a Connect(function block
     # should be at the same indent level as the Connect line's body indent minus one level
@@ -6668,6 +6730,8 @@ def _append_missing_trailing_ends(source: str, fixes: list[str]) -> str:
         if re.match(r'for\b.+\bdo\s*$', code_part):
             depth += 1
         if re.match(r'while\b.+\bdo\s*$', code_part):
+            depth += 1
+        if code_part == 'do':
             depth += 1
         if code_part == 'repeat':
             depth += 1
@@ -6719,6 +6783,8 @@ def _remove_excess_end_keywords(source: str, fixes: list[str]) -> str:
         if re.match(r'for\b.+\bdo\s*$', code_part):
             depth += 1
         if re.match(r'while\b.+\bdo\s*$', code_part):
+            depth += 1
+        if code_part == 'do':
             depth += 1
         if code_part == 'repeat':
             depth += 1
