@@ -334,16 +334,20 @@ def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
     source = _inject_utility_functions(name, source, fixes)
     source = _disable_broken_scripts(name, source, fixes)
 
-    # Remove duplicate trailing return statements
+    # Remove duplicate trailing return statements (may have blank lines between)
     lines = source.rstrip().split('\n')
-    while len(lines) >= 2:
-        last = lines[-1].strip()
-        prev = lines[-2].strip()
-        if last.startswith('return ') and prev.startswith('return '):
-            lines.pop()
-            fixes.append("Removed duplicate trailing return")
-        else:
+    returns_at_end = []
+    for i in range(len(lines) - 1, max(len(lines) - 10, -1), -1):
+        s = lines[i].strip()
+        if s.startswith('return '):
+            returns_at_end.append(i)
+        elif s:  # non-empty, non-return line — stop
             break
+    if len(returns_at_end) > 1:
+        # Keep the first return (earliest in file), remove the rest
+        for idx in returns_at_end[:-1]:  # remove all except the last (earliest)
+            lines[idx] = ''
+        fixes.append("Removed duplicate trailing return")
     source = '\n'.join(lines) + '\n'
 
     return source, fixes

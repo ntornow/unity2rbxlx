@@ -627,8 +627,10 @@ local function findSpawnPoint()
             if not firstSpawn then
                 firstSpawn = obj
             end
-            -- Prefer "SpawnPoint" (no number) as the default initial spawn
+            -- Prefer named spawn points: "SpawnPoint" (default) or "SpawnPoint (1)" (backup)
             if obj.Name == "SpawnPoint" then
+                defaultSpawn = obj
+            elseif obj.Name == "SpawnPoint (1)" and not defaultSpawn then
                 defaultSpawn = obj
             end
         end
