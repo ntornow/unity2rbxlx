@@ -278,7 +278,7 @@ def encode_smooth_grid(
         # objects at the same height; Roblox terrain voxels do.
         # Use max(0, ...) to preserve terrain at sea level for collision.
         raw_h = sample_height(gx * VOXEL_SIZE, gz * VOXEL_SIZE)
-        h_studs = max(0.0, raw_h - 1.0)
+        h_studs = max(0.0, raw_h - VOXEL_SIZE / 2)
         voxel_bottom = gy * VOXEL_SIZE
         voxel_top = voxel_bottom + VOXEL_SIZE
 
