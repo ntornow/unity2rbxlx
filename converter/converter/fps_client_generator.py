@@ -611,22 +611,28 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 
 -- Find the best spawn point in workspace
+-- Prefer the default/unnumbered spawn point (matches Unity's initial spawn)
 local function findSpawnPoint()
-    -- Look for SpawnLocation first
+    local firstSpawn = nil
+    local defaultSpawn = nil
+
     for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("SpawnLocation") then
-            return obj.CFrame + Vector3.new(0, 3, 0)
-        end
-    end
-    -- Fallback: look for parts named "SpawnPoint" or with IsSpawnPoint attribute
-    for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("BasePart") then
-            if obj:GetAttribute("IsSpawnPoint") or string.find(string.lower(obj.Name), "spawn") then
-                return obj.CFrame + Vector3.new(0, 3, 0)
+        if obj:IsA("SpawnLocation") or (obj:IsA("BasePart") and
+            (obj:GetAttribute("IsSpawnPoint") or obj.Name:lower():find("spawn"))) then
+            if not firstSpawn then
+                firstSpawn = obj
+            end
+            -- Prefer "SpawnPoint" (no number) as the default initial spawn
+            if obj.Name == "SpawnPoint" then
+                defaultSpawn = obj
             end
         end
     end
-    -- Default spawn above origin
+
+    local chosen = defaultSpawn or firstSpawn
+    if chosen then
+        return chosen.CFrame + Vector3.new(0, 3, 0)
+    end
     return CFrame.new(0, 10, 0)
 end
 
