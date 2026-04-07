@@ -2679,6 +2679,7 @@ def _convert_fbx_prefab_instance(
     part.attributes["_ScaleY"] = abs(combined_scale[1]) * _sf2
     part.attributes["_ScaleZ"] = abs(combined_scale[2]) * _sf2
 
+    _apply_gameplay_attributes(part, name)
     return [part]
 
 

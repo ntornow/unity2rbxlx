@@ -1491,13 +1491,23 @@ script.Disabled = true
                             script_classes.add(val)
 
                 for class_name in script_classes:
-                    if class_name in script_by_name and class_name not in bound_script_names:
+                    if class_name in script_by_name:
                         script = script_by_name[class_name]
                         # Only bind Server scripts and LocalScripts to parts
                         # ModuleScripts stay in ReplicatedStorage for require()
                         if script.script_type != "ModuleScript":
-                            part.scripts.append(script)
-                            bound_script_names.add(class_name)
+                            # Clone the script for each instance so all prefab
+                            # variants get their inherited MonoBehaviour scripts
+                            if class_name in bound_script_names:
+                                clone = RbxScript(
+                                    name=script.name,
+                                    source=script.source,
+                                    script_type=script.script_type,
+                                )
+                                part.scripts.append(clone)
+                            else:
+                                part.scripts.append(script)
+                                bound_script_names.add(class_name)
                             bound_count += 1
                             log.debug("[write_output]   Bound '%s' to part '%s'",
                                       class_name, part.name)
@@ -1564,10 +1574,10 @@ script.Disabled = true
         has_character_controller = False
         has_cinemachine = False
         has_sub_emitters = False
-        has_pickups = False
+        # has_pickups removed — scripts propagated automatically now
 
         def _scan_parts(parts):
-            nonlocal has_animator, has_navmesh, has_character_controller, has_cinemachine, has_sub_emitters, has_pickups
+            nonlocal has_animator, has_navmesh, has_character_controller, has_cinemachine, has_sub_emitters
             for part in parts:
                 attrs = getattr(part, "attributes", {})
                 if attrs.get("HasAnimator"):
@@ -1578,8 +1588,7 @@ script.Disabled = true
                     has_character_controller = True
                 if attrs.get("CinemachineVCam"):
                     has_cinemachine = True
-                if attrs.get("IsPickup"):
-                    has_pickups = True
+                # IsPickup detection removed — scripts propagated automatically
                 # Check particle emitters for sub-emitter attributes
                 for pe in getattr(part, "particle_emitters", None) or []:
                     pe_attrs = getattr(pe, "attributes", {})
@@ -1605,18 +1614,8 @@ script.Disabled = true
             modules_to_inject.append(("CharacterBridge", "physics_bridge.luau"))
         if has_sub_emitters:
             modules_to_inject.append(("SubEmitterRuntime", "sub_emitter_runtime.luau"))
-        if has_pickups:
-            pickup_path = runtime_dir / "pickup_runtime.luau"
-            if pickup_path.exists():
-                source = pickup_path.read_text(encoding="utf-8")
-                existing = [s for s in self.state.rbx_place.scripts if s.name == "PickupRuntime"]
-                if not existing:
-                    self.state.rbx_place.scripts.append(RbxScript(
-                        name="PickupRuntime",
-                        source=source,
-                        script_type="Script",
-                    ))
-                    injected += 1
+        # PickupRuntime removed — pickup scripts are now properly propagated
+        # from base prefabs to variants via _bind_scripts_to_parts cloning.
         if has_cinemachine:
             # Cinemachine is a LocalScript (runs on client for camera control)
             cinemachine_path = runtime_dir / "cinemachine_runtime.luau"
