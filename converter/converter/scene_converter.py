@@ -1097,10 +1097,12 @@ def _convert_node(
     rx, ry, rz = unity_to_roblox_pos(wx, wy, wz)
 
     # -- Rotation --
-    # Scene node rotations include any FBX-internal transforms (PreRotation,
-    # axis conversion) baked by Unity.  Roblox also bakes these into mesh
-    # vertices during import.  The rotation maps directly with handedness flip.
     quat = tuple(world_rot)
+    if node.mesh_guid and guid_index:
+        asset_path = guid_index.resolve(node.mesh_guid)
+        if asset_path and asset_path.suffix.lower() in ('.fbx', '.obj'):
+            from core.coordinate_system import strip_fbx_prerotation
+            quat = strip_fbx_prerotation(*quat)
     rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*quat)
     rot = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
 
@@ -2606,14 +2608,9 @@ def _convert_fbx_prefab_instance(
         elif pp == "m_LocalScale.z": scl[2] = fval
 
     rx, ry, rz = unity_to_roblox_pos(*pos)
-    # FBX-as-prefab: check UpAxis to decide stripping
-    from core.coordinate_system import is_yup_fbx
-    if is_yup_fbx(fbx_path):
-        rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*rot)
-    else:
-        from core.coordinate_system import strip_fbx_prerotation
-        stripped = strip_fbx_prerotation(*rot)
-        rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*stripped)
+    from core.coordinate_system import strip_fbx_prerotation
+    stripped_rot = strip_fbx_prerotation(*rot)
+    rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*stripped_rot)
     rot_mat = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
 
     # Mesh pivot vertical correction
@@ -2891,25 +2888,15 @@ def _convert_prefab_instance(
                     custom_field_overrides[pp] = val
 
     # Convert transform.
-    # Y-up FBX: Roblox bakes all FBX-internal transforms into vertices →
-    #   scene rotation is pure designer placement → just handedness flip
-    # Z-up FBX: Unity bakes -90°X axis conversion into the prefab root
-    #   rotation. Roblox also bakes the axis conversion into vertices.
-    #   Must strip the -90°X to avoid double-applying.
+    # The prefab root rotation may contain FBX internal transforms (axis
+    # conversion, Lcl Rotation) that Roblox bakes into mesh vertices.
+    # Use heuristic strip to detect and remove the -90°X component.
+    # This works for both Y-up and Z-up FBX files at the root level.
     rx, ry, rz = unity_to_roblox_pos(*pos)
     quat_for_roblox = rot
-    if hasattr(template, 'root') and template.root and template.root.mesh_guid and guid_index:
-        _fbx = guid_index.resolve(template.root.mesh_guid)
-        if _fbx and _fbx.suffix.lower() in ('.fbx', '.obj'):
-            from core.coordinate_system import is_yup_fbx
-            if is_yup_fbx(_fbx):
-                pass  # Y-up: no strip needed
-            else:
-                from core.coordinate_system import strip_fbx_prerotation
-                quat_for_roblox = list(strip_fbx_prerotation(*rot))  # Z-up: strip axis conv
-        else:
-            from core.coordinate_system import strip_fbx_prerotation
-            quat_for_roblox = list(strip_fbx_prerotation(*rot))  # fallback
+    if hasattr(template, 'root') and template.root and template.root.mesh_guid:
+        from core.coordinate_system import strip_fbx_prerotation
+        quat_for_roblox = list(strip_fbx_prerotation(*rot))
     rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*quat_for_roblox)
     rot_mat = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
 
