@@ -45,6 +45,38 @@ def _quat_multiply(
 _FBX_PREROT_INV = (math.sin(math.radians(45)), 0.0, 0.0, math.cos(math.radians(45)))
 
 
+_fbx_upaxis_cache: dict[str, int] = {}
+
+
+def _read_fbx_up_axis(fbx_path) -> int:
+    """Read UpAxis from FBX binary. Returns 0=X, 1=Y, 2=Z, -1=unknown."""
+    from pathlib import Path
+    try:
+        data = Path(fbx_path).read_bytes()
+        idx = data.find(b'UpAxis')
+        if idx < 0:
+            return -1
+        search = data[idx:idx + 100]
+        for i in range(len(search) - 5):
+            if search[i:i + 1] == b'I':
+                val = int.from_bytes(search[i + 1:i + 5], 'little')
+                if val in (0, 1, 2):
+                    return val
+    except Exception:
+        pass
+    return -1
+
+
+def is_yup_fbx(fbx_path) -> bool:
+    """Check if an FBX file uses Y-up coordinate system."""
+    if fbx_path is None:
+        return False
+    key = str(fbx_path)
+    if key not in _fbx_upaxis_cache:
+        _fbx_upaxis_cache[key] = _read_fbx_up_axis(fbx_path)
+    return _fbx_upaxis_cache[key] == 1
+
+
 def needs_fbx_prerotation_strip(
     qx: float, qy: float, qz: float, qw: float,
 ) -> bool:
