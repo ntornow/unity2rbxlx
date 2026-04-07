@@ -1358,11 +1358,19 @@ def _process_components(
                         max(part.size[2], adjusted_size[2]),
                     )
                 part.can_collide = can_collide
-                # Apply collider center offset to part CFrame position
+                # Apply collider center offset to part CFrame position.
+                # Skip for Y-up FBX meshes where Roblox bakes mesh positions.
                 if center_offset != (0.0, 0.0, 0.0):
-                    part.cframe.x += center_offset[0]
-                    part.cframe.y += center_offset[1]
-                    part.cframe.z += center_offset[2]
+                    _skip_center = False
+                    if hasattr(node, 'mesh_guid') and node.mesh_guid and guid_index:
+                        _co_fbx = guid_index.resolve(node.mesh_guid)
+                        if _co_fbx and _co_fbx.suffix.lower() in ('.fbx', '.obj'):
+                            from core.coordinate_system import is_yup_fbx
+                            _skip_center = is_yup_fbx(_co_fbx)
+                    if not _skip_center:
+                        part.cframe.x += center_offset[0]
+                        part.cframe.y += center_offset[1]
+                        part.cframe.z += center_offset[2]
 
                 # MeshCollider → set CollisionFidelity based on convex flag
                 if ct == "MeshCollider":
