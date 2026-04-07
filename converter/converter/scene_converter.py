@@ -540,6 +540,16 @@ def _compose_parts_with_parent_cframe(
     then adds the parent's world position. Also composes rotation matrices.
     """
     for part in parts:
+        # Skip parts already in world-space from _convert_prefab_node
+        if getattr(part, '_world_composed', False):
+            # Still recurse into children that might need composition
+            if hasattr(part, 'children') and part.children:
+                _compose_parts_with_parent_cframe(
+                    part.children, px, py, pz,
+                    pr00, pr01, pr02, pr10, pr11, pr12, pr20, pr21, pr22,
+                    has_rotation,
+                )
+            continue
         if hasattr(part, 'cframe') and part.cframe:
             cx = part.cframe.x or 0
             cy = part.cframe.y or 0
@@ -3508,6 +3518,8 @@ def _convert_prefab_node(
         if child_part:
             part.children.append(child_part)
 
+    # Mark as already in world-space so composition pass doesn't double-apply
+    part._world_composed = True
     return part
 
 
