@@ -282,7 +282,10 @@ def encode_smooth_grid(
         # but always keep at least a thin surface (1 stud) when Unity
         # has terrain at this location (raw_h >= 0). This ensures
         # ground exists even at sea level (height 0).
-        h_studs = max(1.0, raw_h - VOXEL_SIZE / 2) if raw_h > 0 else 0.0
+        # Ensure terrain exists everywhere within the heightmap bounds,
+        # even at sea level (height 0). Unity terrain always has a surface;
+        # Roblox needs at least a thin voxel for collision.
+        h_studs = max(1.0, raw_h - VOXEL_SIZE / 2)
         voxel_bottom = gy * VOXEL_SIZE
         voxel_top = voxel_bottom + VOXEL_SIZE
 
