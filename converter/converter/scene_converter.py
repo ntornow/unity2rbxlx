@@ -2756,10 +2756,13 @@ def _convert_prefab_instance(
         if target_fid and target_fid != "0" and target_fid != root_target_fid:
             child_modifications.setdefault(target_fid, []).append(mod)
 
-    # Extract position/rotation/scale and additional properties from modifications
-    pos = [0.0, 0.0, 0.0]
-    rot = [0.0, 0.0, 0.0, 1.0]
-    scl = [1.0, 1.0, 1.0]
+    # Extract position/rotation/scale from modifications.
+    # Default to prefab template root transform so instances without
+    # scene overrides use the correct base transform.
+    _tr = template.root if hasattr(template, 'root') and template.root else None
+    pos = list(_tr.position) if _tr and hasattr(_tr, 'position') else [0.0, 0.0, 0.0]
+    rot = list(_tr.rotation) if _tr and hasattr(_tr, 'rotation') else [0.0, 0.0, 0.0, 1.0]
+    scl = list(_tr.scale) if _tr and hasattr(_tr, 'scale') else [1.0, 1.0, 1.0]
     name_override = None
     material_override_guid: str | None = None
     is_static = False
