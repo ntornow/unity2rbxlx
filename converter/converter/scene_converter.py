@@ -3252,11 +3252,11 @@ def _convert_prefab_node(
                     node_rot = [0.0, 0.0, 0.0, 1.0]  # Y-up: all baked
                     world_pos = list(pp)               # position also baked
                 else:
-                    from core.coordinate_system import strip_fbx_prerotation
-                    node_rot = list(strip_fbx_prerotation(*local_rot))  # Z-up: strip axis conv
+                    from core.coordinate_system import strip_fbx_prerotation_left
+                    node_rot = list(strip_fbx_prerotation_left(*local_rot))  # Z-up child: left-strip
             else:
-                from core.coordinate_system import strip_fbx_prerotation
-                node_rot = list(strip_fbx_prerotation(*local_rot))  # fallback
+                from core.coordinate_system import strip_fbx_prerotation_left
+                node_rot = list(strip_fbx_prerotation_left(*local_rot))  # fallback: left-strip
 
         # Compose rotations (parent * child)
         world_rot = _quat_multiply(pr, node_rot)
@@ -3284,8 +3284,8 @@ def _convert_prefab_node(
                     from core.coordinate_system import strip_fbx_prerotation
                     local_rot = list(strip_fbx_prerotation(*local_rot))
             else:
-                from core.coordinate_system import strip_fbx_prerotation
-                local_rot = list(strip_fbx_prerotation(*local_rot))
+                from core.coordinate_system import strip_fbx_prerotation_left
+                local_rot = list(strip_fbx_prerotation_left(*local_rot))
 
     rx, ry, rz = unity_to_roblox_pos(*local_pos)
 

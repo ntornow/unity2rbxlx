@@ -94,19 +94,27 @@ def needs_fbx_prerotation_strip(
 def strip_fbx_prerotation(
     qx: float, qy: float, qz: float, qw: float,
 ) -> tuple[float, float, float, float]:
-    """Remove the FBX -90° X pre-rotation from a Unity quaternion.
+    """Remove the FBX -90° X pre-rotation (right-multiply).
 
-    FBX meshes authored in Z-up tools (3ds Max, Blender default) include a
-    -90° X pre-rotation in the FBX root node to convert to Y-up.  Unity bakes
-    this into the scene rotation, but Roblox applies it during mesh import.
-    Stripping it avoids double-rotation (e.g. planes pointing nose-down).
-
-    Only strips when the rotation actually contains the pre-rotation
-    (detected by local-Z mapping to world-Y).
+    Use for ROOT-level rotations where full = DESIGNER * PREROT.
+    Computes: DESIGNER = full * inv(PREROT).
     """
     if not needs_fbx_prerotation_strip(qx, qy, qz, qw):
         return (qx, qy, qz, qw)
     return _quat_multiply((qx, qy, qz, qw), _FBX_PREROT_INV)
+
+
+def strip_fbx_prerotation_left(
+    qx: float, qy: float, qz: float, qw: float,
+) -> tuple[float, float, float, float]:
+    """Remove the FBX -90° X pre-rotation (left-multiply).
+
+    Use for CHILD-level rotations where full = PREROT * DESIGNER.
+    Computes: DESIGNER = inv(PREROT) * full.
+    """
+    if not needs_fbx_prerotation_strip(qx, qy, qz, qw):
+        return (qx, qy, qz, qw)
+    return _quat_multiply(_FBX_PREROT_INV, (qx, qy, qz, qw))
 
 
 def unity_quat_to_roblox_quat(
