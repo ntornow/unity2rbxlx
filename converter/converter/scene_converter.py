@@ -3002,7 +3002,7 @@ def _convert_prefab_instance(
             # apply parent transforms to children like Unity does).
             child_part = _convert_prefab_node(
                 child, guid_index, material_mappings, uploaded_assets,
-                parent_pos=pos, parent_rot=rot, parent_scl=scl,
+                parent_pos=pos, parent_rot=quat_for_roblox, parent_scl=scl,
                 child_modifications=child_modifications,
                 disabled_components=disabled_components,
             )
