@@ -3247,6 +3247,7 @@ def _convert_prefab_node(
                 from core.coordinate_system import is_yup_fbx
                 if is_yup_fbx(_fbx):
                     node_rot = [0.0, 0.0, 0.0, 1.0]  # Y-up: all baked
+                    world_pos = list(pp)               # position also baked
                 else:
                     from core.coordinate_system import strip_fbx_prerotation
                     node_rot = list(strip_fbx_prerotation(*local_rot))  # Z-up: strip axis conv
