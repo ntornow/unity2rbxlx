@@ -3021,9 +3021,9 @@ def _convert_prefab_instance(
     # Collect prefab instances that use water shaders as water regions
     root = template.root
     if _is_water_node(root, material_mappings, guid_index):
-        # Compose instance scale with prefab root's internal scale
-        root_scl = root.scale
-        composed_scl = (scl[0] * root_scl[0], scl[1] * root_scl[1], scl[2] * root_scl[2])
+        # Use the instance scale directly — it already includes the prefab
+        # root's scale (via template defaults or scene modification overrides).
+        composed_scl = (scl[0], scl[1], scl[2])
         region = _extract_water_region_from_prefab(pos, composed_scl, name)
         _water_regions.append(region)
         log.info("Detected water prefab '%s' at (%.1f, %.1f, %.1f), size (%.1f, %.1f, %.1f)",

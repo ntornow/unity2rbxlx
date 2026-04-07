@@ -732,16 +732,38 @@ def _generate_water_fill_script(water_regions: list) -> str:
         "",
     ]
 
+    MAX_FILL = 2048.0  # Roblox FillBlock max per axis
+
     for i, region in enumerate(water_regions):
         pos = region.position
         size = region.size
         name = getattr(region, "name", "") or f"water_{i}"
         lines.append(f"-- Water region: {name}")
-        lines.append(
-            f"terrain:FillBlock(CFrame.new({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}), "
-            f"Vector3.new({size[0]:.2f}, {size[1]:.2f}, {size[2]:.2f}), "
-            f"Enum.Material.Water)"
-        )
+
+        # Cap size and split into chunks if needed
+        sx = min(abs(size[0]), MAX_FILL * 20)  # reasonable cap
+        sy = min(abs(size[1]), MAX_FILL)
+        sz = min(abs(size[2]), MAX_FILL * 20)
+
+        # Split into MAX_FILL-sized chunks
+        import math
+        nx = max(1, math.ceil(sx / MAX_FILL))
+        nz = max(1, math.ceil(sz / MAX_FILL))
+        chunk_sx = sx / nx
+        chunk_sz = sz / nz
+
+        start_x = pos[0] - sx / 2 + chunk_sx / 2
+        start_z = pos[2] - sz / 2 + chunk_sz / 2
+
+        for ix in range(nx):
+            for iz in range(nz):
+                cx = start_x + ix * chunk_sx
+                cz = start_z + iz * chunk_sz
+                lines.append(
+                    f"terrain:FillBlock(CFrame.new({cx:.2f}, {pos[1]:.2f}, {cz:.2f}), "
+                    f"Vector3.new({chunk_sx:.2f}, {sy:.2f}, {chunk_sz:.2f}), "
+                    f"Enum.Material.Water)"
+                )
         lines.append("")
 
     lines.append(f'print("Water fill complete: {len(water_regions)} region(s)")')
