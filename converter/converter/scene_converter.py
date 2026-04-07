@@ -3289,9 +3289,13 @@ def _convert_prefab_node(
 
     rx, ry, rz = unity_to_roblox_pos(*local_pos)
 
-    # Mesh pivot vertical correction (same as _convert_node)
+    # Mesh pivot vertical correction — skip for Y-up FBX (Roblox bakes position)
     if node.mesh_guid and guid_index:
-        ry += _compute_mesh_vertical_offset(node.mesh_guid, guid_index, local_scl[1])
+        _fbx_off = guid_index.resolve(node.mesh_guid)
+        from core.coordinate_system import is_yup_fbx
+        _is_yup = _fbx_off and _fbx_off.suffix.lower() in ('.fbx', '.obj') and is_yup_fbx(_fbx_off)
+        if not _is_yup:
+            ry += _compute_mesh_vertical_offset(node.mesh_guid, guid_index, local_scl[1])
 
     quat_for_roblox = local_rot
     rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*quat_for_roblox)
