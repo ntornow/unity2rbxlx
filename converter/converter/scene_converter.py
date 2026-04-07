@@ -2577,6 +2577,7 @@ def _convert_fbx_prefab_instance(
     scl = [1.0, 1.0, 1.0]
     name_override = None
 
+    material_guids = []  # Material GUIDs from scene modifications
     for mod in pi.modifications:
         if not isinstance(mod, dict):
             continue
@@ -2591,6 +2592,14 @@ def _convert_fbx_prefab_instance(
                     return []
             except (ValueError, TypeError):
                 pass
+            continue
+        # Extract material overrides
+        if pp.startswith("m_Materials.Array.data["):
+            obj_ref = mod.get("objectReference", {})
+            if isinstance(obj_ref, dict):
+                mg = obj_ref.get("guid", "")
+                if mg and mg != "0" * 32:
+                    material_guids.append(mg)
             continue
         try:
             fval = float(val)
@@ -2679,8 +2688,67 @@ def _convert_fbx_prefab_instance(
     part.attributes["_ScaleY"] = abs(combined_scale[1]) * _sf2
     part.attributes["_ScaleZ"] = abs(combined_scale[2]) * _sf2
 
+    # Apply materials: first try scene modifications, then FBX directory textures
+    _mat_applied = False
+    if material_guids and material_mappings:
+        for mg in material_guids:
+            if mg in material_mappings:
+                mat = material_mappings[mg]
+                _apply_material_to_part(part, mat, uploaded_assets)
+                _mat_applied = True
+                break
+
+    if not _mat_applied and uploaded_assets:
+        # Find textures co-located with the FBX file
+        from core.roblox_types import RbxSurfaceAppearance
+        fbx_dir = str(fbx_path.parent) if fbx_path else ""
+        color_url = ""
+        normal_url = ""
+        for asset_key, asset_url in uploaded_assets.items():
+            if fbx_dir and asset_key.startswith(fbx_dir.replace(str(guid_index.project_root) + "/", "").replace(str(guid_index.project_root), "") if guid_index else ""):
+                lower = asset_key.lower()
+                if any(ext in lower for ext in ('.png', '.psd', '.tga', '.jpg', '.bmp')):
+                    if '_n.' in lower or '_normal' in lower or 'normal' in lower:
+                        normal_url = asset_url
+                    elif not color_url:
+                        color_url = asset_url
+        if color_url:
+            part.surface_appearance = RbxSurfaceAppearance(
+                color_map=color_url,
+                normal_map=normal_url,
+            )
+
     _apply_gameplay_attributes(part, name)
     return [part]
+
+
+def _apply_material_to_part(part, mat_mapping, uploaded_assets):
+    """Apply a material mapping to a part, creating SurfaceAppearance if textures exist."""
+    from core.roblox_types import RbxSurfaceAppearance
+    color_map = ""
+    normal_map = ""
+    if hasattr(mat_mapping, 'textures'):
+        for tex_name, tex_info in (mat_mapping.textures or {}).items():
+            if not isinstance(tex_info, dict):
+                continue
+            tex_guid = tex_info.get("guid", "")
+            if not tex_guid:
+                continue
+            # Find uploaded URL
+            for asset_key, asset_url in (uploaded_assets or {}).items():
+                if tex_guid in asset_key or asset_key.endswith(tex_guid):
+                    if "main" in tex_name.lower() or "albedo" in tex_name.lower() or "diffuse" in tex_name.lower() or tex_name == "_MainTex":
+                        color_map = asset_url
+                    elif "normal" in tex_name.lower() or "bump" in tex_name.lower():
+                        normal_map = asset_url
+                    break
+
+    if color_map or normal_map:
+        sa = RbxSurfaceAppearance(
+            color_map=color_map,
+            normal_map=normal_map,
+        )
+        part.surface_appearance = sa
 
 
 def _convert_prefab_instance(
