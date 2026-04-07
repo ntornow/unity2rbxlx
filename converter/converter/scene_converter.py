@@ -194,6 +194,8 @@ _terrain_world_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
 # Cache for mesh vertical offsets: mesh_guid -> offset_studs
 _mesh_vertical_offset_cache: dict[str, float] = {}
 
+# Scene transform mapping: transform fileID → node fileID (set during conversion)
+_scene_xform_fids: set[str] = set()
 
 def _compute_mesh_vertical_offset(
     mesh_guid: str,
@@ -654,6 +656,10 @@ def convert_scene(
     # Set module-level mesh hierarchies for sub-mesh resolution
     global _mesh_hierarchies
     _mesh_hierarchies = mesh_hierarchies or {}
+
+    # Store scene transform fileIDs for nested instance detection
+    global _scene_xform_fids
+    _scene_xform_fids = set(parsed_scene.transform_fid_to_go_fid.keys()) if hasattr(parsed_scene, 'transform_fid_to_go_fid') else set()
 
     # Identify Canvas nodes so we can exclude them from workspace conversion
     # (they're handled separately by the UI translator).
@@ -2977,8 +2983,17 @@ def _convert_prefab_instance(
     rx, ry, rz = unity_to_roblox_pos(*pos)
     quat_for_roblox = rot
     if hasattr(template, 'root') and template.root and template.root.mesh_guid:
-        from core.coordinate_system import strip_fbx_prerotation
-        quat_for_roblox = list(strip_fbx_prerotation(*rot))
+        # Determine strip direction: nested instances (parent inside another
+        # prefab) use left-strip because their rotation is in the parent's
+        # prerotated space. Top-level instances use right-strip.
+        _parent_fid = str(getattr(pi, 'transform_parent_file_id', '') or '')
+        _is_nested = bool(_parent_fid and _parent_fid not in _scene_xform_fids)
+        if _is_nested:
+            from core.coordinate_system import strip_fbx_prerotation_left
+            quat_for_roblox = list(strip_fbx_prerotation_left(*rot))
+        else:
+            from core.coordinate_system import strip_fbx_prerotation
+            quat_for_roblox = list(strip_fbx_prerotation(*rot))
     rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*quat_for_roblox)
     rot_mat = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
 
