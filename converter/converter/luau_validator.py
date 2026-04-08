@@ -157,6 +157,7 @@ def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
         Tuple of (fixed_source, list_of_fixes_applied).
     """
     fixes: list[str] = []
+    _had_trailing_newline = source.endswith('\n')
 
     source = _strip_leading_prose(name, source, fixes)
     source = _fix_runtime_script_creation(name, source, fixes)
@@ -348,7 +349,9 @@ def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
         for idx in returns_at_end[:-1]:  # remove all except the last (earliest)
             lines[idx] = ''
         fixes.append("Removed duplicate trailing return")
-    source = '\n'.join(lines) + '\n'
+    source = '\n'.join(lines)
+    if _had_trailing_newline:
+        source += '\n'
 
     return source, fixes
 
@@ -7401,6 +7404,10 @@ def fix_gameplay_patterns(name: str, source: str) -> tuple[str, list[str]]:
             '(obj.Name == "DoorTrigger" or obj.Name == "trigger" or obj.Name == "base")'
         )
         fixes.append("Fixed door trigger detection to match actual part names")
+
+    # Preserve original trailing whitespace — don't add or remove newlines
+    if not original.endswith('\n') and source.endswith('\n'):
+        source = source.rstrip('\n')
 
     if source != original:
         return source, fixes
