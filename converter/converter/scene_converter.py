@@ -3096,6 +3096,33 @@ def _convert_prefab_instance(
             # Apply materials to the root MeshPart/Part
             _apply_prefab_materials(root, part, material_mappings)
         else:
+            # For Model containers with Y-up mesh children, apply the first
+            # child's vertical offset to the Model so the assembly sits on
+            # the ground instead of partially underground.
+            _model_y_offset = 0.0
+            if guid_index:
+                # Find first mesh child (may be nested under sub-Models)
+                def _find_first_mesh(node):
+                    for c in node.children:
+                        if c.mesh_guid:
+                            return c
+                        r = _find_first_mesh(c)
+                        if r:
+                            return r
+                    return None
+                _first_mesh = _find_first_mesh(root)
+                if _first_mesh:
+                    _mc_fbx = guid_index.resolve(_first_mesh.mesh_guid)
+                    if _mc_fbx and _mc_fbx.suffix.lower() in ('.fbx', '.obj'):
+                        from core.coordinate_system import is_yup_fbx
+                        if is_yup_fbx(_mc_fbx):
+                            _model_y_offset = _compute_mesh_vertical_offset(_first_mesh.mesh_guid, guid_index, scl[1])
+            cframe = RbxCFrame(
+                x=cframe.x, y=(cframe.y or 0) + _model_y_offset, z=cframe.z,
+                r00=cframe.r00, r01=cframe.r01, r02=cframe.r02,
+                r10=cframe.r10, r11=cframe.r11, r12=cframe.r12,
+                r20=cframe.r20, r21=cframe.r21, r22=cframe.r22,
+            )
             part = RbxPart(
                 name=name,
                 class_name="Model",
