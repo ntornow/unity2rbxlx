@@ -3305,6 +3305,7 @@ def _convert_prefab_node(
     local_pos = list(node.position)
     local_rot = list(node.rotation)
     local_scl = list(node.scale)
+    _yup_pos_zeroed = False
 
     if parent_pos is not None:
         # Apply parent rotation to local position, then add parent position.
@@ -3342,6 +3343,7 @@ def _convert_prefab_node(
                 if is_yup_fbx(_fbx):
                     node_rot = [0.0, 0.0, 0.0, 1.0]  # Y-up: all baked
                     world_pos = list(pp)               # position also baked
+                    _yup_pos_zeroed = True
                 else:
                     from core.coordinate_system import strip_fbx_prerotation_left
                     node_rot = list(strip_fbx_prerotation_left(*local_rot))  # Z-up child: left-strip
@@ -3385,7 +3387,10 @@ def _convert_prefab_node(
         _fbx_off = guid_index.resolve(node.mesh_guid)
         from core.coordinate_system import is_yup_fbx
         _is_yup = _fbx_off and _fbx_off.suffix.lower() in ('.fbx', '.obj') and is_yup_fbx(_fbx_off)
-        if not _is_yup:
+        # Skip vertical offset only when Y-up position was zeroed (multi-mesh
+        # children whose positions are baked by Roblox). Single-mesh Y-up nodes
+        # still need the offset to sit on the ground correctly.
+        if not (_is_yup and _yup_pos_zeroed):
             ry += _compute_mesh_vertical_offset(node.mesh_guid, guid_index, local_scl[1])
 
     quat_for_roblox = local_rot
