@@ -201,6 +201,8 @@ def _compute_mesh_vertical_offset(
     mesh_guid: str,
     guid_index: GuidIndex | None,
     unity_scale_y: float = 1.0,
+    mesh_file_id: str | None = None,
+    mesh_name: str | None = None,
 ) -> float:
     """Compute the vertical offset from mesh pivot to bounding-box center.
 
@@ -209,11 +211,14 @@ def _compute_mesh_vertical_offset(
 
     Uses Roblox mesh_hierarchies data when available (accurate), falling
     back to FBX vertex analysis (approximate).
+
+    When mesh_file_id or mesh_name is provided, selects the specific sub-mesh
+    within a multi-mesh FBX for accurate per-sub-mesh offsets.
     """
     if not guid_index:
         return 0.0
 
-    cache_key = mesh_guid + f"_{unity_scale_y:.4f}"
+    cache_key = mesh_guid + f"_{unity_scale_y:.4f}_{mesh_file_id or ''}_{mesh_name or ''}"
     if cache_key in _mesh_vertical_offset_cache:
         return _mesh_vertical_offset_cache[cache_key]
 
@@ -227,6 +232,19 @@ def _compute_mesh_vertical_offset(
     # coordinate space.  For single-mesh FBX files where the mesh is centered
     # at the model origin, position is (0,0,0) — fall through to FBX analysis.
     if _mesh_hierarchies:
+        # Try specific sub-mesh first via mesh_file_id or name
+        if mesh_file_id or mesh_name:
+            sub_mesh = _resolve_sub_mesh(mesh_guid, mesh_file_id, guid_index, mesh_name=mesh_name)
+            if sub_mesh:
+                pos = sub_mesh.get("position", [0, 0, 0])
+                center_y = pos[1] if len(pos) > 1 else 0.0
+                if abs(center_y) > 0.01:
+                    import_scale = _get_fbx_import_scale(mesh_guid, guid_index)
+                    offset = center_y * import_scale * config.STUDS_PER_METER * abs(unity_scale_y)
+                    _mesh_vertical_offset_cache[cache_key] = offset
+                    return offset
+
+        # Fallback: use first sub-mesh (single-mesh or no file_id/name)
         relative = guid_index.resolve_relative(mesh_guid)
         for key in ([str(relative), str(asset_path)] if relative else [str(asset_path)]):
             if key in _mesh_hierarchies:
@@ -1130,7 +1148,8 @@ def _convert_node(
     # Only apply when the FBX origin is inside the bounding box (indicating a
     # genuine pivot offset, not a scene-space positioned multi-mesh).
     if node.mesh_guid and guid_index:
-        ry += _compute_mesh_vertical_offset(node.mesh_guid, guid_index, node.scale[1])
+        _mfid = node.mesh_file_id if hasattr(node, 'mesh_file_id') else None
+        ry += _compute_mesh_vertical_offset(node.mesh_guid, guid_index, node.scale[1], mesh_file_id=_mfid, mesh_name=node.name)
 
     # -- CFrame --
     cframe = RbxCFrame(
@@ -1710,10 +1729,12 @@ def _resolve_sub_mesh(
     mesh_guid: str,
     mesh_file_id: str | None,
     guid_index: GuidIndex | None,
+    mesh_name: str | None = None,
 ) -> dict | None:
     """Resolve a specific sub-mesh within a multi-mesh FBX using mesh_hierarchies.
 
     Unity FBX fileIDs map to sub-mesh indices: 4300000 → index 0, 4300002 → index 1, etc.
+    Falls back to name matching when index-based lookup fails.
     Returns the sub-mesh dict or None if not available.
     """
     if not _mesh_hierarchies or not guid_index:
@@ -1741,6 +1762,13 @@ def _resolve_sub_mesh(
                             return sub_meshes[idx]
                 except (ValueError, TypeError):
                     pass
+            # Name-based fallback: match sub-mesh by name when index lookup
+            # fails (Unity fileID ordering may differ from Roblox LoadAsset order)
+            if mesh_name:
+                name_lower = mesh_name.lower()
+                for sm in sub_meshes:
+                    if sm.get("name", "").lower() == name_lower:
+                        return sm
             # Fallback: return first sub-mesh (works for single-mesh FBX files
             # and when mesh_file_id is not set)
             return sub_meshes[0]
@@ -3007,7 +3035,9 @@ def _convert_prefab_instance(
 
     # Mesh pivot vertical correction
     if hasattr(template, 'root') and template.root and template.root.mesh_guid and guid_index:
-        ry += _compute_mesh_vertical_offset(template.root.mesh_guid, guid_index, scl[1])
+        _root_mfid = template.root.mesh_file_id if hasattr(template.root, 'mesh_file_id') else None
+        _root_name = template.root.name if hasattr(template.root, 'name') else None
+        ry += _compute_mesh_vertical_offset(template.root.mesh_guid, guid_index, scl[1], mesh_file_id=_root_mfid, mesh_name=_root_name)
 
     cframe = RbxCFrame(
         x=rx, y=ry, z=rz,
@@ -3096,33 +3126,8 @@ def _convert_prefab_instance(
             # Apply materials to the root MeshPart/Part
             _apply_prefab_materials(root, part, material_mappings)
         else:
-            # For Model containers with Y-up mesh children, apply the first
-            # child's vertical offset to the Model so the assembly sits on
-            # the ground instead of partially underground.
-            _model_y_offset = 0.0
-            if guid_index:
-                # Find first mesh child (may be nested under sub-Models)
-                def _find_first_mesh(node):
-                    for c in node.children:
-                        if c.mesh_guid:
-                            return c
-                        r = _find_first_mesh(c)
-                        if r:
-                            return r
-                    return None
-                _first_mesh = _find_first_mesh(root)
-                if _first_mesh:
-                    _mc_fbx = guid_index.resolve(_first_mesh.mesh_guid)
-                    if _mc_fbx and _mc_fbx.suffix.lower() in ('.fbx', '.obj'):
-                        from core.coordinate_system import is_yup_fbx
-                        if is_yup_fbx(_mc_fbx):
-                            _model_y_offset = _compute_mesh_vertical_offset(_first_mesh.mesh_guid, guid_index, scl[1])
-            cframe = RbxCFrame(
-                x=cframe.x, y=(cframe.y or 0) + _model_y_offset, z=cframe.z,
-                r00=cframe.r00, r01=cframe.r01, r02=cframe.r02,
-                r10=cframe.r10, r11=cframe.r11, r12=cframe.r12,
-                r20=cframe.r20, r21=cframe.r21, r22=cframe.r22,
-            )
+            # Model container — children handle their own vertical offsets
+            # via per-sub-mesh mesh_hierarchies position data.
             part = RbxPart(
                 name=name,
                 class_name="Model",
@@ -3409,16 +3414,12 @@ def _convert_prefab_node(
 
     rx, ry, rz = unity_to_roblox_pos(*local_pos)
 
-    # Mesh pivot vertical correction — skip for Y-up FBX (Roblox bakes position)
+    # Mesh pivot vertical correction — adjusts for difference between FBX
+    # origin and Roblox bounding-box center.  Applied to all FBX types
+    # (Y-up and Z-up) using per-sub-mesh position from mesh_hierarchies.
     if node.mesh_guid and guid_index:
-        _fbx_off = guid_index.resolve(node.mesh_guid)
-        from core.coordinate_system import is_yup_fbx
-        _is_yup = _fbx_off and _fbx_off.suffix.lower() in ('.fbx', '.obj') and is_yup_fbx(_fbx_off)
-        # Skip vertical offset only when Y-up position was zeroed (multi-mesh
-        # children whose positions are baked by Roblox). Single-mesh Y-up nodes
-        # still need the offset to sit on the ground correctly.
-        if not (_is_yup and _yup_pos_zeroed):
-            ry += _compute_mesh_vertical_offset(node.mesh_guid, guid_index, local_scl[1])
+        _mfid = node.mesh_file_id if hasattr(node, 'mesh_file_id') else None
+        ry += _compute_mesh_vertical_offset(node.mesh_guid, guid_index, local_scl[1], mesh_file_id=_mfid, mesh_name=node.name)
 
     quat_for_roblox = local_rot
     rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*quat_for_roblox)
@@ -3563,8 +3564,10 @@ def _convert_prefab_node(
         if child_part:
             part.children.append(child_part)
 
-    # Mark as already in world-space so composition pass doesn't double-apply
-    part._world_composed = True
+    # DO NOT mark _world_composed — child positions include the instance's
+    # local position (parent_pos) but NOT the scene hierarchy transforms
+    # above the instance.  The composition pass at convert_scene applies
+    # the parent scene node's CFrame to convert local → world positions.
     return part
 
 
