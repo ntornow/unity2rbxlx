@@ -3150,21 +3150,11 @@ def _convert_prefab_instance(
                             part.children.append(collider_part)
                     break
 
-        # Process root node components (lights, audio, rigidbody).
-        # When root is a MeshPart/Part, attach directly; when Model, find first child.
+        # Process root node components (lights, audio, rigidbody, scripts).
+        # Always process on the root part so _ScriptClass is set for script
+        # binding. This works for both Parts/MeshParts and Models.
         if hasattr(root, 'components') and root.components:
-            if part.class_name in ('Part', 'MeshPart'):
-                _process_components(root, part, guid_index=guid_index, uploaded_assets=uploaded_assets)
-            elif part.children:
-                target_child = None
-                for child in part.children:
-                    if child.class_name in ('Part', 'MeshPart') and child.transparency < 1.0:
-                        target_child = child
-                        break
-                if target_child is None and part.children:
-                    target_child = part.children[0]
-                if target_child:
-                    _process_components(root, target_child, guid_index=guid_index, uploaded_assets=uploaded_assets)
+            _process_components(root, part, guid_index=guid_index, uploaded_assets=uploaded_assets)
     else:
         # Determine size: combine prefab root scale with instance scale override
         root_sx = abs(root.scale[0]) if hasattr(root, "scale") else 1.0
