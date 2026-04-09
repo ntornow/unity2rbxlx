@@ -542,16 +542,16 @@ def _preprocess_yield_return(source: str) -> str:
         r'task.wait(\1)',
         source,
     )
-    # yield return new WaitForEndOfFrame() → task.wait()
+    # yield return new WaitForEndOfFrame() → RunService.RenderStepped:Wait()
     source = re.sub(
         r'\byield\s+return\s+new\s+WaitForEndOfFrame\s*\(\s*\)',
-        'task.wait()',
+        'game:GetService("RunService").RenderStepped:Wait()',
         source,
     )
-    # yield return new WaitForFixedUpdate() → task.wait()
+    # yield return new WaitForFixedUpdate() → RunService.Heartbeat:Wait()
     source = re.sub(
         r'\byield\s+return\s+new\s+WaitForFixedUpdate\s*\(\s*\)',
-        'task.wait()',
+        'game:GetService("RunService").Heartbeat:Wait()',
         source,
     )
     # yield return new WaitUntil(() => condition) → repeat task.wait() until condition

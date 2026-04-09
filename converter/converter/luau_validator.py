@@ -2841,6 +2841,30 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             source,
         )
 
+    # Auto-create ClickDetector when scripts reference it.
+    # Unity OnMouseDown/OnMouseEnter are lifecycle events on any collider, but
+    # Roblox requires an explicit ClickDetector child instance.
+    if 'ClickDetector' in source and 'Instance.new("ClickDetector")' not in source:
+        # Inject ClickDetector creation at top of script
+        inject = ('local ClickDetector = script.Parent:FindFirstChildOfClass("ClickDetector")\n'
+                  'if not ClickDetector then\n'
+                  '    ClickDetector = Instance.new("ClickDetector")\n'
+                  '    ClickDetector.Parent = script.Parent\n'
+                  'end\n')
+        # Insert after the last local/require/GetService line
+        lines = source.split('\n')
+        insert_idx = 0
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if (stripped.startswith('local ') or stripped.startswith('--') or
+                    stripped == '' or 'GetService' in stripped or 'require(' in stripped):
+                insert_idx = i + 1
+            else:
+                break
+        lines.insert(insert_idx, inject)
+        source = '\n'.join(lines)
+        fixes.append("Auto-created ClickDetector for OnMouseDown/OnMouseEnter events")
+
     # Fix SendMessage → SetAttribute (already partially handled, but clean up remnants)
     if 'SetAttributeOptions' in source:
         source = re.sub(

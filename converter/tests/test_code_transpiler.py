@@ -4418,3 +4418,23 @@ class TestValidatorAPIPatterns:
         fixed, _ = validate_and_fix("test", source)
         assert 'FindFirstChildWhichIsA(' in fixed
         assert 'rb =' in fixed
+
+    def test_click_detector_auto_creation(self):
+        """ClickDetector reference → auto-create ClickDetector instance."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local part = script.Parent\nClickDetector.MouseClick:Connect(function(player)\n    print("clicked")\nend)'
+        fixed, fixes = validate_and_fix("test", source)
+        assert 'Instance.new("ClickDetector")' in fixed
+        assert any("ClickDetector" in f for f in fixes)
+
+    def test_wait_for_end_of_frame(self):
+        """WaitForEndOfFrame → RenderStepped:Wait()."""
+        from converter.code_transpiler import _preprocess_yield_return
+        result = _preprocess_yield_return("yield return new WaitForEndOfFrame()")
+        assert "RenderStepped" in result
+
+    def test_wait_for_fixed_update(self):
+        """WaitForFixedUpdate → Heartbeat:Wait()."""
+        from converter.code_transpiler import _preprocess_yield_return
+        result = _preprocess_yield_return("yield return new WaitForFixedUpdate()")
+        assert "Heartbeat" in result
