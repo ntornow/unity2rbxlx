@@ -965,10 +965,17 @@ def generate_state_machine_script(
                 simplified = simplify_keyframes(curve.keyframes, max_count=5)
                 if len(simplified) >= 2:
                     if curve.property_type == "position":
-                        kf = simplified[-1]
+                        kf_start = simplified[0]
+                        kf_end = simplified[-1]
+                        # Use delta between first and last keyframe for relative movement.
+                        # This correctly handles close animations that return to origin
+                        # (endpoint 0,0,0 with startpoint 0,4,0 → delta 0,-4,0).
+                        dx = kf_end.value[0] - kf_start.value[0]
+                        dy = kf_end.value[1] - kf_start.value[1]
+                        dz = -(kf_end.value[2] - kf_start.value[2])  # Z inversion
                         lines.append(f"\tlocal info = TweenInfo.new({clip.duration:.2f})")
                         lines.append(f"\tlocal tween = TweenService:Create(target, info, {{")
-                        lines.append(f"\t\tPosition = target.Position + Vector3.new({kf.value[0]:.3f}, {kf.value[1]:.3f}, {-kf.value[2]:.3f})")
+                        lines.append(f"\t\tPosition = target.Position + Vector3.new({dx:.3f}, {dy:.3f}, {dz:.3f})")
                         lines.append(f"\t}})")
                         lines.append(f"\ttween:Play()")
                         lines.append(f"\ttween.Completed:Wait()")
