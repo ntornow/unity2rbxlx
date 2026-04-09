@@ -5993,17 +5993,45 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
     if '.Parent =(' in source:
         source = re.sub(r'\.Parent\s*=\s*\((\w+(?:\.\w+)*)\)', r'.Parent = \1', source)
 
-    # Fix Unity FindObjectOfType/FindAnyObjectByType/FindObjectsOfType → workspace:FindFirstChildWhichIsA or GetDescendants
+    # Fix Unity FindObjectOfType/FindAnyObjectByType → workspace:FindFirstChildWhichIsA("Type")
     if 'FindAnyObjectByType(' in source or 'FindObjectOfType(' in source:
-        # FindAnyObjectByType<Type>() or FindObjectOfType<Type>() → workspace:FindFirstChildWhichIsA("Type")
+        # Typed version: FindObjectOfType("Type") → workspace:FindFirstChildWhichIsA("Type", true)
         source = re.sub(
-            r'FindAnyObjectByType\(\)',
+            r'(?:FindAnyObjectByType|FindObjectOfType)\("(\w+)"\)',
+            r'workspace:FindFirstChildWhichIsA("\1", true)',
+            source,
+        )
+        # Bare version (no type arg): just use workspace
+        source = re.sub(
+            r'(?:FindAnyObjectByType|FindObjectOfType)\(\)',
             'workspace',
             source,
         )
+
+    # Fix FindObjectsOfType("Type") → type-filtered GetDescendants
+    if 'FindObjectsOfType(' in source:
+        def _replace_find_objects(m):
+            type_name = m.group(1)
+            # Generate inline filter expression
+            return (f'(function() local _r = {{}} for _, _d in workspace:GetDescendants() do '
+                    f'if _d:IsA("{type_name}") then table.insert(_r, _d) end end return _r end)()')
         source = re.sub(
-            r'FindObjectOfType\(\)',
-            'workspace',
+            r'(?:FindObjectsOfType)\("(\w+)"\)',
+            _replace_find_objects,
+            source,
+        )
+
+    # Fix TryGetComponent("Type", out var) → local var = obj:FindFirstChildWhichIsA("Type")
+    if 'TryGetComponent(' in source:
+        source = re.sub(
+            r'(\w+)\.TryGetComponent\("(\w+)",\s*(\w+)\)',
+            r'\3 = \1:FindFirstChildWhichIsA("\2")',
+            source,
+        )
+        # Pattern: if (TryGetComponent(...)) → if var then
+        source = re.sub(
+            r'if\s+(\w+)\s*=\s*(\w+):FindFirstChildWhichIsA\("(\w+)"\)\s+then',
+            r'local \1 = \2:FindFirstChildWhichIsA("\3")\nif \1 then',
             source,
         )
 
