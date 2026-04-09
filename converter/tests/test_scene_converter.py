@@ -473,3 +473,105 @@ class TestMeshSizeFbxBboxFallback:
             assert abs(size[2] - 0.5 * 20.0 * f) < 0.01
         finally:
             sc._fbx_bounding_boxes = old_bboxes
+
+
+class TestMeshVerticalOffsetSubMesh:
+    """Test per-sub-mesh vertical offset selection."""
+
+    def test_submesh_name_fallback(self):
+        """When fileID index is out of bounds, fall back to name matching."""
+        import converter.scene_converter as sc
+        from core.unity_types import GuidIndex, GuidEntry
+        from pathlib import Path
+
+        old_mh = sc._mesh_hierarchies
+        old_cache = sc._mesh_vertical_offset_cache
+        try:
+            sc._mesh_hierarchies = {
+                "Assets/door.fbx": [
+                    {"name": "frame_col", "position": [0, 3.22, 0], "size": [7, 6, 1]},
+                    {"name": "base", "position": [0, 0.14, 0], "size": [5, 0.15, 2]},
+                    {"name": "door", "position": [0, 2.66, 0], "size": [5, 5, 0.7]},
+                ]
+            }
+            sc._mesh_vertical_offset_cache = {}
+
+            gi = GuidIndex(project_root=Path("/fake"))
+            gi.guid_to_entry["door-guid"] = GuidEntry(
+                guid="door-guid",
+                asset_path=Path("/fake/Assets/door.fbx"),
+                relative_path=Path("Assets/door.fbx"),
+                kind="model",
+            )
+
+            # Using mesh_name="door" should find the door sub-mesh (pos Y=2.66)
+            # not the first sub-mesh (frame_col at Y=3.22)
+            import config
+            offset = sc._compute_mesh_vertical_offset(
+                "door-guid", gi, 1.0,
+                mesh_file_id="9999999",  # invalid fileID to force name fallback
+                mesh_name="door",
+            )
+            # Default import_scale is 0.01 (cm→m) when no .meta file exists
+            expected = 2.66 * 0.01 * config.STUDS_PER_METER
+            assert abs(offset - expected) < 0.01, f"Expected ~{expected:.4f}, got {offset:.4f}"
+
+            # Verify it used "door" not "frame_col" (Y=3.22) or "base" (Y=0.14)
+            frame_col_offset = 3.22 * 0.01 * config.STUDS_PER_METER
+            base_offset = 0.14 * 0.01 * config.STUDS_PER_METER
+            assert abs(offset - frame_col_offset) > 0.01, "Should NOT use frame_col"
+            assert abs(offset - base_offset) > 0.01, "Should NOT use base"
+        finally:
+            sc._mesh_hierarchies = old_mh
+            sc._mesh_vertical_offset_cache = old_cache
+
+
+class TestMixedColliderHandling:
+    """Test that physical + trigger colliders on the same node work correctly."""
+
+    def test_physical_then_trigger_keeps_collidable(self):
+        """Physical collider followed by trigger → CanCollide stays True."""
+        from converter.scene_converter import _process_components
+        from core.roblox_types import RbxPart
+
+        class FakeBoxCollider:
+            component_type = "BoxCollider"
+            properties = {"m_IsTrigger": 0, "m_Size": {"x": 1, "y": 1, "z": 1}, "m_Center": {"x": 0, "y": 0, "z": 0}}
+
+        class FakeTriggerCollider:
+            component_type = "SphereCollider"
+            properties = {"m_IsTrigger": 1, "m_Radius": 3, "m_Center": {"x": 0, "y": 0, "z": 0}}
+
+        class FakeNode:
+            name = "DoorBase"
+            components = [FakeBoxCollider(), FakeTriggerCollider()]
+            mesh_guid = None
+
+        part = RbxPart(name="DoorBase", size=(3.571, 3.571, 3.571))
+        _process_components(FakeNode(), part)
+
+        assert part.can_collide is True, "Physical collider should keep CanCollide=True"
+        assert getattr(part, 'can_query', True) is True, "Trigger should set CanQuery=True"
+
+    def test_trigger_then_physical_keeps_collidable(self):
+        """Trigger first, then physical → CanCollide should be True."""
+        from converter.scene_converter import _process_components
+        from core.roblox_types import RbxPart
+
+        class FakeTrigger:
+            component_type = "SphereCollider"
+            properties = {"m_IsTrigger": 1, "m_Radius": 3, "m_Center": {"x": 0, "y": 0, "z": 0}}
+
+        class FakeBox:
+            component_type = "BoxCollider"
+            properties = {"m_IsTrigger": 0, "m_Size": {"x": 1, "y": 1, "z": 1}, "m_Center": {"x": 0, "y": 0, "z": 0}}
+
+        class FakeNode:
+            name = "DoorBase"
+            components = [FakeTrigger(), FakeBox()]
+            mesh_guid = None
+
+        part = RbxPart(name="DoorBase", size=(3.571, 3.571, 3.571))
+        _process_components(FakeNode(), part)
+
+        assert part.can_collide is True, "Physical collider should override trigger's CanCollide=False"
