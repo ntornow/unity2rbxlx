@@ -3337,8 +3337,6 @@ def _convert_prefab_node(
     local_pos = list(node.position)
     local_rot = list(node.rotation)
     local_scl = list(node.scale)
-    _yup_pos_zeroed = False
-
     if parent_pos is not None:
         # Apply parent rotation to local position, then add parent position.
         # This is how Unity composes parent + child transforms.
@@ -3373,9 +3371,7 @@ def _convert_prefab_node(
             if _fbx and _fbx.suffix.lower() in ('.fbx', '.obj'):
                 from core.coordinate_system import is_yup_fbx
                 if is_yup_fbx(_fbx):
-                    node_rot = [0.0, 0.0, 0.0, 1.0]  # Y-up: all baked
-                    world_pos = list(pp)               # position also baked
-                    _yup_pos_zeroed = True
+                    node_rot = [0.0, 0.0, 0.0, 1.0]  # Y-up: rotation baked into vertices
                 else:
                     from core.coordinate_system import strip_fbx_prerotation_left
                     node_rot = list(strip_fbx_prerotation_left(*local_rot))  # Z-up child: left-strip
