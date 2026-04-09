@@ -372,9 +372,37 @@ def encode_smooth_grid(
     wcz_min = (off_z - grid_z + 1) // chunk_size
     wcz_max = off_z // chunk_size
 
+    # Pre-compute max terrain height per chunk column (wcx, wcz) to skip
+    # all-air chunks above the terrain surface without iterating 32^3 voxels.
+    _chunk_max_gy: dict[tuple[int, int], int] = {}
     for wcx in range(wcx_min, wcx_max + 1):
         for wcz in range(wcz_min, wcz_max + 1):
+            max_h = 0.0
+            for sy in range(chunk_size):
+                wvz = wcz * chunk_size + sy
+                gz = off_z - wvz
+                if gz < 0 or gz >= grid_z:
+                    continue
+                for sx in range(chunk_size):
+                    wvx = wcx * chunk_size + sx
+                    gx = wvx - off_x
+                    if gx < 0 or gx >= grid_x:
+                        continue
+                    h = _height_grid[gz * grid_x + gx]
+                    if h > max_h:
+                        max_h = h
+            # Convert max height in studs to max voxel Y index
+            _chunk_max_gy[(wcx, wcz)] = int(math.ceil(max_h / VOXEL_SIZE))
+
+    for wcx in range(wcx_min, wcx_max + 1):
+        for wcz in range(wcz_min, wcz_max + 1):
+            max_gy = _chunk_max_gy.get((wcx, wcz), 0)
             for wcy in range(wcy_min, wcy_max + 1):
+                # Skip chunks entirely above terrain surface
+                chunk_bottom_gy = wcy * chunk_size - off_y
+                if chunk_bottom_gy > max_gy:
+                    continue
+
                 chunk_voxels: list[tuple[int, int]] = []
                 has_non_air = False
 
