@@ -4384,3 +4384,37 @@ class TestValidatorRuntimeGuards:
             script_type="LocalScript",
         ))
         assert _has_client_fps_controller(place)
+
+
+class TestValidatorAPIPatterns:
+    """Tests for Unity API pattern conversions in the validator."""
+
+    def test_find_objects_of_type_typed(self):
+        """FindObjectsOfType("Type") → type-filtered GetDescendants."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local enemies = FindObjectsOfType("Enemy")'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'IsA("Enemy")' in fixed
+        assert 'GetDescendants()' in fixed
+
+    def test_find_object_of_type_typed(self):
+        """FindObjectOfType("Type") → FindFirstChildWhichIsA."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local mgr = FindObjectOfType("GameManager")'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'FindFirstChildWhichIsA("GameManager"' in fixed
+
+    def test_find_any_object_by_type(self):
+        """FindAnyObjectByType("T") → FindFirstChildWhichIsA."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local cam = FindAnyObjectByType("Camera")'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'FindFirstChildWhichIsA("Camera"' in fixed
+
+    def test_try_get_component(self):
+        """TryGetComponent("Type", var) → FindFirstChildWhichIsA."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local rb = obj.TryGetComponent("Rigidbody", rb)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'FindFirstChildWhichIsA(' in fixed
+        assert 'rb =' in fixed

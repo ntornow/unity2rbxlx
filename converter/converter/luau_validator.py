@@ -6023,15 +6023,16 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
 
     # Fix TryGetComponent("Type", out var) → local var = obj:FindFirstChildWhichIsA("Type")
     if 'TryGetComponent(' in source:
+        # Pattern: var = obj.TryGetComponent("Type", var) → var = obj:FindFirstChildWhichIsA("Type")
         source = re.sub(
-            r'(\w+)\.TryGetComponent\("(\w+)",\s*(\w+)\)',
-            r'\3 = \1:FindFirstChildWhichIsA("\2")',
+            r'(?:local\s+)?(\w+)\s*=\s*(\w+)\.TryGetComponent\("(\w+)",\s*\w+\)',
+            r'local \1 = \2:FindFirstChildWhichIsA("\3")',
             source,
         )
-        # Pattern: if (TryGetComponent(...)) → if var then
+        # Pattern: obj.TryGetComponent("Type", var) as expression → obj:FindFirstChildWhichIsA("Type")
         source = re.sub(
-            r'if\s+(\w+)\s*=\s*(\w+):FindFirstChildWhichIsA\("(\w+)"\)\s+then',
-            r'local \1 = \2:FindFirstChildWhichIsA("\3")\nif \1 then',
+            r'(\w+)\.TryGetComponent\("(\w+)",\s*(\w+)\)',
+            r'\1:FindFirstChildWhichIsA("\2")',
             source,
         )
 
