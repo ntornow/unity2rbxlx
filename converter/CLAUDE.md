@@ -32,7 +32,7 @@ Work autonomously with no questions — just churn forever making the converter 
 
 ### Converter Status (as of 2026-04-08)
 
-**967 tests passing** (967 fast in 12s, 30 slow full-pipeline tests)
+**971 tests passing** (971 fast in 10s, 30 slow full-pipeline tests)
 **9 test projects** converting and validating clean with zero errors:
 - SimpleFPS (960 parts, 36 scripts), Gamekit3D (18,534 parts, 249 scripts)
 - SanAndreasUnity (270 scripts), ChopChop (275 scripts), RedRunner (87 scripts)
@@ -42,8 +42,9 @@ Work autonomously with no questions — just churn forever making the converter 
 - P0/P1/P2: ALL resolved (terrain, scripts, content properties, sub-mesh materials, physics, UI, etc.)
 - **Headless mesh resolution**: Luau Execution API → CreateMeshPartAsync + SavePlaceAsync. 328/328 meshes render as proper 3D geometry in Studio edit mode. No Studio interaction required.
 - **One-command pipeline**: `u2r.py convert` → generates rbxlx + publishes to Roblox with proper meshes
-- **Placement accuracy**: Per-sub-mesh vertical offsets, scene hierarchy composition for prefab children, all doors/turrets/pickups at correct positions. 176/176 scripts valid Luau syntax.
+- **Placement accuracy**: Per-sub-mesh vertical offsets, scene hierarchy composition for prefab children, all doors/turrets/pickups at correct positions. 176/176 scripts valid Luau syntax. Mixed collider handling (physical + trigger).
 - **SimpleFPS gameplay verified**: Game starts clean, 0 script errors, water fills, terrain renders, HUD works, spawn points correct, all materials applied (0 default gray).
+- **Performance**: Terrain encoding 7.7x faster via precomputed height grids + chunk skipping. SimpleFPS converts in ~6s total.
 - SmoothGrid terrain: World-space chunk coordinates with Z inversion
 - Luau place builder: 700KB script reconstructs entire place headlessly (parts, meshes, scripts, terrain, lighting, UI)
 - SurfaceAppearance: Full PBR in rbxlx, Texture fallback for headless mode
