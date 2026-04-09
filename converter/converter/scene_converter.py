@@ -1355,9 +1355,11 @@ def _process_components(
         elif ct in _COLLIDER_TYPES:
             is_trigger = bool(int(comp.properties.get("m_IsTrigger", 0)))
             if is_trigger:
-                # Trigger colliders are detection zones — don't collide but remain queryable
-                part.can_collide = False
-                part.can_query = True  # Spatial queries (Touched events) still work
+                # Trigger colliders are detection zones — enable Touched events.
+                # Only disable collision if no physical (non-trigger) collider exists.
+                part.can_query = True
+                if not getattr(part, '_has_physical_collider', False):
+                    part.can_collide = False
             else:
                 # Apply each collider against the original size to avoid
                 # compounding when multiple colliders exist on one node.
@@ -1377,6 +1379,8 @@ def _process_components(
                         max(part.size[2], adjusted_size[2]),
                     )
                 part.can_collide = can_collide
+                if can_collide:
+                    part._has_physical_collider = True
                 # Apply collider center offset to part CFrame position.
                 # Skip for Y-up FBX meshes where Roblox bakes mesh positions.
                 if center_offset != (0.0, 0.0, 0.0):

@@ -173,7 +173,7 @@ Priority: P0 = blocking gameplay, P1 = significant quality, P2 = nice to have.
 - [x] **SpawnPoint → SpawnLocation**: Unity SpawnPoint objects now convert to Roblox SpawnLocation class with correct positions.
 
 ### Remaining
-- [ ] **Prefab child MonoBehaviour binding**: Scripts on child nodes within prefab hierarchies don't get `_ScriptClass` set (get parent guards instead)
+- [x] **Prefab child MonoBehaviour binding**: Fixed — `_process_components()` now runs on all prefab child nodes via recursive `_convert_prefab_node`, setting `_ScriptClass` correctly (224 parts bound, 0 orphan scripts)
 
 ### Deferred (no Roblox equivalent)
 - Cloth simulation → silently skipped
