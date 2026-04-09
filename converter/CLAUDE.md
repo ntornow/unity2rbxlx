@@ -32,7 +32,7 @@ Work autonomously with no questions — just churn forever making the converter 
 
 ### Converter Status (as of 2026-04-08)
 
-**971 tests passing** (971 fast in 10s, 30 slow full-pipeline tests)
+**977 tests passing** (977 fast in 10s, 30 slow full-pipeline tests)
 **9 test projects** converting and validating clean with zero errors:
 - SimpleFPS (960 parts, 36 scripts), Gamekit3D (18,534 parts, 249 scripts)
 - SanAndreasUnity (270 scripts), ChopChop (275 scripts), RedRunner (87 scripts)
