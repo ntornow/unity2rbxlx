@@ -2841,6 +2841,86 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             source,
         )
 
+    # Reposition the WeaponSlot to a typical FPS hand position so the
+    # equipped weapon doesn't clip into the camera. Default (0, 0.5, -1)
+    # puts it dead center in front of the head.
+    if 'CFrame.new(0, 0.5, -1)' in source and 'weaponslot' in source.lower():
+        source = source.replace(
+            'CFrame.new(0, 0.5, -1)',
+            'CFrame.new(0.6, -0.4, -2.0)',
+        )
+        fixes.append("Repositioned WeaponSlot for FPS view (right, down, forward)")
+
+    # Pickup script: delay Destroy() so the player has time to clone the
+    # picked-up item before it disappears. The Player script listens to
+    # an attribute and runs async, so an immediate Destroy makes the
+    # source unavailable.
+    if 'character:SetAttribute("GetItem"' in source and 'script.Parent:Destroy()' in source:
+        source = source.replace(
+            '-- Send item to player\n\tcharacter:SetAttribute("GetItem", itemName)\n\n\t-- Destroy pickup\n\tscript.Parent:Destroy()',
+            '-- Send item to player\n\tcharacter:SetAttribute("GetItem", itemName)\n\n\t-- Delay destroy so player can clone before the item disappears\n\ttask.delay(0.5, function() if script and script.Parent then script.Parent:Destroy() end end)',
+        )
+        fixes.append("Delayed Pickup Destroy() so player can clone item first")
+
+    # When script looks up "riflePrefab" (Unity field reference) and the
+    # Model wasn't created (no mesh_hierarchies during conversion), fall
+    # back to searching for the rifle Model anywhere in workspace.
+    # Idempotent: skip if the wrapper function is already present.
+    if ('FindFirstChild("riflePrefab"' in source
+            and '_RIFLE_LOOKUP_WRAPPED' not in source):
+        source = source.replace(
+            'workspace:FindFirstChild("riflePrefab", true)',
+            '(function() -- _RIFLE_LOOKUP_WRAPPED\n'
+            '    local _rp = workspace:FindFirstChild("riflePrefab", true)\n'
+            '    if _rp then return _rp end\n'
+            '    for _, _d in workspace:GetDescendants() do\n'
+            '        if _d.Name == "Rifle" and _d:IsA("Model") then return _d end\n'
+            '    end\n'
+            '    return nil\n'
+            'end)()',
+        )
+        fixes.append("Added Rifle Model fallback for missing riflePrefab field reference")
+
+    # Fix incomplete Model equip patterns: when a Model is cloned and
+    # parented to a Part (weapon slot), its children are unanchored at
+    # (0,0,0) and don't follow the parent. Inject proper PivotTo + Weld.
+    if 'rifle:IsA("Model")' in source and 'rifle:ScaleTo' in source:
+        # ScaleTo MUST be called BEFORE welding, otherwise welds capture
+        # the unscaled positions and prevent the scale from taking effect.
+        source = re.sub(
+            r'(\s*)elseif\s+rifle:IsA\("Model"\)\s+then\s*\n(\s*)rifle:ScaleTo\([^)]+\)\s*\n\s*end',
+            (r'\1elseif rifle:IsA("Model") then\n'
+             r'\2-- Set primary part for positioning\n'
+             r'\2if not rifle.PrimaryPart then\n'
+             r'\2    rifle.PrimaryPart = rifle:FindFirstChildWhichIsA("BasePart")\n'
+             r'\2end\n'
+             r'\2-- Unanchor parts first so PivotTo/ScaleTo can move them\n'
+             r'\2for _, _p in rifle:GetDescendants() do\n'
+             r'\2    if _p:IsA("BasePart") then\n'
+             r'\2        _p.Anchored = false\n'
+             r'\2        _p.CanCollide = false\n'
+             r'\2        _p.Massless = true\n'
+             r'\2    end\n'
+             r'\2end\n'
+             r'\2-- Scale BEFORE welding (welds would freeze positions)\n'
+             r'\2rifle:ScaleTo(0.2)\n'
+             r'\2-- Move to weapon slot then weld each part\n'
+             r'\2rifle:PivotTo(weaponSlot.CFrame)\n'
+             r'\2for _, _p in rifle:GetDescendants() do\n'
+             r'\2    if _p:IsA("BasePart") then\n'
+             r'\2        local _w = Instance.new("WeldConstraint")\n'
+             r'\2        _w.Part0 = weaponSlot\n'
+             r'\2        _w.Part1 = _p\n'
+             r'\2        _w.Parent = _p\n'
+             r'\2        -- Force visible (bootstrap excludes WeaponSlot from hide)\n'
+             r'\2        _p.LocalTransparencyModifier = 0\n'
+             r'\2    end\n'
+             r'\2end\n'
+             r'\1end'),
+            source,
+        )
+        fixes.append("Fixed Model equip: ScaleTo before WeldConstraints")
+
     # Auto-create ClickDetector when scripts reference it.
     # Unity OnMouseDown/OnMouseEnter are lifecycle events on any collider, but
     # Roblox requires an explicit ClickDetector child instance.
@@ -5850,12 +5930,16 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
             '    return false\n'
             'end\n'
         )
-        # Insert after the first GetService line or at the top
+        # Insert at top after services (find the LAST top-level GetService
+        # line, not any nested ones). Stop at the first non-top-level line.
         lines = source.split('\n')
         insert_idx = 0
         for i, line in enumerate(lines):
-            if 'GetService' in line:
+            stripped = line.lstrip()
+            if line == stripped and 'GetService' in line:  # top-level only
                 insert_idx = i + 1
+            elif line == stripped and stripped and not stripped.startswith('--') and not stripped.startswith('local '):
+                break
         lines.insert(insert_idx, helper)
         source = '\n'.join(lines)
         fixes.append("Injected _isMouseButtonDown helper")

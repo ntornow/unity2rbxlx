@@ -2020,10 +2020,17 @@ def _extract_monobehaviour_attributes(
                         scale_factor = import_scale * unit_ratio * config.STUDS_PER_METER
                         for sm in sub_meshes:
                             native_size = (sm["size"][0], sm["size"][1], sm["size"][2])
+                            # Use the sub-mesh position from mesh_hierarchies
+                            # so parts are offset correctly relative to each other.
+                            # Without this, all parts collapse to the same point.
+                            sm_pos = sm.get("position", [0, 0, 0])
+                            px = sm_pos[0] * scale_factor
+                            py = sm_pos[1] * scale_factor
+                            pz = sm_pos[2] * scale_factor
                             mesh_part = RbxPart(
                                 name=sm["name"],
                                 class_name="MeshPart",
-                                cframe=RbxCFrame(x=0, y=0, z=0),
+                                cframe=RbxCFrame(x=px, y=py, z=pz),
                                 size=(
                                     native_size[0] * scale_factor,
                                     native_size[1] * scale_factor,
