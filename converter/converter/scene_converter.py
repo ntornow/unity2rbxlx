@@ -3146,6 +3146,7 @@ def _convert_prefab_instance(
                 parent_pos=pos, parent_rot=quat_for_roblox, parent_scl=scl,
                 child_modifications=child_modifications,
                 disabled_components=disabled_components,
+                parent_mesh_guid=root.mesh_guid if hasattr(root, 'mesh_guid') else None,
             )
             if child_part:
                 part.children.append(child_part)
@@ -3323,6 +3324,7 @@ def _convert_prefab_node(
     parent_scl: list[float] | tuple[float, ...] | None = None,
     child_modifications: dict[str, list[dict]] | None = None,
     disabled_components: set[str] | None = None,
+    parent_mesh_guid: str | None = None,
 ) -> RbxPart | None:
     """Convert a PrefabNode to an RbxPart.
 
@@ -3376,6 +3378,14 @@ def _convert_prefab_node(
                 from core.coordinate_system import is_yup_fbx
                 if is_yup_fbx(_fbx):
                     node_rot = [0.0, 0.0, 0.0, 1.0]  # Y-up: rotation baked into vertices
+                    # Zero position for NESTED sub-mesh children (depth > 1)
+                    # of the same FBX. At depth 1, children are direct children
+                    # of the prefab root — their positions are scene-level
+                    # (designer-set), not FBX-internal. At depth > 1, children
+                    # are sub-meshes nested under another sub-mesh — their
+                    # positions are FBX-internal and baked by Roblox.
+                    if depth > 0 and parent_mesh_guid and node.mesh_guid == parent_mesh_guid:
+                        world_pos = list(pp)
                 else:
                     from core.coordinate_system import strip_fbx_prerotation_left
                     node_rot = list(strip_fbx_prerotation_left(*local_rot))  # Z-up child: left-strip
@@ -3560,6 +3570,7 @@ def _convert_prefab_node(
             parent_pos=local_pos, parent_rot=local_rot, parent_scl=local_scl,
             child_modifications=child_modifications,
             disabled_components=disabled_components,
+            parent_mesh_guid=node.mesh_guid if hasattr(node, 'mesh_guid') else None,
         )
         if child_part:
             part.children.append(child_part)
