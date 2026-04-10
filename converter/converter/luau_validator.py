@@ -5813,16 +5813,52 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
     for unity_name, roblox_key in _UNITY_INPUT_MAP.items():
         if unity_name in source:
             # IsKeyDown("Jump") → IsKeyDown(Enum.KeyCode.Space)
-            # But for MouseButton types, use IsMouseButtonPressed instead
+            # MouseButton types: use GetMouseButtonsPressed (IsMouseButtonPressed
+            # is not a valid Roblox API)
             if 'MouseButton' in roblox_key:
-                button_num = roblox_key.split('MouseButton')[-1]
                 source = source.replace(
                     f'IsKeyDown({unity_name})',
-                    f'IsMouseButtonPressed({roblox_key})',
+                    f'_isMouseButtonDown({roblox_key})',
                 )
             else:
                 source = source.replace(f'IsKeyDown({unity_name})', f'IsKeyDown({roblox_key})')
             fixes.append(f"Fixed Unity input {unity_name} → {roblox_key}")
+
+    # Fix invalid IsMouseButtonPressed calls (not a valid Roblox API).
+    # Strip the UserInputService: prefix and replace with helper function.
+    if 'IsMouseButtonPressed' in source:
+        source = re.sub(
+            r'(?:UserInputService:|UIS:)?IsMouseButtonPressed\(',
+            '_isMouseButtonDown(',
+            source,
+        )
+        fixes.append("Fixed invalid IsMouseButtonPressed → _isMouseButtonDown helper")
+
+    # Also fix any _isMouseButtonDown that ended up as a method call
+    if 'UserInputService:_isMouseButtonDown' in source or 'UIS:_isMouseButtonDown' in source:
+        source = source.replace('UserInputService:_isMouseButtonDown', '_isMouseButtonDown')
+        source = source.replace('UIS:_isMouseButtonDown', '_isMouseButtonDown')
+
+    # Inject helper function if needed
+    if '_isMouseButtonDown' in source and 'local function _isMouseButtonDown' not in source:
+        helper = (
+            'local function _isMouseButtonDown(btn)\n'
+            '    local UIS = game:GetService("UserInputService")\n'
+            '    for _, input in UIS:GetMouseButtonsPressed() do\n'
+            '        if input.UserInputType == btn then return true end\n'
+            '    end\n'
+            '    return false\n'
+            'end\n'
+        )
+        # Insert after the first GetService line or at the top
+        lines = source.split('\n')
+        insert_idx = 0
+        for i, line in enumerate(lines):
+            if 'GetService' in line:
+                insert_idx = i + 1
+        lines.insert(insert_idx, helper)
+        source = '\n'.join(lines)
+        fixes.append("Injected _isMouseButtonDown helper")
 
     # Catch-all: any remaining IsKeyDown("StringName") → Enum.KeyCode.StringName
     # This handles unmapped Unity input axis names

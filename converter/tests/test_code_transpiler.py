@@ -711,11 +711,12 @@ class TestValidatorStructuralFixes:
         assert '"Jump"' not in fixed
 
     def test_unity_input_fire_to_mouse(self):
-        """IsKeyDown("Fire") → IsMouseButtonPressed(Enum.UserInputType.MouseButton1)."""
+        """IsKeyDown("Fire") → _isMouseButtonDown(Enum.UserInputType.MouseButton1)."""
         from converter.luau_validator import validate_and_fix
         source = 'if UserInputService:IsKeyDown("Fire") then'
         fixed, _ = validate_and_fix("test", source)
-        assert 'IsMouseButtonPressed' in fixed
+        assert '_isMouseButtonDown' in fixed
+        assert 'GetMouseButtonsPressed' in fixed  # helper function injected
         assert '"Fire"' not in fixed
 
 

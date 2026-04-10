@@ -1991,8 +1991,10 @@ def _extract_monobehaviour_attributes(
                 if mesh_key and mesh_key in _mesh_hierarchies:
                     sub_meshes = _mesh_hierarchies[mesh_key]
                     if sub_meshes:
-                        # Create a Model containing all sub-meshes
-                        field_name = key[0].upper() + key[1:] if key else key
+                        # Create a Model containing all sub-meshes.
+                        # Keep the original C# field name (camelCase) so that
+                        # transpiled script lookups via FindFirstChild work.
+                        field_name = key
                         model = RbxPart(
                             name=field_name,
                             class_name="Model",
@@ -2008,8 +2010,8 @@ def _extract_monobehaviour_attributes(
                         # If the reference is a prefab, use the resolved mesh GUID
                         if ref_path.suffix.lower() == ".prefab" and mesh_path != ref_path:
                             mesh_guid_for_scale = None
-                            for g, p in guid_index._guid_to_path.items() if hasattr(guid_index, '_guid_to_path') else []:
-                                if p == mesh_path or str(p) == str(mesh_path):
+                            for g, e in guid_index.guid_to_entry.items():
+                                if e.asset_path == mesh_path or str(e.asset_path) == str(mesh_path):
                                     mesh_guid_for_scale = g
                                     break
                             if mesh_guid_for_scale:
