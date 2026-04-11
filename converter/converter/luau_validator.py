@@ -2862,6 +2862,48 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         )
         fixes.append("Delayed Pickup Destroy() so player can clone item first")
 
+    # Pickup character resolution: walk up the hierarchy to find the
+    # character Model, not just otherPart.Parent (which fails for
+    # accessory/hat sub-parts).
+    if 'local character = otherPart.Parent' in source and 'FindFirstChildWhichIsA("Humanoid")' in source:
+        source = source.replace(
+            'local character = otherPart.Parent\n\tlocal humanoid = character and character:FindFirstChildWhichIsA("Humanoid")',
+            'local character = otherPart:FindFirstAncestorOfClass("Model")\n\twhile character and not character:FindFirstChildWhichIsA("Humanoid") do\n\t\tcharacter = character:FindFirstAncestorOfClass("Model")\n\tend\n\tlocal humanoid = character and character:FindFirstChildWhichIsA("Humanoid")',
+        )
+        fixes.append("Fixed Pickup character resolution to walk up hierarchy")
+
+    # Pickup → Player communication via RemoteEvent (server attributes
+    # don't reliably trigger client listeners). Replace SetAttribute
+    # with FireClient on a shared RemoteEvent.
+    if 'character:SetAttribute("GetItem"' in source and 'GetPlayerFromCharacter' in source:
+        source = source.replace(
+            '-- Send item to player\n\tcharacter:SetAttribute("GetItem", itemName)',
+            '-- Send item to player via RemoteEvent\n\tlocal _re = game:GetService("ReplicatedStorage"):FindFirstChild("ItemPickupEvent")\n\tif not _re then\n\t\t_re = Instance.new("RemoteEvent")\n\t\t_re.Name = "ItemPickupEvent"\n\t\t_re.Parent = game:GetService("ReplicatedStorage")\n\tend\n\t_re:FireClient(player, itemName)',
+        )
+        fixes.append("Pickup uses RemoteEvent instead of attribute")
+
+    # Player listener: also listen on RemoteEvent for item pickups
+    if 'GetAttributeChangedSignal("GetItem")' in source and '_REMOTE_PICKUP_LISTENER' not in source:
+        # Inject RemoteEvent listener that calls getItem
+        injection = (
+            '\n-- _REMOTE_PICKUP_LISTENER\n'
+            'task.spawn(function()\n'
+            '    local _re = game:GetService("ReplicatedStorage"):WaitForChild("ItemPickupEvent", 30)\n'
+            '    if _re then\n'
+            '        _re.OnClientEvent:Connect(function(itemName)\n'
+            '            if getItem then getItem(itemName) end\n'
+            '        end)\n'
+            '    end\n'
+            'end)\n'
+        )
+        # Insert before the first GetAttributeChangedSignal line
+        idx = source.find('character:GetAttributeChangedSignal("GetItem")')
+        if idx >= 0:
+            # Find start of line
+            line_start = source.rfind('\n', 0, idx) + 1
+            source = source[:line_start] + injection + source[line_start:]
+            fixes.append("Added RemoteEvent listener for item pickups")
+
     # When script looks up "riflePrefab" (Unity field reference) and the
     # Model wasn't created (no mesh_hierarchies during conversion), fall
     # back to searching for the rifle Model anywhere in workspace.

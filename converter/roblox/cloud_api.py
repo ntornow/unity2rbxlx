@@ -66,7 +66,10 @@ def _poll_operation(
     max_polls: int = 60,
     poll_interval: float = 2.0,
 ) -> str | None:
-    """Poll an async operation until done, return the asset ID."""
+    """Poll an async operation until done, return the asset ID.
+
+    Only returns numeric asset IDs (not UUIDs or operation paths).
+    """
     url = f"https://apis.roblox.com/assets/v1/operations/{operation_id}"
     for i in range(max_polls):
         time.sleep(poll_interval)
@@ -79,12 +82,18 @@ def _poll_operation(
                 # Asset ID is in response.assetId or response path
                 response_data = data.get("response", {})
                 asset_id = response_data.get("assetId")
-                if asset_id:
+                if asset_id and str(asset_id).isdigit():
                     return str(asset_id)
                 # Try extracting from path like "assets/123456"
                 path = data.get("path", "") or response_data.get("path", "")
                 if "/" in path:
-                    return path.split("/")[-1]
+                    candidate = path.split("/")[-1]
+                    if candidate.isdigit():
+                        return candidate
+                # Operation completed but no numeric asset ID — moderation
+                # may still be pending, or upload was rejected.
+                logger.warning("Upload op %s done but no numeric asset ID: %s",
+                               operation_id, response_data)
                 return None
         except Exception as exc:
             logger.warning("Poll attempt %d failed: %s", i + 1, exc)
