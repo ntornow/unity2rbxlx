@@ -14,6 +14,8 @@ sys.path.insert(0, str(CONVERTER_ROOT))
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 TEST_PROJECTS_DIR = CONVERTER_ROOT.parent / "test_projects"
 
+from tests._project_paths import SIMPLEFPS_PATH, is_populated  # noqa: E402
+
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "slow: marks tests as slow (deselect with '-m \"not slow\"')")
@@ -51,7 +53,12 @@ def platformer_project() -> Path:
 
 @pytest.fixture
 def simplefps_project() -> Path:
-    return TEST_PROJECTS_DIR / "SimpleFPS"
+    if not is_populated(SIMPLEFPS_PATH):
+        pytest.skip(
+            "SimpleFPS project not available "
+            "(submodule not pulled, no external checkout at ../unity-3d-simplefps)"
+        )
+    return SIMPLEFPS_PATH
 
 
 @pytest.fixture

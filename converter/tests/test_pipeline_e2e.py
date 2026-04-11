@@ -12,6 +12,18 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from tests._project_paths import (  # noqa: E402
+    BOATATTACK_PATH,
+    BOSSROOM_PATH,
+    CHOPCHOP_PATH,
+    GAMEKIT3D_PATH,
+    PLATFORMER_PATH,
+    REDRUNNER_PATH,
+    SANANDREAS_PATH,
+    SIMPLEFPS_PATH,
+    is_populated,
+)
+
 
 def _has_unitypy():
     try:
@@ -35,7 +47,7 @@ class TestPipelineE2E:
         config.USE_AI_TRANSPILATION = old
 
     @pytest.mark.skipif(
-        not (Path(__file__).parent.parent.parent / "test_projects" / "SimpleFPS").exists(),
+        not is_populated(SIMPLEFPS_PATH),
         reason="SimpleFPS test project not available",
     )
     def test_simplefps_parse(self, tmp_path):
@@ -44,7 +56,7 @@ class TestPipelineE2E:
         from unity.prefab_parser import parse_prefabs
         from unity.guid_resolver import build_guid_index
 
-        project = Path(__file__).parent.parent.parent / "test_projects" / "SimpleFPS"
+        project = SIMPLEFPS_PATH
 
         # Build GUID index
         guid_index = build_guid_index(project)
@@ -60,14 +72,14 @@ class TestPipelineE2E:
         assert len(library.prefabs) > 0
 
     @pytest.mark.skipif(
-        not (Path(__file__).parent.parent.parent / "test_projects" / "SimpleFPS").exists(),
+        not is_populated(SIMPLEFPS_PATH),
         reason="SimpleFPS test project not available",
     )
     def test_simplefps_full_convert(self, tmp_path):
         """Test full conversion of SimpleFPS (no upload)."""
         from converter.pipeline import Pipeline
 
-        project = Path(__file__).parent.parent.parent / "test_projects" / "SimpleFPS"
+        project = SIMPLEFPS_PATH
         pipeline = Pipeline(
             unity_project_path=project,
             output_dir=tmp_path,
@@ -116,7 +128,7 @@ class TestPipelineE2E:
         assert has_ground, "GroundCollider should exist for terrain collision"
 
     @pytest.mark.skipif(
-        not (Path(__file__).parent.parent.parent / "test_projects" / "3D-Platformer").exists(),
+        not is_populated(PLATFORMER_PATH),
         reason="3D-Platformer test project not available",
     )
     @pytest.mark.skipif(
@@ -127,7 +139,7 @@ class TestPipelineE2E:
         """Test binary scene conversion of 3D-Platformer."""
         from converter.pipeline import Pipeline
 
-        project = Path(__file__).parent.parent.parent / "test_projects" / "3D-Platformer"
+        project = PLATFORMER_PATH
         pipeline = Pipeline(
             unity_project_path=project,
             output_dir=tmp_path,
@@ -140,7 +152,7 @@ class TestPipelineE2E:
         assert len(rbxlx_files) > 0
 
     @pytest.mark.skipif(
-        not (Path(__file__).parent.parent.parent / "test_projects" / "RedRunner").exists(),
+        not is_populated(REDRUNNER_PATH),
         reason="RedRunner test project not available",
     )
     @pytest.mark.skipif(
@@ -151,7 +163,7 @@ class TestPipelineE2E:
         """Test binary scene conversion of RedRunner."""
         from converter.pipeline import Pipeline
 
-        project = Path(__file__).parent.parent.parent / "test_projects" / "RedRunner"
+        project = REDRUNNER_PATH
         pipeline = Pipeline(
             unity_project_path=project,
             output_dir=tmp_path,
@@ -163,14 +175,14 @@ class TestPipelineE2E:
         assert pipeline.context.transpiled_scripts > 0
 
     @pytest.mark.skipif(
-        not (Path(__file__).parent.parent.parent / "test_projects" / "Gamekit3D").exists(),
+        not is_populated(GAMEKIT3D_PATH),
         reason="Gamekit3D test project not available",
     )
     def test_gamekit3d_large_conversion(self, tmp_path):
         """Test large project conversion (Gamekit3D: 18k+ parts)."""
         from converter.pipeline import Pipeline
 
-        project = Path(__file__).parent.parent.parent / "test_projects" / "Gamekit3D"
+        project = GAMEKIT3D_PATH
         pipeline = Pipeline(
             unity_project_path=project,
             output_dir=tmp_path,
@@ -190,14 +202,14 @@ class TestPipelineE2E:
         assert tree.getroot().tag == "roblox"
 
     @pytest.mark.skipif(
-        not (Path(__file__).parent.parent.parent / "test_projects" / "SimpleFPS").exists(),
+        not is_populated(SIMPLEFPS_PATH),
         reason="SimpleFPS test project not available",
     )
     def test_simplefps_no_orphans(self, tmp_path):
         """Verify all prefab instances are parented (zero orphans)."""
         from converter.pipeline import Pipeline
 
-        project = Path(__file__).parent.parent.parent / "test_projects" / "SimpleFPS"
+        project = SIMPLEFPS_PATH
         pipeline = Pipeline(
             unity_project_path=project,
             output_dir=tmp_path,
@@ -217,14 +229,14 @@ class TestPipelineE2E:
         assert len(root_items) < 20, f"Too many workspace root items: {len(root_items)}"
 
     @pytest.mark.skipif(
-        not (Path(__file__).parent.parent.parent / "test_projects" / "SimpleFPS").exists(),
+        not is_populated(SIMPLEFPS_PATH),
         reason="SimpleFPS test project not available",
     )
     def test_simplefps_multi_scene(self, tmp_path):
         """Test multi-scene conversion produces separate .rbxlx files."""
         from converter.pipeline import Pipeline
 
-        project = Path(__file__).parent.parent.parent / "test_projects" / "SimpleFPS"
+        project = SIMPLEFPS_PATH
         pipeline = Pipeline(
             unity_project_path=project,
             output_dir=tmp_path,
@@ -249,14 +261,14 @@ class TestPipelineE2E:
         assert len(pipeline.context.scenes_metadata) == 2
 
     @pytest.mark.skipif(
-        not (Path(__file__).parent.parent.parent / "test_projects" / "ChopChop").exists(),
+        not is_populated(CHOPCHOP_PATH),
         reason="ChopChop test project not available",
     )
     def test_chopchop_nested_project(self, tmp_path):
         """Test auto-detection of nested Unity project root (UOP1_Project/)."""
         from converter.pipeline import Pipeline
 
-        project = Path(__file__).parent.parent.parent / "test_projects" / "ChopChop"
+        project = CHOPCHOP_PATH
         pipeline = Pipeline(
             unity_project_path=project,
             output_dir=tmp_path,
@@ -269,7 +281,7 @@ class TestPipelineE2E:
         assert pipeline.context.transpiled_scripts > 0
 
     @pytest.mark.skipif(
-        not (Path(__file__).parent.parent.parent / "test_projects" / "BossRoom").exists(),
+        not is_populated(BOSSROOM_PATH),
         reason="BossRoom test project not available",
     )
     def test_bossroom_converts(self, tmp_path):
@@ -277,7 +289,7 @@ class TestPipelineE2E:
         from converter.pipeline import Pipeline
         import xml.etree.ElementTree as ET
 
-        project = Path(__file__).parent.parent.parent / "test_projects" / "BossRoom"
+        project = BOSSROOM_PATH
         pipeline = Pipeline(
             unity_project_path=project,
             output_dir=tmp_path,
@@ -293,7 +305,7 @@ class TestPipelineE2E:
         assert tree.getroot().tag == "roblox"
 
     @pytest.mark.skipif(
-        not (Path(__file__).parent.parent.parent / "test_projects" / "BoatAttack").exists(),
+        not is_populated(BOATATTACK_PATH),
         reason="BoatAttack test project not available",
     )
     def test_boatattack_converts(self, tmp_path):
@@ -301,7 +313,7 @@ class TestPipelineE2E:
         from converter.pipeline import Pipeline
         import xml.etree.ElementTree as ET
 
-        project = Path(__file__).parent.parent.parent / "test_projects" / "BoatAttack"
+        project = BOATATTACK_PATH
         pipeline = Pipeline(
             unity_project_path=project,
             output_dir=tmp_path,
@@ -316,7 +328,7 @@ class TestPipelineE2E:
         assert tree.getroot().tag == "roblox"
 
     @pytest.mark.skipif(
-        not (Path(__file__).parent.parent.parent / "test_projects" / "SanAndreasUnity").exists(),
+        not is_populated(SANANDREAS_PATH),
         reason="SanAndreasUnity test project not available",
     )
     def test_sanandreas_converts(self, tmp_path):
@@ -324,7 +336,7 @@ class TestPipelineE2E:
         from converter.pipeline import Pipeline
         import xml.etree.ElementTree as ET
 
-        project = Path(__file__).parent.parent.parent / "test_projects" / "SanAndreasUnity"
+        project = SANANDREAS_PATH
         pipeline = Pipeline(
             unity_project_path=project,
             output_dir=tmp_path,
