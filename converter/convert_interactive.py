@@ -44,7 +44,6 @@ import json
 import logging
 import sys
 import time
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +84,10 @@ SKILL_TO_PIPELINE_PHASE: dict[str, str] = {
 }
 
 STATE_FILENAME = ".convert_state.json"
+
+# Roblox Open Cloud execute_luau accepts scripts up to ~4MB. Place-builder
+# scripts larger than this must fall back to the runtime MeshLoader path.
+MAX_EXECUTE_LUAU_BYTES = 4_000_000
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +183,12 @@ def _run_through(pipeline: Pipeline, target_phase: str) -> None:
     instead of running everything to the end.  ``essential_phases`` are
     re-run unconditionally because they produce in-memory state in
     ``pipeline.state`` that is not persisted to disk.
+
+    ``cloud_side_effect_phases`` (``upload_assets``, ``resolve_assets``) are
+    *never* run as prerequisites — they touch the Roblox Open Cloud API and
+    must only run when explicitly targeted by the ``assemble`` skill phase.
+    Running them as silent prerequisites to ``materials`` or ``transpile``
+    would leak quota / money on every review-phase invocation.
     """
     if target_phase not in PHASES:
         raise click.UsageError(
@@ -194,8 +203,13 @@ def _run_through(pipeline: Pipeline, target_phase: str) -> None:
         "convert_animations",
         "convert_scene",
     }
+    cloud_side_effect_phases = {"upload_assets", "resolve_assets"}
     target_idx = PHASES.index(target_phase)
     for prior in PHASES[:target_idx]:
+        if prior in cloud_side_effect_phases:
+            # Only `assemble` is allowed to run these; never as a prerequisite
+            # for a review phase like `materials` or `transpile`.
+            continue
         if prior in essential_phases or prior not in pipeline.ctx.completed_phases:
             pipeline._run_phase(prior)
     pipeline._run_phase(target_phase)
@@ -262,41 +276,50 @@ def preflight(unity_project_path: str, output_dir: str, install: bool) -> None:
     result: dict[str, Any] = {"phase": "preflight", "success": True}
     result["python_version"] = sys.version.split()[0]
 
-    if sys.version_info < (3, 10):
+    # Matches ``requires-python = ">=3.11"`` in pyproject.toml.
+    if sys.version_info < (3, 11):
         result["success"] = False
-        result["python_error"] = f"Python >= 3.10 required, got {sys.version}"
+        result["python_error"] = f"Python >= 3.11 required, got {sys.version}"
 
+    # Hard dependencies — the pipeline cannot run without these.
     required = {
         "yaml": "PyYAML",
         "lxml": "lxml",
         "click": "click",
         "PIL": "Pillow",
         "trimesh": "trimesh",
-        "anthropic": "anthropic",
         "lz4": "lz4",
         "numpy": "numpy",
+        "requests": "requests",  # roblox/cloud_api.py imports this
     }
-    missing: list[str] = []
-    for mod, pkg in required.items():
-        try:
-            __import__(mod)
-        except ImportError:
-            missing.append(pkg)
+    # Soft dependencies — only needed for opt-in features (AI transpilation).
+    # Missing these is reported as a warning, not a failure.
+    optional = {
+        "anthropic": "anthropic",  # Only needed for AI-assisted transpilation
+    }
 
-    if missing and install:
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", *missing, "--break-system-packages"],
-            capture_output=True,
-        )
-        still_missing = []
-        for mod, pkg in required.items():
+    def _import_missing(mapping: dict[str, str]) -> list[str]:
+        missing: list[str] = []
+        for mod, pkg in mapping.items():
             try:
                 __import__(mod)
             except ImportError:
-                still_missing.append(pkg)
-        missing = still_missing
+                missing.append(pkg)
+        return missing
+
+    missing = _import_missing(required)
+    missing_optional = _import_missing(optional)
+
+    if (missing or missing_optional) and install:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", *missing, *missing_optional],
+            capture_output=True,
+        )
+        missing = _import_missing(required)
+        missing_optional = _import_missing(optional)
         result["install_ran"] = True
     result["missing_packages"] = missing
+    result["missing_optional_packages"] = missing_optional
 
     unity_path = Path(unity_project_path)
     result["unity_project_valid"] = (
@@ -508,9 +531,15 @@ def transpile(unity_project_path: str, output_dir: str,
     """Phase 3b: transpile C# scripts to Luau."""
     if api_key:
         ak = Path(api_key)
-        config.ANTHROPIC_API_KEY = (
-            ak.read_text().strip() if ak.is_file() else api_key.strip()
-        )
+        key_value = ak.read_text().strip() if ak.is_file() else api_key.strip()
+        config.ANTHROPIC_API_KEY = key_value
+        # ``converter/pipeline.py`` does ``from config import ANTHROPIC_API_KEY``
+        # at module load time, so mutating ``config.ANTHROPIC_API_KEY`` alone
+        # leaves the pipeline module's local binding pointing at the old value
+        # (typically ``None``).  Update it too so the transpiler actually sees
+        # the key the user supplied on the CLI.
+        from converter import pipeline as _pipeline_module
+        _pipeline_module.ANTHROPIC_API_KEY = key_value
     if no_ai:
         config.USE_AI_TRANSPILATION = False
 
@@ -722,13 +751,36 @@ def upload(output_dir: str, api_key: str | None,
         })
         sys.exit(1)
 
-    # Resolve universe/place IDs from CLI or cached file.
-    ids_file = out / "resolve_ids.json"
+    # Resolve universe/place IDs from, in priority order:
+    #   1. CLI flags                           (user override)
+    #   2. Persisted ConversionContext          (set by pipeline.resolve_assets
+    #                                            when it auto-creates an experience)
+    #   3. ``.roblox_ids.json``                 (written by pipeline.resolve_assets
+    #                                            as the canonical ID cache)
+    #   4. ``resolve_ids.json``                 (legacy cache written by this CLI)
     uid, pid = universe_id, place_id
-    if (not uid or not pid) and ids_file.exists():
-        cached = json.loads(ids_file.read_text(encoding="utf-8"))
-        uid = uid or cached.get("universe_id")
-        pid = pid or cached.get("place_id")
+
+    if not uid or not pid:
+        try:
+            prior_ctx = ConversionContext.load(ctx_path)
+            uid = uid or prior_ctx.universe_id
+            pid = pid or prior_ctx.place_id
+        except Exception as exc:  # noqa: BLE001 — surfaced to user below if still missing
+            log.debug("upload: could not read ctx for id fallback: %s", exc)
+
+    ids_file = out / "resolve_ids.json"
+    for cache_path in (out / ".roblox_ids.json", ids_file):
+        if uid and pid:
+            break
+        if not cache_path.exists():
+            continue
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            uid = uid or cached.get("universe_id")
+            pid = pid or cached.get("place_id")
+        except (json.JSONDecodeError, OSError) as exc:
+            log.warning("upload: could not read %s: %s", cache_path.name, exc)
+
     if not uid or not pid:
         _emit({
             "phase": "upload",
@@ -740,8 +792,6 @@ def upload(output_dir: str, api_key: str | None,
             ],
         })
         sys.exit(1)
-
-    ids_file.write_text(json.dumps({"universe_id": uid, "place_id": pid}))
 
     # Re-run the pipeline through convert_scene so we have rbx_place in memory
     # for the place builder.
@@ -775,12 +825,13 @@ def upload(output_dir: str, api_key: str | None,
     script_file = out / "place_builder.luau"
     script_file.write_text("\n\n".join(chunks) if len(chunks) > 1 else chunks[0])
 
-    if total_size > 4_000_000:
+    if total_size > MAX_EXECUTE_LUAU_BYTES:
         _emit({
             "phase": "upload",
             "success": False,
             "errors": [
-                f"Place builder script exceeds 4MB limit ({total_size/1024/1024:.1f} MB). "
+                f"Place builder script exceeds {MAX_EXECUTE_LUAU_BYTES // 1_000_000}MB limit "
+                f"({total_size/1024/1024:.1f} MB). "
                 "Use the local rbxlx with the runtime MeshLoader instead."
             ],
             "script_path": str(script_file),
@@ -801,9 +852,25 @@ def upload(output_dir: str, api_key: str | None,
             break
 
     pipeline.ctx.save(_context_path(out))
-    _mark_skill_phase(out, "upload",
-                      universe_id=uid, place_id=pid,
-                      success=all_ok)
+
+    if all_ok:
+        # Only cache universe/place IDs after a successful publish — avoids
+        # persisting bad IDs that would be silently reused next run.
+        ids_file.write_text(json.dumps({"universe_id": uid, "place_id": pid}))
+        _mark_skill_phase(out, "upload",
+                          universe_id=uid, place_id=pid,
+                          success=True)
+    else:
+        # Record the failure without advancing the workflow.  Do NOT add
+        # "upload" to completed_skill_phases — that would let `status`
+        # advance to `report` on a broken publish.
+        state = _load_skill_state(out)
+        state["last_upload_failure"] = {
+            "universe_id": uid,
+            "place_id": pid,
+            "chunks": len(chunks),
+        }
+        _save_skill_state(out, state)
 
     _emit({
         "phase": "upload",
