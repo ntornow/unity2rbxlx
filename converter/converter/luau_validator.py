@@ -2938,6 +2938,18 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
                 source = source[:end_idx] + injection + source[end_idx:]
                 fixes.append("Added RemoteEvent listener for item pickups")
 
+    # Player.luau's setupSounds() walks `script.Parent` for Sound descendants,
+    # but when the script is a ModuleScript in ReplicatedStorage the bound Part
+    # (holding the Unity-serialized AudioClip sounds as Sound children) lives
+    # under Workspace, not under script.Parent. Broaden the search so it also
+    # scans workspace for a matching host Part.
+    if 'local function setupSounds()' in source and '_SETUP_SOUNDS_BROAD' not in source:
+        source = source.replace(
+            'local function setupSounds()\n    local parent = script.Parent',
+            'local function setupSounds()\n    -- _SETUP_SOUNDS_BROAD: also search Workspace for the bound host Part\n    local parent = script.Parent\n    if parent and not parent:FindFirstChildWhichIsA("Sound", true) then\n        for _, _cand in ipairs(workspace:GetDescendants()) do\n            if _cand:IsA("BasePart") and _cand.Name == "Player" and _cand:FindFirstChildWhichIsA("Sound") then\n                parent = _cand\n                break\n            end\n        end\n    end',
+        )
+        fixes.append("Broadened setupSounds() to search Workspace for the host Part's Sound children")
+
     # Shoot: remove the redundant _isMouseButtonDown early-exit. shoot() is
     # called from an InputBegan(MouseButton1) handler, so the polling check
     # races and returns false, preventing any shots from ever firing.

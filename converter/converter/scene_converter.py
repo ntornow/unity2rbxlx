@@ -179,6 +179,11 @@ _mesh_texture_ids: dict[str, str] = {}
 # Maps FBX path -> list of sub-mesh dicts with {name, meshId, size, position, textureId}
 _mesh_hierarchies: dict[str, list[dict]] = {}
 
+# Module-level storage for material mappings (set during convert_scene), used
+# by helpers like _extract_monobehaviour_attributes that resolve sub-mesh
+# SurfaceAppearances from prefab-referenced materials.
+_material_mappings: dict[str, Any] = {}
+
 # Module-level storage for FBX bounding boxes (trimesh fallback for InitialSize)
 # Maps relative asset path -> (width, height, depth) in FBX file units
 _fbx_bounding_boxes: dict[str, tuple[float, float, float]] = {}
@@ -674,6 +679,11 @@ def convert_scene(
     # Set module-level mesh hierarchies for sub-mesh resolution
     global _mesh_hierarchies
     _mesh_hierarchies = mesh_hierarchies or {}
+
+    # Expose material mappings to helpers that need to resolve sub-mesh
+    # SurfaceAppearances from prefab-referenced materials.
+    global _material_mappings
+    _material_mappings = material_mappings or {}
 
     # Store scene transform fileIDs for nested instance detection
     global _scene_xform_fids
@@ -1988,6 +1998,35 @@ def _extract_monobehaviour_attributes(
                         mesh_key = mkey
                         break
 
+                # Resolve the first material from the referenced prefab so we
+                # can apply it as a SurfaceAppearance to each sub-mesh. Unity
+                # stores material references on the prefab's MeshRenderers,
+                # separate from the FBX mesh data.
+                prefab_sa = None
+                prefab_color = None
+                if ref_path.suffix.lower() == ".prefab" and _material_mappings:
+                    try:
+                        import re as _re2
+                        from core.roblox_types import RbxSurfaceAppearance
+                        ptext = ref_path.read_text(encoding="utf-8", errors="replace")
+                        mat_match = _re2.search(r'm_Materials:\s*\n\s*-\s*\{[^}]*guid:\s*(\w+)', ptext)
+                        if mat_match:
+                            mat_guid = mat_match.group(1)
+                            mapping = _material_mappings.get(mat_guid)
+                            if mapping is not None:
+                                prefab_sa = RbxSurfaceAppearance(
+                                    color_map=getattr(mapping, "color_map_path", None),
+                                    normal_map=getattr(mapping, "normal_map_path", None),
+                                    metalness_map=getattr(mapping, "metalness_map_path", None),
+                                    roughness_map=getattr(mapping, "roughness_map_path", None),
+                                    alpha_mode=getattr(mapping, "alpha_mode", "Overlay"),
+                                    transparency=getattr(mapping, "transparency", 0.0),
+                                    tiling=getattr(mapping, "tiling", None),
+                                )
+                                prefab_color = getattr(mapping, "base_color", None)
+                    except Exception:
+                        pass
+
                 if mesh_key and mesh_key in _mesh_hierarchies:
                     sub_meshes = _mesh_hierarchies[mesh_key]
                     if sub_meshes:
@@ -2041,6 +2080,12 @@ def _extract_monobehaviour_attributes(
                             mesh_part.initial_size = native_size
                             if sm.get("textureId"):
                                 mesh_part.texture_id = sm["textureId"]
+                            if prefab_sa is not None:
+                                mesh_part.surface_appearance = prefab_sa
+                            if prefab_color is not None:
+                                mesh_part.color = (
+                                    prefab_color[0], prefab_color[1], prefab_color[2]
+                                )
                             model.children.append(mesh_part)
                         part.children.append(model)
                         log.debug("Created prefab reference '%s' with %d sub-meshes",
