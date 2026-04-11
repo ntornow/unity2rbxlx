@@ -2872,37 +2872,50 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         )
         fixes.append("Fixed Pickup character resolution to walk up hierarchy")
 
-    # Pickup → Player communication via RemoteEvent (server attributes
-    # don't reliably trigger client listeners). Replace SetAttribute
-    # with FireClient on a shared RemoteEvent.
+    # Pickup → Player communication via RemoteEvent + attribute fallback
+    # (use both for reliability — server attributes can be flaky for
+    # cross-context replication, RemoteEvents are explicit messaging).
     if 'character:SetAttribute("GetItem"' in source and 'GetPlayerFromCharacter' in source:
         source = source.replace(
             '-- Send item to player\n\tcharacter:SetAttribute("GetItem", itemName)',
-            '-- Send item to player via RemoteEvent\n\tlocal _re = game:GetService("ReplicatedStorage"):FindFirstChild("ItemPickupEvent")\n\tif not _re then\n\t\t_re = Instance.new("RemoteEvent")\n\t\t_re.Name = "ItemPickupEvent"\n\t\t_re.Parent = game:GetService("ReplicatedStorage")\n\tend\n\t_re:FireClient(player, itemName)',
+            '-- Send item to player via RemoteEvent + attribute (both for reliability)\n\tlocal _RS = game:GetService("ReplicatedStorage")\n\tlocal _re = _RS:FindFirstChild("ItemPickupEvent")\n\tif not _re then\n\t\t_re = Instance.new("RemoteEvent")\n\t\t_re.Name = "ItemPickupEvent"\n\t\t_re.Parent = _RS\n\tend\n\tprint("[Pickup] firing", itemName, "to", player.Name)\n\t_re:FireClient(player, itemName)\n\tcharacter:SetAttribute("GetItem", itemName)',
         )
-        fixes.append("Pickup uses RemoteEvent instead of attribute")
+        fixes.append("Pickup uses RemoteEvent + attribute for reliability")
 
-    # Player listener: also listen on RemoteEvent for item pickups
+    # Player listener: also listen on RemoteEvent for item pickups.
+    # Use a global function reference so it works regardless of injection point.
     if 'GetAttributeChangedSignal("GetItem")' in source and '_REMOTE_PICKUP_LISTENER' not in source:
-        # Inject RemoteEvent listener that calls getItem
+        # Inject RemoteEvent listener that calls getItem.
+        # Use _G or rawget to allow late-binding to getItem.
         injection = (
             '\n-- _REMOTE_PICKUP_LISTENER\n'
             'task.spawn(function()\n'
             '    local _re = game:GetService("ReplicatedStorage"):WaitForChild("ItemPickupEvent", 30)\n'
             '    if _re then\n'
+            '        print("[Player] RemoteEvent listener connected")\n'
             '        _re.OnClientEvent:Connect(function(itemName)\n'
-            '            if getItem then getItem(itemName) end\n'
+            '            print("[Player] OnClientEvent received:", itemName)\n'
+            '            if getItem then\n'
+            '                getItem(itemName)\n'
+            '            else\n'
+            '                print("[Player] getItem is nil!")\n'
+            '            end\n'
             '        end)\n'
+            '    else\n'
+            '        print("[Player] RemoteEvent never appeared")\n'
             '    end\n'
             'end)\n'
         )
-        # Insert before the first GetAttributeChangedSignal line
+        # Insert AFTER the first GetAttributeChangedSignal line so getItem
+        # is already in scope (it's declared above the listener).
         idx = source.find('character:GetAttributeChangedSignal("GetItem")')
         if idx >= 0:
-            # Find start of line
-            line_start = source.rfind('\n', 0, idx) + 1
-            source = source[:line_start] + injection + source[line_start:]
-            fixes.append("Added RemoteEvent listener for item pickups")
+            # Find end of the listener block (look for "end)" after idx)
+            end_idx = source.find('end)\n', idx)
+            if end_idx >= 0:
+                end_idx += len('end)\n')
+                source = source[:end_idx] + injection + source[end_idx:]
+                fixes.append("Added RemoteEvent listener for item pickups")
 
     # When script looks up "riflePrefab" (Unity field reference) and the
     # Model wasn't created (no mesh_hierarchies during conversion), fall
