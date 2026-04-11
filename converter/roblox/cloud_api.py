@@ -174,7 +174,7 @@ def _upload_asset(
     if response.status_code in (200, 201):
         data = response.json()
         asset_id = data.get("assetId") or data.get("id")
-        if asset_id:
+        if asset_id and str(asset_id).isdigit():
             logger.info("Uploaded %s -> asset %s", file_path.name, asset_id)
             return str(asset_id)
 

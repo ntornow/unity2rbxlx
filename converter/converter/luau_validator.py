@@ -2851,6 +2851,19 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         )
         fixes.append("Repositioned WeaponSlot for FPS view (right, down, forward)")
 
+    # MonoBehaviour serialized fields transpile to `script:GetAttribute("X")`,
+    # but the converter writes those attributes on the host Part/Model, not on
+    # the Script instance. Walk up from the script to find the attribute.
+    # Pattern: `local VAR = script:GetAttribute("NAME") or DEFAULT` or
+    #          `local VAR = script:GetAttribute("NAME")`
+    if re.search(r'script:GetAttribute\("[^"]+"\)', source):
+        source = re.sub(
+            r'script:GetAttribute\(("[^"]+")\)',
+            r'(function(_n) local _o = script.Parent while _o do local _v = _o:GetAttribute(_n) if _v ~= nil then return _v end _o = _o.Parent end return nil end)(\1)',
+            source,
+        )
+        fixes.append("Rewrote script:GetAttribute → walk-up lookup on parent hierarchy")
+
     # Pickup script: delay Destroy() so the player has time to clone the
     # picked-up item before it disappears. The Player script listens to
     # an attribute and runs async, so an immediate Destroy makes the
@@ -2872,13 +2885,25 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         )
         fixes.append("Fixed Pickup character resolution to walk up hierarchy")
 
-    # Pickup → Player communication via RemoteEvent + attribute fallback
-    # (use both for reliability — server attributes can be flaky for
-    # cross-context replication, RemoteEvents are explicit messaging).
+    # Pickup → Player communication via RemoteEvent + attribute fallback.
+    # Create the RemoteEvent at script load time (outside the Touched handler)
+    # so the client's WaitForChild resolves before the first touch.
     if 'character:SetAttribute("GetItem"' in source and 'GetPlayerFromCharacter' in source:
+        if '_PICKUP_REMOTE_INIT' not in source:
+            init_block = (
+                '-- _PICKUP_REMOTE_INIT\n'
+                'local _RS = game:GetService("ReplicatedStorage")\n'
+                'local _re = _RS:FindFirstChild("ItemPickupEvent")\n'
+                'if not _re then\n'
+                '\t_re = Instance.new("RemoteEvent")\n'
+                '\t_re.Name = "ItemPickupEvent"\n'
+                '\t_re.Parent = _RS\n'
+                'end\n\n'
+            )
+            source = init_block + source
         source = source.replace(
             '-- Send item to player\n\tcharacter:SetAttribute("GetItem", itemName)',
-            '-- Send item to player via RemoteEvent + attribute (both for reliability)\n\tlocal _RS = game:GetService("ReplicatedStorage")\n\tlocal _re = _RS:FindFirstChild("ItemPickupEvent")\n\tif not _re then\n\t\t_re = Instance.new("RemoteEvent")\n\t\t_re.Name = "ItemPickupEvent"\n\t\t_re.Parent = _RS\n\tend\n\tprint("[Pickup] firing", itemName, "to", player.Name)\n\t_re:FireClient(player, itemName)\n\tcharacter:SetAttribute("GetItem", itemName)',
+            '-- Send item to player via RemoteEvent + attribute (both for reliability)\n\tprint("[Pickup] firing", itemName, "to", player.Name)\n\t_re:FireClient(player, itemName)\n\tcharacter:SetAttribute("GetItem", itemName)',
         )
         fixes.append("Pickup uses RemoteEvent + attribute for reliability")
 
@@ -2890,20 +2915,16 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         injection = (
             '\n-- _REMOTE_PICKUP_LISTENER\n'
             'task.spawn(function()\n'
-            '    local _re = game:GetService("ReplicatedStorage"):WaitForChild("ItemPickupEvent", 30)\n'
-            '    if _re then\n'
-            '        print("[Player] RemoteEvent listener connected")\n'
-            '        _re.OnClientEvent:Connect(function(itemName)\n'
-            '            print("[Player] OnClientEvent received:", itemName)\n'
-            '            if getItem then\n'
-            '                getItem(itemName)\n'
-            '            else\n'
-            '                print("[Player] getItem is nil!")\n'
-            '            end\n'
-            '        end)\n'
-            '    else\n'
-            '        print("[Player] RemoteEvent never appeared")\n'
-            '    end\n'
+            '    local _re = game:GetService("ReplicatedStorage"):WaitForChild("ItemPickupEvent")\n'
+            '    print("[Player] RemoteEvent listener connected")\n'
+            '    _re.OnClientEvent:Connect(function(itemName)\n'
+            '        print("[Player] OnClientEvent received:", itemName)\n'
+            '        if getItem then\n'
+            '            getItem(itemName)\n'
+            '        else\n'
+            '            print("[Player] getItem is nil!")\n'
+            '        end\n'
+            '    end)\n'
             'end)\n'
         )
         # Insert AFTER the first GetAttributeChangedSignal line so getItem
@@ -2916,6 +2937,26 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
                 end_idx += len('end)\n')
                 source = source[:end_idx] + injection + source[end_idx:]
                 fixes.append("Added RemoteEvent listener for item pickups")
+
+    # Shoot: remove the redundant _isMouseButtonDown early-exit. shoot() is
+    # called from an InputBegan(MouseButton1) handler, so the polling check
+    # races and returns false, preventing any shots from ever firing.
+    if 'if not _isMouseButtonDown(Enum.UserInputType.MouseButton1) then return end' in source:
+        source = source.replace(
+            '    if not _isMouseButtonDown(Enum.UserInputType.MouseButton1) then return end\n',
+            '',
+        )
+        fixes.append("Removed _isMouseButtonDown early-exit in shoot() (called from InputBegan)")
+
+    # getRifle: if the pickup Touched fires repeatedly before the script
+    # destroys itself, the client equips many duplicate rifles. Short-circuit
+    # if a weapon was already equipped this life.
+    if 'local function getRifle()' in source and 'if gotWeapon then return end' not in source:
+        source = source.replace(
+            'local function getRifle()\n',
+            'local function getRifle()\n    if gotWeapon then return end\n',
+        )
+        fixes.append("getRifle early-return when gotWeapon already true (prevents duplicate equip)")
 
     # When script looks up "riflePrefab" (Unity field reference) and the
     # Model wasn't created (no mesh_hierarchies during conversion), fall
