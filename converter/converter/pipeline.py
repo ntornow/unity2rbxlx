@@ -916,8 +916,7 @@ return table.concat(allData, "\\n")'''
 
         # Write transpiled scripts to output directory AND add to RbxPlace.
         scripts_dir = self.output_dir / "scripts"
-        # Only wipe scripts/ when transpile_scripts actually ran this session.
-        # When transpile_scripts was skipped (e.g. user hand-ported Luau during
+        # When transpile_scripts was skipped (e.g. user hand-edited Luau during
         # the review step and then ran assemble without --retranspile), preserve
         # the existing scripts directory so hand-edits survive.
         preserve_scripts = (
@@ -932,7 +931,29 @@ return table.concat(allData, "\\n")'''
                 shutil.rmtree(scripts_dir)
         scripts_dir.mkdir(parents=True, exist_ok=True)
 
-        if self.state.transpilation_result:
+        if preserve_scripts:
+            # Rehydrate scripts from disk into rbx_place so the .rbxlx
+            # includes the user's hand-edited Luau files.
+            from core.roblox_types import RbxScript
+            luau_files = sorted(scripts_dir.rglob("*.luau"))
+            for luau_path in luau_files:
+                source = luau_path.read_text(encoding="utf-8")
+                name = luau_path.stem
+                # Infer script type from source content
+                script_type: str = "Script"
+                if source.rstrip().endswith("return " + name) or "\nreturn " in source:
+                    script_type = "ModuleScript"
+                elif "game.Players.LocalPlayer" in source or "UserInputService" in source:
+                    script_type = "LocalScript"
+                self.state.rbx_place.scripts.append(RbxScript(
+                    name=name,
+                    source=source,
+                    script_type=script_type,
+                ))
+            log.info("[write_output] Rehydrated %d scripts from disk (transpile skipped)",
+                     len(luau_files))
+
+        elif self.state.transpilation_result:
             from core.roblox_types import RbxScript
             from converter.luau_validator import validate_and_fix, fix_gameplay_patterns
             total_fixes = 0
