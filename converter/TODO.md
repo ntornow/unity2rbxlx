@@ -134,8 +134,10 @@ Priority: P0 = blocking gameplay, P1 = significant quality, P2 = nice to have.
 
 ### Not Yet Implemented (genuine gaps)
 - [x] **Tilemap/TilemapRenderer**: Tiles converted to thin Parts in a grid with cell sizing, tile colors, sprite GUIDs. TilemapRenderer properties extracted.
+- [ ] **write_output performance for script-heavy projects**: SanAndreasUnity (270 scripts, 24 parts) takes 3-4 min in write_output. Terrain encoder was the SimpleFPS bottleneck (fixed via inlining), but script-heavy projects without terrain still slow. Likely culprits: script binding walk, validator regex patterns on 270 scripts, or rbxlx serialization. Needs focused cProfile to identify the specific sub-step.
 - [ ] **Font upload**: Not supported by Roblox Open Cloud API. UI text uses default Roblox font.
 - [ ] **Video upload**: Not supported by Roblox Open Cloud API. VideoFrame component works but needs manual video ID.
+- [ ] **Eval baseline for all 9 projects**: Initial baseline covers 7/9 (missing Gamekit3D + SanAndreasUnity due to slow write_output). Once the perf issue is resolved, complete the baseline and wire eval-diff into CI.
 
 ### Fixed (2026-03-28 continued)
 - [x] **Skeletal animation bone resolution**: Motor6D now creates actual bone Parts with proper Part0/Part1 Ref links (was string-only names)
