@@ -81,8 +81,11 @@ API_CALL_MAP: dict[str, str] = {
     "Time.time": "workspace:GetServerTimeNow()",
     "Time.deltaTime": "dt",
     "Time.fixedDeltaTime": "dt",
+    "Time.fixedTime": "os.clock()",
+    "Time.fixedTimeAsDouble": "os.clock()",
     "Time.timeScale": "workspace:SetAttribute('TimeScale', 1)",
     "Time.unscaledDeltaTime": "dt",
+    "Time.unscaledTime": "os.clock()",
     "Time.realtimeSinceStartup": "os.clock()",
     "Time.frameCount": "math.floor(tick() * 60)",  # Approximate frame counter
     # -- Input --
@@ -190,8 +193,10 @@ API_CALL_MAP: dict[str, str] = {
     "rigidbody.MovePosition": ".CFrame",
     # -- Collider events --
     "OnCollisionEnter": ".Touched",
+    "OnCollisionStay": ".Touched",
     "OnCollisionExit": ".TouchEnded",
     "OnTriggerEnter": ".Touched",
+    "OnTriggerStay": ".Touched",
     "OnTriggerExit": ".TouchEnded",
     # -- Coroutines --
     "StartCoroutine": "task.spawn",
@@ -449,6 +454,13 @@ API_CALL_MAP: dict[str, str] = {
     "Application.isFocused": "game:GetService('UserInputService').WindowFocused",
     "Application.isEditor": "game:GetService('RunService'):IsStudio()",
     "Application.Quit()": "-- Application.Quit: use game.Players.LocalPlayer:Kick()",
+    "Application.OpenURL": "-- Application.OpenURL: use game:GetService('GuiService'):OpenBrowserWindow",
+    # -- Object Pooling --
+    ".Release(": ":Release(",
+    "ObjectPool.Get(": "ObjectPool:Get(",
+    "Application.backgroundLoadingPriority": "-- backgroundLoadingPriority: no Roblox equivalent",
+    "Application.loadLevel": "-- loadLevel: use TeleportService or place navigation",
+    "Application.LoadLevel": "-- LoadLevel: use TeleportService or place navigation",
     # -- Screen --
     "Screen.width": "workspace.CurrentCamera.ViewportSize.X",
     "Screen.height": "workspace.CurrentCamera.ViewportSize.Y",
@@ -673,8 +685,10 @@ LIFECYCLE_MAP: dict[str, str] = {
     "OnDisable": "-- OnDisable: disconnect events here",
     "OnDestroy": "-- OnDestroy: use Instance.Destroying or Maid pattern",
     "OnCollisionEnter": "part.Touched:Connect(function(otherPart)",
+    "OnCollisionStay": "part.Touched:Connect(function(otherPart) -- Stay: fires once per contact, not per-frame",
     "OnCollisionExit": "part.TouchEnded:Connect(function(otherPart)",
     "OnTriggerEnter": "part.Touched:Connect(function(otherPart)",
+    "OnTriggerStay": "part.Touched:Connect(function(otherPart) -- Stay: fires once per contact, not per-frame",
     "OnTriggerExit": "part.TouchEnded:Connect(function(otherPart)",
     "OnMouseDown": "ClickDetector.MouseClick:Connect(function(player)",
     "OnMouseEnter": "ClickDetector.MouseHoverEnter:Connect(function(player)",

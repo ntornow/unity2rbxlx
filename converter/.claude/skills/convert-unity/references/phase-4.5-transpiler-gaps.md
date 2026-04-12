@@ -1,5 +1,7 @@
 # Phase 4.5h: Transpiler Semantic Gaps
 
+> **Last verified:** 2026-04-12 against commit `e19a342`. Some prescriptions may be stale — cross-check against the current `luau_validator.py` and `api_mappings.py` before acting on them. See the 2026-04-12 audit in TODO.md for known discrepancies.
+
 The AI transpiler translates C# syntax but can miss platform-level semantic differences. Each category below is a known failure mode where 1:1 translation produces broken Luau. Use this file as a **symptom-indexed debugging reference** while writing modules and during validation.
 
 ## 1. MonoBehaviour construction vs Inspector wiring

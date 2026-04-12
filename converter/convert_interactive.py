@@ -295,13 +295,15 @@ def preflight(unity_project_path: str, output_dir: str, install: bool) -> None:
         result["python_error"] = f"Python >= 3.11 required, got {sys.version}"
 
     # Hard dependencies — the pipeline cannot run without these.
+    # Keep this list in sync with the actual `import` statements in real source
+    # (not .venv/). `lxml` and `lz4` used to be listed here but no module under
+    # converter/, unity/, roblox/, runtime/, core/, or utils/ imports them; they
+    # were ghost deps causing false-negative preflight failures on clean clones.
     required = {
         "yaml": "PyYAML",
-        "lxml": "lxml",
         "click": "click",
         "PIL": "Pillow",
         "trimesh": "trimesh",
-        "lz4": "lz4",
         "numpy": "numpy",
         "requests": "requests",  # roblox/cloud_api.py imports this
     }
@@ -546,13 +548,6 @@ def transpile(unity_project_path: str, output_dir: str,
         ak = Path(api_key)
         key_value = ak.read_text().strip() if ak.is_file() else api_key.strip()
         config.ANTHROPIC_API_KEY = key_value
-        # ``converter/pipeline.py`` does ``from config import ANTHROPIC_API_KEY``
-        # at module load time, so mutating ``config.ANTHROPIC_API_KEY`` alone
-        # leaves the pipeline module's local binding pointing at the old value
-        # (typically ``None``).  Update it too so the transpiler actually sees
-        # the key the user supplied on the CLI.
-        from converter import pipeline as _pipeline_module
-        _pipeline_module.ANTHROPIC_API_KEY = key_value
     if no_ai:
         config.USE_AI_TRANSPILATION = False
 

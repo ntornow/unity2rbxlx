@@ -66,7 +66,10 @@ def _poll_operation(
     max_polls: int = 60,
     poll_interval: float = 2.0,
 ) -> str | None:
-    """Poll an async operation until done, return the asset ID."""
+    """Poll an async operation until done, return the asset ID.
+
+    Only returns numeric asset IDs (not UUIDs or operation paths).
+    """
     url = f"https://apis.roblox.com/assets/v1/operations/{operation_id}"
     for i in range(max_polls):
         time.sleep(poll_interval)
@@ -79,12 +82,18 @@ def _poll_operation(
                 # Asset ID is in response.assetId or response path
                 response_data = data.get("response", {})
                 asset_id = response_data.get("assetId")
-                if asset_id:
+                if asset_id and str(asset_id).isdigit():
                     return str(asset_id)
                 # Try extracting from path like "assets/123456"
                 path = data.get("path", "") or response_data.get("path", "")
                 if "/" in path:
-                    return path.split("/")[-1]
+                    candidate = path.split("/")[-1]
+                    if candidate.isdigit():
+                        return candidate
+                # Operation completed but no numeric asset ID — moderation
+                # may still be pending, or upload was rejected.
+                logger.warning("Upload op %s done but no numeric asset ID: %s",
+                               operation_id, response_data)
                 return None
         except Exception as exc:
             logger.warning("Poll attempt %d failed: %s", i + 1, exc)
@@ -165,7 +174,7 @@ def _upload_asset(
     if response.status_code in (200, 201):
         data = response.json()
         asset_id = data.get("assetId") or data.get("id")
-        if asset_id:
+        if asset_id and str(asset_id).isdigit():
             logger.info("Uploaded %s -> asset %s", file_path.name, asset_id)
             return str(asset_id)
 
@@ -247,6 +256,84 @@ def upload_audio(
         asset_type="Audio",
         name=name,
     )
+
+
+def probe_asset_availability(
+    asset_id: str,
+    api_key: str,
+) -> str:
+    """Check whether an uploaded asset is actually reachable/approved.
+
+    Returns one of:
+        "approved"   — asset metadata came back cleanly and looks playable
+        "rejected"   — asset was moderation-rejected or is otherwise blocked
+        "unknown"    — probe was inconclusive (network error, unexpected shape)
+
+    The default on an inconclusive signal is "unknown", not "rejected" — we
+    never want an availability probe to cause false negatives that strip
+    otherwise-working assets from the scene. Only act on an explicit
+    rejection.
+
+    Used by the pipeline's post-upload audit pass (see
+    ``cli.py audit-assets``) to detect cases like the SimpleFPS music1.mp3
+    HTTP 403 where Roblox returned a numeric asset ID from the upload POST
+    but the asset is moderation-rejected when downstream runtime tries to
+    load it.
+    """
+    numeric = "".join(ch for ch in str(asset_id) if ch.isdigit())
+    if not numeric:
+        return "unknown"
+    url = f"{_ASSETS_URL}/{numeric}"
+
+    # Retry up to 3 times on 429 so a transient rate-limit doesn't cause a
+    # false "unknown" — the audit sweep calls this in a tight loop.
+    resp = None
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, headers=_auth_headers(api_key), timeout=30)
+        except requests.RequestException as exc:
+            logger.debug("probe_asset_availability: request failed for %s: %s", numeric, exc)
+            return "unknown"
+        if resp.status_code != 429:
+            break
+        wait = 2.0 * (attempt + 1)
+        logger.debug("probe_asset_availability: 429 on %s, waiting %.1fs", numeric, wait)
+        time.sleep(wait)
+
+    if resp is None:
+        return "unknown"
+    if resp.status_code == 403:
+        return "rejected"
+    if resp.status_code == 404:
+        return "rejected"
+    if resp.status_code != 200:
+        return "unknown"
+
+    try:
+        data = resp.json()
+    except ValueError:
+        return "unknown"
+
+    # The assets/v1/assets/{id} endpoint includes a `moderationResult` with a
+    # `moderationState` enum (Approved / Pending / Rejected). Some responses
+    # wrap it under `response`. Be defensive about both shapes.
+    moderation = (
+        data.get("moderationResult")
+        or (data.get("response") or {}).get("moderationResult")
+        or {}
+    )
+    state = (
+        moderation.get("moderationState")
+        if isinstance(moderation, dict)
+        else None
+    )
+    if state == "Rejected":
+        return "rejected"
+    if state in ("Approved", None):
+        # Approved, or no moderation block reported — trust it.
+        return "approved"
+    # Pending / any other explicit state — treat as unknown, caller decides.
+    return "unknown"
 
 
 def upload_place(

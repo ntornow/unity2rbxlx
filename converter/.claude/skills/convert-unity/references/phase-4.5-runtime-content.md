@@ -1,5 +1,7 @@
 # Phase 4.5f/h (partial): Runtime Content
 
+> **Last verified:** 2026-04-12 against commit `e19a342`. Some prescriptions may be stale — cross-check against the current `luau_validator.py` and `api_mappings.py` before acting on them. See the 2026-04-12 audit in TODO.md for known discrepancies.
+
 Many Unity games generate gameplay content at runtime — spawned enemies, level chunks, procedural terrain, collectible placements. This is the **#1 system that does not survive transpilation** because it depends on Inspector-serialized prefab references, Addressables async loading, and object pooling — none of which have Roblox equivalents. The transpiled code keeps the scoring/movement logic, but spawning methods become empty shells with nil references.
 
 ## Why it breaks

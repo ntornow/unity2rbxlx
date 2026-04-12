@@ -168,6 +168,85 @@ class TestRunThrough:
         assert parse_idx < extract_idx < transpile_idx
 
 
+class TestConversionContextSanitizedSave:
+    """`ConversionContext.save_sanitized()` strips the fields that tie a
+    conversion to a specific creator/place/experience before writing, so
+    users can share a context.json in bug reports / forums without
+    leaking uploaded asset URLs or Roblox IDs.
+    """
+
+    def test_sensitive_fields_are_stripped(self, tmp_path):
+        ctx = ConversionContext(
+            unity_project_path="/tmp/fake/unity",
+            universe_id=9803233464,
+            place_id=83382983775955,
+            experience_name="My Private Test Game",
+            uploaded_assets={
+                "Assets/Sounds/music.mp3": "rbxassetid://73218644566508",
+                "Assets/Textures/hero.png": "rbxassetid://111411402941783",
+            },
+            mesh_hierarchies={"some/mesh.fbx": [{"meshId": "rbxassetid://1"}]},
+            total_game_objects=42,
+            warnings=["sample warning"],
+        )
+        out = tmp_path / "context_sanitized.json"
+        ctx.save_sanitized(out)
+
+        assert out.exists()
+        data = json.loads(out.read_text())
+        # Stripped: credentials / identifiable fields
+        assert data["universe_id"] is None
+        assert data["place_id"] is None
+        assert data["experience_name"] is None
+        assert data["uploaded_assets"] == {}
+        assert data["mesh_hierarchies"] == {}
+        assert data["mesh_native_sizes"] == {}
+        # Preserved: stats / workflow metadata
+        assert data["unity_project_path"] == "/tmp/fake/unity"
+        assert data["total_game_objects"] == 42
+        assert data["warnings"] == ["sample warning"]
+        # Marker so consumers know it's been sanitized
+        assert data["_sanitized"] is True
+
+    def test_full_save_preserves_everything(self, tmp_path):
+        """`.save()` still writes the full state — sanitization is opt-in."""
+        ctx = ConversionContext(
+            universe_id=9803233464,
+            uploaded_assets={"x": "rbxassetid://1"},
+        )
+        out = tmp_path / "context_full.json"
+        ctx.save(out)
+
+        data = json.loads(out.read_text())
+        assert data["universe_id"] == 9803233464
+        assert data["uploaded_assets"] == {"x": "rbxassetid://1"}
+        assert "_sanitized" not in data
+
+
+class TestAnthropicKeyBinding:
+    """Regression: the pipeline must read ANTHROPIC_API_KEY lazily from the
+    config module (``_config.ANTHROPIC_API_KEY``), not capture it at import
+    time. Without lazy binding, the CLI has to patch both ``config`` and
+    ``converter.pipeline`` module globals to make a new key visible — a
+    historical footgun that left the transpiler seeing a stale ``None``.
+    """
+
+    def test_pipeline_sees_mutated_config_key(self, monkeypatch):
+        import config
+        from converter import pipeline as pipeline_module
+
+        monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-ant-test-sentinel")
+        # pipeline.py should resolve the key through its ``_config`` alias,
+        # so a config-level mutation is immediately observable without also
+        # touching pipeline_module.ANTHROPIC_API_KEY.
+        assert pipeline_module._config.ANTHROPIC_API_KEY == "sk-ant-test-sentinel"
+        # And the module must NOT export a captured top-level ANTHROPIC_API_KEY
+        # (which would shadow the lazy lookup and defeat the fix).
+        assert not hasattr(pipeline_module, "ANTHROPIC_API_KEY"), (
+            "pipeline.py should not re-export ANTHROPIC_API_KEY at module level"
+        )
+
+
 class TestPreflight:
     def test_invalid_unity_project(self, tmp_path):
         runner = CliRunner()

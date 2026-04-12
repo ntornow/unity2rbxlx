@@ -21,6 +21,7 @@ Phase-specific documentation for the `convert-unity` skill. Each file owns one n
 | `phase-5-assembly.md` | 5 | Asset upload, mesh resolution, terrain, LFS |
 | `phase-6-upload.md` | 6 | Headless place publish via Open Cloud |
 | `upload-patching.md` | 6 (detail) | Asset ID patching internals + Strategy A/B |
+| `playtest-gotchas.md` | (any) | MCP playtest caveats: module-instance caveat, click coords, Touched spam |
 
 ## House rules
 

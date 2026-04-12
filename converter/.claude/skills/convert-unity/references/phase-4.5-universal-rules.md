@@ -1,5 +1,7 @@
 # Phase 4.5d/e: Universal Rules
 
+> **Last verified:** 2026-04-12 against commit `e19a342`. Some prescriptions may be stale — cross-check against the current `luau_validator.py` and `api_mappings.py` before acting on them. See the 2026-04-12 audit in TODO.md for known discrepancies.
+
 These rules apply to every module in a converted Roblox game. Internalize them before writing any Luau.
 
 ## Game loop wiring
@@ -25,7 +27,7 @@ These rules apply to every module in a converted Roblox game. Internalize them b
 
 ## Part size limits
 
-Roblox Parts **silently fail to render** if any dimension exceeds 2048 studs. No error, no warning. Ground planes, roads, and terrain boundaries from Unity often exceed this. Either clamp and tile, or use Roblox Terrain. The pipeline caps Part sizes at 2048 studs in `converter/scene_converter.py`.
+Roblox Parts **silently fail to render** if any dimension exceeds 2048 studs. No error, no warning. Ground planes, roads, and terrain boundaries from Unity often exceed this. Either clamp and tile, or use Roblox Terrain. The pipeline caps visible Part sizes at 2048 studs per axis in `roblox/rbxlx_writer.py` (invisible/trigger parts get a 16384-stud cap since they don't render).
 
 ## Visibility rule — the #1 correctness issue
 

@@ -1,5 +1,7 @@
 # Phase 4.5h/i: Module-per-Component Rewrite & Bootstrap
 
+> **Last verified:** 2026-04-12 against commit `e19a342`. Some prescriptions may be stale — cross-check against the current `luau_validator.py` and `api_mappings.py` before acting on them. See the 2026-04-12 audit in TODO.md for known discrepancies.
+
 ## Module-per-component rule
 
 For each major game system, write a **separate Luau module** that mirrors its Unity counterpart. Mapping:
