@@ -193,8 +193,10 @@ API_CALL_MAP: dict[str, str] = {
     "rigidbody.MovePosition": ".CFrame",
     # -- Collider events --
     "OnCollisionEnter": ".Touched",
+    "OnCollisionStay": ".Touched",
     "OnCollisionExit": ".TouchEnded",
     "OnTriggerEnter": ".Touched",
+    "OnTriggerStay": ".Touched",
     "OnTriggerExit": ".TouchEnded",
     # -- Coroutines --
     "StartCoroutine": "task.spawn",
@@ -680,8 +682,10 @@ LIFECYCLE_MAP: dict[str, str] = {
     "OnDisable": "-- OnDisable: disconnect events here",
     "OnDestroy": "-- OnDestroy: use Instance.Destroying or Maid pattern",
     "OnCollisionEnter": "part.Touched:Connect(function(otherPart)",
+    "OnCollisionStay": "part.Touched:Connect(function(otherPart) -- Stay: fires once per contact, not per-frame",
     "OnCollisionExit": "part.TouchEnded:Connect(function(otherPart)",
     "OnTriggerEnter": "part.Touched:Connect(function(otherPart)",
+    "OnTriggerStay": "part.Touched:Connect(function(otherPart) -- Stay: fires once per contact, not per-frame",
     "OnTriggerExit": "part.TouchEnded:Connect(function(otherPart)",
     "OnMouseDown": "ClickDetector.MouseClick:Connect(function(player)",
     "OnMouseEnter": "ClickDetector.MouseHoverEnter:Connect(function(player)",
