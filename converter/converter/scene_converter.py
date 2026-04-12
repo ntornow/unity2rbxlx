@@ -3243,6 +3243,24 @@ def _convert_prefab_instance(
         is_root_mod = (not root_target_fid or not mod_target_fid or
                        mod_target_fid == "0" or mod_target_fid == root_target_fid)
 
+        # Custom MonoBehaviour field overrides: if the propertyPath doesn't
+        # match any known Unity system property (m_*) and isn't a transform
+        # component, treat it as a serialized field override → store as
+        # an attribute on the resulting Part so scripts can read it.
+        if not pp.startswith("m_") and not pp.startswith("Serialized"):
+            # Simple scalar overrides (int/float/string/bool)
+            target_info = mod.get("target", {})
+            if isinstance(val, str):
+                # Try numeric first
+                try:
+                    custom_field_overrides[pp] = float(val)
+                except ValueError:
+                    if val.lower() in ("true", "false"):
+                        custom_field_overrides[pp] = val.lower() == "true"
+                    elif len(val) < 100:
+                        custom_field_overrides[pp] = val
+            continue
+
         try:
             fval = float(val)
         except (ValueError, TypeError):
