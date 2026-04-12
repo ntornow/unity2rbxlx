@@ -51,7 +51,7 @@ Work autonomously with no questions — just churn forever making the converter 
 - **One-command pipeline**: `u2r.py convert` → generates rbxlx + publishes to Roblox with proper meshes
 - **Placement accuracy**: Per-sub-mesh vertical offsets, scene hierarchy composition for prefab children, all doors/turrets/pickups at correct positions. 176/176 scripts valid Luau syntax. Mixed collider handling (physical + trigger).
 - **SimpleFPS gameplay verified**: Game starts clean, 0 script errors, water fills, terrain renders, HUD works, spawn points correct, all materials applied (0 default gray).
-- **Performance**: Terrain encoding 7.7x faster via precomputed height grids + chunk skipping. SimpleFPS converts in ~6s total.
+- **Performance**: Terrain encoding 2.4x faster via inlined _get_voxel (eliminated 13.8M function calls). SimpleFPS write_output: 8.0s→3.4s. Precomputed height grids + chunk skipping from prior session.
 - SmoothGrid terrain: World-space chunk coordinates with Z inversion
 - Luau place builder: 700KB script reconstructs entire place headlessly (parts, meshes, scripts, terrain, lighting, UI)
 - SurfaceAppearance: Full PBR in rbxlx, Texture fallback for headless mode
