@@ -1,5 +1,7 @@
 # Phase 4.5: Game Logic Porting — Overview
 
+> **Last verified:** 2026-04-12 against commit `e19a342`. Some prescriptions may be stale — cross-check against the current `luau_validator.py` and `api_mappings.py` before acting on them. See the 2026-04-12 audit in TODO.md for known discrepancies.
+
 The AI transpiler in Phase 4 converts each file independently. Phase 4.5 provides **cross-file architectural awareness**: state machines, component wiring, platform-specific overrides, and the universal rules that keep transpiled Luau from silently breaking.
 
 **Do NOT flatten the game into a monolithic script.** The Roblox port must mirror the Unity project's component separation, state machine structure, and timing models.

@@ -1,5 +1,7 @@
 # Phase 4.5a: Architecture Map
 
+> **Last verified:** 2026-04-12 against commit `e19a342`. Some prescriptions may be stale — cross-check against the current `luau_validator.py` and `api_mappings.py` before acting on them. See the 2026-04-12 audit in TODO.md for known discrepancies.
+
 Before rewriting any module, build a mental model of how the Unity project is wired. Read every C# script in `<unity_project_path>/Assets/Scripts/` and produce three artifacts.
 
 ## 1. State machine identification

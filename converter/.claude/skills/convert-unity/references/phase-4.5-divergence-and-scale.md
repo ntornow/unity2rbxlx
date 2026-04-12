@@ -1,5 +1,7 @@
 # Phase 4.5b/c: Platform Divergence & Scale
 
+> **Last verified:** 2026-04-12 against commit `e19a342`. Some prescriptions may be stale — cross-check against the current `luau_validator.py` and `api_mappings.py` before acting on them. See the 2026-04-12 audit in TODO.md for known discrepancies.
+
 Unity is a blank canvas — no character, camera, input, or physics until you write them. Roblox provides defaults for all of these. For each pillar below, ask: **"Does the Unity game do this itself?"** Then: **"Does Roblox's default do the same thing, or must we override it?"**
 
 ## Pillars
