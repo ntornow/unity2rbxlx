@@ -181,3 +181,32 @@ Priority: P0 = blocking gameplay, P1 = significant quality, P2 = nice to have.
 - Blend shapes → silently skipped
 - Reflection probes → silently skipped (Future lighting compensates)
 - Light probes → silently skipped (Future lighting compensates)
+
+## Open Gaps (2026-04-12 session)
+
+Catalogued after the SimpleFPS rifle pickup end-to-end fix and PR #1 merge.
+Priority: `P0` = blocks gameplay, `P1` = correctness / maintainability, `P2` = nice to have.
+
+### Gameplay / runtime
+- [ ] **P0 — music1.mp3 HTTP 403 after upload.** Ambient soundtrack re-uploaded to `rbxassetid://105677099883784` is moderation-rejected server-side. Converter has no detection or recovery — leaves a broken SoundId in the rbxlx. Fix: add a post-upload asset-availability probe in `cloud_api.py` (GET the asset metadata, check for 403/moderation); on failure, log a warning and strip the Sound from the scene instead of embedding a broken ID.
+- [ ] **P1 — Pickup `Touched` spam.** Server Pickup script fires `ItemPickupEvent` 10+ times in the 0.5s destroy-delay window because `Touched` fires every physics step while the character overlaps the trigger. Client-side `getRifle` idempotency masks the visible bug but logs are noisy and RemoteEvent traffic is wasted. Fix: add a `local fired = false` debounce on the server Pickup script via `luau_validator.py`.
+- [ ] **P0 — Animation asset 404 audit not run.** User reported "many sound and animation failed to load errors". Only one sound 403 was actually checked this session. Needs a focused sweep: parse all `rbxassetid://` references in the rbxlx, probe each via Open Cloud `GET /v1/assets/{id}`, list any that return 403/404. Likely affects player walk/run/shoot animations.
+- [ ] **P1 — No production-grade shoot verification path.** `Player.shoot()` is only reachable via a temporary test hook injected into `ClientBootstrap`. There's no deterministic harness to confirm the InputBegan → shoot → muzzle-flash chain works after any refactor. Fix: expose `Player.shoot` intentionally (not as a test hack) and add a regression test.
+
+### Pipeline / converter correctness
+- [ ] **P1 — FBX sub-mesh materials only resolve the *first* `m_Materials` entry.** Today's fix in `_extract_monobehaviour_attributes` reads `m_Materials[0]` with a single regex match and applies that one SurfaceAppearance to *every* sub-mesh. Multi-material rifles/vehicles lose per-submesh variety. Fix: parse the full `m_Materials` list, match each sub-mesh to its corresponding MeshRenderer material index by name or file-ID order.
+- [ ] **P1 — `_material_mappings` module-level global.** Added this session as a short-circuit into `_extract_monobehaviour_attributes`. Breaks the "explicit data flow / no module globals for state" principle in the file header. Fix: thread `material_mappings` through `_extract_monobehaviour_attributes`'s signature.
+- [ ] **P1 — `script:GetAttribute("X")` walk-up rewrite is over-broad.** Validator rewrites *every* `script:GetAttribute(...)` call in transpiled scripts, not just serialized-field reads. Legitimate self-attribute reads get silently redirected to a parent. Fix: only rewrite when the top-level of the script reads an attribute whose name appears in the corresponding Unity MonoBehaviour's serialized fields (extracted in `scene_converter.py`).
+- [ ] **P2 — `_project_paths.py` hardcodes `../unity-3d-simplefps` external fallback.** Convenient for the PR author but opaque to anyone else. Either document it or remove the fallback entirely.
+- [ ] **P2 — `convert_interactive.py preflight` lists `lxml` and `lz4` as hard deps.** Neither is imported in real source. Fresh clones get false-negative failures. Fix: drop both from the `required` dict in `preflight()`.
+- [ ] **P2 — 12 phase-4.5 doc staleness items still unresolved.** Today's pass fixed 3 of 15 findings from the audit. Remaining items touch singleton handling, property getter metamethods, input wiring blanket claims, and animator config naming heuristics. Fix: schedule a dedicated doc sync sprint, or add a "last-verified-against-commit" header to each reference file.
+
+### Infrastructure / observability
+- [ ] **P1 — CI doesn't run the slow suite.** `.github/workflows/test.yml` runs `-m "not slow"` only. The 31 slow tests (Gamekit3D end-to-end etc.) are off-CI and are the ones most likely to catch large-codebase regressions. Fix: add a separate `slow` job that runs on schedule (nightly) or on `workflow_dispatch`, with submodules enabled and a longer timeout.
+- [ ] **P1 — `upload_audio` does not verify playability.** Returns a numeric ID without probing moderation state. The music1.mp3 403 would've been caught at upload time with a single follow-up GET. Fix: add availability probe in `cloud_api.upload_audio` with a configurable retry window.
+- [ ] **P0 — No regression fixtures for the rifle pickup → equip → shoot chain.** All this session's fixes are guarded only by the 998 fast tests, none of which touch SimpleFPS pickup semantics. First thing to break next refactor. Fix: add an rbxlx-level golden-snapshot test — convert SimpleFPS, assert specific script contents (`_PICKUP_REMOTE_INIT`, `gotWeapon` early-return, walk-up `GetAttribute` lookup).
+- [ ] **P2 — Studio MCP `require()` module-instance caveat undocumented.** Playtest agents that `require()` a client-side ModuleScript from the command-bar context get a fresh module instance, not the one the LocalScript holds. Hit this at least twice this session. Fix: add a "Playtest gotchas" section to the `convert-unity` skill docs.
+
+### Scope / project
+- [ ] **P1 — No second project end-to-end-verified this session.** All fixes are in general-purpose code paths but were only validated against SimpleFPS. Gamekit3D / BossRoom / ChopChop may have regressions. Fix: run the slow suite against all 9 test projects after each gameplay-impacting change.
+- [ ] **P2 — `converter/output/<project>/conversion_context.json` holds real IDs but is only protected by `.gitignore`.** If force-added or scraped by a backup tool, Roblox creator/universe/place IDs and uploaded asset URLs become public. Fix: add a `ConversionContext.save_sanitized()` that strips credentials-bearing fields, and use it for any path a user might share.
