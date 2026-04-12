@@ -1433,7 +1433,10 @@ def _process_components(
 
         # -- MonoBehaviour: extract serialized numeric/string fields as attributes --
         elif ct == "MonoBehaviour":
-            _extract_monobehaviour_attributes(comp.properties, part, guid_index, uploaded_assets)
+            _extract_monobehaviour_attributes(
+                comp.properties, part, guid_index, uploaded_assets,
+                material_mappings=_material_mappings,
+            )
 
         # -- Physics Joints --
         elif ct in _JOINT_TYPES:
@@ -1886,11 +1889,70 @@ _MONO_SYSTEM_PROPS = frozenset({
 })
 
 
+def _extract_prefab_material_map(
+    prefab_path: Path,
+) -> tuple[dict[str, str], str | None]:
+    """Walk a Unity prefab YAML and build a `{GameObject name: material GUID}`
+    map plus a fallback (first-seen) material GUID.
+
+    Unity prefab structure: each visible sub-mesh has its own GameObject with
+    a MeshRenderer component whose `m_Materials[0]` points at the material to
+    use. The MeshRenderer references its owner via `m_GameObject: {fileID: N}`
+    where N is the GameObject's fileID. This function reads both passes and
+    joins them, so per-sub-mesh materials can be resolved by name at sub-mesh
+    build time.
+
+    The function is resilient to missing fields — it returns an empty map and
+    `None` for the fallback if parsing fails.
+    """
+    try:
+        text = prefab_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}, None
+
+    import re as _re
+
+    # Pass 1: {fileID: GO name}. GameObject blocks are prefixed by `!u!1 &N`.
+    go_name_by_fid: dict[str, str] = {}
+    go_block = _re.compile(
+        r'--- !u!1 &(\d+).*?\nGameObject:.*?\n  m_Name:\s*(.*?)\n',
+        _re.DOTALL,
+    )
+    for match in go_block.finditer(text):
+        go_name_by_fid[match.group(1)] = match.group(2).strip()
+
+    # Pass 2: {GO fileID: first material GUID} from MeshRenderer blocks.
+    # Also accept SkinnedMeshRenderer (!u!137) for rigged meshes.
+    material_by_go_fid: dict[str, str] = {}
+    fallback_guid: str | None = None
+    renderer_block = _re.compile(
+        r'--- !u!(?:23|137) &\d+.*?\n(?:MeshRenderer|SkinnedMeshRenderer):.*?'
+        r'm_GameObject:\s*\{fileID:\s*(\d+)\}.*?'
+        r'm_Materials:\s*\n\s*-\s*\{[^}]*guid:\s*(\w+)',
+        _re.DOTALL,
+    )
+    for match in renderer_block.finditer(text):
+        go_fid, mat_guid = match.group(1), match.group(2)
+        material_by_go_fid.setdefault(go_fid, mat_guid)
+        if fallback_guid is None:
+            fallback_guid = mat_guid
+
+    # Join: {GO name: material guid}.
+    name_to_mat: dict[str, str] = {}
+    for fid, mat_guid in material_by_go_fid.items():
+        name = go_name_by_fid.get(fid)
+        if name:
+            name_to_mat[name] = mat_guid
+
+    return name_to_mat, fallback_guid
+
+
 def _extract_monobehaviour_attributes(
     properties: dict[str, Any],
     part: RbxPart,
     guid_index: GuidIndex | None,
     uploaded_assets: dict[str, str] | None = None,
+    material_mappings: dict[str, Any] | None = None,
 ) -> None:
     """Extract serialized fields from a MonoBehaviour as Roblox attributes.
 
@@ -1998,34 +2060,44 @@ def _extract_monobehaviour_attributes(
                         mesh_key = mkey
                         break
 
-                # Resolve the first material from the referenced prefab so we
-                # can apply it as a SurfaceAppearance to each sub-mesh. Unity
-                # stores material references on the prefab's MeshRenderers,
-                # separate from the FBX mesh data.
-                prefab_sa = None
-                prefab_color = None
-                if ref_path.suffix.lower() == ".prefab" and _material_mappings:
-                    try:
-                        import re as _re2
-                        from core.roblox_types import RbxSurfaceAppearance
-                        ptext = ref_path.read_text(encoding="utf-8", errors="replace")
-                        mat_match = _re2.search(r'm_Materials:\s*\n\s*-\s*\{[^}]*guid:\s*(\w+)', ptext)
-                        if mat_match:
-                            mat_guid = mat_match.group(1)
-                            mapping = _material_mappings.get(mat_guid)
-                            if mapping is not None:
-                                prefab_sa = RbxSurfaceAppearance(
-                                    color_map=getattr(mapping, "color_map_path", None),
-                                    normal_map=getattr(mapping, "normal_map_path", None),
-                                    metalness_map=getattr(mapping, "metalness_map_path", None),
-                                    roughness_map=getattr(mapping, "roughness_map_path", None),
-                                    alpha_mode=getattr(mapping, "alpha_mode", "Overlay"),
-                                    transparency=getattr(mapping, "transparency", 0.0),
-                                    tiling=getattr(mapping, "tiling", None),
-                                )
-                                prefab_color = getattr(mapping, "base_color", None)
-                    except Exception:
-                        pass
+                # Resolve materials from the referenced prefab so we can apply
+                # them as SurfaceAppearances to each sub-mesh. Unity stores
+                # material references on the prefab's MeshRenderers, separate
+                # from the FBX mesh data. A prefab may have *per-GameObject*
+                # materials (one MeshRenderer per GO named after a sub-mesh)
+                # or a single MeshRenderer covering all sub-meshes — we handle
+                # both: build a {go_name: material_guid} map and fall back to
+                # the first-material-seen when a sub-mesh name isn't in it.
+                #
+                # Prefer the parameter passed in; fall back to the module-level
+                # global for any caller path that still relies on the old
+                # implicit state (convert_scene sets both in lockstep).
+                mat_mappings = material_mappings if material_mappings is not None else _material_mappings
+                prefab_material_by_name: dict[str, str] = {}
+                prefab_fallback_guid: str | None = None
+                if ref_path.suffix.lower() == ".prefab" and mat_mappings:
+                    prefab_material_by_name, prefab_fallback_guid = (
+                        _extract_prefab_material_map(ref_path)
+                    )
+
+                def _build_sa_for(mat_guid: str | None):
+                    from core.roblox_types import RbxSurfaceAppearance
+                    if not mat_guid:
+                        return None, None
+                    mapping = mat_mappings.get(mat_guid) if mat_mappings else None
+                    if mapping is None:
+                        return None, None
+                    sa = RbxSurfaceAppearance(
+                        color_map=getattr(mapping, "color_map_path", None),
+                        normal_map=getattr(mapping, "normal_map_path", None),
+                        metalness_map=getattr(mapping, "metalness_map_path", None),
+                        roughness_map=getattr(mapping, "roughness_map_path", None),
+                        alpha_mode=getattr(mapping, "alpha_mode", "Overlay"),
+                        transparency=getattr(mapping, "transparency", 0.0),
+                        tiling=getattr(mapping, "tiling", None),
+                    )
+                    base = getattr(mapping, "base_color", None)
+                    return sa, base
 
                 if mesh_key and mesh_key in _mesh_hierarchies:
                     sub_meshes = _mesh_hierarchies[mesh_key]
@@ -2080,11 +2152,19 @@ def _extract_monobehaviour_attributes(
                             mesh_part.initial_size = native_size
                             if sm.get("textureId"):
                                 mesh_part.texture_id = sm["textureId"]
-                            if prefab_sa is not None:
-                                mesh_part.surface_appearance = prefab_sa
-                            if prefab_color is not None:
+                            # Resolve per-sub-mesh material: try the named
+                            # lookup first, then fall back to the prefab's
+                            # first-seen material guid.
+                            sm_guid = (
+                                prefab_material_by_name.get(sm["name"])
+                                or prefab_fallback_guid
+                            )
+                            sm_sa, sm_color = _build_sa_for(sm_guid)
+                            if sm_sa is not None:
+                                mesh_part.surface_appearance = sm_sa
+                            if sm_color is not None:
                                 mesh_part.color = (
-                                    prefab_color[0], prefab_color[1], prefab_color[2]
+                                    sm_color[0], sm_color[1], sm_color[2]
                                 )
                             model.children.append(mesh_part)
                         part.children.append(model)

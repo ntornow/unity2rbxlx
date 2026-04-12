@@ -2854,15 +2854,36 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     # MonoBehaviour serialized fields transpile to `script:GetAttribute("X")`,
     # but the converter writes those attributes on the host Part/Model, not on
     # the Script instance. Walk up from the script to find the attribute.
-    # Pattern: `local VAR = script:GetAttribute("NAME") or DEFAULT` or
-    #          `local VAR = script:GetAttribute("NAME")`
-    if re.search(r'script:GetAttribute\("[^"]+"\)', source):
-        source = re.sub(
-            r'script:GetAttribute\(("[^"]+")\)',
-            r'(function(_n) local _o = script.Parent while _o do local _v = _o:GetAttribute(_n) if _v ~= nil then return _v end _o = _o.Parent end return nil end)(\1)',
+    #
+    # Only rewrite reads that look like serialized-field resolution at the top
+    # of the script: `local VAR = script:GetAttribute("NAME")` or the same
+    # with an `or DEFAULT` fallback. Script-local marker attributes set with
+    # `script:SetAttribute("_X", ...)` earlier in the same file are NOT
+    # rewritten — they're legitimate self-state and the walk-up would silently
+    # redirect them to a parent.
+    self_set_pattern = re.compile(r'script:SetAttribute\("([^"]+)"')
+    self_set_names = set(self_set_pattern.findall(source))
+
+    def _replace_field_read(match: re.Match) -> str:
+        attr_name = match.group(1).strip('"')
+        if attr_name in self_set_names:
+            return match.group(0)
+        return (
+            f'(function(_n) local _o = script.Parent while _o do '
+            f'local _v = _o:GetAttribute(_n) if _v ~= nil then return _v end '
+            f'_o = _o.Parent end return nil end)("{attr_name}")'
+        )
+
+    field_read_pattern = re.compile(
+        r'^(\s*local\s+\w+\s*=\s*)script:GetAttribute\(("[^"]+")\)',
+        re.MULTILINE,
+    )
+    if field_read_pattern.search(source):
+        source = field_read_pattern.sub(
+            lambda m: m.group(1) + _replace_field_read(re.match(r'"([^"]+)"', m.group(2))),
             source,
         )
-        fixes.append("Rewrote script:GetAttribute → walk-up lookup on parent hierarchy")
+        fixes.append("Rewrote script:GetAttribute top-level field reads → walk-up lookup")
 
     # Pickup script: delay Destroy() so the player has time to clone the
     # picked-up item before it disappears. The Player script listens to
@@ -2887,7 +2908,10 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
 
     # Pickup → Player communication via RemoteEvent + attribute fallback.
     # Create the RemoteEvent at script load time (outside the Touched handler)
-    # so the client's WaitForChild resolves before the first touch.
+    # so the client's WaitForChild resolves before the first touch. Also add
+    # a `_fired` debounce so the server only fires once per pickup even while
+    # `Touched` spams during the 0.5s destroy-delay window (character overlaps
+    # the trigger for multiple physics steps).
     if 'character:SetAttribute("GetItem"' in source and 'GetPlayerFromCharacter' in source:
         if '_PICKUP_REMOTE_INIT' not in source:
             init_block = (
@@ -2898,14 +2922,15 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
                 '\t_re = Instance.new("RemoteEvent")\n'
                 '\t_re.Name = "ItemPickupEvent"\n'
                 '\t_re.Parent = _RS\n'
-                'end\n\n'
+                'end\n'
+                'local _fired = false\n\n'
             )
             source = init_block + source
         source = source.replace(
             '-- Send item to player\n\tcharacter:SetAttribute("GetItem", itemName)',
-            '-- Send item to player via RemoteEvent + attribute (both for reliability)\n\tprint("[Pickup] firing", itemName, "to", player.Name)\n\t_re:FireClient(player, itemName)\n\tcharacter:SetAttribute("GetItem", itemName)',
+            '-- Send item to player via RemoteEvent + attribute (both for reliability)\n\tif _fired then return end\n\t_fired = true\n\tprint("[Pickup] firing", itemName, "to", player.Name)\n\t_re:FireClient(player, itemName)\n\tcharacter:SetAttribute("GetItem", itemName)',
         )
-        fixes.append("Pickup uses RemoteEvent + attribute for reliability")
+        fixes.append("Pickup uses RemoteEvent + attribute with Touched debounce")
 
     # Player listener: also listen on RemoteEvent for item pickups.
     # Use a global function reference so it works regardless of injection point.

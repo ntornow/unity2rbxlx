@@ -282,13 +282,15 @@ def preflight(unity_project_path: str, output_dir: str, install: bool) -> None:
         result["python_error"] = f"Python >= 3.11 required, got {sys.version}"
 
     # Hard dependencies — the pipeline cannot run without these.
+    # Keep this list in sync with the actual `import` statements in real source
+    # (not .venv/). `lxml` and `lz4` used to be listed here but no module under
+    # converter/, unity/, roblox/, runtime/, core/, or utils/ imports them; they
+    # were ghost deps causing false-negative preflight failures on clean clones.
     required = {
         "yaml": "PyYAML",
-        "lxml": "lxml",
         "click": "click",
         "PIL": "Pillow",
         "trimesh": "trimesh",
-        "lz4": "lz4",
         "numpy": "numpy",
         "requests": "requests",  # roblox/cloud_api.py imports this
     }

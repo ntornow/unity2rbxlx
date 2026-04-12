@@ -4439,3 +4439,52 @@ class TestValidatorAPIPatterns:
         from converter.code_transpiler import _preprocess_yield_return
         result = _preprocess_yield_return("yield return new WaitForFixedUpdate()")
         assert "Heartbeat" in result
+
+
+class TestScriptGetAttributeScoping:
+    """The validator rewrites `script:GetAttribute("X")` at the top of a
+    transpiled MonoBehaviour file into a walk-up lookup through
+    `script.Parent` ancestors, because the converter stores serialized
+    fields on the host Part/Model — not on the Script instance itself.
+
+    The rewrite must NOT touch attributes that the same script sets on
+    itself earlier in the file (e.g. `script:SetAttribute("_MeshesLoaded", true)`
+    followed later by `script:GetAttribute("_MeshesLoaded")`). Those are
+    legitimate script-local markers and walking up to a parent would
+    silently break them.
+    """
+
+    def test_top_level_field_read_is_rewritten(self):
+        from converter.luau_validator import validate_and_fix
+
+        source = 'local itemName = script:GetAttribute("itemName") or ""\n'
+        fixed, _ = validate_and_fix("Pickup", source)
+        assert "script.Parent" in fixed
+        assert 'GetAttribute("itemName")' not in fixed or "while _o" in fixed
+
+    def test_self_set_marker_is_preserved(self):
+        from converter.luau_validator import validate_and_fix
+
+        source = (
+            'if script:GetAttribute("MeshesLoaded") then return end\n'
+            'script:SetAttribute("MeshesLoaded", true)\n'
+        )
+        fixed, _ = validate_and_fix("MeshLoader", source)
+        # The self-set marker check is NOT a top-level `local X = ...` read,
+        # so it should be left alone regardless.
+        assert "while _o" not in fixed
+        assert 'script:GetAttribute("MeshesLoaded")' in fixed
+
+    def test_field_and_marker_coexist(self):
+        from converter.luau_validator import validate_and_fix
+
+        source = (
+            'local itemName = script:GetAttribute("itemName") or ""\n'
+            'if script:GetAttribute("_Init") then return end\n'
+            'script:SetAttribute("_Init", true)\n'
+        )
+        fixed, _ = validate_and_fix("Pickup", source)
+        # Field read gets walk-up rewrite
+        assert "while _o" in fixed
+        # Self-set marker read is untouched
+        assert 'script:GetAttribute("_Init")' in fixed

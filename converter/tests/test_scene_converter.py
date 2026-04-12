@@ -571,3 +571,67 @@ class TestMixedColliderHandling:
         _process_components(FakeNode(), part)
 
         assert part.can_collide is True, "Physical collider should override trigger's CanCollide=False"
+
+
+class TestExtractPrefabMaterialMap:
+    """`_extract_prefab_material_map` reads a Unity prefab YAML and returns
+    `{GameObject name: material GUID}` so per-sub-mesh SurfaceAppearances can
+    be applied correctly when the FBX's mesh hierarchy is reconstructed from
+    `mesh_hierarchies`. The old implementation only captured the first
+    material GUID and applied it blanket-style to every sub-mesh, losing any
+    per-sub-mesh variety on multi-material models.
+    """
+
+    def test_two_gameobjects_with_different_materials(self, tmp_path):
+        from converter.scene_converter import _extract_prefab_material_map
+
+        prefab = tmp_path / "Gun.prefab"
+        prefab.write_text(
+            "--- !u!1 &11111\n"
+            "GameObject:\n"
+            "  m_Name: barrel\n"
+            "--- !u!23 &22222\n"
+            "MeshRenderer:\n"
+            "  m_GameObject: {fileID: 11111}\n"
+            "  m_Materials:\n"
+            "  - {fileID: 2100000, guid: aaaaaaaaaaaaaaaa, type: 2}\n"
+            "--- !u!1 &33333\n"
+            "GameObject:\n"
+            "  m_Name: stock\n"
+            "--- !u!23 &44444\n"
+            "MeshRenderer:\n"
+            "  m_GameObject: {fileID: 33333}\n"
+            "  m_Materials:\n"
+            "  - {fileID: 2100000, guid: bbbbbbbbbbbbbbbb, type: 2}\n"
+        )
+        name_map, fallback = _extract_prefab_material_map(prefab)
+        assert name_map == {"barrel": "aaaaaaaaaaaaaaaa",
+                            "stock": "bbbbbbbbbbbbbbbb"}
+        assert fallback == "aaaaaaaaaaaaaaaa"
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        from converter.scene_converter import _extract_prefab_material_map
+        missing = tmp_path / "does_not_exist.prefab"
+        name_map, fallback = _extract_prefab_material_map(missing)
+        assert name_map == {}
+        assert fallback is None
+
+    def test_skinned_mesh_renderer_also_counted(self, tmp_path):
+        """Rigged/skinned meshes use SkinnedMeshRenderer (class !u!137), not
+        MeshRenderer. The extractor must treat both consistently."""
+        from converter.scene_converter import _extract_prefab_material_map
+
+        prefab = tmp_path / "Rigged.prefab"
+        prefab.write_text(
+            "--- !u!1 &1\n"
+            "GameObject:\n"
+            "  m_Name: Body\n"
+            "--- !u!137 &2\n"
+            "SkinnedMeshRenderer:\n"
+            "  m_GameObject: {fileID: 1}\n"
+            "  m_Materials:\n"
+            "  - {fileID: 2100000, guid: cafecafecafecafe, type: 2}\n"
+        )
+        name_map, fallback = _extract_prefab_material_map(prefab)
+        assert name_map == {"Body": "cafecafecafecafe"}
+        assert fallback == "cafecafecafecafe"
