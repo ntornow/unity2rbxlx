@@ -1182,7 +1182,35 @@ def _rule_based_transpile(
         # -- API call substitution --
         for unity_api, roblox_api in api_mappings.items():
             if unity_api in converted:
-                converted = converted.replace(unity_api, roblox_api)
+                # When the mapping produces a bare ".Property" or ":Method"
+                # (starts with . or :) AND the original text had a standalone
+                # `transform.X` (not `obj.transform.X`), the implicit `this.`
+                # receiver was consumed by the replacement. Prepend
+                # `script.Parent` so the Luau output has a valid receiver.
+                _is_implicit = (
+                    roblox_api.startswith((".", ":"))
+                    and unity_api.split(".")[0] in ("transform", "gameObject")
+                )
+                if _is_implicit:
+                    # Check whether there's a preceding `obj.transform.X` pattern.
+                    # If so, strip the leading dot from the Roblox mapping so the
+                    # existing receiver connects cleanly: `obj.transform.X` → `obj.X`.
+                    # If standalone (`transform.X` with no preceding word), prepend
+                    # `script.Parent` as the implicit `this` receiver.
+                    if re.search(r'\w\.' + re.escape(unity_api), converted):
+                        roblox_stripped = roblox_api.lstrip(".").lstrip(":")
+                        prefix = ":" if roblox_api.startswith(":") else "."
+                        converted = re.sub(
+                            r'(\w)\.' + re.escape(unity_api),
+                            r'\1' + prefix + roblox_stripped,
+                            converted,
+                        )
+                    else:
+                        converted = converted.replace(
+                            unity_api, "script.Parent" + roblox_api,
+                        )
+                else:
+                    converted = converted.replace(unity_api, roblox_api)
                 matched_patterns += 1
                 # Track service imports.
                 for svc in SERVICE_IMPORTS:

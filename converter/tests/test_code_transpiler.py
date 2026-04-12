@@ -4616,3 +4616,42 @@ return Player
 
         # getRifle is idempotent against repeated Touched fires.
         assert "if gotWeapon then return end" in fixed
+
+
+class TestRuleBasedReceiverResolution:
+    """The rule-based transpiler's API mapping step applies entries like
+    ``"transform.position": ".Position"``.  When the C# source has a
+    standalone ``transform.position`` (implicit ``this.``), the result
+    must be ``script.Parent.Position``, not a bare ``.Position``.
+    When preceded by ``obj.transform.position``, the result must be
+    ``obj.Position`` (no double-dot).
+    """
+
+    def test_standalone_transform_gets_script_parent(self):
+        from converter.code_transpiler import _rule_based_transpile
+
+        src = "downVector = transform.position - Vector3.up;"
+        luau, _, _ = _rule_based_transpile(src)
+        assert "script.Parent.Position" in luau, f"Expected script.Parent.Position in: {luau}"
+
+    def test_obj_dot_transform_no_double_dot(self):
+        from converter.code_transpiler import _rule_based_transpile
+
+        src = "other.transform.position = Vector3.zero;"
+        luau, _, _ = _rule_based_transpile(src)
+        assert "other.Position" in luau, f"Expected other.Position in: {luau}"
+        assert ".." not in luau, f"Double dot found: {luau}"
+
+    def test_gameobject_name_gets_script_parent(self):
+        from converter.code_transpiler import _rule_based_transpile
+
+        src = 'string n = gameObject.name;'
+        luau, _, _ = _rule_based_transpile(src)
+        assert "script.Parent.Name" in luau, f"Expected script.Parent.Name in: {luau}"
+
+    def test_transform_forward_resolves(self):
+        from converter.code_transpiler import _rule_based_transpile
+
+        src = "Vector3 dir = transform.forward;"
+        luau, _, _ = _rule_based_transpile(src)
+        assert "script.Parent.CFrame.LookVector" in luau
