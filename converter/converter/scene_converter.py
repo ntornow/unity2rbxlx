@@ -1206,54 +1206,84 @@ def _convert_node(
         part.size = (max(bx, 0.001), max(by, 0.001), max(bz, 0.001))
     # -- Mesh asset --
     elif has_mesh and node.mesh_guid:
-        mesh_id = _resolve_mesh_id(node.mesh_guid, guid_index, uploaded_assets,
-                                    mesh_file_id=node.mesh_file_id)
-        if mesh_id:
-            part.mesh_id = mesh_id
-        # Compute mesh size from native Roblox data (requires upload + resolve)
-        sized = False
-        if _mesh_native_sizes and guid_index:
-            result = _compute_mesh_size(node.scale, node.mesh_guid, guid_index, _mesh_native_sizes)
-            if result:
-                part.size, part.initial_size = result
-                sized = True
-        # Fallback 1: use FBX bounding box from trimesh as InitialSize estimate.
-        if not sized and guid_index and node.mesh_guid:
-            result = _compute_mesh_size_from_fbx_bbox(node.scale, node.mesh_guid, guid_index)
-            if result:
-                part.size, part.initial_size = result
-                sized = True
-        # Fallback 2: use unity scale as meters when no geometry data available.
-        if not sized and guid_index and node.mesh_guid:
+        # Check for multi-sub-mesh FBX: if the FBX resolved to 2+ sub-meshes
+        # in mesh_hierarchies, we must convert this Part into a Model with a
+        # child MeshPart per sub-mesh. Otherwise the converter only picks the
+        # first sub-mesh's MeshId and the other geometry is lost (e.g. a fence
+        # with frame + chain-link sub-meshes renders as just a thin bar).
+        _multi_sub = _get_multi_sub_meshes(node.mesh_guid, guid_index)
+        if _multi_sub and len(_multi_sub) > 1 and not node.mesh_file_id:
+            part.class_name = "Model"
+            part.mesh_id = None
             sx, sy, sz = node.scale
-            part.size = (
-                max(0.05, abs(sx) * config.STUDS_PER_METER),
-                max(0.05, abs(sy) * config.STUDS_PER_METER),
-                max(0.05, abs(sz) * config.STUDS_PER_METER),
-            )
-        # Store scale for MeshLoader runtime sizing.
-        # Roblox's CreateMeshPartAsync returns InitialSize in raw FBX units (often cm).
-        # We need: finalSize = InitialSize * import_scale * STUDS_PER_METER * unity_scale
-        # Store the combined scale factor so MeshLoader can compute:
-        #   newPart.Size = InitialSize * _ScaleX/Y/Z
-        if has_mesh:
-            sx, sy, sz = node.scale
-            if not hasattr(part, "attributes") or part.attributes is None:
-                part.attributes = {}
-            # Get FBX import scale (converts FBX units to Unity meters)
-            import_scale = 0.01  # default for cm FBX files
-            unit_ratio = 1.0
-            if node.mesh_guid and guid_index:
-                import_scale = _get_fbx_import_scale(node.mesh_guid, guid_index)
-                unit_ratio = _get_fbx_unit_ratio(node.mesh_guid, guid_index)
+            import_scale = _get_fbx_import_scale(node.mesh_guid, guid_index) if guid_index else 0.01
+            unit_ratio = _get_fbx_unit_ratio(node.mesh_guid, guid_index) if guid_index else 1.0
             scale_factor = import_scale * unit_ratio * config.STUDS_PER_METER
-            part.attributes["_ScaleX"] = abs(sx) * scale_factor
-            part.attributes["_ScaleY"] = abs(sy) * scale_factor
-            part.attributes["_ScaleZ"] = abs(sz) * scale_factor
-        # Set TextureID from embedded FBX texture if available
-        tex_id = _resolve_mesh_texture_id(node.mesh_guid, guid_index)
-        if tex_id:
-            part.texture_id = tex_id
+            for sm in _multi_sub:
+                native_size = (sm["size"][0], sm["size"][1], sm["size"][2])
+                sm_pos = sm.get("position", [0, 0, 0])
+                px = sm_pos[0] * scale_factor * abs(sx)
+                py = sm_pos[1] * scale_factor * abs(sy)
+                pz = sm_pos[2] * scale_factor * abs(sz)
+                mesh_part = RbxPart(
+                    name=sm["name"],
+                    class_name="MeshPart",
+                    cframe=RbxCFrame(x=px, y=py, z=pz),
+                    size=(
+                        native_size[0] * scale_factor * abs(sx),
+                        native_size[1] * scale_factor * abs(sy),
+                        native_size[2] * scale_factor * abs(sz),
+                    ),
+                )
+                mesh_part.mesh_id = sm["meshId"]
+                mesh_part.initial_size = native_size
+                if sm.get("textureId"):
+                    mesh_part.texture_id = sm["textureId"]
+                part.children.append(mesh_part)
+        else:
+            mesh_id = _resolve_mesh_id(node.mesh_guid, guid_index, uploaded_assets,
+                                        mesh_file_id=node.mesh_file_id)
+            if mesh_id:
+                part.mesh_id = mesh_id
+            # Compute mesh size from native Roblox data (requires upload + resolve)
+            sized = False
+            if _mesh_native_sizes and guid_index:
+                result = _compute_mesh_size(node.scale, node.mesh_guid, guid_index, _mesh_native_sizes)
+                if result:
+                    part.size, part.initial_size = result
+                    sized = True
+            # Fallback 1: use FBX bounding box from trimesh as InitialSize estimate.
+            if not sized and guid_index and node.mesh_guid:
+                result = _compute_mesh_size_from_fbx_bbox(node.scale, node.mesh_guid, guid_index)
+                if result:
+                    part.size, part.initial_size = result
+                    sized = True
+            # Fallback 2: use unity scale as meters when no geometry data available.
+            if not sized and guid_index and node.mesh_guid:
+                sx, sy, sz = node.scale
+                part.size = (
+                    max(0.05, abs(sx) * config.STUDS_PER_METER),
+                    max(0.05, abs(sy) * config.STUDS_PER_METER),
+                    max(0.05, abs(sz) * config.STUDS_PER_METER),
+                )
+            # Store scale for MeshLoader runtime sizing.
+            if has_mesh:
+                sx, sy, sz = node.scale
+                if not hasattr(part, "attributes") or part.attributes is None:
+                    part.attributes = {}
+                import_scale = 0.01
+                unit_ratio = 1.0
+                if node.mesh_guid and guid_index:
+                    import_scale = _get_fbx_import_scale(node.mesh_guid, guid_index)
+                    unit_ratio = _get_fbx_unit_ratio(node.mesh_guid, guid_index)
+                scale_factor = import_scale * unit_ratio * config.STUDS_PER_METER
+                part.attributes["_ScaleX"] = abs(sx) * scale_factor
+                part.attributes["_ScaleY"] = abs(sy) * scale_factor
+                part.attributes["_ScaleZ"] = abs(sz) * scale_factor
+            # Set TextureID from embedded FBX texture if available
+            tex_id = _resolve_mesh_texture_id(node.mesh_guid, guid_index)
+            if tex_id:
+                part.texture_id = tex_id
 
     # -- Material --
     _apply_materials(node, part, material_mappings)
@@ -1890,6 +1920,27 @@ _MONO_SYSTEM_PROPS = frozenset({
 
 
 _prefab_material_cache: dict[str, tuple[dict[str, str], str | None]] = {}
+
+
+def _get_multi_sub_meshes(
+    mesh_guid: str,
+    guid_index: GuidIndex | None,
+) -> list[dict] | None:
+    """Return the mesh_hierarchies sub-mesh list for a GUID if it has 2+
+    entries. Returns ``None`` if the FBX is a single-mesh or if no
+    hierarchy data is available.
+    """
+    if not _mesh_hierarchies or not guid_index:
+        return None
+    asset_path = guid_index.resolve(mesh_guid)
+    if not asset_path:
+        return None
+    relative = guid_index.resolve_relative(mesh_guid)
+    for key in ([str(relative), str(asset_path)] if relative else [str(asset_path)]):
+        if key in _mesh_hierarchies:
+            subs = _mesh_hierarchies[key]
+            return subs if len(subs) >= 2 else None
+    return None
 
 
 def _extract_prefab_material_map(
