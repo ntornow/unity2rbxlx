@@ -671,10 +671,6 @@ def validate(output_dir: str, write: bool) -> None:
               help="Roblox Open Cloud API key (string or path to file).")
 @click.option("--creator-id", type=str, default=None,
               help="Roblox Creator ID (number or path to file).")
-@click.option("--retranspile", is_flag=True,
-              help="Force re-transpilation even if scripts were already transpiled. "
-              "Without this flag, hand-edited Luau scripts in output_dir/scripts/ "
-              "are preserved.")
 def assemble(unity_project_path: str, output_dir: str,
              no_upload: bool, no_resolve: bool, retranspile: bool,
              api_key: str | None, creator_id: str | None) -> None:
@@ -952,7 +948,7 @@ def report(output_dir: str) -> None:
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "unity_project_path": ctx.unity_project_path,
         "output_dir": str(out),
-        "selected_scene": Path(ctx.selected_scene).name if ctx.selected_scene else "",
+        "selected_scene": _relative_scene_path(ctx.selected_scene, ctx.unity_project_path),
         "rbxlx_path": str(rbxlx_path) if rbxlx_path.exists() else None,
         "rbxlx_size_mb": rbxlx_size_mb,
         "stats": _ctx_summary(ctx),
