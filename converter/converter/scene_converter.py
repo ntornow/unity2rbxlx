@@ -450,10 +450,16 @@ def _compute_mesh_size(
     mesh_guid: str,
     guid_index: GuidIndex,
     mesh_native_sizes: dict[str, tuple[float, float, float]],
+    mesh_file_id: str | None = None,
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
     """Compute Roblox MeshPart Size and InitialSize from Unity + Roblox data.
 
     Requires native sizes from Roblox LoadAsset (populated by the resolve step).
+
+    When ``mesh_file_id`` is provided and the FBX has multiple sub-meshes in
+    mesh_hierarchies, uses the specific sub-mesh's native dimensions instead
+    of the overall FBX bounding box. Without this, all sub-meshes (frame, door,
+    base) would get the same size, causing overlapping/stretched geometry.
 
     InitialSize = native mesh bounding box from Roblox
     Size = InitialSize × import_scale × unity_scale × STUDS_PER_METER
@@ -465,6 +471,22 @@ def _compute_mesh_size(
     if not asset_path:
         return None
 
+    # Try per-sub-mesh sizing via mesh_hierarchies first
+    if mesh_file_id and _mesh_hierarchies:
+        sub_mesh = _resolve_sub_mesh(mesh_guid, mesh_file_id, guid_index)
+        if sub_mesh:
+            native = (sub_mesh["size"][0], sub_mesh["size"][1], sub_mesh["size"][2])
+            import_scale = _get_fbx_import_scale(mesh_guid, guid_index)
+            unit_ratio = _get_fbx_unit_ratio(mesh_guid, guid_index)
+            scale_factor = import_scale * unit_ratio * config.STUDS_PER_METER
+            size = (
+                abs(unity_scale[0]) * native[0] * scale_factor,
+                abs(unity_scale[1]) * native[1] * scale_factor,
+                abs(unity_scale[2]) * native[2] * scale_factor,
+            )
+            return size, native
+
+    # Fallback: use the overall FBX bounding box from mesh_native_sizes
     relative = guid_index.resolve_relative(mesh_guid)
     for key in [str(relative), str(asset_path)] if relative else [str(asset_path)]:
         if key in mesh_native_sizes:
@@ -472,9 +494,6 @@ def _compute_mesh_size(
             import_scale = _get_fbx_import_scale(mesh_guid, guid_index)
             unit_ratio = _get_fbx_unit_ratio(mesh_guid, guid_index)
             initial_size = (native[0], native[1], native[2])
-            # unit_ratio compensates for FBX internal node transforms
-            # that Roblox doesn't apply (e.g., cm→m conversion baked
-            # into Lcl Scaling nodes)
             scale_factor = import_scale * unit_ratio * config.STUDS_PER_METER
             size = (
                 abs(unity_scale[0]) * initial_size[0] * scale_factor,
@@ -1270,7 +1289,8 @@ def _convert_node(
             # Compute mesh size from native Roblox data (requires upload + resolve)
             sized = False
             if _mesh_native_sizes and guid_index:
-                result = _compute_mesh_size(node.scale, node.mesh_guid, guid_index, _mesh_native_sizes)
+                result = _compute_mesh_size(node.scale, node.mesh_guid, guid_index, _mesh_native_sizes,
+                                            mesh_file_id=node.mesh_file_id)
                 if result:
                     part.size, part.initial_size = result
                     sized = True
@@ -3435,7 +3455,8 @@ def _convert_prefab_instance(
                 # Compute mesh size from native Roblox data
                 sized = False
                 if _mesh_native_sizes and guid_index:
-                    result = _compute_mesh_size(combined_scl, root.mesh_guid, guid_index, _mesh_native_sizes)
+                    result = _compute_mesh_size(combined_scl, root.mesh_guid, guid_index, _mesh_native_sizes,
+                                                mesh_file_id=root.mesh_file_id if hasattr(root, 'mesh_file_id') else None)
                     if result:
                         part.size, part.initial_size = result
                         sized = True
@@ -3576,7 +3597,8 @@ def _convert_prefab_instance(
             combined_scale = (sx, sy, sz)
             sized = False
             if _mesh_native_sizes and guid_index:
-                result = _compute_mesh_size(combined_scale, root.mesh_guid, guid_index, _mesh_native_sizes)
+                result = _compute_mesh_size(combined_scale, root.mesh_guid, guid_index, _mesh_native_sizes,
+                                            mesh_file_id=root.mesh_file_id if hasattr(root, 'mesh_file_id') else None)
                 if result:
                     part.size, part.initial_size = result
                     sized = True
@@ -3818,7 +3840,8 @@ def _convert_prefab_node(
         # Compute mesh size from native Roblox data (requires upload + resolve)
         sized = False
         if _mesh_native_sizes and guid_index:
-            result = _compute_mesh_size(local_scl, node.mesh_guid, guid_index, _mesh_native_sizes)
+            result = _compute_mesh_size(local_scl, node.mesh_guid, guid_index, _mesh_native_sizes,
+                                        mesh_file_id=node.mesh_file_id if hasattr(node, 'mesh_file_id') else None)
             if result:
                 part.size, part.initial_size = result
                 sized = True
