@@ -32,7 +32,7 @@ Work autonomously with no questions — just churn forever making the converter 
 
 ### Converter Status (as of 2026-04-12)
 
-**998 tests passing** (998 fast in ~11s, 31 slow full-pipeline tests)
+**1020 tests passing** (1020 fast in ~12s, 31 slow full-pipeline tests)
 **9 test projects** converting and validating clean with zero errors:
 - SimpleFPS (960 parts, 36 scripts), Gamekit3D (18,534 parts, 249 scripts)
 - SanAndreasUnity (270 scripts), ChopChop (275 scripts), RedRunner (87 scripts)
@@ -163,7 +163,7 @@ Where:
 ## Running Tests
 ```bash
 cd converter
-python -m pytest tests/ -m "not slow" -v   # Fast suite: 998 tests in ~11s
+python -m pytest tests/ -m "not slow" -v   # Fast suite: 1020 tests in ~12s
 python -m pytest tests/ -v                  # Full suite: 1029 tests in ~65s (includes CLI + Gamekit3D e2e)
 ```
 

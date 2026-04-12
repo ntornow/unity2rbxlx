@@ -134,10 +134,10 @@ Priority: P0 = blocking gameplay, P1 = significant quality, P2 = nice to have.
 
 ### Not Yet Implemented (genuine gaps)
 - [x] **Tilemap/TilemapRenderer**: Tiles converted to thin Parts in a grid with cell sizing, tile colors, sprite GUIDs. TilemapRenderer properties extracted.
-- [ ] **write_output performance for script-heavy projects**: SanAndreasUnity (270 scripts, 24 parts) takes 3-4 min in write_output. Terrain encoder was the SimpleFPS bottleneck (fixed via inlining), but script-heavy projects without terrain still slow. Likely culprits: script binding walk, validator regex patterns on 270 scripts, or rbxlx serialization. Needs focused cProfile to identify the specific sub-step.
+- [x] **write_output performance for script-heavy projects**: Fixed 2026-04-12. Root cause: catastrophic regex backtracking in `luau_validator.py:5334` — the if-expression paren-unwrapping pattern `(\((?:[^()]*|\([^()]*\))*\))` caused exponential backtracking on deeply-nested expressions. SanAndreasUnity: 13+ min → 9.1s. Gamekit3D: 30+ min → 20.6s. Also fixed terrain encoder inlining (SimpleFPS write_output 8.0s → 3.4s).
 - [ ] **Font upload**: Not supported by Roblox Open Cloud API. UI text uses default Roblox font.
 - [ ] **Video upload**: Not supported by Roblox Open Cloud API. VideoFrame component works but needs manual video ID.
-- [ ] **Eval baseline for all 9 projects**: Initial baseline covers 7/9 (missing Gamekit3D + SanAndreasUnity due to slow write_output). Once the perf issue is resolved, complete the baseline and wire eval-diff into CI.
+- [x] **Eval baseline for all 9 projects**: Fixed 2026-04-12. All 9 projects complete in 85s total. `eval_baseline.json` committed with per-project metrics. `u2r.py eval-diff` can gate future changes. **Open follow-up:** wire eval-diff into CI nightly job.
 
 ### Fixed (2026-03-28 continued)
 - [x] **Skeletal animation bone resolution**: Motor6D now creates actual bone Parts with proper Part0/Part1 Ref links (was string-only names)
