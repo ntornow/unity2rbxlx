@@ -433,6 +433,11 @@ class Pipeline:
         convert_dir = self.output_dir / "converted_textures"
         convert_dir.mkdir(parents=True, exist_ok=True)
 
+        # Collected for a post-upload moderation audit. We probe only newly
+        # uploaded assets (not cached entries from a previous run) so the
+        # audit cost stays proportional to the new work.
+        new_uploads: list[tuple[str, str]] = []
+
         for kind, uploader, extensions in [
             ("texture", upload_image, {".png", ".jpg", ".jpeg", ".bmp", ".tga", ".tif", ".tiff", ".psd"}),
             ("mesh", upload_mesh, {".fbx", ".obj"}),
@@ -464,6 +469,7 @@ class Pipeline:
                 if result:
                     uploaded[rel] = f"rbxassetid://{result}"
                     log.info("[upload_assets]   %s -> rbxassetid://%s  (source: %s)", name, result, rel)
+                    new_uploads.append((rel, result))
                 else:
                     log.warning("[upload_assets]   FAILED: %s  (source: %s)", name, rel)
                     self.ctx.asset_upload_errors.append(rel)
@@ -471,6 +477,47 @@ class Pipeline:
 
         log.info("[upload_assets] %d assets uploaded, %d errors",
                  len(uploaded), len(self.ctx.asset_upload_errors))
+
+        # Post-upload moderation audit: probe newly-uploaded assets (audio
+        # and images get moderation-rejected most often) and strip any that
+        # come back rejected, so the rbxlx writer doesn't embed broken IDs.
+        # We only check new uploads, not cached entries from previous runs,
+        # to keep the audit cost proportional to new work. The audit fails
+        # soft — if the metadata endpoint can't make up its mind, we assume
+        # the asset is fine and leave it in place.
+        self._audit_new_uploads(new_uploads, api_key)
+
+    def _audit_new_uploads(
+        self,
+        new_uploads: list[tuple[str, str]],
+        api_key: str,
+    ) -> None:
+        """Probe newly-uploaded assets for moderation rejection and strip
+        any that are rejected. No-op for empty input or missing API key.
+        """
+        if not new_uploads or not api_key:
+            return
+
+        from roblox.cloud_api import probe_asset_availability
+        uploaded = self.ctx.uploaded_assets
+
+        rejected: list[tuple[str, str]] = []
+        for rel, asset_id in new_uploads:
+            status = probe_asset_availability(asset_id, api_key)
+            if status == "rejected":
+                rejected.append((rel, asset_id))
+            time.sleep(1.1)  # Throttle: metadata endpoint rate-limits hard.
+
+        if rejected:
+            log.warning(
+                "[upload_assets] Stripping %d moderation-rejected asset(s) "
+                "from uploaded_assets so they don't leak into the rbxlx:",
+                len(rejected),
+            )
+            for rel, asset_id in rejected:
+                log.warning("  REJECTED: %s -> rbxassetid://%s", rel, asset_id)
+                uploaded.pop(rel, None)
+                self.ctx.asset_upload_errors.append(f"{rel} (moderation rejected)")
 
     def convert_materials(self) -> None:
         """Phase 4: Map Unity materials to Roblox SurfaceAppearance."""
