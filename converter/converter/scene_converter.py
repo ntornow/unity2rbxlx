@@ -2925,27 +2925,70 @@ def _convert_fbx_prefab_instance(
     from converter.material_mapper import _infer_roblox_material
     inferred_material = _infer_roblox_material(name)
 
-    part = RbxPart(
-        name=name,
-        class_name="MeshPart",
-        cframe=cframe,
-        size=mesh_size,
-        initial_size=mesh_init,
-        anchored=True,
-        material=inferred_material,
-    )
-    if mesh_id:
-        part.mesh_id = mesh_id
-    # Store scale for MeshLoader runtime sizing
-    if mesh_guid and guid_index:
-        _imp = _get_fbx_import_scale(mesh_guid, guid_index)
-        _ur = _get_fbx_unit_ratio(mesh_guid, guid_index)
+    # Multi-sub-mesh FBX: if the uploaded FBX resolved to 2+ sub-meshes,
+    # create a Model with child MeshParts instead of a single MeshPart.
+    # This makes fences, vehicles, and other composite FBX assets render
+    # with all their geometry instead of only the first sub-mesh.
+    _multi_subs = _get_multi_sub_meshes(mesh_guid, guid_index) if mesh_guid else None
+    if _multi_subs and len(_multi_subs) > 1:
+        part = RbxPart(
+            name=name,
+            class_name="Model",
+            cframe=cframe,
+            anchored=True,
+        )
+        if mesh_guid and guid_index:
+            _imp = _get_fbx_import_scale(mesh_guid, guid_index)
+            _ur = _get_fbx_unit_ratio(mesh_guid, guid_index)
+        else:
+            _imp, _ur = 0.01, 1.0
+        _sf2 = _imp * _ur * config.STUDS_PER_METER
+        for sm in _multi_subs:
+            native = (sm["size"][0], sm["size"][1], sm["size"][2])
+            sm_pos = sm.get("position", [0, 0, 0])
+            child = RbxPart(
+                name=sm["name"],
+                class_name="MeshPart",
+                cframe=RbxCFrame(
+                    x=sm_pos[0] * _sf2 * abs(combined_scale[0]),
+                    y=sm_pos[1] * _sf2 * abs(combined_scale[1]),
+                    z=sm_pos[2] * _sf2 * abs(combined_scale[2]),
+                ),
+                size=(
+                    native[0] * _sf2 * abs(combined_scale[0]),
+                    native[1] * _sf2 * abs(combined_scale[1]),
+                    native[2] * _sf2 * abs(combined_scale[2]),
+                ),
+                anchored=True,
+                material=inferred_material,
+            )
+            child.mesh_id = sm["meshId"]
+            child.initial_size = native
+            if sm.get("textureId"):
+                child.texture_id = sm["textureId"]
+            part.children.append(child)
     else:
-        _imp, _ur = 0.01, 1.0
-    _sf2 = _imp * _ur * config.STUDS_PER_METER
-    part.attributes["_ScaleX"] = abs(combined_scale[0]) * _sf2
-    part.attributes["_ScaleY"] = abs(combined_scale[1]) * _sf2
-    part.attributes["_ScaleZ"] = abs(combined_scale[2]) * _sf2
+        part = RbxPart(
+            name=name,
+            class_name="MeshPart",
+            cframe=cframe,
+            size=mesh_size,
+            initial_size=mesh_init,
+            anchored=True,
+            material=inferred_material,
+        )
+        if mesh_id:
+            part.mesh_id = mesh_id
+        # Store scale for MeshLoader runtime sizing
+        if mesh_guid and guid_index:
+            _imp = _get_fbx_import_scale(mesh_guid, guid_index)
+            _ur = _get_fbx_unit_ratio(mesh_guid, guid_index)
+        else:
+            _imp, _ur = 0.01, 1.0
+        _sf2 = _imp * _ur * config.STUDS_PER_METER
+        part.attributes["_ScaleX"] = abs(combined_scale[0]) * _sf2
+        part.attributes["_ScaleY"] = abs(combined_scale[1]) * _sf2
+        part.attributes["_ScaleZ"] = abs(combined_scale[2]) * _sf2
 
     # Apply materials: first try scene modifications, then FBX directory textures
     _mat_applied = False
@@ -3276,7 +3319,18 @@ def _convert_prefab_instance(
         # MeshPart and parent the children under it.  MeshPart can hold child
         # Items in rbxlx, so this preserves both the mesh geometry and the
         # hierarchy.  If the root has no mesh, use a Model container.
-        if root_has_mesh:
+        #
+        # Exception: multi-sub-mesh FBXs (like tallfence.fbx) have the same
+        # mesh_guid on both the root and children (pointing at the FBX file),
+        # and the children handle individual sub-meshes via mesh_file_id.
+        # In that case, make the root a Model so the children render their
+        # own sub-mesh geometry and the root doesn't show a duplicate.
+        _root_multi = (
+            root_has_mesh
+            and _get_multi_sub_meshes(root.mesh_guid, guid_index)
+            and has_children
+        )
+        if root_has_mesh and not _root_multi:
             _builtin_root = _UNITY_BUILTIN_MESH_SHAPES.get(root.mesh_file_id or "") if hasattr(root, "mesh_file_id") else None
             if _builtin_root:
                 part = RbxPart(name=name, class_name="Part", cframe=cframe, anchored=True)
