@@ -56,3 +56,89 @@ class TestCloudAPI:
         result = upload_image(test_img, "test-api-key", "12345", "User", "test")
         # Should handle gracefully (return None on failure)
         assert result is None
+
+
+class TestProbeAssetAvailability:
+    """`probe_asset_availability` classifies an uploaded asset as
+    approved / rejected / unknown by hitting the assets metadata endpoint.
+    The intent is that a rejection (e.g. music moderation) can be caught
+    before the broken ID lands in the rbxlx — but inconclusive responses
+    should fail soft to "unknown" so the probe never regresses a working
+    upload.
+    """
+
+    @patch("roblox.cloud_api.requests.get")
+    def test_http_403_is_rejected(self, mock_get):
+        from roblox.cloud_api import probe_asset_availability
+        mock_resp = MagicMock()
+        mock_resp.status_code = 403
+        mock_get.return_value = mock_resp
+        assert probe_asset_availability("12345", "k") == "rejected"
+
+    @patch("roblox.cloud_api.requests.get")
+    def test_http_404_is_rejected(self, mock_get):
+        from roblox.cloud_api import probe_asset_availability
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        mock_get.return_value = mock_resp
+        assert probe_asset_availability("12345", "k") == "rejected"
+
+    @patch("roblox.cloud_api.requests.get")
+    def test_moderation_rejected_payload(self, mock_get):
+        from roblox.cloud_api import probe_asset_availability
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "moderationResult": {"moderationState": "Rejected"}
+        }
+        mock_get.return_value = mock_resp
+        assert probe_asset_availability("12345", "k") == "rejected"
+
+    @patch("roblox.cloud_api.requests.get")
+    def test_approved_payload(self, mock_get):
+        from roblox.cloud_api import probe_asset_availability
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "moderationResult": {"moderationState": "Approved"}
+        }
+        mock_get.return_value = mock_resp
+        assert probe_asset_availability("12345", "k") == "approved"
+
+    @patch("roblox.cloud_api.requests.get")
+    def test_no_moderation_field_is_approved(self, mock_get):
+        """Some asset types return 200 without a moderationResult. That's
+        not a rejection — trust the 200 and report approved."""
+        from roblox.cloud_api import probe_asset_availability
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"id": "12345"}
+        mock_get.return_value = mock_resp
+        assert probe_asset_availability("12345", "k") == "approved"
+
+    @patch("roblox.cloud_api.requests.get")
+    def test_network_error_is_unknown(self, mock_get):
+        """The probe must NEVER escalate network hiccups into false
+        rejections — regressing a working asset is worse than missing one."""
+        import requests as _requests
+        from roblox.cloud_api import probe_asset_availability
+        mock_get.side_effect = _requests.RequestException("boom")
+        assert probe_asset_availability("12345", "k") == "unknown"
+
+    @patch("roblox.cloud_api.requests.get")
+    def test_pending_moderation_is_unknown(self, mock_get):
+        from roblox.cloud_api import probe_asset_availability
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "moderationResult": {"moderationState": "Pending"}
+        }
+        mock_get.return_value = mock_resp
+        assert probe_asset_availability("12345", "k") == "unknown"
+
+    def test_non_numeric_id_is_unknown(self):
+        """UUID / path / empty inputs short-circuit to unknown without
+        touching the network."""
+        from roblox.cloud_api import probe_asset_availability
+        assert probe_asset_availability("", "k") == "unknown"
+        assert probe_asset_availability("dc5c29d6-34b4-46c8", "k") == "unknown"

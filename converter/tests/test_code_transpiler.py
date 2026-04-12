@@ -4488,3 +4488,131 @@ class TestScriptGetAttributeScoping:
         assert "while _o" in fixed
         # Self-set marker read is untouched
         assert 'script:GetAttribute("_Init")' in fixed
+
+
+class TestRiflePickupChainValidator:
+    """Regression fixture for the 2026-04-12 SimpleFPS rifle pickup fixes.
+
+    Each of these test cases hand-crafts a script that matches what the
+    (AI-assisted) transpiler produces for SimpleFPS's Pickup.cs / Player.cs
+    and asserts that ``validate_and_fix`` still leaves the specific markers
+    that the runtime depends on. The fast suite runs this without touching
+    SimpleFPS so it's cheap to keep green.
+    """
+
+    # Uses real tabs (\t) in the body of the Touched handler because that's
+    # what the AI transpiler emits and what the validator's literal-match
+    # fixes key on (`\n\t-- Send item to player`, `\n\tscript.Parent:Destroy()`).
+    _PICKUP_AI = (
+        '-- Services\n'
+        'local RunService = game:GetService("RunService")\n'
+        'local Players = game:GetService("Players")\n'
+        '\n'
+        'local itemName = script:GetAttribute("itemName") or ""\n'
+        '\n'
+        'local part = script.Parent\n'
+        'if part:IsA("Model") then\n'
+        '\tpart = part:FindFirstChildWhichIsA("BasePart")\n'
+        'end\n'
+        '\n'
+        'part.Touched:Connect(function(otherPart)\n'
+        '\tlocal character = otherPart:FindFirstAncestorOfClass("Model")\n'
+        '\twhile character and not character:FindFirstChildWhichIsA("Humanoid") do\n'
+        '\t\tcharacter = character:FindFirstAncestorOfClass("Model")\n'
+        '\tend\n'
+        '\tlocal humanoid = character and character:FindFirstChildWhichIsA("Humanoid")\n'
+        '\tif not humanoid then\n'
+        '\t\treturn\n'
+        '\tend\n'
+        '\n'
+        '\tlocal player = Players:GetPlayerFromCharacter(character)\n'
+        '\tif not player then\n'
+        '\t\treturn\n'
+        '\tend\n'
+        '\n'
+        '\t-- Send item to player\n'
+        '\tcharacter:SetAttribute("GetItem", itemName)\n'
+        '\n'
+        '\t-- Destroy pickup\n'
+        '\tscript.Parent:Destroy()\n'
+        'end)\n'
+    )
+
+    _PLAYER_AI = '''\
+local UserInputService = game:GetService("UserInputService")
+local function _isMouseButtonDown(btn)
+    return false
+end
+
+local Player = {}
+local gotWeapon = false
+
+local function setupSounds()
+    local parent = script.Parent
+end
+
+local function getRifle()
+    gotWeapon = true
+end
+
+local function shoot()
+    if not gotWeapon then return end
+    if not _isMouseButtonDown(Enum.UserInputType.MouseButton1) then return end
+    print("pew")
+end
+
+character:GetAttributeChangedSignal("GetItem"):Connect(function()
+    local val = character:GetAttribute("GetItem")
+    if val == "Rifle" then getRifle() end
+end)
+
+Player.shoot = shoot
+return Player
+'''
+
+    def test_pickup_script_gets_all_fixes(self):
+        from converter.luau_validator import validate_and_fix
+        fixed, _ = validate_and_fix("Pickup", self._PICKUP_AI)
+
+        # RemoteEvent created at script-init, before Touched handler.
+        assert "_PICKUP_REMOTE_INIT" in fixed
+        assert 'Instance.new("RemoteEvent")' in fixed
+        init_idx = fixed.index("_PICKUP_REMOTE_INIT")
+        touched_idx = fixed.index("part.Touched:Connect")
+        assert init_idx < touched_idx, (
+            "_PICKUP_REMOTE_INIT must precede part.Touched so the client's "
+            "WaitForChild resolves before the first touch"
+        )
+
+        # Debounce flag and early-return inside the handler.
+        assert "local _fired = false" in fixed
+        assert "if _fired then return end" in fixed
+
+        # Serialized-field read rewritten to walk-up lookup.
+        assert "while _o" in fixed
+
+        # Character resolution walks up to find the humanoid-bearing Model.
+        assert 'FindFirstAncestorOfClass("Model")' in fixed
+
+        # Destroy is delayed so the client can clone the item first.
+        assert "task.delay" in fixed and "script.Parent:Destroy()" in fixed
+
+    def test_player_script_gets_all_fixes(self):
+        from converter.luau_validator import validate_and_fix
+        fixed, _ = validate_and_fix("Player", self._PLAYER_AI)
+
+        # RemoteEvent listener injected after GetAttributeChangedSignal hookup.
+        assert "_REMOTE_PICKUP_LISTENER" in fixed
+        assert 'WaitForChild("ItemPickupEvent")' in fixed
+        # No 30s timeout — the server now creates the event at init time.
+        assert 'ItemPickupEvent", 30' not in fixed
+
+        # setupSounds has the Workspace fallback for ModuleScript-reclassified
+        # Player scripts where script.Parent is ReplicatedStorage.
+        assert "_SETUP_SOUNDS_BROAD" in fixed
+
+        # Shoot no longer gated by the _isMouseButtonDown race.
+        assert "_isMouseButtonDown(Enum.UserInputType.MouseButton1)" not in fixed
+
+        # getRifle is idempotent against repeated Touched fires.
+        assert "if gotWeapon then return end" in fixed

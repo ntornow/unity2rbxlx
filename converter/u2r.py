@@ -837,5 +837,92 @@ def _is_text_yaml(path: Path) -> bool:
         return False
 
 
+@main.command("audit-assets")
+@click.argument("output_dir", type=click.Path(exists=True))
+@click.option("--api-key", type=str, default=None,
+              help="Roblox Open Cloud API key (string or path to file).")
+@click.option("--fail-on-reject", is_flag=True,
+              help="Exit non-zero if any asset is rejected.")
+def audit_assets(output_dir: str, api_key: str | None, fail_on_reject: bool) -> None:
+    """Probe every uploaded asset in conversion_context.json for moderation.
+
+    Hits the Roblox assets metadata endpoint for each `rbxassetid://NUM`
+    entry in the context and classifies the result as approved / rejected
+    / unknown. Use this to catch post-upload moderation rejections (e.g.
+    music that uploads cleanly but is blocked at runtime with HTTP 403)
+    before they leak into a published place.
+    """
+    from pathlib import Path
+    import json
+    import sys
+
+    import config
+    from roblox.cloud_api import probe_asset_availability
+    from core.conversion_context import ConversionContext
+
+    out = Path(output_dir).resolve()
+    ctx_path = out / "conversion_context.json"
+    if not ctx_path.exists():
+        click.echo(f"No conversion_context.json at {out}", err=True)
+        sys.exit(2)
+
+    if api_key:
+        ak = Path(api_key)
+        config.ROBLOX_API_KEY = (
+            ak.read_text().strip() if ak.is_file() else api_key.strip()
+        )
+    if not config.ROBLOX_API_KEY:
+        click.echo("No Roblox API key. Pass --api-key or set ROBLOX_API_KEY.", err=True)
+        sys.exit(2)
+
+    ctx = ConversionContext.load(ctx_path)
+    rejected: list[tuple[str, str]] = []
+    unknown: list[tuple[str, str]] = []
+    approved = 0
+
+    import time as _time
+    total = len(ctx.uploaded_assets)
+    click.echo(f"Probing {total} uploaded assets...")
+    for i, (key, url) in enumerate(ctx.uploaded_assets.items(), 1):
+        numeric = "".join(ch for ch in str(url) if ch.isdigit())
+        if not numeric:
+            rejected.append((key, f"{url} (non-numeric ID)"))
+            continue
+        status = probe_asset_availability(numeric, config.ROBLOX_API_KEY)
+        if status == "rejected":
+            rejected.append((key, url))
+        elif status == "unknown":
+            unknown.append((key, url))
+        else:
+            approved += 1
+        if i % 25 == 0:
+            click.echo(f"  {i}/{total}...")
+        # Throttle: Roblox Open Cloud assets endpoint rate-limits aggressively
+        # (~60 req/min for metadata reads). Sleep between calls so the sweep
+        # doesn't cascade into 429s that would get misclassified as "unknown".
+        _time.sleep(1.1)
+
+    click.echo("")
+    click.echo(f"Approved: {approved}")
+    click.echo(f"Rejected: {len(rejected)}")
+    click.echo(f"Unknown:  {len(unknown)}")
+
+    if rejected:
+        click.echo("\nRejected assets:")
+        for key, url in rejected:
+            click.echo(f"  {key} -> {url}")
+
+    report_path = out / "asset_audit.json"
+    report_path.write_text(json.dumps({
+        "approved_count": approved,
+        "rejected": [{"path": k, "url": u} for k, u in rejected],
+        "unknown": [{"path": k, "url": u} for k, u in unknown],
+    }, indent=2))
+    click.echo(f"\nReport: {report_path}")
+
+    if fail_on_reject and rejected:
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     main()
