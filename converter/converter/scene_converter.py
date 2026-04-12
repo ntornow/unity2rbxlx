@@ -191,6 +191,10 @@ _fbx_bounding_boxes: dict[str, tuple[float, float, float]] = {}
 # Module-level collector for water regions discovered during node conversion.
 # Populated by _convert_node / _convert_prefab_instance, consumed by convert_scene.
 _water_regions: list[RbxWaterRegion] = []
+
+# Collector for unknown/unhandled Unity component types found during conversion.
+# Logged at the end of convert_scene so users know what was skipped.
+_unhandled_components: set[str] = set()
 # Terrain world position offset — subtracted from object positions so they
 # align with terrain encoder's (0,0,0)-based voxel grid.
 _terrain_world_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
@@ -1062,6 +1066,14 @@ def convert_scene(
         len(place.water_regions),
         "found" if place.camera else "default",
     )
+    # Report any unhandled component types so users know what was skipped.
+    if _unhandled_components:
+        log.info(
+            "Unhandled Unity component types (skipped): %s",
+            ", ".join(sorted(_unhandled_components)),
+        )
+        _unhandled_components.clear()
+
     return place
 
 
@@ -1746,8 +1758,9 @@ def _process_components(
         elif ct in _SILENT_SKIP_TYPES:
             pass
 
-        # -- Unknown component: log for debugging --
+        # -- Unknown component: log so users know what was skipped --
         else:
+            _unhandled_components.add(ct)
             log.debug("Unhandled component type '%s' on node '%s'", ct, node.name)
 
     # -- Anchoring logic --
