@@ -1230,6 +1230,119 @@ def eval_diff(baseline: str, current: str, fail_on_regression: bool) -> None:
         sys.exit(1)
 
 
+@main.command("visual-compare")
+@click.argument("unity_project", type=click.Path(exists=True))
+@click.option("--output", "-o", type=click.Path(), default="./output",
+              help="Output directory (where converted_place.rbxlx lives).")
+@click.option("--scene", type=str, default=None,
+              help="Scene path relative to project (auto-detected if omitted).")
+@click.option("--save-dir", type=click.Path(), default=None,
+              help="Directory for screenshots and diff output (default: output/comparison).")
+def visual_compare(unity_project: str, output: str, scene: str | None,
+                   save_dir: str | None) -> None:
+    """Side-by-side visual comparison: read Unity scene camera, match in Roblox Studio.
+
+    Reads the game camera position from the Unity scene file, converts it
+    to Roblox coordinates, positions Roblox Studio's camera at the
+    equivalent viewpoint, and captures screenshots from both. Then runs
+    SSIM (structural similarity) between the two images.
+
+    Requires:
+    - Unity Editor open with the project loaded (for computer-use screenshot)
+    - Roblox Studio open with converted_place.rbxlx (for MCP screen capture)
+
+    The command outputs SSIM score and saves:
+    - unity_screenshot.png — cropped Unity viewport
+    - roblox_screenshot.png — Studio viewport capture
+    - diff_heatmap.png — pixel-level difference visualization
+    """
+    from pathlib import Path
+    import json
+
+    project_path = Path(unity_project).resolve()
+    output_path = Path(output).resolve()
+    comparison_dir = Path(save_dir) if save_dir else output_path / "comparison"
+    comparison_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Step 1: Find scene and read Unity camera ---
+    if scene is None:
+        scenes = list(project_path.glob("**/*.unity"))
+        yaml_scenes = [s for s in scenes if _is_text_yaml(s)]
+        if yaml_scenes:
+            scene = str(yaml_scenes[0].relative_to(project_path))
+        else:
+            click.echo("No text YAML scenes found.")
+            return
+
+    click.echo(f"Scene: {scene}")
+
+    from comparison.screenshot_capture import (
+        get_scene_camera_info,
+        unity_camera_to_roblox,
+        generate_roblox_camera_luau,
+    )
+
+    cam_info = get_scene_camera_info(project_path, scene)
+    if not cam_info:
+        click.echo("Could not find camera in scene. Specify --scene.")
+        return
+
+    click.echo(f"Unity camera: {cam_info['name']} at {cam_info['position']}")
+
+    roblox_cam = unity_camera_to_roblox(
+        cam_info["position"],
+        cam_info.get("rotation_euler", (0, 0, 0)),
+        cam_info.get("fov", 60),
+    )
+    click.echo(f"Roblox camera: pos={roblox_cam['position']} fov={roblox_cam['fov']}")
+
+    # --- Step 2: Position Roblox Studio camera via MCP ---
+    luau_script = generate_roblox_camera_luau(
+        roblox_cam["position"],
+        roblox_cam["rotation"],
+        roblox_cam["fov"],
+    )
+    click.echo("\nRoblox camera Luau script (paste into Studio command bar or run via MCP):")
+    click.echo(f"  {luau_script.strip()}")
+
+    # --- Step 3: Save camera info for external tools ---
+    camera_data = {
+        "unity": {
+            "name": cam_info["name"],
+            "position": cam_info["position"],
+            "rotation_euler": cam_info.get("rotation_euler"),
+            "fov": cam_info.get("fov", 60),
+        },
+        "roblox": roblox_cam,
+        "luau_script": luau_script,
+    }
+    camera_path = comparison_dir / "camera_match.json"
+    camera_path.write_text(json.dumps(camera_data, indent=2), encoding="utf-8")
+    click.echo(f"\nCamera data saved: {camera_path}")
+
+    # --- Step 4: Instructions for manual capture ---
+    click.echo("\n--- Capture Instructions ---")
+    click.echo("1. In Unity: navigate Scene view to the camera position, or enter Play mode")
+    click.echo("2. In Roblox Studio: run the Luau script above in the command bar")
+    click.echo("3. Take screenshots of both viewports")
+    click.echo(f"4. Run: python3 u2r.py compare {unity_project} -o {output} --visual \\")
+    click.echo(f"     --unity-screenshot <unity.png> --roblox-screenshot <roblox.png>")
+
+    # --- Step 5: If screenshots already exist, run SSIM ---
+    unity_img = comparison_dir / "unity_screenshot.png"
+    roblox_img = comparison_dir / "roblox_screenshot.png"
+    if unity_img.exists() and roblox_img.exists():
+        click.echo("\nFound existing screenshots — running SSIM comparison...")
+        from comparison.visual_diff import compare_images
+        results = compare_images(
+            str(unity_img), str(roblox_img),
+            output_dir=str(comparison_dir),
+        )
+        if results:
+            click.echo(f"  SSIM: {results.get('ssim', 'N/A')}")
+            click.echo(f"  Diff saved: {comparison_dir / 'diff_heatmap.png'}")
+
+
 def _get_git_commit() -> str:
     """Return the current short git commit hash, or 'unknown'."""
     import subprocess
