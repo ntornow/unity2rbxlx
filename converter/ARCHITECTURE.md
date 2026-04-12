@@ -12,6 +12,60 @@ Unity Project --> [Parser] --> Scene Graph (IR) --> [Converter] --> Roblox Outpu
                                                   [Comparison System]
 ```
 
+## Entry Points
+
+The converter exposes the same `Pipeline` class through two CLIs that share the same `conversion_context.json` on disk. A conversion can be started in one mode and finished in the other.
+
+### Mode 1 — `u2r.py` (non-interactive)
+
+End-to-end CLI for one-shot conversions, CI/CD, batch jobs. No human in the loop. Subcommands: `convert`, `publish`, `analyze`, `validate`, `resolve`, `compare`. See `python u2r.py --help`.
+
+### Mode 2 — `convert_interactive.py` + `/convert-unity` skill (phase-by-phase)
+
+`convert_interactive.py` is a Click CLI where each subcommand corresponds to one phase of the user-facing skill workflow. Each subcommand emits structured JSON to stdout, persists state in `conversion_context.json`, and can be invoked independently — prerequisite phases are re-run as needed (matching `Pipeline.resume` semantics).
+
+| Skill phase | Pipeline phases run | Notes |
+|---|---|---|
+| `preflight`  | (none — env check)                | Validates Python, packages, Unity project |
+| `status`     | (none — reads ctx)                | Reports completed phases + next phase |
+| `discover`   | parse                             | Builds GUID index, picks scene |
+| `inventory`  | parse → extract_assets            | Builds asset manifest |
+| `materials`  | … → convert_materials             | Maps Unity .mat → SurfaceAppearance |
+| `transpile`  | … → transpile_scripts             | C# → Luau (rule-based + AI) |
+| `validate`   | (none — runs `luau_validator`)    | Auto-fixes Luau quality issues in `<output_dir>/scripts/` |
+| `assemble`   | upload_assets, resolve_assets, convert_animations, convert_scene, write_output | Produces `converted_place.rbxlx` |
+| `upload`     | parse → convert_scene + headless place builder | Publishes via `execute_luau` |
+| `report`     | (none — writes `conversion_report.json`) | Final summary |
+
+The `/convert-unity` skill (`converter/.claude/skills/convert-unity/SKILL.md`) drives the interactive workflow. It pauses at each phase for human review (scene selection, material review, script review, scale strategy, etc.) and contains the Step 4.5 game-logic-porting playbook (architecture map, Unity↔Roblox divergence analysis, module-per-component rewrite, bootstrap wiring) that the pipeline cannot automate. See also `references/upload-patching.md` for upload-strategy details.
+
+### Architecture diagram
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  /convert-unity  (Claude Code skill — human in loop)    │
+└──────────────┬──────────────────────────────────────────┘
+               │ invokes per-phase subcommands
+               ▼
+┌─────────────────────────────┐    ┌──────────────────────┐
+│  convert_interactive.py     │    │  u2r.py (one-shot)   │
+│  (10 Click subcommands,     │    │  convert/publish/…   │
+│   JSON to stdout)           │    │                      │
+└──────────────┬──────────────┘    └──────────┬───────────┘
+               │                              │
+               └─────────────┬────────────────┘
+                             ▼
+              ┌──────────────────────────────┐
+              │  Pipeline  (converter/       │
+              │   pipeline.py)               │
+              │  ┌────────────────────────┐  │
+              │  │ ConversionContext      │  │
+              │  │ (conversion_context.   │  │
+              │  │  json — persisted)     │  │
+              │  └────────────────────────┘  │
+              └──────────────────────────────┘
+```
+
 ## Pipeline Phases
 
 1. **Parse**: scene_parser + prefab_parser + guid_resolver -- parse Unity YAML

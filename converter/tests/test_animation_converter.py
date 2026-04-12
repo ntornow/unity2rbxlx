@@ -728,19 +728,19 @@ class TestAnimationDiscovery:
 # Test integration with real SimpleFPS .anim files (if available)
 # ---------------------------------------------------------------------------
 
+from tests._project_paths import SIMPLEFPS_PATH as _SIMPLE_FPS_PATH, is_populated as _is_populated
+
+
+@pytest.mark.skipif(
+    not _is_populated(_SIMPLE_FPS_PATH),
+    reason="SimpleFPS test project not available",
+)
 class TestRealAnimFiles:
     """Integration tests using actual SimpleFPS animation files."""
 
-    SIMPLE_FPS_PATH = Path(__file__).parent.parent.parent / "test_projects" / "SimpleFPS"
-
-    @pytest.fixture
-    def skip_if_no_simplefps(self) -> None:
-        if not self.SIMPLE_FPS_PATH.exists():
-            pytest.skip("SimpleFPS test project not available")
-
-    def test_parse_door_open_anim(self, skip_if_no_simplefps: None) -> None:
+    def test_parse_door_open_anim(self) -> None:
         """Parse the actual door open.anim file from SimpleFPS."""
-        anim_path = self.SIMPLE_FPS_PATH / "Assets/AssetPack/SciFi_Door/Animation/open.anim"
+        anim_path = _SIMPLE_FPS_PATH / "Assets/AssetPack/SciFi_Door/Animation/open.anim"
         clip = parse_anim_file(anim_path)
 
         assert clip is not None
@@ -754,9 +754,9 @@ class TestRealAnimFiles:
         assert len(pos_curve.keyframes) == 2
         assert pos_curve.keyframes[1].value[1] == pytest.approx(4.0)
 
-    def test_parse_door_close_anim(self, skip_if_no_simplefps: None) -> None:
+    def test_parse_door_close_anim(self) -> None:
         """Parse the actual door close.anim file."""
-        anim_path = self.SIMPLE_FPS_PATH / "Assets/AssetPack/SciFi_Door/Animation/close.anim"
+        anim_path = _SIMPLE_FPS_PATH / "Assets/AssetPack/SciFi_Door/Animation/close.anim"
         clip = parse_anim_file(anim_path)
 
         assert clip is not None
@@ -768,9 +768,9 @@ class TestRealAnimFiles:
         assert pos_curve.keyframes[0].value[1] == pytest.approx(4.0)
         assert pos_curve.keyframes[1].value[1] == pytest.approx(0.0)
 
-    def test_parse_door_controller(self, skip_if_no_simplefps: None) -> None:
+    def test_parse_door_controller(self) -> None:
         """Parse the actual door.controller file."""
-        ctrl_path = self.SIMPLE_FPS_PATH / "Assets/AssetPack/SciFi_Door/Animation/door.controller"
+        ctrl_path = _SIMPLE_FPS_PATH / "Assets/AssetPack/SciFi_Door/Animation/door.controller"
         ctrl = parse_controller_file(ctrl_path)
 
         assert ctrl is not None
@@ -785,9 +785,9 @@ class TestRealAnimFiles:
         assert "open" in state_names
         assert "close" in state_names
 
-    def test_parse_hostile_plane_controller(self, skip_if_no_simplefps: None) -> None:
+    def test_parse_hostile_plane_controller(self) -> None:
         """Parse the HostilePlane.controller file (single auto-play state)."""
-        ctrl_path = self.SIMPLE_FPS_PATH / "Assets/Animations/HostilePlane/HostilePlane.controller"
+        ctrl_path = _SIMPLE_FPS_PATH / "Assets/Animations/HostilePlane/HostilePlane.controller"
         ctrl = parse_controller_file(ctrl_path)
 
         assert ctrl is not None
@@ -796,9 +796,9 @@ class TestRealAnimFiles:
         assert len(ctrl.states) == 1
         assert ctrl.states[0].name == "Flying"
 
-    def test_parse_plane_holder_controller(self, skip_if_no_simplefps: None) -> None:
+    def test_parse_plane_holder_controller(self) -> None:
         """Parse PlaneHolder.controller (int parameter, multiple states)."""
-        ctrl_path = self.SIMPLE_FPS_PATH / "Assets/Animations/PlaneHolder/PlaneHolder.controller"
+        ctrl_path = _SIMPLE_FPS_PATH / "Assets/Animations/PlaneHolder/PlaneHolder.controller"
         ctrl = parse_controller_file(ctrl_path)
 
         assert ctrl is not None
@@ -813,9 +813,9 @@ class TestRealAnimFiles:
         assert "holder3" in state_names
         assert "Idle" in state_names
 
-    def test_parse_holder1_anim(self, skip_if_no_simplefps: None) -> None:
+    def test_parse_holder1_anim(self) -> None:
         """Parse holder1.anim which targets child objects by path."""
-        anim_path = self.SIMPLE_FPS_PATH / "Assets/Animations/PlaneHolder/holder1.anim"
+        anim_path = _SIMPLE_FPS_PATH / "Assets/Animations/PlaneHolder/holder1.anim"
         clip = parse_anim_file(anim_path)
 
         assert clip is not None
@@ -826,10 +826,10 @@ class TestRealAnimFiles:
         child_curves = [c for c in clip.curves if c.path]
         assert len(child_curves) >= 1
 
-    def test_generate_door_animation_script(self, skip_if_no_simplefps: None) -> None:
+    def test_generate_door_animation_script(self) -> None:
         """Generate a complete door animation script."""
-        anim_path = self.SIMPLE_FPS_PATH / "Assets/AssetPack/SciFi_Door/Animation/open.anim"
-        ctrl_path = self.SIMPLE_FPS_PATH / "Assets/AssetPack/SciFi_Door/Animation/door.controller"
+        anim_path = _SIMPLE_FPS_PATH / "Assets/AssetPack/SciFi_Door/Animation/open.anim"
+        ctrl_path = _SIMPLE_FPS_PATH / "Assets/AssetPack/SciFi_Door/Animation/door.controller"
 
         clip = parse_anim_file(anim_path)
         ctrl = parse_controller_file(ctrl_path)
@@ -844,9 +844,9 @@ class TestRealAnimFiles:
         assert "open" in luau  # parameter name
         assert "GetAttributeChangedSignal" in luau
 
-    def test_full_project_discovery(self, skip_if_no_simplefps: None) -> None:
+    def test_full_project_discovery(self) -> None:
         """Discover all animations in the SimpleFPS project."""
-        clips, controllers = discover_animations(self.SIMPLE_FPS_PATH)
+        clips, controllers = discover_animations(_SIMPLE_FPS_PATH)
 
         # SimpleFPS has: open.anim, close.anim, fly.anim, Flying.anim,
         #                holder1.anim, holder2.anim, holder3.anim
@@ -856,12 +856,12 @@ class TestRealAnimFiles:
         #              PlaneHolder.controller, Plane Flying.controller
         assert len(controllers) >= 4
 
-    def test_full_project_conversion(self, skip_if_no_simplefps: None) -> None:
+    def test_full_project_conversion(self) -> None:
         """Run full animation conversion on SimpleFPS project."""
         from unity.guid_resolver import build_guid_index
 
-        guid_index = build_guid_index(self.SIMPLE_FPS_PATH)
-        result = convert_animations(self.SIMPLE_FPS_PATH, guid_index=guid_index)
+        guid_index = build_guid_index(_SIMPLE_FPS_PATH)
+        result = convert_animations(_SIMPLE_FPS_PATH, guid_index=guid_index)
 
         assert result.total_clips >= 7
         assert result.total_controllers >= 4

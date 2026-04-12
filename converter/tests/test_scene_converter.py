@@ -45,15 +45,11 @@ class TestHierarchyParenting:
     """Test that prefab hierarchy parenting works."""
 
     @pytest.mark.slow
-    @pytest.mark.skipif(
-        not (Path(__file__).parent.parent.parent / "test_projects" / "SimpleFPS").exists(),
-        reason="SimpleFPS test project not available",
-    )
-    def test_dynamic_objects_has_children(self):
+    def test_dynamic_objects_has_children(self, simplefps_project):
         """DynamicObjects/Level should have child sectors."""
         from converter.pipeline import Pipeline
 
-        project = Path(__file__).parent.parent.parent / "test_projects" / "SimpleFPS"
+        project = simplefps_project
         pipeline = Pipeline(
             unity_project_path=project,
             output_dir=Path("/tmp/test_hierarchy"),

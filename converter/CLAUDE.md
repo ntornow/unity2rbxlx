@@ -70,6 +70,35 @@ Detailed session-by-session progress is in git history. Key milestones:
 ## Overview
 Converts Unity game projects into playable Roblox experiences. Handles scene hierarchy, materials, C# -> Luau transpilation, mesh processing, animation conversion, and asset upload.
 
+## Entry Points
+
+There are two CLIs that share the same `Pipeline` class and the same `conversion_context.json` on disk:
+
+1. **`u2r.py` — non-interactive end-to-end CLI.** Use this for one-shot conversions, CI, batch jobs, anything that should run without human-in-the-loop. Subcommands: `convert`, `publish`, `analyze`, `validate`, `resolve`, `compare`. See `python u2r.py --help`.
+
+2. **`convert_interactive.py` — phase-by-phase CLI for the `/convert-unity` Claude Code skill.** Each subcommand maps to a single skill phase, emits structured JSON to stdout, and persists state in `conversion_context.json`. Subcommands:
+
+   | Skill phase | Pipeline phases run | Notes |
+   |---|---|---|
+   | `preflight`  | (none — env check)                | Validates Python, packages, Unity project |
+   | `status`     | (none — reads ctx)                | Reports completed phases + next |
+   | `discover`   | parse                             | Builds GUID index, picks scene |
+   | `inventory`  | parse → extract_assets            | Builds asset manifest |
+   | `materials`  | … → convert_materials             | Maps Unity .mat → SurfaceAppearance |
+   | `transpile`  | … → transpile_scripts             | C# → Luau (rule-based + AI) |
+   | `validate`   | (none — runs `luau_validator`)    | Auto-fixes Luau quality issues |
+   | `assemble`   | upload_assets, resolve_assets, convert_animations, convert_scene, write_output | Produces `converted_place.rbxlx` |
+   | `upload`     | parse → convert_scene + headless place builder | Publishes via `execute_luau` |
+   | `report`     | (none — writes `conversion_report.json`) | Final summary |
+
+   Each subcommand re-runs essential prerequisite phases on every invocation (matching `Pipeline.resume` semantics) so individual calls are self-contained — but state from previous calls is loaded from `conversion_context.json`.
+
+3. **`/convert-unity` skill** — `converter/.claude/skills/convert-unity/SKILL.md` is the institutional knowledge layer that Claude Code follows when walking a user through an interactive conversion. It encodes the Unity↔Roblox semantic gaps (Step 4.5: architecture map, divergence analysis, module rewrite, bootstrap wiring) that the pipeline cannot automate.
+
+   See also `converter/.claude/skills/convert-unity/references/upload-patching.md` for upload-strategy details.
+
+   **Bug fix protocol:** when fixing a problem found in converted output, always fix BOTH the pipeline code (under `converter/`, `unity/`, `roblox/`, `runtime/`) AND the affected output scripts in `<output_dir>/scripts/`. A fix only to the output regresses on the next conversion; a fix only to the pipeline leaves the current game broken.
+
 ## Architecture
 
 ```

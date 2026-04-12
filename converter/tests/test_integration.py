@@ -7,12 +7,11 @@ from pathlib import Path
 
 import pytest
 
-SIMPLEFPS_DIR = Path(__file__).parent.parent.parent / "test_projects" / "SimpleFPS"
-BOATATTACK_DIR = Path(__file__).parent.parent.parent / "test_projects" / "BoatAttack"
-
-
-def _has_project(path: Path) -> bool:
-    return path.exists() and (path / "Assets").exists()
+from tests._project_paths import (
+    BOATATTACK_PATH as BOATATTACK_DIR,
+    SIMPLEFPS_PATH as SIMPLEFPS_DIR,
+    is_populated as _has_project,
+)
 
 
 @pytest.mark.skipif(not _has_project(SIMPLEFPS_DIR), reason="SimpleFPS project not found")
@@ -336,7 +335,7 @@ class TestRbxlxOutputQuality:
         assert len(materials) >= 1, f"No material types found"
 
 
-GAMEKIT3D_DIR = Path(__file__).parent.parent.parent / "test_projects" / "Gamekit3D"
+from tests._project_paths import GAMEKIT3D_PATH as GAMEKIT3D_DIR  # noqa: E402
 
 
 @pytest.mark.slow
@@ -942,13 +941,11 @@ class TestMeshSizing:
         """Verify turret_01.fbx returns correct import scale (USF=100 → 1.0)."""
         from converter.scene_converter import _get_fbx_import_scale
         from unity.guid_resolver import build_guid_index
-        from pathlib import Path
 
-        proj = Path("../test_projects/SimpleFPS")
-        if not proj.exists():
+        if not _has_project(SIMPLEFPS_DIR):
             pytest.skip("SimpleFPS not found")
 
-        idx = build_guid_index(proj)
+        idx = build_guid_index(SIMPLEFPS_DIR)
         # Find turret mesh GUID
         for guid, entry in idx.guid_to_entry.items():
             if "turret_01.fbx" in str(entry.relative_path):
@@ -961,13 +958,11 @@ class TestMeshSizing:
         """Verify totem_01.fbx returns correct import scale (globalScale=100)."""
         from converter.scene_converter import _get_fbx_import_scale
         from unity.guid_resolver import build_guid_index
-        from pathlib import Path
 
-        proj = Path("../test_projects/SimpleFPS")
-        if not proj.exists():
+        if not _has_project(SIMPLEFPS_DIR):
             pytest.skip("SimpleFPS not found")
 
-        idx = build_guid_index(proj)
+        idx = build_guid_index(SIMPLEFPS_DIR)
         for guid, entry in idx.guid_to_entry.items():
             if "totem_01.fbx" in str(entry.relative_path):
                 scale = _get_fbx_import_scale(guid, idx)
