@@ -81,8 +81,11 @@ API_CALL_MAP: dict[str, str] = {
     "Time.time": "workspace:GetServerTimeNow()",
     "Time.deltaTime": "dt",
     "Time.fixedDeltaTime": "dt",
+    "Time.fixedTime": "os.clock()",
+    "Time.fixedTimeAsDouble": "os.clock()",
     "Time.timeScale": "workspace:SetAttribute('TimeScale', 1)",
     "Time.unscaledDeltaTime": "dt",
+    "Time.unscaledTime": "os.clock()",
     "Time.realtimeSinceStartup": "os.clock()",
     "Time.frameCount": "math.floor(tick() * 60)",  # Approximate frame counter
     # -- Input --
@@ -449,6 +452,10 @@ API_CALL_MAP: dict[str, str] = {
     "Application.isFocused": "game:GetService('UserInputService').WindowFocused",
     "Application.isEditor": "game:GetService('RunService'):IsStudio()",
     "Application.Quit()": "-- Application.Quit: use game.Players.LocalPlayer:Kick()",
+    "Application.OpenURL": "-- Application.OpenURL: use game:GetService('GuiService'):OpenBrowserWindow",
+    "Application.backgroundLoadingPriority": "-- backgroundLoadingPriority: no Roblox equivalent",
+    "Application.loadLevel": "-- loadLevel: use TeleportService or place navigation",
+    "Application.LoadLevel": "-- LoadLevel: use TeleportService or place navigation",
     # -- Screen --
     "Screen.width": "workspace.CurrentCamera.ViewportSize.X",
     "Screen.height": "workspace.CurrentCamera.ViewportSize.Y",
