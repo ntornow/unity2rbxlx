@@ -1219,16 +1219,26 @@ def _convert_node(
             import_scale = _get_fbx_import_scale(node.mesh_guid, guid_index) if guid_index else 0.01
             unit_ratio = _get_fbx_unit_ratio(node.mesh_guid, guid_index) if guid_index else 1.0
             scale_factor = import_scale * unit_ratio * config.STUDS_PER_METER
+            # part.cframe is the parent world CFrame from the scene node
+            _pcf = part.cframe
             for sm in _multi_sub:
                 native_size = (sm["size"][0], sm["size"][1], sm["size"][2])
                 sm_pos = sm.get("position", [0, 0, 0])
-                px = sm_pos[0] * scale_factor * abs(sx)
-                py = sm_pos[1] * scale_factor * abs(sy)
-                pz = sm_pos[2] * scale_factor * abs(sz)
+                lx = sm_pos[0] * scale_factor * abs(sx)
+                ly = sm_pos[1] * scale_factor * abs(sy)
+                lz = sm_pos[2] * scale_factor * abs(sz)
+                wx = _pcf.x + _pcf.r00 * lx + _pcf.r01 * ly + _pcf.r02 * lz
+                wy = _pcf.y + _pcf.r10 * lx + _pcf.r11 * ly + _pcf.r12 * lz
+                wz = _pcf.z + _pcf.r20 * lx + _pcf.r21 * ly + _pcf.r22 * lz
                 mesh_part = RbxPart(
                     name=sm["name"],
                     class_name="MeshPart",
-                    cframe=RbxCFrame(x=px, y=py, z=pz),
+                    cframe=RbxCFrame(
+                        x=wx, y=wy, z=wz,
+                        r00=_pcf.r00, r01=_pcf.r01, r02=_pcf.r02,
+                        r10=_pcf.r10, r11=_pcf.r11, r12=_pcf.r12,
+                        r20=_pcf.r20, r21=_pcf.r21, r22=_pcf.r22,
+                    ),
                     size=(
                         native_size[0] * scale_factor * abs(sx),
                         native_size[1] * scale_factor * abs(sy),
@@ -2946,13 +2956,24 @@ def _convert_fbx_prefab_instance(
         for sm in _multi_subs:
             native = (sm["size"][0], sm["size"][1], sm["size"][2])
             sm_pos = sm.get("position", [0, 0, 0])
+            # Compute world-space CFrame for the child by composing the
+            # parent's rotation + position with the sub-mesh local offset.
+            # Roblox Model children need absolute CFrames (Models don't
+            # apply their own CFrame to children like Unity does).
+            lx = sm_pos[0] * _sf2 * abs(combined_scale[0])
+            ly = sm_pos[1] * _sf2 * abs(combined_scale[1])
+            lz = sm_pos[2] * _sf2 * abs(combined_scale[2])
+            wx = cframe.x + cframe.r00 * lx + cframe.r01 * ly + cframe.r02 * lz
+            wy = cframe.y + cframe.r10 * lx + cframe.r11 * ly + cframe.r12 * lz
+            wz = cframe.z + cframe.r20 * lx + cframe.r21 * ly + cframe.r22 * lz
             child = RbxPart(
                 name=sm["name"],
                 class_name="MeshPart",
                 cframe=RbxCFrame(
-                    x=sm_pos[0] * _sf2 * abs(combined_scale[0]),
-                    y=sm_pos[1] * _sf2 * abs(combined_scale[1]),
-                    z=sm_pos[2] * _sf2 * abs(combined_scale[2]),
+                    x=wx, y=wy, z=wz,
+                    r00=cframe.r00, r01=cframe.r01, r02=cframe.r02,
+                    r10=cframe.r10, r11=cframe.r11, r12=cframe.r12,
+                    r20=cframe.r20, r21=cframe.r21, r22=cframe.r22,
                 ),
                 size=(
                     native[0] * _sf2 * abs(combined_scale[0]),
