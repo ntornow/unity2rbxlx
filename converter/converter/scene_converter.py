@@ -1889,11 +1889,18 @@ _MONO_SYSTEM_PROPS = frozenset({
 })
 
 
+_prefab_material_cache: dict[str, tuple[dict[str, str], str | None]] = {}
+
+
 def _extract_prefab_material_map(
     prefab_path: Path,
 ) -> tuple[dict[str, str], str | None]:
     """Walk a Unity prefab YAML and build a `{GameObject name: material GUID}`
     map plus a fallback (first-seen) material GUID.
+
+    Results are cached by resolved path so repeated calls for the same prefab
+    (common in Gamekit3D where many instances share the same base prefab) don't
+    re-read and re-regex the file.
 
     Unity prefab structure: each visible sub-mesh has its own GameObject with
     a MeshRenderer component whose `m_Materials[0]` points at the material to
@@ -1905,9 +1912,14 @@ def _extract_prefab_material_map(
     The function is resilient to missing fields — it returns an empty map and
     `None` for the fallback if parsing fails.
     """
+    cache_key = str(prefab_path.resolve())
+    if cache_key in _prefab_material_cache:
+        return _prefab_material_cache[cache_key]
+
     try:
         text = prefab_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
+        _prefab_material_cache[cache_key] = ({}, None)
         return {}, None
 
     import re as _re
@@ -1944,7 +1956,9 @@ def _extract_prefab_material_map(
         if name:
             name_to_mat[name] = mat_guid
 
-    return name_to_mat, fallback_guid
+    result = (name_to_mat, fallback_guid)
+    _prefab_material_cache[cache_key] = result
+    return result
 
 
 def _extract_monobehaviour_attributes(
