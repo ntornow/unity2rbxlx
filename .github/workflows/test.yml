@@ -5,9 +5,6 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  # Nightly slow run at 07:00 UTC so we catch regressions on the big
-  # end-to-end projects (Gamekit3D etc.) without paying the cost on every
-  # push.
   schedule:
     - cron: "0 7 * * *"
   workflow_dispatch:
@@ -33,9 +30,6 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # Install dependencies listed in pyproject.toml + dev extras.
-          # Not using `pip install -e .` because the repo doesn't have a
-          # conventional package layout — tests rely on `sys.path` shims.
           pip install \
             pyyaml click Pillow trimesh scikit-image requests anthropic \
             numpy pytest pytest-cov
@@ -44,10 +38,7 @@ jobs:
         run: pytest tests/ -m "not slow" -v
 
   slow:
-    # Runs on schedule and manual dispatch only — NOT on every push/PR,
-    # because the end-to-end fixtures need the full test_projects/*
-    # submodules (many GB of FBX/textures) and take ~65s.
-    name: slow test suite (nightly)
+    name: slow test suite + eval regression (nightly)
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     timeout-minutes: 30
@@ -74,3 +65,8 @@ jobs:
 
       - name: Run full test suite
         run: pytest tests/ -v
+
+      - name: Run eval and check for regressions
+        run: |
+          python3 u2r.py eval -o ./eval_current --baseline ./eval_current.json
+          python3 u2r.py eval-diff eval_baseline.json eval_current.json --fail-on-regression
