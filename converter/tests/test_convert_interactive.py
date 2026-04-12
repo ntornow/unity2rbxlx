@@ -69,8 +69,8 @@ class TestCtxSummary:
     def test_shape_and_keys(self):
         ctx = ConversionContext(
             unity_project_path="/tmp/fake/unity",
-            selected_scene="/tmp/fake/unity/Assets/Scenes/Main/level.unity",
-            scene_paths=["/tmp/fake/unity/Assets/Scenes/Main/level.unity", "/tmp/fake/unity/Assets/Scenes/menu.unity"],
+            selected_scene="Assets/Scenes/Main/level.unity",
+            scene_paths=["Assets/Scenes/Main/level.unity", "Assets/Scenes/menu.unity"],
             total_game_objects=42,
             converted_parts=30,
             total_scripts=10,

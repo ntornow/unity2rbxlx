@@ -239,10 +239,13 @@ def _relative_scene_path(scene_path: str, unity_project_path: str) -> str:
     """Return scene path relative to the Unity project root for disambiguation."""
     if not scene_path:
         return ""
+    p = Path(scene_path)
+    if not p.is_absolute():
+        return str(p)
     try:
-        return str(Path(scene_path).relative_to(unity_project_path))
+        return str(p.relative_to(unity_project_path))
     except ValueError:
-        return Path(scene_path).name
+        return p.name
 
 
 def _ctx_summary(ctx: ConversionContext) -> dict:
