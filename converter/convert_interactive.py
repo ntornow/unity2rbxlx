@@ -172,7 +172,20 @@ def _make_pipeline(
         skip_upload=skip_upload,
     )
     if ctx_path.exists():
-        pipeline.ctx = ConversionContext.load(ctx_path)
+        prior_ctx = ConversionContext.load(ctx_path)
+        # Guard against cross-project contamination: if the persisted context
+        # came from a different Unity project, the GUID index and selected_scene
+        # will silently produce corrupt output.
+        prior_project = str(Path(prior_ctx.unity_project_path).resolve()) if prior_ctx.unity_project_path else ""
+        current_project = str(Path(unity_project_path).resolve())
+        if prior_project and prior_project != current_project:
+            raise click.UsageError(
+                f"output_dir already contains a conversion from a different project:\n"
+                f"  prior:   {prior_project}\n"
+                f"  current: {current_project}\n"
+                f"Choose a fresh output_dir or remove the existing one."
+            )
+        pipeline.ctx = prior_ctx
     return pipeline
 
 
@@ -645,12 +658,16 @@ def validate(output_dir: str, write: bool) -> None:
               help="Skip asset upload (placeholder URLs in the .rbxlx).")
 @click.option("--no-resolve", is_flag=True,
               help="Skip headless mesh resolution.")
+@click.option("--retranspile", is_flag=True,
+              help="Force re-transpilation even if scripts were already transpiled. "
+              "Without this flag, hand-edited Luau scripts in output_dir/scripts/ "
+              "are preserved.")
 @click.option("--api-key", type=str, default=None,
               help="Roblox Open Cloud API key (string or path to file).")
 @click.option("--creator-id", type=str, default=None,
               help="Roblox Creator ID (number or path to file).")
 def assemble(unity_project_path: str, output_dir: str,
-             no_upload: bool, no_resolve: bool,
+             no_upload: bool, no_resolve: bool, retranspile: bool,
              api_key: str | None, creator_id: str | None) -> None:
     """Phase 4: upload assets, resolve, convert animations + scene, write .rbxlx."""
     if api_key:
@@ -665,8 +682,17 @@ def assemble(unity_project_path: str, output_dir: str,
 
     pipeline = _make_pipeline(unity_project_path, output_dir, skip_upload=no_upload)
 
+    # Tell write_output whether to wipe scripts/ (see pipeline.py deferred fix R2/C1).
+    pipeline._retranspile = retranspile
+
     # Run every prerequisite + the assembly phases in order, but stop at
     # write_output (don't trigger headless publish — that's the upload step).
+    # When --retranspile is absent and transpile_scripts already ran, skip it
+    # to preserve hand-edited Luau scripts from the review step.
+    skip_transpile = (
+        not retranspile
+        and "transpile_scripts" in pipeline.ctx.completed_phases
+    )
     try:
         for phase in [
             "parse", "extract_assets", "upload_assets", "resolve_assets",
@@ -674,6 +700,8 @@ def assemble(unity_project_path: str, output_dir: str,
             "convert_scene", "write_output",
         ]:
             if no_resolve and phase == "resolve_assets":
+                continue
+            if skip_transpile and phase == "transpile_scripts":
                 continue
             pipeline._run_phase(phase)
     except Exception as exc:
@@ -881,6 +909,11 @@ def upload(output_dir: str, api_key: str | None,
         "script_size_kb": round(total_size / 1024, 1),
         "script_path": str(script_file),
         "chunk_results": chunk_results,
+        "warning": (
+            "Publishing a fresh rebuild of the scene, not the local .rbxlx. "
+            "Any manual edits to converted_place.rbxlx or place_builder.luau "
+            "are not reflected in the uploaded place."
+        ),
     })
 
 

@@ -870,10 +870,20 @@ return table.concat(allData, "\\n")'''
 
         # Write transpiled scripts to output directory AND add to RbxPlace.
         scripts_dir = self.output_dir / "scripts"
-        # Clean old scripts from previous runs to avoid stale files
-        if scripts_dir.exists():
-            import shutil
-            shutil.rmtree(scripts_dir)
+        # Only wipe scripts/ when transpile_scripts actually ran this session.
+        # When transpile_scripts was skipped (e.g. user hand-ported Luau during
+        # the review step and then ran assemble without --retranspile), preserve
+        # the existing scripts directory so hand-edits survive.
+        preserve_scripts = (
+            "transpile_scripts" in self.ctx.completed_phases
+            and not getattr(self, "_retranspile", False)
+            and scripts_dir.exists()
+            and not self.state.transpilation_result
+        )
+        if not preserve_scripts:
+            if scripts_dir.exists():
+                import shutil
+                shutil.rmtree(scripts_dir)
         scripts_dir.mkdir(parents=True, exist_ok=True)
 
         if self.state.transpilation_result:
