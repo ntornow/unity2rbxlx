@@ -1298,6 +1298,19 @@ def _convert_node(
     # -- Material --
     _apply_materials(node, part, material_mappings)
 
+    # When the part is a multi-sub-mesh Model, SurfaceAppearance on the Model
+    # container has no visual effect — propagate to each child MeshPart.
+    if part.class_name == "Model" and part.children and part.surface_appearance:
+        for child in part.children:
+            if child.class_name == "MeshPart" and not child.surface_appearance:
+                child.surface_appearance = part.surface_appearance
+                child.color = part.color
+                child.material = part.material
+                child.transparency = part.transparency
+                child.reflectance = part.reflectance
+        # Clear from the Model container (no-op visually, avoids confusion)
+        part.surface_appearance = None
+
     # -- Components --
     _process_components(node, part, guid_index=guid_index, uploaded_assets=uploaded_assets, scene_nodes=scene_nodes)
 

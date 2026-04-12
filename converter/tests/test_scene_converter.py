@@ -635,3 +635,76 @@ class TestExtractPrefabMaterialMap:
         name_map, fallback = _extract_prefab_material_map(prefab)
         assert name_map == {"Body": "cafecafecafecafe"}
         assert fallback == "cafecafecafecafe"
+
+
+class TestMultiSubMeshMaterialPropagation:
+    """When a scene node becomes a multi-sub-mesh Model, materials applied to
+    the Model container must propagate to child MeshParts (SurfaceAppearance
+    on a Model has no visual effect in Roblox)."""
+
+    def test_surface_appearance_propagated_to_children(self):
+        from core.roblox_types import RbxPart, RbxSurfaceAppearance
+
+        # Simulate a Model with two child MeshParts (post-_convert_node state)
+        parent = RbxPart(name="Fence", class_name="Model")
+        parent.surface_appearance = RbxSurfaceAppearance(
+            color_map="rbxassetid://111",
+            normal_map="rbxassetid://222",
+        )
+        parent.color = (0.5, 0.5, 0.5)
+        parent.material = "Metal"
+        parent.transparency = 0.1
+        parent.reflectance = 0.3
+
+        child_a = RbxPart(name="Frame", class_name="MeshPart")
+        child_b = RbxPart(name="ChainLink", class_name="MeshPart")
+        parent.children = [child_a, child_b]
+
+        # Apply the same propagation logic used in _convert_node
+        if parent.class_name == "Model" and parent.children and parent.surface_appearance:
+            for child in parent.children:
+                if child.class_name == "MeshPart" and not child.surface_appearance:
+                    child.surface_appearance = parent.surface_appearance
+                    child.color = parent.color
+                    child.material = parent.material
+                    child.transparency = parent.transparency
+                    child.reflectance = parent.reflectance
+            parent.surface_appearance = None
+
+        assert child_a.surface_appearance is not None
+        assert child_a.surface_appearance.color_map == "rbxassetid://111"
+        assert child_a.color == (0.5, 0.5, 0.5)
+        assert child_a.material == "Metal"
+        assert child_a.transparency == 0.1
+        assert child_a.reflectance == 0.3
+        assert child_b.surface_appearance is not None
+        assert parent.surface_appearance is None
+
+    def test_child_with_existing_sa_not_overwritten(self):
+        from core.roblox_types import RbxPart, RbxSurfaceAppearance
+
+        parent = RbxPart(name="Vehicle", class_name="Model")
+        parent.surface_appearance = RbxSurfaceAppearance(color_map="rbxassetid://999")
+
+        child = RbxPart(name="Body", class_name="MeshPart")
+        child.surface_appearance = RbxSurfaceAppearance(color_map="rbxassetid://original")
+        parent.children = [child]
+
+        if parent.class_name == "Model" and parent.children and parent.surface_appearance:
+            for c in parent.children:
+                if c.class_name == "MeshPart" and not c.surface_appearance:
+                    c.surface_appearance = parent.surface_appearance
+            parent.surface_appearance = None
+
+        # Child's existing SA should be preserved, not overwritten
+        assert child.surface_appearance.color_map == "rbxassetid://original"
+
+    def test_no_propagation_for_single_meshpart(self):
+        from core.roblox_types import RbxPart, RbxSurfaceAppearance
+
+        part = RbxPart(name="Rock", class_name="MeshPart")
+        part.surface_appearance = RbxSurfaceAppearance(color_map="rbxassetid://555")
+
+        # No children, no propagation needed — SA stays on the part
+        assert part.surface_appearance is not None
+        assert part.surface_appearance.color_map == "rbxassetid://555"

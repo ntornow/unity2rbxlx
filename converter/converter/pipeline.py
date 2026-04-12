@@ -55,6 +55,8 @@ class PipelineState:
     rbx_place: RbxPlace | None = None
     prefab_library: Any = None
     dependency_map: dict[str, list[str]] = field(default_factory=dict)
+    scriptable_objects: Any = None
+    sprite_result: Any = None
 
 
 class Pipeline:
@@ -336,6 +338,32 @@ class Pipeline:
             len(self.state.asset_manifest.assets),
             self.state.asset_manifest.total_size_bytes / (1024 * 1024),
         )
+
+        # Convert ScriptableObject .asset files to Luau ModuleScripts.
+        try:
+            from converter.scriptable_object_converter import convert_asset_files
+            so_result = convert_asset_files(self.unity_project_path)
+            if so_result.converted:
+                self.state.scriptable_objects = so_result
+                log.info("[extract_assets] Converted %d ScriptableObject .asset files",
+                         so_result.converted)
+        except Exception as exc:
+            log.debug("[extract_assets] ScriptableObject conversion skipped: %s", exc)
+
+        # Extract individual sprites from spritesheets.
+        try:
+            from converter.sprite_extractor import extract_sprites
+            if self.state.guid_index:
+                sprite_result = extract_sprites(self.state.guid_index, self.output_dir)
+                if sprite_result.total_sprites_extracted:
+                    self.state.sprite_result = sprite_result
+                    log.info("[extract_assets] Extracted %d sprites from %d spritesheets",
+                             sprite_result.total_sprites_extracted,
+                             sprite_result.total_spritesheets)
+                for w in sprite_result.warnings:
+                    log.warning("[extract_assets] Sprite: %s", w)
+        except Exception as exc:
+            log.debug("[extract_assets] Sprite extraction skipped: %s", exc)
 
         # Pre-compute FBX bounding boxes via trimesh for InitialSize fallback.
         # This runs only when mesh_native_sizes (from Studio resolution) are
@@ -939,9 +967,16 @@ return table.concat(allData, "\\n")'''
             for luau_path in luau_files:
                 source = luau_path.read_text(encoding="utf-8")
                 name = luau_path.stem
-                # Infer script type from source content
+                # Infer script type from source content.
+                # Only classify as ModuleScript if the file ends with a
+                # top-level return (the canonical ModuleScript pattern).
+                # A bare "\nreturn " anywhere in the file is NOT sufficient
+                # — regular Scripts have helper returns and early exits.
                 script_type: str = "Script"
-                if source.rstrip().endswith("return " + name) or "\nreturn " in source:
+                stripped_end = source.rstrip()
+                if (stripped_end.endswith("return " + name)
+                        or stripped_end.endswith("return module")
+                        or stripped_end.endswith("return {}")):
                     script_type = "ModuleScript"
                 elif "game.Players.LocalPlayer" in source or "UserInputService" in source:
                     script_type = "LocalScript"
@@ -1156,6 +1191,18 @@ return table.concat(allData, "\\n")'''
             log.info("[write_output] Auto-generated %d FPS client scripts/GUIs", fps_added)
         if detect_fps_game(self.state.rbx_place):
             self.state.rbx_place.is_fps_game = True
+
+        # Add ScriptableObject data tables as ModuleScripts.
+        if self.state.scriptable_objects:
+            from core.roblox_types import RbxScript
+            for asset in self.state.scriptable_objects.assets:
+                self.state.rbx_place.scripts.append(RbxScript(
+                    name=asset.asset_name,
+                    source=asset.luau_source,
+                    script_type="ModuleScript",
+                ))
+            log.info("[write_output] Added %d ScriptableObject ModuleScripts",
+                     len(self.state.scriptable_objects.assets))
 
         # Inject runtime library modules when relevant features are detected.
         self._inject_runtime_modules()
@@ -1451,6 +1498,17 @@ script.Disabled = true
                  rbxlx_path, result.get("parts_written", 0),
                  result.get("scripts_written", 0))
 
+        # Produce binary .rbxl alongside XML .rbxlx (needed for Open Cloud Place API).
+        try:
+            from roblox.rbxl_binary_writer import xml_to_binary
+            rbxl_path = xml_to_binary(rbxlx_path)
+            log.info("[write_output] Binary .rbxl written: %s (%.1f KB)",
+                     rbxl_path, rbxl_path.stat().st_size / 1024)
+        except ImportError:
+            log.debug("[write_output] lz4 not installed, skipping binary .rbxl")
+        except Exception as exc:
+            log.warning("[write_output] Binary .rbxl conversion failed: %s", exc)
+
         # Verify transform accuracy: compare Unity scene positions to rbxlx output.
         # Logs errors for any object with >10° rotation error or >2m position error.
         try:
@@ -1497,38 +1555,79 @@ script.Disabled = true
             rbxlx_path.write_text(raw_xml, encoding="utf-8")
             log.info("[write_output] Stripped %d invalid local texture paths from SurfaceAppearances", stripped)
 
-        # Write conversion report.
+        # Write conversion report using the structured report_generator when
+        # available, falling back to the inline dict for compatibility.
         import json as _json
-        # Collect script type breakdown
         script_types = {"Script": 0, "LocalScript": 0, "ModuleScript": 0}
         for s in (self.state.rbx_place.scripts or []):
             st = getattr(s, "script_type", "Script")
             script_types[st] = script_types.get(st, 0) + 1
 
-        report = {
-            "project": str(self.unity_project_path),
-            "scene": self.ctx.selected_scene,
-            "output": str(self.output_dir),
-            "stats": {
-                "game_objects": self.ctx.total_game_objects,
-                "parts": self.ctx.converted_parts,
-                "scripts": self.ctx.transpiled_scripts,
-                "script_types": script_types,
-                "materials": f"{self.ctx.converted_materials}/{self.ctx.total_materials}",
-                "animations": self.ctx.converted_animations,
-                "uploaded_assets": len(self.ctx.uploaded_assets),
-                "upload_errors": len(self.ctx.asset_upload_errors),
-                "terrains": len(self.state.rbx_place.terrains),
-                "screen_guis": len(self.state.rbx_place.screen_guis),
-                "streaming_enabled": self.ctx.converted_parts > 5000,
-            },
-            "elements": result,
-            "errors": self.ctx.errors,
-            "upload_errors": self.ctx.asset_upload_errors[:20],  # Cap for readability
-            "needs_resolution": len(self.ctx.uploaded_assets) > 0 and not self.ctx.mesh_native_sizes,
-        }
         report_path = self.output_dir / "conversion_report.json"
-        report_path.write_text(_json.dumps(report, indent=2), encoding="utf-8")
+        try:
+            from converter.report_generator import (
+                ConversionReport, AssetSummary, ScriptSummary,
+                MaterialSummary, ComponentSummary,
+                SceneSummary, OutputSummary, generate_report,
+            )
+            structured = ConversionReport(
+                unity_project_path=str(self.unity_project_path),
+                output_dir=str(self.output_dir),
+                success=len(self.ctx.errors) == 0,
+                errors=list(self.ctx.errors),
+                warnings=list(self.ctx.warnings),
+                assets=AssetSummary(
+                    total=len(self.ctx.uploaded_assets),
+                    by_kind={"upload_errors": len(self.ctx.asset_upload_errors)},
+                ),
+                scripts=ScriptSummary(
+                    total=self.ctx.transpiled_scripts,
+                    succeeded=self.ctx.transpiled_scripts,
+                    flagged_for_review=0,
+                ),
+                materials=MaterialSummary(
+                    total=self.ctx.total_materials,
+                    fully_converted=self.ctx.converted_materials,
+                ),
+                scene=SceneSummary(
+                    total_game_objects=self.ctx.total_game_objects,
+                ),
+                components=ComponentSummary(
+                    converted=self.ctx.converted_parts,
+                ),
+                output=OutputSummary(
+                    rbxl_path=str(rbxlx_path),
+                    parts_written=result.get("parts_written", 0),
+                    scripts_in_place=result.get("scripts_written", 0),
+                    report_path=str(report_path),
+                ),
+            )
+            generate_report(structured, report_path, print_summary=False)
+        except Exception:
+            # Fallback: inline dict for environments without report_generator
+            report = {
+                "project": str(self.unity_project_path),
+                "scene": self.ctx.selected_scene,
+                "output": str(self.output_dir),
+                "stats": {
+                    "game_objects": self.ctx.total_game_objects,
+                    "parts": self.ctx.converted_parts,
+                    "scripts": self.ctx.transpiled_scripts,
+                    "script_types": script_types,
+                    "materials": f"{self.ctx.converted_materials}/{self.ctx.total_materials}",
+                    "animations": self.ctx.converted_animations,
+                    "uploaded_assets": len(self.ctx.uploaded_assets),
+                    "upload_errors": len(self.ctx.asset_upload_errors),
+                    "terrains": len(self.state.rbx_place.terrains),
+                    "screen_guis": len(self.state.rbx_place.screen_guis),
+                    "streaming_enabled": self.ctx.converted_parts > 5000,
+                },
+                "elements": result,
+                "errors": self.ctx.errors,
+                "upload_errors": self.ctx.asset_upload_errors[:20],
+                "needs_resolution": len(self.ctx.uploaded_assets) > 0 and not self.ctx.mesh_native_sizes,
+            }
+            report_path.write_text(_json.dumps(report, indent=2), encoding="utf-8")
 
         # Persist context.
         self.ctx.save(self._context_path)
@@ -1737,6 +1836,27 @@ script.Disabled = true
                         script_type="ModuleScript",
                     ))
                     injected += 1
+
+        # Script-content-based bridge injection: scan transpiled Luau for
+        # API usage patterns (Time.deltaTime, Input.GetKey, etc.) and inject
+        # the corresponding bridge ModuleScripts from runtime/.
+        try:
+            from converter.bridge_injector import detect_needed_bridges, inject_bridges
+            luau_sources = [s.source for s in self.state.rbx_place.scripts]
+            existing_names = {s.name for s in self.state.rbx_place.scripts}
+            bridge_result = detect_needed_bridges(luau_sources, existing_names)
+            for filename, source in inject_bridges(bridge_result.needed):
+                name = Path(filename).stem
+                if name not in existing_names:
+                    self.state.rbx_place.scripts.append(RbxScript(
+                        name=name,
+                        source=source,
+                        script_type="ModuleScript",
+                    ))
+                    existing_names.add(name)
+                    injected += 1
+        except Exception as exc:
+            log.debug("[write_output] Bridge injection skipped: %s", exc)
 
         if injected:
             log.info("[write_output] Injected %d runtime library modules", injected)

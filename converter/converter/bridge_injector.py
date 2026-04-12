@@ -114,7 +114,8 @@ def detect_needed_bridges(
     result = BridgeInjectionResult()
 
     for spec in BRIDGE_SPECS:
-        if spec.filename in existing:
+        stem = Path(spec.filename).stem
+        if spec.filename in existing or stem in existing or spec.module_name in existing:
             result.already_present.append(spec.filename)
             continue
 
