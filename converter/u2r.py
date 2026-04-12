@@ -1068,6 +1068,25 @@ def eval_cmd(output: str, baseline: str | None) -> None:
                 except (json.JSONDecodeError, KeyError):
                     pass
 
+            # Count TODO placeholders and C# residue in transpiled scripts
+            scripts_dir = proj_out / "scripts"
+            if scripts_dir.exists():
+                import re as _re
+                todo_count = 0
+                csharp_residue = 0
+                for script_file in scripts_dir.rglob("*.luau"):
+                    text = script_file.read_text(encoding="utf-8", errors="replace")
+                    todo_count += len(_re.findall(
+                        r'--\s*TODO[:\s]', text, _re.IGNORECASE,
+                    ))
+                    csharp_residue += len(_re.findall(
+                        r'\b(?:GetComponent|AddComponent|FindObjectOfType|'
+                        r'SendMessage|BroadcastMessage)\s*[<(]',
+                        text,
+                    ))
+                metrics["todo_placeholders"] = todo_count
+                metrics["csharp_residue"] = csharp_residue
+
         except Exception as exc:
             elapsed = _time.monotonic() - t0
             metrics = {
@@ -1130,6 +1149,7 @@ def eval_diff(baseline: str, current: str, fail_on_regression: bool) -> None:
     }
     lower_is_better = {
         "errors", "warnings", "sounds_empty", "conversion_time_s",
+        "todo_placeholders", "csharp_residue",
     }
 
     regressions: list[str] = []

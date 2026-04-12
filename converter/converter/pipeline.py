@@ -1668,6 +1668,15 @@ script.Disabled = true
             modules_to_inject.append(("CharacterBridge", "physics_bridge.luau"))
         if has_sub_emitters:
             modules_to_inject.append(("SubEmitterRuntime", "sub_emitter_runtime.luau"))
+
+        # Detect object pooling patterns in transpiled scripts
+        has_pool = any(
+            "pool" in s.source.lower() and ("GetNew" in s.source or "pool.Free" in s.source or "pool.Get" in s.source)
+            for s in self.state.rbx_place.scripts
+        )
+        if has_pool:
+            modules_to_inject.append(("ObjectPool", "object_pool.luau"))
+
         # PickupRuntime removed — pickup scripts are now properly propagated
         # from base prefabs to variants via _bind_scripts_to_parts cloning.
         if has_cinemachine:

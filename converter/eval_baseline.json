@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-04-12T04:04:50Z",
-  "commit": "490ea32",
+  "generated_at": "2026-04-12T05:24:09Z",
+  "commit": "d736f59",
   "projects": {
     "3D-Platformer": {
       "status": "ok",
@@ -16,7 +16,7 @@
       "converted_animations": 0,
       "warnings": 0,
       "errors": 0,
-      "rbxlx_size_kb": 91.5,
+      "rbxlx_size_kb": 91.7,
       "parts": 16,
       "mesh_parts": 0,
       "models": 1,
@@ -27,7 +27,9 @@
       "sa_with_textures": 0,
       "sounds_with_id": 0,
       "sounds_empty": 0,
-      "validator_fixes": 0
+      "validator_fixes": 0,
+      "todo_placeholders": 0,
+      "csharp_residue": 0
     },
     "BoatAttack": {
       "status": "ok",
@@ -43,7 +45,7 @@
       "converted_animations": 2,
       "warnings": 0,
       "errors": 0,
-      "rbxlx_size_kb": 237.9,
+      "rbxlx_size_kb": 238.0,
       "parts": 6,
       "mesh_parts": 0,
       "models": 2,
@@ -54,11 +56,13 @@
       "sa_with_textures": 0,
       "sounds_with_id": 0,
       "sounds_empty": 0,
-      "validator_fixes": 0
+      "validator_fixes": 0,
+      "todo_placeholders": 95,
+      "csharp_residue": 0
     },
     "BossRoom": {
       "status": "ok",
-      "conversion_time_s": 10.2,
+      "conversion_time_s": 10.3,
       "total_game_objects": 0,
       "converted_parts": 0,
       "total_scripts": 195,
@@ -81,11 +85,13 @@
       "sa_with_textures": 0,
       "sounds_with_id": 0,
       "sounds_empty": 0,
-      "validator_fixes": 0
+      "validator_fixes": 0,
+      "todo_placeholders": 33,
+      "csharp_residue": 0
     },
     "ChopChop": {
       "status": "ok",
-      "conversion_time_s": 26.3,
+      "conversion_time_s": 26.4,
       "total_game_objects": 0,
       "converted_parts": 16,
       "total_scripts": 275,
@@ -108,11 +114,13 @@
       "sa_with_textures": 0,
       "sounds_with_id": 0,
       "sounds_empty": 0,
-      "validator_fixes": 0
+      "validator_fixes": 0,
+      "todo_placeholders": 66,
+      "csharp_residue": 0
     },
     "Gamekit3D": {
       "status": "ok",
-      "conversion_time_s": 20.6,
+      "conversion_time_s": 20.5,
       "total_game_objects": 279,
       "converted_parts": 18393,
       "total_scripts": 224,
@@ -124,22 +132,24 @@
       "converted_animations": 17,
       "warnings": 0,
       "errors": 0,
-      "rbxlx_size_kb": 27914.3,
+      "rbxlx_size_kb": 27917.3,
       "parts": 15326,
       "mesh_parts": 0,
       "models": 3066,
-      "scripts_in_rbxlx": 274,
+      "scripts_in_rbxlx": 275,
       "sounds": 285,
       "lights": 22,
       "surface_appearances": 0,
       "sa_with_textures": 0,
       "sounds_with_id": 0,
       "sounds_empty": 285,
-      "validator_fixes": 0
+      "validator_fixes": 0,
+      "todo_placeholders": 13,
+      "csharp_residue": 0
     },
     "PrefabWorkflows": {
       "status": "ok",
-      "conversion_time_s": 7.7,
+      "conversion_time_s": 6.0,
       "total_game_objects": 6136,
       "converted_parts": 6582,
       "total_scripts": 4,
@@ -162,7 +172,9 @@
       "sa_with_textures": 0,
       "sounds_with_id": 0,
       "sounds_empty": 0,
-      "validator_fixes": 0
+      "validator_fixes": 0,
+      "todo_placeholders": 0,
+      "csharp_residue": 0
     },
     "RedRunner": {
       "status": "ok",
@@ -189,11 +201,13 @@
       "sa_with_textures": 0,
       "sounds_with_id": 0,
       "sounds_empty": 0,
-      "validator_fixes": 0
+      "validator_fixes": 0,
+      "todo_placeholders": 55,
+      "csharp_residue": 0
     },
     "SanAndreasUnity": {
       "status": "ok",
-      "conversion_time_s": 9.1,
+      "conversion_time_s": 10.5,
       "total_game_objects": 2,
       "converted_parts": 24,
       "total_scripts": 270,
@@ -216,11 +230,13 @@
       "sa_with_textures": 0,
       "sounds_with_id": 0,
       "sounds_empty": 0,
-      "validator_fixes": 0
+      "validator_fixes": 0,
+      "todo_placeholders": 335,
+      "csharp_residue": 0
     },
     "SimpleFPS": {
       "status": "ok",
-      "conversion_time_s": 6.3,
+      "conversion_time_s": 4.9,
       "total_game_objects": 87,
       "converted_parts": 944,
       "total_scripts": 36,
@@ -243,7 +259,9 @@
       "sa_with_textures": 0,
       "sounds_with_id": 0,
       "sounds_empty": 98,
-      "validator_fixes": 0
+      "validator_fixes": 0,
+      "todo_placeholders": 2,
+      "csharp_residue": 0
     }
   }
 }

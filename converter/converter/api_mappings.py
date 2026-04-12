@@ -455,6 +455,9 @@ API_CALL_MAP: dict[str, str] = {
     "Application.isEditor": "game:GetService('RunService'):IsStudio()",
     "Application.Quit()": "-- Application.Quit: use game.Players.LocalPlayer:Kick()",
     "Application.OpenURL": "-- Application.OpenURL: use game:GetService('GuiService'):OpenBrowserWindow",
+    # -- Object Pooling --
+    ".Release(": ":Release(",
+    "ObjectPool.Get(": "ObjectPool:Get(",
     "Application.backgroundLoadingPriority": "-- backgroundLoadingPriority: no Roblox equivalent",
     "Application.loadLevel": "-- loadLevel: use TeleportService or place navigation",
     "Application.LoadLevel": "-- LoadLevel: use TeleportService or place navigation",
