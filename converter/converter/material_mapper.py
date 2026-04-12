@@ -243,24 +243,12 @@ def _parse_material(
         if color_map_path:
             mapping.color_map_path = str(color_map_path)
 
-            # Detect textures with significant alpha transparency (e.g.
-            # chain-link fences, grills, foliage). Even when Unity's _Mode
-            # is Opaque, if the texture has >30% transparent pixels, Roblox
-            # needs AlphaMode=Transparency to render the see-through areas.
-            if mapping.alpha_mode == "Overlay" and color_map_path.exists():
-                try:
-                    from PIL import Image as _PIL
-                    import numpy as _np
-                    img = _PIL.open(str(color_map_path))
-                    if "A" in img.getbands():
-                        alpha = _np.array(img)[:, :, -1]
-                        transparent_pct = (alpha < 128).sum() / alpha.size
-                        if transparent_pct > 0.3:
-                            mapping.alpha_mode = "Transparency"
-                            log.debug("Detected alpha transparency in %s (%.0f%% transparent) → AlphaMode=Transparency",
-                                      color_map_path.name, transparent_pct * 100)
-                except Exception:
-                    pass  # PIL not available or image unreadable — keep Overlay
+            # Note: alpha_mode is set based on Unity's _Mode property above.
+            # _Mode=0 (Opaque) → Overlay, _Mode=1 (Cutout) → Overlay,
+            # _Mode=2/3 (Fade/Transparent) → Transparency.
+            # We do NOT scan the texture for alpha pixels — that would be
+            # a heuristic hack. The correct rendering mode comes from
+            # the material's _Mode property, not from the texture content.
         # Extract tiling/offset (m_Scale, m_Offset)
         tex_scale = color_tex.get("m_Scale", {})
         tex_offset = color_tex.get("m_Offset", {})

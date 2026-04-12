@@ -2387,6 +2387,15 @@ def _apply_materials(
         if comp.component_type not in ("MeshRenderer", "SkinnedMeshRenderer"):
             continue
 
+        # Disabled MeshRenderer (m_Enabled: 0) → invisible in Unity at runtime.
+        # Common for collision-only meshes (frame_col) that have a MeshCollider
+        # but no visible rendering. Make the Roblox Part invisible too.
+        renderer_enabled = int(comp.properties.get("m_Enabled", 1))
+        if renderer_enabled == 0:
+            part.transparency = 1.0
+            part.cast_shadow = False
+            return  # No material to apply — renderer is off
+
         # Extract CastShadow from m_CastShadows: 0=Off, 1=On, 2=TwoSided, 3=ShadowsOnly
         cast_shadows = int(comp.properties.get("m_CastShadows", 1))
         if cast_shadows == 0:
@@ -2509,6 +2518,12 @@ def _apply_prefab_materials(
     for comp in components:
         if comp.component_type not in ("MeshRenderer", "SkinnedMeshRenderer"):
             continue
+
+        # Disabled renderer → invisible collision-only mesh
+        if int(comp.properties.get("m_Enabled", 1)) == 0:
+            part.transparency = 1.0
+            part.cast_shadow = False
+            return
 
         mat_refs = comp.properties.get("m_Materials", [])
         if not mat_refs:
