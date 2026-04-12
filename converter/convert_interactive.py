@@ -222,11 +222,21 @@ def _next_skill_phase(completed: list[str]) -> str | None:
     return None
 
 
+def _relative_scene_path(scene_path: str, unity_project_path: str) -> str:
+    """Return scene path relative to the Unity project root for disambiguation."""
+    if not scene_path:
+        return ""
+    try:
+        return str(Path(scene_path).relative_to(unity_project_path))
+    except ValueError:
+        return Path(scene_path).name
+
+
 def _ctx_summary(ctx: ConversionContext) -> dict:
     """Pull skill-relevant fields out of a ConversionContext."""
     return {
         "unity_project_path": ctx.unity_project_path,
-        "selected_scene": Path(ctx.selected_scene).name if ctx.selected_scene else "",
+        "selected_scene": _relative_scene_path(ctx.selected_scene, ctx.unity_project_path),
         "scene_count": len(ctx.scene_paths),
         "total_game_objects": ctx.total_game_objects,
         "converted_parts": ctx.converted_parts,
@@ -422,9 +432,9 @@ def discover(unity_project_path: str, output_dir: str, scene: str | None) -> Non
     payload: dict[str, Any] = {
         "phase": "discover",
         "success": True,
-        "selected_scene": Path(ctx.selected_scene).name if ctx.selected_scene else "",
+        "selected_scene": _relative_scene_path(ctx.selected_scene, ctx.unity_project_path),
         "scene_count": len(ctx.scene_paths),
-        "scene_paths": [str(Path(p).name) for p in ctx.scene_paths],
+        "scene_paths": [_relative_scene_path(p, ctx.unity_project_path) for p in ctx.scene_paths],
         "total_game_objects": ctx.total_game_objects,
         "errors": ctx.errors[-10:] if ctx.errors else [],
     }
@@ -649,9 +659,14 @@ def validate(output_dir: str, write: bool) -> None:
               help="Roblox Open Cloud API key (string or path to file).")
 @click.option("--creator-id", type=str, default=None,
               help="Roblox Creator ID (number or path to file).")
+@click.option("--retranspile", is_flag=True,
+              help="Force re-transpilation even if scripts were already transpiled. "
+              "Without this flag, hand-edited Luau scripts in output_dir/scripts/ "
+              "are preserved.")
 def assemble(unity_project_path: str, output_dir: str,
              no_upload: bool, no_resolve: bool,
-             api_key: str | None, creator_id: str | None) -> None:
+             api_key: str | None, creator_id: str | None,
+             retranspile: bool) -> None:
     """Phase 4: upload assets, resolve, convert animations + scene, write .rbxlx."""
     if api_key:
         ak = Path(api_key)
@@ -664,6 +679,14 @@ def assemble(unity_project_path: str, output_dir: str,
         config.ROBLOX_CREATOR_ID = int(raw)
 
     pipeline = _make_pipeline(unity_project_path, output_dir, skip_upload=no_upload)
+    pipeline._retranspile = retranspile
+
+    # When transpile_scripts already ran and --retranspile is not set, skip
+    # re-transpilation so hand-edited Luau scripts are preserved.
+    skip_transpile = (
+        not retranspile
+        and "transpile_scripts" in pipeline.ctx.completed_phases
+    )
 
     # Run every prerequisite + the assembly phases in order, but stop at
     # write_output (don't trigger headless publish — that's the upload step).
@@ -674,6 +697,8 @@ def assemble(unity_project_path: str, output_dir: str,
             "convert_scene", "write_output",
         ]:
             if no_resolve and phase == "resolve_assets":
+                continue
+            if skip_transpile and phase == "transpile_scripts":
                 continue
             pipeline._run_phase(phase)
     except Exception as exc:
@@ -803,6 +828,7 @@ def upload(output_dir: str, api_key: str | None,
         for phase in [
             "parse", "extract_assets", "convert_materials",
             "transpile_scripts", "convert_animations", "convert_scene",
+            "write_output",
         ]:
             pipeline._run_phase(phase)
     except Exception as exc:
