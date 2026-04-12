@@ -2087,35 +2087,39 @@ def _extract_monobehaviour_attributes(
                 # global for any caller path that still relies on the old
                 # implicit state (convert_scene sets both in lockstep).
                 mat_mappings = material_mappings if material_mappings is not None else _material_mappings
-                prefab_material_by_name: dict[str, str] = {}
-                prefab_fallback_guid: str | None = None
-                if ref_path.suffix.lower() == ".prefab" and mat_mappings:
-                    prefab_material_by_name, prefab_fallback_guid = (
-                        _extract_prefab_material_map(ref_path)
-                    )
-
-                def _build_sa_for(mat_guid: str | None):
-                    from core.roblox_types import RbxSurfaceAppearance
-                    if not mat_guid:
-                        return None, None
-                    mapping = mat_mappings.get(mat_guid) if mat_mappings else None
-                    if mapping is None:
-                        return None, None
-                    sa = RbxSurfaceAppearance(
-                        color_map=getattr(mapping, "color_map_path", None),
-                        normal_map=getattr(mapping, "normal_map_path", None),
-                        metalness_map=getattr(mapping, "metalness_map_path", None),
-                        roughness_map=getattr(mapping, "roughness_map_path", None),
-                        alpha_mode=getattr(mapping, "alpha_mode", "Overlay"),
-                        transparency=getattr(mapping, "transparency", 0.0),
-                        tiling=getattr(mapping, "tiling", None),
-                    )
-                    base = getattr(mapping, "base_color", None)
-                    return sa, base
 
                 if mesh_key and mesh_key in _mesh_hierarchies:
                     sub_meshes = _mesh_hierarchies[mesh_key]
                     if sub_meshes:
+                        # Now that we know sub-meshes exist, resolve materials.
+                        # Deferred to here so the prefab YAML read only
+                        # happens when we'll actually build MeshParts.
+                        prefab_material_by_name: dict[str, str] = {}
+                        prefab_fallback_guid: str | None = None
+                        if ref_path.suffix.lower() == ".prefab" and mat_mappings:
+                            prefab_material_by_name, prefab_fallback_guid = (
+                                _extract_prefab_material_map(ref_path)
+                            )
+
+                        def _build_sa_for(mat_guid: str | None):
+                            from core.roblox_types import RbxSurfaceAppearance
+                            if not mat_guid:
+                                return None, None
+                            mapping = mat_mappings.get(mat_guid) if mat_mappings else None
+                            if mapping is None:
+                                return None, None
+                            sa = RbxSurfaceAppearance(
+                                color_map=getattr(mapping, "color_map_path", None),
+                                normal_map=getattr(mapping, "normal_map_path", None),
+                                metalness_map=getattr(mapping, "metalness_map_path", None),
+                                roughness_map=getattr(mapping, "roughness_map_path", None),
+                                alpha_mode=getattr(mapping, "alpha_mode", "Overlay"),
+                                transparency=getattr(mapping, "transparency", 0.0),
+                                tiling=getattr(mapping, "tiling", None),
+                            )
+                            base = getattr(mapping, "base_color", None)
+                            return sa, base
+
                         # Create a Model containing all sub-meshes.
                         # Keep the original C# field name (camelCase) so that
                         # transpiled script lookups via FindFirstChild work.
