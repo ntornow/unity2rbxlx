@@ -68,7 +68,7 @@ ASSET_EXT_TO_KIND: dict[str, str] = {
     ".asmdef": "assembly_definition",
     ".asmref": "assembly_definition",
     # Data
-    ".asset": "unknown",
+    ".asset": "scriptable_object",
     ".json": "data", ".xml": "data", ".yaml": "data", ".yml": "data",
     ".txt": "data", ".csv": "data",
     # Other
@@ -155,7 +155,16 @@ PRE_TILE_MAX_FACTOR: int = 4
 FLIP_NORMAL_GREEN_CHANNEL: bool = False
 
 # ---------------------------------------------------------------------------
+# Packages (prefab packages for ReplicatedStorage/Templates)
+# ---------------------------------------------------------------------------
+
+EMIT_PACKAGES: bool = True
+PACKAGES_SUBDIR: str = "packages"
+
+# ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
 
 REPORT_FILENAME: str = "conversion_report.json"
+REPORT_VERBOSE: bool = True
+UNCONVERTED_FILENAME: str = "UNCONVERTED.md"
