@@ -140,8 +140,8 @@ Priority: P0 = blocking gameplay, P1 = significant quality, P2 = nice to have.
 - [x] **OnCollisionStay/OnCollisionExit**: Fixed 2026-04-12. OnCollisionStay/OnTriggerStay → part.Touched, OnCollisionExit/OnTriggerExit → part.TouchEnded. Both were already in api_mappings; Stay variants added. The per-frame semantic gap (Unity Stay fires every FixedUpdate, Roblox Touched fires once per contact) is inherent to the platform — noted in mapping comments.
 - [ ] **Binary animation/controller parsing**: .anim and .controller files are skipped when binary-encoded. Affects ~40% of games with skeletal animation. Needs UnityPy integration or binary YAML parser.
 - [ ] **Persistent prefab/asset cache**: Prefab library is in-memory only. SQLite or pickle cache keyed by (GUID, mtime) would halve pipeline time for multi-scene projects and large games.
-- [ ] **Font upload**: Not supported by Roblox Open Cloud API. UI text uses default Roblox font.
-- [ ] **Video upload**: Not supported by Roblox Open Cloud API. VideoFrame component works but needs manual video ID.
+- [x] **Font upload**: Roblox API limitation (not actionable). UI text uses default Roblox font. Users can manually upload fonts via Creator Dashboard.
+- [x] **Video upload**: Roblox API limitation (not actionable). VideoFrame component emitted correctly but video ID must be set manually after upload via Creator Dashboard.
 - [x] **Eval baseline for all 9 projects**: Fixed 2026-04-12. All 9 projects complete in 85s total. `eval_baseline.json` committed with per-project metrics. `u2r.py eval-diff` can gate future changes. **Open follow-up:** wire eval-diff into CI nightly job.
 
 ### Fixed (2026-03-28 continued)
