@@ -2990,13 +2990,18 @@ def _convert_fbx_prefab_instance(
         part.attributes["_ScaleY"] = abs(combined_scale[1]) * _sf2
         part.attributes["_ScaleZ"] = abs(combined_scale[2]) * _sf2
 
-    # Apply materials: first try scene modifications, then FBX directory textures
+    # Apply materials: first try scene modifications, then FBX directory textures.
+    # For multi-sub-mesh Models, apply the material to each child MeshPart
+    # (a SurfaceAppearance on a Model container has no visual effect).
+    _targets = part.children if part.class_name == "Model" and part.children else [part]
+
     _mat_applied = False
     if material_guids and material_mappings:
         for mg in material_guids:
             if mg in material_mappings:
                 mat = material_mappings[mg]
-                _apply_material_to_part(part, mat, uploaded_assets)
+                for t in _targets:
+                    _apply_material_to_part(t, mat, uploaded_assets)
                 _mat_applied = True
                 break
 
@@ -3015,10 +3020,12 @@ def _convert_fbx_prefab_instance(
                     elif not color_url:
                         color_url = asset_url
         if color_url:
-            part.surface_appearance = RbxSurfaceAppearance(
+            sa = RbxSurfaceAppearance(
                 color_map=color_url,
                 normal_map=normal_url,
             )
+            for t in _targets:
+                t.surface_appearance = sa
 
     _apply_gameplay_attributes(part, name)
     return [part]
