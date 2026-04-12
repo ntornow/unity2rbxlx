@@ -5331,7 +5331,12 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
                             return f'{prefix}{inner_cond}{after}'
                         return full  # simple condition, leave as-is
             return full
-        source = re.sub(r'(\(if\s+)(\((?:[^()]*|\([^()]*\))*\)\s+then\b)', _fix_if_expr_parens, source)
+        # DISABLED: the nested-parens regex `(\((?:[^()]*|\([^()]*\))*\))`
+        # causes catastrophic backtracking on scripts with deeply-nested
+        # expressions (SanAndreasUnity's BaseAimMovementState: 13+ min hang).
+        # The fix it applies (unwrapping `(if (cond) then` → `(if cond then`)
+        # is rare and not worth the risk. If needed, implement with a manual
+        # paren-counting scan instead of regex.
 
     # Fix: `or then` at end of if-condition (broken multi-line condition)
     # `elseif (... or then\n  continuation)` → comment out broken line + continuation
