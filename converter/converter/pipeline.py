@@ -15,7 +15,6 @@ from typing import Any
 
 import config as _config
 from config import (
-    ANTHROPIC_API_KEY,
     OUTPUT_DIR,
     RBXLX_OUTPUT_FILENAME,
 )
@@ -586,7 +585,7 @@ class Pipeline:
             unity_project_path=self.unity_project_path,
             script_infos=script_infos,
             use_ai=_config.USE_AI_TRANSPILATION,
-            api_key=ANTHROPIC_API_KEY,
+            api_key=_config.ANTHROPIC_API_KEY,
         )
         self.ctx.transpiled_scripts = self.state.transpilation_result.total_transpiled
         log.info(

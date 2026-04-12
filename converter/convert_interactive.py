@@ -533,13 +533,6 @@ def transpile(unity_project_path: str, output_dir: str,
         ak = Path(api_key)
         key_value = ak.read_text().strip() if ak.is_file() else api_key.strip()
         config.ANTHROPIC_API_KEY = key_value
-        # ``converter/pipeline.py`` does ``from config import ANTHROPIC_API_KEY``
-        # at module load time, so mutating ``config.ANTHROPIC_API_KEY`` alone
-        # leaves the pipeline module's local binding pointing at the old value
-        # (typically ``None``).  Update it too so the transpiler actually sees
-        # the key the user supplied on the CLI.
-        from converter import pipeline as _pipeline_module
-        _pipeline_module.ANTHROPIC_API_KEY = key_value
     if no_ai:
         config.USE_AI_TRANSPILATION = False
 

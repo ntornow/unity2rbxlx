@@ -2,10 +2,14 @@
 # Test upload of a small FBX mesh to Roblox Open Cloud
 # This reproduces the timeout issue — the POST succeeds but the async operation
 # never completes within the poll window.
+#
+# Expects an `apikey` and `creator_id` file in the repo root (both gitignored).
+# Run from the repo root: `./test_upload.sh`
 
-API_KEY=$(cat /Users/nicktornow/unity/apikey)
-CREATOR_ID=$(cat /Users/nicktornow/unity/creator_id)
-FILE="/Users/nicktornow/unity/test_projects/SimpleFPS/Assets/AssetPack/Pallet/pallet03_prp.fbx"
+REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+API_KEY=$(cat "$REPO_ROOT/apikey")
+CREATOR_ID=$(cat "$REPO_ROOT/creator_id")
+FILE="$REPO_ROOT/test_projects/SimpleFPS/Assets/AssetPack/Pallet/pallet03_prp.fbx"
 
 echo "=== Step 1: Upload ==="
 RESPONSE=$(curl -s -X POST "https://apis.roblox.com/assets/v1/assets" \

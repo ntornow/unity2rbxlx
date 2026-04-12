@@ -168,6 +168,30 @@ class TestRunThrough:
         assert parse_idx < extract_idx < transpile_idx
 
 
+class TestAnthropicKeyBinding:
+    """Regression: the pipeline must read ANTHROPIC_API_KEY lazily from the
+    config module (``_config.ANTHROPIC_API_KEY``), not capture it at import
+    time. Without lazy binding, the CLI has to patch both ``config`` and
+    ``converter.pipeline`` module globals to make a new key visible — a
+    historical footgun that left the transpiler seeing a stale ``None``.
+    """
+
+    def test_pipeline_sees_mutated_config_key(self, monkeypatch):
+        import config
+        from converter import pipeline as pipeline_module
+
+        monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "sk-ant-test-sentinel")
+        # pipeline.py should resolve the key through its ``_config`` alias,
+        # so a config-level mutation is immediately observable without also
+        # touching pipeline_module.ANTHROPIC_API_KEY.
+        assert pipeline_module._config.ANTHROPIC_API_KEY == "sk-ant-test-sentinel"
+        # And the module must NOT export a captured top-level ANTHROPIC_API_KEY
+        # (which would shadow the lazy lookup and defeat the fix).
+        assert not hasattr(pipeline_module, "ANTHROPIC_API_KEY"), (
+            "pipeline.py should not re-export ANTHROPIC_API_KEY at module level"
+        )
+
+
 class TestPreflight:
     def test_invalid_unity_project(self, tmp_path):
         runner = CliRunner()

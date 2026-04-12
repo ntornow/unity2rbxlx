@@ -30,13 +30,20 @@ Work autonomously with no questions — just churn forever making the converter 
 ### Progress tracking:
 - See [TODO.md](TODO.md) for comprehensive gap analysis and task list
 
-### Converter Status (as of 2026-04-08)
+### Converter Status (as of 2026-04-12)
 
-**977 tests passing** (977 fast in 10s, 30 slow full-pipeline tests)
+**998 tests passing** (998 fast in ~11s, 31 slow full-pipeline tests)
 **9 test projects** converting and validating clean with zero errors:
 - SimpleFPS (960 parts, 36 scripts), Gamekit3D (18,534 parts, 249 scripts)
 - SanAndreasUnity (270 scripts), ChopChop (275 scripts), RedRunner (87 scripts)
 - BoatAttack (55 scripts), BossRoom (195 scripts), 3D-Platformer (7 scripts), PrefabWorkflows (6,582 parts)
+
+**Recent session (2026-04-11/12):**
+- Rifle pickup end-to-end fix for SimpleFPS: script:GetAttribute walk-up lookup, RemoteEvent created at script-init (no race), getRifle idempotency, shoot() cleanup, cloud_api strict asset-ID validation.
+- Rifle sub-mesh textures: prefab-referenced materials now applied as SurfaceAppearance to FBX sub-mesh MeshParts in `_extract_monobehaviour_attributes`.
+- setupSounds broadening: ModuleScript-reclassified Player scripts now fall back to workspace search for a host Part's Sound children.
+- Merged PR #1 (`/convert-unity` skill + phase-by-phase interactive CLI, +2,809 lines).
+- CI wired (`.github/workflows/test.yml`), ANTHROPIC_API_KEY lazy binding, phase-4.5 doc staleness pass.
 
 **Key milestones achieved:**
 - P0/P1/P2: ALL resolved (terrain, scripts, content properties, sub-mesh materials, physics, UI, etc.)
@@ -156,8 +163,8 @@ Where:
 ## Running Tests
 ```bash
 cd converter
-python -m pytest tests/ -m "not slow" -v   # Fast suite: 872 tests in ~10s
-python -m pytest tests/ -v                  # Full suite: 888 tests in ~65s (includes CLI + Gamekit3D e2e)
+python -m pytest tests/ -m "not slow" -v   # Fast suite: 998 tests in ~11s
+python -m pytest tests/ -v                  # Full suite: 1029 tests in ~65s (includes CLI + Gamekit3D e2e)
 ```
 
 ## Running Conversion
