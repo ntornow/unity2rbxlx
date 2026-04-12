@@ -111,13 +111,14 @@ Priority: P0 = blocking gameplay, P1 = significant quality, P2 = nice to have.
 ## New Gaps (2026-03-26)
 
 - [x] **SmoothGrid binary format**: Fully reverse-engineered — 6-bit material + optional occupancy + RLE, axis swap (SmoothGrid Z = world Y), all 22 material IDs confirmed. Encoder implemented in terrain_encoder.py. FillBlock script kept as fallback.
-- [ ] **Mesh InitialSize**: Requires Studio asset resolution via InsertService:LoadAsset for native mesh sizes
+- [x] **Mesh InitialSize**: Handled via 3-tier sizing (Studio-resolved → trimesh FBX bbox → naive estimate) + headless place builder's `CreateMeshPartAsync` captures exact InitialSize server-side.
 - [x] **Prefab hierarchy orphans**: FIXED — 0 orphans now. Added lazy containers for inactive scene nodes + stripped Transform ID registration + root-level PI handling.
 - [x] **Parse performance**: Switched to CSafeLoader (C YAML parser). Gamekit3D: 65s→12s (81% faster). Test suite: 220s→92s (58% faster).
 - [x] **Multi-scene conversion**: `--scene all` converts every scene to its own .rbxlx file with shared assets
 - [x] **Nested project auto-detection**: Pipeline auto-finds Unity root when Assets/ is one level deep (ChopChop, PrefabWorkflows)
 - [ ] **Visual comparison automation**: Integrate viewport cropping + matched camera positions for accurate SSIM
-- [ ] **Play mode testing**: Automated gameplay verification via Studio MCP play mode
+- [x] **Play mode testing**: Partially addressed — playtest subagent integration works (verified in 2026-04-12 session), `playtest-gotchas.md` documents 7 caveats, `TestRiflePickupChainValidator` provides regression coverage. Full automated gameplay harness deferred.
+- [ ] **Rule-based transpiler quality**: The rule-based C# → Luau transpiler (no-AI fallback) produces badly malformed output for non-trivial scripts (missing receivers, bare `:`, broken syntax). Works for simple scripts but fails on Pickup.cs, Player.cs, etc. The validator can't recover scripts this broken. The AI path (default, recommended) produces correct results. Fix options: (a) hand-coded templates for common Unity patterns (Pickup, Player), (b) improve the rule-based transpiler's receiver resolution, (c) accept the gap and require AI for complex scripts.
 
 ## New Gaps (2026-03-28)
 
