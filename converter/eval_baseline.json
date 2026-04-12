@@ -1,0 +1,98 @@
+{
+  "generated_at": "2026-04-12T03:03:37Z",
+  "commit": "39cc44e",
+  "note": "Initial baseline. SimpleFPS has full upload+resolve; others use skip_upload (no MeshParts/SA). Gamekit3D pending.",
+  "projects": {
+    "3D-Platformer": {
+      "parts": 16,
+      "mesh_parts": 0,
+      "models": 1,
+      "scripts": 12,
+      "sounds": 0,
+      "surface_appearances": 0,
+      "sa_with_textures": 0,
+      "sounds_with_id": 0,
+      "sounds_empty": 0,
+      "rbxlx_kb": 91.5,
+      "status": "ok"
+    },
+    "BoatAttack": {
+      "parts": 6,
+      "mesh_parts": 0,
+      "models": 2,
+      "scripts": 63,
+      "sounds": 0,
+      "surface_appearances": 0,
+      "sa_with_textures": 0,
+      "sounds_with_id": 0,
+      "sounds_empty": 0,
+      "rbxlx_kb": 237.9,
+      "status": "ok"
+    },
+    "BossRoom": {
+      "parts": 0,
+      "mesh_parts": 0,
+      "models": 0,
+      "scripts": 200,
+      "sounds": 0,
+      "surface_appearances": 0,
+      "sa_with_textures": 0,
+      "sounds_with_id": 0,
+      "sounds_empty": 0,
+      "rbxlx_kb": 728.0,
+      "status": "ok"
+    },
+    "ChopChop": {
+      "parts": 11,
+      "mesh_parts": 0,
+      "models": 4,
+      "scripts": 293,
+      "sounds": 0,
+      "surface_appearances": 0,
+      "sa_with_textures": 0,
+      "sounds_with_id": 0,
+      "sounds_empty": 0,
+      "rbxlx_kb": 2832.2,
+      "status": "ok"
+    },
+    "PrefabWorkflows": {
+      "parts": 5869,
+      "mesh_parts": 0,
+      "models": 712,
+      "scripts": 12,
+      "sounds": 0,
+      "surface_appearances": 0,
+      "sa_with_textures": 0,
+      "sounds_with_id": 0,
+      "sounds_empty": 0,
+      "rbxlx_kb": 9907.1,
+      "status": "ok"
+    },
+    "RedRunner": {
+      "parts": 4,
+      "mesh_parts": 0,
+      "models": 0,
+      "scripts": 92,
+      "sounds": 0,
+      "surface_appearances": 0,
+      "sa_with_textures": 0,
+      "sounds_with_id": 0,
+      "sounds_empty": 0,
+      "rbxlx_kb": 247.4,
+      "status": "ok"
+    },
+    "SimpleFPS": {
+      "parts": 373,
+      "mesh_parts": 354,
+      "models": 246,
+      "scripts": 176,
+      "sounds": 154,
+      "surface_appearances": 247,
+      "sa_with_textures": 246,
+      "sounds_with_id": 152,
+      "sounds_empty": 2,
+      "rbxlx_kb": 3822.0,
+      "status": "ok"
+    }
+  }
+}
