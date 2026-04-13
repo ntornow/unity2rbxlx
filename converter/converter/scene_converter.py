@@ -2282,8 +2282,15 @@ def _extract_monobehaviour_attributes(
                                     sm_color[0], sm_color[1], sm_color[2]
                                 )
                             model.children.append(mesh_part)
+                        # Prefab field references are templates for runtime
+                        # cloning (e.g. riflePrefab → cloned on pickup). Hide
+                        # the template so it doesn't render at full scale in
+                        # workspace. Scripts clone and show it when needed.
+                        for _child in model.children:
+                            if hasattr(_child, 'transparency'):
+                                _child.transparency = 1.0
                         part.children.append(model)
-                        log.debug("Created prefab reference '%s' with %d sub-meshes",
+                        log.debug("Created prefab reference '%s' with %d sub-meshes (hidden template)",
                                   field_name, len(sub_meshes))
 
 
@@ -4010,6 +4017,11 @@ def _fix_empty_mesh_parts(parts: list[RbxPart]) -> int:
     When a mesh GUID resolves to a non-FBX file (e.g. embedded prefab mesh),
     the MeshPart gets no mesh_id and renders as a large default block.
     Convert these to small transparent Parts so they don't clutter the scene.
+
+    Also hides plain Parts that are children of Models and have no visual
+    content (bone anchors like LeftHand/RightHand, empty placeholders).
+    These are typically empty GameObjects in Unity that serve as transform
+    anchors but shouldn't render as visible boxes in Roblox.
     """
     count = 0
     for part in parts:
@@ -4018,6 +4030,16 @@ def _fix_empty_mesh_parts(parts: list[RbxPart]) -> int:
             part.transparency = 1.0
             part.can_collide = False
             part.size = (1.0, 1.0, 1.0)
+            count += 1
+        elif (part.class_name == "Part"
+              and not part.mesh_id
+              and not part.surface_appearance
+              and getattr(part, 'transparency', 0) < 1.0
+              and part.color == (0.63, 0.63, 0.63)):
+            # Plain gray Part with no mesh or texture — likely a bone anchor
+            # or empty placeholder that shouldn't render visually.
+            part.transparency = 1.0
+            part.can_collide = False
             count += 1
         if hasattr(part, 'children') and part.children:
             count += _fix_empty_mesh_parts(part.children)
