@@ -455,6 +455,19 @@ class Pipeline:
                 upload_path = asset.path
                 name = asset.path.stem
 
+                # Z-mirror mesh files before upload: Unity is left-handed
+                # (Z-forward), Roblox is right-handed (Z-back).  Negating Z
+                # vertices fixes mirrored text/geometry.
+                if kind == "mesh":
+                    from converter.mesh_processor import mirror_mesh_z
+                    mirror_dir = self.output_dir / "mirrored_meshes"
+                    mirrored = mirror_mesh_z(
+                        upload_path,
+                        mirror_dir / (asset.path.stem + ".obj"),
+                    )
+                    if mirrored:
+                        upload_path = mirrored
+
                 # Auto-convert non-PNG/JPG formats to PNG before uploading
                 if kind == "texture" and asset.path.suffix.lower() in (".bmp", ".tga", ".tif", ".tiff", ".psd"):
                     try:
