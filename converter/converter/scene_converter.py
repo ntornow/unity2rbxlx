@@ -2949,9 +2949,13 @@ def _convert_fbx_prefab_instance(
     rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*stripped_rot)
     rot_mat = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
 
-    # Mesh pivot vertical correction
+    # Mesh pivot vertical correction — only for single-mesh FBX instances.
+    # Multi-sub-mesh models have child positions from mesh_hierarchies that
+    # already include the correct Y offset. Applying the vertical offset to
+    # the parent would double-count, lifting the model above ground.
     mesh_guid = pi.source_prefab_guid if hasattr(pi, 'source_prefab_guid') else None
-    if mesh_guid and guid_index:
+    _multi_subs = _get_multi_sub_meshes(mesh_guid, guid_index) if mesh_guid else None
+    if mesh_guid and guid_index and not _multi_subs:
         ry += _compute_mesh_vertical_offset(mesh_guid, guid_index, scl[1])
 
     cframe = RbxCFrame(
