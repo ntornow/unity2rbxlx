@@ -146,10 +146,21 @@ def convert_to_png(
         return output_path
 
     img = Image.open(image_path)
-    # Always flatten to RGB — alpha channels in diffuse textures (TGA, PSD)
-    # are typically smoothness/detail masks in Unity, not transparency.
-    # Keeping them causes Roblox Texture objects to render semi-transparent.
-    img.convert("RGB").save(output_path, "PNG")
+    # Preserve RGBA if the alpha channel is meaningful (>10% of pixels
+    # are non-opaque), which indicates transparency cutouts (chain-link
+    # fences, foliage, grills). Strip to RGB otherwise — alpha in most
+    # diffuse textures is a smoothness/detail mask, not transparency,
+    # and keeping it causes unintended semi-transparency in Roblox.
+    if img.mode == "RGBA":
+        import numpy as np
+        alpha = np.array(img)[:, :, -1]
+        has_meaningful_alpha = (alpha < 250).sum() / alpha.size > 0.1
+        if has_meaningful_alpha:
+            img.save(output_path, "PNG")  # Keep RGBA
+        else:
+            img.convert("RGB").save(output_path, "PNG")  # Strip alpha
+    else:
+        img.convert("RGB").save(output_path, "PNG")
 
     logger.info("Converted %s -> %s (%.0f KB -> %.0f KB)",
                 image_path.name, output_path.name,
