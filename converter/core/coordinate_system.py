@@ -167,6 +167,16 @@ def quaternion_to_rotation_matrix(
     r21 = 2.0 * (yz + wx)
     r22 = 1.0 - 2.0 * (xx + yy)
 
+    # Mirror correction: negate the Z column to account for left-handed
+    # (Unity) → right-handed (Roblox) mesh geometry. FBX meshes uploaded
+    # to Roblox retain their original vertex data, but the coordinate
+    # system flip means front/back faces are swapped. Negating the Z
+    # column of the rotation matrix creates a reflection that corrects
+    # this, so text and asymmetric features face the right direction.
+    r02 = -r02
+    r12 = -r12
+    r22 = -r22
+
     return (r00, r01, r02, r10, r11, r12, r20, r21, r22)
 
 

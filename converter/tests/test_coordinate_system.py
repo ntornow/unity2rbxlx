@@ -60,25 +60,25 @@ class TestUnityQuatToRobloxQuat:
 class TestQuaternionToRotationMatrix:
     def test_identity(self):
         mat = quaternion_to_rotation_matrix(0, 0, 0, 1)
-        # Identity matrix
-        assert abs(mat[0] - 1.0) < 1e-6  # R00
-        assert abs(mat[4] - 1.0) < 1e-6  # R11
-        assert abs(mat[8] - 1.0) < 1e-6  # R22
+        # Identity with Z-column negated (mirror correction for left→right handedness)
+        assert abs(mat[0] - 1.0) < 1e-6   # R00
+        assert abs(mat[4] - 1.0) < 1e-6   # R11
+        assert abs(mat[8] - (-1.0)) < 1e-6  # R22 = -1 (Z mirror)
         # Off-diagonals should be ~0
         assert abs(mat[1]) < 1e-6  # R01
-        assert abs(mat[2]) < 1e-6  # R02
+        assert abs(mat[2]) < 1e-6  # R02 (negated 0 = 0)
         assert abs(mat[3]) < 1e-6  # R10
 
     def test_90_deg_y_rotation(self):
-        # 90 degrees around Y axis
+        # 90 degrees around Y axis, with Z-column mirror correction
         angle = math.pi / 2
         qw = math.cos(angle / 2)
         qy = math.sin(angle / 2)
         mat = quaternion_to_rotation_matrix(0, qy, 0, qw)
-        # R00 should be ~0, R02 should be ~1
-        assert abs(mat[0]) < 1e-6       # R00 ≈ 0
-        assert abs(mat[2] - 1.0) < 1e-6  # R02 ≈ 1
-        assert abs(mat[4] - 1.0) < 1e-6  # R11 ≈ 1
+        # R00 ≈ 0, R02 ≈ -1 (was +1, negated by Z mirror)
+        assert abs(mat[0]) < 1e-6          # R00 ≈ 0
+        assert abs(mat[2] - (-1.0)) < 1e-6  # R02 ≈ -1
+        assert abs(mat[4] - 1.0) < 1e-6     # R11 ≈ 1
 
     def test_zero_quaternion_gives_identity(self):
         mat = quaternion_to_rotation_matrix(0, 0, 0, 0)

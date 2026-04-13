@@ -224,7 +224,10 @@ def _parse_material(
         mapping.alpha_mode = "Overlay"
         mapping.transparency = 0.0
     elif mode == _ALPHA_CUTOUT:
-        mapping.alpha_mode = "Overlay"
+        # Cutout mode uses texture alpha with _Cutoff threshold for
+        # hard-edged transparency (chain-link fences, foliage, grills).
+        # Roblox's Transparency AlphaMode is the closest equivalent.
+        mapping.alpha_mode = "Transparency"
         mapping.transparency = 0.0
     elif mode == _ALPHA_FADE:
         mapping.alpha_mode = "Transparency"
