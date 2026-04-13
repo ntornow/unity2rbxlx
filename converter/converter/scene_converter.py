@@ -3744,6 +3744,25 @@ def _convert_prefab_node(
     local_pos = list(node.position)
     local_rot = list(node.rotation)
     local_scl = list(node.scale)
+
+    # For sub-meshes of multi-mesh FBX files, Unity stores the sub-mesh
+    # PIVOT position, but Roblox positions MeshParts at the bounding-box
+    # CENTER.  When mesh_hierarchies data is available, use the Roblox
+    # center position (converted to Unity coords) instead of the Unity
+    # pivot position.  This corrects visual spacing between parts.
+    _is_multi_sub = False
+    if parent_pos is not None and node.mesh_guid and _mesh_hierarchies and guid_index:
+        _mfid = node.mesh_file_id if hasattr(node, 'mesh_file_id') else None
+        _multi = _get_multi_sub_meshes(node.mesh_guid, guid_index)
+        if _multi and len(_multi) > 1:
+            sub_mesh = _resolve_sub_mesh(node.mesh_guid, _mfid, guid_index, mesh_name=node.name)
+            if sub_mesh:
+                sm_pos = sub_mesh.get("position", [0, 0, 0])
+                # mesh_hierarchies positions use Roblox coords (Z negated vs Unity).
+                # Convert to Unity space: negate Z.
+                local_pos = [sm_pos[0], sm_pos[1], -sm_pos[2]]
+                _is_multi_sub = True
+
     if parent_pos is not None:
         # Apply parent rotation to local position, then add parent position.
         # This is how Unity composes parent + child transforms.
@@ -3826,12 +3845,10 @@ def _convert_prefab_node(
     rx, ry, rz = unity_to_roblox_pos(*local_pos)
 
     # Mesh pivot vertical correction — adjusts for difference between FBX
-    # origin and Roblox bounding-box center.  Only applied to root-level
-    # nodes (parent_pos is None).  For children within a prefab hierarchy,
-    # positions are already correctly composed from the parent transform;
-    # adding per-sub-mesh vertical offsets would shift each part by a
-    # different amount and break the spatial relationship between siblings.
-    if node.mesh_guid and guid_index and parent_pos is None:
+    # origin and Roblox bounding-box center.  Skip for multi-sub-mesh FBX
+    # children — their positions were already replaced with mesh_hierarchies
+    # center positions above, so no pivot-to-center correction is needed.
+    if node.mesh_guid and guid_index and not _is_multi_sub:
         _mfid = node.mesh_file_id if hasattr(node, 'mesh_file_id') else None
         ry += _compute_mesh_vertical_offset(node.mesh_guid, guid_index, local_scl[1], mesh_file_id=_mfid, mesh_name=node.name)
 
