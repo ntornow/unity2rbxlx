@@ -3826,9 +3826,12 @@ def _convert_prefab_node(
     rx, ry, rz = unity_to_roblox_pos(*local_pos)
 
     # Mesh pivot vertical correction — adjusts for difference between FBX
-    # origin and Roblox bounding-box center.  Applied to all FBX types
-    # (Y-up and Z-up) using per-sub-mesh position from mesh_hierarchies.
-    if node.mesh_guid and guid_index:
+    # origin and Roblox bounding-box center.  Only applied to root-level
+    # nodes (parent_pos is None).  For children within a prefab hierarchy,
+    # positions are already correctly composed from the parent transform;
+    # adding per-sub-mesh vertical offsets would shift each part by a
+    # different amount and break the spatial relationship between siblings.
+    if node.mesh_guid and guid_index and parent_pos is None:
         _mfid = node.mesh_file_id if hasattr(node, 'mesh_file_id') else None
         ry += _compute_mesh_vertical_offset(node.mesh_guid, guid_index, local_scl[1], mesh_file_id=_mfid, mesh_name=node.name)
 
