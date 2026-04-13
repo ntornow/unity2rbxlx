@@ -3099,9 +3099,39 @@ def _convert_fbx_prefab_instance(
                     elif not color_url:
                         color_url = asset_url
         if color_url:
+            # Check if the color texture has alpha for transparency
+            # (e.g. chain-link fences where the FBX is a flat plane and
+            # the cutout pattern is in the texture alpha channel).
+            alpha_mode = "Overlay"
+            # Check if the co-located color texture has alpha for
+            # transparency (chain-link fences, foliage cutouts).
+            for asset_key, asset_url in uploaded_assets.items():
+                if asset_url == color_url:
+                    # Try multiple path resolutions
+                    candidates = [Path(asset_key)]
+                    if guid_index:
+                        candidates.append(guid_index.project_root / asset_key)
+                    if fbx_path:
+                        candidates.append(fbx_path.parent.parent / asset_key.split("/")[-1])
+                    for tex_path in candidates:
+                        if tex_path.exists():
+                            try:
+                                from PIL import Image as _PIL
+                                import numpy as _np
+                                _img = _PIL.open(str(tex_path))
+                                if "A" in _img.getbands():
+                                    _a = _np.array(_img)[:, :, -1]
+                                    if (_a < 250).sum() / _a.size > 0.1:
+                                        alpha_mode = "Transparency"
+                            except Exception:
+                                pass
+                            break
+                    break
+
             sa = RbxSurfaceAppearance(
                 color_map=color_url,
                 normal_map=normal_url,
+                alpha_mode=alpha_mode,
             )
             for t in _targets:
                 t.surface_appearance = sa

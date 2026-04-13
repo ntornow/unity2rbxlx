@@ -246,12 +246,27 @@ def _parse_material(
         if color_map_path:
             mapping.color_map_path = str(color_map_path)
 
-            # Note: alpha_mode is set based on Unity's _Mode property above.
-            # _Mode=0 (Opaque) → Overlay, _Mode=1 (Cutout) → Overlay,
-            # _Mode=2/3 (Fade/Transparent) → Transparency.
-            # We do NOT scan the texture for alpha pixels — that would be
-            # a heuristic hack. The correct rendering mode comes from
-            # the material's _Mode property, not from the texture content.
+            # Unity's Standard shader renders texture alpha even when
+            # _Mode=0 (Opaque). This is visible on chain-link fences,
+            # foliage cutouts, and grills where the mesh is a flat plane
+            # and the transparency pattern is entirely in the texture
+            # alpha channel. If the resolved texture has an alpha channel,
+            # check whether it's meaningfully transparent and override
+            # AlphaMode accordingly.
+            if mapping.alpha_mode == "Overlay" and color_map_path.exists():
+                try:
+                    from PIL import Image as _PIL
+                    import numpy as _np
+                    _img = _PIL.open(str(color_map_path))
+                    if "A" in _img.getbands():
+                        _alpha = _np.array(_img)[:, :, -1]
+                        # "Meaningfully transparent" = >10% of pixels are
+                        # non-opaque. This excludes textures with a solid
+                        # alpha channel (all 255) or minor edge feathering.
+                        if (_alpha < 250).sum() / _alpha.size > 0.1:
+                            mapping.alpha_mode = "Transparency"
+                except Exception:
+                    pass
         # Extract tiling/offset (m_Scale, m_Offset)
         tex_scale = color_tex.get("m_Scale", {})
         tex_offset = color_tex.get("m_Offset", {})
