@@ -451,6 +451,7 @@ def _compute_mesh_size(
     guid_index: GuidIndex,
     mesh_native_sizes: dict[str, tuple[float, float, float]],
     mesh_file_id: str | None = None,
+    mesh_name: str | None = None,
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
     """Compute Roblox MeshPart Size and InitialSize from Unity + Roblox data.
 
@@ -473,7 +474,7 @@ def _compute_mesh_size(
 
     # Try per-sub-mesh sizing via mesh_hierarchies first
     if mesh_file_id and _mesh_hierarchies:
-        sub_mesh = _resolve_sub_mesh(mesh_guid, mesh_file_id, guid_index)
+        sub_mesh = _resolve_sub_mesh(mesh_guid, mesh_file_id, guid_index, mesh_name=mesh_name)
         if sub_mesh:
             native = (sub_mesh["size"][0], sub_mesh["size"][1], sub_mesh["size"][2])
             import_scale = _get_fbx_import_scale(mesh_guid, guid_index)
@@ -1283,14 +1284,14 @@ def _convert_node(
                 part.children.append(mesh_part)
         else:
             mesh_id = _resolve_mesh_id(node.mesh_guid, guid_index, uploaded_assets,
-                                        mesh_file_id=node.mesh_file_id)
+                                        mesh_file_id=node.mesh_file_id, mesh_name=node.name)
             if mesh_id:
                 part.mesh_id = mesh_id
             # Compute mesh size from native Roblox data (requires upload + resolve)
             sized = False
             if _mesh_native_sizes and guid_index:
                 result = _compute_mesh_size(node.scale, node.mesh_guid, guid_index, _mesh_native_sizes,
-                                            mesh_file_id=node.mesh_file_id)
+                                            mesh_file_id=node.mesh_file_id, mesh_name=node.name)
                 if result:
                     part.size, part.initial_size = result
                     sized = True
@@ -1871,15 +1872,17 @@ def _resolve_mesh_id(
     guid_index: GuidIndex | None,
     uploaded_assets: dict[str, str],
     mesh_file_id: str | None = None,
+    mesh_name: str | None = None,
 ) -> str | None:
     """Resolve a mesh GUID to an rbxassetid URL.
 
     When mesh_hierarchies data is available and mesh_file_id is provided,
     resolves to the specific sub-mesh within a multi-mesh FBX.
-    Otherwise falls back to uploaded_assets lookup.
+    Falls back to name-based matching when the fileID index is out of bounds
+    (Unity's fileID numbering has gaps that cause index overflow).
     """
     # Try sub-mesh resolution first
-    sub_mesh = _resolve_sub_mesh(mesh_guid, mesh_file_id, guid_index)
+    sub_mesh = _resolve_sub_mesh(mesh_guid, mesh_file_id, guid_index, mesh_name=mesh_name)
     if sub_mesh and sub_mesh.get("meshId"):
         return sub_mesh["meshId"]
     if guid_index is None:
@@ -3449,14 +3452,16 @@ def _convert_prefab_instance(
                 rbx_size = unity_scale_to_roblox_size(combined_scl)
                 part = RbxPart(name=name, class_name="MeshPart", cframe=cframe, size=rbx_size, anchored=True)
                 mesh_id = _resolve_mesh_id(root.mesh_guid, guid_index, uploaded_assets,
-                                           mesh_file_id=root.mesh_file_id if hasattr(root, 'mesh_file_id') else None)
+                                           mesh_file_id=root.mesh_file_id if hasattr(root, 'mesh_file_id') else None,
+                                           mesh_name=root.name if hasattr(root, 'name') else None)
                 if mesh_id:
                     part.mesh_id = mesh_id
                 # Compute mesh size from native Roblox data
                 sized = False
                 if _mesh_native_sizes and guid_index:
                     result = _compute_mesh_size(combined_scl, root.mesh_guid, guid_index, _mesh_native_sizes,
-                                                mesh_file_id=root.mesh_file_id if hasattr(root, 'mesh_file_id') else None)
+                                                mesh_file_id=root.mesh_file_id if hasattr(root, 'mesh_file_id') else None,
+                                                mesh_name=root.name if hasattr(root, 'name') else None)
                     if result:
                         part.size, part.initial_size = result
                         sized = True
@@ -3583,7 +3588,8 @@ def _convert_prefab_instance(
             part.size = (max(bx, 0.001), max(by, 0.001), max(bz, 0.001))
         elif has_mesh and root.mesh_guid:
             mesh_id = _resolve_mesh_id(root.mesh_guid, guid_index, uploaded_assets,
-                                        mesh_file_id=root.mesh_file_id if hasattr(root, 'mesh_file_id') else None)
+                                        mesh_file_id=root.mesh_file_id if hasattr(root, 'mesh_file_id') else None,
+                                        mesh_name=root.name if hasattr(root, 'name') else None)
             if mesh_id:
                 part.mesh_id = mesh_id
             # Store scale attributes for MeshLoader runtime sizing
@@ -3598,7 +3604,8 @@ def _convert_prefab_instance(
             sized = False
             if _mesh_native_sizes and guid_index:
                 result = _compute_mesh_size(combined_scale, root.mesh_guid, guid_index, _mesh_native_sizes,
-                                            mesh_file_id=root.mesh_file_id if hasattr(root, 'mesh_file_id') else None)
+                                            mesh_file_id=root.mesh_file_id if hasattr(root, 'mesh_file_id') else None,
+                                            mesh_name=root.name if hasattr(root, 'name') else None)
                 if result:
                     part.size, part.initial_size = result
                     sized = True
@@ -3827,7 +3834,8 @@ def _convert_prefab_node(
         part.size = (max(bx, 0.001), max(by, 0.001), max(bz, 0.001))
     elif has_mesh and node.mesh_guid:
         mesh_id = _resolve_mesh_id(node.mesh_guid, guid_index, uploaded_assets,
-                                    mesh_file_id=node.mesh_file_id if hasattr(node, 'mesh_file_id') else None)
+                                    mesh_file_id=node.mesh_file_id if hasattr(node, 'mesh_file_id') else None,
+                                    mesh_name=node.name if hasattr(node, 'name') else None)
         if mesh_id:
             part.mesh_id = mesh_id
         # Store scale for MeshLoader runtime sizing
@@ -3841,7 +3849,8 @@ def _convert_prefab_node(
         sized = False
         if _mesh_native_sizes and guid_index:
             result = _compute_mesh_size(local_scl, node.mesh_guid, guid_index, _mesh_native_sizes,
-                                        mesh_file_id=node.mesh_file_id if hasattr(node, 'mesh_file_id') else None)
+                                        mesh_file_id=node.mesh_file_id if hasattr(node, 'mesh_file_id') else None,
+                                        mesh_name=node.name if hasattr(node, 'name') else None)
             if result:
                 part.size, part.initial_size = result
                 sized = True
