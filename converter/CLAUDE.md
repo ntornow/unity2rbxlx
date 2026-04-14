@@ -159,6 +159,11 @@ Where:
 - No circular imports between modules
 - State between phases stored in ConversionContext (JSON-serializable)
 - Use actual data from Roblox (LoadAsset) for mesh sizes, not heuristics
+- **Inline Unity → Roblox API translation over runtime wrappers.** Translate at
+  transpile time via `api_mappings.py` / `UTILITY_FUNCTIONS` / `luau_validator.py`,
+  not via `require`-able wrapper modules under `runtime/`. See
+  `docs/design/inline-over-runtime-wrappers.md` for the rationale and the list
+  of wrappers removed under this policy.
 
 ## Running Tests
 ```bash

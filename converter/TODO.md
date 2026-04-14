@@ -218,3 +218,44 @@ Priority: `P0` = blocks gameplay, `P1` = correctness / maintainability, `P2` = n
 ### Scope / project
 - [x] **P1 — No second project end-to-end-verified this session.** Fixed 2026-04-12: ran eval across 8 projects (all except Gamekit3D). 6 completed successfully (3D-Platformer, BoatAttack, BossRoom, ChopChop, PrefabWorkflows, RedRunner) with 100% script transpilation rates. SanAndreasUnity and Gamekit3D have slow write_output phases being profiled. Initial eval baseline committed. SimpleFPS verified in Studio with gameplay testing.
 - [x] **P2 — `converter/output/<project>/conversion_context.json` holds real IDs but is only protected by `.gitignore`.** Fixed 2026-04-12: new `ConversionContext.save_sanitized()` writes a redacted copy — strips `universe_id`, `place_id`, `experience_name`, `uploaded_assets`, `mesh_native_sizes`, `mesh_hierarchies` — and stamps a `_sanitized: true` marker. Preserves stats, phase completion, warnings, Unity project path. 2 new tests in `TestConversionContextSanitizedSave`. The regular `.save()` still writes everything for pause/resume.
+
+## Open Gaps (2026-04-14 session — inline-over-runtime-wrappers)
+
+Deferred follow-ups from removing the seven rejected runtime bridges. See
+`docs/design/inline-over-runtime-wrappers.md` for the governing policy and
+the full list of what was removed.
+
+- [ ] **P1 — Consolidate animator runtime modules.** Two runtime modules
+  overlap: `converter/runtime/animator_runtime.luau` (currently the accepted
+  one, auto-injected by the pipeline) and `converter/runtime/animator_bridge.luau`
+  (379 lines, the rejected one — still present because it implements a
+  state-machine surface with parameters/triggers/blend trees that
+  `animator_runtime.luau` may not cover). Similarly for
+  `converter/runtime/TransformAnimator.luau` (205 lines, keyframe-curve-based
+  CFrame/Size animation) vs. whatever `animation_converter.py` emits via
+  TweenService. Action: diff each pair; merge unique logic into the accepted
+  module; delete the rejected one; extend the regression guard in
+  `tests/test_no_rejected_bridges.py` to cover it. Unlike the other seven
+  bridges, these implement genuinely stateful per-entity runtime behavior
+  and cannot be flattened into a single-call inline translation — the
+  question is which *module* owns them, not whether a module is needed.
+- [ ] **P1 — Rewrite phase-3 commit `10c786c` on `origin/merge-phase3` to
+  drop bridge injection.** The phase-3 wiring commit imports `bridge_injector`
+  and installs a `detect_needed_bridges`/`inject_bridges` try-except block at
+  `converter/converter/pipeline.py` lines 1843–1859. After the deletions in
+  this branch, that block references a module that no longer exists and the
+  two bridge-related test files (`test_bridge_injector.py`,
+  `test_runtime_bridges.py`) are now dead additions. Action: either drop
+  `10c786c` entirely or rewrite it to preserve the other six pieces
+  (`rbxl_binary_writer` wiring, `report_generator`, `scriptable_object_converter`,
+  `sprite_extractor`, `cloud_api` content-type auto-detection, CI `lz4`
+  dependency) while removing the bridge-injection hunk + the two bridge
+  test files. Belongs as its own branch operation on `merge-phase3`, not on
+  phase 2.
+- [ ] **P2 — `Input.GetSwipe` has no test-project coverage yet.** The
+  `getSwipe()` utility is implemented and has a unit test, but none of the 9
+  test projects actually use touch/swipe input, so the end-to-end path
+  (TouchSwipe handler, swipe consumption, frame-reset semantics) is
+  unverified against a real game. Action: either add a minimal touch-input
+  fixture to a test project, or accept that GetSwipe is speculative
+  infrastructure until a mobile Unity game shows up in the eval set.
