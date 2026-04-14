@@ -447,10 +447,22 @@ class Pipeline:
             eligible = [a for a in assets if a.path.suffix.lower() in extensions]
             log.info("[upload_assets] Uploading %d %s assets...", len(eligible), kind)
 
+            # Asset upload blocklist: relative paths that should NEVER be
+            # re-uploaded (e.g. user flagged a bad asset, or Roblox returned
+            # a problematic asset ID). Read from
+            # ``<output_dir>/.upload_blocklist`` — one relative path per line.
+            blocklist_file = self.output_dir / ".upload_blocklist"
+            blocklist: set[str] = set()
+            if blocklist_file.exists():
+                blocklist = {line.strip() for line in blocklist_file.read_text().splitlines() if line.strip() and not line.startswith("#")}
+
             for asset in eligible:
                 rel = str(asset.relative_path)
                 if rel in uploaded:
                     continue  # Already uploaded (resume support)
+                if rel in blocklist:
+                    log.info("[upload_assets] Skipping blocklisted asset: %s", rel)
+                    continue
 
                 upload_path = asset.path
                 name = asset.path.stem
