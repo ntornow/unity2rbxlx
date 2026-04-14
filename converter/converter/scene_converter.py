@@ -3083,25 +3083,93 @@ def _convert_fbx_prefab_instance(
         for mg in material_guids:
             if mg in material_mappings:
                 mat = material_mappings[mg]
-                for t in _targets:
-                    _apply_material_to_part(t, mat, uploaded_assets)
-                _mat_applied = True
-                break
+                # Only count as applied if the material actually has textures —
+                # otherwise fall through to the co-located texture fallback so
+                # that textures like chainlink.psd (referenced only by child
+                # materials, not the one baked into the scene m_Materials[0])
+                # can still be discovered for multi-sub-mesh FBX files.
+                has_textures = (
+                    getattr(mat, "color_map_path", None)
+                    or getattr(mat, "normal_map_path", None)
+                )
+                if has_textures:
+                    for t in _targets:
+                        _apply_material_to_part(t, mat, uploaded_assets)
+                    _mat_applied = True
+                    break
 
     if not _mat_applied and uploaded_assets:
-        # Find textures co-located with the FBX file
+        # Find textures co-located with the FBX file.
+        #
+        # Multi-sub-mesh FBX files (like tallfence.fbx with frame+chain)
+        # reference multiple .mat files. Each .mat points at its own
+        # texture. We prefer a sibling material's texture over a raw
+        # co-located image, since materials carry the correct ColorMap
+        # assignment. Fall back to directory scanning if no material in
+        # the FBX's sibling Materials/ folder has textures.
         from core.roblox_types import RbxSurfaceAppearance
         fbx_dir = str(fbx_path.parent) if fbx_path else ""
         color_url = ""
         normal_url = ""
-        for asset_key, asset_url in uploaded_assets.items():
-            if fbx_dir and asset_key.startswith(fbx_dir.replace(str(guid_index.project_root) + "/", "").replace(str(guid_index.project_root), "") if guid_index else ""):
-                lower = asset_key.lower()
-                if any(ext in lower for ext in ('.png', '.psd', '.tga', '.jpg', '.bmp')):
-                    if '_n.' in lower or '_normal' in lower or 'normal' in lower:
-                        normal_url = asset_url
-                    elif not color_url:
-                        color_url = asset_url
+
+        if fbx_path and guid_index:
+            # Scan the FBX's sibling Materials/ directory for .mat files.
+            # FBX files have their own baked-in material references that
+            # aren't surfaced via the scene YAML (e.g., tallfence.fbx has
+            # frame + chainlink materials; the scene only overrides [0]).
+            # Parse those .mat files and pick the first one that has a
+            # _MainTex texture whose GUID was uploaded.
+            import re as _re
+            mat_sibling_dir = fbx_path.parent / "Materials"
+            if mat_sibling_dir.exists():
+                for mat_file in sorted(mat_sibling_dir.glob("*.mat")):
+                    try:
+                        text = mat_file.read_text(errors="replace")
+                    except OSError:
+                        continue
+                    # Find _MainTex block and its texture guid
+                    m = _re.search(
+                        r"- _MainTex:\s*\n\s+m_Texture:\s*\{fileID:\s*\d+,\s*guid:\s*([0-9a-f]+)",
+                        text,
+                    )
+                    if not m:
+                        continue
+                    tex_guid = m.group(1)
+                    tex_path = guid_index.resolve(tex_guid)
+                    if not tex_path:
+                        continue
+                    # Look up this texture in uploaded_assets
+                    for ak, au in uploaded_assets.items():
+                        if tex_path.name in ak or tex_guid in ak:
+                            color_url = au
+                            break
+                    if color_url:
+                        # Also try to find a normal map in the same material
+                        nm = _re.search(
+                            r"- _BumpMap:\s*\n\s+m_Texture:\s*\{fileID:\s*\d+,\s*guid:\s*([0-9a-f]+)",
+                            text,
+                        )
+                        if nm:
+                            ng = nm.group(1)
+                            nt_path = guid_index.resolve(ng)
+                            if nt_path:
+                                for ak, au in uploaded_assets.items():
+                                    if nt_path.name in ak or ng in ak:
+                                        normal_url = au
+                                        break
+                        break
+
+        if not color_url:
+            # Fallback: scan uploaded assets by path prefix
+            for asset_key, asset_url in uploaded_assets.items():
+                if fbx_dir and asset_key.startswith(fbx_dir.replace(str(guid_index.project_root) + "/", "").replace(str(guid_index.project_root), "") if guid_index else ""):
+                    lower = asset_key.lower()
+                    if any(ext in lower for ext in ('.png', '.psd', '.tga', '.jpg', '.bmp')):
+                        if '_n.' in lower or '_normal' in lower or 'normal' in lower:
+                            if not normal_url:
+                                normal_url = asset_url
+                        elif not color_url:
+                            color_url = asset_url
         if color_url:
             # Check if the color texture has alpha for transparency
             # (e.g. chain-link fences where the FBX is a flat plane and
