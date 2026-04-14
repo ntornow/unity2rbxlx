@@ -433,6 +433,19 @@ class Pipeline:
         convert_dir = self.output_dir / "converted_textures"
         convert_dir.mkdir(parents=True, exist_ok=True)
 
+        # Compute which texture source paths belong to materials that
+        # render with transparency (cutout, fade, transparent). Only those
+        # textures get their alpha channel preserved; everything else is
+        # stripped to RGB to prevent spurious transparency from mask
+        # channels (roughness/metalness/specular packed into alpha).
+        alpha_texture_paths: set[str] = set()
+        if self.state.material_mappings:
+            for mapping in self.state.material_mappings.values():
+                if getattr(mapping, "alpha_mode", "Overlay") != "Overlay":
+                    cmp = getattr(mapping, "color_map_path", None)
+                    if cmp and not cmp.startswith("rbxassetid://"):
+                        alpha_texture_paths.add(str(Path(cmp).resolve()))
+
         # Collected for a post-upload moderation audit. We probe only newly
         # uploaded assets (not cached entries from a previous run) so the
         # audit cost stays proportional to the new work.
@@ -467,11 +480,21 @@ class Pipeline:
                 upload_path = asset.path
                 name = asset.path.stem
 
+                # Determine whether this texture needs its alpha channel
+                # preserved. Alpha is only kept for textures that feed
+                # into materials with a transparent/cutout alpha_mode —
+                # everything else strips alpha to avoid spurious
+                # transparency from mask channels (roughness/metalness/
+                # specular packed into alpha).
+                needs_alpha = False
+                if kind == "texture":
+                    needs_alpha = str(asset.path.resolve()) in alpha_texture_paths
+
                 # Auto-convert non-PNG/JPG formats to PNG before uploading
                 if kind == "texture" and asset.path.suffix.lower() in (".bmp", ".tga", ".tif", ".tiff", ".psd"):
                     try:
                         png_path = convert_dir / (asset.path.stem + ".png")
-                        upload_path = convert_to_png(asset.path, png_path)
+                        upload_path = convert_to_png(asset.path, png_path, preserve_alpha=needs_alpha)
                     except Exception as exc:
                         log.warning("[upload_assets] Failed to convert %s to PNG: %s", asset.path.name, exc)
                         self.ctx.asset_upload_errors.append(rel)
@@ -485,7 +508,7 @@ class Pipeline:
                     try:
                         from utils.image_processing import flip_image_horizontal
                         flipped_path = convert_dir / (asset.path.stem + "_flipped.png")
-                        upload_path = flip_image_horizontal(upload_path, flipped_path)
+                        upload_path = flip_image_horizontal(upload_path, flipped_path, preserve_alpha=needs_alpha)
                     except Exception as exc:
                         log.warning("[upload_assets] Failed to flip %s: %s", asset.path.name, exc)
 

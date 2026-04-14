@@ -3190,11 +3190,11 @@ def _convert_fbx_prefab_instance(
                             try:
                                 from PIL import Image as _PIL
                                 import numpy as _np
-                                _img = _PIL.open(str(tex_path))
-                                if "A" in _img.getbands():
-                                    _a = _np.array(_img)[:, :, -1]
-                                    if (_a < 250).sum() / _a.size > 0.1:
-                                        alpha_mode = "Transparency"
+                                # Co-located fallback is only reached when
+                                # no material maps this texture; default to
+                                # Overlay. The correct alpha_mode is driven
+                                # by material_mapper (shader-type aware).
+                                pass
                             except Exception:
                                 pass
                             break

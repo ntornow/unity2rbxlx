@@ -38,6 +38,31 @@ _ALPHA_CUTOUT = 1
 _ALPHA_FADE = 2
 _ALPHA_TRANSPARENT = 3
 
+# Unity built-in shader fileIDs that are INHERENTLY cutout/transparent,
+# regardless of the _Mode property. The legacy Transparent/Cutout/*
+# shaders (used for chain-link fences, foliage, etc.) don't have a
+# _Mode toggle — the shader variant itself encodes the transparency
+# behaviour. Discovered by inspecting Unity's built-in shader YAML
+# descriptors in builtin_extra.
+_BUILTIN_CUTOUT_SHADER_IDS = frozenset({
+    51,   # Transparent/Cutout/Diffuse
+    52,   # Transparent/Cutout/Vertex-Lit
+    53,   # Transparent/Cutout/Bumped Diffuse
+    54,   # Transparent/Cutout/Bumped Specular
+    55,   # Transparent/Cutout/Specular
+    56,   # Transparent/Cutout/Soft Edge Unlit
+    57,   # Nature/Tree Soft Occlusion Leaves
+    200,  # Legacy Unlit/Transparent Cutout
+})
+_BUILTIN_TRANSPARENT_SHADER_IDS = frozenset({
+    30,   # Transparent/Diffuse
+    31,   # Transparent/Vertex-Lit
+    32,   # Transparent/Bumped Diffuse
+    33,   # Transparent/Bumped Specular
+    34,   # Transparent/Specular
+    202,  # Unlit/Transparent
+})
+
 
 @dataclass
 class TextureOperation:
@@ -218,25 +243,41 @@ def _parse_material(
             float(base_color.get("b", 0.63)),
         )
 
-    # -- Transparency mode (_Mode) --
-    mode = int(floats.get("_Mode", _ALPHA_OPAQUE))
-    if mode == _ALPHA_OPAQUE:
-        mapping.alpha_mode = "Overlay"
-        mapping.transparency = 0.0
-    elif mode == _ALPHA_CUTOUT:
-        # Cutout mode uses texture alpha with _Cutoff threshold for
-        # hard-edged transparency (chain-link fences, foliage, grills).
-        # Roblox's Transparency AlphaMode is the closest equivalent.
+    # -- Transparency mode --
+    # Legacy built-in shaders encode cutout/transparent behaviour in the
+    # shader variant itself (no _Mode); Standard/URP/HDRP use the _Mode
+    # property. Check the shader fileID first.
+    shader_ref = mat_data.get("m_Shader", {})
+    shader_file_id = 0
+    if isinstance(shader_ref, dict):
+        try:
+            shader_file_id = int(shader_ref.get("fileID", 0))
+        except (ValueError, TypeError):
+            shader_file_id = 0
+
+    if shader_file_id in _BUILTIN_CUTOUT_SHADER_IDS:
         mapping.alpha_mode = "Transparency"
         mapping.transparency = 0.0
-    elif mode == _ALPHA_FADE:
+    elif shader_file_id in _BUILTIN_TRANSPARENT_SHADER_IDS:
         mapping.alpha_mode = "Transparency"
         alpha = float(base_color.get("a", 1.0)) if base_color else 1.0
         mapping.transparency = 1.0 - alpha
-    elif mode == _ALPHA_TRANSPARENT:
-        mapping.alpha_mode = "Transparency"
-        alpha = float(base_color.get("a", 1.0)) if base_color else 1.0
-        mapping.transparency = 1.0 - alpha
+    else:
+        mode = int(floats.get("_Mode", _ALPHA_OPAQUE))
+        if mode == _ALPHA_OPAQUE:
+            mapping.alpha_mode = "Overlay"
+            mapping.transparency = 0.0
+        elif mode == _ALPHA_CUTOUT:
+            mapping.alpha_mode = "Transparency"
+            mapping.transparency = 0.0
+        elif mode == _ALPHA_FADE:
+            mapping.alpha_mode = "Transparency"
+            alpha = float(base_color.get("a", 1.0)) if base_color else 1.0
+            mapping.transparency = 1.0 - alpha
+        elif mode == _ALPHA_TRANSPARENT:
+            mapping.alpha_mode = "Transparency"
+            alpha = float(base_color.get("a", 1.0)) if base_color else 1.0
+            mapping.transparency = 1.0 - alpha
 
     # -- Texture mapping --
     # ColorMap: _MainTex (Standard), _BaseMap (URP), or _BaseColorMap (HDRP).
@@ -245,28 +286,6 @@ def _parse_material(
         color_map_path = _resolve_texture(color_tex, guid_index)
         if color_map_path:
             mapping.color_map_path = str(color_map_path)
-
-            # Unity's Standard shader renders texture alpha even when
-            # _Mode=0 (Opaque). This is visible on chain-link fences,
-            # foliage cutouts, and grills where the mesh is a flat plane
-            # and the transparency pattern is entirely in the texture
-            # alpha channel. If the resolved texture has an alpha channel,
-            # check whether it's meaningfully transparent and override
-            # AlphaMode accordingly.
-            if mapping.alpha_mode == "Overlay" and color_map_path.exists():
-                try:
-                    from PIL import Image as _PIL
-                    import numpy as _np
-                    _img = _PIL.open(str(color_map_path))
-                    if "A" in _img.getbands():
-                        _alpha = _np.array(_img)[:, :, -1]
-                        # "Meaningfully transparent" = >10% of pixels are
-                        # non-opaque. This excludes textures with a solid
-                        # alpha channel (all 255) or minor edge feathering.
-                        if (_alpha < 250).sum() / _alpha.size > 0.1:
-                            mapping.alpha_mode = "Transparency"
-                except Exception:
-                    pass
         # Extract tiling/offset (m_Scale, m_Offset)
         tex_scale = color_tex.get("m_Scale", {})
         tex_offset = color_tex.get("m_Offset", {})

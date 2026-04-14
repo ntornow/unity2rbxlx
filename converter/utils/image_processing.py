@@ -121,12 +121,19 @@ def invert_image(image_path: str | Path, output_path: str | Path) -> Path:
 def convert_to_png(
     image_path: str | Path,
     output_path: str | Path | None = None,
+    preserve_alpha: bool = False,
 ) -> Path:
     """Convert any image (BMP, TGA, TIFF, etc.) to PNG format.
 
     Args:
         image_path: Path to the source image.
         output_path: Where to write the PNG. If None, writes next to source with .png extension.
+        preserve_alpha: If True, keep the alpha channel. If False (default),
+            strip alpha — most Unity textures pack a metalness/roughness/
+            specular mask into alpha that would cause spurious transparency
+            if Roblox rendered it. The caller should determine whether a
+            texture actually needs alpha based on the material's Unity
+            shader (e.g., _Mode=Cutout or a Transparent/Cutout/* shader).
 
     Returns:
         Path to the converted PNG file.
@@ -146,19 +153,8 @@ def convert_to_png(
         return output_path
 
     img = Image.open(image_path)
-    # Preserve RGBA if the alpha channel is meaningful (>10% of pixels
-    # are non-opaque), which indicates transparency cutouts (chain-link
-    # fences, foliage, grills). Strip to RGB otherwise — alpha in most
-    # diffuse textures is a smoothness/detail mask, not transparency,
-    # and keeping it causes unintended semi-transparency in Roblox.
-    if img.mode == "RGBA":
-        import numpy as np
-        alpha = np.array(img)[:, :, -1]
-        has_meaningful_alpha = (alpha < 250).sum() / alpha.size > 0.1
-        if has_meaningful_alpha:
-            img.save(output_path, "PNG")  # Keep RGBA
-        else:
-            img.convert("RGB").save(output_path, "PNG")  # Strip alpha
+    if preserve_alpha and img.mode == "RGBA":
+        img.save(output_path, "PNG")
     else:
         img.convert("RGB").save(output_path, "PNG")
 
@@ -172,6 +168,7 @@ def convert_to_png(
 def flip_image_horizontal(
     image_path: str | Path,
     output_path: str | Path,
+    preserve_alpha: bool = False,
 ) -> Path:
     """Mirror an image left-to-right (flip along the X axis).
 
@@ -183,7 +180,8 @@ def flip_image_horizontal(
     so asymmetric content appears mirrored. Pre-flipping the texture
     cancels out that mirroring.
 
-    Preserves the image's mode (RGB, RGBA, L, etc.) and alpha data.
+    If ``preserve_alpha`` is False (default) the alpha channel is
+    dropped — see ``convert_to_png`` for why this is the safe default.
     """
     image_path = Path(image_path)
     output_path = Path(output_path)
@@ -192,6 +190,9 @@ def flip_image_horizontal(
 
     img = Image.open(image_path)
     flipped = img.transpose(Image.FLIP_LEFT_RIGHT)
+
+    if not preserve_alpha and flipped.mode == "RGBA":
+        flipped = flipped.convert("RGB")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     flipped.save(output_path)
