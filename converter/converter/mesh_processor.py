@@ -329,6 +329,7 @@ def mirror_mesh_z(
             log.warning("assimp export error for %s: %s", mesh_path.name, exc)
             return None
 
+    tmp_mirrored_obj = None
     try:
         scene = trimesh.load(obj_to_load, process=False)
 
@@ -347,7 +348,28 @@ def mirror_mesh_z(
             scene.invert()
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        scene.export(str(output_path))
+
+        # If output is FBX, we need to go through assimp (trimesh can't write FBX).
+        # Write an intermediate OBJ, then convert to FBX with assimp.
+        if output_path.suffix.lower() == ".fbx":
+            assimp_cli = shutil.which("assimp")
+            if not assimp_cli:
+                log.warning("assimp CLI not found; cannot export %s as FBX", mesh_path.name)
+                return None
+            tmp_mirrored_obj = tempfile.NamedTemporaryFile(suffix=".obj", delete=False)
+            tmp_mirrored_obj.close()
+            scene.export(tmp_mirrored_obj.name)
+            result = subprocess.run(
+                [assimp_cli, "export", tmp_mirrored_obj.name, str(output_path)],
+                capture_output=True, timeout=60,
+            )
+            if result.returncode != 0:
+                log.warning("assimp FBX export failed for %s: %s", mesh_path.name,
+                            result.stderr.decode(errors="replace")[:200])
+                return None
+        else:
+            scene.export(str(output_path))
+
         log.info("Z-mirrored %s -> %s", mesh_path.name, output_path.name)
         return output_path
 
@@ -358,6 +380,9 @@ def mirror_mesh_z(
         if tmp_obj:
             Path(tmp_obj.name).unlink(missing_ok=True)
             Path(tmp_obj.name.replace(".obj", ".mtl")).unlink(missing_ok=True)
+        if tmp_mirrored_obj:
+            Path(tmp_mirrored_obj.name).unlink(missing_ok=True)
+            Path(tmp_mirrored_obj.name.replace(".obj", ".mtl")).unlink(missing_ok=True)
 
 
 def compute_bounding_box(mesh_path: str | Path) -> tuple[float, float, float]:

@@ -457,13 +457,14 @@ class Pipeline:
 
                 # Z-mirror mesh files before upload: Unity is left-handed
                 # (Z-forward), Roblox is right-handed (Z-back).  Negating Z
-                # vertices fixes mirrored text/geometry.
+                # vertices fixes mirrored text/geometry.  Output as FBX since
+                # Roblox Open Cloud only accepts FBX for Model uploads.
                 if kind == "mesh":
                     from converter.mesh_processor import mirror_mesh_z
                     mirror_dir = self.output_dir / "mirrored_meshes"
                     mirrored = mirror_mesh_z(
                         upload_path,
-                        mirror_dir / (asset.path.stem + ".obj"),
+                        mirror_dir / (asset.path.stem + ".fbx"),
                     )
                     if mirrored:
                         upload_path = mirrored
