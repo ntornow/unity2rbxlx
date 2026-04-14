@@ -455,19 +455,6 @@ class Pipeline:
                 upload_path = asset.path
                 name = asset.path.stem
 
-                # Z-mirror mesh files before upload: Unity is left-handed
-                # (Z-forward), Roblox is right-handed (Z-back).  Direct FBX
-                # binary editing preserves sub-mesh structure (unlike
-                # assimp FBX→OBJ→FBX round-trip which merges sub-meshes).
-                # Old-format FBX (version < 7100) is silently passed through.
-                if kind == "mesh" and asset.path.suffix.lower() == ".fbx":
-                    from converter.fbx_binary import mirror_fbx_z_inplace
-                    mirror_dir = self.output_dir / "mirrored_meshes"
-                    mirror_dir.mkdir(parents=True, exist_ok=True)
-                    mirrored_path = mirror_dir / asset.path.name
-                    if mirror_fbx_z_inplace(asset.path, mirrored_path):
-                        upload_path = mirrored_path
-
                 # Auto-convert non-PNG/JPG formats to PNG before uploading
                 if kind == "texture" and asset.path.suffix.lower() in (".bmp", ".tga", ".tif", ".tiff", ".psd"):
                     try:
