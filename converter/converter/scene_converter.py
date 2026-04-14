@@ -3112,6 +3112,10 @@ def _convert_fbx_prefab_instance(
         color_url = ""
         normal_url = ""
 
+        # Track whether the sibling material was a cutout/transparent
+        # shader so we can set alpha_mode correctly later on.
+        sibling_alpha_mode: str | None = None
+
         if fbx_path and guid_index:
             # Scan the FBX's sibling Materials/ directory for .mat files.
             # FBX files have their own baked-in material references that
@@ -3120,6 +3124,10 @@ def _convert_fbx_prefab_instance(
             # Parse those .mat files and pick the first one that has a
             # _MainTex texture whose GUID was uploaded.
             import re as _re
+            from converter.material_mapper import (
+                _BUILTIN_CUTOUT_SHADER_IDS,
+                _BUILTIN_TRANSPARENT_SHADER_IDS,
+            )
             mat_sibling_dir = fbx_path.parent / "Materials"
             if mat_sibling_dir.exists():
                 for mat_file in sorted(mat_sibling_dir.glob("*.mat")):
@@ -3144,6 +3152,12 @@ def _convert_fbx_prefab_instance(
                             color_url = au
                             break
                     if color_url:
+                        # Detect cutout/transparent by shader fileID
+                        sm = _re.search(r"m_Shader:\s*\{fileID:\s*(\d+)", text)
+                        if sm:
+                            sid = int(sm.group(1))
+                            if sid in _BUILTIN_CUTOUT_SHADER_IDS or sid in _BUILTIN_TRANSPARENT_SHADER_IDS:
+                                sibling_alpha_mode = "Transparency"
                         # Also try to find a normal map in the same material
                         nm = _re.search(
                             r"- _BumpMap:\s*\n\s+m_Texture:\s*\{fileID:\s*\d+,\s*guid:\s*([0-9a-f]+)",
@@ -3171,35 +3185,11 @@ def _convert_fbx_prefab_instance(
                         elif not color_url:
                             color_url = asset_url
         if color_url:
-            # Check if the color texture has alpha for transparency
-            # (e.g. chain-link fences where the FBX is a flat plane and
-            # the cutout pattern is in the texture alpha channel).
-            alpha_mode = "Overlay"
-            # Check if the co-located color texture has alpha for
-            # transparency (chain-link fences, foliage cutouts).
-            for asset_key, asset_url in uploaded_assets.items():
-                if asset_url == color_url:
-                    # Try multiple path resolutions
-                    candidates = [Path(asset_key)]
-                    if guid_index:
-                        candidates.append(guid_index.project_root / asset_key)
-                    if fbx_path:
-                        candidates.append(fbx_path.parent.parent / asset_key.split("/")[-1])
-                    for tex_path in candidates:
-                        if tex_path.exists():
-                            try:
-                                from PIL import Image as _PIL
-                                import numpy as _np
-                                # Co-located fallback is only reached when
-                                # no material maps this texture; default to
-                                # Overlay. The correct alpha_mode is driven
-                                # by material_mapper (shader-type aware).
-                                pass
-                            except Exception:
-                                pass
-                            break
-                    break
-
+            # alpha_mode comes from the sibling .mat's shader when it's a
+            # legacy cutout/transparent shader (chain-link fences use
+            # Transparent/Cutout/Diffuse, fileID 51). Otherwise default
+            # to Overlay.
+            alpha_mode = sibling_alpha_mode or "Overlay"
             sa = RbxSurfaceAppearance(
                 color_map=color_url,
                 normal_map=normal_url,

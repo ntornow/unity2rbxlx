@@ -618,6 +618,34 @@ class Pipeline:
         except Exception as exc:
             log.warning("[convert_materials] Could not collect prefab material GUIDs: %s", exc)
 
+        # Also pick up .mat files that live in the same Materials/ sibling
+        # folder as any referenced FBX. Unity's "search materials" importer
+        # setting auto-links these to FBX material slots even though they
+        # aren't referenced in scene YAML — and we need them mapped so
+        # cutout/transparent alpha is correctly detected for sub-meshes
+        # like the chainlink fence.
+        if self.state.asset_manifest and self.state.guid_index:
+            import re as _re
+            extra_from_siblings = 0
+            for asset in self.state.asset_manifest.by_kind.get("mesh", []):
+                if asset.path.suffix.lower() != ".fbx":
+                    continue
+                mat_dir = asset.path.parent / "Materials"
+                if not mat_dir.is_dir():
+                    continue
+                for mat_meta in mat_dir.glob("*.mat.meta"):
+                    try:
+                        m = _re.search(r"guid:\s*([0-9a-f]+)", mat_meta.read_text(errors="replace"))
+                    except OSError:
+                        continue
+                    if m:
+                        g = m.group(1)
+                        if g not in referenced_guids:
+                            referenced_guids.add(g)
+                            extra_from_siblings += 1
+            if extra_from_siblings:
+                log.info("[convert_materials] Added %d sibling Materials/ GUIDs", extra_from_siblings)
+
         log.info("[convert_materials] Found %d material GUIDs (scene + prefabs)", len(referenced_guids))
         self.state.material_mappings = map_materials(
             unity_project_path=self.unity_project_path,
