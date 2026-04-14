@@ -538,10 +538,28 @@ class Pipeline:
                 "from uploaded_assets so they don't leak into the rbxlx:",
                 len(rejected),
             )
+            # Also append to the blocklist so the next run doesn't re-upload
+            # these — repeated moderation hits on the same content can trigger
+            # account-level moderation on the uploader.
+            blocklist_file = self.output_dir / ".upload_blocklist"
+            existing = set()
+            if blocklist_file.exists():
+                existing = {line.strip() for line in blocklist_file.read_text().splitlines()}
+            new_lines = []
             for rel, asset_id in rejected:
                 log.warning("  REJECTED: %s -> rbxassetid://%s", rel, asset_id)
                 uploaded.pop(rel, None)
                 self.ctx.asset_upload_errors.append(f"{rel} (moderation rejected)")
+                if rel not in existing:
+                    new_lines.append(rel)
+            if new_lines:
+                header = "" if blocklist_file.exists() else "# Auto-populated: assets that triggered Roblox moderation.\n"
+                with open(blocklist_file, "a") as f:
+                    if header:
+                        f.write(header)
+                    for line in new_lines:
+                        f.write(line + "\n")
+                log.warning("[upload_assets] Added %d path(s) to %s", len(new_lines), blocklist_file)
 
     def convert_materials(self) -> None:
         """Phase 4: Map Unity materials to Roblox SurfaceAppearance."""
