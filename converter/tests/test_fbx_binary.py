@@ -28,8 +28,8 @@ class TestMirrorPreservesStructure:
         dst = tmp_path / "mirrored.fbx"
         assert mirror_fbx_z_inplace(FBX_PATH, dst)
 
-        _, roots_src, _ = read_fbx(FBX_PATH)
-        _, roots_dst, _ = read_fbx(dst)
+        _, roots_src = read_fbx(FBX_PATH)
+        _, roots_dst = read_fbx(dst)
         g_src = _find_geometry_nodes(roots_src)
         g_dst = _find_geometry_nodes(roots_dst)
         assert len(g_src) == len(g_dst) == 14, "HornetRifle has 14 sub-meshes"
@@ -38,8 +38,8 @@ class TestMirrorPreservesStructure:
         dst = tmp_path / "mirrored.fbx"
         mirror_fbx_z_inplace(FBX_PATH, dst)
 
-        _, roots_src, _ = read_fbx(FBX_PATH)
-        _, roots_dst, _ = read_fbx(dst)
+        _, roots_src = read_fbx(FBX_PATH)
+        _, roots_dst = read_fbx(dst)
         g_src = _find_geometry_nodes(roots_src)
         g_dst = _find_geometry_nodes(roots_dst)
 

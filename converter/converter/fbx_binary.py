@@ -106,14 +106,8 @@ def _read_node(data: bytes, pos: int, ver: int) -> tuple[FbxNode | None, int]:
     return FbxNode(name=name, properties=props, children=children), end_offset
 
 
-def read_fbx(path: str | Path) -> tuple[int, list[FbxNode], bytes]:
-    """Read an FBX binary file and return (version, root_nodes, footer).
-
-    The footer includes the root-level null terminator (13 or 25 bytes of
-    zeros) and the trailing magic/version bytes that Roblox and other
-    strict FBX parsers validate. Preserving it verbatim is the simplest
-    way to produce a byte-level-valid FBX when modifying vertex data.
-    """
+def read_fbx(path: str | Path) -> tuple[int, list[FbxNode]]:
+    """Read an FBX binary file and return (version, root_nodes)."""
     data = Path(path).read_bytes()
     if not data.startswith(FBX_HEADER):
         raise ValueError("Not an FBX binary file")
@@ -131,9 +125,7 @@ def read_fbx(path: str | Path) -> tuple[int, list[FbxNode], bytes]:
         if node is None:
             break
         roots.append(node)
-    # Footer starts at the root-level null terminator and runs to EOF
-    footer = data[pos:]
-    return ver, roots, footer
+    return ver, roots
 
 
 # ---------------------------------------------------------------------------
@@ -196,18 +188,8 @@ def _write_node(node: FbxNode, pos: int, ver: int) -> tuple[bytes, int]:
     return header + prop_bytes + child_bytes, end_offset
 
 
-def write_fbx(
-    path: str | Path,
-    version: int,
-    roots: list[FbxNode],
-    footer: bytes = b"",
-) -> None:
-    """Serialise (version, roots) to an FBX binary file.
-
-    ``footer`` should be the byte sequence returned by ``read_fbx()`` —
-    it contains the root-level null terminator plus the trailing magic
-    bytes that strict parsers (Roblox, Autodesk FBX SDK) require.
-    """
+def write_fbx(path: str | Path, version: int, roots: list[FbxNode]) -> None:
+    """Serialise (version, roots) to an FBX binary file."""
     out = bytearray()
     out += FBX_HEADER
     out += struct.pack("<I", version)
@@ -217,13 +199,13 @@ def write_fbx(
         rb, pos = _write_node(r, pos, version)
         out += rb
 
-    if footer:
-        out += footer
-    else:
-        # Minimal fallback: just the null terminator (won't pass strict
-        # parsers like Roblox's FBX importer).
-        null_size = 13 if version < 7500 else 25
-        out += b"\x00" * null_size
+    # Root-level null terminator
+    null_size = 13 if version < 7500 else 25
+    out += b"\x00" * null_size
+
+    # The FBX footer (160 bytes or so) is optional for Roblox/assimp. Pad
+    # with zeros to preserve any tools that skim for a stable footer.
+    out += b"\x00" * 16
 
     Path(path).write_bytes(bytes(out))
 
@@ -289,7 +271,7 @@ def mirror_fbx_z_inplace(src_path: str | Path, dst_path: str | Path) -> bool:
     Returns True on success, False if the file format isn't supported.
     """
     try:
-        ver, roots, footer = read_fbx(src_path)
+        ver, roots = read_fbx(src_path)
     except (ValueError, NotImplementedError):
         return False
 
@@ -315,5 +297,5 @@ def mirror_fbx_z_inplace(src_path: str | Path, dst_path: str | Path) -> bool:
                         if nc.properties and nc.properties[0].type_code == "d":
                             nc.properties[0].value = _negate_z(nc.properties[0].value)
 
-    write_fbx(dst_path, ver, roots, footer=footer)
+    write_fbx(dst_path, ver, roots)
     return True
