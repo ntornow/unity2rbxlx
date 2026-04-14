@@ -2403,14 +2403,17 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     # Fix: Input.GetAxis("AxisName") → proper Roblox input API
     # Also clean up broken GetGamepadState(...)("AxisName") from old API mapping
     if 'GetAxis' in source or 'GetGamepadState' in source:
-        # Map axis names to proper Roblox input calls
+        # Map axis names to proper Roblox input calls. Horizontal/Vertical
+        # resolve to utility functions (inputHorizontal/inputVertical) so that
+        # the generated Luau stays readable; the function bodies are injected
+        # via UTILITY_FUNCTIONS when the call sites appear in the source.
         _axis_map = {
             'MouseX': 'UserInputService:GetMouseDelta().X',
             'MouseY': 'UserInputService:GetMouseDelta().Y',
             'Mouse X': 'UserInputService:GetMouseDelta().X',
             'Mouse Y': 'UserInputService:GetMouseDelta().Y',
-            'Horizontal': '((UserInputService:IsKeyDown(Enum.KeyCode.D) and 1 or 0) - (UserInputService:IsKeyDown(Enum.KeyCode.A) and 1 or 0))',
-            'Vertical': '((UserInputService:IsKeyDown(Enum.KeyCode.W) and 1 or 0) - (UserInputService:IsKeyDown(Enum.KeyCode.S) and 1 or 0))',
+            'Horizontal': 'inputHorizontal()',
+            'Vertical': 'inputVertical()',
             'Mouse ScrollWheel': 'UserInputService:GetMouseDelta().Y',
         }
         # Fix broken GetGamepadState(...)("AxisName") pattern

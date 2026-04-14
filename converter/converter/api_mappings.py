@@ -98,6 +98,7 @@ API_CALL_MAP: dict[str, str] = {
     "Input.GetMouseButton": "UserInputService:IsMouseButtonPressed",
     "Input.GetMouseButtonDown": "UserInputService.InputBegan",
     "Input.GetAxis": "-- Input.GetAxis",  # Handled by validator axis-specific mapping
+    "Input.GetSwipe": "getSwipe",  # handled by UTILITY_FUNCTIONS
     "Input.mousePosition": "UserInputService:GetMouseLocation()",
     "Input.GetTouch": "UserInputService.TouchStarted",
     "Input.anyKeyDown": "-- Input.anyKeyDown: use UserInputService.InputBegan",
@@ -1012,5 +1013,41 @@ local function setActive(instance, active)
 \t\t\tif not active and child.Playing then child:Stop() end
 \t\tend
 \tend
+end""",
+    # Input utility functions (replace deleted runtime/Input.luau wrapper)
+    "inputHorizontal": """\
+local function inputHorizontal()
+\tlocal UIS = game:GetService("UserInputService")
+\tlocal right = UIS:IsKeyDown(Enum.KeyCode.D) or UIS:IsKeyDown(Enum.KeyCode.Right)
+\tlocal left = UIS:IsKeyDown(Enum.KeyCode.A) or UIS:IsKeyDown(Enum.KeyCode.Left)
+\treturn (right and 1 or 0) - (left and 1 or 0)
+end""",
+    "inputVertical": """\
+local function inputVertical()
+\tlocal UIS = game:GetService("UserInputService")
+\tlocal up = UIS:IsKeyDown(Enum.KeyCode.W) or UIS:IsKeyDown(Enum.KeyCode.Up)
+\tlocal down = UIS:IsKeyDown(Enum.KeyCode.S) or UIS:IsKeyDown(Enum.KeyCode.Down)
+\treturn (up and 1 or 0) - (down and 1 or 0)
+end""",
+    "getSwipe": """\
+local _lastSwipe: string? = nil
+do
+\tlocal UIS = game:GetService("UserInputService")
+\tUIS.TouchSwipe:Connect(function(direction, _)
+\t\tif direction == Enum.SwipeDirection.Left then
+\t\t\t_lastSwipe = "Left"
+\t\telseif direction == Enum.SwipeDirection.Right then
+\t\t\t_lastSwipe = "Right"
+\t\telseif direction == Enum.SwipeDirection.Up then
+\t\t\t_lastSwipe = "Up"
+\t\telseif direction == Enum.SwipeDirection.Down then
+\t\t\t_lastSwipe = "Down"
+\t\tend
+\tend)
+end
+local function getSwipe(): string?
+\tlocal s = _lastSwipe
+\t_lastSwipe = nil
+\treturn s
 end""",
 }

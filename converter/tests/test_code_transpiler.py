@@ -793,6 +793,15 @@ class TestNewTranspilerFeatures:
         luau, _, _ = _rule_based_transpile(csharp)
         assert "local function mathRepeat(" in luau
 
+    def test_input_getswipe_maps_to_utility(self):
+        """Input.GetSwipe → getSwipe() with TouchSwipe-driven utility body."""
+        from converter.code_transpiler import _rule_based_transpile
+        csharp = 'string s = Input.GetSwipe();'
+        luau, _, _ = _rule_based_transpile(csharp)
+        assert "getSwipe(" in luau
+        assert "local function getSwipe" in luau
+        assert "TouchSwipe" in luau
+
     def test_mathf_delta_angle_deps(self):
         """mathDeltaAngle depends on mathRepeat — both should be injected."""
         from converter.code_transpiler import _rule_based_transpile
