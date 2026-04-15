@@ -2841,6 +2841,243 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             source,
         )
 
+    # Reposition the WeaponSlot to a typical FPS hand position so the
+    # equipped weapon doesn't clip into the camera. Default (0, 0.5, -1)
+    # puts it dead center in front of the head.
+    if 'CFrame.new(0, 0.5, -1)' in source and 'weaponslot' in source.lower():
+        source = source.replace(
+            'CFrame.new(0, 0.5, -1)',
+            'CFrame.new(0.6, -0.4, -2.0)',
+        )
+        fixes.append("Repositioned WeaponSlot for FPS view (right, down, forward)")
+
+    # MonoBehaviour serialized fields transpile to `script:GetAttribute("X")`,
+    # but the converter writes those attributes on the host Part/Model, not on
+    # the Script instance. Walk up from the script to find the attribute.
+    #
+    # Only rewrite reads that look like serialized-field resolution at the top
+    # of the script: `local VAR = script:GetAttribute("NAME")` or the same
+    # with an `or DEFAULT` fallback. Script-local marker attributes set with
+    # `script:SetAttribute("_X", ...)` earlier in the same file are NOT
+    # rewritten — they're legitimate self-state and the walk-up would silently
+    # redirect them to a parent.
+    self_set_pattern = re.compile(r'script:SetAttribute\("([^"]+)"')
+    self_set_names = set(self_set_pattern.findall(source))
+
+    def _replace_field_read(match: re.Match) -> str:
+        attr_name = match.group(1).strip('"')
+        if attr_name in self_set_names:
+            return match.group(0)
+        return (
+            f'(function(_n) local _o = script.Parent while _o do '
+            f'local _v = _o:GetAttribute(_n) if _v ~= nil then return _v end '
+            f'_o = _o.Parent end return nil end)("{attr_name}")'
+        )
+
+    field_read_pattern = re.compile(
+        r'^(\s*local\s+\w+\s*=\s*)script:GetAttribute\(("[^"]+")\)',
+        re.MULTILINE,
+    )
+    if field_read_pattern.search(source):
+        source = field_read_pattern.sub(
+            lambda m: m.group(1) + _replace_field_read(re.match(r'"([^"]+)"', m.group(2))),
+            source,
+        )
+        fixes.append("Rewrote script:GetAttribute top-level field reads → walk-up lookup")
+
+    # Pickup script: delay Destroy() so the player has time to clone the
+    # picked-up item before it disappears. The Player script listens to
+    # an attribute and runs async, so an immediate Destroy makes the
+    # source unavailable.
+    if 'character:SetAttribute("GetItem"' in source and 'script.Parent:Destroy()' in source:
+        source = source.replace(
+            '-- Send item to player\n\tcharacter:SetAttribute("GetItem", itemName)\n\n\t-- Destroy pickup\n\tscript.Parent:Destroy()',
+            '-- Send item to player\n\tcharacter:SetAttribute("GetItem", itemName)\n\n\t-- Delay destroy so player can clone before the item disappears\n\ttask.delay(0.5, function() if script and script.Parent then script.Parent:Destroy() end end)',
+        )
+        fixes.append("Delayed Pickup Destroy() so player can clone item first")
+
+    # Pickup character resolution: walk up the hierarchy to find the
+    # character Model, not just otherPart.Parent (which fails for
+    # accessory/hat sub-parts).
+    if 'local character = otherPart.Parent' in source and 'FindFirstChildWhichIsA("Humanoid")' in source:
+        source = source.replace(
+            'local character = otherPart.Parent\n\tlocal humanoid = character and character:FindFirstChildWhichIsA("Humanoid")',
+            'local character = otherPart:FindFirstAncestorOfClass("Model")\n\twhile character and not character:FindFirstChildWhichIsA("Humanoid") do\n\t\tcharacter = character:FindFirstAncestorOfClass("Model")\n\tend\n\tlocal humanoid = character and character:FindFirstChildWhichIsA("Humanoid")',
+        )
+        fixes.append("Fixed Pickup character resolution to walk up hierarchy")
+
+    # Pickup → Player communication via RemoteEvent + attribute fallback.
+    # Create the RemoteEvent at script load time (outside the Touched handler)
+    # so the client's WaitForChild resolves before the first touch. Also add
+    # a `_fired` debounce so the server only fires once per pickup even while
+    # `Touched` spams during the 0.5s destroy-delay window (character overlaps
+    # the trigger for multiple physics steps).
+    if 'character:SetAttribute("GetItem"' in source and 'GetPlayerFromCharacter' in source:
+        if '_PICKUP_REMOTE_INIT' not in source:
+            init_block = (
+                '-- _PICKUP_REMOTE_INIT\n'
+                'local _RS = game:GetService("ReplicatedStorage")\n'
+                'local _re = _RS:FindFirstChild("ItemPickupEvent")\n'
+                'if not _re then\n'
+                '\t_re = Instance.new("RemoteEvent")\n'
+                '\t_re.Name = "ItemPickupEvent"\n'
+                '\t_re.Parent = _RS\n'
+                'end\n'
+                'local _fired = false\n\n'
+            )
+            source = init_block + source
+        source = source.replace(
+            '-- Send item to player\n\tcharacter:SetAttribute("GetItem", itemName)',
+            '-- Send item to player via RemoteEvent + attribute (both for reliability)\n\tif _fired then return end\n\t_fired = true\n\tprint("[Pickup] firing", itemName, "to", player.Name)\n\t_re:FireClient(player, itemName)\n\tcharacter:SetAttribute("GetItem", itemName)',
+        )
+        fixes.append("Pickup uses RemoteEvent + attribute with Touched debounce")
+
+    # Player listener: also listen on RemoteEvent for item pickups.
+    # Use a global function reference so it works regardless of injection point.
+    if 'GetAttributeChangedSignal("GetItem")' in source and '_REMOTE_PICKUP_LISTENER' not in source:
+        # Inject RemoteEvent listener that calls getItem.
+        # Use _G or rawget to allow late-binding to getItem.
+        injection = (
+            '\n-- _REMOTE_PICKUP_LISTENER\n'
+            'task.spawn(function()\n'
+            '    local _re = game:GetService("ReplicatedStorage"):WaitForChild("ItemPickupEvent")\n'
+            '    print("[Player] RemoteEvent listener connected")\n'
+            '    _re.OnClientEvent:Connect(function(itemName)\n'
+            '        print("[Player] OnClientEvent received:", itemName)\n'
+            '        if getItem then\n'
+            '            getItem(itemName)\n'
+            '        else\n'
+            '            print("[Player] getItem is nil!")\n'
+            '        end\n'
+            '    end)\n'
+            'end)\n'
+        )
+        # Insert AFTER the first GetAttributeChangedSignal line so getItem
+        # is already in scope (it's declared above the listener).
+        idx = source.find('character:GetAttributeChangedSignal("GetItem")')
+        if idx >= 0:
+            # Find end of the listener block (look for "end)" after idx)
+            end_idx = source.find('end)\n', idx)
+            if end_idx >= 0:
+                end_idx += len('end)\n')
+                source = source[:end_idx] + injection + source[end_idx:]
+                fixes.append("Added RemoteEvent listener for item pickups")
+
+    # Player.luau's setupSounds() walks `script.Parent` for Sound descendants,
+    # but when the script is a ModuleScript in ReplicatedStorage the bound Part
+    # (holding the Unity-serialized AudioClip sounds as Sound children) lives
+    # under Workspace, not under script.Parent. Broaden the search so it also
+    # scans workspace for a matching host Part.
+    if 'local function setupSounds()' in source and '_SETUP_SOUNDS_BROAD' not in source:
+        source = source.replace(
+            'local function setupSounds()\n    local parent = script.Parent',
+            'local function setupSounds()\n    -- _SETUP_SOUNDS_BROAD: also search Workspace for the bound host Part\n    local parent = script.Parent\n    if parent and not parent:FindFirstChildWhichIsA("Sound", true) then\n        for _, _cand in ipairs(workspace:GetDescendants()) do\n            if _cand:IsA("BasePart") and _cand.Name == "Player" and _cand:FindFirstChildWhichIsA("Sound") then\n                parent = _cand\n                break\n            end\n        end\n    end',
+        )
+        fixes.append("Broadened setupSounds() to search Workspace for the host Part's Sound children")
+
+    # Shoot: remove the redundant _isMouseButtonDown early-exit. shoot() is
+    # called from an InputBegan(MouseButton1) handler, so the polling check
+    # races and returns false, preventing any shots from ever firing.
+    if 'if not _isMouseButtonDown(Enum.UserInputType.MouseButton1) then return end' in source:
+        source = source.replace(
+            '    if not _isMouseButtonDown(Enum.UserInputType.MouseButton1) then return end\n',
+            '',
+        )
+        fixes.append("Removed _isMouseButtonDown early-exit in shoot() (called from InputBegan)")
+
+    # getRifle: if the pickup Touched fires repeatedly before the script
+    # destroys itself, the client equips many duplicate rifles. Short-circuit
+    # if a weapon was already equipped this life.
+    if 'local function getRifle()' in source and 'if gotWeapon then return end' not in source:
+        source = source.replace(
+            'local function getRifle()\n',
+            'local function getRifle()\n    if gotWeapon then return end\n',
+        )
+        fixes.append("getRifle early-return when gotWeapon already true (prevents duplicate equip)")
+
+    # When script looks up "riflePrefab" (Unity field reference) and the
+    # Model wasn't created (no mesh_hierarchies during conversion), fall
+    # back to searching for the rifle Model anywhere in workspace.
+    # Idempotent: skip if the wrapper function is already present.
+    if ('FindFirstChild("riflePrefab"' in source
+            and '_RIFLE_LOOKUP_WRAPPED' not in source):
+        source = source.replace(
+            'workspace:FindFirstChild("riflePrefab", true)',
+            '(function() -- _RIFLE_LOOKUP_WRAPPED\n'
+            '    local _rp = workspace:FindFirstChild("riflePrefab", true)\n'
+            '    if _rp then return _rp end\n'
+            '    for _, _d in workspace:GetDescendants() do\n'
+            '        if _d.Name == "Rifle" and _d:IsA("Model") then return _d end\n'
+            '    end\n'
+            '    return nil\n'
+            'end)()',
+        )
+        fixes.append("Added Rifle Model fallback for missing riflePrefab field reference")
+
+    # Fix incomplete Model equip patterns: when a Model is cloned and
+    # parented to a Part (weapon slot), its children are unanchored at
+    # (0,0,0) and don't follow the parent. Inject proper PivotTo + Weld.
+    if 'rifle:IsA("Model")' in source and 'rifle:ScaleTo' in source:
+        # ScaleTo MUST be called BEFORE welding, otherwise welds capture
+        # the unscaled positions and prevent the scale from taking effect.
+        source = re.sub(
+            r'(\s*)elseif\s+rifle:IsA\("Model"\)\s+then\s*\n(\s*)rifle:ScaleTo\([^)]+\)\s*\n\s*end',
+            (r'\1elseif rifle:IsA("Model") then\n'
+             r'\2-- Set primary part for positioning\n'
+             r'\2if not rifle.PrimaryPart then\n'
+             r'\2    rifle.PrimaryPart = rifle:FindFirstChildWhichIsA("BasePart")\n'
+             r'\2end\n'
+             r'\2-- Unanchor parts first so PivotTo/ScaleTo can move them\n'
+             r'\2for _, _p in rifle:GetDescendants() do\n'
+             r'\2    if _p:IsA("BasePart") then\n'
+             r'\2        _p.Anchored = false\n'
+             r'\2        _p.CanCollide = false\n'
+             r'\2        _p.Massless = true\n'
+             r'\2    end\n'
+             r'\2end\n'
+             r'\2-- Scale BEFORE welding (welds would freeze positions)\n'
+             r'\2rifle:ScaleTo(0.2)\n'
+             r'\2-- Move to weapon slot then weld each part\n'
+             r'\2rifle:PivotTo(weaponSlot.CFrame)\n'
+             r'\2for _, _p in rifle:GetDescendants() do\n'
+             r'\2    if _p:IsA("BasePart") then\n'
+             r'\2        local _w = Instance.new("WeldConstraint")\n'
+             r'\2        _w.Part0 = weaponSlot\n'
+             r'\2        _w.Part1 = _p\n'
+             r'\2        _w.Parent = _p\n'
+             r'\2        -- Force visible (bootstrap excludes WeaponSlot from hide)\n'
+             r'\2        _p.LocalTransparencyModifier = 0\n'
+             r'\2    end\n'
+             r'\2end\n'
+             r'\1end'),
+            source,
+        )
+        fixes.append("Fixed Model equip: ScaleTo before WeldConstraints")
+
+    # Auto-create ClickDetector when scripts reference it.
+    # Unity OnMouseDown/OnMouseEnter are lifecycle events on any collider, but
+    # Roblox requires an explicit ClickDetector child instance.
+    if 'ClickDetector' in source and 'Instance.new("ClickDetector")' not in source:
+        # Inject ClickDetector creation at top of script
+        inject = ('local ClickDetector = script.Parent:FindFirstChildOfClass("ClickDetector")\n'
+                  'if not ClickDetector then\n'
+                  '    ClickDetector = Instance.new("ClickDetector")\n'
+                  '    ClickDetector.Parent = script.Parent\n'
+                  'end\n')
+        # Insert after the last local/require/GetService line
+        lines = source.split('\n')
+        insert_idx = 0
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if (stripped.startswith('local ') or stripped.startswith('--') or
+                    stripped == '' or 'GetService' in stripped or 'require(' in stripped):
+                insert_idx = i + 1
+            else:
+                break
+        lines.insert(insert_idx, inject)
+        source = '\n'.join(lines)
+        fixes.append("Auto-created ClickDetector for OnMouseDown/OnMouseEnter events")
+
     # Fix SendMessage → SetAttribute (already partially handled, but clean up remnants)
     if 'SetAttributeOptions' in source:
         source = re.sub(
@@ -5094,7 +5331,12 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
                             return f'{prefix}{inner_cond}{after}'
                         return full  # simple condition, leave as-is
             return full
-        source = re.sub(r'(\(if\s+)(\((?:[^()]*|\([^()]*\))*\)\s+then\b)', _fix_if_expr_parens, source)
+        # DISABLED: the nested-parens regex `(\((?:[^()]*|\([^()]*\))*\))`
+        # causes catastrophic backtracking on scripts with deeply-nested
+        # expressions (SanAndreasUnity's BaseAimMovementState: 13+ min hang).
+        # The fix it applies (unwrapping `(if (cond) then` → `(if cond then`)
+        # is rare and not worth the risk. If needed, implement with a manual
+        # paren-counting scan instead of regex.
 
     # Fix: `or then` at end of if-condition (broken multi-line condition)
     # `elseif (... or then\n  continuation)` → comment out broken line + continuation
@@ -5789,16 +6031,56 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
     for unity_name, roblox_key in _UNITY_INPUT_MAP.items():
         if unity_name in source:
             # IsKeyDown("Jump") → IsKeyDown(Enum.KeyCode.Space)
-            # But for MouseButton types, use IsMouseButtonPressed instead
+            # MouseButton types: use GetMouseButtonsPressed (IsMouseButtonPressed
+            # is not a valid Roblox API)
             if 'MouseButton' in roblox_key:
-                button_num = roblox_key.split('MouseButton')[-1]
                 source = source.replace(
                     f'IsKeyDown({unity_name})',
-                    f'IsMouseButtonPressed({roblox_key})',
+                    f'_isMouseButtonDown({roblox_key})',
                 )
             else:
                 source = source.replace(f'IsKeyDown({unity_name})', f'IsKeyDown({roblox_key})')
             fixes.append(f"Fixed Unity input {unity_name} → {roblox_key}")
+
+    # Fix invalid IsMouseButtonPressed calls (not a valid Roblox API).
+    # Strip the UserInputService: prefix and replace with helper function.
+    if 'IsMouseButtonPressed' in source:
+        source = re.sub(
+            r'(?:UserInputService:|UIS:)?IsMouseButtonPressed\(',
+            '_isMouseButtonDown(',
+            source,
+        )
+        fixes.append("Fixed invalid IsMouseButtonPressed → _isMouseButtonDown helper")
+
+    # Also fix any _isMouseButtonDown that ended up as a method call
+    if 'UserInputService:_isMouseButtonDown' in source or 'UIS:_isMouseButtonDown' in source:
+        source = source.replace('UserInputService:_isMouseButtonDown', '_isMouseButtonDown')
+        source = source.replace('UIS:_isMouseButtonDown', '_isMouseButtonDown')
+
+    # Inject helper function if needed
+    if '_isMouseButtonDown' in source and 'local function _isMouseButtonDown' not in source:
+        helper = (
+            'local function _isMouseButtonDown(btn)\n'
+            '    local UIS = game:GetService("UserInputService")\n'
+            '    for _, input in UIS:GetMouseButtonsPressed() do\n'
+            '        if input.UserInputType == btn then return true end\n'
+            '    end\n'
+            '    return false\n'
+            'end\n'
+        )
+        # Insert at top after services (find the LAST top-level GetService
+        # line, not any nested ones). Stop at the first non-top-level line.
+        lines = source.split('\n')
+        insert_idx = 0
+        for i, line in enumerate(lines):
+            stripped = line.lstrip()
+            if line == stripped and 'GetService' in line:  # top-level only
+                insert_idx = i + 1
+            elif line == stripped and stripped and not stripped.startswith('--') and not stripped.startswith('local '):
+                break
+        lines.insert(insert_idx, helper)
+        source = '\n'.join(lines)
+        fixes.append("Injected _isMouseButtonDown helper")
 
     # Catch-all: any remaining IsKeyDown("StringName") → Enum.KeyCode.StringName
     # This handles unmapped Unity input axis names
@@ -5993,17 +6275,46 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
     if '.Parent =(' in source:
         source = re.sub(r'\.Parent\s*=\s*\((\w+(?:\.\w+)*)\)', r'.Parent = \1', source)
 
-    # Fix Unity FindObjectOfType/FindAnyObjectByType/FindObjectsOfType → workspace:FindFirstChildWhichIsA or GetDescendants
+    # Fix Unity FindObjectOfType/FindAnyObjectByType → workspace:FindFirstChildWhichIsA("Type")
     if 'FindAnyObjectByType(' in source or 'FindObjectOfType(' in source:
-        # FindAnyObjectByType<Type>() or FindObjectOfType<Type>() → workspace:FindFirstChildWhichIsA("Type")
+        # Typed version: FindObjectOfType("Type") → workspace:FindFirstChildWhichIsA("Type", true)
         source = re.sub(
-            r'FindAnyObjectByType\(\)',
+            r'(?:FindAnyObjectByType|FindObjectOfType)\("(\w+)"\)',
+            r'workspace:FindFirstChildWhichIsA("\1", true)',
+            source,
+        )
+        # Bare version (no type arg): just use workspace
+        source = re.sub(
+            r'(?:FindAnyObjectByType|FindObjectOfType)\(\)',
             'workspace',
             source,
         )
+
+    # Fix FindObjectsOfType("Type") → type-filtered GetDescendants
+    if 'FindObjectsOfType(' in source:
+        def _replace_find_objects(m):
+            type_name = m.group(1)
+            # Generate inline filter expression
+            return (f'(function() local _r = {{}} for _, _d in workspace:GetDescendants() do '
+                    f'if _d:IsA("{type_name}") then table.insert(_r, _d) end end return _r end)()')
         source = re.sub(
-            r'FindObjectOfType\(\)',
-            'workspace',
+            r'(?:FindObjectsOfType)\("(\w+)"\)',
+            _replace_find_objects,
+            source,
+        )
+
+    # Fix TryGetComponent("Type", out var) → local var = obj:FindFirstChildWhichIsA("Type")
+    if 'TryGetComponent(' in source:
+        # Pattern: var = obj.TryGetComponent("Type", var) → var = obj:FindFirstChildWhichIsA("Type")
+        source = re.sub(
+            r'(?:local\s+)?(\w+)\s*=\s*(\w+)\.TryGetComponent\("(\w+)",\s*\w+\)',
+            r'local \1 = \2:FindFirstChildWhichIsA("\3")',
+            source,
+        )
+        # Pattern: obj.TryGetComponent("Type", var) as expression → obj:FindFirstChildWhichIsA("Type")
+        source = re.sub(
+            r'(\w+)\.TryGetComponent\("(\w+)",\s*(\w+)\)',
+            r'\1:FindFirstChildWhichIsA("\2")',
             source,
         )
 

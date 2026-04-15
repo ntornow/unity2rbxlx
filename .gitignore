@@ -17,6 +17,8 @@ venv/
 
 # Converter output (generated, large)
 converter/output/
+converter/eval_output/
+converter/eval_current.json
 
 # Cache
 .cache/

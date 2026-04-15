@@ -202,20 +202,20 @@ def transpile_scripts(
             luau, confidence, warnings = ai_results[key]
             strategy = "ai"
 
-        # Fall back to rule-based if AI didn't run or failed
+        # Fall back to stub if AI didn't run or failed. The stub comments
+        # out the original C# as reference and generates a minimal module
+        # skeleton. This is intentionally minimal — AI transpilation is the
+        # primary path and the stub is only a safety net for offline/no-key
+        # scenarios. The old regex-based transpiler was removed because AI
+        # produces superior output and the regex patterns were a maintenance
+        # burden (catastrophic backtracking, 500+ lines of fragile patterns).
         if not luau or confidence < 0.1:
-            luau, confidence, warnings = _rule_based_transpile(csharp_source, API_CALL_MAP)
-            strategy = "rule_based"
-            result.total_rule_based += 1
-
-        # Final safety net: if rule-based output still looks broken,
-        # use a guaranteed-valid stub instead
-        if strategy == "rule_based" and _has_syntax_errors(luau):
             from converter.stub_generator import generate_stub
             luau = generate_stub(csharp_source, info)
             strategy = "stub"
             confidence = 0.3
-            warnings.append("Used stub generator (rule-based output had syntax errors)")
+            result.total_rule_based += 1
+            warnings.append("AI unavailable — used stub generator (run with API key for full transpilation)")
 
         # Flag for manual review if confidence is still low.
         flagged = confidence < TRANSPILATION_CONFIDENCE_THRESHOLD
@@ -542,16 +542,16 @@ def _preprocess_yield_return(source: str) -> str:
         r'task.wait(\1)',
         source,
     )
-    # yield return new WaitForEndOfFrame() → task.wait()
+    # yield return new WaitForEndOfFrame() → RunService.RenderStepped:Wait()
     source = re.sub(
         r'\byield\s+return\s+new\s+WaitForEndOfFrame\s*\(\s*\)',
-        'task.wait()',
+        'game:GetService("RunService").RenderStepped:Wait()',
         source,
     )
-    # yield return new WaitForFixedUpdate() → task.wait()
+    # yield return new WaitForFixedUpdate() → RunService.Heartbeat:Wait()
     source = re.sub(
         r'\byield\s+return\s+new\s+WaitForFixedUpdate\s*\(\s*\)',
-        'task.wait()',
+        'game:GetService("RunService").Heartbeat:Wait()',
         source,
     )
     # yield return new WaitUntil(() => condition) → repeat task.wait() until condition
@@ -706,597 +706,35 @@ def _rule_based_transpile(
     csharp_source: str,
     api_mappings: dict[str, str] | None = None,
 ) -> tuple[str, float, list[str]]:
-    """Transpile C# source to Luau using regex-based pattern matching.
+    """DEPRECATED: Legacy regex-based transpiler.
 
-    Args:
-        csharp_source: The C# source code.
-        api_mappings: The API_CALL_MAP to use for substitution.
+    Kept as a thin wrapper around the stub generator for backward
+    compatibility with tests that call it directly. New code should
+    use AI transpilation (the default path) which produces superior
+    output. The 500+ lines of regex patterns were removed because:
+    - AI transpilation handles generics, LINQ, delegates, async/await
+    - Regex patterns caused catastrophic backtracking (13 min hangs)
+    - Dual maintenance (regex + API mappings + validator) was wasteful
 
-    Returns:
-        Tuple of (luau_source, confidence, warnings).
+    Returns a stub module with the original C# commented out.
     """
-    if api_mappings is None:
-        api_mappings = API_CALL_MAP
-    warnings: list[str] = []
+    # Extract class name from source for the stub
+    import re as _re
+    class_match = _re.search(r'class\s+(\w+)', csharp_source)
+    class_name = class_match.group(1) if class_match else "Module"
 
-    # Pre-process: handle multi-line constructs before line-by-line pass
-    csharp_source = _preprocess_multiline_constructs(csharp_source)
+    # Generate stub: comment out C# source, create skeleton module
+    lines = []
+    lines.append(f"-- Auto-generated stub for {class_name}")
+    lines.append(f"-- AI transpilation recommended for full conversion")
+    lines.append(f"local {class_name} = {{}}")
+    lines.append("")
+    for cs_line in csharp_source.split("\n"):
+        lines.append(f"-- [C#] {cs_line}")
+    lines.append("")
+    lines.append(f"return {class_name}")
 
-    lines = csharp_source.split("\n")
-    output_lines: list[str] = []
-    services_needed: set[str] = set()
-    matched_patterns = 0
-    total_code_lines = 0
-
-    # Stateful tracking for switch/case blocks
-    in_switch = False
-    switch_var = ""
-    first_case = True
-
-    for line in lines:
-        stripped = line.strip()
-
-        # Skip empty lines (preserve them).
-        if not stripped:
-            output_lines.append("")
-            continue
-
-        total_code_lines += 1
-
-        # -- Remove using import statements (not 'using' blocks which are preprocessed) --
-        if stripped.startswith("using ") and not stripped.startswith("using ("):
-            output_lines.append(f"-- {stripped}")
-            matched_patterns += 1
-            continue
-
-        # -- Remove namespace declarations --
-        if stripped.startswith("namespace "):
-            output_lines.append(f"-- {stripped}")
-            matched_patterns += 1
-            continue
-
-        # -- Convert class declarations --
-        m = re.match(
-            r"^\s*(?:public\s+)?(?:abstract\s+|sealed\s+|partial\s+)?class\s+(\w+)\s*(?::\s*([\w,\s]+))?\s*\{?\s*$",
-            line,
-        )
-        if m:
-            class_name = m.group(1)
-            base_class = m.group(2) or ""
-            output_lines.append(f"-- class {class_name} : {base_class}")
-            output_lines.append(f"local {class_name} = {{}}")
-            matched_patterns += 1
-            continue
-
-        # -- Convert interface declarations -> comment (no Luau equivalent)
-        m_iface = re.match(
-            r"^\s*(?:public\s+)?interface\s+(\w+)\s*(?::\s*\w+)?\s*\{?\s*$",
-            line,
-        )
-        if m_iface:
-            output_lines.append(f"-- interface {m_iface.group(1)} (no Luau equivalent)")
-            matched_patterns += 1
-            continue
-
-        # -- Convert struct declarations -> table
-        m_struct = re.match(
-            r"^\s*(?:public\s+)?(?:readonly\s+)?struct\s+(\w+)\s*(?::\s*\w+)?\s*\{?\s*$",
-            line,
-        )
-        if m_struct:
-            output_lines.append(f"-- struct {m_struct.group(1)}")
-            output_lines.append(f"local {m_struct.group(1)} = {{}}")
-            matched_patterns += 1
-            continue
-
-        # -- Convert lifecycle methods --
-        lifecycle_match = False
-        for hook, replacement in LIFECYCLE_MAP.items():
-            pattern = rf"(?:void|IEnumerator)\s+{re.escape(hook)}\s*\("
-            if re.search(pattern, line):
-                output_lines.append(f"{replacement}")
-                lifecycle_match = True
-                matched_patterns += 1
-                # Track required services.
-                if "RunService" in replacement:
-                    services_needed.add("RunService")
-                break
-        if lifecycle_match:
-            continue
-
-        # -- Skip C# attributes like [Range(...)], [HideInInspector], [SerializeField] --
-        if re.match(r"^\s*\[[\w(,.\s\"\')\]]+\]\s*$", stripped):
-            matched_patterns += 1
-            continue
-
-        # -- Skip #if / #endif preprocessor directives --
-        if stripped.startswith("#"):
-            output_lines.append(f"-- {stripped}")
-            matched_patterns += 1
-            continue
-
-        # -- Switch/case stateful conversion --
-        m_switch = re.match(r"^\s*switch\s*\((.+)\)\s*\{?\s*$", stripped)
-        if m_switch:
-            in_switch = True
-            switch_var = m_switch.group(1).strip()
-            first_case = True
-            matched_patterns += 1
-            continue
-
-        if in_switch:
-            # case "value": or case EnumValue: or case 0:
-            m_case = re.match(r'^\s*case\s+(.+?):\s*$', stripped)
-            if m_case:
-                case_val = m_case.group(1).strip()
-                indent = len(line) - len(line.lstrip())
-                if first_case:
-                    output_lines.append(f"{' ' * indent}if {switch_var} == {case_val} then")
-                    first_case = False
-                else:
-                    output_lines.append(f"{' ' * indent}elseif {switch_var} == {case_val} then")
-                matched_patterns += 1
-                continue
-            if re.match(r'^\s*default\s*:\s*$', stripped):
-                indent = len(line) - len(line.lstrip())
-                output_lines.append(f"{' ' * indent}else")
-                matched_patterns += 1
-                continue
-            if stripped == "break" or stripped == "break;":
-                matched_patterns += 1
-                continue
-            # End of switch block
-            if stripped == "}" or stripped == "end":
-                in_switch = False
-                switch_var = ""
-                first_case = True
-                output_lines.append(f"{' ' * (len(line) - len(line.lstrip()))}end")
-                matched_patterns += 1
-                continue
-
-        # -- C# property get/set blocks -> skip --
-        if re.match(r"^\s*(?:get|set)\s*\{", stripped):
-            continue
-
-        # -- C# auto-properties: "[access] Type Name { get; set; }" -> local Name = nil
-        m_autoprop = re.match(
-            r"^\s*(?:public|private|protected|internal)?\s*(?:static\s+)?(?:override\s+)?(\w+(?:<[\w,\s]+>)?(?:\?)?)\s+(\w+)\s*\{\s*get;\s*(?:(?:private\s+)?set;)?\s*\}",
-            stripped,
-        )
-        if m_autoprop:
-            output_lines.append(f"    local {m_autoprop.group(2)} = nil -- {m_autoprop.group(1)} property")
-            matched_patterns += 1
-            continue
-
-        # -- C# enum declaration -> convert to table
-        m_enum = re.match(r"^\s*enum\s+(\w+)\s*\{([^}]*)\}", stripped)
-        if m_enum:
-            enum_name = m_enum.group(1)
-            members = [m.strip() for m in m_enum.group(2).split(",") if m.strip()]
-            output_lines.append(f"local {enum_name} = {{")
-            for i, member in enumerate(members):
-                # Handle "Name = value" and plain "Name"
-                if "=" in member:
-                    name, val = member.split("=", 1)
-                    output_lines.append(f"    {name.strip()} = {val.strip()},")
-                else:
-                    output_lines.append(f"    {member} = {i},")
-            output_lines.append("}")
-            matched_patterns += 1
-            continue
-
-        # -- Pure C# field declarations without = (no initializer) -> comment out --
-        # e.g. "private AudioSource source;" or "public GameObject explosion;"
-        m_field = re.match(
-            r"^\s*(?:public|private|protected|internal)\s+(?:static\s+)?(\w+(?:<[\w,\s]+>)?(?:\[\])?)\s+(\w+)\s*;?\s*$",
-            stripped,
-        )
-        if m_field:
-            output_lines.append(f"    local {m_field.group(2)} = nil -- {m_field.group(1)}")
-            matched_patterns += 1
-            continue
-
-        # -- C# method signatures -> convert to local function --
-        m_method = re.match(
-            r"^\s*(?:public|private|protected|internal)?\s*(?:static\s+)?(?:override\s+)?(?:virtual\s+)?(?:async\s+)?(?:void|bool|int|float|double|string|IEnumerator|Task|[\w<>\[\].]+)\s+(\w+)\s*\(\s*([^)]*)\)\s*\{?\s*$",
-            stripped,
-        )
-        if m_method and m_method.group(1) not in ("if", "while", "for", "switch", "catch"):
-            func_name = m_method.group(1)
-            params = m_method.group(2)
-            # Convert C# params to Luau params (strip types)
-            luau_params = []
-            if params.strip():
-                for p in params.split(","):
-                    p = p.strip()
-                    parts = p.split()
-                    if len(parts) >= 2:
-                        luau_params.append(parts[-1])
-                    elif parts:
-                        luau_params.append(parts[0])
-            indent = len(line) - len(line.lstrip())
-            output_lines.append(f"{' ' * indent}local function {func_name}({', '.join(luau_params)})")
-            matched_patterns += 1
-            continue
-
-        # -- Apply line-level transformations --
-        converted = line
-
-        # C-style comments // -> --
-        converted = re.sub(r"//(.*)$", r"--\1", converted)
-
-        # Remove access modifiers and C# keywords with no Luau equivalent
-        converted = re.sub(r"\b(public|private|protected|internal)\s+", "", converted)
-        converted = re.sub(r"\b(static|override|virtual|abstract|sealed|readonly|const|partial|volatile)\s+", "", converted)
-
-        # Float literal suffixes: 5f -> 5, 0.8f -> 0.8
-        converted = re.sub(r"(\d+(?:\.\d+)?)f\b", r"\1", converted)
-
-        # for loop: must run BEFORE variable declaration regex (which would convert "int i = 0")
-        # Pattern: for (int i = START; i < END; i++) → for i = START, END-1 do
-        m_for = re.match(
-            r"(\s*)for\s*\(\s*(?:int|var)?\s*(\w+)\s*=\s*(\d+)\s*;\s*\2\s*<\s*(\w+(?:\.\w+)?)\s*;\s*\2\+\+\s*\)",
-            converted,
-        )
-        if m_for:
-            converted = f"{m_for.group(1)}for {m_for.group(2)} = {m_for.group(3)}, {m_for.group(4)}-1 do"
-        if not m_for:
-            # Pattern: for (int i = 0; i <= END; i++) → for i = 0, END do
-            m_for_le = re.match(
-                r"(\s*)for\s*\(\s*(?:int|var)?\s*(\w+)\s*=\s*(\d+)\s*;\s*\2\s*<=\s*(\w+(?:\.\w+)?)\s*;\s*\2\+\+\s*\)",
-                converted,
-            )
-            if m_for_le:
-                converted = f"{m_for_le.group(1)}for {m_for_le.group(2)} = {m_for_le.group(3)}, {m_for_le.group(4)} do"
-                m_for = m_for_le
-        if not m_for:
-            # Pattern: for (int i = START; i >= END; i--) → for i = START, END, -1 do
-            m_for_dec = re.match(
-                r"(\s*)for\s*\(\s*(?:int|var)?\s*(\w+)\s*=\s*(\w+(?:\.\w+)?)\s*;\s*\2\s*>=\s*(\d+)\s*;\s*\2--\s*\)",
-                converted,
-            )
-            if m_for_dec:
-                converted = f"{m_for_dec.group(1)}for {m_for_dec.group(2)} = {m_for_dec.group(3)}, {m_for_dec.group(4)}, -1 do"
-        if not m_for:
-            # Expression-based init: for (int i = expr; i < END; i++) → for i = expr, END-1 do
-            m_for_expr = re.match(
-                r"(\s*)for\s*\(\s*(?:int|var)?\s*(\w+)\s*=\s*([^;]+?)\s*;\s*\2\s*<\s*([^;]+?)\s*;\s*\2\+\+\s*\)",
-                converted,
-            )
-            if m_for_expr:
-                converted = f"{m_for_expr.group(1)}for {m_for_expr.group(2)} = {m_for_expr.group(3)}, {m_for_expr.group(4)}-1 do"
-                m_for = m_for_expr
-        if not m_for:
-            # Expression-based decrement: for (int i = expr; i >= END; i--) → for i = expr, END, -1 do
-            m_for_expr_dec = re.match(
-                r"(\s*)for\s*\(\s*(?:int|var)?\s*(\w+)\s*=\s*([^;]+?)\s*;\s*\2\s*>=\s*([^;]+?)\s*;\s*\2--\s*\)",
-                converted,
-            )
-            if m_for_expr_dec:
-                converted = f"{m_for_expr_dec.group(1)}for {m_for_expr_dec.group(2)} = {m_for_expr_dec.group(3)}, {m_for_expr_dec.group(4)}, -1 do"
-                m_for = m_for_expr_dec
-        if not m_for:
-            # Custom step: for (int i = START; i < END; i += STEP) → for i = START, END-1, STEP do
-            m_for_step = re.match(
-                r"(\s*)for\s*\(\s*(?:int|var)?\s*(\w+)\s*=\s*([^;]+?)\s*;\s*\2\s*<\s*([^;]+?)\s*;\s*\2\s*\+=\s*(\d+)\s*\)",
-                converted,
-            )
-            if m_for_step:
-                converted = f"{m_for_step.group(1)}for {m_for_step.group(2)} = {m_for_step.group(3)}, {m_for_step.group(4)}-1, {m_for_step.group(5)} do"
-                m_for = m_for_step
-        if not m_for:
-            # Custom negative step: for (int i = START; i > END; i -= STEP) → for i = START, END+1, -STEP do
-            m_for_neg_step = re.match(
-                r"(\s*)for\s*\(\s*(?:int|var)?\s*(\w+)\s*=\s*([^;]+?)\s*;\s*\2\s*>\s*([^;]+?)\s*;\s*\2\s*-=\s*(\d+)\s*\)",
-                converted,
-            )
-            if m_for_neg_step:
-                converted = f"{m_for_neg_step.group(1)}for {m_for_neg_step.group(2)} = {m_for_neg_step.group(3)}, {m_for_neg_step.group(4)}+1, -{m_for_neg_step.group(5)} do"
-                m_for = m_for_neg_step
-
-        # C# variable declarations with types -> local
-        # "Type varName = value" -> "local varName = value"
-        converted = re.sub(
-            r"\b(?:var|int|float|double|bool|string|long|byte|short|uint)\s+(\w+)\s*=",
-            r"local \1 =",
-            converted,
-        )
-        # Complex types: "GameObject varName = ..." -> "local varName = ..."
-        converted = re.sub(
-            r"\b(?:GameObject|Transform|Vector3|Vector2|Quaternion|Color|"
-            r"Rigidbody|AudioSource|AudioClip|Animator|Camera|Collider|"
-            r"CharacterController|RaycastHit|Ray|Bounds|Rect|Material|"
-            r"Texture2D|Sprite|Mesh|NavMeshAgent|Canvas|RectTransform|"
-            r"Image|Button|Text|Slider|Toggle)\s+(\w+)\s*=",
-            r"local \1 =",
-            converted,
-        )
-        # Array types: "Type[] varName = ..." -> "local varName = ..."
-        converted = re.sub(
-            r"\b\w+\[\]\s+(\w+)\s*=",
-            r"local \1 =",
-            converted,
-        )
-        # Generic types: "List<T> varName = ..." -> "local varName = ..."
-        converted = re.sub(
-            r"\b\w+<[^>]+>\s+(\w+)\s*=",
-            r"local \1 =",
-            converted,
-        )
-        # Custom PascalCase types: "MyClass varName = ..." -> "local varName = ..."
-        # Only match UpperCamelCase identifiers followed by a lowercase variable name
-        # to avoid false positives with Luau keywords or function calls.
-        converted = re.sub(
-            r"\b(?!local\b|return\b|function\b|if\b|else\b|end\b|for\b|while\b|repeat\b|until\b|then\b|do\b|not\b|and\b|or\b|true\b|false\b|nil\b)[A-Z]\w+\s+([a-z]\w*)\s*=",
-            r"local \1 =",
-            converted,
-        )
-
-        # Operator substitution.
-        converted = re.sub(r"!=", "~=", converted)
-        converted = re.sub(r"(?<!\w)&&(?!\w)", " and ", converted)
-        converted = re.sub(r"(?<!\w)\|\|(?!\w)", " or ", converted)
-        # Negate operator: !expr -> not expr (but not != which is already handled).
-        converted = re.sub(r"(?<!=)!(?!=)(\w)", r"not \1", converted)
-
-        # Null -> nil.
-        converted = re.sub(r"\bnull\b", "nil", converted)
-
-        # throw new X("...") → error("...") — must run BEFORE new keyword removal
-        converted = re.sub(r'\bthrow\s+new\s+\w+\(([^)]*)\)', r'error(\1)', converted)
-        converted = re.sub(r'\bthrow\s+(\w+)', r'error(\1)', converted)
-
-        # new keyword removal for constructors
-        # Array initialization: "new Type[] { ... }" → "{ ... }"
-        converted = re.sub(r"\bnew\s+\w+\[\]\s*", "", converted)
-        # List/Dict initialization: "new List<T>()" → "{}"
-        converted = re.sub(r"\bnew\s+\w+<[^>]+>\(\)", "{}", converted)
-        # Dict initializer: "new Dictionary<K,V> { { "key", val }, ... }" → { ["key"] = val, ... }
-        converted = re.sub(
-            r'\bnew\s+Dictionary<[^>]+>\s*\{',
-            '{',
-            converted,
-        )
-        # List initializer: "new List<T> { a, b, c }" → "{ a, b, c }"
-        converted = re.sub(r'\bnew\s+List<[^>]+>\s*\{', '{', converted)
-        # HashSet initializer: "new HashSet<T> { a, b }" → "{ a, b }"
-        converted = re.sub(r'\bnew\s+HashSet<[^>]+>\s*\{', '{', converted)
-        converted = re.sub(r"\bnew\s+(Vector3|Vector2|Color|CFrame|Ray)\(", r"\1.new(", converted)
-        converted = re.sub(r"\bnew\s+\w+\(", "(", converted)  # other constructors
-
-        # C# verbatim string @"..." → "..." (remove @ prefix)
-        converted = re.sub(r'@"', '"', converted)
-        # C# params keyword → strip
-        converted = re.sub(r'\bparams\s+', '', converted)
-
-        # nameof(X) → "X" (C# compile-time string of identifier)
-        converted = re.sub(r'\bnameof\s*\(\s*([\w.]+)\s*\)', r'"\1"', converted)
-
-        # C# typeof(Type) → "Type" (reflection type object → string name)
-        converted = re.sub(r'\btypeof\s*\(\s*([A-Z]\w*)\s*\)', r'"\1"', converted)
-
-        # C# default(Type) → nil (default value expression)
-        converted = re.sub(r'\bdefault\s*\(\s*\w+\s*\)', 'nil', converted)
-
-        # Null-coalescing: expr ?? fallback → (if expr ~= nil then expr else fallback)
-        converted = re.sub(
-            r'(\w+)\s*\?\?\s*([^;,\)]+)',
-            r'(if \1 ~= nil then \1 else \2)',
-            converted,
-        )
-
-        # Lambda expressions: x => expr → function(x) return expr end
-        # Multi-line lambda with block: (x, y) => { → function(x, y)
-        # Use lookbehind for ( to avoid consuming the outer call paren
-        converted = re.sub(
-            r'(?<=\()(\w+(?:\s*,\s*\w+)*)\)\s*=>\s*\{',
-            r'function(\1)',
-            converted,
-        )
-        # Single-param block lambda: x => { → function(x)
-        converted = re.sub(
-            r'\b(\w+)\s*=>\s*\{',
-            r'function(\1)',
-            converted,
-        )
-        # Multi-param expression lambda: (x, y) => expr → function(x, y) return expr end
-        converted = re.sub(
-            r'(?<=\()(\w+(?:\s*,\s*\w+)*)\)\s*=>\s*([^,\){]+?)(?=\s*[,\)])',
-            r'function(\1) return \2 end',
-            converted,
-        )
-        # Simple single-param: x => x.Name → function(x) return x.Name end
-        converted = re.sub(
-            r'\b(\w+)\s*=>\s*([^,\)]+?)(?=\s*[,\)])',
-            r'function(\1) return \2 end',
-            converted,
-        )
-
-        # C# cast: (Type)expr -> expr (primitive + numeric + common Unity types)
-        # Cast must be followed by a word char or ( — not by ) ; , or EOL
-        converted = re.sub(
-            r"\((?:int|uint|float|double|decimal|bool|string|byte|sbyte"
-            r"|short|ushort|long|ulong|char|object)\)"
-            r"(?=\s*[\w(])",
-            "", converted,
-        )
-        # PascalCase type casts: (Transform)obj, (Collider)hit
-        # More restrictive: must be preceded by = or , or ( and followed by word
-        converted = re.sub(
-            r"(?<=[=(,\s])\(([A-Z]\w*)\)(?=\s*\w)",
-            "", converted,
-        )
-        # as Type -> (remove)
-        converted = re.sub(r"\s+as\s+\w+", "", converted)
-
-        # Ternary: a ? b : c -> if a then b else c
-        # Handles complex conditions like (a > b), a == b, etc.
-        # Match: condition ? true_expr : false_expr
-        # The condition can be: parenthesized expr, comparison, or simple word
-        # IMPORTANT: Only match (cond) ? when:
-        # 1. cond doesn't contain commas (those are function args, not conditions)
-        # 2. The ( is NOT preceded by a word char (to avoid matching func(0) ?)
-        converted = re.sub(
-            r"(?<!\w)\(([^),]+)\)\s*\?\s*([^:]+):\s*(.+?)(?=\s*$|\s*;)",
-            r"(if (\1) then \2 else \3)",
-            converted,
-        )
-        converted = re.sub(
-            r"(\w+(?:\.\w+)*(?:\s*[<>=!~]+\s*\w+(?:\.\w+)*)?)\s*\?\s*([^:]+):\s*(.+?)(?=\s*$|\s*;)",
-            r"(if \1 then \2 else \3)",
-            converted,
-        )
-        # try/catch -> pcall
-        converted = re.sub(r"\btry\s*\{?\s*$", "local ok, err = pcall(function()", converted)
-        converted = re.sub(r"\bcatch\s*\(\s*\w+\s+(\w+)\s*\)\s*\{?\s*$",
-                           r"end)\nif not ok then\n    local \1 = err", converted)
-        converted = re.sub(r"\bcatch\s*\{?\s*$", "end)\nif not ok then", converted)
-        converted = re.sub(r"\bfinally\s*\{?\s*$", "end -- finally", converted)
-
-        # switch/case handled by stateful converter above; catch any remaining
-        # bare break statements from switch blocks
-        if stripped == "break" or stripped == "break;":
-            if in_switch:
-                matched_patterns += 1
-                continue
-
-        # foreach: "foreach (Type item in collection)" -> "for _, item in collection do"
-        # Also handles generic types: "foreach (KeyValuePair<X,Y> item in collection)"
-        converted = re.sub(
-            r"\bforeach\s*\(\s*\w+(?:<[^>]+>)?\s+(\w+)\s+in\s+([^\)]+)\s*\)",
-            r"for _, \1 in \2 do",
-            converted,
-        )
-
-        # Convert C# string interpolation $"..." to string.format.
-        converted = re.sub(
-            r'\$"([^"]*)"',
-            lambda m: _convert_interpolated_string(m.group(1)),
-            converted,
-        )
-
-        # String concatenation with + → .. (only when one side is a string literal)
-        converted = re.sub(r'("[^"]*")\s*\+\s*', r'\1 .. ', converted)
-        converted = re.sub(r'\s*\+\s*("[^"]*")', r' .. \1', converted)
-
-        # -- API call substitution --
-        for unity_api, roblox_api in api_mappings.items():
-            if unity_api in converted:
-                converted = converted.replace(unity_api, roblox_api)
-                matched_patterns += 1
-                # Track service imports.
-                for svc in SERVICE_IMPORTS:
-                    if svc in roblox_api:
-                        services_needed.add(svc)
-
-        # -- if/else/elseif conversion --
-        # "} else if (cond) {" → "elseif cond then"
-        converted = re.sub(
-            r"}\s*else\s+if\s*\((.+)\)\s*\{?",
-            r"elseif \1 then",
-            converted,
-        )
-        # "} else {" → "else"
-        converted = re.sub(r"}\s*else\s*\{?", "else", converted)
-        # "if (condition) {" → "if condition then"
-        converted = re.sub(
-            r"\bif\s*\((.+)\)\s*\{?$",
-            r"if \1 then",
-            converted,
-        )
-        # "while (condition) {" → "while condition do"
-        converted = re.sub(
-            r"\bwhile\s*\((.+)\)\s*\{?$",
-            r"while \1 do",
-            converted,
-        )
-        # "do {" → "repeat" (do-while loops)
-        converted = re.sub(r"^\s*do\s*\{?\s*$", "repeat", converted)
-        # "} while (condition);" → "until not (condition)"
-        converted = re.sub(
-            r"}\s*while\s*\((.+)\)\s*;?",
-            r"until not (\1)",
-            converted,
-        )
-
-        # -- Closing braces -> end --
-        if converted.strip() == "}":
-            converted = converted.replace("}", "end")
-            matched_patterns += 1
-
-        # -- Opening braces -- (remove standalone {)
-        if converted.strip() == "{":
-            continue
-
-        # Remove trailing braces on non-standalone lines
-        converted = re.sub(r"\s*\{\s*$", "", converted)
-
-        # -- Semicolons --
-        converted = converted.rstrip(";").rstrip()
-
-        # Skip empty lines that resulted from stripping
-        if not converted.strip():
-            output_lines.append("")
-            continue
-
-        output_lines.append(converted)
-
-    # Prepend service imports.
-    header_lines: list[str] = []
-    if services_needed:
-        header_lines.append("-- Services")
-        for svc in sorted(services_needed):
-            if svc in SERVICE_IMPORTS:
-                header_lines.append(SERVICE_IMPORTS[svc])
-        header_lines.append("")
-
-    # Inject utility functions that are used in the output
-    joined_output = "\n".join(output_lines)
-    utils_needed: list[str] = []
-    for func_name in UTILITY_FUNCTIONS:
-        if func_name + "(" in joined_output:
-            utils_needed.append(func_name)
-    # Dependency resolution: mathDeltaAngle and mathLerpAngle depend on mathRepeat
-    if ("mathDeltaAngle" in utils_needed or "mathLerpAngle" in utils_needed) and "mathRepeat" not in utils_needed:
-        utils_needed.insert(0, "mathRepeat")
-    if "mathLerpAngle" in utils_needed and "mathDeltaAngle" not in utils_needed:
-        utils_needed.insert(0 if "mathRepeat" not in utils_needed else 1, "mathDeltaAngle")
-    if utils_needed:
-        # Group utilities by category for readability
-        math_utils = [u for u in utils_needed if u.startswith("math")]
-        linq_utils = [u for u in utils_needed if u.startswith("linq")]
-        vec3_utils = [u for u in utils_needed if u.startswith("vec3")]
-        other_utils = [u for u in utils_needed if u not in math_utils + linq_utils + vec3_utils]
-        for label, group in [
-            ("-- Math utility functions", math_utils),
-            ("-- LINQ utility functions", linq_utils),
-            ("-- Vector3 utility functions", vec3_utils),
-            ("-- Utility functions", other_utils),
-        ]:
-            if group:
-                header_lines.append(label)
-                for func_name in group:
-                    if func_name in UTILITY_FUNCTIONS:
-                        header_lines.append(UTILITY_FUNCTIONS[func_name])
-                        header_lines.append("")
-
-    luau_source = "\n".join(header_lines + output_lines)
-
-    # Safety pass: comment out any lines that still contain C# syntax
-    # that would cause Luau parse errors
-    luau_source = _sanitize_luau(luau_source)
-
-    # Compute confidence based on how many patterns matched.
-    if total_code_lines > 0:
-        confidence = min(1.0, matched_patterns / max(total_code_lines * 0.5, 1))
-    else:
-        confidence = 0.5
-
-    # Cap confidence -- rule-based never claims perfect conversion.
-    confidence = min(confidence, 0.85)
-
-    return luau_source, confidence, warnings
-
+    return "\n".join(lines), 0.3, ["Stub generated (AI transpilation unavailable)"]
 
 def _sanitize_luau(source: str) -> str:
     """Final safety pass: comment out lines with invalid Luau syntax.

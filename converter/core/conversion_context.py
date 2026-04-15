@@ -76,6 +76,45 @@ class ConversionContext:
         data = asdict(self)
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
+    # Fields that reveal Roblox creator identity, universe/place ownership,
+    # or uploaded asset URLs — anything that should be stripped before
+    # sharing a conversion_context.json outside the repo (bug reports,
+    # gists, forums, etc.).
+    _SENSITIVE_FIELDS: "tuple[str, ...]" = (
+        "universe_id",
+        "place_id",
+        "experience_name",
+        "uploaded_assets",
+        "mesh_native_sizes",
+        "mesh_hierarchies",
+    )
+
+    def save_sanitized(self, path: Path) -> None:
+        """Write a redacted copy of the context to ``path``.
+
+        Strips Roblox IDs, uploaded asset URLs, and anything else that would
+        tie the file to a specific creator/place/experience. Use this when
+        uploading a conversion_context.json as a bug report attachment or
+        sharing one outside the repo — ``save()`` preserves everything for
+        pause/resume but is unsafe to expose.
+
+        Preserves: scene stats, phase completion, errors/warnings, Unity
+        project path. Removes: universe/place IDs, experience name,
+        uploaded_assets mapping, mesh resolution tables.
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = asdict(self)
+        for k in self._SENSITIVE_FIELDS:
+            if k in data:
+                if isinstance(data[k], dict):
+                    data[k] = {}
+                elif isinstance(data[k], list):
+                    data[k] = []
+                else:
+                    data[k] = None
+        data["_sanitized"] = True
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
     @classmethod
     def load(cls, path: Path) -> ConversionContext:
         data = json.loads(path.read_text(encoding="utf-8"))

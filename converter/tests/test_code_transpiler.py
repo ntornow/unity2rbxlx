@@ -8,235 +8,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
-class TestRuleBasedTranspile:
-    def test_debug_log(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'Debug.Log("Hello World");'
-        luau, confidence, warnings = _rule_based_transpile(csharp)
-        assert "print" in luau
-
-    def test_variable_declaration(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = "float speed = 5.0f;"
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "local" in luau or "speed" in luau
-
-    def test_operator_conversion(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = "if (a != b && c || !d)"
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "~=" in luau
-        assert "and" in luau
-        assert "or" in luau
-
-    def test_lifecycle_mapping(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = """
-        void Update() {
-            transform.position += Vector3.forward * Time.deltaTime;
-        }
-        """
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "Heartbeat" in luau or "RunService" in luau
-
-    def test_vector3_conversion(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = "Vector3 pos = new Vector3(1, 2, 3);"
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "Vector3.new" in luau
-
-    def test_instantiate(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = "var obj = Instantiate(prefab);"
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "Clone" in luau
-
-    def test_getcomponent(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'GetComponent<Rigidbody>()'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "FindFirstChildOfClass" in luau
-
-    def test_confidence_score(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'Debug.Log("simple");'
-        _, confidence, _ = _rule_based_transpile(csharp)
-        assert 0.0 <= confidence <= 1.0
-
-
-class TestScriptClassification:
-    def test_classify_server_script(self):
-        from converter.code_transpiler import _classify_script_type
-        csharp = """
-        public class GameManager : MonoBehaviour {
-            void Start() { }
-            void Update() { }
-        }
-        """
-        assert _classify_script_type(csharp, None) == "Script"
-
-    def test_classify_local_script(self):
-        from converter.code_transpiler import _classify_script_type
-        csharp = """
-        public class PlayerInput : MonoBehaviour {
-            void Update() {
-                if (Input.GetKeyDown(KeyCode.Space)) { }
-                Camera.main.transform.position = pos;
-            }
-        }
-        """
-        assert _classify_script_type(csharp, None) == "LocalScript"
-
-    def test_classify_ui_script_as_local(self):
-        from converter.code_transpiler import _classify_script_type
-        csharp = """
-        using UnityEngine.UI;
-        public class HudControl : MonoBehaviour {
-            private Text ammoText;
-            void Start() { ammoText = GetComponent<Text>(); }
-        }
-        """
-        assert _classify_script_type(csharp, None) == "LocalScript"
-
-    def test_classify_module_script(self):
-        from converter.code_transpiler import _classify_script_type
-        csharp = """
-        public static class Util {
-            public static float Clamp(float val, float min, float max) {
-                return Mathf.Clamp(val, min, max);
-            }
-        }
-        """
-        assert _classify_script_type(csharp, None) == "ModuleScript"
-
-
-    def test_try_catch_to_pcall(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = """try {
-    DoSomething();
-} catch (Exception e) {
-    Debug.Log(e.Message);
-}"""
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "pcall" in luau
-
-    def test_string_concat_with_plus(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'string msg = "Hello " + name;'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert ".." in luau
-
-    def test_throw_to_error(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'throw new ArgumentException("bad value");'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "error" in luau
-
-    def test_if_else_conversion(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = """if (health <= 0) {
-    isDead = true;
-} else if (health < 20) {
-    isLow = true;
-} else {
-    isOk = true;
-}"""
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "if health <= 0 then" in luau
-        assert "elseif health < 20 then" in luau
-        assert "else" in luau
-        assert "end" in luau
-
-    def test_while_loop(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = "while (running) {"
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "while running do" in luau
-
-    def test_for_loop_inclusive(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = "for (int i = 0; i <= count; i++)"
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "for i = 0, count do" in luau
-
-    def test_for_loop_decrement(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = "for (int i = n; i >= 0; i--)"
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "for i = n, 0, -1 do" in luau
-
-    def test_foreach_generic_type(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = "foreach (KeyValuePair<string, int> pair in dict)"
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "for _, pair in dict do" in luau
-
-    def test_auto_property(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = "public bool isActive { get; set; }"
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "local isActive = nil" in luau
-
-    def test_enum_declaration(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = "enum GameState { Menu, Playing, Paused, GameOver }"
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "local GameState" in luau
-        assert "Menu = 0" in luau
-        assert "GameOver = 3" in luau
-
-    def test_interface_declaration(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = "public interface IMovable {"
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "interface IMovable" in luau
-
-    def test_struct_declaration(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = "public struct DamageInfo {"
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "local DamageInfo" in luau
-
-    def test_override_keyword_stripped(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = "public override void OnDeath()"
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "override" not in luau
-        assert "OnDeath" in luau
-
-    def test_field_with_semicolon(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = "private float currentHealth;"
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "local currentHealth" in luau
-
-    def test_readonly_keyword_stripped(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = "public readonly int maxCount = 10;"
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "readonly" not in luau
-
-    def test_const_keyword_stripped(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = "public const float GRAVITY = 9.81f;"
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "const" not in luau
-        assert "9.81" in luau
-
-    def test_array_initialization(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = "int[] arr = new int[] { 1, 2, 3 };"
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "{ 1, 2, 3 }" in luau
-        assert "new" not in luau
-
-    def test_list_initialization(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = "var names = new List<string>();"
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "{}" in luau
-
-
 class TestVisualOnlyDetection:
     """Tests for _is_visual_only_script classification."""
 
@@ -711,387 +482,13 @@ class TestValidatorStructuralFixes:
         assert '"Jump"' not in fixed
 
     def test_unity_input_fire_to_mouse(self):
-        """IsKeyDown("Fire") → IsMouseButtonPressed(Enum.UserInputType.MouseButton1)."""
+        """IsKeyDown("Fire") → _isMouseButtonDown(Enum.UserInputType.MouseButton1)."""
         from converter.luau_validator import validate_and_fix
         source = 'if UserInputService:IsKeyDown("Fire") then'
         fixed, _ = validate_and_fix("test", source)
-        assert 'IsMouseButtonPressed' in fixed
+        assert '_isMouseButtonDown' in fixed
+        assert 'GetMouseButtonsPressed' in fixed  # helper function injected
         assert '"Fire"' not in fixed
-
-
-class TestNewTranspilerFeatures:
-    """Tests for newly added transpiler features."""
-
-    def test_nameof_expression(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'Debug.Log(nameof(health));'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert '"health"' in luau
-
-    def test_nameof_dotted(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'string name = nameof(MyClass.Property);'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert '"MyClass.Property"' in luau
-
-    def test_null_coalescing(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'var result = value ?? fallback;'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "~= nil" in luau
-        assert "value" in luau
-        assert "fallback" in luau
-
-    def test_dictionary_initializer(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'var dict = new Dictionary<string, int> { "a", 1 };'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "Dictionary" not in luau or "-- " in luau
-        assert "{" in luau
-
-    def test_list_initializer(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'var items = new List<int> { 1, 2, 3 };'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "List" not in luau or "-- " in luau
-        assert "{ 1, 2, 3 }" in luau
-
-    def test_hashset_initializer(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'var set = new HashSet<string> { "a", "b" };'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "HashSet" not in luau or "-- " in luau
-
-    def test_queue_enqueue(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'queue.Enqueue(item);'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "table.insert(" in luau
-
-    def test_stack_push(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'stack.Push(item);'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "table.insert(" in luau
-
-    def test_mathf_repeat(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'float r = Mathf.Repeat(t, length);'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "mathRepeat(" in luau
-
-    def test_mathf_approximately(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'if (Mathf.Approximately(a, b))'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "mathApproximately(" in luau
-
-    def test_mathf_utility_functions_injected(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'float r = Mathf.Repeat(t, length);'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "local function mathRepeat(" in luau
-
-    def test_mathf_delta_angle_deps(self):
-        """mathDeltaAngle depends on mathRepeat — both should be injected."""
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'float d = Mathf.DeltaAngle(current, target);'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "local function mathDeltaAngle(" in luau
-        assert "local function mathRepeat(" in luau
-
-    def test_dotween_domove(self):
-        from converter.luau_validator import validate_and_fix
-        source = 'part.DOMove(targetPos, 1.5)'
-        fixed, fixes = validate_and_fix("test", source)
-        assert "TweenService:Create(" in fixed
-        assert "Position" in fixed
-
-    def test_dotween_doscale(self):
-        from converter.luau_validator import validate_and_fix
-        source = 'obj.DOScale(newSize, 0.5)'
-        fixed, fixes = validate_and_fix("test", source)
-        assert "TweenService:Create(" in fixed
-        assert "Size" in fixed
-
-    def test_dotween_dofade(self):
-        from converter.luau_validator import validate_and_fix
-        source = 'part.DOFade(0, 2.0)'
-        fixed, fixes = validate_and_fix("test", source)
-        assert "TweenService:Create(" in fixed
-        assert "Transparency" in fixed
-
-    def test_queue_dequeue_fix(self):
-        from converter.luau_validator import validate_and_fix
-        source = 'local item = queue.table.remove(, 1)'
-        fixed, fixes = validate_and_fix("test", source)
-        assert "table.remove(queue, 1)" in fixed
-
-    def test_stack_pop_fix(self):
-        from converter.luau_validator import validate_and_fix
-        source = 'local item = stack.table.remove(, #)'
-        fixed, fixes = validate_and_fix("test", source)
-        assert "table.remove(stack, #stack)" in fixed
-
-    def test_event_connect_touched(self):
-        from converter.luau_validator import validate_and_fix
-        source = 'part.Touched += onTouch'
-        fixed, fixes = validate_and_fix("test", source)
-        assert ":Connect(" in fixed
-
-    def test_mathf_inverselerp(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'float t = Mathf.InverseLerp(a, b, value);'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "mathInverseLerp(" in luau
-        assert "local function mathInverseLerp(" in luau
-
-    def test_lambda_expression(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'var result = items.Where(x => x.Health > 0);'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "function(x)" in luau
-        assert "return" in luau
-
-    def test_linq_where_utility_injected(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'var alive = enemies.Where(x => x.Health > 0);'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "linqWhere(" in luau
-        assert "local function linqWhere(" in luau
-
-    def test_linq_select(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'var names = items.Select(x => x.Name);'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "linqSelect(" in luau
-        assert "local function linqSelect(" in luau
-
-    def test_linq_any(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'bool hasEnemy = enemies.Any(x => x.IsAlive);'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "linqAny(" in luau
-
-    def test_linq_first_or_default(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'var item = items.FirstOrDefault(x => x.Active);'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "linqFirstOrDefault(" in luau
-
-    def test_linq_order_by(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'var sorted = items.OrderBy(x => x.Priority);'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "linqOrderBy(" in luau
-
-    def test_linq_sum(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'int total = items.Sum(x => x.Value);'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "linqSum(" in luau
-
-    def test_linq_tolist_removed(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'var list = items.ToList();'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "ToList" not in luau
-
-    def test_linq_distinct(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'var unique = items.Distinct();'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "linqDistinct(" in luau
-
-    def test_oncomplete_tween(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'tween.OnComplete(Finish);'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "Completed:Connect(" in luau
-
-
-class TestSwitchCase:
-    def test_simple_switch(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = """
-switch (type) {
-    case 0:
-        DoA();
-        break;
-    case 1:
-        DoB();
-        break;
-    default:
-        DoC();
-        break;
-}"""
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "if type == 0 then" in luau
-        assert "elseif type == 1 then" in luau
-        assert "else" in luau
-        assert "end" in luau
-        assert "break" not in luau or "-- " in luau
-
-    def test_string_case(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = """
-switch (name) {
-    case "fire":
-        PlayFire();
-        break;
-    case "water":
-        PlayWater();
-        break;
-}"""
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert 'if name == "fire" then' in luau
-        assert 'elseif name == "water" then' in luau
-
-
-class TestMultiLineEnum:
-    def test_multiline_enum(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = """
-public enum ModulationType
-{
-    Sine,
-    Triangle,
-    Perlin,
-    Random
-}"""
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "ModulationType" in luau
-        assert "Sine" in luau
-        assert "Random" in luau
-
-    def test_enum_with_values(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = """
-enum State
-{
-    Idle = 0,
-    Running = 1,
-    Dead = 2
-}"""
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "Idle = 0" in luau
-        assert "Running = 1" in luau
-        assert "Dead = 2" in luau
-
-
-class TestOutParameters:
-    def test_out_var(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'dict.TryGetValue(key, out var value);'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "out" not in luau or "-- " in luau
-
-    def test_out_type(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'Physics.Raycast(origin, direction, out RaycastHit hit, distance);'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "out" not in luau or "-- " in luau
-
-    def test_ref_param(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'void DoSomething(ref int x) {'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "ref" not in luau or "-- " in luau
-
-
-class TestYieldReturn:
-    def test_wait_for_seconds(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'yield return new WaitForSeconds(2.5f);'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "task.wait(" in luau
-        assert "yield" not in luau
-
-    def test_yield_null(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'yield return null;'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "task.wait()" in luau
-
-    def test_yield_break(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'yield break;'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "return" in luau
-        assert "yield" not in luau
-
-
-class TestNullConditional:
-    def test_property_access(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'var name = obj?.Name;'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "?" not in luau or "-- " in luau
-        assert "obj" in luau
-        assert "nil" in luau
-
-    def test_null_coalescing_assignment(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'cache ??= new List<int>();'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "if cache == nil" in luau or "cache" in luau
-
-
-class TestIsTypeCheck:
-    def test_is_null(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'if (obj is null) return;'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "== nil" in luau
-        assert " is " not in luau or "-- " in luau
-
-    def test_is_not_null(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'if (obj is not null) DoSomething();'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "~= nil" in luau
-
-    def test_is_type(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'if (comp is BoxCollider) return;'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "BoxCollider" in luau
-        assert "typeof" in luau or "IsA" in luau
-
-
-class TestStringInterpolation:
-    def test_format_specifier_f2(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'string s = $"Value: {health:F2}";'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "%.2f" in luau
-        assert "health" in luau
-
-    def test_format_specifier_n0(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'string s = $"Score: {score:N0}";'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "%d" in luau
-
-    def test_format_specifier_d3(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'string s = $"ID: {id:D3}";'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "%03d" in luau
-
-    def test_format_specifier_x(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'string s = $"Hex: {val:X}";'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "%x" in luau
-
-    def test_mixed_format(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'string s = $"HP: {hp:F1}/{maxHp}";'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert "%.1f" in luau
-        assert "hp" in luau
-        assert "maxHp" in luau
 
 
 class TestAsyncAwait:
@@ -1208,90 +605,6 @@ class TestPropertyBodies:
         result = _preprocess_multiline_constructs(csharp)
         assert "local Speed" in result or "get_Speed" in result
         assert "m_Speed" in result
-
-
-class TestGenericTypeDeclarations:
-    """Test that generic/custom type variable declarations get 'local' prefix."""
-
-    def test_generic_list_type(self):
-        from converter.code_transpiler import _rule_based_transpile
-        luau, _, _ = _rule_based_transpile("List<int> numbers = {1, 2, 3};")
-        assert "local numbers" in luau
-
-    def test_generic_dictionary_type(self):
-        from converter.code_transpiler import _rule_based_transpile
-        luau, _, _ = _rule_based_transpile("Dictionary<string, int> map = {};")
-        assert "local map" in luau
-
-    def test_custom_class_type(self):
-        from converter.code_transpiler import _rule_based_transpile
-        luau, _, _ = _rule_based_transpile("PlayerController controller = GetComponent();")
-        assert "local controller" in luau
-
-    def test_does_not_match_keywords(self):
-        from converter.code_transpiler import _rule_based_transpile
-        luau, _, _ = _rule_based_transpile("return value")
-        assert "local value" not in luau
-
-
-class TestComplexForLoops:
-    """Test enhanced for-loop pattern matching."""
-
-    def test_expression_init_for(self):
-        from converter.code_transpiler import _rule_based_transpile
-        luau, _, _ = _rule_based_transpile("for (int i = arr.Length - 1; i < count; i++)")
-        assert "for i = arr.Length - 1" in luau or "for i =" in luau
-
-    def test_step_for(self):
-        from converter.code_transpiler import _rule_based_transpile
-        luau, _, _ = _rule_based_transpile("for (int i = 0; i < 10; i += 2)")
-        assert "2 do" in luau
-
-    def test_negative_step_for(self):
-        from converter.code_transpiler import _rule_based_transpile
-        luau, _, _ = _rule_based_transpile("for (int i = 10; i > 0; i -= 2)")
-        assert "-2 do" in luau
-
-    def test_expression_decrement_for(self):
-        from converter.code_transpiler import _rule_based_transpile
-        luau, _, _ = _rule_based_transpile("for (int i = items.Count - 1; i >= 0; i--)")
-        assert "for i = items.Count - 1" in luau or "for i =" in luau
-        assert "-1 do" in luau
-
-
-class TestTernaryOperator:
-    """Test ternary operator conversion."""
-
-    def test_simple_ternary(self):
-        from converter.code_transpiler import _rule_based_transpile
-        luau, _, _ = _rule_based_transpile("result = isReady ? value1 : value2;")
-        assert "if" in luau and "then" in luau and "else" in luau
-
-    def test_parenthesized_condition_ternary(self):
-        from converter.code_transpiler import _rule_based_transpile
-        luau, _, _ = _rule_based_transpile("result = (a > b) ? x : y;")
-        assert "if" in luau and "then" in luau and "else" in luau
-
-
-class TestMultiLineLambda:
-    """Test multi-line lambda expression conversion."""
-
-    def test_block_lambda_multi_param(self):
-        from converter.code_transpiler import _rule_based_transpile
-        luau, _, _ = _rule_based_transpile("items.ForEach((x, y) => {")
-        assert "function(x, y)" in luau
-        assert "=>" not in luau
-
-    def test_block_lambda_single_param(self):
-        from converter.code_transpiler import _rule_based_transpile
-        luau, _, _ = _rule_based_transpile("items.ForEach(item => {")
-        assert "function(item)" in luau
-        assert "=>" not in luau
-
-    def test_multi_param_expression_lambda(self):
-        from converter.code_transpiler import _rule_based_transpile
-        luau, _, _ = _rule_based_transpile("items.Sort((a, b) => a.Name)")
-        assert "function(a, b)" in luau
 
 
 class TestStringGsubEscaping:
@@ -1512,58 +825,6 @@ class TestCollectionMethodFixes:
         assert "if myEvent then" in fixed
         assert ":Fire(arg1, arg2)" in fixed
         assert "end" in fixed
-
-
-class TestExpandedTranspilerFeatures:
-    """Test newly added transpiler features: casts, typeof, using, lock, default."""
-
-    def test_uint_cast_stripped(self):
-        from converter.code_transpiler import _rule_based_transpile
-        luau, _, _ = _rule_based_transpile('local x = (uint)value;')
-        assert '(uint)' not in luau
-        assert 'value' in luau
-
-    def test_byte_cast_stripped(self):
-        from converter.code_transpiler import _rule_based_transpile
-        luau, _, _ = _rule_based_transpile('local b = (byte)data;')
-        assert '(byte)' not in luau
-
-    def test_unity_type_cast_stripped(self):
-        from converter.code_transpiler import _rule_based_transpile
-        luau, _, _ = _rule_based_transpile('local t = (Transform)component;')
-        assert '(Transform)' not in luau
-
-    def test_typeof_class_to_string(self):
-        from converter.code_transpiler import _rule_based_transpile
-        luau, _, _ = _rule_based_transpile('local t = typeof(PlayerController);')
-        assert '"PlayerController"' in luau
-        assert 'typeof(' not in luau
-
-    def test_typeof_preserves_luau_typeof(self):
-        """Luau's typeof(obj) (lowercase argument) should not be converted."""
-        from converter.code_transpiler import _rule_based_transpile
-        luau, _, _ = _rule_based_transpile('if typeof(obj) == "string" then')
-        # Luau typeof with lowercase arg should remain
-        assert 'typeof(obj)' in luau
-
-    def test_default_type(self):
-        from converter.code_transpiler import _rule_based_transpile
-        luau, _, _ = _rule_based_transpile('local v = default(Vector3);')
-        assert 'nil' in luau
-        assert 'default(' not in luau
-
-    def test_using_block_stripped(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'using (var stream = new FileStream("a.txt")) {\nstream.Read();\n}'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert 'using' not in luau
-
-    def test_lock_block_stripped(self):
-        from converter.code_transpiler import _rule_based_transpile
-        csharp = 'lock (syncRoot) {\nx = 1;\n}'
-        luau, _, _ = _rule_based_transpile(csharp)
-        assert 'lock' not in luau
-        assert 'x = 1' in luau
 
 
 class TestDependencyInjection:
@@ -2571,23 +1832,8 @@ class TestValidatorNewFixes:
         # Should be balanced — no extra end inserted
         assert fixed.count('end') == 2  # one for if, one for function
 
-    def test_utility_function_no_double_paren(self):
-        """Utility function API mappings don't produce double parens."""
-        from converter.code_transpiler import _rule_based_transpile
-        from converter.api_mappings import API_CALL_MAP
-        source = 'float angle = Vector3.SignedAngle(a, b, c);'
-        luau, _, _ = _rule_based_transpile(source, API_CALL_MAP)
-        assert 'vec3SignedAngle((' not in luau
-        assert 'vec3SignedAngle(a' in luau
-
-    def test_ternary_not_matching_func_call_parens(self):
-        """Ternary regex doesn't match (0) from function calls."""
-        from converter.code_transpiler import _rule_based_transpile
-        from converter.api_mappings import API_CALL_MAP
-        source = 'x = Mathf.Lerp(m_Power, Input.GetMouseButton(0) ? maxPower : minPower, dt);'
-        luau, _, _ = _rule_based_transpile(source, API_CALL_MAP)
-        # The (0) should NOT be treated as a ternary condition
-        assert 'if (0) then' not in luau
+    # test_utility_function_no_double_paren — removed (tested rule-based regex)
+    # test_ternary_not_matching_func_call_parens — removed (tested rule-based regex)
 
     def test_eof_end_appending(self):
         """Missing end at EOF gets appended."""
@@ -4384,3 +3630,234 @@ class TestValidatorRuntimeGuards:
             script_type="LocalScript",
         ))
         assert _has_client_fps_controller(place)
+
+
+class TestValidatorAPIPatterns:
+    """Tests for Unity API pattern conversions in the validator."""
+
+    def test_find_objects_of_type_typed(self):
+        """FindObjectsOfType("Type") → type-filtered GetDescendants."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local enemies = FindObjectsOfType("Enemy")'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'IsA("Enemy")' in fixed
+        assert 'GetDescendants()' in fixed
+
+    def test_find_object_of_type_typed(self):
+        """FindObjectOfType("Type") → FindFirstChildWhichIsA."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local mgr = FindObjectOfType("GameManager")'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'FindFirstChildWhichIsA("GameManager"' in fixed
+
+    def test_find_any_object_by_type(self):
+        """FindAnyObjectByType("T") → FindFirstChildWhichIsA."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local cam = FindAnyObjectByType("Camera")'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'FindFirstChildWhichIsA("Camera"' in fixed
+
+    def test_try_get_component(self):
+        """TryGetComponent("Type", var) → FindFirstChildWhichIsA."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local rb = obj.TryGetComponent("Rigidbody", rb)'
+        fixed, _ = validate_and_fix("test", source)
+        assert 'FindFirstChildWhichIsA(' in fixed
+        assert 'rb =' in fixed
+
+    def test_click_detector_auto_creation(self):
+        """ClickDetector reference → auto-create ClickDetector instance."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local part = script.Parent\nClickDetector.MouseClick:Connect(function(player)\n    print("clicked")\nend)'
+        fixed, fixes = validate_and_fix("test", source)
+        assert 'Instance.new("ClickDetector")' in fixed
+        assert any("ClickDetector" in f for f in fixes)
+
+    def test_wait_for_end_of_frame(self):
+        """WaitForEndOfFrame → RenderStepped:Wait()."""
+        from converter.code_transpiler import _preprocess_yield_return
+        result = _preprocess_yield_return("yield return new WaitForEndOfFrame()")
+        assert "RenderStepped" in result
+
+    def test_wait_for_fixed_update(self):
+        """WaitForFixedUpdate → Heartbeat:Wait()."""
+        from converter.code_transpiler import _preprocess_yield_return
+        result = _preprocess_yield_return("yield return new WaitForFixedUpdate()")
+        assert "Heartbeat" in result
+
+
+class TestScriptGetAttributeScoping:
+    """The validator rewrites `script:GetAttribute("X")` at the top of a
+    transpiled MonoBehaviour file into a walk-up lookup through
+    `script.Parent` ancestors, because the converter stores serialized
+    fields on the host Part/Model — not on the Script instance itself.
+
+    The rewrite must NOT touch attributes that the same script sets on
+    itself earlier in the file (e.g. `script:SetAttribute("_MeshesLoaded", true)`
+    followed later by `script:GetAttribute("_MeshesLoaded")`). Those are
+    legitimate script-local markers and walking up to a parent would
+    silently break them.
+    """
+
+    def test_top_level_field_read_is_rewritten(self):
+        from converter.luau_validator import validate_and_fix
+
+        source = 'local itemName = script:GetAttribute("itemName") or ""\n'
+        fixed, _ = validate_and_fix("Pickup", source)
+        assert "script.Parent" in fixed
+        assert 'GetAttribute("itemName")' not in fixed or "while _o" in fixed
+
+    def test_self_set_marker_is_preserved(self):
+        from converter.luau_validator import validate_and_fix
+
+        source = (
+            'if script:GetAttribute("MeshesLoaded") then return end\n'
+            'script:SetAttribute("MeshesLoaded", true)\n'
+        )
+        fixed, _ = validate_and_fix("MeshLoader", source)
+        # The self-set marker check is NOT a top-level `local X = ...` read,
+        # so it should be left alone regardless.
+        assert "while _o" not in fixed
+        assert 'script:GetAttribute("MeshesLoaded")' in fixed
+
+    def test_field_and_marker_coexist(self):
+        from converter.luau_validator import validate_and_fix
+
+        source = (
+            'local itemName = script:GetAttribute("itemName") or ""\n'
+            'if script:GetAttribute("_Init") then return end\n'
+            'script:SetAttribute("_Init", true)\n'
+        )
+        fixed, _ = validate_and_fix("Pickup", source)
+        # Field read gets walk-up rewrite
+        assert "while _o" in fixed
+        # Self-set marker read is untouched
+        assert 'script:GetAttribute("_Init")' in fixed
+
+
+class TestRiflePickupChainValidator:
+    """Regression fixture for the 2026-04-12 SimpleFPS rifle pickup fixes.
+
+    Each of these test cases hand-crafts a script that matches what the
+    (AI-assisted) transpiler produces for SimpleFPS's Pickup.cs / Player.cs
+    and asserts that ``validate_and_fix`` still leaves the specific markers
+    that the runtime depends on. The fast suite runs this without touching
+    SimpleFPS so it's cheap to keep green.
+    """
+
+    # Uses real tabs (\t) in the body of the Touched handler because that's
+    # what the AI transpiler emits and what the validator's literal-match
+    # fixes key on (`\n\t-- Send item to player`, `\n\tscript.Parent:Destroy()`).
+    _PICKUP_AI = (
+        '-- Services\n'
+        'local RunService = game:GetService("RunService")\n'
+        'local Players = game:GetService("Players")\n'
+        '\n'
+        'local itemName = script:GetAttribute("itemName") or ""\n'
+        '\n'
+        'local part = script.Parent\n'
+        'if part:IsA("Model") then\n'
+        '\tpart = part:FindFirstChildWhichIsA("BasePart")\n'
+        'end\n'
+        '\n'
+        'part.Touched:Connect(function(otherPart)\n'
+        '\tlocal character = otherPart:FindFirstAncestorOfClass("Model")\n'
+        '\twhile character and not character:FindFirstChildWhichIsA("Humanoid") do\n'
+        '\t\tcharacter = character:FindFirstAncestorOfClass("Model")\n'
+        '\tend\n'
+        '\tlocal humanoid = character and character:FindFirstChildWhichIsA("Humanoid")\n'
+        '\tif not humanoid then\n'
+        '\t\treturn\n'
+        '\tend\n'
+        '\n'
+        '\tlocal player = Players:GetPlayerFromCharacter(character)\n'
+        '\tif not player then\n'
+        '\t\treturn\n'
+        '\tend\n'
+        '\n'
+        '\t-- Send item to player\n'
+        '\tcharacter:SetAttribute("GetItem", itemName)\n'
+        '\n'
+        '\t-- Destroy pickup\n'
+        '\tscript.Parent:Destroy()\n'
+        'end)\n'
+    )
+
+    _PLAYER_AI = '''\
+local UserInputService = game:GetService("UserInputService")
+local function _isMouseButtonDown(btn)
+    return false
+end
+
+local Player = {}
+local gotWeapon = false
+
+local function setupSounds()
+    local parent = script.Parent
+end
+
+local function getRifle()
+    gotWeapon = true
+end
+
+local function shoot()
+    if not gotWeapon then return end
+    if not _isMouseButtonDown(Enum.UserInputType.MouseButton1) then return end
+    print("pew")
+end
+
+character:GetAttributeChangedSignal("GetItem"):Connect(function()
+    local val = character:GetAttribute("GetItem")
+    if val == "Rifle" then getRifle() end
+end)
+
+Player.shoot = shoot
+return Player
+'''
+
+    def test_pickup_script_gets_all_fixes(self):
+        from converter.luau_validator import validate_and_fix
+        fixed, _ = validate_and_fix("Pickup", self._PICKUP_AI)
+
+        # RemoteEvent created at script-init, before Touched handler.
+        assert "_PICKUP_REMOTE_INIT" in fixed
+        assert 'Instance.new("RemoteEvent")' in fixed
+        init_idx = fixed.index("_PICKUP_REMOTE_INIT")
+        touched_idx = fixed.index("part.Touched:Connect")
+        assert init_idx < touched_idx, (
+            "_PICKUP_REMOTE_INIT must precede part.Touched so the client's "
+            "WaitForChild resolves before the first touch"
+        )
+
+        # Debounce flag and early-return inside the handler.
+        assert "local _fired = false" in fixed
+        assert "if _fired then return end" in fixed
+
+        # Serialized-field read rewritten to walk-up lookup.
+        assert "while _o" in fixed
+
+        # Character resolution walks up to find the humanoid-bearing Model.
+        assert 'FindFirstAncestorOfClass("Model")' in fixed
+
+        # Destroy is delayed so the client can clone the item first.
+        assert "task.delay" in fixed and "script.Parent:Destroy()" in fixed
+
+    def test_player_script_gets_all_fixes(self):
+        from converter.luau_validator import validate_and_fix
+        fixed, _ = validate_and_fix("Player", self._PLAYER_AI)
+
+        # RemoteEvent listener injected after GetAttributeChangedSignal hookup.
+        assert "_REMOTE_PICKUP_LISTENER" in fixed
+        assert 'WaitForChild("ItemPickupEvent")' in fixed
+        # No 30s timeout — the server now creates the event at init time.
+        assert 'ItemPickupEvent", 30' not in fixed
+
+        # setupSounds has the Workspace fallback for ModuleScript-reclassified
+        # Player scripts where script.Parent is ReplicatedStorage.
+        assert "_SETUP_SOUNDS_BROAD" in fixed
+
+        # Shoot no longer gated by the _isMouseButtonDown race.
+        assert "_isMouseButtonDown(Enum.UserInputType.MouseButton1)" not in fixed
+
+        # getRifle is idempotent against repeated Touched fires.
+        assert "if gotWeapon then return end" in fixed

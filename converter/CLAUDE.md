@@ -30,18 +30,28 @@ Work autonomously with no questions — just churn forever making the converter 
 ### Progress tracking:
 - See [TODO.md](TODO.md) for comprehensive gap analysis and task list
 
-### Converter Status (as of 2026-03-30)
+### Converter Status (as of 2026-04-12)
 
-**947 tests passing** (931 fast in 12s, 16 slow full-pipeline tests in 65s)
+**1020 tests passing** (1020 fast in ~12s, 31 slow full-pipeline tests)
 **9 test projects** converting and validating clean with zero errors:
-- SimpleFPS (945 parts, 42 scripts), Gamekit3D (18,534 parts, 249 scripts)
+- SimpleFPS (960 parts, 36 scripts), Gamekit3D (18,534 parts, 249 scripts)
 - SanAndreasUnity (270 scripts), ChopChop (275 scripts), RedRunner (87 scripts)
 - BoatAttack (55 scripts), BossRoom (195 scripts), 3D-Platformer (7 scripts), PrefabWorkflows (6,582 parts)
+
+**Recent session (2026-04-11/12):**
+- Rifle pickup end-to-end fix for SimpleFPS: script:GetAttribute walk-up lookup, RemoteEvent created at script-init (no race), getRifle idempotency, shoot() cleanup, cloud_api strict asset-ID validation.
+- Rifle sub-mesh textures: prefab-referenced materials now applied as SurfaceAppearance to FBX sub-mesh MeshParts in `_extract_monobehaviour_attributes`.
+- setupSounds broadening: ModuleScript-reclassified Player scripts now fall back to workspace search for a host Part's Sound children.
+- Merged PR #1 (`/convert-unity` skill + phase-by-phase interactive CLI, +2,809 lines).
+- CI wired (`.github/workflows/test.yml`), ANTHROPIC_API_KEY lazy binding, phase-4.5 doc staleness pass.
 
 **Key milestones achieved:**
 - P0/P1/P2: ALL resolved (terrain, scripts, content properties, sub-mesh materials, physics, UI, etc.)
 - **Headless mesh resolution**: Luau Execution API → CreateMeshPartAsync + SavePlaceAsync. 328/328 meshes render as proper 3D geometry in Studio edit mode. No Studio interaction required.
 - **One-command pipeline**: `u2r.py convert` → generates rbxlx + publishes to Roblox with proper meshes
+- **Placement accuracy**: Per-sub-mesh vertical offsets, scene hierarchy composition for prefab children, all doors/turrets/pickups at correct positions. 176/176 scripts valid Luau syntax. Mixed collider handling (physical + trigger).
+- **SimpleFPS gameplay verified**: Game starts clean, 0 script errors, water fills, terrain renders, HUD works, spawn points correct, all materials applied (0 default gray).
+- **Performance**: Terrain encoding 2.4x faster via inlined _get_voxel (eliminated 13.8M function calls). SimpleFPS write_output: 8.0s→3.4s. Precomputed height grids + chunk skipping from prior session.
 - SmoothGrid terrain: World-space chunk coordinates with Z inversion
 - Luau place builder: 700KB script reconstructs entire place headlessly (parts, meshes, scripts, terrain, lighting, UI)
 - SurfaceAppearance: Full PBR in rbxlx, Texture fallback for headless mode
@@ -66,6 +76,35 @@ Detailed session-by-session progress is in git history. Key milestones:
 
 ## Overview
 Converts Unity game projects into playable Roblox experiences. Handles scene hierarchy, materials, C# -> Luau transpilation, mesh processing, animation conversion, and asset upload.
+
+## Entry Points
+
+There are two CLIs that share the same `Pipeline` class and the same `conversion_context.json` on disk:
+
+1. **`u2r.py` — non-interactive end-to-end CLI.** Use this for one-shot conversions, CI, batch jobs, anything that should run without human-in-the-loop. Subcommands: `convert`, `publish`, `analyze`, `validate`, `resolve`, `compare`. See `python u2r.py --help`.
+
+2. **`convert_interactive.py` — phase-by-phase CLI for the `/convert-unity` Claude Code skill.** Each subcommand maps to a single skill phase, emits structured JSON to stdout, and persists state in `conversion_context.json`. Subcommands:
+
+   | Skill phase | Pipeline phases run | Notes |
+   |---|---|---|
+   | `preflight`  | (none — env check)                | Validates Python, packages, Unity project |
+   | `status`     | (none — reads ctx)                | Reports completed phases + next |
+   | `discover`   | parse                             | Builds GUID index, picks scene |
+   | `inventory`  | parse → extract_assets            | Builds asset manifest |
+   | `materials`  | … → convert_materials             | Maps Unity .mat → SurfaceAppearance |
+   | `transpile`  | … → transpile_scripts             | C# → Luau (rule-based + AI) |
+   | `validate`   | (none — runs `luau_validator`)    | Auto-fixes Luau quality issues |
+   | `assemble`   | upload_assets, resolve_assets, convert_animations, convert_scene, write_output | Produces `converted_place.rbxlx` |
+   | `upload`     | parse → convert_scene + headless place builder | Publishes via `execute_luau` |
+   | `report`     | (none — writes `conversion_report.json`) | Final summary |
+
+   Each subcommand re-runs essential prerequisite phases on every invocation (matching `Pipeline.resume` semantics) so individual calls are self-contained — but state from previous calls is loaded from `conversion_context.json`.
+
+3. **`/convert-unity` skill** — `converter/.claude/skills/convert-unity/SKILL.md` is the institutional knowledge layer that Claude Code follows when walking a user through an interactive conversion. It encodes the Unity↔Roblox semantic gaps (Step 4.5: architecture map, divergence analysis, module rewrite, bootstrap wiring) that the pipeline cannot automate.
+
+   See also `converter/.claude/skills/convert-unity/references/upload-patching.md` for upload-strategy details.
+
+   **Bug fix protocol:** when fixing a problem found in converted output, always fix BOTH the pipeline code (under `converter/`, `unity/`, `roblox/`, `runtime/`) AND the affected output scripts in `<output_dir>/scripts/`. A fix only to the output regresses on the next conversion; a fix only to the pipeline leaves the current game broken.
 
 ## Architecture
 
@@ -124,8 +163,8 @@ Where:
 ## Running Tests
 ```bash
 cd converter
-python -m pytest tests/ -m "not slow" -v   # Fast suite: 872 tests in ~10s
-python -m pytest tests/ -v                  # Full suite: 888 tests in ~65s (includes CLI + Gamekit3D e2e)
+python -m pytest tests/ -m "not slow" -v   # Fast suite: 1020 tests in ~12s
+python -m pytest tests/ -v                  # Full suite: 1029 tests in ~65s (includes CLI + Gamekit3D e2e)
 ```
 
 ## Running Conversion
@@ -154,7 +193,7 @@ python u2r.py convert ../test_projects/SimpleFPS -o ./output/SimpleFPS --api-key
 - Uploaded meshes return Model IDs which must be resolved to real MeshIds via Studio MCP
 - Git LFS pointer files are detected and skipped (actual FBX data needs LFS pull)
 - VFX Graph, particle SubEmitters, Tilemap, and Cloth have no Roblox equivalent (silently skipped)
-- Font and video assets cannot be uploaded via Roblox Open Cloud API (require manual upload)
+- **Roblox API limitation — font/video upload**: The Open Cloud API only supports Image, Model (mesh), and Audio asset types. Font files and video files must be uploaded manually via the [Creator Dashboard](https://create.roblox.com) and their asset IDs pasted into the converted place. UI text falls back to Roblox's default font; VideoFrame components are emitted with an empty video ID placeholder
 - Cross-scene constraint Part0/Part1 linking may fail for constraints spanning different scene roots
 
 ## Test Projects (../test_projects/)

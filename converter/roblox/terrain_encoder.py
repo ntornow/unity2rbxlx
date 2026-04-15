@@ -253,56 +253,6 @@ def encode_smooth_grid(
     chunks_y = int(math.ceil(grid_y / chunk_size))
     chunks_z = int(math.ceil(grid_z / chunk_size))
 
-    def _get_voxel(gx: int, gy: int, gz: int) -> tuple[int, int]:
-        """Return (material, occupancy) for global voxel position.
-
-        occupancy: 0 = empty, 255 = fully solid.
-        Surface voxels get partial occupancy for smooth edges.
-        """
-        if gx < 0 or gy < 0 or gz < 0 or gx >= grid_x or gy >= grid_y or gz >= grid_z:
-            return (MATERIAL_AIR, 0)
-
-        # Offset terrain surface down by half a voxel so that objects placed
-        # ON the terrain in Unity render ABOVE the terrain in Roblox.
-        # Unity terrain is a mesh that coexists with objects at the same Y,
-        # but Roblox terrain voxels are volumetric and would occlude thin
-        # objects (like floor tiles) at the exact same height.
-        # Offset terrain surface down by half a voxel so runway tiles and
-        # objects placed ON terrain in Unity render above terrain in Roblox.
-        # Unity terrain meshes coexist with objects visually, but Roblox
-        # terrain voxels are volumetric. Half a voxel keeps the terrain
-        # close to the correct height while preventing tile occlusion.
-        # Lower terrain surface by 1 stud to prevent volumetric terrain
-        # voxels from occluding thin objects (tiles, floors) placed ON the
-        # terrain in Unity.  Unity terrain is a mesh that doesn't occlude
-        # objects at the same height; Roblox terrain voxels do.
-        # Use max(0, ...) to preserve terrain at sea level for collision.
-        raw_h = sample_height(gx * VOXEL_SIZE, gz * VOXEL_SIZE)
-        # Lower terrain by half a voxel to prevent tile occlusion,
-        # but always keep at least a thin surface (1 stud) when Unity
-        # has terrain at this location (raw_h >= 0). This ensures
-        # ground exists even at sea level (height 0).
-        # Ensure terrain exists everywhere within the heightmap bounds,
-        # even at sea level (height 0). Unity terrain always has a surface;
-        # Roblox needs at least a thin voxel for collision.
-        h_studs = max(1.0, raw_h - VOXEL_SIZE / 2)
-        voxel_bottom = gy * VOXEL_SIZE
-        voxel_top = voxel_bottom + VOXEL_SIZE
-
-        if voxel_top <= h_studs:
-            # Fully below surface — solid
-            mat = _get_surface_material(gx, gz, h_studs)
-            return (mat, 255)
-        elif voxel_bottom >= h_studs:
-            # Fully above surface — air
-            return (MATERIAL_AIR, 0)
-        else:
-            # Surface voxel — partial occupancy
-            occ = (h_studs - voxel_bottom) / VOXEL_SIZE
-            occ_byte = max(1, min(255, int(occ * 255)))
-            mat = _get_surface_material(gx, gz, h_studs)
-            return (mat, occ_byte)
-
     def _get_surface_material(gx: int, gz: int, h_studs: float) -> int:
         """Determine material for a voxel based on position."""
         if splat_alphas and splat_resolution > 0:
@@ -316,6 +266,38 @@ def encode_smooth_grid(
         h_dz = abs(sample_height(gx * VOXEL_SIZE, (gz + 1) * VOXEL_SIZE) - h_studs)
         slope = max(h_dx, h_dz) / VOXEL_SIZE
         return _height_based_material(norm_h, slope, max_height_studs)
+
+    # Pre-compute height and material grids at voxel resolution.
+    # This avoids calling sample_height() per voxel in the inner loop
+    # (~13M calls for SimpleFPS → ~287K lookups instead).
+    _height_grid = [0.0] * (grid_x * grid_z)
+    _material_grid = [MATERIAL_GRASS] * (grid_x * grid_z)
+    for _gz in range(grid_z):
+        _stud_z = _gz * VOXEL_SIZE
+        for _gx in range(grid_x):
+            _stud_x = _gx * VOXEL_SIZE
+            _raw_h = sample_height(_stud_x, _stud_z)
+            _h = max(1.0, _raw_h - VOXEL_SIZE / 2)
+            _idx = _gz * grid_x + _gx
+            _height_grid[_idx] = _h
+            _material_grid[_idx] = _get_surface_material(_gx, _gz, _h)
+
+    def _get_voxel(gx: int, gy: int, gz: int) -> tuple[int, int]:
+        """Return (material, occupancy) for global voxel position."""
+        if gx < 0 or gy < 0 or gz < 0 or gx >= grid_x or gy >= grid_y or gz >= grid_z:
+            return (MATERIAL_AIR, 0)
+        idx = gz * grid_x + gx
+        h_studs = _height_grid[idx]
+        voxel_bottom = gy * VOXEL_SIZE
+        voxel_top = voxel_bottom + VOXEL_SIZE
+        if voxel_top <= h_studs:
+            return (_material_grid[idx], 255)
+        elif voxel_bottom >= h_studs:
+            return (MATERIAL_AIR, 0)
+        else:
+            occ = (h_studs - voxel_bottom) / VOXEL_SIZE
+            occ_byte = max(1, min(255, int(occ * 255)))
+            return (_material_grid[idx], occ_byte)
 
     def _make_chunk_header(cx: int, cy: int, cz: int) -> bytes:
         """12-byte MSB-interleaved int32 chunk coordinates (absolute or delta)."""
@@ -390,28 +372,82 @@ def encode_smooth_grid(
     wcz_min = (off_z - grid_z + 1) // chunk_size
     wcz_max = off_z // chunk_size
 
+    # Pre-compute max terrain height per chunk column (wcx, wcz) to skip
+    # all-air chunks above the terrain surface without iterating 32^3 voxels.
+    _chunk_max_gy: dict[tuple[int, int], int] = {}
     for wcx in range(wcx_min, wcx_max + 1):
         for wcz in range(wcz_min, wcz_max + 1):
+            max_h = 0.0
+            for sy in range(chunk_size):
+                wvz = wcz * chunk_size + sy
+                gz = off_z - wvz
+                if gz < 0 or gz >= grid_z:
+                    continue
+                for sx in range(chunk_size):
+                    wvx = wcx * chunk_size + sx
+                    gx = wvx - off_x
+                    if gx < 0 or gx >= grid_x:
+                        continue
+                    h = _height_grid[gz * grid_x + gx]
+                    if h > max_h:
+                        max_h = h
+            # Convert max height in studs to max voxel Y index
+            _chunk_max_gy[(wcx, wcz)] = int(math.ceil(max_h / VOXEL_SIZE))
+
+    for wcx in range(wcx_min, wcx_max + 1):
+        for wcz in range(wcz_min, wcz_max + 1):
+            max_gy = _chunk_max_gy.get((wcx, wcz), 0)
             for wcy in range(wcy_min, wcy_max + 1):
+                # Skip chunks entirely above terrain surface
+                chunk_bottom_gy = wcy * chunk_size - off_y
+                if chunk_bottom_gy > max_gy:
+                    continue
+
                 chunk_voxels: list[tuple[int, int]] = []
                 has_non_air = False
 
-                # sz = Y axis (height), sy = Z axis (depth), sx = X axis
+                # Optimized voxel generation: instead of calling _get_voxel
+                # 32^3 times (13.8M calls for SimpleFPS), compute per-column.
+                # For a fixed (gx, gz), the height h is constant — all Y-voxels
+                # below h are solid, all above are air, and the boundary voxel
+                # has partial occupancy. One height lookup per column instead
+                # of per-voxel.
+                #
+                # Axis mapping: sz = Y (height), sy = Z (depth), sx = X
+                _air = (MATERIAL_AIR, 0)
+                _base_wvy = wcy * chunk_size - off_y
+                _base_wvz = wcz * chunk_size
+                _base_wvx = wcx * chunk_size - off_x
+
                 for sz in range(chunk_size):
-                    wvy = wcy * chunk_size + sz
-                    gy = wvy - off_y  # terrain-local Y
+                    gy = _base_wvy + sz
 
                     for sy in range(chunk_size):
-                        wvz = wcz * chunk_size + sy
-                        gz = off_z - wvz  # terrain-local Z (INVERTED)
+                        gz = off_z - (_base_wvz + sy)
 
                         for sx in range(chunk_size):
-                            wvx = wcx * chunk_size + sx
-                            gx = wvx - off_x  # terrain-local X
+                            gx = _base_wvx + sx
 
-                            v = _get_voxel(gx, gy, gz)
-                            chunk_voxels.append(v)
-                            if v[0] != MATERIAL_AIR:
+                            # Inlined _get_voxel for speed (avoids 13.8M
+                            # function-call overhead — 1.5s on SimpleFPS)
+                            if gx < 0 or gy < 0 or gz < 0 or gx >= grid_x or gy >= grid_y or gz >= grid_z:
+                                chunk_voxels.append(_air)
+                                continue
+                            idx = gz * grid_x + gx
+                            h_studs = _height_grid[idx]
+                            voxel_bottom = gy * VOXEL_SIZE
+                            voxel_top = voxel_bottom + VOXEL_SIZE
+                            if voxel_top <= h_studs:
+                                mat = _material_grid[idx]
+                                chunk_voxels.append((mat, 255))
+                                has_non_air = True
+                            elif voxel_bottom >= h_studs:
+                                chunk_voxels.append(_air)
+                            else:
+                                occ = (h_studs - voxel_bottom) / VOXEL_SIZE
+                                occ_byte = max(1, min(255, int(occ * 255)))
+                                mat = _material_grid[idx]
+                                chunk_voxels.append((mat, occ_byte))
                                 has_non_air = True
 
                 if not has_non_air:

@@ -15,7 +15,6 @@ from typing import Any
 
 import config as _config
 from config import (
-    ANTHROPIC_API_KEY,
     OUTPUT_DIR,
     RBXLX_OUTPUT_FILENAME,
 )
@@ -434,6 +433,59 @@ class Pipeline:
         convert_dir = self.output_dir / "converted_textures"
         convert_dir.mkdir(parents=True, exist_ok=True)
 
+        # Compute which texture source paths belong to materials that
+        # render with transparency (cutout, fade, transparent). Only those
+        # textures get their alpha channel preserved; everything else is
+        # stripped to RGB to prevent spurious transparency from mask
+        # channels (roughness/metalness/specular packed into alpha).
+        #
+        # upload_assets runs BEFORE convert_materials, so we can't use the
+        # full material_mappings. Instead, scan every .mat file in the
+        # project and flag textures referenced by materials whose shader
+        # fileID is a legacy cutout/transparent variant, or whose _Mode
+        # is Cutout/Fade/Transparent.
+        alpha_texture_paths: set[str] = set()
+        if self.state.guid_index:
+            import re as _re
+            from converter.material_mapper import (
+                _BUILTIN_CUTOUT_SHADER_IDS,
+                _BUILTIN_TRANSPARENT_SHADER_IDS,
+            )
+            for mat_file in self.unity_project_path.rglob("*.mat"):
+                try:
+                    text = mat_file.read_text(errors="replace")
+                except OSError:
+                    continue
+                # Shader fileID check
+                sm = _re.search(r"m_Shader:\s*\{fileID:\s*(\d+)", text)
+                shader_id = int(sm.group(1)) if sm else 0
+                is_transparent = (
+                    shader_id in _BUILTIN_CUTOUT_SHADER_IDS
+                    or shader_id in _BUILTIN_TRANSPARENT_SHADER_IDS
+                )
+                # _Mode check for Standard/URP/HDRP
+                if not is_transparent:
+                    mm = _re.search(r"-\s*_Mode:\s*(\d+)", text)
+                    if mm and int(mm.group(1)) > 0:
+                        is_transparent = True
+                if not is_transparent:
+                    continue
+                # Record every color-map texture referenced by this material
+                for tex_key in ("_MainTex", "_BaseMap", "_BaseColorMap"):
+                    tm = _re.search(
+                        rf"- {tex_key}:\s*\n\s+m_Texture:\s*\{{fileID:\s*\d+,\s*guid:\s*([0-9a-f]+)",
+                        text,
+                    )
+                    if tm:
+                        tex_path = self.state.guid_index.resolve(tm.group(1))
+                        if tex_path:
+                            alpha_texture_paths.add(str(tex_path.resolve()))
+
+        # Collected for a post-upload moderation audit. We probe only newly
+        # uploaded assets (not cached entries from a previous run) so the
+        # audit cost stays proportional to the new work.
+        new_uploads: list[tuple[str, str]] = []
+
         for kind, uploader, extensions in [
             ("texture", upload_image, {".png", ".jpg", ".jpeg", ".bmp", ".tga", ".tif", ".tiff", ".psd"}),
             ("mesh", upload_mesh, {".fbx", ".obj"}),
@@ -443,19 +495,41 @@ class Pipeline:
             eligible = [a for a in assets if a.path.suffix.lower() in extensions]
             log.info("[upload_assets] Uploading %d %s assets...", len(eligible), kind)
 
+            # Asset upload blocklist: relative paths that should NEVER be
+            # re-uploaded (e.g. user flagged a bad asset, or Roblox returned
+            # a problematic asset ID). Read from
+            # ``<output_dir>/.upload_blocklist`` — one relative path per line.
+            blocklist_file = self.output_dir / ".upload_blocklist"
+            blocklist: set[str] = set()
+            if blocklist_file.exists():
+                blocklist = {line.strip() for line in blocklist_file.read_text().splitlines() if line.strip() and not line.startswith("#")}
+
             for asset in eligible:
                 rel = str(asset.relative_path)
                 if rel in uploaded:
                     continue  # Already uploaded (resume support)
+                if rel in blocklist:
+                    log.info("[upload_assets] Skipping blocklisted asset: %s", rel)
+                    continue
 
                 upload_path = asset.path
                 name = asset.path.stem
+
+                # Determine whether this texture needs its alpha channel
+                # preserved. Alpha is only kept for textures that feed
+                # into materials with a transparent/cutout alpha_mode —
+                # everything else strips alpha to avoid spurious
+                # transparency from mask channels (roughness/metalness/
+                # specular packed into alpha).
+                needs_alpha = False
+                if kind == "texture":
+                    needs_alpha = str(asset.path.resolve()) in alpha_texture_paths
 
                 # Auto-convert non-PNG/JPG formats to PNG before uploading
                 if kind == "texture" and asset.path.suffix.lower() in (".bmp", ".tga", ".tif", ".tiff", ".psd"):
                     try:
                         png_path = convert_dir / (asset.path.stem + ".png")
-                        upload_path = convert_to_png(asset.path, png_path)
+                        upload_path = convert_to_png(asset.path, png_path, preserve_alpha=needs_alpha)
                     except Exception as exc:
                         log.warning("[upload_assets] Failed to convert %s to PNG: %s", asset.path.name, exc)
                         self.ctx.asset_upload_errors.append(rel)
@@ -465,6 +539,7 @@ class Pipeline:
                 if result:
                     uploaded[rel] = f"rbxassetid://{result}"
                     log.info("[upload_assets]   %s -> rbxassetid://%s  (source: %s)", name, result, rel)
+                    new_uploads.append((rel, result))
                 else:
                     log.warning("[upload_assets]   FAILED: %s  (source: %s)", name, rel)
                     self.ctx.asset_upload_errors.append(rel)
@@ -472,6 +547,65 @@ class Pipeline:
 
         log.info("[upload_assets] %d assets uploaded, %d errors",
                  len(uploaded), len(self.ctx.asset_upload_errors))
+
+        # Post-upload moderation audit: probe newly-uploaded assets (audio
+        # and images get moderation-rejected most often) and strip any that
+        # come back rejected, so the rbxlx writer doesn't embed broken IDs.
+        # We only check new uploads, not cached entries from previous runs,
+        # to keep the audit cost proportional to new work. The audit fails
+        # soft — if the metadata endpoint can't make up its mind, we assume
+        # the asset is fine and leave it in place.
+        self._audit_new_uploads(new_uploads, api_key)
+
+    def _audit_new_uploads(
+        self,
+        new_uploads: list[tuple[str, str]],
+        api_key: str,
+    ) -> None:
+        """Probe newly-uploaded assets for moderation rejection and strip
+        any that are rejected. No-op for empty input or missing API key.
+        """
+        if not new_uploads or not api_key:
+            return
+
+        from roblox.cloud_api import probe_asset_availability
+        uploaded = self.ctx.uploaded_assets
+
+        rejected: list[tuple[str, str]] = []
+        for rel, asset_id in new_uploads:
+            status = probe_asset_availability(asset_id, api_key)
+            if status == "rejected":
+                rejected.append((rel, asset_id))
+            time.sleep(1.1)  # Throttle: metadata endpoint rate-limits hard.
+
+        if rejected:
+            log.warning(
+                "[upload_assets] Stripping %d moderation-rejected asset(s) "
+                "from uploaded_assets so they don't leak into the rbxlx:",
+                len(rejected),
+            )
+            # Also append to the blocklist so the next run doesn't re-upload
+            # these — repeated moderation hits on the same content can trigger
+            # account-level moderation on the uploader.
+            blocklist_file = self.output_dir / ".upload_blocklist"
+            existing = set()
+            if blocklist_file.exists():
+                existing = {line.strip() for line in blocklist_file.read_text().splitlines()}
+            new_lines = []
+            for rel, asset_id in rejected:
+                log.warning("  REJECTED: %s -> rbxassetid://%s", rel, asset_id)
+                uploaded.pop(rel, None)
+                self.ctx.asset_upload_errors.append(f"{rel} (moderation rejected)")
+                if rel not in existing:
+                    new_lines.append(rel)
+            if new_lines:
+                header = "" if blocklist_file.exists() else "# Auto-populated: assets that triggered Roblox moderation.\n"
+                with open(blocklist_file, "a") as f:
+                    if header:
+                        f.write(header)
+                    for line in new_lines:
+                        f.write(line + "\n")
+                log.warning("[upload_assets] Added %d path(s) to %s", len(new_lines), blocklist_file)
 
     def convert_materials(self) -> None:
         """Phase 4: Map Unity materials to Roblox SurfaceAppearance."""
@@ -506,6 +640,34 @@ class Pipeline:
                 _collect_mat_guids(prefab.root)
         except Exception as exc:
             log.warning("[convert_materials] Could not collect prefab material GUIDs: %s", exc)
+
+        # Also pick up .mat files that live in the same Materials/ sibling
+        # folder as any referenced FBX. Unity's "search materials" importer
+        # setting auto-links these to FBX material slots even though they
+        # aren't referenced in scene YAML — and we need them mapped so
+        # cutout/transparent alpha is correctly detected for sub-meshes
+        # like the chainlink fence.
+        if self.state.asset_manifest and self.state.guid_index:
+            import re as _re
+            extra_from_siblings = 0
+            for asset in self.state.asset_manifest.by_kind.get("mesh", []):
+                if asset.path.suffix.lower() != ".fbx":
+                    continue
+                mat_dir = asset.path.parent / "Materials"
+                if not mat_dir.is_dir():
+                    continue
+                for mat_meta in mat_dir.glob("*.mat.meta"):
+                    try:
+                        m = _re.search(r"guid:\s*([0-9a-f]+)", mat_meta.read_text(errors="replace"))
+                    except OSError:
+                        continue
+                    if m:
+                        g = m.group(1)
+                        if g not in referenced_guids:
+                            referenced_guids.add(g)
+                            extra_from_siblings += 1
+            if extra_from_siblings:
+                log.info("[convert_materials] Added %d sibling Materials/ GUIDs", extra_from_siblings)
 
         log.info("[convert_materials] Found %d material GUIDs (scene + prefabs)", len(referenced_guids))
         self.state.material_mappings = map_materials(
@@ -586,7 +748,7 @@ class Pipeline:
             unity_project_path=self.unity_project_path,
             script_infos=script_infos,
             use_ai=_config.USE_AI_TRANSPILATION,
-            api_key=ANTHROPIC_API_KEY,
+            api_key=_config.ANTHROPIC_API_KEY,
         )
         self.ctx.transpiled_scripts = self.state.transpilation_result.total_transpiled
         log.info(
@@ -870,13 +1032,44 @@ return table.concat(allData, "\\n")'''
 
         # Write transpiled scripts to output directory AND add to RbxPlace.
         scripts_dir = self.output_dir / "scripts"
-        # Clean old scripts from previous runs to avoid stale files
-        if scripts_dir.exists():
-            import shutil
-            shutil.rmtree(scripts_dir)
+        # When transpile_scripts was skipped (e.g. user hand-edited Luau during
+        # the review step and then ran assemble without --retranspile), preserve
+        # the existing scripts directory so hand-edits survive.
+        preserve_scripts = (
+            "transpile_scripts" in self.ctx.completed_phases
+            and not getattr(self, "_retranspile", False)
+            and scripts_dir.exists()
+            and not self.state.transpilation_result
+        )
+        if not preserve_scripts:
+            if scripts_dir.exists():
+                import shutil
+                shutil.rmtree(scripts_dir)
         scripts_dir.mkdir(parents=True, exist_ok=True)
 
-        if self.state.transpilation_result:
+        if preserve_scripts:
+            # Rehydrate scripts from disk into rbx_place so the .rbxlx
+            # includes the user's hand-edited Luau files.
+            from core.roblox_types import RbxScript
+            luau_files = sorted(scripts_dir.rglob("*.luau"))
+            for luau_path in luau_files:
+                source = luau_path.read_text(encoding="utf-8")
+                name = luau_path.stem
+                # Infer script type from source content
+                script_type: str = "Script"
+                if source.rstrip().endswith("return " + name) or "\nreturn " in source:
+                    script_type = "ModuleScript"
+                elif "game.Players.LocalPlayer" in source or "UserInputService" in source:
+                    script_type = "LocalScript"
+                self.state.rbx_place.scripts.append(RbxScript(
+                    name=name,
+                    source=source,
+                    script_type=script_type,
+                ))
+            log.info("[write_output] Rehydrated %d scripts from disk (transpile skipped)",
+                     len(luau_files))
+
+        elif self.state.transpilation_result:
             from core.roblox_types import RbxScript
             from converter.luau_validator import validate_and_fix, fix_gameplay_patterns
             total_fixes = 0
@@ -1031,15 +1224,23 @@ return table.concat(allData, "\\n")'''
                 bootstrap_lines.append('-- Hide local character for first-person view')
                 bootstrap_lines.append('local Players = game:GetService("Players")')
                 bootstrap_lines.append('local lp = Players.LocalPlayer')
+                bootstrap_lines.append('local function _isInWeaponSlot(inst)')
+                bootstrap_lines.append('    local p = inst.Parent')
+                bootstrap_lines.append('    while p and p ~= game do')
+                bootstrap_lines.append('        if p.Name == "WeaponSlot" then return true end')
+                bootstrap_lines.append('        p = p.Parent')
+                bootstrap_lines.append('    end')
+                bootstrap_lines.append('    return false')
+                bootstrap_lines.append('end')
                 bootstrap_lines.append('local function hideCharacter(char)')
                 bootstrap_lines.append('    if not char then return end')
                 bootstrap_lines.append('    for _, part in char:GetDescendants() do')
-                bootstrap_lines.append('        if part:IsA("BasePart") or part:IsA("Decal") or part:IsA("MeshPart") then')
+                bootstrap_lines.append('        if (part:IsA("BasePart") or part:IsA("Decal") or part:IsA("MeshPart")) and not _isInWeaponSlot(part) then')
                 bootstrap_lines.append('            part.LocalTransparencyModifier = 1')
                 bootstrap_lines.append('        end')
                 bootstrap_lines.append('    end')
                 bootstrap_lines.append('    char.DescendantAdded:Connect(function(desc)')
-                bootstrap_lines.append('        if desc:IsA("BasePart") or desc:IsA("Decal") or desc:IsA("MeshPart") then')
+                bootstrap_lines.append('        if (desc:IsA("BasePart") or desc:IsA("Decal") or desc:IsA("MeshPart")) and not _isInWeaponSlot(desc) then')
                 bootstrap_lines.append('            desc.LocalTransparencyModifier = 1')
                 bootstrap_lines.append('        end')
                 bootstrap_lines.append('    end)')
@@ -1493,9 +1694,12 @@ script.Disabled = true
                 for class_name in script_classes:
                     if class_name in script_by_name:
                         script = script_by_name[class_name]
-                        # Only bind Server scripts and LocalScripts to parts
-                        # ModuleScripts stay in ReplicatedStorage for require()
-                        if script.script_type != "ModuleScript":
+                        # Only bind Server scripts and LocalScripts to parts.
+                        # ModuleScripts stay in ReplicatedStorage for require().
+                        # Skip stub scripts (AI unavailable) — they have no
+                        # runnable code, and cloning them per instance bloats
+                        # the rbxlx (Gamekit3D: 7860 copies of a Variations stub).
+                        if script.script_type != "ModuleScript" and "AI transpilation recommended" not in script.source:
                             # Clone the script for each instance so all prefab
                             # variants get their inherited MonoBehaviour scripts
                             if class_name in bound_script_names:
@@ -1614,6 +1818,15 @@ script.Disabled = true
             modules_to_inject.append(("CharacterBridge", "physics_bridge.luau"))
         if has_sub_emitters:
             modules_to_inject.append(("SubEmitterRuntime", "sub_emitter_runtime.luau"))
+
+        # Detect object pooling patterns in transpiled scripts
+        has_pool = any(
+            "pool" in s.source.lower() and ("GetNew" in s.source or "pool.Free" in s.source or "pool.Get" in s.source)
+            for s in self.state.rbx_place.scripts
+        )
+        if has_pool:
+            modules_to_inject.append(("ObjectPool", "object_pool.luau"))
+
         # PickupRuntime removed — pickup scripts are now properly propagated
         # from base prefabs to variants via _bind_scripts_to_parts cloning.
         if has_cinemachine:

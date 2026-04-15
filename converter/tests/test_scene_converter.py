@@ -45,15 +45,11 @@ class TestHierarchyParenting:
     """Test that prefab hierarchy parenting works."""
 
     @pytest.mark.slow
-    @pytest.mark.skipif(
-        not (Path(__file__).parent.parent.parent / "test_projects" / "SimpleFPS").exists(),
-        reason="SimpleFPS test project not available",
-    )
-    def test_dynamic_objects_has_children(self):
+    def test_dynamic_objects_has_children(self, simplefps_project):
         """DynamicObjects/Level should have child sectors."""
         from converter.pipeline import Pipeline
 
-        project = Path(__file__).parent.parent.parent / "test_projects" / "SimpleFPS"
+        project = simplefps_project
         pipeline = Pipeline(
             unity_project_path=project,
             output_dir=Path("/tmp/test_hierarchy"),
@@ -473,3 +469,169 @@ class TestMeshSizeFbxBboxFallback:
             assert abs(size[2] - 0.5 * 20.0 * f) < 0.01
         finally:
             sc._fbx_bounding_boxes = old_bboxes
+
+
+class TestMeshVerticalOffsetSubMesh:
+    """Test per-sub-mesh vertical offset selection."""
+
+    def test_submesh_name_fallback(self):
+        """When fileID index is out of bounds, fall back to name matching."""
+        import converter.scene_converter as sc
+        from core.unity_types import GuidIndex, GuidEntry
+        from pathlib import Path
+
+        old_mh = sc._mesh_hierarchies
+        old_cache = sc._mesh_vertical_offset_cache
+        try:
+            sc._mesh_hierarchies = {
+                "Assets/door.fbx": [
+                    {"name": "frame_col", "position": [0, 3.22, 0], "size": [7, 6, 1]},
+                    {"name": "base", "position": [0, 0.14, 0], "size": [5, 0.15, 2]},
+                    {"name": "door", "position": [0, 2.66, 0], "size": [5, 5, 0.7]},
+                ]
+            }
+            sc._mesh_vertical_offset_cache = {}
+
+            gi = GuidIndex(project_root=Path("/fake"))
+            gi.guid_to_entry["door-guid"] = GuidEntry(
+                guid="door-guid",
+                asset_path=Path("/fake/Assets/door.fbx"),
+                relative_path=Path("Assets/door.fbx"),
+                kind="model",
+            )
+
+            # Using mesh_name="door" should find the door sub-mesh (pos Y=2.66)
+            # not the first sub-mesh (frame_col at Y=3.22)
+            import config
+            offset = sc._compute_mesh_vertical_offset(
+                "door-guid", gi, 1.0,
+                mesh_file_id="9999999",  # invalid fileID to force name fallback
+                mesh_name="door",
+            )
+            # Default import_scale is 0.01 (cm→m) when no .meta file exists
+            expected = 2.66 * 0.01 * config.STUDS_PER_METER
+            assert abs(offset - expected) < 0.01, f"Expected ~{expected:.4f}, got {offset:.4f}"
+
+            # Verify it used "door" not "frame_col" (Y=3.22) or "base" (Y=0.14)
+            frame_col_offset = 3.22 * 0.01 * config.STUDS_PER_METER
+            base_offset = 0.14 * 0.01 * config.STUDS_PER_METER
+            assert abs(offset - frame_col_offset) > 0.01, "Should NOT use frame_col"
+            assert abs(offset - base_offset) > 0.01, "Should NOT use base"
+        finally:
+            sc._mesh_hierarchies = old_mh
+            sc._mesh_vertical_offset_cache = old_cache
+
+
+class TestMixedColliderHandling:
+    """Test that physical + trigger colliders on the same node work correctly."""
+
+    def test_physical_then_trigger_keeps_collidable(self):
+        """Physical collider followed by trigger → CanCollide stays True."""
+        from converter.scene_converter import _process_components
+        from core.roblox_types import RbxPart
+
+        class FakeBoxCollider:
+            component_type = "BoxCollider"
+            properties = {"m_IsTrigger": 0, "m_Size": {"x": 1, "y": 1, "z": 1}, "m_Center": {"x": 0, "y": 0, "z": 0}}
+
+        class FakeTriggerCollider:
+            component_type = "SphereCollider"
+            properties = {"m_IsTrigger": 1, "m_Radius": 3, "m_Center": {"x": 0, "y": 0, "z": 0}}
+
+        class FakeNode:
+            name = "DoorBase"
+            components = [FakeBoxCollider(), FakeTriggerCollider()]
+            mesh_guid = None
+
+        part = RbxPart(name="DoorBase", size=(3.571, 3.571, 3.571))
+        _process_components(FakeNode(), part)
+
+        assert part.can_collide is True, "Physical collider should keep CanCollide=True"
+        assert getattr(part, 'can_query', True) is True, "Trigger should set CanQuery=True"
+
+    def test_trigger_then_physical_keeps_collidable(self):
+        """Trigger first, then physical → CanCollide should be True."""
+        from converter.scene_converter import _process_components
+        from core.roblox_types import RbxPart
+
+        class FakeTrigger:
+            component_type = "SphereCollider"
+            properties = {"m_IsTrigger": 1, "m_Radius": 3, "m_Center": {"x": 0, "y": 0, "z": 0}}
+
+        class FakeBox:
+            component_type = "BoxCollider"
+            properties = {"m_IsTrigger": 0, "m_Size": {"x": 1, "y": 1, "z": 1}, "m_Center": {"x": 0, "y": 0, "z": 0}}
+
+        class FakeNode:
+            name = "DoorBase"
+            components = [FakeTrigger(), FakeBox()]
+            mesh_guid = None
+
+        part = RbxPart(name="DoorBase", size=(3.571, 3.571, 3.571))
+        _process_components(FakeNode(), part)
+
+        assert part.can_collide is True, "Physical collider should override trigger's CanCollide=False"
+
+
+class TestExtractPrefabMaterialMap:
+    """`_extract_prefab_material_map` reads a Unity prefab YAML and returns
+    `{GameObject name: material GUID}` so per-sub-mesh SurfaceAppearances can
+    be applied correctly when the FBX's mesh hierarchy is reconstructed from
+    `mesh_hierarchies`. The old implementation only captured the first
+    material GUID and applied it blanket-style to every sub-mesh, losing any
+    per-sub-mesh variety on multi-material models.
+    """
+
+    def test_two_gameobjects_with_different_materials(self, tmp_path):
+        from converter.scene_converter import _extract_prefab_material_map
+
+        prefab = tmp_path / "Gun.prefab"
+        prefab.write_text(
+            "--- !u!1 &11111\n"
+            "GameObject:\n"
+            "  m_Name: barrel\n"
+            "--- !u!23 &22222\n"
+            "MeshRenderer:\n"
+            "  m_GameObject: {fileID: 11111}\n"
+            "  m_Materials:\n"
+            "  - {fileID: 2100000, guid: aaaaaaaaaaaaaaaa, type: 2}\n"
+            "--- !u!1 &33333\n"
+            "GameObject:\n"
+            "  m_Name: stock\n"
+            "--- !u!23 &44444\n"
+            "MeshRenderer:\n"
+            "  m_GameObject: {fileID: 33333}\n"
+            "  m_Materials:\n"
+            "  - {fileID: 2100000, guid: bbbbbbbbbbbbbbbb, type: 2}\n"
+        )
+        name_map, fallback = _extract_prefab_material_map(prefab)
+        assert name_map == {"barrel": "aaaaaaaaaaaaaaaa",
+                            "stock": "bbbbbbbbbbbbbbbb"}
+        assert fallback == "aaaaaaaaaaaaaaaa"
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        from converter.scene_converter import _extract_prefab_material_map
+        missing = tmp_path / "does_not_exist.prefab"
+        name_map, fallback = _extract_prefab_material_map(missing)
+        assert name_map == {}
+        assert fallback is None
+
+    def test_skinned_mesh_renderer_also_counted(self, tmp_path):
+        """Rigged/skinned meshes use SkinnedMeshRenderer (class !u!137), not
+        MeshRenderer. The extractor must treat both consistently."""
+        from converter.scene_converter import _extract_prefab_material_map
+
+        prefab = tmp_path / "Rigged.prefab"
+        prefab.write_text(
+            "--- !u!1 &1\n"
+            "GameObject:\n"
+            "  m_Name: Body\n"
+            "--- !u!137 &2\n"
+            "SkinnedMeshRenderer:\n"
+            "  m_GameObject: {fileID: 1}\n"
+            "  m_Materials:\n"
+            "  - {fileID: 2100000, guid: cafecafecafecafe, type: 2}\n"
+        )
+        name_map, fallback = _extract_prefab_material_map(prefab)
+        assert name_map == {"Body": "cafecafecafecafe"}
+        assert fallback == "cafecafecafecafe"

@@ -11,6 +11,7 @@ dependencies = [
     "scikit-image>=0.21",
     "requests>=2.31",
     "anthropic>=0.40",
+    "numpy>=1.26",
 ]
 
 [project.optional-dependencies]
@@ -19,9 +20,13 @@ dev = [
     "pytest-cov>=4.0",
 ]
 
-[project.scripts]
-unity2roblox = "cli:main"
-
 [build-system]
 requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# This repo layout isn't a conventional Python package — callers rely on
+# `sys.path` shims in tests/ and on running `u2r.py` / `convert_interactive.py`
+# directly from the repo. Don't try to auto-discover modules (setuptools would
+# pick up ``tests`` and then fail when it finds no package metadata there).
+py-modules = []

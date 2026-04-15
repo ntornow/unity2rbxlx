@@ -837,5 +837,524 @@ def _is_text_yaml(path: Path) -> bool:
         return False
 
 
+@main.command("audit-assets")
+@click.argument("output_dir", type=click.Path(exists=True))
+@click.option("--api-key", type=str, default=None,
+              help="Roblox Open Cloud API key (string or path to file).")
+@click.option("--fail-on-reject", is_flag=True,
+              help="Exit non-zero if any asset is rejected.")
+def audit_assets(output_dir: str, api_key: str | None, fail_on_reject: bool) -> None:
+    """Probe every uploaded asset in conversion_context.json for moderation.
+
+    Hits the Roblox assets metadata endpoint for each `rbxassetid://NUM`
+    entry in the context and classifies the result as approved / rejected
+    / unknown. Use this to catch post-upload moderation rejections (e.g.
+    music that uploads cleanly but is blocked at runtime with HTTP 403)
+    before they leak into a published place.
+    """
+    from pathlib import Path
+    import json
+    import sys
+
+    import config
+    from roblox.cloud_api import probe_asset_availability
+    from core.conversion_context import ConversionContext
+
+    out = Path(output_dir).resolve()
+    ctx_path = out / "conversion_context.json"
+    if not ctx_path.exists():
+        click.echo(f"No conversion_context.json at {out}", err=True)
+        sys.exit(2)
+
+    if api_key:
+        ak = Path(api_key)
+        config.ROBLOX_API_KEY = (
+            ak.read_text().strip() if ak.is_file() else api_key.strip()
+        )
+    if not config.ROBLOX_API_KEY:
+        click.echo("No Roblox API key. Pass --api-key or set ROBLOX_API_KEY.", err=True)
+        sys.exit(2)
+
+    ctx = ConversionContext.load(ctx_path)
+    rejected: list[tuple[str, str]] = []
+    unknown: list[tuple[str, str]] = []
+    approved = 0
+
+    import time as _time
+    total = len(ctx.uploaded_assets)
+    click.echo(f"Probing {total} uploaded assets...")
+    for i, (key, url) in enumerate(ctx.uploaded_assets.items(), 1):
+        numeric = "".join(ch for ch in str(url) if ch.isdigit())
+        if not numeric:
+            rejected.append((key, f"{url} (non-numeric ID)"))
+            continue
+        status = probe_asset_availability(numeric, config.ROBLOX_API_KEY)
+        if status == "rejected":
+            rejected.append((key, url))
+        elif status == "unknown":
+            unknown.append((key, url))
+        else:
+            approved += 1
+        if i % 25 == 0:
+            click.echo(f"  {i}/{total}...")
+        # Throttle: Roblox Open Cloud assets endpoint rate-limits aggressively
+        # (~60 req/min for metadata reads). Sleep between calls so the sweep
+        # doesn't cascade into 429s that would get misclassified as "unknown".
+        _time.sleep(1.1)
+
+    click.echo("")
+    click.echo(f"Approved: {approved}")
+    click.echo(f"Rejected: {len(rejected)}")
+    click.echo(f"Unknown:  {len(unknown)}")
+
+    if rejected:
+        click.echo("\nRejected assets:")
+        for key, url in rejected:
+            click.echo(f"  {key} -> {url}")
+
+    report_path = out / "asset_audit.json"
+    report_path.write_text(json.dumps({
+        "approved_count": approved,
+        "rejected": [{"path": k, "url": u} for k, u in rejected],
+        "unknown": [{"path": k, "url": u} for k, u in unknown],
+    }, indent=2))
+    click.echo(f"\nReport: {report_path}")
+
+    if fail_on_reject and rejected:
+        sys.exit(1)
+
+
+@main.command("eval")
+@click.option("--output", "-o", type=click.Path(), default="./eval_output",
+              help="Directory for per-project conversion outputs.")
+@click.option("--baseline", type=click.Path(), default=None,
+              help="Path to write eval_baseline.json (default: eval_output/eval_baseline.json).")
+def eval_cmd(output: str, baseline: str | None) -> None:
+    """Convert all test projects and capture quality metrics.
+
+    Converts every populated project under ../test_projects/ with --no-upload,
+    measures structural / script / material quality metrics, and writes an
+    eval JSON file. Use `eval-diff` to compare against a previous baseline.
+    """
+    from pathlib import Path
+    import json
+    import time as _time
+    import xml.etree.ElementTree as ET
+
+    from converter.pipeline import Pipeline
+    import config
+
+    config.USE_AI_TRANSPILATION = False  # deterministic rule-based for eval
+
+    test_projects_dir = Path(__file__).parent.parent / "test_projects"
+    out_root = Path(output).resolve()
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    projects: list[tuple[str, Path]] = []
+    if test_projects_dir.is_dir():
+        for child in sorted(test_projects_dir.iterdir()):
+            if not child.is_dir():
+                continue
+            if (child / "Assets").is_dir():
+                projects.append((child.name, child))
+            else:
+                for sub in child.iterdir():
+                    if sub.is_dir() and (sub / "Assets").is_dir():
+                        projects.append((child.name, sub))
+                        break
+
+    if not projects:
+        click.echo("No populated test projects found under ../test_projects/")
+        return
+
+    click.echo(f"Evaluating {len(projects)} projects...")
+    results: dict[str, dict] = {}
+
+    for name, project_path in projects:
+        click.echo(f"\n--- {name} ---")
+        proj_out = out_root / name
+        proj_out.mkdir(parents=True, exist_ok=True)
+
+        t0 = _time.monotonic()
+        try:
+            pipeline = Pipeline(
+                unity_project_path=project_path,
+                output_dir=proj_out,
+                skip_upload=True,
+            )
+            pipeline.run_all()
+            elapsed = _time.monotonic() - t0
+
+            ctx = pipeline.ctx
+            metrics: dict[str, Any] = {
+                "status": "ok",
+                "conversion_time_s": round(elapsed, 1),
+                "total_game_objects": ctx.total_game_objects,
+                "converted_parts": ctx.converted_parts,
+                "total_scripts": ctx.total_scripts,
+                "transpiled_scripts": ctx.transpiled_scripts,
+                "script_ratio": round(ctx.transpiled_scripts / max(ctx.total_scripts, 1), 3),
+                "total_materials": ctx.total_materials,
+                "converted_materials": ctx.converted_materials,
+                "total_animations": ctx.total_animations,
+                "converted_animations": ctx.converted_animations,
+                "warnings": len(ctx.warnings),
+                "errors": len(ctx.errors),
+            }
+
+            # Parse rbxlx for structural metrics
+            rbxlx_path = proj_out / "converted_place.rbxlx"
+            if rbxlx_path.exists():
+                metrics["rbxlx_size_kb"] = round(rbxlx_path.stat().st_size / 1024, 1)
+                try:
+                    tree = ET.parse(str(rbxlx_path))
+                    classes: dict[str, int] = {}
+                    for item in tree.iter("Item"):
+                        cls = item.get("class", "")
+                        classes[cls] = classes.get(cls, 0) + 1
+
+                    metrics["parts"] = classes.get("Part", 0)
+                    metrics["mesh_parts"] = classes.get("MeshPart", 0)
+                    metrics["models"] = classes.get("Model", 0)
+                    metrics["scripts_in_rbxlx"] = (
+                        classes.get("Script", 0)
+                        + classes.get("LocalScript", 0)
+                        + classes.get("ModuleScript", 0)
+                    )
+                    metrics["sounds"] = classes.get("Sound", 0)
+                    metrics["lights"] = (
+                        classes.get("PointLight", 0)
+                        + classes.get("SpotLight", 0)
+                        + classes.get("SurfaceLight", 0)
+                    )
+
+                    # SurfaceAppearance texture coverage
+                    sa_total = sa_textured = 0
+                    for item in tree.iter("Item"):
+                        if item.get("class") == "SurfaceAppearance":
+                            sa_total += 1
+                            props = item.find("Properties")
+                            if props is not None:
+                                cm = props.find('Content[@name="ColorMap"]')
+                                url = cm.find("url") if cm is not None else None
+                                if url is not None and url.text and url.text.strip():
+                                    sa_textured += 1
+                    metrics["surface_appearances"] = sa_total
+                    metrics["sa_with_textures"] = sa_textured
+
+                    # Sounds with valid SoundId
+                    snd_ok = snd_empty = 0
+                    for item in tree.iter("Item"):
+                        if item.get("class") == "Sound":
+                            props = item.find("Properties")
+                            if props is not None:
+                                content = props.find('Content[@name="SoundId"]')
+                                url_elem = content.find("url") if content is not None else None
+                                if url_elem is not None and url_elem.text and url_elem.text.strip():
+                                    snd_ok += 1
+                                else:
+                                    snd_empty += 1
+                    metrics["sounds_with_id"] = snd_ok
+                    metrics["sounds_empty"] = snd_empty
+                except ET.ParseError as exc:
+                    metrics["rbxlx_parse_error"] = str(exc)
+
+            # Count validator fixes from conversion report
+            report_path = proj_out / "conversion_report.json"
+            if report_path.exists():
+                try:
+                    report = json.loads(report_path.read_text())
+                    metrics["validator_fixes"] = report.get("validator_fixes", 0)
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+            # Count TODO placeholders and C# residue in transpiled scripts
+            scripts_dir = proj_out / "scripts"
+            if scripts_dir.exists():
+                import re as _re
+                todo_count = 0
+                csharp_residue = 0
+                for script_file in scripts_dir.rglob("*.luau"):
+                    text = script_file.read_text(encoding="utf-8", errors="replace")
+                    todo_count += len(_re.findall(
+                        r'--\s*TODO[:\s]', text, _re.IGNORECASE,
+                    ))
+                    csharp_residue += len(_re.findall(
+                        r'\b(?:GetComponent|AddComponent|FindObjectOfType|'
+                        r'SendMessage|BroadcastMessage)\s*[<(]',
+                        text,
+                    ))
+                metrics["todo_placeholders"] = todo_count
+                metrics["csharp_residue"] = csharp_residue
+
+        except Exception as exc:
+            elapsed = _time.monotonic() - t0
+            metrics = {
+                "status": "error",
+                "conversion_time_s": round(elapsed, 1),
+                "error": str(exc),
+            }
+
+        results[name] = metrics
+        click.echo(f"  status={metrics['status']}  time={metrics.get('conversion_time_s', '?')}s")
+        if metrics["status"] == "ok":
+            click.echo(
+                f"  parts={metrics.get('parts', 0)}+{metrics.get('mesh_parts', 0)} "
+                f"scripts={metrics.get('transpiled_scripts', 0)}/{metrics.get('total_scripts', 0)} "
+                f"SA={metrics.get('sa_with_textures', 0)}/{metrics.get('surface_appearances', 0)} "
+                f"sounds={metrics.get('sounds_with_id', 0)}/{metrics.get('sounds', 0)}"
+            )
+
+    # Write results
+    baseline_path = Path(baseline) if baseline else out_root / "eval_baseline.json"
+    eval_data = {
+        "generated_at": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+        "commit": _get_git_commit(),
+        "projects": results,
+    }
+    baseline_path.write_text(json.dumps(eval_data, indent=2), encoding="utf-8")
+    click.echo(f"\nEval written to: {baseline_path}")
+
+    # Summary
+    ok = sum(1 for m in results.values() if m["status"] == "ok")
+    err = sum(1 for m in results.values() if m["status"] == "error")
+    click.echo(f"\n{ok} succeeded, {err} failed out of {len(results)} projects")
+
+
+@main.command("eval-diff")
+@click.argument("baseline", type=click.Path(exists=True))
+@click.argument("current", type=click.Path(exists=True))
+@click.option("--fail-on-regression", is_flag=True,
+              help="Exit non-zero if any metric regressed.")
+def eval_diff(baseline: str, current: str, fail_on_regression: bool) -> None:
+    """Compare two eval JSON files and report regressions/improvements.
+
+    Metrics where HIGHER is better: converted_parts, transpiled_scripts,
+    script_ratio, sa_with_textures, sounds_with_id.
+
+    Metrics where LOWER is better: errors, warnings, sounds_empty,
+    conversion_time_s.
+    """
+    import json
+
+    with open(baseline) as f:
+        base = json.load(f)
+    with open(current) as f:
+        curr = json.load(f)
+
+    higher_is_better = {
+        "converted_parts", "transpiled_scripts", "script_ratio",
+        "sa_with_textures", "sounds_with_id", "parts", "mesh_parts",
+        "scripts_in_rbxlx", "surface_appearances", "converted_materials",
+    }
+    lower_is_better = {
+        "errors", "warnings", "sounds_empty", "conversion_time_s",
+        "todo_placeholders", "csharp_residue",
+    }
+
+    regressions: list[str] = []
+    improvements: list[str] = []
+
+    base_projects = base.get("projects", {})
+    curr_projects = curr.get("projects", {})
+
+    click.echo(f"Baseline: {base.get('commit', '?')} ({base.get('generated_at', '?')})")
+    click.echo(f"Current:  {curr.get('commit', '?')} ({curr.get('generated_at', '?')})")
+    click.echo("")
+
+    all_projects = sorted(set(base_projects) | set(curr_projects))
+    for proj in all_projects:
+        bp = base_projects.get(proj, {})
+        cp = curr_projects.get(proj, {})
+
+        if not bp:
+            click.echo(f"  {proj}: NEW (not in baseline)")
+            continue
+        if not cp:
+            click.echo(f"  {proj}: MISSING (was in baseline)")
+            regressions.append(f"{proj}: missing from current eval")
+            continue
+
+        if bp.get("status") == "error" and cp.get("status") == "ok":
+            improvements.append(f"{proj}: was error, now ok")
+        elif bp.get("status") == "ok" and cp.get("status") == "error":
+            regressions.append(f"{proj}: was ok, now error: {cp.get('error', '?')}")
+            continue
+
+        diffs: list[str] = []
+        for key in sorted(set(bp) | set(cp)):
+            if key in ("status", "error", "rbxlx_parse_error", "validator_fixes"):
+                continue
+            bv = bp.get(key)
+            cv = cp.get(key)
+            if bv is None or cv is None:
+                continue
+            if not isinstance(bv, (int, float)) or not isinstance(cv, (int, float)):
+                continue
+            if bv == cv:
+                continue
+
+            delta = cv - bv
+            pct = f"{delta/abs(bv)*100:+.1f}%" if bv != 0 else "new"
+
+            if key in higher_is_better:
+                tag = "improved" if delta > 0 else "REGRESSED"
+            elif key in lower_is_better:
+                tag = "improved" if delta < 0 else "REGRESSED"
+            else:
+                tag = "changed"
+
+            line = f"    {key}: {bv} → {cv} ({pct}) [{tag}]"
+            diffs.append(line)
+            if tag == "REGRESSED":
+                regressions.append(f"{proj}.{key}: {bv} → {cv}")
+            elif tag == "improved":
+                improvements.append(f"{proj}.{key}: {bv} → {cv}")
+
+        if diffs:
+            click.echo(f"  {proj}:")
+            for d in diffs:
+                click.echo(d)
+        else:
+            click.echo(f"  {proj}: no changes")
+
+    click.echo(f"\nImprovements: {len(improvements)}")
+    click.echo(f"Regressions:  {len(regressions)}")
+
+    if regressions:
+        click.echo("\nREGRESSIONS:")
+        for r in regressions:
+            click.echo(f"  - {r}")
+
+    if fail_on_regression and regressions:
+        sys.exit(1)
+
+
+@main.command("visual-compare")
+@click.argument("unity_project", type=click.Path(exists=True))
+@click.option("--output", "-o", type=click.Path(), default="./output",
+              help="Output directory (where converted_place.rbxlx lives).")
+@click.option("--scene", type=str, default=None,
+              help="Scene path relative to project (auto-detected if omitted).")
+@click.option("--save-dir", type=click.Path(), default=None,
+              help="Directory for screenshots and diff output (default: output/comparison).")
+def visual_compare(unity_project: str, output: str, scene: str | None,
+                   save_dir: str | None) -> None:
+    """Side-by-side visual comparison: read Unity scene camera, match in Roblox Studio.
+
+    Reads the game camera position from the Unity scene file, converts it
+    to Roblox coordinates, positions Roblox Studio's camera at the
+    equivalent viewpoint, and captures screenshots from both. Then runs
+    SSIM (structural similarity) between the two images.
+
+    Requires:
+    - Unity Editor open with the project loaded (for computer-use screenshot)
+    - Roblox Studio open with converted_place.rbxlx (for MCP screen capture)
+
+    The command outputs SSIM score and saves:
+    - unity_screenshot.png — cropped Unity viewport
+    - roblox_screenshot.png — Studio viewport capture
+    - diff_heatmap.png — pixel-level difference visualization
+    """
+    from pathlib import Path
+    import json
+
+    project_path = Path(unity_project).resolve()
+    output_path = Path(output).resolve()
+    comparison_dir = Path(save_dir) if save_dir else output_path / "comparison"
+    comparison_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Step 1: Find scene and read Unity camera ---
+    if scene is None:
+        scenes = list(project_path.glob("**/*.unity"))
+        yaml_scenes = [s for s in scenes if _is_text_yaml(s)]
+        if yaml_scenes:
+            scene = str(yaml_scenes[0].relative_to(project_path))
+        else:
+            click.echo("No text YAML scenes found.")
+            return
+
+    click.echo(f"Scene: {scene}")
+
+    from comparison.screenshot_capture import (
+        get_scene_camera_info,
+        unity_camera_to_roblox,
+        generate_roblox_camera_luau,
+    )
+
+    cam_info = get_scene_camera_info(project_path, scene)
+    if not cam_info:
+        click.echo("Could not find camera in scene. Specify --scene.")
+        return
+
+    click.echo(f"Unity camera: {cam_info['name']} at {cam_info['position']}")
+
+    roblox_cam = unity_camera_to_roblox(
+        cam_info["position"],
+        cam_info.get("rotation_euler", (0, 0, 0)),
+        cam_info.get("fov", 60),
+    )
+    click.echo(f"Roblox camera: pos={roblox_cam['position']} fov={roblox_cam['fov']}")
+
+    # --- Step 2: Position Roblox Studio camera via MCP ---
+    luau_script = generate_roblox_camera_luau(
+        roblox_cam["position"],
+        roblox_cam["rotation"],
+        roblox_cam["fov"],
+    )
+    click.echo("\nRoblox camera Luau script (paste into Studio command bar or run via MCP):")
+    click.echo(f"  {luau_script.strip()}")
+
+    # --- Step 3: Save camera info for external tools ---
+    camera_data = {
+        "unity": {
+            "name": cam_info["name"],
+            "position": cam_info["position"],
+            "rotation_euler": cam_info.get("rotation_euler"),
+            "fov": cam_info.get("fov", 60),
+        },
+        "roblox": roblox_cam,
+        "luau_script": luau_script,
+    }
+    camera_path = comparison_dir / "camera_match.json"
+    camera_path.write_text(json.dumps(camera_data, indent=2), encoding="utf-8")
+    click.echo(f"\nCamera data saved: {camera_path}")
+
+    # --- Step 4: Instructions for manual capture ---
+    click.echo("\n--- Capture Instructions ---")
+    click.echo("1. In Unity: navigate Scene view to the camera position, or enter Play mode")
+    click.echo("2. In Roblox Studio: run the Luau script above in the command bar")
+    click.echo("3. Take screenshots of both viewports")
+    click.echo(f"4. Run: python3 u2r.py compare {unity_project} -o {output} --visual \\")
+    click.echo(f"     --unity-screenshot <unity.png> --roblox-screenshot <roblox.png>")
+
+    # --- Step 5: If screenshots already exist, run SSIM ---
+    unity_img = comparison_dir / "unity_screenshot.png"
+    roblox_img = comparison_dir / "roblox_screenshot.png"
+    if unity_img.exists() and roblox_img.exists():
+        click.echo("\nFound existing screenshots — running SSIM comparison...")
+        from comparison.visual_diff import compare_images
+        results = compare_images(
+            str(unity_img), str(roblox_img),
+            output_dir=str(comparison_dir),
+        )
+        if results:
+            click.echo(f"  SSIM: {results.get('ssim', 'N/A')}")
+            click.echo(f"  Diff saved: {comparison_dir / 'diff_heatmap.png'}")
+
+
+def _get_git_commit() -> str:
+    """Return the current short git commit hash, or 'unknown'."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout.strip() if result.returncode == 0 else "unknown"
+    except Exception:
+        return "unknown"
+
+
 if __name__ == "__main__":
     main()
