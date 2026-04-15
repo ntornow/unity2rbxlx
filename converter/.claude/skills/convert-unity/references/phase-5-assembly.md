@@ -15,16 +15,13 @@ Screen every asset in `AssetManifest` (built by Phase 2) against the standards b
 | 3 | Restricted Content Policy | https://en.help.roblox.com/hc/en-us/articles/15869919570708-Restricted-Content-Policy |
 | 4 | Content Maturity Labels | https://en.help.roblox.com/hc/en-us/articles/8862768451604-Content-Maturity-Labels |
 | 5 | Content Maturity & Compliance (creator docs) | https://create.roblox.com/docs/production/promotion/content-maturity |
-| 6 | Advertising Standards | https://en.help.roblox.com/hc/en-us/articles/13722260778260-Advertising-Standards |
-| 7 | Roblox Terms of Use | https://en.help.roblox.com/hc/en-us/articles/115004647846-Roblox-Terms-of-Use |
-| 8 | Creator Store distribution rules | https://github.com/Roblox/creator-docs/blob/main/content/en-us/production/creator-store.md |
-| 9 | Audio asset rules | https://github.com/Roblox/creator-docs/blob/main/content/en-us/audio/assets.md |
+| 6 | Roblox Terms of Use | https://en.help.roblox.com/hc/en-us/articles/115004647846-Roblox-Terms-of-Use |
 
 Fetch live pages if online; fall back to the summary below if a page is unreachable. Never skip screening because a fetch failed.
 
 ### Summary (authoritative defaults)
 
-Roblox organises its Community Standards into four pillars, plus a maturity tier system and layered Terms of Use / DMCA / Advertising rules. All apply to uploaded assets (images, meshes, audio, scripts, text, filenames).
+Roblox organises its Community Standards into four pillars, plus a maturity tier system and layered Terms of Use / DMCA rules. All apply to uploaded assets (images, meshes, audio, scripts, text, filenames).
 
 - **Safety** — no content sexualising or endangering minors (CSAM is an absolute block); no glorification of real-world violence, terrorism, self-harm, or illegal drugs.
 - **Civility** — no hate speech, slurs, or dehumanising content targeting protected classes; no harassment or doxxing.
@@ -32,7 +29,6 @@ Roblox organises its Community Standards into four pillars, plus a maturity tier
 - **Security** — no PII leaks, no credential / cookie / token exfiltration patterns in scripts, no pushing users off-platform.
 - **Maturity tiers** — Minimal / Mild / Moderate / Restricted. Strong realistic violence, heavy gore, romantic themes, alcohol, and strong language require the 17+ Restricted tier.
 - **Never allowed at any tier:** CSAM, sexual content with minors, real hate symbols, glorification of mass violence, real PII exposure, IP infringement.
-- **Advertising assets** (decals used as thumbnails, icons, banners) carry the strictest bar regardless of the experience's own tier.
 
 ### Per-kind screening
 
@@ -48,7 +44,7 @@ For each asset emit one of:
 - `WARNING` — borderline (ambiguous brand logo, stylised weapon, mild language). Requires human review.
 - `VIOLATION` — clearly offending under the standards above.
 
-Every `WARNING` / `VIOLATION` must cite the pillar (Safety / Civility / Integrity / Security / Maturity / Advertising / ToU-DMCA) and the source-document row from the table above.
+Every `WARNING` / `VIOLATION` must cite the pillar (Safety / Civility / Integrity / Security / Maturity / ToU-DMCA) and the source-document row from the table above.
 
 ### Report
 
