@@ -438,13 +438,48 @@ class Pipeline:
         # textures get their alpha channel preserved; everything else is
         # stripped to RGB to prevent spurious transparency from mask
         # channels (roughness/metalness/specular packed into alpha).
+        #
+        # upload_assets runs BEFORE convert_materials, so we can't use the
+        # full material_mappings. Instead, scan every .mat file in the
+        # project and flag textures referenced by materials whose shader
+        # fileID is a legacy cutout/transparent variant, or whose _Mode
+        # is Cutout/Fade/Transparent.
         alpha_texture_paths: set[str] = set()
-        if self.state.material_mappings:
-            for mapping in self.state.material_mappings.values():
-                if getattr(mapping, "alpha_mode", "Overlay") != "Overlay":
-                    cmp = getattr(mapping, "color_map_path", None)
-                    if cmp and not cmp.startswith("rbxassetid://"):
-                        alpha_texture_paths.add(str(Path(cmp).resolve()))
+        if self.state.guid_index:
+            import re as _re
+            from converter.material_mapper import (
+                _BUILTIN_CUTOUT_SHADER_IDS,
+                _BUILTIN_TRANSPARENT_SHADER_IDS,
+            )
+            for mat_file in self.unity_project_path.rglob("*.mat"):
+                try:
+                    text = mat_file.read_text(errors="replace")
+                except OSError:
+                    continue
+                # Shader fileID check
+                sm = _re.search(r"m_Shader:\s*\{fileID:\s*(\d+)", text)
+                shader_id = int(sm.group(1)) if sm else 0
+                is_transparent = (
+                    shader_id in _BUILTIN_CUTOUT_SHADER_IDS
+                    or shader_id in _BUILTIN_TRANSPARENT_SHADER_IDS
+                )
+                # _Mode check for Standard/URP/HDRP
+                if not is_transparent:
+                    mm = _re.search(r"-\s*_Mode:\s*(\d+)", text)
+                    if mm and int(mm.group(1)) > 0:
+                        is_transparent = True
+                if not is_transparent:
+                    continue
+                # Record every color-map texture referenced by this material
+                for tex_key in ("_MainTex", "_BaseMap", "_BaseColorMap"):
+                    tm = _re.search(
+                        rf"- {tex_key}:\s*\n\s+m_Texture:\s*\{{fileID:\s*\d+,\s*guid:\s*([0-9a-f]+)",
+                        text,
+                    )
+                    if tm:
+                        tex_path = self.state.guid_index.resolve(tm.group(1))
+                        if tex_path:
+                            alpha_texture_paths.add(str(tex_path.resolve()))
 
         # Collected for a post-upload moderation audit. We probe only newly
         # uploaded assets (not cached entries from a previous run) so the
