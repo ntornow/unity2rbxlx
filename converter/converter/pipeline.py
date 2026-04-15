@@ -535,18 +535,6 @@ class Pipeline:
                         self.ctx.asset_upload_errors.append(rel)
                         continue
 
-                # Mirror textures left-to-right before upload to compensate
-                # for the Unity (left-handed) → Roblox (right-handed) UV
-                # traversal flip. Without this, text/logos on FBX meshes
-                # read backwards (e.g., "SEA"/"SECTOR" on SF_Door).
-                if kind == "texture":
-                    try:
-                        from utils.image_processing import flip_image_horizontal
-                        flipped_path = convert_dir / (asset.path.stem + "_flipped.png")
-                        upload_path = flip_image_horizontal(upload_path, flipped_path, preserve_alpha=needs_alpha)
-                    except Exception as exc:
-                        log.warning("[upload_assets] Failed to flip %s: %s", asset.path.name, exc)
-
                 result = uploader(upload_path, api_key, creator_id, creator_type, name)
                 if result:
                     uploaded[rel] = f"rbxassetid://{result}"

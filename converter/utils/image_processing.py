@@ -165,42 +165,6 @@ def convert_to_png(
     return output_path
 
 
-def flip_image_horizontal(
-    image_path: str | Path,
-    output_path: str | Path,
-    preserve_alpha: bool = False,
-) -> Path:
-    """Mirror an image left-to-right (flip along the X axis).
-
-    Used to compensate for the Unity↔Roblox handedness difference on
-    textures that contain directional content (text, logos, asymmetric
-    decals). Unity renders the FBX in a left-handed coordinate system;
-    when the same FBX+texture is re-rendered in Roblox's right-handed
-    system, the UVs trace across the texture in the opposite direction,
-    so asymmetric content appears mirrored. Pre-flipping the texture
-    cancels out that mirroring.
-
-    If ``preserve_alpha`` is False (default) the alpha channel is
-    dropped — see ``convert_to_png`` for why this is the safe default.
-    """
-    image_path = Path(image_path)
-    output_path = Path(output_path)
-    if _is_lfs_pointer(image_path):
-        raise OSError(f"Git LFS pointer (not actual image data): {image_path.name}")
-
-    img = Image.open(image_path)
-    flipped = img.transpose(Image.FLIP_LEFT_RIGHT)
-
-    if not preserve_alpha and flipped.mode == "RGBA":
-        flipped = flipped.convert("RGB")
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    flipped.save(output_path)
-
-    logger.info("Flipped %s -> %s", image_path.name, output_path.name)
-    return output_path
-
-
 def resize_image(
     image_path: str | Path,
     max_size: int | Tuple[int, int],
