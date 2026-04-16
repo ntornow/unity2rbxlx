@@ -222,6 +222,147 @@ def _screen_audio_filename(name: str, relative_path: str) -> ModerationFinding |
     return None
 
 
+def _screen_image_content(
+    image_paths: list[tuple[Path, str]],
+    batch_size: int = 20,
+) -> list[ModerationFinding]:
+    """Screen image files for inappropriate content using Claude vision.
+
+    Sends batches of images to the Anthropic API for content analysis.
+    Returns findings for any images flagged as problematic.
+    """
+    import config
+
+    api_key = config.ANTHROPIC_API_KEY
+    if not api_key:
+        log.warning("[moderate_assets] No ANTHROPIC_API_KEY — skipping image content screening")
+        return []
+
+    try:
+        import anthropic
+    except ImportError:
+        log.warning("[moderate_assets] anthropic package not installed — skipping image content screening")
+        return []
+
+    client = anthropic.Anthropic(api_key=api_key)
+    model = getattr(config, "ANTHROPIC_MODEL", "claude-sonnet-4-6")
+    findings = []
+
+    for batch_start in range(0, len(image_paths), batch_size):
+        batch = image_paths[batch_start:batch_start + batch_size]
+
+        # Build content blocks: each image + its filename
+        content = []
+        filenames = []
+        for img_path, rel_path in batch:
+            try:
+                import base64
+                img_data = img_path.read_bytes()
+                # Determine media type
+                suffix = img_path.suffix.lower()
+                media_map = {
+                    ".png": "image/png", ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg", ".gif": "image/gif",
+                    ".webp": "image/webp", ".bmp": "image/bmp",
+                }
+                media_type = media_map.get(suffix)
+                if not media_type:
+                    # Convert non-standard formats to PNG
+                    try:
+                        from PIL import Image
+                        import io
+                        img = Image.open(img_path)
+                        buf = io.BytesIO()
+                        img.convert("RGBA").save(buf, format="PNG")
+                        img_data = buf.getvalue()
+                        media_type = "image/png"
+                    except Exception:
+                        continue
+
+                b64 = base64.b64encode(img_data).decode()
+                # Skip very large images (>5MB encoded)
+                if len(b64) > 5_000_000:
+                    continue
+                content.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": b64,
+                    },
+                })
+                content.append({
+                    "type": "text",
+                    "text": f"Image {len(filenames) + 1}: {rel_path}",
+                })
+                filenames.append(rel_path)
+            except Exception as exc:
+                log.debug("Failed to read image %s: %s", rel_path, exc)
+                continue
+
+        if not content:
+            continue
+
+        content.append({
+            "type": "text",
+            "text": (
+                "You are a content moderator for Roblox, a platform used by children. "
+                "Review each image above for violations of Roblox Community Standards. "
+                "Flag any image containing: nudity or sexual content, realistic violence "
+                "or gore, hate symbols, real-world weapons designed to look realistic, "
+                "drug use, or any content inappropriate for children.\n\n"
+                "For each image, respond with EXACTLY one line in the format:\n"
+                "IMAGE_NUMBER|CLASSIFICATION|REASON\n"
+                "Where CLASSIFICATION is OK, WARNING, or VIOLATION.\n"
+                "Example: 1|OK|Game character sprite, appropriate\n"
+                "Example: 3|VIOLATION|Contains nudity\n"
+                "Only output the lines, nothing else."
+            ),
+        })
+
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=1024,
+                messages=[{"role": "user", "content": content}],
+            )
+            result_text = response.content[0].text.strip()
+
+            for line in result_text.split("\n"):
+                line = line.strip()
+                if not line or "|" not in line:
+                    continue
+                parts = line.split("|", 2)
+                if len(parts) < 3:
+                    continue
+                try:
+                    idx = int(parts[0].strip()) - 1
+                except (ValueError, IndexError):
+                    continue
+                classification = parts[1].strip().upper()
+                reason = parts[2].strip()
+
+                if classification in ("WARNING", "VIOLATION") and 0 <= idx < len(filenames):
+                    findings.append(ModerationFinding(
+                        relative_path=filenames[idx],
+                        kind="texture",
+                        classification=classification,
+                        standards=["Safety"],
+                        evidence=reason,
+                        source_document="#1",
+                    ))
+
+            log.info(
+                "[moderate_assets] Image batch %d-%d: screened %d images",
+                batch_start + 1, batch_start + len(batch), len(filenames),
+            )
+
+        except Exception as exc:
+            log.warning("[moderate_assets] Image screening API call failed: %s", exc)
+
+    return findings
+
+
 def moderate_assets(
     manifest,  # AssetManifest
     project_name: str,
@@ -239,6 +380,9 @@ def moderate_assets(
     """
     report = ModerationReport(project=project_name)
 
+    # Collect texture paths for vision-based screening
+    texture_paths: list[tuple[Path, str]] = []
+
     for asset in manifest.assets:
         rel = str(asset.relative_path)
         kind = asset.kind
@@ -253,6 +397,10 @@ def moderate_assets(
                 relative_path=rel, kind=kind, classification="OK",
                 standards=[], evidence="", source_document="",
             ))
+
+        # Collect textures for image content screening
+        if kind == "texture":
+            texture_paths.append((asset.path, rel))
 
         # Audio-specific: copyrighted song detection
         if kind == "audio":
@@ -273,6 +421,13 @@ def moderate_assets(
                     relative_path=rel, kind="script", classification="OK",
                     standards=[], evidence="", source_document="",
                 ))
+
+    # Vision-based image content screening
+    if texture_paths:
+        log.info("[moderate_assets] Screening %d texture images via Claude vision...", len(texture_paths))
+        image_findings = _screen_image_content(texture_paths)
+        for f in image_findings:
+            report.add(f)
 
     return report
 
