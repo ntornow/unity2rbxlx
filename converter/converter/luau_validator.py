@@ -3014,6 +3014,19 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         )
         fixes.append("Added Rifle Model fallback for missing riflePrefab field reference")
 
+    # When the riflePrefab attribute isn't set (returns nil), the script
+    # never reaches FindFirstChild. Add a child-lookup fallback after
+    # the attribute-based lookup so the prefab is found as a child of
+    # the parent part.
+    _attr_lookup = 'if riflePrefabName then\n        riflePrefab = workspace:FindFirstChild(riflePrefabName, true)\n    end'
+    _child_fallback = '    if not riflePrefab then\n        riflePrefab = parent:FindFirstChild("riflePrefab")\n    end'
+    if _attr_lookup in source and _child_fallback not in source:
+        source = source.replace(
+            _attr_lookup,
+            _attr_lookup + '\n' + _child_fallback,
+        )
+        fixes.append("Added riflePrefab child-lookup fallback when attribute not set")
+
     # Fix incomplete Model equip patterns: when a Model is cloned and
     # parented to a Part (weapon slot), its children are unanchored at
     # (0,0,0) and don't follow the parent. Inject proper PivotTo + Weld.
@@ -4784,6 +4797,16 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
 
     # Camera and movement fixes are handled by the AI transpiler prompt.
     # See code_transpiler.py _AI_SYSTEM_PROMPT for ESC key, camera, and UI guidance.
+
+    # Fix W/S movement direction: Unity uses +Z for forward, but in Roblox
+    # the camera faces -Z. Input direction vectors that map W→+Z need the
+    # Z component negated so W moves the player forward (toward -Z).
+    if 'return Vector3.new(right, 0, forward)' in source:
+        source = source.replace(
+            'return Vector3.new(right, 0, forward)',
+            'return Vector3.new(right, 0, -forward)',
+        )
+        fixes.append("Negated forward in movement direction (Unity +Z forward → Roblox -Z forward)")
 
     # .time property on VFX/particle instances → comment out
     if re.search(r'\w+\.time\s*=\s*[\d.]', source):
