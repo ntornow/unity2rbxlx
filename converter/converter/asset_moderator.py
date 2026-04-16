@@ -19,6 +19,11 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+try:
+    import anthropic as _anthropic
+except ImportError:
+    _anthropic = None  # type: ignore[assignment]
+
 log = logging.getLogger(__name__)
 
 
@@ -84,12 +89,12 @@ class ModerationReport:
 _SLUR_PATTERNS: list[re.Pattern] = [
     re.compile(p, re.IGNORECASE)
     for p in [
-        r"\bn[i1]gg(?:er|a|az)\b",
-        r"\bf[a@]gg?(?:ot|it)\b",
-        r"\bk[i1]ke\b",
-        r"\bsp[i1]c[ks]?\b",
-        r"\bch[i1]nk\b",
-        r"\bretard(?:ed)?\b",
+        r"(?:^|[^a-zA-Z])n[i1]gg(?:er|a|az|as)s?(?:[^a-zA-Z]|$)",
+        r"(?:^|[^a-zA-Z])f[a@]gg?(?:ot|it)(?:[^a-zA-Z]|$)",
+        r"(?:^|[^a-zA-Z])k[i1]ke(?:[^a-zA-Z]|$)",
+        r"(?:^|[^a-zA-Z])sp[i1]c[ks]?(?:[^a-zA-Z]|$)",
+        r"(?:^|[^a-zA-Z])ch[i1]nk(?:[^a-zA-Z]|$)",
+        r"(?:^|[^a-zA-Z])retard(?:ed)?(?:[^a-zA-Z]|$)",
     ]
 ]
 
@@ -238,13 +243,11 @@ def _screen_image_content(
         log.warning("[moderate_assets] No ANTHROPIC_API_KEY — skipping image content screening")
         return []
 
-    try:
-        import anthropic
-    except ImportError:
+    if _anthropic is None:
         log.warning("[moderate_assets] anthropic package not installed — skipping image content screening")
         return []
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = _anthropic.Anthropic(api_key=api_key)
     model = getattr(config, "ANTHROPIC_MODEL", "claude-sonnet-4-6")
     findings = []
 
