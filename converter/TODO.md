@@ -246,19 +246,17 @@ the full list of what was removed.
   bridges, these implement genuinely stateful per-entity runtime behavior
   and cannot be flattened into a single-call inline translation — the
   question is which *module* owns them, not whether a module is needed.
-- [ ] **P1 — Rewrite phase-3 commit `10c786c` on `origin/merge-phase3` to
-  drop bridge injection.** The phase-3 wiring commit imports `bridge_injector`
-  and installs a `detect_needed_bridges`/`inject_bridges` try-except block at
-  `converter/converter/pipeline.py` lines 1843–1859. After the deletions in
-  this branch, that block references a module that no longer exists and the
-  two bridge-related test files (`test_bridge_injector.py`,
-  `test_runtime_bridges.py`) are now dead additions. Action: either drop
-  `10c786c` entirely or rewrite it to preserve the other six pieces
-  (`rbxl_binary_writer` wiring, `report_generator`, `scriptable_object_converter`,
-  `sprite_extractor`, `cloud_api` content-type auto-detection, CI `lz4`
-  dependency) while removing the bridge-injection hunk + the two bridge
-  test files. Belongs as its own branch operation on `merge-phase3`, not on
-  phase 2.
+- [x] **P1 — Rewrite phase-3 commit `10c786c` on `origin/merge-phase3` to
+  drop bridge injection.** Closed 2026-04-17 by abandoning the branch
+  and landing the six wanted pieces as fresh commits on main against
+  current pipeline.py. See `docs/design/merge-plan-phase-3-augmented.md`
+  for the full audit of Phase 3's 12 items. Landed: binary writer wiring
+  + content-type auto-detect + `lz4` dep (item 6), report_generator
+  adoption (item 7), sprite_extractor wiring (item 3),
+  scriptable_object_converter wiring + disk persistence (item 5),
+  rehydration reads `conversion_plan.json` (item 12), mesh_splitter
+  deletion (item 4). The `merge-phase3` branch is now obsolete and
+  should be deleted.
 - [ ] **P2 — `Input.GetSwipe` has no test-project coverage yet.** The
   `getSwipe()` utility is implemented and has a unit test, but none of the 9
   test projects actually use touch/swipe input, so the end-to-end path
@@ -266,3 +264,37 @@ the full list of what was removed.
   unverified against a real game. Action: either add a minimal touch-input
   fixture to a test project, or accept that GetSwipe is speculative
   infrastructure until a mobile Unity game shows up in the eval set.
+
+## Phase 3 merge plan — deferred items (2026-04-17 session)
+
+The Phase 3 plan at
+`https://github.com/jiazou/unity-roblox-game-converter/blob/main/MERGE_PLAN.md`
+has 12 items; 6 landed in this session, 2 were closed as superseded
+(items 1 and 8), and the following 4 are deferred. See
+`docs/design/merge-plan-phase-3-augmented.md` for the full audit.
+
+- [ ] **P2 — Phase 3 item 2: Vertex color baking.** Module
+  (`converter/vertex_color_baker.py`, 572 LOC) exists but is unwired.
+  Real gap — vertex-color-only materials currently fall back to Color3
+  or default gray (documented in `phase-3-materials.md` lines 35-37).
+  Needs a discovery pass first: which of the 9 test projects actually
+  have vertex-color-only materials? Without a project that exercises it,
+  wiring is unsafe. Action: audit `.mat` files across test projects for
+  `colors:` vertex-color references with no albedo texture; if any
+  project hits, add a `uses_vertex_colors` flag to `MaterialMapping`
+  and invoke `bake_vertex_colors_batch` after `convert_materials`.
+- [ ] **P2 — Phase 3 item 9: `extract_serialized_field_refs()`.** Not
+  ported. Was a dependency of item 10 (prefab packages). Defer with
+  item 10.
+- [ ] **P2 — Phase 3 item 10: `generate_prefab_packages()`.** Not
+  ported. Current approach uses in-memory `prefab_library` + inline
+  prefab expansion; per-prefab packages (for ReplicatedStorage/Templates
+  cloning) would enable runtime prefab spawning but need an architecture
+  pass — where do packages live, how does the spawner script reference
+  them, how does cross-scene prefab reuse work. Not in Phase 3 scope;
+  revisit when a test project requires runtime prefab spawning.
+- [ ] **P3 — Phase 3 item 11: disk rewrite for `animation_data/`,
+  `packages/`.** Partial — Phase 3 item 5's
+  `scripts/scriptable_objects/` directory is now handled by the
+  existing `rglob("*.luau")` walk. `animation_data/` already exists.
+  `packages/` depends on item 10 landing first.
