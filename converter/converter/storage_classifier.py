@@ -1,34 +1,27 @@
 """
-storage_classifier.py -- Phase 4a.5: explicit server/client/replicated storage decisions.
+storage_classifier.py -- Phase 4a.5: server/client/replicated container assignment.
 
-Unity has no inherent networking model — all code and assets live in one process.
-Roblox replicates data between server and client, so every module and every
-template must be placed in a container that reflects who needs to read it.
+Unity has no networking model; Roblox replicates between server and client.
+Every module needs an explicit container. This module answers, per script:
 
-This module answers the three networking questions explicitly:
+1. Does the server need it?
+2. Does the client need it?
+3. Do both need it?
 
-1. Does the server need this?
-2. Does the client need this?
-3. Do both need this?
+Output: a StoragePlan with a concrete parent_path on each RbxScript.
+rbxlx_writer.py and luau_place_builder.py route by parent_path.
 
-...for every converted script, producing a StoragePlan that assigns each script
-a concrete parent_path. Downstream (rbxlx_writer.py, luau_place_builder.py)
-routes each script to its assigned container.
+Rules (first match wins):
 
-Decision rules (first match wins):
+  - client-only API surface       -> StarterPlayerScripts (LocalScript)
+  - character-attached            -> StarterCharacterScripts (LocalScript)
+  - name hint *Loading* / *Boot*  -> ReplicatedFirst
+  - ModuleScript reached by client -> ReplicatedStorage
+  - ModuleScript only server      -> ServerStorage
+  - otherwise                     -> ServerScriptService
 
-  Scripts:
-    - client-only API surface                -> StarterPlayerScripts (LocalScript)
-    - character-attached per scene wiring    -> StarterCharacterScripts (LocalScript)
-    - name hint *Loading* / *Boot* / *Splash* and runs pre-replication
-                                             -> ReplicatedFirst
-    - ModuleScript required by any client    -> ReplicatedStorage
-    - ModuleScript required only by servers  -> ServerStorage
-    - everything else                        -> ServerScriptService
-
-  Ambiguity: default to ReplicatedStorage over ServerStorage. Misplacing into
-  ReplicatedStorage degrades security; misplacing into ServerStorage breaks the
-  game. The survivable default is ReplicatedStorage.
+Ambiguity: default to ReplicatedStorage. Misplacing into ReplicatedStorage
+degrades security; misplacing into ServerStorage breaks the game.
 """
 
 from __future__ import annotations
