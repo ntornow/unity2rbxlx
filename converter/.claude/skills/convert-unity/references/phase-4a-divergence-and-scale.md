@@ -1,8 +1,10 @@
-# Phase 4.5b/c: Platform Divergence & Scale
+# Phase 4a.2: Platform Divergence & Scale
 
-> **Last verified:** 2026-04-12 against commit `e19a342`. Some prescriptions may be stale — cross-check against the current `luau_validator.py` and `api_mappings.py` before acting on them. See the 2026-04-12 audit in TODO.md for known discrepancies.
+> **Last verified:** 2026-04-16. Cross-check against current `luau_validator.py` and `api_mappings.py` before acting on prescriptions.
 
 Unity is a blank canvas — no character, camera, input, or physics until you write them. Roblox provides defaults for all of these. For each pillar below, ask: **"Does the Unity game do this itself?"** Then: **"Does Roblox's default do the same thing, or must we override it?"**
+
+Decisions made here feed the bootstrap plan (4a.4) and dictate which scripts become LocalScripts in StarterPlayerScripts (4a.5).
 
 ## Pillars
 
@@ -46,26 +48,22 @@ Unity uses 1 unit ≈ 1 meter. Roblox uses studs (1 stud ≈ 0.28 m). The pipeli
 5. Pass `groundY` and any original Unity positioning constants through to the controllers (do not rescale the constants — the world is already at Unity scale).
 6. Scale camera offset proportionally.
 7. Scale world-space UI geometry (road widths, lane stripes, etc.) to match Unity's source values.
-8. **Do NOT scale runtime-spawned content by default.** Both the character (now scaled down) and converted world geometry are at Unity scale. Cloned templates from ReplicatedStorage are already correct. Scaling them by the character factor makes them too small. Only scale spawned content if the Unity game explicitly scales instantiated objects in code. Note: `Model:ScaleTo()` only works on Models, not individual BaseParts. If needed:
-   ```lua
-   if clone:IsA("Model") then clone:ScaleTo(SCALE)
-   elseif clone:IsA("BasePart") then clone.Size = clone.Size * SCALE end
-   ```
+8. **Do NOT scale runtime-spawned content by default.** Cloned templates from ReplicatedStorage are already correct. Scaling them by the character factor makes them too small. Only scale spawned content if the Unity game explicitly scales instantiated objects in code. Note: `Model:ScaleTo()` only works on Models, not individual BaseParts.
 
 ## Pipeline details
 
-**World-space computation.** Unity stores transforms as local-space. The pipeline computes world-space recursively in `converter/scene_converter.py` via the `node_to_part()` recursion that threads parent transforms through the scene tree. The formula: `world_pos = parent_pos + parent_rot * local_pos`; `world_rot = parent_rot * local_rot`; `world_scale = parent_scale × node_scale`. The Unity → Roblox axis flip (`(x, y, z)` → `(x, y, -z)`; quaternion `(qx, qy, qz, qw)` → `(-qx, -qy, qz, qw)`) lives in `core/coordinate_system.py`. If objects cluster at the origin, check that root-level scene nodes start with parent position `(0, 0, 0)` and identity rotation `(0, 0, 0, 1)`.
+**World-space computation.** Unity stores transforms as local-space. The pipeline computes world-space recursively in `converter/scene_converter.py` via `node_to_part()`. The formula: `world_pos = parent_pos + parent_rot * local_pos`; `world_rot = parent_rot * local_rot`; `world_scale = parent_scale × node_scale`. The axis flip lives in `core/coordinate_system.py`. If objects cluster at the origin, check root-level scene nodes start with parent position `(0, 0, 0)` and identity rotation `(0, 0, 0, 1)`.
 
-**FBX bounding box sizing.** MeshPart sizes are derived from FBX bounds (see `converter/mesh_processor.py`), scaled by the FBX `UnitScaleFactor` and Unity's `.fbx.meta` settings (`globalScale`, `useFileScale`). Three things must be right:
-- **UnitScaleFactor** — stored in the FBX binary; `1.0` ≈ cm (scale ×0.01), `100.0` ≈ m (scale ×1.0).
+**FBX bounding box sizing.** MeshPart sizes are derived from FBX bounds (`converter/mesh_processor.py`), scaled by FBX `UnitScaleFactor` and Unity's `.fbx.meta` (`globalScale`, `useFileScale`). Three things must be right:
+- **UnitScaleFactor** — in FBX binary; `1.0` ≈ cm (scale ×0.01), `100.0` ≈ m (scale ×1.0).
 - **Unity import scale** — `useFileScale=1` → `globalScale × USF/100`; `useFileScale=0` → `globalScale` alone.
-- **Parent scale chain** — non-unit parent scales accumulate. If a mesh is at correct position but wrong size, walk its hierarchy for non-unit scales.
+- **Parent scale chain** — non-unit parent scales accumulate. If mesh is at correct position but wrong size, walk hierarchy for non-unit scales.
 
-**Decoration positions are baked into prefabs — preserve them faithfully.** Artists pre-position all decoration children at specific local offsets. There is no runtime repositioning at the decoration level. Never override or "fix" these positions in pipeline output. If decorations appear to block the play area, the root cause is elsewhere (camera angle, character scale, mesh orientation) — not the baked positions.
+**Decoration positions are baked into prefabs — preserve them faithfully.** Never override or "fix" these positions. If decorations block the play area, root cause is elsewhere (camera, scale, mesh orientation).
 
 ## Mesh facing direction
 
-The pipeline passes positions and rotations 1:1 (with the axis flip). FBX meshes are uploaded as-is; Unity is left-handed Y-up (Z-forward), Roblox is right-handed Y-up. Mesh geometry baked into the FBX may face the wrong direction.
+FBX meshes are uploaded as-is; Unity is left-handed Y-up (Z-forward), Roblox is right-handed Y-up. Mesh geometry baked into the FBX may face the wrong direction.
 
 After conversion, visually verify decoration meshes. If objects face the wrong way, apply a 180° Y-axis rotation at spawn time:
 
@@ -75,8 +73,19 @@ local rot = (desc.CFrame - desc.CFrame.Position) * Y_FLIP
 desc.CFrame = CFrame.new(pos) * rot
 ```
 
-**This is not always needed — it depends on how the original meshes were authored. Test visually before applying.**
+**Not always needed — depends on how meshes were authored. Test visually before applying.**
 
-## Decision output
+## Output
 
-The agent decides the override approach for each pillar and the scale strategy based on the factors above, then applies them in the bootstrap (see `phase-4.5-module-rewrite.md`).
+`divergence_overrides` in `conversion_plan.json`:
+
+```
+divergence_overrides:
+  character: { mode: "humanoid_default" | "custom_controller" | "non_humanoid" | "none" }
+  camera:    { mode: "orbit_default" | "fixed" | "rail" | "topdown" | "isometric" }
+  input:     { mode: "default_wasd" | "auto_run" | "on_rails" | "grid" | "vehicle" }
+  scale:     { strategy: "char_down" | "world_up" | "hybrid", factor: float }
+  mesh_facing: { apply_y_flip: bool }
+```
+
+The agent decides each override based on the Unity code it read. These decisions feed the bootstrap emit in 4c.

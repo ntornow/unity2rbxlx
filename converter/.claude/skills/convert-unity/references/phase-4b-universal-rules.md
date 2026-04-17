@@ -1,13 +1,13 @@
-# Phase 4.5d/e: Universal Rules
+# Phase 4b.1: Universal Rules
 
-> **Last verified:** 2026-04-12 against commit `e19a342`. Some prescriptions may be stale — cross-check against the current `luau_validator.py` and `api_mappings.py` before acting on them. See the 2026-04-12 audit in TODO.md for known discrepancies.
+> **Last verified:** 2026-04-16. Cross-check against current `luau_validator.py` and `api_mappings.py` before acting on prescriptions.
 
-These rules apply to every module in a converted Roblox game. Internalize them before writing any Luau.
+These rules apply to every Luau module the transpiler emits. Feed them into the transpile prompt / ruleset — not as post-hoc fixes.
 
 ## Game loop wiring
 
 - Unity implicitly calls `Update()`, `FixedUpdate()`, `LateUpdate()` on all active MonoBehaviours every frame.
-- Roblox has no implicit per-frame callbacks. A method named `Update()` that isn't connected to anything will **never execute**.
+- Roblox has no implicit per-frame callbacks. A method named `Update()` that isn't connected **never executes**.
 - **Always override.** Add `RunService.Heartbeat:Connect(function(dt) obj:Update(dt) end)`. Without this, the game appears frozen — no movement, spawning, or scoring. Disconnect in cleanup paths (`End`, `OnDisable`, `Destroy`).
 
 ## Threading and yielding
@@ -36,7 +36,7 @@ Roblox Parts **silently fail to render** if any dimension exceeds 2048 studs. No
 - **Unity:** objects are invisible unless they have a MeshRenderer, SkinnedMeshRenderer, or SpriteRenderer. A typical scene has dozens of invisible script containers, triggers, audio sources, managers.
 - **Roblox:** every Part is visible by default. A Part with no mesh renders as an opaque gray block.
 
-The pipeline MUST set `Transparency = 1` on every converted Part that lacks a renderer. The full set of visibility rules (enforced in `converter/scene_converter.py`):
+The pipeline MUST set `Transparency = 1` on every converted Part that lacks a renderer. Full visibility rules (enforced in `converter/scene_converter.py`):
 
 1. **No renderer, no mesh** → `Transparency=1, CanCollide=false` (script containers, empty transforms, managers).
 2. **Trigger colliders** (`isTrigger=true`) → `Transparency=1`.
@@ -44,16 +44,16 @@ The pipeline MUST set `Transparency = 1` on every converted Part that lacks a re
 4. **Disabled renderers** (`m_Enabled=0`) → `Transparency=1`.
 5. **UI subtrees** (Canvas hierarchies) → filtered out of the 3D hierarchy, converted to ScreenGui by `converter/ui_translator.py`.
 
-**Visibility is per-node, not inherited.** The pipeline checks each node independently. A parent without a renderer gets `Transparency=1`, but its children with renderers stay visible. This matches Unity's behavior. Do NOT add workarounds that force child MeshParts visible.
+**Visibility is per-node, not inherited.** A parent without a renderer gets `Transparency=1`, but its children with renderers stay visible. Matches Unity's behavior. Do NOT add workarounds that force child MeshParts visible.
 
 **Diagnostic for opaque gray rectangles blocking the view:** check (1) SpriteRenderer nodes not hidden, (2) Quad/Plane primitives not hidden, (3) MeshLoader race condition.
 
 ## Asset loading (mesh strategies)
 
-`MeshId` is read-only at runtime. u2r supports two strategies for getting mesh geometry into the published place — see `references/upload-patching.md` for full detail.
+`MeshId` is read-only at runtime. u2r supports two strategies — see `references/upload-patching.md` for detail.
 
-- **Strategy A — Headless place builder (preferred).** `roblox/luau_place_builder.py` generates a Luau script that runs server-side via `execute_luau`, calls `CreateMeshPartAsync` for every uploaded mesh, and saves the place via `SavePlaceAsync`. The resulting `.rbxlx` has real geometry visible in Studio edit mode. **No bootstrap wait needed.**
-- **Strategy B — Runtime MeshLoader (fallback).** Used when the headless script exceeds the 4 MB Luau Execution API limit or API access is unavailable. A MeshLoader ServerScript clones MeshParts from `InsertService:LoadAsset()` results into the scene at runtime. **The bootstrap MUST wait for MeshLoader completion before entering gameplay.** Use polling, not `Changed:Wait()`:
+- **Strategy A — Headless place builder (preferred).** `roblox/luau_place_builder.py` runs server-side via `execute_luau`, calls `CreateMeshPartAsync` for every uploaded mesh, saves the place via `SavePlaceAsync`. Resulting `.rbxlx` has real geometry visible in Studio edit mode. **No bootstrap wait needed.**
+- **Strategy B — Runtime MeshLoader (fallback).** Used when headless script exceeds the 4 MB Luau Execution API limit. MeshLoader ServerScript clones MeshParts from `InsertService:LoadAsset()` results at runtime. **Bootstrap MUST wait for MeshLoader completion** before entering gameplay. Use polling, not `Changed:Wait()`:
 
   ```lua
   local done = ReplicatedStorage:WaitForChild("MeshLoaderDone", 120)
@@ -62,12 +62,12 @@ The pipeline MUST set `Transparency = 1` on every converted Part that lacks a re
   end
   ```
 
-- **Skinned meshes** (FBX with bone data) are invisible as static MeshParts. The pipeline strips skinning during FBX conversion. If a mesh is invisible despite correct MeshId/Size/Transparency, check `assimp info <file>.fbx` for `Bones: N > 0`.
+- **Skinned meshes** (FBX with bone data) are invisible as static MeshParts. Pipeline strips skinning during FBX conversion. If a mesh is invisible despite correct MeshId/Size/Transparency, check `assimp info <file>.fbx` for `Bones: N > 0`.
 
 ## ScriptableObject data and database init
 
-- The pipeline transpiles `.asset` files to `_Data.lua` ModuleScripts via `converter/script_asset_rewriter.py`, but data still contains raw GUIDs and `nil` placeholders. GUIDs must be mapped to Template names in ReplicatedStorage, and the data-loading code must be called before game start.
-- **Database initialization order.** If the bootstrap skips UI states (loadout/shop) that trigger database initialization, scripts get `nil`. The bootstrap must call all `LoadDatabase()` functions explicitly before the gameplay state. Audit every singleton's `Create`/`Init` for database-loading side effects.
+- Pipeline transpiles `.asset` files to `_Data.lua` ModuleScripts via `converter/script_asset_rewriter.py`, but data still contains raw GUIDs and `nil` placeholders. GUIDs must be mapped to Template names in ReplicatedStorage, and data-loading code must be called before game start.
+- **Database initialization order.** If bootstrap skips UI states (loadout/shop) that trigger database init, scripts get `nil`. Bootstrap must call all `LoadDatabase()` functions explicitly before the gameplay state. Audit every singleton's `Create`/`Init` for database-loading side effects.
 
 ## ScreenGui placement
 
