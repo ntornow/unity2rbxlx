@@ -162,8 +162,7 @@ Where:
 - **Inline Unity → Roblox API translation over runtime wrappers.** Translate at
   transpile time via `api_mappings.py` / `UTILITY_FUNCTIONS` / `luau_validator.py`,
   not via `require`-able wrapper modules under `runtime/`. See
-  `docs/design/inline-over-runtime-wrappers.md` for the rationale and the list
-  of wrappers removed under this policy.
+  `docs/design/inline-over-runtime-wrappers.md` for the rationale.
 
 ## Running Tests
 ```bash
