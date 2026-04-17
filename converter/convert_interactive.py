@@ -662,10 +662,6 @@ def validate(output_dir: str, write: bool) -> None:
               help="Roblox Open Cloud API key (string or path to file).")
 @click.option("--creator-id", type=str, default=None,
               help="Roblox Creator ID (number or path to file).")
-@click.option("--retranspile", is_flag=True,
-              help="Force re-transpilation even if scripts were already transpiled. "
-              "Without this flag, hand-edited Luau scripts in output_dir/scripts/ "
-              "are preserved.")
 def assemble(unity_project_path: str, output_dir: str,
              no_upload: bool, no_resolve: bool, retranspile: bool,
              api_key: str | None, creator_id: str | None) -> None:
@@ -823,12 +819,19 @@ def upload(output_dir: str, api_key: str | None,
     pipeline.ctx.universe_id = uid
     pipeline.ctx.place_id = pid
 
+    # If transpile_scripts was already completed in a prior run, skip it
+    # so user's hand-edited Luau files in output_dir/scripts/ are preserved
+    # (the write_output phase rehydrates them from disk automatically).
+    phases = [
+        "parse", "extract_assets", "convert_materials",
+        "transpile_scripts", "convert_animations", "convert_scene",
+        "write_output",
+    ]
+    if "transpile_scripts" in pipeline.ctx.completed_phases:
+        phases = [p for p in phases if p != "transpile_scripts"]
+
     try:
-        for phase in [
-            "parse", "extract_assets", "convert_materials",
-            "transpile_scripts", "convert_animations", "convert_scene",
-            "write_output",
-        ]:
+        for phase in phases:
             pipeline._run_phase(phase)
     except Exception as exc:
         _emit({"phase": "upload", "success": False,

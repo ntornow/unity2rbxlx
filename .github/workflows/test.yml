@@ -32,7 +32,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install \
             pyyaml click Pillow trimesh scikit-image requests anthropic \
-            numpy pytest pytest-cov
+            numpy lz4 pytest pytest-cov
 
       - name: Run fast test suite
         run: pytest tests/ -m "not slow" -v
@@ -61,7 +61,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install \
             pyyaml click Pillow trimesh scikit-image requests anthropic \
-            numpy pytest pytest-cov
+            numpy lz4 pytest pytest-cov
 
       - name: Run full test suite
         run: pytest tests/ -v
