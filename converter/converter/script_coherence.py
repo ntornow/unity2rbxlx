@@ -201,6 +201,16 @@ def fix_require_classifications(scripts: list[RbxScript]) -> int:
                 fixes += 1
                 log.info("  Reclassified '%s' from %s to ModuleScript (required by another script)",
                          name, old_type)
+                # Add return nil if the script has no return statement
+                stripped_source = target.source.rstrip()
+                last_lines = stripped_source.split('\n')
+                has_return = any(
+                    line.strip().startswith('return ')
+                    for line in last_lines[-3:]
+                )
+                if not has_return:
+                    target.source = stripped_source + '\n\nreturn nil\n'
+                    log.info("  Added 'return nil' to '%s' (required as module but has no return)", name)
 
     # Pass 2: Scripts that end with `return ...` are likely ModuleScripts.
     for s in scripts:

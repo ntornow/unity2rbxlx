@@ -4798,15 +4798,17 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     # Camera and movement fixes are handled by the AI transpiler prompt.
     # See code_transpiler.py _AI_SYSTEM_PROMPT for ESC key, camera, and UI guidance.
 
-    # Fix W/S movement direction: Unity uses +Z for forward, but in Roblox
-    # the camera faces -Z. Input direction vectors that map W→+Z need the
-    # Z component negated so W moves the player forward (toward -Z).
-    if 'return Vector3.new(right, 0, forward)' in source:
+    # Fix W/S movement direction: the AI transpiler sometimes negates
+    # the forward component, but Humanoid:Move with the yaw-rotated
+    # direction already handles the coordinate system correctly.
+    # Ensure forward is NOT negated — W=+1 maps to +Z in camera-local
+    # space which the yaw CFrame rotates to the correct world direction.
+    if 'return Vector3.new(right, 0, -forward)' in source:
         source = source.replace(
-            'return Vector3.new(right, 0, forward)',
             'return Vector3.new(right, 0, -forward)',
+            'return Vector3.new(right, 0, forward)',
         )
-        fixes.append("Negated forward in movement direction (Unity +Z forward → Roblox -Z forward)")
+        fixes.append("Removed forward negation in movement direction (yaw CFrame handles coordinate mapping)")
 
     # .time property on VFX/particle instances → comment out
     if re.search(r'\w+\.time\s*=\s*[\d.]', source):
