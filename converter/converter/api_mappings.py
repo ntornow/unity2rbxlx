@@ -304,14 +304,16 @@ API_CALL_MAP: dict[str, str] = {
     "PlayableDirector.played": "-- PlayableDirector.played: use BindableEvent for sequence start",
     "PlayableDirector.stopped": "-- PlayableDirector.stopped: use BindableEvent for sequence end",
     ".OnComplete(": ".Completed:Connect(",
-    # -- NavMesh --
-    "NavMeshAgent": "-- NavMeshAgent: use Roblox PathfindingService",
+    # -- NavMesh (via runtime/nav_mesh_runtime.luau) --
+    # NavAgent wraps PathfindingService with a NavMeshAgent-like API.
+    "NavMeshAgent": "-- NavMeshAgent: via runtime/nav_mesh_runtime.luau (NavAgent)",
     "NavMesh.CalculatePath": "PathfindingService:CreatePath()",
-    ".SetDestination(": "navMoveTo(",
-    ".remainingDistance": "-- remainingDistance: compute from waypoints",
+    ".SetDestination(": "navMoveTo(",  # inline helper; runtime module uses NavAgent:SetDestination()
+    ".remainingDistance": ":GetRemainingDistance()",  # via NavAgent:GetRemainingDistance()
     ".isStopped": ":GetAttribute('NavIsStopped')",
     "navMeshAgent.speed": "humanoid.WalkSpeed",
     "agent.speed": "humanoid.WalkSpeed",
+    "NavMeshAgent.Stop": ":Stop()",  # via NavAgent:Stop()
     "NavMeshObstacle": "-- NavMeshObstacle: no direct equivalent",
     # -- New Input System --
     "InputAction": "-- InputAction: use ContextActionService or UserInputService",
@@ -350,10 +352,18 @@ API_CALL_MAP: dict[str, str] = {
     ".Aggregate(": "linqAggregate(",  # handled by UTILITY_FUNCTIONS
     ".Last(": "linqLast(",  # handled by UTILITY_FUNCTIONS
     ".LastOrDefault(": "linqLastOrDefault(",  # handled by UTILITY_FUNCTIONS
-    # -- Cinemachine --
-    "CinemachineVirtualCamera": "-- CinemachineVirtualCamera: configure workspace.CurrentCamera",
-    "CinemachineBrain": "-- CinemachineBrain: use workspace.CurrentCamera",
+    # -- Cinemachine (via runtime/cinemachine_runtime.luau) --
+    # Attribute-driven runtime: parts with CinemachineVCam attribute are
+    # discovered at runtime and blended by priority. Attributes used:
+    # CinemachinePriority, CinemachineFOV, CinemachineFollow,
+    # CinemachineLookAt, CinemachineFollowOffset.
+    "CinemachineVirtualCamera": "-- CinemachineVirtualCamera: via runtime/cinemachine_runtime.luau (attribute-driven)",
+    "CinemachineBrain": "-- CinemachineBrain: via runtime/cinemachine_runtime.luau",
+    "CinemachineFreeLook": "-- CinemachineFreeLook: via runtime/cinemachine_runtime.luau",
     ".m_Lens.FieldOfView": ".FieldOfView",
+    ".m_Priority": ":SetAttribute('CinemachinePriority', priority)",
+    ".Follow": ":SetAttribute('CinemachineFollow', targetName)",
+    ".LookAt": ":SetAttribute('CinemachineLookAt', targetName)",
     # -- Terrain --
     "Terrain.activeTerrain": "-- Terrain: use Roblox Terrain object",
     "TerrainData": "-- TerrainData: use workspace.Terrain",
@@ -376,10 +386,15 @@ API_CALL_MAP: dict[str, str] = {
     "Invoke(\"": "task.delay(",  # MonoBehaviour.Invoke("method", delay)
     # InvokeRepeating handled by validator (needs arg parsing)
     "CancelInvoke": "-- CancelInvoke: cancel spawned task",
-    # -- UnityEvent --
+    # -- UnityEvent (inline + runtime/event_system.luau) --
+    # Simple AddListener/RemoveListener maps inline to BindableEvent:Connect.
+    # For games that use Unity's EventSystem (pointer/selection delegation),
+    # the runtime module provides EventSystem.new(), :Select(), :On(), :Destroy().
     ".AddListener(": ".Event:Connect(",
     ".RemoveListener(": "-- RemoveListener: disconnect the connection",
     ".RemoveAllListeners()": "-- RemoveAllListeners: disconnect all connections",
+    "EventSystem.SetSelectedGameObject": "eventSystem:Select",  # via runtime/event_system.luau
+    "ExecuteEvents.Execute": "eventSystem:On",  # via runtime/event_system.luau
     # -- System.Action / delegates --
     "Action<": "-- Action: use function type",
     # Func<> handled by validator generic type stripping
@@ -480,10 +495,13 @@ API_CALL_MAP: dict[str, str] = {
     "PlayerPrefs.SetString": "-- PlayerPrefs: use DataStoreService",
     "PlayerPrefs.Save": "-- PlayerPrefs.Save: DataStore saves automatically",
     "PlayerPrefs.DeleteAll": "-- PlayerPrefs.DeleteAll: clear DataStore",
-    # -- CharacterController --
-    ".isGrounded": "-- isGrounded: use Humanoid:GetState() == Enum.HumanoidStateType.Running",
-    "CharacterController.Move": "Humanoid:Move",
-    "CharacterController.SimpleMove": "Humanoid:Move",
+    # -- CharacterController (via runtime/physics_bridge.luau) --
+    # CharacterBridge wraps Humanoid with a CharacterController-like API:
+    # CharacterBridge.new(character, config?), :Move(), :SimpleMove(),
+    # :IsGrounded() (raycast-based), :SetGravity().
+    ".isGrounded": "characterBridge:IsGrounded()",  # via CharacterBridge:IsGrounded()
+    "CharacterController.Move": "characterBridge:Move",  # via CharacterBridge:Move()
+    "CharacterController.SimpleMove": "characterBridge:SimpleMove",  # via CharacterBridge:SimpleMove()
     # -- Physics cast additional --
     "Physics.SphereCastAll": "workspace:Spherecast",
     "Physics.BoxCast": "workspace:Blockcast",
