@@ -23,7 +23,7 @@ Both entry points share the same `Pipeline` class, the same `ConversionContext` 
 
 - **Python 3.11+**
 - **Claude CLI** (`claude`) -- used for AI-assisted C# to Luau transpilation
-- **Roblox Open Cloud API key** -- for asset uploads ([create one here](https://create.roblox.com/credentials))
+- **Roblox Open Cloud API key** -- for asset uploads ([create one here](https://create.roblox.com/dashboard/credentials))
 - **Roblox Studio** -- for opening converted files and resolving uploaded asset IDs
 
 ## Setup

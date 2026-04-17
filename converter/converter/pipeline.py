@@ -461,6 +461,54 @@ class Pipeline:
         convert_dir = self.output_dir / "converted_textures"
         convert_dir.mkdir(parents=True, exist_ok=True)
 
+        # Compute which texture source paths belong to materials that
+        # render with transparency (cutout, fade, transparent). Only those
+        # textures get their alpha channel preserved; everything else is
+        # stripped to RGB to prevent spurious transparency from mask
+        # channels (roughness/metalness/specular packed into alpha).
+        #
+        # upload_assets runs BEFORE convert_materials, so we can't use the
+        # full material_mappings. Instead, scan every .mat file in the
+        # project and flag textures referenced by materials whose shader
+        # fileID is a legacy cutout/transparent variant, or whose _Mode
+        # is Cutout/Fade/Transparent.
+        alpha_texture_paths: set[str] = set()
+        if self.state.guid_index:
+            import re as _re
+            from converter.material_mapper import (
+                _BUILTIN_CUTOUT_SHADER_IDS,
+                _BUILTIN_TRANSPARENT_SHADER_IDS,
+            )
+            for mat_file in self.unity_project_path.rglob("*.mat"):
+                try:
+                    text = mat_file.read_text(errors="replace")
+                except OSError:
+                    continue
+                # Shader fileID check
+                sm = _re.search(r"m_Shader:\s*\{fileID:\s*(\d+)", text)
+                shader_id = int(sm.group(1)) if sm else 0
+                is_transparent = (
+                    shader_id in _BUILTIN_CUTOUT_SHADER_IDS
+                    or shader_id in _BUILTIN_TRANSPARENT_SHADER_IDS
+                )
+                # _Mode check for Standard/URP/HDRP
+                if not is_transparent:
+                    mm = _re.search(r"-\s*_Mode:\s*(\d+)", text)
+                    if mm and int(mm.group(1)) > 0:
+                        is_transparent = True
+                if not is_transparent:
+                    continue
+                # Record every color-map texture referenced by this material
+                for tex_key in ("_MainTex", "_BaseMap", "_BaseColorMap"):
+                    tm = _re.search(
+                        rf"- {tex_key}:\s*\n\s+m_Texture:\s*\{{fileID:\s*\d+,\s*guid:\s*([0-9a-f]+)",
+                        text,
+                    )
+                    if tm:
+                        tex_path = self.state.guid_index.resolve(tm.group(1))
+                        if tex_path:
+                            alpha_texture_paths.add(str(tex_path.resolve()))
+
         # Collected for a post-upload moderation audit. We probe only newly
         # uploaded assets (not cached entries from a previous run) so the
         # audit cost stays proportional to the new work.
@@ -475,19 +523,41 @@ class Pipeline:
             eligible = [a for a in assets if a.path.suffix.lower() in extensions]
             log.info("[upload_assets] Uploading %d %s assets...", len(eligible), kind)
 
+            # Asset upload blocklist: relative paths that should NEVER be
+            # re-uploaded (e.g. user flagged a bad asset, or Roblox returned
+            # a problematic asset ID). Read from
+            # ``<output_dir>/.upload_blocklist`` — one relative path per line.
+            blocklist_file = self.output_dir / ".upload_blocklist"
+            blocklist: set[str] = set()
+            if blocklist_file.exists():
+                blocklist = {line.strip() for line in blocklist_file.read_text().splitlines() if line.strip() and not line.startswith("#")}
+
             for asset in eligible:
                 rel = str(asset.relative_path)
                 if rel in uploaded:
                     continue  # Already uploaded (resume support)
+                if rel in blocklist:
+                    log.info("[upload_assets] Skipping blocklisted asset: %s", rel)
+                    continue
 
                 upload_path = asset.path
                 name = asset.path.stem
+
+                # Determine whether this texture needs its alpha channel
+                # preserved. Alpha is only kept for textures that feed
+                # into materials with a transparent/cutout alpha_mode —
+                # everything else strips alpha to avoid spurious
+                # transparency from mask channels (roughness/metalness/
+                # specular packed into alpha).
+                needs_alpha = False
+                if kind == "texture":
+                    needs_alpha = str(asset.path.resolve()) in alpha_texture_paths
 
                 # Auto-convert non-PNG/JPG formats to PNG before uploading
                 if kind == "texture" and asset.path.suffix.lower() in (".bmp", ".tga", ".tif", ".tiff", ".psd"):
                     try:
                         png_path = convert_dir / (asset.path.stem + ".png")
-                        upload_path = convert_to_png(asset.path, png_path)
+                        upload_path = convert_to_png(asset.path, png_path, preserve_alpha=needs_alpha)
                     except Exception as exc:
                         log.warning("[upload_assets] Failed to convert %s to PNG: %s", asset.path.name, exc)
                         self.ctx.asset_upload_errors.append(rel)
@@ -542,10 +612,28 @@ class Pipeline:
                 "from uploaded_assets so they don't leak into the rbxlx:",
                 len(rejected),
             )
+            # Also append to the blocklist so the next run doesn't re-upload
+            # these — repeated moderation hits on the same content can trigger
+            # account-level moderation on the uploader.
+            blocklist_file = self.output_dir / ".upload_blocklist"
+            existing = set()
+            if blocklist_file.exists():
+                existing = {line.strip() for line in blocklist_file.read_text().splitlines()}
+            new_lines = []
             for rel, asset_id in rejected:
                 log.warning("  REJECTED: %s -> rbxassetid://%s", rel, asset_id)
                 uploaded.pop(rel, None)
                 self.ctx.asset_upload_errors.append(f"{rel} (moderation rejected)")
+                if rel not in existing:
+                    new_lines.append(rel)
+            if new_lines:
+                header = "" if blocklist_file.exists() else "# Auto-populated: assets that triggered Roblox moderation.\n"
+                with open(blocklist_file, "a") as f:
+                    if header:
+                        f.write(header)
+                    for line in new_lines:
+                        f.write(line + "\n")
+                log.warning("[upload_assets] Added %d path(s) to %s", len(new_lines), blocklist_file)
 
     def convert_materials(self) -> None:
         """Phase 4: Map Unity materials to Roblox SurfaceAppearance."""
@@ -580,6 +668,34 @@ class Pipeline:
                 _collect_mat_guids(prefab.root)
         except Exception as exc:
             log.warning("[convert_materials] Could not collect prefab material GUIDs: %s", exc)
+
+        # Also pick up .mat files that live in the same Materials/ sibling
+        # folder as any referenced FBX. Unity's "search materials" importer
+        # setting auto-links these to FBX material slots even though they
+        # aren't referenced in scene YAML — and we need them mapped so
+        # cutout/transparent alpha is correctly detected for sub-meshes
+        # like the chainlink fence.
+        if self.state.asset_manifest and self.state.guid_index:
+            import re as _re
+            extra_from_siblings = 0
+            for asset in self.state.asset_manifest.by_kind.get("mesh", []):
+                if asset.path.suffix.lower() != ".fbx":
+                    continue
+                mat_dir = asset.path.parent / "Materials"
+                if not mat_dir.is_dir():
+                    continue
+                for mat_meta in mat_dir.glob("*.mat.meta"):
+                    try:
+                        m = _re.search(r"guid:\s*([0-9a-f]+)", mat_meta.read_text(errors="replace"))
+                    except OSError:
+                        continue
+                    if m:
+                        g = m.group(1)
+                        if g not in referenced_guids:
+                            referenced_guids.add(g)
+                            extra_from_siblings += 1
+            if extra_from_siblings:
+                log.info("[convert_materials] Added %d sibling Materials/ GUIDs", extra_from_siblings)
 
         log.info("[convert_materials] Found %d material GUIDs (scene + prefabs)", len(referenced_guids))
         self.state.material_mappings = map_materials(
@@ -1677,9 +1793,12 @@ script.Disabled = true
                 for class_name in script_classes:
                     if class_name in script_by_name:
                         script = script_by_name[class_name]
-                        # Only bind Server scripts and LocalScripts to parts
-                        # ModuleScripts stay in ReplicatedStorage for require()
-                        if script.script_type != "ModuleScript":
+                        # Only bind Server scripts and LocalScripts to parts.
+                        # ModuleScripts stay in ReplicatedStorage for require().
+                        # Skip stub scripts (AI unavailable) — they have no
+                        # runnable code, and cloning them per instance bloats
+                        # the rbxlx (Gamekit3D: 7860 copies of a Variations stub).
+                        if script.script_type != "ModuleScript" and "AI transpilation recommended" not in script.source:
                             # Clone the script for each instance so all prefab
                             # variants get their inherited MonoBehaviour scripts
                             if class_name in bound_script_names:

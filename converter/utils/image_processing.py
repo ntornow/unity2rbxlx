@@ -121,12 +121,19 @@ def invert_image(image_path: str | Path, output_path: str | Path) -> Path:
 def convert_to_png(
     image_path: str | Path,
     output_path: str | Path | None = None,
+    preserve_alpha: bool = False,
 ) -> Path:
     """Convert any image (BMP, TGA, TIFF, etc.) to PNG format.
 
     Args:
         image_path: Path to the source image.
         output_path: Where to write the PNG. If None, writes next to source with .png extension.
+        preserve_alpha: If True, keep the alpha channel. If False (default),
+            strip alpha — most Unity textures pack a metalness/roughness/
+            specular mask into alpha that would cause spurious transparency
+            if Roblox rendered it. The caller should determine whether a
+            texture actually needs alpha based on the material's Unity
+            shader (e.g., _Mode=Cutout or a Transparent/Cutout/* shader).
 
     Returns:
         Path to the converted PNG file.
@@ -146,10 +153,10 @@ def convert_to_png(
         return output_path
 
     img = Image.open(image_path)
-    # Always flatten to RGB — alpha channels in diffuse textures (TGA, PSD)
-    # are typically smoothness/detail masks in Unity, not transparency.
-    # Keeping them causes Roblox Texture objects to render semi-transparent.
-    img.convert("RGB").save(output_path, "PNG")
+    if preserve_alpha and img.mode == "RGBA":
+        img.save(output_path, "PNG")
+    else:
+        img.convert("RGB").save(output_path, "PNG")
 
     logger.info("Converted %s -> %s (%.0f KB -> %.0f KB)",
                 image_path.name, output_path.name,

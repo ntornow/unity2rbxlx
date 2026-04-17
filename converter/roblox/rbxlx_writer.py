@@ -239,6 +239,11 @@ def _make_surface_appearance(parent_xml: ET.Element, sa: RbxSurfaceAppearance) -
     if hasattr(sa, "roughness_map") and sa.roughness_map and "rbxassetid" in sa.roughness_map:
         _add_content(props, "RoughnessMap", sa.roughness_map)
 
+    # AlphaMode: 0=Overlay (default), 1=Transparency
+    alpha_mode = getattr(sa, "alpha_mode", "Overlay")
+    if alpha_mode == "Transparency":
+        _add_token(props, "AlphaMode", 1)
+
 
 def _make_light(parent_xml: ET.Element, light: RbxLight) -> None:
     """Serialize a light (PointLight / SpotLight / SurfaceLight) as an Item."""

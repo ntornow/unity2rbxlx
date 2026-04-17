@@ -25,6 +25,11 @@ _SUPPORTED_SHADERS = frozenset({
     "Universal Render Pipeline/Simple Lit",
     "Lit",
     "SimpleLit",
+    # HDRP shaders
+    "HDRP/Lit",
+    "HDRP/LitTessellation",
+    "HDRenderPipeline/Lit",
+    "HDRenderPipeline/LitTessellation",
 })
 
 # Unity transparency mode values (_Mode property).
@@ -32,6 +37,31 @@ _ALPHA_OPAQUE = 0
 _ALPHA_CUTOUT = 1
 _ALPHA_FADE = 2
 _ALPHA_TRANSPARENT = 3
+
+# Unity built-in shader fileIDs that are INHERENTLY cutout/transparent,
+# regardless of the _Mode property. The legacy Transparent/Cutout/*
+# shaders (used for chain-link fences, foliage, etc.) don't have a
+# _Mode toggle — the shader variant itself encodes the transparency
+# behaviour. Discovered by inspecting Unity's built-in shader YAML
+# descriptors in builtin_extra.
+_BUILTIN_CUTOUT_SHADER_IDS = frozenset({
+    51,   # Transparent/Cutout/Diffuse
+    52,   # Transparent/Cutout/Vertex-Lit
+    53,   # Transparent/Cutout/Bumped Diffuse
+    54,   # Transparent/Cutout/Bumped Specular
+    55,   # Transparent/Cutout/Specular
+    56,   # Transparent/Cutout/Soft Edge Unlit
+    57,   # Nature/Tree Soft Occlusion Leaves
+    200,  # Legacy Unlit/Transparent Cutout
+})
+_BUILTIN_TRANSPARENT_SHADER_IDS = frozenset({
+    30,   # Transparent/Diffuse
+    31,   # Transparent/Vertex-Lit
+    32,   # Transparent/Bumped Diffuse
+    33,   # Transparent/Bumped Specular
+    34,   # Transparent/Specular
+    202,  # Unlit/Transparent
+})
 
 
 @dataclass
@@ -190,7 +220,13 @@ def _parse_material(
     mapping.shader_name = shader_name
 
     if shader_name not in _SUPPORTED_SHADERS:
-        mapping.warnings.append(f"Unsupported shader: {shader_name}")
+        # Shader Graph materials often use custom names but still have
+        # standard PBR properties. Accept any shader and try to extract
+        # properties — the texture slot lookups below use multiple
+        # fallback names (Standard + URP + HDRP) so they work on most
+        # shader variants regardless of the shader name.
+        if not shader_name.startswith(("Shader Graphs/", "Custom/")):
+            mapping.warnings.append(f"Unsupported shader: {shader_name}")
 
     # Extract saved properties.
     saved_props = mat_data.get("m_SavedProperties", {})
@@ -198,8 +234,8 @@ def _parse_material(
     floats = _normalize_floats(saved_props.get("m_Floats", []))
     colors = _normalize_colors(saved_props.get("m_Colors", []))
 
-    # -- Base color (_Color) --
-    base_color = colors.get("_Color", {})
+    # -- Base color (_Color or _BaseColor for HDRP) --
+    base_color = colors.get("_Color") or colors.get("_BaseColor", {})
     if base_color:
         mapping.base_color = (
             float(base_color.get("r", 0.63)),
@@ -207,26 +243,45 @@ def _parse_material(
             float(base_color.get("b", 0.63)),
         )
 
-    # -- Transparency mode (_Mode) --
-    mode = int(floats.get("_Mode", _ALPHA_OPAQUE))
-    if mode == _ALPHA_OPAQUE:
-        mapping.alpha_mode = "Overlay"
+    # -- Transparency mode --
+    # Legacy built-in shaders encode cutout/transparent behaviour in the
+    # shader variant itself (no _Mode); Standard/URP/HDRP use the _Mode
+    # property. Check the shader fileID first.
+    shader_ref = mat_data.get("m_Shader", {})
+    shader_file_id = 0
+    if isinstance(shader_ref, dict):
+        try:
+            shader_file_id = int(shader_ref.get("fileID", 0))
+        except (ValueError, TypeError):
+            shader_file_id = 0
+
+    if shader_file_id in _BUILTIN_CUTOUT_SHADER_IDS:
+        mapping.alpha_mode = "Transparency"
         mapping.transparency = 0.0
-    elif mode == _ALPHA_CUTOUT:
-        mapping.alpha_mode = "Overlay"
-        mapping.transparency = 0.0
-    elif mode == _ALPHA_FADE:
+    elif shader_file_id in _BUILTIN_TRANSPARENT_SHADER_IDS:
         mapping.alpha_mode = "Transparency"
         alpha = float(base_color.get("a", 1.0)) if base_color else 1.0
         mapping.transparency = 1.0 - alpha
-    elif mode == _ALPHA_TRANSPARENT:
-        mapping.alpha_mode = "Transparency"
-        alpha = float(base_color.get("a", 1.0)) if base_color else 1.0
-        mapping.transparency = 1.0 - alpha
+    else:
+        mode = int(floats.get("_Mode", _ALPHA_OPAQUE))
+        if mode == _ALPHA_OPAQUE:
+            mapping.alpha_mode = "Overlay"
+            mapping.transparency = 0.0
+        elif mode == _ALPHA_CUTOUT:
+            mapping.alpha_mode = "Transparency"
+            mapping.transparency = 0.0
+        elif mode == _ALPHA_FADE:
+            mapping.alpha_mode = "Transparency"
+            alpha = float(base_color.get("a", 1.0)) if base_color else 1.0
+            mapping.transparency = 1.0 - alpha
+        elif mode == _ALPHA_TRANSPARENT:
+            mapping.alpha_mode = "Transparency"
+            alpha = float(base_color.get("a", 1.0)) if base_color else 1.0
+            mapping.transparency = 1.0 - alpha
 
     # -- Texture mapping --
-    # ColorMap: _MainTex or _BaseMap (URP).
-    color_tex = tex_envs.get("_MainTex") or tex_envs.get("_BaseMap")
+    # ColorMap: _MainTex (Standard), _BaseMap (URP), or _BaseColorMap (HDRP).
+    color_tex = tex_envs.get("_MainTex") or tex_envs.get("_BaseMap") or tex_envs.get("_BaseColorMap")
     if color_tex:
         color_map_path = _resolve_texture(color_tex, guid_index)
         if color_map_path:
@@ -245,15 +300,17 @@ def _parse_material(
             if ox != 0.0 or oy != 0.0:
                 mapping.offset = (ox, oy)
 
-    # NormalMap: _BumpMap.
-    bump_tex = tex_envs.get("_BumpMap")
+    # NormalMap: _BumpMap (Standard/URP) or _NormalMap (HDRP).
+    bump_tex = tex_envs.get("_BumpMap") or tex_envs.get("_NormalMap")
     if bump_tex:
         normal_path = _resolve_texture(bump_tex, guid_index)
         if normal_path:
             mapping.normal_map_path = str(normal_path)
 
-    # MetalnessMap: _MetallicGlossMap R channel.
-    metallic_tex = tex_envs.get("_MetallicGlossMap")
+    # MetalnessMap: _MetallicGlossMap (Standard/URP) or _MaskMap (HDRP).
+    # HDRP _MaskMap packs: R=metallic, G=AO, B=detail mask, A=smoothness.
+    # Same channel layout as Standard's _MetallicGlossMap for R and A.
+    metallic_tex = tex_envs.get("_MetallicGlossMap") or tex_envs.get("_MaskMap")
     if metallic_tex:
         metallic_path = _resolve_texture(metallic_tex, guid_index)
         if metallic_path:
@@ -318,10 +375,10 @@ def _parse_material(
                     "Manual review recommended."
                 )
 
-    # Emission: _EmissionColor with non-zero RGB → emissive material
+    # Emission: _EmissionColor (Standard/URP) or _EmissiveColor (HDRP)
     colors = mat_data.get("m_Colors", {})
     if isinstance(colors, dict):
-        emission = colors.get("_EmissionColor", {})
+        emission = colors.get("_EmissionColor") or colors.get("_EmissiveColor", {})
         if isinstance(emission, dict):
             er = float(emission.get("r", 0.0))
             eg = float(emission.get("g", 0.0))

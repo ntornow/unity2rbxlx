@@ -18,7 +18,7 @@ Phase-specific documentation for the `convert-unity` skill. Each file owns one n
 | `phase-4.5-runtime-content.md` | 4.5f, 4.5h (partial) | Runtime spawning, templates, movement model |
 | `phase-4.5-transpiler-gaps.md` | 4.5h | Semantic gaps where transpiled Luau silently breaks |
 | `phase-4.5-module-rewrite.md` | 4.5h, 4.5i | Module-per-component rules, bootstrap wiring |
-| `phase-5-assembly.md` | 5 | Asset upload, mesh resolution, terrain, LFS |
+| `phase-5-assembly.md` | 5 | Asset moderation (Roblox safety standards), upload, mesh resolution, terrain, LFS |
 | `phase-6-upload.md` | 6 | Headless place publish via Open Cloud |
 | `upload-patching.md` | 6 (detail) | Asset ID patching internals + Strategy A/B |
 | `playtest-gotchas.md` | (any) | MCP playtest caveats: module-instance caveat, click coords, Touched spam |

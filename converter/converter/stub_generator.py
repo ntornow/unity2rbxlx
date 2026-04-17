@@ -72,6 +72,7 @@ def generate_stub(csharp_source: str, script_info: Any) -> str:
     # Build Luau
     lines: list[str] = []
     lines.append(f"-- Converted from Unity C#: {class_name or 'UnknownScript'}")
+    lines.append(f"-- AI transpilation recommended for full conversion")
     lines.append(f"-- Original base class: {base_class or 'MonoBehaviour'}")
     lines.append("")
 
