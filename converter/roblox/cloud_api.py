@@ -303,6 +303,15 @@ def probe_asset_availability(
     if resp is None:
         return "unknown"
     if resp.status_code == 403:
+        # Distinguish asset-level rejection from account-level moderation:
+        # when the uploader's account is moderated, every probe returns
+        # 403 with "User is moderated" — those assets aren't actually
+        # rejected, they're just inaccessible to this API key. Treating
+        # those as rejected would strip otherwise-valid uploads from
+        # the rbxlx.
+        body = resp.text or ""
+        if "user is moderated" in body.lower() or "user moderated" in body.lower():
+            return "unknown"
         return "rejected"
     if resp.status_code == 404:
         return "rejected"

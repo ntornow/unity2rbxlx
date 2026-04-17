@@ -198,7 +198,7 @@ python u2r.py convert ../test_projects/SimpleFPS -o ./output/SimpleFPS --api-key
 - Uploaded meshes return Model IDs which must be resolved to real MeshIds via Studio MCP
 - Git LFS pointer files are detected and skipped (actual FBX data needs LFS pull)
 - VFX Graph, particle SubEmitters, Tilemap, and Cloth have no Roblox equivalent (silently skipped)
-- Font and video assets cannot be uploaded via Roblox Open Cloud API (require manual upload)
+- **Roblox API limitation — font/video upload**: The Open Cloud API only supports Image, Model (mesh), and Audio asset types. Font files and video files must be uploaded manually via the [Creator Dashboard](https://create.roblox.com) and their asset IDs pasted into the converted place. UI text falls back to Roblox's default font; VideoFrame components are emitted with an empty video ID placeholder
 - Cross-scene constraint Part0/Part1 linking may fail for constraints spanning different scene roots
 
 ## Test Projects (../test_projects/)

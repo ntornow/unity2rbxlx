@@ -191,6 +191,10 @@ _fbx_bounding_boxes: dict[str, tuple[float, float, float]] = {}
 # Module-level collector for water regions discovered during node conversion.
 # Populated by _convert_node / _convert_prefab_instance, consumed by convert_scene.
 _water_regions: list[RbxWaterRegion] = []
+
+# Collector for unknown/unhandled Unity component types found during conversion.
+# Logged at the end of convert_scene so users know what was skipped.
+_unhandled_components: set[str] = set()
 # Terrain world position offset — subtracted from object positions so they
 # align with terrain encoder's (0,0,0)-based voxel grid.
 _terrain_world_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
@@ -446,10 +450,17 @@ def _compute_mesh_size(
     mesh_guid: str,
     guid_index: GuidIndex,
     mesh_native_sizes: dict[str, tuple[float, float, float]],
+    mesh_file_id: str | None = None,
+    mesh_name: str | None = None,
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
     """Compute Roblox MeshPart Size and InitialSize from Unity + Roblox data.
 
     Requires native sizes from Roblox LoadAsset (populated by the resolve step).
+
+    When ``mesh_file_id`` is provided and the FBX has multiple sub-meshes in
+    mesh_hierarchies, uses the specific sub-mesh's native dimensions instead
+    of the overall FBX bounding box. Without this, all sub-meshes (frame, door,
+    base) would get the same size, causing overlapping/stretched geometry.
 
     InitialSize = native mesh bounding box from Roblox
     Size = InitialSize × import_scale × unity_scale × STUDS_PER_METER
@@ -461,6 +472,22 @@ def _compute_mesh_size(
     if not asset_path:
         return None
 
+    # Try per-sub-mesh sizing via mesh_hierarchies first
+    if mesh_file_id and _mesh_hierarchies:
+        sub_mesh = _resolve_sub_mesh(mesh_guid, mesh_file_id, guid_index, mesh_name=mesh_name)
+        if sub_mesh:
+            native = (sub_mesh["size"][0], sub_mesh["size"][1], sub_mesh["size"][2])
+            import_scale = _get_fbx_import_scale(mesh_guid, guid_index)
+            unit_ratio = _get_fbx_unit_ratio(mesh_guid, guid_index)
+            scale_factor = import_scale * unit_ratio * config.STUDS_PER_METER
+            size = (
+                abs(unity_scale[0]) * native[0] * scale_factor,
+                abs(unity_scale[1]) * native[1] * scale_factor,
+                abs(unity_scale[2]) * native[2] * scale_factor,
+            )
+            return size, native
+
+    # Fallback: use the overall FBX bounding box from mesh_native_sizes
     relative = guid_index.resolve_relative(mesh_guid)
     for key in [str(relative), str(asset_path)] if relative else [str(asset_path)]:
         if key in mesh_native_sizes:
@@ -468,9 +495,6 @@ def _compute_mesh_size(
             import_scale = _get_fbx_import_scale(mesh_guid, guid_index)
             unit_ratio = _get_fbx_unit_ratio(mesh_guid, guid_index)
             initial_size = (native[0], native[1], native[2])
-            # unit_ratio compensates for FBX internal node transforms
-            # that Roblox doesn't apply (e.g., cm→m conversion baked
-            # into Lcl Scaling nodes)
             scale_factor = import_scale * unit_ratio * config.STUDS_PER_METER
             size = (
                 abs(unity_scale[0]) * initial_size[0] * scale_factor,
@@ -1062,6 +1086,14 @@ def convert_scene(
         len(place.water_regions),
         "found" if place.camera else "default",
     )
+    # Report any unhandled component types so users know what was skipped.
+    if _unhandled_components:
+        log.info(
+            "Unhandled Unity component types (skipped): %s",
+            ", ".join(sorted(_unhandled_components)),
+        )
+        _unhandled_components.clear()
+
     return place
 
 
@@ -1252,13 +1284,14 @@ def _convert_node(
                 part.children.append(mesh_part)
         else:
             mesh_id = _resolve_mesh_id(node.mesh_guid, guid_index, uploaded_assets,
-                                        mesh_file_id=node.mesh_file_id)
+                                        mesh_file_id=node.mesh_file_id, mesh_name=node.name)
             if mesh_id:
                 part.mesh_id = mesh_id
             # Compute mesh size from native Roblox data (requires upload + resolve)
             sized = False
             if _mesh_native_sizes and guid_index:
-                result = _compute_mesh_size(node.scale, node.mesh_guid, guid_index, _mesh_native_sizes)
+                result = _compute_mesh_size(node.scale, node.mesh_guid, guid_index, _mesh_native_sizes,
+                                            mesh_file_id=node.mesh_file_id, mesh_name=node.name)
                 if result:
                     part.size, part.initial_size = result
                     sized = True
@@ -1746,8 +1779,9 @@ def _process_components(
         elif ct in _SILENT_SKIP_TYPES:
             pass
 
-        # -- Unknown component: log for debugging --
+        # -- Unknown component: log so users know what was skipped --
         else:
+            _unhandled_components.add(ct)
             log.debug("Unhandled component type '%s' on node '%s'", ct, node.name)
 
     # -- Anchoring logic --
@@ -1838,15 +1872,17 @@ def _resolve_mesh_id(
     guid_index: GuidIndex | None,
     uploaded_assets: dict[str, str],
     mesh_file_id: str | None = None,
+    mesh_name: str | None = None,
 ) -> str | None:
     """Resolve a mesh GUID to an rbxassetid URL.
 
     When mesh_hierarchies data is available and mesh_file_id is provided,
     resolves to the specific sub-mesh within a multi-mesh FBX.
-    Otherwise falls back to uploaded_assets lookup.
+    Falls back to name-based matching when the fileID index is out of bounds
+    (Unity's fileID numbering has gaps that cause index overflow).
     """
     # Try sub-mesh resolution first
-    sub_mesh = _resolve_sub_mesh(mesh_guid, mesh_file_id, guid_index)
+    sub_mesh = _resolve_sub_mesh(mesh_guid, mesh_file_id, guid_index, mesh_name=mesh_name)
     if sub_mesh and sub_mesh.get("meshId"):
         return sub_mesh["meshId"]
     if guid_index is None:
@@ -2246,8 +2282,15 @@ def _extract_monobehaviour_attributes(
                                     sm_color[0], sm_color[1], sm_color[2]
                                 )
                             model.children.append(mesh_part)
+                        # Prefab field references are templates for runtime
+                        # cloning (e.g. riflePrefab → cloned on pickup). Hide
+                        # the template so it doesn't render at full scale in
+                        # workspace. Scripts clone and show it when needed.
+                        for _child in model.children:
+                            if hasattr(_child, 'transparency'):
+                                _child.transparency = 1.0
                         part.children.append(model)
-                        log.debug("Created prefab reference '%s' with %d sub-meshes",
+                        log.debug("Created prefab reference '%s' with %d sub-meshes (hidden template)",
                                   field_name, len(sub_meshes))
 
 
@@ -2374,6 +2417,15 @@ def _apply_materials(
         if comp.component_type not in ("MeshRenderer", "SkinnedMeshRenderer"):
             continue
 
+        # Disabled MeshRenderer (m_Enabled: 0) → invisible in Unity at runtime.
+        # Common for collision-only meshes (frame_col) that have a MeshCollider
+        # but no visible rendering. Make the Roblox Part invisible too.
+        renderer_enabled = int(comp.properties.get("m_Enabled", 1))
+        if renderer_enabled == 0:
+            part.transparency = 1.0
+            part.cast_shadow = False
+            return  # No material to apply — renderer is off
+
         # Extract CastShadow from m_CastShadows: 0=Off, 1=On, 2=TwoSided, 3=ShadowsOnly
         cast_shadows = int(comp.properties.get("m_CastShadows", 1))
         if cast_shadows == 0:
@@ -2496,6 +2548,12 @@ def _apply_prefab_materials(
     for comp in components:
         if comp.component_type not in ("MeshRenderer", "SkinnedMeshRenderer"):
             continue
+
+        # Disabled renderer → invisible collision-only mesh
+        if int(comp.properties.get("m_Enabled", 1)) == 0:
+            part.transparency = 1.0
+            part.cast_shadow = False
+            return
 
         mat_refs = comp.properties.get("m_Materials", [])
         if not mat_refs:
@@ -2891,9 +2949,13 @@ def _convert_fbx_prefab_instance(
     rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*stripped_rot)
     rot_mat = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
 
-    # Mesh pivot vertical correction
+    # Mesh pivot vertical correction — only for single-mesh FBX instances.
+    # Multi-sub-mesh models have child positions from mesh_hierarchies that
+    # already include the correct Y offset. Applying the vertical offset to
+    # the parent would double-count, lifting the model above ground.
     mesh_guid = pi.source_prefab_guid if hasattr(pi, 'source_prefab_guid') else None
-    if mesh_guid and guid_index:
+    _multi_subs = _get_multi_sub_meshes(mesh_guid, guid_index) if mesh_guid else None
+    if mesh_guid and guid_index and not _multi_subs:
         ry += _compute_mesh_vertical_offset(mesh_guid, guid_index, scl[1])
 
     cframe = RbxCFrame(
@@ -3021,29 +3083,117 @@ def _convert_fbx_prefab_instance(
         for mg in material_guids:
             if mg in material_mappings:
                 mat = material_mappings[mg]
-                for t in _targets:
-                    _apply_material_to_part(t, mat, uploaded_assets)
-                _mat_applied = True
-                break
+                # Only count as applied if the material actually has textures —
+                # otherwise fall through to the co-located texture fallback so
+                # that textures like chainlink.psd (referenced only by child
+                # materials, not the one baked into the scene m_Materials[0])
+                # can still be discovered for multi-sub-mesh FBX files.
+                has_textures = (
+                    getattr(mat, "color_map_path", None)
+                    or getattr(mat, "normal_map_path", None)
+                )
+                if has_textures:
+                    for t in _targets:
+                        _apply_material_to_part(t, mat, uploaded_assets)
+                    _mat_applied = True
+                    break
 
     if not _mat_applied and uploaded_assets:
-        # Find textures co-located with the FBX file
+        # Find textures co-located with the FBX file.
+        #
+        # Multi-sub-mesh FBX files (like tallfence.fbx with frame+chain)
+        # reference multiple .mat files. Each .mat points at its own
+        # texture. We prefer a sibling material's texture over a raw
+        # co-located image, since materials carry the correct ColorMap
+        # assignment. Fall back to directory scanning if no material in
+        # the FBX's sibling Materials/ folder has textures.
         from core.roblox_types import RbxSurfaceAppearance
         fbx_dir = str(fbx_path.parent) if fbx_path else ""
         color_url = ""
         normal_url = ""
-        for asset_key, asset_url in uploaded_assets.items():
-            if fbx_dir and asset_key.startswith(fbx_dir.replace(str(guid_index.project_root) + "/", "").replace(str(guid_index.project_root), "") if guid_index else ""):
-                lower = asset_key.lower()
-                if any(ext in lower for ext in ('.png', '.psd', '.tga', '.jpg', '.bmp')):
-                    if '_n.' in lower or '_normal' in lower or 'normal' in lower:
-                        normal_url = asset_url
-                    elif not color_url:
-                        color_url = asset_url
+
+        # Track whether the sibling material was a cutout/transparent
+        # shader so we can set alpha_mode correctly later on.
+        sibling_alpha_mode: str | None = None
+
+        if fbx_path and guid_index:
+            # Scan the FBX's sibling Materials/ directory for .mat files.
+            # FBX files have their own baked-in material references that
+            # aren't surfaced via the scene YAML (e.g., tallfence.fbx has
+            # frame + chainlink materials; the scene only overrides [0]).
+            # Parse those .mat files and pick the first one that has a
+            # _MainTex texture whose GUID was uploaded.
+            import re as _re
+            from converter.material_mapper import (
+                _BUILTIN_CUTOUT_SHADER_IDS,
+                _BUILTIN_TRANSPARENT_SHADER_IDS,
+            )
+            mat_sibling_dir = fbx_path.parent / "Materials"
+            if mat_sibling_dir.exists():
+                for mat_file in sorted(mat_sibling_dir.glob("*.mat")):
+                    try:
+                        text = mat_file.read_text(errors="replace")
+                    except OSError:
+                        continue
+                    # Find _MainTex block and its texture guid
+                    m = _re.search(
+                        r"- _MainTex:\s*\n\s+m_Texture:\s*\{fileID:\s*\d+,\s*guid:\s*([0-9a-f]+)",
+                        text,
+                    )
+                    if not m:
+                        continue
+                    tex_guid = m.group(1)
+                    tex_path = guid_index.resolve(tex_guid)
+                    if not tex_path:
+                        continue
+                    # Look up this texture in uploaded_assets
+                    for ak, au in uploaded_assets.items():
+                        if tex_path.name in ak or tex_guid in ak:
+                            color_url = au
+                            break
+                    if color_url:
+                        # Detect cutout/transparent by shader fileID
+                        sm = _re.search(r"m_Shader:\s*\{fileID:\s*(\d+)", text)
+                        if sm:
+                            sid = int(sm.group(1))
+                            if sid in _BUILTIN_CUTOUT_SHADER_IDS or sid in _BUILTIN_TRANSPARENT_SHADER_IDS:
+                                sibling_alpha_mode = "Transparency"
+                        # Also try to find a normal map in the same material
+                        nm = _re.search(
+                            r"- _BumpMap:\s*\n\s+m_Texture:\s*\{fileID:\s*\d+,\s*guid:\s*([0-9a-f]+)",
+                            text,
+                        )
+                        if nm:
+                            ng = nm.group(1)
+                            nt_path = guid_index.resolve(ng)
+                            if nt_path:
+                                for ak, au in uploaded_assets.items():
+                                    if nt_path.name in ak or ng in ak:
+                                        normal_url = au
+                                        break
+                        break
+
+        if not color_url:
+            # Fallback: scan uploaded assets by path prefix
+            for asset_key, asset_url in uploaded_assets.items():
+                if fbx_dir and asset_key.startswith(fbx_dir.replace(str(guid_index.project_root) + "/", "").replace(str(guid_index.project_root), "") if guid_index else ""):
+                    lower = asset_key.lower()
+                    if any(ext in lower for ext in ('.png', '.psd', '.tga', '.jpg', '.bmp')):
+                        if '_n.' in lower or '_normal' in lower or 'normal' in lower:
+                            if not normal_url:
+                                normal_url = asset_url
+                        elif not color_url:
+                            color_url = asset_url
         if color_url:
+            # alpha_mode comes from the sibling .mat's shader when it's a
+            # legacy cutout/transparent shader (chain-link fences use
+            # Transparent/Cutout/Diffuse, fileID 51). Otherwise default
+            # to Overlay.
+            alpha_mode = sibling_alpha_mode or "Overlay"
             sa = RbxSurfaceAppearance(
                 color_map=color_url,
                 normal_map=normal_url,
+                alpha_mode=alpha_mode,
             )
             for t in _targets:
                 t.surface_appearance = sa
@@ -3243,6 +3393,24 @@ def _convert_prefab_instance(
         is_root_mod = (not root_target_fid or not mod_target_fid or
                        mod_target_fid == "0" or mod_target_fid == root_target_fid)
 
+        # Custom MonoBehaviour field overrides: if the propertyPath doesn't
+        # match any known Unity system property (m_*) and isn't a transform
+        # component, treat it as a serialized field override → store as
+        # an attribute on the resulting Part so scripts can read it.
+        if not pp.startswith("m_") and not pp.startswith("Serialized"):
+            # Simple scalar overrides (int/float/string/bool)
+            target_info = mod.get("target", {})
+            if isinstance(val, str):
+                # Try numeric first
+                try:
+                    custom_field_overrides[pp] = float(val)
+                except ValueError:
+                    if val.lower() in ("true", "false"):
+                        custom_field_overrides[pp] = val.lower() == "true"
+                    elif len(val) < 100:
+                        custom_field_overrides[pp] = val
+            continue
+
         try:
             fval = float(val)
         except (ValueError, TypeError):
@@ -3383,13 +3551,16 @@ def _convert_prefab_instance(
                 rbx_size = unity_scale_to_roblox_size(combined_scl)
                 part = RbxPart(name=name, class_name="MeshPart", cframe=cframe, size=rbx_size, anchored=True)
                 mesh_id = _resolve_mesh_id(root.mesh_guid, guid_index, uploaded_assets,
-                                           mesh_file_id=root.mesh_file_id if hasattr(root, 'mesh_file_id') else None)
+                                           mesh_file_id=root.mesh_file_id if hasattr(root, 'mesh_file_id') else None,
+                                           mesh_name=root.name if hasattr(root, 'name') else None)
                 if mesh_id:
                     part.mesh_id = mesh_id
                 # Compute mesh size from native Roblox data
                 sized = False
                 if _mesh_native_sizes and guid_index:
-                    result = _compute_mesh_size(combined_scl, root.mesh_guid, guid_index, _mesh_native_sizes)
+                    result = _compute_mesh_size(combined_scl, root.mesh_guid, guid_index, _mesh_native_sizes,
+                                                mesh_file_id=root.mesh_file_id if hasattr(root, 'mesh_file_id') else None,
+                                                mesh_name=root.name if hasattr(root, 'name') else None)
                     if result:
                         part.size, part.initial_size = result
                         sized = True
@@ -3516,7 +3687,8 @@ def _convert_prefab_instance(
             part.size = (max(bx, 0.001), max(by, 0.001), max(bz, 0.001))
         elif has_mesh and root.mesh_guid:
             mesh_id = _resolve_mesh_id(root.mesh_guid, guid_index, uploaded_assets,
-                                        mesh_file_id=root.mesh_file_id if hasattr(root, 'mesh_file_id') else None)
+                                        mesh_file_id=root.mesh_file_id if hasattr(root, 'mesh_file_id') else None,
+                                        mesh_name=root.name if hasattr(root, 'name') else None)
             if mesh_id:
                 part.mesh_id = mesh_id
             # Store scale attributes for MeshLoader runtime sizing
@@ -3530,7 +3702,9 @@ def _convert_prefab_instance(
             combined_scale = (sx, sy, sz)
             sized = False
             if _mesh_native_sizes and guid_index:
-                result = _compute_mesh_size(combined_scale, root.mesh_guid, guid_index, _mesh_native_sizes)
+                result = _compute_mesh_size(combined_scale, root.mesh_guid, guid_index, _mesh_native_sizes,
+                                            mesh_file_id=root.mesh_file_id if hasattr(root, 'mesh_file_id') else None,
+                                            mesh_name=root.name if hasattr(root, 'name') else None)
                 if result:
                     part.size, part.initial_size = result
                     sized = True
@@ -3628,6 +3802,25 @@ def _convert_prefab_node(
     local_pos = list(node.position)
     local_rot = list(node.rotation)
     local_scl = list(node.scale)
+
+    # For sub-meshes of multi-mesh FBX files, Unity stores the sub-mesh
+    # PIVOT position, but Roblox positions MeshParts at the bounding-box
+    # CENTER.  When mesh_hierarchies data is available, use the Roblox
+    # center position (converted to Unity coords) instead of the Unity
+    # pivot position.  This corrects visual spacing between parts.
+    _is_multi_sub = False
+    if parent_pos is not None and node.mesh_guid and _mesh_hierarchies and guid_index:
+        _mfid = node.mesh_file_id if hasattr(node, 'mesh_file_id') else None
+        _multi = _get_multi_sub_meshes(node.mesh_guid, guid_index)
+        if _multi and len(_multi) > 1:
+            sub_mesh = _resolve_sub_mesh(node.mesh_guid, _mfid, guid_index, mesh_name=node.name)
+            if sub_mesh:
+                sm_pos = sub_mesh.get("position", [0, 0, 0])
+                # mesh_hierarchies positions use Roblox coords (Z negated vs Unity).
+                # Convert to Unity space: negate Z.
+                local_pos = [sm_pos[0], sm_pos[1], -sm_pos[2]]
+                _is_multi_sub = True
+
     if parent_pos is not None:
         # Apply parent rotation to local position, then add parent position.
         # This is how Unity composes parent + child transforms.
@@ -3710,9 +3903,10 @@ def _convert_prefab_node(
     rx, ry, rz = unity_to_roblox_pos(*local_pos)
 
     # Mesh pivot vertical correction — adjusts for difference between FBX
-    # origin and Roblox bounding-box center.  Applied to all FBX types
-    # (Y-up and Z-up) using per-sub-mesh position from mesh_hierarchies.
-    if node.mesh_guid and guid_index:
+    # origin and Roblox bounding-box center.  Skip for multi-sub-mesh FBX
+    # children — their positions were already replaced with mesh_hierarchies
+    # center positions above, so no pivot-to-center correction is needed.
+    if node.mesh_guid and guid_index and not _is_multi_sub:
         _mfid = node.mesh_file_id if hasattr(node, 'mesh_file_id') else None
         ry += _compute_mesh_vertical_offset(node.mesh_guid, guid_index, local_scl[1], mesh_file_id=_mfid, mesh_name=node.name)
 
@@ -3759,7 +3953,8 @@ def _convert_prefab_node(
         part.size = (max(bx, 0.001), max(by, 0.001), max(bz, 0.001))
     elif has_mesh and node.mesh_guid:
         mesh_id = _resolve_mesh_id(node.mesh_guid, guid_index, uploaded_assets,
-                                    mesh_file_id=node.mesh_file_id if hasattr(node, 'mesh_file_id') else None)
+                                    mesh_file_id=node.mesh_file_id if hasattr(node, 'mesh_file_id') else None,
+                                    mesh_name=node.name if hasattr(node, 'name') else None)
         if mesh_id:
             part.mesh_id = mesh_id
         # Store scale for MeshLoader runtime sizing
@@ -3772,7 +3967,9 @@ def _convert_prefab_node(
         # Compute mesh size from native Roblox data (requires upload + resolve)
         sized = False
         if _mesh_native_sizes and guid_index:
-            result = _compute_mesh_size(local_scl, node.mesh_guid, guid_index, _mesh_native_sizes)
+            result = _compute_mesh_size(local_scl, node.mesh_guid, guid_index, _mesh_native_sizes,
+                                        mesh_file_id=node.mesh_file_id if hasattr(node, 'mesh_file_id') else None,
+                                        mesh_name=node.name if hasattr(node, 'name') else None)
             if result:
                 part.size, part.initial_size = result
                 sized = True
@@ -3932,6 +4129,11 @@ def _fix_empty_mesh_parts(parts: list[RbxPart]) -> int:
     When a mesh GUID resolves to a non-FBX file (e.g. embedded prefab mesh),
     the MeshPart gets no mesh_id and renders as a large default block.
     Convert these to small transparent Parts so they don't clutter the scene.
+
+    Also hides plain Parts that are children of Models and have no visual
+    content (bone anchors like LeftHand/RightHand, empty placeholders).
+    These are typically empty GameObjects in Unity that serve as transform
+    anchors but shouldn't render as visible boxes in Roblox.
     """
     count = 0
     for part in parts:
@@ -3940,6 +4142,16 @@ def _fix_empty_mesh_parts(parts: list[RbxPart]) -> int:
             part.transparency = 1.0
             part.can_collide = False
             part.size = (1.0, 1.0, 1.0)
+            count += 1
+        elif (part.class_name == "Part"
+              and not part.mesh_id
+              and not part.surface_appearance
+              and getattr(part, 'transparency', 0) < 1.0
+              and part.color == (0.63, 0.63, 0.63)):
+            # Plain gray Part with no mesh or texture — likely a bone anchor
+            # or empty placeholder that shouldn't render visually.
+            part.transparency = 1.0
+            part.can_collide = False
             count += 1
         if hasattr(part, 'children') and part.children:
             count += _fix_empty_mesh_parts(part.children)

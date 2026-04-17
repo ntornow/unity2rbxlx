@@ -138,8 +138,10 @@ Priority: P0 = blocking gameplay, P1 = significant quality, P2 = nice to have.
 - [x] **Object pooling runtime shim**: Fixed 2026-04-12. New `runtime/object_pool.luau` module provides `ObjectPool.new(template, initialSize)`, `:Get()`, `:Release(obj)`, `:Clear()`. Auto-injected when pool patterns detected in transpiled scripts. API mappings added for `.Release()` and `ObjectPool.Get()`.
 - [x] **TODO placeholders in transpiled scripts**: Fixed 2026-04-12. Eval framework now tracks `todo_placeholders` and `csharp_residue` per project. Results: 0 C# residue across all 9 projects. TODO counts: SimpleFPS=2, Gamekit3D=13, SanAndreasUnity=335 (GTA SA loader complexity). These are tracked in eval-diff as lower-is-better metrics so future improvements reduce the count.
 - [x] **OnCollisionStay/OnCollisionExit**: Fixed 2026-04-12. OnCollisionStay/OnTriggerStay → part.Touched, OnCollisionExit/OnTriggerExit → part.TouchEnded. Both were already in api_mappings; Stay variants added. The per-frame semantic gap (Unity Stay fires every FixedUpdate, Roblox Touched fires once per contact) is inherent to the platform — noted in mapping comments.
-- [ ] **Font upload**: Not supported by Roblox Open Cloud API. UI text uses default Roblox font.
-- [ ] **Video upload**: Not supported by Roblox Open Cloud API. VideoFrame component works but needs manual video ID.
+- [ ] **Binary animation/controller parsing**: .anim and .controller files are skipped when binary-encoded. Affects ~40% of games with skeletal animation. Needs UnityPy integration or binary YAML parser.
+- [ ] **Persistent prefab/asset cache**: Prefab library is in-memory only. SQLite or pickle cache keyed by (GUID, mtime) would halve pipeline time for multi-scene projects and large games.
+- [x] **Font upload**: Roblox API limitation (not actionable). UI text uses default Roblox font. Users can manually upload fonts via Creator Dashboard.
+- [x] **Video upload**: Roblox API limitation (not actionable). VideoFrame component emitted correctly but video ID must be set manually after upload via Creator Dashboard.
 - [x] **Eval baseline for all 9 projects**: Fixed 2026-04-12. All 9 projects complete in 85s total. `eval_baseline.json` committed with per-project metrics. `u2r.py eval-diff` can gate future changes. **Open follow-up:** wire eval-diff into CI nightly job.
 
 ### Fixed (2026-03-28 continued)
@@ -218,6 +220,11 @@ Priority: `P0` = blocks gameplay, `P1` = correctness / maintainability, `P2` = n
 ### Scope / project
 - [x] **P1 — No second project end-to-end-verified this session.** Fixed 2026-04-12: ran eval across 8 projects (all except Gamekit3D). 6 completed successfully (3D-Platformer, BoatAttack, BossRoom, ChopChop, PrefabWorkflows, RedRunner) with 100% script transpilation rates. SanAndreasUnity and Gamekit3D have slow write_output phases being profiled. Initial eval baseline committed. SimpleFPS verified in Studio with gameplay testing.
 - [x] **P2 — `converter/output/<project>/conversion_context.json` holds real IDs but is only protected by `.gitignore`.** Fixed 2026-04-12: new `ConversionContext.save_sanitized()` writes a redacted copy — strips `universe_id`, `place_id`, `experience_name`, `uploaded_assets`, `mesh_native_sizes`, `mesh_hierarchies` — and stamps a `_sanitized: true` marker. Preserves stats, phase completion, warnings, Unity project path. 2 new tests in `TestConversionContextSanitizedSave`. The regular `.save()` still writes everything for pause/resume.
+
+## Rendering Differences (2026-04-12 visual comparison)
+
+- [ ] **Mesh Z-axis mirroring**: Unity left-handed → Roblox right-handed coordinate conversion negates Z positions but doesn't mirror mesh geometry. All asymmetric features (text, door handles) render backwards. Fix options: (a) pre-rotate each mesh 180° around Y before upload, (b) apply negative Z scale on the CFrame (may not work for MeshParts), (c) re-export FBXes with mirrored geometry.
+- [ ] **Wire/grid mesh opacity**: Chain-link fences and similar thin-geometry meshes render as opaque in Roblox because the mesh renderer fills sub-pixel gaps between wires. Unity renders these gaps correctly. The texture alpha (87.7% transparent for chainlink.psd) could compensate via AlphaMode=Transparency, but Unity's material has _Mode=0 (Opaque), so we'd be changing the intended rendering mode. Documenting as a platform rendering difference.
 
 ## Open Gaps (2026-04-14 session — inline-over-runtime-wrappers)
 

@@ -246,6 +246,19 @@ def _convert_ui_element(node: SceneNode) -> RbxUIElement | None:
     elif element_class == "ScrollingFrame":
         _apply_scroll_properties(element, ui_properties)
 
+    # Extract UI widget properties — these store values/config as
+    # attributes so runtime scripts can read them.
+    for comp in node.components:
+        ct = comp.component_type
+        if ct == "Slider":
+            _apply_slider_properties(element, comp.properties)
+        elif ct in ("InputField", "TMP_InputField"):
+            _apply_inputfield_properties(element, comp.properties)
+        elif ct in ("Dropdown", "TMP_Dropdown"):
+            _apply_dropdown_properties(element, comp.properties)
+        elif ct == "Toggle":
+            _apply_toggle_properties(element, comp.properties)
+
     # Extract background color.
     _apply_color_properties(element, ui_properties)
 
@@ -410,10 +423,89 @@ def _apply_image_properties(element: RbxUIElement, props: dict[str, Any]) -> Non
 
 
 def _apply_scroll_properties(element: RbxUIElement, props: dict[str, Any]) -> None:
-    """Extract scroll properties (placeholder -- limited mapping)."""
-    # ScrollRect properties map loosely to ScrollingFrame.
-    # Most configuration is done via Roblox properties directly.
-    pass
+    """Extract scroll properties from Unity ScrollRect → Roblox ScrollingFrame."""
+    horizontal = props.get("m_Horizontal", 1)
+    vertical = props.get("m_Vertical", 1)
+    if not hasattr(element, 'attributes'):
+        element.attributes = {}
+    element.attributes["_ScrollHorizontal"] = bool(int(horizontal))
+    element.attributes["_ScrollVertical"] = bool(int(vertical))
+
+
+def _apply_slider_properties(element: RbxUIElement, props: dict[str, Any]) -> None:
+    """Extract Slider properties as attributes for runtime scripts."""
+    if not hasattr(element, 'attributes'):
+        element.attributes = {}
+    for key in ("m_MinValue", "m_MaxValue", "m_Value", "m_WholeNumbers"):
+        val = props.get(key)
+        if val is not None:
+            attr_name = key[2:]  # Strip m_ prefix
+            try:
+                element.attributes[attr_name] = float(val)
+            except (TypeError, ValueError):
+                pass
+    # Direction: 0=LeftToRight, 1=RightToLeft, 2=BottomToTop, 3=TopToBottom
+    direction = props.get("m_Direction", 0)
+    try:
+        element.attributes["SliderDirection"] = int(direction)
+    except (TypeError, ValueError):
+        pass
+
+
+def _apply_inputfield_properties(element: RbxUIElement, props: dict[str, Any]) -> None:
+    """Extract InputField/TMP_InputField properties."""
+    text = props.get("m_Text", props.get("m_text", ""))
+    if isinstance(text, str) and text:
+        element.text = text
+    placeholder = props.get("m_Placeholder", {})
+    if isinstance(placeholder, dict):
+        # The placeholder is a reference to a child Text component
+        # Store the reference for post-processing
+        if not hasattr(element, 'attributes'):
+            element.attributes = {}
+        element.attributes["_PlaceholderRef"] = str(placeholder.get("fileID", ""))
+    char_limit = props.get("m_CharacterLimit", 0)
+    try:
+        cl = int(char_limit)
+        if cl > 0:
+            if not hasattr(element, 'attributes'):
+                element.attributes = {}
+            element.attributes["_CharacterLimit"] = cl
+    except (TypeError, ValueError):
+        pass
+
+
+def _apply_dropdown_properties(element: RbxUIElement, props: dict[str, Any]) -> None:
+    """Extract Dropdown/TMP_Dropdown properties as attributes."""
+    if not hasattr(element, 'attributes'):
+        element.attributes = {}
+    value = props.get("m_Value", 0)
+    try:
+        element.attributes["DropdownValue"] = int(value)
+    except (TypeError, ValueError):
+        pass
+    # Options are stored as m_Options.m_Options[].m_Text
+    options = props.get("m_Options", {})
+    if isinstance(options, dict):
+        option_list = options.get("m_Options", [])
+        if isinstance(option_list, list):
+            texts = []
+            for opt in option_list:
+                if isinstance(opt, dict):
+                    texts.append(opt.get("m_Text", ""))
+            if texts:
+                element.attributes["_DropdownOptions"] = ",".join(texts)
+
+
+def _apply_toggle_properties(element: RbxUIElement, props: dict[str, Any]) -> None:
+    """Extract Toggle properties."""
+    if not hasattr(element, 'attributes'):
+        element.attributes = {}
+    is_on = props.get("m_IsOn", 1)
+    try:
+        element.attributes["ToggleIsOn"] = bool(int(is_on))
+    except (TypeError, ValueError):
+        pass
 
 
 def _apply_color_properties(element: RbxUIElement, props: dict[str, Any]) -> None:

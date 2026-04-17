@@ -64,7 +64,9 @@ python3 convert_interactive.py validate <output_dir> --write 2>/dev/null
 
 The transpiler converts files independently; 4.5 is the cross-file architectural pass. Mirror Unity's component separation, state machine, and timing model — **faithful port over workarounds**. The overview file routes you to the seven sub-phase files and defines the dependency DAG.
 
-### Step 5: Assembly — `references/phase-5-assembly.md`
+### Step 5: Moderate & Assemble — `references/phase-5-assembly.md`
+
+Screen every asset against Roblox's published safety standards first. Only run `assemble` after moderation comes back clean (see the reference file for standards, screening rules, and halting behaviour).
 
 ```bash
 python3 convert_interactive.py assemble <unity_project_path> <output_dir> \
