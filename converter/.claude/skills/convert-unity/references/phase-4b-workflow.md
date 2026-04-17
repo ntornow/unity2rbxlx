@@ -1,6 +1,6 @@
-# Phase 4: Code Transpilation
+# Phase 4b.0: Transpile Workflow
 
-AI-assisted C# → Luau translation. Consumes `conversion_plan.json` from Phase 4a; universal coding rules in `phase-4b-universal-rules.md` and migrated transpile-time rules in `phase-4b-transpile-rules.md`. Residual cross-file gaps are handled by Phase 4c.
+AI-assisted C# → Luau translation. Consumes `conversion_plan.json` from Phase 4a. Rules live in `phase-4b-universal-rules.md` (invariants) and `phase-4b-transpile-rules.md` (per-C#-idiom). Residual cross-file gaps are handled by Phase 4c.
 
 ## Command
 
