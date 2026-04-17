@@ -340,6 +340,28 @@ class Pipeline:
             self.state.asset_manifest.total_size_bytes / (1024 * 1024),
         )
 
+        # Convert ScriptableObject .asset files (Unity data assets) into
+        # Luau ModuleScripts. The .luau files are written under
+        # <output>/scripts/scriptable_objects/ so the disk-rehydration path
+        # picks them up — which was the Phase 3 plan's "critical" persistence
+        # requirement so preserved-script assemble runs don't lose them.
+        try:
+            from converter.scriptable_object_converter import convert_asset_files
+            so_result = convert_asset_files(self.unity_project_path)
+            if so_result.converted:
+                self.state.scriptable_objects = so_result
+                so_dir = self.output_dir / "scripts" / "scriptable_objects"
+                so_dir.mkdir(parents=True, exist_ok=True)
+                for asset in so_result.assets:
+                    out_path = so_dir / f"{asset.asset_name}.luau"
+                    out_path.write_text(asset.luau_source, encoding="utf-8")
+                log.info(
+                    "[extract_assets] Converted %d ScriptableObject .asset files",
+                    so_result.converted,
+                )
+        except Exception as exc:
+            log.debug("[extract_assets] ScriptableObject conversion skipped: %s", exc)
+
         # Slice individual sprites out of any spritesheet textures the
         # project ships with. Writes to <output>/sprites/ and exposes a
         # GUID -> file mapping on the ctx for SpriteRenderer consumers.
@@ -1236,6 +1258,29 @@ return table.concat(allData, "\\n")'''
                 ))
             log.info("[write_output] Wrote %d animation data modules",
                      len(self.state.animation_result.animation_data_modules))
+
+        # Attach ScriptableObject data tables as ModuleScripts. The .luau
+        # files were written to scripts/scriptable_objects/ during
+        # extract_assets so both the fresh-transpile and preserved-script
+        # assemble paths end up with the same set on disk — but only the
+        # preserved path walks scripts/ to populate rbx_place. Attach
+        # explicitly here and dedupe by name so we don't double up on
+        # rehydration.
+        if self.state.scriptable_objects:
+            from core.roblox_types import RbxScript
+            existing = {s.name for s in self.state.rbx_place.scripts}
+            added = 0
+            for asset in self.state.scriptable_objects.assets:
+                if asset.asset_name in existing:
+                    continue
+                self.state.rbx_place.scripts.append(RbxScript(
+                    name=asset.asset_name,
+                    source=asset.luau_source,
+                    script_type="ModuleScript",
+                ))
+                added += 1
+            if added:
+                log.info("[write_output] Added %d ScriptableObject ModuleScripts", added)
 
         # Post-transpilation: rewrite asset references in scripts.
         from converter.script_asset_rewriter import rewrite_asset_references
