@@ -57,7 +57,7 @@ python3 convert_interactive.py materials <unity_project_path> <output_dir> 2>/de
 
 Upfront architectural planning pass. Read the Unity project and emit `conversion_plan.json` with architecture map, divergence overrides, templates manifest, module boundaries, and **storage plan** (the 3 networking questions: server / client / replicated). The overview file routes to the five sub-phase files and defines the dependency DAG. No pipeline command yet — planning is currently agent-driven.
 
-### Step 4b: Transpile with plan — `references/phase-4-transpilation.md` + `references/phase-4b-*.md`
+### Step 4b: Transpile with plan — `references/phase-4b-workflow.md` + `references/phase-4b-universal-rules.md` + `references/phase-4b-transpile-rules.md`
 
 ```bash
 python3 convert_interactive.py transpile <unity_project_path> <output_dir> --api-key <key> 2>/dev/null

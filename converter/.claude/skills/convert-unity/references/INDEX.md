@@ -15,9 +15,9 @@ Phase-specific documentation for the `convert-unity` skill. Each file owns one n
 | `phase-4a-runtime-plan.md` | 4a.3 | Animation approach, templates manifest, movement model |
 | `phase-4a-module-boundaries.md` | 4a.4 | Module-per-component plan, bootstrap shape |
 | `phase-4a-storage-classification.md` | 4a.5 | **Server / client / replicated storage decisions (3 networking questions)** |
-| `phase-4-transpilation.md` | 4b | Transpile errors, review UX |
+| `phase-4b-workflow.md` | 4b.0 | Transpile CLI, error codes, per-script review UX |
 | `phase-4b-universal-rules.md` | 4b.1 | Game loop, yielding, visibility, assets, ScreenGui |
-| `phase-4b-transpile-rules.md` | 4b.2 | Transpile-time rules (migrated from transpiler gaps) |
+| `phase-4b-transpile-rules.md` | 4b.2 | Per-C#-idiom emit rules (migrated from transpiler gaps) |
 | `phase-4c-overview.md` | 4c | Router for reactive sub-phase files below |
 | `phase-4c-runtime-emit.md` | 4c.1 | Spawner code, animator wiring on clones, particle `:Emit()` |
 | `phase-4c-bootstrap-emit.md` | 4c.2 | Emit `GameBootstrap.lua` against transpiled modules |
