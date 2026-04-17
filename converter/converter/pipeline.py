@@ -1659,6 +1659,21 @@ script.Disabled = true
                  rbxlx_path, result.get("parts_written", 0),
                  result.get("scripts_written", 0))
 
+        # Produce binary .rbxl alongside the XML .rbxlx. The Open Cloud Place
+        # API (POST /universes/.../places/.../versions) only accepts binary
+        # rbxl uploads, so a sibling .rbxl is written here for that future
+        # integration. Skipped silently if lz4 isn't installed; a best-effort
+        # log is emitted on any other failure so the conversion still succeeds.
+        try:
+            from roblox.rbxl_binary_writer import xml_to_binary
+            rbxl_path = xml_to_binary(rbxlx_path)
+            log.info("[write_output] Binary RBXL: %s (%.1f KB)",
+                     rbxl_path, rbxl_path.stat().st_size / 1024)
+        except ImportError:
+            log.debug("[write_output] lz4 not installed; skipping binary .rbxl")
+        except Exception as exc:
+            log.warning("[write_output] Binary .rbxl conversion failed: %s", exc)
+
         # Verify transform accuracy: compare Unity scene positions to rbxlx output.
         # Logs errors for any object with >10° rotation error or >2m position error.
         try:

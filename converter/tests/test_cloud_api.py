@@ -142,3 +142,40 @@ class TestProbeAssetAvailability:
         from roblox.cloud_api import probe_asset_availability
         assert probe_asset_availability("", "k") == "unknown"
         assert probe_asset_availability("dc5c29d6-34b4-46c8", "k") == "unknown"
+
+
+class TestUploadPlaceContentType:
+    """`upload_place` must send Content-Type ``application/xml`` for a .rbxlx
+    file and ``application/octet-stream`` for a .rbxl. The Open Cloud Place
+    endpoint rejects mismatched Content-Type headers, so this must be driven
+    by the file extension rather than hardcoded."""
+
+    @patch("roblox.cloud_api.requests.post")
+    def test_xml_content_type_for_rbxlx(self, mock_post, tmp_path):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {}
+        mock_post.return_value = mock_resp
+
+        from roblox.cloud_api import upload_place
+        rbxlx = tmp_path / "test.rbxlx"
+        rbxlx.write_text("<roblox></roblox>")
+        assert upload_place(rbxlx, "k", "1", "2") is True
+
+        headers = mock_post.call_args.kwargs["headers"]
+        assert headers["Content-Type"] == "application/xml"
+
+    @patch("roblox.cloud_api.requests.post")
+    def test_octet_stream_for_rbxl(self, mock_post, tmp_path):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {}
+        mock_post.return_value = mock_resp
+
+        from roblox.cloud_api import upload_place
+        rbxl = tmp_path / "test.rbxl"
+        rbxl.write_bytes(b"<roblox!\x89\xff\x0d\x0a\x1a\x0a")
+        assert upload_place(rbxl, "k", "1", "2") is True
+
+        headers = mock_post.call_args.kwargs["headers"]
+        assert headers["Content-Type"] == "application/octet-stream"

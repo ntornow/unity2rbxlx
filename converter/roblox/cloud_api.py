@@ -360,6 +360,14 @@ def upload_place(
         logger.error("Place file not found: %s", rbxlx_path)
         return False
 
+    # .rbxl is binary, .rbxlx is XML — pick the Content-Type accordingly so the
+    # Open Cloud endpoint accepts either.
+    content_type = (
+        "application/octet-stream"
+        if rbxlx_path.suffix.lower() == ".rbxl"
+        else "application/xml"
+    )
+
     url = _PLACE_VERSION_URL.format(universe_id=universe_id, place_id=place_id)
     params = {"versionType": "Published"}
 
@@ -371,7 +379,7 @@ def upload_place(
             params=params,
             headers={
                 **_auth_headers(api_key),
-                "Content-Type": "application/xml",
+                "Content-Type": content_type,
             },
             data=body,
             timeout=_DEFAULT_TIMEOUT,
