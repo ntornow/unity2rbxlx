@@ -1183,24 +1183,47 @@ return table.concat(allData, "\\n")'''
         if preserve_scripts:
             # Rehydrate scripts from disk into rbx_place so the .rbxlx
             # includes the user's hand-edited Luau files.
+            #
+            # Use the previous run's conversion_plan.json (written by
+            # _classify_storage) as the source of truth for script_type
+            # and parent_path — content heuristics are the fallback for
+            # scripts missing from the plan (e.g. hand-added after the
+            # last classify run). This closes the Phase 3 plan item 12
+            # loop: the classifier writes, the rehydrator reads.
             from core.roblox_types import RbxScript
+            plan_lookup = self._load_storage_plan_for_rehydration()
+
             luau_files = sorted(scripts_dir.rglob("*.luau"))
             for luau_path in luau_files:
                 source = luau_path.read_text(encoding="utf-8")
                 name = luau_path.stem
-                # Infer script type from source content
-                script_type: str = "Script"
-                if source.rstrip().endswith("return " + name) or "\nreturn " in source:
-                    script_type = "ModuleScript"
-                elif "game.Players.LocalPlayer" in source or "UserInputService" in source:
-                    script_type = "LocalScript"
-                self.state.rbx_place.scripts.append(RbxScript(
+
+                if name in plan_lookup:
+                    script_type, parent_path = plan_lookup[name]
+                else:
+                    # Fallback: content heuristic for files the plan didn't see.
+                    script_type = "Script"
+                    if source.rstrip().endswith("return " + name) or "\nreturn " in source:
+                        script_type = "ModuleScript"
+                    elif "game.Players.LocalPlayer" in source or "UserInputService" in source:
+                        script_type = "LocalScript"
+                    parent_path = None
+
+                script = RbxScript(
                     name=name,
                     source=source,
                     script_type=script_type,
-                ))
-            log.info("[write_output] Rehydrated %d scripts from disk (transpile skipped)",
-                     len(luau_files))
+                )
+                if parent_path and hasattr(script, "parent_path"):
+                    script.parent_path = parent_path
+                self.state.rbx_place.scripts.append(script)
+            log.info(
+                "[write_output] Rehydrated %d scripts from disk (%d via storage plan, "
+                "%d via content heuristic)",
+                len(luau_files),
+                sum(1 for p in luau_files if p.stem in plan_lookup),
+                sum(1 for p in luau_files if p.stem not in plan_lookup),
+            )
 
         elif self.state.transpilation_result:
             from core.roblox_types import RbxScript
@@ -1847,6 +1870,47 @@ script.Disabled = true
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _load_storage_plan_for_rehydration(self) -> dict[str, tuple[str, str | None]]:
+        """Load the previous run's conversion_plan.json and return a
+        ``name -> (script_type, parent_path)`` mapping keyed by script name.
+
+        Returns an empty dict if the plan file is missing / malformed, so
+        rehydration falls back to the content heuristic. The mapping covers
+        every script the classifier decided on — rehydration uses the
+        recorded script_type and parent_path directly instead of re-running
+        heuristics.
+        """
+        plan_path = self.output_dir / "conversion_plan.json"
+        if not plan_path.exists():
+            return {}
+
+        import json as _json
+        try:
+            raw = _json.loads(plan_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            log.debug("[rehydrate] conversion_plan.json unreadable: %s", exc)
+            return {}
+
+        plan = raw.get("storage_plan") or {}
+        # Map the Phase 4a.5 categories back to RbxScript.script_type + parent_path.
+        # Categories in StoragePlan: server_scripts / client_scripts /
+        # character_scripts / replicated_first_scripts / shared_modules /
+        # server_modules.
+        category_to_type_and_path: list[tuple[str, str, str]] = [
+            # (category_key, script_type, parent_path)
+            ("server_scripts",            "Script",       "ServerScriptService"),
+            ("client_scripts",            "LocalScript",  "StarterPlayer.StarterPlayerScripts"),
+            ("character_scripts",         "LocalScript",  "StarterPlayer.StarterCharacterScripts"),
+            ("replicated_first_scripts",  "ModuleScript", "ReplicatedFirst"),
+            ("shared_modules",            "ModuleScript", "ReplicatedStorage"),
+            ("server_modules",            "ModuleScript", "ServerStorage"),
+        ]
+        lookup: dict[str, tuple[str, str | None]] = {}
+        for cat_key, script_type, parent_path in category_to_type_and_path:
+            for name in plan.get(cat_key, []) or []:
+                lookup[name] = (script_type, parent_path)
+        return lookup
 
     def _classify_storage(self) -> None:
         """Phase 4a.5: run the storage classifier on populated scripts.
