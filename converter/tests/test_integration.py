@@ -618,8 +618,31 @@ class TestLuauValidator:
         from converter.luau_validator import validate_and_fix
         source = 'local h = UserInputService:GetGamepadState(Enum.UserInputType.Gamepad1)("Horizontal")'
         fixed, fixes = validate_and_fix("test", source)
+        # Call site rewritten to the utility helper, and the helper body
+        # (which contains IsKeyDown) is auto-injected at the top of the file.
+        assert "inputHorizontal()" in fixed
+        assert "local function inputHorizontal" in fixed
         assert "IsKeyDown" in fixed
         assert "GetGamepadState" not in fixed
+
+    def test_fix_input_getaxis_vertical(self):
+        from converter.luau_validator import validate_and_fix
+        source = 'local v = UserInputService:GetGamepadState(Enum.UserInputType.Gamepad1)("Vertical")'
+        fixed, _ = validate_and_fix("test", source)
+        assert "inputVertical()" in fixed
+        assert "local function inputVertical" in fixed
+        # Utility supports both WASD and arrow keys.
+        assert "Enum.KeyCode.W" in fixed
+        assert "Enum.KeyCode.Up" in fixed
+        assert "GetGamepadState" not in fixed
+
+    def test_fix_input_getaxis_comment_form(self):
+        """The transpiler sometimes leaves a `-- Input.GetAxis("Horizontal")`
+        comment instead of the gamepad form; the validator should handle both."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local h = -- Input.GetAxis("Horizontal")'
+        fixed, _ = validate_and_fix("test", source)
+        assert "inputHorizontal()" in fixed
 
     def test_event_subscription_numeric_not_converted(self):
         """curHealth = curHealth + healAmount should NOT become curHealth:Connect(healAmount)."""

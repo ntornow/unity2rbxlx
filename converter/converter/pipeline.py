@@ -32,6 +32,7 @@ log = logging.getLogger(__name__)
 PHASES: list[str] = [
     "parse",
     "extract_assets",
+    "moderate_assets",
     "upload_assets",
     "resolve_assets",
     "convert_materials",
@@ -431,6 +432,70 @@ class Pipeline:
         if computed:
             log.info("[extract_assets] Computed FBX bounding boxes for %d meshes", computed)
 
+    def moderate_assets(self) -> None:
+        """Phase 2.5: Screen assets for safety violations before upload.
+
+        Checks filenames, script content, and audio names against Roblox's
+        Community Standards to prevent account moderation. Violations are
+        auto-added to the upload blocklist; warnings are logged.
+        """
+        if self.skip_upload:
+            log.info("[moderate_assets] Skipping (--no-upload)")
+            return
+
+        manifest = self.state.asset_manifest
+        if not manifest:
+            return
+
+        from converter.asset_moderator import moderate_assets, write_report
+
+        project_name = self.unity_project_path.name
+        scripts_dir = self.unity_project_path / "Assets"
+        report = moderate_assets(manifest, project_name, scripts_dir)
+
+        # Write report
+        report_path = write_report(report, self.output_dir)
+
+        # Log summary
+        log.info(
+            "[moderate_assets] Screened %d assets: %d OK, %d warnings, %d violations",
+            report.checked, report.ok, report.warnings, report.violations,
+        )
+
+        if report.violations > 0 or report.warnings > 0:
+            for f in report.findings:
+                if f.classification == "VIOLATION":
+                    log.warning(
+                        "[moderate_assets] VIOLATION: %s — %s [%s]",
+                        f.relative_path, f.evidence, ", ".join(f.standards),
+                    )
+                elif f.classification == "WARNING":
+                    log.warning(
+                        "[moderate_assets] WARNING: %s — %s [%s]",
+                        f.relative_path, f.evidence, ", ".join(f.standards),
+                    )
+
+        # Auto-blocklist violations
+        if report.violations > 0:
+            blocklist_file = self.output_dir / ".upload_blocklist"
+            existing = set()
+            if blocklist_file.exists():
+                existing = set(blocklist_file.read_text().splitlines())
+            new_blocks = [
+                f.relative_path for f in report.findings
+                if f.classification == "VIOLATION" and f.relative_path not in existing
+            ]
+            if new_blocks:
+                with open(blocklist_file, "a") as fh:
+                    for b in new_blocks:
+                        fh.write(b + "\n")
+                log.info(
+                    "[moderate_assets] Added %d violation(s) to upload blocklist",
+                    len(new_blocks),
+                )
+
+        log.info("[moderate_assets] Report: %s", report_path)
+
     def upload_assets(self) -> None:
         """Phase 3: Upload all assets (textures, meshes, audio) to Roblox."""
         if self.skip_upload:
@@ -542,6 +607,19 @@ class Pipeline:
 
                 upload_path = asset.path
                 name = asset.path.stem
+
+                # Fix mesh handedness: Unity (left-handed) vs Roblox
+                # (right-handed). Negates X and Y in FBX vertices,
+                # equivalent to 180° rotation around Z (vertical).
+                # Preserves triangle winding (no backface culling)
+                # and keeps text right-side up.
+                if kind == "mesh" and asset.path.suffix.lower() == ".fbx":
+                    from converter.fbx_binary import mirror_fbx_handedness
+                    mirror_dir = self.output_dir / "mirrored_meshes"
+                    mirror_dir.mkdir(parents=True, exist_ok=True)
+                    mirrored_path = mirror_dir / asset.path.name
+                    if mirror_fbx_handedness(asset.path, mirrored_path):
+                        upload_path = mirrored_path
 
                 # Determine whether this texture needs its alpha channel
                 # preserved. Alpha is only kept for textures that feed
@@ -814,9 +892,16 @@ class Pipeline:
         Skips if mesh data is already populated (from a previous run or manual
         resolve step).
         """
-        if self.ctx.mesh_native_sizes and self.ctx.mesh_hierarchies:
-            log.info("[resolve_assets] Mesh resolution data already present (%d meshes) — skipping",
-                     len(self.ctx.mesh_native_sizes))
+        # Check if all uploaded meshes have been resolved, not just some
+        uploaded_mesh_count = sum(
+            1 for k in self.ctx.uploaded_assets
+            if any(k.lower().endswith(ext) for ext in ('.fbx', '.obj'))
+        ) if self.ctx.uploaded_assets else 0
+        resolved_count = len(self.ctx.mesh_native_sizes) if self.ctx.mesh_native_sizes else 0
+
+        if resolved_count > 0 and resolved_count >= uploaded_mesh_count:
+            log.info("[resolve_assets] Mesh resolution data already present (%d/%d meshes) — skipping",
+                     resolved_count, uploaded_mesh_count)
             return
 
         if self.skip_upload:
@@ -1192,6 +1277,13 @@ return table.concat(allData, "\\n")'''
         fixes = fix_require_classifications(self.state.rbx_place.scripts)
         if fixes:
             log.info("[write_output] Reclassified %d scripts based on require() dependencies", fixes)
+
+        # Phase 4a.5 storage classification: assign each script a concrete
+        # parent_path (server/client/replicated) before rbxlx emission. See
+        # references/phase-4a-storage-classification.md. Currently inlined here;
+        # will be promoted to a distinct pipeline phase once write_output is
+        # split into assemble_scripts + serialize.
+        self._classify_storage()
 
         # Bind scripts to their target parts using _ScriptClass attributes.
         # In Unity, MonoBehaviours are children of GameObjects. We replicate
@@ -1753,6 +1845,39 @@ script.Disabled = true
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _classify_storage(self) -> None:
+        """Phase 4a.5: run the storage classifier on populated scripts.
+
+        Assigns each RbxScript a concrete ``parent_path`` based on call-graph
+        analysis + client/server API detection. Persists the resulting plan
+        to ``self.ctx.storage_plan`` and to ``conversion_plan.json`` in the
+        output directory.
+
+        Safe to call multiple times — the classifier is idempotent.
+        """
+        if self.state.rbx_place is None or not self.state.rbx_place.scripts:
+            return
+
+        from converter.storage_classifier import classify_storage
+        import json as _json
+
+        plan = classify_storage(
+            self.state.rbx_place.scripts,
+            dependency_map=self.state.dependency_map or None,
+        )
+        self.ctx.storage_plan = plan.to_dict()
+
+        plan_path = self.output_dir / "conversion_plan.json"
+        plan_path.write_text(
+            _json.dumps({"storage_plan": self.ctx.storage_plan}, indent=2),
+            encoding="utf-8",
+        )
+        log.info(
+            "[classify_storage] %d scripts classified (plan written to %s)",
+            len(plan.decisions),
+            plan_path.name,
+        )
+
     def _bind_scripts_to_parts(self) -> None:
         """Bind transpiled scripts to their target parts using _ScriptClass attributes.
 
@@ -1955,27 +2080,6 @@ script.Disabled = true
                         script_type="ModuleScript",
                     ))
                     injected += 1
-
-        # Script-content-based bridge injection: scan transpiled Luau for
-        # API usage patterns (Time.deltaTime, Input.GetKey, etc.) and inject
-        # the corresponding bridge ModuleScripts from runtime/.
-        try:
-            from converter.bridge_injector import detect_needed_bridges, inject_bridges
-            luau_sources = [s.source for s in self.state.rbx_place.scripts]
-            existing_names = {s.name for s in self.state.rbx_place.scripts}
-            bridge_result = detect_needed_bridges(luau_sources, existing_names)
-            for filename, source in inject_bridges(bridge_result.needed):
-                name = Path(filename).stem
-                if name not in existing_names:
-                    self.state.rbx_place.scripts.append(RbxScript(
-                        name=name,
-                        source=source,
-                        script_type="ModuleScript",
-                    ))
-                    existing_names.add(name)
-                    injected += 1
-        except Exception as exc:
-            log.debug("[write_output] Bridge injection skipped: %s", exc)
 
         if injected:
             log.info("[write_output] Injected %d runtime library modules", injected)

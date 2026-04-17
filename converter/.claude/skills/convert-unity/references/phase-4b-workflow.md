@@ -1,6 +1,6 @@
-# Phase 4: Code Transpilation
+# Phase 4b.0: Transpile Workflow
 
-AI-assisted C# → Luau translation. Each file is translated independently; cross-file semantic gaps are resolved in Phase 4.5.
+AI-assisted C# → Luau translation. Consumes `conversion_plan.json` from Phase 4a. Rules live in `phase-4b-universal-rules.md` (invariants) and `phase-4b-transpile-rules.md` (per-C#-idiom). Residual cross-file gaps are handled by Phase 4c.
 
 ## Command
 
@@ -48,5 +48,5 @@ When showing a flagged script:
 
 1. Lead with the C# source and the Luau output side-by-side.
 2. Call out the specific lines the transpiler flagged.
-3. Name the semantic gap category if it matches one from `phase-4.5-transpiler-gaps.md` (property-as-function, singleton accessor, Inspector ref, etc.) — these are the common failure modes.
+3. Name the semantic gap category if it matches one from `phase-4c-residual-gaps.md` (property-as-function, singleton accessor, Inspector ref, etc.) — these are the common failure modes. Rules already migrated upfront live in `phase-4b-transpile-rules.md`.
 4. Decide Accept / Retry / Edit / Skip based on the factors above.

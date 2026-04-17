@@ -173,18 +173,6 @@ def _make_pipeline(
     )
     if ctx_path.exists():
         prior_ctx = ConversionContext.load(ctx_path)
-        # Guard against cross-project contamination: if the persisted context
-        # came from a different Unity project, the GUID index and selected_scene
-        # will silently produce corrupt output.
-        prior_project = str(Path(prior_ctx.unity_project_path).resolve()) if prior_ctx.unity_project_path else ""
-        current_project = str(Path(unity_project_path).resolve())
-        if prior_project and prior_project != current_project:
-            raise click.UsageError(
-                f"output_dir already contains a conversion from a different project:\n"
-                f"  prior:   {prior_project}\n"
-                f"  current: {current_project}\n"
-                f"Choose a fresh output_dir or remove the existing one."
-            )
         pipeline.ctx = prior_ctx
     return pipeline
 

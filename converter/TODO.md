@@ -225,3 +225,44 @@ Priority: `P0` = blocks gameplay, `P1` = correctness / maintainability, `P2` = n
 
 - [ ] **Mesh Z-axis mirroring**: Unity left-handed → Roblox right-handed coordinate conversion negates Z positions but doesn't mirror mesh geometry. All asymmetric features (text, door handles) render backwards. Fix options: (a) pre-rotate each mesh 180° around Y before upload, (b) apply negative Z scale on the CFrame (may not work for MeshParts), (c) re-export FBXes with mirrored geometry.
 - [ ] **Wire/grid mesh opacity**: Chain-link fences and similar thin-geometry meshes render as opaque in Roblox because the mesh renderer fills sub-pixel gaps between wires. Unity renders these gaps correctly. The texture alpha (87.7% transparent for chainlink.psd) could compensate via AlphaMode=Transparency, but Unity's material has _Mode=0 (Opaque), so we'd be changing the intended rendering mode. Documenting as a platform rendering difference.
+
+## Open Gaps (2026-04-14 session — inline-over-runtime-wrappers)
+
+Deferred follow-ups from removing the seven rejected runtime bridges. See
+`docs/design/inline-over-runtime-wrappers.md` for the governing policy and
+the full list of what was removed.
+
+- [ ] **P1 — Consolidate animator runtime modules.** Two runtime modules
+  overlap: `converter/runtime/animator_runtime.luau` (currently the accepted
+  one, auto-injected by the pipeline) and `converter/runtime/animator_bridge.luau`
+  (379 lines, the rejected one — still present because it implements a
+  state-machine surface with parameters/triggers/blend trees that
+  `animator_runtime.luau` may not cover). Similarly for
+  `converter/runtime/TransformAnimator.luau` (205 lines, keyframe-curve-based
+  CFrame/Size animation) vs. whatever `animation_converter.py` emits via
+  TweenService. Action: diff each pair; merge unique logic into the accepted
+  module; delete the rejected one; extend the regression guard in
+  `tests/test_no_rejected_bridges.py` to cover it. Unlike the other seven
+  bridges, these implement genuinely stateful per-entity runtime behavior
+  and cannot be flattened into a single-call inline translation — the
+  question is which *module* owns them, not whether a module is needed.
+- [ ] **P1 — Rewrite phase-3 commit `10c786c` on `origin/merge-phase3` to
+  drop bridge injection.** The phase-3 wiring commit imports `bridge_injector`
+  and installs a `detect_needed_bridges`/`inject_bridges` try-except block at
+  `converter/converter/pipeline.py` lines 1843–1859. After the deletions in
+  this branch, that block references a module that no longer exists and the
+  two bridge-related test files (`test_bridge_injector.py`,
+  `test_runtime_bridges.py`) are now dead additions. Action: either drop
+  `10c786c` entirely or rewrite it to preserve the other six pieces
+  (`rbxl_binary_writer` wiring, `report_generator`, `scriptable_object_converter`,
+  `sprite_extractor`, `cloud_api` content-type auto-detection, CI `lz4`
+  dependency) while removing the bridge-injection hunk + the two bridge
+  test files. Belongs as its own branch operation on `merge-phase3`, not on
+  phase 2.
+- [ ] **P2 — `Input.GetSwipe` has no test-project coverage yet.** The
+  `getSwipe()` utility is implemented and has a unit test, but none of the 9
+  test projects actually use touch/swipe input, so the end-to-end path
+  (TouchSwipe handler, swipe consumption, frame-reset semantics) is
+  unverified against a real game. Action: either add a minimal touch-input
+  fixture to a test project, or accept that GetSwipe is speculative
+  infrastructure until a mobile Unity game shows up in the eval set.
