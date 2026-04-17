@@ -222,6 +222,19 @@ class TestConversionContextSanitizedSave:
         assert data["uploaded_assets"] == {"x": "rbxassetid://1"}
         assert "_sanitized" not in data
 
+    def test_sprite_guid_to_file_round_trips(self, tmp_path):
+        """sprite_extractor results survive save/load."""
+        ctx = ConversionContext(
+            sprite_guid_to_file={
+                "abc123": "/out/sprites/hero.png",
+                "def456:frame_01": "/out/sprites/frame_01.png",
+            },
+        )
+        out = tmp_path / "ctx.json"
+        ctx.save(out)
+        loaded = ConversionContext.load(out)
+        assert loaded.sprite_guid_to_file == ctx.sprite_guid_to_file
+
 
 class TestAnthropicKeyBinding:
     """Regression: the pipeline must read ANTHROPIC_API_KEY lazily from the

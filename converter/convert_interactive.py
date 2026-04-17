@@ -939,11 +939,8 @@ def report(output_dir: str) -> None:
         if rbxlx_path.exists() else 0.0
     )
 
-    # Read the structured report the pipeline's write_output phase already
-    # wrote (via converter.report_generator). Merge in skill-only fields —
-    # selected_scene (as a project-relative path), skill phase tracking,
-    # place identifiers, rbxlx size, asset_upload_errors — without clobbering
-    # the structured shape downstream readers rely on.
+    # Augment the structured report written by pipeline.write_output with
+    # skill-only fields, without clobbering its shape.
     report_path = out / "conversion_report.json"
     if report_path.exists():
         try:

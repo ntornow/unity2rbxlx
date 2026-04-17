@@ -72,10 +72,7 @@ class ConversionContext:
     # emitting; falls back to script_type heuristics when absent.
     storage_plan: dict[str, Any] = field(default_factory=dict)
 
-    # Sprite extraction (Phase 3 item 3): GUID -> sliced sprite PNG path.
-    # Produced by converter.sprite_extractor.extract_sprites in extract_assets.
-    # SpriteRenderer/UI ImageLabel consumers can swap the GUID for the real
-    # sliced PNG instead of a whole spritesheet.
+    # GUID -> sliced sprite PNG path (from sprite_extractor).
     sprite_guid_to_file: dict[str, str] = field(default_factory=dict)
 
     def mark_phase_complete(self, phase: str) -> None:

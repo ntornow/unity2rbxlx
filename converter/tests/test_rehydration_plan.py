@@ -1,12 +1,4 @@
-"""
-test_rehydration_plan.py — Verify the preserved-scripts rehydration path
-reads conversion_plan.json (written by storage_classifier) instead of
-re-inferring script_type via content heuristics.
-
-This closes the Phase 3 plan item 12 loop: classifier writes, rehydrator
-reads. Without this wiring, a hand-edit that swaps script content can
-silently reclassify the script on the next assemble run.
-"""
+"""Tests: preserved-scripts rehydration reads conversion_plan.json."""
 
 import json
 import sys
@@ -17,12 +9,21 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 def _make_pipeline(tmp_path):
     from converter.pipeline import Pipeline
+    from core.roblox_types import RbxPlace
 
     project = tmp_path / "proj"
     (project / "Assets").mkdir(parents=True)
     output = tmp_path / "out"
     output.mkdir(parents=True)
-    return Pipeline(unity_project_path=project, output_dir=output, skip_upload=True)
+    pipeline = Pipeline(unity_project_path=project, output_dir=output, skip_upload=True)
+    pipeline.state.rbx_place = RbxPlace()
+    return pipeline
+
+
+def _write_plan(pipeline, storage_plan):
+    plan_path = pipeline.output_dir / "conversion_plan.json"
+    plan_path.write_text(json.dumps({"storage_plan": storage_plan}))
+    return plan_path
 
 
 def test_load_storage_plan_missing_file_returns_empty(tmp_path):
@@ -32,28 +33,22 @@ def test_load_storage_plan_missing_file_returns_empty(tmp_path):
 
 def test_load_storage_plan_malformed_file_returns_empty(tmp_path):
     pipeline = _make_pipeline(tmp_path)
-    plan_path = pipeline.output_dir / "conversion_plan.json"
-    plan_path.write_text("not valid json {{{")
+    (pipeline.output_dir / "conversion_plan.json").write_text("not valid json {{{")
     assert pipeline._load_storage_plan_for_rehydration() == {}
 
 
 def test_load_storage_plan_returns_category_lookup(tmp_path):
     pipeline = _make_pipeline(tmp_path)
-    plan_path = pipeline.output_dir / "conversion_plan.json"
-    plan_path.write_text(json.dumps({
-        "storage_plan": {
-            "server_scripts": ["GameManager"],
-            "client_scripts": ["InputHandler"],
-            "character_scripts": ["PlayerMove"],
-            "replicated_first_scripts": ["Loading"],
-            "shared_modules": ["Constants"],
-            "server_modules": ["Secrets"],
-            "decisions": [],
-        }
-    }))
+    _write_plan(pipeline, {
+        "server_scripts": ["GameManager"],
+        "client_scripts": ["InputHandler"],
+        "character_scripts": ["PlayerMove"],
+        "replicated_first_scripts": ["Loading"],
+        "shared_modules": ["Constants"],
+        "server_modules": ["Secrets"],
+    })
 
     lookup = pipeline._load_storage_plan_for_rehydration()
-
     assert lookup["GameManager"] == ("Script", "ServerScriptService")
     assert lookup["InputHandler"] == ("LocalScript", "StarterPlayer.StarterPlayerScripts")
     assert lookup["PlayerMove"] == ("LocalScript", "StarterPlayer.StarterCharacterScripts")
@@ -62,56 +57,64 @@ def test_load_storage_plan_returns_category_lookup(tmp_path):
     assert lookup["Secrets"] == ("ModuleScript", "ServerStorage")
 
 
-def test_rehydration_uses_plan_over_heuristic(tmp_path, monkeypatch):
-    """A script whose content would be misclassified by the heuristic
-    (has `\\nreturn ` somewhere in a log line) must land with the plan's
-    decision — Script, not ModuleScript — when the plan lists it."""
-    from core.conversion_context import ConversionContext
-    from core.roblox_types import RbxPlace
-
+def test_rehydration_uses_plan_over_heuristic(tmp_path):
+    """Heuristic would flag the `\\nreturn` substring as ModuleScript; plan wins."""
     pipeline = _make_pipeline(tmp_path)
     scripts_dir = pipeline.output_dir / "scripts"
     scripts_dir.mkdir()
-    # This file ends with `end`; content has "\nreturn " in a commented
-    # string, which the old heuristic misclassifies as ModuleScript.
     (scripts_dir / "GameManager.luau").write_text(
-        'local x = "prefix\\nreturn foo"\n'
-        'print("hello")\n'
+        'local x = "prefix\\nreturn foo"\nprint("hello")\n'
     )
+    _write_plan(pipeline, {"server_scripts": ["GameManager"]})
 
-    plan_path = pipeline.output_dir / "conversion_plan.json"
-    plan_path.write_text(json.dumps({
-        "storage_plan": {
-            "server_scripts": ["GameManager"],
-            "decisions": [],
-        }
-    }))
-
-    # Set up just enough pipeline state for write_output's rehydration
-    # branch to run without triggering the rest of the phase.
-    pipeline.state.rbx_place = RbxPlace()
-    pipeline.ctx = ConversionContext(unity_project_path=str(pipeline.unity_project_path))
-    pipeline.ctx.completed_phases.append("transpile_scripts")
-    pipeline._retranspile = False
-
-    # Inline the rehydration block (same as pipeline.write_output preserved branch).
-    from core.roblox_types import RbxScript
-    plan_lookup = pipeline._load_storage_plan_for_rehydration()
-    for luau_path in sorted(scripts_dir.rglob("*.luau")):
-        source = luau_path.read_text()
-        name = luau_path.stem
-        if name in plan_lookup:
-            script_type, parent_path = plan_lookup[name]
-        else:
-            script_type = "Script"
-            parent_path = None
-            if source.rstrip().endswith("return " + name) or "\nreturn " in source:
-                script_type = "ModuleScript"
-        pipeline.state.rbx_place.scripts.append(
-            RbxScript(name=name, source=source, script_type=script_type)
-        )
+    pipeline._rehydrate_scripts_from_disk(scripts_dir)
 
     script = pipeline.state.rbx_place.scripts[0]
     assert script.name == "GameManager"
-    # Plan wins over the `\nreturn ` heuristic.
     assert script.script_type == "Script"
+
+
+def test_rehydration_sets_parent_path_from_plan(tmp_path):
+    pipeline = _make_pipeline(tmp_path)
+    scripts_dir = pipeline.output_dir / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "InputHandler.luau").write_text("-- local script\n")
+    _write_plan(pipeline, {"client_scripts": ["InputHandler"]})
+
+    pipeline._rehydrate_scripts_from_disk(scripts_dir)
+
+    script = pipeline.state.rbx_place.scripts[0]
+    assert script.script_type == "LocalScript"
+    assert getattr(script, "parent_path", None) == "StarterPlayer.StarterPlayerScripts"
+
+
+def test_rehydration_falls_back_to_heuristic_for_unplanned_script(tmp_path):
+    pipeline = _make_pipeline(tmp_path)
+    scripts_dir = pipeline.output_dir / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "NewModule.luau").write_text("local M = {}\nreturn M\n")
+    # Plan covers a different script only.
+    _write_plan(pipeline, {"server_scripts": ["SomethingElse"]})
+
+    pipeline._rehydrate_scripts_from_disk(scripts_dir)
+
+    script = pipeline.state.rbx_place.scripts[0]
+    assert script.name == "NewModule"
+    assert script.script_type == "ModuleScript"  # heuristic on `\nreturn `
+    assert getattr(script, "parent_path", None) is None
+
+
+def test_rehydration_picks_up_scriptable_objects_subdir(tmp_path):
+    """Item 5 writes to scripts/scriptable_objects/; item 12 must find them."""
+    pipeline = _make_pipeline(tmp_path)
+    scripts_dir = pipeline.output_dir / "scripts"
+    so_dir = scripts_dir / "scriptable_objects"
+    so_dir.mkdir(parents=True)
+    (so_dir / "Inventory.luau").write_text('local data = {}\nreturn data\n')
+
+    pipeline._rehydrate_scripts_from_disk(scripts_dir)
+
+    names = [s.name for s in pipeline.state.rbx_place.scripts]
+    assert "Inventory" in names
+    inv = next(s for s in pipeline.state.rbx_place.scripts if s.name == "Inventory")
+    assert inv.script_type == "ModuleScript"

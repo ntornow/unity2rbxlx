@@ -1,8 +1,4 @@
-"""
-test_scriptable_object_wiring.py — Verify extract_assets runs the
-ScriptableObject converter and persists .luau files to disk, and
-write_output attaches them as ModuleScripts on rbx_place.
-"""
+"""Tests: ScriptableObject converter wiring in extract_assets + write_output."""
 
 import sys
 from pathlib import Path
@@ -58,32 +54,23 @@ def test_extract_assets_writes_scriptable_objects_to_disk(tmp_path):
 
 
 def test_write_output_attaches_scriptable_objects_as_module_scripts():
-    """write_output should append a ModuleScript per converted asset,
-    dedupe by name, and skip the step when scriptable_objects is None."""
-    from converter.pipeline import Pipeline
+    """Attach loop appends a ModuleScript per asset and dedupes by name."""
     from core.roblox_types import RbxPlace, RbxScript
 
-    pipeline = Pipeline.__new__(Pipeline)
-    pipeline.state = MagicMock()
-    pipeline.state.rbx_place = RbxPlace()
-    pipeline.state.rbx_place.scripts = [
-        RbxScript(name="Existing", source="", script_type="Script"),
-    ]
-    pipeline.state.scriptable_objects = _fake_so_result(["Inventory", "Existing"])
+    place = RbxPlace()
+    place.scripts = [RbxScript(name="Existing", source="", script_type="Script")]
+    so = _fake_so_result(["Inventory", "Existing"])
 
-    # Inline the same attach logic used in write_output.
-    existing = {s.name for s in pipeline.state.rbx_place.scripts}
-    added = 0
-    for asset in pipeline.state.scriptable_objects.assets:
+    existing = {s.name for s in place.scripts}
+    for asset in so.assets:
         if asset.asset_name in existing:
             continue
-        pipeline.state.rbx_place.scripts.append(RbxScript(
+        place.scripts.append(RbxScript(
             name=asset.asset_name,
             source=asset.luau_source,
             script_type="ModuleScript",
         ))
-        added += 1
 
-    assert added == 1  # "Existing" was deduped
-    inventory = next(s for s in pipeline.state.rbx_place.scripts if s.name == "Inventory")
-    assert inventory.script_type == "ModuleScript"
+    names = [s.name for s in place.scripts]
+    assert names == ["Existing", "Inventory"]
+    assert next(s for s in place.scripts if s.name == "Inventory").script_type == "ModuleScript"

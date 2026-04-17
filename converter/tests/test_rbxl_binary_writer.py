@@ -1,11 +1,4 @@
-"""
-test_rbxl_binary_writer.py — Smoke tests for the XML -> binary RBXL writer.
-
-These assertions are deliberately light: we verify the binary file gets
-written, has the right magic header, and parses every XML Item without
-raising. Full round-trip correctness is validated end-to-end via the
-pipeline's write_output test.
-"""
+"""Smoke tests for the XML -> binary RBXL writer."""
 
 import sys
 from pathlib import Path
@@ -60,3 +53,21 @@ def test_xml_to_binary_rejects_empty_file(tmp_path):
     import pytest
     with pytest.raises(ValueError):
         xml_to_binary(xml_path)
+
+
+def test_xml_to_binary_sibling_emission_round_trip(tmp_path):
+    """The pipeline emits .rbxl alongside .rbxlx with the same stem."""
+    from roblox.rbxl_binary_writer import xml_to_binary
+
+    rbxlx = tmp_path / "converted_place.rbxlx"
+    rbxlx.write_text(
+        '<roblox version="4">'
+        '<Item class="Workspace" referent="RBX0">'
+        '<Properties><string name="Name">Workspace</string></Properties>'
+        '</Item>'
+        '</roblox>'
+    )
+    rbxl = xml_to_binary(rbxlx)
+    assert rbxl.parent == rbxlx.parent
+    assert rbxl.stem == rbxlx.stem
+    assert rbxl.suffix == ".rbxl"

@@ -145,10 +145,7 @@ class TestProbeAssetAvailability:
 
 
 class TestUploadPlaceContentType:
-    """`upload_place` must send Content-Type ``application/xml`` for a .rbxlx
-    file and ``application/octet-stream`` for a .rbxl. The Open Cloud Place
-    endpoint rejects mismatched Content-Type headers, so this must be driven
-    by the file extension rather than hardcoded."""
+    """upload_place picks Content-Type from the file extension."""
 
     @patch("roblox.cloud_api.requests.post")
     def test_xml_content_type_for_rbxlx(self, mock_post, tmp_path):
