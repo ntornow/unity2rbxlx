@@ -1021,8 +1021,6 @@ class TestStateMachineGeneration:
 # ---------------------------------------------------------------------------
 
 class TestAnimationDataExport:
-    """Tests for export_controller_json, export_clip_keyframes, and
-    animation_data_modules on AnimationConversionResult."""
 
     def _make_controller_with_clip(self):
         clip = AnimClip(
@@ -1061,7 +1059,6 @@ class TestAnimationDataExport:
         return ctrl, clip
 
     def test_export_controller_json(self):
-        """export_controller_json returns correct state machine structure."""
         ctrl, _ = self._make_controller_with_clip()
         data = export_controller_json(ctrl)
         assert data["name"] == "HumanoidCtrl"
@@ -1069,12 +1066,57 @@ class TestAnimationDataExport:
         assert data["defaultState"] == "Idle"
         assert data["parameters"][0]["name"] == "Speed"
         assert data["parameters"][0]["type"] == "Float"
-        # Transition destination should be resolved
         walking = [s for s in data["states"] if s["name"] == "Walking"][0]
         assert walking["transitions"][0]["destination"] == "Idle"
 
+    def test_export_condition_modes(self):
+        """All 6 condition modes the animator_runtime supports are mapped."""
+        mode_map = {1: "If", 2: "IfNot", 3: "Greater", 4: "Less", 6: "Equals", 7: "NotEqual"}
+        conditions = []
+        for mode_int, mode_str in mode_map.items():
+            conditions.append(AnimCondition(parameter="p", mode=mode_int, threshold=0.5))
+        ctrl = AnimatorController(
+            name="C", states=[
+                AnimState(name="A", file_id="1", clip_guid="g1"),
+                AnimState(name="B", file_id="2", clip_guid="g2",
+                          transitions=[AnimTransition(name="t", dst_state_file_id="1", conditions=conditions)]),
+            ],
+            parameters=[AnimParameter(name="p", param_type=1, default_float=0.0)],
+            default_state_file_id="1",
+        )
+        data = export_controller_json(ctrl)
+        exported_modes = {c["mode"] for s in data["states"] for t in s["transitions"] for c in t["conditions"]}
+        assert exported_modes == set(mode_map.values())
+
+    def test_export_transition_fields_match_runtime(self):
+        """Transition fields include everything animator_runtime reads."""
+        ctrl, _ = self._make_controller_with_clip()
+        data = export_controller_json(ctrl)
+        walking = [s for s in data["states"] if s["name"] == "Walking"][0]
+        tr = walking["transitions"][0]
+        for field in ("destination", "conditions", "duration", "hasExitTime", "exitTime"):
+            assert field in tr, f"missing transition field: {field}"
+
+    def test_export_parameter_types(self):
+        """All Unity parameter types map to strings the runtime supports."""
+        ctrl = AnimatorController(
+            name="C", states=[AnimState(name="S", file_id="1", clip_guid="g")],
+            parameters=[
+                AnimParameter(name="f", param_type=1, default_float=1.5),
+                AnimParameter(name="i", param_type=3, default_int=7),
+                AnimParameter(name="b", param_type=4, default_bool=True),
+                AnimParameter(name="t", param_type=9),
+            ],
+            default_state_file_id="1",
+        )
+        data = export_controller_json(ctrl)
+        by_name = {p["name"]: p for p in data["parameters"]}
+        assert by_name["f"]["type"] == "Float" and by_name["f"]["defaultValue"] == 1.5
+        assert by_name["i"]["type"] == "Int" and by_name["i"]["defaultValue"] == 7
+        assert by_name["b"]["type"] == "Bool" and by_name["b"]["defaultValue"] is True
+        assert by_name["t"]["type"] == "Trigger"
+
     def test_export_clip_keyframes(self):
-        """export_clip_keyframes returns bone keyframe data."""
         _, clip = self._make_controller_with_clip()
         data = export_clip_keyframes(clip)
         assert data["duration"] == 1.0

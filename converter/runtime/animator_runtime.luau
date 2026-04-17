@@ -1,24 +1,17 @@
--- AnimatorRuntime: Interprets exported Animator Controller JSON at runtime.
+-- AnimatorRuntime: state machine driven by exported Animator Controller JSON.
 --
--- States:      {name, motion, speed, transitions}
--- Transitions: {destination, conditions, duration, hasExitTime, exitTime}
--- Conditions:  {parameter, mode (Greater/Less/Equals/NotEqual/If/IfNot), threshold}
--- BlendTrees:  {param, clips = { {clip, threshold}, ... }}
---
--- Usage:
---   local AnimatorRuntime = require(path.to.AnimatorRuntime)
---   local controller = HttpService:JSONDecode(controllerJson)
---   local runtime = AnimatorRuntime.new(controller, humanoid:FindFirstChildOfClass("Animator"))
---   runtime:LoadAnimations({ Walk = "rbxassetid://123", Idle = "rbxassetid://456" })
---   RunService.Heartbeat:Connect(function(dt) runtime:Update(dt) end)
+-- Controller format (from export_controller_json):
+--   states:             [{name, motion, speed, loop, transitions, blendTree?}]
+--   transitions:        [{destination, conditions, duration, hasExitTime, exitTime}]
+--   conditions:         [{parameter, mode, threshold}]
+--   parameters:         [{name, type, defaultValue}]
+--   anyStateTransitions: same as transitions (optional)
+--   blendTrees:         {name -> {param, clips: [{clip, threshold}]}} (optional)
+--   defaultState:       string (optional)
 
 local AnimatorRuntime = {}
 AnimatorRuntime.__index = AnimatorRuntime
 
---- Create a new AnimatorRuntime instance.
---- @param controllerData table -- Parsed JSON of the exported Animator Controller.
---- @param humanoidOrAnimController Humanoid|AnimationController -- Target to play animations on.
---- @return AnimatorRuntime
 function AnimatorRuntime.new(controllerData, humanoidOrAnimController)
 	local self = setmetatable({}, AnimatorRuntime)
 	self.controller = controllerData
@@ -30,81 +23,48 @@ function AnimatorRuntime.new(controllerData, humanoidOrAnimController)
 	self.tracks = {}
 	self._warnedClips = {}
 
-	-- Initialise parameters with their default values
 	if controllerData.parameters then
 		for _, p in controllerData.parameters do
-			if p.type == "Bool" then
-				self.parameters[p.name] = p.defaultValue or false
-			else
-				self.parameters[p.name] = p.defaultValue or 0
-			end
+			self.parameters[p.name] = if p.type == "Bool" then (p.defaultValue or false) else (p.defaultValue or 0)
 		end
 	end
 
-	-- Set the entry state: prefer defaultState, fall back to first
-	local entryState = nil
+	-- Prefer defaultState, fall back to first
+	local entry = nil
 	if controllerData.defaultState and controllerData.states then
 		for _, s in controllerData.states do
 			if s.name == controllerData.defaultState then
-				entryState = s
+				entry = s
 				break
 			end
 		end
 	end
-	if not entryState and controllerData.states and #controllerData.states > 0 then
-		entryState = controllerData.states[1]
+	if not entry and controllerData.states and #controllerData.states > 0 then
+		entry = controllerData.states[1]
 	end
-	self.currentState = entryState
+	self.currentState = entry
 
 	return self
 end
 
---- Set a boolean parameter.
---- @param name string
---- @param value boolean
-function AnimatorRuntime:SetBool(name, value)
-	self.parameters[name] = value
-end
+-- Parameter setters
 
---- Set a float parameter.
---- @param name string
---- @param value number
-function AnimatorRuntime:SetFloat(name, value)
-	self.parameters[name] = value
-end
+function AnimatorRuntime:SetBool(name, value) self.parameters[name] = value end
+function AnimatorRuntime:SetFloat(name, value) self.parameters[name] = value end
+function AnimatorRuntime:SetInteger(name, value) self.parameters[name] = math.floor(value) end
 
---- Set an integer parameter.
---- @param name string
---- @param value number
-function AnimatorRuntime:SetInteger(name, value)
-	self.parameters[name] = math.floor(value)
-end
-
---- Set a trigger parameter (auto-resets on next frame).
---- @param name string
 function AnimatorRuntime:SetTrigger(name)
 	self.parameters[name] = true
-	task.defer(function()
-		self.parameters[name] = false
-	end)
+	task.defer(function() self.parameters[name] = false end)
 end
 
---- Get a float parameter value.
-function AnimatorRuntime:GetFloat(name)
-	return self.parameters[name] or 0
-end
+-- Parameter getters
 
---- Get a boolean parameter value.
-function AnimatorRuntime:GetBool(name)
-	return self.parameters[name] or false
-end
+function AnimatorRuntime:GetFloat(name) return self.parameters[name] or 0 end
+function AnimatorRuntime:GetBool(name) return self.parameters[name] or false end
+function AnimatorRuntime:GetInt(name) return self.parameters[name] or 0 end
 
---- Get an integer parameter value.
-function AnimatorRuntime:GetInt(name)
-	return self.parameters[name] or 0
-end
-
---- Jump directly to a state by name (mirrors Unity Animator.Play).
+-- Jump directly to a state by name.
 function AnimatorRuntime:Play(stateName)
 	for _, s in self.controller.states do
 		if s.name == stateName then
@@ -115,158 +75,94 @@ function AnimatorRuntime:Play(stateName)
 	warn("[AnimatorRuntime] Unknown state: " .. tostring(stateName))
 end
 
---- Evaluate a single transition condition against current parameters.
---- @param condition table -- {parameter, mode, threshold}
---- @return boolean
 function AnimatorRuntime:_evaluateCondition(condition)
-	local paramValue = self.parameters[condition.parameter]
-	if paramValue == nil then
-		return false
-	end
+	local val = self.parameters[condition.parameter]
+	if val == nil then return false end
 
-	if condition.mode == "Greater" then
-		return paramValue > condition.threshold
-	elseif condition.mode == "Less" then
-		return paramValue < condition.threshold
-	elseif condition.mode == "Equals" then
-		return paramValue == condition.threshold
-	elseif condition.mode == "NotEqual" then
-		return paramValue ~= condition.threshold
-	elseif condition.mode == "If" then
-		return paramValue == true
-	elseif condition.mode == "IfNot" then
-		return paramValue == false
+	local mode = condition.mode
+	if mode == "Greater" then return val > condition.threshold
+	elseif mode == "Less" then return val < condition.threshold
+	elseif mode == "Equals" then return val == condition.threshold
+	elseif mode == "NotEqual" then return val ~= condition.threshold
+	elseif mode == "If" then return val == true
+	elseif mode == "IfNot" then return val == false
 	end
-
 	return false
 end
 
---- Check all transitions from the current state and fire the first valid one.
---- Also checks anyStateTransitions from the controller root.
 function AnimatorRuntime:_checkTransitions()
-	if not self.currentState then
-		return
-	end
+	if not self.currentState then return end
 
-	-- Helper: evaluate a single transition table
 	local function tryTransition(transition)
-		local allMet = true
-
 		if transition.conditions then
 			for _, cond in transition.conditions do
-				if not self:_evaluateCondition(cond) then
-					allMet = false
-					break
-				end
+				if not self:_evaluateCondition(cond) then return false end
 			end
 		end
-
 		if transition.hasExitTime and self.currentTrack then
-			if self.stateTime < (transition.exitTime or 1) then
-				allMet = false
-			end
+			if self.stateTime < (transition.exitTime or 1) then return false end
 		end
-
-		if allMet then
-			-- Don't allow Any→same state
-			if transition.destination == self.currentState.name then
-				return false
-			end
-			self:_transitionTo(transition.destination, transition.duration or 0.25)
-			return true
-		end
-		return false
+		if transition.destination == self.currentState.name then return false end
+		self:_transitionTo(transition.destination, transition.duration or 0.25)
+		return true
 	end
 
-	-- Check current state's own transitions first
 	if self.currentState.transitions then
-		for _, transition in self.currentState.transitions do
-			if tryTransition(transition) then return end
+		for _, tr in self.currentState.transitions do
+			if tryTransition(tr) then return end
 		end
 	end
-
-	-- Check any-state transitions (controller-level, apply from every state)
 	if self.controller.anyStateTransitions then
-		for _, transition in self.controller.anyStateTransitions do
-			if tryTransition(transition) then return end
+		for _, tr in self.controller.anyStateTransitions do
+			if tryTransition(tr) then return end
 		end
 	end
 end
 
---- Transition to a new state by name with a crossfade duration.
---- @param stateName string
---- @param duration number -- Crossfade duration in seconds.
 function AnimatorRuntime:_transitionTo(stateName, duration)
 	local newState = nil
 	for _, s in self.controller.states do
-		if s.name == stateName then
-			newState = s
-			break
-		end
+		if s.name == stateName then newState = s; break end
 	end
+	if not newState then return end
 
-	if not newState then
-		return
-	end
-
-	-- Stop the current animation track with crossfade
-	if self.currentTrack then
-		self.currentTrack:Stop(duration)
-	end
-
+	if self.currentTrack then self.currentTrack:Stop(duration) end
 	self.currentState = newState
 	self.stateTime = 0
 
-	-- Check if this state uses a blend tree
 	if newState.blendTree and self.controller.blendTrees then
 		self:_startBlendTree(newState.blendTree)
 		return
 	end
 
-	-- Play the new state's animation if we have a loaded track for its motion
-	local track = self.tracks[newState.motion]
-	if not track then
-		track = self:_lazyLoadTrack(newState.motion)
-	end
+	local track = self.tracks[newState.motion] or self:_lazyLoadTrack(newState.motion)
 	if track then
 		track:Play(duration)
 		track.Looped = newState.loop ~= false
 		local speed = newState.speed or 1
-		if speed ~= 1 then
-			track:AdjustSpeed(speed)
-		end
+		if speed ~= 1 then track:AdjustSpeed(speed) end
 		self.currentTrack = track
 	end
 end
 
---- Advance the runtime by dt seconds.  Call this every frame.
---- @param dt number -- Delta time in seconds.
 function AnimatorRuntime:Update(dt)
 	self.stateTime = self.stateTime + dt
 	self:_checkTransitions()
-
-	-- Update blend tree weights if active
 	if self.currentState and self.currentState.blendTree and self.controller.blendTrees then
 		self:_updateBlendTree(self.currentState.blendTree)
 	end
 end
 
---- Pre-load animation assets and create AnimationTracks.
---- @param animations table<string, string> -- Map of motion name -> animation asset ID.
 function AnimatorRuntime:LoadAnimations(animations)
 	for name, animId in animations do
 		local anim = Instance.new("Animation")
 		anim.AnimationId = animId
-		local track = self.animator:LoadAnimation(anim)
-		self.tracks[name] = track
+		self.tracks[name] = self.animator:LoadAnimation(anim)
 	end
 end
 
---- Lazy-load a track by searching for an Animation instance by name.
 function AnimatorRuntime:_lazyLoadTrack(clipName)
-	if self.tracks[clipName] then
-		return self.tracks[clipName]
-	end
+	if self.tracks[clipName] then return self.tracks[clipName] end
 	if not self.animator then return nil end
 	local parent = self.animator.Parent
 	if not parent then return nil end
@@ -286,11 +182,10 @@ function AnimatorRuntime:_lazyLoadTrack(clipName)
 	return nil
 end
 
---- Start all blend tree tracks at weight 0.
+-- 1D blend tree: start all tracks at weight 0, then interpolate per-frame.
 function AnimatorRuntime:_startBlendTree(blendTreeName)
 	local bt = self.controller.blendTrees[blendTreeName]
 	if not bt or not bt.clips then return end
-
 	for _, entry in bt.clips do
 		local track = self.tracks[entry.clip] or self:_lazyLoadTrack(entry.clip)
 		if track then
@@ -301,7 +196,6 @@ function AnimatorRuntime:_startBlendTree(blendTreeName)
 	end
 end
 
---- Interpolate blend tree clip weights based on the driving parameter.
 function AnimatorRuntime:_updateBlendTree(blendTreeName)
 	local bt = self.controller.blendTrees[blendTreeName]
 	if not bt or not bt.clips or #bt.clips == 0 then return end
@@ -314,7 +208,6 @@ function AnimatorRuntime:_updateBlendTree(blendTreeName)
 		if not track then continue end
 
 		local weight = 0
-
 		if i == 1 and paramValue <= entry.threshold then
 			weight = 1
 		elseif i == #clips and paramValue >= entry.threshold then
@@ -332,47 +225,34 @@ function AnimatorRuntime:_updateBlendTree(blendTreeName)
 				end
 			end
 		end
-
 		track:AdjustWeight(weight, 0.1)
 	end
 end
 
---- Load bone keyframe data for TweenService-based animation fallback.
---- Use this when animation asset IDs aren't available (no upload).
---- @param keyframeData table<string, table> -- Map of motion name -> keyframe table.
----   Keyframe table format: { bones = { boneName = { {time, cf={x,y,z,rx,ry,rz}}, ... } } }
+-- TweenService-based bone animation fallback (no uploaded animation assets).
 function AnimatorRuntime:LoadKeyframes(keyframeData)
 	self._keyframeData = keyframeData
 end
 
---- Play a bone animation from keyframe data using TweenService.
---- @param motionName string -- Name of the motion to play.
---- @param model Model|BasePart -- The model containing bone Parts.
---- @param loop boolean -- Whether to loop the animation.
 function AnimatorRuntime:_playKeyframeAnimation(motionName, model, loop)
 	local TweenService = game:GetService("TweenService")
-	if not self._keyframeData or not self._keyframeData[motionName] then
-		return
-	end
+	if not self._keyframeData or not self._keyframeData[motionName] then return end
 
 	local data = self._keyframeData[motionName]
 	local bones = data.bones or {}
 	local duration = data.duration or 1
 
-	-- Stop any existing keyframe animation
 	if self._keyframeConn then
 		self._keyframeConn:Disconnect()
 		self._keyframeConn = nil
 	end
 
-	-- Find bone Parts in the model (with fuzzy name matching)
 	local boneParts = {}
-	local bonePartsLower = {} -- lowercase lookup for case-insensitive matching
+	local bonePartsLower = {}
 	for _, desc in model:GetDescendants() do
 		if desc:IsA("BasePart") then
 			boneParts[desc.Name] = desc
 			bonePartsLower[string.lower(desc.Name)] = desc
-			-- Also index without common prefixes (mixamorig:, Bip01, etc.)
 			local stripped = desc.Name:match(":(.+)") or desc.Name
 			if stripped ~= desc.Name then
 				boneParts[stripped] = desc
@@ -381,7 +261,6 @@ function AnimatorRuntime:_playKeyframeAnimation(motionName, model, loop)
 		end
 	end
 
-	-- Animate each bone using TweenService
 	local function playOnce()
 		for boneName, keyframes in bones do
 			local part = boneParts[boneName] or bonePartsLower[string.lower(boneName)]
@@ -396,16 +275,11 @@ function AnimatorRuntime:_playKeyframeAnimation(motionName, model, loop)
 
 					local cf = kf.cf
 					local targetCF = CFrame.new(cf.x or 0, cf.y or 0, cf.z or 0) *
-						CFrame.Angles(
-							math.rad(cf.rx or 0),
-							math.rad(cf.ry or 0),
-							math.rad(cf.rz or 0)
-						)
+						CFrame.Angles(math.rad(cf.rx or 0), math.rad(cf.ry or 0), math.rad(cf.rz or 0))
 
 					local info = TweenInfo.new(dt, Enum.EasingStyle.Linear)
-					local tween = TweenService:Create(part, info, { CFrame = targetCF })
-					tween:Play()
-					tween.Completed:Wait()
+					TweenService:Create(part, info, { CFrame = targetCF }):Play()
+					task.wait(dt)
 				end
 			end)
 		end
@@ -414,16 +288,13 @@ function AnimatorRuntime:_playKeyframeAnimation(motionName, model, loop)
 
 	if loop then
 		task.spawn(function()
-			while self.currentState and self.currentState.motion == motionName do
-				playOnce()
-			end
+			while self.currentState and self.currentState.motion == motionName do playOnce() end
 		end)
 	else
 		task.spawn(playOnce)
 	end
 end
 
---- Stop all tracks and clean up.
 function AnimatorRuntime:Destroy()
 	for _, track in self.tracks do
 		track:Stop(0)
@@ -432,7 +303,6 @@ function AnimatorRuntime:Destroy()
 	self.tracks = {}
 	self.currentTrack = nil
 	self.currentState = nil
-
 	if self._keyframeConn then
 		self._keyframeConn:Disconnect()
 		self._keyframeConn = nil

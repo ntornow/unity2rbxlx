@@ -1,14 +1,6 @@
-"""
-test_no_rejected_bridges.py -- Regression guard for the
-inline-over-runtime-wrappers policy.
+"""Regression guard for inline-over-runtime-wrappers policy.
 
 See docs/design/inline-over-runtime-wrappers.md.
-
-Nine runtime wrappers were removed in favor of inline translations in
-api_mappings.py, regex fixes in luau_validator.py, and consolidation
-into animator_runtime.luau. This test asserts they stay deleted, so
-that if anyone regenerates the bridge layer from scratch later, CI
-will remind them of the decision before it lands.
 """
 
 from pathlib import Path
@@ -36,40 +28,19 @@ _REJECTED_PYTHON_MODULES = [
 
 
 def test_rejected_runtime_bridges_do_not_exist():
-    """The nine rejected wrappers must not reappear in converter/runtime/.
-
-    If this test fails, either (a) you're legitimately restoring one of
-    these modules and should update the design doc + this test, or (b)
-    a rebase or merge resurrected a deleted file and you should delete
-    it again.
-    """
     surviving = [
         name for name in _REJECTED_BRIDGES if (RUNTIME_DIR / name).exists()
     ]
-    assert not surviving, (
-        f"Rejected runtime bridges reappeared in {RUNTIME_DIR}: {surviving}. "
-        "See docs/design/inline-over-runtime-wrappers.md for why these were removed. "
-        "If you are intentionally restoring them, update the design doc and this "
-        "test together."
-    )
+    assert not surviving, f"Rejected bridges reappeared: {surviving}"
 
 
 def test_bridge_injector_does_not_exist():
-    """The bridge_injector scanner was orphaned after the wrappers were
-    removed; it should not reappear either."""
     for rel in _REJECTED_PYTHON_MODULES:
         path = CONVERTER_ROOT / rel
-        assert not path.exists(), (
-            f"{rel} reappeared. See docs/design/inline-over-runtime-wrappers.md."
-        )
+        assert not path.exists(), f"{rel} reappeared"
 
 
 def test_api_mappings_still_inlines_covered_apis():
-    """The inline mappings that replaced the wrappers must still be
-    present. If one of these goes missing, a transpiled script will
-    either emit the raw Unity call or rely on a runtime wrapper we no
-    longer ship.
-    """
     from converter.api_mappings import API_CALL_MAP, UTILITY_FUNCTIONS
 
     # Time.luau replacements
@@ -90,8 +61,6 @@ def test_api_mappings_still_inlines_covered_apis():
     assert "Input.GetKeyDown" in API_CALL_MAP
     assert "Input.GetMouseButton" in API_CALL_MAP
 
-    # Input.luau new utilities (axis + swipe) — these were added as part
-    # of the deletion, not pre-existing.
     assert API_CALL_MAP.get("Input.GetSwipe") == "getSwipe"
     assert "inputHorizontal" in UTILITY_FUNCTIONS
     assert "inputVertical" in UTILITY_FUNCTIONS
@@ -103,8 +72,6 @@ def test_api_mappings_still_inlines_covered_apis():
     assert "GameObject.Find" in API_CALL_MAP
     assert "GameObject.FindWithTag" in API_CALL_MAP
 
-    # MonoBehaviour.luau lifecycle coverage (sampled — full check is
-    # in the LIFECYCLE_MAP tests)
     from converter.api_mappings import LIFECYCLE_MAP
     for hook in [
         "Awake", "Start", "Update", "FixedUpdate", "LateUpdate",
@@ -115,16 +82,25 @@ def test_api_mappings_still_inlines_covered_apis():
 
 
 def test_animator_runtime_has_consolidated_features():
-    """animator_runtime.luau must contain features merged from
-    animator_bridge.luau (getters, Play, blend trees, Any-state,
-    Destroy). If this test fails, the consolidation was reverted."""
-    runtime_path = RUNTIME_DIR / "animator_runtime.luau"
-    assert runtime_path.exists(), "animator_runtime.luau is missing"
-    source = runtime_path.read_text(encoding="utf-8")
-
+    source = (RUNTIME_DIR / "animator_runtime.luau").read_text()
     for method in ["GetFloat", "GetBool", "GetInt", "Play",
                     "Destroy", "_startBlendTree", "_updateBlendTree",
                     "_lazyLoadTrack", "anyStateTransitions"]:
-        assert method in source, (
-            f"animator_runtime.luau missing consolidated method/feature: {method}"
-        )
+        assert method in source, f"missing: {method}"
+
+
+def test_animator_runtime_luau_syntax():
+    source = (RUNTIME_DIR / "animator_runtime.luau").read_text()
+    lines = source.splitlines()
+
+    # No leftover --- docstring blocks (slop indicator)
+    triple_dash = [i for i, l in enumerate(lines, 1) if l.strip().startswith("---")]
+    assert not triple_dash, f"--- docstrings at lines {triple_dash}"
+
+    # Must return the module table
+    assert lines[-1].strip() == "return AnimatorRuntime"
+
+    # Sanity: expected method count (22 functions after consolidation)
+    func_count = sum(1 for l in lines if l.strip().startswith("function ") or
+                     l.strip().startswith("local function "))
+    assert func_count >= 20, f"unexpectedly few functions: {func_count}"

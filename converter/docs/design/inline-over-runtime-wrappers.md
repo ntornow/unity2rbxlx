@@ -134,12 +134,7 @@ The nine wrappers that were removed under this policy:
    trees, getters, `Play()`, Any-state transitions, lazy track loading,
    `Destroy()`) merged into `animator_runtime.luau`; deleted.
 
-All nine runtime wrappers have been removed; their unique features were either
-already inlined or merged into `animator_runtime.luau`.
-
 And the orphaned scanner:
 
- - `converter/converter/bridge_injector.py` — the pipeline component that
-   scanned transpiled Luau for bridge usage patterns and auto-injected the
-   wrapper modules. Removed because the wrappers it injected are all gone
-   or about to be.
+ - `converter/converter/bridge_injector.py` — scanned transpiled Luau for
+   bridge usage and auto-injected wrapper modules. Removed with the wrappers.
