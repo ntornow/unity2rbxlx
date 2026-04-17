@@ -280,9 +280,14 @@ def probe_asset_availability(
     but the asset is moderation-rejected when downstream runtime tries to
     load it.
     """
-    numeric = "".join(ch for ch in str(asset_id) if ch.isdigit())
-    if not numeric:
+    # Accept a plain numeric ID or the full ``rbxassetid://<n>`` form.
+    # Anything else (UUIDs, paths, empty strings) is inconclusive.
+    raw = str(asset_id).strip()
+    if raw.startswith("rbxassetid://"):
+        raw = raw[len("rbxassetid://"):]
+    if not raw.isdigit():
         return "unknown"
+    numeric = raw
     url = f"{_ASSETS_URL}/{numeric}"
 
     # Retry up to 3 times on 429 so a transient rate-limit doesn't cause a
