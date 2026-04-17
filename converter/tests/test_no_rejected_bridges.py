@@ -4,14 +4,11 @@ inline-over-runtime-wrappers policy.
 
 See docs/design/inline-over-runtime-wrappers.md.
 
-Seven runtime wrappers were removed in favor of inline translations in
-api_mappings.py and regex fixes in luau_validator.py. This test asserts
-they stay deleted, so that if anyone regenerates the bridge layer from
-scratch later, CI will remind them of the decision before it lands.
-
-Two animator-related wrappers (TransformAnimator.luau, animator_bridge.luau)
-are intentionally NOT covered by this test — they are deferred pending
-consolidation with animator_runtime.luau. See TODO.md.
+Nine runtime wrappers were removed in favor of inline translations in
+api_mappings.py, regex fixes in luau_validator.py, and consolidation
+into animator_runtime.luau. This test asserts they stay deleted, so
+that if anyone regenerates the bridge layer from scratch later, CI
+will remind them of the decision before it lands.
 """
 
 from pathlib import Path
@@ -28,6 +25,8 @@ _REJECTED_BRIDGES = [
     "GameObjectUtil.luau",
     "StateMachine.luau",
     "physics_queries.luau",
+    "animator_bridge.luau",
+    "TransformAnimator.luau",
 ]
 
 
@@ -37,7 +36,7 @@ _REJECTED_PYTHON_MODULES = [
 
 
 def test_rejected_runtime_bridges_do_not_exist():
-    """The seven rejected wrappers must not reappear in converter/runtime/.
+    """The nine rejected wrappers must not reappear in converter/runtime/.
 
     If this test fails, either (a) you're legitimately restoring one of
     these modules and should update the design doc + this test, or (b)
@@ -113,3 +112,19 @@ def test_api_mappings_still_inlines_covered_apis():
         "OnCollisionEnter", "OnTriggerEnter",
     ]:
         assert hook in LIFECYCLE_MAP, f"Lifecycle hook {hook} missing from LIFECYCLE_MAP"
+
+
+def test_animator_runtime_has_consolidated_features():
+    """animator_runtime.luau must contain features merged from
+    animator_bridge.luau (getters, Play, blend trees, Any-state,
+    Destroy). If this test fails, the consolidation was reverted."""
+    runtime_path = RUNTIME_DIR / "animator_runtime.luau"
+    assert runtime_path.exists(), "animator_runtime.luau is missing"
+    source = runtime_path.read_text(encoding="utf-8")
+
+    for method in ["GetFloat", "GetBool", "GetInt", "Play",
+                    "Destroy", "_startBlendTree", "_updateBlendTree",
+                    "_lazyLoadTrack", "anyStateTransitions"]:
+        assert method in source, (
+            f"animator_runtime.luau missing consolidated method/feature: {method}"
+        )

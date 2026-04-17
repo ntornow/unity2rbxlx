@@ -3,6 +3,7 @@
 -- States:      {name, motion, speed, transitions}
 -- Transitions: {destination, conditions, duration, hasExitTime, exitTime}
 -- Conditions:  {parameter, mode (Greater/Less/Equals/NotEqual/If/IfNot), threshold}
+-- BlendTrees:  {param, clips = { {clip, threshold}, ... }}
 --
 -- Usage:
 --   local AnimatorRuntime = require(path.to.AnimatorRuntime)
@@ -27,6 +28,7 @@ function AnimatorRuntime.new(controllerData, humanoidOrAnimController)
 	self.currentTrack = nil
 	self.stateTime = 0
 	self.tracks = {}
+	self._warnedClips = {}
 
 	-- Initialise parameters with their default values
 	if controllerData.parameters then
@@ -39,10 +41,20 @@ function AnimatorRuntime.new(controllerData, humanoidOrAnimController)
 		end
 	end
 
-	-- Set the entry state (first in the list)
-	if controllerData.states and #controllerData.states > 0 then
-		self.currentState = controllerData.states[1]
+	-- Set the entry state: prefer defaultState, fall back to first
+	local entryState = nil
+	if controllerData.defaultState and controllerData.states then
+		for _, s in controllerData.states do
+			if s.name == controllerData.defaultState then
+				entryState = s
+				break
+			end
+		end
 	end
+	if not entryState and controllerData.states and #controllerData.states > 0 then
+		entryState = controllerData.states[1]
+	end
+	self.currentState = entryState
 
 	return self
 end
@@ -77,6 +89,32 @@ function AnimatorRuntime:SetTrigger(name)
 	end)
 end
 
+--- Get a float parameter value.
+function AnimatorRuntime:GetFloat(name)
+	return self.parameters[name] or 0
+end
+
+--- Get a boolean parameter value.
+function AnimatorRuntime:GetBool(name)
+	return self.parameters[name] or false
+end
+
+--- Get an integer parameter value.
+function AnimatorRuntime:GetInt(name)
+	return self.parameters[name] or 0
+end
+
+--- Jump directly to a state by name (mirrors Unity Animator.Play).
+function AnimatorRuntime:Play(stateName)
+	for _, s in self.controller.states do
+		if s.name == stateName then
+			self:_transitionTo(stateName, 0.25)
+			return
+		end
+	end
+	warn("[AnimatorRuntime] Unknown state: " .. tostring(stateName))
+end
+
 --- Evaluate a single transition condition against current parameters.
 --- @param condition table -- {parameter, mode, threshold}
 --- @return boolean
@@ -104,15 +142,16 @@ function AnimatorRuntime:_evaluateCondition(condition)
 end
 
 --- Check all transitions from the current state and fire the first valid one.
+--- Also checks anyStateTransitions from the controller root.
 function AnimatorRuntime:_checkTransitions()
-	if not self.currentState or not self.currentState.transitions then
+	if not self.currentState then
 		return
 	end
 
-	for _, transition in self.currentState.transitions do
+	-- Helper: evaluate a single transition table
+	local function tryTransition(transition)
 		local allMet = true
 
-		-- Evaluate parameter conditions
 		if transition.conditions then
 			for _, cond in transition.conditions do
 				if not self:_evaluateCondition(cond) then
@@ -122,7 +161,6 @@ function AnimatorRuntime:_checkTransitions()
 			end
 		end
 
-		-- Check exit-time constraint
 		if transition.hasExitTime and self.currentTrack then
 			if self.stateTime < (transition.exitTime or 1) then
 				allMet = false
@@ -130,8 +168,27 @@ function AnimatorRuntime:_checkTransitions()
 		end
 
 		if allMet then
+			-- Don't allow Any→same state
+			if transition.destination == self.currentState.name then
+				return false
+			end
 			self:_transitionTo(transition.destination, transition.duration or 0.25)
-			return
+			return true
+		end
+		return false
+	end
+
+	-- Check current state's own transitions first
+	if self.currentState.transitions then
+		for _, transition in self.currentState.transitions do
+			if tryTransition(transition) then return end
+		end
+	end
+
+	-- Check any-state transitions (controller-level, apply from every state)
+	if self.controller.anyStateTransitions then
+		for _, transition in self.controller.anyStateTransitions do
+			if tryTransition(transition) then return end
 		end
 	end
 end
@@ -160,10 +217,24 @@ function AnimatorRuntime:_transitionTo(stateName, duration)
 	self.currentState = newState
 	self.stateTime = 0
 
+	-- Check if this state uses a blend tree
+	if newState.blendTree and self.controller.blendTrees then
+		self:_startBlendTree(newState.blendTree)
+		return
+	end
+
 	-- Play the new state's animation if we have a loaded track for its motion
 	local track = self.tracks[newState.motion]
+	if not track then
+		track = self:_lazyLoadTrack(newState.motion)
+	end
 	if track then
 		track:Play(duration)
+		track.Looped = newState.loop ~= false
+		local speed = newState.speed or 1
+		if speed ~= 1 then
+			track:AdjustSpeed(speed)
+		end
 		self.currentTrack = track
 	end
 end
@@ -173,6 +244,11 @@ end
 function AnimatorRuntime:Update(dt)
 	self.stateTime = self.stateTime + dt
 	self:_checkTransitions()
+
+	-- Update blend tree weights if active
+	if self.currentState and self.currentState.blendTree and self.controller.blendTrees then
+		self:_updateBlendTree(self.currentState.blendTree)
+	end
 end
 
 --- Pre-load animation assets and create AnimationTracks.
@@ -183,6 +259,81 @@ function AnimatorRuntime:LoadAnimations(animations)
 		anim.AnimationId = animId
 		local track = self.animator:LoadAnimation(anim)
 		self.tracks[name] = track
+	end
+end
+
+--- Lazy-load a track by searching for an Animation instance by name.
+function AnimatorRuntime:_lazyLoadTrack(clipName)
+	if self.tracks[clipName] then
+		return self.tracks[clipName]
+	end
+	if not self.animator then return nil end
+	local parent = self.animator.Parent
+	if not parent then return nil end
+
+	for _, child in parent:GetDescendants() do
+		if child:IsA("Animation") and child.Name == clipName then
+			local track = self.animator:LoadAnimation(child)
+			self.tracks[clipName] = track
+			return track
+		end
+	end
+
+	if not self._warnedClips[clipName] then
+		warn("[AnimatorRuntime] Animation not found: " .. tostring(clipName))
+		self._warnedClips[clipName] = true
+	end
+	return nil
+end
+
+--- Start all blend tree tracks at weight 0.
+function AnimatorRuntime:_startBlendTree(blendTreeName)
+	local bt = self.controller.blendTrees[blendTreeName]
+	if not bt or not bt.clips then return end
+
+	for _, entry in bt.clips do
+		local track = self.tracks[entry.clip] or self:_lazyLoadTrack(entry.clip)
+		if track then
+			track:Play(0.1)
+			track.Looped = true
+			track:AdjustWeight(0, 0.1)
+		end
+	end
+end
+
+--- Interpolate blend tree clip weights based on the driving parameter.
+function AnimatorRuntime:_updateBlendTree(blendTreeName)
+	local bt = self.controller.blendTrees[blendTreeName]
+	if not bt or not bt.clips or #bt.clips == 0 then return end
+
+	local paramValue = self.parameters[bt.param] or 0
+	local clips = bt.clips
+
+	for i, entry in clips do
+		local track = self.tracks[entry.clip]
+		if not track then continue end
+
+		local weight = 0
+
+		if i == 1 and paramValue <= entry.threshold then
+			weight = 1
+		elseif i == #clips and paramValue >= entry.threshold then
+			weight = 1
+		elseif i < #clips then
+			local nextEntry = clips[i + 1]
+			if paramValue >= entry.threshold and paramValue <= nextEntry.threshold then
+				local range = nextEntry.threshold - entry.threshold
+				weight = if range > 0 then 1 - (paramValue - entry.threshold) / range else 1
+			elseif i > 1 then
+				local prevEntry = clips[i - 1]
+				if paramValue >= prevEntry.threshold and paramValue <= entry.threshold then
+					local range = entry.threshold - prevEntry.threshold
+					weight = if range > 0 then (paramValue - prevEntry.threshold) / range else 0
+				end
+			end
+		end
+
+		track:AdjustWeight(weight, 0.1)
 	end
 end
 
@@ -269,6 +420,22 @@ function AnimatorRuntime:_playKeyframeAnimation(motionName, model, loop)
 		end)
 	else
 		task.spawn(playOnce)
+	end
+end
+
+--- Stop all tracks and clean up.
+function AnimatorRuntime:Destroy()
+	for _, track in self.tracks do
+		track:Stop(0)
+		track:Destroy()
+	end
+	self.tracks = {}
+	self.currentTrack = nil
+	self.currentState = nil
+
+	if self._keyframeConn then
+		self._keyframeConn:Disconnect()
+		self._keyframeConn = nil
 	end
 end
 
