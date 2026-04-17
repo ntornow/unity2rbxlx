@@ -1720,38 +1720,54 @@ script.Disabled = true
             rbxlx_path.write_text(raw_xml, encoding="utf-8")
             log.info("[write_output] Stripped %d invalid local texture paths from SurfaceAppearances", stripped)
 
-        # Write conversion report.
-        import json as _json
-        # Collect script type breakdown
+        # Write the conversion report via the structured report_generator.
+        # The same dataclasses feed both the JSON file and the interactive
+        # report() command (which decorates the file with skill-phase
+        # metadata), so downstream readers see one canonical shape.
+        report_path = self.output_dir / "conversion_report.json"
+        from converter.report_generator import (
+            ConversionReport, AssetSummary, ScriptSummary, MaterialSummary,
+            ComponentSummary, SceneSummary, OutputSummary, generate_report,
+        )
         script_types = {"Script": 0, "LocalScript": 0, "ModuleScript": 0}
         for s in (self.state.rbx_place.scripts or []):
             st = getattr(s, "script_type", "Script")
             script_types[st] = script_types.get(st, 0) + 1
-
-        report = {
-            "project": str(self.unity_project_path),
-            "scene": self.ctx.selected_scene,
-            "output": str(self.output_dir),
-            "stats": {
-                "game_objects": self.ctx.total_game_objects,
-                "parts": self.ctx.converted_parts,
-                "scripts": self.ctx.transpiled_scripts,
-                "script_types": script_types,
-                "materials": f"{self.ctx.converted_materials}/{self.ctx.total_materials}",
-                "animations": self.ctx.converted_animations,
-                "uploaded_assets": len(self.ctx.uploaded_assets),
-                "upload_errors": len(self.ctx.asset_upload_errors),
-                "terrains": len(self.state.rbx_place.terrains),
-                "screen_guis": len(self.state.rbx_place.screen_guis),
-                "streaming_enabled": self.ctx.converted_parts > 5000,
-            },
-            "elements": result,
-            "errors": self.ctx.errors,
-            "upload_errors": self.ctx.asset_upload_errors[:20],  # Cap for readability
-            "needs_resolution": len(self.ctx.uploaded_assets) > 0 and not self.ctx.mesh_native_sizes,
-        }
-        report_path = self.output_dir / "conversion_report.json"
-        report_path.write_text(_json.dumps(report, indent=2), encoding="utf-8")
+        structured = ConversionReport(
+            unity_project_path=str(self.unity_project_path),
+            output_dir=str(self.output_dir),
+            success=len(self.ctx.errors) == 0,
+            errors=list(self.ctx.errors),
+            warnings=list(self.ctx.warnings),
+            assets=AssetSummary(
+                total=len(self.ctx.uploaded_assets),
+                by_kind={
+                    **{k: v for k, v in script_types.items()},
+                    "upload_errors": len(self.ctx.asset_upload_errors),
+                },
+            ),
+            scripts=ScriptSummary(
+                total=self.ctx.transpiled_scripts,
+                succeeded=self.ctx.transpiled_scripts,
+            ),
+            materials=MaterialSummary(
+                total=self.ctx.total_materials,
+                fully_converted=self.ctx.converted_materials,
+            ),
+            scene=SceneSummary(
+                total_game_objects=self.ctx.total_game_objects,
+            ),
+            components=ComponentSummary(
+                converted=self.ctx.converted_parts,
+            ),
+            output=OutputSummary(
+                rbxl_path=str(rbxlx_path),
+                parts_written=result.get("parts_written", 0),
+                scripts_in_place=result.get("scripts_written", 0),
+                report_path=str(report_path),
+            ),
+        )
+        generate_report(structured, report_path, print_summary=False)
 
         # Persist context.
         self.ctx.save(self._context_path)

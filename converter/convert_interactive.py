@@ -939,7 +939,21 @@ def report(output_dir: str) -> None:
         if rbxlx_path.exists() else 0.0
     )
 
-    report_data = {
+    # Read the structured report the pipeline's write_output phase already
+    # wrote (via converter.report_generator). Merge in skill-only fields —
+    # selected_scene (as a project-relative path), skill phase tracking,
+    # place identifiers, rbxlx size, asset_upload_errors — without clobbering
+    # the structured shape downstream readers rely on.
+    report_path = out / "conversion_report.json"
+    if report_path.exists():
+        try:
+            report_data = json.loads(report_path.read_text(encoding="utf-8"))
+        except Exception:
+            report_data = {}
+    else:
+        report_data = {}
+
+    report_data.update({
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "unity_project_path": ctx.unity_project_path,
         "output_dir": str(out),
@@ -955,9 +969,8 @@ def report(output_dir: str) -> None:
         "warnings": ctx.warnings,
         "errors": ctx.errors,
         "asset_upload_errors": ctx.asset_upload_errors,
-    }
+    })
 
-    report_path = out / "conversion_report.json"
     report_path.write_text(json.dumps(report_data, indent=2, default=str),
                            encoding="utf-8")
 
