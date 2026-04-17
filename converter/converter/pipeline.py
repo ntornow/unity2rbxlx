@@ -56,6 +56,8 @@ class PipelineState:
     rbx_place: RbxPlace | None = None
     prefab_library: Any = None
     dependency_map: dict[str, list[str]] = field(default_factory=dict)
+    sprite_result: Any = None
+    scriptable_objects: Any = None
 
 
 class Pipeline:
@@ -337,6 +339,30 @@ class Pipeline:
             len(self.state.asset_manifest.assets),
             self.state.asset_manifest.total_size_bytes / (1024 * 1024),
         )
+
+        # Slice individual sprites out of any spritesheet textures the
+        # project ships with. Writes to <output>/sprites/ and exposes a
+        # GUID -> file mapping on the ctx for SpriteRenderer consumers.
+        # Best-effort: a Pillow-less env or malformed .meta drops to a
+        # warning rather than failing the phase.
+        if self.state.guid_index:
+            try:
+                from converter.sprite_extractor import extract_sprites
+                sprite_result = extract_sprites(self.state.guid_index, self.output_dir)
+                if sprite_result.total_sprites_extracted:
+                    self.state.sprite_result = sprite_result
+                    self.ctx.sprite_guid_to_file = {
+                        k: str(v) for k, v in sprite_result.sprite_guid_to_file.items()
+                    }
+                    log.info(
+                        "[extract_assets] Extracted %d sprites from %d spritesheets",
+                        sprite_result.total_sprites_extracted,
+                        sprite_result.total_spritesheets,
+                    )
+                for w in sprite_result.warnings:
+                    log.warning("[extract_assets] Sprite: %s", w)
+            except Exception as exc:
+                log.debug("[extract_assets] Sprite extraction skipped: %s", exc)
 
         # Pre-compute FBX bounding boxes via trimesh for InitialSize fallback.
         # This runs only when mesh_native_sizes (from Studio resolution) are
