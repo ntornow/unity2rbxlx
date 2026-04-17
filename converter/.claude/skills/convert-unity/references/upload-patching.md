@@ -97,7 +97,7 @@ placeholder:Destroy()
 - **Scan both Workspace AND ReplicatedStorage.** Scene objects live in Workspace, but prefab templates for runtime spawning live in ReplicatedStorage/Templates. If the MeshLoader only scans Workspace, all runtime-cloned content will have placeholder geometry instead of real meshes.
 - **Transfer ALL properties from placeholder to clone.** The replacement must copy `CFrame`, `Anchored`, `CanCollide`, `Transparency`, `Color` (vertex-color fallback), and `Size` from the placeholder. It must also reparent all children (SurfaceAppearance with texture references). InsertService-loaded meshes have geometry but no SurfaceAppearance or custom Color3.
 - **Batch InsertService calls.** Firing all `InsertService:LoadAsset()` calls simultaneously overwhelms Roblox's asset servers, causing `SslConnectFail` on most requests. Load in batches of ~10 with retries.
-- **Game bootstrap MUST wait for MeshLoader to finish before entering gameplay.** MeshLoader loads assets asynchronously (typically 20-30s for ~175 meshes). Use polling on a `MeshLoaderDone` BoolValue in ReplicatedStorage — see Step 4.5e in the main SKILL.md.
+- **Game bootstrap MUST wait for MeshLoader to finish before entering gameplay.** MeshLoader loads assets asynchronously (typically 20-30s for ~175 meshes). Use polling on a `MeshLoaderDone` BoolValue in ReplicatedStorage — see `phase-4b-universal-rules.md` ("Asset loading").
 
 ## Asset Type for Texture Uploads
 

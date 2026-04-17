@@ -1243,6 +1243,13 @@ return table.concat(allData, "\\n")'''
         if fixes:
             log.info("[write_output] Reclassified %d scripts based on require() dependencies", fixes)
 
+        # Phase 4a.5 storage classification: assign each script a concrete
+        # parent_path (server/client/replicated) before rbxlx emission. See
+        # references/phase-4a-storage-classification.md. Currently inlined here;
+        # will be promoted to a distinct pipeline phase once write_output is
+        # split into assemble_scripts + serialize.
+        self._classify_storage()
+
         # Bind scripts to their target parts using _ScriptClass attributes.
         # In Unity, MonoBehaviours are children of GameObjects. We replicate
         # this by placing scripts as children of their target parts, which
@@ -1738,6 +1745,39 @@ script.Disabled = true
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _classify_storage(self) -> None:
+        """Phase 4a.5: run the storage classifier on populated scripts.
+
+        Assigns each RbxScript a concrete ``parent_path`` based on call-graph
+        analysis + client/server API detection. Persists the resulting plan
+        to ``self.ctx.storage_plan`` and to ``conversion_plan.json`` in the
+        output directory.
+
+        Safe to call multiple times — the classifier is idempotent.
+        """
+        if self.state.rbx_place is None or not self.state.rbx_place.scripts:
+            return
+
+        from converter.storage_classifier import classify_storage
+        import json as _json
+
+        plan = classify_storage(
+            self.state.rbx_place.scripts,
+            dependency_map=self.state.dependency_map or None,
+        )
+        self.ctx.storage_plan = plan.to_dict()
+
+        plan_path = self.output_dir / "conversion_plan.json"
+        plan_path.write_text(
+            _json.dumps({"storage_plan": self.ctx.storage_plan}, indent=2),
+            encoding="utf-8",
+        )
+        log.info(
+            "[classify_storage] %d scripts classified (plan written to %s)",
+            len(plan.decisions),
+            plan_path.name,
+        )
 
     def _bind_scripts_to_parts(self) -> None:
         """Bind transpiled scripts to their target parts using _ScriptClass attributes.

@@ -53,16 +53,22 @@ python3 convert_interactive.py inventory <unity_project_path> <output_dir> 2>/de
 python3 convert_interactive.py materials <unity_project_path> <output_dir> 2>/dev/null
 ```
 
-### Step 4: Code Transpilation — `references/phase-4-transpilation.md`
+### Step 4a: Plan — start with `references/phase-4a-overview.md`
+
+Upfront architectural planning pass. Read the Unity project and emit `conversion_plan.json` with architecture map, divergence overrides, templates manifest, module boundaries, and **storage plan** (the 3 networking questions: server / client / replicated). The overview file routes to the five sub-phase files and defines the dependency DAG. No pipeline command yet — planning is currently agent-driven.
+
+### Step 4b: Transpile with plan — `references/phase-4-transpilation.md` + `references/phase-4b-*.md`
 
 ```bash
 python3 convert_interactive.py transpile <unity_project_path> <output_dir> --api-key <key> 2>/dev/null
 python3 convert_interactive.py validate <output_dir> --write 2>/dev/null
 ```
 
-### Step 4.5: Game Logic Porting — start with `references/phase-4.5-overview.md`
+Transpile reads `conversion_plan.json` from 4a. Universal coding rules live in `references/phase-4b-universal-rules.md`; migrated transpile-time rules in `references/phase-4b-transpile-rules.md`.
 
-The transpiler converts files independently; 4.5 is the cross-file architectural pass. Mirror Unity's component separation, state machine, and timing model — **faithful port over workarounds**. The overview file routes you to the seven sub-phase files and defines the dependency DAG.
+### Step 4c: Reactive fixups — start with `references/phase-4c-overview.md`
+
+Bootstrap emission, spawner wiring, animator-on-clone bindings, and residual transpiler gaps. Intentionally small — anything reliably automatable should migrate leftward to 4b.
 
 ### Step 5: Moderate & Assemble — `references/phase-5-assembly.md`
 
