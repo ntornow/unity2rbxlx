@@ -158,6 +158,7 @@ def _validate_and_fix_single_pass(name: str, source: str, fixes: list[str]) -> s
     source = _fix_missing_end_keywords(name, source, fixes)
     source = _fix_missing_function_end(name, source, fixes)
     source = _fix_undefined_module_return(name, source, fixes)
+    source = _fix_duplicate_module_return(name, source, fixes)
     source = _fix_missing_module_return(name, source, fixes)
     source = _fix_nil_typed_variables(name, source, fixes)
     source = _fix_module_script_parent_access(name, source, fixes)
@@ -5142,6 +5143,7 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     # `function Foo(script.Parent)` → `function Foo(obj)`
     # `function Foo(script.Parent, x, y)` → `function Foo(obj, x, y)`
     # `function Foo(layers, script.Parent)` → `function Foo(layers, obj)`
+    # Also handles dotted names: `function Module.Method(script.Parent, ...)` → `function Module.Method(obj, ...)`
     if 'script.Parent)' in source or 'script.Parent,' in source:
         def _fix_script_parent_param(m):
             prefix = m.group(1)
@@ -5150,10 +5152,22 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
             params = re.sub(r'\bscript\.Parent\b', 'obj', params)
             return f'{prefix}{params})'
         source = re.sub(
-            r'((?:local\s+)?function\s+\w+\()([^)]*\bscript\.Parent\b[^)]*)\)',
+            r'((?:local\s+)?function\s+[\w.:]+\()([^)]*\bscript\.Parent\b[^)]*)\)',
             _fix_script_parent_param,
             source,
         )
+
+    # Fix: `script.Parent = value` inside table literals (from C# `this.gameObject = x`)
+    # Dotted keys are not valid in Luau table constructors.
+    # `{ script.Parent = go, ... }` → `{ scriptParent = go, ... }`
+    if re.search(r'^\s+script\.Parent\s*=\s*', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s+)script\.Parent\s*=\s*(.+)$',
+            r'\1scriptParent = \2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Fixed dotted key script.Parent in table literal → scriptParent")
 
     # Fix: broken comparison `> then` / `< then` where RHS leaked to next line
     # `if expr > then\n    value)` → comment out (broken expression)
@@ -5898,6 +5912,87 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
     if end_else_fixed:
         source = '\n'.join(new_lines)
         fixes.append("Fixed end before elseif/else → merged")
+
+    # Fix "double else" / "else followed by end" — garbled C# `} else {` blocks.
+    # Pattern 1: `else\n    end` where else has an empty body with just a stray end.
+    #   Remove the else and the stray end (the previous if/else block is already closed).
+    # Pattern 2: `else\n    <code>\n    else` where two else branches appear for the same if.
+    #   Remove the second else (keep the first one and its code).
+    lines = source.split('\n')
+    new_lines = []
+    i = 0
+    double_else_fixed = False
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if stripped == 'else':
+            # Look ahead for the next non-blank line
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j < len(lines):
+                next_stripped = lines[j].strip()
+                if next_stripped == 'end':
+                    # Pattern: `else` with body = just `end` → remove both
+                    double_else_fixed = True
+                    i = j + 1  # Skip both the else and the end
+                    continue
+            # Also check: is the previous non-blank result line also `else`?
+            # That means two consecutive else blocks — remove the duplicate.
+            prev_idx = len(new_lines) - 1
+            while prev_idx >= 0 and not new_lines[prev_idx].strip():
+                prev_idx -= 1
+            if prev_idx >= 0 and new_lines[prev_idx].strip() == 'else':
+                # Two consecutive else clauses — skip this duplicate else
+                double_else_fixed = True
+                i += 1
+                continue
+        new_lines.append(lines[i])
+        i += 1
+    if double_else_fixed:
+        source = '\n'.join(new_lines)
+        fixes.append("Fixed double else / else-end → removed garbled else block")
+
+    # Fix duplicate `} -- enum` lines produced by table-close-before-local logic.
+    # When a table close brace gets the ` -- enum` comment, the original brace may
+    # survive as well, producing two consecutive `} -- enum` lines.
+    if '} -- enum' in source:
+        lines = source.split('\n')
+        new_lines = []
+        dup_enum_fixed = False
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped == '} -- enum' and new_lines:
+                prev_stripped = new_lines[-1].strip()
+                if prev_stripped == '} -- enum':
+                    dup_enum_fixed = True
+                    continue  # Skip the duplicate
+            new_lines.append(line)
+        if dup_enum_fixed:
+            source = '\n'.join(new_lines)
+            fixes.append("Removed duplicate } -- enum line")
+
+    # Fix stray `end` after `end,` in table literals.
+    # Pattern: inline function in table `Key = function(self) ... end,` is correct,
+    # but a stray bare `end` on the next non-blank line comes from C# `}` conversion.
+    # Remove bare `end` lines that immediately follow `end,` (the comma signals table context).
+    lines = source.split('\n')
+    new_lines = []
+    stray_end_fixed = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == 'end':
+            # Look back for the previous non-blank line
+            prev_idx = len(new_lines) - 1
+            while prev_idx >= 0 and not new_lines[prev_idx].strip():
+                prev_idx -= 1
+            if prev_idx >= 0 and new_lines[prev_idx].strip() == 'end,':
+                # Stray end after end, in table literal — skip it
+                stray_end_fixed = True
+                continue
+        new_lines.append(line)
+    if stray_end_fixed:
+        source = '\n'.join(new_lines)
+        fixes.append("Removed stray end after end, in table literal")
 
     # Fix premature `then` on multi-line `if...and` conditions.
     # Pattern: `if expr then\n    and expr` — the `then` on the first line is wrong.
@@ -6969,6 +7064,68 @@ def _fix_undefined_module_return(name: str, source: str, fixes: list[str]) -> st
     return '\n'.join(src_lines)
 
 
+def _fix_duplicate_module_return(name: str, source: str, fixes: list[str]) -> str:
+    """Remove duplicate `return ModuleName` at EOF when a `return { ... }` table return exists.
+
+    When `_fix_missing_module_return` runs on a script that already has a `return { ... }`
+    table return (exporting specific members), it may add a redundant `return ClassName`.
+    This produces `Expected <eof>, got 'return'` errors.
+
+    Fix: if the last significant line is `return CapitalizedName` and there's a
+    `return { ... }` (single or multi-line) in the preceding lines, remove the
+    trailing `return CapitalizedName`.
+    """
+    lines = source.rstrip().split('\n')
+
+    # Find the last non-blank, non-comment line
+    last_idx = len(lines) - 1
+    while last_idx >= 0 and (not lines[last_idx].strip() or lines[last_idx].strip().startswith('--')):
+        last_idx -= 1
+
+    if last_idx < 0:
+        return source
+
+    last_stripped = lines[last_idx].strip()
+    m = re.match(r'^return\s+([A-Z]\w+)\s*$', last_stripped)
+    if not m:
+        return source  # Last line is not `return ModuleName`
+
+    # Look backwards for a `return {` table return before this line
+    for bi in range(last_idx - 1, max(last_idx - 40, -1), -1):
+        back_s = lines[bi].strip()
+        if not back_s or back_s.startswith('--'):
+            continue
+        if back_s.startswith('return {') or back_s == '}' or back_s == '},':
+            # Confirm there's a `return {` in the vicinity
+            if back_s.startswith('return {'):
+                # Direct single-line or start of multi-line table return
+                lines.pop(last_idx)
+                # Also remove blank lines before the removed return
+                while lines and not lines[-1].strip():
+                    lines.pop()
+                fixes.append(f"Removed duplicate 'return {m.group(1)}' (table return already exists)")
+                return '\n'.join(lines) + '\n'
+            if back_s in ('}', '},'):
+                # Check if this closes a `return {` block — skip table entries
+                for bi2 in range(bi - 1, max(bi - 30, -1), -1):
+                    back_s2 = lines[bi2].strip()
+                    if not back_s2 or back_s2.startswith('--'):
+                        continue
+                    if back_s2.startswith('return {'):
+                        lines.pop(last_idx)
+                        while lines and not lines[-1].strip():
+                            lines.pop()
+                        fixes.append(f"Removed duplicate 'return {m.group(1)}' (table return already exists)")
+                        return '\n'.join(lines) + '\n'
+                    # Skip table entry lines (key = value, or value,)
+                    if back_s2.endswith(',') or back_s2.endswith('= {'):
+                        continue
+                    break  # Not a table return close
+        break  # Hit real code that's not a return/table — stop looking
+
+    return source
+
+
 def _fix_missing_module_return(name: str, source: str, fixes: list[str]) -> str:
     """Add `return ClassName` to scripts that define a module table but never return it.
 
@@ -6976,8 +7133,15 @@ def _fix_missing_module_return(name: str, source: str, fixes: list[str]) -> str:
     Prefers the class that matches the script name.
     """
     # Check if there's already a module-level return at the end
-    # (return ClassName, not return from inside a function)
+    # (return ClassName, return { ... }, not return from inside a function)
     last_lines = source.rstrip().split('\n')
+    # Also check: is there a top-level `return { ... }` near the end?
+    # This catches both single-line `return { key = val }` and multi-line:
+    #   return {
+    #       key = val,
+    #   }
+    # Walk backwards: if we see `}` as last significant line, check if a preceding
+    # `return {` at indent 0 exists nearby (within 30 lines).
     for line in reversed(last_lines):
         stripped = line.strip()
         if not stripped or stripped.startswith('--'):
@@ -6987,6 +7151,20 @@ def _fix_missing_module_return(name: str, source: str, fixes: list[str]) -> str:
         m_ret = re.match(r'^return\s+([A-Z]\w+)\s*$', stripped)
         if m_ret:
             return source  # Already has a proper module return
+        if stripped.startswith('return {'):
+            return source  # Single-line table return
+        if stripped in ('}', '},'):
+            # Could be closing brace of a `return { ... }` block.
+            # Look back up to 30 lines for the matching `return {` at top-level.
+            tail_idx = len(last_lines) - 1
+            for bi in range(tail_idx - 1, max(tail_idx - 30, -1), -1):
+                back_s = last_lines[bi].strip()
+                if not back_s or back_s.startswith('--'):
+                    continue
+                if back_s.startswith('return {'):
+                    return source  # Multi-line table return
+                if back_s == 'end' or back_s.startswith('function ') or back_s.startswith('local function '):
+                    break  # Went past function boundary — not a table return
         if stripped.startswith('return '):
             break  # Has a return but not a module-level one (e.g., inside a function)
         break
