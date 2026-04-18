@@ -11,7 +11,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
+import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1255,6 +1257,13 @@ def _ai_transpile(
     # Strip markdown code fences if present.
     luau_source = _strip_code_fences(luau_source)
 
+    # Lint check + reprompt loop: run luau-analyze to catch syntax errors,
+    # then ask Claude to fix them if any are found.
+    luau_source, lint_warnings = _lint_and_fix(
+        luau_source, class_name=class_name, original_csharp=csharp_source,
+    )
+    warnings.extend(lint_warnings)
+
     # AI transpilation gets a baseline confidence based on output quality.
     confidence = 0.75
 
@@ -1334,7 +1343,6 @@ def _claude_cli_transpile(
     Returns:
         Tuple of (luau_source, confidence, warnings).
     """
-    import subprocess
     import shutil
 
     warnings: list[str] = []
@@ -1389,11 +1397,21 @@ def _claude_cli_transpile(
     # Strip code fences if present.
     luau_source = _strip_code_fences(luau_source)
 
+    # Lint check + reprompt loop: run luau-analyze to catch syntax errors,
+    # then ask Claude to fix them if any are found.
+    luau_source, lint_warnings = _lint_and_fix(
+        luau_source, class_name=class_name, original_csharp=csharp_source,
+    )
+    warnings.extend(lint_warnings)
+
     # Score confidence.
     confidence = 0.75
     if "local " in luau_source and "end" in luau_source:
         confidence = 0.85
     if "game:GetService" in luau_source:
+        confidence = min(confidence + 0.05, 0.95)
+    # Boost confidence if lint-clean
+    if not lint_warnings:
         confidence = min(confidence + 0.05, 0.95)
 
     # Cache result.
@@ -1466,6 +1484,111 @@ def _classify_script_type(csharp_source: str, info: Any) -> str:
 
     # Default to server Script.
     return "Script"
+
+
+# ---------------------------------------------------------------------------
+# Luau lint check + AI reprompt loop
+# ---------------------------------------------------------------------------
+
+def _luau_syntax_check(luau_source: str) -> list[str]:
+    """Run luau-analyze on the source and return SyntaxError lines.
+
+    Returns an empty list if the source is syntactically valid.
+    Only reports SyntaxError lines — TypeErrors for unknown Roblox globals
+    are expected and filtered out.
+    """
+    import shutil
+    analyzer = shutil.which("luau-analyze")
+    if not analyzer:
+        return []  # No analyzer available, skip check
+
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".luau", delete=False, encoding="utf-8") as f:
+        f.write(luau_source)
+        tmp_path = f.name
+
+    try:
+        result = subprocess.run(
+            [analyzer, tmp_path],
+            capture_output=True, text=True, timeout=10,
+        )
+        # Extract only SyntaxError lines
+        errors = []
+        for line in result.stdout.splitlines() + result.stderr.splitlines():
+            if "SyntaxError" in line:
+                # Strip the temp file path for cleaner error messages
+                clean = line.replace(tmp_path, "script")
+                errors.append(clean)
+        return errors
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+    finally:
+        os.unlink(tmp_path)
+
+
+def _reprompt_fix(luau_source: str, syntax_errors: list[str], original_csharp: str = "") -> str:
+    """Ask Claude CLI to fix syntax errors in transpiled Luau code.
+
+    Sends the broken Luau source + error messages to Claude with a focused
+    fix prompt. Returns the corrected source.
+    """
+    import shutil
+    claude_path = shutil.which("claude")
+    if not claude_path:
+        return luau_source  # Can't reprompt without CLI
+
+    error_text = "\n".join(syntax_errors[:10])  # Cap at 10 errors
+
+    prompt = (
+        "The following Luau script has syntax errors reported by luau-analyze. "
+        "Fix ALL the syntax errors and return ONLY the corrected Luau code. "
+        "No markdown fences. No explanations.\n\n"
+        "SYNTAX ERRORS:\n"
+        f"{error_text}\n\n"
+        "BROKEN LUAU SOURCE:\n"
+        f"{luau_source}"
+    )
+
+    try:
+        result = subprocess.run(
+            [claude_path, "-p", prompt, "--output-format", "text"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            fixed = _strip_code_fences(result.stdout.strip())
+            # Sanity check: fixed version should still have key Luau patterns
+            if "end" in fixed and len(fixed) > len(luau_source) * 0.3:
+                return fixed
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    return luau_source  # Return original if reprompt failed
+
+
+def _lint_and_fix(luau_source: str, class_name: str = "",
+                  original_csharp: str = "", max_retries: int = 2) -> tuple[str, list[str]]:
+    """Run luau-analyze, reprompt Claude to fix syntax errors if found.
+
+    Returns (fixed_source, warnings).
+    """
+    warnings = []
+    for attempt in range(max_retries + 1):
+        errors = _luau_syntax_check(luau_source)
+        if not errors:
+            if attempt > 0:
+                log.info("  [%s] Lint clean after %d reprompt(s)", class_name, attempt)
+            return luau_source, warnings
+
+        if attempt < max_retries:
+            log.info("  [%s] luau-analyze found %d syntax error(s), reprompting (attempt %d)...",
+                     class_name, len(errors), attempt + 1)
+            luau_source = _reprompt_fix(luau_source, errors, original_csharp)
+        else:
+            log.warning("  [%s] %d syntax error(s) remain after %d reprompt(s): %s",
+                        class_name, len(errors), max_retries, errors[0])
+            warnings.append(f"luau-analyze: {len(errors)} syntax errors remain after {max_retries} reprompts")
+
+    return luau_source, warnings
 
 
 # ---------------------------------------------------------------------------
