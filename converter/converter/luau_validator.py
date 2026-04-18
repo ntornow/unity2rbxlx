@@ -8429,12 +8429,12 @@ def _fix_module_script_parent_access(name: str, source: str, fixes: list[str]) -
         if alias_m:
             parent_aliases.add(alias_m.group(1))
 
-        # Check for script.Parent (or alias) usage in runtime code.
-        # Check at module scope AND inside functions (aliases set at module scope
-        # are shared across functions, so any function using e.g. part.CFrame
-        # will crash when script.Parent is ReplicatedStorage).
+        # Check for script.Parent (or alias) usage in runtime code at MODULE SCOPE.
+        # Only trigger on module-scope code (in_function == 0) to avoid false
+        # positives on scripts that use script.Parent inside conditionally-called
+        # functions (e.g. Player module with IsClient guard).
         check_names = ['script.Parent'] + list(parent_aliases)
-        if any(n in stripped for n in check_names):
+        if in_function == 0 and any(n in stripped for n in check_names):
             # Runtime indicators: event connections, property access, method calls
             if any(p in stripped for p in [
                 '.Position', '.CFrame', '.Size', '.Orientation',
