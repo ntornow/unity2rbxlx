@@ -26,7 +26,7 @@ discover        parse
 inventory       extract_assets
 materials       convert_materials
 transpile       transpile_scripts
-validate        (no pipeline call — runs luau_validator on disk)
+validate        (no pipeline call — runs luau-analyze syntax check)
 assemble        upload_assets, resolve_assets, convert_animations,
                 convert_scene, write_output
 upload          headless place publish via Open Cloud execute_luau
@@ -607,22 +607,26 @@ def validate(output_dir: str, write: bool) -> None:
         })
         return
 
-    from converter.luau_validator import validate_and_fix
+    import subprocess, shutil
+    analyzer = shutil.which("luau-analyze")
 
     files_with_fixes: list[dict] = []
     total_fixes = 0
     for path in sorted(candidates):
-        source = path.read_text(encoding="utf-8")
-        fixed_source, fixes = validate_and_fix(path.name, source)
-        if fixes:
-            files_with_fixes.append({
-                "file": str(path.relative_to(out)),
-                "fix_count": len(fixes),
-                "fixes": fixes[:10],
-            })
-            total_fixes += len(fixes)
-            if write and fixed_source != source:
-                path.write_text(fixed_source, encoding="utf-8")
+        if analyzer:
+            result = subprocess.run(
+                [analyzer, str(path)],
+                capture_output=True, text=True, timeout=10,
+            )
+            errors = [l for l in (result.stdout + result.stderr).splitlines()
+                      if "SyntaxError" in l]
+            if errors:
+                files_with_fixes.append({
+                    "file": str(path.relative_to(out)),
+                    "fix_count": len(errors),
+                    "fixes": errors[:10],
+                })
+                total_fixes += len(errors)
 
     _mark_skill_phase(out, "validate")
 

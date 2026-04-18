@@ -1156,19 +1156,7 @@ return table.concat(allData, "\\n")'''
 
         elif self.state.transpilation_result:
             from core.roblox_types import RbxScript
-            from converter.luau_validator import validate_and_fix, fix_gameplay_patterns
-            total_fixes = 0
             for ts in self.state.transpilation_result.scripts:
-                # Validate and fix common AI transpilation issues.
-                fixed_source, fixes = validate_and_fix(ts.output_filename, ts.luau_source)
-                if fixes:
-                    ts.luau_source = fixed_source
-                    total_fixes += len(fixes)
-                # Fix gameplay-specific patterns (pickup detection, etc.)
-                fixed_source, gp_fixes = fix_gameplay_patterns(ts.output_filename, ts.luau_source)
-                if gp_fixes:
-                    ts.luau_source = fixed_source
-                    total_fixes += len(gp_fixes)
                 out_path = scripts_dir / ts.output_filename
                 out_path.write_text(ts.luau_source, encoding="utf-8")
                 self.state.rbx_place.scripts.append(RbxScript(
@@ -1176,8 +1164,6 @@ return table.concat(allData, "\\n")'''
                     source=ts.luau_source,
                     script_type=ts.script_type,
                 ))
-            if total_fixes:
-                log.info("[write_output] Applied %d Luau validation fixes", total_fixes)
 
         # Write animation scripts to output directory AND add to RbxPlace.
         if self.state.animation_result and self.state.animation_result.generated_scripts:
@@ -1608,18 +1594,6 @@ script.Disabled = true
                 script_type="Script",
             ))
             log.info("[write_output] TerrainSnap script embedded")
-
-        # Final validation pass: apply validator fixes to all scripts one last time
-        # (catches patterns introduced by require injection, reclassification, etc.)
-        from converter.luau_validator import validate_and_fix
-        final_fixes = 0
-        for s in self.state.rbx_place.scripts:
-            fixed_source, fixes = validate_and_fix(s.name, s.source)
-            if fixes:
-                s.source = fixed_source
-                final_fixes += len(fixes)
-        if final_fixes:
-            log.info("[write_output] Final validation pass applied %d fixes", final_fixes)
 
         # Patch scripts that use setupSounds: also search script.Parent for
         # Sound children (sounds from MonoBehaviour AudioClip fields are placed
