@@ -245,11 +245,8 @@ def fix_require_classifications(scripts: list[RbxScript]) -> int:
     # Add early-return guards for scripts that access script.Parent properties.
     fixes += _guard_script_parent_access(scripts)
 
-    # Pass 6: Circular require detection — disabled for now.
-    # The lazy-loading replacement is too aggressive (replaces all module name
-    # references, breaking function calls and table access). Needs a more
-    # targeted approach that only wraps the require() call itself.
-    # fixes += _break_circular_requires(scripts)
+    # Pass 6: Circular require detection — lazy proxy for one direction.
+    fixes += _break_circular_requires(scripts)
 
     # Pass 7: Fix string concatenation with + (C# remnant).
     fixes += _fix_string_concat(scripts)
@@ -412,8 +409,13 @@ def _guard_script_parent_access(scripts: list[RbxScript]) -> int:
 def _break_circular_requires(scripts: list[RbxScript]) -> int:
     """Detect and break circular require chains by converting to lazy-loading.
 
-    If module A requires module B, and B requires A (directly or via name
-    overlap), convert one direction to a lazy-loading pattern.
+    If module A requires module B, and B requires A (directly or via a chain),
+    convert one direction to a lazy-loading pattern.
+
+    IMPORTANT: Only the ``local X = require(...)`` line is replaced with a
+    lazy-loading proxy.  All other references to ``X`` in the script are left
+    untouched — the proxy forwards ``__index`` / ``__newindex`` / ``__call``
+    to the real module once it is loaded, so existing code works as-is.
     """
     fixes = 0
     # Build a require graph
@@ -422,43 +424,58 @@ def _break_circular_requires(scripts: list[RbxScript]) -> int:
 
     for s in scripts:
         deps = set()
-        for m in re.finditer(r'require\([^)]*["\'](\w+)["\']', s.source):
+        # Match FindFirstChild("Name", ...) inside require() calls
+        for m in re.finditer(r'require\(.*?FindFirstChild\(\s*["\'](\w+)["\']', s.source):
             deps.add(m.group(1))
+        # Also match require(path.ModuleName) patterns
         for m in re.finditer(r'require\([^)]*\.(\w+)\s*\)', s.source):
             deps.add(m.group(1))
         require_graph[s.name] = deps
+
+    # Track already-broken edges so we don't break both directions
+    broken: set[tuple[str, str]] = set()
 
     # Find cycles
     for name, deps in require_graph.items():
         for dep in deps:
             if dep in require_graph and name in require_graph[dep]:
                 # Circular: name requires dep, dep requires name
-                # Break the cycle in the shorter script (less risk)
+                if (name, dep) in broken or (dep, name) in broken:
+                    continue
+                # Break the cycle in the script that requires the other
                 target = script_by_name.get(name)
                 if not target:
                     continue
-                # Convert the require to lazy-loading
-                pattern = rf'(local\s+{re.escape(dep)}\s*=\s*require\([^)]+\))'
-                match = re.search(pattern, target.source)
+                # Match the full require line (may have nested parens)
+                pattern = rf'^(local\s+{re.escape(dep)}\s*=\s*require\(.+\))$'
+                match = re.search(pattern, target.source, re.MULTILINE)
                 if match:
                     old_require = match.group(1)
+                    # Replace with a lazy proxy that defers require() until
+                    # first access.  The variable name stays the same so all
+                    # other references (function calls, table reads) work
+                    # without modification.
                     lazy = (
-                        f'local _{dep}_ref\n'
-                        f'local function _get_{dep}()\n'
-                        f'    if not _{dep}_ref then _{dep}_ref = require('
-                        f'game:GetService("ReplicatedStorage"):FindFirstChild("{dep}", true)) end\n'
-                        f'    return _{dep}_ref\n'
-                        f'end'
+                        f'local {dep} = setmetatable({{}}, {{\n'
+                        f'    __index = function(_, k)\n'
+                        f'        local mod = require(game:GetService("ReplicatedStorage")'
+                        f':FindFirstChild("{dep}", true))\n'
+                        f'        {dep} = mod  -- replace proxy with real module\n'
+                        f'        return mod[k]\n'
+                        f'    end,\n'
+                        f'    __call = function(_, ...)\n'
+                        f'        local mod = require(game:GetService("ReplicatedStorage")'
+                        f':FindFirstChild("{dep}", true))\n'
+                        f'        {dep} = mod\n'
+                        f'        return mod(...)\n'
+                        f'    end,\n'
+                        f'}})'
                     )
                     target.source = target.source.replace(old_require, lazy)
-                    # Replace usages of the module with the getter
-                    target.source = re.sub(
-                        rf'\b{re.escape(dep)}\b(?!\s*_ref\b|_get_)',
-                        f'_get_{dep}()',
-                        target.source,
-                    )
+                    # Do NOT replace other references — the proxy handles them
+                    broken.add((name, dep))
                     fixes += 1
-                    log.info("  Broke circular require: '%s' → '%s' (lazy-loaded)", name, dep)
+                    log.info("  Broke circular require: '%s' → '%s' (lazy proxy)", name, dep)
 
     return fixes
 
@@ -511,8 +528,10 @@ def _stub_unavailable_sdks(scripts: list[RbxScript]) -> int:
             # Check if it's already guarded
             if f'{mod_name} = {mod_name} or' in s.source:
                 continue
-            # Find the require or local declaration
-            decl_pattern = rf'^(local\s+{re.escape(mod_name)}\s*=\s*.+)$'
+            # Find a require() declaration for this module (single-line only).
+            # Avoid matching table literal openers like `local X = {` which
+            # span multiple lines — inserting a stub there breaks the table.
+            decl_pattern = rf'^(local\s+{re.escape(mod_name)}\s*=\s*require\(.+\))$'
             match = re.search(decl_pattern, s.source, re.MULTILINE)
             if match:
                 stub = (f'\n{mod_name} = {mod_name} or '
