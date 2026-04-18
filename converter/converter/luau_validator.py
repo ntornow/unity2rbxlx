@@ -3053,6 +3053,32 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
         )
         fixes.append("Broadened setupSounds() to search Workspace for the host Part's Sound children")
 
+    # setupReferences: when script is a ModuleScript in ReplicatedStorage,
+    # script.Parent won't have the attributes/children from the bound Part.
+    # Broaden the lookup to search workspace for the host Part by script name.
+    if 'local function setupReferences()' in source and '_SETUP_REFS_BROAD' not in source:
+        old_setup = 'local function setupReferences()\n    local parent = script.Parent\n    if not parent then return end'
+        if old_setup in source:
+            # Extract the script's module name to search workspace by
+            mod_m = re.search(r'^local\s+(\w+)\s*=\s*\{\}', source, re.MULTILINE)
+            search_name = mod_m.group(1) if mod_m else 'script.Name'
+            new_setup = (
+                'local function setupReferences()\n'
+                '    -- _SETUP_REFS_BROAD: also search Workspace for the bound host Part\n'
+                '    local parent = script.Parent\n'
+                '    if not parent or not parent:IsA("BasePart") then\n'
+                f'        for _, _cand in ipairs(workspace:GetDescendants()) do\n'
+                f'            if _cand:IsA("BasePart") and _cand.Name == "{search_name}" then\n'
+                '                parent = _cand\n'
+                '                break\n'
+                '            end\n'
+                '        end\n'
+                '    end\n'
+                '    if not parent then return end'
+            )
+            source = source.replace(old_setup, new_setup)
+            fixes.append("Broadened setupReferences() to search Workspace for the host Part")
+
     # Shoot: remove the redundant _isMouseButtonDown early-exit. shoot() is
     # called from an InputBegan(MouseButton1) handler, so the polling check
     # races and returns false, preventing any shots from ever firing.
@@ -8448,9 +8474,11 @@ def _fix_module_script_parent_access(name: str, source: str, fixes: list[str]) -
     if not has_runtime_parent:
         return source
 
-    # Insert an early-return guard after the module table declaration
-    # This prevents all module-scope runtime code from executing when
-    # the script is in ReplicatedStorage.
+    # Insert an early-return guard after the module table declaration.
+    # Also inject a host-Part lookup so scripts that use script.Parent
+    # to find children (riflePrefab, sounds, etc.) can find their original
+    # host Part in workspace after being reclassified as ModuleScripts.
+    script_name = name.replace('.luau', '').replace('.lua', '')
     guard = (
         "\n-- Guard: skip runtime code if script is not parented to a game object\n"
         "if not (script.Parent:IsA(\"BasePart\") or script.Parent:IsA(\"Model\")"
