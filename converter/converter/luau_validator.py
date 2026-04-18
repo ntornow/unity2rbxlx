@@ -161,6 +161,7 @@ def _validate_and_fix_single_pass(name: str, source: str, fixes: list[str]) -> s
     source = _fix_duplicate_module_return(name, source, fixes)
     source = _fix_missing_module_return(name, source, fixes)
     source = _fix_nil_typed_variables(name, source, fixes)
+    source = _fix_nil_safe_module_access(name, source, fixes)
     source = _fix_module_script_parent_access(name, source, fixes)
     return source
 
@@ -5981,6 +5982,7 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
     # Pattern: inline function in table `Key = function(self) ... end,` is correct,
     # but a stray bare `end` on the next non-blank line comes from C# `}` conversion.
     # Remove bare `end` lines that immediately follow `end,` (the comma signals table context).
+    # Also handles: `end,` then blank lines then `end` (same pattern with whitespace gap).
     lines = source.split('\n')
     new_lines = []
     stray_end_fixed = False
@@ -6000,6 +6002,22 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
         source = '\n'.join(new_lines)
         fixes.append("Removed stray end after end, in table literal")
 
+    # Fix stray `end)` at EOF when there is no matching `:Connect(function(` opener.
+    # This happens when a C# callback/lambda body gets merged with surrounding code,
+    # producing `end)` that has no corresponding `Connect(function(` block.
+    if source.rstrip().endswith('end)'):
+        # Check if there's a matching :Connect(function( or task.spawn/defer(function(
+        has_connect = ':Connect(function(' in source
+        has_task_cb = re.search(r'task\.(delay|spawn|defer)\(.*function\s*\(', source) is not None
+        if not has_connect and not has_task_cb:
+            lines_eof = source.split('\n')
+            for eof_idx in range(len(lines_eof) - 1, -1, -1):
+                if lines_eof[eof_idx].strip() == 'end)':
+                    lines_eof[eof_idx] = lines_eof[eof_idx].replace('end)', 'end')
+                    fixes.append("Fixed stray end) at EOF → end (no matching Connect opener)")
+                    break
+            source = '\n'.join(lines_eof)
+
     # Fix premature `then` on multi-line `if...and` conditions.
     # Pattern: `if expr then\n    and expr` — the `then` on the first line is wrong.
     if re.search(r'if\s+.+\s+then\s*$\n\s+and\s+', source, re.MULTILINE):
@@ -6013,7 +6031,16 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
 
     # Fix `if (expr) then > val end` — garbled C# comparison inside if-condition.
     # The `then >` should be just `>` (comparison operator, not block opener).
+    # Also handles garbled forms like `then > VAL end end end end end` where
+    # multiple `end` keywords from C# brace conversion follow on the same line.
     if ' then > ' in source:
+        # First strip trailing `end` chains from the garbled `then > ... end end end` line
+        source = re.sub(
+            r'\)\s+then\s+>\s+(\w+(?:\.\w+)*)\s+(?:end\s*)+$',
+            r') > \1 then',
+            source,
+            flags=re.MULTILINE,
+        )
         source = re.sub(
             r'\)\s+then\s+>\s+(\w)',
             r') > \1',
@@ -6969,62 +6996,86 @@ def _fix_missing_ends_in_blocks(source: str, fixes: list[str]) -> str:
 
 
 def _fix_missing_function_end(name: str, source: str, fixes: list[str]) -> str:
-    """Insert missing `end` between consecutive local functions.
+    """Insert missing `end` between consecutive functions at the same indent level.
 
-    When a function's last line is `return` or `end` (closing an inner block)
-    but has no closing `end` for itself, and the next `local function` starts
-    at same or lesser indentation, insert `end`.
+    Uses a stack of (indent, block_type) to track open blocks. When a new
+    function definition appears at the same indent as a previous function
+    that is still open (no matching `end`), insert the missing `end`.
     Runs AFTER _fix_missing_end_keywords to avoid being removed by excess-end logic.
     """
-    # Check for either `return` or `end` followed by blank lines then `local function`
-    if not re.search(r'(?:return\s+\w+|^\s+end)\s*\n(?:\s*\n)*\s*local\s+function\s+', source, re.MULTILINE):
-        return source
-
     lines = source.split('\n')
     result = []
+    changed = False
 
-    # Track function open/close depth to detect unclosed functions
-    func_depth = 0
-    func_start_indents = []
+    # Stack of (indent, block_type) for open blocks
+    # block_type: 'function', 'if', 'for', 'while', 'do', 'repeat'
+    block_stack: list[tuple[int, str]] = []
 
     for i, line in enumerate(lines):
-        result.append(line)
         stripped = line.strip()
+        indent = len(line) - len(line.lstrip()) if stripped else 0
 
-        # Track function depth
+        # Before appending this line, check if it's a new function definition
+        # that indicates a previous function at the same indent is unclosed
         if re.match(r'(?:local\s+)?function\s+[\w.:]+\s*\(', stripped):
-            indent = len(line) - len(line.lstrip())
-            func_depth += 1
-            func_start_indents.append(indent)
-        if stripped == 'end' and func_depth > 0:
-            func_depth -= 1
-            if func_start_indents:
-                func_start_indents.pop()
+            # Check if there's an open function block at the same indent level
+            # This means the previous function was never closed
+            if block_stack:
+                # Find any open function at the same indent
+                for si in range(len(block_stack) - 1, -1, -1):
+                    s_indent, s_type = block_stack[si]
+                    if s_type == 'function' and s_indent == indent:
+                        # Close all blocks from the top of the stack down to (and
+                        # including) this function block
+                        while len(block_stack) > si:
+                            block_stack.pop()
+                        result.append(f'{" " * indent}end')
+                        changed = True
+                        break
+                    elif s_indent < indent:
+                        # This function is nested inside an outer block at lesser
+                        # indent — it's not a sibling, stop looking
+                        break
 
-        # Check if this line ends a function body (return or inner-block end)
-        is_end_of_body = (
-            re.match(r'\s+return\s+\w+', line) or
-            (stripped == 'end' and func_depth > 0)
-        )
-        if is_end_of_body:
-            j = i + 1
-            while j < len(lines) and lines[j].strip() == '':
-                j += 1
-            if j < len(lines) and re.match(r'\s*local\s+function\s+', lines[j]):
-                # Check indentation: next function at same or lesser indent means
-                # current function is unclosed
-                body_indent = len(line) - len(line.lstrip())
-                func_indent = len(lines[j]) - len(lines[j].lstrip())
-                if func_indent <= body_indent and func_depth > 0:
-                    result.append(f'{" " * func_indent}end')
-                    func_depth -= 1
-                    if func_start_indents:
-                        func_start_indents.pop()
+        result.append(line)
 
-    new_source = '\n'.join(result)
-    if new_source != source:
-        fixes.append("Fixed missing function end before next local function")
-    return new_source
+        if stripped.startswith('--') or not stripped:
+            continue
+
+        # Strip trailing comments for analysis
+        code_part = re.sub(r'\s*--.*$', '', stripped).rstrip()
+
+        # Count block openers and push onto stack
+        if re.search(r'\bfunction\s*[\w.:(]', code_part):
+            func_count = len(re.findall(r'\bfunction\s*[\w.:(]', code_part))
+            end_count_inline = len(re.findall(r'\bend\b', code_part))
+            net = max(0, func_count - end_count_inline)
+            for _ in range(net):
+                block_stack.append((indent, 'function'))
+        elif re.match(r'if\b.+\bthen\s*$', code_part) or (
+                re.search(r'\bthen\s*$', code_part) and not re.match(r'(?:if|elseif)\b', code_part)
+                and not re.search(r'\bfunction\b', code_part)):
+            block_stack.append((indent, 'if'))
+        elif re.match(r'for\b.+\bdo\s*$', code_part):
+            block_stack.append((indent, 'for'))
+        elif re.match(r'while\b.+\bdo\s*$', code_part):
+            block_stack.append((indent, 'while'))
+        elif code_part == 'do':
+            block_stack.append((indent, 'do'))
+        elif code_part == 'repeat':
+            block_stack.append((indent, 'repeat'))
+
+        # Count closers — pop from stack
+        if stripped == 'end' or stripped.startswith('end)') or stripped == 'end,':
+            if block_stack:
+                block_stack.pop()
+        elif re.match(r'until\b', stripped):
+            if block_stack:
+                block_stack.pop()
+
+    if changed:
+        fixes.append("Fixed missing function end before next function definition")
+    return '\n'.join(result)
 
 
 def _fix_undefined_module_return(name: str, source: str, fixes: list[str]) -> str:
@@ -7412,7 +7463,7 @@ def _append_missing_trailing_ends(source: str, fixes: list[str]) -> str:
             depth += 1
         if code_part == 'repeat':
             depth += 1
-        if stripped == 'end' or stripped.startswith('end)'):
+        if stripped == 'end' or stripped.startswith('end)') or stripped == 'end,':
             depth -= 1
         if re.match(r'until\b', stripped):
             depth -= 1
@@ -7467,7 +7518,7 @@ def _remove_excess_end_keywords(source: str, fixes: list[str]) -> str:
             depth += 1
 
         # Count closers — mark for removal if depth would go negative
-        if stripped == 'end' or stripped.startswith('end)'):
+        if stripped == 'end' or stripped.startswith('end)') or stripped == 'end,':
             depth -= 1
             if depth < 0:
                 lines_to_remove.append(i)
@@ -7558,7 +7609,7 @@ def _fix_connect_closures(source: str, fixes: list[str]) -> str:
                 depth += 1
 
             # Count block closers
-            if stripped == 'end' or stripped.startswith('end)'):
+            if stripped == 'end' or stripped.startswith('end)') or stripped == 'end,':
                 depth -= 1
                 if depth == 0:
                     # This closer should be end) (closes the Connect function)
@@ -7636,8 +7687,8 @@ def _remove_excess_trailing_ends(source: str, fixes: list[str]) -> str:
             depth += 1
         if code_part == 'repeat':
             depth += 1
-        # Count closers (standalone end, end), end),)
-        if stripped == 'end' or stripped.startswith('end)'):
+        # Count closers (standalone end, end), end),, end,)
+        if stripped == 'end' or stripped.startswith('end)') or stripped == 'end,':
             depth -= 1
         if re.match(r'until\b', stripped):
             depth -= 1
@@ -7729,7 +7780,7 @@ def _insert_missing_ends_for_single_statement_blocks(source: str, fixes: list[st
 
         # Before adding this line, check if any open blocks need closing
         # based on indent level
-        is_closer = stripped == 'end' or stripped.startswith('end)')
+        is_closer = stripped == 'end' or stripped.startswith('end)') or stripped == 'end,'
         if indent >= 0 and not is_closer and stripped not in ('else',) and not stripped.startswith('elseif '):
             while block_stack:
                 top_indent, top_type = block_stack[-1]
@@ -7933,6 +7984,68 @@ def _fix_nil_typed_variables(name: str, source: str, fixes: list[str]) -> str:
         source = '\n'.join(lines)
         fixes.append("Initialized nil-typed numeric/bool variables to default values")
 
+    return source
+
+
+def _fix_nil_safe_module_access(name: str, source: str, fixes: list[str]) -> str:
+    """Guard top-level code that indexes nil-safe-required modules.
+
+    When a module is required with the nil-safe pattern:
+        local X = _X_mod and require(_X_mod) or nil
+    and top-level code (not inside a function) does `X.Something` or `X:Method()`,
+    the call will error at runtime if X is nil.
+
+    This wraps such top-level statements in `if X then ... end` guards.
+    """
+    # Find all nil-safe-required module names
+    nil_safe_mods = set()
+    for m in re.finditer(r'^\s*local\s+(\w+)\s*=\s*_\w+_mod\s+and\s+require\(', source, re.MULTILINE):
+        nil_safe_mods.add(m.group(1))
+
+    if not nil_safe_mods:
+        return source
+
+    lines = source.split('\n')
+    result = []
+    changed = False
+    func_depth = 0
+
+    for line in lines:
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip()) if stripped else 0
+
+        # Track function depth (only guard top-level code)
+        if stripped.startswith('--') or not stripped:
+            result.append(line)
+            continue
+
+        code_part = re.sub(r'\s*--.*$', '', stripped).rstrip()
+
+        # Track block depth
+        if re.search(r'\bfunction\s*[\w.:(]', code_part):
+            func_count = len(re.findall(r'\bfunction\s*[\w.:(]', code_part))
+            end_count = len(re.findall(r'\bend\b', code_part))
+            func_depth += max(0, func_count - end_count)
+        if stripped == 'end' or stripped.startswith('end)') or stripped == 'end,':
+            func_depth = max(0, func_depth - 1)
+
+        # Only fix top-level statements (func_depth == 0)
+        if func_depth == 0:
+            # Check if this line indexes a nil-safe module: ModName.X or ModName:X
+            for mod in nil_safe_mods:
+                if re.match(rf'^{re.escape(mod)}[.:]', stripped):
+                    # Wrap in nil guard
+                    result.append(f'{" " * indent}if {mod} then {stripped} end')
+                    changed = True
+                    break
+            else:
+                result.append(line)
+        else:
+            result.append(line)
+
+    if changed:
+        fixes.append("Added nil guard for nil-safe-required module access")
+        return '\n'.join(result)
     return source
 
 
