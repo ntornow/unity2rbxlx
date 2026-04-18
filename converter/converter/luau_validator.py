@@ -1935,12 +1935,18 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
         fixes.append("Fixed nil as function parameter name → _param")
 
     # Fix reserved words used as bare table keys: `true = 2` → `["true"] = 2`
+    # Handles both start-of-line keys and mid-line (after comma): `, true = 2`
     _LUA_RESERVED = {'and', 'break', 'do', 'else', 'elseif', 'end', 'false',
                      'for', 'function', 'if', 'in', 'local', 'nil', 'not',
                      'or', 'repeat', 'return', 'then', 'true', 'until', 'while',
                      'continue'}
     for kw in _LUA_RESERVED:
-        # Match as a table key: `  true = value` (indented, inside table)
+        # Match mid-line: `, true = value` or `{ true = value`
+        mid_pat = rf'([{{,]\s*){kw}(\s*=\s*)'
+        if re.search(mid_pat, source):
+            source = re.sub(mid_pat, rf'\1["{kw}"]\2', source)
+            fixes.append(f"Quoted reserved word '{kw}' as table key (mid-line)")
+        # Match as a table key at start of line: `  true = value` (indented)
         pat = rf'^(\s+){kw}\s*=\s*'
         if re.search(pat, source, re.MULTILINE):
             source = re.sub(
@@ -6818,7 +6824,7 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
             if ' then' not in stripped and not stripped.endswith('then'):
                 # Check if a continuation line has 'then' (multiline condition)
                 has_then_below = False
-                for j in range(i + 1, min(i + 5, len(lines_mt))):
+                for j in range(i + 1, min(i + 15, len(lines_mt))):
                     next_s = lines_mt[j].strip()
                     if next_s and ' then' in next_s or next_s.endswith('then'):
                         has_then_below = True
