@@ -487,37 +487,44 @@ def _fix_string_concat(scripts: list[RbxScript]) -> int:
 def _stub_unavailable_sdks(scripts: list[RbxScript]) -> int:
     """Stub out platform SDK calls that have no Roblox equivalent.
 
-    FlurryAnalytics, Firebase Crashlytics, Google Play Services, etc.
+    For modules that use .Instance (Unity singleton pattern), add a
+    nil-safe stub near the module declaration so .Instance calls don't crash.
+    Instead of wrapping each call site (which breaks multi-line expressions),
+    we ensure the module variable is never nil by providing a stub.
     """
     fixes = 0
-    _SDK_PATTERNS = [
-        (r'(\w+)\.Instance:(\w+)\(', r'-- [SDK stub] \g<0>'),
-        (r'FlurryAnalytics\.\w+', None),
-        (r'CrashlyticsInit\.\w+', None),
-    ]
 
     for s in scripts:
-        # Guard .Instance access on nil modules
-        if '.Instance:' in s.source:
-            lines = s.source.split('\n')
-            new_lines = []
-            for line in lines:
-                stripped = line.strip()
-                if '.Instance:' in stripped and not stripped.startswith('--'):
-                    # Wrap in nil check
-                    indent = len(line) - len(line.lstrip())
-                    # Find the module name: `ModuleName.Instance:Method()`
-                    m = re.match(r'(\s*)(\w+)\.Instance:', line)
-                    if m:
-                        mod_name = m.group(2)
-                        new_lines.append(f'{" " * indent}if {mod_name} and {mod_name}.Instance then')
-                        new_lines.append(f'{" " * indent}    {stripped}')
-                        new_lines.append(f'{" " * indent}end')
-                        fixes += 1
-                        continue
-                new_lines.append(line)
-            if fixes:
-                s.source = '\n'.join(new_lines)
-                log.info("  Guarded SDK .Instance calls in '%s'", s.name)
+        if '.Instance:' not in s.source and '.Instance.' not in s.source:
+            continue
+
+        # Find module names that use .Instance
+        instance_modules = set()
+        for m in re.finditer(r'(\w+)\.Instance[:\.]', s.source):
+            instance_modules.add(m.group(1))
+
+        if not instance_modules:
+            continue
+
+        # For each module, add a nil-safe stub after its require/declaration
+        for mod_name in instance_modules:
+            # Check if it's already guarded
+            if f'{mod_name} = {mod_name} or' in s.source:
+                continue
+            # Find the require or local declaration
+            decl_pattern = rf'^(local\s+{re.escape(mod_name)}\s*=\s*.+)$'
+            match = re.search(decl_pattern, s.source, re.MULTILINE)
+            if match:
+                stub = (f'\n{mod_name} = {mod_name} or '
+                        f'{{Instance = {{}}}}  -- Stub: SDK not available on Roblox')
+                # Add stub after the declaration line
+                # Use setmetatable so any method call returns a no-op
+                stub = (f'\nif not {mod_name} then {mod_name} = '
+                        f'setmetatable({{Instance = setmetatable({{}}, '
+                        f'{{__index = function() return function() end end}})}}, '
+                        f'{{__index = function() return function() end end}}) end')
+                s.source = s.source[:match.end()] + stub + s.source[match.end():]
+                fixes += 1
+                log.info("  Stubbed SDK module '%s' in '%s'", mod_name, s.name)
 
     return fixes
