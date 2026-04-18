@@ -239,6 +239,24 @@ def fix_require_classifications(scripts: list[RbxScript]) -> int:
     # also be a LocalScript (otherwise B's LocalPlayer calls will be nil).
     fixes += _propagate_client_classification(scripts, script_by_name)
 
+    # Pass 5: Guard script.Parent access in reclassified ModuleScripts.
+    # When a script is reclassified to ModuleScript and moved to ReplicatedStorage,
+    # script.Parent becomes ReplicatedStorage (not the original game object).
+    # Add early-return guards for scripts that access script.Parent properties.
+    fixes += _guard_script_parent_access(scripts)
+
+    # Pass 6: Circular require detection — disabled for now.
+    # The lazy-loading replacement is too aggressive (replaces all module name
+    # references, breaking function calls and table access). Needs a more
+    # targeted approach that only wraps the require() call itself.
+    # fixes += _break_circular_requires(scripts)
+
+    # Pass 7: Fix string concatenation with + (C# remnant).
+    fixes += _fix_string_concat(scripts)
+
+    # Pass 8: Stub out unavailable platform SDKs (FlurryAnalytics, Firebase, etc.)
+    fixes += _stub_unavailable_sdks(scripts)
+
     return fixes
 
 
@@ -319,5 +337,187 @@ def _fix_client_server_classification(scripts: list[RbxScript]) -> int:
             fixes += 1
             log.info("  Reclassified '%s' from LocalScript to Script (uses server-only APIs)",
                      s.name)
+
+    return fixes
+
+
+def _guard_script_parent_access(scripts: list[RbxScript]) -> int:
+    """Add early-return guard to ModuleScripts that use script.Parent for runtime access.
+
+    When a script is reclassified to ModuleScript in ReplicatedStorage,
+    script.Parent is ReplicatedStorage (not a game object). Code that accesses
+    .CFrame, .Position, .Size, .Touched etc. on script.Parent will crash.
+
+    This injects a guard after the module table declaration that returns early
+    if script.Parent is not a BasePart/Model/Folder.
+    """
+    fixes = 0
+    _RUNTIME_PROPS = ['.Position', '.CFrame', '.Size', '.Orientation',
+                      '.Touched:', '.Anchored']
+
+    for s in scripts:
+        if s.script_type != "ModuleScript":
+            continue
+        if '-- Guard: skip runtime' in s.source:
+            continue  # Already guarded
+
+        # Check for script.Parent or alias usage with runtime properties
+        has_runtime = False
+        aliases = set()
+        for line in s.source.split('\n'):
+            stripped = line.strip()
+            if stripped.startswith('--'):
+                continue
+            # Track aliases: `local part = script.Parent`
+            m = re.match(r'local\s+(\w+)\s*=\s*script\.Parent\b', stripped)
+            if m:
+                aliases.add(m.group(1))
+            # Check for runtime property access at module scope
+            check_names = ['script.Parent'] + list(aliases)
+            for name in check_names:
+                if name in stripped and any(p in stripped for p in _RUNTIME_PROPS):
+                    has_runtime = True
+                    break
+            if has_runtime:
+                break
+
+        if not has_runtime:
+            continue
+
+        # Find the module table declaration and insert guard after it
+        module_m = re.search(r'^return\s+(\w+)\s*$', s.source, re.MULTILINE)
+        if not module_m:
+            continue
+        module_name = module_m.group(1)
+
+        table_m = re.search(
+            r'^(local\s+' + re.escape(module_name) + r'\s*=\s*\{\})',
+            s.source, re.MULTILINE,
+        )
+        if table_m:
+            guard = (
+                f'\n-- Guard: skip runtime code if script is in ReplicatedStorage\n'
+                f'if not (script.Parent:IsA("BasePart") or script.Parent:IsA("Model")'
+                f' or script.Parent:IsA("Folder")) then\n'
+                f'    return {module_name}\n'
+                f'end\n'
+            )
+            s.source = s.source[:table_m.end()] + guard + s.source[table_m.end():]
+            fixes += 1
+            log.info("  Added script.Parent guard to '%s'", s.name)
+
+    return fixes
+
+
+def _break_circular_requires(scripts: list[RbxScript]) -> int:
+    """Detect and break circular require chains by converting to lazy-loading.
+
+    If module A requires module B, and B requires A (directly or via name
+    overlap), convert one direction to a lazy-loading pattern.
+    """
+    fixes = 0
+    # Build a require graph
+    require_graph: dict[str, set[str]] = {}
+    script_by_name = {s.name: s for s in scripts}
+
+    for s in scripts:
+        deps = set()
+        for m in re.finditer(r'require\([^)]*["\'](\w+)["\']', s.source):
+            deps.add(m.group(1))
+        for m in re.finditer(r'require\([^)]*\.(\w+)\s*\)', s.source):
+            deps.add(m.group(1))
+        require_graph[s.name] = deps
+
+    # Find cycles
+    for name, deps in require_graph.items():
+        for dep in deps:
+            if dep in require_graph and name in require_graph[dep]:
+                # Circular: name requires dep, dep requires name
+                # Break the cycle in the shorter script (less risk)
+                target = script_by_name.get(name)
+                if not target:
+                    continue
+                # Convert the require to lazy-loading
+                pattern = rf'(local\s+{re.escape(dep)}\s*=\s*require\([^)]+\))'
+                match = re.search(pattern, target.source)
+                if match:
+                    old_require = match.group(1)
+                    lazy = (
+                        f'local _{dep}_ref\n'
+                        f'local function _get_{dep}()\n'
+                        f'    if not _{dep}_ref then _{dep}_ref = require('
+                        f'game:GetService("ReplicatedStorage"):FindFirstChild("{dep}", true)) end\n'
+                        f'    return _{dep}_ref\n'
+                        f'end'
+                    )
+                    target.source = target.source.replace(old_require, lazy)
+                    # Replace usages of the module with the getter
+                    target.source = re.sub(
+                        rf'\b{re.escape(dep)}\b(?!\s*_ref\b|_get_)',
+                        f'_get_{dep}()',
+                        target.source,
+                    )
+                    fixes += 1
+                    log.info("  Broke circular require: '%s' → '%s' (lazy-loaded)", name, dep)
+
+    return fixes
+
+
+def _fix_string_concat(scripts: list[RbxScript]) -> int:
+    """Fix C# string concatenation with + that survived AI transpilation."""
+    fixes = 0
+    for s in scripts:
+        if '"+' not in s.source and '" +' not in s.source:
+            continue
+        original = s.source
+        # Fix "str" + "str" → "str" .. "str"
+        s.source = re.sub(r'"\s*\+\s*"', '" .. "', s.source)
+        # Fix "str" + var → "str" .. var
+        s.source = re.sub(r'"\s*\+\s*(\w)', r'" .. \1', s.source)
+        # Fix var + "str" → var .. "str"
+        s.source = re.sub(r'(\w)\s*\+\s*"', r'\1 .. "', s.source)
+        # Fix line-ending "str" + → "str" ..
+        s.source = re.sub(r'"\s*\+\s*$', '" ..', s.source, flags=re.MULTILINE)
+        if s.source != original:
+            fixes += 1
+            log.info("  Fixed string '+' concatenation in '%s'", s.name)
+    return fixes
+
+
+def _stub_unavailable_sdks(scripts: list[RbxScript]) -> int:
+    """Stub out platform SDK calls that have no Roblox equivalent.
+
+    FlurryAnalytics, Firebase Crashlytics, Google Play Services, etc.
+    """
+    fixes = 0
+    _SDK_PATTERNS = [
+        (r'(\w+)\.Instance:(\w+)\(', r'-- [SDK stub] \g<0>'),
+        (r'FlurryAnalytics\.\w+', None),
+        (r'CrashlyticsInit\.\w+', None),
+    ]
+
+    for s in scripts:
+        # Guard .Instance access on nil modules
+        if '.Instance:' in s.source:
+            lines = s.source.split('\n')
+            new_lines = []
+            for line in lines:
+                stripped = line.strip()
+                if '.Instance:' in stripped and not stripped.startswith('--'):
+                    # Wrap in nil check
+                    indent = len(line) - len(line.lstrip())
+                    # Find the module name: `ModuleName.Instance:Method()`
+                    m = re.match(r'(\s*)(\w+)\.Instance:', line)
+                    if m:
+                        mod_name = m.group(2)
+                        new_lines.append(f'{" " * indent}if {mod_name} and {mod_name}.Instance then')
+                        new_lines.append(f'{" " * indent}    {stripped}')
+                        new_lines.append(f'{" " * indent}end')
+                        fixes += 1
+                        continue
+                new_lines.append(line)
+            if fixes:
+                s.source = '\n'.join(new_lines)
+                log.info("  Guarded SDK .Instance calls in '%s'", s.name)
 
     return fixes
