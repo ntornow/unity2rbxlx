@@ -146,19 +146,8 @@ def _fix_ternary_in_line(line: str) -> str:
     return line
 
 
-def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
-    """Validate and fix common Luau issues in a transpiled script.
-
-    Args:
-        name: Script name (for logging).
-        source: Luau source code.
-
-    Returns:
-        Tuple of (fixed_source, list_of_fixes_applied).
-    """
-    fixes: list[str] = []
-    _had_trailing_newline = source.endswith('\n')
-
+def _validate_and_fix_single_pass(name: str, source: str, fixes: list[str]) -> str:
+    """Run one pass of all validation/fix rules. Returns fixed source."""
     source = _strip_leading_prose(name, source, fixes)
     source = _fix_runtime_script_creation(name, source, fixes)
     source = _fix_plugin_only_properties(name, source, fixes)
@@ -172,7 +161,39 @@ def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
     source = _fix_missing_module_return(name, source, fixes)
     source = _fix_nil_typed_variables(name, source, fixes)
     source = _fix_module_script_parent_access(name, source, fixes)
-    # Second pass: catch patterns introduced by structural fixes
+    return source
+
+
+def validate_and_fix(name: str, source: str) -> tuple[str, list[str]]:
+    """Validate and fix common Luau issues in a transpiled script.
+
+    Args:
+        name: Script name (for logging).
+        source: Luau source code.
+
+    Returns:
+        Tuple of (fixed_source, list_of_fixes_applied).
+    """
+    fixes: list[str] = []
+    _had_trailing_newline = source.endswith('\n')
+
+    source = _validate_and_fix_single_pass(name, source, fixes)
+
+    # Run up to 2 additional convergence passes: structural fixes in one pass
+    # can expose new patterns (e.g. removing a stray `},` reveals a stray `end`).
+    # Convergence passes: end/table fixes can expose new patterns
+    # (e.g. collapsing `end\n},` reveals a stray `end`).
+    # Only re-run end-keyword and function-end fixes (idempotent-safe).
+    for _pass in range(2):
+        prev = source
+        extra_fixes: list[str] = []
+        source = _fix_missing_end_keywords(name, source, extra_fixes)
+        source = _fix_missing_function_end(name, source, extra_fixes)
+        if source == prev:
+            break
+        fixes.extend(extra_fixes)
+
+    # Post-convergence cleanup: catch patterns introduced by structural fixes
     if re.search(r'\bthis\.', source):
         source = re.sub(r'\bthis\.(\w+)', r'script.Parent.\1', source)
     # Second pass: :GetChild/:LookAt may appear from property getter expansion
@@ -1911,6 +1932,50 @@ def _fix_csharp_remnants(name: str, source: str, fixes: list[str]) -> str:
         source = re.sub(r'function\s+(\w+)\(nil\)', r'function \1(_param)', source)
         source = re.sub(r'function\s*\(nil\)', r'function(_param)', source)
         fixes.append("Fixed nil as function parameter name → _param")
+
+    # Fix reserved words used as bare table keys: `true = 2` → `["true"] = 2`
+    _LUA_RESERVED = {'and', 'break', 'do', 'else', 'elseif', 'end', 'false',
+                     'for', 'function', 'if', 'in', 'local', 'nil', 'not',
+                     'or', 'repeat', 'return', 'then', 'true', 'until', 'while',
+                     'continue'}
+    for kw in _LUA_RESERVED:
+        # Match as a table key: `  true = value` (indented, inside table)
+        pat = rf'^(\s+){kw}\s*=\s*'
+        if re.search(pat, source, re.MULTILINE):
+            source = re.sub(
+                rf'^(\s+){kw}(\s*=\s*)',
+                rf'\1["{kw}"]\2',
+                source,
+                flags=re.MULTILINE,
+            )
+            fixes.append(f"Quoted reserved word '{kw}' as table key")
+
+    # Fix C# string concatenation `+` not converted to `..`
+    # Pattern: `"string" +` at end of line, or `"string" + "string"` inline
+    if re.search(r'"\s*\+\s*(?:$|")', source, re.MULTILINE):
+        source = re.sub(r'"\s*\+\s*"', '" .. "', source)
+        source = re.sub(r'"\s*\+\s*$', '" ..', source, flags=re.MULTILINE)
+        source = re.sub(r'"\s*\+\s*(\w)', r'" .. \1', source)
+        fixes.append("Fixed C# string '+' concatenation → '..'")
+
+    # Fix nil-unsafe require(FindFirstChild) — wrap in nil check
+    # Pattern: `local X = require(game:GetService("RS"):FindFirstChild("X", true))`
+    # FindFirstChild returns nil when the module doesn't exist, causing require(nil) to error.
+    if re.search(r'require\(.+:FindFirstChild\(', source):
+        def _fix_safe_require(m):
+            indent = m.group(1)
+            varname = m.group(2)
+            obj_expr = m.group(3)
+            find_args = m.group(4)
+            return (f'{indent}local _{varname}_mod = {obj_expr}:FindFirstChild({find_args})\n'
+                    f'{indent}local {varname} = _{varname}_mod and require(_{varname}_mod) or nil')
+        source = re.sub(
+            r'^(\s*)local\s+(\w+)\s*=\s*require\((.+):FindFirstChild\(([^)]+)\)\)',
+            _fix_safe_require,
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Wrapped require(FindFirstChild) in nil-safe pattern")
 
     if source != original and not fixes:
         fixes.append("Fixed C# syntax remnants")
@@ -5520,6 +5585,20 @@ def _fix_end_closing_table(source: str, fixes: list[str]) -> str:
         no_str = re.sub(r'"[^"]*"', '""', stripped)
         no_str = re.sub(r"'[^']*'", "''", no_str)
 
+        # Handle `end` followed by `},` on the next line (C# brace-to-end staircase).
+        # When a function-as-table-value closes, the AI sometimes emits:
+        #     end       ← closes function
+        #     },        ← C# brace close (should be part of end,)
+        # Fix: collapse to `end,` (function close + table entry comma).
+        if stripped == 'end' and idx + 1 < len(lines):
+            next_stripped = lines[idx + 1].strip()
+            if next_stripped == '},' or next_stripped == '},':
+                if _is_inside_table_context(lines, idx) and _has_unclosed_function_above(lines, idx):
+                    new_lines.append(line[:indent] + 'end,')
+                    lines[idx + 1] = ''  # Remove the `},` line
+                    changed = True
+                    continue
+
         # Handle `end,` — if we're inside a table literal AND there's no unclosed
         # function definition above, this should be `},` (table entry close).
         # But if there IS an unclosed function, `end,` is valid Luau (closes the
@@ -5607,21 +5686,35 @@ def _find_unclosed_brace_indent(lines: list[str], idx: int) -> int | None:
 def _has_unclosed_function_above(lines: list[str], idx: int) -> bool:
     """Check if there's an unclosed `function` definition above idx within the table.
 
-    Walks backwards counting function openers and end closers.
+    Walks backwards counting ALL block openers (function, if, for, while, do)
+    and end closers to properly match ends with their openers.
     Returns True if there's a function with no matching end.
     """
-    func_depth = 0
+    # Track block depth: each `end` closes one block, each opener opens one.
+    # We specifically want to know if there's a function that's still open.
+    block_depth = 0  # positive = more ends than openers seen so far
     for i in range(idx - 1, max(idx - 100, -1), -1):
         s = lines[i].strip()
         if s.startswith('--'):
             continue
-        # Count end keywords (closers)
-        if re.match(r'^end\b', s):
-            func_depth += 1
-        # Count function openers
+        # Count end keywords (closers) — walking backwards, so ends increase depth
+        if re.match(r'^end[,);\s]', s) or s == 'end':
+            block_depth += 1
+        # Count ALL block openers (not just functions)
+        # if...then, for...do, while...do, repeat, do
+        if re.search(r'\bif\b.+\bthen\s*$', s):
+            if block_depth > 0:
+                block_depth -= 1  # This if consumed an end
+        if re.search(r'\bfor\b.+\bdo\s*$', s):
+            if block_depth > 0:
+                block_depth -= 1
+        if re.search(r'\bwhile\b.+\bdo\s*$', s):
+            if block_depth > 0:
+                block_depth -= 1
+        # Function openers
         if re.search(r'\bfunction\s*\(', s) or re.search(r'\bfunction\s+\w', s):
-            if func_depth > 0:
-                func_depth -= 1
+            if block_depth > 0:
+                block_depth -= 1  # This function consumed an end
             else:
                 return True  # Unclosed function found
         # Stop at table opener line (we don't look past the current table)
@@ -5805,6 +5898,44 @@ def _fix_structural_syntax(name: str, source: str, fixes: list[str]) -> str:
     if end_else_fixed:
         source = '\n'.join(new_lines)
         fixes.append("Fixed end before elseif/else → merged")
+
+    # Fix premature `then` on multi-line `if...and` conditions.
+    # Pattern: `if expr then\n    and expr` — the `then` on the first line is wrong.
+    if re.search(r'if\s+.+\s+then\s*$\n\s+and\s+', source, re.MULTILINE):
+        source = re.sub(
+            r'^(\s*if\s+.+?)\s+then\s*$(\n\s+and\s+)',
+            r'\1\2',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Removed premature 'then' on multi-line if...and condition")
+
+    # Fix `if (expr) then > val end` — garbled C# comparison inside if-condition.
+    # The `then >` should be just `>` (comparison operator, not block opener).
+    if ' then > ' in source:
+        source = re.sub(
+            r'\)\s+then\s+>\s+(\w)',
+            r') > \1',
+            source,
+        )
+        # Also remove the orphan `end` that was part of `then...end`
+        source = re.sub(
+            r'\)\s+then\s+>\s+',
+            r') > ',
+            source,
+        )
+        fixes.append("Fixed 'then >' garbled comparison in if-condition")
+
+    # Fix `function Module.Name = value` — C# property setter transpiled as function declaration.
+    # Not valid Luau syntax. Comment it out.
+    if re.search(r'^function\s+\w+\.\w+\s*=\s*', source, re.MULTILINE):
+        source = re.sub(
+            r'^(function\s+\w+\.\w+\s*=\s*.*)$',
+            r'-- [Unity property setter] \1',
+            source,
+            flags=re.MULTILINE,
+        )
+        fixes.append("Commented out C# property setter as function declaration")
 
     # Strip stray `{` braces at start of line (C# block openers that survived conversion)
     if re.search(r'^\s*\{\s*$', source, re.MULTILINE):
@@ -6739,33 +6870,56 @@ def _fix_missing_ends_in_blocks(source: str, fixes: list[str]) -> str:
 def _fix_missing_function_end(name: str, source: str, fixes: list[str]) -> str:
     """Insert missing `end` between consecutive local functions.
 
-    When a function ends with `return` but has no closing `end`, and the next
-    `local function` starts at same or lesser indentation, insert `end`.
+    When a function's last line is `return` or `end` (closing an inner block)
+    but has no closing `end` for itself, and the next `local function` starts
+    at same or lesser indentation, insert `end`.
     Runs AFTER _fix_missing_end_keywords to avoid being removed by excess-end logic.
     """
-    if not re.search(r'return\s+\w+.*\n(?:\s*\n)*\s*local\s+function\s+', source):
+    # Check for either `return` or `end` followed by blank lines then `local function`
+    if not re.search(r'(?:return\s+\w+|^\s+end)\s*\n(?:\s*\n)*\s*local\s+function\s+', source, re.MULTILINE):
         return source
 
     lines = source.split('\n')
     result = []
+
+    # Track function open/close depth to detect unclosed functions
+    func_depth = 0
+    func_start_indents = []
+
     for i, line in enumerate(lines):
         result.append(line)
-        if re.match(r'\s+return\s+\w+', line):
+        stripped = line.strip()
+
+        # Track function depth
+        if re.match(r'(?:local\s+)?function\s+[\w.:]+\s*\(', stripped):
+            indent = len(line) - len(line.lstrip())
+            func_depth += 1
+            func_start_indents.append(indent)
+        if stripped == 'end' and func_depth > 0:
+            func_depth -= 1
+            if func_start_indents:
+                func_start_indents.pop()
+
+        # Check if this line ends a function body (return or inner-block end)
+        is_end_of_body = (
+            re.match(r'\s+return\s+\w+', line) or
+            (stripped == 'end' and func_depth > 0)
+        )
+        if is_end_of_body:
             j = i + 1
-            has_end_between = False
             while j < len(lines) and lines[j].strip() == '':
                 j += 1
-            # Check if there's an `end` between return and next function
-            if j < len(lines) and lines[j].strip() == 'end':
-                has_end_between = True
-                j += 1
-                while j < len(lines) and lines[j].strip() == '':
-                    j += 1
-            if not has_end_between and j < len(lines) and re.match(r'\s+local\s+function\s+', lines[j]):
-                ret_indent = len(line) - len(line.lstrip())
+            if j < len(lines) and re.match(r'\s*local\s+function\s+', lines[j]):
+                # Check indentation: next function at same or lesser indent means
+                # current function is unclosed
+                body_indent = len(line) - len(line.lstrip())
                 func_indent = len(lines[j]) - len(lines[j].lstrip())
-                if func_indent <= ret_indent:
+                if func_indent <= body_indent and func_depth > 0:
                     result.append(f'{" " * func_indent}end')
+                    func_depth -= 1
+                    if func_start_indents:
+                        func_start_indents.pop()
+
     new_source = '\n'.join(result)
     if new_source != source:
         fixes.append("Fixed missing function end before next local function")
@@ -7618,6 +7772,7 @@ def _fix_module_script_parent_access(name: str, source: str, fixes: list[str]) -
 
     # Check if module-scope code uses script.Parent for runtime behavior
     has_runtime_parent = False
+    parent_aliases: set[str] = set()
     lines = source.split('\n')
     in_function = 0
 
@@ -7641,8 +7796,17 @@ def _fix_module_script_parent_access(name: str, source: str, fixes: list[str]) -
         if re.match(r'while\b.+\bdo\s*$', code_part):
             in_function += 1
 
-        # Module scope: check for script.Parent usage in runtime code
-        if in_function == 0 and 'script.Parent' in stripped:
+        # Track script.Parent aliases: `local part = script.Parent`
+        alias_m = re.match(r'local\s+(\w+)\s*=\s*script\.Parent\b', stripped)
+        if alias_m:
+            parent_aliases.add(alias_m.group(1))
+
+        # Check for script.Parent (or alias) usage in runtime code.
+        # Check at module scope AND inside functions (aliases set at module scope
+        # are shared across functions, so any function using e.g. part.CFrame
+        # will crash when script.Parent is ReplicatedStorage).
+        check_names = ['script.Parent'] + list(parent_aliases)
+        if any(n in stripped for n in check_names):
             # Runtime indicators: event connections, property access, method calls
             if any(p in stripped for p in [
                 '.Position', '.CFrame', '.Size', '.Orientation',
