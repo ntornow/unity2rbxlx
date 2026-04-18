@@ -1205,8 +1205,15 @@ def _ai_transpile(
     cache_key = _cache_key(csharp_source + class_name + script_type + project_context + _prompt_hash, model)
     cached = _load_cache(cache_key)
     if cached is not None:
-        log.debug("AI transpilation cache hit for %s", cache_key[:12])
-        return cached["luau"], cached["confidence"], cached.get("warnings", [])
+        # Verify cached result passes lint — old caches may have syntax errors
+        luau_cached = cached["luau"]
+        cached_errors = _luau_syntax_check(luau_cached)
+        if not cached_errors:
+            log.debug("AI transpilation cache hit for %s (lint clean)", cache_key[:12])
+            return luau_cached, cached["confidence"], cached.get("warnings", [])
+        else:
+            log.info("  [%s] Cache hit but %d syntax error(s) — re-transpiling",
+                     class_name, len(cached_errors))
 
     # Call the API.
     try:
@@ -1352,8 +1359,15 @@ def _claude_cli_transpile(
     cache_key = _cache_key(csharp_source + class_name + script_type + project_context + _prompt_hash, "claude-cli-v4")
     cached = _load_cache(cache_key)
     if cached is not None:
-        log.debug("Claude CLI cache hit for %s", cache_key[:12])
-        return cached["luau"], cached["confidence"], cached.get("warnings", [])
+        # Verify cached result passes lint — old caches may have syntax errors
+        luau_cached = cached["luau"]
+        cached_errors = _luau_syntax_check(luau_cached)
+        if not cached_errors:
+            log.debug("Claude CLI cache hit for %s (lint clean)", cache_key[:12])
+            return luau_cached, cached["confidence"], cached.get("warnings", [])
+        else:
+            log.info("  [%s] Cache hit but %d syntax error(s) — re-transpiling",
+                     class_name, len(cached_errors))
 
     # Check claude is available
     claude_path = shutil.which("claude")
