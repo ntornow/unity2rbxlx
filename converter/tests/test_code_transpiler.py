@@ -3861,3 +3861,64 @@ return Player
 
         # getRifle is idempotent against repeated Touched fires.
         assert "if gotWeapon then return end" in fixed
+
+
+class TestValidatorSwipeRoyalePatterns:
+    """Tests for validator rules added during swipe-royale conversion."""
+
+    def test_end_comma_staircase_in_table(self):
+        """end followed by }, inside table → collapsed to end,"""
+        from converter.luau_validator import validate_and_fix
+        source = 'local t = {\n    fn = function()\n        x = 1\n    end\n    },\n}\nreturn t'
+        fixed, _ = validate_and_fix("test", source)
+        assert '},\n}' not in fixed or 'end,' in fixed
+
+    def test_reserved_word_table_key_midline(self):
+        """true = 2 inside table → ["true"] = 2"""
+        from converter.luau_validator import validate_and_fix
+        source = 'local T = { A = 0, B = 1, true = 2 }'
+        fixed, _ = validate_and_fix("test", source)
+        assert '["true"]' in fixed
+
+    def test_premature_then_multiline_if(self):
+        """if expr then\\n    and expr → removes premature then"""
+        from converter.luau_validator import validate_and_fix
+        source = 'if x > 0 then\n    and y > 0 then\n    print("ok")\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert fixed.count(' then') == 1, f"Should have exactly one 'then', got: {fixed}"
+
+    def test_string_plus_concat(self):
+        """C# string + concat → Luau .."""
+        from converter.luau_validator import validate_and_fix
+        source = 'local s = "hello" + " world"'
+        fixed, _ = validate_and_fix("test", source)
+        assert '..' in fixed
+        assert '+' not in fixed.replace('--', '')  # ignore comments
+
+    def test_nil_safe_require_findfirstchild(self):
+        """require(X:FindFirstChild(...)) wrapped in nil check"""
+        from converter.luau_validator import validate_and_fix
+        source = 'local M = require(game:GetService("ReplicatedStorage"):FindFirstChild("M", true))'
+        fixed, _ = validate_and_fix("test", source)
+        assert '_M_mod' in fixed or 'FindFirstChild' in fixed
+
+    def test_module_guard_not_added_to_function_scope(self):
+        """Guard should NOT be added when script.Parent is only used inside functions"""
+        from converter.luau_validator import validate_and_fix
+        source = 'local M = {}\nlocal function foo()\n    local p = script.Parent\n    p.CFrame = CFrame.new()\nend\nreturn M'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- Guard:' not in fixed, "Should not add guard for function-scope usage"
+
+    def test_module_guard_added_for_module_scope(self):
+        """Guard SHOULD be added when script.Parent property access is at module scope"""
+        from converter.luau_validator import validate_and_fix
+        source = 'local M = {}\nlocal part = script.Parent\npart.CFrame = CFrame.new()\nreturn M'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- Guard:' in fixed, "Should add guard for module-scope usage"
+
+    def test_function_setter_commented_out(self):
+        """function X.Y = val → commented out"""
+        from converter.luau_validator import validate_and_fix
+        source = 'function Foo.Bar = 42\nend'
+        fixed, _ = validate_and_fix("test", source)
+        assert '-- [Unity property setter]' in fixed
