@@ -254,6 +254,15 @@ def fix_require_classifications(scripts: list[RbxScript]) -> int:
     # Pass 8: Stub out unavailable platform SDKs (FlurryAnalytics, Firebase, etc.)
     fixes += _stub_unavailable_sdks(scripts)
 
+    # Pass 9: Guard client-only code in ModuleScripts loaded by server scripts.
+    # When a ModuleScript uses Players.LocalPlayer at module scope, wrap it in
+    # RunService:IsClient() so the server-side require() doesn't crash.
+    fixes += _guard_client_code_in_modules(scripts)
+
+    # Pass 10: Add workspace lookup for ModuleScripts that do FindFirstChild
+    # on script.Parent at module scope (e.g. HostilePlane looking for "Origin").
+    fixes += _add_workspace_fallback(scripts)
+
     return fixes
 
 
@@ -545,5 +554,117 @@ def _stub_unavailable_sdks(scripts: list[RbxScript]) -> int:
                 s.source = s.source[:match.end()] + stub + s.source[match.end():]
                 fixes += 1
                 log.info("  Stubbed SDK module '%s' in '%s'", mod_name, s.name)
+
+    return fixes
+
+
+def _guard_client_code_in_modules(scripts: list[RbxScript]) -> int:
+    """Wrap client-only initialization in RunService:IsClient() for ModuleScripts.
+
+    When a ModuleScript uses Players.LocalPlayer at module scope (outside
+    functions), the server-side require() will crash because LocalPlayer is nil.
+    Wrap the client-only block (from LocalPlayer usage to end of file) in an
+    IsClient() guard.
+    """
+    fixes = 0
+    for s in scripts:
+        if s.script_type != "ModuleScript":
+            continue
+        if 'RunService:IsClient()' in s.source:
+            continue  # Already guarded
+
+        # Check for module-scope LocalPlayer usage
+        has_local_player_module_scope = False
+        lines = s.source.split('\n')
+        in_function = 0
+        lp_line_idx = -1
+
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith('--'):
+                continue
+            # Only track function depth — if/for/while at module scope
+            # are still module scope, not inside a function.
+            if re.search(r'\bfunction\s*[\w.:(]', stripped):
+                in_function += 1
+            if (stripped == 'end' or stripped.startswith('end)') or stripped == 'end,') and in_function > 0:
+                in_function -= 1
+
+            if in_function == 0 and not stripped.startswith('local ') and (
+                'localPlayer.' in stripped or 'LocalPlayer.' in stripped
+            ):
+                has_local_player_module_scope = True
+                lp_line_idx = i
+                break
+
+        if not has_local_player_module_scope or lp_line_idx < 0:
+            continue
+
+        # Find the return statement at the end
+        return_m = re.search(r'^return\s+\w+\s*$', s.source, re.MULTILINE)
+        if not return_m:
+            continue
+
+        # Wrap the client-only block in IsClient() guard
+        # Insert `if RunService:IsClient() then` before the LocalPlayer usage
+        # and `end` before the return
+        indent = '  '  # Minimal indent for the guard
+        lines.insert(lp_line_idx, f'\nif game:GetService("RunService"):IsClient() then')
+        # Find return line (shifted by 1 due to insertion)
+        for j in range(len(lines) - 1, -1, -1):
+            if lines[j].strip().startswith('return '):
+                lines.insert(j, 'end\n')
+                break
+        s.source = '\n'.join(lines)
+        fixes += 1
+        log.info("  Added IsClient() guard for client-only code in '%s'", s.name)
+
+    return fixes
+
+
+def _add_workspace_fallback(scripts: list[RbxScript]) -> int:
+    """Add workspace lookup for ModuleScripts that use script.Parent:FindFirstChild at module scope.
+
+    When script.Parent is ReplicatedStorage, FindFirstChild won't find game objects.
+    Add a fallback that searches workspace for the script's named parent.
+    """
+    fixes = 0
+    for s in scripts:
+        if s.script_type != "ModuleScript":
+            continue
+        if '-- workspace fallback' in s.source:
+            continue  # Already has fallback
+
+        # Check for pattern: `local model = script.Parent` followed by
+        # `model:FindFirstChild("X")` at module scope
+        model_alias = None
+        alias_m = re.search(r'^local\s+(\w+)\s*=\s*script\.Parent\b', s.source, re.MULTILINE)
+        if alias_m:
+            model_alias = alias_m.group(1)
+
+        if not model_alias:
+            continue
+
+        # Check if the alias is used with FindFirstChild at module scope
+        find_m = re.search(
+            rf'^local\s+\w+\s*=\s*{re.escape(model_alias)}:FindFirstChild\(',
+            s.source, re.MULTILINE,
+        )
+        if not find_m:
+            continue
+
+        # Add workspace fallback after the alias assignment
+        fallback = (
+            f'\n-- workspace fallback: script.Parent is ReplicatedStorage for ModuleScripts\n'
+            f'if not {model_alias}:IsA("BasePart") and not {model_alias}:IsA("Model") then\n'
+            f'    {model_alias} = workspace:FindFirstChild("{s.name}", true) or {model_alias}\n'
+            f'end'
+        )
+        s.source = s.source.replace(
+            alias_m.group(0),
+            alias_m.group(0) + fallback,
+        )
+        fixes += 1
+        log.info("  Added workspace fallback for '%s' in '%s'", model_alias, s.name)
 
     return fixes
