@@ -154,6 +154,11 @@ def _validate_and_fix_single_pass(name: str, source: str, fixes: list[str]) -> s
     source = _fix_enum_comparisons(name, source, fixes)
     source = _fix_csharp_remnants(name, source, fixes)
     source = _fix_common_api_mistakes(name, source, fixes)
+    source = _fix_duplicate_guard_blocks(name, source, fixes)
+    source = _fix_missing_table_commas(name, source, fixes)
+    source = _fix_recursive_require(name, source, fixes)
+    source = _fix_broken_multiline_if(name, source, fixes)
+    source = _fix_misplaced_return(name, source, fixes)
     source = _fix_structural_syntax(name, source, fixes)
     source = _fix_missing_end_keywords(name, source, fixes)
     source = _fix_missing_function_end(name, source, fixes)
@@ -5578,6 +5583,328 @@ def _fix_common_api_mistakes(name: str, source: str, fixes: list[str]) -> str:
     return source
 
 
+def _fix_duplicate_guard_blocks(name: str, source: str, fixes: list[str]) -> str:
+    """Remove duplicate consecutive guard blocks that check script.Parent:IsA.
+
+    The guard insertion can be applied multiple times across converter runs,
+    producing identical back-to-back guard blocks like:
+        if not (script.Parent:IsA("BasePart") ...) then return X end
+        if not (script.Parent:IsA("BasePart") ...) then return X end
+    Keep only the first occurrence.
+    """
+    guard_pat = re.compile(
+        r'(-- Guard: skip runtime code[^\n]*\n'
+        r'if not \(script\.Parent:IsA\("BasePart"\).*?\bthen\b\n'
+        r'\s+return \w+\n'
+        r'end\n)',
+        re.DOTALL,
+    )
+    matches = list(guard_pat.finditer(source))
+    if len(matches) <= 1:
+        return source
+    # Keep the first match, remove all subsequent identical ones
+    # Walk backwards to preserve offsets
+    removed = 0
+    for m in reversed(matches[1:]):
+        # Also remove any blank lines between consecutive guards
+        start = m.start()
+        end = m.end()
+        # Consume leading blank lines
+        while start > 0 and source[start - 1] == '\n':
+            start -= 1
+            if start > 0 and source[start - 1] == '\n':
+                break  # keep one newline
+        source = source[:start] + '\n' + source[end:]
+        removed += 1
+    if removed:
+        fixes.append(f"Removed {removed} duplicate guard block(s)")
+    return source
+
+
+def _fix_missing_table_commas(name: str, source: str, fixes: list[str]) -> str:
+    """Insert missing commas between consecutive string literals in table literals.
+
+    Detects patterns like:
+        {"January", "February", "March"
+            "April", "May"}
+    where a comma is missing after the last string on a line, causing
+    'Expected }' errors when the next line continues with another string.
+    """
+    # Pattern: a quoted string at the end of a line (no comma/semicolon after),
+    # followed by a line that starts with a quoted string (table continuation)
+    # We need to be inside a table literal context.
+    lines = source.split('\n')
+    changed = False
+    for i in range(len(lines) - 1):
+        line = lines[i]
+        next_line = lines[i + 1]
+        stripped = line.rstrip()
+        next_stripped = next_line.lstrip()
+        # Current line ends with a quoted string (no trailing comma)
+        if re.search(r'["\']$', stripped.rstrip()) and not re.search(r'[,;{}]\s*$', stripped):
+            # Next line starts with a quoted string (indicating table continuation)
+            if re.match(r'\s*["\']', next_line):
+                # Verify we're in a table context by checking for { above
+                in_table = False
+                brace_depth = 0
+                for j in range(i, max(i - 50, -1), -1):
+                    check_line = lines[j]
+                    cs = check_line.strip()
+                    if cs.startswith('--'):
+                        continue
+                    no_str = re.sub(r'"[^"]*"', '""', cs)
+                    no_str = re.sub(r"'[^']*'", "''", no_str)
+                    brace_depth += no_str.count('}') - no_str.count('{')
+                    if brace_depth < 0:
+                        in_table = True
+                        break
+                if in_table:
+                    lines[i] = stripped + ','
+                    changed = True
+    if changed:
+        source = '\n'.join(lines)
+        fixes.append("Added missing comma between consecutive string literals in table")
+    return source
+
+
+def _fix_recursive_require(name: str, source: str, fixes: list[str]) -> str:
+    """Break circular require chains by converting one side to lazy-load.
+
+    Detects when module A requires module B at the top level, and module B
+    also requires module A (bidirectional). Since we only see one file at a
+    time, we detect the pattern where a module both:
+    1. Is required by others (it has `return ModuleName` at end)
+    2. Requires another module that likely requires it back
+
+    The fix: wrap the require in a lazy-loading function that defers the
+    actual require() call until first use.
+    """
+    # Find all nil-safe requires: local X = _X_mod and require(_X_mod) or nil
+    requires = list(re.finditer(
+        r'^(\s*local\s+(\w+)\s*=\s*_(\w+)_mod\s+and\s+require\(_\3_mod\)\s+or\s+nil)\s*$',
+        source, re.MULTILINE,
+    ))
+    if not requires:
+        return source
+
+    # Check if this script returns a module (is itself a ModuleScript)
+    module_match = re.search(r'^return\s+(\w+)\s*$', source, re.MULTILINE)
+    if not module_match:
+        return source
+
+    module_name = module_match.group(1)
+
+    # Look for potential circular dependencies:
+    # If this module name appears in the required module's name or vice versa,
+    # it's likely circular. Also check if the required module name is a suffix/prefix
+    # of this module name (e.g., RuntimeManager <-> FMODRuntimeManagerOnGUIHelper).
+    lines = source.split('\n')
+    changed = False
+    for req_match in requires:
+        req_var = req_match.group(2)  # e.g., FMODRuntimeManagerOnGUIHelper
+        req_mod = req_match.group(3)  # e.g., FMODRuntimeManagerOnGUIHelper
+
+        # Heuristic: likely circular if the required module's name contains this
+        # module's FULL name embedded inside it (e.g., FMODRuntimeManagerOnGUIHelper
+        # contains "RuntimeManager").  This suggests a helper/wrapper pattern where
+        # the helper requires the main module and the main module requires the helper.
+        # Exclude the case where the required module is simply this module name with
+        # a common suffix appended (e.g., SkeletonGhostRenderer is NOT circular with
+        # SkeletonGhost -- it's a parent-child, not a circular dep).
+        is_likely_circular = False
+        mn_lower = module_name.lower()
+        rm_lower = req_mod.lower()
+        if mn_lower in rm_lower and mn_lower != rm_lower:
+            # Required name contains our name -- check it's not just a suffix extension
+            # e.g., "SkeletonGhost" -> "SkeletonGhostRenderer" is NOT circular
+            #        "RuntimeManager" -> "FMODRuntimeManagerOnGUIHelper" IS circular
+            suffix = rm_lower[rm_lower.index(mn_lower) + len(mn_lower):]
+            prefix = rm_lower[:rm_lower.index(mn_lower)]
+            # If there's a meaningful prefix OR the name appears mid-string, it's circular
+            if prefix:
+                is_likely_circular = True
+            # If suffix is just a common type name, it's a subtype, not circular
+            elif suffix and suffix not in ('renderer', 'component', 'helper', 'data',
+                                           'asset', 'bone', 'constraint', 'animation',
+                                           'animator', 'utility', 'manager', 'view',
+                                           'controller', 'handler', 'listener', 'event'):
+                is_likely_circular = True
+        elif rm_lower in mn_lower and mn_lower != rm_lower:
+            # Our name contains the required name -- similar logic
+            suffix = mn_lower[mn_lower.index(rm_lower) + len(rm_lower):]
+            prefix = mn_lower[:mn_lower.index(rm_lower)]
+            if prefix:
+                is_likely_circular = True
+            elif suffix and suffix not in ('renderer', 'component', 'helper', 'data',
+                                           'asset', 'bone', 'constraint', 'animation',
+                                           'animator', 'utility', 'manager', 'view',
+                                           'controller', 'handler', 'listener', 'event'):
+                is_likely_circular = True
+        if not is_likely_circular:
+            continue
+
+        # Check if req_var is actually used in the code (beyond the require line)
+        usage_pattern = re.compile(rf'\b{re.escape(req_var)}\b')
+        usage_count = len(usage_pattern.findall(source)) - 1  # subtract the require line itself
+        if usage_count <= 0:
+            # Not used anywhere -- just leave it as nil-safe require (no circular issue)
+            continue
+
+        # Replace the require with a lazy-loading pattern
+        old_line = req_match.group(1)
+        indent = re.match(r'^(\s*)', old_line).group(1)
+        lazy_replacement = (
+            f'{indent}local {req_var} = nil -- lazy-loaded to break circular require\n'
+            f'{indent}local function _get_{req_var}()\n'
+            f'{indent}    if {req_var} == nil then\n'
+            f'{indent}        local _mod = game:GetService("ReplicatedStorage"):FindFirstChild("{req_mod}", true)\n'
+            f'{indent}        if _mod then {req_var} = require(_mod) end\n'
+            f'{indent}    end\n'
+            f'{indent}    return {req_var}\n'
+            f'{indent}end'
+        )
+        source = source.replace(old_line, lazy_replacement)
+        # Replace usages of the module variable with the lazy getter
+        # But only direct usages like `req_var.Method` or `req_var:Method`
+        # Don't replace inside the lazy function itself
+        source_lines = source.split('\n')
+        in_lazy_func = False
+        new_lines = []
+        for sl in source_lines:
+            if f'local function _get_{req_var}()' in sl:
+                in_lazy_func = True
+            if in_lazy_func:
+                new_lines.append(sl)
+                if sl.strip() == 'end' and in_lazy_func:
+                    in_lazy_func = False
+                continue
+            # Replace `req_var.` and `req_var:` with `_get_req_var().` and `_get_req_var():`
+            if re.search(rf'\b{re.escape(req_var)}[.:]', sl):
+                sl = re.sub(
+                    rf'\b{re.escape(req_var)}([.:])',
+                    rf'_get_{req_var}()\1',
+                    sl,
+                )
+            new_lines.append(sl)
+        source = '\n'.join(new_lines)
+        changed = True
+
+    if changed:
+        fixes.append("Converted circular require to lazy-load pattern")
+    return source
+
+
+def _fix_broken_multiline_if(name: str, source: str, fixes: list[str]) -> str:
+    """Fix broken multi-line if conditions where 'then' appears on the first line.
+
+    Detects patterns like:
+        if condition1 then
+            and condition2
+            and condition3 then
+    The first 'then' should not be there; the conditions should be joined.
+    Fix: remove the first 'then', join the continuation lines.
+    """
+    lines = source.split('\n')
+    changed = False
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        # Look for: `if CONDITION then` followed by `and CONDITION` on next line
+        if re.match(r'^if\b.+\bthen\s*$', stripped):
+            # Check if the next non-blank line starts with 'and' or 'or'
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j < len(lines):
+                next_s = lines[j].strip()
+                if re.match(r'^(?:and|or)\b', next_s):
+                    # This is a broken multi-line condition.
+                    # Remove 'then' from the first line
+                    lines[i] = re.sub(r'\s+then\s*$', '', lines[i])
+                    # Now collect all continuation lines until we find a proper 'then'
+                    # and merge them
+                    while j < len(lines):
+                        cont_s = lines[j].strip()
+                        if not cont_s:
+                            j += 1
+                            continue
+                        # If this continuation line ends with 'then', it's the real then
+                        if re.search(r'\bthen\s*$', cont_s):
+                            # Join this line to the if line
+                            indent = len(lines[i]) - len(lines[i].lstrip())
+                            # Remove any 'end' that was inserted after the broken 'then'
+                            # and before the continuation 'and'
+                            lines[i] = lines[i].rstrip() + '\n' + lines[j]
+                            # Remove the continuation line
+                            lines.pop(j)
+                            changed = True
+                            break
+                        elif re.match(r'^(?:and|or)\b', cont_s):
+                            # Another continuation — append to the if line
+                            lines[i] = lines[i].rstrip() + '\n' + lines[j]
+                            lines.pop(j)
+                            changed = True
+                            # Don't increment j since we removed a line
+                        else:
+                            # Not a continuation — the condition was on one line
+                            # and 'then' was correct after all. Restore it.
+                            lines[i] = lines[i].rstrip() + ' then'
+                            break
+        i += 1
+    if changed:
+        source = '\n'.join(lines)
+        fixes.append("Fixed broken multi-line if condition (premature 'then')")
+    return source
+
+
+def _fix_misplaced_return(name: str, source: str, fixes: list[str]) -> str:
+    """Fix `return ModuleName` that appears mid-file with code after it.
+
+    When AI inserts `return ModuleName` too early (before all methods are
+    defined), it causes 'Expected <eof>, got function' errors. This fix
+    moves the return to the end of the file (after all function definitions).
+
+    Only applies when the return matches a module table pattern (return CapitalName)
+    and there are function definitions after it.
+    """
+    lines = source.split('\n')
+
+    # Find all `return CapName` at top indent level (indent 0)
+    return_indices = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip()) if stripped else 0
+        if indent == 0 and re.match(r'^return\s+[A-Z]\w+\s*$', stripped):
+            return_indices.append(i)
+
+    if not return_indices:
+        return source
+
+    # Check each return: if there's a function definition after it, the return is misplaced
+    for ret_idx in return_indices:
+        # Check if this is the last return (at EOF) — that's fine
+        has_code_after = False
+        has_func_after = False
+        for j in range(ret_idx + 1, len(lines)):
+            s = lines[j].strip()
+            if not s or s.startswith('--'):
+                continue
+            has_code_after = True
+            if re.match(r'^(?:local\s+)?function\s+', s):
+                has_func_after = True
+                break
+
+        if has_func_after:
+            # Remove this return — it will be re-added at EOF by _fix_missing_module_return
+            ret_line = lines[ret_idx]
+            lines[ret_idx] = f'-- [moved to EOF] {ret_line.strip()}'
+            source = '\n'.join(lines)
+            fixes.append("Moved misplaced mid-file return to EOF")
+            break  # Only fix the first misplaced return
+
+    return source
+
+
 def _fix_end_closing_table(source: str, fixes: list[str]) -> str:
     """Fix `end` or `end,` used to close table literals instead of `}` or `},`.
 
@@ -8066,6 +8393,10 @@ def _fix_module_script_parent_access(name: str, source: str, fixes: list[str]) -
         return source
 
     module_name = module_match.group(1)
+
+    # Skip if guard already exists (avoid inserting duplicates on re-runs)
+    if '-- Guard: skip runtime code if script is not parented to a game object' in source:
+        return source
 
     # Check if module-scope code uses script.Parent for runtime behavior
     has_runtime_parent = False
