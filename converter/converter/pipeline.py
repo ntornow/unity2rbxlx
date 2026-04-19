@@ -1753,12 +1753,12 @@ script.Disabled = true
                 for class_name in script_classes:
                     if class_name in script_by_name:
                         script = script_by_name[class_name]
-                        # Only bind Server scripts and LocalScripts to parts.
+                        # Only bind Server scripts to parts.
                         # ModuleScripts stay in ReplicatedStorage for require().
-                        # Skip stub scripts (AI unavailable) — they have no
-                        # runnable code, and cloning them per instance bloats
-                        # the rbxlx (Gamekit3D: 7860 copies of a Variations stub).
-                        if script.script_type != "ModuleScript" and "AI transpilation recommended" not in script.source:
+                        # LocalScripts go to StarterPlayerScripts (they don't
+                        # execute when parented to workspace Parts).
+                        # Skip stub scripts (AI unavailable).
+                        if script.script_type == "Script" and "AI transpilation recommended" not in script.source:
                             # Clone the script for each instance so all prefab
                             # variants get their inherited MonoBehaviour scripts
                             if class_name in bound_script_names:

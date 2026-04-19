@@ -104,8 +104,21 @@ def inject_require_calls(
         require_lines = []
         for dep in sorted(set(requires_to_add)):
             target = script_by_class[dep]
-            # Ensure the target is a ModuleScript
+            # Ensure the target is a ModuleScript — BUT don't reclassify
+            # scripts that are heavily client-only (LocalPlayer, camera,
+            # UserInputService, RenderStepped). These break when loaded
+            # as modules on the server. Instead, skip the require.
             if target.script_type != "ModuleScript":
+                # Count client-only API usage
+                client_api_count = sum(
+                    1 for pat in _CLIENT_ONLY_PATTERNS
+                    if re.search(pat, target.source)
+                )
+                if client_api_count >= 3:
+                    log.info("  Skipping require of '%s' (heavy client-only script, %d client APIs)",
+                             dep, client_api_count)
+                    requires_to_add = [r for r in requires_to_add if r != dep]
+                    continue
                 old_type = target.script_type
                 target.script_type = "ModuleScript"
                 log.info("  Reclassified '%s' from %s to ModuleScript (required by '%s')",
@@ -191,11 +204,20 @@ def fix_require_classifications(scripts: list[RbxScript]) -> int:
         for m in re.finditer(r'require\([^)]*\.(\w+)\s*\)', s.source):
             required_names.add(m.group(1))
 
-    # Reclassify required scripts as ModuleScript.
+    # Reclassify required scripts as ModuleScript — but skip heavy client-only
+    # scripts (3+ client APIs) that would break as modules on the server.
     for name in required_names:
         if name in script_by_name:
             target = script_by_name[name]
             if target.script_type != "ModuleScript":
+                client_api_count = sum(
+                    1 for pat in _CLIENT_ONLY_PATTERNS
+                    if re.search(pat, target.source)
+                )
+                if client_api_count >= 3:
+                    log.info("  Skipping reclassification of '%s' (heavy client-only, %d APIs)",
+                             name, client_api_count)
+                    continue
                 old_type = target.script_type
                 target.script_type = "ModuleScript"
                 fixes += 1
@@ -260,9 +282,11 @@ def fix_require_classifications(scripts: list[RbxScript]) -> int:
     fixes += _guard_client_code_in_modules(scripts)
 
     # Pass 10: Fix prefab lookups that search ReplicatedStorage instead of workspace.
-    # The AI often generates `ReplicatedStorage:FindFirstChild("PrefabName")` for
-    # game objects that are actually children of Parts in workspace.
     fixes += _fix_prefab_lookups(scripts)
+
+    # Pass 13: Fix cloned prefabs that have Transparency=1 and Anchored=true.
+    # Unity prefab templates are hidden in the scene but clones should be visible.
+    fixes += _fix_clone_visibility(scripts)
 
     # Pass 11: Add workspace lookup for ModuleScripts that do FindFirstChild
     # on script.Parent at module scope (e.g. HostilePlane looking for "Origin").
@@ -842,5 +866,88 @@ def _wire_attribute_listeners(scripts: list[RbxScript]) -> int:
 
         if added_any:
             fixes += 1
+
+    return fixes
+
+
+def _fix_clone_visibility(scripts: list[RbxScript]) -> int:
+    """Fix cloned prefab parts that have Transparency=1 and Anchored=true.
+
+    Unity prefab templates are often invisible in the scene (disabled GameObjects).
+    The converter preserves Transparency=1 and Anchored=true. When the prefab is
+    cloned at runtime (e.g. rifle pickup), the clone should be visible and unanchored.
+
+    Injects a helper loop after Clone() calls that sets Transparency=0 and
+    Anchored=false on all BasePart descendants.
+    """
+    fixes = 0
+    _VISIBILITY_FIX = (
+        '\n        -- Fix clone visibility (prefab template may be invisible/anchored)\n'
+        '        for _, _p in rifle:GetDescendants() do\n'
+        '            if _p:IsA("BasePart") then\n'
+        '                _p.Transparency = 0\n'
+        '                _p.Anchored = false\n'
+        '            end\n'
+        '        end'
+    )
+
+    for s in scripts:
+        # Look for pattern: X:Clone() ... X.Parent = Y
+        # where the clone is a prefab being placed in the scene
+        if ':Clone()' not in s.source:
+            continue
+
+        # Find clone+parent patterns
+        lines = s.source.split('\n')
+        new_lines = []
+        i = 0
+        changed = False
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            # Detect: local X = Y:Clone()
+            clone_m = re.match(r'(\s*)local\s+(\w+)\s*=\s*\w+:Clone\(\)', stripped)
+            if clone_m:
+                clone_var = clone_m.group(2)
+                # Look ahead for `.Parent = ` within 20 lines
+                has_parent = False
+                for j in range(i + 1, min(i + 20, len(lines))):
+                    if f'{clone_var}.Parent' in lines[j]:
+                        has_parent = True
+                        break
+                if has_parent and '-- Fix clone visibility' not in s.source:
+                    indent = len(line) - len(line.lstrip())
+                    i4 = " " * (indent + 4)
+                    i8 = " " * (indent + 8)
+                    i12 = " " * (indent + 12)
+                    fix_code = (
+                        f'\n{i4}-- Fix clone visibility and weld sub-mesh parts together\n'
+                        f'{i4}local _primary = {clone_var}.PrimaryPart or {clone_var}:FindFirstChildWhichIsA("BasePart")\n'
+                        f'{i4}for _, _p in {clone_var}:GetDescendants() do\n'
+                        f'{i8}if _p:IsA("BasePart") then\n'
+                        f'{i12}_p.Transparency = 0\n'
+                        f'{i12}_p.Anchored = false\n'
+                        f'{i12}_p.CanCollide = false\n'
+                        f'{i12}if _primary and _p ~= _primary then\n'
+                        f'{i12}    local _w = Instance.new("WeldConstraint")\n'
+                        f'{i12}    _w.Part0 = _p\n'
+                        f'{i12}    _w.Part1 = _primary\n'
+                        f'{i12}    _w.Parent = _p\n'
+                        f'{i12}end\n'
+                        f'{i8}end\n'
+                        f'{i4}end'
+                    )
+                    new_lines.append(line)
+                    new_lines.append(fix_code)
+                    changed = True
+                    i += 1
+                    continue
+            new_lines.append(line)
+            i += 1
+
+        if changed:
+            s.source = '\n'.join(new_lines)
+            fixes += 1
+            log.info("  Added clone visibility fix in '%s'", s.name)
 
     return fixes
