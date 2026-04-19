@@ -182,7 +182,7 @@ python u2r.py convert ../test_projects/SimpleFPS -o ./output/SimpleFPS --api-key
 - Roblox: right-handed Y-up
 - Position: (x, y, z)_unity -> (x, y, -z)_roblox
 - Quaternion: (qx, qy, qz, qw)_unity -> (-qx, -qy, qz, qw)_roblox
-- FBX mesh handedness: `fbx_binary.mirror_fbx_handedness()` negates the depth axis in vertices/normals (Z for Y-up FBX, Y for Z-up FBX) and flips polygon winding before upload. This mirrors the mesh the same way Unity does on import, so it renders identically in Roblox with no rotational offset to the CFrame.
+- FBX mesh handedness: `fbx_binary.mirror_fbx_handedness()` negates X and Y in vertices/normals before upload (equivalent to 180° rotation around Z/vertical). This fixes asymmetric mesh features (text, logos) appearing on the wrong side in Roblox without affecting vertical positioning, triangle winding, or text orientation.
 
 ## Known Limitations
 - FBX files with sub-mesh hierarchies use collider-based size fallback when Studio resolution not available
@@ -250,7 +250,7 @@ After uploading, run these steps via Studio MCP `execute_luau`:
 
 ### Asset Upload & Processing
 - Pre-upload asset safety moderation (`moderate_assets` phase) — screens filenames, scripts, and audio against Roblox Community Standards; auto-blocklists violations
-- FBX mesh handedness fix — negates depth axis (Z for Y-up, Y for Z-up) in vertices and flips winding before upload to correct left-handed/right-handed mirror
+- FBX mesh handedness fix — negates X+Y in vertices before upload to correct left-handed/right-handed mirror
 - PSD, BMP, TGA, TIF texture auto-conversion to PNG
 - FBX and OBJ mesh upload via Open Cloud API
 - MP3, OGG, WAV, FLAC audio upload

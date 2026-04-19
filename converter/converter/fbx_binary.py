@@ -2,10 +2,10 @@
 fbx_binary.py -- Minimal FBX binary reader/writer for in-place vertex editing.
 
 Parses FBX binary files into a node tree and serialises them back, preserving
-all sub-mesh structure. Used by ``mirror_fbx_handedness()`` to negate one axis
-in Vertices/Normals arrays and flip polygon winding in PolygonVertexIndex
-arrays to fix left-handed/right-handed handedness, without the sub-mesh loss
-that assimp's FBX→OBJ→FBX round-trip causes.
+all sub-mesh structure. Used by ``mirror_fbx_z_inplace()`` to negate Z
+coordinates in Vertices/Normals arrays and flip polygon winding in
+PolygonVertexIndex arrays without the sub-mesh loss that assimp's
+FBX→OBJ→FBX round-trip causes.
 
 Supports FBX versions < 7500 (32-bit offsets); 7500+ support (64-bit offsets)
 is straightforward but not currently required.
@@ -332,42 +332,33 @@ def mirror_fbx_handedness(src_path: str | Path, dst_path: str | Path) -> bool:
     if not geoms:
         return False
 
-    # Determine which axis to negate based on UpAxis.
-    up = _detect_upaxis(roots)
-
-    # Unity converts right-handed FBX to left-handed by negating one axis
-    # on import.  To make the mesh look the same in Roblox (right-handed)
-    # as it did in Unity, we apply the same single-axis negate:
-    #
-    #   Y-up FBX  →  negate Z  (mirrors front/back in world space)
-    #   Z-up FBX  →  negate Y  (after Roblox's -90° X import rotation,
-    #                            FBX Y becomes world -Z, so negating Y
-    #                            mirrors world Z, matching Unity)
-    #
-    # A single-axis negate is a reflection (det = -1), which reverses
-    # triangle winding.  We flip winding to compensate so faces remain
-    # outward and backface culling works correctly.
-    negate_axis = 2 if up == 1 else 1   # Z for Y-up, Y for Z-up
+    # Negate both X and Y axes. This is equivalent to a 180° rotation
+    # around Z (the vertical axis in these FBX files). Unlike a single-
+    # axis negate (which is a mirror and reverses triangle winding),
+    # negating two axes is a proper rotation (determinant = +1) that
+    # preserves triangle winding — so no winding flip is needed and
+    # faces remain visible. The mesh simply faces the opposite
+    # direction, fixing which side shows which texture (e.g. SEA vs
+    # A32 on the SimpleFPS doors) without making text upside-down.
 
     for geom in geoms:
         v_node = _child(geom, b"Vertices")
         if v_node and v_node.properties and v_node.properties[0].type_code == "d":
-            v_node.properties[0].value = _negate_axis(v_node.properties[0].value, negate_axis)
+            v_node.properties[0].value = _negate_axis(v_node.properties[0].value, 0)  # X
+            v_node.properties[0].value = _negate_axis(v_node.properties[0].value, 1)  # Y
 
-        # Flip polygon winding to compensate for the single-axis
-        # reflection (det = -1).  Without this, faces would be
-        # inside-out and invisible due to backface culling.
-        pvi_node = _child(geom, b"PolygonVertexIndex")
-        if pvi_node and pvi_node.properties and pvi_node.properties[0].type_code == "i":
-            pvi_node.properties[0].value = _flip_winding(pvi_node.properties[0].value)
+        # No winding flip needed — negating two axes is a rotation
+        # (det = +1), not a reflection, so triangle handedness is
+        # preserved and faces render correctly without backface culling.
 
-        # Negate the same axis in normals
+        # Negate X and Y in normals
         for ln in geom.children:
             if ln.name == b"LayerElementNormal":
                 for nc in ln.children:
                     if nc.name in (b"Normals", b"NormalsW"):
                         if nc.properties and nc.properties[0].type_code == "d":
-                            nc.properties[0].value = _negate_axis(nc.properties[0].value, negate_axis)
+                            nc.properties[0].value = _negate_axis(nc.properties[0].value, 0)
+                            nc.properties[0].value = _negate_axis(nc.properties[0].value, 1)
 
     write_fbx(dst_path, ver, roots, footer=footer)
     return True

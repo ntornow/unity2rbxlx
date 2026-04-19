@@ -581,12 +581,10 @@ class Pipeline:
                 name = asset.path.stem
 
                 # Fix mesh handedness: Unity (left-handed) vs Roblox
-                # (right-handed). Negates the depth axis in FBX
-                # vertices (Z for Y-up, Y for Z-up) and flips
-                # polygon winding to compensate. This mirrors the
-                # mesh the same way Unity does on import, so it
-                # renders identically in Roblox without introducing
-                # any rotational offset to the CFrame.
+                # (right-handed). Negates X and Y in FBX vertices,
+                # equivalent to 180° rotation around Z (vertical).
+                # Preserves triangle winding (no backface culling)
+                # and keeps text right-side up.
                 if kind == "mesh" and asset.path.suffix.lower() == ".fbx":
                     from converter.fbx_binary import mirror_fbx_handedness
                     mirror_dir = self.output_dir / "mirrored_meshes"
