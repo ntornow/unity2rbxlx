@@ -268,6 +268,11 @@ def fix_require_classifications(scripts: list[RbxScript]) -> int:
     # on script.Parent at module scope (e.g. HostilePlane looking for "Origin").
     fixes += _add_workspace_fallback(scripts)
 
+    # Pass 12: Wire SetAttribute/GetAttributeChangedSignal for inter-script communication.
+    # When Pickup sets `character:SetAttribute("GetItem", name)`, the Player script
+    # needs to listen and call its local GetItem function.
+    fixes += _wire_attribute_listeners(scripts)
+
     return fixes
 
 
@@ -564,76 +569,118 @@ def _stub_unavailable_sdks(scripts: list[RbxScript]) -> int:
 
 
 def _guard_client_code_in_modules(scripts: list[RbxScript]) -> int:
-    """Wrap client-only initialization in RunService:IsClient() for ModuleScripts.
+    """Make LocalPlayer access nil-safe in ModuleScripts loaded by server scripts.
 
-    When a ModuleScript uses Players.LocalPlayer at module scope (outside
-    functions), the server-side require() will crash because LocalPlayer is nil.
-    Wrap the client-only block (from LocalPlayer usage to end of file) in an
-    IsClient() guard.
+    When a ModuleScript uses Players.LocalPlayer at module scope, the server-side
+    require() will crash because LocalPlayer is nil. Instead of wrapping a block
+    (which hides function definitions from the server), we:
+    1. Make LocalPlayer access nil-safe: `player.Character` → `player and player.Character`
+    2. Guard event connections that use LocalPlayer with IsClient() checks
+    This keeps function definitions (GetRifle, etc.) available to server scripts.
     """
     fixes = 0
     for s in scripts:
         if s.script_type != "ModuleScript":
             continue
-        if 'RunService:IsClient()' in s.source:
-            continue  # Already guarded
+        if '-- _CLIENT_GUARD_APPLIED' in s.source:
+            continue
 
-        # Check for module-scope LocalPlayer usage
-        has_local_player_module_scope = False
-        _lp_aliases: set[str] = set()
+        # Find LocalPlayer alias
+        alias_m = re.search(r'local\s+(\w+)\s*=\s*\w+\.LocalPlayer\b', s.source)
+        if not alias_m:
+            continue
+        lp_var = alias_m.group(1)
+
+        original = s.source
+
+        # 1. Make module-scope LocalPlayer access and derived variable chain nil-safe.
+        # The AI often produces a chain like:
+        #   local player = Players.LocalPlayer
+        #   local character = player.Character or player.CharacterAdded:Wait()
+        #   local humanoid = character:FindFirstChildWhichIsA("Humanoid")
+        #   local rootPart = character:WaitForChild("HumanoidRootPart")
+        #   local head = character:FindFirstChild("Head") or rootPart
+        # All of these crash on the server because player is nil.
+        # We nil-safe the entire chain by tracking derived variables.
+        _derived = {lp_var}  # Variables that are nil when LocalPlayer is nil
         lines = s.source.split('\n')
-        in_function = 0
-        lp_line_idx = -1
-
         for i, line in enumerate(lines):
             stripped = line.strip()
-            if stripped.startswith('--'):
+            if not stripped.startswith('local '):
                 continue
-            # Only track function depth — if/for/while at module scope
-            # are still module scope, not inside a function.
+            # Check if RHS references any nil-derived variable
+            m = re.match(r'^(local\s+(\w+)\s*=\s*)(.*)', stripped)
+            if not m:
+                continue
+            decl, varname, rhs = m.group(1), m.group(2), m.group(3)
+            uses_derived = any(
+                re.search(rf'\b{re.escape(d)}\b', rhs) for d in _derived
+            )
+            if uses_derived:
+                _derived.add(varname)
+                # Wrap RHS: `expr` → `(LP_VAR) and (expr) or nil`
+                indent = len(line) - len(line.lstrip())
+                lines[i] = f'{" " * indent}{decl}({lp_var}) and ({rhs}) or nil'
+        s.source = '\n'.join(lines)
+
+        # 2. Make standalone LocalPlayer method calls nil-safe
+        # `player.CharacterAdded:Connect(...)` → `if player then player.CharacterAdded:Connect(...) end`
+        lines = s.source.split('\n')
+        new_lines = []
+        in_function = 0
+        for line in lines:
+            stripped = line.strip()
             if re.search(r'\bfunction\s*[\w.:(]', stripped):
                 in_function += 1
-            if (stripped == 'end' or stripped.startswith('end)') or stripped == 'end,') and in_function > 0:
+            if (stripped == 'end' or stripped.startswith('end)')) and in_function > 0:
                 in_function -= 1
 
-            # Track LocalPlayer aliases: `local player = Players.LocalPlayer`
-            lp_alias_m = re.match(r'local\s+(\w+)\s*=\s*\w+\.LocalPlayer\b', stripped)
-            if lp_alias_m:
-                _lp_aliases.add(lp_alias_m.group(1))
+            # Guard module-scope standalone calls on LocalPlayer alias
+            if (in_function == 0 and
+                not stripped.startswith('--') and
+                not stripped.startswith('local ') and
+                not stripped.startswith('if ') and
+                re.match(rf'{re.escape(lp_var)}\.', stripped)):
+                indent = len(line) - len(line.lstrip())
+                new_lines.append(f'{" " * indent}if {lp_var} then')
+                new_lines.append(line)
+                new_lines.append(f'{" " * indent}end')
+            else:
+                new_lines.append(line)
+        s.source = '\n'.join(new_lines)
 
-            # Check for LocalPlayer (or alias) usage at module scope.
-            # Skip lines that DECLARE the LocalPlayer variable itself,
-            # but catch lines that USE it (even in other declarations).
-            lp_names = ['localPlayer.', 'LocalPlayer.'] + [f'{a}.' for a in _lp_aliases]
-            is_lp_declaration = bool(re.match(r'local\s+\w+\s*=\s*\w+\.LocalPlayer\b', stripped))
-            if in_function == 0 and not is_lp_declaration and any(
-                n in stripped for n in lp_names
-            ):
-                has_local_player_module_scope = True
-                lp_line_idx = i
-                break
+        # 3. Guard client-only API calls at module scope
+        # Camera, UserInputService, RenderStepped connections
+        s.source = re.sub(
+            r'^(camera\.CameraType\s*=)',
+            r'if game:GetService("RunService"):IsClient() then \1',
+            s.source, count=1, flags=re.MULTILINE,
+        )
+        # Find the last client-only connection and close the guard
+        # Look for RenderStepped or InputBegan connections
+        if 'camera.CameraType =' in original:
+            # Find the last event connection block and add `end` after it
+            last_connect = -1
+            connect_lines = s.source.split('\n')
+            for i, line in enumerate(connect_lines):
+                if ':Connect(function' in line and in_function == 0:
+                    # Find matching end)
+                    for j in range(i + 1, len(connect_lines)):
+                        if connect_lines[j].strip() in ('end)', 'end)'):
+                            last_connect = j
+                            break
+            if last_connect > 0:
+                connect_lines.insert(last_connect + 1, 'end -- IsClient guard')
+                s.source = '\n'.join(connect_lines)
 
-        if not has_local_player_module_scope or lp_line_idx < 0:
-            continue
-
-        # Find the return statement at the end
-        return_m = re.search(r'^return\s+\w+\s*$', s.source, re.MULTILINE)
-        if not return_m:
-            continue
-
-        # Wrap the client-only block in IsClient() guard
-        # Insert `if RunService:IsClient() then` before the LocalPlayer usage
-        # and `end` before the return
-        indent = '  '  # Minimal indent for the guard
-        lines.insert(lp_line_idx, f'\nif game:GetService("RunService"):IsClient() then')
-        # Find return line (shifted by 1 due to insertion)
-        for j in range(len(lines) - 1, -1, -1):
-            if lines[j].strip().startswith('return '):
-                lines.insert(j, 'end\n')
-                break
-        s.source = '\n'.join(lines)
-        fixes += 1
-        log.info("  Added IsClient() guard for client-only code in '%s'", s.name)
+        if s.source != original:
+            # Mark as processed to avoid re-processing
+            s.source = s.source.replace(
+                alias_m.group(0),
+                alias_m.group(0) + '  -- _CLIENT_GUARD_APPLIED',
+            )
+            fixes += 1
+            log.info("  Made LocalPlayer access nil-safe in '%s'", s.name)
 
     return fixes
 
@@ -725,5 +772,75 @@ def _fix_prefab_lookups(scripts: list[RbxScript]) -> int:
         if s.source != original:
             fixes += 1
             log.info("  Fixed prefab lookup in '%s' (RS → workspace)", s.name)
+
+    return fixes
+
+
+def _wire_attribute_listeners(scripts: list[RbxScript]) -> int:
+    """Wire SetAttribute calls to matching local functions via GetAttributeChangedSignal.
+
+    When one script does `target:SetAttribute("GetItem", itemName)` and another
+    script has a local function `GetItem`, add a listener on the character that
+    calls the function when the attribute changes. This bridges the inter-script
+    communication gap from Unity's SendMessage pattern.
+    """
+    fixes = 0
+    # Find all SetAttribute calls across all scripts
+    attr_names: set[str] = set()
+    for s in scripts:
+        for m in re.finditer(r':SetAttribute\(["\'](\w+)["\']', s.source):
+            attr_names.add(m.group(1))
+
+    # Only wire GetItem — other attribute-based calls (TakeDamage, UpdateSpawnpoint)
+    # are already handled by existing listeners in the AI-transpiled scripts.
+    attr_names = {n for n in attr_names if n == 'GetItem'}
+
+    # For scripts that have matching local functions, add listeners
+    for s in scripts:
+        added_any = False
+        for attr_name in attr_names:
+            # Check if this script has a local function or variable with that name
+            has_func = bool(re.search(
+                rf'^{attr_name}\s*=\s*function\b|^local\s+function\s+{attr_name}\b',
+                s.source, re.MULTILINE,
+            ))
+            if not has_func:
+                continue
+            # Check if listener already exists
+            if f'GetAttributeChangedSignal("{attr_name}")' in s.source:
+                continue
+            # Check if there's a character variable to listen on
+            char_var = None
+            for candidate in ['character', 'char', 'playerCharacter']:
+                if re.search(rf'\blocal\s+{candidate}\b', s.source):
+                    char_var = candidate
+                    break
+            if not char_var:
+                continue
+
+            # Add the listener before the return statement
+            listener = (
+                f'\n-- Auto-wired attribute listener for {attr_name}\n'
+                f'if {char_var} and game:GetService("RunService"):IsClient() then\n'
+                f'    task.defer(function()\n'
+                f'        {char_var}:GetAttributeChangedSignal("{attr_name}"):Connect(function()\n'
+                f'            local val = {char_var}:GetAttribute("{attr_name}")\n'
+                f'            if val ~= nil then\n'
+                f'                {char_var}:SetAttribute("{attr_name}", nil)\n'
+                f'                {attr_name}(val)\n'
+                f'            end\n'
+                f'        end)\n'
+                f'    end)\n'
+                f'end\n'
+            )
+            # Insert before the last return
+            return_m = re.search(r'^return\s+\w+\s*$', s.source, re.MULTILINE)
+            if return_m:
+                s.source = s.source[:return_m.start()] + listener + s.source[return_m.start():]
+                added_any = True
+                log.info("  Wired attribute listener '%s' in '%s'", attr_name, s.name)
+
+        if added_any:
+            fixes += 1
 
     return fixes
