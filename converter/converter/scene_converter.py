@@ -1177,8 +1177,12 @@ def _convert_node(
     if node.mesh_guid and guid_index:
         asset_path = guid_index.resolve(node.mesh_guid)
         if asset_path and asset_path.suffix.lower() in ('.fbx', '.obj'):
-            from core.coordinate_system import strip_fbx_prerotation
-            quat = strip_fbx_prerotation(*quat)
+            # Only strip FBX prerotation for Z-up FBX files. Y-up FBX files
+            # don't have a prerotation, so stripping would incorrectly modify
+            # the designer-set rotation (e.g. airplane rotated on its side).
+            from core.coordinate_system import strip_fbx_prerotation, is_fbx_y_up
+            if not is_fbx_y_up(asset_path):
+                quat = strip_fbx_prerotation(*quat)
     rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*quat)
     rot = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
 

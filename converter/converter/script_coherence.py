@@ -259,7 +259,12 @@ def fix_require_classifications(scripts: list[RbxScript]) -> int:
     # RunService:IsClient() so the server-side require() doesn't crash.
     fixes += _guard_client_code_in_modules(scripts)
 
-    # Pass 10: Add workspace lookup for ModuleScripts that do FindFirstChild
+    # Pass 10: Fix prefab lookups that search ReplicatedStorage instead of workspace.
+    # The AI often generates `ReplicatedStorage:FindFirstChild("PrefabName")` for
+    # game objects that are actually children of Parts in workspace.
+    fixes += _fix_prefab_lookups(scripts)
+
+    # Pass 11: Add workspace lookup for ModuleScripts that do FindFirstChild
     # on script.Parent at module scope (e.g. HostilePlane looking for "Origin").
     fixes += _add_workspace_fallback(scripts)
 
@@ -575,6 +580,7 @@ def _guard_client_code_in_modules(scripts: list[RbxScript]) -> int:
 
         # Check for module-scope LocalPlayer usage
         has_local_player_module_scope = False
+        _lp_aliases: set[str] = set()
         lines = s.source.split('\n')
         in_function = 0
         lp_line_idx = -1
@@ -590,8 +596,18 @@ def _guard_client_code_in_modules(scripts: list[RbxScript]) -> int:
             if (stripped == 'end' or stripped.startswith('end)') or stripped == 'end,') and in_function > 0:
                 in_function -= 1
 
-            if in_function == 0 and not stripped.startswith('local ') and (
-                'localPlayer.' in stripped or 'LocalPlayer.' in stripped
+            # Track LocalPlayer aliases: `local player = Players.LocalPlayer`
+            lp_alias_m = re.match(r'local\s+(\w+)\s*=\s*\w+\.LocalPlayer\b', stripped)
+            if lp_alias_m:
+                _lp_aliases.add(lp_alias_m.group(1))
+
+            # Check for LocalPlayer (or alias) usage at module scope.
+            # Skip lines that DECLARE the LocalPlayer variable itself,
+            # but catch lines that USE it (even in other declarations).
+            lp_names = ['localPlayer.', 'LocalPlayer.'] + [f'{a}.' for a in _lp_aliases]
+            is_lp_declaration = bool(re.match(r'local\s+\w+\s*=\s*\w+\.LocalPlayer\b', stripped))
+            if in_function == 0 and not is_lp_declaration and any(
+                n in stripped for n in lp_names
             ):
                 has_local_player_module_scope = True
                 lp_line_idx = i
@@ -666,5 +682,48 @@ def _add_workspace_fallback(scripts: list[RbxScript]) -> int:
         )
         fixes += 1
         log.info("  Added workspace fallback for '%s' in '%s'", model_alias, s.name)
+
+    return fixes
+
+
+def _fix_prefab_lookups(scripts: list[RbxScript]) -> int:
+    """Fix prefab/asset lookups that incorrectly search ReplicatedStorage.
+
+    The AI transpiler often generates `ReplicatedStorage:FindFirstChild("PrefabName")`
+    for game objects that are actually children of Parts in workspace. This redirects
+    those lookups to search workspace instead, with case-insensitive matching.
+    """
+    fixes = 0
+    # Collect all script names to avoid redirecting module requires
+    module_names = {s.name for s in scripts if s.script_type == "ModuleScript"}
+
+    for s in scripts:
+        original = s.source
+        # Find patterns like:
+        #   local X = ReplicatedStorage:FindFirstChild("Name")
+        #   local X = game:GetService("ReplicatedStorage"):FindFirstChild("Name")
+        # where "Name" is NOT a known ModuleScript (those belong in RS)
+        def _fix_rs_lookup(m):
+            indent = m.group(1)
+            varname = m.group(2)
+            obj_name = m.group(3)
+            # Don't redirect if this is a known module
+            if obj_name in module_names:
+                return m.group(0)
+            # Redirect to workspace search (case-insensitive, recursive)
+            return (f'{indent}local {varname} = workspace:FindFirstChild("{obj_name}", true)'
+                    f' or workspace:FindFirstChild("{obj_name.lower()}", true)'
+                    f' or workspace:FindFirstChild("{obj_name[0].lower() + obj_name[1:]}", true)')
+
+        s.source = re.sub(
+            r'^(\s*)local\s+(\w+)\s*=\s*(?:ReplicatedStorage|game:GetService\(["\']ReplicatedStorage["\']\))'
+            r':FindFirstChild\(["\'](\w+)["\']\)',
+            _fix_rs_lookup,
+            s.source,
+            flags=re.MULTILINE,
+        )
+        if s.source != original:
+            fixes += 1
+            log.info("  Fixed prefab lookup in '%s' (RS → workspace)", s.name)
 
     return fixes
