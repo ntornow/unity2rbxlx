@@ -30,17 +30,16 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install \
-            pyyaml click Pillow trimesh scikit-image requests anthropic \
-            numpy pytest pytest-cov
+          pip install -e ".[dev]"
 
       - name: Run fast test suite
         run: pytest tests/ -m "not slow" -v
 
-  slow:
-    name: slow test suite + eval regression (nightly)
+  slow-unit-tests:
+    name: slow unit + integration tests (nightly)
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: fast
     timeout-minutes: 30
     defaults:
       run:
@@ -59,14 +58,156 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install \
-            pyyaml click Pillow trimesh scikit-image requests anthropic \
-            numpy pytest pytest-cov
+          pip install -e ".[dev]"
 
-      - name: Run full test suite
-        run: pytest tests/ -v
+      - name: Run full test suite (unit + integration, incl. @slow)
+        run: pytest tests/ -v --junitxml=pytest-junit.xml
 
-      - name: Run eval and check for regressions
+      - name: Upload pytest results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-junit
+          path: converter/pytest-junit.xml
+          retention-days: 14
+
+  convert-matrix:
+    name: convert ${{ matrix.project }}
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: fast
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        project:
+          - SimpleFPS
+          - 3D-Platformer
+          - BoatAttack
+          - BossRoom
+          - ChopChop
+          - PrefabWorkflows
+          - RedRunner
+          - SanAndreasUnity
+          - Gamekit3D
+    defaults:
+      run:
+        working-directory: converter
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: true
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
         run: |
-          python3 u2r.py eval -o ./eval_current --baseline ./eval_current.json
-          python3 u2r.py eval-diff eval_baseline.json eval_current.json --fail-on-regression
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Convert ${{ matrix.project }}
+        id: convert
+        run: |
+          python u2r.py convert "../test_projects/${{ matrix.project }}" \
+            -o "./output/${{ matrix.project }}" \
+            --scene all \
+            --no-upload \
+            --no-ai \
+            --no-resolve
+
+      - name: Validate generated rbxlx
+        if: steps.convert.outcome == 'success'
+        run: |
+          rbxlx="./output/${{ matrix.project }}/converted_place.rbxlx"
+          if [ ! -f "$rbxlx" ]; then
+            echo "::error::No rbxlx produced at $rbxlx"
+            exit 1
+          fi
+          python u2r.py validate "$rbxlx"
+
+      - name: Upload conversion artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: convert-${{ matrix.project }}
+          path: |
+            converter/output/${{ matrix.project }}/converted_place.rbxlx
+            converter/output/${{ matrix.project }}/conversion_report.json
+            converter/output/${{ matrix.project }}/conversion_context.json
+            converter/output/${{ matrix.project }}/scripts/
+          if-no-files-found: warn
+          retention-days: 14
+
+  eval-regression:
+    name: eval regression vs baseline (nightly)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: fast
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: converter
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: true
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run eval across all test projects
+        run: |
+          python u2r.py eval \
+            --output ./eval_output \
+            --baseline ./eval_output/eval_current.json
+
+      - name: Diff against committed baseline
+        run: |
+          python u2r.py eval-diff \
+            ./eval_baseline.json \
+            ./eval_output/eval_current.json \
+            --fail-on-regression
+
+      - name: Upload eval outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-output
+          path: |
+            converter/eval_output/eval_current.json
+            converter/eval_output/**/conversion_report.json
+            converter/eval_output/**/converted_place.rbxlx
+          if-no-files-found: warn
+          retention-days: 14
+
+  nightly-summary:
+    name: nightly summary
+    runs-on: ubuntu-latest
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    needs: [slow-unit-tests, convert-matrix, eval-regression]
+    steps:
+      - name: Check nightly job results
+        run: |
+          echo "slow-unit-tests: ${{ needs.slow-unit-tests.result }}"
+          echo "convert-matrix:  ${{ needs.convert-matrix.result }}"
+          echo "eval-regression: ${{ needs.eval-regression.result }}"
+          if [ "${{ needs.slow-unit-tests.result }}" != "success" ] \
+             || [ "${{ needs.convert-matrix.result }}" != "success" ] \
+             || [ "${{ needs.eval-regression.result }}" != "success" ]; then
+            echo "::error::Nightly build had failures"
+            exit 1
+          fi
