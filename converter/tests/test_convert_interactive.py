@@ -84,8 +84,8 @@ class TestCtxSummary:
         )
         summary = _ctx_summary(ctx)
 
-        # Basename reduction on scene paths.
-        assert summary["selected_scene"] == "level.unity"
+        # Project-relative scene paths for disambiguation.
+        assert summary["selected_scene"] == "Assets/Scenes/Main/level.unity"
         assert summary["scene_count"] == 2
         assert summary["total_game_objects"] == 42
         assert summary["converted_parts"] == 30

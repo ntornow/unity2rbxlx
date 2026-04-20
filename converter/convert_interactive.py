@@ -172,7 +172,8 @@ def _make_pipeline(
         skip_upload=skip_upload,
     )
     if ctx_path.exists():
-        pipeline.ctx = ConversionContext.load(ctx_path)
+        prior_ctx = ConversionContext.load(ctx_path)
+        pipeline.ctx = prior_ctx
     return pipeline
 
 
@@ -226,10 +227,13 @@ def _relative_scene_path(scene_path: str, unity_project_path: str) -> str:
     """Return scene path relative to the Unity project root for disambiguation."""
     if not scene_path:
         return ""
+    p = Path(scene_path)
+    if not p.is_absolute():
+        return str(p)
     try:
-        return str(Path(scene_path).relative_to(unity_project_path))
+        return str(p.relative_to(unity_project_path))
     except ValueError:
-        return Path(scene_path).name
+        return p.name
 
 
 def _ctx_summary(ctx: ConversionContext) -> dict:
@@ -654,18 +658,17 @@ def validate(output_dir: str, write: bool) -> None:
               help="Skip asset upload (placeholder URLs in the .rbxlx).")
 @click.option("--no-resolve", is_flag=True,
               help="Skip headless mesh resolution.")
-@click.option("--api-key", type=str, default=None,
-              help="Roblox Open Cloud API key (string or path to file).")
-@click.option("--creator-id", type=str, default=None,
-              help="Roblox Creator ID (number or path to file).")
 @click.option("--retranspile", is_flag=True,
               help="Force re-transpilation even if scripts were already transpiled. "
               "Without this flag, hand-edited Luau scripts in output_dir/scripts/ "
               "are preserved.")
+@click.option("--api-key", type=str, default=None,
+              help="Roblox Open Cloud API key (string or path to file).")
+@click.option("--creator-id", type=str, default=None,
+              help="Roblox Creator ID (number or path to file).")
 def assemble(unity_project_path: str, output_dir: str,
-             no_upload: bool, no_resolve: bool,
-             api_key: str | None, creator_id: str | None,
-             retranspile: bool) -> None:
+             no_upload: bool, no_resolve: bool, retranspile: bool,
+             api_key: str | None, creator_id: str | None) -> None:
     """Phase 4: upload assets, resolve, convert animations + scene, write .rbxlx."""
     if api_key:
         ak = Path(api_key)
@@ -686,9 +689,6 @@ def assemble(unity_project_path: str, output_dir: str,
         not retranspile
         and "transpile_scripts" in pipeline.ctx.completed_phases
     )
-
-    # Run every prerequisite + the assembly phases in order, but stop at
-    # write_output (don't trigger headless publish — that's the upload step).
     try:
         for phase in [
             "parse", "extract_assets", "upload_assets", "resolve_assets",
@@ -823,12 +823,19 @@ def upload(output_dir: str, api_key: str | None,
     pipeline.ctx.universe_id = uid
     pipeline.ctx.place_id = pid
 
+    # If transpile_scripts was already completed in a prior run, skip it
+    # so user's hand-edited Luau files in output_dir/scripts/ are preserved
+    # (the write_output phase rehydrates them from disk automatically).
+    phases = [
+        "parse", "extract_assets", "convert_materials",
+        "transpile_scripts", "convert_animations", "convert_scene",
+        "write_output",
+    ]
+    if "transpile_scripts" in pipeline.ctx.completed_phases:
+        phases = [p for p in phases if p != "transpile_scripts"]
+
     try:
-        for phase in [
-            "parse", "extract_assets", "convert_materials",
-            "transpile_scripts", "convert_animations", "convert_scene",
-            "write_output",
-        ]:
+        for phase in phases:
             pipeline._run_phase(phase)
     except Exception as exc:
         _emit({"phase": "upload", "success": False,
@@ -906,6 +913,11 @@ def upload(output_dir: str, api_key: str | None,
         "script_size_kb": round(total_size / 1024, 1),
         "script_path": str(script_file),
         "chunk_results": chunk_results,
+        "warning": (
+            "Publishing a fresh rebuild of the scene, not the local .rbxlx. "
+            "Any manual edits to converted_place.rbxlx or place_builder.luau "
+            "are not reflected in the uploaded place."
+        ),
     })
 
 
@@ -938,7 +950,7 @@ def report(output_dir: str) -> None:
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "unity_project_path": ctx.unity_project_path,
         "output_dir": str(out),
-        "selected_scene": Path(ctx.selected_scene).name if ctx.selected_scene else "",
+        "selected_scene": _relative_scene_path(ctx.selected_scene, ctx.unity_project_path),
         "rbxlx_path": str(rbxlx_path) if rbxlx_path.exists() else None,
         "rbxlx_size_mb": rbxlx_size_mb,
         "stats": _ctx_summary(ctx),

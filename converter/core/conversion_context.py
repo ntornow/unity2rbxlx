@@ -66,6 +66,12 @@ class ConversionContext:
     # Comparison results
     comparison_scores: dict[str, Any] = field(default_factory=dict)
 
+    # Storage plan (Phase 4a.5): explicit per-script container assignments.
+    # Produced by converter.storage_classifier.classify_storage and written to
+    # conversion_plan.json. rbxlx_writer reads each script's parent_path when
+    # emitting; falls back to script_type heuristics when absent.
+    storage_plan: dict[str, Any] = field(default_factory=dict)
+
     def mark_phase_complete(self, phase: str) -> None:
         if phase not in self.completed_phases:
             self.completed_phases.append(phase)

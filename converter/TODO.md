@@ -225,3 +225,37 @@ Priority: `P0` = blocks gameplay, `P1` = correctness / maintainability, `P2` = n
 
 - [ ] **Mesh Z-axis mirroring**: Unity left-handed → Roblox right-handed coordinate conversion negates Z positions but doesn't mirror mesh geometry. All asymmetric features (text, door handles) render backwards. Fix options: (a) pre-rotate each mesh 180° around Y before upload, (b) apply negative Z scale on the CFrame (may not work for MeshParts), (c) re-export FBXes with mirrored geometry.
 - [ ] **Wire/grid mesh opacity**: Chain-link fences and similar thin-geometry meshes render as opaque in Roblox because the mesh renderer fills sub-pixel gaps between wires. Unity renders these gaps correctly. The texture alpha (87.7% transparent for chainlink.psd) could compensate via AlphaMode=Transparency, but Unity's material has _Mode=0 (Opaque), so we'd be changing the intended rendering mode. Documenting as a platform rendering difference.
+
+## Open Gaps (2026-04-14 session — inline-over-runtime-wrappers)
+
+Deferred follow-ups from removing the seven rejected runtime bridges. See
+`docs/design/inline-over-runtime-wrappers.md` for the governing policy and
+the full list of what was removed.
+
+- [x] **P1 — Consolidate animator runtime modules.** Fixed 2026-04-17:
+  merged unique features from `animator_bridge.luau` (blend trees, getter
+  methods, `Play()`, Any-state transitions, lazy track loading, `Destroy()`)
+  into `animator_runtime.luau`. Deleted `animator_bridge.luau` (redundant
+  state machine) and `TransformAnimator.luau` (redundant with
+  `animation_converter.py` TweenService output). Regression guard in
+  `test_no_rejected_bridges.py` extended to cover both deleted files +
+  assert consolidated features remain.
+- [ ] **P1 — Rewrite phase-3 commit `10c786c` on `origin/merge-phase3` to
+  drop bridge injection.** The phase-3 wiring commit imports `bridge_injector`
+  and installs a `detect_needed_bridges`/`inject_bridges` try-except block at
+  `converter/converter/pipeline.py` lines 1843–1859. After the deletions in
+  this branch, that block references a module that no longer exists and the
+  two bridge-related test files (`test_bridge_injector.py`,
+  `test_runtime_bridges.py`) are now dead additions. Action: either drop
+  `10c786c` entirely or rewrite it to preserve the other six pieces
+  (`rbxl_binary_writer` wiring, `report_generator`, `scriptable_object_converter`,
+  `sprite_extractor`, `cloud_api` content-type auto-detection, CI `lz4`
+  dependency) while removing the bridge-injection hunk + the two bridge
+  test files. Belongs as its own branch operation on `merge-phase3`, not on
+  phase 2.
+- [x] **P2 — `Input.GetSwipe` has no test-project coverage yet.** Accepted
+  2026-04-17 as speculative infrastructure. The mapping + utility function +
+  regression guard (`test_no_rejected_bridges.py` asserts
+  `API_CALL_MAP["Input.GetSwipe"] == "getSwipe"` and
+  `"getSwipe" in UTILITY_FUNCTIONS`) all exist. Real end-to-end coverage
+  will come when a mobile Unity game enters the eval set.

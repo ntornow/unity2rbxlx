@@ -1474,6 +1474,7 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, Any]:
     starter_char_scripts_item, _ = _make_item(starter_player, "StarterCharacterScripts", "StarterCharacterScripts")
     starter_gui = _make_service(root, "StarterGui")
     replicated_storage = _make_service(root, "ReplicatedStorage")
+    replicated_first = _make_service(root, "ReplicatedFirst")
     server_storage = _make_service(root, "ServerStorage")
 
     # ---- Workspace parts -------------------------------------------------
@@ -1543,17 +1544,39 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, Any]:
         stats["scripts_written"] += 1
 
     # ---- Scripts ---------------------------------------------------------
+    # Routing priority:
+    #   1. script.parent_path (from Phase 4a.5 storage classification) — explicit
+    #      per-script container assignment produced by converter.storage_classifier.
+    #   2. script.script_type — fallback heuristic for scripts without a plan.
+    #
+    # parent_path values the classifier emits:
+    #   ServerScriptService, ServerStorage, ReplicatedStorage, ReplicatedFirst,
+    #   StarterPlayer.StarterPlayerScripts, StarterPlayer.StarterCharacterScripts,
+    #   StarterGui
     scripts: list[RbxScript] = getattr(place, "scripts", None) or []
+    _container_by_path: dict[str, Any] = {
+        "ServerScriptService": server_script_service,
+        "ServerStorage": server_storage,
+        "ReplicatedStorage": replicated_storage,
+        "ReplicatedFirst": replicated_first,
+        "StarterPlayer.StarterPlayerScripts": starter_player_scripts_item,
+        "StarterPlayer.StarterCharacterScripts": starter_char_scripts_item,
+        "StarterGui": starter_gui,
+    }
     for script in scripts:
         stype = getattr(script, "script_type", "Script")
-        if stype == "Script":
-            _make_script(server_script_service, script)
-        elif stype == "LocalScript":
-            _make_script(starter_player_scripts_item, script)
-        elif stype == "ModuleScript":
-            _make_script(replicated_storage, script)
-        else:
-            _make_script(server_script_service, script)
+        parent_path = getattr(script, "parent_path", None)
+        target = _container_by_path.get(parent_path) if parent_path else None
+        if target is None:
+            # Fallback: script_type-based heuristic (legacy path for scripts
+            # without a storage plan, e.g. hand-edited rehydration).
+            if stype == "LocalScript":
+                target = starter_player_scripts_item
+            elif stype == "ModuleScript":
+                target = replicated_storage
+            else:
+                target = server_script_service
+        _make_script(target, script)
         stats["scripts_written"] += 1
 
     # ---- Auto-create RemoteEvents referenced by scripts --------------------
