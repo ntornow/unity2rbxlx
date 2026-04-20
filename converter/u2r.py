@@ -381,7 +381,7 @@ def validate(rbxlx_file: str) -> None:
     valid_classes = {
         # Services
         "Workspace", "Terrain", "Lighting", "ServerScriptService",
-        "ReplicatedStorage", "ServerStorage",
+        "ReplicatedStorage", "ReplicatedFirst", "ServerStorage",
         "StarterGui", "StarterPlayer", "StarterPlayerScripts", "StarterCharacterScripts",
         # Core instances
         "Part", "MeshPart", "Model", "SpawnLocation", "Camera",
