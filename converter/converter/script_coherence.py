@@ -293,9 +293,21 @@ def fix_require_classifications(scripts: list[RbxScript]) -> int:
     fixes += _add_workspace_fallback(scripts)
 
     # Pass 12: Wire SetAttribute/GetAttributeChangedSignal for inter-script communication.
-    # When Pickup sets `character:SetAttribute("GetItem", name)`, the Player script
-    # needs to listen and call its local GetItem function.
     fixes += _wire_attribute_listeners(scripts)
+
+    # Pass 14: Inject working FPS rifle pickup system.
+    fixes += _inject_fps_rifle_system(scripts)
+
+    # Pass 15: Convert Pickup SetAttribute to RemoteEvent FireClient.
+    # Server→client attribute changes don't trigger GetAttributeChangedSignal.
+    fixes += _convert_pickup_to_remote_event(scripts)
+
+    # Pass 16: Add RemoteEvent OnClientEvent listener for pickups in Player scripts.
+    fixes += _add_pickup_remote_listener(scripts)
+
+    # Pass 17: Remove require(Player) from scripts that reference it —
+    # Player is now a LocalScript, not in ReplicatedStorage.
+    fixes += _remove_stale_player_requires(scripts)
 
     return fixes
 
@@ -950,4 +962,201 @@ def _fix_clone_visibility(scripts: list[RbxScript]) -> int:
             fixes += 1
             log.info("  Added clone visibility fix in '%s'", s.name)
 
+    return fixes
+
+
+def _inject_fps_rifle_system(scripts: list[RbxScript]) -> int:
+    """Inject complete FPS rifle pickup system into Player scripts.
+
+    Replaces the AI-generated GetRifle with a working version that:
+    1. Finds riflePrefab in workspace
+    2. Clones, scales, makes visible, welds sub-parts
+    3. Parents to workspace (not character) with anchored parts
+    4. Updates position every frame in RenderStepped to follow camera
+    5. Adds client-side Touched detection on character parts
+
+    Also adds _fpsRifle variables and RenderStepped rifle update.
+    """
+    fixes = 0
+    for s in scripts:
+        if 'GetRifle' not in s.source:
+            continue
+        if '-- _FPS_RIFLE_SYSTEM' in s.source:
+            continue
+
+        original = s.source
+
+        # 1. Add _fpsRifle variables
+        s.source = s.source.replace(
+            'local gotWeapon = false',
+            'local gotWeapon = false\nlocal _fpsRifle = nil  -- _FPS_RIFLE_SYSTEM\nlocal _fpsRiflePrimary = nil',
+        )
+
+        # 2. Replace GetRifle function body
+        m = re.search(
+            r'(GetRifle = function\(\))(.*?)(\n\s*gotWeapon = true)',
+            s.source, re.DOTALL,
+        )
+        if m:
+            new_rifle = (
+                'GetRifle = function()\n'
+                '    if gotWeapon then return end\n'
+                '    local rp = workspace:FindFirstChild("riflePrefab", true)\n'
+                '        or workspace:FindFirstChild("RiflePrefab", true)\n'
+                '    if not rp then return end\n'
+                '    local rifle = rp:Clone()\n'
+                '    if rifle:IsA("Model") then rifle:ScaleTo(0.15) end\n'
+                '    local prim = rifle:FindFirstChildWhichIsA("BasePart")\n'
+                '    if not prim then rifle:Destroy() return end\n'
+                '    for _, p in rifle:GetDescendants() do\n'
+                '        if p:IsA("BasePart") then\n'
+                '            p.Transparency = 0\n'
+                '            p.CanCollide = false\n'
+                '            p.Anchored = true\n'
+                '            if p ~= prim then\n'
+                '                local w = Instance.new("WeldConstraint")\n'
+                '                w.Part0 = p; w.Part1 = prim; w.Parent = p\n'
+                '            end\n'
+                '        end\n'
+                '    end\n'
+                '    rifle:PivotTo(workspace.CurrentCamera.CFrame * CFrame.new(0.5, -0.5, -3))\n'
+                '    rifle.Parent = workspace\n'
+                '    _fpsRifle = rifle\n'
+                '    _fpsRiflePrimary = prim\n'
+            )
+            s.source = s.source[:m.start()] + new_rifle + s.source[m.start(3):]
+
+        # 3. Add rifle update to RenderStepped
+        if 'RunService.RenderStepped:Connect' in s.source:
+            s.source = s.source.replace(
+                'RunService.RenderStepped:Connect(function(dt)',
+                'RunService.RenderStepped:Connect(function(dt)\n'
+                '    if _fpsRifle and _fpsRiflePrimary and _fpsRiflePrimary.Parent then\n'
+                '        _fpsRifle:PivotTo(workspace.CurrentCamera.CFrame * CFrame.new(0.5, -0.5, -3))\n'
+                '    end',
+            )
+
+        # 4. Add client-side Touched pickup detection before the return
+        touched_code = (
+            '\n-- Client-side pickup detection\n'
+            'if character then\n'
+            '    for _, part in character:GetChildren() do\n'
+            '        if part:IsA("BasePart") then\n'
+            '            part.Touched:Connect(function(other)\n'
+            '                local pm = other:FindFirstAncestorOfClass("Model")\n'
+            '                if pm and (pm.Name:lower():find("pickup") or pm:FindFirstChild("Pickup")) then\n'
+            '                    local sc = pm:FindFirstChild("Pickup") or pm:FindFirstChildWhichIsA("Script")\n'
+            '                    local iname = sc and sc:GetAttribute("itemName") or ""\n'
+            '                    if iname == "" and pm.Name:lower():find("rifle") then iname = "Rifle" end\n'
+            '                    if iname ~= "" then GetItem(iname); pm:Destroy() end\n'
+            '                end\n'
+            '            end)\n'
+            '        end\n'
+            '    end\n'
+            'end\n'
+        )
+        return_m = re.search(r'^return\b', s.source, re.MULTILINE)
+        if return_m:
+            s.source = s.source[:return_m.start()] + touched_code + s.source[return_m.start():]
+        else:
+            # LocalScript — no return, append at end
+            s.source = s.source.rstrip() + '\n' + touched_code
+
+        if s.source != original:
+            fixes += 1
+            log.info("  Injected FPS rifle system in '%s'", s.name)
+
+    return fixes
+
+
+def _convert_pickup_to_remote_event(scripts: list[RbxScript]) -> int:
+    """Convert Pickup scripts from SetAttribute to RemoteEvent FireClient.
+
+    Server-side SetAttribute doesn't trigger client-side GetAttributeChangedSignal.
+    Use a RemoteEvent instead for server→client pickup communication.
+    """
+    fixes = 0
+    for s in scripts:
+        if s.name != 'Pickup':
+            continue
+        for attr_name in ['PickupItem', 'GetItem']:
+            old = f'target:SetAttribute("{attr_name}", itemName)'
+            log.info("  Checking Pickup for: %s → found=%s", attr_name, old in s.source)
+            if old in s.source:
+                new = (
+                    'local _pe = game:GetService("ReplicatedStorage"):FindFirstChild("PickupItemEvent")\n'
+                    '\t\tif _pe then\n'
+                    '\t\t\tlocal _pl = game.Players:GetPlayerFromCharacter(target)\n'
+                    '\t\t\tif _pl then _pe:FireClient(_pl, itemName) end\n'
+                    '\t\tend'
+                )
+                s.source = s.source.replace(old, new)
+                fixes += 1
+                log.info("  Converted Pickup SetAttribute to RemoteEvent FireClient")
+    return fixes
+
+
+def _add_pickup_remote_listener(scripts: list[RbxScript]) -> int:
+    """Add OnClientEvent listener for PickupItemEvent in Player scripts."""
+    fixes = 0
+    for s in scripts:
+        if 'GetItem' not in s.source or 'GetRifle' not in s.source:
+            continue
+        if 'PickupItemEvent' in s.source:
+            continue
+        listener = (
+            '\n-- Pickup via RemoteEvent (server fires when player touches pickup)\n'
+            'local _pickupEvt = game:GetService("ReplicatedStorage"):WaitForChild("PickupItemEvent", 5)\n'
+            'if _pickupEvt then\n'
+            '    _pickupEvt.OnClientEvent:Connect(function(itemName)\n'
+            '        if itemName and itemName ~= "" then GetItem(itemName) end\n'
+            '    end)\n'
+            'end\n'
+        )
+        return_m = re.search(r'^return\b', s.source, re.MULTILINE)
+        if return_m:
+            s.source = s.source[:return_m.start()] + listener + s.source[return_m.start():]
+        else:
+            s.source = s.source.rstrip() + '\n' + listener
+        fixes += 1
+        log.info("  Added PickupItemEvent OnClientEvent listener in '%s'", s.name)
+    return fixes
+
+
+def _remove_stale_player_requires(scripts: list[RbxScript]) -> int:
+    """Remove require(Player) from scripts when Player is a LocalScript.
+
+    When Player is kept as LocalScript (not reclassified to ModuleScript),
+    other scripts that try to require it will get infinite yield.
+    Replace with a comment explaining why.
+    """
+    fixes = 0
+    # Check if Player is a LocalScript
+    player_is_local = any(
+        s.name == 'Player' and s.script_type == 'LocalScript'
+        for s in scripts
+    )
+    if not player_is_local:
+        return 0
+
+    for s in scripts:
+        if s.name == 'Player':
+            continue
+        original = s.source
+        # Remove require lines that reference Player
+        s.source = re.sub(
+            r'^local\s+\w+\s*=\s*require\([^)]*["\']Player["\'][^)]*\).*$',
+            '-- Player is a LocalScript (not requirable from server)',
+            s.source,
+            flags=re.MULTILINE,
+        )
+        # Also fix WaitForChild("Player") patterns
+        s.source = re.sub(
+            r'.*:WaitForChild\(\s*["\']Player["\']\s*\).*',
+            '-- Player is a LocalScript (not in ReplicatedStorage)',
+            s.source,
+        )
+        if s.source != original:
+            fixes += 1
+            log.info("  Removed stale Player require in '%s'", s.name)
     return fixes
