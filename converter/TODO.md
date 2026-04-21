@@ -232,20 +232,14 @@ Deferred follow-ups from removing the seven rejected runtime bridges. See
 `docs/design/inline-over-runtime-wrappers.md` for the governing policy and
 the full list of what was removed.
 
-- [ ] **P1 — Consolidate animator runtime modules.** Two runtime modules
-  overlap: `converter/runtime/animator_runtime.luau` (currently the accepted
-  one, auto-injected by the pipeline) and `converter/runtime/animator_bridge.luau`
-  (379 lines, the rejected one — still present because it implements a
-  state-machine surface with parameters/triggers/blend trees that
-  `animator_runtime.luau` may not cover). Similarly for
-  `converter/runtime/TransformAnimator.luau` (205 lines, keyframe-curve-based
-  CFrame/Size animation) vs. whatever `animation_converter.py` emits via
-  TweenService. Action: diff each pair; merge unique logic into the accepted
-  module; delete the rejected one; extend the regression guard in
-  `tests/test_no_rejected_bridges.py` to cover it. Unlike the other seven
-  bridges, these implement genuinely stateful per-entity runtime behavior
-  and cannot be flattened into a single-call inline translation — the
-  question is which *module* owns them, not whether a module is needed.
+- [x] **P1 — Consolidate animator runtime modules.** Fixed 2026-04-17:
+  merged unique features from `animator_bridge.luau` (blend trees, getter
+  methods, `Play()`, Any-state transitions, lazy track loading, `Destroy()`)
+  into `animator_runtime.luau`. Deleted `animator_bridge.luau` (redundant
+  state machine) and `TransformAnimator.luau` (redundant with
+  `animation_converter.py` TweenService output). Regression guard in
+  `test_no_rejected_bridges.py` extended to cover both deleted files +
+  assert consolidated features remain.
 - [ ] **P1 — Rewrite phase-3 commit `10c786c` on `origin/merge-phase3` to
   drop bridge injection.** The phase-3 wiring commit imports `bridge_injector`
   and installs a `detect_needed_bridges`/`inject_bridges` try-except block at
@@ -259,10 +253,9 @@ the full list of what was removed.
   dependency) while removing the bridge-injection hunk + the two bridge
   test files. Belongs as its own branch operation on `merge-phase3`, not on
   phase 2.
-- [ ] **P2 — `Input.GetSwipe` has no test-project coverage yet.** The
-  `getSwipe()` utility is implemented and has a unit test, but none of the 9
-  test projects actually use touch/swipe input, so the end-to-end path
-  (TouchSwipe handler, swipe consumption, frame-reset semantics) is
-  unverified against a real game. Action: either add a minimal touch-input
-  fixture to a test project, or accept that GetSwipe is speculative
-  infrastructure until a mobile Unity game shows up in the eval set.
+- [x] **P2 — `Input.GetSwipe` has no test-project coverage yet.** Accepted
+  2026-04-17 as speculative infrastructure. The mapping + utility function +
+  regression guard (`test_no_rejected_bridges.py` asserts
+  `API_CALL_MAP["Input.GetSwipe"] == "getSwipe"` and
+  `"getSwipe" in UTILITY_FUNCTIONS`) all exist. Real end-to-end coverage
+  will come when a mobile Unity game enters the eval set.

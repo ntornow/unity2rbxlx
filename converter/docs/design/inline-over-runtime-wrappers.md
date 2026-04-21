@@ -126,14 +126,15 @@ The nine wrappers that were removed under this policy:
    inline via `LIFECYCLE_MAP`; no runtime base class needed.
  - `converter/runtime/StateMachine.luau` — not a Unity API; speculative
    infrastructure with no test-project callers.
- - `converter/runtime/TransformAnimator.luau` — **still present, pending
-   consolidation with `animator_runtime.luau`** (see TODO.md).
- - `converter/runtime/animator_bridge.luau` — **still present, pending
-   consolidation with `animator_runtime.luau`** (see TODO.md).
+ - `converter/runtime/TransformAnimator.luau` — redundant with
+   `animation_converter.py`'s TweenService output; deleted. Its
+   curve-based CFrame/Size animation is handled inline by generated
+   TweenService scripts.
+ - `converter/runtime/animator_bridge.luau` — unique features (blend
+   trees, getters, `Play()`, Any-state transitions, lazy track loading,
+   `Destroy()`) merged into `animator_runtime.luau`; deleted.
 
 And the orphaned scanner:
 
- - `converter/converter/bridge_injector.py` — the pipeline component that
-   scanned transpiled Luau for bridge usage patterns and auto-injected the
-   wrapper modules. Removed because the wrappers it injected are all gone
-   or about to be.
+ - `converter/converter/bridge_injector.py` — scanned transpiled Luau for
+   bridge usage and auto-injected wrapper modules. Removed with the wrappers.

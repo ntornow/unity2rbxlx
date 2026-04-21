@@ -107,8 +107,6 @@ class TestProbeAssetAvailability:
 
     @patch("roblox.cloud_api.requests.get")
     def test_no_moderation_field_is_approved(self, mock_get):
-        """Some asset types return 200 without a moderationResult. That's
-        not a rejection — trust the 200 and report approved."""
         from roblox.cloud_api import probe_asset_availability
         mock_resp = MagicMock()
         mock_resp.status_code = 200
@@ -118,8 +116,6 @@ class TestProbeAssetAvailability:
 
     @patch("roblox.cloud_api.requests.get")
     def test_network_error_is_unknown(self, mock_get):
-        """The probe must NEVER escalate network hiccups into false
-        rejections — regressing a working asset is worse than missing one."""
         import requests as _requests
         from roblox.cloud_api import probe_asset_availability
         mock_get.side_effect = _requests.RequestException("boom")
@@ -137,8 +133,18 @@ class TestProbeAssetAvailability:
         assert probe_asset_availability("12345", "k") == "unknown"
 
     def test_non_numeric_id_is_unknown(self):
-        """UUID / path / empty inputs short-circuit to unknown without
-        touching the network."""
         from roblox.cloud_api import probe_asset_availability
         assert probe_asset_availability("", "k") == "unknown"
         assert probe_asset_availability("dc5c29d6-34b4-46c8", "k") == "unknown"
+        assert probe_asset_availability("not-a-number", "k") == "unknown"
+        assert probe_asset_availability("/path/to/file.fbx", "k") == "unknown"
+
+    @patch("roblox.cloud_api.requests.get")
+    def test_rbxassetid_prefix_stripped(self, mock_get):
+        from roblox.cloud_api import probe_asset_availability
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"id": "12345"}
+        mock_get.return_value = mock_resp
+        assert probe_asset_availability("rbxassetid://12345", "k") == "approved"
+        assert "12345" in mock_get.call_args[0][0]
