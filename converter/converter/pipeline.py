@@ -1392,18 +1392,6 @@ return table.concat(allData, "\\n")'''
         if detect_fps_game(self.state.rbx_place):
             self.state.rbx_place.is_fps_game = True
 
-        # Add ScriptableObject data tables as ModuleScripts.
-        if self.state.scriptable_objects:
-            from core.roblox_types import RbxScript
-            for asset in self.state.scriptable_objects.assets:
-                self.state.rbx_place.scripts.append(RbxScript(
-                    name=asset.asset_name,
-                    source=asset.luau_source,
-                    script_type="ModuleScript",
-                ))
-            log.info("[write_output] Added %d ScriptableObject ModuleScripts",
-                     len(self.state.scriptable_objects.assets))
-
         # Inject runtime library modules when relevant features are detected.
         self._inject_runtime_modules()
 
