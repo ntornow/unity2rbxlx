@@ -1343,6 +1343,52 @@ def visual_compare(unity_project: str, output: str, scene: str | None,
             click.echo(f"  Diff saved: {comparison_dir / 'diff_heatmap.png'}")
 
 
+@main.command("smoke-test")
+@click.argument("rbxlx_file", type=click.Path(exists=True))
+@click.option("--timeout", type=int, default=180,
+              help="Max seconds to wait for health-check completion (default: 180)")
+@click.option("--output-dir", "-o", type=click.Path(), default=None,
+              help="Directory for smoke test artifacts (default: alongside rbxlx)")
+@click.option("--no-screenshot", is_flag=True, help="Skip screenshot capture")
+@click.option("--keep-injected", is_flag=True, help="Keep the injected rbxlx file after test")
+def smoke_test(
+    rbxlx_file: str,
+    timeout: int,
+    output_dir: str | None,
+    no_screenshot: bool,
+    keep_injected: bool,
+) -> None:
+    """Run a smoke test: open place in Studio, enter Play, capture results.
+
+    Opens the given .rbxlx in Roblox Studio, injects a health-check script,
+    enters Play mode, waits for script output in Studio logs, takes a
+    screenshot, and produces a pass/fail report.
+
+    Requires macOS with Roblox Studio installed and logged in.
+
+    Examples:
+
+      python u2r.py smoke-test output/SimpleFPS/converted_place.rbxlx
+
+      python u2r.py smoke-test converted_place.rbxlx --timeout 300 -o ./smoke_results
+    """
+    from smoke_test import run_smoke_test, format_report
+
+    out = Path(output_dir) if output_dir else None
+    report = run_smoke_test(
+        rbxlx_path=rbxlx_file,
+        timeout=timeout,
+        screenshot=not no_screenshot,
+        output_dir=out,
+        keep_injected=keep_injected,
+    )
+
+    click.echo(format_report(report))
+
+    if report.status != "pass":
+        sys.exit(1)
+
+
 def _get_git_commit() -> str:
     """Return the current short git commit hash, or 'unknown'."""
     import subprocess
