@@ -340,18 +340,14 @@ class Pipeline:
             self.state.asset_manifest.total_size_bytes / (1024 * 1024),
         )
 
-        # ScriptableObject .asset -> Luau ModuleScripts under
-        # scripts/scriptable_objects/ so rehydration picks them up.
+        # ScriptableObject .asset -> Luau ModuleScripts, held in state.
+        # The disk write happens in write_output after scripts_dir is
+        # (possibly) wiped, so the disk layout matches the rbxlx.
         try:
             from converter.scriptable_object_converter import convert_asset_files
             so_result = convert_asset_files(self.unity_project_path)
             if so_result.converted:
                 self.state.scriptable_objects = so_result
-                so_dir = self.output_dir / "scripts" / "scriptable_objects"
-                so_dir.mkdir(parents=True, exist_ok=True)
-                for asset in so_result.assets:
-                    out_path = so_dir / f"{asset.asset_name}.luau"
-                    out_path.write_text(asset.luau_source, encoding="utf-8")
                 log.info(
                     "[extract_assets] Converted %d ScriptableObject .asset files",
                     so_result.converted,
@@ -1173,6 +1169,17 @@ return table.concat(allData, "\\n")'''
                 import shutil
                 shutil.rmtree(scripts_dir)
         scripts_dir.mkdir(parents=True, exist_ok=True)
+
+        # ScriptableObject ModuleScripts: write to disk *after* the optional
+        # rmtree so the files survive into the output. Both the fresh-transpile
+        # and preserved-script paths end up with the same files on disk.
+        if self.state.scriptable_objects:
+            so_dir = scripts_dir / "scriptable_objects"
+            so_dir.mkdir(parents=True, exist_ok=True)
+            for asset in self.state.scriptable_objects.assets:
+                (so_dir / f"{asset.asset_name}.luau").write_text(
+                    asset.luau_source, encoding="utf-8",
+                )
 
         if preserve_scripts:
             self._rehydrate_scripts_from_disk(scripts_dir)

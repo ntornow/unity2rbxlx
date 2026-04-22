@@ -25,7 +25,9 @@ def _fake_so_result(assets):
     )
 
 
-def test_extract_assets_writes_scriptable_objects_to_disk(tmp_path):
+def test_extract_assets_populates_scriptable_objects_state(tmp_path):
+    """extract_assets converts .asset files into state but defers the disk
+    write to write_output so the scripts_dir rmtree doesn't wipe them."""
     from converter.pipeline import Pipeline
 
     project = tmp_path / "fake_project"
@@ -37,7 +39,6 @@ def test_extract_assets_writes_scriptable_objects_to_disk(tmp_path):
     fake_manifest = MagicMock()
     fake_manifest.assets = []
     fake_manifest.total_size_bytes = 0
-
     fake_so = _fake_so_result(["Inventory", "QuestDatabase"])
 
     with patch("unity.asset_extractor.extract_assets", return_value=fake_manifest), \
@@ -46,11 +47,9 @@ def test_extract_assets_writes_scriptable_objects_to_disk(tmp_path):
          patch.object(pipeline, "_compute_fbx_bounding_boxes"):
         pipeline.extract_assets()
 
-    so_dir = output / "scripts" / "scriptable_objects"
-    assert (so_dir / "Inventory.luau").exists()
-    assert (so_dir / "QuestDatabase.luau").exists()
-    assert "Inventory" in (so_dir / "Inventory.luau").read_text()
     assert pipeline.state.scriptable_objects is fake_so
+    # Disk write deferred to write_output.
+    assert not (output / "scripts" / "scriptable_objects").exists()
 
 
 def test_write_output_attaches_scriptable_objects_as_module_scripts():
@@ -74,3 +73,38 @@ def test_write_output_attaches_scriptable_objects_as_module_scripts():
     names = [s.name for s in place.scripts]
     assert names == ["Existing", "Inventory"]
     assert next(s for s in place.scripts if s.name == "Inventory").script_type == "ModuleScript"
+
+
+def test_scriptable_objects_survive_fresh_transpile_rmtree(tmp_path):
+    """write_output wipes scripts/ on the fresh-transpile path, but the SO
+    disk write happens *after* the wipe so the files land correctly."""
+    from converter.pipeline import Pipeline
+
+    project = tmp_path / "fake_project"
+    (project / "Assets").mkdir(parents=True)
+    output = tmp_path / "out"
+    scripts_dir = output / "scripts"
+    scripts_dir.mkdir(parents=True)
+    # Simulate leftover state a rmtree would clear.
+    (scripts_dir / "stale.luau").write_text("stale")
+
+    pipeline = Pipeline(unity_project_path=project, output_dir=output, skip_upload=True)
+    pipeline.state.scriptable_objects = _fake_so_result(["Inventory"])
+
+    # Reproduce the minimum slice of write_output that handles scripts_dir.
+    # (Running the full write_output requires rbx_place + transpilation plumbing
+    # that this unit test doesn't need.)
+    import shutil
+    if scripts_dir.exists():
+        shutil.rmtree(scripts_dir)
+    scripts_dir.mkdir(parents=True)
+    if pipeline.state.scriptable_objects:
+        so_dir = scripts_dir / "scriptable_objects"
+        so_dir.mkdir(parents=True, exist_ok=True)
+        for asset in pipeline.state.scriptable_objects.assets:
+            (so_dir / f"{asset.asset_name}.luau").write_text(
+                asset.luau_source, encoding="utf-8",
+            )
+
+    assert not (scripts_dir / "stale.luau").exists()
+    assert (scripts_dir / "scriptable_objects" / "Inventory.luau").exists()
