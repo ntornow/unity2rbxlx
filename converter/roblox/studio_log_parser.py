@@ -91,6 +91,35 @@ def wait_for_marker(
     return False
 
 
+def wait_for_place_loaded(
+    log_path: Path,
+    timeout: float = 60,
+    poll_interval: float = 2,
+) -> bool:
+    """Poll until Studio finishes opening a place file (vs. Start Page only).
+
+    Looks for ``StartSoloSession`` registrations, ``EditDataModel`` creation,
+    or the first ``[FLog::Output]`` from a user script — any of which indicate
+    the DataModel has been populated with the place.
+    """
+    markers = [
+        "OpenPlaceSuccess",
+        "open place (identifier",
+        "saveDataModelToLocalFile succeeded",
+        "auto-recovery file was created",
+        "PlaceOpenFailed",
+    ]
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if log_path.exists():
+            text = log_path.read_text(errors="replace")
+            for m in markers:
+                if m in text:
+                    return True
+        time.sleep(poll_interval)
+    return False
+
+
 def parse_log(log_path: Path) -> StudioLogResult:
     """Parse a Studio log file and extract smoke test results and errors."""
     result = StudioLogResult(log_path=log_path)

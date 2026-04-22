@@ -9,6 +9,7 @@ that the Studio log parser can pick up.
 from __future__ import annotations
 
 import copy
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -203,8 +204,19 @@ def _build_script_element(name: str, source: str) -> ET.Element:
     return item
 
 
-def _write_rbxlx(tree: ET.TreeBuilder, path: Path) -> None:
-    """Write the XML tree to disk, wrapping ProtectedString content in CDATA."""
+_CDATA_RE = re.compile(r"&lt;!\[CDATA\[(.*?)\]\]&gt;", re.DOTALL)
+
+
+def _write_rbxlx(tree: ET.ElementTree, path: Path) -> None:
+    """Write the XML tree to disk, wrapping ProtectedString content in CDATA.
+
+    ElementTree doesn't have a native CDATA section type, so we wrap the text
+    in ``<![CDATA[...]]>`` markers and then post-process the serialized XML:
+    every ``&lt;![CDATA[...]]&gt;`` region gets its content XML-unescaped and
+    re-emitted as a real CDATA section. Without the content-unescape step,
+    characters like ``<`` inside the Luau source (e.g. ``#errors <= 20``)
+    arrive in Studio as ``&lt;`` and break parsing.
+    """
     root = tree.getroot()
 
     for ps in root.iter("ProtectedString"):
@@ -213,9 +225,12 @@ def _write_rbxlx(tree: ET.TreeBuilder, path: Path) -> None:
 
     raw_xml = ET.tostring(root, encoding="unicode", xml_declaration=False)
 
-    # ET escapes our CDATA markers — unescape them
-    raw_xml = raw_xml.replace("&lt;![CDATA[", "<![CDATA[")
-    raw_xml = raw_xml.replace("]]&gt;", "]]>")
+    def _restore(match: re.Match) -> str:
+        inner = match.group(1)
+        inner = inner.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+        return f"<![CDATA[{inner}]]>"
+
+    raw_xml = _CDATA_RE.sub(_restore, raw_xml)
 
     with open(path, "w", encoding="utf-8") as f:
         f.write('<?xml version="1.0" encoding="utf-8"?>\n')

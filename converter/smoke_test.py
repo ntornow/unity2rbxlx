@@ -32,6 +32,7 @@ from roblox.studio_log_parser import (
     get_studio_log_files,
     parse_log,
     wait_for_marker,
+    wait_for_place_loaded,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,8 @@ logger = logging.getLogger(__name__)
 STUDIO_LOAD_WAIT = 20  # seconds to wait after Studio opens before entering Play
 PLAY_MODE_SETTLE = 30  # seconds to wait after entering Play mode for scripts to run
 SMOKE_TEST_TIMEOUT = 180  # max seconds to wait for [SMOKE_TEST_DONE] marker
+
+STUDIO_AUTOSAVES_DIR = Path.home() / "Library" / "Application Support" / "Roblox" / "RobloxStudio" / "AutoSaves"
 
 
 @dataclass
@@ -110,9 +113,12 @@ def run_smoke_test(
     # Step 2: Record existing logs so we can find the new one
     pre_logs = set(get_studio_log_files())
 
-    # Step 3: Kill any existing Studio instances
+    # Step 3: Kill any existing Studio instances (waits for exit)
     _kill_studio()
-    time.sleep(2)
+
+    # Step 3b: Clear auto-recovery files + stale lock so Studio doesn't show
+    # the "An auto-recovery file was found" dialog.
+    _clear_autosaves_and_locks(injected_path)
 
     # Step 4: Open Studio with the injected place
     logger.info("Opening Roblox Studio with %s", injected_path)
@@ -136,14 +142,24 @@ def run_smoke_test(
     else:
         logger.warning("Could not find new Studio log file")
 
-    # Step 7: Enter Play mode
+    # Step 7: Wait for Studio to actually open the place (not just sit on Start Page)
+    if log_path:
+        logger.info("Waiting for Studio to finish opening the place...")
+        loaded = wait_for_place_loaded(log_path, timeout=60)
+        if not loaded:
+            logger.warning(
+                "Studio did not reach EditDataModel — Start Page likely still showing; "
+                "Play mode will probably be a no-op"
+            )
+
+    # Step 8: Enter Play mode
     logger.info("Entering Play mode via osascript...")
     play_ok = _enter_play_mode()
     report.play_mode_entered = play_ok
     if not play_ok:
         logger.warning("osascript Play mode failed — continuing anyway")
 
-    # Step 8: Wait for smoke test completion
+    # Step 9: Wait for smoke test completion
     if log_path:
         logger.info("Waiting up to %ds for smoke test results...", timeout)
         found = wait_for_marker(log_path, "[SMOKE_TEST_DONE]", timeout=timeout)
@@ -153,7 +169,7 @@ def run_smoke_test(
         logger.info("No log path — waiting %ds blindly", PLAY_MODE_SETTLE)
         time.sleep(PLAY_MODE_SETTLE)
 
-    # Step 9: Take screenshot
+    # Step 10: Take screenshot
     if screenshot:
         ss_path = output_dir / "studio_screenshot.png"
         logger.info("Taking screenshot...")
@@ -161,7 +177,7 @@ def run_smoke_test(
         if took:
             report.screenshot_path = str(ss_path)
 
-    # Step 10: Parse logs
+    # Step 11: Parse logs
     if log_path:
         log_result = parse_log(log_path)
         report.health_check_started = log_result.smoke_test_started
@@ -171,11 +187,11 @@ def run_smoke_test(
         report.studio_errors = log_result.flog_errors
         report.studio_crashed = log_result.studio_crashed
 
-    # Step 11: Kill Studio
+    # Step 12: Kill Studio
     logger.info("Stopping Studio...")
     _kill_studio()
 
-    # Step 12: Determine status
+    # Step 13: Determine status
     report.duration_seconds = round(time.monotonic() - t0, 1)
 
     if report.studio_crashed:
@@ -205,13 +221,26 @@ def run_smoke_test(
     return report
 
 
+STUDIO_BINARY = Path("/Applications/RobloxStudio.app/Contents/MacOS/RobloxStudio")
+
+
 def _open_studio(rbxlx_path: Path) -> bool:
-    """Open Roblox Studio with a .rbxlx file via macOS open command."""
+    """Open Roblox Studio with a .rbxlx file.
+
+    Invokes the Studio binary directly with the path as a positional arg.
+    This bypasses macOS ``open -a``, which routes through Studio's URL
+    protocol handler (``-protocolString file:// -protocolHandlerLaunch``)
+    and opens Studio on the Start Page instead of the target place.
+    """
+    if not STUDIO_BINARY.exists():
+        logger.error("Roblox Studio binary not found at %s", STUDIO_BINARY)
+        return False
     try:
         subprocess.Popen(
-            ["open", "-a", "RobloxStudio", str(rbxlx_path)],
+            [str(STUDIO_BINARY), str(rbxlx_path)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
         )
         return True
     except Exception as exc:
@@ -220,12 +249,35 @@ def _open_studio(rbxlx_path: Path) -> bool:
 
 
 def _enter_play_mode() -> bool:
-    """Send F5 keystroke to Roblox Studio via osascript to enter Play mode."""
+    """Send F5 keystroke to Roblox Studio via osascript to enter Play mode.
+
+    Blocks until Studio is actually the frontmost app before sending the
+    keystroke — otherwise 'tell ... to activate' can race with whatever
+    terminal/editor was focused and the F5 goes to the wrong window.
+
+    Also sends Escape (cancel auto-recovery dialog → don't load old version)
+    and Return (click default "Continue" on the Lighting Technology Migration
+    dialog) to clear any modal dialogs that would otherwise eat the F5.
+    """
     script = '''
     tell application "RobloxStudio" to activate
-    delay 1
     tell application "System Events"
+        repeat 80 times
+            if (exists process "RobloxStudio") then
+                if frontmost of process "RobloxStudio" then exit repeat
+            end if
+            delay 0.25
+        end repeat
+        delay 0.5
         tell process "RobloxStudio"
+            -- Dismiss common startup dialogs (auto-recovery, lighting migration)
+            key code 53
+            delay 0.3
+            key code 36
+            delay 0.3
+            key code 53
+            delay 0.3
+            -- F5 = Play
             key code 96
         end tell
     end tell
@@ -235,12 +287,40 @@ def _enter_play_mode() -> bool:
             ["osascript", "-e", script],
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=30,
         )
+        if result.returncode != 0:
+            logger.warning("osascript stderr: %s", result.stderr.strip())
         return result.returncode == 0
     except Exception as exc:
         logger.error("osascript failed: %s", exc)
         return False
+
+
+def _clear_autosaves_and_locks(injected_path: Path) -> None:
+    """Remove stale auto-recovery files and Studio file locks.
+
+    Studio shows a modal 'auto-recovery' dialog on startup if it finds a
+    matching recovery file from a prior crash/kill — that dialog eats the F5
+    keystroke. Stale ``.lock`` files from killed Studios also cause noisy
+    OTA-lock errors. Clearing both is safe because the smoke test always
+    regenerates the injected place from scratch.
+    """
+    stem = injected_path.stem  # e.g. "place_smoketest"
+    if STUDIO_AUTOSAVES_DIR.exists():
+        for f in STUDIO_AUTOSAVES_DIR.glob(f"{stem}_AutoRecovery_*.rbxl"):
+            try:
+                f.unlink()
+                logger.info("Removed stale auto-recovery file: %s", f.name)
+            except OSError:
+                pass
+    lock_path = injected_path.with_suffix(injected_path.suffix + ".lock")
+    if lock_path.exists():
+        try:
+            lock_path.unlink()
+            logger.info("Removed stale lock file: %s", lock_path)
+        except OSError:
+            pass
 
 
 def _take_screenshot(output_path: Path) -> bool:
@@ -257,16 +337,35 @@ def _take_screenshot(output_path: Path) -> bool:
         return False
 
 
-def _kill_studio() -> None:
-    """Kill all Roblox Studio processes."""
+def _kill_studio(wait_seconds: float = 10) -> None:
+    """Kill all Roblox Studio processes and wait for them to exit.
+
+    Studio ignores SIGTERM in some states — send SIGKILL. Match on the full
+    ``RobloxStudio.app`` path (not just ``RobloxStudio``) so we don't match
+    our own shell command line.
+    """
+    pattern = "RobloxStudio.app/Contents/MacOS/RobloxStudio"
     try:
         subprocess.run(
-            ["pkill", "-f", "RobloxStudio"],
+            ["pkill", "-KILL", "-f", pattern],
             capture_output=True,
             timeout=10,
         )
     except Exception:
-        pass
+        return
+
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        r = subprocess.run(
+            ["pgrep", "-f", pattern],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if r.returncode != 0:  # no matches
+            return
+        time.sleep(0.5)
+    logger.warning("Studio processes still running after %.0fs", wait_seconds)
 
 
 def _cleanup(injected_path: Path, keep: bool) -> None:
