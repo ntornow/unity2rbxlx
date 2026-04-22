@@ -1,6 +1,6 @@
 # Phase 4a.4: Module Boundaries & Bootstrap Shape
 
-> **Last verified:** 2026-04-16. Cross-check `luau_validator.py` and `api_mappings.py` before acting on prescriptions.
+> **Last verified:** 2026-04-16. Cross-check `api_mappings.py` and `code_transpiler.py` before acting on prescriptions.
 
 Decide Unity → Luau module mapping **before** transpile. 4b emits to these boundaries; 4c emits a bootstrap that wires them. Storage classification (4a.5) reads boundaries to pick containers.
 

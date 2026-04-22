@@ -1,6 +1,6 @@
 # Phase 4a.1: Architecture Map
 
-> **Last verified:** 2026-04-16. Cross-check `luau_validator.py` and `api_mappings.py` before acting on prescriptions.
+> **Last verified:** 2026-04-16. Cross-check `api_mappings.py` and `code_transpiler.py` before acting on prescriptions.
 
 Read every C# script in `<unity_project_path>/Assets/Scripts/` and produce three artifacts. Feeds module boundaries (4a.4) and storage classification (4a.5).
 

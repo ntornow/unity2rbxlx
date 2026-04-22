@@ -1,6 +1,6 @@
 # Phase 4c.2: Bootstrap Emission
 
-> **Last verified:** 2026-04-16. Cross-check `luau_validator.py` and `api_mappings.py` before acting on prescriptions.
+> **Last verified:** 2026-04-16. Cross-check `api_mappings.py` and `code_transpiler.py` before acting on prescriptions.
 
 Emit `GameBootstrap.lua` against the real shape of transpiled modules. Inputs: `bootstrap_shape` and `storage_plan` from `conversion_plan.json`, plus actual files under `<output_dir>/scripts/`.
 

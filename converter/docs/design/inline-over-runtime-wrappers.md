@@ -1,7 +1,8 @@
 # Inline Translation Over Runtime Wrappers
 
 **Status:** Adopted 2026-04-14. Applies to `converter/converter/api_mappings.py`,
-`converter/converter/luau_validator.py`, and the `converter/runtime/` module set.
+`converter/converter/code_transpiler.py` (lint+reprompt loop), and the
+`converter/runtime/` module set.
 
 ## Decision
 
@@ -18,9 +19,10 @@ Inline mechanisms:
    `mathLerp`, `setActive`). These are compile-time templates, not runtime
    modules: the helper body is copied into the generated script, not
    `require`'d from a shared module.
- - `luau_validator.py` — regex-based post-processor that catches patterns the
-   mapper leaves as markers (e.g. `-- Input.GetAxis("Horizontal")` → `inputHorizontal()`)
-   and fixes Luau-specific quality issues.
+ - `luau-analyze` + AI reprompt loop in `code_transpiler.py` — after AI
+   transpilation, runs `luau-analyze` on the output and sends any syntax
+   errors back to Claude for a targeted fix (up to 2 retries). Replaces the
+   former regex-based `luau_validator.py` post-processor (removed 2026-04-18).
 
 ## Rationale
 
@@ -96,15 +98,15 @@ Extend the inline layer, not the runtime layer:
 1. Add an entry to `API_CALL_MAP` / `LIFECYCLE_MAP` in `api_mappings.py`.
 2. If the mapping needs a helper function to stay readable, add the helper to
    `UTILITY_FUNCTIONS` and point the mapping at the helper name — the
-   transpiler and validator already auto-inject the helper body when it is
-   referenced. See `inputHorizontal`, `inputVertical`, `getSwipe`, `setActive`,
-   `mathLerp` as worked examples.
-3. If the mapping needs a multi-line regex fix (e.g. yielding statements,
-   property getters), add it to `luau_validator.py` in the relevant
-   `_fix_*` helper.
+   transpiler auto-injects the helper body when it is referenced. See
+   `inputHorizontal`, `inputVertical`, `getSwipe`, `setActive`, `mathLerp`
+   as worked examples.
+3. If the AI is systematically producing a non-syntactic mistranslation (i.e.
+   parses clean under `luau-analyze` but is semantically wrong), update the
+   transpiler prompt in `code_transpiler.py` or extend `API_CALL_MAP` to
+   handle the pattern directly.
 4. Add a test under `converter/tests/` with a minimal C# or Luau input and
-   an assertion on the rewritten output. See the `test_fix_input_getaxis_*`
-   tests in `test_integration.py` as a template.
+   an assertion on the rewritten output.
 
 ## History
 

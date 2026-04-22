@@ -93,7 +93,7 @@ There are two CLIs that share the same `Pipeline` class and the same `conversion
    | `inventory`  | parse → extract_assets            | Builds asset manifest |
    | `materials`  | … → convert_materials             | Maps Unity .mat → SurfaceAppearance |
    | `transpile`  | … → transpile_scripts             | C# → Luau (rule-based + AI) |
-   | `validate`   | (none — runs `luau_validator`)    | Auto-fixes Luau quality issues |
+   | `validate`   | (none — runs `luau-analyze`)      | Syntax-checks `<output_dir>/scripts/` with luau-analyze |
    | `assemble`   | upload_assets, resolve_assets, convert_animations, convert_scene, write_output | Produces `converted_place.rbxlx` |
    | `upload`     | parse → convert_scene + headless place builder | Publishes via `execute_luau` |
    | `report`     | (none — writes `conversion_report.json`) | Final summary |
@@ -160,8 +160,9 @@ Where:
 - State between phases stored in ConversionContext (JSON-serializable)
 - Use actual data from Roblox (LoadAsset) for mesh sizes, not heuristics
 - **Inline Unity → Roblox API translation over runtime wrappers.** Translate at
-  transpile time via `api_mappings.py` / `UTILITY_FUNCTIONS` / `luau_validator.py`,
-  not via `require`-able wrapper modules under `runtime/`. See
+  transpile time via `api_mappings.py` / `UTILITY_FUNCTIONS`, with `luau-analyze`
+  + AI reprompt loop catching any syntax errors in the generated output, not via
+  `require`-able wrapper modules under `runtime/`. See
   `docs/design/inline-over-runtime-wrappers.md` for the rationale.
 
 ## Running Tests
@@ -283,8 +284,8 @@ After uploading, run these steps via Studio MCP `execute_luau`:
 - Water region detection and sizing
 
 ### Scripts
-- C# → Luau transpilation (rule-based + AI via Claude CLI, 99.7% success)
-- 6,950-line Luau validator with 50+ fix categories (200+ regex patterns)
+- C# → Luau transpilation (AI via Claude CLI with on-disk cache, 99.7% success)
+- `luau-analyze` syntax check + AI reprompt loop on transpile output (replaces the former regex-based `luau_validator.py`, removed 2026-04-18)
 - Client/Server/Module script auto-detection and reclassification
 - Cross-script dependency injection (require() calls auto-inserted)
 - Utility function auto-injection (Mathf, LINQ, Vector3 helpers)

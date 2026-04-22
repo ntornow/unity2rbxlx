@@ -1,6 +1,6 @@
 # Phase 4a.2: Platform Divergence & Scale
 
-> **Last verified:** 2026-04-16. Cross-check `luau_validator.py` and `api_mappings.py` before acting on prescriptions.
+> **Last verified:** 2026-04-16. Cross-check `api_mappings.py` and `code_transpiler.py` before acting on prescriptions.
 
 Unity has no defaults. Roblox has defaults for character, camera, input, physics. For each pillar: **does Unity diverge from Roblox's default, and what's the override?**
 

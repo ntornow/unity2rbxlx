@@ -11,10 +11,10 @@ python3 convert_interactive.py transpile <unity_project_path> <output_dir> --api
 After review, validate:
 
 ```bash
-python3 convert_interactive.py validate <output_dir> --write 2>/dev/null
+python3 convert_interactive.py validate <output_dir> 2>/dev/null
 ```
 
-The validator (`converter/luau_validator.py`) auto-fixes common Luau quality issues across 50+ categories. `--write` rewrites the files in `<output_dir>/scripts/` in place; omit it to dry-run.
+`validate` runs `luau-analyze` over every script in `<output_dir>/scripts/` and reports syntax errors. It does not rewrite files — the transpile step already runs a `luau-analyze` + AI reprompt loop (`code_transpiler.py:_lint_and_fix`) that fixes syntax errors at the source before writing them.
 
 ## Structured errors
 
@@ -40,7 +40,7 @@ The transpile command returns JSON. Handle specific error codes instead of blind
 - **Edit manually.** Small, localized fix the agent can make without another round trip.
 - **Skip.** Script is unused by the primary scene or is pure editor tooling.
 
-**Escape hatch:** If review volume is unmanageable, trust validator results over per-file inspection — let `validate` flag structural issues and focus review on those.
+**Escape hatch:** If review volume is unmanageable, trust luau-analyze results over per-file inspection — let `validate` surface syntax errors and focus review on those.
 
 ## Review UX
 

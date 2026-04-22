@@ -1,6 +1,6 @@
 # Phase 4c: Reactive — Overview
 
-> **Last verified:** 2026-04-16. Cross-check `luau_validator.py` and `api_mappings.py` before acting on prescriptions.
+> **Last verified:** 2026-04-16. Cross-check `api_mappings.py` and `code_transpiler.py` before acting on prescriptions.
 
 Bootstrap emission, spawner wiring, animator-on-clone bindings, residual transpiler gaps — work that needs emitted Luau to exist.
 
@@ -20,13 +20,13 @@ Bootstrap emission, spawner wiring, animator-on-clone bindings, residual transpi
 |---|---|
 | `runtime-emit` | Project has runtime-spawned templates OR animations |
 | `bootstrap-emit` | Always |
-| `residual-gaps` | Validator flags issues OR converted game has visible bugs matching the symptom index |
+| `residual-gaps` | `luau-analyze` flags issues OR converted game has visible bugs matching the symptom index |
 
 ## Inputs
 
 - `conversion_plan.json` (4a)
 - Transpiled Luau under `<output_dir>/scripts/` (4b)
-- Validator output (`luau_validator.py`)
+- `luau-analyze` output from `convert_interactive.py validate`
 
 ## Outputs
 

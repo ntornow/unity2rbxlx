@@ -1,6 +1,6 @@
 # Phase 4c.1: Runtime Emission (spawners + animator wiring)
 
-> **Last verified:** 2026-04-16. Cross-check `luau_validator.py` and `api_mappings.py` before acting on prescriptions.
+> **Last verified:** 2026-04-16. Cross-check `api_mappings.py` and `code_transpiler.py` before acting on prescriptions.
 
 Write spawn/cleanup and animator wiring on top of transpiled managers. Inputs: `templates_manifest` and `animation_plan` from 4a, transpiled modules from 4b.
 

@@ -32,7 +32,7 @@ End-to-end CLI for one-shot conversions, CI/CD, batch jobs. No human in the loop
 | `inventory`  | parse → extract_assets            | Builds asset manifest |
 | `materials`  | … → convert_materials             | Maps Unity .mat → SurfaceAppearance |
 | `transpile`  | … → transpile_scripts             | C# → Luau (rule-based + AI) |
-| `validate`   | (none — runs `luau_validator`)    | Auto-fixes Luau quality issues in `<output_dir>/scripts/` |
+| `validate`   | (none — runs `luau-analyze`)      | Syntax-checks `<output_dir>/scripts/` with luau-analyze |
 | `assemble`   | upload_assets, resolve_assets, convert_animations, convert_scene, write_output | Produces `converted_place.rbxlx` |
 | `upload`     | parse → convert_scene + headless place builder | Publishes via `execute_luau` |
 | `report`     | (none — writes `conversion_report.json`) | Final summary |
