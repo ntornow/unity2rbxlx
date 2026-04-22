@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    - cron: "0 7 * * *"
+    - cron: "0 19 * * *"
   workflow_dispatch:
 
 jobs:
@@ -198,20 +198,94 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  smoke-test:
+    name: smoke test SimpleFPS (self-hosted macOS + Studio)
+    runs-on: [self-hosted, macOS, studio]
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: fast
+    timeout-minutes: 25
+    env:
+      # Path to the populated SimpleFPS Unity project on the self-hosted
+      # runner. test_projects/* in this repo are gitlinks with no
+      # .gitmodules, so CI cannot populate them; we point at a locally
+      # cloned Unity project instead. Override by setting a runner-level
+      # env var or repo variable if the path ever changes.
+      UNITY_SIMPLEFPS_DIR: /Users/jiazou/workspace/unity-3d-simplefps
+    defaults:
+      run:
+        working-directory: converter
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Verify SimpleFPS source exists
+        run: |
+          if [ ! -d "$UNITY_SIMPLEFPS_DIR/Assets" ]; then
+            echo "::error::SimpleFPS Unity project not found at $UNITY_SIMPLEFPS_DIR"
+            exit 1
+          fi
+
+      - name: Install dependencies into shared venv
+        run: |
+          VENV="$HOME/.unity2rbxlx-venv"
+          if [ ! -x "$VENV/bin/python" ]; then
+            python3 -m venv "$VENV"
+          fi
+          "$VENV/bin/python" -m pip install --upgrade pip
+          "$VENV/bin/python" -m pip install -e ".[dev]"
+
+      - name: Convert SimpleFPS
+        run: |
+          "$HOME/.unity2rbxlx-venv/bin/python" u2r.py convert "$UNITY_SIMPLEFPS_DIR" \
+            -o "./output/SimpleFPS" \
+            --scene all \
+            --no-upload \
+            --no-ai \
+            --no-resolve
+
+      - name: Run smoke test
+        run: |
+          # --scene all writes per-scene rbxlx files (main.rbxlx is the
+          # gameplay scene — 944 parts / 51 scripts). There is no unified
+          # converted_place.rbxlx in multi-scene mode.
+          RBXLX="./output/SimpleFPS/main.rbxlx"
+          if [ ! -f "$RBXLX" ]; then
+            echo "::error::Expected rbxlx not found: $RBXLX"
+            ls -la ./output/SimpleFPS/ || true
+            exit 1
+          fi
+          echo "smoke-testing $RBXLX"
+          "$HOME/.unity2rbxlx-venv/bin/python" u2r.py smoke-test "$RBXLX" \
+            --output-dir ./smoke_output/SimpleFPS
+
+      - name: Upload smoke test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-SimpleFPS
+          path: |
+            converter/smoke_output/SimpleFPS/smoke_test_report.json
+            converter/smoke_output/SimpleFPS/studio_screenshot.png
+          if-no-files-found: warn
+          retention-days: 14
+
   nightly-summary:
     name: nightly summary
     runs-on: ubuntu-latest
     if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-    needs: [slow-unit-tests, convert-matrix, eval-regression]
+    needs: [slow-unit-tests, convert-matrix, eval-regression, smoke-test]
     steps:
       - name: Check nightly job results
         run: |
           echo "slow-unit-tests: ${{ needs.slow-unit-tests.result }}"
           echo "convert-matrix:  ${{ needs.convert-matrix.result }}"
           echo "eval-regression: ${{ needs.eval-regression.result }}"
+          echo "smoke-test:      ${{ needs.smoke-test.result }}"
           if [ "${{ needs.slow-unit-tests.result }}" != "success" ] \
              || [ "${{ needs.convert-matrix.result }}" != "success" ] \
-             || [ "${{ needs.eval-regression.result }}" != "success" ]; then
+             || [ "${{ needs.eval-regression.result }}" != "success" ] \
+             || [ "${{ needs.smoke-test.result }}" != "success" ]; then
             echo "::error::Nightly build had failures"
             exit 1
           fi

@@ -1,0 +1,53 @@
+name: sync-upstream
+
+# Pulls the latest ntornow/unity2rbxlx:main into jiazou/unity2rbxlx:main 30
+# minutes before the nightly cron fires (02:30 CST / 18:30 UTC). The main
+# `tests` workflow then triggers at 19:00 UTC against the freshly-synced
+# commit, so the nightly smoke test reflects the latest upstream code.
+
+on:
+  schedule:
+    - cron: "30 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/ntornow/unity2rbxlx.git
+          git fetch upstream main
+
+      - name: Merge upstream/main into main
+        run: |
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "fork main already contains upstream/main — nothing to sync"
+            exit 0
+          fi
+          if git merge-base --is-ancestor HEAD upstream/main; then
+            echo "fast-forwarding fork main to upstream/main"
+            git merge --ff-only upstream/main
+          else
+            echo "fork has diverged — creating merge commit"
+            git merge upstream/main --no-edit \
+              -m "chore(nightly): sync with ntornow/unity2rbxlx@upstream/main"
+          fi
+
+      - name: Push to fork
+        run: git push origin main
