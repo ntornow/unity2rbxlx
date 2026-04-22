@@ -448,11 +448,11 @@ API_CALL_MAP: dict[str, str] = {
     "Math.Sqrt": "math.sqrt",
     "Math.PI": "math.pi",
     # -- Array/List --
-    # .Add/.Remove/.RemoveAt/.Insert/.IndexOf handled by luau_validator regex
+    # .Add/.Remove/.RemoveAt/.Insert/.IndexOf handled by AI transpiler
     # (simple string replacement can't restructure obj.Method(arg) → func(obj, arg))
     ".Reverse()": "-- Reverse: reverse table in-place",
     ".Sort()": "table.sort",
-    # ContainsKey and TryGetValue handled by luau_validator, not here
+    # ContainsKey and TryGetValue handled by AI transpiler
     # (inline comment replacement would break the code line)
     ".GetInstanceID()": "-- GetInstanceID: no Roblox equivalent",
     ".Equals(": "==",

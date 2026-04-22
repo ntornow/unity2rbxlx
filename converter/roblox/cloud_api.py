@@ -262,33 +262,17 @@ def probe_asset_availability(
     asset_id: str,
     api_key: str,
 ) -> str:
-    """Check whether an uploaded asset is actually reachable/approved.
+    """Check whether an uploaded asset is reachable/approved.
 
-    Returns one of:
-        "approved"   — asset metadata came back cleanly and looks playable
-        "rejected"   — asset was moderation-rejected or is otherwise blocked
-        "unknown"    — probe was inconclusive (network error, unexpected shape)
-
-    The default on an inconclusive signal is "unknown", not "rejected" — we
-    never want an availability probe to cause false negatives that strip
-    otherwise-working assets from the scene. Only act on an explicit
-    rejection.
-
-    Used by the pipeline's post-upload audit pass (see
-    ``cli.py audit-assets``) to detect cases like the SimpleFPS music1.mp3
-    HTTP 403 where Roblox returned a numeric asset ID from the upload POST
-    but the asset is moderation-rejected when downstream runtime tries to
-    load it.
+    Returns "approved", "rejected", or "unknown" (inconclusive).
+    Defaults to "unknown" on errors to avoid false negatives.
     """
-    # Accept a plain numeric ID or the full ``rbxassetid://<n>`` form.
-    # Anything else (UUIDs, paths, empty strings) is inconclusive.
-    raw = str(asset_id).strip()
-    if raw.startswith("rbxassetid://"):
-        raw = raw[len("rbxassetid://"):]
-    if not raw.isdigit():
+    clean = str(asset_id).strip()
+    if clean.startswith("rbxassetid://"):
+        clean = clean[len("rbxassetid://"):]
+    if not clean.isdigit():
         return "unknown"
-    numeric = raw
-    url = f"{_ASSETS_URL}/{numeric}"
+    url = f"{_ASSETS_URL}/{clean}"
 
     # Retry up to 3 times on 429 so a transient rate-limit doesn't cause a
     # false "unknown" — the audit sweep calls this in a tight loop.
@@ -297,12 +281,12 @@ def probe_asset_availability(
         try:
             resp = requests.get(url, headers=_auth_headers(api_key), timeout=30)
         except requests.RequestException as exc:
-            logger.debug("probe_asset_availability: request failed for %s: %s", numeric, exc)
+            logger.debug("probe_asset_availability: request failed for %s: %s", clean, exc)
             return "unknown"
         if resp.status_code != 429:
             break
         wait = 2.0 * (attempt + 1)
-        logger.debug("probe_asset_availability: 429 on %s, waiting %.1fs", numeric, wait)
+        logger.debug("probe_asset_availability: 429 on %s, waiting %.1fs", clean, wait)
         time.sleep(wait)
 
     if resp is None:
@@ -365,8 +349,7 @@ def upload_place(
         logger.error("Place file not found: %s", rbxlx_path)
         return False
 
-    # .rbxl is binary, .rbxlx is XML — pick the Content-Type accordingly so the
-    # Open Cloud endpoint accepts either.
+    # .rbxl is binary, .rbxlx is XML. suffix.lower() to handle .RBXL too.
     content_type = (
         "application/octet-stream"
         if rbxlx_path.suffix.lower() == ".rbxl"

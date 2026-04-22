@@ -56,8 +56,8 @@ class PipelineState:
     rbx_place: RbxPlace | None = None
     prefab_library: Any = None
     dependency_map: dict[str, list[str]] = field(default_factory=dict)
-    sprite_result: Any = None
     scriptable_objects: Any = None
+    sprite_result: Any = None
 
 
 class Pipeline:
@@ -1179,19 +1179,7 @@ return table.concat(allData, "\\n")'''
 
         elif self.state.transpilation_result:
             from core.roblox_types import RbxScript
-            from converter.luau_validator import validate_and_fix, fix_gameplay_patterns
-            total_fixes = 0
             for ts in self.state.transpilation_result.scripts:
-                # Validate and fix common AI transpilation issues.
-                fixed_source, fixes = validate_and_fix(ts.output_filename, ts.luau_source)
-                if fixes:
-                    ts.luau_source = fixed_source
-                    total_fixes += len(fixes)
-                # Fix gameplay-specific patterns (pickup detection, etc.)
-                fixed_source, gp_fixes = fix_gameplay_patterns(ts.output_filename, ts.luau_source)
-                if gp_fixes:
-                    ts.luau_source = fixed_source
-                    total_fixes += len(gp_fixes)
                 out_path = scripts_dir / ts.output_filename
                 out_path.write_text(ts.luau_source, encoding="utf-8")
                 self.state.rbx_place.scripts.append(RbxScript(
@@ -1199,8 +1187,6 @@ return table.concat(allData, "\\n")'''
                     source=ts.luau_source,
                     script_type=ts.script_type,
                 ))
-            if total_fixes:
-                log.info("[write_output] Applied %d Luau validation fixes", total_fixes)
 
         # Write animation scripts to output directory AND add to RbxPlace.
         if self.state.animation_result and self.state.animation_result.generated_scripts:
@@ -1405,6 +1391,18 @@ return table.concat(allData, "\\n")'''
             log.info("[write_output] Auto-generated %d FPS client scripts/GUIs", fps_added)
         if detect_fps_game(self.state.rbx_place):
             self.state.rbx_place.is_fps_game = True
+
+        # Add ScriptableObject data tables as ModuleScripts.
+        if self.state.scriptable_objects:
+            from core.roblox_types import RbxScript
+            for asset in self.state.scriptable_objects.assets:
+                self.state.rbx_place.scripts.append(RbxScript(
+                    name=asset.asset_name,
+                    source=asset.luau_source,
+                    script_type="ModuleScript",
+                ))
+            log.info("[write_output] Added %d ScriptableObject ModuleScripts",
+                     len(self.state.scriptable_objects.assets))
 
         # Inject runtime library modules when relevant features are detected.
         self._inject_runtime_modules()
@@ -1656,18 +1654,6 @@ script.Disabled = true
                 script_type="Script",
             ))
             log.info("[write_output] TerrainSnap script embedded")
-
-        # Final validation pass: apply validator fixes to all scripts one last time
-        # (catches patterns introduced by require injection, reclassification, etc.)
-        from converter.luau_validator import validate_and_fix
-        final_fixes = 0
-        for s in self.state.rbx_place.scripts:
-            fixed_source, fixes = validate_and_fix(s.name, s.source)
-            if fixes:
-                s.source = fixed_source
-                final_fixes += len(fixes)
-        if final_fixes:
-            log.info("[write_output] Final validation pass applied %d fixes", final_fixes)
 
         # Patch scripts that use setupSounds: also search script.Parent for
         # Sound children (sounds from MonoBehaviour AudioClip fields are placed
@@ -1953,12 +1939,12 @@ script.Disabled = true
                 for class_name in script_classes:
                     if class_name in script_by_name:
                         script = script_by_name[class_name]
-                        # Only bind Server scripts and LocalScripts to parts.
+                        # Only bind Server scripts to parts.
                         # ModuleScripts stay in ReplicatedStorage for require().
-                        # Skip stub scripts (AI unavailable) — they have no
-                        # runnable code, and cloning them per instance bloats
-                        # the rbxlx (Gamekit3D: 7860 copies of a Variations stub).
-                        if script.script_type != "ModuleScript" and "AI transpilation recommended" not in script.source:
+                        # LocalScripts go to StarterPlayerScripts (they don't
+                        # execute when parented to workspace Parts).
+                        # Skip stub scripts (AI unavailable).
+                        if script.script_type == "Script" and "AI transpilation recommended" not in script.source:
                             # Clone the script for each instance so all prefab
                             # variants get their inherited MonoBehaviour scripts
                             if class_name in bound_script_names:
