@@ -84,9 +84,8 @@ class Pipeline:
         self.output_dir = Path(output_dir or OUTPUT_DIR).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.skip_upload = skip_upload
-        # Skip the XML -> binary .rbxl conversion. Set True on the
-        # interactive `upload` rebuild, which publishes via execute_luau
-        # and never reads the .rbxl file. Per MERGE_PLAN Phase 3 item 6.
+        # True on the interactive `upload` rebuild (publishes via
+        # execute_luau; never reads the .rbxl file).
         self.skip_binary_rbxl = skip_binary_rbxl
 
         self.ctx = ConversionContext(
@@ -1687,8 +1686,6 @@ script.Disabled = true
                  result.get("scripts_written", 0))
 
         # Sibling .rbxl for the Open Cloud place endpoint (binary-only).
-        # Skipped if lz4 isn't installed, or if the caller asked to skip
-        # (e.g. interactive upload, which publishes via execute_luau).
         if self.skip_binary_rbxl:
             log.debug("[write_output] skip_binary_rbxl set; skipping binary .rbxl")
         else:
@@ -1776,7 +1773,6 @@ script.Disabled = true
             st = getattr(s, "script_type", "Script")
             script_types[st] = script_types.get(st, 0) + 1
 
-        # Project-relative scene path per MERGE_PLAN Phase 3 item 7.
         selected_scene = ""
         if self.ctx.selected_scene:
             p = Path(self.ctx.selected_scene)
@@ -1908,17 +1904,13 @@ script.Disabled = true
         )
         self.ctx.storage_plan = plan.to_dict()
 
-        # script_paths: name -> path relative to scripts_dir. Records the
-        # original subdir so rehydration can preserve directory identity
-        # (MERGE_PLAN Phase 3 item 12). Names with multiple paths keep the
-        # first — a name collision across subdirs is pre-existing.
+        # Record each script's subdir so rehydration can route it back.
         script_paths: dict[str, str] = {}
         scripts_dir = self.output_dir / "scripts"
         if scripts_dir.is_dir():
             for luau_path in sorted(scripts_dir.rglob("*.luau")):
-                stem = luau_path.stem
                 script_paths.setdefault(
-                    stem, str(luau_path.relative_to(scripts_dir)),
+                    luau_path.stem, str(luau_path.relative_to(scripts_dir)),
                 )
 
         plan_path = self.output_dir / "conversion_plan.json"

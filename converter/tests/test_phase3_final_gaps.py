@@ -1,16 +1,10 @@
-"""Tests for Pipeline-level wiring of the Phase 3 items.
-
-These cover the seams where the Pipeline integrates with the extracted
-helpers (rehydration, report assembly, binary-writer skip, storage plan
-emission). Unit-level tests for each helper live in their own files.
-"""
+"""Pipeline-level wiring tests for the three closed Phase 3 gaps."""
 
 from __future__ import annotations
 
 import json
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -29,14 +23,11 @@ def _make_pipeline(tmp_path):
 
 
 class TestSkipBinaryRbxl:
-    """MERGE_PLAN Phase 3 item 6: the interactive upload rebuild path must
-    not produce a .rbxl file."""
-
-    def test_default_runs_xml_to_binary(self, tmp_path):
+    def test_default_is_false(self, tmp_path):
         pipeline = _make_pipeline(tmp_path)
         assert pipeline.skip_binary_rbxl is False
 
-    def test_flag_available_in_constructor(self, tmp_path):
+    def test_constructor_kwarg(self, tmp_path):
         from converter.pipeline import Pipeline
 
         project = tmp_path / "proj"
@@ -49,34 +40,32 @@ class TestSkipBinaryRbxl:
         )
         assert pipeline.skip_binary_rbxl is True
 
-    def test_interactive_upload_sets_skip_binary_rbxl(self, tmp_path):
-        """convert_interactive.upload should toggle the flag on."""
-        import convert_interactive as ci
+    def test_interactive_make_pipeline_threads_flag(self, tmp_path):
+        """_make_pipeline must propagate skip_binary_rbxl so convert_interactive.upload
+        can turn off the binary writer on the rebuild path."""
+        from convert_interactive import _make_pipeline as cli_make_pipeline
 
-        # Read the upload() source; look for the assignment that MERGE_PLAN
-        # item 6 mandates. This is a static check — functionally exercising
-        # the full upload() command requires Roblox API keys.
-        src = Path(ci.__file__).read_text()
-        assert "pipeline.skip_binary_rbxl = True" in src, (
-            "convert_interactive.upload must set pipeline.skip_binary_rbxl = True"
-        )
+        project = tmp_path / "proj"
+        (project / "Assets").mkdir(parents=True)
+        out = tmp_path / "out"
+
+        pipeline = cli_make_pipeline(project, out, skip_binary_rbxl=True)
+        assert pipeline.skip_binary_rbxl is True
+
+        default = cli_make_pipeline(project, out)
+        assert default.skip_binary_rbxl is False
 
 
 class TestReportIncludesSceneRelPath:
-    """MERGE_PLAN Phase 3 item 7: structured report must include the
-    project-relative scene path, not just an absolute one."""
-
     def test_scene_is_project_relative(self, tmp_path):
         from core.conversion_context import ConversionContext
 
         pipeline = _make_pipeline(tmp_path)
-        # Point selected_scene at an absolute path inside the project.
         scene_abs = pipeline.unity_project_path / "Assets" / "Scenes" / "main.unity"
         pipeline.ctx = ConversionContext(
             unity_project_path=str(pipeline.unity_project_path),
             selected_scene=str(scene_abs),
         )
-
         report = pipeline._build_conversion_report(
             tmp_path / "place.rbxlx", {}, tmp_path / "report.json",
         )
@@ -110,10 +99,7 @@ class TestReportIncludesSceneRelPath:
 
 
 class TestStoragePlanScriptPaths:
-    """MERGE_PLAN Phase 3 item 12: conversion_plan.json should record
-    relative paths so rehydration can preserve directory identity."""
-
-    def test_classify_storage_records_script_paths(self, tmp_path):
+    def test_records_relative_script_paths(self, tmp_path):
         from core.roblox_types import RbxScript
 
         pipeline = _make_pipeline(tmp_path)
@@ -136,17 +122,15 @@ class TestStoragePlanScriptPaths:
         plan = json.loads(
             (pipeline.output_dir / "conversion_plan.json").read_text(encoding="utf-8"),
         )
-        assert "script_paths" in plan
         paths = plan["script_paths"]
         assert paths["PlayerController"] == "PlayerController.luau"
         assert paths["Door"] == "animations/Door.luau"
         assert paths["Inventory"] == "scriptable_objects/Inventory.luau"
 
-    def test_classify_storage_handles_missing_scripts_dir(self, tmp_path):
+    def test_missing_scripts_dir_is_empty_dict(self, tmp_path):
         from core.roblox_types import RbxScript
 
         pipeline = _make_pipeline(tmp_path)
-        # No scripts/ dir on disk.
         pipeline.state.rbx_place.scripts = [
             RbxScript(name="Foo", source="", script_type="Script"),
         ]
