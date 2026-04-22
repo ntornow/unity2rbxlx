@@ -72,6 +72,9 @@ class ConversionContext:
     # emitting; falls back to script_type heuristics when absent.
     storage_plan: dict[str, Any] = field(default_factory=dict)
 
+    # GUID -> sliced sprite PNG path (from sprite_extractor).
+    sprite_guid_to_file: dict[str, str] = field(default_factory=dict)
+
     def mark_phase_complete(self, phase: str) -> None:
         if phase not in self.completed_phases:
             self.completed_phases.append(phase)

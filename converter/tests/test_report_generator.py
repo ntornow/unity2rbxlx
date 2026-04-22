@@ -20,11 +20,6 @@ from converter.report_generator import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
 def _make_report(**overrides) -> ConversionReport:
     defaults = dict(
         unity_project_path="/fake/project",
@@ -50,14 +45,7 @@ def _make_report(**overrides) -> ConversionReport:
     return ConversionReport(**defaults)
 
 
-# ---------------------------------------------------------------------------
-# JSON serialization
-# ---------------------------------------------------------------------------
-
-
 class TestGenerateReport:
-    """Verify JSON output correctness."""
-
     def test_writes_json_file(self, tmp_path):
         report = _make_report()
         out = tmp_path / "report.json"
@@ -71,14 +59,9 @@ class TestGenerateReport:
         out = tmp_path / "report.json"
         generate_report(report, out, print_summary=False)
         data = json.loads(out.read_text(encoding="utf-8"))
-        assert "generated_at" in data
-        assert "unity_project_path" in data
-        assert "assets" in data
-        assert "scripts" in data
-        assert "materials" in data
-        assert "scene" in data
-        assert "components" in data
-        assert "output" in data
+        for key in ("generated_at", "unity_project_path", "assets", "scripts",
+                    "materials", "scene", "components", "output"):
+            assert key in data
 
     def test_asset_summary_serialized(self, tmp_path):
         report = _make_report()
@@ -121,8 +104,6 @@ class TestGenerateReport:
 
 
 class TestReportSummaryPrinting:
-    """Verify print_summary produces output."""
-
     def test_print_summary_true(self, tmp_path, capsys):
         report = _make_report()
         out = tmp_path / "report.json"
@@ -158,3 +139,78 @@ class TestReportSummaryPrinting:
         out = tmp_path / "sub" / "dir" / "report.json"
         generate_report(report, out, print_summary=False)
         assert out.exists()
+
+
+class TestPipelineIntegration:
+    """Tests that exercise Pipeline._build_conversion_report end-to-end."""
+
+    def test_build_conversion_report_reflects_ctx(self, tmp_path):
+        from converter.pipeline import Pipeline
+        from core.conversion_context import ConversionContext
+        from core.roblox_types import RbxPlace, RbxScript
+
+        project = tmp_path / "proj"
+        (project / "Assets").mkdir(parents=True)
+        pipeline = Pipeline(
+            unity_project_path=project, output_dir=tmp_path / "out", skip_upload=True,
+        )
+        pipeline.ctx = ConversionContext(
+            total_game_objects=500,
+            converted_parts=295,
+            transpiled_scripts=36,
+            total_materials=12,
+            converted_materials=10,
+            uploaded_assets={"a": "rbxassetid://1", "b": "rbxassetid://2"},
+            asset_upload_errors=["bad.png"],
+            errors=[],
+            warnings=["hi"],
+        )
+        pipeline.state.rbx_place = RbxPlace()
+        pipeline.state.rbx_place.scripts = [
+            RbxScript(name="A", source="", script_type="Script"),
+            RbxScript(name="B", source="", script_type="LocalScript"),
+            RbxScript(name="C", source="", script_type="ModuleScript"),
+        ]
+
+        report = pipeline._build_conversion_report(
+            tmp_path / "place.rbxlx",
+            {"parts_written": 295, "scripts_written": 36},
+            tmp_path / "report.json",
+        )
+        assert report.success is True
+        assert report.warnings == ["hi"]
+        assert report.assets.total == 2
+        assert report.assets.by_kind == {
+            "Script": 1, "LocalScript": 1, "ModuleScript": 1, "upload_errors": 1,
+        }
+        assert report.scripts.total == 36
+        assert report.materials.fully_converted == 10
+        assert report.scene.total_game_objects == 500
+        assert report.components.converted == 295
+        assert report.output.parts_written == 295
+
+    def test_interactive_report_preserves_structured_fields(self, tmp_path):
+        """Interactive report() augments the file without clobbering shape."""
+        report = ConversionReport(
+            unity_project_path="/unity/SimpleFPS",
+            output_dir=str(tmp_path),
+            success=True,
+            output=OutputSummary(parts_written=42),
+        )
+        report_path = tmp_path / "conversion_report.json"
+        generate_report(report, report_path, print_summary=False)
+
+        data = json.loads(report_path.read_text(encoding="utf-8"))
+        data.update({
+            "selected_scene": "Assets/Scenes/main.unity",
+            "completed_skill_phases": ["discover", "inventory"],
+            "universe_id": 12345,
+            "rbxlx_size_mb": 1.5,
+        })
+        report_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+        merged = json.loads(report_path.read_text(encoding="utf-8"))
+        assert merged["selected_scene"] == "Assets/Scenes/main.unity"
+        assert merged["universe_id"] == 12345
+        assert merged["output"]["parts_written"] == 42
+        assert merged["success"] is True

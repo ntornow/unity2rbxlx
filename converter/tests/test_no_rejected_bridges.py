@@ -24,6 +24,12 @@ _REJECTED_BRIDGES = [
 
 _REJECTED_PYTHON_MODULES = [
     "converter/bridge_injector.py",
+    # mesh_splitter was ported for Phase 3 item 4 (split multi-material
+    # FBX meshes into per-material OBJs). Superseded by the sub-mesh
+    # hierarchy path in scene_converter, which routes each material slot
+    # to a MeshPart child using mesh_hierarchies from Studio resolution.
+    # See docs/design/merge-plan-phase-3-augmented.md.
+    "converter/mesh_splitter.py",
 ]
 
 
@@ -34,10 +40,14 @@ def test_rejected_runtime_bridges_do_not_exist():
     assert not surviving, f"Rejected bridges reappeared: {surviving}"
 
 
-def test_bridge_injector_does_not_exist():
+def test_rejected_python_modules_do_not_exist():
+    """bridge_injector and mesh_splitter were ported then rejected; guard against reappearance."""
     for rel in _REJECTED_PYTHON_MODULES:
         path = CONVERTER_ROOT / rel
-        assert not path.exists(), f"{rel} reappeared"
+        assert not path.exists(), (
+            f"{rel} reappeared. See docs/design/inline-over-runtime-wrappers.md "
+            f"and docs/design/merge-plan-phase-3-augmented.md for the rationale."
+        )
 
 
 def test_api_mappings_still_inlines_covered_apis():

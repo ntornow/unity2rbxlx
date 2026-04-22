@@ -818,8 +818,10 @@ def upload(output_dir: str, api_key: str | None,
         sys.exit(1)
 
     # Re-run the pipeline through convert_scene so we have rbx_place in memory
-    # for the place builder.
+    # for the place builder. Publish goes via execute_luau, so the binary
+    # .rbxl is not used — tell write_output to skip it (MERGE_PLAN item 6).
     pipeline = _make_pipeline(None, out)
+    pipeline.skip_binary_rbxl = True
     pipeline.ctx.universe_id = uid
     pipeline.ctx.place_id = pid
 
@@ -946,7 +948,18 @@ def report(output_dir: str) -> None:
         if rbxlx_path.exists() else 0.0
     )
 
-    report_data = {
+    # Augment the structured report written by pipeline.write_output with
+    # skill-only fields, without clobbering its shape.
+    report_path = out / "conversion_report.json"
+    if report_path.exists():
+        try:
+            report_data = json.loads(report_path.read_text(encoding="utf-8"))
+        except Exception:
+            report_data = {}
+    else:
+        report_data = {}
+
+    report_data.update({
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "unity_project_path": ctx.unity_project_path,
         "output_dir": str(out),
@@ -962,9 +975,8 @@ def report(output_dir: str) -> None:
         "warnings": ctx.warnings,
         "errors": ctx.errors,
         "asset_upload_errors": ctx.asset_upload_errors,
-    }
+    })
 
-    report_path = out / "conversion_report.json"
     report_path.write_text(json.dumps(report_data, indent=2, default=str),
                            encoding="utf-8")
 

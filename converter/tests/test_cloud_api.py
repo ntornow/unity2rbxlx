@@ -148,3 +148,37 @@ class TestProbeAssetAvailability:
         mock_get.return_value = mock_resp
         assert probe_asset_availability("rbxassetid://12345", "k") == "approved"
         assert "12345" in mock_get.call_args[0][0]
+
+
+class TestUploadPlaceContentType:
+    """upload_place picks Content-Type from the file extension."""
+
+    @patch("roblox.cloud_api.requests.post")
+    def test_xml_content_type_for_rbxlx(self, mock_post, tmp_path):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {}
+        mock_post.return_value = mock_resp
+
+        from roblox.cloud_api import upload_place
+        rbxlx = tmp_path / "test.rbxlx"
+        rbxlx.write_text("<roblox></roblox>")
+        assert upload_place(rbxlx, "k", "1", "2") is True
+
+        headers = mock_post.call_args.kwargs["headers"]
+        assert headers["Content-Type"] == "application/xml"
+
+    @patch("roblox.cloud_api.requests.post")
+    def test_octet_stream_for_rbxl(self, mock_post, tmp_path):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {}
+        mock_post.return_value = mock_resp
+
+        from roblox.cloud_api import upload_place
+        rbxl = tmp_path / "test.rbxl"
+        rbxl.write_bytes(b"<roblox!\x89\xff\x0d\x0a\x1a\x0a")
+        assert upload_place(rbxl, "k", "1", "2") is True
+
+        headers = mock_post.call_args.kwargs["headers"]
+        assert headers["Content-Type"] == "application/octet-stream"

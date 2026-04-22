@@ -78,11 +78,16 @@ class Pipeline:
         unity_project_path: str | Path,
         output_dir: str | Path | None = None,
         skip_upload: bool = False,
+        skip_binary_rbxl: bool = False,
     ) -> None:
         self.unity_project_path = self._find_unity_root(Path(unity_project_path).resolve())
         self.output_dir = Path(output_dir or OUTPUT_DIR).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.skip_upload = skip_upload
+        # Skip the XML -> binary .rbxl conversion. Set True on the
+        # interactive `upload` rebuild, which publishes via execute_luau
+        # and never reads the .rbxl file. Per MERGE_PLAN Phase 3 item 6.
+        self.skip_binary_rbxl = skip_binary_rbxl
 
         self.ctx = ConversionContext(
             unity_project_path=str(self.unity_project_path),
@@ -340,31 +345,41 @@ class Pipeline:
             self.state.asset_manifest.total_size_bytes / (1024 * 1024),
         )
 
-        # Convert ScriptableObject .asset files to Luau ModuleScripts.
+        # ScriptableObject .asset -> Luau ModuleScripts, held in state.
+        # The disk write happens in write_output after scripts_dir is
+        # (possibly) wiped, so the disk layout matches the rbxlx.
         try:
             from converter.scriptable_object_converter import convert_asset_files
             so_result = convert_asset_files(self.unity_project_path)
             if so_result.converted:
                 self.state.scriptable_objects = so_result
-                log.info("[extract_assets] Converted %d ScriptableObject .asset files",
-                         so_result.converted)
+                log.info(
+                    "[extract_assets] Converted %d ScriptableObject .asset files",
+                    so_result.converted,
+                )
         except Exception as exc:
             log.debug("[extract_assets] ScriptableObject conversion skipped: %s", exc)
 
-        # Extract individual sprites from spritesheets.
-        try:
-            from converter.sprite_extractor import extract_sprites
-            if self.state.guid_index:
+        # Slice spritesheet textures into <output>/sprites/; expose the
+        # GUID -> file map on ctx for SpriteRenderer consumers.
+        if self.state.guid_index:
+            try:
+                from converter.sprite_extractor import extract_sprites
                 sprite_result = extract_sprites(self.state.guid_index, self.output_dir)
                 if sprite_result.total_sprites_extracted:
                     self.state.sprite_result = sprite_result
-                    log.info("[extract_assets] Extracted %d sprites from %d spritesheets",
-                             sprite_result.total_sprites_extracted,
-                             sprite_result.total_spritesheets)
+                    self.ctx.sprite_guid_to_file = {
+                        k: str(v) for k, v in sprite_result.sprite_guid_to_file.items()
+                    }
+                    log.info(
+                        "[extract_assets] Extracted %d sprites from %d spritesheets",
+                        sprite_result.total_sprites_extracted,
+                        sprite_result.total_spritesheets,
+                    )
                 for w in sprite_result.warnings:
                     log.warning("[extract_assets] Sprite: %s", w)
-        except Exception as exc:
-            log.debug("[extract_assets] Sprite extraction skipped: %s", exc)
+            except Exception as exc:
+                log.debug("[extract_assets] Sprite extraction skipped: %s", exc)
 
         # Pre-compute FBX bounding boxes via trimesh for InitialSize fallback.
         # This runs only when mesh_native_sizes (from Studio resolution) are
@@ -1160,34 +1175,19 @@ return table.concat(allData, "\\n")'''
                 shutil.rmtree(scripts_dir)
         scripts_dir.mkdir(parents=True, exist_ok=True)
 
+        # ScriptableObject ModuleScripts: write to disk *after* the optional
+        # rmtree so the files survive into the output. Both the fresh-transpile
+        # and preserved-script paths end up with the same files on disk.
+        if self.state.scriptable_objects:
+            so_dir = scripts_dir / "scriptable_objects"
+            so_dir.mkdir(parents=True, exist_ok=True)
+            for asset in self.state.scriptable_objects.assets:
+                (so_dir / f"{asset.asset_name}.luau").write_text(
+                    asset.luau_source, encoding="utf-8",
+                )
+
         if preserve_scripts:
-            # Rehydrate scripts from disk into rbx_place so the .rbxlx
-            # includes the user's hand-edited Luau files.
-            from core.roblox_types import RbxScript
-            luau_files = sorted(scripts_dir.rglob("*.luau"))
-            for luau_path in luau_files:
-                source = luau_path.read_text(encoding="utf-8")
-                name = luau_path.stem
-                # Infer script type from source content.
-                # Only classify as ModuleScript if the file ends with a
-                # top-level return (the canonical ModuleScript pattern).
-                # A bare "\nreturn " anywhere in the file is NOT sufficient
-                # — regular Scripts have helper returns and early exits.
-                script_type: str = "Script"
-                stripped_end = source.rstrip()
-                if (stripped_end.endswith("return " + name)
-                        or stripped_end.endswith("return module")
-                        or stripped_end.endswith("return {}")):
-                    script_type = "ModuleScript"
-                elif "game.Players.LocalPlayer" in source or "UserInputService" in source:
-                    script_type = "LocalScript"
-                self.state.rbx_place.scripts.append(RbxScript(
-                    name=name,
-                    source=source,
-                    script_type=script_type,
-                ))
-            log.info("[write_output] Rehydrated %d scripts from disk (transpile skipped)",
-                     len(luau_files))
+            self._rehydrate_scripts_from_disk(scripts_dir)
 
         elif self.state.transpilation_result:
             from core.roblox_types import RbxScript
@@ -1231,6 +1231,24 @@ return table.concat(allData, "\\n")'''
                 ))
             log.info("[write_output] Wrote %d animation data modules",
                      len(self.state.animation_result.animation_data_modules))
+
+        # Attach ScriptableObject ModuleScripts on the fresh-transpile path.
+        # Rehydration already picks them up from disk; dedupe by name.
+        if self.state.scriptable_objects:
+            from core.roblox_types import RbxScript
+            existing = {s.name for s in self.state.rbx_place.scripts}
+            added = 0
+            for asset in self.state.scriptable_objects.assets:
+                if asset.asset_name in existing:
+                    continue
+                self.state.rbx_place.scripts.append(RbxScript(
+                    name=asset.asset_name,
+                    source=asset.luau_source,
+                    script_type="ModuleScript",
+                ))
+                added += 1
+            if added:
+                log.info("[write_output] Added %d ScriptableObject ModuleScripts", added)
 
         # Post-transpilation: rewrite asset references in scripts.
         from converter.script_asset_rewriter import rewrite_asset_references
@@ -1385,18 +1403,6 @@ return table.concat(allData, "\\n")'''
             log.info("[write_output] Auto-generated %d FPS client scripts/GUIs", fps_added)
         if detect_fps_game(self.state.rbx_place):
             self.state.rbx_place.is_fps_game = True
-
-        # Add ScriptableObject data tables as ModuleScripts.
-        if self.state.scriptable_objects:
-            from core.roblox_types import RbxScript
-            for asset in self.state.scriptable_objects.assets:
-                self.state.rbx_place.scripts.append(RbxScript(
-                    name=asset.asset_name,
-                    source=asset.luau_source,
-                    script_type="ModuleScript",
-                ))
-            log.info("[write_output] Added %d ScriptableObject ModuleScripts",
-                     len(self.state.scriptable_objects.assets))
 
         # Inject runtime library modules when relevant features are detected.
         self._inject_runtime_modules()
@@ -1680,16 +1686,21 @@ script.Disabled = true
                  rbxlx_path, result.get("parts_written", 0),
                  result.get("scripts_written", 0))
 
-        # Produce binary .rbxl alongside XML .rbxlx (needed for Open Cloud Place API).
-        try:
-            from roblox.rbxl_binary_writer import xml_to_binary
-            rbxl_path = xml_to_binary(rbxlx_path)
-            log.info("[write_output] Binary .rbxl written: %s (%.1f KB)",
-                     rbxl_path, rbxl_path.stat().st_size / 1024)
-        except ImportError:
-            log.debug("[write_output] lz4 not installed, skipping binary .rbxl")
-        except Exception as exc:
-            log.warning("[write_output] Binary .rbxl conversion failed: %s", exc)
+        # Sibling .rbxl for the Open Cloud place endpoint (binary-only).
+        # Skipped if lz4 isn't installed, or if the caller asked to skip
+        # (e.g. interactive upload, which publishes via execute_luau).
+        if self.skip_binary_rbxl:
+            log.debug("[write_output] skip_binary_rbxl set; skipping binary .rbxl")
+        else:
+            try:
+                from roblox.rbxl_binary_writer import xml_to_binary
+                rbxl_path = xml_to_binary(rbxlx_path)
+                log.info("[write_output] Binary RBXL: %s (%.1f KB)",
+                         rbxl_path, rbxl_path.stat().st_size / 1024)
+            except ImportError:
+                log.debug("[write_output] lz4 not installed; skipping binary .rbxl")
+            except Exception as exc:
+                log.warning("[write_output] Binary .rbxl conversion failed: %s", exc)
 
         # Verify transform accuracy: compare Unity scene positions to rbxlx output.
         # Logs errors for any object with >10° rotation error or >2m position error.
@@ -1737,79 +1748,12 @@ script.Disabled = true
             rbxlx_path.write_text(raw_xml, encoding="utf-8")
             log.info("[write_output] Stripped %d invalid local texture paths from SurfaceAppearances", stripped)
 
-        # Write conversion report using the structured report_generator when
-        # available, falling back to the inline dict for compatibility.
-        import json as _json
-        script_types = {"Script": 0, "LocalScript": 0, "ModuleScript": 0}
-        for s in (self.state.rbx_place.scripts or []):
-            st = getattr(s, "script_type", "Script")
-            script_types[st] = script_types.get(st, 0) + 1
-
+        # Structured conversion report (see converter.report_generator).
+        # The interactive report() command decorates this file in place.
         report_path = self.output_dir / "conversion_report.json"
-        try:
-            from converter.report_generator import (
-                ConversionReport, AssetSummary, ScriptSummary,
-                MaterialSummary, ComponentSummary,
-                SceneSummary, OutputSummary, generate_report,
-            )
-            structured = ConversionReport(
-                unity_project_path=str(self.unity_project_path),
-                output_dir=str(self.output_dir),
-                success=len(self.ctx.errors) == 0,
-                errors=list(self.ctx.errors),
-                warnings=list(self.ctx.warnings),
-                assets=AssetSummary(
-                    total=len(self.ctx.uploaded_assets),
-                    by_kind={"upload_errors": len(self.ctx.asset_upload_errors)},
-                ),
-                scripts=ScriptSummary(
-                    total=self.ctx.transpiled_scripts,
-                    succeeded=self.ctx.transpiled_scripts,
-                    flagged_for_review=0,
-                ),
-                materials=MaterialSummary(
-                    total=self.ctx.total_materials,
-                    fully_converted=self.ctx.converted_materials,
-                ),
-                scene=SceneSummary(
-                    total_game_objects=self.ctx.total_game_objects,
-                ),
-                components=ComponentSummary(
-                    converted=self.ctx.converted_parts,
-                ),
-                output=OutputSummary(
-                    rbxl_path=str(rbxlx_path),
-                    parts_written=result.get("parts_written", 0),
-                    scripts_in_place=result.get("scripts_written", 0),
-                    report_path=str(report_path),
-                ),
-            )
-            generate_report(structured, report_path, print_summary=False)
-        except Exception:
-            # Fallback: inline dict for environments without report_generator
-            report = {
-                "project": str(self.unity_project_path),
-                "scene": self.ctx.selected_scene,
-                "output": str(self.output_dir),
-                "stats": {
-                    "game_objects": self.ctx.total_game_objects,
-                    "parts": self.ctx.converted_parts,
-                    "scripts": self.ctx.transpiled_scripts,
-                    "script_types": script_types,
-                    "materials": f"{self.ctx.converted_materials}/{self.ctx.total_materials}",
-                    "animations": self.ctx.converted_animations,
-                    "uploaded_assets": len(self.ctx.uploaded_assets),
-                    "upload_errors": len(self.ctx.asset_upload_errors),
-                    "terrains": len(self.state.rbx_place.terrains),
-                    "screen_guis": len(self.state.rbx_place.screen_guis),
-                    "streaming_enabled": self.ctx.converted_parts > 5000,
-                },
-                "elements": result,
-                "errors": self.ctx.errors,
-                "upload_errors": self.ctx.asset_upload_errors[:20],
-                "needs_resolution": len(self.ctx.uploaded_assets) > 0 and not self.ctx.mesh_native_sizes,
-            }
-            report_path.write_text(_json.dumps(report, indent=2), encoding="utf-8")
+        structured = self._build_conversion_report(rbxlx_path, result, report_path)
+        from converter.report_generator import generate_report
+        generate_report(structured, report_path, print_summary=False)
 
         # Persist context.
         self.ctx.save(self._context_path)
@@ -1818,6 +1762,129 @@ script.Disabled = true
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _build_conversion_report(
+        self, rbxlx_path: Path, result: dict, report_path: Path
+    ) -> Any:
+        """Assemble the structured ConversionReport for write_output."""
+        from converter.report_generator import (
+            ConversionReport, AssetSummary, ScriptSummary, MaterialSummary,
+            ComponentSummary, SceneSummary, OutputSummary,
+        )
+        script_types = {"Script": 0, "LocalScript": 0, "ModuleScript": 0}
+        for s in (self.state.rbx_place.scripts or []):
+            st = getattr(s, "script_type", "Script")
+            script_types[st] = script_types.get(st, 0) + 1
+
+        # Project-relative scene path per MERGE_PLAN Phase 3 item 7.
+        selected_scene = ""
+        if self.ctx.selected_scene:
+            p = Path(self.ctx.selected_scene)
+            if p.is_absolute():
+                try:
+                    selected_scene = str(p.relative_to(self.unity_project_path))
+                except ValueError:
+                    selected_scene = p.name
+            else:
+                selected_scene = str(p)
+
+        return ConversionReport(
+            unity_project_path=str(self.unity_project_path),
+            output_dir=str(self.output_dir),
+            success=len(self.ctx.errors) == 0,
+            errors=list(self.ctx.errors),
+            warnings=list(self.ctx.warnings),
+            assets=AssetSummary(
+                total=len(self.ctx.uploaded_assets),
+                by_kind={**script_types, "upload_errors": len(self.ctx.asset_upload_errors)},
+            ),
+            scripts=ScriptSummary(
+                total=self.ctx.transpiled_scripts,
+                succeeded=self.ctx.transpiled_scripts,
+            ),
+            materials=MaterialSummary(
+                total=self.ctx.total_materials,
+                fully_converted=self.ctx.converted_materials,
+            ),
+            scene=SceneSummary(
+                selected_scene=selected_scene,
+                total_game_objects=self.ctx.total_game_objects,
+            ),
+            components=ComponentSummary(converted=self.ctx.converted_parts),
+            output=OutputSummary(
+                rbxl_path=str(rbxlx_path),
+                parts_written=result.get("parts_written", 0),
+                scripts_in_place=result.get("scripts_written", 0),
+                report_path=str(report_path),
+            ),
+        )
+
+    def _rehydrate_scripts_from_disk(self, scripts_dir: Path) -> None:
+        """Populate rbx_place.scripts from disk for the preserved-scripts path.
+
+        Uses the previous run's conversion_plan.json for script_type and
+        parent_path; falls back to content heuristics for unclassified files.
+        """
+        from core.roblox_types import RbxScript
+
+        plan_lookup = self._load_storage_plan_for_rehydration()
+        luau_files = sorted(scripts_dir.rglob("*.luau"))
+        from_plan = 0
+        for luau_path in luau_files:
+            source = luau_path.read_text(encoding="utf-8")
+            name = luau_path.stem
+
+            if name in plan_lookup:
+                script_type, parent_path = plan_lookup[name]
+                from_plan += 1
+            else:
+                script_type = "Script"
+                parent_path = None
+                if source.rstrip().endswith("return " + name) or "\nreturn " in source:
+                    script_type = "ModuleScript"
+                elif "game.Players.LocalPlayer" in source or "UserInputService" in source:
+                    script_type = "LocalScript"
+
+            script = RbxScript(name=name, source=source, script_type=script_type)
+            if parent_path and hasattr(script, "parent_path"):
+                script.parent_path = parent_path
+            self.state.rbx_place.scripts.append(script)
+
+        log.info(
+            "[write_output] Rehydrated %d scripts from disk (%d via plan, %d via heuristic)",
+            len(luau_files), from_plan, len(luau_files) - from_plan,
+        )
+
+    def _load_storage_plan_for_rehydration(self) -> dict[str, tuple[str, str | None]]:
+        """Load conversion_plan.json into `name -> (script_type, parent_path)`.
+
+        Returns {} on missing or malformed plan.
+        """
+        plan_path = self.output_dir / "conversion_plan.json"
+        if not plan_path.exists():
+            return {}
+
+        import json as _json
+        try:
+            raw = _json.loads(plan_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            log.debug("[rehydrate] conversion_plan.json unreadable: %s", exc)
+            return {}
+
+        plan = raw.get("storage_plan") or {}
+        category_map = [
+            ("server_scripts",           "Script",       "ServerScriptService"),
+            ("client_scripts",           "LocalScript",  "StarterPlayer.StarterPlayerScripts"),
+            ("character_scripts",        "LocalScript",  "StarterPlayer.StarterCharacterScripts"),
+            ("replicated_first_scripts", "ModuleScript", "ReplicatedFirst"),
+            ("shared_modules",           "ModuleScript", "ReplicatedStorage"),
+            ("server_modules",           "ModuleScript", "ServerStorage"),
+        ]
+        lookup: dict[str, tuple[str, str | None]] = {}
+        for cat_key, script_type, parent_path in category_map:
+            for name in plan.get(cat_key, []) or []:
+                lookup[name] = (script_type, parent_path)
+        return lookup
 
     def _classify_storage(self) -> None:
         """Phase 4a.5: run the storage classifier on populated scripts.
@@ -1841,9 +1908,25 @@ script.Disabled = true
         )
         self.ctx.storage_plan = plan.to_dict()
 
+        # script_paths: name -> path relative to scripts_dir. Records the
+        # original subdir so rehydration can preserve directory identity
+        # (MERGE_PLAN Phase 3 item 12). Names with multiple paths keep the
+        # first — a name collision across subdirs is pre-existing.
+        script_paths: dict[str, str] = {}
+        scripts_dir = self.output_dir / "scripts"
+        if scripts_dir.is_dir():
+            for luau_path in sorted(scripts_dir.rglob("*.luau")):
+                stem = luau_path.stem
+                script_paths.setdefault(
+                    stem, str(luau_path.relative_to(scripts_dir)),
+                )
+
         plan_path = self.output_dir / "conversion_plan.json"
         plan_path.write_text(
-            _json.dumps({"storage_plan": self.ctx.storage_plan}, indent=2),
+            _json.dumps({
+                "storage_plan": self.ctx.storage_plan,
+                "script_paths": script_paths,
+            }, indent=2),
             encoding="utf-8",
         )
         log.info(

@@ -349,8 +349,12 @@ def upload_place(
         logger.error("Place file not found: %s", rbxlx_path)
         return False
 
-    # Detect binary .rbxl vs XML .rbxlx for correct Content-Type.
-    content_type = "application/octet-stream" if rbxlx_path.suffix == ".rbxl" else "application/xml"
+    # .rbxl is binary, .rbxlx is XML. suffix.lower() to handle .RBXL too.
+    content_type = (
+        "application/octet-stream"
+        if rbxlx_path.suffix.lower() == ".rbxl"
+        else "application/xml"
+    )
 
     url = _PLACE_VERSION_URL.format(universe_id=universe_id, place_id=place_id)
     params = {"versionType": "Published"}

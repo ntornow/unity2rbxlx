@@ -57,6 +57,7 @@ class ComponentSummary:
 
 @dataclass
 class SceneSummary:
+    selected_scene: str = ""  # project-relative Unity scene path
     scenes_parsed: int = 0
     total_game_objects: int = 0
     prefabs_parsed: int = 0
