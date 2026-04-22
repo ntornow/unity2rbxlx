@@ -818,8 +818,10 @@ def upload(output_dir: str, api_key: str | None,
         sys.exit(1)
 
     # Re-run the pipeline through convert_scene so we have rbx_place in memory
-    # for the place builder.
+    # for the place builder. Publish goes via execute_luau, so the binary
+    # .rbxl is not used — tell write_output to skip it (MERGE_PLAN item 6).
     pipeline = _make_pipeline(None, out)
+    pipeline.skip_binary_rbxl = True
     pipeline.ctx.universe_id = uid
     pipeline.ctx.place_id = pid
 

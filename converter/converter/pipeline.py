@@ -78,11 +78,16 @@ class Pipeline:
         unity_project_path: str | Path,
         output_dir: str | Path | None = None,
         skip_upload: bool = False,
+        skip_binary_rbxl: bool = False,
     ) -> None:
         self.unity_project_path = self._find_unity_root(Path(unity_project_path).resolve())
         self.output_dir = Path(output_dir or OUTPUT_DIR).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.skip_upload = skip_upload
+        # Skip the XML -> binary .rbxl conversion. Set True on the
+        # interactive `upload` rebuild, which publishes via execute_luau
+        # and never reads the .rbxl file. Per MERGE_PLAN Phase 3 item 6.
+        self.skip_binary_rbxl = skip_binary_rbxl
 
         self.ctx = ConversionContext(
             unity_project_path=str(self.unity_project_path),
@@ -1682,16 +1687,20 @@ script.Disabled = true
                  result.get("scripts_written", 0))
 
         # Sibling .rbxl for the Open Cloud place endpoint (binary-only).
-        # Skipped if lz4 isn't installed.
-        try:
-            from roblox.rbxl_binary_writer import xml_to_binary
-            rbxl_path = xml_to_binary(rbxlx_path)
-            log.info("[write_output] Binary RBXL: %s (%.1f KB)",
-                     rbxl_path, rbxl_path.stat().st_size / 1024)
-        except ImportError:
-            log.debug("[write_output] lz4 not installed; skipping binary .rbxl")
-        except Exception as exc:
-            log.warning("[write_output] Binary .rbxl conversion failed: %s", exc)
+        # Skipped if lz4 isn't installed, or if the caller asked to skip
+        # (e.g. interactive upload, which publishes via execute_luau).
+        if self.skip_binary_rbxl:
+            log.debug("[write_output] skip_binary_rbxl set; skipping binary .rbxl")
+        else:
+            try:
+                from roblox.rbxl_binary_writer import xml_to_binary
+                rbxl_path = xml_to_binary(rbxlx_path)
+                log.info("[write_output] Binary RBXL: %s (%.1f KB)",
+                         rbxl_path, rbxl_path.stat().st_size / 1024)
+            except ImportError:
+                log.debug("[write_output] lz4 not installed; skipping binary .rbxl")
+            except Exception as exc:
+                log.warning("[write_output] Binary .rbxl conversion failed: %s", exc)
 
         # Verify transform accuracy: compare Unity scene positions to rbxlx output.
         # Logs errors for any object with >10° rotation error or >2m position error.
@@ -1766,6 +1775,19 @@ script.Disabled = true
         for s in (self.state.rbx_place.scripts or []):
             st = getattr(s, "script_type", "Script")
             script_types[st] = script_types.get(st, 0) + 1
+
+        # Project-relative scene path per MERGE_PLAN Phase 3 item 7.
+        selected_scene = ""
+        if self.ctx.selected_scene:
+            p = Path(self.ctx.selected_scene)
+            if p.is_absolute():
+                try:
+                    selected_scene = str(p.relative_to(self.unity_project_path))
+                except ValueError:
+                    selected_scene = p.name
+            else:
+                selected_scene = str(p)
+
         return ConversionReport(
             unity_project_path=str(self.unity_project_path),
             output_dir=str(self.output_dir),
@@ -1784,7 +1806,10 @@ script.Disabled = true
                 total=self.ctx.total_materials,
                 fully_converted=self.ctx.converted_materials,
             ),
-            scene=SceneSummary(total_game_objects=self.ctx.total_game_objects),
+            scene=SceneSummary(
+                selected_scene=selected_scene,
+                total_game_objects=self.ctx.total_game_objects,
+            ),
             components=ComponentSummary(converted=self.ctx.converted_parts),
             output=OutputSummary(
                 rbxl_path=str(rbxlx_path),
@@ -1883,9 +1908,25 @@ script.Disabled = true
         )
         self.ctx.storage_plan = plan.to_dict()
 
+        # script_paths: name -> path relative to scripts_dir. Records the
+        # original subdir so rehydration can preserve directory identity
+        # (MERGE_PLAN Phase 3 item 12). Names with multiple paths keep the
+        # first — a name collision across subdirs is pre-existing.
+        script_paths: dict[str, str] = {}
+        scripts_dir = self.output_dir / "scripts"
+        if scripts_dir.is_dir():
+            for luau_path in sorted(scripts_dir.rglob("*.luau")):
+                stem = luau_path.stem
+                script_paths.setdefault(
+                    stem, str(luau_path.relative_to(scripts_dir)),
+                )
+
         plan_path = self.output_dir / "conversion_plan.json"
         plan_path.write_text(
-            _json.dumps({"storage_plan": self.ctx.storage_plan}, indent=2),
+            _json.dumps({
+                "storage_plan": self.ctx.storage_plan,
+                "script_paths": script_paths,
+            }, indent=2),
             encoding="utf-8",
         )
         log.info(
