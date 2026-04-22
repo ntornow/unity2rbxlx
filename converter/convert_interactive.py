@@ -142,6 +142,7 @@ def _make_pipeline(
     output_dir: str | Path,
     *,
     skip_upload: bool = False,
+    skip_binary_rbxl: bool = False,
 ) -> Pipeline:
     """Build a Pipeline and rehydrate ctx from disk if a previous run exists.
 
@@ -170,6 +171,7 @@ def _make_pipeline(
         unity_project_path=unity_project_path,
         output_dir=out,
         skip_upload=skip_upload,
+        skip_binary_rbxl=skip_binary_rbxl,
     )
     if ctx_path.exists():
         prior_ctx = ConversionContext.load(ctx_path)
@@ -817,11 +819,10 @@ def upload(output_dir: str, api_key: str | None,
         })
         sys.exit(1)
 
-    # Re-run the pipeline through convert_scene so we have rbx_place in memory
-    # for the place builder. Publish goes via execute_luau, so the binary
-    # .rbxl is not used — tell write_output to skip it (MERGE_PLAN item 6).
-    pipeline = _make_pipeline(None, out)
-    pipeline.skip_binary_rbxl = True
+    # Re-run the pipeline through convert_scene so we have rbx_place in
+    # memory for the place builder. Publish goes via execute_luau, so the
+    # binary .rbxl is never read.
+    pipeline = _make_pipeline(None, out, skip_binary_rbxl=True)
     pipeline.ctx.universe_id = uid
     pipeline.ctx.place_id = pid
 
