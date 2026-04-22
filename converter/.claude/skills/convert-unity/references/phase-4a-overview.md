@@ -1,6 +1,6 @@
 # Phase 4a: Plan — Overview
 
-> **Last verified:** 2026-04-16. Cross-check `luau_validator.py` and `api_mappings.py` before acting on prescriptions.
+> **Last verified:** 2026-04-16. Cross-check `api_mappings.py` and `code_transpiler.py` before acting on prescriptions.
 
 Read the Unity project, emit `conversion_plan.json`. Phase 4b consumes it. Phase 4c handles only what needs emitted Luau to exist.
 

@@ -1,6 +1,6 @@
 # Phase 4c.3: Residual Transpiler Gaps
 
-> **Last verified:** 2026-04-16. Cross-check `luau_validator.py` and `api_mappings.py` before acting on prescriptions.
+> **Last verified:** 2026-04-16. Cross-check `api_mappings.py` and `code_transpiler.py` before acting on prescriptions.
 
 Symptom-indexed debugging for transpiler misses that 4b upfront rules didn't cover. Read only when the validator flags an issue or the converted game has a matching visible bug.
 

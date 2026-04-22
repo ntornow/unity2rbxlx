@@ -1,6 +1,6 @@
 # Phase 4a.3: Runtime Plan (Animation + Templates + Movement)
 
-> **Last verified:** 2026-04-16. Cross-check `luau_validator.py` and `api_mappings.py` before acting on prescriptions.
+> **Last verified:** 2026-04-16. Cross-check `api_mappings.py` and `code_transpiler.py` before acting on prescriptions.
 
 Plan animations and runtime spawning from the Unity side. Outputs feed transpile (4b), storage classification (4a.5), and spawner/animator emit in 4c.
 
