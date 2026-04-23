@@ -194,7 +194,6 @@ python u2r.py convert ../test_projects/SimpleFPS -o ./output/SimpleFPS --api-key
 - PSD/TGA/BMP/TIF texture files are auto-converted to PNG for upload (requires PIL/Pillow)
 - Animations are converted to TweenService scripts — works for property animations, skeletal uses Motor6D chain
 - Terrain uses SmoothGrid binary encoding (reverse-engineered format, needs Studio verification) with FillBlock script fallback
-- Binary Unity scenes (.unity) require UnityPy for parsing; text YAML scenes are natively supported
 - Uploaded textures return Decal IDs which must be resolved to Image IDs via Studio MCP
 - Uploaded meshes return Model IDs which must be resolved to real MeshIds via Studio MCP
 - Git LFS pointer files are detected and skipped (actual FBX data needs LFS pull)
@@ -241,7 +240,7 @@ After uploading, run these steps via Studio MCP `execute_luau`:
 ## Supported Features
 
 ### Scene & Asset Parsing
-- Text YAML scene parsing (binary requires UnityPy)
+- Text YAML + binary scene parsing (binary scenes + terrain `.asset` files parsed via UnityPy)
 - Both Standard and URP (Universal Render Pipeline) Lit shaders
 - Both old (data:/first:/second:) and new (list-of-dicts) Unity YAML formats
 - Prefab instance hierarchy with world-space transform composition

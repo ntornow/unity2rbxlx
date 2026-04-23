@@ -177,7 +177,6 @@ test_projects/                    # Git submodules of sample Unity projects
 
 ## Limitations
 
-- Binary Unity scenes require UnityPy for parsing; text YAML scenes are natively supported
 - Skeletal/bone animations are not yet supported (property animations work via TweenService)
 - Custom shaders are approximated with Roblox materials
 - Git LFS pointer files are detected and skipped (run `git lfs pull` first)
