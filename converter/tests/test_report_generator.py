@@ -16,6 +16,7 @@ from converter.report_generator import (
     OutputSummary,
     SceneSummary,
     ScriptSummary,
+    augment_report,
     generate_report,
 )
 
@@ -139,6 +140,62 @@ class TestReportSummaryPrinting:
         out = tmp_path / "sub" / "dir" / "report.json"
         generate_report(report, out, print_summary=False)
         assert out.exists()
+
+
+class TestAugmentReport:
+    """augment_report centralises the 'read existing report.json and merge
+    skill-only fields' flow that convert_interactive.report used to do
+    inline. Routing through one helper keeps the two reporting paths from
+    drifting and localises the malformed-JSON handling.
+    """
+
+    def test_merges_extras_into_existing_report(self, tmp_path):
+        report = _make_report()
+        path = tmp_path / "report.json"
+        generate_report(report, path, print_summary=False)
+
+        merged = augment_report(path, {
+            "completed_skill_phases": ["discover", "inventory"],
+            "universe_id": 12345,
+        })
+
+        assert merged["completed_skill_phases"] == ["discover", "inventory"]
+        assert merged["universe_id"] == 12345
+        # Existing fields from generate_report survive.
+        assert merged["unity_project_path"] == "/fake/project"
+        assert merged["assets"]["total"] == 50
+
+        # Disk write reflects the merge.
+        on_disk = json.loads(path.read_text(encoding="utf-8"))
+        assert on_disk["universe_id"] == 12345
+        assert on_disk["unity_project_path"] == "/fake/project"
+
+    def test_missing_file_starts_from_empty(self, tmp_path):
+        path = tmp_path / "nope.json"
+        merged = augment_report(path, {"foo": "bar"})
+
+        assert merged == {"foo": "bar"}
+        assert json.loads(path.read_text(encoding="utf-8")) == {"foo": "bar"}
+
+    def test_malformed_file_warns_and_starts_from_empty(self, tmp_path, capsys):
+        path = tmp_path / "report.json"
+        path.write_text("not valid json {{{")
+
+        merged = augment_report(path, {"after": "ok"})
+
+        captured = capsys.readouterr()
+        assert "could not parse" in captured.err
+        assert merged == {"after": "ok"}
+        assert json.loads(path.read_text(encoding="utf-8")) == {"after": "ok"}
+
+    def test_extras_override_existing_fields(self, tmp_path):
+        path = tmp_path / "report.json"
+        path.write_text(json.dumps({"status": "old", "keep": "me"}))
+
+        merged = augment_report(path, {"status": "new"})
+
+        assert merged["status"] == "new"  # override
+        assert merged["keep"] == "me"  # preserved
 
 
 class TestPipelineIntegration:

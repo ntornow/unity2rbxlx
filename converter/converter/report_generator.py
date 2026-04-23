@@ -172,3 +172,42 @@ def generate_report(
         print("\n".join(lines))
 
     return output_path
+
+
+def augment_report(report_path: Path, extras: dict[str, Any]) -> dict[str, Any]:
+    """Merge skill-specific fields into an existing conversion_report.json.
+
+    pipeline.write_output serializes a ConversionReport dataclass via
+    generate_report. The interactive /convert-unity skill then needs to
+    decorate that report with skill-only state (completed_skill_phases,
+    universe_id, rbxlx_size_mb, etc) without reopening the dataclass
+    schema. This helper reads, merges, writes, and returns the merged
+    dict — one path, one broad-catch, one stderr warning. Callers must
+    not duplicate the json.loads/update/dumps dance.
+
+    Missing or malformed reports start from an empty dict so the skill
+    path still produces a report the user can inspect; the underlying
+    parse error is surfaced on stderr.
+    """
+    import sys
+
+    report_path = Path(report_path)
+    report_data: dict[str, Any] = {}
+    if report_path.exists():
+        try:
+            report_data = json.loads(report_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            print(
+                f"warning: could not parse existing {report_path.name} ({exc}); "
+                f"regenerating from scratch.",
+                file=sys.stderr,
+            )
+
+    report_data.update(extras)
+
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        json.dumps(report_data, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
+    return report_data
