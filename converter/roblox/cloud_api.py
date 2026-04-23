@@ -28,7 +28,9 @@ _PLACE_VERSION_URL = (
     "https://apis.roblox.com/universes/v2/universes/{universe_id}"
     "/places/{place_id}/versions"
 )
-_CREATE_EXPERIENCE_URL = "https://apis.roblox.com/universes/v1/universes/create"
+# The legacy universes/v1/universes/create endpoint requires cookie + XSRF
+# auth and is not reachable with an Open Cloud API key. Open Cloud v2 does not
+# expose universe creation. See create_experience() below.
 _LUAU_EXECUTION_URL = (
     "https://apis.roblox.com/cloud/v2/universes/{universe_id}"
     "/places/{place_id}/luau-execution-session-tasks"
@@ -402,58 +404,25 @@ def upload_place(
 
 
 def create_experience(
-    api_key: str,
-    name: str,
-    description: str = "",
+    api_key: str,  # noqa: ARG001 — kept for API compatibility with existing callers
+    name: str,  # noqa: ARG001
+    description: str = "",  # noqa: ARG001
 ) -> tuple[int, int] | None:
-    """Create a new Roblox experience (universe + start place).
+    """Universe creation is not supported by Open Cloud with API-key auth.
 
-    Returns ``(universe_id, place_id)`` on success, or ``None`` on failure.
+    Always returns ``None``. Callers must supply a pre-created universe+place
+    (via ``--universe-id`` / ``--place-id`` or the cached ``.roblox_ids.json``).
+
+    The legacy endpoint ``https://apis.roblox.com/universes/v1/universes/create``
+    is internal and requires a ``ROBLOSECURITY`` cookie + XSRF token, not an
+    Open Cloud API key. Roblox has stated intent to add API-key support but
+    no timeline. Open Cloud v2 has no ``POST /universes`` endpoint at all.
     """
-    payload = {
-        "templatePlaceId": 0,
-        "name": name,
-        "description": description,
-    }
-
-    def _do_create() -> requests.Response:
-        resp = requests.post(
-            _CREATE_EXPERIENCE_URL,
-            headers={
-                **_auth_headers(api_key),
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=_DEFAULT_TIMEOUT,
-        )
-        return resp
-
-    try:
-        response = exponential_backoff_retry(
-            _do_create,
-            max_retries=3,
-            retry_on=lambda r: r.status_code in (429, 500, 502, 503),
-        )
-    except Exception:
-        logger.exception("Failed to create experience after retries")
-        return None
-
-    _handle_rate_limit(response)
-
-    if response.status_code in (200, 201):
-        data = response.json()
-        universe_id = data.get("universeId") or data.get("id")
-        place_id = data.get("rootPlaceId") or data.get("startPlaceId")
-        if universe_id and place_id:
-            logger.info("Created experience universe=%s place=%s", universe_id, place_id)
-            return (int(universe_id), int(place_id))
-        logger.warning("Experience created but missing IDs: %s", data)
-        return None
-
-    logger.error(
-        "Experience creation failed (%d): %s",
-        response.status_code,
-        response.text[:500],
+    logger.warning(
+        "create_experience: universe creation is not supported via Open Cloud "
+        "API key. Create a place at https://create.roblox.com/dashboard/creations "
+        "and pass --universe-id / --place-id (or let pipeline.resolve_assets "
+        "recover them from .roblox_ids.json)."
     )
     return None
 

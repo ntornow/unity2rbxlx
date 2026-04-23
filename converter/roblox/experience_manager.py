@@ -11,7 +11,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from converter.roblox.cloud_api import (
+from roblox.cloud_api import (
     create_experience,
     upload_image,
     upload_mesh,
@@ -49,32 +49,31 @@ def _classify_asset(path: Path) -> str | None:
 def get_or_create_experience(
     api_key: str,
     name: str,
-    creator_id: str,
+    creator_id: str,  # noqa: ARG001 — kept for API compatibility
 ) -> tuple[int, int]:
-    """Return ``(universe_id, place_id)`` for an experience.
+    """Return ``(universe_id, place_id)``; universe creation is unsupported.
 
-    Attempts to create a new experience. If creation fails, raises
-    ``RuntimeError``.
+    Open Cloud does not expose universe creation via API-key auth, so this
+    helper always raises ``RuntimeError`` with actionable guidance. Callers
+    must obtain a ``(universe_id, place_id)`` pair externally (Creator Hub
+    or ``convert --universe-id X --place-id Y``).
 
     Parameters
     ----------
     api_key:
         Roblox Open Cloud API key with appropriate scopes.
     name:
-        Display name for the experience.
+        Display name for the experience (unused; kept for API compatibility).
     creator_id:
-        Roblox user or group ID that owns the experience.
-
-    Returns
-    -------
-    tuple[int, int]
-        ``(universe_id, place_id)``
+        Roblox user or group ID that would own the experience (unused).
     """
     result = create_experience(api_key, name=name, description=f"Auto-created experience: {name}")
     if result is None:
         raise RuntimeError(
-            f"Failed to create Roblox experience '{name}'. "
-            "Check your API key permissions and creator_id."
+            f"Cannot auto-create Roblox experience '{name}': Open Cloud does "
+            "not support universe creation with API-key auth. Create a place "
+            "at https://create.roblox.com/dashboard/creations, then pass its "
+            "universe_id and place_id explicitly."
         )
     universe_id, place_id = result
     logger.info(
