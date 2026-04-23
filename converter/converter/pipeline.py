@@ -357,7 +357,13 @@ class Pipeline:
                     so_result.converted,
                 )
         except Exception as exc:
-            log.debug("[extract_assets] ScriptableObject conversion skipped: %s", exc)
+            # Keep a broad except so a third-party parser bug doesn't torch
+            # the whole pipeline — but emit at WARNING level (not debug) and
+            # record to ctx.warnings so users see that some .asset files
+            # didn't become ModuleScripts. Default log level hides debug.
+            msg = f"ScriptableObject conversion failed: {exc}"
+            log.warning("[extract_assets] %s", msg)
+            self.ctx.warnings.append(f"[extract_assets] {msg}")
 
         # Slice spritesheet textures into <output>/sprites/; expose the
         # GUID -> file map on ctx for SpriteRenderer consumers.
@@ -378,7 +384,12 @@ class Pipeline:
                 for w in sprite_result.warnings:
                     log.warning("[extract_assets] Sprite: %s", w)
             except Exception as exc:
-                log.debug("[extract_assets] Sprite extraction skipped: %s", exc)
+                # Same rationale as above: broad except to isolate third-party
+                # failures, but visible WARNING and persisted to ctx so the
+                # missing sprites surface in the final report.
+                msg = f"Sprite extraction failed: {exc}"
+                log.warning("[extract_assets] %s", msg)
+                self.ctx.warnings.append(f"[extract_assets] {msg}")
 
         # Pre-compute FBX bounding boxes via trimesh for InitialSize fallback.
         # This runs only when mesh_native_sizes (from Studio resolution) are

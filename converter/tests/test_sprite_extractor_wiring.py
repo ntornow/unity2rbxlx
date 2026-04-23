@@ -61,7 +61,12 @@ def test_extract_assets_skips_without_guid_index(tmp_path):
     assert pipeline.state.sprite_result is None
 
 
-def test_extract_assets_swallows_failure(tmp_path):
+def test_extract_assets_surfaces_sprite_failure_as_warning(tmp_path):
+    """Sprite extractor failures must not crash the pipeline (a broken
+    spritesheet shouldn't take the whole conversion down), but the failure
+    MUST be visible: a WARNING log and a ctx.warnings entry so the final
+    report surfaces it. Silent swallow would hide a real bug.
+    """
     pipeline = _make_pipeline(tmp_path)
     pipeline.state.guid_index = MagicMock()
 
@@ -70,4 +75,38 @@ def test_extract_assets_swallows_failure(tmp_path):
          patch.object(pipeline, "_compute_fbx_bounding_boxes"):
         pipeline.extract_assets()
 
+    # Pipeline didn't crash, sprite result still None (nothing to work with).
     assert pipeline.state.sprite_result is None
+    # The failure must have been recorded to ctx.warnings, not silently swallowed.
+    assert any(
+        "Sprite extraction failed" in w and "boom" in w
+        for w in pipeline.ctx.warnings
+    ), f"sprite failure not surfaced in ctx.warnings: {pipeline.ctx.warnings}"
+
+
+def test_extract_assets_surfaces_scriptable_object_failure_as_warning(tmp_path):
+    """Same contract for the ScriptableObject converter: failure is
+    survivable but must be visible in ctx.warnings for the report.
+    """
+    pipeline = _make_pipeline(tmp_path)
+    pipeline.state.guid_index = MagicMock()
+
+    with patch(
+        "unity.asset_extractor.extract_assets", return_value=_fake_manifest(),
+    ), patch(
+        "converter.scriptable_object_converter.convert_asset_files",
+        side_effect=RuntimeError("asset parse failed"),
+    ), patch(
+        "converter.sprite_extractor.extract_sprites",
+        return_value=_fake_sprite_result(0),
+    ), patch.object(pipeline, "_compute_fbx_bounding_boxes"):
+        pipeline.extract_assets()
+
+    assert pipeline.state.scriptable_objects is None
+    assert any(
+        "ScriptableObject conversion failed" in w and "asset parse failed" in w
+        for w in pipeline.ctx.warnings
+    ), (
+        "scriptable object failure not surfaced in ctx.warnings: "
+        f"{pipeline.ctx.warnings}"
+    )
