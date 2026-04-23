@@ -1037,15 +1037,20 @@ def report(output_dir: str) -> None:
     )
 
     # Augment the structured report written by pipeline.write_output with
-    # skill-only fields, without clobbering its shape.
+    # skill-only fields, without clobbering its shape. A malformed report
+    # from an earlier run shouldn't be silently discarded — log it so the
+    # user knows their report file got stomped.
     report_path = out / "conversion_report.json"
+    report_data: dict = {}
     if report_path.exists():
         try:
             report_data = json.loads(report_path.read_text(encoding="utf-8"))
-        except Exception:
-            report_data = {}
-    else:
-        report_data = {}
+        except (json.JSONDecodeError, OSError) as exc:
+            click.echo(
+                f"warning: could not parse existing {report_path.name} ({exc}); "
+                f"regenerating from scratch.",
+                err=True,
+            )
 
     report_data.update({
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
