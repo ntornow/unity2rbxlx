@@ -90,6 +90,36 @@ STATE_FILENAME = ".convert_state.json"
 MAX_EXECUTE_LUAU_BYTES = 4_000_000
 
 
+def _resolve_credential(
+    cli_value: str | None,
+    env_var: str,
+    filename: str,
+    project_path: Path,
+) -> str | None:
+    """Resolve a Roblox Open Cloud credential: CLI arg, env var, then file.
+
+    Duplicates u2r._resolve_credential to avoid importing u2r's click app
+    (which registers side-effecting command decorators at import time).
+    If a shared utils module is added later, both callers should move to it.
+    """
+    import os
+
+    if cli_value:
+        p = Path(cli_value)
+        return p.read_text().strip() if p.is_file() else cli_value.strip()
+
+    val = os.environ.get(env_var, "")
+    if val:
+        return val.strip()
+
+    for search_dir in [project_path.parent, project_path.parent.parent, Path.cwd()]:
+        fp = search_dir / filename
+        if fp.exists():
+            return fp.read_text().strip()
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Helpers — state, context, JSON emission
 # ---------------------------------------------------------------------------
@@ -708,15 +738,35 @@ def assemble(unity_project_path: str, output_dir: str,
              no_upload: bool, no_resolve: bool, retranspile: bool,
              api_key: str | None, creator_id: str | None) -> None:
     """Phase 4: upload assets, resolve, convert animations + scene, write .rbxlx."""
-    if api_key:
-        ak = Path(api_key)
-        config.ROBLOX_API_KEY = (
-            ak.read_text().strip() if ak.is_file() else api_key.strip()
-        )
-    if creator_id:
-        cid = Path(creator_id)
-        raw = cid.read_text().strip() if cid.is_file() else creator_id.strip()
-        config.ROBLOX_CREATOR_ID = int(raw)
+    # Resolve credentials from CLI -> env -> file (same precedence as u2r.py)
+    # so users get the documented auto-discovery behavior. Without this,
+    # assemble without --api-key silently ran with an empty config, every
+    # upload_assets call no-opped, and the final payload reported
+    # success=True with zero uploads.
+    project_path = Path(unity_project_path).resolve()
+    resolved_key = _resolve_credential(api_key, "ROBLOX_API_KEY", "apikey", project_path)
+    if resolved_key:
+        config.ROBLOX_API_KEY = resolved_key
+    resolved_cid = _resolve_credential(
+        creator_id, "ROBLOX_CREATOR_ID", "creator_id", project_path,
+    )
+    if resolved_cid:
+        config.ROBLOX_CREATOR_ID = int(resolved_cid)
+
+    # Fail fast when uploads are intended but creds can't be found. Running
+    # the whole pipeline just to emit a meaningless success=True with zero
+    # uploads wastes the user's time and hides the real problem.
+    if not no_upload and (
+        not config.ROBLOX_API_KEY or config.ROBLOX_CREATOR_ID is None
+    ):
+        _emit({"phase": "assemble", "success": False, "errors": [
+            "Roblox Open Cloud credentials not found. Pass --api-key and "
+            "--creator-id, set ROBLOX_API_KEY and ROBLOX_CREATOR_ID env "
+            "vars, place 'apikey' and 'creator_id' files in the Unity "
+            "project parent or current working directory, or pass "
+            "--no-upload to skip asset upload."
+        ]})
+        sys.exit(1)
 
     pipeline = _make_pipeline(unity_project_path, output_dir, skip_upload=no_upload)
     pipeline._retranspile = retranspile
@@ -729,7 +779,8 @@ def assemble(unity_project_path: str, output_dir: str,
     )
     try:
         for phase in [
-            "parse", "extract_assets", "upload_assets", "resolve_assets",
+            "parse", "extract_assets", "moderate_assets",
+            "upload_assets", "resolve_assets",
             "convert_materials", "transpile_scripts", "convert_animations",
             "convert_scene", "write_output",
         ]:

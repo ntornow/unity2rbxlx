@@ -438,6 +438,125 @@ class TestStatus:
 
 
 # ---------------------------------------------------------------------------
+# assemble — workflow fidelity guards (P1-4 from 2026-04-24 Codex review)
+# ---------------------------------------------------------------------------
+
+
+class TestAssembleWorkflowFidelity:
+    """Regressions on the documented assemble workflow:
+    phase-5-assembly.md lists moderate_assets before upload_assets, and
+    upload_assets is supposed to be a no-op only when the user explicitly
+    opts out via --no-upload. Before the P1-4 fix, moderate_assets was
+    missing from the hand-rolled phase list and missing creds silently
+    skipped uploads while still reporting success=True.
+    """
+
+    def test_phase_list_includes_moderate_assets_before_upload(self):
+        """Read the assemble command's source and assert moderate_assets
+        sits between extract_assets and upload_assets. (The live pipeline
+        run would also catch this via Pipeline.moderate_assets side effects,
+        but that requires a full project fixture — this source-level check
+        catches ordering regressions without the heavy lift.)
+        """
+        import inspect
+
+        import convert_interactive
+
+        # convert_interactive.assemble is a Click command; the underlying
+        # function lives on .callback.
+        src = inspect.getsource(convert_interactive.assemble.callback)
+        phase_list_start = src.index('for phase in [')
+        phase_list_end = src.index(']', phase_list_start)
+        phase_list_src = src[phase_list_start:phase_list_end]
+        # Check order by scanning for the three phase names.
+        for name in ("extract_assets", "moderate_assets", "upload_assets"):
+            assert f'"{name}"' in phase_list_src, (
+                f"{name} missing from assemble's phase list"
+            )
+        assert (
+            phase_list_src.index('"extract_assets"')
+            < phase_list_src.index('"moderate_assets"')
+            < phase_list_src.index('"upload_assets"')
+        ), "moderate_assets must run between extract_assets and upload_assets"
+
+    def test_missing_creds_without_no_upload_fails_fast(self, tmp_path, monkeypatch):
+        """When the user invokes assemble without --no-upload and without
+        credentials (CLI / env / file), the command must fail fast before
+        running any pipeline phases, not silently skip uploads.
+        """
+        import config as _config
+        monkeypatch.setattr(_config, "ROBLOX_API_KEY", "")
+        monkeypatch.setattr(_config, "ROBLOX_CREATOR_ID", None)
+        monkeypatch.delenv("ROBLOX_API_KEY", raising=False)
+        monkeypatch.delenv("ROBLOX_CREATOR_ID", raising=False)
+
+        unity = tmp_path / "FakeProject"
+        (unity / "Assets").mkdir(parents=True)
+        out = tmp_path / "out"
+        out.mkdir()
+
+        # Seed a conversion_context so _make_pipeline would otherwise succeed —
+        # we want to prove the cred check fires first.
+        ctx = ConversionContext(unity_project_path=str(unity.resolve()))
+        ctx.save(out / "conversion_context.json")
+
+        # Monkeypatch _make_pipeline so a pass-through would crash loudly and
+        # give us a distinct signal — if we get here the fast-fail didn't fire.
+        import convert_interactive
+        def _guarded_make_pipeline(*args, **kwargs):
+            raise AssertionError("pipeline built before cred check ran")
+        monkeypatch.setattr(convert_interactive, "_make_pipeline", _guarded_make_pipeline)
+
+        runner = CliRunner()
+        _, payload = _invoke_json(runner, ["assemble", str(unity), str(out)])
+
+        assert payload["phase"] == "assemble"
+        assert payload["success"] is False
+        assert any(
+            "credentials" in e.lower() or "--api-key" in e
+            for e in payload.get("errors", [])
+        ), f"unexpected errors: {payload.get('errors')}"
+
+    def test_no_upload_flag_skips_cred_check(self, tmp_path, monkeypatch):
+        """--no-upload is the explicit opt-out: assemble must proceed even
+        without credentials. We stub _make_pipeline to a no-op pipeline so
+        the test doesn't need a real Unity project, and assert assemble
+        makes it past the cred check.
+        """
+        import config as _config
+        monkeypatch.setattr(_config, "ROBLOX_API_KEY", "")
+        monkeypatch.setattr(_config, "ROBLOX_CREATOR_ID", None)
+        monkeypatch.delenv("ROBLOX_API_KEY", raising=False)
+        monkeypatch.delenv("ROBLOX_CREATOR_ID", raising=False)
+
+        unity = tmp_path / "FakeProject"
+        (unity / "Assets").mkdir(parents=True)
+        out = tmp_path / "out"
+        out.mkdir()
+        ctx = ConversionContext(unity_project_path=str(unity.resolve()))
+        ctx.save(out / "conversion_context.json")
+
+        import convert_interactive
+        # If we reach _make_pipeline, the cred check correctly skipped.
+        # Raise a sentinel error so we know we got past it — and so the test
+        # doesn't try to run a real pipeline.
+        class _ReachedPipeline(Exception):
+            pass
+        def _sentinel(*args, **kwargs):
+            raise _ReachedPipeline
+        monkeypatch.setattr(convert_interactive, "_make_pipeline", _sentinel)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli, ["assemble", str(unity), str(out), "--no-upload"],
+            catch_exceptions=True,
+        )
+        assert isinstance(result.exception, _ReachedPipeline), (
+            f"cred check fired under --no-upload; output: {result.output}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # validate — runs against already-transpiled .lua/.luau files on disk
 # ---------------------------------------------------------------------------
 
