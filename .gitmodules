@@ -1,0 +1,3 @@
+[submodule "test_projects/SimpleFPS"]
+	path = test_projects/SimpleFPS
+	url = https://github.com/joaobside/unity-3d-simplefps.git
