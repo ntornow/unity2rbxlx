@@ -52,27 +52,50 @@ def test_extract_assets_populates_scriptable_objects_state(tmp_path):
     assert not (output / "scripts" / "scriptable_objects").exists()
 
 
-def test_write_output_attaches_scriptable_objects_as_module_scripts():
-    """Attach loop appends a ModuleScript per asset and dedupes by name."""
+def test_write_output_attaches_scriptable_objects_as_module_scripts(tmp_path):
+    """write_output must append one ModuleScript per ScriptableObject asset
+    (deduped by name) and set source_path so in-memory edits round-trip back
+    to scripts/scriptable_objects/ on the next run.
+
+    This test drives the real pipeline.write_output so a regression in the
+    attach block is caught — not a reproduction of the logic.
+    """
+    from converter.pipeline import Pipeline
     from core.roblox_types import RbxPlace, RbxScript
 
-    place = RbxPlace()
-    place.scripts = [RbxScript(name="Existing", source="", script_type="Script")]
-    so = _fake_so_result(["Inventory", "Existing"])
+    project = tmp_path / "proj"
+    (project / "Assets").mkdir(parents=True)
+    output = tmp_path / "out"
 
-    existing = {s.name for s in place.scripts}
-    for asset in so.assets:
-        if asset.asset_name in existing:
-            continue
-        place.scripts.append(RbxScript(
-            name=asset.asset_name,
-            source=asset.luau_source,
-            script_type="ModuleScript",
-        ))
+    pipeline = Pipeline(
+        unity_project_path=project, output_dir=output, skip_upload=True,
+    )
+    pipeline.state.rbx_place = RbxPlace()
+    pipeline.state.rbx_place.scripts = [
+        RbxScript(name="Existing", source="", script_type="Script"),
+    ]
+    pipeline.state.scriptable_objects = _fake_so_result(["Inventory", "Existing"])
+    # Mark transpile_scripts completed so write_output takes the
+    # preserve-vs-fresh branch relevant to this test. We want the
+    # fresh-write attach path (scriptable_objects state populated) — set
+    # it up so write_output falls into the fresh branch.
+    pipeline.ctx.completed_phases.append("transpile_scripts")
+    pipeline._retranspile = True  # forces fresh branch (not preserve)
 
-    names = [s.name for s in place.scripts]
-    assert names == ["Existing", "Inventory"]
-    assert next(s for s in place.scripts if s.name == "Inventory").script_type == "ModuleScript"
+    pipeline.write_output()
+
+    names = [s.name for s in pipeline.state.rbx_place.scripts]
+    assert "Inventory" in names
+    assert names.count("Existing") == 1, "Existing should not be duplicated"
+
+    inventory = next(
+        s for s in pipeline.state.rbx_place.scripts if s.name == "Inventory"
+    )
+    assert inventory.script_type == "ModuleScript"
+    assert inventory.source_path == "scriptable_objects/Inventory.luau", (
+        "ScriptableObject RbxScript must record source_path so the final "
+        "rewrite loop lands in-memory edits back in the correct subdir."
+    )
 
 
 def test_scriptable_objects_survive_fresh_transpile_rmtree(tmp_path):

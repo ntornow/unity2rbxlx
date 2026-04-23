@@ -1037,22 +1037,13 @@ def report(output_dir: str) -> None:
     )
 
     # Augment the structured report written by pipeline.write_output with
-    # skill-only fields, without clobbering its shape. A malformed report
-    # from an earlier run shouldn't be silently discarded — log it so the
-    # user knows their report file got stomped.
-    report_path = out / "conversion_report.json"
-    report_data: dict = {}
-    if report_path.exists():
-        try:
-            report_data = json.loads(report_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
-            click.echo(
-                f"warning: could not parse existing {report_path.name} ({exc}); "
-                f"regenerating from scratch.",
-                err=True,
-            )
+    # skill-only fields. Routed through report_generator.augment_report so
+    # there's one reporting path — no parallel json.loads/update/dumps dance
+    # that could drift from the pipeline's schema.
+    from converter.report_generator import augment_report
 
-    report_data.update({
+    report_path = out / "conversion_report.json"
+    report_data = augment_report(report_path, {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "unity_project_path": ctx.unity_project_path,
         "output_dir": str(out),
@@ -1069,9 +1060,6 @@ def report(output_dir: str) -> None:
         "errors": ctx.errors,
         "asset_upload_errors": ctx.asset_upload_errors,
     })
-
-    report_path.write_text(json.dumps(report_data, indent=2, default=str),
-                           encoding="utf-8")
 
     _mark_skill_phase(out, "report", report_path=str(report_path))
 

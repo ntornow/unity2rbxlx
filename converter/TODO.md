@@ -286,8 +286,67 @@ has 12 items; 6 landed in this session, 2 were closed as superseded
   pass — where do packages live, how does the spawner script reference
   them, how does cross-scene prefab reuse work. Not in Phase 3 scope;
   revisit when a test project requires runtime prefab spawning.
-- [ ] **P3 — Phase 3 item 11: disk rewrite for `animation_data/`,
-  `packages/`.** Partial — Phase 3 item 5's
-  `scripts/scriptable_objects/` directory is now handled by the
-  existing `rglob("*.luau")` walk. `animation_data/` already exists.
-  `packages/` depends on item 10 landing first.
+- [ ] **P3 — Phase 3 item 11: disk rewrite for `packages/`.**
+  Closed for `animations/`, `animation_data/`, and
+  `scriptable_objects/` by the 2026-04-24 `source_path` work: every
+  `RbxScript` created by the fresh-write or rehydrate path records its
+  relative disk location, and the final rewrite loop in `write_output`
+  writes back via `source_path` instead of the old top-level +
+  `animations/` heuristic. Only `packages/` remains, and it depends on
+  item 10 (`generate_prefab_packages`) landing first.
+
+## 2026-04-24 session — Codex review closures
+
+Independent review by OpenAI Codex CLI surfaced 9 findings graded
+P0 / P1 / P2. All shipped upstream via PRs #19, #20, #21.
+
+- [x] **P0-1 — `transpile` → `validate` workflow broken.** `transpile`
+  now persists Luau to `scripts/*.luau` so the subsequent `validate`
+  command finds them. Commit `03e6bff`.
+- [x] **P0-2 — `_make_pipeline` cross-project regression.** Deferred-fix
+  C3 had regressed after the original landing in `86392e6`. Re-landed
+  with a guard + three regression tests. Commit `ba560e2`.
+- [x] **P0-3 — Rehydration not lossless across nested subdirs.** Added
+  `RbxScript.source_path`; every fresh-write and rehydrate site now
+  records it; final rewrite in `write_output` honors it instead of the
+  top-level-plus-`animations/` heuristic. Closed Phase 3 item 11 for
+  existing subdirs and item 12 entirely. Commit `0292f79`.
+- [x] **P1-4 — `assemble` silently no-ops without creds + missed
+  `moderate_assets`.** Pre-flight cred check + `_resolve_credential`
+  auto-discovery + `moderate_assets` added to the phase list.
+  Commit `ed6596d`.
+- [x] **P1-5 — Phase 3 extractors swallowed exceptions.** Broadcast to
+  `log.warning` + appended to `ctx.warnings` so the final report
+  surfaces the failure instead of silent drop. Commit `217bbc3`.
+- [x] **P1-6 — Missing regression tests.** Added `resume` vs
+  `_run_through` parity (source-level + behavior-level) and three-flow
+  phase-order parity. Commit `420b01e`. Three-flow rbx_place
+  byte-equivalence still deferred — needs a real Unity fixture.
+- [x] **P2-7a — Broad-catch on report JSON.** Narrowed and surfaced
+  to stderr. Commit `c9bf537`.
+- [x] **P2-7b — Multi-paragraph module docstrings.** `report_generator`
+  and `scriptable_object_converter` compressed to one-line WHYs.
+  Commit `7581421`.
+- [x] **P2-7c — Dead `experience_manager` module.** Deleted the module
+  and the `create_experience` shim (237 lines of unreachable code).
+  Commit `5ea4c60`.
+- [x] **Item 5 tail — ScriptableObject `source_path` miss.** Found
+  while auditing the Codex plan-execution table. One-line fix on the
+  fresh-write attach at `pipeline.py:1263`. Commit `bccb7a5` (PR #21).
+- [x] **Item 7 tail — `convert_interactive.report` inline JSON.**
+  Routed through a new `report_generator.augment_report(path, extras)`
+  helper so both callers go through one reporting path. Four new tests
+  in `TestAugmentReport`. Commit `79a517c` (PR #21).
+
+Plus three prerequisite fixes from earlier in the same session:
+
+- [x] **Open Cloud `create_experience` endpoint unreachable.** Stopped
+  chasing `universes/v1/universes/create` (requires ROBLOSECURITY
+  cookie + XSRF). `pipeline.resolve_assets` now emits actionable
+  instructions directing users to pre-create a universe/place and pass
+  `--universe-id` / `--place-id`. Commit `9ed7daa`.
+- [x] **UnityPy undeclared dependency.** Added to `pyproject.toml` —
+  fresh `pip install -e .` no longer silently ships empty terrain.
+  Commit `11dc5c9`.
+- [x] **`.context/` ungitignored.** Per-workstation AI-assistant state
+  added to `.gitignore`. Commit `8fc45e1`.

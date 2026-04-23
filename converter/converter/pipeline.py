@@ -1264,6 +1264,7 @@ return table.concat(allData, "\\n")'''
                     name=asset.asset_name,
                     source=asset.luau_source,
                     script_type="ModuleScript",
+                    source_path=f"scriptable_objects/{asset.asset_name}.luau",
                 ))
                 added += 1
             if added:
