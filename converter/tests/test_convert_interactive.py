@@ -479,6 +479,146 @@ class TestValidate:
         assert "validate" in state.get("completed_skill_phases", [])
 
 
+class TestTranspileValidateWorkflow:
+    """Regression: the documented `transpile` -> `validate` workflow from
+    SKILL.md must complete cleanly. `transpile` persists every Luau source
+    from state.transpilation_result.scripts to `scripts/*.luau`, so
+    `validate` (which reads from disk) can find them.
+
+    The original P0 bug was surfaced in the 2026-04-24 Codex review: prior
+    to the fix, transpile only populated in-memory state. `.luau` emission
+    happened inside ``write_output`` (pipeline.py:1200-1201), which the
+    interactive transpile command never runs. So a clean transpile ->
+    validate flow handed validate an empty scripts/ dir and it hard-errored.
+    """
+
+    def test_transpile_persists_luau_and_validate_finds_them(
+        self, tmp_path, monkeypatch,
+    ):
+        import convert_interactive
+        from convert_interactive import cli
+        from converter.code_transpiler import TranspilationResult, TranspiledScript
+
+        unity = tmp_path / "FakeProject"
+        (unity / "Assets").mkdir(parents=True)
+        out = tmp_path / "out"
+        out.mkdir()
+
+        def fake_run_through(pipeline, target_phase):
+            # Stub the transpile_scripts phase: populate the in-memory result
+            # the way the real phase does, without actually transpiling.
+            pipeline.state.transpilation_result = TranspilationResult(
+                scripts=[
+                    TranspiledScript(
+                        source_path="Assets/Foo.cs",
+                        output_filename="Foo.luau",
+                        csharp_source="// stub",
+                        luau_source='-- Foo\nprint("foo")\n',
+                        strategy="rule_based",
+                        confidence=1.0,
+                    ),
+                    TranspiledScript(
+                        source_path="Assets/Bar.cs",
+                        output_filename="Bar.luau",
+                        csharp_source="// stub",
+                        luau_source='-- Bar\nlocal M = {}\nreturn M\n',
+                        strategy="rule_based",
+                        confidence=1.0,
+                        script_type="ModuleScript",
+                    ),
+                ],
+                total_transpiled=2,
+                total_rule_based=2,
+            )
+            pipeline.ctx.total_scripts = 2
+            pipeline.ctx.transpiled_scripts = 2
+            pipeline.ctx.completed_phases.append(target_phase)
+
+        monkeypatch.setattr(convert_interactive, "_run_through", fake_run_through)
+
+        runner = CliRunner()
+
+        exit_code, payload_transpile = _invoke_json(
+            runner, ["transpile", str(unity), str(out)],
+        )
+        assert exit_code == 0
+        assert payload_transpile["success"] is True
+        assert payload_transpile["transpiled"] == 2
+
+        # Transpile persisted both sources to disk under scripts/.
+        scripts_dir = out / "scripts"
+        assert (scripts_dir / "Foo.luau").read_text() == '-- Foo\nprint("foo")\n'
+        assert (scripts_dir / "Bar.luau").read_text() == (
+            '-- Bar\nlocal M = {}\nreturn M\n'
+        )
+
+        _, payload_validate = _invoke_json(runner, ["validate", str(out)])
+        assert payload_validate["phase"] == "validate"
+        assert payload_validate["success"] is True, (
+            f"validate rejected transpile output: "
+            f"{payload_validate.get('errors')}"
+        )
+        assert payload_validate["files_scanned"] == 2
+
+    def test_transpile_clears_stale_top_level_luau_but_preserves_subdirs(
+        self, tmp_path, monkeypatch,
+    ):
+        """A re-run of transpile should drop .luau files for C# scripts that
+        no longer exist in the Unity project (stale top-level output), but
+        must NOT touch sibling subdirectories written by other phases
+        (animations/, animation_data/, scriptable_objects/).
+        """
+        import convert_interactive
+        from convert_interactive import cli
+        from converter.code_transpiler import TranspilationResult, TranspiledScript
+
+        unity = tmp_path / "FakeProject"
+        (unity / "Assets").mkdir(parents=True)
+        out = tmp_path / "out"
+        scripts_dir = out / "scripts"
+        scripts_dir.mkdir(parents=True)
+
+        # Seed stale top-level file AND untouchable subdir files.
+        (scripts_dir / "Stale.luau").write_text("-- deleted from unity\n")
+        (scripts_dir / "animations").mkdir()
+        (scripts_dir / "animations" / "Door.luau").write_text("-- anim survives\n")
+        (scripts_dir / "scriptable_objects").mkdir()
+        (scripts_dir / "scriptable_objects" / "Inv.luau").write_text(
+            "-- so survives\n"
+        )
+
+        def fake_run_through(pipeline, target_phase):
+            pipeline.state.transpilation_result = TranspilationResult(
+                scripts=[TranspiledScript(
+                    source_path="Assets/Kept.cs",
+                    output_filename="Kept.luau",
+                    csharp_source="// stub",
+                    luau_source="-- Kept\n",
+                    strategy="rule_based",
+                    confidence=1.0,
+                )],
+                total_transpiled=1,
+                total_rule_based=1,
+            )
+            pipeline.ctx.total_scripts = 1
+            pipeline.ctx.transpiled_scripts = 1
+            pipeline.ctx.completed_phases.append(target_phase)
+
+        monkeypatch.setattr(convert_interactive, "_run_through", fake_run_through)
+
+        runner = CliRunner()
+        _invoke_json(runner, ["transpile", str(unity), str(out)])
+
+        assert (scripts_dir / "Kept.luau").exists()
+        assert not (scripts_dir / "Stale.luau").exists(), "stale luau not swept"
+        assert (scripts_dir / "animations" / "Door.luau").exists(), (
+            "animations/ was wiped — must be preserved"
+        )
+        assert (scripts_dir / "scriptable_objects" / "Inv.luau").exists(), (
+            "scriptable_objects/ was wiped — must be preserved"
+        )
+
+
 # ---------------------------------------------------------------------------
 # upload — error paths that don't require a real Roblox API call
 # ---------------------------------------------------------------------------

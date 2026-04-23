@@ -581,6 +581,26 @@ def transpile(unity_project_path: str, output_dir: str,
 
     ctx = pipeline.ctx
     result = pipeline.state.transpilation_result
+
+    # Persist Luau sources to disk so the subsequent `validate` command
+    # (which reads from scripts/*.luau) and the preserved-scripts assemble
+    # path (which rehydrates from disk when transpile_scripts is skipped)
+    # both see this run's output. write_output's fresh-transpile branch
+    # does the same write; doing it here keeps the transpile->validate
+    # workflow correct even when the user hasn't run assemble yet.
+    # Scoped wipe: clear only top-level stale .luau so animations/,
+    # animation_data/, and scriptable_objects/ subdirs written by other
+    # phases survive.
+    if result is not None and getattr(result, "scripts", None):
+        scripts_dir = Path(output_dir).resolve() / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        for stale in scripts_dir.glob("*.luau"):
+            stale.unlink()
+        for ts in result.scripts:
+            (scripts_dir / ts.output_filename).write_text(
+                ts.luau_source, encoding="utf-8",
+            )
+
     flagged_files: list[dict] = []
     if result is not None and hasattr(result, "scripts"):
         for ts in getattr(result, "scripts", []):
