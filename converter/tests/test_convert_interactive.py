@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -166,6 +167,76 @@ class TestRunThrough:
         extract_idx = pipeline.run_log.index("extract_assets")
         transpile_idx = pipeline.run_log.index("transpile_scripts")
         assert parse_idx < extract_idx < transpile_idx
+
+
+class TestMakePipelineCrossProjectGuard:
+    """Cross-project contamination guard: ``_make_pipeline`` must refuse to
+    load a persisted ``conversion_context.json`` whose stored
+    ``unity_project_path`` differs from the one the caller supplied. Mixing
+    state across projects silently feeds the new project's GUID index with
+    the old project's stale ``selected_scene`` / uploaded asset IDs and
+    produces broken rbxlx output instead of a clean failure.
+
+    The fix was originally called out in the Phase 1 deferred-fixes memo
+    (C3, closed in commit ``86392e6``) but regressed. Re-landed 2026-04-24
+    after the Codex review surfaced it again.
+    """
+
+    def test_mismatched_project_path_rejects_with_usage_error(self, tmp_path):
+        from convert_interactive import _make_pipeline
+
+        project_a = tmp_path / "ProjectA"
+        project_b = tmp_path / "ProjectB"
+        project_a.mkdir()
+        project_b.mkdir()
+        out = tmp_path / "out"
+        out.mkdir()
+
+        # Persist a context that was built for Project A.
+        ctx = ConversionContext(unity_project_path=str(project_a.resolve()))
+        ctx.save(out / "conversion_context.json")
+
+        # Requesting Project B against the same output dir must fail loudly.
+        with pytest.raises(click.exceptions.UsageError) as exc_info:
+            _make_pipeline(str(project_b), str(out))
+
+        msg = str(exc_info.value)
+        assert str(project_a.resolve()) in msg
+        assert str(project_b) in msg or str(project_b.resolve()) in msg
+
+    def test_matching_project_path_loads_cleanly(self, tmp_path):
+        from convert_interactive import _make_pipeline
+
+        project = tmp_path / "Project"
+        project.mkdir()
+        out = tmp_path / "out"
+        out.mkdir()
+
+        ctx = ConversionContext(unity_project_path=str(project.resolve()))
+        ctx.total_game_objects = 7
+        ctx.save(out / "conversion_context.json")
+
+        pipeline = _make_pipeline(str(project), str(out))
+        # Context round-tripped from disk.
+        assert pipeline.ctx.total_game_objects == 7
+
+    def test_recovered_path_skips_comparison(self, tmp_path):
+        """When caller passes unity_project_path=None, the path is recovered
+        from the persisted context. The comparison must not fire in that
+        branch since it would always compare a value to itself.
+        """
+        from convert_interactive import _make_pipeline
+
+        project = tmp_path / "Project"
+        project.mkdir()
+        out = tmp_path / "out"
+        out.mkdir()
+
+        ctx = ConversionContext(unity_project_path=str(project.resolve()))
+        ctx.save(out / "conversion_context.json")
+
+        pipeline = _make_pipeline(None, str(out))
+        assert str(pipeline.ctx.unity_project_path) == str(project.resolve())
 
 
 class TestConversionContextSanitizedSave:

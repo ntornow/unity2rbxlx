@@ -154,6 +154,7 @@ def _make_pipeline(
     out.mkdir(parents=True, exist_ok=True)
 
     ctx_path = _context_path(out)
+    requested_by_caller = unity_project_path is not None
     if unity_project_path is None:
         if not ctx_path.exists():
             raise click.UsageError(
@@ -175,6 +176,21 @@ def _make_pipeline(
     )
     if ctx_path.exists():
         prior_ctx = ConversionContext.load(ctx_path)
+        # Refuse to silently mix a fresh Unity project with a context saved
+        # for a different one: stale selected_scene / GUID index / upload IDs
+        # would feed the new project and corrupt its output. Only compare
+        # when the caller explicitly named a project — the None branch above
+        # deliberately recovers the path from prior_ctx.
+        if requested_by_caller and prior_ctx.unity_project_path and (
+            Path(prior_ctx.unity_project_path).resolve()
+            != Path(unity_project_path).resolve()
+        ):
+            raise click.UsageError(
+                f"{ctx_path} has conversion state for "
+                f"{prior_ctx.unity_project_path}, but this command was "
+                f"invoked with {unity_project_path}. Use a fresh output "
+                f"directory or delete {out} and start over."
+            )
         pipeline.ctx = prior_ctx
     return pipeline
 
