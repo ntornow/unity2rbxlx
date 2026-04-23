@@ -1,13 +1,6 @@
-"""
-report_generator.py — Generates a human-readable and machine-readable
-conversion report summarising the outcome of a Unity -> Roblox conversion run.
-
-The report captures asset counts, script transpilation results, warnings,
-errors, and overall conversion health. It is written as a JSON file and
-optionally printed as a text summary to stdout.
-
-No other module is imported here.
-"""
+"""Single conversion-report writer. Replaces the per-caller inline JSON
+emissions that used to drift between pipeline.write_output and the
+interactive CLI's report command (Phase 3 item 7)."""
 
 from __future__ import annotations
 

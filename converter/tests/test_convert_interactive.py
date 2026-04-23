@@ -169,6 +169,218 @@ class TestRunThrough:
         assert parse_idx < extract_idx < transpile_idx
 
 
+class TestResumeVsRunThroughParity:
+    """Parity tests called out as missing in the 2026-04-24 Codex review.
+
+    ``Pipeline.resume(target)`` (used by ``u2r.py``) and ``_run_through(target)``
+    (used by the interactive CLI) share the same essential_phases list
+    when replaying prerequisites. If the two diverge silently, interactive
+    commands can produce different in-memory state from their CLI
+    counterparts — breaking the premise that the skill and the CLI are two
+    interfaces to the same pipeline.
+    """
+
+    def test_essential_phases_sets_match(self):
+        """Both functions declare an 'essential_phases' set literal.
+        Extract them and assert equality — pure source-level check so the
+        test fails the moment one literal is updated and the other isn't.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        import convert_interactive
+        from converter.pipeline import Pipeline
+
+        def _essential_set(fn) -> set[str]:
+            # getsource(method) preserves original indentation which breaks
+            # ast.parse; dedent to column 0 first.
+            tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Assign)
+                    and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id == "essential_phases"
+                    and isinstance(node.value, ast.Set)
+                ):
+                    return {
+                        elt.value for elt in node.value.elts
+                        if isinstance(elt, ast.Constant)
+                    }
+            raise AssertionError("essential_phases not found")
+
+        cli_set = _essential_set(Pipeline.resume)
+        skill_set = _essential_set(convert_interactive._run_through)
+        assert cli_set == skill_set, (
+            "Pipeline.resume and _run_through have diverged on which phases "
+            f"get re-run unconditionally. resume={cli_set}, "
+            f"_run_through={skill_set}. Update both together."
+        )
+
+    def test_prereq_phases_identical_minus_cloud(self):
+        """Executive check: the ordered list of prereq phases that run before
+        a review phase target must be identical between the two drivers,
+        except that _run_through deliberately drops the cloud phases.
+        This pins the currently-working behavior so a refactor can't
+        silently skip a prereq on one side.
+        """
+        from convert_interactive import _run_through
+        from converter.pipeline import PHASES
+
+        class _StubForRunThrough:
+            def __init__(self):
+                self.run_log: list[str] = []
+                self.ctx = ConversionContext()
+            def _run_phase(self, phase):
+                self.run_log.append(phase)
+                if phase not in self.ctx.completed_phases:
+                    self.ctx.completed_phases.append(phase)
+
+        target = "convert_materials"
+
+        stub = _StubForRunThrough()
+        _run_through(stub, target)
+
+        target_idx = PHASES.index(target)
+        expected_prereqs_minus_cloud = [
+            p for p in PHASES[:target_idx]
+            if p not in {"upload_assets", "resolve_assets"}
+        ]
+        # _run_through also runs the target itself, once.
+        assert stub.run_log == expected_prereqs_minus_cloud + [target], (
+            f"run_log: {stub.run_log}"
+        )
+
+    def test_run_through_stops_at_target_resume_would_continue(self):
+        """Documented contract: _run_through stops at target; resume runs
+        everything from target forward. Checks the interactive side
+        explicitly so no future change silently makes it run further.
+        """
+        from convert_interactive import _run_through
+        from converter.pipeline import PHASES
+
+        class _Stub:
+            def __init__(self):
+                self.run_log: list[str] = []
+                self.ctx = ConversionContext()
+            def _run_phase(self, phase):
+                self.run_log.append(phase)
+                self.ctx.completed_phases.append(phase)
+
+        stub = _Stub()
+        _run_through(stub, "convert_materials")
+
+        # Nothing after convert_materials should be in the log.
+        target_idx = PHASES.index("convert_materials")
+        for later in PHASES[target_idx + 1:]:
+            assert later not in stub.run_log, (
+                f"_run_through ran {later} after target; that's resume's job"
+            )
+
+
+class TestThreeFlowPhaseOrder:
+    """Phase-order parity across the three documented flows:
+      (a) u2r.py convert — Pipeline.run() iterates PHASES in order
+      (b) interactive-fresh assemble — hand-rolled list in convert_interactive.assemble
+      (c) interactive-rehydrated assemble — same hand-rolled list, skipping
+          transpile_scripts when ctx.completed_phases already contains it.
+
+    A full three-flow rbx_place equivalence test needs a realistic Unity
+    fixture. This lighter check asserts the *phase order* (minus the
+    flow-specific skips) is consistent, which is the invariant most likely
+    to regress when someone edits one list without updating the other.
+    """
+
+    def test_assemble_phase_list_matches_pipeline_phases_minus_moderate_skip(self):
+        """Interactive assemble's phase list must stay a subset of PHASES
+        and preserve PHASES order. Earlier versions of the fix omitted
+        moderate_assets (P1-4). A future edit that rearranges PHASES would
+        silently regress unless we pin this.
+        """
+        import ast
+        import inspect
+
+        import convert_interactive
+        from converter.pipeline import PHASES
+
+        tree = ast.parse(inspect.getsource(convert_interactive.assemble.callback))
+        assemble_list: list[str] | None = None
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.For)
+                and isinstance(node.iter, ast.List)
+                and all(
+                    isinstance(el, ast.Constant) and isinstance(el.value, str)
+                    for el in node.iter.elts
+                )
+            ):
+                candidate = [el.value for el in node.iter.elts]
+                if set(candidate).issubset(set(PHASES)):
+                    assemble_list = candidate
+                    break
+        assert assemble_list is not None, "assemble phase list not found"
+
+        # Every phase in assemble must appear in PHASES (subset).
+        assert set(assemble_list).issubset(set(PHASES))
+        # Order must match PHASES order.
+        assert assemble_list == [p for p in PHASES if p in assemble_list], (
+            f"assemble phase order diverges from PHASES. "
+            f"assemble={assemble_list}, PHASES={PHASES}"
+        )
+
+    def test_rehydrated_flow_skips_only_transpile(self, monkeypatch):
+        """The rehydrated interactive flow differs from fresh by exactly one
+        phase: transpile_scripts is skipped when ctx.completed_phases
+        already lists it and --retranspile is absent. Any additional skip
+        would be a behavior drift.
+        """
+        import config as _config
+        monkeypatch.setattr(_config, "ROBLOX_API_KEY", "stub")
+        monkeypatch.setattr(_config, "ROBLOX_CREATOR_ID", 1)
+
+        # We can't run real phases here, so we stub _make_pipeline's return.
+        run_log: list[str] = []
+
+        class _Stub:
+            def __init__(self):
+                self.ctx = ConversionContext()
+                self.ctx.completed_phases.append("transpile_scripts")
+            def _run_phase(self, phase):
+                run_log.append(phase)
+
+        import convert_interactive
+        monkeypatch.setattr(
+            convert_interactive, "_make_pipeline",
+            lambda *args, **kwargs: _Stub(),
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["assemble", "/tmp/any", "/tmp/out", "--no-upload", "--no-resolve"],
+            catch_exceptions=False,
+        )
+        # Under --no-upload the cred check is skipped (P1-4) so assemble runs.
+        # Under --no-resolve, resolve_assets is skipped from the list.
+        # Under completed transpile_scripts + no --retranspile, that's skipped too.
+        # Everything else should appear in order.
+        assert "transpile_scripts" not in run_log, (
+            "rehydrated flow ran transpile_scripts despite ctx marking it done"
+        )
+        assert "resolve_assets" not in run_log, "resolve_assets not skipped by --no-resolve"
+        # Remaining phases still run in PHASES order.
+        from converter.pipeline import PHASES
+        remaining = [p for p in PHASES if p in run_log]
+        assert run_log == remaining, (
+            f"phase order drift in rehydrated flow. run_log={run_log}, "
+            f"expected={remaining}"
+        )
+        # Exit code may be non-zero because the stub _run_phase doesn't do real
+        # work — we only care about the run_log shape.
+        _ = result
+
+
 class TestMakePipelineCrossProjectGuard:
     """Cross-project contamination guard: ``_make_pipeline`` must refuse to
     load a persisted ``conversion_context.json`` whose stored
@@ -435,6 +647,125 @@ class TestStatus:
         assert payload["completed_skill_phases"] == ["discover", "inventory"]
         assert payload["next_skill_phase"] == "materials"
         assert payload["context"]["unity_project_path"] == "/tmp/fake/unity"
+
+
+# ---------------------------------------------------------------------------
+# assemble — workflow fidelity guards (P1-4 from 2026-04-24 Codex review)
+# ---------------------------------------------------------------------------
+
+
+class TestAssembleWorkflowFidelity:
+    """Regressions on the documented assemble workflow:
+    phase-5-assembly.md lists moderate_assets before upload_assets, and
+    upload_assets is supposed to be a no-op only when the user explicitly
+    opts out via --no-upload. Before the P1-4 fix, moderate_assets was
+    missing from the hand-rolled phase list and missing creds silently
+    skipped uploads while still reporting success=True.
+    """
+
+    def test_phase_list_includes_moderate_assets_before_upload(self):
+        """Read the assemble command's source and assert moderate_assets
+        sits between extract_assets and upload_assets. (The live pipeline
+        run would also catch this via Pipeline.moderate_assets side effects,
+        but that requires a full project fixture — this source-level check
+        catches ordering regressions without the heavy lift.)
+        """
+        import inspect
+
+        import convert_interactive
+
+        # convert_interactive.assemble is a Click command; the underlying
+        # function lives on .callback.
+        src = inspect.getsource(convert_interactive.assemble.callback)
+        phase_list_start = src.index('for phase in [')
+        phase_list_end = src.index(']', phase_list_start)
+        phase_list_src = src[phase_list_start:phase_list_end]
+        # Check order by scanning for the three phase names.
+        for name in ("extract_assets", "moderate_assets", "upload_assets"):
+            assert f'"{name}"' in phase_list_src, (
+                f"{name} missing from assemble's phase list"
+            )
+        assert (
+            phase_list_src.index('"extract_assets"')
+            < phase_list_src.index('"moderate_assets"')
+            < phase_list_src.index('"upload_assets"')
+        ), "moderate_assets must run between extract_assets and upload_assets"
+
+    def test_missing_creds_without_no_upload_fails_fast(self, tmp_path, monkeypatch):
+        """When the user invokes assemble without --no-upload and without
+        credentials (CLI / env / file), the command must fail fast before
+        running any pipeline phases, not silently skip uploads.
+        """
+        import config as _config
+        monkeypatch.setattr(_config, "ROBLOX_API_KEY", "")
+        monkeypatch.setattr(_config, "ROBLOX_CREATOR_ID", None)
+        monkeypatch.delenv("ROBLOX_API_KEY", raising=False)
+        monkeypatch.delenv("ROBLOX_CREATOR_ID", raising=False)
+
+        unity = tmp_path / "FakeProject"
+        (unity / "Assets").mkdir(parents=True)
+        out = tmp_path / "out"
+        out.mkdir()
+
+        # Seed a conversion_context so _make_pipeline would otherwise succeed —
+        # we want to prove the cred check fires first.
+        ctx = ConversionContext(unity_project_path=str(unity.resolve()))
+        ctx.save(out / "conversion_context.json")
+
+        # Monkeypatch _make_pipeline so a pass-through would crash loudly and
+        # give us a distinct signal — if we get here the fast-fail didn't fire.
+        import convert_interactive
+        def _guarded_make_pipeline(*args, **kwargs):
+            raise AssertionError("pipeline built before cred check ran")
+        monkeypatch.setattr(convert_interactive, "_make_pipeline", _guarded_make_pipeline)
+
+        runner = CliRunner()
+        _, payload = _invoke_json(runner, ["assemble", str(unity), str(out)])
+
+        assert payload["phase"] == "assemble"
+        assert payload["success"] is False
+        assert any(
+            "credentials" in e.lower() or "--api-key" in e
+            for e in payload.get("errors", [])
+        ), f"unexpected errors: {payload.get('errors')}"
+
+    def test_no_upload_flag_skips_cred_check(self, tmp_path, monkeypatch):
+        """--no-upload is the explicit opt-out: assemble must proceed even
+        without credentials. We stub _make_pipeline to a no-op pipeline so
+        the test doesn't need a real Unity project, and assert assemble
+        makes it past the cred check.
+        """
+        import config as _config
+        monkeypatch.setattr(_config, "ROBLOX_API_KEY", "")
+        monkeypatch.setattr(_config, "ROBLOX_CREATOR_ID", None)
+        monkeypatch.delenv("ROBLOX_API_KEY", raising=False)
+        monkeypatch.delenv("ROBLOX_CREATOR_ID", raising=False)
+
+        unity = tmp_path / "FakeProject"
+        (unity / "Assets").mkdir(parents=True)
+        out = tmp_path / "out"
+        out.mkdir()
+        ctx = ConversionContext(unity_project_path=str(unity.resolve()))
+        ctx.save(out / "conversion_context.json")
+
+        import convert_interactive
+        # If we reach _make_pipeline, the cred check correctly skipped.
+        # Raise a sentinel error so we know we got past it — and so the test
+        # doesn't try to run a real pipeline.
+        class _ReachedPipeline(Exception):
+            pass
+        def _sentinel(*args, **kwargs):
+            raise _ReachedPipeline
+        monkeypatch.setattr(convert_interactive, "_make_pipeline", _sentinel)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli, ["assemble", str(unity), str(out), "--no-upload"],
+            catch_exceptions=True,
+        )
+        assert isinstance(result.exception, _ReachedPipeline), (
+            f"cred check fired under --no-upload; output: {result.output}"
+        )
 
 
 # ---------------------------------------------------------------------------

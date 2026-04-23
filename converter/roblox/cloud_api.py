@@ -28,9 +28,6 @@ _PLACE_VERSION_URL = (
     "https://apis.roblox.com/universes/v2/universes/{universe_id}"
     "/places/{place_id}/versions"
 )
-# The legacy universes/v1/universes/create endpoint requires cookie + XSRF
-# auth and is not reachable with an Open Cloud API key. Open Cloud v2 does not
-# expose universe creation. See create_experience() below.
 _LUAU_EXECUTION_URL = (
     "https://apis.roblox.com/cloud/v2/universes/{universe_id}"
     "/places/{place_id}/luau-execution-session-tasks"
@@ -401,30 +398,6 @@ def upload_place(
         "Place publish failed (%d): %s", response.status_code, response.text[:500]
     )
     return False
-
-
-def create_experience(
-    api_key: str,  # noqa: ARG001 — kept for API compatibility with existing callers
-    name: str,  # noqa: ARG001
-    description: str = "",  # noqa: ARG001
-) -> tuple[int, int] | None:
-    """Universe creation is not supported by Open Cloud with API-key auth.
-
-    Always returns ``None``. Callers must supply a pre-created universe+place
-    (via ``--universe-id`` / ``--place-id`` or the cached ``.roblox_ids.json``).
-
-    The legacy endpoint ``https://apis.roblox.com/universes/v1/universes/create``
-    is internal and requires a ``ROBLOSECURITY`` cookie + XSRF token, not an
-    Open Cloud API key. Roblox has stated intent to add API-key support but
-    no timeline. Open Cloud v2 has no ``POST /universes`` endpoint at all.
-    """
-    logger.warning(
-        "create_experience: universe creation is not supported via Open Cloud "
-        "API key. Create a place at https://create.roblox.com/dashboard/creations "
-        "and pass --universe-id / --place-id (or let pipeline.resolve_assets "
-        "recover them from .roblox_ids.json)."
-    )
-    return None
 
 
 # ---------------------------------------------------------------------------

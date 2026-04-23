@@ -47,7 +47,7 @@ Work autonomously with no questions — just churn forever making the converter 
 
 **Key milestones achieved:**
 - P0/P1/P2: ALL resolved (terrain, scripts, content properties, sub-mesh materials, physics, UI, etc.)
-- **Headless mesh resolution**: Luau Execution API → CreateMeshPartAsync + SavePlaceAsync. 328/328 meshes render as proper 3D geometry in Studio edit mode. Requires caller to supply a pre-created `--universe-id` / `--place-id` (Open Cloud does not support universe creation via API-key auth; see `roblox/cloud_api.create_experience`). After the first run, IDs are cached in `<output>/.roblox_ids.json` and the pipeline runs one-command.
+- **Headless mesh resolution**: Luau Execution API → CreateMeshPartAsync + SavePlaceAsync. 328/328 meshes render as proper 3D geometry in Studio edit mode. Requires caller to supply a pre-created `--universe-id` / `--place-id` (Open Cloud does not support universe creation via API-key auth). After the first run, IDs are cached in `<output>/.roblox_ids.json` and the pipeline runs one-command.
 - **One-command pipeline** (once IDs are cached): `u2r.py convert` → generates rbxlx + publishes to Roblox with proper meshes
 - **Placement accuracy**: Per-sub-mesh vertical offsets, scene hierarchy composition for prefab children, all doors/turrets/pickups at correct positions. 176/176 scripts valid Luau syntax. Mixed collider handling (physical + trigger).
 - **SimpleFPS gameplay verified**: Game starts clean, 0 script errors, water fills, terrain renders, HUD works, spawn points correct, all materials applied (0 default gray).

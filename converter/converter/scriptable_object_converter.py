@@ -1,34 +1,6 @@
-"""
-scriptable_object_converter.py — Converts Unity ScriptableObject .asset files to Luau data tables.
-
-Unity ScriptableObject data assets (.asset files) are YAML files containing serialized
-field data. This module parses them and generates Roblox ModuleScript source that
-returns a Luau table with the same data.
-
-Example Unity .asset:
-    %YAML 1.1
-    --- !u!114 &11400000
-    MonoBehaviour:
-      m_Name: MyDatabase
-      myInt: 42
-      myString: hello
-      items:
-        - name: Sword
-          damage: 10
-
-Generated Luau ModuleScript:
-    -- Auto-generated from MyDatabase.asset
-    local data = {
-        myInt = 42,
-        myString = "hello",
-        items = {
-            { name = "Sword", damage = 10 },
-        },
-    }
-    return data
-
-No other module is imported here.
-"""
+"""Converts Unity ScriptableObject .asset YAML to Luau ModuleScripts. Roblox
+has no ScriptableObject equivalent, so we serialize each asset's field data
+into a returned Luau table consumers can require()."""
 
 from __future__ import annotations
 
