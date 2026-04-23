@@ -154,6 +154,7 @@ def _make_pipeline(
     out.mkdir(parents=True, exist_ok=True)
 
     ctx_path = _context_path(out)
+    requested_by_caller = unity_project_path is not None
     if unity_project_path is None:
         if not ctx_path.exists():
             raise click.UsageError(
@@ -175,6 +176,21 @@ def _make_pipeline(
     )
     if ctx_path.exists():
         prior_ctx = ConversionContext.load(ctx_path)
+        # Refuse to silently mix a fresh Unity project with a context saved
+        # for a different one: stale selected_scene / GUID index / upload IDs
+        # would feed the new project and corrupt its output. Only compare
+        # when the caller explicitly named a project — the None branch above
+        # deliberately recovers the path from prior_ctx.
+        if requested_by_caller and prior_ctx.unity_project_path and (
+            Path(prior_ctx.unity_project_path).resolve()
+            != Path(unity_project_path).resolve()
+        ):
+            raise click.UsageError(
+                f"{ctx_path} has conversion state for "
+                f"{prior_ctx.unity_project_path}, but this command was "
+                f"invoked with {unity_project_path}. Use a fresh output "
+                f"directory or delete {out} and start over."
+            )
         pipeline.ctx = prior_ctx
     return pipeline
 
@@ -565,6 +581,26 @@ def transpile(unity_project_path: str, output_dir: str,
 
     ctx = pipeline.ctx
     result = pipeline.state.transpilation_result
+
+    # Persist Luau sources to disk so the subsequent `validate` command
+    # (which reads from scripts/*.luau) and the preserved-scripts assemble
+    # path (which rehydrates from disk when transpile_scripts is skipped)
+    # both see this run's output. write_output's fresh-transpile branch
+    # does the same write; doing it here keeps the transpile->validate
+    # workflow correct even when the user hasn't run assemble yet.
+    # Scoped wipe: clear only top-level stale .luau so animations/,
+    # animation_data/, and scriptable_objects/ subdirs written by other
+    # phases survive.
+    if result is not None and getattr(result, "scripts", None):
+        scripts_dir = Path(output_dir).resolve() / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        for stale in scripts_dir.glob("*.luau"):
+            stale.unlink()
+        for ts in result.scripts:
+            (scripts_dir / ts.output_filename).write_text(
+                ts.luau_source, encoding="utf-8",
+            )
+
     flagged_files: list[dict] = []
     if result is not None and hasattr(result, "scripts"):
         for ts in getattr(result, "scripts", []):

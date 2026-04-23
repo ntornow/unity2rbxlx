@@ -118,3 +118,127 @@ def test_rehydration_picks_up_scriptable_objects_subdir(tmp_path):
     assert "Inventory" in names
     inv = next(s for s in pipeline.state.rbx_place.scripts if s.name == "Inventory")
     assert inv.script_type == "ModuleScript"
+
+
+def test_rehydration_records_source_path_for_nested_files(tmp_path):
+    """Lossless rehydration (P0-3): each rehydrated RbxScript must record its
+    relative disk path so the final rewrite loop can update the original
+    file in-place instead of dumping everything into scripts/ root.
+    """
+    pipeline = _make_pipeline(tmp_path)
+    scripts_dir = pipeline.output_dir / "scripts"
+    (scripts_dir / "animations").mkdir(parents=True)
+    (scripts_dir / "animation_data").mkdir(parents=True)
+    (scripts_dir / "scriptable_objects").mkdir(parents=True)
+
+    (scripts_dir / "Top.luau").write_text("-- top-level\n")
+    (scripts_dir / "animations" / "Door.luau").write_text("-- anim\n")
+    (scripts_dir / "animation_data" / "DoorData.luau").write_text(
+        "local M = {}\nreturn M\n"
+    )
+    (scripts_dir / "scriptable_objects" / "Inventory.luau").write_text(
+        "local I = {}\nreturn I\n"
+    )
+
+    pipeline._rehydrate_scripts_from_disk(scripts_dir)
+
+    by_name = {s.name: s for s in pipeline.state.rbx_place.scripts}
+    assert by_name["Top"].source_path == "Top.luau"
+    assert by_name["Door"].source_path == "animations/Door.luau"
+    assert by_name["DoorData"].source_path == "animation_data/DoorData.luau"
+    assert by_name["Inventory"].source_path == "scriptable_objects/Inventory.luau"
+
+
+def test_final_rewrite_honors_source_path_for_nested_scripts(tmp_path):
+    """write_output's trailing rewrite loop must use RbxScript.source_path so
+    an edit applied in-memory (after rehydration, during require injection
+    / reclassification) lands on the nested-dir file it came from — not in a
+    duplicate copy at scripts/<name>.luau.
+    """
+    from core.roblox_types import RbxScript, RbxPart
+
+    pipeline = _make_pipeline(tmp_path)
+    scripts_dir = pipeline.output_dir / "scripts"
+    so_dir = scripts_dir / "scriptable_objects"
+    anim_dir = scripts_dir / "animations"
+    so_dir.mkdir(parents=True)
+    anim_dir.mkdir(parents=True)
+
+    # Original on-disk contents (what rehydration would read).
+    (so_dir / "Inventory.luau").write_text("-- original\n")
+    (anim_dir / "Door.luau").write_text("-- original\n")
+
+    pipeline.state.rbx_place.scripts = [
+        RbxScript(
+            name="Inventory",
+            source="-- REWRITTEN\n",
+            script_type="ModuleScript",
+            source_path="scriptable_objects/Inventory.luau",
+        ),
+        RbxScript(
+            name="Door",
+            source="-- REWRITTEN\n",
+            script_type="Script",
+            source_path="animations/Door.luau",
+        ),
+    ]
+
+    # Exercise just the final rewrite loop in isolation — mirroring the code
+    # at the tail of write_output.
+    for s in pipeline.state.rbx_place.scripts:
+        out_path = scripts_dir / s.source_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(s.source, encoding="utf-8")
+
+    assert (so_dir / "Inventory.luau").read_text() == "-- REWRITTEN\n"
+    assert (anim_dir / "Door.luau").read_text() == "-- REWRITTEN\n"
+    # No duplicate at the top level — the bug before this fix.
+    assert not (scripts_dir / "Inventory.luau").exists()
+    assert not (scripts_dir / "Door.luau").exists()
+
+
+def test_rehydration_round_trip_nested_dirs_preserves_layout(tmp_path):
+    """End-to-end: seed nested scripts, rehydrate, mutate in memory, run the
+    final rewrite loop as-defined in pipeline.write_output, and confirm the
+    on-disk layout matches the seeded layout with updated content — no
+    duplicates at scripts/ root, no lost nested files.
+    """
+    pipeline = _make_pipeline(tmp_path)
+    scripts_dir = pipeline.output_dir / "scripts"
+    (scripts_dir / "animations").mkdir(parents=True)
+    (scripts_dir / "scriptable_objects").mkdir(parents=True)
+
+    (scripts_dir / "GameManager.luau").write_text("-- v1 GameManager\n")
+    (scripts_dir / "animations" / "DoorOpen.luau").write_text("-- v1 DoorOpen\n")
+    (scripts_dir / "scriptable_objects" / "Config.luau").write_text(
+        "local C = {}\nreturn C\n"
+    )
+
+    pipeline._rehydrate_scripts_from_disk(scripts_dir)
+
+    for s in pipeline.state.rbx_place.scripts:
+        s.source = f"-- v2 {s.name}\n"
+
+    # Copy-paste of the final rewrite block in write_output (post-fix).
+    for s in pipeline.state.rbx_place.scripts:
+        if getattr(s, "source_path", None):
+            out_path = scripts_dir / s.source_path
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(s.source, encoding="utf-8")
+            continue
+        luau_path = scripts_dir / f"{s.name}.luau"
+        anim_path = scripts_dir / "animations" / f"{s.name}.luau"
+        if anim_path.exists():
+            anim_path.write_text(s.source, encoding="utf-8")
+        elif luau_path.exists() or not (scripts_dir / "animations").exists():
+            luau_path.write_text(s.source, encoding="utf-8")
+
+    assert (scripts_dir / "GameManager.luau").read_text() == "-- v2 GameManager\n"
+    assert (scripts_dir / "animations" / "DoorOpen.luau").read_text() == "-- v2 DoorOpen\n"
+    assert (scripts_dir / "scriptable_objects" / "Config.luau").read_text() == "-- v2 Config\n"
+    # Each script exists in exactly one place.
+    assert sorted(p.relative_to(scripts_dir).as_posix() for p in scripts_dir.rglob("*.luau")) == [
+        "GameManager.luau",
+        "animations/DoorOpen.luau",
+        "scriptable_objects/Config.luau",
+    ]

@@ -67,6 +67,13 @@ class RbxScript:
     source: str
     script_type: ScriptType = "Script"
     parent_path: str | None = None     # where to place in hierarchy
+    # Relative path within ``<output_dir>/scripts/`` where this script was
+    # loaded from or should be written back to. Populated by the fresh-write
+    # and rehydration paths in write_output so the final rewrite can reach
+    # nested-dir scripts (animations/, animation_data/, scriptable_objects/,
+    # ...). ``None`` for scripts injected in-memory after rehydration (e.g.
+    # bootstrap, FPS controller).
+    source_path: str | None = None
 
 
 @dataclass
