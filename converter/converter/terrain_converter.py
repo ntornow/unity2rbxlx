@@ -41,7 +41,12 @@ def read_unity_terrain(terrain_data_path: Path) -> dict[str, Any] | None:
     try:
         import UnityPy
     except ImportError:
-        log.warning("UnityPy required for terrain heightmap extraction")
+        log.warning(
+            "UnityPy not installed — terrain will be empty (no heightmap, no "
+            "splat map). UnityPy is a required dependency; install it with "
+            "'pip install UnityPy' or reinstall the converter via "
+            "'pip install -e .' to pull it from pyproject.toml."
+        )
         return None
 
     try:

@@ -13,6 +13,7 @@ dependencies = [
     "anthropic>=0.40",
     "numpy>=1.26",
     "lz4>=4.0",
+    "UnityPy>=1.10",
 ]
 
 [project.optional-dependencies]

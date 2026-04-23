@@ -951,22 +951,28 @@ class Pipeline:
                 except Exception:
                     pass
 
-        # Create experience if still missing
+        # No universe/place — cannot run headless mesh resolution. Open Cloud
+        # does not support universe creation with API-key auth, so we cannot
+        # auto-provision one. Tell the user exactly how to unblock themselves.
         if not universe_id or not place_id:
-            from roblox.cloud_api import create_experience
-            log.info("[resolve_assets] Creating experience for headless mesh resolution...")
-            exp_name = self.state.parsed_scene.roots[0].name if self.state.parsed_scene and self.state.parsed_scene.roots else "Converted"
-            result = create_experience(api_key, exp_name)
-            if result:
-                universe_id, place_id = result
-                self.ctx.universe_id = universe_id
-                self.ctx.place_id = place_id
-                self.ctx.experience_name = exp_name
-                log.info("[resolve_assets] Created universe=%s place=%s", universe_id, place_id)
-            else:
-                log.warning("[resolve_assets] Failed to create experience — cannot resolve meshes headlessly. "
-                           "Run 'u2r.py resolve' manually after first conversion.")
-                return
+            log.warning(
+                "[resolve_assets] No --universe-id / --place-id supplied and no "
+                ".roblox_ids.json cache. Headless mesh resolution is skipped; "
+                "meshes in the rbxlx will carry Model IDs instead of real Mesh IDs "
+                "(they will appear as placeholder parts in Studio until resolved)."
+            )
+            log.warning("[resolve_assets] To enable headless resolution on the next run:")
+            log.warning("[resolve_assets]   1. Create an empty place at "
+                        "https://create.roblox.com/dashboard/creations (Baseplate template)")
+            log.warning("[resolve_assets]   2. Copy its universe + place IDs from the URL:")
+            log.warning("[resolve_assets]        .../experiences/<UNIVERSE_ID>/places/<PLACE_ID>/configure")
+            log.warning("[resolve_assets]   3. Re-run: u2r.py convert ... "
+                        "--universe-id <UID> --place-id <PID>")
+            log.warning("[resolve_assets]   IDs are cached in <output>/.roblox_ids.json "
+                        "so future runs are one-command.")
+            log.warning("[resolve_assets] Alternative: run 'u2r.py resolve <output>' and "
+                        "execute the generated scripts via Studio Command Bar.")
+            return
 
         # Persist IDs to cache file (survives context resets)
         import json as _json

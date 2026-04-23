@@ -47,8 +47,8 @@ Work autonomously with no questions — just churn forever making the converter 
 
 **Key milestones achieved:**
 - P0/P1/P2: ALL resolved (terrain, scripts, content properties, sub-mesh materials, physics, UI, etc.)
-- **Headless mesh resolution**: Luau Execution API → CreateMeshPartAsync + SavePlaceAsync. 328/328 meshes render as proper 3D geometry in Studio edit mode. No Studio interaction required.
-- **One-command pipeline**: `u2r.py convert` → generates rbxlx + publishes to Roblox with proper meshes
+- **Headless mesh resolution**: Luau Execution API → CreateMeshPartAsync + SavePlaceAsync. 328/328 meshes render as proper 3D geometry in Studio edit mode. Requires caller to supply a pre-created `--universe-id` / `--place-id` (Open Cloud does not support universe creation via API-key auth; see `roblox/cloud_api.create_experience`). After the first run, IDs are cached in `<output>/.roblox_ids.json` and the pipeline runs one-command.
+- **One-command pipeline** (once IDs are cached): `u2r.py convert` → generates rbxlx + publishes to Roblox with proper meshes
 - **Placement accuracy**: Per-sub-mesh vertical offsets, scene hierarchy composition for prefab children, all doors/turrets/pickups at correct positions. 176/176 scripts valid Luau syntax. Mixed collider handling (physical + trigger).
 - **SimpleFPS gameplay verified**: Game starts clean, 0 script errors, water fills, terrain renders, HUD works, spawn points correct, all materials applied (0 default gray).
 - **Performance**: Terrain encoding 2.4x faster via inlined _get_voxel (eliminated 13.8M function calls). SimpleFPS write_output: 8.0s→3.4s. Precomputed height grids + chunk skipping from prior session.
@@ -194,7 +194,6 @@ python u2r.py convert ../test_projects/SimpleFPS -o ./output/SimpleFPS --api-key
 - PSD/TGA/BMP/TIF texture files are auto-converted to PNG for upload (requires PIL/Pillow)
 - Animations are converted to TweenService scripts — works for property animations, skeletal uses Motor6D chain
 - Terrain uses SmoothGrid binary encoding (reverse-engineered format, needs Studio verification) with FillBlock script fallback
-- Binary Unity scenes (.unity) require UnityPy for parsing; text YAML scenes are natively supported
 - Uploaded textures return Decal IDs which must be resolved to Image IDs via Studio MCP
 - Uploaded meshes return Model IDs which must be resolved to real MeshIds via Studio MCP
 - Git LFS pointer files are detected and skipped (actual FBX data needs LFS pull)
@@ -241,7 +240,7 @@ After uploading, run these steps via Studio MCP `execute_luau`:
 ## Supported Features
 
 ### Scene & Asset Parsing
-- Text YAML scene parsing (binary requires UnityPy)
+- Text YAML + binary scene parsing (binary scenes + terrain `.asset` files parsed via UnityPy)
 - Both Standard and URP (Universal Render Pipeline) Lit shaders
 - Both old (data:/first:/second:) and new (list-of-dicts) Unity YAML formats
 - Prefab instance hierarchy with world-space transform composition
