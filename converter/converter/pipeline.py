@@ -1203,6 +1203,7 @@ return table.concat(allData, "\\n")'''
                     name=ts.output_filename.replace(".luau", ""),
                     source=ts.luau_source,
                     script_type=ts.script_type,
+                    source_path=ts.output_filename,
                 ))
 
         # Write animation scripts to output directory AND add to RbxPlace.
@@ -1217,6 +1218,7 @@ return table.concat(allData, "\\n")'''
                     name=script_name,
                     source=luau_source,
                     script_type="Script",
+                    source_path=f"animations/{script_name}.luau",
                 ))
             log.info("[write_output] Wrote %d animation scripts",
                      len(self.state.animation_result.generated_scripts))
@@ -1233,6 +1235,7 @@ return table.concat(allData, "\\n")'''
                     name=module_name,
                     source=module_source,
                     script_type="ModuleScript",
+                    source_path=f"animation_data/{module_name}.luau",
                 ))
             log.info("[write_output] Wrote %d animation data modules",
                      len(self.state.animation_result.animation_data_modules))
@@ -1670,11 +1673,22 @@ script.Disabled = true
                     "setupSounds(character)\n    -- Also search bound Part for sounds from MonoBehaviour fields\n    if script.Parent and script.Parent:IsA(\"BasePart\") then\n        setupSounds(script.Parent)\n    end",
                 )
 
-        # Final write: ensure .luau files on disk match the fully processed sources
-        # (after require injection, reclassification, and all other post-processing)
+        # Final write: ensure .luau files on disk match the fully processed
+        # sources (after require injection, reclassification, and all other
+        # post-processing). Prefer the explicit source_path set by rehydration
+        # and the fresh-write branches so nested-dir scripts
+        # (animations/, animation_data/, scriptable_objects/) round-trip back
+        # to their original location. Fall back to the top-level/animations
+        # heuristic only for scripts injected in-memory later in write_output
+        # (bootstrap, FPS controller, runtime libs) that never had a disk
+        # path to begin with.
         scripts_dir = self.output_dir / "scripts"
         for s in self.state.rbx_place.scripts:
-            # Check both direct and animations subdirectory
+            if getattr(s, "source_path", None):
+                out_path = scripts_dir / s.source_path
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(s.source, encoding="utf-8")
+                continue
             luau_path = scripts_dir / f"{s.name}.luau"
             anim_path = scripts_dir / "animations" / f"{s.name}.luau"
             if anim_path.exists():
@@ -1826,6 +1840,11 @@ script.Disabled = true
 
         Uses the previous run's conversion_plan.json for script_type and
         parent_path; falls back to content heuristics for unclassified files.
+
+        Records each script's relative disk path so the final rewrite loop in
+        write_output can put edits back in nested subdirs (animations/,
+        animation_data/, scriptable_objects/) instead of defaulting every
+        file to the top-level scripts/ dir.
         """
         from core.roblox_types import RbxScript
 
@@ -1847,7 +1866,12 @@ script.Disabled = true
                 elif "game.Players.LocalPlayer" in source or "UserInputService" in source:
                     script_type = "LocalScript"
 
-            script = RbxScript(name=name, source=source, script_type=script_type)
+            script = RbxScript(
+                name=name,
+                source=source,
+                script_type=script_type,
+                source_path=str(luau_path.relative_to(scripts_dir)),
+            )
             if parent_path and hasattr(script, "parent_path"):
                 script.parent_path = parent_path
             self.state.rbx_place.scripts.append(script)
