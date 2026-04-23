@@ -49,7 +49,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: false
+
+      # Only SimpleFPS has a .gitmodules mapping; the other 8 gitlinks under
+      # test_projects/ are dormant. Tests auto-skip unpopulated projects via
+      # converter/tests/_project_paths.is_populated().
+      - name: Init SimpleFPS submodule (skip LFS smudge)
+        # The upstream repo's LFS quota is exhausted so binary assets cannot
+        # be pulled; GIT_LFS_SKIP_SMUDGE=1 leaves LFS pointer files in place
+        # and the converter detects + skips them (per converter/CLAUDE.md).
+        env:
+          GIT_LFS_SKIP_SMUDGE: "1"
+        run: git submodule update --init --recursive test_projects/SimpleFPS
+        working-directory: ${{ github.workspace }}
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -84,24 +96,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Only SimpleFPS is wired to a submodule URL. Re-expand this list as
+        # additional test_projects/* entries gain .gitmodules mappings.
         project:
           - SimpleFPS
-          - 3D-Platformer
-          - BoatAttack
-          - BossRoom
-          - ChopChop
-          - PrefabWorkflows
-          - RedRunner
-          - SanAndreasUnity
-          - Gamekit3D
     defaults:
       run:
         working-directory: converter
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
-          lfs: true
+          submodules: false
+
+      - name: Init ${{ matrix.project }} submodule (skip LFS smudge)
+        # Upstream Unity repos often hit LFS quota; skip smudging so the
+        # pointer files stay in place — the converter detects and skips them.
+        env:
+          GIT_LFS_SKIP_SMUDGE: "1"
+        run: git submodule update --init --recursive "test_projects/${{ matrix.project }}"
+        working-directory: ${{ github.workspace }}
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -127,12 +140,18 @@ jobs:
       - name: Validate generated rbxlx
         if: steps.convert.outcome == 'success'
         run: |
-          rbxlx="./output/${{ matrix.project }}/converted_place.rbxlx"
-          if [ ! -f "$rbxlx" ]; then
-            echo "::error::No rbxlx produced at $rbxlx"
+          # --scene all writes per-scene files (e.g. main.rbxlx, menu.rbxlx),
+          # not a unified converted_place.rbxlx. Validate every rbxlx found.
+          found=0
+          for rbxlx in ./output/${{ matrix.project }}/*.rbxlx; do
+            [ -f "$rbxlx" ] || continue
+            found=1
+            python u2r.py validate "$rbxlx"
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "::error::No rbxlx files produced under ./output/${{ matrix.project }}/"
             exit 1
           fi
-          python u2r.py validate "$rbxlx"
 
       - name: Upload conversion artifacts
         if: always()
@@ -140,7 +159,7 @@ jobs:
         with:
           name: convert-${{ matrix.project }}
           path: |
-            converter/output/${{ matrix.project }}/converted_place.rbxlx
+            converter/output/${{ matrix.project }}/*.rbxlx
             converter/output/${{ matrix.project }}/conversion_report.json
             converter/output/${{ matrix.project }}/conversion_context.json
             converter/output/${{ matrix.project }}/scripts/
@@ -159,8 +178,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
-          lfs: true
+          submodules: false
+
+      # u2r.py eval auto-discovers populated projects under test_projects/
+      # via _project_paths.is_populated(), so initing only SimpleFPS limits
+      # the eval run to that project until more submodules are wired up.
+      - name: Init SimpleFPS submodule (skip LFS smudge)
+        # The upstream repo's LFS quota is exhausted so binary assets cannot
+        # be pulled; GIT_LFS_SKIP_SMUDGE=1 leaves LFS pointer files in place
+        # and the converter detects + skips them (per converter/CLAUDE.md).
+        env:
+          GIT_LFS_SKIP_SMUDGE: "1"
+        run: git submodule update --init --recursive test_projects/SimpleFPS
+        working-directory: ${{ github.workspace }}
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -179,10 +209,15 @@ jobs:
             --output ./eval_output \
             --baseline ./eval_output/eval_current.json
 
-      - name: Diff against committed baseline
+      - name: Diff against committed baseline (SimpleFPS subset)
         run: |
+          # Baseline contains all 9 projects; in CI only SimpleFPS is
+          # populated, so subset the baseline before diffing — otherwise
+          # the 8 unpopulated projects register as MISSING regressions.
+          jq '{commit, generated_at, projects: {SimpleFPS: .projects.SimpleFPS}}' \
+            ./eval_baseline.json > ./eval_baseline_simplefps.json
           python u2r.py eval-diff \
-            ./eval_baseline.json \
+            ./eval_baseline_simplefps.json \
             ./eval_output/eval_current.json \
             --fail-on-regression
 
@@ -249,7 +284,10 @@ jobs:
           # --scene all writes per-scene rbxlx files (main.rbxlx is the
           # gameplay scene — 944 parts / 51 scripts). There is no unified
           # converted_place.rbxlx in multi-scene mode.
-          RBXLX="./output/SimpleFPS/main.rbxlx"
+          # Absolute paths: Studio launched from a non-interactive shell
+          # won't reliably resolve relative rbxlx paths (it silently falls
+          # back to Start Page and F5 becomes a no-op).
+          RBXLX="$PWD/output/SimpleFPS/main.rbxlx"
           if [ ! -f "$RBXLX" ]; then
             echo "::error::Expected rbxlx not found: $RBXLX"
             ls -la ./output/SimpleFPS/ || true
@@ -257,7 +295,7 @@ jobs:
           fi
           echo "smoke-testing $RBXLX"
           "$HOME/.unity2rbxlx-venv/bin/python" u2r.py smoke-test "$RBXLX" \
-            --output-dir ./smoke_output/SimpleFPS
+            --output-dir "$PWD/smoke_output/SimpleFPS"
 
       - name: Upload smoke test artifacts
         if: always()

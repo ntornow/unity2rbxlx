@@ -232,7 +232,7 @@ class TestRbxlxOutputQuality:
             "Script", "LocalScript", "ModuleScript",
             "ScreenGui", "Frame", "TextLabel", "TextButton", "ImageLabel",
             "SurfaceAppearance", "Texture", "Decal", "Sky", "Camera",
-            "Lighting", "ServerScriptService", "ReplicatedStorage", "ServerStorage",
+            "Lighting", "ServerScriptService", "ReplicatedStorage", "ReplicatedFirst", "ServerStorage",
             "StarterGui", "StarterPlayer", "StarterPlayerScripts", "StarterCharacterScripts",
             "RemoteEvent", "ParticleEmitter",
             "Trail", "Beam", "Attachment",

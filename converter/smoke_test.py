@@ -300,15 +300,19 @@ def _enter_play_mode() -> bool:
 def _clear_autosaves_and_locks(injected_path: Path) -> None:
     """Remove stale auto-recovery files and Studio file locks.
 
-    Studio shows a modal 'auto-recovery' dialog on startup if it finds a
-    matching recovery file from a prior crash/kill — that dialog eats the F5
-    keystroke. Stale ``.lock`` files from killed Studios also cause noisy
-    OTA-lock errors. Clearing both is safe because the smoke test always
-    regenerates the injected place from scratch.
+    Studio shows a modal 'auto-recovery' dialog on startup if it finds *any*
+    recovery file in the AutoSaves directory — not just one matching the
+    place we're opening. That dialog blocks every keystroke including F5,
+    leaving the smoke test waiting for a Play mode that never starts.
+
+    Globbing only the injected place's stem misses recovery files from
+    prior unrelated Studio sessions (e.g. ``Place_AutoRecovery_*.rbxl``
+    from a default-named place that was killed). Sweep them all — Studio
+    creates them as crash insurance, and any session reaching this point
+    is being killed and restarted from a freshly injected rbxlx anyway.
     """
-    stem = injected_path.stem  # e.g. "place_smoketest"
     if STUDIO_AUTOSAVES_DIR.exists():
-        for f in STUDIO_AUTOSAVES_DIR.glob(f"{stem}_AutoRecovery_*.rbxl"):
+        for f in STUDIO_AUTOSAVES_DIR.glob("*_AutoRecovery_*.rbxl"):
             try:
                 f.unlink()
                 logger.info("Removed stale auto-recovery file: %s", f.name)
