@@ -132,6 +132,9 @@ class RbxUIElement:
     text: str = ""
     text_color: tuple[float, float, float] = (0, 0, 0)
     text_size: int = 14
+    text_x_alignment: str = ""         # "Left" | "Center" | "Right"; empty = writer default
+    text_y_alignment: str = ""         # "Top" | "Center" | "Bottom"; empty = writer default
+    font: str = ""                     # Roblox Font enum label (e.g. "SourceSans"); empty = writer default
     image: str = ""                    # rbxassetid:// URL
     children: list[RbxUIElement] = field(default_factory=list)
     visible: bool = True

@@ -88,3 +88,98 @@ class TestTextProperties:
         props = {"m_Text": "x", "m_FontSize": 12, "m_Color": {"r": 1, "g": 0, "b": 0.5}}
         _apply_text_properties(element, props)
         assert element.text_color == (1.0, 0.0, 0.5)
+
+    def test_text_anchor_split(self):
+        """Phase 4.6: m_Alignment 0..8 splits into TextXAlignment + TextYAlignment."""
+        cases = [
+            (0, "Left",   "Top"),
+            (1, "Center", "Top"),
+            (2, "Right",  "Top"),
+            (3, "Left",   "Center"),
+            (4, "Center", "Center"),
+            (5, "Right",  "Center"),
+            (6, "Left",   "Bottom"),
+            (7, "Center", "Bottom"),
+            (8, "Right",  "Bottom"),
+        ]
+        for anchor, want_x, want_y in cases:
+            element = RbxUIElement()
+            _apply_text_properties(element, {"m_Text": "t", "m_FontSize": 12, "m_Alignment": anchor})
+            assert element.text_x_alignment == want_x, f"anchor={anchor}"
+            assert element.text_y_alignment == want_y, f"anchor={anchor}"
+
+    def test_text_anchor_absent_leaves_defaults(self):
+        """When Unity doesn't set m_Alignment, writer-side defaults must win."""
+        element = RbxUIElement()
+        _apply_text_properties(element, {"m_Text": "t", "m_FontSize": 12})
+        assert element.text_x_alignment == ""
+        assert element.text_y_alignment == ""
+
+    def test_font_map(self):
+        """Phase 4.6: Unity m_Font.m_Name maps to Roblox Font enum labels."""
+        element = RbxUIElement()
+        _apply_text_properties(element, {
+            "m_Text": "t",
+            "m_FontSize": 12,
+            "m_Font": {"m_Name": "Arial"},
+        })
+        assert element.font == "Arial"
+
+    def test_font_unknown_leaves_default(self):
+        element = RbxUIElement()
+        _apply_text_properties(element, {
+            "m_Text": "t",
+            "m_FontSize": 12,
+            "m_Font": {"m_Name": "SomeCustomFont"},
+        })
+        assert element.font == ""
+
+    def test_alignment_and_font_nested_in_font_data(self):
+        """Phase 4.6: SimpleFPS-style serialization stores m_Alignment and
+        m_Font inside m_FontData; extractor must fall back to the nested
+        layout when top-level keys are absent.
+        """
+        element = RbxUIElement()
+        _apply_text_properties(element, {
+            "m_Text": "Battery 1",
+            "m_FontSize": 10,
+            "m_FontData": {
+                "m_Font": {"m_Name": "Arial"},
+                "m_FontSize": 10,
+                "m_Alignment": 7,  # LowerCenter
+            },
+        })
+        assert element.font == "Arial"
+        assert element.text_x_alignment == "Center"
+        assert element.text_y_alignment == "Bottom"
+
+    def test_top_level_alignment_wins_over_nested(self):
+        """When both layouts are present, top-level takes precedence."""
+        element = RbxUIElement()
+        _apply_text_properties(element, {
+            "m_Text": "x",
+            "m_FontSize": 12,
+            "m_Alignment": 0,  # UpperLeft
+            "m_Font": {"m_Name": "Roboto"},
+            "m_FontData": {
+                "m_Alignment": 8,  # LowerRight
+                "m_Font": {"m_Name": "Arial"},
+            },
+        })
+        assert element.text_x_alignment == "Left"
+        assert element.text_y_alignment == "Top"
+        assert element.font == "Roboto"
+
+
+class TestImageScriptGuidFallback:
+    def test_mb_with_image_script_guid_detected_as_image(self):
+        """Phase 4.6: Custom Image subclasses (MonoBehaviour + script GUID
+        fe87c0e1...) are detected as Images even without m_Sprite in props."""
+        from converter.ui_translator import _is_ui_image_mb
+
+        assert _is_ui_image_mb({
+            "m_Script": {"guid": "fe87c0e1cc204ed48ad3b37840f39efc"},
+        })
+        assert not _is_ui_image_mb({"m_Script": {"guid": "abc123"}})
+        assert not _is_ui_image_mb({})
+        assert not _is_ui_image_mb({"m_Script": "not-a-dict"})
