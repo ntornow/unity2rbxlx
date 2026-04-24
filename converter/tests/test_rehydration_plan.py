@@ -197,6 +197,43 @@ def test_final_rewrite_honors_source_path_for_nested_scripts(tmp_path):
     assert not (scripts_dir / "Door.luau").exists()
 
 
+def test_unconverted_md_written_when_entries_exist(tmp_path):
+    """Phase 4.5b: ``_write_unconverted_md`` aggregates animation entries
+    into ``UNCONVERTED.md`` grouped by category.
+    """
+    from converter.animation_converter import AnimationConversionResult
+    pipeline = _make_pipeline(tmp_path)
+    pipeline.state.animation_result = AnimationConversionResult(
+        unconverted=[
+            {"category": "animator_controller",
+             "item": "Enemy.controller",
+             "reason": "binary-encoded .controller"},
+            {"category": "blend_tree",
+             "item": "Player/Move",
+             "reason": "2D BlendType=1 not supported"},
+        ],
+    )
+    pipeline._write_unconverted_md()
+    md = (pipeline.output_dir / "UNCONVERTED.md").read_text()
+    assert "## animator_controller" in md
+    assert "Enemy.controller" in md
+    assert "## blend_tree" in md
+    assert "Player/Move" in md
+
+
+def test_unconverted_md_removed_when_no_entries(tmp_path):
+    """An empty unconverted list means UNCONVERTED.md must not linger."""
+    from converter.animation_converter import AnimationConversionResult
+    pipeline = _make_pipeline(tmp_path)
+    # Seed a stale file as if a prior run had emitted it.
+    stale = pipeline.output_dir / "UNCONVERTED.md"
+    stale.write_text("# Stale\n")
+    pipeline.state.animation_result = AnimationConversionResult(unconverted=[])
+
+    pipeline._write_unconverted_md()
+    assert not stale.exists()
+
+
 def test_rehydration_round_trip_animation_data_preserves_layout(tmp_path):
     """Phase 4.11: animator controller data modules live in `animation_data/`.
     Seed one, rehydrate, mutate in-memory, run the same final rewrite

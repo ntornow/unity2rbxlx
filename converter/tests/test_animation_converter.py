@@ -1555,6 +1555,233 @@ class TestPhase45Routing:
         assert result.routing["Ghost"]["__controller__"]["target"] == "skipped"
         assert not result.animation_data_modules
 
+    def test_binary_controller_emits_unconverted_entry(self, tmp_path: Path) -> None:
+        """Phase 4.5b: binary .controller files surface in UNCONVERTED.md."""
+        ctrl = tmp_path / "Binary.controller"
+        # Non-YAML binary signature fails is_text_yaml(); parser records
+        # the entry into the supplied list and returns None.
+        ctrl.write_bytes(b"\x00\x01\x02binary-not-yaml")
+        out: list = []
+        result = parse_controller_file(ctrl, unconverted_out=out)
+        assert result is None
+        assert len(out) == 1
+        assert out[0]["category"] == "animator_controller"
+        assert "Binary.controller" in out[0]["item"]
+        assert "binary" in out[0]["reason"].lower()
+
+    def test_2d_blend_tree_emits_unconverted_entry(self, tmp_path: Path) -> None:
+        """Phase 4.5b: 2D blend trees surface in UNCONVERTED.md."""
+        ctrl = tmp_path / "TwoD.controller"
+        ctrl.write_text(textwrap.dedent("""\
+            %YAML 1.1
+            %TAG !u! tag:unity3d.com,2011:
+            --- !u!91 &9100000
+            AnimatorController:
+              m_Name: TwoD
+              m_AnimatorLayers:
+              - m_Name: Base Layer
+                m_StateMachine: {fileID: 200}
+            --- !u!1107 &200
+            AnimatorStateMachine:
+              m_ChildStates:
+              - m_State: {fileID: 300}
+              m_DefaultState: {fileID: 300}
+            --- !u!1102 &300
+            AnimatorState:
+              m_Name: Blend
+              m_Motion: {fileID: 400}
+            --- !u!206 &400
+            BlendTree:
+              m_Name: Cartesian
+              m_BlendType: 1
+              m_BlendParameter: X
+              m_Childs:
+              - m_Threshold: 0
+                m_Motion:
+                  guid: cccccccccccccccccccccccccccccccc
+            """))
+        out: list = []
+        c = parse_controller_file(ctrl, unconverted_out=out)
+        assert c is not None
+        assert len(out) == 1
+        assert out[0]["category"] == "blend_tree"
+        assert "TwoD/Blend" in out[0]["item"]
+        assert "2D" in out[0]["reason"]
+
+    def test_nested_2d_blend_tree_emits_unconverted_entry(self, tmp_path: Path) -> None:
+        """Phase 4.5b follow-up (Codex P2 #2): a 1D blend tree whose
+        nested child is itself 2D must also surface the drop in
+        UNCONVERTED.md — the outer parser only reports its own
+        top-level 2D case.
+        """
+        ctrl = tmp_path / "Nested.controller"
+        ctrl.write_text(textwrap.dedent("""\
+            %YAML 1.1
+            %TAG !u! tag:unity3d.com,2011:
+            --- !u!91 &9100000
+            AnimatorController:
+              m_Name: Nested
+              m_AnimatorLayers:
+              - m_Name: Base Layer
+                m_StateMachine: {fileID: 200}
+            --- !u!1107 &200
+            AnimatorStateMachine:
+              m_ChildStates:
+              - m_State: {fileID: 300}
+              m_DefaultState: {fileID: 300}
+            --- !u!1102 &300
+            AnimatorState:
+              m_Name: Move
+              m_Motion: {fileID: 400}
+            --- !u!206 &400
+            BlendTree:
+              m_Name: Outer1D
+              m_BlendType: 0
+              m_BlendParameter: Speed
+              m_Childs:
+              - m_Threshold: 0
+                m_Motion: {fileID: 401}
+            --- !u!206 &401
+            BlendTree:
+              m_Name: Inner2D
+              m_BlendType: 1
+              m_BlendParameter: X
+              m_BlendParameterY: Y
+              m_Childs:
+              - m_Threshold: 0
+                m_Motion:
+                  guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+            """))
+        out: list = []
+        c = parse_controller_file(ctrl, unconverted_out=out)
+        assert c is not None
+        # The outer 1D tree parses; but the nested 2D grandchild
+        # surfaces an entry regardless.
+        assert any(
+            e["category"] == "blend_tree" and "nested" in e["item"]
+            for e in out
+        ), f"expected nested blend_tree entry, got: {out}"
+        # And the outer tree is still emitted 1D with a flattened clip.
+        assert "Outer1D" in c.blend_trees
+        assert c.blend_trees["Outer1D"].entries[0].clip_guid == "a" * 32
+
+    def test_binary_controller_entry_carries_meta_guid(self, tmp_path: Path) -> None:
+        """Phase 4.5b follow-up (Codex P2 #1): binary controller entries
+        carry the `.meta` GUID so convert_animations can scene-filter them.
+        """
+        ctrl = tmp_path / "Bin.controller"
+        ctrl.write_bytes(b"\x00\x01\x02binary")
+        meta = tmp_path / "Bin.controller.meta"
+        meta.write_text("fileFormatVersion: 2\nguid: 12345abcdef0000000000000000000ff\n")
+        out: list = []
+        parse_controller_file(ctrl, unconverted_out=out)
+        assert len(out) == 1
+        assert out[0]["guid"] == "12345abcdef0000000000000000000ff"
+
+    def test_scene_scoping_filters_unconverted_list(self, tmp_path: Path) -> None:
+        """Phase 4.5b follow-up (Codex P2 #1): when scene-scoping is
+        active, UNCONVERTED entries for controllers the run didn't
+        emit must be dropped from `result.unconverted`.
+        """
+        from core.unity_types import ParsedScene
+        assets = tmp_path / "Assets"
+        assets.mkdir()
+        # Controller A referenced by scene, but carries a 2D blend tree.
+        ctrl_a = assets / "A.controller"
+        ctrl_a.write_text(textwrap.dedent("""\
+            %YAML 1.1
+            %TAG !u! tag:unity3d.com,2011:
+            --- !u!91 &9100000
+            AnimatorController:
+              m_Name: A
+              m_AnimatorLayers:
+              - m_Name: Base Layer
+                m_StateMachine: {fileID: 200}
+            --- !u!1107 &200
+            AnimatorStateMachine:
+              m_ChildStates:
+              - m_State: {fileID: 300}
+              m_DefaultState: {fileID: 300}
+            --- !u!1102 &300
+            AnimatorState:
+              m_Name: Stand
+              m_Motion: {fileID: 400}
+            --- !u!206 &400
+            BlendTree:
+              m_Name: StandBlend
+              m_BlendType: 1
+              m_BlendParameter: X
+              m_Childs: []
+            """))
+        ctrl_a.with_suffix(".controller.meta").write_text(
+            "fileFormatVersion: 2\nguid: " + "a" * 32 + "\n"
+        )
+        # Controller B also has a 2D blend tree but is NOT referenced.
+        ctrl_b = assets / "B.controller"
+        ctrl_b.write_text(textwrap.dedent("""\
+            %YAML 1.1
+            %TAG !u! tag:unity3d.com,2011:
+            --- !u!91 &9100000
+            AnimatorController:
+              m_Name: B
+              m_AnimatorLayers:
+              - m_Name: Base Layer
+                m_StateMachine: {fileID: 200}
+            --- !u!1107 &200
+            AnimatorStateMachine:
+              m_ChildStates:
+              - m_State: {fileID: 300}
+              m_DefaultState: {fileID: 300}
+            --- !u!1102 &300
+            AnimatorState:
+              m_Name: Fly
+              m_Motion: {fileID: 400}
+            --- !u!206 &400
+            BlendTree:
+              m_Name: FlyBlend
+              m_BlendType: 1
+              m_BlendParameter: X
+              m_Childs: []
+            """))
+        ctrl_b.with_suffix(".controller.meta").write_text(
+            "fileFormatVersion: 2\nguid: " + "b" * 32 + "\n"
+        )
+        # Scene only references A.
+        scene = ParsedScene(
+            scene_path=assets / "Level.unity",
+            referenced_animator_controller_guids={"a" * 32},
+        )
+
+        from unity.guid_resolver import build_guid_index
+        guid_index = build_guid_index(tmp_path)
+        result = convert_animations(
+            tmp_path, guid_index=guid_index, parsed_scenes=[scene],
+        )
+
+        # A's blend_tree entry stays; B's is filtered out.
+        owners = {e.get("item", "").split("/", 1)[0] for e in result.unconverted
+                  if e["category"] == "blend_tree"}
+        assert "A" in owners, f"expected A in owners, got {owners} (unconverted={result.unconverted})"
+        assert "B" not in owners, f"B should be filtered out, got {owners}"
+
+    def test_generated_tween_script_has_policy_header(self) -> None:
+        """Phase 4.5b: every inline TweenService script references the policy doc."""
+        clip = AnimClip(
+            name="Spin",
+            duration=1.0,
+            loop=True,
+            sample_rate=30.0,
+            curves=[
+                AnimCurve(property_type="euler", path="Spinner",
+                          keyframes=[
+                              AnimKeyframe(time=0.0, value=(0, 0, 0)),
+                              AnimKeyframe(time=1.0, value=(0, 360, 0)),
+                          ]),
+            ],
+        )
+        source = generate_tween_script(clip=clip)
+        assert "inline-over-runtime-wrappers.md" in source
+
     def test_parsed_scenes_scene_prefix_applied(self, tmp_path: Path) -> None:
         """Scene-scoped names: modules get prefixed by the scene stem."""
         from core.unity_types import ParsedScene
