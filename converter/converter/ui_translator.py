@@ -450,9 +450,15 @@ def _apply_text_properties(
             float(color.get("b", 0)),
         )
 
-    # Font: Unity ships m_Font as a ref; m_Name inside carries the
-    # human-readable font name that the Roblox Font enum is keyed on.
-    font_ref = props.get("m_Font", {})
+    # Font + alignment live at the top level on some Unity Text
+    # serializations but inside m_FontData on others (the legacy layout
+    # that ships with SimpleFPS). Check both, top-level first.
+    font_data = props.get("m_FontData")
+    font_data = font_data if isinstance(font_data, dict) else {}
+
+    font_ref = props.get("m_Font")
+    if not isinstance(font_ref, dict):
+        font_ref = font_data.get("m_Font", {})
     font_name = ""
     if isinstance(font_ref, dict):
         font_name = str(font_ref.get("m_Name", "") or "")
@@ -464,6 +470,8 @@ def _apply_text_properties(
     # TMP uses separate m_HorizontalAlignment / m_VerticalAlignment bitfields
     # — not supported here yet; legacy Text covers the common case.
     anchor_raw = props.get("m_Alignment")
+    if anchor_raw is None:
+        anchor_raw = font_data.get("m_Alignment")
     if anchor_raw is not None:
         try:
             anchor = int(float(anchor_raw))

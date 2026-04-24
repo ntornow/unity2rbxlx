@@ -134,6 +134,42 @@ class TestTextProperties:
         })
         assert element.font == ""
 
+    def test_alignment_and_font_nested_in_font_data(self):
+        """Phase 4.6: SimpleFPS-style serialization stores m_Alignment and
+        m_Font inside m_FontData; extractor must fall back to the nested
+        layout when top-level keys are absent.
+        """
+        element = RbxUIElement()
+        _apply_text_properties(element, {
+            "m_Text": "Battery 1",
+            "m_FontSize": 10,
+            "m_FontData": {
+                "m_Font": {"m_Name": "Arial"},
+                "m_FontSize": 10,
+                "m_Alignment": 7,  # LowerCenter
+            },
+        })
+        assert element.font == "Arial"
+        assert element.text_x_alignment == "Center"
+        assert element.text_y_alignment == "Bottom"
+
+    def test_top_level_alignment_wins_over_nested(self):
+        """When both layouts are present, top-level takes precedence."""
+        element = RbxUIElement()
+        _apply_text_properties(element, {
+            "m_Text": "x",
+            "m_FontSize": 12,
+            "m_Alignment": 0,  # UpperLeft
+            "m_Font": {"m_Name": "Roboto"},
+            "m_FontData": {
+                "m_Alignment": 8,  # LowerRight
+                "m_Font": {"m_Name": "Arial"},
+            },
+        })
+        assert element.text_x_alignment == "Left"
+        assert element.text_y_alignment == "Top"
+        assert element.font == "Roboto"
+
 
 class TestImageScriptGuidFallback:
     def test_mb_with_image_script_guid_detected_as_image(self):
