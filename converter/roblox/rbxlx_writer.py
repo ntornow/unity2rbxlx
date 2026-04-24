@@ -609,6 +609,29 @@ def _make_ui_element(parent_xml: ET.Element, elem: RbxUIElement) -> None:
     if hasattr(elem, "text_size") and elem.text_size:
         _add_int(props, "TextSize", elem.text_size)
 
+    # Text alignment + Font (token enums). Only emit when explicitly set so
+    # elements without Unity Text data keep the Roblox defaults.
+    tx = getattr(elem, "text_x_alignment", "") or ""
+    if tx:
+        tx_map = {"Left": 0, "Right": 1, "Center": 2}
+        if tx in tx_map:
+            _add_token(props, "TextXAlignment", tx_map[tx])
+    ty = getattr(elem, "text_y_alignment", "") or ""
+    if ty:
+        ty_map = {"Top": 0, "Center": 1, "Bottom": 2}
+        if ty in ty_map:
+            _add_token(props, "TextYAlignment", ty_map[ty])
+    font_name = getattr(elem, "font", "") or ""
+    if font_name:
+        font_map = {
+            "Legacy": 0, "Arial": 1, "ArialBold": 2,
+            "SourceSans": 3, "SourceSansBold": 4, "SourceSansSemibold": 5,
+            "SourceSansLight": 6, "SourceSansItalic": 7,
+            "Roboto": 35, "RobotoCondensed": 36, "RobotoMono": 37,
+        }
+        if font_name in font_map:
+            _add_token(props, "Font", font_map[font_name])
+
     if hasattr(elem, "image") and elem.image and "guid://" not in elem.image:
         _add_content(props, "Image", elem.image)
 

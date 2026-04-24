@@ -197,7 +197,10 @@ def ref_guid(ref: Any) -> str | None:
 # Document parsing
 # ---------------------------------------------------------------------------
 
-def parse_documents(raw_text: str) -> list[tuple[int, str, dict]]:
+def parse_documents(
+    raw_text: str,
+    warnings_out: list[str] | None = None,
+) -> list[tuple[int, str, dict]]:
     """Parse a Unity YAML file into (classID, fileID, body_dict) triples.
 
     Pre-scans document separators to capture classID and fileID before
@@ -207,6 +210,10 @@ def parse_documents(raw_text: str) -> list[tuple[int, str, dict]]:
     - Negative fileIDs (Prefab Variants, Unity 2018.3+)
     - Stripped documents are filtered out
     - Per-document YAML error recovery
+
+    If ``warnings_out`` is provided, per-document parse errors are appended
+    to it so callers can surface them through the final conversion report
+    instead of only the logger.
     """
     # Step 1: collect (classID, fileID, is_stripped)
     doc_headers: list[tuple[int, str, bool]] = []
@@ -229,8 +236,10 @@ def parse_documents(raw_text: str) -> list[tuple[int, str, dict]]:
         try:
             parsed = yaml.load(chunk, Loader=_YamlLoader)
         except yaml.YAMLError as exc:
-            log.warning("YAML parse error in document %d (data may be lost): %s",
-                        len(docs), str(exc)[:200])
+            msg = f"YAML parse error in document {len(docs)} (data may be lost): {str(exc)[:200]}"
+            log.warning(msg)
+            if warnings_out is not None:
+                warnings_out.append(msg)
             docs.append(None)
             continue
         docs.append(parsed)

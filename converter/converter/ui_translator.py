@@ -35,6 +35,48 @@ _UI_CLASS_MAP: dict[str, str] = {
     "ScrollRect": "ScrollingFrame",
 }
 
+# Unity font name -> Roblox Font enum label. Unknown fonts fall back to
+# SourceSans (the Roblox default) so legacy content still renders.
+_FONT_MAP: dict[str, str] = {
+    "Arial": "Arial",
+    "Arial-Bold": "ArialBold",
+    "ArialMT": "Arial",
+    "Roboto": "Roboto",
+    "Roboto-Bold": "Roboto",
+    "LiberationSans": "SourceSans",
+}
+
+# Unity TextAnchor (0..8, row-major UpperLeft..LowerRight) split into
+# horizontal + vertical Roblox TextAlignment tokens.
+_TEXT_ANCHOR_X: dict[int, str] = {
+    0: "Left",   1: "Center", 2: "Right",
+    3: "Left",   4: "Center", 5: "Right",
+    6: "Left",   7: "Center", 8: "Right",
+}
+_TEXT_ANCHOR_Y: dict[int, str] = {
+    0: "Top",    1: "Top",    2: "Top",
+    3: "Center", 4: "Center", 5: "Center",
+    6: "Bottom", 7: "Bottom", 8: "Bottom",
+}
+
+# UnityEngine.UI.Image script GUID — MonoBehaviours using this script are
+# Image components that the scene parser can't distinguish by classID alone.
+_UI_IMAGE_SCRIPT_GUID_PREFIX = "fe87c0e1cc204ed48ad3"
+
+
+def _is_ui_image_mb(props: dict[str, Any]) -> bool:
+    """Detect a MonoBehaviour-wrapped UnityEngine.UI.Image by its script GUID.
+
+    Custom Image subclasses may omit m_Sprite from serialized fields while
+    still rendering an image at runtime; matching the known Image script
+    GUID is the fallback.
+    """
+    script = props.get("m_Script", {})
+    if not isinstance(script, dict):
+        return False
+    guid = script.get("guid", "")
+    return isinstance(guid, str) and guid.startswith(_UI_IMAGE_SCRIPT_GUID_PREFIX)
+
 
 def convert_canvas(canvas_nodes: list[SceneNode]) -> list[RbxScreenGui]:
     """Convert a list of Unity Canvas root nodes to Roblox ScreenGui objects.
@@ -181,7 +223,7 @@ def _convert_ui_element(node: SceneNode) -> RbxUIElement | None:
                 if element_class == "Frame":
                     element_class = "TextLabel"
                 ui_properties.update(props)
-            if "m_Sprite" in props:
+            if "m_Sprite" in props or _is_ui_image_mb(props):
                 if element_class == "Frame":
                     element_class = "ImageLabel"
                 ui_properties.update(props)
@@ -321,6 +363,18 @@ def _extract_rect_transform(
     pivot_x = float(pivot.get("x", 0.5)) if isinstance(pivot, dict) else 0.5
     pivot_y = float(pivot.get("y", 0.5)) if isinstance(pivot, dict) else 0.5
 
+    # Partial-anchor warning: one axis stretched, the other absolute.
+    # Roblox UDim2 handles the mixed case, but the visual result often
+    # diverges from Unity when m_Pivot/anchor offsets interact oddly.
+    stretched_x = abs(amin_x - amax_x) >= 0.001
+    stretched_y = abs(amin_y - amax_y) >= 0.001
+    if stretched_x != stretched_y:
+        log.warning(
+            "RectTransform uses mixed stretch+absolute anchoring "
+            "(anchor_min=(%g,%g), anchor_max=(%g,%g)); layout may differ from Unity",
+            amin_x, amin_y, amax_x, amax_y,
+        )
+
     # If anchors are the same point -> absolute positioning.
     if abs(amin_x - amax_x) < 0.001 and abs(amin_y - amax_y) < 0.001:
         # Size is from sizeDelta.
@@ -395,6 +449,29 @@ def _apply_text_properties(
             float(color.get("g", 0)),
             float(color.get("b", 0)),
         )
+
+    # Font: Unity ships m_Font as a ref; m_Name inside carries the
+    # human-readable font name that the Roblox Font enum is keyed on.
+    font_ref = props.get("m_Font", {})
+    font_name = ""
+    if isinstance(font_ref, dict):
+        font_name = str(font_ref.get("m_Name", "") or "")
+    mapped_font = _FONT_MAP.get(font_name)
+    if mapped_font:
+        element.font = mapped_font
+
+    # Alignment: Unity TextAnchor is a single 0..8 enum covering both axes.
+    # TMP uses separate m_HorizontalAlignment / m_VerticalAlignment bitfields
+    # — not supported here yet; legacy Text covers the common case.
+    anchor_raw = props.get("m_Alignment")
+    if anchor_raw is not None:
+        try:
+            anchor = int(float(anchor_raw))
+        except (TypeError, ValueError):
+            anchor = -1
+        if anchor in _TEXT_ANCHOR_X:
+            element.text_x_alignment = _TEXT_ANCHOR_X[anchor]
+            element.text_y_alignment = _TEXT_ANCHOR_Y[anchor]
 
     # Background transparency (text elements are usually transparent).
     element.background_transparency = 1.0
