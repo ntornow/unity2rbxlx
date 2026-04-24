@@ -197,6 +197,46 @@ def test_final_rewrite_honors_source_path_for_nested_scripts(tmp_path):
     assert not (scripts_dir / "Door.luau").exists()
 
 
+def test_rehydration_round_trip_animation_data_preserves_layout(tmp_path):
+    """Phase 4.11: animator controller data modules live in `animation_data/`.
+    Seed one, rehydrate, mutate in-memory, run the same final rewrite
+    policy as write_output, and assert the file is overwritten in place
+    with no duplicate at the scripts/ root.
+    """
+    pipeline = _make_pipeline(tmp_path)
+    scripts_dir = pipeline.output_dir / "scripts"
+    (scripts_dir / "animation_data").mkdir(parents=True)
+
+    original = "-- animator controller v1 data\nlocal Data = {}\nreturn Data\n"
+    (scripts_dir / "animation_data" / "Level1_PlayerAnimController.luau").write_text(original)
+
+    pipeline._rehydrate_scripts_from_disk(scripts_dir)
+
+    # Sanity: rehydrated, categorized as ModuleScript, source_path recorded.
+    script = next(
+        s for s in pipeline.state.rbx_place.scripts
+        if s.name == "Level1_PlayerAnimController"
+    )
+    assert script.script_type == "ModuleScript"
+    assert script.source_path == "animation_data/Level1_PlayerAnimController.luau"
+    assert script.source == original
+
+    # Mutate in memory (simulating require-injection / reclassification).
+    new_source = "-- animator controller v2 data\nlocal Data = {updated=true}\nreturn Data\n"
+    script.source = new_source
+
+    # Mirror the final write_output rewrite loop — source_path routes back.
+    for s in pipeline.state.rbx_place.scripts:
+        if getattr(s, "source_path", None):
+            out_path = scripts_dir / s.source_path
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(s.source, encoding="utf-8")
+
+    assert (scripts_dir / "animation_data" / "Level1_PlayerAnimController.luau").read_text() == new_source
+    # No duplicate at scripts/ root.
+    assert not (scripts_dir / "Level1_PlayerAnimController.luau").exists()
+
+
 def test_rehydration_round_trip_nested_dirs_preserves_layout(tmp_path):
     """End-to-end: seed nested scripts, rehydrate, mutate in memory, run the
     final rewrite loop as-defined in pipeline.write_output, and confirm the

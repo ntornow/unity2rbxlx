@@ -350,3 +350,63 @@ Plus three prerequisite fixes from earlier in the same session:
   Commit `11dc5c9`.
 - [x] **`.context/` ungitignored.** Per-workstation AI-assistant state
   added to `.gitignore`. Commit `8fc45e1`.
+
+## Phase 4 merge plan — execution log (2026-04-24 session)
+
+Plan sources:
+`https://github.com/jiazou/unity-roblox-game-converter/blob/main/MERGE_PLAN.md`
+`https://github.com/jiazou/unity-roblox-game-converter/blob/main/MERGE_PLAN_PHASE4.md`
+
+Rollback point tagged before PR 1: `phase4-rollback-point` (at
+commit `385c669`). Six-PR sequence: PR 1 (4.1/4.6/4.7/4.11),
+PR 2 (4.5 — animation routing), PR 3 (4.2/4.8 — materials +
+vertex color), PR 4 (4.3/4.9), PR 5 (4.10), PR 6 (4.4 diagnostics).
+
+### PR 1 — 4.1 / 4.6 / 4.7 / 4.11
+
+Dest-drift audit (against `main` at `385c669`) shrank PR 1 from
+the plan's ~260 lines to ~80. Scope decisions:
+
+- **4.1 api_mappings — SKIPPED.** Dest (1071 lines) is the canonical
+  superset; source (492 lines) adds no keys dest lacks, and its
+  animator control entries (`animatorBridge:SetBool` etc.) violate
+  the inline-over-runtime policy that dest's `:SetAttribute` mapping
+  already honors. Regression guard stays in
+  `test_no_rejected_bridges.py`.
+- **4.6 ui_translator — partial port.** Added `_FONT_MAP` (Unity
+  font name → Roblox `Enum.Font` label), `_TEXT_ANCHOR_X`/`_Y`
+  (9-point TextAnchor split), MonoBehaviour UI-Image script-GUID
+  fallback (`fe87c0e1...`), and partial-anchor mixed-stretch warning
+  in `_extract_rect_transform`. `RbxUIElement` gained
+  `text_x_alignment` / `text_y_alignment` / `font` fields;
+  `rbxlx_writer` emits the corresponding tokens only when set.
+  Y-inversion audit: dest's two-branch
+  logic is semantically equivalent to source's anchor-center form;
+  no behavior change.
+- **4.7 scene_parser — 2 small additions.** New
+  `ParsedScene.referenced_animator_controller_guids: set[str]` +
+  `ParsedScene.parse_warnings: list[str]`. Pass 4 in
+  `scene_parser.py` aggregates `m_Controller` GUIDs off Animator
+  components (classID 95) so 4.5 can enumerate controllers in one
+  pass instead of walking every part. `parse_documents` now takes
+  an optional `warnings_out` list so scene YAML errors reach the
+  final conversion report instead of being logger-only. Existing
+  per-part `AnimatorController` attribute in `scene_converter.py`
+  kept; the new set is additive.
+- **4.11 disk rewrite — test-only.** The 2026-04-24 `source_path`
+  work (commit `0292f79`) already made rehydration generic across
+  any subdir, so `animation_data/` is covered. Added a focused
+  round-trip test for that subdir; `packages/` emission remains a
+  follow-up deferred until 4.10 actually writes to it.
+
+### Deferred follow-ups from PR 1
+
+- **4.11.packages** — `packages/` subdir emission + rehydration
+  round-trip test. Deferred until PR 5 (4.10
+  `generate_prefab_packages`) lands. Without 4.10, nothing writes
+  there so the dir never exists.
+- **TMP alignment** — `m_HorizontalAlignment` / `m_VerticalAlignment`
+  bitfields on TextMeshPro components aren't split into
+  `text_x_alignment` / `text_y_alignment` yet; only legacy
+  `m_Alignment` (single 0..8 enum) is handled. Revisit if a test
+  project exercises TMP-only text layout issues.

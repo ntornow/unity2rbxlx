@@ -113,6 +113,43 @@ class TestParseScene:
         with pytest.raises(FileNotFoundError):
             parse_scene("/nonexistent/path.unity")
 
+    def test_parse_warnings_list_exists(self):
+        """Phase 4.7: ParsedScene.parse_warnings accumulates per-doc YAML errors."""
+        scene = parse_scene(FIXTURES_DIR / "simple_scene.yaml")
+        # Clean fixture — field must exist and be empty, not missing.
+        assert isinstance(scene.parse_warnings, list)
+
+    def test_animator_controller_guid_aggregated(self, tmp_path):
+        """Phase 4.7: Animator components surface their m_Controller GUID on
+        ParsedScene.referenced_animator_controller_guids for 4.5 routing.
+        """
+        scene_yaml = """%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &100
+GameObject:
+  m_Name: Player
+  m_IsActive: 1
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 101}
+  - component: {fileID: 102}
+--- !u!4 &101
+Transform:
+  m_GameObject: {fileID: 100}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_Father: {fileID: 0}
+--- !u!95 &102
+Animator:
+  m_GameObject: {fileID: 100}
+  m_Controller: {fileID: 9100000, guid: deadbeefcafebabe1234567890abcdef, type: 2}
+"""
+        scene_file = tmp_path / "anim_scene.unity"
+        scene_file.write_text(scene_yaml)
+        scene = parse_scene(scene_file)
+        assert "deadbeefcafebabe1234567890abcdef" in scene.referenced_animator_controller_guids
+
 
 class TestParseRealScene:
     """Tests against real test projects (skipped if not available)."""

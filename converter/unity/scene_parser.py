@@ -32,6 +32,7 @@ from unity.yaml_parser import (
     CID_MESH_FILTER,
     CID_MESH_RENDERER,
     CID_SKINNED_MESH_RENDERER,
+    CID_ANIMATOR,
     KNOWN_COMPONENT_CIDS,
     COMPONENT_CID_TO_NAME,
     extract_vec3,
@@ -65,9 +66,9 @@ def parse_scene(scene_path: str | Path) -> ParsedScene:
             return ParsedScene(scene_path=scene_path)
 
     raw_text = scene_path.read_text(encoding="utf-8", errors="replace")
-    triples = parse_documents(raw_text)
-
     result = ParsedScene(scene_path=scene_path)
+    triples = parse_documents(raw_text, warnings_out=result.parse_warnings)
+
     result.raw_documents = [doc for _, _, doc in triples]
 
     # ------------------------------------------------------------------
@@ -185,6 +186,12 @@ def parse_scene(scene_path: str | Path) -> ParsedScene:
                 guid = ref_guid(mat_ref)
                 if guid:
                     result.referenced_material_guids.add(guid)
+
+        # Extract Animator controller GUID for 4.5 routing.
+        if cid == CID_ANIMATOR:
+            ctrl_guid = ref_guid(body.get("m_Controller", {}))
+            if ctrl_guid:
+                result.referenced_animator_controller_guids.add(ctrl_guid)
 
     # ------------------------------------------------------------------
     # Pass 5: Wire parent/child hierarchy
