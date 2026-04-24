@@ -236,6 +236,11 @@ class AnimationConversionResult:
     # Serialized into conversion_plan.json under the "animation_routing" key
     # so rehydration and downstream consumers can see what got routed where.
     routing: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
+    # Entries describing unconverted animation features — binary controllers
+    # we can't parse, 2D blend trees we don't emit, etc. The pipeline
+    # aggregates these into UNCONVERTED.md so users know what was dropped.
+    # Each entry: {"category": str, "item": str, "reason": str}.
+    unconverted: list[dict[str, str]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -363,12 +368,18 @@ def _parse_vector_curve(curve_data: dict[str, Any], property_type: str) -> AnimC
         return None
 
     curve = AnimCurve(property_type=property_type, path=path)
+    dropped_count = 0
 
     for kf_data in keyframe_list:
         if not isinstance(kf_data, dict):
+            dropped_count += 1
             continue
 
-        time = float(kf_data.get("time", 0))
+        try:
+            time = float(kf_data.get("time", 0))
+        except (TypeError, ValueError):
+            dropped_count += 1
+            continue
         value_data = kf_data.get("value", {})
 
         if isinstance(value_data, dict):
@@ -390,6 +401,7 @@ def _parse_vector_curve(curve_data: dict[str, Any], property_type: str) -> AnimC
         elif isinstance(value_data, (int, float)):
             value = (float(value_data),)
         else:
+            dropped_count += 1
             continue
 
         kf = AnimKeyframe(time=time, value=value)
@@ -422,6 +434,12 @@ def _parse_vector_curve(curve_data: dict[str, Any], property_type: str) -> AnimC
 
         curve.keyframes.append(kf)
 
+    if dropped_count:
+        log.warning(
+            "Dropped %d malformed keyframe(s) from %s curve on path %r",
+            dropped_count, property_type, path,
+        )
+
     return curve if curve.keyframes else None
 
 
@@ -429,7 +447,10 @@ def _parse_vector_curve(curve_data: dict[str, Any], property_type: str) -> AnimC
 # .controller file parsing
 # ---------------------------------------------------------------------------
 
-def parse_controller_file(controller_path: Path) -> AnimatorController | None:
+def parse_controller_file(
+    controller_path: Path,
+    unconverted_out: list[dict[str, str]] | None = None,
+) -> AnimatorController | None:
     """Parse a Unity .controller file and return an AnimatorController.
 
     Args:
@@ -443,7 +464,17 @@ def parse_controller_file(controller_path: Path) -> AnimatorController | None:
         return None
 
     if not is_text_yaml(controller_path):
-        log.debug("Controller file is binary, skipping: %s", controller_path.name)
+        log.warning(
+            "Controller file is binary, skipping: %s "
+            "(UnityPy text-export required to parse)",
+            controller_path.name,
+        )
+        if unconverted_out is not None:
+            unconverted_out.append({
+                "category": "animator_controller",
+                "item": controller_path.name,
+                "reason": "binary-encoded .controller; UnityPy text-export required",
+            })
         return None
 
     try:
@@ -520,7 +551,11 @@ def parse_controller_file(controller_path: Path) -> AnimatorController | None:
                 if motion_fid and motion_fid in docs_by_fid:
                     bt_cid, bt_body = docs_by_fid[motion_fid]
                     if bt_cid == 206:
-                        bt = _parse_blend_tree(bt_body, docs_by_fid, state_name)
+                        bt = _parse_blend_tree(
+                            bt_body, docs_by_fid, state_name,
+                            unconverted_out=unconverted_out,
+                            controller_name=name,
+                        )
                         if bt is not None:
                             controller.blend_trees[bt.name] = bt
                             blend_tree_name = bt.name
@@ -587,6 +622,8 @@ def _parse_blend_tree(
     bt_body: dict[str, Any],
     docs_by_fid: dict[str, tuple[int, dict]],
     owning_state_name: str,
+    unconverted_out: list[dict[str, str]] | None = None,
+    controller_name: str = "",
 ) -> BlendTree | None:
     """Parse a BlendTree YAML body into a 1D BlendTree structure.
 
@@ -602,6 +639,13 @@ def _parse_blend_tree(
             "keeping fallback clip only",
             owning_state_name, blend_type,
         )
+        if unconverted_out is not None:
+            qual = f"{controller_name}/{owning_state_name}" if controller_name else owning_state_name
+            unconverted_out.append({
+                "category": "blend_tree",
+                "item": qual,
+                "reason": f"2D BlendType={blend_type} not supported; first-leaf clip used as fallback",
+            })
         return None
 
     # Unity serialized name lives on the BlendTree doc; fall back to the
@@ -766,6 +810,9 @@ def generate_tween_script(
     lines.append("-- Auto-generated animation script")
     lines.append(f"-- Converted from Unity AnimationClip: {clip.name}")
     lines.append(f"-- Duration: {clip.duration:.2f}s, Loop: {clip.loop}")
+    lines.append(
+        "-- Inline TweenService per docs/design/inline-over-runtime-wrappers.md"
+        " (no TransformAnimator / AnimatorBridge require).")
     lines.append("")
     lines.append("local TweenService = game:GetService(\"TweenService\")")
     lines.append("local RunService = game:GetService(\"RunService\")")
@@ -1388,12 +1435,16 @@ def export_clip_keyframes(clip: AnimClip) -> dict[str, Any]:
 def discover_animations(
     unity_project_path: Path,
     guid_index: Any = None,
+    unconverted_out: list[dict[str, str]] | None = None,
 ) -> tuple[list[AnimClip], list[AnimatorController]]:
     """Discover and parse all .anim and .controller files in a Unity project.
 
     Args:
         unity_project_path: Root path of the Unity project.
         guid_index: Optional GUID index for resolving clip references.
+        unconverted_out: When supplied, ``parse_controller_file`` appends
+            entries here for binary controllers and 2D blend trees that
+            couldn't be emitted. Pipeline writes these to UNCONVERTED.md.
 
     Returns:
         Tuple of (clips, controllers).
@@ -1415,7 +1466,7 @@ def discover_animations(
 
     # Find all .controller files
     for ctrl_path in sorted(assets_dir.rglob("*.controller")):
-        ctrl = parse_controller_file(ctrl_path)
+        ctrl = parse_controller_file(ctrl_path, unconverted_out=unconverted_out)
         if ctrl:
             controllers.append(ctrl)
             log.debug("Parsed animator controller: %s (%d states, %d params)",
@@ -1452,13 +1503,17 @@ def convert_animations(
         AnimationConversionResult with clips, controllers, generated
         scripts, and per-clip routing metadata.
     """
-    clips, controllers = discover_animations(unity_project_path, guid_index)
+    unconverted: list[dict[str, str]] = []
+    clips, controllers = discover_animations(
+        unity_project_path, guid_index, unconverted_out=unconverted,
+    )
 
     result = AnimationConversionResult(
         clips=clips,
         controllers=controllers,
         total_clips=len(clips),
         total_controllers=len(controllers),
+        unconverted=unconverted,
     )
 
     # Path lookup + GUID → clip name for BlendTree entry resolution.

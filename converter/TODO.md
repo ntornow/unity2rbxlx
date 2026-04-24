@@ -460,9 +460,38 @@ populated with correct per-clip reasons, `u2r.py validate` 0 errors.
   on `PrefabTemplate` + unioning into the scene set is the right
   fix; safe to defer since the unscoped fallback keeps existing
   projects working.
-- **Binary `.controller` + 2D blend tree UNCONVERTED.md entries.** PR 2b.
-- **Malformed keyframe `log.warning`.** PR 2b.
-- **Inline-policy header in generated transform-only scripts.** PR 2b.
 - **Transform-only prefab scanning** (one tween script per prefab
   animator, not just per scene) — plan calls this out; revisit
   alongside the prefab-animator aggregation above.
+
+### PR 2b — 4.5 robustness polish
+
+- **`UNCONVERTED.md` writer.** New `Pipeline._write_unconverted_md()`
+  aggregates `AnimationConversionResult.unconverted` entries grouped
+  by category (binary `.controller`, 2D blend tree) into
+  `<output>/UNCONVERTED.md` at the tail of `write_output`. Removes
+  any stale file when no entries remain so the absence of the md is
+  itself signal.
+- **Unconverted-entry plumbing.** `parse_controller_file` and
+  `_parse_blend_tree` take an optional `unconverted_out: list`
+  kwarg; `discover_animations` and `convert_animations` thread it
+  through. Keeps the API additive — older callers that don't pass
+  a list still work.
+- **Malformed keyframe `log.warning`.** `_parse_vector_curve` now
+  counts and logs skipped non-dict / non-numeric keyframes per
+  curve with path context. Previously silent drops.
+- **Inline-policy header in generated transform-only scripts.**
+  `generate_tween_script` prepends a `-- Inline TweenService per
+  docs/design/inline-over-runtime-wrappers.md (no TransformAnimator
+  / AnimatorBridge require)` comment to every output so readers can
+  find the governing design doc without grepping the codebase.
+- **Bridge-leak test tightened.** The regression guard now matches
+  only `require\\s*\\(.*AnimatorBridge.*\\)` patterns instead of
+  bare substrings — the new policy header intentionally names the
+  deleted bridges in a comment.
+
+Verification: fast suite 596 passed (+5); full SimpleFPS conversion
+still produces 7 transform-only scripts with the new header; no
+`UNCONVERTED.md` emitted for SimpleFPS (no binary controllers, no
+2D blend trees); `luau-analyze` (SyntaxError filter) passes 7/7;
+`u2r.py validate` 0 errors.

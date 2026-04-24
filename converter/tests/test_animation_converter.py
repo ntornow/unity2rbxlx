@@ -1555,6 +1555,77 @@ class TestPhase45Routing:
         assert result.routing["Ghost"]["__controller__"]["target"] == "skipped"
         assert not result.animation_data_modules
 
+    def test_binary_controller_emits_unconverted_entry(self, tmp_path: Path) -> None:
+        """Phase 4.5b: binary .controller files surface in UNCONVERTED.md."""
+        ctrl = tmp_path / "Binary.controller"
+        # Non-YAML binary signature fails is_text_yaml(); parser records
+        # the entry into the supplied list and returns None.
+        ctrl.write_bytes(b"\x00\x01\x02binary-not-yaml")
+        out: list = []
+        result = parse_controller_file(ctrl, unconverted_out=out)
+        assert result is None
+        assert len(out) == 1
+        assert out[0]["category"] == "animator_controller"
+        assert "Binary.controller" in out[0]["item"]
+        assert "binary" in out[0]["reason"].lower()
+
+    def test_2d_blend_tree_emits_unconverted_entry(self, tmp_path: Path) -> None:
+        """Phase 4.5b: 2D blend trees surface in UNCONVERTED.md."""
+        ctrl = tmp_path / "TwoD.controller"
+        ctrl.write_text(textwrap.dedent("""\
+            %YAML 1.1
+            %TAG !u! tag:unity3d.com,2011:
+            --- !u!91 &9100000
+            AnimatorController:
+              m_Name: TwoD
+              m_AnimatorLayers:
+              - m_Name: Base Layer
+                m_StateMachine: {fileID: 200}
+            --- !u!1107 &200
+            AnimatorStateMachine:
+              m_ChildStates:
+              - m_State: {fileID: 300}
+              m_DefaultState: {fileID: 300}
+            --- !u!1102 &300
+            AnimatorState:
+              m_Name: Blend
+              m_Motion: {fileID: 400}
+            --- !u!206 &400
+            BlendTree:
+              m_Name: Cartesian
+              m_BlendType: 1
+              m_BlendParameter: X
+              m_Childs:
+              - m_Threshold: 0
+                m_Motion:
+                  guid: cccccccccccccccccccccccccccccccc
+            """))
+        out: list = []
+        c = parse_controller_file(ctrl, unconverted_out=out)
+        assert c is not None
+        assert len(out) == 1
+        assert out[0]["category"] == "blend_tree"
+        assert "TwoD/Blend" in out[0]["item"]
+        assert "2D" in out[0]["reason"]
+
+    def test_generated_tween_script_has_policy_header(self) -> None:
+        """Phase 4.5b: every inline TweenService script references the policy doc."""
+        clip = AnimClip(
+            name="Spin",
+            duration=1.0,
+            loop=True,
+            sample_rate=30.0,
+            curves=[
+                AnimCurve(property_type="euler", path="Spinner",
+                          keyframes=[
+                              AnimKeyframe(time=0.0, value=(0, 0, 0)),
+                              AnimKeyframe(time=1.0, value=(0, 360, 0)),
+                          ]),
+            ],
+        )
+        source = generate_tween_script(clip=clip)
+        assert "inline-over-runtime-wrappers.md" in source
+
     def test_parsed_scenes_scene_prefix_applied(self, tmp_path: Path) -> None:
         """Scene-scoped names: modules get prefixed by the scene stem."""
         from core.unity_types import ParsedScene

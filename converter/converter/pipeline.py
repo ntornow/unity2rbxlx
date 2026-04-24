@@ -1784,6 +1784,12 @@ script.Disabled = true
             rbxlx_path.write_text(raw_xml, encoding="utf-8")
             log.info("[write_output] Stripped %d invalid local texture paths from SurfaceAppearances", stripped)
 
+        # UNCONVERTED.md — human-readable log of features the converter
+        # deliberately dropped (e.g. binary .controller files that need
+        # UnityPy text-export, 2D blend trees). Sources contribute via
+        # their result objects' ``unconverted`` list.
+        self._write_unconverted_md()
+
         # Structured conversion report (see converter.report_generator).
         # The interactive report() command decorates this file in place.
         report_path = self.output_dir / "conversion_report.json"
@@ -1794,6 +1800,49 @@ script.Disabled = true
         # Persist context.
         self.ctx.save(self._context_path)
         log.info("[write_output] Context saved to %s", self._context_path)
+
+    def _write_unconverted_md(self) -> None:
+        """Aggregate ``unconverted`` entries from result objects into
+        ``UNCONVERTED.md``. When nothing is unconverted, the file is
+        removed so stale state from prior runs doesn't linger.
+        """
+        from config import UNCONVERTED_FILENAME
+
+        sections: dict[str, list[dict[str, str]]] = {}
+        if self.state.animation_result is not None:
+            entries = getattr(self.state.animation_result, "unconverted", None) or []
+            for entry in entries:
+                category = entry.get("category", "misc")
+                sections.setdefault(category, []).append(entry)
+
+        out_path = self.output_dir / UNCONVERTED_FILENAME
+        if not sections:
+            if out_path.exists():
+                out_path.unlink()
+            return
+
+        lines = [
+            "# UNCONVERTED",
+            "",
+            "Features the converter deliberately dropped from this run. "
+            "Each bullet is a feature that has no in-policy Roblox "
+            "equivalent (or requires source data the converter can't "
+            "parse yet). See TODO.md + the Phase 4 plan for roadmap.",
+            "",
+        ]
+        for category in sorted(sections):
+            lines.append(f"## {category}")
+            lines.append("")
+            for entry in sections[category]:
+                item = entry.get("item", "?")
+                reason = entry.get("reason", "")
+                lines.append(f"- `{item}` — {reason}")
+            lines.append("")
+        out_path.write_text("\n".join(lines), encoding="utf-8")
+        log.info(
+            "[write_output] UNCONVERTED.md written (%d entries across %d categories)",
+            sum(len(v) for v in sections.values()), len(sections),
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers

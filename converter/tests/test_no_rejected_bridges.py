@@ -125,9 +125,15 @@ def test_generated_transform_only_script_has_no_deleted_bridge_require():
     )
     source = generate_tween_script(clip=clip)
     assert source is not None
-    for bad in ("AnimatorBridge", "TransformAnimator",
-                "bridge/TransformAnimator", "bridge/AnimatorBridge"):
-        assert bad not in source, f"generated transform-only script references {bad}"
+    # Match ``require(... AnimatorBridge ...)`` or ``require(... TransformAnimator ...)``
+    # — plain mentions are fine (the inline-policy header comment names
+    # them) but a live runtime import is the regression we care about.
+    import re
+    for bad in ("AnimatorBridge", "TransformAnimator"):
+        pattern = rf"require\s*\([^)]*{bad}[^)]*\)"
+        assert not re.search(pattern, source), (
+            f"generated transform-only script require()s {bad}"
+        )
 
 
 def test_animator_runtime_luau_syntax():
