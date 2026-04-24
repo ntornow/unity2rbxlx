@@ -1670,6 +1670,17 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, Any]:
     for prefab in prefabs:
         _make_part(server_storage, prefab)
 
+    # ---- ReplicatedStorage.Templates (Phase 4.10 prefab packages) --------
+    # Per-prefab RbxPart trees that scripts :Clone() at runtime. See
+    # docs/design/inline-over-runtime-wrappers.md — the companion
+    # PrefabSpawner helper is stateless and only wraps Instance:Clone.
+    replicated_templates = getattr(place, "replicated_templates", None) or []
+    if replicated_templates:
+        templates_folder, _ = _make_item(replicated_storage, "Folder", "Templates")
+        for template in replicated_templates:
+            _make_part(templates_folder, template)
+            stats["parts_written"] += _count_parts(template)
+
     # ---- Lights / sounds (standalone, attached to place level) -----------
     standalone_lights: list[RbxLight] = getattr(place, "lights", None) or []
     for light in standalone_lights:

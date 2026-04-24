@@ -893,3 +893,75 @@ form because it DID influence Player.luau's writer side — the
 post-PR4 Player now exports `_G.Player.hasKey` + sets the init
 attribute, which is half the bridge. Just not enough for Door to
 pick up on its own.
+
+### PR 5 — 4.10 generate_prefab_packages + 4.11.packages
+
+Scope-audited from plan's ~300 line estimate down to ~220 code
+lines by skipping standalone `.rbxm` file emission (source does
+it as a Toolbox convenience; dest doesn't have write_rbxm
+infrastructure and gameplay doesn't use it at runtime).
+
+Architecture decisions made before code landed:
+1. **Package location** — embedded in the rbxlx under
+   `ReplicatedStorage.Templates` as a Folder of Models. No
+   standalone `.rbxm` files.
+2. **Spawner API** — new `PrefabSpawner.luau` ModuleScript
+   exposing `Spawner.spawn(name, parent?, cframe?)` wrapping
+   `Templates:WaitForChild(name):Clone()`. Thin stateless helper;
+   in-policy per `docs/design/inline-over-runtime-wrappers.md`
+   (it's convenience, not a runtime bridge).
+3. **Filtering** — emit ONLY prefabs referenced by at least one
+   script's field value in `ctx.serialized_field_refs`
+   (from PR 4). Prevents the rbxlx from bloating with every
+   parsed prefab. Unreferenced prefabs still expand inline in
+   scenes via existing `scene_converter` code.
+4. **Disk layout** — `packages/manifest.json` records emitted +
+   missing template names. Closes Phase 4.11's `packages/`
+   deferred piece (`source_path` rehydration already generic from
+   PR 1; the spawner's `source_path = "packages/PrefabSpawner.luau"`
+   round-trips automatically).
+
+New code:
+- `converter/converter/prefab_packages.py` (~180 lines) —
+  `generate_prefab_packages()` + helpers + `_SPAWNER_LUAU`.
+  Reuses existing `scene_converter._convert_prefab_node` for the
+  actual Unity PrefabNode → RbxPart conversion.
+- `RbxPlace.replicated_templates: list[RbxPart]` — new field.
+- `Pipeline._generate_prefab_packages()` — called from
+  `write_output` after runtime-module injection. Writes into
+  `state.rbx_place.replicated_templates` + appends
+  PrefabSpawner as an RbxScript.
+- `rbxlx_writer` emits a `Folder` named `Templates` inside
+  `ReplicatedStorage` with the template parts as children.
+- `u2r.py validate` whitelists `Folder` as a valid class.
+
+Tests (16 new in `tests/test_prefab_packages.py`):
+- `_collect_referenced_prefab_names` — filters audio refs
+- Default filter vs `include_all` override
+- Null/empty library handling
+- Unconverted entries for null root, None-returning
+  converter, raising converter
+- PrefabSpawner script fields (name, type, source_path,
+  inline-policy reference in the source)
+- Manifest persistence + missing-prefab reporting
+- `RbxPlace.replicated_templates` default initialization
+
+Verification:
+- Fast suite: 679 passed (+16 new), 2 skipped, 25 deselected.
+- SimpleFPS smoke (`--no-upload --no-ai --no-resolve`): 944 parts,
+  7 templates emitted into `ReplicatedStorage.Templates`
+  (Explosion, Flare, Plane Flying, PlaneBullet, Rifle, Smoke,
+  TurretBullet — exactly the distinct prefab names from PR 4's
+  18 serialized_field_refs), 0 unconverted, 0 referenced-but-missing.
+  `packages/manifest.json` written. `u2r.py validate` 0 errors
+  after Folder whitelist fix.
+
+Deferred follow-ups:
+- Standalone `.rbxm` file output per prefab — Toolbox
+  convenience; no runtime dependency.
+- Material wiring into templates — reuses what
+  `_convert_prefab_node` already produces; full SurfaceAppearance
+  round-trip through templates unverified on this smoke because
+  `--no-upload` means no real asset IDs.
+- Per-prefab variant-chain preservation in templates — currently
+  emits the flattened resolved form.

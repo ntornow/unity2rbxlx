@@ -406,6 +406,8 @@ def validate(rbxlx_file: str) -> None:
         # Physics
         "WeldConstraint", "HingeConstraint", "SpringConstraint",
         "BallSocketConstraint",
+        # Containers
+        "Folder",
     }
     invalid = {cls for cls in stats if cls not in valid_classes}
 
