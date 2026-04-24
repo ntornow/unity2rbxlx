@@ -64,13 +64,87 @@ _BUILTIN_TRANSPARENT_SHADER_IDS = frozenset({
 })
 
 
+# Shader-category taxonomy. Keeps the routing benefit of source's
+# ShaderInfo without the full .shader file parsing (deferred as a
+# follow-up — no test project exercises custom HLSL yet).
+_SHADER_CATEGORIES: tuple[str, ...] = (
+    "BUILTIN", "URP", "HDRP", "LEGACY", "PARTICLE", "SPRITE",
+    "UI", "UNLIT", "MOBILE", "SKYBOX", "CUSTOM", "UNKNOWN",
+)
+
+
+def categorize_shader(shader_name: str) -> str:
+    """Bucket a Unity shader-name string into a ShaderCategory label.
+
+    Pure name-based — never reads the ``.shader`` source. That's a
+    deliberate scope cut: every project in the eval set so far
+    identifies by name alone.
+    """
+    if not shader_name:
+        return "UNKNOWN"
+    low = shader_name.lower()
+    if low == "standard" or low.startswith("standard ("):
+        return "BUILTIN"
+    if "universal render pipeline/" in low or low.startswith("urp/"):
+        return "URP"
+    if "hdrp/" in low or "hdrenderpipeline/" in low:
+        return "HDRP"
+    if low.startswith("particles/") or low.startswith("legacy shaders/particles/"):
+        return "PARTICLE"
+    if low.startswith("sprites/") or "sprite" in low:
+        return "SPRITE"
+    if low.startswith("ui/") or low.startswith("unityengine/ui/"):
+        return "UI"
+    if "unlit" in low:
+        return "UNLIT"
+    if low.startswith("mobile/"):
+        return "MOBILE"
+    if low.startswith("skybox/"):
+        return "SKYBOX"
+    if low.startswith("legacy shaders/"):
+        return "LEGACY"
+    if low.startswith("hidden/") or "/custom/" in low:
+        return "CUSTOM"
+    return "UNKNOWN"
+
+
+# Shaders (or shader-name substrings) that drive their color from
+# vertex colors instead of a baked albedo texture. Shader-name
+# heuristic only — flagging these tells 4.8's baker to run.
+_VERTEX_COLOR_SHADER_HINTS: tuple[str, ...] = (
+    "vertexlit",
+    "vertex color",
+    "vertexcolor",
+    "vertex-lit",
+    "particles/vertexlit blended",
+)
+
+
+def shader_uses_vertex_colors(shader_name: str) -> bool:
+    """True when the shader-name string suggests vertex-color output."""
+    if not shader_name:
+        return False
+    low = shader_name.lower()
+    return any(hint in low for hint in _VERTEX_COLOR_SHADER_HINTS)
+
+
 @dataclass
 class TextureOperation:
     """A queued texture processing operation."""
     source_path: str
     output_path: str
-    operation: str  # "copy", "extract_r", "extract_a", "invert", "invert_a"
+    operation: str  # "copy", "extract_r", "extract_a", "invert", "invert_a",
+                    # "bake_ao", "threshold_alpha", "to_grayscale"
     channel: str = ""  # "R", "G", "B", "A"
+    # Per-op knobs. Only the op that reads them populates a given field.
+    ao_strength: float = 1.0       # bake_ao: lerp strength [0..1]
+    alpha_cutoff: float = 0.5      # threshold_alpha: binary cutoff [0..1]
+    # Optional pixel offset applied after the op — supports the Unity
+    # ``_MainTex_ST`` ``offset`` component with wrap semantics.
+    pixel_offset: tuple[int, int] | None = None
+    # Optional normal-scale factor baked into normal maps (Unity
+    # ``_BumpScale``). Decodes normal → scales XY → renormalizes.
+    normal_scale: float | None = None
 
 
 @dataclass
@@ -80,19 +154,26 @@ class MaterialMapping:
     normal_map_path: str | None = None
     metalness_map_path: str | None = None
     roughness_map_path: str | None = None
+    ao_map_path: str | None = None          # Ambient Occlusion source (baked into albedo in 4.2)
     base_color: tuple[float, float, float] = (0.63, 0.63, 0.63)
     transparency: float = 0.0
     alpha_mode: str = "Overlay"
     warnings: list[str] = field(default_factory=list)
     texture_operations: list[TextureOperation] = field(default_factory=list)
     shader_name: str = ""
+    shader_category: str = "UNKNOWN"  # One of _SHADER_CATEGORIES
     material_name: str = ""
     roblox_material: str = "Plastic"  # Inferred Roblox material enum name
     metallic: float = 0.0  # Unity _Metallic value (0-1)
     tiling: tuple[float, float] | None = None  # (scaleX, scaleY) from _MainTex_ST
     offset: tuple[float, float] | None = None  # (offsetX, offsetY) from _MainTex_ST
     emission_color: tuple[float, float, float] | None = None  # Unity _EmissionColor (r,g,b)
+    emission_strength: float = 1.0  # Unity _EmissionStrength / HDRP _EmissiveIntensity
     is_emissive: bool = False  # True if material has emission
+    uses_vertex_colors: bool = False  # Flips 4.8 vertex-color baker on for this material
+    # Source path for the generating Unity .mat; fed into 4.8's baker to
+    # locate the sibling FBX mesh when baking vertex colours.
+    source_path: str | None = None
 
 
 def _resolve_texture_url(
@@ -201,7 +282,10 @@ def _parse_material(
 
     Handles Standard, Standard (Specular), and URP Lit shaders.
     """
-    mapping = MaterialMapping(material_name=mat_path.stem)
+    mapping = MaterialMapping(
+        material_name=mat_path.stem,
+        source_path=str(mat_path),
+    )
 
     try:
         raw = mat_path.read_text(encoding="utf-8", errors="replace")
@@ -215,9 +299,11 @@ def _parse_material(
         mapping.warnings.append("Could not parse material YAML")
         return mapping
 
-    # Identify shader.
+    # Identify shader (name + category).
     shader_name = _extract_shader_name(mat_data, guid_index)
     mapping.shader_name = shader_name
+    mapping.shader_category = categorize_shader(shader_name)
+    mapping.uses_vertex_colors = shader_uses_vertex_colors(shader_name)
 
     if shader_name not in _SUPPORTED_SHADERS:
         # Shader Graph materials often use custom names but still have
@@ -375,7 +461,9 @@ def _parse_material(
                     "Manual review recommended."
                 )
 
-    # Emission: _EmissionColor (Standard/URP) or _EmissiveColor (HDRP)
+    # Emission: _EmissionColor (Standard/URP) or _EmissiveColor (HDRP).
+    # Strength comes from _EmissionStrength (Standard) or
+    # _EmissiveIntensity (HDRP); defaults to 1.0.
     colors = mat_data.get("m_Colors", {})
     if isinstance(colors, dict):
         emission = colors.get("_EmissionColor") or colors.get("_EmissiveColor", {})
@@ -394,6 +482,20 @@ def _parse_material(
         if er > 0.01 or eg > 0.01 or eb > 0.01:
             mapping.emission_color = (er, eg, eb)
             mapping.is_emissive = True
+
+    if mapping.is_emissive:
+        norm_floats = _normalize_floats(
+            mat_data.get("m_SavedProperties", {}).get("m_Floats", [])
+        )
+        for key in ("_EmissionStrength", "_EmissiveIntensity"):
+            val = norm_floats.get(key)
+            if val is None:
+                val = mat_data.get("m_Floats", {}).get(key) if isinstance(
+                    mat_data.get("m_Floats"), dict
+                ) else None
+            if isinstance(val, (int, float)) and val > 0:
+                mapping.emission_strength = float(val)
+                break
 
     # Infer Roblox material from material name keywords
     mapping.roblox_material = _infer_roblox_material(mapping.material_name)

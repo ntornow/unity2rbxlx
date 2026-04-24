@@ -197,6 +197,36 @@ def test_final_rewrite_honors_source_path_for_nested_scripts(tmp_path):
     assert not (scripts_dir / "Door.luau").exists()
 
 
+def test_unconverted_md_aggregates_material_warnings(tmp_path):
+    """Phase 4.2: material warnings surface as UNCONVERTED.md entries."""
+    from converter.animation_converter import AnimationConversionResult
+    from converter.material_mapper import MaterialMapping
+
+    pipeline = _make_pipeline(tmp_path)
+    pipeline.state.animation_result = AnimationConversionResult(unconverted=[])
+    pipeline.state.material_mappings = {
+        "guid-a": MaterialMapping(
+            material_name="SandShader",
+            shader_name="Some/CustomShader",
+            warnings=["Unsupported shader: Some/CustomShader"],
+        ),
+        "guid-b": MaterialMapping(
+            material_name="VCOLMat",
+            shader_name="Legacy Shaders/VertexLit",
+            uses_vertex_colors=True,
+            warnings=["Vertex-color baking skipped: no mesh referrers found for this material"],
+        ),
+    }
+
+    pipeline._write_unconverted_md()
+    md = (pipeline.output_dir / "UNCONVERTED.md").read_text()
+    assert "## material" in md
+    assert "SandShader" in md
+    assert "VCOLMat" in md
+    assert "Unsupported shader" in md
+    assert "no mesh referrers" in md
+
+
 def test_unconverted_md_written_when_entries_exist(tmp_path):
     """Phase 4.5b: ``_write_unconverted_md`` aggregates animation entries
     into ``UNCONVERTED.md`` grouped by category.

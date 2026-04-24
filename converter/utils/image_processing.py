@@ -261,3 +261,152 @@ def generate_uniform_texture(
 
     logger.info("Generated %s %s texture -> %s", size, color, output_path)
     return output_path
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.2 additions
+# ---------------------------------------------------------------------------
+
+
+def bake_ao(
+    albedo_path: str | Path,
+    ao_path: str | Path,
+    output_path: str | Path,
+    strength: float = 1.0,
+) -> Path:
+    """Multiply an ambient-occlusion map into an albedo texture.
+
+    Roblox SurfaceAppearance has no dedicated AO slot, so Unity's AO
+    data has to be baked into the color map. ``strength`` is a lerp
+    factor in ``[0..1]`` matching Unity's ``_OcclusionStrength`` —
+    0 bakes nothing, 1 bakes the map at full strength.
+
+    Output is always PNG. Bypasses PIL's own composite mode traps by
+    operating on raw pixel tuples.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    albedo = Image.open(str(albedo_path)).convert("RGBA")
+    ao = Image.open(str(ao_path)).convert("L").resize(albedo.size)
+    strength = max(0.0, min(1.0, float(strength)))
+
+    albedo_px = albedo.load()
+    ao_px = ao.load()
+    w, h = albedo.size
+    out = Image.new("RGBA", albedo.size)
+    out_px = out.load()
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = albedo_px[x, y]
+            ao_val = ao_px[x, y] / 255.0
+            # lerp(1.0, ao_val, strength) — strength=0 → 1.0, strength=1 → ao_val.
+            factor = 1.0 - strength + strength * ao_val
+            out_px[x, y] = (
+                int(r * factor), int(g * factor), int(b * factor), a,
+            )
+    out.save(output_path)
+    logger.info("Baked AO (strength=%.2f) -> %s", strength, output_path)
+    return output_path
+
+
+def threshold_alpha(
+    image_path: str | Path,
+    output_path: str | Path,
+    cutoff: float = 0.5,
+) -> Path:
+    """Clip the alpha channel to a binary 0/255 mask at ``cutoff``.
+
+    Matches Unity's Cutout shader behavior — every pixel whose alpha
+    is below the cutoff becomes fully transparent; everything at or
+    above becomes fully opaque. Source RGB is preserved.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    img = Image.open(str(image_path)).convert("RGBA")
+    threshold = int(max(0.0, min(1.0, float(cutoff))) * 255)
+    r, g, b, a = img.split()
+    a_bin = a.point(lambda v: 255 if v >= threshold else 0)
+    Image.merge("RGBA", (r, g, b, a_bin)).save(output_path)
+    logger.info("Thresholded alpha at %d -> %s", threshold, output_path)
+    return output_path
+
+
+def to_grayscale(
+    image_path: str | Path,
+    output_path: str | Path,
+) -> Path:
+    """Convert an RGB image to luminance-encoded grayscale (single L channel).
+
+    Used for smoothness / metallic maps where Unity stores the value
+    in a specific channel but Roblox expects a grayscale intensity.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    img = Image.open(str(image_path)).convert("L")
+    img.save(output_path)
+    logger.info("Grayscale -> %s", output_path)
+    return output_path
+
+
+def offset_image(
+    image_path: str | Path,
+    output_path: str | Path,
+    offset: Tuple[int, int],
+) -> Path:
+    """Shift a texture by ``(dx, dy)`` with wrap-around semantics.
+
+    Matches Unity's ``_MainTex_ST`` offset component. Pixels that fall
+    off one edge reappear on the opposite edge.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    from PIL import ImageChops
+    img = Image.open(str(image_path))
+    shifted = ImageChops.offset(img, int(offset[0]), int(offset[1]))
+    shifted.save(output_path)
+    logger.info("Offset %s -> %s", tuple(offset), output_path)
+    return output_path
+
+
+def scale_normal_map(
+    image_path: str | Path,
+    output_path: str | Path,
+    scale: float,
+) -> Path:
+    """Re-encode a tangent-space normal map with the given XY scale.
+
+    Decodes each pixel normal from ``[0..255]`` to ``[-1..1]``, scales
+    the XY components by ``scale``, renormalizes the vector, re-encodes
+    back to ``[0..255]``. Matches Unity ``_BumpScale``.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    img = Image.open(str(image_path)).convert("RGBA")
+    w, h = img.size
+    px = img.load()
+    out = Image.new("RGBA", img.size)
+    out_px = out.load()
+    scale = float(scale)
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = px[x, y]
+            nx = (r / 127.5) - 1.0
+            ny = (g / 127.5) - 1.0
+            nz = (b / 127.5) - 1.0
+            nx *= scale
+            ny *= scale
+            length = (nx * nx + ny * ny + nz * nz) ** 0.5
+            if length > 1e-6:
+                nx /= length
+                ny /= length
+                nz /= length
+            out_px[x, y] = (
+                int((nx + 1.0) * 127.5),
+                int((ny + 1.0) * 127.5),
+                int((nz + 1.0) * 127.5),
+                a,
+            )
+    out.save(output_path)
+    logger.info("Scaled normal map (%.2f) -> %s", scale, output_path)
+    return output_path

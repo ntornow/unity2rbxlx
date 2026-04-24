@@ -108,3 +108,72 @@ class TestMaterialParsing:
                 mode = entry["_Mode"]
                 break
         assert mode == 0  # Opaque
+
+
+class TestPhase42ShaderCategorization:
+    """Phase 4.2: name-based shader categorization."""
+
+    def test_categorize_standard(self):
+        from converter.material_mapper import categorize_shader
+        assert categorize_shader('Standard') == 'BUILTIN'
+        assert categorize_shader('Standard (Specular setup)') == 'BUILTIN'
+
+    def test_categorize_urp(self):
+        from converter.material_mapper import categorize_shader
+        assert categorize_shader('Universal Render Pipeline/Lit') == 'URP'
+        assert categorize_shader('Universal Render Pipeline/Simple Lit') == 'URP'
+
+    def test_categorize_hdrp(self):
+        from converter.material_mapper import categorize_shader
+        assert categorize_shader('HDRP/Lit') == 'HDRP'
+        assert categorize_shader('HDRenderPipeline/Lit') == 'HDRP'
+
+    def test_categorize_legacy(self):
+        from converter.material_mapper import categorize_shader
+        assert categorize_shader('Legacy Shaders/Diffuse') == 'LEGACY'
+
+    def test_categorize_particle(self):
+        from converter.material_mapper import categorize_shader
+        assert categorize_shader('Particles/Standard Surface') == 'PARTICLE'
+        assert categorize_shader('Legacy Shaders/Particles/Alpha Blended') == 'PARTICLE'
+
+    def test_categorize_unlit(self):
+        from converter.material_mapper import categorize_shader
+        assert categorize_shader('Unlit/Texture') == 'UNLIT'
+
+    def test_categorize_skybox(self):
+        from converter.material_mapper import categorize_shader
+        assert categorize_shader('Skybox/Procedural') == 'SKYBOX'
+
+    def test_categorize_unknown(self):
+        from converter.material_mapper import categorize_shader
+        assert categorize_shader('SomeGame/CustomShader') == 'UNKNOWN'
+        assert categorize_shader('') == 'UNKNOWN'
+
+
+class TestPhase42VertexColorDetection:
+    def test_vertex_lit_flagged(self):
+        from converter.material_mapper import shader_uses_vertex_colors
+        assert shader_uses_vertex_colors('Legacy Shaders/VertexLit')
+        assert shader_uses_vertex_colors('Particles/VertexLit Blended')
+
+    def test_standard_not_flagged(self):
+        from converter.material_mapper import shader_uses_vertex_colors
+        assert not shader_uses_vertex_colors('Standard')
+        assert not shader_uses_vertex_colors('Universal Render Pipeline/Lit')
+
+    def test_empty_not_flagged(self):
+        from converter.material_mapper import shader_uses_vertex_colors
+        assert not shader_uses_vertex_colors('')
+
+
+class TestPhase42MaterialMappingExtension:
+    def test_new_fields_default_safely(self):
+        from converter.material_mapper import MaterialMapping
+        m = MaterialMapping()
+        assert m.shader_category == 'UNKNOWN'
+        assert m.uses_vertex_colors is False
+        assert m.emission_strength == 1.0
+        assert m.source_path is None
+        assert m.ao_map_path is None
+
