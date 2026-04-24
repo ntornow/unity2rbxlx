@@ -527,3 +527,173 @@ Verification: fast suite 600 passed (+4 new tests for Codex fixes);
 SimpleFPS smoke unchanged (7 scripts, 0 validate errors, no
 UNCONVERTED.md emitted because SimpleFPS has no binary controllers
 or 2D blend trees).
+
+### PR 3 — 4.2 material_mapper + 4.8 vertex color baker wiring
+
+Audit shrank the scope from the plan's ~680-line estimate to
+~470 by explicitly dropping source's `.shader` file parser,
+`UnconvertedFeature` dataclass, and texture ops (detail blend,
+heightmap→normal) for which no test project provides fixtures.
+Reuse existing `MaterialMapping.warnings: list[str]` instead of
+adding a new dataclass; extend PR 2b's `_write_unconverted_md` to
+aggregate material warnings alongside animation entries.
+
+- **Shader categorization (4.2.1).** New `categorize_shader()`
+  maps a Unity shader-name string to one of 12 labels (BUILTIN,
+  URP, HDRP, LEGACY, PARTICLE, SPRITE, UI, UNLIT, MOBILE, SKYBOX,
+  CUSTOM, UNKNOWN). Name-based only — no `.shader` source parsing,
+  no `#include` resolution (deferred; no test project exercises
+  custom HLSL yet). `MaterialMapping.shader_category` records
+  the result per material.
+- **Vertex color detection (4.2.5).** `shader_uses_vertex_colors()`
+  heuristic scans the shader-name string for `VertexLit`,
+  `Vertex Color`, `VertexColor`, `Vertex-Lit`, and
+  `Particles/VertexLit Blended` hints. Sets
+  `MaterialMapping.uses_vertex_colors: bool` during
+  `_parse_material`. Flips on the 4.8 baker.
+- **Texture ops (4.2.2).** Added three new operations in
+  `utils/image_processing.py` and wired into the pipeline texture
+  executor: `bake_ao` (AO → albedo composite with `strength` lerp
+  matching Unity `_OcclusionStrength`), `threshold_alpha` (binary
+  cutoff alpha clipping for Unity Cutout shader parity),
+  `to_grayscale` (RGB → single-channel luminance). Plus
+  `offset_image` and `scale_normal_map` as post-ops on the
+  existing `TextureOperation` dataclass (applied after the primary
+  op via new `pixel_offset` and `normal_scale` fields). Also fills
+  the `extract_a` branch that was declared but never routed.
+- **Advanced material props (4.2.4).** Extract Unity
+  `_EmissionStrength` / HDRP `_EmissiveIntensity` into
+  `MaterialMapping.emission_strength`. `ao_map_path` field added
+  on the dataclass so a downstream AO-source lookup can plug in
+  (baker already does). `source_path` on the mapping so 4.8
+  can locate the owning `.mat` file.
+- **UNCONVERTED.md extends (4.2.3).** `Pipeline._write_unconverted_md`
+  now iterates `state.material_mappings.values()` too, turning every
+  `MaterialMapping.warnings` entry into an `UNCONVERTED.md` bullet
+  grouped under the `material` category. SimpleFPS smoke surfaces
+  7 legitimate entries on the full project (FXWaterPro /
+  FXWater4Advanced / FXWaterBasic / FXWater4Simple / RotatingTexture
+  water + propeller shaders).
+- **Vertex color baker wiring (4.8).** New
+  `Pipeline._bake_vertex_colors()` runs at the tail of
+  `convert_materials`. Walks `parsed_scene.all_nodes` + prefab
+  library roots, inverts the mesh→material graph to find meshes
+  that reference each flagged material, collects
+  `(mesh_fbx, albedo)` pairs, and delegates to
+  `bake_vertex_colors_batch`. Graceful fallback when the baker
+  module fails to import (e.g. `pyassimp` missing): warning surfaces
+  into `MaterialMapping.warnings` and flows into `UNCONVERTED.md`.
+  Materials without a mesh referrer or without an albedo texture
+  also record a skip reason. No crash paths.
+
+Verification: fast suite 619 passed (+19 new); full SimpleFPS
+convert produces 944 parts / 50 scripts / 50/51 materials /
+7 anim scripts / terrain SmoothGrid encoded / 0 validate errors /
+7 material entries in `UNCONVERTED.md` for legitimate unsupported
+water shaders.
+
+### PR 3 — Codex review follow-ups (2026-04-24)
+
+Codex flagged 2 P1s + 1 P2. GATE was FAIL. Both P1s were real
+correctness bugs affecting the normal `--upload` flow (our
+`--no-upload` smoke never hit them).
+
+- **Fix #1 (Codex P1) — baker silently skipped on upload flow.**
+  `map_materials()` rewrites `color_map_path` to `rbxassetid://…`
+  after the upload step, but `_bake_vertex_colors()` was then
+  calling `Path(color_map).exists()` on the URL and failing. Added
+  `MaterialMapping.local_color_map_path` field; `map_materials`
+  captures the pre-upload local path there, and the baker reads it
+  first.
+- **Fix #2 (Codex P1) — shared materials overwrote each other.**
+  When a flagged material had multiple mesh referrers, each bake's
+  `entry.output_path` overwrote the mapping's `color_map_path` on
+  every loop iteration — last mesh wins. Baker now bakes only the
+  first (deterministic sort order) representative mesh per material
+  and records the deferred meshes in `mapping.warnings`
+  (surfaces into `UNCONVERTED.md`). Proper per-mesh baking would
+  require per-part `SurfaceAppearance` splitting, which is
+  architecturally bigger than PR 3 scope.
+- **Fix #3 (Codex P2) — deferred.** Sub-mesh identity
+  (`mesh_file_id`) is not yet preserved through to the baker;
+  FBX files with multiple embedded meshes will rasterize the whole
+  file instead of the specific submesh. This requires extending
+  `bake_vertex_colors_batch`'s signature — out of PR 3 scope.
+  Logged here for a follow-up PR.
+
+Verification: fast suite 621 passed (+2 new Codex-fix tests);
+SimpleFPS smoke unchanged (944 parts / 50/51 materials / 7 anim
+scripts / terrain OK / 0 validate errors / 7 UNCONVERTED
+entries). Both new tests stub `bake_vertex_colors_batch` so they
+run in the fast suite with no `pyassimp` dependency.
+
+### Deferred from PR 3 → future phase/hands-on
+
+- `.shader` file source parsing (with `#include` resolution) —
+  revisit when a test project ships custom HLSL worth inspecting
+- `composite_detail`, `blend_normal_detail`, `heightmap_to_normal`
+  texture ops from source — revisit when a test project exercises
+  detail textures
+- Companion Luau scripts per material — source has an empty stub
+- `UnconvertedFeature` dataclass with severity tiers — revisit if
+  warnings grow noisy enough to benefit from filtering
+
+## Cross-script shared-state transpilation gap (2026-04-24)
+
+Surfaced during the full SimpleFPS conversion test of PR 3. Doors
+in the loaded game never opened because `Player.luau` tracks the
+key as module-local state while `Door.luau` reads a character
+attribute — no bridge between the two.
+
+**Observed:**
+- `Player.luau:72` — `local gotKey = false`
+- `Player.luau:267` / `:398` — `gotKey = true` on pickup / dev-bypass F1
+- `Player.luau:76-78` — exports `Player.hasKey = function() return gotKey end`
+- `Door.luau:58-62` — reads `character:GetAttribute("hasKey")` /
+  `player:GetAttribute("hasKey")`. **Nothing ever writes that attribute.**
+- Result: even picking up the keycard or hitting the dev-bypass
+  hotkey leaves the door's `hasKey` check `false` forever.
+
+**Pattern:** Unity cross-script state (static fields or singleton
+references) lowers inconsistently under AI transpilation — the
+owning script keeps it as module-local data, reader scripts guess
+at `GetAttribute`/`SetAttribute` as the IPC channel (a reasonable
+Roblox default), but the two code paths never get linked. Same
+gap affects `gotItems`, `gotWeapon`, and likely any other
+Unity-level shared state in SimpleFPS and future projects.
+
+**Workaround for the current output:** one-line mirror at each
+`gotKey = true` site — `if character then
+character:SetAttribute("hasKey", true) end`. Applied to the two
+assignment sites in `output/SimpleFPS_full/scripts/Player.luau`
+so PR 3 smoke could validate doors end-to-end.
+
+**Proper converter fix (belongs in PR 4, Phase 4.3):**
+The Phase 4 plan's 4.3.1 ("Port Dependency-Aware Context
+Building") has the answer — the AI transpiler's prompt should
+include already-transpiled dependencies' output and public
+signatures. Door.cs transpilation should see Player.luau's
+exported `Player.hasKey = function()` and generate
+`require(Player).hasKey()` instead of `GetAttribute("hasKey")`.
+The dependency-order batching in 4.3.1 also guarantees Player is
+transpiled before Door so its signatures are available.
+
+**Alternative (cheaper, also in 4.3 scope): prompt rule.**
+Teach the transpiler prompt: "For cross-script boolean state
+exposed via Unity public fields / properties, use
+`:GetAttribute`/`:SetAttribute` on the character consistently on
+BOTH read and write sides. Never module-local variables for
+cross-script state." Less structural than the dependency-context
+approach but closes this exact gap without requiring transpile
+ordering.
+
+**Post-transpile check (cheap linter, could live outside 4.3):**
+Walk all generated Luau. Flag every `GetAttribute("X")` that has
+no corresponding `SetAttribute("X")` in any other script, OR that
+has a same-named module-local variable in another script. Add to
+`UNCONVERTED.md` as a consistency warning. Catches the class of
+bug even when the AI gets it wrong.
+
+Action: address in PR 4 via 4.3.1 dependency-aware prompt +
+explicit shared-state rule. The linter is a nice add but not
+load-bearing if the prompt fix lands.

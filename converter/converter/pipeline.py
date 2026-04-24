@@ -813,7 +813,11 @@ class Pipeline:
 
         # Execute queued texture operations (channel extraction, inversion)
         # and upload the results if we have an API key.
-        from utils.image_processing import extract_channel, invert_image, convert_to_png
+        from utils.image_processing import (
+            extract_channel, invert_image, convert_to_png,
+            bake_ao, threshold_alpha, to_grayscale,
+            offset_image, scale_normal_map,
+        )
         ops_done = 0
         for guid, mapping in self.state.material_mappings.items():
             for op in getattr(mapping, "texture_operations", []):
@@ -833,11 +837,40 @@ class Pipeline:
                                         source.name, conv_exc)
                     if op.operation == "extract_r":
                         extract_channel(actual_source, "R", output)
+                    elif op.operation == "extract_a":
+                        extract_channel(actual_source, "A", output)
                     elif op.operation == "invert_a":
                         invert_image(actual_source, output)
                     elif op.operation == "copy":
                         import shutil
                         shutil.copy2(source, output)
+                    elif op.operation == "bake_ao":
+                        # Source is the AO map; we overlay onto the material's
+                        # current color map if one exists, otherwise skip.
+                        color_map = mapping.color_map_path
+                        if color_map and Path(color_map).exists():
+                            bake_ao(color_map, actual_source, output,
+                                    strength=op.ao_strength)
+                            mapping.color_map_path = str(output)
+                        else:
+                            mapping.warnings.append(
+                                "bake_ao: no color map to composite onto; skipped"
+                            )
+                    elif op.operation == "threshold_alpha":
+                        threshold_alpha(actual_source, output, cutoff=op.alpha_cutoff)
+                    elif op.operation == "to_grayscale":
+                        to_grayscale(actual_source, output)
+                    else:
+                        log.debug("[convert_materials] Unknown texture op: %s", op.operation)
+                        continue
+
+                    # Optional post-ops. Chain offset and normal-scale onto
+                    # whatever the op just produced (or copy for passthrough).
+                    post_in = output if output.exists() else actual_source
+                    if op.pixel_offset is not None:
+                        offset_image(post_in, output, op.pixel_offset)
+                    if op.normal_scale is not None and op.normal_scale != 1.0:
+                        scale_normal_map(post_in, output, op.normal_scale)
                     ops_done += 1
                 except Exception as exc:
                     log.warning("[convert_materials] Texture op failed: %s: %s", op.operation, exc)
@@ -849,6 +882,157 @@ class Pipeline:
             self.ctx.converted_materials,
             self.ctx.total_materials,
         )
+
+        # Phase 4.8: bake per-mesh vertex colors into the albedo texture for
+        # any material flagged uses_vertex_colors. Runs after texture ops so
+        # the baker sees the final color_map_path.
+        self._bake_vertex_colors()
+
+    def _bake_vertex_colors(self) -> None:
+        """Bake Unity per-vertex colors into albedo textures for flagged
+        materials (Phase 4.8). Graceful fallback when pyassimp is absent —
+        each affected material gets a warning surfaced into UNCONVERTED.md
+        rather than crashing the run.
+        """
+        flagged = [
+            (guid, mapping) for guid, mapping
+            in (self.state.material_mappings or {}).items()
+            if getattr(mapping, "uses_vertex_colors", False)
+        ]
+        if not flagged:
+            return
+
+        log.info("[vertex_color_bake] %d materials flagged", len(flagged))
+        try:
+            from converter.vertex_color_baker import bake_vertex_colors_batch
+        except ImportError as exc:
+            log.warning("[vertex_color_bake] baker unavailable: %s", exc)
+            for _, mapping in flagged:
+                mapping.warnings.append(
+                    "Vertex-color baking skipped: vertex_color_baker module unavailable"
+                )
+            return
+
+        # Find mesh referrers for each flagged material. A MeshRenderer
+        # with ``m_Materials`` entry pointing at this GUID and a sibling
+        # MeshFilter with ``m_Mesh`` → FBX gives us a (mesh, material)
+        # pair to bake.
+        scene = self.state.parsed_scene
+        prefab_library = self.state.prefab_library
+        guid_index = self.state.guid_index
+        if guid_index is None or scene is None:
+            log.info("[vertex_color_bake] missing guid_index or scene — skipped")
+            for _, mapping in flagged:
+                mapping.warnings.append(
+                    "Vertex-color baking skipped: scene/guid_index not available"
+                )
+            return
+
+        # Invert: material guid → [mesh FBX path]
+        material_to_meshes: dict[str, set[Path]] = {}
+
+        def _walk_scene_nodes(nodes):
+            for node in nodes:
+                mesh_guid = getattr(node, "mesh_guid", None)
+                if mesh_guid:
+                    mesh_path = guid_index.resolve(mesh_guid)
+                    if mesh_path and mesh_path.exists():
+                        for comp in getattr(node, "components", []):
+                            if comp.component_type not in (
+                                "MeshRenderer", "SkinnedMeshRenderer",
+                            ):
+                                continue
+                            for mat_ref in (comp.properties.get("m_Materials") or []):
+                                if isinstance(mat_ref, dict):
+                                    mg = mat_ref.get("guid", "")
+                                    if mg:
+                                        material_to_meshes.setdefault(mg, set()).add(mesh_path)
+                _walk_scene_nodes(getattr(node, "children", []))
+
+        _walk_scene_nodes(list(scene.all_nodes.values()))
+        if prefab_library is not None:
+            for prefab in getattr(prefab_library, "prefabs", []):
+                root = getattr(prefab, "root", None)
+                if root is not None:
+                    _walk_scene_nodes([root])
+
+        pairs: list[tuple[Path, Path]] = []
+        material_pair_index: list[Any] = []  # MaterialMapping per pair, for routing back
+        for guid, mapping in flagged:
+            meshes = material_to_meshes.get(guid, set())
+            if not meshes:
+                mapping.warnings.append(
+                    "Vertex-color baking skipped: no mesh referrers found for this material"
+                )
+                continue
+            # Prefer the local albedo path (captured pre-upload) over
+            # the current color_map_path, which is an ``rbxassetid://``
+            # URL once uploads have run.
+            color_map = (
+                getattr(mapping, "local_color_map_path", None)
+                or mapping.color_map_path
+            )
+            if not color_map:
+                # No albedo — caller would need standalone baking; defer
+                # that path (rare) so 4.8 stays narrow.
+                mapping.warnings.append(
+                    "Vertex-color baking skipped: no color_map_path on material (standalone baking not wired)"
+                )
+                continue
+            albedo = Path(color_map)
+            if not albedo.exists():
+                mapping.warnings.append(
+                    f"Vertex-color baking skipped: albedo path missing at {albedo}"
+                )
+                continue
+
+            # Vertex colors are mesh-specific, but Roblox SurfaceAppearance
+            # is per-material. When a material is shared by multiple
+            # meshes we bake only the first referrer (deterministic
+            # sort order) and record a warning — per-mesh baking would
+            # require splitting the mapping into per-part SurfaceAppearances,
+            # which is out of PR 3 scope.
+            sorted_meshes = sorted(meshes)
+            representative = sorted_meshes[0]
+            pairs.append((representative, albedo))
+            material_pair_index.append(mapping)
+            if len(sorted_meshes) > 1:
+                others = ", ".join(m.name for m in sorted_meshes[1:])
+                mapping.warnings.append(
+                    f"Vertex-color baking used mesh '{representative.name}'; "
+                    f"other meshes sharing this material may need per-part "
+                    f"baking (not wired): {others}"
+                )
+
+        if not pairs:
+            return
+
+        out_dir = self.output_dir / "textures" / "vertex_baked"
+        try:
+            result = bake_vertex_colors_batch(pairs, out_dir)
+        except Exception as exc:
+            log.warning("[vertex_color_bake] batch failed: %s", exc)
+            for mapping in material_pair_index:
+                mapping.warnings.append(f"Vertex-color baking failed: {exc}")
+            return
+
+        log.info(
+            "[vertex_color_bake] %d total, %d baked, %d no_colors, %d skipped",
+            result.total, result.baked, result.no_colors, result.skipped,
+        )
+
+        for entry, mapping in zip(result.entries, material_pair_index):
+            if entry.baked and entry.output_path:
+                mapping.color_map_path = str(entry.output_path)
+            elif not entry.has_vertex_colors:
+                # Most common outcome when the shader says vertex colors
+                # but the FBX mesh doesn't actually store them. Log as
+                # informational, not a hard warning.
+                continue
+            elif entry.error:
+                mapping.warnings.append(
+                    f"Vertex-color baking failed for {entry.mesh_path.name}: {entry.error}"
+                )
 
     def transpile_scripts(self) -> None:
         """Phase 4: Transpile C# scripts to Luau."""
@@ -1814,6 +1998,18 @@ script.Disabled = true
             for entry in entries:
                 category = entry.get("category", "misc")
                 sections.setdefault(category, []).append(entry)
+
+        # Material warnings surface the "drop" side of the mapper —
+        # unsupported shaders, specular-workflow approximations, AO
+        # skips, missing LFS textures. Each warning becomes an entry
+        # keyed by the material name.
+        for guid, mapping in (self.state.material_mappings or {}).items():
+            for warning in getattr(mapping, "warnings", []) or []:
+                sections.setdefault("material", []).append({
+                    "category": "material",
+                    "item": getattr(mapping, "material_name", guid),
+                    "reason": warning,
+                })
 
         out_path = self.output_dir / UNCONVERTED_FILENAME
         if not sections:
