@@ -236,6 +236,11 @@ class AnimationConversionResult:
     # Serialized into conversion_plan.json under the "animation_routing" key
     # so rehydration and downstream consumers can see what got routed where.
     routing: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
+    # Entries describing unconverted animation features — binary controllers
+    # we can't parse, 2D blend trees we don't emit, etc. The pipeline
+    # aggregates these into UNCONVERTED.md so users know what was dropped.
+    # Each entry: {"category": str, "item": str, "reason": str}.
+    unconverted: list[dict[str, str]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -363,12 +368,18 @@ def _parse_vector_curve(curve_data: dict[str, Any], property_type: str) -> AnimC
         return None
 
     curve = AnimCurve(property_type=property_type, path=path)
+    dropped_count = 0
 
     for kf_data in keyframe_list:
         if not isinstance(kf_data, dict):
+            dropped_count += 1
             continue
 
-        time = float(kf_data.get("time", 0))
+        try:
+            time = float(kf_data.get("time", 0))
+        except (TypeError, ValueError):
+            dropped_count += 1
+            continue
         value_data = kf_data.get("value", {})
 
         if isinstance(value_data, dict):
@@ -390,6 +401,7 @@ def _parse_vector_curve(curve_data: dict[str, Any], property_type: str) -> AnimC
         elif isinstance(value_data, (int, float)):
             value = (float(value_data),)
         else:
+            dropped_count += 1
             continue
 
         kf = AnimKeyframe(time=time, value=value)
@@ -422,6 +434,12 @@ def _parse_vector_curve(curve_data: dict[str, Any], property_type: str) -> AnimC
 
         curve.keyframes.append(kf)
 
+    if dropped_count:
+        log.warning(
+            "Dropped %d malformed keyframe(s) from %s curve on path %r",
+            dropped_count, property_type, path,
+        )
+
     return curve if curve.keyframes else None
 
 
@@ -429,7 +447,10 @@ def _parse_vector_curve(curve_data: dict[str, Any], property_type: str) -> AnimC
 # .controller file parsing
 # ---------------------------------------------------------------------------
 
-def parse_controller_file(controller_path: Path) -> AnimatorController | None:
+def parse_controller_file(
+    controller_path: Path,
+    unconverted_out: list[dict[str, str]] | None = None,
+) -> AnimatorController | None:
     """Parse a Unity .controller file and return an AnimatorController.
 
     Args:
@@ -443,7 +464,34 @@ def parse_controller_file(controller_path: Path) -> AnimatorController | None:
         return None
 
     if not is_text_yaml(controller_path):
-        log.debug("Controller file is binary, skipping: %s", controller_path.name)
+        log.warning(
+            "Controller file is binary, skipping: %s "
+            "(UnityPy text-export required to parse)",
+            controller_path.name,
+        )
+        if unconverted_out is not None:
+            # Also record the asset GUID from the .meta sibling when
+            # available so convert_animations() can scene-filter binary
+            # controllers the same way it filters parsed ones.
+            ctrl_guid = ""
+            meta = controller_path.with_suffix(controller_path.suffix + ".meta")
+            if meta.exists():
+                try:
+                    for line in meta.read_text(encoding="utf-8", errors="replace").splitlines():
+                        s = line.strip()
+                        if s.startswith("guid:"):
+                            ctrl_guid = s.split(":", 1)[1].strip()
+                            break
+                except OSError:
+                    pass
+            entry: dict[str, str] = {
+                "category": "animator_controller",
+                "item": controller_path.name,
+                "reason": "binary-encoded .controller; UnityPy text-export required",
+            }
+            if ctrl_guid:
+                entry["guid"] = ctrl_guid
+            unconverted_out.append(entry)
         return None
 
     try:
@@ -520,14 +568,22 @@ def parse_controller_file(controller_path: Path) -> AnimatorController | None:
                 if motion_fid and motion_fid in docs_by_fid:
                     bt_cid, bt_body = docs_by_fid[motion_fid]
                     if bt_cid == 206:
-                        bt = _parse_blend_tree(bt_body, docs_by_fid, state_name)
+                        bt = _parse_blend_tree(
+                            bt_body, docs_by_fid, state_name,
+                            unconverted_out=unconverted_out,
+                            controller_name=name,
+                        )
                         if bt is not None:
                             controller.blend_trees[bt.name] = bt
                             blend_tree_name = bt.name
                         # Always set a clip_guid fallback (first resolvable
                         # leaf) so rehydration / degraded playback still
                         # picks up something for unsupported 2D trees.
-                        clip_guid = _first_leaf_clip_guid(bt_body, docs_by_fid)
+                        clip_guid = _first_leaf_clip_guid(
+                            bt_body, docs_by_fid,
+                            unconverted_out=unconverted_out,
+                            context=f"{name}/{state_name}",
+                        )
 
         state = AnimState(
             name=state_name,
@@ -587,6 +643,8 @@ def _parse_blend_tree(
     bt_body: dict[str, Any],
     docs_by_fid: dict[str, tuple[int, dict]],
     owning_state_name: str,
+    unconverted_out: list[dict[str, str]] | None = None,
+    controller_name: str = "",
 ) -> BlendTree | None:
     """Parse a BlendTree YAML body into a 1D BlendTree structure.
 
@@ -602,6 +660,13 @@ def _parse_blend_tree(
             "keeping fallback clip only",
             owning_state_name, blend_type,
         )
+        if unconverted_out is not None:
+            qual = f"{controller_name}/{owning_state_name}" if controller_name else owning_state_name
+            unconverted_out.append({
+                "category": "blend_tree",
+                "item": qual,
+                "reason": f"2D BlendType={blend_type} not supported; first-leaf clip used as fallback",
+            })
         return None
 
     # Unity serialized name lives on the BlendTree doc; fall back to the
@@ -619,10 +684,32 @@ def _parse_blend_tree(
             continue
         guid = motion_ref.get("guid", "") or ""
         if not guid:
-            # Nested blend tree → inline its first leaf clip.
+            # Nested blend tree → inline its first leaf clip. Also record
+            # the nested tree as unconverted when it's 2D, so a 1D tree
+            # with a 2D grandchild isn't silently collapsed.
+            nested_body = _deref_motion(motion_ref, docs_by_fid)
+            if nested_body:
+                nested_type = int(nested_body.get("m_BlendType", 0) or 0)
+                if nested_type != 0 and unconverted_out is not None:
+                    qual = (
+                        f"{controller_name}/{owning_state_name}/nested"
+                        if controller_name else f"{owning_state_name}/nested"
+                    )
+                    unconverted_out.append({
+                        "category": "blend_tree",
+                        "item": qual,
+                        "reason": (
+                            f"nested BlendType={nested_type} not supported; "
+                            "first-leaf clip used as fallback"
+                        ),
+                    })
             guid = _first_leaf_clip_guid(
-                _deref_motion(motion_ref, docs_by_fid),
-                docs_by_fid,
+                nested_body, docs_by_fid,
+                unconverted_out=unconverted_out,
+                context=(
+                    f"{controller_name}/{owning_state_name}"
+                    if controller_name else owning_state_name
+                ),
             )
         if guid:
             entries.append(BlendTreeEntry(threshold=threshold, clip_guid=guid))
@@ -648,8 +735,17 @@ def _deref_motion(
 def _first_leaf_clip_guid(
     bt_body: dict[str, Any],
     docs_by_fid: dict[str, tuple[int, dict]],
+    unconverted_out: list[dict[str, str]] | None = None,
+    context: str = "",
 ) -> str:
-    """Return the first clip GUID reachable from a (possibly nested) tree."""
+    """Return the first clip GUID reachable from a (possibly nested) tree.
+
+    When ``unconverted_out`` is provided, any nested BlendTree whose
+    ``m_BlendType`` is non-zero also records an UNCONVERTED entry —
+    this catches the case where a supported 1D tree contains a
+    deeply nested 2D child that would otherwise silently collapse to
+    its first-leaf clip.
+    """
     if not bt_body:
         return ""
     for child in bt_body.get("m_Childs", []) or []:
@@ -663,7 +759,20 @@ def _first_leaf_clip_guid(
             return guid
         nested = _deref_motion(child_motion, docs_by_fid)
         if nested:
-            nested_guid = _first_leaf_clip_guid(nested, docs_by_fid)
+            nested_type = int(nested.get("m_BlendType", 0) or 0)
+            if nested_type != 0 and unconverted_out is not None:
+                qual = f"{context}/nested" if context else "nested"
+                unconverted_out.append({
+                    "category": "blend_tree",
+                    "item": qual,
+                    "reason": (
+                        f"nested BlendType={nested_type} not supported; "
+                        "first-leaf clip used as fallback"
+                    ),
+                })
+            nested_guid = _first_leaf_clip_guid(
+                nested, docs_by_fid, unconverted_out, context,
+            )
             if nested_guid:
                 return nested_guid
     return ""
@@ -766,6 +875,9 @@ def generate_tween_script(
     lines.append("-- Auto-generated animation script")
     lines.append(f"-- Converted from Unity AnimationClip: {clip.name}")
     lines.append(f"-- Duration: {clip.duration:.2f}s, Loop: {clip.loop}")
+    lines.append(
+        "-- Inline TweenService per docs/design/inline-over-runtime-wrappers.md"
+        " (no TransformAnimator / AnimatorBridge require).")
     lines.append("")
     lines.append("local TweenService = game:GetService(\"TweenService\")")
     lines.append("local RunService = game:GetService(\"RunService\")")
@@ -1388,12 +1500,16 @@ def export_clip_keyframes(clip: AnimClip) -> dict[str, Any]:
 def discover_animations(
     unity_project_path: Path,
     guid_index: Any = None,
+    unconverted_out: list[dict[str, str]] | None = None,
 ) -> tuple[list[AnimClip], list[AnimatorController]]:
     """Discover and parse all .anim and .controller files in a Unity project.
 
     Args:
         unity_project_path: Root path of the Unity project.
         guid_index: Optional GUID index for resolving clip references.
+        unconverted_out: When supplied, ``parse_controller_file`` appends
+            entries here for binary controllers and 2D blend trees that
+            couldn't be emitted. Pipeline writes these to UNCONVERTED.md.
 
     Returns:
         Tuple of (clips, controllers).
@@ -1415,7 +1531,7 @@ def discover_animations(
 
     # Find all .controller files
     for ctrl_path in sorted(assets_dir.rglob("*.controller")):
-        ctrl = parse_controller_file(ctrl_path)
+        ctrl = parse_controller_file(ctrl_path, unconverted_out=unconverted_out)
         if ctrl:
             controllers.append(ctrl)
             log.debug("Parsed animator controller: %s (%d states, %d params)",
@@ -1452,13 +1568,17 @@ def convert_animations(
         AnimationConversionResult with clips, controllers, generated
         scripts, and per-clip routing metadata.
     """
-    clips, controllers = discover_animations(unity_project_path, guid_index)
+    unconverted: list[dict[str, str]] = []
+    clips, controllers = discover_animations(
+        unity_project_path, guid_index, unconverted_out=unconverted,
+    )
 
     result = AnimationConversionResult(
         clips=clips,
         controllers=controllers,
         total_clips=len(clips),
         total_controllers=len(controllers),
+        unconverted=unconverted,
     )
 
     # Path lookup + GUID → clip name for BlendTree entry resolution.
@@ -1603,6 +1723,40 @@ def convert_animations(
                     f"return data\n"
                 )
                 result.animation_data_modules.append((module_name, module_source))
+
+    # Scene-scoped runs: UNCONVERTED entries were collected during
+    # project-wide discovery, before the scene filter got applied.
+    # Drop entries for controllers the current run isn't emitting
+    # output for, so the md doesn't report features from unrelated
+    # scenes.
+    if any_scene_has_refs:
+        accepted_names = {
+            ctrl.name for ctrl in controllers
+            if ctrl.name in scenes_per_controller
+        }
+        any_scene_refs: set[str] = set()
+        for scene in parsed_scenes or ():
+            any_scene_refs.update(
+                getattr(scene, "referenced_animator_controller_guids", set())
+            )
+        filtered: list[dict[str, str]] = []
+        for entry in result.unconverted:
+            category = entry.get("category", "")
+            if category == "blend_tree":
+                # Item shape is "Controller/..." — keep iff controller accepted.
+                owner = entry.get("item", "").split("/", 1)[0]
+                if owner in accepted_names:
+                    filtered.append(entry)
+            elif category == "animator_controller":
+                # Binary controllers only know their .meta guid.
+                guid = entry.get("guid", "")
+                if guid and guid in any_scene_refs:
+                    filtered.append(entry)
+                # If no guid recorded (no .meta), drop — we can't
+                # prove the controller is in scope.
+            else:
+                filtered.append(entry)
+        result.unconverted = filtered
 
     # Standalone clips (no controller references them) — treated as
     # transform-only if they match the predicate, else still dropped

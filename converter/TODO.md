@@ -460,9 +460,70 @@ populated with correct per-clip reasons, `u2r.py validate` 0 errors.
   on `PrefabTemplate` + unioning into the scene set is the right
   fix; safe to defer since the unscoped fallback keeps existing
   projects working.
-- **Binary `.controller` + 2D blend tree UNCONVERTED.md entries.** PR 2b.
-- **Malformed keyframe `log.warning`.** PR 2b.
-- **Inline-policy header in generated transform-only scripts.** PR 2b.
 - **Transform-only prefab scanning** (one tween script per prefab
   animator, not just per scene) — plan calls this out; revisit
   alongside the prefab-animator aggregation above.
+
+### PR 2b — 4.5 robustness polish
+
+- **`UNCONVERTED.md` writer.** New `Pipeline._write_unconverted_md()`
+  aggregates `AnimationConversionResult.unconverted` entries grouped
+  by category (binary `.controller`, 2D blend tree) into
+  `<output>/UNCONVERTED.md` at the tail of `write_output`. Removes
+  any stale file when no entries remain so the absence of the md is
+  itself signal.
+- **Unconverted-entry plumbing.** `parse_controller_file` and
+  `_parse_blend_tree` take an optional `unconverted_out: list`
+  kwarg; `discover_animations` and `convert_animations` thread it
+  through. Keeps the API additive — older callers that don't pass
+  a list still work.
+- **Malformed keyframe `log.warning`.** `_parse_vector_curve` now
+  counts and logs skipped non-dict / non-numeric keyframes per
+  curve with path context. Previously silent drops.
+- **Inline-policy header in generated transform-only scripts.**
+  `generate_tween_script` prepends a `-- Inline TweenService per
+  docs/design/inline-over-runtime-wrappers.md (no TransformAnimator
+  / AnimatorBridge require)` comment to every output so readers can
+  find the governing design doc without grepping the codebase.
+- **Bridge-leak test tightened.** The regression guard now matches
+  only `require\\s*\\(.*AnimatorBridge.*\\)` patterns instead of
+  bare substrings — the new policy header intentionally names the
+  deleted bridges in a comment.
+
+Verification: fast suite 596 passed (+5); full SimpleFPS conversion
+still produces 7 transform-only scripts with the new header; no
+`UNCONVERTED.md` emitted for SimpleFPS (no binary controllers, no
+2D blend trees); `luau-analyze` (SyntaxError filter) passes 7/7;
+`u2r.py validate` 0 errors.
+
+### PR 2b — Codex review follow-ups (2026-04-24)
+
+Codex review of PR 2b flagged three P2 findings. GATE was PASS
+(no P1) but the fixes are cheap and make the polish actually reliable.
+
+- **Fix #1 — scene-filter leak into `UNCONVERTED.md`.** Entries for
+  controllers the run didn't emit output for are now dropped from
+  `result.unconverted` when scene-scoping is active.
+  `parse_controller_file` records the binary `.controller`'s `.meta`
+  GUID in the entry so `convert_animations` can filter binary
+  controllers against the scene's referenced GUID set. Blend-tree
+  entries filter by controller name.
+- **Fix #2 — nested 2D blend tree escaped detection.** A 1D blend
+  tree containing a 2D grandchild used to silently collapse to the
+  first-leaf clip without an UNCONVERTED entry. `_parse_blend_tree`
+  and `_first_leaf_clip_guid` now check `m_BlendType` on every
+  descent and surface nested 2D trees with the full
+  `controller/state/nested` context.
+- **Fix #3 — bridge-leak regression regex false-negative.** The
+  previous `require\\s*\\([^)]*bridge[^)]*\\)` regex stopped at the
+  first `)`, so the idiomatic Luau form `require(game:GetService
+  ("…"):FindFirstChild("AnimatorBridge"))` slipped through. Replaced
+  with a paren-balanced scanner in the test that walks from each
+  `require(` to its matching close-paren and checks the full
+  argument. New sanity test asserts the scanner flags the exact
+  nested form the old regex missed.
+
+Verification: fast suite 600 passed (+4 new tests for Codex fixes);
+SimpleFPS smoke unchanged (7 scripts, 0 validate errors, no
+UNCONVERTED.md emitted because SimpleFPS has no binary controllers
+or 2D blend trees).
