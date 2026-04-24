@@ -125,15 +125,70 @@ def test_generated_transform_only_script_has_no_deleted_bridge_require():
     )
     source = generate_tween_script(clip=clip)
     assert source is not None
-    # Match ``require(... AnimatorBridge ...)`` or ``require(... TransformAnimator ...)``
-    # — plain mentions are fine (the inline-policy header comment names
-    # them) but a live runtime import is the regression we care about.
-    import re
+    # Check every ``require(...)`` call with a paren-balanced scanner —
+    # a character-class like ``[^)]*`` stops at the first close-paren
+    # and misses idiomatic Luau forms like:
+    #     require(game:GetService("ReplicatedStorage"):FindFirstChild("AnimatorBridge"))
+    # Plain mentions outside a require() are fine (the inline-policy
+    # header comment names the deleted bridges on purpose).
     for bad in ("AnimatorBridge", "TransformAnimator"):
-        pattern = rf"require\s*\([^)]*{bad}[^)]*\)"
-        assert not re.search(pattern, source), (
-            f"generated transform-only script require()s {bad}"
-        )
+        for arg in _require_arguments(source):
+            assert bad not in arg, (
+                f"generated transform-only script require()s {bad}: {arg!r}"
+            )
+
+
+def test_require_arguments_catches_nested_service_lookup():
+    """Sanity: the new paren-balanced scanner must flag the exact
+    nested form the old regex missed.
+    """
+    luau = 'local Bridge = require(game:GetService("ReplicatedStorage"):FindFirstChild("AnimatorBridge"))\n'
+    args = _require_arguments(luau)
+    assert len(args) == 1
+    assert "AnimatorBridge" in args[0]
+
+    # Control: a plain mention in a comment is NOT captured.
+    luau_comment = '-- AnimatorBridge is removed; see inline-over-runtime-wrappers.md\nlocal t = {}\n'
+    assert _require_arguments(luau_comment) == []
+
+
+def _require_arguments(source: str) -> list[str]:
+    """Return the argument text of every ``require(...)`` call.
+
+    Reads balanced parens starting at each ``require(``. Does not try
+    to ignore requires inside string literals — Luau scripts rarely
+    contain the literal text ``require(`` in a string, and a false
+    positive here only means the test is stricter.
+    """
+    results: list[str] = []
+    i = 0
+    while True:
+        idx = source.find("require", i)
+        if idx == -1:
+            break
+        j = idx + len("require")
+        while j < len(source) and source[j] in " \t\n\r":
+            j += 1
+        if j >= len(source) or source[j] != "(":
+            i = idx + 1
+            continue
+        start = j + 1
+        depth = 1
+        k = start
+        while k < len(source) and depth > 0:
+            ch = source[k]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            k += 1
+        if depth == 0:
+            results.append(source[start:k - 1])
+            i = k
+        else:
+            # Unbalanced — bail to avoid infinite loop.
+            break
+    return results
 
 
 def test_animator_runtime_luau_syntax():

@@ -495,3 +495,35 @@ still produces 7 transform-only scripts with the new header; no
 `UNCONVERTED.md` emitted for SimpleFPS (no binary controllers, no
 2D blend trees); `luau-analyze` (SyntaxError filter) passes 7/7;
 `u2r.py validate` 0 errors.
+
+### PR 2b — Codex review follow-ups (2026-04-24)
+
+Codex review of PR 2b flagged three P2 findings. GATE was PASS
+(no P1) but the fixes are cheap and make the polish actually reliable.
+
+- **Fix #1 — scene-filter leak into `UNCONVERTED.md`.** Entries for
+  controllers the run didn't emit output for are now dropped from
+  `result.unconverted` when scene-scoping is active.
+  `parse_controller_file` records the binary `.controller`'s `.meta`
+  GUID in the entry so `convert_animations` can filter binary
+  controllers against the scene's referenced GUID set. Blend-tree
+  entries filter by controller name.
+- **Fix #2 — nested 2D blend tree escaped detection.** A 1D blend
+  tree containing a 2D grandchild used to silently collapse to the
+  first-leaf clip without an UNCONVERTED entry. `_parse_blend_tree`
+  and `_first_leaf_clip_guid` now check `m_BlendType` on every
+  descent and surface nested 2D trees with the full
+  `controller/state/nested` context.
+- **Fix #3 — bridge-leak regression regex false-negative.** The
+  previous `require\\s*\\([^)]*bridge[^)]*\\)` regex stopped at the
+  first `)`, so the idiomatic Luau form `require(game:GetService
+  ("…"):FindFirstChild("AnimatorBridge"))` slipped through. Replaced
+  with a paren-balanced scanner in the test that walks from each
+  `require(` to its matching close-paren and checks the full
+  argument. New sanity test asserts the scanner flags the exact
+  nested form the old regex missed.
+
+Verification: fast suite 600 passed (+4 new tests for Codex fixes);
+SimpleFPS smoke unchanged (7 scripts, 0 validate errors, no
+UNCONVERTED.md emitted because SimpleFPS has no binary controllers
+or 2D blend trees).
