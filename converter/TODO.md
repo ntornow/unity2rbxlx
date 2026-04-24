@@ -637,3 +637,63 @@ run in the fast suite with no `pyassimp` dependency.
 - Companion Luau scripts per material — source has an empty stub
 - `UnconvertedFeature` dataclass with severity tiers — revisit if
   warnings grow noisy enough to benefit from filtering
+
+## Cross-script shared-state transpilation gap (2026-04-24)
+
+Surfaced during the full SimpleFPS conversion test of PR 3. Doors
+in the loaded game never opened because `Player.luau` tracks the
+key as module-local state while `Door.luau` reads a character
+attribute — no bridge between the two.
+
+**Observed:**
+- `Player.luau:72` — `local gotKey = false`
+- `Player.luau:267` / `:398` — `gotKey = true` on pickup / dev-bypass F1
+- `Player.luau:76-78` — exports `Player.hasKey = function() return gotKey end`
+- `Door.luau:58-62` — reads `character:GetAttribute("hasKey")` /
+  `player:GetAttribute("hasKey")`. **Nothing ever writes that attribute.**
+- Result: even picking up the keycard or hitting the dev-bypass
+  hotkey leaves the door's `hasKey` check `false` forever.
+
+**Pattern:** Unity cross-script state (static fields or singleton
+references) lowers inconsistently under AI transpilation — the
+owning script keeps it as module-local data, reader scripts guess
+at `GetAttribute`/`SetAttribute` as the IPC channel (a reasonable
+Roblox default), but the two code paths never get linked. Same
+gap affects `gotItems`, `gotWeapon`, and likely any other
+Unity-level shared state in SimpleFPS and future projects.
+
+**Workaround for the current output:** one-line mirror at each
+`gotKey = true` site — `if character then
+character:SetAttribute("hasKey", true) end`. Applied to the two
+assignment sites in `output/SimpleFPS_full/scripts/Player.luau`
+so PR 3 smoke could validate doors end-to-end.
+
+**Proper converter fix (belongs in PR 4, Phase 4.3):**
+The Phase 4 plan's 4.3.1 ("Port Dependency-Aware Context
+Building") has the answer — the AI transpiler's prompt should
+include already-transpiled dependencies' output and public
+signatures. Door.cs transpilation should see Player.luau's
+exported `Player.hasKey = function()` and generate
+`require(Player).hasKey()` instead of `GetAttribute("hasKey")`.
+The dependency-order batching in 4.3.1 also guarantees Player is
+transpiled before Door so its signatures are available.
+
+**Alternative (cheaper, also in 4.3 scope): prompt rule.**
+Teach the transpiler prompt: "For cross-script boolean state
+exposed via Unity public fields / properties, use
+`:GetAttribute`/`:SetAttribute` on the character consistently on
+BOTH read and write sides. Never module-local variables for
+cross-script state." Less structural than the dependency-context
+approach but closes this exact gap without requiring transpile
+ordering.
+
+**Post-transpile check (cheap linter, could live outside 4.3):**
+Walk all generated Luau. Flag every `GetAttribute("X")` that has
+no corresponding `SetAttribute("X")` in any other script, OR that
+has a same-named module-local variable in another script. Add to
+`UNCONVERTED.md` as a consistency warning. Catches the class of
+bug even when the AI gets it wrong.
+
+Action: address in PR 4 via 4.3.1 dependency-aware prompt +
+explicit shared-state rule. The linter is a nice add but not
+load-bearing if the prompt fix lands.
