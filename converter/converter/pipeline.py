@@ -889,13 +889,20 @@ class Pipeline:
         )
 
     def convert_animations(self) -> None:
-        """Phase 5a: Convert Unity animations to Roblox TweenService scripts."""
+        """Phase 5a: route Unity animations to animator_runtime or inline TweenService.
+
+        Phase 4.5: when a parsed scene is available, pass it so the
+        converter can filter controllers to those actually referenced
+        and scene-scope the emitted module names.
+        """
         log.info("[convert_animations] Discovering and converting animations ...")
         from converter.animation_converter import convert_animations as _convert_anims
 
+        parsed_scenes = [self.state.parsed_scene] if self.state.parsed_scene else None
         self.state.animation_result = _convert_anims(
             unity_project_path=self.unity_project_path,
             guid_index=self.state.guid_index,
+            parsed_scenes=parsed_scenes,
         )
         self.ctx.total_animations = self.state.animation_result.total_clips
         self.ctx.converted_animations = self.state.animation_result.total_scripts_generated
@@ -1955,11 +1962,17 @@ script.Disabled = true
                     luau_path.stem, str(luau_path.relative_to(scripts_dir)),
                 )
 
+        # Animation routing (Phase 4.5): per-clip target + reason.
+        animation_routing: dict[str, dict[str, dict[str, str]]] = {}
+        if self.state.animation_result is not None:
+            animation_routing = getattr(self.state.animation_result, "routing", {}) or {}
+
         plan_path = self.output_dir / "conversion_plan.json"
         plan_path.write_text(
             _json.dumps({
                 "storage_plan": self.ctx.storage_plan,
                 "script_paths": script_paths,
+                "animation_routing": animation_routing,
             }, indent=2),
             encoding="utf-8",
         )

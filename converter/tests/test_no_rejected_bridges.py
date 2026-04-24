@@ -99,6 +99,37 @@ def test_animator_runtime_has_consolidated_features():
         assert method in source, f"missing: {method}"
 
 
+def test_generated_transform_only_script_has_no_deleted_bridge_require():
+    """Phase 4.5: transform-only animation scripts are inline TweenService —
+    they must not require() any deleted runtime bridge.
+    """
+    from converter.animation_converter import (
+        AnimClip, AnimCurve, AnimKeyframe, generate_tween_script,
+    )
+
+    clip = AnimClip(
+        name="Spin",
+        duration=1.0,
+        loop=True,
+        sample_rate=30.0,
+        curves=[
+            AnimCurve(
+                property_type="euler",
+                path="Spinner",
+                keyframes=[
+                    AnimKeyframe(time=0.0, value=(0, 0, 0)),
+                    AnimKeyframe(time=1.0, value=(0, 360, 0)),
+                ],
+            ),
+        ],
+    )
+    source = generate_tween_script(clip=clip)
+    assert source is not None
+    for bad in ("AnimatorBridge", "TransformAnimator",
+                "bridge/TransformAnimator", "bridge/AnimatorBridge"):
+        assert bad not in source, f"generated transform-only script references {bad}"
+
+
 def test_animator_runtime_luau_syntax():
     source = (RUNTIME_DIR / "animator_runtime.luau").read_text()
     lines = source.splitlines()
