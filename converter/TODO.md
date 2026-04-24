@@ -410,3 +410,59 @@ the plan's ~260 lines to ~80. Scope decisions:
   `text_x_alignment` / `text_y_alignment` yet; only legacy
   `m_Alignment` (single 0..8 enum) is handled. Revisit if a test
   project exercises TMP-only text layout issues.
+
+### PR 2a — 4.5 animation routing engine
+
+Scope: the "core" half of Phase 4.5 (routing predicate, blend trees,
+per-clip routing, persistence, scene-scoped naming, parsed_scenes
+consumption). Robustness polish split into PR 2b.
+
+- **UNITY_TO_R15_BONE_MAP + `AnimClip.is_transform_only` predicate.**
+  20-entry Unity humanoid-bone → R15 part map, plus
+  `AnimClip.bone_paths` populated on parse and an `is_transform_only`
+  property that strips `Armature|` prefixes when testing paths.
+- **BlendTree/BlendTreeEntry dataclasses + 1D parsing.** Replaced the
+  "first-child fallback" hack in `parse_controller_file` with a
+  proper `_parse_blend_tree` resolving `m_Childs` into
+  `BlendTreeEntry`. 2D blend trees log a warning, emit nothing, and
+  keep a first-leaf `clip_guid` on the state as runtime fallback.
+  Nested blend trees inline their first leaf.
+- **`export_controller_json` emits `blendTrees`** matching the schema
+  `runtime/animator_runtime.luau` already consumes:
+  `{name → {param, clips: [{clip, threshold}]}}`. Clip names resolve
+  from GUIDs via a new `clip_name_by_guid` kwarg.
+- **Per-clip routing + `AnimationConversionResult.routing`.** Each
+  clip is routed once: humanoid → bundled in animator_runtime JSON;
+  transform-only → inline TweenService Script. Orphan clips go
+  inline. Routing + reason persisted to `conversion_plan.json`
+  under `animation_routing`.
+- **`parsed_scenes` consumption + scene-scoped naming.** When any
+  parsed scene's `referenced_animator_controller_guids` set is
+  non-empty, controllers are filtered and emitted as
+  `AnimationData_{scene}_{controller}`. When every scene's set is
+  empty (Animators live inside prefabs — the common case for
+  SimpleFPS), fall back to unscoped emission.
+- **No deleted-bridge requires.** New regression test in
+  `test_no_rejected_bridges.py` asserts `generate_tween_script`
+  output never references `AnimatorBridge` or `TransformAnimator`.
+
+Verification: fast suite 591 passed; full SimpleFPS convert ran
+clean in 1.9s — 7 transform-only inline scripts, 0 AnimationData
+modules (no humanoid clips in SimpleFPS), `animation_routing`
+populated with correct per-clip reasons, `u2r.py validate` 0 errors.
+
+### Deferred from PR 2a → addressed in PR 2b or later
+
+- **Prefab-scoped animator controller aggregation.** Scenes that
+  only reach controllers through prefab instances have an empty
+  `referenced_animator_controller_guids` set, so scene-scoped
+  naming never activates for them. Adding equivalent aggregation
+  on `PrefabTemplate` + unioning into the scene set is the right
+  fix; safe to defer since the unscoped fallback keeps existing
+  projects working.
+- **Binary `.controller` + 2D blend tree UNCONVERTED.md entries.** PR 2b.
+- **Malformed keyframe `log.warning`.** PR 2b.
+- **Inline-policy header in generated transform-only scripts.** PR 2b.
+- **Transform-only prefab scanning** (one tween script per prefab
+  animator, not just per scene) — plan calls this out; revisit
+  alongside the prefab-animator aggregation above.

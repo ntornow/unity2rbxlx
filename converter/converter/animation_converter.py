@@ -33,6 +33,43 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Unity humanoid-bone → Roblox R15 part name.
+#
+# Used by is_transform_only() to decide a clip's routing target:
+#   - any bone matches  → humanoid clip → animator_runtime.luau
+#   - no bone matches   → transform-only → inline TweenService
+#
+# See docs/design/inline-over-runtime-wrappers.md for the policy that deletes
+# AnimatorBridge / TransformAnimator and mandates these two inline targets.
+# ---------------------------------------------------------------------------
+
+UNITY_TO_R15_BONE_MAP: dict[str, str] = {
+    "Hips": "HumanoidRootPart",
+    "Spine": "LowerTorso",
+    "Chest": "UpperTorso",
+    "UpperChest": "UpperTorso",
+    "Neck": "Head",  # Roblox has no separate Neck part
+    "Head": "Head",
+    "LeftShoulder": "LeftUpperArm",
+    "LeftUpperArm": "LeftUpperArm",
+    "LeftLowerArm": "LeftLowerArm",
+    "LeftHand": "LeftHand",
+    "RightShoulder": "RightUpperArm",
+    "RightUpperArm": "RightUpperArm",
+    "RightLowerArm": "RightLowerArm",
+    "RightHand": "RightHand",
+    "LeftUpperLeg": "LeftUpperLeg",
+    "LeftLowerLeg": "LeftLowerLeg",
+    "LeftFoot": "LeftFoot",
+    "RightUpperLeg": "RightUpperLeg",
+    "RightLowerLeg": "RightLowerLeg",
+    "RightFoot": "RightFoot",
+}
+
+_HUMANOID_BONE_NAMES = frozenset(UNITY_TO_R15_BONE_MAP.keys())
+
+
+# ---------------------------------------------------------------------------
 # Data models
 # ---------------------------------------------------------------------------
 
@@ -74,6 +111,31 @@ class AnimClip:
     curves: list[AnimCurve] = field(default_factory=list)
     events: list[AnimEvent] = field(default_factory=list)
     source_path: Path | None = None
+    # Union of unique transform-curve paths in this clip, used for routing.
+    bone_paths: list[str] = field(default_factory=list)
+
+    @property
+    def is_transform_only(self) -> bool:
+        """True when no curve path references a humanoid bone.
+
+        Clips driving humanoid bones (Hips, Spine, LeftUpperArm, …) must
+        go through animator_runtime.luau so Roblox's Humanoid can play
+        them. Clips driving only arbitrary transform children (a spinning
+        platform, a bobbing door) can use inline TweenService instead.
+
+        Returns False for empty clips — we can't route what we can't see.
+        """
+        if not self.curves:
+            return False
+        for curve in self.curves:
+            if not curve.path:
+                continue
+            for part in curve.path.split("/"):
+                # Mixamo-style "Armature|LeftFoot" — last segment wins.
+                clean = part.split("|")[-1] if "|" in part else part
+                if clean in _HUMANOID_BONE_NAMES:
+                    return False
+        return True
 
 
 @dataclass
@@ -84,6 +146,9 @@ class AnimState:
     clip_guid: str  # GUID of the referenced AnimationClip
     speed: float = 1.0
     transitions: list[AnimTransition] = field(default_factory=list)
+    # When this state's motion is a BlendTree, its name is recorded here
+    # and the runtime looks it up in AnimatorController.blend_trees.
+    blend_tree_name: str = ""
 
 
 @dataclass
@@ -116,6 +181,34 @@ class AnimParameter:
 
 
 @dataclass
+class BlendTreeEntry:
+    """One motion entry in a 1D blend tree.
+
+    ``clip_guid`` is captured at parse time; ``clip_name`` is populated
+    later once the GUID → AnimClip lookup is available. Nested blend
+    trees are flattened: the entry's nested tree (if any) is inlined
+    by picking its first resolvable child clip.
+    """
+    threshold: float
+    clip_guid: str = ""
+    clip_name: str = ""
+
+
+@dataclass
+class BlendTree:
+    """A 1D Unity blend tree.
+
+    The Luau runtime at ``runtime/animator_runtime.luau`` expects the
+    emitted JSON shape ``{name -> {param, clips: [{clip, threshold}]}}``.
+    2D blend trees are not emitted; those states log a warning and fall
+    back to the first child clip in their state's ``clip_guid``.
+    """
+    name: str
+    param: str
+    entries: list[BlendTreeEntry] = field(default_factory=list)
+
+
+@dataclass
 class AnimatorController:
     """A parsed Unity AnimatorController."""
     name: str
@@ -123,6 +216,8 @@ class AnimatorController:
     states: list[AnimState] = field(default_factory=list)
     default_state_file_id: str = ""
     source_path: Path | None = None
+    # Blend trees referenced by any state in this controller, keyed by name.
+    blend_trees: dict[str, BlendTree] = field(default_factory=dict)
 
 
 @dataclass
@@ -135,6 +230,12 @@ class AnimationConversionResult:
     total_clips: int = 0
     total_controllers: int = 0
     total_scripts_generated: int = 0
+    # Per-clip routing decisions.  Shape:
+    #   { controller_name: { clip_name: { "target": str, "reason": str } } }
+    # "target" is one of: "animator_runtime", "inline_tween", "skipped".
+    # Serialized into conversion_plan.json under the "animation_routing" key
+    # so rehydration and downstream consumers can see what got routed where.
+    routing: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +336,14 @@ def _parse_clip_body(body: dict[str, Any], source_path: Path) -> AnimClip:
                 float_parameter=float(event_data.get("floatParameter", 0)),
                 string_parameter=event_data.get("stringParameter", ""),
             ))
+
+    # Record unique paths so is_transform_only() and downstream routing can
+    # inspect the clip without re-walking its curves.
+    seen_paths: set[str] = set()
+    for curve in clip.curves:
+        if curve.path and curve.path not in seen_paths:
+            seen_paths.add(curve.path)
+            clip.bone_paths.append(curve.path)
 
     return clip
 
@@ -398,46 +507,34 @@ def parse_controller_file(controller_path: Path) -> AnimatorController | None:
         if cid != 1102:
             continue
 
+        state_name = body.get("m_Name", "")
         motion_ref = body.get("m_Motion", {})
         clip_guid = ""
+        blend_tree_name = ""
+
         if isinstance(motion_ref, dict):
-            clip_guid = motion_ref.get("guid", "")
-            # If no GUID, the motion might be a BlendTree (local fileID reference)
+            clip_guid = motion_ref.get("guid", "") or ""
             if not clip_guid:
+                # Local fileID refers to a BlendTree doc in this same file.
                 motion_fid = str(motion_ref.get("fileID", ""))
                 if motion_fid and motion_fid in docs_by_fid:
                     bt_cid, bt_body = docs_by_fid[motion_fid]
-                    if bt_cid == 206:  # BlendTree classID
-                        # Extract the first child motion's clip GUID as fallback
-                        children = bt_body.get("m_Childs", []) or []
-                        for child in children:
-                            if not isinstance(child, dict):
-                                continue
-                            child_motion = child.get("m_Motion", {})
-                            if isinstance(child_motion, dict):
-                                child_guid = child_motion.get("guid", "")
-                                if child_guid:
-                                    clip_guid = child_guid
-                                    break
-                                # Nested BlendTree: try its children too
-                                nested_fid = str(child_motion.get("fileID", ""))
-                                if nested_fid and nested_fid in docs_by_fid:
-                                    n_cid, n_body = docs_by_fid[nested_fid]
-                                    if n_cid == 206:
-                                        for nc in (n_body.get("m_Childs", []) or []):
-                                            if isinstance(nc, dict):
-                                                nm = nc.get("m_Motion", {})
-                                                if isinstance(nm, dict) and nm.get("guid"):
-                                                    clip_guid = nm["guid"]
-                                                    break
-                                    if clip_guid:
-                                        break
+                    if bt_cid == 206:
+                        bt = _parse_blend_tree(bt_body, docs_by_fid, state_name)
+                        if bt is not None:
+                            controller.blend_trees[bt.name] = bt
+                            blend_tree_name = bt.name
+                        # Always set a clip_guid fallback (first resolvable
+                        # leaf) so rehydration / degraded playback still
+                        # picks up something for unsupported 2D trees.
+                        clip_guid = _first_leaf_clip_guid(bt_body, docs_by_fid)
 
         state = AnimState(
-            name=body.get("m_Name", ""),
+            name=state_name,
             file_id=fid,
             clip_guid=clip_guid,
             speed=float(body.get("m_Speed", 1.0)),
+            blend_tree_name=blend_tree_name,
         )
 
         # Parse transitions for this state
@@ -484,6 +581,92 @@ def _parse_transition(body: dict[str, Any]) -> AnimTransition | None:
         ))
 
     return transition
+
+
+def _parse_blend_tree(
+    bt_body: dict[str, Any],
+    docs_by_fid: dict[str, tuple[int, dict]],
+    owning_state_name: str,
+) -> BlendTree | None:
+    """Parse a BlendTree YAML body into a 1D BlendTree structure.
+
+    2D blend trees (``m_BlendType`` != 0) are skipped with a warning —
+    the runtime only consumes 1D. Nested blend trees flatten: a child
+    that itself points at another blend tree contributes its first
+    resolvable leaf clip.
+    """
+    blend_type = int(bt_body.get("m_BlendType", 0))
+    if blend_type != 0:
+        log.warning(
+            "BlendTree on state %r uses unsupported BlendType=%d (2D); "
+            "keeping fallback clip only",
+            owning_state_name, blend_type,
+        )
+        return None
+
+    # Unity serialized name lives on the BlendTree doc; fall back to the
+    # owning state so lookups remain deterministic.
+    name = bt_body.get("m_Name") or owning_state_name or "BlendTree"
+    param = bt_body.get("m_BlendParameter", "") or ""
+
+    entries: list[BlendTreeEntry] = []
+    for child in bt_body.get("m_Childs", []) or []:
+        if not isinstance(child, dict):
+            continue
+        threshold = float(child.get("m_Threshold", 0) or 0)
+        motion_ref = child.get("m_Motion", {})
+        if not isinstance(motion_ref, dict):
+            continue
+        guid = motion_ref.get("guid", "") or ""
+        if not guid:
+            # Nested blend tree → inline its first leaf clip.
+            guid = _first_leaf_clip_guid(
+                _deref_motion(motion_ref, docs_by_fid),
+                docs_by_fid,
+            )
+        if guid:
+            entries.append(BlendTreeEntry(threshold=threshold, clip_guid=guid))
+
+    if not entries:
+        return None
+    return BlendTree(name=name, param=param, entries=entries)
+
+
+def _deref_motion(
+    motion_ref: dict[str, Any],
+    docs_by_fid: dict[str, tuple[int, dict]],
+) -> dict[str, Any]:
+    """Resolve a Motion reference to its BlendTree doc, or {} if not one."""
+    motion_fid = str(motion_ref.get("fileID", ""))
+    if motion_fid and motion_fid in docs_by_fid:
+        cid, body = docs_by_fid[motion_fid]
+        if cid == 206:
+            return body
+    return {}
+
+
+def _first_leaf_clip_guid(
+    bt_body: dict[str, Any],
+    docs_by_fid: dict[str, tuple[int, dict]],
+) -> str:
+    """Return the first clip GUID reachable from a (possibly nested) tree."""
+    if not bt_body:
+        return ""
+    for child in bt_body.get("m_Childs", []) or []:
+        if not isinstance(child, dict):
+            continue
+        child_motion = child.get("m_Motion", {})
+        if not isinstance(child_motion, dict):
+            continue
+        guid = child_motion.get("guid", "") or ""
+        if guid:
+            return guid
+        nested = _deref_motion(child_motion, docs_by_fid)
+        if nested:
+            nested_guid = _first_leaf_clip_guid(nested, docs_by_fid)
+            if nested_guid:
+                return nested_guid
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -1059,11 +1242,19 @@ def generate_state_machine_script(
     return "\n".join(lines) + "\n"
 
 
-def export_controller_json(controller: AnimatorController) -> dict[str, Any]:
+def export_controller_json(
+    controller: AnimatorController,
+    clip_name_by_guid: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """Export an AnimatorController as a JSON-serializable dict for the runtime.
 
     The animator_runtime.luau expects this format for state machine evaluation.
+
+    When ``clip_name_by_guid`` is provided, BlendTree entries resolve their
+    ``clip_guid`` → ``clip_name`` so the runtime can look clips up by name.
+    Without it, entries missing a name are dropped (they'd be unreachable).
     """
+    clip_name_by_guid = clip_name_by_guid or {}
     states = []
     for state in controller.states:
         transitions = []
@@ -1084,12 +1275,15 @@ def export_controller_json(controller: AnimatorController) -> dict[str, Any]:
                 "hasExitTime": trans.has_exit_time,
                 "exitTime": trans.exit_time,
             })
-        states.append({
+        state_entry: dict[str, Any] = {
             "name": state.name,
             "motion": state.name,  # Use state name as motion key
             "speed": state.speed,
             "transitions": transitions,
-        })
+        }
+        if state.blend_tree_name:
+            state_entry["blendTree"] = state.blend_tree_name
+        states.append(state_entry)
 
     # Resolve transition destination names from file_id
     state_name_by_fid = {s.file_id: s.name for s in controller.states}
@@ -1113,12 +1307,27 @@ def export_controller_json(controller: AnimatorController) -> dict[str, Any]:
             "defaultValue": default_val,
         })
 
-    return {
+    # Resolve blend-tree entries' clip_guid → clip_name for the Luau runtime.
+    blend_trees: dict[str, Any] = {}
+    for bt_name, bt in controller.blend_trees.items():
+        out_clips: list[dict[str, Any]] = []
+        for entry in bt.entries:
+            clip_name = entry.clip_name or clip_name_by_guid.get(entry.clip_guid, "")
+            if not clip_name:
+                continue
+            out_clips.append({"clip": clip_name, "threshold": entry.threshold})
+        if out_clips:
+            blend_trees[bt_name] = {"param": bt.param, "clips": out_clips}
+
+    result: dict[str, Any] = {
         "name": controller.name,
         "states": states,
         "parameters": parameters,
         "defaultState": state_name_by_fid.get(controller.default_state_file_id, ""),
     }
+    if blend_trees:
+        result["blendTrees"] = blend_trees
+    return result
 
 
 def export_clip_keyframes(clip: AnimClip) -> dict[str, Any]:
@@ -1218,17 +1427,30 @@ def discover_animations(
 def convert_animations(
     unity_project_path: Path,
     guid_index: Any = None,
+    parsed_scenes: list[Any] | None = None,
 ) -> AnimationConversionResult:
     """Convert all animations in a Unity project to Roblox Luau scripts.
 
-    This is the main entry point for the animation conversion phase.
+    Phase 4.5 routing: each clip is sent to exactly one target —
+      - humanoid clips (touch R15 bone names)  → animator_runtime.luau JSON
+      - transform-only clips (non-humanoid)    → inline TweenService Scripts
+    No ``require()`` of deleted bridge modules is emitted from either path.
+    Per-clip routing + reason is recorded on ``result.routing`` so the
+    pipeline can persist it to ``conversion_plan.json``.
 
     Args:
         unity_project_path: Root path of the Unity project.
         guid_index: GUID index for resolving clip references in controllers.
+        parsed_scenes: When provided, only controllers referenced by at
+            least one scene's ``referenced_animator_controller_guids`` are
+            emitted, and module names are prefixed with the scene name.
+            One set of animation_data modules is emitted per (scene,
+            controller) pair. Unset → project-wide emission, no prefix
+            (current/test behaviour).
 
     Returns:
-        AnimationConversionResult with clips, controllers, and generated scripts.
+        AnimationConversionResult with clips, controllers, generated
+        scripts, and per-clip routing metadata.
     """
     clips, controllers = discover_animations(unity_project_path, guid_index)
 
@@ -1239,84 +1461,153 @@ def convert_animations(
         total_controllers=len(controllers),
     )
 
-    # Build a guid -> clip mapping if we have a guid_index
+    # Path lookup + GUID → clip name for BlendTree entry resolution.
     clip_by_path: dict[str, AnimClip] = {}
     for clip in clips:
         if clip.source_path:
-            # Use resolve() to normalize symlinks (e.g. /var -> /private/var on macOS)
             clip_by_path[str(clip.source_path.resolve())] = clip
 
-    # For each controller, find associated clips and generate scripts
-    for ctrl in controllers:
-        # Build clips_by_guid for this controller
-        clips_by_guid: dict[str, AnimClip] = {}
-        ctrl_clips: list[AnimClip] = []
+    clip_name_by_guid: dict[str, str] = {}
+    if guid_index:
+        for clip in clips:
+            if clip.source_path:
+                gid = guid_index.guid_for_path(clip.source_path.resolve())
+                if gid:
+                    clip_name_by_guid[gid] = clip.name
 
-        for state in ctrl.states:
-            if not state.clip_guid:
+    # Determine which scenes reference each controller (by GUID). Scenes
+    # only directly carry Animator components when a GameObject in the
+    # scene YAML has one; in most projects Animators live inside prefabs,
+    # so the scene's set is empty. In that case fall back to unscoped
+    # emission for every controller — filtering would drop them all.
+    scenes_per_controller: dict[str, list[str]] = {}
+    any_scene_has_refs = False
+    if parsed_scenes and guid_index:
+        for scene in parsed_scenes:
+            if getattr(scene, "referenced_animator_controller_guids", None):
+                any_scene_has_refs = True
+                break
+    if any_scene_has_refs and guid_index:
+        for ctrl in controllers:
+            ctrl_guid = (
+                guid_index.guid_for_path(ctrl.source_path.resolve())
+                if ctrl.source_path else None
+            )
+            if not ctrl_guid:
                 continue
+            for scene in parsed_scenes or ():
+                refs = getattr(scene, "referenced_animator_controller_guids", set())
+                if ctrl_guid in refs:
+                    scene_stem = getattr(scene, "scene_path", None)
+                    scene_stem = scene_stem.stem if scene_stem else ""
+                    scenes_per_controller.setdefault(ctrl.name, []).append(scene_stem)
+    default_scopes = [""]
 
-            # Try to resolve the clip GUID to a path
-            if guid_index:
-                clip_path = guid_index.resolve(state.clip_guid)
-                if clip_path:
-                    resolved_key = str(clip_path.resolve())
-                    if resolved_key in clip_by_path:
-                        clip = clip_by_path[resolved_key]
-                        ctrl_clips.append(clip)
-                        clips_by_guid[state.clip_guid] = clip
+    for ctrl in controllers:
+        scopes = scenes_per_controller.get(ctrl.name, default_scopes)
+        if any_scene_has_refs and ctrl.name not in scenes_per_controller:
+            # Scene filtering active and this controller is unreferenced
+            # by any scene we have data for — skip, log as routing.
+            result.routing.setdefault(ctrl.name, {})["__controller__"] = {
+                "target": "skipped",
+                "reason": "not referenced by any parsed scene",
+            }
+            continue
+
+        # Resolve clips the controller actually references (via states).
+        ctrl_clips: list[AnimClip] = []
+        clips_by_guid: dict[str, AnimClip] = {}
+        for state in ctrl.states:
+            if not state.clip_guid or not guid_index:
+                continue
+            clip_path = guid_index.resolve(state.clip_guid)
+            if not clip_path:
+                continue
+            resolved_key = str(clip_path.resolve())
+            clip = clip_by_path.get(resolved_key)
+            if clip and clip not in ctrl_clips:
+                ctrl_clips.append(clip)
+                clips_by_guid[state.clip_guid] = clip
 
         if not ctrl_clips:
             continue
 
-        # Use unified state machine for controllers with transitions
-        has_transitions = any(s.transitions for s in ctrl.states)
-        if has_transitions and len(ctrl.states) >= 2:
-            script_name = f"Anim_{ctrl.name}_StateMachine"
-            luau_source = generate_state_machine_script(
-                controller=ctrl,
-                clips_by_guid=clips_by_guid,
-                game_object_name=ctrl.name,
-            )
-            if luau_source:
-                result.generated_scripts.append((script_name, luau_source))
-        else:
-            # Simple controller: generate per-clip scripts
-            for clip in ctrl_clips:
+        # Partition the controller's clips by routing target.
+        humanoid_clips: list[AnimClip] = []
+        transform_only_clips: list[AnimClip] = []
+        per_clip_routing: dict[str, dict[str, str]] = {}
+        for clip in ctrl_clips:
+            if clip.is_transform_only:
+                transform_only_clips.append(clip)
+                per_clip_routing[clip.name] = {
+                    "target": "inline_tween",
+                    "reason": "non-humanoid transform-only curves",
+                }
+            else:
+                humanoid_clips.append(clip)
+                per_clip_routing[clip.name] = {
+                    "target": "animator_runtime",
+                    "reason": "humanoid bone targets or empty curve set",
+                }
+        result.routing[ctrl.name] = per_clip_routing
+
+        # Emit per (scene, controller) pair.
+        for scope in scopes:
+            prefix = f"{scope}_" if scope else ""
+
+            # State-machine script for humanoid clips when the controller
+            # has transitions — one script per scope.
+            has_transitions = any(s.transitions for s in ctrl.states)
+            if humanoid_clips and has_transitions and len(ctrl.states) >= 2:
+                script_name = f"Anim_{prefix}{ctrl.name}_StateMachine"
+                luau_source = generate_state_machine_script(
+                    controller=ctrl,
+                    clips_by_guid={g: c for g, c in clips_by_guid.items() if not c.is_transform_only},
+                    game_object_name=ctrl.name,
+                )
+                if luau_source:
+                    result.generated_scripts.append((script_name, luau_source))
+
+            # Inline TweenService script for every transform-only clip,
+            # regardless of state-machine presence — these never go
+            # through animator_runtime.
+            for clip in transform_only_clips:
                 if not clip.curves:
                     continue
-
-                script_name = f"Anim_{ctrl.name}_{clip.name}"
+                script_name = f"Anim_{prefix}{ctrl.name}_{clip.name}"
                 luau_source = generate_tween_script(
                     clip=clip,
                     game_object_name=ctrl.name,
                     controller=ctrl,
                 )
-
                 if luau_source:
                     result.generated_scripts.append((script_name, luau_source))
 
-        # Export controller JSON and keyframe data as a ModuleScript
-        controller_data = export_controller_json(ctrl)
-        keyframes: dict[str, Any] = {}
-        for clip in ctrl_clips:
-            keyframes[clip.name] = export_clip_keyframes(clip)
-        combined = {
-            "controller": controller_data,
-            "keyframes": keyframes,
-        }
-        module_name = f"AnimationData_{ctrl.name}"
-        json_str = json.dumps(combined, indent=2)
-        module_source = (
-            f"-- Auto-generated animation data for {ctrl.name}\n"
-            f"-- Used by animator_runtime.luau LoadKeyframes()\n"
-            f"local data = game:GetService(\"HttpService\")"
-            f":JSONDecode([==[{json_str}]==])\n"
-            f"return data\n"
-        )
-        result.animation_data_modules.append((module_name, module_source))
+            # animator_runtime JSON module — emit only when at least one
+            # humanoid clip lands here. Transform-only clips are NOT
+            # bundled (they're inline Scripts above).
+            if humanoid_clips:
+                controller_data = export_controller_json(ctrl, clip_name_by_guid)
+                keyframes: dict[str, Any] = {
+                    clip.name: export_clip_keyframes(clip) for clip in humanoid_clips
+                }
+                combined = {"controller": controller_data, "keyframes": keyframes}
+                module_name = f"AnimationData_{prefix}{ctrl.name}"
+                json_str = json.dumps(combined, indent=2)
+                module_source = (
+                    f"-- Auto-generated animation data for {module_name}\n"
+                    f"-- Consumed by animator_runtime.luau LoadKeyframes()\n"
+                    f"-- Policy: see docs/design/inline-over-runtime-wrappers.md\n"
+                    f"local data = game:GetService(\"HttpService\")"
+                    f":JSONDecode([==[{json_str}]==])\n"
+                    f"return data\n"
+                )
+                result.animation_data_modules.append((module_name, module_source))
 
-    # Also generate scripts for standalone clips not referenced by any controller
+    # Standalone clips (no controller references them) — treated as
+    # transform-only if they match the predicate, else still dropped
+    # through generate_tween_script (which is the only non-bridge
+    # option available for orphaned clips).
     referenced_clips: set[str] = set()
     for ctrl in controllers:
         for state in ctrl.states:
@@ -1326,13 +1617,20 @@ def convert_animations(
                     referenced_clips.add(str(clip_path.resolve()))
 
     for clip in clips:
-        if clip.source_path and str(clip.source_path.resolve()) not in referenced_clips:
-            if not clip.curves:
-                continue
-            script_name = f"Anim_{clip.name}"
-            luau_source = generate_tween_script(clip=clip)
-            if luau_source:
-                result.generated_scripts.append((script_name, luau_source))
+        if not clip.source_path:
+            continue
+        if str(clip.source_path.resolve()) in referenced_clips:
+            continue
+        if not clip.curves:
+            continue
+        script_name = f"Anim_{clip.name}"
+        luau_source = generate_tween_script(clip=clip)
+        if luau_source:
+            result.generated_scripts.append((script_name, luau_source))
+            result.routing.setdefault("__orphans__", {})[clip.name] = {
+                "target": "inline_tween",
+                "reason": "no controller references this clip",
+            }
 
     result.total_scripts_generated = len(result.generated_scripts)
 
