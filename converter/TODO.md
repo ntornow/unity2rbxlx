@@ -592,6 +592,41 @@ convert produces 944 parts / 50 scripts / 50/51 materials /
 7 material entries in `UNCONVERTED.md` for legitimate unsupported
 water shaders.
 
+### PR 3 — Codex review follow-ups (2026-04-24)
+
+Codex flagged 2 P1s + 1 P2. GATE was FAIL. Both P1s were real
+correctness bugs affecting the normal `--upload` flow (our
+`--no-upload` smoke never hit them).
+
+- **Fix #1 (Codex P1) — baker silently skipped on upload flow.**
+  `map_materials()` rewrites `color_map_path` to `rbxassetid://…`
+  after the upload step, but `_bake_vertex_colors()` was then
+  calling `Path(color_map).exists()` on the URL and failing. Added
+  `MaterialMapping.local_color_map_path` field; `map_materials`
+  captures the pre-upload local path there, and the baker reads it
+  first.
+- **Fix #2 (Codex P1) — shared materials overwrote each other.**
+  When a flagged material had multiple mesh referrers, each bake's
+  `entry.output_path` overwrote the mapping's `color_map_path` on
+  every loop iteration — last mesh wins. Baker now bakes only the
+  first (deterministic sort order) representative mesh per material
+  and records the deferred meshes in `mapping.warnings`
+  (surfaces into `UNCONVERTED.md`). Proper per-mesh baking would
+  require per-part `SurfaceAppearance` splitting, which is
+  architecturally bigger than PR 3 scope.
+- **Fix #3 (Codex P2) — deferred.** Sub-mesh identity
+  (`mesh_file_id`) is not yet preserved through to the baker;
+  FBX files with multiple embedded meshes will rasterize the whole
+  file instead of the specific submesh. This requires extending
+  `bake_vertex_colors_batch`'s signature — out of PR 3 scope.
+  Logged here for a follow-up PR.
+
+Verification: fast suite 621 passed (+2 new Codex-fix tests);
+SimpleFPS smoke unchanged (944 parts / 50/51 materials / 7 anim
+scripts / terrain OK / 0 validate errors / 7 UNCONVERTED
+entries). Both new tests stub `bake_vertex_colors_batch` so they
+run in the fast suite with no `pyassimp` dependency.
+
 ### Deferred from PR 3 → future phase/hands-on
 
 - `.shader` file source parsing (with `#include` resolution) —

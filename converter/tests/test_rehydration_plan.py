@@ -197,6 +197,152 @@ def test_final_rewrite_honors_source_path_for_nested_scripts(tmp_path):
     assert not (scripts_dir / "Door.luau").exists()
 
 
+def test_vertex_color_baker_uses_local_albedo_path(tmp_path, monkeypatch):
+    """PR 3 Codex follow-up (P1 #1): _bake_vertex_colors() must read from
+    ``local_color_map_path`` so it still works after the upload step has
+    rewritten ``color_map_path`` to an ``rbxassetid://`` URL.
+    """
+    from converter.animation_converter import AnimationConversionResult
+    from converter.material_mapper import MaterialMapping
+    from core.unity_types import ParsedScene, SceneNode, ComponentData
+
+    # Real file on disk to represent the local albedo.
+    albedo = tmp_path / "albedo.png"
+    albedo.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+    mesh = tmp_path / "mesh.fbx"
+    mesh.write_bytes(b"fbx-stub")
+
+    pipeline = _make_pipeline(tmp_path)
+    pipeline.state.animation_result = AnimationConversionResult(unconverted=[])
+
+    mat_guid = "m" * 32
+    mapping = MaterialMapping(
+        material_name="VCMat",
+        uses_vertex_colors=True,
+        color_map_path="rbxassetid://12345",  # post-upload URL — NOT a file
+        local_color_map_path=str(albedo),      # the pre-upload file
+    )
+    pipeline.state.material_mappings = {mat_guid: mapping}
+
+    # Minimal scene with a mesh referrer.
+    node = SceneNode(name="Prop", file_id="1", active=True, layer=0, tag="")
+    node.mesh_guid = "fbx-guid"
+    node.components = [ComponentData(
+        component_type="MeshRenderer",
+        file_id="2",
+        properties={"m_Materials": [{"guid": mat_guid}]},
+    )]
+    scene = ParsedScene(scene_path=tmp_path / "scene.unity")
+    scene.all_nodes = {"1": node}
+    pipeline.state.parsed_scene = scene
+
+    class _StubGuidIndex:
+        def resolve(self, guid):
+            return mesh if guid == "fbx-guid" else None
+
+    pipeline.state.guid_index = _StubGuidIndex()
+
+    # Stub the baker so we can assert it got the local file as albedo.
+    received: dict = {}
+
+    def _fake_batch(pairs, out_dir, resolution=None):
+        received["pairs"] = list(pairs)
+        from converter.vertex_color_baker import VertexColorBakeResult, BakeResult
+        r = VertexColorBakeResult()
+        for mesh_p, _ in pairs:
+            r.entries.append(BakeResult(mesh_path=mesh_p, baked=False, has_vertex_colors=False))
+        r.total = len(r.entries)
+        return r
+
+    monkeypatch.setattr(
+        "converter.vertex_color_baker.bake_vertex_colors_batch", _fake_batch
+    )
+
+    pipeline._bake_vertex_colors()
+
+    assert received.get("pairs"), "baker must be invoked"
+    assert received["pairs"][0][1] == albedo, (
+        f"albedo must be the local file, got {received['pairs'][0][1]}"
+    )
+    assert not any(
+        "albedo path missing" in w for w in mapping.warnings
+    ), f"no 'albedo missing' warning expected, got: {mapping.warnings}"
+
+
+def test_vertex_color_baker_dedupes_per_material(tmp_path, monkeypatch):
+    """PR 3 Codex follow-up (P1 #2): when a material has multiple mesh
+    referrers, we bake only the first and warn about the others rather
+    than overwrite the mapping's color_map_path on each loop iteration.
+    """
+    from converter.animation_converter import AnimationConversionResult
+    from converter.material_mapper import MaterialMapping
+    from core.unity_types import ParsedScene, SceneNode, ComponentData
+
+    albedo = tmp_path / "albedo.png"
+    albedo.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+    mesh_a = tmp_path / "mesh_A.fbx"
+    mesh_b = tmp_path / "mesh_B.fbx"
+    mesh_a.write_bytes(b"fbx-A")
+    mesh_b.write_bytes(b"fbx-B")
+
+    pipeline = _make_pipeline(tmp_path)
+    pipeline.state.animation_result = AnimationConversionResult(unconverted=[])
+
+    mat_guid = "m" * 32
+    mapping = MaterialMapping(
+        material_name="SharedVC",
+        uses_vertex_colors=True,
+        local_color_map_path=str(albedo),
+    )
+    pipeline.state.material_mappings = {mat_guid: mapping}
+
+    nodes: dict[str, SceneNode] = {}
+    for i, (node_name, mesh_guid) in enumerate([("PropA", "guid-A"), ("PropB", "guid-B")]):
+        n = SceneNode(name=node_name, file_id=str(i), active=True, layer=0, tag="")
+        n.mesh_guid = mesh_guid
+        n.components = [ComponentData(
+            component_type="MeshRenderer",
+            file_id=f"c{i}",
+            properties={"m_Materials": [{"guid": mat_guid}]},
+        )]
+        nodes[str(i)] = n
+    scene = ParsedScene(scene_path=tmp_path / "scene.unity")
+    scene.all_nodes = nodes
+    pipeline.state.parsed_scene = scene
+
+    class _StubGuidIndex:
+        def resolve(self, guid):
+            return {"guid-A": mesh_a, "guid-B": mesh_b}.get(guid)
+
+    pipeline.state.guid_index = _StubGuidIndex()
+
+    calls: list[list] = []
+
+    def _fake_batch(pairs, out_dir, resolution=None):
+        pairs_list = list(pairs)
+        calls.append(pairs_list)
+        from converter.vertex_color_baker import VertexColorBakeResult, BakeResult
+        r = VertexColorBakeResult()
+        for mesh_p, _ in pairs_list:
+            r.entries.append(BakeResult(mesh_path=mesh_p, baked=False, has_vertex_colors=False))
+        r.total = len(r.entries)
+        return r
+
+    monkeypatch.setattr(
+        "converter.vertex_color_baker.bake_vertex_colors_batch", _fake_batch
+    )
+
+    pipeline._bake_vertex_colors()
+
+    # One representative mesh, not two.
+    assert len(calls) == 1
+    assert len(calls[0]) == 1, f"expected 1 pair for shared material, got {calls[0]}"
+    # Warning must name the second mesh as deferred.
+    warning_blob = " ".join(mapping.warnings)
+    assert "mesh_B.fbx" in warning_blob or "mesh_A.fbx" in warning_blob
+    assert "per-part" in warning_blob
+
+
 def test_unconverted_md_aggregates_material_warnings(tmp_path):
     """Phase 4.2: material warnings surface as UNCONVERTED.md entries."""
     from converter.animation_converter import AnimationConversionResult

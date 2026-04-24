@@ -965,7 +965,13 @@ class Pipeline:
                     "Vertex-color baking skipped: no mesh referrers found for this material"
                 )
                 continue
-            color_map = mapping.color_map_path
+            # Prefer the local albedo path (captured pre-upload) over
+            # the current color_map_path, which is an ``rbxassetid://``
+            # URL once uploads have run.
+            color_map = (
+                getattr(mapping, "local_color_map_path", None)
+                or mapping.color_map_path
+            )
             if not color_map:
                 # No albedo — caller would need standalone baking; defer
                 # that path (rare) so 4.8 stays narrow.
@@ -979,9 +985,24 @@ class Pipeline:
                     f"Vertex-color baking skipped: albedo path missing at {albedo}"
                 )
                 continue
-            for mesh_path in sorted(meshes):
-                pairs.append((mesh_path, albedo))
-                material_pair_index.append(mapping)
+
+            # Vertex colors are mesh-specific, but Roblox SurfaceAppearance
+            # is per-material. When a material is shared by multiple
+            # meshes we bake only the first referrer (deterministic
+            # sort order) and record a warning — per-mesh baking would
+            # require splitting the mapping into per-part SurfaceAppearances,
+            # which is out of PR 3 scope.
+            sorted_meshes = sorted(meshes)
+            representative = sorted_meshes[0]
+            pairs.append((representative, albedo))
+            material_pair_index.append(mapping)
+            if len(sorted_meshes) > 1:
+                others = ", ".join(m.name for m in sorted_meshes[1:])
+                mapping.warnings.append(
+                    f"Vertex-color baking used mesh '{representative.name}'; "
+                    f"other meshes sharing this material may need per-part "
+                    f"baking (not wired): {others}"
+                )
 
         if not pairs:
             return

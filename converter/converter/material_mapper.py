@@ -155,6 +155,11 @@ class MaterialMapping:
     metalness_map_path: str | None = None
     roughness_map_path: str | None = None
     ao_map_path: str | None = None          # Ambient Occlusion source (baked into albedo in 4.2)
+    # Local filesystem path to the albedo PNG, captured BEFORE the
+    # upload step rewrites ``color_map_path`` to an ``rbxassetid://``
+    # URL. 4.8's vertex-color baker needs a real file to open, so it
+    # reads from this field rather than the post-upload URL.
+    local_color_map_path: str | None = None
     base_color: tuple[float, float, float] = (0.63, 0.63, 0.63)
     transparency: float = 0.0
     alpha_mode: str = "Overlay"
@@ -245,6 +250,12 @@ def map_materials(
             continue
 
         mapping = _parse_material(mat_path, guid, guid_index, textures_dir)
+
+        # Capture the local filesystem path BEFORE the upload rewrite —
+        # 4.8's vertex-color baker needs to open this file, not an
+        # ``rbxassetid://`` URL.
+        if mapping.color_map_path:
+            mapping.local_color_map_path = mapping.color_map_path
 
         # Resolve local texture paths to uploaded rbxassetid:// URLs.
         if ua:
