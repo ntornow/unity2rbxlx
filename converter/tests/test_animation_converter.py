@@ -28,6 +28,8 @@ from converter.animation_converter import (
     AnimTransition,
     AnimatorController,
     AnimationConversionResult,
+    BlendTree,
+    BlendTreeEntry,
     parse_anim_file,
     parse_controller_file,
     simplify_keyframes,
@@ -1234,3 +1236,391 @@ class TestAnimationDataExport:
             assert "JSONDecode" in module_source
             assert "controller" in module_source
             assert "keyframes" in module_source
+
+
+class TestPhase45Routing:
+    """Phase 4.5: humanoid vs transform-only routing, blend trees, persistence."""
+
+    def test_is_transform_only_empty_clip(self) -> None:
+        """A clip with no curves is neither humanoid nor transform-only."""
+        clip = AnimClip(name="empty", duration=1.0, loop=False, sample_rate=60.0)
+        assert clip.is_transform_only is False
+
+    def test_is_transform_only_non_humanoid_path(self) -> None:
+        """Curves on arbitrary children route as transform-only."""
+        clip = AnimClip(
+            name="door",
+            duration=1.0,
+            loop=False,
+            sample_rate=60.0,
+            curves=[
+                AnimCurve(property_type="position", path="Hinge",
+                          keyframes=[AnimKeyframe(time=0.0, value=(0, 0, 0))]),
+            ],
+        )
+        assert clip.is_transform_only is True
+
+    def test_is_transform_only_humanoid_path(self) -> None:
+        """Any humanoid bone reference flips to False."""
+        clip = AnimClip(
+            name="walk",
+            duration=1.0,
+            loop=True,
+            sample_rate=60.0,
+            curves=[
+                AnimCurve(property_type="position", path="Armature/Hips/Spine",
+                          keyframes=[AnimKeyframe(time=0.0, value=(0, 0, 0))]),
+            ],
+        )
+        assert clip.is_transform_only is False
+
+    def test_is_transform_only_mixamo_prefix(self) -> None:
+        """Mixamo-style ``Armature|LeftFoot`` must strip to ``LeftFoot``."""
+        clip = AnimClip(
+            name="run",
+            duration=1.0,
+            loop=True,
+            sample_rate=60.0,
+            curves=[
+                AnimCurve(property_type="position", path="Root|LeftFoot",
+                          keyframes=[AnimKeyframe(time=0.0, value=(0, 0, 0))]),
+            ],
+        )
+        assert clip.is_transform_only is False
+
+    def test_bone_paths_deduped_on_parse(self, tmp_path: Path) -> None:
+        """Parsed clips record each unique curve path once in bone_paths."""
+        anim = tmp_path / "Rotate.anim"
+        anim.write_text(textwrap.dedent("""\
+            %YAML 1.1
+            %TAG !u! tag:unity3d.com,2011:
+            --- !u!74 &1
+            AnimationClip:
+              m_Name: Rotate
+              m_SampleRate: 30
+              m_AnimationClipSettings:
+                m_StartTime: 0
+                m_StopTime: 2.0
+                m_LoopTime: 1
+              m_EulerCurves:
+              - curve:
+                  m_Curve:
+                  - time: 0
+                    value: {x: 0, y: 0, z: 0}
+                path: Spinner
+              m_ScaleCurves:
+              - curve:
+                  m_Curve:
+                  - time: 0
+                    value: {x: 1, y: 1, z: 1}
+                path: Spinner
+              m_PositionCurves: []
+              m_RotationCurves: []
+            """))
+        clip = parse_anim_file(anim)
+        assert clip is not None
+        assert clip.bone_paths == ["Spinner"]
+        assert clip.is_transform_only is True
+
+    def test_blend_tree_parses_1d_from_controller(self, tmp_path: Path) -> None:
+        """A 1D blend tree is attached to AnimatorController.blend_trees."""
+        ctrl = tmp_path / "Locomotion.controller"
+        ctrl.write_text(textwrap.dedent("""\
+            %YAML 1.1
+            %TAG !u! tag:unity3d.com,2011:
+            --- !u!91 &9100000
+            AnimatorController:
+              m_Name: Locomotion
+              m_AnimatorParameters:
+              - m_Name: Speed
+                m_Type: 1
+              m_AnimatorLayers:
+              - serializedVersion: 5
+                m_Name: Base Layer
+                m_StateMachine:
+                  fileID: 200
+            --- !u!1107 &200
+            AnimatorStateMachine:
+              m_ChildStates:
+              - m_State: {fileID: 300}
+              m_DefaultState: {fileID: 300}
+            --- !u!1102 &300
+            AnimatorState:
+              m_Name: Move
+              m_Motion: {fileID: 400}
+            --- !u!206 &400
+            BlendTree:
+              m_Name: MoveBlend
+              m_BlendType: 0
+              m_BlendParameter: Speed
+              m_Childs:
+              - m_Threshold: 0
+                m_Motion:
+                  guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+              - m_Threshold: 1
+                m_Motion:
+                  guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+            """))
+        c = parse_controller_file(ctrl)
+        assert c is not None
+        assert "MoveBlend" in c.blend_trees
+        bt = c.blend_trees["MoveBlend"]
+        assert bt.param == "Speed"
+        assert [e.clip_guid for e in bt.entries] == [
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ]
+        move_state = next(s for s in c.states if s.name == "Move")
+        assert move_state.blend_tree_name == "MoveBlend"
+
+    def test_blend_tree_2d_is_skipped_but_fallback_clip_kept(self, tmp_path: Path) -> None:
+        """2D blend trees are not emitted; the state still gets a fallback clip_guid."""
+        ctrl = tmp_path / "TwoD.controller"
+        ctrl.write_text(textwrap.dedent("""\
+            %YAML 1.1
+            %TAG !u! tag:unity3d.com,2011:
+            --- !u!91 &9100000
+            AnimatorController:
+              m_Name: TwoD
+              m_AnimatorLayers:
+              - m_Name: Base Layer
+                m_StateMachine: {fileID: 200}
+            --- !u!1107 &200
+            AnimatorStateMachine:
+              m_ChildStates:
+              - m_State: {fileID: 300}
+              m_DefaultState: {fileID: 300}
+            --- !u!1102 &300
+            AnimatorState:
+              m_Name: MixMove
+              m_Motion: {fileID: 400}
+            --- !u!206 &400
+            BlendTree:
+              m_Name: Cartesian
+              m_BlendType: 1
+              m_BlendParameter: X
+              m_BlendParameterY: Y
+              m_Childs:
+              - m_Threshold: 0
+                m_Motion:
+                  guid: cccccccccccccccccccccccccccccccc
+            """))
+        c = parse_controller_file(ctrl)
+        assert c is not None
+        assert c.blend_trees == {}  # 2D trees are not emitted
+        state = c.states[0]
+        assert state.blend_tree_name == ""
+        # Fallback clip_guid kept so the runtime has something to play.
+        assert state.clip_guid == "cccccccccccccccccccccccccccccccc"
+
+    def test_export_blend_trees_resolved_clip_names(self) -> None:
+        """export_controller_json emits blendTrees with clip names resolved from GUID."""
+        bt = BlendTree(
+            name="Locomotion",
+            param="Speed",
+            entries=[
+                BlendTreeEntry(threshold=0.0, clip_guid="guid-idle"),
+                BlendTreeEntry(threshold=1.0, clip_guid="guid-run"),
+            ],
+        )
+        ctrl = AnimatorController(name="Player")
+        ctrl.blend_trees["Locomotion"] = bt
+        ctrl.states.append(AnimState(
+            name="Move", file_id="300", clip_guid="",
+            blend_tree_name="Locomotion",
+        ))
+        data = export_controller_json(ctrl, clip_name_by_guid={
+            "guid-idle": "Idle", "guid-run": "Run",
+        })
+        assert data["blendTrees"] == {
+            "Locomotion": {
+                "param": "Speed",
+                "clips": [
+                    {"clip": "Idle", "threshold": 0.0},
+                    {"clip": "Run", "threshold": 1.0},
+                ],
+            },
+        }
+        move = next(s for s in data["states"] if s["name"] == "Move")
+        assert move["blendTree"] == "Locomotion"
+
+    def test_export_blend_trees_absent_when_no_entries(self) -> None:
+        """No blendTrees key emitted when the controller has none."""
+        ctrl = AnimatorController(name="Empty")
+        data = export_controller_json(ctrl)
+        assert "blendTrees" not in data
+
+    def test_routing_records_per_clip_decisions(self, tmp_path: Path) -> None:
+        """convert_animations writes humanoid vs transform-only routing per clip."""
+        # Build a minimal project: one transform-only clip + controller.
+        assets = tmp_path / "Assets"
+        assets.mkdir()
+        anim = assets / "Spin.anim"
+        anim.write_text(textwrap.dedent("""\
+            %YAML 1.1
+            %TAG !u! tag:unity3d.com,2011:
+            --- !u!74 &1
+            AnimationClip:
+              m_Name: Spin
+              m_SampleRate: 30
+              m_AnimationClipSettings:
+                m_StartTime: 0
+                m_StopTime: 1.0
+                m_LoopTime: 1
+              m_EulerCurves:
+              - curve:
+                  m_Curve:
+                  - time: 0
+                    value: {x: 0, y: 0, z: 0}
+                  - time: 1
+                    value: {x: 0, y: 360, z: 0}
+                path: Spinner
+              m_PositionCurves: []
+              m_RotationCurves: []
+              m_ScaleCurves: []
+            """))
+        anim_meta = anim.with_suffix(".anim.meta")
+        anim_meta.write_text("fileFormatVersion: 2\nguid: " + "d" * 32 + "\n")
+        ctrl = assets / "SpinCtrl.controller"
+        ctrl.write_text(textwrap.dedent(f"""\
+            %YAML 1.1
+            %TAG !u! tag:unity3d.com,2011:
+            --- !u!91 &9100000
+            AnimatorController:
+              m_Name: SpinCtrl
+              m_AnimatorLayers:
+              - m_Name: Base Layer
+                m_StateMachine: {{fileID: 200}}
+            --- !u!1107 &200
+            AnimatorStateMachine:
+              m_ChildStates:
+              - m_State: {{fileID: 300}}
+              m_DefaultState: {{fileID: 300}}
+            --- !u!1102 &300
+            AnimatorState:
+              m_Name: Spinning
+              m_Motion:
+                fileID: 7400000
+                guid: {"d" * 32}
+                type: 2
+            """))
+
+        from unity.guid_resolver import build_guid_index
+        guid_index = build_guid_index(tmp_path)
+        result = convert_animations(tmp_path, guid_index=guid_index)
+
+        assert "SpinCtrl" in result.routing
+        assert result.routing["SpinCtrl"]["Spin"]["target"] == "inline_tween"
+        # No animation_data module for a pure-transform-only controller —
+        # the runtime JSON path is reserved for humanoid clips.
+        assert not any(name.startswith("AnimationData_Spin") for name, _ in result.animation_data_modules)
+        # Transform-only clip produced an inline TweenService script.
+        assert any(name.startswith("Anim_SpinCtrl_Spin") for name, _ in result.generated_scripts)
+
+    def test_parsed_scenes_filter_unreferenced_controllers(self, tmp_path: Path) -> None:
+        """When parsed_scenes is set, controllers no scene references are skipped."""
+        from core.unity_types import ParsedScene
+        assets = tmp_path / "Assets"
+        assets.mkdir()
+        # Controller with a meta GUID, never referenced by any scene.
+        ctrl = assets / "Ghost.controller"
+        ctrl.write_text(textwrap.dedent("""\
+            %YAML 1.1
+            %TAG !u! tag:unity3d.com,2011:
+            --- !u!91 &9100000
+            AnimatorController:
+              m_Name: Ghost
+              m_AnimatorLayers:
+              - m_Name: Base Layer
+                m_StateMachine: {fileID: 200}
+            --- !u!1107 &200
+            AnimatorStateMachine:
+              m_ChildStates: []
+            """))
+        ctrl.with_suffix(".controller.meta").write_text(
+            "fileFormatVersion: 2\nguid: " + "e" * 32 + "\n"
+        )
+        # Scene that references a *different* controller guid.
+        scene_obj = ParsedScene(
+            scene_path=assets / "Level1.unity",
+            referenced_animator_controller_guids={"f" * 32},
+        )
+
+        from unity.guid_resolver import build_guid_index
+        guid_index = build_guid_index(tmp_path)
+        result = convert_animations(
+            tmp_path, guid_index=guid_index, parsed_scenes=[scene_obj],
+        )
+        assert "Ghost" in result.routing
+        assert result.routing["Ghost"]["__controller__"]["target"] == "skipped"
+        assert not result.animation_data_modules
+
+    def test_parsed_scenes_scene_prefix_applied(self, tmp_path: Path) -> None:
+        """Scene-scoped names: modules get prefixed by the scene stem."""
+        from core.unity_types import ParsedScene
+        assets = tmp_path / "Assets"
+        assets.mkdir()
+        # Humanoid clip so we emit JSON.
+        anim = assets / "Walk.anim"
+        anim.write_text(textwrap.dedent("""\
+            %YAML 1.1
+            %TAG !u! tag:unity3d.com,2011:
+            --- !u!74 &1
+            AnimationClip:
+              m_Name: Walk
+              m_SampleRate: 30
+              m_AnimationClipSettings:
+                m_StartTime: 0
+                m_StopTime: 1.0
+                m_LoopTime: 1
+              m_PositionCurves:
+              - curve:
+                  m_Curve:
+                  - time: 0
+                    value: {x: 0, y: 0, z: 0}
+                path: Hips
+              m_RotationCurves: []
+              m_EulerCurves: []
+              m_ScaleCurves: []
+            """))
+        anim.with_suffix(".anim.meta").write_text(
+            "fileFormatVersion: 2\nguid: " + "a" * 32 + "\n"
+        )
+        ctrl = assets / "Locomotion.controller"
+        ctrl.write_text(textwrap.dedent(f"""\
+            %YAML 1.1
+            %TAG !u! tag:unity3d.com,2011:
+            --- !u!91 &9100000
+            AnimatorController:
+              m_Name: Locomotion
+              m_AnimatorLayers:
+              - m_Name: Base Layer
+                m_StateMachine: {{fileID: 200}}
+            --- !u!1107 &200
+            AnimatorStateMachine:
+              m_ChildStates:
+              - m_State: {{fileID: 300}}
+              m_DefaultState: {{fileID: 300}}
+            --- !u!1102 &300
+            AnimatorState:
+              m_Name: Walk
+              m_Motion:
+                fileID: 7400000
+                guid: {"a" * 32}
+                type: 2
+            """))
+        ctrl.with_suffix(".controller.meta").write_text(
+            "fileFormatVersion: 2\nguid: " + "b" * 32 + "\n"
+        )
+        scene_obj = ParsedScene(
+            scene_path=assets / "Level1.unity",
+            referenced_animator_controller_guids={"b" * 32},
+        )
+
+        from unity.guid_resolver import build_guid_index
+        guid_index = build_guid_index(tmp_path)
+        result = convert_animations(
+            tmp_path, guid_index=guid_index, parsed_scenes=[scene_obj],
+        )
+        module_names = [name for name, _ in result.animation_data_modules]
+        assert any(n == "AnimationData_Level1_Locomotion" for n in module_names), module_names
