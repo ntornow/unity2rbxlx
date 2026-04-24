@@ -75,6 +75,13 @@ class ConversionContext:
     # GUID -> sliced sprite PNG path (from sprite_extractor).
     sprite_guid_to_file: dict[str, str] = field(default_factory=dict)
 
+    # Phase 4.9: per-script serialized field references.  Shape:
+    #   { relative_cs_path: { field_name: prefab_name_or_audio_ref } }
+    # Populated after parse, before transpile_scripts. Consumed by the
+    # transpiler (so the AI prompt knows which fields point at prefabs)
+    # and by 4.10 prefab packages (to know which prefabs to emit).
+    serialized_field_refs: dict[str, dict[str, str]] = field(default_factory=dict)
+
     def mark_phase_complete(self, phase: str) -> None:
         if phase not in self.completed_phases:
             self.completed_phases.append(phase)

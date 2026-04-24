@@ -398,6 +398,50 @@ class Pipeline:
         if not self.ctx.mesh_native_sizes:
             self._compute_fbx_bounding_boxes()
 
+        # Phase 4.9: serialized-field refs off MonoBehaviour components.
+        # Feeds the transpiler (so AI knows which fields point at prefabs)
+        # and 4.10 prefab packages. Persisted into conversion_context.json.
+        self._extract_serialized_field_refs()
+
+    def _extract_serialized_field_refs(self) -> None:
+        """Phase 4.9 — gather prefab + audio references off MonoBehaviours.
+
+        The prefab library is normally lazy-loaded in ``convert_materials``,
+        but that runs AFTER transpile_scripts — by which point this phase
+        needs to have surfaced its refs. Trigger prefab parsing here so
+        the walk sees every MonoBehaviour, not just the scene's.
+        """
+        from converter.serialized_field_extractor import (
+            extract_serialized_field_refs, serialize_for_context,
+        )
+
+        if self.state.prefab_library is None:
+            try:
+                from unity.prefab_parser import parse_prefabs
+                self.state.prefab_library = parse_prefabs(self.unity_project_path)
+            except Exception as exc:
+                log.warning(
+                    "[extract_assets] Could not parse prefabs for "
+                    "serialized-field extraction: %s", exc,
+                )
+
+        scenes = [self.state.parsed_scene] if self.state.parsed_scene else []
+        refs = extract_serialized_field_refs(
+            parsed_scenes=scenes,
+            prefab_library=self.state.prefab_library,
+            guid_index=self.state.guid_index,
+        )
+        if not refs:
+            return
+        self.ctx.serialized_field_refs = serialize_for_context(
+            refs, project_root=self.unity_project_path,
+        )
+        total = sum(len(v) for v in refs.values())
+        log.info(
+            "[extract_assets] Serialized field refs: %d scripts, %d fields",
+            len(refs), total,
+        )
+
     def _compute_fbx_bounding_boxes(self) -> None:
         """Scan all mesh assets and compute bounding boxes.
 
@@ -1064,6 +1108,7 @@ class Pipeline:
             script_infos=script_infos,
             use_ai=_config.USE_AI_TRANSPILATION,
             api_key=_config.ANTHROPIC_API_KEY,
+            serialized_field_refs=self.ctx.serialized_field_refs or None,
         )
         self.ctx.transpiled_scripts = self.state.transpilation_result.total_transpiled
         log.info(
