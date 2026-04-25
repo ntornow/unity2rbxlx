@@ -281,6 +281,17 @@ def transpile_scripts(
             result.total_rule_based += 1
             warnings.append("AI unavailable — used stub generator (run with API key for full transpilation)")
 
+        # Phase 4.4: surface C# methods missing from the Luau output
+        # as warnings. Only runs on AI-transpiled scripts — stubs and
+        # rule-based output don't round-trip C# methods meaningfully.
+        if strategy == "ai" and luau:
+            from converter.transpile_diagnostics import check_method_completeness
+            missing = check_method_completeness(
+                csharp_source, luau, source_name=info.path.name,
+            )
+            if missing:
+                warnings.extend(missing)
+
         # Flag for manual review if confidence is still low.
         flagged = confidence < TRANSPILATION_CONFIDENCE_THRESHOLD
 

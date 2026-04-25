@@ -43,6 +43,23 @@ PHASES: list[str] = [
 ]
 
 
+def _carry_unconverted(
+    animation_result: Any, entries: list[dict[str, str]],
+) -> None:
+    """Append entries onto ``animation_result.unconverted`` so the existing
+    PR 2b UNCONVERTED.md writer picks them up. Materials use
+    MaterialMapping.warnings (a different channel); this helper exists
+    because prefab-package drops don't own a dataclass of their own and
+    writing a new aggregation channel just for them is overkill.
+    """
+    if animation_result is None or not entries:
+        return
+    carrier = getattr(animation_result, "unconverted", None)
+    if carrier is None:
+        return
+    carrier.extend(entries)
+
+
 @dataclass
 class PipelineState:
     """Intermediate state passed between pipeline phases."""
@@ -1663,6 +1680,12 @@ return table.concat(allData, "\\n")'''
         # Inject runtime library modules when relevant features are detected.
         self._inject_runtime_modules()
 
+        # Phase 4.10: emit referenced prefabs into ReplicatedStorage.Templates
+        # so scripts can :Clone() them at runtime. Must run AFTER the script
+        # coherence / bootstrap steps so the spawner's source_path and
+        # injected RbxScript fields round-trip through rehydration.
+        self._generate_prefab_packages()
+
         # Encode terrain heightmap data into SmoothGrid binary for rbxlx embedding.
         # Also save a Luau script as fallback for environments without UnityPy.
         if self.state.rbx_place.terrains:
@@ -2089,6 +2112,24 @@ script.Disabled = true
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _collect_method_warnings(self) -> list[str]:
+        """Pull Phase 4.4 method-completeness warnings off transpiled scripts.
+
+        ``code_transpiler`` tags each AI-transpiled script's warnings
+        with a leading ``[<filename>]`` when method-completeness finds
+        a drop. Collect those here so the conversion report surfaces
+        them without the caller having to walk scripts themselves.
+        """
+        tr = self.state.transpilation_result
+        if tr is None:
+            return []
+        warnings: list[str] = []
+        for script in getattr(tr, "scripts", []):
+            for w in getattr(script, "warnings", []) or []:
+                if "missing from Luau output" in w:
+                    warnings.append(w)
+        return warnings
+
     def _build_conversion_report(
         self, rbxlx_path: Path, result: dict, report_path: Path
     ) -> Any:
@@ -2126,6 +2167,7 @@ script.Disabled = true
             scripts=ScriptSummary(
                 total=self.ctx.transpiled_scripts,
                 succeeded=self.ctx.transpiled_scripts,
+                method_completeness_warnings=self._collect_method_warnings(),
             ),
             materials=MaterialSummary(
                 total=self.ctx.total_materials,
@@ -2376,6 +2418,58 @@ script.Disabled = true
                 log.debug("[write_output]   Added parent guard to '%s'", s.name)
         if disabled_count:
             log.info("[write_output] Added BasePart parent guards to %d unbound scripts", disabled_count)
+
+    def _generate_prefab_packages(self) -> None:
+        """Phase 4.10 — emit referenced prefabs as Models in
+        ReplicatedStorage.Templates, plus a thin PrefabSpawner helper.
+
+        Filters by ``ctx.serialized_field_refs`` (from PR 4 / Phase
+        4.9) so only prefabs that scripts actually reference get
+        emitted — preventing the rbxlx from bloating with every
+        parsed prefab in the project.
+        """
+        from converter.prefab_packages import (
+            generate_prefab_packages, write_packages_manifest,
+        )
+
+        prefab_library = self.state.prefab_library
+        if prefab_library is None or not getattr(prefab_library, "prefabs", None):
+            return
+
+        result = generate_prefab_packages(
+            prefab_library=prefab_library,
+            serialized_field_refs=self.ctx.serialized_field_refs or None,
+            guid_index=self.state.guid_index,
+            material_mappings=self.state.material_mappings,
+            uploaded_assets=self.ctx.uploaded_assets,
+        )
+
+        if not result.templates:
+            if result.unconverted:
+                # Surface drops to UNCONVERTED.md via the shared writer —
+                # the animation_result channel is the only carrier right
+                # now, so append there. Same pattern as PR 3 materials.
+                _carry_unconverted(self.state.animation_result, result.unconverted)
+            return
+
+        self.state.rbx_place.replicated_templates.extend(result.templates)
+        if result.spawner_script is not None:
+            self.state.rbx_place.scripts.append(result.spawner_script)
+        if result.unconverted:
+            _carry_unconverted(self.state.animation_result, result.unconverted)
+
+        # Persist a small manifest under packages/ — closes the packages
+        # half of Phase 4.11's disk-rewrite deferred item.
+        try:
+            write_packages_manifest(self.output_dir, result.manifest)
+        except OSError as exc:
+            log.warning("[prefab_packages] manifest write failed: %s", exc)
+
+        log.info(
+            "[write_output] Emitted %d prefab templates into "
+            "ReplicatedStorage.Templates (%d in manifest)",
+            len(result.templates), result.manifest.get("total_templates", 0),
+        )
 
     def _inject_runtime_modules(self) -> None:
         """Inject runtime library ModuleScripts when relevant features are detected.
