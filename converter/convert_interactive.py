@@ -665,12 +665,16 @@ def validate(output_dir: str, write: bool) -> None:
     """Phase 3c: run the Luau validator over transpiled scripts on disk."""
     out = Path(output_dir).resolve()
 
+    # Phase 4.4 extension: recurse into subdirs so the luau-analyze
+    # gate covers newly-added paths — scripts/animations/ from PR 2,
+    # scripts/animation_data/ from PR 2, scripts/packages/ from PR 5,
+    # scripts/scriptable_objects/ from Phase 3.
     candidates: list[Path] = []
     for sub in ("scripts", "luau", "Luau"):
         d = out / sub
         if d.is_dir():
-            candidates.extend(d.glob("*.lua"))
-            candidates.extend(d.glob("*.luau"))
+            candidates.extend(d.rglob("*.lua"))
+            candidates.extend(d.rglob("*.luau"))
     if not candidates:
         _emit({
             "phase": "validate",

@@ -965,3 +965,160 @@ Deferred follow-ups:
   `--no-upload` means no real asset IDs.
 - Per-prefab variant-chain preservation in templates — currently
   emits the flattened resolved form.
+
+### PR 6 — 4.4 transpile diagnostics (FINAL Phase 4 PR)
+
+Audit shrank scope to ~80 lines code by reusing existing
+infrastructure: dest already runs ``luau-analyze`` syntax gating
+in ``code_transpiler``'s reprompt loop; PR 4 already added the
+UNCONVERTED-stub prompt rule. Only real gaps were
+(a) the method-completeness diagnostic itself, (b) the validate
+CLI's non-recursive glob.
+
+- **`converter/converter/transpile_diagnostics.py`** (~130 lines).
+  Exports `check_method_completeness(csharp, luau, source_name)`
+  returning a list of warnings for C# methods missing from the
+  Luau output. Pure function. Strips C# comments + string literals
+  before regex-extracting method names so ``// public void Foo()``
+  or ``"public void Bar()"`` in a log string don't register as
+  real declarations. Honors ``-- UNCONVERTED`` and ``-- TODO``
+  comments as intentional drops. Lifecycle hooks (Awake, Start,
+  Update, …) are exempt because the transpiler idiomatically
+  lowers them into top-level code or `RunService` connections.
+- **`code_transpiler.py` Phase-3 hook**. After AI transpile
+  produces the Luau and warnings, call the diagnostic. Append
+  any missing-method warnings onto the script's `warnings` list.
+  Gated on `strategy == "ai"` — rule-based stubs don't round-trip
+  C# methods meaningfully.
+- **`convert_interactive.py` validate** now uses `rglob` instead
+  of flat `glob`. Covers `scripts/animations/`,
+  `scripts/animation_data/`, `scripts/packages/`,
+  `scripts/scriptable_objects/` — every Luau-emitting subdir
+  added between PR 1 and PR 5.
+- **`report_generator.py`** gains
+  `ScriptSummary.method_completeness_warnings: list[str]`.
+  Pipeline's `_build_conversion_report` populates it via a new
+  `_collect_method_warnings()` helper that walks
+  `transpilation_result.scripts` looking for the
+  "missing from Luau output" pattern.
+
+Explicitly NOT done (plan mandate "DO NOT"):
+- `luau_validator.py` resurrection
+- `ValidationIssue`/`ValidationResult` dataclasses
+- E001-E030 structured error codes
+
+Tests (+14 in `tests/test_transpile_diagnostics.py`):
+- Strip-comments helper handles line, block, string forms
+- Lifecycle exemption (Awake/Start/Update/etc. silent)
+- Missing methods reported with source name embedded
+- Function-form recognition: `Class:Method`, `Class.Method`,
+  `local function`, plain `function`
+- `-- UNCONVERTED` and `-- TODO` comments count as intentional
+  drops
+- Comments and string literals in C# don't register as methods
+- Multiple missing methods sorted alphabetically (deterministic)
+- Empty inputs short-circuit safely
+- Source-name embedded in every warning
+
+Verification:
+- Fast suite 693 passed (+14 new), 2 skipped, 25 deselected.
+- SimpleFPS smoke (`--no-upload --no-ai --no-resolve`):
+  944 parts / 36 scripts / 50/51 materials / 7 anim scripts /
+  7 prefab templates / 0 method_completeness_warnings (no AI ran
+  in this smoke; rule-based path doesn't trigger the diagnostic).
+- `convert_interactive.py validate /tmp/phase4_pr6_smoke`:
+  44 files scanned (top-level scripts + animations/ subdir
+  + packages/PrefabSpawner.luau), 0 syntax errors.
+
+This closes Phase 4. All six plan PRs landed. ~3000 net lines
+across the merge sequence.
+
+Deferred to follow-up PRs (post-Phase-4):
+- Cross-script shared-state linter (see prompt-iteration-failed
+  section above) — finds `:GetAttribute("X")` calls with no
+  matching `:SetAttribute("X")` in the corpus when a dependency
+  exports a getter, then either rewrites or warns.
+- Standalone `.rbxm` file output per prefab (Toolbox convenience).
+- Full SurfaceAppearance round-trip through templates.
+- Prefab-scoped animator controller GUID aggregation (PR 2a
+  follow-up).
+- Sub-mesh identity (`mesh_file_id`) in vertex-color baking.
+
+### PR 6 — Codex review follow-ups (2026-04-25)
+
+Codex flagged 2 P1 + 1 P2 in PR 6's diagnostic. GATE was FAIL.
+All real and addressed before the PR landed.
+
+- **Fix #1 (Codex P1) — default-private + generic methods missed.**
+  The C# regex required an explicit access modifier; `void Helper()`,
+  `IEnumerator Run()`, `public TOut Map<TIn>(...)` slipped through.
+  Loosened the regex to make modifiers optional, anchored on
+  statement boundaries (`^|;|{|}`), and added a keyword filter
+  (`if`/`for`/`while`/`return`/`void`/`var`/etc.) so control-flow
+  statements don't get captured as methods. Generic method-name
+  parameters (`Map<TIn, TOut>(...)`) now recognized via the trailing
+  `<...>` pattern after the captured name.
+- **Fix #2 (Codex P1) — assignment-style Luau exports false-positived.**
+  The Luau regex only saw `function Foo:Bar()` / `function Foo.Bar()`.
+  Repo emits `_G.Player.hasKey = function() ... end` (assignment form,
+  used by Player.luau under PR 4's dep-aware context). The diagnostic
+  was claiming `hasKey` missing even when correctly emitted. Added a
+  second regex capturing `(?:[\w.]+\.)?(\w+)\s*=\s*function\s*\(`,
+  unioned with the existing `function`-keyword forms.
+- **Fix #3 (Codex P2) — collision/trigger/mouse hooks not exempt.**
+  Unity callbacks `OnCollisionEnter`/`OnCollisionStay`/`OnCollisionExit`,
+  `OnTriggerEnter`/`OnTriggerStay`/`OnTriggerExit` (1D + 2D variants),
+  `OnMouseDown`/`OnMouseUp`/`OnMouseEnter`/`OnMouseExit`/`OnMouseOver`/
+  `OnMouseDrag`/`OnMouseUpAsButton`, plus particle/animator events
+  (`OnParticleCollision`, `OnAnimatorIK`, etc.) get rewritten to
+  `part.Touched:Connect(...)` / `MouseClick:Connect(...)` —
+  no named function survives. All added to `_LIFECYCLE_EXEMPT`.
+
+Tests (+12 new):
+- `TestCodexFix1NoModifierMethods`: default-private void/IEnumerator
+  capture, generic method capture, void/var keyword filtering,
+  control-flow keyword filtering.
+- `TestCodexFix2AssignmentLuauForms`: dotted, _G-prefixed, bare,
+  and function-keyword forms all recognized as definitions.
+- `TestCodexFix3CollisionHooksExempt`: 1D/2D collision + trigger
+  + mouse + on-application hooks all silent.
+
+Verification: fast suite 705 passed (+12); SimpleFPS smoke
+unchanged (944 parts / 36 scripts / 50/51 materials / 0
+method_completeness_warnings as expected for `--no-ai`).
+
+### PR 6 — post-Codex, post-AI-smoke follow-ups (2026-04-25)
+
+Validated PR 6's diagnostic by running a partial convert on
+output/SimpleFPS_full (AI transpile cache hit, 10s). Initial
+pass surfaced **37 method_completeness_warnings** across 14
+scripts — but inspection showed all 37 were false positives or
+case-mismatch noise. Two additional fixes:
+
+- **Call-site filter.** The loosened regex from Codex fix #1
+  matched `return GetComponent<X>()` inside property getters as
+  declarations (`return`=return-type, `GetComponent`=name). Added
+  `_CALL_SITE_PRECEDING_KEYWORDS` regex that scans the text
+  between the matched statement boundary and the captured name
+  for `return`/`throw`/`yield`/`await`/`new` — if any appears,
+  drop the match (it's an expression, not a declaration).
+  Dropped 8 false positives including all 6 `GetComponent` hits
+  + 1 `GameObject` + 1 other.
+- **Case-insensitive Luau match.** AI transpiler routinely applies
+  Luau camelCase conventions to PascalCase C# methods — `Shoot`
+  becomes `shoot`, `TakeDamage` becomes `takeDamage`. Matching
+  case-insensitively (both on function-definition recognition
+  AND `-- UNCONVERTED` comment names) cuts the remaining 28
+  naming-convention false positives.
+
+Final verification: 33 tests pass in
+`tests/test_transpile_diagnostics.py` (+7 new: call-site filter
+covers return/new/throw cases, real methods past `return` still
+captured, case-insensitive match covers camelCase + reversal +
+UNCONVERTED comments). SimpleFPS full AI-convert report surfaces
+**exactly 1 method_completeness_warning** — `HudControl.cs:
+PauseMenu`, a real signal where the AI renamed the method to
+`pauseMenuHandler` to avoid clashing with a local variable of
+the same name. Human-actionable, not noise.
+
+Signal-to-noise went from 0/37 → 1/1.

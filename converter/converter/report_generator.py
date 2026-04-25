@@ -27,6 +27,9 @@ class ScriptSummary:
     skipped: int = 0
     ai_transpiled: int = 0
     flagged_scripts: list[str] = field(default_factory=list)   # filenames
+    # Phase 4.4: C# methods that disappeared silently from the Luau
+    # output — neither present as a function nor marked UNCONVERTED.
+    method_completeness_warnings: list[str] = field(default_factory=list)
 
 
 @dataclass

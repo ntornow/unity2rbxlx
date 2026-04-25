@@ -2112,6 +2112,24 @@ script.Disabled = true
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _collect_method_warnings(self) -> list[str]:
+        """Pull Phase 4.4 method-completeness warnings off transpiled scripts.
+
+        ``code_transpiler`` tags each AI-transpiled script's warnings
+        with a leading ``[<filename>]`` when method-completeness finds
+        a drop. Collect those here so the conversion report surfaces
+        them without the caller having to walk scripts themselves.
+        """
+        tr = self.state.transpilation_result
+        if tr is None:
+            return []
+        warnings: list[str] = []
+        for script in getattr(tr, "scripts", []):
+            for w in getattr(script, "warnings", []) or []:
+                if "missing from Luau output" in w:
+                    warnings.append(w)
+        return warnings
+
     def _build_conversion_report(
         self, rbxlx_path: Path, result: dict, report_path: Path
     ) -> Any:
@@ -2149,6 +2167,7 @@ script.Disabled = true
             scripts=ScriptSummary(
                 total=self.ctx.transpiled_scripts,
                 succeeded=self.ctx.transpiled_scripts,
+                method_completeness_warnings=self._collect_method_warnings(),
             ),
             materials=MaterialSummary(
                 total=self.ctx.total_materials,
