@@ -1072,11 +1072,16 @@ def convert_scene(
     if flattened:
         log.info("Flattened %d single-child Models", flattened)
 
-    # Downgrade MeshParts with no mesh_id to small invisible Parts.
-    # This handles meshes embedded in prefabs (no FBX file to upload).
+    # MeshParts whose source mesh GUID didn't resolve (missing FBX / unfetched
+    # LFS / embedded mesh) get downgraded to magenta-coloured Parts so the
+    # missing-asset failure surfaces visually instead of hiding the model.
     fixed_empty = _fix_empty_mesh_parts(place.workspace_parts)
     if fixed_empty:
-        log.info("Downgraded %d empty MeshParts to Parts", fixed_empty)
+        log.warning(
+            "[scene_converter] %d MeshParts had unresolved meshes — kept visible as "
+            "magenta placeholders. Source FBX files may be missing or LFS-blocked.",
+            fixed_empty,
+        )
 
     log.info(
         "Scene converted: %d top-level parts, %d screen_guis, %d terrains, %d water regions, lighting configured, camera %s",
@@ -4137,34 +4142,30 @@ def _collect_post_processing(parsed_scene: ParsedScene, place: RbxPlace) -> None
 
 
 def _fix_empty_mesh_parts(parts: list[RbxPart]) -> int:
-    """Downgrade MeshParts that have no mesh_id to small invisible Parts.
+    """Surface MeshParts whose source mesh couldn't be resolved.
 
-    When a mesh GUID resolves to a non-FBX file (e.g. embedded prefab mesh),
-    the MeshPart gets no mesh_id and renders as a large default block.
-    Convert these to small transparent Parts so they don't clutter the scene.
+    When a mesh GUID resolves to a non-FBX file (embedded prefab mesh, an LFS
+    pointer that wasn't fetched, or the source FBX is missing from the project),
+    the MeshPart gets no mesh_id. Previously these were silently hidden
+    (Transparency=1.0, size shrunk to 1x1x1) which masquerades source-asset
+    failures as the part not existing — entire models vanish if every mesh is
+    missing (e.g. a project where the rifle FBX was stripped and every prefab
+    part lost its visual). Now we downgrade to Part but keep the original size,
+    leave the part collidable, and color it magenta so the missing-asset failure
+    is visually obvious.
 
-    Also hides plain Parts that are children of Models and have no visual
-    content (bone anchors like LeftHand/RightHand, empty placeholders).
-    These are typically empty GameObjects in Unity that serve as transform
-    anchors but shouldn't render as visible boxes in Roblox.
+    The previous heuristic that also hid plain gray Parts (assuming bone anchors
+    like LeftHand/RightHand) was too aggressive — for any prefab where every
+    visual part lost its mesh, the heuristic hid the entire model. True empty
+    Unity GameObjects are already hidden upstream in `_assemble_part` via the
+    `not has_visual` branch, so removing this heuristic doesn't regress that case.
     """
+    MISSING_MESH_COLOR = (1.0, 0.0, 1.0)  # magenta — classic missing-texture marker
     count = 0
     for part in parts:
         if part.class_name == "MeshPart" and not part.mesh_id:
             part.class_name = "Part"
-            part.transparency = 1.0
-            part.can_collide = False
-            part.size = (1.0, 1.0, 1.0)
-            count += 1
-        elif (part.class_name == "Part"
-              and not part.mesh_id
-              and not part.surface_appearance
-              and getattr(part, 'transparency', 0) < 1.0
-              and part.color == (0.63, 0.63, 0.63)):
-            # Plain gray Part with no mesh or texture — likely a bone anchor
-            # or empty placeholder that shouldn't render visually.
-            part.transparency = 1.0
-            part.can_collide = False
+            part.color = MISSING_MESH_COLOR
             count += 1
         if hasattr(part, 'children') and part.children:
             count += _fix_empty_mesh_parts(part.children)

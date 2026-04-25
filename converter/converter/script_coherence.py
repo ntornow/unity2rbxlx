@@ -779,6 +779,10 @@ def _fix_prefab_lookups(scripts: list[RbxScript]) -> int:
     fixes = 0
     # Collect all script names to avoid redirecting module requires
     module_names = {s.name for s in scripts if s.script_type == "ModuleScript"}
+    # Names that legitimately live in ReplicatedStorage and must NOT be redirected.
+    # "Templates" is the prefab_packages convention — ReplicatedStorage.Templates holds
+    # all emitted prefab templates that scripts :Clone() at runtime.
+    rs_resident_names = {"Templates"}
 
     for s in scripts:
         original = s.source
@@ -790,8 +794,8 @@ def _fix_prefab_lookups(scripts: list[RbxScript]) -> int:
             indent = m.group(1)
             varname = m.group(2)
             obj_name = m.group(3)
-            # Don't redirect if this is a known module
-            if obj_name in module_names:
+            # Don't redirect if this is a known module or RS-resident container
+            if obj_name in module_names or obj_name in rs_resident_names:
                 return m.group(0)
             # Redirect to workspace search (case-insensitive, recursive)
             return (f'{indent}local {varname} = workspace:FindFirstChild("{obj_name}", true)'

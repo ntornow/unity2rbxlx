@@ -285,11 +285,28 @@ def generate_place_luau(
     b.line()
 
     # --- Water regions ---
+    # Roblox Terrain:FillBlock has a 2048-stud-per-axis cap; oversized regions
+    # silently no-op. Split each water region into a grid of <=MAX_FILL chunks.
+    import math as _math
+    MAX_FILL = 2048.0
     for wr in place.water_regions:
-        b.line(
-            f"terrain:FillBlock(CFrame.new({_f(wr.position[0])},{_f(wr.position[1])},"
-            f"{_f(wr.position[2])}),{_v3(*wr.size)},Enum.Material.Water)"
-        )
+        sx = min(abs(wr.size[0]), MAX_FILL * 20)
+        sy = min(abs(wr.size[1]), MAX_FILL)
+        sz = min(abs(wr.size[2]), MAX_FILL * 20)
+        nx = max(1, _math.ceil(sx / MAX_FILL))
+        nz = max(1, _math.ceil(sz / MAX_FILL))
+        chunk_sx = sx / nx
+        chunk_sz = sz / nz
+        start_x = wr.position[0] - sx / 2 + chunk_sx / 2
+        start_z = wr.position[2] - sz / 2 + chunk_sz / 2
+        for ix in range(nx):
+            for iz in range(nz):
+                cx = start_x + ix * chunk_sx
+                cz = start_z + iz * chunk_sz
+                b.line(
+                    f"terrain:FillBlock(CFrame.new({_f(cx)},{_f(wr.position[1])},{_f(cz)}),"
+                    f"{_v3(chunk_sx, sy, chunk_sz)},Enum.Material.Water)"
+                )
     b.line()
 
     # Save
