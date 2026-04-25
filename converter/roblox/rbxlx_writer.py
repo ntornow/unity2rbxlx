@@ -17,6 +17,7 @@ from uuid import uuid4
 from typing import Any
 
 from core.roblox_types import (
+    RbxAttrValue,
     RbxBeam,
     RbxCFrame,
     RbxCameraConfig,
@@ -817,7 +818,7 @@ def _make_script(parent_xml: ET.Element, script: RbxScript) -> None:
     _add_protected_string(props, "Source", source)
 
 
-def _encode_attributes(attrs: dict[str, Any]) -> str:
+def _encode_attributes(attrs: dict[str, RbxAttrValue]) -> str:
     """Encode a dict of attributes into Roblox binary attribute format (base64).
 
     Format: u32 entry_count, then for each entry:
@@ -1012,7 +1013,7 @@ def _make_part(parent_xml: ET.Element, part: RbxPart) -> None:
         _add_bool(props, "Neutral", True)  # All teams can spawn
 
     # --- Collect ALL attributes (part attrs + mesh/texture data) ---
-    all_attrs: dict[str, Any] = dict(getattr(part, "attributes", None) or {})
+    all_attrs: dict[str, RbxAttrValue] = dict(getattr(part, "attributes", None) or {})
 
     # Also store MeshId as attribute for MeshLoader fallback
     if part_class == "MeshPart" and hasattr(part, "mesh_id") and part.mesh_id:

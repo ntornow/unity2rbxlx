@@ -1,0 +1,13 @@
+# no-any-allowlist.txt
+#
+# Files where `Any` annotations are permitted because the file translates
+# untyped external data into the typed IR. Inside the typed core, `Any`
+# is a bug — see the principle in check_no_any.sh.
+#
+# Format: <relative path from repo root> | <reason>
+# Each entry should rarely move. Adding to this list requires reviewer
+# sign-off in the PR.
+
+converter/unity/yaml_parser.py | YAML deserialization boundary; output is dict-of-Any narrowed by callers
+converter/unity/prefab_parser.py | Unity YAML dict-of-Any -> PrefabLibrary narrowing point
+converter/unity/binary_scene_parser.py | UnityPy library has no type stubs; Any unavoidable at the seam
