@@ -1558,12 +1558,18 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, Any]:
         _make_post_processing(lighting, pp_config)
 
     # ---- Water fill script ------------------------------------------------
+    # Emitted as a LocalScript in StarterPlayerScripts (not a server Script).
+    # When run on the server, Terrain:FillBlock-induced voxel changes don't
+    # reliably replicate to clients beyond a small radius around connected
+    # players — distant chunks (the 16km water plane around an island) often
+    # arrive empty. Running on each client's machine means the local terrain
+    # view always has water voxels filled, regardless of replication range.
     if water_regions:
         water_script = _generate_water_fill_script(water_regions)
-        _make_script(server_script_service, RbxScript(
+        _make_script(starter_player_scripts_item, RbxScript(
             name="WaterFill",
             source=water_script,
-            script_type="Script",
+            script_type="LocalScript",
         ))
         stats["scripts_written"] += 1
 
