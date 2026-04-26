@@ -1283,16 +1283,31 @@ class Pipeline:
                         "execute the generated scripts via Studio Command Bar.")
             return
 
-        # ID cache write deferred until after a successful resolve (below).
-        # Writing premature IDs here would poison the shared cache for any
-        # later u2r publish / interactive upload command if assemble was
-        # invoked with a typo'd or unauthorized experience ID.
+        # ID cache write deferred until we either finish a resolve OR
+        # confirm there's nothing to resolve. Writing premature IDs at
+        # phase entry would poison the shared cache for later u2r publish
+        # / interactive upload commands if assemble was invoked with a
+        # typo'd or unauthorized experience ID.
 
-        # Find uploaded mesh assets (Model IDs from cloud upload)
-        mesh_assets = {k: v for k, v in self.ctx.uploaded_assets.items()
-                       if any(k.lower().endswith(ext) for ext in ('.fbx', '.obj'))}
+        # Find uploaded mesh assets (Model IDs from cloud upload). Skip
+        # ones already resolved so a force-rerun doesn't redo them — and
+        # so transient batch failures can't shrink a prior resolution.
+        already_resolved = self.ctx.mesh_native_sizes or {}
+        mesh_assets = {
+            k: v for k, v in self.ctx.uploaded_assets.items()
+            if any(k.lower().endswith(ext) for ext in ('.fbx', '.obj'))
+            and k not in already_resolved
+        }
         if not mesh_assets:
-            log.info("[resolve_assets] No mesh assets to resolve")
+            log.info(
+                "[resolve_assets] No new mesh assets to resolve "
+                "(%d already resolved)", len(already_resolved),
+            )
+            # Cache the IDs anyway: the user reached this point with valid
+            # uid/pid, and not refreshing the cache means a later publish
+            # would silently target the previous experience.
+            from roblox.id_cache import write_ids
+            write_ids(self.output_dir, universe_id, place_id)
             return
 
         log.info("[resolve_assets] Resolving %d mesh assets via Luau Execution API...", len(mesh_assets))
@@ -1375,10 +1390,20 @@ return table.concat(allData, "\\n")'''
                     entry["textureId"] = texture_id
                 mesh_hierarchies[path].append(entry)
 
-            self.ctx.mesh_native_sizes = mesh_native_sizes
-            self.ctx.mesh_hierarchies = mesh_hierarchies
-            log.info("[resolve_assets] Resolved %d meshes (%d sub-meshes total)",
-                     len(mesh_native_sizes), sum(len(v) for v in mesh_hierarchies.values()))
+            # Merge into existing tables instead of replacing. A transient
+            # batch failure during a force-rerun would otherwise shrink a
+            # prior mostly-complete resolution by overwriting it with this
+            # run's smaller result set.
+            merged_sizes = {**already_resolved, **mesh_native_sizes}
+            existing_hierarchies = self.ctx.mesh_hierarchies or {}
+            merged_hierarchies = {**existing_hierarchies, **mesh_hierarchies}
+            self.ctx.mesh_native_sizes = merged_sizes
+            self.ctx.mesh_hierarchies = merged_hierarchies
+            log.info(
+                "[resolve_assets] Resolved %d new meshes (total %d, %d sub-meshes)",
+                len(mesh_native_sizes), len(merged_sizes),
+                sum(len(v) for v in merged_hierarchies.values()),
+            )
             # Persist IDs only AFTER a successful resolve so we know the
             # uid/pid pair actually authenticated against Open Cloud.
             from roblox.id_cache import write_ids
