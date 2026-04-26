@@ -309,6 +309,12 @@ def fix_require_classifications(scripts: list[RbxScript]) -> int:
     # Player is now a LocalScript, not in ReplicatedStorage.
     fixes += _remove_stale_player_requires(scripts)
 
+    # Pass 18: Disable Roblox default PlayerModule controls in FPS-style
+    # client scripts that set MouseBehavior=LockCenter. Without this,
+    # the default PlayerModule (auto-loaded into StarterPlayerScripts)
+    # resets MouseBehavior every frame, preventing mouse-look from working.
+    fixes += _disable_default_controls_in_fps_scripts(scripts)
+
     return fixes
 
 
@@ -1124,6 +1130,55 @@ def _add_pickup_remote_listener(scripts: list[RbxScript]) -> int:
             s.source = s.source.rstrip() + '\n' + listener
         fixes += 1
         log.info("  Added PickupItemEvent OnClientEvent listener in '%s'", s.name)
+    return fixes
+
+
+def _disable_default_controls_in_fps_scripts(scripts: list[RbxScript]) -> int:
+    """Disable Roblox's default PlayerModule controls in FPS-style scripts.
+
+    Detects client scripts that set ``MouseBehavior = Enum.MouseBehavior.LockCenter``
+    (the unmistakable signature of an FPS controller) and prepends a one-time
+    setup block that disables the default PlayerModule controls. Without this,
+    the auto-loaded ``StarterPlayerScripts/PlayerModule`` resets MouseBehavior
+    back to ``Default`` every frame, so the FPS controller's lock never sticks
+    and mouse-look does not work.
+
+    The prepended block is idempotent (guarded by an attribute check) so the
+    same script can be cloned to multiple players without re-running.
+    """
+    fixes = 0
+    marker = "-- u2r: PlayerModule controls disabled"
+    setup = (
+        "-- u2r: PlayerModule controls disabled (FPS controller manages camera/mouse)\n"
+        "do\n"
+        "    local _lp = game:GetService(\"Players\").LocalPlayer\n"
+        "    if _lp then\n"
+        "        local _ps = _lp:WaitForChild(\"PlayerScripts\", 5)\n"
+        "        local _pm = _ps and _ps:FindFirstChild(\"PlayerModule\")\n"
+        "        if _pm then\n"
+        "            local ok, mod = pcall(require, _pm)\n"
+        "            if ok and mod then\n"
+        "                local ok2, controls = pcall(function() return mod:GetControls() end)\n"
+        "                if ok2 and controls and controls.Disable then\n"
+        "                    pcall(function() controls:Disable() end)\n"
+        "                end\n"
+        "            end\n"
+        "        end\n"
+        "    end\n"
+        "end\n\n"
+    )
+    for s in scripts:
+        if s.script_type != "LocalScript":
+            continue
+        if marker in s.source:
+            continue
+        if not re.search(
+            r"MouseBehavior\s*=\s*Enum\.MouseBehavior\.LockCenter", s.source
+        ):
+            continue
+        s.source = setup + s.source
+        fixes += 1
+        log.info("  Disabled default PlayerModule controls in '%s'", s.name)
     return fixes
 
 
