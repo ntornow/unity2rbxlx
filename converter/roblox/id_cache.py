@@ -49,11 +49,23 @@ def read_ids(output_dir: Path) -> tuple[int | None, int | None]:
         except (json.JSONDecodeError, OSError) as exc:
             log.warning("id_cache: could not read %s: %s", path.name, exc)
             continue
+        # Treat any unexpected shape (list, scalar, dict with wrong keys
+        # or non-numeric values) the same as missing — the inline readers
+        # this helper replaced silently fell through to the next source.
+        if not isinstance(data, dict):
+            log.warning("id_cache: %s has unexpected shape (%s)", path.name, type(data).__name__)
+            continue
         uid = data.get("universe_id")
         pid = data.get("place_id")
-        if uid and pid:
+        try:
+            uid_int = int(uid) if uid else 0
+            pid_int = int(pid) if pid else 0
+        except (TypeError, ValueError):
+            log.warning("id_cache: %s has non-numeric uid/pid", path.name)
+            continue
+        if uid_int and pid_int:
             canonical_pref = 1 if name == CANONICAL else 0
-            candidates.append((mtime, canonical_pref, int(uid), int(pid)))
+            candidates.append((mtime, canonical_pref, uid_int, pid_int))
 
     if not candidates:
         return None, None

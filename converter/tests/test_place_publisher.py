@@ -218,6 +218,25 @@ class TestIdCacheMtimePriority:
         uid, pid = read_ids(tmp_path)
         assert (uid, pid) == (999, 888), "must prefer freshest mtime"
 
+    def test_non_dict_cache_returns_none_not_crash(self, tmp_path):
+        """JSON list / scalar in the cache file used to crash callers via
+        AttributeError on .get(). Codex round 16 caught this. The helper
+        must treat any non-dict shape as missing.
+        """
+        (tmp_path / CANONICAL).write_text(json.dumps([1, 2, 3]))
+        uid, pid = read_ids(tmp_path)
+        assert (uid, pid) == (None, None)
+
+    def test_non_numeric_cache_returns_none_not_crash(self, tmp_path):
+        """Non-numeric uid/pid (e.g. {"universe_id": "abc"}) used to
+        crash int() conversion. Treat as malformed → missing.
+        """
+        (tmp_path / CANONICAL).write_text(
+            json.dumps({"universe_id": "abc", "place_id": "xyz"})
+        )
+        uid, pid = read_ids(tmp_path)
+        assert (uid, pid) == (None, None)
+
     def test_canonical_newer_than_legacy_wins(self, tmp_path):
         import os
         (tmp_path / LEGACY).write_text(

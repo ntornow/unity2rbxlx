@@ -1226,11 +1226,17 @@ class Pipeline:
             if any(k.lower().endswith(ext) for ext in ('.fbx', '.obj'))
         ) if self.ctx.uploaded_assets else 0
         resolved_count = len(self.ctx.mesh_native_sizes) if self.ctx.mesh_native_sizes else 0
-
-        if resolved_count > 0 and resolved_count >= uploaded_mesh_count:
-            log.info("[resolve_assets] Mesh resolution data already present (%d/%d meshes) — skipping",
-                     resolved_count, uploaded_mesh_count)
-            return
+        all_meshes_resolved = (
+            resolved_count > 0 and resolved_count >= uploaded_mesh_count
+        )
+        if all_meshes_resolved:
+            log.info(
+                "[resolve_assets] Mesh resolution data already present "
+                "(%d/%d meshes) — skipping mesh resolve, but still "
+                "validating uid/pid below so a retarget refreshes the "
+                "shared ID cache.",
+                resolved_count, uploaded_mesh_count,
+            )
 
         if self.skip_upload:
             log.info("[resolve_assets] Skipping (--no-upload)")
@@ -1292,8 +1298,11 @@ class Pipeline:
         # Find uploaded mesh assets (Model IDs from cloud upload). Skip
         # ones already resolved so a force-rerun doesn't redo them — and
         # so transient batch failures can't shrink a prior resolution.
+        # When ALL meshes are already resolved, fall through to the
+        # no-mesh validation+cache-refresh path below so a retarget still
+        # updates .roblox_ids.json.
         already_resolved = self.ctx.mesh_native_sizes or {}
-        mesh_assets = {
+        mesh_assets = {} if all_meshes_resolved else {
             k: v for k, v in self.ctx.uploaded_assets.items()
             if any(k.lower().endswith(ext) for ext in ('.fbx', '.obj'))
             and k not in already_resolved
