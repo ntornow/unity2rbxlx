@@ -1153,22 +1153,33 @@ def _disable_default_controls_in_fps_scripts(scripts: list[RbxScript]) -> int:
     # before PlayerModule is present — so use WaitForChild (not FindFirstChild)
     # to actually block until it's available, otherwise the disable silently
     # no-ops and Roblox's default controls keep overriding MouseBehavior.
+    # Disable on script-init AND on every CharacterAdded — Roblox re-enables
+    # the default PlayerModule controls during character (re)spawn, so a
+    # one-shot disable at script init isn't enough; without the CharacterAdded
+    # hook the disable wins for the first frame and is then silently undone
+    # when the character actually loads.
     setup = (
         "-- u2r: PlayerModule controls disabled (FPS controller manages camera/mouse)\n"
         "do\n"
         "    local _lp = game:GetService(\"Players\").LocalPlayer\n"
-        "    if _lp then\n"
+        "    local function _disablePlayerModule()\n"
+        "        if not _lp then return end\n"
         "        local _ps = _lp:WaitForChild(\"PlayerScripts\", 10)\n"
         "        local _pm = _ps and _ps:WaitForChild(\"PlayerModule\", 10)\n"
-        "        if _pm then\n"
-        "            local ok, mod = pcall(require, _pm)\n"
-        "            if ok and mod then\n"
-        "                local ok2, controls = pcall(function() return mod:GetControls() end)\n"
-        "                if ok2 and controls and controls.Disable then\n"
-        "                    pcall(function() controls:Disable() end)\n"
-        "                end\n"
-        "            end\n"
+        "        if not _pm then return end\n"
+        "        local ok, mod = pcall(require, _pm)\n"
+        "        if not ok or not mod then return end\n"
+        "        local ok2, controls = pcall(function() return mod:GetControls() end)\n"
+        "        if ok2 and controls and controls.Disable then\n"
+        "            pcall(function() controls:Disable() end)\n"
         "        end\n"
+        "    end\n"
+        "    _disablePlayerModule()\n"
+        "    if _lp then\n"
+        "        _lp.CharacterAdded:Connect(function()\n"
+        "            task.wait()  -- let Roblox finish its respawn handling first\n"
+        "            _disablePlayerModule()\n"
+        "        end)\n"
         "    end\n"
         "end\n\n"
     )
