@@ -1148,13 +1148,18 @@ def _disable_default_controls_in_fps_scripts(scripts: list[RbxScript]) -> int:
     """
     fixes = 0
     marker = "-- u2r: PlayerModule controls disabled"
+    # PlayerModule is loaded into PlayerScripts asynchronously by the default
+    # PlayerScriptsLoader. Player.luau runs early in character init, often
+    # before PlayerModule is present — so use WaitForChild (not FindFirstChild)
+    # to actually block until it's available, otherwise the disable silently
+    # no-ops and Roblox's default controls keep overriding MouseBehavior.
     setup = (
         "-- u2r: PlayerModule controls disabled (FPS controller manages camera/mouse)\n"
         "do\n"
         "    local _lp = game:GetService(\"Players\").LocalPlayer\n"
         "    if _lp then\n"
-        "        local _ps = _lp:WaitForChild(\"PlayerScripts\", 5)\n"
-        "        local _pm = _ps and _ps:FindFirstChild(\"PlayerModule\")\n"
+        "        local _ps = _lp:WaitForChild(\"PlayerScripts\", 10)\n"
+        "        local _pm = _ps and _ps:WaitForChild(\"PlayerModule\", 10)\n"
         "        if _pm then\n"
         "            local ok, mod = pcall(require, _pm)\n"
         "            if ok and mod then\n"
