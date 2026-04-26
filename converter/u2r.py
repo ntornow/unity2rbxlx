@@ -9,7 +9,10 @@ from pathlib import Path
 
 import click
 
+from unity.yaml_parser import is_text_yaml as _is_text_yaml
+from utils.credentials import resolve_credential as _resolve_credential
 from utils.logging_config import setup_logging
+from utils.script_cache import scripts_cache_intact
 
 
 @click.group()
@@ -17,40 +20,6 @@ from utils.logging_config import setup_logging
 def main(verbose: bool) -> None:
     """Unity to Roblox Game Converter."""
     setup_logging(level="DEBUG" if verbose else "INFO")
-
-
-def _resolve_credential(
-    cli_value: str | None,
-    env_var: str,
-    filename: str,
-    project_path: Path,
-) -> str | None:
-    """Resolve a credential from CLI arg, env var, or file autodiscovery.
-
-    The CLI value can be a literal string or a path to a file containing the value.
-    Falls back to environment variable, then searches common directories for a file.
-    """
-    import os
-
-    # 1. CLI argument: could be a literal value or a file path
-    if cli_value:
-        p = Path(cli_value)
-        if p.is_file():
-            return p.read_text().strip()
-        return cli_value.strip()
-
-    # 2. Environment variable
-    val = os.environ.get(env_var, "")
-    if val:
-        return val.strip()
-
-    # 3. Auto-discover file in common locations
-    for search_dir in [project_path.parent, project_path.parent.parent, Path.cwd()]:
-        fp = search_dir / filename
-        if fp.exists():
-            return fp.read_text().strip()
-
-    return None
 
 
 @main.command()
@@ -179,22 +148,15 @@ def convert(
 
     if has_meshes and not no_upload and not no_resolve and resolved_key:
         click.echo("\n--- Publishing to Roblox (headless mesh resolution) ---")
-        from roblox.cloud_api import execute_luau
-        from roblox.luau_place_builder import generate_place_luau
+        from roblox.id_cache import read_ids, write_ids
+        from roblox.place_publisher import publish_place
 
-        # Load universe/place IDs from CLI args or cached file. Same filename
-        # as the pipeline's resolve_assets phase so both code paths share state
-        # (was previously split: u2r wrote resolve_ids.json, pipeline read
-        # .roblox_ids.json — they never saw each other's IDs).
-        ids_file = output_path / ".roblox_ids.json"
         uid, pid = universe_id, place_id
         if not uid or not pid:
-            if ids_file.exists():
-                import json
-                ids = json.loads(ids_file.read_text())
-                uid, pid = ids.get("universe_id"), ids.get("place_id")
-                if uid and pid:
-                    click.echo(f"  Reusing universe={uid} place={pid}")
+            cached_uid, cached_pid = read_ids(output_path)
+            if cached_uid and cached_pid:
+                uid, pid = cached_uid, cached_pid
+                click.echo(f"  Reusing universe={uid} place={pid}")
         if not uid or not pid:
             click.echo("  No universe/place IDs found.")
             click.echo("  Create an experience at https://create.roblox.com and pass:")
@@ -202,46 +164,28 @@ def convert(
             click.echo("  IDs will be cached for future runs.")
             click.echo(f"\n  To validate: python u2r.py validate {rbxlx_file}")
             return
-        # Cache IDs for future runs (canonical filename matches pipeline reader)
-        import json
-        ids_file.write_text(json.dumps({"universe_id": uid, "place_id": pid}))
 
-        # Generate Luau script(s) that reconstruct the place with proper meshes
-        click.echo("  Generating place reconstruction script...")
-        from roblox.luau_place_builder import generate_place_luau_chunked
-        chunks = generate_place_luau_chunked(pipeline.state.rbx_place)
-        total_size = sum(len(c) for c in chunks)
-        click.echo(f"  Script size: {total_size:,} chars ({total_size/1024:.0f} KB), {len(chunks)} chunk(s)")
+        click.echo(f"  Publishing on universe={uid} place={pid}...")
+        result = publish_place(
+            resolved_key, uid, pid, pipeline.state.rbx_place, output_path,
+        )
+        click.echo(f"  Script size: {result.total_bytes:,} chars "
+                   f"({result.total_bytes/1024:.0f} KB), {result.chunks} chunk(s)")
+        click.echo(f"  Script saved to: {result.script_path}")
 
-        # Save the script for inspection/debugging
-        script_file = output_path / "place_builder.luau"
-        script_file.write_text(chunks[0] if len(chunks) == 1 else "\n\n".join(chunks))
-        click.echo(f"  Script saved to: {script_file}")
-
-        if total_size > 4_000_000:
-            click.echo(f"  WARNING: Script exceeds 4MB limit ({total_size/1024/1024:.1f} MB).")
-            click.echo("  Skipping headless execution. Use the local rbxlx with runtime MeshLoader.")
-            click.echo(f"  Script saved to: {script_file} (for manual execution in Studio)")
-            click.echo(f"\n  Local rbxlx: {rbxlx_file}")
-            click.echo(f"  To validate: python u2r.py validate {rbxlx_file}")
-            return
-
-        # Execute each chunk headlessly
-        all_ok = True
-        for i, chunk in enumerate(chunks):
-            click.echo(f"  Executing chunk {i+1}/{len(chunks)} on universe={uid} place={pid}...")
-            result = execute_luau(resolved_key, uid, pid, chunk, timeout="300s")
-            if result is None:
-                click.echo(f"  Chunk {i+1} failed.")
-                all_ok = False
-                break
-
-        if all_ok:
+        if result.exceeded_limit:
+            click.echo(f"  WARNING: {result.error}")
+            click.echo(f"  Script saved to: {result.script_path} (for manual execution in Studio)")
+        elif result.success:
+            # Cache IDs only after a successful publish so a typo'd /
+            # unauthorized place ID doesn't get stickily reused next run.
+            write_ids(output_path, uid, pid)
             click.echo("  Place published successfully!")
-            click.echo(f"\n  Open in Studio: File → Open from Roblox → select the experience")
+            click.echo("\n  Open in Studio: File → Open from Roblox → select the experience")
             click.echo("  Meshes render as proper 3D geometry in edit mode.")
         else:
-            click.echo("\n  Headless execution failed. The rbxlx still works with runtime MeshLoader.")
+            click.echo(f"  {result.error}")
+            click.echo("  Headless execution failed. The rbxlx still works with runtime MeshLoader.")
 
     click.echo(f"\n  Local rbxlx: {rbxlx_file}")
     click.echo(f"  To validate: python u2r.py validate {rbxlx_file}")
@@ -249,51 +193,211 @@ def convert(
 
 @main.command()
 @click.argument("output_dir", type=click.Path(exists=True))
-@click.option("--api-key", type=str, default=None, help="Roblox API key")
+@click.option("--api-key", type=str, default=None, help="Roblox API key (string or path to file)")
+@click.option("--creator-id", type=str, default=None, help="Roblox Creator ID (number or path to file)")
 @click.option("--universe-id", type=int, default=None)
 @click.option("--place-id", type=int, default=None)
-def publish(output_dir: str, api_key: str | None, universe_id: int | None, place_id: int | None) -> None:
+def publish(
+    output_dir: str,
+    api_key: str | None,
+    creator_id: str | None,
+    universe_id: int | None,
+    place_id: int | None,
+) -> None:
     """Publish a previously converted place to Roblox with proper meshes.
 
-    Re-publishes the place from an existing conversion output directory
-    without re-running the conversion. Useful for iterating on the Roblox
-    experience without re-converting the Unity project.
+    Replays the cached chunks at ``<output>/place_builder_chunks.json`` if
+    present (fast path, no Unity project required). Falls back to a fresh
+    Pipeline rebuild from the saved ConversionContext if the chunk cache is
+    missing — that path requires the original Unity project at the path
+    recorded in ``conversion_context.json`` and a creator ID for fresh
+    uploads (``--creator-id`` or ``ROBLOX_CREATOR_ID``).
     """
-    output_path = Path(output_dir)
-    resolved_key = _resolve_api_key(api_key)
+    import config
+    output_path = Path(output_dir).resolve()
+
+    from roblox.id_cache import read_ids, write_ids
+    from roblox.place_publisher import publish_cached_chunks, publish_place
+    from converter.pipeline import Pipeline
+    from core.conversion_context import ConversionContext
+
+    # Credential autodiscovery: prefer files next to output_dir, then fall
+    # back to the Unity project path recorded in conversion_context.json so
+    # the publish flow finds the same apikey/creator_id files that
+    # u2r.convert / convert_interactive.assemble already used.
+    resolved_key = _resolve_credential(api_key, "ROBLOX_API_KEY", "apikey", output_path)
+    resolved_cid = _resolve_credential(creator_id, "ROBLOX_CREATOR_ID", "creator_id", output_path)
+    if not resolved_key or not resolved_cid:
+        ctx_path_for_creds = output_path / "conversion_context.json"
+        if ctx_path_for_creds.exists():
+            try:
+                _peek = ConversionContext.load(ctx_path_for_creds)
+                if _peek.unity_project_path:
+                    project_anchor = Path(_peek.unity_project_path)
+                    if not resolved_key:
+                        resolved_key = _resolve_credential(
+                            api_key, "ROBLOX_API_KEY", "apikey", project_anchor,
+                        )
+                    if not resolved_cid:
+                        resolved_cid = _resolve_credential(
+                            creator_id, "ROBLOX_CREATOR_ID", "creator_id", project_anchor,
+                        )
+            except Exception as exc:  # noqa: BLE001 — diagnostic only
+                click.echo(f"  (could not peek context for cred autodiscovery: {exc})")
+
     if not resolved_key:
         click.echo("ERROR: API key required. Pass --api-key or create apikey file."); return
+    config.ROBLOX_API_KEY = resolved_key
+    if resolved_cid:
+        config.ROBLOX_CREATOR_ID = int(resolved_cid)
 
-    from roblox.cloud_api import execute_luau
-    from converter.pipeline import Pipeline
-
-    # Load IDs
-    ids_file = output_path / "resolve_ids.json"
     uid, pid = universe_id, place_id
     if not uid or not pid:
-        if ids_file.exists():
-            import json
-            ids = json.loads(ids_file.read_text())
-            uid, pid = ids.get("universe_id"), ids.get("place_id")
+        cached_uid, cached_pid = read_ids(output_path)
+        uid = uid or cached_uid
+        pid = pid or cached_pid
     if not uid or not pid:
-        click.echo("ERROR: --universe-id and --place-id required (or cached in resolve_ids.json)"); return
+        click.echo("ERROR: --universe-id and --place-id required (or cached in .roblox_ids.json)"); return
 
-    # Check for pre-generated script
-    script_file = output_path / "place_builder.luau"
-    if script_file.exists():
-        click.echo(f"Using cached script: {script_file}")
-        luau_script = script_file.read_text()
-    else:
-        click.echo("ERROR: No place_builder.luau found. Run 'convert' first."); return
-
-    click.echo(f"Script: {len(luau_script):,} chars ({len(luau_script)/1024:.0f} KB)")
+    # Fast path: replay cached chunks. Works on archived/moved output dirs
+    # whose Unity project is gone. Falls back to a Pipeline rebuild only if
+    # the chunk cache is missing.
     click.echo(f"Publishing to universe={uid} place={pid}...")
-    result = execute_luau(resolved_key, uid, pid, luau_script, timeout="300s")
-    if result is not None:
+    result = publish_cached_chunks(resolved_key, uid, pid, output_path)
+    if result is None:
+        click.echo("No cached chunks found — rebuilding from Unity project.")
+        ctx_path = output_path / "conversion_context.json"
+        if not ctx_path.exists():
+            click.echo(f"ERROR: No conversion_context.json in {output_path}. Run 'convert' first."); return
+        prior_ctx = ConversionContext.load(ctx_path)
+        if not prior_ctx.unity_project_path:
+            click.echo("ERROR: conversion_context.json has no unity_project_path."); return
+        if not Path(prior_ctx.unity_project_path).is_dir():
+            click.echo(
+                f"ERROR: Unity project path missing: {prior_ctx.unity_project_path}\n"
+                "Re-run 'u2r.py convert' to regenerate the chunk cache."
+            ); return
+
+        pipeline = Pipeline(
+            unity_project_path=prior_ctx.unity_project_path,
+            output_dir=output_path,
+            skip_binary_rbxl=True,
+        )
+        pipeline.ctx = prior_ctx
+        pipeline.ctx.universe_id = uid
+        pipeline.ctx.place_id = pid
+
+        # Run prereqs through extract_assets + moderate_assets so we can
+        # check whether any assets actually need uploading before deciding
+        # whether to demand a creator_id. moderate_assets must run before
+        # the precheck because it auto-extends .upload_blocklist with
+        # filename-violation entries — without it, the precheck would
+        # false-positive when the only "pending" assets are ones the
+        # subsequent pipeline would moderate-block anyway.
+        pipeline.run_through("extract_assets")
+        pipeline._run_phase("moderate_assets")
+
+        # Mirror upload_assets's eligibility filter: extensions per kind,
+        # blocklist entries from .upload_blocklist, and the dedupe against
+        # ctx.uploaded_assets. Without matching that filter, this precheck
+        # would false-positive on output dirs whose pending assets are
+        # blocklisted or whose extensions aren't supported uploads.
+        UPLOADABLE_EXTENSIONS = {
+            "texture": {".png", ".jpg", ".jpeg", ".bmp", ".tga", ".tif", ".tiff", ".psd"},
+            "mesh": {".fbx", ".obj"},
+            "audio": {".mp3", ".ogg", ".wav", ".flac"},
+        }
+        blocklist: set[str] = set()
+        blocklist_file = output_path / ".upload_blocklist"
+        if blocklist_file.exists():
+            blocklist = {
+                line.strip() for line in blocklist_file.read_text().splitlines()
+                if line.strip() and not line.startswith("#")
+            }
+
+        manifest = pipeline.state.asset_manifest
+        pending_uploads: list = []
+        unresolved_uploaded_meshes: list[str] = []
+        if manifest is not None:
+            already_uploaded = set(pipeline.ctx.uploaded_assets.keys())
+            for asset in manifest.assets:
+                exts = UPLOADABLE_EXTENSIONS.get(asset.kind)
+                if exts is None or asset.path.suffix.lower() not in exts:
+                    continue
+                rel = str(asset.relative_path)
+                if rel in already_uploaded or rel in blocklist:
+                    continue
+                pending_uploads.append(asset)
+            # resolve_assets needs creator_id when mesh uploads have not all
+            # been resolved. ``resolve_assets`` itself does NOT consult the
+            # blocklist — it tries to resolve every mesh in
+            # ``ctx.uploaded_assets`` — so the precheck must mirror that
+            # exactly: counting blocklisted uploaded meshes too. Otherwise
+            # a publish could skip the missing-creator_id error and ship
+            # placeholder MeshIds because resolve_assets later self-bails.
+            uploaded_meshes = [
+                p for p in pipeline.ctx.uploaded_assets
+                if p.lower().endswith((".fbx", ".obj"))
+            ]
+            resolved = pipeline.ctx.mesh_native_sizes
+            unresolved_uploaded_meshes = [
+                p for p in uploaded_meshes if p not in resolved
+            ]
+
+        if (pending_uploads or unresolved_uploaded_meshes) and config.ROBLOX_CREATOR_ID is None:
+            reasons = []
+            if pending_uploads:
+                reasons.append(f"{len(pending_uploads)} assets need upload")
+            if unresolved_uploaded_meshes:
+                reasons.append(
+                    f"{len(unresolved_uploaded_meshes)} uploaded meshes not yet resolved"
+                )
+            click.echo(
+                f"ERROR: {' and '.join(reasons)}, but --creator-id "
+                "(or ROBLOX_CREATOR_ID) is not set. Pass --creator-id, "
+                "set the env var, or place a 'creator_id' file under "
+                "the output directory's parent."
+            ); return
+
+        # Skip already-completed prereqs on the second run_through.
+        # moderate_assets ran above as part of the precheck, so it goes
+        # in skip, not force_rerun. Upload + resolve still need
+        # force_rerun so they fire even if completed_phases marks them
+        # done from a prior run.
+        skip: set[str] = {"parse", "extract_assets", "moderate_assets"}
+        if (
+            "transpile_scripts" in pipeline.ctx.completed_phases
+            and scripts_cache_intact(output_path, pipeline.ctx.transpiled_scripts)
+        ):
+            skip.add("transpile_scripts")
+        force_rerun = {"upload_assets", "resolve_assets"}
+        pipeline.run_through("write_output", skip=skip, force_rerun=force_rerun)
+
+        # Persist the rebuilt context so the next publish / assemble sees
+        # the new uploaded_assets and mesh_native_sizes entries instead of
+        # re-uploading and re-resolving from stale state. _run_phase saves
+        # at the end of every phase, but an explicit save here makes the
+        # contract explicit and survives any future phase-skip changes.
+        pipeline.ctx.save(output_path / "conversion_context.json")
+
+        if pipeline.state.rbx_place is None:
+            click.echo("ERROR: rbx_place is empty after rebuilding scene state."); return
+
+        result = publish_place(
+            resolved_key, uid, pid, pipeline.state.rbx_place, output_path,
+        )
+
+    click.echo(f"Script size: {result.total_bytes:,} chars "
+               f"({result.total_bytes/1024:.0f} KB), {result.chunks} chunk(s)")
+    if result.exceeded_limit:
+        click.echo(f"WARNING: {result.error}")
+        click.echo(f"Script saved to: {result.script_path}")
+    elif result.success:
+        write_ids(output_path, uid, pid)
         click.echo("Place published successfully!")
         click.echo("Open in Studio: File → Open from Roblox → select the experience")
     else:
-        click.echo("Publication failed.")
+        click.echo(f"Publication failed: {result.error}")
 
 
 @main.command()
@@ -305,7 +409,6 @@ def analyze(unity_project: str) -> None:
     from unity.guid_resolver import build_guid_index
     from unity.asset_extractor import extract_assets
     from unity.script_analyzer import analyze_all_scripts
-    from unity.yaml_parser import is_text_yaml
 
     project = Path(unity_project).resolve()
     # Auto-detect nested Unity project root
@@ -333,7 +436,7 @@ def analyze(unity_project: str) -> None:
     scenes = list((project / "Assets").rglob("*.unity")) if (project / "Assets").exists() else []
     click.echo(f"\nScenes: {len(scenes)}")
     for s in scenes:
-        is_text = is_text_yaml(s)
+        is_text = _is_text_yaml(s)
         status = "text YAML" if is_text else "BINARY (requires UnityPy)"
         click.echo(f"  {s.relative_to(project)}: {status}")
         if is_text:
@@ -840,16 +943,6 @@ def compare(
     report_path = comparison_dir / "comparison_report.json"
     report_path.write_text(json.dumps(report, indent=2, default=str))
     click.echo(f"\nReport saved: {report_path}")
-
-
-def _is_text_yaml(path: Path) -> bool:
-    """Check if a .unity file is text YAML format."""
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            header = f.read(50)
-            return header.startswith("%YAML")
-    except Exception:
-        return False
 
 
 @main.command("audit-assets")

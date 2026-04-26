@@ -222,6 +222,70 @@ class Pipeline:
                  elapsed, len(scene_paths))
         return self.ctx
 
+    # Phases whose primary outputs live in self.state (in-memory) rather than
+    # ConversionContext (on disk), so they MUST re-run on every resumed
+    # invocation even if ctx.completed_phases marks them done.
+    ESSENTIAL_PHASES: frozenset[str] = frozenset({
+        "parse", "extract_assets", "convert_materials",
+        "transpile_scripts", "convert_animations", "convert_scene",
+    })
+
+    def run_through(
+        self,
+        target_phase: str,
+        *,
+        skip: set[str] | frozenset[str] | None = None,
+        force_rerun: set[str] | frozenset[str] | None = None,
+        run_after: bool = False,
+    ) -> None:
+        """Run prerequisites for ``target_phase``, then the target itself.
+
+        Prerequisites (phases earlier than ``target_phase``) run if they are
+        in :attr:`ESSENTIAL_PHASES`, in ``force_rerun``, or not yet
+        completed per ``ctx.completed_phases``. ``skip`` overrides all of
+        the above — listed phases never run.
+
+        ``target_phase`` itself always runs unless it is in ``skip``.
+
+        ``force_rerun`` exists for retry semantics: ``assemble`` re-runs the
+        cloud side-effect phases (``moderate_assets``, ``upload_assets``,
+        ``resolve_assets``) on every invocation so a second ``assemble``
+        call after fixing credentials or changing assets actually re-uploads
+        rather than silently skipping the cloud work.
+
+        If ``run_after`` is True, every phase after ``target_phase`` is also
+        run unconditionally (modulo ``skip``) — this matches
+        :meth:`resume`'s "redo this phase and everything after" contract.
+        """
+        if target_phase not in PHASES:
+            raise ValueError(
+                f"Unknown phase '{target_phase}'. Valid phases: {PHASES}"
+            )
+        skip = set(skip or ())
+        force_rerun = set(force_rerun or ())
+        target_idx = PHASES.index(target_phase)
+
+        for prior in PHASES[:target_idx]:
+            if prior in skip:
+                continue
+            if (
+                prior in self.ESSENTIAL_PHASES
+                or prior in force_rerun
+                or prior not in self.ctx.completed_phases
+            ):
+                self._run_phase(prior)
+
+        if target_phase not in skip:
+            self._run_phase(target_phase)
+
+        if run_after:
+            # Resume contract: every later phase runs unconditionally so the
+            # user gets a clean re-execution from the target forward.
+            for remaining in PHASES[target_idx + 1:]:
+                if remaining in skip:
+                    continue
+                self._run_phase(remaining)
+
     def resume(self, phase: str) -> ConversionContext:
         """Resume the pipeline from *phase*, re-running it and all subsequent phases.
 
@@ -236,26 +300,12 @@ class Pipeline:
                 f"Unknown phase '{phase}'. Valid phases: {PHASES}"
             )
 
-        # Reload context if available.
         if self._context_path.exists():
             self.ctx = ConversionContext.load(self._context_path)
             log.info("Loaded persisted context from %s", self._context_path)
 
-        idx = PHASES.index(phase)
         log.info("=== Resuming pipeline from phase '%s' ===", phase)
-
-        # Always re-run phases that produce in-memory state not persisted to context.
-        essential_phases = {"parse", "extract_assets", "convert_materials",
-                           "transpile_scripts", "convert_animations", "convert_scene"}
-        for prior_phase in PHASES[:idx]:
-            if prior_phase not in self.ctx.completed_phases or prior_phase in essential_phases:
-                log.info("Running prerequisite phase '%s'", prior_phase)
-                self._run_phase(prior_phase)
-
-        # Run the requested phase and everything after it.
-        for remaining_phase in PHASES[idx:]:
-            self._run_phase(remaining_phase)
-
+        self.run_through(phase, run_after=True)
         log.info("=== Resume complete ===")
         return self.ctx
 
@@ -1176,11 +1226,17 @@ class Pipeline:
             if any(k.lower().endswith(ext) for ext in ('.fbx', '.obj'))
         ) if self.ctx.uploaded_assets else 0
         resolved_count = len(self.ctx.mesh_native_sizes) if self.ctx.mesh_native_sizes else 0
-
-        if resolved_count > 0 and resolved_count >= uploaded_mesh_count:
-            log.info("[resolve_assets] Mesh resolution data already present (%d/%d meshes) — skipping",
-                     resolved_count, uploaded_mesh_count)
-            return
+        all_meshes_resolved = (
+            resolved_count > 0 and resolved_count >= uploaded_mesh_count
+        )
+        if all_meshes_resolved:
+            log.info(
+                "[resolve_assets] Mesh resolution data already present "
+                "(%d/%d meshes) — skipping mesh resolve, but still "
+                "validating uid/pid below so a retarget refreshes the "
+                "shared ID cache.",
+                resolved_count, uploaded_mesh_count,
+            )
 
         if self.skip_upload:
             log.info("[resolve_assets] Skipping (--no-upload)")
@@ -1200,20 +1256,15 @@ class Pipeline:
 
         # Try to recover IDs from a persistent cache file (survives context resets)
         if not universe_id or not place_id:
-            ids_cache = self.output_dir / ".roblox_ids.json"
-            if ids_cache.exists():
-                import json as _json
-                try:
-                    ids = _json.loads(ids_cache.read_text())
-                    universe_id = ids.get("universe_id")
-                    place_id = ids.get("place_id")
-                    if universe_id and place_id:
-                        self.ctx.universe_id = universe_id
-                        self.ctx.place_id = place_id
-                        log.info("[resolve_assets] Recovered IDs from cache: universe=%s place=%s",
-                                 universe_id, place_id)
-                except Exception:
-                    pass
+            from roblox.id_cache import read_ids
+            cached_uid, cached_pid = read_ids(self.output_dir)
+            if cached_uid and cached_pid:
+                universe_id = cached_uid
+                place_id = cached_pid
+                self.ctx.universe_id = universe_id
+                self.ctx.place_id = place_id
+                log.info("[resolve_assets] Recovered IDs from cache: universe=%s place=%s",
+                         universe_id, place_id)
 
         # No universe/place — cannot run headless mesh resolution. Open Cloud
         # does not support universe creation with API-key auth, so we cannot
@@ -1238,16 +1289,51 @@ class Pipeline:
                         "execute the generated scripts via Studio Command Bar.")
             return
 
-        # Persist IDs to cache file (survives context resets)
-        import json as _json
-        ids_cache = self.output_dir / ".roblox_ids.json"
-        ids_cache.write_text(_json.dumps({"universe_id": universe_id, "place_id": place_id}))
+        # ID cache write deferred until we either finish a resolve OR
+        # confirm there's nothing to resolve. Writing premature IDs at
+        # phase entry would poison the shared cache for later u2r publish
+        # / interactive upload commands if assemble was invoked with a
+        # typo'd or unauthorized experience ID.
 
-        # Find uploaded mesh assets (Model IDs from cloud upload)
-        mesh_assets = {k: v for k, v in self.ctx.uploaded_assets.items()
-                       if any(k.lower().endswith(ext) for ext in ('.fbx', '.obj'))}
+        # Find uploaded mesh assets (Model IDs from cloud upload). Skip
+        # ones already resolved so a force-rerun doesn't redo them — and
+        # so transient batch failures can't shrink a prior resolution.
+        # When ALL meshes are already resolved, fall through to the
+        # no-mesh validation+cache-refresh path below so a retarget still
+        # updates .roblox_ids.json.
+        already_resolved = self.ctx.mesh_native_sizes or {}
+        mesh_assets = {} if all_meshes_resolved else {
+            k: v for k, v in self.ctx.uploaded_assets.items()
+            if any(k.lower().endswith(ext) for ext in ('.fbx', '.obj'))
+            and k not in already_resolved
+        }
         if not mesh_assets:
-            log.info("[resolve_assets] No mesh assets to resolve")
+            log.info(
+                "[resolve_assets] No new mesh assets to resolve "
+                "(%d already resolved)", len(already_resolved),
+            )
+            # Validate uid/pid against Open Cloud before caching. Without
+            # the validation call, a typo'd retarget on a mesh-free output
+            # would silently poison .roblox_ids.json. Without ANY cache
+            # write, retargets on mesh-free outputs would never refresh
+            # the cache, so a later publish would target the prior
+            # experience. The minimal execute_luau call here resolves both.
+            from roblox.cloud_api import execute_luau
+            ok = execute_luau(
+                api_key, universe_id, place_id, "return 'ok'", timeout="60s",
+            )
+            if ok is not None:
+                from roblox.id_cache import write_ids
+                write_ids(self.output_dir, universe_id, place_id)
+                log.info(
+                    "[resolve_assets] uid=%s pid=%s validated; cache refreshed",
+                    universe_id, place_id,
+                )
+            else:
+                log.warning(
+                    "[resolve_assets] uid=%s pid=%s did not authenticate; "
+                    "cache NOT refreshed", universe_id, place_id,
+                )
             return
 
         log.info("[resolve_assets] Resolving %d mesh assets via Luau Execution API...", len(mesh_assets))
@@ -1330,10 +1416,24 @@ return table.concat(allData, "\\n")'''
                     entry["textureId"] = texture_id
                 mesh_hierarchies[path].append(entry)
 
-            self.ctx.mesh_native_sizes = mesh_native_sizes
-            self.ctx.mesh_hierarchies = mesh_hierarchies
-            log.info("[resolve_assets] Resolved %d meshes (%d sub-meshes total)",
-                     len(mesh_native_sizes), sum(len(v) for v in mesh_hierarchies.values()))
+            # Merge into existing tables instead of replacing. A transient
+            # batch failure during a force-rerun would otherwise shrink a
+            # prior mostly-complete resolution by overwriting it with this
+            # run's smaller result set.
+            merged_sizes = {**already_resolved, **mesh_native_sizes}
+            existing_hierarchies = self.ctx.mesh_hierarchies or {}
+            merged_hierarchies = {**existing_hierarchies, **mesh_hierarchies}
+            self.ctx.mesh_native_sizes = merged_sizes
+            self.ctx.mesh_hierarchies = merged_hierarchies
+            log.info(
+                "[resolve_assets] Resolved %d new meshes (total %d, %d sub-meshes)",
+                len(mesh_native_sizes), len(merged_sizes),
+                sum(len(v) for v in merged_hierarchies.values()),
+            )
+            # Persist IDs only AFTER a successful resolve so we know the
+            # uid/pid pair actually authenticated against Open Cloud.
+            from roblox.id_cache import write_ids
+            write_ids(self.output_dir, universe_id, place_id)
         else:
             log.warning("[resolve_assets] No mesh resolution data obtained")
 

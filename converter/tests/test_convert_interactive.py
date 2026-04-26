@@ -24,6 +24,7 @@ from convert_interactive import (
     _run_through,
     cli,
 )
+from converter.pipeline import Pipeline
 from core.conversion_context import ConversionContext
 
 
@@ -120,7 +121,14 @@ class TestRunThrough:
     """
 
     class _StubPipeline:
-        """Minimal stand-in for Pipeline that records what phases ran."""
+        """Minimal stand-in for Pipeline that records what phases ran.
+
+        Inherits the real ``run_through`` semantics by calling into
+        ``Pipeline.run_through`` with ``self`` so the prereq/skip rules
+        under test are the same code that runs in production.
+        """
+
+        ESSENTIAL_PHASES = Pipeline.ESSENTIAL_PHASES
 
         def __init__(self):
             self.run_log: list[str] = []
@@ -128,11 +136,11 @@ class TestRunThrough:
 
         def _run_phase(self, phase: str) -> None:
             self.run_log.append(phase)
-            # Track completion the way the real pipeline does, so the
-            # "skip if already completed" branch in _run_through behaves
-            # realistically.
             if phase not in self.ctx.completed_phases:
                 self.ctx.completed_phases.append(phase)
+
+        def run_through(self, target, *, skip=None, force_rerun=None, run_after=False):
+            return Pipeline.run_through(self, target, skip=skip, force_rerun=force_rerun, run_after=run_after)
 
     def test_materials_does_not_run_cloud_phases(self):
         """Running `_run_through(convert_materials)` on a fresh output must
@@ -180,43 +188,19 @@ class TestResumeVsRunThroughParity:
     interfaces to the same pipeline.
     """
 
-    def test_essential_phases_sets_match(self):
-        """Both functions declare an 'essential_phases' set literal.
-        Extract them and assert equality — pure source-level check so the
-        test fails the moment one literal is updated and the other isn't.
+    def test_essential_phases_is_single_source_of_truth(self):
+        """The essential-phases set used to live in two parallel literals
+        (``Pipeline.resume`` and ``_run_through``). Both now route through
+        ``Pipeline.run_through`` which reads ``Pipeline.ESSENTIAL_PHASES``,
+        eliminating the drift surface. Pin the contents so a phase can't
+        silently fall off the list.
         """
-        import ast
-        import inspect
-        import textwrap
-
-        import convert_interactive
         from converter.pipeline import Pipeline
 
-        def _essential_set(fn) -> set[str]:
-            # getsource(method) preserves original indentation which breaks
-            # ast.parse; dedent to column 0 first.
-            tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
-            for node in ast.walk(tree):
-                if (
-                    isinstance(node, ast.Assign)
-                    and len(node.targets) == 1
-                    and isinstance(node.targets[0], ast.Name)
-                    and node.targets[0].id == "essential_phases"
-                    and isinstance(node.value, ast.Set)
-                ):
-                    return {
-                        elt.value for elt in node.value.elts
-                        if isinstance(elt, ast.Constant)
-                    }
-            raise AssertionError("essential_phases not found")
-
-        cli_set = _essential_set(Pipeline.resume)
-        skill_set = _essential_set(convert_interactive._run_through)
-        assert cli_set == skill_set, (
-            "Pipeline.resume and _run_through have diverged on which phases "
-            f"get re-run unconditionally. resume={cli_set}, "
-            f"_run_through={skill_set}. Update both together."
-        )
+        assert Pipeline.ESSENTIAL_PHASES == frozenset({
+            "parse", "extract_assets", "convert_materials",
+            "transpile_scripts", "convert_animations", "convert_scene",
+        })
 
     def test_prereq_phases_identical_minus_cloud(self):
         """Executive check: the ordered list of prereq phases that run before
@@ -229,6 +213,7 @@ class TestResumeVsRunThroughParity:
         from converter.pipeline import PHASES
 
         class _StubForRunThrough:
+            ESSENTIAL_PHASES = Pipeline.ESSENTIAL_PHASES
             def __init__(self):
                 self.run_log: list[str] = []
                 self.ctx = ConversionContext()
@@ -236,6 +221,8 @@ class TestResumeVsRunThroughParity:
                 self.run_log.append(phase)
                 if phase not in self.ctx.completed_phases:
                     self.ctx.completed_phases.append(phase)
+            def run_through(self, target, *, skip=None, force_rerun=None, run_after=False):
+                return Pipeline.run_through(self, target, skip=skip, force_rerun=force_rerun, run_after=run_after)
 
         target = "convert_materials"
 
@@ -261,12 +248,15 @@ class TestResumeVsRunThroughParity:
         from converter.pipeline import PHASES
 
         class _Stub:
+            ESSENTIAL_PHASES = Pipeline.ESSENTIAL_PHASES
             def __init__(self):
                 self.run_log: list[str] = []
                 self.ctx = ConversionContext()
             def _run_phase(self, phase):
                 self.run_log.append(phase)
                 self.ctx.completed_phases.append(phase)
+            def run_through(self, target, *, skip=None, force_rerun=None, run_after=False):
+                return Pipeline.run_through(self, target, skip=skip, force_rerun=force_rerun, run_after=run_after)
 
         stub = _Stub()
         _run_through(stub, "convert_materials")
@@ -292,42 +282,152 @@ class TestThreeFlowPhaseOrder:
     to regress when someone edits one list without updating the other.
     """
 
-    def test_assemble_phase_list_matches_pipeline_phases_minus_moderate_skip(self):
-        """Interactive assemble's phase list must stay a subset of PHASES
-        and preserve PHASES order. Earlier versions of the fix omitted
-        moderate_assets (P1-4). A future edit that rearranges PHASES would
-        silently regress unless we pin this.
+    def test_assemble_runs_phases_in_pipeline_order(self, monkeypatch):
+        """Interactive assemble must run phases in PHASES order with no
+        skips beyond the user-requested ones. Earlier versions hand-rolled
+        the phase list and accidentally dropped moderate_assets (P1-4); the
+        refactor to ``Pipeline.run_through`` removed that hand-rolling, so
+        check the behavioral contract directly: stub the pipeline and
+        observe which phases fire when assemble runs without any skips.
         """
-        import ast
-        import inspect
+        import config as _config
+        monkeypatch.setattr(_config, "ROBLOX_API_KEY", "stub")
+        monkeypatch.setattr(_config, "ROBLOX_CREATOR_ID", 1)
 
-        import convert_interactive
         from converter.pipeline import PHASES
 
-        tree = ast.parse(inspect.getsource(convert_interactive.assemble.callback))
-        assemble_list: list[str] | None = None
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.For)
-                and isinstance(node.iter, ast.List)
-                and all(
-                    isinstance(el, ast.Constant) and isinstance(el.value, str)
-                    for el in node.iter.elts
-                )
-            ):
-                candidate = [el.value for el in node.iter.elts]
-                if set(candidate).issubset(set(PHASES)):
-                    assemble_list = candidate
-                    break
-        assert assemble_list is not None, "assemble phase list not found"
+        run_log: list[str] = []
 
-        # Every phase in assemble must appear in PHASES (subset).
-        assert set(assemble_list).issubset(set(PHASES))
-        # Order must match PHASES order.
-        assert assemble_list == [p for p in PHASES if p in assemble_list], (
-            f"assemble phase order diverges from PHASES. "
-            f"assemble={assemble_list}, PHASES={PHASES}"
+        class _Stub:
+            ESSENTIAL_PHASES = Pipeline.ESSENTIAL_PHASES
+            def __init__(self):
+                self.ctx = ConversionContext()
+            def _run_phase(self, phase):
+                run_log.append(phase)
+                if phase not in self.ctx.completed_phases:
+                    self.ctx.completed_phases.append(phase)
+            def run_through(self, target, *, skip=None, force_rerun=None, run_after=False):
+                return Pipeline.run_through(self, target, skip=skip, force_rerun=force_rerun, run_after=run_after)
+
+        import convert_interactive
+        monkeypatch.setattr(
+            convert_interactive, "_make_pipeline",
+            lambda *a, **k: _Stub(),
         )
+
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            from pathlib import Path as _Path
+            unity = _Path("Project")
+            (unity / "Assets").mkdir(parents=True)
+            runner.invoke(
+                cli,
+                ["assemble", str(unity), "out"],
+                catch_exceptions=False,
+            )
+
+        # Every phase in PHASES should have fired exactly once, in order.
+        assert run_log == list(PHASES), (
+            f"assemble phase order diverges from PHASES. "
+            f"run_log={run_log}, PHASES={list(PHASES)}"
+        )
+
+    def test_assemble_runs_transpile_when_scripts_cache_missing(self, monkeypatch):
+        """If output/scripts/ doesn't exist (archived/partial-copy output
+        dir), assemble must NOT skip transpile_scripts even if completed.
+        Otherwise write_output rehydrates nothing and ships scripts-less
+        places. Regression flagged by Codex review round 3.
+        """
+        import config as _config
+        monkeypatch.setattr(_config, "ROBLOX_API_KEY", "stub")
+        monkeypatch.setattr(_config, "ROBLOX_CREATOR_ID", 1)
+
+        run_log: list[str] = []
+
+        class _Stub:
+            ESSENTIAL_PHASES = Pipeline.ESSENTIAL_PHASES
+            def __init__(self):
+                self.ctx = ConversionContext()
+                self.ctx.completed_phases.append("transpile_scripts")
+            def _run_phase(self, phase):
+                run_log.append(phase)
+            def run_through(self, target, *, skip=None, force_rerun=None, run_after=False):
+                return Pipeline.run_through(self, target, skip=skip, force_rerun=force_rerun, run_after=run_after)
+
+        import convert_interactive
+        monkeypatch.setattr(
+            convert_interactive, "_make_pipeline",
+            lambda *a, **k: _Stub(),
+        )
+
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            from pathlib import Path as _Path
+            unity = _Path("Project")
+            (unity / "Assets").mkdir(parents=True)
+            # Note: `out/scripts/` deliberately not created — simulating an
+            # archived output dir whose script cache is gone.
+            runner.invoke(
+                cli,
+                ["assemble", str(unity), "out"],
+                catch_exceptions=False,
+            )
+
+        assert "transpile_scripts" in run_log, (
+            "transpile must re-run when scripts/ cache is missing; "
+            f"run_log={run_log}"
+        )
+
+    def test_assemble_retry_reruns_cloud_phases(self, monkeypatch):
+        """Retry semantics: when assemble runs after a previous assemble has
+        already marked moderate_assets/upload_assets/resolve_assets complete,
+        a second invocation must STILL run them — otherwise users who hit
+        bad creds, network failures, or asset changes can't retry without
+        deleting their output dir. Regression caught by Codex review on the
+        first pass of the run_through refactor.
+        """
+        import config as _config
+        monkeypatch.setattr(_config, "ROBLOX_API_KEY", "stub")
+        monkeypatch.setattr(_config, "ROBLOX_CREATOR_ID", 1)
+
+        from converter.pipeline import PHASES
+
+        run_log: list[str] = []
+
+        class _Stub:
+            ESSENTIAL_PHASES = Pipeline.ESSENTIAL_PHASES
+            def __init__(self):
+                self.ctx = ConversionContext()
+                # Simulate a prior assemble: every phase already marked done.
+                for p in PHASES:
+                    self.ctx.completed_phases.append(p)
+            def _run_phase(self, phase):
+                run_log.append(phase)
+            def run_through(self, target, *, skip=None, force_rerun=None, run_after=False):
+                return Pipeline.run_through(self, target, skip=skip, force_rerun=force_rerun, run_after=run_after)
+
+        import convert_interactive
+        monkeypatch.setattr(
+            convert_interactive, "_make_pipeline",
+            lambda *a, **k: _Stub(),
+        )
+
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            from pathlib import Path as _Path
+            unity = _Path("Project")
+            (unity / "Assets").mkdir(parents=True)
+            runner.invoke(
+                cli,
+                ["assemble", str(unity), "out", "--retranspile"],
+                catch_exceptions=False,
+            )
+
+        for required in ("moderate_assets", "upload_assets", "resolve_assets"):
+            assert required in run_log, (
+                f"{required} was skipped on retry — should have re-run "
+                f"despite already being in completed_phases. run_log={run_log}"
+            )
 
     def test_rehydrated_flow_skips_only_transpile(self, monkeypatch):
         """The rehydrated interactive flow differs from fresh by exactly one
@@ -343,11 +443,16 @@ class TestThreeFlowPhaseOrder:
         run_log: list[str] = []
 
         class _Stub:
+            ESSENTIAL_PHASES = Pipeline.ESSENTIAL_PHASES
             def __init__(self):
                 self.ctx = ConversionContext()
                 self.ctx.completed_phases.append("transpile_scripts")
             def _run_phase(self, phase):
                 run_log.append(phase)
+                if phase not in self.ctx.completed_phases:
+                    self.ctx.completed_phases.append(phase)
+            def run_through(self, target, *, skip=None, force_rerun=None, run_after=False):
+                return Pipeline.run_through(self, target, skip=skip, force_rerun=force_rerun, run_after=run_after)
 
         import convert_interactive
         monkeypatch.setattr(
@@ -663,33 +768,55 @@ class TestAssembleWorkflowFidelity:
     skipped uploads while still reporting success=True.
     """
 
-    def test_phase_list_includes_moderate_assets_before_upload(self):
-        """Read the assemble command's source and assert moderate_assets
-        sits between extract_assets and upload_assets. (The live pipeline
-        run would also catch this via Pipeline.moderate_assets side effects,
-        but that requires a full project fixture — this source-level check
-        catches ordering regressions without the heavy lift.)
+    def test_assemble_runs_moderate_assets_before_upload(self, monkeypatch):
+        """Earlier versions of assemble's hand-rolled phase list omitted
+        moderate_assets (P1-4), letting the upload phase run before the
+        moderation gate. The refactor to ``Pipeline.run_through`` makes the
+        order come from the canonical PHASES list, but the guarantee still
+        needs an explicit test: stub the pipeline and verify the actual
+        phase fire order.
         """
-        import inspect
+        import config as _config
+        monkeypatch.setattr(_config, "ROBLOX_API_KEY", "stub")
+        monkeypatch.setattr(_config, "ROBLOX_CREATOR_ID", 1)
+
+        run_log: list[str] = []
+
+        class _Stub:
+            ESSENTIAL_PHASES = Pipeline.ESSENTIAL_PHASES
+            def __init__(self):
+                self.ctx = ConversionContext()
+            def _run_phase(self, phase):
+                run_log.append(phase)
+                if phase not in self.ctx.completed_phases:
+                    self.ctx.completed_phases.append(phase)
+            def run_through(self, target, *, skip=None, force_rerun=None, run_after=False):
+                return Pipeline.run_through(self, target, skip=skip, force_rerun=force_rerun, run_after=run_after)
 
         import convert_interactive
+        monkeypatch.setattr(
+            convert_interactive, "_make_pipeline",
+            lambda *a, **k: _Stub(),
+        )
 
-        # convert_interactive.assemble is a Click command; the underlying
-        # function lives on .callback.
-        src = inspect.getsource(convert_interactive.assemble.callback)
-        phase_list_start = src.index('for phase in [')
-        phase_list_end = src.index(']', phase_list_start)
-        phase_list_src = src[phase_list_start:phase_list_end]
-        # Check order by scanning for the three phase names.
-        for name in ("extract_assets", "moderate_assets", "upload_assets"):
-            assert f'"{name}"' in phase_list_src, (
-                f"{name} missing from assemble's phase list"
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            from pathlib import Path as _Path
+            unity = _Path("Project")
+            (unity / "Assets").mkdir(parents=True)
+            runner.invoke(
+                cli,
+                ["assemble", str(unity), "out"],
+                catch_exceptions=False,
             )
+
+        for name in ("extract_assets", "moderate_assets", "upload_assets"):
+            assert name in run_log, f"{name} did not run during assemble"
         assert (
-            phase_list_src.index('"extract_assets"')
-            < phase_list_src.index('"moderate_assets"')
-            < phase_list_src.index('"upload_assets"')
-        ), "moderate_assets must run between extract_assets and upload_assets"
+            run_log.index("extract_assets")
+            < run_log.index("moderate_assets")
+            < run_log.index("upload_assets")
+        ), f"phase order: {run_log}"
 
     def test_missing_creds_without_no_upload_fails_fast(self, tmp_path, monkeypatch):
         """When the user invokes assemble without --no-upload and without
