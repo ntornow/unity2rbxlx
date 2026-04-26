@@ -372,6 +372,13 @@ def publish(
         force_rerun = {"upload_assets", "resolve_assets"}
         pipeline.run_through("write_output", skip=skip, force_rerun=force_rerun)
 
+        # Persist the rebuilt context so the next publish / assemble sees
+        # the new uploaded_assets and mesh_native_sizes entries instead of
+        # re-uploading and re-resolving from stale state. _run_phase saves
+        # at the end of every phase, but an explicit save here makes the
+        # contract explicit and survives any future phase-skip changes.
+        pipeline.ctx.save(output_path / "conversion_context.json")
+
         if pipeline.state.rbx_place is None:
             click.echo("ERROR: rbx_place is empty after rebuilding scene state."); return
 
