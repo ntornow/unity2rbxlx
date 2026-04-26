@@ -174,17 +174,26 @@ def publish_cached_chunks(
         except (json.JSONDecodeError, OSError) as exc:
             log.warning("publish_cached_chunks: %s unreadable: %s", chunks_path, exc)
             data = None
-        if isinstance(data, list) and all(isinstance(c, str) for c in data):
+        # Reject empty lists and non-empty entries-of-empty-strings: an
+        # empty cache would make _publish_chunks no-op and falsely report
+        # success=True. Treat it as missing so callers can fall back.
+        if (
+            isinstance(data, list)
+            and data
+            and all(isinstance(c, str) and c for c in data)
+        ):
             chunks = data
-        else:
-            log.warning("publish_cached_chunks: %s has unexpected shape", chunks_path)
+        elif data is not None:
+            log.warning("publish_cached_chunks: %s empty or unexpected shape", chunks_path)
 
     if chunks is None and script_path.exists():
         try:
-            chunks = [script_path.read_text(encoding="utf-8")]
+            text = script_path.read_text(encoding="utf-8")
         except OSError as exc:
             log.warning("publish_cached_chunks: %s unreadable: %s", script_path, exc)
             return None
+        if text:
+            chunks = [text]
 
     if chunks is None:
         return None

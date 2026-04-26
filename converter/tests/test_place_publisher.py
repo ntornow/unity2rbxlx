@@ -78,6 +78,26 @@ class TestPublishCachedChunks:
         # No legacy script either, so this returns None (fall through to rebuild).
         assert publish_cached_chunks("k", 1, 2, tmp_path) is None
 
+    def test_empty_cache_returns_none(self, tmp_path):
+        """An empty chunk list would let ``_publish_chunks`` no-op and
+        falsely report success=True. Treat it as missing so callers can
+        fall back to a legacy script or rebuild path.
+        """
+        (tmp_path / CHUNKS_FILENAME).write_text(json.dumps([]))
+        assert publish_cached_chunks("k", 1, 2, tmp_path) is None
+
+    def test_empty_string_chunks_returns_none(self, tmp_path):
+        """Same logic — a list of empty strings is still nothing to send."""
+        (tmp_path / CHUNKS_FILENAME).write_text(json.dumps(["", ""]))
+        assert publish_cached_chunks("k", 1, 2, tmp_path) is None
+
+    def test_empty_legacy_script_returns_none(self, tmp_path):
+        """An empty place_builder.luau (e.g. zero-byte file) likewise
+        shouldn't false-positive a successful publish.
+        """
+        (tmp_path / "place_builder.luau").write_text("")
+        assert publish_cached_chunks("k", 1, 2, tmp_path) is None
+
     def test_legacy_script_fallback_when_chunks_json_missing(self, tmp_path, monkeypatch):
         """Output dirs from before the chunk cache existed still have
         ``place_builder.luau``. Republishing those must work without a

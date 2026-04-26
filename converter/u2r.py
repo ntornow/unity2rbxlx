@@ -215,18 +215,41 @@ def publish(
     """
     import config
     output_path = Path(output_dir).resolve()
-    resolved_key = _resolve_credential(api_key, "ROBLOX_API_KEY", "apikey", output_path)
-    if not resolved_key:
-        click.echo("ERROR: API key required. Pass --api-key or create apikey file."); return
-    config.ROBLOX_API_KEY = resolved_key
-    resolved_cid = _resolve_credential(creator_id, "ROBLOX_CREATOR_ID", "creator_id", output_path)
-    if resolved_cid:
-        config.ROBLOX_CREATOR_ID = int(resolved_cid)
 
     from roblox.id_cache import read_ids, write_ids
     from roblox.place_publisher import publish_cached_chunks, publish_place
     from converter.pipeline import Pipeline
     from core.conversion_context import ConversionContext
+
+    # Credential autodiscovery: prefer files next to output_dir, then fall
+    # back to the Unity project path recorded in conversion_context.json so
+    # the publish flow finds the same apikey/creator_id files that
+    # u2r.convert / convert_interactive.assemble already used.
+    resolved_key = _resolve_credential(api_key, "ROBLOX_API_KEY", "apikey", output_path)
+    resolved_cid = _resolve_credential(creator_id, "ROBLOX_CREATOR_ID", "creator_id", output_path)
+    if not resolved_key or not resolved_cid:
+        ctx_path_for_creds = output_path / "conversion_context.json"
+        if ctx_path_for_creds.exists():
+            try:
+                _peek = ConversionContext.load(ctx_path_for_creds)
+                if _peek.unity_project_path:
+                    project_anchor = Path(_peek.unity_project_path)
+                    if not resolved_key:
+                        resolved_key = _resolve_credential(
+                            api_key, "ROBLOX_API_KEY", "apikey", project_anchor,
+                        )
+                    if not resolved_cid:
+                        resolved_cid = _resolve_credential(
+                            creator_id, "ROBLOX_CREATOR_ID", "creator_id", project_anchor,
+                        )
+            except Exception as exc:  # noqa: BLE001 — diagnostic only
+                click.echo(f"  (could not peek context for cred autodiscovery: {exc})")
+
+    if not resolved_key:
+        click.echo("ERROR: API key required. Pass --api-key or create apikey file."); return
+    config.ROBLOX_API_KEY = resolved_key
+    if resolved_cid:
+        config.ROBLOX_CREATOR_ID = int(resolved_cid)
 
     uid, pid = universe_id, place_id
     if not uid or not pid:
