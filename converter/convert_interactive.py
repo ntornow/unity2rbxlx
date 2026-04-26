@@ -747,8 +747,12 @@ def assemble(unity_project_path: str, output_dir: str,
     if no_resolve:
         skip.add("resolve_assets")
     # Cloud side-effect phases must re-run on every assemble invocation so
-    # a retry after fixing creds / changing assets actually re-uploads,
-    # rather than skipping because completed_phases lists them. Each phase
+    # the second pass picks up newly-discovered assets and resolves any
+    # uploaded meshes that had no MeshIds yet. Note: upload_assets dedupes
+    # by relative path against ctx.uploaded_assets — it does NOT detect
+    # in-place content edits to the same file. Users who change a mesh or
+    # texture in place must remove its entry from ctx.uploaded_assets (or
+    # delete conversion_context.json) to force a re-upload. Each phase
     # self-gates on ``--no-upload`` / missing creds, so listing them here
     # is safe even when uploads should no-op.
     force_rerun = {"moderate_assets", "upload_assets", "resolve_assets"}
