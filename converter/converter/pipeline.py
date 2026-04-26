@@ -1603,12 +1603,35 @@ return table.concat(allData, "\\n")'''
             r'MouseBehavior\s*=\s*Enum\.MouseBehavior\.LockCenter',
             r'InputBegan:Connect',
         ]
+        # Anti-FPS patterns: modules that re-enable the mouse cursor or unlock
+        # the mouse at init time clobber the FPS controller's setup. If any
+        # script sets MouseBehavior=LockCenter (an FPS controller), exclude
+        # such modules from the bootstrap — they should only run when the
+        # player explicitly navigates to a menu, not unconditionally on Play.
+        _anti_fps_patterns = [
+            r'MouseIconEnabled\s*=\s*true',
+            r'MouseBehavior\s*=\s*Enum\.MouseBehavior\.Default',
+        ]
+        has_fps_controller = any(
+            _re.search(r'MouseBehavior\s*=\s*Enum\.MouseBehavior\.LockCenter', s.source)
+            for s in self.state.rbx_place.scripts
+        )
         side_effect_modules = []
         for s in self.state.rbx_place.scripts:
             if s.script_type != "ModuleScript":
                 continue
-            if any(_re.search(p, s.source) for p in _side_effect_patterns):
-                side_effect_modules.append(s.name)
+            if not any(_re.search(p, s.source) for p in _side_effect_patterns):
+                continue
+            if has_fps_controller and any(
+                _re.search(p, s.source) for p in _anti_fps_patterns
+            ):
+                log.info(
+                    "[write_output] Skipping bootstrap require of '%s' "
+                    "(would clobber FPS controller mouse state)",
+                    s.name,
+                )
+                continue
+            side_effect_modules.append(s.name)
 
         if side_effect_modules:
             bootstrap_lines = ['-- Auto-generated bootstrap: require modules with side-effects']
