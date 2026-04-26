@@ -1,0 +1,196 @@
+# Future Improvements
+
+Long-horizon, multi-PR or strategic work. For active PR-scoped items, see
+[`TODO.md`](../TODO.md). For documented limitations, see
+[`UNSUPPORTED.md`](UNSUPPORTED.md). For architectural debt and bug-shaped
+gaps, see [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md).
+
+This file captures vision-level work — items that span multiple PRs, require
+architecture decisions before code, or are nice-to-have improvements not yet
+committed to as work.
+
+---
+
+## Animation system completion
+
+**Status:** Phases 0–2 landed. Animator runtime parses controllers, drives
+state machines, and supports 1D blend trees via `runtime/animator_runtime.luau`
++ `animation_converter.py`. Phases 3–5 are open.
+
+### Phase 3 — `KeyframeSequence` export
+
+Generate `KeyframeSequence` XML nodes in the rbxlx so animations are part
+of the place file rather than referenced by external asset ID. Closest to
+self-contained output. The alternative (bulk-uploading via `cloud_api.py`
+to get asset IDs) works but adds an upload step and asset count.
+
+Trade-off: KeyframeSequence is a heavy XML structure, but it's deterministic
+and round-trips correctly.
+
+### Phase 4 — Pipeline integration polish
+
+The animation phase is wired in but doesn't yet:
+- Aggregate animator controller GUIDs from `PrefabTemplate` (only scenes do
+  this today; prefab-only references fall back to unscoped naming — see
+  TODO "Prefab-scoped animator controller GUID aggregation")
+- Emit per-prefab tween scripts for transform-only animations (only
+  per-scene today)
+
+### Phase 5 — Advanced features (out of scope until needed)
+
+- **2D blend trees (freeform)** — Cartesian / directional blending with
+  Delaunay triangulation. Currently surfaced to `UNCONVERTED.md` with the
+  first leaf clip used as fallback.
+- **Animation layers + avatar masks** — Roblox has no per-bone masking;
+  would need per-bone track splitting or `AnimationTrack.Priority` games.
+- **Root motion extraction** — Separate root bone curves → apply as
+  `HumanoidRootPart` movement.
+- **Inverse kinematics** — Would require a full IK solver in Luau.
+  Out of scope.
+
+---
+
+## Asset upload pipeline refactor
+
+The current upload path (`roblox/cloud_api.py`) does not deduplicate by
+content hash. Identical textures with different filenames re-upload every
+time, costing both wall time and Roblox quota.
+
+### Content-hash deduplication
+
+For each `.glb` / `.png` / `.ogg` file:
+
+1. Hash content (SHA-256) before uploading.
+2. Store `{content_hash: roblox_asset_id}` in `.roblox_ids.json` alongside
+   the existing filename-keyed cache.
+3. Before uploading, check if hash already exists → skip upload, reuse
+   asset ID.
+
+Estimated savings on a re-run of SimpleFPS: 175 meshes × ~3s upload latency
+= 9+ minutes that becomes near-zero on cache hit.
+
+### Open Cloud asset audit baked into the pipeline
+
+`u2r.py audit-assets` exists and surfaces asset moderation rejections, but
+it's a separate command. Wiring it into `upload_assets` so rejected IDs
+never reach the rbxlx writer is the natural next step. Tracked as a
+follow-up note in archive (under "P0 — Animation asset 404 audit not run").
+
+---
+
+## Custom serializer evaluation: rbx-dom or rbxmk
+
+The current `rbxlx_writer.py` reimplements Roblox's binary format. The
+research suggests rbx-dom is "the definitive industry standard" — our
+serializer misses internal properties (confirmed: `MeshPart.MeshId` set in
+XML is ignored by Studio).
+
+### Current workaround
+
+`InsertService:LoadAsset()` at runtime bypasses the serializer for meshes
+entirely. The serializer only handles simple properties (scripts, lighting,
+spawn points) which it does correctly.
+
+### Why this is low priority
+
+Since meshes load via InsertService, the serializer only writes the place
+shell. For that use case it works fine. Replacing with rbxmk adds a Go
+binary dependency for marginal benefit.
+
+### When to revisit
+
+- If the runtime LoadAsset approach starts hitting quota / rate-limit walls
+  at scale.
+- If a future Roblox API change makes more properties serializer-only.
+- If we want true headless place generation without Studio MCP for asset
+  resolution.
+
+---
+
+## Type discipline across the whole repo
+
+The forward-only no-Any gate (PR #10) prevents new smuggling. The next
+strategic step is bringing the existing offenders under the principle:
+
+### Phase A — promote one file at a time
+
+Each cleanup PR picks one file in the typed core (`pipeline.py`,
+`scene_converter.py`, `code_transpiler.py`, etc.), tightens its `Any`
+annotations to real types, and verifies via `mypy --strict` or `pyright
+strict` on that file alone.
+
+This is grunt work, but compounds: every promoted file makes the next
+easier (typed values flowing in mean fewer `Any` widening at the boundary).
+
+### Phase B — repo-wide type checker in CI
+
+Once the pile of `Any` is small enough, add `pyright` (or `mypy --strict`)
+as a CI gate. Initially scoped to `core/`, `unity/`, `roblox/` — the
+"data" layer. Then `converter/` (the orchestration layer) once that's
+clean.
+
+This is tracked at the file-by-file level in `TODO.md` § "Type-strictness
+debt." This entry captures the strategic sequencing.
+
+---
+
+## Cross-script shared-state linter
+
+**Status:** Tracked in `TODO.md` as a P1 item, captured here because it's
+strategically larger than a typical bug fix.
+
+The PR 4 dependency-aware-context work showed that the AI transpiler can
+ignore prompt rules about cross-script state coordination (see archive:
+"Cross-script shared-state gap — prompt iteration insufficient"). The
+right fix is a post-transpile linter, not more prompt iteration.
+
+The linter would walk every generated `.luau` and find
+`:GetAttribute("X")` calls with no matching `:SetAttribute("X")` anywhere
+in the corpus AND a matching exported getter. Then either:
+
+- **(a) Auto-rewrite** — strict, requires high confidence in detection.
+- **(b) Surface to `UNCONVERTED.md`** — safer first landing.
+
+Option (b) until we have a regression corpus, then graduate to (a).
+
+---
+
+## Standalone `.rbxm` per-prefab output
+
+Source repo had `write_rbxm_package()` for emitting prefabs as standalone
+Roblox model files. Useful for Roblox Toolbox / sharing individual prefabs
+without the whole place. Not needed at runtime — gameplay uses the
+`ReplicatedStorage.Templates` path instead.
+
+Tracked as a small TODO; could expand into a richer per-prefab export
+flow if a use case emerges (e.g. "export this Unity prefab as a Toolbox-
+ready model" CLI command).
+
+---
+
+## Persistent prefab/asset cache
+
+The prefab library is rebuilt from disk on every conversion. SQLite or
+pickle cache keyed by `(GUID, mtime)` would halve pipeline time for
+multi-scene projects and large games.
+
+Tracked as a P2 in `TODO.md`. Captured here because the cache schema
+needs a design pass before code (what gets cached, invalidation strategy,
+migration).
+
+---
+
+## NavMesh advanced features
+
+The current `nav_mesh_runtime.luau` provides `PathfindingService`-backed
+movement for `NavMeshAgent`. Advanced cases not covered:
+
+- **Off-mesh links** — Unity NavMesh supports manually-defined connections
+  (jumping gaps, climbing ladders). Not preserved.
+- **Area costs** — Unity NavMesh supports per-area cost tweaking
+  (e.g. roads cheaper than grass). Not surfaced to PathfindingService
+  modifiers.
+- **Dynamic carving** — `NavMeshObstacle` with carving on. Currently the
+  obstacle metadata is captured as attributes but no runtime re-bake.
+
+Revisit if a project ships AI navigation that depends on these features.

@@ -107,4 +107,6 @@ Each cleanup is a separate small PR that brings one file under the principle.
 ---
 
 For platform limitations, Unity features with no Roblox equivalent, and Open
-Cloud API limits, see the **Known Limitations** section in `CLAUDE.md`.
+Cloud API limits, see [`docs/UNSUPPORTED.md`](docs/UNSUPPORTED.md). For
+architectural debt and bug-shaped gaps, see [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
+For long-horizon strategic work, see [`docs/FUTURE_IMPROVEMENTS.md`](docs/FUTURE_IMPROVEMENTS.md).
