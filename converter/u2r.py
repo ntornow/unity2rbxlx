@@ -294,34 +294,60 @@ def publish(
         # rebuild-from-fully-uploaded-state workflow.
         pipeline.run_through("extract_assets")
 
+        # Mirror upload_assets's eligibility filter: extensions per kind,
+        # blocklist entries from .upload_blocklist, and the dedupe against
+        # ctx.uploaded_assets. Without matching that filter, this precheck
+        # would false-positive on output dirs whose pending assets are
+        # blocklisted or whose extensions aren't supported uploads.
+        UPLOADABLE_EXTENSIONS = {
+            "texture": {".png", ".jpg", ".jpeg", ".bmp", ".tga", ".tif", ".tiff", ".psd"},
+            "mesh": {".fbx", ".obj"},
+            "audio": {".mp3", ".ogg", ".wav", ".flac"},
+        }
+        blocklist: set[str] = set()
+        blocklist_file = output_path / ".upload_blocklist"
+        if blocklist_file.exists():
+            blocklist = {
+                line.strip() for line in blocklist_file.read_text().splitlines()
+                if line.strip() and not line.startswith("#")
+            }
+
         manifest = pipeline.state.asset_manifest
         pending_uploads: list = []
-        needs_mesh_resolution = False
+        unresolved_uploaded_meshes: list[str] = []
         if manifest is not None:
-            uploadable_kinds = {"texture", "mesh", "audio"}
             already_uploaded = set(pipeline.ctx.uploaded_assets.keys())
-            has_mesh_asset = False
             for asset in manifest.assets:
-                if asset.kind not in uploadable_kinds:
+                exts = UPLOADABLE_EXTENSIONS.get(asset.kind)
+                if exts is None or asset.path.suffix.lower() not in exts:
                     continue
-                if asset.kind == "mesh":
-                    has_mesh_asset = True
-                if str(asset.relative_path) in already_uploaded:
+                rel = str(asset.relative_path)
+                if rel in already_uploaded or rel in blocklist:
                     continue
                 pending_uploads.append(asset)
-            # resolve_assets needs creator_id too — if mesh assets exist but
-            # the resolution table is empty, the rebuild will silently ship
-            # placeholder MeshIds without a creator_id.
-            needs_mesh_resolution = (
-                has_mesh_asset and not pipeline.ctx.mesh_native_sizes
-            )
+            # resolve_assets needs creator_id when mesh uploads have not all
+            # been resolved. Comparing counts against the on-disk resolution
+            # table catches the partial-resolution case where the previous
+            # heuristic (just "is mesh_native_sizes empty?") would let a
+            # publish ship placeholder MeshIds for the unresolved ones.
+            uploaded_meshes = [
+                p for p in pipeline.ctx.uploaded_assets
+                if p.lower().endswith((".fbx", ".obj"))
+                and p not in blocklist
+            ]
+            resolved = pipeline.ctx.mesh_native_sizes
+            unresolved_uploaded_meshes = [
+                p for p in uploaded_meshes if p not in resolved
+            ]
 
-        if (pending_uploads or needs_mesh_resolution) and config.ROBLOX_CREATOR_ID is None:
+        if (pending_uploads or unresolved_uploaded_meshes) and config.ROBLOX_CREATOR_ID is None:
             reasons = []
             if pending_uploads:
                 reasons.append(f"{len(pending_uploads)} assets need upload")
-            if needs_mesh_resolution:
-                reasons.append("mesh resolution not yet performed")
+            if unresolved_uploaded_meshes:
+                reasons.append(
+                    f"{len(unresolved_uploaded_meshes)} uploaded meshes not yet resolved"
+                )
             click.echo(
                 f"ERROR: {' and '.join(reasons)}, but --creator-id "
                 "(or ROBLOX_CREATOR_ID) is not set. Pass --creator-id, "

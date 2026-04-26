@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from roblox.id_cache import read_ids, write_ids, CANONICAL, LEGACY
 from roblox.place_publisher import (
     CHUNKS_FILENAME,
     MAX_EXECUTE_LUAU_BYTES,
@@ -191,6 +192,45 @@ class TestSizeGuard:
         assert result.success is False
         assert result.exceeded_limit is True
         assert called == [], "execute_luau must not be called when oversized"
+
+
+class TestIdCacheMtimePriority:
+    """When both .roblox_ids.json and resolve_ids.json exist (migration
+    state), pick the most recently modified file. Returning the canonical
+    file unconditionally would silently route publishes to the previous
+    experience whenever the legacy file holds the freshest retarget.
+    Regression flagged by Codex review on the v2 branch.
+    """
+
+    def test_legacy_newer_than_canonical_wins(self, tmp_path):
+        import os
+        # Older canonical
+        (tmp_path / CANONICAL).write_text(
+            json.dumps({"universe_id": 100, "place_id": 200})
+        )
+        os.utime(tmp_path / CANONICAL, (1000, 1000))
+        # Newer legacy (later mtime → freshest retarget)
+        (tmp_path / LEGACY).write_text(
+            json.dumps({"universe_id": 999, "place_id": 888})
+        )
+        os.utime(tmp_path / LEGACY, (5000, 5000))
+
+        uid, pid = read_ids(tmp_path)
+        assert (uid, pid) == (999, 888), "must prefer freshest mtime"
+
+    def test_canonical_newer_than_legacy_wins(self, tmp_path):
+        import os
+        (tmp_path / LEGACY).write_text(
+            json.dumps({"universe_id": 100, "place_id": 200})
+        )
+        os.utime(tmp_path / LEGACY, (1000, 1000))
+        (tmp_path / CANONICAL).write_text(
+            json.dumps({"universe_id": 999, "place_id": 888})
+        )
+        os.utime(tmp_path / CANONICAL, (5000, 5000))
+
+        uid, pid = read_ids(tmp_path)
+        assert (uid, pid) == (999, 888)
 
 
 class TestPublishCachedChunksRespectsSizeGuard:

@@ -27,24 +27,34 @@ LEGACY = "resolve_ids.json"
 def read_ids(output_dir: Path) -> tuple[int | None, int | None]:
     """Return (universe_id, place_id) from the cache, or (None, None) if absent.
 
-    Tries the canonical file first; falls back to the legacy filename so older
-    output directories keep working until the next successful publish rewrites
-    the cache to the canonical name.
+    On migrated output directories both ``.roblox_ids.json`` and
+    ``resolve_ids.json`` may exist — older runs of ``u2r publish`` /
+    interactive ``upload`` updated only the legacy file after a retarget,
+    while ``resolve_assets`` only ever wrote the canonical one. Returning
+    the canonical entry unconditionally would silently route publishes to
+    the previous experience, so we pick the file with the most recent
+    mtime when both are valid.
     """
+    candidates: list[tuple[float, int, int]] = []
     for name in (CANONICAL, LEGACY):
         path = output_dir / name
         if not path.exists():
             continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
+            mtime = path.stat().st_mtime
         except (json.JSONDecodeError, OSError) as exc:
             log.warning("id_cache: could not read %s: %s", path.name, exc)
             continue
         uid = data.get("universe_id")
         pid = data.get("place_id")
         if uid and pid:
-            return int(uid), int(pid)
-    return None, None
+            candidates.append((mtime, int(uid), int(pid)))
+
+    if not candidates:
+        return None, None
+    candidates.sort(reverse=True)  # newest mtime first
+    return candidates[0][1], candidates[0][2]
 
 
 def write_ids(output_dir: Path, universe_id: int, place_id: int) -> Path:

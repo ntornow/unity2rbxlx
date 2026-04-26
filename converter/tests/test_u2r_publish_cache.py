@@ -179,6 +179,95 @@ class TestRobloxIdsCacheTiming:
             f"expected creator-id error for pending uploads, got:\n{result.output[:1500]}"
         )
 
+    def test_publish_rebuild_skips_blocklisted_assets_in_pending_check(
+        self, tmp_path, monkeypatch,
+    ):
+        """A manifest asset that's in .upload_blocklist should not count as
+        pending — upload_assets won't actually upload it. The publish
+        precheck must mirror upload_assets's filter or it false-positives
+        the creator_id requirement on output dirs whose only "pending"
+        asset is blocklisted. Regression caught by Codex.
+        """
+        import config as _config
+        monkeypatch.setattr(_config, "ROBLOX_API_KEY", "")
+        monkeypatch.setattr(_config, "ROBLOX_CREATOR_ID", None)
+        monkeypatch.delenv("ROBLOX_API_KEY", raising=False)
+        monkeypatch.delenv("ROBLOX_CREATOR_ID", raising=False)
+
+        unity = tmp_path / "FakeProject"
+        (unity / "Assets").mkdir(parents=True)
+        out = tmp_path / "out"
+        out.mkdir()
+
+        from converter import pipeline as _pl_mod
+        from core.conversion_context import ConversionContext
+        from core.unity_types import AssetEntry, AssetManifest
+
+        # Manifest has a blocklisted texture; nothing else to upload.
+        ctx_obj = ConversionContext(unity_project_path=str(unity.resolve()))
+        ctx_obj.save(out / "conversion_context.json")
+        (out / ".upload_blocklist").write_text("Assets/blocked.png\n")
+
+        ran_publish = []
+
+        class _PState:
+            asset_manifest = AssetManifest(
+                project_root=unity,
+                assets=[AssetEntry(
+                    path=unity / "Assets" / "blocked.png",
+                    relative_path=Path("Assets/blocked.png"),
+                    kind="texture",
+                    size_bytes=100,
+                )],
+                total_size_bytes=100,
+            )
+            rbx_place = object()
+
+        class _StubPipeline:
+            ESSENTIAL_PHASES = _pl_mod.Pipeline.ESSENTIAL_PHASES
+            def __init__(self, *, unity_project_path, output_dir, **_):
+                self.unity_project_path = Path(unity_project_path).resolve()
+                self.output_dir = Path(output_dir).resolve()
+                self.ctx = ctx_obj
+                self.state = _PState()
+            def run_through(self, *a, **k):
+                pass
+
+        monkeypatch.setattr(_pl_mod, "Pipeline", _StubPipeline)
+
+        from roblox import place_publisher
+        from roblox.place_publisher import PublishResult
+        monkeypatch.setattr(
+            place_publisher, "publish_place",
+            lambda *a, **kw: ran_publish.append(True) or PublishResult(
+                success=True, chunks=1, total_bytes=10,
+                script_path=Path(a[4]) / "place_builder.luau",
+            ),
+        )
+        monkeypatch.setattr(
+            place_publisher, "publish_cached_chunks",
+            lambda *a, **kw: None,
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "publish", str(out),
+                "--api-key", "stub",
+                "--universe-id", "1",
+                "--place-id", "2",
+            ],
+            catch_exceptions=False,
+        )
+
+        # Must not demand creator-id when the only pending asset is blocklisted.
+        assert "creator-id" not in result.output.lower() and "creator_id" not in result.output.lower(), (
+            f"creator-id wrongly demanded for blocklisted-only pending list:\n"
+            f"{result.output[:1500]}"
+        )
+        assert ran_publish, "should reach publish_place — no pending uploads after blocklist filter"
+
     def test_publish_rebuild_does_not_demand_creator_id_when_nothing_pending(
         self, tmp_path, monkeypatch,
     ):
