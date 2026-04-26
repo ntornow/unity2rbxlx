@@ -23,8 +23,14 @@ from core.unity_types import (
     AssetManifest,
     GuidIndex,
     ParsedScene,
+    PrefabLibrary,
 )
 from core.roblox_types import RbxPlace
+from converter.animation_converter import AnimationConversionResult
+from converter.code_transpiler import TranspilationResult
+from converter.material_mapper import MaterialMapping
+from converter.scriptable_object_converter import AssetConversionResult
+from converter.sprite_extractor import SpriteExtractionResult
 
 log = logging.getLogger(__name__)
 
@@ -67,14 +73,14 @@ class PipelineState:
     guid_index: GuidIndex | None = None
     parsed_scene: ParsedScene | None = None
     asset_manifest: AssetManifest | None = None
-    material_mappings: dict[str, Any] = field(default_factory=dict)
-    transpilation_result: Any = None
-    animation_result: Any = None
+    material_mappings: dict[str, MaterialMapping] = field(default_factory=dict)
+    transpilation_result: TranspilationResult | None = None
+    animation_result: AnimationConversionResult | None = None
     rbx_place: RbxPlace | None = None
-    prefab_library: Any = None
+    prefab_library: PrefabLibrary | None = None
     dependency_map: dict[str, list[str]] = field(default_factory=dict)
-    scriptable_objects: Any = None
-    sprite_result: Any = None
+    scriptable_objects: AssetConversionResult | None = None
+    sprite_result: SpriteExtractionResult | None = None
 
 
 class Pipeline:
