@@ -52,6 +52,8 @@ import click
 import config
 from converter.pipeline import PHASES, Pipeline
 from core.conversion_context import ConversionContext
+from utils.credentials import resolve_credential as _resolve_credential
+from utils.script_cache import scripts_cache_intact
 
 log = logging.getLogger(__name__)
 
@@ -84,40 +86,6 @@ SKILL_TO_PIPELINE_PHASE: dict[str, str] = {
 }
 
 STATE_FILENAME = ".convert_state.json"
-
-# Roblox Open Cloud execute_luau accepts scripts up to ~4MB. Place-builder
-# scripts larger than this must fall back to the runtime MeshLoader path.
-MAX_EXECUTE_LUAU_BYTES = 4_000_000
-
-
-def _resolve_credential(
-    cli_value: str | None,
-    env_var: str,
-    filename: str,
-    project_path: Path,
-) -> str | None:
-    """Resolve a Roblox Open Cloud credential: CLI arg, env var, then file.
-
-    Duplicates u2r._resolve_credential to avoid importing u2r's click app
-    (which registers side-effecting command decorators at import time).
-    If a shared utils module is added later, both callers should move to it.
-    """
-    import os
-
-    if cli_value:
-        p = Path(cli_value)
-        return p.read_text().strip() if p.is_file() else cli_value.strip()
-
-    val = os.environ.get(env_var, "")
-    if val:
-        return val.strip()
-
-    for search_dir in [project_path.parent, project_path.parent.parent, Path.cwd()]:
-        fp = search_dir / filename
-        if fp.exists():
-            return fp.read_text().strip()
-
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -225,43 +193,26 @@ def _make_pipeline(
     return pipeline
 
 
+# Cloud-side-effect phases are NEVER run as prerequisites for a review-only
+# command like materials/transpile/validate. They hit Roblox Open Cloud and
+# would leak quota/money on every silent invocation. Only the `assemble`
+# skill phase is allowed to run them, by NOT passing them in `skip`.
+_CLOUD_SIDE_EFFECT_PHASES: frozenset[str] = frozenset({
+    "upload_assets", "resolve_assets",
+})
+
+
 def _run_through(pipeline: Pipeline, target_phase: str) -> None:
     """Run prerequisite phases then ``target_phase`` — but nothing after.
 
-    This mirrors :meth:`Pipeline.resume` except it stops at *target_phase*
-    instead of running everything to the end.  ``essential_phases`` are
-    re-run unconditionally because they produce in-memory state in
-    ``pipeline.state`` that is not persisted to disk.
-
-    ``cloud_side_effect_phases`` (``upload_assets``, ``resolve_assets``) are
-    *never* run as prerequisites — they touch the Roblox Open Cloud API and
-    must only run when explicitly targeted by the ``assemble`` skill phase.
-    Running them as silent prerequisites to ``materials`` or ``transpile``
-    would leak quota / money on every review-phase invocation.
+    Thin wrapper around :meth:`Pipeline.run_through` that excludes the cloud
+    side-effect phases as silent prerequisites.
     """
     if target_phase not in PHASES:
         raise click.UsageError(
             f"Unknown pipeline phase '{target_phase}'. Valid: {PHASES}"
         )
-
-    essential_phases = {
-        "parse",
-        "extract_assets",
-        "convert_materials",
-        "transpile_scripts",
-        "convert_animations",
-        "convert_scene",
-    }
-    cloud_side_effect_phases = {"upload_assets", "resolve_assets"}
-    target_idx = PHASES.index(target_phase)
-    for prior in PHASES[:target_idx]:
-        if prior in cloud_side_effect_phases:
-            # Only `assemble` is allowed to run these; never as a prerequisite
-            # for a review phase like `materials` or `transpile`.
-            continue
-        if prior in essential_phases or prior not in pipeline.ctx.completed_phases:
-            pipeline._run_phase(prior)
-    pipeline._run_phase(target_phase)
+    pipeline.run_through(target_phase, skip=_CLOUD_SIDE_EFFECT_PHASES)
 
 
 def _next_skill_phase(completed: list[str]) -> str | None:
@@ -757,9 +708,14 @@ def assemble(unity_project_path: str, output_dir: str,
     if resolved_cid:
         config.ROBLOX_CREATOR_ID = int(resolved_cid)
 
-    # Fail fast when uploads are intended but creds can't be found. Running
-    # the whole pipeline just to emit a meaningless success=True with zero
-    # uploads wastes the user's time and hides the real problem.
+    # Fail fast when uploads are intended but creds can't be found.
+    # Reliably detecting "this rerun has no new cloud work" requires
+    # comparing the on-disk asset manifest against ctx.uploaded_assets,
+    # which we don't have until extract_assets runs. Rather than guess
+    # with a heuristic that misses new assets, we ask users to pass
+    # ``--no-upload`` explicitly when they want an offline rerun against
+    # an already-published output directory. That's the same flag they'd
+    # use for a fresh offline conversion, so it's discoverable.
     if not no_upload and (
         not config.ROBLOX_API_KEY or config.ROBLOX_CREATOR_ID is None
     ):
@@ -768,7 +724,8 @@ def assemble(unity_project_path: str, output_dir: str,
             "--creator-id, set ROBLOX_API_KEY and ROBLOX_CREATOR_ID env "
             "vars, place 'apikey' and 'creator_id' files in the Unity "
             "project parent or current working directory, or pass "
-            "--no-upload to skip asset upload."
+            "--no-upload to skip asset upload (use this when reassembling "
+            "an output directory whose uploads are already complete)."
         ]})
         sys.exit(1)
 
@@ -776,23 +733,27 @@ def assemble(unity_project_path: str, output_dir: str,
     pipeline._retranspile = retranspile
 
     # When transpile_scripts already ran and --retranspile is not set, skip
-    # re-transpilation so hand-edited Luau scripts are preserved.
-    skip_transpile = (
+    # re-transpilation so hand-edited Luau scripts are preserved. But only
+    # if the on-disk cache survived: an archived/partially-copied output
+    # dir without scripts/ would otherwise rehydrate nothing.
+    out_path = Path(output_dir).resolve()
+    skip: set[str] = set()
+    if (
         not retranspile
         and "transpile_scripts" in pipeline.ctx.completed_phases
-    )
+        and scripts_cache_intact(out_path, pipeline.ctx.transpiled_scripts)
+    ):
+        skip.add("transpile_scripts")
+    if no_resolve:
+        skip.add("resolve_assets")
+    # Cloud side-effect phases must re-run on every assemble invocation so
+    # a retry after fixing creds / changing assets actually re-uploads,
+    # rather than skipping because completed_phases lists them. Each phase
+    # self-gates on ``--no-upload`` / missing creds, so listing them here
+    # is safe even when uploads should no-op.
+    force_rerun = {"moderate_assets", "upload_assets", "resolve_assets"}
     try:
-        for phase in [
-            "parse", "extract_assets", "moderate_assets",
-            "upload_assets", "resolve_assets",
-            "convert_materials", "transpile_scripts", "convert_animations",
-            "convert_scene", "write_output",
-        ]:
-            if no_resolve and phase == "resolve_assets":
-                continue
-            if skip_transpile and phase == "transpile_scripts":
-                continue
-            pipeline._run_phase(phase)
+        pipeline.run_through("write_output", skip=skip, force_rerun=force_rerun)
     except Exception as exc:
         _emit({"phase": "assemble", "success": False, "errors": [str(exc)]})
         sys.exit(1)
@@ -869,13 +830,21 @@ def upload(output_dir: str, api_key: str | None,
         sys.exit(1)
 
     # Resolve universe/place IDs from, in priority order:
-    #   1. CLI flags                           (user override)
-    #   2. Persisted ConversionContext          (set by pipeline.resolve_assets
-    #                                            when it auto-creates an experience)
-    #   3. ``.roblox_ids.json``                 (written by pipeline.resolve_assets
-    #                                            as the canonical ID cache)
-    #   4. ``resolve_ids.json``                 (legacy cache written by this CLI)
+    #   1. CLI flags                  (user override)
+    #   2. shared roblox.id_cache      (.roblox_ids.json, with legacy fallback)
+    #   3. Persisted ConversionContext (older snapshot)
+    #
+    # The shared cache wins over ctx because ``u2r publish`` updates the
+    # cache after a successful retarget but does not always update ctx in
+    # the same output dir. Reading ctx first would silently route a later
+    # interactive ``upload`` to the previous experience.
+    from roblox.id_cache import read_ids
     uid, pid = universe_id, place_id
+
+    if not uid or not pid:
+        cached_uid, cached_pid = read_ids(out)
+        uid = uid or cached_uid
+        pid = pid or cached_pid
 
     if not uid or not pid:
         try:
@@ -884,19 +853,6 @@ def upload(output_dir: str, api_key: str | None,
             pid = pid or prior_ctx.place_id
         except Exception as exc:  # noqa: BLE001 — surfaced to user below if still missing
             log.debug("upload: could not read ctx for id fallback: %s", exc)
-
-    ids_file = out / "resolve_ids.json"
-    for cache_path in (out / ".roblox_ids.json", ids_file):
-        if uid and pid:
-            break
-        if not cache_path.exists():
-            continue
-        try:
-            cached = json.loads(cache_path.read_text(encoding="utf-8"))
-            uid = uid or cached.get("universe_id")
-            pid = pid or cached.get("place_id")
-        except (json.JSONDecodeError, OSError) as exc:
-            log.warning("upload: could not read %s: %s", cache_path.name, exc)
 
     if not uid or not pid:
         _emit({
@@ -917,20 +873,21 @@ def upload(output_dir: str, api_key: str | None,
     pipeline.ctx.universe_id = uid
     pipeline.ctx.place_id = pid
 
-    # If transpile_scripts was already completed in a prior run, skip it
-    # so user's hand-edited Luau files in output_dir/scripts/ are preserved
-    # (the write_output phase rehydrates them from disk automatically).
-    phases = [
-        "parse", "extract_assets", "convert_materials",
-        "transpile_scripts", "convert_animations", "convert_scene",
-        "write_output",
-    ]
-    if "transpile_scripts" in pipeline.ctx.completed_phases:
-        phases = [p for p in phases if p != "transpile_scripts"]
-
+    # Rebuild rbx_place via the pipeline. Cloud side-effect phases
+    # (moderate_assets, upload_assets, resolve_assets) are skipped because
+    # `upload` re-publishes existing state, not re-uploads. transpile_scripts
+    # is skipped if already completed AND the on-disk script cache survived
+    # so hand-edited Luau in <output>/scripts/ is preserved (write_output
+    # rehydrates from disk). Without the cache check, an archived output
+    # dir without scripts/ would publish a place with no scripts.
+    skip: set[str] = {"moderate_assets", "upload_assets", "resolve_assets"}
+    if (
+        "transpile_scripts" in pipeline.ctx.completed_phases
+        and scripts_cache_intact(out, pipeline.ctx.transpiled_scripts)
+    ):
+        skip.add("transpile_scripts")
     try:
-        for phase in phases:
-            pipeline._run_phase(phase)
+        pipeline.run_through("write_output", skip=skip)
     except Exception as exc:
         _emit({"phase": "upload", "success": False,
                "errors": [f"Failed to rebuild scene state: {exc}"]})
@@ -942,47 +899,28 @@ def upload(output_dir: str, api_key: str | None,
                "errors": ["rbx_place is empty after rebuilding scene state."]})
         sys.exit(1)
 
-    from roblox.cloud_api import execute_luau
-    from roblox.luau_place_builder import generate_place_luau_chunked
+    from roblox.place_publisher import publish_place
 
-    chunks = generate_place_luau_chunked(rbx_place)
-    total_size = sum(len(c) for c in chunks)
-
-    script_file = out / "place_builder.luau"
-    script_file.write_text("\n\n".join(chunks) if len(chunks) > 1 else chunks[0])
-
-    if total_size > MAX_EXECUTE_LUAU_BYTES:
-        _emit({
-            "phase": "upload",
-            "success": False,
-            "errors": [
-                f"Place builder script exceeds {MAX_EXECUTE_LUAU_BYTES // 1_000_000}MB limit "
-                f"({total_size/1024/1024:.1f} MB). "
-                "Use the local rbxlx with the runtime MeshLoader instead."
-            ],
-            "script_path": str(script_file),
-        })
-        sys.exit(1)
-
-    chunk_results: list[dict] = []
-    all_ok = True
-    for i, chunk in enumerate(chunks):
-        log.info("Executing place builder chunk %d/%d", i + 1, len(chunks))
-        result = execute_luau(
-            config.ROBLOX_API_KEY, uid, pid, chunk, timeout="300s",
-        )
-        ok = result is not None
-        chunk_results.append({"chunk": i + 1, "ok": ok})
-        if not ok:
-            all_ok = False
-            break
+    publish_result = publish_place(
+        config.ROBLOX_API_KEY, uid, pid, rbx_place, out,
+    )
 
     pipeline.ctx.save(_context_path(out))
 
-    if all_ok:
+    if publish_result.exceeded_limit:
+        _emit({
+            "phase": "upload",
+            "success": False,
+            "errors": [publish_result.error],
+            "script_path": str(publish_result.script_path),
+        })
+        sys.exit(1)
+
+    if publish_result.success:
         # Only cache universe/place IDs after a successful publish — avoids
         # persisting bad IDs that would be silently reused next run.
-        ids_file.write_text(json.dumps({"universe_id": uid, "place_id": pid}))
+        from roblox.id_cache import write_ids
+        write_ids(out, uid, pid)
         _mark_skill_phase(out, "upload",
                           universe_id=uid, place_id=pid,
                           success=True)
@@ -994,19 +932,19 @@ def upload(output_dir: str, api_key: str | None,
         state["last_upload_failure"] = {
             "universe_id": uid,
             "place_id": pid,
-            "chunks": len(chunks),
+            "chunks": publish_result.chunks,
         }
         _save_skill_state(out, state)
 
     _emit({
         "phase": "upload",
-        "success": all_ok,
+        "success": publish_result.success,
         "universe_id": uid,
         "place_id": pid,
-        "chunks": len(chunks),
-        "script_size_kb": round(total_size / 1024, 1),
-        "script_path": str(script_file),
-        "chunk_results": chunk_results,
+        "chunks": publish_result.chunks,
+        "script_size_kb": round(publish_result.total_bytes / 1024, 1),
+        "script_path": str(publish_result.script_path),
+        "chunk_results": publish_result.chunk_results,
         "warning": (
             "Publishing a fresh rebuild of the scene, not the local .rbxlx. "
             "Any manual edits to converted_place.rbxlx or place_builder.luau "

@@ -1,0 +1,184 @@
+"""
+test_place_publisher.py -- chunk-cache + size-guard semantics for the
+shared headless publish helper.
+
+Regression coverage for two real bugs caught on previous review passes:
+
+1. ``u2r publish`` used to read ``place_builder.luau`` (the human-readable
+   join of all chunks) and feed it to ``execute_luau`` as one ~4 MB+ blob,
+   silently failing for big places. The fix is the chunk-cache JSON used
+   here so re-publish runs through the size-guarded chunked path.
+
+2. The first refactor regressed the ability to republish from an output
+   directory whose Unity project is gone. ``publish_cached_chunks`` is the
+   fast path that restores that workflow.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from roblox.place_publisher import (
+    CHUNKS_FILENAME,
+    MAX_EXECUTE_LUAU_BYTES,
+    PublishResult,
+    publish_cached_chunks,
+    publish_place,
+)
+
+
+class _StubExecuteLuau:
+    """Records each (uid, pid, script_len) call; returns a non-None token
+    so the publish loop sees success."""
+
+    def __init__(self):
+        self.calls: list[tuple[int, int, int]] = []
+
+    def __call__(self, api_key, uid, pid, script, *, timeout="300s"):
+        self.calls.append((uid, pid, len(script)))
+        return {"ok": True}
+
+
+class TestPublishCachedChunks:
+    def test_returns_none_when_cache_absent(self, tmp_path):
+        result = publish_cached_chunks("k", 1, 2, tmp_path)
+        assert result is None
+
+    def test_replays_cached_chunks(self, tmp_path, monkeypatch):
+        from roblox import place_publisher
+
+        chunks = ["chunk-one", "chunk-two", "chunk-three"]
+        (tmp_path / CHUNKS_FILENAME).write_text(json.dumps(chunks))
+
+        stub = _StubExecuteLuau()
+        monkeypatch.setattr(
+            place_publisher, "_publish_chunks",
+            lambda api_key, uid, pid, chs, script_path, *, timeout: PublishResult(
+                success=True,
+                chunks=len(chs),
+                total_bytes=sum(len(c) for c in chs),
+                script_path=script_path,
+                chunk_results=[{"chunk": i + 1, "ok": True} for i in range(len(chs))],
+            ),
+        )
+
+        result = publish_cached_chunks("k", 1, 2, tmp_path)
+        assert result is not None
+        assert result.success
+        assert result.chunks == 3
+        assert result.total_bytes == sum(len(c) for c in chunks)
+
+    def test_corrupt_cache_returns_none(self, tmp_path):
+        (tmp_path / CHUNKS_FILENAME).write_text("not json {{")
+        assert publish_cached_chunks("k", 1, 2, tmp_path) is None
+
+    def test_wrong_shape_cache_returns_none(self, tmp_path):
+        (tmp_path / CHUNKS_FILENAME).write_text(json.dumps({"not": "a list"}))
+        # No legacy script either, so this returns None (fall through to rebuild).
+        assert publish_cached_chunks("k", 1, 2, tmp_path) is None
+
+    def test_legacy_script_fallback_when_chunks_json_missing(self, tmp_path, monkeypatch):
+        """Output dirs from before the chunk cache existed still have
+        ``place_builder.luau``. Republishing those must work without a
+        Pipeline rebuild — the regression flagged by Codex round 2.
+        """
+        (tmp_path / "place_builder.luau").write_text("legacy single-chunk script")
+
+        called: list[tuple] = []
+        monkeypatch.setattr(
+            "roblox.cloud_api.execute_luau",
+            lambda *a, **kw: called.append(a) or {"ok": True},
+        )
+
+        result = publish_cached_chunks("k", 1, 2, tmp_path)
+        assert result is not None
+        assert result.success
+        assert result.chunks == 1
+        assert len(called) == 1, "must execute legacy script through the chunked path"
+
+    def test_legacy_oversized_script_fails_loudly(self, tmp_path, monkeypatch):
+        """A legacy place_builder.luau >4MB used to silently fail at runtime
+        because the old ``publish`` ran one ``execute_luau`` with no size
+        guard. Now the size guard catches it and the user gets a clear
+        error directing them to re-convert.
+        """
+        big = "x" * (MAX_EXECUTE_LUAU_BYTES + 1)
+        (tmp_path / "place_builder.luau").write_text(big)
+
+        called: list[tuple] = []
+        monkeypatch.setattr(
+            "roblox.cloud_api.execute_luau",
+            lambda *a, **kw: called.append(a) or {"ok": True},
+        )
+
+        result = publish_cached_chunks("k", 1, 2, tmp_path)
+        assert result is not None
+        assert result.success is False
+        assert result.exceeded_limit is True
+        assert called == [], "must not call execute_luau on oversized legacy script"
+
+
+class TestPublishPlaceWritesCache:
+    """``publish_place`` MUST write ``place_builder_chunks.json`` so a later
+    ``u2r publish`` can replay without rebuilding from the Unity project.
+    """
+
+    def test_chunks_cache_written_on_publish(self, tmp_path, monkeypatch):
+        from roblox import place_publisher
+
+        fake_chunks = ["a" * 100, "b" * 200]
+        monkeypatch.setattr(
+            "roblox.luau_place_builder.generate_place_luau_chunked",
+            lambda rbx_place: fake_chunks,
+        )
+        monkeypatch.setattr(
+            "roblox.cloud_api.execute_luau",
+            lambda *a, **kw: {"ok": True},
+        )
+
+        result = publish_place("k", 1, 2, object(), tmp_path)
+
+        assert result.success
+        chunks_path = tmp_path / CHUNKS_FILENAME
+        assert chunks_path.exists()
+        assert json.loads(chunks_path.read_text()) == fake_chunks
+
+
+class TestSizeGuard:
+    """The 4MB execute_luau cap must be enforced. The unguarded
+    single-script publish path used to ship oversized places that silently
+    failed at runtime.
+    """
+
+    def test_oversized_chunks_short_circuit(self, tmp_path, monkeypatch):
+        # One huge chunk that exceeds the cap. Stub generation so we don't
+        # actually allocate 4MB+ of place data.
+        big_chunk = "x" * (MAX_EXECUTE_LUAU_BYTES + 1)
+        monkeypatch.setattr(
+            "roblox.luau_place_builder.generate_place_luau_chunked",
+            lambda rbx_place: [big_chunk],
+        )
+
+        called = []
+        monkeypatch.setattr(
+            "roblox.cloud_api.execute_luau",
+            lambda *a, **kw: called.append(a) or {"ok": True},
+        )
+
+        result = publish_place("k", 1, 2, object(), tmp_path)
+
+        assert result.success is False
+        assert result.exceeded_limit is True
+        assert called == [], "execute_luau must not be called when oversized"
+
+
+class TestPublishCachedChunksRespectsSizeGuard:
+    def test_oversized_cache_short_circuits(self, tmp_path):
+        big = "x" * (MAX_EXECUTE_LUAU_BYTES + 1)
+        (tmp_path / CHUNKS_FILENAME).write_text(json.dumps([big]))
+
+        result = publish_cached_chunks("k", 1, 2, tmp_path)
+        assert result is not None
+        assert result.success is False
+        assert result.exceeded_limit is True
