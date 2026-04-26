@@ -309,6 +309,12 @@ def fix_require_classifications(scripts: list[RbxScript]) -> int:
     # Player is now a LocalScript, not in ReplicatedStorage.
     fixes += _remove_stale_player_requires(scripts)
 
+    # Pass 18: Disable Roblox default PlayerModule controls in FPS-style
+    # client scripts that set MouseBehavior=LockCenter. Without this,
+    # the default PlayerModule (auto-loaded into StarterPlayerScripts)
+    # resets MouseBehavior every frame, preventing mouse-look from working.
+    fixes += _disable_default_controls_in_fps_scripts(scripts)
+
     return fixes
 
 
@@ -779,6 +785,12 @@ def _fix_prefab_lookups(scripts: list[RbxScript]) -> int:
     fixes = 0
     # Collect all script names to avoid redirecting module requires
     module_names = {s.name for s in scripts if s.script_type == "ModuleScript"}
+    # Names that legitimately live in ReplicatedStorage and must NOT be redirected.
+    # ReplicatedStorage.<PREFAB_PACKAGES_FOLDER> holds emitted prefab templates that
+    # scripts :Clone() at runtime — single source of truth in prefab_packages so
+    # renaming the folder there flows through here automatically.
+    from converter.prefab_packages import PREFAB_PACKAGES_FOLDER
+    rs_resident_names = {PREFAB_PACKAGES_FOLDER}
 
     for s in scripts:
         original = s.source
@@ -790,8 +802,8 @@ def _fix_prefab_lookups(scripts: list[RbxScript]) -> int:
             indent = m.group(1)
             varname = m.group(2)
             obj_name = m.group(3)
-            # Don't redirect if this is a known module
-            if obj_name in module_names:
+            # Don't redirect if this is a known module or RS-resident container
+            if obj_name in module_names or obj_name in rs_resident_names:
                 return m.group(0)
             # Redirect to workspace search (case-insensitive, recursive)
             return (f'{indent}local {varname} = workspace:FindFirstChild("{obj_name}", true)'
@@ -1123,12 +1135,92 @@ def _add_pickup_remote_listener(scripts: list[RbxScript]) -> int:
     return fixes
 
 
-def _remove_stale_player_requires(scripts: list[RbxScript]) -> int:
-    """Remove require(Player) from scripts when Player is a LocalScript.
+def _disable_default_controls_in_fps_scripts(scripts: list[RbxScript]) -> int:
+    """Disable Roblox's default PlayerModule controls in FPS-style scripts.
 
-    When Player is kept as LocalScript (not reclassified to ModuleScript),
-    other scripts that try to require it will get infinite yield.
-    Replace with a comment explaining why.
+    Detects client scripts that set ``MouseBehavior = Enum.MouseBehavior.LockCenter``
+    (the unmistakable signature of an FPS controller) and prepends a one-time
+    setup block that disables the default PlayerModule controls. Without this,
+    the auto-loaded ``StarterPlayerScripts/PlayerModule`` resets MouseBehavior
+    back to ``Default`` every frame, so the FPS controller's lock never sticks
+    and mouse-look does not work.
+
+    The prepended block is idempotent (guarded by an attribute check) so the
+    same script can be cloned to multiple players without re-running.
+    """
+    fixes = 0
+    # The marker line is the FIRST line of the prepended setup so an idempotent
+    # `marker in s.source` check works whether the function runs again on the
+    # same script (e.g. re-running write_output after editing on disk).
+    marker = "-- u2r: disable default PlayerModule controls"
+    setup = (
+        f"{marker} + assert FPS mouse state\n"
+        "-- Re-applies on CharacterAdded because Roblox's character spawn flow\n"
+        "-- re-enables the default PlayerModule and resets MouseBehavior.\n"
+        "do\n"
+        "    local _lp = game:GetService(\"Players\").LocalPlayer\n"
+        "    local _UIS = game:GetService(\"UserInputService\")\n"
+        "    local function _applyFpsMouseState()\n"
+        "        if not _lp then return end\n"
+        "        local _ps = _lp:WaitForChild(\"PlayerScripts\", 10)\n"
+        "        local _pm = _ps and _ps:WaitForChild(\"PlayerModule\", 10)\n"
+        "        if _pm then\n"
+        "            local ok, mod = pcall(require, _pm)\n"
+        "            if ok and mod then\n"
+        "                local ok2, controls = pcall(function() return mod:GetControls() end)\n"
+        "                if ok2 and controls and controls.Disable then\n"
+        "                    pcall(function() controls:Disable() end)\n"
+        "                end\n"
+        "            end\n"
+        "        end\n"
+        "        _UIS.MouseBehavior = Enum.MouseBehavior.LockCenter\n"
+        "        _UIS.MouseIconEnabled = false\n"
+        "    end\n"
+        "    _applyFpsMouseState()\n"
+        "    if _lp then\n"
+        "        _lp.CharacterAdded:Connect(function()\n"
+        "            task.wait()  -- let Roblox finish its respawn handling first\n"
+        "            _applyFpsMouseState()\n"
+        "        end)\n"
+        "    end\n"
+        "end\n\n"
+    )
+    for s in scripts:
+        if s.script_type != "LocalScript":
+            continue
+        if marker in s.source:
+            continue
+        if not re.search(
+            r"MouseBehavior\s*=\s*Enum\.MouseBehavior\.LockCenter", s.source
+        ):
+            continue
+        s.source = setup + s.source
+        fixes += 1
+        log.info("  Disabled default PlayerModule controls in '%s'", s.name)
+    return fixes
+
+
+def _remove_stale_player_requires(scripts: list[RbxScript]) -> int:
+    """Rewrite Player-as-module references when Player is actually a LocalScript.
+
+    When the AI transpiler emits something like:
+
+        local playerScript = ReplicatedStorage:WaitForChild("Player")
+        local Player = require(playerScript)
+        local healthUpdate = playerScript:WaitForChild("HealthUpdate")
+
+    rewrite all three idioms together so we don't leave an orphan use
+    of ``playerScript`` (would crash with "Attempted to call require with
+    invalid argument(s)" at runtime, killing the whole script).
+
+    Strategy: redirect the binding to ``Players.LocalPlayer:WaitForChild
+    ("PlayerScripts"):WaitForChild("Player")`` (NOT ``script.Parent`` —
+    pipeline.write_output's BasePart-guard heuristic regexes
+    ``local \w+ = script.Parent\b`` and would prepend an early-exit guard
+    to any script whose parent is StarterPlayerScripts). Then stub out
+    ``require(NAME)`` since LocalScripts cannot be required.
+
+    Restricted to LocalScripts only — server-side code has no LocalPlayer.
     """
     fixes = 0
     # Check if Player is a LocalScript
@@ -1142,21 +1234,59 @@ def _remove_stale_player_requires(scripts: list[RbxScript]) -> int:
     for s in scripts:
         if s.name == 'Player':
             continue
+        # Only rewrite client-side scripts. Server Scripts and ModuleScripts
+        # required from server-side code don't have access to LocalPlayer, so
+        # rewriting their `:WaitForChild("Player")` to `Players.LocalPlayer:...`
+        # would crash on the server (LocalPlayer is nil). The intent of this
+        # pass is purely to fix client scripts that thought Player was a
+        # ReplicatedStorage module — leave server-side alone.
+        if s.script_type != 'LocalScript':
+            continue
         original = s.source
-        # Remove require lines that reference Player
+        # Find the variable bound to a Player WaitForChild lookup so we can
+        # rewrite both the binding line and any subsequent uses coherently.
+        bind_match = re.search(
+            r'local\s+(\w+)\s*=\s*[^\n]*:WaitForChild\(\s*["\']Player["\']\s*\)',
+            s.source,
+        )
+        if bind_match:
+            varname = bind_match.group(1)
+            # Redirect the binding to the actual LocalScript location at runtime.
+            # Use the LocalPlayer.PlayerScripts path (works for any sibling
+            # LocalScript) rather than `script.Parent`, because `script.Parent`
+            # accesses trigger the BasePart-parent-guard heuristic in
+            # pipeline.write_output (`local \w+ = script.Parent\b` matches any
+            # script.Parent alias and adds an `if not script.Parent:IsA("BasePart")
+            # then return end` prelude that would early-exit a client script
+            # whose parent is StarterPlayerScripts).
+            s.source = re.sub(
+                r'local\s+\w+\s*=\s*[^\n]*:WaitForChild\(\s*["\']Player["\']\s*\)',
+                f'local {varname} = game:GetService("Players").LocalPlayer:WaitForChild("PlayerScripts"):WaitForChild("Player")',
+                s.source,
+            )
+            # `require(varname)` cannot work — LocalScripts aren't requirable.
+            # Replace with a stub so subsequent code doesn't crash on missing var.
+            require_pattern = (
+                r'^(\s*)local\s+(\w+)\s*=\s*require\(\s*'
+                + re.escape(varname)
+                + r'\s*\).*$'
+            )
+            stub = (
+                r"\1local \2 = nil  -- Player is a LocalScript "
+                "(not requirable); use BindableEvent children on the Player "
+                "LocalScript instance"
+            )
+            s.source = re.sub(require_pattern, stub, s.source, flags=re.MULTILINE)
+        # Catch direct `local X = require(<expr containing "Player">)` calls —
+        # a different shape from the binding case above (no intermediate
+        # variable, the lookup is inline in the require call).
         s.source = re.sub(
-            r'^local\s+\w+\s*=\s*require\([^)]*["\']Player["\'][^)]*\).*$',
-            '-- Player is a LocalScript (not requirable from server)',
+            r'^(\s*)local\s+(\w+)\s*=\s*require\([^)]*["\']Player["\'][^)]*\).*$',
+            r"\1local \2 = nil  -- Player is a LocalScript (not requirable)",
             s.source,
             flags=re.MULTILINE,
         )
-        # Also fix WaitForChild("Player") patterns
-        s.source = re.sub(
-            r'.*:WaitForChild\(\s*["\']Player["\']\s*\).*',
-            '-- Player is a LocalScript (not in ReplicatedStorage)',
-            s.source,
-        )
         if s.source != original:
             fixes += 1
-            log.info("  Removed stale Player require in '%s'", s.name)
+            log.info("  Rewired stale Player require/lookup in '%s'", s.name)
     return fixes

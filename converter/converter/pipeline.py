@@ -1603,12 +1603,35 @@ return table.concat(allData, "\\n")'''
             r'MouseBehavior\s*=\s*Enum\.MouseBehavior\.LockCenter',
             r'InputBegan:Connect',
         ]
+        # Anti-FPS patterns: modules that re-enable the mouse cursor or unlock
+        # the mouse at init time clobber the FPS controller's setup. If any
+        # script sets MouseBehavior=LockCenter (an FPS controller), exclude
+        # such modules from the bootstrap — they should only run when the
+        # player explicitly navigates to a menu, not unconditionally on Play.
+        _anti_fps_patterns = [
+            r'MouseIconEnabled\s*=\s*true',
+            r'MouseBehavior\s*=\s*Enum\.MouseBehavior\.Default',
+        ]
+        has_fps_controller = any(
+            _re.search(r'MouseBehavior\s*=\s*Enum\.MouseBehavior\.LockCenter', s.source)
+            for s in self.state.rbx_place.scripts
+        )
         side_effect_modules = []
         for s in self.state.rbx_place.scripts:
             if s.script_type != "ModuleScript":
                 continue
-            if any(_re.search(p, s.source) for p in _side_effect_patterns):
-                side_effect_modules.append(s.name)
+            if not any(_re.search(p, s.source) for p in _side_effect_patterns):
+                continue
+            if has_fps_controller and any(
+                _re.search(p, s.source) for p in _anti_fps_patterns
+            ):
+                log.info(
+                    "[write_output] Skipping bootstrap require of '%s' "
+                    "(would clobber FPS controller mouse state)",
+                    s.name,
+                )
+                continue
+            side_effect_modules.append(s.name)
 
         if side_effect_modules:
             bootstrap_lines = ['-- Auto-generated bootstrap: require modules with side-effects']
@@ -1691,40 +1714,87 @@ return table.concat(allData, "\\n")'''
         if self.state.rbx_place.terrains:
             from converter.terrain_converter import read_unity_terrain, generate_terrain_luau
             for terrain_obj in self.state.rbx_place.terrains:
-                if terrain_obj.terrain_data_guid and self.state.guid_index:
-                    td_path = self.state.guid_index.resolve(terrain_obj.terrain_data_guid)
-                    if td_path and td_path.exists():
-                        terrain_data = read_unity_terrain(td_path)
-                        if terrain_data:
-                            from core.coordinate_system import unity_to_roblox_pos
-                            # Use the terrain world offset (includes parent chain)
-                            # computed during scene conversion, not just local position.
-                            from converter.scene_converter import _terrain_world_offset
-                            rpos = unity_to_roblox_pos(*_terrain_world_offset)
-                            # Encode terrain voxels into rbxlx binary format
-                            try:
-                                from roblox.terrain_encoder import encode_smooth_grid, encode_physics_grid
-                                terrain_obj.smooth_grid = encode_smooth_grid(
-                                    terrain_data["heights"],
-                                    terrain_data["resolution"],
-                                    terrain_data["scale"],
-                                    rpos,
-                                    layer_names=terrain_data.get("layers"),
-                                    splat_alphas=terrain_data.get("splat_alphas"),
-                                    splat_resolution=terrain_data.get("splat_resolution", 0),
-                                )
-                                terrain_obj.physics_grid = encode_physics_grid()
-                                log.info("[write_output] Terrain SmoothGrid encoded for rbxlx embedding")
-                            except Exception as exc:
-                                log.warning("[write_output] Failed to encode terrain SmoothGrid: %s", exc)
-                            # Save terrain FillBlock script as a standalone file (backup/reference).
-                            # Not injected as a runtime script since SmoothGrid binary data
-                            # is already embedded in the rbxlx — no runtime generation needed.
-                            luau = generate_terrain_luau(terrain_data, rpos, voxel_size=16)
-                            terrain_path = self.output_dir / "generate_terrain.luau"
-                            terrain_path.write_text(luau, encoding="utf-8")
-                            log.info("[write_output] Terrain script saved to %s (reference only)",
-                                     terrain_path.name)
+                guid = terrain_obj.terrain_data_guid
+                if not guid:
+                    log.warning("[write_output] Terrain heightmap missing: terrain_data_guid is empty. "
+                                "Place will have an empty Terrain shell with no SmoothGrid.")
+                    continue
+                if not self.state.guid_index:
+                    log.warning("[write_output] Terrain heightmap missing: GUID index unavailable for %s. "
+                                "Place will have an empty Terrain shell with no SmoothGrid.", guid)
+                    continue
+                td_path = self.state.guid_index.resolve(guid)
+                if not td_path:
+                    log.warning("[write_output] Terrain heightmap missing: GUID %s did not resolve to any file. "
+                                "Place will have an empty Terrain shell with no SmoothGrid.", guid)
+                    continue
+                if not td_path.exists():
+                    log.warning("[write_output] Terrain heightmap missing: %s does not exist on disk. "
+                                "Place will have an empty Terrain shell with no SmoothGrid. "
+                                "If this file is Git LFS-tracked, run `git lfs pull` to fetch it.",
+                                td_path)
+                    continue
+                # Detect Git LFS pointer files (small text stub starting with the LFS spec line).
+                try:
+                    head = td_path.read_bytes()[:64]
+                except OSError as exc:
+                    log.warning("[write_output] Terrain heightmap unreadable at %s: %s. "
+                                "Place will have an empty Terrain shell with no SmoothGrid.", td_path, exc)
+                    continue
+                if head.startswith(b"version https://git-lfs.github.com/spec/v1"):
+                    log.warning("[write_output] Terrain heightmap %s is an unfetched Git LFS pointer "
+                                "(stub size %d bytes). Place will have an empty Terrain shell with no SmoothGrid. "
+                                "Run `git lfs pull` to fetch the actual binary, then re-run conversion.",
+                                td_path, td_path.stat().st_size)
+                    continue
+                terrain_data = read_unity_terrain(td_path)
+                if not terrain_data:
+                    log.warning("[write_output] Terrain heightmap at %s could not be parsed "
+                                "(read_unity_terrain returned None — UnityPy missing or unsupported format). "
+                                "Place will have an empty Terrain shell with no SmoothGrid.", td_path)
+                    continue
+                from core.coordinate_system import unity_to_roblox_pos
+                # Use the terrain world offset (includes parent chain)
+                # computed during scene conversion, not just local position.
+                from converter.scene_converter import _terrain_world_offset
+                rpos = unity_to_roblox_pos(*_terrain_world_offset)
+                # Encode terrain voxels into rbxlx binary format
+                try:
+                    from roblox.terrain_encoder import encode_smooth_grid, encode_physics_grid
+                    terrain_obj.smooth_grid = encode_smooth_grid(
+                        terrain_data["heights"],
+                        terrain_data["resolution"],
+                        terrain_data["scale"],
+                        rpos,
+                        layer_names=terrain_data.get("layers"),
+                        splat_alphas=terrain_data.get("splat_alphas"),
+                        splat_resolution=terrain_data.get("splat_resolution", 0),
+                    )
+                    terrain_obj.physics_grid = encode_physics_grid()
+                    log.info("[write_output] Terrain SmoothGrid encoded for rbxlx embedding")
+                except Exception as exc:
+                    log.warning("[write_output] Failed to encode terrain SmoothGrid: %s", exc)
+                # Save terrain FillBlock script as a standalone file (for inspection)
+                # AND register the body for headless publish consumption. The Open
+                # Cloud Luau Execution API cannot set the SmoothGrid BinaryString,
+                # so the headless place builder needs the FillBlock fallback.
+                #
+                # Crucially: the FillBlock body is NOT added to place.scripts. If
+                # it were, every Studio open would run a server script that begins
+                # with `t:Clear()` followed by ~9000 voxel_size=16 FillBlocks —
+                # wiping the high-fidelity SmoothGrid and replacing it with the
+                # coarse fallback. We instead store it on
+                # ``place.headless_terrain_scripts`` (a separate list) which the
+                # luau_place_builder reads but the rbxlx writer ignores. Multiple
+                # terrains contribute multiple entries (preserving all of them
+                # during headless bake — the previous single-named-script design
+                # silently dropped terrains 2+).
+                luau = generate_terrain_luau(terrain_data, rpos, voxel_size=16)
+                terrain_path = self.output_dir / f"generate_terrain_{len(self.state.rbx_place.headless_terrain_scripts) + 1}.luau"
+                terrain_path.write_text(luau, encoding="utf-8")
+                log.info("[write_output] Terrain script saved to %s (%d chars)",
+                         terrain_path.name, len(luau))
+                self.state.rbx_place.headless_terrain_scripts.append(luau)
 
         # MeshLoader: only inject if mesh resolution data is NOT available.
         # When resolve_assets has run, real MeshIds are already in the rbxlx

@@ -708,3 +708,86 @@ class TestMultiSubMeshMaterialPropagation:
         # No children, no propagation needed — SA stays on the part
         assert part.surface_appearance is not None
         assert part.surface_appearance.color_map == "rbxassetid://555"
+
+
+class TestFixEmptyMeshParts:
+    """``_fix_empty_mesh_parts`` surfaces missing-asset failures (magenta) but
+    still hides genuine bone-anchor sockets in models that have rendered meshes.
+    """
+
+    def _make_part(self, name, class_name="Part", mesh_id="", color=(0.63, 0.63, 0.63),
+                   size=(1.0, 1.0, 1.0), surface_appearance=None, transparency=0.0):
+        from core.roblox_types import RbxPart
+        return RbxPart(
+            name=name, class_name=class_name, mesh_id=mesh_id,
+            color=color, size=size, surface_appearance=surface_appearance,
+            transparency=transparency,
+        )
+
+    def test_meshpart_without_mesh_id_becomes_magenta_part(self):
+        from converter.scene_converter import _fix_empty_mesh_parts
+        parts = [self._make_part("RifleBarrel", class_name="MeshPart")]
+        n = _fix_empty_mesh_parts(parts)
+        assert n == 1
+        p = parts[0]
+        assert p.class_name == "Part"
+        assert p.color == (1.0, 0.0, 1.0)
+        # Original size preserved (no 1x1x1 shrink)
+        assert p.size == (1.0, 1.0, 1.0)
+
+    def test_bone_anchor_hidden_only_when_sibling_has_real_mesh(self):
+        # Model with a real MeshPart (visual) AND a default-gray empty
+        # placeholder Part (anchor). The anchor should be hidden, the visual
+        # left alone.
+        from converter.scene_converter import _fix_empty_mesh_parts
+        from core.roblox_types import RbxPart
+        model = RbxPart(name="Character", class_name="Model")
+        model.children = [
+            self._make_part("Body", class_name="MeshPart", mesh_id="rbxassetid://123"),
+            self._make_part("LeftHand"),  # default gray, no mesh, default 1x1x1
+        ]
+        _fix_empty_mesh_parts([model])
+        body, left_hand = model.children
+        # Visual untouched
+        assert body.transparency == 0.0
+        assert body.color != (1.0, 0.0, 1.0)
+        # Bone anchor hidden
+        assert left_hand.transparency == 1.0
+        assert left_hand.can_collide is False
+
+    def test_bone_anchor_not_hidden_when_no_sibling_has_mesh(self):
+        # Critical regression: in projects whose visual mesh assets are
+        # missing (rifle FBX stripped), every part of the rifle Model lacks
+        # a real mesh. The previous heuristic hid all parts → entire model
+        # disappears. Narrow heuristic should leave them alone.
+        from converter.scene_converter import _fix_empty_mesh_parts
+        from core.roblox_types import RbxPart
+        model = RbxPart(name="Rifle", class_name="Model")
+        model.children = [
+            # All parts of the rifle had a mesh reference that didn't resolve.
+            # After the magenta downgrade pass these are class="Part",
+            # color=magenta (set by the pass on this iteration).
+            self._make_part("barrel", class_name="MeshPart"),
+            self._make_part("stock", class_name="MeshPart"),
+            self._make_part("trigger", class_name="MeshPart"),
+        ]
+        _fix_empty_mesh_parts([model])
+        # All three got magenta-downgraded; none got hidden as bone-anchors
+        for child in model.children:
+            assert child.color == (1.0, 0.0, 1.0)
+            assert child.transparency == 0.0
+
+    def test_non_default_size_part_not_hidden(self):
+        # A Part with size != 1x1x1 (e.g. an explicit BoxCollider) is NOT a
+        # bone-anchor — it has a meaningful shape. Don't hide it.
+        from converter.scene_converter import _fix_empty_mesh_parts
+        from core.roblox_types import RbxPart
+        model = RbxPart(name="Model", class_name="Model")
+        model.children = [
+            self._make_part("Visual", class_name="MeshPart", mesh_id="rbxassetid://123"),
+            self._make_part("Collider", size=(3.0, 1.0, 5.0)),  # not default
+        ]
+        _fix_empty_mesh_parts([model])
+        collider = model.children[1]
+        # Has meaningful size — left visible
+        assert collider.transparency == 0.0

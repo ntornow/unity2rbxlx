@@ -414,3 +414,10 @@ class RbxPlace:
     # at runtime. Each entry is a fully-converted RbxPart tree whose
     # name matches the Unity prefab's stem.
     replicated_templates: list[RbxPart] = field(default_factory=list)
+    # Per-terrain FillBlock Luau bodies, consumed by ``luau_place_builder``
+    # ONLY during headless publish (where the Open Cloud Luau Execution API
+    # cannot set the ``SmoothGrid`` BinaryString). The rbxlx writer
+    # deliberately ignores this field — at Studio-load time the embedded
+    # SmoothGrid binary already provides the heightmap, so running a
+    # FillBlock fallback would overwrite it with lower-fidelity voxels.
+    headless_terrain_scripts: list[str] = field(default_factory=list)
