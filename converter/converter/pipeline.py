@@ -1190,6 +1190,11 @@ class Pipeline:
             self.ctx.total_scripts,
         )
 
+        from converter.shared_state_linter import lint_and_rewrite
+        self.state.transpilation_result.shared_state_warnings = lint_and_rewrite(
+            self.state.transpilation_result.scripts
+        )
+
     def convert_animations(self) -> None:
         """Phase 5a: route Unity animations to animator_runtime or inline TweenService.
 
@@ -2241,6 +2246,11 @@ script.Disabled = true
             entries = getattr(self.state.animation_result, "unconverted", None) or []
             for entry in entries:
                 category = entry.get("category", "misc")
+                sections.setdefault(category, []).append(entry)
+
+        if self.state.transpilation_result is not None:
+            for entry in getattr(self.state.transpilation_result, "shared_state_warnings", []) or []:
+                category = entry.get("category", "shared_state")
                 sections.setdefault(category, []).append(entry)
 
         # Material warnings surface the "drop" side of the mapper —

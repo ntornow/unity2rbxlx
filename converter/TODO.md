@@ -17,15 +17,6 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
 
 ## Cross-script transpilation
 
-- [ ] **P1 — Cross-script shared-state linter.** Validation of PR 4's
-  dependency-aware context showed the AI transpiler still emits
-  `character:GetAttribute("hasKey")` on reader scripts even when the writer
-  exports a getter. Two prompt iterations failed to close it. Fix belongs in a
-  post-transpile linter that walks generated `.luau`, finds `:GetAttribute("X")`
-  calls with no matching `:SetAttribute("X")` and a matching exported getter,
-  then either auto-rewrites to `require(Module).getX()` or surfaces an
-  `UNCONVERTED.md` warning. See archive: "Cross-script shared-state gap —
-  prompt iteration insufficient (2026-04-24)".
 - [ ] **P2 — 4.3.2 C# pattern warnings.** Skipped in PR 4. Pre-flight
   diagnostics for LINQ / networking / async patterns. Revisit when a project
   ships a class of error that warrants pre-flight surfacing.

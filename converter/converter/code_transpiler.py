@@ -65,6 +65,9 @@ class TranspilationResult:
     total_ai: int = 0
     total_failed: int = 0
     total_flagged: int = 0
+    # Orphan :GetAttribute() reads found by the post-transpile shared-state
+    # linter, in UNCONVERTED.md entry shape ({category, item, reason}).
+    shared_state_warnings: list[dict[str, str]] = field(default_factory=list)
 
     @property
     def counts(self) -> dict[str, int]:
