@@ -23,9 +23,18 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TypedDict
+
+from core.roblox_types import RbxPlace
 
 log = logging.getLogger(__name__)
+
+
+class ChunkResult(TypedDict):
+    """Per-chunk publish outcome. Stays a plain dict at runtime (TypedDict)
+    so the existing JSON-emit path serializes it without conversion."""
+    chunk: int
+    ok: bool
 
 # Roblox Open Cloud execute_luau accepts scripts up to ~4MB. Place-builder
 # scripts larger than this must fall back to the runtime MeshLoader path.
@@ -44,7 +53,7 @@ class PublishResult:
     total_bytes: int = 0
     exceeded_limit: bool = False
     script_path: Path | None = None
-    chunk_results: list[dict[str, Any]] = field(default_factory=list)
+    chunk_results: list[ChunkResult] = field(default_factory=list)
     error: str | None = None
 
 
@@ -90,12 +99,12 @@ def _publish_chunks(
             ),
         )
 
-    chunk_results: list[dict[str, Any]] = []
+    chunk_results: list[ChunkResult] = []
     for i, chunk in enumerate(chunks):
         log.info("place_publisher: executing chunk %d/%d", i + 1, len(chunks))
         result = execute_luau(api_key, universe_id, place_id, chunk, timeout=timeout)
         ok = result is not None
-        chunk_results.append({"chunk": i + 1, "ok": ok})
+        chunk_results.append(ChunkResult(chunk=i + 1, ok=ok))
         if not ok:
             return PublishResult(
                 success=False,
@@ -119,7 +128,7 @@ def publish_place(
     api_key: str,
     universe_id: int,
     place_id: int,
-    rbx_place: Any,
+    rbx_place: RbxPlace,
     output_dir: Path,
     *,
     timeout: str = "300s",
