@@ -802,7 +802,7 @@ def _fallback_parse_mat(raw: str) -> dict[str, Any] | None:
     return result if result else None
 
 
-def _extract_shader_name(mat_data: dict[str, Any], guid_index: Any = None) -> str:
+def _extract_shader_name(mat_data: dict[str, object], guid_index: GuidIndex | None = None) -> str:
     """Extract the shader name from parsed material data.
 
     Resolves shader GUIDs via guid_index to get the actual shader file name.
