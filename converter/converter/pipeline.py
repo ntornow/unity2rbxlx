@@ -1303,11 +1303,28 @@ class Pipeline:
                 "[resolve_assets] No new mesh assets to resolve "
                 "(%d already resolved)", len(already_resolved),
             )
-            # Cache the IDs anyway: the user reached this point with valid
-            # uid/pid, and not refreshing the cache means a later publish
-            # would silently target the previous experience.
-            from roblox.id_cache import write_ids
-            write_ids(self.output_dir, universe_id, place_id)
+            # Validate uid/pid against Open Cloud before caching. Without
+            # the validation call, a typo'd retarget on a mesh-free output
+            # would silently poison .roblox_ids.json. Without ANY cache
+            # write, retargets on mesh-free outputs would never refresh
+            # the cache, so a later publish would target the prior
+            # experience. The minimal execute_luau call here resolves both.
+            from roblox.cloud_api import execute_luau
+            ok = execute_luau(
+                api_key, universe_id, place_id, "return 'ok'", timeout="60s",
+            )
+            if ok is not None:
+                from roblox.id_cache import write_ids
+                write_ids(self.output_dir, universe_id, place_id)
+                log.info(
+                    "[resolve_assets] uid=%s pid=%s validated; cache refreshed",
+                    universe_id, place_id,
+                )
+            else:
+                log.warning(
+                    "[resolve_assets] uid=%s pid=%s did not authenticate; "
+                    "cache NOT refreshed", universe_id, place_id,
+                )
             return
 
         log.info("[resolve_assets] Resolving %d mesh assets via Luau Execution API...", len(mesh_assets))
