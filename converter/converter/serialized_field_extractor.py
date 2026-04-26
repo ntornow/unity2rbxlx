@@ -20,6 +20,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from core.unity_types import GuidIndex, ParsedScene, PrefabLibrary
+
 # Unity MonoBehaviour fields that never hold author-visible serialized data —
 # they're engine-internal. Skipping them avoids false positives.
 _MONO_INTERNAL_PROPS: frozenset[str] = frozenset({
@@ -90,9 +92,9 @@ def _process_mono_properties(
 
 
 def extract_serialized_field_refs(
-    parsed_scenes: list[Any],
-    prefab_library: Any,
-    guid_index: Any,
+    parsed_scenes: list[ParsedScene],
+    prefab_library: PrefabLibrary | None,
+    guid_index: GuidIndex | None,
 ) -> dict[Path, dict[str, str]]:
     """Return ``{script_cs_path: {field_name: prefab_or_audio_ref}}``.
 

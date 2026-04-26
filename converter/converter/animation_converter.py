@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from core.unity_types import GuidIndex, ParsedScene
 from unity.yaml_parser import parse_documents, doc_body, is_text_yaml
 
 log = logging.getLogger(__name__)
@@ -1542,8 +1543,8 @@ def discover_animations(
 
 def convert_animations(
     unity_project_path: Path,
-    guid_index: Any = None,
-    parsed_scenes: list[Any] | None = None,
+    guid_index: GuidIndex | None = None,
+    parsed_scenes: list[ParsedScene] | None = None,
 ) -> AnimationConversionResult:
     """Convert all animations in a Unity project to Roblox Luau scripts.
 

@@ -38,6 +38,8 @@ from pathlib import Path
 from typing import Any
 
 from core.roblox_types import RbxPart, RbxScript
+from core.unity_types import GuidIndex, PrefabLibrary
+from converter.material_mapper import MaterialMapping
 
 log = logging.getLogger(__name__)
 
@@ -112,10 +114,10 @@ def _collect_referenced_prefab_names(
 
 
 def generate_prefab_packages(
-    prefab_library: Any,
+    prefab_library: PrefabLibrary | None,
     serialized_field_refs: dict[str, dict[str, str]] | None,
-    guid_index: Any,
-    material_mappings: dict[str, Any] | None = None,
+    guid_index: GuidIndex | None,
+    material_mappings: dict[str, MaterialMapping] | None = None,
     uploaded_assets: dict[str, str] | None = None,
     include_all: bool = False,
 ) -> PrefabPackagesResult:
