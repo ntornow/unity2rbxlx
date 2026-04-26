@@ -1387,7 +1387,7 @@ def _count_parts(part: RbxPart) -> int:
 # Public API
 # ---------------------------------------------------------------------------
 
-def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, Any]:
+def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, int]:
     """Write an RbxPlace to a ``.rbxlx`` file at *output_path*.
 
     Returns a statistics dictionary with counts of serialized elements:
@@ -1584,7 +1584,7 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, Any]:
     #   StarterPlayer.StarterPlayerScripts, StarterPlayer.StarterCharacterScripts,
     #   StarterGui
     scripts: list[RbxScript] = getattr(place, "scripts", None) or []
-    _container_by_path: dict[str, Any] = {
+    _container_by_path: dict[str, ET.Element] = {
         "ServerScriptService": server_script_service,
         "ServerStorage": server_storage,
         "ReplicatedStorage": replicated_storage,
