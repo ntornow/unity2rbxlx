@@ -2353,7 +2353,7 @@ script.Disabled = true
             self.state.rbx_place.scripts,
             dependency_map=self.state.dependency_map or None,
         )
-        self.ctx.storage_plan = plan.to_dict()
+        self.ctx.storage_plan = plan
 
         # Record each script's subdir so rehydration can route it back.
         script_paths: dict[str, str] = {}
@@ -2372,7 +2372,7 @@ script.Disabled = true
         plan_path = self.output_dir / "conversion_plan.json"
         plan_path.write_text(
             _json.dumps({
-                "storage_plan": self.ctx.storage_plan,
+                "storage_plan": plan.to_dict(),
                 "script_paths": script_paths,
                 "animation_routing": animation_routing,
             }, indent=2),

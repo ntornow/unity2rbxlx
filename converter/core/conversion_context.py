@@ -9,7 +9,10 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from converter.storage_classifier import StoragePlan
 
 
 @dataclass
@@ -70,7 +73,8 @@ class ConversionContext:
     # Produced by converter.storage_classifier.classify_storage and written to
     # conversion_plan.json. rbxlx_writer reads each script's parent_path when
     # emitting; falls back to script_type heuristics when absent.
-    storage_plan: dict[str, Any] = field(default_factory=dict)
+    # Reconstructed from dict shape on JSON load via __post_init__.
+    storage_plan: StoragePlan | None = None
 
     # GUID -> sliced sprite PNG path (from sprite_extractor).
     sprite_guid_to_file: dict[str, str] = field(default_factory=dict)
@@ -81,6 +85,15 @@ class ConversionContext:
     # transpiler (so the AI prompt knows which fields point at prefabs)
     # and by 4.10 prefab packages (to know which prefabs to emit).
     serialized_field_refs: dict[str, dict[str, str]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # JSON load via `cls(**data)` populates storage_plan as a dict (the
+        # asdict() form). Reconstruct it as a StoragePlan when present so the
+        # field's declared type holds at runtime. Lazy import avoids the
+        # core <-> converter dependency cycle.
+        if isinstance(self.storage_plan, dict):
+            from converter.storage_classifier import StoragePlan
+            self.storage_plan = StoragePlan(**self.storage_plan) if self.storage_plan else None
 
     def mark_phase_complete(self, phase: str) -> None:
         if phase not in self.completed_phases:

@@ -68,10 +68,6 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
 
 ## Infrastructure
 
-- [ ] **P1 — Eval-diff in CI nightly job.** `eval_baseline.json` exists and
-  `u2r.py eval-diff` can gate, but the CI nightly job doesn't run it yet.
-  See archive: "Eval baseline for all 9 projects" entry under Open Gaps
-  (2026-04-12 session).
 - [ ] **P2 — Three-flow `rbx_place` byte-equivalence test.** Codex review
   P1-6 deferred. Source-level + behavior-level parity is now tested
   (commit `420b01e`). Byte-equivalence requires a real Unity fixture.
