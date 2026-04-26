@@ -1128,11 +1128,25 @@ def _add_pickup_remote_listener(scripts: list[RbxScript]) -> int:
 
 
 def _remove_stale_player_requires(scripts: list[RbxScript]) -> int:
-    """Remove require(Player) from scripts when Player is a LocalScript.
+    """Rewrite Player-as-module references when Player is actually a LocalScript.
 
-    When Player is kept as LocalScript (not reclassified to ModuleScript),
-    other scripts that try to require it will get infinite yield.
-    Replace with a comment explaining why.
+    When the AI transpiler emits something like:
+
+        local playerScript = ReplicatedStorage:WaitForChild("Player")
+        local Player = require(playerScript)
+        local healthUpdate = playerScript:WaitForChild("HealthUpdate")
+
+    we need a coherent rewrite — earlier this function nuked the
+    WaitForChild("Player") line but left `require(playerScript)` and
+    `playerScript:WaitForChild("HealthUpdate")` orphaned (undefined
+    variable → "Attempted to call require with invalid argument(s)" at
+    runtime, killing the whole script).
+
+    New approach: when we find a `local NAME = ...:WaitForChild("Player")`
+    binding, redirect NAME to the actual LocalScript path
+    (`script.Parent:WaitForChild("Player")`) so the BindableEvent children
+    still resolve, and stub out `require(NAME)` since LocalScripts cannot
+    be required.
     """
     fixes = 0
     # Check if Player is a LocalScript
@@ -1147,20 +1161,45 @@ def _remove_stale_player_requires(scripts: list[RbxScript]) -> int:
         if s.name == 'Player':
             continue
         original = s.source
-        # Remove require lines that reference Player
+        # Find the variable bound to a Player WaitForChild lookup so we can
+        # rewrite both the binding line and any subsequent uses coherently.
+        bind_match = re.search(
+            r'local\s+(\w+)\s*=\s*[^\n]*:WaitForChild\(\s*["\']Player["\']\s*\)',
+            s.source,
+        )
+        if bind_match:
+            varname = bind_match.group(1)
+            # Redirect the binding to the actual LocalScript location at runtime.
+            # The Player LocalScript lives in StarterPlayerScripts, which is
+            # cloned to PlayerScripts on character load — script.Parent is the
+            # right path from any sibling LocalScript in PlayerScripts.
+            s.source = re.sub(
+                r'local\s+\w+\s*=\s*[^\n]*:WaitForChild\(\s*["\']Player["\']\s*\)',
+                f'local {varname} = script.Parent:WaitForChild("Player")',
+                s.source,
+            )
+            # `require(varname)` cannot work — LocalScripts aren't requirable.
+            # Replace with a stub so subsequent code doesn't crash on missing var.
+            require_pattern = (
+                r'^(\s*)local\s+(\w+)\s*=\s*require\(\s*'
+                + re.escape(varname)
+                + r'\s*\).*$'
+            )
+            s.source = re.sub(
+                require_pattern,
+                r"\1local \2 = nil  -- Player is a LocalScript (not requirable); use BindableEvents on script.Parent.Player",
+                s.source,
+                flags=re.MULTILINE,
+            )
+        # Catch direct `require(...Player...)` calls where the require
+        # contains the literal string "Player" (no intermediate variable).
         s.source = re.sub(
-            r'^local\s+\w+\s*=\s*require\([^)]*["\']Player["\'][^)]*\).*$',
-            '-- Player is a LocalScript (not requirable from server)',
+            r'^(\s*)local\s+(\w+)\s*=\s*require\([^)]*["\']Player["\'][^)]*\).*$',
+            r"\1local \2 = nil  -- Player is a LocalScript (not requirable from server)",
             s.source,
             flags=re.MULTILINE,
         )
-        # Also fix WaitForChild("Player") patterns
-        s.source = re.sub(
-            r'.*:WaitForChild\(\s*["\']Player["\']\s*\).*',
-            '-- Player is a LocalScript (not in ReplicatedStorage)',
-            s.source,
-        )
         if s.source != original:
             fixes += 1
-            log.info("  Removed stale Player require in '%s'", s.name)
+            log.info("  Rewired stale Player require/lookup in '%s'", s.name)
     return fixes
