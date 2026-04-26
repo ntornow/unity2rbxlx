@@ -118,7 +118,7 @@ class PrefabTemplate:
     name: str
     root: PrefabNode | None = None
     all_nodes: dict[str, PrefabNode] = field(default_factory=dict)
-    raw_documents: list[dict] = field(default_factory=list)
+    raw_documents: list[dict[str, object]] = field(default_factory=list)
     referenced_material_guids: set[str] = field(default_factory=set)
     referenced_mesh_guids: set[str] = field(default_factory=set)
     is_multi_root: bool = False

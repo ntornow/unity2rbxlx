@@ -76,29 +76,18 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
 
 ## Type-strictness debt (forward-only gate landed; cleanup separate)
 
-The no-Any gate prevents new smuggling but doesn't fix existing offenders.
-Each cleanup is a separate small PR that brings one file under the principle.
+The no-Any gate prevents new smuggling. Existing-offender cleanup has
+landed in dedicated PRs (#10 gate, storage_plan, ported-module signatures
+PR #34, PipelineState PR #36, trivial 3-fix + ConversionContext final 4).
 
-- [ ] **P1 — `core/conversion_context.py` Any-erasure.** L50 `mesh_native_sizes`,
-  L57 `mesh_hierarchies`, L65 `scenes_metadata`, L68 `comparison_scores`,
-  L73 `storage_plan`. The `storage_plan` field is the worst — `StoragePlan`
-  IS already a dataclass at `converter/storage_classifier.py:90`.
-- [ ] **P1 — `pipeline.py` `PipelineState` fields.** `transpilation_result`,
-  `animation_result`, `prefab_library`, `scriptable_objects`, `sprite_result`,
-  `material_mappings` all `Any`. Each has a real type already in the codebase.
-- [ ] **P1 — Ported-module signatures.** Original audit findings:
-  - `serialized_field_extractor.py:92-95` — `parsed_scenes: list[Any]`,
-    `prefab_library: Any`, `guid_index: Any`
-  - `prefab_packages.py:101-107` — `prefab_library: Any`, `guid_index: Any`,
-    `material_mappings: dict[str, Any]`
-  - `animation_converter.py:1543-1545` — `guid_index: Any`,
-    `parsed_scenes: list[Any]`
-  - `material_mapper.py:805` — internal `_extract_shader_name(..., guid_index: Any)`
-- [ ] **P2 — `core/unity_types.py:121` `raw_documents: list[dict]`.** Trivial
-  fix to `list[dict[str, Any]]` once the dict shape is decided.
-- [ ] **P2 — `roblox/rbxlx_writer.py` Any in return + internal state.**
-  L1390 `-> dict[str, Any]` (writer return), L1581 `_container_by_path:
-  dict[str, Any]` (ET element map).
+Remaining items:
+
+- [ ] **P2 — `scene_converter.py:180` `_mesh_hierarchies: dict[str, list[dict]]`.**
+  Module-level cache; the bare `dict` is missing-type-arg, not Any.
+  Tighten to `dict[str, list[MeshHierarchyEntry]]` for consistency
+  with `ConversionContext.mesh_hierarchies` (the TypedDict is in
+  `core/conversion_context.py`). Not flagged by the no-Any gate;
+  cleanup-only.
 
 ---
 
