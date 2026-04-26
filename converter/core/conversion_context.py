@@ -9,10 +9,28 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING, TypedDict
 
 if TYPE_CHECKING:
     from converter.storage_classifier import StoragePlan
+
+
+class MeshHierarchyEntry(TypedDict, total=False):
+    """One sub-mesh inside an FBX, as resolved by Roblox Studio LoadAsset."""
+
+    name: str
+    meshId: str
+    size: list[float]      # [x, y, z]
+    position: list[float]  # [x, y, z]
+    textureId: str
+
+
+class SceneMetadata(TypedDict):
+    """Per-scene conversion stats produced by multi-scene pipeline runs."""
+
+    parts: int
+    scripts: int
+    game_objects: int
 
 
 @dataclass
@@ -49,25 +67,28 @@ class ConversionContext:
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
-    # Mesh resolution (Model ID -> real MeshId + native sizes)
-    mesh_native_sizes: dict[str, Any] = field(default_factory=dict)
+    # Mesh resolution (Model ID -> real MeshId + native sizes).
+    # Value is [x, y, z] floats (the FBX's overall bounding box).
+    mesh_native_sizes: dict[str, list[float]] = field(default_factory=dict)
 
     # Mesh texture IDs (asset path -> rbxassetid:// URL for TextureID embedded in uploaded FBX models)
     mesh_texture_ids: dict[str, str] = field(default_factory=dict)
 
     # Full mesh hierarchy from Roblox LoadAsset:
-    # fbx_path -> list of {name, meshId, size:[x,y,z], position:[x,y,z], textureId}
-    mesh_hierarchies: dict[str, Any] = field(default_factory=dict)
+    # fbx_path -> list of MeshHierarchyEntry (one per sub-mesh).
+    mesh_hierarchies: dict[str, list[MeshHierarchyEntry]] = field(default_factory=dict)
 
     # FBX bounding boxes computed via trimesh (fallback for InitialSize when Studio
     # resolution is unavailable).  Maps relative asset path -> (w, h, d) in FBX units.
     fbx_bounding_boxes: dict[str, list[float]] = field(default_factory=dict)
 
-    # Multi-scene metadata: scene_name -> {parts, scripts, ...}
-    scenes_metadata: dict[str, Any] = field(default_factory=dict)
+    # Multi-scene metadata: scene_name -> per-scene stats.
+    scenes_metadata: dict[str, SceneMetadata] = field(default_factory=dict)
 
-    # Comparison results
-    comparison_scores: dict[str, Any] = field(default_factory=dict)
+    # Comparison results — populated by the comparison subsystem when a
+    # visual diff runs. Shape varies by comparison type; using `object` to
+    # require narrowing at consumption sites rather than smuggling Any.
+    comparison_scores: dict[str, object] = field(default_factory=dict)
 
     # Storage plan (Phase 4a.5): explicit per-script container assignments.
     # Produced by converter.storage_classifier.classify_storage and written to
