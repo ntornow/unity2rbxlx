@@ -1170,12 +1170,16 @@ def _remove_stale_player_requires(scripts: list[RbxScript]) -> int:
         if bind_match:
             varname = bind_match.group(1)
             # Redirect the binding to the actual LocalScript location at runtime.
-            # The Player LocalScript lives in StarterPlayerScripts, which is
-            # cloned to PlayerScripts on character load — script.Parent is the
-            # right path from any sibling LocalScript in PlayerScripts.
+            # Use the LocalPlayer.PlayerScripts path (works for any sibling
+            # LocalScript) rather than `script.Parent`, because `script.Parent`
+            # accesses trigger the BasePart-parent-guard heuristic in
+            # pipeline.write_output (`local \w+ = script.Parent\b` matches any
+            # script.Parent alias and adds an `if not script.Parent:IsA("BasePart")
+            # then return end` prelude that would early-exit a client script
+            # whose parent is StarterPlayerScripts).
             s.source = re.sub(
                 r'local\s+\w+\s*=\s*[^\n]*:WaitForChild\(\s*["\']Player["\']\s*\)',
-                f'local {varname} = script.Parent:WaitForChild("Player")',
+                f'local {varname} = game:GetService("Players").LocalPlayer:WaitForChild("PlayerScripts"):WaitForChild("Player")',
                 s.source,
             )
             # `require(varname)` cannot work — LocalScripts aren't requirable.
