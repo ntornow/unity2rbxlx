@@ -1158,51 +1158,44 @@ def _disable_default_controls_in_fps_scripts(scripts: list[RbxScript]) -> int:
     # one-shot disable at script init isn't enough; without the CharacterAdded
     # hook the disable wins for the first frame and is then silently undone
     # when the character actually loads.
-    # Roblox's CameraModule sets MouseBehavior every frame in its update loop,
-    # even after Controls:Disable(). One-shot disable at script init or on
-    # CharacterAdded gets silently undone the next frame. The reliable fix is
-    # a BindToRenderStep at Camera priority that pins MouseBehavior=LockCenter
-    # every frame — runs strictly after the CameraModule's update, so its
-    # value wins. Disable() is still called to suppress default movement input.
+    # PlayerModule's CameraModule writes MouseBehavior at init time (before
+    # the FPS controller's later set runs), and again on every CharacterAdded.
+    # Strategy: disable the PlayerModule controls (suppress default movement
+    # input), then explicitly assert MouseBehavior=LockCenter immediately
+    # after the disable in both code paths. In steady state, nothing pushes
+    # MouseBehavior — once we set it last, it stays — so no per-frame pin is
+    # needed. The FPS controller's own MouseBehavior set later in the script
+    # is then a redundant but harmless reaffirmation.
     setup = (
-        "-- u2r: PlayerModule controls disabled + MouseBehavior pinned per-frame\n"
-        "-- (FPS controller manages camera/mouse; the default PlayerModule\n"
-        "--  CameraModule resets MouseBehavior every frame, so we re-pin it.)\n"
+        "-- u2r: disable default PlayerModule controls + assert FPS mouse state\n"
+        "-- Re-applies on CharacterAdded because Roblox's character spawn flow\n"
+        "-- re-enables the default PlayerModule and resets MouseBehavior.\n"
         "do\n"
         "    local _lp = game:GetService(\"Players\").LocalPlayer\n"
         "    local _UIS = game:GetService(\"UserInputService\")\n"
-        "    local _RunService = game:GetService(\"RunService\")\n"
-        "    local function _disablePlayerModule()\n"
+        "    local function _applyFpsMouseState()\n"
         "        if not _lp then return end\n"
         "        local _ps = _lp:WaitForChild(\"PlayerScripts\", 10)\n"
         "        local _pm = _ps and _ps:WaitForChild(\"PlayerModule\", 10)\n"
-        "        if not _pm then return end\n"
-        "        local ok, mod = pcall(require, _pm)\n"
-        "        if not ok or not mod then return end\n"
-        "        local ok2, controls = pcall(function() return mod:GetControls() end)\n"
-        "        if ok2 and controls and controls.Disable then\n"
-        "            pcall(function() controls:Disable() end)\n"
+        "        if _pm then\n"
+        "            local ok, mod = pcall(require, _pm)\n"
+        "            if ok and mod then\n"
+        "                local ok2, controls = pcall(function() return mod:GetControls() end)\n"
+        "                if ok2 and controls and controls.Disable then\n"
+        "                    pcall(function() controls:Disable() end)\n"
+        "                end\n"
+        "            end\n"
         "        end\n"
+        "        _UIS.MouseBehavior = Enum.MouseBehavior.LockCenter\n"
+        "        _UIS.MouseIconEnabled = false\n"
         "    end\n"
-        "    _disablePlayerModule()\n"
+        "    _applyFpsMouseState()\n"
         "    if _lp then\n"
         "        _lp.CharacterAdded:Connect(function()\n"
         "            task.wait()  -- let Roblox finish its respawn handling first\n"
-        "            _disablePlayerModule()\n"
+        "            _applyFpsMouseState()\n"
         "        end)\n"
         "    end\n"
-        "    -- Pin MouseBehavior every frame at Camera priority so the default\n"
-        "    -- CameraModule's per-frame reset can't override the FPS lock.\n"
-        "    pcall(function()\n"
-        "        _RunService:BindToRenderStep(\"u2r_FpsMouseLock\", Enum.RenderPriority.Camera.Value, function()\n"
-        "            if _UIS.MouseBehavior ~= Enum.MouseBehavior.LockCenter then\n"
-        "                _UIS.MouseBehavior = Enum.MouseBehavior.LockCenter\n"
-        "            end\n"
-        "            if _UIS.MouseIconEnabled then\n"
-        "                _UIS.MouseIconEnabled = false\n"
-        "            end\n"
-        "        end)\n"
-        "    end)\n"
         "end\n\n"
     )
     for s in scripts:
