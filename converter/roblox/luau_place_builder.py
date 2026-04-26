@@ -880,46 +880,24 @@ def _emit_terrain(b: _LuauBuilder, place: RbxPlace) -> None:
     """Emit terrain generation via FillBlock calls.
 
     Since the Luau Execution API cannot set BinaryString properties
-    (SmoothGrid), we embed the terrain generator script's FillBlock
-    calls directly. This is the same approach used by the runtime
-    TerrainGenerator script fallback.
+    (SmoothGrid), we inline FillBlock bodies directly. The pipeline
+    populates ``place.headless_terrain_scripts`` with one Luau body per
+    terrain (kept off ``place.scripts`` so they don't get emitted into
+    the rbxlx — running them at Studio load would wipe the embedded
+    SmoothGrid via ``t:Clear()``).
     """
     if not place.terrains:
         return
-
-    # Find the TerrainGenerator script source — it contains FillBlock calls
-    terrain_script = None
-    for s in place.scripts:
-        if s.name == "TerrainGenerator":
-            terrain_script = s
-            break
-
-    if terrain_script:
-        # Inline the terrain generator as a self-contained function.
-        # Strip script-specific lines (attribute checks, Disabled=true)
-        # that don't apply in the headless context.
-        src = terrain_script.source
-        clean_lines = []
-        for line in src.split("\n"):
-            stripped = line.strip()
-            # Skip script lifecycle management
-            if stripped.startswith("if script:GetAttribute"):
-                continue
-            if stripped.startswith("script:SetAttribute"):
-                continue
-            if stripped.startswith("script.Disabled"):
-                continue
-            clean_lines.append(line)
-        clean_src = "\n".join(clean_lines)
-
-        # Paste the cleaned source directly in a do...end block
-        b.line("-- Terrain generation")
+    bodies = getattr(place, "headless_terrain_scripts", None) or []
+    if not bodies:
+        b.line("-- No terrain generator available")
+        return
+    for i, body in enumerate(bodies):
+        b.line(f"-- Terrain generation [{i + 1}/{len(bodies)}]")
         b.line("do")
-        for line in clean_lines:
+        for line in body.split("\n"):
             b._lines.append(line)
         b.line("end")
-    else:
-        b.line("-- No terrain generator available")
 
 
 # ---------------------------------------------------------------------------

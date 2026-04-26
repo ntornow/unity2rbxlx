@@ -182,22 +182,19 @@ def convert(
         from roblox.cloud_api import execute_luau
         from roblox.luau_place_builder import generate_place_luau
 
-        # Load universe/place IDs from CLI args or cached file. Use the same
-        # cache filename as the pipeline's resolve_assets phase so both code
-        # paths share state (was previously split: u2r wrote resolve_ids.json,
-        # pipeline read .roblox_ids.json — they never saw each other's IDs).
+        # Load universe/place IDs from CLI args or cached file. Same filename
+        # as the pipeline's resolve_assets phase so both code paths share state
+        # (was previously split: u2r wrote resolve_ids.json, pipeline read
+        # .roblox_ids.json — they never saw each other's IDs).
         ids_file = output_path / ".roblox_ids.json"
-        legacy_ids_file = output_path / "resolve_ids.json"
         uid, pid = universe_id, place_id
         if not uid or not pid:
-            for cache in (ids_file, legacy_ids_file):
-                if cache.exists():
-                    import json
-                    ids = json.loads(cache.read_text())
-                    uid, pid = ids.get("universe_id"), ids.get("place_id")
-                    if uid and pid:
-                        click.echo(f"  Reusing universe={uid} place={pid} (from {cache.name})")
-                        break
+            if ids_file.exists():
+                import json
+                ids = json.loads(ids_file.read_text())
+                uid, pid = ids.get("universe_id"), ids.get("place_id")
+                if uid and pid:
+                    click.echo(f"  Reusing universe={uid} place={pid}")
         if not uid or not pid:
             click.echo("  No universe/place IDs found.")
             click.echo("  Create an experience at https://create.roblox.com and pass:")

@@ -1775,35 +1775,26 @@ return table.concat(allData, "\\n")'''
                 except Exception as exc:
                     log.warning("[write_output] Failed to encode terrain SmoothGrid: %s", exc)
                 # Save terrain FillBlock script as a standalone file (for inspection)
-                # AND inject as a TerrainGenerator script so luau_place_builder can
-                # inline its FillBlock calls into the headless place reconstruction.
-                # The Open Cloud Luau Execution API cannot set the SmoothGrid
-                # BinaryString property, so the headless publish path needs the
-                # FillBlock fallback even though the rbxlx-Studio path uses SmoothGrid.
-                # The script self-disables on first run via the TerrainGenerated
-                # attribute, so it's a no-op when the place is opened from the rbxlx.
+                # AND register the body for headless publish consumption. The Open
+                # Cloud Luau Execution API cannot set the SmoothGrid BinaryString,
+                # so the headless place builder needs the FillBlock fallback.
+                #
+                # Crucially: the FillBlock body is NOT added to place.scripts. If
+                # it were, every Studio open would run a server script that begins
+                # with `t:Clear()` followed by ~9000 voxel_size=16 FillBlocks —
+                # wiping the high-fidelity SmoothGrid and replacing it with the
+                # coarse fallback. We instead store it on
+                # ``place.headless_terrain_scripts`` (a separate list) which the
+                # luau_place_builder reads but the rbxlx writer ignores. Multiple
+                # terrains contribute multiple entries (preserving all of them
+                # during headless bake — the previous single-named-script design
+                # silently dropped terrains 2+).
                 luau = generate_terrain_luau(terrain_data, rpos, voxel_size=16)
-                terrain_path = self.output_dir / "generate_terrain.luau"
+                terrain_path = self.output_dir / f"generate_terrain_{len(self.state.rbx_place.headless_terrain_scripts) + 1}.luau"
                 terrain_path.write_text(luau, encoding="utf-8")
                 log.info("[write_output] Terrain script saved to %s (%d chars)",
                          terrain_path.name, len(luau))
-                from core.roblox_types import RbxScript
-                terrain_script = RbxScript(
-                    name="TerrainGenerator",
-                    source=(
-                        "-- Auto-generated terrain from Unity heightmap\n"
-                        "-- Runs once on server start, then disables itself.\n"
-                        "-- Headless publish (luau_place_builder) inlines this with the\n"
-                        "-- attribute guard stripped, so terrain bakes into the saved place.\n"
-                        "if script:GetAttribute('TerrainGenerated') then return end\n\n"
-                        + luau + "\n\n"
-                        "script:SetAttribute('TerrainGenerated', true)\n"
-                        "script.Disabled = true\n"
-                    ),
-                    script_type="Script",
-                )
-                self.state.rbx_place.scripts.append(terrain_script)
-                log.info("[write_output] TerrainGenerator script injected for headless publish")
+                self.state.rbx_place.headless_terrain_scripts.append(luau)
 
         # MeshLoader: only inject if mesh resolution data is NOT available.
         # When resolve_assets has run, real MeshIds are already in the rbxlx

@@ -4141,34 +4141,63 @@ def _collect_post_processing(parsed_scene: ParsedScene, place: RbxPlace) -> None
                      pp.bloom_enabled, pp.color_correction_enabled, pp.dof_enabled, pp.sun_rays_enabled)
 
 
-def _fix_empty_mesh_parts(parts: list[RbxPart]) -> int:
-    """Surface MeshParts whose source mesh couldn't be resolved.
+def _fix_empty_mesh_parts(parts: list[RbxPart], _parent_model_part: "RbxPart | None" = None) -> int:
+    """Surface MeshParts whose source mesh couldn't be resolved + hide true empty anchors.
 
-    When a mesh GUID resolves to a non-FBX file (embedded prefab mesh, an LFS
-    pointer that wasn't fetched, or the source FBX is missing from the project),
-    the MeshPart gets no mesh_id. Previously these were silently hidden
-    (Transparency=1.0, size shrunk to 1x1x1) which masquerades source-asset
-    failures as the part not existing — entire models vanish if every mesh is
-    missing (e.g. a project where the rifle FBX was stripped and every prefab
-    part lost its visual). Now we downgrade to Part but keep the original size,
-    leave the part collidable, and color it magenta so the missing-asset failure
-    is visually obvious.
+    Two passes:
 
-    The previous heuristic that also hid plain gray Parts (assuming bone anchors
-    like LeftHand/RightHand) was too aggressive — for any prefab where every
-    visual part lost its mesh, the heuristic hid the entire model. True empty
-    Unity GameObjects are already hidden upstream in `_assemble_part` via the
-    `not has_visual` branch, so removing this heuristic doesn't regress that case.
+    1. ``MeshPart`` with no ``mesh_id`` → downgrade to ``Part`` and color magenta.
+       The mesh GUID resolved to something that isn't an FBX (embedded prefab
+       mesh, unfetched LFS pointer, missing source). Previously these were
+       silently hidden (Transparency=1, 1x1x1) which made entire models
+       disappear when every visual mesh was missing. Magenta keeps the failure
+       visible without claiming the part doesn't exist.
+
+    2. Plain gray, mesh-less, default-1x1x1 ``Part`` whose immediate parent is
+       a ``Model`` containing at least one visible-mesh sibling → hide as a
+       bone anchor. This is the narrow successor of the previous heuristic
+       which over-fired (hid every part of any model whose meshes were all
+       missing). Restricting to "model has at least one rendered MeshPart
+       sibling" preserves the original purpose (hiding LeftHand/RightHand
+       sockets in articulated models) without hiding the rifle in a project
+       whose rifle FBX is stripped.
     """
     MISSING_MESH_COLOR = (1.0, 0.0, 1.0)  # magenta — classic missing-texture marker
+    DEFAULT_GRAY = (0.63, 0.63, 0.63)
+    DEFAULT_SIZE = (1.0, 1.0, 1.0)
     count = 0
+    # Pre-scan: does the parent Model context have any actually-rendered
+    # MeshPart? If not, the bone-anchor heuristic should NOT fire for any
+    # of these siblings — the whole model is missing meshes (the rifle case).
+    parent_has_real_mesh = False
+    if _parent_model_part is not None:
+        for sib in parts:
+            if sib.class_name == "MeshPart" and getattr(sib, "mesh_id", ""):
+                parent_has_real_mesh = True
+                break
     for part in parts:
         if part.class_name == "MeshPart" and not part.mesh_id:
             part.class_name = "Part"
             part.color = MISSING_MESH_COLOR
             count += 1
-        if hasattr(part, 'children') and part.children:
-            count += _fix_empty_mesh_parts(part.children)
+        elif (
+            parent_has_real_mesh
+            and part.class_name == "Part"
+            and not getattr(part, "mesh_id", "")
+            and not getattr(part, "surface_appearance", None)
+            and getattr(part, "transparency", 0) < 1.0
+            and getattr(part, "color", None) == DEFAULT_GRAY
+            and getattr(part, "size", None) == DEFAULT_SIZE
+        ):
+            # Empty placeholder Part (default gray, default 1x1x1, no mesh, no
+            # texture) inside a Model that DOES have rendered meshes — this is
+            # the bone-anchor / socket pattern. Hide it.
+            part.transparency = 1.0
+            part.can_collide = False
+            count += 1
+        children = getattr(part, "children", None)
+        if children:
+            count += _fix_empty_mesh_parts(children, part)
     return count
 
 

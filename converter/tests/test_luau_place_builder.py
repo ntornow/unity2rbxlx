@@ -135,3 +135,110 @@ class TestLuauPlaceBuilder:
         script = generate_place_luau(place)
         assert "Parent" in script
         assert "Child" in script
+
+
+class TestWaterFillBlockChunking:
+    """Roblox Terrain:FillBlock has a 2048-stud-per-axis cap; oversized
+    regions silently no-op. The place builder must split big water planes
+    (e.g. SimpleFPS's 16km island ocean) into ≤2048-stud chunks.
+    """
+
+    def _place_with_water(self, size_xyz):
+        from core.roblox_types import RbxWaterRegion
+        place = RbxPlace()
+        # Need at least one part so the place builder generates a complete script
+        place.workspace_parts.append(RbxPart(
+            name="Anchor", class_name="Part",
+            cframe=RbxCFrame(), size=(4, 1, 4), anchored=True,
+        ))
+        place.water_regions.append(RbxWaterRegion(
+            position=(0.0, 14.28, 0.0), size=size_xyz, name="Ocean",
+        ))
+        return place
+
+    def test_oversized_water_is_chunked(self):
+        place = self._place_with_water((16069.0, 2.0, 16069.0))
+        script = generate_place_luau(place)
+        # Should emit multiple FillBlock(... Material.Water ...) calls
+        water_fills = script.count("Enum.Material.Water")
+        # 16069 / 2048 = 8 chunks per axis → 64 total
+        assert water_fills == 64, f"expected 64 chunks for 16069×16069 water, got {water_fills}"
+
+    def test_chunk_size_does_not_exceed_2048(self):
+        import re as _re
+        place = self._place_with_water((16069.0, 2.0, 16069.0))
+        script = generate_place_luau(place)
+        # Vector3.new(<x>, <y>, <z>) on the FillBlock lines — extract X size
+        sizes = _re.findall(
+            r"FillBlock\([^)]+\),Vector3\.new\(([\d.+-eE]+),([\d.+-eE]+),([\d.+-eE]+)\),Enum\.Material\.Water",
+            script,
+        )
+        assert sizes, "no parsed water FillBlock sizes"
+        for sx, _sy, sz in sizes:
+            assert float(sx) <= 2048.0, f"chunk X size {sx} exceeds 2048"
+            assert float(sz) <= 2048.0, f"chunk Z size {sz} exceeds 2048"
+
+    def test_small_water_is_not_chunked(self):
+        place = self._place_with_water((100.0, 2.0, 100.0))
+        script = generate_place_luau(place)
+        # Small region fits in one chunk
+        assert script.count("Enum.Material.Water") == 1
+
+
+class TestHeadlessTerrainEmit:
+    """The place builder reads terrain FillBlock bodies from
+    place.headless_terrain_scripts (NOT from place.scripts) so the embedded
+    SmoothGrid in the rbxlx isn't wiped at Studio-load by a runtime script.
+    Multi-terrain scenes contribute multiple bodies — all must be inlined.
+    """
+
+    def _place_with_terrains(self, n):
+        from core.roblox_types import RbxTerrain
+        place = RbxPlace()
+        place.workspace_parts.append(RbxPart(
+            name="Anchor", class_name="Part",
+            cframe=RbxCFrame(), size=(4, 1, 4), anchored=True,
+        ))
+        for i in range(n):
+            place.terrains.append(RbxTerrain(
+                position=(0.0, 0.0, 0.0), size=(1000, 600, 1000),
+            ))
+        return place
+
+    def test_emits_each_headless_body(self):
+        place = self._place_with_terrains(2)
+        place.headless_terrain_scripts.append("local t = workspace.Terrain\nt:FillBlock(CFrame.new(0,0,0), Vector3.new(4,4,4), Enum.Material.Grass)")
+        place.headless_terrain_scripts.append("local t = workspace.Terrain\nt:FillBlock(CFrame.new(50,0,0), Vector3.new(4,4,4), Enum.Material.Sand)")
+        script = generate_place_luau(place)
+        # Both bodies inlined, in their own do/end blocks
+        assert script.count("-- Terrain generation [1/2]") == 1
+        assert script.count("-- Terrain generation [2/2]") == 1
+        assert "Enum.Material.Grass" in script
+        assert "Enum.Material.Sand" in script
+
+    def test_terrain_present_but_no_headless_bodies_emits_marker(self):
+        place = self._place_with_terrains(1)
+        # No headless body registered → fallback to comment
+        script = generate_place_luau(place)
+        assert "-- No terrain generator available" in script
+
+    def test_no_terrain_emits_nothing(self):
+        place = RbxPlace()
+        place.workspace_parts.append(RbxPart(
+            name="Anchor", class_name="Part",
+            cframe=RbxCFrame(), size=(4, 1, 4), anchored=True,
+        ))
+        place.headless_terrain_scripts.append("ignored")
+        script = generate_place_luau(place)
+        # No terrain → don't emit anything terrain-related
+        assert "-- Terrain generation" not in script
+        assert "-- No terrain generator available" not in script
+
+    def test_terrain_bodies_not_in_place_scripts(self):
+        # Regression guard: the rbxlx writer reads place.scripts, so anything
+        # left in there is a runtime script that would run at Studio-load.
+        # The fix specifically moved terrain bodies OUT of place.scripts.
+        place = self._place_with_terrains(1)
+        place.headless_terrain_scripts.append("t:FillBlock(...)")
+        # The contract: scripts list does not contain a TerrainGenerator entry
+        assert not any(s.name == "TerrainGenerator" for s in place.scripts)

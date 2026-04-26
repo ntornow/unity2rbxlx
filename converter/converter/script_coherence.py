@@ -786,9 +786,11 @@ def _fix_prefab_lookups(scripts: list[RbxScript]) -> int:
     # Collect all script names to avoid redirecting module requires
     module_names = {s.name for s in scripts if s.script_type == "ModuleScript"}
     # Names that legitimately live in ReplicatedStorage and must NOT be redirected.
-    # "Templates" is the prefab_packages convention — ReplicatedStorage.Templates holds
-    # all emitted prefab templates that scripts :Clone() at runtime.
-    rs_resident_names = {"Templates"}
+    # ReplicatedStorage.<PREFAB_PACKAGES_FOLDER> holds emitted prefab templates that
+    # scripts :Clone() at runtime — single source of truth in prefab_packages so
+    # renaming the folder there flows through here automatically.
+    from converter.prefab_packages import PREFAB_PACKAGES_FOLDER
+    rs_resident_names = {PREFAB_PACKAGES_FOLDER}
 
     for s in scripts:
         original = s.source
@@ -1147,27 +1149,12 @@ def _disable_default_controls_in_fps_scripts(scripts: list[RbxScript]) -> int:
     same script can be cloned to multiple players without re-running.
     """
     fixes = 0
-    marker = "-- u2r: PlayerModule controls disabled"
-    # PlayerModule is loaded into PlayerScripts asynchronously by the default
-    # PlayerScriptsLoader. Player.luau runs early in character init, often
-    # before PlayerModule is present — so use WaitForChild (not FindFirstChild)
-    # to actually block until it's available, otherwise the disable silently
-    # no-ops and Roblox's default controls keep overriding MouseBehavior.
-    # Disable on script-init AND on every CharacterAdded — Roblox re-enables
-    # the default PlayerModule controls during character (re)spawn, so a
-    # one-shot disable at script init isn't enough; without the CharacterAdded
-    # hook the disable wins for the first frame and is then silently undone
-    # when the character actually loads.
-    # PlayerModule's CameraModule writes MouseBehavior at init time (before
-    # the FPS controller's later set runs), and again on every CharacterAdded.
-    # Strategy: disable the PlayerModule controls (suppress default movement
-    # input), then explicitly assert MouseBehavior=LockCenter immediately
-    # after the disable in both code paths. In steady state, nothing pushes
-    # MouseBehavior — once we set it last, it stays — so no per-frame pin is
-    # needed. The FPS controller's own MouseBehavior set later in the script
-    # is then a redundant but harmless reaffirmation.
+    # The marker line is the FIRST line of the prepended setup so an idempotent
+    # `marker in s.source` check works whether the function runs again on the
+    # same script (e.g. re-running write_output after editing on disk).
+    marker = "-- u2r: disable default PlayerModule controls"
     setup = (
-        "-- u2r: disable default PlayerModule controls + assert FPS mouse state\n"
+        f"{marker} + assert FPS mouse state\n"
         "-- Re-applies on CharacterAdded because Roblox's character spawn flow\n"
         "-- re-enables the default PlayerModule and resets MouseBehavior.\n"
         "do\n"
@@ -1222,17 +1209,18 @@ def _remove_stale_player_requires(scripts: list[RbxScript]) -> int:
         local Player = require(playerScript)
         local healthUpdate = playerScript:WaitForChild("HealthUpdate")
 
-    we need a coherent rewrite — earlier this function nuked the
-    WaitForChild("Player") line but left `require(playerScript)` and
-    `playerScript:WaitForChild("HealthUpdate")` orphaned (undefined
-    variable → "Attempted to call require with invalid argument(s)" at
-    runtime, killing the whole script).
+    rewrite all three idioms together so we don't leave an orphan use
+    of ``playerScript`` (would crash with "Attempted to call require with
+    invalid argument(s)" at runtime, killing the whole script).
 
-    New approach: when we find a `local NAME = ...:WaitForChild("Player")`
-    binding, redirect NAME to the actual LocalScript path
-    (`script.Parent:WaitForChild("Player")`) so the BindableEvent children
-    still resolve, and stub out `require(NAME)` since LocalScripts cannot
-    be required.
+    Strategy: redirect the binding to ``Players.LocalPlayer:WaitForChild
+    ("PlayerScripts"):WaitForChild("Player")`` (NOT ``script.Parent`` —
+    pipeline.write_output's BasePart-guard heuristic regexes
+    ``local \w+ = script.Parent\b`` and would prepend an early-exit guard
+    to any script whose parent is StarterPlayerScripts). Then stub out
+    ``require(NAME)`` since LocalScripts cannot be required.
+
+    Restricted to LocalScripts only — server-side code has no LocalPlayer.
     """
     fixes = 0
     # Check if Player is a LocalScript
@@ -1245,6 +1233,14 @@ def _remove_stale_player_requires(scripts: list[RbxScript]) -> int:
 
     for s in scripts:
         if s.name == 'Player':
+            continue
+        # Only rewrite client-side scripts. Server Scripts and ModuleScripts
+        # required from server-side code don't have access to LocalPlayer, so
+        # rewriting their `:WaitForChild("Player")` to `Players.LocalPlayer:...`
+        # would crash on the server (LocalPlayer is nil). The intent of this
+        # pass is purely to fix client scripts that thought Player was a
+        # ReplicatedStorage module — leave server-side alone.
+        if s.script_type != 'LocalScript':
             continue
         original = s.source
         # Find the variable bound to a Player WaitForChild lookup so we can
@@ -1275,17 +1271,18 @@ def _remove_stale_player_requires(scripts: list[RbxScript]) -> int:
                 + re.escape(varname)
                 + r'\s*\).*$'
             )
-            s.source = re.sub(
-                require_pattern,
-                r"\1local \2 = nil  -- Player is a LocalScript (not requirable); use BindableEvents on script.Parent.Player",
-                s.source,
-                flags=re.MULTILINE,
+            stub = (
+                r"\1local \2 = nil  -- Player is a LocalScript "
+                "(not requirable); use BindableEvent children on the Player "
+                "LocalScript instance"
             )
-        # Catch direct `require(...Player...)` calls where the require
-        # contains the literal string "Player" (no intermediate variable).
+            s.source = re.sub(require_pattern, stub, s.source, flags=re.MULTILINE)
+        # Catch direct `local X = require(<expr containing "Player">)` calls —
+        # a different shape from the binding case above (no intermediate
+        # variable, the lookup is inline in the require call).
         s.source = re.sub(
             r'^(\s*)local\s+(\w+)\s*=\s*require\([^)]*["\']Player["\'][^)]*\).*$',
-            r"\1local \2 = nil  -- Player is a LocalScript (not requirable from server)",
+            r"\1local \2 = nil  -- Player is a LocalScript (not requirable)",
             s.source,
             flags=re.MULTILINE,
         )

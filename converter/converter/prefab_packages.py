@@ -9,6 +9,12 @@ reference into an RbxPart tree, attached to the rbxlx's
 or use the generated ``PrefabSpawner.luau`` companion module for
 convenience + optional placement.
 
+The folder name is exported as :data:`PREFAB_PACKAGES_FOLDER` so other
+pipeline passes (notably ``script_coherence._fix_prefab_lookups``) can
+reference the same value without duplicating the literal — the folder
+legitimately lives in ReplicatedStorage and must be exempted from any
+RS-to-workspace lookup rewrite.
+
 **Filtering:** only prefabs referenced by at least one script's
 serialized field (from Phase 4.9's ``serialized_field_refs``) are
 emitted. Emitting every parsed prefab would bloat the rbxlx with
@@ -34,6 +40,13 @@ from typing import Any
 from core.roblox_types import RbxPart, RbxScript
 
 log = logging.getLogger(__name__)
+
+# Folder under ``ReplicatedStorage`` that holds the prefab templates.
+# Single source of truth — referenced by:
+#   - the generated PrefabSpawner.luau body in this file
+#   - script_coherence._fix_prefab_lookups (exempted from the
+#     RS-to-workspace rewrite, since the folder legitimately lives in RS)
+PREFAB_PACKAGES_FOLDER = "Templates"
 
 
 @dataclass
