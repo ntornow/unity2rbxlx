@@ -190,6 +190,8 @@ python u2r.py convert ../test_projects/SimpleFPS -o ./output/SimpleFPS --api-key
 - FBX mesh handedness: `fbx_binary.mirror_fbx_handedness()` negates X and Y in vertices/normals before upload (equivalent to 180° rotation around Z/vertical). This fixes asymmetric mesh features (text, logos) appearing on the wrong side in Roblox without affecting vertical positioning, triangle winding, or text orientation.
 
 ## Known Limitations
+
+### Pipeline / asset processing
 - FBX files with sub-mesh hierarchies use collider-based size fallback when Studio resolution not available
 - PSD/TGA/BMP/TIF texture files are auto-converted to PNG for upload (requires PIL/Pillow)
 - Animations are converted to TweenService scripts — works for property animations, skeletal uses Motor6D chain
@@ -197,9 +199,25 @@ python u2r.py convert ../test_projects/SimpleFPS -o ./output/SimpleFPS --api-key
 - Uploaded textures return Decal IDs which must be resolved to Image IDs via Studio MCP
 - Uploaded meshes return Model IDs which must be resolved to real MeshIds via Studio MCP
 - Git LFS pointer files are detected and skipped (actual FBX data needs LFS pull)
-- VFX Graph, particle SubEmitters, Tilemap, and Cloth have no Roblox equivalent (silently skipped)
-- **Roblox API limitation — font/video upload**: The Open Cloud API only supports Image, Model (mesh), and Audio asset types. Font files and video files must be uploaded manually via the [Creator Dashboard](https://create.roblox.com) and their asset IDs pasted into the converted place. UI text falls back to Roblox's default font; VideoFrame components are emitted with an empty video ID placeholder
-- Cross-scene constraint Part0/Part1 linking may fail for constraints spanning different scene roots
+
+### Unity features with no Roblox equivalent (silently skipped)
+- **Cloth simulation** — Roblox has no cloth physics primitive
+- **Wind zones** — Roblox has no wind volume primitive
+- **Blend shapes** — Roblox MeshPart has no morph target system
+- **Reflection probes** — Roblox handles reflections globally via Lighting; Future technology compensates
+- **Light probes** — Roblox handles indirect lighting globally; Future technology compensates
+- **VFX Graph + particle SubEmitters** — Roblox has no node-graph VFX primitive; ParticleEmitter approximation where possible
+- **Tilemap (2D)** — converted to thin Parts in a grid (not silently skipped, but limited; see `component_converter`)
+
+### Roblox API limits
+- **Font/video upload**: Open Cloud API only supports Image, Model (mesh), and Audio asset types. Fonts and videos must be uploaded manually via the [Creator Dashboard](https://create.roblox.com) and their asset IDs pasted into the converted place. UI text falls back to Roblox's default font; VideoFrame components are emitted with an empty video ID placeholder.
+
+### Cross-scene constraints
+- Constraint Part0/Part1 linking may fail for constraints spanning different scene roots. The converter resolves referents within a single scene's Part graph; Roblox places have no Unity-style multi-scene composition model.
+
+### Platform-rendering differences (visual divergence, not auto-fixed)
+- **Mesh Z-axis mirroring**: Unity is left-handed (Z-forward); Roblox is right-handed. The converter negates Z positions so objects land in the correct world location, but mesh geometry itself is not mirrored — asymmetric features (text, door handles, logos) render backwards. Possible fixes (none obviously correct): pre-rotate each mesh 180° around Y before upload (may affect skinning rigs), negative Z scale on CFrame (unreliable for MeshParts), or re-export FBXes with mirrored geometry. Documented as a known visual difference.
+- **Wire/grid mesh opacity**: Chain-link fences and similar thin-geometry meshes render as opaque in Roblox because the mesh renderer fills sub-pixel gaps between wires. Texture alpha could compensate via `AlphaMode=Transparency`, but the source Unity material is typically `_Mode=0` (Opaque), so changing it would alter the intended rendering mode.
 
 ## Test Projects (../test_projects/)
 - **SimpleFPS**: 2 scenes (TEXT YAML), 37+ scripts, 87+ prefabs -- primary test project
