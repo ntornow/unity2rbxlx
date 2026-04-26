@@ -329,14 +329,15 @@ def publish(
                     continue
                 pending_uploads.append(asset)
             # resolve_assets needs creator_id when mesh uploads have not all
-            # been resolved. Comparing counts against the on-disk resolution
-            # table catches the partial-resolution case where the previous
-            # heuristic (just "is mesh_native_sizes empty?") would let a
-            # publish ship placeholder MeshIds for the unresolved ones.
+            # been resolved. ``resolve_assets`` itself does NOT consult the
+            # blocklist — it tries to resolve every mesh in
+            # ``ctx.uploaded_assets`` — so the precheck must mirror that
+            # exactly: counting blocklisted uploaded meshes too. Otherwise
+            # a publish could skip the missing-creator_id error and ship
+            # placeholder MeshIds because resolve_assets later self-bails.
             uploaded_meshes = [
                 p for p in pipeline.ctx.uploaded_assets
                 if p.lower().endswith((".fbx", ".obj"))
-                and p not in blocklist
             ]
             resolved = pipeline.ctx.mesh_native_sizes
             unresolved_uploaded_meshes = [

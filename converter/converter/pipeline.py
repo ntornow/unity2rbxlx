@@ -1283,9 +1283,10 @@ class Pipeline:
                         "execute the generated scripts via Studio Command Bar.")
             return
 
-        # Persist IDs to cache file (survives context resets)
-        from roblox.id_cache import write_ids
-        write_ids(self.output_dir, universe_id, place_id)
+        # ID cache write deferred until after a successful resolve (below).
+        # Writing premature IDs here would poison the shared cache for any
+        # later u2r publish / interactive upload command if assemble was
+        # invoked with a typo'd or unauthorized experience ID.
 
         # Find uploaded mesh assets (Model IDs from cloud upload)
         mesh_assets = {k: v for k, v in self.ctx.uploaded_assets.items()
@@ -1378,6 +1379,10 @@ return table.concat(allData, "\\n")'''
             self.ctx.mesh_hierarchies = mesh_hierarchies
             log.info("[resolve_assets] Resolved %d meshes (%d sub-meshes total)",
                      len(mesh_native_sizes), sum(len(v) for v in mesh_hierarchies.values()))
+            # Persist IDs only AFTER a successful resolve so we know the
+            # uid/pid pair actually authenticated against Open Cloud.
+            from roblox.id_cache import write_ids
+            write_ids(self.output_dir, universe_id, place_id)
         else:
             log.warning("[resolve_assets] No mesh resolution data obtained")
 
