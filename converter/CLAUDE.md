@@ -189,17 +189,17 @@ python u2r.py convert ../test_projects/SimpleFPS -o ./output/SimpleFPS --api-key
 - Quaternion: (qx, qy, qz, qw)_unity -> (-qx, -qy, qz, qw)_roblox
 - FBX mesh handedness: `fbx_binary.mirror_fbx_handedness()` negates X and Y in vertices/normals before upload (equivalent to 180° rotation around Z/vertical). This fixes asymmetric mesh features (text, logos) appearing on the wrong side in Roblox without affecting vertical positioning, triangle winding, or text orientation.
 
-## Known Limitations
-- FBX files with sub-mesh hierarchies use collider-based size fallback when Studio resolution not available
-- PSD/TGA/BMP/TIF texture files are auto-converted to PNG for upload (requires PIL/Pillow)
-- Animations are converted to TweenService scripts — works for property animations, skeletal uses Motor6D chain
-- Terrain uses SmoothGrid binary encoding (reverse-engineered format, needs Studio verification) with FillBlock script fallback
-- Uploaded textures return Decal IDs which must be resolved to Image IDs via Studio MCP
-- Uploaded meshes return Model IDs which must be resolved to real MeshIds via Studio MCP
-- Git LFS pointer files are detected and skipped (actual FBX data needs LFS pull)
-- VFX Graph, particle SubEmitters, Tilemap, and Cloth have no Roblox equivalent (silently skipped)
-- **Roblox API limitation — font/video upload**: The Open Cloud API only supports Image, Model (mesh), and Audio asset types. Font files and video files must be uploaded manually via the [Creator Dashboard](https://create.roblox.com) and their asset IDs pasted into the converted place. UI text falls back to Roblox's default font; VideoFrame components are emitted with an empty video ID placeholder
-- Cross-scene constraint Part0/Part1 linking may fail for constraints spanning different scene roots
+## Reference Documentation
+
+User-facing documentation lives outside this file:
+
+- [`docs/UNSUPPORTED.md`](docs/UNSUPPORTED.md) — what the converter cannot do (platform limits, Unity features with no Roblox equivalent, API restrictions, rendering differences)
+- [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) — architectural debt and bug-shaped concerns
+- [`docs/FUTURE_IMPROVEMENTS.md`](docs/FUTURE_IMPROVEMENTS.md) — long-horizon, multi-PR strategic work
+- [`TODO.md`](TODO.md) — active PR-scoped work
+- [`TODO_archive.md`](TODO_archive.md) — historical work + per-phase PR execution logs
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — internal pipeline architecture
+- [`docs/design/`](docs/design/) — design decisions (inline-over-runtime policy, merge plan)
 
 ## Test Projects (../test_projects/)
 - **SimpleFPS**: 2 scenes (TEXT YAML), 37+ scripts, 87+ prefabs -- primary test project
