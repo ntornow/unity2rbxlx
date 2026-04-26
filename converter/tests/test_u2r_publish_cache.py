@@ -159,7 +159,8 @@ class TestRobloxIdsCacheTiming:
                 self.output_dir = Path(output_dir).resolve()
                 self.ctx = ctx_obj
                 self.state = _PState()
-            def run_through(self, *a, **k):
+            def run_through(self, *a, **k): pass
+            def _run_phase(self, phase):
                 pass
 
         monkeypatch.setattr(_pl_mod, "Pipeline", _StubPipeline)
@@ -230,7 +231,8 @@ class TestRobloxIdsCacheTiming:
                 self.output_dir = Path(output_dir).resolve()
                 self.ctx = ctx_obj
                 self.state = _PState()
-            def run_through(self, *a, **k):
+            def run_through(self, *a, **k): pass
+            def _run_phase(self, phase):
                 pass
 
         monkeypatch.setattr(_pl_mod, "Pipeline", _StubPipeline)
@@ -267,6 +269,104 @@ class TestRobloxIdsCacheTiming:
             f"{result.output[:1500]}"
         )
         assert ran_publish, "should reach publish_place — no pending uploads after blocklist filter"
+
+    def test_publish_runs_moderation_before_pending_check(self, tmp_path, monkeypatch):
+        """moderate_assets auto-extends .upload_blocklist with filename-
+        violation entries. The publish precheck must run moderation BEFORE
+        computing pending_uploads, otherwise an output whose remaining
+        pending assets would be moderation-blocked false-positives the
+        creator_id requirement. Regression caught by Codex round 10.
+        """
+        import config as _config
+        monkeypatch.setattr(_config, "ROBLOX_API_KEY", "")
+        monkeypatch.setattr(_config, "ROBLOX_CREATOR_ID", None)
+        monkeypatch.delenv("ROBLOX_API_KEY", raising=False)
+        monkeypatch.delenv("ROBLOX_CREATOR_ID", raising=False)
+
+        unity = tmp_path / "FakeProject"
+        (unity / "Assets").mkdir(parents=True)
+        out = tmp_path / "out"
+        out.mkdir()
+
+        from converter import pipeline as _pl_mod
+        from core.conversion_context import ConversionContext
+        from core.unity_types import AssetEntry, AssetManifest
+
+        ctx_obj = ConversionContext(unity_project_path=str(unity.resolve()))
+        ctx_obj.save(out / "conversion_context.json")
+
+        ran_publish = []
+        run_log: list[str] = []
+
+        class _PState:
+            asset_manifest = AssetManifest(
+                project_root=unity,
+                assets=[AssetEntry(
+                    path=unity / "Assets" / "moderation_blocked.png",
+                    relative_path=Path("Assets/moderation_blocked.png"),
+                    kind="texture",
+                    size_bytes=100,
+                )],
+                total_size_bytes=100,
+            )
+            rbx_place = object()
+
+        class _StubPipeline:
+            ESSENTIAL_PHASES = _pl_mod.Pipeline.ESSENTIAL_PHASES
+            def __init__(self, *, unity_project_path, output_dir, **_):
+                self.unity_project_path = Path(unity_project_path).resolve()
+                self.output_dir = Path(output_dir).resolve()
+                self.ctx = ctx_obj
+                self.state = _PState()
+            def run_through(self, *a, **k):
+                run_log.append(f"run_through:{a[0] if a else '?'}")
+            def _run_phase(self, phase):
+                run_log.append(f"_run_phase:{phase}")
+                # Stand in for moderate_assets writing the blocklist:
+                # the asset has a violating name, so moderation adds it
+                # to .upload_blocklist before the precheck reads it.
+                if phase == "moderate_assets":
+                    blocklist_path = self.output_dir / ".upload_blocklist"
+                    blocklist_path.write_text("Assets/moderation_blocked.png\n")
+
+        monkeypatch.setattr(_pl_mod, "Pipeline", _StubPipeline)
+
+        from roblox import place_publisher
+        from roblox.place_publisher import PublishResult
+        monkeypatch.setattr(
+            place_publisher, "publish_place",
+            lambda *a, **kw: ran_publish.append(True) or PublishResult(
+                success=True, chunks=1, total_bytes=10,
+                script_path=Path(a[4]) / "place_builder.luau",
+            ),
+        )
+        monkeypatch.setattr(
+            place_publisher, "publish_cached_chunks",
+            lambda *a, **kw: None,
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "publish", str(out),
+                "--api-key", "stub",
+                "--universe-id", "1",
+                "--place-id", "2",
+            ],
+            catch_exceptions=False,
+        )
+
+        # Order check: moderate_assets must run before precheck (and
+        # thus before publish_place). The asset would otherwise count
+        # as pending and trigger the creator_id error.
+        moderate_calls = [r for r in run_log if r == "_run_phase:moderate_assets"]
+        assert moderate_calls, f"moderate_assets did not run: {run_log}"
+        assert "creator-id" not in result.output.lower() and "creator_id" not in result.output.lower(), (
+            f"creator-id wrongly demanded — moderation should have blocklisted "
+            f"the only pending asset:\n{result.output[:1500]}"
+        )
+        assert ran_publish, "should reach publish_place after moderation"
 
     def test_publish_rebuild_does_not_demand_creator_id_when_nothing_pending(
         self, tmp_path, monkeypatch,
@@ -318,7 +418,8 @@ class TestRobloxIdsCacheTiming:
                 self.output_dir = Path(output_dir).resolve()
                 self.ctx = ctx_obj
                 self.state = _PState()
-            def run_through(self, *a, **k):
+            def run_through(self, *a, **k): pass
+            def _run_phase(self, phase):
                 pass
 
         monkeypatch.setattr(_pl_mod, "Pipeline", _StubPipeline)

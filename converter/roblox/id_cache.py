@@ -35,7 +35,10 @@ def read_ids(output_dir: Path) -> tuple[int | None, int | None]:
     the previous experience, so we pick the file with the most recent
     mtime when both are valid.
     """
-    candidates: list[tuple[float, int, int]] = []
+    # (mtime, canonical_pref, uid, pid). canonical_pref=1 wins ties so an
+    # equal-mtime case (e.g. after zip/unzip normalizes timestamps across
+    # files) is broken deterministically by filename, not by numeric IDs.
+    candidates: list[tuple[float, int, int, int]] = []
     for name in (CANONICAL, LEGACY):
         path = output_dir / name
         if not path.exists():
@@ -49,12 +52,14 @@ def read_ids(output_dir: Path) -> tuple[int | None, int | None]:
         uid = data.get("universe_id")
         pid = data.get("place_id")
         if uid and pid:
-            candidates.append((mtime, int(uid), int(pid)))
+            canonical_pref = 1 if name == CANONICAL else 0
+            candidates.append((mtime, canonical_pref, int(uid), int(pid)))
 
     if not candidates:
         return None, None
-    candidates.sort(reverse=True)  # newest mtime first
-    return candidates[0][1], candidates[0][2]
+    # Higher mtime wins; at equal mtime, canonical (1) beats legacy (0).
+    candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
+    return candidates[0][2], candidates[0][3]
 
 
 def write_ids(output_dir: Path, universe_id: int, place_id: int) -> Path:

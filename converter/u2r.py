@@ -287,12 +287,15 @@ def publish(
         pipeline.ctx.universe_id = uid
         pipeline.ctx.place_id = pid
 
-        # Run prereqs through extract_assets so we can check whether any
-        # assets actually need uploading before deciding whether to demand
-        # a creator_id. Outputs whose ctx.uploaded_assets already covers
-        # the manifest don't need creator_id; this is the
-        # rebuild-from-fully-uploaded-state workflow.
+        # Run prereqs through extract_assets + moderate_assets so we can
+        # check whether any assets actually need uploading before deciding
+        # whether to demand a creator_id. moderate_assets must run before
+        # the precheck because it auto-extends .upload_blocklist with
+        # filename-violation entries — without it, the precheck would
+        # false-positive when the only "pending" assets are ones the
+        # subsequent pipeline would moderate-block anyway.
         pipeline.run_through("extract_assets")
+        pipeline._run_phase("moderate_assets")
 
         # Mirror upload_assets's eligibility filter: extensions per kind,
         # blocklist entries from .upload_blocklist, and the dedupe against
@@ -355,16 +358,18 @@ def publish(
                 "the output directory's parent."
             ); return
 
-        # Skip already-completed prereqs on the second run_through. Cloud
-        # phases get force_rerun so a fully-uploaded ctx still triggers
-        # resolve_assets / re-emits the rbxlx with current asset state.
-        skip: set[str] = {"parse", "extract_assets"}
+        # Skip already-completed prereqs on the second run_through.
+        # moderate_assets ran above as part of the precheck, so it goes
+        # in skip, not force_rerun. Upload + resolve still need
+        # force_rerun so they fire even if completed_phases marks them
+        # done from a prior run.
+        skip: set[str] = {"parse", "extract_assets", "moderate_assets"}
         if (
             "transpile_scripts" in pipeline.ctx.completed_phases
             and scripts_cache_intact(output_path, pipeline.ctx.transpiled_scripts)
         ):
             skip.add("transpile_scripts")
-        force_rerun = {"moderate_assets", "upload_assets", "resolve_assets"}
+        force_rerun = {"upload_assets", "resolve_assets"}
         pipeline.run_through("write_output", skip=skip, force_rerun=force_rerun)
 
         if pipeline.state.rbx_place is None:
