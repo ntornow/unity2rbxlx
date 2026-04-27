@@ -55,6 +55,24 @@ _SERVER_ONLY_PATTERNS = [
 ]
 
 
+def _module_require_body(name: str) -> str:
+    """Return the body of a ``require(...)`` lookup that survives the storage
+    classifier's split between ReplicatedStorage and ServerStorage.
+
+    The classifier (``storage_classifier.classify_storage``) parents a
+    ModuleScript in ServerStorage when only server-side callers require it,
+    so a hardcoded ``ReplicatedStorage:FindFirstChild`` lookup returns nil
+    and ``require(nil)`` raises at runtime. The fallback chain covers both
+    containers; a client script that erroneously asks for a server-only
+    module still gets nil (visible failure) rather than reaching a
+    forbidden container.
+    """
+    return (
+        f'game:GetService("ReplicatedStorage"):FindFirstChild("{name}", true)'
+        f' or game:GetService("ServerStorage"):FindFirstChild("{name}", true)'
+    )
+
+
 def inject_require_calls(
     scripts: list[RbxScript],
     dependency_map: dict[str, list[str]],
@@ -152,8 +170,7 @@ def inject_require_calls(
                     target.source = "\n".join(tgt_lines)
 
             require_lines.append(
-                f'local {dep} = require(game:GetService("ReplicatedStorage")'
-                f':FindFirstChild("{dep}", true))'
+                f'local {dep} = require({_module_require_body(dep)})'
             )
 
         if require_lines:
@@ -519,14 +536,12 @@ def _break_circular_requires(scripts: list[RbxScript]) -> int:
                     lazy = (
                         f'local {dep} = setmetatable({{}}, {{\n'
                         f'    __index = function(_, k)\n'
-                        f'        local mod = require(game:GetService("ReplicatedStorage")'
-                        f':FindFirstChild("{dep}", true))\n'
+                        f'        local mod = require({_module_require_body(dep)})\n'
                         f'        {dep} = mod  -- replace proxy with real module\n'
                         f'        return mod[k]\n'
                         f'    end,\n'
                         f'    __call = function(_, ...)\n'
-                        f'        local mod = require(game:GetService("ReplicatedStorage")'
-                        f':FindFirstChild("{dep}", true))\n'
+                        f'        local mod = require({_module_require_body(dep)})\n'
                         f'        {dep} = mod\n'
                         f'        return mod(...)\n'
                         f'    end,\n'

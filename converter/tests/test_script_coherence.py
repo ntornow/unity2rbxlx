@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.roblox_types import RbxScript
 from converter.script_coherence import (
     fix_require_classifications,
+    inject_require_calls,
     _break_circular_requires,
     _fix_clone_visibility,
     _fix_prefab_lookups,
@@ -300,6 +301,48 @@ class TestFixCloneVisibility:
         second = _fix_clone_visibility(scripts)
         assert second == 0
         assert scripts[0].source.count("Fix clone visibility and weld") == 1
+
+
+class TestInjectRequireCallsFallback:
+    """The storage classifier may park a server-only ModuleScript in
+    ServerStorage instead of ReplicatedStorage. Hardcoding the require
+    target to ReplicatedStorage produces ``require(nil)`` at runtime.
+
+    The injected require must search both ReplicatedStorage AND
+    ServerStorage so it survives whichever container the classifier picks.
+
+    Regression for the SimpleFPS GerstnerDisplace error surfaced via Studio
+    smoke test on 2026-04-27 — Displace was parented under ServerStorage
+    but GerstnerDisplace's require looked in ReplicatedStorage.
+    """
+
+    def test_emitted_require_searches_both_storages(self):
+        scripts = [
+            RbxScript(name="Caller", source="-- empty\n", script_type="Script"),
+            RbxScript(name="Helper", source="local M = {}\nreturn M\n", script_type="Script"),
+        ]
+        injected = inject_require_calls(scripts, {"Caller": ["Helper"]})
+        assert injected == 1
+        src = scripts[0].source
+        assert 'local Helper = require(' in src
+        assert 'ReplicatedStorage' in src
+        assert 'ServerStorage' in src
+        assert ' or ' in src  # fallback chain glue
+
+    def test_no_injection_for_already_present_require(self):
+        # If the caller already requires Helper, don't double-inject.
+        existing = (
+            'local Helper = require(game:GetService("ReplicatedStorage")'
+            ':FindFirstChild("Helper", true))\n'
+        )
+        scripts = [
+            RbxScript(name="Caller", source=existing, script_type="Script"),
+            RbxScript(name="Helper", source="local M = {}\nreturn M\n", script_type="Script"),
+        ]
+        injected = inject_require_calls(scripts, {"Caller": ["Helper"]})
+        assert injected == 0
+        # Original require line is preserved verbatim.
+        assert existing.strip() in scripts[0].source
 
 
 class TestFixPrefabLookupsTemplatesExemption:
