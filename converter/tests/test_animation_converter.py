@@ -351,6 +351,137 @@ AnimationClip:
         assert len(clip.curves) == 0
 
 
+class TestBinaryAnimParsing:
+    """Binary .anim files route through UnityPy. We mock the UnityPy
+    surface to avoid needing a binary fixture in-tree -- the seam under
+    test is whether the typetree dict is fed correctly to _parse_clip_body."""
+
+    def _binary_anim_file(self, tmp_path: Path) -> Path:
+        """Create a non-YAML byte file so is_text_yaml() returns False."""
+        f = tmp_path / "binary.anim"
+        f.write_bytes(b"\x00\x01\x02UnityFS\x00not-yaml")
+        return f
+
+    def _make_fake_env(self, typetree: dict[str, Any]):
+        """Build a stand-in for UnityPy's Environment with a single
+        AnimationClip object whose read_typetree() returns typetree."""
+        class _FakeType:
+            name = "AnimationClip"
+
+        class _FakeObj:
+            type = _FakeType()
+            def read_typetree(self) -> dict[str, Any]:
+                return typetree
+
+        class _FakeEnv:
+            objects = [_FakeObj()]
+
+        return _FakeEnv()
+
+    def test_binary_anim_lowers_to_clip_body(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Binary anim with a position curve produces an AnimClip identical
+        in shape to the YAML path."""
+        import UnityPy
+
+        typetree: dict[str, Any] = {
+            "m_Name": "binary_open",
+            "m_SampleRate": 60.0,
+            "m_AnimationClipSettings": {
+                "m_StartTime": 0.0,
+                "m_StopTime": 1.0,
+                "m_LoopTime": 0,
+            },
+            "m_PositionCurves": [{
+                "path": "",
+                "curve": {
+                    "m_Curve": [
+                        {"time": 0.0, "value": {"x": 0.0, "y": 0.0, "z": 0.0}},
+                        {"time": 1.0, "value": {"x": 0.0, "y": 4.0, "z": 0.0}},
+                    ],
+                },
+            }],
+            "m_RotationCurves": [],
+            "m_EulerCurves": [],
+            "m_ScaleCurves": [],
+            "m_FloatCurves": [],
+            "m_Events": [],
+        }
+        fake_env = self._make_fake_env(typetree)
+        monkeypatch.setattr(UnityPy, "load", lambda _path: fake_env)
+
+        clip = parse_anim_file(self._binary_anim_file(tmp_path))
+        assert clip is not None
+        assert clip.name == "binary_open"
+        assert clip.duration == pytest.approx(1.0)
+        assert clip.loop is False
+        assert clip.sample_rate == 60.0
+        assert len(clip.curves) == 1
+
+        curve = clip.curves[0]
+        assert curve.property_type == "position"
+        assert len(curve.keyframes) == 2
+        assert curve.keyframes[0].value == pytest.approx((0.0, 0.0, 0.0))
+        assert curve.keyframes[1].value == pytest.approx((0.0, 4.0, 0.0))
+
+    def test_binary_anim_no_clip_object_returns_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A binary file with no AnimationClip yields None (skipped)."""
+        import UnityPy
+
+        class _FakeType:
+            name = "GameObject"
+
+        class _FakeObj:
+            type = _FakeType()
+            def read_typetree(self) -> dict[str, Any]:
+                return {}
+
+        class _FakeEnv:
+            objects = [_FakeObj()]
+
+        monkeypatch.setattr(UnityPy, "load", lambda _path: _FakeEnv())
+        clip = parse_anim_file(self._binary_anim_file(tmp_path))
+        assert clip is None
+
+    def test_binary_anim_unitypy_load_failure_returns_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If UnityPy raises on load, the function returns None instead of
+        propagating -- a malformed file shouldn't crash the pipeline."""
+        import UnityPy
+
+        def _boom(_path: str):
+            raise RuntimeError("not a real serialized file")
+
+        monkeypatch.setattr(UnityPy, "load", _boom)
+        clip = parse_anim_file(self._binary_anim_file(tmp_path))
+        assert clip is None
+
+    def test_binary_anim_typetree_failure_returns_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If read_typetree raises, the function returns None."""
+        import UnityPy
+
+        class _FakeType:
+            name = "AnimationClip"
+
+        class _FakeObj:
+            type = _FakeType()
+            def read_typetree(self) -> dict[str, Any]:
+                raise RuntimeError("typetree corrupt")
+
+        class _FakeEnv:
+            objects = [_FakeObj()]
+
+        monkeypatch.setattr(UnityPy, "load", lambda _path: _FakeEnv())
+        clip = parse_anim_file(self._binary_anim_file(tmp_path))
+        assert clip is None
+
+
 # ---------------------------------------------------------------------------
 # Test .controller parsing
 # ---------------------------------------------------------------------------

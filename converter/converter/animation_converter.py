@@ -251,6 +251,11 @@ class AnimationConversionResult:
 def parse_anim_file(anim_path: Path) -> AnimClip | None:
     """Parse a Unity .anim file and return an AnimClip.
 
+    Handles both text YAML (ForceText / Mixed serialization) and binary
+    (ForceBinary). Binary files are read via UnityPy and lowered to the
+    same dict shape the YAML parser produces, so ``_parse_clip_body``
+    consumes either path identically.
+
     Args:
         anim_path: Path to the .anim file.
 
@@ -262,8 +267,7 @@ def parse_anim_file(anim_path: Path) -> AnimClip | None:
         return None
 
     if not is_text_yaml(anim_path):
-        log.debug("Animation file is binary, skipping: %s", anim_path.name)
-        return None
+        return _parse_anim_binary(anim_path)
 
     try:
         raw_text = anim_path.read_text(encoding="utf-8", errors="replace")
@@ -282,6 +286,48 @@ def parse_anim_file(anim_path: Path) -> AnimClip | None:
         body = doc_body(doc)
         return _parse_clip_body(body, anim_path)
 
+    return None
+
+
+def _parse_anim_binary(anim_path: Path) -> AnimClip | None:
+    """Parse a binary-encoded .anim via UnityPy.
+
+    UnityPy's typetree dump uses the same Unity field names the YAML parser
+    expects (m_Name, m_PositionCurves, m_RotationCurves, m_EulerCurves,
+    m_ScaleCurves, m_FloatCurves, m_SampleRate, m_Events,
+    m_AnimationClipSettings) so we delegate to the existing
+    ``_parse_clip_body`` after reading the typetree.
+    """
+    try:
+        import UnityPy  # type: ignore[import-untyped]
+    except ImportError:
+        log.warning(
+            "Binary .anim parsing requires UnityPy. Install with: pip install UnityPy "
+            "(skipping %s)", anim_path.name,
+        )
+        return None
+
+    try:
+        env = UnityPy.load(str(anim_path))
+    except Exception as exc:  # UnityPy raises a variety of errors on malformed input
+        log.warning("UnityPy failed to load %s: %s", anim_path.name, exc)
+        return None
+
+    for obj in env.objects:
+        if obj.type.name != "AnimationClip":
+            continue
+        try:
+            body = obj.read_typetree()
+        except Exception as exc:
+            log.warning(
+                "UnityPy failed to read typetree for %s: %s", anim_path.name, exc,
+            )
+            return None
+        if not isinstance(body, dict):
+            continue
+        return _parse_clip_body(body, anim_path)
+
+    log.debug("No AnimationClip object found in binary file %s", anim_path.name)
     return None
 
 
