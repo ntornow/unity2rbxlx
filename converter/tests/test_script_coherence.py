@@ -11,6 +11,7 @@ from core.roblox_types import RbxScript
 from converter.script_coherence import (
     fix_require_classifications,
     _break_circular_requires,
+    _fix_clone_visibility,
     _fix_prefab_lookups,
     _remove_stale_player_requires,
     _disable_default_controls_in_fps_scripts,
@@ -207,6 +208,98 @@ class TestBreakCircularRequires:
         fixes = _break_circular_requires(scripts)
         assert fixes == 1  # Only one direction broken
 
+
+
+class TestFixCloneVisibility:
+    """The injected clone-visibility helper used to read `clone.PrimaryPart`
+    unconditionally. PrimaryPart only exists on Model — a bare-Part clone
+    raises 'PrimaryPart is not a valid member of Part' at runtime, even when
+    the read is the LHS of an `or`. The fix wraps the access in an IsA
+    branch so the helper works for both Part and Model clones.
+
+    Regression for the SimpleFPS HostilePlane error surfaced via Studio
+    smoke test on 2026-04-27.
+    """
+
+    def _wrap(self, clone_block: str) -> str:
+        # _fix_clone_visibility scans for a `local X = Y:Clone()` line
+        # followed within 20 lines by `X.Parent`. Provide both anchors.
+        return (
+            "local templates = ReplicatedStorage:FindFirstChild(\"Templates\")\n"
+            "local prefab = templates:FindFirstChild(\"Bullet\")\n"
+            f"{clone_block}\n"
+            "    bullet.Parent = workspace\n"
+            "end\n"
+        )
+
+    def test_unguarded_primarypart_access_is_replaced(self):
+        scripts = [
+            RbxScript(
+                name="Shooter",
+                source=self._wrap("if prefab then\n    local bullet = prefab:Clone()"),
+                script_type="Script",
+            ),
+        ]
+        fixes = _fix_clone_visibility(scripts)
+        assert fixes == 1
+        # The bare `bullet.PrimaryPart or ...` pattern must NOT appear.
+        assert "local _primary = bullet.PrimaryPart or" not in scripts[0].source
+        # The IsA-guarded branch should be present.
+        assert "if bullet:IsA(\"BasePart\") then" in scripts[0].source
+        assert "elseif bullet:IsA(\"Model\") then" in scripts[0].source
+
+    def test_part_branch_resets_visibility_on_the_clone_itself(self):
+        # When the clone IS a BasePart, the helper must reset Transparency,
+        # Anchored, CanCollide on the clone itself (descendants don't include it).
+        scripts = [
+            RbxScript(
+                name="Shooter",
+                source=self._wrap("if prefab then\n    local bullet = prefab:Clone()"),
+                script_type="Script",
+            ),
+        ]
+        _fix_clone_visibility(scripts)
+        src = scripts[0].source
+        # Locate the BasePart branch and verify all three resets are inside it.
+        part_branch_start = src.index("if bullet:IsA(\"BasePart\") then")
+        part_branch_end = src.index("elseif bullet:IsA(\"Model\") then")
+        part_branch = src[part_branch_start:part_branch_end]
+        assert "bullet.Transparency = 0" in part_branch
+        assert "bullet.Anchored = false" in part_branch
+        assert "bullet.CanCollide = false" in part_branch
+        assert "_primary = bullet" in part_branch
+
+    def test_model_branch_resolves_primary_from_primarypart_or_descendant(self):
+        scripts = [
+            RbxScript(
+                name="Shooter",
+                source=self._wrap("if prefab then\n    local bullet = prefab:Clone()"),
+                script_type="Script",
+            ),
+        ]
+        _fix_clone_visibility(scripts)
+        src = scripts[0].source
+        model_branch_start = src.index("elseif bullet:IsA(\"Model\") then")
+        model_branch_end = src.index("end\n", model_branch_start)
+        model_branch = src[model_branch_start:model_branch_end]
+        # Reading PrimaryPart inside an IsA("Model") branch is safe.
+        assert "_primary = bullet.PrimaryPart or bullet:FindFirstChildWhichIsA(\"BasePart\")" in model_branch
+
+    def test_idempotent_on_repeat_application(self):
+        # If the fix has already been applied (marker in source), don't
+        # re-inject — would produce duplicate _primary declarations.
+        scripts = [
+            RbxScript(
+                name="Shooter",
+                source=self._wrap("if prefab then\n    local bullet = prefab:Clone()"),
+                script_type="Script",
+            ),
+        ]
+        first = _fix_clone_visibility(scripts)
+        assert first == 1
+        second = _fix_clone_visibility(scripts)
+        assert second == 0
+        assert scripts[0].source.count("Fix clone visibility and weld") == 1
 
 
 class TestFixPrefabLookupsTemplatesExemption:
