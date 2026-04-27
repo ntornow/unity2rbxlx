@@ -944,9 +944,21 @@ def _fix_clone_visibility(scripts: list[RbxScript]) -> int:
                     i4 = " " * (indent + 4)
                     i8 = " " * (indent + 8)
                     i12 = " " * (indent + 12)
+                    # PrimaryPart only exists on Model. A bare-Part clone
+                    # raises "PrimaryPart is not a valid member" at runtime
+                    # if we read it without an IsA guard, even when the read
+                    # is the LHS of an `or`. Branch by class first.
                     fix_code = (
                         f'\n{i4}-- Fix clone visibility and weld sub-mesh parts together\n'
-                        f'{i4}local _primary = {clone_var}.PrimaryPart or {clone_var}:FindFirstChildWhichIsA("BasePart")\n'
+                        f'{i4}local _primary\n'
+                        f'{i4}if {clone_var}:IsA("BasePart") then\n'
+                        f'{i8}_primary = {clone_var}\n'
+                        f'{i8}{clone_var}.Transparency = 0\n'
+                        f'{i8}{clone_var}.Anchored = false\n'
+                        f'{i8}{clone_var}.CanCollide = false\n'
+                        f'{i4}elseif {clone_var}:IsA("Model") then\n'
+                        f'{i8}_primary = {clone_var}.PrimaryPart or {clone_var}:FindFirstChildWhichIsA("BasePart")\n'
+                        f'{i4}end\n'
                         f'{i4}for _, _p in {clone_var}:GetDescendants() do\n'
                         f'{i8}if _p:IsA("BasePart") then\n'
                         f'{i12}_p.Transparency = 0\n'
