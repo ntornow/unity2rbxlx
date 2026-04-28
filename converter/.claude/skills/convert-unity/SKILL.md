@@ -74,9 +74,12 @@ Bootstrap emission, spawner wiring, animator-on-clone bindings, and residual tra
 
 Screen every asset against Roblox's published safety standards first. Only run `assemble` after moderation comes back clean (see the reference file for standards, screening rules, and halting behaviour).
 
+If the project has FBX/OBJ meshes, ask the user for `--universe-id` / `--place-id` *before* running assemble — `resolve_assets` halts without them on first run rather than emitting a broken local rbxlx. Once cached in `.roblox_ids.json` after a successful publish, omit them.
+
 ```bash
 python3 convert_interactive.py assemble <unity_project_path> <output_dir> \
-  --api-key ../apikey --creator-id ../creator_id 2>/dev/null
+  --api-key ../apikey --creator-id ../creator_id \
+  --universe-id <UID> --place-id <PID> 2>/dev/null
 ```
 
 ### Step 6: Upload & Publish — `references/phase-6-upload.md`

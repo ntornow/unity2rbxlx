@@ -75,10 +75,15 @@ Also log a `[moderation]` line with counts and the first few violations.
 
 ```bash
 python3 convert_interactive.py assemble <unity_project_path> <output_dir> \
-  --api-key ../apikey --creator-id ../creator_id 2>/dev/null
+  --api-key ../apikey --creator-id ../creator_id \
+  --universe-id <UID> --place-id <PID> 2>/dev/null
 ```
 
-Use `--no-upload` for a dry-run with placeholder URLs, or `--no-resolve` to skip the headless mesh resolver.
+Pass `--universe-id` / `--place-id` whenever the project has FBX/OBJ meshes — `resolve_assets` needs them to call `CreateMeshPartAsync` and embed real Mesh IDs in the local rbxlx. Without them, `resolve_assets` halts with a clear error rather than silently emitting a broken artifact (Studio's `MeshContentProvider` cannot fetch raw Model IDs as MeshIds, so geometry vanishes and the spawned character has no floor to stand on).
+
+The IDs are cached in `<output>/.roblox_ids.json` after the first successful publish, so subsequent assemble runs can omit them.
+
+Use `--no-upload` for a dry-run with placeholder URLs (skips upload + resolve entirely), or `--no-resolve` to skip the headless mesh resolver only (the rbxlx will carry Model IDs and Studio cannot render them — only useful for upload-only workflows).
 
 ### Pipeline phases run
 

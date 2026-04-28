@@ -689,9 +689,18 @@ def validate(output_dir: str, write: bool) -> None:
               help="Roblox Open Cloud API key (string or path to file).")
 @click.option("--creator-id", type=str, default=None,
               help="Roblox Creator ID (number or path to file).")
+@click.option("--universe-id", type=int, default=None,
+              help="Roblox Universe ID for headless mesh resolution. "
+              "Required for the local converted_place.rbxlx to be valid "
+              "when the project has FBX/OBJ meshes. Cached after the "
+              "first successful publish in <output>/.roblox_ids.json.")
+@click.option("--place-id", type=int, default=None,
+              help="Roblox Place ID for headless mesh resolution "
+              "(see --universe-id).")
 def assemble(unity_project_path: str, output_dir: str,
              no_upload: bool, no_resolve: bool, retranspile: bool,
-             api_key: str | None, creator_id: str | None) -> None:
+             api_key: str | None, creator_id: str | None,
+             universe_id: int | None, place_id: int | None) -> None:
     """Phase 4: upload assets, resolve, convert animations + scene, write .rbxlx."""
     # Resolve credentials from CLI -> env -> file (same precedence as u2r.py)
     # so users get the documented auto-discovery behavior. Without this,
@@ -731,6 +740,17 @@ def assemble(unity_project_path: str, output_dir: str,
 
     pipeline = _make_pipeline(unity_project_path, output_dir, skip_upload=no_upload)
     pipeline._retranspile = retranspile
+
+    # Plumb --universe-id / --place-id into ctx so resolve_assets can run
+    # headless mesh resolution on the first assemble invocation. Without
+    # these (or a previously-cached pair in <output>/.roblox_ids.json),
+    # resolve_assets has no way to call CreateMeshPartAsync and the local
+    # converted_place.rbxlx ends up with raw Model IDs that Studio fails
+    # to fetch — see the hard-fail in pipeline.resolve_assets.
+    if universe_id:
+        pipeline.ctx.universe_id = universe_id
+    if place_id:
+        pipeline.ctx.place_id = place_id
 
     # When transpile_scripts already ran and --retranspile is not set, skip
     # re-transpilation so hand-edited Luau scripts are preserved. But only
@@ -925,6 +945,44 @@ def upload(output_dir: str, api_key: str | None,
         # persisting bad IDs that would be silently reused next run.
         from roblox.id_cache import write_ids
         write_ids(out, uid, pid)
+
+        # Self-heal: if the local converted_place.rbxlx was written before
+        # universe/place IDs were available (legacy first-run path, when
+        # users called assemble with no IDs and got a silent skip), the
+        # MeshParts in it still carry raw Model IDs that Studio fails to
+        # fetch. Now that the publish has confirmed the IDs work, re-run
+        # resolve_assets + write_output so the local rbxlx matches what
+        # was just published. This rewrites the file in place.
+        uploaded_meshes = sum(
+            1 for k in (pipeline.ctx.uploaded_assets or {})
+            if any(k.lower().endswith(ext) for ext in ('.fbx', '.obj'))
+        )
+        resolved_meshes = len(pipeline.ctx.mesh_native_sizes or {})
+        if uploaded_meshes and resolved_meshes < uploaded_meshes:
+            log.info(
+                "[upload] Self-heal: %d unresolved mesh(es) detected in "
+                "local rbxlx — re-running resolve_assets + write_output "
+                "so the file matches the published place.",
+                uploaded_meshes - resolved_meshes,
+            )
+            try:
+                heal = _make_pipeline(None, out, skip_binary_rbxl=True)
+                heal.ctx.universe_id = uid
+                heal.ctx.place_id = pid
+                heal.run_through(
+                    "write_output",
+                    skip={"transpile_scripts", "moderate_assets",
+                          "upload_assets"},
+                    force_rerun={"resolve_assets", "convert_scene",
+                                 "write_output"},
+                )
+            except Exception as exc:  # noqa: BLE001 — non-fatal
+                log.warning(
+                    "[upload] Self-heal failed: %s. The published place "
+                    "is correct; re-run 'assemble' to fix the local "
+                    "rbxlx.", exc,
+                )
+
         _mark_skill_phase(out, "upload",
                           universe_id=uid, place_id=pid,
                           success=True)
