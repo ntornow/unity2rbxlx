@@ -1277,29 +1277,6 @@ class Pipeline:
                 log.info("[resolve_assets] Recovered IDs from cache: universe=%s place=%s",
                          universe_id, place_id)
 
-        # No universe/place — cannot run headless mesh resolution. Open Cloud
-        # does not support universe creation with API-key auth, so we cannot
-        # auto-provision one. Tell the user exactly how to unblock themselves.
-        if not universe_id or not place_id:
-            log.warning(
-                "[resolve_assets] No --universe-id / --place-id supplied and no "
-                ".roblox_ids.json cache. Headless mesh resolution is skipped; "
-                "meshes in the rbxlx will carry Model IDs instead of real Mesh IDs "
-                "(they will appear as placeholder parts in Studio until resolved)."
-            )
-            log.warning("[resolve_assets] To enable headless resolution on the next run:")
-            log.warning("[resolve_assets]   1. Create an empty place at "
-                        "https://create.roblox.com/dashboard/creations (Baseplate template)")
-            log.warning("[resolve_assets]   2. Copy its universe + place IDs from the URL:")
-            log.warning("[resolve_assets]        .../experiences/<UNIVERSE_ID>/places/<PLACE_ID>/configure")
-            log.warning("[resolve_assets]   3. Re-run: u2r.py convert ... "
-                        "--universe-id <UID> --place-id <PID>")
-            log.warning("[resolve_assets]   IDs are cached in <output>/.roblox_ids.json "
-                        "so future runs are one-command.")
-            log.warning("[resolve_assets] Alternative: run 'u2r.py resolve <output>' and "
-                        "execute the generated scripts via Studio Command Bar.")
-            return
-
         # ID cache write deferred until we either finish a resolve OR
         # confirm there's nothing to resolve. Writing premature IDs at
         # phase entry would poison the shared cache for later u2r publish
@@ -1318,6 +1295,45 @@ class Pipeline:
             if any(k.lower().endswith(ext) for ext in ('.fbx', '.obj'))
             and k not in already_resolved
         }
+
+        # No universe/place IDs. Open Cloud does not support universe
+        # creation via API-key auth, so we cannot auto-provision. The
+        # behaviour split:
+        #   * If any uploaded mesh is unresolved, halt: writing
+        #     converted_place.rbxlx with raw Model IDs produces a
+        #     visibly broken artifact (Studio's MeshContentProvider
+        #     can't fetch Model IDs as MeshIds, geometry vanishes,
+        #     and the spawned character cannot move because no
+        #     floor loads). The previous silent-warning path
+        #     understated the consequence and let users open a
+        #     dead-on-arrival rbxlx without realising why.
+        #   * If there are no unresolved meshes (mesh-free project,
+        #     or fully resolved on a prior run), keep going: the
+        #     cache-refresh below also no-ops without IDs, so this
+        #     is an honest skip.
+        if not universe_id or not place_id:
+            if mesh_assets:
+                raise RuntimeError(
+                    "[resolve_assets] Cannot finalize converted_place.rbxlx: "
+                    f"{len(mesh_assets)} uploaded mesh(es) still carry "
+                    "Roblox Model IDs that Studio cannot fetch directly. "
+                    "Pass --universe-id / --place-id to assemble (or run "
+                    "'upload' once with IDs to populate "
+                    "<output>/.roblox_ids.json, then rerun assemble). "
+                    "Without IDs the local rbxlx loads empty in Studio "
+                    "(MeshContentProvider 'could not fetch') and the "
+                    "spawned character cannot move because no floor "
+                    "geometry resolves. Create an experience at "
+                    "https://create.roblox.com/dashboard/creations "
+                    "(Baseplate) and copy the IDs from the URL: "
+                    ".../experiences/<UNIVERSE_ID>/places/<PLACE_ID>/configure. "
+                    "Use --no-upload to skip cloud work entirely."
+                )
+            log.info(
+                "[resolve_assets] No universe/place IDs supplied and no "
+                "unresolved meshes — skipping cache-refresh validation."
+            )
+            return
         if not mesh_assets:
             log.info(
                 "[resolve_assets] No new mesh assets to resolve "
