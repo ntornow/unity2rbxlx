@@ -534,6 +534,261 @@ class TestControllerParsing:
         assert ctrl is None
 
 
+class TestBinaryControllerParsing:
+    """Binary .controller files route through UnityPy. We mock the UnityPy
+    surface to avoid needing a binary fixture in-tree -- the seam under
+    test is whether the typetree graph (AnimatorController + AnimatorState +
+    AnimatorStateMachine + AnimatorStateTransition + BlendTree) lowers into
+    the same docs_by_fid shape the YAML path produces, with PPtrs
+    translated into fileID/guid keys."""
+
+    def _binary_controller_file(self, tmp_path: Path) -> Path:
+        f = tmp_path / "binary.controller"
+        f.write_bytes(b"\x00\x01\x02UnityFS\x00not-yaml")
+        return f
+
+    def _make_obj(self, type_name: str, path_id: int, body: dict[str, Any]) -> Any:
+        class _FakeType:
+            name = type_name
+
+        class _FakeObj:
+            type = _FakeType()
+            def __init__(self, pid: int, b: dict[str, Any]) -> None:
+                self.path_id = pid
+                self._body = b
+                self.assets_file = None  # set by _make_env
+            def read_typetree(self) -> dict[str, Any]:
+                return self._body
+
+        return _FakeObj(path_id, body)
+
+    def _make_env(
+        self,
+        objs: list[Any],
+        externals: list[Any] | None = None,
+    ) -> Any:
+        class _FakeAssetsFile:
+            def __init__(self, ext: list[Any]) -> None:
+                self.externals = ext
+
+        af = _FakeAssetsFile(list(externals) if externals else [])
+        for obj in objs:
+            obj.assets_file = af
+
+        class _FakeEnv:
+            objects = objs
+
+        return _FakeEnv()
+
+    def _make_external(self, guid: str) -> Any:
+        class _FakeExt:
+            def __init__(self, g: str) -> None:
+                self.guid = g
+        return _FakeExt(guid)
+
+    def test_binary_controller_lowers_to_yaml_shape(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Binary controller with state machine + states + transitions
+        produces the same AnimatorController structure the YAML path
+        builds. PPtrs (m_FileID/m_PathID) are translated so the local
+        state-machine/state/transition lookups all resolve."""
+        import UnityPy
+
+        # AnimatorController -> StateMachine (path 200) -> State Idle (300)
+        #   transitions to State Walk (400) on parameter "Speed" > 0.1
+        controller_body: dict[str, Any] = {
+            "m_Name": "Hero",
+            "m_AnimatorParameters": [{
+                "m_Name": "Speed",
+                "m_Type": 1,  # Float
+                "m_DefaultFloat": 0.0,
+                "m_DefaultInt": 0,
+                "m_DefaultBool": 0,
+            }],
+            "m_AnimatorLayers": [{
+                "m_Name": "Base Layer",
+                "m_StateMachine": {"m_FileID": 0, "m_PathID": 200},
+            }],
+        }
+        sm_body: dict[str, Any] = {
+            "m_DefaultState": {"m_FileID": 0, "m_PathID": 300},
+        }
+        idle_body: dict[str, Any] = {
+            "m_Name": "Idle",
+            "m_Speed": 1.0,
+            "m_Motion": {
+                "m_FileID": 1,  # external — clip in another .anim
+                "m_PathID": 7400000,
+            },
+            "m_Transitions": [
+                {"m_FileID": 0, "m_PathID": 500},
+            ],
+        }
+        walk_body: dict[str, Any] = {
+            "m_Name": "Walk",
+            "m_Speed": 1.0,
+            "m_Motion": {"m_FileID": 0, "m_PathID": 0},
+            "m_Transitions": [],
+        }
+        trans_body: dict[str, Any] = {
+            "m_Name": "ToWalk",
+            "m_DstState": {"m_FileID": 0, "m_PathID": 400},
+            "m_HasExitTime": 0,
+            "m_ExitTime": 0.0,
+            "m_TransitionDuration": 0.25,
+            "m_Conditions": [{
+                "m_ConditionEvent": "Speed",
+                "m_ConditionMode": 3,  # Greater
+                "m_EventTreshold": 0.1,
+            }],
+        }
+
+        objs = [
+            self._make_obj("AnimatorController", 100, controller_body),
+            self._make_obj("AnimatorStateMachine", 200, sm_body),
+            self._make_obj("AnimatorState", 300, idle_body),
+            self._make_obj("AnimatorState", 400, walk_body),
+            self._make_obj("AnimatorStateTransition", 500, trans_body),
+        ]
+        externals = [self._make_external("a" * 32)]
+        fake_env = self._make_env(objs, externals)
+        monkeypatch.setattr(UnityPy, "load", lambda _path: fake_env)
+
+        ctrl = parse_controller_file(self._binary_controller_file(tmp_path))
+        assert ctrl is not None
+        assert ctrl.name == "Hero"
+        assert len(ctrl.parameters) == 1
+        assert ctrl.parameters[0].name == "Speed"
+        assert ctrl.parameters[0].param_type == 1
+        assert ctrl.default_state_file_id == "300"
+
+        # Both states preserved with correct names + speeds
+        names = {s.name for s in ctrl.states}
+        assert names == {"Idle", "Walk"}
+
+        idle = next(s for s in ctrl.states if s.name == "Idle")
+        # External clip GUID resolved from m_FileID=1 → externals[0]
+        assert idle.clip_guid == "a" * 32
+        assert len(idle.transitions) == 1
+        t = idle.transitions[0]
+        assert t.dst_state_file_id == "400"
+        assert t.transition_duration == pytest.approx(0.25)
+        assert t.conditions[0].parameter == "Speed"
+        assert t.conditions[0].mode == 3
+        assert t.conditions[0].threshold == pytest.approx(0.1)
+
+    def test_binary_controller_resolves_local_blend_tree(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A state pointing at a local BlendTree (m_FileID=0, m_PathID=<bt>)
+        resolves through docs_by_fid the same way the YAML walker does,
+        and the 1D blend tree gets recorded on the controller."""
+        import UnityPy
+
+        controller_body: dict[str, Any] = {
+            "m_Name": "Mover",
+            "m_AnimatorParameters": [],
+            "m_AnimatorLayers": [{
+                "m_Name": "Base Layer",
+                "m_StateMachine": {"m_FileID": 0, "m_PathID": 200},
+            }],
+        }
+        sm_body: dict[str, Any] = {
+            "m_DefaultState": {"m_FileID": 0, "m_PathID": 300},
+        }
+        state_body: dict[str, Any] = {
+            "m_Name": "Move",
+            "m_Speed": 1.0,
+            "m_Motion": {"m_FileID": 0, "m_PathID": 600},  # → BlendTree
+            "m_Transitions": [],
+        }
+        bt_body: dict[str, Any] = {
+            "m_Name": "MoveTree",
+            "m_BlendType": 0,  # 1D
+            "m_BlendParameter": "Speed",
+            "m_Childs": [
+                {
+                    "m_Threshold": 0.0,
+                    # External anim ref — clip GUID resolved via externals
+                    "m_Motion": {"m_FileID": 1, "m_PathID": 7400000},
+                },
+                {
+                    "m_Threshold": 1.0,
+                    "m_Motion": {"m_FileID": 2, "m_PathID": 7400000},
+                },
+            ],
+        }
+
+        objs = [
+            self._make_obj("AnimatorController", 100, controller_body),
+            self._make_obj("AnimatorStateMachine", 200, sm_body),
+            self._make_obj("AnimatorState", 300, state_body),
+            self._make_obj("BlendTree", 600, bt_body),
+        ]
+        externals = [
+            self._make_external("b" * 32),
+            self._make_external("c" * 32),
+        ]
+        fake_env = self._make_env(objs, externals)
+        monkeypatch.setattr(UnityPy, "load", lambda _path: fake_env)
+
+        ctrl = parse_controller_file(self._binary_controller_file(tmp_path))
+        assert ctrl is not None
+        assert "MoveTree" in ctrl.blend_trees
+        bt = ctrl.blend_trees["MoveTree"]
+        assert bt.param == "Speed"
+        assert len(bt.entries) == 2
+        assert {e.clip_guid for e in bt.entries} == {"b" * 32, "c" * 32}
+
+        # State carries the blend tree name and a fallback clip GUID.
+        move = next(s for s in ctrl.states if s.name == "Move")
+        assert move.blend_tree_name == "MoveTree"
+        assert move.clip_guid in ("b" * 32, "c" * 32)
+
+    def test_binary_controller_unitypy_load_failure_records_unconverted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When UnityPy.load raises, return None and emit an UNCONVERTED
+        entry — the pipeline must still surface the unparsed file rather
+        than silently dropping it."""
+        import UnityPy
+
+        def _boom(_path: str) -> None:
+            raise RuntimeError("not a real serialized file")
+
+        monkeypatch.setattr(UnityPy, "load", _boom)
+        out: list[dict[str, str]] = []
+        ctrl = parse_controller_file(
+            self._binary_controller_file(tmp_path),
+            unconverted_out=out,
+        )
+        assert ctrl is None
+        assert len(out) == 1
+        assert out[0]["category"] == "animator_controller"
+        assert "binary" in out[0]["reason"].lower()
+
+    def test_binary_controller_no_animator_object_records_unconverted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If UnityPy loads but finds no AnimatorController, emit an
+        UNCONVERTED entry with that specific reason."""
+        import UnityPy
+
+        objs = [self._make_obj("GameObject", 1, {"m_Name": "junk"})]
+        fake_env = self._make_env(objs)
+        monkeypatch.setattr(UnityPy, "load", lambda _path: fake_env)
+
+        out: list[dict[str, str]] = []
+        ctrl = parse_controller_file(
+            self._binary_controller_file(tmp_path),
+            unconverted_out=out,
+        )
+        assert ctrl is None
+        assert len(out) == 1
+        assert "no AnimatorController" in out[0]["reason"]
+
+
 # ---------------------------------------------------------------------------
 # Test keyframe simplification
 # ---------------------------------------------------------------------------

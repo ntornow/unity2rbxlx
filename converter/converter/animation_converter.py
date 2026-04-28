@@ -500,6 +500,11 @@ def parse_controller_file(
 ) -> AnimatorController | None:
     """Parse a Unity .controller file and return an AnimatorController.
 
+    Handles both text YAML and binary serialization. Binary files route
+    through UnityPy and lower into the same ``docs_by_fid`` shape the YAML
+    path produces (PPtrs translated to fileID/guid keys), so the same
+    state-machine / transition / blend-tree walker drives both.
+
     Args:
         controller_path: Path to the .controller file.
 
@@ -511,35 +516,7 @@ def parse_controller_file(
         return None
 
     if not is_text_yaml(controller_path):
-        log.warning(
-            "Controller file is binary, skipping: %s "
-            "(UnityPy text-export required to parse)",
-            controller_path.name,
-        )
-        if unconverted_out is not None:
-            # Also record the asset GUID from the .meta sibling when
-            # available so convert_animations() can scene-filter binary
-            # controllers the same way it filters parsed ones.
-            ctrl_guid = ""
-            meta = controller_path.with_suffix(controller_path.suffix + ".meta")
-            if meta.exists():
-                try:
-                    for line in meta.read_text(encoding="utf-8", errors="replace").splitlines():
-                        s = line.strip()
-                        if s.startswith("guid:"):
-                            ctrl_guid = s.split(":", 1)[1].strip()
-                            break
-                except OSError:
-                    pass
-            entry: dict[str, str] = {
-                "category": "animator_controller",
-                "item": controller_path.name,
-                "reason": "binary-encoded .controller; UnityPy text-export required",
-            }
-            if ctrl_guid:
-                entry["guid"] = ctrl_guid
-            unconverted_out.append(entry)
-        return None
+        return _parse_controller_binary(controller_path, unconverted_out)
 
     try:
         raw_text = controller_path.read_text(encoding="utf-8", errors="replace")
@@ -567,7 +544,218 @@ def parse_controller_file(
         return None
 
     name = controller_body.get("m_Name", controller_path.stem)
-    controller = AnimatorController(name=name, source_path=controller_path)
+    return _build_controller_from_docs(
+        name, controller_body, docs_by_fid, controller_path, unconverted_out,
+    )
+
+
+# Class IDs for AnimatorController-graph object types. UnityPy exposes
+# `obj.type.name` reliably across versions; the integer class_id surface
+# has churned. Both match the YAML !u! tags.
+_ANIMATOR_GRAPH_CIDS: dict[str, int] = {
+    "AnimatorController": 91,
+    "BlendTree": 206,
+    "AnimatorStateTransition": 1101,
+    "AnimatorState": 1102,
+    "AnimatorStateMachine": 1107,
+    "AnimatorTransition": 1109,  # AnyState/Entry transitions
+}
+
+
+def _parse_controller_binary(
+    controller_path: Path,
+    unconverted_out: list[dict[str, str]] | None,
+) -> AnimatorController | None:
+    """Parse a binary-encoded .controller via UnityPy.
+
+    Walks every object in the SerializedFile, translates PPtr structs
+    (``{m_FileID, m_PathID}``) into the YAML-style ``{fileID, guid}`` form
+    the rest of the parser expects, then delegates to the same builder
+    the YAML path uses.
+
+    On failure (UnityPy missing, malformed file, no AnimatorController
+    object) records an UNCONVERTED entry on ``unconverted_out`` and
+    returns None.
+    """
+    try:
+        import UnityPy  # type: ignore[import-untyped]
+    except ImportError:
+        log.warning(
+            "Binary .controller parsing requires UnityPy. Install with: "
+            "pip install UnityPy (skipping %s)", controller_path.name,
+        )
+        _record_binary_controller_unconverted(
+            controller_path, unconverted_out,
+            reason="binary-encoded .controller; UnityPy not installed",
+        )
+        return None
+
+    try:
+        env = UnityPy.load(str(controller_path))
+    except Exception as exc:
+        log.warning(
+            "UnityPy failed to load binary .controller %s: %s",
+            controller_path.name, exc,
+        )
+        _record_binary_controller_unconverted(
+            controller_path, unconverted_out,
+            reason="binary-encoded .controller; UnityPy load failed",
+        )
+        return None
+
+    externals = _collect_externals(env)
+
+    docs_by_fid: dict[str, tuple[int, dict]] = {}
+    controller_body: dict[str, Any] | None = None
+
+    for obj in env.objects:
+        type_name = getattr(obj.type, "name", "") if hasattr(obj, "type") else ""
+        try:
+            body = obj.read_typetree()
+        except Exception as exc:
+            log.debug(
+                "UnityPy failed typetree on %s/%s: %s",
+                controller_path.name, type_name, exc,
+            )
+            continue
+        if not isinstance(body, dict):
+            continue
+        _translate_pptrs(body, externals)
+        cid = _ANIMATOR_GRAPH_CIDS.get(type_name, 0)
+        docs_by_fid[str(obj.path_id)] = (cid, body)
+        if type_name == "AnimatorController":
+            controller_body = body
+
+    if controller_body is None:
+        _record_binary_controller_unconverted(
+            controller_path, unconverted_out,
+            reason="binary-encoded .controller; no AnimatorController object found",
+        )
+        return None
+
+    name = controller_body.get("m_Name", controller_path.stem)
+    return _build_controller_from_docs(
+        name, controller_body, docs_by_fid, controller_path, unconverted_out,
+    )
+
+
+def _collect_externals(env: Any) -> list[Any]:
+    """Pull the ordered external-dependency list off any object's
+    SerializedFile. PPtr ``m_FileID`` is 1-indexed into this list.
+    """
+    for obj in getattr(env, "objects", []) or []:
+        af = getattr(obj, "assets_file", None)
+        if af is None:
+            continue
+        ext = getattr(af, "externals", None)
+        if ext is None:
+            continue
+        try:
+            return list(ext)
+        except TypeError:
+            return []
+    return []
+
+
+def _externals_guid_str(externals: list[Any], file_id: int) -> str:
+    """Resolve a PPtr ``m_FileID`` into a ``.meta``-format hex GUID.
+
+    Returns ``""`` when out of range or the entry has no GUID. UnityPy
+    exposes the GUID as a ``UnityGUID`` (``__str__`` produces the .meta
+    hex), as a hex string, or as raw bytes depending on version — handle
+    all three.
+    """
+    idx = int(file_id) - 1
+    if idx < 0 or idx >= len(externals):
+        return ""
+    ext = externals[idx]
+    guid_val = getattr(ext, "guid", None)
+    if guid_val is None:
+        return ""
+    if isinstance(guid_val, str):
+        return guid_val
+    if isinstance(guid_val, (bytes, bytearray)):
+        return bytes(guid_val).hex()
+    return str(guid_val)
+
+
+def _translate_pptrs(body: Any, externals: list[Any]) -> None:
+    """Recursively rewrite UnityPy PPtr dicts ``{m_FileID, m_PathID}`` to
+    also carry ``fileID`` (the destination object's path_id) and ``guid``
+    (resolved from the externals list when m_FileID > 0).
+
+    The YAML-side parser (``_parse_blend_tree``, ``_parse_transition``,
+    ``_first_leaf_clip_guid``, the state walker) reads ``fileID`` for
+    local refs and ``guid`` for cross-file refs. This translation lets
+    the same code drive both formats.
+    """
+    if isinstance(body, dict):
+        if "m_FileID" in body and "m_PathID" in body and "fileID" not in body:
+            file_id = body["m_FileID"]
+            path_id = body["m_PathID"]
+            try:
+                body["fileID"] = int(path_id) if path_id is not None else 0
+            except (TypeError, ValueError):
+                body["fileID"] = 0
+            try:
+                body["guid"] = (
+                    _externals_guid_str(externals, int(file_id))
+                    if file_id else ""
+                )
+            except (TypeError, ValueError):
+                body["guid"] = ""
+        for v in body.values():
+            _translate_pptrs(v, externals)
+    elif isinstance(body, list):
+        for item in body:
+            _translate_pptrs(item, externals)
+
+
+def _record_binary_controller_unconverted(
+    controller_path: Path,
+    unconverted_out: list[dict[str, str]] | None,
+    reason: str,
+) -> None:
+    """Emit an UNCONVERTED entry for a binary .controller we couldn't
+    parse, carrying the .meta GUID so scene-scoped filtering still works.
+    """
+    if unconverted_out is None:
+        return
+    ctrl_guid = ""
+    meta = controller_path.with_suffix(controller_path.suffix + ".meta")
+    if meta.exists():
+        try:
+            for line in meta.read_text(encoding="utf-8", errors="replace").splitlines():
+                s = line.strip()
+                if s.startswith("guid:"):
+                    ctrl_guid = s.split(":", 1)[1].strip()
+                    break
+        except OSError:
+            pass
+    entry: dict[str, str] = {
+        "category": "animator_controller",
+        "item": controller_path.name,
+        "reason": reason,
+    }
+    if ctrl_guid:
+        entry["guid"] = ctrl_guid
+    unconverted_out.append(entry)
+
+
+def _build_controller_from_docs(
+    name: str,
+    controller_body: dict[str, Any],
+    docs_by_fid: dict[str, tuple[int, dict]],
+    source_path: Path,
+    unconverted_out: list[dict[str, str]] | None,
+) -> AnimatorController:
+    """Build an AnimatorController from a pre-indexed document graph.
+
+    Used by both the YAML and binary parsing paths; the binary path
+    feeds an equivalent ``docs_by_fid`` keyed by UnityPy path_id with
+    PPtrs translated into the YAML-style ``fileID`` / ``guid`` shape.
+    """
+    controller = AnimatorController(name=name, source_path=source_path)
 
     # Parse parameters
     for param_data in controller_body.get("m_AnimatorParameters", []) or []:
