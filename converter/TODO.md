@@ -8,12 +8,6 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
 
 ## Pipeline / runtime gaps
 
-- [ ] **P1 — Binary `.controller` parsing.** Binary `.anim` files are now
-  read via UnityPy (delegates to the same `_parse_clip_body` as text YAML).
-  Binary `.controller` files still bail with an UNCONVERTED.md entry —
-  follow-up needs typetree-graph traversal across AnimatorController +
-  AnimatorState + AnimatorStateMachine + AnimatorStateTransition + BlendTree
-  with PPtr resolution. Same pattern as `binary_scene_parser.py`.
 - [ ] **P2 — Persistent prefab/asset cache.** Prefab library is in-memory only.
   SQLite or pickle cache keyed by `(GUID, mtime)` would halve pipeline time
   for multi-scene projects and large games.
