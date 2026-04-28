@@ -32,6 +32,9 @@ _SMOKE_RESULT_RE = re.compile(
 _SMOKE_ERROR_RE = re.compile(
     r"\[SMOKE_TEST_ERROR\]\s*(.*)"
 )
+_SMOKE_CLIENT_RESULT_RE = re.compile(
+    r"\[SMOKE_TEST_CLIENT_RESULT\]\s*(.*)"
+)
 
 
 @dataclass
@@ -42,6 +45,8 @@ class StudioLogResult:
     smoke_test_done: bool = False
     smoke_test_result: dict | None = None
     smoke_test_errors: list[str] = field(default_factory=list)
+    client_result: dict | None = None
+    input_window_opened: bool = False
     flog_errors: list[str] = field(default_factory=list)
     flog_output_lines: list[str] = field(default_factory=list)
     studio_crashed: bool = False
@@ -142,10 +147,20 @@ def parse_log(log_path: Path) -> StudioLogResult:
             if "[SMOKE_TEST_DONE]" in output_text:
                 result.smoke_test_done = True
 
+            if "[SMOKE_TEST_INPUT_WINDOW_OPEN]" in output_text:
+                result.input_window_opened = True
+
             sm = _SMOKE_RESULT_RE.search(output_text)
             if sm:
                 try:
                     result.smoke_test_result = json.loads(sm.group(1))
+                except json.JSONDecodeError:
+                    pass
+
+            cm = _SMOKE_CLIENT_RESULT_RE.search(output_text)
+            if cm:
+                try:
+                    result.client_result = json.loads(cm.group(1))
                 except json.JSONDecodeError:
                     pass
 

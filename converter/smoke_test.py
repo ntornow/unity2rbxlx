@@ -17,6 +17,8 @@ Or programmatically:
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import json
 import logging
 import platform
@@ -40,6 +42,10 @@ logger = logging.getLogger(__name__)
 STUDIO_LOAD_WAIT = 20  # seconds to wait after Studio opens before entering Play
 PLAY_MODE_SETTLE = 30  # seconds to wait after entering Play mode for scripts to run
 SMOKE_TEST_TIMEOUT = 180  # max seconds to wait for [SMOKE_TEST_DONE] marker
+INPUT_WINDOW_TIMEOUT = 45  # max seconds after Play to see [SMOKE_TEST_INPUT_WINDOW_OPEN]
+WASD_HOLD_SECONDS = 1.5  # seconds each WASD key is held down
+MOUSE_SIMULATION_SECONDS = 3.0  # total wall time spent moving the mouse
+MOUSE_TICK_SECONDS = 0.05  # delay between successive mouse-delta events
 
 STUDIO_AUTOSAVES_DIR = Path.home() / "Library" / "Application Support" / "Roblox" / "RobloxStudio" / "AutoSaves"
 
@@ -54,6 +60,13 @@ class SmokeTestReport:
     health_check_started: bool = False
     health_check_done: bool = False
     health_check_result: dict | None = None
+    client_result: dict | None = None
+    input_simulation_ran: bool = False
+    terrain_rendered: bool = False
+    water_rendered: bool = False
+    mouse_moves_view: bool = False
+    wasd_works: bool = False
+    animations_loaded: bool = False
     script_errors: list[str] = field(default_factory=list)
     studio_errors: list[str] = field(default_factory=list)
     studio_crashed: bool = False
@@ -159,6 +172,21 @@ def run_smoke_test(
     if not play_ok:
         logger.warning("osascript Play mode failed — continuing anyway")
 
+    # Step 8b: Wait for client to open the input window, then drive WASD + mouse
+    if log_path:
+        logger.info("Waiting up to %ds for [SMOKE_TEST_INPUT_WINDOW_OPEN]...", INPUT_WINDOW_TIMEOUT)
+        opened = wait_for_marker(
+            log_path,
+            "[SMOKE_TEST_INPUT_WINDOW_OPEN]",
+            timeout=INPUT_WINDOW_TIMEOUT,
+        )
+        if opened:
+            logger.info("Driving simulated WASD + mouse input...")
+            _simulate_input_window()
+            report.input_simulation_ran = True
+        else:
+            logger.warning("Input window never opened — skipping input simulation")
+
     # Step 9: Wait for smoke test completion
     if log_path:
         logger.info("Waiting up to %ds for smoke test results...", timeout)
@@ -183,9 +211,25 @@ def run_smoke_test(
         report.health_check_started = log_result.smoke_test_started
         report.health_check_done = log_result.smoke_test_done
         report.health_check_result = log_result.smoke_test_result
+        report.client_result = log_result.client_result
         report.script_errors = log_result.smoke_test_errors
         report.studio_errors = log_result.flog_errors
         report.studio_crashed = log_result.studio_crashed
+
+        if log_result.smoke_test_result:
+            report.terrain_rendered = bool(log_result.smoke_test_result.get("terrainRendered"))
+            # Server scan as a fallback; SimpleFPS and similar fill water on the
+            # client only, so the server-side voxel scan won't see it.
+            report.water_rendered = bool(log_result.smoke_test_result.get("waterRendered"))
+        if log_result.client_result:
+            report.mouse_moves_view = bool(log_result.client_result.get("cameraMoved"))
+            report.wasd_works = bool(log_result.client_result.get("playerMoved"))
+            report.animations_loaded = (
+                bool(log_result.client_result.get("hasAnimator"))
+                and bool(log_result.client_result.get("hasAnimateScript"))
+            )
+            if log_result.client_result.get("waterRendered"):
+                report.water_rendered = True
 
     # Step 12: Kill Studio
     logger.info("Stopping Studio...")
@@ -327,6 +371,194 @@ def _clear_autosaves_and_locks(injected_path: Path) -> None:
             pass
 
 
+def _simulate_input_window() -> None:
+    """Drive WASD via osascript and the mouse via CoreGraphics CGEvent.
+
+    Sequenced to fit inside the client-side 12 s input window:
+    ~3 s of mouse movement (locked first-person rotates the camera) followed
+    by ~6 s of WASD presses (each held for ``WASD_HOLD_SECONDS``). Both
+    helpers swallow errors and log a warning so a missing/locked-out
+    accessibility permission (osascript) or unavailable CoreGraphics
+    framework doesn't kill the whole smoke test.
+    """
+    _simulate_mouse_movement(MOUSE_SIMULATION_SECONDS)
+    _simulate_wasd(WASD_HOLD_SECONDS)
+
+
+def _simulate_wasd(hold_seconds: float) -> bool:
+    """Press W, A, S, D in sequence via osascript, holding each for hold_seconds.
+
+    Re-activates RobloxStudio first so keystrokes go to the play window even
+    if focus drifted after the F5 keystroke.
+    """
+    script = f'''
+    tell application "RobloxStudio" to activate
+    delay 0.3
+    tell application "System Events"
+        tell process "RobloxStudio"
+            key down "w"
+            delay {hold_seconds}
+            key up "w"
+            key down "a"
+            delay {hold_seconds}
+            key up "a"
+            key down "s"
+            delay {hold_seconds}
+            key up "s"
+            key down "d"
+            delay {hold_seconds}
+            key up "d"
+        end tell
+    end tell
+    '''
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=hold_seconds * 5 + 10,
+        )
+        if result.returncode != 0:
+            logger.warning("WASD osascript stderr: %s", result.stderr.strip())
+            return False
+        return True
+    except Exception as exc:
+        logger.warning("WASD simulation failed: %s", exc)
+        return False
+
+
+# CoreGraphics CGEvent constants
+_kCGEventMouseMoved = 5
+_kCGEventRightMouseDown = 3
+_kCGEventRightMouseUp = 4
+_kCGEventRightMouseDragged = 6
+_kCGHIDEventTap = 0
+_kCGMouseButtonRight = 1
+
+
+class _CGPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+
+def _load_coregraphics() -> ctypes.CDLL | None:
+    """Return CoreGraphics CDLL on macOS, None elsewhere or if loading fails."""
+    if platform.system() != "Darwin":
+        return None
+    try:
+        path = ctypes.util.find_library("CoreGraphics") or (
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+        )
+        cg = ctypes.CDLL(path)
+        cg.CGEventCreate.restype = ctypes.c_void_p
+        cg.CGEventCreate.argtypes = [ctypes.c_void_p]
+        cg.CGEventGetLocation.restype = _CGPoint
+        cg.CGEventGetLocation.argtypes = [ctypes.c_void_p]
+        cg.CGEventCreateMouseEvent.restype = ctypes.c_void_p
+        cg.CGEventCreateMouseEvent.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, _CGPoint, ctypes.c_uint32
+        ]
+        cg.CGEventPost.restype = None
+        cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+        cg.CFRelease.restype = None
+        cg.CFRelease.argtypes = [ctypes.c_void_p]
+        return cg
+    except OSError as exc:
+        logger.warning("CoreGraphics unavailable for mouse simulation: %s", exc)
+        return None
+
+
+def _get_studio_window_center() -> tuple[float, float] | None:
+    """Return the screen center of Studio's frontmost window via osascript.
+
+    Falls back to None if the window can't be located. Used as the click
+    anchor for the synthesized right-mouse-drag — it must land inside the
+    play viewport for Roblox to bind the drag to the camera.
+    """
+    script = '''
+    tell application "System Events"
+        tell process "RobloxStudio"
+            set p to position of front window
+            set s to size of front window
+            return (item 1 of p as string) & "," & (item 2 of p as string) & "," & ¬
+                   (item 1 of s as string) & "," & (item 2 of s as string)
+        end tell
+    end tell
+    '''
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        x, y, w, h = (float(v) for v in result.stdout.strip().split(","))
+        return (x + w / 2, y + h / 2)
+    except Exception:
+        return None
+
+
+def _simulate_mouse_movement(duration_seconds: float) -> bool:
+    """Right-mouse-button drag horizontally across Studio's window center.
+
+    In Roblox's default Custom camera, holding right-mouse and moving the
+    cursor yaws the camera. We post:
+      1. RightMouseDown at the window center
+      2. A series of RightMouseDragged events sweeping ±240 px horizontally
+      3. RightMouseUp
+
+    This avoids LockFirstPerson edge cases (cursor capture filters our
+    deltas) and matches what a real player would do to look around.
+    Returns False if CoreGraphics or the window lookup fails.
+    """
+    cg = _load_coregraphics()
+    if cg is None:
+        return False
+
+    center = _get_studio_window_center()
+    if center is None:
+        logger.warning("Could not locate Studio window — skipping mouse drag")
+        return False
+
+    cx, cy = center
+    sweep = 240
+    ticks = max(8, int(duration_seconds / MOUSE_TICK_SECONDS))
+
+    def _post(evt_type: int, x: float, y: float) -> None:
+        evt = cg.CGEventCreateMouseEvent(
+            None, evt_type, _CGPoint(x, y), _kCGMouseButtonRight
+        )
+        if evt:
+            cg.CGEventPost(_kCGHIDEventTap, evt)
+            cg.CFRelease(evt)
+
+    try:
+        _post(_kCGEventMouseMoved, cx, cy)
+        time.sleep(0.1)
+        _post(_kCGEventRightMouseDown, cx, cy)
+        time.sleep(0.1)
+        for i in range(ticks):
+            # Triangle wave: -sweep..+sweep..-sweep over the duration
+            phase = (i / ticks) * 4
+            if phase < 1:
+                offset = sweep * phase
+            elif phase < 3:
+                offset = sweep * (2 - phase)
+            else:
+                offset = sweep * (phase - 4)
+            _post(_kCGEventRightMouseDragged, cx + offset, cy)
+            time.sleep(MOUSE_TICK_SECONDS)
+        _post(_kCGEventRightMouseUp, cx, cy)
+    except Exception as exc:
+        logger.warning("Mouse drag failed: %s", exc)
+        # Make sure we don't leave the right button stuck down
+        try:
+            _post(_kCGEventRightMouseUp, cx, cy)
+        except Exception:
+            pass
+        return False
+    return True
+
+
 def _take_screenshot(output_path: Path) -> bool:
     """Take a screenshot of the entire screen via macOS screencapture."""
     try:
@@ -395,6 +627,25 @@ def format_report(report: SmokeTestReport) -> str:
         lines.append(f"  Parts: {r.get('parts', '?')} (mesh: {r.get('meshParts', '?')})")
         lines.append(f"  Scripts: {r.get('scripts', '?')}")
         lines.append(f"  Script errors: {r.get('scriptErrorCount', '?')}")
+
+    def _yn(b: bool) -> str:
+        return "yes" if b else "no"
+
+    lines.append(f"  Input simulation: {_yn(report.input_simulation_ran)}")
+    lines.append(f"  Terrain rendered: {_yn(report.terrain_rendered)}")
+    lines.append(f"  Water rendered: {_yn(report.water_rendered)}")
+    lines.append(f"  Mouse moves view: {_yn(report.mouse_moves_view)}")
+    lines.append(f"  WASD works: {_yn(report.wasd_works)}")
+    lines.append(f"  Animations loaded: {_yn(report.animations_loaded)}")
+
+    if report.client_result:
+        c = report.client_result
+        lines.append(
+            "  Client deltas: "
+            f"camLookΔ={c.get('cameraLookDelta', 0):.3f} "
+            f"posΔ={c.get('playerPositionDelta', 0):.2f} "
+            f"animPlays={c.get('animationTracksPlayed', 0)}"
+        )
 
     if report.script_errors:
         lines.append(f"  Top script errors ({len(report.script_errors)}):")
