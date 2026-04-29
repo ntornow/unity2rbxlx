@@ -245,7 +245,14 @@ jobs:
   smoke-test:
     name: smoke test SimpleFPS (self-hosted macOS + Studio)
     runs-on: [self-hosted, macOS, studio]
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Self-hosted runner is registered to jiazou/unity2rbxlx only — when this
+    # workflow runs on the upstream repo (ntornow/unity2rbxlx) there is no
+    # matching runner and the job sits in queue for the 24h GitHub maximum
+    # before being cancelled. Gate on the fork so upstream's nightly skips
+    # this job cleanly instead of timing out the whole run.
+    if: |
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+      && github.repository == 'jiazou/unity2rbxlx'
     needs: fast
     timeout-minutes: 25
     env:
@@ -329,10 +336,13 @@ jobs:
           echo "convert-matrix:  ${{ needs.convert-matrix.result }}"
           echo "eval-regression: ${{ needs.eval-regression.result }}"
           echo "smoke-test:      ${{ needs.smoke-test.result }}"
+          # smoke-test is fork-only (self-hosted runner registration) — treat
+          # "skipped" as acceptable when the workflow runs on upstream.
+          smoke="${{ needs.smoke-test.result }}"
           if [ "${{ needs.slow-unit-tests.result }}" != "success" ] \
              || [ "${{ needs.convert-matrix.result }}" != "success" ] \
              || [ "${{ needs.eval-regression.result }}" != "success" ] \
-             || [ "${{ needs.smoke-test.result }}" != "success" ]; then
+             || { [ "$smoke" != "success" ] && [ "$smoke" != "skipped" ]; }; then
             echo "::error::Nightly build had failures"
             exit 1
           fi
