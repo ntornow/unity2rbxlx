@@ -483,8 +483,12 @@ def _resolve_variant_chain(
     # Variant overrides of Animator m_Controller would otherwise be lost —
     # rebuild the controller-ref set from the merged component graph so
     # variants that swap controllers route to the new GUID, not the base.
+    # Union with the variant's own pre-merge set so controllers declared on
+    # variant-added GameObjects (which live outside merged.all_nodes until
+    # variant_added_objects support lands) are not dropped.
     merged.referenced_animator_controller_guids = (
         _collect_animator_controller_guids(merged.all_nodes)
+        | set(template.referenced_animator_controller_guids)
     )
 
     # Transfer merged result back into the template

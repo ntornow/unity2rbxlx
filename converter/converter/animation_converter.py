@@ -1870,12 +1870,15 @@ def convert_animations(
     # scene instantiations and lets the runtime require the script from
     # ``ReplicatedStorage.Templates.<Prefab>`` directly.
     #
-    # When scene filtering is active, restrict consideration to prefabs
-    # actually instantiated by some parsed scene — otherwise unrelated
-    # prefabs that live in different scenes would force-emit their
-    # controllers into the current run (Codex P2 review feedback).
+    # Whenever ``parsed_scenes`` is supplied, restrict consideration to
+    # prefabs actually instantiated by one of those scenes — independent
+    # of whether the scene's controller-ref set has been pre-aggregated.
+    # The aggregate-first pattern is fragile (a caller invoking
+    # ``convert_animations()`` without first running
+    # ``aggregate_prefab_controller_refs()`` would otherwise see every
+    # prefab in the library treated as in-scope).
     instantiated_prefab_guids: set[str] | None = None
-    if any_scene_has_refs and parsed_scenes:
+    if parsed_scenes is not None:
         instantiated_prefab_guids = set()
         for scene in parsed_scenes:
             for instance in scene.prefab_instances:

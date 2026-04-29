@@ -2667,9 +2667,183 @@ class TestPhase59PrefabScopedTweenScripts:
         assert any(n == "Anim_Used_Wheel_Spin" for n in names), names
         assert not any(n == "Anim_Unused_Wheel_Spin" for n in names), names
 
+    def test_uninstantiated_prefab_filtered_even_without_pre_aggregation(
+        self, tmp_path: Path,
+    ) -> None:
+        """Codex P2 #2 fix: when parsed_scenes is supplied, the prefab
+        in-scope filter activates regardless of whether the scene's
+        referenced_animator_controller_guids set has been pre-aggregated.
+        A direct caller of convert_animations that skips
+        aggregate_prefab_controller_refs() should still get correctly
+        scope-restricted prefab emission.
+        """
+        from core.unity_types import (
+            ParsedScene,
+            PrefabInstanceData,
+            PrefabLibrary,
+            PrefabTemplate,
+        )
+        from unity.guid_resolver import build_guid_index
+
+        project, ctrl_guid, _ = self._build_transform_only_controller_project(tmp_path)
+        used_prefab = PrefabTemplate(
+            prefab_path=project / "Assets" / "Used.prefab",
+            name="Used",
+            referenced_animator_controller_guids={ctrl_guid},
+        )
+        unused_prefab = PrefabTemplate(
+            prefab_path=project / "Assets" / "Unused.prefab",
+            name="Unused",
+            referenced_animator_controller_guids={ctrl_guid},
+        )
+        library = PrefabLibrary(
+            prefabs=[used_prefab, unused_prefab],
+            by_name={"Used": used_prefab, "Unused": unused_prefab},
+            by_guid={
+                "used" + "0" * 28: used_prefab,
+                "unused" + "0" * 26: unused_prefab,
+            },
+        )
+        # Scene has prefab_instance pointing at Used, but its
+        # referenced_animator_controller_guids is left EMPTY (no pre-
+        # aggregation). The prefab-scope filter must still kick in.
+        scene = ParsedScene(
+            scene_path=project / "Assets" / "Level1.unity",
+            prefab_instances=[PrefabInstanceData(
+                file_id="500",
+                source_prefab_guid="used" + "0" * 28,
+                source_prefab_file_id="0",
+                transform_parent_file_id="0",
+                modifications=[],
+            )],
+        )
+        guid_index = build_guid_index(project)
+        result = convert_animations(
+            project,
+            guid_index=guid_index,
+            parsed_scenes=[scene],
+            prefab_library=library,
+        )
+        names = [name for name, _ in result.generated_scripts]
+        # Only the instantiated prefab gets a scope; Unused is filtered.
+        assert any(n == "Anim_Used_Wheel_Spin" for n in names), names
+        assert not any(n == "Anim_Unused_Wheel_Spin" for n in names), names
+
     def test_variant_override_of_controller_uses_new_guid(
         self, tmp_path: Path,
     ) -> None:
+        """Codex P2 fix (round 1): when a prefab variant overrides an
+        Animator's m_Controller, the merged template's
+        referenced_animator_controller_guids rebuilds from the modified
+        component graph — base controller GUID is dropped and the override
+        GUID takes its place.
+        """
+        from core.unity_types import (
+            PrefabComponent,
+            PrefabNode,
+            PrefabTemplate,
+        )
+        from unity.prefab_parser import (
+            _resolve_variant_chain,
+            _collect_animator_controller_guids,
+        )
+
+        # Source prefab has Animator pointing at controller GUID c*32.
+        source_root = PrefabNode(
+            name="Hero",
+            file_id="100",
+            active=True,
+            components=[
+                PrefabComponent(
+                    component_type="Animator",
+                    file_id="102",
+                    properties={
+                        "m_Controller": {
+                            "fileID": 9100000,
+                            "guid": "c" * 32,
+                            "type": 2,
+                        },
+                    },
+                ),
+            ],
+        )
+        source = PrefabTemplate(
+            prefab_path=Path("/fake/Hero.prefab"),
+            name="Hero",
+            root=source_root,
+            all_nodes={"100": source_root},
+            referenced_animator_controller_guids={"c" * 32},
+            variant_resolved=True,
+        )
+        # Variant overrides m_Controller.guid to "d"*32.
+        variant_root = PrefabNode(name="HeroVariant", file_id="V100", active=True)
+        variant = PrefabTemplate(
+            prefab_path=Path("/fake/HeroVariant.prefab"),
+            name="HeroVariant",
+            root=variant_root,
+            all_nodes={"V100": variant_root},
+            is_variant=True,
+            source_prefab_guid="hero" + "0" * 28,
+            variant_modifications=[
+                {
+                    "target": {"fileID": "102"},
+                    "propertyPath": "m_Controller",
+                    "value": "",
+                    "objectReference": {"fileID": 9100000, "guid": "d" * 32, "type": 2},
+                },
+            ],
+        )
+        by_guid = {"hero" + "0" * 28: source}
+        _resolve_variant_chain(variant, by_guid)
+
+        # Merged tree's Animator points at the override GUID.
+        merged_refs = _collect_animator_controller_guids(variant.all_nodes)
+        assert "d" * 32 in merged_refs
+        # Base controller is no longer referenced (no variant-added Animator
+        # would have it; the override replaces the source's pointer).
+        assert "c" * 32 not in merged_refs
+
+    def test_variant_added_animator_keeps_controller_ref(self) -> None:
+        """Codex P2 #3 fix: when a variant prefab adds its OWN Animator (the
+        component lives outside the source's tree), the variant's pre-merge
+        referenced_animator_controller_guids must survive variant chain
+        resolution. Without the union, recompute-from-merged would drop it.
+        """
+        from core.unity_types import (
+            PrefabComponent,
+            PrefabNode,
+            PrefabTemplate,
+        )
+        from unity.prefab_parser import _resolve_variant_chain
+
+        # Source has no Animator components.
+        source_root = PrefabNode(name="Source", file_id="100", active=True)
+        source = PrefabTemplate(
+            prefab_path=Path("/fake/Source.prefab"),
+            name="Source",
+            root=source_root,
+            all_nodes={"100": source_root},
+            referenced_animator_controller_guids=set(),
+            variant_resolved=True,
+        )
+        # Variant declares its own Animator with controller "v"*32.
+        # Simulate _parse_single_prefab populating
+        # template.referenced_animator_controller_guids before the variant
+        # chain resolves.
+        variant_root = PrefabNode(name="Variant", file_id="V100", active=True)
+        variant = PrefabTemplate(
+            prefab_path=Path("/fake/Variant.prefab"),
+            name="Variant",
+            root=variant_root,
+            all_nodes={"V100": variant_root},
+            referenced_animator_controller_guids={"v" * 32},
+            is_variant=True,
+            source_prefab_guid="src" + "0" * 29,
+        )
+        by_guid = {"src" + "0" * 29: source}
+        _resolve_variant_chain(variant, by_guid)
+        # Variant's controller GUID survives the merge.
+        assert "v" * 32 in variant.referenced_animator_controller_guids
         """Codex P2 fix: when a prefab variant overrides an Animator's
         m_Controller, the merged template's referenced_animator_controller_guids
         rebuilds from the modified component graph — base controller GUID
