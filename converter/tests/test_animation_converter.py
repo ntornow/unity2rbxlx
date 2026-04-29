@@ -2350,6 +2350,88 @@ class TestPhase58PrefabControllerAggregation:
         added = aggregate_prefab_controller_refs(scene, PrefabLibrary())
         assert added == 0
 
+    def test_instance_override_of_controller_aggregates(self) -> None:
+        """Codex P1 fix: when a scene's PrefabInstance overrides
+        Animator.m_Controller per-instance, the override GUID must be
+        unioned into the scene's controller set in addition to (or
+        instead of) the prefab template's base controller.
+        """
+        from core.unity_types import (
+            ParsedScene,
+            PrefabInstanceData,
+            PrefabLibrary,
+            PrefabTemplate,
+        )
+        from unity.prefab_parser import aggregate_prefab_controller_refs
+
+        prefab = PrefabTemplate(
+            prefab_path=Path("/fake/Hero.prefab"),
+            name="Hero",
+            referenced_animator_controller_guids={"base" + "0" * 28},
+        )
+        library = PrefabLibrary(
+            prefabs=[prefab],
+            by_name={"Hero": prefab},
+            by_guid={"hero" + "0" * 28: prefab},
+        )
+        # Scene instance overrides m_Controller with a different GUID.
+        scene = ParsedScene(
+            scene_path=Path("Level1.unity"),
+            prefab_instances=[PrefabInstanceData(
+                file_id="500",
+                source_prefab_guid="hero" + "0" * 28,
+                source_prefab_file_id="100100000",
+                transform_parent_file_id="0",
+                modifications=[
+                    {
+                        "target": {"fileID": 102},
+                        "propertyPath": "m_Controller",
+                        "value": "",
+                        "objectReference": {"guid": "ovrd" + "0" * 28},
+                    },
+                ],
+            )],
+        )
+
+        added = aggregate_prefab_controller_refs(scene, library)
+        # Both base + override are recorded.
+        assert "base" + "0" * 28 in scene.referenced_animator_controller_guids
+        assert "ovrd" + "0" * 28 in scene.referenced_animator_controller_guids
+        assert added == 2
+
+    def test_instance_override_without_template_still_aggregates(self) -> None:
+        """A scene-level override on a missing-from-library prefab still
+        records the override GUID so the new controller routes correctly.
+        """
+        from core.unity_types import (
+            ParsedScene,
+            PrefabInstanceData,
+            PrefabLibrary,
+        )
+        from unity.prefab_parser import aggregate_prefab_controller_refs
+
+        scene = ParsedScene(
+            scene_path=Path("Level1.unity"),
+            prefab_instances=[PrefabInstanceData(
+                file_id="500",
+                source_prefab_guid="missing" + "0" * 25,
+                source_prefab_file_id="0",
+                transform_parent_file_id="0",
+                modifications=[
+                    {
+                        "target": {"fileID": 102},
+                        "propertyPath": "m_Controller",
+                        "value": "",
+                        "objectReference": {"guid": "ovrd" + "0" * 28},
+                    },
+                ],
+            )],
+        )
+
+        added = aggregate_prefab_controller_refs(scene, PrefabLibrary())
+        assert "ovrd" + "0" * 28 in scene.referenced_animator_controller_guids
+        assert added == 1
+
     def test_variant_inherits_source_controller_refs(self) -> None:
         """A prefab variant with no controller overrides inherits its
         source's animator controller GUIDs through the merged component

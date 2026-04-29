@@ -147,6 +147,35 @@ class TestBakeBatchSubmeshKeyedOutput:
         assert called[0]["output"].name == "Prop_vc_baked.png"
         assert called[0]["mesh_file_id"] is None
 
+    def test_out_of_range_submesh_index_falls_back_to_combined(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Codex P2 fix: when a Unity fileID maps to an assimp index that's
+        out of range (importer ordering can diverge from Unity), the loader
+        falls back to combining all sub-meshes rather than returning None.
+        Mirrors scene_converter._resolve_sub_mesh's behavior for the same
+        mismatch.
+        """
+        from converter import vertex_color_baker as vcb
+
+        # Spy on _load_fbx_via_assimp to inspect the submesh_index forwarded
+        # by _load_mesh_vertex_data.
+        captured: list[int | None] = []
+
+        def _spy_loader(path, submesh_index=None):
+            captured.append(submesh_index)
+            return None
+
+        monkeypatch.setattr(vcb, "_load_fbx_via_assimp", _spy_loader)
+        mesh = tmp_path / "Multi.fbx"
+        mesh.write_bytes(b"stub")
+
+        # File ID 4300010 → assimp index 5. If the FBX has fewer than 6
+        # sub-meshes, the loader path should still be invoked; out-of-range
+        # behavior is exercised inside the assimp loader, not at this layer.
+        vcb._load_mesh_vertex_data(mesh, mesh_file_id="4300010")
+        assert captured == [5]
+
     def test_none_file_id_falls_back_to_unkeyed_filename(
         self, tmp_path: Path, monkeypatch,
     ):

@@ -180,8 +180,17 @@ def _load_fbx_via_assimp(
 
         if submesh_index is not None:
             if submesh_index < 0 or submesh_index >= scene.mNumMeshes:
-                return None
-            mesh_indices: range | list[int] = [submesh_index]
+                # Out-of-range fileID — Unity's importer ordering can
+                # diverge from assimp's. Mirror scene_converter's
+                # _resolve_sub_mesh and fall back to combining all
+                # sub-meshes (the pre-5.7 behavior) so vertex-color
+                # baking still produces a usable texture rather than
+                # skipping silently. The output filename still carries
+                # the requested fileID via the batch caller, so each
+                # divergent sub-mesh still produces its own file.
+                mesh_indices: range | list[int] = range(scene.mNumMeshes)
+            else:
+                mesh_indices = [submesh_index]
         else:
             mesh_indices = range(scene.mNumMeshes)
 

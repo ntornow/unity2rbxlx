@@ -442,7 +442,9 @@ jobs:
           # Phase 5.3 acceptance: non-empty TranspiledScript.warnings is the
           # only acceptable failure mode. The validate command surfaces
           # warnings without failing; we then read the conversion_report.json
-          # and assert no scripts had strategy="failed".
+          # and assert no scripts fell back to the stub generator (which is
+          # what transpile_scripts() does when the AI backend errors —
+          # there is no "failed" strategy emitted by the pipeline).
           for rbxlx in ./output/SimpleFPS_ai/*.rbxlx; do
             [ -f "$rbxlx" ] || continue
             python u2r.py validate "$rbxlx"
@@ -451,14 +453,22 @@ jobs:
           import json, sys
           from pathlib import Path
           report = json.loads(Path('./output/SimpleFPS_ai/conversion_report.json').read_text())
-          failed = [s for s in report.get('scripts', []) if s.get('strategy') == 'failed']
-          if failed:
-              print(f'::error::{len(failed)} scripts failed AI transpilation:')
-              for s in failed[:10]:
-                  print(f'  {s.get(\"source_path\", \"?\")}')
+          scripts = report.get('scripts', [])
+          # AI nightly hard-fails on any stub fallback (AI backend errored
+          # or produced unusable output) and on any explicit failed entry.
+          stubbed = [s for s in scripts if s.get('strategy') == 'stub']
+          failed = [s for s in scripts if s.get('strategy') == 'failed']
+          if stubbed or failed:
+              print(f'::error::{len(stubbed)} scripts fell back to stub, {len(failed)} marked failed:')
+              for s in (stubbed + failed)[:10]:
+                  print(f'  {s.get(\"strategy\")}: {s.get(\"source_path\", \"?\")}')
               sys.exit(1)
-          warn_count = sum(1 for s in report.get('scripts', []) if s.get('warnings'))
-          print(f'AI transpile OK: {warn_count} scripts have warnings (acceptable)')
+          # Also surface tolerance: how many AI scripts carry warnings
+          # (acceptance allows warnings; we just want visibility).
+          warn_count = sum(1 for s in scripts if s.get('warnings'))
+          ai_count = sum(1 for s in scripts if s.get('strategy') == 'ai')
+          print(f'AI transpile OK: {ai_count}/{len(scripts)} via AI, '
+                f'{warn_count} have warnings (acceptable)')
           "
 
       - name: Upload AI conversion artifacts

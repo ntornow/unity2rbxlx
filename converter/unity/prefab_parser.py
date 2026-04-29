@@ -571,22 +571,44 @@ def aggregate_prefab_controller_refs(
     helper walks every PrefabInstance in the scene, resolves the source
     prefab via the library's GUID index, and unions in that prefab's
     ``referenced_animator_controller_guids`` (already variant-chain-merged
-    by ``_resolve_variant_chain``).
+    by ``_resolve_variant_chain``). It also reads each instance's
+    ``modifications`` for per-instance ``m_Controller`` overrides — when a
+    scene-level PrefabInstance swaps the controller GUID, the override
+    GUID joins the set so the new controller's animation modules emit.
 
     Returns the count of newly added controller GUIDs.
     """
-    if not parsed_scene.prefab_instances or not prefab_library.by_guid:
+    if not parsed_scene.prefab_instances:
         return 0
+
+    by_guid = prefab_library.by_guid or {}
 
     before = len(parsed_scene.referenced_animator_controller_guids)
     for instance in parsed_scene.prefab_instances:
         guid = instance.source_prefab_guid
-        if not guid:
-            continue
-        template = prefab_library.by_guid.get(guid)
-        if template is None:
-            continue
-        parsed_scene.referenced_animator_controller_guids |= (
-            template.referenced_animator_controller_guids
-        )
+        if guid:
+            template = by_guid.get(guid)
+            if template is not None:
+                parsed_scene.referenced_animator_controller_guids |= (
+                    template.referenced_animator_controller_guids
+                )
+
+        # Per-instance m_Controller overrides. The modification dicts are
+        # shaped {target: {fileID}, propertyPath: "m_Controller", value: "",
+        # objectReference: {guid}} — pull objectReference.guid for any
+        # property path that ends in "m_Controller".
+        for mod in instance.modifications or ():
+            if not isinstance(mod, dict):
+                continue
+            prop = mod.get("propertyPath", "")
+            if not isinstance(prop, str) or not prop.endswith("m_Controller"):
+                continue
+            obj_ref = mod.get("objectReference") or {}
+            if not isinstance(obj_ref, dict):
+                continue
+            override_guid = obj_ref.get("guid", "")
+            if isinstance(override_guid, str) and override_guid:
+                parsed_scene.referenced_animator_controller_guids.add(
+                    override_guid
+                )
     return len(parsed_scene.referenced_animator_controller_guids) - before
