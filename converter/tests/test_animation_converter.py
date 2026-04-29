@@ -2885,6 +2885,61 @@ class TestPhase59PrefabScopedTweenScripts:
         # would have it; the override replaces the source's pointer).
         assert "c" * 32 not in merged_refs
 
+    def test_unrelated_controller_skipped_when_scene_has_only_prefab_refs(
+        self, tmp_path: Path,
+    ) -> None:
+        """Codex P2 fix (round 5): when scene filtering is active via
+        parsed_scenes + prefab_library (the common prefab-only case),
+        controllers not referenced by any instantiated prefab are
+        SKIPPED instead of falling through to default_scopes (unscoped).
+        Prevents leakage of unrelated controllers from other scenes.
+        """
+        from core.unity_types import (
+            ParsedScene,
+            PrefabInstanceData,
+            PrefabLibrary,
+            PrefabTemplate,
+        )
+        from unity.guid_resolver import build_guid_index
+
+        project, ctrl_guid, _ = self._build_transform_only_controller_project(tmp_path)
+        # Library has a prefab that DOESN'T reference this controller.
+        unrelated_prefab = PrefabTemplate(
+            prefab_path=project / "Assets" / "Other.prefab",
+            name="Other",
+            referenced_animator_controller_guids=set(),
+        )
+        library = PrefabLibrary(
+            prefabs=[unrelated_prefab],
+            by_name={"Other": unrelated_prefab},
+            by_guid={"other" + "0" * 27: unrelated_prefab},
+        )
+        # Scene has zero direct controller refs and instantiates the
+        # unrelated prefab (which doesn't have the controller either).
+        scene = ParsedScene(
+            scene_path=project / "Assets" / "Level1.unity",
+            prefab_instances=[PrefabInstanceData(
+                file_id="500",
+                source_prefab_guid="other" + "0" * 27,
+                source_prefab_file_id="0",
+                transform_parent_file_id="0",
+                modifications=[],
+            )],
+        )
+
+        guid_index = build_guid_index(project)
+        result = convert_animations(
+            project,
+            guid_index=guid_index,
+            parsed_scenes=[scene],
+            prefab_library=library,
+        )
+        # Controller is skipped — no scripts emit for it.
+        assert "Wheel" in result.routing
+        assert result.routing["Wheel"]["__controller__"]["target"] == "skipped"
+        names = [name for name, _ in result.generated_scripts]
+        assert not any("Wheel" in n for n in names), names
+
     def test_instance_override_routes_to_prefab_scope(
         self, tmp_path: Path,
     ) -> None:

@@ -1968,9 +1968,24 @@ def convert_animations(
 
         scene_match = ctrl.name in scenes_per_controller
         prefab_match = ctrl.name in prefabs_per_controller
-        if any_scene_has_refs and not scene_match and not prefab_match:
+        # Scene filtering activates when EITHER a scene supplies direct
+        # controller refs OR the caller passed parsed_scenes alongside a
+        # prefab_library (the common prefab-only case where the scene
+        # set is empty until aggregate_prefab_controller_refs runs). In
+        # both cases the caller is asking for scope-restricted output;
+        # unscoped fallback only applies when no scene context exists.
+        scene_filtering_active = any_scene_has_refs or (
+            parsed_scenes is not None
+            and prefab_library is not None
+            and (
+                instantiated_prefab_guids is not None
+                and len(instantiated_prefab_guids) > 0
+            )
+        )
+        if scene_filtering_active and not scene_match and not prefab_match:
             # Scene filtering active and this controller is unreferenced
-            # by any parsed scene OR any prefab — skip, log as routing.
+            # by any parsed scene OR any instantiated prefab — skip, log
+            # as routing.
             result.routing.setdefault(ctrl.name, {})["__controller__"] = {
                 "target": "skipped",
                 "reason": "not referenced by any parsed scene",
