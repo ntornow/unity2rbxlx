@@ -1201,15 +1201,33 @@ class Pipeline:
         Phase 4.5: when a parsed scene is available, pass it so the
         converter can filter controllers to those actually referenced
         and scene-scope the emitted module names.
+
+        Phase 5.8: union prefab-derived animator controller GUIDs into
+        the scene set before invoking the converter; most projects keep
+        Animators inside prefabs, so without this step the scene's set
+        is empty and scene scoping never activates.
         """
         log.info("[convert_animations] Discovering and converting animations ...")
         from converter.animation_converter import convert_animations as _convert_anims
+        from unity.prefab_parser import aggregate_prefab_controller_refs
 
         parsed_scenes = [self.state.parsed_scene] if self.state.parsed_scene else None
+        if parsed_scenes and self.state.prefab_library is not None:
+            for scene in parsed_scenes:
+                added = aggregate_prefab_controller_refs(
+                    scene, self.state.prefab_library,
+                )
+                if added:
+                    log.info(
+                        "[convert_animations] aggregated %d prefab-referenced "
+                        "controller GUID(s) into scene %s",
+                        added, scene.scene_path.name,
+                    )
         self.state.animation_result = _convert_anims(
             unity_project_path=self.unity_project_path,
             guid_index=self.state.guid_index,
             parsed_scenes=parsed_scenes,
+            prefab_library=self.state.prefab_library,
         )
         self.ctx.total_animations = self.state.animation_result.total_clips
         self.ctx.converted_animations = self.state.animation_result.total_scripts_generated

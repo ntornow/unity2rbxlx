@@ -85,15 +85,19 @@ _TMP_VERTICAL_BITS: dict[int, str] = {
 }
 
 
-def _coerce_int(raw: Any) -> int | None:
-    """Best-effort int coercion for serialized YAML scalars; None on failure."""
+def _coerce_int(raw: object) -> int | None:
+    """Best-effort int coercion for serialized YAML scalars; None on failure.
+
+    Accepts ``object`` because YAML scalars cross the parser boundary as
+    untyped values (int, float, str, bool, None) — narrow inside the try.
+    """
     try:
-        return int(float(raw))
+        return int(float(raw))  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
 
 
-def _map_tmp_bitfield(raw: Any, table: dict[int, str]) -> str | None:
+def _map_tmp_bitfield(raw: object, table: dict[int, str]) -> str | None:
     """Resolve a TMP alignment bitfield int to a Roblox token.
 
     Direct lookup first; if absent, fall back to the lowest set bit so

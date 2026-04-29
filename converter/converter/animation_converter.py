@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from core.unity_types import GuidIndex, ParsedScene
+from core.unity_types import GuidIndex, ParsedScene, PrefabLibrary
 from unity.yaml_parser import parse_documents, doc_body, is_text_yaml
 
 log = logging.getLogger(__name__)
@@ -1779,6 +1779,7 @@ def convert_animations(
     unity_project_path: Path,
     guid_index: GuidIndex | None = None,
     parsed_scenes: list[ParsedScene] | None = None,
+    prefab_library: PrefabLibrary | None = None,
 ) -> AnimationConversionResult:
     """Convert all animations in a Unity project to Roblox Luau scripts.
 
@@ -1798,6 +1799,12 @@ def convert_animations(
             One set of animation_data modules is emitted per (scene,
             controller) pair. Unset → project-wide emission, no prefix
             (current/test behaviour).
+        prefab_library: Phase 5.9 — when supplied alongside ``parsed_scenes``,
+            controllers referenced via PrefabTemplate get a prefab-name scope
+            in addition to (or instead of) the scene scope. Transform-only
+            tween scripts then live alongside the prefab template under
+            ``ReplicatedStorage.Templates.<Prefab>`` and dedupe across
+            multiple scene instances of the same prefab.
 
     Returns:
         AnimationConversionResult with clips, controllers, generated
@@ -1856,13 +1863,48 @@ def convert_animations(
                     scene_stem = getattr(scene, "scene_path", None)
                     scene_stem = scene_stem.stem if scene_stem else ""
                     scenes_per_controller.setdefault(ctrl.name, []).append(scene_stem)
+
+    # Phase 5.9: prefab-scoped emission. When a controller lives inside a
+    # PrefabTemplate (the common case), emit one tween script per prefab
+    # template rather than per-scene-instance. This dedupes scripts across
+    # scene instantiations and lets the runtime require the script from
+    # ``ReplicatedStorage.Templates.<Prefab>`` directly.
+    prefabs_per_controller: dict[str, list[str]] = {}
+    if prefab_library is not None and guid_index:
+        for ctrl in controllers:
+            ctrl_guid = (
+                guid_index.guid_for_path(ctrl.source_path.resolve())
+                if ctrl.source_path else None
+            )
+            if not ctrl_guid:
+                continue
+            for prefab in prefab_library.prefabs:
+                if ctrl_guid in prefab.referenced_animator_controller_guids:
+                    if prefab.name not in prefabs_per_controller.setdefault(
+                        ctrl.name, []
+                    ):
+                        prefabs_per_controller[ctrl.name].append(prefab.name)
     default_scopes = [""]
 
     for ctrl in controllers:
-        scopes = scenes_per_controller.get(ctrl.name, default_scopes)
-        if any_scene_has_refs and ctrl.name not in scenes_per_controller:
+        scene_scopes = scenes_per_controller.get(ctrl.name, [])
+        prefab_scopes = prefabs_per_controller.get(ctrl.name, [])
+        # Prefab scopes win when present (5.9): the controller belongs to a
+        # prefab template, and the runtime requires the script from
+        # ``ReplicatedStorage.Templates.<Prefab>``. Scene scoping remains for
+        # controllers attached directly to a scene's GameObjects.
+        if prefab_scopes:
+            scopes = list(prefab_scopes)
+        elif scene_scopes:
+            scopes = list(scene_scopes)
+        else:
+            scopes = default_scopes
+
+        scene_match = ctrl.name in scenes_per_controller
+        prefab_match = ctrl.name in prefabs_per_controller
+        if any_scene_has_refs and not scene_match and not prefab_match:
             # Scene filtering active and this controller is unreferenced
-            # by any scene we have data for — skip, log as routing.
+            # by any parsed scene OR any prefab — skip, log as routing.
             result.routing.setdefault(ctrl.name, {})["__controller__"] = {
                 "target": "skipped",
                 "reason": "not referenced by any parsed scene",
@@ -1968,6 +2010,7 @@ def convert_animations(
         accepted_names = {
             ctrl.name for ctrl in controllers
             if ctrl.name in scenes_per_controller
+            or ctrl.name in prefabs_per_controller
         }
         any_scene_refs: set[str] = set()
         for scene in parsed_scenes or ():
