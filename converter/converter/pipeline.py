@@ -1045,8 +1045,11 @@ class Pipeline:
                 )
             return
 
-        # Invert: material guid → [mesh FBX path]
-        material_to_meshes: dict[str, set[Path]] = {}
+        # Invert: material guid → set[(mesh_path, mesh_file_id)]. Phase 5.7
+        # threads ``mesh_file_id`` through so an FBX with multiple sub-meshes
+        # gets one bake per (mesh_path, mesh_file_id) pair rather than one
+        # combined bake for the whole FBX file.
+        material_to_meshes: dict[str, set[tuple[Path, str]]] = {}
 
         def _walk_scene_nodes(nodes):
             for node in nodes:
@@ -1054,6 +1057,7 @@ class Pipeline:
                 if mesh_guid:
                     mesh_path = guid_index.resolve(mesh_guid)
                     if mesh_path and mesh_path.exists():
+                        mesh_file_id = getattr(node, "mesh_file_id", None) or ""
                         for comp in getattr(node, "components", []):
                             if comp.component_type not in (
                                 "MeshRenderer", "SkinnedMeshRenderer",
@@ -1063,7 +1067,9 @@ class Pipeline:
                                 if isinstance(mat_ref, dict):
                                     mg = mat_ref.get("guid", "")
                                     if mg:
-                                        material_to_meshes.setdefault(mg, set()).add(mesh_path)
+                                        material_to_meshes.setdefault(mg, set()).add(
+                                            (mesh_path, mesh_file_id)
+                                        )
                 _walk_scene_nodes(getattr(node, "children", []))
 
         _walk_scene_nodes(list(scene.all_nodes.values()))
@@ -1073,7 +1079,7 @@ class Pipeline:
                 if root is not None:
                     _walk_scene_nodes([root])
 
-        pairs: list[tuple[Path, Path]] = []
+        pairs: list[tuple[Path, Path, str | None]] = []
         material_pair_index: list[Any] = []  # MaterialMapping per pair, for routing back
         for guid, mapping in flagged:
             meshes = material_to_meshes.get(guid, set())
@@ -1103,22 +1109,31 @@ class Pipeline:
                 )
                 continue
 
-            # Vertex colors are mesh-specific, but Roblox SurfaceAppearance
-            # is per-material. When a material is shared by multiple
-            # meshes we bake only the first referrer (deterministic
-            # sort order) and record a warning — per-mesh baking would
-            # require splitting the mapping into per-part SurfaceAppearances,
-            # which is out of PR 3 scope.
-            sorted_meshes = sorted(meshes)
-            representative = sorted_meshes[0]
-            pairs.append((representative, albedo))
+            # Vertex colors are mesh-specific. Phase 5.7 keys per
+            # (mesh_path, mesh_file_id) so distinct sub-meshes of the same
+            # FBX bake to distinct textures. The mapping still gets a
+            # single representative output (Roblox SurfaceAppearance is
+            # per-material), but each unique sub-mesh produces its own
+            # PNG so a follow-up pass can split per-part if needed.
+            sorted_meshes = sorted(
+                meshes, key=lambda mp: (str(mp[0]), mp[1] or ""),
+            )
+            representative_mesh, representative_fid = sorted_meshes[0]
+            pairs.append((
+                representative_mesh,
+                albedo,
+                representative_fid or None,
+            ))
             material_pair_index.append(mapping)
             if len(sorted_meshes) > 1:
-                others = ", ".join(m.name for m in sorted_meshes[1:])
+                others = ", ".join(
+                    f"{mp.name}:{fid or '-'}" for mp, fid in sorted_meshes[1:]
+                )
                 mapping.warnings.append(
-                    f"Vertex-color baking used mesh '{representative.name}'; "
-                    f"other meshes sharing this material may need per-part "
-                    f"baking (not wired): {others}"
+                    f"Vertex-color baking used mesh "
+                    f"'{representative_mesh.name}:{representative_fid or '-'}'; "
+                    f"other (mesh, sub-mesh) pairs sharing this material may "
+                    f"need per-part baking (not wired): {others}"
                 )
 
         if not pairs:

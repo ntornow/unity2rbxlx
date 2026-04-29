@@ -42,12 +42,39 @@ class VertexColorBakeResult:
     warnings: list[str] = field(default_factory=list)
 
 
+_UNITY_FBX_FILE_ID_BASE = 4300000
+
+
+def _unity_file_id_to_submesh_index(mesh_file_id: str | None) -> int | None:
+    """Convert a Unity FBX sub-mesh fileID to a 0-based assimp mesh index.
+
+    Unity's FBX importer assigns fileIDs starting at 4300000 and incrementing
+    by 2 (4300000 → 0, 4300002 → 1, 4300004 → 2, ...). Returns None when the
+    fileID is missing, malformed, below the base, or otherwise unconvertible.
+    """
+    if not mesh_file_id:
+        return None
+    try:
+        fid = int(mesh_file_id)
+    except (TypeError, ValueError):
+        return None
+    if fid < _UNITY_FBX_FILE_ID_BASE:
+        return None
+    return (fid - _UNITY_FBX_FILE_ID_BASE) // 2
+
+
 def _load_fbx_via_assimp(
     mesh_path: Path,
+    submesh_index: int | None = None,
 ) -> tuple[Any, Any, Any, Any] | None:
     """Load FBX using pyassimp's ctypes bindings (requires libassimp).
 
     Returns (vertices, faces, uv_coords, vertex_colors) or None.
+
+    When ``submesh_index`` is set, only that single sub-mesh is loaded —
+    used by the per-mesh-id baking path (Phase 5.7) so an FBX with N
+    sub-meshes and N distinct vertex-color sets bakes to N distinct
+    textures rather than one combined texture.
     """
     import numpy as np
     import ctypes
@@ -151,7 +178,14 @@ def _load_fbx_via_assimp(
         all_colors = []
         vert_offset = 0
 
-        for i in range(scene.mNumMeshes):
+        if submesh_index is not None:
+            if submesh_index < 0 or submesh_index >= scene.mNumMeshes:
+                return None
+            mesh_indices: range | list[int] = [submesh_index]
+        else:
+            mesh_indices = range(scene.mNumMeshes)
+
+        for i in mesh_indices:
             m = scene.mMeshes[i].contents
             nv = m.mNumVertices
 
@@ -219,6 +253,7 @@ def _load_fbx_via_assimp(
 
 def _load_mesh_vertex_data(
     mesh_path: Path,
+    mesh_file_id: str | None = None,
 ) -> tuple[Any, Any, Any, Any] | None:
     """
     Load mesh and extract vertices, faces, UVs, and vertex colors.
@@ -229,6 +264,10 @@ def _load_mesh_vertex_data(
       - faces: (F, 3) int
       - uv_coords: (N, 2) float — per-vertex UV0
       - vertex_colors: (N, 4) uint8 — RGBA per vertex
+
+    When ``mesh_file_id`` is a valid Unity FBX sub-mesh fileID
+    (4300000-base + 2*index), only that sub-mesh's data is returned
+    so per-sub-mesh vertex-color baking emits one texture per sub-mesh.
     """
     try:
         import numpy as np
@@ -237,7 +276,8 @@ def _load_mesh_vertex_data(
 
     # FBX files: use pyassimp (trimesh can't load FBX)
     if mesh_path.suffix.lower() == ".fbx":
-        return _load_fbx_via_assimp(mesh_path)
+        submesh_index = _unity_file_id_to_submesh_index(mesh_file_id)
+        return _load_fbx_via_assimp(mesh_path, submesh_index=submesh_index)
 
     try:
         import trimesh  # type: ignore
@@ -436,6 +476,7 @@ def bake_vertex_colors_into_albedo(
     albedo_path: Path,
     output_path: Path,
     resolution: int | None = None,
+    mesh_file_id: str | None = None,
 ) -> BakeResult:
     """
     Bake vertex colours from a mesh into an albedo texture.
@@ -456,7 +497,7 @@ def bake_vertex_colors_into_albedo(
     """
     result = BakeResult(mesh_path=mesh_path)
 
-    data = _load_mesh_vertex_data(mesh_path)
+    data = _load_mesh_vertex_data(mesh_path, mesh_file_id=mesh_file_id)
     if data is None:
         result.has_vertex_colors = False
         return result
@@ -533,7 +574,7 @@ def bake_vertex_colors_standalone(
 
 
 def bake_vertex_colors_batch(
-    mesh_albedo_pairs: list[tuple[Path, Path]],
+    mesh_albedo_pairs: list[tuple[Path, Path]] | list[tuple[Path, Path, str | None]],
     output_dir: Path,
     resolution: int | None = None,
 ) -> VertexColorBakeResult:
@@ -541,7 +582,12 @@ def bake_vertex_colors_batch(
     Batch-bake vertex colours for multiple mesh/albedo pairs.
 
     Args:
-        mesh_albedo_pairs: List of (mesh_path, albedo_path) tuples.
+        mesh_albedo_pairs: List of (mesh_path, albedo_path) or
+            (mesh_path, albedo_path, mesh_file_id) tuples. The 3-tuple
+            form (Phase 5.7) selects a specific FBX sub-mesh; the output
+            filename is keyed by ``mesh_file_id`` so different sub-meshes
+            of the same FBX bake to distinct textures rather than
+            overwriting each other.
         output_dir: Directory for output textures.
         resolution: Optional resolution override.
 
@@ -550,13 +596,23 @@ def bake_vertex_colors_batch(
     """
     result = VertexColorBakeResult()
 
-    for mesh_path, albedo_path in mesh_albedo_pairs:
+    for entry_tuple in mesh_albedo_pairs:
+        if len(entry_tuple) == 3:
+            mesh_path, albedo_path, mesh_file_id = entry_tuple
+        else:
+            mesh_path, albedo_path = entry_tuple
+            mesh_file_id = None
+
         result.total += 1
-        out_name = f"{mesh_path.stem}_vc_baked.png"
+        if mesh_file_id:
+            out_name = f"{mesh_path.stem}_{mesh_file_id}_vc_baked.png"
+        else:
+            out_name = f"{mesh_path.stem}_vc_baked.png"
         out_path = output_dir / out_name
 
         entry = bake_vertex_colors_into_albedo(
             mesh_path, albedo_path, out_path, resolution,
+            mesh_file_id=mesh_file_id,
         )
         result.entries.append(entry)
 

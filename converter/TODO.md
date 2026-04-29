@@ -23,28 +23,12 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
 
 ## Materials & meshes
 
-- [ ] **P2 — Sub-mesh identity in vertex-color baking.** PR 3 deferred. FBX
-  files with multiple embedded meshes currently rasterize the whole file
-  instead of the specific sub-mesh — `mesh_file_id` is not yet preserved
-  through `bake_vertex_colors_batch`'s signature.
 - [ ] **P2 — Full SurfaceAppearance round-trip through templates.** PR 5
   deferred. The smoke ran with `--no-upload` so real asset IDs never wired
   through `ReplicatedStorage.Templates`. Verify on a full upload run.
 - [ ] **P2 — Per-prefab variant-chain preservation in templates.** PR 5
   currently emits the flattened resolved form; variant-chain reapplication
   at runtime is not preserved.
-
-## Animation routing
-
-- [ ] **P2 — Prefab-scoped animator controller GUID aggregation.** PR 2a
-  deferred. Scenes that only reach controllers through prefab instances have
-  an empty `referenced_animator_controller_guids` set, so scene-scoped naming
-  never activates for them. Add equivalent aggregation on `PrefabTemplate`
-  and union into the scene set. Unscoped fallback keeps existing projects
-  working.
-- [ ] **P2 — Transform-only prefab scanning.** PR 2a deferred. One tween
-  script per prefab animator (not just per scene). Revisit alongside the
-  prefab-animator aggregation above.
 
 ## Infrastructure
 
