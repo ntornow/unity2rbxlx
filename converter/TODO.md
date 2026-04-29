@@ -12,15 +12,6 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   SQLite or pickle cache keyed by `(GUID, mtime)` would halve pipeline time
   for multi-scene projects and large games.
 
-## Cross-script transpilation
-
-- [ ] **P2 — 4.3.2 C# pattern warnings.** Skipped in PR 4. Pre-flight
-  diagnostics for LINQ / networking / async patterns. Revisit when a project
-  ships a class of error that warrants pre-flight surfacing.
-- [ ] **P2 — 4.3.4 `_classify_script_type` harmonization.** Dest defaults to
-  `Script`; source defaulted to `ModuleScript`. Revisit if a project ships
-  cross-classified scripts that need source's behavior.
-
 ## Materials & meshes
 
 - [ ] **P2 — Full SurfaceAppearance round-trip through templates.** PR 5

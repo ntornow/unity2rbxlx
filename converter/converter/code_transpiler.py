@@ -269,6 +269,14 @@ def transpile_scripts(
             luau, confidence, warnings = ai_results[key]
             strategy = "ai"
 
+        # Phase 5.11: pre-AI pattern warnings — prepend before any AI/stub
+        # warnings so a reader sees structural hazards first. The patterns
+        # don't depend on transpile output and apply uniformly across
+        # rule-based, AI, and stub strategies.
+        pattern_warnings = _analyze_csharp_patterns(csharp_source)
+        if pattern_warnings:
+            warnings = pattern_warnings + warnings
+
         # Fall back to stub if AI didn't run or failed. The stub comments
         # out the original C# as reference and generates a minimal module
         # skeleton. This is intentionally minimal — AI transpilation is the
@@ -1800,6 +1808,15 @@ def _classify_script_type(csharp_source: str, info: Any) -> str:
     """Classify a script as Script, LocalScript, or ModuleScript.
 
     Based on content analysis of the C# source and analyzer metadata.
+
+    Phase 5.12 harmonization: when the source isn't clearly client-side
+    and isn't a MonoBehaviour/NetworkBehaviour, default to ``ModuleScript``
+    (matching the source repo). The downstream ``script_coherence``
+    pass already promotes required-by-others scripts to ``ModuleScript``;
+    starting from ``ModuleScript`` for non-MonoBehaviour code prevents
+    spurious "reclassified to ModuleScript" reclassifications. Genuine
+    server gameplay (MonoBehaviour with no client APIs) still resolves
+    to ``Script``.
     """
     # Use the analyzer's suggestion as the primary signal.
     if hasattr(info, "suggested_type"):
@@ -1822,13 +1839,112 @@ def _classify_script_type(csharp_source: str, info: Any) -> str:
     if any(indicator in source_lower for indicator in client_indicators):
         return "LocalScript"
 
-    # No MonoBehaviour base -> ModuleScript.
-    if "monobehaviour" not in source_lower and "networkbehaviour" not in source_lower:
-        if "class " in csharp_source:
-            return "ModuleScript"
+    is_mono = (
+        "monobehaviour" in source_lower
+        or "networkbehaviour" in source_lower
+    )
 
-    # Default to server Script.
-    return "Script"
+    # MonoBehaviour-derived gameplay code on the server.
+    if is_mono:
+        return "Script"
+
+    # Everything else (utility classes, plain C# files, no MonoBehaviour
+    # base) defaults to ModuleScript. This matches source-repo behavior
+    # and avoids the downstream coherence pass having to promote bare
+    # utility scripts post-hoc.
+    return "ModuleScript"
+
+
+# ---------------------------------------------------------------------------
+# Phase 5.11: pre-AI C# pattern analysis
+#
+# Surface high-impact patterns that frequently produce Luau the AI can't
+# faithfully transpile. Warnings are added to TranspiledScript.warnings so
+# they show up in the conversion report ahead of method-completeness
+# diagnostics — the user sees them BEFORE they hit the broken behavior.
+# ---------------------------------------------------------------------------
+
+# Each entry: (category, regex, human-readable warning).
+# Patterns are ordered by frequency in real-world Unity projects so the
+# first match for a category surfaces the most-likely-relevant snippet.
+_CSHARP_PATTERN_RULES: list[tuple[str, str, str]] = [
+    (
+        "linq",
+        r"\b(?:using\s+System\.Linq|\.(?:Select|Where|OrderBy|OrderByDescending|"
+        r"GroupBy|Aggregate|FirstOrDefault|SingleOrDefault|ToList|ToArray|ToDictionary|"
+        r"Distinct|Skip|Take|Zip)\s*\()",
+        "LINQ usage detected (System.Linq or .Select/.Where/.OrderBy/etc.); "
+        "Roblox/Luau has no LINQ — verify the AI used UTILITY_FUNCTIONS or "
+        "explicit loops",
+    ),
+    (
+        "async",
+        r"\b(?:async\s+(?:Task|void)|await\s+|Task<[A-Za-z_]|Task\.Run\s*\(|"
+        r"Task\.Delay\s*\(|UniTask)",
+        "async/await or Task<T> detected; Luau coroutines are similar but not "
+        "identical — verify the AI translated to coroutine.wrap / task.wait",
+    ),
+    (
+        "networking",
+        # Mix of word-boundary identifiers and bracketed attributes — the
+        # \[Command\] alternation lives outside the \b group because '['
+        # is non-word and \b would never match before it.
+        r"(?:\b(?:UnityWebRequest|UnityEngine\.Networking|NetworkBehaviour|"
+        r"RpcTarget|PhotonView|Mirror\.NetworkServer|Mirror\.NetworkClient)\b|"
+        r"\[(?:Command|ClientRpc|ServerRpc)\])",
+        "Unity Networking/Mirror/Photon API detected; map manually to Roblox "
+        "RemoteEvent / RemoteFunction — the AI cannot infer authority topology",
+    ),
+    (
+        "reflection",
+        r"\b(?:typeof\s*\(|GetType\s*\(\s*\)|Activator\.CreateInstance|"
+        r"System\.Reflection\.|FieldInfo|MethodInfo|PropertyInfo)",
+        "Reflection API detected (typeof / GetType / System.Reflection); "
+        "Luau has no equivalent — refactor to explicit dispatch",
+    ),
+    (
+        "threading",
+        r"\b(?:System\.Threading\.|new\s+Thread\s*\(|ThreadPool\.|"
+        r"Interlocked\.|\block\s*\(|Mutex|Semaphore)",
+        "Threading primitives detected; Luau is single-threaded with task.spawn "
+        "+ events — verify shared-state isn't assumed atomic",
+    ),
+    (
+        "unsafe_or_pointers",
+        r"\b(?:unsafe\s*(?:\{|public|private|internal)|fixed\s*\(|stackalloc\b|"
+        r"\bIntPtr\b|Marshal\.)",
+        "Unsafe code or unmanaged pointers detected (unsafe / fixed / IntPtr / "
+        "Marshal); Luau has no equivalent — manual rewrite required",
+    ),
+]
+
+
+def _analyze_csharp_patterns(csharp_source: str) -> list[str]:
+    """Return human-readable warnings for high-impact C# patterns that
+    frequently mistranspile.
+
+    Six categories: LINQ, async/await, Unity Networking / Mirror / Photon,
+    reflection, threading, and unsafe/unmanaged pointers. One warning per
+    category triggered.
+
+    Strips ``//`` and ``/* */`` comments before matching so commented-out
+    code doesn't trigger false positives. (String literals are NOT
+    stripped — patterns rarely appear inside strings, and stripping would
+    require a full lexer.)
+    """
+    if not csharp_source:
+        return []
+
+    # Drop // line comments and /* ... */ block comments. Conservative —
+    # ignores escapes inside string literals (rare in real C#).
+    cleaned = re.sub(r"//[^\n]*", "", csharp_source)
+    cleaned = re.sub(r"/\*.*?\*/", "", cleaned, flags=re.DOTALL)
+
+    warnings: list[str] = []
+    for _category, pattern, message in _CSHARP_PATTERN_RULES:
+        if re.search(pattern, cleaned):
+            warnings.append(message)
+    return warnings
 
 
 # ---------------------------------------------------------------------------
