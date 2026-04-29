@@ -1869,6 +1869,24 @@ def convert_animations(
     # template rather than per-scene-instance. This dedupes scripts across
     # scene instantiations and lets the runtime require the script from
     # ``ReplicatedStorage.Templates.<Prefab>`` directly.
+    #
+    # When scene filtering is active, restrict consideration to prefabs
+    # actually instantiated by some parsed scene — otherwise unrelated
+    # prefabs that live in different scenes would force-emit their
+    # controllers into the current run (Codex P2 review feedback).
+    instantiated_prefab_guids: set[str] | None = None
+    if any_scene_has_refs and parsed_scenes:
+        instantiated_prefab_guids = set()
+        for scene in parsed_scenes:
+            for instance in scene.prefab_instances:
+                if instance.source_prefab_guid:
+                    instantiated_prefab_guids.add(instance.source_prefab_guid)
+
+    prefab_to_guid: dict[int, str] = {}
+    if prefab_library is not None:
+        for guid, prefab in prefab_library.by_guid.items():
+            prefab_to_guid[id(prefab)] = guid
+
     prefabs_per_controller: dict[str, list[str]] = {}
     if prefab_library is not None and guid_index:
         for ctrl in controllers:
@@ -1879,11 +1897,16 @@ def convert_animations(
             if not ctrl_guid:
                 continue
             for prefab in prefab_library.prefabs:
-                if ctrl_guid in prefab.referenced_animator_controller_guids:
-                    if prefab.name not in prefabs_per_controller.setdefault(
-                        ctrl.name, []
-                    ):
-                        prefabs_per_controller[ctrl.name].append(prefab.name)
+                if ctrl_guid not in prefab.referenced_animator_controller_guids:
+                    continue
+                if instantiated_prefab_guids is not None:
+                    prefab_guid = prefab_to_guid.get(id(prefab))
+                    if prefab_guid is None or prefab_guid not in instantiated_prefab_guids:
+                        continue
+                if prefab.name not in prefabs_per_controller.setdefault(
+                    ctrl.name, []
+                ):
+                    prefabs_per_controller[ctrl.name].append(prefab.name)
     default_scopes = [""]
 
     for ctrl in controllers:

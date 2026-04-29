@@ -385,6 +385,30 @@ def _set_nested_property(
             target[last] = value
 
 
+def _collect_animator_controller_guids(
+    nodes: dict[str, PrefabNode],
+) -> set[str]:
+    """Walk a node tree and collect every Animator m_Controller GUID.
+
+    Used post-variant-merge to rebuild ``referenced_animator_controller_guids``
+    from the modified component graph (variant overrides of m_Controller
+    are otherwise lost — the set was copied from the source before
+    modifications applied).
+    """
+    refs: set[str] = set()
+    for node in nodes.values():
+        for comp in node.components:
+            if comp.component_type != "Animator":
+                continue
+            props = comp.properties if isinstance(comp.properties, dict) else {}
+            ctrl = props.get("m_Controller", {})
+            if isinstance(ctrl, dict):
+                guid = ref_guid(ctrl)
+                if guid:
+                    refs.add(guid)
+    return refs
+
+
 def _resolve_variant_chain(
     template: PrefabTemplate,
     by_guid: dict[str, PrefabTemplate],
@@ -456,13 +480,20 @@ def _resolve_variant_chain(
     # Apply this variant's modifications
     _apply_variant_modifications(merged, template.variant_modifications)
 
+    # Variant overrides of Animator m_Controller would otherwise be lost —
+    # rebuild the controller-ref set from the merged component graph so
+    # variants that swap controllers route to the new GUID, not the base.
+    merged.referenced_animator_controller_guids = (
+        _collect_animator_controller_guids(merged.all_nodes)
+    )
+
     # Transfer merged result back into the template
     template.root = merged.root
     template.all_nodes = merged.all_nodes
     template.is_multi_root = merged.is_multi_root
     template.referenced_material_guids |= merged.referenced_material_guids
     template.referenced_mesh_guids |= merged.referenced_mesh_guids
-    template.referenced_animator_controller_guids |= (
+    template.referenced_animator_controller_guids = set(
         merged.referenced_animator_controller_guids
     )
     template.variant_resolved = True
