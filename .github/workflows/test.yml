@@ -313,6 +313,55 @@ jobs:
           "$HOME/.unity2rbxlx-venv/bin/python" u2r.py smoke-test "$RBXLX" \
             --output-dir "$PWD/smoke_output/SimpleFPS"
 
+      # Phase 5.2a: assert no placeholder rbxassetid://0 URLs leaked into
+      # the rbxlx. The smoke-test runs --no-upload so placeholder URLs ARE
+      # expected for FBX/audio that need real uploads — we only enforce
+      # strict validation in real-upload runs (the gated job below).
+      # Here we run validate without --strict-asset-ids so the warning
+      # is logged but doesn't fail the smoke job.
+      - name: Validate smoke rbxlx (placeholder warnings)
+        run: |
+          RBXLX="$PWD/output/SimpleFPS/main.rbxlx"
+          "$HOME/.unity2rbxlx-venv/bin/python" u2r.py validate "$RBXLX"
+
+      # Phase 5.4: wire visual-compare into nightly CI. Reads the smoke
+      # screenshot and compares against a committed baseline using SSIM,
+      # failing on SSIM below 0.85. Gated on baseline existence so the
+      # job degrades gracefully until a baseline gets committed.
+      - name: Visual compare against baseline (SSIM 0.85)
+        if: always()
+        run: |
+          ROBLOX_SHOT="$PWD/smoke_output/SimpleFPS/studio_screenshot.png"
+          BASELINE="$PWD/eval_baseline_screenshots/SimpleFPS_main.png"
+          if [ ! -f "$BASELINE" ]; then
+            echo "::warning::No baseline screenshot at $BASELINE; visual-compare skipped. "
+            echo "Commit one after a known-good run to activate the SSIM gate."
+            exit 0
+          fi
+          if [ ! -f "$ROBLOX_SHOT" ]; then
+            echo "::warning::Smoke screenshot not produced; visual-compare skipped."
+            exit 0
+          fi
+          mkdir -p "$PWD/visual_compare/SimpleFPS"
+          "$HOME/.unity2rbxlx-venv/bin/python" -c "
+          import sys, json
+          from pathlib import Path
+          from comparison.visual_diff import compare_images
+          out = Path('$PWD/visual_compare/SimpleFPS')
+          out.mkdir(parents=True, exist_ok=True)
+          result = compare_images(
+              image_a_path=Path('$BASELINE'),
+              image_b_path=Path('$ROBLOX_SHOT'),
+              output_dir=out,
+          )
+          (out / 'visual_diff.json').write_text(json.dumps(result, indent=2, default=str))
+          ssim = result['ssim']
+          print(f'SSIM: {ssim:.4f}  (baseline: 0.85)')
+          if ssim < 0.85:
+              print(f'::error::Visual regression — SSIM {ssim:.4f} < 0.85')
+              sys.exit(1)
+          "
+
       - name: Upload smoke test artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -321,6 +370,193 @@ jobs:
           path: |
             converter/smoke_output/SimpleFPS/smoke_test_report.json
             converter/smoke_output/SimpleFPS/studio_screenshot.png
+            converter/visual_compare/SimpleFPS/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # Phase 5.3: AI-on convert-matrix variant. Runs the SimpleFPS conversion
+  # with the AI transpiler enabled and asserts that non-empty
+  # TranspiledScript.warnings is the only acceptable failure mode (i.e.
+  # no hard transpile failures). Gated on ANTHROPIC_API_KEY availability —
+  # when the secret isn't configured the job is skipped cleanly so forks
+  # without a key don't see false-failure red builds.
+  ai-convert-matrix:
+    name: AI-on convert SimpleFPS (nightly)
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+      && github.repository == 'jiazou/unity2rbxlx'
+    needs: fast
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: converter
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Init SimpleFPS submodule (skip LFS smudge)
+        env:
+          GIT_LFS_SKIP_SMUDGE: "1"
+        run: git submodule update --init --recursive test_projects/SimpleFPS
+        working-directory: ${{ github.workspace }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Skip if no Anthropic API key
+        id: keycheck
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "no-key=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::ANTHROPIC_API_KEY secret not set; AI-on matrix skipped"
+          else
+            echo "no-key=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Convert SimpleFPS with AI transpiler
+        if: steps.keycheck.outputs.no-key != 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python u2r.py convert "../test_projects/SimpleFPS" \
+            -o "./output/SimpleFPS_ai" \
+            --scene all \
+            --no-upload \
+            --no-resolve
+
+      - name: Validate AI conversion (placeholder warnings allowed)
+        if: steps.keycheck.outputs.no-key != 'true'
+        run: |
+          # Phase 5.3 acceptance: non-empty TranspiledScript.warnings is the
+          # only acceptable failure mode. The validate command surfaces
+          # warnings without failing; we then read the conversion_report.json
+          # and assert no scripts had strategy="failed".
+          for rbxlx in ./output/SimpleFPS_ai/*.rbxlx; do
+            [ -f "$rbxlx" ] || continue
+            python u2r.py validate "$rbxlx"
+          done
+          python -c "
+          import json, sys
+          from pathlib import Path
+          report = json.loads(Path('./output/SimpleFPS_ai/conversion_report.json').read_text())
+          failed = [s for s in report.get('scripts', []) if s.get('strategy') == 'failed']
+          if failed:
+              print(f'::error::{len(failed)} scripts failed AI transpilation:')
+              for s in failed[:10]:
+                  print(f'  {s.get(\"source_path\", \"?\")}')
+              sys.exit(1)
+          warn_count = sum(1 for s in report.get('scripts', []) if s.get('warnings'))
+          print(f'AI transpile OK: {warn_count} scripts have warnings (acceptable)')
+          "
+
+      - name: Upload AI conversion artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-convert-SimpleFPS
+          path: |
+            converter/output/SimpleFPS_ai/*.rbxlx
+            converter/output/SimpleFPS_ai/conversion_report.json
+            converter/output/SimpleFPS_ai/scripts/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # Phase 5.2b: real-upload smoke. Gated on ROBLOX_API_KEY + UNIVERSE_ID +
+  # PLACE_ID secrets so it only runs when credentials are wired up. When
+  # active, it runs upload + resolve, then validates --strict-asset-ids
+  # which fails on any rbxassetid://0 placeholder URL. The SurfaceAppearance
+  # round-trip through ReplicatedStorage.Templates is exercised because the
+  # full upload pipeline materializes texture URLs into the templates.
+  real-upload-smoke:
+    name: real-upload smoke (nightly, gated)
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+      && github.repository == 'jiazou/unity2rbxlx'
+    needs: fast
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: converter
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Init SimpleFPS submodule (skip LFS smudge)
+        env:
+          GIT_LFS_SKIP_SMUDGE: "1"
+        run: git submodule update --init --recursive test_projects/SimpleFPS
+        working-directory: ${{ github.workspace }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Skip if upload secrets unavailable
+        id: keycheck
+        env:
+          ROBLOX_API_KEY: ${{ secrets.ROBLOX_API_KEY }}
+          ROBLOX_UNIVERSE_ID: ${{ secrets.ROBLOX_UNIVERSE_ID }}
+          ROBLOX_PLACE_ID: ${{ secrets.ROBLOX_PLACE_ID }}
+        run: |
+          if [ -z "$ROBLOX_API_KEY" ] || [ -z "$ROBLOX_UNIVERSE_ID" ] || [ -z "$ROBLOX_PLACE_ID" ]; then
+            echo "no-key=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Roblox upload secrets missing; real-upload smoke skipped"
+          else
+            echo "no-key=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Convert + upload + resolve SimpleFPS
+        if: steps.keycheck.outputs.no-key != 'true'
+        env:
+          ROBLOX_API_KEY: ${{ secrets.ROBLOX_API_KEY }}
+        run: |
+          python u2r.py convert "../test_projects/SimpleFPS" \
+            -o "./output/SimpleFPS_upload" \
+            --scene all \
+            --no-ai \
+            --universe-id "${{ secrets.ROBLOX_UNIVERSE_ID }}" \
+            --place-id "${{ secrets.ROBLOX_PLACE_ID }}"
+
+      - name: Validate upload run with strict asset IDs (5.2a)
+        if: steps.keycheck.outputs.no-key != 'true'
+        run: |
+          # Phase 5.2a: every asset URL must be real after upload+resolve.
+          # --strict-asset-ids exits 1 on any rbxassetid://0 placeholder.
+          for rbxlx in ./output/SimpleFPS_upload/*.rbxlx; do
+            [ -f "$rbxlx" ] || continue
+            python u2r.py validate "$rbxlx" --strict-asset-ids
+          done
+
+      - name: Upload real-upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-upload-SimpleFPS
+          path: |
+            converter/output/SimpleFPS_upload/*.rbxlx
+            converter/output/SimpleFPS_upload/conversion_report.json
+            converter/output/SimpleFPS_upload/conversion_context.json
           if-no-files-found: warn
           retention-days: 14
 
@@ -328,21 +564,28 @@ jobs:
     name: nightly summary
     runs-on: ubuntu-latest
     if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-    needs: [slow-unit-tests, convert-matrix, eval-regression, smoke-test]
+    needs: [slow-unit-tests, convert-matrix, eval-regression, smoke-test, ai-convert-matrix, real-upload-smoke]
     steps:
       - name: Check nightly job results
         run: |
-          echo "slow-unit-tests: ${{ needs.slow-unit-tests.result }}"
-          echo "convert-matrix:  ${{ needs.convert-matrix.result }}"
-          echo "eval-regression: ${{ needs.eval-regression.result }}"
-          echo "smoke-test:      ${{ needs.smoke-test.result }}"
-          # smoke-test is fork-only (self-hosted runner registration) — treat
-          # "skipped" as acceptable when the workflow runs on upstream.
+          echo "slow-unit-tests:    ${{ needs.slow-unit-tests.result }}"
+          echo "convert-matrix:     ${{ needs.convert-matrix.result }}"
+          echo "eval-regression:    ${{ needs.eval-regression.result }}"
+          echo "smoke-test:         ${{ needs.smoke-test.result }}"
+          echo "ai-convert-matrix:  ${{ needs.ai-convert-matrix.result }}"
+          echo "real-upload-smoke:  ${{ needs.real-upload-smoke.result }}"
+          # smoke-test, ai-convert-matrix, and real-upload-smoke are
+          # fork-and-secret-gated — treat "skipped" as acceptable when
+          # they don't run on upstream or when secrets aren't configured.
           smoke="${{ needs.smoke-test.result }}"
+          ai="${{ needs.ai-convert-matrix.result }}"
+          up="${{ needs.real-upload-smoke.result }}"
           if [ "${{ needs.slow-unit-tests.result }}" != "success" ] \
              || [ "${{ needs.convert-matrix.result }}" != "success" ] \
              || [ "${{ needs.eval-regression.result }}" != "success" ] \
-             || { [ "$smoke" != "success" ] && [ "$smoke" != "skipped" ]; }; then
+             || { [ "$smoke" != "success" ] && [ "$smoke" != "skipped" ]; } \
+             || { [ "$ai" != "success" ] && [ "$ai" != "skipped" ]; } \
+             || { [ "$up" != "success" ] && [ "$up" != "skipped" ]; }; then
             echo "::error::Nightly build had failures"
             exit 1
           fi

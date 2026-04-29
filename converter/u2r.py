@@ -4,6 +4,7 @@ u2r.py -- Click-based CLI for the Unity -> Roblox converter.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -469,7 +470,10 @@ def analyze(unity_project: str) -> None:
 
 @main.command()
 @click.argument("rbxlx_file", type=click.Path(exists=True))
-def validate(rbxlx_file: str) -> None:
+@click.option("--strict-asset-ids", is_flag=True,
+              help="Phase 5.2a: exit non-zero if any rbxassetid://0 placeholder "
+                   "URLs remain in the rbxlx (indicates incomplete upload/resolve).")
+def validate(rbxlx_file: str, strict_asset_ids: bool) -> None:
     """Validate a generated .rbxlx file for Roblox compatibility."""
     import xml.etree.ElementTree as ET
 
@@ -567,6 +571,20 @@ def validate(rbxlx_file: str) -> None:
                         sa_with_textures += 1
                         break
 
+    # Phase 5.2a: scan for placeholder asset URLs. After a real upload+resolve
+    # cycle every rbxassetid://NUM should reference a real numeric asset.
+    # Placeholders (rbxassetid://0 in particular) are emitted by --no-upload
+    # runs and signal that the upload step was skipped or failed for that
+    # asset. The smoke-test job uses --strict-asset-ids to catch this.
+    placeholder_urls: list[str] = []
+    placeholder_re = re.compile(r"rbxassetid://0+(?:\?|$|/)")
+    for content in tree.iter("Content"):
+        url_el = content.find("url")
+        if url_el is None or not url_el.text:
+            continue
+        if placeholder_re.search(url_el.text):
+            placeholder_urls.append(url_el.text)
+
     # Results
     total = sum(stats.values())
     issues = len(invalid) + local_paths + string_mats
@@ -590,6 +608,13 @@ def validate(rbxlx_file: str) -> None:
     if stats.get("Sky", 0) == 0:
         warnings.append(f"    No Sky (need skybox texture upload)")
 
+    if placeholder_urls:
+        warnings.append(
+            f"    {len(placeholder_urls)} placeholder rbxassetid://0 URLs "
+            f"(asset upload incomplete for these — re-run with --upload "
+            f"once API key is available)"
+        )
+
     if issues == 0 and not warnings:
         click.echo(f"\n  ✓ No issues found")
     elif issues == 0 and warnings:
@@ -609,6 +634,17 @@ def validate(rbxlx_file: str) -> None:
             click.echo(f"\n  Warnings ({len(warnings)}):")
             for w in warnings:
                 click.echo(w)
+
+    # Phase 5.2a: strict mode treats any placeholder rbxassetid://0 as a
+    # gating failure (used by the nightly smoke-test to catch incomplete
+    # upload+resolve cycles before the rbxlx ships).
+    if strict_asset_ids and placeholder_urls:
+        click.echo(
+            f"\n  ERROR: --strict-asset-ids: {len(placeholder_urls)} placeholder "
+            f"rbxassetid://0 URL(s) found in {rbxlx_path.name}",
+            err=True,
+        )
+        sys.exit(1)
 
 
 @main.command()

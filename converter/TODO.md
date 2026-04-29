@@ -19,11 +19,23 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   through `ReplicatedStorage.Templates`. Verify on a full upload run.
 ## Infrastructure
 
-- [ ] **P2 — Three-flow `rbx_place` byte-equivalence test.** Codex review
-  P1-6 deferred. Source-level + behavior-level parity is now tested
-  (commit `420b01e`). Byte-equivalence requires a real Unity fixture.
+- [ ] **P2 — Three-flow byte-equivalence: u2r.py vs convert_interactive.py
+  divergence (Phase 5.1 follow-up).** The byte-equivalence test landed
+  with `test_three_flows_produce_identical_rbxlx` xfailed because the
+  in-memory u2r.py path inlines scripts via `_convert_prefab_node` while
+  the cross-process interactive path goes through `rehydration_plan.py`,
+  producing different sets of Script Items. Harmonize the two paths so
+  the test flips from xfail to xpass.
 - [ ] **P2 — Standalone `.rbxm` file output per prefab.** PR 5 deferred.
   Toolbox convenience; no runtime dependency on this format.
+- [ ] **P2 — Visual-compare baseline screenshot (Phase 5.4 follow-up).**
+  CI step is wired, gated on `eval_baseline_screenshots/SimpleFPS_main.png`
+  existing. Commit a known-good baseline from the next clean smoke run
+  to activate the SSIM 0.85 gate; until then the step warns and continues.
+- [ ] **P2 — Real-upload smoke secrets (Phase 5.2b / 5.3 follow-up).**
+  CI jobs `real-upload-smoke` and `ai-convert-matrix` skip cleanly until
+  the repo secrets `ROBLOX_API_KEY`, `ROBLOX_UNIVERSE_ID`, `ROBLOX_PLACE_ID`,
+  and `ANTHROPIC_API_KEY` are configured. Wire them when CI billing allows.
 
 ## Type-strictness debt (forward-only gate landed; cleanup separate)
 
