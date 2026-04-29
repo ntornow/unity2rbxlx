@@ -26,10 +26,6 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
 - [ ] **P2 — Full SurfaceAppearance round-trip through templates.** PR 5
   deferred. The smoke ran with `--no-upload` so real asset IDs never wired
   through `ReplicatedStorage.Templates`. Verify on a full upload run.
-- [ ] **P2 — Per-prefab variant-chain preservation in templates.** PR 5
-  currently emits the flattened resolved form; variant-chain reapplication
-  at runtime is not preserved.
-
 ## Infrastructure
 
 - [ ] **P2 — Three-flow `rbx_place` byte-equivalence test.** Codex review
