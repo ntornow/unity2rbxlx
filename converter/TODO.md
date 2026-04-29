@@ -46,14 +46,6 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   script per prefab animator (not just per scene). Revisit alongside the
   prefab-animator aggregation above.
 
-## UI
-
-- [ ] **P2 — TMP alignment.** PR 1 deferred. `m_HorizontalAlignment` and
-  `m_VerticalAlignment` bitfields on TextMeshPro components aren't split
-  into `text_x_alignment` / `text_y_alignment` yet; only legacy `m_Alignment`
-  (single 0..8 enum) is handled. Revisit if a test project exercises
-  TMP-only text layout issues.
-
 ## Infrastructure
 
 - [ ] **P2 — Three-flow `rbx_place` byte-equivalence test.** Codex review

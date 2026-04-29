@@ -59,6 +59,55 @@ _TEXT_ANCHOR_Y: dict[int, str] = {
     6: "Bottom", 7: "Bottom", 8: "Bottom",
 }
 
+# TextMeshPro HorizontalAlignmentOptions bitfield values mapped to Roblox
+# TextXAlignment tokens. Justified/Flush/Geometry have no Roblox equivalent;
+# Justified collapses to Left (extends from a left-aligned baseline) and
+# Flush/Geometry collapse to Center (closer to their visual centroid).
+_TMP_HORIZONTAL_BITS: dict[int, str] = {
+    1: "Left",       # Left
+    2: "Center",     # Center
+    4: "Right",      # Right
+    8: "Left",       # Justified -> Left (no Roblox equivalent)
+    16: "Center",    # Flush -> Center
+    32: "Center",    # Geometry -> Center
+}
+
+# TextMeshPro VerticalAlignmentOptions bitfield values mapped to Roblox
+# TextYAlignment tokens. Baseline collapses to Bottom (baseline ≈ glyph
+# bottom for non-descender text), Geometry to Center, Capline to Top.
+_TMP_VERTICAL_BITS: dict[int, str] = {
+    256: "Top",      # Top
+    512: "Center",   # Middle
+    1024: "Bottom",  # Bottom
+    2048: "Bottom",  # Baseline -> Bottom
+    4096: "Center",  # Geometry -> Center
+    8192: "Top",     # Capline -> Top
+}
+
+
+def _coerce_int(raw: Any) -> int | None:
+    """Best-effort int coercion for serialized YAML scalars; None on failure."""
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def _map_tmp_bitfield(raw: Any, table: dict[int, str]) -> str | None:
+    """Resolve a TMP alignment bitfield int to a Roblox token.
+
+    Direct lookup first; if absent, fall back to the lowest set bit so
+    multi-flag values still classify (TMP only sets one flag per axis in
+    practice, but YAML files written by some tools may OR extra bits).
+    """
+    value = _coerce_int(raw)
+    if value is None or value <= 0:
+        return None
+    if value in table:
+        return table[value]
+    lowest_bit = value & -value
+    return table.get(lowest_bit)
+
 # UnityEngine.UI.Image script GUID — MonoBehaviours using this script are
 # Image components that the scene parser can't distinguish by classID alone.
 _UI_IMAGE_SCRIPT_GUID_PREFIX = "fe87c0e1cc204ed48ad3"
@@ -466,20 +515,30 @@ def _apply_text_properties(
     if mapped_font:
         element.font = mapped_font
 
-    # Alignment: Unity TextAnchor is a single 0..8 enum covering both axes.
-    # TMP uses separate m_HorizontalAlignment / m_VerticalAlignment bitfields
-    # — not supported here yet; legacy Text covers the common case.
+    # Alignment. Two serializations coexist:
+    #   - Legacy UnityEngine.UI.Text: single m_Alignment 0..8 row-major enum.
+    #   - TextMeshPro: split m_HorizontalAlignment / m_VerticalAlignment
+    #     bitfields (HorizontalAlignmentOptions / VerticalAlignmentOptions).
+    # TMP fields take precedence per axis when present so a TMP component
+    # writing both legacy and split fields routes to the bitfield reading.
     anchor_raw = props.get("m_Alignment")
     if anchor_raw is None:
         anchor_raw = font_data.get("m_Alignment")
     if anchor_raw is not None:
-        try:
-            anchor = int(float(anchor_raw))
-        except (TypeError, ValueError):
-            anchor = -1
-        if anchor in _TEXT_ANCHOR_X:
+        anchor = _coerce_int(anchor_raw)
+        if anchor is not None and anchor in _TEXT_ANCHOR_X:
             element.text_x_alignment = _TEXT_ANCHOR_X[anchor]
             element.text_y_alignment = _TEXT_ANCHOR_Y[anchor]
+
+    h_raw = props.get("m_HorizontalAlignment", font_data.get("m_HorizontalAlignment"))
+    h_token = _map_tmp_bitfield(h_raw, _TMP_HORIZONTAL_BITS)
+    if h_token is not None:
+        element.text_x_alignment = h_token
+
+    v_raw = props.get("m_VerticalAlignment", font_data.get("m_VerticalAlignment"))
+    v_token = _map_tmp_bitfield(v_raw, _TMP_VERTICAL_BITS)
+    if v_token is not None:
+        element.text_y_alignment = v_token
 
     # Background transparency (text elements are usually transparent).
     element.background_transparency = 1.0
