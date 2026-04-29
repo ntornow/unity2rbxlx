@@ -1109,33 +1109,37 @@ class Pipeline:
                 )
                 continue
 
-            # Vertex colors are mesh-specific. Phase 5.7 keys per
-            # (mesh_path, mesh_file_id) so distinct sub-meshes of the same
-            # FBX bake to distinct textures. Every unique sub-mesh referrer
-            # is enqueued — the per-material mapping points at the first
-            # representative, and the additional baked PNGs land alongside
-            # so a per-part materialization pass can pick them up later.
+            # Vertex colors are mesh-specific. Phase 5.7: every unique
+            # (mesh_path, mesh_file_id) referrer also gets a keyed PNG.
+            # The mapping itself points at a "combined" bake of the
+            # representative FBX (whole-FBX, no sub-mesh ID — pre-5.7
+            # behavior) so a single SurfaceAppearance still covers every
+            # sub-mesh that uses this material. Per-sub-mesh PNGs land
+            # alongside so a follow-up per-part rebinding pass can split.
             sorted_meshes = sorted(
                 meshes, key=lambda mp: (str(mp[0]), mp[1] or ""),
             )
-            for idx, (mesh_path, mesh_fid) in enumerate(sorted_meshes):
-                pairs.append((mesh_path, albedo, mesh_fid or None))
-                # Only the first pair routes back to this mapping (Roblox
-                # SurfaceAppearance is per-material, so the rbxlx still
-                # references one PNG); the others bake into the output dir
-                # without rewriting the mapping.
-                material_pair_index.append(mapping if idx == 0 else None)
+            rep_mesh, rep_fid = sorted_meshes[0]
+            # Primary (combined) entry — drives the mapping's color_map_path.
+            pairs.append((rep_mesh, albedo, None))
+            material_pair_index.append(mapping)
+            # Auxiliary keyed entries — produce one PNG per (mesh, sub-mesh)
+            # without rebinding the mapping.
+            for mesh_path, mesh_fid in sorted_meshes:
+                if not mesh_fid:
+                    continue
+                pairs.append((mesh_path, albedo, mesh_fid))
+                material_pair_index.append(None)
             if len(sorted_meshes) > 1:
-                rep_mesh, rep_fid = sorted_meshes[0]
                 others = ", ".join(
                     f"{mp.name}:{fid or '-'}" for mp, fid in sorted_meshes[1:]
                 )
                 mapping.warnings.append(
-                    f"Vertex-color baking used mesh "
-                    f"'{rep_mesh.name}:{rep_fid or '-'}'; "
+                    f"Vertex-color baking used combined bake of "
+                    f"'{rep_mesh.name}'; "
                     f"other (mesh, sub-mesh) pairs sharing this material "
-                    f"each baked to distinct PNGs (per-part rebinding "
-                    f"not wired): {others}"
+                    f"each baked to distinct PNGs alongside (per-part "
+                    f"rebinding not wired): {others}"
                 )
 
         if not pairs:

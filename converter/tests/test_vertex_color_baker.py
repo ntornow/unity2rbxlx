@@ -56,7 +56,9 @@ class TestBakeBatchSubmeshKeyedOutput:
 
     def test_distinct_filenames_per_submesh(self, tmp_path: Path, monkeypatch):
         """Three (mesh, albedo, file_id) triples produce three distinct
-        output PNG paths, each keyed by file_id.
+        output PNG paths, each keyed by file_id. Acceptance criterion:
+        an FBX with three sub-meshes and three distinct vertex-color
+        sets bakes to three distinct textures.
         """
         from converter import vertex_color_baker as vcb
 

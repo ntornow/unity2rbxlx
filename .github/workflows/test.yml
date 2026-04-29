@@ -528,10 +528,15 @@ jobs:
           ROBLOX_API_KEY: ${{ secrets.ROBLOX_API_KEY }}
           ROBLOX_UNIVERSE_ID: ${{ secrets.ROBLOX_UNIVERSE_ID }}
           ROBLOX_PLACE_ID: ${{ secrets.ROBLOX_PLACE_ID }}
+          ROBLOX_CREATOR_ID: ${{ secrets.ROBLOX_CREATOR_ID }}
         run: |
-          if [ -z "$ROBLOX_API_KEY" ] || [ -z "$ROBLOX_UNIVERSE_ID" ] || [ -z "$ROBLOX_PLACE_ID" ]; then
+          # u2r.py convert needs creator-id for upload_assets — without it
+          # upload silently skips and validate --strict-asset-ids will fail
+          # every run. Gate on all four to keep the job green-or-skipped.
+          if [ -z "$ROBLOX_API_KEY" ] || [ -z "$ROBLOX_UNIVERSE_ID" ] \
+             || [ -z "$ROBLOX_PLACE_ID" ] || [ -z "$ROBLOX_CREATOR_ID" ]; then
             echo "no-key=true" >> "$GITHUB_OUTPUT"
-            echo "::warning::Roblox upload secrets missing; real-upload smoke skipped"
+            echo "::warning::Roblox upload secrets missing (need ROBLOX_API_KEY, ROBLOX_UNIVERSE_ID, ROBLOX_PLACE_ID, ROBLOX_CREATOR_ID); real-upload smoke skipped"
           else
             echo "no-key=false" >> "$GITHUB_OUTPUT"
           fi
@@ -545,6 +550,7 @@ jobs:
             -o "./output/SimpleFPS_upload" \
             --scene all \
             --no-ai \
+            --creator-id "${{ secrets.ROBLOX_CREATOR_ID }}" \
             --universe-id "${{ secrets.ROBLOX_UNIVERSE_ID }}" \
             --place-id "${{ secrets.ROBLOX_PLACE_ID }}"
 
