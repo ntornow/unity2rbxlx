@@ -36,6 +36,15 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   CI jobs `real-upload-smoke` and `ai-convert-matrix` skip cleanly until
   the repo secrets `ROBLOX_API_KEY`, `ROBLOX_UNIVERSE_ID`, `ROBLOX_PLACE_ID`,
   and `ANTHROPIC_API_KEY` are configured. Wire them when CI billing allows.
+- [ ] **P1 — Attach prefab-scoped animation scripts under
+  `ReplicatedStorage.Templates.<Prefab>` (Phase 5.9 deep follow-up).**
+  The current 5.9 emission renames `Anim_<Prefab>_<Ctrl>_<Clip>` so the
+  script names dedupe across scene instances, but `write_output()` still
+  parents every generated animation script in a global container, so
+  cloning the prefab from `Templates` doesn't carry the animation
+  driver. Real fix: emit the script as a child of the corresponding
+  `RbxPart` template in `prefab_packages` (or thread a `parent_path`
+  attribute through `storage_classifier`). Codex final-pass [P1].
 
 ## Type-strictness debt (forward-only gate landed; cleanup separate)
 

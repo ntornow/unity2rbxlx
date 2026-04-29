@@ -1111,29 +1111,31 @@ class Pipeline:
 
             # Vertex colors are mesh-specific. Phase 5.7 keys per
             # (mesh_path, mesh_file_id) so distinct sub-meshes of the same
-            # FBX bake to distinct textures. The mapping still gets a
-            # single representative output (Roblox SurfaceAppearance is
-            # per-material), but each unique sub-mesh produces its own
-            # PNG so a follow-up pass can split per-part if needed.
+            # FBX bake to distinct textures. Every unique sub-mesh referrer
+            # is enqueued — the per-material mapping points at the first
+            # representative, and the additional baked PNGs land alongside
+            # so a per-part materialization pass can pick them up later.
             sorted_meshes = sorted(
                 meshes, key=lambda mp: (str(mp[0]), mp[1] or ""),
             )
-            representative_mesh, representative_fid = sorted_meshes[0]
-            pairs.append((
-                representative_mesh,
-                albedo,
-                representative_fid or None,
-            ))
-            material_pair_index.append(mapping)
+            for idx, (mesh_path, mesh_fid) in enumerate(sorted_meshes):
+                pairs.append((mesh_path, albedo, mesh_fid or None))
+                # Only the first pair routes back to this mapping (Roblox
+                # SurfaceAppearance is per-material, so the rbxlx still
+                # references one PNG); the others bake into the output dir
+                # without rewriting the mapping.
+                material_pair_index.append(mapping if idx == 0 else None)
             if len(sorted_meshes) > 1:
+                rep_mesh, rep_fid = sorted_meshes[0]
                 others = ", ".join(
                     f"{mp.name}:{fid or '-'}" for mp, fid in sorted_meshes[1:]
                 )
                 mapping.warnings.append(
                     f"Vertex-color baking used mesh "
-                    f"'{representative_mesh.name}:{representative_fid or '-'}'; "
-                    f"other (mesh, sub-mesh) pairs sharing this material may "
-                    f"need per-part baking (not wired): {others}"
+                    f"'{rep_mesh.name}:{rep_fid or '-'}'; "
+                    f"other (mesh, sub-mesh) pairs sharing this material "
+                    f"each baked to distinct PNGs (per-part rebinding "
+                    f"not wired): {others}"
                 )
 
         if not pairs:
@@ -1145,7 +1147,8 @@ class Pipeline:
         except Exception as exc:
             log.warning("[vertex_color_bake] batch failed: %s", exc)
             for mapping in material_pair_index:
-                mapping.warnings.append(f"Vertex-color baking failed: {exc}")
+                if mapping is not None:
+                    mapping.warnings.append(f"Vertex-color baking failed: {exc}")
             return
 
         log.info(
@@ -1154,6 +1157,12 @@ class Pipeline:
         )
 
         for entry, mapping in zip(result.entries, material_pair_index):
+            # Phase 5.7: secondary sub-mesh entries have mapping=None — they
+            # bake additional PNGs into the output dir for follow-up per-
+            # part materialization but don't rebind the mapping (Roblox
+            # SurfaceAppearance is per-material, not per-sub-mesh).
+            if mapping is None:
+                continue
             if entry.baked and entry.output_path:
                 mapping.color_map_path = str(entry.output_path)
             elif not entry.has_vertex_colors:

@@ -323,7 +323,9 @@ def test_vertex_color_baker_dedupes_per_material(tmp_path, monkeypatch):
         calls.append(pairs_list)
         from converter.vertex_color_baker import VertexColorBakeResult, BakeResult
         r = VertexColorBakeResult()
-        for mesh_p, _ in pairs_list:
+        # Each entry can be (mesh, albedo) or (mesh, albedo, fid).
+        for entry in pairs_list:
+            mesh_p = entry[0]
             r.entries.append(BakeResult(mesh_path=mesh_p, baked=False, has_vertex_colors=False))
         r.total = len(r.entries)
         return r
@@ -334,10 +336,13 @@ def test_vertex_color_baker_dedupes_per_material(tmp_path, monkeypatch):
 
     pipeline._bake_vertex_colors()
 
-    # One representative mesh, not two.
+    # Phase 5.7 update: every (mesh, sub-mesh) referrer enqueues a pair so
+    # distinct sub-meshes bake to distinct PNGs. Two referrers ⇒ two pairs.
+    # The mapping is only rewritten by the FIRST pair (deterministic), so
+    # the per-material color_map_path doesn't bounce between meshes.
     assert len(calls) == 1
-    assert len(calls[0]) == 1, f"expected 1 pair for shared material, got {calls[0]}"
-    # Warning must name the second mesh as deferred.
+    assert len(calls[0]) == 2, f"expected 2 pairs for two referrers, got {calls[0]}"
+    # Warning must name the second mesh.
     warning_blob = " ".join(mapping.warnings)
     assert "mesh_B.fbx" in warning_blob or "mesh_A.fbx" in warning_blob
     assert "per-part" in warning_blob

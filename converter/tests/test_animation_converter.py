@@ -2885,6 +2885,68 @@ class TestPhase59PrefabScopedTweenScripts:
         # would have it; the override replaces the source's pointer).
         assert "c" * 32 not in merged_refs
 
+    def test_instance_override_routes_to_prefab_scope(
+        self, tmp_path: Path,
+    ) -> None:
+        """Codex P2 fix (round 3): when a scene's PrefabInstance overrides
+        Animator.m_Controller per-instance, the override controller emits
+        under the prefab template's scope (not the scene's), preserving
+        the one-script-per-prefab dedupe.
+        """
+        from core.unity_types import (
+            ParsedScene,
+            PrefabInstanceData,
+            PrefabLibrary,
+            PrefabTemplate,
+        )
+        from unity.guid_resolver import build_guid_index
+        from unity.prefab_parser import aggregate_prefab_controller_refs
+
+        project, ctrl_guid, _ = self._build_transform_only_controller_project(tmp_path)
+        # The prefab template doesn't reference this controller; only the
+        # scene-level override does.
+        prefab = PrefabTemplate(
+            prefab_path=project / "Assets" / "Vehicle.prefab",
+            name="Vehicle",
+            referenced_animator_controller_guids=set(),
+        )
+        library = PrefabLibrary(
+            prefabs=[prefab],
+            by_name={"Vehicle": prefab},
+            by_guid={"vehicle" + "0" * 25: prefab},
+        )
+        scene = ParsedScene(
+            scene_path=project / "Assets" / "Level1.unity",
+            prefab_instances=[PrefabInstanceData(
+                file_id="500",
+                source_prefab_guid="vehicle" + "0" * 25,
+                source_prefab_file_id="0",
+                transform_parent_file_id="0",
+                modifications=[
+                    {
+                        "target": {"fileID": 102},
+                        "propertyPath": "m_Controller",
+                        "value": "",
+                        "objectReference": {"guid": ctrl_guid},
+                    },
+                ],
+            )],
+        )
+        # Aggregate populates the scene set with the override GUID.
+        aggregate_prefab_controller_refs(scene, library)
+
+        guid_index = build_guid_index(project)
+        result = convert_animations(
+            project,
+            guid_index=guid_index,
+            parsed_scenes=[scene],
+            prefab_library=library,
+        )
+        names = [name for name, _ in result.generated_scripts]
+        # Override routes to the prefab scope, not the scene scope.
+        assert any(n == "Anim_Vehicle_Wheel_Spin" for n in names), names
+        assert not any(n == "Anim_Level1_Wheel_Spin" for n in names), names
+
     def test_variant_added_animator_keeps_controller_ref(self) -> None:
         """Codex P2 #3 fix: when a variant prefab adds its OWN Animator (the
         component lives outside the source's tree), the variant's pre-merge

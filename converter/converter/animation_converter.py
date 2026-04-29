@@ -1890,6 +1890,35 @@ def convert_animations(
         for guid, prefab in prefab_library.by_guid.items():
             prefab_to_guid[id(prefab)] = guid
 
+    # Pre-walk per-instance m_Controller overrides: map override_guid →
+    # set of prefab names whose instance applied that override. Lets a
+    # scene-level override route to the correct prefab scope (Codex P2).
+    instance_overrides_by_ctrl_guid: dict[str, set[str]] = {}
+    if prefab_library is not None and parsed_scenes:
+        for scene in parsed_scenes:
+            for inst in scene.prefab_instances:
+                if not inst.source_prefab_guid:
+                    continue
+                inst_prefab = (prefab_library.by_guid or {}).get(
+                    inst.source_prefab_guid
+                )
+                if inst_prefab is None:
+                    continue
+                for mod in inst.modifications or ():
+                    if not isinstance(mod, dict):
+                        continue
+                    prop = mod.get("propertyPath", "")
+                    if not isinstance(prop, str) or not prop.endswith("m_Controller"):
+                        continue
+                    obj_ref = mod.get("objectReference") or {}
+                    if not isinstance(obj_ref, dict):
+                        continue
+                    override_guid = obj_ref.get("guid", "")
+                    if isinstance(override_guid, str) and override_guid:
+                        instance_overrides_by_ctrl_guid.setdefault(
+                            override_guid, set(),
+                        ).add(inst_prefab.name)
+
     prefabs_per_controller: dict[str, list[str]] = {}
     if prefab_library is not None and guid_index:
         for ctrl in controllers:
@@ -1910,6 +1939,17 @@ def convert_animations(
                     ctrl.name, []
                 ):
                     prefabs_per_controller[ctrl.name].append(prefab.name)
+            # Per-instance override: even when the prefab template itself
+            # doesn't reference this controller, an instance that swapped
+            # to it should still pull the prefab into scope so the override
+            # animates under the prefab template, not the scene.
+            for prefab_name in sorted(
+                instance_overrides_by_ctrl_guid.get(ctrl_guid, set()),
+            ):
+                if prefab_name not in prefabs_per_controller.setdefault(
+                    ctrl.name, [],
+                ):
+                    prefabs_per_controller[ctrl.name].append(prefab_name)
     default_scopes = [""]
 
     for ctrl in controllers:
