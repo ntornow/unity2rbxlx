@@ -92,6 +92,24 @@ function PrefabSpawner.spawn(name, parent, cframe)
 \treturn clone
 end
 
+-- Phase 5.13: returns the variant chain for a template by walking the
+-- VariantParentTemplate attribute. The chain is ordered from the named
+-- template up to its root parent. Useful for diagnostics and for
+-- composers that need to walk the inheritance chain.
+function PrefabSpawner.variantChain(name)
+\tlocal chain = {name}
+\tlocal seen = {[name] = true}
+\tlocal cur = _templatesFolder():FindFirstChild(name)
+\twhile cur do
+\t\tlocal parentName = cur:GetAttribute("VariantParentTemplate")
+\t\tif not parentName or seen[parentName] then break end
+\t\tseen[parentName] = true
+\t\ttable.insert(chain, parentName)
+\t\tcur = _templatesFolder():FindFirstChild(parentName)
+\tend
+\treturn chain
+end
+
 return PrefabSpawner
 """
 
@@ -151,6 +169,29 @@ def generate_prefab_packages(
     # import graph (avoids circular-import risk during pipeline setup).
     from converter.scene_converter import _convert_prefab_node
 
+    # Phase 5.13: build a variant→parent name lookup so variant templates
+    # carry a ``VariantParentTemplate`` attribute pointing at their source
+    # prefab's name. The runtime can then either clone the variant
+    # directly (current path: variant template is the fully-resolved tree)
+    # or compose at clone time by cloning the parent and re-applying
+    # overrides. The metadata is emitted regardless; the runtime composer
+    # is opt-in via the PrefabSpawner module.
+    variant_parent_by_name: dict[str, str] = {}
+    by_guid = getattr(prefab_library, "by_guid", None) or {}
+    for prefab in prefab_library.prefabs:
+        if not getattr(prefab, "is_variant", False):
+            continue
+        parent_guid = getattr(prefab, "source_prefab_guid", None)
+        if not parent_guid:
+            continue
+        parent = by_guid.get(parent_guid)
+        if parent is None:
+            continue
+        parent_name = getattr(parent, "name", None)
+        child_name = getattr(prefab, "name", None)
+        if parent_name and child_name:
+            variant_parent_by_name[child_name] = parent_name
+
     for template in prefab_library.prefabs:
         name = getattr(template, "name", None)
         if not name:
@@ -194,6 +235,14 @@ def generate_prefab_packages(
         # prefab parser may have preserved.
         from core.roblox_types import RbxCFrame
         part.cframe = RbxCFrame()
+
+        # Phase 5.13: tag variants with their parent template name so the
+        # runtime spawner can compose at clone time (and so a follow-up
+        # parent-template update propagates to variants).
+        parent_name = variant_parent_by_name.get(name)
+        if parent_name:
+            part.attributes["VariantParentTemplate"] = parent_name
+
         result.templates.append(part)
 
     if result.templates:
@@ -204,10 +253,19 @@ def generate_prefab_packages(
             parent_path="ReplicatedStorage",
             source_path="packages/PrefabSpawner.luau",
         )
+    emitted_names = {t.name for t in result.templates}
+    variant_chains = {
+        name: parent
+        for name, parent in variant_parent_by_name.items()
+        if name in emitted_names
+    }
     result.manifest = {
         "total_templates": len(result.templates),
-        "emitted_names": sorted(t.name for t in result.templates),
-        "referenced_but_missing": sorted(referenced - {t.name for t in result.templates}),
+        "emitted_names": sorted(emitted_names),
+        "referenced_but_missing": sorted(referenced - emitted_names),
+        # Phase 5.13: per-emitted variant, the parent template name. Lets
+        # tools and the runtime composer reconstruct the inheritance chain.
+        "variant_chains": variant_chains,
     }
     log.info(
         "[prefab_packages] emitted %d templates "

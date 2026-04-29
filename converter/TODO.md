@@ -12,55 +12,39 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   SQLite or pickle cache keyed by `(GUID, mtime)` would halve pipeline time
   for multi-scene projects and large games.
 
-## Cross-script transpilation
-
-- [ ] **P2 — 4.3.2 C# pattern warnings.** Skipped in PR 4. Pre-flight
-  diagnostics for LINQ / networking / async patterns. Revisit when a project
-  ships a class of error that warrants pre-flight surfacing.
-- [ ] **P2 — 4.3.4 `_classify_script_type` harmonization.** Dest defaults to
-  `Script`; source defaulted to `ModuleScript`. Revisit if a project ships
-  cross-classified scripts that need source's behavior.
-
 ## Materials & meshes
 
-- [ ] **P2 — Sub-mesh identity in vertex-color baking.** PR 3 deferred. FBX
-  files with multiple embedded meshes currently rasterize the whole file
-  instead of the specific sub-mesh — `mesh_file_id` is not yet preserved
-  through `bake_vertex_colors_batch`'s signature.
 - [ ] **P2 — Full SurfaceAppearance round-trip through templates.** PR 5
   deferred. The smoke ran with `--no-upload` so real asset IDs never wired
   through `ReplicatedStorage.Templates`. Verify on a full upload run.
-- [ ] **P2 — Per-prefab variant-chain preservation in templates.** PR 5
-  currently emits the flattened resolved form; variant-chain reapplication
-  at runtime is not preserved.
-
-## Animation routing
-
-- [ ] **P2 — Prefab-scoped animator controller GUID aggregation.** PR 2a
-  deferred. Scenes that only reach controllers through prefab instances have
-  an empty `referenced_animator_controller_guids` set, so scene-scoped naming
-  never activates for them. Add equivalent aggregation on `PrefabTemplate`
-  and union into the scene set. Unscoped fallback keeps existing projects
-  working.
-- [ ] **P2 — Transform-only prefab scanning.** PR 2a deferred. One tween
-  script per prefab animator (not just per scene). Revisit alongside the
-  prefab-animator aggregation above.
-
-## UI
-
-- [ ] **P2 — TMP alignment.** PR 1 deferred. `m_HorizontalAlignment` and
-  `m_VerticalAlignment` bitfields on TextMeshPro components aren't split
-  into `text_x_alignment` / `text_y_alignment` yet; only legacy `m_Alignment`
-  (single 0..8 enum) is handled. Revisit if a test project exercises
-  TMP-only text layout issues.
-
 ## Infrastructure
 
-- [ ] **P2 — Three-flow `rbx_place` byte-equivalence test.** Codex review
-  P1-6 deferred. Source-level + behavior-level parity is now tested
-  (commit `420b01e`). Byte-equivalence requires a real Unity fixture.
+- [ ] **P2 — Three-flow byte-equivalence: u2r.py vs convert_interactive.py
+  divergence (Phase 5.1 follow-up).** The byte-equivalence test landed
+  with `test_three_flows_produce_identical_rbxlx` xfailed because the
+  in-memory u2r.py path inlines scripts via `_convert_prefab_node` while
+  the cross-process interactive path goes through `rehydration_plan.py`,
+  producing different sets of Script Items. Harmonize the two paths so
+  the test flips from xfail to xpass.
 - [ ] **P2 — Standalone `.rbxm` file output per prefab.** PR 5 deferred.
   Toolbox convenience; no runtime dependency on this format.
+- [ ] **P2 — Visual-compare baseline screenshot (Phase 5.4 follow-up).**
+  CI step is wired, gated on `eval_baseline_screenshots/SimpleFPS_main.png`
+  existing. Commit a known-good baseline from the next clean smoke run
+  to activate the SSIM 0.85 gate; until then the step warns and continues.
+- [ ] **P2 — Real-upload smoke secrets (Phase 5.2b / 5.3 follow-up).**
+  CI jobs `real-upload-smoke` and `ai-convert-matrix` skip cleanly until
+  the repo secrets `ROBLOX_API_KEY`, `ROBLOX_UNIVERSE_ID`, `ROBLOX_PLACE_ID`,
+  and `ANTHROPIC_API_KEY` are configured. Wire them when CI billing allows.
+- [ ] **P1 — Attach prefab-scoped animation scripts under
+  `ReplicatedStorage.Templates.<Prefab>` (Phase 5.9 deep follow-up).**
+  The current 5.9 emission renames `Anim_<Prefab>_<Ctrl>_<Clip>` so the
+  script names dedupe across scene instances, but `write_output()` still
+  parents every generated animation script in a global container, so
+  cloning the prefab from `Templates` doesn't carry the animation
+  driver. Real fix: emit the script as a child of the corresponding
+  `RbxPart` template in `prefab_packages` (or thread a `parent_path`
+  attribute through `storage_classifier`). Codex final-pass [P1].
 
 ## Type-strictness debt (forward-only gate landed; cleanup separate)
 

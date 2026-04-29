@@ -201,3 +201,186 @@ class TestReplicatedTemplatesField:
         p = RbxPlace()
         assert p.replicated_templates == []
         assert isinstance(p.replicated_templates, list)
+
+
+def _variant_template(name: str, source_prefab_guid: str | None = None):
+    """Build a minimal variant-aware PrefabTemplate-like object for tests."""
+    root = SimpleNamespace(
+        name=name,
+        position=(0.0, 0.0, 0.0),
+        rotation=(0.0, 0.0, 0.0, 1.0),
+        scale=(1.0, 1.0, 1.0),
+        mesh_guid=None,
+        mesh_file_id=None,
+        components=[],
+        children=[],
+        active=True,
+        file_id="1",
+        from_prefab_instance=False,
+        source_prefab_name=None,
+    )
+    return SimpleNamespace(
+        name=name,
+        root=root,
+        is_variant=source_prefab_guid is not None,
+        source_prefab_guid=source_prefab_guid,
+    )
+
+
+def _variant_library(*prefabs, by_guid=None):
+    return SimpleNamespace(
+        prefabs=list(prefabs),
+        by_guid=dict(by_guid or {}),
+    )
+
+
+class TestPhase513VariantChainTemplates:
+    """Phase 5.13: per-prefab variant-chain preservation in templates.
+
+    Acceptance: a prefab with two variants emits three Templates that
+    compose at clone time. Variant templates carry a
+    ``VariantParentTemplate`` attribute pointing at their source prefab
+    and the manifest reports the variant chain.
+    """
+
+    def test_two_variants_emit_three_templates(self, monkeypatch):
+        monkeypatch.setattr(
+            "converter.scene_converter._convert_prefab_node",
+            lambda node, **_: RbxPart(name=node.name),
+        )
+        base = _variant_template("Hero")
+        blue = _variant_template("HeroBlue", source_prefab_guid="hero" + "0" * 28)
+        red = _variant_template("HeroRed", source_prefab_guid="hero" + "0" * 28)
+        lib = _variant_library(
+            base, blue, red,
+            by_guid={
+                "hero" + "0" * 28: base,
+                "blue" + "0" * 28: blue,
+                "red0" + "0" * 28: red,
+            },
+        )
+        result = generate_prefab_packages(lib, None, guid_index=None, include_all=True)
+
+        emitted = sorted(t.name for t in result.templates)
+        assert emitted == ["Hero", "HeroBlue", "HeroRed"]
+        assert result.manifest["total_templates"] == 3
+
+    def test_variant_template_carries_parent_attribute(self, monkeypatch):
+        monkeypatch.setattr(
+            "converter.scene_converter._convert_prefab_node",
+            lambda node, **_: RbxPart(name=node.name),
+        )
+        base = _variant_template("Hero")
+        variant = _variant_template(
+            "HeroBlue", source_prefab_guid="hero" + "0" * 28,
+        )
+        lib = _variant_library(
+            base, variant,
+            by_guid={
+                "hero" + "0" * 28: base,
+                "blue" + "0" * 28: variant,
+            },
+        )
+        result = generate_prefab_packages(lib, None, guid_index=None, include_all=True)
+
+        emitted_by_name = {t.name: t for t in result.templates}
+        # Base has NO parent attribute.
+        assert "VariantParentTemplate" not in emitted_by_name["Hero"].attributes
+        # Variant carries parent name.
+        assert emitted_by_name["HeroBlue"].attributes["VariantParentTemplate"] == "Hero"
+
+    def test_manifest_reports_variant_chain(self, monkeypatch):
+        monkeypatch.setattr(
+            "converter.scene_converter._convert_prefab_node",
+            lambda node, **_: RbxPart(name=node.name),
+        )
+        base = _variant_template("Hero")
+        blue = _variant_template("HeroBlue", source_prefab_guid="hero" + "0" * 28)
+        red = _variant_template("HeroRed", source_prefab_guid="hero" + "0" * 28)
+        lib = _variant_library(
+            base, blue, red,
+            by_guid={
+                "hero" + "0" * 28: base,
+                "blue" + "0" * 28: blue,
+                "red0" + "0" * 28: red,
+            },
+        )
+        result = generate_prefab_packages(lib, None, guid_index=None, include_all=True)
+
+        assert result.manifest["variant_chains"] == {
+            "HeroBlue": "Hero",
+            "HeroRed": "Hero",
+        }
+
+    def test_unknown_parent_guid_skips_variant_metadata(self, monkeypatch):
+        """Variant pointing at a missing parent GUID just emits the variant
+        without metadata — no crash, no broken chain.
+        """
+        monkeypatch.setattr(
+            "converter.scene_converter._convert_prefab_node",
+            lambda node, **_: RbxPart(name=node.name),
+        )
+        orphan = _variant_template(
+            "Orphan", source_prefab_guid="missing" + "0" * 25,
+        )
+        lib = _variant_library(orphan, by_guid={"orph" + "0" * 28: orphan})
+        result = generate_prefab_packages(lib, None, guid_index=None, include_all=True)
+
+        emitted = result.templates[0]
+        assert "VariantParentTemplate" not in emitted.attributes
+        assert result.manifest["variant_chains"] == {}
+
+    def test_spawner_script_exposes_variant_chain_helper(self, monkeypatch):
+        """The auto-generated PrefabSpawner module includes a variantChain
+        helper that walks VariantParentTemplate attributes.
+        """
+        monkeypatch.setattr(
+            "converter.scene_converter._convert_prefab_node",
+            lambda node, **_: RbxPart(name=node.name),
+        )
+        base = _variant_template("Hero")
+        variant = _variant_template(
+            "HeroBlue", source_prefab_guid="hero" + "0" * 28,
+        )
+        lib = _variant_library(
+            base, variant,
+            by_guid={
+                "hero" + "0" * 28: base,
+                "blue" + "0" * 28: variant,
+            },
+        )
+        result = generate_prefab_packages(lib, None, guid_index=None, include_all=True)
+
+        spawner = result.spawner_script
+        assert spawner is not None
+        assert "PrefabSpawner.variantChain" in spawner.source
+        assert "VariantParentTemplate" in spawner.source
+
+    def test_unreferenced_variant_filtered_with_target_set(self, monkeypatch):
+        """When serialized_field_refs is supplied, variants not referenced
+        by any script are filtered out (parent emission unaffected).
+        """
+        monkeypatch.setattr(
+            "converter.scene_converter._convert_prefab_node",
+            lambda node, **_: RbxPart(name=node.name),
+        )
+        base = _variant_template("Hero")
+        variant = _variant_template(
+            "HeroBlue", source_prefab_guid="hero" + "0" * 28,
+        )
+        lib = _variant_library(
+            base, variant,
+            by_guid={
+                "hero" + "0" * 28: base,
+                "blue" + "0" * 28: variant,
+            },
+        )
+        # Script only references HeroBlue, not Hero.
+        refs = {"Assets/P.cs": {"prefab": "HeroBlue"}}
+        result = generate_prefab_packages(lib, refs, guid_index=None)
+
+        emitted = sorted(t.name for t in result.templates)
+        assert emitted == ["HeroBlue"]
+        # Manifest still records the variant chain entry; HeroBlue is
+        # emitted even though its parent Hero was filtered out.
+        assert result.manifest["variant_chains"] == {"HeroBlue": "Hero"}

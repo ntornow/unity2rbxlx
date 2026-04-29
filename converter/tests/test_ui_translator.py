@@ -170,6 +170,140 @@ class TestTextProperties:
         assert element.text_y_alignment == "Top"
         assert element.font == "Roboto"
 
+    def test_tmp_horizontal_bitfield(self):
+        """Phase 5.10: TMP m_HorizontalAlignment bitfields map to TextXAlignment.
+
+        HorizontalAlignmentOptions: Left=1, Center=2, Right=4, Justified=8,
+        Flush=16, Geometry=32. Justified collapses to Left, Flush/Geometry to
+        Center (no Roblox equivalent).
+        """
+        cases = [
+            (1, "Left"),
+            (2, "Center"),
+            (4, "Right"),
+            (8, "Left"),    # Justified -> Left
+            (16, "Center"), # Flush -> Center
+            (32, "Center"), # Geometry -> Center
+        ]
+        for h_value, want_x in cases:
+            element = RbxUIElement()
+            _apply_text_properties(element, {
+                "m_Text": "t",
+                "m_FontSize": 12,
+                "m_HorizontalAlignment": h_value,
+            })
+            assert element.text_x_alignment == want_x, f"h={h_value}"
+            # Vertical untouched when only horizontal is set.
+            assert element.text_y_alignment == ""
+
+    def test_tmp_vertical_bitfield(self):
+        """Phase 5.10: TMP m_VerticalAlignment bitfields map to TextYAlignment.
+
+        VerticalAlignmentOptions: Top=256, Middle=512, Bottom=1024,
+        Baseline=2048, Geometry=4096, Capline=8192. Baseline -> Bottom,
+        Geometry -> Center, Capline -> Top.
+        """
+        cases = [
+            (256, "Top"),
+            (512, "Center"),
+            (1024, "Bottom"),
+            (2048, "Bottom"),  # Baseline
+            (4096, "Center"),  # Geometry
+            (8192, "Top"),     # Capline
+        ]
+        for v_value, want_y in cases:
+            element = RbxUIElement()
+            _apply_text_properties(element, {
+                "m_Text": "t",
+                "m_FontSize": 12,
+                "m_VerticalAlignment": v_value,
+            })
+            assert element.text_y_alignment == want_y, f"v={v_value}"
+            assert element.text_x_alignment == ""
+
+    def test_tmp_bitfield_paired(self):
+        """A TMP fixture with explicit bitfield values converts to matching
+        text_x_alignment / text_y_alignment (the plan's acceptance criterion).
+        """
+        element = RbxUIElement()
+        _apply_text_properties(element, {
+            "m_Text": "Score",
+            "m_FontSize": 18,
+            "m_HorizontalAlignment": 4,    # Right
+            "m_VerticalAlignment": 1024,    # Bottom
+        })
+        assert element.text_x_alignment == "Right"
+        assert element.text_y_alignment == "Bottom"
+
+    def test_tmp_bitfield_overrides_legacy_alignment(self):
+        """When both legacy m_Alignment and TMP split fields are serialized,
+        the TMP bitfield values win per axis.
+        """
+        element = RbxUIElement()
+        _apply_text_properties(element, {
+            "m_Text": "x",
+            "m_FontSize": 12,
+            "m_Alignment": 0,                  # UpperLeft (legacy)
+            "m_HorizontalAlignment": 4,         # Right
+            "m_VerticalAlignment": 1024,        # Bottom
+        })
+        assert element.text_x_alignment == "Right"
+        assert element.text_y_alignment == "Bottom"
+
+    def test_tmp_bitfield_partial_override_keeps_legacy_other_axis(self):
+        """If only m_HorizontalAlignment is provided alongside legacy
+        m_Alignment, the vertical axis comes from the legacy enum.
+        """
+        element = RbxUIElement()
+        _apply_text_properties(element, {
+            "m_Text": "x",
+            "m_FontSize": 12,
+            "m_Alignment": 7,                  # LowerCenter (legacy)
+            "m_HorizontalAlignment": 1,         # Left
+        })
+        assert element.text_x_alignment == "Left"     # TMP wins on x
+        assert element.text_y_alignment == "Bottom"   # Legacy wins on y
+
+    def test_tmp_bitfield_zero_or_invalid_ignored(self):
+        """0 and unparseable bitfields are ignored; defaults persist."""
+        element = RbxUIElement()
+        _apply_text_properties(element, {
+            "m_Text": "x",
+            "m_FontSize": 12,
+            "m_HorizontalAlignment": 0,
+            "m_VerticalAlignment": "garbage",
+        })
+        assert element.text_x_alignment == ""
+        assert element.text_y_alignment == ""
+
+    def test_tmp_bitfield_in_font_data_fallback(self):
+        """Some TMP fixtures nest split fields inside m_FontData; fall back
+        when top-level keys are absent.
+        """
+        element = RbxUIElement()
+        _apply_text_properties(element, {
+            "m_Text": "x",
+            "m_FontSize": 12,
+            "m_FontData": {
+                "m_HorizontalAlignment": 2,   # Center
+                "m_VerticalAlignment": 256,    # Top
+            },
+        })
+        assert element.text_x_alignment == "Center"
+        assert element.text_y_alignment == "Top"
+
+    def test_tmp_bitfield_multibit_falls_back_to_lowest(self):
+        """Multi-flag bitfield values resolve via lowest set bit."""
+        element = RbxUIElement()
+        _apply_text_properties(element, {
+            "m_Text": "x",
+            "m_FontSize": 12,
+            "m_HorizontalAlignment": 1 | 32,   # Left | Geometry -> Left
+            "m_VerticalAlignment": 256 | 4096,  # Top | Geometry -> Top
+        })
+        assert element.text_x_alignment == "Left"
+        assert element.text_y_alignment == "Top"
+
 
 class TestImageScriptGuidFallback:
     def test_mb_with_image_script_guid_detected_as_image(self):

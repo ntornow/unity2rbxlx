@@ -1045,8 +1045,11 @@ class Pipeline:
                 )
             return
 
-        # Invert: material guid → [mesh FBX path]
-        material_to_meshes: dict[str, set[Path]] = {}
+        # Invert: material guid → set[(mesh_path, mesh_file_id)]. Phase 5.7
+        # threads ``mesh_file_id`` through so an FBX with multiple sub-meshes
+        # gets one bake per (mesh_path, mesh_file_id) pair rather than one
+        # combined bake for the whole FBX file.
+        material_to_meshes: dict[str, set[tuple[Path, str]]] = {}
 
         def _walk_scene_nodes(nodes):
             for node in nodes:
@@ -1054,6 +1057,7 @@ class Pipeline:
                 if mesh_guid:
                     mesh_path = guid_index.resolve(mesh_guid)
                     if mesh_path and mesh_path.exists():
+                        mesh_file_id = getattr(node, "mesh_file_id", None) or ""
                         for comp in getattr(node, "components", []):
                             if comp.component_type not in (
                                 "MeshRenderer", "SkinnedMeshRenderer",
@@ -1063,7 +1067,9 @@ class Pipeline:
                                 if isinstance(mat_ref, dict):
                                     mg = mat_ref.get("guid", "")
                                     if mg:
-                                        material_to_meshes.setdefault(mg, set()).add(mesh_path)
+                                        material_to_meshes.setdefault(mg, set()).add(
+                                            (mesh_path, mesh_file_id)
+                                        )
                 _walk_scene_nodes(getattr(node, "children", []))
 
         _walk_scene_nodes(list(scene.all_nodes.values()))
@@ -1073,7 +1079,7 @@ class Pipeline:
                 if root is not None:
                     _walk_scene_nodes([root])
 
-        pairs: list[tuple[Path, Path]] = []
+        pairs: list[tuple[Path, Path, str | None]] = []
         material_pair_index: list[Any] = []  # MaterialMapping per pair, for routing back
         for guid, mapping in flagged:
             meshes = material_to_meshes.get(guid, set())
@@ -1103,22 +1109,37 @@ class Pipeline:
                 )
                 continue
 
-            # Vertex colors are mesh-specific, but Roblox SurfaceAppearance
-            # is per-material. When a material is shared by multiple
-            # meshes we bake only the first referrer (deterministic
-            # sort order) and record a warning — per-mesh baking would
-            # require splitting the mapping into per-part SurfaceAppearances,
-            # which is out of PR 3 scope.
-            sorted_meshes = sorted(meshes)
-            representative = sorted_meshes[0]
-            pairs.append((representative, albedo))
+            # Vertex colors are mesh-specific. Phase 5.7: every unique
+            # (mesh_path, mesh_file_id) referrer also gets a keyed PNG.
+            # The mapping itself points at a "combined" bake of the
+            # representative FBX (whole-FBX, no sub-mesh ID — pre-5.7
+            # behavior) so a single SurfaceAppearance still covers every
+            # sub-mesh that uses this material. Per-sub-mesh PNGs land
+            # alongside so a follow-up per-part rebinding pass can split.
+            sorted_meshes = sorted(
+                meshes, key=lambda mp: (str(mp[0]), mp[1] or ""),
+            )
+            rep_mesh, rep_fid = sorted_meshes[0]
+            # Primary (combined) entry — drives the mapping's color_map_path.
+            pairs.append((rep_mesh, albedo, None))
             material_pair_index.append(mapping)
+            # Auxiliary keyed entries — produce one PNG per (mesh, sub-mesh)
+            # without rebinding the mapping.
+            for mesh_path, mesh_fid in sorted_meshes:
+                if not mesh_fid:
+                    continue
+                pairs.append((mesh_path, albedo, mesh_fid))
+                material_pair_index.append(None)
             if len(sorted_meshes) > 1:
-                others = ", ".join(m.name for m in sorted_meshes[1:])
+                others = ", ".join(
+                    f"{mp.name}:{fid or '-'}" for mp, fid in sorted_meshes[1:]
+                )
                 mapping.warnings.append(
-                    f"Vertex-color baking used mesh '{representative.name}'; "
-                    f"other meshes sharing this material may need per-part "
-                    f"baking (not wired): {others}"
+                    f"Vertex-color baking used combined bake of "
+                    f"'{rep_mesh.name}'; "
+                    f"other (mesh, sub-mesh) pairs sharing this material "
+                    f"each baked to distinct PNGs alongside (per-part "
+                    f"rebinding not wired): {others}"
                 )
 
         if not pairs:
@@ -1130,7 +1151,8 @@ class Pipeline:
         except Exception as exc:
             log.warning("[vertex_color_bake] batch failed: %s", exc)
             for mapping in material_pair_index:
-                mapping.warnings.append(f"Vertex-color baking failed: {exc}")
+                if mapping is not None:
+                    mapping.warnings.append(f"Vertex-color baking failed: {exc}")
             return
 
         log.info(
@@ -1139,6 +1161,12 @@ class Pipeline:
         )
 
         for entry, mapping in zip(result.entries, material_pair_index):
+            # Phase 5.7: secondary sub-mesh entries have mapping=None — they
+            # bake additional PNGs into the output dir for follow-up per-
+            # part materialization but don't rebind the mapping (Roblox
+            # SurfaceAppearance is per-material, not per-sub-mesh).
+            if mapping is None:
+                continue
             if entry.baked and entry.output_path:
                 mapping.color_map_path = str(entry.output_path)
             elif not entry.has_vertex_colors:
@@ -1201,15 +1229,33 @@ class Pipeline:
         Phase 4.5: when a parsed scene is available, pass it so the
         converter can filter controllers to those actually referenced
         and scene-scope the emitted module names.
+
+        Phase 5.8: union prefab-derived animator controller GUIDs into
+        the scene set before invoking the converter; most projects keep
+        Animators inside prefabs, so without this step the scene's set
+        is empty and scene scoping never activates.
         """
         log.info("[convert_animations] Discovering and converting animations ...")
         from converter.animation_converter import convert_animations as _convert_anims
+        from unity.prefab_parser import aggregate_prefab_controller_refs
 
         parsed_scenes = [self.state.parsed_scene] if self.state.parsed_scene else None
+        if parsed_scenes and self.state.prefab_library is not None:
+            for scene in parsed_scenes:
+                added = aggregate_prefab_controller_refs(
+                    scene, self.state.prefab_library,
+                )
+                if added:
+                    log.info(
+                        "[convert_animations] aggregated %d prefab-referenced "
+                        "controller GUID(s) into scene %s",
+                        added, scene.scene_path.name,
+                    )
         self.state.animation_result = _convert_anims(
             unity_project_path=self.unity_project_path,
             guid_index=self.state.guid_index,
             parsed_scenes=parsed_scenes,
+            prefab_library=self.state.prefab_library,
         )
         self.ctx.total_animations = self.state.animation_result.total_clips
         self.ctx.converted_animations = self.state.animation_result.total_scripts_generated

@@ -323,7 +323,9 @@ def test_vertex_color_baker_dedupes_per_material(tmp_path, monkeypatch):
         calls.append(pairs_list)
         from converter.vertex_color_baker import VertexColorBakeResult, BakeResult
         r = VertexColorBakeResult()
-        for mesh_p, _ in pairs_list:
+        # Each entry can be (mesh, albedo) or (mesh, albedo, fid).
+        for entry in pairs_list:
+            mesh_p = entry[0]
             r.entries.append(BakeResult(mesh_path=mesh_p, baked=False, has_vertex_colors=False))
         r.total = len(r.entries)
         return r
@@ -334,13 +336,104 @@ def test_vertex_color_baker_dedupes_per_material(tmp_path, monkeypatch):
 
     pipeline._bake_vertex_colors()
 
-    # One representative mesh, not two.
+    # Phase 5.7: when referrers have no sub-mesh fileIDs (e.g. distinct
+    # whole-FBX meshes sharing a material), only the primary "combined"
+    # bake of the representative is enqueued — auxiliary keyed PNGs are
+    # only emitted for referrers WITH a mesh_file_id. This preserves
+    # pre-5.7 behavior for shared-material multi-FBX setups while still
+    # producing keyed auxiliary PNGs for shared-material multi-sub-mesh
+    # FBXs (covered by test_vertex_color_baker.py).
     assert len(calls) == 1
-    assert len(calls[0]) == 1, f"expected 1 pair for shared material, got {calls[0]}"
-    # Warning must name the second mesh as deferred.
+    assert len(calls[0]) == 1, f"expected 1 combined pair, got {calls[0]}"
+    # Warning must name the second mesh.
     warning_blob = " ".join(mapping.warnings)
     assert "mesh_B.fbx" in warning_blob or "mesh_A.fbx" in warning_blob
     assert "per-part" in warning_blob
+
+
+def test_vertex_color_baker_emits_combined_plus_keyed_for_submeshes(
+    tmp_path, monkeypatch,
+):
+    """Phase 5.7 + Codex P2 round-4 fix: when one material is shared
+    across multiple sub-meshes of the SAME FBX (with mesh_file_ids), the
+    baker enqueues a primary combined bake (drives the mapping) plus
+    one auxiliary keyed bake per sub-mesh (lands in the output dir for
+    follow-up per-part rebinding).
+    """
+    from converter.animation_converter import AnimationConversionResult
+    from converter.material_mapper import MaterialMapping
+    from core.unity_types import ParsedScene, SceneNode, ComponentData
+
+    albedo = tmp_path / "albedo.png"
+    albedo.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+    mesh = tmp_path / "Multi.fbx"
+    mesh.write_bytes(b"fbx-stub")
+
+    pipeline = _make_pipeline(tmp_path)
+    pipeline.state.animation_result = AnimationConversionResult(unconverted=[])
+
+    mat_guid = "m" * 32
+    mapping = MaterialMapping(
+        material_name="SharedSubMeshes",
+        uses_vertex_colors=True,
+        local_color_map_path=str(albedo),
+    )
+    pipeline.state.material_mappings = {mat_guid: mapping}
+
+    nodes: dict[str, SceneNode] = {}
+    # Two SceneNodes share the same FBX but reference different sub-meshes
+    # (mesh_file_id 4300000 and 4300002 → assimp index 0 and 1).
+    for i, fid in enumerate(["4300000", "4300002"]):
+        n = SceneNode(name=f"Part{i}", file_id=str(i), active=True, layer=0, tag="")
+        n.mesh_guid = "shared-fbx"
+        n.mesh_file_id = fid
+        n.components = [ComponentData(
+            component_type="MeshRenderer",
+            file_id=f"c{i}",
+            properties={"m_Materials": [{"guid": mat_guid}]},
+        )]
+        nodes[str(i)] = n
+    scene = ParsedScene(scene_path=tmp_path / "scene.unity")
+    scene.all_nodes = nodes
+    pipeline.state.parsed_scene = scene
+
+    class _StubGuidIndex:
+        def resolve(self, guid):
+            return mesh if guid == "shared-fbx" else None
+
+    pipeline.state.guid_index = _StubGuidIndex()
+
+    calls: list[list] = []
+
+    def _fake_batch(pairs, out_dir, resolution=None):
+        pairs_list = list(pairs)
+        calls.append(pairs_list)
+        from converter.vertex_color_baker import VertexColorBakeResult, BakeResult
+        r = VertexColorBakeResult()
+        for entry in pairs_list:
+            r.entries.append(BakeResult(
+                mesh_path=entry[0],
+                baked=False,
+                has_vertex_colors=False,
+            ))
+        r.total = len(r.entries)
+        return r
+
+    monkeypatch.setattr(
+        "converter.vertex_color_baker.bake_vertex_colors_batch", _fake_batch
+    )
+
+    pipeline._bake_vertex_colors()
+
+    # Three pairs: 1 combined (no fileID) + 2 keyed (one per sub-mesh).
+    assert len(calls) == 1
+    pairs = calls[0]
+    assert len(pairs) == 3, f"expected 1 combined + 2 keyed, got {pairs}"
+    # First pair is the combined bake (no file_id).
+    assert pairs[0][2] is None, f"first pair should be combined: {pairs[0]}"
+    # Remaining pairs are keyed by sub-mesh fileID.
+    keyed_fids = sorted(p[2] for p in pairs[1:])
+    assert keyed_fids == ["4300000", "4300002"], keyed_fids
 
 
 def test_unconverted_md_aggregates_material_warnings(tmp_path):

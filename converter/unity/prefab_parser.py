@@ -17,12 +17,14 @@ from pathlib import Path
 from typing import Any
 
 from core.unity_types import (
+    ParsedScene,
     PrefabComponent,
     PrefabNode,
     PrefabTemplate,
     PrefabLibrary,
 )
 from unity.yaml_parser import (
+    CID_ANIMATOR,
     CID_GAME_OBJECT,
     CID_TRANSFORM,
     CID_RECT_TRANSFORM,
@@ -163,6 +165,11 @@ def _parse_single_prefab(prefab_path: Path) -> PrefabTemplate:
                 guid = ref_guid(mat_ref)
                 if guid:
                     template.referenced_material_guids.add(guid)
+
+        if cid == CID_ANIMATOR:
+            ctrl_guid = ref_guid(body.get("m_Controller", {}))
+            if ctrl_guid:
+                template.referenced_animator_controller_guids.add(ctrl_guid)
 
     # Wire hierarchy
     roots: list[PrefabNode] = []
@@ -378,6 +385,30 @@ def _set_nested_property(
             target[last] = value
 
 
+def _collect_animator_controller_guids(
+    nodes: dict[str, PrefabNode],
+) -> set[str]:
+    """Walk a node tree and collect every Animator m_Controller GUID.
+
+    Used post-variant-merge to rebuild ``referenced_animator_controller_guids``
+    from the modified component graph (variant overrides of m_Controller
+    are otherwise lost — the set was copied from the source before
+    modifications applied).
+    """
+    refs: set[str] = set()
+    for node in nodes.values():
+        for comp in node.components:
+            if comp.component_type != "Animator":
+                continue
+            props = comp.properties if isinstance(comp.properties, dict) else {}
+            ctrl = props.get("m_Controller", {})
+            if isinstance(ctrl, dict):
+                guid = ref_guid(ctrl)
+                if guid:
+                    refs.add(guid)
+    return refs
+
+
 def _resolve_variant_chain(
     template: PrefabTemplate,
     by_guid: dict[str, PrefabTemplate],
@@ -440,11 +471,25 @@ def _resolve_variant_chain(
         all_nodes=merged_nodes,
         referenced_material_guids=set(source.referenced_material_guids),
         referenced_mesh_guids=set(source.referenced_mesh_guids),
+        referenced_animator_controller_guids=set(
+            source.referenced_animator_controller_guids
+        ),
         is_multi_root=source.is_multi_root,
     )
 
     # Apply this variant's modifications
     _apply_variant_modifications(merged, template.variant_modifications)
+
+    # Variant overrides of Animator m_Controller would otherwise be lost —
+    # rebuild the controller-ref set from the merged component graph so
+    # variants that swap controllers route to the new GUID, not the base.
+    # Union with the variant's own pre-merge set so controllers declared on
+    # variant-added GameObjects (which live outside merged.all_nodes until
+    # variant_added_objects support lands) are not dropped.
+    merged.referenced_animator_controller_guids = (
+        _collect_animator_controller_guids(merged.all_nodes)
+        | set(template.referenced_animator_controller_guids)
+    )
 
     # Transfer merged result back into the template
     template.root = merged.root
@@ -452,6 +497,9 @@ def _resolve_variant_chain(
     template.is_multi_root = merged.is_multi_root
     template.referenced_material_guids |= merged.referenced_material_guids
     template.referenced_mesh_guids |= merged.referenced_mesh_guids
+    template.referenced_animator_controller_guids = set(
+        merged.referenced_animator_controller_guids
+    )
     template.variant_resolved = True
 
     log.debug("Resolved variant %s from source %s (%d modifications applied)",
@@ -509,3 +557,58 @@ def parse_prefabs(unity_project_path: str | Path) -> PrefabLibrary:
 
     log.info("Parsed %d prefabs (%d variants resolved)", len(library.prefabs), variant_count)
     return library
+
+
+def aggregate_prefab_controller_refs(
+    parsed_scene: ParsedScene,
+    prefab_library: PrefabLibrary,
+) -> int:
+    """Union animator controller GUIDs reachable through prefab instances
+    into ``parsed_scene.referenced_animator_controller_guids``.
+
+    Most Unity projects keep Animators inside prefabs rather than on direct
+    scene GameObjects, so the scene-level controller set is empty. This
+    helper walks every PrefabInstance in the scene, resolves the source
+    prefab via the library's GUID index, and unions in that prefab's
+    ``referenced_animator_controller_guids`` (already variant-chain-merged
+    by ``_resolve_variant_chain``). It also reads each instance's
+    ``modifications`` for per-instance ``m_Controller`` overrides — when a
+    scene-level PrefabInstance swaps the controller GUID, the override
+    GUID joins the set so the new controller's animation modules emit.
+
+    Returns the count of newly added controller GUIDs.
+    """
+    if not parsed_scene.prefab_instances:
+        return 0
+
+    by_guid = prefab_library.by_guid or {}
+
+    before = len(parsed_scene.referenced_animator_controller_guids)
+    for instance in parsed_scene.prefab_instances:
+        guid = instance.source_prefab_guid
+        if guid:
+            template = by_guid.get(guid)
+            if template is not None:
+                parsed_scene.referenced_animator_controller_guids |= (
+                    template.referenced_animator_controller_guids
+                )
+
+        # Per-instance m_Controller overrides. The modification dicts are
+        # shaped {target: {fileID}, propertyPath: "m_Controller", value: "",
+        # objectReference: {guid}} — pull objectReference.guid for any
+        # property path that ends in "m_Controller".
+        for mod in instance.modifications or ():
+            if not isinstance(mod, dict):
+                continue
+            prop = mod.get("propertyPath", "")
+            if not isinstance(prop, str) or not prop.endswith("m_Controller"):
+                continue
+            obj_ref = mod.get("objectReference") or {}
+            if not isinstance(obj_ref, dict):
+                continue
+            override_guid = obj_ref.get("guid", "")
+            if isinstance(override_guid, str) and override_guid:
+                parsed_scene.referenced_animator_controller_guids.add(
+                    override_guid
+                )
+    return len(parsed_scene.referenced_animator_controller_guids) - before
