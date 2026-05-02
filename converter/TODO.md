@@ -46,6 +46,30 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   `RbxPart` template in `prefab_packages` (or thread a `parent_path`
   attribute through `storage_classifier`). Codex final-pass [P1].
 
+## Animation correctness gaps
+
+- [ ] **P1 — Same-name AnimatorController collisions in
+  `convert_animations`.** `scenes_per_controller`, `prefabs_per_controller`,
+  `result.routing`, and the script-name format `Anim_{prefix}{ctrl.name}_…`
+  all key on `AnimatorController.name`. Two distinct .controller files with
+  the same internal name (common in projects where each prefab ships its
+  own "AnimController") collapse into one bucket: scope/filter decisions,
+  routing entries, and emitted script names collide and overwrite each
+  other. Fix: key the maps by controller GUID (or source path), and
+  disambiguate the script name with a stable suffix when names repeat.
+  Add a regression test that defines two same-named controllers in
+  separate prefabs and asserts both emit independent scripts.
+- [ ] **P1 — Same-name AnimationClip collisions in `keyframes` export.**
+  In `convert_animations`, the per-controller `keyframes` dict is keyed
+  on `clip.name`: `keyframes = { clip.name: export_clip_keyframes(clip)
+  for clip in humanoid_clips }`. If a controller references two clips
+  with the same name (separate `clip_guid`s, identical user-given names),
+  the dict-comprehension silently keeps the last one and the runtime
+  state machine plays the wrong asset. Fix: detect the collision, log
+  it as UNCONVERTED, and key by something stable (clip GUID, or a
+  disambiguated suffix). Add a regression test mirroring the controller
+  same-name case.
+
 ## Type-strictness debt (forward-only gate landed; cleanup separate)
 
 The no-Any gate prevents new smuggling. Existing-offender cleanup has

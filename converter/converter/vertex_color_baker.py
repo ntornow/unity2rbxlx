@@ -72,9 +72,9 @@ def _load_fbx_via_assimp(
     Returns (vertices, faces, uv_coords, vertex_colors) or None.
 
     When ``submesh_index`` is set, only that single sub-mesh is loaded —
-    used by the per-mesh-id baking path (Phase 5.7) so an FBX with N
-    sub-meshes and N distinct vertex-color sets bakes to N distinct
-    textures rather than one combined texture.
+    used by the per-mesh-id baking path so an FBX with N sub-meshes and
+    N distinct vertex-color sets bakes to N distinct textures rather
+    than one combined texture.
     """
     import numpy as np
     import ctypes
@@ -593,10 +593,10 @@ def bake_vertex_colors_batch(
     Args:
         mesh_albedo_pairs: List of (mesh_path, albedo_path) or
             (mesh_path, albedo_path, mesh_file_id) tuples. The 3-tuple
-            form (Phase 5.7) selects a specific FBX sub-mesh; the output
-            filename is keyed by ``mesh_file_id`` so different sub-meshes
-            of the same FBX bake to distinct textures rather than
-            overwriting each other.
+            form selects a specific FBX sub-mesh; the output filename
+            is keyed by ``mesh_file_id`` so different sub-meshes of the
+            same FBX bake to distinct textures rather than overwriting
+            each other.
         output_dir: Directory for output textures.
         resolution: Optional resolution override.
 

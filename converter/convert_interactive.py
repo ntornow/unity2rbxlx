@@ -820,7 +820,7 @@ def assemble(unity_project_path: str, output_dir: str,
               help="Roblox Place ID (cached after first use).")
 def upload(output_dir: str, api_key: str | None,
            universe_id: int | None, place_id: int | None) -> None:
-    """Phase 5: publish the .rbxlx to Roblox via headless place builder."""
+    """Publish the .rbxlx to Roblox via headless place builder."""
     out = Path(output_dir).resolve()
     ctx_path = _context_path(out)
     if not ctx_path.exists():

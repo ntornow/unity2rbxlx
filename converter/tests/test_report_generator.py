@@ -246,6 +246,62 @@ class TestPipelineIntegration:
         assert report.components.converted == 295
         assert report.output.parts_written == 295
 
+    def test_script_summary_reflects_transpilation_result(self, tmp_path):
+        """When ``state.transpilation_result`` is populated, the report's
+        ``scripts`` block must surface ai/rule-based/flagged counts and
+        the list of flagged script names — not just the bare total from
+        ``ctx.transpiled_scripts``.
+        """
+        from converter.pipeline import Pipeline
+        from converter.code_transpiler import TranspilationResult, TranspiledScript
+        from core.conversion_context import ConversionContext
+        from core.roblox_types import RbxPlace
+
+        project = tmp_path / "proj"
+        (project / "Assets").mkdir(parents=True)
+        pipeline = Pipeline(
+            unity_project_path=project, output_dir=tmp_path / "out", skip_upload=True,
+        )
+        pipeline.ctx = ConversionContext(transpiled_scripts=3)
+        pipeline.state.rbx_place = RbxPlace()
+        pipeline.state.transpilation_result = TranspilationResult(
+            scripts=[
+                TranspiledScript(
+                    source_path=str(project / "Assets" / "Foo.cs"),
+                    output_filename="Foo.luau",
+                    csharp_source="", luau_source="",
+                    strategy="ai", confidence=0.95,
+                    flagged_for_review=False,
+                ),
+                TranspiledScript(
+                    source_path=str(project / "Assets" / "Bar.cs"),
+                    output_filename="Bar.luau",
+                    csharp_source="", luau_source="",
+                    strategy="ai", confidence=0.4,
+                    flagged_for_review=True,
+                ),
+                TranspiledScript(
+                    source_path=str(project / "Assets" / "Baz.cs"),
+                    output_filename="Baz.luau",
+                    csharp_source="", luau_source="",
+                    strategy="stub", confidence=0.3,
+                    flagged_for_review=False,
+                ),
+            ],
+            total_transpiled=3, total_ai=2, total_rule_based=1,
+            total_flagged=1, total_failed=0,
+        )
+
+        report = pipeline._build_conversion_report(
+            tmp_path / "place.rbxlx", {"parts_written": 0, "scripts_written": 3},
+            tmp_path / "report.json",
+        )
+        assert report.scripts.total == 3
+        assert report.scripts.succeeded == 3
+        assert report.scripts.ai_transpiled == 2
+        assert report.scripts.flagged_for_review == 1
+        assert report.scripts.flagged_scripts == ["Bar.cs"]
+
     def test_interactive_report_preserves_structured_fields(self, tmp_path):
         """Interactive report() augments the file without clobbering shape."""
         report = ConversionReport(
