@@ -36,6 +36,33 @@ class TestRequireReclassification:
         fixes = fix_require_classifications(scripts)
         assert scripts[0].script_type == "ModuleScript"
 
+    def test_return_statement_does_not_demote_fps_controller(self):
+        """An FPS controller that exposes a Player table at the top and
+        ends with ``return Player`` would otherwise be demoted to a
+        ModuleScript by the trailing-return rule. ModuleScripts only
+        execute when something requires them — but the controller's
+        RenderStepped/InputBegan listeners need to run on character
+        spawn. Force LocalScript when client-only APIs are present.
+        """
+        src = (
+            'local Players = game:GetService("Players")\n'
+            'local UIS = game:GetService("UserInputService")\n'
+            'local Player = {}\n'
+            'function Player.move() UIS.MouseBehavior = Enum.MouseBehavior.LockCenter end\n'
+            'Players.LocalPlayer.CharacterAdded:Connect(Player.move)\n'
+            'return Player\n'
+        )
+        scripts = [RbxScript(name="Player", source=src, script_type="Script")]
+        fix_require_classifications(scripts)
+        # Pass 3 (_fix_client_server_classification) promotes the script
+        # back to LocalScript on its client-API signature; it must NOT
+        # have been frozen as ModuleScript by Pass 2.
+        assert scripts[0].script_type == "LocalScript", (
+            f"client-API FPS controller with `return Player` ended as "
+            f"{scripts[0].script_type!r}; downstream FPS-controls injection "
+            f"only runs on LocalScripts, so demoting here breaks the chain."
+        )
+
 
 class TestClientServerClassification:
     def test_local_player_becomes_local_script(self):
@@ -516,3 +543,75 @@ class TestDisableDefaultControlsInFpsScripts:
         fixes = _disable_default_controls_in_fps_scripts(scripts)
         assert fixes == 0
         assert scripts[0].source == 'print("hello")\n'
+
+    def test_first_person_hide_block_present(self):
+        """The setup block must hide character body parts and accessories
+        for first-person view, with a WeaponSlot exemption so the held
+        weapon stays visible. Roblox loads accessories asynchronously
+        after CharacterAdded, so DescendantAdded must wire up first
+        (otherwise an accessory delivered between snapshot capture and
+        Connect slips past both passes).
+        """
+        scripts = [
+            RbxScript(
+                name="FpsController",
+                source='UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter\n',
+                script_type="LocalScript",
+            ),
+        ]
+        _disable_default_controls_in_fps_scripts(scripts)
+        src = scripts[0].source
+        assert "_isInWeaponSlot" in src
+        assert "LocalTransparencyModifier = 1" in src
+        # Connect must come BEFORE GetDescendants so accessories added
+        # in the gap aren't missed. Indices guard the order: a future
+        # edit that swaps them will trip this.
+        connect_idx = src.find("char.DescendantAdded:Connect(_hidePart)")
+        iterate_idx = src.find("for _, part in char:GetDescendants()")
+        assert connect_idx > 0 and iterate_idx > 0
+        assert connect_idx < iterate_idx, (
+            "DescendantAdded must connect before GetDescendants iterate; "
+            "swapping them lets late-loaded accessories slip past."
+        )
+
+    def test_spawn_floor_snap_block_present(self):
+        """The setup block must include a runtime snap-to-floor pass so a
+        character that respawns over a gap (Unity SpawnPoint with no
+        physical floor under it) gets reseated on the surface below.
+        Verbatim assertions lock down the three properties Codex round-1
+        found broken in the first cut: ray origin must be at HRP (not
+        above — overhead bridges would hit first), the threshold must
+        compare to the SNAP TARGET (else a normally-grounded character
+        with HRP ~3 studs above the floor re-snaps every spawn), and
+        the snap must preserve rotation (CFrame.new(pos) would zero it).
+        """
+        scripts = [
+            RbxScript(
+                name="FpsController",
+                source='UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter\n',
+                script_type="LocalScript",
+            ),
+        ]
+        _disable_default_controls_in_fps_scripts(scripts)
+        src = scripts[0].source
+
+        # Ray origin must be HRP itself (filter-excluded), not HRP + offset.
+        assert "workspace:Raycast(hrp.Position, Vector3.new(0, -200, 0)" in src
+        assert "hrp.Position + Vector3.new(0, 5, 0)" not in src, (
+            "ray origin starting above HRP can hit overhead geometry "
+            "first and snap the player upward onto a ceiling"
+        )
+
+        # Threshold must compare HRP to the snap TARGET, not the raw hit.
+        # Comparing to hit means a normal character (HRP ~3 studs above
+        # floor) always re-snaps on every CharacterAdded.
+        assert "(hrp.Position - target).Magnitude > 2" in src
+        assert "(hrp.Position - hit.Position).Magnitude > 2" not in src
+
+        # Snap must preserve CFrame rotation (the character's facing
+        # direction). CFrame.new(pos) resets to identity.
+        assert "hrp.CFrame = hrp.CFrame + (target - hrp.Position)" in src
+        assert "hrp.CFrame = CFrame.new(hit.Position" not in src
+
+        # Must fire on initial character AND every respawn, not once.
+        assert src.count("_snapToFloor(") >= 2

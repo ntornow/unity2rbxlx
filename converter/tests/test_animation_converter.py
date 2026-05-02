@@ -2885,6 +2885,37 @@ class TestPhase59PrefabScopedTweenScripts:
         # would have it; the override replaces the source's pointer).
         assert "c" * 32 not in merged_refs
 
+    def test_scene_with_no_refs_or_instances_skips_all_controllers(
+        self, tmp_path: Path,
+    ) -> None:
+        """Passing ``parsed_scenes=[empty_scene]`` with no prefab_library
+        is itself a request for scope-restricted output. A scene that
+        references no controllers and instantiates no prefabs should
+        produce zero animation scripts for the project's controllers,
+        not fall through to project-wide emission.
+        """
+        from core.unity_types import ParsedScene
+        from unity.guid_resolver import build_guid_index
+
+        project, _, _ = self._build_transform_only_controller_project(tmp_path)
+        empty_scene = ParsedScene(
+            scene_path=project / "Assets" / "Empty.unity",
+            prefab_instances=[],
+        )
+
+        guid_index = build_guid_index(project)
+        result = convert_animations(
+            project,
+            guid_index=guid_index,
+            parsed_scenes=[empty_scene],
+            # Deliberately no prefab_library — the scope intent is the
+            # parsed_scenes argument itself, not a prefab pre-aggregation.
+        )
+        assert "Wheel" in result.routing
+        assert result.routing["Wheel"]["__controller__"]["target"] == "skipped"
+        names = [name for name, _ in result.generated_scripts]
+        assert not any("Wheel" in n for n in names), names
+
     def test_unrelated_controller_skipped_when_scene_has_only_prefab_refs(
         self, tmp_path: Path,
     ) -> None:

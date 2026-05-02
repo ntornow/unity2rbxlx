@@ -251,21 +251,36 @@ def fix_require_classifications(scripts: list[RbxScript]) -> int:
                     target.source = stripped_source + '\n\nreturn nil\n'
                     log.info("  Added 'return nil' to '%s' (required as module but has no return)", name)
 
-    # Pass 2: Scripts that end with `return ...` are likely ModuleScripts.
+    # Pass 2: Scripts that end with `return ...` are likely ModuleScripts —
+    # except FPS-style controllers that read client-only globals at the top
+    # level (LocalPlayer / UserInputService / mouse). Those have to remain
+    # LocalScripts: their RenderStepped/InputBegan listeners fire from top-
+    # level and must run on character spawn, which a ModuleScript only would
+    # if something explicitly required it.
     for s in scripts:
         if s.script_type == "ModuleScript":
             continue
-        # Check if the script ends with a return statement (ignoring trailing whitespace/comments)
         lines = s.source.rstrip().split("\n")
         for line in reversed(lines):
             stripped = line.strip()
             if not stripped or stripped.startswith("--"):
                 continue
             if stripped.startswith("return "):
-                # This script returns something — it's a ModuleScript pattern
-                s.script_type = "ModuleScript"
-                fixes += 1
-                log.info("  Reclassified '%s' to ModuleScript (ends with return statement)", s.name)
+                has_client = any(
+                    re.search(pat, s.source) for pat in _CLIENT_ONLY_PATTERNS
+                )
+                if has_client:
+                    log.info(
+                        "  Skipping ModuleScript reclassification of '%s' "
+                        "(ends with return but uses client-only APIs)", s.name,
+                    )
+                else:
+                    s.script_type = "ModuleScript"
+                    fixes += 1
+                    log.info(
+                        "  Reclassified '%s' to ModuleScript (ends with return statement)",
+                        s.name,
+                    )
             break  # Only check the last non-empty, non-comment line
 
     # Pass 3: Client-side API detection.
@@ -1180,18 +1195,27 @@ def _disable_default_controls_in_fps_scripts(scripts: list[RbxScript]) -> int:
     # `marker in s.source` check works whether the function runs again on the
     # same script (e.g. re-running write_output after editing on disk).
     marker = "-- u2r: disable default PlayerModule controls"
+    # HumanoidRootPart sits ~3 studs above the feet, so a normally-grounded
+    # character reads ~3 studs above the floor it stands on. The snap target
+    # is therefore floor + 3y, and we compare HRP to *target* (not the raw
+    # hit) so that "already standing" doesn't trip the threshold.
     setup = (
-        f"{marker} + assert FPS mouse state\n"
+        f"{marker} + assert FPS mouse state + first-person body hide + spawn floor-snap\n"
         "-- Re-applies on CharacterAdded because Roblox's character spawn flow\n"
-        "-- re-enables the default PlayerModule and resets MouseBehavior.\n"
+        "-- re-enables the default PlayerModule and resets MouseBehavior, and\n"
+        "-- because Roblox loads avatar accessories asynchronously after the\n"
+        "-- character spawns — DescendantAdded catches each late-added Handle\n"
+        "-- so the user's hat/chain/glasses don't float across the FPS camera.\n"
         "do\n"
         "    local _lp = game:GetService(\"Players\").LocalPlayer\n"
         "    local _UIS = game:GetService(\"UserInputService\")\n"
         "    local function _applyFpsMouseState()\n"
-        "        if not _lp then return end\n"
         "        local _ps = _lp:WaitForChild(\"PlayerScripts\", 10)\n"
         "        local _pm = _ps and _ps:WaitForChild(\"PlayerModule\", 10)\n"
         "        if _pm then\n"
+        "            -- pcall the require/GetControls/Disable trio because the\n"
+        "            -- Roblox-managed PlayerModule API has shifted historically;\n"
+        "            -- a future rename should not break the FPS lock.\n"
         "            local ok, mod = pcall(require, _pm)\n"
         "            if ok and mod then\n"
         "                local ok2, controls = pcall(function() return mod:GetControls() end)\n"
@@ -1203,13 +1227,65 @@ def _disable_default_controls_in_fps_scripts(scripts: list[RbxScript]) -> int:
         "        _UIS.MouseBehavior = Enum.MouseBehavior.LockCenter\n"
         "        _UIS.MouseIconEnabled = false\n"
         "    end\n"
-        "    _applyFpsMouseState()\n"
-        "    if _lp then\n"
-        "        _lp.CharacterAdded:Connect(function()\n"
-        "            task.wait()  -- let Roblox finish its respawn handling first\n"
-        "            _applyFpsMouseState()\n"
-        "        end)\n"
+        "    -- Walk up parents looking for a node named WeaponSlot. The FPS\n"
+        "    -- controller parents the held weapon under camera.WeaponSlot, so\n"
+        "    -- anything reachable through that chain must stay visible.\n"
+        "    local function _isInWeaponSlot(inst)\n"
+        "        local p = inst.Parent\n"
+        "        while p and p ~= game do\n"
+        "            if p.Name == \"WeaponSlot\" then return true end\n"
+        "            p = p.Parent\n"
+        "        end\n"
+        "        return false\n"
         "    end\n"
+        "    local function _hidePart(part)\n"
+        "        if (part:IsA(\"BasePart\") or part:IsA(\"Decal\")) and not _isInWeaponSlot(part) then\n"
+        "            part.LocalTransparencyModifier = 1\n"
+        "        end\n"
+        "    end\n"
+        "    local function _hideCharacter(char)\n"
+        "        if not char then return end\n"
+        "        -- Connect FIRST, then iterate the snapshot. Roblox can deliver\n"
+        "        -- a DescendantAdded between snapshot capture and Connect, so\n"
+        "        -- iterating first would let an accessory inserted in that gap\n"
+        "        -- slip through both passes.\n"
+        "        char.DescendantAdded:Connect(_hidePart)\n"
+        "        for _, part in char:GetDescendants() do _hidePart(part) end\n"
+        "    end\n"
+        "    -- After Roblox finishes its respawn flow the character can land\n"
+        "    -- in mid-air when the Unity SpawnPoint sits over a gap rather\n"
+        "    -- than on a floor (the Unity transform is a marker; the converter\n"
+        "    -- doesn't ground-snap it). Raycast down once and reseat the HRP\n"
+        "    -- on whatever surface is directly below.\n"
+        "    local function _snapToFloor(char)\n"
+        "        if not char then return end\n"
+        "        local hrp = char:WaitForChild(\"HumanoidRootPart\", 5)\n"
+        "        if not hrp then return end\n"
+        "        task.wait()\n"
+        "        local rp = RaycastParams.new()\n"
+        "        rp.FilterDescendantsInstances = {char}\n"
+        "        rp.FilterType = Enum.RaycastFilterType.Exclude\n"
+        "        -- Origin = HRP itself (the character is filter-excluded). Starting\n"
+        "        -- above HRP risks hitting an overhead ceiling/bridge first and\n"
+        "        -- snapping the player upward onto it.\n"
+        "        local hit = workspace:Raycast(hrp.Position, Vector3.new(0, -200, 0), rp)\n"
+        "        if not hit then return end\n"
+        "        local target = hit.Position + Vector3.new(0, 3, 0)\n"
+        "        if (hrp.Position - target).Magnitude > 2 then\n"
+        "            -- Translate by delta to preserve the character's yaw/pitch\n"
+        "            -- (CFrame.new(target) would reset rotation to identity).\n"
+        "            hrp.CFrame = hrp.CFrame + (target - hrp.Position)\n"
+        "        end\n"
+        "    end\n"
+        "    _applyFpsMouseState()\n"
+        "    _hideCharacter(_lp.Character)\n"
+        "    _snapToFloor(_lp.Character)\n"
+        "    _lp.CharacterAdded:Connect(function(char)\n"
+        "        task.wait()  -- let Roblox finish its respawn handling first\n"
+        "        _applyFpsMouseState()\n"
+        "        _hideCharacter(char)\n"
+        "        _snapToFloor(char)\n"
+        "    end)\n"
         "end\n\n"
     )
     for s in scripts:

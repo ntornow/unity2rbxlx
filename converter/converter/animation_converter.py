@@ -1799,7 +1799,7 @@ def convert_animations(
             One set of animation_data modules is emitted per (scene,
             controller) pair. Unset → project-wide emission, no prefix
             (current/test behaviour).
-        prefab_library: Phase 5.9 — when supplied alongside ``parsed_scenes``,
+        prefab_library: when supplied alongside ``parsed_scenes``,
             controllers referenced via PrefabTemplate get a prefab-name scope
             in addition to (or instead of) the scene scope. Transform-only
             tween scripts then live alongside the prefab template under
@@ -1864,7 +1864,7 @@ def convert_animations(
                     scene_stem = scene_stem.stem if scene_stem else ""
                     scenes_per_controller.setdefault(ctrl.name, []).append(scene_stem)
 
-    # Phase 5.9: prefab-scoped emission. When a controller lives inside a
+    # Prefab-scoped emission: when a controller lives inside a
     # PrefabTemplate (the common case), emit one tween script per prefab
     # template rather than per-scene-instance. This dedupes scripts across
     # scene instantiations and lets the runtime require the script from
@@ -1892,7 +1892,7 @@ def convert_animations(
 
     # Pre-walk per-instance m_Controller overrides: map override_guid →
     # set of prefab names whose instance applied that override. Lets a
-    # scene-level override route to the correct prefab scope (Codex P2).
+    # scene-level override route to the correct prefab scope.
     instance_overrides_by_ctrl_guid: dict[str, set[str]] = {}
     if prefab_library is not None and parsed_scenes:
         for scene in parsed_scenes:
@@ -1968,20 +1968,13 @@ def convert_animations(
 
         scene_match = ctrl.name in scenes_per_controller
         prefab_match = ctrl.name in prefabs_per_controller
-        # Scene filtering activates when EITHER a scene supplies direct
-        # controller refs OR the caller passed parsed_scenes alongside a
-        # prefab_library (the common prefab-only case where the scene
-        # set is empty until aggregate_prefab_controller_refs runs). In
-        # both cases the caller is asking for scope-restricted output;
-        # unscoped fallback only applies when no scene context exists.
-        scene_filtering_active = any_scene_has_refs or (
-            parsed_scenes is not None
-            and prefab_library is not None
-            and (
-                instantiated_prefab_guids is not None
-                and len(instantiated_prefab_guids) > 0
-            )
-        )
+        # Passing parsed_scenes is itself the request for scope-restricted
+        # output. Activate filtering whenever the caller supplied scenes,
+        # even when none of them reference any controller and none
+        # instantiate a prefab — that's a scoped run with zero animator
+        # work, not a fall-through to project-wide emission. Project-wide
+        # emission only applies when the caller passed parsed_scenes=None.
+        scene_filtering_active = any_scene_has_refs or parsed_scenes is not None
         if scene_filtering_active and not scene_match and not prefab_match:
             # Scene filtering active and this controller is unreferenced
             # by any parsed scene OR any instantiated prefab — skip, log
@@ -2050,8 +2043,6 @@ def convert_animations(
             # regardless of state-machine presence — these never go
             # through animator_runtime.
             for clip in transform_only_clips:
-                if not clip.curves:
-                    continue
                 script_name = f"Anim_{prefix}{ctrl.name}_{clip.name}"
                 luau_source = generate_tween_script(
                     clip=clip,
@@ -2086,8 +2077,9 @@ def convert_animations(
     # project-wide discovery, before the scene filter got applied.
     # Drop entries for controllers the current run isn't emitting
     # output for, so the md doesn't report features from unrelated
-    # scenes.
-    if any_scene_has_refs:
+    # scenes. Mirror the scope-activation condition above so
+    # prefab-only and empty-scene runs also get filtered.
+    if any_scene_has_refs or parsed_scenes is not None:
         accepted_names = {
             ctrl.name for ctrl in controllers
             if ctrl.name in scenes_per_controller

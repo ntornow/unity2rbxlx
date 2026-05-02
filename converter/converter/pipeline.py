@@ -1045,8 +1045,8 @@ class Pipeline:
                 )
             return
 
-        # Invert: material guid → set[(mesh_path, mesh_file_id)]. Phase 5.7
-        # threads ``mesh_file_id`` through so an FBX with multiple sub-meshes
+        # Invert: material guid → set[(mesh_path, mesh_file_id)]. Threading
+        # ``mesh_file_id`` through means an FBX with multiple sub-meshes
         # gets one bake per (mesh_path, mesh_file_id) pair rather than one
         # combined bake for the whole FBX file.
         material_to_meshes: dict[str, set[tuple[Path, str]]] = {}
@@ -1109,13 +1109,13 @@ class Pipeline:
                 )
                 continue
 
-            # Vertex colors are mesh-specific. Phase 5.7: every unique
+            # Vertex colors are mesh-specific. Every unique
             # (mesh_path, mesh_file_id) referrer also gets a keyed PNG.
             # The mapping itself points at a "combined" bake of the
-            # representative FBX (whole-FBX, no sub-mesh ID — pre-5.7
-            # behavior) so a single SurfaceAppearance still covers every
-            # sub-mesh that uses this material. Per-sub-mesh PNGs land
-            # alongside so a follow-up per-part rebinding pass can split.
+            # representative FBX (whole-FBX, no sub-mesh ID) so a single
+            # SurfaceAppearance still covers every sub-mesh that uses
+            # this material. Per-sub-mesh PNGs land alongside so a
+            # follow-up per-part rebinding pass can split.
             sorted_meshes = sorted(
                 meshes, key=lambda mp: (str(mp[0]), mp[1] or ""),
             )
@@ -1161,9 +1161,9 @@ class Pipeline:
         )
 
         for entry, mapping in zip(result.entries, material_pair_index):
-            # Phase 5.7: secondary sub-mesh entries have mapping=None — they
-            # bake additional PNGs into the output dir for follow-up per-
-            # part materialization but don't rebind the mapping (Roblox
+            # Secondary sub-mesh entries have mapping=None — they bake
+            # additional PNGs into the output dir for follow-up per-part
+            # materialization but don't rebind the mapping (Roblox
             # SurfaceAppearance is per-material, not per-sub-mesh).
             if mapping is None:
                 continue
@@ -1224,16 +1224,16 @@ class Pipeline:
         )
 
     def convert_animations(self) -> None:
-        """Phase 5a: route Unity animations to animator_runtime or inline TweenService.
+        """Route Unity animations to animator_runtime or inline TweenService.
 
-        Phase 4.5: when a parsed scene is available, pass it so the
-        converter can filter controllers to those actually referenced
-        and scene-scope the emitted module names.
+        When a parsed scene is available, pass it so the converter can
+        filter controllers to those actually referenced and scene-scope
+        the emitted module names.
 
-        Phase 5.8: union prefab-derived animator controller GUIDs into
-        the scene set before invoking the converter; most projects keep
-        Animators inside prefabs, so without this step the scene's set
-        is empty and scene scoping never activates.
+        Union prefab-derived animator controller GUIDs into the scene
+        set before invoking the converter; most projects keep Animators
+        inside prefabs, so without this step the scene's set is empty
+        and scene scoping never activates.
         """
         log.info("[convert_animations] Discovering and converting animations ...")
         from converter.animation_converter import convert_animations as _convert_anims
@@ -1511,7 +1511,7 @@ return table.concat(allData, "\\n")'''
             log.warning("[resolve_assets] No mesh resolution data obtained")
 
     def convert_scene(self) -> None:
-        """Phase 5b: Convert the parsed scene hierarchy to Roblox parts."""
+        """Convert the parsed scene hierarchy to Roblox parts."""
         log.info("[convert_scene] Converting scene hierarchy ...")
         from converter.scene_converter import convert_scene  # type: ignore[import-untyped]
 
@@ -1821,33 +1821,12 @@ return table.concat(allData, "\\n")'''
                 bootstrap_lines.append('local camera = workspace.CurrentCamera')
                 bootstrap_lines.append('camera.CameraType = Enum.CameraType.Scriptable')
                 bootstrap_lines.append('')
-                bootstrap_lines.append('-- Hide local character for first-person view')
-                bootstrap_lines.append('local Players = game:GetService("Players")')
-                bootstrap_lines.append('local lp = Players.LocalPlayer')
-                bootstrap_lines.append('local function _isInWeaponSlot(inst)')
-                bootstrap_lines.append('    local p = inst.Parent')
-                bootstrap_lines.append('    while p and p ~= game do')
-                bootstrap_lines.append('        if p.Name == "WeaponSlot" then return true end')
-                bootstrap_lines.append('        p = p.Parent')
-                bootstrap_lines.append('    end')
-                bootstrap_lines.append('    return false')
-                bootstrap_lines.append('end')
-                bootstrap_lines.append('local function hideCharacter(char)')
-                bootstrap_lines.append('    if not char then return end')
-                bootstrap_lines.append('    for _, part in char:GetDescendants() do')
-                bootstrap_lines.append('        if (part:IsA("BasePart") or part:IsA("Decal") or part:IsA("MeshPart")) and not _isInWeaponSlot(part) then')
-                bootstrap_lines.append('            part.LocalTransparencyModifier = 1')
-                bootstrap_lines.append('        end')
-                bootstrap_lines.append('    end')
-                bootstrap_lines.append('    char.DescendantAdded:Connect(function(desc)')
-                bootstrap_lines.append('        if (desc:IsA("BasePart") or desc:IsA("Decal") or desc:IsA("MeshPart")) and not _isInWeaponSlot(desc) then')
-                bootstrap_lines.append('            desc.LocalTransparencyModifier = 1')
-                bootstrap_lines.append('        end')
-                bootstrap_lines.append('    end)')
-                bootstrap_lines.append('end')
-                bootstrap_lines.append('hideCharacter(lp.Character)')
-                bootstrap_lines.append('lp.CharacterAdded:Connect(hideCharacter)')
-                bootstrap_lines.append('')
+                # First-person body/accessory hiding + spawn floor-snap live in
+                # script_coherence._disable_default_controls_in_fps_scripts so
+                # they ride along with the FPS LocalScript itself rather than
+                # the bootstrap. The bootstrap's `has_camera_control` only
+                # inspects `side_effect_modules`, which excludes FPS LocalScripts,
+                # so any logic placed here would have shipped dead.
             for i, mod in enumerate(side_effect_modules):
                 var = f'mod{i}'
                 bootstrap_lines.append(f'local {var} = RS:WaitForChild("{mod}", 10)')
@@ -2361,7 +2340,7 @@ script.Disabled = true
     # ------------------------------------------------------------------
 
     def _collect_method_warnings(self) -> list[str]:
-        """Pull Phase 4.4 method-completeness warnings off transpiled scripts.
+        """Pull method-completeness warnings off transpiled scripts.
 
         ``code_transpiler`` tags each AI-transpiled script's warnings
         with a leading ``[<filename>]`` when method-completeness finds
@@ -2377,6 +2356,38 @@ script.Disabled = true
                 if "missing from Luau output" in w:
                     warnings.append(w)
         return warnings
+
+    def _build_script_summary(self) -> "ScriptSummary":
+        """Project the live ``TranspilationResult`` onto ``ScriptSummary``.
+
+        ``ScriptSummary`` exposes ai/flagged/skipped counts and the list
+        of flagged script names — all derivable from ``state.transpilation_result``,
+        not from the bare ``ctx.transpiled_scripts`` count. Keeping this
+        single mapping means the report and the live result can't drift.
+        """
+        from converter.report_generator import ScriptSummary
+        tr = self.state.transpilation_result
+        if tr is None:
+            total = self.ctx.transpiled_scripts
+            return ScriptSummary(
+                total=total,
+                succeeded=total,
+                method_completeness_warnings=self._collect_method_warnings(),
+            )
+        flagged_scripts = [
+            Path(s.source_path).name
+            for s in tr.scripts
+            if s.flagged_for_review
+        ]
+        return ScriptSummary(
+            total=tr.total_transpiled,
+            succeeded=tr.total_transpiled - tr.total_failed,
+            flagged_for_review=tr.total_flagged,
+            skipped=tr.total_failed,
+            ai_transpiled=tr.total_ai,
+            flagged_scripts=flagged_scripts,
+            method_completeness_warnings=self._collect_method_warnings(),
+        )
 
     def _build_conversion_report(
         self, rbxlx_path: Path, result: dict, report_path: Path
@@ -2412,11 +2423,7 @@ script.Disabled = true
                 total=len(self.ctx.uploaded_assets),
                 by_kind={**script_types, "upload_errors": len(self.ctx.asset_upload_errors)},
             ),
-            scripts=ScriptSummary(
-                total=self.ctx.transpiled_scripts,
-                succeeded=self.ctx.transpiled_scripts,
-                method_completeness_warnings=self._collect_method_warnings(),
-            ),
+            scripts=self._build_script_summary(),
             materials=MaterialSummary(
                 total=self.ctx.total_materials,
                 fully_converted=self.ctx.converted_materials,

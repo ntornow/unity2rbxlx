@@ -269,10 +269,10 @@ def transpile_scripts(
             luau, confidence, warnings = ai_results[key]
             strategy = "ai"
 
-        # Phase 5.11: pre-AI pattern warnings — prepend before any AI/stub
-        # warnings so a reader sees structural hazards first. The patterns
-        # don't depend on transpile output and apply uniformly across
-        # rule-based, AI, and stub strategies.
+        # Pre-AI pattern warnings — prepend before any AI/stub warnings
+        # so a reader sees structural hazards first. The patterns don't
+        # depend on transpile output and apply uniformly across rule-
+        # based, AI, and stub strategies.
         pattern_warnings = _analyze_csharp_patterns(csharp_source)
         if pattern_warnings:
             warnings = pattern_warnings + warnings
@@ -1809,14 +1809,13 @@ def _classify_script_type(csharp_source: str, info: Any) -> str:
 
     Based on content analysis of the C# source and analyzer metadata.
 
-    Phase 5.12 harmonization: when the source isn't clearly client-side
-    and isn't a MonoBehaviour/NetworkBehaviour, default to ``ModuleScript``
-    (matching the source repo). The downstream ``script_coherence``
-    pass already promotes required-by-others scripts to ``ModuleScript``;
-    starting from ``ModuleScript`` for non-MonoBehaviour code prevents
-    spurious "reclassified to ModuleScript" reclassifications. Genuine
-    server gameplay (MonoBehaviour with no client APIs) still resolves
-    to ``Script``.
+    When the source isn't clearly client-side and isn't a MonoBehaviour
+    or NetworkBehaviour, default to ``ModuleScript``. The downstream
+    ``script_coherence`` pass already promotes required-by-others
+    scripts to ``ModuleScript``; starting from ``ModuleScript`` for
+    non-MonoBehaviour code prevents spurious "reclassified to
+    ModuleScript" reclassifications. Genuine server gameplay
+    (MonoBehaviour with no client APIs) still resolves to ``Script``.
     """
     # Use the analyzer's suggestion as the primary signal.
     if hasattr(info, "suggested_type"):
@@ -1856,7 +1855,7 @@ def _classify_script_type(csharp_source: str, info: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Phase 5.11: pre-AI C# pattern analysis
+# Pre-AI C# pattern analysis
 #
 # Surface high-impact patterns that frequently produce Luau the AI can't
 # faithfully transpile. Warnings are added to TranspiledScript.warnings so
