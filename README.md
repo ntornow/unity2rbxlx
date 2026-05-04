@@ -108,7 +108,7 @@ python convert_interactive.py materials ../test_projects/SimpleFPS ./output/Simp
 # 4. Transpile — C# → Luau
 python convert_interactive.py transpile ../test_projects/SimpleFPS ./output/SimpleFPS --api-key <anthropic_key>
 
-# 4c. Validate — run the Luau validator over transpiled output
+# 4c. Validate — run luau-analyze over transpiled output
 python convert_interactive.py validate ./output/SimpleFPS --write
 
 # 5. Assemble — upload assets, resolve, convert scene, write .rbxlx
@@ -175,9 +175,19 @@ test_projects/                    # Git submodules of sample Unity projects
 - Position: `(x, y, z)` Unity -> `(x, y, -z)` Roblox
 - Quaternion: `(qx, qy, qz, qw)` Unity -> `(-qx, -qy, qz, qw)` Roblox
 
+## Documentation
+
+- [`converter/CLAUDE.md`](converter/CLAUDE.md) — engineering overview + upload semantics
+- [`converter/ARCHITECTURE.md`](converter/ARCHITECTURE.md) — pipeline architecture + design decisions
+- [`converter/docs/UNSUPPORTED.md`](converter/docs/UNSUPPORTED.md) — what the converter cannot do
+- [`converter/docs/KNOWN_ISSUES.md`](converter/docs/KNOWN_ISSUES.md) — architectural debt and bug-shaped concerns
+- [`converter/docs/FUTURE_IMPROVEMENTS.md`](converter/docs/FUTURE_IMPROVEMENTS.md) — long-horizon, multi-PR work
+- [`converter/docs/design/inline-over-runtime-wrappers.md`](converter/docs/design/inline-over-runtime-wrappers.md) — key design decision (transpile-time API translation, no runtime wrappers)
+- [`converter/TODO.md`](converter/TODO.md) — active PR-scoped work
+
 ## Limitations
 
-- Skeletal/bone animations are not yet supported (property animations work via TweenService)
+- Skeletal animation supported for R15-mappable rigs (Motor6D + `animator_runtime.luau`); both text-YAML and binary `.anim` / `.controller` are parsed (binary requires the optional `UnityPy` dependency). See `converter/docs/UNSUPPORTED.md` for the full list.
 - Custom shaders are approximated with Roblox materials
 - Git LFS pointer files are detected and skipped (run `git lfs pull` first)
-- VFX Graph and advanced particle sub-emitters are not yet converted
+- VFX Graph is not converted (no node-graph primitive on Roblox); particle sub-emitters are auto-converted via `sub_emitter_runtime.luau` when `_HasSubEmitters` is detected

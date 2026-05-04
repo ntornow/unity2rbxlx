@@ -180,6 +180,24 @@ migration).
 
 ---
 
+## `.rbxlx` reader for direct publish-from-disk
+
+The dest pipeline only writes `rbxlx`; it never reads one. Both publish paths therefore reconstruct `rbx_place` rather than reading the on-disk file:
+
+- **Interactive `upload`** (`convert_interactive.py upload`) re-runs the pipeline in-memory and publishes a fresh rebuild. Hand-edits to `converted_place.rbxlx` between `assemble` and `upload` are silently dropped. A runtime warning surfaces this.
+- **`u2r.py publish`** replays cached chunks (`<output>/place_builder_chunks.json`) when present, preserving the assembled state byte-for-byte. Falls back to a fresh Pipeline rebuild on cache miss.
+
+Adding an `.rbxlx` reader would let `upload` honor hand-edits to the on-disk file directly and would unify the two publish paths. The work is non-trivial: the writer is the only round-trip in the codebase today, and the reader needs to handle Roblox's full XML schema (Refs, attributes, custom serializers) for non-trivial places.
+
+Until a reader exists, the workaround is **open `converted_place.rbxlx` in Roblox Studio → File → Publish to Roblox**. Studio is the only path that publishes the reviewed file directly. See `converter/CLAUDE.md` § Upload semantics for the full comparison.
+
+When to revisit:
+- If user feedback shows the rebuild path is dropping meaningful hand-edits.
+- If the cached-chunks fast path is insufficient for a real workflow (e.g., users want to edit `place_builder.luau` directly and re-publish).
+- If we move toward a serializer-first design (see "Custom serializer evaluation" above) — at that point a reader becomes a natural side product.
+
+---
+
 ## NavMesh advanced features
 
 The current `nav_mesh_runtime.luau` provides `PathfindingService`-backed

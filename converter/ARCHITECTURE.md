@@ -37,7 +37,9 @@ End-to-end CLI for one-shot conversions, CI/CD, batch jobs. No human in the loop
 | `upload`     | parse → convert_scene + headless place builder | Publishes via `execute_luau` |
 | `report`     | (none — writes `conversion_report.json`) | Final summary |
 
-The `/convert-unity` skill (`converter/.claude/skills/convert-unity/SKILL.md`) drives the interactive workflow. It pauses at each phase for human review (scene selection, material review, script review, scale strategy, etc.) and contains the Step 4.5 game-logic-porting playbook (architecture map, Unity↔Roblox divergence analysis, module-per-component rewrite, bootstrap wiring) that the pipeline cannot automate. See also `references/upload-patching.md` for upload-strategy details.
+The `/convert-unity` skill (`converter/.claude/skills/convert-unity/SKILL.md`) drives the interactive workflow. It pauses at each phase for human review (scene selection, material review, script review, scale strategy, etc.) and contains the Step 4.5 game-logic-porting playbook (architecture map, Unity↔Roblox divergence analysis, module-per-component rewrite, bootstrap wiring) that the pipeline cannot automate.
+
+Upload publishing has two paths with different semantics: interactive `upload` rebuilds `rbx_place` from source on every run; `u2r.py publish` replays cached chunks at `<output>/place_builder_chunks.json` and falls back to a fresh rebuild only on cache miss. Manual `.rbxlx` publishing is via Roblox Studio (File → Publish to Roblox). See `CLAUDE.md` § Upload semantics for the full comparison; the skill-internal upload-strategy detail lives in the skill's `references/upload-patching.md`.
 
 ### Architecture diagram
 
@@ -68,17 +70,18 @@ The `/convert-unity` skill (`converter/.claude/skills/convert-unity/SKILL.md`) d
 
 ## Pipeline Phases
 
-1. **Parse**: scene_parser + prefab_parser + guid_resolver -- parse Unity YAML
+1. **Parse**: scene_parser + prefab_parser + guid_resolver -- parse Unity YAML (text + binary via UnityPy)
 2. **Extract Assets**: asset_extractor -- catalog and hash all assets (textures, meshes, audio)
-3. **Upload Assets**: cloud_api -- upload to Roblox Open Cloud (textures as Decal, meshes as Model, audio)
-4. **Resolve Assets** (Studio-required): InsertService:LoadAsset to get:
+3. **Moderate Assets** (`moderate_assets`): asset_moderator -- screen filenames, scripts, and audio against Roblox Community Standards before upload; auto-blocklist violations
+4. **Upload Assets**: cloud_api -- upload to Roblox Open Cloud (textures as Decal, meshes as Model, audio)
+5. **Resolve Assets** (Studio-required): InsertService:LoadAsset to get:
    - Mesh Model IDs -> real MeshIds + sub-mesh hierarchy with sizes
    - Texture Decal IDs -> Image IDs (SurfaceAppearance needs Image, not Decal)
-5. **Materials**: material_mapper -- Unity .mat files -> Roblox SurfaceAppearance with uploaded texture URLs
-6. **Scripts**: code_transpiler -- C# -> Luau (rule-based + AI via Claude CLI)
-7. **Animations**: animation_converter -- .anim/.controller -> TweenService Luau scripts
-8. **Convert Scene**: scene_converter + component_converter -- build Roblox data model
-9. **Output**: rbxlx_writer -- generate .rbxlx XML
+6. **Materials**: material_mapper -- Unity .mat files -> Roblox SurfaceAppearance with uploaded texture URLs
+7. **Scripts**: code_transpiler -- C# -> Luau (rule-based + AI via Claude CLI), syntax-gated by `luau-analyze` + AI reprompt loop (replaces the former `luau_validator.py`, removed 2026-04-18)
+8. **Animations**: animation_converter -- .anim/.controller -> TweenService Luau scripts (transform-only) or animator_runtime (humanoid)
+9. **Convert Scene**: scene_converter + component_converter -- build Roblox data model
+10. **Output**: rbxlx_writer -- generate .rbxlx XML; optional sibling .rbxl via `rbxl_binary_writer`
 
 ## Asset Resolution (Critical)
 
@@ -114,6 +117,12 @@ Where:
 - State between phases stored in ConversionContext (JSON-serializable)
 - Use actual data from Roblox (LoadAsset) for mesh sizes, not heuristics
 
+## Design Decisions
+
+- **Inline over runtime wrappers** — Unity APIs are translated to Luau at transpile time via `api_mappings.py` / `UTILITY_FUNCTIONS`, not via `require()`-able runtime modules. Only stateful runtimes survive (`animator_runtime`, `nav_mesh_runtime`, `event_system`, `physics_bridge`, `cinemachine_runtime`, plus feature runtimes for object pooling, pickups, sub-emitters). Nine runtime bridges were deleted in 2026-04. See `docs/design/inline-over-runtime-wrappers.md`.
+- **Conversion plan rehydration** — `conversion_plan.json` records `{script_type, parent_path}` for every transpiled script so the rehydration path (interactive `assemble --no-retranspile`, `upload` rebuild) reconstructs the exact same Roblox script-container layout as the fresh-transpile path. Phase 3 design.
+- **Upload publishes a rebuild, not the on-disk `.rbxlx`** — there is no `.rbxlx` reader; both publish paths reconstruct `rbx_place` rather than reading the file. See `CLAUDE.md` § Upload semantics. Reader is roadmapped in `docs/FUTURE_IMPROVEMENTS.md`.
+
 ## Coordinate System
 
 - Unity: left-handed Y-up, Z-forward
@@ -135,7 +144,7 @@ Where:
 
 ## Supported Features
 
-- Text YAML scene parsing (binary requires UnityPy)
+- Text YAML + binary scene parsing (binary via UnityPy, including terrain `.asset` files)
 - Both Standard and URP (Universal Render Pipeline) Lit shaders
 - Both old (data:/first:/second:) and new (list-of-dicts) Unity YAML formats
 - PSD, BMP, TGA, TIF texture auto-conversion to PNG

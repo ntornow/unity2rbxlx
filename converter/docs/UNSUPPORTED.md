@@ -114,7 +114,7 @@ These are platform-level restrictions. The converter cannot work around them.
 | Limitation | Impact | Why permanent |
 |---|---|---|
 | No custom shaders | Vertex shader effects (world curve, wave) cannot be replicated | Roblox engine restriction |
-| 1 material per MeshPart | Multi-material meshes must be split (handled by `mesh_splitter`) | Roblox data model |
+| 1 material per MeshPart | Multi-material meshes are split into a sub-mesh hierarchy (handled by `scene_converter`) | Roblox data model |
 | UV0 only | Secondary UV channels (lightmaps on UV1) are lost | Roblox uses single UV |
 | No height/displacement mapping | Parallax effects lost | Engine renderer |
 | No SSS / anisotropy / iridescence / clear coat | HDRP advanced materials simplified | No PBR extension API |
@@ -185,11 +185,14 @@ are not analyzed.
 
 ### Multi-material mesh splitting (FBX edge cases)
 
-`mesh_splitter` decomposes multi-material meshes into separate sub-meshes. The
-common case (GLB / well-formed FBX) works. Edge cases:
+`scene_converter` builds a sub-mesh hierarchy from the per-submesh material
+list, emitting one `MeshPart` per submesh material under a parent `Model`.
+The common case (GLB / well-formed FBX) works. Edge cases:
 
-- FBX files where trimesh can't decompose by material — falls back to first
-  material only, others lost.
+- FBX files where `scene_converter` can't resolve per-submesh materials
+  from the prefab's `m_Materials` list (e.g. material count mismatch with
+  the FBX sub-mesh count) — falls back to first-material-only with the
+  unmatched materials surfaced via `UNCONVERTED.md`.
 - Sub-mesh material ordering when `m_Materials` and mesh sub-mesh indices
   don't align — surfaced via `UNCONVERTED.md`.
 

@@ -55,7 +55,7 @@ Work autonomously with no questions — just churn forever making the converter 
 - SmoothGrid terrain: World-space chunk coordinates with Z inversion
 - Luau place builder: 700KB script reconstructs entire place headlessly (parts, meshes, scripts, terrain, lighting, UI)
 - SurfaceAppearance: Full PBR in rbxlx, Texture fallback for headless mode
-- Luau validator: 6,950 lines, 50+ fix categories, format specifier preservation
+- Luau syntax gate: `luau-analyze` + AI reprompt loop in `code_transpiler.py` (replaced regex `luau_validator.py`, removed 2026-04-18)
 - Script transpilation: 99.7% success rate across all projects
 - Bone name resolution: Mixamo prefix stripping, case-insensitive matching
 
@@ -188,6 +188,18 @@ python u2r.py convert ../test_projects/SimpleFPS -o ./output/SimpleFPS --api-key
 - Position: (x, y, z)_unity -> (x, y, -z)_roblox
 - Quaternion: (qx, qy, qz, qw)_unity -> (-qx, -qy, qz, qw)_roblox
 - FBX mesh handedness: `fbx_binary.mirror_fbx_handedness()` negates X and Y in vertices/normals before upload (equivalent to 180° rotation around Z/vertical). This fixes asymmetric mesh features (text, logos) appearing on the wrong side in Roblox without affecting vertical positioning, triangle winding, or text orientation.
+
+## Upload semantics
+
+Two paths publish to Roblox; they have different "what gets published" semantics. Pick the right one for your workflow.
+
+| Path | What it publishes | When to use |
+|---|---|---|
+| **Interactive `upload`** (`convert_interactive.py upload`) | A **fresh rebuild** of `rbx_place` from source. Re-runs `parse → … → convert_scene` in-memory and feeds the result to the headless place builder. **Hand-edits to `converted_place.rbxlx` between `assemble` and `upload` are silently dropped.** A runtime warning (`convert_interactive.py:1011`) surfaces this. | Skill-driven flow when you want a one-shot publish after assemble; or when source has changed and you want a fresh build. |
+| **`u2r.py publish`** | **Replays cached chunks** — `<output>/place_builder_chunks.json` first, then `<output>/place_builder.luau` for older conversions (`roblox/place_publisher.py:publish_cached_chunks`, two-tier fallback). Both shapes preserve the assembled state byte-for-byte. Falls back to a fresh Pipeline rebuild **only when both cache shapes are missing**. | When you want to re-publish the assembled state without re-running the converter (e.g., after a transient upload failure), or when the Unity project has been moved/archived. See `u2r.py:208–290` and `roblox/place_publisher.py:153–230`. |
+| **Studio manual publish** | Whatever is in the local `converted_place.rbxlx` (you edit it in Studio first). | When you want to publish a hand-edited `.rbxlx`. There is no `.rbxlx` reader on the dest side, so this is the only path that publishes the reviewed file directly. Roadmapped in `docs/FUTURE_IMPROVEMENTS.md`. |
+
+The historical "deferred fix C2" (upload publishes a fresh rebuild, not the reviewed `.rbxlx`) is closed by this documentation + the runtime warning + the `u2r.py publish` cached-chunks fast path. Implementing an `.rbxlx` reader is roadmap, not Phase 6.
 
 ## Reference Documentation
 
