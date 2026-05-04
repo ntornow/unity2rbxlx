@@ -23,6 +23,17 @@ Because the place is reconstructed server-side via the Luau Execution API, the r
 
 For full details and the runtime MeshLoader fallback (Strategy B), read `references/upload-patching.md`.
 
+## What gets published
+
+**The interactive `upload` subcommand publishes a fresh rebuild, not the local `.rbxlx`.** Upload re-runs `parse → … → convert_scene` in-memory and feeds the rebuilt `rbx_place` into the headless place builder. The runtime warning emitted in the upload JSON output (`convert_interactive.py:1011`) surfaces this to the user.
+
+Why: there is no `.rbxlx` reader on the dest side; the pipeline only writes rbxlx, never reads it. Adding a reader is roadmapped in `converter/docs/FUTURE_IMPROVEMENTS.md`.
+
+What this means in practice:
+- Hand-edits to `<output>/converted_place.rbxlx` between `assemble` and `upload` are silently dropped on republish.
+- If you want to publish a hand-edited `.rbxlx`, open it in Studio and use **File → Publish to Roblox** (the manual route under "Decision: upload failures" below).
+- If you want to re-publish the assembled state without re-running the converter, prefer `python u2r.py publish <output_dir>` from the non-interactive CLI: it replays `<output>/place_builder_chunks.json` if cached (preserving the assembled state byte-for-byte), and only falls back to a fresh Pipeline rebuild when the cache is missing. See `converter/CLAUDE.md` § Upload semantics for the side-by-side comparison.
+
 ## Prerequisites
 
 The target place must already exist. The user creates it once in Roblox Studio (File > New > Save to Roblox), then provides the universe ID and place ID.
