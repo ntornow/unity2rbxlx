@@ -189,9 +189,10 @@ are not analyzed.
 list, emitting one `MeshPart` per submesh material under a parent `Model`.
 The common case (GLB / well-formed FBX) works. Edge cases:
 
-- FBX files where the asset moderator can't extract per-submesh materials —
-  falls back to first-material-only with the unmatched materials surfaced
-  via `UNCONVERTED.md`.
+- FBX files where `scene_converter` can't resolve per-submesh materials
+  from the prefab's `m_Materials` list (e.g. material count mismatch with
+  the FBX sub-mesh count) — falls back to first-material-only with the
+  unmatched materials surfaced via `UNCONVERTED.md`.
 - Sub-mesh material ordering when `m_Materials` and mesh sub-mesh indices
   don't align — surfaced via `UNCONVERTED.md`.
 
