@@ -15,7 +15,6 @@ import textwrap
 from typing import Sequence
 
 from core.roblox_types import RbxPart, RbxCFrame
-from core.coordinate_system import quaternion_to_rotation_matrix
 
 # Maximum bytes per script chunk sent to execute_luau (stay under 50 KB to
 # avoid MCP timeout issues).
@@ -23,38 +22,15 @@ _MAX_CHUNK_BYTES = 50_000
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Internal helpers (canonical implementations live in roblox.luau_emit).
 # ---------------------------------------------------------------------------
 
-def _cframe_ctor(cf: RbxCFrame) -> str:
-    """Return a Luau ``CFrame.new(...)`` constructor string for *cf*."""
-    mat = quaternion_to_rotation_matrix(cf.qx, cf.qy, cf.qz, cf.qw)
-    if isinstance(mat, (list, tuple)) and isinstance(mat[0], (list, tuple)):
-        flat = [mat[r][c] for r in range(3) for c in range(3)]
-    else:
-        flat = list(mat[:9])
-    args = ", ".join(
-        str(v)
-        for v in [cf.x, cf.y, cf.z] + flat
-    )
-    return f"CFrame.new({args})"
-
-
-def _color3_ctor(color: tuple | list) -> str:
-    """Return a ``Color3.new(r, g, b)`` or ``Color3.fromRGB(r, g, b)``."""
-    r, g, b = color[:3]
-    if all(isinstance(c, float) and c <= 1.0 for c in (r, g, b)):
-        return f"Color3.new({r}, {g}, {b})"
-    return f"Color3.fromRGB({int(r)}, {int(g)}, {int(b)})"
-
-
-def _vector3_ctor(x: float, y: float, z: float) -> str:
-    return f"Vector3.new({x}, {y}, {z})"
-
-
-def _escape_luau_string(s: str) -> str:
-    """Escape a string for embedding inside Luau double-quotes."""
-    return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+from roblox.luau_emit import (  # noqa: E402
+    cframe_ctor as _cframe_ctor,
+    color3_ctor as _color3_ctor,
+    vector3_ctor as _vector3_ctor,
+    escape_luau_string as _escape_luau_string,
+)
 
 
 # ---------------------------------------------------------------------------

@@ -449,10 +449,14 @@ def analyze(unity_project: str) -> None:
         else:
             try:
                 from unity.binary_scene_parser import parse_binary_scene
-                parsed = parse_binary_scene(s)
-                click.echo(f"    Roots: {len(parsed.roots)}, Total nodes: {len(parsed.all_nodes)}")
-            except Exception:
-                click.echo(f"    (could not parse - install UnityPy)")
+            except ImportError:
+                click.echo("    (could not parse - install UnityPy)")
+            else:
+                try:
+                    parsed = parse_binary_scene(s)
+                    click.echo(f"    Roots: {len(parsed.roots)}, Total nodes: {len(parsed.all_nodes)}")
+                except Exception as exc:
+                    click.echo(f"    (parse failed: {exc})")
 
     # Prefabs
     library = parse_prefabs(project)
@@ -1209,8 +1213,8 @@ def eval_cmd(output: str, baseline: str | None) -> None:
                 try:
                     report = json.loads(report_path.read_text())
                     metrics["validator_fixes"] = report.get("validator_fixes", 0)
-                except (json.JSONDecodeError, KeyError):
-                    pass
+                except (json.JSONDecodeError, OSError) as exc:
+                    metrics["report_read_error"] = f"{report_path}: {exc}"
 
             # Count TODO placeholders and C# residue in transpiled scripts
             scripts_dir = proj_out / "scripts"

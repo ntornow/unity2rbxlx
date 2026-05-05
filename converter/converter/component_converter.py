@@ -1874,55 +1874,22 @@ def convert_skinned_mesh_renderer(
     for fid in bone_file_ids:
         node = scene_nodes.get(fid)
         if node is None:
-            # Bone references a transform we can't resolve -- skip it
             continue
 
-        name = getattr(node, "name", f"Bone_{fid}")
+        name = node.name
         bone_name_by_fid[fid] = name
 
-        # Get parent fileID
-        parent_fid = None
-        parent = getattr(node, "parent", None)
-        if parent is not None:
-            pfid = getattr(parent, "file_id", None)
-            if pfid:
-                parent_fid = str(pfid)
+        parent_fid = node.parent_file_id
 
-        # Extract local position from the node's transform
-        pos = {"x": 0.0, "y": 0.0, "z": 0.0}
-        rot = {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}
-
-        # SceneNode stores position/rotation as dicts or has them from transform
-        node_pos = getattr(node, "position", None)
-        if isinstance(node_pos, dict):
-            pos = node_pos
-        elif node_pos is not None and hasattr(node_pos, "__iter__"):
-            # Could be a tuple/list (x, y, z)
-            try:
-                vals = list(node_pos)
-                if len(vals) >= 3:
-                    pos = {"x": float(vals[0]), "y": float(vals[1]), "z": float(vals[2])}
-            except (TypeError, ValueError):
-                pass
-
-        node_rot = getattr(node, "rotation", None)
-        if isinstance(node_rot, dict):
-            rot = node_rot
-        elif node_rot is not None and hasattr(node_rot, "__iter__"):
-            try:
-                vals = list(node_rot)
-                if len(vals) >= 4:
-                    rot = {"x": float(vals[0]), "y": float(vals[1]),
-                           "z": float(vals[2]), "w": float(vals[3])}
-            except (TypeError, ValueError):
-                pass
+        px, py, pz = node.position
+        rx, ry, rz, rw = node.rotation
 
         bone_info.append({
             "file_id": fid,
             "name": name,
             "parent_fid": parent_fid,
-            "pos": pos,
-            "rot": rot,
+            "pos": {"x": px, "y": py, "z": pz},
+            "rot": {"x": rx, "y": ry, "z": rz, "w": rw},
         })
 
     if not bone_info:

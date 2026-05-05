@@ -22,35 +22,10 @@ STUDS_PER_METER = config.STUDS_PER_METER
 
 
 # ---------------------------------------------------------------------------
-# Quaternion math
+# Quaternion math (canonical implementations in core.coordinate_system)
 # ---------------------------------------------------------------------------
 
-def quat_multiply(a, b):
-    """Multiply quaternions (x,y,z,w) format."""
-    ax, ay, az, aw = a
-    bx, by, bz, bw = b
-    return (
-        aw * bx + ax * bw + ay * bz - az * by,
-        aw * by - ax * bz + ay * bw + az * bx,
-        aw * bz + ax * by - ay * bx + az * bw,
-        aw * bw - ax * bx - ay * by - az * bz,
-    )
-
-
-def quat_rotate(q, v):
-    """Rotate vector v by quaternion q."""
-    qx, qy, qz, qw = q
-    vx, vy, vz = v
-    t = [
-        2.0 * (qy * vz - qz * vy),
-        2.0 * (qz * vx - qx * vz),
-        2.0 * (qx * vy - qy * vx),
-    ]
-    return (
-        vx + qw * t[0] + (qy * t[2] - qz * t[1]),
-        vy + qw * t[1] + (qz * t[0] - qx * t[2]),
-        vz + qw * t[2] + (qx * t[1] - qy * t[0]),
-    )
+from core.coordinate_system import quat_multiply, quat_rotate  # noqa: E402
 
 
 def quat_angle_diff(q1, q2):

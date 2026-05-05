@@ -690,3 +690,87 @@ class TestTilemapRendererConversion:
         props = {"m_TileAnchor": {"x": 0.5, "y": 0.5}}
         attrs = convert_tilemap_renderer(props)
         assert "_TilemapAnchorX" not in attrs
+
+
+class TestSkinnedMeshRendererBoneResolution:
+    """Regression tests for convert_skinned_mesh_renderer.
+
+    Bug history: an earlier version read `node.parent` (and expected position
+    as a dict), but `SceneNode` exposes `parent_file_id` and tuple position/
+    rotation. The result was zero Motor6Ds and an empty bone hierarchy on
+    every real scene.
+    """
+
+    def _make_node(self, fid: str, name: str, parent_fid: str | None = None):
+        from core.unity_types import SceneNode
+        return SceneNode(
+            name=name,
+            file_id=fid,
+            active=True,
+            layer=0,
+            tag="",
+            parent_file_id=parent_fid,
+            position=(0.0, 1.0, 0.0),
+            rotation=(0.0, 0.0, 0.0, 1.0),
+        )
+
+    def test_bone_chain_produces_motor6ds(self):
+        """A two-bone chain (root → child, both in m_Bones) must yield a Motor6D
+        whose part0 is the parent bone name."""
+        from converter.component_converter import convert_skinned_mesh_renderer
+
+        scene_nodes = {
+            "10": self._make_node("10", "Hips"),
+            "11": self._make_node("11", "Spine", parent_fid="10"),
+        }
+        props = {
+            "m_Bones": [{"fileID": "10"}, {"fileID": "11"}],
+            "m_RootBone": {"fileID": "10"},
+        }
+
+        motor6ds, attrs = convert_skinned_mesh_renderer(props, scene_nodes=scene_nodes)
+
+        assert len(motor6ds) == 1, "child bone must produce one Motor6D joint"
+        assert motor6ds[0].part0_name == "Hips"
+        assert motor6ds[0].part1_name == "Spine"
+        assert attrs["_BoneCount"] == 2
+        assert attrs["_RootBone"] == "Hips"
+        assert attrs["_BoneHierarchy"] == "Spine:Hips"
+
+    def test_bone_position_uses_unity_to_roblox_z_negation(self):
+        """C0 offset must scale by STUDS_PER_METER and negate Z."""
+        from converter.component_converter import convert_skinned_mesh_renderer
+        import config
+
+        from core.unity_types import SceneNode
+        child = SceneNode(
+            name="Child", file_id="2", active=True, layer=0, tag="",
+            parent_file_id="1",
+            position=(0.0, 0.0, 1.0),
+            rotation=(0.0, 0.0, 0.0, 1.0),
+        )
+        parent = SceneNode(
+            name="Parent", file_id="1", active=True, layer=0, tag="",
+            position=(0.0, 0.0, 0.0),
+            rotation=(0.0, 0.0, 0.0, 1.0),
+        )
+        props = {
+            "m_Bones": [{"fileID": "1"}, {"fileID": "2"}],
+            "m_RootBone": {"fileID": "1"},
+        }
+
+        motor6ds, _ = convert_skinned_mesh_renderer(
+            props, scene_nodes={"1": parent, "2": child},
+        )
+        assert motor6ds[0].c0.z == pytest.approx(-config.STUDS_PER_METER)
+
+    def test_unresolved_bones_skipped_silently(self):
+        """A bone whose fileID is missing from scene_nodes must be skipped."""
+        from converter.component_converter import convert_skinned_mesh_renderer
+
+        scene_nodes = {"10": self._make_node("10", "Hips")}
+        props = {"m_Bones": [{"fileID": "10"}, {"fileID": "999"}]}
+
+        motor6ds, attrs = convert_skinned_mesh_renderer(props, scene_nodes=scene_nodes)
+        assert motor6ds == []  # only one bone resolved, no parent chain
+        assert attrs["_BoneCount"] == 1
