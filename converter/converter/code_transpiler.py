@@ -1315,18 +1315,38 @@ Lifecycle:
 - OnDestroy → `script.Destroying:Connect(function() ... end)` or Maid pattern
 - OnEnable/OnDisable → manual enable/disable via attributes
 - OnCollisionEnter/OnTriggerEnter → `part.Touched:Connect(function(otherPart) ... end)`
-  **IMPORTANT**: `.Touched` only works on BasePart instances, NOT Models. If `script.Parent` is a Model, find the first BasePart child: `local part = script.Parent:FindFirstChildWhichIsA("BasePart")`
+  **IMPORTANT — Model trigger parts**: `.Touched` only works on BasePart instances, NOT Models. When `script.Parent` is a Model that mixes visible mesh Parts with an invisible trigger zone (Transparency=1, common Unity pattern — Collider/Trigger/Detector child holding the proximity sphere alongside visible MeshParts), `:FindFirstChildWhichIsA("BasePart")` returns the WRONG one — typically the trigger zone because it's listed first in the children. Use one of these instead:
+  - Prefer a named trigger Part: `local trigger = model:FindFirstChild("Collider") or model:FindFirstChild("Trigger") or model:FindFirstChild("PickupTouchDetector")`
+  - For visible mesh interaction (touch a wall, pick up a coin), prefer the first NON-trigger Part: `for _, p in ipairs(model:GetChildren()) do if p:IsA("BasePart") and p.Transparency < 1 then trigger = p; break end end`
+  - For movement (rotate, lerp, follow path), use `model:PivotTo(model:GetPivot() * delta)` — do NOT pick a single child Part and move it (siblings stay where they are).
 
 Core:
 - `Debug.Log/LogWarning/LogError` → `print` / `warn`
 - `Instantiate(prefab)` → `prefab:Clone(); clone.Parent = workspace`
 - `Destroy(obj)` / `Destroy(obj, delay)` → `obj:Destroy()` / `game:GetService("Debris"):AddItem(obj, delay)`
 - `GetComponent<T>()` → `:FindFirstChildWhichIsA("T")`
-- `transform.position` → `part.Position`, `transform.rotation` → `part.CFrame`
-- `transform.forward/right/up` → `part.CFrame.LookVector/RightVector/UpVector`
-- `transform.localScale` → `part.Size`
 - `gameObject.SetActive(false)` → set `Transparency=1, CanCollide=false` (or use recursive helper)
-- `gameObject` / `this` → `script.Parent` (the part/model the script is parented to)
+- `gameObject` / `this` → `script.Parent` (the part OR model the script is parented to — see "Model vs Part dispatch" below)
+
+### Model vs Part dispatch
+Unity's `transform.X` is one API regardless of whether the GameObject has a single mesh or a hierarchy. In Roblox, BasePart and Model have **different** APIs, so every `transform.X` translation needs to dispatch on `script.Parent:IsA("Model")`. Helper pattern at the top of the script:
+```lua
+local container = script.Parent
+local function getCFrame()
+    if container:IsA("Model") then return container:GetPivot() end
+    return container.CFrame
+end
+local function setCFrame(cf)
+    if container:IsA("Model") then container:PivotTo(cf) else container.CFrame = cf end
+end
+local function getPosition() return getCFrame().Position end
+```
+Then:
+- `transform.position` → `getPosition()` (read) or `setCFrame(CFrame.new(newPos))` (write)
+- `transform.rotation` → `getCFrame()` (read) or `setCFrame(getCFrame() * rot)` (compose)
+- `transform.forward/right/up` → `getCFrame().LookVector/RightVector/UpVector`
+- `transform.localScale` → `container.Size` for BasePart, `container:ScaleTo(s)` for Model (Models have no Size)
+Skip the helpers when you can prove `script.Parent` is always a BasePart (the script lives next to a single MeshPart, no Model wrapper). Otherwise emit the dispatch — picking a child Part and reading/writing its CFrame moves only that child, not the model.
 
 Input:
 - `Input.GetKey/GetKeyDown/GetKeyUp` → `UserInputService:IsKeyDown(Enum.KeyCode.X)`

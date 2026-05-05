@@ -149,6 +149,7 @@ class TestSimpleFPSConversion:
         assert result.total_clips > 0
         assert len(result.generated_scripts) > 0
 
+    @pytest.mark.slow
     def test_script_transpilation(self):
         from unity.script_analyzer import analyze_all_scripts
         from converter.code_transpiler import transpile_scripts
@@ -156,7 +157,10 @@ class TestSimpleFPSConversion:
         scripts = analyze_all_scripts(SIMPLEFPS_DIR)
         assert len(scripts) > 0
 
-        # Use cached results (no AI needed for test)
+        # use_ai=True hits Claude CLI when LLM_CACHE_DIR is cold — slow.
+        # Marked slow because cache validity depends on the AI prompt and
+        # model version; any prompt edit (e.g. code_transpiler.py:1318)
+        # invalidates every entry and turns this into a real network call.
         tr = transpile_scripts(SIMPLEFPS_DIR, scripts, use_ai=True, api_key="")
         assert tr.total_transpiled > 0
 
