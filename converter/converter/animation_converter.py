@@ -20,9 +20,11 @@ of keyframes), we sample at reduced keyframe density and use sequential tweens.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,40 @@ from core.unity_types import GuidIndex, ParsedScene, PrefabLibrary
 from unity.yaml_parser import parse_documents, doc_body, is_text_yaml
 
 log = logging.getLogger(__name__)
+
+
+def _disambiguate_by_source(items: list, label: str) -> dict[int, str]:
+    """Map ``id(item)`` → unique display name across ``items``.
+
+    Returns ``item.name`` when names are unique; otherwise appends an
+    8-char hash of ``item.source_path`` so two distinct files that share
+    a Unity-given name don't stomp on each other in dicts and on disk.
+
+    ``label`` is used only for the ``unknown`` fallback when ``source_path``
+    is missing — ``f"{name}__{label}"`` is still preferable to silent
+    collision.
+    """
+    name_counts: Counter[str] = Counter(getattr(i, "name", "") for i in items)
+    out: dict[int, str] = {}
+    seen_disambig: dict[str, int] = {}
+    for item in items:
+        name = getattr(item, "name", "") or "unnamed"
+        if name_counts[name] <= 1:
+            out[id(item)] = name
+            continue
+        src = getattr(item, "source_path", None)
+        if src is not None:
+            disambig = hashlib.sha1(
+                str(Path(src).resolve()).encode()
+            ).hexdigest()[:8]
+        else:
+            # No source_path to hash — fall back to a per-name counter
+            # so we still avoid stomping. Worse than path-derived because
+            # the value isn't stable across runs, but it keeps the data.
+            seen_disambig[name] = seen_disambig.get(name, 0) + 1
+            disambig = f"{label}{seen_disambig[name]}"
+        out[id(item)] = f"{name}__{disambig}"
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1838,6 +1874,13 @@ def convert_animations(
                 if gid:
                     clip_name_by_guid[gid] = clip.name
 
+    # Disambiguate controllers that share a Unity-given name. Two distinct
+    # .controller files with identical ``m_Name`` (a common pattern when
+    # each prefab ships its own "AnimController") would otherwise collide
+    # in scenes_per_controller / prefabs_per_controller / result.routing
+    # and in the generated script names. Maps id(ctrl) → unique display name.
+    ctrl_display = _disambiguate_by_source(controllers, label="ctrl")
+
     # Determine which scenes reference each controller (by GUID). Scenes
     # only directly carry Animator components when a GameObject in the
     # scene YAML has one; in most projects Animators live inside prefabs,
@@ -1863,7 +1906,9 @@ def convert_animations(
                 if ctrl_guid in refs:
                     scene_stem = getattr(scene, "scene_path", None)
                     scene_stem = scene_stem.stem if scene_stem else ""
-                    scenes_per_controller.setdefault(ctrl.name, []).append(scene_stem)
+                    scenes_per_controller.setdefault(
+                        ctrl_display[id(ctrl)], []
+                    ).append(scene_stem)
 
     # Prefab-scoped emission: when a controller lives inside a
     # PrefabTemplate (the common case), emit one tween script per prefab
@@ -1929,6 +1974,7 @@ def convert_animations(
             )
             if not ctrl_guid:
                 continue
+            ctrl_key = ctrl_display[id(ctrl)]
             for prefab in prefab_library.prefabs:
                 if ctrl_guid not in prefab.referenced_animator_controller_guids:
                     continue
@@ -1937,9 +1983,9 @@ def convert_animations(
                     if prefab_guid is None or prefab_guid not in instantiated_prefab_guids:
                         continue
                 if prefab.name not in prefabs_per_controller.setdefault(
-                    ctrl.name, []
+                    ctrl_key, []
                 ):
-                    prefabs_per_controller[ctrl.name].append(prefab.name)
+                    prefabs_per_controller[ctrl_key].append(prefab.name)
             # Per-instance override: even when the prefab template itself
             # doesn't reference this controller, an instance that swapped
             # to it should still pull the prefab into scope so the override
@@ -1948,14 +1994,15 @@ def convert_animations(
                 instance_overrides_by_ctrl_guid.get(ctrl_guid, set()),
             ):
                 if prefab_name not in prefabs_per_controller.setdefault(
-                    ctrl.name, [],
+                    ctrl_key, [],
                 ):
-                    prefabs_per_controller[ctrl.name].append(prefab_name)
+                    prefabs_per_controller[ctrl_key].append(prefab_name)
     default_scopes = [""]
 
     for ctrl in controllers:
-        scene_scopes = scenes_per_controller.get(ctrl.name, [])
-        prefab_scopes = prefabs_per_controller.get(ctrl.name, [])
+        ctrl_key = ctrl_display[id(ctrl)]
+        scene_scopes = scenes_per_controller.get(ctrl_key, [])
+        prefab_scopes = prefabs_per_controller.get(ctrl_key, [])
         # Prefab scopes win when present (5.9): the controller belongs to a
         # prefab template, and the runtime requires the script from
         # ``ReplicatedStorage.Templates.<Prefab>``. Scene scoping remains for
@@ -1967,8 +2014,8 @@ def convert_animations(
         else:
             scopes = default_scopes
 
-        scene_match = ctrl.name in scenes_per_controller
-        prefab_match = ctrl.name in prefabs_per_controller
+        scene_match = ctrl_key in scenes_per_controller
+        prefab_match = ctrl_key in prefabs_per_controller
         # Passing parsed_scenes is itself the request for scope-restricted
         # output. Activate filtering whenever the caller supplied scenes,
         # even when none of them reference any controller and none
@@ -1980,7 +2027,7 @@ def convert_animations(
             # Scene filtering active and this controller is unreferenced
             # by any parsed scene OR any instantiated prefab — skip, log
             # as routing.
-            result.routing.setdefault(ctrl.name, {})["__controller__"] = {
+            result.routing.setdefault(ctrl_key, {})["__controller__"] = {
                 "target": "skipped",
                 "reason": "not referenced by any parsed scene",
             }
@@ -2004,24 +2051,60 @@ def convert_animations(
         if not ctrl_clips:
             continue
 
-        # Partition the controller's clips by routing target.
+        # Partition the controller's clips by routing target. Disambiguate
+        # clip names within each partition: two distinct clips that share
+        # a Unity-given name would otherwise collide in per_clip_routing,
+        # in inline-tween script names, and (for humanoid clips) in the
+        # animator_runtime keyframes dict — silently dropping all but
+        # the last entry. The collision is logged as UNCONVERTED so the
+        # user sees it; the affected entries get an 8-char source-path
+        # hash suffix so the data survives.
         humanoid_clips: list[AnimClip] = []
         transform_only_clips: list[AnimClip] = []
-        per_clip_routing: dict[str, dict[str, str]] = {}
         for clip in ctrl_clips:
             if clip.is_transform_only:
                 transform_only_clips.append(clip)
-                per_clip_routing[clip.name] = {
-                    "target": "inline_tween",
-                    "reason": "non-humanoid transform-only curves",
-                }
             else:
                 humanoid_clips.append(clip)
-                per_clip_routing[clip.name] = {
-                    "target": "animator_runtime",
-                    "reason": "humanoid bone targets or empty curve set",
-                }
-        result.routing[ctrl.name] = per_clip_routing
+
+        humanoid_display = _disambiguate_by_source(humanoid_clips, label="clip")
+        transform_display = _disambiguate_by_source(transform_only_clips, label="clip")
+
+        for clip in humanoid_clips:
+            disp = humanoid_display[id(clip)]
+            if disp != clip.name:
+                result.unconverted.append({
+                    "category": "animation_clip",
+                    "item": f"{ctrl_key}/{clip.name}",
+                    "reason": (
+                        f"duplicate clip name within controller — "
+                        f"emitted as '{disp}' to avoid collision"
+                    ),
+                })
+        for clip in transform_only_clips:
+            disp = transform_display[id(clip)]
+            if disp != clip.name:
+                result.unconverted.append({
+                    "category": "animation_clip",
+                    "item": f"{ctrl_key}/{clip.name}",
+                    "reason": (
+                        f"duplicate clip name within controller — "
+                        f"emitted as '{disp}' to avoid collision"
+                    ),
+                })
+
+        per_clip_routing: dict[str, dict[str, str]] = {}
+        for clip in transform_only_clips:
+            per_clip_routing[transform_display[id(clip)]] = {
+                "target": "inline_tween",
+                "reason": "non-humanoid transform-only curves",
+            }
+        for clip in humanoid_clips:
+            per_clip_routing[humanoid_display[id(clip)]] = {
+                "target": "animator_runtime",
+                "reason": "humanoid bone targets or empty curve set",
+            }
+        result.routing[ctrl_key] = per_clip_routing
 
         # Emit per (scene, controller) pair.
         for scope in scopes:
@@ -2031,7 +2114,7 @@ def convert_animations(
             # has transitions — one script per scope.
             has_transitions = any(s.transitions for s in ctrl.states)
             if humanoid_clips and has_transitions and len(ctrl.states) >= 2:
-                script_name = f"Anim_{prefix}{ctrl.name}_StateMachine"
+                script_name = f"Anim_{prefix}{ctrl_key}_StateMachine"
                 luau_source = generate_state_machine_script(
                     controller=ctrl,
                     clips_by_guid={g: c for g, c in clips_by_guid.items() if not c.is_transform_only},
@@ -2044,7 +2127,8 @@ def convert_animations(
             # regardless of state-machine presence — these never go
             # through animator_runtime.
             for clip in transform_only_clips:
-                script_name = f"Anim_{prefix}{ctrl.name}_{clip.name}"
+                clip_disp = transform_display[id(clip)]
+                script_name = f"Anim_{prefix}{ctrl_key}_{clip_disp}"
                 luau_source = generate_tween_script(
                     clip=clip,
                     game_object_name=ctrl.name,
@@ -2059,10 +2143,11 @@ def convert_animations(
             if humanoid_clips:
                 controller_data = export_controller_json(ctrl, clip_name_by_guid)
                 keyframes: dict[str, Any] = {
-                    clip.name: export_clip_keyframes(clip) for clip in humanoid_clips
+                    humanoid_display[id(clip)]: export_clip_keyframes(clip)
+                    for clip in humanoid_clips
                 }
                 combined = {"controller": controller_data, "keyframes": keyframes}
-                module_name = f"AnimationData_{prefix}{ctrl.name}"
+                module_name = f"AnimationData_{prefix}{ctrl_key}"
                 json_str = json.dumps(combined, indent=2)
                 module_source = (
                     f"-- Auto-generated animation data for {module_name}\n"
@@ -2083,8 +2168,8 @@ def convert_animations(
     if any_scene_has_refs or parsed_scenes is not None:
         accepted_names = {
             ctrl.name for ctrl in controllers
-            if ctrl.name in scenes_per_controller
-            or ctrl.name in prefabs_per_controller
+            if ctrl_display[id(ctrl)] in scenes_per_controller
+            or ctrl_display[id(ctrl)] in prefabs_per_controller
         }
         any_scene_refs: set[str] = set()
         for scene in parsed_scenes or ():
@@ -2122,18 +2207,29 @@ def convert_animations(
                 if clip_path:
                     referenced_clips.add(str(clip_path.resolve()))
 
-    for clip in clips:
-        if not clip.source_path:
-            continue
-        if str(clip.source_path.resolve()) in referenced_clips:
-            continue
-        if not clip.curves:
-            continue
-        script_name = f"Anim_{clip.name}"
+    orphan_clips: list[AnimClip] = [
+        clip for clip in clips
+        if clip.source_path
+        and str(clip.source_path.resolve()) not in referenced_clips
+        and clip.curves
+    ]
+    orphan_display = _disambiguate_by_source(orphan_clips, label="orphan")
+    for clip in orphan_clips:
+        disp = orphan_display[id(clip)]
+        if disp != clip.name:
+            result.unconverted.append({
+                "category": "animation_clip",
+                "item": f"__orphans__/{clip.name}",
+                "reason": (
+                    f"duplicate orphan clip name — emitted as "
+                    f"'{disp}' to avoid collision"
+                ),
+            })
+        script_name = f"Anim_{disp}"
         luau_source = generate_tween_script(clip=clip)
         if luau_source:
             result.generated_scripts.append((script_name, luau_source))
-            result.routing.setdefault("__orphans__", {})[clip.name] = {
+            result.routing.setdefault("__orphans__", {})[disp] = {
                 "target": "inline_tween",
                 "reason": "no controller references this clip",
             }
