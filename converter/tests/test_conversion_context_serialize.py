@@ -15,15 +15,7 @@ from pathlib import Path
 
 import json
 
-import pytest
-
 from core.conversion_context import ConversionContext
-
-# `_SENSITIVE_FIELDS` is annotated as a tuple at module load but `dataclass`
-# treats it as a regular field because there's no `ClassVar` marker. After a
-# JSON roundtrip the tuple becomes a list. This is a known wart, not a
-# correctness regression — exclude it from field-by-field comparison.
-_NON_DATA_FIELDS = {"_SENSITIVE_FIELDS"}
 
 
 def _populated_ctx() -> ConversionContext:
@@ -79,8 +71,6 @@ class TestRoundTrip:
 
         # Every data field survives the round trip.
         for fname in original.__dataclass_fields__:
-            if fname in _NON_DATA_FIELDS:
-                continue
             assert getattr(loaded, fname) == getattr(original, fname), (
                 f"field {fname!r} mismatch after load: "
                 f"{getattr(original, fname)!r} -> {getattr(loaded, fname)!r}"
@@ -145,17 +135,32 @@ class TestSanitizedSave:
         assert data["warnings"] == original.warnings
         assert data["scenes_metadata"] == original.scenes_metadata
 
-    @pytest.mark.xfail(
-        reason="save_sanitized adds a `_sanitized` marker that load() rejects "
-        "with TypeError. Fix is a one-line change in load() to drop unknown keys, "
-        "but it's out of scope for the test-safety-net PR. See PR thread.",
-        strict=True,
-    )
     def test_sanitized_file_can_be_loaded(self, tmp_path: Path) -> None:
-        """KNOWN BROKEN: load() can't handle files written by save_sanitized.
-        Pinned via xfail so when the production fix lands, this test starts
-        passing and pytest forces the xfail marker to be removed."""
+        """A redacted file must be re-loadable so users can inspect it
+        and so an automated pipeline can resume from a sanitized snapshot
+        (e.g. CI replaying a bug report attachment)."""
         original = _populated_ctx()
         out = tmp_path / "redacted.json"
         original.save_sanitized(out)
-        ConversionContext.load(out)  # currently raises TypeError
+        loaded = ConversionContext.load(out)
+        # Sensitive fields are blanked but the load itself succeeds
+        assert loaded.universe_id is None
+        assert loaded.uploaded_assets == {}
+        # Non-sensitive fields survive
+        assert loaded.unity_project_path == original.unity_project_path
+        assert loaded.completed_phases == original.completed_phases
+
+    def test_load_drops_unknown_keys(self, tmp_path: Path) -> None:
+        """Files written by older versions, hand-edited files, or future
+        versions with extra keys must still load — the unknown keys get
+        dropped silently rather than raising TypeError."""
+        ctx = ConversionContext(unity_project_path="/x")
+        ctx.save(tmp_path / "ctx.json")
+        # Inject a forward-compat field
+        data = json.loads((tmp_path / "ctx.json").read_text())
+        data["future_field_not_yet_added"] = {"speculative": True}
+        (tmp_path / "ctx.json").write_text(json.dumps(data))
+
+        loaded = ConversionContext.load(tmp_path / "ctx.json")
+        assert loaded.unity_project_path == "/x"
+        assert not hasattr(loaded, "future_field_not_yet_added")

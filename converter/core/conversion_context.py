@@ -7,9 +7,9 @@ Serializable to JSON for pause/resume support.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields
 from pathlib import Path
-from typing import Any, TYPE_CHECKING, TypedDict
+from typing import Any, ClassVar, TYPE_CHECKING, TypedDict
 
 if TYPE_CHECKING:
     from converter.storage_classifier import StoragePlan
@@ -129,8 +129,9 @@ class ConversionContext:
     # Fields that reveal Roblox creator identity, universe/place ownership,
     # or uploaded asset URLs — anything that should be stripped before
     # sharing a conversion_context.json outside the repo (bug reports,
-    # gists, forums, etc.).
-    _SENSITIVE_FIELDS: "tuple[str, ...]" = (
+    # gists, forums, etc.). ClassVar prevents this constant from being
+    # treated as a dataclass field by ``asdict()`` and ``cls(**data)``.
+    _SENSITIVE_FIELDS: ClassVar[tuple[str, ...]] = (
         "universe_id",
         "place_id",
         "experience_name",
@@ -167,5 +168,15 @@ class ConversionContext:
 
     @classmethod
     def load(cls, path: Path) -> ConversionContext:
+        """Reconstruct a ConversionContext from a JSON file written by
+        ``save()`` or ``save_sanitized()``.
+
+        Drops keys that aren't dataclass fields (e.g. the ``_sanitized``
+        marker added by ``save_sanitized``, or pre-ClassVar files where
+        ``_SENSITIVE_FIELDS`` was serialized) so users can load redacted
+        bug-report attachments without manual JSON surgery.
+        """
         data = json.loads(path.read_text(encoding="utf-8"))
-        return cls(**data)
+        known = {f.name for f in fields(cls)}
+        cleaned = {k: v for k, v in data.items() if k in known}
+        return cls(**cleaned)
