@@ -23,6 +23,15 @@ import logging
 import re
 from core.roblox_types import RbxScript
 
+# Re-export project-specific patches that used to live here. Tests and any
+# external callers can keep importing from this module unchanged.
+from converter.script_coherence_packs import (  # noqa: F401  (re-exports)
+    _add_pickup_remote_listener,
+    _convert_pickup_to_remote_event,
+    _fix_pickup_visual_target,
+    _inject_fps_rifle_system,
+)
+
 log = logging.getLogger(__name__)
 
 # APIs that ONLY work on the client — scripts using these must be LocalScripts.
@@ -327,15 +336,12 @@ def fix_require_classifications(scripts: list[RbxScript]) -> int:
     # Pass 12: Wire SetAttribute/GetAttributeChangedSignal for inter-script communication.
     fixes += _wire_attribute_listeners(scripts)
 
-    # Pass 14: Inject working FPS rifle pickup system.
-    fixes += _inject_fps_rifle_system(scripts)
-
-    # Pass 15: Convert Pickup SetAttribute to RemoteEvent FireClient.
-    # Server→client attribute changes don't trigger GetAttributeChangedSignal.
-    fixes += _convert_pickup_to_remote_event(scripts)
-
-    # Pass 16: Add RemoteEvent OnClientEvent listener for pickups in Player scripts.
-    fixes += _add_pickup_remote_listener(scripts)
+    # Project-specific patch packs (rifle pickup, etc.) live in
+    # script_coherence_packs.py. Each pack opts in via its own detect()
+    # so non-FPS projects (Gamekit3D, BoatAttack, etc.) don't have FPS
+    # rifle code injected into their scripts.
+    from converter.script_coherence_packs import run_packs
+    fixes += run_packs(scripts)
 
     # Pass 17: Remove require(Player) from scripts that reference it —
     # Player is now a LocalScript, not in ReplicatedStorage.
@@ -360,16 +366,6 @@ def fix_require_classifications(scripts: list[RbxScript]) -> int:
     # Without this, rotating turrets can never engage targets whose
     # initial-contact angle was outside the engagement cone.
     fixes += _add_trigger_stay_polling(scripts)
-
-    # Pass 21: Make Pickup-style rotate+bob scripts work when the visible
-    # entity is a child Model rather than a direct Part. Unity's
-    # ``transform.Rotate`` on the script's GameObject just-works because
-    # all children inherit the transform; in Roblox, the AI binds to the
-    # first BasePart child via FindFirstChildWhichIsA, which often picks
-    # the invisible trigger collider (Transparency=1) and animates that
-    # instead of the visible Model. Patch: rewrite the script to find the
-    # visual child Model (or non-trigger Part) and use ``PivotTo``.
-    fixes += _fix_pickup_visual_target(scripts)
 
     return fixes
 
@@ -1043,167 +1039,6 @@ def _fix_clone_visibility(scripts: list[RbxScript]) -> int:
     return fixes
 
 
-def _inject_fps_rifle_system(scripts: list[RbxScript]) -> int:
-    """Inject complete FPS rifle pickup system into Player scripts.
-
-    Replaces the AI-generated GetRifle with a working version that:
-    1. Finds riflePrefab in workspace
-    2. Clones, scales, makes visible, welds sub-parts
-    3. Parents to workspace (not character) with anchored parts
-    4. Updates position every frame in RenderStepped to follow camera
-    5. Adds client-side Touched detection on character parts
-
-    Also adds _fpsRifle variables and RenderStepped rifle update.
-    """
-    fixes = 0
-    for s in scripts:
-        if 'GetRifle' not in s.source:
-            continue
-        if '-- _FPS_RIFLE_SYSTEM' in s.source:
-            continue
-
-        original = s.source
-
-        # 1. Add _fpsRifle variables
-        s.source = s.source.replace(
-            'local gotWeapon = false',
-            'local gotWeapon = false\nlocal _fpsRifle = nil  -- _FPS_RIFLE_SYSTEM\nlocal _fpsRiflePrimary = nil',
-        )
-
-        # 2. Replace GetRifle function body
-        m = re.search(
-            r'(GetRifle = function\(\))(.*?)(\n\s*gotWeapon = true)',
-            s.source, re.DOTALL,
-        )
-        if m:
-            new_rifle = (
-                'GetRifle = function()\n'
-                '    if gotWeapon then return end\n'
-                '    local rp = workspace:FindFirstChild("riflePrefab", true)\n'
-                '        or workspace:FindFirstChild("RiflePrefab", true)\n'
-                '    if not rp then return end\n'
-                '    local rifle = rp:Clone()\n'
-                '    if rifle:IsA("Model") then rifle:ScaleTo(0.15) end\n'
-                '    local prim = rifle:FindFirstChildWhichIsA("BasePart")\n'
-                '    if not prim then rifle:Destroy() return end\n'
-                '    for _, p in rifle:GetDescendants() do\n'
-                '        if p:IsA("BasePart") then\n'
-                '            p.Transparency = 0\n'
-                '            p.CanCollide = false\n'
-                '            p.Anchored = true\n'
-                '            if p ~= prim then\n'
-                '                local w = Instance.new("WeldConstraint")\n'
-                '                w.Part0 = p; w.Part1 = prim; w.Parent = p\n'
-                '            end\n'
-                '        end\n'
-                '    end\n'
-                '    rifle:PivotTo(workspace.CurrentCamera.CFrame * CFrame.new(0.5, -0.5, -3))\n'
-                '    rifle.Parent = workspace\n'
-                '    _fpsRifle = rifle\n'
-                '    _fpsRiflePrimary = prim\n'
-            )
-            s.source = s.source[:m.start()] + new_rifle + s.source[m.start(3):]
-
-        # 3. Add rifle update to RenderStepped
-        if 'RunService.RenderStepped:Connect' in s.source:
-            s.source = s.source.replace(
-                'RunService.RenderStepped:Connect(function(dt)',
-                'RunService.RenderStepped:Connect(function(dt)\n'
-                '    if _fpsRifle and _fpsRiflePrimary and _fpsRiflePrimary.Parent then\n'
-                '        _fpsRifle:PivotTo(workspace.CurrentCamera.CFrame * CFrame.new(0.5, -0.5, -3))\n'
-                '    end',
-            )
-
-        # 4. Add client-side Touched pickup detection before the return
-        touched_code = (
-            '\n-- Client-side pickup detection\n'
-            'if character then\n'
-            '    for _, part in character:GetChildren() do\n'
-            '        if part:IsA("BasePart") then\n'
-            '            part.Touched:Connect(function(other)\n'
-            '                local pm = other:FindFirstAncestorOfClass("Model")\n'
-            '                if pm and (pm.Name:lower():find("pickup") or pm:FindFirstChild("Pickup")) then\n'
-            '                    local sc = pm:FindFirstChild("Pickup") or pm:FindFirstChildWhichIsA("Script")\n'
-            '                    local iname = (sc and sc:GetAttribute("itemName"))\n'
-            '                        or pm:GetAttribute("itemName") or ""\n'
-            '                    if iname == "" and pm.Name:lower():find("rifle") then iname = "Rifle" end\n'
-            '                    if iname == "" and pm.Name:lower():find("key") then iname = "Key" end\n'
-            '                    if iname == "" and pm.Name:lower():find("ammo") then iname = "Ammo" end\n'
-            '                    if iname == "" and (pm.Name:lower():find("health") or pm.Name:lower():find("hp")) then iname = "Health" end\n'
-            '                    if iname ~= "" then getItem(iname); pm:Destroy() end\n'
-            '                end\n'
-            '            end)\n'
-            '        end\n'
-            '    end\n'
-            'end\n'
-        )
-        return_m = re.search(r'^return\b', s.source, re.MULTILINE)
-        if return_m:
-            s.source = s.source[:return_m.start()] + touched_code + s.source[return_m.start():]
-        else:
-            # LocalScript — no return, append at end
-            s.source = s.source.rstrip() + '\n' + touched_code
-
-        if s.source != original:
-            fixes += 1
-            log.info("  Injected FPS rifle system in '%s'", s.name)
-
-    return fixes
-
-
-def _convert_pickup_to_remote_event(scripts: list[RbxScript]) -> int:
-    """Convert Pickup scripts from SetAttribute to RemoteEvent FireClient.
-
-    Server-side SetAttribute doesn't trigger client-side GetAttributeChangedSignal.
-    Use a RemoteEvent instead for server→client pickup communication.
-    """
-    fixes = 0
-    for s in scripts:
-        if s.name != 'Pickup':
-            continue
-        for attr_name in ['PickupItem', 'GetItem']:
-            old = f'target:SetAttribute("{attr_name}", itemName)'
-            log.info("  Checking Pickup for: %s → found=%s", attr_name, old in s.source)
-            if old in s.source:
-                new = (
-                    'local _pe = game:GetService("ReplicatedStorage"):FindFirstChild("PickupItemEvent")\n'
-                    '\t\tif _pe then\n'
-                    '\t\t\tlocal _pl = game.Players:GetPlayerFromCharacter(target)\n'
-                    '\t\t\tif _pl then _pe:FireClient(_pl, itemName) end\n'
-                    '\t\tend'
-                )
-                s.source = s.source.replace(old, new)
-                fixes += 1
-                log.info("  Converted Pickup SetAttribute to RemoteEvent FireClient")
-    return fixes
-
-
-def _add_pickup_remote_listener(scripts: list[RbxScript]) -> int:
-    """Add OnClientEvent listener for PickupItemEvent in Player scripts."""
-    fixes = 0
-    for s in scripts:
-        if 'GetItem' not in s.source or 'GetRifle' not in s.source:
-            continue
-        if 'PickupItemEvent' in s.source:
-            continue
-        listener = (
-            '\n-- Pickup via RemoteEvent (server fires when player touches pickup)\n'
-            'local _pickupEvt = game:GetService("ReplicatedStorage"):WaitForChild("PickupItemEvent", 5)\n'
-            'if _pickupEvt then\n'
-            '    _pickupEvt.OnClientEvent:Connect(function(itemName)\n'
-            '        if itemName and itemName ~= "" then getItem(itemName) end\n'
-            '    end)\n'
-            'end\n'
-        )
-        return_m = re.search(r'^return\b', s.source, re.MULTILINE)
-        if return_m:
-            s.source = s.source[:return_m.start()] + listener + s.source[return_m.start():]
-        else:
-            s.source = s.source.rstrip() + '\n' + listener
-        fixes += 1
-        log.info("  Added PickupItemEvent OnClientEvent listener in '%s'", s.name)
-    return fixes
-
 
 def _disable_default_controls_in_fps_scripts(scripts: list[RbxScript]) -> int:
     """Disable Roblox's default PlayerModule controls in FPS-style scripts.
@@ -1635,134 +1470,4 @@ def _add_trigger_stay_polling(scripts: list[RbxScript]) -> int:
     return fixes
 
 
-_PICKUP_REPLACEMENT = """local RunService = game:GetService("RunService")
-local Debris = game:GetService("Debris")
 
-local container = script.Parent
-
--- Find the visible target. Prefer Models (e.g. Rifle, Battery) over Parts;
--- fall back to opaque Parts; last resort any Part. The Pickup container
--- typically has invisible Trigger Parts (Transparency=1) sitting alongside
--- the visible mesh content — the visual target is what should bob and rotate.
-local function findVisualTarget(parent)
-\tfor _, c in ipairs(parent:GetChildren()) do
-\t\tif c:IsA("Model") and c.Name ~= "MinimapIcon" then return c end
-\tend
-\tfor _, c in ipairs(parent:GetChildren()) do
-\t\tif c:IsA("BasePart") and c.Transparency < 1 then return c end
-\tend
-\tfor _, c in ipairs(parent:GetChildren()) do
-\t\tif c:IsA("BasePart") then return c end
-\tend
-\treturn nil
-end
-
-local function findTriggerPart(parent)
-\tlocal d = parent:FindFirstChild("PickupTouchDetector")
-\tif d and d:IsA("BasePart") then return d end
-\tlocal c = parent:FindFirstChild("Collider")
-\tif c and c:IsA("BasePart") then return c end
-\tfor _, x in ipairs(parent:GetChildren()) do
-\t\tif x:IsA("BasePart") and x.Transparency >= 1 then return x end
-\tend
-\treturn nil
-end
-
-local target = findVisualTarget(container)
-local trigger = findTriggerPart(container)
--- itemName is serialized on either the script (post-coherence) or the
--- container Model (Unity MonoBehaviour fields land on the parent Part/Model).
-local itemName = script:GetAttribute("itemName")
-\tor (container and container:GetAttribute("itemName"))
-\tor ""
-local rotationSpeed = 100
-local source = container:FindFirstChildWhichIsA("Sound")
-
-if not target then return end
-
-local function getPivot()
-\tif target:IsA("Model") then return target:GetPivot() end
-\treturn target.CFrame
-end
-local function setPivot(cf)
-\tif target:IsA("Model") then target:PivotTo(cf) else target.CFrame = cf end
-end
-
--- Models need a PrimaryPart for PivotTo to work consistently.
-if target:IsA("Model") and not target.PrimaryPart then
-\tlocal p = target:FindFirstChildWhichIsA("BasePart")
-\tif p then target.PrimaryPart = p end
-end
-
-local origin = getPivot().Position
-local upPos = origin
-local downPos = origin - Vector3.new(0, 0.5, 0)
-
-local function moveDown()
-\twhile target and target.Parent do
-\t\tif getPivot().Position.Y <= downPos.Y + 0.05 then break end
-\t\tlocal dt = RunService.Heartbeat:Wait()
-\t\t-- Re-fetch pivot AFTER the wait so we don't clobber rotation
-\t\t-- updates applied by the concurrent Heartbeat rotator below.
-\t\tsetPivot(getPivot() + Vector3.new(0, -0.5 * dt, 0))
-\tend
-end
-local function moveUp()
-\twhile target and target.Parent do
-\t\tif getPivot().Position.Y >= upPos.Y - 0.05 then break end
-\t\tlocal dt = RunService.Heartbeat:Wait()
-\t\tsetPivot(getPivot() + Vector3.new(0, 0.5 * dt, 0))
-\tend
-end
-
-task.spawn(function()
-\twhile target and target.Parent do moveDown(); moveUp() end
-end)
-
-RunService.Heartbeat:Connect(function(dt)
-\tif target and target.Parent then
-\t\tsetPivot(getPivot() * CFrame.Angles(0, math.rad(rotationSpeed) * dt, 0))
-\tend
-end)
-
-local touchPart = trigger or (target:IsA("BasePart") and target or target:FindFirstChildWhichIsA("BasePart"))
-if touchPart then
-\ttouchPart.Touched:Connect(function(otherPart)
-\t\tlocal character = otherPart:FindFirstAncestorOfClass("Model")
-\t\tif character and game:GetService("Players"):GetPlayerFromCharacter(character) then
-\t\t\tcharacter:SetAttribute("GetItem", itemName)
-\t\t\tif source then source:Play() end
-\t\t\tDebris:AddItem(container, 0)
-\t\tend
-\tend)
-end
-"""
-
-
-def _fix_pickup_visual_target(scripts: list[RbxScript]) -> int:
-    """Replace Pickup.luau bodies with Model-aware rotate+bob+touch logic.
-
-    Detection: script name ``Pickup`` (Unity Pickup.cs convention) AND the
-    body contains the AI-emitted ``rotationSpeed`` + ``moveDown`` / ``bobLoop``
-    pattern bound to ``script.Parent``. The replacement is structurally the
-    same Unity behavior (downward then upward bob + Y rotation + Touched
-    pickup) but routes through ``PivotTo`` for Models so a child Rifle /
-    Battery Model is what visually animates, not the invisible trigger Part.
-    """
-    fixes = 0
-    for s in scripts:
-        if s.name != "Pickup":
-            continue
-        # Anchor on tokens specific to the Unity Pickup.cs translation
-        # so we don't replace unrelated scripts that happen to share a name.
-        if not (
-            "rotationSpeed" in s.source
-            and ("moveDown" in s.source or "MoveDown" in s.source)
-            and "Touched" in s.source
-            and "GetItem" in s.source
-        ):
-            continue
-        s.source = _PICKUP_REPLACEMENT
-        fixes += 1
-        log.info("  Rewired Pickup '%s' to Model-aware rotate+bob", s.name)
-    return fixes
