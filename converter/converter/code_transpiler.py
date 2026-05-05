@@ -1315,10 +1315,52 @@ Lifecycle:
 - OnDestroy → `script.Destroying:Connect(function() ... end)` or Maid pattern
 - OnEnable/OnDisable → manual enable/disable via attributes
 - OnCollisionEnter/OnTriggerEnter → `part.Touched:Connect(function(otherPart) ... end)`
-  **IMPORTANT — Model trigger parts**: `.Touched` only works on BasePart instances, NOT Models. When `script.Parent` is a Model that mixes visible mesh Parts with an invisible trigger zone (Transparency=1, common Unity pattern — Collider/Trigger/Detector child holding the proximity sphere alongside visible MeshParts), `:FindFirstChildWhichIsA("BasePart")` returns the WRONG one — typically the trigger zone because it's listed first in the children. Use one of these instead:
-  - Prefer a named trigger Part: `local trigger = model:FindFirstChild("Collider") or model:FindFirstChild("Trigger") or model:FindFirstChild("PickupTouchDetector")`
-  - For visible mesh interaction (touch a wall, pick up a coin), prefer the first NON-trigger Part: `for _, p in ipairs(model:GetChildren()) do if p:IsA("BasePart") and p.Transparency < 1 then trigger = p; break end end`
-  - For movement (rotate, lerp, follow path), use `model:PivotTo(model:GetPivot() * delta)` — do NOT pick a single child Part and move it (siblings stay where they are).
+  **IMPORTANT — Model trigger parts**: `.Touched` only works on BasePart instances, NOT Models. When `script.Parent` is a Model that mixes visible mesh Parts with an invisible trigger zone (Transparency=1, common Unity pattern — Collider/Trigger/Detector child holding the proximity sphere alongside visible MeshParts), `:FindFirstChildWhichIsA("BasePart")` returns the WRONG one — typically the trigger zone because it's listed first in the children. Emit a tiered finder helper at the top of the script and use that:
+```lua
+-- Tier 1: a Part the prefab author NAMED as the trigger. Common Unity
+-- conventions across projects: Collider, Trigger, TriggerZone, Detector,
+-- Sensor, Hitbox, Range, ProximityVolume, PickupTouchDetector. Names
+-- vary per project — don't assume any single one.
+local TRIGGER_NAMES = {"Collider", "Trigger", "TriggerZone", "Detector",
+    "Sensor", "Hitbox", "Range", "ProximityVolume", "PickupTouchDetector"}
+local function findTriggerPart(parent)
+    for _, n in ipairs(TRIGGER_NAMES) do
+        local p = parent:FindFirstChild(n)
+        if p and p:IsA("BasePart") then return p end
+    end
+    -- Tier 2: any invisible BasePart child (no mesh, fully transparent).
+    for _, c in ipairs(parent:GetChildren()) do
+        if c:IsA("BasePart") and c.Transparency >= 1 and not c:IsA("MeshPart") then
+            return c
+        end
+    end
+    return nil
+end
+local function findVisualTarget(parent)
+    -- Tier 1: child Model (Unity pickups often wrap visible meshes in a Model).
+    -- Skip MinimapIcon / UI Models that have no real geometry.
+    for _, c in ipairs(parent:GetChildren()) do
+        if c:IsA("Model") and c.Name ~= "MinimapIcon" and c:FindFirstChildWhichIsA("BasePart") then
+            return c
+        end
+    end
+    -- Tier 2: a MeshPart (mesh implies visual intent).
+    for _, c in ipairs(parent:GetChildren()) do
+        if c:IsA("MeshPart") then return c end
+    end
+    -- Tier 3: a non-trigger BasePart. ``Transparency < 1`` is an
+    -- imperfect proxy (Decal-only Parts can have Transparency=1, debug
+    -- colliders can be semi-transparent), but it's the best the runtime
+    -- can do without compile-time prefab info — and tiers 1 and 2 catch
+    -- the common cases first.
+    for _, c in ipairs(parent:GetChildren()) do
+        if c:IsA("BasePart") and c.Transparency < 1 then return c end
+    end
+    -- Tier 4: any BasePart, last resort.
+    return parent:FindFirstChildWhichIsA("BasePart")
+end
+```
+Then use `findTriggerPart(model)` for `OnTriggerEnter` Touched handlers and `findVisualTarget(model)` for animations / `transform.X` access. For movement (rotate, lerp, follow path), use `model:PivotTo(model:GetPivot() * delta)` on the whole Model — do NOT animate a single child Part (siblings stay where they are).
 
 Core:
 - `Debug.Log/LogWarning/LogError` → `print` / `warn`
@@ -1331,6 +1373,10 @@ Core:
 ### Model vs Part dispatch
 Unity's `transform.X` is one API regardless of whether the GameObject has a single mesh or a hierarchy. In Roblox, BasePart and Model have **different** APIs, so every `transform.X` translation needs to dispatch on `script.Parent:IsA("Model")`. Helper pattern at the top of the script:
 ```lua
+-- Capture container at script init. If the script may reparent itself
+-- at runtime (rare — only do this if the C# explicitly does
+-- ``transform.SetParent(...)`` on its own GameObject), inline
+-- ``script.Parent`` at each call site instead of capturing.
 local container = script.Parent
 -- Without a PrimaryPart, ``Model:PivotTo`` and ``:GetPivot`` use the
 -- model's bounding-box centre as the rotation pivot — which means

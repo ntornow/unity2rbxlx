@@ -92,24 +92,75 @@ class TestTriggerPartGuidance:
             "Without it the AI may revert to the naive lookup."
         )
 
-    def test_named_trigger_part_examples(self):
-        # The AI gets concrete names to try first. SimpleFPS uses
-        # 'Collider' (Turret) and 'PickupTouchDetector' (Pickup); other
-        # projects may use 'Trigger'. Don't assert exhaustive coverage —
-        # just that named-lookup is present.
-        for name in ('"Collider"', '"Trigger"', '"PickupTouchDetector"'):
+    def test_trigger_name_list_covers_common_unity_conventions(self):
+        # Unity prefab authors use a variety of names for the trigger
+        # GameObject. SimpleFPS specifically used "Collider" (Turret) and
+        # "PickupTouchDetector" (Pickup), but other projects ship with
+        # different names. Codex P2 review noted the original list was
+        # SimpleFPS-flavored; expanded to cover broader convention.
+        for name in (
+            '"Collider"', '"Trigger"', '"TriggerZone"', '"Detector"',
+            '"Sensor"', '"Hitbox"', '"Range"', '"ProximityVolume"',
+            '"PickupTouchDetector"',
+        ):
             assert name in _AI_SYSTEM_PROMPT, (
-                f"Named-trigger example {name} missing — AI loses the "
-                f"hint to prefer named lookup over first-BasePart."
+                f"Trigger name {name} missing from TRIGGER_NAMES list — "
+                f"AI may fail to find the trigger Part on prefabs that "
+                f"use this naming convention."
             )
 
-    def test_visible_filter_present(self):
-        # The 'first non-trigger Part' fallback uses Transparency<1 as
-        # the visible-vs-invisible heuristic. Imperfect but deterministic.
-        assert "Transparency < 1" in _AI_SYSTEM_PROMPT or \
-               "Transparency <" in _AI_SYSTEM_PROMPT, (
-            "Visible-Part filter lost — AI falls back to "
-            "FindFirstChildWhichIsA, which broke Pickup scripts."
+    def test_finder_helpers_taught_as_tiered_functions(self):
+        # The improved guidance emits ``findTriggerPart`` and
+        # ``findVisualTarget`` helpers with a tiered fallback rather
+        # than relying on ``Transparency < 1`` alone. Tier 1 (named
+        # lookup) catches the common case; tiers 2-4 degrade gracefully
+        # so non-converter-emitted prefabs still get a reasonable target.
+        assert "findTriggerPart" in _AI_SYSTEM_PROMPT, (
+            "Lost ``findTriggerPart`` helper definition — AI falls back "
+            "to inline lookups that the Pickup script bug originated from."
+        )
+        assert "findVisualTarget" in _AI_SYSTEM_PROMPT, (
+            "Lost ``findVisualTarget`` helper — animations would target "
+            "the trigger zone again."
+        )
+
+    def test_visual_target_prefers_models_then_meshparts_then_visible(self):
+        # The tiered finder must teach: Model child first (Unity
+        # pickups), then MeshPart (mesh implies visual), then
+        # Transparency<1 fallback. The exact order matters because
+        # tiers 1-2 catch the common cases without depending on the
+        # imperfect Transparency proxy.
+        assert ':IsA("Model")' in _AI_SYSTEM_PROMPT
+        assert ':IsA("MeshPart")' in _AI_SYSTEM_PROMPT
+        assert "Transparency < 1" in _AI_SYSTEM_PROMPT, (
+            "Visible-Part fallback lost. Tiers 1-2 cover most cases "
+            "but tier 3 is the only thing that handles plain Parts."
+        )
+        # Order check: Model tier should appear before Transparency
+        # tier in the prompt text. Brittle but cheap.
+        model_pos = _AI_SYSTEM_PROMPT.index(':IsA("Model") and c.Name ~= "MinimapIcon"')
+        transp_pos = _AI_SYSTEM_PROMPT.index("Transparency < 1")
+        assert model_pos < transp_pos, (
+            "Tiered finder reordered — Model preference must come "
+            "before the Transparency<1 fallback; otherwise we hit the "
+            "imperfect proxy first and skip the cleaner case."
+        )
+
+
+class TestReparentingNote:
+    """The dispatch helper captures ``script.Parent`` once at init.
+    That's correct for typical Unity scripts, but breaks if the script
+    reparents itself at runtime. Edge case but worth flagging — codex
+    P2 review noted the gap.
+    """
+
+    def test_reparenting_caveat_present(self):
+        # The note tells the AI when to inline ``script.Parent`` instead
+        # of capturing.
+        assert "reparent" in _AI_SYSTEM_PROMPT.lower(), (
+            "Lost the reparenting caveat — AI may emit captured "
+            "``container`` for self-reparenting scripts and silently "
+            "operate on the original parent forever."
         )
 
 
