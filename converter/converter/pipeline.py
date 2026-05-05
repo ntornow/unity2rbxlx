@@ -1908,8 +1908,7 @@ return table.concat(allData, "\\n")'''
                 from core.coordinate_system import unity_to_roblox_pos
                 # Use the terrain world offset (includes parent chain)
                 # computed during scene conversion, not just local position.
-                from converter.scene_converter import _terrain_world_offset
-                rpos = unity_to_roblox_pos(*_terrain_world_offset)
+                rpos = unity_to_roblox_pos(*self.state.rbx_place.terrain_world_offset)
                 # Encode terrain voxels into rbxlx binary format
                 try:
                     from roblox.terrain_encoder import encode_smooth_grid, encode_physics_grid

@@ -421,3 +421,8 @@ class RbxPlace:
     # SmoothGrid binary already provides the heightmap, so running a
     # FillBlock fallback would overwrite it with lower-fidelity voxels.
     headless_terrain_scripts: list[str] = field(default_factory=list)
+    # Terrain world position offset (computed by scene_converter from the
+    # parent chain, consumed by pipeline.write_output when encoding the
+    # SmoothGrid). Replaces a module-level global in scene_converter that
+    # was being read after convert_scene returned.
+    terrain_world_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)

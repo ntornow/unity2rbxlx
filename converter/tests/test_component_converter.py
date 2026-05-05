@@ -156,25 +156,23 @@ class TestMonoBehaviourAttributes:
 class TestSubMeshResolution:
     def test_resolve_sub_mesh_by_file_id(self):
         """fileID 4300000 → index 0, 4300002 → index 1, etc."""
-        from converter.scene_converter import _resolve_sub_mesh, _mesh_hierarchies
-        # Temporarily set mesh hierarchies
+        from converter.scene_converter import _resolve_sub_mesh
         import converter.scene_converter as sc
-        old = sc._mesh_hierarchies
-        sc._mesh_hierarchies = {
-            "Assets/Models/turret.fbx": [
-                {"name": "base", "meshId": "rbxassetid://100", "size": [1, 2, 1]},
-                {"name": "weapon", "meshId": "rbxassetid://200", "size": [0.5, 0.5, 1]},
-                {"name": "barrel", "meshId": "rbxassetid://300", "size": [0.2, 0.2, 0.8]},
-            ]
-        }
-        try:
-            from unittest.mock import MagicMock
-            mock_idx = MagicMock()
-            mock_idx.resolve.return_value = None
-            mock_idx.resolve_relative.return_value = "Assets/Models/turret.fbx"
+        from pathlib import Path
+        from unittest.mock import MagicMock
 
-            # Override resolve to return a path
-            from pathlib import Path
+        old_ctx = sc._current_ctx
+        sc._current_ctx = sc.SceneConversionContext(
+            mesh_hierarchies={
+                "Assets/Models/turret.fbx": [
+                    {"name": "base", "meshId": "rbxassetid://100", "size": [1, 2, 1]},
+                    {"name": "weapon", "meshId": "rbxassetid://200", "size": [0.5, 0.5, 1]},
+                    {"name": "barrel", "meshId": "rbxassetid://300", "size": [0.2, 0.2, 0.8]},
+                ]
+            },
+        )
+        try:
+            mock_idx = MagicMock()
             mock_idx.resolve.return_value = Path("Assets/Models/turret.fbx")
             mock_idx.resolve_relative.return_value = Path("Assets/Models/turret.fbx")
 
@@ -190,7 +188,7 @@ class TestSubMeshResolution:
             assert result2 is not None
             assert result2["name"] == "barrel"
         finally:
-            sc._mesh_hierarchies = old
+            sc._current_ctx = old_ctx
 
 
 class TestMaterialInference:
