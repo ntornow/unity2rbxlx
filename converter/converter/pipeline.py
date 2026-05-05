@@ -2635,6 +2635,15 @@ script.Disabled = true
             r'script\.Parent\.AssemblyLinearVelocity',
             r'local \w+ = script\.Parent\b',  # alias like `local part = script.Parent`
         ]
+        # Scripts that already gate on ``script.Parent:IsA(...)`` carry
+        # their own conditional binding (smart-binding animation scripts
+        # do this — see generate_tween_script's prefab_scoped path).
+        # The blanket BasePart guard would short-circuit a Model-targeted
+        # check before it ever runs, breaking the script's own logic.
+        _self_guard_patterns = (
+            re.compile(r'script\.Parent\s*:\s*IsA\s*\(\s*["\']Model["\']'),
+            re.compile(r'script\.Parent\s*:\s*IsA\s*\(\s*["\']BasePart["\']'),
+        )
         disabled_count = 0
         for s in list(self.state.rbx_place.scripts):
             if s.script_type == "ModuleScript":
@@ -2642,13 +2651,17 @@ script.Disabled = true
             needs_parent_part = any(
                 re.search(pat, s.source) for pat in _parent_part_patterns
             )
-            if needs_parent_part:
-                # Wrap script with a parent type check
-                guard = ('-- Guard: this script expects script.Parent to be a BasePart\n'
-                         'if not script.Parent:IsA("BasePart") then return end\n\n')
-                s.source = guard + s.source
-                disabled_count += 1
-                log.debug("[write_output]   Added parent guard to '%s'", s.name)
+            if not needs_parent_part:
+                continue
+            if any(p.search(s.source) for p in _self_guard_patterns):
+                # Self-guarded — let the script make its own decision.
+                continue
+            # Wrap script with a parent type check
+            guard = ('-- Guard: this script expects script.Parent to be a BasePart\n'
+                     'if not script.Parent:IsA("BasePart") then return end\n\n')
+            s.source = guard + s.source
+            disabled_count += 1
+            log.debug("[write_output]   Added parent guard to '%s'", s.name)
         if disabled_count:
             log.info("[write_output] Added BasePart parent guards to %d unbound scripts", disabled_count)
 
@@ -2691,6 +2704,21 @@ script.Disabled = true
         if result.unconverted:
             _carry_unconverted(self.state.animation_result, result.unconverted)
 
+        # Attach a copy of every prefab-scoped animation script under its
+        # template so cloning ``ReplicatedStorage.Templates.<Prefab>``
+        # carries the animation driver. Phase 5.9 baked the prefab name
+        # into the script_name (Anim_<Prefab>_<Ctrl>_<Clip>) so names
+        # dedupe across scene instances, but write_output left every
+        # generated script in the place's flat list — clones left them
+        # behind. We *copy* (not move): the flat-list version still
+        # drives prefabs that are scene-baked rather than runtime-cloned
+        # (``scene_converter._convert_prefab_instance`` expands those
+        # inline into ``workspace_parts`` without attaching a script).
+        # The script body uses smart binding (script.Parent if it's a
+        # part/model, else workspace search) so the same source works in
+        # both contexts without races between the two copies.
+        self._attach_prefab_scoped_animation_scripts_to_templates()
+
         # Persist a small manifest under packages/ — closes the packages
         # half of Phase 4.11's disk-rewrite deferred item.
         try:
@@ -2703,6 +2731,55 @@ script.Disabled = true
             "ReplicatedStorage.Templates (%d in manifest)",
             len(result.templates), result.manifest.get("total_templates", 0),
         )
+
+    def _attach_prefab_scoped_animation_scripts_to_templates(self) -> None:
+        """Attach copies of prefab-scoped animation scripts under their
+        templates without removing the originals from the flat list.
+
+        Reads ``animation_result.script_scopes`` (built when the controller
+        lives inside a PrefabTemplate). For every (script_name, template_name)
+        pair, if both the script and the template exist on the place,
+        deep-copy the script and append the copy to ``template.scripts``.
+        The original stays in ``rbx_place.scripts`` so prefabs that were
+        expanded inline by ``scene_converter`` still get a driver via
+        the same workspace lookup pattern they relied on before this
+        pass landed. Scripts that don't match any template (the prefab
+        was filtered out by ``serialized_field_refs``) stay in the flat
+        list only.
+        """
+        anim = self.state.animation_result
+        if anim is None or not getattr(anim, "script_scopes", None):
+            return
+
+        templates_by_name = {
+            t.name: t for t in self.state.rbx_place.replicated_templates
+        }
+        scripts_by_name = {
+            s.name: s for s in self.state.rbx_place.scripts
+        }
+
+        from copy import copy as _shallow_copy
+        attached = 0
+        for script_name, template_name in anim.script_scopes.items():
+            template = templates_by_name.get(template_name)
+            script = scripts_by_name.get(script_name)
+            if template is None or script is None:
+                continue
+            # Independent RbxScript so storage_classifier's parent_path
+            # mutation on the flat-list copy doesn't accidentally retag
+            # the template-attached copy. Source/name are shared (same
+            # smart-binding body works in both contexts).
+            template_copy = _shallow_copy(script)
+            template_copy.parent_path = None
+            template.scripts.append(template_copy)
+            attached += 1
+
+        if attached:
+            log.info(
+                "[write_output] Attached %d prefab-scoped animation "
+                "script(s) under ReplicatedStorage.Templates.<Prefab>",
+                attached,
+            )
 
     def _inject_runtime_modules(self) -> None:
         """Inject runtime library ModuleScripts when relevant features are detected.

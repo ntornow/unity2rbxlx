@@ -203,6 +203,163 @@ class TestReplicatedTemplatesField:
         assert isinstance(p.replicated_templates, list)
 
 
+class TestAttachPrefabScopedAnimationScripts:
+    """Phase 5.9 deep-fix: prefab-scoped animation scripts must reach the
+    template's ``scripts`` list (so cloning the template carries the
+    driver) without losing the flat-list copy that drives scene-baked
+    instances. The copy uses smart binding (script.Parent first, fall
+    back to workspace search) so a single source body works in both
+    contexts."""
+
+    def _make_pipeline(self, tmp_path):
+        """Build a Pipeline against a minimal Unity project layout, with
+        an empty RbxPlace allocated up front (write_output normally
+        creates this; we skip straight to the subphase under test)."""
+        from converter.pipeline import Pipeline
+        from core.roblox_types import RbxPlace
+        (tmp_path / "Assets").mkdir(parents=True, exist_ok=True)
+        pipeline = Pipeline(unity_project_path=tmp_path, output_dir=tmp_path / "out")
+        pipeline.state.rbx_place = RbxPlace()
+        return pipeline
+
+    def _make_animation_result(self, script_scopes):
+        """Animation result with the given prefab-scope mapping."""
+        from converter.animation_converter import AnimationConversionResult
+        return AnimationConversionResult(script_scopes=dict(script_scopes))
+
+    def test_attaches_copy_under_template_keeps_original(self, tmp_path):
+        """Script with a matching template gets a copy attached under
+        ``template.scripts``. The original stays in the flat list so
+        scene-baked prefab instances still get a driver."""
+        from core.roblox_types import RbxPart, RbxScript
+
+        pipeline = self._make_pipeline(tmp_path)
+        pipeline.state.animation_result = self._make_animation_result(
+            {"Anim_Vehicle_Wheel_Spin": "Vehicle"}
+        )
+        anim_script = RbxScript(
+            name="Anim_Vehicle_Wheel_Spin",
+            source="-- anim",
+            script_type="Script",
+            parent_path="ServerScriptService",
+        )
+        pipeline.state.rbx_place.scripts.append(anim_script)
+        template = RbxPart(name="Vehicle", class_name="Model")
+        pipeline.state.rbx_place.replicated_templates.append(template)
+
+        pipeline._attach_prefab_scoped_animation_scripts_to_templates()
+
+        # Original stays put — scene-baked path keeps its global driver.
+        assert anim_script in pipeline.state.rbx_place.scripts
+        assert anim_script.parent_path == "ServerScriptService"
+        # Template carries an independent copy (clone path).
+        assert len(template.scripts) == 1
+        attached = template.scripts[0]
+        assert attached is not anim_script, "template copy must be independent"
+        assert attached.name == anim_script.name
+        assert attached.source == anim_script.source
+        # The template copy's parent_path is cleared so storage_classifier
+        # / writer don't reroute it back to a top-level container.
+        assert attached.parent_path is None
+
+    def test_skips_when_template_missing(self, tmp_path):
+        """Script whose template was filtered out (e.g. by serialized_field_refs)
+        is left alone — no exception, no silent loss."""
+        from core.roblox_types import RbxScript
+
+        pipeline = self._make_pipeline(tmp_path)
+        pipeline.state.animation_result = self._make_animation_result(
+            {"Anim_Ghost_Ctrl_Clip": "Ghost"}
+        )
+        anim_script = RbxScript(
+            name="Anim_Ghost_Ctrl_Clip",
+            source="-- anim",
+            script_type="Script",
+            parent_path="ServerScriptService",
+        )
+        pipeline.state.rbx_place.scripts.append(anim_script)
+        # Note: no Ghost template registered.
+
+        pipeline._attach_prefab_scoped_animation_scripts_to_templates()
+
+        assert anim_script in pipeline.state.rbx_place.scripts
+        assert anim_script.parent_path == "ServerScriptService"
+
+    def test_unscoped_scripts_untouched(self, tmp_path):
+        """Empty script_scopes is a no-op — scene-scoped and project-wide
+        animation scripts don't leak into ``template.scripts``."""
+        from core.roblox_types import RbxPart, RbxScript
+
+        pipeline = self._make_pipeline(tmp_path)
+        pipeline.state.animation_result = self._make_animation_result({})
+        anim_script = RbxScript(
+            name="Anim_Level1_Ctrl_Clip",
+            source="-- anim",
+            script_type="Script",
+            parent_path="ServerScriptService",
+        )
+        pipeline.state.rbx_place.scripts.append(anim_script)
+        template = RbxPart(name="Vehicle", class_name="Model")
+        pipeline.state.rbx_place.replicated_templates.append(template)
+
+        pipeline._attach_prefab_scoped_animation_scripts_to_templates()
+
+        assert anim_script in pipeline.state.rbx_place.scripts
+        assert template.scripts == []
+
+    def test_no_animation_result_is_noop(self, tmp_path):
+        """Pipelines that never ran transpile_scripts have no
+        animation_result. The attach pass must tolerate that without
+        crashing."""
+        from core.roblox_types import RbxPart, RbxScript
+
+        pipeline = self._make_pipeline(tmp_path)
+        pipeline.state.animation_result = None
+        pipeline.state.rbx_place.replicated_templates.append(
+            RbxPart(name="Vehicle"),
+        )
+        pipeline.state.rbx_place.scripts.append(
+            RbxScript(name="x", source="", script_type="Script"),
+        )
+
+        pipeline._attach_prefab_scoped_animation_scripts_to_templates()  # must not raise
+
+    def test_self_guarded_script_skips_baseparts_guard(self, tmp_path):
+        """A smart-binding script that already self-guards via
+        ``script.Parent:IsA("Model")`` must not get the unconditional
+        BasePart guard prepended — that would short-circuit the
+        script's own conditional before it runs, breaking both the
+        flat-list and template-attached copies."""
+        from core.roblox_types import RbxPart, RbxScript
+
+        pipeline = self._make_pipeline(tmp_path)
+        smart_source = (
+            "if script.Parent and (script.Parent:IsA('Model') "
+            "or script.Parent:IsA('BasePart')) then\n"
+            "  local target = script.Parent:FindFirstChild('Vehicle', true)\n"
+            "else\n"
+            "  local target = workspace:FindFirstChild('Vehicle', true)\n"
+            "end\n"
+        )
+        anim_script = RbxScript(
+            name="Anim_Vehicle_Wheel_Spin",
+            source=smart_source,
+            script_type="Script",
+            parent_path="ServerScriptService",
+        )
+        pipeline.state.rbx_place.scripts.append(anim_script)
+        pipeline.state.rbx_place.workspace_parts.append(
+            RbxPart(name="Anchor", class_name="Part"),
+        )
+
+        pipeline._bind_scripts_to_parts()
+
+        assert "if not script.Parent:IsA(\"BasePart\") then return end" not in anim_script.source, (
+            "self-guarded script must not receive the BasePart-only guard; "
+            "full source:\n" + anim_script.source
+        )
+
+
 def _variant_template(name: str, source_prefab_guid: str | None = None):
     """Build a minimal variant-aware PrefabTemplate-like object for tests."""
     root = SimpleNamespace(
