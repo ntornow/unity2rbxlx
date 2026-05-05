@@ -17,6 +17,7 @@ from typing import Any
 
 import config
 
+from core.conversion_context import MeshHierarchyEntry
 from core.unity_types import (
     AssetManifest,
     ComponentData,
@@ -24,6 +25,7 @@ from core.unity_types import (
     ParsedScene,
     SceneNode,
 )
+from converter.material_mapper import MaterialMapping
 from core.roblox_types import (
     RbxCFrame,
     RbxCameraConfig,
@@ -172,8 +174,8 @@ class SceneConversionContext:
     # Inputs (set at convert_scene entry, read by helpers)
     mesh_native_sizes: dict[str, tuple[float, float, float]] = field(default_factory=dict)
     mesh_texture_ids: dict[str, str] = field(default_factory=dict)
-    mesh_hierarchies: dict[str, list[dict]] = field(default_factory=dict)
-    material_mappings: dict[str, Any] = field(default_factory=dict)
+    mesh_hierarchies: dict[str, list[MeshHierarchyEntry]] = field(default_factory=dict)
+    material_mappings: dict[str, MaterialMapping] = field(default_factory=dict)
     fbx_bounding_boxes: dict[str, tuple[float, float, float]] = field(default_factory=dict)
     scene_xform_fids: set[str] = field(default_factory=set)
 
