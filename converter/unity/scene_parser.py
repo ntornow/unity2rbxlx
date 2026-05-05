@@ -39,6 +39,7 @@ from unity.yaml_parser import (
     extract_quat,
     ref_file_id,
     ref_guid,
+    ordered_child_go_fids,
     parse_documents,
     doc_body,
     is_text_yaml,
@@ -194,17 +195,29 @@ def parse_scene(scene_path: str | Path) -> ParsedScene:
                 result.referenced_animator_controller_guids.add(ctrl_guid)
 
     # ------------------------------------------------------------------
-    # Pass 5: Wire parent/child hierarchy
-    # ------------------------------------------------------------------
+    # Pass 5: Wire parent/child hierarchy in Unity m_Children order
+    # (see ``ordered_child_go_fids`` in unity.yaml_parser for rationale).
     for node in result.all_nodes.values():
         if node.parent_file_id is None:
             result.roots.append(node)
-        else:
-            parent = result.all_nodes.get(node.parent_file_id)
-            if parent:
-                parent.children.append(node)
-            else:
-                result.roots.append(node)
+    for go_fid, node in result.all_nodes.items():
+        entry = go_fid_to_transform.get(go_fid)
+        if entry is None:
+            continue
+        _, xform = entry
+        seen: set[str] = set()
+        for cgo in ordered_child_go_fids(xform, xform_fid_to_go_fid):
+            child = result.all_nodes.get(cgo)
+            if child and child.parent_file_id == go_fid and cgo not in seen:
+                node.children.append(child)
+                seen.add(cgo)
+        # Stragglers — children whose fileID wasn't in m_Children but
+        # still claim this node as parent. Shouldn't happen for
+        # well-formed YAML; preserved for robustness.
+        for other_go, other in result.all_nodes.items():
+            if other.parent_file_id == go_fid and other_go not in seen:
+                node.children.append(other)
+                seen.add(other_go)
 
     # ------------------------------------------------------------------
     # Pass 6: Record PrefabInstance documents

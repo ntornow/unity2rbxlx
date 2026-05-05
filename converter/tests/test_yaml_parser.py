@@ -180,3 +180,72 @@ class TestIsTextYaml:
 
     def test_nonexistent(self, tmp_path):
         assert not is_text_yaml(tmp_path / "nope.unity")
+
+
+class TestOrderedChildGoFids:
+    """Walking ``m_Children`` in display order is the only way to keep
+    Unity's ``transform.GetChild(i)`` semantics intact when the YAML
+    document iteration order differs from authored order. SimpleFPS
+    Turret was the canonical reproducer: ``m_Children=[Base, Collider]``
+    in the prefab, but the YAML had Collider's GameObject defined first,
+    so the parser visited [Collider, Base] and ``getTBase = GetChild(0)``
+    returned the wrong sibling.
+    """
+
+    from unity.yaml_parser import ordered_child_go_fids
+
+    def test_returns_children_in_m_children_order(self):
+        from unity.yaml_parser import ordered_child_go_fids
+        # Two child Transforms, fileIDs 100 and 200.
+        # m_Children lists them as [200, 100] — i.e. the AUTHORED order
+        # is opposite the YAML-document order.
+        xform = {
+            "m_Children": [
+                {"fileID": 200},
+                {"fileID": 100},
+            ]
+        }
+        # xform_fid → go_fid mapping (each Transform belongs to one GO)
+        xform_to_go = {"100": "go_first", "200": "go_second"}
+        result = ordered_child_go_fids(xform, xform_to_go)
+        assert result == ["go_second", "go_first"]
+
+    def test_drops_dangling_references(self):
+        # An m_Children entry whose fileID doesn't resolve to a known
+        # GameObject must be skipped — not produce an empty string in
+        # the output (which would later look up nothing under that key
+        # and waste cycles or crash on .children.append(None)).
+        from unity.yaml_parser import ordered_child_go_fids
+        xform = {
+            "m_Children": [
+                {"fileID": 100},
+                {"fileID": 999},  # unknown
+                {"fileID": 200},
+            ]
+        }
+        xform_to_go = {"100": "go_a", "200": "go_b"}
+        result = ordered_child_go_fids(xform, xform_to_go)
+        assert result == ["go_a", "go_b"]
+
+    def test_empty_m_children_returns_empty(self):
+        from unity.yaml_parser import ordered_child_go_fids
+        assert ordered_child_go_fids({}, {}) == []
+        assert ordered_child_go_fids({"m_Children": []}, {}) == []
+        # m_Children present but all references are zero/null
+        assert ordered_child_go_fids(
+            {"m_Children": [{"fileID": 0}, {"fileID": 0}]},
+            {},
+        ) == []
+
+    def test_dedupes_repeated_fileids(self):
+        # Defensive: an authored prefab shouldn't list the same child
+        # twice, but if it did, the helper must not yield duplicates.
+        from unity.yaml_parser import ordered_child_go_fids
+        xform = {
+            "m_Children": [
+                {"fileID": 100},
+                {"fileID": 100},
+            ]
+        }
+        result = ordered_child_go_fids(xform, {"100": "go_a"})
+        assert result == ["go_a"]

@@ -1433,6 +1433,19 @@ def _process_components(
     rigidbody_props: dict[str, Any] = {}
     original_size = part.size  # Save for collider calculations
 
+    # Pre-scan: does ANY collider on this GameObject mark itself as a trigger?
+    # When yes, the trigger's "detection volume" semantics dominate even if a
+    # physical collider was emitted later in the YAML. Without this pre-scan,
+    # the policy is order-dependent: [physical, trigger] → CanCollide=False
+    # but [trigger, physical] → CanCollide=True (because the physical branch
+    # would re-flip it). Unity component order isn't guaranteed across prefab
+    # variants, so the conversion result needs to be order-independent.
+    node_has_trigger = any(
+        c.component_type in _COLLIDER_TYPES
+        and bool(int(c.properties.get("m_IsTrigger", 0)))
+        for c in node.components
+    )
+
     for comp in node.components:
         ct = comp.component_type
 
@@ -1457,10 +1470,37 @@ def _process_components(
             is_trigger = bool(int(comp.properties.get("m_IsTrigger", 0)))
             if is_trigger:
                 # Trigger colliders are detection zones — enable Touched events.
-                # Only disable collision if no physical (non-trigger) collider exists.
+                # When the same GameObject has BOTH a trigger and a physical
+                # collider (common Unity pattern: small body + larger
+                # proximity sphere), the trigger's behavior dominates so
+                # scripts using ``model:FindFirstChild("<NodeName>")`` reach
+                # the detection zone, not a wall. Drop physical-collide,
+                # grow Part size to the trigger's bounding box, and make it
+                # invisible. The physical collider's contribution is lost
+                # here — siblings (e.g. a separate Base MeshPart) usually
+                # carry the actual physical collision for the model.
                 part.can_query = True
-                if not getattr(part, '_has_physical_collider', False):
-                    part.can_collide = False
+                part.can_collide = False
+                trigger_size, _, trigger_offset = convert_collider(
+                    ct, comp.properties, original_size,
+                )
+                # Grow part size to encompass the trigger zone.
+                part.size = (
+                    max(part.size[0], trigger_size[0]),
+                    max(part.size[1], trigger_size[1]),
+                    max(part.size[2], trigger_size[2]),
+                )
+                # Round trigger shape inferred from Unity collider type.
+                if ct == "SphereCollider":
+                    part.shape = 0  # Ball
+                # Hide the trigger zone visually since it's a detection volume.
+                part.transparency = 1.0
+                # Apply center offset so the trigger sits at Unity's
+                # specified center, not the GameObject origin.
+                if trigger_offset != (0.0, 0.0, 0.0):
+                    part.cframe.x += trigger_offset[0]
+                    part.cframe.y += trigger_offset[1]
+                    part.cframe.z += trigger_offset[2]
             else:
                 # Apply each collider against the original size to avoid
                 # compounding when multiple colliders exist on one node.
@@ -1479,9 +1519,12 @@ def _process_components(
                         max(part.size[1], adjusted_size[1]),
                         max(part.size[2], adjusted_size[2]),
                     )
-                part.can_collide = can_collide
-                if can_collide:
-                    part._has_physical_collider = True
+                # Trigger semantics dominate when both kinds are on the
+                # same node — see ``node_has_trigger`` pre-scan above.
+                if not node_has_trigger:
+                    part.can_collide = can_collide
+                    if can_collide:
+                        part._has_physical_collider = True
                 # Apply collider center offset to part CFrame position.
                 # Skip for Y-up FBX meshes where Roblox bakes mesh positions.
                 if center_offset != (0.0, 0.0, 0.0):
@@ -4165,6 +4208,26 @@ def _fix_empty_mesh_parts(parts: list[RbxPart], _parent_model_part: "RbxPart | N
     MISSING_MESH_COLOR = (1.0, 0.0, 1.0)  # magenta — classic missing-texture marker
     DEFAULT_GRAY = (0.63, 0.63, 0.63)
     DEFAULT_SIZE = (1.0, 1.0, 1.0)
+    # Material/colour hints by part-name keyword so unresolved-mesh placeholders
+    # blend into the scene visually instead of staring out as bright magenta.
+    # The user still sees the placeholder shape; the colour just tells them
+    # what kind of object it should have been.
+    _NAME_HINTS: list[tuple[tuple[str, ...], int, tuple[float, float, float]]] = [
+        # (substring keywords, Roblox Material enum int, RGB 0..1)
+        # Material enum: Wood=512, Metal=1088, Plastic=256, SmoothPlastic=272
+        (("plank", "beam", "wood"), 512, (0.47, 0.31, 0.15)),
+        (("battery", "ammo_fbx", "hp_fbx", "girder", "vent", "boxbelt",
+          "antenna", "camera3", "box_big", "totem", "sf_door", "door"),
+         1088, (0.55, 0.55, 0.59)),
+        (("key",), 256, (1.0, 0.86, 0.0)),
+    ]
+    def _hint_for(name: str) -> tuple[int, tuple[float, float, float]] | None:
+        n = name.lower()
+        for keys, mat, col in _NAME_HINTS:
+            for k in keys:
+                if k in n:
+                    return mat, col
+        return None
     count = 0
     # Pre-scan: does the parent Model context have any actually-rendered
     # MeshPart? If not, the bone-anchor heuristic should NOT fire for any
@@ -4178,7 +4241,11 @@ def _fix_empty_mesh_parts(parts: list[RbxPart], _parent_model_part: "RbxPart | N
     for part in parts:
         if part.class_name == "MeshPart" and not part.mesh_id:
             part.class_name = "Part"
-            part.color = MISSING_MESH_COLOR
+            hint = _hint_for(part.name)
+            if hint is not None:
+                part.material, part.color = hint
+            else:
+                part.color = MISSING_MESH_COLOR
             count += 1
         elif (
             parent_has_real_mesh

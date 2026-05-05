@@ -193,6 +193,38 @@ def ref_guid(ref: Any) -> str | None:
     return None
 
 
+def ordered_child_go_fids(
+    transform_body: dict,
+    xform_fid_to_go_fid: dict[str, str],
+) -> list[str]:
+    """Walk a Transform's ``m_Children`` list and resolve to GameObject fileIDs.
+
+    Unity stores child Transform fileIDs in display order on the parent
+    Transform. The parser otherwise visits nodes in YAML-document order,
+    which doesn't match the prefab's authored order — so scripts that
+    read ``transform.GetChild(i)`` translate to a Roblox ``GetChildren()[i]``
+    that returns the wrong sibling. (SimpleFPS Turret had Collider listed
+    in the YAML before Base; ``getTBase = getChildIndex(model, 1)`` then
+    returned the trigger Part instead of the rotating MeshPart.)
+
+    Returns child GameObject fileIDs in m_Children order, dropping any
+    references that don't resolve to a known GameObject. The caller is
+    responsible for falling back to YAML-doc order for stragglers and for
+    preserving the parent → child hierarchy invariants.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for child_ref in (transform_body.get("m_Children") or []):
+        cf = ref_file_id(child_ref)
+        if not cf:
+            continue
+        cgo = xform_fid_to_go_fid.get(cf)
+        if cgo and cgo not in seen:
+            out.append(cgo)
+            seen.add(cgo)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Document parsing
 # ---------------------------------------------------------------------------

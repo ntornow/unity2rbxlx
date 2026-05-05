@@ -347,6 +347,30 @@ def fix_require_classifications(scripts: list[RbxScript]) -> int:
     # resets MouseBehavior every frame, preventing mouse-look from working.
     fixes += _disable_default_controls_in_fps_scripts(scripts)
 
+    # Pass 19: Expose ``<Table>.<Event> = <Bindable>.Event`` cross-script.
+    # Producer parents its BindableEvents to ``script`` with matching Name;
+    # consumers rewrite ``<var>.<Key>:Connect`` to
+    # ``<var>:WaitForChild("<Key>").Event:Connect``. Without this, the
+    # consumer indexes the producer LocalScript Instance for a non-existent
+    # property and crashes ("X is not a valid member of LocalScript").
+    fixes += _expose_local_script_events(scripts)
+
+    # Pass 20: Approximate Unity OnTriggerStay with a Heartbeat poll on
+    # scripts that translated it to a single-shot ``Touched:Connect``.
+    # Without this, rotating turrets can never engage targets whose
+    # initial-contact angle was outside the engagement cone.
+    fixes += _add_trigger_stay_polling(scripts)
+
+    # Pass 21: Make Pickup-style rotate+bob scripts work when the visible
+    # entity is a child Model rather than a direct Part. Unity's
+    # ``transform.Rotate`` on the script's GameObject just-works because
+    # all children inherit the transform; in Roblox, the AI binds to the
+    # first BasePart child via FindFirstChildWhichIsA, which often picks
+    # the invisible trigger collider (Transparency=1) and animates that
+    # instead of the visible Model. Patch: rewrite the script to find the
+    # visual child Model (or non-trigger Part) and use ``PivotTo``.
+    fixes += _fix_pickup_visual_target(scripts)
+
     return fixes
 
 
@@ -1100,9 +1124,13 @@ def _inject_fps_rifle_system(scripts: list[RbxScript]) -> int:
             '                local pm = other:FindFirstAncestorOfClass("Model")\n'
             '                if pm and (pm.Name:lower():find("pickup") or pm:FindFirstChild("Pickup")) then\n'
             '                    local sc = pm:FindFirstChild("Pickup") or pm:FindFirstChildWhichIsA("Script")\n'
-            '                    local iname = sc and sc:GetAttribute("itemName") or ""\n'
+            '                    local iname = (sc and sc:GetAttribute("itemName"))\n'
+            '                        or pm:GetAttribute("itemName") or ""\n'
             '                    if iname == "" and pm.Name:lower():find("rifle") then iname = "Rifle" end\n'
-            '                    if iname ~= "" then GetItem(iname); pm:Destroy() end\n'
+            '                    if iname == "" and pm.Name:lower():find("key") then iname = "Key" end\n'
+            '                    if iname == "" and pm.Name:lower():find("ammo") then iname = "Ammo" end\n'
+            '                    if iname == "" and (pm.Name:lower():find("health") or pm.Name:lower():find("hp")) then iname = "Health" end\n'
+            '                    if iname ~= "" then getItem(iname); pm:Destroy() end\n'
             '                end\n'
             '            end)\n'
             '        end\n'
@@ -1163,7 +1191,7 @@ def _add_pickup_remote_listener(scripts: list[RbxScript]) -> int:
             'local _pickupEvt = game:GetService("ReplicatedStorage"):WaitForChild("PickupItemEvent", 5)\n'
             'if _pickupEvt then\n'
             '    _pickupEvt.OnClientEvent:Connect(function(itemName)\n'
-            '        if itemName and itemName ~= "" then GetItem(itemName) end\n'
+            '        if itemName and itemName ~= "" then getItem(itemName) end\n'
             '    end)\n'
             'end\n'
         )
@@ -1337,23 +1365,44 @@ def _remove_stale_player_requires(scripts: list[RbxScript]) -> int:
     for s in scripts:
         if s.name == 'Player':
             continue
-        # Only rewrite client-side scripts. Server Scripts and ModuleScripts
-        # required from server-side code don't have access to LocalPlayer, so
-        # rewriting their `:WaitForChild("Player")` to `Players.LocalPlayer:...`
-        # would crash on the server (LocalPlayer is nil). The intent of this
-        # pass is purely to fix client scripts that thought Player was a
-        # ReplicatedStorage module — leave server-side alone.
+        # Server-side: replace ``require(...:WaitForChild("Player"))`` with a
+        # benign empty-API stub. The server can't require a LocalScript and
+        # would either infinite-yield on WaitForChild or crash on the
+        # require call. A stub keeps the script alive; cross-process state
+        # sharing requires a future RemoteFunction round-trip.
         if s.script_type != 'LocalScript':
+            stub_re = re.compile(
+                r'^(?P<indent>\s*)local\s+(?P<var>\w+)\s*=\s*require\(\s*[^)\n]*:WaitForChild\(\s*["\']Player["\']\s*\)\s*\).*$',
+                re.MULTILINE,
+            )
+            new_src, n = stub_re.subn(
+                r'\g<indent>local \g<var> = { hasItems = function() return {} end, }'
+                r'  -- server-side stub for client LocalScript "Player"',
+                s.source,
+            )
+            if n:
+                s.source = new_src
+                fixes += 1
+                log.info("  Stubbed Player require in server script '%s'", s.name)
             continue
+        # Client-side: rewrite the WaitForChild binding to point at the
+        # actual LocalScript location so subsequent code can read the
+        # script Instance.
         original = s.source
         # Find the variable bound to a Player WaitForChild lookup so we can
         # rewrite both the binding line and any subsequent uses coherently.
+        # Anchor to the full line so we capture any wrapping parens / trailing
+        # tokens — a previous version stopped at the inner `:WaitForChild("Player")`
+        # match and left orphan `)` characters that broke parsing (HudControl
+        # and Plane both hit this).
         bind_match = re.search(
-            r'local\s+(\w+)\s*=\s*[^\n]*:WaitForChild\(\s*["\']Player["\']\s*\)',
+            r'^(?P<indent>\s*)local\s+(?P<var>\w+)\s*=\s*[^\n]*:WaitForChild\(\s*["\']Player["\']\s*\)[^\n]*$',
             s.source,
+            flags=re.MULTILINE,
         )
         if bind_match:
-            varname = bind_match.group(1)
+            varname = bind_match.group("var")
+            indent = bind_match.group("indent")
             # Redirect the binding to the actual LocalScript location at runtime.
             # Use the LocalPlayer.PlayerScripts path (works for any sibling
             # LocalScript) rather than `script.Parent`, because `script.Parent`
@@ -1363,9 +1412,10 @@ def _remove_stale_player_requires(scripts: list[RbxScript]) -> int:
             # then return end` prelude that would early-exit a client script
             # whose parent is StarterPlayerScripts).
             s.source = re.sub(
-                r'local\s+\w+\s*=\s*[^\n]*:WaitForChild\(\s*["\']Player["\']\s*\)',
-                f'local {varname} = game:GetService("Players").LocalPlayer:WaitForChild("PlayerScripts"):WaitForChild("Player")',
+                r'^\s*local\s+\w+\s*=\s*[^\n]*:WaitForChild\(\s*["\']Player["\']\s*\)[^\n]*$',
+                f'{indent}local {varname} = game:GetService("Players").LocalPlayer:WaitForChild("PlayerScripts"):WaitForChild("Player")',
                 s.source,
+                flags=re.MULTILINE,
             )
             # `require(varname)` cannot work — LocalScripts aren't requirable.
             # Replace with a stub so subsequent code doesn't crash on missing var.
@@ -1392,4 +1442,327 @@ def _remove_stale_player_requires(scripts: list[RbxScript]) -> int:
         if s.source != original:
             fixes += 1
             log.info("  Rewired stale Player require/lookup in '%s'", s.name)
+    return fixes
+
+
+def _expose_local_script_events(scripts: list[RbxScript]) -> int:
+    """Make ``<Table>.<Event> = <Bindable>.Event`` accessible across LocalScripts.
+
+    The AI transpiler emits a Unity-style class export pattern:
+
+        local Player = {}
+        local healthUpdateEvent = Instance.new("BindableEvent")
+        Player.HealthUpdate = healthUpdateEvent.Event   -- producer
+        ...
+        Player.HealthUpdate:Connect(updateHealth)        -- consumer (other LocalScript)
+
+    The producer's ``Player`` is a *local table* — siblings can't reach it
+    through the LocalScript Instance. The consumer's ``Player`` is the
+    LocalScript Instance itself (resolved via
+    ``LocalPlayer.PlayerScripts:WaitForChild("Player")``). Indexing an
+    Instance for a non-property key throws "X is not a valid member of
+    LocalScript", so every cross-script event subscription fails.
+
+    Fix: parent each producer-side BindableEvent to ``script`` with the
+    table-key as its Name, then rewrite consumers' ``<var>.<Key>:Connect``
+    to ``<var>:WaitForChild("<Key>").Event:Connect``. Only runs when the
+    producer LocalScript exists in the script set.
+    """
+    fixes = 0
+    # Pattern: local <bindableVar> = Instance.new("BindableEvent")
+    bindable_decl = re.compile(
+        r'local\s+(\w+)\s*=\s*Instance\.new\(\s*["\']BindableEvent["\']\s*\)',
+    )
+    # Pattern: <Table>.<Key> = <bindableVar>.Event
+    expose_pat = re.compile(
+        r'(\w+)\.(\w+)\s*=\s*(\w+)\.Event\b',
+    )
+
+    # Step 1 — find producer LocalScripts and the (table, key, bindable_var) triples they expose.
+    # Map: producer_script_name -> set of exposed event keys
+    producers: dict[str, dict[str, str]] = {}  # name -> {event_key: bindable_var}
+    for s in scripts:
+        if s.script_type != "LocalScript":
+            continue
+        bindables = set(bindable_decl.findall(s.source))
+        if not bindables:
+            continue
+        exposed: dict[str, str] = {}
+        for table_var, key, bvar in expose_pat.findall(s.source):
+            if bvar in bindables:
+                exposed[key] = bvar
+        if exposed:
+            producers[s.name] = exposed
+
+    if not producers:
+        return 0
+
+    # Step 2 — patch each producer to parent its BindableEvents to ``script``.
+    for s in scripts:
+        if s.name not in producers:
+            continue
+        exposed = producers[s.name]
+        original = s.source
+        for key, bvar in exposed.items():
+            # Insert a Name+Parent assignment immediately after the BindableEvent declaration,
+            # but only once (skip if the marker already exists).
+            marker = f'{bvar}.Name = "{key}"'
+            if marker in s.source:
+                continue
+            decl_re = re.compile(
+                rf'^(\s*local\s+{re.escape(bvar)}\s*=\s*Instance\.new\(\s*["\']BindableEvent["\']\s*\)\s*)$',
+                re.MULTILINE,
+            )
+            insert = (
+                rf'\1\n{marker}; '
+                rf'{bvar}.Parent = script'
+            )
+            s.source = decl_re.sub(insert, s.source, count=1)
+        if s.source != original:
+            fixes += 1
+            log.info("  Exposed %d BindableEvent(s) on producer '%s'", len(exposed), s.name)
+
+    # Step 3 — rewrite consumers. A consumer binds the producer LocalScript via
+    # ``WaitForChild("<ProducerName>")`` and then does ``<var>.<Key>:Connect(...)``.
+    bind_re = re.compile(
+        r'^\s*local\s+(\w+)\s*=\s*[^\n]*:WaitForChild\(\s*["\']([^"\']+)["\']\s*\)[^\n]*$',
+        re.MULTILINE,
+    )
+    for s in scripts:
+        if s.name in producers:
+            continue  # producers don't need the consumer rewrite for their own table
+        original = s.source
+        # Find variables bound to producer LocalScripts (via WaitForChild)
+        var_to_producer: dict[str, str] = {}
+        for var, child_name in bind_re.findall(s.source):
+            if child_name in producers:
+                var_to_producer[var] = child_name
+        if not var_to_producer:
+            continue
+        for var, prod in var_to_producer.items():
+            for key in producers[prod]:
+                pat = re.compile(rf'\b{re.escape(var)}\.{re.escape(key)}:Connect\(')
+                repl = f'{var}:WaitForChild("{key}").Event:Connect('
+                s.source = pat.sub(repl, s.source)
+        if s.source != original:
+            fixes += 1
+            log.info("  Rewired %d cross-script event binding(s) in '%s'",
+                     sum(len(producers[p]) for p in var_to_producer.values()),
+                     s.name)
+    return fixes
+
+
+def _add_trigger_stay_polling(scripts: list[RbxScript]) -> int:
+    """Approximate Unity ``OnTriggerStay`` for trigger-collider scripts.
+
+    The AI typically translates Unity's ``OnTriggerStay`` to a single
+    ``triggerCollider.Touched:Connect`` handler. ``Touched`` fires once per
+    part-touch event, not every frame, so the script's per-frame angle
+    or distance checks (e.g. a rotating turret cone) only get one shot
+    when each player part initially contacts the trigger. If the angle
+    fails on first contact, the player has to leave and re-enter to get
+    another evaluation — turrets effectively never engage rotating
+    targets.
+
+    Detection: a script that names ``triggerCollider`` and binds
+    ``Touched:Connect`` AND defines an ``angle <`` cone check inside that
+    handler. Patch: append a Heartbeat polling loop using
+    ``workspace:GetPartBoundsInRadius`` (works regardless of CanCollide)
+    that re-runs the same engage logic at 6.7Hz while the script's
+    ``state`` is non-Engaged.
+    """
+    fixes = 0
+    poll_marker = "-- __TRIGGER_STAY_POLL__"
+    for s in scripts:
+        if poll_marker in s.source:
+            continue
+        if "triggerCollider" not in s.source:
+            continue
+        if "angle <" not in s.source:
+            continue
+        if "startEngaged" not in s.source:
+            continue
+        # Heuristic: only patch if the engage logic uses getTBase/sightRadius
+        # or the converter-emitted helper functions. Avoids patching
+        # arbitrary scripts that happen to mention angle.
+        if not (
+            "getTBase" in s.source
+            and ("getSightRadius" in s.source or "sightRadius" in s.source)
+        ):
+            continue
+        s.source += (
+            "\n\n" + poll_marker + " Unity OnTriggerStay equivalent — Touched fires\n"
+            "-- only on part-touch *events*, but Unity OnTriggerStay re-runs every\n"
+            "-- physics frame. Polling lets a rotating turret eventually pick up\n"
+            "-- a target whose initial-contact angle was outside the engagement cone.\n"
+            "do\n"
+            "    local _RunService = game:GetService(\"RunService\")\n"
+            "    local _sightRadius = getSightRadius()\n"
+            "    local _lastCheck = 0\n"
+            "    _RunService.Heartbeat:Connect(function()\n"
+            "        if state == State.Engaged then return end\n"
+            "        if tick() - _lastCheck < 0.15 then return end\n"
+            "        _lastCheck = tick()\n"
+            "        local _base = getTBase()\n"
+            "        if not _base then return end\n"
+            "        local _basePos = getPosition(_base)\n"
+            "        local _hits = workspace:GetPartBoundsInRadius(_basePos, _sightRadius)\n"
+            "        for _, _p in ipairs(_hits) do\n"
+            "            if isPlayerPart(_p) then\n"
+            "                local _character = getPlayerCharacter(_p)\n"
+            "                if _character then\n"
+            "                    local _targetPart = _character:FindFirstChild(\"HumanoidRootPart\") or _p\n"
+            "                    local _dir = _targetPart.Position - _basePos\n"
+            "                    local _angle = vectorAngle(_dir, getForward(_base))\n"
+            "                    if _angle < 55 then\n"
+            "                        local _rp = RaycastParams.new()\n"
+            "                        _rp.FilterDescendantsInstances = {model}\n"
+            "                        _rp.FilterType = Enum.RaycastFilterType.Exclude\n"
+            "                        local _res = workspace:Raycast(_basePos, _dir.Unit * _sightRadius, _rp)\n"
+            "                        if _res and isPlayerPart(_res.Instance) then\n"
+            "                            startEngaged(_targetPart)\n"
+            "                            return\n"
+            "                        end\n"
+            "                    end\n"
+            "                end\n"
+            "            end\n"
+            "        end\n"
+            "    end)\n"
+            "end\n"
+        )
+        fixes += 1
+        log.info("  Added OnTriggerStay polling loop to '%s'", s.name)
+    return fixes
+
+
+_PICKUP_REPLACEMENT = """local RunService = game:GetService("RunService")
+local Debris = game:GetService("Debris")
+
+local container = script.Parent
+
+-- Find the visible target. Prefer Models (e.g. Rifle, Battery) over Parts;
+-- fall back to opaque Parts; last resort any Part. The Pickup container
+-- typically has invisible Trigger Parts (Transparency=1) sitting alongside
+-- the visible mesh content — the visual target is what should bob and rotate.
+local function findVisualTarget(parent)
+\tfor _, c in ipairs(parent:GetChildren()) do
+\t\tif c:IsA("Model") and c.Name ~= "MinimapIcon" then return c end
+\tend
+\tfor _, c in ipairs(parent:GetChildren()) do
+\t\tif c:IsA("BasePart") and c.Transparency < 1 then return c end
+\tend
+\tfor _, c in ipairs(parent:GetChildren()) do
+\t\tif c:IsA("BasePart") then return c end
+\tend
+\treturn nil
+end
+
+local function findTriggerPart(parent)
+\tlocal d = parent:FindFirstChild("PickupTouchDetector")
+\tif d and d:IsA("BasePart") then return d end
+\tlocal c = parent:FindFirstChild("Collider")
+\tif c and c:IsA("BasePart") then return c end
+\tfor _, x in ipairs(parent:GetChildren()) do
+\t\tif x:IsA("BasePart") and x.Transparency >= 1 then return x end
+\tend
+\treturn nil
+end
+
+local target = findVisualTarget(container)
+local trigger = findTriggerPart(container)
+-- itemName is serialized on either the script (post-coherence) or the
+-- container Model (Unity MonoBehaviour fields land on the parent Part/Model).
+local itemName = script:GetAttribute("itemName")
+\tor (container and container:GetAttribute("itemName"))
+\tor ""
+local rotationSpeed = 100
+local source = container:FindFirstChildWhichIsA("Sound")
+
+if not target then return end
+
+local function getPivot()
+\tif target:IsA("Model") then return target:GetPivot() end
+\treturn target.CFrame
+end
+local function setPivot(cf)
+\tif target:IsA("Model") then target:PivotTo(cf) else target.CFrame = cf end
+end
+
+-- Models need a PrimaryPart for PivotTo to work consistently.
+if target:IsA("Model") and not target.PrimaryPart then
+\tlocal p = target:FindFirstChildWhichIsA("BasePart")
+\tif p then target.PrimaryPart = p end
+end
+
+local origin = getPivot().Position
+local upPos = origin
+local downPos = origin - Vector3.new(0, 0.5, 0)
+
+local function moveDown()
+\twhile target and target.Parent do
+\t\tif getPivot().Position.Y <= downPos.Y + 0.05 then break end
+\t\tlocal dt = RunService.Heartbeat:Wait()
+\t\t-- Re-fetch pivot AFTER the wait so we don't clobber rotation
+\t\t-- updates applied by the concurrent Heartbeat rotator below.
+\t\tsetPivot(getPivot() + Vector3.new(0, -0.5 * dt, 0))
+\tend
+end
+local function moveUp()
+\twhile target and target.Parent do
+\t\tif getPivot().Position.Y >= upPos.Y - 0.05 then break end
+\t\tlocal dt = RunService.Heartbeat:Wait()
+\t\tsetPivot(getPivot() + Vector3.new(0, 0.5 * dt, 0))
+\tend
+end
+
+task.spawn(function()
+\twhile target and target.Parent do moveDown(); moveUp() end
+end)
+
+RunService.Heartbeat:Connect(function(dt)
+\tif target and target.Parent then
+\t\tsetPivot(getPivot() * CFrame.Angles(0, math.rad(rotationSpeed) * dt, 0))
+\tend
+end)
+
+local touchPart = trigger or (target:IsA("BasePart") and target or target:FindFirstChildWhichIsA("BasePart"))
+if touchPart then
+\ttouchPart.Touched:Connect(function(otherPart)
+\t\tlocal character = otherPart:FindFirstAncestorOfClass("Model")
+\t\tif character and game:GetService("Players"):GetPlayerFromCharacter(character) then
+\t\t\tcharacter:SetAttribute("GetItem", itemName)
+\t\t\tif source then source:Play() end
+\t\t\tDebris:AddItem(container, 0)
+\t\tend
+\tend)
+end
+"""
+
+
+def _fix_pickup_visual_target(scripts: list[RbxScript]) -> int:
+    """Replace Pickup.luau bodies with Model-aware rotate+bob+touch logic.
+
+    Detection: script name ``Pickup`` (Unity Pickup.cs convention) AND the
+    body contains the AI-emitted ``rotationSpeed`` + ``moveDown`` / ``bobLoop``
+    pattern bound to ``script.Parent``. The replacement is structurally the
+    same Unity behavior (downward then upward bob + Y rotation + Touched
+    pickup) but routes through ``PivotTo`` for Models so a child Rifle /
+    Battery Model is what visually animates, not the invisible trigger Part.
+    """
+    fixes = 0
+    for s in scripts:
+        if s.name != "Pickup":
+            continue
+        # Anchor on tokens specific to the Unity Pickup.cs translation
+        # so we don't replace unrelated scripts that happen to share a name.
+        if not (
+            "rotationSpeed" in s.source
+            and ("moveDown" in s.source or "MoveDown" in s.source)
+            and "Touched" in s.source
+            and "GetItem" in s.source
+        ):
+            continue
+        s.source = _PICKUP_REPLACEMENT
+        fixes += 1
+        log.info("  Rewired Pickup '%s' to Model-aware rotate+bob", s.name)
     return fixes

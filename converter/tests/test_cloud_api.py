@@ -182,3 +182,82 @@ class TestUploadPlaceContentType:
 
         headers = mock_post.call_args.kwargs["headers"]
         assert headers["Content-Type"] == "application/octet-stream"
+
+
+class TestPollOperationErrorSurfacing:
+    """``_poll_operation`` reads Roblox's async-upload status. When the
+    operation completes without an asset ID — Roblox-side failure — we
+    must surface ``data.error.code`` and ``data.error.message`` so users
+    can distinguish a moderation reject from a transient outage from a
+    malformed asset. The previous implementation logged "Upload op done
+    but no numeric asset ID: {}" which threw away the only diagnostic
+    Roblox returned.
+    """
+
+    def test_done_with_error_surfaces_code_and_message(self, caplog):
+        import logging
+        from roblox.cloud_api import _poll_operation
+        with patch("roblox.cloud_api.requests.get") as mock_get, \
+             patch("roblox.cloud_api.time.sleep"):
+            mock_resp = MagicMock(status_code=200)
+            mock_resp.json.return_value = {
+                "path": "operations/abc",
+                "operationId": "abc",
+                "done": True,
+                "error": {"code": "Unknown", "message": "Unknown Error", "details": []},
+                "response": {},
+            }
+            mock_get.return_value = mock_resp
+            with caplog.at_level(logging.WARNING, logger="roblox.cloud_api"):
+                result = _poll_operation("abc", "fakekey", max_polls=1, poll_interval=0)
+            assert result is None
+            warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+            joined = "\n".join(warnings)
+            assert "code=Unknown" in joined or "Unknown" in joined, (
+                f"error.code must be in the log; got: {joined!r}"
+            )
+            assert "Unknown Error" in joined, (
+                f"error.message must be in the log; got: {joined!r}"
+            )
+
+    def test_done_without_error_field_logs_missing_asset_id(self, caplog):
+        # Roblox responds done=True with no error and no assetId — the
+        # warning should still fire so silent drops are visible, but with
+        # a synthetic ``MissingAssetId`` code instead of crashing on the
+        # missing ``error`` field.
+        import logging
+        from roblox.cloud_api import _poll_operation
+        with patch("roblox.cloud_api.requests.get") as mock_get, \
+             patch("roblox.cloud_api.time.sleep"):
+            mock_resp = MagicMock(status_code=200)
+            mock_resp.json.return_value = {
+                "path": "operations/xyz",
+                "done": True,
+                "response": {},
+            }
+            mock_get.return_value = mock_resp
+            with caplog.at_level(logging.WARNING, logger="roblox.cloud_api"):
+                result = _poll_operation("xyz", "fakekey", max_polls=1, poll_interval=0)
+            assert result is None
+            assert any("MissingAssetId" in r.message for r in caplog.records), (
+                "warning must label a missing-error case so users can grep for it"
+            )
+
+    def test_done_with_asset_id_returns_id_no_warning(self, caplog):
+        import logging
+        from roblox.cloud_api import _poll_operation
+        with patch("roblox.cloud_api.requests.get") as mock_get, \
+             patch("roblox.cloud_api.time.sleep"):
+            mock_resp = MagicMock(status_code=200)
+            mock_resp.json.return_value = {
+                "done": True,
+                "response": {"assetId": "12345"},
+            }
+            mock_get.return_value = mock_resp
+            with caplog.at_level(logging.WARNING, logger="roblox.cloud_api"):
+                result = _poll_operation("op", "fakekey", max_polls=1, poll_interval=0)
+            assert result == "12345"
+            # Successful path must not log error warnings.
+            assert not any(
+                "code=" in r.message for r in caplog.records
+            ), "successful upload should not emit error-code warnings"
