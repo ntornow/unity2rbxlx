@@ -1592,14 +1592,226 @@ return table.concat(allData, "\\n")'''
             len(self.state.rbx_place.workspace_parts),
         )
 
+    SUBPHASE_ORDER: tuple[str, ...] = (
+        "_subphase_emit_scripts_to_disk",
+        "_subphase_cohere_scripts",
+        "_classify_storage",
+        "_bind_scripts_to_parts",
+        "_subphase_inject_autogen_scripts",
+        "_inject_runtime_modules",
+        "_generate_prefab_packages",
+        "_subphase_encode_terrain",
+        "_subphase_inject_mesh_loader",
+        "_subphase_patch_setup_sounds",
+        "_subphase_finalize_scripts_to_disk",
+    )
+    """Order in which write_output() invokes its subphases.
+
+    Each subphase mutates ``self.state.rbx_place`` and/or writes files to
+    ``self.output_dir``. Ordering is load-bearing:
+      - cohere_scripts must run after emit_scripts_to_disk (needs scripts in place)
+      - classify_storage must run after cohere_scripts (Script→ModuleScript reclassification
+        affects which storage container each script belongs in)
+      - inject_autogen_scripts must run after classify_storage (autogen scripts
+        need to know about FPS controllers to skip clobbering modules)
+      - encode_terrain reads ``state.rbx_place.terrain_world_offset`` set by convert_scene
+      - finalize_scripts_to_disk must run last so on-disk scripts/ matches
+        the in-memory state about to be serialized.
+    A test asserts the actual call sequence in write_output matches this tuple.
+    """
+
     def write_output(self) -> None:
-        """Phase 6: Serialize the Roblox place to disk."""
+        """Phase 6: Serialize the Roblox place to disk.
+
+        Orchestrates the subphases listed in :data:`SUBPHASE_ORDER`.
+        Each subphase is a separate method so it can be invoked or
+        mocked in isolation by tests.
+        """
         log.info("[write_output] Writing output ...")
 
         if self.state.rbx_place is None:
             log.warning("[write_output] No RbxPlace -- skipping")
             return
 
+        # write_output is the assembly + serialization pipeline. Each subphase
+        # below mutates self.state.rbx_place and/or writes files to self.output_dir.
+        # Order is load-bearing — see SUBPHASE_ORDER for dependency rationale.
+        self._subphase_emit_scripts_to_disk()
+        self._subphase_cohere_scripts()
+        self._classify_storage()
+        self._bind_scripts_to_parts()
+        self._subphase_inject_autogen_scripts()
+        self._inject_runtime_modules()
+        self._generate_prefab_packages()
+        self._subphase_encode_terrain()
+        self._subphase_inject_mesh_loader()
+
+        # TerrainSnap: disabled pending terrain encoder coordinate system fix.
+        # The terrain encoder's -(cz+1) Z-axis formula creates a systematic offset
+        # between terrain voxel positions and object world positions. A proper fix
+        # requires restructuring the encoder to place chunks at world coordinates.
+        if False and self.state.rbx_place.terrains:
+            from core.roblox_types import RbxScript
+            terrain_snap = '''-- Auto-generated terrain snap script
+-- Computes a uniform Y offset to align objects with terrain surface.
+-- Samples small ground-level objects to find the median terrain-object gap,
+-- then shifts ALL parts by that offset (preserving relative positions).
+if script:GetAttribute("TerrainSnapDone") then return end
+task.wait(2)
+
+local terrain = workspace:FindFirstChildOfClass("Terrain")
+if not terrain then script:SetAttribute("TerrainSnapDone", true); return end
+
+local params = RaycastParams.new()
+params.FilterType = Enum.RaycastFilterType.Include
+params.FilterDescendantsInstances = {terrain}
+
+-- Step 1: Sample small ground-level parts to compute median offset
+local offsets = {}
+for _, part in workspace:GetDescendants() do
+    if part:IsA("BasePart") and part.Anchored and part.Size.Y < 10 then
+        local pos = part.Position
+        local result = workspace:Raycast(
+            Vector3.new(pos.X, 500, pos.Z),
+            Vector3.new(0, -1000, 0), params
+        )
+        if result then
+            local terrainY = result.Position.Y
+            local bottomY = pos.Y - part.Size.Y / 2
+            local gap = terrainY - bottomY
+            if math.abs(gap) < 100 then
+                table.insert(offsets, gap)
+            end
+        end
+    end
+end
+
+if #offsets == 0 then
+    print("TerrainSnap: no samples found")
+    script:SetAttribute("TerrainSnapDone", true); return
+end
+
+-- Compute median offset
+table.sort(offsets)
+local median = offsets[math.floor(#offsets / 2) + 1]
+
+-- Only apply if the offset is significant (> 2 studs)
+if math.abs(median) < 2 then
+    print(string.format("TerrainSnap: median offset %.1f too small, skipping", median))
+    script:SetAttribute("TerrainSnapDone", true); return
+end
+
+-- Step 2: Apply uniform offset to all anchored parts
+local shifted = 0
+for _, part in workspace:GetDescendants() do
+    if part:IsA("BasePart") and part.Anchored then
+        part.CFrame = part.CFrame + Vector3.new(0, median, 0)
+        shifted = shifted + 1
+    end
+end
+print("TerrainSnap: shifted " .. shifted .. " parts by " .. math.floor(median * 10 + 0.5) / 10 .. " studs (sampled " .. #offsets .. ")")
+script:SetAttribute("TerrainSnapDone", true)
+script.Disabled = true
+'''
+            self.state.rbx_place.scripts.append(RbxScript(
+                name="TerrainSnap",
+                source=terrain_snap,
+                script_type="Script",
+            ))
+            log.info("[write_output] TerrainSnap script embedded")
+
+        self._subphase_patch_setup_sounds()
+        self._subphase_finalize_scripts_to_disk()
+
+        # Write the RBXLX file.
+        import config as _cfg_mod
+        rbxlx_path = self.output_dir / _cfg_mod.RBXLX_OUTPUT_FILENAME
+        from roblox.rbxlx_writer import write_rbxlx
+        result = write_rbxlx(self.state.rbx_place, rbxlx_path)
+        log.info("[write_output] RBXLX: %s (%d parts, %d scripts)",
+                 rbxlx_path, result.get("parts_written", 0),
+                 result.get("scripts_written", 0))
+
+        # Sibling .rbxl for the Open Cloud place endpoint (binary-only).
+        if self.skip_binary_rbxl:
+            log.debug("[write_output] skip_binary_rbxl set; skipping binary .rbxl")
+        else:
+            try:
+                from roblox.rbxl_binary_writer import xml_to_binary
+                rbxl_path = xml_to_binary(rbxlx_path)
+                log.info("[write_output] Binary RBXL: %s (%.1f KB)",
+                         rbxl_path, rbxl_path.stat().st_size / 1024)
+            except ImportError:
+                log.debug("[write_output] lz4 not installed; skipping binary .rbxl")
+            except Exception as exc:
+                log.warning("[write_output] Binary .rbxl conversion failed: %s", exc)
+
+        # Verify transform accuracy: compare Unity scene positions to rbxlx output.
+        # Logs errors for any object with >10° rotation error or >2m position error.
+        try:
+            from tools.transform_audit import parse_rbxlx, parse_unity_scene_transforms, compare_transforms
+            scene_path = self.state.scene_path or (
+                Path(self.ctx.selected_scene) if self.ctx.selected_scene else None
+            )
+            if scene_path and Path(scene_path).exists() and rbxlx_path.exists():
+                roblox_data = parse_rbxlx(str(rbxlx_path))
+                unity_data = parse_unity_scene_transforms(str(scene_path))
+                discrepancies = compare_transforms(
+                    unity_data, roblox_data,
+                    pos_threshold=999999, rot_threshold=10.0,
+                )
+                rot_errors = [d for d in discrepancies if d['rot_error_deg'] > 10.0]
+                if rot_errors:
+                    log.warning("[write_output] Transform audit: %d objects with >10° rotation error", len(rot_errors))
+                    for d in rot_errors[:10]:
+                        log.warning("  %s: %.1f° rotation error (path: %s)",
+                                   d['name'], d['rot_error_deg'], d.get('path', '?'))
+                else:
+                    log.info("[write_output] Transform audit: all rotations within 10° tolerance")
+        except Exception as exc:
+            log.debug("[write_output] Transform audit skipped: %s", exc)
+
+        # Post-process: strip local file paths from SurfaceAppearance textures.
+        # Done via regex on raw XML to preserve CDATA sections in scripts.
+        import re as _re_post
+        raw_xml = rbxlx_path.read_text(encoding="utf-8")
+        # Remove <Content name="..."><url>LOCAL_PATH</url></Content> entries
+        # where the URL is a local path (contains / or \ but not rbxassetid)
+        original_len = len(raw_xml)
+        pattern = r'<Content name="[^"]*">\s*<url>[^<]*(?:/|\\)[^<]*</url>\s*</Content>'
+        matches = list(_re_post.finditer(pattern, raw_xml))
+        stripped = 0
+        for m in matches:
+            if "rbxassetid" not in m.group():
+                stripped += 1
+        if stripped:
+            raw_xml = _re_post.sub(
+                lambda m: "" if "rbxassetid" not in m.group() else m.group(),
+                pattern, raw_xml,
+            )
+            rbxlx_path.write_text(raw_xml, encoding="utf-8")
+            log.info("[write_output] Stripped %d invalid local texture paths from SurfaceAppearances", stripped)
+
+        # UNCONVERTED.md — human-readable log of features the converter
+        # deliberately dropped (e.g. binary .controller files that need
+        # UnityPy text-export, 2D blend trees). Sources contribute via
+        # their result objects' ``unconverted`` list.
+        self._write_unconverted_md()
+
+        # Structured conversion report (see converter.report_generator).
+        # The interactive report() command decorates this file in place.
+        report_path = self.output_dir / "conversion_report.json"
+        structured = self._build_conversion_report(rbxlx_path, result, report_path)
+        from converter.report_generator import generate_report
+        generate_report(structured, report_path, print_summary=False)
+
+        # Persist context.
+        self.ctx.save(self._context_path)
+        log.info("[write_output] Context saved to %s", self._context_path)
+    def _subphase_emit_scripts_to_disk(self) -> None:
+        """Materialize transpiled, animation, and ScriptableObject scripts onto disk
+        and into ``state.rbx_place.scripts``. Honors the ``preserve_scripts``
+        path that lets users hand-edit Luau between assemble and upload."""
         # Write transpiled scripts to output directory AND add to RbxPlace.
         scripts_dir = self.output_dir / "scripts"
         # When transpile_scripts was skipped (e.g. user hand-edited Luau during
@@ -1696,6 +1908,10 @@ return table.concat(allData, "\\n")'''
             if added:
                 log.info("[write_output] Added %d ScriptableObject ModuleScripts", added)
 
+    def _subphase_cohere_scripts(self) -> None:
+        """Post-transpile script coherence: rewrite asset references, inject
+        cross-script ``require()`` calls, and reclassify Script→ModuleScript
+        based on require dependencies."""
         # Post-transpilation: rewrite asset references in scripts.
         from converter.script_asset_rewriter import rewrite_asset_references
         rewrites = rewrite_asset_references(
@@ -1728,19 +1944,10 @@ return table.concat(allData, "\\n")'''
         if fixes:
             log.info("[write_output] Reclassified %d scripts based on require() dependencies", fixes)
 
-        # Phase 4a.5 storage classification: assign each script a concrete
-        # parent_path (server/client/replicated) before rbxlx emission. See
-        # references/phase-4a-storage-classification.md. Currently inlined here;
-        # will be promoted to a distinct pipeline phase once write_output is
-        # split into assemble_scripts + serialize.
-        self._classify_storage()
-
-        # Bind scripts to their target parts using _ScriptClass attributes.
-        # In Unity, MonoBehaviours are children of GameObjects. We replicate
-        # this by placing scripts as children of their target parts, which
-        # allows scripts to use script.Parent to reference their part.
-        self._bind_scripts_to_parts()
-
+    def _subphase_inject_autogen_scripts(self) -> None:
+        """Synthesize project-bootstrap scripts: collision-group setup,
+        GameServerManager spawn handling, ClientBootstrap that requires
+        side-effect ModuleScripts, and FPS controller scripts/HUD."""
         # Auto-generate collision group setup if Unity layers are used.
         from converter.fps_client_generator import generate_collision_group_script
         has_layers = False
@@ -1852,15 +2059,9 @@ return table.concat(allData, "\\n")'''
         if detect_fps_game(self.state.rbx_place):
             self.state.rbx_place.is_fps_game = True
 
-        # Inject runtime library modules when relevant features are detected.
-        self._inject_runtime_modules()
-
-        # Phase 4.10: emit referenced prefabs into ReplicatedStorage.Templates
-        # so scripts can :Clone() them at runtime. Must run AFTER the script
-        # coherence / bootstrap steps so the spawner's source_path and
-        # injected RbxScript fields round-trip through rehydration.
-        self._generate_prefab_packages()
-
+    def _subphase_encode_terrain(self) -> None:
+        """Encode each terrain's heightmap into Roblox SmoothGrid binary and
+        register a FillBlock Luau body for headless publish."""
         # Encode terrain heightmap data into SmoothGrid binary for rbxlx embedding.
         # Also save a Luau script as fallback for environments without UnityPy.
         if self.state.rbx_place.terrains:
@@ -1948,6 +2149,10 @@ return table.concat(allData, "\\n")'''
                          terrain_path.name, len(luau))
                 self.state.rbx_place.headless_terrain_scripts.append(luau)
 
+    def _subphase_inject_mesh_loader(self) -> None:
+        """Inject the auto-generated MeshLoader Script that calls
+        ``CreateMeshPartAsync`` for placeholder MeshParts when mesh
+        resolution data is unavailable (i.e. resolve_assets did not run)."""
         # MeshLoader: only inject if mesh resolution data is NOT available.
         # When resolve_assets has run, real MeshIds are already in the rbxlx
         # and no runtime loading is needed. The MeshLoader would actively harm
@@ -2082,80 +2287,9 @@ script.Disabled = true
             log.info("[write_output] MeshLoader script embedded for %d mesh assets",
                      sum(1 for p in self.ctx.uploaded_assets if Path(p).suffix.lower() in ('.fbx', '.obj')))
 
-        # TerrainSnap: disabled pending terrain encoder coordinate system fix.
-        # The terrain encoder's -(cz+1) Z-axis formula creates a systematic offset
-        # between terrain voxel positions and object world positions. A proper fix
-        # requires restructuring the encoder to place chunks at world coordinates.
-        if False and self.state.rbx_place.terrains:
-            from core.roblox_types import RbxScript
-            terrain_snap = '''-- Auto-generated terrain snap script
--- Computes a uniform Y offset to align objects with terrain surface.
--- Samples small ground-level objects to find the median terrain-object gap,
--- then shifts ALL parts by that offset (preserving relative positions).
-if script:GetAttribute("TerrainSnapDone") then return end
-task.wait(2)
-
-local terrain = workspace:FindFirstChildOfClass("Terrain")
-if not terrain then script:SetAttribute("TerrainSnapDone", true); return end
-
-local params = RaycastParams.new()
-params.FilterType = Enum.RaycastFilterType.Include
-params.FilterDescendantsInstances = {terrain}
-
--- Step 1: Sample small ground-level parts to compute median offset
-local offsets = {}
-for _, part in workspace:GetDescendants() do
-    if part:IsA("BasePart") and part.Anchored and part.Size.Y < 10 then
-        local pos = part.Position
-        local result = workspace:Raycast(
-            Vector3.new(pos.X, 500, pos.Z),
-            Vector3.new(0, -1000, 0), params
-        )
-        if result then
-            local terrainY = result.Position.Y
-            local bottomY = pos.Y - part.Size.Y / 2
-            local gap = terrainY - bottomY
-            if math.abs(gap) < 100 then
-                table.insert(offsets, gap)
-            end
-        end
-    end
-end
-
-if #offsets == 0 then
-    print("TerrainSnap: no samples found")
-    script:SetAttribute("TerrainSnapDone", true); return
-end
-
--- Compute median offset
-table.sort(offsets)
-local median = offsets[math.floor(#offsets / 2) + 1]
-
--- Only apply if the offset is significant (> 2 studs)
-if math.abs(median) < 2 then
-    print(string.format("TerrainSnap: median offset %.1f too small, skipping", median))
-    script:SetAttribute("TerrainSnapDone", true); return
-end
-
--- Step 2: Apply uniform offset to all anchored parts
-local shifted = 0
-for _, part in workspace:GetDescendants() do
-    if part:IsA("BasePart") and part.Anchored then
-        part.CFrame = part.CFrame + Vector3.new(0, median, 0)
-        shifted = shifted + 1
-    end
-end
-print("TerrainSnap: shifted " .. shifted .. " parts by " .. math.floor(median * 10 + 0.5) / 10 .. " studs (sampled " .. #offsets .. ")")
-script:SetAttribute("TerrainSnapDone", true)
-script.Disabled = true
-'''
-            self.state.rbx_place.scripts.append(RbxScript(
-                name="TerrainSnap",
-                source=terrain_snap,
-                script_type="Script",
-            ))
-            log.info("[write_output] TerrainSnap script embedded")
-
+    def _subphase_patch_setup_sounds(self) -> None:
+        """Patch Player-style scripts that call ``setupSounds`` to also search
+        the bound Part's children for Sound instances."""
         # Patch scripts that use setupSounds: also search script.Parent for
         # Sound children (sounds from MonoBehaviour AudioClip fields are placed
         # as children of the bound Part, not the character).
@@ -2166,6 +2300,10 @@ script.Disabled = true
                     "setupSounds(character)\n    -- Also search bound Part for sounds from MonoBehaviour fields\n    if script.Parent and script.Parent:IsA(\"BasePart\") then\n        setupSounds(script.Parent)\n    end",
                 )
 
+    def _subphase_finalize_scripts_to_disk(self) -> None:
+        """Write every script's final source back to disk. Runs after every
+        in-memory mutation so the on-disk ``scripts/`` tree mirrors what
+        gets serialized into the rbxlx."""
         # Final write: ensure .luau files on disk match the fully processed
         # sources (after require injection, reclassification, and all other
         # post-processing). Prefer the explicit source_path set by rehydration
@@ -2189,91 +2327,6 @@ script.Disabled = true
             elif luau_path.exists() or not (scripts_dir / "animations").exists():
                 luau_path.write_text(s.source, encoding="utf-8")
 
-        # Write the RBXLX file.
-        import config as _cfg_mod
-        rbxlx_path = self.output_dir / _cfg_mod.RBXLX_OUTPUT_FILENAME
-        from roblox.rbxlx_writer import write_rbxlx
-        result = write_rbxlx(self.state.rbx_place, rbxlx_path)
-        log.info("[write_output] RBXLX: %s (%d parts, %d scripts)",
-                 rbxlx_path, result.get("parts_written", 0),
-                 result.get("scripts_written", 0))
-
-        # Sibling .rbxl for the Open Cloud place endpoint (binary-only).
-        if self.skip_binary_rbxl:
-            log.debug("[write_output] skip_binary_rbxl set; skipping binary .rbxl")
-        else:
-            try:
-                from roblox.rbxl_binary_writer import xml_to_binary
-                rbxl_path = xml_to_binary(rbxlx_path)
-                log.info("[write_output] Binary RBXL: %s (%.1f KB)",
-                         rbxl_path, rbxl_path.stat().st_size / 1024)
-            except ImportError:
-                log.debug("[write_output] lz4 not installed; skipping binary .rbxl")
-            except Exception as exc:
-                log.warning("[write_output] Binary .rbxl conversion failed: %s", exc)
-
-        # Verify transform accuracy: compare Unity scene positions to rbxlx output.
-        # Logs errors for any object with >10° rotation error or >2m position error.
-        try:
-            from tools.transform_audit import parse_rbxlx, parse_unity_scene_transforms, compare_transforms
-            scene_path = self.state.scene_path or (
-                Path(self.ctx.selected_scene) if self.ctx.selected_scene else None
-            )
-            if scene_path and Path(scene_path).exists() and rbxlx_path.exists():
-                roblox_data = parse_rbxlx(str(rbxlx_path))
-                unity_data = parse_unity_scene_transforms(str(scene_path))
-                discrepancies = compare_transforms(
-                    unity_data, roblox_data,
-                    pos_threshold=999999, rot_threshold=10.0,
-                )
-                rot_errors = [d for d in discrepancies if d['rot_error_deg'] > 10.0]
-                if rot_errors:
-                    log.warning("[write_output] Transform audit: %d objects with >10° rotation error", len(rot_errors))
-                    for d in rot_errors[:10]:
-                        log.warning("  %s: %.1f° rotation error (path: %s)",
-                                   d['name'], d['rot_error_deg'], d.get('path', '?'))
-                else:
-                    log.info("[write_output] Transform audit: all rotations within 10° tolerance")
-        except Exception as exc:
-            log.debug("[write_output] Transform audit skipped: %s", exc)
-
-        # Post-process: strip local file paths from SurfaceAppearance textures.
-        # Done via regex on raw XML to preserve CDATA sections in scripts.
-        import re as _re_post
-        raw_xml = rbxlx_path.read_text(encoding="utf-8")
-        # Remove <Content name="..."><url>LOCAL_PATH</url></Content> entries
-        # where the URL is a local path (contains / or \ but not rbxassetid)
-        original_len = len(raw_xml)
-        pattern = r'<Content name="[^"]*">\s*<url>[^<]*(?:/|\\)[^<]*</url>\s*</Content>'
-        matches = list(_re_post.finditer(pattern, raw_xml))
-        stripped = 0
-        for m in matches:
-            if "rbxassetid" not in m.group():
-                stripped += 1
-        if stripped:
-            raw_xml = _re_post.sub(
-                lambda m: "" if "rbxassetid" not in m.group() else m.group(),
-                pattern, raw_xml,
-            )
-            rbxlx_path.write_text(raw_xml, encoding="utf-8")
-            log.info("[write_output] Stripped %d invalid local texture paths from SurfaceAppearances", stripped)
-
-        # UNCONVERTED.md — human-readable log of features the converter
-        # deliberately dropped (e.g. binary .controller files that need
-        # UnityPy text-export, 2D blend trees). Sources contribute via
-        # their result objects' ``unconverted`` list.
-        self._write_unconverted_md()
-
-        # Structured conversion report (see converter.report_generator).
-        # The interactive report() command decorates this file in place.
-        report_path = self.output_dir / "conversion_report.json"
-        structured = self._build_conversion_report(rbxlx_path, result, report_path)
-        from converter.report_generator import generate_report
-        generate_report(structured, report_path, print_summary=False)
-
-        # Persist context.
-        self.ctx.save(self._context_path)
-        log.info("[write_output] Context saved to %s", self._context_path)
 
     def _write_unconverted_md(self) -> None:
         """Aggregate ``unconverted`` entries from result objects into
