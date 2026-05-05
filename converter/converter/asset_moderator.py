@@ -270,7 +270,10 @@ def _screen_image_content(
                 }
                 media_type = media_map.get(suffix)
                 if not media_type:
-                    # Convert non-standard formats to PNG
+                    # Convert non-standard formats to PNG. PIL raises
+                    # UnidentifiedImageError (subclass of OSError) on
+                    # unreadable formats, OSError on disk failures, and
+                    # ValueError on unsupported pixel modes.
                     try:
                         from PIL import Image
                         import io
@@ -279,7 +282,8 @@ def _screen_image_content(
                         img.convert("RGBA").save(buf, format="PNG")
                         img_data = buf.getvalue()
                         media_type = "image/png"
-                    except Exception:
+                    except (OSError, ValueError) as exc:
+                        log.debug("Skipping image %s: %s", img_path, exc)
                         continue
 
                 b64 = base64.b64encode(img_data).decode()

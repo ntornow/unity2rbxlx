@@ -652,7 +652,8 @@ def _collect_externals(env: Any) -> list[Any]:
             continue
         try:
             return list(ext)
-        except TypeError:
+        except TypeError as exc:
+            log.debug("UnityPy externals not iterable on %s: %s", obj, exc)
             return []
     return []
 

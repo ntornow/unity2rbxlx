@@ -95,6 +95,10 @@ def read_unity_terrain(terrain_data_path: Path) -> dict[str, Any] | None:
                 for layer_ref in splat.m_TerrainLayers:
                     # Try to resolve the layer name from the referenced object
                     layer_name = ""
+                    # UnityPy's .read() / .get_obj() can raise on an
+                    # unresolvable reference (PPtr to a stripped object).
+                    # Falling back to the raw PPtr string is fine — the
+                    # downstream layer_name normalization handles it.
                     try:
                         if hasattr(layer_ref, "read"):
                             layer_obj = layer_ref.read()
@@ -106,8 +110,8 @@ def read_unity_terrain(terrain_data_path: Path) -> dict[str, Any] | None:
                             layer_obj = layer_ref.get_obj().read()
                             if hasattr(layer_obj, "m_Name"):
                                 layer_name = str(layer_obj.m_Name)
-                    except Exception:
-                        pass
+                    except (AttributeError, KeyError, ValueError) as exc:
+                        log.debug("Could not resolve terrain layer ref: %s", exc)
                     if not layer_name:
                         layer_name = str(layer_ref)
                     layer_names.append(layer_name)
