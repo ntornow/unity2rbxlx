@@ -1433,6 +1433,19 @@ def _process_components(
     rigidbody_props: dict[str, Any] = {}
     original_size = part.size  # Save for collider calculations
 
+    # Pre-scan: does ANY collider on this GameObject mark itself as a trigger?
+    # When yes, the trigger's "detection volume" semantics dominate even if a
+    # physical collider was emitted later in the YAML. Without this pre-scan,
+    # the policy is order-dependent: [physical, trigger] → CanCollide=False
+    # but [trigger, physical] → CanCollide=True (because the physical branch
+    # would re-flip it). Unity component order isn't guaranteed across prefab
+    # variants, so the conversion result needs to be order-independent.
+    node_has_trigger = any(
+        c.component_type in _COLLIDER_TYPES
+        and bool(int(c.properties.get("m_IsTrigger", 0)))
+        for c in node.components
+    )
+
     for comp in node.components:
         ct = comp.component_type
 
@@ -1506,9 +1519,12 @@ def _process_components(
                         max(part.size[1], adjusted_size[1]),
                         max(part.size[2], adjusted_size[2]),
                     )
-                part.can_collide = can_collide
-                if can_collide:
-                    part._has_physical_collider = True
+                # Trigger semantics dominate when both kinds are on the
+                # same node — see ``node_has_trigger`` pre-scan above.
+                if not node_has_trigger:
+                    part.can_collide = can_collide
+                    if can_collide:
+                        part._has_physical_collider = True
                 # Apply collider center offset to part CFrame position.
                 # Skip for Y-up FBX meshes where Roblox bakes mesh positions.
                 if center_offset != (0.0, 0.0, 0.0):

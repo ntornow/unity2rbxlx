@@ -16,6 +16,9 @@ from converter.script_coherence import (
     _fix_prefab_lookups,
     _remove_stale_player_requires,
     _disable_default_controls_in_fps_scripts,
+    _expose_local_script_events,
+    _add_trigger_stay_polling,
+    _fix_pickup_visual_target,
 )
 
 
@@ -615,3 +618,357 @@ class TestDisableDefaultControlsInFpsScripts:
 
         # Must fire on initial character AND every respawn, not once.
         assert src.count("_snapToFloor(") >= 2
+
+
+class TestRemoveStalePlayerRequiresServerStub:
+    """Server-side `require(ReplicatedStorage:WaitForChild("Player"))` must
+    be replaced with a benign stub. The server can't require a LocalScript
+    so the original call would either infinite-yield on WaitForChild or
+    crash. Real-world repro: SimpleFPS Machine.luau.
+    """
+
+    def test_server_inline_require_replaced_with_stub(self):
+        scripts = [
+            RbxScript(name="Player", source="return {}", script_type="LocalScript"),
+            RbxScript(
+                name="Machine",
+                source=(
+                    'local ReplicatedStorage = game:GetService("ReplicatedStorage")\n'
+                    'local Player = require(ReplicatedStorage:WaitForChild("Player"))\n'
+                    'local items = Player.hasItems()\n'
+                ),
+                script_type="Script",
+            ),
+        ]
+        _remove_stale_player_requires(scripts)
+        out = scripts[1].source
+        assert "require(ReplicatedStorage:WaitForChild" not in out, (
+            "server-side require would infinite-yield; must be stubbed"
+        )
+        assert "hasItems = function() return {} end" in out
+        # Subsequent ``Player.hasItems()`` calls should still type-check
+        # against the stub table without raising at parse time.
+        assert "Player.hasItems()" in out
+
+    def test_server_stub_uses_indent_from_source(self):
+        # Stubbed line must preserve the original indentation so the
+        # surrounding block stays well-formed.
+        scripts = [
+            RbxScript(name="Player", source="return {}", script_type="LocalScript"),
+            RbxScript(
+                name="Machine",
+                source=(
+                    "do\n"
+                    '    local Player = require(ReplicatedStorage:WaitForChild("Player"))\n'
+                    "end\n"
+                ),
+                script_type="Script",
+            ),
+        ]
+        _remove_stale_player_requires(scripts)
+        out = scripts[1].source
+        # The stub line should be indented 4 spaces inside the do-block.
+        assert "    local Player = " in out
+
+    def test_server_path_does_not_misfire_on_unrelated_require(self):
+        # Stub regex requires ``:WaitForChild("Player")`` *inside* the
+        # require argument. A require of something else must not be stubbed.
+        scripts = [
+            RbxScript(name="Player", source="return {}", script_type="LocalScript"),
+            RbxScript(
+                name="ServerOther",
+                source='local M = require(ReplicatedStorage:WaitForChild("MathUtil"))\n',
+                script_type="Script",
+            ),
+        ]
+        _remove_stale_player_requires(scripts)
+        # Untouched
+        assert 'require(ReplicatedStorage:WaitForChild("MathUtil"))' in scripts[1].source
+        assert "hasItems" not in scripts[1].source
+
+
+class TestRemoveStalePlayerRequiresLineAnchored:
+    """Regression: the rewrite regex used to stop at the inner
+    ``:WaitForChild("Player")`` close-paren and leave any wrapping ``)``
+    behind. HudControl and Plane both shipped with an orphan ``)`` that
+    broke parsing (``Expected identifier when parsing expression, got ')'``).
+    Anchor the regex to the full line so trailing junk gets consumed.
+    """
+
+    def test_extra_trailing_paren_is_consumed(self):
+        scripts = [
+            RbxScript(name="Player", source="return {}", script_type="LocalScript"),
+            RbxScript(
+                name="HudControl",
+                source=(
+                    'local Player = ('
+                    'game:GetService("Players").LocalPlayer'
+                    ':WaitForChild("PlayerScripts"):WaitForChild("Player"))\n'
+                    'Player:DoStuff()\n'
+                ),
+                script_type="LocalScript",
+            ),
+        ]
+        _remove_stale_player_requires(scripts)
+        out = scripts[1].source
+        # No orphan ``))`` left over from the wrapping paren.
+        assert ":WaitForChild(\"Player\"))" not in out
+        # Binding still functional.
+        assert (
+            'local Player = game:GetService("Players").LocalPlayer'
+            ':WaitForChild("PlayerScripts"):WaitForChild("Player")'
+        ) in out
+
+    def test_indent_preserved(self):
+        scripts = [
+            RbxScript(name="Player", source="return {}", script_type="LocalScript"),
+            RbxScript(
+                name="Indented",
+                source='        local P = ws:WaitForChild("Player")\n',
+                script_type="LocalScript",
+            ),
+        ]
+        _remove_stale_player_requires(scripts)
+        # Eight-space indent preserved.
+        assert scripts[1].source.startswith("        local P = ")
+
+
+class TestExposeLocalScriptEvents:
+    """Cross-script BindableEvent wiring. Producer LocalScript needs to
+    parent its events to ``script`` with matching Name; consumers need
+    ``<var>.<Key>:Connect`` rewritten to
+    ``<var>:WaitForChild("<Key>").Event:Connect``. Without both, the
+    consumer indexes the producer LocalScript Instance for a non-existent
+    property and hits "X is not a valid member of LocalScript".
+    """
+
+    def test_producer_parents_bindables(self):
+        producer = RbxScript(
+            name="Player",
+            source=(
+                "local Player = {}\n"
+                'local healthEvent = Instance.new("BindableEvent")\n'
+                "Player.HealthUpdate = healthEvent.Event\n"
+            ),
+            script_type="LocalScript",
+        )
+        _expose_local_script_events([producer])
+        assert 'healthEvent.Name = "HealthUpdate"' in producer.source
+        assert "healthEvent.Parent = script" in producer.source
+
+    def test_consumer_subscription_rewritten(self):
+        producer = RbxScript(
+            name="Player",
+            source=(
+                "local Player = {}\n"
+                'local ev = Instance.new("BindableEvent")\n'
+                "Player.HealthUpdate = ev.Event\n"
+            ),
+            script_type="LocalScript",
+        )
+        consumer = RbxScript(
+            name="HudControl",
+            source=(
+                'local Player = LocalPlayer:WaitForChild("PlayerScripts"):WaitForChild("Player")\n'
+                "Player.HealthUpdate:Connect(function() end)\n"
+            ),
+            script_type="LocalScript",
+        )
+        _expose_local_script_events([producer, consumer])
+        assert (
+            'Player:WaitForChild("HealthUpdate").Event:Connect'
+            in consumer.source
+        )
+        assert "Player.HealthUpdate:Connect(" not in consumer.source
+
+    def test_no_op_when_no_producer(self):
+        # If no script has the ``<Table>.<Key> = <Bindable>.Event`` pattern,
+        # consumers stay untouched (otherwise we'd rewrite to call into a
+        # non-existent BindableEvent child).
+        consumer = RbxScript(
+            name="Other",
+            source=(
+                'local Player = X:WaitForChild("Player")\n'
+                "Player.SomethingElse:Connect(handler)\n"
+            ),
+            script_type="LocalScript",
+        )
+        fixes = _expose_local_script_events([consumer])
+        assert fixes == 0
+        assert "Player.SomethingElse:Connect(handler)" in consumer.source
+
+    def test_only_local_scripts_become_producers(self):
+        # A ModuleScript with the same export pattern is exporting a real
+        # API surface (require()-able). Don't rewrite it as a sibling
+        # LocalScript — the WaitForChild path won't resolve a Module's
+        # "child" Bindables since modules are typically required, not
+        # walked.
+        mod = RbxScript(
+            name="Stats",
+            source=(
+                "local M = {}\n"
+                'local ev = Instance.new("BindableEvent")\n'
+                "M.Update = ev.Event\n"
+                "return M\n"
+            ),
+            script_type="ModuleScript",
+        )
+        fixes = _expose_local_script_events([mod])
+        assert fixes == 0
+        assert "ev.Parent = script" not in mod.source
+
+    def test_idempotent(self):
+        producer = RbxScript(
+            name="Player",
+            source=(
+                "local Player = {}\n"
+                'local ev = Instance.new("BindableEvent")\n'
+                "Player.HealthUpdate = ev.Event\n"
+            ),
+            script_type="LocalScript",
+        )
+        _expose_local_script_events([producer])
+        first = producer.source
+        _expose_local_script_events([producer])
+        assert producer.source == first, "second pass must be a no-op"
+
+
+class TestAddTriggerStayPolling:
+    """Approximate Unity OnTriggerStay with a Heartbeat poll. Without it,
+    a single-shot ``Touched:Connect`` plus a per-frame angle check yields
+    a turret that engages a target only on the exact frame the player
+    first touches the trigger zone — and never re-checks as the turret
+    rotates. Detection is gated on a 4-token signature so unrelated
+    scripts don't get a poll loop appended.
+    """
+
+    def _turret_source(self, **omit):
+        # Minimal reproducer of the AI-emitted turret pattern. Override
+        # the kwargs to remove a token and force the heuristic to skip.
+        tokens = {
+            "trigger": 'local triggerCollider = model:FindFirstChild("Collider")',
+            "touched": "triggerCollider.Touched:Connect(function(other) end)",
+            "angle": "if angle < 55 then end",
+            "engage": "startEngaged(target)",
+            "tbase": "local function getTBase() end",
+            "sight": "local function getSightRadius() end",
+        }
+        for k in omit:
+            tokens.pop(k, None)
+        return "\n".join(tokens.values()) + "\n"
+
+    def test_appends_poll_loop_when_all_tokens_present(self):
+        s = RbxScript(name="Turret", source=self._turret_source(), script_type="Script")
+        fixes = _add_trigger_stay_polling([s])
+        assert fixes == 1
+        assert "RunService.Heartbeat:Connect" in s.source
+        assert "GetPartBoundsInRadius" in s.source
+        assert "__TRIGGER_STAY_POLL__" in s.source
+
+    def test_skips_script_without_triggerCollider(self):
+        s = RbxScript(name="Other", source=self._turret_source(trigger=True), script_type="Script")
+        # remove trigger token altogether
+        s.source = s.source.replace("triggerCollider", "otherCollider")
+        fixes = _add_trigger_stay_polling([s])
+        assert fixes == 0
+        assert "RunService.Heartbeat:Connect" not in s.source
+
+    def test_skips_script_without_angle_check(self):
+        # No "angle <" token — could be a generic touch handler with no
+        # cone-of-vision logic, so polling is unnecessary.
+        s = RbxScript(name="OtherTouch", source=self._turret_source(angle=True), script_type="Script")
+        s.source = s.source.replace("if angle < 55 then end", "")
+        fixes = _add_trigger_stay_polling([s])
+        assert fixes == 0
+
+    def test_skips_script_without_startEngaged(self):
+        s = RbxScript(name="OtherTouch", source=self._turret_source(engage=True), script_type="Script")
+        s.source = s.source.replace("startEngaged(target)", "")
+        fixes = _add_trigger_stay_polling([s])
+        assert fixes == 0
+
+    def test_skips_script_without_getTBase(self):
+        # The Unity-specific tBase identifier anchors the heuristic to
+        # turret-shaped scripts. Without it we don't know the script
+        # uses the per-frame state machine convention we're patching.
+        s = RbxScript(name="OtherTouch", source=self._turret_source(tbase=True), script_type="Script")
+        fixes = _add_trigger_stay_polling([s])
+        assert fixes == 0
+
+    def test_idempotent(self):
+        s = RbxScript(name="Turret", source=self._turret_source(), script_type="Script")
+        _add_trigger_stay_polling([s])
+        first = s.source
+        fixes = _add_trigger_stay_polling([s])
+        assert fixes == 0
+        assert s.source == first
+
+
+class TestFixPickupVisualTarget:
+    """Pickup script's body gets wholesale replaced with a Model-aware
+    rotate+bob+touched template. Detection requires the AI's translation
+    of Unity Pickup.cs (``rotationSpeed`` + bob loop + Touched + GetItem).
+    Wrong matches would silently drop game logic.
+    """
+
+    _PICKUP_SHAPE = (
+        "local rotationSpeed = 100\n"
+        "local function moveDown() end\n"
+        "part.Touched:Connect(function(o)\n"
+        '    other:SendMessage("GetItem", itemName)\n'
+        "end)\n"
+    )
+
+    def test_replaces_body_when_all_anchors_present(self):
+        s = RbxScript(name="Pickup", source=self._PICKUP_SHAPE, script_type="Script")
+        fixes = _fix_pickup_visual_target([s])
+        assert fixes == 1
+        assert "findVisualTarget" in s.source, (
+            "replacement template must include the Model-aware target finder"
+        )
+        assert "PivotTo" in s.source
+        # The original body must be gone — the new template is canonical.
+        assert "part.Touched:Connect(function(o)" not in s.source
+
+    def test_skips_when_name_does_not_match_pickup(self):
+        # Name guard prevents accidental replacement of a different
+        # script that happens to mention "rotationSpeed".
+        s = RbxScript(name="Spinner", source=self._PICKUP_SHAPE, script_type="Script")
+        fixes = _fix_pickup_visual_target([s])
+        assert fixes == 0
+        assert s.source == self._PICKUP_SHAPE
+
+    def test_skips_when_anchor_token_missing(self):
+        # The 4-token gate (rotationSpeed + moveDown + Touched + GetItem)
+        # must all match. A Pickup-named script that doesn't follow the
+        # Unity pattern (e.g. hand-rewritten) is left alone.
+        no_get_item = self._PICKUP_SHAPE.replace("GetItem", "GiveItem")
+        s = RbxScript(name="Pickup", source=no_get_item, script_type="Script")
+        fixes = _fix_pickup_visual_target([s])
+        assert fixes == 0
+        assert s.source == no_get_item
+
+    def test_template_handles_model_target(self):
+        # The replacement template must include code paths for both
+        # BasePart and Model targets — the bug it's fixing is that
+        # rotation only worked on the invisible trigger Part, not the
+        # visible child Model.
+        s = RbxScript(name="Pickup", source=self._PICKUP_SHAPE, script_type="Script")
+        _fix_pickup_visual_target([s])
+        assert ':IsA("Model")' in s.source
+        assert ":PivotTo(" in s.source
+        # And the template must read itemName from container fallback
+        # too, since Unity MonoBehaviour fields land on the parent Part,
+        # not the Script.
+        assert 'container:GetAttribute("itemName")' in s.source
+
+    def test_idempotent(self):
+        s = RbxScript(name="Pickup", source=self._PICKUP_SHAPE, script_type="Script")
+        _fix_pickup_visual_target([s])
+        first = s.source
+        fixes = _fix_pickup_visual_target([s])
+        # The ``if poll_marker in source: continue`` guard isn't on this
+        # pass; instead the source no longer matches the 4-token gate
+        # because the template doesn't have ``moveDown`` lowercase as a
+        # bare function (it's wrapped) — verify it isn't double-replaced.
+        assert s.source == first or fixes == 0

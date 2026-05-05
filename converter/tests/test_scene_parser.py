@@ -165,3 +165,95 @@ class TestParseRealScene:
         assert len(scene.roots) > 0
         # SimpleFPS should have many game objects
         assert len(scene.all_nodes) > 10
+
+
+class TestMChildrenOrderPreserved:
+    """When a parent Transform lists children in m_Children, the parser
+    must preserve that authored order — even when the YAML's document
+    iteration order is different. Reproducer: SimpleFPS Turret prefab
+    declared Collider's GameObject before Base in the YAML stream, but
+    the authored m_Children was [Base, Collider]. ``transform.GetChild(0)``
+    in the C# (translated to ``getTBase = getChildIndex(model, 1)``) needs
+    Base, not Collider, or the turret rotates the trigger zone instead
+    of its visible mesh.
+    """
+
+    def test_children_appear_in_m_children_order_not_yaml_order(self, tmp_path):
+        # A scene with three sibling GameObjects whose YAML-doc order
+        # is [C, B, A] but whose parent's m_Children says [A, B, C].
+        # The parsed root must yield children in [A, B, C] order.
+        scene = tmp_path / "ordered.unity"
+        scene.write_text(
+            "%YAML 1.1\n"
+            "%TAG !u! tag:unity3d.com,2011:\n"
+            # Parent GO + Transform first, but its m_Children list is the
+            # authored order: A then B then C.
+            "--- !u!1 &1\n"
+            "GameObject:\n"
+            "  m_Component:\n"
+            "  - component: {fileID: 11}\n"
+            "  m_Name: Root\n"
+            "--- !u!4 &11\n"
+            "Transform:\n"
+            "  m_GameObject: {fileID: 1}\n"
+            "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+            "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+            "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+            "  m_Children:\n"
+            "  - {fileID: 30}\n"
+            "  - {fileID: 20}\n"
+            "  - {fileID: 31}\n"
+            "  m_Father: {fileID: 0}\n"
+            # Children declared in REVERSED YAML order: C, B, A.
+            "--- !u!1 &3\n"
+            "GameObject:\n"
+            "  m_Component:\n"
+            "  - component: {fileID: 31}\n"
+            "  m_Name: ChildC\n"
+            "--- !u!4 &31\n"
+            "Transform:\n"
+            "  m_GameObject: {fileID: 3}\n"
+            "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+            "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+            "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+            "  m_Children: []\n"
+            "  m_Father: {fileID: 11}\n"
+            "--- !u!1 &2\n"
+            "GameObject:\n"
+            "  m_Component:\n"
+            "  - component: {fileID: 20}\n"
+            "  m_Name: ChildB\n"
+            "--- !u!4 &20\n"
+            "Transform:\n"
+            "  m_GameObject: {fileID: 2}\n"
+            "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+            "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+            "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+            "  m_Children: []\n"
+            "  m_Father: {fileID: 11}\n"
+            "--- !u!1 &30\n"
+            "GameObject:\n"
+            "  m_Component:\n"
+            "  - component: {fileID: 30}\n"
+            "  m_Name: ChildA\n"
+            "--- !u!4 &30\n"
+            "Transform:\n"
+            "  m_GameObject: {fileID: 30}\n"
+            "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+            "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+            "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+            "  m_Children: []\n"
+            "  m_Father: {fileID: 11}\n"
+        )
+        result = parse_scene(scene)
+        assert len(result.roots) == 1
+        root = result.roots[0]
+        assert root.name == "Root"
+        names = [c.name for c in root.children]
+        # Authored m_Children was [30, 20, 31] = [ChildA, ChildB, ChildC]
+        # YAML-doc order was [C, B, A] — must NOT match.
+        assert names == ["ChildA", "ChildB", "ChildC"], (
+            f"children appeared in {names}; expected [ChildA, ChildB, ChildC] "
+            f"from m_Children order. Falling back to YAML order would "
+            f"break ``transform.GetChild(i)`` for any prefab."
+        )

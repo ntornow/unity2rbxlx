@@ -317,3 +317,135 @@ class TestSpriteAtlasRendering:
                 if name_el is not None and "SpriteSurfaceGui" in (name_el.text or ""):
                     surface_guis.append(item)
         assert len(surface_guis) == 0
+
+
+class TestAutoRemoteEventReservedNames:
+    """The auto-RemoteEvent generator scans scripts for ``WaitForChild("X")``
+    and creates a same-named RemoteEvent. It must NOT create one for a
+    name that another writer path will also add as a Folder or
+    ModuleScript — otherwise ReplicatedStorage ends up with two siblings
+    named X and ``WaitForChild("X")`` returns a non-deterministic match.
+
+    Reproducer: SimpleFPS Player.luau does
+    ``ReplicatedStorage.Templates:WaitForChild("Rifle")``. The "Templates"
+    string in the lookup made the auto-generator emit a RemoteEvent named
+    "Templates" alongside the Folder named "Templates" that the prefab
+    packages writer creates — turret scripts then resolved Templates to
+    the RemoteEvent (no children) and infinite-yielded on
+    ``Templates:WaitForChild("TurretBullet")``.
+    """
+
+    def _place_with_template_lookup(self, has_replicated_templates: bool):
+        """Build a place with a script that WaitForChild's "Templates"
+        AND uses a RemoteEvent API (FireServer / OnServerEvent) on a
+        different name. The latter is what makes the heuristic decide
+        the lookup might be a RemoteEvent.
+        """
+        script = RbxScript(
+            name="Player",
+            source=(
+                'local ReplicatedStorage = game:GetService("ReplicatedStorage")\n'
+                'local templates = ReplicatedStorage:WaitForChild("Templates")\n'
+                'local fireRemote = ReplicatedStorage:WaitForChild("FireRemote")\n'
+                "fireRemote:FireServer()\n"
+                'templates:WaitForChild("Rifle")\n'
+            ),
+            script_type="LocalScript",
+        )
+        place = RbxPlace()
+        place.scripts.append(script)
+        if has_replicated_templates:
+            # Anything in this list triggers the writer to create the
+            # Templates Folder.
+            place.replicated_templates.append(
+                RbxPart(name="Rifle", class_name="Model")
+            )
+        return place
+
+    def _count_replicated_storage_children_named(self, root, name: str) -> dict[str, int]:
+        """Walk the rbxlx XML and return {ClassName: count} for direct
+        ReplicatedStorage children whose Name matches ``name``.
+        """
+        out: dict[str, int] = {}
+        for item in root.iter("Item"):
+            cls = item.get("class")
+            if cls != "ReplicatedStorage":
+                continue
+            # Direct children: those Items whose immediate Item parent is
+            # the ReplicatedStorage Item we just found.
+            for child in item.findall("Item"):
+                child_cls = child.get("class") or ""
+                name_el = child.find("Properties/string[@name='Name']")
+                if name_el is not None and (name_el.text or "") == name:
+                    out[child_cls] = out.get(child_cls, 0) + 1
+        return out
+
+    def test_no_remoteevent_named_templates_when_folder_exists(self, tmp_path):
+        from roblox.rbxlx_writer import write_rbxlx
+        place = self._place_with_template_lookup(has_replicated_templates=True)
+        output = tmp_path / "test.rbxlx"
+        write_rbxlx(place, output)
+        tree = ET.parse(output)
+        root = tree.getroot()
+        children = self._count_replicated_storage_children_named(root, "Templates")
+        assert children.get("Folder", 0) == 1, (
+            "Templates Folder must exist (replicated_templates is non-empty)"
+        )
+        assert "RemoteEvent" not in children, (
+            "Auto-RemoteEvent generator must skip 'Templates' when the "
+            "writer is also adding a Folder by that name. Got: %r" % children
+        )
+
+    def test_remoteevent_emitted_when_no_folder_collision(self, tmp_path):
+        # Sanity-check: the heuristic still emits RemoteEvents for names
+        # that AREN'T reserved. Otherwise the bug fix could over-suppress.
+        from roblox.rbxlx_writer import write_rbxlx
+        place = self._place_with_template_lookup(has_replicated_templates=False)
+        output = tmp_path / "test.rbxlx"
+        write_rbxlx(place, output)
+        tree = ET.parse(output)
+        root = tree.getroot()
+        # FireRemote was looked up + used with FireServer — should be
+        # auto-created as a RemoteEvent.
+        fireremote = self._count_replicated_storage_children_named(root, "FireRemote")
+        assert fireremote.get("RemoteEvent", 0) == 1, (
+            "auto-RemoteEvent for FireRemote must still be emitted; got %r"
+            % fireremote
+        )
+
+    def test_no_remoteevent_named_after_modulescript(self, tmp_path):
+        # If any script is a ModuleScript with name "EventSystem", and a
+        # different script does ``ReplicatedStorage:WaitForChild("EventSystem")``,
+        # we must NOT create a RemoteEvent named "EventSystem" — the
+        # ModuleScript will be added to ReplicatedStorage by the storage
+        # classifier and a sibling RemoteEvent of the same name would
+        # cause the same WaitForChild ambiguity.
+        from roblox.rbxlx_writer import write_rbxlx
+        module = RbxScript(
+            name="EventSystem",
+            source="local M = {}\nfunction M.fire() end\nreturn M\n",
+            script_type="ModuleScript",
+        )
+        consumer = RbxScript(
+            name="Other",
+            source=(
+                'local ReplicatedStorage = game:GetService("ReplicatedStorage")\n'
+                'local es = ReplicatedStorage:WaitForChild("EventSystem")\n'
+                'local r = ReplicatedStorage:WaitForChild("Hit")\n'
+                "r:FireServer()\n"
+            ),
+            script_type="LocalScript",
+        )
+        place = RbxPlace()
+        place.scripts.extend([module, consumer])
+        output = tmp_path / "test.rbxlx"
+        write_rbxlx(place, output)
+        tree = ET.parse(output)
+        root = tree.getroot()
+        children = self._count_replicated_storage_children_named(root, "EventSystem")
+        # The storage classifier puts ModuleScripts in ReplicatedStorage by
+        # default. We don't want a sibling RemoteEvent of the same name.
+        assert "RemoteEvent" not in children, (
+            "Auto-RemoteEvent generator must skip names that match an "
+            "emitted ModuleScript. Got: %r" % children
+        )

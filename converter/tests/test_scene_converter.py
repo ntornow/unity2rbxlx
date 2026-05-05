@@ -566,10 +566,13 @@ class TestMixedColliderHandling:
     def test_trigger_then_physical_takes_trigger_behavior(self):
         """Trigger first then physical: same outcome — trigger wins.
 
-        Order-independent. The physical collider's size still gets merged
-        in via max(), but its CanCollide flag is overridden because the
-        trigger pass set CanCollide=False and the physical branch never
-        revisits it once a trigger ran.
+        Order-independent. ``_process_components`` pre-scans for any
+        trigger collider on the node before iterating; if present, the
+        physical branch skips its own ``can_collide=True`` assignment.
+        Without the pre-scan the policy would be last-one-wins (which
+        Unity component order is YAML-document order, not deterministic
+        across prefab variants — that flaky behavior used to be the
+        observed "feature" before this fix).
         """
         from converter.scene_converter import _process_components
         from core.roblox_types import RbxPart
@@ -590,11 +593,8 @@ class TestMixedColliderHandling:
         part = RbxPart(name="DoorBase", size=(3.571, 3.571, 3.571))
         _process_components(FakeNode(), part)
 
-        # Trigger ran first and set CanCollide=False; the physical branch
-        # then sets it back to True. So in this ordering the test sees
-        # can_collide=True. This is order-dependent — see the
-        # ``physical_then_trigger`` test for the dominant case.
-        assert part.can_collide is True, "Physical processed after trigger restores CanCollide"
+        assert part.can_collide is False, "Trigger semantics dominate regardless of YAML order"
+        assert getattr(part, 'can_query', True) is True, "Trigger should set CanQuery=True"
 
 
 class TestExtractPrefabMaterialMap:
