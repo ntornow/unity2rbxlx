@@ -268,6 +268,27 @@ def generate_place_luau(
     for part in place.server_storage_parts:
         _emit_part(b, part, "SS", mesh_cache, part_counter)
 
+    # --- ReplicatedStorage prefab templates ---
+    # rbxlx_writer.py emits these under ReplicatedStorage.Templates so
+    # gameplay scripts can ``ReplicatedStorage.Templates:WaitForChild(...):Clone()``.
+    # The headless path needs the same folder for two reasons:
+    #   1. PrefabSpawner.luau (in place.scripts) calls
+    #      ``ReplicatedStorage:WaitForChild("Templates")`` — without the
+    #      folder it stalls forever.
+    #   2. Phase 5.9 attaches prefab-scoped animation scripts under
+    #      ``template.scripts`` (see Pipeline._reparent_prefab_scoped_animation_scripts).
+    #      _emit_part recurses into ``part.scripts`` so the animation
+    #      driver clones with the template.
+    templates = getattr(place, "replicated_templates", None) or []
+    if templates:
+        b.block("do")
+        b.line("local TF=Instance.new('Folder')")
+        b.line("TF.Name='Templates'")
+        b.line("TF.Parent=RS")
+        for template in templates:
+            _emit_part(b, template, "TF", mesh_cache, part_counter)
+        b.end()
+
     b.line()
 
     # --- Scripts ---

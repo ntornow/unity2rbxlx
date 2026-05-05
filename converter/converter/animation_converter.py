@@ -281,6 +281,13 @@ class AnimationConversionResult:
     # aggregates these into UNCONVERTED.md so users know what was dropped.
     # Each entry: {"category": str, "item": str, "reason": str}.
     unconverted: list[dict[str, str]] = field(default_factory=list)
+    # ``generated_scripts`` entry name → prefab template name, populated
+    # only for emissions whose scope is a prefab (the controller lives
+    # inside a PrefabTemplate). The pipeline uses this to reparent the
+    # script under ``ReplicatedStorage.Templates.<Prefab>`` so cloning
+    # the template carries the animation driver. Scripts with a scene-
+    # scope or no scope stay in the place's flat script list.
+    script_scopes: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -1126,6 +1133,8 @@ def generate_tween_script(
     clip: AnimClip,
     game_object_name: str = "",
     controller: AnimatorController | None = None,
+    *,
+    prefab_scoped: bool = False,
 ) -> str:
     """Generate a Luau script that uses TweenService to play an AnimClip.
 
@@ -1137,6 +1146,12 @@ def generate_tween_script(
         clip: The parsed AnimClip to convert.
         game_object_name: Name of the target Roblox part/model.
         controller: Optional controller for state machine context.
+        prefab_scoped: When True, the script lives under a template
+            cloned via ``ReplicatedStorage.Templates.<Prefab>:Clone()``.
+            Target binding walks up from ``script.Parent`` so each clone's
+            script animates its own clone — a global ``workspace`` search
+            would bind every clone's script to whichever copy
+            ``FindFirstChild(name, true)`` returns first.
 
     Returns:
         Luau source code as a string.
@@ -1158,26 +1173,57 @@ def generate_tween_script(
     lines.append("local RunService = game:GetService(\"RunService\")")
     lines.append("")
 
-    # Animation scripts live in ServerScriptService, so find targets in workspace.
-    # Try the explicit name first, then fall back to searching by clip name.
-    # Extract potential target names from curve paths (used for both target search and child path trimming)
+    # Curve-path roots are used by both the target lookup (workspace path)
+    # and the child-path trimming logic later, so compute them up front
+    # regardless of which target-binding branch we take.
     curve_roots: set[str] = set()
     for c in clip.curves:
         if c.path:
             root = c.path.split("/")[0]
             curve_roots.add(root)
 
-    if target_name:
-        lines.append(f'local target = workspace:FindFirstChild("{target_name}", true)')
-    else:
-        # Try to find target by clip name or common parent patterns
-        lines.append(f'-- No explicit target; search workspace for an object this animation might apply to')
-        lines.append(f'local target = nil')
-        if curve_roots:
-            for root in sorted(curve_roots):
-                lines.append(f'if not target then target = workspace:FindFirstChild("{root}", true) end')
+    if prefab_scoped:
+        # Smart binding: works whether this script lives under a cloned
+        # prefab template (script.Parent is the clone) or in the global
+        # flat list as a fallback for scene-baked instances. Without the
+        # script.Parent branch, multi-instance prefabs all bind to whichever
+        # copy ``workspace:FindFirstChild`` returns first — only one
+        # animates correctly. Without the fallback, scene-baked prefab
+        # instances (no script attached) get no driver at all.
+        lines.append("-- Prefab-scoped: prefer script.Parent (this clone), fall")
+        lines.append("-- back to workspace search when running from a global container.")
+        lines.append("local target")
+        lines.append("if script.Parent and (script.Parent:IsA('Model') or script.Parent:IsA('BasePart')) then")
+        if target_name and target_name != "":
+            # Animator host may live on a child of the prefab root —
+            # search within the clone before settling on script.Parent.
+            lines.append(f'    target = script.Parent:FindFirstChild("{target_name}", true) or script.Parent')
         else:
-            lines.append(f'target = workspace:FindFirstChild("{clip.name}", true)')
+            lines.append("    target = script.Parent")
+        lines.append("else")
+        if target_name:
+            lines.append(f'    target = workspace:FindFirstChild("{target_name}", true)')
+        elif curve_roots:
+            lines.append("    target = nil")
+            for root in sorted(curve_roots):
+                lines.append(f'    if not target then target = workspace:FindFirstChild("{root}", true) end')
+        else:
+            lines.append(f'    target = workspace:FindFirstChild("{clip.name}", true)')
+        lines.append("end")
+    else:
+        # Animation scripts live in ServerScriptService, so find targets in workspace.
+        # Try the explicit name first, then fall back to searching by clip name.
+        if target_name:
+            lines.append(f'local target = workspace:FindFirstChild("{target_name}", true)')
+        else:
+            # Try to find target by clip name or common parent patterns
+            lines.append(f'-- No explicit target; search workspace for an object this animation might apply to')
+            lines.append(f'local target = nil')
+            if curve_roots:
+                for root in sorted(curve_roots):
+                    lines.append(f'if not target then target = workspace:FindFirstChild("{root}", true) end')
+            else:
+                lines.append(f'target = workspace:FindFirstChild("{clip.name}", true)')
     lines.append(f'if not target then')
     lines.append(f'    -- Animation target not found; script will not run')
     lines.append(f'    return')
@@ -1456,6 +1502,8 @@ def generate_state_machine_script(
     controller: AnimatorController,
     clips_by_guid: dict[str, AnimClip],
     game_object_name: str = "",
+    *,
+    prefab_scoped: bool = False,
 ) -> str:
     """Generate a unified Luau state machine script for an AnimatorController.
 
@@ -1469,6 +1517,12 @@ def generate_state_machine_script(
         controller: The parsed AnimatorController.
         clips_by_guid: Dict mapping clip GUID to AnimClip.
         game_object_name: Name of the target Roblox part/model.
+        prefab_scoped: When True, the script lives under a template
+            cloned via ``ReplicatedStorage.Templates.<Prefab>:Clone()``.
+            Target binding walks up from ``script.Parent`` so each clone's
+            state machine drives its own clone — a global ``workspace``
+            search would bind every clone to whichever copy
+            ``FindFirstChild(name, true)`` returns first.
 
     Returns:
         Luau source code as a string, or "" if no usable states.
@@ -1502,9 +1556,24 @@ def generate_state_machine_script(
     lines.append('local RunService = game:GetService("RunService")')
     lines.append("")
 
-    # Find target
+    # Find target. Prefab-scoped scripts use a smart-binding lookup:
+    # prefer script.Parent (so each clone of a prefab template animates
+    # itself), fall back to workspace search (so the same script body
+    # also drives scene-baked instances when it lives in the global flat
+    # list). Searching within script.Parent for the controller name
+    # handles prefabs whose Animator sits on a child node, not the root.
     target_name = game_object_name or controller.name
-    lines.append(f'local target = workspace:FindFirstChild("{target_name}", true)')
+    if prefab_scoped:
+        lines.append("-- Prefab-scoped: prefer script.Parent (this clone), fall")
+        lines.append("-- back to workspace search when running from a global container.")
+        lines.append("local target")
+        lines.append("if script.Parent and (script.Parent:IsA('Model') or script.Parent:IsA('BasePart')) then")
+        lines.append(f'    target = script.Parent:FindFirstChild("{target_name}", true) or script.Parent')
+        lines.append("else")
+        lines.append(f'    target = workspace:FindFirstChild("{target_name}", true)')
+        lines.append("end")
+    else:
+        lines.append(f'local target = workspace:FindFirstChild("{target_name}", true)')
     lines.append("if not target then return end")
     lines.append("if target:IsA('Model') then")
     lines.append("    target = target.PrimaryPart or target:FindFirstChildWhichIsA('BasePart') or target")
@@ -2012,10 +2081,13 @@ def convert_animations(
         # controllers attached directly to a scene's GameObjects.
         if prefab_scopes:
             scopes = list(prefab_scopes)
+            scope_is_prefab = True
         elif scene_scopes:
             scopes = list(scene_scopes)
+            scope_is_prefab = False
         else:
             scopes = default_scopes
+            scope_is_prefab = False
 
         scene_match = ctrl_key in scenes_per_controller
         prefab_match = ctrl_key in prefabs_per_controller
@@ -2122,9 +2194,12 @@ def convert_animations(
                     controller=ctrl,
                     clips_by_guid={g: c for g, c in clips_by_guid.items() if not c.is_transform_only},
                     game_object_name=ctrl.name,
+                    prefab_scoped=scope_is_prefab,
                 )
                 if luau_source:
                     result.generated_scripts.append((script_name, luau_source))
+                    if scope_is_prefab:
+                        result.script_scopes[script_name] = scope
 
             # Inline TweenService script for every transform-only clip,
             # regardless of state-machine presence — these never go
@@ -2136,9 +2211,12 @@ def convert_animations(
                     clip=clip,
                     game_object_name=ctrl.name,
                     controller=ctrl,
+                    prefab_scoped=scope_is_prefab,
                 )
                 if luau_source:
                     result.generated_scripts.append((script_name, luau_source))
+                    if scope_is_prefab:
+                        result.script_scopes[script_name] = scope
 
             # animator_runtime JSON module — emit only when at least one
             # humanoid clip lands here. Transform-only clips are NOT

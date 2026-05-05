@@ -2942,6 +2942,147 @@ class TestPhase59PrefabScopedTweenScripts:
         assert any(n == "Anim_Vehicle_Wheel_Spin" for n in names), names
         # Scene scope must NOT be present when prefab scope is in effect.
         assert not any(n == "Anim_Level1_Wheel_Spin" for n in names), names
+        # script_scopes carries the prefab name so the pipeline can
+        # reparent the script under ReplicatedStorage.Templates.<Prefab>
+        # — the scene-scoped path must NOT populate this map (asserted
+        # in a sibling test below).
+        assert result.script_scopes.get("Anim_Vehicle_Wheel_Spin") == "Vehicle", (
+            f"expected prefab-scoped script in script_scopes, got "
+            f"{result.script_scopes}"
+        )
+
+    def test_prefab_scoped_script_targets_script_parent_not_workspace(
+        self, tmp_path: Path,
+    ) -> None:
+        """Prefab-scoped scripts must bind to ``script.Parent`` (the cloned
+        model), not to ``workspace:FindFirstChild(name, true)``. Without
+        this, two clones of the same prefab template each carry their own
+        script, but every clone's script binds to whichever clone
+        FindFirstChild returns first — only one clone animates correctly.
+        """
+        from core.unity_types import (
+            ParsedScene,
+            PrefabInstanceData,
+            PrefabLibrary,
+            PrefabTemplate,
+        )
+        from unity.guid_resolver import build_guid_index
+        from unity.prefab_parser import aggregate_prefab_controller_refs
+
+        project, ctrl_guid, _ = self._build_transform_only_controller_project(tmp_path)
+        prefab = PrefabTemplate(
+            prefab_path=project / "Assets" / "Vehicle.prefab",
+            name="Vehicle",
+            referenced_animator_controller_guids={ctrl_guid},
+        )
+        library = PrefabLibrary(
+            prefabs=[prefab],
+            by_name={"Vehicle": prefab},
+            by_guid={"vehicle" + "0" * 25: prefab},
+        )
+        scene = ParsedScene(
+            scene_path=project / "Assets" / "Level1.unity",
+            prefab_instances=[PrefabInstanceData(
+                file_id="500",
+                source_prefab_guid="vehicle" + "0" * 25,
+                source_prefab_file_id="0",
+                transform_parent_file_id="0",
+                modifications=[],
+            )],
+        )
+        aggregate_prefab_controller_refs(scene, library)
+
+        guid_index = build_guid_index(project)
+        result = convert_animations(
+            project,
+            guid_index=guid_index,
+            parsed_scenes=[scene],
+            prefab_library=library,
+        )
+        prefab_source = next(
+            source for name, source in result.generated_scripts
+            if name == "Anim_Vehicle_Wheel_Spin"
+        )
+        # Smart binding: script.Parent (clone) wins, with a workspace
+        # fallback only for the global flat-list copy that drives
+        # scene-baked instances. Both branches must be present.
+        assert "script.Parent" in prefab_source, (
+            "expected prefab-scoped script to bind via script.Parent so "
+            "each clone animates its own copy; full source:\n" + prefab_source
+        )
+        assert "workspace:FindFirstChild" in prefab_source, (
+            "expected prefab-scoped script to keep a workspace fallback for "
+            "scene-baked instances; full source:\n" + prefab_source
+        )
+        # The branch ordering matters: script.Parent first, fall back to
+        # workspace search. Otherwise multi-clone setups race the global
+        # search ahead of the per-clone binding.
+        parent_idx = prefab_source.index("script.Parent")
+        ws_idx = prefab_source.index("workspace:FindFirstChild")
+        assert parent_idx < ws_idx, (
+            "script.Parent branch must precede the workspace fallback so "
+            "clones bind to themselves before falling through; full source:\n"
+            + prefab_source
+        )
+
+    def test_scene_scoped_script_keeps_workspace_lookup(
+        self, tmp_path: Path,
+    ) -> None:
+        """Scene-scoped scripts (no prefab template to live in) keep the
+        legacy workspace lookup. Switching them to ``script.Parent`` would
+        miss the target since these scripts live in a global container."""
+        from core.unity_types import ParsedScene
+        from unity.guid_resolver import build_guid_index
+
+        project, ctrl_guid, _ = self._build_transform_only_controller_project(tmp_path)
+        scene = ParsedScene(
+            scene_path=project / "Assets" / "Level1.unity",
+            referenced_animator_controller_guids={ctrl_guid},
+        )
+        guid_index = build_guid_index(project)
+        result = convert_animations(
+            project,
+            guid_index=guid_index,
+            parsed_scenes=[scene],
+        )
+        scene_source = next(
+            source for name, source in result.generated_scripts
+            if name == "Anim_Level1_Wheel_Spin"
+        )
+        assert "workspace:FindFirstChild" in scene_source, (
+            "scene-scoped scripts must keep the workspace lookup; "
+            "full source:\n" + scene_source
+        )
+
+    def test_scene_scoped_emission_does_not_set_script_scopes(
+        self, tmp_path: Path,
+    ) -> None:
+        """When emission falls back to scene scope (controller referenced
+        directly by a scene's GameObject — not via a prefab), script_scopes
+        stays empty so the pipeline keeps those scripts in the place's flat
+        list. Reparenting a scene-scoped script under a prefab template
+        would be wrong: there is no template for the script to live in."""
+        from core.unity_types import ParsedScene
+        from unity.guid_resolver import build_guid_index
+
+        project, _ctrl_guid, _ = self._build_transform_only_controller_project(tmp_path)
+        # Scene that directly references the controller (no prefab).
+        scene = ParsedScene(
+            scene_path=project / "Assets" / "Level1.unity",
+            referenced_animator_controller_guids={_ctrl_guid},
+        )
+        guid_index = build_guid_index(project)
+        result = convert_animations(
+            project,
+            guid_index=guid_index,
+            parsed_scenes=[scene],
+        )
+        names = [name for name, _ in result.generated_scripts]
+        assert any(n == "Anim_Level1_Wheel_Spin" for n in names), names
+        assert result.script_scopes == {}, (
+            f"expected empty script_scopes for scene-scoped emission, "
+            f"got {result.script_scopes}"
+        )
 
     def test_multiple_prefab_instances_do_not_duplicate_script(
         self, tmp_path: Path,

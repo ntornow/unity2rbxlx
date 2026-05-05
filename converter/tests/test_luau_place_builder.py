@@ -136,6 +136,68 @@ class TestLuauPlaceBuilder:
         assert "Parent" in script
         assert "Child" in script
 
+    def test_replicated_templates_emitted_under_templates_folder(self):
+        """Headless publish must emit ``ReplicatedStorage.Templates`` and
+        every ``replicated_templates`` entry under it. Without this folder,
+        gameplay scripts that ``ReplicatedStorage:WaitForChild("Templates")``
+        (PrefabSpawner.luau and prefab-scoped animation drivers) stall
+        forever in the published place even though the .rbxlx path works
+        end-to-end.
+        """
+        place = RbxPlace()
+        # Anchor part so the place reads as non-empty.
+        place.workspace_parts.append(RbxPart(
+            name="Anchor", class_name="Part",
+            cframe=RbxCFrame(), size=(4, 1, 4), anchored=True,
+        ))
+        template = RbxPart(name="Vehicle", class_name="Model")
+        place.replicated_templates.append(template)
+
+        script = generate_place_luau(place)
+
+        assert "TF.Name='Templates'" in script, (
+            "expected Templates folder creation; full script:\n" + script
+        )
+        assert "TF.Parent=RS" in script
+        # The template itself is emitted as a child of the Templates folder.
+        assert "Vehicle" in script
+
+    def test_replicated_template_carries_child_scripts_in_headless(self):
+        """A script attached to a template's ``scripts`` list (from the
+        Phase 5.9 reparent pass) must travel with the template into the
+        headless publish output. Pre-fix, the reparent moved scripts under
+        templates while the headless builder ignored ``replicated_templates``,
+        so prefab-scoped animation drivers vanished from headless publishes
+        entirely."""
+        place = RbxPlace()
+        place.workspace_parts.append(RbxPart(
+            name="Anchor", class_name="Part",
+            cframe=RbxCFrame(), size=(4, 1, 4), anchored=True,
+        ))
+        template = RbxPart(name="Vehicle", class_name="Model")
+        template.scripts.append(RbxScript(
+            name="Anim_Vehicle_Wheel_Spin",
+            source='print("vehicle anim driver")',
+            script_type="Script",
+        ))
+        place.replicated_templates.append(template)
+
+        script = generate_place_luau(place)
+
+        # Both the script name and its source must reach the published place.
+        assert "Anim_Vehicle_Wheel_Spin" in script, (
+            "child script of replicated template missing from headless output"
+        )
+        assert 'print("vehicle anim driver")' in script
+
+    def test_no_templates_folder_when_replicated_templates_empty(self):
+        """An empty ``replicated_templates`` list must NOT emit the
+        Templates folder. Adding it unconditionally would break projects
+        that don't use prefab packages by leaving an empty folder behind."""
+        place = _minimal_place()
+        script = generate_place_luau(place)
+        assert "TF.Name='Templates'" not in script
+
 
 class TestWaterFillBlockChunking:
     """Roblox Terrain:FillBlock has a 2048-stud-per-axis cap; oversized
