@@ -46,11 +46,14 @@ def _disambiguate_by_source(items: list, label: str) -> dict[int, str]:
     is missing — ``f"{name}__{label}"`` is still preferable to silent
     collision.
     """
-    name_counts: Counter[str] = Counter(getattr(i, "name", "") for i in items)
+    def _name_of(item: object) -> str:
+        return getattr(item, "name", "") or "unnamed"
+
+    name_counts: Counter[str] = Counter(_name_of(i) for i in items)
     out: dict[int, str] = {}
     seen_disambig: dict[str, int] = {}
     for item in items:
-        name = getattr(item, "name", "") or "unnamed"
+        name = _name_of(item)
         if name_counts[name] <= 1:
             out[id(item)] = name
             continue
@@ -2141,7 +2144,22 @@ def convert_animations(
             # humanoid clip lands here. Transform-only clips are NOT
             # bundled (they're inline Scripts above).
             if humanoid_clips:
-                controller_data = export_controller_json(ctrl, clip_name_by_guid)
+                # Override the project-wide ``clip_name_by_guid`` with this
+                # controller's disambiguated names for clips this controller
+                # owns, so ``blendTrees[*].clips[*].clip`` matches the
+                # disambiguated keyframe keys below. Clips not in this
+                # controller's clips_by_guid keep their project-wide bare
+                # name, preserving pre-fix behavior for blend-tree leaf
+                # clips that aren't reachable through any state.
+                clip_display_by_id = {**humanoid_display, **transform_display}
+                ctrl_clip_name_by_guid: dict[str, str] = dict(clip_name_by_guid)
+                for guid, c in clips_by_guid.items():
+                    disp = clip_display_by_id.get(id(c))
+                    if disp is not None:
+                        ctrl_clip_name_by_guid[guid] = disp
+                controller_data = export_controller_json(
+                    ctrl, ctrl_clip_name_by_guid,
+                )
                 keyframes: dict[str, Any] = {
                     humanoid_display[id(clip)]: export_clip_keyframes(clip)
                     for clip in humanoid_clips
@@ -2176,13 +2194,22 @@ def convert_animations(
             any_scene_refs.update(
                 getattr(scene, "referenced_animator_controller_guids", set())
             )
+        # accepted_names is keyed on bare ctrl.name (the user-given name);
+        # ctrl_display values are what gets baked into per-controller item
+        # prefixes when names collide. Accept either form so the filter
+        # works whether the entry was authored against ctrl.name (blend_tree
+        # discovery, pre-disambig) or against ctrl_display (the new
+        # animation_clip warnings authored after disambig).
+        accepted_prefixes = accepted_names | set(scenes_per_controller) | set(prefabs_per_controller)
         filtered: list[dict[str, str]] = []
         for entry in result.unconverted:
             category = entry.get("category", "")
-            if category == "blend_tree":
-                # Item shape is "Controller/..." — keep iff controller accepted.
+            if category in ("blend_tree", "animation_clip"):
+                # Item shape is "Owner/..." where Owner is either a
+                # controller name or "__orphans__" (project-wide; never
+                # filtered by scope).
                 owner = entry.get("item", "").split("/", 1)[0]
-                if owner in accepted_names:
+                if owner == "__orphans__" or owner in accepted_prefixes:
                     filtered.append(entry)
             elif category == "animator_controller":
                 # Binary controllers only know their .meta guid.

@@ -2145,6 +2145,131 @@ class TestPhase45Routing:
             f"got {result.unconverted}"
         )
 
+    def test_same_name_clips_blend_tree_keys_match_keyframes(
+        self, tmp_path: Path
+    ) -> None:
+        """When a blend tree references two same-named clips, the
+        emitted ``blendTrees[*].clips[*].clip`` values must match keys
+        present in the ``keyframes`` dict — otherwise the runtime
+        looks up a name nothing emitted and silently plays nothing."""
+        assets = tmp_path / "Assets"
+        assets.mkdir()
+
+        # Two humanoid "Walk" clips at distinct paths.
+        for fname, guid in (("WalkA.anim", "a" * 32), ("WalkB.anim", "b" * 32)):
+            (assets / fname).write_text(textwrap.dedent("""\
+                %YAML 1.1
+                %TAG !u! tag:unity3d.com,2011:
+                --- !u!74 &7400000
+                AnimationClip:
+                  m_Name: Walk
+                  m_SampleRate: 30
+                  m_AnimationClipSettings:
+                    m_StartTime: 0
+                    m_StopTime: 1.0
+                    m_LoopTime: 1
+                  m_PositionCurves:
+                  - curve:
+                      m_Curve:
+                      - time: 0
+                        value: {x: 0, y: 0, z: 0}
+                      - time: 1
+                        value: {x: 1, y: 0, z: 0}
+                    path: Hips
+                  m_RotationCurves: []
+                  m_EulerCurves: []
+                  m_ScaleCurves: []
+                """))
+            (assets / fname).with_suffix(".anim.meta").write_text(
+                f"fileFormatVersion: 2\nguid: {guid}\n"
+            )
+
+        # State 1: directly references Walk-A (gets into clips_by_guid).
+        # State 2: blend tree referencing both Walks. Blend-tree leaf
+        # resolution registers Walk-A as the state's fallback clip_guid;
+        # State 1 already registers Walk-A. Walk-B reaches keyframes only
+        # via its own state. State 3 directly references Walk-B so both
+        # clips end up in humanoid_clips.
+        ctrl = assets / "Locomotion.controller"
+        ctrl.write_text(textwrap.dedent(f"""\
+            %YAML 1.1
+            %TAG !u! tag:unity3d.com,2011:
+            --- !u!91 &9100000
+            AnimatorController:
+              m_Name: Locomotion
+              m_AnimatorParameters:
+              - m_Name: Speed
+                m_Type: 1
+              m_AnimatorLayers:
+              - serializedVersion: 5
+                m_Name: Base Layer
+                m_StateMachine:
+                  fileID: 200
+            --- !u!1107 &200
+            AnimatorStateMachine:
+              m_ChildStates:
+              - m_State: {{fileID: 300}}
+              - m_State: {{fileID: 301}}
+              m_DefaultState: {{fileID: 300}}
+            --- !u!1102 &300
+            AnimatorState:
+              m_Name: Move
+              m_Motion: {{fileID: 400}}
+            --- !u!1102 &301
+            AnimatorState:
+              m_Name: WalkB_Direct
+              m_Motion:
+                fileID: 7400000
+                guid: {"b" * 32}
+                type: 2
+            --- !u!206 &400
+            BlendTree:
+              m_Name: MoveBlend
+              m_BlendType: 0
+              m_BlendParameter: Speed
+              m_Childs:
+              - m_Threshold: 0
+                m_Motion:
+                  guid: {"a" * 32}
+              - m_Threshold: 1
+                m_Motion:
+                  guid: {"b" * 32}
+            """))
+
+        from unity.guid_resolver import build_guid_index
+        guid_index = build_guid_index(tmp_path)
+        result = convert_animations(tmp_path, guid_index=guid_index)
+
+        assert len(result.animation_data_modules) == 1
+        _, module_source = result.animation_data_modules[0]
+
+        import json
+        json_start = module_source.index("[==[") + 4
+        json_end = module_source.rindex("]==]")
+        data = json.loads(module_source[json_start:json_end])
+
+        keyframe_keys = set(data["keyframes"].keys())
+        assert len(keyframe_keys) == 2, keyframe_keys
+
+        bt_clip_names = [
+            entry["clip"]
+            for bt in data["controller"].get("blendTrees", {}).values()
+            for entry in bt["clips"]
+        ]
+        assert len(bt_clip_names) == 2, bt_clip_names
+        # Every blend-tree clip reference must point at a real keyframe key.
+        # Without per-controller disambiguated clip-name resolution, both
+        # blend-tree entries would carry the bare "Walk" name and miss the
+        # disambiguated "Walk__<hash>" keyframe keys.
+        missing = [n for n in bt_clip_names if n not in keyframe_keys]
+        assert not missing, (
+            f"blend-tree references {missing} have no matching keyframe "
+            f"entry; keyframes={sorted(keyframe_keys)}"
+        )
+        # Both references must be distinct so the two clips actually play
+        # at the two different thresholds.
+        assert len(set(bt_clip_names)) == 2, bt_clip_names
+
     def test_binary_controller_emits_unconverted_entry(self, tmp_path: Path) -> None:
         """Phase 4.5b: binary .controller files surface in UNCONVERTED.md."""
         ctrl = tmp_path / "Binary.controller"
