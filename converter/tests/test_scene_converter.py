@@ -1,7 +1,26 @@
 """Tests for scene_converter.py key functions."""
 
+from contextlib import contextmanager
+
 import pytest
 from pathlib import Path
+
+
+@contextmanager
+def _scene_ctx(**kwargs):
+    """Activate a SceneConversionContext for the duration of the block.
+
+    Used by tests that exercise scene_converter helpers in isolation.
+    Production code goes through ``convert_scene()`` which sets up the
+    context automatically.
+    """
+    import converter.scene_converter as sc
+    old = sc._current_ctx
+    sc._current_ctx = sc.SceneConversionContext(**kwargs)
+    try:
+        yield sc._current_ctx
+    finally:
+        sc._current_ctx = old
 
 
 class TestWaterDetection:
@@ -384,91 +403,73 @@ class TestMeshSizeFbxBboxFallback:
         """When FBX bbox data is available, it should be used as InitialSize."""
         import converter.scene_converter as sc
 
-        # Set up FBX bounding boxes (simulating trimesh output)
-        old_bboxes = sc._fbx_bounding_boxes
-        try:
-            sc._fbx_bounding_boxes = {
-                "Assets/Models/crate.fbx": (100.0, 50.0, 80.0),
-            }
+        abs_path = tmp_path / "Assets" / "Models" / "crate.fbx"
+        abs_path.parent.mkdir(parents=True, exist_ok=True)
+        abs_path.touch()
+        meta = abs_path.with_suffix(".fbx.meta")
+        meta.write_text("globalScale: 0.01\nuseFileScale: 0\n")
 
-            abs_path = tmp_path / "Assets" / "Models" / "crate.fbx"
-            abs_path.parent.mkdir(parents=True, exist_ok=True)
-            abs_path.touch()
-            # Write a .meta file with default import scale (0.01)
-            meta = abs_path.with_suffix(".fbx.meta")
-            meta.write_text("globalScale: 0.01\nuseFileScale: 0\n")
+        guid = "test-guid-123"
+        gi = self._make_guid_index(guid, "Assets/Models/crate.fbx", str(abs_path))
 
-            guid = "test-guid-123"
-            gi = self._make_guid_index(guid, "Assets/Models/crate.fbx", str(abs_path))
-
+        with _scene_ctx(fbx_bounding_boxes={
+            "Assets/Models/crate.fbx": (100.0, 50.0, 80.0),
+        }):
             result = sc._compute_mesh_size_from_fbx_bbox(
                 unity_scale=(1.0, 1.0, 1.0),
                 mesh_guid=guid,
                 guid_index=gi,
             )
-            assert result is not None
-            size, initial_size = result
-            # InitialSize should match the FBX bbox
-            assert initial_size == (100.0, 50.0, 80.0)
-            # Size = InitialSize * import_scale(0.01) * STUDS_PER_METER(3.571) * unity_scale(1)
-            import config
-            expected_factor = 0.01 * config.STUDS_PER_METER
-            assert abs(size[0] - 100.0 * expected_factor) < 0.01
-            assert abs(size[1] - 50.0 * expected_factor) < 0.01
-            assert abs(size[2] - 80.0 * expected_factor) < 0.01
-        finally:
-            sc._fbx_bounding_boxes = old_bboxes
+        assert result is not None
+        size, initial_size = result
+        assert initial_size == (100.0, 50.0, 80.0)
+        import config
+        expected_factor = 0.01 * config.STUDS_PER_METER
+        assert abs(size[0] - 100.0 * expected_factor) < 0.01
+        assert abs(size[1] - 50.0 * expected_factor) < 0.01
+        assert abs(size[2] - 80.0 * expected_factor) < 0.01
 
     def test_fbx_bbox_not_available_returns_none(self):
         """When no FBX bbox data exists, the function returns None."""
         import converter.scene_converter as sc
 
-        old_bboxes = sc._fbx_bounding_boxes
-        try:
-            sc._fbx_bounding_boxes = {}
+        with _scene_ctx(fbx_bounding_boxes={}):
             result = sc._compute_mesh_size_from_fbx_bbox(
                 unity_scale=(1.0, 1.0, 1.0),
                 mesh_guid="nonexistent",
                 guid_index=self._make_guid_index("other", "x.fbx", "/tmp/x.fbx"),
             )
-            assert result is None
-        finally:
-            sc._fbx_bounding_boxes = old_bboxes
+        assert result is None
 
     def test_fbx_bbox_respects_unity_scale(self, tmp_path):
         """Unity scale should multiply into the final Size."""
         import converter.scene_converter as sc
 
-        old_bboxes = sc._fbx_bounding_boxes
-        try:
-            sc._fbx_bounding_boxes = {
-                "Assets/Models/pillar.fbx": (20.0, 200.0, 20.0),
-            }
+        abs_path = tmp_path / "Assets" / "Models" / "pillar.fbx"
+        abs_path.parent.mkdir(parents=True, exist_ok=True)
+        abs_path.touch()
+        meta = abs_path.with_suffix(".fbx.meta")
+        meta.write_text("globalScale: 0.01\nuseFileScale: 0\n")
 
-            abs_path = tmp_path / "Assets" / "Models" / "pillar.fbx"
-            abs_path.parent.mkdir(parents=True, exist_ok=True)
-            abs_path.touch()
-            meta = abs_path.with_suffix(".fbx.meta")
-            meta.write_text("globalScale: 0.01\nuseFileScale: 0\n")
+        guid = "pillar-guid"
+        gi = self._make_guid_index(guid, "Assets/Models/pillar.fbx", str(abs_path))
 
-            guid = "pillar-guid"
-            gi = self._make_guid_index(guid, "Assets/Models/pillar.fbx", str(abs_path))
-
+        with _scene_ctx(fbx_bounding_boxes={
+            "Assets/Models/pillar.fbx": (20.0, 200.0, 20.0),
+        }):
             result = sc._compute_mesh_size_from_fbx_bbox(
                 unity_scale=(2.0, 3.0, 0.5),
                 mesh_guid=guid,
                 guid_index=gi,
             )
-            assert result is not None
-            size, initial_size = result
-            assert initial_size == (20.0, 200.0, 20.0)
-            import config
-            f = 0.01 * config.STUDS_PER_METER
-            assert abs(size[0] - 2.0 * 20.0 * f) < 0.01
-            assert abs(size[1] - 3.0 * 200.0 * f) < 0.01
-            assert abs(size[2] - 0.5 * 20.0 * f) < 0.01
-        finally:
-            sc._fbx_bounding_boxes = old_bboxes
+        assert result is not None
+        size, initial_size = result
+        assert initial_size == (20.0, 200.0, 20.0)
+        import config
+        f = 0.01 * config.STUDS_PER_METER
+        assert abs(size[0] - 2.0 * 20.0 * f) < 0.01
+        assert abs(size[1] - 3.0 * 200.0 * f) < 0.01
+        assert abs(size[2] - 0.5 * 20.0 * f) < 0.01
 
 
 class TestMeshVerticalOffsetSubMesh:
@@ -480,45 +481,42 @@ class TestMeshVerticalOffsetSubMesh:
         from core.unity_types import GuidIndex, GuidEntry
         from pathlib import Path
 
-        old_mh = sc._mesh_hierarchies
         old_cache = sc._mesh_vertical_offset_cache
         try:
-            sc._mesh_hierarchies = {
+            sc._mesh_vertical_offset_cache = {}
+            with _scene_ctx(mesh_hierarchies={
                 "Assets/door.fbx": [
                     {"name": "frame_col", "position": [0, 3.22, 0], "size": [7, 6, 1]},
                     {"name": "base", "position": [0, 0.14, 0], "size": [5, 0.15, 2]},
                     {"name": "door", "position": [0, 2.66, 0], "size": [5, 5, 0.7]},
                 ]
-            }
-            sc._mesh_vertical_offset_cache = {}
+            }):
+                gi = GuidIndex(project_root=Path("/fake"))
+                gi.guid_to_entry["door-guid"] = GuidEntry(
+                    guid="door-guid",
+                    asset_path=Path("/fake/Assets/door.fbx"),
+                    relative_path=Path("Assets/door.fbx"),
+                    kind="model",
+                )
 
-            gi = GuidIndex(project_root=Path("/fake"))
-            gi.guid_to_entry["door-guid"] = GuidEntry(
-                guid="door-guid",
-                asset_path=Path("/fake/Assets/door.fbx"),
-                relative_path=Path("Assets/door.fbx"),
-                kind="model",
-            )
+                # Using mesh_name="door" should find the door sub-mesh (pos Y=2.66)
+                # not the first sub-mesh (frame_col at Y=3.22)
+                import config
+                offset = sc._compute_mesh_vertical_offset(
+                    "door-guid", gi, 1.0,
+                    mesh_file_id="9999999",  # invalid fileID to force name fallback
+                    mesh_name="door",
+                )
+                # Default import_scale is 0.01 (cm→m) when no .meta file exists
+                expected = 2.66 * 0.01 * config.STUDS_PER_METER
+                assert abs(offset - expected) < 0.01, f"Expected ~{expected:.4f}, got {offset:.4f}"
 
-            # Using mesh_name="door" should find the door sub-mesh (pos Y=2.66)
-            # not the first sub-mesh (frame_col at Y=3.22)
-            import config
-            offset = sc._compute_mesh_vertical_offset(
-                "door-guid", gi, 1.0,
-                mesh_file_id="9999999",  # invalid fileID to force name fallback
-                mesh_name="door",
-            )
-            # Default import_scale is 0.01 (cm→m) when no .meta file exists
-            expected = 2.66 * 0.01 * config.STUDS_PER_METER
-            assert abs(offset - expected) < 0.01, f"Expected ~{expected:.4f}, got {offset:.4f}"
-
-            # Verify it used "door" not "frame_col" (Y=3.22) or "base" (Y=0.14)
-            frame_col_offset = 3.22 * 0.01 * config.STUDS_PER_METER
-            base_offset = 0.14 * 0.01 * config.STUDS_PER_METER
-            assert abs(offset - frame_col_offset) > 0.01, "Should NOT use frame_col"
-            assert abs(offset - base_offset) > 0.01, "Should NOT use base"
+                # Verify it used "door" not "frame_col" (Y=3.22) or "base" (Y=0.14)
+                frame_col_offset = 3.22 * 0.01 * config.STUDS_PER_METER
+                base_offset = 0.14 * 0.01 * config.STUDS_PER_METER
+                assert abs(offset - frame_col_offset) > 0.01, "Should NOT use frame_col"
+                assert abs(offset - base_offset) > 0.01, "Should NOT use base"
         finally:
-            sc._mesh_hierarchies = old_mh
             sc._mesh_vertical_offset_cache = old_cache
 
 

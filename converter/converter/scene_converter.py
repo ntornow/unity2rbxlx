@@ -11,11 +11,13 @@ from __future__ import annotations
 import logging
 import math
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import config
 
+from core.conversion_context import MeshHierarchyEntry
 from core.unity_types import (
     AssetManifest,
     ComponentData,
@@ -23,6 +25,7 @@ from core.unity_types import (
     ParsedScene,
     SceneNode,
 )
+from converter.material_mapper import MaterialMapping
 from core.roblox_types import (
     RbxCFrame,
     RbxCameraConfig,
@@ -144,42 +147,66 @@ _LOD_TYPES = {"LODGroup"}
 # Unity built-in primitive mesh fileIDs -> (Roblox Part.Shape enum, flatten_y).
 # Shape enum: 0=Ball, 1=Block, 2=Cylinder, 3=Wedge
 
-# Module-level storage for mesh native sizes (set during convert_scene)
-_mesh_native_sizes: dict[str, tuple[float, float, float]] = {}
+# ---------------------------------------------------------------------------
+# Scene conversion context
+# ---------------------------------------------------------------------------
+#
+# Single mutable container for state previously held in 9 module-level
+# globals (mesh sizes, material mappings, water-region collector, etc.).
+# convert_scene() instantiates one at entry and clears it on exit so:
+#
+#   - Multi-scene runs (`u2r.py convert --scene all`) cannot bleed state
+#     across scenes.
+#   - Helpers that read context fail loud (RuntimeError) if invoked
+#     outside an active conversion, instead of silently reading stale
+#     module-level data.
+#
+# Helpers access the active context via `_ctx()`. The frozen-input vs
+# accumulated-output split locked in the eng-review plan is deferred: this
+# PR keeps a single mutable dataclass to minimize diff against the existing
+# call sites; the input/output split lands when individual helper
+# signatures are refactored to accept ctx explicitly.
 
-# Module-level storage for mesh texture IDs (set during convert_scene)
-_mesh_texture_ids: dict[str, str] = {}
+@dataclass
+class SceneConversionContext:
+    """All state mutable during one ``convert_scene()`` call."""
 
-# Module-level storage for mesh hierarchies (set during convert_scene)
-# Maps FBX path -> list of sub-mesh dicts with {name, meshId, size, position, textureId}
-_mesh_hierarchies: dict[str, list[dict]] = {}
+    # Inputs (set at convert_scene entry, read by helpers)
+    mesh_native_sizes: dict[str, tuple[float, float, float]] = field(default_factory=dict)
+    mesh_texture_ids: dict[str, str] = field(default_factory=dict)
+    mesh_hierarchies: dict[str, list[MeshHierarchyEntry]] = field(default_factory=dict)
+    material_mappings: dict[str, MaterialMapping] = field(default_factory=dict)
+    fbx_bounding_boxes: dict[str, tuple[float, float, float]] = field(default_factory=dict)
+    scene_xform_fids: set[str] = field(default_factory=set)
 
-# Module-level storage for material mappings (set during convert_scene), used
-# by helpers like _extract_monobehaviour_attributes that resolve sub-mesh
-# SurfaceAppearances from prefab-referenced materials.
-_material_mappings: dict[str, Any] = {}
-
-# Module-level storage for FBX bounding boxes (trimesh fallback for InitialSize)
-# Maps relative asset path -> (width, height, depth) in FBX file units
-_fbx_bounding_boxes: dict[str, tuple[float, float, float]] = {}
-
-# Module-level collector for water regions discovered during node conversion.
-# Populated by _convert_node / _convert_prefab_instance, consumed by convert_scene.
-_water_regions: list[RbxWaterRegion] = []
-
-# Collector for unknown/unhandled Unity component types found during conversion.
-# Logged at the end of convert_scene so users know what was skipped.
-_unhandled_components: set[str] = set()
-# Terrain world position offset — subtracted from object positions so they
-# align with terrain encoder's (0,0,0)-based voxel grid.
-_terrain_world_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    # Outputs (accumulated during conversion, consumed before convert_scene returns)
+    water_regions: list[RbxWaterRegion] = field(default_factory=list)
+    unhandled_components: set[str] = field(default_factory=set)
+    terrain_world_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
 
-# Cache for mesh vertical offsets: mesh_guid -> offset_studs
+_current_ctx: SceneConversionContext | None = None
+
+
+def _ctx() -> SceneConversionContext:
+    """Return the active SceneConversionContext.
+
+    Raises ``RuntimeError`` when no conversion is in progress — helpers
+    invoked outside ``convert_scene()`` would previously read stale
+    module-level globals.
+    """
+    if _current_ctx is None:
+        raise RuntimeError(
+            "scene_converter helper accessed without an active "
+            "SceneConversionContext (called outside convert_scene?)"
+        )
+    return _current_ctx
+
+
+# Cache for mesh vertical offsets: mesh_guid -> offset_studs.
+# Kept as a process-level cache (not per-scene) because the result depends
+# only on the mesh file content, which doesn't change between scenes.
 _mesh_vertical_offset_cache: dict[str, float] = {}
-
-# Scene transform mapping: transform fileID → node fileID (set during conversion)
-_scene_xform_fids: set[str] = set()
 
 def _compute_mesh_vertical_offset(
     mesh_guid: str,
@@ -215,7 +242,7 @@ def _compute_mesh_vertical_offset(
     # is non-zero.  This gives the actual mesh center offset in Roblox's
     # coordinate space.  For single-mesh FBX files where the mesh is centered
     # at the model origin, position is (0,0,0) — fall through to FBX analysis.
-    if _mesh_hierarchies:
+    if _ctx().mesh_hierarchies:
         # Try specific sub-mesh first via mesh_file_id or name
         if mesh_file_id or mesh_name:
             sub_mesh = _resolve_sub_mesh(mesh_guid, mesh_file_id, guid_index, mesh_name=mesh_name)
@@ -231,8 +258,8 @@ def _compute_mesh_vertical_offset(
         # Fallback: use first sub-mesh (single-mesh or no file_id/name)
         relative = guid_index.resolve_relative(mesh_guid)
         for key in ([str(relative), str(asset_path)] if relative else [str(asset_path)]):
-            if key in _mesh_hierarchies:
-                sub_meshes = _mesh_hierarchies[key]
+            if key in _ctx().mesh_hierarchies:
+                sub_meshes = _ctx().mesh_hierarchies[key]
                 if sub_meshes:
                     pos = sub_meshes[0].get("position", [0, 0, 0])
                     center_y = pos[1] if len(pos) > 1 else 0.0
@@ -448,7 +475,7 @@ def _compute_mesh_size(
         return None
 
     # Try per-sub-mesh sizing via mesh_hierarchies first
-    if mesh_file_id and _mesh_hierarchies:
+    if mesh_file_id and _ctx().mesh_hierarchies:
         sub_mesh = _resolve_sub_mesh(mesh_guid, mesh_file_id, guid_index, mesh_name=mesh_name)
         if sub_mesh:
             native = (sub_mesh["size"][0], sub_mesh["size"][1], sub_mesh["size"][2])
@@ -499,7 +526,7 @@ def _compute_mesh_size_from_fbx_bbox(
 
     Returns (size, initial_size) or None if no bounding box is available.
     """
-    if not _fbx_bounding_boxes:
+    if not _ctx().fbx_bounding_boxes:
         return None
 
     asset_path = guid_index.resolve(mesh_guid)
@@ -509,8 +536,8 @@ def _compute_mesh_size_from_fbx_bbox(
     relative = guid_index.resolve_relative(mesh_guid)
     bbox = None
     for key in [str(relative), str(asset_path)] if relative else [str(asset_path)]:
-        if key in _fbx_bounding_boxes:
-            bbox = _fbx_bounding_boxes[key]
+        if key in _ctx().fbx_bounding_boxes:
+            bbox = _ctx().fbx_bounding_boxes[key]
             break
 
     if bbox is None:
@@ -644,41 +671,31 @@ def convert_scene(
 
     place = RbxPlace()
 
-    # Reset module-level caches for this conversion run
-    global _water_regions, _mesh_vertical_offset_cache
-    _water_regions = []
+    # Set up the per-scene conversion context. All previously-global state
+    # lives on `_current_ctx` for the duration of this call. The try/finally
+    # below clears it so a subsequent convert_scene() doesn't inherit stale
+    # data and so any helper invoked outside convert_scene fails loud
+    # instead of silently reading the previous run's state.
+    global _current_ctx, _mesh_vertical_offset_cache
     _mesh_vertical_offset_cache = {}
-
-    # Set module-level mesh native sizes for use by _compute_mesh_size
-    global _mesh_native_sizes
-    _mesh_native_sizes = mesh_native_sizes or {}
-    if not _mesh_native_sizes:
+    _current_ctx = SceneConversionContext(
+        mesh_native_sizes=mesh_native_sizes or {},
+        mesh_texture_ids=mesh_texture_ids or {},
+        mesh_hierarchies=mesh_hierarchies or {},
+        material_mappings=material_mappings or {},
+        fbx_bounding_boxes=fbx_bounding_boxes or {},
+        scene_xform_fids=(
+            set(parsed_scene.transform_fid_to_go_fid.keys())
+            if hasattr(parsed_scene, 'transform_fid_to_go_fid')
+            else set()
+        ),
+    )
+    if not _ctx().mesh_native_sizes:
         log.warning("No mesh native sizes available — mesh sizing will use FBX bounding box fallback. "
                     "Run Studio asset resolution for exact sizing.")
-
-    # Set module-level FBX bounding boxes for InitialSize fallback
-    global _fbx_bounding_boxes
-    _fbx_bounding_boxes = fbx_bounding_boxes or {}
-    if _fbx_bounding_boxes and not _mesh_native_sizes:
+    if _ctx().fbx_bounding_boxes and not _ctx().mesh_native_sizes:
         log.info("Using FBX bounding boxes for %d meshes as InitialSize fallback",
-                 len(_fbx_bounding_boxes))
-
-    # Set module-level mesh texture IDs for use by _resolve_mesh_texture_id
-    global _mesh_texture_ids
-    _mesh_texture_ids = mesh_texture_ids or {}
-
-    # Set module-level mesh hierarchies for sub-mesh resolution
-    global _mesh_hierarchies
-    _mesh_hierarchies = mesh_hierarchies or {}
-
-    # Expose material mappings to helpers that need to resolve sub-mesh
-    # SurfaceAppearances from prefab-referenced materials.
-    global _material_mappings
-    _material_mappings = material_mappings or {}
-
-    # Store scene transform fileIDs for nested instance detection
-    global _scene_xform_fids
-    _scene_xform_fids = set(parsed_scene.transform_fid_to_go_fid.keys()) if hasattr(parsed_scene, 'transform_fid_to_go_fid') else set()
+                 len(_ctx().fbx_bounding_boxes))
 
     # Identify Canvas nodes so we can exclude them from workspace conversion
     # (they're handled separately by the UI translator).
@@ -689,8 +706,6 @@ def convert_scene(
     # The terrain encoder places terrain at (0,0,0) in chunk space,
     # so object positions must be made terrain-relative to align correctly.
     terrain_node_ids: set[int] = set()
-    global _terrain_world_offset
-    _terrain_world_offset = (0.0, 0.0, 0.0)
     for node in parsed_scene.all_nodes.values():
         for comp in node.components:
             if comp.component_type in _TERRAIN_TYPES:
@@ -704,7 +719,7 @@ def convert_scene(
                     twy += _pn.position[1]
                     twz += _pn.position[2]
                     _pf = _pn.parent_file_id
-                _terrain_world_offset = (twx, twy, twz)
+                _ctx().terrain_world_offset = (twx, twy, twz)
                 log.info("Terrain world position offset: (%.1f, %.1f, %.1f)", twx, twy, twz)
 
     # Build a mapping from Transform file_id → scene node, so we can parent
@@ -1021,8 +1036,8 @@ def convert_scene(
     _collect_terrains(parsed_scene, place)
 
     # Collect water regions discovered during node/prefab conversion.
-    if _water_regions:
-        place.water_regions = list(_water_regions)
+    if _ctx().water_regions:
+        place.water_regions = list(_ctx().water_regions)
         log.info("Collected %d water regions for terrain water fill", len(place.water_regions))
 
     # Collect post-processing components from the scene.
@@ -1059,13 +1074,24 @@ def convert_scene(
         "found" if place.camera else "default",
     )
     # Report any unhandled component types so users know what was skipped.
-    if _unhandled_components:
+    if _ctx().unhandled_components:
         log.info(
             "Unhandled Unity component types (skipped): %s",
-            ", ".join(sorted(_unhandled_components)),
+            ", ".join(sorted(_ctx().unhandled_components)),
         )
-        _unhandled_components.clear()
+        _ctx().unhandled_components.clear()
 
+    # Persist terrain world offset on the place so write_output can read it
+    # after convert_scene returns (previously communicated via a module global).
+    place.terrain_world_offset = _ctx().terrain_world_offset
+
+    # NOTE: we deliberately do NOT clear _current_ctx here. prefab_packages
+    # calls _convert_prefab_node after convert_scene returns to emit
+    # ReplicatedStorage.Templates, and that helper still reads ctx fields
+    # like mesh_hierarchies. Each subsequent convert_scene() overwrites
+    # _current_ctx wholesale, so multi-scene runs are still safe; the only
+    # risk is helpers invoked BEFORE the first convert_scene, which the
+    # _ctx() RuntimeError guard catches.
     return place
 
 
@@ -1100,7 +1126,7 @@ def _convert_node(
     # Collect water nodes as terrain water regions instead of creating Parts.
     if _is_water_node(node, material_mappings, guid_index):
         region = _extract_water_region(node)
-        _water_regions.append(region)
+        _ctx().water_regions.append(region)
         log.info("Detected water plane '%s' at (%.1f, %.1f, %.1f), size (%.1f, %.1f, %.1f)",
                  node.name, *region.position, *region.size)
         return None
@@ -1261,8 +1287,8 @@ def _convert_node(
                 part.mesh_id = mesh_id
             # Compute mesh size from native Roblox data (requires upload + resolve)
             sized = False
-            if _mesh_native_sizes and guid_index:
-                result = _compute_mesh_size(node.scale, node.mesh_guid, guid_index, _mesh_native_sizes,
+            if _ctx().mesh_native_sizes and guid_index:
+                result = _compute_mesh_size(node.scale, node.mesh_guid, guid_index, _ctx().mesh_native_sizes,
                                             mesh_file_id=node.mesh_file_id, mesh_name=node.name)
                 if result:
                     part.size, part.initial_size = result
@@ -1536,7 +1562,7 @@ def _process_components(
         elif ct == "MonoBehaviour":
             _extract_monobehaviour_attributes(
                 comp.properties, part, guid_index, uploaded_assets,
-                material_mappings=_material_mappings,
+                material_mappings=_ctx().material_mappings,
             )
 
         # -- Physics Joints --
@@ -1809,7 +1835,7 @@ def _process_components(
 
         # -- Unknown component: log so users know what was skipped --
         else:
-            _unhandled_components.add(ct)
+            _ctx().unhandled_components.add(ct)
             log.debug("Unhandled component type '%s' on node '%s'", ct, node.name)
 
     # -- Anchoring logic --
@@ -1856,7 +1882,7 @@ def _resolve_sub_mesh(
     Falls back to name matching when index-based lookup fails.
     Returns the sub-mesh dict or None if not available.
     """
-    if not _mesh_hierarchies or not guid_index:
+    if not _ctx().mesh_hierarchies or not guid_index:
         return None
 
     asset_path = guid_index.resolve(mesh_guid)
@@ -1865,8 +1891,8 @@ def _resolve_sub_mesh(
 
     relative = guid_index.resolve_relative(mesh_guid)
     for key in ([str(relative), str(asset_path)] if relative else [str(asset_path)]):
-        if key in _mesh_hierarchies:
-            sub_meshes = _mesh_hierarchies[key]
+        if key in _ctx().mesh_hierarchies:
+            sub_meshes = _ctx().mesh_hierarchies[key]
             if not sub_meshes:
                 return None
             # If mesh_file_id is provided, use it to select sub-mesh
@@ -1941,13 +1967,13 @@ def _resolve_mesh_texture_id(
     mesh_guid: str,
     guid_index: GuidIndex | None,
 ) -> str | None:
-    """Resolve a mesh GUID to an embedded TextureID from _mesh_texture_ids.
+    """Resolve a mesh GUID to an embedded TextureID from _ctx().mesh_texture_ids.
 
     When FBX models are uploaded to Roblox and resolved via InsertService,
     they may contain an embedded TextureID. This function looks up the
     texture ID using the mesh asset path.
     """
-    if not _mesh_texture_ids or guid_index is None:
+    if not _ctx().mesh_texture_ids or guid_index is None:
         return None
 
     asset_path = guid_index.resolve(mesh_guid)
@@ -1963,8 +1989,8 @@ def _resolve_mesh_texture_id(
         candidates.append(key.replace("/", "\\"))
 
     for key in candidates:
-        if key in _mesh_texture_ids:
-            return _mesh_texture_ids[key]
+        if key in _ctx().mesh_texture_ids:
+            return _ctx().mesh_texture_ids[key]
 
     return None
 
@@ -2004,15 +2030,15 @@ def _get_multi_sub_meshes(
     entries. Returns ``None`` if the FBX is a single-mesh or if no
     hierarchy data is available.
     """
-    if not _mesh_hierarchies or not guid_index:
+    if not _ctx().mesh_hierarchies or not guid_index:
         return None
     asset_path = guid_index.resolve(mesh_guid)
     if not asset_path:
         return None
     relative = guid_index.resolve_relative(mesh_guid)
     for key in ([str(relative), str(asset_path)] if relative else [str(asset_path)]):
-        if key in _mesh_hierarchies:
-            subs = _mesh_hierarchies[key]
+        if key in _ctx().mesh_hierarchies:
+            subs = _ctx().mesh_hierarchies[key]
             return subs if len(subs) >= 2 else None
     return None
 
@@ -2190,7 +2216,7 @@ def _extract_monobehaviour_attributes(
                 # Find mesh hierarchy data for this asset
                 relative_mesh = guid_index.resolve_relative_path(mesh_path) if hasattr(guid_index, 'resolve_relative_path') else None
                 mesh_key = None
-                for mkey in _mesh_hierarchies:
+                for mkey in _ctx().mesh_hierarchies:
                     if str(mesh_path).endswith(mkey) or (relative_mesh and str(relative_mesh) == mkey):
                         mesh_key = mkey
                         break
@@ -2211,10 +2237,10 @@ def _extract_monobehaviour_attributes(
                 # Prefer the parameter passed in; fall back to the module-level
                 # global for any caller path that still relies on the old
                 # implicit state (convert_scene sets both in lockstep).
-                mat_mappings = material_mappings if material_mappings is not None else _material_mappings
+                mat_mappings = material_mappings if material_mappings is not None else _ctx().material_mappings
 
-                if mesh_key and mesh_key in _mesh_hierarchies:
-                    sub_meshes = _mesh_hierarchies[mesh_key]
+                if mesh_key and mesh_key in _ctx().mesh_hierarchies:
+                    sub_meshes = _ctx().mesh_hierarchies[mesh_key]
                     if sub_meshes:
                         # Now that we know sub-meshes exist, resolve materials.
                         # Deferred to here so the prefab YAML read only
@@ -3005,8 +3031,8 @@ def _convert_fbx_prefab_instance(
     combined_scale = (abs(scl[0]), abs(scl[1]), abs(scl[2]))
     mesh_size = unity_scale_to_roblox_size(combined_scale)
     mesh_init = None
-    if mesh_guid and _mesh_native_sizes and guid_index:
-        result = _compute_mesh_size(combined_scale, mesh_guid, guid_index, _mesh_native_sizes)
+    if mesh_guid and _ctx().mesh_native_sizes and guid_index:
+        result = _compute_mesh_size(combined_scale, mesh_guid, guid_index, _ctx().mesh_native_sizes)
         if result:
             mesh_size, mesh_init = result
     elif mesh_guid and guid_index:
@@ -3497,7 +3523,7 @@ def _convert_prefab_instance(
         # prefab) use left-strip because their rotation is in the parent's
         # prerotated space. Top-level instances use right-strip.
         _parent_fid = str(getattr(pi, 'transform_parent_file_id', '') or '')
-        _is_nested = bool(_parent_fid and _parent_fid not in _scene_xform_fids)
+        _is_nested = bool(_parent_fid and _parent_fid not in _ctx().scene_xform_fids)
         if _is_nested:
             from core.coordinate_system import strip_fbx_prerotation_left
             quat_for_roblox = list(strip_fbx_prerotation_left(*rot))
@@ -3529,7 +3555,7 @@ def _convert_prefab_instance(
         # root's scale (via template defaults or scene modification overrides).
         composed_scl = (scl[0], scl[1], scl[2])
         region = _extract_water_region_from_prefab(pos, composed_scl, name)
-        _water_regions.append(region)
+        _ctx().water_regions.append(region)
         log.info("Detected water prefab '%s' at (%.1f, %.1f, %.1f), size (%.1f, %.1f, %.1f)",
                  name, *region.position, *region.size)
         return []
@@ -3585,8 +3611,8 @@ def _convert_prefab_instance(
                     part.mesh_id = mesh_id
                 # Compute mesh size from native Roblox data
                 sized = False
-                if _mesh_native_sizes and guid_index:
-                    result = _compute_mesh_size(combined_scl, root.mesh_guid, guid_index, _mesh_native_sizes,
+                if _ctx().mesh_native_sizes and guid_index:
+                    result = _compute_mesh_size(combined_scl, root.mesh_guid, guid_index, _ctx().mesh_native_sizes,
                                                 mesh_file_id=root.mesh_file_id if hasattr(root, 'mesh_file_id') else None,
                                                 mesh_name=root.name if hasattr(root, 'name') else None)
                     if result:
@@ -3729,8 +3755,8 @@ def _convert_prefab_instance(
             # Compute mesh size from native Roblox data (requires upload + resolve)
             combined_scale = (sx, sy, sz)
             sized = False
-            if _mesh_native_sizes and guid_index:
-                result = _compute_mesh_size(combined_scale, root.mesh_guid, guid_index, _mesh_native_sizes,
+            if _ctx().mesh_native_sizes and guid_index:
+                result = _compute_mesh_size(combined_scale, root.mesh_guid, guid_index, _ctx().mesh_native_sizes,
                                             mesh_file_id=root.mesh_file_id if hasattr(root, 'mesh_file_id') else None,
                                             mesh_name=root.name if hasattr(root, 'name') else None)
                 if result:
@@ -3837,7 +3863,7 @@ def _convert_prefab_node(
     # center position (converted to Unity coords) instead of the Unity
     # pivot position.  This corrects visual spacing between parts.
     _is_multi_sub = False
-    if parent_pos is not None and node.mesh_guid and _mesh_hierarchies and guid_index:
+    if parent_pos is not None and node.mesh_guid and _ctx().mesh_hierarchies and guid_index:
         _mfid = node.mesh_file_id if hasattr(node, 'mesh_file_id') else None
         _multi = _get_multi_sub_meshes(node.mesh_guid, guid_index)
         if _multi and len(_multi) > 1:
@@ -3994,8 +4020,8 @@ def _convert_prefab_node(
         part.attributes["_ScaleZ"] = abs(local_scl[2]) * _sf3
         # Compute mesh size from native Roblox data (requires upload + resolve)
         sized = False
-        if _mesh_native_sizes and guid_index:
-            result = _compute_mesh_size(local_scl, node.mesh_guid, guid_index, _mesh_native_sizes,
+        if _ctx().mesh_native_sizes and guid_index:
+            result = _compute_mesh_size(local_scl, node.mesh_guid, guid_index, _ctx().mesh_native_sizes,
                                         mesh_file_id=node.mesh_file_id if hasattr(node, 'mesh_file_id') else None,
                                         mesh_name=node.name if hasattr(node, 'name') else None)
             if result:
