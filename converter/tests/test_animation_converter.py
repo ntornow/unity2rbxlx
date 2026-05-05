@@ -1949,7 +1949,15 @@ class TestPhase45Routing:
         (assets / "PrefabB").mkdir(parents=True)
 
         # Each prefab has its own "AnimController" — common Unity pattern.
-        for sub, guid_prefix in (("PrefabA", "a"), ("PrefabB", "b")):
+        # GUIDs are lowercased by _parse_meta_file, so the clip and
+        # controller .meta files in each prefab need genuinely distinct
+        # 32-char guids (not just case-different) to avoid colliding in
+        # the index.
+        per_prefab = (
+            ("PrefabA", "a" * 32, "1" * 32),
+            ("PrefabB", "b" * 32, "2" * 32),
+        )
+        for sub, clip_guid, ctrl_guid in per_prefab:
             anim = assets / sub / "Spin.anim"
             anim.write_text(textwrap.dedent(f"""\
                 %YAML 1.1
@@ -1975,7 +1983,7 @@ class TestPhase45Routing:
                   m_ScaleCurves: []
                 """))
             anim.with_suffix(".anim.meta").write_text(
-                f"fileFormatVersion: 2\nguid: {guid_prefix * 32}\n"
+                f"fileFormatVersion: 2\nguid: {clip_guid}\n"
             )
 
             ctrl = assets / sub / "AnimController.controller"
@@ -1998,11 +2006,11 @@ class TestPhase45Routing:
                   m_Name: Spinning
                   m_Motion:
                     fileID: 7400000
-                    guid: {guid_prefix * 32}
+                    guid: {clip_guid}
                     type: 2
                 """))
             ctrl.with_suffix(".controller.meta").write_text(
-                f"fileFormatVersion: 2\nguid: {guid_prefix.upper() * 32}\n"
+                f"fileFormatVersion: 2\nguid: {ctrl_guid}\n"
             )
 
         from unity.guid_resolver import build_guid_index
