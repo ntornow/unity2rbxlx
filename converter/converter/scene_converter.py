@@ -2200,7 +2200,10 @@ def _extract_monobehaviour_attributes(
                 # Resolve the prefab's mesh: for .prefab files, find the referenced FBX
                 mesh_path = ref_path
                 if ref_path.suffix.lower() == ".prefab":
-                    # Read prefab to find its mesh reference
+                    # Read prefab to find its mesh reference. OSError
+                    # covers a missing/unreadable .prefab; everything
+                    # else (regex, GUID resolution) is in-memory and
+                    # shouldn't fail.
                     try:
                         import re as _re
                         prefab_text = ref_path.read_text(encoding="utf-8", errors="replace")
@@ -2210,8 +2213,8 @@ def _extract_monobehaviour_attributes(
                             resolved_mesh = guid_index.resolve(mesh_guid_ref)
                             if resolved_mesh:
                                 mesh_path = resolved_mesh
-                    except Exception:
-                        pass
+                    except OSError as exc:
+                        log.debug("Could not read prefab %s: %s", ref_path, exc)
 
                 # Find mesh hierarchy data for this asset
                 relative_mesh = guid_index.resolve_relative_path(mesh_path) if hasattr(guid_index, 'resolve_relative_path') else None
