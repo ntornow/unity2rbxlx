@@ -300,3 +300,119 @@ class TestPickupVisualTargetPack:
         original = s.source
         packs_module._fix_pickup_visual_target([s])
         assert s.source == original
+
+
+class TestFpsDefaultControlsPack:
+    """The fps_default_controls_off pack auto-enables when any LocalScript
+    locks the mouse — the unmistakable signature of an FPS controller."""
+
+    def test_detects_lock_center(self) -> None:
+        scripts = [
+            RbxScript(
+                name="FpsController",
+                source="UIS.MouseBehavior = Enum.MouseBehavior.LockCenter",
+                script_type="LocalScript",
+            ),
+        ]
+        assert packs_module._detect_fps_default_controls(scripts) is True
+
+    def test_does_not_match_server_scripts(self) -> None:
+        """Lock-center on a Server script is meaningless — the pack should
+        still skip if no LocalScript matches."""
+        scripts = [
+            RbxScript(
+                name="ServerCode",
+                source="UIS.MouseBehavior = Enum.MouseBehavior.LockCenter",
+                script_type="Script",
+            ),
+        ]
+        assert packs_module._detect_fps_default_controls(scripts) is False
+
+    def test_does_not_match_non_fps_localscripts(self) -> None:
+        scripts = [
+            RbxScript(
+                name="MenuClient",
+                source="local x = 1\nprint('hi')",
+                script_type="LocalScript",
+            ),
+        ]
+        assert packs_module._detect_fps_default_controls(scripts) is False
+
+    def test_inject_prepends_setup_block(self) -> None:
+        s = RbxScript(
+            name="FpsController",
+            source=(
+                "local UIS = game:GetService('UserInputService')\n"
+                "UIS.MouseBehavior = Enum.MouseBehavior.LockCenter\n"
+            ),
+            script_type="LocalScript",
+        )
+        fixes = packs_module._disable_default_controls_in_fps_scripts([s])
+        assert fixes == 1
+        assert "-- u2r: disable default PlayerModule controls" in s.source
+        assert s.source.endswith(
+            "UIS.MouseBehavior = Enum.MouseBehavior.LockCenter\n"
+        )
+
+    def test_inject_idempotent(self) -> None:
+        s = RbxScript(
+            name="FpsController",
+            source="UIS.MouseBehavior = Enum.MouseBehavior.LockCenter\n",
+            script_type="LocalScript",
+        )
+        first = packs_module._disable_default_controls_in_fps_scripts([s])
+        second = packs_module._disable_default_controls_in_fps_scripts([s])
+        assert first == 1
+        assert second == 0  # marker prevents re-injection
+
+
+class TestTriggerStayPollingPack:
+    """The trigger_stay_polling pack auto-enables on the converter-emitted
+    turret AI pattern (triggerCollider + getTBase + sightRadius)."""
+
+    def _turret_script(self) -> RbxScript:
+        return RbxScript(
+            name="TurretAI",
+            source=(
+                "local triggerCollider = script.Parent\n"
+                "function getTBase() return script.Parent end\n"
+                "function getSightRadius() return 50 end\n"
+                "function startEngaged(t) end\n"
+                "if angle < 55 then startEngaged(target) end\n"
+            ),
+            script_type="Script",
+        )
+
+    def test_detects_turret_pattern(self) -> None:
+        assert packs_module._detect_trigger_stay_polling(
+            [self._turret_script()],
+        ) is True
+
+    def test_does_not_detect_unrelated_scripts(self) -> None:
+        s = RbxScript(name="Util", source="local x = 1", script_type="Script")
+        assert packs_module._detect_trigger_stay_polling([s]) is False
+
+    def test_does_not_detect_partial_match(self) -> None:
+        """A script with triggerCollider but missing the helper functions
+        must NOT trigger — avoids polluting non-turret scripts that
+        happen to mention triggerCollider."""
+        s = RbxScript(
+            name="Other",
+            source="local triggerCollider = nil\nif angle < 90 then ... end",
+            script_type="Script",
+        )
+        assert packs_module._detect_trigger_stay_polling([s]) is False
+
+    def test_inject_appends_polling_loop(self) -> None:
+        s = self._turret_script()
+        fixes = packs_module._add_trigger_stay_polling([s])
+        assert fixes == 1
+        assert "-- __TRIGGER_STAY_POLL__" in s.source
+        assert "RunService.Heartbeat:Connect" in s.source
+
+    def test_inject_idempotent(self) -> None:
+        s = self._turret_script()
+        first = packs_module._add_trigger_stay_polling([s])
+        second = packs_module._add_trigger_stay_polling([s])
+        assert first == 1
+        assert second == 0
