@@ -1332,6 +1332,14 @@ Core:
 Unity's `transform.X` is one API regardless of whether the GameObject has a single mesh or a hierarchy. In Roblox, BasePart and Model have **different** APIs, so every `transform.X` translation needs to dispatch on `script.Parent:IsA("Model")`. Helper pattern at the top of the script:
 ```lua
 local container = script.Parent
+-- Without a PrimaryPart, ``Model:PivotTo`` and ``:GetPivot`` use the
+-- model's bounding-box centre as the rotation pivot — which means
+-- compose-rotation patterns like ``setCFrame(getCFrame() * Angles(...))``
+-- rotate around the wrong axis. Pin a PrimaryPart at script init so the
+-- pivot matches the GameObject origin the rest of the code expects.
+if container:IsA("Model") and not container.PrimaryPart then
+    container.PrimaryPart = container:FindFirstChildWhichIsA("BasePart")
+end
 local function getCFrame()
     if container:IsA("Model") then return container:GetPivot() end
     return container.CFrame
