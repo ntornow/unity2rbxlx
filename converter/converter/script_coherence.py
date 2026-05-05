@@ -27,7 +27,9 @@ from core.roblox_types import RbxScript
 # external callers can keep importing from this module unchanged.
 from converter.script_coherence_packs import (  # noqa: F401  (re-exports)
     _add_pickup_remote_listener,
+    _add_trigger_stay_polling,
     _convert_pickup_to_remote_event,
+    _disable_default_controls_in_fps_scripts,
     _fix_pickup_visual_target,
     _inject_fps_rifle_system,
 )
@@ -347,12 +349,6 @@ def fix_require_classifications(scripts: list[RbxScript]) -> int:
     # Player is now a LocalScript, not in ReplicatedStorage.
     fixes += _remove_stale_player_requires(scripts)
 
-    # Pass 18: Disable Roblox default PlayerModule controls in FPS-style
-    # client scripts that set MouseBehavior=LockCenter. Without this,
-    # the default PlayerModule (auto-loaded into StarterPlayerScripts)
-    # resets MouseBehavior every frame, preventing mouse-look from working.
-    fixes += _disable_default_controls_in_fps_scripts(scripts)
-
     # Pass 19: Expose ``<Table>.<Event> = <Bindable>.Event`` cross-script.
     # Producer parents its BindableEvents to ``script`` with matching Name;
     # consumers rewrite ``<var>.<Key>:Connect`` to
@@ -361,11 +357,11 @@ def fix_require_classifications(scripts: list[RbxScript]) -> int:
     # property and crashes ("X is not a valid member of LocalScript").
     fixes += _expose_local_script_events(scripts)
 
-    # Pass 20: Approximate Unity OnTriggerStay with a Heartbeat poll on
-    # scripts that translated it to a single-shot ``Touched:Connect``.
-    # Without this, rotating turrets can never engage targets whose
-    # initial-contact angle was outside the engagement cone.
-    fixes += _add_trigger_stay_polling(scripts)
+    # Passes 18 (FPS default-controls disable) and 20 (OnTriggerStay
+    # polling) moved to script_coherence_packs.py. They are project-
+    # specific patches that auto-enable on detection of FPS controllers
+    # / converter-emitted turret AI helpers, so non-FPS projects skip
+    # them. Both already ran via run_packs() above.
 
     return fixes
 
@@ -1039,133 +1035,6 @@ def _fix_clone_visibility(scripts: list[RbxScript]) -> int:
     return fixes
 
 
-
-def _disable_default_controls_in_fps_scripts(scripts: list[RbxScript]) -> int:
-    """Disable Roblox's default PlayerModule controls in FPS-style scripts.
-
-    Detects client scripts that set ``MouseBehavior = Enum.MouseBehavior.LockCenter``
-    (the unmistakable signature of an FPS controller) and prepends a one-time
-    setup block that disables the default PlayerModule controls. Without this,
-    the auto-loaded ``StarterPlayerScripts/PlayerModule`` resets MouseBehavior
-    back to ``Default`` every frame, so the FPS controller's lock never sticks
-    and mouse-look does not work.
-
-    The prepended block is idempotent (guarded by an attribute check) so the
-    same script can be cloned to multiple players without re-running.
-    """
-    fixes = 0
-    # The marker line is the FIRST line of the prepended setup so an idempotent
-    # `marker in s.source` check works whether the function runs again on the
-    # same script (e.g. re-running write_output after editing on disk).
-    marker = "-- u2r: disable default PlayerModule controls"
-    # HumanoidRootPart sits ~3 studs above the feet, so a normally-grounded
-    # character reads ~3 studs above the floor it stands on. The snap target
-    # is therefore floor + 3y, and we compare HRP to *target* (not the raw
-    # hit) so that "already standing" doesn't trip the threshold.
-    setup = (
-        f"{marker} + assert FPS mouse state + first-person body hide + spawn floor-snap\n"
-        "-- Re-applies on CharacterAdded because Roblox's character spawn flow\n"
-        "-- re-enables the default PlayerModule and resets MouseBehavior, and\n"
-        "-- because Roblox loads avatar accessories asynchronously after the\n"
-        "-- character spawns — DescendantAdded catches each late-added Handle\n"
-        "-- so the user's hat/chain/glasses don't float across the FPS camera.\n"
-        "do\n"
-        "    local _lp = game:GetService(\"Players\").LocalPlayer\n"
-        "    local _UIS = game:GetService(\"UserInputService\")\n"
-        "    local function _applyFpsMouseState()\n"
-        "        local _ps = _lp:WaitForChild(\"PlayerScripts\", 10)\n"
-        "        local _pm = _ps and _ps:WaitForChild(\"PlayerModule\", 10)\n"
-        "        if _pm then\n"
-        "            -- pcall the require/GetControls/Disable trio because the\n"
-        "            -- Roblox-managed PlayerModule API has shifted historically;\n"
-        "            -- a future rename should not break the FPS lock.\n"
-        "            local ok, mod = pcall(require, _pm)\n"
-        "            if ok and mod then\n"
-        "                local ok2, controls = pcall(function() return mod:GetControls() end)\n"
-        "                if ok2 and controls and controls.Disable then\n"
-        "                    pcall(function() controls:Disable() end)\n"
-        "                end\n"
-        "            end\n"
-        "        end\n"
-        "        _UIS.MouseBehavior = Enum.MouseBehavior.LockCenter\n"
-        "        _UIS.MouseIconEnabled = false\n"
-        "    end\n"
-        "    -- Walk up parents looking for a node named WeaponSlot. The FPS\n"
-        "    -- controller parents the held weapon under camera.WeaponSlot, so\n"
-        "    -- anything reachable through that chain must stay visible.\n"
-        "    local function _isInWeaponSlot(inst)\n"
-        "        local p = inst.Parent\n"
-        "        while p and p ~= game do\n"
-        "            if p.Name == \"WeaponSlot\" then return true end\n"
-        "            p = p.Parent\n"
-        "        end\n"
-        "        return false\n"
-        "    end\n"
-        "    local function _hidePart(part)\n"
-        "        if (part:IsA(\"BasePart\") or part:IsA(\"Decal\")) and not _isInWeaponSlot(part) then\n"
-        "            part.LocalTransparencyModifier = 1\n"
-        "        end\n"
-        "    end\n"
-        "    local function _hideCharacter(char)\n"
-        "        if not char then return end\n"
-        "        -- Connect FIRST, then iterate the snapshot. Roblox can deliver\n"
-        "        -- a DescendantAdded between snapshot capture and Connect, so\n"
-        "        -- iterating first would let an accessory inserted in that gap\n"
-        "        -- slip through both passes.\n"
-        "        char.DescendantAdded:Connect(_hidePart)\n"
-        "        for _, part in char:GetDescendants() do _hidePart(part) end\n"
-        "    end\n"
-        "    -- After Roblox finishes its respawn flow the character can land\n"
-        "    -- in mid-air when the Unity SpawnPoint sits over a gap rather\n"
-        "    -- than on a floor (the Unity transform is a marker; the converter\n"
-        "    -- doesn't ground-snap it). Raycast down once and reseat the HRP\n"
-        "    -- on whatever surface is directly below.\n"
-        "    local function _snapToFloor(char)\n"
-        "        if not char then return end\n"
-        "        local hrp = char:WaitForChild(\"HumanoidRootPart\", 5)\n"
-        "        if not hrp then return end\n"
-        "        task.wait()\n"
-        "        local rp = RaycastParams.new()\n"
-        "        rp.FilterDescendantsInstances = {char}\n"
-        "        rp.FilterType = Enum.RaycastFilterType.Exclude\n"
-        "        -- Origin = HRP itself (the character is filter-excluded). Starting\n"
-        "        -- above HRP risks hitting an overhead ceiling/bridge first and\n"
-        "        -- snapping the player upward onto it.\n"
-        "        local hit = workspace:Raycast(hrp.Position, Vector3.new(0, -200, 0), rp)\n"
-        "        if not hit then return end\n"
-        "        local target = hit.Position + Vector3.new(0, 3, 0)\n"
-        "        if (hrp.Position - target).Magnitude > 2 then\n"
-        "            -- Translate by delta to preserve the character's yaw/pitch\n"
-        "            -- (CFrame.new(target) would reset rotation to identity).\n"
-        "            hrp.CFrame = hrp.CFrame + (target - hrp.Position)\n"
-        "        end\n"
-        "    end\n"
-        "    _applyFpsMouseState()\n"
-        "    _hideCharacter(_lp.Character)\n"
-        "    _snapToFloor(_lp.Character)\n"
-        "    _lp.CharacterAdded:Connect(function(char)\n"
-        "        task.wait()  -- let Roblox finish its respawn handling first\n"
-        "        _applyFpsMouseState()\n"
-        "        _hideCharacter(char)\n"
-        "        _snapToFloor(char)\n"
-        "    end)\n"
-        "end\n\n"
-    )
-    for s in scripts:
-        if s.script_type != "LocalScript":
-            continue
-        if marker in s.source:
-            continue
-        if not re.search(
-            r"MouseBehavior\s*=\s*Enum\.MouseBehavior\.LockCenter", s.source
-        ):
-            continue
-        s.source = setup + s.source
-        fixes += 1
-        log.info("  Disabled default PlayerModule controls in '%s'", s.name)
-    return fixes
-
-
 def _remove_stale_player_requires(scripts: list[RbxScript]) -> int:
     """Rewrite Player-as-module references when Player is actually a LocalScript.
 
@@ -1385,89 +1254,5 @@ def _expose_local_script_events(scripts: list[RbxScript]) -> int:
                      sum(len(producers[p]) for p in var_to_producer.values()),
                      s.name)
     return fixes
-
-
-def _add_trigger_stay_polling(scripts: list[RbxScript]) -> int:
-    """Approximate Unity ``OnTriggerStay`` for trigger-collider scripts.
-
-    The AI typically translates Unity's ``OnTriggerStay`` to a single
-    ``triggerCollider.Touched:Connect`` handler. ``Touched`` fires once per
-    part-touch event, not every frame, so the script's per-frame angle
-    or distance checks (e.g. a rotating turret cone) only get one shot
-    when each player part initially contacts the trigger. If the angle
-    fails on first contact, the player has to leave and re-enter to get
-    another evaluation — turrets effectively never engage rotating
-    targets.
-
-    Detection: a script that names ``triggerCollider`` and binds
-    ``Touched:Connect`` AND defines an ``angle <`` cone check inside that
-    handler. Patch: append a Heartbeat polling loop using
-    ``workspace:GetPartBoundsInRadius`` (works regardless of CanCollide)
-    that re-runs the same engage logic at 6.7Hz while the script's
-    ``state`` is non-Engaged.
-    """
-    fixes = 0
-    poll_marker = "-- __TRIGGER_STAY_POLL__"
-    for s in scripts:
-        if poll_marker in s.source:
-            continue
-        if "triggerCollider" not in s.source:
-            continue
-        if "angle <" not in s.source:
-            continue
-        if "startEngaged" not in s.source:
-            continue
-        # Heuristic: only patch if the engage logic uses getTBase/sightRadius
-        # or the converter-emitted helper functions. Avoids patching
-        # arbitrary scripts that happen to mention angle.
-        if not (
-            "getTBase" in s.source
-            and ("getSightRadius" in s.source or "sightRadius" in s.source)
-        ):
-            continue
-        s.source += (
-            "\n\n" + poll_marker + " Unity OnTriggerStay equivalent — Touched fires\n"
-            "-- only on part-touch *events*, but Unity OnTriggerStay re-runs every\n"
-            "-- physics frame. Polling lets a rotating turret eventually pick up\n"
-            "-- a target whose initial-contact angle was outside the engagement cone.\n"
-            "do\n"
-            "    local _RunService = game:GetService(\"RunService\")\n"
-            "    local _sightRadius = getSightRadius()\n"
-            "    local _lastCheck = 0\n"
-            "    _RunService.Heartbeat:Connect(function()\n"
-            "        if state == State.Engaged then return end\n"
-            "        if tick() - _lastCheck < 0.15 then return end\n"
-            "        _lastCheck = tick()\n"
-            "        local _base = getTBase()\n"
-            "        if not _base then return end\n"
-            "        local _basePos = getPosition(_base)\n"
-            "        local _hits = workspace:GetPartBoundsInRadius(_basePos, _sightRadius)\n"
-            "        for _, _p in ipairs(_hits) do\n"
-            "            if isPlayerPart(_p) then\n"
-            "                local _character = getPlayerCharacter(_p)\n"
-            "                if _character then\n"
-            "                    local _targetPart = _character:FindFirstChild(\"HumanoidRootPart\") or _p\n"
-            "                    local _dir = _targetPart.Position - _basePos\n"
-            "                    local _angle = vectorAngle(_dir, getForward(_base))\n"
-            "                    if _angle < 55 then\n"
-            "                        local _rp = RaycastParams.new()\n"
-            "                        _rp.FilterDescendantsInstances = {model}\n"
-            "                        _rp.FilterType = Enum.RaycastFilterType.Exclude\n"
-            "                        local _res = workspace:Raycast(_basePos, _dir.Unit * _sightRadius, _rp)\n"
-            "                        if _res and isPlayerPart(_res.Instance) then\n"
-            "                            startEngaged(_targetPart)\n"
-            "                            return\n"
-            "                        end\n"
-            "                    end\n"
-            "                end\n"
-            "            end\n"
-            "        end\n"
-            "    end)\n"
-            "end\n"
-        )
-        fixes += 1
-        log.info("  Added OnTriggerStay polling loop to '%s'", s.name)
-    return fixes
-
 
 
