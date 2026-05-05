@@ -295,7 +295,8 @@ def _load_mesh_vertex_data(
 
     try:
         mesh = trimesh.load(str(mesh_path), force="mesh", process=False)
-    except Exception:
+    except (OSError, ValueError) as exc:
+        log.debug("trimesh.load(%s) failed: %s", mesh_path, exc)
         return None
 
     vertices = mesh.vertices
@@ -357,8 +358,8 @@ def _load_mesh_vertex_data(
                 tex_visual = visual.to_texture()
                 if hasattr(tex_visual, "uv") and tex_visual.uv is not None:
                     uv = np.array(tex_visual.uv, dtype=np.float32)
-            except Exception:
-                pass
+            except (AttributeError, ValueError) as exc:
+                log.debug("visual.to_texture() failed for %s: %s", mesh_path, exc)
 
     if uv is None or len(uv) != len(vertices):
         return None

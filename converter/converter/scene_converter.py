@@ -70,36 +70,11 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Quaternion helpers for composing parent + child transforms
+# Quaternion helpers (canonical implementations live in core.coordinate_system).
 # ---------------------------------------------------------------------------
 
-def _quat_multiply(q1: list | tuple, q2: list | tuple) -> list[float]:
-    """Multiply two quaternions (x, y, z, w) -> combined rotation."""
-    x1, y1, z1, w1 = q1
-    x2, y2, z2, w2 = q2
-    return [
-        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-    ]
-
-
-def _quat_rotate(q: list | tuple, v: list) -> list[float]:
-    """Rotate a 3D vector by a quaternion (x, y, z, w)."""
-    qx, qy, qz, qw = q
-    vx, vy, vz = v
-    # q * v * q_conjugate (optimized)
-    t = [
-        2.0 * (qy * vz - qz * vy),
-        2.0 * (qz * vx - qx * vz),
-        2.0 * (qx * vy - qy * vx),
-    ]
-    return [
-        vx + qw * t[0] + (qy * t[2] - qz * t[1]),
-        vy + qw * t[1] + (qz * t[0] - qx * t[2]),
-        vz + qw * t[2] + (qx * t[1] - qy * t[0]),
-    ]
+from core.coordinate_system import quat_multiply as _quat_multiply  # noqa: E402
+from core.coordinate_system import quat_rotate as _quat_rotate  # noqa: E402
 
 
 # Component types that indicate a light.
@@ -607,24 +582,16 @@ def _compose_parts_with_parent_cframe(
                 rx = pr00 * cx + pr01 * cy + pr02 * cz
                 ry = pr10 * cx + pr11 * cy + pr12 * cz
                 rz = pr20 * cx + pr21 * cy + pr22 * cz
-                cr00 = part.cframe.r00 if part.cframe.r00 is not None else 1.0
-                cr01 = part.cframe.r01 if part.cframe.r01 is not None else 0.0
-                cr02 = part.cframe.r02 if part.cframe.r02 is not None else 0.0
-                cr10 = part.cframe.r10 if part.cframe.r10 is not None else 0.0
-                cr11 = part.cframe.r11 if part.cframe.r11 is not None else 1.0
-                cr12 = part.cframe.r12 if part.cframe.r12 is not None else 0.0
-                cr20 = part.cframe.r20 if part.cframe.r20 is not None else 0.0
-                cr21 = part.cframe.r21 if part.cframe.r21 is not None else 0.0
-                cr22 = part.cframe.r22 if part.cframe.r22 is not None else 1.0
-                nr00 = pr00*cr00 + pr01*cr10 + pr02*cr20
-                nr01 = pr00*cr01 + pr01*cr11 + pr02*cr21
-                nr02 = pr00*cr02 + pr01*cr12 + pr02*cr22
-                nr10 = pr10*cr00 + pr11*cr10 + pr12*cr20
-                nr11 = pr10*cr01 + pr11*cr11 + pr12*cr21
-                nr12 = pr10*cr02 + pr11*cr12 + pr12*cr22
-                nr20 = pr20*cr00 + pr21*cr10 + pr22*cr20
-                nr21 = pr20*cr01 + pr21*cr11 + pr22*cr21
-                nr22 = pr20*cr02 + pr21*cr12 + pr22*cr22
+                cf = part.cframe
+                nr00 = pr00*cf.r00 + pr01*cf.r10 + pr02*cf.r20
+                nr01 = pr00*cf.r01 + pr01*cf.r11 + pr02*cf.r21
+                nr02 = pr00*cf.r02 + pr01*cf.r12 + pr02*cf.r22
+                nr10 = pr10*cf.r00 + pr11*cf.r10 + pr12*cf.r20
+                nr11 = pr10*cf.r01 + pr11*cf.r11 + pr12*cf.r21
+                nr12 = pr10*cf.r02 + pr11*cf.r12 + pr12*cf.r22
+                nr20 = pr20*cf.r00 + pr21*cf.r10 + pr22*cf.r20
+                nr21 = pr20*cf.r01 + pr21*cf.r11 + pr22*cf.r21
+                nr22 = pr20*cf.r02 + pr21*cf.r12 + pr22*cf.r22
                 part.cframe = RbxCFrame(
                     x=px + rx, y=py + ry, z=pz + rz,
                     r00=nr00, r01=nr01, r02=nr02,

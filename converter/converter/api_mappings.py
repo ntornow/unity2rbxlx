@@ -483,18 +483,8 @@ API_CALL_MAP: dict[str, str] = {
     # -- Resources --
     "Resources.Load": "-- Resources.Load: use game.ReplicatedStorage:FindFirstChild",
     # -- SceneManager --
-    "SceneManager.LoadScene": "-- SceneManager.LoadScene: not available in Roblox (single-place)",
     "SceneManager.LoadSceneAsync": "-- SceneManager.LoadSceneAsync: not available in Roblox (single-place)",
-    "SceneManager.GetActiveScene": "-- GetActiveScene: use game.PlaceId",
-    # -- PlayerPrefs --
-    "PlayerPrefs.GetFloat": "-- PlayerPrefs: use DataStoreService or Player:GetAttribute",
-    "PlayerPrefs.SetFloat": "-- PlayerPrefs: use DataStoreService or Player:SetAttribute",
-    "PlayerPrefs.GetInt": "-- PlayerPrefs: use DataStoreService",
-    "PlayerPrefs.SetInt": "-- PlayerPrefs: use DataStoreService",
-    "PlayerPrefs.GetString": "-- PlayerPrefs: use DataStoreService",
-    "PlayerPrefs.SetString": "-- PlayerPrefs: use DataStoreService",
-    "PlayerPrefs.Save": "-- PlayerPrefs.Save: DataStore saves automatically",
-    "PlayerPrefs.DeleteAll": "-- PlayerPrefs.DeleteAll: clear DataStore",
+    "PlayerPrefs.DeleteAll": "DataStoreService:GetDataStore('PlayerPrefs'):RemoveAsync",
     # -- CharacterController (via runtime/physics_bridge.luau) --
     # CharacterBridge wraps Humanoid with a CharacterController-like API:
     # CharacterBridge.new(character, config?), :Move(), :SimpleMove(),
@@ -533,8 +523,8 @@ API_CALL_MAP: dict[str, str] = {
     "Path.GetFileName": "string.match",
     "Path.GetExtension": "string.match",
     "Path.GetDirectoryName": "string.match",
-    # -- ExecuteEvents (Unity UI event system) --
-    "ExecuteEvents.Execute": "-- ExecuteEvents: use Roblox event system",
+    # -- ExecuteEvents (Unity UI event system) -- canonical mapping is at the
+    # top of API_CALL_MAP (eventSystem:On via runtime/event_system.luau).
     "ExecuteEvents.ExecuteHierarchy": "-- ExecuteEvents: use Roblox event system",
     # -- LayoutRebuilder --
     "LayoutRebuilder.MarkLayoutForRebuild": "-- LayoutRebuilder: UI auto-sizes in Roblox",
@@ -612,7 +602,7 @@ TYPE_MAP: dict[str, str] = {
     "RuntimeAnimatorController": "AnimationController",
     # MonoBehaviour base
     "MonoBehaviour": "-- MonoBehaviour: Roblox script",
-    "ScriptableObject": "-- ScriptableObject: use ModuleScript table",
+    "ScriptableObject": "ModuleScript",
     # Physics
     "RaycastHit": "RaycastResult",
     "Ray": "Ray",
@@ -635,8 +625,10 @@ TYPE_MAP: dict[str, str] = {
     "TextMeshPro": "TextLabel",
     "TMP_Text": "TextLabel",
     "TMP_InputField": "TextBox",
-    # Navigation
-    "NavMeshAgent": "PathfindingService",
+    # Navigation (NavMeshAgent runtime is wired via PathfindingService elsewhere;
+    # the type substitution here is just "Instance" because the variable holds
+    # the proxy created at runtime, not the service singleton.)
+    "NavMeshAgent": "Instance",
     # Networking
     "NetworkBehaviour": "-- NetworkBehaviour: use RemoteEvents",
     # Collections (generic)
@@ -676,16 +668,10 @@ TYPE_MAP: dict[str, str] = {
     "TrailRenderer": "Trail",
     "Cloth": "Instance",
     "Joint": "Constraint",
-    "RectTransform": "Frame",
-    "Canvas": "ScreenGui",
-    "Animator": "AnimationController",
     "Animation": "AnimationController",
-    "AudioClip": "Sound",
     "AnimationCurve": "NumberSequence",
     "Gradient": "ColorSequence",
-    "ScriptableObject": "ModuleScript",
     "TextAsset": "string",
-    "NavMeshAgent": "Instance",
     "GUIStyle": "Instance",
 }
 

@@ -24,7 +24,7 @@ def unity_to_roblox_pos(
     return (x * STUDS_PER_METER, y * STUDS_PER_METER, -z * STUDS_PER_METER)
 
 
-def _quat_multiply(
+def quat_multiply(
     a: tuple[float, float, float, float],
     b: tuple[float, float, float, float],
 ) -> tuple[float, float, float, float]:
@@ -36,6 +36,23 @@ def _quat_multiply(
         aw * by - ax * bz + ay * bw + az * bx,
         aw * bz + ax * by - ay * bx + az * bw,
         aw * bw - ax * bx - ay * by - az * bz,
+    )
+
+
+def quat_rotate(
+    q: tuple[float, float, float, float],
+    v: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """Rotate vector v=(x,y,z) by quaternion q=(x,y,z,w)."""
+    qx, qy, qz, qw = q
+    vx, vy, vz = v
+    tx = 2.0 * (qy * vz - qz * vy)
+    ty = 2.0 * (qz * vx - qx * vz)
+    tz = 2.0 * (qx * vy - qy * vx)
+    return (
+        vx + qw * tx + (qy * tz - qz * ty),
+        vy + qw * ty + (qz * tx - qx * tz),
+        vz + qw * tz + (qx * ty - qy * tx),
     )
 
 
@@ -53,17 +70,17 @@ def _read_fbx_up_axis(fbx_path) -> int:
     from pathlib import Path
     try:
         data = Path(fbx_path).read_bytes()
-        idx = data.find(b'UpAxis')
-        if idx < 0:
-            return -1
-        search = data[idx:idx + 100]
-        for i in range(len(search) - 5):
-            if search[i:i + 1] == b'I':
-                val = int.from_bytes(search[i + 1:i + 5], 'little')
-                if val in (0, 1, 2):
-                    return val
-    except Exception:
-        pass
+    except OSError:
+        return -1
+    idx = data.find(b'UpAxis')
+    if idx < 0:
+        return -1
+    search = data[idx:idx + 100]
+    for i in range(len(search) - 5):
+        if search[i:i + 1] == b'I':
+            val = int.from_bytes(search[i + 1:i + 5], 'little')
+            if val in (0, 1, 2):
+                return val
     return -1
 
 
@@ -101,7 +118,7 @@ def strip_fbx_prerotation(
     """
     if not needs_fbx_prerotation_strip(qx, qy, qz, qw):
         return (qx, qy, qz, qw)
-    return _quat_multiply((qx, qy, qz, qw), _FBX_PREROT_INV)
+    return quat_multiply((qx, qy, qz, qw), _FBX_PREROT_INV)
 
 
 def strip_fbx_prerotation_left(
@@ -114,7 +131,7 @@ def strip_fbx_prerotation_left(
     """
     if not needs_fbx_prerotation_strip(qx, qy, qz, qw):
         return (qx, qy, qz, qw)
-    return _quat_multiply(_FBX_PREROT_INV, (qx, qy, qz, qw))
+    return quat_multiply(_FBX_PREROT_INV, (qx, qy, qz, qw))
 
 
 def unity_quat_to_roblox_quat(

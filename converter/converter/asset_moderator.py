@@ -165,7 +165,7 @@ def _screen_script(path: Path, relative_path: str) -> list[ModerationFinding]:
     findings = []
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
-    except Exception:
+    except OSError:
         return findings
 
     for pat in _SLUR_PATTERNS:
