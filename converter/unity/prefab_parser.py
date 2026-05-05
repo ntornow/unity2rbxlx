@@ -171,17 +171,36 @@ def _parse_single_prefab(prefab_path: Path) -> PrefabTemplate:
             if ctrl_guid:
                 template.referenced_animator_controller_guids.add(ctrl_guid)
 
-    # Wire hierarchy
+    # Wire hierarchy. Preserve Unity m_Children display order — see
+    # scene_parser.py for the why (Turret prefab's tBase=GetChild(0)
+    # depends on Base coming before Collider in the children list).
     roots: list[PrefabNode] = []
     for node in template.all_nodes.values():
         if node.parent_file_id is None:
             roots.append(node)
-        else:
-            parent = template.all_nodes.get(node.parent_file_id)
-            if parent:
-                parent.children.append(node)
-            else:
-                roots.append(node)
+    for go_fid, node in template.all_nodes.items():
+        entry = go_fid_to_transform.get(go_fid)
+        if entry is None:
+            continue
+        _, xform = entry
+        ordered_child_xform_fids = [
+            ref_file_id(c) for c in (xform.get("m_Children") or [])
+            if ref_file_id(c)
+        ]
+        ordered_child_go_fids = [
+            xform_fid_to_go_fid.get(cf) for cf in ordered_child_xform_fids
+            if xform_fid_to_go_fid.get(cf)
+        ]
+        seen: set[str] = set()
+        for cgo in ordered_child_go_fids:
+            child = template.all_nodes.get(cgo)
+            if child and child.parent_file_id == go_fid and cgo not in seen:
+                node.children.append(child)
+                seen.add(cgo)
+        for other_go, other in template.all_nodes.items():
+            if other.parent_file_id == go_fid and other_go not in seen:
+                node.children.append(other)
+                seen.add(other_go)
 
     if len(roots) == 1:
         template.root = roots[0]

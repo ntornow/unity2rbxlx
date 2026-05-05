@@ -67,7 +67,11 @@ def _poll_operation(
 ) -> str | None:
     """Poll an async operation until done, return the asset ID.
 
-    Only returns numeric asset IDs (not UUIDs or operation paths).
+    Only returns numeric asset IDs (not UUIDs or operation paths). On a
+    Roblox-side processing failure, surfaces ``error.code`` and
+    ``error.message`` so callers know whether the upload was rejected by
+    moderation, malformed, or hit a transient server bug — the previous
+    "no numeric asset ID" message dropped the only diagnostic Roblox returned.
     """
     url = f"https://apis.roblox.com/assets/v1/operations/{operation_id}"
     for i in range(max_polls):
@@ -89,10 +93,16 @@ def _poll_operation(
                     candidate = path.split("/")[-1]
                     if candidate.isdigit():
                         return candidate
-                # Operation completed but no numeric asset ID — moderation
-                # may still be pending, or upload was rejected.
-                logger.warning("Upload op %s done but no numeric asset ID: %s",
-                               operation_id, response_data)
+                # Operation completed without an asset ID. The real cause
+                # is on ``data.error`` — surface it so users know whether
+                # to retry, fix the source asset, or skip it permanently.
+                error = data.get("error") or {}
+                err_code = error.get("code", "MissingAssetId")
+                err_msg = error.get("message", "")
+                logger.warning(
+                    "Upload op %s failed: code=%s message=%r response=%s",
+                    operation_id, err_code, err_msg, response_data,
+                )
                 return None
         except Exception as exc:
             logger.warning("Poll attempt %d failed: %s", i + 1, exc)

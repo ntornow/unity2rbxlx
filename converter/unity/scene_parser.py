@@ -195,16 +195,44 @@ def parse_scene(scene_path: str | Path) -> ParsedScene:
 
     # ------------------------------------------------------------------
     # Pass 5: Wire parent/child hierarchy
-    # ------------------------------------------------------------------
+    #
+    # Preserve Unity's display order by walking each Transform's
+    # ``m_Children`` list. Without this, children land in YAML-document
+    # iteration order — which differs from Unity's m_Children order — so
+    # scripts that read ``transform.GetChild(i)`` translate to a Roblox
+    # ``GetChildren()[i]`` lookup that returns the wrong sibling. (E.g.
+    # SimpleFPS Turret model: m_Children=[Base, Collider] in Unity, but
+    # the parser visited the YAML docs as [Collider, Base], breaking
+    # rotation and bullet origin lookups.) Fall back to YAML order for
+    # any child whose fileID isn't in the parent's m_Children list.
     for node in result.all_nodes.values():
         if node.parent_file_id is None:
             result.roots.append(node)
-        else:
-            parent = result.all_nodes.get(node.parent_file_id)
-            if parent:
-                parent.children.append(node)
-            else:
-                result.roots.append(node)
+    for go_fid, node in result.all_nodes.items():
+        entry = go_fid_to_transform.get(go_fid)
+        if entry is None:
+            continue
+        _, xform = entry
+        ordered_child_xform_fids = [
+            ref_file_id(c) for c in (xform.get("m_Children") or [])
+            if ref_file_id(c)
+        ]
+        ordered_child_go_fids = [
+            xform_fid_to_go_fid.get(cf) for cf in ordered_child_xform_fids
+            if xform_fid_to_go_fid.get(cf)
+        ]
+        # Append in Unity m_Children order first…
+        seen: set[str] = set()
+        for cgo in ordered_child_go_fids:
+            child = result.all_nodes.get(cgo)
+            if child and child.parent_file_id == go_fid and cgo not in seen:
+                node.children.append(child)
+                seen.add(cgo)
+        # …then any stragglers (shouldn't happen for well-formed YAML).
+        for other_go, other in result.all_nodes.items():
+            if other.parent_file_id == go_fid and other_go not in seen:
+                node.children.append(other)
+                seen.add(other_go)
 
     # ------------------------------------------------------------------
     # Pass 6: Record PrefabInstance documents

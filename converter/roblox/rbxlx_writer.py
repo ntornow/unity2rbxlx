@@ -1623,6 +1623,18 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, int]:
              "ResumeButton", "Frame", "Background", "Checkmark",
              "HumanoidRootPart", "Humanoid", "Head", "Torso", "Character",
              "Backpack", "PlayerScripts", "leaderstats"}
+    # Skip names that other writer paths will add to ReplicatedStorage as a
+    # Folder/ModuleScript/etc. — creating a same-named RemoteEvent makes
+    # WaitForChild ambiguous and can return the wrong instance.
+    _reserved_rs_names: set[str] = {"Templates"} if (
+        getattr(place, "replicated_templates", None) or []
+    ) else set()
+    for s in scripts:
+        if getattr(s, "script_type", None) == "ModuleScript":
+            target_name = getattr(s, "name", None)
+            if target_name:
+                _reserved_rs_names.add(target_name)
+    _skip = _skip | _reserved_rs_names
     # Also skip names that scripts create as BindableEvents (not RemoteEvents)
     _bindable_names: set[str] = set()
     for script in scripts:
