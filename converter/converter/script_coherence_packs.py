@@ -278,12 +278,21 @@ RunService.Heartbeat:Connect(function(dt)
 \tend
 end)
 
+local _Players = game:GetService("Players")
+local _RS = game:GetService("ReplicatedStorage")
+-- Pickup→Player must cross the server/client boundary: Pickup is a server
+-- Script and Player runs as a LocalScript, so SetAttribute on the client's
+-- character won't replicate. Fire a RemoteEvent in ReplicatedStorage instead;
+-- rbxlx_writer auto-creates `PickupItemEvent` because this script references
+-- it with FireClient. Player's coherence pack adds the OnClientEvent listener.
+local _pickupEvent = _RS:FindFirstChild("PickupItemEvent")
 local touchPart = trigger or (target:IsA("BasePart") and target or target:FindFirstChildWhichIsA("BasePart"))
 if touchPart then
 \ttouchPart.Touched:Connect(function(otherPart)
 \t\tlocal character = otherPart:FindFirstAncestorOfClass("Model")
-\t\tif character and game:GetService("Players"):GetPlayerFromCharacter(character) then
-\t\t\tcharacter:SetAttribute("GetItem", itemName)
+\t\tlocal player = character and _Players:GetPlayerFromCharacter(character)
+\t\tif player then
+\t\t\tif _pickupEvent then _pickupEvent:FireClient(player, itemName) end
 \t\t\tif source then source:Play() end
 \t\t\tDebris:AddItem(container, 0)
 \t\tend
@@ -412,23 +421,69 @@ def _inject_fps_rifle_system(scripts: list["RbxScript"]) -> int:
 )
 def _convert_pickup_to_remote_event(scripts: list["RbxScript"]) -> int:
     fixes = 0
+    # Match `<receiver>:SetAttribute("PickupItem"|"GetItem", itemName)` where
+    # the receiver may be `target`, `character`, `player.Character`, or `other`
+    # (different variable names produced by the AI-transpiled Pickup, the
+    # _PICKUP_REPLACEMENT template, and rule-based outputs). The receiver
+    # expression is captured so we can derive the player from it.
+    pattern = re.compile(
+        r'([a-zA-Z_][\w.]*)\s*:\s*SetAttribute\s*\(\s*"(PickupItem|GetItem)"\s*,\s*itemName\s*\)'
+    )
     for s in scripts:
         if s.name != 'Pickup':
             continue
-        for attr_name in ['PickupItem', 'GetItem']:
-            old = f'target:SetAttribute("{attr_name}", itemName)'
-            log.info("  Checking Pickup for: %s → found=%s", attr_name, old in s.source)
-            if old in s.source:
-                new = (
-                    'local _pe = game:GetService("ReplicatedStorage"):FindFirstChild("PickupItemEvent")\n'
-                    '\t\tif _pe then\n'
-                    '\t\t\tlocal _pl = game.Players:GetPlayerFromCharacter(target)\n'
-                    '\t\t\tif _pl then _pe:FireClient(_pl, itemName) end\n'
-                    '\t\tend'
-                )
-                s.source = s.source.replace(old, new)
-                fixes += 1
-                log.info("  Converted Pickup SetAttribute to RemoteEvent FireClient")
+
+        def _replace(m: "re.Match[str]") -> str:
+            receiver = m.group(1)
+            return (
+                'do\n'
+                '\t\t\tlocal _pe = game:GetService("ReplicatedStorage"):FindFirstChild("PickupItemEvent")\n'
+                f'\t\t\tlocal _char = {receiver}\n'
+                '\t\t\tlocal _pl = _char and game:GetService("Players"):GetPlayerFromCharacter(_char)\n'
+                '\t\t\tif _pe and _pl then _pe:FireClient(_pl, itemName) end\n'
+                '\t\tend'
+            )
+
+        new_src, count = pattern.subn(_replace, s.source)
+        if count:
+            s.source = new_src
+            fixes += count
+            log.info(
+                "  Converted %d Pickup SetAttribute -> PickupItemEvent:FireClient",
+                count,
+            )
+
+        # Unity's MonoBehaviour serialized fields land as attributes on the
+        # parent Model (the GameObject), not on the Script — but the AI
+        # transpiler emits ``script:GetAttribute("itemName")`` which always
+        # returns nil and falls back to ``""``. Replace each
+        # ``local <name> = script:GetAttribute("<attr>")`` with a walk-up
+        # search that checks each ancestor's attribute. Without this,
+        # every AI-transpiled Pickup fires the RemoteEvent with an empty
+        # string and the client listener filters it out (no rifle equip,
+        # no health/ammo apply).
+        attr_pattern = re.compile(
+            r'(local\s+\w+\s*=\s*)script:GetAttribute\(\s*"(\w+)"\s*\)'
+        )
+
+        def _attr_replace(m: "re.Match[str]") -> str:
+            decl = m.group(1)
+            attr = m.group(2)
+            return (
+                f'{decl}(function() local _c=script.Parent; '
+                f'while _c do local v=_c:GetAttribute("{attr}"); '
+                f'if v ~= nil then return v end; _c=_c.Parent end; '
+                f'return script:GetAttribute("{attr}") end)()'
+            )
+
+        new_src2, count2 = attr_pattern.subn(_attr_replace, s.source)
+        if count2:
+            s.source = new_src2
+            fixes += count2
+            log.info(
+                "  Promoted %d Pickup script:GetAttribute reads to walk-up search",
+                count2,
+            )
     return fixes
 
 
@@ -442,16 +497,24 @@ def _convert_pickup_to_remote_event(scripts: list["RbxScript"]) -> int:
 def _add_pickup_remote_listener(scripts: list["RbxScript"]) -> int:
     fixes = 0
     for s in scripts:
-        if 'GetItem' not in s.source or 'GetRifle' not in s.source:
+        # Detect a Player-style controller by name presence: AI transpilation
+        # emits Lua-conventional camelCase (`getItem`, `getRifle`) while
+        # earlier rule-based output kept C# Title-case (`GetItem`, `GetRifle`).
+        # Match either by lowering the search.
+        src_lower = s.source.lower()
+        if 'getitem' not in src_lower or 'getrifle' not in src_lower:
             continue
         if 'PickupItemEvent' in s.source:
             continue
+        # Pick whichever casing the script already uses for the dispatch call
+        # so we don't introduce an undefined identifier.
+        get_item_name = 'getItem' if 'getItem' in s.source else 'GetItem'
         listener = (
             '\n-- Pickup via RemoteEvent (server fires when player touches pickup)\n'
             'local _pickupEvt = game:GetService("ReplicatedStorage"):WaitForChild("PickupItemEvent", 5)\n'
             'if _pickupEvt then\n'
             '    _pickupEvt.OnClientEvent:Connect(function(itemName)\n'
-            '        if itemName and itemName ~= "" then getItem(itemName) end\n'
+            f'        if itemName and itemName ~= "" then {get_item_name}(itemName) end\n'
             '    end)\n'
             'end\n'
         )
@@ -710,3 +773,4 @@ def _add_trigger_stay_polling(scripts: list["RbxScript"]) -> int:
         fixes += 1
         log.info("  Added OnTriggerStay polling loop to '%s'", s.name)
     return fixes
+
