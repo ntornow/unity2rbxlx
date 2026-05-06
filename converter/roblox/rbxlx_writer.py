@@ -1611,8 +1611,28 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, int]:
 
     # ---- Auto-create RemoteEvents referenced by scripts --------------------
     import re as _re
+
+    # Walk every script in the place: top-level (place.scripts) AND scripts
+    # bound to parts (part.scripts) recursively. The auto-create scan must
+    # see both, because cross-trust-boundary RemoteEvents are most often
+    # referenced by inline scripts attached to pickup/turret/etc. models —
+    # if we only scanned place.scripts we'd miss the FireClient calls in
+    # Pickup-on-each-pickup-model and never create the matching RemoteEvent
+    # in ReplicatedStorage. Symptom of that bug: server FireClient becomes
+    # a no-op and the client never receives the pickup signal.
+    def _collect_all_scripts(_place) -> list:
+        out: list = list(getattr(_place, "scripts", None) or [])
+        def _walk(part_list):
+            for p in part_list or []:
+                out.extend(getattr(p, "scripts", None) or [])
+                _walk(getattr(p, "children", None) or [])
+        _walk(getattr(_place, "workspace_parts", None) or getattr(_place, "parts", None) or [])
+        return out
+
+    _all_scripts = _collect_all_scripts(place)
+
     _remote_names: set[str] = set()
-    for script in scripts:
+    for script in _all_scripts:
         src = getattr(script, "source", "")
         # Match patterns like: ReplicatedStorage:FindFirstChild("Foo") or :WaitForChild("Foo")
         for m in _re.finditer(r'(?:FindFirstChild|WaitForChild)\s*\(\s*"([^"]+)"\s*\)', src):
@@ -1622,22 +1642,39 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, int]:
              "Health", "Fill", "Ammo", "Cur", "Back", "CurHealth", "Label",
              "ResumeButton", "Frame", "Background", "Checkmark",
              "HumanoidRootPart", "Humanoid", "Head", "Torso", "Character",
-             "Backpack", "PlayerScripts", "leaderstats"}
+             "Backpack", "PlayerScripts", "leaderstats",
+             # Trigger-part names emitted by the Unity converter and looked up
+             # via FindFirstChild in many runtime scripts. Without this guard,
+             # any script that ALSO has FireServer/FireClient/etc. anywhere
+             # in its source (e.g. a Pickup/Turret) causes a same-named
+             # RemoteEvent to be spuriously created in ReplicatedStorage,
+             # shadowing the real trigger Part inside the model.
+             "Collider", "Trigger", "TriggerZone", "Detector",
+             "Sensor", "Hitbox", "Range", "ProximityVolume",
+             "PickupTouchDetector"}
     # Skip names that other writer paths will add to ReplicatedStorage as a
     # Folder/ModuleScript/etc. — creating a same-named RemoteEvent makes
     # WaitForChild ambiguous and can return the wrong instance.
     _reserved_rs_names: set[str] = {"Templates"} if (
         getattr(place, "replicated_templates", None) or []
     ) else set()
-    for s in scripts:
+    for s in _all_scripts:
         if getattr(s, "script_type", None) == "ModuleScript":
             target_name = getattr(s, "name", None)
             if target_name:
                 _reserved_rs_names.add(target_name)
+    # Also reserve emitted prefab template names so a script doing
+    # ``Templates:FindFirstChild("Rifle")`` doesn't trigger a spurious
+    # ReplicatedStorage.Rifle RemoteEvent shadowing the real
+    # ReplicatedStorage.Templates.Rifle Model.
+    for tmpl in getattr(place, "replicated_templates", None) or []:
+        tname = getattr(tmpl, "name", None) or (tmpl.get("name") if isinstance(tmpl, dict) else None)
+        if tname:
+            _reserved_rs_names.add(tname)
     _skip = _skip | _reserved_rs_names
     # Also skip names that scripts create as BindableEvents (not RemoteEvents)
     _bindable_names: set[str] = set()
-    for script in scripts:
+    for script in _all_scripts:
         src = getattr(script, "source", "")
         if "BindableEvent" in src:
             for m in _re.finditer(r'\.Name\s*=\s*"([^"]+)"', src):
@@ -1653,7 +1690,7 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, int]:
              "FireClient" in getattr(s, "source", "") or
              "OnClientEvent" in getattr(s, "source", "") or
              "FireAllClients" in getattr(s, "source", ""))
-            for s in scripts
+            for s in _all_scripts
         )
         if is_remote:
             _make_item(replicated_storage, "RemoteEvent", rname)

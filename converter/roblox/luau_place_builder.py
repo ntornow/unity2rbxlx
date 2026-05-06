@@ -587,18 +587,31 @@ def _emit_surface_appearance(
     instances which DO work headlessly.
     """
     color_map = sa.color_map if sa.color_map and "rbxassetid" in sa.color_map else ""
+    normal_map = sa.normal_map if sa.normal_map and "rbxassetid" in sa.normal_map else ""
+    metalness_map = sa.metalness_map if sa.metalness_map and "rbxassetid" in sa.metalness_map else ""
+    roughness_map = sa.roughness_map if sa.roughness_map and "rbxassetid" in sa.roughness_map else ""
+
+    # Skip emitting the SurfaceAppearance entirely when no map references
+    # survive validation. An empty SurfaceAppearance child overrides the
+    # MeshPart's own TextureID and forces a flat gray render — worse than
+    # the un-decorated mesh would render on its own. The "Skip if empty"
+    # guard fixes the doors/dock/rifle "no color" symptom users hit when
+    # the material had no usable texture URLs (e.g. all maps were dropped
+    # by upload errors or pointed at non-rbxassetid:// values).
+    if not (color_map or normal_map or metalness_map or roughness_map):
+        return
 
     # Try SurfaceAppearance first (works in Studio, not headless)
     b.line("do local saOk=pcall(function()")
     b.line("local sa=Instance.new('SurfaceAppearance')")
     if color_map:
         b.line(f"sa.ColorMap={_luau_str(color_map)}")
-    if sa.normal_map and "rbxassetid" in sa.normal_map:
-        b.line(f"sa.NormalMap={_luau_str(sa.normal_map)}")
-    if sa.metalness_map and "rbxassetid" in sa.metalness_map:
-        b.line(f"sa.MetalnessMap={_luau_str(sa.metalness_map)}")
-    if sa.roughness_map and "rbxassetid" in sa.roughness_map:
-        b.line(f"sa.RoughnessMap={_luau_str(sa.roughness_map)}")
+    if normal_map:
+        b.line(f"sa.NormalMap={_luau_str(normal_map)}")
+    if metalness_map:
+        b.line(f"sa.MetalnessMap={_luau_str(metalness_map)}")
+    if roughness_map:
+        b.line(f"sa.RoughnessMap={_luau_str(roughness_map)}")
     if sa.alpha_mode and sa.alpha_mode != "Overlay":
         b.line(f"sa.AlphaMode=Enum.AlphaMode.{sa.alpha_mode}")
     b.line(f"sa.Parent={parent_var}")

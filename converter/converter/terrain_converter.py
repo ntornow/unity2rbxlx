@@ -110,7 +110,7 @@ def read_unity_terrain(terrain_data_path: Path) -> dict[str, Any] | None:
                             layer_obj = layer_ref.get_obj().read()
                             if hasattr(layer_obj, "m_Name"):
                                 layer_name = str(layer_obj.m_Name)
-                    except (AttributeError, KeyError, ValueError) as exc:
+                    except (AttributeError, KeyError, ValueError, OSError) as exc:
                         log.debug("Could not resolve terrain layer ref: %s", exc)
                     if not layer_name:
                         layer_name = str(layer_ref)
