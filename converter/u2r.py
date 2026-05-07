@@ -148,9 +148,9 @@ def convert(
     ) if pipeline.context.uploaded_assets else False
 
     if has_meshes and not no_upload and not no_resolve and resolved_key:
-        click.echo("\n--- Publishing to Roblox (headless mesh resolution) ---")
+        click.echo("\n--- Publishing to Roblox ---")
         from roblox.id_cache import read_ids, write_ids
-        from roblox.place_publisher import publish_place
+        from roblox.place_publisher import publish_place, publish_place_file
 
         uid, pid = universe_id, place_id
         if not uid or not pid:
@@ -167,14 +167,32 @@ def convert(
             return
 
         click.echo(f"  Publishing on universe={uid} place={pid}...")
-        result = publish_place(
-            resolved_key, uid, pid, pipeline.state.rbx_place, output_path,
+        # Place file upload is the preferred path: it round-trips
+        # CollisionFidelity and other Plugin-gated MeshPart properties that
+        # the chunked execute_luau builder cannot set. The Open Cloud
+        # /universes/v1 place-version endpoint expects the binary .rbxl form
+        # (XML .rbxlx returns 400 "Invalid Content stream") so prefer that.
+        rbxl_file = output_path / "converted_place.rbxl"
+        upload_target = rbxl_file if rbxl_file.exists() else (
+            rbxlx_file if rbxlx_file.exists() else None
         )
-        click.echo(f"  Script size: {result.total_bytes:,} chars "
-                   f"({result.total_bytes/1024:.0f} KB), {result.chunks} chunk(s)")
-        click.echo(f"  Script saved to: {result.script_path}")
+        if upload_target is not None:
+            result = publish_place_file(resolved_key, uid, pid, upload_target)
+            click.echo(
+                f"  {upload_target.name}: {result.total_bytes:,} bytes "
+                f"({result.total_bytes / 1024:.0f} KB)"
+            )
+        else:
+            click.echo(f"  (no place file on disk — falling back to chunked builder)")
+            result = publish_place(
+                resolved_key, uid, pid, pipeline.state.rbx_place, output_path,
+            )
+            click.echo(
+                f"  Script size: {result.total_bytes:,} chars "
+                f"({result.total_bytes / 1024:.0f} KB), {result.chunks} chunk(s)"
+            )
 
-        if result.exceeded_limit:
+        if getattr(result, "exceeded_limit", False):
             click.echo(f"  WARNING: {result.error}")
             click.echo(f"  Script saved to: {result.script_path} (for manual execution in Studio)")
         elif result.success:
@@ -183,10 +201,9 @@ def convert(
             write_ids(output_path, uid, pid)
             click.echo("  Place published successfully!")
             click.echo("\n  Open in Studio: File → Open from Roblox → select the experience")
-            click.echo("  Meshes render as proper 3D geometry in edit mode.")
         else:
             click.echo(f"  {result.error}")
-            click.echo("  Headless execution failed. The rbxlx still works with runtime MeshLoader.")
+            click.echo("  Publish failed. The local rbxlx still opens directly in Studio.")
 
     click.echo(f"\n  Local rbxlx: {rbxlx_file}")
     click.echo(f"  To validate: python u2r.py validate {rbxlx_file}")
@@ -218,7 +235,9 @@ def publish(
     output_path = Path(output_dir).resolve()
 
     from roblox.id_cache import read_ids, write_ids
-    from roblox.place_publisher import publish_cached_chunks, publish_place
+    from roblox.place_publisher import (
+        publish_cached_chunks, publish_place, publish_place_file,
+    )
     from converter.pipeline import Pipeline
     from core.conversion_context import ConversionContext
 
@@ -260,11 +279,23 @@ def publish(
     if not uid or not pid:
         click.echo("ERROR: --universe-id and --place-id required (or cached in .roblox_ids.json)"); return
 
-    # Fast path: replay cached chunks. Works on archived/moved output dirs
-    # whose Unity project is gone. Falls back to a Pipeline rebuild only if
-    # the chunk cache is missing.
+    # Fast path: upload the existing place file. Preserves CollisionFidelity
+    # and other Plugin-gated MeshPart properties that the chunked
+    # execute_luau path can't write. Open Cloud /universes/v1 expects the
+    # binary .rbxl (XML .rbxlx returns 400 "Invalid Content stream"), so
+    # prefer that. Falls back to cached-chunks execution, then to a Pipeline
+    # rebuild, only when no place file is on disk.
     click.echo(f"Publishing to universe={uid} place={pid}...")
-    result = publish_cached_chunks(resolved_key, uid, pid, output_path)
+    rbxl_path = output_path / "converted_place.rbxl"
+    rbxlx_path = output_path / "converted_place.rbxlx"
+    upload_target = rbxl_path if rbxl_path.exists() else (
+        rbxlx_path if rbxlx_path.exists() else None
+    )
+    if upload_target is not None:
+        result = publish_place_file(resolved_key, uid, pid, upload_target)
+    else:
+        click.echo("  (no place file — falling back to cached chunks)")
+        result = publish_cached_chunks(resolved_key, uid, pid, output_path)
     if result is None:
         click.echo("No cached chunks found — rebuilding from Unity project.")
         ctx_path = output_path / "conversion_context.json"

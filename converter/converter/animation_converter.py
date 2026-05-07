@@ -1244,8 +1244,15 @@ def generate_tween_script(
     for c in child_curves:
         child_paths.setdefault(c.path, []).append(c)
 
-    # Generate animation function
-    lines.append("local function playAnimation()")
+    # Generate animation function. Takes ``target`` as a parameter so the
+    # parameter-driven path below can call ``playAnimation(_t)`` once per
+    # discovered instance — multi-instance prefabs (e.g. SimpleFPS doors)
+    # require a per-target tween, otherwise only the first instance moves.
+    # When called with no arg (loop / play-once branches that pre-date the
+    # multi-target refactor) it falls back to the outer ``target`` lookup.
+    lines.append("local _initialTarget = target")
+    lines.append("local function playAnimation(target)")
+    lines.append("\ttarget = target or _initialTarget")
 
     if self_curves:
         _generate_curves_code(lines, self_curves, "target", clip, indent=1)
@@ -1456,32 +1463,60 @@ def _generate_parameter_driven_playback(
 
     if bool_params:
         param = bool_params[0]
+        # Multi-instance safe: enumerate every same-named descendant the
+        # initial single-target search may have missed (SimpleFPS has 6
+        # ``Door`` Model copies, each with a sibling ``door`` MeshPart;
+        # without the loop, only one of the six listens for the toggle).
+        # ``script.Parent``-bound prefab-scoped scripts run once per clone
+        # so the loop is a no-op in that branch (only one match).
         lines.append(f"-- Parameter-driven animation: {param.name} (bool)")
-        lines.append(f"local isActive = false")
-        lines.append("")
-        lines.append(f"-- Listen for attribute changes to trigger animation")
-        lines.append(f"target:SetAttribute(\"{param.name}\", false)")
-        lines.append("")
-        lines.append(f"target:GetAttributeChangedSignal(\"{param.name}\"):Connect(function()")
-        lines.append(f"\tlocal val = target:GetAttribute(\"{param.name}\")")
-        lines.append(f"\tif val and not isActive then")
-        lines.append(f"\t\tisActive = true")
-        lines.append(f"\t\tplayAnimation()")
-        if clip.loop:
-            lines.append(f"\telseif not val then")
-            lines.append(f"\t\tisActive = false")
-        else:
-            lines.append(f"\t\tisActive = false")
+        lines.append(f"local _targets = {{ target }}")
+        lines.append(f"if not (script.Parent and script.Parent:IsA('BasePart')) then")
+        lines.append(f"\tlocal _targetName = target.Name")
+        lines.append(f"\tfor _, _t in ipairs(workspace:GetDescendants()) do")
+        lines.append(f"\t\tif _t ~= target and _t.Name == _targetName and (_t:IsA('BasePart') or _t:IsA('Model')) then")
+        lines.append(f"\t\t\tif _t:IsA('Model') then _t = _t.PrimaryPart or _t:FindFirstChildWhichIsA('BasePart') or _t end")
+        lines.append(f"\t\t\tif _t and _t:IsA('BasePart') then table.insert(_targets, _t) end")
+        lines.append(f"\t\tend")
         lines.append(f"\tend")
-        lines.append(f"end)")
+        lines.append(f"end")
+        lines.append("")
+        lines.append(f"for _, _t in ipairs(_targets) do")
+        lines.append(f"\tlocal _isActive = false")
+        lines.append(f"\t_t:SetAttribute(\"{param.name}\", false)")
+        lines.append(f"\t_t:GetAttributeChangedSignal(\"{param.name}\"):Connect(function()")
+        lines.append(f"\t\tlocal val = _t:GetAttribute(\"{param.name}\")")
+        lines.append(f"\t\tif val and not _isActive then")
+        lines.append(f"\t\t\t_isActive = true")
+        lines.append(f"\t\t\tplayAnimation(_t)")
+        if clip.loop:
+            lines.append(f"\t\telseif not val then")
+            lines.append(f"\t\t\t_isActive = false")
+        else:
+            lines.append(f"\t\t\t_isActive = false")
+        lines.append(f"\t\tend")
+        lines.append(f"\tend)")
+        lines.append(f"end")
     elif int_params:
         param = int_params[0]
         lines.append(f"-- Parameter-driven animation: {param.name} (int)")
-        lines.append(f"target:SetAttribute(\"{param.name}\", 0)")
+        lines.append(f"local _targets = {{ target }}")
+        lines.append(f"if not (script.Parent and script.Parent:IsA('BasePart')) then")
+        lines.append(f"\tlocal _targetName = target.Name")
+        lines.append(f"\tfor _, _t in ipairs(workspace:GetDescendants()) do")
+        lines.append(f"\t\tif _t ~= target and _t.Name == _targetName and (_t:IsA('BasePart') or _t:IsA('Model')) then")
+        lines.append(f"\t\t\tif _t:IsA('Model') then _t = _t.PrimaryPart or _t:FindFirstChildWhichIsA('BasePart') or _t end")
+        lines.append(f"\t\t\tif _t and _t:IsA('BasePart') then table.insert(_targets, _t) end")
+        lines.append(f"\t\tend")
+        lines.append(f"\tend")
+        lines.append(f"end")
         lines.append("")
-        lines.append(f"target:GetAttributeChangedSignal(\"{param.name}\"):Connect(function()")
-        lines.append(f"\tplayAnimation()")
-        lines.append(f"end)")
+        lines.append(f"for _, _t in ipairs(_targets) do")
+        lines.append(f"\t_t:SetAttribute(\"{param.name}\", 0)")
+        lines.append(f"\t_t:GetAttributeChangedSignal(\"{param.name}\"):Connect(function()")
+        lines.append(f"\t\tplayAnimation(_t)")
+        lines.append(f"\tend)")
+        lines.append(f"end")
     else:
         # No parameters, auto-play
         if clip.loop:

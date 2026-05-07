@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 _ASSETS_URL = "https://apis.roblox.com/assets/v1/assets"
 _PLACE_VERSION_URL = (
-    "https://apis.roblox.com/universes/v2/universes/{universe_id}"
+    "https://apis.roblox.com/universes/v1/{universe_id}"
     "/places/{place_id}/versions"
 )
 _LUAU_EXECUTION_URL = (

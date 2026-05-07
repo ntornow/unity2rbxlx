@@ -124,6 +124,57 @@ def _publish_chunks(
     )
 
 
+def publish_place_file(
+    api_key: str,
+    universe_id: int,
+    place_id: int,
+    rbxlx_path: Path,
+) -> PublishResult:
+    """Publish a place by uploading the generated ``.rbxlx`` file directly.
+
+    Preferred over :func:`publish_place` when the rbxlx already carries the
+    complete final state (resolved ``MeshId`` URLs, attributes, RemoteEvents,
+    ``CollisionFidelity``). The execute_luau builder path can't set
+    properties that require ``Plugin`` capability — most importantly
+    ``CollisionFidelity`` — so concave-mesh collision proxies (door frames,
+    interior cutouts) lose their hole and become solid hulls in the live
+    place.
+
+    Open Cloud's place-version endpoint accepts the rbxlx body verbatim and
+    Roblox ingests every property the file serializes, including the ones
+    Plugin-gated runtime APIs can't write. CollisionFidelity round-trips
+    correctly through this path.
+    """
+    from roblox.cloud_api import upload_place
+
+    rbxlx_path = Path(rbxlx_path)
+    if not rbxlx_path.exists():
+        return PublishResult(
+            success=False,
+            error=f"rbxlx not found at {rbxlx_path}",
+        )
+
+    total_bytes = rbxlx_path.stat().st_size
+    log.info(
+        "place_publisher: uploading %s (%d bytes) to universe=%s place=%s",
+        rbxlx_path.name, total_bytes, universe_id, place_id,
+    )
+    ok = upload_place(rbxlx_path, api_key, universe_id, place_id)
+    if not ok:
+        return PublishResult(
+            success=False,
+            total_bytes=total_bytes,
+            script_path=rbxlx_path,
+            error="rbxlx upload failed (see cloud_api log).",
+        )
+    return PublishResult(
+        success=True,
+        chunks=1,
+        total_bytes=total_bytes,
+        script_path=rbxlx_path,
+    )
+
+
 def publish_place(
     api_key: str,
     universe_id: int,
