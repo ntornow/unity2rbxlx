@@ -292,6 +292,17 @@ if touchPart then
 \t\tlocal character = otherPart:FindFirstAncestorOfClass("Model")
 \t\tlocal player = character and _Players:GetPlayerFromCharacter(character)
 \t\tif player then
+\t\t\t-- Persist the pickup as a server-side Player attribute so server
+\t\t\t-- scripts (e.g. Door checking ``Player.hasKey``) can react. The
+\t\t\t-- client-side Player LocalScript also flips its own LocalPlayer
+\t\t\t-- attribute via the FireClient below, but ``LocalPlayer:SetAttribute``
+\t\t\t-- on the client doesn't replicate to the server — so any server
+\t\t\t-- consumer of ``hasKey``/``hasRifle`` never sees the flag without
+\t\t\t-- this server-side write. Player Object attributes set server-side
+\t\t\t-- DO replicate, so the client read still works.
+\t\t\tif itemName and itemName ~= "" then
+\t\t\t\tplayer:SetAttribute("has" .. itemName, true)
+\t\t\tend
 \t\t\tif _pickupEvent then _pickupEvent:FireClient(player, itemName) end
 \t\t\tif source then source:Play() end
 \t\t\tDebris:AddItem(container, 0)
