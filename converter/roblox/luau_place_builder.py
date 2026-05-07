@@ -291,6 +291,15 @@ def generate_place_luau(
 
     b.line()
 
+    # --- Auto-create RemoteEvents referenced by scripts -----------------
+    # Mirror rbxlx_writer's auto-create scan: scripts reference cross-
+    # trust-boundary RemoteEvents (e.g. PickupItemEvent) via
+    # ``ReplicatedStorage:FindFirstChild/WaitForChild("Foo")``. Without
+    # creating them here, FireClient/OnClientEvent silently no-op on the
+    # headlessly-published place even though the rbxlx file works in Studio.
+    _emit_remote_events(b, place)
+    b.line()
+
     # --- Scripts ---
     _emit_scripts(b, place.scripts)
     b.line()
@@ -446,6 +455,7 @@ def _emit_part(
         b.line(f"{var}.Name={_luau_str(name)}")
         if part.cframe:
             b.line(f"{var}.WorldPivot={_cf(part.cframe)}")
+        _emit_attributes(b, part.attributes or {}, var)
         b.line(f"{var}.Parent={parent_var}")
         # Children
         for child in part.children or []:
@@ -554,6 +564,106 @@ def _emit_part(
         b.end()
 
 
+_REMOTE_EVENT_SKIP = {
+    "PlayerGui", "HUD", "Module", "ItemModule", "Pause", "Crosshair",
+    "Health", "Fill", "Ammo", "Cur", "Back", "CurHealth", "Label",
+    "ResumeButton", "Frame", "Background", "Checkmark",
+    "HumanoidRootPart", "Humanoid", "Head", "Torso", "Character",
+    "Backpack", "PlayerScripts", "leaderstats",
+    "Collider", "Trigger", "TriggerZone", "Detector",
+    "Sensor", "Hitbox", "Range", "ProximityVolume",
+    "PickupTouchDetector",
+}
+
+
+def _emit_remote_events(b: _LuauBuilder, place) -> None:
+    """Auto-create RemoteEvents in ReplicatedStorage that scripts reference.
+
+    Mirrors the scan in rbxlx_writer.py so FireClient / OnClientEvent
+    pairs across server Scripts and LocalScripts (e.g. PickupItemEvent)
+    actually have an instance to bind to in the headless publish path.
+    """
+    import re as _re
+
+    # Walk every script anywhere in the place: top-level + part-attached + recursive children
+    all_scripts: list = list(getattr(place, "scripts", None) or [])
+    def _walk(parts):
+        for p in parts or []:
+            all_scripts.extend(getattr(p, "scripts", None) or [])
+            _walk(getattr(p, "children", None) or [])
+    _walk(getattr(place, "workspace_parts", None) or [])
+    _walk(getattr(place, "server_storage_parts", None) or [])
+    _walk(getattr(place, "replicated_templates", None) or [])
+
+    candidates: set[str] = set()
+    for s in all_scripts:
+        src = getattr(s, "source", "") or ""
+        for m in _re.finditer(r'(?:FindFirstChild|WaitForChild)\s*\(\s*"([^"]+)"\s*\)', src):
+            candidates.add(m.group(1))
+
+    # Reserve names occupied by ModuleScripts and prefab templates
+    reserved = set(_REMOTE_EVENT_SKIP)
+    if getattr(place, "replicated_templates", None):
+        reserved.add("Templates")
+        for tmpl in place.replicated_templates:
+            tname = getattr(tmpl, "name", None)
+            if tname:
+                reserved.add(tname)
+    for s in all_scripts:
+        if getattr(s, "script_type", None) == "ModuleScript":
+            tn = getattr(s, "name", None)
+            if tn:
+                reserved.add(tn)
+
+    # BindableEvents created via ``Instance.new("BindableEvent"); ev.Name="X"``
+    bindables: set[str] = set()
+    for s in all_scripts:
+        src = getattr(s, "source", "") or ""
+        if "BindableEvent" in src:
+            for m in _re.finditer(r'\.Name\s*=\s*"([^"]+)"', src):
+                bindables.add(m.group(1))
+    reserved |= bindables
+
+    for name in sorted(candidates - reserved):
+        is_remote = any(
+            f'"{name}"' in (getattr(s, "source", "") or "") and
+            any(api in (getattr(s, "source", "") or "") for api in (
+                "FireServer", "OnServerEvent", "FireClient",
+                "OnClientEvent", "FireAllClients",
+            ))
+            for s in all_scripts
+        )
+        if not is_remote:
+            continue
+        b.block("do")
+        b.line("local re=Instance.new('RemoteEvent')")
+        b.line(f"re.Name={_luau_str(name)}")
+        b.line("re.Parent=RS")
+        b.end()
+
+
+def _emit_attributes(b: _LuauBuilder, attrs: dict, var: str) -> None:
+    """Emit SetAttribute calls for each entry in *attrs*.
+
+    rbxlx_writer serializes these into AttributesSerialize blobs; the
+    headless builder needs the same data via the runtime API so gameplay
+    scripts that read ``script.Parent:GetAttribute("itemName")`` etc.
+    actually find the value.
+    """
+    if not attrs:
+        return
+    for key, value in attrs.items():
+        if isinstance(value, bool):
+            v = "true" if value else "false"
+        elif isinstance(value, (int, float)):
+            v = _f(float(value))
+        elif isinstance(value, str):
+            v = _luau_str(value)
+        else:
+            continue  # skip unsupported types (Vector3, Color3, etc.)
+        b.line(f"{var}:SetAttribute({_luau_str(key)},{v})")
+
+
 def _emit_part_extras(b: _LuauBuilder, part: RbxPart, var: str) -> None:
     """Emit optional part properties (shared between Part and MeshPart paths)."""
     if not part.can_query:
@@ -566,6 +676,7 @@ def _emit_part_extras(b: _LuauBuilder, part: RbxPart, var: str) -> None:
         b.line(f"{var}.Massless=true")
     if part.reflectance and part.reflectance > 0:
         b.line(f"{var}.Reflectance={_f(part.reflectance)}")
+    _emit_attributes(b, part.attributes or {}, var)
 
     # CustomPhysicalProperties
     cpp = part.custom_physical_properties

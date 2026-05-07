@@ -1806,18 +1806,19 @@ def _claude_cli_transpile(
         f"```csharp\n{csharp_source}\n```"
     )
 
+    claude_timeout = 600
     try:
         result = subprocess.run(
             [claude_path, "-p", prompt, "--output-format", "text"],
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=claude_timeout,
         )
         if result.returncode != 0:
             raise RuntimeError(f"claude CLI exited with code {result.returncode}: {result.stderr[:200]}")
         luau_source = result.stdout.strip()
     except subprocess.TimeoutExpired:
-        raise RuntimeError("claude CLI timed out after 120s")
+        raise RuntimeError(f"claude CLI timed out after {claude_timeout}s")
     except FileNotFoundError:
         raise RuntimeError("'claude' CLI not found")
 

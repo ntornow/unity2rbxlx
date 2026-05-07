@@ -484,6 +484,32 @@ def _convert_pickup_to_remote_event(scripts: list["RbxScript"]) -> int:
                 "  Promoted %d Pickup script:GetAttribute reads to walk-up search",
                 count2,
             )
+
+        # Some AI variants skip SetAttribute entirely and emit their own
+        # RemoteEvent (e.g. ``PickupGetItem``) created at script init. Player
+        # listens on the canonical ``PickupItemEvent`` (injected by the
+        # _add_pickup_remote_listener pack), so a non-canonical name leaves
+        # the two sides talking past each other. Rewrite any RemoteEvent
+        # named ``Pickup*`` in a Pickup script to the canonical name.
+        re_alias_pattern = re.compile(
+            r'"(Pickup(?:GetItem|Get|Event|Item|Remote))"'
+        )
+        renamed = 0
+        def _alias_replace(m: "re.Match[str]") -> str:
+            nonlocal renamed
+            if m.group(1) == "PickupItemEvent":
+                return m.group(0)
+            renamed += 1
+            return '"PickupItemEvent"'
+
+        new_src3 = re_alias_pattern.sub(_alias_replace, s.source)
+        if renamed:
+            s.source = new_src3
+            fixes += renamed
+            log.info(
+                "  Canonicalized %d Pickup RemoteEvent name(s) to PickupItemEvent",
+                renamed,
+            )
     return fixes
 
 
@@ -772,5 +798,99 @@ def _add_trigger_stay_polling(scripts: list["RbxScript"]) -> int:
         )
         fixes += 1
         log.info("  Added OnTriggerStay polling loop to '%s'", s.name)
+    return fixes
+
+
+# ---------------------------------------------------------------------------
+# Pack: hud_player_bindable_events
+# ---------------------------------------------------------------------------
+
+# Maps the lowercase BindableEvent variable suffix the AI typically emits in
+# Player.luau (``healthUpdateEvent``, ``ammoUpdateEvent``, …) to the
+# CamelCase name that HUD-style consumers look up via
+# ``ReplicatedStorage:FindFirstChild("HealthUpdate")``. The two sides are
+# wired independently by the AI and don't agree on naming, so without this
+# pack the HUD never receives Player-side updates.
+_PLAYER_HUD_EVENT_NAMES = {
+    "healthUpdateEvent": "HealthUpdate",
+    "ammoUpdateEvent": "AmmoUpdate",
+    "itemUpdateEvent": "ItemUpdate",
+    "pauseEvent": "PauseEvent",
+}
+
+
+def _detect_player_hud_events(scripts: list["RbxScript"]) -> bool:
+    has_player = False
+    has_hud = False
+    for s in scripts:
+        src = s.source or ""
+        if any(v in src for v in _PLAYER_HUD_EVENT_NAMES) and \
+                'Instance.new("BindableEvent")' in src:
+            has_player = True
+        # HUD-style consumer: looks up event names in ReplicatedStorage by
+        # name. Match either the literal ``FindFirstChild("Foo")`` form or a
+        # ``resolveEvent("Foo")``-style helper that takes the string as an
+        # argument — both produce the same lookup at runtime.
+        for n in _PLAYER_HUD_EVENT_NAMES.values():
+            if (
+                f'FindFirstChild("{n}")' in src
+                or f'WaitForChild("{n}")' in src
+                or (
+                    f'"{n}"' in src
+                    and "ReplicatedStorage" in src
+                    and ("FindFirstChild" in src or "WaitForChild" in src)
+                )
+            ):
+                has_hud = True
+                break
+        if has_player and has_hud:
+            return True
+    return False
+
+
+@patch_pack(
+    name="hud_player_bindable_events",
+    description="Publish Player.luau's anonymous BindableEvents to "
+    "ReplicatedStorage under the names HudControl.luau expects, so HUD "
+    "subscribers actually receive health/ammo/item updates.",
+    detect=_detect_player_hud_events,
+)
+def _publish_player_hud_events(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    decl_re = re.compile(
+        r'^(\s*local\s+(' + '|'.join(map(re.escape, _PLAYER_HUD_EVENT_NAMES))
+        + r')\s*=\s*Instance\.new\(\s*["\']BindableEvent["\']\s*\)\s*)$',
+        re.MULTILINE,
+    )
+    for s in scripts:
+        if 'Instance.new("BindableEvent")' not in s.source:
+            continue
+        original = s.source
+        seen: set[str] = set()
+
+        def _replace(m: "re.Match[str]") -> str:
+            decl, var = m.group(1), m.group(2)
+            event_name = _PLAYER_HUD_EVENT_NAMES.get(var)
+            if not event_name or var in seen:
+                return decl
+            seen.add(var)
+            return (
+                f'{decl}\n'
+                f'{var}.Name = "{event_name}"\n'
+                f'do local _existing = game:GetService("ReplicatedStorage")'
+                f':FindFirstChild("{event_name}"); '
+                f'if _existing and _existing:IsA("BindableEvent") then '
+                f'{var}:Destroy(); {var} = _existing else '
+                f'{var}.Parent = game:GetService("ReplicatedStorage") end end'
+            )
+
+        s.source = decl_re.sub(_replace, s.source)
+        if s.source != original and seen:
+            fixes += 1
+            log.info(
+                "  Published %d Player BindableEvent(s) to ReplicatedStorage "
+                "in '%s': %s",
+                len(seen), s.name, ", ".join(sorted(seen)),
+            )
     return fixes
 
