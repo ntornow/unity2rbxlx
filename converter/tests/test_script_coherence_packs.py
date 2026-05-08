@@ -333,6 +333,36 @@ class TestPickupRemoteEventServerAttr:
             "Touched signal observes the flag flip"
         )
 
+    def test_injects_has_attr_when_unrelated_has_attribute_initialized(self) -> None:
+        """Codex finding [P1] (round 7): a Pickup that initializes an
+        unrelated has-flag (e.g. ``player:SetAttribute("hasKey", false)``
+        for default state) should still get the dynamic-concat write
+        injected before FireClient. The previous detector substring
+        check ``'SetAttribute("has"' not in src`` would false-skip
+        these Pickups.
+        """
+        s = RbxScript(
+            name="Pickup",
+            source=(
+                'local _pe = game:GetService("ReplicatedStorage")'
+                ':FindFirstChild("PickupItemEvent")\n'
+                '-- Initialize default state (unrelated to the dynamic write):\n'
+                'local function _resetPlayer(p) p:SetAttribute("hasKey", false) end\n'
+                'triggerPart.Touched:Connect(function(otherPart)\n'
+                '    local character = otherPart:FindFirstAncestorOfClass("Model")\n'
+                '    local player = game:GetService("Players"):GetPlayerFromCharacter(character)\n'
+                '    if _pe and player then _pe:FireClient(player, itemName) end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+        # Detector should still fire even though _resetPlayer mentions
+        # SetAttribute("hasKey", false).
+        assert packs_module._detect_pickup_setattribute_pattern([s]) is True
+        packs_module._convert_pickup_to_remote_event([s])
+        # The exact dynamic-concat pattern is injected.
+        assert ':SetAttribute("has" .. itemName, true)' in s.source
+
     def test_injects_has_attr_into_direct_fireclient_pickups(self) -> None:
         """Codex finding [P1] (round 6): a Pickup that already uses
         ``PickupItemEvent:FireClient(...)`` directly (e.g. the

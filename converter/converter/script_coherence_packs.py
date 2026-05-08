@@ -456,11 +456,28 @@ def _detect_pickup_setattribute_pattern(scripts: list["RbxScript"]) -> bool:
             return True
         # Direct-RemoteEvent shape: fires PickupItemEvent but doesn't
         # write the server-side has-attribute. The apply function
-        # injects the missing write.
-        if "PickupItemEvent" in src and "FireClient" in src and \
-                'SetAttribute("has"' not in src:
+        # injects the missing write. Match the EXACT dynamic-concat
+        # pattern the pack injects (``SetAttribute("has" .. itemName,
+        # true)``) — checking for any ``SetAttribute("has"...)`` would
+        # false-skip Pickups that init unrelated has-flags (e.g. an
+        # opening-state ``SetAttribute("hasKey", false)``) but never
+        # write the dynamic-concat shape that mirrors what the
+        # pack would inject.
+        if (
+            "PickupItemEvent" in src
+            and "FireClient" in src
+            and not _PICKUP_HAS_ATTR_INJECTED_RE.search(src)
+        ):
             return True
     return False
+
+
+# The exact server-attr write the pack injects. Matching this directly
+# (rather than ``SetAttribute("has"...)``) avoids false-skipping
+# Pickups that init unrelated has-flags before firing.
+_PICKUP_HAS_ATTR_INJECTED_RE = re.compile(
+    r':\s*SetAttribute\s*\(\s*"has"\s*\.\.\s*itemName\s*,\s*true\s*\)'
+)
 
 
 # Match ``getItem(`` or ``GetItem(`` as an UNQUALIFIED symbol — a real
@@ -588,7 +605,7 @@ def _convert_pickup_to_remote_event(scripts: list["RbxScript"]) -> int:
         if (
             "PickupItemEvent" in s.source
             and "FireClient" in s.source
-            and 'SetAttribute("has"' not in s.source
+            and not _PICKUP_HAS_ATTR_INJECTED_RE.search(s.source)
         ):
             injected = _inject_has_attribute_before_fireclient(s)
             if injected:
