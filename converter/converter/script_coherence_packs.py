@@ -423,12 +423,42 @@ def _inject_fps_rifle_system(scripts: list["RbxScript"]) -> int:
 # Pack: pickup_remote_event
 # ---------------------------------------------------------------------------
 
+# Match ``<receiver>:SetAttribute("PickupItem"|"GetItem", itemName)`` —
+# the canonical AI-transpiled-Pickup-handler shape we rewrite. Module-level
+# so the detector and the apply function share one source of truth.
+_PICKUP_SETATTRIBUTE_RE = re.compile(
+    r'[a-zA-Z_][\w.]*\s*:\s*SetAttribute\s*\(\s*"(?:PickupItem|GetItem)"\s*,\s*itemName\s*\)'
+)
+
+
+def _detect_pickup_setattribute_pattern(scripts: list["RbxScript"]) -> bool:
+    """Detector for ``pickup_remote_event_server``.
+
+    Fires on any project that has a ``Pickup``-named script writing
+    ``character:SetAttribute("GetItem"|"PickupItem", itemName)``. This
+    is the post-AI-transpile shape the pack rewrites. Detector is
+    intentionally name-agnostic — the previous gate ``_detect_fps_rifle_pickup``
+    bound this to FPS-rifle projects only, but ``door_global_player_to_attribute``
+    relies on the server-attribute write the pack injects, and pickup
+    patterns appear in any genre. Without a generic detector, key doors
+    in non-rifle projects would be rewritten to ``GetAttribute("hasKey")``
+    on a flag nobody writes.
+    """
+    return any(
+        s.name == "Pickup" and _PICKUP_SETATTRIBUTE_RE.search(s.source or "")
+        for s in scripts
+    )
+
+
 @patch_pack(
     name="pickup_remote_event_server",
     description="Convert Pickup script SetAttribute calls to "
     "ReplicatedStorage.PickupItemEvent:FireClient — server-side "
-    "SetAttribute does not trigger client GetAttributeChangedSignal.",
-    detect=_detect_fps_rifle_pickup,
+    "SetAttribute does not trigger client GetAttributeChangedSignal. "
+    "Also injects a server-side ``player:SetAttribute('has'..itemName, true)`` "
+    "before FireClient so server scripts (Door, etc.) can read replicated "
+    "gameplay flags.",
+    detect=_detect_pickup_setattribute_pattern,
 )
 def _convert_pickup_to_remote_event(scripts: list["RbxScript"]) -> int:
     fixes = 0
@@ -711,6 +741,48 @@ def _detect_door_global_player_lookup(scripts: list["RbxScript"]) -> bool:
     return False
 
 
+# Touched/TouchEnded callback parameter name in Connect(function(NAME)...).
+# The converter's api_mappings emits ``otherPart`` for OnTrigger*/OnCollision*
+# handlers, but AI transpiles often use ``other``. Capture whatever the
+# generated source actually used so call-site rewrites pass the right
+# argument; falling back to ``otherPart`` matches the documented convention.
+_TOUCH_CALLBACK_RE = re.compile(
+    r'(?:Touched|TouchEnded)\s*:\s*Connect\s*\(\s*function\s*\(\s*([a-zA-Z_]\w*)'
+)
+
+
+def _ensure_players_service_binding(source: str) -> str:
+    """Insert ``local Players = game:GetService("Players")`` at the top
+    of *source* if it's not already bound. The Door rewrite calls
+    ``Players:GetPlayerFromCharacter`` and would crash on the first
+    Touched if a Door previously only used ``_G.Player.hasKey()`` and
+    therefore never bound the service.
+
+    "Bound" specifically means an explicit assignment — either
+    ``local Players = ...`` or ``Players = ...``. Bare references to
+    ``Players`` (e.g. ``Players:GetPlayerFromCharacter`` injected by an
+    earlier pass of THIS pack) don't count, otherwise we'd false-skip
+    on every re-pass after a partial rewrite.
+    """
+    if re.search(r'^\s*(?:local\s+)?Players\s*=', source, re.MULTILINE):
+        return source
+    return 'local Players = game:GetService("Players")\n' + source
+
+
+def _resolve_touch_callback_param(source: str, default: str = "otherPart") -> str:
+    """Return the parameter name the surrounding ``Touched``/``TouchEnded``
+    callback uses, defaulting to ``otherPart`` (the converter's own
+    OnTrigger*/OnCollision* convention from api_mappings.py).
+
+    A door script with no Touched binding at all is rare — log defensively
+    and fall back to the default; the rewrite degrades gracefully because
+    the helper still type-checks even if the runtime arg is nil (the
+    helper returns false on nil ``_part``).
+    """
+    m = _TOUCH_CALLBACK_RE.search(source)
+    return m.group(1) if m else default
+
+
 @patch_pack(
     name="door_global_player_to_attribute",
     description="Rewrite Door scripts that probe gameplay flags via "
@@ -748,34 +820,44 @@ def _fix_door_global_player_lookup(scripts: list["RbxScript"]) -> int:
             )
 
         # Apply both helper shapes. Each appends to ``captured_helpers`` so
-        # call-site fixups below pass ``other`` to the now-arg-required fn.
+        # call-site fixups below pass the touching part to the now-arg-required fn.
         s.source = _DOOR_GLOBAL_PLAYER_HELPER_RE.sub(_helper_replace, s.source)
         s.source = _DOOR_GLOBAL_PLAYER_RETURN_RE.sub(_helper_replace, s.source)
+
+        # Resolve the actual Touched callback parameter from the post-rewrite
+        # source so call sites pass the right name. AI transpiles use ``other``;
+        # the converter's api_mappings.py emits ``otherPart`` for OnTrigger*/
+        # OnCollision* handlers — both must work without breaking the door.
+        callback_param = _resolve_touch_callback_param(s.source)
 
         for fn_name, _attr in captured_helpers:
             s.source = re.sub(
                 rf'\b{re.escape(fn_name)}\(\)',
-                f'{fn_name}(other)',
+                f'{fn_name}({callback_param})',
                 s.source,
             )
 
         # Inline-guard rewrite: ``if _G.Player and _G.Player.hasX then`` →
-        # ``if (function() ... end)() then``. Self-invoking lambda derives
-        # the player from the conventionally-named ``other`` parameter of
-        # the surrounding Touched/TouchEnded callback. Without the lambda
-        # we'd need to refactor the surrounding block; with it we keep the
+        # self-invoking lambda that derives the player from the surrounding
+        # Touched/TouchEnded callback's parameter. Without the lambda we'd
+        # need to refactor the surrounding block; with it we keep the
         # rewrite local and the existing ``then ... end`` body intact.
         def _inline_replace(m: "re.Match[str]") -> str:
             attr = m.group(1)
             return (
                 f'if (function() '
-                f'local _m = other and other:FindFirstAncestorOfClass("Model"); '
+                f'local _m = {callback_param} and {callback_param}:FindFirstAncestorOfClass("Model"); '
                 f'local _p = _m and Players:GetPlayerFromCharacter(_m); '
                 f'return _p and _p:GetAttribute("{attr}") '
                 f'end)() then'
             )
 
         s.source = _DOOR_GLOBAL_PLAYER_INLINE_RE.sub(_inline_replace, s.source)
+
+        # Ensure Players is bound — both rewrites call
+        # ``Players:GetPlayerFromCharacter`` and a Door that previously only
+        # used ``_G.Player.hasKey()`` may have skipped the service binding.
+        s.source = _ensure_players_service_binding(s.source)
 
         if s.source != original:
             fixes += 1
