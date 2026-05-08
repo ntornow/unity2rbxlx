@@ -274,6 +274,230 @@ class TestFpsRifleInjection:
         assert s.source == original
 
 
+class TestPickupRemoteEventServerAttr:
+    """The ``pickup_remote_event_server`` pack rewrites
+    ``character:SetAttribute("GetItem", itemName)`` to fire the
+    ``PickupItemEvent`` RemoteEvent — and ALSO writes
+    ``player:SetAttribute("has"..itemName, true)`` server-side so doors
+    and other server scripts can read the gameplay flag. The combined
+    invariant existed only inside ``_PICKUP_REPLACEMENT`` previously, and
+    that template was gated behind a detector that ``pickup_remote_event_server``
+    itself was disabling — so the server-attr write silently dropped.
+    These tests pin both invariants on the canonical AI-transpile shape.
+    """
+
+    def _ai_transpiled_pickup(self) -> RbxScript:
+        return RbxScript(
+            name="Pickup",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'local itemName = script:GetAttribute("itemName") or ""\n'
+                'triggerPart.Touched:Connect(function(otherPart)\n'
+                '    local character = otherPart:FindFirstAncestorOfClass("Model")\n'
+                '    if not character then return end\n'
+                '    local player = Players:GetPlayerFromCharacter(character)\n'
+                '    if not player then return end\n'
+                '    character:SetAttribute("GetItem", itemName)\n'
+                '    container:Destroy()\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+
+    def test_fires_remote_event(self) -> None:
+        s = self._ai_transpiled_pickup()
+        packs_module._convert_pickup_to_remote_event([s])
+        assert "PickupItemEvent" in s.source
+        assert "FireClient(_pl, itemName)" in s.source
+        # The original SetAttribute call must be gone — leaving it would
+        # leak ``GetItem`` onto the character (server-side, but only the
+        # client-side Player listener used to read it).
+        assert 'SetAttribute("GetItem", itemName)' not in s.source
+
+    def test_writes_server_side_player_attribute(self) -> None:
+        """The pack must inject ``_pl:SetAttribute("has"..itemName, true)``
+        BEFORE ``FireClient``. Server-side Player Object attribute writes
+        replicate to the client; the client-side Player.luau read in
+        ``hasKey`` was correct already, but the SERVER-side Door read of
+        ``player:GetAttribute("hasKey")`` saw nil before this fix.
+        """
+        s = self._ai_transpiled_pickup()
+        packs_module._convert_pickup_to_remote_event([s])
+        assert '_pl:SetAttribute("has" .. itemName, true)' in s.source
+        # Order matters: write the attribute, then fire the event.
+        attr_idx = s.source.index('_pl:SetAttribute("has" .. itemName')
+        fire_idx = s.source.index("FireClient(_pl, itemName)")
+        assert attr_idx < fire_idx, (
+            "server-attr write must precede FireClient so a server-side "
+            "Door listener seeing a same-frame attribute read on the "
+            "Touched signal observes the flag flip"
+        )
+
+    def test_skips_empty_itemname_at_runtime(self) -> None:
+        """The injected SetAttribute is guarded by ``itemName ~= ""`` so
+        a pickup with no itemName attribute doesn't write a useless
+        ``has`` attribute (the empty-string concat would still produce
+        ``"has"`` as the key)."""
+        s = self._ai_transpiled_pickup()
+        packs_module._convert_pickup_to_remote_event([s])
+        assert 'itemName and itemName ~= ""' in s.source
+
+
+class TestDoorGlobalPlayerToAttribute:
+    """The ``door_global_player_to_attribute`` pack catches Door scripts
+    where the AI transpiler emitted a server-incompatible
+    ``_G.Player.hasKey`` lookup and rewrites it to read the replicated
+    Player attribute that ``pickup_remote_event_server`` writes.
+
+    Three transpile shapes seen in the wild are pinned here: helper that
+    if-checks then returns, helper that returns truthy-and, and inline
+    if-guards inside Touched. The fast detector flips on any
+    ``_G.Player`` substring so every shape gets considered.
+    """
+
+    @staticmethod
+    def _door_with_helper() -> RbxScript:
+        return RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'local function getPlayerHasKey()\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        return _G.Player.hasKey()\n'
+                '    end\n'
+                '    return false\n'
+                'end\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    if getPlayerHasKey() then\n'
+                '        toggleDoor(true)\n'
+                '    end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+
+    @staticmethod
+    def _door_with_return_helper() -> RbxScript:
+        return RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'local function getPlayerHasKey()\n'
+                '    return _G.Player and _G.Player.hasKey or false\n'
+                'end\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    if getPlayerHasKey() then toggleDoor(true) end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+
+    @staticmethod
+    def _door_with_inline_guard() -> RbxScript:
+        return RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        toggleDoor(true)\n'
+                '    end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+
+    def test_detector_matches_any_g_player_reference(self) -> None:
+        for factory in (
+            self._door_with_helper,
+            self._door_with_return_helper,
+            self._door_with_inline_guard,
+        ):
+            assert packs_module._detect_door_global_player_lookup(
+                [factory()]
+            ) is True
+
+    def test_detector_skips_clean_doors(self) -> None:
+        """A Door already reading ``player:GetAttribute("hasKey")`` must
+        NOT trigger the rewrite — re-running the pack should be a no-op."""
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local function getPlayerHasKey(part)\n'
+                '    local m = part and part:FindFirstAncestorOfClass("Model")\n'
+                '    local p = m and Players:GetPlayerFromCharacter(m)\n'
+                '    return p and p:GetAttribute("hasKey")\n'
+                'end\n'
+            ),
+            script_type="Script",
+        )
+        assert packs_module._detect_door_global_player_lookup([s]) is False
+
+    def test_detector_skips_non_door_scripts(self) -> None:
+        """Other scripts may legitimately use ``_G.Player`` — the pack
+        is gated on ``s.name == "Door"`` to avoid touching them."""
+        s = RbxScript(
+            name="HudControl",
+            source="_G.Player = { hasKey = false }",
+            script_type="LocalScript",
+        )
+        assert packs_module._detect_door_global_player_lookup([s]) is False
+
+    def test_helper_form_rewrites_to_player_attribute(self) -> None:
+        s = self._door_with_helper()
+        packs_module._fix_door_global_player_lookup([s])
+        assert "_G.Player" not in s.source
+        assert 'getPlayerHasKey(_part)' in s.source  # helper now takes a part
+        assert 'GetPlayerFromCharacter(_model)' in s.source
+        assert ':GetAttribute("hasKey")' in s.source
+        # Call sites must pass ``other`` from the Touched callback.
+        assert "getPlayerHasKey(other)" in s.source
+        assert "getPlayerHasKey()" not in s.source
+
+    def test_return_helper_form_rewrites_to_player_attribute(self) -> None:
+        s = self._door_with_return_helper()
+        packs_module._fix_door_global_player_lookup([s])
+        assert "_G.Player" not in s.source
+        assert ':GetAttribute("hasKey")' in s.source
+        assert "getPlayerHasKey(other)" in s.source
+
+    def test_inline_guard_rewrites_to_player_attribute(self) -> None:
+        s = self._door_with_inline_guard()
+        packs_module._fix_door_global_player_lookup([s])
+        assert "_G.Player" not in s.source
+        assert ':GetAttribute("hasKey")' in s.source
+        # Inline guard becomes a self-invoking lambda; ``other`` is the
+        # Touched callback's parameter.
+        assert 'other and other:FindFirstAncestorOfClass("Model")' in s.source
+
+    def test_idempotent(self) -> None:
+        s = self._door_with_helper()
+        packs_module._fix_door_global_player_lookup([s])
+        first_pass = s.source
+        packs_module._fix_door_global_player_lookup([s])
+        assert s.source == first_pass
+
+    def test_preserves_attribute_name_for_non_key_doors(self) -> None:
+        """The pack captures ``has<X>`` from the original source — a door
+        that reads ``hasMagicWand`` produces ``GetAttribute("hasMagicWand")``,
+        not a hardcoded ``hasKey``."""
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local function probe()\n'
+                '    if _G.Player and _G.Player.hasMagicWand then\n'
+                '        return _G.Player.hasMagicWand()\n'
+                '    end\n'
+                '    return false\n'
+                'end\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._fix_door_global_player_lookup([s])
+        assert 'GetAttribute("hasMagicWand")' in s.source
+        assert 'GetAttribute("hasKey")' not in s.source
+
+
 class TestPickupVisualTargetPack:
     def test_detects_pickup_with_rotation_pattern(self) -> None:
         scripts = [

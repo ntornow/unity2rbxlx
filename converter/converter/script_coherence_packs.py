@@ -451,6 +451,15 @@ def _convert_pickup_to_remote_event(scripts: list["RbxScript"]) -> int:
                 '\t\t\tlocal _pe = game:GetService("ReplicatedStorage"):FindFirstChild("PickupItemEvent")\n'
                 f'\t\t\tlocal _char = {receiver}\n'
                 '\t\t\tlocal _pl = _char and game:GetService("Players"):GetPlayerFromCharacter(_char)\n'
+                '\t\t\t-- Persist the pickup as a server-side Player attribute so server\n'
+                '\t\t\t-- scripts (e.g. Door checking ``player:GetAttribute("hasKey")``) can\n'
+                '\t\t\t-- react. ``LocalPlayer:SetAttribute`` from the client does not\n'
+                '\t\t\t-- replicate, so any server consumer of ``hasKey``/``hasRifle``\n'
+                '\t\t\t-- needs this server-side write. Object attributes set server-side\n'
+                '\t\t\t-- DO replicate, so the client read in Player.luau still works.\n'
+                '\t\t\tif _pl and itemName and itemName ~= "" then\n'
+                '\t\t\t\t_pl:SetAttribute("has" .. itemName, true)\n'
+                '\t\t\tend\n'
                 '\t\t\tif _pe and _pl then _pe:FireClient(_pl, itemName) end\n'
                 '\t\tend'
             )
@@ -638,6 +647,141 @@ def _fix_pickup_visual_target(scripts: list["RbxScript"]) -> int:
         s.source = _PICKUP_REPLACEMENT
         fixes += 1
         log.info("  Rewired Pickup '%s' to Model-aware rotate+bob", s.name)
+    return fixes
+
+
+# ---------------------------------------------------------------------------
+# Pack: door_global_player_to_attribute
+# ---------------------------------------------------------------------------
+#
+# AI transpiles of Unity's ``Door.cs`` sometimes emit a helper of the form
+# ``if _G.Player and _G.Player.hasKey then return _G.Player.hasKey() end``
+# under the assumption that ``Player`` exposes itself as a global. Two
+# things break that assumption in the converted output:
+#
+#   1. ``Player.luau`` runs as a LocalScript — server scripts can't see
+#      its locals or globals.
+#   2. ``_G`` is per-actor in Roblox, so even a client read from a server
+#      script wouldn't cross the boundary.
+#
+# Pickup's coherence pack already writes ``player:SetAttribute("has"..itemName,
+# true)`` server-side, which DOES replicate. Rewrite the helper to read
+# that replicated attribute by deriving the player from the touching part.
+
+# Helper-style probe: ``local function fn() if _G.Player and _G.Player.hasX
+# then return _G.Player.hasX[()] end; return false end`` — captures function
+# name (group 1) and attribute name (group 2). Two trailing forms covered:
+# ``return _G.Player.hasX`` (field) and ``return _G.Player.hasX()`` (call).
+_DOOR_GLOBAL_PLAYER_HELPER_RE = re.compile(
+    r'local function (\w+)\(\)\s*\n'
+    r'\s*if _G\.Player and _G\.Player\.(\w+)\s+then\s*\n'
+    r'\s*return _G\.Player\.\2(?:\(\))?\s*\n'
+    r'\s*end\s*\n'
+    r'\s*return false\s*\n'
+    r'\s*end',
+)
+
+# Single-line ``return _G.Player and _G.Player.hasX [or false]`` body —
+# a different but equally common AI shape. Captures fn name and attribute.
+_DOOR_GLOBAL_PLAYER_RETURN_RE = re.compile(
+    r'local function (\w+)\(\)\s*\n'
+    r'\s*return _G\.Player\s+and\s+_G\.Player\.(\w+)(?:\(\))?'
+    r'(?:\s+or\s+false)?\s*\n'
+    r'\s*end',
+)
+
+# Inline-guard form: ``if _G.Player and _G.Player.hasX then …`` (no helper).
+# Captures attribute name only — there's no helper to rename. The body that
+# follows the ``then`` is rewritten to derive a player from the touching part.
+_DOOR_GLOBAL_PLAYER_INLINE_RE = re.compile(
+    r'\bif _G\.Player\s+and\s+_G\.Player\.(\w+)(?:\(\))?\s+then\b'
+)
+
+
+def _detect_door_global_player_lookup(scripts: list["RbxScript"]) -> bool:
+    for s in scripts:
+        if s.name != "Door":
+            continue
+        src = s.source or ""
+        # Cheap detector first — narrows the regex work to scripts that
+        # contain ``_G.Player`` at all. Catches every shape we rewrite below
+        # without running the slower regexes on unrelated Door variants.
+        if "_G.Player" in src:
+            return True
+    return False
+
+
+@patch_pack(
+    name="door_global_player_to_attribute",
+    description="Rewrite Door scripts that probe gameplay flags via "
+    "``_G.Player.hasKey()`` to read ``player:GetAttribute('hasKey')`` "
+    "instead. Player runs as a LocalScript so its globals never reach the "
+    "server-side Door, but Pickup writes a replicated server attribute "
+    "the Door can actually see. Covers three AI-transpile shapes: "
+    "``if _G.Player and _G.Player.hasX then return _G.Player.hasX() end`` "
+    "helper, ``return _G.Player and _G.Player.hasX`` helper, and inline "
+    "``if _G.Player and _G.Player.hasX then …`` guards inside Touched.",
+    detect=_detect_door_global_player_lookup,
+)
+def _fix_door_global_player_lookup(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        if s.name != "Door":
+            continue
+        if "_G.Player" not in (s.source or ""):
+            continue
+
+        original = s.source
+        captured_helpers: list[tuple[str, str]] = []
+
+        def _helper_replace(m: "re.Match[str]") -> str:
+            fn_name = m.group(1)
+            attr = m.group(2)
+            captured_helpers.append((fn_name, attr))
+            return (
+                f'local function {fn_name}(_part)\n'
+                f'    local _model = _part and _part:FindFirstAncestorOfClass("Model")\n'
+                f'    local _player = _model and Players:GetPlayerFromCharacter(_model)\n'
+                f'    if _player then return _player:GetAttribute("{attr}") end\n'
+                f'    return false\n'
+                f'end'
+            )
+
+        # Apply both helper shapes. Each appends to ``captured_helpers`` so
+        # call-site fixups below pass ``other`` to the now-arg-required fn.
+        s.source = _DOOR_GLOBAL_PLAYER_HELPER_RE.sub(_helper_replace, s.source)
+        s.source = _DOOR_GLOBAL_PLAYER_RETURN_RE.sub(_helper_replace, s.source)
+
+        for fn_name, _attr in captured_helpers:
+            s.source = re.sub(
+                rf'\b{re.escape(fn_name)}\(\)',
+                f'{fn_name}(other)',
+                s.source,
+            )
+
+        # Inline-guard rewrite: ``if _G.Player and _G.Player.hasX then`` →
+        # ``if (function() ... end)() then``. Self-invoking lambda derives
+        # the player from the conventionally-named ``other`` parameter of
+        # the surrounding Touched/TouchEnded callback. Without the lambda
+        # we'd need to refactor the surrounding block; with it we keep the
+        # rewrite local and the existing ``then ... end`` body intact.
+        def _inline_replace(m: "re.Match[str]") -> str:
+            attr = m.group(1)
+            return (
+                f'if (function() '
+                f'local _m = other and other:FindFirstAncestorOfClass("Model"); '
+                f'local _p = _m and Players:GetPlayerFromCharacter(_m); '
+                f'return _p and _p:GetAttribute("{attr}") '
+                f'end)() then'
+            )
+
+        s.source = _DOOR_GLOBAL_PLAYER_INLINE_RE.sub(_inline_replace, s.source)
+
+        if s.source != original:
+            fixes += 1
+            log.info(
+                "  Rewrote Door _G.Player gameplay-flag lookups in '%s'", s.name,
+            )
     return fixes
 
 
