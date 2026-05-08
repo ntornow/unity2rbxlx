@@ -16,6 +16,215 @@ from utils.logging_config import setup_logging
 from utils.script_cache import scripts_cache_intact
 
 
+def _scan_rbxl_collision_fidelity_targets(rbxl_path: Path) -> list[dict]:
+    """Extract MeshParts whose ``CollisionFidelity`` is non-Default
+    directly from a published ``.rbxl`` file. Used by ``u2r publish``
+    when there's no in-memory ``RbxPlace`` to walk — typical for
+    archived or moved output dirs that still want the post-upload
+    re-cook to fire so concave MeshColliders don't collapse to Box on
+    the live place.
+
+    Walks the binary lz4-framed chunks looking for INST and PRNT
+    relationships. The PROP chunk for ``CollisionFidelity`` carries
+    the enum value per-instance; ``MeshId`` carries the cook source.
+    Returns ``[]`` if anything looks malformed — the publish then
+    proceeds without the fixup rather than failing the upload.
+    """
+    import struct
+    try:
+        import lz4.block as _lz4
+    except ImportError:
+        return []
+
+    try:
+        data = rbxl_path.read_bytes()
+    except OSError:
+        return []
+
+    # Walk chunks past the 16-byte header + 16-byte preamble.
+    pos = 0
+    pos = data.find(b"INST", 14)
+    if pos < 0:
+        return []
+
+    inst_classes: dict[int, str] = {}
+    inst_count: dict[int, int] = {}
+    inst_referents: dict[int, list[int]] = {}
+    parents: dict[int, int] = {}
+    names: dict[int, str] = {}
+
+    # Per-instance property values keyed by referent
+    coll_fid: dict[int, int] = {}
+    mesh_id: dict[int, str] = {}
+
+    def _decode_chunk(p: int) -> tuple[bytes, bytes, int] | None:
+        if p + 16 > len(data):
+            return None
+        chunk_name = data[p:p + 4]
+        cl = struct.unpack_from("<I", data, p + 4)[0]
+        ul = struct.unpack_from("<I", data, p + 8)[0]
+        body_start = p + 16
+        if cl == 0:
+            body = data[body_start:body_start + ul]
+            return chunk_name, body, body_start + ul
+        try:
+            body = _lz4.decompress(
+                data[body_start:body_start + cl], uncompressed_size=ul,
+            )
+        except Exception:
+            return None
+        return chunk_name, body, body_start + cl
+
+    # Helpers for the binary-string parse
+    def _read_str(buf: bytes, off: int) -> tuple[str, int]:
+        ln = struct.unpack_from("<I", buf, off)[0]
+        return buf[off + 4:off + 4 + ln].decode("utf-8", "replace"), off + 4 + ln
+
+    def _read_referents(buf: bytes, off: int, n: int) -> tuple[list[int], int]:
+        # Stored as transformed int32 array, accumulating; the rbxl
+        # binary writer uses _interleave_u32 with zigzag encoding.
+        if n == 0:
+            return [], off
+        # 4 bytes per value, byte-interleaved big-endian
+        raw = bytearray(n * 4)
+        for byte_idx in range(4):
+            for val_idx in range(n):
+                raw[val_idx * 4 + byte_idx] = buf[off + byte_idx * n + val_idx]
+        out = []
+        prev = 0
+        for i in range(n):
+            packed = struct.unpack_from(">I", raw, i * 4)[0]
+            # zigzag decode
+            v = (packed >> 1) ^ (-(packed & 1) & 0xFFFFFFFF)
+            v = v if v < 0x80000000 else v - 0x100000000
+            prev += v
+            out.append(prev)
+        return out, off + n * 4
+
+    while pos < len(data) - 16:
+        decoded = _decode_chunk(pos)
+        if decoded is None:
+            break
+        chunk_name, body, next_pos = decoded
+        pos = next_pos
+        if chunk_name == b"END\x00":
+            break
+
+        if chunk_name == b"INST":
+            class_id = struct.unpack_from("<I", body, 0)[0]
+            cls_name, off = _read_str(body, 4)
+            # Skip 1 byte (is_service flag)
+            off += 1
+            count = struct.unpack_from("<I", body, off)[0]
+            off += 4
+            referents, _off = _read_referents(body, off, count)
+            inst_classes[class_id] = cls_name
+            inst_count[class_id] = count
+            inst_referents[class_id] = referents
+
+        elif chunk_name == b"PROP":
+            class_id = struct.unpack_from("<I", body, 0)[0]
+            prop_name, off = _read_str(body, 4)
+            type_id = body[off]
+            off += 1
+            referents = inst_referents.get(class_id, [])
+            if not referents:
+                continue
+            n = len(referents)
+            if prop_name == "Name" and type_id == 0x01:
+                # Sequence of length-prefixed strings
+                for ref in referents:
+                    ln = struct.unpack_from("<I", body, off)[0]
+                    off += 4
+                    names[ref] = body[off:off + ln].decode("utf-8", "replace")
+                    off += ln
+            elif prop_name == "MeshId" and type_id == 0x01:
+                for ref in referents:
+                    ln = struct.unpack_from("<I", body, off)[0]
+                    off += 4
+                    mesh_id[ref] = body[off:off + ln].decode("utf-8", "replace")
+                    off += ln
+            elif prop_name == "CollisionFidelity" and type_id == 0x12:
+                # Interleaved u32 array
+                if off + n * 4 > len(body):
+                    continue
+                raw = bytearray(n * 4)
+                for byte_idx in range(4):
+                    for val_idx in range(n):
+                        raw[val_idx * 4 + byte_idx] = body[off + byte_idx * n + val_idx]
+                for i, ref in enumerate(referents):
+                    coll_fid[ref] = struct.unpack_from(">I", raw, i * 4)[0]
+
+        elif chunk_name == b"PRNT":
+            # Format: u8 version, u32 count, then two int32 arrays
+            version = body[0]
+            del version
+            count = struct.unpack_from("<I", body, 1)[0]
+            off = 5
+            if count == 0:
+                continue
+            child_refs, off = _read_referents(body, off, count)
+            parent_refs, _off = _read_referents(body, off, count)
+            for c, p in zip(child_refs, parent_refs):
+                parents[c] = p
+
+    # Build path strings for each MeshPart with non-Default fidelity
+    _names = {1: "Hull", 3: "PreciseConvexDecomposition"}
+    targets: list[dict] = []
+    for class_id, cls in inst_classes.items():
+        if cls != "MeshPart":
+            continue
+        for ref in inst_referents[class_id]:
+            fid = coll_fid.get(ref, 0)
+            if fid not in _names:
+                continue
+            mid = mesh_id.get(ref, "")
+            if not mid:
+                continue
+            # Walk parents up to workspace; collect names
+            chain: list[str] = []
+            cur = ref
+            for _ in range(200):  # safety bound
+                nm = names.get(cur)
+                if nm is None:
+                    break
+                chain.append(nm)
+                if nm == "Workspace":
+                    break
+                cur = parents.get(cur, -1)
+                if cur < 0:
+                    break
+            if not chain or chain[-1] != "Workspace":
+                continue
+            # Drop the Workspace root and reverse to get top-down path
+            path = "/".join(reversed(chain[:-1]))
+            targets.append({
+                "path": path,
+                "mesh_id": mid,
+                "fidelity": _names[fid],
+            })
+    return targets
+
+
+def _publish_with_targets(
+    api_key: str,
+    universe_id: int,
+    place_id: int,
+    rbxl_path: Path,
+    targets: list[dict],
+):
+    """Thin wrapper for ``u2r publish``: upload the .rbxl then re-cook
+    fixup-targets. Centralizes the call so the publish subcommand
+    matches the convert subcommand's CollisionFidelity guarantee
+    instead of silently skipping the fixup. Returns the
+    PublishResult so the caller can inspect ``success``."""
+    from roblox.place_publisher import publish_place_file
+    return publish_place_file(
+        api_key, universe_id, place_id, rbxl_path,
+        fixup_targets=targets,
+    )
+
+
 @click.group()
 @click.option("--verbose", "-v", is_flag=True, help="Enable debug logging")
 def main(verbose: bool) -> None:
@@ -282,22 +491,28 @@ def publish(
     if not uid or not pid:
         click.echo("ERROR: --universe-id and --place-id required (or cached in .roblox_ids.json)"); return
 
-    # Fast path: upload the existing place file. Preserves CollisionFidelity
-    # and other Plugin-gated MeshPart properties that the chunked
-    # execute_luau path can't write. Open Cloud /universes/v1 expects the
-    # binary .rbxl (XML .rbxlx returns 400 "Invalid Content stream"), so
-    # prefer that. Falls back to cached-chunks execution, then to a Pipeline
-    # rebuild, only when no place file is on disk.
+    # Fast path: upload the existing binary place file. Preserves
+    # CollisionFidelity and other Plugin-gated MeshPart properties that
+    # the chunked execute_luau path can't write. Open Cloud
+    # /universes/v1 only accepts binary .rbxl (XML .rbxlx returns 400
+    # ``Invalid Content stream``); .rbxlx-only outputs go to the
+    # cached-chunks fallback rather than tripping that 400, since the
+    # chunked builder can recreate the place from the in-memory cache
+    # without the binary writer's lz4 dependency.
     click.echo(f"Publishing to universe={uid} place={pid}...")
     rbxl_path = output_path / "converted_place.rbxl"
-    rbxlx_path = output_path / "converted_place.rbxlx"
-    upload_target = rbxl_path if rbxl_path.exists() else (
-        rbxlx_path if rbxlx_path.exists() else None
-    )
-    if upload_target is not None:
-        result = publish_place_file(resolved_key, uid, pid, upload_target)
+    if rbxl_path.exists():
+        # Build CollisionFidelity fixup targets from the rbxl on disk
+        # so non-Default fidelities re-cook on the live place. Without
+        # this scan, ``u2r publish`` would upload the file but skip the
+        # fixup (no in-memory rbx_place available), and concave
+        # MeshColliders would collapse back to Box on the live place.
+        targets = _scan_rbxl_collision_fidelity_targets(rbxl_path)
+        result = _publish_with_targets(
+            resolved_key, uid, pid, rbxl_path, targets,
+        )
     else:
-        click.echo("  (no place file — falling back to cached chunks)")
+        click.echo("  (no .rbxl — falling back to cached chunks)")
         result = publish_cached_chunks(resolved_key, uid, pid, output_path)
     if result is None:
         click.echo("No cached chunks found — rebuilding from Unity project.")

@@ -230,6 +230,7 @@ def publish_place_file(
     rbxlx_path: Path,
     *,
     rbx_place=None,
+    fixup_targets: list[dict] | None = None,
     fixup_collision_fidelity: bool = True,
 ) -> PublishResult:
     """Publish a place by uploading the generated ``.rbxlx`` file directly.
@@ -279,8 +280,13 @@ def publish_place_file(
             error="rbxlx upload failed (see cloud_api log).",
         )
 
-    if fixup_collision_fidelity and rbx_place is not None:
-        targets = _collect_collision_fidelity_targets(rbx_place)
+    if fixup_collision_fidelity:
+        if fixup_targets is not None:
+            targets = fixup_targets
+        elif rbx_place is not None:
+            targets = _collect_collision_fidelity_targets(rbx_place)
+        else:
+            targets = []
         if targets:
             log.info(
                 "place_publisher: cooking CollisionFidelity for %d MeshPart(s) ...",

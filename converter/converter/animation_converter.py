@@ -1471,7 +1471,17 @@ def _generate_parameter_driven_playback(
         # so the loop is a no-op in that branch (only one match).
         lines.append(f"-- Parameter-driven animation: {param.name} (bool)")
         lines.append(f"local _targets = {{ target }}")
-        lines.append(f"if not (script.Parent and script.Parent:IsA('BasePart')) then")
+        # Skip the workspace-wide scan when this script is itself a
+        # prefab-scoped clone (parent is a BasePart *or* a Model).
+        # Prefab-scoped clones run once per instance, so each clone's
+        # ``target`` is already the correct single instance — joining
+        # the global scan would re-bind every clone's listener to every
+        # same-named target in the place and call playAnimation N times
+        # per attribute flip. Only the global flat-list driver
+        # (``script.Parent`` is a service like ServerScriptService)
+        # needs the multi-instance fanout.
+        lines.append(f"local _ownerIsContainer = script.Parent and (script.Parent:IsA('BasePart') or script.Parent:IsA('Model'))")
+        lines.append(f"if not _ownerIsContainer then")
         lines.append(f"\tlocal _targetName = target.Name")
         lines.append(f"\tfor _, _t in ipairs(workspace:GetDescendants()) do")
         lines.append(f"\t\tif _t ~= target and _t.Name == _targetName and (_t:IsA('BasePart') or _t:IsA('Model')) then")
@@ -1501,7 +1511,11 @@ def _generate_parameter_driven_playback(
         param = int_params[0]
         lines.append(f"-- Parameter-driven animation: {param.name} (int)")
         lines.append(f"local _targets = {{ target }}")
-        lines.append(f"if not (script.Parent and script.Parent:IsA('BasePart')) then")
+        # Same prefab-scoped guard as the bool-param branch — see
+        # comment above; both Model and BasePart parents indicate a
+        # per-clone driver and must skip the workspace-wide scan.
+        lines.append(f"local _ownerIsContainer = script.Parent and (script.Parent:IsA('BasePart') or script.Parent:IsA('Model'))")
+        lines.append(f"if not _ownerIsContainer then")
         lines.append(f"\tlocal _targetName = target.Name")
         lines.append(f"\tfor _, _t in ipairs(workspace:GetDescendants()) do")
         lines.append(f"\t\tif _t ~= target and _t.Name == _targetName and (_t:IsA('BasePart') or _t:IsA('Model')) then")
