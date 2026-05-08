@@ -876,6 +876,74 @@ class TestPickupRemoteEventDetectorIsGenreAgnostic:
             "listener — would double-apply pickup effects"
         )
 
+    def test_client_listener_picks_actual_controller_not_first_localplayer(self) -> None:
+        """Codex finding [P2] (round 6): when no script is named
+        ``Player`` and multiple LocalScripts mention ``LocalPlayer``,
+        the previous tier-2 fallback returned the FIRST such script in
+        registration order. A UI helper that happens to reference
+        ``LocalPlayer`` (e.g. for player-name display) but doesn't
+        define ``getItem`` would steal the listener install from the
+        actual controller.
+
+        The fix scores each candidate on player-controller signal
+        density (LocalPlayer + Character + Humanoid + UserInputService)
+        plus a strong boost for actually DEFINING ``getItem`` rather
+        than just referencing it. The script that defines ``getItem``
+        wins regardless of registration order.
+        """
+        scripts = [
+            RbxScript(
+                name="Pickup",
+                source=(
+                    'triggerPart.Touched:Connect(function(otherPart)\n'
+                    '    local character = otherPart:FindFirstAncestorOfClass("Model")\n'
+                    '    character:SetAttribute("GetItem", itemName)\n'
+                    'end)\n'
+                ),
+                script_type="Script",
+            ),
+            # UI helper FIRST in registration order: references
+            # LocalPlayer for display purposes and has a bare getItem
+            # CALL but no DEFINITION.
+            RbxScript(
+                name="InventoryUI",
+                source=(
+                    'local LocalPlayer = game:GetService("Players").LocalPlayer\n'
+                    'local function _refresh()\n'
+                    '    print(LocalPlayer.Name, "has", getItem("count"))\n'
+                    'end\n'
+                ),
+                script_type="LocalScript",
+            ),
+            # Actual controller SECOND: defines getItem and references
+            # all the controller signals.
+            RbxScript(
+                name="PlayerClient",
+                source=(
+                    'local Players = game:GetService("Players")\n'
+                    'local LocalPlayer = Players.LocalPlayer\n'
+                    'local Character = LocalPlayer.Character\n'
+                    'local Humanoid = Character and Character:FindFirstChildWhichIsA("Humanoid")\n'
+                    'local UserInputService = game:GetService("UserInputService")\n'
+                    'local function getItem(name)\n'
+                    '    -- real controller dispatch\n'
+                    'end\n'
+                ),
+                script_type="LocalScript",
+            ),
+        ]
+        run_packs(scripts)
+        ui = scripts[1]
+        controller = scripts[2]
+        assert "PickupItemEvent" in controller.source, (
+            "actual controller (PlayerClient) must get the listener "
+            "regardless of registration order"
+        )
+        assert "PickupItemEvent" not in ui.source, (
+            "UI helper must NOT steal the listener even though it "
+            "references LocalPlayer first"
+        )
+
     def test_client_listener_skips_qualified_getitem_calls(self) -> None:
         """Codex finding [P1] (round 5): a LocalScript that only
         references getItem through a namespace (``inventory.getItem(``,
@@ -1109,6 +1177,34 @@ class TestPickupRemoteEventDetectorIsGenreAgnostic:
         packs_module._fix_door_global_player_lookup([s])
         # The hasKey guard inside the same callback (after an inner
         # ``if`` block) must be rewritten — it's still in scope.
+        assert 'other and other:FindFirstAncestorOfClass' in s.source
+        assert "_G.Player" not in s.source
+
+    def test_touch_range_survives_standalone_do_blocks(self) -> None:
+        """Codex finding [P3] (round 6): a Touched callback containing
+        a standalone ``do ... end`` block must keep its computed range
+        open until the callback's own ``end``. The previous parser
+        omitted ``do`` from the open set, so a standalone do-block
+        decremented depth on its inner ``end`` and prematurely closed
+        the callback.
+        """
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    do\n'
+                '        local _scope = "guarded"\n'
+                '    end\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        toggleDoor(true)\n'
+                '    end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._fix_door_global_player_lookup([s])
+        # The hasKey guard after the do-block is still in scope.
         assert 'other and other:FindFirstAncestorOfClass' in s.source
         assert "_G.Player" not in s.source
 

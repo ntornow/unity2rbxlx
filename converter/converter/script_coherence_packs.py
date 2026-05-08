@@ -754,9 +754,16 @@ def _select_pickup_listener_target(
     Selection order — most specific first:
       1. A LocalScript literally named ``Player`` with a bare ``getItem``
          symbol — the canonical Player controller.
-      2. The first LocalScript referencing ``LocalPlayer`` AND a bare
-         ``getItem`` symbol — a player controller that's named
-         differently (e.g. ``PlayerClient``).
+      2. The LocalScript with the highest player-controller signal
+         score: ``+1`` for each of these signals seen in source —
+         ``LocalPlayer``, ``Character``, ``Humanoid``,
+         ``UserInputService``, plus a strong ``+3`` boost for an actual
+         ``function getItem(...)`` / ``function GetItem(...)``
+         definition (not just a call). UI/tutorial scripts that merely
+         CALL ``getItem`` outside their own definition score lower than
+         the script that defines it, so the listener installs in the
+         actual controller even when ``LocalPlayer`` happens to appear
+         elsewhere first.
       3. None — the project has no obvious player controller. Better to
          drop the listener than install it in a UI/tutorial script
          that happens to define ``getItem`` for unrelated reasons.
@@ -776,11 +783,33 @@ def _select_pickup_listener_target(
     for s in eligible:
         if s.name == "Player":
             return s
-    # Tier 2: a controller-shaped LocalScript (references LocalPlayer).
-    for s in eligible:
-        if "LocalPlayer" in (s.source or ""):
-            return s
-    return None
+
+    # Tier 2: score each candidate; pick the highest-scoring controller.
+    def _score(s: "RbxScript") -> int:
+        src = s.source or ""
+        score = 0
+        for signal in ("LocalPlayer", "Character", "Humanoid",
+                       "UserInputService"):
+            if signal in src:
+                score += 1
+        # Heavy weight on ACTUAL definition of getItem — controllers
+        # define it; UI scripts that only call ``inventory.getItem``
+        # don't (and are already filtered out by the qualified-call
+        # rejection in the symbol regex; this guards the rare case
+        # where a UI script also has a bare ``getItem(...)`` call).
+        if re.search(r'\bfunction\s+(?:get|Get)Item\s*\(', src):
+            score += 3
+        return score
+
+    scored = sorted(eligible, key=_score, reverse=True)
+    if not scored:
+        return None
+    best = scored[0]
+    if _score(best) == 0:
+        # No controller signals at all — skip rather than install in
+        # a script we can't identify as a player controller.
+        return None
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -941,11 +970,15 @@ def _resolve_touch_callback_param(source: str, default: str = "otherPart") -> st
 # ``while`` in the open set, an ordinary ``if cond then ... end`` inside
 # a Touched handler decrements the depth and prematurely closes the
 # callback's computed range, leaving later code in the same handler
-# treated as out-of-scope. Standalone ``do ... end`` blocks are rare in
-# converter-emitted code and are intentionally not tracked; if one
-# appears inside a Touched handler, the under-count would close the
-# range early — accepting that as a known limitation.
-_LUA_BLOCK_OPEN_RE = re.compile(r'\b(?:function|if|for|while)\b')
+# treated as out-of-scope.
+#
+# ``do`` is special-cased: as a STANDALONE block (``do BODY end``) it
+# opens and pairs with ``end``, but inside ``for ... do ... end`` and
+# ``while ... do ... end`` the ``do`` is part of the loop construct and
+# is consumed by the matching ``for``/``while`` open. The scanner below
+# tracks a "loop expects do" flag so the post-loop ``do`` is not double-
+# counted.
+_LUA_BLOCK_OPEN_RE = re.compile(r'\b(?:function|if|for|while|do)\b')
 _LUA_END_RE = re.compile(r'\bend\b')
 
 
@@ -977,8 +1010,15 @@ def _touch_callback_ranges(source: str) -> list[tuple[int, int, str]]:
         # Walk block-open/end tokens with depth counter. The header's
         # own ``function`` is what put us at depth 1; we look for the
         # matching ``end`` that closes the callback.
+        #
+        # ``loop_pending_do`` tracks ``for``/``while`` opens that
+        # haven't yet seen their ``do``: when the next ``do`` arrives,
+        # it's consumed by the loop and NOT counted as a separate
+        # block open. Standalone ``do ... end`` (no preceding loop)
+        # opens normally.
         depth = 1
         pos = body_start
+        loop_pending_do = 0
         body_end: int | None = None
         while pos < len(source):
             open_m = _LUA_BLOCK_OPEN_RE.search(source, pos)
@@ -986,7 +1026,14 @@ def _touch_callback_ranges(source: str) -> list[tuple[int, int, str]]:
             if end_m is None:
                 break
             if open_m is not None and open_m.start() < end_m.start():
-                depth += 1
+                kw = open_m.group()
+                if kw == "do" and loop_pending_do > 0:
+                    # Consumed by a preceding ``for``/``while``.
+                    loop_pending_do -= 1
+                else:
+                    depth += 1
+                    if kw in ("for", "while"):
+                        loop_pending_do += 1
                 pos = open_m.end()
                 continue
             depth -= 1
