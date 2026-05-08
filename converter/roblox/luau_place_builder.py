@@ -180,11 +180,24 @@ def generate_place_luau(
     b.line("local terrain=WS.Terrain")
     b.line()
 
-    # Helper: safe CreateMeshPartAsync wrapper
-    b.line("local function mkMesh(meshId,cf,sz,col,mat,tr,anch)")
+    # Helper: safe CreateMeshPartAsync wrapper.
+    # ``collFid`` is an optional Enum.CollisionFidelity; when set, it's
+    # passed to CreateMeshPartAsync as the `CollisionFidelity` option
+    # field. The MeshPart is *cooked* with that fidelity at creation
+    # time — assigning ``mp.CollisionFidelity = …`` after the fact does
+    # not re-cook the mesh, so Studio silently snaps the property back
+    # to whatever shape Roblox actually built (typically Box). This is
+    # the only path that preserves PreciseConvexDecomposition for
+    # concave collision proxies (e.g. Door's frame_col with the
+    # doorway hole) through the headless publish.
+    b.line("local function mkMesh(meshId,cf,sz,col,mat,tr,anch,collFid)")
     b.indent()
     b.line("local ok,mp=pcall(function()")
     b.indent()
+    b.line("if collFid then")
+    b.indent()
+    b.line("return AssetService:CreateMeshPartAsync(meshId,{CollisionFidelity=collFid})")
+    b.end()
     b.line("return AssetService:CreateMeshPartAsync(meshId)")
     b.end(")")
     b.block("if ok and mp then")
@@ -479,9 +492,24 @@ def _emit_part(
         tr = part.transparency or 0
         anchored = "true" if part.anchored else "false"
 
+        # CollisionFidelity must be passed to CreateMeshPartAsync so the
+        # mesh is cooked with the right collision shape; assignment after
+        # the fact silently snaps back to whatever Roblox actually built
+        # (typically Box), which destroys concave hole geometry like
+        # door frames. The Python ``part.collision_fidelity`` is the
+        # enum's int value (Default=0, Hull=1, Box=2, Precise=3).
+        coll_fid_arg = "nil"
+        cfid = getattr(part, "collision_fidelity", None)
+        if cfid is not None and cfid != 0:
+            _names = {1: "Hull", 2: "Box", 3: "PreciseConvexDecomposition"}
+            n = _names.get(int(cfid))
+            if n:
+                coll_fid_arg = f"Enum.CollisionFidelity.{n}"
+
         b.line(
             f"local {var}=mkMesh({_luau_str(resolved_mesh)},"
-            f"{cf_str},{_v3(*sz)},{_c3u8(*col)},{mat},{_f(tr)},{anchored})"
+            f"{cf_str},{_v3(*sz)},{_c3u8(*col)},{mat},{_f(tr)},{anchored},"
+            f"{coll_fid_arg})"
         )
         b.line(f"{var}.Name={_luau_str(name)}")
 
