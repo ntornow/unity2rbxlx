@@ -631,12 +631,19 @@ def _canonicalize_pickup_remote_event(scripts: list["RbxScript"]) -> int:
 def _add_pickup_remote_listener(scripts: list["RbxScript"]) -> int:
     fixes = 0
     for s in scripts:
+        # ``OnClientEvent`` is client-only — installing it in a server
+        # ``Script`` would crash at runtime. Restrict to LocalScripts so
+        # widening the ``getItem`` match across genres doesn't sweep up
+        # server-side ``Script``s or shared ``ModuleScript``s that
+        # legitimately define a ``GetItem`` helper for their own purposes.
+        if s.script_type != "LocalScript":
+            continue
         # Detect a Player-style controller by name presence: AI transpilation
         # emits Lua-conventional camelCase (`getItem`) while earlier
         # rule-based output kept C# Title-case (`GetItem`). Match either by
         # lowering the search. ``getRifle`` is no longer required — the
-        # listener installs in any script with a ``getItem`` dispatch so
-        # non-FPS projects (RPG key pickups, platformer health pickups,
+        # listener installs in any LocalScript with a ``getItem`` dispatch
+        # so non-FPS projects (RPG key pickups, platformer health pickups,
         # etc.) don't silently drop their client-side pickup handling.
         src_lower = s.source.lower()
         if 'getitem' not in src_lower:
@@ -815,24 +822,29 @@ def _resolve_touch_callback_param(source: str, default: str = "otherPart") -> st
 
 
 def _resolve_touch_callback_param_at(
-    source: str, position: int, default: str = "otherPart"
-) -> str:
+    source: str, position: int
+) -> str | None:
     """Return the parameter name of the closest ``Touched``/``TouchEnded``
-    callback whose ``Connect(function(VAR)`` opens before *position*.
+    callback whose ``Connect(function(VAR)`` opens before *position*,
+    or ``None`` if no such callback precedes it.
 
-    Walks backwards from *position* so call sites and inline guards
-    inside a Touched handler get rewritten with that handler's own
-    parameter name, not whatever the first handler in the file used.
-    Falls back to *default* (``otherPart``) when no preceding callback
-    is found — the rewrite degrades gracefully because the helper
-    returns false on nil and the inline lambda's ``_p`` resolves to
-    nil, so a misresolved name produces a closed door rather than a
-    runtime error.
+    A ``None`` return means the call site is outside any touch handler
+    (e.g. during script init: ``print(getPlayerHasKey())``). Callers
+    must NOT inject ``otherPart`` as a fallback in that case — that
+    would reference an undefined variable and silently force the
+    helper down its nil-arg branch. Leaving the call site at zero args
+    instead lets the helper's nil-arg early-return handle it cleanly.
+
+    Crude AST: brace counting is overkill because Roblox scripts that
+    use the rewritten helper exclusively in non-touch contexts are
+    rare (and codex flagged this as the failure mode). The closest
+    preceding match is "good enough" for in-touch sites; the absence
+    of a preceding match unambiguously signals an outside-touch site.
     """
     last_match: re.Match[str] | None = None
     for m in _TOUCH_CALLBACK_RE.finditer(source, 0, position):
         last_match = m
-    return last_match.group(1) if last_match else default
+    return last_match.group(1) if last_match else None
 
 
 @patch_pack(
@@ -884,7 +896,11 @@ def _fix_door_global_player_lookup(scripts: list["RbxScript"]) -> int:
         # GetAttribute check always evaluates falsy and that branch never
         # runs. ``_rewrite_in_place_with_callback`` walks each match in
         # source order and resolves the closest preceding ``Touched``/
-        # ``TouchEnded`` callback's parameter name for each.
+        # ``TouchEnded`` callback's parameter name for each. Sites with
+        # no preceding callback are left unchanged so we don't inject
+        # an undefined variable into init-time helper calls (e.g.
+        # ``print(getPlayerHasKey())``); the rewritten helper's nil-arg
+        # early-return handles those naturally.
         def _rewrite_in_place_with_callback(
             source: str,
             pattern: re.Pattern[str],
@@ -893,8 +909,11 @@ def _fix_door_global_player_lookup(scripts: list["RbxScript"]) -> int:
             pieces: list[str] = []
             cursor = 0
             for m in pattern.finditer(source):
-                pieces.append(source[cursor:m.start()])
                 cb = _resolve_touch_callback_param_at(source, m.start())
+                if cb is None:
+                    # Outside any touch handler — leave the match alone.
+                    continue
+                pieces.append(source[cursor:m.start()])
                 pieces.append(replacer(m, cb))
                 cursor = m.end()
             pieces.append(source[cursor:])
@@ -912,6 +931,9 @@ def _fix_door_global_player_lookup(scripts: list["RbxScript"]) -> int:
         # self-invoking lambda that derives the player from the surrounding
         # Touched/TouchEnded callback's parameter. Per-position resolution
         # ensures each guard inside its own handler picks the right name.
+        # Inline guards outside any touch handler are skipped — there's no
+        # ``other``/``otherPart`` in scope to derive a player from, and
+        # rewriting them would inject an undefined variable.
         s.source = _rewrite_in_place_with_callback(
             s.source,
             _DOOR_GLOBAL_PLAYER_INLINE_RE,
