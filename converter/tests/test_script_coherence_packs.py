@@ -751,6 +751,46 @@ class TestPickupRemoteEventDetectorIsGenreAgnostic:
         util = scripts[1]
         assert "PickupItemEvent" not in util.source
 
+    def test_client_listener_skips_qualified_getitem_calls(self) -> None:
+        """Codex finding [P1] (round 5): a LocalScript that only
+        references getItem through a namespace (``inventory.getItem(``,
+        ``self:getItem(``) doesn't define a bare ``getItem`` symbol.
+        The injected listener body calls bare ``getItem(itemName)``,
+        which would raise ``attempt to call a nil value`` on the first
+        pickup event.
+
+        The fix: ``_GETITEM_SYMBOL_RE`` rejects matches preceded by
+        ``.`` or ``:``.
+        """
+        scripts = [
+            RbxScript(
+                name="Pickup",
+                source=(
+                    'triggerPart.Touched:Connect(function(otherPart)\n'
+                    '    local character = otherPart:FindFirstAncestorOfClass("Model")\n'
+                    '    character:SetAttribute("GetItem", itemName)\n'
+                    'end)\n'
+                ),
+                script_type="Script",
+            ),
+            # Only references inventory.getItem — no bare getItem.
+            RbxScript(
+                name="InventoryClient",
+                source=(
+                    'local inventory = require(script.Parent.Inventory)\n'
+                    'inventory.getItem("startKey")\n'
+                ),
+                script_type="LocalScript",
+            ),
+        ]
+        run_packs(scripts)
+        client = scripts[1]
+        assert "PickupItemEvent" not in client.source, (
+            "qualified inventory.getItem should not trigger listener "
+            "install — the listener body calls bare getItem which "
+            "doesn't exist in this script"
+        )
+
     def test_client_listener_skips_substring_only_match(self) -> None:
         """Codex finding [P1] (round 4): a LocalScript that mentions
         ``getItemModule`` (or any identifier containing the substring
@@ -916,6 +956,65 @@ class TestPickupRemoteEventDetectorIsGenreAgnostic:
         assert "print(\"init:\", getPlayerHasKey())" in s.source
         # The in-touch call site must still get its callback param.
         assert "if getPlayerHasKey(other) then" in s.source
+
+    def test_touch_range_survives_nested_lua_blocks(self) -> None:
+        """Codex finding [P1] (round 5): a Touched callback containing
+        ordinary ``if``/``for``/``while`` blocks must keep its computed
+        range open until the callback's own ``end``. The previous
+        parser only counted ``function`` as opens against ``end`` as
+        closes, so an inner ``if cond then ... end`` would prematurely
+        close the callback's range and leave a later ``_G.Player``
+        guard in the same handler treated as outside-scope.
+        """
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    if ready then\n'
+                '        warmup()\n'
+                '    end\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        toggleDoor(true)\n'
+                '    end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._fix_door_global_player_lookup([s])
+        # The hasKey guard inside the same callback (after an inner
+        # ``if`` block) must be rewritten — it's still in scope.
+        assert 'other and other:FindFirstAncestorOfClass' in s.source
+        assert "_G.Player" not in s.source
+
+    def test_touch_range_survives_for_and_while_blocks(self) -> None:
+        """Same scope rule for ``for`` and ``while`` loops inside the
+        callback. Each closes with ``end``; counting only ``function``
+        as opens would close the callback range early once the loop
+        ends. The fix counts ``function``, ``if``, ``for``, ``while``
+        as opens.
+        """
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    for _, p in ipairs({1,2,3}) do\n'
+                '        log(p)\n'
+                '    end\n'
+                '    while waiting do\n'
+                '        task.wait(0.1)\n'
+                '    end\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        toggleDoor(true)\n'
+                '    end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._fix_door_global_player_lookup([s])
+        assert 'other and other:FindFirstAncestorOfClass' in s.source
+        assert "_G.Player" not in s.source
 
     def test_helper_calls_after_closed_touch_block_not_rewritten(self) -> None:
         """Codex finding [P1] (round 4): a helper call AFTER a touch

@@ -450,11 +450,15 @@ def _detect_pickup_setattribute_pattern(scripts: list["RbxScript"]) -> bool:
     )
 
 
-# Match ``getItem(`` or ``GetItem(`` as a standalone symbol — a real
-# function definition or call. ``\b`` before excludes ``getitem`` inside
-# longer identifiers; ``\(`` after excludes ``getItemModule(`` because
-# the trailing ``M`` blocks the open-paren from following the ``Item``.
-_GETITEM_SYMBOL_RE = re.compile(r'\b(?:get|Get)Item\s*\(')
+# Match ``getItem(`` or ``GetItem(`` as an UNQUALIFIED symbol — a real
+# top-level function definition or call. The negative lookbehind
+# ``(?<![.:])`` rejects qualified accesses like ``inventory.getItem(``
+# or ``self:getItem(`` because the listener body the pack injects calls
+# bare ``getItem(itemName)``; if a script only references getItem
+# through a namespace, that bare call would raise on the first pickup
+# event. ``\b`` before excludes ``getitem`` inside longer identifiers
+# (e.g. ``getItemized``); ``\(`` after excludes ``getItemModule(``.
+_GETITEM_SYMBOL_RE = re.compile(r'(?<![.:])\b(?:get|Get)Item\s*\(')
 
 
 def _detect_pickup_remote_event_in_use(scripts: list["RbxScript"]) -> bool:
@@ -830,12 +834,17 @@ def _resolve_touch_callback_param(source: str, default: str = "otherPart") -> st
     return m.group(1) if m else default
 
 
-# Function/end token boundaries — used by the touch-callback range
-# scanner below. Word-boundary matches reject substrings like ``endpoint``
-# or ``functions``; they're imperfect against tokens inside string
-# literals or comments but the converter's outputs don't realistically
-# embed Lua keywords in those contexts.
-_LUA_FUNCTION_OPEN_RE = re.compile(r'\bfunction\b\s*\(')
+# Lua block-opening keywords paired with ``end``. Counting these as
+# opens against ``end`` as closes correctly tracks nested function/if/
+# for/while bodies inside a Touched callback. Without ``if``/``for``/
+# ``while`` in the open set, an ordinary ``if cond then ... end`` inside
+# a Touched handler decrements the depth and prematurely closes the
+# callback's computed range, leaving later code in the same handler
+# treated as out-of-scope. Standalone ``do ... end`` blocks are rare in
+# converter-emitted code and are intentionally not tracked; if one
+# appears inside a Touched handler, the under-count would close the
+# range early — accepting that as a known limitation.
+_LUA_BLOCK_OPEN_RE = re.compile(r'\b(?:function|if|for|while)\b')
 _LUA_END_RE = re.compile(r'\bend\b')
 
 
@@ -850,9 +859,10 @@ def _touch_callback_ranges(source: str) -> list[tuple[int, int, str]]:
     ``body_start <= pos < body_end``; positions after ``body_end`` are
     outside scope, so the parameter is no longer accessible there.
 
-    Implementation walks ``function``/``end`` tokens to find the matching
-    end of each callback. Imperfect against tokens in strings/comments
-    but sufficient for converter-emitted code.
+    Implementation walks Lua block-opening tokens (``function``, ``if``,
+    ``for``, ``while``) and ``end`` tokens with a depth counter to find
+    the matching end of each callback. Imperfect against tokens in
+    strings/comments but sufficient for converter-emitted code.
     """
     ranges: list[tuple[int, int, str]] = []
     for header in _TOUCH_CALLBACK_RE.finditer(source):
@@ -863,18 +873,20 @@ def _touch_callback_ranges(source: str) -> list[tuple[int, int, str]]:
             continue
         body_start = header_close + 1
 
-        # Walk function/end tokens with depth counter.
+        # Walk block-open/end tokens with depth counter. The header's
+        # own ``function`` is what put us at depth 1; we look for the
+        # matching ``end`` that closes the callback.
         depth = 1
         pos = body_start
         body_end: int | None = None
         while pos < len(source):
-            fn_m = _LUA_FUNCTION_OPEN_RE.search(source, pos)
+            open_m = _LUA_BLOCK_OPEN_RE.search(source, pos)
             end_m = _LUA_END_RE.search(source, pos)
             if end_m is None:
                 break
-            if fn_m is not None and fn_m.start() < end_m.start():
+            if open_m is not None and open_m.start() < end_m.start():
                 depth += 1
-                pos = fn_m.end()
+                pos = open_m.end()
                 continue
             depth -= 1
             if depth == 0:
