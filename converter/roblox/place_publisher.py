@@ -124,28 +124,139 @@ def _publish_chunks(
     )
 
 
+def _build_collision_fidelity_fixup_script(targets: list[dict]) -> str:
+    """Build a Luau script that re-cooks specific MeshParts with the right
+    CollisionFidelity by recreating them via ``CreateMeshPartAsync`` with
+    the option dict (the only way Roblox actually decomposes concave
+    geometry — property assignment from a serialized place file silently
+    snaps back to Box).
+
+    Targets are a list of ``{path, mesh_id, fidelity}`` dicts; the
+    script resolves each by descending from ``workspace`` so it doesn't
+    have to walk every part in the place (an unbounded scan times out
+    server-side on places with thousands of descendants).
+    """
+    import json as _json
+    payload = _json.dumps(targets)
+    return f"""
+local AssetService = game:GetService("AssetService")
+local TARGETS = game:GetService("HttpService"):JSONDecode([==[{payload}]==])
+local fixed, failed = 0, 0
+local function resolve(path)
+    local node = workspace
+    for segment in string.gmatch(path, "[^/]+") do
+        if not node then return nil end
+        node = node:FindFirstChild(segment)
+    end
+    return node
+end
+for _, target in ipairs(TARGETS) do
+    local old = resolve(target.path)
+    if old and old:IsA("MeshPart") and old.MeshId == target.mesh_id then
+        local ok, new = pcall(function()
+            return AssetService:CreateMeshPartAsync(
+                old.MeshId,
+                {{ CollisionFidelity = Enum.CollisionFidelity[target.fidelity] }}
+            )
+        end)
+        if ok and new then
+            new.Name = old.Name
+            new.CFrame = old.CFrame
+            new.Anchored = old.Anchored
+            new.Size = old.Size
+            new.Color = old.Color
+            new.Material = old.Material
+            new.Transparency = old.Transparency
+            new.CanCollide = old.CanCollide
+            new.CanQuery = old.CanQuery
+            new.CanTouch = old.CanTouch
+            new.CastShadow = old.CastShadow
+            new.TextureID = old.TextureID
+            for k, v in pairs(old:GetAttributes()) do
+                new:SetAttribute(k, v)
+            end
+            for _, c in ipairs(old:GetChildren()) do
+                c.Parent = new
+            end
+            new.Parent = old.Parent
+            old:Destroy()
+            fixed = fixed + 1
+        else
+            failed = failed + 1
+        end
+    else
+        failed = failed + 1
+    end
+end
+AssetService:SavePlaceAsync()
+return string.format("CollisionFidelity fixup: %d cooked, %d failed (of %d targets)", fixed, failed, #TARGETS)
+"""
+
+
+def _collect_collision_fidelity_targets(rbx_place) -> list[dict]:
+    """Walk an RbxPlace and pick out every MeshPart whose
+    ``collision_fidelity`` is non-Default and non-Box. Each target carries
+    its workspace path (so the runtime fixup can resolve it without an
+    O(N) scan), the mesh URL it should be cooked from, and the fidelity
+    enum *name* (the runtime resolves via ``Enum.CollisionFidelity[name]``).
+    """
+    _names = {1: "Hull", 3: "PreciseConvexDecomposition"}
+    targets: list[dict] = []
+
+    def _walk(parts, prefix: str):
+        for p in parts or []:
+            cls = getattr(p, "class_name", None) or "Part"
+            name = getattr(p, "name", None) or "Part"
+            child_prefix = f"{prefix}/{name}" if prefix else name
+            if cls == "MeshPart":
+                fid = getattr(p, "collision_fidelity", None)
+                mesh_id = getattr(p, "mesh_id", None) or ""
+                if fid in _names and mesh_id:
+                    targets.append({
+                        "path": child_prefix,
+                        "mesh_id": mesh_id,
+                        "fidelity": _names[fid],
+                    })
+            _walk(getattr(p, "children", None) or [], child_prefix)
+
+    _walk(getattr(rbx_place, "workspace_parts", None) or [], "")
+    return targets
+
+
 def publish_place_file(
     api_key: str,
     universe_id: int,
     place_id: int,
     rbxlx_path: Path,
+    *,
+    rbx_place=None,
+    fixup_collision_fidelity: bool = True,
 ) -> PublishResult:
     """Publish a place by uploading the generated ``.rbxlx`` file directly.
 
-    Preferred over :func:`publish_place` when the rbxlx already carries the
-    complete final state (resolved ``MeshId`` URLs, attributes, RemoteEvents,
-    ``CollisionFidelity``). The execute_luau builder path can't set
-    properties that require ``Plugin`` capability — most importantly
-    ``CollisionFidelity`` — so concave-mesh collision proxies (door frames,
-    interior cutouts) lose their hole and become solid hulls in the live
-    place.
+    The rbxlx carries the complete final state (resolved ``MeshId`` URLs,
+    attributes, RemoteEvents, scripts, surface appearances). Open Cloud's
+    place-version endpoint ingests every property byte-for-byte —
+    including ``CollisionFidelity``.
 
-    Open Cloud's place-version endpoint accepts the rbxlx body verbatim and
-    Roblox ingests every property the file serializes, including the ones
-    Plugin-gated runtime APIs can't write. CollisionFidelity round-trips
-    correctly through this path.
+    Caveat: ``CollisionFidelity`` is a property whose runtime effect
+    depends on a *cooked* collision mesh, and Roblox builds that mesh at
+    MeshPart creation time, not on property assignment from a serialized
+    file. So a freshly-loaded place with ``<token name="CollisionFidelity">3</token>``
+    in the file shows the property as Box (whatever the asset was ingested
+    with) until something explicitly recreates the part via
+    ``AssetService:CreateMeshPartAsync(id, {CollisionFidelity = ...})``.
+
+    The fixup pass below does exactly that, scoped to MeshParts whose
+    fidelity is non-Default and non-Box. Bounded payload (~few dozen
+    parts in SimpleFPS-class projects), runs in seconds, and reuses the
+    Open Cloud Luau Execution session that's already authorized against
+    this universe.
+
+    Set ``fixup_collision_fidelity=False`` to skip the fixup (e.g. when
+    the place has no concave collision proxies that need preservation).
     """
-    from roblox.cloud_api import upload_place
+    from roblox.cloud_api import upload_place, execute_luau
 
     rbxlx_path = Path(rbxlx_path)
     if not rbxlx_path.exists():
@@ -167,6 +278,35 @@ def publish_place_file(
             script_path=rbxlx_path,
             error="rbxlx upload failed (see cloud_api log).",
         )
+
+    if fixup_collision_fidelity and rbx_place is not None:
+        targets = _collect_collision_fidelity_targets(rbx_place)
+        if targets:
+            log.info(
+                "place_publisher: cooking CollisionFidelity for %d MeshPart(s) ...",
+                len(targets),
+            )
+            script = _build_collision_fidelity_fixup_script(targets)
+            result = execute_luau(
+                api_key, universe_id, place_id, script, timeout="240s",
+            )
+            if result is None:
+                log.warning(
+                    "place_publisher: CollisionFidelity fixup didn't "
+                    "complete (execute_luau timeout). The place is "
+                    "published but %d concave MeshCollider(s) may collapse "
+                    "to Box collision. Re-run u2r.py publish to retry.",
+                    len(targets),
+                )
+            else:
+                outputs = (result.get("output", {}) or {}).get("results") or []
+                if outputs:
+                    log.info("place_publisher: fixup result: %s", outputs[0])
+        else:
+            log.debug(
+                "place_publisher: no MeshParts need CollisionFidelity fixup"
+            )
+
     return PublishResult(
         success=True,
         chunks=1,

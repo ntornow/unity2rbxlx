@@ -177,7 +177,10 @@ def convert(
             rbxlx_file if rbxlx_file.exists() else None
         )
         if upload_target is not None:
-            result = publish_place_file(resolved_key, uid, pid, upload_target)
+            result = publish_place_file(
+                resolved_key, uid, pid, upload_target,
+                rbx_place=pipeline.state.rbx_place,
+            )
             click.echo(
                 f"  {upload_target.name}: {result.total_bytes:,} bytes "
                 f"({result.total_bytes / 1024:.0f} KB)"
