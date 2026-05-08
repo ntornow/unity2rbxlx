@@ -923,11 +923,26 @@ def upload(output_dir: str, api_key: str | None,
                "errors": ["rbx_place is empty after rebuilding scene state."]})
         sys.exit(1)
 
-    from roblox.place_publisher import publish_place
+    # Prefer the place file-upload path: it preserves CollisionFidelity and
+    # other Plugin-gated MeshPart properties that the chunked execute_luau
+    # builder cannot set. Open Cloud /universes/v1 only accepts binary
+    # .rbxl (XML .rbxlx returns 400), so prefer that. Falls back to
+    # publish_place only when no place file is on disk.
+    from roblox.place_publisher import publish_place, publish_place_file
 
-    publish_result = publish_place(
-        config.ROBLOX_API_KEY, uid, pid, rbx_place, out,
+    rbxl_for_upload = out / "converted_place.rbxl"
+    rbxlx_for_upload = out / "converted_place.rbxlx"
+    file_for_upload = rbxl_for_upload if rbxl_for_upload.exists() else (
+        rbxlx_for_upload if rbxlx_for_upload.exists() else None
     )
+    if file_for_upload is not None:
+        publish_result = publish_place_file(
+            config.ROBLOX_API_KEY, uid, pid, file_for_upload,
+        )
+    else:
+        publish_result = publish_place(
+            config.ROBLOX_API_KEY, uid, pid, rbx_place, out,
+        )
 
     pipeline.ctx.save(_context_path(out))
 

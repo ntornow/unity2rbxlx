@@ -2608,6 +2608,28 @@ script.Disabled = true
                             bound_count += 1
                             log.debug("[write_output]   Bound '%s' to part '%s'",
                                       class_name, part.name)
+                            # Trigger heuristic: any invisible MeshPart that
+                            # carries a server Script is acting as a detection
+                            # zone (Door's ``base``, Pickup's bounding cube,
+                            # etc.). _convert_prefab_node skips collider
+                            # processing entirely so the part inherits the
+                            # mesh's bounding box as its CanCollide=true
+                            # collision volume — a 21-stud invisible cube the
+                            # player can't walk through. Force CanCollide=False
+                            # here once the script binding confirms the
+                            # trigger role; Touched still fires (CanTouch
+                            # defaults to true) so Door/Pickup logic works.
+                            if (
+                                getattr(part, "class_name", None) == "MeshPart"
+                                and (getattr(part, "transparency", 0) or 0) >= 1.0
+                                and getattr(part, "can_collide", False)
+                            ):
+                                part.can_collide = False
+                                log.debug(
+                                    "[write_output]   Forced CanCollide=False on "
+                                    "invisible MeshPart '%s' (carries server Script '%s')",
+                                    part.name, class_name,
+                                )
 
                 # Recurse into children
                 if getattr(part, "children", None):

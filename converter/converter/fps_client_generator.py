@@ -521,13 +521,29 @@ local function waitForRemote(name)
     return ReplicatedStorage:WaitForChild(name, 10)
 end
 
+-- The producer side may be either a server RemoteEvent (FireClient) or a
+-- client-side BindableEvent (e.g. published by Player.luau via the
+-- hud_player_bindable_events coherence pack). They expose different event
+-- members — RemoteEvent.OnClientEvent vs BindableEvent.Event — so dispatch
+-- on the instance class instead of hard-coding either one. Without this
+-- fork the auto-generated HUD crashes the moment Player.luau ships its
+-- updates over a BindableEvent.
+local function connectClient(evt, handler)
+    if not evt then return end
+    if evt:IsA("BindableEvent") then
+        evt.Event:Connect(handler)
+    elseif evt:IsA("RemoteEvent") then
+        evt.OnClientEvent:Connect(handler)
+    end
+end
+
 local HealthUpdateRemote = waitForRemote("HealthUpdate")
 local AmmoUpdateRemote = waitForRemote("AmmoUpdate")
 local ItemUpdateRemote = waitForRemote("ItemUpdate")
 
 -- Health update
 if HealthUpdateRemote and healthFill then
-    HealthUpdateRemote.OnClientEvent:Connect(function(curHealth)
+    connectClient(HealthUpdateRemote, function(curHealth)
         local pct = math.clamp(curHealth / MAX_HEALTH, 0, 1)
         healthFill.Size = UDim2.new(pct, 0, 1, 0)
 
@@ -544,14 +560,14 @@ end
 
 -- Ammo update
 if AmmoUpdateRemote and ammoCur then
-    AmmoUpdateRemote.OnClientEvent:Connect(function(curAmmo)
+    connectClient(AmmoUpdateRemote, function(curAmmo)
         ammoCur.Text = tostring(curAmmo)
     end)
 end
 
 -- Item collected
 if ItemUpdateRemote and itemModule then
-    ItemUpdateRemote.OnClientEvent:Connect(function(itemName)
+    connectClient(ItemUpdateRemote, function(itemName)
         local indicator = itemModule:FindFirstChild(itemName)
         if indicator then
             indicator.BackgroundColor3 = Color3.new(0.2, 0.7, 0.2)

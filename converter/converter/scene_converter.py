@@ -1426,6 +1426,20 @@ def _process_components(
     rigidbody_props: dict[str, Any] = {}
     original_size = part.size  # Save for collider calculations
 
+    # Visible-only meshes (MeshFilter+MeshRenderer with no Collider component)
+    # need CanCollide=False so they don't act as solid blockers when their
+    # mesh has a hole the simplified hull collapses (Roblox MeshPart inherits
+    # the mesh bounding box as collision unless given precise decomposition,
+    # which the upload path can't reliably set). Concrete case: SimpleFPS
+    # SciFi_Door's ``frame`` GameObject has only a MeshRenderer; the door's
+    # ``frame_col`` sibling carries the actual concave MeshCollider. Without
+    # this rule, ``frame`` becomes a 26x23x5.5 stud invisible-hole-as-solid
+    # wall that blocks the doorway. RbxPart defaults to can_collide=True;
+    # flip it off when no Unity collider authority survived component scan.
+    has_unity_collider = any(
+        c.component_type in _COLLIDER_TYPES for c in node.components
+    )
+
     # Pre-scan: does ANY collider on this GameObject mark itself as a trigger?
     # When yes, the trigger's "detection volume" semantics dominate even if a
     # physical collider was emitted later in the YAML. Without this pre-scan,
@@ -1837,6 +1851,22 @@ def _process_components(
         else:
             _ctx().unhandled_components.add(ct)
             log.debug("Unhandled component type '%s' on node '%s'", ct, node.name)
+
+    # -- Visual-only mesh detection --
+    # If this GameObject has NO Unity Collider component and the part is a
+    # MeshPart (i.e. it has visible mesh geometry), make it non-colliding.
+    # See ``has_unity_collider`` definition above for the rationale —
+    # SimpleFPS Door's ``frame`` and similar collision-proxy patterns where
+    # the visible mesh is renderer-only and a sibling ``*_col`` carries the
+    # real Collider. Skip if a sibling already disabled collide via the
+    # trigger branch (those parts handle their own can_collide).
+    if (
+        not has_unity_collider
+        and not has_rigidbody
+        and getattr(part, "class_name", "") == "MeshPart"
+        and part.can_collide
+    ):
+        part.can_collide = False
 
     # -- Anchoring logic --
     # No rigidbody -> anchored (static geometry).

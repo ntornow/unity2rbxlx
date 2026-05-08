@@ -180,11 +180,24 @@ def generate_place_luau(
     b.line("local terrain=WS.Terrain")
     b.line()
 
-    # Helper: safe CreateMeshPartAsync wrapper
-    b.line("local function mkMesh(meshId,cf,sz,col,mat,tr,anch)")
+    # Helper: safe CreateMeshPartAsync wrapper.
+    # ``collFid`` is an optional Enum.CollisionFidelity; when set, it's
+    # passed to CreateMeshPartAsync as the `CollisionFidelity` option
+    # field. The MeshPart is *cooked* with that fidelity at creation
+    # time — assigning ``mp.CollisionFidelity = …`` after the fact does
+    # not re-cook the mesh, so Studio silently snaps the property back
+    # to whatever shape Roblox actually built (typically Box). This is
+    # the only path that preserves PreciseConvexDecomposition for
+    # concave collision proxies (e.g. Door's frame_col with the
+    # doorway hole) through the headless publish.
+    b.line("local function mkMesh(meshId,cf,sz,col,mat,tr,anch,collFid)")
     b.indent()
     b.line("local ok,mp=pcall(function()")
     b.indent()
+    b.line("if collFid then")
+    b.indent()
+    b.line("return AssetService:CreateMeshPartAsync(meshId,{CollisionFidelity=collFid})")
+    b.end()
     b.line("return AssetService:CreateMeshPartAsync(meshId)")
     b.end(")")
     b.block("if ok and mp then")
@@ -479,9 +492,24 @@ def _emit_part(
         tr = part.transparency or 0
         anchored = "true" if part.anchored else "false"
 
+        # CollisionFidelity must be passed to CreateMeshPartAsync so the
+        # mesh is cooked with the right collision shape; assignment after
+        # the fact silently snaps back to whatever Roblox actually built
+        # (typically Box), which destroys concave hole geometry like
+        # door frames. The Python ``part.collision_fidelity`` is the
+        # enum's int value (Default=0, Hull=1, Box=2, Precise=3).
+        coll_fid_arg = "nil"
+        cfid = getattr(part, "collision_fidelity", None)
+        if cfid is not None and cfid != 0:
+            _names = {1: "Hull", 2: "Box", 3: "PreciseConvexDecomposition"}
+            n = _names.get(int(cfid))
+            if n:
+                coll_fid_arg = f"Enum.CollisionFidelity.{n}"
+
         b.line(
             f"local {var}=mkMesh({_luau_str(resolved_mesh)},"
-            f"{cf_str},{_v3(*sz)},{_c3u8(*col)},{mat},{_f(tr)},{anchored})"
+            f"{cf_str},{_v3(*sz)},{_c3u8(*col)},{mat},{_f(tr)},{anchored},"
+            f"{coll_fid_arg})"
         )
         b.line(f"{var}.Name={_luau_str(name)}")
 
@@ -666,6 +694,17 @@ def _emit_attributes(b: _LuauBuilder, attrs: dict, var: str) -> None:
 
 def _emit_part_extras(b: _LuauBuilder, part: RbxPart, var: str) -> None:
     """Emit optional part properties (shared between Part and MeshPart paths)."""
+    # MeshParts come back from ``mkMesh`` (CreateMeshPartAsync wrapper) with
+    # CanCollide defaulting to true. The plain-Part branch sets CanCollide
+    # explicitly via _emit_part, but the MeshPart branch only calls this
+    # extras helper — so a converter-side ``part.can_collide=False`` (e.g.
+    # the trigger heuristic in _bind_scripts_to_parts that flips Door's
+    # invisible ``base``) never lands in the live place. Always emit
+    # CanCollide=false here so MeshPart triggers actually let the player
+    # walk through. (CanCollide=true is the wrapper default, so we only
+    # need to write it when it's false.)
+    if not part.can_collide:
+        b.line(f"{var}.CanCollide=false")
     if not part.can_query:
         b.line(f"{var}.CanQuery=false")
     if not part.can_touch:
@@ -727,16 +766,29 @@ def _emit_surface_appearance(
         b.line(f"sa.AlphaMode=Enum.AlphaMode.{sa.alpha_mode}")
     b.line(f"sa.Parent={parent_var}")
     b.line("end)")
-    # Fallback: use Texture instances for color map (works headlessly)
+    # Fallback when SurfaceAppearance creation fails (headless execution
+    # blocks the Plugin capability on SA property writes). Prefer
+    # MeshPart.TextureID, which renders the texture via the mesh's own UV
+    # map — the right look. The previous fallback (six face-Textures with
+    # the same image) tiled the asset across each cardinal face without
+    # UVs, so doors / panels / rifles looked like flat-gray meshes with
+    # mismatched stamps. Only fall back to face-Textures when the parent
+    # part is not a MeshPart (e.g. a basic Part where TextureID isn't a
+    # property).
     if color_map:
         b.line("if not saOk then")
+        b.line(f"if {parent_var}:IsA('MeshPart') then")
+        b.line(f"{parent_var}.TextureID={_luau_str(color_map)}")
+        b.line("else")
         b.line(f"for _,face in ipairs(Enum.NormalId:GetEnumItems()) do")
         b.line(f"local t=Instance.new('Texture')")
         b.line(f"t.Texture={_luau_str(color_map)}")
         b.line(f"t.Face=face")
         b.line(f"t.StudsPerTileU=8 t.StudsPerTileV=8")
         b.line(f"t.Parent={parent_var}")
-        b.line("end end")
+        b.line("end")
+        b.line("end")
+        b.line("end")
     b.line("end")  # close the outer do block
 
 
