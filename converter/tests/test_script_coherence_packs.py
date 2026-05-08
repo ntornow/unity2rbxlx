@@ -333,6 +333,40 @@ class TestPickupRemoteEventServerAttr:
             "Touched signal observes the flag flip"
         )
 
+    def test_injects_has_attr_into_direct_fireclient_pickups(self) -> None:
+        """Codex finding [P1] (round 6): a Pickup that already uses
+        ``PickupItemEvent:FireClient(...)`` directly (e.g. the
+        canonical ``_PICKUP_REPLACEMENT`` body, or a hand-written
+        Pickup) skips the legacy SetAttribute → FireClient rewrite.
+        Without this fix, those Pickups never write the server-side
+        ``has<X>`` flag, and ``door_global_player_to_attribute``
+        rewrites Door to read an attribute nobody writes — every key
+        door stays permanently locked.
+
+        The fix injects the SetAttribute write before each FireClient
+        call when the Pickup uses FireClient but doesn't already carry
+        ``SetAttribute("has"...)``.
+        """
+        s = RbxScript(
+            name="Pickup",
+            source=(
+                'local _pe = game:GetService("ReplicatedStorage")'
+                ':FindFirstChild("PickupItemEvent")\n'
+                'triggerPart.Touched:Connect(function(otherPart)\n'
+                '    local character = otherPart:FindFirstAncestorOfClass("Model")\n'
+                '    local player = game:GetService("Players"):GetPlayerFromCharacter(character)\n'
+                '    if _pe and player then _pe:FireClient(player, itemName) end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._convert_pickup_to_remote_event([s])
+        assert ':SetAttribute("has" .. itemName, true)' in s.source
+        # Order: SetAttribute write must precede FireClient.
+        attr_idx = s.source.index('SetAttribute("has" .. itemName')
+        fire_idx = s.source.index('FireClient(player, itemName)')
+        assert attr_idx < fire_idx
+
     def test_skips_empty_itemname_at_runtime(self) -> None:
         """The injected SetAttribute is guarded by ``itemName ~= ""`` so
         a pickup with no itemName attribute doesn't write a useless

@@ -434,20 +434,33 @@ _PICKUP_SETATTRIBUTE_RE = re.compile(
 def _detect_pickup_setattribute_pattern(scripts: list["RbxScript"]) -> bool:
     """Detector for ``pickup_remote_event_server``.
 
-    Fires on any project that has a ``Pickup``-named script writing
-    ``character:SetAttribute("GetItem"|"PickupItem", itemName)``. This
-    is the post-AI-transpile shape the pack rewrites. Detector is
-    intentionally name-agnostic — the previous gate ``_detect_fps_rifle_pickup``
-    bound this to FPS-rifle projects only, but ``door_global_player_to_attribute``
-    relies on the server-attribute write the pack injects, and pickup
-    patterns appear in any genre. Without a generic detector, key doors
-    in non-rifle projects would be rewritten to ``GetAttribute("hasKey")``
-    on a flag nobody writes.
+    Fires on any ``Pickup`` script that either writes
+    ``character:SetAttribute("GetItem"|"PickupItem", itemName)`` (the
+    legacy AI-transpile shape the pack rewrites) OR fires
+    ``PickupItemEvent`` directly without the server-side
+    ``has<X>`` attribute write. The latter case applies to
+    pre-rewritten pickups (e.g. the ``_PICKUP_REPLACEMENT`` body) that
+    skip the legacy SetAttribute step entirely; without this gate they
+    miss the ``_pl:SetAttribute("has"..itemName, true)`` injection
+    that ``door_global_player_to_attribute`` depends on.
+
+    Detector is intentionally name-agnostic — the previous gate
+    ``_detect_fps_rifle_pickup`` bound this to FPS-rifle projects only,
+    but pickup patterns appear in any genre.
     """
-    return any(
-        s.name == "Pickup" and _PICKUP_SETATTRIBUTE_RE.search(s.source or "")
-        for s in scripts
-    )
+    for s in scripts:
+        if s.name != "Pickup":
+            continue
+        src = s.source or ""
+        if _PICKUP_SETATTRIBUTE_RE.search(src):
+            return True
+        # Direct-RemoteEvent shape: fires PickupItemEvent but doesn't
+        # write the server-side has-attribute. The apply function
+        # injects the missing write.
+        if "PickupItemEvent" in src and "FireClient" in src and \
+                'SetAttribute("has"' not in src:
+            return True
+    return False
 
 
 # Match ``getItem(`` or ``GetItem(`` as an UNQUALIFIED symbol — a real
@@ -566,6 +579,61 @@ def _convert_pickup_to_remote_event(scripts: list["RbxScript"]) -> int:
                 "  Promoted %d Pickup script:GetAttribute reads to walk-up search",
                 count2,
             )
+
+        # Direct-RemoteEvent path: Pickups that already use FireClient
+        # (``_PICKUP_REPLACEMENT`` body, hand-written shapes) skip the
+        # legacy SetAttribute -> FireClient rewrite above. Inject the
+        # server-side ``has<X>`` attribute write before FireClient if
+        # missing — door_global_player_to_attribute relies on it.
+        if (
+            "PickupItemEvent" in s.source
+            and "FireClient" in s.source
+            and 'SetAttribute("has"' not in s.source
+        ):
+            injected = _inject_has_attribute_before_fireclient(s)
+            if injected:
+                fixes += injected
+                log.info(
+                    "  Injected server-side has<X> SetAttribute "
+                    "before FireClient in '%s'",
+                    s.name,
+                )
+    return fixes
+
+
+def _inject_has_attribute_before_fireclient(s: "RbxScript") -> int:
+    """Insert ``_pl:SetAttribute("has"..itemName, true)`` before each
+    ``<event>:FireClient(<player>, itemName)`` call in *s.source* that
+    doesn't already have one.
+
+    Recovers from the gap codex flagged: a Pickup whose AI transpile
+    (or canonical ``_PICKUP_REPLACEMENT``) writes via FireClient
+    directly skips the SetAttribute → FireClient rewrite above, so
+    the server-side flag never replicates to the Door.
+
+    Captures the ``_pl``-equivalent player variable from FireClient's
+    first argument so the injected SetAttribute targets the same
+    player object the event fires for.
+    """
+    fire_re = re.compile(
+        r'([a-zA-Z_][\w.]*)\s*:\s*FireClient\s*\(\s*([a-zA-Z_]\w*)\s*,\s*itemName\s*\)'
+    )
+    fixes = 0
+
+    def _inject(m: "re.Match[str]") -> str:
+        player_var = m.group(2)
+        # Indent the injection to match the line containing FireClient.
+        # Walk back to find the line's leading whitespace.
+        return (
+            f'if {player_var} and itemName and itemName ~= "" then '
+            f'{player_var}:SetAttribute("has" .. itemName, true) end\n\t\t\t'
+            f'{m.group(0)}'
+        )
+
+    new_src, count = fire_re.subn(_inject, s.source)
+    if count:
+        s.source = new_src
+        fixes += count
     return fixes
 
 
