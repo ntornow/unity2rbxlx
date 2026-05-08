@@ -450,6 +450,27 @@ def _detect_pickup_setattribute_pattern(scripts: list["RbxScript"]) -> bool:
     )
 
 
+def _detect_pickup_remote_event_in_use(scripts: list["RbxScript"]) -> bool:
+    """Detector for ``pickup_remote_event_client``.
+
+    Detectors run lazily inside ``run_packs`` — by the time this fires,
+    ``pickup_remote_event_server`` has already rewritten Pickup scripts
+    to ``FireClient(_pl, itemName)`` on ``PickupItemEvent``. Detect that
+    post-rewrite shape rather than the pre-rewrite ``SetAttribute``
+    pattern, so the client listener installs whenever the server pack
+    has fired — including non-FPS projects where the legacy
+    ``GetItem``-attribute bridge no longer exists.
+
+    Also fires for projects whose Pickup was authored to use
+    ``PickupItemEvent`` directly (the canonical ``_PICKUP_REPLACEMENT``
+    body), so the listener install isn't gated on the rewrite path.
+    """
+    return any(
+        s.name == "Pickup" and "PickupItemEvent" in (s.source or "")
+        for s in scripts
+    )
+
+
 @patch_pack(
     name="pickup_remote_event_server",
     description="Convert Pickup script SetAttribute calls to "
@@ -597,20 +618,28 @@ def _canonicalize_pickup_remote_event(scripts: list["RbxScript"]) -> int:
 
 @patch_pack(
     name="pickup_remote_event_client",
-    description="Add OnClientEvent listener for PickupItemEvent in Player "
-    "scripts that own the GetRifle function.",
+    description="Add OnClientEvent listener for PickupItemEvent in any "
+    "Player-style controller (any script with a ``getItem``/``GetItem`` "
+    "dispatch). Coupled to ``pickup_remote_event_server`` so the listener "
+    "is installed wherever the server-side Pickup fires the event — not "
+    "just in FPS-rifle projects. Without this, broadening the server pack "
+    "to any genre would remove the legacy client-side ``GetItem`` "
+    "attribute trigger and leave non-FPS pickups silently unwired.",
     after=("fps_rifle_inject", "pickup_remote_event_server"),
-    detect=_detect_fps_rifle_pickup,
+    detect=_detect_pickup_remote_event_in_use,
 )
 def _add_pickup_remote_listener(scripts: list["RbxScript"]) -> int:
     fixes = 0
     for s in scripts:
         # Detect a Player-style controller by name presence: AI transpilation
-        # emits Lua-conventional camelCase (`getItem`, `getRifle`) while
-        # earlier rule-based output kept C# Title-case (`GetItem`, `GetRifle`).
-        # Match either by lowering the search.
+        # emits Lua-conventional camelCase (`getItem`) while earlier
+        # rule-based output kept C# Title-case (`GetItem`). Match either by
+        # lowering the search. ``getRifle`` is no longer required — the
+        # listener installs in any script with a ``getItem`` dispatch so
+        # non-FPS projects (RPG key pickups, platformer health pickups,
+        # etc.) don't silently drop their client-side pickup handling.
         src_lower = s.source.lower()
-        if 'getitem' not in src_lower or 'getrifle' not in src_lower:
+        if 'getitem' not in src_lower:
             continue
         if 'PickupItemEvent' in s.source:
             continue
@@ -770,17 +799,40 @@ def _ensure_players_service_binding(source: str) -> str:
 
 
 def _resolve_touch_callback_param(source: str, default: str = "otherPart") -> str:
-    """Return the parameter name the surrounding ``Touched``/``TouchEnded``
-    callback uses, defaulting to ``otherPart`` (the converter's own
-    OnTrigger*/OnCollision* convention from api_mappings.py).
+    """Return the parameter name of the FIRST ``Touched``/``TouchEnded``
+    callback in *source*, defaulting to ``otherPart`` (the converter's
+    own OnTrigger*/OnCollision* convention from api_mappings.py).
 
-    A door script with no Touched binding at all is rare — log defensively
-    and fall back to the default; the rewrite degrades gracefully because
-    the helper still type-checks even if the runtime arg is nil (the
-    helper returns false on nil ``_part``).
+    Use :func:`_resolve_touch_callback_param_at` for per-position
+    resolution when the same script has multiple touch handlers with
+    different parameter names (e.g. one handler uses ``other``, another
+    uses ``otherPart``); rewriting both with one global pick would leave
+    the mismatched handler reading an undefined variable and silently
+    failing.
     """
     m = _TOUCH_CALLBACK_RE.search(source)
     return m.group(1) if m else default
+
+
+def _resolve_touch_callback_param_at(
+    source: str, position: int, default: str = "otherPart"
+) -> str:
+    """Return the parameter name of the closest ``Touched``/``TouchEnded``
+    callback whose ``Connect(function(VAR)`` opens before *position*.
+
+    Walks backwards from *position* so call sites and inline guards
+    inside a Touched handler get rewritten with that handler's own
+    parameter name, not whatever the first handler in the file used.
+    Falls back to *default* (``otherPart``) when no preceding callback
+    is found — the rewrite degrades gracefully because the helper
+    returns false on nil and the inline lambda's ``_p`` resolves to
+    nil, so a misresolved name produces a closed door rather than a
+    runtime error.
+    """
+    last_match: re.Match[str] | None = None
+    for m in _TOUCH_CALLBACK_RE.finditer(source, 0, position):
+        last_match = m
+    return last_match.group(1) if last_match else default
 
 
 @patch_pack(
@@ -824,35 +876,53 @@ def _fix_door_global_player_lookup(scripts: list["RbxScript"]) -> int:
         s.source = _DOOR_GLOBAL_PLAYER_HELPER_RE.sub(_helper_replace, s.source)
         s.source = _DOOR_GLOBAL_PLAYER_RETURN_RE.sub(_helper_replace, s.source)
 
-        # Resolve the actual Touched callback parameter from the post-rewrite
-        # source so call sites pass the right name. AI transpiles use ``other``;
-        # the converter's api_mappings.py emits ``otherPart`` for OnTrigger*/
-        # OnCollision* handlers — both must work without breaking the door.
-        callback_param = _resolve_touch_callback_param(s.source)
+        # Resolve the callback parameter PER call site, not once for the
+        # whole file. Doors with multiple handlers can use different
+        # names (e.g. ``Touched(function(other)`` and
+        # ``TouchEnded(function(otherPart)``) — using a global pick would
+        # rewrite the mismatched handler with the wrong variable, so its
+        # GetAttribute check always evaluates falsy and that branch never
+        # runs. ``_rewrite_in_place_with_callback`` walks each match in
+        # source order and resolves the closest preceding ``Touched``/
+        # ``TouchEnded`` callback's parameter name for each.
+        def _rewrite_in_place_with_callback(
+            source: str,
+            pattern: re.Pattern[str],
+            replacer: "Callable[[re.Match[str], str], str]",
+        ) -> str:
+            pieces: list[str] = []
+            cursor = 0
+            for m in pattern.finditer(source):
+                pieces.append(source[cursor:m.start()])
+                cb = _resolve_touch_callback_param_at(source, m.start())
+                pieces.append(replacer(m, cb))
+                cursor = m.end()
+            pieces.append(source[cursor:])
+            return ''.join(pieces)
 
         for fn_name, _attr in captured_helpers:
-            s.source = re.sub(
-                rf'\b{re.escape(fn_name)}\(\)',
-                f'{fn_name}({callback_param})',
+            call_re = re.compile(rf'\b{re.escape(fn_name)}\(\)')
+            s.source = _rewrite_in_place_with_callback(
                 s.source,
+                call_re,
+                lambda _m, cb, fn=fn_name: f'{fn}({cb})',
             )
 
         # Inline-guard rewrite: ``if _G.Player and _G.Player.hasX then`` →
         # self-invoking lambda that derives the player from the surrounding
-        # Touched/TouchEnded callback's parameter. Without the lambda we'd
-        # need to refactor the surrounding block; with it we keep the
-        # rewrite local and the existing ``then ... end`` body intact.
-        def _inline_replace(m: "re.Match[str]") -> str:
-            attr = m.group(1)
-            return (
+        # Touched/TouchEnded callback's parameter. Per-position resolution
+        # ensures each guard inside its own handler picks the right name.
+        s.source = _rewrite_in_place_with_callback(
+            s.source,
+            _DOOR_GLOBAL_PLAYER_INLINE_RE,
+            lambda m, cb: (
                 f'if (function() '
-                f'local _m = {callback_param} and {callback_param}:FindFirstAncestorOfClass("Model"); '
+                f'local _m = {cb} and {cb}:FindFirstAncestorOfClass("Model"); '
                 f'local _p = _m and Players:GetPlayerFromCharacter(_m); '
-                f'return _p and _p:GetAttribute("{attr}") '
+                f'return _p and _p:GetAttribute("{m.group(1)}") '
                 f'end)() then'
-            )
-
-        s.source = _DOOR_GLOBAL_PLAYER_INLINE_RE.sub(_inline_replace, s.source)
+            ),
+        )
 
         # Ensure Players is bound — both rewrites call
         # ``Players:GetPlayerFromCharacter`` and a Door that previously only

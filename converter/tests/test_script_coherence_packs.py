@@ -665,6 +665,149 @@ class TestPickupRemoteEventDetectorIsGenreAgnostic:
         ]
         assert packs_module._detect_pickup_setattribute_pattern(scripts) is False
 
+    def test_client_listener_detector_fires_after_server_pack_runs(self) -> None:
+        """Codex finding [P1] (round 2): broadening the server pack must
+        broaden the client pack too. Detectors run lazily inside
+        ``run_packs``, so by the time ``pickup_remote_event_client``'s
+        detector fires, ``pickup_remote_event_server`` has already
+        rewritten the Pickup to use ``PickupItemEvent``. The client
+        detector must look for the post-rewrite shape, NOT the
+        pre-rewrite ``SetAttribute`` pattern.
+        """
+        scripts = [
+            RbxScript(
+                name="Pickup",
+                source=(
+                    'local _pe = game:GetService("ReplicatedStorage")'
+                    ':FindFirstChild("PickupItemEvent")\n'
+                    'if _pe and _pl then _pe:FireClient(_pl, itemName) end\n'
+                ),
+                script_type="Script",
+            ),
+        ]
+        assert packs_module._detect_pickup_remote_event_in_use(scripts) is True
+
+    def test_client_listener_installs_in_non_fps_player_script(self) -> None:
+        """Codex finding [P1] (round 2): the client listener used to
+        require BOTH ``getItem`` and ``getRifle``. Non-FPS projects with
+        only ``GetItem`` would never get a listener, leaving the broadened
+        server pack's FireClient unreachable on the client.
+
+        The listener must install in any script with a ``getItem``/
+        ``GetItem`` dispatch, not just FPS Player scripts. End-to-end
+        check via ``run_packs`` so we exercise the lazy detector chain
+        (server pack writes ``PickupItemEvent``, client pack detects it,
+        installs the listener).
+        """
+        scripts = [
+            # Pre-rewrite Pickup with the legacy SetAttribute pattern.
+            # ``pickup_remote_event_server`` will rewrite this into
+            # ``FireClient(_pl, itemName)`` + ``PickupItemEvent`` lookup,
+            # at which point the client pack's detector should fire.
+            RbxScript(
+                name="Pickup",
+                source=(
+                    'triggerPart.Touched:Connect(function(otherPart)\n'
+                    '    local character = otherPart:FindFirstAncestorOfClass("Model")\n'
+                    '    character:SetAttribute("GetItem", itemName)\n'
+                    'end)\n'
+                ),
+                script_type="Script",
+            ),
+            # RPG-style Player with a GetItem dispatch but no GetRifle.
+            RbxScript(
+                name="Player",
+                source=(
+                    'local function GetItem(name)\n'
+                    '    print("got " .. tostring(name))\n'
+                    'end\n'
+                ),
+                script_type="LocalScript",
+            ),
+        ]
+        run_packs(scripts)
+        player = scripts[1]
+        assert "PickupItemEvent" in player.source, (
+            "client listener must install in non-FPS Player scripts when "
+            "the broadened server pack rewrites the Pickup"
+        )
+        assert ':WaitForChild("PickupItemEvent"' in player.source
+
+    def test_per_handler_callback_resolution(self) -> None:
+        """Codex finding [P2]: a Door with two touch handlers using
+        different parameter names (``Touched(other)`` and
+        ``TouchEnded(otherPart)``) must rewrite each handler's call site
+        with that handler's own parameter name. A single global pick
+        breaks the mismatched handler — the GetAttribute check evaluates
+        falsy and the close branch never runs.
+        """
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'local function getPlayerHasKey()\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        return _G.Player.hasKey()\n'
+                '    end\n'
+                '    return false\n'
+                'end\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    if getPlayerHasKey() then toggleDoor(true) end\n'
+                'end)\n'
+                'triggerPart.TouchEnded:Connect(function(otherPart)\n'
+                '    if getPlayerHasKey() then toggleDoor(false) end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._fix_door_global_player_lookup([s])
+        # First handler rewrites to (other); second to (otherPart). One
+        # site of each must exist; neither may be rewritten with the
+        # wrong name.
+        assert "getPlayerHasKey(other)" in s.source
+        assert "getPlayerHasKey(otherPart)" in s.source
+        # Make sure each call site appears in its own handler's body —
+        # check the substring slices around each Connect block.
+        touched_idx = s.source.index("Touched:Connect")
+        touchended_idx = s.source.index("TouchEnded:Connect")
+        touched_block = s.source[touched_idx:touchended_idx]
+        touchended_block = s.source[touchended_idx:]
+        assert "getPlayerHasKey(other)" in touched_block
+        assert "getPlayerHasKey(otherPart)" in touchended_block
+        assert "getPlayerHasKey(otherPart)" not in touched_block
+        assert "getPlayerHasKey(other)" not in touchended_block.replace(
+            "getPlayerHasKey(otherPart)", ""
+        )
+
+    def test_per_handler_inline_guard_resolution(self) -> None:
+        """Same per-handler callback issue applies to inline guards.
+        Each guard's IIFE must reference its own enclosing handler's
+        parameter name."""
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        toggleDoor(true)\n'
+                '    end\n'
+                'end)\n'
+                'triggerPart.TouchEnded:Connect(function(otherPart)\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        toggleDoor(false)\n'
+                '    end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._fix_door_global_player_lookup([s])
+        touched_idx = s.source.index("Touched:Connect")
+        touchended_idx = s.source.index("TouchEnded:Connect")
+        touched_block = s.source[touched_idx:touchended_idx]
+        touchended_block = s.source[touchended_idx:]
+        assert 'other and other:FindFirstAncestorOfClass' in touched_block
+        assert 'otherPart and otherPart:FindFirstAncestorOfClass' in touchended_block
+
 
 class TestPickupVisualTargetPack:
     def test_detects_pickup_with_rotation_pattern(self) -> None:
