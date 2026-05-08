@@ -641,48 +641,78 @@ def _canonicalize_pickup_remote_event(scripts: list["RbxScript"]) -> int:
 )
 def _add_pickup_remote_listener(scripts: list["RbxScript"]) -> int:
     fixes = 0
-    for s in scripts:
-        # ``OnClientEvent`` is client-only — installing it in a server
-        # ``Script`` would crash at runtime. Restrict to LocalScripts so
-        # widening the ``getItem`` match across genres doesn't sweep up
-        # server-side ``Script``s or shared ``ModuleScript``s that
-        # legitimately define a ``GetItem`` helper for their own purposes.
-        if s.script_type != "LocalScript":
-            continue
-        # Detect a Player-style controller by an EXACT ``getItem``/
-        # ``GetItem`` symbol — definition or call. A loose substring
-        # match (the previous gate) sweeps up unrelated identifiers like
-        # ``getItemModule`` and injects a listener whose
-        # ``getItem(itemName)`` body refers to a function that doesn't
-        # exist, raising on the first pickup event. The word-boundary
-        # patterns below match ``getItem(``, ``GetItem(``, and
-        # ``function getItem`` / ``function GetItem``; they reject
-        # ``getItemModule(`` because the trailing ``M`` blocks the
-        # ``\(`` after the symbol.
-        if not _GETITEM_SYMBOL_RE.search(s.source or ""):
-            continue
-        if 'PickupItemEvent' in s.source:
-            continue
-        # Pick whichever casing the script already uses for the dispatch call
-        # so we don't introduce an undefined identifier.
-        get_item_name = 'getItem' if re.search(r'\bgetItem\b', s.source) else 'GetItem'
-        listener = (
-            '\n-- Pickup via RemoteEvent (server fires when player touches pickup)\n'
-            'local _pickupEvt = game:GetService("ReplicatedStorage"):WaitForChild("PickupItemEvent", 5)\n'
-            'if _pickupEvt then\n'
-            '    _pickupEvt.OnClientEvent:Connect(function(itemName)\n'
-            f'        if itemName and itemName ~= "" then {get_item_name}(itemName) end\n'
-            '    end)\n'
-            'end\n'
-        )
-        return_m = re.search(r'^return\b', s.source, re.MULTILINE)
-        if return_m:
-            s.source = s.source[:return_m.start()] + listener + s.source[return_m.start():]
-        else:
-            s.source = s.source.rstrip() + '\n' + listener
-        fixes += 1
-        log.info("  Added PickupItemEvent OnClientEvent listener in '%s'", s.name)
+    # Install in only ONE controller per project. A converted project
+    # may have multiple LocalScripts that define or call ``getItem``
+    # (auxiliary UI, tutorial, inventory helpers, etc.); installing the
+    # listener in all of them dispatches each pickup event multiple
+    # times, double-applying item effects. Pick one canonical target:
+    # prefer a script named ``Player`` if available, otherwise the
+    # first LocalScript that references ``LocalPlayer`` (the
+    # player-controller signature) and has a real ``getItem`` symbol.
+    candidate = _select_pickup_listener_target(scripts)
+    if candidate is None:
+        return 0
+    s = candidate
+    if 'PickupItemEvent' in s.source:
+        return 0
+    # Pick whichever casing the script already uses for the dispatch call
+    # so we don't introduce an undefined identifier.
+    get_item_name = 'getItem' if re.search(r'\bgetItem\b', s.source) else 'GetItem'
+    listener = (
+        '\n-- Pickup via RemoteEvent (server fires when player touches pickup)\n'
+        'local _pickupEvt = game:GetService("ReplicatedStorage"):WaitForChild("PickupItemEvent", 5)\n'
+        'if _pickupEvt then\n'
+        '    _pickupEvt.OnClientEvent:Connect(function(itemName)\n'
+        f'        if itemName and itemName ~= "" then {get_item_name}(itemName) end\n'
+        '    end)\n'
+        'end\n'
+    )
+    return_m = re.search(r'^return\b', s.source, re.MULTILINE)
+    if return_m:
+        s.source = s.source[:return_m.start()] + listener + s.source[return_m.start():]
+    else:
+        s.source = s.source.rstrip() + '\n' + listener
+    fixes += 1
+    log.info("  Added PickupItemEvent OnClientEvent listener in '%s'", s.name)
     return fixes
+
+
+def _select_pickup_listener_target(
+    scripts: list["RbxScript"],
+) -> "RbxScript | None":
+    """Pick the single LocalScript that should host the
+    ``PickupItemEvent`` OnClientEvent listener.
+
+    Selection order — most specific first:
+      1. A LocalScript literally named ``Player`` with a bare ``getItem``
+         symbol — the canonical Player controller.
+      2. The first LocalScript referencing ``LocalPlayer`` AND a bare
+         ``getItem`` symbol — a player controller that's named
+         differently (e.g. ``PlayerClient``).
+      3. None — the project has no obvious player controller. Better to
+         drop the listener than install it in a UI/tutorial script
+         that happens to define ``getItem`` for unrelated reasons.
+
+    Installing in multiple controllers is the failure mode this avoids:
+    each pickup event would dispatch through every listener,
+    double-applying item effects.
+    """
+    eligible = [
+        s for s in scripts
+        if s.script_type == "LocalScript"
+        and _GETITEM_SYMBOL_RE.search(s.source or "")
+    ]
+    if not eligible:
+        return None
+    # Tier 1: the canonical Player controller by name.
+    for s in eligible:
+        if s.name == "Player":
+            return s
+    # Tier 2: a controller-shaped LocalScript (references LocalPlayer).
+    for s in eligible:
+        if "LocalPlayer" in (s.source or ""):
+            return s
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -802,18 +832,21 @@ _TOUCH_CALLBACK_RE = re.compile(
 
 def _ensure_players_service_binding(source: str) -> str:
     """Insert ``local Players = game:GetService("Players")`` at the top
-    of *source* if it's not already bound. The Door rewrite calls
-    ``Players:GetPlayerFromCharacter`` and would crash on the first
-    Touched if a Door previously only used ``_G.Player.hasKey()`` and
-    therefore never bound the service.
+    of *source* if it's not already bound at file scope. The Door
+    rewrite calls ``Players:GetPlayerFromCharacter`` from outer scope
+    and would crash on the first Touched if the helper runs before a
+    nested binding has executed (or the nested binding is unreachable
+    from the outer call).
 
-    "Bound" specifically means an explicit assignment — either
-    ``local Players = ...`` or ``Players = ...``. Bare references to
-    ``Players`` (e.g. ``Players:GetPlayerFromCharacter`` injected by an
-    earlier pass of THIS pack) don't count, otherwise we'd false-skip
-    on every re-pass after a partial rewrite.
+    Only TOP-LEVEL bindings count — a ``local Players = ...`` inside a
+    nested function or callback isn't visible to the rewrite's outer
+    helper. Heuristic: match an assignment at column 0 (no leading
+    indentation), which corresponds to chunk-level statements in
+    well-formatted Lua. AI-transpiled output and the converter's own
+    rule-based emit both indent function bodies, so this distinguishes
+    file-level from nested bindings reliably enough.
     """
-    if re.search(r'^\s*(?:local\s+)?Players\s*=', source, re.MULTILINE):
+    if re.search(r'^(?:local\s+)?Players\s*=', source, re.MULTILINE):
         return source
     return 'local Players = game:GetService("Players")\n' + source
 

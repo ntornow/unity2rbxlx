@@ -592,6 +592,41 @@ class TestDoorGlobalPlayerToAttribute:
         helper_idx = s.source.index('Players:GetPlayerFromCharacter')
         assert binding_idx < helper_idx
 
+    def test_nested_players_binding_does_not_satisfy_top_level_check(self) -> None:
+        """Codex finding [P2] (round 5): a Door that binds ``Players``
+        only inside a nested function/callback shouldn't count as
+        "already bound" — the outer helper rewrite calls
+        ``Players:GetPlayerFromCharacter`` from outer scope, where the
+        nested local isn't visible. The pack must inject a top-level
+        binding even when a nested one exists.
+        """
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local function getPlayerHasKey()\n'
+                '    -- Nested binding only — not visible at file scope.\n'
+                '    local Players = game:GetService("Players")\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        return _G.Player.hasKey()\n'
+                '    end\n'
+                '    return false\n'
+                'end\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    if getPlayerHasKey() then toggleDoor(true) end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._fix_door_global_player_lookup([s])
+        # Top-level Players binding must be inserted: the rewritten
+        # helper calls Players:GetPlayerFromCharacter at file scope.
+        first_line = s.source.split('\n', 1)[0]
+        assert first_line == 'local Players = game:GetService("Players")', (
+            "top-level Players binding required even when a nested "
+            "binding exists — the helper rewrite calls Players from "
+            "outer scope"
+        )
+
     def test_does_not_double_inject_players_service(self) -> None:
         """If Players is already bound (the SimpleFPS shape), don't
         prepend a second binding — that would shadow nothing harmful but
@@ -750,6 +785,62 @@ class TestPickupRemoteEventDetectorIsGenreAgnostic:
         run_packs(scripts)
         util = scripts[1]
         assert "PickupItemEvent" not in util.source
+
+    def test_client_listener_installs_in_only_one_controller(self) -> None:
+        """Codex finding [P2] (round 5): a project with multiple
+        LocalScripts that match the ``getItem`` symbol must NOT get the
+        listener installed in all of them — every pickup event would
+        fire through every listener, double-applying item effects.
+
+        The fix selects a single canonical target: prefer a script
+        named ``Player``, otherwise the first LocalScript referencing
+        ``LocalPlayer`` AND ``getItem``.
+        """
+        scripts = [
+            RbxScript(
+                name="Pickup",
+                source=(
+                    'triggerPart.Touched:Connect(function(otherPart)\n'
+                    '    local character = otherPart:FindFirstAncestorOfClass("Model")\n'
+                    '    character:SetAttribute("GetItem", itemName)\n'
+                    'end)\n'
+                ),
+                script_type="Script",
+            ),
+            # Canonical Player controller — should get the listener.
+            RbxScript(
+                name="Player",
+                source=(
+                    'local Players = game:GetService("Players")\n'
+                    'local LocalPlayer = Players.LocalPlayer\n'
+                    'local function getItem(name)\n'
+                    '    -- player controller dispatch\n'
+                    'end\n'
+                ),
+                script_type="LocalScript",
+            ),
+            # Auxiliary UI script that also defines getItem — must be
+            # skipped to avoid double-dispatch.
+            RbxScript(
+                name="InventoryUI",
+                source=(
+                    'local function GetItem(name)\n'
+                    '    print("inventory got " .. name)\n'
+                    'end\n'
+                ),
+                script_type="LocalScript",
+            ),
+        ]
+        run_packs(scripts)
+        player = scripts[1]
+        ui = scripts[2]
+        assert "PickupItemEvent" in player.source, (
+            "canonical Player controller must get the listener"
+        )
+        assert "PickupItemEvent" not in ui.source, (
+            "auxiliary UI script with getItem must NOT get a duplicate "
+            "listener — would double-apply pickup effects"
+        )
 
     def test_client_listener_skips_qualified_getitem_calls(self) -> None:
         """Codex finding [P1] (round 5): a LocalScript that only
