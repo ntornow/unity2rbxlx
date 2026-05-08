@@ -43,6 +43,7 @@ TYPE_REFERENT = 0x13
 TYPE_NUMBERSEQUENCE = 0x15
 TYPE_COLORSEQUENCE = 0x16
 TYPE_NUMBERRANGE = 0x17
+TYPE_COLOR3UINT8 = 0x1A
 # Map XML element tags -> binary type IDs.
 _XML_TYPE_MAP: dict[str, int] = {
     "string": TYPE_STRING,
@@ -54,6 +55,7 @@ _XML_TYPE_MAP: dict[str, int] = {
     "Vector3": TYPE_VECTOR3,
     "CoordinateFrame": TYPE_CFRAME,
     "Color3": TYPE_COLOR3,
+    "Color3uint8": TYPE_COLOR3UINT8,
     "BrickColor": TYPE_BRICKCOLOR,
     "token": TYPE_ENUM,
     # Roblox Studio expects ContentId properties (MeshId, TextureId, ColorMap,
@@ -61,6 +63,12 @@ _XML_TYPE_MAP: dict[str, int] = {
     # "Unexpected format 32 (expected 1) << ContentId" on load.
     "Content": TYPE_STRING,
     "ProtectedString": TYPE_STRING,
+    # BinaryString carries base64-encoded raw bytes in XML
+    # (AttributesSerialize blobs etc.) The Roblox binary format groups
+    # BinaryString under property type 0x01 (String), with the raw decoded
+    # bytes as the payload — see https://dom.rojo.space/binary-strings.html.
+    # _parse_property base64-decodes; _encode_string handles arbitrary bytes.
+    "BinaryString": TYPE_STRING,
     "UDim2": TYPE_UDIM2,
     "NumberRange": TYPE_NUMBERRANGE,
     "NumberSequence": TYPE_NUMBERSEQUENCE,
@@ -158,7 +166,15 @@ def _interleave_u32(values: list[int]) -> bytes:
     return bytes(result)
 
 
-def _encode_string(s: str) -> bytes:
+def _encode_string(s: str | bytes) -> bytes:
+    """Encode a Roblox binary string property value (length-prefixed payload).
+
+    Accepts either text (UTF-8 encoded) or raw bytes (BinaryString blobs
+    such as AttributesSerialize, where the XML carries base64-encoded
+    arbitrary bytes — see https://dom.rojo.space/binary-strings.html).
+    """
+    if isinstance(s, bytes):
+        return struct.pack("<I", len(s)) + s
     encoded = s.encode("utf-8")
     return struct.pack("<I", len(encoded)) + encoded
 
@@ -270,12 +286,36 @@ def _parse_property(el: ET.Element) -> tuple[int, object] | None:
 
     if tag in ("string", "ProtectedString"):
         return (TYPE_STRING, el.text or "")
+    elif tag == "BinaryString":
+        # Base64-decoded raw bytes (AttributesSerialize blobs etc.). XML
+        # may include a leading newline / CDATA wrapper; strip whitespace
+        # before decoding. Empty body decodes to empty bytes.
+        import base64 as _b64
+        text = (el.text or "").strip()
+        try:
+            raw = _b64.b64decode(text) if text else b""
+        except (ValueError, _b64.binascii.Error):
+            raw = b""
+        return (TYPE_STRING, raw)
     elif tag == "Content":
         # Roblox XML uses <Content><url>value</url></Content> for asset refs.
         # Fall back to el.text for legacy flat-text Content elements.
         url_child = el.find("url")
         value = url_child.text if url_child is not None and url_child.text else (el.text or "")
         return (TYPE_STRING, value)
+    elif tag == "Color3uint8":
+        # MeshPart uses ``Color3uint8`` instead of ``Color3``. The XML
+        # value is a uint32 packing 0xRRGGBB (alpha unused). Roblox
+        # binary type id 0x1A stores 3 component arrays: R, G, B as
+        # bytes (no alpha) — see https://dom.rojo.space/binary.html.
+        try:
+            packed = int(el.text or "0")
+        except ValueError:
+            packed = 0
+        r = (packed >> 16) & 0xFF
+        g = (packed >> 8) & 0xFF
+        b = packed & 0xFF
+        return (TYPE_COLOR3UINT8, (r, g, b))
     elif tag == "bool":
         return (TYPE_BOOL, (el.text or "").lower() == "true")
     elif tag == "int":
@@ -359,6 +399,7 @@ def _default_for_type(type_id: int) -> object:
         TYPE_VECTOR2: (0.0, 0.0),
         TYPE_VECTOR3: (0.0, 0.0, 0.0),
         TYPE_COLOR3: (0.0, 0.0, 0.0),
+        TYPE_COLOR3UINT8: (162, 162, 162),
         TYPE_CFRAME: (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
         TYPE_BRICKCOLOR: 194,
         TYPE_ENUM: 0,
@@ -378,7 +419,10 @@ def _serialise_prop_values(type_id: int, values: list[object]) -> bytes:
 
     if type_id == TYPE_STRING:
         for v in values:
-            buf += _encode_string(str(v))
+            # BinaryString blobs (e.g. AttributesSerialize) decode to raw
+            # bytes via _parse_property; keep them as-is. Everything else
+            # round-trips through str() — _encode_string accepts both.
+            buf += _encode_string(v if isinstance(v, (str, bytes)) else str(v))
 
     elif type_id == TYPE_BOOL:
         for v in values:
@@ -415,6 +459,17 @@ def _serialise_prop_values(type_id: int, values: list[object]) -> bytes:
         buf += _interleave_u32(rs)
         buf += _interleave_u32(gs)
         buf += _interleave_u32(bs)
+
+    elif type_id == TYPE_COLOR3UINT8:
+        # https://dom.rojo.space/binary.html — Color3uint8 stores three
+        # component arrays (R bytes, G bytes, B bytes), no alpha,
+        # no interleave. Each component is a single byte per instance.
+        rs = bytearray(int(v[0]) & 0xFF for v in values)
+        gs = bytearray(int(v[1]) & 0xFF for v in values)
+        bs = bytearray(int(v[2]) & 0xFF for v in values)
+        buf += rs
+        buf += gs
+        buf += bs
 
     elif type_id == TYPE_CFRAME:
         # For each CFrame: 1 byte rotation_id.
