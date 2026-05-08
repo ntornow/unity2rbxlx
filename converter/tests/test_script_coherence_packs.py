@@ -274,6 +274,1122 @@ class TestFpsRifleInjection:
         assert s.source == original
 
 
+class TestPickupRemoteEventServerAttr:
+    """The ``pickup_remote_event_server`` pack rewrites
+    ``character:SetAttribute("GetItem", itemName)`` to fire the
+    ``PickupItemEvent`` RemoteEvent — and ALSO writes
+    ``player:SetAttribute("has"..itemName, true)`` server-side so doors
+    and other server scripts can read the gameplay flag. The combined
+    invariant existed only inside ``_PICKUP_REPLACEMENT`` previously, and
+    that template was gated behind a detector that ``pickup_remote_event_server``
+    itself was disabling — so the server-attr write silently dropped.
+    These tests pin both invariants on the canonical AI-transpile shape.
+    """
+
+    def _ai_transpiled_pickup(self) -> RbxScript:
+        return RbxScript(
+            name="Pickup",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'local itemName = script:GetAttribute("itemName") or ""\n'
+                'triggerPart.Touched:Connect(function(otherPart)\n'
+                '    local character = otherPart:FindFirstAncestorOfClass("Model")\n'
+                '    if not character then return end\n'
+                '    local player = Players:GetPlayerFromCharacter(character)\n'
+                '    if not player then return end\n'
+                '    character:SetAttribute("GetItem", itemName)\n'
+                '    container:Destroy()\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+
+    def test_fires_remote_event(self) -> None:
+        s = self._ai_transpiled_pickup()
+        packs_module._convert_pickup_to_remote_event([s])
+        assert "PickupItemEvent" in s.source
+        assert "FireClient(_pl, itemName)" in s.source
+        # The original SetAttribute call must be gone — leaving it would
+        # leak ``GetItem`` onto the character (server-side, but only the
+        # client-side Player listener used to read it).
+        assert 'SetAttribute("GetItem", itemName)' not in s.source
+
+    def test_writes_server_side_player_attribute(self) -> None:
+        """The pack must inject ``_pl:SetAttribute("has"..itemName, true)``
+        BEFORE ``FireClient``. Server-side Player Object attribute writes
+        replicate to the client; the client-side Player.luau read in
+        ``hasKey`` was correct already, but the SERVER-side Door read of
+        ``player:GetAttribute("hasKey")`` saw nil before this fix.
+        """
+        s = self._ai_transpiled_pickup()
+        packs_module._convert_pickup_to_remote_event([s])
+        assert '_pl:SetAttribute("has" .. itemName, true)' in s.source
+        # Order matters: write the attribute, then fire the event.
+        attr_idx = s.source.index('_pl:SetAttribute("has" .. itemName')
+        fire_idx = s.source.index("FireClient(_pl, itemName)")
+        assert attr_idx < fire_idx, (
+            "server-attr write must precede FireClient so a server-side "
+            "Door listener seeing a same-frame attribute read on the "
+            "Touched signal observes the flag flip"
+        )
+
+    def test_injects_has_attr_when_unrelated_has_attribute_initialized(self) -> None:
+        """Codex finding [P1] (round 7): a Pickup that initializes an
+        unrelated has-flag (e.g. ``player:SetAttribute("hasKey", false)``
+        for default state) should still get the dynamic-concat write
+        injected before FireClient. The previous detector substring
+        check ``'SetAttribute("has"' not in src`` would false-skip
+        these Pickups.
+        """
+        s = RbxScript(
+            name="Pickup",
+            source=(
+                'local _pe = game:GetService("ReplicatedStorage")'
+                ':FindFirstChild("PickupItemEvent")\n'
+                '-- Initialize default state (unrelated to the dynamic write):\n'
+                'local function _resetPlayer(p) p:SetAttribute("hasKey", false) end\n'
+                'triggerPart.Touched:Connect(function(otherPart)\n'
+                '    local character = otherPart:FindFirstAncestorOfClass("Model")\n'
+                '    local player = game:GetService("Players"):GetPlayerFromCharacter(character)\n'
+                '    if _pe and player then _pe:FireClient(player, itemName) end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+        # Detector should still fire even though _resetPlayer mentions
+        # SetAttribute("hasKey", false).
+        assert packs_module._detect_pickup_setattribute_pattern([s]) is True
+        packs_module._convert_pickup_to_remote_event([s])
+        # The exact dynamic-concat pattern is injected.
+        assert ':SetAttribute("has" .. itemName, true)' in s.source
+
+    def test_injects_has_attr_into_direct_fireclient_pickups(self) -> None:
+        """Codex finding [P1] (round 6): a Pickup that already uses
+        ``PickupItemEvent:FireClient(...)`` directly (e.g. the
+        canonical ``_PICKUP_REPLACEMENT`` body, or a hand-written
+        Pickup) skips the legacy SetAttribute → FireClient rewrite.
+        Without this fix, those Pickups never write the server-side
+        ``has<X>`` flag, and ``door_global_player_to_attribute``
+        rewrites Door to read an attribute nobody writes — every key
+        door stays permanently locked.
+
+        The fix injects the SetAttribute write before each FireClient
+        call when the Pickup uses FireClient but doesn't already carry
+        ``SetAttribute("has"...)``.
+        """
+        s = RbxScript(
+            name="Pickup",
+            source=(
+                'local _pe = game:GetService("ReplicatedStorage")'
+                ':FindFirstChild("PickupItemEvent")\n'
+                'triggerPart.Touched:Connect(function(otherPart)\n'
+                '    local character = otherPart:FindFirstAncestorOfClass("Model")\n'
+                '    local player = game:GetService("Players"):GetPlayerFromCharacter(character)\n'
+                '    if _pe and player then _pe:FireClient(player, itemName) end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._convert_pickup_to_remote_event([s])
+        assert ':SetAttribute("has" .. itemName, true)' in s.source
+        # Order: SetAttribute write must precede FireClient.
+        attr_idx = s.source.index('SetAttribute("has" .. itemName')
+        fire_idx = s.source.index('FireClient(player, itemName)')
+        assert attr_idx < fire_idx
+
+    def test_skips_empty_itemname_at_runtime(self) -> None:
+        """The injected SetAttribute is guarded by ``itemName ~= ""`` so
+        a pickup with no itemName attribute doesn't write a useless
+        ``has`` attribute (the empty-string concat would still produce
+        ``"has"`` as the key)."""
+        s = self._ai_transpiled_pickup()
+        packs_module._convert_pickup_to_remote_event([s])
+        assert 'itemName and itemName ~= ""' in s.source
+
+
+class TestDoorGlobalPlayerToAttribute:
+    """The ``door_global_player_to_attribute`` pack catches Door scripts
+    where the AI transpiler emitted a server-incompatible
+    ``_G.Player.hasKey`` lookup and rewrites it to read the replicated
+    Player attribute that ``pickup_remote_event_server`` writes.
+
+    Three transpile shapes seen in the wild are pinned here: helper that
+    if-checks then returns, helper that returns truthy-and, and inline
+    if-guards inside Touched. The fast detector flips on any
+    ``_G.Player`` substring so every shape gets considered.
+    """
+
+    @staticmethod
+    def _door_with_helper() -> RbxScript:
+        return RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'local function getPlayerHasKey()\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        return _G.Player.hasKey()\n'
+                '    end\n'
+                '    return false\n'
+                'end\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    if getPlayerHasKey() then\n'
+                '        toggleDoor(true)\n'
+                '    end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+
+    @staticmethod
+    def _door_with_return_helper() -> RbxScript:
+        return RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'local function getPlayerHasKey()\n'
+                '    return _G.Player and _G.Player.hasKey or false\n'
+                'end\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    if getPlayerHasKey() then toggleDoor(true) end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+
+    @staticmethod
+    def _door_with_inline_guard() -> RbxScript:
+        return RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        toggleDoor(true)\n'
+                '    end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+
+    def test_detector_matches_any_g_player_reference(self) -> None:
+        for factory in (
+            self._door_with_helper,
+            self._door_with_return_helper,
+            self._door_with_inline_guard,
+        ):
+            assert packs_module._detect_door_global_player_lookup(
+                [factory()]
+            ) is True
+
+    def test_detector_skips_clean_doors(self) -> None:
+        """A Door already reading ``player:GetAttribute("hasKey")`` must
+        NOT trigger the rewrite — re-running the pack should be a no-op."""
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local function getPlayerHasKey(part)\n'
+                '    local m = part and part:FindFirstAncestorOfClass("Model")\n'
+                '    local p = m and Players:GetPlayerFromCharacter(m)\n'
+                '    return p and p:GetAttribute("hasKey")\n'
+                'end\n'
+            ),
+            script_type="Script",
+        )
+        assert packs_module._detect_door_global_player_lookup([s]) is False
+
+    def test_detector_skips_non_door_scripts(self) -> None:
+        """Other scripts may legitimately use ``_G.Player`` — the pack
+        is gated on ``s.name == "Door"`` to avoid touching them."""
+        s = RbxScript(
+            name="HudControl",
+            source="_G.Player = { hasKey = false }",
+            script_type="LocalScript",
+        )
+        assert packs_module._detect_door_global_player_lookup([s]) is False
+
+    def test_helper_form_rewrites_to_player_attribute(self) -> None:
+        s = self._door_with_helper()
+        packs_module._fix_door_global_player_lookup([s])
+        assert "_G.Player" not in s.source
+        assert 'getPlayerHasKey(_part)' in s.source  # helper now takes a part
+        assert 'GetPlayerFromCharacter(_model)' in s.source
+        assert ':GetAttribute("hasKey")' in s.source
+        # Call sites must pass ``other`` from the Touched callback.
+        assert "getPlayerHasKey(other)" in s.source
+        assert "getPlayerHasKey()" not in s.source
+
+    def test_return_helper_form_rewrites_to_player_attribute(self) -> None:
+        s = self._door_with_return_helper()
+        packs_module._fix_door_global_player_lookup([s])
+        assert "_G.Player" not in s.source
+        assert ':GetAttribute("hasKey")' in s.source
+        assert "getPlayerHasKey(other)" in s.source
+
+    def test_inline_guard_rewrites_to_player_attribute(self) -> None:
+        s = self._door_with_inline_guard()
+        packs_module._fix_door_global_player_lookup([s])
+        assert "_G.Player" not in s.source
+        assert ':GetAttribute("hasKey")' in s.source
+        # Inline guard becomes a self-invoking lambda; the lambda must
+        # reference whichever name the surrounding Touched callback used
+        # (this fixture uses ``other``).
+        assert 'other and other:FindFirstAncestorOfClass("Model")' in s.source
+
+    def test_idempotent(self) -> None:
+        s = self._door_with_helper()
+        packs_module._fix_door_global_player_lookup([s])
+        first_pass = s.source
+        packs_module._fix_door_global_player_lookup([s])
+        assert s.source == first_pass
+
+    def test_preserves_attribute_name_for_non_key_doors(self) -> None:
+        """The pack captures ``has<X>`` from the original source — a door
+        that reads ``hasMagicWand`` produces ``GetAttribute("hasMagicWand")``,
+        not a hardcoded ``hasKey``."""
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'local function probe()\n'
+                '    if _G.Player and _G.Player.hasMagicWand then\n'
+                '        return _G.Player.hasMagicWand()\n'
+                '    end\n'
+                '    return false\n'
+                'end\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    if probe() then return end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._fix_door_global_player_lookup([s])
+        assert 'GetAttribute("hasMagicWand")' in s.source
+        assert 'GetAttribute("hasKey")' not in s.source
+
+    # ------------------------------------------------------------------
+    # Codex review findings — pin against regressions
+    # ------------------------------------------------------------------
+
+    def test_helper_call_site_uses_otherPart_when_callback_does(self) -> None:
+        """Codex finding [P1]: api_mappings.py emits
+        ``Connect(function(otherPart)`` for OnTrigger*/OnCollision*
+        handlers. When the Door uses the otherPart convention, the
+        rewritten ``getPlayerHasKey()`` call site must pass ``otherPart``,
+        not the hardcoded ``other``. Otherwise ``_part`` is nil at runtime
+        and the helper always returns false → door stays closed forever.
+        """
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'local function getPlayerHasKey()\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        return _G.Player.hasKey()\n'
+                '    end\n'
+                '    return false\n'
+                'end\n'
+                'triggerPart.Touched:Connect(function(otherPart)\n'
+                '    if getPlayerHasKey() then\n'
+                '        toggleDoor(true)\n'
+                '    end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._fix_door_global_player_lookup([s])
+        assert "getPlayerHasKey(otherPart)" in s.source
+        assert "getPlayerHasKey(other)" not in s.source
+
+    def test_inline_guard_uses_otherPart_when_callback_does(self) -> None:
+        """Codex finding [P1]: same callback-name issue for inline guards.
+        The IIFE must read ``otherPart`` when the surrounding callback
+        uses that name; otherwise the lambda references an undefined
+        variable, the condition is always falsy, and ``toggleDoor(...)``
+        is unreachable.
+        """
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'triggerPart.Touched:Connect(function(otherPart)\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        toggleDoor(true)\n'
+                '    end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._fix_door_global_player_lookup([s])
+        assert 'otherPart and otherPart:FindFirstAncestorOfClass("Model")' in s.source
+        # Must not leak the wrong name into the IIFE.
+        assert 'other and other:FindFirstAncestorOfClass' not in s.source
+
+    def test_injects_players_service_binding_when_missing(self) -> None:
+        """Codex finding [P1]: a Door that previously only used
+        ``_G.Player.hasKey()`` may have skipped the
+        ``local Players = game:GetService("Players")`` binding entirely.
+        The rewrite calls ``Players:GetPlayerFromCharacter`` and would
+        crash on the first Touched without the binding. The pack must
+        prepend the binding when missing.
+        """
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local function getPlayerHasKey()\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        return _G.Player.hasKey()\n'
+                '    end\n'
+                '    return false\n'
+                'end\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    if getPlayerHasKey() then\n'
+                '        toggleDoor(true)\n'
+                '    end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._fix_door_global_player_lookup([s])
+        assert 'local Players = game:GetService("Players")' in s.source
+        # And it must come before the helper that uses it — at file top.
+        binding_idx = s.source.index('local Players = game:GetService("Players")')
+        helper_idx = s.source.index('Players:GetPlayerFromCharacter')
+        assert binding_idx < helper_idx
+
+    def test_nested_players_binding_does_not_satisfy_top_level_check(self) -> None:
+        """Codex finding [P2] (round 5): a Door that binds ``Players``
+        only inside a nested function/callback shouldn't count as
+        "already bound" — the outer helper rewrite calls
+        ``Players:GetPlayerFromCharacter`` from outer scope, where the
+        nested local isn't visible. The pack must inject a top-level
+        binding even when a nested one exists.
+        """
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local function getPlayerHasKey()\n'
+                '    -- Nested binding only — not visible at file scope.\n'
+                '    local Players = game:GetService("Players")\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        return _G.Player.hasKey()\n'
+                '    end\n'
+                '    return false\n'
+                'end\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    if getPlayerHasKey() then toggleDoor(true) end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._fix_door_global_player_lookup([s])
+        # Top-level Players binding must be inserted: the rewritten
+        # helper calls Players:GetPlayerFromCharacter at file scope.
+        first_line = s.source.split('\n', 1)[0]
+        assert first_line == 'local Players = game:GetService("Players")', (
+            "top-level Players binding required even when a nested "
+            "binding exists — the helper rewrite calls Players from "
+            "outer scope"
+        )
+
+    def test_does_not_double_inject_players_service(self) -> None:
+        """If Players is already bound (the SimpleFPS shape), don't
+        prepend a second binding — that would shadow nothing harmful but
+        adds a noise line and breaks idempotence guarantees."""
+        s = self._door_with_helper()  # already has Players binding
+        original_count = s.source.count('local Players = game:GetService("Players")')
+        assert original_count == 1
+        packs_module._fix_door_global_player_lookup([s])
+        assert s.source.count('local Players = game:GetService("Players")') == 1
+
+
+class TestPickupRemoteEventDetectorIsGenreAgnostic:
+    """Codex finding [P2]: ``door_global_player_to_attribute`` only works
+    if ``pickup_remote_event_server`` runs to write the replicated
+    server-side ``has<X>`` attribute. The Pickup pack used to gate on
+    ``_detect_fps_rifle_pickup``, which fires only on rifle markers
+    (``riflePrefab``/``GetRifle``). A non-FPS project with key doors
+    would have the Door rewritten to read ``GetAttribute("hasKey")`` on
+    a flag nobody writes — leaving every key door permanently locked.
+
+    The fix swaps the detector to ``_detect_pickup_setattribute_pattern``,
+    which fires on the pattern the pack actually rewrites.
+    """
+
+    def test_detector_fires_without_rifle_markers(self) -> None:
+        """A pickup project with a Pickup script and a key (no rifle
+        anywhere) should still trigger the pack."""
+        scripts = [
+            RbxScript(
+                name="Pickup",
+                source=(
+                    'triggerPart.Touched:Connect(function(otherPart)\n'
+                    '    local character = otherPart:FindFirstAncestorOfClass("Model")\n'
+                    '    character:SetAttribute("GetItem", itemName)\n'
+                    'end)\n'
+                ),
+                script_type="Script",
+            ),
+            # No Player.luau, no riflePrefab — pure RPG-style pickup.
+        ]
+        assert packs_module._detect_pickup_setattribute_pattern(scripts) is True
+
+    def test_detector_skips_non_pickup_setattribute_calls(self) -> None:
+        """A non-Pickup script that happens to call ``SetAttribute``
+        with similar shape must NOT trigger the pack — the rewrite is
+        Pickup-specific."""
+        scripts = [
+            RbxScript(
+                name="Inventory",
+                source=(
+                    'character:SetAttribute("GetItem", itemName)\n'
+                ),
+                script_type="Script",
+            ),
+        ]
+        assert packs_module._detect_pickup_setattribute_pattern(scripts) is False
+
+    def test_detector_skips_pickup_already_using_remote_event(self) -> None:
+        """A Pickup that's already been processed (no SetAttribute call
+        anymore, just FireClient) should not re-trigger — the pack is
+        idempotent and re-running it must be a no-op."""
+        scripts = [
+            RbxScript(
+                name="Pickup",
+                source=(
+                    'pickupEvent:FireClient(player, itemName)\n'
+                    'container:Destroy()\n'
+                ),
+                script_type="Script",
+            ),
+        ]
+        assert packs_module._detect_pickup_setattribute_pattern(scripts) is False
+
+    def test_client_listener_detector_fires_after_server_pack_runs(self) -> None:
+        """Codex finding [P1] (round 2): broadening the server pack must
+        broaden the client pack too. Detectors run lazily inside
+        ``run_packs``, so by the time ``pickup_remote_event_client``'s
+        detector fires, ``pickup_remote_event_server`` has already
+        rewritten the Pickup to use ``PickupItemEvent``. The client
+        detector must look for the post-rewrite shape, NOT the
+        pre-rewrite ``SetAttribute`` pattern.
+        """
+        scripts = [
+            RbxScript(
+                name="Pickup",
+                source=(
+                    'local _pe = game:GetService("ReplicatedStorage")'
+                    ':FindFirstChild("PickupItemEvent")\n'
+                    'if _pe and _pl then _pe:FireClient(_pl, itemName) end\n'
+                ),
+                script_type="Script",
+            ),
+        ]
+        assert packs_module._detect_pickup_remote_event_in_use(scripts) is True
+
+    def test_client_listener_skips_server_scripts(self) -> None:
+        """Codex finding [P2] (round 3): ``OnClientEvent`` is client-only.
+        A server ``Script`` that happens to define a ``GetItem`` helper
+        for its own purposes must not get the listener installed —
+        ``RemoteEvent.OnClientEvent:Connect`` would crash on the server.
+        Restrict the install to scripts classified as ``LocalScript``.
+        """
+        scripts = [
+            # Pre-rewrite Pickup so the server pack fires.
+            RbxScript(
+                name="Pickup",
+                source=(
+                    'triggerPart.Touched:Connect(function(otherPart)\n'
+                    '    local character = otherPart:FindFirstAncestorOfClass("Model")\n'
+                    '    character:SetAttribute("GetItem", itemName)\n'
+                    'end)\n'
+                ),
+                script_type="Script",
+            ),
+            # A SERVER script with its own GetItem helper — must be skipped.
+            RbxScript(
+                name="LootDispenser",
+                source=(
+                    'local function GetItem(name)\n'
+                    '    -- server-side inventory dispatch, not a client controller\n'
+                    '    return inventory[name]\n'
+                    'end\n'
+                ),
+                script_type="Script",
+            ),
+        ]
+        run_packs(scripts)
+        loot = scripts[1]
+        assert "PickupItemEvent" not in loot.source, (
+            "client listener must not install in a server Script — "
+            "OnClientEvent is client-only and would crash on the server"
+        )
+
+    def test_client_listener_skips_module_scripts(self) -> None:
+        """Codex finding [P2] (round 3): same applies to shared
+        ModuleScripts that happen to define ``getItem``. The runtime
+        context for a ModuleScript depends on its caller, but
+        OnClientEvent is unsafe to install unconditionally."""
+        scripts = [
+            RbxScript(
+                name="Pickup",
+                source=(
+                    'triggerPart.Touched:Connect(function(otherPart)\n'
+                    '    local character = otherPart:FindFirstAncestorOfClass("Model")\n'
+                    '    character:SetAttribute("GetItem", itemName)\n'
+                    'end)\n'
+                ),
+                script_type="Script",
+            ),
+            RbxScript(
+                name="InventoryUtil",
+                source='local M = {}\nfunction M.getItem(name) end\nreturn M\n',
+                script_type="ModuleScript",
+            ),
+        ]
+        run_packs(scripts)
+        util = scripts[1]
+        assert "PickupItemEvent" not in util.source
+
+    def test_client_listener_installs_in_only_one_controller(self) -> None:
+        """Codex finding [P2] (round 5): a project with multiple
+        LocalScripts that match the ``getItem`` symbol must NOT get the
+        listener installed in all of them — every pickup event would
+        fire through every listener, double-applying item effects.
+
+        The fix selects a single canonical target: prefer a script
+        named ``Player``, otherwise the first LocalScript referencing
+        ``LocalPlayer`` AND ``getItem``.
+        """
+        scripts = [
+            RbxScript(
+                name="Pickup",
+                source=(
+                    'triggerPart.Touched:Connect(function(otherPart)\n'
+                    '    local character = otherPart:FindFirstAncestorOfClass("Model")\n'
+                    '    character:SetAttribute("GetItem", itemName)\n'
+                    'end)\n'
+                ),
+                script_type="Script",
+            ),
+            # Canonical Player controller — should get the listener.
+            RbxScript(
+                name="Player",
+                source=(
+                    'local Players = game:GetService("Players")\n'
+                    'local LocalPlayer = Players.LocalPlayer\n'
+                    'local function getItem(name)\n'
+                    '    -- player controller dispatch\n'
+                    'end\n'
+                ),
+                script_type="LocalScript",
+            ),
+            # Auxiliary UI script that also defines getItem — must be
+            # skipped to avoid double-dispatch.
+            RbxScript(
+                name="InventoryUI",
+                source=(
+                    'local function GetItem(name)\n'
+                    '    print("inventory got " .. name)\n'
+                    'end\n'
+                ),
+                script_type="LocalScript",
+            ),
+        ]
+        run_packs(scripts)
+        player = scripts[1]
+        ui = scripts[2]
+        assert "PickupItemEvent" in player.source, (
+            "canonical Player controller must get the listener"
+        )
+        assert "PickupItemEvent" not in ui.source, (
+            "auxiliary UI script with getItem must NOT get a duplicate "
+            "listener — would double-apply pickup effects"
+        )
+
+    def test_client_listener_picks_actual_controller_not_first_localplayer(self) -> None:
+        """Codex finding [P2] (round 6): when no script is named
+        ``Player`` and multiple LocalScripts mention ``LocalPlayer``,
+        the previous tier-2 fallback returned the FIRST such script in
+        registration order. A UI helper that happens to reference
+        ``LocalPlayer`` (e.g. for player-name display) but doesn't
+        define ``getItem`` would steal the listener install from the
+        actual controller.
+
+        The fix scores each candidate on player-controller signal
+        density (LocalPlayer + Character + Humanoid + UserInputService)
+        plus a strong boost for actually DEFINING ``getItem`` rather
+        than just referencing it. The script that defines ``getItem``
+        wins regardless of registration order.
+        """
+        scripts = [
+            RbxScript(
+                name="Pickup",
+                source=(
+                    'triggerPart.Touched:Connect(function(otherPart)\n'
+                    '    local character = otherPart:FindFirstAncestorOfClass("Model")\n'
+                    '    character:SetAttribute("GetItem", itemName)\n'
+                    'end)\n'
+                ),
+                script_type="Script",
+            ),
+            # UI helper FIRST in registration order: references
+            # LocalPlayer for display purposes and has a bare getItem
+            # CALL but no DEFINITION.
+            RbxScript(
+                name="InventoryUI",
+                source=(
+                    'local LocalPlayer = game:GetService("Players").LocalPlayer\n'
+                    'local function _refresh()\n'
+                    '    print(LocalPlayer.Name, "has", getItem("count"))\n'
+                    'end\n'
+                ),
+                script_type="LocalScript",
+            ),
+            # Actual controller SECOND: defines getItem and references
+            # all the controller signals.
+            RbxScript(
+                name="PlayerClient",
+                source=(
+                    'local Players = game:GetService("Players")\n'
+                    'local LocalPlayer = Players.LocalPlayer\n'
+                    'local Character = LocalPlayer.Character\n'
+                    'local Humanoid = Character and Character:FindFirstChildWhichIsA("Humanoid")\n'
+                    'local UserInputService = game:GetService("UserInputService")\n'
+                    'local function getItem(name)\n'
+                    '    -- real controller dispatch\n'
+                    'end\n'
+                ),
+                script_type="LocalScript",
+            ),
+        ]
+        run_packs(scripts)
+        ui = scripts[1]
+        controller = scripts[2]
+        assert "PickupItemEvent" in controller.source, (
+            "actual controller (PlayerClient) must get the listener "
+            "regardless of registration order"
+        )
+        assert "PickupItemEvent" not in ui.source, (
+            "UI helper must NOT steal the listener even though it "
+            "references LocalPlayer first"
+        )
+
+    def test_client_listener_skips_qualified_getitem_calls(self) -> None:
+        """Codex finding [P1] (round 5): a LocalScript that only
+        references getItem through a namespace (``inventory.getItem(``,
+        ``self:getItem(``) doesn't define a bare ``getItem`` symbol.
+        The injected listener body calls bare ``getItem(itemName)``,
+        which would raise ``attempt to call a nil value`` on the first
+        pickup event.
+
+        The fix: ``_GETITEM_SYMBOL_RE`` rejects matches preceded by
+        ``.`` or ``:``.
+        """
+        scripts = [
+            RbxScript(
+                name="Pickup",
+                source=(
+                    'triggerPart.Touched:Connect(function(otherPart)\n'
+                    '    local character = otherPart:FindFirstAncestorOfClass("Model")\n'
+                    '    character:SetAttribute("GetItem", itemName)\n'
+                    'end)\n'
+                ),
+                script_type="Script",
+            ),
+            # Only references inventory.getItem — no bare getItem.
+            RbxScript(
+                name="InventoryClient",
+                source=(
+                    'local inventory = require(script.Parent.Inventory)\n'
+                    'inventory.getItem("startKey")\n'
+                ),
+                script_type="LocalScript",
+            ),
+        ]
+        run_packs(scripts)
+        client = scripts[1]
+        assert "PickupItemEvent" not in client.source, (
+            "qualified inventory.getItem should not trigger listener "
+            "install — the listener body calls bare getItem which "
+            "doesn't exist in this script"
+        )
+
+    def test_client_listener_skips_substring_only_match(self) -> None:
+        """Codex finding [P1] (round 4): a LocalScript that mentions
+        ``getItemModule`` (or any identifier containing the substring
+        ``getItem``) but never defines or calls ``getItem`` itself was
+        being matched by the previous loose substring check. The
+        listener body calls ``getItem(itemName)`` — which doesn't exist
+        in such scripts — and crashes on the first pickup event.
+
+        The fix: require ``getItem(`` or ``GetItem(`` as a real symbol
+        (word-boundary match).
+        """
+        scripts = [
+            RbxScript(
+                name="Pickup",
+                source=(
+                    'triggerPart.Touched:Connect(function(otherPart)\n'
+                    '    local character = otherPart:FindFirstAncestorOfClass("Model")\n'
+                    '    character:SetAttribute("GetItem", itemName)\n'
+                    'end)\n'
+                ),
+                script_type="Script",
+            ),
+            # HudControl-style LocalScript — defines getItemModule, not getItem.
+            RbxScript(
+                name="HudControl",
+                source=(
+                    'local function getItemModule()\n'
+                    '    return require(script.Parent.ItemModule)\n'
+                    'end\n'
+                    'getItemModule()\n'
+                ),
+                script_type="LocalScript",
+            ),
+        ]
+        run_packs(scripts)
+        hud = scripts[1]
+        assert "PickupItemEvent" not in hud.source, (
+            "loose substring match injected listener that calls "
+            "getItem(itemName) — a function this script doesn't define"
+        )
+        assert ":WaitForChild(\"PickupItemEvent\"" not in hud.source
+
+    def test_client_listener_installs_in_non_fps_player_script(self) -> None:
+        """Codex finding [P1] (round 2): the client listener used to
+        require BOTH ``getItem`` and ``getRifle``. Non-FPS projects with
+        only ``GetItem`` would never get a listener, leaving the broadened
+        server pack's FireClient unreachable on the client.
+
+        The listener must install in any script with a ``getItem``/
+        ``GetItem`` dispatch, not just FPS Player scripts. End-to-end
+        check via ``run_packs`` so we exercise the lazy detector chain
+        (server pack writes ``PickupItemEvent``, client pack detects it,
+        installs the listener).
+        """
+        scripts = [
+            # Pre-rewrite Pickup with the legacy SetAttribute pattern.
+            # ``pickup_remote_event_server`` will rewrite this into
+            # ``FireClient(_pl, itemName)`` + ``PickupItemEvent`` lookup,
+            # at which point the client pack's detector should fire.
+            RbxScript(
+                name="Pickup",
+                source=(
+                    'triggerPart.Touched:Connect(function(otherPart)\n'
+                    '    local character = otherPart:FindFirstAncestorOfClass("Model")\n'
+                    '    character:SetAttribute("GetItem", itemName)\n'
+                    'end)\n'
+                ),
+                script_type="Script",
+            ),
+            # RPG-style Player with a GetItem dispatch but no GetRifle.
+            RbxScript(
+                name="Player",
+                source=(
+                    'local function GetItem(name)\n'
+                    '    print("got " .. tostring(name))\n'
+                    'end\n'
+                ),
+                script_type="LocalScript",
+            ),
+        ]
+        run_packs(scripts)
+        player = scripts[1]
+        assert "PickupItemEvent" in player.source, (
+            "client listener must install in non-FPS Player scripts when "
+            "the broadened server pack rewrites the Pickup"
+        )
+        assert ':WaitForChild("PickupItemEvent"' in player.source
+
+    def test_per_handler_callback_resolution(self) -> None:
+        """Codex finding [P2]: a Door with two touch handlers using
+        different parameter names (``Touched(other)`` and
+        ``TouchEnded(otherPart)``) must rewrite each handler's call site
+        with that handler's own parameter name. A single global pick
+        breaks the mismatched handler — the GetAttribute check evaluates
+        falsy and the close branch never runs.
+        """
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'local function getPlayerHasKey()\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        return _G.Player.hasKey()\n'
+                '    end\n'
+                '    return false\n'
+                'end\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    if getPlayerHasKey() then toggleDoor(true) end\n'
+                'end)\n'
+                'triggerPart.TouchEnded:Connect(function(otherPart)\n'
+                '    if getPlayerHasKey() then toggleDoor(false) end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._fix_door_global_player_lookup([s])
+        # First handler rewrites to (other); second to (otherPart). One
+        # site of each must exist; neither may be rewritten with the
+        # wrong name.
+        assert "getPlayerHasKey(other)" in s.source
+        assert "getPlayerHasKey(otherPart)" in s.source
+        # Make sure each call site appears in its own handler's body —
+        # check the substring slices around each Connect block.
+        touched_idx = s.source.index("Touched:Connect")
+        touchended_idx = s.source.index("TouchEnded:Connect")
+        touched_block = s.source[touched_idx:touchended_idx]
+        touchended_block = s.source[touchended_idx:]
+        assert "getPlayerHasKey(other)" in touched_block
+        assert "getPlayerHasKey(otherPart)" in touchended_block
+        assert "getPlayerHasKey(otherPart)" not in touched_block
+        assert "getPlayerHasKey(other)" not in touchended_block.replace(
+            "getPlayerHasKey(otherPart)", ""
+        )
+
+    def test_skips_helper_calls_outside_touch_handlers(self) -> None:
+        """Codex finding [P1] (round 3): a Door variant that calls the
+        helper during init (e.g. ``print(getPlayerHasKey())``) or from
+        a non-Touched callback would have ``otherPart`` injected as an
+        argument by the previous resolver — referencing an undefined
+        variable. Outside-touch sites must be left at zero args; the
+        rewritten helper's nil-arg path returns false cleanly.
+        """
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'local function getPlayerHasKey()\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        return _G.Player.hasKey()\n'
+                '    end\n'
+                '    return false\n'
+                'end\n'
+                '-- Diagnostic call during init (no touch handler around it)\n'
+                'print("init:", getPlayerHasKey())\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    if getPlayerHasKey() then toggleDoor(true) end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._fix_door_global_player_lookup([s])
+        # The init-time call must NOT have an undefined variable injected.
+        assert "print(\"init:\", getPlayerHasKey())" in s.source
+        # The in-touch call site must still get its callback param.
+        assert "if getPlayerHasKey(other) then" in s.source
+
+    def test_touch_range_survives_nested_lua_blocks(self) -> None:
+        """Codex finding [P1] (round 5): a Touched callback containing
+        ordinary ``if``/``for``/``while`` blocks must keep its computed
+        range open until the callback's own ``end``. The previous
+        parser only counted ``function`` as opens against ``end`` as
+        closes, so an inner ``if cond then ... end`` would prematurely
+        close the callback's range and leave a later ``_G.Player``
+        guard in the same handler treated as outside-scope.
+        """
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    if ready then\n'
+                '        warmup()\n'
+                '    end\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        toggleDoor(true)\n'
+                '    end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._fix_door_global_player_lookup([s])
+        # The hasKey guard inside the same callback (after an inner
+        # ``if`` block) must be rewritten — it's still in scope.
+        assert 'other and other:FindFirstAncestorOfClass' in s.source
+        assert "_G.Player" not in s.source
+
+    def test_touch_range_survives_standalone_do_blocks(self) -> None:
+        """Codex finding [P3] (round 6): a Touched callback containing
+        a standalone ``do ... end`` block must keep its computed range
+        open until the callback's own ``end``. The previous parser
+        omitted ``do`` from the open set, so a standalone do-block
+        decremented depth on its inner ``end`` and prematurely closed
+        the callback.
+        """
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    do\n'
+                '        local _scope = "guarded"\n'
+                '    end\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        toggleDoor(true)\n'
+                '    end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._fix_door_global_player_lookup([s])
+        # The hasKey guard after the do-block is still in scope.
+        assert 'other and other:FindFirstAncestorOfClass' in s.source
+        assert "_G.Player" not in s.source
+
+    def test_touch_range_survives_for_and_while_blocks(self) -> None:
+        """Same scope rule for ``for`` and ``while`` loops inside the
+        callback. Each closes with ``end``; counting only ``function``
+        as opens would close the callback range early once the loop
+        ends. The fix counts ``function``, ``if``, ``for``, ``while``
+        as opens.
+        """
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    for _, p in ipairs({1,2,3}) do\n'
+                '        log(p)\n'
+                '    end\n'
+                '    while waiting do\n'
+                '        task.wait(0.1)\n'
+                '    end\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        toggleDoor(true)\n'
+                '    end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._fix_door_global_player_lookup([s])
+        assert 'other and other:FindFirstAncestorOfClass' in s.source
+        assert "_G.Player" not in s.source
+
+    def test_helper_calls_after_closed_touch_block_not_rewritten(self) -> None:
+        """Codex finding [P1] (round 4): a helper call AFTER a touch
+        callback's matching ``end`` is no longer in the callback's
+        scope. The previous resolver's "closest preceding header" pick
+        would borrow the now-out-of-scope ``other``, injecting an
+        undefined variable. Scope-aware ranges check enclosure, not
+        proximity.
+        """
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'local function getPlayerHasKey()\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        return _G.Player.hasKey()\n'
+                '    end\n'
+                '    return false\n'
+                'end\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    if getPlayerHasKey() then toggleDoor(true) end\n'
+                'end)\n'
+                '-- This call is AFTER the touched block closed:\n'
+                'print("debug:", getPlayerHasKey())\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._fix_door_global_player_lookup([s])
+        # The in-touch site is rewritten with ``other``.
+        assert "if getPlayerHasKey(other) then" in s.source
+        # The post-block call must NOT have ``other`` injected — that
+        # would reference an out-of-scope variable.
+        assert 'print("debug:", getPlayerHasKey())' in s.source
+
+    def test_inline_guards_after_closed_touch_block_not_rewritten(self) -> None:
+        """Same scope rule for inline guards: a guard after the touch
+        callback's matching ``end`` should not borrow the closed
+        callback's parameter."""
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        toggleDoor(true)\n'
+                '    end\n'
+                'end)\n'
+                '-- This guard is AFTER the touched block closed:\n'
+                'if _G.Player and _G.Player.hasKey then\n'
+                '    error("must not run before touched")\n'
+                'end\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._fix_door_global_player_lookup([s])
+        # In-touch guard rewritten correctly.
+        touched_idx = s.source.index("Touched:Connect")
+        in_touch = s.source[touched_idx:s.source.index("end)")]
+        assert 'other and other:FindFirstAncestorOfClass' in in_touch
+        # Post-block guard left alone (the body still has _G.Player —
+        # it's broken but not introducing an undefined-variable error).
+        post_block = s.source[s.source.index("end)") + len("end)"):]
+        assert 'other and other:FindFirstAncestorOfClass' not in post_block
+
+    def test_skips_inline_guards_outside_touch_handlers(self) -> None:
+        """Same outside-touch rule applies to inline ``_G.Player`` guards
+        — a guard outside a touch handler has no ``other``/``otherPart``
+        in scope to derive a player from. Leaving it unrewritten is the
+        less-bad option (it stays broken, but doesn't introduce a new
+        undefined-variable error). In practice, AI transpiles only
+        place these guards inside Touched/TouchEnded.
+        """
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                '-- Hypothetical init-time guard with no enclosing touch handler\n'
+                'if _G.Player and _G.Player.hasKey then\n'
+                '    error("must not run before touched")\n'
+                'end\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        toggleDoor(true)\n'
+                '    end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._fix_door_global_player_lookup([s])
+        # Inline guard inside Touched is rewritten correctly.
+        touched_idx = s.source.index("Touched:Connect")
+        in_touch = s.source[touched_idx:]
+        assert 'other and other:FindFirstAncestorOfClass' in in_touch
+
+    def test_per_handler_inline_guard_resolution(self) -> None:
+        """Same per-handler callback issue applies to inline guards.
+        Each guard's IIFE must reference its own enclosing handler's
+        parameter name."""
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        toggleDoor(true)\n'
+                '    end\n'
+                'end)\n'
+                'triggerPart.TouchEnded:Connect(function(otherPart)\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        toggleDoor(false)\n'
+                '    end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._fix_door_global_player_lookup([s])
+        touched_idx = s.source.index("Touched:Connect")
+        touchended_idx = s.source.index("TouchEnded:Connect")
+        touched_block = s.source[touched_idx:touchended_idx]
+        touchended_block = s.source[touchended_idx:]
+        assert 'other and other:FindFirstAncestorOfClass' in touched_block
+        assert 'otherPart and otherPart:FindFirstAncestorOfClass' in touchended_block
+
+
 class TestPickupVisualTargetPack:
     def test_detects_pickup_with_rotation_pattern(self) -> None:
         scripts = [

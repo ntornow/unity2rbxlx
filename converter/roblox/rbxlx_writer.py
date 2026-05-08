@@ -1023,6 +1023,36 @@ def _make_part(parent_xml: ET.Element, part: RbxPart) -> None:
     if part_class == "MeshPart" and hasattr(part, "texture_id") and part.texture_id:
         all_attrs["_TextureId"] = part.texture_id
 
+    # Persist desired CollisionFidelity in an attribute so a runtime
+    # recook script can re-create the part via
+    # ``AssetService:CreateMeshPartAsync(meshId, {CollisionFidelity=…})``.
+    # The plain ``<token name="CollisionFidelity">N</token>`` we emit
+    # above is ingested as a property but Roblox doesn't re-cook the
+    # collision mesh from that property — Studio (and the runtime)
+    # silently snap it back to ``Box`` until something explicitly
+    # creates the part with the option dict. The recook script
+    # auto-injected by the pipeline reads this attribute and runs
+    # CreateMeshPartAsync at game start so locally-loaded rbxlx files
+    # behave like the published-place chunked builder. See commit
+    # 4610a17 for the original analysis.
+    coll_fid = getattr(part, "collision_fidelity", None)
+    if (
+        part_class == "MeshPart"
+        and getattr(part, "mesh_id", None)
+        and coll_fid is not None
+        and coll_fid != 0  # 0 = Default; only non-default needs cooking
+    ):
+        # Map int token → enum name string the runtime script can pass
+        # back through Enum.CollisionFidelity[…].
+        _COLL_FID_NAMES = {
+            1: "Hull",
+            2: "Box",  # explicit Box still benefits from the cook path
+            3: "PreciseConvexDecomposition",
+        }
+        name = _COLL_FID_NAMES.get(int(coll_fid))
+        if name:
+            all_attrs["_DesiredCollisionFidelity"] = name
+
     # SurfaceAppearance: store texture URLs as attributes for runtime loading
     sa = getattr(part, "surface_appearance", None)
     if sa is not None and part_class == "MeshPart":

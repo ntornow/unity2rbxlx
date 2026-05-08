@@ -423,12 +423,104 @@ def _inject_fps_rifle_system(scripts: list["RbxScript"]) -> int:
 # Pack: pickup_remote_event
 # ---------------------------------------------------------------------------
 
+# Match ``<receiver>:SetAttribute("PickupItem"|"GetItem", itemName)`` —
+# the canonical AI-transpiled-Pickup-handler shape we rewrite. Module-level
+# so the detector and the apply function share one source of truth.
+_PICKUP_SETATTRIBUTE_RE = re.compile(
+    r'[a-zA-Z_][\w.]*\s*:\s*SetAttribute\s*\(\s*"(?:PickupItem|GetItem)"\s*,\s*itemName\s*\)'
+)
+
+
+def _detect_pickup_setattribute_pattern(scripts: list["RbxScript"]) -> bool:
+    """Detector for ``pickup_remote_event_server``.
+
+    Fires on any ``Pickup`` script that either writes
+    ``character:SetAttribute("GetItem"|"PickupItem", itemName)`` (the
+    legacy AI-transpile shape the pack rewrites) OR fires
+    ``PickupItemEvent`` directly without the server-side
+    ``has<X>`` attribute write. The latter case applies to
+    pre-rewritten pickups (e.g. the ``_PICKUP_REPLACEMENT`` body) that
+    skip the legacy SetAttribute step entirely; without this gate they
+    miss the ``_pl:SetAttribute("has"..itemName, true)`` injection
+    that ``door_global_player_to_attribute`` depends on.
+
+    Detector is intentionally name-agnostic — the previous gate
+    ``_detect_fps_rifle_pickup`` bound this to FPS-rifle projects only,
+    but pickup patterns appear in any genre.
+    """
+    for s in scripts:
+        if s.name != "Pickup":
+            continue
+        src = s.source or ""
+        if _PICKUP_SETATTRIBUTE_RE.search(src):
+            return True
+        # Direct-RemoteEvent shape: fires PickupItemEvent but doesn't
+        # write the server-side has-attribute. The apply function
+        # injects the missing write. Match the EXACT dynamic-concat
+        # pattern the pack injects (``SetAttribute("has" .. itemName,
+        # true)``) — checking for any ``SetAttribute("has"...)`` would
+        # false-skip Pickups that init unrelated has-flags (e.g. an
+        # opening-state ``SetAttribute("hasKey", false)``) but never
+        # write the dynamic-concat shape that mirrors what the
+        # pack would inject.
+        if (
+            "PickupItemEvent" in src
+            and "FireClient" in src
+            and not _PICKUP_HAS_ATTR_INJECTED_RE.search(src)
+        ):
+            return True
+    return False
+
+
+# The exact server-attr write the pack injects. Matching this directly
+# (rather than ``SetAttribute("has"...)``) avoids false-skipping
+# Pickups that init unrelated has-flags before firing.
+_PICKUP_HAS_ATTR_INJECTED_RE = re.compile(
+    r':\s*SetAttribute\s*\(\s*"has"\s*\.\.\s*itemName\s*,\s*true\s*\)'
+)
+
+
+# Match ``getItem(`` or ``GetItem(`` as an UNQUALIFIED symbol — a real
+# top-level function definition or call. The negative lookbehind
+# ``(?<![.:])`` rejects qualified accesses like ``inventory.getItem(``
+# or ``self:getItem(`` because the listener body the pack injects calls
+# bare ``getItem(itemName)``; if a script only references getItem
+# through a namespace, that bare call would raise on the first pickup
+# event. ``\b`` before excludes ``getitem`` inside longer identifiers
+# (e.g. ``getItemized``); ``\(`` after excludes ``getItemModule(``.
+_GETITEM_SYMBOL_RE = re.compile(r'(?<![.:])\b(?:get|Get)Item\s*\(')
+
+
+def _detect_pickup_remote_event_in_use(scripts: list["RbxScript"]) -> bool:
+    """Detector for ``pickup_remote_event_client``.
+
+    Detectors run lazily inside ``run_packs`` — by the time this fires,
+    ``pickup_remote_event_server`` has already rewritten Pickup scripts
+    to ``FireClient(_pl, itemName)`` on ``PickupItemEvent``. Detect that
+    post-rewrite shape rather than the pre-rewrite ``SetAttribute``
+    pattern, so the client listener installs whenever the server pack
+    has fired — including non-FPS projects where the legacy
+    ``GetItem``-attribute bridge no longer exists.
+
+    Also fires for projects whose Pickup was authored to use
+    ``PickupItemEvent`` directly (the canonical ``_PICKUP_REPLACEMENT``
+    body), so the listener install isn't gated on the rewrite path.
+    """
+    return any(
+        s.name == "Pickup" and "PickupItemEvent" in (s.source or "")
+        for s in scripts
+    )
+
+
 @patch_pack(
     name="pickup_remote_event_server",
     description="Convert Pickup script SetAttribute calls to "
     "ReplicatedStorage.PickupItemEvent:FireClient — server-side "
-    "SetAttribute does not trigger client GetAttributeChangedSignal.",
-    detect=_detect_fps_rifle_pickup,
+    "SetAttribute does not trigger client GetAttributeChangedSignal. "
+    "Also injects a server-side ``player:SetAttribute('has'..itemName, true)`` "
+    "before FireClient so server scripts (Door, etc.) can read replicated "
+    "gameplay flags.",
+    detect=_detect_pickup_setattribute_pattern,
 )
 def _convert_pickup_to_remote_event(scripts: list["RbxScript"]) -> int:
     fixes = 0
@@ -451,6 +543,15 @@ def _convert_pickup_to_remote_event(scripts: list["RbxScript"]) -> int:
                 '\t\t\tlocal _pe = game:GetService("ReplicatedStorage"):FindFirstChild("PickupItemEvent")\n'
                 f'\t\t\tlocal _char = {receiver}\n'
                 '\t\t\tlocal _pl = _char and game:GetService("Players"):GetPlayerFromCharacter(_char)\n'
+                '\t\t\t-- Persist the pickup as a server-side Player attribute so server\n'
+                '\t\t\t-- scripts (e.g. Door checking ``player:GetAttribute("hasKey")``) can\n'
+                '\t\t\t-- react. ``LocalPlayer:SetAttribute`` from the client does not\n'
+                '\t\t\t-- replicate, so any server consumer of ``hasKey``/``hasRifle``\n'
+                '\t\t\t-- needs this server-side write. Object attributes set server-side\n'
+                '\t\t\t-- DO replicate, so the client read in Player.luau still works.\n'
+                '\t\t\tif _pl and itemName and itemName ~= "" then\n'
+                '\t\t\t\t_pl:SetAttribute("has" .. itemName, true)\n'
+                '\t\t\tend\n'
                 '\t\t\tif _pe and _pl then _pe:FireClient(_pl, itemName) end\n'
                 '\t\tend'
             )
@@ -495,6 +596,61 @@ def _convert_pickup_to_remote_event(scripts: list["RbxScript"]) -> int:
                 "  Promoted %d Pickup script:GetAttribute reads to walk-up search",
                 count2,
             )
+
+        # Direct-RemoteEvent path: Pickups that already use FireClient
+        # (``_PICKUP_REPLACEMENT`` body, hand-written shapes) skip the
+        # legacy SetAttribute -> FireClient rewrite above. Inject the
+        # server-side ``has<X>`` attribute write before FireClient if
+        # missing — door_global_player_to_attribute relies on it.
+        if (
+            "PickupItemEvent" in s.source
+            and "FireClient" in s.source
+            and not _PICKUP_HAS_ATTR_INJECTED_RE.search(s.source)
+        ):
+            injected = _inject_has_attribute_before_fireclient(s)
+            if injected:
+                fixes += injected
+                log.info(
+                    "  Injected server-side has<X> SetAttribute "
+                    "before FireClient in '%s'",
+                    s.name,
+                )
+    return fixes
+
+
+def _inject_has_attribute_before_fireclient(s: "RbxScript") -> int:
+    """Insert ``_pl:SetAttribute("has"..itemName, true)`` before each
+    ``<event>:FireClient(<player>, itemName)`` call in *s.source* that
+    doesn't already have one.
+
+    Recovers from the gap codex flagged: a Pickup whose AI transpile
+    (or canonical ``_PICKUP_REPLACEMENT``) writes via FireClient
+    directly skips the SetAttribute → FireClient rewrite above, so
+    the server-side flag never replicates to the Door.
+
+    Captures the ``_pl``-equivalent player variable from FireClient's
+    first argument so the injected SetAttribute targets the same
+    player object the event fires for.
+    """
+    fire_re = re.compile(
+        r'([a-zA-Z_][\w.]*)\s*:\s*FireClient\s*\(\s*([a-zA-Z_]\w*)\s*,\s*itemName\s*\)'
+    )
+    fixes = 0
+
+    def _inject(m: "re.Match[str]") -> str:
+        player_var = m.group(2)
+        # Indent the injection to match the line containing FireClient.
+        # Walk back to find the line's leading whitespace.
+        return (
+            f'if {player_var} and itemName and itemName ~= "" then '
+            f'{player_var}:SetAttribute("has" .. itemName, true) end\n\t\t\t'
+            f'{m.group(0)}'
+        )
+
+    new_src, count = fire_re.subn(_inject, s.source)
+    if count:
+        s.source = new_src
+        fixes += count
     return fixes
 
 
@@ -558,43 +714,119 @@ def _canonicalize_pickup_remote_event(scripts: list["RbxScript"]) -> int:
 
 @patch_pack(
     name="pickup_remote_event_client",
-    description="Add OnClientEvent listener for PickupItemEvent in Player "
-    "scripts that own the GetRifle function.",
+    description="Add OnClientEvent listener for PickupItemEvent in any "
+    "Player-style controller (any script with a ``getItem``/``GetItem`` "
+    "dispatch). Coupled to ``pickup_remote_event_server`` so the listener "
+    "is installed wherever the server-side Pickup fires the event — not "
+    "just in FPS-rifle projects. Without this, broadening the server pack "
+    "to any genre would remove the legacy client-side ``GetItem`` "
+    "attribute trigger and leave non-FPS pickups silently unwired.",
     after=("fps_rifle_inject", "pickup_remote_event_server"),
-    detect=_detect_fps_rifle_pickup,
+    detect=_detect_pickup_remote_event_in_use,
 )
 def _add_pickup_remote_listener(scripts: list["RbxScript"]) -> int:
     fixes = 0
-    for s in scripts:
-        # Detect a Player-style controller by name presence: AI transpilation
-        # emits Lua-conventional camelCase (`getItem`, `getRifle`) while
-        # earlier rule-based output kept C# Title-case (`GetItem`, `GetRifle`).
-        # Match either by lowering the search.
-        src_lower = s.source.lower()
-        if 'getitem' not in src_lower or 'getrifle' not in src_lower:
-            continue
-        if 'PickupItemEvent' in s.source:
-            continue
-        # Pick whichever casing the script already uses for the dispatch call
-        # so we don't introduce an undefined identifier.
-        get_item_name = 'getItem' if 'getItem' in s.source else 'GetItem'
-        listener = (
-            '\n-- Pickup via RemoteEvent (server fires when player touches pickup)\n'
-            'local _pickupEvt = game:GetService("ReplicatedStorage"):WaitForChild("PickupItemEvent", 5)\n'
-            'if _pickupEvt then\n'
-            '    _pickupEvt.OnClientEvent:Connect(function(itemName)\n'
-            f'        if itemName and itemName ~= "" then {get_item_name}(itemName) end\n'
-            '    end)\n'
-            'end\n'
-        )
-        return_m = re.search(r'^return\b', s.source, re.MULTILINE)
-        if return_m:
-            s.source = s.source[:return_m.start()] + listener + s.source[return_m.start():]
-        else:
-            s.source = s.source.rstrip() + '\n' + listener
-        fixes += 1
-        log.info("  Added PickupItemEvent OnClientEvent listener in '%s'", s.name)
+    # Install in only ONE controller per project. A converted project
+    # may have multiple LocalScripts that define or call ``getItem``
+    # (auxiliary UI, tutorial, inventory helpers, etc.); installing the
+    # listener in all of them dispatches each pickup event multiple
+    # times, double-applying item effects. Pick one canonical target:
+    # prefer a script named ``Player`` if available, otherwise the
+    # first LocalScript that references ``LocalPlayer`` (the
+    # player-controller signature) and has a real ``getItem`` symbol.
+    candidate = _select_pickup_listener_target(scripts)
+    if candidate is None:
+        return 0
+    s = candidate
+    if 'PickupItemEvent' in s.source:
+        return 0
+    # Pick whichever casing the script already uses for the dispatch call
+    # so we don't introduce an undefined identifier.
+    get_item_name = 'getItem' if re.search(r'\bgetItem\b', s.source) else 'GetItem'
+    listener = (
+        '\n-- Pickup via RemoteEvent (server fires when player touches pickup)\n'
+        'local _pickupEvt = game:GetService("ReplicatedStorage"):WaitForChild("PickupItemEvent", 5)\n'
+        'if _pickupEvt then\n'
+        '    _pickupEvt.OnClientEvent:Connect(function(itemName)\n'
+        f'        if itemName and itemName ~= "" then {get_item_name}(itemName) end\n'
+        '    end)\n'
+        'end\n'
+    )
+    return_m = re.search(r'^return\b', s.source, re.MULTILINE)
+    if return_m:
+        s.source = s.source[:return_m.start()] + listener + s.source[return_m.start():]
+    else:
+        s.source = s.source.rstrip() + '\n' + listener
+    fixes += 1
+    log.info("  Added PickupItemEvent OnClientEvent listener in '%s'", s.name)
     return fixes
+
+
+def _select_pickup_listener_target(
+    scripts: list["RbxScript"],
+) -> "RbxScript | None":
+    """Pick the single LocalScript that should host the
+    ``PickupItemEvent`` OnClientEvent listener.
+
+    Selection order — most specific first:
+      1. A LocalScript literally named ``Player`` with a bare ``getItem``
+         symbol — the canonical Player controller.
+      2. The LocalScript with the highest player-controller signal
+         score: ``+1`` for each of these signals seen in source —
+         ``LocalPlayer``, ``Character``, ``Humanoid``,
+         ``UserInputService``, plus a strong ``+3`` boost for an actual
+         ``function getItem(...)`` / ``function GetItem(...)``
+         definition (not just a call). UI/tutorial scripts that merely
+         CALL ``getItem`` outside their own definition score lower than
+         the script that defines it, so the listener installs in the
+         actual controller even when ``LocalPlayer`` happens to appear
+         elsewhere first.
+      3. None — the project has no obvious player controller. Better to
+         drop the listener than install it in a UI/tutorial script
+         that happens to define ``getItem`` for unrelated reasons.
+
+    Installing in multiple controllers is the failure mode this avoids:
+    each pickup event would dispatch through every listener,
+    double-applying item effects.
+    """
+    eligible = [
+        s for s in scripts
+        if s.script_type == "LocalScript"
+        and _GETITEM_SYMBOL_RE.search(s.source or "")
+    ]
+    if not eligible:
+        return None
+    # Tier 1: the canonical Player controller by name.
+    for s in eligible:
+        if s.name == "Player":
+            return s
+
+    # Tier 2: score each candidate; pick the highest-scoring controller.
+    def _score(s: "RbxScript") -> int:
+        src = s.source or ""
+        score = 0
+        for signal in ("LocalPlayer", "Character", "Humanoid",
+                       "UserInputService"):
+            if signal in src:
+                score += 1
+        # Heavy weight on ACTUAL definition of getItem — controllers
+        # define it; UI scripts that only call ``inventory.getItem``
+        # don't (and are already filtered out by the qualified-call
+        # rejection in the symbol regex; this guards the rare case
+        # where a UI script also has a bare ``getItem(...)`` call).
+        if re.search(r'\bfunction\s+(?:get|Get)Item\s*\(', src):
+            score += 3
+        return score
+
+    scored = sorted(eligible, key=_score, reverse=True)
+    if not scored:
+        return None
+    best = scored[0]
+    if _score(best) == 0:
+        # No controller signals at all — skip rather than install in
+        # a script we can't identify as a player controller.
+        return None
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -638,6 +870,346 @@ def _fix_pickup_visual_target(scripts: list["RbxScript"]) -> int:
         s.source = _PICKUP_REPLACEMENT
         fixes += 1
         log.info("  Rewired Pickup '%s' to Model-aware rotate+bob", s.name)
+    return fixes
+
+
+# ---------------------------------------------------------------------------
+# Pack: door_global_player_to_attribute
+# ---------------------------------------------------------------------------
+#
+# AI transpiles of Unity's ``Door.cs`` sometimes emit a helper of the form
+# ``if _G.Player and _G.Player.hasKey then return _G.Player.hasKey() end``
+# under the assumption that ``Player`` exposes itself as a global. Two
+# things break that assumption in the converted output:
+#
+#   1. ``Player.luau`` runs as a LocalScript — server scripts can't see
+#      its locals or globals.
+#   2. ``_G`` is per-actor in Roblox, so even a client read from a server
+#      script wouldn't cross the boundary.
+#
+# Pickup's coherence pack already writes ``player:SetAttribute("has"..itemName,
+# true)`` server-side, which DOES replicate. Rewrite the helper to read
+# that replicated attribute by deriving the player from the touching part.
+
+# Helper-style probe: ``local function fn() if _G.Player and _G.Player.hasX
+# then return _G.Player.hasX[()] end; return false end`` — captures function
+# name (group 1) and attribute name (group 2). Two trailing forms covered:
+# ``return _G.Player.hasX`` (field) and ``return _G.Player.hasX()`` (call).
+_DOOR_GLOBAL_PLAYER_HELPER_RE = re.compile(
+    r'local function (\w+)\(\)\s*\n'
+    r'\s*if _G\.Player and _G\.Player\.(\w+)\s+then\s*\n'
+    r'\s*return _G\.Player\.\2(?:\(\))?\s*\n'
+    r'\s*end\s*\n'
+    r'\s*return false\s*\n'
+    r'\s*end',
+)
+
+# Single-line ``return _G.Player and _G.Player.hasX [or false]`` body —
+# a different but equally common AI shape. Captures fn name and attribute.
+_DOOR_GLOBAL_PLAYER_RETURN_RE = re.compile(
+    r'local function (\w+)\(\)\s*\n'
+    r'\s*return _G\.Player\s+and\s+_G\.Player\.(\w+)(?:\(\))?'
+    r'(?:\s+or\s+false)?\s*\n'
+    r'\s*end',
+)
+
+# Inline-guard form: ``if _G.Player and _G.Player.hasX then …`` (no helper).
+# Captures attribute name only — there's no helper to rename. The body that
+# follows the ``then`` is rewritten to derive a player from the touching part.
+_DOOR_GLOBAL_PLAYER_INLINE_RE = re.compile(
+    r'\bif _G\.Player\s+and\s+_G\.Player\.(\w+)(?:\(\))?\s+then\b'
+)
+
+
+def _detect_door_global_player_lookup(scripts: list["RbxScript"]) -> bool:
+    for s in scripts:
+        if s.name != "Door":
+            continue
+        src = s.source or ""
+        # Cheap detector first — narrows the regex work to scripts that
+        # contain ``_G.Player`` at all. Catches every shape we rewrite below
+        # without running the slower regexes on unrelated Door variants.
+        if "_G.Player" in src:
+            return True
+    return False
+
+
+# Touched/TouchEnded callback parameter name in Connect(function(NAME)...).
+# The converter's api_mappings emits ``otherPart`` for OnTrigger*/OnCollision*
+# handlers, but AI transpiles often use ``other``. Capture whatever the
+# generated source actually used so call-site rewrites pass the right
+# argument; falling back to ``otherPart`` matches the documented convention.
+_TOUCH_CALLBACK_RE = re.compile(
+    r'(?:Touched|TouchEnded)\s*:\s*Connect\s*\(\s*function\s*\(\s*([a-zA-Z_]\w*)'
+)
+
+
+def _ensure_players_service_binding(source: str) -> str:
+    """Insert ``local Players = game:GetService("Players")`` at the top
+    of *source* if it's not already bound at file scope. The Door
+    rewrite calls ``Players:GetPlayerFromCharacter`` from outer scope
+    and would crash on the first Touched if the helper runs before a
+    nested binding has executed (or the nested binding is unreachable
+    from the outer call).
+
+    Only TOP-LEVEL bindings count — a ``local Players = ...`` inside a
+    nested function or callback isn't visible to the rewrite's outer
+    helper. Heuristic: match an assignment at column 0 (no leading
+    indentation), which corresponds to chunk-level statements in
+    well-formatted Lua. AI-transpiled output and the converter's own
+    rule-based emit both indent function bodies, so this distinguishes
+    file-level from nested bindings reliably enough.
+    """
+    if re.search(r'^(?:local\s+)?Players\s*=', source, re.MULTILINE):
+        return source
+    return 'local Players = game:GetService("Players")\n' + source
+
+
+def _resolve_touch_callback_param(source: str, default: str = "otherPart") -> str:
+    """Return the parameter name of the FIRST ``Touched``/``TouchEnded``
+    callback in *source*, defaulting to ``otherPart`` (the converter's
+    own OnTrigger*/OnCollision* convention from api_mappings.py).
+
+    Use :func:`_resolve_touch_callback_param_at` for per-position
+    resolution when the same script has multiple touch handlers with
+    different parameter names (e.g. one handler uses ``other``, another
+    uses ``otherPart``); rewriting both with one global pick would leave
+    the mismatched handler reading an undefined variable and silently
+    failing.
+    """
+    m = _TOUCH_CALLBACK_RE.search(source)
+    return m.group(1) if m else default
+
+
+# Lua block-opening keywords paired with ``end``. Counting these as
+# opens against ``end`` as closes correctly tracks nested function/if/
+# for/while bodies inside a Touched callback. Without ``if``/``for``/
+# ``while`` in the open set, an ordinary ``if cond then ... end`` inside
+# a Touched handler decrements the depth and prematurely closes the
+# callback's computed range, leaving later code in the same handler
+# treated as out-of-scope.
+#
+# ``do`` is special-cased: as a STANDALONE block (``do BODY end``) it
+# opens and pairs with ``end``, but inside ``for ... do ... end`` and
+# ``while ... do ... end`` the ``do`` is part of the loop construct and
+# is consumed by the matching ``for``/``while`` open. The scanner below
+# tracks a "loop expects do" flag so the post-loop ``do`` is not double-
+# counted.
+_LUA_BLOCK_OPEN_RE = re.compile(r'\b(?:function|if|for|while|do)\b')
+_LUA_END_RE = re.compile(r'\bend\b')
+
+
+def _touch_callback_ranges(source: str) -> list[tuple[int, int, str]]:
+    """Return the lexical ranges of every ``Touched``/``TouchEnded``
+    callback in *source* as ``(body_start, body_end, param_name)``.
+
+    ``body_start`` is the position right after the callback's opening
+    ``)`` of ``function(VAR)`` — i.e. where the body begins.
+    ``body_end`` is the position right before the matching ``end`` of
+    that callback. A position is "inside" the callback only when
+    ``body_start <= pos < body_end``; positions after ``body_end`` are
+    outside scope, so the parameter is no longer accessible there.
+
+    Implementation walks Lua block-opening tokens (``function``, ``if``,
+    ``for``, ``while``) and ``end`` tokens with a depth counter to find
+    the matching end of each callback. Imperfect against tokens in
+    strings/comments but sufficient for converter-emitted code.
+    """
+    ranges: list[tuple[int, int, str]] = []
+    for header in _TOUCH_CALLBACK_RE.finditer(source):
+        var = header.group(1)
+        # Body starts right after the closing ``)`` of ``function(VAR)``.
+        header_close = source.find(')', header.end())
+        if header_close == -1:
+            continue
+        body_start = header_close + 1
+
+        # Walk block-open/end tokens with depth counter. The header's
+        # own ``function`` is what put us at depth 1; we look for the
+        # matching ``end`` that closes the callback.
+        #
+        # ``loop_pending_do`` tracks ``for``/``while`` opens that
+        # haven't yet seen their ``do``: when the next ``do`` arrives,
+        # it's consumed by the loop and NOT counted as a separate
+        # block open. Standalone ``do ... end`` (no preceding loop)
+        # opens normally.
+        depth = 1
+        pos = body_start
+        loop_pending_do = 0
+        body_end: int | None = None
+        while pos < len(source):
+            open_m = _LUA_BLOCK_OPEN_RE.search(source, pos)
+            end_m = _LUA_END_RE.search(source, pos)
+            if end_m is None:
+                break
+            if open_m is not None and open_m.start() < end_m.start():
+                kw = open_m.group()
+                if kw == "do" and loop_pending_do > 0:
+                    # Consumed by a preceding ``for``/``while``.
+                    loop_pending_do -= 1
+                else:
+                    depth += 1
+                    if kw in ("for", "while"):
+                        loop_pending_do += 1
+                pos = open_m.end()
+                continue
+            depth -= 1
+            if depth == 0:
+                body_end = end_m.start()
+                break
+            pos = end_m.end()
+        if body_end is not None:
+            ranges.append((body_start, body_end, var))
+    return ranges
+
+
+def _resolve_touch_callback_param_at(
+    source: str, position: int,
+    ranges: list[tuple[int, int, str]] | None = None,
+) -> str | None:
+    """Return the parameter name of the ``Touched``/``TouchEnded``
+    callback that LEXICALLY ENCLOSES *position*, or ``None`` if no
+    open callback contains it.
+
+    Critical: a callback that has already CLOSED (its matching ``end``
+    appeared before *position*) does not enclose later code, even if
+    its ``function(VAR)`` header was the most recent. Without this
+    scope check, code after a touch block would borrow the now-out-of-
+    scope ``other`` and inject an undefined-variable reference at a
+    site that runs at module init.
+
+    *ranges* is an optional precomputed list (one per touch callback)
+    so callers rewriting many sites in the same source don't pay the
+    O(N) walk per site.
+    """
+    if ranges is None:
+        ranges = _touch_callback_ranges(source)
+    enclosing: tuple[int, int, str] | None = None
+    for start, end, var in ranges:
+        if start <= position < end:
+            # Innermost wins when nested touch callbacks (rare but
+            # legal): pick the range with the latest start.
+            if enclosing is None or start > enclosing[0]:
+                enclosing = (start, end, var)
+    return enclosing[2] if enclosing else None
+
+
+@patch_pack(
+    name="door_global_player_to_attribute",
+    description="Rewrite Door scripts that probe gameplay flags via "
+    "``_G.Player.hasKey()`` to read ``player:GetAttribute('hasKey')`` "
+    "instead. Player runs as a LocalScript so its globals never reach the "
+    "server-side Door, but Pickup writes a replicated server attribute "
+    "the Door can actually see. Covers three AI-transpile shapes: "
+    "``if _G.Player and _G.Player.hasX then return _G.Player.hasX() end`` "
+    "helper, ``return _G.Player and _G.Player.hasX`` helper, and inline "
+    "``if _G.Player and _G.Player.hasX then …`` guards inside Touched.",
+    detect=_detect_door_global_player_lookup,
+)
+def _fix_door_global_player_lookup(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        if s.name != "Door":
+            continue
+        if "_G.Player" not in (s.source or ""):
+            continue
+
+        original = s.source
+        captured_helpers: list[tuple[str, str]] = []
+
+        def _helper_replace(m: "re.Match[str]") -> str:
+            fn_name = m.group(1)
+            attr = m.group(2)
+            captured_helpers.append((fn_name, attr))
+            return (
+                f'local function {fn_name}(_part)\n'
+                f'    local _model = _part and _part:FindFirstAncestorOfClass("Model")\n'
+                f'    local _player = _model and Players:GetPlayerFromCharacter(_model)\n'
+                f'    if _player then return _player:GetAttribute("{attr}") end\n'
+                f'    return false\n'
+                f'end'
+            )
+
+        # Apply both helper shapes. Each appends to ``captured_helpers`` so
+        # call-site fixups below pass the touching part to the now-arg-required fn.
+        s.source = _DOOR_GLOBAL_PLAYER_HELPER_RE.sub(_helper_replace, s.source)
+        s.source = _DOOR_GLOBAL_PLAYER_RETURN_RE.sub(_helper_replace, s.source)
+
+        # Resolve the callback parameter PER call site, not once for the
+        # whole file. Doors with multiple handlers can use different
+        # names (e.g. ``Touched(function(other)`` and
+        # ``TouchEnded(function(otherPart)``) — using a global pick would
+        # rewrite the mismatched handler with the wrong variable, so its
+        # GetAttribute check always evaluates falsy and that branch never
+        # runs. ``_rewrite_in_place_with_callback`` walks each match in
+        # source order and resolves the closest preceding ``Touched``/
+        # ``TouchEnded`` callback's parameter name for each. Sites with
+        # no preceding callback are left unchanged so we don't inject
+        # an undefined variable into init-time helper calls (e.g.
+        # ``print(getPlayerHasKey())``); the rewritten helper's nil-arg
+        # early-return handles those naturally.
+        def _rewrite_in_place_with_callback(
+            source: str,
+            pattern: re.Pattern[str],
+            replacer: "Callable[[re.Match[str], str], str]",
+        ) -> str:
+            # Precompute callback ranges once per source — both helpers
+            # below iterate the same source and pay O(N) per call site
+            # otherwise. Ranges respect lexical scope: a position past a
+            # closed callback's matching ``end`` is outside that callback.
+            ranges = _touch_callback_ranges(source)
+            pieces: list[str] = []
+            cursor = 0
+            for m in pattern.finditer(source):
+                cb = _resolve_touch_callback_param_at(
+                    source, m.start(), ranges=ranges,
+                )
+                if cb is None:
+                    # Outside any touch handler — leave the match alone.
+                    continue
+                pieces.append(source[cursor:m.start()])
+                pieces.append(replacer(m, cb))
+                cursor = m.end()
+            pieces.append(source[cursor:])
+            return ''.join(pieces)
+
+        for fn_name, _attr in captured_helpers:
+            call_re = re.compile(rf'\b{re.escape(fn_name)}\(\)')
+            s.source = _rewrite_in_place_with_callback(
+                s.source,
+                call_re,
+                lambda _m, cb, fn=fn_name: f'{fn}({cb})',
+            )
+
+        # Inline-guard rewrite: ``if _G.Player and _G.Player.hasX then`` →
+        # self-invoking lambda that derives the player from the surrounding
+        # Touched/TouchEnded callback's parameter. Per-position resolution
+        # ensures each guard inside its own handler picks the right name.
+        # Inline guards outside any touch handler are skipped — there's no
+        # ``other``/``otherPart`` in scope to derive a player from, and
+        # rewriting them would inject an undefined variable.
+        s.source = _rewrite_in_place_with_callback(
+            s.source,
+            _DOOR_GLOBAL_PLAYER_INLINE_RE,
+            lambda m, cb: (
+                f'if (function() '
+                f'local _m = {cb} and {cb}:FindFirstAncestorOfClass("Model"); '
+                f'local _p = _m and Players:GetPlayerFromCharacter(_m); '
+                f'return _p and _p:GetAttribute("{m.group(1)}") '
+                f'end)() then'
+            ),
+        )
+
+        # Ensure Players is bound — both rewrites call
+        # ``Players:GetPlayerFromCharacter`` and a Door that previously only
+        # used ``_G.Player.hasKey()`` may have skipped the service binding.
+        s.source = _ensure_players_service_binding(s.source)
+
+        if s.source != original:
+            fixes += 1
+            log.info(
+                "  Rewrote Door _G.Player gameplay-flag lookups in '%s'", s.name,
+            )
     return fixes
 
 
