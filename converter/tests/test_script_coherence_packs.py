@@ -751,6 +751,48 @@ class TestPickupRemoteEventDetectorIsGenreAgnostic:
         util = scripts[1]
         assert "PickupItemEvent" not in util.source
 
+    def test_client_listener_skips_substring_only_match(self) -> None:
+        """Codex finding [P1] (round 4): a LocalScript that mentions
+        ``getItemModule`` (or any identifier containing the substring
+        ``getItem``) but never defines or calls ``getItem`` itself was
+        being matched by the previous loose substring check. The
+        listener body calls ``getItem(itemName)`` — which doesn't exist
+        in such scripts — and crashes on the first pickup event.
+
+        The fix: require ``getItem(`` or ``GetItem(`` as a real symbol
+        (word-boundary match).
+        """
+        scripts = [
+            RbxScript(
+                name="Pickup",
+                source=(
+                    'triggerPart.Touched:Connect(function(otherPart)\n'
+                    '    local character = otherPart:FindFirstAncestorOfClass("Model")\n'
+                    '    character:SetAttribute("GetItem", itemName)\n'
+                    'end)\n'
+                ),
+                script_type="Script",
+            ),
+            # HudControl-style LocalScript — defines getItemModule, not getItem.
+            RbxScript(
+                name="HudControl",
+                source=(
+                    'local function getItemModule()\n'
+                    '    return require(script.Parent.ItemModule)\n'
+                    'end\n'
+                    'getItemModule()\n'
+                ),
+                script_type="LocalScript",
+            ),
+        ]
+        run_packs(scripts)
+        hud = scripts[1]
+        assert "PickupItemEvent" not in hud.source, (
+            "loose substring match injected listener that calls "
+            "getItem(itemName) — a function this script doesn't define"
+        )
+        assert ":WaitForChild(\"PickupItemEvent\"" not in hud.source
+
     def test_client_listener_installs_in_non_fps_player_script(self) -> None:
         """Codex finding [P1] (round 2): the client listener used to
         require BOTH ``getItem`` and ``getRifle``. Non-FPS projects with
@@ -874,6 +916,69 @@ class TestPickupRemoteEventDetectorIsGenreAgnostic:
         assert "print(\"init:\", getPlayerHasKey())" in s.source
         # The in-touch call site must still get its callback param.
         assert "if getPlayerHasKey(other) then" in s.source
+
+    def test_helper_calls_after_closed_touch_block_not_rewritten(self) -> None:
+        """Codex finding [P1] (round 4): a helper call AFTER a touch
+        callback's matching ``end`` is no longer in the callback's
+        scope. The previous resolver's "closest preceding header" pick
+        would borrow the now-out-of-scope ``other``, injecting an
+        undefined variable. Scope-aware ranges check enclosure, not
+        proximity.
+        """
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'local function getPlayerHasKey()\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        return _G.Player.hasKey()\n'
+                '    end\n'
+                '    return false\n'
+                'end\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    if getPlayerHasKey() then toggleDoor(true) end\n'
+                'end)\n'
+                '-- This call is AFTER the touched block closed:\n'
+                'print("debug:", getPlayerHasKey())\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._fix_door_global_player_lookup([s])
+        # The in-touch site is rewritten with ``other``.
+        assert "if getPlayerHasKey(other) then" in s.source
+        # The post-block call must NOT have ``other`` injected — that
+        # would reference an out-of-scope variable.
+        assert 'print("debug:", getPlayerHasKey())' in s.source
+
+    def test_inline_guards_after_closed_touch_block_not_rewritten(self) -> None:
+        """Same scope rule for inline guards: a guard after the touch
+        callback's matching ``end`` should not borrow the closed
+        callback's parameter."""
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'triggerPart.Touched:Connect(function(other)\n'
+                '    if _G.Player and _G.Player.hasKey then\n'
+                '        toggleDoor(true)\n'
+                '    end\n'
+                'end)\n'
+                '-- This guard is AFTER the touched block closed:\n'
+                'if _G.Player and _G.Player.hasKey then\n'
+                '    error("must not run before touched")\n'
+                'end\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._fix_door_global_player_lookup([s])
+        # In-touch guard rewritten correctly.
+        touched_idx = s.source.index("Touched:Connect")
+        in_touch = s.source[touched_idx:s.source.index("end)")]
+        assert 'other and other:FindFirstAncestorOfClass' in in_touch
+        # Post-block guard left alone (the body still has _G.Player —
+        # it's broken but not introducing an undefined-variable error).
+        post_block = s.source[s.source.index("end)") + len("end)"):]
+        assert 'other and other:FindFirstAncestorOfClass' not in post_block
 
     def test_skips_inline_guards_outside_touch_handlers(self) -> None:
         """Same outside-touch rule applies to inline ``_G.Player`` guards

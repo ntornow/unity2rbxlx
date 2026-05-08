@@ -450,6 +450,13 @@ def _detect_pickup_setattribute_pattern(scripts: list["RbxScript"]) -> bool:
     )
 
 
+# Match ``getItem(`` or ``GetItem(`` as a standalone symbol — a real
+# function definition or call. ``\b`` before excludes ``getitem`` inside
+# longer identifiers; ``\(`` after excludes ``getItemModule(`` because
+# the trailing ``M`` blocks the open-paren from following the ``Item``.
+_GETITEM_SYMBOL_RE = re.compile(r'\b(?:get|Get)Item\s*\(')
+
+
 def _detect_pickup_remote_event_in_use(scripts: list["RbxScript"]) -> bool:
     """Detector for ``pickup_remote_event_client``.
 
@@ -638,21 +645,23 @@ def _add_pickup_remote_listener(scripts: list["RbxScript"]) -> int:
         # legitimately define a ``GetItem`` helper for their own purposes.
         if s.script_type != "LocalScript":
             continue
-        # Detect a Player-style controller by name presence: AI transpilation
-        # emits Lua-conventional camelCase (`getItem`) while earlier
-        # rule-based output kept C# Title-case (`GetItem`). Match either by
-        # lowering the search. ``getRifle`` is no longer required — the
-        # listener installs in any LocalScript with a ``getItem`` dispatch
-        # so non-FPS projects (RPG key pickups, platformer health pickups,
-        # etc.) don't silently drop their client-side pickup handling.
-        src_lower = s.source.lower()
-        if 'getitem' not in src_lower:
+        # Detect a Player-style controller by an EXACT ``getItem``/
+        # ``GetItem`` symbol — definition or call. A loose substring
+        # match (the previous gate) sweeps up unrelated identifiers like
+        # ``getItemModule`` and injects a listener whose
+        # ``getItem(itemName)`` body refers to a function that doesn't
+        # exist, raising on the first pickup event. The word-boundary
+        # patterns below match ``getItem(``, ``GetItem(``, and
+        # ``function getItem`` / ``function GetItem``; they reject
+        # ``getItemModule(`` because the trailing ``M`` blocks the
+        # ``\(`` after the symbol.
+        if not _GETITEM_SYMBOL_RE.search(s.source or ""):
             continue
         if 'PickupItemEvent' in s.source:
             continue
         # Pick whichever casing the script already uses for the dispatch call
         # so we don't introduce an undefined identifier.
-        get_item_name = 'getItem' if 'getItem' in s.source else 'GetItem'
+        get_item_name = 'getItem' if re.search(r'\bgetItem\b', s.source) else 'GetItem'
         listener = (
             '\n-- Pickup via RemoteEvent (server fires when player touches pickup)\n'
             'local _pickupEvt = game:GetService("ReplicatedStorage"):WaitForChild("PickupItemEvent", 5)\n'
@@ -821,30 +830,91 @@ def _resolve_touch_callback_param(source: str, default: str = "otherPart") -> st
     return m.group(1) if m else default
 
 
-def _resolve_touch_callback_param_at(
-    source: str, position: int
-) -> str | None:
-    """Return the parameter name of the closest ``Touched``/``TouchEnded``
-    callback whose ``Connect(function(VAR)`` opens before *position*,
-    or ``None`` if no such callback precedes it.
+# Function/end token boundaries — used by the touch-callback range
+# scanner below. Word-boundary matches reject substrings like ``endpoint``
+# or ``functions``; they're imperfect against tokens inside string
+# literals or comments but the converter's outputs don't realistically
+# embed Lua keywords in those contexts.
+_LUA_FUNCTION_OPEN_RE = re.compile(r'\bfunction\b\s*\(')
+_LUA_END_RE = re.compile(r'\bend\b')
 
-    A ``None`` return means the call site is outside any touch handler
-    (e.g. during script init: ``print(getPlayerHasKey())``). Callers
-    must NOT inject ``otherPart`` as a fallback in that case — that
-    would reference an undefined variable and silently force the
-    helper down its nil-arg branch. Leaving the call site at zero args
-    instead lets the helper's nil-arg early-return handle it cleanly.
 
-    Crude AST: brace counting is overkill because Roblox scripts that
-    use the rewritten helper exclusively in non-touch contexts are
-    rare (and codex flagged this as the failure mode). The closest
-    preceding match is "good enough" for in-touch sites; the absence
-    of a preceding match unambiguously signals an outside-touch site.
+def _touch_callback_ranges(source: str) -> list[tuple[int, int, str]]:
+    """Return the lexical ranges of every ``Touched``/``TouchEnded``
+    callback in *source* as ``(body_start, body_end, param_name)``.
+
+    ``body_start`` is the position right after the callback's opening
+    ``)`` of ``function(VAR)`` — i.e. where the body begins.
+    ``body_end`` is the position right before the matching ``end`` of
+    that callback. A position is "inside" the callback only when
+    ``body_start <= pos < body_end``; positions after ``body_end`` are
+    outside scope, so the parameter is no longer accessible there.
+
+    Implementation walks ``function``/``end`` tokens to find the matching
+    end of each callback. Imperfect against tokens in strings/comments
+    but sufficient for converter-emitted code.
     """
-    last_match: re.Match[str] | None = None
-    for m in _TOUCH_CALLBACK_RE.finditer(source, 0, position):
-        last_match = m
-    return last_match.group(1) if last_match else None
+    ranges: list[tuple[int, int, str]] = []
+    for header in _TOUCH_CALLBACK_RE.finditer(source):
+        var = header.group(1)
+        # Body starts right after the closing ``)`` of ``function(VAR)``.
+        header_close = source.find(')', header.end())
+        if header_close == -1:
+            continue
+        body_start = header_close + 1
+
+        # Walk function/end tokens with depth counter.
+        depth = 1
+        pos = body_start
+        body_end: int | None = None
+        while pos < len(source):
+            fn_m = _LUA_FUNCTION_OPEN_RE.search(source, pos)
+            end_m = _LUA_END_RE.search(source, pos)
+            if end_m is None:
+                break
+            if fn_m is not None and fn_m.start() < end_m.start():
+                depth += 1
+                pos = fn_m.end()
+                continue
+            depth -= 1
+            if depth == 0:
+                body_end = end_m.start()
+                break
+            pos = end_m.end()
+        if body_end is not None:
+            ranges.append((body_start, body_end, var))
+    return ranges
+
+
+def _resolve_touch_callback_param_at(
+    source: str, position: int,
+    ranges: list[tuple[int, int, str]] | None = None,
+) -> str | None:
+    """Return the parameter name of the ``Touched``/``TouchEnded``
+    callback that LEXICALLY ENCLOSES *position*, or ``None`` if no
+    open callback contains it.
+
+    Critical: a callback that has already CLOSED (its matching ``end``
+    appeared before *position*) does not enclose later code, even if
+    its ``function(VAR)`` header was the most recent. Without this
+    scope check, code after a touch block would borrow the now-out-of-
+    scope ``other`` and inject an undefined-variable reference at a
+    site that runs at module init.
+
+    *ranges* is an optional precomputed list (one per touch callback)
+    so callers rewriting many sites in the same source don't pay the
+    O(N) walk per site.
+    """
+    if ranges is None:
+        ranges = _touch_callback_ranges(source)
+    enclosing: tuple[int, int, str] | None = None
+    for start, end, var in ranges:
+        if start <= position < end:
+            # Innermost wins when nested touch callbacks (rare but
+            # legal): pick the range with the latest start.
+            if enclosing is None or start > enclosing[0]:
+                enclosing = (start, end, var)
+    return enclosing[2] if enclosing else None
 
 
 @patch_pack(
@@ -906,10 +976,17 @@ def _fix_door_global_player_lookup(scripts: list["RbxScript"]) -> int:
             pattern: re.Pattern[str],
             replacer: "Callable[[re.Match[str], str], str]",
         ) -> str:
+            # Precompute callback ranges once per source — both helpers
+            # below iterate the same source and pay O(N) per call site
+            # otherwise. Ranges respect lexical scope: a position past a
+            # closed callback's matching ``end`` is outside that callback.
+            ranges = _touch_callback_ranges(source)
             pieces: list[str] = []
             cursor = 0
             for m in pattern.finditer(source):
-                cb = _resolve_touch_callback_param_at(source, m.start())
+                cb = _resolve_touch_callback_param_at(
+                    source, m.start(), ranges=ranges,
+                )
                 if cb is None:
                     # Outside any touch handler — leave the match alone.
                     continue
