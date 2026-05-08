@@ -66,6 +66,27 @@ def _carry_unconverted(
     carrier.extend(entries)
 
 
+def _scene_needs_collision_recook(parts: list) -> bool:
+    """Walk the part tree and return True if any MeshPart has a
+    non-Default ``collision_fidelity`` set.
+
+    Used by ``_subphase_inject_autogen_scripts`` to decide whether to
+    add the ``CollisionFidelityRecook`` script. Most projects will
+    need it (door frames, archways, fences, prefab models all set
+    Hull or PreciseConvexDecomposition); skipping the inject when no
+    parts need it keeps the script out of all-cube/Block-fidelity
+    scenes for a slightly smaller place file.
+    """
+    for p in parts:
+        coll_fid = getattr(p, "collision_fidelity", None)
+        if coll_fid is not None and coll_fid != 0 and getattr(p, "mesh_id", None):
+            return True
+        children = getattr(p, "children", None) or []
+        if children and _scene_needs_collision_recook(children):
+            return True
+    return False
+
+
 @dataclass
 class PipelineState:
     """Intermediate state passed between pipeline phases."""
@@ -1898,6 +1919,31 @@ return table.concat(allData, "\\n")'''
         if not existing_server_mgr:
             self.state.rbx_place.scripts.append(generate_game_server_script())
             log.info("[write_output] Injected GameServerManager script")
+
+        # Auto-generate CollisionFidelityRecook server script when ANY
+        # MeshPart in the scene has a non-Default ``collision_fidelity``.
+        # The rbxlx_writer attaches a ``_DesiredCollisionFidelity``
+        # attribute on those parts; the script reads it at game start
+        # and recreates the part via CreateMeshPartAsync to actually
+        # cook the collision mesh. Without this, locally-loaded rbxlx
+        # files leave Hull/PreciseConvexDecomposition parts with Box
+        # collision (Roblox doesn't re-cook on property assignment),
+        # producing invisible bounding-box blockers behind hollow
+        # shapes like door frames.
+        from converter.fps_client_generator import (
+            generate_collision_fidelity_recook_script,
+        )
+        existing_recook = [
+            s for s in self.state.rbx_place.scripts
+            if s.name == "CollisionFidelityRecook"
+        ]
+        if not existing_recook and _scene_needs_collision_recook(
+            self.state.rbx_place.workspace_parts or []
+        ):
+            self.state.rbx_place.scripts.append(
+                generate_collision_fidelity_recook_script()
+            )
+            log.info("[write_output] Injected CollisionFidelityRecook script")
 
         # Bootstrap: generate a LocalScript that requires ModuleScripts with
         # side-effects (RenderStepped/Heartbeat connections, mouse lock, etc.)

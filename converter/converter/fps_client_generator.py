@@ -858,6 +858,121 @@ print("[CollisionGroups] Setup complete:", createdGroups)
     )
 
 
+def generate_collision_fidelity_recook_script() -> RbxScript:
+    """Generate a server Script that re-cooks MeshPart collision at game start.
+
+    Roblox doesn't re-cook collision when ``CollisionFidelity`` is set
+    via the property — only ``AssetService:CreateMeshPartAsync(meshId,
+    {CollisionFidelity = …})`` actually generates a cooked physics
+    asset. So a freshly-loaded place with non-Default fidelity in the
+    rbxlx silently snaps every MeshPart's collision back to ``Box``,
+    leaving invisible bounding-box blockers behind shapes that should
+    have hollow geometry (door frames, archways, fences, etc.).
+
+    The rbxlx writer marks each affected MeshPart with the attribute
+    ``_DesiredCollisionFidelity = "<EnumName>"``. This script iterates
+    every such part on game start, calls CreateMeshPartAsync with the
+    right option dict, transfers properties + children + parent over,
+    and destroys the old part. The result behaves like the live
+    published place's chunked-builder cook (``luau_place_builder.py``)
+    but for locally-loaded rbxlx files where that path doesn't run.
+
+    Failures are logged and the original part is kept as-is; the script
+    never raises and never crashes the place if a single mesh fails to
+    cook.
+    """
+    source = '''\
+-- CollisionFidelityRecook (auto-generated)
+--
+-- Roblox doesn't re-cook MeshPart collision when CollisionFidelity is
+-- set via the property — only AssetService:CreateMeshPartAsync(meshId,
+-- {CollisionFidelity = ...}) actually generates a cooked physics
+-- asset. The rbxlx writer marks parts that need recooking with the
+-- attribute ``_DesiredCollisionFidelity``; this script performs the
+-- cook at game start so locally-loaded rbxlx files behave like the
+-- live published place.
+
+local AssetService = game:GetService("AssetService")
+
+local function _propsFromOld(old)
+    return {
+        Name = old.Name,
+        CFrame = old.CFrame,
+        Size = old.Size,
+        Anchored = old.Anchored,
+        CanCollide = old.CanCollide,
+        CanQuery = old.CanQuery,
+        CanTouch = old.CanTouch,
+        Massless = old.Massless,
+        Transparency = old.Transparency,
+        Reflectance = old.Reflectance,
+        Material = old.Material,
+        Color = old.Color,
+        TextureID = old.TextureID,
+    }
+end
+
+local function _recookOne(old)
+    local meshId = old.MeshId
+    if not meshId or meshId == "" then return false end
+    local desired = old:GetAttribute("_DesiredCollisionFidelity")
+    if not desired then return false end
+    local fidEnum
+    local ok = pcall(function()
+        fidEnum = Enum.CollisionFidelity[desired]
+    end)
+    if not ok or not fidEnum then return false end
+
+    local newOk, newPart = pcall(function()
+        return AssetService:CreateMeshPartAsync(meshId, {
+            CollisionFidelity = fidEnum,
+        })
+    end)
+    if not newOk or not newPart then
+        warn("[CollisionFidelityRecook] failed to cook " .. old:GetFullName()
+            .. " — " .. tostring(newPart))
+        return false
+    end
+
+    -- Transfer properties + children + parent.
+    local props = _propsFromOld(old)
+    for k, v in pairs(props) do
+        pcall(function() (newPart :: any)[k] = v end)
+    end
+    -- Move children (SurfaceAppearance, Welds, Sounds, Scripts, etc.)
+    -- before reparenting so the new part inherits the same hierarchy.
+    for _, child in ipairs(old:GetChildren()) do
+        child.Parent = newPart
+    end
+    newPart.Parent = old.Parent
+    -- Strip the marker so re-runs don't double-cook.
+    pcall(function() newPart:SetAttribute("_DesiredCollisionFidelity", nil) end)
+    old:Destroy()
+    return true
+end
+
+local cooked, failed = 0, 0
+for _, m in ipairs(workspace:GetDescendants()) do
+    if m:IsA("MeshPart") and m:GetAttribute("_DesiredCollisionFidelity") then
+        if _recookOne(m) then
+            cooked = cooked + 1
+        else
+            failed = failed + 1
+        end
+    end
+end
+
+if cooked > 0 or failed > 0 then
+    print(("[CollisionFidelityRecook] cooked=%d failed=%d"):format(cooked, failed))
+end
+'''
+    return RbxScript(
+        name="CollisionFidelityRecook",
+        source=source,
+        script_type="Script",
+    )
+
+
 def inject_fps_scripts(place: RbxPlace) -> int:
     """If the game is FPS-style, inject client controller, HUD script, and HUD ScreenGui.
 
