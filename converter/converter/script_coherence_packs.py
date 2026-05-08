@@ -495,17 +495,49 @@ def _convert_pickup_to_remote_event(scripts: list["RbxScript"]) -> int:
                 "  Promoted %d Pickup script:GetAttribute reads to walk-up search",
                 count2,
             )
+    return fixes
 
-        # Some AI variants skip SetAttribute entirely and emit their own
-        # RemoteEvent (e.g. ``PickupGetItem``) created at script init. Player
-        # listens on the canonical ``PickupItemEvent`` (injected by the
-        # _add_pickup_remote_listener pack), so a non-canonical name leaves
-        # the two sides talking past each other. Rewrite any RemoteEvent
-        # named ``Pickup*`` in a Pickup script to the canonical name.
-        re_alias_pattern = re.compile(
-            r'"(Pickup(?:GetItem|Get|Event|Item|Remote))"'
-        )
+
+# ---------------------------------------------------------------------------
+# Pack: pickup_remote_event_canonical_name
+# ---------------------------------------------------------------------------
+#
+# Lifted out of the FPS-rifle gate so it applies to any project that has a
+# Pickup-named server script (RPGs, platformers, FPSes — pickups are a
+# generic Unity gameplay convention). Independent AI passes invent
+# different RemoteEvent names for the same producer/consumer pair
+# (``PickupGetItem`` on the server-side Pickup, ``PickupItemEvent`` on the
+# client-side listener); without canonicalization the two sides don't
+# talk to each other.
+_PICKUP_REMOTE_ALIAS_RE = re.compile(
+    r'"(Pickup(?:GetItem|Get|Event|Item|Remote))"'
+)
+
+
+def _detect_pickup_script_with_remote_alias(scripts: list["RbxScript"]) -> bool:
+    for s in scripts:
+        if s.name != "Pickup":
+            continue
+        if _PICKUP_REMOTE_ALIAS_RE.search(s.source or ""):
+            return True
+    return False
+
+
+@patch_pack(
+    name="pickup_remote_event_canonical_name",
+    description="Canonicalize any ``Pickup*`` RemoteEvent name in a "
+    "Pickup-named script to ``PickupItemEvent`` so the consumer-side "
+    "listener (which the producer/consumer bridge or _add_pickup_remote_listener "
+    "wires up) actually fires.",
+    detect=_detect_pickup_script_with_remote_alias,
+)
+def _canonicalize_pickup_remote_event(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        if s.name != "Pickup":
+            continue
         renamed = 0
+
         def _alias_replace(m: "re.Match[str]") -> str:
             nonlocal renamed
             if m.group(1) == "PickupItemEvent":
@@ -513,9 +545,9 @@ def _convert_pickup_to_remote_event(scripts: list["RbxScript"]) -> int:
             renamed += 1
             return '"PickupItemEvent"'
 
-        new_src3 = re_alias_pattern.sub(_alias_replace, s.source)
+        new_src = _PICKUP_REMOTE_ALIAS_RE.sub(_alias_replace, s.source)
         if renamed:
-            s.source = new_src3
+            s.source = new_src
             fixes += renamed
             log.info(
                 "  Canonicalized %d Pickup RemoteEvent name(s) to PickupItemEvent",
@@ -813,95 +845,145 @@ def _add_trigger_stay_polling(scripts: list["RbxScript"]) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Pack: hud_player_bindable_events
+# Pack: producer_consumer_bindable_events
 # ---------------------------------------------------------------------------
+#
+# Generic event-bridge: when an AI-transpiled script declares an anonymous
+# ``local <var> = Instance.new("BindableEvent")`` and uses ``<var>:Fire(…)``
+# locally, AND a sibling script looks up an event in ReplicatedStorage by
+# name (either ``FindFirstChild/WaitForChild("Foo")`` directly or a
+# ``resolveEvent("Foo")``-style helper that takes a string), the two sides
+# are talking past each other. The producer publishes nowhere, the consumer
+# subscribes to nothing.
+#
+# Common origin: Unity static C# events (``Player.HealthUpdate +=``) split
+# across files at transpile time — the producer side becomes anonymous
+# BindableEvents in one script, the consumer side becomes name-based lookups
+# in another. SimpleFPS Player/HudControl is one example, but the same
+# split shows up in any project that used static event handlers.
+#
+# Algorithm: in each script, find ``Instance.new("BindableEvent")``
+# declarations followed by ``:Fire(…)`` calls on the same variable; in
+# every script, find every literal RemoteEvent/BindableEvent name looked
+# up in ReplicatedStorage. Match by stem (``healthUpdateEvent`` →
+# ``HealthUpdate`` after camelCase→PascalCase plus ``Event`` suffix
+# stripping). When a producer's stem matches a consumer's lookup name,
+# rewrite the producer declaration to publish under that consumer name.
 
-# Maps the lowercase BindableEvent variable suffix the AI typically emits in
-# Player.luau (``healthUpdateEvent``, ``ammoUpdateEvent``, …) to the
-# CamelCase name that HUD-style consumers look up via
-# ``ReplicatedStorage:FindFirstChild("HealthUpdate")``. The two sides are
-# wired independently by the AI and don't agree on naming, so without this
-# pack the HUD never receives Player-side updates.
-_PLAYER_HUD_EVENT_NAMES = {
-    "healthUpdateEvent": "HealthUpdate",
-    "ammoUpdateEvent": "AmmoUpdate",
-    "itemUpdateEvent": "ItemUpdate",
-    "pauseEvent": "PauseEvent",
-}
+_BINDABLE_DECL_RE = re.compile(
+    r'^(\s*local\s+(\w+)\s*=\s*Instance\.new\(\s*["\']BindableEvent["\']\s*\)\s*)$',
+    re.MULTILINE,
+)
+_RS_EVENT_LOOKUP_RE = re.compile(
+    r'(?:FindFirstChild|WaitForChild|resolveEvent)\s*\(\s*"([A-Z]\w+)"',
+)
 
 
-def _detect_player_hud_events(scripts: list["RbxScript"]) -> bool:
-    has_player = False
-    has_hud = False
+def _producer_stem(var: str) -> str:
+    """Map a producer var name to the PascalCase stem the consumer side
+    is most likely looking up. ``healthUpdateEvent`` -> ``HealthUpdate``,
+    ``pauseEvent`` -> ``Pause`` (so it matches a ``Pause``/``PauseEvent``
+    consumer lookup; we try both forms at match time)."""
+    if not var:
+        return ""
+    stem = var
+    if stem.endswith("Event"):
+        stem = stem[: -len("Event")]
+    if not stem:
+        stem = var
+    return stem[:1].upper() + stem[1:]
+
+
+def _detect_producer_consumer_events(scripts: list["RbxScript"]) -> bool:
+    has_producer = False
+    has_consumer = False
     for s in scripts:
         src = s.source or ""
-        if any(v in src for v in _PLAYER_HUD_EVENT_NAMES) and \
-                'Instance.new("BindableEvent")' in src:
-            has_player = True
-        # HUD-style consumer: looks up event names in ReplicatedStorage by
-        # name. Match either the literal ``FindFirstChild("Foo")`` form or a
-        # ``resolveEvent("Foo")``-style helper that takes the string as an
-        # argument — both produce the same lookup at runtime.
-        for n in _PLAYER_HUD_EVENT_NAMES.values():
-            if (
-                f'FindFirstChild("{n}")' in src
-                or f'WaitForChild("{n}")' in src
-                or (
-                    f'"{n}"' in src
-                    and "ReplicatedStorage" in src
-                    and ("FindFirstChild" in src or "WaitForChild" in src)
-                )
-            ):
-                has_hud = True
-                break
-        if has_player and has_hud:
+        if 'Instance.new("BindableEvent")' in src and ":Fire(" in src:
+            has_producer = True
+        if (
+            "ReplicatedStorage" in src
+            and ("FindFirstChild" in src or "WaitForChild" in src)
+            and _RS_EVENT_LOOKUP_RE.search(src)
+        ):
+            has_consumer = True
+        if has_producer and has_consumer:
             return True
     return False
 
 
 @patch_pack(
-    name="hud_player_bindable_events",
-    description="Publish Player.luau's anonymous BindableEvents to "
-    "ReplicatedStorage under the names HudControl.luau expects, so HUD "
-    "subscribers actually receive health/ammo/item updates.",
-    detect=_detect_player_hud_events,
+    name="producer_consumer_bindable_events",
+    description="Publish anonymous BindableEvents (Producer side) to "
+    "ReplicatedStorage under the names ReplicatedStorage:FindFirstChild "
+    "consumers expect. Bridges Unity static events split across "
+    "AI-transpiled scripts without producer/consumer name agreement.",
+    detect=_detect_producer_consumer_events,
 )
-def _publish_player_hud_events(scripts: list["RbxScript"]) -> int:
+def _publish_producer_consumer_events(scripts: list["RbxScript"]) -> int:
+    # Step 1: collect every event name the consumer side looks up in
+    # ReplicatedStorage. Capitalized first letter to filter out variable
+    # references like ``FindFirstChild(name)``.
+    consumer_names: set[str] = set()
+    for s in scripts:
+        for m in _RS_EVENT_LOOKUP_RE.finditer(s.source or ""):
+            consumer_names.add(m.group(1))
+
+    if not consumer_names:
+        return 0
+
+    # Step 2: in each script, find producers (anonymous BindableEvent + Fire)
+    # whose stems match a consumer lookup. Skip producers already named.
     fixes = 0
-    decl_re = re.compile(
-        r'^(\s*local\s+(' + '|'.join(map(re.escape, _PLAYER_HUD_EVENT_NAMES))
-        + r')\s*=\s*Instance\.new\(\s*["\']BindableEvent["\']\s*\)\s*)$',
-        re.MULTILINE,
-    )
     for s in scripts:
         if 'Instance.new("BindableEvent")' not in s.source:
             continue
         original = s.source
-        seen: set[str] = set()
+        published: dict[str, str] = {}  # var -> consumer name
+
+        for m in _BINDABLE_DECL_RE.finditer(s.source):
+            var = m.group(2)
+            # Require the producer to actually fire the event, otherwise
+            # we'd hijack an unrelated BindableEvent (e.g. a private
+            # debug helper).
+            if not re.search(rf'\b{re.escape(var)}\s*:\s*Fire\b', s.source):
+                continue
+            stem = _producer_stem(var)
+            # Try the stripped stem (``HealthUpdate``) and the literal stem
+            # without ``Event`` suffix removal (``Pause`` for ``pauseEvent``)
+            # as well as ``<stem>Event`` (``PauseEvent``).
+            candidates = {stem, stem + "Event"}
+            for cand in candidates:
+                if cand in consumer_names:
+                    published[var] = cand
+                    break
+
+        if not published:
+            continue
 
         def _replace(m: "re.Match[str]") -> str:
             decl, var = m.group(1), m.group(2)
-            event_name = _PLAYER_HUD_EVENT_NAMES.get(var)
-            if not event_name or var in seen:
+            consumer = published.get(var)
+            if not consumer:
                 return decl
-            seen.add(var)
             return (
                 f'{decl}\n'
-                f'{var}.Name = "{event_name}"\n'
+                f'{var}.Name = "{consumer}"\n'
                 f'do local _existing = game:GetService("ReplicatedStorage")'
-                f':FindFirstChild("{event_name}"); '
+                f':FindFirstChild("{consumer}"); '
                 f'if _existing and _existing:IsA("BindableEvent") then '
                 f'{var}:Destroy(); {var} = _existing else '
                 f'{var}.Parent = game:GetService("ReplicatedStorage") end end'
             )
 
-        s.source = decl_re.sub(_replace, s.source)
-        if s.source != original and seen:
+        s.source = _BINDABLE_DECL_RE.sub(_replace, s.source)
+        if s.source != original:
             fixes += 1
             log.info(
-                "  Published %d Player BindableEvent(s) to ReplicatedStorage "
-                "in '%s': %s",
-                len(seen), s.name, ", ".join(sorted(seen)),
+                "  Published %d BindableEvent(s) to ReplicatedStorage in "
+                "'%s': %s",
+                len(published), s.name,
+                ", ".join(f"{v}->{n}" for v, n in sorted(published.items())),
             )
     return fixes
 
