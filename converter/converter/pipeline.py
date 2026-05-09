@@ -255,7 +255,22 @@ class Pipeline:
         # migration signal — documented as a known limitation; the
         # workaround is to pass ``--scaffolding=fps`` explicitly on
         # rebuild, which the publish CLI surfaces.
-        is_multi_scene = bool(self.ctx.selected_scene)
+        #
+        # Multi-scene detection: ``ctx.selected_scene`` alone is NOT a
+        # reliable signal — it's set on every run including ordinary
+        # single-scene conversions (``Pipeline.run_all`` populates it
+        # at line 710). The discriminator is ``scenes_metadata``,
+        # which is only populated by ``run_all_scenes``'s per-scene
+        # loop and persists across resumes. Falling back to the disk
+        # shape catches the rare case where ctx was wiped but per-
+        # scene rbxlx files remain.
+        is_multi_scene = bool(self.ctx.scenes_metadata) or (
+            sum(
+                1 for p in self.output_dir.glob("*.rbxlx")
+                if p.name != "converted_place.rbxlx"
+            )
+            >= 1
+        )
         scripts_dir = self.output_dir / "scripts"
         if scripts_dir.is_dir() and not is_multi_scene:
             # Recognised auto-gen filenames across pipeline eras:
@@ -2463,12 +2478,22 @@ return table.concat(allData, "\\n")'''
             "AutoFpsHudController", "FPSController", "HUDController",
             "FpsClient",
         }
+        # ``AutoFpsEventDispatch`` is an FPS-only ModuleScript whose
+        # source has no per-line marker comment — its name is the
+        # marker by design (the ``AutoFps`` prefix is converter-owned
+        # namespace, distinct from a user-authored ``EventDispatch``).
+        # Pruning by name only is safe because the prefix itself
+        # signals auto-gen origin.
+        fps_name_only = {"AutoFpsEventDispatch"}
         original = self.state.rbx_place.scripts
         kept = [
             s for s in original
             if not (
-                s.name in fps_names
-                and any(m in s.source[:512] for m in fps_markers)
+                (
+                    s.name in fps_names
+                    and any(m in s.source[:512] for m in fps_markers)
+                )
+                or s.name in fps_name_only
             )
         ]
         removed_scripts = len(original) - len(kept)

@@ -326,6 +326,56 @@ class TestFpsOptOutPrunesRehydratedScaffolding:
         names = {s.name for s in pl.state.rbx_place.scripts}
         assert "FpsClient" not in names
 
+    def test_opt_out_drops_autogen_event_dispatch_module(
+        self, tmp_path: Path,
+    ) -> None:
+        """Codex finding [P3] (PR #70 round 6): the renamed
+        ``AutoFpsEventDispatch`` ModuleScript must also be pruned on
+        opt-out. It's only injected for FPS scaffolding, so a
+        rehydrated copy on a non-FPS rerun is stale converter-owned
+        runtime code that would ship to the user's place.
+
+        ``AutoFpsEventDispatch`` carries no per-line marker comment —
+        its name itself is the marker (the ``AutoFps`` prefix is
+        converter-namespace owned, distinct from a user-authored
+        ``EventDispatch``). Pruning is name-only.
+        """
+        pl = self._make_pipeline(tmp_path)
+        pl.state.rbx_place.scripts.append(
+            RbxScript(
+                name="AutoFpsEventDispatch",
+                source=(
+                    "-- EventDispatch: cross-class connect helper.\n"
+                    "local EventDispatch = {}\n"
+                    "return EventDispatch\n"
+                ),
+                script_type="ModuleScript",
+            )
+        )
+        pl._subphase_inject_autogen_scripts()
+        names = {s.name for s in pl.state.rbx_place.scripts}
+        assert "AutoFpsEventDispatch" not in names
+
+    def test_opt_out_keeps_user_authored_event_dispatch_module(
+        self, tmp_path: Path,
+    ) -> None:
+        """A user-authored ``EventDispatch`` (no ``AutoFps`` prefix)
+        must survive opt-out. The prefix is the discriminator —
+        ``AUTO_FPS_EVENT_DISPATCH_NAME`` is specifically chosen to
+        avoid colliding with that name.
+        """
+        pl = self._make_pipeline(tmp_path)
+        pl.state.rbx_place.scripts.append(
+            RbxScript(
+                name="EventDispatch",
+                source="-- User-authored EventDispatch module\n",
+                script_type="ModuleScript",
+            )
+        )
+        pl._subphase_inject_autogen_scripts()
+        names = {s.name for s in pl.state.rbx_place.scripts}
+        assert "EventDispatch" in names
+
     def test_opt_out_keeps_user_authored_hud_screengui(
         self, tmp_path: Path,
     ) -> None:

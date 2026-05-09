@@ -652,15 +652,17 @@ class TestBackwardCompatMigration:
     def test_migration_ignores_shared_scripts_cache_in_multi_scene(
         self, tmp_path: Path,
     ) -> None:
-        """Codex finding [P2] (PR #70 round 5): in multi-scene output
-        dirs, ``scripts/`` is a shared cache populated by an earlier
-        scene's transpilation. A leftover ``HUDController.luau`` from
+        """Codex finding [P2] (PR #70 round 5/6): in multi-scene output
+        dirs, ``scripts/`` is a shared cache populated by whichever
+        scene converted last. A leftover ``HUDController.luau`` from
         a prior FPS-scene conversion must NOT migrate the menu-scene
         resume to ``scaffolding=['fps']``.
 
-        Multi-scene mode is signalled by ``ctx.selected_scene`` being
-        set — the scripts-dir cache check is gated off in that mode,
-        relying on the scene-scoped rbxlx for the signal.
+        The discriminator is ``ctx.scenes_metadata`` (populated only
+        by ``run_all_scenes``) — NOT ``ctx.selected_scene``, which is
+        set on every run including single-scene conversions and so
+        would falsely gate off the scripts-dir signal for legitimate
+        single-scene resumes.
         """
         project = tmp_path / "Project"
         scenes_dir = project / "Assets" / "Scenes"
@@ -675,21 +677,64 @@ class TestBackwardCompatMigration:
         (scripts_dir / "HUDController.luau").write_text(
             "-- HUD Controller (auto-generated)\n"
         )
-        # menu.rbxlx (the selected scene's artifact) has no marker.
+        # main.rbxlx + menu.rbxlx — multi-scene shape; neither has
+        # the FPS marker (the prior FPS scene's scripts/ cache is the
+        # only stale artifact).
+        (out / "main.rbxlx").write_text(
+            '<roblox version="4"></roblox>\n'
+        )
         (out / "menu.rbxlx").write_text(
             '<roblox version="4"></roblox>\n'
         )
 
         pl = Pipeline(unity_project_path=project, output_dir=out)
+        # Mimic the post-resume state: ``run_all_scenes`` populated
+        # scenes_metadata for both scenes; selected_scene is the
+        # currently-targeted one.
+        pl.ctx.scenes_metadata = {
+            "main": {"parts": 0, "scripts": 0, "game_objects": 0},
+            "menu": {"parts": 0, "scripts": 0, "game_objects": 0},
+        }
         pl.ctx.selected_scene = str(scenes_dir / "menu.unity")
-        # Shared scripts/ cache must not signal migration when scoped
-        # to the non-FPS scene; rbxlx is the authoritative scope.
+        # Shared scripts/ cache must not signal migration when in a
+        # true multi-scene state — rbxlx is the authoritative scope.
         assert pl._fps_artifacts_on_disk() is False
-        # Single-scene mode (selected_scene unset) still honours the
-        # scripts-dir signal so single-scene resumes don't regress.
-        pl.ctx.selected_scene = ""
-        # Need a canonical rbxlx for the fallback to find — but the
-        # scripts-dir signal alone should already trigger.
+
+    def test_migration_honours_scripts_cache_in_single_scene(
+        self, tmp_path: Path,
+    ) -> None:
+        """Codex finding [P2] (PR #70 round 6): a real single-scene
+        resume populates ``ctx.selected_scene`` too — keying multi-
+        scene off ``selected_scene`` would silently drop FPS HUD/
+        controller migration on legitimate same-project resumes.
+
+        ``scenes_metadata`` is the precise discriminator: empty
+        means single-scene, populated means ``run_all_scenes``.
+        """
+        project = tmp_path / "Project"
+        scenes_dir = project / "Assets" / "Scenes"
+        scenes_dir.mkdir(parents=True)
+        (scenes_dir / "main.unity").touch()
+        out = tmp_path / "output"
+        out.mkdir()
+        # Single-scene shape: only converted_place.rbxlx (no marker)
+        # plus a pre-flag FPS leftover in scripts/.
+        scripts_dir = out / "scripts"
+        scripts_dir.mkdir()
+        (scripts_dir / "HUDController.luau").write_text(
+            "-- HUD Controller (auto-generated)\n"
+        )
+        (out / "converted_place.rbxlx").write_text(
+            '<roblox version="4"></roblox>\n'
+        )
+
+        pl = Pipeline(unity_project_path=project, output_dir=out)
+        # selected_scene IS set even on single-scene resumes — the
+        # codex round-6 finding pinned this exact failure mode.
+        pl.ctx.selected_scene = str(scenes_dir / "main.unity")
+        # scenes_metadata stays empty → single-scene → scripts/ cache
+        # signal must fire so legitimate FPS resumes still migrate.
+        assert pl.ctx.scenes_metadata == {}
         assert pl._fps_artifacts_on_disk() is True
 
     def test_migration_skips_canonical_rbxlx_when_scoped_exists(
