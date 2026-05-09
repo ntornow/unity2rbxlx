@@ -1965,6 +1965,29 @@ return table.concat(allData, "\\n")'''
         from converter.fps_client_generator import detect_fps_game
         looks_fps = detect_fps_game(self.state.rbx_place)
 
+        # Backward-compat migration: an output directory created before
+        # ``ConversionContext.scaffolding`` existed rehydrates with an
+        # empty list, so a publish/upload re-run would silently drop
+        # the FPS scripts the original conversion auto-injected.
+        # Detect this case (existing conversion + heuristic match +
+        # empty scaffolding) and infer ``scaffolding=["fps"]`` with a
+        # warning so users see what changed and can pin the value
+        # explicitly (``--scaffolding=fps``) on subsequent runs.
+        if (
+            looks_fps
+            and not self.scaffolding
+            and self.ctx.completed_phases  # ran before this resume
+        ):
+            log.warning(
+                "[write_output] Migrating pre-scaffolding output dir: "
+                "heuristic detected FPS-style scripts and no explicit "
+                "scaffolding was persisted. Inferring "
+                "scaffolding=['fps'] to preserve auto-injected FPS "
+                "controller/HUD. Pin this with --scaffolding=fps on "
+                "future runs to make it explicit."
+            )
+            self.apply_scaffolding(["fps"])
+
         # Auto-generate collision group setup if Unity layers are used.
         from converter.fps_client_generator import generate_collision_group_script
         has_layers = False
