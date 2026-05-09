@@ -174,29 +174,19 @@ class Pipeline:
         # that's been deleted.
         self._fps_artifacts_at_init: bool = self._fps_artifacts_on_disk()
 
-        # ``_is_resume`` distinguishes a true resume/rebuild against
-        # an existing output dir from a fresh convert that happens to
-        # land in a directory containing stale FPS scripts (e.g. a
-        # user pointing ``u2r.py convert ProjectB`` at an output dir
-        # left over from a prior ``ProjectA`` conversion). Without
-        # this gate, the backward-compat migration would silently
-        # auto-inject FPS scaffolding into ProjectB even though the
-        # caller never passed ``--scaffolding=fps``.
+        # ``_is_resume`` flags an EXPLICIT resume/rebuild (set True
+        # by :meth:`resume` and the publish-rebuild path in u2r.py
+        # before running). The backward-compat FPS migration only
+        # fires when this flag is True — not when ``run_all()`` is
+        # invoked against an existing output dir, which is a
+        # full-conversion rerun and should honour the new opt-in
+        # default.
         #
-        # True only when ``conversion_context.json`` exists at init
-        # AND its persisted ``unity_project_path`` matches the path
-        # this Pipeline was constructed for.
+        # Default False at construction. Setters: ``resume()``, and
+        # external callers (``u2r.py publish`` rebuild fallback)
+        # that explicitly mean "this is a rebuild from persisted
+        # state, not a fresh conversion".
         self._is_resume: bool = False
-        if self._context_path.exists():
-            try:
-                _existing = ConversionContext.load(self._context_path)
-                if _existing.unity_project_path:
-                    self._is_resume = (
-                        Path(_existing.unity_project_path).resolve()
-                        == self.unity_project_path
-                    )
-            except Exception:  # noqa: BLE001 — defensive on disk read
-                self._is_resume = False
 
     @property
     def scaffolding(self) -> frozenset[str]:
@@ -471,6 +461,12 @@ class Pipeline:
         if self._context_path.exists():
             self.ctx = ConversionContext.load(self._context_path)
             log.info("Loaded persisted context from %s", self._context_path)
+            # Mark this Pipeline as an explicit resume so the
+            # backward-compat FPS migration in
+            # ``_subphase_inject_autogen_scripts`` knows the on-disk
+            # FPS scripts belong to a true rebuild rather than stale
+            # files from a previous run sharing the output dir.
+            self._is_resume = True
             # Re-apply the constructor's scaffolding request after the
             # ctx swap so ``u2r.py convert --phase write_output
             # --scaffolding=fps`` actually injects FPS scaffolding even

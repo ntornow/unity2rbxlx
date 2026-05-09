@@ -458,19 +458,20 @@ class TestBackwardCompatMigration:
     def _make_pipeline_with_disk_artifacts(
         tmp_path: Path,
         files: dict[str, str],
+        *,
+        is_resume: bool = True,
     ) -> Pipeline:
-        """Pre-write disk artifacts AND a matching conversion_context.json
-        BEFORE constructing the Pipeline, so both
-        ``_fps_artifacts_at_init`` and ``_is_resume`` (snapshotted in
-        __init__) see them as a true resume rather than a fresh
-        convert into a dir with stale files.
+        """Pre-write disk artifacts BEFORE constructing the Pipeline,
+        so ``_fps_artifacts_at_init`` (snapshotted in __init__) sees
+        them.
 
-        The inject subphase reads the cached snapshots rather than
-        re-checking disk — by then the scripts/ dir may have been
-        wiped by ``_subphase_emit_scripts_to_disk``.
+        Sets ``_is_resume = True`` by default to mirror real resume
+        flows (where ``Pipeline.resume()`` or
+        ``convert_interactive._make_pipeline``'s ctx-swap branch
+        marks the flag). Pass ``is_resume=False`` for tests that
+        simulate a fresh ``run_all`` against an output dir with
+        leftover FPS scripts.
         """
-        from core.conversion_context import ConversionContext
-
         project = tmp_path / "fakeproject"
         (project / "Assets").mkdir(parents=True)
         out = tmp_path / "output"
@@ -480,13 +481,9 @@ class TestBackwardCompatMigration:
         for name, content in files.items():
             (scripts_dir / name).write_text(content)
 
-        # Persist a ctx whose unity_project_path matches the project,
-        # so ``_is_resume`` evaluates True for the migration path.
-        prior = ConversionContext(unity_project_path=str(project))
-        prior.save(out / "conversion_context.json")
-
         pl = Pipeline(unity_project_path=project, output_dir=out)
         pl.state.rbx_place = _fps_shaped_place()
+        pl._is_resume = is_resume
         return pl
 
     def test_migration_infers_fps_when_hud_script_on_disk(
@@ -566,73 +563,54 @@ class TestBackwardCompatMigration:
         pl._subphase_inject_autogen_scripts()
         assert pl.scaffolding == frozenset()
 
-    def test_migration_skips_fresh_convert_into_reused_dir(
+    def test_migration_skips_full_convert_rerun(
         self, tmp_path: Path,
     ) -> None:
-        """Codex finding [P2] (round 8): a user pointing
-        ``u2r.py convert ProjectB`` at an output dir left over from a
-        prior ProjectA conversion would have stale FPS scripts on
-        disk, but ProjectB might not be FPS at all. The migration
-        must NOT auto-infer ``scaffolding=['fps']`` in that case.
+        """Codex finding [P2] (round 9): a same-project rerun via
+        ``u2r.py convert``/``Pipeline.run_all()`` must NOT migrate
+        even when FPS scripts exist on disk. Full conversions
+        regenerate from source — the user opted out of scaffolding
+        by NOT passing ``--scaffolding=fps``, and the new opt-in
+        default takes precedence over preserving leftover artifacts.
 
-        ``_is_resume`` gate distinguishes: True only when the
-        persisted ctx's ``unity_project_path`` matches the Pipeline's.
-        For a fresh convert into a foreign output dir, the persisted
-        path differs (or the ctx file is fresh after Pipeline init
-        creates one) and migration is suppressed.
+        Migration only fires for EXPLICIT resume paths
+        (``Pipeline.resume()`` or the publish-rebuild fallback);
+        ``run_all`` leaves ``_is_resume = False``.
         """
-        from core.conversion_context import ConversionContext
-
-        # Set up an output dir whose ctx points at ProjectA, but the
-        # new Pipeline is constructed for ProjectB.
-        project_a = tmp_path / "ProjectA"
-        (project_a / "Assets").mkdir(parents=True)
-        project_b = tmp_path / "ProjectB"
-        (project_b / "Assets").mkdir(parents=True)
-        out = tmp_path / "output"
-        out.mkdir()
-        scripts_dir = out / "scripts"
-        scripts_dir.mkdir()
-        (scripts_dir / "HUDController.luau").write_text(
-            "-- HUD Controller (auto-generated)\n"
+        pl = self._make_pipeline_with_disk_artifacts(
+            tmp_path,
+            {
+                "HUDController.luau": (
+                    "-- HUD Controller (auto-generated)\n"
+                    "-- legacy artifact from prior FPS run\n"
+                ),
+            },
+            is_resume=False,  # full convert, not a resume
         )
-        # Persist a ctx for ProjectA.
-        prior = ConversionContext(unity_project_path=str(project_a))
-        prior.save(out / "conversion_context.json")
-
-        # Pipeline init for ProjectB — different project.
-        pl = Pipeline(unity_project_path=project_b, output_dir=out)
-        pl.state.rbx_place = _fps_shaped_place()
-        # Migration signal (artifacts on disk) is True...
+        # Disk signal is present...
         assert pl._fps_artifacts_at_init is True
-        # ...but resume signal is False because projects mismatch.
+        # ...but resume flag is False (full convert).
         assert pl._is_resume is False
         # So migration must NOT fire.
         pl._subphase_inject_autogen_scripts()
         assert pl.scaffolding == frozenset()
 
-    def test_migration_fires_when_project_matches(
+    def test_migration_fires_only_on_explicit_resume(
         self, tmp_path: Path,
     ) -> None:
-        """The flip-side: a true resume (same project, prior ctx
-        exists, FPS scripts on disk) should trigger the migration."""
-        from core.conversion_context import ConversionContext
-
-        project = tmp_path / "Project"
-        (project / "Assets").mkdir(parents=True)
-        out = tmp_path / "output"
-        out.mkdir()
-        scripts_dir = out / "scripts"
-        scripts_dir.mkdir()
-        (scripts_dir / "HUDController.luau").write_text(
-            "-- HUD Controller (auto-generated)\n"
+        """Same disk state, ``is_resume=True`` (the explicit-resume
+        marker set by ``Pipeline.resume()`` and the publish-rebuild
+        path) → migration fires. Combined with the previous test,
+        this pins the resume-vs-rerun discriminator."""
+        pl = self._make_pipeline_with_disk_artifacts(
+            tmp_path,
+            {
+                "HUDController.luau": (
+                    "-- HUD Controller (auto-generated)\n"
+                ),
+            },
+            is_resume=True,
         )
-        prior = ConversionContext(unity_project_path=str(project))
-        prior.save(out / "conversion_context.json")
-
-        pl = Pipeline(unity_project_path=project, output_dir=out)
-        pl.state.rbx_place = _fps_shaped_place()
-        assert pl._is_resume is True
         pl._subphase_inject_autogen_scripts()
         assert "fps" in pl.scaffolding
 

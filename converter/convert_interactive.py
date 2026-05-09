@@ -199,6 +199,10 @@ def _make_pipeline(
                 f"directory or delete {out} and start over."
             )
         pipeline.ctx = prior_ctx
+        # Mark as explicit resume so the FPS migration treats on-disk
+        # FPS scripts as legitimately preserved (not stale leftovers
+        # from a foreign-project conversion that shared this dir).
+        pipeline._is_resume = True
         # Re-merge the caller's scaffolding request after the ctx swap
         # — the rehydrated ctx may carry persisted entries; the new
         # request adds to them (additive, idempotent).

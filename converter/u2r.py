@@ -564,14 +564,19 @@ def publish(
         pipeline.ctx = prior_ctx
         pipeline.ctx.universe_id = uid
         pipeline.ctx.place_id = pid
+        # Mark this rebuild path as an explicit resume so the
+        # backward-compat FPS migration treats on-disk FPS scripts
+        # as legitimately preserved rather than stale leftovers.
+        # ``hasattr`` guards tolerate ``Pipeline`` stubs in the
+        # publish-cache tests.
+        if hasattr(pipeline, "_is_resume"):
+            pipeline._is_resume = True
         # Re-merge the caller's scaffolding request after the ctx swap.
         # Old contexts (saved before the scaffolding field existed)
         # rehydrate as ``scaffolding=[]``; passing ``--scaffolding=fps``
         # to ``u2r.py publish`` is the documented opt-back-in path so
         # rebuilds reproduce the original FPS scripts/HUD without
-        # re-running the full conversion. ``hasattr`` guard tolerates
-        # ``Pipeline`` stubs in the publish-cache tests that don't
-        # implement the method.
+        # re-running the full conversion.
         if scaffolding_list and hasattr(pipeline, "apply_scaffolding"):
             pipeline.apply_scaffolding(scaffolding_list)
 
