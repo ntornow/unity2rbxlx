@@ -350,9 +350,13 @@ class TestFpsHeuristicNoFalsePositiveOnAutogen:
         self, tmp_path: Path,
     ) -> None:
         """A place containing ONLY the converter's autogen scripts
-        (GameServerManager, CollisionGroupSetup, CollisionFidelityRecook)
-        must not trigger ``detect_fps_game``. The detector is meant for
-        user-authored content, not the converter's own scaffolding."""
+        (GameServerManager, CollisionFidelityRecook, etc.) must not
+        trigger ``detect_fps_game``. The detector skips files
+        carrying any of ``_AUTOGEN_MARKERS``, so user-authored
+        content is the only thing it considers — the converter's
+        generic spawn-flow code (``PlayerShoot`` + ``RemoteEvent``)
+        no longer false-positives.
+        """
         from converter.autogen import (
             generate_collision_fidelity_recook_script,
             generate_game_server_script,
@@ -367,20 +371,10 @@ class TestFpsHeuristicNoFalsePositiveOnAutogen:
             workspace_parts=[],
             screen_guis=[],
         )
-        # The autogen GameServerManager mentions PlayerShoot + RemoteEvent
-        # because it wires up the generic player-spawn flow. The detector
-        # in isolation matches that, so this asserts the FAILURE MODE
-        # codex flagged: detect_fps_game returns True on a non-FPS scene.
-        # See ``_subphase_inject_autogen_scripts`` for the fix — the
-        # subphase checks the heuristic BEFORE these autogens land.
         looks_fps = detect_fps_game(place)
-        # Document the upstream behaviour: detector itself isn't smart
-        # enough to filter autogens, but the call site is. If this
-        # assertion ever flips (e.g. detector grows an autogen filter),
-        # the call-site ordering can be relaxed.
-        assert looks_fps is True, (
-            "detector matches autogen GameServerManager — "
-            "the call site must filter, not the detector"
+        assert looks_fps is False, (
+            "detector should skip auto-gen scripts — only user "
+            "content drives the heuristic"
         )
 
     def test_is_fps_game_set_on_heuristic_match_without_opt_in(

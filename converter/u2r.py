@@ -514,6 +514,15 @@ def publish(
     if not uid or not pid:
         click.echo("ERROR: --universe-id and --place-id required (or cached in .roblox_ids.json)"); return
 
+    # ``--scaffolding`` only takes effect on the rebuild fallback —
+    # the fast path uploads the cached ``.rbxl`` byte-for-byte, so
+    # the scripts in that cache are whatever the prior conversion
+    # produced. Warn loudly when the user passes ``--scaffolding``
+    # alongside an existing cache so the silent no-op surfaces.
+    scaffolding_was_requested = bool(
+        scaffolding and scaffolding.strip()
+    )
+
     # Fast path: upload the existing binary place file. Preserves
     # CollisionFidelity and other Plugin-gated MeshPart properties that
     # the chunked execute_luau path can't write. Open Cloud
@@ -524,6 +533,16 @@ def publish(
     # without the binary writer's lz4 dependency.
     click.echo(f"Publishing to universe={uid} place={pid}...")
     rbxl_path = output_path / "converted_place.rbxl"
+    if rbxl_path.exists() and scaffolding_was_requested:
+        click.echo(
+            f"  --scaffolding={scaffolding!r} requested but "
+            f"{rbxl_path.name} exists — the fast path uploads the "
+            "cached .rbxl byte-for-byte, so the requested scaffolding "
+            "is IGNORED. To rebuild from source with the new "
+            "scaffolding, delete the cached .rbxl (and "
+            "place_builder_chunks.json) and re-run, or use "
+            "u2r.py convert --scaffolding=fps."
+        )
     if rbxl_path.exists():
         # Build CollisionFidelity fixup targets from the rbxl on disk
         # so non-Default fidelities re-cook on the live place. Without

@@ -2402,12 +2402,70 @@ return table.concat(allData, "\\n")'''
                     "[write_output] Auto-generated %d FPS client scripts/GUIs "
                     "(--scaffolding=fps)", fps_added,
                 )
-        elif looks_fps:
-            log.info(
-                "[write_output] Heuristic detected FPS-style scripts; "
-                "skipping auto-injected FPS controller/HUD. Pass "
-                "--scaffolding=fps to opt in."
+        else:
+            # Opt-out cleanup: remove auto-gen FPS scripts that may
+            # have been rehydrated from a prior --scaffolding=fps run.
+            # Without this, the rehydrate would silently carry the
+            # last run's HUDController/FPSController forward even
+            # after the user toggled the flag off.
+            removed = self._remove_rehydrated_fps_autogen()
+            if removed:
+                log.info(
+                    "[write_output] Removed %d rehydrated FPS auto-gen "
+                    "script(s) — current run did not pass "
+                    "--scaffolding=fps",
+                    removed,
+                )
+            if looks_fps:
+                log.info(
+                    "[write_output] Heuristic detected FPS-style scripts; "
+                    "skipping auto-injected FPS controller/HUD. Pass "
+                    "--scaffolding=fps to opt in."
+                )
+
+    def _remove_rehydrated_fps_autogen(self) -> int:
+        """Drop FPS-only auto-gen scripts and the HUD ScreenGui that
+        were rehydrated from a prior ``--scaffolding=fps`` run.
+
+        Called from ``_subphase_inject_autogen_scripts`` on the
+        opt-out branch — the user toggled FPS off but the rehydrate
+        loaded last run's auto-gen files. Pruning here makes the
+        opt-out effective without breaking the review flow's
+        general edit-preservation contract (other auto-gen scripts
+        — GameServerManager, CollisionGroupSetup, etc. — stay).
+
+        Marker-based, name-aware: matches the FPS-specific header
+        comments AND the canonical names so user-authored files of
+        the same name (without the marker) are left alone.
+        """
+        if self.state.rbx_place is None:
+            return 0
+        fps_markers = (
+            "-- HUD Controller (auto-generated)",
+            "-- FPS Client Controller (auto-generated)",
+        )
+        fps_names = {
+            "AutoFpsHudController", "FPSController", "HUDController",
+        }
+        original = self.state.rbx_place.scripts
+        kept = [
+            s for s in original
+            if not (
+                s.name in fps_names
+                and any(m in s.source[:512] for m in fps_markers)
             )
+        ]
+        removed_scripts = len(original) - len(kept)
+        self.state.rbx_place.scripts = kept
+
+        # The FPS HUD ScreenGui carries a name marker — drop it on
+        # opt-out so the player doesn't inherit a stale HUD shell
+        # with no controller wiring.
+        original_guis = self.state.rbx_place.screen_guis
+        kept_guis = [sg for sg in original_guis if sg.name != "HUD"]
+        removed_guis = len(original_guis) - len(kept_guis)
+        self.state.rbx_place.screen_guis = kept_guis
+        return removed_scripts + removed_guis
 
     def _subphase_encode_terrain(self) -> None:
         """Encode each terrain's heightmap into Roblox SmoothGrid binary and
@@ -2843,14 +2901,14 @@ script.Disabled = true
             ),
         )
 
-    # Marker substrings that identify converter-emitted scripts on
-    # disk. The rehydrate path skips files carrying any of these so
-    # ``--scaffolding=fps`` opt-out reruns rebuild scaffolding from
-    # the current flags instead of resurrecting last-run's auto-gen
-    # files. Each subphase that auto-injects re-emits its own scripts
-    # cleanly when its gate (scaffolding flag, scene predicate, etc.)
-    # opts in for the new run.
-    _AUTOGEN_REHYDRATE_SKIP_MARKERS: tuple[str, ...] = (
+    # Marker substrings that identify converter-emitted scripts.
+    # Used by ``detect_fps_game`` to skip auto-gen files (the
+    # GameServerManager mentions ``PlayerShoot`` + ``RemoteEvent``
+    # to wire up its generic spawn flow, so unfiltered detection
+    # false-positives every conversion). User edits to auto-gen
+    # scripts still come through rehydrate as user-authored content;
+    # only the heuristic skips them.
+    _AUTOGEN_MARKERS: tuple[str, ...] = (
         "-- HUD Controller (auto-generated)",
         "-- FPS Client Controller (auto-generated)",
         "-- CollisionFidelityRecook (auto-generated)",
@@ -2874,31 +2932,22 @@ script.Disabled = true
         animation_data/, scriptable_objects/) instead of defaulting every
         file to the top-level scripts/ dir.
 
-        SKIPS converter-owned auto-gen files (FPS controller / HUD,
-        GameServerManager, CollisionGroupSetup, EventDispatch, animation
-        scripts, ClientBootstrap). Each of those is re-emitted on this
-        run by the corresponding inject subphase based on the current
-        scaffolding/scene state — pulling the prior copy back in would
-        defeat the ``--scaffolding=fps`` opt-out contract and silently
-        carry forward old scaffolding when it was deliberately turned
-        off this run.
+        Rehydrates ALL ``.luau`` files including converter-emitted ones
+        — the review flow lets users hand-edit auto-gen scripts
+        between assemble and upload, and skipping them would silently
+        discard those edits. Opt-out behaviour (``--scaffolding=fps``
+        OFF after a prior FPS run) is handled separately by
+        ``_subphase_inject_autogen_scripts``, which removes rehydrated
+        FPS auto-gen scripts when scaffolding doesn't include ``fps``.
         """
         from core.roblox_types import RbxScript
 
         plan_lookup = self._load_storage_plan_for_rehydration()
         luau_files = sorted(scripts_dir.rglob("*.luau"))
         from_plan = 0
-        skipped_autogen = 0
         for luau_path in luau_files:
             source = luau_path.read_text(encoding="utf-8")
             name = luau_path.stem
-
-            # Skip converter-owned auto-gen files — see
-            # ``_AUTOGEN_REHYDRATE_SKIP_MARKERS`` docstring above.
-            head = source[:512]
-            if any(m in head for m in self._AUTOGEN_REHYDRATE_SKIP_MARKERS):
-                skipped_autogen += 1
-                continue
 
             if name in plan_lookup:
                 script_type, parent_path = plan_lookup[name]
@@ -2921,14 +2970,9 @@ script.Disabled = true
                 script.parent_path = parent_path
             self.state.rbx_place.scripts.append(script)
 
-        rehydrated = len(luau_files) - skipped_autogen
         log.info(
-            "[write_output] Rehydrated %d scripts from disk "
-            "(%d via plan, %d via heuristic, %d auto-gen skipped)",
-            rehydrated,
-            from_plan,
-            rehydrated - from_plan,
-            skipped_autogen,
+            "[write_output] Rehydrated %d scripts from disk (%d via plan, %d via heuristic)",
+            len(luau_files), from_plan, len(luau_files) - from_plan,
         )
 
     def _load_storage_plan_for_rehydration(self) -> dict[str, tuple[str, str | None]]:
