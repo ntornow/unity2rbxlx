@@ -235,7 +235,12 @@ class Pipeline:
         # Two signals — the user keeps either to count as a true
         # pre-PR FPS output:
         #   1. ``scripts/<name>.luau`` carrying the auto-gen marker
-        #      for any of the historic FPS-emitted script names.
+        #      for any of the historic FPS-emitted script names —
+        #      ONLY honoured for single-scene runs. Multi-scene runs
+        #      (``run_all_scenes``) rewrite the same ``scripts/``
+        #      cache for whichever scene converted last, so its
+        #      contents aren't scoped to ``ctx.selected_scene``;
+        #      using it would migrate non-FPS scenes too.
         #   2. The rbxlx output itself contains the auto-gen marker
         #      string. Survives cache pruning — users who archive or
         #      shrink an output dir tend to keep the rbxlx as the
@@ -250,8 +255,9 @@ class Pipeline:
         # migration signal — documented as a known limitation; the
         # workaround is to pass ``--scaffolding=fps`` explicitly on
         # rebuild, which the publish CLI surfaces.
+        is_multi_scene = bool(self.ctx.selected_scene)
         scripts_dir = self.output_dir / "scripts"
-        if scripts_dir.is_dir():
+        if scripts_dir.is_dir() and not is_multi_scene:
             # Recognised auto-gen filenames across pipeline eras:
             #   - ``HUDController.luau`` (pre-rename HUD listener)
             #   - ``AutoFpsHudController.luau`` (post-rename HUD listener)
@@ -293,9 +299,10 @@ class Pipeline:
             scoped = self.output_dir / f"{scene_stem}.rbxlx"
             if scoped.exists():
                 place_files.append(scoped)
-        canonical = self.output_dir / "converted_place.rbxlx"
-        if canonical.exists() and canonical not in place_files:
-            place_files.append(canonical)
+        if not place_files:
+            canonical = self.output_dir / "converted_place.rbxlx"
+            if canonical.exists():
+                place_files.append(canonical)
         if not place_files:
             # Last resort for unscoped multi-scene rebuilds; matches
             # the conservative pre-scoped behaviour but only when no
