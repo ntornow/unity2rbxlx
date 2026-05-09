@@ -500,6 +500,12 @@ def generate_hud_screen_gui() -> RbxScreenGui:
 
     screen_gui = RbxScreenGui(name="HUD")
     screen_gui.elements = [crosshair, module, item_module, pause_menu]
+    # Marker attribute so opt-out cleanup can distinguish this
+    # auto-gen ScreenGui from a user-authored "HUD" ScreenGui (e.g.
+    # one produced by Canvas/UI conversion). Without it, dropping
+    # by name alone would delete legitimate non-FPS HUDs that
+    # happen to share the name.
+    screen_gui.attributes["_AutoFpsHud"] = True
 
     return screen_gui
 
@@ -567,9 +573,9 @@ end
 -- hud_player_bindable_events coherence pack). They expose different
 -- event members — RemoteEvent.OnClientEvent vs BindableEvent.Event —
 -- so the dispatch helper forks on the instance class. Lives in the
--- shared ``EventDispatch`` runtime module so other scaffolding can
--- reuse it without re-implementing the fork.
-local EventDispatch = require(ReplicatedStorage:WaitForChild("EventDispatch"))
+-- shared ``AutoFpsEventDispatch`` runtime module — distinct name to
+-- avoid colliding with user-authored ``EventDispatch.cs`` projects.
+local EventDispatch = require(ReplicatedStorage:WaitForChild("AutoFpsEventDispatch"))
 local connectClient = EventDispatch.connectClient
 
 local HealthUpdateRemote = waitForRemote("HealthUpdate")
@@ -709,24 +715,38 @@ def inject_fps_scripts(place: RbxPlace) -> int:
             "HUD listener already present from prior conversion)"
         )
 
-    # AutoFpsHudController requires ``ReplicatedStorage.EventDispatch``
-    # at runtime. Auto-inject the runtime ModuleScript here too so
-    # standalone callers (anyone using ``inject_fps_scripts`` outside
-    # ``Pipeline._inject_runtime_modules``) get a working FPS bundle.
-    # The pipeline path also injects via the runtime-modules subphase;
-    # the existing-name dedupe below handles the duplicate.
-    has_event_dispatch = any(s.name == "EventDispatch" for s in place.scripts)
-    if not has_event_dispatch:
+    # AutoFpsHudController requires the FPS-scoped event dispatch
+    # ModuleScript at runtime. Distinct name (``AutoFpsEventDispatch``)
+    # avoids collision with any user-authored ``EventDispatch`` script
+    # — e.g. a project that ships its own EventDispatch.cs would
+    # transpile to ``EventDispatch.luau`` and the disk finalizer's
+    # name-based filename collision would clobber one of the two.
+    # Pipeline's runtime-modules subphase also injects under this
+    # name; the existing-name dedupe below handles the duplicate.
+    has_autogen_event_dispatch = any(
+        s.name == AUTO_FPS_EVENT_DISPATCH_NAME
+        and s.script_type == "ModuleScript"
+        for s in place.scripts
+    )
+    if not has_autogen_event_dispatch:
         place.scripts.append(_load_event_dispatch_module())
         added += 1
-        log.info("Injected EventDispatch ModuleScript")
+        log.info("Injected %s ModuleScript", AUTO_FPS_EVENT_DISPATCH_NAME)
 
     return added
 
 
+# Canonical name for the auto-injected FPS event-dispatch module.
+# Distinct from a hypothetical user-authored ``EventDispatch`` script
+# so the disk write doesn't collide. The auto-generated HUDController
+# requires this exact name from ``ReplicatedStorage``; keep them
+# in sync via the ``AUTO_FPS_EVENT_DISPATCH_NAME`` constant.
+AUTO_FPS_EVENT_DISPATCH_NAME = "AutoFpsEventDispatch"
+
+
 def _load_event_dispatch_module() -> RbxScript:
     """Load ``runtime/event_dispatch.luau`` from disk and wrap it as
-    a ModuleScript named ``EventDispatch``.
+    the FPS-scoped ``AutoFpsEventDispatch`` ModuleScript.
 
     Read at call time (not module import) so unit tests that don't
     exercise the FPS path don't pay the disk read.
@@ -737,7 +757,7 @@ def _load_event_dispatch_module() -> RbxScript:
         / "runtime" / "event_dispatch.luau"
     )
     return RbxScript(
-        name="EventDispatch",
+        name=AUTO_FPS_EVENT_DISPATCH_NAME,
         source=runtime_path.read_text(encoding="utf-8"),
         script_type="ModuleScript",
     )

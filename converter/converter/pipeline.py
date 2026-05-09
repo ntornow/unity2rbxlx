@@ -2458,11 +2458,19 @@ return table.concat(allData, "\\n")'''
         removed_scripts = len(original) - len(kept)
         self.state.rbx_place.scripts = kept
 
-        # The FPS HUD ScreenGui carries a name marker — drop it on
-        # opt-out so the player doesn't inherit a stale HUD shell
-        # with no controller wiring.
+        # The FPS HUD ScreenGui is identified by a marker attribute
+        # (``_AutoFpsHud``) the generator stamps on it, NOT by its
+        # name. A user-authored ScreenGui named ``HUD`` (e.g. from
+        # Canvas/UI conversion) doesn't carry the marker and is
+        # preserved through opt-out runs.
         original_guis = self.state.rbx_place.screen_guis
-        kept_guis = [sg for sg in original_guis if sg.name != "HUD"]
+        kept_guis = [
+            sg for sg in original_guis
+            if not (
+                sg.name == "HUD"
+                and getattr(sg, "attributes", {}).get("_AutoFpsHud")
+            )
+        ]
         removed_guis = len(original_guis) - len(kept_guis)
         self.state.rbx_place.screen_guis = kept_guis
         return removed_scripts + removed_guis
@@ -3373,13 +3381,16 @@ script.Disabled = true
         if has_sub_emitters:
             modules_to_inject.append(("SubEmitterRuntime", "sub_emitter_runtime.luau"))
         # FPS scaffolding's auto-generated HUDController requires
-        # ``EventDispatch.connectClient`` from this runtime module to
-        # bridge RemoteEvent vs BindableEvent producers. Inject when
-        # opted in via ``--scaffolding=fps`` so the require resolves;
-        # without this the HUD load fails at WaitForChild on the
-        # missing ModuleScript.
+        # ``AutoFpsEventDispatch.connectClient`` from this runtime
+        # module to bridge RemoteEvent vs BindableEvent producers.
+        # Inject when opted in via ``--scaffolding=fps`` so the
+        # require resolves. Distinct ``AutoFps`` name avoids
+        # colliding with a user-authored ``EventDispatch.cs`` script.
         if "fps" in self.scaffolding:
-            modules_to_inject.append(("EventDispatch", "event_dispatch.luau"))
+            from converter.scaffolding.fps import AUTO_FPS_EVENT_DISPATCH_NAME
+            modules_to_inject.append(
+                (AUTO_FPS_EVENT_DISPATCH_NAME, "event_dispatch.luau"),
+            )
 
         # Detect object pooling patterns in transpiled scripts
         has_pool = any(

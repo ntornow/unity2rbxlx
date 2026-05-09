@@ -85,7 +85,7 @@ class TestHudClientScriptRequiresEventDispatch:
 
     def test_hud_script_requires_event_dispatch(self) -> None:
         script = generate_hud_client_script()
-        assert 'require(ReplicatedStorage:WaitForChild("EventDispatch"))' in (
+        assert 'require(ReplicatedStorage:WaitForChild("AutoFpsEventDispatch"))' in (
             script.source
         )
         # The local-rebind is what call sites use throughout the body.
@@ -147,8 +147,8 @@ class TestPipelineInjectsEventDispatchOnOptIn:
         )
         pl._inject_runtime_modules()
         names = {s.name for s in pl.state.rbx_place.scripts}
-        assert "EventDispatch" in names, (
-            "EventDispatch ModuleScript must be auto-injected when "
+        assert "AutoFpsEventDispatch" in names, (
+            "AutoFpsEventDispatch ModuleScript must be auto-injected when "
             "--scaffolding=fps is set; otherwise the auto-generated "
             "HUDController crashes on require"
         )
@@ -162,7 +162,7 @@ class TestPipelineInjectsEventDispatchOnOptIn:
         pl = self._make_pipeline_with_fps_opt_in(tmp_path, scaffolding=None)
         pl._inject_runtime_modules()
         names = {s.name for s in pl.state.rbx_place.scripts}
-        assert "EventDispatch" not in names
+        assert "AutoFpsEventDispatch" not in names
 
     def test_event_dispatch_injected_as_modulescript(
         self, tmp_path: Path,
@@ -174,9 +174,37 @@ class TestPipelineInjectsEventDispatchOnOptIn:
         )
         pl._inject_runtime_modules()
         ed = next(
-            s for s in pl.state.rbx_place.scripts if s.name == "EventDispatch"
+            s for s in pl.state.rbx_place.scripts if s.name == "AutoFpsEventDispatch"
         )
         assert ed.script_type == "ModuleScript"
+
+    def test_user_authored_eventdispatch_does_not_block_inject(
+        self, tmp_path: Path,
+    ) -> None:
+        """Codex finding [P2] (PR #70 round 3): a project that ships
+        its own ``EventDispatch.cs`` (transpiled to
+        ``EventDispatch.luau``) shouldn't suppress our injection.
+        Different name (``AutoFpsEventDispatch``) eliminates the
+        collision entirely — both can coexist on disk.
+        """
+        pl = self._make_pipeline_with_fps_opt_in(
+            tmp_path, scaffolding=["fps"],
+        )
+        pl.state.rbx_place.scripts.append(
+            RbxScript(
+                name="EventDispatch",
+                source=(
+                    "-- User-authored EventDispatch (different purpose)\n"
+                    "local M = {}\nreturn M\n"
+                ),
+                script_type="LocalScript",
+            )
+        )
+        pl._inject_runtime_modules()
+        names = [s.name for s in pl.state.rbx_place.scripts]
+        # Both coexist under distinct names.
+        assert names.count("EventDispatch") == 1
+        assert names.count("AutoFpsEventDispatch") == 1
 
     def test_event_dispatch_idempotent_on_repeat_inject(
         self, tmp_path: Path,
@@ -191,7 +219,7 @@ class TestPipelineInjectsEventDispatchOnOptIn:
         pl._inject_runtime_modules()
         pl._inject_runtime_modules()
         ed_count = sum(
-            1 for s in pl.state.rbx_place.scripts if s.name == "EventDispatch"
+            1 for s in pl.state.rbx_place.scripts if s.name == "AutoFpsEventDispatch"
         )
         assert ed_count == 1
 
@@ -254,9 +282,9 @@ class TestFpsOptOutPrunesRehydratedScaffolding:
                 script_type="Script",
             ),
         ])
-        pl.state.rbx_place.screen_guis.append(
-            RbxScreenGui(name="HUD", elements=[])
-        )
+        autogen_hud = RbxScreenGui(name="HUD", elements=[])
+        autogen_hud.attributes["_AutoFpsHud"] = True
+        pl.state.rbx_place.screen_guis.append(autogen_hud)
 
         # Run the inject subphase WITHOUT scaffolding=["fps"].
         pl._subphase_inject_autogen_scripts()
@@ -270,6 +298,41 @@ class TestFpsOptOutPrunesRehydratedScaffolding:
         # GameServerManager preserved (re-emitted by its own subphase
         # too — but at least one copy stays).
         assert "GameServerManager" in names
+
+    def test_opt_out_keeps_user_authored_hud_screengui(
+        self, tmp_path: Path,
+    ) -> None:
+        """Codex finding [P1] (PR #70 round 3): a Canvas-converted HUD
+        ScreenGui (user content) named ``HUD`` must NOT be deleted by
+        the FPS opt-out cleanup. The auto-gen ScreenGui carries an
+        ``_AutoFpsHud`` marker attribute; user-authored ones don't.
+        """
+        from core.roblox_types import RbxScreenGui
+
+        pl = self._make_pipeline(tmp_path)
+        # User-authored HUD (no marker attr).
+        user_hud = RbxScreenGui(name="HUD", elements=[])
+        pl.state.rbx_place.screen_guis.append(user_hud)
+        # Run opt-out.
+        pl._subphase_inject_autogen_scripts()
+        gui_names = {sg.name for sg in pl.state.rbx_place.screen_guis}
+        assert "HUD" in gui_names
+
+    def test_opt_out_drops_autogen_hud_screengui(
+        self, tmp_path: Path,
+    ) -> None:
+        """Companion: an auto-gen HUD ScreenGui (carrying the
+        ``_AutoFpsHud`` marker) IS dropped on opt-out so the player
+        doesn't inherit a stale shell with no controller wiring."""
+        from core.roblox_types import RbxScreenGui
+
+        pl = self._make_pipeline(tmp_path)
+        autogen_hud = RbxScreenGui(name="HUD", elements=[])
+        autogen_hud.attributes["_AutoFpsHud"] = True
+        pl.state.rbx_place.screen_guis.append(autogen_hud)
+        pl._subphase_inject_autogen_scripts()
+        gui_names = {sg.name for sg in pl.state.rbx_place.screen_guis}
+        assert "HUD" not in gui_names
 
     def test_opt_out_keeps_user_authored_hudcontroller(
         self, tmp_path: Path,
