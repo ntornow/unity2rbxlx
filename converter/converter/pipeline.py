@@ -2104,6 +2104,20 @@ return table.concat(allData, "\\n")'''
         # snapshot, so the soft hint (in the else branch) doesn't fire
         # on every conversion just because the autogen GameServerManager
         # mentions ``PlayerShoot`` + ``RemoteEvent``.
+        # ``is_fps_game`` drives FPS-related scene flags downstream
+        # (e.g. ``StarterPlayer.CameraMode = LockFirstPerson`` in the
+        # rbxlx writer). Set it whenever EITHER the heuristic matched
+        # user content OR the caller explicitly opted into FPS
+        # scaffolding — the user-or-heuristic disjunction matches the
+        # pre-refactor behaviour for projects that ship their own
+        # controller, AND respects ``--scaffolding=fps`` runs whose
+        # user scripts don't trip the heuristic. Tying this to
+        # injection alone regresses both cases (explicit opt-in
+        # without heuristic match, and projects with their own
+        # controller that just need the camera flag).
+        if looks_fps or "fps" in self.scaffolding:
+            self.state.rbx_place.is_fps_game = True
+
         if "fps" in self.scaffolding:
             from converter.fps_client_generator import inject_fps_scripts
             fps_added = inject_fps_scripts(self.state.rbx_place)
@@ -2112,8 +2126,6 @@ return table.concat(allData, "\\n")'''
                     "[write_output] Auto-generated %d FPS client scripts/GUIs "
                     "(--scaffolding=fps)", fps_added,
                 )
-            if looks_fps:
-                self.state.rbx_place.is_fps_game = True
         elif looks_fps:
             log.info(
                 "[write_output] Heuristic detected FPS-style scripts; "

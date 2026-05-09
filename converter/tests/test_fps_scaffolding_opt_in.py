@@ -339,6 +339,79 @@ class TestFpsHeuristicNoFalsePositiveOnAutogen:
             "the call site must filter, not the detector"
         )
 
+    def test_is_fps_game_set_on_heuristic_match_without_opt_in(
+        self, fps_pipeline_factory,
+    ) -> None:
+        """Pre-refactor regression check: a project whose user scripts
+        already trip ``detect_fps_game`` (e.g. ships its own controller
+        and HUD) but DOES NOT pass ``--scaffolding=fps`` must still get
+        ``is_fps_game = True``. That flag drives downstream scene
+        settings — ``StarterPlayer.CameraMode = LockFirstPerson`` in
+        the rbxlx writer — independently of HUD/controller injection.
+        """
+        pl = fps_pipeline_factory(None)  # no opt-in
+        # Default fixture place trips detect_fps_game (PlayerShoot
+        # RemoteEvent + Raycast + ammo + curHealth + gotWeapon).
+        pl._subphase_inject_autogen_scripts()
+        assert getattr(pl.state.rbx_place, "is_fps_game", False) is True
+
+    def test_is_fps_game_set_on_explicit_opt_in_without_heuristic_match(
+        self, tmp_path: Path,
+    ) -> None:
+        """Pre-refactor regression check: a project that passes
+        ``--scaffolding=fps`` but whose user scripts don't trip the
+        FPS heuristic must still get ``is_fps_game = True``. The
+        explicit caller opt-in is authoritative; the heuristic was
+        always best-effort."""
+        from core.roblox_types import RbxPlace as _Place
+
+        project = tmp_path / "fakeproject"
+        (project / "Assets").mkdir(parents=True)
+        out = tmp_path / "out"
+        out.mkdir()
+
+        pl = Pipeline(
+            unity_project_path=project,
+            output_dir=out,
+            scaffolding=["fps"],
+        )
+        # Place with NO user FPS markers — heuristic returns False.
+        pl.state.rbx_place = _Place(
+            scripts=[
+                RbxScript(
+                    name="Hello",
+                    source='print("hello world")',
+                    script_type="LocalScript",
+                ),
+            ],
+            workspace_parts=[],
+            screen_guis=[],
+        )
+        pl._subphase_inject_autogen_scripts()
+        assert getattr(pl.state.rbx_place, "is_fps_game", False) is True
+
+    def test_is_fps_game_stays_false_for_non_fps_default(
+        self, tmp_path: Path,
+    ) -> None:
+        """Non-FPS project, no opt-in, no FPS-shaped scripts: the flag
+        stays unset so the rbxlx writer doesn't apply FPS-only scene
+        settings to a generic project."""
+        from core.roblox_types import RbxPlace as _Place
+
+        project = tmp_path / "fakeproject"
+        (project / "Assets").mkdir(parents=True)
+        out = tmp_path / "out"
+        out.mkdir()
+
+        pl = Pipeline(unity_project_path=project, output_dir=out)
+        pl.state.rbx_place = _Place(
+            scripts=[],
+            workspace_parts=[],
+            screen_guis=[],
+        )
+        pl._subphase_inject_autogen_scripts()
+        assert getattr(pl.state.rbx_place, "is_fps_game", False) is False
+
     def test_subphase_runs_detector_before_autogen_inject(
         self, fps_pipeline_factory,
     ) -> None:
