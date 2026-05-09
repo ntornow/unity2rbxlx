@@ -974,13 +974,18 @@ end
 
 
 def inject_fps_scripts(place: RbxPlace) -> int:
-    """If the game is FPS-style, inject client controller, HUD script, and HUD ScreenGui.
+    """Inject FPS client controller, HUD ScreenGui, and HUDController LocalScript.
+
+    The caller is responsible for deciding whether to invoke this — the
+    pipeline gates it behind ``--scaffolding=fps``. The previous gate
+    auto-detected FPS games via ``detect_fps_game`` and ran on every
+    matching project, sweeping up converted projects whose scripts
+    happened to match the heuristic. The opt-in flag keeps non-FPS
+    projects (Gamekit3D, BoatAttack, ChopChop, RedRunner) free of
+    unwanted UI/input scripts.
 
     Returns the number of scripts/guis added.
     """
-    if not detect_fps_game(place):
-        return 0
-
     added = 0
 
     # Add FPS client controller (only if AI didn't already generate one)

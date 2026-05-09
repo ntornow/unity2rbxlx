@@ -251,6 +251,12 @@ def main(verbose: bool) -> None:
               help="Roblox Universe ID for mesh resolution (reuse across runs)")
 @click.option("--place-id", type=int, default=None,
               help="Roblox Place ID for mesh resolution (reuse across runs)")
+@click.option("--scaffolding", type=str, default=None,
+              help="Comma-separated genre scaffolding to inject (e.g. "
+              "'fps' to add the FPS client controller + HUD ScreenGui + "
+              "HUDController). Default: none — the converter makes no "
+              "game-genre assumptions and only emits scaffolding when "
+              "explicitly requested.")
 def convert(
     unity_project: str,
     output: str,
@@ -263,6 +269,7 @@ def convert(
     creator_id: str | None,
     universe_id: int | None,
     place_id: int | None,
+    scaffolding: str | None,
 ) -> None:
     """Convert a Unity project to a Roblox experience.
 
@@ -295,10 +302,18 @@ def convert(
     if no_ai:
         config.USE_AI_TRANSPILATION = False
 
+    # Parse comma-separated scaffolding list. Unknown names are passed
+    # through to the pipeline; the inject site logs (and ignores) values
+    # it doesn't recognise rather than failing the whole conversion.
+    scaffolding_set: frozenset[str] = frozenset(
+        s.strip().lower() for s in (scaffolding or "").split(",") if s.strip()
+    )
+
     pipeline = Pipeline(
         unity_project_path=project_path,
         output_dir=output_path,
         skip_upload=no_upload,
+        scaffolding=scaffolding_set,
     )
 
     # Plumb --universe-id / --place-id into the pipeline context so the

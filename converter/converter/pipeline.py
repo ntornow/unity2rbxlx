@@ -123,6 +123,7 @@ class Pipeline:
         output_dir: str | Path | None = None,
         skip_upload: bool = False,
         skip_binary_rbxl: bool = False,
+        scaffolding: frozenset[str] | None = None,
     ) -> None:
         self.unity_project_path = self._find_unity_root(Path(unity_project_path).resolve())
         self.output_dir = Path(output_dir or OUTPUT_DIR).resolve()
@@ -131,6 +132,14 @@ class Pipeline:
         # True on the interactive `upload` rebuild (publishes via
         # execute_luau; never reads the .rbxl file).
         self.skip_binary_rbxl = skip_binary_rbxl
+        # Opt-in genre scaffolding. Empty by default — the converter
+        # makes no game-genre assumptions and only emits controllers
+        # / HUDs when explicitly requested. Currently recognised:
+        #   - ``"fps"`` → inject FPS client controller LocalScript,
+        #     HUD ScreenGui, and HUDController LocalScript via
+        #     ``fps_client_generator.inject_fps_scripts``.
+        # Pass via ``u2r.py convert --scaffolding=fps``.
+        self.scaffolding = frozenset(scaffolding or ())
 
         self.ctx = ConversionContext(
             unity_project_path=str(self.unity_project_path),
@@ -2023,13 +2032,35 @@ return table.concat(allData, "\\n")'''
             log.info("[write_output] Bootstrap LocalScript requires %d side-effect modules: %s",
                      len(side_effect_modules), ", ".join(side_effect_modules))
 
-        # Auto-generate client scripts and HUD for FPS-style games.
-        from converter.fps_client_generator import inject_fps_scripts, detect_fps_game
-        fps_added = inject_fps_scripts(self.state.rbx_place)
-        if fps_added:
-            log.info("[write_output] Auto-generated %d FPS client scripts/GUIs", fps_added)
-        if detect_fps_game(self.state.rbx_place):
-            self.state.rbx_place.is_fps_game = True
+        # FPS scaffolding is opt-in — pass ``--scaffolding=fps`` to
+        # request the auto-generated FPS client controller, HUD
+        # ScreenGui, and HUDController LocalScript. Default behaviour
+        # is no game-genre assumptions: non-FPS projects (Gamekit3D,
+        # BoatAttack, ChopChop, RedRunner) get a clean conversion
+        # without unwanted UI/input scripts injected.
+        if "fps" in self.scaffolding:
+            from converter.fps_client_generator import (
+                inject_fps_scripts, detect_fps_game,
+            )
+            fps_added = inject_fps_scripts(self.state.rbx_place)
+            if fps_added:
+                log.info(
+                    "[write_output] Auto-generated %d FPS client scripts/GUIs "
+                    "(--scaffolding=fps)", fps_added,
+                )
+            if detect_fps_game(self.state.rbx_place):
+                self.state.rbx_place.is_fps_game = True
+        else:
+            # Soft hint when the heuristic looks FPS-shaped but no
+            # opt-in. Helps users discover the flag without forcing
+            # the scaffolding on every project that happens to match.
+            from converter.fps_client_generator import detect_fps_game
+            if detect_fps_game(self.state.rbx_place):
+                log.info(
+                    "[write_output] Heuristic detected FPS-style scripts; "
+                    "skipping auto-injected FPS controller/HUD. Pass "
+                    "--scaffolding=fps to opt in."
+                )
 
     def _subphase_encode_terrain(self) -> None:
         """Encode each terrain's heightmap into Roblox SmoothGrid binary and
