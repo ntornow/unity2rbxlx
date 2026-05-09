@@ -244,6 +244,50 @@ class TestScaffoldingPersistence:
         pl.apply_scaffolding([])
         assert pl.scaffolding == frozenset({"fps"})
 
+    def test_unknown_scaffolding_name_warns_but_persists(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """Codex finding [P3] (PR #69 round 4): a typo like
+        ``--scaffolding=fsps`` was previously silent — the value
+        landed in ``conversion_context.json`` and the conversion
+        ran with no FPS scaffolding (the typo isn't ``"fps"``).
+        Validating against the known set logs a warning so the
+        typo surfaces in conversion logs.
+
+        The value is still persisted (forward-compat for genres
+        added in future) — only the warn-on-unknown gate matters.
+        """
+        import logging
+
+        project = tmp_path / "fakeproject"
+        (project / "Assets").mkdir(parents=True)
+        with caplog.at_level(logging.WARNING):
+            pl = Pipeline(
+                unity_project_path=project,
+                output_dir=tmp_path / "out",
+                scaffolding=["fsps"],
+            )
+        assert "fsps" in pl.scaffolding  # persisted forward-compat
+        assert "Unknown scaffolding name" in caplog.text
+        assert "fsps" in caplog.text
+
+    def test_known_scaffolding_name_does_not_warn(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """``--scaffolding=fps`` is the canonical opt-in — must not
+        trigger the unknown-name warning."""
+        import logging
+
+        project = tmp_path / "fakeproject"
+        (project / "Assets").mkdir(parents=True)
+        with caplog.at_level(logging.WARNING):
+            Pipeline(
+                unity_project_path=project,
+                output_dir=tmp_path / "out",
+                scaffolding=["fps"],
+            )
+        assert "Unknown scaffolding name" not in caplog.text
+
     def test_apply_scaffolding_normalises_input(self, tmp_path: Path) -> None:
         """Strip + lowercase, just like the CLI parser. Avoids
         case-sensitivity surprises across CLI vs interactive paths."""
@@ -309,11 +353,11 @@ class TestFpsHeuristicNoFalsePositiveOnAutogen:
         (GameServerManager, CollisionGroupSetup, CollisionFidelityRecook)
         must not trigger ``detect_fps_game``. The detector is meant for
         user-authored content, not the converter's own scaffolding."""
-        from converter.fps_client_generator import (
-            generate_game_server_script,
+        from converter.autogen import (
             generate_collision_fidelity_recook_script,
-            detect_fps_game,
+            generate_game_server_script,
         )
+        from converter.scaffolding.fps import detect_fps_game
 
         place = RbxPlace(
             scripts=[
@@ -449,7 +493,7 @@ class TestBackwardCompatMigration:
           exists on disk (evidence of a pre-PR FPS conversion).
 
     The on-disk signal is reliable because those filenames are ONLY
-    written by ``fps_client_generator`` — they don't appear on a
+    written by ``scaffolding.fps.inject_fps_scripts`` — they don't appear on a
     fresh non-FPS conversion. Distinguishes "resumed from pre-PR FPS
     conversion" from "fresh post-PR run" without false positives.
     """
@@ -484,6 +528,12 @@ class TestBackwardCompatMigration:
         pl = Pipeline(unity_project_path=project, output_dir=out)
         pl.state.rbx_place = _fps_shaped_place()
         pl._is_resume = is_resume
+        # Mirror the real resume paths (``Pipeline.resume`` /
+        # ``convert_interactive._make_pipeline`` / ``u2r.py publish``
+        # rebuild): re-snapshot the FPS-artifact signal AFTER the
+        # ctx swap so the rbxlx scan respects ``ctx.selected_scene``.
+        if is_resume:
+            pl._fps_artifacts_at_init = pl._fps_artifacts_on_disk()
         return pl
 
     def test_migration_infers_fps_when_hud_script_on_disk(
@@ -545,6 +595,224 @@ class TestBackwardCompatMigration:
         pl._subphase_inject_autogen_scripts()
         assert pl.scaffolding == frozenset()
 
+    def test_migration_recognises_legacy_fpscontroller_filename(
+        self, tmp_path: Path,
+    ) -> None:
+        """Codex finding [P2] (PR #69 round 2): the controller script
+        is emitted as ``FPSController.luau`` (caps), not
+        ``FpsClient.luau``. A pre-PR output dir whose HUD script was
+        pruned but whose controller script remains must still
+        trigger the migration."""
+        pl = self._make_pipeline_with_disk_artifacts(tmp_path, {
+            "FPSController.luau": (
+                "-- FPS Client Controller (auto-generated)\n"
+                "-- WASD movement + mouse look + raycast shooting\n"
+            ),
+        })
+        pl._subphase_inject_autogen_scripts()
+        assert "fps" in pl.scaffolding
+
+    def test_migration_scoped_to_selected_scene_rbxlx(
+        self, tmp_path: Path,
+    ) -> None:
+        """Codex finding [P2] (PR #69 round 5): in a multi-scene
+        output dir, a marker in ``main.rbxlx`` (the FPS scene) must
+        NOT migrate the whole conversion when the selected scene is
+        ``menu`` (a non-FPS scene). The scan looks at the
+        selected-scene-specific rbxlx first.
+
+        Tests ``_fps_artifacts_on_disk`` directly with a
+        scene-scoped ctx — the snapshot is taken AFTER ctx is
+        loaded in real resume paths.
+        """
+        project = tmp_path / "Project"
+        scenes_dir = project / "Assets" / "Scenes"
+        scenes_dir.mkdir(parents=True)
+        (scenes_dir / "main.unity").touch()
+        (scenes_dir / "menu.unity").touch()
+        out = tmp_path / "output"
+        out.mkdir()
+        # main.rbxlx has the marker; menu.rbxlx does not.
+        (out / "main.rbxlx").write_text(
+            '<roblox><Item><ProtectedString><![CDATA[\n'
+            '-- HUD Controller (auto-generated)\n'
+            ']]></ProtectedString></Item></roblox>\n'
+        )
+        (out / "menu.rbxlx").write_text(
+            '<roblox><Item><ProtectedString><![CDATA[\n'
+            '-- User-authored menu logic\n'
+            ']]></ProtectedString></Item></roblox>\n'
+        )
+
+        pl = Pipeline(unity_project_path=project, output_dir=out)
+        # Set selected_scene to the non-FPS one (mimics the post-
+        # ctx-swap state of a real resume).
+        pl.ctx.selected_scene = str(scenes_dir / "menu.unity")
+        # Scoped to menu.rbxlx (which has no marker) → no signal.
+        assert pl._fps_artifacts_on_disk() is False
+        # Now flip the selected scene to the FPS one — same dir,
+        # different scope, signal flips to True.
+        pl.ctx.selected_scene = str(scenes_dir / "main.unity")
+        assert pl._fps_artifacts_on_disk() is True
+
+    def test_migration_recognises_multi_scene_rbxlx_filenames(
+        self, tmp_path: Path,
+    ) -> None:
+        """Codex finding [P2] (PR #69 round 2): ``run_all_scenes``
+        writes per-scene rbxlx files (e.g. ``main.rbxlx``,
+        ``menu.rbxlx``) rather than ``converted_place.rbxlx``. The
+        rbxlx fallback must scan every ``*.rbxlx`` in the output dir,
+        not just the canonical name, otherwise multi-scene rebuilds
+        with a pruned scripts cache silently lose FPS scaffolding."""
+        from core.conversion_context import ConversionContext
+
+        project = tmp_path / "Project"
+        (project / "Assets").mkdir(parents=True)
+        out = tmp_path / "output"
+        out.mkdir()
+        # Multi-scene output: no converted_place.rbxlx; per-scene files.
+        (out / "main.rbxlx").write_text(
+            '<roblox version="4">\n'
+            '  <Item class="Script">\n'
+            '    <Properties>\n'
+            '      <ProtectedString name="Source"><![CDATA[\n'
+            '-- HUD Controller (auto-generated)\n'
+            ']]></ProtectedString>\n'
+            '    </Properties>\n'
+            '  </Item>\n'
+            '</roblox>\n'
+        )
+        (out / "menu.rbxlx").write_text(
+            '<roblox version="4"></roblox>\n'
+        )
+        prior = ConversionContext(unity_project_path=str(project))
+        prior.save(out / "conversion_context.json")
+
+        pl = Pipeline(unity_project_path=project, output_dir=out)
+        pl._is_resume = True
+        # Mirror the real resume paths: re-snapshot after the
+        # mocked ctx swap so the rbxlx scan respects ctx state.
+        pl._fps_artifacts_at_init = pl._fps_artifacts_on_disk()
+        # Glob matched main.rbxlx → migration fires.
+        assert pl._fps_artifacts_at_init is True
+        pl.state.rbx_place = _fps_shaped_place()
+        pl._subphase_inject_autogen_scripts()
+        assert "fps" in pl.scaffolding
+
+    def test_migration_signal_falls_back_to_rbxlx_when_scripts_pruned(
+        self, tmp_path: Path,
+    ) -> None:
+        """Codex finding [P2] (PR #69 round 1): a user who archived
+        or pruned ``scripts/`` after a pre-PR FPS conversion still
+        has the canonical rbxlx output. The migration must find the
+        FPS auto-gen marker in that rbxlx so rebuild paths
+        (``u2r.py publish`` rebuild, interactive ``upload``) don't
+        silently drop the FPS scripts.
+        """
+        from core.conversion_context import ConversionContext
+
+        project = tmp_path / "Project"
+        (project / "Assets").mkdir(parents=True)
+        out = tmp_path / "output"
+        out.mkdir()
+        # No scripts/ dir — pruned. rbxlx remains with the marker
+        # embedded in an inline ProtectedString source block.
+        (out / "converted_place.rbxlx").write_text(
+            '<roblox version="4">\n'
+            '  <Item class="Script">\n'
+            '    <Properties>\n'
+            '      <string name="Name">HUDController</string>\n'
+            '      <ProtectedString name="Source"><![CDATA[\n'
+            '-- HUD Controller (auto-generated)\n'
+            '-- Updates health bar, ammo counter, and item indicators\n'
+            ']]></ProtectedString>\n'
+            '    </Properties>\n'
+            '  </Item>\n'
+            '</roblox>\n'
+        )
+        prior = ConversionContext(unity_project_path=str(project))
+        prior.save(out / "conversion_context.json")
+
+        pl = Pipeline(unity_project_path=project, output_dir=out)
+        pl.state.rbx_place = _fps_shaped_place()
+        # Simulate the explicit-resume mark that real publish/
+        # interactive paths set after the ctx swap.
+        pl._is_resume = True
+        # Mirror the real resume paths: re-snapshot after the
+        # mocked ctx swap so the rbxlx scan respects ctx state.
+        pl._fps_artifacts_at_init = pl._fps_artifacts_on_disk()
+        # rbxlx fallback caught the marker even though scripts/ is gone.
+        assert pl._fps_artifacts_at_init is True
+        pl._subphase_inject_autogen_scripts()
+        assert "fps" in pl.scaffolding
+
+    def test_migration_skips_when_rbxlx_lacks_autogen_marker(
+        self, tmp_path: Path,
+    ) -> None:
+        """A rbxlx that doesn't carry the FPS auto-gen marker (e.g.
+        a non-FPS conversion's output) must NOT trigger the
+        migration via the new fallback signal. User-authored scripts
+        bundled in the rbxlx don't carry the canonical marker."""
+        from core.conversion_context import ConversionContext
+
+        project = tmp_path / "Project"
+        (project / "Assets").mkdir(parents=True)
+        out = tmp_path / "output"
+        out.mkdir()
+        (out / "converted_place.rbxlx").write_text(
+            '<roblox version="4">\n'
+            '  <Item class="Script">\n'
+            '    <Properties>\n'
+            '      <string name="Name">UserScript</string>\n'
+            '      <ProtectedString name="Source"><![CDATA[\n'
+            '-- User-authored gameplay script\n'
+            'local x = 1\n'
+            ']]></ProtectedString>\n'
+            '    </Properties>\n'
+            '  </Item>\n'
+            '</roblox>\n'
+        )
+        prior = ConversionContext(unity_project_path=str(project))
+        prior.save(out / "conversion_context.json")
+
+        pl = Pipeline(unity_project_path=project, output_dir=out)
+        pl._is_resume = True
+        # Mirror the real resume paths: re-snapshot after the
+        # mocked ctx swap so the rbxlx scan respects ctx state.
+        pl._fps_artifacts_at_init = pl._fps_artifacts_on_disk()
+        assert pl._fps_artifacts_at_init is False
+        pl.state.rbx_place = _fps_shaped_place()
+        pl._subphase_inject_autogen_scripts()
+        assert pl.scaffolding == frozenset()
+
+    def test_migration_signal_handles_chunk_boundary_marker(
+        self, tmp_path: Path,
+    ) -> None:
+        """The streaming scanner reads the rbxlx in 64KB chunks. A
+        marker straddling the boundary between two chunks must still
+        be detected — the scanner keeps the last
+        (max_marker_len - 1) bytes from the prior chunk to bridge.
+        """
+        project = tmp_path / "Project"
+        (project / "Assets").mkdir(parents=True)
+        out = tmp_path / "output"
+        out.mkdir()
+        # Pad to push the marker across the 64KB chunk boundary.
+        # Marker is 33 chars; pad to land it at offset 65520 so it
+        # spans bytes 65520..65553 (across the 65536 boundary).
+        marker = "-- HUD Controller (auto-generated)"
+        pad_len = 65520
+        content = b"x" * pad_len + marker.encode("utf-8") + b"y" * 1024
+        (out / "converted_place.rbxlx").write_bytes(content)
+
+        pl = Pipeline(unity_project_path=project, output_dir=out)
+        pl._is_resume = True
+        # Mirror the real resume paths: re-snapshot after the
+        # mocked ctx swap so the rbxlx scan respects ctx state.
+        pl._fps_artifacts_at_init = pl._fps_artifacts_on_disk()
+        # Scanner found the boundary-spanning marker.
+        assert pl._fps_artifacts_at_init is True
+
     def test_migration_skips_user_authored_hudcontroller(
         self, tmp_path: Path,
     ) -> None:
@@ -587,12 +855,47 @@ class TestBackwardCompatMigration:
             },
             is_resume=False,  # full convert, not a resume
         )
-        # Disk signal is present...
-        assert pl._fps_artifacts_at_init is True
-        # ...but resume flag is False (full convert).
+        # Disk signal IS present (verified via direct scan), but the
+        # cached snapshot stays False because the fixture only
+        # re-snapshots on resume — mirroring ``run_all`` which never
+        # snapshots either. Both gates false → no migration.
+        assert pl._fps_artifacts_on_disk() is True
+        assert pl._fps_artifacts_at_init is False
         assert pl._is_resume is False
-        # So migration must NOT fire.
         pl._subphase_inject_autogen_scripts()
+        assert pl.scaffolding == frozenset()
+
+    def test_cross_project_resume_clears_persisted_scaffolding(
+        self, tmp_path: Path,
+    ) -> None:
+        """Codex finding [P1] (PR #69 round 4): a cross-project resume
+        must NOT inherit the prior project's persisted scaffolding.
+        Otherwise ``u2r.py convert ProjectB -o ./projectA-output
+        --phase write_output`` would inject ProjectA's FPS HUD into
+        ProjectB despite the project-mismatch warning.
+        """
+        from core.conversion_context import ConversionContext
+
+        project_a = tmp_path / "ProjectA"
+        (project_a / "Assets").mkdir(parents=True)
+        project_b = tmp_path / "ProjectB"
+        (project_b / "Assets").mkdir(parents=True)
+        out = tmp_path / "output"
+        out.mkdir()
+        # Persist ctx for ProjectA with FPS scaffolding marked.
+        prior = ConversionContext(unity_project_path=str(project_a))
+        prior.scaffolding = ["fps"]
+        prior.save(out / "conversion_context.json")
+
+        # Pipeline init for ProjectB resuming from ProjectA's ctx.
+        pl = Pipeline(unity_project_path=project_b, output_dir=out)
+        try:
+            pl.resume("write_output")
+        except Exception:
+            pass
+        # Cross-project → resume flag stays False AND persisted
+        # scaffolding is cleared so it doesn't leak into ProjectB.
+        assert pl._is_resume is False
         assert pl.scaffolding == frozenset()
 
     def test_resume_validates_project_match(
@@ -772,7 +1075,7 @@ class TestInjectFpsScriptsIdempotent:
     """
 
     def test_does_not_double_inject_hud_controller(self) -> None:
-        from converter.fps_client_generator import (
+        from converter.scaffolding.fps import (
             inject_fps_scripts, generate_hud_client_script,
         )
 
@@ -803,7 +1106,7 @@ class TestInjectFpsScriptsIdempotent:
         Marker-based dedupe (across both canonical names) keeps the
         legacy script as the single auto-gen listener.
         """
-        from converter.fps_client_generator import inject_fps_scripts
+        from converter.scaffolding.fps import inject_fps_scripts
 
         place = RbxPlace(
             scripts=[
@@ -836,7 +1139,7 @@ class TestInjectFpsScriptsIdempotent:
     def test_first_invocation_still_injects_hud(self) -> None:
         """A truly fresh place still gets the AutoFpsHudController —
         the guard short-circuits only when one already exists."""
-        from converter.fps_client_generator import inject_fps_scripts
+        from converter.scaffolding.fps import inject_fps_scripts
 
         place = RbxPlace(scripts=[], workspace_parts=[], screen_guis=[])
         inject_fps_scripts(place)
@@ -855,7 +1158,7 @@ class TestInjectFpsScriptsIdempotent:
         scripts coexist on disk under different filenames — the user's
         custom HUD logic and the auto-generated event-listener wiring
         for the FPS HUD ScreenGui both run."""
-        from converter.fps_client_generator import inject_fps_scripts
+        from converter.scaffolding.fps import inject_fps_scripts
 
         place = RbxPlace(
             scripts=[

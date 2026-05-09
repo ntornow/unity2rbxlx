@@ -203,6 +203,11 @@ def _make_pipeline(
         # FPS scripts as legitimately preserved (not stale leftovers
         # from a foreign-project conversion that shared this dir).
         pipeline._is_resume = True
+        # Re-snapshot the FPS migration signal AFTER the ctx swap so
+        # the rbxlx scan can scope to ``ctx.selected_scene`` for
+        # multi-scene runs.
+        if hasattr(pipeline, "_fps_artifacts_on_disk"):
+            pipeline._fps_artifacts_at_init = pipeline._fps_artifacts_on_disk()
         # Re-merge the caller's scaffolding request after the ctx swap
         # — the rehydrated ctx may carry persisted entries; the new
         # request adds to them (additive, idempotent).

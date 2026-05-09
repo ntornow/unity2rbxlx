@@ -165,7 +165,7 @@ class TestSimpleFPSConversion:
         assert tr.total_transpiled > 0
 
     def test_fps_client_generator(self):
-        from converter.fps_client_generator import generate_hud_client_script
+        from converter.scaffolding.fps import generate_hud_client_script
 
         script = generate_hud_client_script()
         assert "HUD" in script.source

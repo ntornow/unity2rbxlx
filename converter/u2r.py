@@ -571,6 +571,10 @@ def publish(
         # publish-cache tests.
         if hasattr(pipeline, "_is_resume"):
             pipeline._is_resume = True
+        if hasattr(pipeline, "_fps_artifacts_on_disk"):
+            # Re-snapshot now that ctx carries selected_scene so the
+            # rbxlx scan can scope per-scene for multi-scene rebuilds.
+            pipeline._fps_artifacts_at_init = pipeline._fps_artifacts_on_disk()
         # Re-merge the caller's scaffolding request after the ctx swap.
         # Old contexts (saved before the scaffolding field existed)
         # rehydrate as ``scaffolding=[]``; passing ``--scaffolding=fps``

@@ -8,37 +8,29 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
 
 ## Pipeline / runtime gaps
 
-- [ ] **P1 — Remove FPS-specific logic from the converter
-  (`fps_client_generator.py`) [PART 2 — extraction].** PR #66 generalized
-  `script_coherence_packs.py` (the producer/consumer BindableEvent bridge
-  and the Pickup RemoteEvent canonicalization). PR #1 of this refactor
-  flipped the default to "no auto-inject" via the new
-  `--scaffolding=fps` opt-in flag — non-FPS projects (Gamekit3D,
-  BoatAttack, ChopChop, RedRunner) now convert clean without unwanted
-  UI/input scripts.
+- [ ] **P3 — Optional component-aware autogen injection.** The
+  remaining piece of the original FPS-extraction P1: replace the
+  heuristic-based ``detect_fps_game`` with component-aware injection.
+  e.g. emit a Cinemachine bridge only when the scene actually has a
+  CinemachineVirtualCamera, not when the script heuristic matches.
+  Currently the detector still runs as a soft hint when
+  ``--scaffolding=fps`` is not passed.
 
-  Remaining work for PR #2:
-  - Extract the genuinely-generic helpers (e.g. `connectClient` event
-    dispatch in `generate_hud_client_script`) into a generic
-    runtime/library module under `runtime/`, since they apply regardless
-    of game genre.
-  - Move the FPS-specific emitters (`generate_fps_client_script`,
-    `generate_hud_screen_gui`, `generate_hud_client_script`,
-    `inject_fps_scripts`, `detect_fps_game`, `_has_client_fps_controller`,
-    `_has_hud_screen_gui`) into a project-scoped scaffolding folder
-    (e.g. `converter/scaffolding/fps.py`).
-  - Keep generic emitters (`generate_game_server_script`,
-    `generate_collision_group_script`,
-    `generate_collision_fidelity_recook_script`) in their current
-    location, or move to `converter/autogen.py` for clarity.
-  - Optional: replace the heuristic-only detector with component-aware
-    injection — e.g. emit a Cinemachine bridge only when the scene
-    actually has a CinemachineVirtualCamera, not when the heuristic
-    matches.
+  Earlier phases of this work shipped:
+  - PR #66: generalized ``script_coherence_packs.py``.
+  - PR #1 (#68): made FPS scaffolding opt-in via ``--scaffolding=fps``.
+  - PR #2: split ``fps_client_generator.py`` into
+    ``converter/scaffolding/fps.py`` (FPS-specific) and
+    ``converter/autogen.py`` (generic autogen scripts), with the
+    historic name kept as a thin re-export shim.
 
-  Acceptance test (PR #1, ALREADY PASSES): convert a non-FPS project and
-  confirm none of `fps_client_generator.py`'s outputs are emitted unless
-  `--scaffolding=fps` is passed.
+  Optional remaining cleanup:
+  - Extract ``connectClient`` from the inline body of
+    ``generate_hud_client_script`` into a runtime library module
+    under ``runtime/event_dispatch.luau`` so other scaffolding
+    modules can reuse it.
+  - Eventually remove the ``fps_client_generator.py`` shim once any
+    external callers have migrated.
 
 - [ ] **P2 — Persistent prefab/asset cache.** Prefab library is in-memory only.
   SQLite or pickle cache keyed by `(GUID, mtime)` would halve pipeline time

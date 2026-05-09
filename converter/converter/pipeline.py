@@ -148,7 +148,7 @@ class Pipeline:
         # game-genre assumptions. Currently recognised:
         #   - ``"fps"`` → inject FPS client controller LocalScript,
         #     HUD ScreenGui, and HUDController LocalScript via
-        #     ``fps_client_generator.inject_fps_scripts``.
+        #     ``scaffolding.fps.inject_fps_scripts``.
         # Pass via ``u2r.py convert --scaffolding=fps`` or merge in via
         # :meth:`apply_scaffolding` after rehydrating ctx from disk.
         #
@@ -163,16 +163,21 @@ class Pipeline:
             sorted({str(s).strip().lower() for s in (scaffolding or ()) if str(s).strip()})
         )
         if self._init_scaffolding:
-            self.ctx.scaffolding = list(self._init_scaffolding)
+            # Route through apply_scaffolding so unknown-name validation
+            # fires here too — otherwise a typo'd
+            # ``Pipeline(scaffolding=["fsps"])`` would persist silently.
+            self.apply_scaffolding(self._init_scaffolding)
 
-        # Snapshot the backward-compat migration signal AT INIT TIME,
-        # before any subphase wipes the scripts/ dir. ``write_output()``
-        # calls ``_subphase_emit_scripts_to_disk`` (which rmtrees
-        # ``scripts/`` when ``--retranspile`` is set) BEFORE
-        # ``_subphase_inject_autogen_scripts``, so checking on-disk
-        # files in the inject subphase would miss the pre-PR signal
-        # that's been deleted.
-        self._fps_artifacts_at_init: bool = self._fps_artifacts_on_disk()
+        # ``_fps_artifacts_at_init`` caches the backward-compat
+        # migration signal BEFORE ``_subphase_emit_scripts_to_disk``
+        # wipes ``scripts/`` (with ``--retranspile``). Default False
+        # at construction — only resume/rebuild paths re-snapshot
+        # this with a properly-loaded ctx (so the rbxlx scan can
+        # scope to ``ctx.selected_scene`` for multi-scene runs).
+        # Fresh ``run_all()`` doesn't trigger migration anyway
+        # (``_is_resume`` stays False), so the init-time default of
+        # False is safe.
+        self._fps_artifacts_at_init: bool = False
 
         # ``_is_resume`` flags an EXPLICIT resume/rebuild (set True
         # by :meth:`resume` and the publish-rebuild path in u2r.py
@@ -227,32 +232,120 @@ class Pipeline:
         to identically-named .luau files in ``scripts/``) doesn't
         falsely trigger the migration on a fresh conversion.
         """
+        # Two signals — the user keeps either to count as a true
+        # pre-PR FPS output:
+        #   1. ``scripts/<name>.luau`` carrying the auto-gen marker
+        #      for any of the historic FPS-emitted script names.
+        #   2. The rbxlx output itself contains the auto-gen marker
+        #      string. Survives cache pruning — users who archive or
+        #      shrink an output dir tend to keep the rbxlx as the
+        #      canonical artifact even when the scripts cache goes.
+        # Either signal flips True; user-authored .cs/.luau files
+        # transpiled into the scripts dir don't carry the marker.
+        #
+        # ``.rbxl`` is intentionally NOT a fallback target: our binary
+        # writer LZ4-compresses script source inside PROP chunks, so
+        # the marker comment is not reliably present as a UTF-8
+        # substring. Users who keep only the binary file lose the
+        # migration signal — documented as a known limitation; the
+        # workaround is to pass ``--scaffolding=fps`` explicitly on
+        # rebuild, which the publish CLI surfaces.
         scripts_dir = self.output_dir / "scripts"
-        if not scripts_dir.is_dir():
-            return False
-        # Both the legacy filename (``HUDController.luau`` from pre-PR
-        # auto-gen, before the rename to ``AutoFpsHudController``) and
-        # the new filename are recognised so the migration works
-        # against output dirs from either era. Marker presence is the
-        # final discriminator — user-authored files don't carry it.
-        candidates = (
-            "HUDController.luau",
-            "AutoFpsHudController.luau",
-            "FpsClient.luau",
-        )
-        for name in candidates:
-            path = scripts_dir / name
-            if not path.exists():
-                continue
-            try:
-                # Only read the first ~256 bytes — markers always live
-                # in the first comment line.
-                head = path.read_text(encoding="utf-8", errors="replace")[:256]
-            except OSError:
-                continue
-            if any(marker in head for marker in self._FPS_AUTOGEN_MARKERS):
+        if scripts_dir.is_dir():
+            # Recognised auto-gen filenames across pipeline eras:
+            #   - ``HUDController.luau`` (pre-rename HUD listener)
+            #   - ``AutoFpsHudController.luau`` (post-rename HUD listener)
+            #   - ``FpsClient.luau`` (legacy controller stub name)
+            #   - ``FPSController.luau`` (the actual generated
+            #     controller name from ``generate_fps_client_script``)
+            candidates = (
+                "HUDController.luau",
+                "AutoFpsHudController.luau",
+                "FpsClient.luau",
+                "FPSController.luau",
+            )
+            for name in candidates:
+                path = scripts_dir / name
+                if not path.exists():
+                    continue
+                try:
+                    # Only read the first ~256 bytes — markers always live
+                    # in the first comment line.
+                    head = path.read_text(encoding="utf-8", errors="replace")[:256]
+                except OSError:
+                    continue
+                if any(marker in head for marker in self._FPS_AUTOGEN_MARKERS):
+                    return True
+
+        # Fallback: scan the rbxlx for the marker. Scope matters for
+        # multi-scene output dirs (``run_all_scenes`` writes per-scene
+        # files like ``main.rbxlx`` and ``menu.rbxlx``) — a marker in
+        # ``main.rbxlx`` shouldn't migrate the whole project to
+        # ``scaffolding=['fps']`` if only the main scene was FPS-shaped
+        # and the menu wasn't. Prefer the SELECTED-scene-specific
+        # rbxlx when available, fall back to the canonical
+        # single-scene name, and only glob ``*.rbxlx`` as a
+        # last-resort safety net (a multi-scene rebuild with no
+        # selected scene set).
+        place_files: list[Path] = []
+        if self.ctx.selected_scene:
+            scene_stem = Path(self.ctx.selected_scene).stem
+            scoped = self.output_dir / f"{scene_stem}.rbxlx"
+            if scoped.exists():
+                place_files.append(scoped)
+        canonical = self.output_dir / "converted_place.rbxlx"
+        if canonical.exists() and canonical not in place_files:
+            place_files.append(canonical)
+        if not place_files:
+            # Last resort for unscoped multi-scene rebuilds; matches
+            # the conservative pre-scoped behaviour but only when no
+            # scene-specific signal is available.
+            place_files.extend(self.output_dir.glob("*.rbxlx"))
+        for place_file in place_files:
+            if self._file_contains_any_marker(place_file):
                 return True
         return False
+
+    def _file_contains_any_marker(self, path: Path) -> bool:
+        """Stream-search *path* for any FPS auto-gen marker.
+
+        Reads in 64KB chunks so a multi-MB rbxlx doesn't load fully
+        into memory just for a substring check. Reads with
+        ``errors="replace"`` so the binary rbxl format (which embeds
+        the same marker text in its compressed source blocks) doesn't
+        trip a UnicodeDecodeError. Bridges the chunk boundary by
+        keeping the last ``len(longest_marker) - 1`` bytes from the
+        previous chunk.
+        """
+        markers = self._FPS_AUTOGEN_MARKERS
+        if not markers:
+            return False
+        max_marker_len = max(len(m) for m in markers)
+        try:
+            with path.open("rb") as f:
+                tail = b""
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        return False
+                    blob = tail + chunk
+                    text = blob.decode("utf-8", errors="replace")
+                    for marker in markers:
+                        if marker in text:
+                            return True
+                    # Keep the last (max_marker_len - 1) bytes so the
+                    # next iteration sees markers that straddle the
+                    # boundary.
+                    tail = blob[-(max_marker_len - 1):] if max_marker_len > 1 else b""
+        except OSError:
+            return False
+
+    # Scaffolding names the pipeline knows how to inject. Unknown
+    # names are accepted (forward-compat with future genres) but
+    # logged at WARN level so a typo like ``--scaffolding=fsps``
+    # surfaces in the conversion logs instead of silently persisting
+    # an inert no-op into ``conversion_context.json``.
+    _KNOWN_SCAFFOLDING: frozenset[str] = frozenset({"fps"})
 
     def apply_scaffolding(self, scaffolding: Iterable[str] | None) -> None:
         """Merge *scaffolding* into ``self.ctx.scaffolding``.
@@ -262,12 +355,28 @@ class Pipeline:
         request without dropping previously persisted entries.
         Empty/None inputs are no-ops, so resume paths that don't pass
         ``--scaffolding`` simply preserve the persisted set.
+
+        Logs a warning for unknown scaffolding names — the value is
+        still persisted (forward-compat for future genres), but the
+        log helps users catch typos like ``--scaffolding=fsps``
+        instead of silently writing an inert entry into
+        ``conversion_context.json``.
         """
         if not scaffolding:
             return
-        merged = set(self.ctx.scaffolding or ()) | {
+        normalised = {
             str(s).strip().lower() for s in scaffolding if str(s).strip()
         }
+        unknown = normalised - self._KNOWN_SCAFFOLDING
+        if unknown:
+            log.warning(
+                "[scaffolding] Unknown scaffolding name(s) %s — "
+                "persisting them anyway (forward-compat) but the "
+                "pipeline currently only honours %s. Check for typos.",
+                sorted(unknown),
+                sorted(self._KNOWN_SCAFFOLDING),
+            )
+        merged = set(self.ctx.scaffolding or ()) | normalised
         self.ctx.scaffolding = sorted(merged)
 
     @staticmethod
@@ -475,7 +584,33 @@ class Pipeline:
             )
             self.ctx = loaded
             self._is_resume = same_project
+            # Re-take the FPS artifact snapshot now that ctx carries
+            # ``selected_scene`` — the snapshot logic scopes the
+            # rbxlx scan to the selected-scene-specific output file
+            # for multi-scene runs. The init-time snapshot (taken
+            # with a fresh empty ctx) couldn't see that scope.
+            self._fps_artifacts_at_init = self._fps_artifacts_on_disk()
             if not same_project:
+                # Drop the prior project's persisted scaffolding too:
+                # a cross-project resume that inherits ``["fps"]`` from
+                # ProjectA's ctx would inject FPS scaffolding into
+                # ProjectB even though the mismatch warning explicitly
+                # warned about cross-project leakage. Clearing the
+                # field is the simplest safe behaviour — the caller
+                # can re-pass ``--scaffolding=fps`` via the
+                # constructor's ``scaffolding`` arg if they actually
+                # want it for the new project (and that re-application
+                # happens below).
+                if self.ctx.scaffolding:
+                    log.warning(
+                        "[resume] Clearing persisted scaffolding %r "
+                        "from cross-project ctx (was for %r, this "
+                        "Pipeline targets %r).",
+                        list(self.ctx.scaffolding),
+                        loaded.unity_project_path,
+                        str(self.unity_project_path),
+                    )
+                    self.ctx.scaffolding = []
                 log.warning(
                     "[resume] Persisted ctx targets %r but this "
                     "Pipeline is configured for %r. Loading state "
@@ -2062,7 +2197,7 @@ return table.concat(allData, "\\n")'''
         # in ``place.scripts``. Otherwise ``detect_fps_game`` matches
         # the converter's own autogen and the soft hint fires on every
         # non-FPS conversion.
-        from converter.fps_client_generator import detect_fps_game
+        from converter.scaffolding.fps import detect_fps_game
         looks_fps = detect_fps_game(self.state.rbx_place)
 
         # Backward-compat migration: an output directory created before
@@ -2096,7 +2231,7 @@ return table.concat(allData, "\\n")'''
             self.apply_scaffolding(["fps"])
 
         # Auto-generate collision group setup if Unity layers are used.
-        from converter.fps_client_generator import generate_collision_group_script
+        from converter.autogen import generate_collision_group_script
         has_layers = False
         def _check_layers(parts):
             nonlocal has_layers
@@ -2114,7 +2249,7 @@ return table.concat(allData, "\\n")'''
             log.info("[write_output] Injected CollisionGroupSetup script")
 
         # Auto-generate game server manager (spawn system, player init).
-        from converter.fps_client_generator import generate_game_server_script
+        from converter.autogen import generate_game_server_script
         existing_server_mgr = [s for s in self.state.rbx_place.scripts if s.name == "GameServerManager"]
         if not existing_server_mgr:
             self.state.rbx_place.scripts.append(generate_game_server_script())
@@ -2130,7 +2265,7 @@ return table.concat(allData, "\\n")'''
         # collision (Roblox doesn't re-cook on property assignment),
         # producing invisible bounding-box blockers behind hollow
         # shapes like door frames.
-        from converter.fps_client_generator import (
+        from converter.autogen import (
             generate_collision_fidelity_recook_script,
         )
         existing_recook = [
@@ -2260,7 +2395,7 @@ return table.concat(allData, "\\n")'''
             self.state.rbx_place.is_fps_game = True
 
         if "fps" in self.scaffolding:
-            from converter.fps_client_generator import inject_fps_scripts
+            from converter.scaffolding.fps import inject_fps_scripts
             fps_added = inject_fps_scripts(self.state.rbx_place)
             if fps_added:
                 log.info(
