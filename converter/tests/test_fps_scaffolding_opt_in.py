@@ -244,6 +244,50 @@ class TestScaffoldingPersistence:
         pl.apply_scaffolding([])
         assert pl.scaffolding == frozenset({"fps"})
 
+    def test_unknown_scaffolding_name_warns_but_persists(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """Codex finding [P3] (PR #69 round 4): a typo like
+        ``--scaffolding=fsps`` was previously silent — the value
+        landed in ``conversion_context.json`` and the conversion
+        ran with no FPS scaffolding (the typo isn't ``"fps"``).
+        Validating against the known set logs a warning so the
+        typo surfaces in conversion logs.
+
+        The value is still persisted (forward-compat for genres
+        added in future) — only the warn-on-unknown gate matters.
+        """
+        import logging
+
+        project = tmp_path / "fakeproject"
+        (project / "Assets").mkdir(parents=True)
+        with caplog.at_level(logging.WARNING):
+            pl = Pipeline(
+                unity_project_path=project,
+                output_dir=tmp_path / "out",
+                scaffolding=["fsps"],
+            )
+        assert "fsps" in pl.scaffolding  # persisted forward-compat
+        assert "Unknown scaffolding name" in caplog.text
+        assert "fsps" in caplog.text
+
+    def test_known_scaffolding_name_does_not_warn(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """``--scaffolding=fps`` is the canonical opt-in — must not
+        trigger the unknown-name warning."""
+        import logging
+
+        project = tmp_path / "fakeproject"
+        (project / "Assets").mkdir(parents=True)
+        with caplog.at_level(logging.WARNING):
+            Pipeline(
+                unity_project_path=project,
+                output_dir=tmp_path / "out",
+                scaffolding=["fps"],
+            )
+        assert "Unknown scaffolding name" not in caplog.text
+
     def test_apply_scaffolding_normalises_input(self, tmp_path: Path) -> None:
         """Strip + lowercase, just like the CLI parser. Avoids
         case-sensitivity surprises across CLI vs interactive paths."""
@@ -756,6 +800,39 @@ class TestBackwardCompatMigration:
         assert pl._is_resume is False
         # So migration must NOT fire.
         pl._subphase_inject_autogen_scripts()
+        assert pl.scaffolding == frozenset()
+
+    def test_cross_project_resume_clears_persisted_scaffolding(
+        self, tmp_path: Path,
+    ) -> None:
+        """Codex finding [P1] (PR #69 round 4): a cross-project resume
+        must NOT inherit the prior project's persisted scaffolding.
+        Otherwise ``u2r.py convert ProjectB -o ./projectA-output
+        --phase write_output`` would inject ProjectA's FPS HUD into
+        ProjectB despite the project-mismatch warning.
+        """
+        from core.conversion_context import ConversionContext
+
+        project_a = tmp_path / "ProjectA"
+        (project_a / "Assets").mkdir(parents=True)
+        project_b = tmp_path / "ProjectB"
+        (project_b / "Assets").mkdir(parents=True)
+        out = tmp_path / "output"
+        out.mkdir()
+        # Persist ctx for ProjectA with FPS scaffolding marked.
+        prior = ConversionContext(unity_project_path=str(project_a))
+        prior.scaffolding = ["fps"]
+        prior.save(out / "conversion_context.json")
+
+        # Pipeline init for ProjectB resuming from ProjectA's ctx.
+        pl = Pipeline(unity_project_path=project_b, output_dir=out)
+        try:
+            pl.resume("write_output")
+        except Exception:
+            pass
+        # Cross-project → resume flag stays False AND persisted
+        # scaffolding is cleared so it doesn't leak into ProjectB.
+        assert pl._is_resume is False
         assert pl.scaffolding == frozenset()
 
     def test_resume_validates_project_match(

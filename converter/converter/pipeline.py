@@ -163,7 +163,10 @@ class Pipeline:
             sorted({str(s).strip().lower() for s in (scaffolding or ()) if str(s).strip()})
         )
         if self._init_scaffolding:
-            self.ctx.scaffolding = list(self._init_scaffolding)
+            # Route through apply_scaffolding so unknown-name validation
+            # fires here too — otherwise a typo'd
+            # ``Pipeline(scaffolding=["fsps"])`` would persist silently.
+            self.apply_scaffolding(self._init_scaffolding)
 
         # Snapshot the backward-compat migration signal AT INIT TIME,
         # before any subphase wipes the scripts/ dir. ``write_output()``
@@ -317,6 +320,13 @@ class Pipeline:
         except OSError:
             return False
 
+    # Scaffolding names the pipeline knows how to inject. Unknown
+    # names are accepted (forward-compat with future genres) but
+    # logged at WARN level so a typo like ``--scaffolding=fsps``
+    # surfaces in the conversion logs instead of silently persisting
+    # an inert no-op into ``conversion_context.json``.
+    _KNOWN_SCAFFOLDING: frozenset[str] = frozenset({"fps"})
+
     def apply_scaffolding(self, scaffolding: Iterable[str] | None) -> None:
         """Merge *scaffolding* into ``self.ctx.scaffolding``.
 
@@ -325,12 +335,28 @@ class Pipeline:
         request without dropping previously persisted entries.
         Empty/None inputs are no-ops, so resume paths that don't pass
         ``--scaffolding`` simply preserve the persisted set.
+
+        Logs a warning for unknown scaffolding names — the value is
+        still persisted (forward-compat for future genres), but the
+        log helps users catch typos like ``--scaffolding=fsps``
+        instead of silently writing an inert entry into
+        ``conversion_context.json``.
         """
         if not scaffolding:
             return
-        merged = set(self.ctx.scaffolding or ()) | {
+        normalised = {
             str(s).strip().lower() for s in scaffolding if str(s).strip()
         }
+        unknown = normalised - self._KNOWN_SCAFFOLDING
+        if unknown:
+            log.warning(
+                "[scaffolding] Unknown scaffolding name(s) %s — "
+                "persisting them anyway (forward-compat) but the "
+                "pipeline currently only honours %s. Check for typos.",
+                sorted(unknown),
+                sorted(self._KNOWN_SCAFFOLDING),
+            )
+        merged = set(self.ctx.scaffolding or ()) | normalised
         self.ctx.scaffolding = sorted(merged)
 
     @staticmethod
@@ -539,6 +565,26 @@ class Pipeline:
             self.ctx = loaded
             self._is_resume = same_project
             if not same_project:
+                # Drop the prior project's persisted scaffolding too:
+                # a cross-project resume that inherits ``["fps"]`` from
+                # ProjectA's ctx would inject FPS scaffolding into
+                # ProjectB even though the mismatch warning explicitly
+                # warned about cross-project leakage. Clearing the
+                # field is the simplest safe behaviour — the caller
+                # can re-pass ``--scaffolding=fps`` via the
+                # constructor's ``scaffolding`` arg if they actually
+                # want it for the new project (and that re-application
+                # happens below).
+                if self.ctx.scaffolding:
+                    log.warning(
+                        "[resume] Clearing persisted scaffolding %r "
+                        "from cross-project ctx (was for %r, this "
+                        "Pipeline targets %r).",
+                        list(self.ctx.scaffolding),
+                        loaded.unity_project_path,
+                        str(self.unity_project_path),
+                    )
+                    self.ctx.scaffolding = []
                 log.warning(
                     "[resume] Persisted ctx targets %r but this "
                     "Pipeline is configured for %r. Loading state "
