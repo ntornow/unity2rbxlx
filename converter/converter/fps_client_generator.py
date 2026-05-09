@@ -1004,9 +1004,21 @@ def inject_fps_scripts(place: RbxPlace) -> int:
     else:
         log.info("Skipping HUD ScreenGui injection (Canvas-converted HUD already exists)")
 
-    # Add HUD controller LocalScript
-    place.scripts.append(generate_hud_client_script())
-    added += 1
-    log.info("Injected HUD controller LocalScript")
+    # Add HUD controller LocalScript only if one isn't already present.
+    # Without this guard, a second ``assemble``/``publish`` rebuild
+    # against an existing FPS output dir appends a duplicate
+    # ``HUDController`` — the previous run's HUDController is
+    # rehydrated from disk into ``place.scripts``, then this branch
+    # appends a fresh one. Two listeners on the same HUD events
+    # double-update health/ammo/items.
+    has_hud_controller = any(
+        s.name == "HUDController" for s in place.scripts
+    )
+    if not has_hud_controller:
+        place.scripts.append(generate_hud_client_script())
+        added += 1
+        log.info("Injected HUD controller LocalScript")
+    else:
+        log.info("Skipping HUDController injection (already present from prior conversion)")
 
     return added

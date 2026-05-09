@@ -177,6 +177,17 @@ class Pipeline:
         """
         return frozenset(self.ctx.scaffolding or ())
 
+    # Marker comments at the top of every auto-generated FPS script.
+    # Match against file CONTENT (not just filename) because a user's
+    # own Unity ``HUDController.cs`` / ``FpsClient.cs`` would transpile
+    # to identically-named ``.luau`` files in this output dir, and the
+    # backward-compat migration must not misclassify those as evidence
+    # of a pre-PR FPS conversion.
+    _FPS_AUTOGEN_MARKERS: tuple[str, ...] = (
+        "-- HUD Controller (auto-generated)",
+        "-- FPS Client Controller (auto-generated)",
+    )
+
     def _fps_artifacts_on_disk(self) -> bool:
         """Return True if this output dir already contains FPS scripts
         emitted by a pre-scaffolding-flag conversion run.
@@ -185,16 +196,28 @@ class Pipeline:
         :meth:`_subphase_inject_autogen_scripts` to distinguish
         "resumed from a pre-PR FPS conversion" (where we should
         re-emit the FPS scripts) from "fresh post-PR conversion"
-        (where the user must opt in explicitly). Checks for the
-        canonical script names that ``fps_client_generator`` emits —
-        ``HUDController.luau`` and ``FpsClient.luau`` — both of which
-        only appear when ``inject_fps_scripts`` ran.
+        (where the user must opt in explicitly).
+
+        Checks file CONTENT for the auto-generated header comments
+        rather than just file names, so a Unity project that ships
+        its own ``HUDController.cs`` or ``FpsClient.cs`` (transpiled
+        to identically-named .luau files in ``scripts/``) doesn't
+        falsely trigger the migration on a fresh conversion.
         """
         scripts_dir = self.output_dir / "scripts"
         if not scripts_dir.is_dir():
             return False
         for name in ("HUDController.luau", "FpsClient.luau"):
-            if (scripts_dir / name).exists():
+            path = scripts_dir / name
+            if not path.exists():
+                continue
+            try:
+                # Only read the first ~256 bytes — markers always live
+                # in the first comment line.
+                head = path.read_text(encoding="utf-8", errors="replace")[:256]
+            except OSError:
+                continue
+            if any(marker in head for marker in self._FPS_AUTOGEN_MARKERS):
                 return True
         return False
 

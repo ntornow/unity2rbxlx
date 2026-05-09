@@ -458,12 +458,14 @@ class TestBackwardCompatMigration:
         self, fps_pipeline_factory, tmp_path,
     ) -> None:
         pl = fps_pipeline_factory(None)
-        # Simulate a pre-PR conversion: HUDController.luau exists in
-        # the output's scripts dir, but ctx.scaffolding is empty.
+        # Simulate a pre-PR conversion: HUDController.luau with the
+        # canonical auto-generated marker exists in scripts/, but
+        # ctx.scaffolding is empty (saved before the field existed).
         scripts_dir = pl.output_dir / "scripts"
         scripts_dir.mkdir(parents=True, exist_ok=True)
         (scripts_dir / "HUDController.luau").write_text(
-            "-- legacy HUD script from pre-PR FPS conversion\n",
+            "-- HUD Controller (auto-generated)\n"
+            "-- Updates health bar, ammo counter, and item indicators\n",
         )
         assert pl.scaffolding == frozenset()
         pl._subphase_inject_autogen_scripts()
@@ -475,12 +477,13 @@ class TestBackwardCompatMigration:
     def test_migration_infers_fps_when_fpsclient_on_disk(
         self, fps_pipeline_factory,
     ) -> None:
-        """Either canonical script name triggers the migration."""
+        """Either canonical auto-generated script triggers the migration."""
         pl = fps_pipeline_factory(None)
         scripts_dir = pl.output_dir / "scripts"
         scripts_dir.mkdir(parents=True, exist_ok=True)
         (scripts_dir / "FpsClient.luau").write_text(
-            "-- legacy FPS controller from pre-PR conversion\n",
+            "-- FPS Client Controller (auto-generated)\n"
+            "-- WASD movement + mouse look + raycast shooting\n",
         )
         pl._subphase_inject_autogen_scripts()
         assert "fps" in pl.scaffolding
@@ -512,3 +515,77 @@ class TestBackwardCompatMigration:
         (scripts_dir / "Door.luau").write_text("-- user door script\n")
         pl._subphase_inject_autogen_scripts()
         assert pl.scaffolding == frozenset()
+
+    def test_migration_skips_user_authored_hudcontroller(
+        self, fps_pipeline_factory,
+    ) -> None:
+        """A Unity project that ships its own ``HUDController.cs`` will
+        transpile to ``HUDController.luau`` in ``scripts/`` on every
+        conversion. The migration must NOT misclassify that file as
+        evidence of a pre-PR FPS conversion — the auto-generated
+        marker comment is the discriminator."""
+        pl = fps_pipeline_factory(None)
+        scripts_dir = pl.output_dir / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        # User-authored content — no auto-generated marker.
+        (scripts_dir / "HUDController.luau").write_text(
+            '-- User HUD controller (transpiled from HUDController.cs)\n'
+            'local Players = game:GetService("Players")\n',
+        )
+        pl._subphase_inject_autogen_scripts()
+        assert pl.scaffolding == frozenset()
+
+    def test_migration_fires_only_on_autogen_marker(
+        self, fps_pipeline_factory,
+    ) -> None:
+        """The auto-generated marker comment IS the discriminator —
+        flip the migration on by adding the marker to a same-named
+        file. Same file path, different content → different result."""
+        pl = fps_pipeline_factory(None)
+        scripts_dir = pl.output_dir / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        # Auto-generated content — has the canonical marker.
+        (scripts_dir / "HUDController.luau").write_text(
+            '-- HUD Controller (auto-generated)\n'
+            '-- Updates health bar, ammo counter, and item indicators\n',
+        )
+        pl._subphase_inject_autogen_scripts()
+        assert "fps" in pl.scaffolding
+
+
+class TestInjectFpsScriptsIdempotent:
+    """``inject_fps_scripts`` must be safe to call against a place
+    that already contains a HUDController from a prior run. Without
+    a guard, a second ``assemble``/``publish`` rebuild against an
+    existing FPS output dir appends a duplicate HUDController — both
+    listeners fire on the same HUD events and double-update health/
+    ammo/items.
+    """
+
+    def test_does_not_double_inject_hud_controller(self) -> None:
+        from converter.fps_client_generator import (
+            inject_fps_scripts, generate_hud_client_script,
+        )
+
+        # Place already has a HUDController (rehydrated from prior run).
+        place = RbxPlace(
+            scripts=[generate_hud_client_script()],
+            workspace_parts=[],
+            screen_guis=[],
+        )
+        inject_fps_scripts(place)
+        hud_count = sum(1 for s in place.scripts if s.name == "HUDController")
+        assert hud_count == 1, (
+            f"expected 1 HUDController, got {hud_count} — duplicate "
+            "injection on rerun double-fires HUD updates"
+        )
+
+    def test_first_invocation_still_injects_hud(self) -> None:
+        """A truly fresh place still gets the HUDController — the
+        guard short-circuits only when one already exists."""
+        from converter.fps_client_generator import inject_fps_scripts
+
+        place = RbxPlace(scripts=[], workspace_parts=[], screen_guis=[])
+        inject_fps_scripts(place)
+        hud_count = sum(1 for s in place.scripts if s.name == "HUDController")
+        assert hud_count == 1
