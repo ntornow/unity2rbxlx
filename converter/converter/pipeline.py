@@ -11,6 +11,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Iterable
 from typing import Any
 
 import config as _config
@@ -123,6 +124,7 @@ class Pipeline:
         output_dir: str | Path | None = None,
         skip_upload: bool = False,
         skip_binary_rbxl: bool = False,
+        scaffolding: frozenset[str] | None = None,
     ) -> None:
         self.unity_project_path = self._find_unity_root(Path(unity_project_path).resolve())
         self.output_dir = Path(output_dir or OUTPUT_DIR).resolve()
@@ -138,6 +140,135 @@ class Pipeline:
         self.state = PipelineState()
 
         self._context_path = self.output_dir / "conversion_context.json"
+
+        # Opt-in genre scaffolding persisted on the context so resumed
+        # builds (publish rebuild path, interactive upload re-runs,
+        # assemble against an existing output dir) reproduce the same
+        # place contents. Empty by default — the converter makes no
+        # game-genre assumptions. Currently recognised:
+        #   - ``"fps"`` → inject FPS client controller LocalScript,
+        #     HUD ScreenGui, and HUDController LocalScript via
+        #     ``fps_client_generator.inject_fps_scripts``.
+        # Pass via ``u2r.py convert --scaffolding=fps`` or merge in via
+        # :meth:`apply_scaffolding` after rehydrating ctx from disk.
+        #
+        # ``_init_scaffolding`` keeps the caller's constructor request
+        # alive across ctx swaps inside :meth:`resume` (which loads ctx
+        # from disk and replaces ``self.ctx`` wholesale). Without this
+        # snapshot, ``u2r.py convert --phase write_output --scaffolding=fps``
+        # would silently revert to whatever was persisted in
+        # ``conversion_context.json`` — making the new flag a no-op on
+        # the most common resume entry point.
+        self._init_scaffolding: tuple[str, ...] = tuple(
+            sorted({str(s).strip().lower() for s in (scaffolding or ()) if str(s).strip()})
+        )
+        if self._init_scaffolding:
+            self.ctx.scaffolding = list(self._init_scaffolding)
+
+        # Snapshot the backward-compat migration signal AT INIT TIME,
+        # before any subphase wipes the scripts/ dir. ``write_output()``
+        # calls ``_subphase_emit_scripts_to_disk`` (which rmtrees
+        # ``scripts/`` when ``--retranspile`` is set) BEFORE
+        # ``_subphase_inject_autogen_scripts``, so checking on-disk
+        # files in the inject subphase would miss the pre-PR signal
+        # that's been deleted.
+        self._fps_artifacts_at_init: bool = self._fps_artifacts_on_disk()
+
+        # ``_is_resume`` flags an EXPLICIT resume/rebuild (set True
+        # by :meth:`resume` and the publish-rebuild path in u2r.py
+        # before running). The backward-compat FPS migration only
+        # fires when this flag is True — not when ``run_all()`` is
+        # invoked against an existing output dir, which is a
+        # full-conversion rerun and should honour the new opt-in
+        # default.
+        #
+        # Default False at construction. Setters: ``resume()``, and
+        # external callers (``u2r.py publish`` rebuild fallback)
+        # that explicitly mean "this is a rebuild from persisted
+        # state, not a fresh conversion".
+        self._is_resume: bool = False
+
+    @property
+    def scaffolding(self) -> frozenset[str]:
+        """Return the active genre-scaffolding set as a frozenset.
+
+        Reads from ``self.ctx.scaffolding`` so resumed builds (which
+        rehydrate ``self.ctx`` from disk) automatically pick up
+        whatever scaffolding was requested at conversion time. Callers
+        must NOT cache this — :class:`ConversionContext` reload may
+        replace ``self.ctx`` mid-flight.
+        """
+        return frozenset(self.ctx.scaffolding or ())
+
+    # Marker comments at the top of every auto-generated FPS script.
+    # Match against file CONTENT (not just filename) because a user's
+    # own Unity ``HUDController.cs`` / ``FpsClient.cs`` would transpile
+    # to identically-named ``.luau`` files in this output dir, and the
+    # backward-compat migration must not misclassify those as evidence
+    # of a pre-PR FPS conversion.
+    _FPS_AUTOGEN_MARKERS: tuple[str, ...] = (
+        "-- HUD Controller (auto-generated)",
+        "-- FPS Client Controller (auto-generated)",
+    )
+
+    def _fps_artifacts_on_disk(self) -> bool:
+        """Return True if this output dir already contains FPS scripts
+        emitted by a pre-scaffolding-flag conversion run.
+
+        Used by the backward-compat migration in
+        :meth:`_subphase_inject_autogen_scripts` to distinguish
+        "resumed from a pre-PR FPS conversion" (where we should
+        re-emit the FPS scripts) from "fresh post-PR conversion"
+        (where the user must opt in explicitly).
+
+        Checks file CONTENT for the auto-generated header comments
+        rather than just file names, so a Unity project that ships
+        its own ``HUDController.cs`` or ``FpsClient.cs`` (transpiled
+        to identically-named .luau files in ``scripts/``) doesn't
+        falsely trigger the migration on a fresh conversion.
+        """
+        scripts_dir = self.output_dir / "scripts"
+        if not scripts_dir.is_dir():
+            return False
+        # Both the legacy filename (``HUDController.luau`` from pre-PR
+        # auto-gen, before the rename to ``AutoFpsHudController``) and
+        # the new filename are recognised so the migration works
+        # against output dirs from either era. Marker presence is the
+        # final discriminator — user-authored files don't carry it.
+        candidates = (
+            "HUDController.luau",
+            "AutoFpsHudController.luau",
+            "FpsClient.luau",
+        )
+        for name in candidates:
+            path = scripts_dir / name
+            if not path.exists():
+                continue
+            try:
+                # Only read the first ~256 bytes — markers always live
+                # in the first comment line.
+                head = path.read_text(encoding="utf-8", errors="replace")[:256]
+            except OSError:
+                continue
+            if any(marker in head for marker in self._FPS_AUTOGEN_MARKERS):
+                return True
+        return False
+
+    def apply_scaffolding(self, scaffolding: Iterable[str] | None) -> None:
+        """Merge *scaffolding* into ``self.ctx.scaffolding``.
+
+        Idempotent and additive — call after rehydrating ``self.ctx``
+        from disk (e.g. in ``_make_pipeline``) to honor a NEW caller
+        request without dropping previously persisted entries.
+        Empty/None inputs are no-ops, so resume paths that don't pass
+        ``--scaffolding`` simply preserve the persisted set.
+        """
+        if not scaffolding:
+            return
+        merged = set(self.ctx.scaffolding or ()) | {
+            str(s).strip().lower() for s in scaffolding if str(s).strip()
+        }
+        self.ctx.scaffolding = sorted(merged)
 
     @staticmethod
     def _find_unity_root(path: Path) -> Path:
@@ -328,8 +459,38 @@ class Pipeline:
             )
 
         if self._context_path.exists():
-            self.ctx = ConversionContext.load(self._context_path)
+            loaded = ConversionContext.load(self._context_path)
             log.info("Loaded persisted context from %s", self._context_path)
+            # Validate the persisted ctx matches THIS Pipeline's
+            # project before treating the load as an authoritative
+            # resume. ``u2r.py convert <new-project> -o <old-output>
+            # --phase write_output`` would otherwise silently apply
+            # FPS migration / persisted scaffolding from the old
+            # project. Mismatch → load the ctx for state but flag
+            # the resume as cross-project so the FPS migration
+            # suppresses itself.
+            same_project = bool(loaded.unity_project_path) and (
+                Path(loaded.unity_project_path).resolve()
+                == self.unity_project_path
+            )
+            self.ctx = loaded
+            self._is_resume = same_project
+            if not same_project:
+                log.warning(
+                    "[resume] Persisted ctx targets %r but this "
+                    "Pipeline is configured for %r. Loading state "
+                    "for resume but suppressing same-project "
+                    "migrations to avoid cross-project leakage.",
+                    loaded.unity_project_path,
+                    str(self.unity_project_path),
+                )
+            # Re-apply the constructor's scaffolding request after the
+            # ctx swap so ``u2r.py convert --phase write_output
+            # --scaffolding=fps`` actually injects FPS scaffolding even
+            # when the persisted ctx didn't have it. Additive merge —
+            # persisted entries are kept, the new request adds to them.
+            if self._init_scaffolding:
+                self.apply_scaffolding(self._init_scaffolding)
 
         log.info("=== Resuming pipeline from phase '%s' ===", phase)
         self.run_through(phase, run_after=True)
@@ -1895,6 +2056,45 @@ return table.concat(allData, "\\n")'''
         """Synthesize project-bootstrap scripts: collision-group setup,
         GameServerManager spawn handling, ClientBootstrap that requires
         side-effect ModuleScripts, and FPS controller scripts/HUD."""
+        # Run the FPS heuristic against USER scripts only — before the
+        # autogen GameServerManager (which contains both ``PlayerShoot``
+        # and ``RemoteEvent`` to wire up its generic spawn flow) lands
+        # in ``place.scripts``. Otherwise ``detect_fps_game`` matches
+        # the converter's own autogen and the soft hint fires on every
+        # non-FPS conversion.
+        from converter.fps_client_generator import detect_fps_game
+        looks_fps = detect_fps_game(self.state.rbx_place)
+
+        # Backward-compat migration: an output directory created before
+        # ``ConversionContext.scaffolding`` existed rehydrates with an
+        # empty list, so a publish/upload re-run would silently drop
+        # the FPS scripts the original conversion auto-injected.
+        #
+        # Three required signals:
+        #   1. ``self.scaffolding`` is empty (no explicit opt-in this run)
+        #   2. ``self._fps_artifacts_at_init`` — pre-existing FPS auto-gen
+        #      scripts were on disk at init time (cached because
+        #      ``emit_scripts_to_disk`` may have wiped ``scripts/`` by
+        #      the time this subphase runs).
+        #   3. ``self._is_resume`` — the persisted ctx's unity project
+        #      matches this Pipeline's, so the on-disk scripts belong
+        #      to a TRUE resume, not a fresh convert into a dir that
+        #      happens to hold leftover FPS scripts from another project.
+        if (
+            not self.scaffolding
+            and self._fps_artifacts_at_init
+            and self._is_resume
+        ):
+            log.warning(
+                "[write_output] Migrating pre-scaffolding output dir: "
+                "found previously-emitted FPS scripts on disk and no "
+                "explicit scaffolding was persisted. Inferring "
+                "scaffolding=['fps'] to preserve auto-injected FPS "
+                "controller/HUD. Pin this with --scaffolding=fps on "
+                "future runs to make it explicit."
+            )
+            self.apply_scaffolding(["fps"])
+
         # Auto-generate collision group setup if Unity layers are used.
         from converter.fps_client_generator import generate_collision_group_script
         has_layers = False
@@ -1964,9 +2164,20 @@ return table.concat(allData, "\\n")'''
             r'MouseIconEnabled\s*=\s*true',
             r'MouseBehavior\s*=\s*Enum\.MouseBehavior\.Default',
         ]
-        has_fps_controller = any(
-            _re.search(r'MouseBehavior\s*=\s*Enum\.MouseBehavior\.LockCenter', s.source)
-            for s in self.state.rbx_place.scripts
+        # An FPS controller will lock the mouse via
+        # ``MouseBehavior.LockCenter``. If any existing script already
+        # does that, we filter anti-FPS modules. ``--scaffolding=fps``
+        # ALSO injects an FPS controller later in this same subphase
+        # (``inject_fps_scripts`` runs after this filter), so honour
+        # the opt-in here too — otherwise a side-effect module that
+        # sets ``MouseBehavior.Default`` slips through and clobbers
+        # the soon-to-be-injected controller's mouse lock at runtime.
+        has_fps_controller = (
+            "fps" in self.scaffolding
+            or any(
+                _re.search(r'MouseBehavior\s*=\s*Enum\.MouseBehavior\.LockCenter', s.source)
+                for s in self.state.rbx_place.scripts
+            )
         )
         side_effect_modules = []
         for s in self.state.rbx_place.scripts:
@@ -2023,13 +2234,45 @@ return table.concat(allData, "\\n")'''
             log.info("[write_output] Bootstrap LocalScript requires %d side-effect modules: %s",
                      len(side_effect_modules), ", ".join(side_effect_modules))
 
-        # Auto-generate client scripts and HUD for FPS-style games.
-        from converter.fps_client_generator import inject_fps_scripts, detect_fps_game
-        fps_added = inject_fps_scripts(self.state.rbx_place)
-        if fps_added:
-            log.info("[write_output] Auto-generated %d FPS client scripts/GUIs", fps_added)
-        if detect_fps_game(self.state.rbx_place):
+        # FPS scaffolding is opt-in — pass ``--scaffolding=fps`` to
+        # request the auto-generated FPS client controller, HUD
+        # ScreenGui, and HUDController LocalScript. Default behaviour
+        # is no game-genre assumptions: non-FPS projects (Gamekit3D,
+        # BoatAttack, ChopChop, RedRunner) get a clean conversion
+        # without unwanted UI/input scripts injected.
+        #
+        # ``looks_fps`` was computed above against the user-scripts-only
+        # snapshot, so the soft hint (in the else branch) doesn't fire
+        # on every conversion just because the autogen GameServerManager
+        # mentions ``PlayerShoot`` + ``RemoteEvent``.
+        # ``is_fps_game`` drives FPS-related scene flags downstream
+        # (e.g. ``StarterPlayer.CameraMode = LockFirstPerson`` in the
+        # rbxlx writer). Set it whenever EITHER the heuristic matched
+        # user content OR the caller explicitly opted into FPS
+        # scaffolding — the user-or-heuristic disjunction matches the
+        # pre-refactor behaviour for projects that ship their own
+        # controller, AND respects ``--scaffolding=fps`` runs whose
+        # user scripts don't trip the heuristic. Tying this to
+        # injection alone regresses both cases (explicit opt-in
+        # without heuristic match, and projects with their own
+        # controller that just need the camera flag).
+        if looks_fps or "fps" in self.scaffolding:
             self.state.rbx_place.is_fps_game = True
+
+        if "fps" in self.scaffolding:
+            from converter.fps_client_generator import inject_fps_scripts
+            fps_added = inject_fps_scripts(self.state.rbx_place)
+            if fps_added:
+                log.info(
+                    "[write_output] Auto-generated %d FPS client scripts/GUIs "
+                    "(--scaffolding=fps)", fps_added,
+                )
+        elif looks_fps:
+            log.info(
+                "[write_output] Heuristic detected FPS-style scripts; "
+                "skipping auto-injected FPS controller/HUD. Pass "
+                "--scaffolding=fps to opt in."
+            )
 
     def _subphase_encode_terrain(self) -> None:
         """Encode each terrain's heightmap into Roblox SmoothGrid binary and

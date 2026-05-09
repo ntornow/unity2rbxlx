@@ -605,7 +605,11 @@ if pauseMenu then
 end
 '''
     return RbxScript(
-        name="HUDController",
+        # Distinct from any user-authored ``HUDController.cs`` so the
+        # transpiled .luau files don't collide on disk and clobber each
+        # other. The script content is unchanged from the historic
+        # auto-generated copy — only the name moved.
+        name="AutoFpsHudController",
         source=source,
         script_type="LocalScript",
     )
@@ -974,13 +978,18 @@ end
 
 
 def inject_fps_scripts(place: RbxPlace) -> int:
-    """If the game is FPS-style, inject client controller, HUD script, and HUD ScreenGui.
+    """Inject FPS client controller, HUD ScreenGui, and HUDController LocalScript.
+
+    The caller is responsible for deciding whether to invoke this — the
+    pipeline gates it behind ``--scaffolding=fps``. The previous gate
+    auto-detected FPS games via ``detect_fps_game`` and ran on every
+    matching project, sweeping up converted projects whose scripts
+    happened to match the heuristic. The opt-in flag keeps non-FPS
+    projects (Gamekit3D, BoatAttack, ChopChop, RedRunner) free of
+    unwanted UI/input scripts.
 
     Returns the number of scripts/guis added.
     """
-    if not detect_fps_game(place):
-        return 0
-
     added = 0
 
     # Add FPS client controller (only if AI didn't already generate one)
@@ -999,9 +1008,30 @@ def inject_fps_scripts(place: RbxPlace) -> int:
     else:
         log.info("Skipping HUD ScreenGui injection (Canvas-converted HUD already exists)")
 
-    # Add HUD controller LocalScript
-    place.scripts.append(generate_hud_client_script())
-    added += 1
-    log.info("Injected HUD controller LocalScript")
+    # Add HUD controller LocalScript only if a previous AUTO-GENERATED
+    # HUD controller isn't already present. Match by marker comment
+    # rather than name alone: a pre-PR rebuild path may have rehydrated
+    # the LEGACY ``HUDController.luau`` (auto-gen, with marker) from
+    # disk into ``place.scripts``. Name-only matching against
+    # ``AutoFpsHudController`` would miss that legacy script and append
+    # a second auto-gen HUD listener — both run, double-handling
+    # HealthUpdate/AmmoUpdate/ItemUpdate.
+    #
+    # User-authored ``HUDController.cs`` (transpiled) won't carry the
+    # canonical marker, so this dedupe leaves them untouched.
+    has_autogen_hud = any(
+        "-- HUD Controller (auto-generated)" in s.source
+        and s.name in ("AutoFpsHudController", "HUDController")
+        for s in place.scripts
+    )
+    if not has_autogen_hud:
+        place.scripts.append(generate_hud_client_script())
+        added += 1
+        log.info("Injected AutoFpsHudController LocalScript")
+    else:
+        log.info(
+            "Skipping AutoFpsHudController injection (auto-generated "
+            "HUD listener already present from prior conversion)"
+        )
 
     return added

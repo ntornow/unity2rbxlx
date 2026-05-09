@@ -9,38 +9,36 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
 ## Pipeline / runtime gaps
 
 - [ ] **P1 — Remove FPS-specific logic from the converter
-  (`fps_client_generator.py`).** PR #66 generalized
+  (`fps_client_generator.py`) [PART 2 — extraction].** PR #66 generalized
   `script_coherence_packs.py` (the producer/consumer BindableEvent bridge
-  and the Pickup RemoteEvent canonicalization) but
-  `fps_client_generator.py` is still bolted into the pipeline as the only
-  remaining genre-specific module. It auto-emits an FPS HUD ScreenGui, a
-  WASD + mouse-look controller LocalScript, a HudControl LocalScript, and
-  the `connectClient(evt, handler)` BindableEvent/RemoteEvent dispatch
-  helper — all triggered when the converter detects an FPS-style
-  controller pattern. Net effect: any non-FPS project that happens to
-  match the detection heuristic gets unwanted UI / input scripts injected,
-  and the converter carries genre-specific scaffolding instead of staying
-  generic.
+  and the Pickup RemoteEvent canonicalization). PR #1 of this refactor
+  flipped the default to "no auto-inject" via the new
+  `--scaffolding=fps` opt-in flag — non-FPS projects (Gamekit3D,
+  BoatAttack, ChopChop, RedRunner) now convert clean without unwanted
+  UI/input scripts.
 
-  Refactor goals:
+  Remaining work for PR #2:
   - Extract the genuinely-generic helpers (e.g. `connectClient` event
-    dispatch) into a generic runtime/library module, since they apply
-    regardless of game genre.
-  - Replace the auto-emit-on-detection behavior with an explicit opt-in:
-    either a per-project flag in `conversion_plan.json` (the user's
-    `/convert-unity` skill review can flip it for FPS projects) or move
-    the FPS-specific emitters into a project-scoped scaffolding folder
-    that ships only when the user requests it.
-  - Delete the FPS detection heuristic; the converter should default to
-    no game-genre assumptions and only inject controllers/UI when the
-    Unity scene already has the matching components (e.g. emit a
-    Cinemachine bridge only when the scene actually has a
-    CinemachineVirtualCamera).
+    dispatch in `generate_hud_client_script`) into a generic
+    runtime/library module under `runtime/`, since they apply regardless
+    of game genre.
+  - Move the FPS-specific emitters (`generate_fps_client_script`,
+    `generate_hud_screen_gui`, `generate_hud_client_script`,
+    `inject_fps_scripts`, `detect_fps_game`, `_has_client_fps_controller`,
+    `_has_hud_screen_gui`) into a project-scoped scaffolding folder
+    (e.g. `converter/scaffolding/fps.py`).
+  - Keep generic emitters (`generate_game_server_script`,
+    `generate_collision_group_script`,
+    `generate_collision_fidelity_recook_script`) in their current
+    location, or move to `converter/autogen.py` for clarity.
+  - Optional: replace the heuristic-only detector with component-aware
+    injection — e.g. emit a Cinemachine bridge only when the scene
+    actually has a CinemachineVirtualCamera, not when the heuristic
+    matches.
 
-  Acceptance test: convert a non-FPS project (Gamekit3D, BoatAttack,
-  ChopChop, RedRunner) and confirm none of `fps_client_generator.py`'s
-  outputs (HUD, controller, HudControl) are emitted unless explicitly
-  opted in.
+  Acceptance test (PR #1, ALREADY PASSES): convert a non-FPS project and
+  confirm none of `fps_client_generator.py`'s outputs are emitted unless
+  `--scaffolding=fps` is passed.
 
 - [ ] **P2 — Persistent prefab/asset cache.** Prefab library is in-memory only.
   SQLite or pickle cache keyed by `(GUID, mtime)` would halve pipeline time

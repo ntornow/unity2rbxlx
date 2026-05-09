@@ -107,6 +107,17 @@ class ConversionContext:
     # and by 4.10 prefab packages (to know which prefabs to emit).
     serialized_field_refs: dict[str, dict[str, str]] = field(default_factory=dict)
 
+    # Opt-in genre scaffolding requested by the caller. Persisted as a
+    # sorted ``list[str]`` for JSON-friendliness; the pipeline reads it
+    # back as a frozenset. Currently recognised: ``"fps"`` (auto-injected
+    # FPS client controller + HUD ScreenGui + HUDController LocalScript).
+    # Round-trips through ``conversion_context.json`` so resumed builds
+    # (``u2r.py publish`` rebuild path, ``convert_interactive upload``
+    # / ``assemble`` re-run) reproduce the same place contents instead
+    # of dropping the FPS scripts because the in-memory Pipeline default
+    # is empty.
+    scaffolding: list[str] = field(default_factory=list)
+
     def __post_init__(self) -> None:
         # JSON load via `cls(**data)` populates storage_plan as a dict (the
         # asdict() form). Reconstruct it as a StoragePlan when present so the

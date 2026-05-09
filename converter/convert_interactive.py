@@ -45,6 +45,7 @@ import logging
 import sys
 import time
 from pathlib import Path
+from collections.abc import Iterable
 from typing import Any
 
 import click
@@ -141,12 +142,19 @@ def _make_pipeline(
     *,
     skip_upload: bool = False,
     skip_binary_rbxl: bool = False,
+    scaffolding: Iterable[str] | None = None,
 ) -> Pipeline:
     """Build a Pipeline and rehydrate ctx from disk if a previous run exists.
 
     Accepts ``unity_project_path=None`` for phases that only read state
     (e.g. ``status``, ``upload``, ``report``).  In that case the unity project
     path is recovered from the persisted ``ConversionContext``.
+
+    *scaffolding* is the caller's NEW request (e.g. ``--scaffolding=fps``
+    on this invocation). It's merged with whatever was persisted in
+    ``conversion_context.json`` from prior runs — additive so a follow-up
+    ``upload`` against an existing assemble doesn't drop the previously
+    requested FPS scripts/HUD.
     """
     out = Path(output_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -171,6 +179,7 @@ def _make_pipeline(
         output_dir=out,
         skip_upload=skip_upload,
         skip_binary_rbxl=skip_binary_rbxl,
+        scaffolding=scaffolding,
     )
     if ctx_path.exists():
         prior_ctx = ConversionContext.load(ctx_path)
@@ -190,6 +199,14 @@ def _make_pipeline(
                 f"directory or delete {out} and start over."
             )
         pipeline.ctx = prior_ctx
+        # Mark as explicit resume so the FPS migration treats on-disk
+        # FPS scripts as legitimately preserved (not stale leftovers
+        # from a foreign-project conversion that shared this dir).
+        pipeline._is_resume = True
+        # Re-merge the caller's scaffolding request after the ctx swap
+        # — the rehydrated ctx may carry persisted entries; the new
+        # request adds to them (additive, idempotent).
+        pipeline.apply_scaffolding(scaffolding)
     return pipeline
 
 
@@ -697,10 +714,17 @@ def validate(output_dir: str, write: bool) -> None:
 @click.option("--place-id", type=int, default=None,
               help="Roblox Place ID for headless mesh resolution "
               "(see --universe-id).")
+@click.option("--scaffolding", type=str, default=None,
+              help="Comma-separated genre scaffolding to inject (e.g. "
+              "'fps' to add the FPS client controller + HUD ScreenGui + "
+              "HUDController). Default: none. Persisted in "
+              "conversion_context.json so subsequent ``upload`` re-runs "
+              "against the same output dir reproduce the same scripts.")
 def assemble(unity_project_path: str, output_dir: str,
              no_upload: bool, no_resolve: bool, retranspile: bool,
              api_key: str | None, creator_id: str | None,
-             universe_id: int | None, place_id: int | None) -> None:
+             universe_id: int | None, place_id: int | None,
+             scaffolding: str | None) -> None:
     """Phase 4: upload assets, resolve, convert animations + scene, write .rbxlx."""
     # Resolve credentials from CLI -> env -> file (same precedence as u2r.py)
     # so users get the documented auto-discovery behavior. Without this,
@@ -738,7 +762,14 @@ def assemble(unity_project_path: str, output_dir: str,
         ]})
         sys.exit(1)
 
-    pipeline = _make_pipeline(unity_project_path, output_dir, skip_upload=no_upload)
+    scaffolding_list = [
+        s.strip().lower() for s in (scaffolding or "").split(",") if s.strip()
+    ]
+    pipeline = _make_pipeline(
+        unity_project_path, output_dir,
+        skip_upload=no_upload,
+        scaffolding=scaffolding_list,
+    )
     pipeline._retranspile = retranspile
 
     # Plumb --universe-id / --place-id into ctx so resolve_assets can run

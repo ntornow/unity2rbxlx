@@ -251,6 +251,12 @@ def main(verbose: bool) -> None:
               help="Roblox Universe ID for mesh resolution (reuse across runs)")
 @click.option("--place-id", type=int, default=None,
               help="Roblox Place ID for mesh resolution (reuse across runs)")
+@click.option("--scaffolding", type=str, default=None,
+              help="Comma-separated genre scaffolding to inject (e.g. "
+              "'fps' to add the FPS client controller + HUD ScreenGui + "
+              "HUDController). Default: none — the converter makes no "
+              "game-genre assumptions and only emits scaffolding when "
+              "explicitly requested.")
 def convert(
     unity_project: str,
     output: str,
@@ -263,6 +269,7 @@ def convert(
     creator_id: str | None,
     universe_id: int | None,
     place_id: int | None,
+    scaffolding: str | None,
 ) -> None:
     """Convert a Unity project to a Roblox experience.
 
@@ -295,10 +302,18 @@ def convert(
     if no_ai:
         config.USE_AI_TRANSPILATION = False
 
+    # Parse comma-separated scaffolding list. Unknown names are passed
+    # through to the pipeline; the inject site logs (and ignores) values
+    # it doesn't recognise rather than failing the whole conversion.
+    scaffolding_set: frozenset[str] = frozenset(
+        s.strip().lower() for s in (scaffolding or "").split(",") if s.strip()
+    )
+
     pipeline = Pipeline(
         unity_project_path=project_path,
         output_dir=output_path,
         skip_upload=no_upload,
+        scaffolding=scaffolding_set,
     )
 
     # Plumb --universe-id / --place-id into the pipeline context so the
@@ -427,12 +442,20 @@ def convert(
 @click.option("--creator-id", type=str, default=None, help="Roblox Creator ID (number or path to file)")
 @click.option("--universe-id", type=int, default=None)
 @click.option("--place-id", type=int, default=None)
+@click.option("--scaffolding", type=str, default=None,
+              help="Comma-separated genre scaffolding for the rebuild "
+              "fallback path (e.g. 'fps'). Merged additively with whatever "
+              "is persisted in conversion_context.json — pass this when "
+              "rebuilding an output directory created before the "
+              "scaffolding field existed and you want the FPS scripts/HUD "
+              "back without re-running the full conversion.")
 def publish(
     output_dir: str,
     api_key: str | None,
     creator_id: str | None,
     universe_id: int | None,
     place_id: int | None,
+    scaffolding: str | None,
 ) -> None:
     """Publish a previously converted place to Roblox with proper meshes.
 
@@ -528,14 +551,34 @@ def publish(
                 "Re-run 'u2r.py convert' to regenerate the chunk cache."
             ); return
 
+        scaffolding_list = [
+            s.strip().lower()
+            for s in (scaffolding or "").split(",") if s.strip()
+        ]
         pipeline = Pipeline(
             unity_project_path=prior_ctx.unity_project_path,
             output_dir=output_path,
             skip_binary_rbxl=True,
+            scaffolding=scaffolding_list,
         )
         pipeline.ctx = prior_ctx
         pipeline.ctx.universe_id = uid
         pipeline.ctx.place_id = pid
+        # Mark this rebuild path as an explicit resume so the
+        # backward-compat FPS migration treats on-disk FPS scripts
+        # as legitimately preserved rather than stale leftovers.
+        # ``hasattr`` guards tolerate ``Pipeline`` stubs in the
+        # publish-cache tests.
+        if hasattr(pipeline, "_is_resume"):
+            pipeline._is_resume = True
+        # Re-merge the caller's scaffolding request after the ctx swap.
+        # Old contexts (saved before the scaffolding field existed)
+        # rehydrate as ``scaffolding=[]``; passing ``--scaffolding=fps``
+        # to ``u2r.py publish`` is the documented opt-back-in path so
+        # rebuilds reproduce the original FPS scripts/HUD without
+        # re-running the full conversion.
+        if scaffolding_list and hasattr(pipeline, "apply_scaffolding"):
+            pipeline.apply_scaffolding(scaffolding_list)
 
         # Run prereqs through extract_assets + moderate_assets so we can
         # check whether any assets actually need uploading before deciding
