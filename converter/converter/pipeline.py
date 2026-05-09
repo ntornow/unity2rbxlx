@@ -3286,6 +3286,14 @@ script.Disabled = true
             modules_to_inject.append(("CharacterBridge", "physics_bridge.luau"))
         if has_sub_emitters:
             modules_to_inject.append(("SubEmitterRuntime", "sub_emitter_runtime.luau"))
+        # FPS scaffolding's auto-generated HUDController requires
+        # ``EventDispatch.connectClient`` from this runtime module to
+        # bridge RemoteEvent vs BindableEvent producers. Inject when
+        # opted in via ``--scaffolding=fps`` so the require resolves;
+        # without this the HUD load fails at WaitForChild on the
+        # missing ModuleScript.
+        if "fps" in self.scaffolding:
+            modules_to_inject.append(("EventDispatch", "event_dispatch.luau"))
 
         # Detect object pooling patterns in transpiled scripts
         has_pool = any(

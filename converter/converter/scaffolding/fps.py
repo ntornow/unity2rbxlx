@@ -535,21 +535,15 @@ local function waitForRemote(name)
     return ReplicatedStorage:WaitForChild(name, 10)
 end
 
--- The producer side may be either a server RemoteEvent (FireClient) or a
--- client-side BindableEvent (e.g. published by Player.luau via the
--- hud_player_bindable_events coherence pack). They expose different event
--- members — RemoteEvent.OnClientEvent vs BindableEvent.Event — so dispatch
--- on the instance class instead of hard-coding either one. Without this
--- fork the auto-generated HUD crashes the moment Player.luau ships its
--- updates over a BindableEvent.
-local function connectClient(evt, handler)
-    if not evt then return end
-    if evt:IsA("BindableEvent") then
-        evt.Event:Connect(handler)
-    elseif evt:IsA("RemoteEvent") then
-        evt.OnClientEvent:Connect(handler)
-    end
-end
+-- The producer side may be either a server RemoteEvent (FireClient) or
+-- a client-side BindableEvent (e.g. published by Player.luau via the
+-- hud_player_bindable_events coherence pack). They expose different
+-- event members — RemoteEvent.OnClientEvent vs BindableEvent.Event —
+-- so the dispatch helper forks on the instance class. Lives in the
+-- shared ``EventDispatch`` runtime module so other scaffolding can
+-- reuse it without re-implementing the fork.
+local EventDispatch = require(ReplicatedStorage:WaitForChild("EventDispatch"))
+local connectClient = EventDispatch.connectClient
 
 local HealthUpdateRemote = waitForRemote("HealthUpdate")
 local AmmoUpdateRemote = waitForRemote("AmmoUpdate")
