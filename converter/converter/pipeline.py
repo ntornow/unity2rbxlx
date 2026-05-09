@@ -11,6 +11,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Iterable
 from typing import Any
 
 import config as _config
@@ -132,14 +133,6 @@ class Pipeline:
         # True on the interactive `upload` rebuild (publishes via
         # execute_luau; never reads the .rbxl file).
         self.skip_binary_rbxl = skip_binary_rbxl
-        # Opt-in genre scaffolding. Empty by default — the converter
-        # makes no game-genre assumptions and only emits controllers
-        # / HUDs when explicitly requested. Currently recognised:
-        #   - ``"fps"`` → inject FPS client controller LocalScript,
-        #     HUD ScreenGui, and HUDController LocalScript via
-        #     ``fps_client_generator.inject_fps_scripts``.
-        # Pass via ``u2r.py convert --scaffolding=fps``.
-        self.scaffolding = frozenset(scaffolding or ())
 
         self.ctx = ConversionContext(
             unity_project_path=str(self.unity_project_path),
@@ -147,6 +140,47 @@ class Pipeline:
         self.state = PipelineState()
 
         self._context_path = self.output_dir / "conversion_context.json"
+
+        # Opt-in genre scaffolding persisted on the context so resumed
+        # builds (publish rebuild path, interactive upload re-runs,
+        # assemble against an existing output dir) reproduce the same
+        # place contents. Empty by default — the converter makes no
+        # game-genre assumptions. Currently recognised:
+        #   - ``"fps"`` → inject FPS client controller LocalScript,
+        #     HUD ScreenGui, and HUDController LocalScript via
+        #     ``fps_client_generator.inject_fps_scripts``.
+        # Pass via ``u2r.py convert --scaffolding=fps`` or merge in via
+        # :meth:`apply_scaffolding` after rehydrating ctx from disk.
+        if scaffolding:
+            self.ctx.scaffolding = sorted(set(scaffolding))
+
+    @property
+    def scaffolding(self) -> frozenset[str]:
+        """Return the active genre-scaffolding set as a frozenset.
+
+        Reads from ``self.ctx.scaffolding`` so resumed builds (which
+        rehydrate ``self.ctx`` from disk) automatically pick up
+        whatever scaffolding was requested at conversion time. Callers
+        must NOT cache this — :class:`ConversionContext` reload may
+        replace ``self.ctx`` mid-flight.
+        """
+        return frozenset(self.ctx.scaffolding or ())
+
+    def apply_scaffolding(self, scaffolding: Iterable[str] | None) -> None:
+        """Merge *scaffolding* into ``self.ctx.scaffolding``.
+
+        Idempotent and additive — call after rehydrating ``self.ctx``
+        from disk (e.g. in ``_make_pipeline``) to honor a NEW caller
+        request without dropping previously persisted entries.
+        Empty/None inputs are no-ops, so resume paths that don't pass
+        ``--scaffolding`` simply preserve the persisted set.
+        """
+        if not scaffolding:
+            return
+        merged = set(self.ctx.scaffolding or ()) | {
+            str(s).strip().lower() for s in scaffolding if str(s).strip()
+        }
+        self.ctx.scaffolding = sorted(merged)
 
     @staticmethod
     def _find_unity_root(path: Path) -> Path:

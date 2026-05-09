@@ -172,3 +172,83 @@ class TestPipelineScaffoldingPlumbing:
             scaffolding=frozenset({"fps"}),
         )
         assert "fps" in pl.scaffolding
+
+
+class TestScaffoldingPersistence:
+    """``scaffolding`` is stored on ``ConversionContext`` so it survives
+    a JSON round-trip. Resumed builds (``u2r.py publish`` rebuild path,
+    ``convert_interactive upload`` against an existing assemble, or a
+    second ``assemble`` call without re-passing ``--scaffolding``) must
+    reproduce the same place contents — they look up scaffolding on
+    the rehydrated ctx, not from a fresh empty Pipeline default.
+    """
+
+    def test_scaffolding_round_trips_through_json(
+        self, tmp_path: Path,
+    ) -> None:
+        from core.conversion_context import ConversionContext
+
+        ctx = ConversionContext(unity_project_path="/x")
+        ctx.scaffolding = ["fps", "puzzle"]
+
+        path = tmp_path / "ctx.json"
+        ctx.save(path)
+        loaded = ConversionContext.load(path)
+        assert loaded.scaffolding == ["fps", "puzzle"]
+
+    def test_pipeline_reads_scaffolding_from_rehydrated_ctx(
+        self, tmp_path: Path,
+    ) -> None:
+        """Simulates the ``u2r.py publish`` rebuild path: a fresh
+        Pipeline gets ``ctx`` swapped in from disk. The new ctx
+        carries scaffolding; the property must reflect it without any
+        explicit re-init."""
+        from core.conversion_context import ConversionContext
+
+        project = tmp_path / "fakeproject"
+        (project / "Assets").mkdir(parents=True)
+        pl = Pipeline(unity_project_path=project, output_dir=tmp_path / "out")
+        assert pl.scaffolding == frozenset()  # default
+
+        prior = ConversionContext(
+            unity_project_path=str(project),
+            scaffolding=["fps"],
+        )
+        pl.ctx = prior  # mirrors u2r.py publish rebuild path
+        assert pl.scaffolding == frozenset({"fps"})
+
+    def test_apply_scaffolding_is_additive(self, tmp_path: Path) -> None:
+        """A follow-up ``assemble`` call passing
+        ``--scaffolding=puzzle`` must NOT drop the ``fps`` entry that
+        was persisted from a prior run; the merge is additive."""
+        project = tmp_path / "fakeproject"
+        (project / "Assets").mkdir(parents=True)
+        pl = Pipeline(
+            unity_project_path=project,
+            output_dir=tmp_path / "out",
+            scaffolding=["fps"],
+        )
+        pl.apply_scaffolding(["puzzle"])
+        assert pl.scaffolding == frozenset({"fps", "puzzle"})
+
+    def test_apply_scaffolding_none_is_noop(self, tmp_path: Path) -> None:
+        project = tmp_path / "fakeproject"
+        (project / "Assets").mkdir(parents=True)
+        pl = Pipeline(
+            unity_project_path=project,
+            output_dir=tmp_path / "out",
+            scaffolding=["fps"],
+        )
+        pl.apply_scaffolding(None)
+        assert pl.scaffolding == frozenset({"fps"})
+        pl.apply_scaffolding([])
+        assert pl.scaffolding == frozenset({"fps"})
+
+    def test_apply_scaffolding_normalises_input(self, tmp_path: Path) -> None:
+        """Strip + lowercase, just like the CLI parser. Avoids
+        case-sensitivity surprises across CLI vs interactive paths."""
+        project = tmp_path / "fakeproject"
+        (project / "Assets").mkdir(parents=True)
+        pl = Pipeline(unity_project_path=project, output_dir=tmp_path / "out")
+        pl.apply_scaffolding([" FPS ", "  ", "Puzzle"])
+        assert pl.scaffolding == frozenset({"fps", "puzzle"})
