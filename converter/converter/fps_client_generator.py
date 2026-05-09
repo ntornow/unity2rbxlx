@@ -1004,21 +1004,28 @@ def inject_fps_scripts(place: RbxPlace) -> int:
     else:
         log.info("Skipping HUD ScreenGui injection (Canvas-converted HUD already exists)")
 
-    # Add HUD controller LocalScript only if one isn't already present.
-    # Without this guard, a second ``assemble``/``publish`` rebuild
-    # against an existing FPS output dir appends a duplicate
-    # ``HUDController`` — the previous run's HUDController is
-    # rehydrated from disk into ``place.scripts``, then this branch
-    # appends a fresh one. Two listeners on the same HUD events
-    # double-update health/ammo/items.
-    has_hud_controller = any(
-        s.name == "HUDController" for s in place.scripts
+    # Add HUD controller LocalScript only if a previous AUTO-GENERATED
+    # HUDController isn't already present. The marker comment at the
+    # top of ``generate_hud_client_script`` is the discriminator:
+    # name-only matching would suppress the inject when a user-authored
+    # ``HUDController.cs`` (transpiled) lands in ``place.scripts``,
+    # leaving the auto-emitted HUD ScreenGui with no listener for
+    # HealthUpdate/AmmoUpdate/ItemUpdate. Marker matching distinguishes
+    # the prior auto-emit (which we want to skip on rerun) from a
+    # user-authored script that happens to share the name (which
+    # serves a different purpose and shouldn't suppress the inject).
+    has_autogen_hud = any(
+        s.name == "HUDController" and "-- HUD Controller (auto-generated)" in s.source
+        for s in place.scripts
     )
-    if not has_hud_controller:
+    if not has_autogen_hud:
         place.scripts.append(generate_hud_client_script())
         added += 1
         log.info("Injected HUD controller LocalScript")
     else:
-        log.info("Skipping HUDController injection (already present from prior conversion)")
+        log.info(
+            "Skipping HUDController injection (auto-generated copy "
+            "already present from prior conversion)"
+        )
 
     return added

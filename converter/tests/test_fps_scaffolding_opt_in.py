@@ -589,3 +589,43 @@ class TestInjectFpsScriptsIdempotent:
         inject_fps_scripts(place)
         hud_count = sum(1 for s in place.scripts if s.name == "HUDController")
         assert hud_count == 1
+
+    def test_user_authored_hudcontroller_does_not_suppress_inject(
+        self,
+    ) -> None:
+        """Codex finding [P2] (round 6): a project with its own
+        ``HUDController.cs`` (transpiled to a HUDController LocalScript)
+        must NOT cause the auto-generated HUDController to be skipped
+        — the auto-emitted HUD ScreenGui needs the auto-generated
+        controller's event-listener wiring to update on
+        HealthUpdate/AmmoUpdate/ItemUpdate.
+        """
+        from converter.fps_client_generator import inject_fps_scripts
+
+        place = RbxPlace(
+            scripts=[
+                # User-authored HUDController — different content,
+                # serves the user's gameplay (e.g. a weapon-wheel HUD).
+                RbxScript(
+                    name="HUDController",
+                    source=(
+                        "-- User HUDController (from HUDController.cs)\n"
+                        "local weaponWheel = workspace:WaitForChild('WeaponWheel')\n"
+                    ),
+                    script_type="LocalScript",
+                ),
+            ],
+            workspace_parts=[],
+            screen_guis=[],
+        )
+        inject_fps_scripts(place)
+        # Both should now be present: the user-authored HUDController
+        # AND the auto-generated one.
+        hud_scripts = [s for s in place.scripts if s.name == "HUDController"]
+        assert len(hud_scripts) == 2
+        # One has the auto-generated marker, one doesn't.
+        markers = sum(
+            1 for s in hud_scripts
+            if "-- HUD Controller (auto-generated)" in s.source
+        )
+        assert markers == 1
