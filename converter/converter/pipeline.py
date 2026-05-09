@@ -459,14 +459,31 @@ class Pipeline:
             )
 
         if self._context_path.exists():
-            self.ctx = ConversionContext.load(self._context_path)
+            loaded = ConversionContext.load(self._context_path)
             log.info("Loaded persisted context from %s", self._context_path)
-            # Mark this Pipeline as an explicit resume so the
-            # backward-compat FPS migration in
-            # ``_subphase_inject_autogen_scripts`` knows the on-disk
-            # FPS scripts belong to a true rebuild rather than stale
-            # files from a previous run sharing the output dir.
-            self._is_resume = True
+            # Validate the persisted ctx matches THIS Pipeline's
+            # project before treating the load as an authoritative
+            # resume. ``u2r.py convert <new-project> -o <old-output>
+            # --phase write_output`` would otherwise silently apply
+            # FPS migration / persisted scaffolding from the old
+            # project. Mismatch → load the ctx for state but flag
+            # the resume as cross-project so the FPS migration
+            # suppresses itself.
+            same_project = bool(loaded.unity_project_path) and (
+                Path(loaded.unity_project_path).resolve()
+                == self.unity_project_path
+            )
+            self.ctx = loaded
+            self._is_resume = same_project
+            if not same_project:
+                log.warning(
+                    "[resume] Persisted ctx targets %r but this "
+                    "Pipeline is configured for %r. Loading state "
+                    "for resume but suppressing same-project "
+                    "migrations to avoid cross-project leakage.",
+                    loaded.unity_project_path,
+                    str(self.unity_project_path),
+                )
             # Re-apply the constructor's scaffolding request after the
             # ctx swap so ``u2r.py convert --phase write_output
             # --scaffolding=fps`` actually injects FPS scaffolding even
@@ -2147,9 +2164,20 @@ return table.concat(allData, "\\n")'''
             r'MouseIconEnabled\s*=\s*true',
             r'MouseBehavior\s*=\s*Enum\.MouseBehavior\.Default',
         ]
-        has_fps_controller = any(
-            _re.search(r'MouseBehavior\s*=\s*Enum\.MouseBehavior\.LockCenter', s.source)
-            for s in self.state.rbx_place.scripts
+        # An FPS controller will lock the mouse via
+        # ``MouseBehavior.LockCenter``. If any existing script already
+        # does that, we filter anti-FPS modules. ``--scaffolding=fps``
+        # ALSO injects an FPS controller later in this same subphase
+        # (``inject_fps_scripts`` runs after this filter), so honour
+        # the opt-in here too — otherwise a side-effect module that
+        # sets ``MouseBehavior.Default`` slips through and clobbers
+        # the soon-to-be-injected controller's mouse lock at runtime.
+        has_fps_controller = (
+            "fps" in self.scaffolding
+            or any(
+                _re.search(r'MouseBehavior\s*=\s*Enum\.MouseBehavior\.LockCenter', s.source)
+                for s in self.state.rbx_place.scripts
+            )
         )
         side_effect_modules = []
         for s in self.state.rbx_place.scripts:

@@ -595,6 +595,76 @@ class TestBackwardCompatMigration:
         pl._subphase_inject_autogen_scripts()
         assert pl.scaffolding == frozenset()
 
+    def test_resume_validates_project_match(
+        self, tmp_path: Path,
+    ) -> None:
+        """Codex finding [P2] (round 10): ``Pipeline.resume()`` setting
+        ``_is_resume = True`` unconditionally allowed a cross-project
+        ``u2r.py convert <new-project> -o <old-output> --phase ...``
+        to inherit migration/scaffolding from the persisted ctx of
+        the old project. Validate the persisted ``unity_project_path``
+        matches THIS Pipeline's project before classifying as a true
+        same-project resume.
+        """
+        from core.conversion_context import ConversionContext
+
+        project_a = tmp_path / "ProjectA"
+        (project_a / "Assets").mkdir(parents=True)
+        project_b = tmp_path / "ProjectB"
+        (project_b / "Assets").mkdir(parents=True)
+        out = tmp_path / "output"
+        out.mkdir()
+        # Persist ctx for ProjectA with FPS scaffolding marked.
+        prior = ConversionContext(unity_project_path=str(project_a))
+        prior.scaffolding = ["fps"]
+        prior.save(out / "conversion_context.json")
+        # Drop a legacy FPS artifact that would normally trigger migration.
+        scripts_dir = out / "scripts"
+        scripts_dir.mkdir()
+        (scripts_dir / "HUDController.luau").write_text(
+            "-- HUD Controller (auto-generated)\n"
+        )
+
+        # Pipeline init for ProjectB — different project. Resume
+        # against this output dir.
+        pl = Pipeline(unity_project_path=project_b, output_dir=out)
+        # Force an attempt at resume() — but resume() only runs phases,
+        # so we manually trigger the resume() path's ctx-load logic.
+        # Easiest: call resume("write_output") which goes through the
+        # ctx-load + project-match validation. But run_through doesn't
+        # need the actual phases to run for the test — we can stop
+        # before any phase by mocking or by inspecting state right
+        # after the load.
+        try:
+            pl.resume("write_output")
+        except Exception:
+            # Phases will fail without real Unity content; we only
+            # care about the post-load state.
+            pass
+        # Cross-project resume → same-project flag must be False.
+        assert pl._is_resume is False
+
+    def test_resume_marks_same_project_as_resume(
+        self, tmp_path: Path,
+    ) -> None:
+        """Same-project resume → ``_is_resume`` True (the migration
+        path is allowed)."""
+        from core.conversion_context import ConversionContext
+
+        project = tmp_path / "Project"
+        (project / "Assets").mkdir(parents=True)
+        out = tmp_path / "output"
+        out.mkdir()
+        prior = ConversionContext(unity_project_path=str(project))
+        prior.save(out / "conversion_context.json")
+
+        pl = Pipeline(unity_project_path=project, output_dir=out)
+        try:
+            pl.resume("write_output")
+        except Exception:
+            pass
+        assert pl._is_resume is True
+
     def test_migration_fires_only_on_explicit_resume(
         self, tmp_path: Path,
     ) -> None:
@@ -629,6 +699,67 @@ class TestBackwardCompatMigration:
         })
         pl._subphase_inject_autogen_scripts()
         assert "fps" in pl.scaffolding
+
+
+class TestFpsScaffoldingClobberProtection:
+    """Codex finding [P2] (round 10): the bootstrap-filter in
+    ``_subphase_inject_autogen_scripts`` runs BEFORE
+    ``inject_fps_scripts``, so on a fresh ``--scaffolding=fps`` run
+    ``has_fps_controller`` was False and anti-FPS modules (those
+    that set ``MouseBehavior=Default`` or ``MouseIconEnabled=true``)
+    didn't get filtered out of ``ClientBootstrap``'s require list.
+    Those modules then clobbered the FPS controller's mouse lock at
+    runtime.
+
+    Fix: ``has_fps_controller`` now also considers
+    ``"fps" in self.scaffolding`` — opt-in is treated as evidence
+    that an FPS controller will be injected, so anti-FPS modules
+    are filtered preemptively.
+    """
+
+    def test_anti_fps_module_filtered_when_fps_opt_in(
+        self, tmp_path: Path,
+    ) -> None:
+        from core.roblox_types import RbxPlace as _Place
+
+        project = tmp_path / "fakeproject"
+        (project / "Assets").mkdir(parents=True)
+        out = tmp_path / "output"
+        out.mkdir()
+
+        anti_fps = RbxScript(
+            name="MenuController",
+            source=(
+                "-- Menu controller (sets default mouse on enter)\n"
+                "local UserInputService = game:GetService('UserInputService')\n"
+                "UserInputService.MouseBehavior = Enum.MouseBehavior.Default\n"
+                "UserInputService.MouseIconEnabled = true\n"
+                "local function onEnter() end\n"
+                "RunService.Heartbeat:Connect(onEnter)\n"
+            ),
+            script_type="ModuleScript",
+        )
+        pl = Pipeline(
+            unity_project_path=project,
+            output_dir=out,
+            scaffolding=["fps"],
+        )
+        pl.state.rbx_place = _Place(
+            scripts=[anti_fps],
+            workspace_parts=[],
+            screen_guis=[],
+        )
+        pl._subphase_inject_autogen_scripts()
+        # ClientBootstrap shouldn't require the anti-FPS module.
+        bootstrap = next(
+            (s for s in pl.state.rbx_place.scripts if s.name == "ClientBootstrap"),
+            None,
+        )
+        if bootstrap is not None:
+            assert "MenuController" not in bootstrap.source, (
+                "anti-FPS MenuController slipped into ClientBootstrap "
+                "even though --scaffolding=fps was set"
+            )
 
 
 class TestInjectFpsScriptsIdempotent:
