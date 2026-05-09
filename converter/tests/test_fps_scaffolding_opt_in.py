@@ -528,6 +528,12 @@ class TestBackwardCompatMigration:
         pl = Pipeline(unity_project_path=project, output_dir=out)
         pl.state.rbx_place = _fps_shaped_place()
         pl._is_resume = is_resume
+        # Mirror the real resume paths (``Pipeline.resume`` /
+        # ``convert_interactive._make_pipeline`` / ``u2r.py publish``
+        # rebuild): re-snapshot the FPS-artifact signal AFTER the
+        # ctx swap so the rbxlx scan respects ``ctx.selected_scene``.
+        if is_resume:
+            pl._fps_artifacts_at_init = pl._fps_artifacts_on_disk()
         return pl
 
     def test_migration_infers_fps_when_hud_script_on_disk(
@@ -606,6 +612,49 @@ class TestBackwardCompatMigration:
         pl._subphase_inject_autogen_scripts()
         assert "fps" in pl.scaffolding
 
+    def test_migration_scoped_to_selected_scene_rbxlx(
+        self, tmp_path: Path,
+    ) -> None:
+        """Codex finding [P2] (PR #69 round 5): in a multi-scene
+        output dir, a marker in ``main.rbxlx`` (the FPS scene) must
+        NOT migrate the whole conversion when the selected scene is
+        ``menu`` (a non-FPS scene). The scan looks at the
+        selected-scene-specific rbxlx first.
+
+        Tests ``_fps_artifacts_on_disk`` directly with a
+        scene-scoped ctx — the snapshot is taken AFTER ctx is
+        loaded in real resume paths.
+        """
+        project = tmp_path / "Project"
+        scenes_dir = project / "Assets" / "Scenes"
+        scenes_dir.mkdir(parents=True)
+        (scenes_dir / "main.unity").touch()
+        (scenes_dir / "menu.unity").touch()
+        out = tmp_path / "output"
+        out.mkdir()
+        # main.rbxlx has the marker; menu.rbxlx does not.
+        (out / "main.rbxlx").write_text(
+            '<roblox><Item><ProtectedString><![CDATA[\n'
+            '-- HUD Controller (auto-generated)\n'
+            ']]></ProtectedString></Item></roblox>\n'
+        )
+        (out / "menu.rbxlx").write_text(
+            '<roblox><Item><ProtectedString><![CDATA[\n'
+            '-- User-authored menu logic\n'
+            ']]></ProtectedString></Item></roblox>\n'
+        )
+
+        pl = Pipeline(unity_project_path=project, output_dir=out)
+        # Set selected_scene to the non-FPS one (mimics the post-
+        # ctx-swap state of a real resume).
+        pl.ctx.selected_scene = str(scenes_dir / "menu.unity")
+        # Scoped to menu.rbxlx (which has no marker) → no signal.
+        assert pl._fps_artifacts_on_disk() is False
+        # Now flip the selected scene to the FPS one — same dir,
+        # different scope, signal flips to True.
+        pl.ctx.selected_scene = str(scenes_dir / "main.unity")
+        assert pl._fps_artifacts_on_disk() is True
+
     def test_migration_recognises_multi_scene_rbxlx_filenames(
         self, tmp_path: Path,
     ) -> None:
@@ -641,6 +690,9 @@ class TestBackwardCompatMigration:
 
         pl = Pipeline(unity_project_path=project, output_dir=out)
         pl._is_resume = True
+        # Mirror the real resume paths: re-snapshot after the
+        # mocked ctx swap so the rbxlx scan respects ctx state.
+        pl._fps_artifacts_at_init = pl._fps_artifacts_on_disk()
         # Glob matched main.rbxlx → migration fires.
         assert pl._fps_artifacts_at_init is True
         pl.state.rbx_place = _fps_shaped_place()
@@ -686,6 +738,9 @@ class TestBackwardCompatMigration:
         # Simulate the explicit-resume mark that real publish/
         # interactive paths set after the ctx swap.
         pl._is_resume = True
+        # Mirror the real resume paths: re-snapshot after the
+        # mocked ctx swap so the rbxlx scan respects ctx state.
+        pl._fps_artifacts_at_init = pl._fps_artifacts_on_disk()
         # rbxlx fallback caught the marker even though scripts/ is gone.
         assert pl._fps_artifacts_at_init is True
         pl._subphase_inject_autogen_scripts()
@@ -722,6 +777,9 @@ class TestBackwardCompatMigration:
 
         pl = Pipeline(unity_project_path=project, output_dir=out)
         pl._is_resume = True
+        # Mirror the real resume paths: re-snapshot after the
+        # mocked ctx swap so the rbxlx scan respects ctx state.
+        pl._fps_artifacts_at_init = pl._fps_artifacts_on_disk()
         assert pl._fps_artifacts_at_init is False
         pl.state.rbx_place = _fps_shaped_place()
         pl._subphase_inject_autogen_scripts()
@@ -749,6 +807,9 @@ class TestBackwardCompatMigration:
 
         pl = Pipeline(unity_project_path=project, output_dir=out)
         pl._is_resume = True
+        # Mirror the real resume paths: re-snapshot after the
+        # mocked ctx swap so the rbxlx scan respects ctx state.
+        pl._fps_artifacts_at_init = pl._fps_artifacts_on_disk()
         # Scanner found the boundary-spanning marker.
         assert pl._fps_artifacts_at_init is True
 
@@ -794,11 +855,13 @@ class TestBackwardCompatMigration:
             },
             is_resume=False,  # full convert, not a resume
         )
-        # Disk signal is present...
-        assert pl._fps_artifacts_at_init is True
-        # ...but resume flag is False (full convert).
+        # Disk signal IS present (verified via direct scan), but the
+        # cached snapshot stays False because the fixture only
+        # re-snapshots on resume — mirroring ``run_all`` which never
+        # snapshots either. Both gates false → no migration.
+        assert pl._fps_artifacts_on_disk() is True
+        assert pl._fps_artifacts_at_init is False
         assert pl._is_resume is False
-        # So migration must NOT fire.
         pl._subphase_inject_autogen_scripts()
         assert pl.scaffolding == frozenset()
 

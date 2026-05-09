@@ -168,14 +168,16 @@ class Pipeline:
             # ``Pipeline(scaffolding=["fsps"])`` would persist silently.
             self.apply_scaffolding(self._init_scaffolding)
 
-        # Snapshot the backward-compat migration signal AT INIT TIME,
-        # before any subphase wipes the scripts/ dir. ``write_output()``
-        # calls ``_subphase_emit_scripts_to_disk`` (which rmtrees
-        # ``scripts/`` when ``--retranspile`` is set) BEFORE
-        # ``_subphase_inject_autogen_scripts``, so checking on-disk
-        # files in the inject subphase would miss the pre-PR signal
-        # that's been deleted.
-        self._fps_artifacts_at_init: bool = self._fps_artifacts_on_disk()
+        # ``_fps_artifacts_at_init`` caches the backward-compat
+        # migration signal BEFORE ``_subphase_emit_scripts_to_disk``
+        # wipes ``scripts/`` (with ``--retranspile``). Default False
+        # at construction — only resume/rebuild paths re-snapshot
+        # this with a properly-loaded ctx (so the rbxlx scan can
+        # scope to ``ctx.selected_scene`` for multi-scene runs).
+        # Fresh ``run_all()`` doesn't trigger migration anyway
+        # (``_is_resume`` stays False), so the init-time default of
+        # False is safe.
+        self._fps_artifacts_at_init: bool = False
 
         # ``_is_resume`` flags an EXPLICIT resume/rebuild (set True
         # by :meth:`resume` and the publish-rebuild path in u2r.py
@@ -275,13 +277,31 @@ class Pipeline:
                 if any(marker in head for marker in self._FPS_AUTOGEN_MARKERS):
                     return True
 
-        # Fallback: scan every ``*.rbxlx`` in the output dir for the
-        # marker. Multi-scene runs (``run_all_scenes``) write per-
-        # scene files like ``main.rbxlx`` / ``menu.rbxlx`` instead of
-        # ``converted_place.rbxlx``, so we can't hardcode the
-        # filename. Single-scene runs hit ``converted_place.rbxlx``
-        # via the same glob.
-        for place_file in self.output_dir.glob("*.rbxlx"):
+        # Fallback: scan the rbxlx for the marker. Scope matters for
+        # multi-scene output dirs (``run_all_scenes`` writes per-scene
+        # files like ``main.rbxlx`` and ``menu.rbxlx``) — a marker in
+        # ``main.rbxlx`` shouldn't migrate the whole project to
+        # ``scaffolding=['fps']`` if only the main scene was FPS-shaped
+        # and the menu wasn't. Prefer the SELECTED-scene-specific
+        # rbxlx when available, fall back to the canonical
+        # single-scene name, and only glob ``*.rbxlx`` as a
+        # last-resort safety net (a multi-scene rebuild with no
+        # selected scene set).
+        place_files: list[Path] = []
+        if self.ctx.selected_scene:
+            scene_stem = Path(self.ctx.selected_scene).stem
+            scoped = self.output_dir / f"{scene_stem}.rbxlx"
+            if scoped.exists():
+                place_files.append(scoped)
+        canonical = self.output_dir / "converted_place.rbxlx"
+        if canonical.exists() and canonical not in place_files:
+            place_files.append(canonical)
+        if not place_files:
+            # Last resort for unscoped multi-scene rebuilds; matches
+            # the conservative pre-scoped behaviour but only when no
+            # scene-specific signal is available.
+            place_files.extend(self.output_dir.glob("*.rbxlx"))
+        for place_file in place_files:
             if self._file_contains_any_marker(place_file):
                 return True
         return False
@@ -564,6 +584,12 @@ class Pipeline:
             )
             self.ctx = loaded
             self._is_resume = same_project
+            # Re-take the FPS artifact snapshot now that ctx carries
+            # ``selected_scene`` — the snapshot logic scopes the
+            # rbxlx scan to the selected-scene-specific output file
+            # for multi-scene runs. The init-time snapshot (taken
+            # with a fresh empty ctx) couldn't see that scope.
+            self._fps_artifacts_at_init = self._fps_artifacts_on_disk()
             if not same_project:
                 # Drop the prior project's persisted scaffolding too:
                 # a cross-project resume that inherits ``["fps"]`` from
