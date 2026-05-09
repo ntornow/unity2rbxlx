@@ -227,32 +227,83 @@ class Pipeline:
         to identically-named .luau files in ``scripts/``) doesn't
         falsely trigger the migration on a fresh conversion.
         """
+        # Two signals — the user keeps either to count as a true
+        # pre-PR FPS output:
+        #   1. ``scripts/HUDController.luau`` (legacy) /
+        #      ``scripts/AutoFpsHudController.luau`` (post-rename) /
+        #      ``scripts/FpsClient.luau`` carrying the auto-gen marker.
+        #   2. The rbxlx output itself contains the auto-gen marker
+        #      string. Survives cache pruning — users who archive or
+        #      shrink an output dir tend to keep the rbxlx as the
+        #      canonical artifact even when the scripts cache goes.
+        # Either signal flips True; user-authored .cs/.luau files
+        # transpiled into the scripts dir don't carry the marker.
         scripts_dir = self.output_dir / "scripts"
-        if not scripts_dir.is_dir():
-            return False
-        # Both the legacy filename (``HUDController.luau`` from pre-PR
-        # auto-gen, before the rename to ``AutoFpsHudController``) and
-        # the new filename are recognised so the migration works
-        # against output dirs from either era. Marker presence is the
-        # final discriminator — user-authored files don't carry it.
-        candidates = (
-            "HUDController.luau",
-            "AutoFpsHudController.luau",
-            "FpsClient.luau",
-        )
-        for name in candidates:
-            path = scripts_dir / name
-            if not path.exists():
+        if scripts_dir.is_dir():
+            candidates = (
+                "HUDController.luau",
+                "AutoFpsHudController.luau",
+                "FpsClient.luau",
+            )
+            for name in candidates:
+                path = scripts_dir / name
+                if not path.exists():
+                    continue
+                try:
+                    # Only read the first ~256 bytes — markers always live
+                    # in the first comment line.
+                    head = path.read_text(encoding="utf-8", errors="replace")[:256]
+                except OSError:
+                    continue
+                if any(marker in head for marker in self._FPS_AUTOGEN_MARKERS):
+                    return True
+
+        # Fallback: scan the rbxlx for the marker. The output XML
+        # embeds every script's source verbatim, so the auto-gen
+        # comment string appears as plain text. We stream the file
+        # in chunks to avoid loading the full ~4MB-50MB into memory
+        # just for a substring check.
+        for fname in ("converted_place.rbxlx", "converted_place.rbxl"):
+            place_file = self.output_dir / fname
+            if not place_file.exists():
                 continue
-            try:
-                # Only read the first ~256 bytes — markers always live
-                # in the first comment line.
-                head = path.read_text(encoding="utf-8", errors="replace")[:256]
-            except OSError:
-                continue
-            if any(marker in head for marker in self._FPS_AUTOGEN_MARKERS):
+            if self._file_contains_any_marker(place_file):
                 return True
         return False
+
+    def _file_contains_any_marker(self, path: Path) -> bool:
+        """Stream-search *path* for any FPS auto-gen marker.
+
+        Reads in 64KB chunks so a multi-MB rbxlx doesn't load fully
+        into memory just for a substring check. Reads with
+        ``errors="replace"`` so the binary rbxl format (which embeds
+        the same marker text in its compressed source blocks) doesn't
+        trip a UnicodeDecodeError. Bridges the chunk boundary by
+        keeping the last ``len(longest_marker) - 1`` bytes from the
+        previous chunk.
+        """
+        markers = self._FPS_AUTOGEN_MARKERS
+        if not markers:
+            return False
+        max_marker_len = max(len(m) for m in markers)
+        try:
+            with path.open("rb") as f:
+                tail = b""
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        return False
+                    blob = tail + chunk
+                    text = blob.decode("utf-8", errors="replace")
+                    for marker in markers:
+                        if marker in text:
+                            return True
+                    # Keep the last (max_marker_len - 1) bytes so the
+                    # next iteration sees markers that straddle the
+                    # boundary.
+                    tail = blob[-(max_marker_len - 1):] if max_marker_len > 1 else b""
+        except OSError:
+            return False
 
     def apply_scaffolding(self, scaffolding: Iterable[str] | None) -> None:
         """Merge *scaffolding* into ``self.ctx.scaffolding``.

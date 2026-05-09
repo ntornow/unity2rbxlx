@@ -545,6 +545,111 @@ class TestBackwardCompatMigration:
         pl._subphase_inject_autogen_scripts()
         assert pl.scaffolding == frozenset()
 
+    def test_migration_signal_falls_back_to_rbxlx_when_scripts_pruned(
+        self, tmp_path: Path,
+    ) -> None:
+        """Codex finding [P2] (PR #69 round 1): a user who archived
+        or pruned ``scripts/`` after a pre-PR FPS conversion still
+        has the canonical rbxlx output. The migration must find the
+        FPS auto-gen marker in that rbxlx so rebuild paths
+        (``u2r.py publish`` rebuild, interactive ``upload``) don't
+        silently drop the FPS scripts.
+        """
+        from core.conversion_context import ConversionContext
+
+        project = tmp_path / "Project"
+        (project / "Assets").mkdir(parents=True)
+        out = tmp_path / "output"
+        out.mkdir()
+        # No scripts/ dir — pruned. rbxlx remains with the marker
+        # embedded in an inline ProtectedString source block.
+        (out / "converted_place.rbxlx").write_text(
+            '<roblox version="4">\n'
+            '  <Item class="Script">\n'
+            '    <Properties>\n'
+            '      <string name="Name">HUDController</string>\n'
+            '      <ProtectedString name="Source"><![CDATA[\n'
+            '-- HUD Controller (auto-generated)\n'
+            '-- Updates health bar, ammo counter, and item indicators\n'
+            ']]></ProtectedString>\n'
+            '    </Properties>\n'
+            '  </Item>\n'
+            '</roblox>\n'
+        )
+        prior = ConversionContext(unity_project_path=str(project))
+        prior.save(out / "conversion_context.json")
+
+        pl = Pipeline(unity_project_path=project, output_dir=out)
+        pl.state.rbx_place = _fps_shaped_place()
+        # Simulate the explicit-resume mark that real publish/
+        # interactive paths set after the ctx swap.
+        pl._is_resume = True
+        # rbxlx fallback caught the marker even though scripts/ is gone.
+        assert pl._fps_artifacts_at_init is True
+        pl._subphase_inject_autogen_scripts()
+        assert "fps" in pl.scaffolding
+
+    def test_migration_skips_when_rbxlx_lacks_autogen_marker(
+        self, tmp_path: Path,
+    ) -> None:
+        """A rbxlx that doesn't carry the FPS auto-gen marker (e.g.
+        a non-FPS conversion's output) must NOT trigger the
+        migration via the new fallback signal. User-authored scripts
+        bundled in the rbxlx don't carry the canonical marker."""
+        from core.conversion_context import ConversionContext
+
+        project = tmp_path / "Project"
+        (project / "Assets").mkdir(parents=True)
+        out = tmp_path / "output"
+        out.mkdir()
+        (out / "converted_place.rbxlx").write_text(
+            '<roblox version="4">\n'
+            '  <Item class="Script">\n'
+            '    <Properties>\n'
+            '      <string name="Name">UserScript</string>\n'
+            '      <ProtectedString name="Source"><![CDATA[\n'
+            '-- User-authored gameplay script\n'
+            'local x = 1\n'
+            ']]></ProtectedString>\n'
+            '    </Properties>\n'
+            '  </Item>\n'
+            '</roblox>\n'
+        )
+        prior = ConversionContext(unity_project_path=str(project))
+        prior.save(out / "conversion_context.json")
+
+        pl = Pipeline(unity_project_path=project, output_dir=out)
+        pl._is_resume = True
+        assert pl._fps_artifacts_at_init is False
+        pl.state.rbx_place = _fps_shaped_place()
+        pl._subphase_inject_autogen_scripts()
+        assert pl.scaffolding == frozenset()
+
+    def test_migration_signal_handles_chunk_boundary_marker(
+        self, tmp_path: Path,
+    ) -> None:
+        """The streaming scanner reads the rbxlx in 64KB chunks. A
+        marker straddling the boundary between two chunks must still
+        be detected — the scanner keeps the last
+        (max_marker_len - 1) bytes from the prior chunk to bridge.
+        """
+        project = tmp_path / "Project"
+        (project / "Assets").mkdir(parents=True)
+        out = tmp_path / "output"
+        out.mkdir()
+        # Pad to push the marker across the 64KB chunk boundary.
+        # Marker is 33 chars; pad to land it at offset 65520 so it
+        # spans bytes 65520..65553 (across the 65536 boundary).
+        marker = "-- HUD Controller (auto-generated)"
+        pad_len = 65520
+        content = b"x" * pad_len + marker.encode("utf-8") + b"y" * 1024
+        (out / "converted_place.rbxlx").write_bytes(content)
+
+        pl = Pipeline(unity_project_path=project, output_dir=out)
+        pl._is_resume = True
+        # Scanner found the boundary-spanning marker.
+        assert pl._fps_artifacts_at_init is True
+
     def test_migration_skips_user_authored_hudcontroller(
         self, tmp_path: Path,
     ) -> None:
