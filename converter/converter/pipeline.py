@@ -235,7 +235,12 @@ class Pipeline:
         # Two signals — the user keeps either to count as a true
         # pre-PR FPS output:
         #   1. ``scripts/<name>.luau`` carrying the auto-gen marker
-        #      for any of the historic FPS-emitted script names.
+        #      for any of the historic FPS-emitted script names —
+        #      ONLY honoured for single-scene runs. Multi-scene runs
+        #      (``run_all_scenes``) rewrite the same ``scripts/``
+        #      cache for whichever scene converted last, so its
+        #      contents aren't scoped to ``ctx.selected_scene``;
+        #      using it would migrate non-FPS scenes too.
         #   2. The rbxlx output itself contains the auto-gen marker
         #      string. Survives cache pruning — users who archive or
         #      shrink an output dir tend to keep the rbxlx as the
@@ -250,8 +255,24 @@ class Pipeline:
         # migration signal — documented as a known limitation; the
         # workaround is to pass ``--scaffolding=fps`` explicitly on
         # rebuild, which the publish CLI surfaces.
+        #
+        # Multi-scene detection: ``ctx.selected_scene`` alone is NOT a
+        # reliable signal — it's set on every run including ordinary
+        # single-scene conversions (``Pipeline.run_all`` populates it
+        # at line 710). The discriminator is ``scenes_metadata``,
+        # which is only populated by ``run_all_scenes``'s per-scene
+        # loop and persists across resumes. Falling back to the disk
+        # shape catches the rare case where ctx was wiped but per-
+        # scene rbxlx files remain.
+        is_multi_scene = bool(self.ctx.scenes_metadata) or (
+            sum(
+                1 for p in self.output_dir.glob("*.rbxlx")
+                if p.name != "converted_place.rbxlx"
+            )
+            >= 1
+        )
         scripts_dir = self.output_dir / "scripts"
-        if scripts_dir.is_dir():
+        if scripts_dir.is_dir() and not is_multi_scene:
             # Recognised auto-gen filenames across pipeline eras:
             #   - ``HUDController.luau`` (pre-rename HUD listener)
             #   - ``AutoFpsHudController.luau`` (post-rename HUD listener)
@@ -293,9 +314,10 @@ class Pipeline:
             scoped = self.output_dir / f"{scene_stem}.rbxlx"
             if scoped.exists():
                 place_files.append(scoped)
-        canonical = self.output_dir / "converted_place.rbxlx"
-        if canonical.exists() and canonical not in place_files:
-            place_files.append(canonical)
+        if not place_files:
+            canonical = self.output_dir / "converted_place.rbxlx"
+            if canonical.exists():
+                place_files.append(canonical)
         if not place_files:
             # Last resort for unscoped multi-scene rebuilds; matches
             # the conservative pre-scoped behaviour but only when no
@@ -2402,12 +2424,97 @@ return table.concat(allData, "\\n")'''
                     "[write_output] Auto-generated %d FPS client scripts/GUIs "
                     "(--scaffolding=fps)", fps_added,
                 )
-        elif looks_fps:
-            log.info(
-                "[write_output] Heuristic detected FPS-style scripts; "
-                "skipping auto-injected FPS controller/HUD. Pass "
-                "--scaffolding=fps to opt in."
+        else:
+            # Opt-out cleanup: remove auto-gen FPS scripts that may
+            # have been rehydrated from a prior --scaffolding=fps run.
+            # Without this, the rehydrate would silently carry the
+            # last run's HUDController/FPSController forward even
+            # after the user toggled the flag off.
+            removed = self._remove_rehydrated_fps_autogen()
+            if removed:
+                log.info(
+                    "[write_output] Removed %d rehydrated FPS auto-gen "
+                    "script(s) — current run did not pass "
+                    "--scaffolding=fps",
+                    removed,
+                )
+            if looks_fps:
+                log.info(
+                    "[write_output] Heuristic detected FPS-style scripts; "
+                    "skipping auto-injected FPS controller/HUD. Pass "
+                    "--scaffolding=fps to opt in."
+                )
+
+    def _remove_rehydrated_fps_autogen(self) -> int:
+        """Drop FPS-only auto-gen scripts and the HUD ScreenGui that
+        were rehydrated from a prior ``--scaffolding=fps`` run.
+
+        Called from ``_subphase_inject_autogen_scripts`` on the
+        opt-out branch — the user toggled FPS off but the rehydrate
+        loaded last run's auto-gen files. Pruning here makes the
+        opt-out effective without breaking the review flow's
+        general edit-preservation contract (other auto-gen scripts
+        — GameServerManager, CollisionGroupSetup, etc. — stay).
+
+        Marker-based, name-aware: matches the FPS-specific header
+        comments AND the canonical names so user-authored files of
+        the same name (without the marker) are left alone.
+        """
+        if self.state.rbx_place is None:
+            return 0
+        fps_markers = (
+            "-- HUD Controller (auto-generated)",
+            "-- FPS Client Controller (auto-generated)",
+        )
+        # Recognised FPS auto-gen script names across pipeline eras:
+        #   - ``AutoFpsHudController``: post-rename HUD listener.
+        #   - ``HUDController``: pre-rename HUD listener (legacy).
+        #   - ``FPSController``: actual emitted controller (caps).
+        #   - ``FpsClient``: alternate legacy controller name in
+        #     ``_fps_artifacts_on_disk`` migration list — kept here
+        #     so opt-out reruns prune that filename too if a prior
+        #     conversion happened to write it.
+        fps_names = {
+            "AutoFpsHudController", "FPSController", "HUDController",
+            "FpsClient",
+        }
+        # ``AutoFpsEventDispatch`` is an FPS-only ModuleScript whose
+        # source has no per-line marker comment — its name is the
+        # marker by design (the ``AutoFps`` prefix is converter-owned
+        # namespace, distinct from a user-authored ``EventDispatch``).
+        # Pruning by name only is safe because the prefix itself
+        # signals auto-gen origin.
+        fps_name_only = {"AutoFpsEventDispatch"}
+        original = self.state.rbx_place.scripts
+        kept = [
+            s for s in original
+            if not (
+                (
+                    s.name in fps_names
+                    and any(m in s.source[:512] for m in fps_markers)
+                )
+                or s.name in fps_name_only
             )
+        ]
+        removed_scripts = len(original) - len(kept)
+        self.state.rbx_place.scripts = kept
+
+        # The FPS HUD ScreenGui is identified by a marker attribute
+        # (``_AutoFpsHud``) the generator stamps on it, NOT by its
+        # name. A user-authored ScreenGui named ``HUD`` (e.g. from
+        # Canvas/UI conversion) doesn't carry the marker and is
+        # preserved through opt-out runs.
+        original_guis = self.state.rbx_place.screen_guis
+        kept_guis = [
+            sg for sg in original_guis
+            if not (
+                sg.name == "HUD"
+                and getattr(sg, "attributes", {}).get("_AutoFpsHud")
+            )
+        ]
+        removed_guis = len(original_guis) - len(kept_guis)
+        self.state.rbx_place.screen_guis = kept_guis
+        return removed_scripts + removed_guis
 
     def _subphase_encode_terrain(self) -> None:
         """Encode each terrain's heightmap into Roblox SmoothGrid binary and
@@ -2843,6 +2950,26 @@ script.Disabled = true
             ),
         )
 
+    # Marker substrings that identify converter-emitted scripts.
+    # Used by ``detect_fps_game`` to skip auto-gen files (the
+    # GameServerManager mentions ``PlayerShoot`` + ``RemoteEvent``
+    # to wire up its generic spawn flow, so unfiltered detection
+    # false-positives every conversion). User edits to auto-gen
+    # scripts still come through rehydrate as user-authored content;
+    # only the heuristic skips them.
+    _AUTOGEN_MARKERS: tuple[str, ...] = (
+        "-- HUD Controller (auto-generated)",
+        "-- FPS Client Controller (auto-generated)",
+        "-- CollisionFidelityRecook (auto-generated)",
+        "-- CollisionGroup Setup (auto-generated from Unity layers)",
+        "-- Game Server Manager (auto-generated by Unity converter)",
+        "-- EventDispatch: cross-class connect helper",
+        "-- Auto-generated bootstrap:",
+        "-- Auto-generated animation script",
+        "-- Auto-generated Animator State Machine",
+        "-- Auto-generated mesh loader",
+    )
+
     def _rehydrate_scripts_from_disk(self, scripts_dir: Path) -> None:
         """Populate rbx_place.scripts from disk for the preserved-scripts path.
 
@@ -2853,6 +2980,14 @@ script.Disabled = true
         write_output can put edits back in nested subdirs (animations/,
         animation_data/, scriptable_objects/) instead of defaulting every
         file to the top-level scripts/ dir.
+
+        Rehydrates ALL ``.luau`` files including converter-emitted ones
+        — the review flow lets users hand-edit auto-gen scripts
+        between assemble and upload, and skipping them would silently
+        discard those edits. Opt-out behaviour (``--scaffolding=fps``
+        OFF after a prior FPS run) is handled separately by
+        ``_subphase_inject_autogen_scripts``, which removes rehydrated
+        FPS auto-gen scripts when scaffolding doesn't include ``fps``.
         """
         from core.roblox_types import RbxScript
 
@@ -3286,6 +3421,17 @@ script.Disabled = true
             modules_to_inject.append(("CharacterBridge", "physics_bridge.luau"))
         if has_sub_emitters:
             modules_to_inject.append(("SubEmitterRuntime", "sub_emitter_runtime.luau"))
+        # FPS scaffolding's auto-generated HUDController requires
+        # ``AutoFpsEventDispatch.connectClient`` from this runtime
+        # module to bridge RemoteEvent vs BindableEvent producers.
+        # Inject when opted in via ``--scaffolding=fps`` so the
+        # require resolves. Distinct ``AutoFps`` name avoids
+        # colliding with a user-authored ``EventDispatch.cs`` script.
+        if "fps" in self.scaffolding:
+            from converter.scaffolding.fps import AUTO_FPS_EVENT_DISPATCH_NAME
+            modules_to_inject.append(
+                (AUTO_FPS_EVENT_DISPATCH_NAME, "event_dispatch.luau"),
+            )
 
         # Detect object pooling patterns in transpiled scripts
         has_pool = any(

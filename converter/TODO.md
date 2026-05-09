@@ -24,11 +24,14 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
     ``converter/autogen.py`` (generic autogen scripts), with the
     historic name kept as a thin re-export shim.
 
+  Earlier cleanup landed:
+  - PR #3: extracted ``connectClient`` into
+    ``runtime/event_dispatch.luau`` (auto-injected when
+    ``--scaffolding=fps`` opts in). HUDController now requires the
+    shared module instead of inlining the BindableEvent vs
+    RemoteEvent fork.
+
   Optional remaining cleanup:
-  - Extract ``connectClient`` from the inline body of
-    ``generate_hud_client_script`` into a runtime library module
-    under ``runtime/event_dispatch.luau`` so other scaffolding
-    modules can reuse it.
   - Eventually remove the ``fps_client_generator.py`` shim once any
     external callers have migrated.
 

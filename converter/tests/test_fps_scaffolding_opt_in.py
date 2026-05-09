@@ -350,9 +350,13 @@ class TestFpsHeuristicNoFalsePositiveOnAutogen:
         self, tmp_path: Path,
     ) -> None:
         """A place containing ONLY the converter's autogen scripts
-        (GameServerManager, CollisionGroupSetup, CollisionFidelityRecook)
-        must not trigger ``detect_fps_game``. The detector is meant for
-        user-authored content, not the converter's own scaffolding."""
+        (GameServerManager, CollisionFidelityRecook, etc.) must not
+        trigger ``detect_fps_game``. The detector skips files
+        carrying any of ``_AUTOGEN_MARKERS``, so user-authored
+        content is the only thing it considers — the converter's
+        generic spawn-flow code (``PlayerShoot`` + ``RemoteEvent``)
+        no longer false-positives.
+        """
         from converter.autogen import (
             generate_collision_fidelity_recook_script,
             generate_game_server_script,
@@ -367,20 +371,10 @@ class TestFpsHeuristicNoFalsePositiveOnAutogen:
             workspace_parts=[],
             screen_guis=[],
         )
-        # The autogen GameServerManager mentions PlayerShoot + RemoteEvent
-        # because it wires up the generic player-spawn flow. The detector
-        # in isolation matches that, so this asserts the FAILURE MODE
-        # codex flagged: detect_fps_game returns True on a non-FPS scene.
-        # See ``_subphase_inject_autogen_scripts`` for the fix — the
-        # subphase checks the heuristic BEFORE these autogens land.
         looks_fps = detect_fps_game(place)
-        # Document the upstream behaviour: detector itself isn't smart
-        # enough to filter autogens, but the call site is. If this
-        # assertion ever flips (e.g. detector grows an autogen filter),
-        # the call-site ordering can be relaxed.
-        assert looks_fps is True, (
-            "detector matches autogen GameServerManager — "
-            "the call site must filter, not the detector"
+        assert looks_fps is False, (
+            "detector should skip auto-gen scripts — only user "
+            "content drives the heuristic"
         )
 
     def test_is_fps_game_set_on_heuristic_match_without_opt_in(
@@ -654,6 +648,132 @@ class TestBackwardCompatMigration:
         # different scope, signal flips to True.
         pl.ctx.selected_scene = str(scenes_dir / "main.unity")
         assert pl._fps_artifacts_on_disk() is True
+
+    def test_migration_ignores_shared_scripts_cache_in_multi_scene(
+        self, tmp_path: Path,
+    ) -> None:
+        """Codex finding [P2] (PR #70 round 5/6): in multi-scene output
+        dirs, ``scripts/`` is a shared cache populated by whichever
+        scene converted last. A leftover ``HUDController.luau`` from
+        a prior FPS-scene conversion must NOT migrate the menu-scene
+        resume to ``scaffolding=['fps']``.
+
+        The discriminator is ``ctx.scenes_metadata`` (populated only
+        by ``run_all_scenes``) — NOT ``ctx.selected_scene``, which is
+        set on every run including single-scene conversions and so
+        would falsely gate off the scripts-dir signal for legitimate
+        single-scene resumes.
+        """
+        project = tmp_path / "Project"
+        scenes_dir = project / "Assets" / "Scenes"
+        scenes_dir.mkdir(parents=True)
+        (scenes_dir / "main.unity").touch()
+        (scenes_dir / "menu.unity").touch()
+        out = tmp_path / "output"
+        out.mkdir()
+        # Shared scripts cache: an FPS-scene leftover sits here.
+        scripts_dir = out / "scripts"
+        scripts_dir.mkdir()
+        (scripts_dir / "HUDController.luau").write_text(
+            "-- HUD Controller (auto-generated)\n"
+        )
+        # main.rbxlx + menu.rbxlx — multi-scene shape; neither has
+        # the FPS marker (the prior FPS scene's scripts/ cache is the
+        # only stale artifact).
+        (out / "main.rbxlx").write_text(
+            '<roblox version="4"></roblox>\n'
+        )
+        (out / "menu.rbxlx").write_text(
+            '<roblox version="4"></roblox>\n'
+        )
+
+        pl = Pipeline(unity_project_path=project, output_dir=out)
+        # Mimic the post-resume state: ``run_all_scenes`` populated
+        # scenes_metadata for both scenes; selected_scene is the
+        # currently-targeted one.
+        pl.ctx.scenes_metadata = {
+            "main": {"parts": 0, "scripts": 0, "game_objects": 0},
+            "menu": {"parts": 0, "scripts": 0, "game_objects": 0},
+        }
+        pl.ctx.selected_scene = str(scenes_dir / "menu.unity")
+        # Shared scripts/ cache must not signal migration when in a
+        # true multi-scene state — rbxlx is the authoritative scope.
+        assert pl._fps_artifacts_on_disk() is False
+
+    def test_migration_honours_scripts_cache_in_single_scene(
+        self, tmp_path: Path,
+    ) -> None:
+        """Codex finding [P2] (PR #70 round 6): a real single-scene
+        resume populates ``ctx.selected_scene`` too — keying multi-
+        scene off ``selected_scene`` would silently drop FPS HUD/
+        controller migration on legitimate same-project resumes.
+
+        ``scenes_metadata`` is the precise discriminator: empty
+        means single-scene, populated means ``run_all_scenes``.
+        """
+        project = tmp_path / "Project"
+        scenes_dir = project / "Assets" / "Scenes"
+        scenes_dir.mkdir(parents=True)
+        (scenes_dir / "main.unity").touch()
+        out = tmp_path / "output"
+        out.mkdir()
+        # Single-scene shape: only converted_place.rbxlx (no marker)
+        # plus a pre-flag FPS leftover in scripts/.
+        scripts_dir = out / "scripts"
+        scripts_dir.mkdir()
+        (scripts_dir / "HUDController.luau").write_text(
+            "-- HUD Controller (auto-generated)\n"
+        )
+        (out / "converted_place.rbxlx").write_text(
+            '<roblox version="4"></roblox>\n'
+        )
+
+        pl = Pipeline(unity_project_path=project, output_dir=out)
+        # selected_scene IS set even on single-scene resumes — the
+        # codex round-6 finding pinned this exact failure mode.
+        pl.ctx.selected_scene = str(scenes_dir / "main.unity")
+        # scenes_metadata stays empty → single-scene → scripts/ cache
+        # signal must fire so legitimate FPS resumes still migrate.
+        assert pl.ctx.scenes_metadata == {}
+        assert pl._fps_artifacts_on_disk() is True
+
+    def test_migration_skips_canonical_rbxlx_when_scoped_exists(
+        self, tmp_path: Path,
+    ) -> None:
+        """Codex finding [P3] (PR #70 round 5): when a scene-scoped
+        rbxlx exists (``<scene>.rbxlx``), the fallback must NOT also
+        scan ``converted_place.rbxlx``. Otherwise a stale canonical
+        snapshot from a prior single-scene FPS conversion would
+        contaminate a multi-scene non-FPS scene resume.
+        """
+        project = tmp_path / "Project"
+        scenes_dir = project / "Assets" / "Scenes"
+        scenes_dir.mkdir(parents=True)
+        (scenes_dir / "menu.unity").touch()
+        out = tmp_path / "output"
+        out.mkdir()
+        # Stale canonical rbxlx with the FPS marker (from a prior
+        # single-scene FPS conversion the user has since pivoted).
+        (out / "converted_place.rbxlx").write_text(
+            '<roblox version="4">\n'
+            '  <Item class="Script">\n'
+            '    <Properties>\n'
+            '      <ProtectedString name="Source"><![CDATA[\n'
+            '-- HUD Controller (auto-generated)\n'
+            ']]></ProtectedString>\n'
+            '    </Properties>\n'
+            '  </Item>\n'
+            '</roblox>\n'
+        )
+        # Fresh menu.rbxlx — the new scene-scoped artifact, no marker.
+        (out / "menu.rbxlx").write_text(
+            '<roblox version="4"></roblox>\n'
+        )
+
+        pl = Pipeline(unity_project_path=project, output_dir=out)
+        pl.ctx.selected_scene = str(scenes_dir / "menu.unity")
+        # Scoped match exists; canonical must NOT be scanned.
+        assert pl._fps_artifacts_on_disk() is False
 
     def test_migration_recognises_multi_scene_rbxlx_filenames(
         self, tmp_path: Path,
