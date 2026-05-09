@@ -439,61 +439,76 @@ class TestFpsHeuristicNoFalsePositiveOnAutogen:
 
 class TestBackwardCompatMigration:
     """Output directories created before this PR have
-    ``conversion_context.json`` files with no ``scaffolding`` field.
-    Resuming/rebuilding those would silently drop the FPS scripts the
-    original conversion auto-injected. The subphase migrates by
-    inferring ``scaffolding=["fps"]`` when:
-       1. The heuristic matches the user content,
-       2. The ctx has no scaffolding entry,
-       3. ``completed_phases`` is non-empty (this is a resumed run,
-          not a fresh conversion).
+    ``conversion_context.json`` files with no ``scaffolding`` field
+    AND ``scripts/HUDController.luau`` (or ``FpsClient.luau``) on
+    disk from the prior pipeline's auto-inject. Resuming/rebuilding
+    those would silently drop the FPS scripts. The subphase migrates
+    by inferring ``scaffolding=["fps"]`` when ALL of:
+       1. ``self.scaffolding`` is empty (no explicit opt-in),
+       2. ``scripts/HUDController.luau`` or ``scripts/FpsClient.luau``
+          exists on disk (evidence of a pre-PR FPS conversion).
+
+    The on-disk signal is reliable because those filenames are ONLY
+    written by ``fps_client_generator`` — they don't appear on a
+    fresh non-FPS conversion. Distinguishes "resumed from pre-PR FPS
+    conversion" from "fresh post-PR run" without false positives.
     """
 
-    def test_migration_infers_fps_for_old_resumed_ctx(
-        self, fps_pipeline_factory,
+    def test_migration_infers_fps_when_hud_script_on_disk(
+        self, fps_pipeline_factory, tmp_path,
     ) -> None:
         pl = fps_pipeline_factory(None)
-        pl.ctx.completed_phases = ["parse", "extract_assets", "convert_scene"]
-        # No scaffolding persisted — old format.
+        # Simulate a pre-PR conversion: HUDController.luau exists in
+        # the output's scripts dir, but ctx.scaffolding is empty.
+        scripts_dir = pl.output_dir / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / "HUDController.luau").write_text(
+            "-- legacy HUD script from pre-PR FPS conversion\n",
+        )
         assert pl.scaffolding == frozenset()
         pl._subphase_inject_autogen_scripts()
-        # Migration kicks in; FPS scaffolding is now active.
+        # Migration kicks in — scaffolding now carries fps.
         assert "fps" in pl.scaffolding
-        # And FPS scripts are emitted.
         names = {s.name for s in pl.state.rbx_place.scripts}
         assert "HUDController" in names
+
+    def test_migration_infers_fps_when_fpsclient_on_disk(
+        self, fps_pipeline_factory,
+    ) -> None:
+        """Either canonical script name triggers the migration."""
+        pl = fps_pipeline_factory(None)
+        scripts_dir = pl.output_dir / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / "FpsClient.luau").write_text(
+            "-- legacy FPS controller from pre-PR conversion\n",
+        )
+        pl._subphase_inject_autogen_scripts()
+        assert "fps" in pl.scaffolding
 
     def test_migration_skips_fresh_conversion(
         self, fps_pipeline_factory,
     ) -> None:
-        """A fresh conversion (no completed phases yet) must NOT be
-        treated as a migration target — the user gets the new opt-in
-        default. Otherwise non-FPS projects whose user scripts trip
-        the heuristic would be auto-injected, defeating the purpose
-        of the opt-in flag."""
+        """A fresh conversion has no FPS scripts on disk yet — even
+        if the user content trips ``detect_fps_game``. The migration
+        must NOT fire, otherwise the opt-in contract is broken on
+        the standard pipeline path (``completed_phases`` was a bad
+        signal — every phase marks complete on first run too)."""
         pl = fps_pipeline_factory(None)
-        # completed_phases is empty (default) — fresh run.
+        # No scripts/ dir, no FPS artifacts — fresh run.
         pl._subphase_inject_autogen_scripts()
         assert pl.scaffolding == frozenset()
         names = {s.name for s in pl.state.rbx_place.scripts}
         assert "HUDController" not in names
 
-    def test_migration_skips_explicit_empty_opt_out(
+    def test_migration_skips_when_unrelated_scripts_on_disk(
         self, fps_pipeline_factory,
     ) -> None:
-        """A user who explicitly passed ``--scaffolding=`` (empty)
-        should NOT have FPS auto-inferred even on a resume — the
-        empty set is an explicit choice."""
-        pl = fps_pipeline_factory(frozenset())
-        pl.ctx.completed_phases = ["parse"]
-        # Explicit empty set → migration ALSO doesn't fire because
-        # we can't distinguish "explicit empty" from "old ctx
-        # without the field" purely from data — but the heuristic
-        # matches AND completed_phases is set, so migration would
-        # otherwise fire. Document the trade-off: the migration
-        # treats both as "old, infer FPS".
+        """A scripts/ dir full of user scripts that aren't
+        HUDController/FpsClient must NOT trigger the migration."""
+        pl = fps_pipeline_factory(None)
+        scripts_dir = pl.output_dir / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / "Player.luau").write_text("-- user player script\n")
+        (scripts_dir / "Door.luau").write_text("-- user door script\n")
         pl._subphase_inject_autogen_scripts()
-        # Migration fires — known limitation; user can re-run with
-        # an explicit non-FPS scaffolding once that exists, or the
-        # subphase can be tightened with a "ctx version" marker.
-        assert "fps" in pl.scaffolding
+        assert pl.scaffolding == frozenset()
