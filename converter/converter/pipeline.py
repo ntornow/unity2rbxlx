@@ -151,8 +151,19 @@ class Pipeline:
         #     ``fps_client_generator.inject_fps_scripts``.
         # Pass via ``u2r.py convert --scaffolding=fps`` or merge in via
         # :meth:`apply_scaffolding` after rehydrating ctx from disk.
-        if scaffolding:
-            self.ctx.scaffolding = sorted(set(scaffolding))
+        #
+        # ``_init_scaffolding`` keeps the caller's constructor request
+        # alive across ctx swaps inside :meth:`resume` (which loads ctx
+        # from disk and replaces ``self.ctx`` wholesale). Without this
+        # snapshot, ``u2r.py convert --phase write_output --scaffolding=fps``
+        # would silently revert to whatever was persisted in
+        # ``conversion_context.json`` — making the new flag a no-op on
+        # the most common resume entry point.
+        self._init_scaffolding: tuple[str, ...] = tuple(
+            sorted({str(s).strip().lower() for s in (scaffolding or ()) if str(s).strip()})
+        )
+        if self._init_scaffolding:
+            self.ctx.scaffolding = list(self._init_scaffolding)
 
     @property
     def scaffolding(self) -> frozenset[str]:
@@ -373,6 +384,13 @@ class Pipeline:
         if self._context_path.exists():
             self.ctx = ConversionContext.load(self._context_path)
             log.info("Loaded persisted context from %s", self._context_path)
+            # Re-apply the constructor's scaffolding request after the
+            # ctx swap so ``u2r.py convert --phase write_output
+            # --scaffolding=fps`` actually injects FPS scaffolding even
+            # when the persisted ctx didn't have it. Additive merge —
+            # persisted entries are kept, the new request adds to them.
+            if self._init_scaffolding:
+                self.apply_scaffolding(self._init_scaffolding)
 
         log.info("=== Resuming pipeline from phase '%s' ===", phase)
         self.run_through(phase, run_after=True)
@@ -1938,6 +1956,15 @@ return table.concat(allData, "\\n")'''
         """Synthesize project-bootstrap scripts: collision-group setup,
         GameServerManager spawn handling, ClientBootstrap that requires
         side-effect ModuleScripts, and FPS controller scripts/HUD."""
+        # Run the FPS heuristic against USER scripts only — before the
+        # autogen GameServerManager (which contains both ``PlayerShoot``
+        # and ``RemoteEvent`` to wire up its generic spawn flow) lands
+        # in ``place.scripts``. Otherwise ``detect_fps_game`` matches
+        # the converter's own autogen and the soft hint fires on every
+        # non-FPS conversion.
+        from converter.fps_client_generator import detect_fps_game
+        looks_fps = detect_fps_game(self.state.rbx_place)
+
         # Auto-generate collision group setup if Unity layers are used.
         from converter.fps_client_generator import generate_collision_group_script
         has_layers = False
@@ -2072,29 +2099,27 @@ return table.concat(allData, "\\n")'''
         # is no game-genre assumptions: non-FPS projects (Gamekit3D,
         # BoatAttack, ChopChop, RedRunner) get a clean conversion
         # without unwanted UI/input scripts injected.
+        #
+        # ``looks_fps`` was computed above against the user-scripts-only
+        # snapshot, so the soft hint (in the else branch) doesn't fire
+        # on every conversion just because the autogen GameServerManager
+        # mentions ``PlayerShoot`` + ``RemoteEvent``.
         if "fps" in self.scaffolding:
-            from converter.fps_client_generator import (
-                inject_fps_scripts, detect_fps_game,
-            )
+            from converter.fps_client_generator import inject_fps_scripts
             fps_added = inject_fps_scripts(self.state.rbx_place)
             if fps_added:
                 log.info(
                     "[write_output] Auto-generated %d FPS client scripts/GUIs "
                     "(--scaffolding=fps)", fps_added,
                 )
-            if detect_fps_game(self.state.rbx_place):
+            if looks_fps:
                 self.state.rbx_place.is_fps_game = True
-        else:
-            # Soft hint when the heuristic looks FPS-shaped but no
-            # opt-in. Helps users discover the flag without forcing
-            # the scaffolding on every project that happens to match.
-            from converter.fps_client_generator import detect_fps_game
-            if detect_fps_game(self.state.rbx_place):
-                log.info(
-                    "[write_output] Heuristic detected FPS-style scripts; "
-                    "skipping auto-injected FPS controller/HUD. Pass "
-                    "--scaffolding=fps to opt in."
-                )
+        elif looks_fps:
+            log.info(
+                "[write_output] Heuristic detected FPS-style scripts; "
+                "skipping auto-injected FPS controller/HUD. Pass "
+                "--scaffolding=fps to opt in."
+            )
 
     def _subphase_encode_terrain(self) -> None:
         """Encode each terrain's heightmap into Roblox SmoothGrid binary and

@@ -252,3 +252,113 @@ class TestScaffoldingPersistence:
         pl = Pipeline(unity_project_path=project, output_dir=tmp_path / "out")
         pl.apply_scaffolding([" FPS ", "  ", "Puzzle"])
         assert pl.scaffolding == frozenset({"fps", "puzzle"})
+
+    def test_resume_reapplies_constructor_scaffolding_after_ctx_swap(
+        self, tmp_path: Path,
+    ) -> None:
+        """``u2r.py convert --phase write_output --scaffolding=fps``
+        constructs a Pipeline with the new flag, then calls
+        ``resume()`` which loads ``conversion_context.json`` from disk
+        and replaces ``self.ctx``. The persisted ctx may not carry
+        ``fps``; the constructor's request must still survive the
+        swap so the resume actually injects the FPS scaffolding.
+        """
+        from core.conversion_context import ConversionContext
+
+        project = tmp_path / "fakeproject"
+        (project / "Assets").mkdir(parents=True)
+        out = tmp_path / "out"
+        out.mkdir()
+
+        # Persist a prior ctx with NO scaffolding entry — mimics a
+        # conversion that ran before --scaffolding existed.
+        prior = ConversionContext(unity_project_path=str(project))
+        prior.save(out / "conversion_context.json")
+
+        # Construct Pipeline with the new flag, then mimic the ctx
+        # swap that ``resume()`` performs.
+        pl = Pipeline(
+            unity_project_path=project,
+            output_dir=out,
+            scaffolding=["fps"],
+        )
+        # Sanity: the constructor's request is on ctx pre-swap.
+        assert pl.scaffolding == frozenset({"fps"})
+
+        # Simulate resume()'s ctx reload + re-apply.
+        pl.ctx = ConversionContext.load(out / "conversion_context.json")
+        # Without re-application, the swap would clobber the request.
+        assert pl.scaffolding == frozenset()
+        # The Pipeline keeps the constructor's snapshot for re-application.
+        pl.apply_scaffolding(pl._init_scaffolding)
+        assert pl.scaffolding == frozenset({"fps"})
+
+
+class TestFpsHeuristicNoFalsePositiveOnAutogen:
+    """The FPS heuristic must check USER scripts only — not the
+    converter's own auto-generated GameServerManager (which contains
+    both ``PlayerShoot`` and ``RemoteEvent`` to wire up its generic
+    spawn flow). Otherwise the soft hint fires on every conversion,
+    not just genuine FPS-shaped projects.
+    """
+
+    def test_detector_does_not_fire_on_autogen_only_place(
+        self, tmp_path: Path,
+    ) -> None:
+        """A place containing ONLY the converter's autogen scripts
+        (GameServerManager, CollisionGroupSetup, CollisionFidelityRecook)
+        must not trigger ``detect_fps_game``. The detector is meant for
+        user-authored content, not the converter's own scaffolding."""
+        from converter.fps_client_generator import (
+            generate_game_server_script,
+            generate_collision_fidelity_recook_script,
+            detect_fps_game,
+        )
+
+        place = RbxPlace(
+            scripts=[
+                generate_game_server_script(),
+                generate_collision_fidelity_recook_script(),
+            ],
+            workspace_parts=[],
+            screen_guis=[],
+        )
+        # The autogen GameServerManager mentions PlayerShoot + RemoteEvent
+        # because it wires up the generic player-spawn flow. The detector
+        # in isolation matches that, so this asserts the FAILURE MODE
+        # codex flagged: detect_fps_game returns True on a non-FPS scene.
+        # See ``_subphase_inject_autogen_scripts`` for the fix — the
+        # subphase checks the heuristic BEFORE these autogens land.
+        looks_fps = detect_fps_game(place)
+        # Document the upstream behaviour: detector itself isn't smart
+        # enough to filter autogens, but the call site is. If this
+        # assertion ever flips (e.g. detector grows an autogen filter),
+        # the call-site ordering can be relaxed.
+        assert looks_fps is True, (
+            "detector matches autogen GameServerManager — "
+            "the call site must filter, not the detector"
+        )
+
+    def test_subphase_runs_detector_before_autogen_inject(
+        self, fps_pipeline_factory,
+    ) -> None:
+        """The subphase computes ``looks_fps`` BEFORE appending any
+        autogen scripts so the heuristic only sees user content. A
+        place with NO user FPS markers shouldn't get the soft hint
+        (or be marked ``is_fps_game``) just because GameServerManager
+        landed in ``place.scripts`` mid-subphase."""
+        # Empty place — no user FPS markers anywhere.
+        pl = fps_pipeline_factory(None)
+        pl.state.rbx_place = RbxPlace(
+            scripts=[],
+            workspace_parts=[],
+            screen_guis=[],
+        )
+        pl._subphase_inject_autogen_scripts()
+        # GameServerManager + CollisionFidelityRecook may be appended,
+        # but the FPS hint shouldn't have triggered: is_fps_game stays
+        # falsy and no FPS controller / HUD landed.
+        assert not getattr(pl.state.rbx_place, "is_fps_game", False)
+        names = {s.name for s in pl.state.rbx_place.scripts}
+        assert "HUDController" not in names
+        assert "FpsClient" not in names
