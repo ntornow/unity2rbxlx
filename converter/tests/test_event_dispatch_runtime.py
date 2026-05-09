@@ -299,6 +299,33 @@ class TestFpsOptOutPrunesRehydratedScaffolding:
         # too — but at least one copy stays).
         assert "GameServerManager" in names
 
+    def test_opt_out_drops_legacy_fpsclient(
+        self, tmp_path: Path,
+    ) -> None:
+        """Codex finding [P2] (PR #70 round 4): the migration's
+        recognised-filename list includes the legacy ``FpsClient``
+        name (alternate controller filename from a pre-PR era). The
+        opt-out prune must match the same set, otherwise rebuilding
+        an old output dir without ``--scaffolding=fps`` leaves the
+        legacy controller in ``rbx_place`` even though the heuristic
+        skips its auto-gen marker, so the place ships an unwired
+        controller without the FPS camera flags.
+        """
+        pl = self._make_pipeline(tmp_path)
+        pl.state.rbx_place.scripts.append(
+            RbxScript(
+                name="FpsClient",
+                source=(
+                    "-- FPS Client Controller (auto-generated)\n"
+                    "-- legacy alternate name from a pre-PR conversion\n"
+                ),
+                script_type="LocalScript",
+            )
+        )
+        pl._subphase_inject_autogen_scripts()
+        names = {s.name for s in pl.state.rbx_place.scripts}
+        assert "FpsClient" not in names
+
     def test_opt_out_keeps_user_authored_hud_screengui(
         self, tmp_path: Path,
     ) -> None:

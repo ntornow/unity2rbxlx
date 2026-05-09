@@ -2444,8 +2444,17 @@ return table.concat(allData, "\\n")'''
             "-- HUD Controller (auto-generated)",
             "-- FPS Client Controller (auto-generated)",
         )
+        # Recognised FPS auto-gen script names across pipeline eras:
+        #   - ``AutoFpsHudController``: post-rename HUD listener.
+        #   - ``HUDController``: pre-rename HUD listener (legacy).
+        #   - ``FPSController``: actual emitted controller (caps).
+        #   - ``FpsClient``: alternate legacy controller name in
+        #     ``_fps_artifacts_on_disk`` migration list — kept here
+        #     so opt-out reruns prune that filename too if a prior
+        #     conversion happened to write it.
         fps_names = {
             "AutoFpsHudController", "FPSController", "HUDController",
+            "FpsClient",
         }
         original = self.state.rbx_place.scripts
         kept = [
