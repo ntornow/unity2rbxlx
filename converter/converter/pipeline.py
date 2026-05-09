@@ -229,21 +229,35 @@ class Pipeline:
         """
         # Two signals — the user keeps either to count as a true
         # pre-PR FPS output:
-        #   1. ``scripts/HUDController.luau`` (legacy) /
-        #      ``scripts/AutoFpsHudController.luau`` (post-rename) /
-        #      ``scripts/FpsClient.luau`` carrying the auto-gen marker.
+        #   1. ``scripts/<name>.luau`` carrying the auto-gen marker
+        #      for any of the historic FPS-emitted script names.
         #   2. The rbxlx output itself contains the auto-gen marker
         #      string. Survives cache pruning — users who archive or
         #      shrink an output dir tend to keep the rbxlx as the
         #      canonical artifact even when the scripts cache goes.
         # Either signal flips True; user-authored .cs/.luau files
         # transpiled into the scripts dir don't carry the marker.
+        #
+        # ``.rbxl`` is intentionally NOT a fallback target: our binary
+        # writer LZ4-compresses script source inside PROP chunks, so
+        # the marker comment is not reliably present as a UTF-8
+        # substring. Users who keep only the binary file lose the
+        # migration signal — documented as a known limitation; the
+        # workaround is to pass ``--scaffolding=fps`` explicitly on
+        # rebuild, which the publish CLI surfaces.
         scripts_dir = self.output_dir / "scripts"
         if scripts_dir.is_dir():
+            # Recognised auto-gen filenames across pipeline eras:
+            #   - ``HUDController.luau`` (pre-rename HUD listener)
+            #   - ``AutoFpsHudController.luau`` (post-rename HUD listener)
+            #   - ``FpsClient.luau`` (legacy controller stub name)
+            #   - ``FPSController.luau`` (the actual generated
+            #     controller name from ``generate_fps_client_script``)
             candidates = (
                 "HUDController.luau",
                 "AutoFpsHudController.luau",
                 "FpsClient.luau",
+                "FPSController.luau",
             )
             for name in candidates:
                 path = scripts_dir / name
@@ -258,15 +272,13 @@ class Pipeline:
                 if any(marker in head for marker in self._FPS_AUTOGEN_MARKERS):
                     return True
 
-        # Fallback: scan the rbxlx for the marker. The output XML
-        # embeds every script's source verbatim, so the auto-gen
-        # comment string appears as plain text. We stream the file
-        # in chunks to avoid loading the full ~4MB-50MB into memory
-        # just for a substring check.
-        for fname in ("converted_place.rbxlx", "converted_place.rbxl"):
-            place_file = self.output_dir / fname
-            if not place_file.exists():
-                continue
+        # Fallback: scan every ``*.rbxlx`` in the output dir for the
+        # marker. Multi-scene runs (``run_all_scenes``) write per-
+        # scene files like ``main.rbxlx`` / ``menu.rbxlx`` instead of
+        # ``converted_place.rbxlx``, so we can't hardcode the
+        # filename. Single-scene runs hit ``converted_place.rbxlx``
+        # via the same glob.
+        for place_file in self.output_dir.glob("*.rbxlx"):
             if self._file_contains_any_marker(place_file):
                 return True
         return False

@@ -545,6 +545,64 @@ class TestBackwardCompatMigration:
         pl._subphase_inject_autogen_scripts()
         assert pl.scaffolding == frozenset()
 
+    def test_migration_recognises_legacy_fpscontroller_filename(
+        self, tmp_path: Path,
+    ) -> None:
+        """Codex finding [P2] (PR #69 round 2): the controller script
+        is emitted as ``FPSController.luau`` (caps), not
+        ``FpsClient.luau``. A pre-PR output dir whose HUD script was
+        pruned but whose controller script remains must still
+        trigger the migration."""
+        pl = self._make_pipeline_with_disk_artifacts(tmp_path, {
+            "FPSController.luau": (
+                "-- FPS Client Controller (auto-generated)\n"
+                "-- WASD movement + mouse look + raycast shooting\n"
+            ),
+        })
+        pl._subphase_inject_autogen_scripts()
+        assert "fps" in pl.scaffolding
+
+    def test_migration_recognises_multi_scene_rbxlx_filenames(
+        self, tmp_path: Path,
+    ) -> None:
+        """Codex finding [P2] (PR #69 round 2): ``run_all_scenes``
+        writes per-scene rbxlx files (e.g. ``main.rbxlx``,
+        ``menu.rbxlx``) rather than ``converted_place.rbxlx``. The
+        rbxlx fallback must scan every ``*.rbxlx`` in the output dir,
+        not just the canonical name, otherwise multi-scene rebuilds
+        with a pruned scripts cache silently lose FPS scaffolding."""
+        from core.conversion_context import ConversionContext
+
+        project = tmp_path / "Project"
+        (project / "Assets").mkdir(parents=True)
+        out = tmp_path / "output"
+        out.mkdir()
+        # Multi-scene output: no converted_place.rbxlx; per-scene files.
+        (out / "main.rbxlx").write_text(
+            '<roblox version="4">\n'
+            '  <Item class="Script">\n'
+            '    <Properties>\n'
+            '      <ProtectedString name="Source"><![CDATA[\n'
+            '-- HUD Controller (auto-generated)\n'
+            ']]></ProtectedString>\n'
+            '    </Properties>\n'
+            '  </Item>\n'
+            '</roblox>\n'
+        )
+        (out / "menu.rbxlx").write_text(
+            '<roblox version="4"></roblox>\n'
+        )
+        prior = ConversionContext(unity_project_path=str(project))
+        prior.save(out / "conversion_context.json")
+
+        pl = Pipeline(unity_project_path=project, output_dir=out)
+        pl._is_resume = True
+        # Glob matched main.rbxlx → migration fires.
+        assert pl._fps_artifacts_at_init is True
+        pl.state.rbx_place = _fps_shaped_place()
+        pl._subphase_inject_autogen_scripts()
+        assert "fps" in pl.scaffolding
+
     def test_migration_signal_falls_back_to_rbxlx_when_scripts_pruned(
         self, tmp_path: Path,
     ) -> None:
