@@ -148,7 +148,7 @@ class Pipeline:
         # game-genre assumptions. Currently recognised:
         #   - ``"fps"`` → inject FPS client controller LocalScript,
         #     HUD ScreenGui, and HUDController LocalScript via
-        #     ``fps_client_generator.inject_fps_scripts``.
+        #     ``scaffolding.fps.inject_fps_scripts``.
         # Pass via ``u2r.py convert --scaffolding=fps`` or merge in via
         # :meth:`apply_scaffolding` after rehydrating ctx from disk.
         #
@@ -2062,7 +2062,7 @@ return table.concat(allData, "\\n")'''
         # in ``place.scripts``. Otherwise ``detect_fps_game`` matches
         # the converter's own autogen and the soft hint fires on every
         # non-FPS conversion.
-        from converter.fps_client_generator import detect_fps_game
+        from converter.scaffolding.fps import detect_fps_game
         looks_fps = detect_fps_game(self.state.rbx_place)
 
         # Backward-compat migration: an output directory created before
@@ -2096,7 +2096,7 @@ return table.concat(allData, "\\n")'''
             self.apply_scaffolding(["fps"])
 
         # Auto-generate collision group setup if Unity layers are used.
-        from converter.fps_client_generator import generate_collision_group_script
+        from converter.autogen import generate_collision_group_script
         has_layers = False
         def _check_layers(parts):
             nonlocal has_layers
@@ -2114,7 +2114,7 @@ return table.concat(allData, "\\n")'''
             log.info("[write_output] Injected CollisionGroupSetup script")
 
         # Auto-generate game server manager (spawn system, player init).
-        from converter.fps_client_generator import generate_game_server_script
+        from converter.autogen import generate_game_server_script
         existing_server_mgr = [s for s in self.state.rbx_place.scripts if s.name == "GameServerManager"]
         if not existing_server_mgr:
             self.state.rbx_place.scripts.append(generate_game_server_script())
@@ -2130,7 +2130,7 @@ return table.concat(allData, "\\n")'''
         # collision (Roblox doesn't re-cook on property assignment),
         # producing invisible bounding-box blockers behind hollow
         # shapes like door frames.
-        from converter.fps_client_generator import (
+        from converter.autogen import (
             generate_collision_fidelity_recook_script,
         )
         existing_recook = [
@@ -2260,7 +2260,7 @@ return table.concat(allData, "\\n")'''
             self.state.rbx_place.is_fps_game = True
 
         if "fps" in self.scaffolding:
-            from converter.fps_client_generator import inject_fps_scripts
+            from converter.scaffolding.fps import inject_fps_scripts
             fps_added = inject_fps_scripts(self.state.rbx_place)
             if fps_added:
                 log.info(

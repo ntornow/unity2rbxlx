@@ -309,11 +309,11 @@ class TestFpsHeuristicNoFalsePositiveOnAutogen:
         (GameServerManager, CollisionGroupSetup, CollisionFidelityRecook)
         must not trigger ``detect_fps_game``. The detector is meant for
         user-authored content, not the converter's own scaffolding."""
-        from converter.fps_client_generator import (
-            generate_game_server_script,
+        from converter.autogen import (
             generate_collision_fidelity_recook_script,
-            detect_fps_game,
+            generate_game_server_script,
         )
+        from converter.scaffolding.fps import detect_fps_game
 
         place = RbxPlace(
             scripts=[
@@ -449,7 +449,7 @@ class TestBackwardCompatMigration:
           exists on disk (evidence of a pre-PR FPS conversion).
 
     The on-disk signal is reliable because those filenames are ONLY
-    written by ``fps_client_generator`` — they don't appear on a
+    written by ``scaffolding.fps.inject_fps_scripts`` — they don't appear on a
     fresh non-FPS conversion. Distinguishes "resumed from pre-PR FPS
     conversion" from "fresh post-PR run" without false positives.
     """
@@ -772,7 +772,7 @@ class TestInjectFpsScriptsIdempotent:
     """
 
     def test_does_not_double_inject_hud_controller(self) -> None:
-        from converter.fps_client_generator import (
+        from converter.scaffolding.fps import (
             inject_fps_scripts, generate_hud_client_script,
         )
 
@@ -803,7 +803,7 @@ class TestInjectFpsScriptsIdempotent:
         Marker-based dedupe (across both canonical names) keeps the
         legacy script as the single auto-gen listener.
         """
-        from converter.fps_client_generator import inject_fps_scripts
+        from converter.scaffolding.fps import inject_fps_scripts
 
         place = RbxPlace(
             scripts=[
@@ -836,7 +836,7 @@ class TestInjectFpsScriptsIdempotent:
     def test_first_invocation_still_injects_hud(self) -> None:
         """A truly fresh place still gets the AutoFpsHudController —
         the guard short-circuits only when one already exists."""
-        from converter.fps_client_generator import inject_fps_scripts
+        from converter.scaffolding.fps import inject_fps_scripts
 
         place = RbxPlace(scripts=[], workspace_parts=[], screen_guis=[])
         inject_fps_scripts(place)
@@ -855,7 +855,7 @@ class TestInjectFpsScriptsIdempotent:
         scripts coexist on disk under different filenames — the user's
         custom HUD logic and the auto-generated event-listener wiring
         for the FPS HUD ScreenGui both run."""
-        from converter.fps_client_generator import inject_fps_scripts
+        from converter.scaffolding.fps import inject_fps_scripts
 
         place = RbxPlace(
             scripts=[
