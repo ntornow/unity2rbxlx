@@ -127,8 +127,8 @@ class TestFpsScaffoldingOptIn:
         names = {s.name for s in pl.state.rbx_place.scripts}
         # Either the FpsClient LocalScript or some equivalent FPS
         # controller marker should be present after opt-in.
-        assert "HUDController" in names, (
-            "HUDController must be injected when --scaffolding=fps"
+        assert "AutoFpsHudController" in names, (
+            "AutoFpsHudController must be injected when --scaffolding=fps"
         )
 
     def test_fps_scaffolding_injects_hud_screengui(
@@ -146,7 +146,7 @@ class TestFpsScaffoldingOptIn:
         pl = fps_pipeline_factory(frozenset({"fps", "future_genre"}))
         pl._subphase_inject_autogen_scripts()
         names = {s.name for s in pl.state.rbx_place.scripts}
-        assert "HUDController" in names
+        assert "AutoFpsHudController" in names
 
 
 class TestPipelineScaffoldingPlumbing:
@@ -454,37 +454,58 @@ class TestBackwardCompatMigration:
     conversion" from "fresh post-PR run" without false positives.
     """
 
+    @staticmethod
+    def _make_pipeline_with_disk_artifacts(
+        tmp_path: Path,
+        files: dict[str, str],
+    ) -> Pipeline:
+        """Pre-write disk artifacts BEFORE constructing the Pipeline,
+        so ``_fps_artifacts_at_init`` (snapshotted in __init__) sees
+        them. The inject subphase reads the cached snapshot rather
+        than re-checking disk — by then the scripts/ dir may have
+        been wiped by ``_subphase_emit_scripts_to_disk``.
+        """
+        project = tmp_path / "fakeproject"
+        (project / "Assets").mkdir(parents=True)
+        out = tmp_path / "output"
+        out.mkdir()
+        scripts_dir = out / "scripts"
+        scripts_dir.mkdir()
+        for name, content in files.items():
+            (scripts_dir / name).write_text(content)
+
+        pl = Pipeline(unity_project_path=project, output_dir=out)
+        pl.state.rbx_place = _fps_shaped_place()
+        return pl
+
     def test_migration_infers_fps_when_hud_script_on_disk(
-        self, fps_pipeline_factory, tmp_path,
+        self, tmp_path: Path,
     ) -> None:
-        pl = fps_pipeline_factory(None)
-        # Simulate a pre-PR conversion: HUDController.luau with the
-        # canonical auto-generated marker exists in scripts/, but
-        # ctx.scaffolding is empty (saved before the field existed).
-        scripts_dir = pl.output_dir / "scripts"
-        scripts_dir.mkdir(parents=True, exist_ok=True)
-        (scripts_dir / "HUDController.luau").write_text(
-            "-- HUD Controller (auto-generated)\n"
-            "-- Updates health bar, ammo counter, and item indicators\n",
-        )
+        # Pre-write the disk artifact, then construct the Pipeline so
+        # the at-init snapshot picks up the file.
+        pl = self._make_pipeline_with_disk_artifacts(tmp_path, {
+            "HUDController.luau": (
+                "-- HUD Controller (auto-generated)\n"
+                "-- Updates health bar, ammo counter, and item indicators\n"
+            ),
+        })
         assert pl.scaffolding == frozenset()
         pl._subphase_inject_autogen_scripts()
         # Migration kicks in — scaffolding now carries fps.
         assert "fps" in pl.scaffolding
         names = {s.name for s in pl.state.rbx_place.scripts}
-        assert "HUDController" in names
+        assert "AutoFpsHudController" in names
 
     def test_migration_infers_fps_when_fpsclient_on_disk(
-        self, fps_pipeline_factory,
+        self, tmp_path: Path,
     ) -> None:
         """Either canonical auto-generated script triggers the migration."""
-        pl = fps_pipeline_factory(None)
-        scripts_dir = pl.output_dir / "scripts"
-        scripts_dir.mkdir(parents=True, exist_ok=True)
-        (scripts_dir / "FpsClient.luau").write_text(
-            "-- FPS Client Controller (auto-generated)\n"
-            "-- WASD movement + mouse look + raycast shooting\n",
-        )
+        pl = self._make_pipeline_with_disk_artifacts(tmp_path, {
+            "FpsClient.luau": (
+                "-- FPS Client Controller (auto-generated)\n"
+                "-- WASD movement + mouse look + raycast shooting\n"
+            ),
+        })
         pl._subphase_inject_autogen_scripts()
         assert "fps" in pl.scaffolding
 
@@ -517,38 +538,36 @@ class TestBackwardCompatMigration:
         assert pl.scaffolding == frozenset()
 
     def test_migration_skips_user_authored_hudcontroller(
-        self, fps_pipeline_factory,
+        self, tmp_path: Path,
     ) -> None:
         """A Unity project that ships its own ``HUDController.cs`` will
         transpile to ``HUDController.luau`` in ``scripts/`` on every
         conversion. The migration must NOT misclassify that file as
         evidence of a pre-PR FPS conversion — the auto-generated
         marker comment is the discriminator."""
-        pl = fps_pipeline_factory(None)
-        scripts_dir = pl.output_dir / "scripts"
-        scripts_dir.mkdir(parents=True, exist_ok=True)
-        # User-authored content — no auto-generated marker.
-        (scripts_dir / "HUDController.luau").write_text(
-            '-- User HUD controller (transpiled from HUDController.cs)\n'
-            'local Players = game:GetService("Players")\n',
-        )
+        pl = self._make_pipeline_with_disk_artifacts(tmp_path, {
+            # User-authored content — no auto-generated marker.
+            "HUDController.luau": (
+                '-- User HUD controller (transpiled from HUDController.cs)\n'
+                'local Players = game:GetService("Players")\n'
+            ),
+        })
         pl._subphase_inject_autogen_scripts()
         assert pl.scaffolding == frozenset()
 
     def test_migration_fires_only_on_autogen_marker(
-        self, fps_pipeline_factory,
+        self, tmp_path: Path,
     ) -> None:
         """The auto-generated marker comment IS the discriminator —
         flip the migration on by adding the marker to a same-named
         file. Same file path, different content → different result."""
-        pl = fps_pipeline_factory(None)
-        scripts_dir = pl.output_dir / "scripts"
-        scripts_dir.mkdir(parents=True, exist_ok=True)
-        # Auto-generated content — has the canonical marker.
-        (scripts_dir / "HUDController.luau").write_text(
-            '-- HUD Controller (auto-generated)\n'
-            '-- Updates health bar, ammo counter, and item indicators\n',
-        )
+        pl = self._make_pipeline_with_disk_artifacts(tmp_path, {
+            # Auto-generated content — has the canonical marker.
+            "HUDController.luau": (
+                '-- HUD Controller (auto-generated)\n'
+                '-- Updates health bar, ammo counter, and item indicators\n'
+            ),
+        })
         pl._subphase_inject_autogen_scripts()
         assert "fps" in pl.scaffolding
 
@@ -567,27 +586,32 @@ class TestInjectFpsScriptsIdempotent:
             inject_fps_scripts, generate_hud_client_script,
         )
 
-        # Place already has a HUDController (rehydrated from prior run).
+        # Place already has the auto-gen AutoFpsHudController
+        # (rehydrated from prior run).
         place = RbxPlace(
             scripts=[generate_hud_client_script()],
             workspace_parts=[],
             screen_guis=[],
         )
         inject_fps_scripts(place)
-        hud_count = sum(1 for s in place.scripts if s.name == "HUDController")
+        hud_count = sum(
+            1 for s in place.scripts if s.name == "AutoFpsHudController"
+        )
         assert hud_count == 1, (
-            f"expected 1 HUDController, got {hud_count} — duplicate "
-            "injection on rerun double-fires HUD updates"
+            f"expected 1 AutoFpsHudController, got {hud_count} — "
+            "duplicate injection on rerun double-fires HUD updates"
         )
 
     def test_first_invocation_still_injects_hud(self) -> None:
-        """A truly fresh place still gets the HUDController — the
-        guard short-circuits only when one already exists."""
+        """A truly fresh place still gets the AutoFpsHudController —
+        the guard short-circuits only when one already exists."""
         from converter.fps_client_generator import inject_fps_scripts
 
         place = RbxPlace(scripts=[], workspace_parts=[], screen_guis=[])
         inject_fps_scripts(place)
-        hud_count = sum(1 for s in place.scripts if s.name == "HUDController")
+        hud_count = sum(
+            1 for s in place.scripts if s.name == "AutoFpsHudController"
+        )
         assert hud_count == 1
 
     def test_user_authored_hudcontroller_does_not_suppress_inject(
@@ -595,11 +619,11 @@ class TestInjectFpsScriptsIdempotent:
     ) -> None:
         """Codex finding [P2] (round 6): a project with its own
         ``HUDController.cs`` (transpiled to a HUDController LocalScript)
-        must NOT cause the auto-generated HUDController to be skipped
-        — the auto-emitted HUD ScreenGui needs the auto-generated
-        controller's event-listener wiring to update on
-        HealthUpdate/AmmoUpdate/ItemUpdate.
-        """
+        must NOT cause the auto-generated FPS HUD listener to be
+        skipped. With the rename to ``AutoFpsHudController``, the two
+        scripts coexist on disk under different filenames — the user's
+        custom HUD logic and the auto-generated event-listener wiring
+        for the FPS HUD ScreenGui both run."""
         from converter.fps_client_generator import inject_fps_scripts
 
         place = RbxPlace(
@@ -619,13 +643,15 @@ class TestInjectFpsScriptsIdempotent:
             screen_guis=[],
         )
         inject_fps_scripts(place)
-        # Both should now be present: the user-authored HUDController
-        # AND the auto-generated one.
-        hud_scripts = [s for s in place.scripts if s.name == "HUDController"]
-        assert len(hud_scripts) == 2
-        # One has the auto-generated marker, one doesn't.
-        markers = sum(
-            1 for s in hud_scripts
-            if "-- HUD Controller (auto-generated)" in s.source
-        )
-        assert markers == 1
+        # User's HUDController is preserved (not replaced).
+        user_huds = [
+            s for s in place.scripts if s.name == "HUDController"
+        ]
+        assert len(user_huds) == 1
+        assert "weaponWheel" in user_huds[0].source
+        # Auto-gen is added under the distinct AutoFpsHudController name.
+        auto_huds = [
+            s for s in place.scripts if s.name == "AutoFpsHudController"
+        ]
+        assert len(auto_huds) == 1
+        assert "-- HUD Controller (auto-generated)" in auto_huds[0].source

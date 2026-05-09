@@ -605,7 +605,11 @@ if pauseMenu then
 end
 '''
     return RbxScript(
-        name="HUDController",
+        # Distinct from any user-authored ``HUDController.cs`` so the
+        # transpiled .luau files don't collide on disk and clobber each
+        # other. The script content is unchanged from the historic
+        # auto-generated copy — only the name moved.
+        name="AutoFpsHudController",
         source=source,
         script_type="LocalScript",
     )
@@ -1005,27 +1009,22 @@ def inject_fps_scripts(place: RbxPlace) -> int:
         log.info("Skipping HUD ScreenGui injection (Canvas-converted HUD already exists)")
 
     # Add HUD controller LocalScript only if a previous AUTO-GENERATED
-    # HUDController isn't already present. The marker comment at the
-    # top of ``generate_hud_client_script`` is the discriminator:
-    # name-only matching would suppress the inject when a user-authored
-    # ``HUDController.cs`` (transpiled) lands in ``place.scripts``,
-    # leaving the auto-emitted HUD ScreenGui with no listener for
-    # HealthUpdate/AmmoUpdate/ItemUpdate. Marker matching distinguishes
-    # the prior auto-emit (which we want to skip on rerun) from a
-    # user-authored script that happens to share the name (which
-    # serves a different purpose and shouldn't suppress the inject).
+    # ``AutoFpsHudController`` isn't already present. Name + marker
+    # double-check tolerates a hypothetical future user script that
+    # picks the same name — they coexist instead of clobbering.
     has_autogen_hud = any(
-        s.name == "HUDController" and "-- HUD Controller (auto-generated)" in s.source
+        s.name == "AutoFpsHudController"
+        and "-- HUD Controller (auto-generated)" in s.source
         for s in place.scripts
     )
     if not has_autogen_hud:
         place.scripts.append(generate_hud_client_script())
         added += 1
-        log.info("Injected HUD controller LocalScript")
+        log.info("Injected AutoFpsHudController LocalScript")
     else:
         log.info(
-            "Skipping HUDController injection (auto-generated copy "
-            "already present from prior conversion)"
+            "Skipping AutoFpsHudController injection (auto-generated "
+            "copy already present from prior conversion)"
         )
 
     return added
