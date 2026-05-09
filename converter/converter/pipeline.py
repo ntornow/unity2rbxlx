@@ -171,10 +171,32 @@ class Pipeline:
         # ``scripts/`` when ``--retranspile`` is set) BEFORE
         # ``_subphase_inject_autogen_scripts``, so checking on-disk
         # files in the inject subphase would miss the pre-PR signal
-        # that's been deleted. Cache the result so the migration sees
-        # the original output dir state regardless of when subphases
-        # run.
+        # that's been deleted.
         self._fps_artifacts_at_init: bool = self._fps_artifacts_on_disk()
+
+        # ``_is_resume`` distinguishes a true resume/rebuild against
+        # an existing output dir from a fresh convert that happens to
+        # land in a directory containing stale FPS scripts (e.g. a
+        # user pointing ``u2r.py convert ProjectB`` at an output dir
+        # left over from a prior ``ProjectA`` conversion). Without
+        # this gate, the backward-compat migration would silently
+        # auto-inject FPS scaffolding into ProjectB even though the
+        # caller never passed ``--scaffolding=fps``.
+        #
+        # True only when ``conversion_context.json`` exists at init
+        # AND its persisted ``unity_project_path`` matches the path
+        # this Pipeline was constructed for.
+        self._is_resume: bool = False
+        if self._context_path.exists():
+            try:
+                _existing = ConversionContext.load(self._context_path)
+                if _existing.unity_project_path:
+                    self._is_resume = (
+                        Path(_existing.unity_project_path).resolve()
+                        == self.unity_project_path
+                    )
+            except Exception:  # noqa: BLE001 — defensive on disk read
+                self._is_resume = False
 
     @property
     def scaffolding(self) -> frozenset[str]:
@@ -2035,11 +2057,21 @@ return table.concat(allData, "\\n")'''
         # empty list, so a publish/upload re-run would silently drop
         # the FPS scripts the original conversion auto-injected.
         #
-        # Signal: pre-existing FPS auto-gen scripts on disk at INIT
-        # TIME (cached because emit_scripts_to_disk may have wiped
-        # scripts/ by now). Distinguishes resumed-from-pre-PR from a
-        # fresh post-PR run.
-        if not self.scaffolding and self._fps_artifacts_at_init:
+        # Three required signals:
+        #   1. ``self.scaffolding`` is empty (no explicit opt-in this run)
+        #   2. ``self._fps_artifacts_at_init`` — pre-existing FPS auto-gen
+        #      scripts were on disk at init time (cached because
+        #      ``emit_scripts_to_disk`` may have wiped ``scripts/`` by
+        #      the time this subphase runs).
+        #   3. ``self._is_resume`` — the persisted ctx's unity project
+        #      matches this Pipeline's, so the on-disk scripts belong
+        #      to a TRUE resume, not a fresh convert into a dir that
+        #      happens to hold leftover FPS scripts from another project.
+        if (
+            not self.scaffolding
+            and self._fps_artifacts_at_init
+            and self._is_resume
+        ):
             log.warning(
                 "[write_output] Migrating pre-scaffolding output dir: "
                 "found previously-emitted FPS scripts on disk and no "

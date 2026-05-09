@@ -459,12 +459,18 @@ class TestBackwardCompatMigration:
         tmp_path: Path,
         files: dict[str, str],
     ) -> Pipeline:
-        """Pre-write disk artifacts BEFORE constructing the Pipeline,
-        so ``_fps_artifacts_at_init`` (snapshotted in __init__) sees
-        them. The inject subphase reads the cached snapshot rather
-        than re-checking disk — by then the scripts/ dir may have
-        been wiped by ``_subphase_emit_scripts_to_disk``.
+        """Pre-write disk artifacts AND a matching conversion_context.json
+        BEFORE constructing the Pipeline, so both
+        ``_fps_artifacts_at_init`` and ``_is_resume`` (snapshotted in
+        __init__) see them as a true resume rather than a fresh
+        convert into a dir with stale files.
+
+        The inject subphase reads the cached snapshots rather than
+        re-checking disk — by then the scripts/ dir may have been
+        wiped by ``_subphase_emit_scripts_to_disk``.
         """
+        from core.conversion_context import ConversionContext
+
         project = tmp_path / "fakeproject"
         (project / "Assets").mkdir(parents=True)
         out = tmp_path / "output"
@@ -473,6 +479,11 @@ class TestBackwardCompatMigration:
         scripts_dir.mkdir()
         for name, content in files.items():
             (scripts_dir / name).write_text(content)
+
+        # Persist a ctx whose unity_project_path matches the project,
+        # so ``_is_resume`` evaluates True for the migration path.
+        prior = ConversionContext(unity_project_path=str(project))
+        prior.save(out / "conversion_context.json")
 
         pl = Pipeline(unity_project_path=project, output_dir=out)
         pl.state.rbx_place = _fps_shaped_place()
@@ -555,6 +566,76 @@ class TestBackwardCompatMigration:
         pl._subphase_inject_autogen_scripts()
         assert pl.scaffolding == frozenset()
 
+    def test_migration_skips_fresh_convert_into_reused_dir(
+        self, tmp_path: Path,
+    ) -> None:
+        """Codex finding [P2] (round 8): a user pointing
+        ``u2r.py convert ProjectB`` at an output dir left over from a
+        prior ProjectA conversion would have stale FPS scripts on
+        disk, but ProjectB might not be FPS at all. The migration
+        must NOT auto-infer ``scaffolding=['fps']`` in that case.
+
+        ``_is_resume`` gate distinguishes: True only when the
+        persisted ctx's ``unity_project_path`` matches the Pipeline's.
+        For a fresh convert into a foreign output dir, the persisted
+        path differs (or the ctx file is fresh after Pipeline init
+        creates one) and migration is suppressed.
+        """
+        from core.conversion_context import ConversionContext
+
+        # Set up an output dir whose ctx points at ProjectA, but the
+        # new Pipeline is constructed for ProjectB.
+        project_a = tmp_path / "ProjectA"
+        (project_a / "Assets").mkdir(parents=True)
+        project_b = tmp_path / "ProjectB"
+        (project_b / "Assets").mkdir(parents=True)
+        out = tmp_path / "output"
+        out.mkdir()
+        scripts_dir = out / "scripts"
+        scripts_dir.mkdir()
+        (scripts_dir / "HUDController.luau").write_text(
+            "-- HUD Controller (auto-generated)\n"
+        )
+        # Persist a ctx for ProjectA.
+        prior = ConversionContext(unity_project_path=str(project_a))
+        prior.save(out / "conversion_context.json")
+
+        # Pipeline init for ProjectB — different project.
+        pl = Pipeline(unity_project_path=project_b, output_dir=out)
+        pl.state.rbx_place = _fps_shaped_place()
+        # Migration signal (artifacts on disk) is True...
+        assert pl._fps_artifacts_at_init is True
+        # ...but resume signal is False because projects mismatch.
+        assert pl._is_resume is False
+        # So migration must NOT fire.
+        pl._subphase_inject_autogen_scripts()
+        assert pl.scaffolding == frozenset()
+
+    def test_migration_fires_when_project_matches(
+        self, tmp_path: Path,
+    ) -> None:
+        """The flip-side: a true resume (same project, prior ctx
+        exists, FPS scripts on disk) should trigger the migration."""
+        from core.conversion_context import ConversionContext
+
+        project = tmp_path / "Project"
+        (project / "Assets").mkdir(parents=True)
+        out = tmp_path / "output"
+        out.mkdir()
+        scripts_dir = out / "scripts"
+        scripts_dir.mkdir()
+        (scripts_dir / "HUDController.luau").write_text(
+            "-- HUD Controller (auto-generated)\n"
+        )
+        prior = ConversionContext(unity_project_path=str(project))
+        prior.save(out / "conversion_context.json")
+
+        pl = Pipeline(unity_project_path=project, output_dir=out)
+        pl.state.rbx_place = _fps_shaped_place()
+        assert pl._is_resume is True
+        pl._subphase_inject_autogen_scripts()
+        assert "fps" in pl.scaffolding
+
     def test_migration_fires_only_on_autogen_marker(
         self, tmp_path: Path,
     ) -> None:
@@ -600,6 +681,47 @@ class TestInjectFpsScriptsIdempotent:
         assert hud_count == 1, (
             f"expected 1 AutoFpsHudController, got {hud_count} — "
             "duplicate injection on rerun double-fires HUD updates"
+        )
+
+    def test_dedupe_recognises_legacy_hudcontroller_name(self) -> None:
+        """Codex finding [P2] (round 8): a pre-PR rebuild path may
+        rehydrate the legacy ``HUDController.luau`` (auto-gen, with
+        marker) into ``place.scripts``. Name-only matching against
+        the new ``AutoFpsHudController`` would miss that legacy
+        script and append a SECOND auto-gen HUD listener — both
+        run, double-handling HealthUpdate/AmmoUpdate/ItemUpdate.
+
+        Marker-based dedupe (across both canonical names) keeps the
+        legacy script as the single auto-gen listener.
+        """
+        from converter.fps_client_generator import inject_fps_scripts
+
+        place = RbxPlace(
+            scripts=[
+                # Legacy auto-gen HUDController rehydrated from disk
+                # (pre-PR conversions wrote this exact name + marker).
+                RbxScript(
+                    name="HUDController",
+                    source=(
+                        "-- HUD Controller (auto-generated)\n"
+                        "-- legacy script from a pre-PR FPS conversion\n"
+                    ),
+                    script_type="LocalScript",
+                ),
+            ],
+            workspace_parts=[],
+            screen_guis=[],
+        )
+        inject_fps_scripts(place)
+        # Total auto-gen HUD listeners (matched by marker, any name)
+        # must remain 1 — no duplicate appended under the new name.
+        autogen_huds = [
+            s for s in place.scripts
+            if "-- HUD Controller (auto-generated)" in s.source
+        ]
+        assert len(autogen_huds) == 1, (
+            f"expected 1 auto-gen HUD listener, got {len(autogen_huds)} "
+            "— legacy HUDController name not recognised"
         )
 
     def test_first_invocation_still_injects_hud(self) -> None:
