@@ -478,8 +478,22 @@ def execute_luau(
 
     poll_url = f"https://apis.roblox.com/cloud/v2/{task_path}"
 
+    # Derive client-side poll budget from the server-side ``timeout``.
+    # The Open Cloud API caps task ``timeout`` at 300s, but in practice
+    # tasks (especially those that touch ``AssetService:CreateMeshPartAsync``
+    # + ``SavePlaceAsync`` on multi-MB places) keep returning ``PROCESSING``
+    # well past the nominal 300s before transitioning to a terminal state.
+    # Give the client a much longer poll horizon (15 min) so we don't
+    # abandon a task Roblox is still finishing.
+    try:
+        timeout_seconds = int(str(timeout).rstrip("s"))
+    except ValueError:
+        timeout_seconds = 300
+    poll_budget_seconds = max(900, timeout_seconds + 600)
+    max_poll_attempts = int(poll_budget_seconds / 2.5)
+
     start_time = time.time()
-    for attempt in range(120):  # 5 minutes max (2.5s intervals)
+    for attempt in range(max_poll_attempts):
         time.sleep(2.5)
         try:
             poll_resp = requests.get(
