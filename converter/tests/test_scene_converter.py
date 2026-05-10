@@ -561,6 +561,81 @@ class TestMixedColliderHandling:
         expected_diam = 3 * 2 * STUDS_PER_METER
         assert max(part.size) >= expected_diam - 0.01, "Trigger sphere should grow the Part size"
 
+    def test_invisible_collider_not_dropped_as_marker(self):
+        """A Part with no Renderer but a non-trigger Collider must keep
+        ``CanCollide=True``. The "logic-only / marker" rule must not flip
+        ``can_collide=False`` on it.
+
+        Reproducer: SimpleFPS Pier's ``Collider`` GameObject is an
+        invisible ``BoxCollider`` (m_IsTrigger=0) carrying the entire
+        dock's collision; the visible ``plank``/``beam`` children are
+        renderer-only. Pre-fix, this rule lumped any no-renderer Part
+        as a marker and disabled collision — player fell through dock
+        on respawn. The fix gates the rule on ``not has_collider``.
+        """
+        from converter.scene_converter import _convert_node
+        from core.unity_types import SceneNode
+
+        class FakeBoxCollider:
+            component_type = "BoxCollider"
+            properties = {
+                "m_IsTrigger": 0,
+                "m_Size": {"x": 15, "y": 0.25, "z": 2.25},
+                "m_Center": {"x": 0, "y": 0, "z": 0},
+            }
+
+        node = SceneNode(
+            name="Collider",
+            file_id="1",
+            active=True,
+            layer=0,
+            tag="Untagged",
+            components=[FakeBoxCollider()],
+            parent_file_id=None,
+            position=(0.0, 0.0, 0.0),
+            rotation=(0.0, 0.0, 0.0, 1.0),
+            scale=(1.0, 1.0, 1.0),
+        )
+
+        with _scene_ctx():
+            part = _convert_node(node, None, {}, {})
+
+        assert part is not None
+        assert part.can_collide is True, (
+            "Invisible BoxCollider must remain colliding — "
+            "without this, dock floors / collision proxies fall through."
+        )
+
+    def test_no_collider_no_renderer_part_treated_as_marker(self):
+        """A Part with neither Renderer nor Collider is a true Unity
+        container/marker (logic-only GameObject for child scripts) —
+        ``can_collide=False`` and ``transparency=1.0`` are correct here.
+        Pin the discriminator so future refactors don't drop the marker
+        behavior entirely.
+        """
+        from converter.scene_converter import _convert_node
+        from core.unity_types import SceneNode
+
+        node = SceneNode(
+            name="GameLogicContainer",
+            file_id="1",
+            active=True,
+            layer=0,
+            tag="Untagged",
+            components=[],
+            parent_file_id=None,
+            position=(0.0, 0.0, 0.0),
+            rotation=(0.0, 0.0, 0.0, 1.0),
+            scale=(1.0, 1.0, 1.0),
+        )
+
+        with _scene_ctx():
+            part = _convert_node(node, None, {}, {})
+
+        assert part is not None
+        assert part.can_collide is False
+        assert part.transparency == 1.0
+
     def test_trigger_then_physical_takes_trigger_behavior(self):
         """Trigger first then physical: same outcome — trigger wins.
 

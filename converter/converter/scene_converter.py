@@ -1353,10 +1353,22 @@ def _convert_node(
         any(comp.component_type in ("MeshRenderer", "SkinnedMeshRenderer", "SpriteRenderer")
             for comp in node.components)
     )
-    if not has_visual and part.class_name == "Part":
-        # Parts without meshes or visual components are Unity containers/markers.
-        # Make invisible regardless of whether they have children (child scripts
-        # are reparented separately, so the container doesn't need to render).
+    # ``has_collider`` distinguishes "no-renderer" (just invisible) from
+    # "no-renderer-and-no-collider" (a true marker / logic container). A
+    # non-trigger BoxCollider with ``m_IsTrigger=0`` is a real solid floor
+    # (concrete case: SimpleFPS Pier's invisible ``Collider`` BoxCollider
+    # carries the entire dock's collision; the visible ``plank``/``beam``
+    # children are renderer-only). Without this guard, the rule below
+    # silently makes the dock non-colliding and the player falls through
+    # on spawn. See SimpleFPS_2026-05-09 spawn-collision investigation.
+    has_collider = any(
+        c.component_type in _COLLIDER_TYPES for c in node.components
+    )
+    if not has_visual and not has_collider and part.class_name == "Part":
+        # Parts without meshes, visual components, OR colliders are Unity
+        # containers/markers. Make invisible regardless of whether they
+        # have children (child scripts are reparented separately, so the
+        # container doesn't need to render).
         part.transparency = 1.0
         part.can_collide = False
 
