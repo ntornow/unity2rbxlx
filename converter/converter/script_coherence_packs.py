@@ -1559,3 +1559,113 @@ def _publish_producer_consumer_events(scripts: list["RbxScript"]) -> int:
             )
     return fixes
 
+
+
+# ---------------------------------------------------------------------------
+# Pack: door_tween_open
+# ---------------------------------------------------------------------------
+#
+# Unity's SciFi_Door uses a Mecanim Animator with ``open.anim`` (slides Y
+# +4m over 1s) controlled by ``Animator.SetBool("open", value)``. The
+# converter's animation phase doesn't translate Mecanim controllers to
+# TweenService, so the AI-transpiled ``Door.luau`` ends up calling
+# ``doorAnim:SetAttribute("open", value)`` on the sibling ``door`` mesh
+# but nothing actually moves the part. From the user's POV: the open
+# sound plays, the attribute flips, but the door mesh sits still and
+# blocks the doorway.
+#
+# Inject a one-shot listener at the end of any Door.luau that connects
+# to ``GetAttributeChangedSignal("open")`` and tweens the mesh +14.28
+# studs Y (Unity's 4m × STUDS_PER_METER) on open, back on close.
+#
+# Detector: matches ``SetAttribute("open"`` AND mentions a sibling lookup
+# pattern (``parent:FindFirstChild("door")`` is the canonical form). This
+# avoids touching unrelated scripts that happen to set an "open" attribute.
+
+_DOOR_OPEN_SETATTR_RE = re.compile(r':SetAttribute\(\s*["\']open["\']\s*,')
+_DOOR_SIBLING_LOOKUP_RE = re.compile(
+    r':FindFirstChild\(\s*["\']door["\']\s*\)'
+)
+
+
+def _detect_door_tween_target(scripts: list["RbxScript"]) -> bool:
+    for s in scripts:
+        if s.name != "Door":
+            continue
+        if (
+            _DOOR_OPEN_SETATTR_RE.search(s.source)
+            and _DOOR_SIBLING_LOOKUP_RE.search(s.source)
+            and "_AutoFpsDoorTweenInjected" not in s.source
+        ):
+            return True
+    return False
+
+
+# Tween block appended at end of Door.luau. Self-contained — uses local
+# helpers; doesn't depend on names from the surrounding script. Reads the
+# sibling lookup itself instead of calling the script's ``getDoorAnim``
+# (whose name the AI may rename across runs).
+_DOOR_TWEEN_BLOCK = """
+-- _AutoFpsDoorTweenInjected: door coherence pack
+-- Listens to ``open`` attribute change on the sibling ``door`` mesh and
+-- tweens it +14.28 studs Y (Unity 4m × STUDS_PER_METER) on open, back
+-- on close. Mecanim Animator → TweenService bridge.
+do
+    local TweenService = game:GetService("TweenService")
+    local _doorContainer = script.Parent
+    local _parent = _doorContainer and _doorContainer.Parent
+    local _doorMesh = _parent and _parent:FindFirstChild("door")
+    if _doorMesh and _doorMesh:IsA("BasePart") then
+        local _STUDS_PER_METER = 3.571
+        local _OPEN_OFFSET = Vector3.new(0, 4 * _STUDS_PER_METER, 0)
+        local _closedCFrame = _doorMesh.CFrame
+        local _openCFrame = _closedCFrame + _OPEN_OFFSET
+        local _currentTween
+        local function _animateTo(target)
+            if _currentTween then _currentTween:Cancel() end
+            _currentTween = TweenService:Create(
+                _doorMesh,
+                TweenInfo.new(1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+                { CFrame = target }
+            )
+            _currentTween:Play()
+        end
+        _doorMesh:GetAttributeChangedSignal("open"):Connect(function()
+            if _doorMesh:GetAttribute("open") then
+                _animateTo(_openCFrame)
+            else
+                _animateTo(_closedCFrame)
+            end
+        end)
+    end
+end
+"""
+
+
+@patch_pack(
+    name="door_tween_open",
+    description=(
+        "Append a TweenService listener at the end of Door.luau scripts "
+        "so the sibling ``door`` mesh actually slides on attribute "
+        "change. Without this, doors are stuck closed — the AI transpile "
+        "of Unity's Door.cs only flips the attribute, expecting the "
+        "Mecanim Animator to do the motion (which the converter doesn't "
+        "translate)."
+    ),
+    detect=_detect_door_tween_target,
+)
+def _inject_door_tween(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        if s.name != "Door":
+            continue
+        if (
+            not _DOOR_OPEN_SETATTR_RE.search(s.source)
+            or not _DOOR_SIBLING_LOOKUP_RE.search(s.source)
+            or "_AutoFpsDoorTweenInjected" in s.source
+        ):
+            continue
+        s.source = s.source.rstrip() + "\n" + _DOOR_TWEEN_BLOCK
+        fixes += 1
+        log.info("  Injected door tween listener in '%s'", s.name)
+    return fixes

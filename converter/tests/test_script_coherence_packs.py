@@ -1532,3 +1532,106 @@ class TestTriggerStayPollingPack:
         second = packs_module._add_trigger_stay_polling([s])
         assert first == 1
         assert second == 0
+
+
+class TestDoorTweenOpen:
+    """The ``door_tween_open`` pack appends a TweenService listener to
+    Door.luau so the sibling ``door`` mesh actually slides on attribute
+    change. Pre-pack: Door.cs's AI transpile sets ``open=true`` on the
+    sibling but nothing animates it (Mecanim Animator translation is
+    not implemented). Post-pack: open/close attribute change triggers a
+    1-second Y +14.28 stud tween.
+    """
+
+    @staticmethod
+    def _door_with_attr_set() -> RbxScript:
+        return RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'local container = script.Parent\n'
+                'local function getDoorAnim()\n'
+                '    local parent = container.Parent\n'
+                '    return parent and parent:FindFirstChild("door")\n'
+                'end\n'
+                'local function toggleDoor(value)\n'
+                '    local doorAnim = getDoorAnim()\n'
+                '    if doorAnim then\n'
+                '        doorAnim:SetAttribute("open", value)\n'
+                '    end\n'
+                'end\n'
+            ),
+            script_type="Script",
+        )
+
+    def test_detector_matches_door_with_open_setattribute(self) -> None:
+        assert packs_module._detect_door_tween_target(
+            [self._door_with_attr_set()]
+        ) is True
+
+    def test_detector_skips_already_injected(self) -> None:
+        """Idempotency: if the marker is already present, detector
+        returns False so re-running the pack is a no-op."""
+        s = self._door_with_attr_set()
+        s.source += "\n-- _AutoFpsDoorTweenInjected\n"
+        assert packs_module._detect_door_tween_target([s]) is False
+
+    def test_detector_skips_unrelated_scripts(self) -> None:
+        """A non-Door script that happens to set 'open' attribute must
+        not be touched. The pack only matches scripts named ``Door`` and
+        also requires the sibling ``door`` lookup pattern."""
+        s = RbxScript(
+            name="Chest",
+            source=(
+                'local container = script.Parent\n'
+                'container:SetAttribute("open", true)\n'
+            ),
+            script_type="Script",
+        )
+        assert packs_module._detect_door_tween_target([s]) is False
+
+    def test_detector_skips_door_without_sibling_lookup(self) -> None:
+        """A Door-named script that sets ``open`` but doesn't look up
+        a sibling ``door`` mesh isn't the SciFi_Door pattern. Pack
+        skips it rather than blindly appending a tween block that has
+        nothing to anchor to."""
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local container = script.Parent\n'
+                'container:SetAttribute("open", true)\n'
+            ),
+            script_type="Script",
+        )
+        assert packs_module._detect_door_tween_target([s]) is False
+
+    def test_apply_appends_tween_block(self) -> None:
+        s = self._door_with_attr_set()
+        fixes = packs_module._inject_door_tween([s])
+        assert fixes == 1
+        assert "_AutoFpsDoorTweenInjected" in s.source
+        assert "TweenService" in s.source
+        assert "GetAttributeChangedSignal" in s.source
+        # Tween moves Y by 4 * STUDS_PER_METER (~14.28 studs)
+        assert "4 * _STUDS_PER_METER" in s.source
+        assert "Vector3.new(0, 4 * _STUDS_PER_METER, 0)" in s.source
+
+    def test_apply_idempotent(self) -> None:
+        """Re-running the pack on already-injected source is a no-op
+        (the detector won't even let it run)."""
+        s = self._door_with_attr_set()
+        first = packs_module._inject_door_tween([s])
+        second = packs_module._inject_door_tween([s])
+        assert first == 1
+        assert second == 0
+
+    def test_apply_skips_non_door_named_scripts(self) -> None:
+        """Pack only operates on scripts named ``Door``. A script with
+        the same source under a different name is left alone — keeps
+        the side effect scoped to the Door coherence concern.
+        """
+        s = self._door_with_attr_set()
+        s.name = "OtherScript"
+        fixes = packs_module._inject_door_tween([s])
+        assert fixes == 0
+        assert "_AutoFpsDoorTweenInjected" not in s.source
