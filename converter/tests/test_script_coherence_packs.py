@@ -1798,7 +1798,7 @@ class TestBulletPhysicsRaycast:
         """
         s = self._bullet_script("PlaneBullet")
         packs_module._replace_bullet_physics([s])
-        apply_idx = s.source.index("local function applyHit(model)")
+        apply_idx = s.source.index("local function applyHit(model, impactPos)")
         end_idx = s.source.index("end\n", apply_idx) + 4
         apply_body = s.source[apply_idx:end_idx]
         assert "applyAreaDamage" in apply_body
@@ -2115,14 +2115,14 @@ class TestPlayerDamageRemoteEvent:
         assert "_cam.CFrame.LookVector" in patched_player
 
     def test_plane_bullet_splash_fires_on_wall_impact(self) -> None:
-        """Codex round-3 [P1]: PlaneBullet's splash damage must fire
-        when the bullet hits ANY surface (terrain, wall, prop), not
-        just a Humanoid model. Unity's ``PlaneBullet.cs``
-        ``OnCollisionEnter`` instantiates the explosion + runs
-        ``Physics.OverlapSphere(2)`` regardless of the collider's tag.
+        """PlaneBullet's splash damage must fire when the bullet hits
+        ANY surface (terrain, wall, prop), not just a Humanoid model.
 
-        Pin the non-character impact branch: it must call
-        ``applyAreaDamage(rootPart.Position)`` for splash bullets.
+        Codex round-5 [P1]: splash centers on ``result.Position``
+        (the actual raycast collision point), NOT
+        ``rootPart.Position``. Tunneling at high force values can put
+        rootPart 10+ studs past the impact — larger than the splash
+        radius, missing the near-miss player entirely.
         """
         s = RbxScript(
             name="PlaneBullet",
@@ -2134,14 +2134,14 @@ class TestPlayerDamageRemoteEvent:
             script_type="Script",
         )
         packs_module._replace_bullet_physics([s])
-        # Both branches in the raycast hit-detector apply splash:
-        #   - direct hit on Humanoid: ``applyAreaDamage(...)``
-        #   - non-character impact (wall/ground): ``applyAreaDamage(...)``
-        # so PlaneBullets that land beside the player still hurt them.
+        # Non-character impact branch applies splash at the raycast
+        # ``result.Position`` so wall/ground impacts beside a player
+        # land inside the splash radius.
         non_char_branch = s.source[s.source.index("else"):]
-        assert "applyAreaDamage(rootPart.Position)" in non_char_branch, (
-            "PlaneBullet's non-character impact branch must call "
-            "applyAreaDamage so near-miss shots damage nearby players."
+        assert "applyAreaDamage(result.Position)" in non_char_branch, (
+            "PlaneBullet's non-character impact branch must apply "
+            "splash damage at the raycast result's position so "
+            "near-miss shots damage nearby players."
         )
 
     def test_turret_bullet_non_char_branch_just_destroys(self) -> None:
@@ -2198,3 +2198,102 @@ class TestPlayerDamageRemoteEvent:
         fixes = packs_module._inject_player_damage_remote_event(scripts)
         assert fixes >= 1
         assert "_de:FireServer(hitInst" in scripts[0].source
+
+    def test_plane_bullet_splash_centers_on_raycast_impact(self) -> None:
+        """Codex round-5 [P1]: at high force (PlaneBullet's
+        ``force=200``), the bullet's ``rootPart.Position`` can be 10+
+        studs past the raycast collision point on a tunneling frame
+        — larger than the 7-stud splash radius. Splash must center on
+        ``result.Position`` (the actual collision point) so wall/
+        ground hits beside the player still land inside the splash.
+
+        Pin: both apply_hit_body and non_char_impact_body use
+        ``impactPos`` / ``result.Position``, never ``rootPart.Position``.
+        """
+        s = TestBulletPhysicsRaycast._bullet_script("PlaneBullet")
+        packs_module._replace_bullet_physics([s])
+        # ``applyHit`` signature accepts the impact position.
+        assert "local function applyHit(model, impactPos)" in s.source
+        # ``applyHit`` call site passes ``result.Position``.
+        assert "applyHit(model, result.Position)" in s.source
+        # Direct-hit splash centers on impactPos.
+        apply_idx = s.source.index("local function applyHit(model, impactPos)")
+        end_idx = s.source.index("end\n", apply_idx) + 4
+        apply_body = s.source[apply_idx:end_idx]
+        assert "applyAreaDamage(impactPos)" in apply_body
+        # Non-character impact branch centers on result.Position.
+        non_char_branch = s.source[s.source.index("else"):]
+        assert "applyAreaDamage(result.Position)" in non_char_branch
+        # And rootPart.Position is NOT used as the splash origin in
+        # either branch (it's still fine for VectorForce/velocity).
+        assert "applyAreaDamage(rootPart.Position)" not in s.source
+
+    def test_plane_bullet_spawns_explosion_template(self) -> None:
+        """Codex round-5 [P3]: Unity ``PlaneBullet.cs`` instantiates
+        an ``explosion`` GameObject on every collision. The
+        replacement must clone the ``ReplicatedStorage.Templates.
+        Explosion`` template at the impact point so VFX/audio
+        feedback survives the rewrite.
+        """
+        s = TestBulletPhysicsRaycast._bullet_script("PlaneBullet")
+        packs_module._replace_bullet_physics([s])
+        # Helper present
+        assert "_spawnExplosionAt(originPos)" in s.source
+        assert '_explosionTemplate' in s.source
+        # Looked up from ReplicatedStorage.Templates.Explosion
+        assert 'FindFirstChild("Templates")' in s.source
+        assert 'FindFirstChild("Explosion")' in s.source
+        # Spawn called from both hit branches at the impact point.
+        apply_idx = s.source.index("local function applyHit(model, impactPos)")
+        end_idx = s.source.index("end\n", apply_idx) + 4
+        apply_body = s.source[apply_idx:end_idx]
+        assert "_spawnExplosionAt(impactPos)" in apply_body
+        non_char_branch = s.source[s.source.index("else"):]
+        assert "_spawnExplosionAt(result.Position)" in non_char_branch
+
+    def test_turret_bullet_does_not_spawn_explosion(self) -> None:
+        """``TurretBullet`` has no explosion in Unity source — its
+        replacement should NOT carry the spawnExplosion helper.
+        """
+        s = TestBulletPhysicsRaycast._bullet_script("TurretBullet")
+        packs_module._replace_bullet_physics([s])
+        assert "_spawnExplosionAt" not in s.source
+        assert "_explosionTemplate" not in s.source
+
+    def test_pack_re_emits_router_when_missing_from_patched_source(self) -> None:
+        """Codex round-5 [P2]: on re-conversion from a rehydrated
+        output, the Player script already carries the
+        ``_AutoDamageRemoteEventInjected`` marker but the router
+        script can be absent (pruned by intervening passes). The
+        pack must detect that state and re-emit the router so
+        client shots keep damaging server-side enemies.
+        """
+        # Player script is already patched (carries the marker) so
+        # the per-Player FireServer-inject branch is a no-op.
+        patched_player = RbxScript(
+            name="Player",
+            source=(
+                'local result = workspace:Raycast(origin, dir, rp)\n'
+                'if result then\n'
+                '    local hitInst = result.Instance\n'
+                '    hitInst:SetAttribute("TakeDamage", true)\n'
+                '    -- _AutoDamageRemoteEventInjected: mirror client damage to server\n'
+                '    local _de = game:GetService("ReplicatedStorage"):FindFirstChild("DamageEvent")\n'
+                '    if _de then _de:FireServer(hitInst, Vector3.new(), Vector3.new()) end\n'
+                'end\n'
+            ),
+            script_type="LocalScript",
+        )
+        scripts = [patched_player]
+        # Detector must fire because the router is missing.
+        assert packs_module._detect_player_or_router_present(scripts) is True
+        fixes = packs_module._inject_player_damage_remote_event(scripts)
+        assert fixes >= 1, "pack must run when router is missing"
+        # Router is now present.
+        router = next(
+            (s for s in scripts if s.name == "_AutoDamageEventRouter"),
+            None,
+        )
+        assert router is not None
+        # Player source unchanged (already patched).
+        assert patched_player.source.count("_de:FireServer") == 1

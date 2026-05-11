@@ -1752,7 +1752,29 @@ def _build_bullet_replacement(name: str) -> str:
         # Splash damage: at impact, find players within ``splash_radius``
         # studs * STUDS_PER_METER (Unity OverlapSphere works in meters)
         # and apply damage to each.
+        # Explosion VFX (codex round-5 [P3]): Unity ``PlaneBullet.cs``
+        # instantiates an ``explosion`` GameObject on every collision.
+        # Clone the ``Explosion`` template from
+        # ``ReplicatedStorage.Templates`` if present so the converted
+        # output preserves the VFX/audio feedback. No-op when the
+        # template is absent (older outputs without prefab packages).
         splash_branch = f'''
+local _ReplicatedStorage = game:GetService("ReplicatedStorage")
+local _explosionTemplate = (function()
+    local t = _ReplicatedStorage:FindFirstChild("Templates")
+    return t and t:FindFirstChild("Explosion")
+end)()
+local function _spawnExplosionAt(originPos)
+    if not _explosionTemplate then return end
+    local clone = _explosionTemplate:Clone()
+    if clone:IsA("Model") then
+        clone:PivotTo(CFrame.new(originPos))
+    elseif clone:IsA("BasePart") then
+        clone.CFrame = CFrame.new(originPos)
+    end
+    clone.Parent = workspace
+    Debris:AddItem(clone, 2)
+end
 local function applyAreaDamage(originPos)
     local radius = {splash_radius} * STUDS_PER_METER
     for _, player in ipairs(Players:GetPlayers()) do
@@ -1771,17 +1793,23 @@ end
     #
     # Splash bullets (PlaneBullet): Unity's ``OnCollisionEnter`` runs
     # ``OverlapSphere(2)`` and applies damage to every Player within
-    # the radius — including the directly-hit one. Calling a separate
-    # direct-hit ``SetAttribute`` here BEFORE ``applyAreaDamage`` would
-    # double-damage a head-on victim (codex round-4 [P1]). Splash
-    # bullets therefore use ``applyAreaDamage`` as their ONLY damage
-    # source, matching Unity's single-pass behavior.
+    # the radius — including the directly-hit one. Splash bullets
+    # therefore use ``applyAreaDamage`` as their ONLY damage source,
+    # matching Unity's single-pass behavior.
     #
     # Direct-hit-only bullets (TurretBullet): no splash in Unity, so
     # the only damage source is the direct attribute write.
+    #
+    # Codex round-5 [P1]: splash centers on the raycast ``result``'s
+    # ``Position`` (the actual collision point), NOT
+    # ``rootPart.Position``. At ``force=200``+ a tunneling frame can
+    # put rootPart 10-12 studs past the collision point — larger than
+    # the 7-stud splash radius — so a wall-hit beside a player would
+    # miss entirely.
     if splash_radius > 0:
         apply_hit_body = (
-            '    applyAreaDamage(rootPart.Position)\n'
+            '    _spawnExplosionAt(impactPos)\n'
+            '    applyAreaDamage(impactPos)\n'
             '    container:Destroy()\n'
         )
         # Non-character impact (wall, ground, prop) — splash bullets
@@ -1791,7 +1819,8 @@ end
         # collider's tag.
         non_char_impact_body = (
             '                consumed = true\n'
-            '                applyAreaDamage(rootPart.Position)\n'
+            '                _spawnExplosionAt(result.Position)\n'
+            '                applyAreaDamage(result.Position)\n'
             '                container:Destroy()\n'
             '                return\n'
         )
@@ -1906,7 +1935,7 @@ local rp = RaycastParams.new()
 rp.FilterDescendantsInstances = {{container}}
 rp.FilterType = Enum.RaycastFilterType.Exclude
 
-local function applyHit(model)
+local function applyHit(model, impactPos)
 {apply_hit_body}end
 
 local conn
@@ -1926,7 +1955,7 @@ conn = RunService.Heartbeat:Connect(function()
                 local player = Players:GetPlayerFromCharacter(model)
                 if player or inst:HasTag("Player") or model.Name == "Player" then
                     consumed = true
-                    applyHit(model)
+                    applyHit(model, result.Position)
                     return
                 end
             else
@@ -2150,10 +2179,36 @@ end)
 '''
 
 
+_DAMAGE_ROUTER_NAME = "_AutoDamageEventRouter"
+
+
 def _detect_player_or_router_present(scripts: list["RbxScript"]) -> bool:
-    """The pack runs when ``Player.luau`` needs patching OR the router
-    isn't yet emitted. Re-check both so re-runs are idempotent."""
-    return _detect_player_damage_attr_set(scripts)
+    """Run when EITHER:
+      - a ``Player`` LocalScript still needs the ``FireServer`` patch, OR
+      - a ``Player`` LocalScript was already patched but the
+        ``_AutoDamageEventRouter`` server script is missing.
+
+    Codex round-5 [P2]: on re-conversion from a rehydrated output, the
+    Player script is already patched (carries the
+    ``_AutoDamageRemoteEventInjected`` marker) but the router can be
+    pruned by intervening passes. Without re-checking the router, the
+    pack never runs and shots silently stop damaging server-side
+    enemies. Re-detecting on router-absent ensures the router gets
+    refreshed on every conversion regardless of how the Player script
+    was rehydrated.
+    """
+    if _detect_player_damage_attr_set(scripts):
+        return True
+    # Already-patched Player + missing router → pack must run to
+    # re-emit the router.
+    has_patched_player = any(
+        s.name == "Player"
+        and s.script_type == "LocalScript"
+        and "_AutoDamageRemoteEventInjected" in s.source
+        for s in scripts
+    )
+    has_router = any(s.name == _DAMAGE_ROUTER_NAME for s in scripts)
+    return has_patched_player and not has_router
 
 
 @patch_pack(
@@ -2216,7 +2271,7 @@ def _inject_player_damage_remote_event(scripts: list["RbxScript"]) -> int:
     # keep behaviour in sync with the pack version. Otherwise append a
     # new RbxScript to the list.
     from core.roblox_types import RbxScript
-    router_name = "_AutoDamageEventRouter"
+    router_name = _DAMAGE_ROUTER_NAME
     existing = next((s for s in scripts if s.name == router_name), None)
     if existing is not None:
         if existing.source != _DAMAGE_ROUTER_SOURCE:
