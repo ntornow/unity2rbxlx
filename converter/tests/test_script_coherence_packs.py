@@ -1675,6 +1675,84 @@ class TestDoorTweenOpen:
         scripts = [self._door_with_attr_set()]
         assert packs_module._detect_door_tween_target(scripts) is True
 
+    def test_detector_skips_scene_scoped_anim_names(self) -> None:
+        """Codex round-7 [P1]: scene-baked doors (not prefab-bound)
+        get scene-scoped animation drivers named ``Anim_door_open``
+        / ``Anim_door_close`` (without a prefab prefix). Round-6's
+        regex only matched the longer prefab-scoped form, so those
+        doors silently got a second tween listener → double-animate.
+
+        The detector must recognize BOTH name shapes.
+        """
+        scripts = [
+            self._door_with_attr_set(),
+            RbxScript(
+                name="Anim_door_open",
+                source="-- scene-scoped driver\n",
+                script_type="Script",
+            ),
+            RbxScript(
+                name="Anim_door_close",
+                source="-- scene-scoped driver\n",
+                script_type="Script",
+            ),
+        ]
+        assert packs_module._detect_door_tween_target(scripts) is False
+        fixes = packs_module._inject_door_tween(scripts)
+        assert fixes == 0
+        assert "_AutoFpsDoorTweenInjected" not in scripts[0].source
+
+    def test_pack_fires_on_mixed_project_with_partial_drivers(self) -> None:
+        """Codex round-7 [P2]: a project with TWO Door scripts where
+        only ONE has an animation driver pair must still get the
+        fallback tween injected. Round-6 bailed for the whole pack
+        on any driver presence; mixed projects left uncovered doors
+        stuck closed.
+
+        Pin: when ``driver_count < 2 * door_count`` (i.e. not every
+        door is covered), the pack runs and injects on any Door that
+        doesn't carry the inject marker.
+        """
+        scripts = [
+            self._door_with_attr_set(),  # uncovered Door
+            self._door_with_attr_set(),  # uncovered Door
+            # Only one driver pair — covers ONE door, not both.
+            RbxScript(
+                name="Anim_DoorPrefab_door_open",
+                source="-- one prefab driver\n",
+                script_type="Script",
+            ),
+            RbxScript(
+                name="Anim_DoorPrefab_door_close",
+                source="-- one prefab driver\n",
+                script_type="Script",
+            ),
+        ]
+        # Mixed state → pack runs.
+        assert packs_module._detect_door_tween_target(scripts) is True
+        fixes = packs_module._inject_door_tween(scripts)
+        # The inject pass can't tell which Door the driver covers
+        # from script source alone, so it's safe-by-default and
+        # injects on any unmarked Door in mixed state.
+        assert fixes == 2
+
+    def test_pack_skips_when_every_door_is_covered(self) -> None:
+        """Reciprocal: when ``driver_count >= 2 * door_count`` every
+        door has its own driver pair, so the fallback is a project-
+        wide no-op.
+        """
+        scripts = [
+            self._door_with_attr_set(),
+            self._door_with_attr_set(),
+            RbxScript(name="Anim_A_door_open", source="--\n", script_type="Script"),
+            RbxScript(name="Anim_A_door_close", source="--\n", script_type="Script"),
+            RbxScript(name="Anim_B_door_open", source="--\n", script_type="Script"),
+            RbxScript(name="Anim_B_door_close", source="--\n", script_type="Script"),
+        ]
+        assert packs_module._detect_door_tween_target(scripts) is False
+        fixes = packs_module._inject_door_tween(scripts)
+        assert fixes == 0
+
 
 class TestBulletPhysicsRaycast:
     """The ``bullet_physics_raycast`` pack replaces AI-transpiled Unity

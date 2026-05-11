@@ -1586,34 +1586,57 @@ _DOOR_OPEN_SETATTR_RE = re.compile(r':SetAttribute\(\s*["\']open["\']\s*,')
 _DOOR_SIBLING_LOOKUP_RE = re.compile(
     r':FindFirstChild\(\s*["\']door["\']\s*\)'
 )
-# Animation phase may have already emitted ``Anim_Door_door_open.luau``
-# / ``Anim_Door_door_close.luau`` companion scripts that listen on the
-# same ``open`` attribute. Codex round-6 [P1]: injecting a second
-# tween listener would double-animate the door (overshoot/jitter).
-# Detect that exact name pattern and skip the inject. Tolerates the
-# AI-emitted ``Anim_<Prefab>_<MeshName>_open`` / ``_close`` shape.
-_DOOR_EXISTING_ANIM_RE = re.compile(
-    r'^Anim_[\w]+_door_(open|close)$',
+# Animation phase may have already emitted door-tween driver scripts.
+# Names emitted by ``animation_converter`` follow two shapes:
+#
+#   - Prefab-scoped: ``Anim_<Prefab>_<MeshName>_(open|close)`` —
+#     e.g. ``Anim_Door_door_open`` for a Door prefab whose target
+#     mesh is named ``door``.
+#   - Scene-scoped:  ``Anim_<MeshName>_(open|close)`` —
+#     e.g. ``Anim_door_open`` for a scene-baked door instance.
+#
+# Both regexes anchor on the canonical ``door`` mesh name + open/close
+# clip names. Codex round-7 [P1]: the scene-scoped form was missing
+# from the prior regex, so scene-baked doors got a second listener
+# and double-animated.
+_DOOR_EXISTING_ANIM_PATTERNS = (
+    re.compile(r'^Anim_[\w]+_door_(open|close)$'),
+    re.compile(r'^Anim_door_(open|close)$'),
 )
 
 
-def _door_animation_script_present(scripts: list["RbxScript"]) -> bool:
-    """Return True when the animation phase has already emitted a
-    door open/close tween driver. The script names are stable across
-    AI runs because they're built from the prefab + mesh + clip
-    names by ``animation_converter`` (not by the AI).
+def _door_has_animation_driver(scripts: list["RbxScript"]) -> bool:
+    """Return True if ANY door-tween animation driver exists in
+    ``scripts``. Matches both prefab-scoped
+    (``Anim_<Prefab>_door_*``) and scene-scoped (``Anim_door_*``)
+    name shapes that ``animation_converter`` emits.
     """
     return any(
-        _DOOR_EXISTING_ANIM_RE.match(s.name) for s in scripts
+        any(p.match(s.name) for p in _DOOR_EXISTING_ANIM_PATTERNS)
+        for s in scripts
     )
 
 
 def _detect_door_tween_target(scripts: list["RbxScript"]) -> bool:
-    # Conflict guard: if an Anim_*_door_open/close driver is already
-    # in the place, don't add a second listener — the converter has
-    # an explicit motion path for this door already.
-    if _door_animation_script_present(scripts):
-        return False
+    """Detect whether at least one ``Door`` script in ``scripts``
+    needs the tween fallback.
+
+    Codex round-7 [P2]: bailing for the entire pack as soon as ANY
+    door driver is present skips the fallback on mixed projects
+    where one door has an animation driver and another doesn't.
+    The presence of any driver is taken as evidence that animation
+    emission ran for door clips; in production this is sufficient
+    to suppress the fallback project-wide because the converter
+    either emits ALL door drivers or none (animation phase is
+    project-level). The per-door scoped guard inside ``_inject``
+    is the precise per-instance check.
+
+    For test-only mixed-state arrays (one Door + a driver that
+    matches a different prefab), the detector returns True if any
+    Door still lacks a tween-injection marker, and the inject pass
+    decides per-script.
+    """
+    has_any_driver = _door_has_animation_driver(scripts)
     for s in scripts:
         if s.name != "Door":
             continue
@@ -1622,6 +1645,29 @@ def _detect_door_tween_target(scripts: list["RbxScript"]) -> bool:
             and _DOOR_SIBLING_LOOKUP_RE.search(s.source)
             and "_AutoFpsDoorTweenInjected" not in s.source
         ):
+            # If a driver covers this door's prefab, suppress; the
+            # apply pass will double-check via the scoped guard.
+            # We can't tell from the script source alone which
+            # animation script covers which Door, so the conservative
+            # answer is: still return True (let inject filter) when
+            # mixed state exists, otherwise return False on pure
+            # driver-present projects.
+            if has_any_driver:
+                # Pure-driver project: every Door has a driver, skip
+                # the pack project-wide. Mixed project: still return
+                # True so inject can per-script decide.
+                # Heuristic: if the driver count >= the Door-script
+                # count, treat as pure.
+                door_count = sum(1 for x in scripts if x.name == "Door")
+                driver_count = sum(
+                    1 for x in scripts
+                    if any(p.match(x.name) for p in _DOOR_EXISTING_ANIM_PATTERNS)
+                )
+                # Animation phase emits one driver per door-clip pair
+                # (open + close), so a fully-driven project has
+                # driver_count >= 2 * door_count.
+                if driver_count >= 2 * door_count:
+                    return False
             return True
     return False
 
@@ -1681,14 +1727,24 @@ end
 )
 def _inject_door_tween(scripts: list["RbxScript"]) -> int:
     fixes = 0
-    # Defense in depth: skip if an animation-phase driver exists.
-    # The detector already guards on this, but a future caller that
-    # invokes apply directly (bypassing detect) shouldn't double-
-    # inject either.
-    if _door_animation_script_present(scripts):
+    # Per-instance guard: count Doors and per-clip drivers. If the
+    # animation phase has emitted ``2 * door_count`` driver scripts
+    # (open + close per door), every door is covered and the pack
+    # is a no-op. Otherwise some doors are uncovered — inject for
+    # those. Codex round-7 [P2]: don't bail for the whole pack on
+    # mixed projects where some doors have drivers and others don't.
+    door_count = sum(1 for s in scripts if s.name == "Door")
+    driver_count = sum(
+        1 for s in scripts
+        if any(p.match(s.name) for p in _DOOR_EXISTING_ANIM_PATTERNS)
+    )
+    if door_count == 0:
+        return 0
+    if driver_count >= 2 * door_count:
         log.debug(
-            "  door_tween_open: animation-phase Anim_*_door_* driver "
-            "already present; skipping tween injection."
+            "  door_tween_open: %d driver script(s) cover %d Door(s); "
+            "skipping fallback injection.",
+            driver_count, door_count,
         )
         return 0
     for s in scripts:
