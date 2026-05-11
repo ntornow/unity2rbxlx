@@ -1718,14 +1718,61 @@ def _detect_bullet_unity_transpile(scripts: list["RbxScript"]) -> bool:
     return False
 
 
-# Replacement bullet body. Preserves the canonical Unity-source field
-# names (``fadeTime``, ``force``, ``damage``) so prefab-level attribute
-# overrides keep working. The ``_AutoBulletRaycastInjected`` marker
-# makes the pack idempotent.
-_BULLET_REPLACEMENT_SOURCE = '''\
+# Per-bullet defaults derived from the canonical Unity sources
+# (``TurretBullet.cs``, ``PlaneBullet.cs``). Codex round-1 caught a
+# regression: applying ``TurretBullet``'s defaults (3/60, direct-hit
+# only) to ``PlaneBullet`` silently dropped PlaneBullet's 6-second
+# fade, 200-force velocity, and ~2-stud OverlapSphere splash damage.
+# ``splash_radius`` of 0 means direct-hit only (turret); >0 enables
+# the splash branch with an ``OverlapParams`` proximity check.
+_BULLET_DEFAULTS = {
+    "TurretBullet": {"fadeTime": 3, "force": 60, "damage": 10, "splash_radius": 0},
+    "PlaneBullet": {"fadeTime": 6, "force": 200, "damage": 10, "splash_radius": 2},
+}
+
+
+def _build_bullet_replacement(name: str) -> str:
+    """Build the bullet replacement script body for *name* using the
+    Unity-canonical defaults. Marker comment ``_AutoBulletRaycastInjected``
+    pins idempotency. Splash-damage branch is emitted only when the
+    bullet has a non-zero ``splash_radius`` (PlaneBullet) — keeping
+    TurretBullet's body the lean direct-hit version.
+    """
+    defaults = _BULLET_DEFAULTS.get(name, _BULLET_DEFAULTS["TurretBullet"])
+    splash_radius = defaults["splash_radius"]
+    splash_branch = ""
+    if splash_radius > 0:
+        # Splash damage: at impact, find players within ``splash_radius``
+        # studs * STUDS_PER_METER (Unity OverlapSphere works in meters)
+        # and apply damage to each.
+        splash_branch = f'''
+local function applyAreaDamage(originPos)
+    local radius = {splash_radius} * STUDS_PER_METER
+    for _, player in ipairs(Players:GetPlayers()) do
+        local char = player.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp and (hrp.Position - originPos).Magnitude <= radius then
+            local model = hrp.Parent
+            model:SetAttribute("TakeDamage", damage)
+            local humanoid = model:FindFirstChildOfClass("Humanoid")
+            if humanoid then humanoid:TakeDamage(damage) end
+        end
+    end
+end
+'''
+    apply_hit_body = (
+        '    applyAreaDamage(rootPart.Position)\n'
+        '    container:Destroy()\n'
+    ) if splash_radius > 0 else (
+        '    model:SetAttribute("TakeDamage", damage)\n'
+        '    local humanoid = model:FindFirstChildOfClass("Humanoid")\n'
+        '    if humanoid then humanoid:TakeDamage(damage) end\n'
+        '    container:Destroy()\n'
+    )
+    return f'''\
 -- _AutoBulletRaycastInjected: bullet coherence pack
 -- Stud-space velocity + anti-gravity + raycast hit detection.
--- Replaces the AI transpile of Unity's TurretBullet.cs / PlaneBullet.cs
+-- Replaces the AI transpile of Unity's {name}.cs
 -- (rb.AddRelativeForce + OnCollisionEnter), which stacks three bugs
 -- in stud-space Roblox physics: 5.7x slow velocity, 5.6x strong
 -- gravity, and Touched tunneling at high speeds.
@@ -1749,9 +1796,9 @@ local function getRootPart()
     return container
 end
 
-local fadeTime = 3
-local force = 60
-local damage = 10
+local fadeTime = {defaults["fadeTime"]}
+local force = {defaults["force"]}
+local damage = {defaults["damage"]}
 local STUDS_PER_METER = 3.571
 
 local rootPart = getRootPart()
@@ -1761,7 +1808,7 @@ rootPart.Anchored = false
 
 -- Anti-gravity: cancel Roblox's 196 studs/s² so bullets fly straight
 -- like Unity's near-massless impulse (gravity barely affects them
--- across a 3-second fade in Unity's 9.81 m/s² space).
+-- across the bullet's fadeTime in Unity's 9.81 m/s² space).
 local att0 = Instance.new("Attachment")
 att0.Name = "_BulletAtt0"
 att0.Parent = rootPart
@@ -1789,33 +1836,29 @@ trail.Attachment0 = att1
 trail.Attachment1 = att2
 trail.Lifetime = 0.4
 trail.MinLength = 0
-trail.WidthScale = NumberSequence.new({
+trail.WidthScale = NumberSequence.new({{
     NumberSequenceKeypoint.new(0, 1),
     NumberSequenceKeypoint.new(1, 0),
-})
+}})
 trail.Color = ColorSequence.new(Color3.fromRGB(255, 100, 50))
-trail.Transparency = NumberSequence.new({
+trail.Transparency = NumberSequence.new({{
     NumberSequenceKeypoint.new(0, 0),
     NumberSequenceKeypoint.new(1, 1),
-})
+}})
 trail.Parent = rootPart
 
 Debris:AddItem(container, fadeTime)
-
+{splash_branch}
 -- Raycast hit detection: cast segment from previous-frame position to
 -- current each heartbeat. Catches tunneling that Touched misses.
 local prevPos = rootPart.Position
 local consumed = false
 local rp = RaycastParams.new()
-rp.FilterDescendantsInstances = {container}
+rp.FilterDescendantsInstances = {{container}}
 rp.FilterType = Enum.RaycastFilterType.Exclude
 
 local function applyHit(model)
-    model:SetAttribute("TakeDamage", damage)
-    local humanoid = model:FindFirstChildOfClass("Humanoid")
-    if humanoid then humanoid:TakeDamage(damage) end
-    container:Destroy()
-end
+{apply_hit_body}end
 
 local conn
 conn = RunService.Heartbeat:Connect(function()
@@ -1871,7 +1914,7 @@ def _replace_bullet_physics(scripts: list["RbxScript"]) -> int:
             or "_AutoBulletRaycastInjected" in s.source
         ):
             continue
-        s.source = _BULLET_REPLACEMENT_SOURCE
+        s.source = _build_bullet_replacement(s.name)
         fixes += 1
         log.info("  Replaced bullet physics in '%s'", s.name)
     return fixes
@@ -1927,16 +1970,45 @@ _PLAYER_DAMAGE_FIRE_INSERT = (
 )
 
 
-# Auto-generated server router script. Listens to ``DamageEvent``
-# fires and sets ``TakeDamage`` server-side on the hit instance AND
-# its enclosing Model. Idempotent: re-runs are no-ops because the
-# pack overwrites by name.
+# Auto-generated server router script. The router is NOT client-
+# authoritative: it re-raycasts from the firing player's character
+# toward the reported hit instance and only applies damage when the
+# server-side raycast actually intersects that instance within the
+# player's effective weapon range. This matches Unity Player.cs's
+# ``shootRange = 100`` (meters) ≈ 357 studs.
+#
+# Without this validation, a malicious client could ``FireServer``
+# any workspace instance and the server would apply damage — fully
+# client-authoritative in multiplayer.
 _DAMAGE_ROUTER_SOURCE = '''\
 -- _AutoDamageEventRouter (auto-generated by player_damage_remote_event pack)
 -- Mirrors client-fired damage hits to server-side ``TakeDamage``
 -- attribute writes so server scripts listening via
--- ``GetAttributeChangedSignal`` actually fire.
+-- ``GetAttributeChangedSignal`` actually fire. Validates each hit by
+-- re-raycasting from the firing player's character to the reported
+-- instance — anti-cheat guard against ``FireServer`` of arbitrary
+-- workspace instances.
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local STUDS_PER_METER = 3.571
+-- Mirror of Unity Player.cs ``shootRange = 100`` (meters) + 50% slack
+-- so a borderline-range raycast from the server doesn't drop the
+-- intended hit. Adjust if your project's player script uses a
+-- different range.
+local MAX_SHOOT_RANGE_STUDS = 100 * STUDS_PER_METER * 1.5
+-- Tolerance for the server-side raycast's hit-instance match. A
+-- moving target between client raycast and server replay can land
+-- the server hit on an adjacent part of the same Model; accept the
+-- damage if both share an ancestor Model.
+local function _matchesIntendedHit(serverHit, intendedInst)
+    if serverHit == intendedInst then return true end
+    local serverModel = serverHit:FindFirstAncestorOfClass("Model")
+    local intendedModel = intendedInst:FindFirstAncestorOfClass("Model")
+    if serverModel and intendedModel and serverModel == intendedModel then
+        return true
+    end
+    return false
+end
 
 local de = ReplicatedStorage:FindFirstChild("DamageEvent")
 if not de then
@@ -1949,10 +2021,35 @@ de.OnServerEvent:Connect(function(player, hitInstance)
     if not (hitInstance and hitInstance:IsDescendantOf(workspace)) then
         return
     end
-    -- Set on the hit instance directly so a part-level listener fires.
+    if not (typeof(hitInstance) == "Instance" and hitInstance:IsA("BasePart")) then
+        return
+    end
+
+    -- Resolve the firing player's character + origin.
+    local char = player.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    -- Distance gate: reject any hit beyond the weapon's effective range.
+    local toTarget = hitInstance.Position - hrp.Position
+    local dist = toTarget.Magnitude
+    if dist > MAX_SHOOT_RANGE_STUDS then return end
+
+    -- Line-of-sight + identity gate: re-raycast from the player's
+    -- character toward the reported hit. Server-authoritative — if
+    -- the ray doesn't land on the intended instance (or a sibling of
+    -- the same Model), drop the hit.
+    local rp = RaycastParams.new()
+    rp.FilterDescendantsInstances = {char}
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    local result = workspace:Raycast(hrp.Position, toTarget.Unit * (dist + 2), rp)
+    if not (result and _matchesIntendedHit(result.Instance, hitInstance)) then
+        return
+    end
+
+    -- Validated. Apply the attribute writes server-side so the
+    -- existing ``GetAttributeChangedSignal`` listeners fire.
     hitInstance:SetAttribute("TakeDamage", true)
-    -- Also propagate to the enclosing Model so model-level listeners
-    -- (Turret.luau / HostilePlane.luau) trigger.
     local m = hitInstance:FindFirstAncestorOfClass("Model")
     if m then m:SetAttribute("TakeDamage", true) end
 end)

@@ -1742,6 +1742,34 @@ class TestBulletPhysicsRaycast:
         assert "local force = " in s.source
         assert "local damage = " in s.source
 
+    def test_plane_bullet_uses_unity_planebullet_defaults(self) -> None:
+        """Codex round-1 [P1]: ``PlaneBullet`` must NOT inherit
+        ``TurretBullet``'s defaults. Unity ``PlaneBullet.cs`` has
+        ``fadeTime=6``, ``force=200``, plus splash damage via
+        ``OverlapSphere(2)``. The replacement must reflect that or
+        hostile plane shots regress to slow direct-hit-only bullets.
+        """
+        s = self._bullet_script("PlaneBullet")
+        fixes = packs_module._replace_bullet_physics([s])
+        assert fixes == 1
+        assert "local fadeTime = 6" in s.source
+        assert "local force = 200" in s.source
+        # Splash damage branch present
+        assert "applyAreaDamage" in s.source
+        # Splash radius matches Unity Physics.OverlapSphere(..., 2)
+        assert "2 * STUDS_PER_METER" in s.source
+
+    def test_turret_bullet_keeps_direct_hit_only(self) -> None:
+        """``TurretBullet`` (no splash in Unity source) must stay
+        direct-hit only. The splash branch ships only for bullets that
+        actually had ``Physics.OverlapSphere`` in their Unity source.
+        """
+        s = self._bullet_script("TurretBullet")
+        packs_module._replace_bullet_physics([s])
+        assert "local fadeTime = 3" in s.source
+        assert "local force = 60" in s.source
+        assert "applyAreaDamage" not in s.source
+
 
 class TestPlayerDamageRemoteEvent:
     """The ``player_damage_remote_event`` pack solves the
@@ -1841,3 +1869,30 @@ class TestPlayerDamageRemoteEvent:
         # Only one FireServer call in the patched player source
         patched_player = scripts[0].source
         assert patched_player.count("_de:FireServer(hitInst)") == 1
+
+    def test_router_validates_distance_and_line_of_sight(self) -> None:
+        """Codex round-1 [P1]: the auto-generated server router must NOT
+        trust a client-supplied ``hitInstance`` verbatim. A malicious
+        ``DamageEvent:FireServer(<any enemy>)`` from a hacked client
+        would otherwise apply damage to arbitrary world parts. Validate
+        on the server by re-raycasting from the player's character and
+        confirming the result matches the intended instance, plus a
+        distance gate matching Unity Player.cs's effective range.
+        """
+        scripts = [self._player_script_with_hit()]
+        packs_module._inject_player_damage_remote_event(scripts)
+        router = next(s for s in scripts if s.name == "_AutoDamageEventRouter")
+        src = router.source
+        # Server re-raycasts from the player's character.
+        assert "player.Character" in src
+        assert "HumanoidRootPart" in src
+        assert "workspace:Raycast" in src
+        # Distance gate uses STUDS_PER_METER (matches Unity meters).
+        assert "STUDS_PER_METER" in src
+        assert "MAX_SHOOT_RANGE_STUDS" in src
+        # Identity match — accept hit when raycast result matches the
+        # intended instance OR a sibling part of the same Model (handles
+        # slight client/server timing drift on moving targets).
+        assert "_matchesIntendedHit" in src
+        # Hostile-input guard: the FireServer payload must be a BasePart.
+        assert ':IsA("BasePart")' in src

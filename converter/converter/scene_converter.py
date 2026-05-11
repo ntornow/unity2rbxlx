@@ -1364,13 +1364,21 @@ def _convert_node(
     has_collider = any(
         c.component_type in _COLLIDER_TYPES for c in node.components
     )
-    if not has_visual and not has_collider and part.class_name == "Part":
-        # Parts without meshes, visual components, OR colliders are Unity
-        # containers/markers. Make invisible regardless of whether they
-        # have children (child scripts are reparented separately, so the
-        # container doesn't need to render).
+    if not has_visual and part.class_name == "Part":
+        # No renderer → make invisible regardless. A collider with no
+        # renderer is a collision proxy (Unity's standard pattern: the
+        # invisible Pier ``Collider`` BoxCollider carries the dock's
+        # floor collision while visible plank/beam children render the
+        # wood). Without ``transparency = 1.0`` here, those proxies
+        # render as gray boxes overlaying the level geometry.
         part.transparency = 1.0
-        part.can_collide = False
+        if not has_collider:
+            # True marker: no collider either → also disable collision
+            # so the user doesn't bump into invisible logic containers.
+            # A collider proxy (e.g. dock floor) keeps the can_collide
+            # value ``_process_components`` set (typically True for
+            # non-trigger Unity colliders).
+            part.can_collide = False
 
     # -- Tag as attribute --
     if node.tag and node.tag != "Untagged":

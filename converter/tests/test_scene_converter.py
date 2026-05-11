@@ -561,6 +561,48 @@ class TestMixedColliderHandling:
         expected_diam = 3 * 2 * STUDS_PER_METER
         assert max(part.size) >= expected_diam - 0.01, "Trigger sphere should grow the Part size"
 
+    def test_invisible_collider_stays_invisible(self):
+        """Codex round-1 [P2]: an invisible collider proxy (no renderer
+        + non-trigger collider) must keep ``transparency = 1.0``. Round-0
+        fix gated ``can_collide`` correctly but skipped the transparency
+        write, leaving converted dock floors / collision proxies
+        rendering as gray boxes overlaying real geometry.
+        """
+        from converter.scene_converter import _convert_node
+        from core.unity_types import SceneNode
+
+        class FakeBoxCollider:
+            component_type = "BoxCollider"
+            properties = {
+                "m_IsTrigger": 0,
+                "m_Size": {"x": 15, "y": 0.25, "z": 2.25},
+                "m_Center": {"x": 0, "y": 0, "z": 0},
+            }
+
+        node = SceneNode(
+            name="Collider",
+            file_id="1",
+            active=True,
+            layer=0,
+            tag="Untagged",
+            components=[FakeBoxCollider()],
+            parent_file_id=None,
+            position=(0.0, 0.0, 0.0),
+            rotation=(0.0, 0.0, 0.0, 1.0),
+            scale=(1.0, 1.0, 1.0),
+        )
+
+        with _scene_ctx():
+            part = _convert_node(node, None, {}, {})
+
+        assert part is not None
+        assert part.transparency == 1.0, (
+            "Collider proxy with no renderer must be invisible."
+        )
+        assert part.can_collide is True, (
+            "Round-0 fix: collide must still be true."
+        )
+
     def test_invisible_collider_not_dropped_as_marker(self):
         """A Part with no Renderer but a non-trigger Collider must keep
         ``CanCollide=True``. The "logic-only / marker" rule must not flip
