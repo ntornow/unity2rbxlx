@@ -1767,19 +1767,22 @@ local function applyAreaDamage(originPos)
     end
 end
 '''
-    # Direct-hit path (Humanoid model raycast hit). Splash bullets
-    # ALSO run this for the direct-hit damage, then splash; non-splash
-    # bullets only run direct-hit.
-    direct_hit_body = (
-        '    model:SetAttribute("TakeDamage", damage)\n'
-        '    local humanoid = model:FindFirstChildOfClass("Humanoid")\n'
-        '    if humanoid then humanoid:TakeDamage(damage) end\n'
-    )
+    # Direct-hit path (Humanoid model raycast hit).
+    #
+    # Splash bullets (PlaneBullet): Unity's ``OnCollisionEnter`` runs
+    # ``OverlapSphere(2)`` and applies damage to every Player within
+    # the radius — including the directly-hit one. Calling a separate
+    # direct-hit ``SetAttribute`` here BEFORE ``applyAreaDamage`` would
+    # double-damage a head-on victim (codex round-4 [P1]). Splash
+    # bullets therefore use ``applyAreaDamage`` as their ONLY damage
+    # source, matching Unity's single-pass behavior.
+    #
+    # Direct-hit-only bullets (TurretBullet): no splash in Unity, so
+    # the only damage source is the direct attribute write.
     if splash_radius > 0:
         apply_hit_body = (
-            direct_hit_body
-            + '    applyAreaDamage(rootPart.Position)\n'
-            + '    container:Destroy()\n'
+            '    applyAreaDamage(rootPart.Position)\n'
+            '    container:Destroy()\n'
         )
         # Non-character impact (wall, ground, prop) — splash bullets
         # still explode and apply area damage. Mirrors Unity
@@ -1793,7 +1796,12 @@ end
             '                return\n'
         )
     else:
-        apply_hit_body = direct_hit_body + '    container:Destroy()\n'
+        apply_hit_body = (
+            '    model:SetAttribute("TakeDamage", damage)\n'
+            '    local humanoid = model:FindFirstChildOfClass("Humanoid")\n'
+            '    if humanoid then humanoid:TakeDamage(damage) end\n'
+            '    container:Destroy()\n'
+        )
         # Direct-hit bullets just despawn on terrain/wall impact —
         # matches Unity ``TurretBullet.cs`` whose ``OnCollisionEnter``
         # only damages on player tag and otherwise destroys the bullet.
@@ -1829,9 +1837,17 @@ local function getRootPart()
     return container
 end
 
-local fadeTime = {defaults["fadeTime"]}
-local force = {defaults["force"]}
-local damage = {defaults["damage"]}
+-- Read serialized MonoBehaviour overrides from the part's
+-- attributes; the converter's ``_extract_monobehaviour_attributes``
+-- emits ``fadeTime``/``force``/``damage`` as float attributes so
+-- prefab/instance inspector tuning carries through to runtime.
+-- Unity-canonical defaults are the fallback when an attribute is
+-- absent (e.g. older outputs or a clone whose attributes were
+-- stripped at clone time).
+local _attrHost = container:IsA("Model") and (container.PrimaryPart or container) or container
+local fadeTime = _attrHost:GetAttribute("fadeTime") or {defaults["fadeTime"]}
+local force = _attrHost:GetAttribute("force") or {defaults["force"]}
+local damage = _attrHost:GetAttribute("damage") or {defaults["damage"]}
 local STUDS_PER_METER = 3.571
 
 local rootPart = getRootPart()
@@ -1971,13 +1987,19 @@ def _replace_bullet_physics(scripts: list["RbxScript"]) -> int:
 # attribute server-side so the existing
 # ``GetAttributeChangedSignal`` listeners fire.
 
-# Match ANY local-variable ``:SetAttribute("TakeDamage", true)``
-# coming out of the AI transpile. Different runs name the local
-# ``hitInst``, ``hitPart``, ``hit``, ``instance``, etc. Capture
-# group 1 carries the var name so the injected FireServer call
-# references the same identifier the AI produced.
+# Match ANY local-variable ``:SetAttribute("TakeDamage", <expr>)``
+# coming out of the AI transpile. Different runs vary on TWO axes:
+#   1. The local name: ``hitInst``, ``hitPart``, ``hit``, etc. —
+#      capture group 1 carries the identifier so the injected
+#      FireServer call references the same name.
+#   2. The value: ``true`` is the canonical shape, but the AI
+#      sometimes emits an incrementing form to force the change
+#      signal — e.g. ``(<inst>:GetAttribute("TakeDamage") or 0) + 1``.
+#      Match anything after the comma up to the closing ``)`` so
+#      either shape triggers the pack. Codex round-4 [P2] flagged
+#      that the prior literal-``true`` regex missed real outputs.
 _PLAYER_RAYCAST_HIT_RE = re.compile(
-    r'\b([A-Za-z_]\w*)\s*:\s*SetAttribute\s*\(\s*["\']TakeDamage["\']\s*,\s*true\s*\)',
+    r'\b([A-Za-z_]\w*)\s*:\s*SetAttribute\s*\(\s*["\']TakeDamage["\']\s*,\s*[^)\n]+\s*\)',
 )
 
 
@@ -2163,8 +2185,13 @@ def _inject_player_damage_remote_event(scripts: list["RbxScript"]) -> int:
         # FireServer. Scope: look for the closing ``end`` of the
         # ``if model then ... end`` block immediately after the hit
         # SetAttribute. If absent, insert right after the hit line.
+        # Anchor on the captured hit-var SetAttribute call. Tolerates
+        # both the canonical ``true`` literal AND the incrementing
+        # ``(GetAttribute("TakeDamage") or 0) + 1`` shape (which has
+        # nested parens, so consume up to the next newline rather
+        # than the next `)`).
         anchor_re = re.compile(
-            rf'({re.escape(hit_var)}\s*:\s*SetAttribute\s*\(\s*["\']TakeDamage["\']\s*,\s*true\s*\)\s*\n'
+            rf'({re.escape(hit_var)}\s*:\s*SetAttribute\s*\(\s*["\']TakeDamage["\'][^\n]*\n'
             r'(?:\s*local\s+model\s*=[^\n]+\n)?'
             r'(?:\s*if\s+model\s+then\s+model\s*:\s*SetAttribute[^\n]+end\s*\n)?)',
         )

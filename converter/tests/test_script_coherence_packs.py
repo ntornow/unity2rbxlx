@@ -1752,8 +1752,11 @@ class TestBulletPhysicsRaycast:
         s = self._bullet_script("PlaneBullet")
         fixes = packs_module._replace_bullet_physics([s])
         assert fixes == 1
-        assert "local fadeTime = 6" in s.source
-        assert "local force = 200" in s.source
+        # Defaults are the fallback when the part has no inspector
+        # override attribute (codex round-4 [P2] made the replacement
+        # ``:GetAttribute`` the value first).
+        assert 'GetAttribute("fadeTime") or 6' in s.source
+        assert 'GetAttribute("force") or 200' in s.source
         # Splash damage branch present
         assert "applyAreaDamage" in s.source
         # Splash radius matches Unity Physics.OverlapSphere(..., 2)
@@ -1766,9 +1769,43 @@ class TestBulletPhysicsRaycast:
         """
         s = self._bullet_script("TurretBullet")
         packs_module._replace_bullet_physics([s])
-        assert "local fadeTime = 3" in s.source
-        assert "local force = 60" in s.source
+        assert 'GetAttribute("fadeTime") or 3' in s.source
+        assert 'GetAttribute("force") or 60' in s.source
         assert "applyAreaDamage" not in s.source
+
+    def test_replacement_reads_serialized_inspector_overrides(self) -> None:
+        """Codex round-4 [P2]: bullets carry inspector overrides
+        (``fadeTime``, ``force``, ``damage``) as part attributes via
+        ``_extract_monobehaviour_attributes``. The replacement must
+        ``:GetAttribute`` those values at runtime, falling back to the
+        Unity-canonical defaults only when absent. Without this, a
+        prefab that tunes ``damage = 25`` in Unity silently regresses
+        to the hardcoded 10.
+        """
+        s = self._bullet_script("TurretBullet")
+        packs_module._replace_bullet_physics([s])
+        assert 'GetAttribute("fadeTime") or' in s.source
+        assert 'GetAttribute("force") or' in s.source
+        assert 'GetAttribute("damage") or' in s.source
+
+    def test_plane_bullet_direct_hit_does_not_double_damage(self) -> None:
+        """Codex round-4 [P1]: ``PlaneBullet``'s direct-hit branch must
+        NOT call ``SetAttribute("TakeDamage", damage)`` separately
+        before ``applyAreaDamage`` — Unity's ``OnCollisionEnter`` runs
+        ``OverlapSphere`` once and the directly-hit player is included
+        in that sweep, so a separate direct-damage write would apply
+        the damage twice (20 instead of 10).
+        """
+        s = self._bullet_script("PlaneBullet")
+        packs_module._replace_bullet_physics([s])
+        apply_idx = s.source.index("local function applyHit(model)")
+        end_idx = s.source.index("end\n", apply_idx) + 4
+        apply_body = s.source[apply_idx:end_idx]
+        assert "applyAreaDamage" in apply_body
+        assert 'model:SetAttribute("TakeDamage", damage)' not in apply_body, (
+            "Splash bullets must use applyAreaDamage as the sole "
+            "damage source for direct hits."
+        )
 
     def test_detector_matches_helper_local_names(self) -> None:
         """Codex round-2 [P1]: the real ``PlaneBullet.luau`` transpile
@@ -2134,3 +2171,30 @@ class TestPlayerDamageRemoteEvent:
             "TurretBullet has no Unity splash damage — non-character "
             "impact must just destroy the bullet."
         )
+
+    def test_detector_matches_incrementing_takedamage_form(self) -> None:
+        """Codex round-4 [P2]: the AI transpile sometimes emits
+        ``hitInst:SetAttribute("TakeDamage", (hitInst:GetAttribute
+        ("TakeDamage") or 0) + 1)`` to force the change signal (a
+        plain ``true`` write a second time doesn't fire
+        GetAttributeChangedSignal). The detector must match this
+        non-boolean shape too, otherwise affected projects silently
+        skip the FireServer injection.
+        """
+        s = RbxScript(
+            name="Player",
+            source=(
+                'local result = workspace:Raycast(origin, dir, rp)\n'
+                'if result then\n'
+                '    local hitInst = result.Instance\n'
+                '    hitInst:SetAttribute("TakeDamage", '
+                '(hitInst:GetAttribute("TakeDamage") or 0) + 1)\n'
+                'end\n'
+            ),
+            script_type="LocalScript",
+        )
+        assert packs_module._detect_player_damage_attr_set([s]) is True
+        scripts = [s]
+        fixes = packs_module._inject_player_damage_remote_event(scripts)
+        assert fixes >= 1
+        assert "_de:FireServer(hitInst" in scripts[0].source
