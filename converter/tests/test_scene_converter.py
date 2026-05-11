@@ -807,6 +807,157 @@ class TestMultiSubMeshMaterialPropagation:
         assert part.surface_appearance.color_map == "rbxassetid://555"
 
 
+class TestMultiSubMeshPositionGate:
+    """``_convert_prefab_node`` historically replaced a child's local
+    position with the FBX-internal sub-mesh pivot whenever the child
+    referenced a multi-sub-mesh FBX. That destroyed authoritative
+    ``m_LocalPosition`` values from real Unity prefabs that use the
+    FBX only as a mesh source (assigning individual sub-meshes to
+    manually-positioned GameObjects via MeshFilter).
+
+    Reproducer: SimpleFPS Turret.prefab has Base.localPos.y=1.45m
+    and Weapon.localPos.y=0.93m (Weapon is a child of Base), all
+    referencing turret_01.fbx by ``m_Mesh`` fileID. Pre-fix the Y
+    offsets collapsed to 0 and the converted turrets rendered as
+    flat puddles of meshes piled on the ground.
+
+    Fix: gate the substitution on ``local_pos ≈ (0, 0, 0)``. Only
+    substitute when the prefab carries no positioning of its own
+    (FBX-as-prefab wrapper pattern) — otherwise trust the prefab.
+    """
+
+    @staticmethod
+    def _fake_guid_index_with_fbx(fbx_path):
+        """Build a minimal GuidIndex-like object that resolves a single
+        mesh GUID to a fake FBX path."""
+        class _Idx:
+            def resolve(self, guid):
+                if guid == "turret-fbx-guid":
+                    return fbx_path
+                return None
+            def resolve_relative(self, guid):
+                if guid == "turret-fbx-guid":
+                    return fbx_path
+                return None
+        return _Idx()
+
+    def test_authoritative_local_pos_preserved(self, tmp_path):
+        """A child PrefabNode with non-zero ``m_LocalPosition`` keeps
+        its prefab-defined position even when its mesh is one of a
+        multi-sub-mesh FBX. Pin the Y offset that the round-5 fix
+        restored.
+        """
+        from converter.scene_converter import _convert_prefab_node
+        from core.unity_types import PrefabNode
+
+        fbx_path = tmp_path / "turret_01.fbx"
+        fbx_path.write_bytes(b"")  # exists but empty — path is the marker
+
+        idx = self._fake_guid_index_with_fbx(fbx_path)
+        # PrefabNode for ``Base``: real Unity-prefab position 1.45m up.
+        node = PrefabNode(
+            name="Base",
+            file_id="1",
+            active=True,
+            position=(0.0, 1.45, 0.0),
+            rotation=(0.0, 0.0, 0.0, 1.0),
+            scale=(1.0, 1.0, 1.0),
+            mesh_guid="turret-fbx-guid",
+            mesh_file_id="4300002",
+        )
+
+        # mesh_hierarchies says the FBX-internal sub-mesh sits at ~0.
+        # The pre-fix code would have used (0, -0.0196, 0) instead of
+        # (0, 1.45, 0). Set up the context with that hierarchy data;
+        # ``_get_multi_sub_meshes`` looks up by ``str(asset_path)`` so
+        # key must match the fake guid_index's resolve() return value.
+        mesh_hierarchies = {
+            str(fbx_path): [
+                {"position": [0.0, -0.0196, 0.0], "fileID": "4300002", "name": "TurretBase"},
+                {"position": [0.0, 0.0, 0.0], "fileID": "4300000", "name": "Tower"},
+            ],
+        }
+
+        with _scene_ctx(mesh_hierarchies=mesh_hierarchies):
+            # Convert with a parent at world origin.
+            part = _convert_prefab_node(
+                node, idx, {}, {},
+                parent_pos=[0.0, 0.0, 0.0],
+                parent_rot=[0.0, 0.0, 0.0, 1.0],
+                parent_scl=[1.0, 1.0, 1.0],
+            )
+
+        assert part is not None
+        # World Y must reflect the prefab's 1.45m × STUDS_PER_METER.
+        # Allow ±0.1 stud slack (mesh vertical offset correction may add
+        # small adjustments for Roblox center-of-bbox positioning).
+        from config import STUDS_PER_METER
+        expected_y = 1.45 * STUDS_PER_METER
+        assert abs(part.cframe.y - expected_y) < 0.5, (
+            f"Expected Y≈{expected_y:.2f} (Unity 1.45m), got {part.cframe.y:.2f}. "
+            f"Pre-fix bug: prefab Y was overwritten with FBX sub-mesh pivot ~0."
+        )
+
+    def test_zero_local_pos_still_uses_submesh_position(self, tmp_path):
+        """The FBX-as-prefab pattern (prefab is just an FBX wrapper
+        with internal sub-mesh positioning) still needs the
+        substitution. When the prefab's own local pos is ~0, use the
+        FBX-internal sub-mesh pivot.
+        """
+        from converter.scene_converter import _convert_prefab_node
+        from core.unity_types import PrefabNode
+
+        fbx_path = tmp_path / "multi.fbx"
+        fbx_path.write_bytes(b"")
+
+        idx = self._fake_guid_index_with_fbx(fbx_path)
+
+        # A real FBX wrapper-prefab: prefab position is 0, FBX-internal
+        # sub-mesh position carries the offset.
+        node = PrefabNode(
+            name="SubA",
+            file_id="1",
+            active=True,
+            position=(0.0, 0.0, 0.0),  # wrapper carries no offset
+            rotation=(0.0, 0.0, 0.0, 1.0),
+            scale=(1.0, 1.0, 1.0),
+            mesh_guid="turret-fbx-guid",
+            mesh_file_id="4300002",
+        )
+
+        # FBX-internal positions: SubA sits 2m up from the FBX origin.
+        # Need 2+ entries to satisfy ``_get_multi_sub_meshes``'s
+        # "single-mesh FBX" filter. mesh_file_id 4300002 maps to index 1
+        # via Unity's ``(fid - 4300000) // 2`` rule, so SubA must be at
+        # index 1 to be picked by ``_resolve_sub_mesh``.
+        mesh_hierarchies = {
+            str(fbx_path): [
+                {"position": [0.0, 0.0, 0.0], "fileID": "4300000", "name": "SubB"},
+                {"position": [0.0, 2.0, 0.0], "fileID": "4300002", "name": "SubA"},
+            ],
+        }
+
+        with _scene_ctx(mesh_hierarchies=mesh_hierarchies):
+            part = _convert_prefab_node(
+                node, idx, {}, {},
+                parent_pos=[0.0, 0.0, 0.0],
+                parent_rot=[0.0, 0.0, 0.0, 1.0],
+                parent_scl=[1.0, 1.0, 1.0],
+            )
+
+        assert part is not None
+        # World Y should reflect the FBX-internal 2m sub-mesh pivot
+        # scaled by STUDS_PER_METER (substitution feeds through
+        # ``unity_to_roblox_pos``). Pin Y ≈ 7.14 studs, NOT 0.
+        from config import STUDS_PER_METER
+        expected_y = 2.0 * STUDS_PER_METER
+        assert abs(part.cframe.y - expected_y) < 0.5, (
+            f"Expected Y≈{expected_y:.2f} (FBX-internal sub-mesh pivot), "
+            f"got {part.cframe.y:.2f}. Substitution must still fire when "
+            f"prefab local pos is ~0."
+        )
+
+
 class TestFixEmptyMeshParts:
     """``_fix_empty_mesh_parts`` surfaces missing-asset failures (magenta) but
     still hides genuine bone-anchor sockets in models that have rendered meshes.

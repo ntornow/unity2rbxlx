@@ -3907,11 +3907,28 @@ def _convert_prefab_node(
     # CENTER.  When mesh_hierarchies data is available, use the Roblox
     # center position (converted to Unity coords) instead of the Unity
     # pivot position.  This corrects visual spacing between parts.
+    #
+    # Gate: ONLY substitute when the prefab node's own ``m_LocalPosition``
+    # is approximately zero. A real Unity prefab that uses an FBX as a
+    # mesh SOURCE (assigning individual sub-meshes to manually-positioned
+    # GameObjects via MeshFilter) carries authoritative non-zero local
+    # positions — overwriting those with the FBX-internal sub-mesh pivot
+    # silently collapses the prefab's hierarchy to a single point.
+    # Concrete case: SimpleFPS Turret.prefab has Base.localPos.y=1.45m
+    # and Weapon.localPos.y=0.93m on top of Base; both GameObjects
+    # reference the turret_01.fbx mesh via fileID but the FBX's internal
+    # sub-mesh pivots are ~0, so the substitution wiped the Y stacking
+    # and rendered every turret as a flat puddle of meshes.
     _is_multi_sub = False
     if parent_pos is not None and node.mesh_guid and _ctx().mesh_hierarchies and guid_index:
+        _has_authoritative_pos = (
+            abs(local_pos[0]) > 1e-4
+            or abs(local_pos[1]) > 1e-4
+            or abs(local_pos[2]) > 1e-4
+        )
         _mfid = node.mesh_file_id if hasattr(node, 'mesh_file_id') else None
         _multi = _get_multi_sub_meshes(node.mesh_guid, guid_index)
-        if _multi and len(_multi) > 1:
+        if _multi and len(_multi) > 1 and not _has_authoritative_pos:
             sub_mesh = _resolve_sub_mesh(node.mesh_guid, _mfid, guid_index, mesh_name=node.name)
             if sub_mesh:
                 sm_pos = sub_mesh.get("position", [0, 0, 0])
