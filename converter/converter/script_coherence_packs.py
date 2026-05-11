@@ -1621,22 +1621,24 @@ def _detect_door_tween_target(scripts: list["RbxScript"]) -> bool:
     """Detect whether at least one ``Door`` script in ``scripts``
     needs the tween fallback.
 
-    Codex round-7 [P2]: bailing for the entire pack as soon as ANY
-    door driver is present skips the fallback on mixed projects
-    where one door has an animation driver and another doesn't.
-    The presence of any driver is taken as evidence that animation
-    emission ran for door clips; in production this is sufficient
-    to suppress the fallback project-wide because the converter
-    either emits ALL door drivers or none (animation phase is
-    project-level). The per-door scoped guard inside ``_inject``
-    is the precise per-instance check.
+    Coverage policy: if ANY ``Anim_(<Prefab>_)?door_(open|close)``
+    driver exists in the project, suppress the fallback. Codex
+    round-9 [P1]: ``door_count`` from the flat ``place.scripts``
+    list isn't a count of door instances — ``_bind_scripts_to_parts``
+    clones one shared ``Door`` script onto every door part later, so
+    a project with N door prefabs sharing a single ``Door.cs`` has
+    only ONE ``Door`` script in the flat list. The earlier ratio
+    heuristic (``driver_count >= 2 * door_count``) thus mis-treated
+    those projects as "fully covered" with a single driver pair, and
+    silently skipped the fallback project-wide.
 
-    For test-only mixed-state arrays (one Door + a driver that
-    matches a different prefab), the detector returns True if any
-    Door still lacks a tween-injection marker, and the inject pass
-    decides per-script.
+    The presence of any driver is sufficient evidence that the
+    animation phase emitted door-clip drivers; ``animation_converter``
+    runs project-level (all-or-nothing for door clips). When it
+    didn't fire, NO driver scripts exist and the fallback runs.
     """
-    has_any_driver = _door_has_animation_driver(scripts)
+    if _door_has_animation_driver(scripts):
+        return False
     for s in scripts:
         if s.name != "Door":
             continue
@@ -1645,29 +1647,6 @@ def _detect_door_tween_target(scripts: list["RbxScript"]) -> bool:
             and _DOOR_SIBLING_LOOKUP_RE.search(s.source)
             and "_AutoFpsDoorTweenInjected" not in s.source
         ):
-            # If a driver covers this door's prefab, suppress; the
-            # apply pass will double-check via the scoped guard.
-            # We can't tell from the script source alone which
-            # animation script covers which Door, so the conservative
-            # answer is: still return True (let inject filter) when
-            # mixed state exists, otherwise return False on pure
-            # driver-present projects.
-            if has_any_driver:
-                # Pure-driver project: every Door has a driver, skip
-                # the pack project-wide. Mixed project: still return
-                # True so inject can per-script decide.
-                # Heuristic: if the driver count >= the Door-script
-                # count, treat as pure.
-                door_count = sum(1 for x in scripts if x.name == "Door")
-                driver_count = sum(
-                    1 for x in scripts
-                    if any(p.match(x.name) for p in _DOOR_EXISTING_ANIM_PATTERNS)
-                )
-                # Animation phase emits one driver per door-clip pair
-                # (open + close), so a fully-driven project has
-                # driver_count >= 2 * door_count.
-                if driver_count >= 2 * door_count:
-                    return False
             return True
     return False
 
@@ -1727,24 +1706,15 @@ end
 )
 def _inject_door_tween(scripts: list["RbxScript"]) -> int:
     fixes = 0
-    # Per-instance guard: count Doors and per-clip drivers. If the
-    # animation phase has emitted ``2 * door_count`` driver scripts
-    # (open + close per door), every door is covered and the pack
-    # is a no-op. Otherwise some doors are uncovered — inject for
-    # those. Codex round-7 [P2]: don't bail for the whole pack on
-    # mixed projects where some doors have drivers and others don't.
-    door_count = sum(1 for s in scripts if s.name == "Door")
-    driver_count = sum(
-        1 for s in scripts
-        if any(p.match(s.name) for p in _DOOR_EXISTING_ANIM_PATTERNS)
-    )
-    if door_count == 0:
-        return 0
-    if driver_count >= 2 * door_count:
+    # Animation phase is project-level: if it emitted ANY door-clip
+    # driver, it emitted them for every Unity door clip that had a
+    # controller. Suppress the fallback whenever a driver is present;
+    # the fallback only runs for projects where animation emission
+    # didn't fire for door clips at all.
+    if _door_has_animation_driver(scripts):
         log.debug(
-            "  door_tween_open: %d driver script(s) cover %d Door(s); "
-            "skipping fallback injection.",
-            driver_count, door_count,
+            "  door_tween_open: animation-phase driver(s) present; "
+            "skipping fallback injection."
         )
         return 0
     for s in scripts:
