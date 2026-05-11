@@ -1635,3 +1635,209 @@ class TestDoorTweenOpen:
         fixes = packs_module._inject_door_tween([s])
         assert fixes == 0
         assert "_AutoFpsDoorTweenInjected" not in s.source
+
+
+class TestBulletPhysicsRaycast:
+    """The ``bullet_physics_raycast`` pack replaces AI-transpiled Unity
+    bullet bodies (TurretBullet/PlaneBullet) with stud-space velocity
+    + anti-gravity + raycast hit detection. Pre-pack: bullets fly too
+    slow, nose-dive into terrain, and tunnel past targets at speed.
+    """
+
+    @staticmethod
+    def _bullet_script(name="TurretBullet"):
+        return RbxScript(
+            name=name,
+            source=(
+                'local Debris = game:GetService("Debris")\n'
+                'local container = script.Parent\n'
+                'local rootPart = container\n'
+                'if rootPart then\n'
+                '    rootPart.Anchored = false\n'
+                '    local impulseDir = container.CFrame.LookVector\n'
+                '    rootPart:ApplyImpulse(impulseDir * 60 * rootPart.AssemblyMass)\n'
+                'end\n'
+                'rootPart.Touched:Connect(function(otherPart)\n'
+                '    if otherPart.Parent then\n'
+                '        otherPart.Parent:SetAttribute("TakeDamage", 10)\n'
+                '    end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+
+    def test_detector_matches_turret_bullet(self) -> None:
+        assert packs_module._detect_bullet_unity_transpile(
+            [self._bullet_script("TurretBullet")]
+        ) is True
+
+    def test_detector_matches_plane_bullet(self) -> None:
+        assert packs_module._detect_bullet_unity_transpile(
+            [self._bullet_script("PlaneBullet")]
+        ) is True
+
+    def test_detector_skips_already_replaced(self) -> None:
+        """Idempotency: marker presence short-circuits the detector."""
+        s = self._bullet_script("TurretBullet")
+        s.source += "\n-- _AutoBulletRaycastInjected\n"
+        assert packs_module._detect_bullet_unity_transpile([s]) is False
+
+    def test_detector_skips_unrelated_scripts(self) -> None:
+        """Other scripts (e.g. a non-bullet that happens to ApplyImpulse)
+        don't trigger — the pack is gated on the canonical bullet names."""
+        s = RbxScript(
+            name="Cannon",
+            source=(
+                'rootPart:ApplyImpulse(Vector3.new(0,1,0))\n'
+                'rootPart.Touched:Connect(function() end)\n'
+            ),
+            script_type="Script",
+        )
+        assert packs_module._detect_bullet_unity_transpile([s]) is False
+
+    def test_apply_replaces_bullet_body(self) -> None:
+        s = self._bullet_script("TurretBullet")
+        fixes = packs_module._replace_bullet_physics([s])
+        assert fixes == 1
+        # Marker present so detector skips on re-run
+        assert "_AutoBulletRaycastInjected" in s.source
+        # Stud-space velocity scaling
+        assert "STUDS_PER_METER" in s.source
+        assert "AssemblyLinearVelocity" in s.source
+        # Anti-gravity VectorForce
+        assert "VectorForce" in s.source
+        assert "workspace.Gravity" in s.source
+        # Raycast-based hit detection (segment from prevPos to curPos)
+        assert "Heartbeat" in s.source
+        assert "workspace:Raycast" in s.source
+        # Visible trail for trajectory readability
+        assert "Trail" in s.source
+
+    def test_apply_idempotent(self) -> None:
+        s = self._bullet_script("TurretBullet")
+        first = packs_module._replace_bullet_physics([s])
+        second = packs_module._replace_bullet_physics([s])
+        assert first == 1
+        assert second == 0
+
+    def test_apply_skips_non_bullet_names(self) -> None:
+        """Same source pattern under a different script name (e.g. a
+        rocket prefab named ``Missile``) gets left alone — the pack
+        scopes to canonical bullet names by design.
+        """
+        s = self._bullet_script("Missile")
+        fixes = packs_module._replace_bullet_physics([s])
+        assert fixes == 0
+        assert "_AutoBulletRaycastInjected" not in s.source
+
+    def test_replacement_preserves_unity_field_names(self) -> None:
+        """``fadeTime``, ``force``, ``damage`` field names match Unity
+        TurretBullet.cs / PlaneBullet.cs so prefab attribute overrides
+        on the converted output keep working through serialized
+        ``_force`` / ``_damage`` attribute reads.
+        """
+        s = self._bullet_script("TurretBullet")
+        packs_module._replace_bullet_physics([s])
+        assert "local fadeTime = " in s.source
+        assert "local force = " in s.source
+        assert "local damage = " in s.source
+
+
+class TestPlayerDamageRemoteEvent:
+    """The ``player_damage_remote_event`` pack solves the
+    LocalScript→server attribute-write replication gap. Player.luau's
+    ``shoot()`` raycasts client-side and ``:SetAttribute("TakeDamage",
+    true)`` on the hit instance, but that attribute write never
+    reaches the server. The pack wires a ``DamageEvent`` RemoteEvent +
+    server router so server-side ``GetAttributeChangedSignal`` listeners
+    (Turret.luau, HostilePlane.luau) actually fire.
+    """
+
+    @staticmethod
+    def _player_script_with_hit():
+        return RbxScript(
+            name="Player",
+            source=(
+                'local function shoot()\n'
+                '    local result = workspace:Raycast(origin, dir, rp)\n'
+                '    if result then\n'
+                '        local hitInst = result.Instance\n'
+                '        hitInst:SetAttribute("TakeDamage", true)\n'
+                '        local model = hitInst:FindFirstAncestorOfClass("Model")\n'
+                '        if model then model:SetAttribute("TakeDamage", true) end\n'
+                '    end\n'
+                'end\n'
+            ),
+            script_type="LocalScript",
+        )
+
+    def test_detector_matches_player_with_raycast_setattr(self) -> None:
+        assert packs_module._detect_player_damage_attr_set(
+            [self._player_script_with_hit()]
+        ) is True
+
+    def test_detector_skips_already_patched(self) -> None:
+        s = self._player_script_with_hit()
+        s.source += "\n-- _AutoDamageRemoteEventInjected\n"
+        assert packs_module._detect_player_damage_attr_set([s]) is False
+
+    def test_detector_skips_non_player_scripts(self) -> None:
+        s = RbxScript(
+            name="OtherScript",
+            source='hitInst:SetAttribute("TakeDamage", true)\n',
+            script_type="LocalScript",
+        )
+        assert packs_module._detect_player_damage_attr_set([s]) is False
+
+    def test_apply_inserts_fireserver_after_setattribute(self) -> None:
+        scripts = [self._player_script_with_hit()]
+        fixes = packs_module._inject_player_damage_remote_event(scripts)
+        assert fixes >= 1
+        patched = scripts[0]
+        # Marker comment present (idempotency anchor)
+        assert "_AutoDamageRemoteEventInjected" in patched.source
+        # FireServer call present
+        assert "_de:FireServer(hitInst)" in patched.source
+        # Insertion lands AFTER both SetAttribute lines
+        hit_idx = patched.source.index(
+            'hitInst:SetAttribute("TakeDamage", true)'
+        )
+        model_idx = patched.source.index(
+            'model:SetAttribute("TakeDamage", true)'
+        )
+        fire_idx = patched.source.index("_de:FireServer(hitInst)")
+        assert hit_idx < fire_idx, "FireServer must come after hitInst SetAttribute"
+        assert model_idx < fire_idx, "FireServer must come after model SetAttribute"
+
+    def test_apply_emits_damage_router_script(self) -> None:
+        scripts = [self._player_script_with_hit()]
+        packs_module._inject_player_damage_remote_event(scripts)
+        router = next(
+            (s for s in scripts if s.name == "_AutoDamageEventRouter"),
+            None,
+        )
+        assert router is not None, "server router script must be appended"
+        assert router.script_type == "Script"
+        assert router.parent_path == "ServerScriptService"
+        # Router creates DamageEvent if missing, listens for FireServer,
+        # and propagates the attribute write to both the hit instance
+        # and its enclosing Model.
+        assert 'Name = "DamageEvent"' in router.source
+        assert "OnServerEvent" in router.source
+        assert ':SetAttribute("TakeDamage"' in router.source
+
+    def test_apply_idempotent(self) -> None:
+        """Re-running the pack must not double-insert the FireServer
+        block or duplicate the router script.
+        """
+        scripts = [self._player_script_with_hit()]
+        first = packs_module._inject_player_damage_remote_event(scripts)
+        second = packs_module._inject_player_damage_remote_event(scripts)
+        assert first >= 1
+        assert second == 0, "second run must be a no-op"
+        # Only one router script in the list
+        routers = [s for s in scripts if s.name == "_AutoDamageEventRouter"]
+        assert len(routers) == 1
+        # Only one FireServer call in the patched player source
+        patched_player = scripts[0].source
+        assert patched_player.count("_de:FireServer(hitInst)") == 1

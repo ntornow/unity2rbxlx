@@ -1669,3 +1669,367 @@ def _inject_door_tween(scripts: list["RbxScript"]) -> int:
         fixes += 1
         log.info("  Injected door tween listener in '%s'", s.name)
     return fixes
+
+
+# ---------------------------------------------------------------------------
+# Pack: bullet_physics_raycast
+# ---------------------------------------------------------------------------
+#
+# Unity's bullet scripts (``TurretBullet.cs``, ``PlaneBullet.cs``) use
+# ``rb.AddRelativeForce(Vector3.forward * force, Impulse)`` plus
+# ``OnCollisionEnter`` for hit detection. The AI transpile maps that
+# to ``rootPart:ApplyImpulse(impulseDir * force * mass)`` plus
+# ``Touched``. Three bugs stack in the converted output:
+#
+#  1. ``force=60`` is in Unity m/s but Roblox impulses are in stud-units.
+#     1 Unity m ≈ 3.571 studs, so the bullet flies 5.7x too slow.
+#  2. Roblox gravity is 196 studs/s², equivalent to ~55 m/s² (vs Unity's
+#     9.81 m/s²) — ~5.6x stronger. Bullets nose-dive into the ground.
+#  3. ``Touched`` events tunnel past targets at high speed (3+ studs per
+#     frame at typical bullet velocities), so even when the bullet
+#     reaches the player the hit doesn't register.
+#
+# Fix: replace the bullet's ``Start``-like body and ``Touched`` handler
+# with raycast-based hit detection that:
+#   - Sets ``AssemblyLinearVelocity = forward * force * STUDS_PER_METER``
+#   - Adds an anti-gravity ``VectorForce`` (``force = gravity * mass``)
+#   - Raycasts each ``Heartbeat`` from the previous frame's position to
+#     the current to catch tunnel-through hits
+#   - Adds a visible ``Trail`` so the trajectory reads in-game
+
+_BULLET_DETECT_RE = re.compile(
+    r'rootPart\s*:\s*ApplyImpulse\s*\([^)]*\)',
+)
+_BULLET_TOUCHED_RE = re.compile(
+    r'rootPart\.Touched\s*:\s*Connect',
+)
+
+
+def _detect_bullet_unity_transpile(scripts: list["RbxScript"]) -> bool:
+    for s in scripts:
+        if s.name not in ("TurretBullet", "PlaneBullet"):
+            continue
+        if (
+            _BULLET_DETECT_RE.search(s.source)
+            and _BULLET_TOUCHED_RE.search(s.source)
+            and "_AutoBulletRaycastInjected" not in s.source
+        ):
+            return True
+    return False
+
+
+# Replacement bullet body. Preserves the canonical Unity-source field
+# names (``fadeTime``, ``force``, ``damage``) so prefab-level attribute
+# overrides keep working. The ``_AutoBulletRaycastInjected`` marker
+# makes the pack idempotent.
+_BULLET_REPLACEMENT_SOURCE = '''\
+-- _AutoBulletRaycastInjected: bullet coherence pack
+-- Stud-space velocity + anti-gravity + raycast hit detection.
+-- Replaces the AI transpile of Unity's TurretBullet.cs / PlaneBullet.cs
+-- (rb.AddRelativeForce + OnCollisionEnter), which stacks three bugs
+-- in stud-space Roblox physics: 5.7x slow velocity, 5.6x strong
+-- gravity, and Touched tunneling at high speeds.
+local Debris = game:GetService("Debris")
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+
+local container = script.Parent
+if container:IsA("Model") and not container.PrimaryPart then
+    container.PrimaryPart = container:FindFirstChildWhichIsA("BasePart")
+end
+
+local function getCFrame()
+    if container:IsA("Model") then return container:GetPivot() end
+    return container.CFrame
+end
+local function getRootPart()
+    if container:IsA("Model") then
+        return container.PrimaryPart or container:FindFirstChildWhichIsA("BasePart")
+    end
+    return container
+end
+
+local fadeTime = 3
+local force = 60
+local damage = 10
+local STUDS_PER_METER = 3.571
+
+local rootPart = getRootPart()
+if not rootPart then return end
+
+rootPart.Anchored = false
+
+-- Anti-gravity: cancel Roblox's 196 studs/s² so bullets fly straight
+-- like Unity's near-massless impulse (gravity barely affects them
+-- across a 3-second fade in Unity's 9.81 m/s² space).
+local att0 = Instance.new("Attachment")
+att0.Name = "_BulletAtt0"
+att0.Parent = rootPart
+local antiG = Instance.new("VectorForce")
+antiG.Force = Vector3.new(0, workspace.Gravity * rootPart.AssemblyMass, 0)
+antiG.RelativeTo = Enum.ActuatorRelativeTo.World
+antiG.Attachment0 = att0
+antiG.ApplyAtCenterOfMass = true
+antiG.Parent = rootPart
+
+-- Initial velocity in stud-space (Unity m/s × STUDS_PER_METER).
+rootPart.AssemblyLinearVelocity = getCFrame().LookVector * (force * STUDS_PER_METER)
+
+-- Trail for visible trajectory
+local att1 = Instance.new("Attachment")
+att1.Name = "_TrailAtt1"
+att1.Position = Vector3.new(0, 0, 0.5)
+att1.Parent = rootPart
+local att2 = Instance.new("Attachment")
+att2.Name = "_TrailAtt2"
+att2.Position = Vector3.new(0, 0, -0.5)
+att2.Parent = rootPart
+local trail = Instance.new("Trail")
+trail.Attachment0 = att1
+trail.Attachment1 = att2
+trail.Lifetime = 0.4
+trail.MinLength = 0
+trail.WidthScale = NumberSequence.new({
+    NumberSequenceKeypoint.new(0, 1),
+    NumberSequenceKeypoint.new(1, 0),
+})
+trail.Color = ColorSequence.new(Color3.fromRGB(255, 100, 50))
+trail.Transparency = NumberSequence.new({
+    NumberSequenceKeypoint.new(0, 0),
+    NumberSequenceKeypoint.new(1, 1),
+})
+trail.Parent = rootPart
+
+Debris:AddItem(container, fadeTime)
+
+-- Raycast hit detection: cast segment from previous-frame position to
+-- current each heartbeat. Catches tunneling that Touched misses.
+local prevPos = rootPart.Position
+local consumed = false
+local rp = RaycastParams.new()
+rp.FilterDescendantsInstances = {container}
+rp.FilterType = Enum.RaycastFilterType.Exclude
+
+local function applyHit(model)
+    model:SetAttribute("TakeDamage", damage)
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+    if humanoid then humanoid:TakeDamage(damage) end
+    container:Destroy()
+end
+
+local conn
+conn = RunService.Heartbeat:Connect(function()
+    if consumed or not rootPart.Parent then
+        if conn then conn:Disconnect() end
+        return
+    end
+    local curPos = rootPart.Position
+    local segment = curPos - prevPos
+    if segment.Magnitude > 0 then
+        local result = workspace:Raycast(prevPos, segment, rp)
+        if result then
+            local inst = result.Instance
+            local model = inst:FindFirstAncestorOfClass("Model")
+            if model and model:FindFirstChildOfClass("Humanoid") then
+                local player = Players:GetPlayerFromCharacter(model)
+                if player or inst:HasTag("Player") or model.Name == "Player" then
+                    consumed = true
+                    applyHit(model)
+                    return
+                end
+            else
+                -- Hit non-character (terrain, wall, prop) — destroy.
+                consumed = true
+                container:Destroy()
+                return
+            end
+        end
+    end
+    prevPos = curPos
+end)
+'''
+
+
+@patch_pack(
+    name="bullet_physics_raycast",
+    description=(
+        "Replace AI-transpiled Unity bullet bodies (TurretBullet, "
+        "PlaneBullet) with stud-space velocity + anti-gravity + raycast "
+        "hit detection. Without this, bullets fly too slow, nose-dive, "
+        "and tunnel past targets."
+    ),
+    detect=_detect_bullet_unity_transpile,
+)
+def _replace_bullet_physics(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        if s.name not in ("TurretBullet", "PlaneBullet"):
+            continue
+        if (
+            not _BULLET_DETECT_RE.search(s.source)
+            or not _BULLET_TOUCHED_RE.search(s.source)
+            or "_AutoBulletRaycastInjected" in s.source
+        ):
+            continue
+        s.source = _BULLET_REPLACEMENT_SOURCE
+        fixes += 1
+        log.info("  Replaced bullet physics in '%s'", s.name)
+    return fixes
+
+
+# ---------------------------------------------------------------------------
+# Pack: player_damage_remote_event
+# ---------------------------------------------------------------------------
+#
+# Unity's ``Player.cs`` raycasts on click and ``SendMessage("TakeDamage",
+# damage)`` on the hit collider. The AI transpile renders that as a
+# LocalScript that ``:SetAttribute("TakeDamage", true)`` on the hit
+# instance. But LocalScript attribute writes DON'T replicate to the
+# server — so server-side scripts (e.g. Turret.luau) listening via
+# ``GetAttributeChangedSignal("TakeDamage")`` never fire. Player can
+# never damage anything.
+#
+# Fix: introduce a ``DamageEvent`` RemoteEvent in ReplicatedStorage.
+# Player.luau ``shoot()`` ``FireServer(hitInst)`` after each raycast
+# hit. A tiny server router (auto-generated) listens and sets the
+# attribute server-side so the existing
+# ``GetAttributeChangedSignal`` listeners fire.
+
+_PLAYER_RAYCAST_HIT_RE = re.compile(
+    r'hitInst\s*:\s*SetAttribute\s*\(\s*["\']TakeDamage["\']\s*,\s*true\s*\)',
+)
+
+
+def _detect_player_damage_attr_set(scripts: list["RbxScript"]) -> bool:
+    for s in scripts:
+        if s.name != "Player":
+            continue
+        if s.script_type not in ("LocalScript", "Script"):
+            continue
+        if (
+            _PLAYER_RAYCAST_HIT_RE.search(s.source)
+            and "_AutoDamageRemoteEventInjected" not in s.source
+        ):
+            return True
+    return False
+
+
+# Block inserted after the player's raycast SetAttribute. Fires the
+# RemoteEvent so a server router can mirror the attribute write.
+# The marker comment also pins idempotency.
+_PLAYER_DAMAGE_FIRE_INSERT = (
+    '\n            -- _AutoDamageRemoteEventInjected: mirror client damage to server\n'
+    '            do\n'
+    '                local _de = game:GetService("ReplicatedStorage")'
+    ':FindFirstChild("DamageEvent")\n'
+    '                if _de then _de:FireServer(hitInst) end\n'
+    '            end\n'
+)
+
+
+# Auto-generated server router script. Listens to ``DamageEvent``
+# fires and sets ``TakeDamage`` server-side on the hit instance AND
+# its enclosing Model. Idempotent: re-runs are no-ops because the
+# pack overwrites by name.
+_DAMAGE_ROUTER_SOURCE = '''\
+-- _AutoDamageEventRouter (auto-generated by player_damage_remote_event pack)
+-- Mirrors client-fired damage hits to server-side ``TakeDamage``
+-- attribute writes so server scripts listening via
+-- ``GetAttributeChangedSignal`` actually fire.
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local de = ReplicatedStorage:FindFirstChild("DamageEvent")
+if not de then
+    de = Instance.new("RemoteEvent")
+    de.Name = "DamageEvent"
+    de.Parent = ReplicatedStorage
+end
+
+de.OnServerEvent:Connect(function(player, hitInstance)
+    if not (hitInstance and hitInstance:IsDescendantOf(workspace)) then
+        return
+    end
+    -- Set on the hit instance directly so a part-level listener fires.
+    hitInstance:SetAttribute("TakeDamage", true)
+    -- Also propagate to the enclosing Model so model-level listeners
+    -- (Turret.luau / HostilePlane.luau) trigger.
+    local m = hitInstance:FindFirstAncestorOfClass("Model")
+    if m then m:SetAttribute("TakeDamage", true) end
+end)
+'''
+
+
+def _detect_player_or_router_present(scripts: list["RbxScript"]) -> bool:
+    """The pack runs when ``Player.luau`` needs patching OR the router
+    isn't yet emitted. Re-check both so re-runs are idempotent."""
+    return _detect_player_damage_attr_set(scripts)
+
+
+@patch_pack(
+    name="player_damage_remote_event",
+    description=(
+        "Mirror client-side Player raycast damage hits to the server "
+        "via a DamageEvent RemoteEvent + auto-injected server router. "
+        "Without this, the server-side TakeDamage attribute listener "
+        "never fires (LocalScript SetAttribute doesn't replicate)."
+    ),
+    detect=_detect_player_or_router_present,
+)
+def _inject_player_damage_remote_event(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    # 1. Patch every Player script's raycast hit branch to FireServer.
+    for s in scripts:
+        if s.name != "Player":
+            continue
+        if "_AutoDamageRemoteEventInjected" in s.source:
+            continue
+        m = _PLAYER_RAYCAST_HIT_RE.search(s.source)
+        if not m:
+            continue
+        # Insert after the model:SetAttribute("TakeDamage", true) line
+        # so both the hit-instance and model writes complete before the
+        # FireServer. Scope: look for the closing ``end`` of the
+        # ``if model then ... end`` block immediately after the hit
+        # SetAttribute. If absent, insert right after the hit line.
+        anchor_re = re.compile(
+            r'(hitInst\s*:\s*SetAttribute\s*\(\s*["\']TakeDamage["\']\s*,\s*true\s*\)\s*\n'
+            r'(?:\s*local\s+model\s*=[^\n]+\n)?'
+            r'(?:\s*if\s+model\s+then\s+model\s*:\s*SetAttribute[^\n]+end\s*\n)?)',
+        )
+        anchor_m = anchor_re.search(s.source)
+        if not anchor_m:
+            continue
+        insert_at = anchor_m.end()
+        s.source = (
+            s.source[:insert_at]
+            + _PLAYER_DAMAGE_FIRE_INSERT
+            + s.source[insert_at:]
+        )
+        fixes += 1
+        log.info("  Patched '%s' to FireServer on raycast hit", s.name)
+
+    # 2. Emit (or refresh) the auto-generated server router. Idempotent:
+    # if a router with the canonical name exists, replace its source to
+    # keep behaviour in sync with the pack version. Otherwise append a
+    # new RbxScript to the list.
+    from core.roblox_types import RbxScript
+    router_name = "_AutoDamageEventRouter"
+    existing = next((s for s in scripts if s.name == router_name), None)
+    if existing is not None:
+        if existing.source != _DAMAGE_ROUTER_SOURCE:
+            existing.source = _DAMAGE_ROUTER_SOURCE
+            fixes += 1
+            log.info("  Refreshed %s source", router_name)
+    else:
+        scripts.append(
+            RbxScript(
+                name=router_name,
+                source=_DAMAGE_ROUTER_SOURCE,
+                script_type="Script",
+                parent_path="ServerScriptService",
+            )
+        )
+        fixes += 1
+        log.info("  Emitted %s server router script", router_name)
+
+    return fixes
