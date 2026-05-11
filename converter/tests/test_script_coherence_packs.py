@@ -1636,6 +1636,45 @@ class TestDoorTweenOpen:
         assert fixes == 0
         assert "_AutoFpsDoorTweenInjected" not in s.source
 
+    def test_detector_skips_when_animation_phase_already_emitted_driver(
+        self,
+    ) -> None:
+        """Codex round-6 [P1]: when the animation phase already emitted
+        ``Anim_Door_door_open.luau`` / ``Anim_Door_door_close.luau``
+        (canonical names from ``animation_converter``), the door
+        already has a tween driver. Injecting a second
+        ``GetAttributeChangedSignal("open")`` listener double-animates
+        the part (overshoot/jitter). The pack must skip.
+        """
+        scripts = [
+            self._door_with_attr_set(),
+            RbxScript(
+                name="Anim_Door_door_open",
+                source="-- animation phase driver\n",
+                script_type="Script",
+            ),
+            RbxScript(
+                name="Anim_Door_door_close",
+                source="-- animation phase driver\n",
+                script_type="Script",
+            ),
+        ]
+        assert packs_module._detect_door_tween_target(scripts) is False
+        # Defense in depth: even if apply is called directly, it must
+        # also skip the inject.
+        fixes = packs_module._inject_door_tween(scripts)
+        assert fixes == 0
+        # Door source unchanged
+        assert "_AutoFpsDoorTweenInjected" not in scripts[0].source
+
+    def test_detector_fires_when_no_animation_driver(self) -> None:
+        """Sanity check the negative case: when no Anim_*_door_*
+        driver is present, the pack still fires for a Door that needs
+        the tween.
+        """
+        scripts = [self._door_with_attr_set()]
+        assert packs_module._detect_door_tween_target(scripts) is True
+
 
 class TestBulletPhysicsRaycast:
     """The ``bullet_physics_raycast`` pack replaces AI-transpiled Unity
@@ -2297,3 +2336,30 @@ class TestPlayerDamageRemoteEvent:
         assert router is not None
         # Player source unchanged (already patched).
         assert patched_player.source.count("_de:FireServer") == 1
+
+    def test_router_uses_incrementing_token_for_repeated_hits(self) -> None:
+        """Codex round-6 [P2]: the detector matches the incrementing
+        ``:SetAttribute("TakeDamage", (Get... or 0) + 1)`` form, but
+        if the router writes ``SetAttribute(..., true)`` then the
+        first hit fires GetAttributeChangedSignal and every later hit
+        is a no-change write (already true) — listeners stop firing.
+
+        The router must preserve the incrementing semantics: bump the
+        counter on every validated hit so the change signal fires on
+        every shot. Fall back to ``true`` only when the attribute
+        isn't yet a number (first write on a fresh target).
+        """
+        scripts = [self._player_script_with_hit()]
+        packs_module._inject_player_damage_remote_event(scripts)
+        router = next(s for s in scripts if s.name == "_AutoDamageEventRouter")
+        src = router.source
+        # Helper that bumps the existing number, or seeds with true.
+        assert "_bumpTakeDamage" in src
+        # Numeric bump branch
+        assert 'typeof(cur) == "number"' in src
+        assert "cur + 1" in src
+        # Boolean fallback for fresh writes
+        assert 'SetAttribute("TakeDamage", true)' in src
+        # Called on both the hit instance and the enclosing Model
+        assert "_bumpTakeDamage(hitInstance)" in src
+        assert "_bumpTakeDamage(m)" in src

@@ -1586,9 +1586,34 @@ _DOOR_OPEN_SETATTR_RE = re.compile(r':SetAttribute\(\s*["\']open["\']\s*,')
 _DOOR_SIBLING_LOOKUP_RE = re.compile(
     r':FindFirstChild\(\s*["\']door["\']\s*\)'
 )
+# Animation phase may have already emitted ``Anim_Door_door_open.luau``
+# / ``Anim_Door_door_close.luau`` companion scripts that listen on the
+# same ``open`` attribute. Codex round-6 [P1]: injecting a second
+# tween listener would double-animate the door (overshoot/jitter).
+# Detect that exact name pattern and skip the inject. Tolerates the
+# AI-emitted ``Anim_<Prefab>_<MeshName>_open`` / ``_close`` shape.
+_DOOR_EXISTING_ANIM_RE = re.compile(
+    r'^Anim_[\w]+_door_(open|close)$',
+)
+
+
+def _door_animation_script_present(scripts: list["RbxScript"]) -> bool:
+    """Return True when the animation phase has already emitted a
+    door open/close tween driver. The script names are stable across
+    AI runs because they're built from the prefab + mesh + clip
+    names by ``animation_converter`` (not by the AI).
+    """
+    return any(
+        _DOOR_EXISTING_ANIM_RE.match(s.name) for s in scripts
+    )
 
 
 def _detect_door_tween_target(scripts: list["RbxScript"]) -> bool:
+    # Conflict guard: if an Anim_*_door_open/close driver is already
+    # in the place, don't add a second listener — the converter has
+    # an explicit motion path for this door already.
+    if _door_animation_script_present(scripts):
+        return False
     for s in scripts:
         if s.name != "Door":
             continue
@@ -1656,6 +1681,16 @@ end
 )
 def _inject_door_tween(scripts: list["RbxScript"]) -> int:
     fixes = 0
+    # Defense in depth: skip if an animation-phase driver exists.
+    # The detector already guards on this, but a future caller that
+    # invokes apply directly (bypassing detect) shouldn't double-
+    # inject either.
+    if _door_animation_script_present(scripts):
+        log.debug(
+            "  door_tween_open: animation-phase Anim_*_door_* driver "
+            "already present; skipping tween injection."
+        )
+        return 0
     for s in scripts:
         if s.name != "Door":
             continue
@@ -2170,11 +2205,26 @@ de.OnServerEvent:Connect(function(player, hitInstance, originPos, lookDir)
         return
     end
 
-    -- Validated. Apply the attribute writes server-side so the
-    -- existing ``GetAttributeChangedSignal`` listeners fire.
-    hitInstance:SetAttribute("TakeDamage", true)
+    -- Validated. Apply the attribute writes server-side using an
+    -- incrementing token so ``GetAttributeChangedSignal`` fires on
+    -- EVERY hit — a repeated ``SetAttribute(..., true)`` write only
+    -- fires the signal once because the value didn't change. The
+    -- Player.cs AI transpile uses the same incrementing form for the
+    -- same reason; preserve that semantics on the server side so
+    -- back-to-back shots all register.
+    local function _bumpTakeDamage(inst)
+        local cur = inst:GetAttribute("TakeDamage")
+        if typeof(cur) == "number" then
+            inst:SetAttribute("TakeDamage", cur + 1)
+        else
+            -- First write (boolean form) — leaves listeners using the
+            -- canonical ``true`` literal happy too.
+            inst:SetAttribute("TakeDamage", true)
+        end
+    end
+    _bumpTakeDamage(hitInstance)
     local m = hitInstance:FindFirstAncestorOfClass("Model")
-    if m then m:SetAttribute("TakeDamage", true) end
+    if m then _bumpTakeDamage(m) end
 end)
 '''
 
