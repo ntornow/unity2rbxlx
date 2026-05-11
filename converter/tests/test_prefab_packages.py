@@ -541,3 +541,200 @@ class TestPhase513VariantChainTemplates:
         # Manifest still records the variant chain entry; HeroBlue is
         # emitted even though its parent Hero was filtered out.
         assert result.manifest["variant_chains"] == {"HeroBlue": "Hero"}
+
+
+class TestAttachMonoBehaviourScripts:
+    """``_attach_monobehaviour_scripts_to_templates`` attaches a
+    Script copy under each prefab-template part that carries a
+    ``_ScriptClass`` attribute, even when ``_bind_scripts_to_parts``
+    has already moved the script source out of the flat list onto a
+    scene part. Without this, runtime-cloned prefab templates have no
+    behaviour (concrete case: SimpleFPS TurretBullet template was a
+    bare red cube with no flight/damage code — turret bullets fell
+    inert to the ground).
+    """
+
+    def _make_pipeline(self, tmp_path):
+        from converter.pipeline import Pipeline
+        from core.roblox_types import RbxPlace
+        (tmp_path / "Assets").mkdir(parents=True, exist_ok=True)
+        pipeline = Pipeline(unity_project_path=tmp_path, output_dir=tmp_path / "out")
+        pipeline.state.rbx_place = RbxPlace()
+        return pipeline
+
+    def test_attaches_script_from_flat_list(self, tmp_path):
+        """Common case: script lives in the flat ``place.scripts`` list
+        (no scene instance carried it). Template attribute matches by
+        ``_ScriptClass``; an independent copy lands under the template.
+        """
+        from core.roblox_types import RbxPart, RbxScript
+
+        pipeline = self._make_pipeline(tmp_path)
+        source = RbxScript(
+            name="TurretBullet",
+            source="-- bullet flight logic\n",
+            script_type="Script",
+        )
+        pipeline.state.rbx_place.scripts.append(source)
+
+        template = RbxPart(name="TurretBullet", class_name="Part")
+        template.attributes["_ScriptClass"] = "TurretBullet"
+        pipeline.state.rbx_place.replicated_templates.append(template)
+
+        pipeline._attach_monobehaviour_scripts_to_templates()
+
+        assert len(template.scripts) == 1
+        attached = template.scripts[0]
+        assert attached is not source, "must be independent copy"
+        assert attached.name == "TurretBullet"
+        assert attached.source == source.source
+        assert attached.parent_path is None
+        # Source stays in the flat list — scene-baked instances still find it.
+        assert source in pipeline.state.rbx_place.scripts
+
+    def test_attaches_script_already_moved_to_scene_part(self, tmp_path):
+        """``_bind_scripts_to_parts`` runs before
+        ``_generate_prefab_packages`` and may have already moved the
+        script out of the flat list onto a scene-level part. The
+        attach pass must search those scene-part script lists too;
+        otherwise the template ends up empty. This is the actual
+        SimpleFPS TurretBullet bug path.
+        """
+        from core.roblox_types import RbxPart, RbxScript
+
+        pipeline = self._make_pipeline(tmp_path)
+        # Script is NOT in the flat list — only on a scene part:
+        scene_bullet = RbxPart(name="TurretBullet", class_name="Part")
+        scene_bullet.scripts.append(
+            RbxScript(
+                name="TurretBullet",
+                source="-- bullet flight logic\n",
+                script_type="Script",
+            )
+        )
+        pipeline.state.rbx_place.workspace_parts.append(scene_bullet)
+
+        template = RbxPart(name="TurretBullet", class_name="Part")
+        template.attributes["_ScriptClass"] = "TurretBullet"
+        pipeline.state.rbx_place.replicated_templates.append(template)
+
+        pipeline._attach_monobehaviour_scripts_to_templates()
+
+        assert len(template.scripts) == 1, (
+            "Template must get a copy even when the script was already "
+            "moved to a scene part by _bind_scripts_to_parts."
+        )
+        assert template.scripts[0].source == "-- bullet flight logic\n"
+
+    def test_walks_nested_template_descendants(self, tmp_path):
+        """A prefab template can have nested children (e.g. Turret model
+        with a child weapon Part carrying ``_ScriptClass``). The walk
+        must recurse so every level gets its script attached.
+        """
+        from core.roblox_types import RbxPart, RbxScript
+
+        pipeline = self._make_pipeline(tmp_path)
+        pipeline.state.rbx_place.scripts.append(
+            RbxScript(
+                name="WeaponLogic",
+                source="-- weapon\n",
+                script_type="Script",
+            )
+        )
+        weapon = RbxPart(name="Weapon", class_name="MeshPart")
+        weapon.attributes["_ScriptClass"] = "WeaponLogic"
+        template = RbxPart(name="Turret", class_name="Model")
+        template.children.append(weapon)
+        pipeline.state.rbx_place.replicated_templates.append(template)
+
+        pipeline._attach_monobehaviour_scripts_to_templates()
+
+        # Template root has no _ScriptClass → no script attached at root.
+        assert template.scripts == []
+        # Nested Weapon child got the script.
+        assert len(weapon.scripts) == 1
+        assert weapon.scripts[0].name == "WeaponLogic"
+
+    def test_idempotent_under_re_run(self, tmp_path):
+        """Re-running the pass must not duplicate scripts already
+        attached. Detects the existing script by name and skips."""
+        from core.roblox_types import RbxPart, RbxScript
+
+        pipeline = self._make_pipeline(tmp_path)
+        pipeline.state.rbx_place.scripts.append(
+            RbxScript(
+                name="TurretBullet",
+                source="-- bullet\n",
+                script_type="Script",
+            )
+        )
+        template = RbxPart(name="TurretBullet", class_name="Part")
+        template.attributes["_ScriptClass"] = "TurretBullet"
+        pipeline.state.rbx_place.replicated_templates.append(template)
+
+        pipeline._attach_monobehaviour_scripts_to_templates()
+        pipeline._attach_monobehaviour_scripts_to_templates()
+
+        assert len(template.scripts) == 1, "second run must not duplicate"
+
+    def test_skips_localscripts_and_modulescripts(self, tmp_path):
+        """Only ``Script`` (server) types belong under a workspace part.
+        LocalScripts live under StarterPlayerScripts, ModuleScripts in
+        ReplicatedStorage. Attaching them as part children would either
+        not execute (LocalScript) or pollute the part with require()
+        modules.
+        """
+        from core.roblox_types import RbxPart, RbxScript
+
+        pipeline = self._make_pipeline(tmp_path)
+        pipeline.state.rbx_place.scripts.extend([
+            RbxScript(name="HUD", source="-- hud\n", script_type="LocalScript"),
+            RbxScript(name="Util", source="return {}\n", script_type="ModuleScript"),
+        ])
+        template = RbxPart(name="X", class_name="Part")
+        template.attributes["_ScriptClass"] = "HUD"
+        template.attributes["_ScriptClass_2"] = "Util"
+        pipeline.state.rbx_place.replicated_templates.append(template)
+
+        pipeline._attach_monobehaviour_scripts_to_templates()
+
+        assert template.scripts == [], (
+            "Non-Script types must stay in their canonical containers."
+        )
+
+    def test_skips_ai_stub_scripts(self, tmp_path):
+        """Scripts whose body is an AI-transpilation-recommended stub
+        (no API key, no Claude CLI) must not be attached to the
+        template — the stub would shadow any later real implementation
+        and ship a placeholder to runtime.
+        """
+        from core.roblox_types import RbxPart, RbxScript
+
+        pipeline = self._make_pipeline(tmp_path)
+        pipeline.state.rbx_place.scripts.append(
+            RbxScript(
+                name="Stub",
+                source="-- AI transpilation recommended\nreturn nil\n",
+                script_type="Script",
+            )
+        )
+        template = RbxPart(name="X", class_name="Part")
+        template.attributes["_ScriptClass"] = "Stub"
+        pipeline.state.rbx_place.replicated_templates.append(template)
+
+        pipeline._attach_monobehaviour_scripts_to_templates()
+
+        assert template.scripts == []
+
+    def test_no_templates_is_noop(self, tmp_path):
+        """Pipelines that didn't emit any templates leave the call as a
+        no-op rather than crashing on missing state.
+        """
+        from core.roblox_types import RbxScript
+
+        pipeline = self._make_pipeline(tmp_path)
+        pipeline.state.rbx_place.scripts.append(
+            RbxScript(name="x", source="", script_type="Script"),
+        )
+        # No replicated_templates added.
+        pipeline._attach_monobehaviour_scripts_to_templates()  # must not raise
