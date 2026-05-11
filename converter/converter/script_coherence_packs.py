@@ -1767,15 +1767,41 @@ local function applyAreaDamage(originPos)
     end
 end
 '''
-    apply_hit_body = (
-        '    applyAreaDamage(rootPart.Position)\n'
-        '    container:Destroy()\n'
-    ) if splash_radius > 0 else (
+    # Direct-hit path (Humanoid model raycast hit). Splash bullets
+    # ALSO run this for the direct-hit damage, then splash; non-splash
+    # bullets only run direct-hit.
+    direct_hit_body = (
         '    model:SetAttribute("TakeDamage", damage)\n'
         '    local humanoid = model:FindFirstChildOfClass("Humanoid")\n'
         '    if humanoid then humanoid:TakeDamage(damage) end\n'
-        '    container:Destroy()\n'
     )
+    if splash_radius > 0:
+        apply_hit_body = (
+            direct_hit_body
+            + '    applyAreaDamage(rootPart.Position)\n'
+            + '    container:Destroy()\n'
+        )
+        # Non-character impact (wall, ground, prop) — splash bullets
+        # still explode and apply area damage. Mirrors Unity
+        # ``PlaneBullet.cs`` ``OnCollisionEnter`` which instantiates
+        # the explosion and runs ``OverlapSphere`` regardless of the
+        # collider's tag.
+        non_char_impact_body = (
+            '                consumed = true\n'
+            '                applyAreaDamage(rootPart.Position)\n'
+            '                container:Destroy()\n'
+            '                return\n'
+        )
+    else:
+        apply_hit_body = direct_hit_body + '    container:Destroy()\n'
+        # Direct-hit bullets just despawn on terrain/wall impact —
+        # matches Unity ``TurretBullet.cs`` whose ``OnCollisionEnter``
+        # only damages on player tag and otherwise destroys the bullet.
+        non_char_impact_body = (
+            '                consumed = true\n'
+            '                container:Destroy()\n'
+            '                return\n'
+        )
     return f'''\
 -- _AutoBulletRaycastInjected: bullet coherence pack
 -- Stud-space velocity + anti-gravity + raycast hit detection.
@@ -1888,11 +1914,11 @@ conn = RunService.Heartbeat:Connect(function()
                     return
                 end
             else
-                -- Hit non-character (terrain, wall, prop) — destroy.
-                consumed = true
-                container:Destroy()
-                return
-            end
+                -- Hit non-character (terrain, wall, prop). Splash
+                -- bullets explode here too; direct-hit bullets just
+                -- despawn. Behavior is template-controlled by
+                -- ``non_char_impact_body``.
+{non_char_impact_body}            end
         end
     end
     prevPos = curPos
@@ -1945,8 +1971,13 @@ def _replace_bullet_physics(scripts: list["RbxScript"]) -> int:
 # attribute server-side so the existing
 # ``GetAttributeChangedSignal`` listeners fire.
 
+# Match ANY local-variable ``:SetAttribute("TakeDamage", true)``
+# coming out of the AI transpile. Different runs name the local
+# ``hitInst``, ``hitPart``, ``hit``, ``instance``, etc. Capture
+# group 1 carries the var name so the injected FireServer call
+# references the same identifier the AI produced.
 _PLAYER_RAYCAST_HIT_RE = re.compile(
-    r'hitInst\s*:\s*SetAttribute\s*\(\s*["\']TakeDamage["\']\s*,\s*true\s*\)',
+    r'\b([A-Za-z_]\w*)\s*:\s*SetAttribute\s*\(\s*["\']TakeDamage["\']\s*,\s*true\s*\)',
 )
 
 
@@ -1972,14 +2003,28 @@ def _detect_player_damage_attr_set(scripts: list["RbxScript"]) -> bool:
 
 
 # Block inserted after the player's raycast SetAttribute. Fires the
-# RemoteEvent so a server router can mirror the attribute write.
-# The marker comment also pins idempotency.
-_PLAYER_DAMAGE_FIRE_INSERT = (
+# RemoteEvent so a server router can replay the raycast and mirror
+# the attribute write.
+#
+# The FireServer payload is ``(hitVar, originPos, lookDir)`` where
+# ``hitVar`` is the AI-named local for ``result.Instance``, and the
+# origin/direction come from ``workspace.CurrentCamera.CFrame``
+# (matches the client's own raycast contract: Unity Player.cs uses
+# the camera, not the character root). The server replays the
+# raycast from those values so legitimate over-cover shots aren't
+# rejected when ``HumanoidRootPart→hitInstance`` would be occluded.
+#
+# ``{hit_var}`` is substituted with the AI-named local at apply time.
+_PLAYER_DAMAGE_FIRE_TEMPLATE = (
     '\n            -- _AutoDamageRemoteEventInjected: mirror client damage to server\n'
     '            do\n'
     '                local _de = game:GetService("ReplicatedStorage")'
     ':FindFirstChild("DamageEvent")\n'
-    '                if _de then _de:FireServer(hitInst) end\n'
+    '                if _de then\n'
+    '                    local _cam = workspace.CurrentCamera\n'
+    '                    _de:FireServer({hit_var}, _cam.CFrame.Position, '
+    '_cam.CFrame.LookVector)\n'
+    '                end\n'
     '            end\n'
 )
 
@@ -1998,10 +2043,15 @@ _DAMAGE_ROUTER_SOURCE = '''\
 -- _AutoDamageEventRouter (auto-generated by player_damage_remote_event pack)
 -- Mirrors client-fired damage hits to server-side ``TakeDamage``
 -- attribute writes so server scripts listening via
--- ``GetAttributeChangedSignal`` actually fire. Validates each hit by
--- re-raycasting from the firing player's character to the reported
--- instance — anti-cheat guard against ``FireServer`` of arbitrary
--- workspace instances.
+-- ``GetAttributeChangedSignal`` actually fire.
+--
+-- The router replays the client's raycast on the server from the
+-- client-supplied camera origin + direction. Origin/direction are
+-- sanity-checked against the player's character (origin within
+-- ``MAX_ORIGIN_DRIFT_STUDS`` of the character's head/HRP, direction
+-- a unit vector). Without origin replay the server-from-HRP raycast
+-- rejects legitimate over-cover shots (Unity FPS Player.cs raycasts
+-- from the camera, not the character root).
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local STUDS_PER_METER = 3.571
@@ -2010,10 +2060,13 @@ local STUDS_PER_METER = 3.571
 -- intended hit. Adjust if your project's player script uses a
 -- different range.
 local MAX_SHOOT_RANGE_STUDS = 100 * STUDS_PER_METER * 1.5
--- Tolerance for the server-side raycast's hit-instance match. A
--- moving target between client raycast and server replay can land
--- the server hit on an adjacent part of the same Model; accept the
--- damage if both share an ancestor Model.
+-- Origin sanity bound: the client may shoot from a free-look camera
+-- offset from the character, but the camera shouldn't be more than
+-- a few avatars away from the player's HRP. 20 studs of slack covers
+-- normal first/third-person rigs without admitting arbitrary teleport
+-- spoofs.
+local MAX_ORIGIN_DRIFT_STUDS = 20
+
 local function _matchesIntendedHit(serverHit, intendedInst)
     if serverHit == intendedInst then return true end
     local serverModel = serverHit:FindFirstAncestorOfClass("Model")
@@ -2031,32 +2084,37 @@ if not de then
     de.Parent = ReplicatedStorage
 end
 
-de.OnServerEvent:Connect(function(player, hitInstance)
-    -- Type guard FIRST: a malicious client can ``FireServer(true)`` /
-    -- ``FireServer({})`` and the server must reject the payload
+de.OnServerEvent:Connect(function(player, hitInstance, originPos, lookDir)
+    -- Type guards FIRST: a malicious client can ``FireServer(true)``
+    -- / ``FireServer({})`` and the server must reject the payload
     -- before calling any Instance methods (would throw otherwise).
     if typeof(hitInstance) ~= "Instance" then return end
     if not hitInstance:IsA("BasePart") then return end
     if not hitInstance:IsDescendantOf(workspace) then return end
+    if typeof(originPos) ~= "Vector3" then return end
+    if typeof(lookDir) ~= "Vector3" then return end
+    if lookDir.Magnitude < 1e-3 then return end
 
-    -- Resolve the firing player's character + origin.
     local char = player.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
 
-    -- Distance gate: reject any hit beyond the weapon's effective range.
-    local toTarget = hitInstance.Position - hrp.Position
-    local dist = toTarget.Magnitude
-    if dist > MAX_SHOOT_RANGE_STUDS then return end
+    -- Origin must be close to the player's character (anti-teleport).
+    if (originPos - hrp.Position).Magnitude > MAX_ORIGIN_DRIFT_STUDS then
+        return
+    end
 
-    -- Line-of-sight + identity gate: re-raycast from the player's
-    -- character toward the reported hit. Server-authoritative — if
-    -- the ray doesn't land on the intended instance (or a sibling of
-    -- the same Model), drop the hit.
+    -- Server replay: cast from the client-supplied origin + direction.
+    -- Mirrors what the client's Player.cs raycast already did, so over-
+    -- cover camera shots are accepted just like in single-player.
     local rp = RaycastParams.new()
     rp.FilterDescendantsInstances = {char}
     rp.FilterType = Enum.RaycastFilterType.Exclude
-    local result = workspace:Raycast(hrp.Position, toTarget.Unit * (dist + 2), rp)
+    local result = workspace:Raycast(
+        originPos,
+        lookDir.Unit * MAX_SHOOT_RANGE_STUDS,
+        rp
+    )
     if not (result and _matchesIntendedHit(result.Instance, hitInstance)) then
         return
     end
@@ -2099,13 +2157,14 @@ def _inject_player_damage_remote_event(scripts: list["RbxScript"]) -> int:
         m = _PLAYER_RAYCAST_HIT_RE.search(s.source)
         if not m:
             continue
+        hit_var = m.group(1)
         # Insert after the model:SetAttribute("TakeDamage", true) line
         # so both the hit-instance and model writes complete before the
         # FireServer. Scope: look for the closing ``end`` of the
         # ``if model then ... end`` block immediately after the hit
         # SetAttribute. If absent, insert right after the hit line.
         anchor_re = re.compile(
-            r'(hitInst\s*:\s*SetAttribute\s*\(\s*["\']TakeDamage["\']\s*,\s*true\s*\)\s*\n'
+            rf'({re.escape(hit_var)}\s*:\s*SetAttribute\s*\(\s*["\']TakeDamage["\']\s*,\s*true\s*\)\s*\n'
             r'(?:\s*local\s+model\s*=[^\n]+\n)?'
             r'(?:\s*if\s+model\s+then\s+model\s*:\s*SetAttribute[^\n]+end\s*\n)?)',
         )
@@ -2113,13 +2172,17 @@ def _inject_player_damage_remote_event(scripts: list["RbxScript"]) -> int:
         if not anchor_m:
             continue
         insert_at = anchor_m.end()
+        insert_block = _PLAYER_DAMAGE_FIRE_TEMPLATE.replace(
+            "{hit_var}", hit_var,
+        )
         s.source = (
             s.source[:insert_at]
-            + _PLAYER_DAMAGE_FIRE_INSERT
+            + insert_block
             + s.source[insert_at:]
         )
         fixes += 1
-        log.info("  Patched '%s' to FireServer on raycast hit", s.name)
+        log.info("  Patched '%s' to FireServer (hit var=%s) on raycast hit",
+                 s.name, hit_var)
 
     # 2. Emit (or refresh) the auto-generated server router. Idempotent:
     # if a router with the canonical name exists, replace its source to

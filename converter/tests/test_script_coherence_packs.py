@@ -1856,8 +1856,10 @@ class TestPlayerDamageRemoteEvent:
         patched = scripts[0]
         # Marker comment present (idempotency anchor)
         assert "_AutoDamageRemoteEventInjected" in patched.source
-        # FireServer call present
-        assert "_de:FireServer(hitInst)" in patched.source
+        # FireServer call present with camera-origin payload
+        assert "_de:FireServer(hitInst" in patched.source
+        assert "_cam.CFrame.Position" in patched.source
+        assert "_cam.CFrame.LookVector" in patched.source
         # Insertion lands AFTER both SetAttribute lines
         hit_idx = patched.source.index(
             'hitInst:SetAttribute("TakeDamage", true)'
@@ -1865,7 +1867,7 @@ class TestPlayerDamageRemoteEvent:
         model_idx = patched.source.index(
             'model:SetAttribute("TakeDamage", true)'
         )
-        fire_idx = patched.source.index("_de:FireServer(hitInst)")
+        fire_idx = patched.source.index("_de:FireServer(hitInst")
         assert hit_idx < fire_idx, "FireServer must come after hitInst SetAttribute"
         assert model_idx < fire_idx, "FireServer must come after model SetAttribute"
 
@@ -1900,7 +1902,7 @@ class TestPlayerDamageRemoteEvent:
         assert len(routers) == 1
         # Only one FireServer call in the patched player source
         patched_player = scripts[0].source
-        assert patched_player.count("_de:FireServer(hitInst)") == 1
+        assert patched_player.count("_de:FireServer(hitInst") == 1
 
     def test_router_validates_distance_and_line_of_sight(self) -> None:
         """Codex round-1 [P1]: the auto-generated server router must NOT
@@ -1999,4 +2001,136 @@ class TestPlayerDamageRemoteEvent:
         assert type_idx < first_inst_method, (
             "typeof guard must precede any Instance method call so a "
             "non-Instance payload is rejected cleanly."
+        )
+
+    def test_detector_matches_arbitrary_hit_var_name(self) -> None:
+        """Codex round-3 [P1]: AI transpile may name the raycast-result
+        local ``hitPart``, ``hit``, ``instance``, etc. The detector
+        must match any identifier, not just ``hitInst``. Without this,
+        the pack silently skips real Player.luau outputs and the
+        DamageEvent path stays unwired.
+        """
+        s = RbxScript(
+            name="Player",
+            source=(
+                'local result = workspace:Raycast(origin, dir, rp)\n'
+                'if result then\n'
+                '    local hitPart = result.Instance\n'
+                '    hitPart:SetAttribute("TakeDamage", true)\n'
+                'end\n'
+            ),
+            script_type="LocalScript",
+        )
+        assert packs_module._detect_player_damage_attr_set([s]) is True
+
+    def test_apply_uses_captured_hit_var_name(self) -> None:
+        """Codex round-3 [P1]: when the AI transpile uses ``hitPart``,
+        the inserted ``FireServer`` call must reference ``hitPart``, not
+        a hard-coded ``hitInst``. Otherwise the patched source refers
+        to an undefined variable and crashes at runtime.
+        """
+        s = RbxScript(
+            name="Player",
+            source=(
+                'local result = workspace:Raycast(origin, dir, rp)\n'
+                'if result then\n'
+                '    local hitPart = result.Instance\n'
+                '    hitPart:SetAttribute("TakeDamage", true)\n'
+                'end\n'
+            ),
+            script_type="LocalScript",
+        )
+        packs_module._inject_player_damage_remote_event([s])
+        assert "_de:FireServer(hitPart" in s.source, (
+            "FireServer must reference the AI-captured hit variable "
+            "name (here ``hitPart``), not a hard-coded ``hitInst``."
+        )
+        assert "FireServer(hitInst" not in s.source, (
+            "Stale hard-coded hitInst would crash at runtime when the "
+            "AI named the local ``hitPart``."
+        )
+
+    def test_router_replays_from_client_camera_origin(self) -> None:
+        """Codex round-3 [P2]: server raycast must replay from the
+        client-supplied camera origin/direction (not from
+        HumanoidRootPart). Otherwise legitimate over-cover shots get
+        rejected because the HRP→hitInstance line is occluded even
+        though the camera could see the target.
+
+        The router takes ``originPos`` and ``lookDir`` as RemoteEvent
+        payload args and uses those in its ``workspace:Raycast`` call.
+        """
+        scripts = [self._player_script_with_hit()]
+        packs_module._inject_player_damage_remote_event(scripts)
+        router = next(s for s in scripts if s.name == "_AutoDamageEventRouter")
+        src = router.source
+        # Router signature accepts originPos + lookDir
+        assert "OnServerEvent:Connect(function(player, hitInstance, originPos, lookDir)" in src
+        # Origin sanity bound vs the player's HRP (anti-teleport)
+        assert "MAX_ORIGIN_DRIFT_STUDS" in src
+        # Server replay uses originPos / lookDir, NOT hrp.Position
+        assert "workspace:Raycast(\n        originPos," in src
+        assert "lookDir.Unit" in src
+        # Client-side patch injects camera origin/direction
+        patched_player = scripts[0].source
+        assert "workspace.CurrentCamera" in patched_player
+        assert "_cam.CFrame.Position" in patched_player
+        assert "_cam.CFrame.LookVector" in patched_player
+
+    def test_plane_bullet_splash_fires_on_wall_impact(self) -> None:
+        """Codex round-3 [P1]: PlaneBullet's splash damage must fire
+        when the bullet hits ANY surface (terrain, wall, prop), not
+        just a Humanoid model. Unity's ``PlaneBullet.cs``
+        ``OnCollisionEnter`` instantiates the explosion + runs
+        ``Physics.OverlapSphere(2)`` regardless of the collider's tag.
+
+        Pin the non-character impact branch: it must call
+        ``applyAreaDamage(rootPart.Position)`` for splash bullets.
+        """
+        s = RbxScript(
+            name="PlaneBullet",
+            source=(
+                'local rb = script.Parent\n'
+                'rb:ApplyImpulse(Vector3.new(0, 0, 1) * 200)\n'
+                'rb.Touched:Connect(function() end)\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._replace_bullet_physics([s])
+        # Both branches in the raycast hit-detector apply splash:
+        #   - direct hit on Humanoid: ``applyAreaDamage(...)``
+        #   - non-character impact (wall/ground): ``applyAreaDamage(...)``
+        # so PlaneBullets that land beside the player still hurt them.
+        non_char_branch = s.source[s.source.index("else"):]
+        assert "applyAreaDamage(rootPart.Position)" in non_char_branch, (
+            "PlaneBullet's non-character impact branch must call "
+            "applyAreaDamage so near-miss shots damage nearby players."
+        )
+
+    def test_turret_bullet_non_char_branch_just_destroys(self) -> None:
+        """Companion to the PlaneBullet splash test: TurretBullet has
+        no splash in Unity, so its non-character impact branch should
+        just destroy the bullet without trying to apply area damage.
+        """
+        s = RbxScript(
+            name="TurretBullet",
+            source=(
+                'local rootPart = script.Parent\n'
+                'rootPart:ApplyImpulse(Vector3.new(0, 0, 1) * 60)\n'
+                'rootPart.Touched:Connect(function() end)\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._replace_bullet_physics([s])
+        # TurretBullet's non-character impact branch must NOT splash.
+        # Slice from the ``else`` of the Humanoid-check (the non-char
+        # branch) up to the next ``end``, and confirm splash is absent.
+        non_char_branch = s.source[s.source.index("else"):]
+        # Bound the slice to just the non-character ``else`` block so a
+        # later ``applyAreaDamage`` defined elsewhere can't fool the test.
+        end_idx = non_char_branch.find("end\n")
+        non_char_branch = non_char_branch[:end_idx] if end_idx > 0 else non_char_branch
+        assert "applyAreaDamage" not in non_char_branch, (
+            "TurretBullet has no Unity splash damage — non-character "
+            "impact must just destroy the bullet."
         )
