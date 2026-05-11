@@ -2261,21 +2261,25 @@ de.OnServerEvent:Connect(function(player, hitInstance, originPos, lookDir)
         return
     end
 
-    -- Validated. Apply the attribute writes server-side using an
-    -- incrementing token so ``GetAttributeChangedSignal`` fires on
-    -- EVERY hit — a repeated ``SetAttribute(..., true)`` write only
-    -- fires the signal once because the value didn't change. The
-    -- Player.cs AI transpile uses the same incrementing form for the
-    -- same reason; preserve that semantics on the server side so
-    -- back-to-back shots all register.
+    -- Validated. Apply the attribute writes server-side. Use the
+    -- numeric incrementing form so:
+    --   1. ``GetAttributeChangedSignal`` fires on EVERY hit (a
+    --      repeated ``SetAttribute(..., true)`` write doesn't change
+    --      the value, so the signal only fires once).
+    --   2. Listeners that read ``TakeDamage`` as a number (e.g. the
+    --      converted ``unity-3d-simplefps`` Player listener that uses
+    --      the attribute value as the damage amount) actually see
+    --      usable data instead of ``true``.
+    --
+    -- Seed with ``1`` when the attribute is absent or non-numeric;
+    -- bump by +1 thereafter. Boolean listeners still react to either
+    -- transition (any non-nil truthy value satisfies ``if attr then``).
     local function _bumpTakeDamage(inst)
         local cur = inst:GetAttribute("TakeDamage")
         if typeof(cur) == "number" then
             inst:SetAttribute("TakeDamage", cur + 1)
         else
-            -- First write (boolean form) — leaves listeners using the
-            -- canonical ``true`` literal happy too.
-            inst:SetAttribute("TakeDamage", true)
+            inst:SetAttribute("TakeDamage", 1)
         end
     end
     _bumpTakeDamage(hitInstance)
@@ -2346,15 +2350,30 @@ def _inject_player_damage_remote_event(scripts: list["RbxScript"]) -> int:
         # FireServer. Scope: look for the closing ``end`` of the
         # ``if model then ... end`` block immediately after the hit
         # SetAttribute. If absent, insert right after the hit line.
-        # Anchor on the captured hit-var SetAttribute call. Tolerates
-        # both the canonical ``true`` literal AND the incrementing
-        # ``(GetAttribute("TakeDamage") or 0) + 1`` shape (which has
-        # nested parens, so consume up to the next newline rather
-        # than the next `)`).
+        # Anchor on the captured hit-var SetAttribute call. Tolerates:
+        #   - both the canonical ``true`` literal AND the incrementing
+        #     ``(GetAttribute("TakeDamage") or 0) + 1`` shape (nested
+        #     parens, so consume up to the next newline rather than ``)``).
+        #   - optional ``local model = hitInst:FindFirstAncestor...``
+        #     line right after the SetAttribute.
+        #   - both single-line ``if model then model:SetAttribute(...) end``
+        #     and multi-line forms that wrap the SetAttribute on its
+        #     own line. Codex round-8 [P1] flagged that the multi-line
+        #     shape (already present in some converter outputs) didn't
+        #     match the single-line anchor and silently skipped the
+        #     FireServer injection.
         anchor_re = re.compile(
             rf'({re.escape(hit_var)}\s*:\s*SetAttribute\s*\(\s*["\']TakeDamage["\'][^\n]*\n'
             r'(?:\s*local\s+model\s*=[^\n]+\n)?'
-            r'(?:\s*if\s+model\s+then\s+model\s*:\s*SetAttribute[^\n]+end\s*\n)?)',
+            # Single-line: ``if model then model:SetAttribute(...) end``
+            r'(?:\s*if\s+model\s+then\s+model\s*:\s*SetAttribute[^\n]+end\s*\n'
+            # Multi-line:
+            #   if model then
+            #       model:SetAttribute("TakeDamage", ...)
+            #   end
+            r'|\s*if\s+model\s+then\s*\n'
+            r'\s*model\s*:\s*SetAttribute[^\n]+\n'
+            r'\s*end\s*\n)?)',
         )
         anchor_m = anchor_re.search(s.source)
         if not anchor_m:

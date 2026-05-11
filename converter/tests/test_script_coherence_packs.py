@@ -2422,22 +2422,72 @@ class TestPlayerDamageRemoteEvent:
         first hit fires GetAttributeChangedSignal and every later hit
         is a no-change write (already true) — listeners stop firing.
 
-        The router must preserve the incrementing semantics: bump the
-        counter on every validated hit so the change signal fires on
-        every shot. Fall back to ``true`` only when the attribute
-        isn't yet a number (first write on a fresh target).
+        Codex round-8 [P1] additionally: seeding with ``true`` breaks
+        listeners that read ``TakeDamage`` as a number (e.g. the
+        unity-3d-simplefps Player uses the attribute value as the
+        damage amount). Router must always seed numerically.
+
+        Pin: numeric branch (bump cur + 1), numeric seed (=1 when
+        absent or non-numeric).
         """
         scripts = [self._player_script_with_hit()]
         packs_module._inject_player_damage_remote_event(scripts)
         router = next(s for s in scripts if s.name == "_AutoDamageEventRouter")
         src = router.source
-        # Helper that bumps the existing number, or seeds with true.
         assert "_bumpTakeDamage" in src
         # Numeric bump branch
         assert 'typeof(cur) == "number"' in src
         assert "cur + 1" in src
-        # Boolean fallback for fresh writes
-        assert 'SetAttribute("TakeDamage", true)' in src
+        # Numeric seed for fresh writes (not ``true``)
+        assert 'SetAttribute("TakeDamage", 1)' in src
+        # Confirm the router does NOT seed with the boolean ``true``
+        # (round-8 [P1]: numeric listeners would silently no-op).
+        assert 'SetAttribute("TakeDamage", true)' not in src
         # Called on both the hit instance and the enclosing Model
         assert "_bumpTakeDamage(hitInstance)" in src
         assert "_bumpTakeDamage(m)" in src
+
+    def test_apply_handles_multiline_if_model_block(self) -> None:
+        """Codex round-8 [P1]: the AI transpile sometimes formats the
+        ``if model then`` model-SetAttribute as a multi-line block:
+
+            if model then
+                model:SetAttribute("TakeDamage", true)
+            end
+
+        The round-7 anchor only matched the single-line form, so
+        scripts with the multi-line shape silently skipped the
+        FireServer injection. Detector still fires, so the router
+        gets emitted but the client side stays unpatched — hits stay
+        client-only.
+
+        Pin: the anchor handles both shapes.
+        """
+        s = RbxScript(
+            name="Player",
+            source=(
+                'local result = workspace:Raycast(origin, dir, rp)\n'
+                'if result then\n'
+                '    local hitInst = result.Instance\n'
+                '    hitInst:SetAttribute("TakeDamage", true)\n'
+                '    local model = hitInst:FindFirstAncestorOfClass("Model")\n'
+                '    if model then\n'
+                '        model:SetAttribute("TakeDamage", true)\n'
+                '    end\n'
+                'end\n'
+            ),
+            script_type="LocalScript",
+        )
+        scripts = [s]
+        fixes = packs_module._inject_player_damage_remote_event(scripts)
+        assert fixes >= 1
+        # FireServer present in the patched body
+        assert "_de:FireServer(hitInst" in s.source
+        # Inserted AFTER the multi-line ``if model then ... end`` block
+        end_idx = s.source.index("        model:SetAttribute(\"TakeDamage\", true)")
+        end_block = s.source.index("    end\n", end_idx) + len("    end\n")
+        fire_idx = s.source.index("_de:FireServer(hitInst")
+        assert fire_idx >= end_block, (
+            "FireServer block must follow the multi-line ``if model then`` "
+            "section, not be inserted inside or before it."
+        )
