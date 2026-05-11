@@ -1770,6 +1770,38 @@ class TestBulletPhysicsRaycast:
         assert "local force = 60" in s.source
         assert "applyAreaDamage" not in s.source
 
+    def test_detector_matches_helper_local_names(self) -> None:
+        """Codex round-2 [P1]: the real ``PlaneBullet.luau`` transpile
+        uses ``rb:ApplyImpulse(...)`` and ``part.Touched:Connect(...)``,
+        NOT ``rootPart``. Round-1's detector hard-coded the
+        ``rootPart`` literal and skipped the pack on the actual output.
+        The detector must match any local-variable name so PlaneBullet
+        (and any future bullet that names its locals differently) gets
+        replaced.
+        """
+        s = RbxScript(
+            name="PlaneBullet",
+            source=(
+                'local function getPart() return script.Parent end\n'
+                'local function getRb() return getPart() end\n'
+                'local function start()\n'
+                '    local rb = getRb()\n'
+                '    if rb and not rb.Anchored then\n'
+                '        rb:ApplyImpulse(Vector3.new(0, 0, 1) * 200)\n'
+                '    end\n'
+                'end\n'
+                'local part = getPart()\n'
+                'if part then\n'
+                '    part.Touched:Connect(function(other) end)\n'
+                'end\n'
+            ),
+            script_type="Script",
+        )
+        assert packs_module._detect_bullet_unity_transpile([s]) is True
+        fixes = packs_module._replace_bullet_physics([s])
+        assert fixes == 1, "real PlaneBullet transpile must be replaced"
+        assert "_AutoBulletRaycastInjected" in s.source
+
 
 class TestPlayerDamageRemoteEvent:
     """The ``player_damage_remote_event`` pack solves the
@@ -1896,3 +1928,75 @@ class TestPlayerDamageRemoteEvent:
         assert "_matchesIntendedHit" in src
         # Hostile-input guard: the FireServer payload must be a BasePart.
         assert ':IsA("BasePart")' in src
+
+    def test_detector_skips_server_script_player(self) -> None:
+        """Codex round-2 [P2]: storage-classifier sometimes leaves
+        ``Player`` as a server ``Script`` instead of ``LocalScript``.
+        The pack must NOT inject ``FireServer`` into a server script
+        (would error at runtime). Detector skips Player when
+        script_type != "LocalScript".
+        """
+        s = RbxScript(
+            name="Player",
+            source=(
+                'local function shoot()\n'
+                '    local result = workspace:Raycast(origin, dir, rp)\n'
+                '    if result then\n'
+                '        local hitInst = result.Instance\n'
+                '        hitInst:SetAttribute("TakeDamage", true)\n'
+                '    end\n'
+                'end\n'
+            ),
+            script_type="Script",  # server, NOT LocalScript
+        )
+        assert packs_module._detect_player_damage_attr_set([s]) is False
+
+    def test_apply_skips_server_script_player(self) -> None:
+        """Defense in depth: even if the detector mis-classifies, the
+        apply path must also gate on ``script_type == LocalScript`` so
+        a server Player script never gets ``FireServer`` injected.
+        """
+        s = RbxScript(
+            name="Player",
+            source=(
+                'local result = workspace:Raycast(origin, dir, rp)\n'
+                'if result then\n'
+                '    local hitInst = result.Instance\n'
+                '    hitInst:SetAttribute("TakeDamage", true)\n'
+                'end\n'
+            ),
+            script_type="Script",  # server
+        )
+        scripts = [s]
+        packs_module._inject_player_damage_remote_event(scripts)
+        # The Player source stays untouched
+        assert "_AutoDamageRemoteEventInjected" not in s.source
+        assert "_de:FireServer" not in s.source
+
+    def test_router_type_guards_payload_before_instance_methods(self) -> None:
+        """Codex round-2 [P2]: the server router must reject non-Instance
+        payloads (``true``, ``{}``, strings) BEFORE calling
+        ``IsDescendantOf`` / ``IsA`` on them. Otherwise a malicious or
+        malformed ``FireServer`` throws at runtime instead of being
+        cleanly dropped.
+
+        Pin the type guard ordering: ``typeof(hitInstance) == "Instance"``
+        check appears in source BEFORE the first Instance-method call.
+        """
+        scripts = [self._player_script_with_hit()]
+        packs_module._inject_player_damage_remote_event(scripts)
+        router = next(s for s in scripts if s.name == "_AutoDamageEventRouter")
+        src = router.source
+
+        # The typeof check exists
+        type_idx = src.find('typeof(hitInstance) ~= "Instance"')
+        assert type_idx >= 0, "typeof guard must be present"
+
+        # The first Instance method call (IsDescendantOf / IsA) lives AFTER the typeof guard
+        desc_idx = src.find(':IsDescendantOf(workspace)')
+        isa_idx = src.find(':IsA("BasePart")')
+        first_inst_method = min(i for i in (desc_idx, isa_idx) if i >= 0)
+        assert type_idx < first_inst_method, (
+            "typeof guard must precede any Instance method call so a "
+            "non-Instance payload is rejected cleanly."
+        )

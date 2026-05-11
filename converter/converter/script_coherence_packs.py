@@ -1697,11 +1697,18 @@ def _inject_door_tween(scripts: list["RbxScript"]) -> int:
 #     the current to catch tunnel-through hits
 #   - Adds a visible ``Trail`` so the trajectory reads in-game
 
+# Match ANY local-variable ApplyImpulse / Touched:Connect — the AI
+# transpile of Unity's bullet scripts uses different local names
+# across runs (``rootPart``, ``rb``, ``part``, ``container``, etc.).
+# Codex round-2 found PlaneBullet skipped because the prior regex
+# only matched the literal ``rootPart`` form. The bullet-name scope
+# (``TurretBullet`` / ``PlaneBullet`` only) still gates the pack
+# from touching unrelated impulse-using scripts.
 _BULLET_DETECT_RE = re.compile(
-    r'rootPart\s*:\s*ApplyImpulse\s*\([^)]*\)',
+    r'\b\w+\s*:\s*ApplyImpulse\s*\(',
 )
 _BULLET_TOUCHED_RE = re.compile(
-    r'rootPart\.Touched\s*:\s*Connect',
+    r'\b\w+\.Touched\s*:\s*Connect\b',
 )
 
 
@@ -1944,10 +1951,17 @@ _PLAYER_RAYCAST_HIT_RE = re.compile(
 
 
 def _detect_player_damage_attr_set(scripts: list["RbxScript"]) -> bool:
+    """Match only LocalScript Player bodies. ``FireServer`` is client-
+    only, so injecting it into a server ``Script`` would crash at
+    runtime on the first shot. Server classifications happen on
+    converted projects whose Player.cs was misclassified by the
+    storage-classifier — defending here keeps the pack from poisoning
+    those builds.
+    """
     for s in scripts:
         if s.name != "Player":
             continue
-        if s.script_type not in ("LocalScript", "Script"):
+        if s.script_type != "LocalScript":
             continue
         if (
             _PLAYER_RAYCAST_HIT_RE.search(s.source)
@@ -2018,12 +2032,12 @@ if not de then
 end
 
 de.OnServerEvent:Connect(function(player, hitInstance)
-    if not (hitInstance and hitInstance:IsDescendantOf(workspace)) then
-        return
-    end
-    if not (typeof(hitInstance) == "Instance" and hitInstance:IsA("BasePart")) then
-        return
-    end
+    -- Type guard FIRST: a malicious client can ``FireServer(true)`` /
+    -- ``FireServer({})`` and the server must reject the payload
+    -- before calling any Instance methods (would throw otherwise).
+    if typeof(hitInstance) ~= "Instance" then return end
+    if not hitInstance:IsA("BasePart") then return end
+    if not hitInstance:IsDescendantOf(workspace) then return end
 
     -- Resolve the firing player's character + origin.
     local char = player.Character
@@ -2074,9 +2088,11 @@ def _detect_player_or_router_present(scripts: list["RbxScript"]) -> bool:
 )
 def _inject_player_damage_remote_event(scripts: list["RbxScript"]) -> int:
     fixes = 0
-    # 1. Patch every Player script's raycast hit branch to FireServer.
+    # 1. Patch every Player LocalScript's raycast hit branch to FireServer.
+    # Server ``Script`` classifications are skipped — ``FireServer`` is
+    # client-only and would error on the first shot.
     for s in scripts:
-        if s.name != "Player":
+        if s.name != "Player" or s.script_type != "LocalScript":
             continue
         if "_AutoDamageRemoteEventInjected" in s.source:
             continue
