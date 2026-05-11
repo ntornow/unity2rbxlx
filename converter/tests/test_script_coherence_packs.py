@@ -1636,15 +1636,18 @@ class TestDoorTweenOpen:
         assert fixes == 0
         assert "_AutoFpsDoorTweenInjected" not in s.source
 
-    def test_detector_skips_when_animation_phase_already_emitted_driver(
+    def test_injected_body_defers_to_animation_driver_at_runtime(
         self,
     ) -> None:
-        """Codex round-6 [P1]: when the animation phase already emitted
-        ``Anim_Door_door_open.luau`` / ``Anim_Door_door_close.luau``
-        (canonical names from ``animation_converter``), the door
-        already has a tween driver. Injecting a second
-        ``GetAttributeChangedSignal("open")`` listener double-animates
-        the part (overshoot/jitter). The pack must skip.
+        """Codex round-10 [P2]: animation_converter emits drivers
+        per controller/scope, not project-wide all-or-nothing. The
+        pack runs even when a driver exists project-wide; the
+        INJECTED tween body carries a runtime coexistence guard that
+        scans the door's parent prefab + ReplicatedStorage for any
+        ``Anim_(<Prefab>_)?door_(open|close)`` script and defers to
+        it when found.
+
+        Pin: the body source contains the runtime guard helper.
         """
         scripts = [
             self._door_with_attr_set(),
@@ -1653,19 +1656,22 @@ class TestDoorTweenOpen:
                 source="-- animation phase driver\n",
                 script_type="Script",
             ),
-            RbxScript(
-                name="Anim_Door_door_close",
-                source="-- animation phase driver\n",
-                script_type="Script",
-            ),
         ]
-        assert packs_module._detect_door_tween_target(scripts) is False
-        # Defense in depth: even if apply is called directly, it must
-        # also skip the inject.
-        fixes = packs_module._inject_door_tween(scripts)
-        assert fixes == 0
-        # Door source unchanged
-        assert "_AutoFpsDoorTweenInjected" not in scripts[0].source
+        # Pack still fires at place-level — the per-door runtime
+        # guard handles coexistence.
+        assert packs_module._detect_door_tween_target(scripts) is True
+        packs_module._inject_door_tween(scripts)
+        assert "_AutoFpsDoorTweenInjected" in scripts[0].source
+        # Runtime guard helper present in the injected body.
+        assert "_hasAnimDriver" in scripts[0].source
+        # Guard scans the door's prefab Model AND ReplicatedStorage.
+        assert "_parent:GetDescendants()" in scripts[0].source
+        assert 'game:GetService("ReplicatedStorage")' in scripts[0].source
+        # Tolerates spaces / mixed case in prefab names (round-10 [P2]).
+        assert "string.lower(name)" in scripts[0].source
+        # Anchored patterns match both prefab-scoped and scene-scoped.
+        assert '"^anim_door_open$"' in scripts[0].source
+        assert '"^anim_.+_door_open$"' in scripts[0].source
 
     def test_detector_fires_when_no_animation_driver(self) -> None:
         """Sanity check the negative case: when no Anim_*_door_*
@@ -1675,49 +1681,36 @@ class TestDoorTweenOpen:
         scripts = [self._door_with_attr_set()]
         assert packs_module._detect_door_tween_target(scripts) is True
 
-    def test_detector_skips_scene_scoped_anim_names(self) -> None:
-        """Codex round-7 [P1]: scene-baked doors (not prefab-bound)
-        get scene-scoped animation drivers named ``Anim_door_open``
-        / ``Anim_door_close`` (without a prefab prefix). Round-6's
-        regex only matched the longer prefab-scoped form, so those
-        doors silently got a second tween listener → double-animate.
+    def test_anim_name_match_tolerates_spaces_and_case(self) -> None:
+        """Codex round-10 [P2]: ``animation_converter`` names drivers
+        from raw prefab + controller + clip display names. Those can
+        carry spaces, dashes, and mixed case. The Python ``_DOOR_
+        EXISTING_ANIM_PATTERNS`` are case-insensitive and accept any
+        non-newline characters. The injected runtime guard's Lua
+        patterns are also case-insensitive (via ``string.lower``).
 
-        The detector must recognize BOTH name shapes.
+        Pin: representative variants all match.
         """
-        scripts = [
-            self._door_with_attr_set(),
-            RbxScript(
-                name="Anim_door_open",
-                source="-- scene-scoped driver\n",
-                script_type="Script",
-            ),
-            RbxScript(
-                name="Anim_door_close",
-                source="-- scene-scoped driver\n",
-                script_type="Script",
-            ),
-        ]
-        assert packs_module._detect_door_tween_target(scripts) is False
-        fixes = packs_module._inject_door_tween(scripts)
-        assert fixes == 0
-        assert "_AutoFpsDoorTweenInjected" not in scripts[0].source
+        for name in (
+            "Anim_SciFi Door_door_Open",
+            "Anim_SciFi-Door_door_close",
+            "Anim_DOOR_door_OPEN",
+            "Anim_door_close",
+        ):
+            assert any(
+                p.match(name) for p in packs_module._DOOR_EXISTING_ANIM_PATTERNS
+            ), f"pattern set must match {name!r}"
 
-    def test_pack_skips_when_any_anim_driver_present(self) -> None:
-        """Codex round-9 [P1]: the round-7 heuristic counted ``Door``
-        scripts in the flat list as a proxy for door INSTANCES, but
-        ``_bind_scripts_to_parts`` clones one shared ``Door`` script
-        onto every door part later. A project with N door prefabs
-        sharing a single ``Door.cs`` has ONE ``Door`` script in the
-        flat list, so a single driver pair was enough to satisfy the
-        ``driver_count >= 2 * door_count`` ratio — and the fallback
-        was silently skipped even though other door prefabs were
-        uncovered.
+    def test_pack_still_fires_when_anim_driver_present(self) -> None:
+        """Codex round-10 [P2]: ``animation_converter`` emits drivers
+        per controller/scope. A project with one converted door
+        driver and another Door script whose clips weren't emitted
+        must still get the fallback for the uncovered door. Round-9's
+        project-wide bail left those uncovered doors stuck closed.
 
-        The corrected policy: animation phase is project-level
-        (``animation_converter`` runs all-or-nothing for door clips).
-        If ANY driver script is present, ALL intended doors have
-        animation drivers, so the fallback is a project-wide no-op.
-        Otherwise the fallback runs.
+        New policy: pack always fires when a Door needs the marker;
+        the INJECTED body's runtime guard handles coexistence with
+        any matching ``Anim_*_door_*`` driver at runtime.
         """
         scripts = [
             self._door_with_attr_set(),
@@ -1732,9 +1725,9 @@ class TestDoorTweenOpen:
                 script_type="Script",
             ),
         ]
-        assert packs_module._detect_door_tween_target(scripts) is False
+        assert packs_module._detect_door_tween_target(scripts) is True
         fixes = packs_module._inject_door_tween(scripts)
-        assert fixes == 0
+        assert fixes == 1
 
     def test_pack_fires_when_no_driver_present(self) -> None:
         """Reciprocal: pack runs when no driver script is present in
@@ -2211,8 +2204,12 @@ class TestPlayerDamageRemoteEvent:
         packs_module._inject_player_damage_remote_event(scripts)
         router = next(s for s in scripts if s.name == "_AutoDamageEventRouter")
         src = router.source
-        # Router signature accepts originPos + lookDir
-        assert "OnServerEvent:Connect(function(player, hitInstance, originPos, lookDir)" in src
+        # Router signature accepts takeDamageValue + originPos + lookDir
+        # (round-10 [P1]: server preserves the client's payload value).
+        assert (
+            "OnServerEvent:Connect(function(player, hitInstance, "
+            "takeDamageValue, originPos, lookDir)"
+        ) in src
         # Origin sanity bound vs the player's HRP (anti-teleport)
         assert "MAX_ORIGIN_DRIFT_STUDS" in src
         # Server replay uses originPos / lookDir, NOT hrp.Position
@@ -2408,37 +2405,32 @@ class TestPlayerDamageRemoteEvent:
         # Player source unchanged (already patched).
         assert patched_player.source.count("_de:FireServer") == 1
 
-    def test_router_uses_incrementing_token_for_repeated_hits(self) -> None:
-        """Codex round-6 [P2]: the detector matches the incrementing
-        ``:SetAttribute("TakeDamage", (Get... or 0) + 1)`` form, but
-        if the router writes ``SetAttribute(..., true)`` then the
-        first hit fires GetAttributeChangedSignal and every later hit
-        is a no-change write (already true) — listeners stop firing.
+    def test_router_preserves_client_takedamage_value(self) -> None:
+        """Codex round-10 [P1]: the server router must mirror the
+        client's ``TakeDamage`` payload VERBATIM rather than
+        synthesizing a counter. Listeners that read the attribute as
+        the damage amount (e.g. unity-3d-simplefps) need the original
+        value; a server-side counter discards that data.
 
-        Codex round-8 [P1] additionally: seeding with ``true`` breaks
-        listeners that read ``TakeDamage`` as a number (e.g. the
-        unity-3d-simplefps Player uses the attribute value as the
-        damage amount). Router must always seed numerically.
-
-        Pin: numeric branch (bump cur + 1), numeric seed (=1 when
-        absent or non-numeric).
+        Pin: router writes ``takeDamageValue`` directly, with a
+        nil/false coerce-to-``true`` for malformed client payloads.
         """
         scripts = [self._player_script_with_hit()]
         packs_module._inject_player_damage_remote_event(scripts)
         router = next(s for s in scripts if s.name == "_AutoDamageEventRouter")
         src = router.source
-        assert "_bumpTakeDamage" in src
-        # Numeric bump branch
-        assert 'typeof(cur) == "number"' in src
-        assert "cur + 1" in src
-        # Numeric seed for fresh writes (not ``true``)
-        assert 'SetAttribute("TakeDamage", 1)' in src
-        # Confirm the router does NOT seed with the boolean ``true``
-        # (round-8 [P1]: numeric listeners would silently no-op).
-        assert 'SetAttribute("TakeDamage", true)' not in src
-        # Called on both the hit instance and the enclosing Model
-        assert "_bumpTakeDamage(hitInstance)" in src
-        assert "_bumpTakeDamage(m)" in src
+        # Server writes the client-supplied value, not a synthetic counter.
+        assert 'SetAttribute("TakeDamage", takeDamageValue)' in src
+        # Nil-coerce to true for malformed payloads so a listener
+        # doing ``if attr then`` still reacts.
+        assert "takeDamageValue == nil" in src
+        # No counter helper or synthetic +1 logic.
+        assert "_bumpTakeDamage" not in src
+        assert "cur + 1" not in src
+        # Client patch reads the value back via GetAttribute and sends it.
+        patched_player = scripts[0].source
+        assert 'GetAttribute("TakeDamage")' in patched_player
+        assert "_de:FireServer(hitInst, _td" in patched_player
 
     def test_apply_handles_multiline_if_model_block(self) -> None:
         """Codex round-8 [P1]: the AI transpile sometimes formats the

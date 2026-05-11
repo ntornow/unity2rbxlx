@@ -1599,9 +1599,15 @@ _DOOR_SIBLING_LOOKUP_RE = re.compile(
 # clip names. Codex round-7 [P1]: the scene-scoped form was missing
 # from the prior regex, so scene-baked doors got a second listener
 # and double-animated.
+# Animation drivers names come from ``animation_converter``, which
+# composes them from prefab + controller + clip display names. Those
+# display names can carry spaces, dashes, mixed case ("SciFi Door",
+# "Open" vs "open"). Match case-insensitively and allow any non-_
+# characters in the prefab/controller slot. The trailing
+# ``(open|close)`` clip name is matched case-insensitively too.
 _DOOR_EXISTING_ANIM_PATTERNS = (
-    re.compile(r'^Anim_[\w]+_door_(open|close)$'),
-    re.compile(r'^Anim_door_(open|close)$'),
+    re.compile(r'^Anim_.+_door_(open|close)$', re.IGNORECASE),
+    re.compile(r'^Anim_door_(open|close)$', re.IGNORECASE),
 )
 
 
@@ -1621,24 +1627,19 @@ def _detect_door_tween_target(scripts: list["RbxScript"]) -> bool:
     """Detect whether at least one ``Door`` script in ``scripts``
     needs the tween fallback.
 
-    Coverage policy: if ANY ``Anim_(<Prefab>_)?door_(open|close)``
-    driver exists in the project, suppress the fallback. Codex
-    round-9 [P1]: ``door_count`` from the flat ``place.scripts``
-    list isn't a count of door instances — ``_bind_scripts_to_parts``
-    clones one shared ``Door`` script onto every door part later, so
-    a project with N door prefabs sharing a single ``Door.cs`` has
-    only ONE ``Door`` script in the flat list. The earlier ratio
-    heuristic (``driver_count >= 2 * door_count``) thus mis-treated
-    those projects as "fully covered" with a single driver pair, and
-    silently skipped the fallback project-wide.
+    Coverage policy: the injected tween body carries a RUNTIME
+    coexistence guard (scans the door's parent prefab + RS for an
+    ``Anim_(<Prefab>_)?door_*`` script). So pack-level we only need
+    to identify Door scripts that haven't been marked yet — the
+    runtime guard makes the body a no-op when an animation driver
+    is actually present on the same door instance.
 
-    The presence of any driver is sufficient evidence that the
-    animation phase emitted door-clip drivers; ``animation_converter``
-    runs project-level (all-or-nothing for door clips). When it
-    didn't fire, NO driver scripts exist and the fallback runs.
+    Codex round-10 [P2]: ``animation_converter`` emits drivers per
+    controller/scope, NOT as a project-wide all-or-nothing pass.
+    Detecting at pack-level on ANY driver presence would skip the
+    fallback for uncovered doors in mixed projects. Push the
+    coexistence check to runtime where it's per-instance.
     """
-    if _door_has_animation_driver(scripts):
-        return False
     for s in scripts:
         if s.name != "Door":
             continue
@@ -1660,33 +1661,76 @@ _DOOR_TWEEN_BLOCK = """
 -- Listens to ``open`` attribute change on the sibling ``door`` mesh and
 -- tweens it +14.28 studs Y (Unity 4m × STUDS_PER_METER) on open, back
 -- on close. Mecanim Animator → TweenService bridge.
+--
+-- Per-door coexistence guard: skip if THIS door already has an
+-- ``Anim_*door_*`` driver script wired to its parent (e.g. as a
+-- WaitForChild target in ReplicatedStorage or as a script child of
+-- the same prefab Model). Otherwise the project-level pack and the
+-- per-door animation driver would both tween the same mesh on every
+-- attribute change → overshoot/jitter (codex round-10 [P2]).
 do
     local TweenService = game:GetService("TweenService")
     local _doorContainer = script.Parent
     local _parent = _doorContainer and _doorContainer.Parent
     local _doorMesh = _parent and _parent:FindFirstChild("door")
     if _doorMesh and _doorMesh:IsA("BasePart") then
-        local _STUDS_PER_METER = 3.571
-        local _OPEN_OFFSET = Vector3.new(0, 4 * _STUDS_PER_METER, 0)
-        local _closedCFrame = _doorMesh.CFrame
-        local _openCFrame = _closedCFrame + _OPEN_OFFSET
-        local _currentTween
-        local function _animateTo(target)
-            if _currentTween then _currentTween:Cancel() end
-            _currentTween = TweenService:Create(
-                _doorMesh,
-                TweenInfo.new(1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-                { CFrame = target }
-            )
-            _currentTween:Play()
-        end
-        _doorMesh:GetAttributeChangedSignal("open"):Connect(function()
-            if _doorMesh:GetAttribute("open") then
-                _animateTo(_openCFrame)
-            else
-                _animateTo(_closedCFrame)
+        -- Scan the door's parent prefab (and ReplicatedStorage if the
+        -- driver lives there) for an existing animation driver
+        -- whose name matches ``Anim_(<Prefab>_)?door_(open|close)``
+        -- (case-insensitive). When found, defer to it.
+        local function _hasAnimDriver()
+            local function _matchName(name)
+                local lower = string.lower(name)
+                if string.match(lower, "^anim_door_open$")
+                    or string.match(lower, "^anim_door_close$") then
+                    return true
+                end
+                if string.match(lower, "^anim_.+_door_open$")
+                    or string.match(lower, "^anim_.+_door_close$") then
+                    return true
+                end
+                return false
             end
-        end)
+            -- Walk the prefab Model's descendants.
+            if _parent then
+                for _, d in ipairs(_parent:GetDescendants()) do
+                    if d:IsA("Script") or d:IsA("LocalScript") then
+                        if _matchName(d.Name) then return true end
+                    end
+                end
+            end
+            -- Animation phase sometimes parents drivers under RS.
+            local _rs = game:GetService("ReplicatedStorage")
+            for _, d in ipairs(_rs:GetChildren()) do
+                if d:IsA("Script") or d:IsA("LocalScript") then
+                    if _matchName(d.Name) then return true end
+                end
+            end
+            return false
+        end
+        if not _hasAnimDriver() then
+            local _STUDS_PER_METER = 3.571
+            local _OPEN_OFFSET = Vector3.new(0, 4 * _STUDS_PER_METER, 0)
+            local _closedCFrame = _doorMesh.CFrame
+            local _openCFrame = _closedCFrame + _OPEN_OFFSET
+            local _currentTween
+            local function _animateTo(target)
+                if _currentTween then _currentTween:Cancel() end
+                _currentTween = TweenService:Create(
+                    _doorMesh,
+                    TweenInfo.new(1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+                    { CFrame = target }
+                )
+                _currentTween:Play()
+            end
+            _doorMesh:GetAttributeChangedSignal("open"):Connect(function()
+                if _doorMesh:GetAttribute("open") then
+                    _animateTo(_openCFrame)
+                else
+                    _animateTo(_closedCFrame)
+                end
+            end)
+        end
     end
 end
 """
@@ -1706,17 +1750,11 @@ end
 )
 def _inject_door_tween(scripts: list["RbxScript"]) -> int:
     fixes = 0
-    # Animation phase is project-level: if it emitted ANY door-clip
-    # driver, it emitted them for every Unity door clip that had a
-    # controller. Suppress the fallback whenever a driver is present;
-    # the fallback only runs for projects where animation emission
-    # didn't fire for door clips at all.
-    if _door_has_animation_driver(scripts):
-        log.debug(
-            "  door_tween_open: animation-phase driver(s) present; "
-            "skipping fallback injection."
-        )
-        return 0
+    # The injected tween body carries a runtime coexistence guard
+    # that defers to any sibling ``Anim_*_door_*`` driver, so the
+    # apply path doesn't need to skip project-wide. Round-9's
+    # project-wide bail was unsafe for mixed projects where some
+    # doors had drivers and others didn't (codex round-10 [P2]).
     for s in scripts:
         if s.name != "Door":
             continue
@@ -2134,7 +2172,13 @@ _PLAYER_DAMAGE_FIRE_TEMPLATE = (
     ':FindFirstChild("DamageEvent")\n'
     '                if _de then\n'
     '                    local _cam = workspace.CurrentCamera\n'
-    '                    _de:FireServer({hit_var}, _cam.CFrame.Position, '
+    '                    -- Send the value the client just wrote so\n'
+    '                    -- the server preserves it verbatim (codex\n'
+    '                    -- round-10 [P1]: don\'t let the server\n'
+    '                    -- synthesize a counter that overwrites the\n'
+    '                    -- client\'s damage payload).\n'
+    '                    local _td = {hit_var}:GetAttribute("TakeDamage")\n'
+    '                    _de:FireServer({hit_var}, _td, _cam.CFrame.Position, '
     '_cam.CFrame.LookVector)\n'
     '                end\n'
     '            end\n'
@@ -2196,7 +2240,7 @@ if not de then
     de.Parent = ReplicatedStorage
 end
 
-de.OnServerEvent:Connect(function(player, hitInstance, originPos, lookDir)
+de.OnServerEvent:Connect(function(player, hitInstance, takeDamageValue, originPos, lookDir)
     -- Type guards FIRST: a malicious client can ``FireServer(true)``
     -- / ``FireServer({})`` and the server must reject the payload
     -- before calling any Instance methods (would throw otherwise).
@@ -2231,30 +2275,23 @@ de.OnServerEvent:Connect(function(player, hitInstance, originPos, lookDir)
         return
     end
 
-    -- Validated. Apply the attribute writes server-side. Use the
-    -- numeric incrementing form so:
-    --   1. ``GetAttributeChangedSignal`` fires on EVERY hit (a
-    --      repeated ``SetAttribute(..., true)`` write doesn't change
-    --      the value, so the signal only fires once).
-    --   2. Listeners that read ``TakeDamage`` as a number (e.g. the
-    --      converted ``unity-3d-simplefps`` Player listener that uses
-    --      the attribute value as the damage amount) actually see
-    --      usable data instead of ``true``.
+    -- Validated. Mirror the client's TakeDamage write VERBATIM.
+    -- Codex round-10 [P1]: synthesizing a counter on the server
+    -- discards the client's payload, which under-damages listeners
+    -- that read ``TakeDamage`` as the damage amount. The client
+    -- captures whatever it wrote (``true`` for the canonical AI
+    -- transpile, or an incrementing token for change-signal-safe
+    -- shapes, or a numeric damage value) and sends it through; the
+    -- server preserves that semantics.
     --
-    -- Seed with ``1`` when the attribute is absent or non-numeric;
-    -- bump by +1 thereafter. Boolean listeners still react to either
-    -- transition (any non-nil truthy value satisfies ``if attr then``).
-    local function _bumpTakeDamage(inst)
-        local cur = inst:GetAttribute("TakeDamage")
-        if typeof(cur) == "number" then
-            inst:SetAttribute("TakeDamage", cur + 1)
-        else
-            inst:SetAttribute("TakeDamage", 1)
-        end
+    -- Coerce nil/invalid payloads to ``true`` so a listener doing
+    -- ``if attr then`` still reacts.
+    if takeDamageValue == nil then
+        takeDamageValue = true
     end
-    _bumpTakeDamage(hitInstance)
+    hitInstance:SetAttribute("TakeDamage", takeDamageValue)
     local m = hitInstance:FindFirstAncestorOfClass("Model")
-    if m then _bumpTakeDamage(m) end
+    if m then m:SetAttribute("TakeDamage", takeDamageValue) end
 end)
 '''
 
