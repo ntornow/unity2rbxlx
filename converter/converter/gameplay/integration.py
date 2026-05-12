@@ -61,13 +61,22 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class NodeBinding:
-    """One detector hit against one (node, component) pair."""
+    """One detector hit against one (node, component) pair.
 
-    unity_file_id: str          # scene node file_id
+    ``source_path`` disambiguates file_ids across prefab assets —
+    PR #73b prefab walking exposed real collisions (e.g. multiple
+    SimpleFPS prefabs share file_id ``&100000``), so deny-list entries
+    and operator reports need the source descriptor to be precise.
+    Empty string means "from the parsed scene"; the conversion
+    report surfaces the absolute path of the prefab when present.
+    """
+
+    unity_file_id: str          # node file_id (local to source_path)
     component_file_id: str      # MonoBehaviour component file_id
     node_name: str              # SceneNode.name — operator-friendly
     detector_name: str
     behavior: Behavior
+    source_path: str = ""       # absolute path of scene/prefab the node came from
 
 
 @dataclass(frozen=True)
@@ -93,6 +102,13 @@ class GameplayMatch:
     # pipeline. Codex PR #73a-round-2 caught a "_relative_" misnomer
     # that masked the actual shape.
     script_path: str
+    # Absolute path of the scene OR prefab the binding came from.
+    # Codex PR #73b-round-1 P2 flagged that bare file_ids alone are
+    # ambiguous after prefab walking — multiple prefabs share
+    # ``&100000``. Operators write deny-list entries as
+    # ``<source_path>#<file_id>`` to disambiguate (bare file_id keeps
+    # working for backward compat, but suppresses across every source).
+    source_path: str = ""
 
 
 @dataclass
@@ -295,6 +311,34 @@ def _walk_prefab_nodes(root) -> "list":  # type: ignore[no-untyped-def]
     return out
 
 
+def _deny_list_hit(
+    deny_list: frozenset[str],
+    *,
+    node_file_id: str,
+    component_file_id: str,
+    source_path: str,
+) -> bool:
+    """Return True if any deny-list entry suppresses this binding.
+
+    Accepts BOTH the legacy bare ``file_id`` form (matches across
+    every source) and the qualified ``<source_path>#<file_id>``
+    form (matches one specific source). Codex PR #73b-round-1 P2:
+    after prefab walking, bare file_ids alone are ambiguous because
+    distinct prefab assets share local file_ids; the qualified form
+    is the operator escape hatch.
+    """
+    if not deny_list:
+        return False
+    if node_file_id in deny_list or component_file_id in deny_list:
+        return True
+    if source_path:
+        if f"{source_path}#{node_file_id}" in deny_list:
+            return True
+        if f"{source_path}#{component_file_id}" in deny_list:
+            return True
+    return False
+
+
 def classify_scripts(
     *,
     parsed_scene: "ParsedScene | None",
@@ -335,16 +379,20 @@ def classify_scripts(
     candidates: dict[Path, ClassMatch] = {}
 
     # Build the unified node walk: scene-placed nodes first, then
-    # every prefab template's tree. Ordering matters only for
-    # determinism in the report — equivalence check is symmetric.
-    nodes_to_walk: list = list(parsed_scene.all_nodes.values())
+    # every prefab template's tree. Each entry carries its source
+    # path so deny-list checks and bindings can disambiguate across
+    # prefab assets (codex PR #73b-round-1 P2).
+    scene_path_str = str(getattr(parsed_scene, "scene_path", ""))
+    nodes_to_walk: list[tuple] = [
+        (n, scene_path_str) for n in parsed_scene.all_nodes.values()
+    ]
     if prefab_library is not None:
         for prefab in getattr(prefab_library, "prefabs", []):
-            nodes_to_walk.extend(
-                _walk_prefab_nodes(getattr(prefab, "root", None))
-            )
+            prefab_path_str = str(getattr(prefab, "prefab_path", ""))
+            for n in _walk_prefab_nodes(getattr(prefab, "root", None)):
+                nodes_to_walk.append((n, prefab_path_str))
 
-    for node in nodes_to_walk:
+    for node, source_path in nodes_to_walk:
         for comp, info in _enrich_components(node, guid_to_script):
             try:
                 source_csharp = Path(info.path).read_text(
@@ -357,6 +405,18 @@ def classify_scripts(
                 )
                 continue
 
+            # Pre-check the deny-list with source-qualified entries so
+            # the qualified form (``<source_path>#<file_id>``) suppresses
+            # one prefab without affecting another that shares the same
+            # local file_id (codex PR #73b-round-1 P2).
+            if _deny_list_hit(
+                deny_list,
+                node_file_id=node.file_id,
+                component_file_id=comp.file_id,
+                source_path=source_path,
+            ):
+                continue
+
             from converter.gameplay.detectors import detect
             try:
                 behavior = detect(
@@ -366,10 +426,13 @@ def classify_scripts(
                 )
             except AmbiguousDetectionError as exc:
                 log.warning(
-                    "[gameplay-adapters] %s — falling back to AI path. "
-                    "Add %r (or component %r) to .gameplay_deny.txt to "
-                    "suppress one of the candidates.",
-                    exc, exc.node_file_id, exc.component_file_id,
+                    "[gameplay-adapters] %s in %s — falling back to AI "
+                    "path. Add %r (or component %r) — or the qualified "
+                    "form %r — to .gameplay_deny.txt to suppress one of "
+                    "the candidates.",
+                    exc, source_path or "<scene>",
+                    exc.node_file_id, exc.component_file_id,
+                    f"{source_path}#{exc.node_file_id}" if source_path else exc.node_file_id,
                 )
                 continue
             if behavior is None:
@@ -392,6 +455,7 @@ def classify_scripts(
                 node_name=node.name,
                 detector_name=detector_name,
                 behavior=behavior,
+                source_path=source_path,
             )
 
             key = Path(info.path).resolve()
@@ -509,6 +573,7 @@ def adapter_transpiled_scripts(
                 node_file_id=binding.unity_file_id,
                 component_file_id=binding.component_file_id,
                 script_path=str(entry.script_path),
+                source_path=binding.source_path,
             ))
 
     return scripts, gameplay_matches

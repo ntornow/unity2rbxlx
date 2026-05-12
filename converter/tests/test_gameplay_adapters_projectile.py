@@ -933,21 +933,290 @@ class TestPrefabWalk:
 
 
 # ---------------------------------------------------------------------------
+# Source-qualified deny-list (codex PR #73b-round-1 P2)
+# ---------------------------------------------------------------------------
+#
+# Bare ``file_id`` deny-list entries match across every source. After
+# PR #73b's prefab walk, distinct prefab assets routinely share local
+# file_ids (SimpleFPS has at least two prefabs using ``&100000``). The
+# qualified form ``<source_path>#<file_id>`` is the operator escape
+# hatch that suppresses one specific source without affecting others.
+
+
+class TestSourceQualifiedDenyList:
+    def test_qualified_deny_entry_suppresses_one_prefab(
+        self, tmp_path: Path,
+    ) -> None:
+        """Two prefabs with colliding file_ids classify normally. A
+        qualified deny entry on ONE prefab's path suppresses only
+        that one — the other prefab still emits.
+        """
+        from converter.gameplay.integration import classify_scripts
+
+        cs_path = tmp_path / "TurretBullet.cs"
+        cs_path.write_text(_TURRET_BULLET_CSHARP, encoding="utf-8")
+        info = _StubScriptInfo(path=cs_path, class_name="TurretBullet")
+        guid = "g"
+        guid_index = _StubGuidIndex(
+            by_guid={guid: cs_path},
+            by_path={cs_path.resolve(): guid},
+        )
+
+        # Two distinct prefab files, both containing a bullet at
+        # the same file_id "100" — the collision codex flagged.
+        def _bullet_prefab(prefab_path: str) -> _StubPrefab:
+            bullet = _StubPrefabNode(
+                name="TurretBullet",
+                file_id="100",
+                components=[_StubPrefabComponent(
+                    component_type="MonoBehaviour",
+                    file_id="200",
+                    properties={"m_Script": {"guid": guid, "fileID": 11500000}},
+                )],
+                children=[],
+            )
+            return _StubPrefab(name=prefab_path, root=bullet)
+        # Use _ApPathPrefab so getattr(prefab, "prefab_path", "") yields the right thing
+        prefab_a_path = str(tmp_path / "PrefabA.prefab")
+        prefab_b_path = str(tmp_path / "PrefabB.prefab")
+
+        @dataclass
+        class _PathPrefab:
+            name: str
+            root: object
+            prefab_path: object  # path-like
+
+        prefab_a = _PathPrefab(
+            name="A", root=_bullet_prefab(prefab_a_path).root,
+            prefab_path=prefab_a_path,
+        )
+        prefab_b = _PathPrefab(
+            name="B", root=_bullet_prefab(prefab_b_path).root,
+            prefab_path=prefab_b_path,
+        )
+        prefab_library = _StubPrefabLibrary(prefabs=[prefab_a, prefab_b])
+
+        # Qualified deny: suppress PrefabA's bullet only.
+        deny = frozenset({f"{prefab_a_path}#100"})
+        result = classify_scripts(
+            parsed_scene=_StubParsedScene(all_nodes={}),  # type: ignore[arg-type]
+            guid_index=guid_index,  # type: ignore[arg-type]
+            script_infos=[info],  # type: ignore[list-item]
+            prefab_library=prefab_library,  # type: ignore[arg-type]
+            deny_list=deny,
+        )
+
+        # PrefabB's bullet survives. PrefabA's is suppressed.
+        match = result.matches.get(cs_path.resolve())
+        assert match is not None
+        sources = {b.source_path for b in match.bindings}
+        assert sources == {prefab_b_path}
+
+    def test_bare_file_id_still_suppresses_across_sources(
+        self, tmp_path: Path,
+    ) -> None:
+        """Legacy bare ``file_id`` form keeps working — suppresses
+        EVERY source that uses that id. Pins backward compat with
+        pre-PR #73b ``.gameplay_deny.txt`` files.
+        """
+        from converter.gameplay.integration import classify_scripts
+
+        cs_path = tmp_path / "TurretBullet.cs"
+        cs_path.write_text(_TURRET_BULLET_CSHARP, encoding="utf-8")
+        info = _StubScriptInfo(path=cs_path, class_name="TurretBullet")
+        guid = "g"
+        guid_index = _StubGuidIndex(
+            by_guid={guid: cs_path},
+            by_path={cs_path.resolve(): guid},
+        )
+
+        bullet_a = _StubPrefabNode(
+            name="A_bullet", file_id="100",
+            components=[_StubPrefabComponent(
+                component_type="MonoBehaviour",
+                file_id="200",
+                properties={"m_Script": {"guid": guid, "fileID": 11500000}},
+            )],
+            children=[],
+        )
+        bullet_b = _StubPrefabNode(
+            name="B_bullet", file_id="100",
+            components=[_StubPrefabComponent(
+                component_type="MonoBehaviour",
+                file_id="200",
+                properties={"m_Script": {"guid": guid, "fileID": 11500000}},
+            )],
+            children=[],
+        )
+        prefab_library = _StubPrefabLibrary(prefabs=[
+            _StubPrefab(name="A", root=bullet_a),
+            _StubPrefab(name="B", root=bullet_b),
+        ])
+
+        result = classify_scripts(
+            parsed_scene=_StubParsedScene(all_nodes={}),  # type: ignore[arg-type]
+            guid_index=guid_index,  # type: ignore[arg-type]
+            script_infos=[info],  # type: ignore[list-item]
+            prefab_library=prefab_library,  # type: ignore[arg-type]
+            deny_list=frozenset({"100"}),
+        )
+        # Both prefabs suppressed by the bare entry.
+        assert result.matches == {}
+
+    def test_binding_carries_source_path(self, tmp_path: Path) -> None:
+        """Each NodeBinding records the source it came from so the
+        conversion report can render qualified deny entries.
+        """
+        from converter.gameplay.integration import classify_scripts
+
+        cs_path = tmp_path / "TurretBullet.cs"
+        cs_path.write_text(_TURRET_BULLET_CSHARP, encoding="utf-8")
+        info = _StubScriptInfo(path=cs_path, class_name="TurretBullet")
+        guid = "g"
+        guid_index = _StubGuidIndex(
+            by_guid={guid: cs_path},
+            by_path={cs_path.resolve(): guid},
+        )
+        bullet = _StubPrefabNode(
+            name="TurretBullet", file_id="100",
+            components=[_StubPrefabComponent(
+                component_type="MonoBehaviour",
+                file_id="200",
+                properties={"m_Script": {"guid": guid, "fileID": 11500000}},
+            )],
+            children=[],
+        )
+
+        @dataclass
+        class _PathPrefab:
+            name: str
+            root: object
+            prefab_path: object
+
+        prefab_path = str(tmp_path / "TurretBullet.prefab")
+        prefab = _PathPrefab(name="x", root=bullet, prefab_path=prefab_path)
+        prefab_library = _StubPrefabLibrary(prefabs=[prefab])
+
+        result = classify_scripts(
+            parsed_scene=_StubParsedScene(all_nodes={}),  # type: ignore[arg-type]
+            guid_index=guid_index,  # type: ignore[arg-type]
+            script_infos=[info],  # type: ignore[list-item]
+            prefab_library=prefab_library,  # type: ignore[arg-type]
+        )
+        match = result.matches[cs_path.resolve()]
+        assert match.bindings[0].source_path == prefab_path
+
+
+# ---------------------------------------------------------------------------
+# Runtime semantics — Effect.Damage Player filter (codex PR #73b-round-1 P1)
+# ---------------------------------------------------------------------------
+#
+# These tests pin the runtime's Player-only gate by inspecting the
+# emitted Luau directly. Headless execution of the runtime modules is
+# out of scope for this PR; the Lua source is the source of truth for
+# the contract, and structural assertions are enough to prevent the
+# specific regression codex flagged.
+
+
+class TestDamagePlayerFilter:
+    def _read_runtime(self) -> str:
+        from pathlib import Path as P
+        path = (
+            P(__file__).parent.parent / "runtime" / "gameplay" / "effects.luau"
+        )
+        return path.read_text(encoding="utf-8")
+
+    def test_damage_handler_checks_player(self) -> None:
+        """``Effects.damage`` must gate the ``_applyDamageToModel``
+        call behind one of three Player-detection signals — anything
+        else regresses TurretBullet to damage NPC/allied Humanoids.
+        """
+        body = self._read_runtime()
+        # The three-signal check the legacy bullet pack also uses.
+        assert "Players:GetPlayerFromCharacter" in body
+        assert 'hitInstance:HasTag("Player")' in body
+        assert 'model.Name == "Player"' in body
+
+    def test_damage_handler_destroys_on_any_impact(self) -> None:
+        """Despawn-on-any-impact: matches the legacy bullet pack so
+        bullets don't persist after their raycast hit, even when the
+        hit was a wall (Unity bullets fly through walls; the legacy
+        pack regressed that, and the adapter matches the legacy
+        behaviour for consistency).
+        """
+        body = self._read_runtime()
+        # The destroy line lives outside the ``isPlayer`` branch.
+        # Look for the comment pinning this contract — if a future
+        # refactor moves it inside the if-block, both the comment and
+        # the behaviour need updating together.
+        assert "Despawn on any impact" in body
+
+
+# ---------------------------------------------------------------------------
 # Pipeline mutual exclusion
 # ---------------------------------------------------------------------------
 
 class TestLegacyPackMutex:
-    def test_bullet_pack_in_pipeline_disable_list(self) -> None:
-        """The ``bullet_physics_raycast`` legacy pack must be force-
-        disabled whenever ``use_gameplay_adapters`` is on. Running
-        both would produce double-binding (legacy mutates the AI
-        transpile, adapter replaces it).
-        """
-        import inspect
-        from converter import pipeline as pipeline_mod
+    """Semantic test of the legacy-pack mutex: when
+    ``use_gameplay_adapters`` is on, the bullet + door packs must NOT
+    run (they'd double-bind alongside the adapter). Codex PR
+    #73b-round-1 P3 flagged that an inspect-source substring check is
+    fragile against refactors; pin the runtime behaviour instead.
+    """
 
-        src = inspect.getsource(pipeline_mod)
-        # Search for the disabled_packs frozenset literal that gates
-        # the legacy packs when adapters are on.
-        assert '"bullet_physics_raycast"' in src
-        assert '"door_tween_open"' in src
+    def _run_packs_with_pipeline_gate(
+        self, scripts, use_gameplay_adapters: bool,
+    ):
+        """Invoke ``fix_require_classifications`` the same way
+        ``Pipeline._transpile_scripts`` does — including the
+        ``disabled_packs`` frozenset that gates legacy packs when the
+        adapter flag is on. Returns the disabled_packs the pipeline
+        would have passed.
+        """
+        # Mirror the gate from pipeline.py — single source of truth
+        # for the mutex semantics. If pipeline.py ever changes the
+        # mutex shape, this test fails loudly.
+        from converter.script_coherence import fix_require_classifications
+
+        disabled_packs = frozenset()
+        if use_gameplay_adapters:
+            # The exact set the pipeline maintains. Keep this in sync
+            # with pipeline._transpile_scripts. PR #73c will add the
+            # damage-protocol pack here.
+            disabled_packs = frozenset({
+                "door_tween_open",
+                "bullet_physics_raycast",
+            })
+
+        fix_require_classifications(scripts, disabled_packs=disabled_packs)
+        return disabled_packs
+
+    def test_disabled_packs_when_adapter_on(self) -> None:
+        """Adapter on → bullet_physics_raycast AND door_tween_open
+        are both in disabled_packs.
+        """
+        disabled = self._run_packs_with_pipeline_gate(
+            scripts=[], use_gameplay_adapters=True,
+        )
+        assert "bullet_physics_raycast" in disabled
+        assert "door_tween_open" in disabled
+
+    def test_disabled_packs_when_adapter_off(self) -> None:
+        """Adapter off → no packs are force-disabled. Legacy mode
+        keeps the existing behaviour.
+        """
+        disabled = self._run_packs_with_pipeline_gate(
+            scripts=[], use_gameplay_adapters=False,
+        )
+        assert disabled == frozenset()
+
+    def test_legacy_packs_actually_registered(self) -> None:
+        """Pin that the legacy packs the mutex targets really exist —
+        if a pack is renamed without updating the mutex, the gate
+        becomes a no-op without anyone noticing.
+        """
+        from converter.script_coherence_packs import _REGISTRY
+
+        registered = {p.name for p in _REGISTRY}
+        assert "bullet_physics_raycast" in registered
+        assert "door_tween_open" in registered

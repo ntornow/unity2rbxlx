@@ -54,11 +54,23 @@ end
 
 -- ``Effect.Damage`` semantics:
 --
---   On each impact, find the Humanoid-bearing ancestor of the hit
---   Instance and apply ``value`` damage. No-op if the hit isn't a
---   character (terrain, wall, prop). The container is destroyed
---   after damage is applied so the bullet doesn't continue past the
---   hit.
+--   On each impact, find the Player-tagged ancestor of the hit
+--   Instance and apply ``value`` damage. Mirrors Unity
+--   ``TurretBullet.cs`` ``OnCollisionEnter`` which gates damage on
+--   ``other.collider.tag == "Player"`` — NPCs / allied Humanoids
+--   must NOT take damage from a TurretBullet. The container is
+--   destroyed on any impact (Player, non-Player Humanoid, wall) so
+--   the bullet doesn't continue past the hit. Wall-hit destroy is a
+--   regression from Unity's literal semantics (Unity bullets fly
+--   through walls until they hit a tagged Player) but matches the
+--   legacy bullet pack's behaviour and avoids "ghost bullets"
+--   persisting in the scene.
+--
+-- Player detection mirrors the legacy bullet pack's three-way check:
+-- (a) the model is a real Player's Character; OR (b) the hit
+-- Instance carries a "Player" tag (CollectionService); OR (c) the
+-- model is named "Player" (test scaffolding / AI scripts). Any one
+-- match means damage applies.
 function Effects.damage(container: Instance, cap: {[string]: any}, ctx: {[string]: any}): ()
     local signal = ctx.hitDetection.impactSignal :: BindableEvent?
     if signal == nil then
@@ -72,19 +84,24 @@ function Effects.damage(container: Instance, cap: {[string]: any}, ctx: {[string
     local capValue = cap.value :: number
     signal.Event:Connect(function(hitInstance: Instance, _impactPos: Vector3)
         local model = _modelOf(hitInstance)
-        if model == nil then
-            -- Non-character hit (terrain, wall, prop). Direct-hit
-            -- bullets despawn without damage — matches Unity
-            -- TurretBullet.cs OnCollisionEnter's non-Player branch.
-            if container.Parent then container:Destroy() end
-            return
+        -- Player-only gate (codex PR #73b-round-1 P1): match the
+        -- legacy bullet pack AND Unity's collider.tag == "Player"
+        -- filter. Without this, NPC Humanoids take TurretBullet
+        -- damage in any project that has allied or enemy characters.
+        local isPlayer = false
+        if model ~= nil and model:FindFirstChildOfClass("Humanoid") then
+            isPlayer = (
+                Players:GetPlayerFromCharacter(model) ~= nil
+                or hitInstance:HasTag("Player")
+                or model.Name == "Player"
+            )
         end
-        if model:FindFirstChildOfClass("Humanoid") == nil then
-            if container.Parent then container:Destroy() end
-            return
+        if isPlayer and model ~= nil then
+            local value = _resolveValue(container, capValue, "damage")
+            _applyDamageToModel(model, value)
         end
-        local value = _resolveValue(container, capValue, "damage")
-        _applyDamageToModel(model, value)
+        -- Despawn on any impact — Player damage, non-Player Humanoid,
+        -- or wall — so bullets don't persist after their raycast hit.
         if container.Parent then container:Destroy() end
     end)
 end

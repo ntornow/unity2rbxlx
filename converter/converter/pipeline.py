@@ -3204,6 +3204,7 @@ script.Disabled = true
                 component_file_id=m.component_file_id,
                 script_path=m.script_path,
                 capability_kinds=list(m.capability_kinds),
+                source_path=m.source_path,
             )
             for m in matches
         ]
@@ -3220,6 +3221,7 @@ script.Disabled = true
                 node_name=node_binding.node_name,
                 node_file_id=node_binding.unity_file_id,
                 component_file_id=node_binding.component_file_id,
+                source_path=node_binding.source_path,
             )
 
         divergent = [

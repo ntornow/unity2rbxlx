@@ -398,6 +398,13 @@ def detect(
     matching either suppresses the detection. Per-component IDs let
     operators silence one component on a multi-component node without
     losing detection on the other components.
+
+    This entry point checks bare file_ids only; the source-qualified
+    form ``<source_path>#<file_id>`` is handled by
+    :func:`converter.gameplay.integration.classify_scripts` so callers
+    routing through the integration layer benefit from cross-prefab
+    disambiguation (codex PR #73b-round-1 P2). Direct callers of
+    ``detect()`` are still safe — the bare form matches every source.
     """
     if node.file_id in deny_list or component.file_id in deny_list:
         return None
@@ -426,8 +433,22 @@ DENY_LIST_FILENAME: str = ".gameplay_deny.txt"
 
 
 def load_deny_list(output_dir: str) -> frozenset[str]:
-    """Load ``<output_dir>/.gameplay_deny.txt`` — one Unity file_id per
-    line. Blank lines and ``#`` comments are skipped. Returns an empty
+    """Load ``<output_dir>/.gameplay_deny.txt`` — one entry per line.
+
+    Each line is either:
+      - A bare Unity ``file_id`` (matches every source that uses it).
+        Predates PR #73b; still works for scene-only bindings.
+      - A qualified ``<source_path>#<file_id>`` form. ``source_path``
+        is the absolute path of the scene or prefab that produced
+        the binding (matches what
+        ``conversion_report.json`` reports under
+        ``gameplay_adapters.bindings[].source_path``). Use this to
+        suppress one prefab's binding without affecting other
+        prefabs that share the same local ``file_id`` (codex PR
+        #73b-round-1 P2 — collisions like ``&100000`` are common
+        across prefab assets).
+
+    Blank lines and ``#`` comments are skipped. Returns an empty
     frozenset if the file is absent.
     """
     from pathlib import Path
