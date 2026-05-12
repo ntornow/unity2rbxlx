@@ -1,50 +1,35 @@
 # Gameplay Adapters
 
-**Status:** Proposed 2026-05-12. First stage: PR #72 (this doc + skeleton).
-Targets: `converter/converter/gameplay/`, `converter/runtime/gameplay/`, and
-removal of three coherence packs from `converter/converter/script_coherence_packs.py`
+**Status:** Proposed 2026-05-12. Revised after codex architecture review.
+First stage: PR #72 (this doc). Targets the eventual removal of three
+coherence packs from `converter/converter/script_coherence_packs.py`
 (`bullet_physics_raycast`, `player_damage_remote_event`, `door_tween_open`).
 
 ## Decision
 
-Translate Unity gameplay subsystems (Rigidbody projectiles, Animator-driven
-actuators, camera-raycast damage interactions) via **structured adapters that
-consume Unity facts and emit canonical Luau stubs over a shared runtime
-library** — instead of regex-patching AI-transpiled Luau text after the fact.
+Translate Unity gameplay subsystems via **structured per-instance behaviour
+descriptions composed from orthogonal capability pieces, executed by shared
+runtime libraries** — instead of regex-patching AI-transpiled Luau text after
+the fact.
 
 ## Why we're changing course
 
-The current approach lives in `script_coherence_packs.py` as three packs:
-
-  - `bullet_physics_raycast` regex-detects `TurretBullet`/`PlaneBullet` Luau
-    output and wholesale-replaces the body.
-  - `player_damage_remote_event` regex-patches `Player.luau` to `FireServer`,
-    plus emits a server router script that validates and replays the raycast.
-  - `door_tween_open` regex-detects `Door.luau` and appends a TweenService
-    block, with a runtime guard that tries to defer to animation-phase
-    drivers.
-
+The current approach lives in `script_coherence_packs.py` as three packs.
 PR #71 took 12 rounds of codex review with new findings every round. The
 findings cluster into five recurring categories:
 
 1. **Regex misses AI output variations** — different runs name locals
-   `hitInst` / `hitPart` / `rb` / `rootPart`; AI emits `(GetAttribute or 0) + 1`
-   one round and `true` the next; door driver names include spaces or
-   capitalised clip names. Every variation is a separate regex repair.
+   `hitInst` / `hitPart` / `rb` / `rootPart`; AI emits
+   `(GetAttribute or 0) + 1` one round and `true` the next.
 2. **Client-server protocol drift** — the client patch and the server router
-   are emitted from the same pack but live as two independent text blobs.
-   Adding a payload field on one side without the other leaves rehydrated
-   outputs half-patched.
+   live as two independent text blobs and drift across rounds.
 3. **Mixed-project scoping** — packs run on the flat `place.scripts` list
    (one entry per `.cs` class), with no notion of which prefab instance the
-   adapter should fire for. A project with two Door prefabs where one has an
-   animation-phase driver and the other doesn't trips repeatedly.
+   adapter should fire for.
 4. **Network input validation** — every iteration of the `DamageEvent`
-   RemoteEvent surfaces a new attack class (non-Instance payloads, non-scalar
-   values, repeated-`true` writes that don't fire `GetAttributeChangedSignal`).
+   RemoteEvent surfaces a new attack class.
 5. **Unity-semantics regression** — wholesale-replacement keeps dropping
-   Unity-specific behaviour (PlaneBullet's `OverlapSphere(2)` splash, the
-   `Explosion` template clone, prefab `force=200` override values).
+   Unity-specific behaviour (splash, explosion VFX, prefab override values).
 
 These aren't regex-quality problems. The pack abstraction is the wrong tool
 for the job: each pack is doing semantic lowering, protocol design, and
@@ -52,201 +37,284 @@ runtime generation inside a post-hoc text patcher.
 
 ## Architecture
 
-### Three spec dataclasses (`converter/converter/gameplay/specs.py`)
+### Capability pieces, not monolithic specs
+
+Earlier drafts proposed three flat spec dataclasses (`ProjectileSpec`,
+`ActuatorSpec`, `DamageInteractionSpec`). Codex review pushed back: those
+overloaded transport, lifetime, hit-mode, area-of-effect, and VFX into a
+single struct, and didn't cover sensor/trigger-driven interactions
+(`OnTriggerEnter`, `OverlapSphere`, animation events). Replaced with an
+orthogonal capability model.
+
+Each Unity behaviour decomposes into composable pieces — `dataclass(frozen=True)`
+records under `converter/converter/gameplay/capabilities.py`:
+
+  - **Movement**
+    - `Impulse(direction_local, force_unity)` — Rigidbody + AddRelativeForce
+    - `ConstantVelocity(velocity_unity)`
+    - `Anchored` (no motion; lifetime-only)
+  - **Lifetime**
+    - `Despawn(seconds)` — `Destroy(gameObject, t)`
+    - `OnFirstHit` — destroyed by hit detection rather than timer
+    - `Persistent`
+  - **HitDetection**
+    - `RaycastSegment` — server-side per-Heartbeat segment cast; catches
+      tunneling on fast projectiles
+    - `Touched` — Roblox Touched event
+    - `OverlapSphere(radius_unity)` — `GetPartBoundsInRadius`, used for
+      explosion/splash detection
+  - **Effect**
+    - `Damage(value)` — applies via the shared damage attribute protocol
+    - `Splash(radius_unity, value)` — area damage in stud-converted radius
+    - `SpawnTemplate(name)` — clone `ReplicatedStorage.Templates.<name>`
+      at impact (e.g. `Explosion`)
+    - `ApplyAttribute(name, value)` — generic attribute write on hit target
+  - **Trigger**
+    - `OnEnter(tag_or_attribute_filter)` — `OnTriggerEnter` with tag match
+    - `OnAttributeBecomesTrue(name)` — Animator-bool, e.g. door's `open`
+    - `OnPickup(item_name)` — Pickup→Player attribute write
+
+A `Behavior` dataclass is just an ordered list of capabilities plus a
+binding context (which scene node carries it):
 
 ```python
 @dataclass(frozen=True)
-class ProjectileSpec:
-    """Lowered form of a Unity Rigidbody projectile MonoBehaviour."""
-    unity_class: str         # diagnostic; matches the source .cs class name
-    force: float             # Unity-meters/sec impulse magnitude
-    fade_time: float         # seconds — destroy after this
-    damage: float            # listener-facing payload value
-    splash_radius: float = 0 # 0 = direct-hit only; >0 = Unity OverlapSphere
-    spawn_explosion: bool = False  # clone ReplicatedStorage.Templates.Explosion on impact
-
-@dataclass(frozen=True)
-class ActuatorSpec:
-    """Lowered form of an Animator-bool-driven motion (door/elevator/gate)."""
-    attribute_name: str          # e.g. "open" — the bool parameter
-    open_offset_unity: tuple[float, float, float]  # m_PositionCurves delta
-    open_duration: float         # seconds (clip length)
-    close_duration: float        # seconds (close.anim clip length)
-    target_child_name: str = "door"  # which child mesh moves; default matches SciFi_Door
-
-@dataclass(frozen=True)
-class DamageInteractionSpec:
-    """Lowered form of a Camera-raycast + SendMessage("TakeDamage") hitscan."""
-    weapon_class: str            # diagnostic; matches the source .cs class name
-    shoot_range_unity: float     # Player.cs ``shootRange`` in meters
-    trigger_input: str           # "MouseButton1" by default
-    damage_value: float          # what the server writes to TakeDamage
+class Behavior:
+    unity_file_id: str           # the scene-node fileID this behaviour binds to
+    diagnostic_name: str         # e.g. "TurretBullet" — for logs/manifest only
+    capabilities: tuple[Capability, ...]
 ```
 
-Each spec carries **Unity-side values verbatim**. Stud-space conversion,
-gravity policy, raycast budget, and Roblox-specific concerns live in the
-runtime libraries, not the spec.
-
-### Three runtime libraries (`converter/runtime/gameplay/`)
-
-`projectile.luau` exposes:
-```lua
-Projectile.spawn(container: Instance, spec: ProjectileSpec) -> ()
-```
-The runtime owns: anti-gravity VectorForce, stud-space velocity (Unity
-`force * STUDS_PER_METER`), per-Heartbeat segment raycast (so high-velocity
-bullets don't tunnel past targets), splash damage at the raycast hit
-position, and the Explosion-template clone on impact.
-
-`actuator.luau` exposes:
-```lua
-Actuator.bind(container: Instance, spec: ActuatorSpec) -> ()
-```
-The runtime owns: per-instance coexistence detection (does this prefab
-already have an animation-phase driver listening on the same attribute? if
-so, no-op), TweenService creation, easing, idempotency.
-
-`damage_router.luau` exposes:
-```lua
-DamageRouter.installServer() -> ()        -- called once from a Script
-DamageRouter.fireFromClient(hitInstance: BasePart, takeDamageValue: any) -> ()
-```
-The runtime owns: RemoteEvent creation, full payload validation (typeof,
-IsA, IsDescendantOf, distance gate, server-side raycast replay from camera
-origin), and the `TakeDamage` SetAttribute mirror. Both halves live in one
-Lua file — protocol drift is structurally impossible.
-
-### Detectors operate on Unity facts (`converter/converter/gameplay/*.py`)
-
-Detection input: parsed Unity data the converter already has — MonoBehaviour
-fields (`_extract_monobehaviour_attributes`), C# source bodies (used for
-pattern detection, not parsing), Animator controller clips, prefab
-composition.
-
-Detection output: a `Spec` instance (or `None`). One spec per Unity
-component instance, not one per `.cs` class.
-
+PlaneBullet's converted behaviour is:
 ```python
-# converter/gameplay/projectile.py
-def detect(node: SceneNode, csharp_sources: dict[str, str]) -> ProjectileSpec | None:
-    if not _has_rigidbody(node):
-        return None
-    cs_class = node.attributes.get("_ScriptClass")
-    if not cs_class:
-        return None
-    src = csharp_sources.get(cs_class)
-    if src is None or not _looks_like_projectile(src):
-        return None
-    return ProjectileSpec(
-        unity_class=cs_class,
-        force=float(node.attributes.get("force", _default_force(src))),
-        damage=float(node.attributes.get("damage", _default_damage(src))),
-        fade_time=float(node.attributes.get("fadeTime", _default_fade(src))),
-        splash_radius=_splash_radius_from_overlap_sphere(src),  # 0 if not present
-        spawn_explosion="Instantiate(explosion" in src,
-    )
+Behavior(
+    unity_file_id="…",
+    diagnostic_name="PlaneBullet",
+    capabilities=(
+        Movement.Impulse(direction_local=(0,0,1), force_unity=200),
+        Lifetime.Despawn(seconds=6),
+        HitDetection.RaycastSegment(),
+        Effect.SpawnTemplate(name="Explosion"),
+        Effect.Splash(radius_unity=2, value=10),
+    ),
+)
 ```
 
-`_looks_like_projectile` is a C# (not Luau) signature check —
-`AddRelativeForce`/`AddForce` + Rigidbody + `OnCollisionEnter` with a
-`Destroy(gameObject)`. C# is the source of truth and far less variable than
-AI-transpiled Luau output.
+TurretBullet's is:
+```python
+Behavior(
+    unity_file_id="…",
+    diagnostic_name="TurretBullet",
+    capabilities=(
+        Movement.Impulse(direction_local=(0,0,1), force_unity=60),
+        Lifetime.Despawn(seconds=3),
+        HitDetection.RaycastSegment(),
+        Effect.Damage(value=10),
+    ),
+)
+```
 
-### Emit: three-line stubs
+Door is:
+```python
+Behavior(
+    unity_file_id="…",
+    diagnostic_name="Door",
+    capabilities=(
+        Trigger.OnAttributeBecomesTrue(name="open"),
+        Movement.ConstantVelocity(velocity_unity=(0, 4, 0)),  # +4m Y over duration
+        Lifetime.Persistent,
+    ),
+)
+```
 
-When a detector returns a spec, the converter emits a 3-line transpiled-script
-body that requires the runtime lib and passes the spec:
+The capability vocabulary is **deliberately small**. New Unity patterns
+extend the vocabulary by adding a single capability variant, not a new
+top-level Spec class.
+
+### Detection is composition-first, source-substring is a prefilter
+
+Codex review noted that C# substring matching is structurally the same
+problem as Luau-regex matching, one level up. True — and the doc gates
+substring checks behind hard component-composition checks:
+
+  - **Primary signal:** Unity component composition from the parsed
+    scene/prefab data (`Rigidbody`, `Collider`, `Animator`, MonoBehaviour
+    field shapes from `_extract_monobehaviour_attributes`). This is
+    structured data the converter already produces; it doesn't depend on AI
+    output or even C# parsing.
+  - **Tiebreaker only:** C# source substring (`AddRelativeForce` +
+    `OnCollisionEnter` + `Destroy(gameObject)`) when composition alone is
+    ambiguous (e.g. distinguishing a Rigidbody projectile from a
+    Rigidbody physics prop).
+  - **Conservative defaults:** detection emits a `Behavior` only when the
+    primary signal matches. Substring match alone never triggers
+    classification.
+
+False positives are reported in `conversion_report.json` and rejectable via
+an output-dir deny-list (`<output>/.gameplay_deny.txt` — one
+`unity_file_id` per line).
+
+### One runtime library per capability family
+
+`converter/runtime/gameplay/`:
+
+  - `movement.luau` — `Movement.applyImpulse(part, direction_local, force_unity)`
+    handles stud-space conversion and anti-gravity VectorForce.
+  - `lifetime.luau` — `Lifetime.scheduleDespawn(container, seconds)`,
+    `Lifetime.consumeOnFirstHit(container, hitDetection)`.
+  - `hit_detection.luau` — `HitDetection.raycastSegment(container, onHit)`,
+    `HitDetection.overlapSphere(origin, radius)`.
+  - `effects.luau` — `Effects.damage(target, value)`,
+    `Effects.splash(origin, radius, value)`,
+    `Effects.spawnTemplate(name, cframe)`.
+  - `triggers.luau` — `Triggers.onAttributeBecomesTrue(target, name, fn)`,
+    `Triggers.onPickup(zone, fn)`.
+  - `damage_protocol.luau` — owns the RemoteEvent end-to-end (client fire,
+    server receive, validation, attribute mirror). Client and server halves
+    in one file; protocol drift is structurally impossible. The damage
+    attribute is the boundary between Effect and listener; PR #72 doesn't
+    define a client-side hitscan protocol (codex flagged the previous
+    `DamageInteractionSpec` as FPS-flavoured — handled in a follow-up PR
+    after we see real call sites).
+
+A composer (`converter/runtime/gameplay/composer.luau`) wires capabilities
+together at runtime. Given a behaviour list, it calls the per-family
+runtime functions in the right order. The composer is small (~50 lines)
+because the capability vocabulary is small.
+
+### Emit: per-instance behaviour table
+
+Per Unity scene node that matches at detection time, the converter emits a
+behaviour table and a short require-and-run stub:
 
 ```lua
--- TurretBullet.luau (converter-emitted, AI never sees this script)
-local Projectile = require(game:GetService("ReplicatedStorage"):WaitForChild("AutoGen"):WaitForChild("Projectile"))
-Projectile.spawn(script.Parent, {
-    force = 60, fadeTime = 3, damage = 10, splashRadius = 0,
-    spawnExplosion = false,
+-- TurretBullet.luau (converter-emitted; AI is skipped for matched behaviours)
+local Composer = require(game:GetService("ReplicatedStorage"):WaitForChild("AutoGen"):WaitForChild("Composer"))
+Composer.run(script.Parent, {
+    {kind = "movement.impulse", direction = Vector3.new(0, 0, 1), force = 60},
+    {kind = "lifetime.despawn", seconds = 3},
+    {kind = "hit_detection.raycast_segment"},
+    {kind = "effect.damage", value = 10},
 })
 ```
 
-`AutoGen/` is a converter-owned folder under ReplicatedStorage. Naming
-deliberately project-neutral — the libraries inside aren't FPS-flavoured
-(see "Genre neutrality" below).
+The behaviour table is **per-instance data**, not class-level. Two doors
+with different open offsets get two different tables emitted. No
+`weapon_class` or `target_child_name` class-level leakage.
 
-The transpile phase (`code_transpiler.transpile_scripts`) is where this fits:
-before sending a script to Claude/AI, check the gameplay detectors. If any
-matches, skip the AI entirely and emit the canonical stub. If none match,
-proceed with the existing AI path (`api_mappings.py` + `luau-analyze`
-reprompt loop).
+The composer reads `kind` and dispatches to the right runtime function;
+order is preserved so a `movement.impulse` runs before a `hit_detection`
+that depends on the velocity. The composer is the only runtime entrypoint
+script consumers need to know about.
+
+### Pipeline integration
+
+`code_transpiler.transpile_scripts` gains a pre-AI classification step:
+
+  1. For each Unity script class, run the gameplay detectors against the
+     scene-node bindings that reference that class.
+  2. For each scene node where detection returns a `Behavior`, emit the
+     per-instance stub directly (skip AI for that node).
+  3. For nodes that don't match, proceed with the existing AI path
+     (`api_mappings.py` + `luau-analyze` reprompt loop).
+
+The same `.cs` class can yield different stubs at different scene nodes if
+the prefab overrides (force, damage) differ — the detector reads per-node
+attributes.
 
 ### Genre neutrality
 
 The patterns we're translating aren't FPS-specific despite the test project
 being SimpleFPS:
 
-| Pattern | Genre coverage |
+| Capability | Genre coverage |
 |---|---|
-| Rigidbody projectile | FPS bullets, RPG fireballs, RTS missiles, action-game grenades |
-| Animator-bool actuator | Doors, drawbridges, elevators, gates, traps |
-| Camera-raycast hitscan | FPS shooters, RTS unit attacks, top-down click damage |
+| `Movement.Impulse` | FPS bullets, RPG fireballs, RTS missiles, action grenades |
+| `Trigger.OnAttributeBecomesTrue` | Doors, gates, elevators, traps |
+| `HitDetection.OverlapSphere` | Splash damage, AoE spells, proximity sensors |
+| `Trigger.OnPickup` | Items, ammo, keys, power-ups |
 
-Adapters live under `converter/gameplay/`, not `converter/scaffolding/fps/`.
-Runtime libraries live under `runtime/gameplay/`. No "Auto Fps" prefix on
-anything that isn't actually FPS-specific.
-
-What STAYS in `converter/scaffolding/fps.py`: the genuinely FPS-coded parts —
-HUD ScreenGui (health/ammo/crosshair), `MouseBehavior.LockCenter`, WeaponSlot
-attached to camera, first-person body-hide via `LocalTransparencyModifier`.
-Those are an FPS-input/UX convention, not a Unity pattern.
+Capabilities and runtime libraries live under `converter/gameplay/` and
+`runtime/gameplay/` — no "AutoFps" prefix on anything that isn't actually
+FPS-specific. What stays in `converter/scaffolding/fps.py`: the genuinely
+FPS-coded parts (HUD ScreenGui, `MouseBehavior.LockCenter`, WeaponSlot
+attached to camera, first-person body-hide). Those are FPS-input/UX
+conventions, not Unity patterns.
 
 ## Feature flag and migration
 
-`--use-gameplay-adapters` CLI flag, default off in PR #72. When off, the
-existing coherence packs run unchanged (no regression for projects that have
-already been converted).
+`--use-gameplay-adapters` CLI flag. Default off in PR #73, default on in
+PR #74. Six-PR migration:
 
-PR sequence:
+  - **PR #72 (this):** design doc only.
+  - **PR #73:** introduce capabilities + runtime libraries + detectors,
+    behind the flag (default off). All three existing coherence packs
+    unchanged. Tests + golden files for the new path.
+  - **PR #74:** flip default on. Old coherence packs RETAINED behind an
+    opt-out (`--legacy-gameplay-packs`) so users can A/B-compare the two
+    paths or roll back without code changes. End-to-end validation on
+    SimpleFPS + Gamekit3D + ChopChop.
+  - **PR #75:** rename `_AutoFpsEventDispatch` → `EventDispatch` in
+    `runtime/event_dispatch.luau`. Compatibility shim re-exports the old
+    name so already-converted outputs that reference `_AutoFpsEventDispatch`
+    keep working.
+  - **PR #76:** delete the three coherence packs (their tests and the
+    `_AutoFpsHud*` opt-in clutter come with). Compat shim from PR #75
+    stays. `--legacy-gameplay-packs` becomes an error.
+  - **PR #77:** remove the compat shim and the `--use-gameplay-adapters`
+    flag. Architecture is the default and only path.
 
-  - PR #72 (this PR): introduce specs + runtime libs + detector skeletons,
-    behind the flag. Off by default. Existing coherence packs unchanged.
-  - PR #73: turn the flag on, delete the three packs, run end-to-end on
-    SimpleFPS (already validated in Studio) and smoke-test on Gamekit3D and
-    ChopChop to confirm cross-project pattern matching.
-  - PR #74: rename `_AutoFpsEventDispatch` → `EventDispatch` in
-    `runtime/event_dispatch.luau` (the `AutoFps` prefix was defensive
-    naming; the gameplay runtime libs adopt a clean prefix scheme from the
-    start so they don't repeat that mistake).
-  - PR #75: remove the feature flag, finalise rename to default behaviour.
+Codex review specifically called out the danger of merging
+"flag-on + delete packs" in a single PR (no safety net at the moment you
+need it most). PR #74 keeps both paths live; PR #76 only deletes after
+PR #74 has soaked in production.
 
-Each PR is reviewable independently and rolls back independently.
+Each PR is reviewable independently and rolls back independently. PR #75 is
+the only one that touches runtime module names; the compat shim makes that
+rollback-safe too.
 
 ## Rejected alternatives
 
-**Keep coherence packs, just make the regexes better.** Twelve rounds of
-codex review say no. Each fix uncovers a new edge because the matching
-surface is "AI-transpiled Luau text" and that's an unbounded surface.
-
-**One mega-runtime module that scripts require.** Looks attractive, but
-collapses all three adapters into a single Lua file with three unrelated
-public APIs. Easier to test and version per-adapter.
-
-**Replace AI transpilation entirely with canonical bodies for ALL Unity
-scripts.** Out of scope. The AI still has clear value for Unity scripts that
-don't match a recognised gameplay pattern. The adapter system is opt-in per
-script via spec detection — unrecognised scripts go through the existing
-AI path unchanged.
+  - **Keep coherence packs, just make the regexes better.** Twelve rounds
+    of codex review say no. Each fix uncovers a new edge because the
+    matching surface is "AI-transpiled Luau text" and that's unbounded.
+  - **One mega-runtime module that scripts require.** Collapses every
+    capability into a single Lua file with N unrelated public APIs. The
+    per-family split lets each runtime library be tested and versioned
+    independently.
+  - **Replace AI transpilation entirely with canonical bodies for ALL
+    Unity scripts.** Out of scope. AI keeps clear value for Unity scripts
+    that don't match a recognised pattern (Player.cs's full input handling,
+    custom MonoBehaviours specific to the game). The adapter system is
+    opt-in per detected behaviour.
+  - **Three monolithic specs (`ProjectileSpec`, `ActuatorSpec`,
+    `DamageInteractionSpec`).** Codex review pushed back: overloaded,
+    didn't cover sensor/trigger interactions, smuggled class-level
+    assumptions (`weapon_class`, `target_child_name`). Replaced with the
+    capability composition above.
 
 ## Risks and mitigations
 
-  - **Spec mis-detection.** A non-projectile script that happens to have
-    `AddForce` + `OnCollisionEnter` could be falsely classified. Mitigation:
+  - **Capability mis-detection.** A non-projectile Rigidbody that happens
+    to have AddForce somewhere could match `Movement.Impulse`. Mitigation:
     detectors emit their decision into `conversion_report.json`; users can
-    disable adapter classification per-class via a deny-list config file in
-    the output dir. Tests run all 9 test projects through the detectors and
-    pin expected matches.
-  - **Runtime-library regression.** Centralising the projectile logic into
-    one file means a bug in `projectile.luau` breaks every projectile. The
-    file is small and unit-testable end-to-end with stubbed `workspace` /
-    `RunService` — much easier to test than scattered regex matches.
-  - **Migration cost.** Three coherence packs + ~30 tests get deleted in
-    PR #73. Total deletion is ~600 lines; total addition (this PR series) is
-    ~800 lines. Net code growth is modest; conceptual surface shrinks
-    significantly because the three packs collapse to one mental model
-    (adapter classifies, runtime executes).
+    disable per-class via deny-list (`.gameplay_deny.txt`). Tests run all
+    9 test projects through the detectors and pin expected matches —
+    regression on Gamekit3D / ChopChop / etc. fails CI.
+  - **Runtime-library regression.** Centralising e.g. all projectile logic
+    in `movement.luau` means a bug there breaks every projectile. Each
+    runtime library is small (~100 lines) and unit-testable end-to-end
+    with stubbed `workspace` / `RunService`. Golden-file tests pin the
+    expected emit for canonical Unity inputs.
+  - **Capability vocabulary growth.** The list above is enough to cover
+    the SimpleFPS + Gamekit3D + ChopChop patterns we know about. New
+    Unity patterns extend by adding ONE variant to ONE family (e.g.
+    `Movement.OrbitAround(point)` for spell projectiles). Adding a fifth
+    family would be a flag that we got the partition wrong; PR #73's
+    cross-project smoke tests will catch this early.
+  - **Migration cost.** Six PRs sounds like a lot. The reason is each PR
+    is small (~200 line changes) and individually reviewable. The total
+    code surface deleted (~600 lines coherence packs + ~30 tests) is
+    larger than the added composer + capability libraries (~500 lines)
+    and the conceptual surface shrinks dramatically (one mental model:
+    detector classifies → behaviour table → composer runs).
