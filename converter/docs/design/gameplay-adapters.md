@@ -470,35 +470,116 @@ conventions, not Unity patterns.
 
 ## Feature flag and migration
 
-`--use-gameplay-adapters` CLI flag. Default off in PR #73, default on in
-PR #74. Six-PR migration:
+`--use-gameplay-adapters` CLI flag. Default off in PR #73c (and before),
+default on in PR #74. Eight-PR migration (originally proposed as six;
+codex pushback on PR #72 sharpened the slicing and added two cuts):
 
   - **PR #72 (this):** design doc only.
-  - **PR #73:** introduce capabilities + runtime libraries + detectors,
-    behind the flag (default off). All three existing coherence packs
-    unchanged. Tests + golden files for the new path.
-  - **PR #74:** flip default on. Old coherence packs RETAINED behind an
-    opt-out (`--legacy-gameplay-packs`) so users can A/B-compare the two
-    paths or roll back without code changes. End-to-end validation on
-    SimpleFPS + Gamekit3D + ChopChop.
-  - **PR #75:** rename `_AutoFpsEventDispatch` → `EventDispatch` in
-    `runtime/event_dispatch.luau`. Compatibility shim re-exports the old
-    name so already-converted outputs that reference `_AutoFpsEventDispatch`
-    keep working.
-  - **PR #76:** delete the three coherence packs (their tests and the
-    `_AutoFpsHud*` opt-in clutter come with). Compat shim from PR #75
-    stays. `--legacy-gameplay-packs` becomes an error.
-  - **PR #77:** remove the compat shim and the `--use-gameplay-adapters`
-    flag. Architecture is the default and only path.
 
-Codex review specifically called out the danger of merging
-"flag-on + delete packs" in a single PR (no safety net at the moment you
-need it most). PR #74 keeps both paths live; PR #76 only deletes after
-PR #74 has soaked in production.
+  - **PR #73a:** framework + door vertical slice.
+    - CLI flag (default off).
+    - `Behavior` IR, capability dataclasses, ClassVar `READS`/`WRITES`,
+      emit-time validator (single-writer-per-key, reader-after-writer).
+    - Detector Protocol (`primary()` / `confirm()` / `behavior()`) +
+      `AmbiguousDetectionError`. Contract test that empty C# source
+      doesn't change `primary()` results.
+    - Composer (Lua) + family registry + `_GameplayBound` marker.
+    - Door slice end-to-end: `Trigger.OnBoolAttribute`,
+      `Movement.AttributeDrivenTween`, `Lifetime.Persistent`.
+    - Deny-list plumbing (`<output>/.gameplay_deny.txt`).
+    - Cross-family contract tests — the door alone exercises
+      Trigger→Movement handoff via `ctx.trigger.value`.
 
-Each PR is reviewable independently and rolls back independently. PR #75 is
-the only one that touches runtime module names; the compat shim makes that
-rollback-safe too.
+  - **PR #73b:** projectile vertical slice.
+    - `Movement.Impulse`, `Lifetime.Despawn`,
+      `HitDetection.RaycastSegment`, `HitDetection.OverlapSphere`,
+      `Effect.Damage`, `Effect.Splash`, `Effect.SpawnTemplate`.
+    - Detectors for TurretBullet and PlaneBullet (both Unity-source
+      shapes in SimpleFPS).
+    - End-to-end smoke: SimpleFPS bullet behaviour matches the legacy
+      pack output side-by-side (regression diff on rbxlx).
+
+  - **PR #73c:** damage routing + cross-project smokes.
+    - `damage_protocol.luau` — client and server halves in one file.
+      Value-preserving (server mirrors client's payload verbatim,
+      coerces non-scalar to `true`), camera-origin replay, distance
+      gate, `AmbiguousDetectionError` on multi-match.
+    - Cross-project smoke matrix: SimpleFPS + Gamekit3D + ChopChop.
+      Each project's detectors run; the matches table is golden-tested
+      so detector regressions on non-FPS projects fail CI.
+
+  - **PR #74:** flip default ON.
+    - `--use-gameplay-adapters` defaults true.
+    - `--legacy-gameplay-packs` opt-out flag.
+    - The two modes are **mutually exclusive** at pipeline level. The
+      pipeline asserts at startup: if `--legacy-gameplay-packs` is set,
+      adapter detection is disabled entirely and adapter runtime
+      modules are NOT emitted. If `--use-gameplay-adapters` is on,
+      legacy coherence packs are disabled entirely. Codex pushback on
+      PR #72 flagged that running both produces double-binding (legacy
+      mutates the transpiled body, adapter emits a new stub — they fight
+      over the same scene parts).
+    - Rehydration-aware prune pass: on re-conversion of an output that
+      contains legacy artifacts (`_AutoFpsDoorTweenInjected` marker,
+      `_AutoDamageEventRouter` script, `_AutoFpsHud*` GuiObjects), the
+      pipeline removes them BEFORE adapters emit their replacements,
+      regardless of which mode produced the artifacts. Prevents stale
+      half-state from poisoning the new path.
+    - Codifies the soak-and-delete exit criteria for PR #76 in a new
+      `docs/design/gameplay-adapters-rollout.md` companion doc.
+
+  - **PR #75:** introduce `EventDispatch` runtime module under
+    `runtime/gameplay/event_dispatch.luau`, parented at runtime to a
+    converter-owned `ReplicatedStorage.AutoGen` Folder (NOT directly
+    under `ReplicatedStorage` where user-authored `EventDispatch.cs`
+    transpilations would land). Add an Instance-level alias: at
+    pipeline emit time, the converter ALSO drops a same-named
+    `ModuleScript` at the original `ReplicatedStorage.AutoFpsEventDispatch`
+    location whose body just `return require(ReplicatedStorage.AutoGen.EventDispatch)`.
+    Already-converted outputs that call
+    `WaitForChild("AutoFpsEventDispatch")` from their script bodies
+    keep resolving. The user-script collision risk codex flagged is
+    avoided because the new canonical name lives under `AutoGen/`,
+    not directly under RS.
+
+  - **PR #76:** delete the three coherence packs. Exit criteria
+    codified in `docs/design/gameplay-adapters-rollout.md` (added
+    in #74), enforced via CI check that fails if criteria aren't
+    documented as met:
+      1. Adapters default-on for ≥ 2 consecutive converter releases.
+      2. Zero P1/P2 gameplay regressions reported on the three target
+         patterns across the soak window.
+      3. Cross-project smoke matrix (SimpleFPS / Gamekit3D / ChopChop)
+         green at PR #74 merge AND at the end of the soak window.
+      4. `--legacy-gameplay-packs` rollback usage near-zero during
+         soak (tracked manually; no telemetry pipeline assumed).
+    `--legacy-gameplay-packs` flag becomes a hard error pointing at
+    the relevant CHANGELOG entry. Compat shim from PR #75 stays.
+
+  - **PR #77:** remove `--use-gameplay-adapters` flag. Legacy packs
+    are already gone (since #76) so the flag has no off-state to
+    switch to. Pure cleanup. Compat shim from PR #75 stays.
+
+  - **PR #78:** remove the `AutoFpsEventDispatch` Instance alias from
+    PR #75, after at least one full reconversion cycle confirms no
+    converted output still references the old name in `WaitForChild`.
+    Separate from #77 because flag-removal and shim-removal are
+    independent rollback levers — collapsing them prevents partial
+    rollback if either turns out to be premature.
+
+Codex review on the v6 plan pushed back specifically on:
+  - PR #73 being too big as a single PR (now split into 73a/b/c).
+  - Mode coexistence (now mutually exclusive at pipeline level).
+  - `AutoFpsEventDispatch` rename being unsafe without an Instance-
+    level alias (added in PR #75).
+  - "Soaked in production" being too vague (now codified exit
+    criteria in PR #74).
+  - PR #77 collapsing flag-removal + shim-removal (now split into
+    PR #77 and PR #78).
+
+Each PR is reviewable independently and rolls back independently. The
+8-PR plan looks longer than the original 6-PR plan but each cut is
+smaller and the rollback levers stay distinct.
 
 ## Rejected alternatives
 
