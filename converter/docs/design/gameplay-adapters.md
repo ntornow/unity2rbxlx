@@ -461,13 +461,34 @@ precisely. Top-level counters: `total_classes_emitted` (unique by
   - `triggers.luau` — `Triggers.onBoolAttribute(target, name, ctx)`
     (publishes normalized bool to `ctx.trigger.value` on bind + every
     change), `Triggers.onPickup(zone, fn)`.
-  - `damage_protocol.luau` — owns the RemoteEvent end-to-end (client fire,
-    server receive, validation, attribute mirror). Client and server halves
-    in one file; protocol drift is structurally impossible. The damage
-    attribute is the boundary between Effect and listener; PR #72 doesn't
-    define a client-side hitscan protocol (codex flagged the previous
-    `DamageInteractionSpec` as FPS-flavoured — handled in a follow-up PR
-    after we see real call sites).
+  - `damage_protocol.luau` — owns `ReplicatedStorage.DamageEvent`
+    end-to-end (client fire, server receive, validation, attribute
+    mirror). Client and server halves in one file so protocol drift is
+    structurally impossible. Server validation pipeline: type guards →
+    origin drift gate (`MAX_ORIGIN_DRIFT_STUDS = 20`) → raycast replay
+    from the client-supplied camera origin + dir → distance gate via
+    `MAX_SHOOT_RANGE_STUDS = 100m·3.571·1.5` → value-preserving
+    attribute mirror (non-scalar payloads coerce to `true` so a
+    malicious table can't crash `SetAttribute`). Client half is
+    `DamageProtocol.fire(hitInstance, takeDamageValue)` — reads
+    `workspace.CurrentCamera.CFrame` and FireServers the four-arg
+    payload. The damage attribute remains the boundary between Effect
+    and listener.
+
+    **Idempotent server init** is part of the public contract: an
+    internal `_serverInitialized` flag short-circuits a second
+    `_initServer()` call so a double-load (the always-on bootstrap
+    Script + a workspace-placed adapter stub triggering the same
+    `require()`) doesn't double-bind `OnServerEvent`. Test-only
+    `_resetForTest()` hook re-arms the flag.
+
+    **Canonical name collision posture**: if a non-RemoteEvent
+    Instance already sits at `ReplicatedStorage.DamageEvent` at init
+    time (user-authored Folder, leftover BindableEvent, etc.), the
+    bootstrap renames it to `DamageEvent_displaced` and emits a fresh
+    RemoteEvent at the canonical name. Same posture the legacy
+    `_AutoDamageEventRouter` took before the migration; protects
+    `FireServer` callers from crashing on a type mismatch.
 
 A composer (`converter/runtime/gameplay/composer.luau`) wires capabilities
 together at runtime. Given a behaviour list, it threads the per-family
@@ -477,6 +498,53 @@ vocabulary is small. See "Capability dataflow contract" above for the
 specifics — including how composition errors are caught at emit time, not
 runtime, and why namespacing prevents the local-variable collision problem
 that a flat shared-state approach would have.
+
+### Always-on server bootstrap
+
+(Added PR #73c after codex round-1 [P1] on damage routing.)
+
+Every family runtime module — including `damage_protocol.luau` — is a
+ModuleScript parented to `ReplicatedStorage.AutoGen`. ModuleScripts in
+ReplicatedStorage **do not auto-run**; they execute only when
+something else `require()`s them. Per-instance adapter stubs DO
+require `Gameplay` (the orchestrator that pulls in every family,
+including DamageProtocol), but those stubs are typically attached to
+prefab template parts under `ReplicatedStorage.Templates` — and
+template-scoped scripts don't run until the first runtime clone
+spawns into Workspace. SimpleFPS is the canonical case: TurretBullet,
+PlaneBullet, and SciFi_Door MonoBehaviours all live on prefab roots,
+so the entire Gameplay orchestrator wouldn't load until the first
+bullet was instantiated.
+
+That timing gap is fatal for any family that needs to be **listening
+at server start**, not just available when a stub fires. Damage
+routing is the prototypical case: a Player LocalScript firing
+`DamageEvent` on its first click (before any bullet has spawned)
+would hit a nil RemoteEvent and silently drop the shot. The legacy
+`_AutoDamageEventRouter` was an always-on `Script` in
+`ServerScriptService` precisely for this reason — moving the
+validator logic into a ModuleScript without preserving the always-on
+posture is a regression.
+
+Fix: `runtime/gameplay/server_bootstrap.luau` — a `Script` (not
+ModuleScript) parented to `ServerScriptService` at emit time.
+`WaitForChild("AutoGen", 30) → WaitForChild("Gameplay", 30) →
+require(...)`. Pipeline injection lives next to the existing
+ReplicatedStorage gameplay-modules block, gated on the same
+`adapter_stubs_present` predicate.
+
+**When to add a new family to the bootstrap path.** Only when the
+family needs server-side state attached at game start, independent of
+any specific adapter binding. Common case: owning a RemoteEvent /
+RemoteFunction the AI-transpiled scripts call into. Counter-case: a
+family that only does work *during* a `Composer.run` call (Movement,
+Lifetime, HitDetection, Effects) needs no bootstrap — its handler
+fires when the per-instance stub fires, which is the right time. The
+orchestrator already force-requires every family, so adding a new
+family to the bootstrap path is automatic IF the family's `require()`
+side-effect performs the server-side init. DamageProtocol's
+`_initServer()` is the reference pattern: idempotent, `RunService:
+IsServer()`-gated, runs once at first require.
 
 ### Emit: behaviour table
 
@@ -606,6 +674,71 @@ explicitly in `WRITES` so the validator at least catches reader-after-
 writer ordering on signal subscribers. PR #73b will revisit whether
 signals should become a first-class capability output (typed
 `subscribe()` interface) rather than smuggling them through ctx.
+
+### Legacy pack mutex — three tiers
+
+(Added PR #73c. PR #73a introduced full-disable mutex for one pack;
+PR #73c added the partial-disable tier and made the model explicit.)
+
+The pre-existing `script_coherence_packs.py` packs and the new
+gameplay adapters can BOTH mutate the converter output in overlapping
+ways. Coexistence has to be policed pack-by-pack, not globally —
+codex pushback on PR #72 flagged that "let both run" produces double-
+binding (e.g. legacy door pack mutates the AI-transpiled body to
+animate a sliding mesh, AND the adapter emits a Composer.run stub on
+the same prefab → two tween paths fight over the same `CFrame`).
+
+Three tiers depending on how much of the legacy pack the adapter
+fully replaces:
+
+  1. **Full disable** — entire pack is skipped when adapters are on.
+     Use when the adapter's emission completely supersedes the pack's
+     output. Implementation: the pack name lives in the
+     `LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON` frozenset in
+     `pipeline.py`, which `transpile_scripts` forwards to
+     `script_coherence_packs.run_packs` as `disabled`. Members:
+     `door_tween_open` (PR #73a — adapter owns the door slice end-
+     to-end), `bullet_physics_raycast` (PR #73b — adapter owns the
+     bullet behaviour).
+
+  2. **Partial disable via runtime marker scan** — pack still runs
+     but skips ONE of its responsibilities when adapter stubs are
+     present. Use when the pack does two distinct things and the
+     adapter only replaces one of them. Implementation: the pack's
+     apply function scans `scripts` for `ADAPTER_STUB_MARKER` and
+     short-circuits the now-redundant half. Member:
+     `player_damage_remote_event` (PR #73c — adapter's
+     `damage_protocol.luau` replaces the `_AutoDamageEventRouter`
+     Script, but the pack's body-patch half still has to run because
+     AI-transpiled Player LocalScripts still need their inline
+     `FireServer` call wired up).
+
+  3. **No mutex needed** — packs whose work doesn't overlap with any
+     adapter family. Default posture; no listing required. The
+     adapter system is opt-in per detected behaviour, so most legacy
+     packs (FPS rifle pickup, animator coercion, etc.) keep running
+     unchanged.
+
+**Stale-artifact pruning** (tier 2 supplemental). The partial-
+disable pack ALSO removes any stale artifact from a prior adapters-
+off conversion at apply time. Example: a pre-existing
+`_AutoDamageEventRouter` Script left on disk by a previous adapters-
+off run would double-bind `OnServerEvent` against the new
+DamageProtocol if both ran. The pack's `detect()` widens to fire
+when adapters are active AND a legacy router exists (so the apply
+path runs and prunes); the apply function removes the script in
+place. PR #74's broader rehydration-aware prune pass covers the rest
+of the legacy-artifact surface (`_AutoFpsDoorTweenInjected` marker,
+HUD GuiObjects); PR #73c handles only the damage-router slice
+because that's the one a partial-disable pack already touches.
+
+**Why partial disable beats splitting the pack into two packs**:
+splitting requires duplicating the `detect()` signal (Player.cs body
+plus router source) across two packs, then orchestrating their
+execution order. The marker scan is a single side-effecting check
+inside the existing apply function. Future tier-2 packs should
+follow the same pattern: keep the pack atomic, gate the half-that-
+adapters-replace on `ADAPTER_STUB_MARKER in s.source for s in scripts`.
 
 ### Pipeline integration
 
