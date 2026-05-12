@@ -69,6 +69,35 @@ records under `converter/converter/gameplay/capabilities.py`:
     - `SpawnTemplate(name)` — clone `ReplicatedStorage.Templates.<name>`
       at impact (e.g. `Explosion`)
     - `ApplyAttribute(name, value)` — generic attribute write on hit target
+
+**`Effect.Damage` runtime contract** (added to the doc in PR #73c —
+codex PR #73b round-1 [P1] flagged that both invariants below are
+load-bearing and were previously implicit). Binding on implementers,
+tested in `tests/test_gameplay_adapters_projectile.py::TestDamagePlayerFilter`:
+
+  - **Player-tag gate.** ``Effects.damage`` applies damage ONLY when
+    the hit Instance's ancestor model is recognised as a Player.
+    Three-way check: (a) `Players:GetPlayerFromCharacter(model)`
+    resolves to a real Player; OR (b) the hit Instance carries the
+    `"Player"` CollectionService tag; OR (c) the model is named
+    `"Player"` (test scaffolding + the auto-injected FPS character).
+    Any one match means damage applies. Mirrors Unity
+    `TurretBullet.cs`'s `other.collider.tag == "Player"` filter —
+    NPCs / allied Humanoids MUST NOT take damage from a TurretBullet,
+    or any project with friendly characters regresses. The check is
+    inside `Effects.damage`'s impact subscription, indent-scoped so
+    a future refactor that wraps the damage call in a different
+    conditional fails the test gate.
+  - **Despawn-on-any-impact.** The bullet container is destroyed on
+    every impact — Player damage, non-Player Humanoid, OR wall hit.
+    Without this, raycast bullets persist past their first hit and
+    can damage multiple targets in a single frame, or worse, fly on
+    forever as ghost particles. The destroy call sits OUTSIDE the
+    `if isPlayer` branch so wall hits also clean up the container.
+    `Effect.Splash` and `Effect.SpawnTemplate` follow the same
+    pattern; whichever Effect runs LAST in the tuple owns the
+    `container:Destroy` (validator-enforced ordering ensures exactly
+    one destroyer).
   - **Trigger**
     - `OnEnter(tag_or_attribute_filter)` — `OnTriggerEnter` with tag match
     - `OnBoolAttribute(name)` — Animator-bool, e.g. door's `open`; publishes
@@ -380,7 +409,27 @@ False positives are reported in `conversion_report.json` and rejectable via
 an output-dir deny-list (`<output>/.gameplay_deny.txt` — one ID per
 line; either a scene-node `unity_file_id` OR a component file_id is
 accepted, so an operator can suppress one MonoBehaviour on a multi-
-component node without losing detection on the others). The conversion
+component node without losing detection on the others).
+
+**Deny-list entry forms (PR #73b — qualified form added in PR #73c
+doc-update):**
+
+  - **Bare `<file_id>`** — matches across every source that carries
+    that ID. The original PR #73a form. Still supported for backward
+    compatibility, but ambiguous after PR #73b's prefab walk.
+  - **Qualified `<source_path>#<file_id>`** — matches the file_id only
+    when it appears under the given absolute source path. Required
+    when two prefab assets share a local file_id (Unity's local IDs
+    are not globally unique across `.prefab` files; PR #73b prefab
+    walking made `&100000` a routine collision in SimpleFPS).
+
+A multi-match `AmbiguousDetectionError` log line surfaces all three
+deny-list forms an operator can paste — bare node_file_id, bare
+component_file_id, and the qualified `<source_path>#<id>` shape — so
+suppressing one specific prefab doesn't require an extra round trip
+to find the source path. Both forms can coexist in a single
+`.gameplay_deny.txt`; whichever matches first wins. Lines beginning
+with `#` are comments. The conversion
 report's `gameplay_adapters.bindings[]` entries carry `node_name`,
 `node_file_id`, `component_file_id`, `target_class_name`,
 `script_path` (absolute on disk; "relative" is a misnomer in #73a —
@@ -412,13 +461,34 @@ precisely. Top-level counters: `total_classes_emitted` (unique by
   - `triggers.luau` — `Triggers.onBoolAttribute(target, name, ctx)`
     (publishes normalized bool to `ctx.trigger.value` on bind + every
     change), `Triggers.onPickup(zone, fn)`.
-  - `damage_protocol.luau` — owns the RemoteEvent end-to-end (client fire,
-    server receive, validation, attribute mirror). Client and server halves
-    in one file; protocol drift is structurally impossible. The damage
-    attribute is the boundary between Effect and listener; PR #72 doesn't
-    define a client-side hitscan protocol (codex flagged the previous
-    `DamageInteractionSpec` as FPS-flavoured — handled in a follow-up PR
-    after we see real call sites).
+  - `damage_protocol.luau` — owns `ReplicatedStorage.DamageEvent`
+    end-to-end (client fire, server receive, validation, attribute
+    mirror). Client and server halves in one file so protocol drift is
+    structurally impossible. Server validation pipeline: type guards →
+    origin drift gate (`MAX_ORIGIN_DRIFT_STUDS = 20`) → raycast replay
+    from the client-supplied camera origin + dir → distance gate via
+    `MAX_SHOOT_RANGE_STUDS = 100m·3.571·1.5` → value-preserving
+    attribute mirror (non-scalar payloads coerce to `true` so a
+    malicious table can't crash `SetAttribute`). Client half is
+    `DamageProtocol.fire(hitInstance, takeDamageValue)` — reads
+    `workspace.CurrentCamera.CFrame` and FireServers the four-arg
+    payload. The damage attribute remains the boundary between Effect
+    and listener.
+
+    **Idempotent server init** is part of the public contract: an
+    internal `_serverInitialized` flag short-circuits a second
+    `_initServer()` call so a double-load (the always-on bootstrap
+    Script + a workspace-placed adapter stub triggering the same
+    `require()`) doesn't double-bind `OnServerEvent`. Test-only
+    `_resetForTest()` hook re-arms the flag.
+
+    **Canonical name collision posture**: if a non-RemoteEvent
+    Instance already sits at `ReplicatedStorage.DamageEvent` at init
+    time (user-authored Folder, leftover BindableEvent, etc.), the
+    bootstrap renames it to `DamageEvent_displaced` and emits a fresh
+    RemoteEvent at the canonical name. Same posture the legacy
+    `_AutoDamageEventRouter` took before the migration; protects
+    `FireServer` callers from crashing on a type mismatch.
 
 A composer (`converter/runtime/gameplay/composer.luau`) wires capabilities
 together at runtime. Given a behaviour list, it threads the per-family
@@ -428,6 +498,53 @@ vocabulary is small. See "Capability dataflow contract" above for the
 specifics — including how composition errors are caught at emit time, not
 runtime, and why namespacing prevents the local-variable collision problem
 that a flat shared-state approach would have.
+
+### Always-on server bootstrap
+
+(Added PR #73c after codex round-1 [P1] on damage routing.)
+
+Every family runtime module — including `damage_protocol.luau` — is a
+ModuleScript parented to `ReplicatedStorage.AutoGen`. ModuleScripts in
+ReplicatedStorage **do not auto-run**; they execute only when
+something else `require()`s them. Per-instance adapter stubs DO
+require `Gameplay` (the orchestrator that pulls in every family,
+including DamageProtocol), but those stubs are typically attached to
+prefab template parts under `ReplicatedStorage.Templates` — and
+template-scoped scripts don't run until the first runtime clone
+spawns into Workspace. SimpleFPS is the canonical case: TurretBullet,
+PlaneBullet, and SciFi_Door MonoBehaviours all live on prefab roots,
+so the entire Gameplay orchestrator wouldn't load until the first
+bullet was instantiated.
+
+That timing gap is fatal for any family that needs to be **listening
+at server start**, not just available when a stub fires. Damage
+routing is the prototypical case: a Player LocalScript firing
+`DamageEvent` on its first click (before any bullet has spawned)
+would hit a nil RemoteEvent and silently drop the shot. The legacy
+`_AutoDamageEventRouter` was an always-on `Script` in
+`ServerScriptService` precisely for this reason — moving the
+validator logic into a ModuleScript without preserving the always-on
+posture is a regression.
+
+Fix: `runtime/gameplay/server_bootstrap.luau` — a `Script` (not
+ModuleScript) parented to `ServerScriptService` at emit time.
+`WaitForChild("AutoGen", 30) → WaitForChild("Gameplay", 30) →
+require(...)`. Pipeline injection lives next to the existing
+ReplicatedStorage gameplay-modules block, gated on the same
+`adapter_stubs_present` predicate.
+
+**When to add a new family to the bootstrap path.** Only when the
+family needs server-side state attached at game start, independent of
+any specific adapter binding. Common case: owning a RemoteEvent /
+RemoteFunction the AI-transpiled scripts call into. Counter-case: a
+family that only does work *during* a `Composer.run` call (Movement,
+Lifetime, HitDetection, Effects) needs no bootstrap — its handler
+fires when the per-instance stub fires, which is the right time. The
+orchestrator already force-requires every family, so adding a new
+family to the bootstrap path is automatic IF the family's `require()`
+side-effect performs the server-side init. DamageProtocol's
+`_initServer()` is the reference pattern: idempotent, `RunService:
+IsServer()`-gated, runs once at first require.
 
 ### Emit: behaviour table
 
@@ -558,6 +675,71 @@ writer ordering on signal subscribers. PR #73b will revisit whether
 signals should become a first-class capability output (typed
 `subscribe()` interface) rather than smuggling them through ctx.
 
+### Legacy pack mutex — three tiers
+
+(Added PR #73c. PR #73a introduced full-disable mutex for one pack;
+PR #73c added the partial-disable tier and made the model explicit.)
+
+The pre-existing `script_coherence_packs.py` packs and the new
+gameplay adapters can BOTH mutate the converter output in overlapping
+ways. Coexistence has to be policed pack-by-pack, not globally —
+codex pushback on PR #72 flagged that "let both run" produces double-
+binding (e.g. legacy door pack mutates the AI-transpiled body to
+animate a sliding mesh, AND the adapter emits a Composer.run stub on
+the same prefab → two tween paths fight over the same `CFrame`).
+
+Three tiers depending on how much of the legacy pack the adapter
+fully replaces:
+
+  1. **Full disable** — entire pack is skipped when adapters are on.
+     Use when the adapter's emission completely supersedes the pack's
+     output. Implementation: the pack name lives in the
+     `LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON` frozenset in
+     `pipeline.py`, which `transpile_scripts` forwards to
+     `script_coherence_packs.run_packs` as `disabled`. Members:
+     `door_tween_open` (PR #73a — adapter owns the door slice end-
+     to-end), `bullet_physics_raycast` (PR #73b — adapter owns the
+     bullet behaviour).
+
+  2. **Partial disable via runtime marker scan** — pack still runs
+     but skips ONE of its responsibilities when adapter stubs are
+     present. Use when the pack does two distinct things and the
+     adapter only replaces one of them. Implementation: the pack's
+     apply function scans `scripts` for `ADAPTER_STUB_MARKER` and
+     short-circuits the now-redundant half. Member:
+     `player_damage_remote_event` (PR #73c — adapter's
+     `damage_protocol.luau` replaces the `_AutoDamageEventRouter`
+     Script, but the pack's body-patch half still has to run because
+     AI-transpiled Player LocalScripts still need their inline
+     `FireServer` call wired up).
+
+  3. **No mutex needed** — packs whose work doesn't overlap with any
+     adapter family. Default posture; no listing required. The
+     adapter system is opt-in per detected behaviour, so most legacy
+     packs (FPS rifle pickup, animator coercion, etc.) keep running
+     unchanged.
+
+**Stale-artifact pruning** (tier 2 supplemental). The partial-
+disable pack ALSO removes any stale artifact from a prior adapters-
+off conversion at apply time. Example: a pre-existing
+`_AutoDamageEventRouter` Script left on disk by a previous adapters-
+off run would double-bind `OnServerEvent` against the new
+DamageProtocol if both ran. The pack's `detect()` widens to fire
+when adapters are active AND a legacy router exists (so the apply
+path runs and prunes); the apply function removes the script in
+place. PR #74's broader rehydration-aware prune pass covers the rest
+of the legacy-artifact surface (`_AutoFpsDoorTweenInjected` marker,
+HUD GuiObjects); PR #73c handles only the damage-router slice
+because that's the one a partial-disable pack already touches.
+
+**Why partial disable beats splitting the pack into two packs**:
+splitting requires duplicating the `detect()` signal (Player.cs body
+plus router source) across two packs, then orchestrating their
+execution order. The marker scan is a single side-effecting check
+inside the existing apply function. Future tier-2 packs should
+follow the same pattern: keep the pack atomic, gate the half-that-
+adapters-replace on `ADAPTER_STUB_MARKER in s.source for s in scripts`.
+
 ### Pipeline integration
 
 `Pipeline.transpile_scripts` runs the classification step BEFORE the
@@ -565,9 +747,30 @@ AI pass (the post-AI variant in an earlier #73a draft was reverted —
 codex PR #73a-round-1 flagged that overwriting AI output silently
 dropped matches whenever AI failed for the class):
 
-  1. Walk `parsed_scene.all_nodes`. For each `(node, component)` pair
-     where `component` is a MonoBehaviour with a resolvable script
-     class, run the detectors via `gameplay.integration.classify_scripts`.
+  1. Walk `parsed_scene.all_nodes` **AND every prefab template root**
+     in `prefab_library.prefabs[].root`. For each `(node, component)`
+     pair where `component` is a MonoBehaviour with a resolvable script
+     class, run the detectors via
+     `gameplay.integration.classify_scripts`. Every binding carries the
+     absolute `source_path` of the scene or prefab it came from so
+     deny-list checks (and operator reports) can disambiguate across
+     prefab assets that share local file_ids.
+
+     **Prefab traversal rationale** (added to the doc in PR #73c —
+     this load-bearing detail was missing from the #73a/#73b drafts).
+     Many Unity behaviours (doors, bullets, pickups) live exclusively
+     on `.prefab` roots and are instantiated at runtime by other
+     scripts (`Turret.cs` does `Instantiate(bulletPrefab)`); the
+     `main.unity` scene file itself carries no MonoBehaviour for them.
+     Without the prefab walk, neither the door slice (PR #73a) nor the
+     projectile slice (PR #73b) would fire end-to-end on a real
+     SimpleFPS conversion — the matched `.luau` is attached to the
+     prefab template part in `ReplicatedStorage.Templates.<name>`, so
+     every runtime clone (`Instantiate` → `Clone()` in Roblox)
+     inherits the adapter stub. PR #73b's prefab-walk extension
+     retroactively made PR #73a's door slice actually fire too —
+     SciFi_Door's MonoBehaviour also lives on the prefab template,
+     not the scene root.
   2. Aggregate per-class. Equivalence-check every per-node `Behavior`
      within a class (see "Per-instance vs per-class emission" above);
      divergent classes drop out of `matches` and land in `divergent`.
@@ -678,14 +881,58 @@ codex pushback on PR #72 sharpened the slicing and added two cuts):
     - End-to-end smoke: SimpleFPS bullet behaviour matches the legacy
       pack output side-by-side (regression diff on rbxlx).
 
-  - **PR #73c:** damage routing + cross-project smokes.
-    - `damage_protocol.luau` — client and server halves in one file.
-      Value-preserving (server mirrors client's payload verbatim,
-      coerces non-scalar to `true`), camera-origin replay, distance
-      gate, `AmbiguousDetectionError` on multi-match.
+  - **PR #73c:** damage routing + cross-project smokes + design-doc
+    catch-up.
+    - `damage_protocol.luau` — client and server halves in one file
+      under `runtime/gameplay/`. Owns `ReplicatedStorage.DamageEvent`
+      end-to-end: server-side `OnServerEvent` handler with type
+      guards → origin drift gate (`MAX_ORIGIN_DRIFT_STUDS = 20`) →
+      raycast replay from the client-supplied camera origin + dir →
+      distance gate via `MAX_SHOOT_RANGE_STUDS = 100m·3.571·1.5` →
+      value-preserving attribute mirror (non-scalar payloads coerce
+      to `true` so a malicious table can't crash `SetAttribute`).
+      Force-required by the `Gameplay` orchestrator; the legacy
+      `player_damage_remote_event` coherence pack's body-patch half
+      still runs (Player.cs LocalScripts still need their inline
+      `FireServer` call), but the legacy `_AutoDamageEventRouter`
+      Script is no longer emitted when adapter stubs are present, and
+      any stale legacy router from a prior adapters-off conversion is
+      removed so the two paths don't double-bind `OnServerEvent`.
+    - `_GameplayServerBootstrap` Script parented to
+      `ServerScriptService` (codex PR #73c-round-1 [P1]). All other
+      adapter runtime modules are ModuleScripts under
+      `ReplicatedStorage.AutoGen`; ReplicatedStorage scripts don't
+      auto-run, and per-instance stubs that `require()` the Gameplay
+      orchestrator typically live on prefab templates (the common
+      SimpleFPS shape — TurretBullet / PlaneBullet / SciFi_Door all
+      sit on prefab roots), so the orchestrator wouldn't load until
+      the first runtime clone spawned. Without the bootstrap, a
+      Player LocalScript firing `DamageEvent` on its first click
+      (before any bullet has spawned) would hit a nil RemoteEvent.
+      The legacy `_AutoDamageEventRouter` was an always-on
+      ServerScriptService Script for the same reason; the bootstrap
+      preserves that posture while keeping the validator logic in a
+      ModuleScript. `DamageProtocol._initServer` is idempotent so a
+      double-load (bootstrap + a workspace-placed adapter stub
+      triggering the same `require`) doesn't double-bind
+      `OnServerEvent`.
     - Cross-project smoke matrix: SimpleFPS + Gamekit3D + ChopChop.
-      Each project's detectors run; the matches table is golden-tested
-      so detector regressions on non-FPS projects fail CI.
+      Two layers — real-source classification when the project tree
+      is checked out (pins TurretBullet / PlaneBullet / Door for
+      SimpleFPS; pins ZERO matches across Gamekit3D and ChopChop),
+      plus always-on synthetic-fixture rejection tests so developer
+      machines without the full `test_projects/` tree still catch
+      detector regressions. A detector inventory pin
+      (`ALL_DETECTORS` exact set) forces an explicit decision about
+      cross-project coverage whenever a new detector ships.
+    - Design-doc updates deferred from #73a/#73b: (a) prefab-template
+      walk in `classify_scripts` (the load-bearing detail that made
+      doors and bullets actually fire end-to-end on SimpleFPS); (b)
+      qualified `<source_path>#<file_id>` deny-list form alongside
+      the bare-file_id form (PR #73b made bare IDs ambiguous across
+      prefab assets); (c) `Effect.Damage` runtime contract (Player-
+      tag gate + despawn-on-any-impact). All three were already
+      shipped in code in #73b — PR #73c brings the doc into sync.
 
   - **PR #74:** flip default ON.
     - `--use-gameplay-adapters` defaults true.

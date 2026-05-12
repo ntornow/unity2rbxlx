@@ -3884,6 +3884,14 @@ script.Disabled = true
                 # the first ``Composer.run`` call.
                 ("HitDetection", "hit_detection.luau"),
                 ("Effects", "effects.luau"),
+                # PR #73c: DamageProtocol owns the ``DamageEvent``
+                # RemoteEvent + server-side validator (origin replay,
+                # distance gate, value-preserving attribute mirror).
+                # Replaces the legacy ``_AutoDamageEventRouter`` Script
+                # that ``player_damage_remote_event`` emitted; the body-
+                # patch half of that pack still runs to inject
+                # ``FireServer`` into Player LocalScripts.
+                ("DamageProtocol", "damage_protocol.luau"),
                 ("Gameplay", "gameplay.luau"),
             )
             for module_name, filename in gameplay_modules:
@@ -3909,6 +3917,42 @@ script.Disabled = true
                     parent_path="ReplicatedStorage.AutoGen",
                 ))
                 injected += 1
+
+            # PR #73c codex-round-1 [P1]: emit a server-side bootstrap
+            # Script that force-loads ``AutoGen.Gameplay`` at server
+            # start. Adapter ModuleScripts under ReplicatedStorage do
+            # NOT auto-run; per-instance stubs that require Gameplay
+            # typically live on prefab templates and don't fire until
+            # the first runtime clone spawns. Without the bootstrap,
+            # ``DamageProtocol._initServer`` is delayed past the first
+            # Player click and the legacy body-patched ``FireServer``
+            # call hits a nil RemoteEvent. The legacy
+            # ``_AutoDamageEventRouter`` was an always-on Script for
+            # this exact reason; keep that posture.
+            bootstrap_path = (
+                gameplay_runtime_dir / "server_bootstrap.luau"
+            )
+            if bootstrap_path.exists():
+                bootstrap_name = "_GameplayServerBootstrap"
+                existing_bootstrap = [
+                    s for s in self.state.rbx_place.scripts
+                    if s.name == bootstrap_name
+                    and s.parent_path == "ServerScriptService"
+                ]
+                if not existing_bootstrap:
+                    self.state.rbx_place.scripts.append(_GpRbxScript(
+                        name=bootstrap_name,
+                        source=bootstrap_path.read_text(encoding="utf-8"),
+                        script_type="Script",
+                        parent_path="ServerScriptService",
+                    ))
+                    injected += 1
+            else:
+                log.warning(
+                    "[write_output] gameplay-adapter server bootstrap "
+                    "missing: %s",
+                    bootstrap_path,
+                )
 
         # PickupRuntime removed — pickup scripts are now properly propagated
         # from base prefabs to variants via _bind_scripts_to_parts cloning.

@@ -20,4 +20,13 @@ require(script.Parent:WaitForChild("Lifetime"))
 require(script.Parent:WaitForChild("HitDetection"))
 require(script.Parent:WaitForChild("Effects"))
 
+-- PR #73c: DamageProtocol owns the ``DamageEvent`` RemoteEvent and
+-- the server-side validator. Force-requiring it here means the
+-- server router is up before any adapter-driven bullet hits the
+-- ``Effects.damage`` attribute mirror, and before any AI-transpiled
+-- LocalScript fires the legacy-pack-injected ``FireServer`` call.
+-- The module's body initializes the OnServerEvent connection on
+-- first require (server-side only) and is idempotent.
+require(script.Parent:WaitForChild("DamageProtocol"))
+
 return Composer
