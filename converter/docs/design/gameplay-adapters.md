@@ -120,34 +120,166 @@ Behavior(
     unity_file_id="…",
     diagnostic_name="Door",
     capabilities=(
-        Trigger.OnAttributeBecomesTrue(name="open"),
-        Movement.ConstantVelocity(velocity_unity=(0, 4, 0)),  # +4m Y over duration
+        Movement.TweenOffset(
+            target_offset_unity=(0, 4, 0),  # from open.anim m_PositionCurves
+            open_duration=1.0,              # from clip length
+            close_duration=1.0,             # from close.anim
+            direction_attribute="open",     # toggles forward/reverse
+        ),
         Lifetime.Persistent,
     ),
 )
 ```
 
+`Movement.TweenOffset` is the door/actuator capability — it owns BOTH
+open and close motion. Codex review on the v2 draft flagged that
+`ConstantVelocity` alone didn't capture duration or close-path; folding
+both directions into a single capability that listens on the named
+attribute keeps the runtime authoritative for door semantics.
+
 The capability vocabulary is **deliberately small**. New Unity patterns
 extend the vocabulary by adding a single capability variant, not a new
 top-level Spec class.
 
+### Capability dataflow contract
+
+The previous draft said the composer runs capabilities in tuple order
+but didn't define how capabilities pass information to each other. Codex
+review flagged this as the largest remaining gap: `HitDetection.RaycastSegment`
+needs to know about the bullet's velocity (set by `Movement.Impulse`),
+and `Effect.SpawnTemplate` needs the impact CFrame (set by the hit
+detector). Without a declared contract, those handoffs become implicit
+shared state through the part instance, which is exactly the kind of
+fragility this redesign is trying to remove.
+
+**Contract:** every capability declares what context keys it READS and
+WRITES. The composer owns a per-behaviour `ctx` table keyed by capability
+family, threads it through each capability call, and enforces:
+
+  1. **Single-writer-per-key**: at most one capability per behaviour
+     writes a given `ctx.<family>.<key>`. Two capabilities trying to
+     write the same key is a converter-emit-time error, not a runtime
+     surprise.
+  2. **Reader-after-writer**: a capability that reads `ctx.<family>.<key>`
+     must appear AFTER the capability that writes it in the tuple. Also
+     enforced at emit time.
+  3. **Namespaced by family**: ctx keys live under `ctx.movement.*`,
+     `ctx.hitDetection.*`, etc. Cross-family collisions are impossible
+     by construction; intra-family collisions are caught by the
+     single-writer rule. The user's worry about local variable
+     collision lives here — explicit namespacing per family is the
+     answer.
+
+Each capability declares its reads/writes via class-level constants
+on the dataclass:
+
+```python
+@dataclass(frozen=True)
+class MovementImpulse:
+    direction_local: tuple[float, float, float]
+    force_unity: float
+    READS: ClassVar[frozenset[str]] = frozenset()
+    WRITES: ClassVar[frozenset[str]] = frozenset({"ctx.movement.velocity"})
+
+@dataclass(frozen=True)
+class HitDetectionRaycastSegment:
+    READS: ClassVar[frozenset[str]] = frozenset({"ctx.movement.velocity"})
+    WRITES: ClassVar[frozenset[str]] = frozenset({
+        "ctx.hitDetection.lastImpactCFrame",
+        "ctx.hitDetection.lastInstance",
+    })
+
+@dataclass(frozen=True)
+class EffectSpawnTemplate:
+    name: str
+    READS: ClassVar[frozenset[str]] = frozenset({"ctx.hitDetection.lastImpactCFrame"})
+    WRITES: ClassVar[frozenset[str]] = frozenset()
+```
+
+Validator (`converter/converter/gameplay/composer.py`) walks the
+capability tuple and checks: every key in a capability's `READS` set
+has appeared in some prior capability's `WRITES` set; no key appears
+in two `WRITES` sets. Mismatch → `BehaviorCompositionError` raised at
+emit time, with a pointer to the source Unity component so the user
+knows which prefab needs configuration adjustment (or which capability
+combination isn't supported).
+
+Runtime composer (`runtime/gameplay/composer.luau`) literally threads
+a Lua table:
+
+```lua
+function Composer.run(container, capabilities)
+    local ctx = {
+        movement = {},
+        lifetime = {},
+        hitDetection = {},
+        effect = {},
+        trigger = {},
+    }
+    for _, cap in ipairs(capabilities) do
+        local mod = _registry[cap.kind]
+        mod.run(container, cap, ctx)
+    end
+end
+```
+
+Each runtime module is responsible only for its own family's namespace
+in `ctx` — `movement.luau` writes `ctx.movement.*`, never anything else.
+Convention enforced by tests (the registry's `run` function for each
+family is given a `ctx.<family>` slice, not the full ctx, when feasible).
+
+This gives us:
+  - **No implicit shared state** between capabilities. Everything they
+    share is named, declared, and validated.
+  - **No variable collision** at the Lua level because each runtime
+    module operates on a family-namespaced slice.
+  - **Composition errors caught at emit time** with a clear diagnostic
+    instead of mysterious runtime behaviour.
+  - **Extension stays cheap**: a new capability variant declares its
+    reads/writes once; the composer doesn't need to know about it
+    until registration time.
+
 ### Detection is composition-first, source-substring is a prefilter
 
 Codex review noted that C# substring matching is structurally the same
-problem as Luau-regex matching, one level up. True — and the doc gates
-substring checks behind hard component-composition checks:
+problem as Luau-regex matching, one level up. To prevent future detector
+code from quietly violating "primary signal first," the detector API
+itself separates the two:
+
+```python
+class Detector(Protocol):
+    def primary(self, node: SceneNode) -> bool:
+        """Returns True iff Unity component composition supports this
+        behaviour. MUST NOT inspect source bodies. Tested with composition-
+        only fixtures."""
+    def tiebreaker(self, source_csharp: str) -> bool:
+        """Optional. Only invoked if primary() returns True AND the
+        composition is ambiguous (multiple Detector.primary results
+        match). Substring inspection lives here, scoped, named, and
+        bounded."""
+    def behavior(self, node: SceneNode, source_csharp: str) -> Behavior:
+        """Build the per-instance Behavior. Receives source for value
+        extraction (e.g. default values from script literals), NOT for
+        classification."""
+```
+
+The classifier orchestrator (`converter/converter/gameplay/classify.py`)
+calls `primary()` first and only consults `tiebreaker()` when two
+detectors both pass `primary()`. A detector that returns True from
+`primary()` based on substring inspection violates the contract —
+contract tests (`test_detector_contract.py`) call `primary()` with
+empty C# source and assert the answer doesn't change. This makes the
+"composition-first" rule a structural invariant, not policy text.
 
   - **Primary signal:** Unity component composition from the parsed
     scene/prefab data (`Rigidbody`, `Collider`, `Animator`, MonoBehaviour
     field shapes from `_extract_monobehaviour_attributes`). This is
-    structured data the converter already produces; it doesn't depend on AI
-    output or even C# parsing.
-  - **Tiebreaker only:** C# source substring (`AddRelativeForce` +
-    `OnCollisionEnter` + `Destroy(gameObject)`) when composition alone is
+    structured data the converter already produces.
+  - **Tiebreaker only:** C# source substring when composition alone is
     ambiguous (e.g. distinguishing a Rigidbody projectile from a
     Rigidbody physics prop).
-  - **Conservative defaults:** detection emits a `Behavior` only when the
-    primary signal matches. Substring match alone never triggers
+  - **Conservative defaults:** detection emits a `Behavior` only when
+    `primary()` matches. Substring match alone never triggers
     classification.
 
 False positives are reported in `conversion_report.json` and rejectable via
@@ -178,9 +310,13 @@ an output-dir deny-list (`<output>/.gameplay_deny.txt` — one
     after we see real call sites).
 
 A composer (`converter/runtime/gameplay/composer.luau`) wires capabilities
-together at runtime. Given a behaviour list, it calls the per-family
-runtime functions in the right order. The composer is small (~50 lines)
-because the capability vocabulary is small.
+together at runtime. Given a behaviour list, it threads the per-family
+`ctx` table through each capability in tuple order. The composer is small
+(~80 lines including the family-namespace setup) because the capability
+vocabulary is small. See "Capability dataflow contract" above for the
+specifics — including how composition errors are caught at emit time, not
+runtime, and why namespacing prevents the local-variable collision problem
+that a flat shared-state approach would have.
 
 ### Emit: per-instance behaviour table
 
@@ -198,14 +334,30 @@ Composer.run(script.Parent, {
 })
 ```
 
+```lua
+-- Door.luau (per-instance — two Door prefabs with different offsets get
+-- two different tables)
+local Composer = require(game:GetService("ReplicatedStorage"):WaitForChild("AutoGen"):WaitForChild("Composer"))
+Composer.run(script.Parent, {
+    {kind = "movement.tween_offset",
+     target_offset = Vector3.new(0, 4, 0),
+     open_duration = 1.0,
+     close_duration = 1.0,
+     direction_attribute = "open"},
+    {kind = "lifetime.persistent"},
+})
+```
+
 The behaviour table is **per-instance data**, not class-level. Two doors
 with different open offsets get two different tables emitted. No
 `weapon_class` or `target_child_name` class-level leakage.
 
 The composer reads `kind` and dispatches to the right runtime function;
-order is preserved so a `movement.impulse` runs before a `hit_detection`
-that depends on the velocity. The composer is the only runtime entrypoint
-script consumers need to know about.
+tuple order is preserved AND enforced against the capability dataflow
+contract (see above) so a `hit_detection.raycast_segment` that reads
+`ctx.movement.velocity` cannot be placed before a `movement.impulse`
+that writes it. The composer is the only runtime entrypoint script
+consumers need to know about.
 
 ### Pipeline integration
 
