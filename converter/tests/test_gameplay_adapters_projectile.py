@@ -1119,11 +1119,14 @@ class TestSourceQualifiedDenyList:
 
 
 class TestDamagePlayerFilter:
-    """Structural check: every ``_applyDamageToModel`` call inside the
-    ``Effects.damage`` function body must be guarded by an
-    ``if isPlayer`` conditional. Codex PR #73b-round-2 P3 flagged the
-    prior substring scan as fragile — comments and copy-pasted strings
-    would survive a refactor that broke the semantic gate.
+    """Indentation-scoped check: every ``_applyDamageToModel`` call
+    must have ``if isPlayer`` as its nearest enclosing ``if`` (by
+    indent level). Codex PR #73b-round-3 P3 flagged the prior
+    function-extractor as accidentally correct — anonymous
+    ``function(`` opens weren't counted and one-line ``if-end`` was
+    mis-bracketed. The new check skips function extraction entirely:
+    it walks the whole file by indent, which is robust to the kinds
+    of refactors that would actually break the gate.
     """
 
     def _read_runtime(self) -> str:
@@ -1133,146 +1136,160 @@ class TestDamagePlayerFilter:
         )
         return path.read_text(encoding="utf-8")
 
-    def _extract_damage_function(self, source: str) -> str:
-        """Return the body of ``function Effects.damage(...)`` —
-        from the opening signature through the matching ``end``.
-        Counts ``function``/``end`` pairs (with rough scoping for
-        ``if``/``for``/``do``) so we don't mistakenly stop at an
-        inner block's ``end``.
+    @staticmethod
+    def _enclosing_if(
+        lines: list[str], call_idx: int,
+    ) -> tuple[str, int] | None:
+        """Find the nearest enclosing ``if`` at strictly lower indent
+        than the line at ``call_idx``. Returns ``(if_text, if_idx)``
+        or ``None``. Indent-only — no Lua tokenizer needed, robust to
+        anonymous ``function(`` callbacks and one-line ``if-end``
+        constructs because we never have to match ``end`` pairs.
         """
-        # Find the function header.
-        header = "function Effects.damage("
-        start = source.find(header)
-        assert start != -1, "Effects.damage function not found in effects.luau"
-        # Lua-balance ``end`` against the constructs that open scopes.
-        # This is intentionally simple — comments / strings are not
-        # stripped, so the heuristic relies on the canonical formatting
-        # the file uses. Good enough to fail when someone unwraps the
-        # isPlayer branch (the actual regression we're pinning).
-        idx = start
-        depth = 0
-        i = source.find("\n", idx)
-        for line_no, line in enumerate(source[idx:].splitlines()):
+        call_indent = len(lines[call_idx]) - len(lines[call_idx].lstrip())
+        for prior_idx in range(call_idx - 1, -1, -1):
+            line = lines[prior_idx]
             stripped = line.strip()
-            # Opens.
-            if stripped.startswith("function "):
-                depth += 1
-            elif (
-                stripped.startswith("if ")
-                or stripped.startswith("for ")
-                or stripped.startswith("while ")
-                or stripped.startswith("do ")
-                or stripped == "do"
-            ):
-                depth += 1
-            # Closes.
-            if stripped == "end" or stripped.startswith("end)") or stripped == "end)":
-                depth -= 1
-                if depth == 0:
-                    # Inclusive end of function.
-                    body_end = idx + sum(
-                        len(l) + 1 for l in source[idx:].splitlines()[: line_no + 1]
-                    )
-                    return source[start:body_end]
-        raise AssertionError(
-            "could not locate the matching ``end`` for Effects.damage"
-        )
-
-    def test_apply_damage_call_is_guarded_by_is_player(self) -> None:
-        """Each ``_applyDamageToModel(...)`` call inside
-        ``Effects.damage`` must be preceded (within the same function
-        body) by an ``if isPlayer`` conditional. Catches refactors
-        that move the damage call outside the player branch even when
-        the surrounding comments stay intact.
-        """
-        body = self._extract_damage_function(self._read_runtime())
-        # There must be at least one damage call.
-        assert "_applyDamageToModel(" in body, (
-            "Effects.damage no longer calls _applyDamageToModel — "
-            "the handler probably got renamed or rewritten; verify "
-            "the Player filter is still in place."
-        )
-        # For every line that calls _applyDamageToModel, the *immediately
-        # enclosing* control flow within Effects.damage must be an
-        # ``if isPlayer`` branch.
-        lines = body.splitlines()
-        for i, line in enumerate(lines):
-            if "_applyDamageToModel(" not in line:
+            if not stripped or stripped.startswith("--"):
                 continue
-            # Walk backwards within the function body to find the
-            # most recent ``if ...`` statement at a lower indent and
-            # confirm it tests ``isPlayer``.
-            call_indent = len(line) - len(line.lstrip())
-            found_if = False
-            for prior in reversed(lines[:i]):
-                stripped = prior.strip()
-                prior_indent = len(prior) - len(prior.lstrip())
-                if not stripped:
-                    continue
-                if prior_indent < call_indent and stripped.startswith("if "):
-                    assert "isPlayer" in stripped, (
-                        f"_applyDamageToModel at line {i} is guarded by "
-                        f"{stripped!r} which does not check isPlayer. "
-                        f"TurretBullet would damage non-Player Humanoids."
-                    )
-                    found_if = True
-                    break
-            assert found_if, (
-                f"_applyDamageToModel at line {i} has no enclosing "
-                f"``if`` within Effects.damage — damage is unconditional."
+            prior_indent = len(line) - len(line.lstrip())
+            if prior_indent >= call_indent:
+                continue
+            if stripped.startswith("if "):
+                return stripped, prior_idx
+            # An ``else`` at lower indent flips into the failing
+            # branch of the next if up — keep walking.
+            if stripped == "else" or stripped.startswith("elseif "):
+                continue
+            # An ``end`` at lower indent closes a block — the
+            # call is outside that block. Keep walking.
+            if stripped.startswith("end"):
+                continue
+            # A function header at lower indent terminates the
+            # search — we've walked out of the call's function.
+            if stripped.startswith("function ") or "function(" in stripped:
+                return None
+        return None
+
+    @staticmethod
+    def _calls_in_function(
+        lines: list[str], func_prefix: str,
+    ) -> list[int]:
+        """Return line indices of every ``_applyDamageToModel(...)``
+        call inside the function whose header (at indent 0) starts
+        with ``func_prefix``. Stops at the next top-level ``function``
+        declaration. Avoids ``end``-matching entirely (codex round-3
+        P3 about heuristic block detection).
+        """
+        out: list[int] = []
+        inside = False
+        for i, line in enumerate(lines):
+            indent = len(line) - len(line.lstrip())
+            stripped = line.strip()
+            if indent == 0 and stripped.startswith("function "):
+                inside = stripped.startswith(func_prefix)
+                continue
+            if inside and "_applyDamageToModel(" in stripped and (
+                not stripped.startswith("local function")
+                and not stripped.startswith("function ")
+            ):
+                out.append(i)
+        return out
+
+    def test_apply_damage_call_in_damage_handler_is_player_guarded(
+        self,
+    ) -> None:
+        """``Effects.damage`` must have ``if isPlayer`` as the
+        nearest enclosing conditional for every
+        ``_applyDamageToModel(...)`` call. Catches the codex round-1
+        P1 regression directly. Splash + SpawnTemplate are scoped
+        separately (Splash iterates ``Players:GetPlayers()``, which
+        is inherently Player-only; SpawnTemplate has no damage path).
+        """
+        lines = self._read_runtime().splitlines()
+        call_lines = self._calls_in_function(lines, "function Effects.damage(")
+        assert call_lines, (
+            "no _applyDamageToModel(...) call in Effects.damage — the "
+            "handler may have been renamed; verify the Player gate is "
+            "still in place wherever damage actually applies."
+        )
+        for call_idx in call_lines:
+            guard = self._enclosing_if(lines, call_idx)
+            assert guard is not None, (
+                f"_applyDamageToModel at line {call_idx + 1} (inside "
+                f"Effects.damage) has no enclosing ``if`` — damage is "
+                f"unconditional."
+            )
+            if_text, if_idx = guard
+            assert "isPlayer" in if_text, (
+                f"_applyDamageToModel at line {call_idx + 1} is guarded "
+                f"by {if_text!r} (line {if_idx + 1}), which does NOT "
+                f"check ``isPlayer``. TurretBullet would damage "
+                f"non-Player Humanoids — codex round-1 P1 regression."
             )
 
-    def test_destroy_after_player_branch(self) -> None:
-        """The container:Destroy() call sits OUTSIDE the isPlayer
-        branch — bullets must despawn on any impact (wall, NPC,
-        Player) to match the legacy bullet pack. If a refactor moves
-        the destroy inside the player check, bullets would persist
-        on non-Player hits and double-fire on subsequent frames.
+    def test_splash_iterates_real_players(self) -> None:
+        """``Effects.splash`` doesn't use the ``isPlayer`` boolean —
+        instead it iterates ``Players:GetPlayers()`` and damages each
+        Player's character. Pin that pattern so a refactor that
+        replaces the loop with ``workspace:GetDescendants()`` (or
+        similar) is caught.
         """
-        body = self._extract_damage_function(self._read_runtime())
-        # Find every container:Destroy line in the damage function.
-        destroy_lines = [
-            (i, l) for i, l in enumerate(body.splitlines())
-            if "container:Destroy()" in l
-        ]
-        assert destroy_lines, (
-            "Effects.damage no longer destroys the container on impact — "
-            "bullets would persist after raycast hit."
+        body = self._read_runtime()
+        # Find the function and assert the iteration pattern is intact.
+        splash_idx = body.find("function Effects.splash(")
+        assert splash_idx != -1
+        # Look for the canonical Player iteration within the next
+        # ~80 lines (the function body fits well within that).
+        splash_window = body[splash_idx : splash_idx + 4000]
+        assert "Players:GetPlayers()" in splash_window, (
+            "Effects.splash no longer iterates Players:GetPlayers() — "
+            "splash damage may now apply to non-Player Humanoids."
         )
-        # At least one destroy must NOT be inside an ``if isPlayer`` branch.
-        # Heuristic: walk backwards looking for an ``if``; if the nearest
-        # ``if`` we find is the isPlayer branch and the destroy is INSIDE
-        # it (same indent or deeper than the if's body), that's a bug.
-        # For each destroy, locate the most recent ``if`` and check.
-        ok = False
-        lines = body.splitlines()
-        for line_idx, line in destroy_lines:
-            destroy_indent = len(line) - len(line.lstrip())
-            # Walk back for the most recent ``if`` at indent < destroy_indent.
-            for prior in reversed(lines[:line_idx]):
-                stripped = prior.strip()
-                prior_indent = len(prior) - len(prior.lstrip())
-                if not stripped:
-                    continue
-                if prior_indent < destroy_indent and stripped.startswith("if "):
-                    if "isPlayer" not in stripped:
-                        # The destroy is inside a non-Player branch
-                        # (e.g. signal-nil guard) — that's fine for the
-                        # general check; the goal is at least one
-                        # destroy that lives outside the isPlayer
-                        # conditional.
-                        ok = True
-                    break
-            else:
-                # No enclosing ``if`` — destroy is at function-body
-                # scope, outside every branch. That's the pattern we
-                # want.
-                ok = True
+        assert "_applyDamageToModel(" in splash_window, (
+            "Effects.splash no longer routes through _applyDamageToModel — "
+            "the legacy ``TakeDamage`` attribute mirror path may be broken."
+        )
+
+    def test_destroy_outside_player_branch(self) -> None:
+        """``container:Destroy()`` in the damage path must NOT be
+        nested inside ``if isPlayer`` — bullets must despawn on any
+        impact to match the legacy bullet pack's behaviour. If
+        every destroy in the file ends up gated by Player-only
+        logic, ghost bullets persist after non-Player hits.
+        """
+        lines = self._read_runtime().splitlines()
+        # Look for destroy lines specifically inside Effects.damage's
+        # signal callback. Restrict the search to lines AFTER the
+        # ``function Effects.damage`` header and BEFORE the next
+        # top-level ``function`` declaration. Both are recognisable by
+        # ``function Effects.<name>`` at indent 0 — keeps the search
+        # bounded without depending on ``end`` matching.
+        in_damage = False
+        damage_destroys: list[int] = []
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            indent = len(line) - len(line.lstrip())
+            if indent == 0 and stripped.startswith("function Effects."):
+                in_damage = stripped.startswith("function Effects.damage(")
+                continue
+            if in_damage and "container:Destroy()" in line:
+                damage_destroys.append(i)
+        assert damage_destroys, (
+            "Effects.damage no longer destroys the container — bullets "
+            "would persist after raycast hit."
+        )
+        # At least one destroy must NOT be gated by ``if isPlayer``.
+        found_unconditional_destroy = False
+        for idx in damage_destroys:
+            guard = self._enclosing_if(lines, idx)
+            if guard is None or "isPlayer" not in guard[0]:
+                found_unconditional_destroy = True
                 break
-        assert ok, (
+        assert found_unconditional_destroy, (
             "every container:Destroy() in Effects.damage is gated by "
-            "``if isPlayer`` — bullets would not despawn on non-Player "
-            "hits, regressing to ghost-bullet behaviour."
+            "``if isPlayer`` — non-Player hits would leave ghost "
+            "bullets persisting in the scene."
         )
 
 
@@ -1298,26 +1315,89 @@ class TestLegacyPackMutex:
         assert "door_tween_open" in LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON
 
     def test_pipeline_uses_the_constant(self) -> None:
-        """The transpile_scripts path must reach the constant — not a
-        copy. Locate the mutex gate body in pipeline.py source and
-        assert it references the constant by name. If a future
-        refactor inlines a frozenset literal, this fails.
+        """AST-based check: pipeline.py must reference
+        ``LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON`` as a Name (not just
+        as a substring in a comment / docstring) AND must not contain
+        any other ``frozenset`` literal that includes ``door_tween_open``
+        or ``bullet_physics_raycast`` — that would shadow the mutex
+        constant with a local copy. Codex PR #73b-round-3 P3 flagged
+        that the prior substring scan was both vacuous (the constant
+        DEFINITION contains its own name) and quote-style-sensitive.
         """
+        import ast
         import inspect
         from converter import pipeline as pipeline_mod
 
         src = inspect.getsource(pipeline_mod)
-        assert "LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON" in src
-        # And no local re-definition of the bullet pack name as a
-        # frozenset member — that would shadow the constant.
-        # The bullet pack name should appear ONCE (inside the constant
-        # declaration) — not multiple times.
-        bullet_count = src.count('"bullet_physics_raycast"')
-        assert bullet_count == 1, (
-            f"bullet_physics_raycast appears {bullet_count}× in pipeline.py "
-            f"— expected exactly one occurrence (inside the constant). "
-            f"A local frozenset literal would shadow the mutex constant."
+        tree = ast.parse(src)
+
+        # Count Name references (not the assignment target on the
+        # constant's own definition). Walk every Load context.
+        const_loads = 0
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Name)
+                and node.id == "LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON"
+                and isinstance(node.ctx, ast.Load)
+            ):
+                const_loads += 1
+        assert const_loads >= 1, (
+            "pipeline.py defines LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON "
+            "but never reads it — the mutex constant is unreachable."
         )
+
+        # Search for frozenset({...}) literals that include any of the
+        # pack names; if found anywhere OTHER than the constant's own
+        # declaration, we've got a shadow copy.
+        pack_names = {"door_tween_open", "bullet_physics_raycast"}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Name) or func.id != "frozenset":
+                continue
+            # frozenset({...}) — look inside the Set/List arg.
+            if not node.args:
+                continue
+            arg = node.args[0]
+            if isinstance(arg, (ast.Set, ast.List, ast.Tuple)):
+                names: set[str] = set()
+                for elt in arg.elts:
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        names.add(elt.value)
+                shared = names & pack_names
+                if not shared:
+                    continue
+                # Is this the constant's own assignment? Find the
+                # enclosing assign-target via line number; the constant
+                # is defined once at module level, so we can compare
+                # against the actual definition line.
+                #
+                # Simpler approach: require that the frozenset's
+                # line equals the constant definition's line (i.e.
+                # this Call IS the constant). Anything else is a
+                # shadow copy.
+                const_assign = next(
+                    (
+                        a for a in tree.body
+                        if isinstance(a, ast.AnnAssign)
+                        and isinstance(a.target, ast.Name)
+                        and a.target.id == "LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON"
+                    ),
+                    None,
+                )
+                assert const_assign is not None, (
+                    "LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON is not a "
+                    "module-level AnnAssign; the test needs updating."
+                )
+                if node.lineno != const_assign.value.lineno:  # type: ignore[union-attr]
+                    raise AssertionError(
+                        f"pipeline.py defines an extra frozenset with pack "
+                        f"name(s) {sorted(shared)} at line {node.lineno} — "
+                        f"this shadows the mutex constant defined at line "
+                        f"{const_assign.value.lineno}. Remove the inline "  # type: ignore[union-attr]
+                        f"literal and reference LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON."
+                    )
 
     def test_legacy_packs_actually_registered(self) -> None:
         """Pin that the legacy packs the mutex targets really exist
