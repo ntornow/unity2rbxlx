@@ -17,5 +17,7 @@ local Composer = require(script.Parent:WaitForChild("Composer"))
 require(script.Parent:WaitForChild("Triggers"))
 require(script.Parent:WaitForChild("Movement"))
 require(script.Parent:WaitForChild("Lifetime"))
+require(script.Parent:WaitForChild("HitDetection"))
+require(script.Parent:WaitForChild("Effects"))
 
 return Composer

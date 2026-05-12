@@ -2,9 +2,8 @@
 --
 -- Owns the ``ctx.movement`` namespace.
 --
--- PR #73a ships ``Movement.AttributeDrivenTween`` only. The Impulse /
--- ConstantVelocity capabilities arrive in PR #73b alongside the
--- projectile slice.
+-- Ships ``Movement.AttributeDrivenTween`` (PR #73a, door slice) and
+-- ``Movement.Impulse`` (PR #73b, projectile slice).
 
 local TweenService = game:GetService("TweenService")
 local Composer = require(script.Parent:WaitForChild("Composer"))
@@ -14,6 +13,110 @@ local Movement = {}
 -- 1 Unity meter ≈ 3.571 Roblox studs. Mirrors the constant baked into
 -- ``converter/CLAUDE.md`` and the legacy bullet/door coherence packs.
 local _STUDS_PER_METER: number = 3.571
+
+-- Locate the part the impulse should act on. Bullets are sometimes
+-- bound as ``Model`` containers (prefab with mesh children) and
+-- sometimes as a single ``BasePart``. Returns nil if the container
+-- has no usable physics body.
+local function _rootPartOf(container: Instance): BasePart?
+    if container:IsA("BasePart") then
+        return container
+    end
+    if container:IsA("Model") then
+        if container.PrimaryPart then
+            return container.PrimaryPart
+        end
+        return container:FindFirstChildWhichIsA("BasePart")
+    end
+    return nil
+end
+
+-- Container CFrame source — Model:GetPivot() for prefab containers,
+-- raw CFrame for parts. Used so the impulse direction respects the
+-- container's orientation regardless of whether it's a part or model.
+local function _containerCFrame(container: Instance, rootPart: BasePart): CFrame
+    if container:IsA("Model") then
+        return container:GetPivot()
+    end
+    return rootPart.CFrame
+end
+
+-- ``Movement.Impulse`` semantics:
+--
+--   1. Read ``cap.force_unity`` (Unity m/s) — but allow a runtime
+--      attribute override on the container. SimpleFPS prefabs serialize
+--      ``force`` as an attribute via the MonoBehaviour extractor; the
+--      attribute takes precedence so per-instance Unity inspector
+--      tuning survives the conversion. Same pattern for ``fadeTime``
+--      / ``damage`` in their respective capabilities.
+--   2. Multiply by STUDS_PER_METER to get stud-space velocity.
+--      Roblox impulses are in stud-units; ``200`` Unity m/s would be
+--      ~57 studs/s without the conversion (5.7x too slow).
+--   3. Install an anti-gravity VectorForce so the bullet flies
+--      straight like Unity's near-massless impulse rather than diving
+--      under Roblox's 196 studs/s² gravity (5.6x stronger than
+--      Unity's 9.81 m/s²).
+--   4. Write the velocity vector to ``ctx.movement.velocity`` so the
+--      HitDetection.RaycastSegment handler (validator-enforced to run
+--      after this one) has a stable initial direction.
+function Movement.impulse(container: Instance, cap: {[string]: any}, ctx: {[string]: any}): ()
+    local rootPart = _rootPartOf(container)
+    if rootPart == nil then
+        warn(string.format(
+            "[gameplay/movement] Impulse: no BasePart on %s",
+            container:GetFullName()
+        ))
+        return
+    end
+    local directionLocal = cap.direction_local :: Vector3
+    -- Per-instance attribute override. The legacy bullet pack read
+    -- ``_attrHost:GetAttribute("force")`` for the same reason — Unity
+    -- prefab inspector overrides flow through ``_extract_monobehaviour_attributes``
+    -- onto the part as a numeric attribute. Falling back to the
+    -- capability's emit-time default preserves the Unity-canonical
+    -- value when the attribute is absent.
+    local attrHost: Instance = rootPart
+    local overrideForce = attrHost:GetAttribute("force")
+    local forceUnity: number = (typeof(overrideForce) == "number" and overrideForce)
+        or (cap.force_unity :: number)
+
+    rootPart.Anchored = false
+    local cframe = _containerCFrame(container, rootPart)
+    local worldDir = cframe:VectorToWorldSpace(directionLocal)
+    if worldDir.Magnitude == 0 then
+        warn(string.format(
+            "[gameplay/movement] Impulse: zero direction on %s — no velocity applied",
+            container:GetFullName()
+        ))
+        return
+    end
+    local studsVelocity = worldDir.Unit * (forceUnity * _STUDS_PER_METER)
+    rootPart.AssemblyLinearVelocity = studsVelocity
+
+    -- Anti-gravity VectorForce. Named ``_GameplayAntiGravity`` so a
+    -- re-bind path (Studio reload, attribute change re-emit) can find
+    -- and skip rather than double-install. The composer's _GameplayBound
+    -- marker on the CONTAINER catches the common case; this rootPart-
+    -- level guard handles model-container shapes where the marker
+    -- lives on a non-physics ancestor.
+    local existing = rootPart:FindFirstChild("_GameplayAntiGravity")
+    if existing == nil then
+        local att = Instance.new("Attachment")
+        att.Name = "_GameplayAntiGravityAtt"
+        att.Parent = rootPart
+        local antiG = Instance.new("VectorForce")
+        antiG.Name = "_GameplayAntiGravity"
+        antiG.Force = Vector3.new(0, workspace.Gravity * rootPart.AssemblyMass, 0)
+        antiG.RelativeTo = Enum.ActuatorRelativeTo.World
+        antiG.Attachment0 = att
+        antiG.ApplyAtCenterOfMass = true
+        antiG.Parent = rootPart
+    end
+
+    ctx.movement.velocity = studsVelocity
+end
+
+Composer.register("movement.impulse", Movement.impulse)
 
 -- ``Movement.AttributeDrivenTween`` semantics:
 --

@@ -22,8 +22,15 @@ from converter.gameplay.capabilities import (
     Capability,
     ContainerResolver,
     CTX_FAMILIES,
+    EffectDamage,
+    EffectSplash,
+    EffectSpawnTemplate,
+    HitDetectionOverlapSphere,
+    HitDetectionRaycastSegment,
+    LifetimeDespawn,
     LifetimePersistent,
     MovementAttributeDrivenTween,
+    MovementImpulse,
     TriggerOnBoolAttribute,
 )
 
@@ -173,6 +180,20 @@ def _lua_string(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
 
 
+def _lua_number(n: float) -> str:
+    """Render a Python number as a Lua literal. Floats with no
+    fractional component emit without a trailing ``.0`` (matches the
+    Lua convention) — keeps the golden-test output stable for whole-
+    number defaults from C# ``[Range]`` attributes (e.g. ``force = 60``).
+    """
+    if isinstance(n, bool):
+        # bool is a subclass of int — guard before the int branch.
+        return "true" if n else "false"
+    if isinstance(n, int) or (isinstance(n, float) and n.is_integer()):
+        return str(int(n))
+    return repr(float(n))
+
+
 def _emit_capability(cap: Capability) -> str:
     """Render a single capability as the Lua table form Composer.run
     consumes.
@@ -181,6 +202,14 @@ def _emit_capability(cap: Capability) -> str:
         return (
             "    {kind = " + _lua_string(cap.kind)
             + ", name = " + _lua_string(cap.name) + "},"
+        )
+    if isinstance(cap, MovementImpulse):
+        x, y, z = cap.direction_local
+        return (
+            "    {kind = " + _lua_string(cap.kind) + ",\n"
+            f"     direction_local = Vector3.new({_lua_number(x)}, "
+            f"{_lua_number(y)}, {_lua_number(z)}),\n"
+            f"     force_unity = {_lua_number(cap.force_unity)}}},"
         )
     if isinstance(cap, MovementAttributeDrivenTween):
         x, y, z = cap.target_offset_unity
@@ -192,6 +221,34 @@ def _emit_capability(cap: Capability) -> str:
         )
     if isinstance(cap, LifetimePersistent):
         return "    {kind = " + _lua_string(cap.kind) + "},"
+    if isinstance(cap, LifetimeDespawn):
+        return (
+            "    {kind = " + _lua_string(cap.kind)
+            + f", seconds = {_lua_number(cap.seconds)}}},"
+        )
+    if isinstance(cap, HitDetectionRaycastSegment):
+        return "    {kind = " + _lua_string(cap.kind) + "},"
+    if isinstance(cap, HitDetectionOverlapSphere):
+        return (
+            "    {kind = " + _lua_string(cap.kind)
+            + f", radius_unity = {_lua_number(cap.radius_unity)}}},"
+        )
+    if isinstance(cap, EffectDamage):
+        return (
+            "    {kind = " + _lua_string(cap.kind)
+            + f", value = {_lua_number(cap.value)}}},"
+        )
+    if isinstance(cap, EffectSplash):
+        return (
+            "    {kind = " + _lua_string(cap.kind) + ",\n"
+            f"     radius_unity = {_lua_number(cap.radius_unity)},\n"
+            f"     value = {_lua_number(cap.value)}}},"
+        )
+    if isinstance(cap, EffectSpawnTemplate):
+        return (
+            "    {kind = " + _lua_string(cap.kind)
+            + ", name = " + _lua_string(cap.name) + "},"
+        )
     raise BehaviorCompositionError(
         f"Unknown capability type: {type(cap).__name__}",
         behavior=Behavior(unity_file_id="", diagnostic_name="<unknown>", capabilities=()),

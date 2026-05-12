@@ -1670,11 +1670,19 @@ class Pipeline:
             # class no longer zeroes the whole pass. The pipeline lets
             # AI handle divergent classes by leaving them in
             # ``script_infos`` (their .cs path isn't in ``skip_paths``).
+            # PR #73b: pass the prefab library through so the adapter
+            # fires on prefab-internal MonoBehaviours (doors, bullets,
+            # pickups). Without this, runtime-spawned prefab instances
+            # never carry an adapter stub — the legacy coherence pack
+            # would be the only effective path. ``prefab_library`` may
+            # be None on an early-phase resume where prefabs haven't
+            # parsed yet; classify_scripts handles that.
             classification = classify_scripts(
                 parsed_scene=self.state.parsed_scene,
                 guid_index=self.state.guid_index,
                 script_infos=script_infos,
                 deny_list=deny_list,
+                prefab_library=self.state.prefab_library,
             )
             if classification.matches:
                 adapter_scripts, adapter_gameplay_matches = (
@@ -2406,14 +2414,18 @@ return table.concat(allData, "\\n")'''
         # Post-transpilation: fix script types based on cross-script dependencies.
         from converter.script_coherence import fix_require_classifications
         # Mutual exclusion with legacy coherence packs: when the
-        # gameplay adapters covered a behaviour (e.g. door tween), the
-        # matching legacy pack must NOT also run — they'd fight over
-        # the same scripts and double-bind (codex pushback on PR #72).
-        # PR #73a covers ``door_tween_open`` only; #73b/c add the
-        # bullet + damage packs to this list.
+        # gameplay adapters covered a behaviour (e.g. door tween,
+        # bullet physics), the matching legacy pack must NOT also run
+        # — they'd fight over the same scripts and double-bind (codex
+        # pushback on PR #72). PR #73a covers ``door_tween_open``,
+        # PR #73b adds ``bullet_physics_raycast``; PR #73c adds the
+        # damage routing pack.
         disabled_packs: frozenset[str] = frozenset()
         if self.ctx.use_gameplay_adapters:
-            disabled_packs = frozenset({"door_tween_open"})
+            disabled_packs = frozenset({
+                "door_tween_open",
+                "bullet_physics_raycast",
+            })
         fixes = fix_require_classifications(
             self.state.rbx_place.scripts,
             disabled_packs=disabled_packs,
@@ -3851,6 +3863,12 @@ script.Disabled = true
                 ("Triggers", "triggers.luau"),
                 ("Movement", "movement.luau"),
                 ("Lifetime", "lifetime.luau"),
+                # PR #73b: HitDetection + Effects families for the
+                # projectile slice. Order doesn't matter because the
+                # Gameplay orchestrator force-requires them all before
+                # the first ``Composer.run`` call.
+                ("HitDetection", "hit_detection.luau"),
+                ("Effects", "effects.luau"),
                 ("Gameplay", "gameplay.luau"),
             )
             for module_name, filename in gameplay_modules:

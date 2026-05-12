@@ -42,7 +42,13 @@ from converter.gameplay.detectors import (
 )
 
 if TYPE_CHECKING:
-    from core.unity_types import ComponentData, GuidIndex, ParsedScene, SceneNode
+    from core.unity_types import (
+        ComponentData,
+        GuidIndex,
+        ParsedScene,
+        PrefabLibrary,
+        SceneNode,
+    )
     from converter.code_transpiler import TranspiledScript
     from unity.script_analyzer import ScriptInfo
 
@@ -272,6 +278,23 @@ class ClassificationResult:
         return set(self.matches.keys())
 
 
+def _walk_prefab_nodes(root) -> "list":  # type: ignore[no-untyped-def]
+    """Flatten a prefab's node tree into a list. Returns empty when
+    *root* is None — prefabs with no resolved root (variant parse
+    failures, e.g.) are silently skipped because they can't carry a
+    classifiable MonoBehaviour anyway.
+    """
+    if root is None:
+        return []
+    out = [root]
+    stack = list(getattr(root, "children", []) or [])
+    while stack:
+        node = stack.pop()
+        out.append(node)
+        stack.extend(list(getattr(node, "children", []) or []))
+    return out
+
+
 def classify_scripts(
     *,
     parsed_scene: "ParsedScene | None",
@@ -279,12 +302,23 @@ def classify_scripts(
     script_infos: list["ScriptInfo"],
     deny_list: frozenset[str] = frozenset(),
     detectors: tuple[Detector, ...] = ALL_DETECTORS,
+    prefab_library: "PrefabLibrary | None" = None,
 ) -> ClassificationResult:
-    """Walk the parsed scene, run each detector against every
-    MonoBehaviour component, and aggregate matches by script class.
+    """Walk the parsed scene AND prefab library, run each detector
+    against every MonoBehaviour component, and aggregate matches by
+    script class.
 
     Returns an empty result when ``parsed_scene`` or ``guid_index`` is
     None — the caller hasn't parsed yet, nothing to classify.
+
+    Prefab traversal: many Unity behaviours (doors, bullets, pickups)
+    live exclusively on .prefab roots and are instantiated at runtime
+    by other scripts (``Turret.Instantiate(bulletPrefab)``); the scene
+    file itself carries no MonoBehaviour for them. Walking
+    ``prefab_library.prefabs[].root`` is how the adapter actually fires
+    on runtime-spawned prefab instances. The matched .luau is attached
+    to the prefab template part in ReplicatedStorage.Templates, so
+    every runtime clone inherits the adapter stub.
 
     Per-class divergence: if two bindings of the same class produce
     non-equivalent Behaviors, that class is dropped from ``matches``
@@ -300,7 +334,17 @@ def classify_scripts(
     # Equivalence check runs as Phase 2 so divergence is per-class.
     candidates: dict[Path, ClassMatch] = {}
 
-    for node in parsed_scene.all_nodes.values():
+    # Build the unified node walk: scene-placed nodes first, then
+    # every prefab template's tree. Ordering matters only for
+    # determinism in the report — equivalence check is symmetric.
+    nodes_to_walk: list = list(parsed_scene.all_nodes.values())
+    if prefab_library is not None:
+        for prefab in getattr(prefab_library, "prefabs", []):
+            nodes_to_walk.extend(
+                _walk_prefab_nodes(getattr(prefab, "root", None))
+            )
+
+    for node in nodes_to_walk:
         for comp, info in _enrich_components(node, guid_to_script):
             try:
                 source_csharp = Path(info.path).read_text(
