@@ -292,22 +292,55 @@ def publish_place_file(
                 "place_publisher: cooking CollisionFidelity for %d MeshPart(s) ...",
                 len(targets),
             )
-            script = _build_collision_fidelity_fixup_script(targets)
-            result = execute_luau(
-                api_key, universe_id, place_id, script, timeout="240s",
-            )
-            if result is None:
-                log.warning(
-                    "place_publisher: CollisionFidelity fixup didn't "
-                    "complete (execute_luau timeout). The place is "
-                    "published but %d concave MeshCollider(s) may collapse "
-                    "to Box collision. Re-run u2r.py publish to retry.",
-                    len(targets),
+            # Batch targets — each ``CreateMeshPartAsync`` round-trips an
+            # asset fetch + decomposition (~30-60s on complex meshes),
+            # plus a closing ``SavePlaceAsync``. The Roblox Open Cloud
+            # Luau Execution API caps task timeout at 300s, so a single
+            # 6-mesh call can blow the cap on large places. Splitting
+            # into smaller chunks keeps each task well under budget,
+            # at the cost of ``len(targets) / batch`` extra place saves.
+            BATCH_SIZE = 2
+            failures = 0
+            for batch_idx in range(0, len(targets), BATCH_SIZE):
+                batch = targets[batch_idx : batch_idx + BATCH_SIZE]
+                script = _build_collision_fidelity_fixup_script(batch)
+                log.info(
+                    "place_publisher: fixup batch %d/%d (%d target(s))",
+                    batch_idx // BATCH_SIZE + 1,
+                    (len(targets) + BATCH_SIZE - 1) // BATCH_SIZE,
+                    len(batch),
                 )
-            else:
+                result = execute_luau(
+                    api_key, universe_id, place_id, script, timeout="300s",
+                )
+                if result is None:
+                    # Codex round-10 [P2]: a timed-out batch may still
+                    # be ``PROCESSING`` on Roblox's side. Every batch
+                    # script ends with ``SavePlaceAsync()``, so a
+                    # late-completing earlier batch could clobber a
+                    # later batch's save with a stale snapshot. ABORT
+                    # the loop on first timeout rather than firing more
+                    # batches in parallel with the still-running one.
+                    failures += len(targets) - batch_idx
+                    log.warning(
+                        "place_publisher: fixup batch %d timed out — "
+                        "aborting remaining batches to avoid racing "
+                        "SavePlaceAsync writes. %d target(s) skipped; "
+                        "re-run u2r.py publish to retry.",
+                        batch_idx // BATCH_SIZE + 1,
+                        failures,
+                    )
+                    break
                 outputs = (result.get("output", {}) or {}).get("results") or []
                 if outputs:
                     log.info("place_publisher: fixup result: %s", outputs[0])
+            if failures:
+                log.warning(
+                    "place_publisher: CollisionFidelity fixup partial — "
+                    "%d/%d target(s) failed. Re-run u2r.py publish to retry "
+                    "the missed targets.",
+                    failures, len(targets),
+                )
         else:
             log.debug(
                 "place_publisher: no MeshParts need CollisionFidelity fixup"

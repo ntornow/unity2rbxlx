@@ -1353,12 +1353,32 @@ def _convert_node(
         any(comp.component_type in ("MeshRenderer", "SkinnedMeshRenderer", "SpriteRenderer")
             for comp in node.components)
     )
+    # ``has_collider`` distinguishes "no-renderer" (just invisible) from
+    # "no-renderer-and-no-collider" (a true marker / logic container). A
+    # non-trigger BoxCollider with ``m_IsTrigger=0`` is a real solid floor
+    # (concrete case: SimpleFPS Pier's invisible ``Collider`` BoxCollider
+    # carries the entire dock's collision; the visible ``plank``/``beam``
+    # children are renderer-only). Without this guard, the rule below
+    # silently makes the dock non-colliding and the player falls through
+    # on spawn. See SimpleFPS_2026-05-09 spawn-collision investigation.
+    has_collider = any(
+        c.component_type in _COLLIDER_TYPES for c in node.components
+    )
     if not has_visual and part.class_name == "Part":
-        # Parts without meshes or visual components are Unity containers/markers.
-        # Make invisible regardless of whether they have children (child scripts
-        # are reparented separately, so the container doesn't need to render).
+        # No renderer → make invisible regardless. A collider with no
+        # renderer is a collision proxy (Unity's standard pattern: the
+        # invisible Pier ``Collider`` BoxCollider carries the dock's
+        # floor collision while visible plank/beam children render the
+        # wood). Without ``transparency = 1.0`` here, those proxies
+        # render as gray boxes overlaying the level geometry.
         part.transparency = 1.0
-        part.can_collide = False
+        if not has_collider:
+            # True marker: no collider either → also disable collision
+            # so the user doesn't bump into invisible logic containers.
+            # A collider proxy (e.g. dock floor) keeps the can_collide
+            # value ``_process_components`` set (typically True for
+            # non-trigger Unity colliders).
+            part.can_collide = False
 
     # -- Tag as attribute --
     if node.tag and node.tag != "Untagged":
@@ -3895,11 +3915,28 @@ def _convert_prefab_node(
     # CENTER.  When mesh_hierarchies data is available, use the Roblox
     # center position (converted to Unity coords) instead of the Unity
     # pivot position.  This corrects visual spacing between parts.
+    #
+    # Gate: ONLY substitute when the prefab node's own ``m_LocalPosition``
+    # is approximately zero. A real Unity prefab that uses an FBX as a
+    # mesh SOURCE (assigning individual sub-meshes to manually-positioned
+    # GameObjects via MeshFilter) carries authoritative non-zero local
+    # positions — overwriting those with the FBX-internal sub-mesh pivot
+    # silently collapses the prefab's hierarchy to a single point.
+    # Concrete case: SimpleFPS Turret.prefab has Base.localPos.y=1.45m
+    # and Weapon.localPos.y=0.93m on top of Base; both GameObjects
+    # reference the turret_01.fbx mesh via fileID but the FBX's internal
+    # sub-mesh pivots are ~0, so the substitution wiped the Y stacking
+    # and rendered every turret as a flat puddle of meshes.
     _is_multi_sub = False
     if parent_pos is not None and node.mesh_guid and _ctx().mesh_hierarchies and guid_index:
+        _has_authoritative_pos = (
+            abs(local_pos[0]) > 1e-4
+            or abs(local_pos[1]) > 1e-4
+            or abs(local_pos[2]) > 1e-4
+        )
         _mfid = node.mesh_file_id if hasattr(node, 'mesh_file_id') else None
         _multi = _get_multi_sub_meshes(node.mesh_guid, guid_index)
-        if _multi and len(_multi) > 1:
+        if _multi and len(_multi) > 1 and not _has_authoritative_pos:
             sub_mesh = _resolve_sub_mesh(node.mesh_guid, _mfid, guid_index, mesh_name=node.name)
             if sub_mesh:
                 sm_pos = sub_mesh.get("position", [0, 0, 0])

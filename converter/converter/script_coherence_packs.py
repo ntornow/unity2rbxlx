@@ -1559,3 +1559,887 @@ def _publish_producer_consumer_events(scripts: list["RbxScript"]) -> int:
             )
     return fixes
 
+
+
+# ---------------------------------------------------------------------------
+# Pack: door_tween_open
+# ---------------------------------------------------------------------------
+#
+# Unity's SciFi_Door uses a Mecanim Animator with ``open.anim`` (slides Y
+# +4m over 1s) controlled by ``Animator.SetBool("open", value)``. The
+# converter's animation phase doesn't translate Mecanim controllers to
+# TweenService, so the AI-transpiled ``Door.luau`` ends up calling
+# ``doorAnim:SetAttribute("open", value)`` on the sibling ``door`` mesh
+# but nothing actually moves the part. From the user's POV: the open
+# sound plays, the attribute flips, but the door mesh sits still and
+# blocks the doorway.
+#
+# Inject a one-shot listener at the end of any Door.luau that connects
+# to ``GetAttributeChangedSignal("open")`` and tweens the mesh +14.28
+# studs Y (Unity's 4m × STUDS_PER_METER) on open, back on close.
+#
+# Detector: matches ``SetAttribute("open"`` AND mentions a sibling lookup
+# pattern (``parent:FindFirstChild("door")`` is the canonical form). This
+# avoids touching unrelated scripts that happen to set an "open" attribute.
+
+_DOOR_OPEN_SETATTR_RE = re.compile(r':SetAttribute\(\s*["\']open["\']\s*,')
+_DOOR_SIBLING_LOOKUP_RE = re.compile(
+    r':FindFirstChild\(\s*["\']door["\']\s*\)'
+)
+# Animation phase may have already emitted door-tween driver scripts.
+# Names emitted by ``animation_converter`` follow two shapes:
+#
+#   - Prefab-scoped: ``Anim_<Prefab>_<MeshName>_(open|close)`` —
+#     e.g. ``Anim_Door_door_open`` for a Door prefab whose target
+#     mesh is named ``door``.
+#   - Scene-scoped:  ``Anim_<MeshName>_(open|close)`` —
+#     e.g. ``Anim_door_open`` for a scene-baked door instance.
+#
+# Both regexes anchor on the canonical ``door`` mesh name + open/close
+# clip names. Codex round-7 [P1]: the scene-scoped form was missing
+# from the prior regex, so scene-baked doors got a second listener
+# and double-animated.
+# Animation drivers names come from ``animation_converter``, which
+# composes them from prefab + controller + clip display names. Those
+# display names can carry spaces, dashes, mixed case ("SciFi Door",
+# "Open" vs "open"). Match case-insensitively and allow any non-_
+# characters in the prefab/controller slot. The trailing
+# ``(open|close)`` clip name is matched case-insensitively too.
+_DOOR_EXISTING_ANIM_PATTERNS = (
+    re.compile(r'^Anim_.+_door_(open|close)$', re.IGNORECASE),
+    re.compile(r'^Anim_door_(open|close)$', re.IGNORECASE),
+)
+
+
+def _door_has_animation_driver(scripts: list["RbxScript"]) -> bool:
+    """Return True if ANY door-tween animation driver exists in
+    ``scripts``. Matches both prefab-scoped
+    (``Anim_<Prefab>_door_*``) and scene-scoped (``Anim_door_*``)
+    name shapes that ``animation_converter`` emits.
+    """
+    return any(
+        any(p.match(s.name) for p in _DOOR_EXISTING_ANIM_PATTERNS)
+        for s in scripts
+    )
+
+
+def _detect_door_tween_target(scripts: list["RbxScript"]) -> bool:
+    """Detect whether at least one ``Door`` script in ``scripts``
+    needs the tween fallback.
+
+    Coverage policy: the injected tween body carries a RUNTIME
+    coexistence guard (scans the door's parent prefab + RS for an
+    ``Anim_(<Prefab>_)?door_*`` script). So pack-level we only need
+    to identify Door scripts that haven't been marked yet — the
+    runtime guard makes the body a no-op when an animation driver
+    is actually present on the same door instance.
+
+    Codex round-10 [P2]: ``animation_converter`` emits drivers per
+    controller/scope, NOT as a project-wide all-or-nothing pass.
+    Detecting at pack-level on ANY driver presence would skip the
+    fallback for uncovered doors in mixed projects. Push the
+    coexistence check to runtime where it's per-instance.
+    """
+    for s in scripts:
+        if s.name != "Door":
+            continue
+        if (
+            _DOOR_OPEN_SETATTR_RE.search(s.source)
+            and _DOOR_SIBLING_LOOKUP_RE.search(s.source)
+            and "_AutoFpsDoorTweenInjected" not in s.source
+        ):
+            return True
+    return False
+
+
+# Tween block appended at end of Door.luau. Self-contained — uses local
+# helpers; doesn't depend on names from the surrounding script. Reads the
+# sibling lookup itself instead of calling the script's ``getDoorAnim``
+# (whose name the AI may rename across runs).
+_DOOR_TWEEN_BLOCK = """
+-- _AutoFpsDoorTweenInjected: door coherence pack
+-- Listens to ``open`` attribute change on the sibling ``door`` mesh and
+-- tweens it +14.28 studs Y (Unity 4m × STUDS_PER_METER) on open, back
+-- on close. Mecanim Animator → TweenService bridge.
+--
+-- Per-door coexistence guard: skip if THIS door already has an
+-- ``Anim_*door_*`` driver script wired to its parent (e.g. as a
+-- WaitForChild target in ReplicatedStorage or as a script child of
+-- the same prefab Model). Otherwise the project-level pack and the
+-- per-door animation driver would both tween the same mesh on every
+-- attribute change → overshoot/jitter (codex round-10 [P2]).
+do
+    local TweenService = game:GetService("TweenService")
+    local _doorContainer = script.Parent
+    local _parent = _doorContainer and _doorContainer.Parent
+    local _doorMesh = _parent and _parent:FindFirstChild("door")
+    if _doorMesh and _doorMesh:IsA("BasePart") then
+        -- Scan the door's parent prefab (and ReplicatedStorage if the
+        -- driver lives there) for an existing animation driver
+        -- whose name matches ``Anim_(<Prefab>_)?door_(open|close)``
+        -- (case-insensitive). When found, defer to it.
+        local function _hasAnimDriver()
+            local function _matchName(name)
+                local lower = string.lower(name)
+                if string.match(lower, "^anim_door_open$")
+                    or string.match(lower, "^anim_door_close$") then
+                    return true
+                end
+                if string.match(lower, "^anim_.+_door_open$")
+                    or string.match(lower, "^anim_.+_door_close$") then
+                    return true
+                end
+                return false
+            end
+            -- Walk the prefab Model's descendants.
+            if _parent then
+                for _, d in ipairs(_parent:GetDescendants()) do
+                    if d:IsA("Script") or d:IsA("LocalScript") then
+                        if _matchName(d.Name) then return true end
+                    end
+                end
+            end
+            -- Animation phase parents drivers under various services
+            -- depending on whether the driver is prefab-scoped or
+            -- scene-scoped:
+            --   - prefab-scoped:  ReplicatedStorage.Templates.<Prefab>
+            --                     (also a child of the prefab Model)
+            --   - scene-scoped:   ServerScriptService (round-11 [P1])
+            -- Scan all three to catch every shape.
+            for _, svcName in ipairs({"ReplicatedStorage", "ServerScriptService"}) do
+                local svc = game:GetService(svcName)
+                for _, d in ipairs(svc:GetDescendants()) do
+                    if d:IsA("Script") or d:IsA("LocalScript") then
+                        if _matchName(d.Name) then return true end
+                    end
+                end
+            end
+            return false
+        end
+        if not _hasAnimDriver() then
+            local _STUDS_PER_METER = 3.571
+            local _OPEN_OFFSET = Vector3.new(0, 4 * _STUDS_PER_METER, 0)
+            local _closedCFrame = _doorMesh.CFrame
+            local _openCFrame = _closedCFrame + _OPEN_OFFSET
+            local _currentTween
+            local function _animateTo(target)
+                if _currentTween then _currentTween:Cancel() end
+                _currentTween = TweenService:Create(
+                    _doorMesh,
+                    TweenInfo.new(1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+                    { CFrame = target }
+                )
+                _currentTween:Play()
+            end
+            _doorMesh:GetAttributeChangedSignal("open"):Connect(function()
+                if _doorMesh:GetAttribute("open") then
+                    _animateTo(_openCFrame)
+                else
+                    _animateTo(_closedCFrame)
+                end
+            end)
+        end
+    end
+end
+"""
+
+
+@patch_pack(
+    name="door_tween_open",
+    description=(
+        "Append a TweenService listener at the end of Door.luau scripts "
+        "so the sibling ``door`` mesh actually slides on attribute "
+        "change. Without this, doors are stuck closed — the AI transpile "
+        "of Unity's Door.cs only flips the attribute, expecting the "
+        "Mecanim Animator to do the motion (which the converter doesn't "
+        "translate)."
+    ),
+    detect=_detect_door_tween_target,
+)
+def _inject_door_tween(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    # The injected tween body carries a runtime coexistence guard
+    # that defers to any sibling ``Anim_*_door_*`` driver, so the
+    # apply path doesn't need to skip project-wide. Round-9's
+    # project-wide bail was unsafe for mixed projects where some
+    # doors had drivers and others didn't (codex round-10 [P2]).
+    for s in scripts:
+        if s.name != "Door":
+            continue
+        if (
+            not _DOOR_OPEN_SETATTR_RE.search(s.source)
+            or not _DOOR_SIBLING_LOOKUP_RE.search(s.source)
+            or "_AutoFpsDoorTweenInjected" in s.source
+        ):
+            continue
+        s.source = s.source.rstrip() + "\n" + _DOOR_TWEEN_BLOCK
+        fixes += 1
+        log.info("  Injected door tween listener in '%s'", s.name)
+    return fixes
+
+
+# ---------------------------------------------------------------------------
+# Pack: bullet_physics_raycast
+# ---------------------------------------------------------------------------
+#
+# Unity's bullet scripts (``TurretBullet.cs``, ``PlaneBullet.cs``) use
+# ``rb.AddRelativeForce(Vector3.forward * force, Impulse)`` plus
+# ``OnCollisionEnter`` for hit detection. The AI transpile maps that
+# to ``rootPart:ApplyImpulse(impulseDir * force * mass)`` plus
+# ``Touched``. Three bugs stack in the converted output:
+#
+#  1. ``force=60`` is in Unity m/s but Roblox impulses are in stud-units.
+#     1 Unity m ≈ 3.571 studs, so the bullet flies 5.7x too slow.
+#  2. Roblox gravity is 196 studs/s², equivalent to ~55 m/s² (vs Unity's
+#     9.81 m/s²) — ~5.6x stronger. Bullets nose-dive into the ground.
+#  3. ``Touched`` events tunnel past targets at high speed (3+ studs per
+#     frame at typical bullet velocities), so even when the bullet
+#     reaches the player the hit doesn't register.
+#
+# Fix: replace the bullet's ``Start``-like body and ``Touched`` handler
+# with raycast-based hit detection that:
+#   - Sets ``AssemblyLinearVelocity = forward * force * STUDS_PER_METER``
+#   - Adds an anti-gravity ``VectorForce`` (``force = gravity * mass``)
+#   - Raycasts each ``Heartbeat`` from the previous frame's position to
+#     the current to catch tunnel-through hits
+#   - Adds a visible ``Trail`` so the trajectory reads in-game
+
+# Match ANY local-variable ApplyImpulse / Touched:Connect — the AI
+# transpile of Unity's bullet scripts uses different local names
+# across runs (``rootPart``, ``rb``, ``part``, ``container``, etc.).
+# Codex round-2 found PlaneBullet skipped because the prior regex
+# only matched the literal ``rootPart`` form. The bullet-name scope
+# (``TurretBullet`` / ``PlaneBullet`` only) still gates the pack
+# from touching unrelated impulse-using scripts.
+_BULLET_DETECT_RE = re.compile(
+    r'\b\w+\s*:\s*ApplyImpulse\s*\(',
+)
+_BULLET_TOUCHED_RE = re.compile(
+    r'\b\w+\.Touched\s*:\s*Connect\b',
+)
+
+
+def _detect_bullet_unity_transpile(scripts: list["RbxScript"]) -> bool:
+    for s in scripts:
+        if s.name not in ("TurretBullet", "PlaneBullet"):
+            continue
+        if (
+            _BULLET_DETECT_RE.search(s.source)
+            and _BULLET_TOUCHED_RE.search(s.source)
+            and "_AutoBulletRaycastInjected" not in s.source
+        ):
+            return True
+    return False
+
+
+# Per-bullet defaults derived from the canonical Unity sources
+# (``TurretBullet.cs``, ``PlaneBullet.cs``). Codex round-1 caught a
+# regression: applying ``TurretBullet``'s defaults (3/60, direct-hit
+# only) to ``PlaneBullet`` silently dropped PlaneBullet's 6-second
+# fade, 200-force velocity, and ~2-stud OverlapSphere splash damage.
+# ``splash_radius`` of 0 means direct-hit only (turret); >0 enables
+# the splash branch with an ``OverlapParams`` proximity check.
+_BULLET_DEFAULTS = {
+    "TurretBullet": {"fadeTime": 3, "force": 60, "damage": 10, "splash_radius": 0},
+    "PlaneBullet": {"fadeTime": 6, "force": 200, "damage": 10, "splash_radius": 2},
+}
+
+
+def _build_bullet_replacement(name: str) -> str:
+    """Build the bullet replacement script body for *name* using the
+    Unity-canonical defaults. Marker comment ``_AutoBulletRaycastInjected``
+    pins idempotency. Splash-damage branch is emitted only when the
+    bullet has a non-zero ``splash_radius`` (PlaneBullet) — keeping
+    TurretBullet's body the lean direct-hit version.
+    """
+    defaults = _BULLET_DEFAULTS.get(name, _BULLET_DEFAULTS["TurretBullet"])
+    splash_radius = defaults["splash_radius"]
+    splash_branch = ""
+    if splash_radius > 0:
+        # Splash damage: at impact, find players within ``splash_radius``
+        # studs * STUDS_PER_METER (Unity OverlapSphere works in meters)
+        # and apply damage to each.
+        # Explosion VFX (codex round-5 [P3]): Unity ``PlaneBullet.cs``
+        # instantiates an ``explosion`` GameObject on every collision.
+        # Clone the ``Explosion`` template from
+        # ``ReplicatedStorage.Templates`` if present so the converted
+        # output preserves the VFX/audio feedback. No-op when the
+        # template is absent (older outputs without prefab packages).
+        splash_branch = f'''
+local _ReplicatedStorage = game:GetService("ReplicatedStorage")
+local _explosionTemplate = (function()
+    local t = _ReplicatedStorage:FindFirstChild("Templates")
+    return t and t:FindFirstChild("Explosion")
+end)()
+local function _spawnExplosionAt(originPos)
+    if not _explosionTemplate then return end
+    local clone = _explosionTemplate:Clone()
+    if clone:IsA("Model") then
+        clone:PivotTo(CFrame.new(originPos))
+    elseif clone:IsA("BasePart") then
+        clone.CFrame = CFrame.new(originPos)
+    end
+    clone.Parent = workspace
+    Debris:AddItem(clone, 2)
+end
+local function applyAreaDamage(originPos)
+    local radius = {splash_radius} * STUDS_PER_METER
+    for _, player in ipairs(Players:GetPlayers()) do
+        local char = player.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp and (hrp.Position - originPos).Magnitude <= radius then
+            local model = hrp.Parent
+            model:SetAttribute("TakeDamage", damage)
+            local humanoid = model:FindFirstChildOfClass("Humanoid")
+            if humanoid then humanoid:TakeDamage(damage) end
+        end
+    end
+end
+'''
+    # Direct-hit path (Humanoid model raycast hit).
+    #
+    # Splash bullets (PlaneBullet): Unity's ``OnCollisionEnter`` runs
+    # ``OverlapSphere(2)`` and applies damage to every Player within
+    # the radius — including the directly-hit one. Splash bullets
+    # therefore use ``applyAreaDamage`` as their ONLY damage source,
+    # matching Unity's single-pass behavior.
+    #
+    # Direct-hit-only bullets (TurretBullet): no splash in Unity, so
+    # the only damage source is the direct attribute write.
+    #
+    # Codex round-5 [P1]: splash centers on the raycast ``result``'s
+    # ``Position`` (the actual collision point), NOT
+    # ``rootPart.Position``. At ``force=200``+ a tunneling frame can
+    # put rootPart 10-12 studs past the collision point — larger than
+    # the 7-stud splash radius — so a wall-hit beside a player would
+    # miss entirely.
+    if splash_radius > 0:
+        apply_hit_body = (
+            '    _spawnExplosionAt(impactPos)\n'
+            '    applyAreaDamage(impactPos)\n'
+            '    container:Destroy()\n'
+        )
+        # Non-character impact (wall, ground, prop) — splash bullets
+        # still explode and apply area damage. Mirrors Unity
+        # ``PlaneBullet.cs`` ``OnCollisionEnter`` which instantiates
+        # the explosion and runs ``OverlapSphere`` regardless of the
+        # collider's tag.
+        non_char_impact_body = (
+            '                consumed = true\n'
+            '                _spawnExplosionAt(result.Position)\n'
+            '                applyAreaDamage(result.Position)\n'
+            '                container:Destroy()\n'
+            '                return\n'
+        )
+    else:
+        apply_hit_body = (
+            '    model:SetAttribute("TakeDamage", damage)\n'
+            '    local humanoid = model:FindFirstChildOfClass("Humanoid")\n'
+            '    if humanoid then humanoid:TakeDamage(damage) end\n'
+            '    container:Destroy()\n'
+        )
+        # Direct-hit bullets just despawn on terrain/wall impact —
+        # matches Unity ``TurretBullet.cs`` whose ``OnCollisionEnter``
+        # only damages on player tag and otherwise destroys the bullet.
+        non_char_impact_body = (
+            '                consumed = true\n'
+            '                container:Destroy()\n'
+            '                return\n'
+        )
+    return f'''\
+-- _AutoBulletRaycastInjected: bullet coherence pack
+-- Stud-space velocity + anti-gravity + raycast hit detection.
+-- Replaces the AI transpile of Unity's {name}.cs
+-- (rb.AddRelativeForce + OnCollisionEnter), which stacks three bugs
+-- in stud-space Roblox physics: 5.7x slow velocity, 5.6x strong
+-- gravity, and Touched tunneling at high speeds.
+local Debris = game:GetService("Debris")
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+
+local container = script.Parent
+if container:IsA("Model") and not container.PrimaryPart then
+    container.PrimaryPart = container:FindFirstChildWhichIsA("BasePart")
+end
+
+local function getCFrame()
+    if container:IsA("Model") then return container:GetPivot() end
+    return container.CFrame
+end
+local function getRootPart()
+    if container:IsA("Model") then
+        return container.PrimaryPart or container:FindFirstChildWhichIsA("BasePart")
+    end
+    return container
+end
+
+-- Read serialized MonoBehaviour overrides from the part's
+-- attributes; the converter's ``_extract_monobehaviour_attributes``
+-- emits ``fadeTime``/``force``/``damage`` as float attributes so
+-- prefab/instance inspector tuning carries through to runtime.
+-- Unity-canonical defaults are the fallback when an attribute is
+-- absent (e.g. older outputs or a clone whose attributes were
+-- stripped at clone time).
+local _attrHost = container:IsA("Model") and (container.PrimaryPart or container) or container
+local fadeTime = _attrHost:GetAttribute("fadeTime") or {defaults["fadeTime"]}
+local force = _attrHost:GetAttribute("force") or {defaults["force"]}
+local damage = _attrHost:GetAttribute("damage") or {defaults["damage"]}
+local STUDS_PER_METER = 3.571
+
+local rootPart = getRootPart()
+if not rootPart then return end
+
+rootPart.Anchored = false
+
+-- Anti-gravity: cancel Roblox's 196 studs/s² so bullets fly straight
+-- like Unity's near-massless impulse (gravity barely affects them
+-- across the bullet's fadeTime in Unity's 9.81 m/s² space).
+local att0 = Instance.new("Attachment")
+att0.Name = "_BulletAtt0"
+att0.Parent = rootPart
+local antiG = Instance.new("VectorForce")
+antiG.Force = Vector3.new(0, workspace.Gravity * rootPart.AssemblyMass, 0)
+antiG.RelativeTo = Enum.ActuatorRelativeTo.World
+antiG.Attachment0 = att0
+antiG.ApplyAtCenterOfMass = true
+antiG.Parent = rootPart
+
+-- Initial velocity in stud-space (Unity m/s × STUDS_PER_METER).
+rootPart.AssemblyLinearVelocity = getCFrame().LookVector * (force * STUDS_PER_METER)
+
+-- Trail for visible trajectory
+local att1 = Instance.new("Attachment")
+att1.Name = "_TrailAtt1"
+att1.Position = Vector3.new(0, 0, 0.5)
+att1.Parent = rootPart
+local att2 = Instance.new("Attachment")
+att2.Name = "_TrailAtt2"
+att2.Position = Vector3.new(0, 0, -0.5)
+att2.Parent = rootPart
+local trail = Instance.new("Trail")
+trail.Attachment0 = att1
+trail.Attachment1 = att2
+trail.Lifetime = 0.4
+trail.MinLength = 0
+trail.WidthScale = NumberSequence.new({{
+    NumberSequenceKeypoint.new(0, 1),
+    NumberSequenceKeypoint.new(1, 0),
+}})
+trail.Color = ColorSequence.new(Color3.fromRGB(255, 100, 50))
+trail.Transparency = NumberSequence.new({{
+    NumberSequenceKeypoint.new(0, 0),
+    NumberSequenceKeypoint.new(1, 1),
+}})
+trail.Parent = rootPart
+
+Debris:AddItem(container, fadeTime)
+{splash_branch}
+-- Raycast hit detection: cast segment from previous-frame position to
+-- current each heartbeat. Catches tunneling that Touched misses.
+local prevPos = rootPart.Position
+local consumed = false
+local rp = RaycastParams.new()
+rp.FilterDescendantsInstances = {{container}}
+rp.FilterType = Enum.RaycastFilterType.Exclude
+
+local function applyHit(model, impactPos)
+{apply_hit_body}end
+
+local conn
+conn = RunService.Heartbeat:Connect(function()
+    if consumed or not rootPart.Parent then
+        if conn then conn:Disconnect() end
+        return
+    end
+    local curPos = rootPart.Position
+    local segment = curPos - prevPos
+    if segment.Magnitude > 0 then
+        local result = workspace:Raycast(prevPos, segment, rp)
+        if result then
+            local inst = result.Instance
+            local model = inst:FindFirstAncestorOfClass("Model")
+            if model and model:FindFirstChildOfClass("Humanoid") then
+                local player = Players:GetPlayerFromCharacter(model)
+                if player or inst:HasTag("Player") or model.Name == "Player" then
+                    consumed = true
+                    applyHit(model, result.Position)
+                    return
+                end
+            else
+                -- Hit non-character (terrain, wall, prop). Splash
+                -- bullets explode here too; direct-hit bullets just
+                -- despawn. Behavior is template-controlled by
+                -- ``non_char_impact_body``.
+{non_char_impact_body}            end
+        end
+    end
+    prevPos = curPos
+end)
+'''
+
+
+@patch_pack(
+    name="bullet_physics_raycast",
+    description=(
+        "Replace AI-transpiled Unity bullet bodies (TurretBullet, "
+        "PlaneBullet) with stud-space velocity + anti-gravity + raycast "
+        "hit detection. Without this, bullets fly too slow, nose-dive, "
+        "and tunnel past targets."
+    ),
+    detect=_detect_bullet_unity_transpile,
+)
+def _replace_bullet_physics(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        if s.name not in ("TurretBullet", "PlaneBullet"):
+            continue
+        if (
+            not _BULLET_DETECT_RE.search(s.source)
+            or not _BULLET_TOUCHED_RE.search(s.source)
+            or "_AutoBulletRaycastInjected" in s.source
+        ):
+            continue
+        s.source = _build_bullet_replacement(s.name)
+        fixes += 1
+        log.info("  Replaced bullet physics in '%s'", s.name)
+    return fixes
+
+
+# ---------------------------------------------------------------------------
+# Pack: player_damage_remote_event
+# ---------------------------------------------------------------------------
+#
+# Unity's ``Player.cs`` raycasts on click and ``SendMessage("TakeDamage",
+# damage)`` on the hit collider. The AI transpile renders that as a
+# LocalScript that ``:SetAttribute("TakeDamage", true)`` on the hit
+# instance. But LocalScript attribute writes DON'T replicate to the
+# server — so server-side scripts (e.g. Turret.luau) listening via
+# ``GetAttributeChangedSignal("TakeDamage")`` never fire. Player can
+# never damage anything.
+#
+# Fix: introduce a ``DamageEvent`` RemoteEvent in ReplicatedStorage.
+# Player.luau ``shoot()`` ``FireServer(hitInst)`` after each raycast
+# hit. A tiny server router (auto-generated) listens and sets the
+# attribute server-side so the existing
+# ``GetAttributeChangedSignal`` listeners fire.
+
+# Match ANY local-variable ``:SetAttribute("TakeDamage", <expr>)``
+# coming out of the AI transpile. Different runs vary on TWO axes:
+#   1. The local name: ``hitInst``, ``hitPart``, ``hit``, etc. —
+#      capture group 1 carries the identifier so the injected
+#      FireServer call references the same name.
+#   2. The value: ``true`` is the canonical shape, but the AI
+#      sometimes emits an incrementing form to force the change
+#      signal — e.g. ``(<inst>:GetAttribute("TakeDamage") or 0) + 1``.
+#      Match anything after the comma up to the closing ``)`` so
+#      either shape triggers the pack. Codex round-4 [P2] flagged
+#      that the prior literal-``true`` regex missed real outputs.
+_PLAYER_RAYCAST_HIT_RE = re.compile(
+    r'\b([A-Za-z_]\w*)\s*:\s*SetAttribute\s*\(\s*["\']TakeDamage["\']\s*,\s*[^)\n]+\s*\)',
+)
+
+
+def _detect_player_damage_attr_set(scripts: list["RbxScript"]) -> bool:
+    """Match only LocalScript Player bodies. ``FireServer`` is client-
+    only, so injecting it into a server ``Script`` would crash at
+    runtime on the first shot. Server classifications happen on
+    converted projects whose Player.cs was misclassified by the
+    storage-classifier — defending here keeps the pack from poisoning
+    those builds.
+    """
+    for s in scripts:
+        if s.name != "Player":
+            continue
+        if s.script_type != "LocalScript":
+            continue
+        if (
+            _PLAYER_RAYCAST_HIT_RE.search(s.source)
+            and "_AutoDamageRemoteEventInjected" not in s.source
+        ):
+            return True
+    return False
+
+
+# Block inserted after the player's raycast SetAttribute. Fires the
+# RemoteEvent so a server router can replay the raycast and mirror
+# the attribute write.
+#
+# The FireServer payload is ``(hitVar, originPos, lookDir)`` where
+# ``hitVar`` is the AI-named local for ``result.Instance``, and the
+# origin/direction come from ``workspace.CurrentCamera.CFrame``
+# (matches the client's own raycast contract: Unity Player.cs uses
+# the camera, not the character root). The server replays the
+# raycast from those values so legitimate over-cover shots aren't
+# rejected when ``HumanoidRootPart→hitInstance`` would be occluded.
+#
+# ``{hit_var}`` is substituted with the AI-named local at apply time.
+_PLAYER_DAMAGE_FIRE_TEMPLATE = (
+    '\n            -- _AutoDamageRemoteEventInjected: mirror client damage to server\n'
+    '            do\n'
+    '                local _de = game:GetService("ReplicatedStorage")'
+    ':FindFirstChild("DamageEvent")\n'
+    '                if _de then\n'
+    '                    local _cam = workspace.CurrentCamera\n'
+    '                    -- Send the value the client just wrote so\n'
+    '                    -- the server preserves it verbatim (codex\n'
+    '                    -- round-10 [P1]: don\'t let the server\n'
+    '                    -- synthesize a counter that overwrites the\n'
+    '                    -- client\'s damage payload).\n'
+    '                    local _td = {hit_var}:GetAttribute("TakeDamage")\n'
+    '                    _de:FireServer({hit_var}, _td, _cam.CFrame.Position, '
+    '_cam.CFrame.LookVector)\n'
+    '                end\n'
+    '            end\n'
+)
+
+
+# Auto-generated server router script. The router is NOT client-
+# authoritative: it re-raycasts from the firing player's character
+# toward the reported hit instance and only applies damage when the
+# server-side raycast actually intersects that instance within the
+# player's effective weapon range. This matches Unity Player.cs's
+# ``shootRange = 100`` (meters) ≈ 357 studs.
+#
+# Without this validation, a malicious client could ``FireServer``
+# any workspace instance and the server would apply damage — fully
+# client-authoritative in multiplayer.
+_DAMAGE_ROUTER_SOURCE = '''\
+-- _AutoDamageEventRouter (auto-generated by player_damage_remote_event pack)
+-- Mirrors client-fired damage hits to server-side ``TakeDamage``
+-- attribute writes so server scripts listening via
+-- ``GetAttributeChangedSignal`` actually fire.
+--
+-- The router replays the client's raycast on the server from the
+-- client-supplied camera origin + direction. Origin/direction are
+-- sanity-checked against the player's character (origin within
+-- ``MAX_ORIGIN_DRIFT_STUDS`` of the character's head/HRP, direction
+-- a unit vector). Without origin replay the server-from-HRP raycast
+-- rejects legitimate over-cover shots (Unity FPS Player.cs raycasts
+-- from the camera, not the character root).
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local STUDS_PER_METER = 3.571
+-- Mirror of Unity Player.cs ``shootRange = 100`` (meters) + 50% slack
+-- so a borderline-range raycast from the server doesn't drop the
+-- intended hit. Adjust if your project's player script uses a
+-- different range.
+local MAX_SHOOT_RANGE_STUDS = 100 * STUDS_PER_METER * 1.5
+-- Origin sanity bound: the client may shoot from a free-look camera
+-- offset from the character, but the camera shouldn't be more than
+-- a few avatars away from the player's HRP. 20 studs of slack covers
+-- normal first/third-person rigs without admitting arbitrary teleport
+-- spoofs.
+local MAX_ORIGIN_DRIFT_STUDS = 20
+
+local function _matchesIntendedHit(serverHit, intendedInst)
+    if serverHit == intendedInst then return true end
+    local serverModel = serverHit:FindFirstAncestorOfClass("Model")
+    local intendedModel = intendedInst:FindFirstAncestorOfClass("Model")
+    if serverModel and intendedModel and serverModel == intendedModel then
+        return true
+    end
+    return false
+end
+
+local de = ReplicatedStorage:FindFirstChild("DamageEvent")
+if not de then
+    de = Instance.new("RemoteEvent")
+    de.Name = "DamageEvent"
+    de.Parent = ReplicatedStorage
+end
+
+de.OnServerEvent:Connect(function(player, hitInstance, takeDamageValue, originPos, lookDir)
+    -- Type guards FIRST: a malicious client can ``FireServer(true)``
+    -- / ``FireServer({})`` and the server must reject the payload
+    -- before calling any Instance methods (would throw otherwise).
+    if typeof(hitInstance) ~= "Instance" then return end
+    if not hitInstance:IsA("BasePart") then return end
+    if not hitInstance:IsDescendantOf(workspace) then return end
+    if typeof(originPos) ~= "Vector3" then return end
+    if typeof(lookDir) ~= "Vector3" then return end
+    if lookDir.Magnitude < 1e-3 then return end
+
+    local char = player.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    -- Origin must be close to the player's character (anti-teleport).
+    if (originPos - hrp.Position).Magnitude > MAX_ORIGIN_DRIFT_STUDS then
+        return
+    end
+
+    -- Server replay: cast from the client-supplied origin + direction.
+    -- Mirrors what the client's Player.cs raycast already did, so over-
+    -- cover camera shots are accepted just like in single-player.
+    local rp = RaycastParams.new()
+    rp.FilterDescendantsInstances = {char}
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    local result = workspace:Raycast(
+        originPos,
+        lookDir.Unit * MAX_SHOOT_RANGE_STUDS,
+        rp
+    )
+    if not (result and _matchesIntendedHit(result.Instance, hitInstance)) then
+        return
+    end
+
+    -- Validated. Mirror the client's TakeDamage write VERBATIM.
+    -- Codex round-10 [P1]: synthesizing a counter on the server
+    -- discards the client's payload, which under-damages listeners
+    -- that read ``TakeDamage`` as the damage amount. The client
+    -- captures whatever it wrote (``true`` for the canonical AI
+    -- transpile, or an incrementing token for change-signal-safe
+    -- shapes, or a numeric damage value) and sends it through; the
+    -- server preserves that semantics.
+    --
+    -- Codex round-11 [P2]: Roblox attributes only accept primitive
+    -- scalars (bool/number/string + a few Vector/Color types). A
+    -- malicious client could send a table or function and crash
+    -- ``SetAttribute``. Coerce anything other than the canonical
+    -- shapes (bool/number/string) to ``true`` so a listener doing
+    -- ``if attr then`` still reacts but no SetAttribute call ever
+    -- gets handed an invalid payload.
+    local _t = typeof(takeDamageValue)
+    if _t ~= "boolean" and _t ~= "number" and _t ~= "string" then
+        takeDamageValue = true
+    end
+    hitInstance:SetAttribute("TakeDamage", takeDamageValue)
+    local m = hitInstance:FindFirstAncestorOfClass("Model")
+    if m then m:SetAttribute("TakeDamage", takeDamageValue) end
+end)
+'''
+
+
+_DAMAGE_ROUTER_NAME = "_AutoDamageEventRouter"
+
+
+def _detect_player_or_router_present(scripts: list["RbxScript"]) -> bool:
+    """Run when ANY of:
+      - a ``Player`` LocalScript still needs the ``FireServer`` patch
+      - a ``Player`` LocalScript is already patched but the router
+        script is absent (rehydrated re-conversion lost the router)
+      - a ``Player`` LocalScript is already patched AND a router
+        exists but its source is stale (re-conversion of an
+        already-patched output should refresh the router with any
+        round-to-round improvements — codex round-11 [P2])
+
+    The apply path compares router source byte-for-byte and only
+    rewrites on diff, so this detector being more permissive doesn't
+    re-write a fresh router.
+    """
+    if _detect_player_damage_attr_set(scripts):
+        return True
+    has_patched_player = any(
+        s.name == "Player"
+        and s.script_type == "LocalScript"
+        and "_AutoDamageRemoteEventInjected" in s.source
+        for s in scripts
+    )
+    if not has_patched_player:
+        return False
+    router = next(
+        (s for s in scripts if s.name == _DAMAGE_ROUTER_NAME), None,
+    )
+    if router is None:
+        return True  # Missing — must emit.
+    # Stale router (source diverges from the canonical pack version)
+    # → refresh. ``_inject_player_damage_remote_event``'s router
+    # branch only writes when the source actually differs.
+    return router.source != _DAMAGE_ROUTER_SOURCE
+
+
+@patch_pack(
+    name="player_damage_remote_event",
+    description=(
+        "Mirror client-side Player raycast damage hits to the server "
+        "via a DamageEvent RemoteEvent + auto-injected server router. "
+        "Without this, the server-side TakeDamage attribute listener "
+        "never fires (LocalScript SetAttribute doesn't replicate)."
+    ),
+    detect=_detect_player_or_router_present,
+)
+def _inject_player_damage_remote_event(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    # 1. Patch every Player LocalScript's raycast hit branch to FireServer.
+    # Server ``Script`` classifications are skipped — ``FireServer`` is
+    # client-only and would error on the first shot.
+    for s in scripts:
+        if s.name != "Player" or s.script_type != "LocalScript":
+            continue
+        if "_AutoDamageRemoteEventInjected" in s.source:
+            continue
+        m = _PLAYER_RAYCAST_HIT_RE.search(s.source)
+        if not m:
+            continue
+        hit_var = m.group(1)
+        # Insert after the model:SetAttribute("TakeDamage", true) line
+        # so both the hit-instance and model writes complete before the
+        # FireServer. Scope: look for the closing ``end`` of the
+        # ``if model then ... end`` block immediately after the hit
+        # SetAttribute. If absent, insert right after the hit line.
+        # Anchor on the captured hit-var SetAttribute call. Tolerates:
+        #   - both the canonical ``true`` literal AND the incrementing
+        #     ``(GetAttribute("TakeDamage") or 0) + 1`` shape (nested
+        #     parens, so consume up to the next newline rather than ``)``).
+        #   - optional ``local model = hitInst:FindFirstAncestor...``
+        #     line right after the SetAttribute.
+        #   - both single-line ``if model then model:SetAttribute(...) end``
+        #     and multi-line forms that wrap the SetAttribute on its
+        #     own line. Codex round-8 [P1] flagged that the multi-line
+        #     shape (already present in some converter outputs) didn't
+        #     match the single-line anchor and silently skipped the
+        #     FireServer injection.
+        anchor_re = re.compile(
+            rf'({re.escape(hit_var)}\s*:\s*SetAttribute\s*\(\s*["\']TakeDamage["\'][^\n]*\n'
+            r'(?:\s*local\s+model\s*=[^\n]+\n)?'
+            # Single-line: ``if model then model:SetAttribute(...) end``
+            r'(?:\s*if\s+model\s+then\s+model\s*:\s*SetAttribute[^\n]+end\s*\n'
+            # Multi-line:
+            #   if model then
+            #       model:SetAttribute("TakeDamage", ...)
+            #   end
+            r'|\s*if\s+model\s+then\s*\n'
+            r'\s*model\s*:\s*SetAttribute[^\n]+\n'
+            r'\s*end\s*\n)?)',
+        )
+        anchor_m = anchor_re.search(s.source)
+        if not anchor_m:
+            continue
+        insert_at = anchor_m.end()
+        insert_block = _PLAYER_DAMAGE_FIRE_TEMPLATE.replace(
+            "{hit_var}", hit_var,
+        )
+        s.source = (
+            s.source[:insert_at]
+            + insert_block
+            + s.source[insert_at:]
+        )
+        fixes += 1
+        log.info("  Patched '%s' to FireServer (hit var=%s) on raycast hit",
+                 s.name, hit_var)
+
+    # 2. Emit (or refresh) the auto-generated server router. Idempotent:
+    # if a router with the canonical name exists, replace its source to
+    # keep behaviour in sync with the pack version. Otherwise append a
+    # new RbxScript to the list.
+    from core.roblox_types import RbxScript
+    router_name = _DAMAGE_ROUTER_NAME
+    existing = next((s for s in scripts if s.name == router_name), None)
+    if existing is not None:
+        if existing.source != _DAMAGE_ROUTER_SOURCE:
+            existing.source = _DAMAGE_ROUTER_SOURCE
+            fixes += 1
+            log.info("  Refreshed %s source", router_name)
+    else:
+        scripts.append(
+            RbxScript(
+                name=router_name,
+                source=_DAMAGE_ROUTER_SOURCE,
+                script_type="Script",
+                parent_path="ServerScriptService",
+            )
+        )
+        fixes += 1
+        log.info("  Emitted %s server router script", router_name)
+
+    return fixes

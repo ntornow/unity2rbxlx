@@ -3300,6 +3300,19 @@ script.Disabled = true
         # both contexts without races between the two copies.
         self._attach_prefab_scoped_animation_scripts_to_templates()
 
+        # Same problem, different script source: MonoBehaviour scripts
+        # (TurretBullet, PlaneBullet, Pickup, etc.) are bound to scene-
+        # level parts via ``_bind_scripts_to_parts`` BEFORE templates
+        # are generated. By the time we get here, the script has been
+        # moved out of the flat list and into a scene part's ``.scripts``
+        # list. The template that ``generate_prefab_packages`` just
+        # emitted carries ``_ScriptClass`` attributes but no Script
+        # children — so ``Templates:Clone()`` at runtime returns a part
+        # with no behaviour. Concrete case: SimpleFPS TurretBullet
+        # template is a bare red cube with no flight/damage code, so
+        # turret-fired bullets fall to the ground inert.
+        self._attach_monobehaviour_scripts_to_templates()
+
         # Persist a small manifest under packages/ — closes the packages
         # half of Phase 4.11's disk-rewrite deferred item.
         try:
@@ -3359,6 +3372,92 @@ script.Disabled = true
             log.info(
                 "[write_output] Attached %d prefab-scoped animation "
                 "script(s) under ReplicatedStorage.Templates.<Prefab>",
+                attached,
+            )
+
+    def _attach_monobehaviour_scripts_to_templates(self) -> None:
+        """Attach MonoBehaviour scripts under their prefab template parts.
+
+        Mirror of :meth:`_attach_prefab_scoped_animation_scripts_to_templates`
+        but for arbitrary ``_ScriptClass`` bindings. Walks every part in
+        every prefab template, finds parts with ``_ScriptClass`` (or
+        ``_ScriptClass_N``) attributes, and clones the matching script
+        body onto the part. Searches BOTH the flat ``place.scripts``
+        list and every workspace part's ``.scripts`` (since
+        ``_bind_scripts_to_parts`` may have already moved the script
+        out of the flat list into a scene-level part).
+        """
+        from copy import copy as _shallow_copy
+        from core.roblox_types import RbxScript
+
+        templates = getattr(self.state.rbx_place, "replicated_templates", None)
+        if not templates:
+            return
+
+        # Build script-by-name index from EVERY location a script could
+        # currently live: the flat list + every workspace part's
+        # ``.scripts`` (recursive). First-found wins; ties broken by
+        # the flat list (most authoritative source).
+        scripts_by_name: dict[str, RbxScript] = {}
+
+        def _collect(parts: list) -> None:
+            for p in parts or []:
+                for s in getattr(p, "scripts", None) or []:
+                    if s.name not in scripts_by_name:
+                        scripts_by_name[s.name] = s
+                _collect(getattr(p, "children", None) or [])
+
+        # Flat list first (overrides any scene-attached duplicate).
+        for s in self.state.rbx_place.scripts or []:
+            scripts_by_name.setdefault(s.name, s)
+        _collect(self.state.rbx_place.workspace_parts or [])
+
+        attached = 0
+
+        def _walk(parts: list) -> None:
+            nonlocal attached
+            for part in parts:
+                attrs = getattr(part, "attributes", None) or {}
+                # ``_ScriptClass`` plus optional ``_ScriptClass_N`` for
+                # multi-MonoBehaviour GameObjects (Unity allows several
+                # MonoBehaviour components on one GO).
+                classes: set[str] = set()
+                for key, val in attrs.items():
+                    if key.startswith("_ScriptClass") and isinstance(val, str):
+                        classes.add(val)
+                # Skip when the part already has the script (idempotent
+                # under re-run, and avoids duplicate attachment if a
+                # future pass also wires scripts onto templates).
+                existing_names = {s.name for s in getattr(part, "scripts", None) or []}
+                for class_name in classes:
+                    if class_name in existing_names:
+                        continue
+                    source_script = scripts_by_name.get(class_name)
+                    if source_script is None:
+                        continue
+                    # Skip non-Script types — LocalScripts/ModuleScripts
+                    # don't belong as direct children of a workspace
+                    # part by convention (LocalScripts live under
+                    # StarterPlayerScripts, ModuleScripts in RS).
+                    if source_script.script_type != "Script":
+                        continue
+                    # Skip AI-stubbed scripts (no AI key) so the template
+                    # doesn't ship a stub that would shadow a real
+                    # runtime implementation.
+                    if "AI transpilation recommended" in source_script.source:
+                        continue
+                    clone = _shallow_copy(source_script)
+                    clone.parent_path = None
+                    part.scripts.append(clone)
+                    attached += 1
+                _walk(getattr(part, "children", None) or [])
+
+        _walk(templates)
+
+        if attached:
+            log.info(
+                "[write_output] Attached %d MonoBehaviour script(s) under "
+                "ReplicatedStorage.Templates.<Prefab>",
                 attached,
             )
 

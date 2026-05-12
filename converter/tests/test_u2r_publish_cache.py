@@ -499,3 +499,58 @@ class TestRobloxIdsCacheTiming:
         import json
         cached = json.loads(ids_path.read_text())
         assert cached == {"universe_id": 1234, "place_id": 5678}
+
+
+class TestCollisionFidelityBatchAbort:
+    """Codex round-10 [P2]: when ``execute_luau`` times out on a
+    collision-fidelity batch, the Roblox task may still be running
+    server-side. Every batch script ends with ``SavePlaceAsync()``,
+    so submitting more batches in parallel risks a late-completing
+    earlier batch clobbering a later batch's place save with a stale
+    snapshot. ``place_publisher`` must abort the batch loop on the
+    first timeout rather than firing more batches.
+    """
+
+    def test_publish_aborts_after_first_batch_timeout(
+        self, monkeypatch, tmp_path
+    ):
+        """Simulate ``execute_luau`` returning None on the first
+        batch. Expectation: the publisher does NOT call execute_luau
+        again for subsequent batches.
+        """
+        from roblox import place_publisher, cloud_api
+
+        # ``publish_place_file`` does ``from roblox.cloud_api import
+        # upload_place, execute_luau`` INSIDE the function, so we need
+        # to patch the ``cloud_api`` module-level bindings.
+        monkeypatch.setattr(cloud_api, "upload_place", lambda *a, **kw: True)
+
+        execute_calls: list[str] = []
+        def _fake_execute_luau(api_key, uni, pid, script, timeout="300s"):
+            execute_calls.append(script[:40])
+            return None  # Simulate timeout on every batch.
+        monkeypatch.setattr(cloud_api, "execute_luau", _fake_execute_luau)
+
+        # 6 targets → 3 batches of 2 with BATCH_SIZE=2.
+        targets = [
+            {"path": f"Workspace.M{i}", "mesh_id": "rbxassetid://1", "fidelity": "Hull"}
+            for i in range(6)
+        ]
+        rbxlx = tmp_path / "place.rbxlx"
+        rbxlx.write_text("<roblox></roblox>")
+
+        place_publisher.publish_place_file(
+            api_key="fake",
+            universe_id=1,
+            place_id=2,
+            rbxlx_path=rbxlx,
+            fixup_targets=targets,
+        )
+
+        # Only ONE batch should have been submitted before the abort —
+        # the loop must NOT proceed to batch 2 or 3 after a timeout.
+        assert len(execute_calls) == 1, (
+            f"Expected single batch submit before abort, got {len(execute_calls)}. "
+            "Late-completing earlier batch's SavePlaceAsync would clobber later "
+            "batches' saves."
+        )
