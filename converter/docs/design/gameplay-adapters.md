@@ -165,8 +165,8 @@ implementers, will be tested in PR #73):
     see a strict bool.
   - **Idempotent listener registration:** if `Composer.run` is called
     on the same part twice, the second call observes the existing
-    binding (via the same marker attribute the Movement capability
-    uses) and is a no-op for the listener registration too.
+    binding (see "Re-bind marker" below) and is a no-op for the
+    listener registration too.
 
 **Runtime semantics for `Movement.AttributeDrivenTween`** (binding on
 implementers, will be tested in PR #73):
@@ -180,8 +180,30 @@ implementers, will be tested in PR #73):
     snapping mid-motion.
   - **Idempotent re-bind:** calling `Composer.run` on the same part
     twice doesn't stack listeners or double-register attribute
-    observers. The runtime detects an existing bind (marker attribute
-    on the part) and is a no-op on the second call.
+    observers. The runtime detects an existing bind via the marker
+    attribute `_GameplayBound = true` on the container (see "Re-bind
+    marker" below) and is a no-op on the second call.
+
+**Re-bind marker.** The composer sets a single attribute on each
+container the first time it runs:
+
+```
+container:SetAttribute("_GameplayBound", true)
+```
+
+Every capability's runtime function reads this attribute BEFORE
+registering anything (listeners, tweens, ctx writes) and exits early
+when it's already set. One marker for the whole composer call —
+individual capabilities don't each get their own marker. The marker
+is intentionally underscored to indicate converter-owned, and named
+generically (`_GameplayBound`, not `_DoorBound`) so the same
+mechanism applies to every behaviour the composer drives.
+
+Tests in PR #73 pin: (a) absent marker → composer registers
+listeners as usual and sets the marker; (b) present marker →
+composer is a no-op for THAT call (still safe to register new
+behaviours that weren't part of the original bind via a separate
+mechanism not covered here).
 
 The capability vocabulary is **deliberately small**. New Unity patterns
 extend the vocabulary by adding a single capability variant, not a new
@@ -351,8 +373,9 @@ an output-dir deny-list (`<output>/.gameplay_deny.txt` — one
   - `effects.luau` — `Effects.damage(target, value)`,
     `Effects.splash(origin, radius, value)`,
     `Effects.spawnTemplate(name, cframe)`.
-  - `triggers.luau` — `Triggers.onAttributeBecomesTrue(target, name, fn)`,
-    `Triggers.onPickup(zone, fn)`.
+  - `triggers.luau` — `Triggers.onBoolAttribute(target, name, ctx)`
+    (publishes normalized bool to `ctx.trigger.value` on bind + every
+    change), `Triggers.onPickup(zone, fn)`.
   - `damage_protocol.luau` — owns the RemoteEvent end-to-end (client fire,
     server receive, validation, attribute mirror). Client and server halves
     in one file; protocol drift is structurally impossible. The damage
