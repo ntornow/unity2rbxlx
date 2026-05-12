@@ -1119,6 +1119,13 @@ class TestSourceQualifiedDenyList:
 
 
 class TestDamagePlayerFilter:
+    """Structural check: every ``_applyDamageToModel`` call inside the
+    ``Effects.damage`` function body must be guarded by an
+    ``if isPlayer`` conditional. Codex PR #73b-round-2 P3 flagged the
+    prior substring scan as fragile — comments and copy-pasted strings
+    would survive a refactor that broke the semantic gate.
+    """
+
     def _read_runtime(self) -> str:
         from pathlib import Path as P
         path = (
@@ -1126,30 +1133,147 @@ class TestDamagePlayerFilter:
         )
         return path.read_text(encoding="utf-8")
 
-    def test_damage_handler_checks_player(self) -> None:
-        """``Effects.damage`` must gate the ``_applyDamageToModel``
-        call behind one of three Player-detection signals — anything
-        else regresses TurretBullet to damage NPC/allied Humanoids.
+    def _extract_damage_function(self, source: str) -> str:
+        """Return the body of ``function Effects.damage(...)`` —
+        from the opening signature through the matching ``end``.
+        Counts ``function``/``end`` pairs (with rough scoping for
+        ``if``/``for``/``do``) so we don't mistakenly stop at an
+        inner block's ``end``.
         """
-        body = self._read_runtime()
-        # The three-signal check the legacy bullet pack also uses.
-        assert "Players:GetPlayerFromCharacter" in body
-        assert 'hitInstance:HasTag("Player")' in body
-        assert 'model.Name == "Player"' in body
+        # Find the function header.
+        header = "function Effects.damage("
+        start = source.find(header)
+        assert start != -1, "Effects.damage function not found in effects.luau"
+        # Lua-balance ``end`` against the constructs that open scopes.
+        # This is intentionally simple — comments / strings are not
+        # stripped, so the heuristic relies on the canonical formatting
+        # the file uses. Good enough to fail when someone unwraps the
+        # isPlayer branch (the actual regression we're pinning).
+        idx = start
+        depth = 0
+        i = source.find("\n", idx)
+        for line_no, line in enumerate(source[idx:].splitlines()):
+            stripped = line.strip()
+            # Opens.
+            if stripped.startswith("function "):
+                depth += 1
+            elif (
+                stripped.startswith("if ")
+                or stripped.startswith("for ")
+                or stripped.startswith("while ")
+                or stripped.startswith("do ")
+                or stripped == "do"
+            ):
+                depth += 1
+            # Closes.
+            if stripped == "end" or stripped.startswith("end)") or stripped == "end)":
+                depth -= 1
+                if depth == 0:
+                    # Inclusive end of function.
+                    body_end = idx + sum(
+                        len(l) + 1 for l in source[idx:].splitlines()[: line_no + 1]
+                    )
+                    return source[start:body_end]
+        raise AssertionError(
+            "could not locate the matching ``end`` for Effects.damage"
+        )
 
-    def test_damage_handler_destroys_on_any_impact(self) -> None:
-        """Despawn-on-any-impact: matches the legacy bullet pack so
-        bullets don't persist after their raycast hit, even when the
-        hit was a wall (Unity bullets fly through walls; the legacy
-        pack regressed that, and the adapter matches the legacy
-        behaviour for consistency).
+    def test_apply_damage_call_is_guarded_by_is_player(self) -> None:
+        """Each ``_applyDamageToModel(...)`` call inside
+        ``Effects.damage`` must be preceded (within the same function
+        body) by an ``if isPlayer`` conditional. Catches refactors
+        that move the damage call outside the player branch even when
+        the surrounding comments stay intact.
         """
-        body = self._read_runtime()
-        # The destroy line lives outside the ``isPlayer`` branch.
-        # Look for the comment pinning this contract — if a future
-        # refactor moves it inside the if-block, both the comment and
-        # the behaviour need updating together.
-        assert "Despawn on any impact" in body
+        body = self._extract_damage_function(self._read_runtime())
+        # There must be at least one damage call.
+        assert "_applyDamageToModel(" in body, (
+            "Effects.damage no longer calls _applyDamageToModel — "
+            "the handler probably got renamed or rewritten; verify "
+            "the Player filter is still in place."
+        )
+        # For every line that calls _applyDamageToModel, the *immediately
+        # enclosing* control flow within Effects.damage must be an
+        # ``if isPlayer`` branch.
+        lines = body.splitlines()
+        for i, line in enumerate(lines):
+            if "_applyDamageToModel(" not in line:
+                continue
+            # Walk backwards within the function body to find the
+            # most recent ``if ...`` statement at a lower indent and
+            # confirm it tests ``isPlayer``.
+            call_indent = len(line) - len(line.lstrip())
+            found_if = False
+            for prior in reversed(lines[:i]):
+                stripped = prior.strip()
+                prior_indent = len(prior) - len(prior.lstrip())
+                if not stripped:
+                    continue
+                if prior_indent < call_indent and stripped.startswith("if "):
+                    assert "isPlayer" in stripped, (
+                        f"_applyDamageToModel at line {i} is guarded by "
+                        f"{stripped!r} which does not check isPlayer. "
+                        f"TurretBullet would damage non-Player Humanoids."
+                    )
+                    found_if = True
+                    break
+            assert found_if, (
+                f"_applyDamageToModel at line {i} has no enclosing "
+                f"``if`` within Effects.damage — damage is unconditional."
+            )
+
+    def test_destroy_after_player_branch(self) -> None:
+        """The container:Destroy() call sits OUTSIDE the isPlayer
+        branch — bullets must despawn on any impact (wall, NPC,
+        Player) to match the legacy bullet pack. If a refactor moves
+        the destroy inside the player check, bullets would persist
+        on non-Player hits and double-fire on subsequent frames.
+        """
+        body = self._extract_damage_function(self._read_runtime())
+        # Find every container:Destroy line in the damage function.
+        destroy_lines = [
+            (i, l) for i, l in enumerate(body.splitlines())
+            if "container:Destroy()" in l
+        ]
+        assert destroy_lines, (
+            "Effects.damage no longer destroys the container on impact — "
+            "bullets would persist after raycast hit."
+        )
+        # At least one destroy must NOT be inside an ``if isPlayer`` branch.
+        # Heuristic: walk backwards looking for an ``if``; if the nearest
+        # ``if`` we find is the isPlayer branch and the destroy is INSIDE
+        # it (same indent or deeper than the if's body), that's a bug.
+        # For each destroy, locate the most recent ``if`` and check.
+        ok = False
+        lines = body.splitlines()
+        for line_idx, line in destroy_lines:
+            destroy_indent = len(line) - len(line.lstrip())
+            # Walk back for the most recent ``if`` at indent < destroy_indent.
+            for prior in reversed(lines[:line_idx]):
+                stripped = prior.strip()
+                prior_indent = len(prior) - len(prior.lstrip())
+                if not stripped:
+                    continue
+                if prior_indent < destroy_indent and stripped.startswith("if "):
+                    if "isPlayer" not in stripped:
+                        # The destroy is inside a non-Player branch
+                        # (e.g. signal-nil guard) — that's fine for the
+                        # general check; the goal is at least one
+                        # destroy that lives outside the isPlayer
+                        # conditional.
+                        ok = True
+                    break
+            else:
+                # No enclosing ``if`` — destroy is at function-body
+                # scope, outside every branch. That's the pattern we
+                # want.
+                ok = True
+                break
+        assert ok, (
+            "every container:Destroy() in Effects.damage is gated by "
+            "``if isPlayer`` — bullets would not despawn on non-Player "
+            "hits, regressing to ghost-bullet behaviour."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1157,66 +1281,56 @@ class TestDamagePlayerFilter:
 # ---------------------------------------------------------------------------
 
 class TestLegacyPackMutex:
-    """Semantic test of the legacy-pack mutex: when
-    ``use_gameplay_adapters`` is on, the bullet + door packs must NOT
-    run (they'd double-bind alongside the adapter). Codex PR
-    #73b-round-1 P3 flagged that an inspect-source substring check is
-    fragile against refactors; pin the runtime behaviour instead.
+    """Semantic test of the legacy-pack mutex. The pipeline exposes
+    ``LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON`` as the single source of
+    truth; this test imports that constant directly so a refactor that
+    drops or renames an entry fails the test in the same commit
+    (codex PR #73b-round-2 P3 — re-copying the set into the test
+    breaks the linkage).
     """
 
-    def _run_packs_with_pipeline_gate(
-        self, scripts, use_gameplay_adapters: bool,
-    ):
-        """Invoke ``fix_require_classifications`` the same way
-        ``Pipeline._transpile_scripts`` does — including the
-        ``disabled_packs`` frozenset that gates legacy packs when the
-        adapter flag is on. Returns the disabled_packs the pipeline
-        would have passed.
+    def test_constant_contains_bullet_pack(self) -> None:
+        from converter.pipeline import LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON
+        assert "bullet_physics_raycast" in LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON
+
+    def test_constant_contains_door_pack(self) -> None:
+        from converter.pipeline import LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON
+        assert "door_tween_open" in LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON
+
+    def test_pipeline_uses_the_constant(self) -> None:
+        """The transpile_scripts path must reach the constant — not a
+        copy. Locate the mutex gate body in pipeline.py source and
+        assert it references the constant by name. If a future
+        refactor inlines a frozenset literal, this fails.
         """
-        # Mirror the gate from pipeline.py — single source of truth
-        # for the mutex semantics. If pipeline.py ever changes the
-        # mutex shape, this test fails loudly.
-        from converter.script_coherence import fix_require_classifications
+        import inspect
+        from converter import pipeline as pipeline_mod
 
-        disabled_packs = frozenset()
-        if use_gameplay_adapters:
-            # The exact set the pipeline maintains. Keep this in sync
-            # with pipeline._transpile_scripts. PR #73c will add the
-            # damage-protocol pack here.
-            disabled_packs = frozenset({
-                "door_tween_open",
-                "bullet_physics_raycast",
-            })
-
-        fix_require_classifications(scripts, disabled_packs=disabled_packs)
-        return disabled_packs
-
-    def test_disabled_packs_when_adapter_on(self) -> None:
-        """Adapter on → bullet_physics_raycast AND door_tween_open
-        are both in disabled_packs.
-        """
-        disabled = self._run_packs_with_pipeline_gate(
-            scripts=[], use_gameplay_adapters=True,
+        src = inspect.getsource(pipeline_mod)
+        assert "LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON" in src
+        # And no local re-definition of the bullet pack name as a
+        # frozenset member — that would shadow the constant.
+        # The bullet pack name should appear ONCE (inside the constant
+        # declaration) — not multiple times.
+        bullet_count = src.count('"bullet_physics_raycast"')
+        assert bullet_count == 1, (
+            f"bullet_physics_raycast appears {bullet_count}× in pipeline.py "
+            f"— expected exactly one occurrence (inside the constant). "
+            f"A local frozenset literal would shadow the mutex constant."
         )
-        assert "bullet_physics_raycast" in disabled
-        assert "door_tween_open" in disabled
-
-    def test_disabled_packs_when_adapter_off(self) -> None:
-        """Adapter off → no packs are force-disabled. Legacy mode
-        keeps the existing behaviour.
-        """
-        disabled = self._run_packs_with_pipeline_gate(
-            scripts=[], use_gameplay_adapters=False,
-        )
-        assert disabled == frozenset()
 
     def test_legacy_packs_actually_registered(self) -> None:
-        """Pin that the legacy packs the mutex targets really exist —
-        if a pack is renamed without updating the mutex, the gate
-        becomes a no-op without anyone noticing.
+        """Pin that the legacy packs the mutex targets really exist
+        in ``script_coherence_packs._REGISTRY`` — a rename without
+        updating the mutex would silently turn the gate into a no-op.
+        Single-source-of-truth: iterate the constant, not a copy.
         """
+        from converter.pipeline import LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON
         from converter.script_coherence_packs import _REGISTRY
 
         registered = {p.name for p in _REGISTRY}
-        assert "bullet_physics_raycast" in registered
-        assert "door_tween_open" in registered
+        missing = LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON - registered
+        assert not missing, (
+            f"pipeline mutex names packs that are not in _REGISTRY: {missing}"
+        )
+

@@ -51,6 +51,20 @@ PHASES: list[str] = [
 ]
 
 
+# Legacy coherence packs to force-disable whenever
+# ``ctx.use_gameplay_adapters`` is on. The adapter pipeline replaces
+# the AI-transpiled body of the matched class with a per-instance
+# Composer.run stub; if the matching legacy pack ALSO mutated the
+# transpile output, the two paths would fight over the same scripts.
+# Module-level constant so tests can pin the exact set and PR #73c
+# extends it (damage protocol) without growing a parallel test fixture
+# (codex PR #73b-round-2 P3).
+LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON: frozenset[str] = frozenset({
+    "door_tween_open",          # PR #73a
+    "bullet_physics_raycast",   # PR #73b
+})
+
+
 @runtime_checkable
 class _ScriptLike(Protocol):
     """Duck-type narrowing for the marker scan. Real callers pass
@@ -2417,15 +2431,14 @@ return table.concat(allData, "\\n")'''
         # gameplay adapters covered a behaviour (e.g. door tween,
         # bullet physics), the matching legacy pack must NOT also run
         # — they'd fight over the same scripts and double-bind (codex
-        # pushback on PR #72). PR #73a covers ``door_tween_open``,
-        # PR #73b adds ``bullet_physics_raycast``; PR #73c adds the
-        # damage routing pack.
-        disabled_packs: frozenset[str] = frozenset()
-        if self.ctx.use_gameplay_adapters:
-            disabled_packs = frozenset({
-                "door_tween_open",
-                "bullet_physics_raycast",
-            })
+        # pushback on PR #72). The exact set lives at module level as
+        # ``LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON`` so tests pin the
+        # same constant.
+        disabled_packs: frozenset[str] = (
+            LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON
+            if self.ctx.use_gameplay_adapters
+            else frozenset()
+        )
         fixes = fix_require_classifications(
             self.state.rbx_place.scripts,
             disabled_packs=disabled_packs,
