@@ -71,7 +71,8 @@ records under `converter/converter/gameplay/capabilities.py`:
     - `ApplyAttribute(name, value)` — generic attribute write on hit target
   - **Trigger**
     - `OnEnter(tag_or_attribute_filter)` — `OnTriggerEnter` with tag match
-    - `OnAttributeBecomesTrue(name)` — Animator-bool, e.g. door's `open`
+    - `OnBoolAttribute(name)` — Animator-bool, e.g. door's `open`; publishes
+      current value to `ctx.trigger.value` (see normalization rules below)
     - `OnPickup(item_name)` — Pickup→Player attribute write
 
 A `Behavior` dataclass is just an ordered list of capabilities plus a
@@ -147,6 +148,25 @@ Cross-family handoff goes through the declared ctx contract, not
 through a class-coupled field on the Movement capability. The same
 `Trigger.OnBoolAttribute` is reusable for non-door cases (e.g. trap
 plates, light switches) without dragging Movement semantics with it.
+
+**`Trigger.OnBoolAttribute` normalization rules** (binding on
+implementers, will be tested in PR #73):
+
+  - **Missing or nil attribute on bind:** treated as `false`. The
+    trigger publishes `ctx.trigger.value = false`, so a Door whose
+    `open` attribute was never set starts closed.
+  - **Non-bool value on bind or mutation:** coerced via Lua
+    truthiness — anything that's not `false` or `nil` becomes `true`
+    in ctx. (A numeric `1` or string `"yes"` both become `true`.)
+    Avoids the situation where a misconfigured Unity prefab leaves
+    the door in an undefined state.
+  - **Attribute change event:** every change runs the value through
+    the same normalization and re-publishes to ctx. Readers always
+    see a strict bool.
+  - **Idempotent listener registration:** if `Composer.run` is called
+    on the same part twice, the second call observes the existing
+    binding (via the same marker attribute the Movement capability
+    uses) and is a no-op for the listener registration too.
 
 **Runtime semantics for `Movement.AttributeDrivenTween`** (binding on
 implementers, will be tested in PR #73):
@@ -414,7 +434,7 @@ being SimpleFPS:
 | Capability | Genre coverage |
 |---|---|
 | `Movement.Impulse` | FPS bullets, RPG fireballs, RTS missiles, action grenades |
-| `Trigger.OnAttributeBecomesTrue` | Doors, gates, elevators, traps |
+| `Trigger.OnBoolAttribute` | Doors, gates, elevators, traps |
 | `HitDetection.OverlapSphere` | Splash damage, AoE spells, proximity sensors |
 | `Trigger.OnPickup` | Items, ammo, keys, power-ups |
 
