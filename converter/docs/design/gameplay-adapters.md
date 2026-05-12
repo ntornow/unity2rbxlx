@@ -120,22 +120,48 @@ Behavior(
     unity_file_id="…",
     diagnostic_name="Door",
     capabilities=(
-        Movement.TweenOffset(
-            target_offset_unity=(0, 4, 0),  # from open.anim m_PositionCurves
-            open_duration=1.0,              # from clip length
-            close_duration=1.0,             # from close.anim
-            direction_attribute="open",     # toggles forward/reverse
+        Trigger.OnBoolAttribute(name="open"),  # writes ctx.trigger.value
+        Movement.AttributeDrivenTween(          # reads ctx.trigger.value
+            target_offset_unity=(0, 4, 0),     # from open.anim m_PositionCurves
+            open_duration=1.0,                 # from clip length
+            close_duration=1.0,                # from close.anim
         ),
         Lifetime.Persistent,
     ),
 )
 ```
 
-`Movement.TweenOffset` is the door/actuator capability — it owns BOTH
-open and close motion. Codex review on the v2 draft flagged that
-`ConstantVelocity` alone didn't capture duration or close-path; folding
-both directions into a single capability that listens on the named
-attribute keeps the runtime authoritative for door semantics.
+Door uses TWO capabilities, not one. Codex v3 review flagged that the
+earlier `Movement.TweenOffset(direction_attribute="open")` form
+embedded attribute-listening (a Trigger concern) inside a Movement
+capability — undermining the otherwise-clean family split.
+
+The capability split now mirrors the data flow:
+
+  - `Trigger.OnBoolAttribute(name="open")` watches the named attribute
+    and publishes its current value to `ctx.trigger.value`.
+  - `Movement.AttributeDrivenTween` reads `ctx.trigger.value` and
+    tweens toward/away from the target offset accordingly.
+
+Cross-family handoff goes through the declared ctx contract, not
+through a class-coupled field on the Movement capability. The same
+`Trigger.OnBoolAttribute` is reusable for non-door cases (e.g. trap
+plates, light switches) without dragging Movement semantics with it.
+
+**Runtime semantics for `Movement.AttributeDrivenTween`** (binding on
+implementers, will be tested in PR #73):
+
+  - **Initial pose:** on first bind, read the current value of
+    `ctx.trigger.value` and snap the part to the open OR closed pose
+    without animating. A door spawned with `open=true` starts open.
+  - **Rapid-toggle / mid-tween reversal:** when `ctx.trigger.value`
+    changes during an in-flight tween, cancel that tween and start a
+    new one from the current part position toward the new target. No
+    snapping mid-motion.
+  - **Idempotent re-bind:** calling `Composer.run` on the same part
+    twice doesn't stack listeners or double-register attribute
+    observers. The runtime detects an existing bind (marker attribute
+    on the part) and is a no-op on the second call.
 
 The capability vocabulary is **deliberately small**. New Unity patterns
 extend the vocabulary by adding a single capability variant, not a new
@@ -239,48 +265,54 @@ This gives us:
     reads/writes once; the composer doesn't need to know about it
     until registration time.
 
-### Detection is composition-first, source-substring is a prefilter
+### Detection is composition-first, source-substring is a confirmer
 
 Codex review noted that C# substring matching is structurally the same
 problem as Luau-regex matching, one level up. To prevent future detector
 code from quietly violating "primary signal first," the detector API
-itself separates the two:
+itself separates the two layers:
 
 ```python
 class Detector(Protocol):
     def primary(self, node: SceneNode) -> bool:
-        """Returns True iff Unity component composition supports this
-        behaviour. MUST NOT inspect source bodies. Tested with composition-
-        only fixtures."""
-    def tiebreaker(self, source_csharp: str) -> bool:
-        """Optional. Only invoked if primary() returns True AND the
-        composition is ambiguous (multiple Detector.primary results
-        match). Substring inspection lives here, scoped, named, and
-        bounded."""
+        """Returns True iff Unity component composition is compatible
+        with this behaviour. MUST NOT inspect source bodies. Composition-
+        only — Rigidbody/Collider/Animator/MonoBehaviour field shapes
+        from the parsed scene data. Tested with composition-only
+        fixtures (empty C# source)."""
+    def confirm(self, node: SceneNode, source_csharp: str) -> bool:
+        """Always called when primary() returns True. Substring/source
+        inspection lives here, named and scoped per detector. Acts as a
+        REJECTOR — returning False rules the detector out even if
+        primary() said yes. Cannot upgrade an Infeasible primary() to
+        Feasible (the API doesn't allow it)."""
     def behavior(self, node: SceneNode, source_csharp: str) -> Behavior:
-        """Build the per-instance Behavior. Receives source for value
-        extraction (e.g. default values from script literals), NOT for
+        """Build the per-instance Behavior. Receives source for VALUE
+        extraction (default literals from script body), NOT for
         classification."""
 ```
 
-The classifier orchestrator (`converter/converter/gameplay/classify.py`)
-calls `primary()` first and only consults `tiebreaker()` when two
-detectors both pass `primary()`. A detector that returns True from
-`primary()` based on substring inspection violates the contract —
-contract tests (`test_detector_contract.py`) call `primary()` with
-empty C# source and assert the answer doesn't change. This makes the
-"composition-first" rule a structural invariant, not policy text.
+Codex v3 raised a sharper concern about the earlier "tiebreaker on
+ambiguity only" form: if one detector's `primary()` is too broad, it
+wins outright with no source disambiguation. Solution: rename to
+`confirm()` and run it ALWAYS when `primary()` returns True. Two-layer
+classification:
 
-  - **Primary signal:** Unity component composition from the parsed
-    scene/prefab data (`Rigidbody`, `Collider`, `Animator`, MonoBehaviour
-    field shapes from `_extract_monobehaviour_attributes`). This is
-    structured data the converter already produces.
-  - **Tiebreaker only:** C# source substring when composition alone is
-    ambiguous (e.g. distinguishing a Rigidbody projectile from a
-    Rigidbody physics prop).
-  - **Conservative defaults:** detection emits a `Behavior` only when
-    `primary()` matches. Substring match alone never triggers
-    classification.
+  1. **Feasibility gate (`primary()`):** composition-only. Catches the
+     clear non-matches (no Rigidbody → not a projectile).
+  2. **Confirmation (`confirm()`):** source-aware. Can reject a
+     primary-match by detecting a counter-signal (e.g. the script's
+     `OnCollisionEnter` calls `Rigidbody.AddExplosionForce` rather than
+     `Destroy(gameObject)` → it's a damage receiver, not a projectile).
+
+Both layers can vote No. Neither can override the other to Yes. A
+detector that wanted to classify on substring alone would have to lie
+in `primary()` — caught by contract tests that pass empty C# source.
+
+Multi-detector resolution: if two detectors both pass `primary()` AND
+`confirm()`, the classifier raises `AmbiguousDetectionError` with both
+candidate names. Resolution is operator-driven via deny-list — no
+silent "pick the first match" heuristic.
 
 False positives are reported in `conversion_report.json` and rejectable via
 an output-dir deny-list (`<output>/.gameplay_deny.txt` — one
@@ -339,11 +371,11 @@ Composer.run(script.Parent, {
 -- two different tables)
 local Composer = require(game:GetService("ReplicatedStorage"):WaitForChild("AutoGen"):WaitForChild("Composer"))
 Composer.run(script.Parent, {
-    {kind = "movement.tween_offset",
+    {kind = "trigger.on_bool_attribute", name = "open"},
+    {kind = "movement.attribute_driven_tween",
      target_offset = Vector3.new(0, 4, 0),
      open_duration = 1.0,
-     close_duration = 1.0,
-     direction_attribute = "open"},
+     close_duration = 1.0},
     {kind = "lifetime.persistent"},
 })
 ```
