@@ -765,6 +765,24 @@ codex pushback on PR #72 sharpened the slicing and added two cuts):
       Script is no longer emitted when adapter stubs are present, and
       any stale legacy router from a prior adapters-off conversion is
       removed so the two paths don't double-bind `OnServerEvent`.
+    - `_GameplayServerBootstrap` Script parented to
+      `ServerScriptService` (codex PR #73c-round-1 [P1]). All other
+      adapter runtime modules are ModuleScripts under
+      `ReplicatedStorage.AutoGen`; ReplicatedStorage scripts don't
+      auto-run, and per-instance stubs that `require()` the Gameplay
+      orchestrator typically live on prefab templates (the common
+      SimpleFPS shape — TurretBullet / PlaneBullet / SciFi_Door all
+      sit on prefab roots), so the orchestrator wouldn't load until
+      the first runtime clone spawned. Without the bootstrap, a
+      Player LocalScript firing `DamageEvent` on its first click
+      (before any bullet has spawned) would hit a nil RemoteEvent.
+      The legacy `_AutoDamageEventRouter` was an always-on
+      ServerScriptService Script for the same reason; the bootstrap
+      preserves that posture while keeping the validator logic in a
+      ModuleScript. `DamageProtocol._initServer` is idempotent so a
+      double-load (bootstrap + a workspace-placed adapter stub
+      triggering the same `require`) doesn't double-bind
+      `OnServerEvent`.
     - Cross-project smoke matrix: SimpleFPS + Gamekit3D + ChopChop.
       Two layers — real-source classification when the project tree
       is checked out (pins TurretBullet / PlaneBullet / Door for

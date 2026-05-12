@@ -235,7 +235,12 @@ class TestDamageProtocolStructure:
 class TestPipelineInjection:
     """The pipeline's ``_inject_runtime_modules`` lists every gameplay
     family that should be present under ReplicatedStorage.AutoGen when
-    adapters bind. PR #73c adds DamageProtocol to that list.
+    adapters bind. PR #73c adds DamageProtocol to that list AND emits a
+    server-side bootstrap Script so the adapter runtime is force-
+    loaded at server start (codex PR #73c-round-1 [P1] — without this,
+    prefab-only adapter coverage delays DamageProtocol init past the
+    first Player click and the body-patched FireServer call hits a
+    nil RemoteEvent).
     """
 
     def test_damage_protocol_in_gameplay_modules_tuple(self) -> None:
@@ -272,6 +277,70 @@ class TestPipelineInjection:
             "pipeline.py's gameplay_modules tuple no longer carries "
             "(\"DamageProtocol\", \"damage_protocol.luau\") — runtime "
             "modules won't include the damage router."
+        )
+
+    def test_server_bootstrap_emits_under_server_script_service(
+        self,
+    ) -> None:
+        """Codex PR #73c-round-1 [P1]: a bootstrap Script in
+        ServerScriptService force-loads ``AutoGen.Gameplay`` at server
+        start so DamageProtocol's OnServerEvent is bound before any
+        client clicks. Pin: (a) the bootstrap source file exists, (b)
+        ``_inject_runtime_modules`` references ``server_bootstrap.luau``
+        AND ``"ServerScriptService"`` so the Script lands in the right
+        parent, (c) the source body actually requires
+        ``AutoGen.Gameplay`` (not some other module).
+        """
+        import inspect
+        from converter import pipeline as pipeline_mod
+
+        # (a) The bootstrap file is present.
+        bootstrap_path = (
+            Path(__file__).parent.parent
+            / "runtime" / "gameplay" / "server_bootstrap.luau"
+        )
+        assert bootstrap_path.exists(), (
+            "runtime/gameplay/server_bootstrap.luau missing — the "
+            "[P1] always-on damage routing bootstrap isn't on disk."
+        )
+
+        # (b) Pipeline references the bootstrap by filename and
+        # places it under ServerScriptService.
+        src = inspect.getsource(pipeline_mod)
+        assert "server_bootstrap.luau" in src, (
+            "pipeline.py no longer references server_bootstrap.luau "
+            "— the [P1] bootstrap script won't be injected."
+        )
+        # The injection block lives near the existing gameplay-modules
+        # injection. Walk the source to confirm the bootstrap script
+        # is parented to ServerScriptService AND typed as a Script (a
+        # ModuleScript would have the same problem — it wouldn't
+        # auto-run).
+        bootstrap_idx = src.find("server_bootstrap.luau")
+        # Look in a generous window around the reference for both
+        # markers; the actual injection block fits within ~1500 chars
+        # of the filename reference.
+        window = src[max(0, bootstrap_idx - 200) : bootstrap_idx + 1500]
+        assert '"ServerScriptService"' in window, (
+            "pipeline.py references server_bootstrap.luau but the "
+            "injection no longer parents it to ServerScriptService — "
+            "the bootstrap won't auto-run on server start."
+        )
+        assert '"Script"' in window, (
+            "pipeline.py references server_bootstrap.luau but the "
+            "injection no longer types it as Script — a ModuleScript "
+            "would not auto-run on server start."
+        )
+
+        # (c) The bootstrap body actually requires AutoGen.Gameplay.
+        body = bootstrap_path.read_text(encoding="utf-8")
+        assert 'WaitForChild("AutoGen"' in body, (
+            "bootstrap no longer waits for AutoGen folder — startup "
+            "race regression."
+        )
+        assert 'WaitForChild("Gameplay"' in body, (
+            "bootstrap no longer waits for AutoGen.Gameplay — the "
+            "orchestrator won't be required at server start."
         )
 
 
