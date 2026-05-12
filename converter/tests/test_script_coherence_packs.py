@@ -1664,9 +1664,12 @@ class TestDoorTweenOpen:
         assert "_AutoFpsDoorTweenInjected" in scripts[0].source
         # Runtime guard helper present in the injected body.
         assert "_hasAnimDriver" in scripts[0].source
-        # Guard scans the door's prefab Model AND ReplicatedStorage.
+        # Guard scans the door's prefab Model first.
         assert "_parent:GetDescendants()" in scripts[0].source
-        assert 'game:GetService("ReplicatedStorage")' in scripts[0].source
+        # And BOTH ReplicatedStorage AND ServerScriptService (codex
+        # round-11 [P1]: scene-scoped animation drivers live in SSS).
+        assert '"ReplicatedStorage"' in scripts[0].source
+        assert '"ServerScriptService"' in scripts[0].source
         # Tolerates spaces / mixed case in prefab names (round-10 [P2]).
         assert "string.lower(name)" in scripts[0].source
         # Anchored patterns match both prefab-scoped and scene-scoped.
@@ -2421,9 +2424,11 @@ class TestPlayerDamageRemoteEvent:
         src = router.source
         # Server writes the client-supplied value, not a synthetic counter.
         assert 'SetAttribute("TakeDamage", takeDamageValue)' in src
-        # Nil-coerce to true for malformed payloads so a listener
-        # doing ``if attr then`` still reacts.
-        assert "takeDamageValue == nil" in src
+        # Type guard before SetAttribute: malformed payloads (table,
+        # Vector3, function) are coerced to ``true`` so SetAttribute
+        # never receives an invalid value (codex round-11 [P2]).
+        assert "typeof(takeDamageValue)" in src
+        assert '"boolean"' in src and '"number"' in src and '"string"' in src
         # No counter helper or synthetic +1 logic.
         assert "_bumpTakeDamage" not in src
         assert "cur + 1" not in src
@@ -2475,4 +2480,77 @@ class TestPlayerDamageRemoteEvent:
         assert fire_idx >= end_block, (
             "FireServer block must follow the multi-line ``if model then`` "
             "section, not be inserted inside or before it."
+        )
+
+    def test_pack_refreshes_stale_router_on_reconversion(self) -> None:
+        """Codex round-11 [P2]: the detector returned False when a
+        Player was already patched AND a router script existed,
+        regardless of the router's source. Re-conversion of an
+        already-patched output thus could keep a stale older-version
+        router that lacked the round-to-round improvements
+        (camera-origin replay, value preservation, type guard).
+
+        Pin: when the router source diverges from the canonical pack
+        version, the detector fires and the apply pass refreshes.
+        """
+        # Already-patched Player + a STALE router with the old body.
+        patched_player = RbxScript(
+            name="Player",
+            source=(
+                'local result = workspace:Raycast(origin, dir, rp)\n'
+                'if result then\n'
+                '    local hitInst = result.Instance\n'
+                '    hitInst:SetAttribute("TakeDamage", true)\n'
+                '    -- _AutoDamageRemoteEventInjected: mirror client damage to server\n'
+                '    local _de = game:GetService("ReplicatedStorage"):FindFirstChild("DamageEvent")\n'
+                '    if _de then _de:FireServer(hitInst) end\n'
+                'end\n'
+            ),
+            script_type="LocalScript",
+        )
+        stale_router = RbxScript(
+            name="_AutoDamageEventRouter",
+            source="-- ancient router shape, missing new validation\n",
+            script_type="Script",
+        )
+        scripts = [patched_player, stale_router]
+        # Detector must fire so the router gets refreshed.
+        assert packs_module._detect_player_or_router_present(scripts) is True
+        fixes = packs_module._inject_player_damage_remote_event(scripts)
+        assert fixes >= 1
+        # Router source now matches the canonical pack version.
+        refreshed = next(s for s in scripts if s.name == "_AutoDamageEventRouter")
+        assert refreshed.source == packs_module._DAMAGE_ROUTER_SOURCE
+        # Idempotent: re-run with fresh router → no further changes.
+        fixes2 = packs_module._inject_player_damage_remote_event(scripts)
+        assert fixes2 == 0
+
+    def test_router_coerces_non_scalar_payloads(self) -> None:
+        """Codex round-11 [P2]: a malicious client can fire the
+        DamageEvent with any payload type. Roblox attributes only
+        accept primitive scalars (bool/number/string + a few
+        Vector/Color types); passing a table or function throws on
+        ``SetAttribute``. The router must validate the payload type
+        BEFORE calling SetAttribute, coercing non-canonical shapes to
+        ``true`` (still useful for boolean listeners) so no
+        SetAttribute call ever gets handed an invalid value.
+
+        Pin: the typeof guard appears in source, scoped to the
+        canonical shapes (boolean/number/string).
+        """
+        scripts = [self._player_script_with_hit()]
+        packs_module._inject_player_damage_remote_event(scripts)
+        router = next(s for s in scripts if s.name == "_AutoDamageEventRouter")
+        src = router.source
+        # Type guard before SetAttribute on takeDamageValue.
+        assert "typeof(takeDamageValue)" in src
+        # Canonical shapes accepted; anything else coerced.
+        assert '"boolean"' in src
+        assert '"number"' in src
+        assert '"string"' in src
+        # The guard appears BEFORE any SetAttribute call on hitInstance.
+        guard_idx = src.index("typeof(takeDamageValue)")
+        set_idx = src.index('hitInstance:SetAttribute("TakeDamage", takeDamageValue)')
+        assert guard_idx < set_idx, (
+            "Type guard must run before SetAttribute receives the payload."
         )

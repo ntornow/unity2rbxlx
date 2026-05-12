@@ -1699,11 +1699,19 @@ do
                     end
                 end
             end
-            -- Animation phase sometimes parents drivers under RS.
-            local _rs = game:GetService("ReplicatedStorage")
-            for _, d in ipairs(_rs:GetChildren()) do
-                if d:IsA("Script") or d:IsA("LocalScript") then
-                    if _matchName(d.Name) then return true end
+            -- Animation phase parents drivers under various services
+            -- depending on whether the driver is prefab-scoped or
+            -- scene-scoped:
+            --   - prefab-scoped:  ReplicatedStorage.Templates.<Prefab>
+            --                     (also a child of the prefab Model)
+            --   - scene-scoped:   ServerScriptService (round-11 [P1])
+            -- Scan all three to catch every shape.
+            for _, svcName in ipairs({"ReplicatedStorage", "ServerScriptService"}) do
+                local svc = game:GetService(svcName)
+                for _, d in ipairs(svc:GetDescendants()) do
+                    if d:IsA("Script") or d:IsA("LocalScript") then
+                        if _matchName(d.Name) then return true end
+                    end
                 end
             end
             return false
@@ -2284,9 +2292,15 @@ de.OnServerEvent:Connect(function(player, hitInstance, takeDamageValue, originPo
     -- shapes, or a numeric damage value) and sends it through; the
     -- server preserves that semantics.
     --
-    -- Coerce nil/invalid payloads to ``true`` so a listener doing
-    -- ``if attr then`` still reacts.
-    if takeDamageValue == nil then
+    -- Codex round-11 [P2]: Roblox attributes only accept primitive
+    -- scalars (bool/number/string + a few Vector/Color types). A
+    -- malicious client could send a table or function and crash
+    -- ``SetAttribute``. Coerce anything other than the canonical
+    -- shapes (bool/number/string) to ``true`` so a listener doing
+    -- ``if attr then`` still reacts but no SetAttribute call ever
+    -- gets handed an invalid payload.
+    local _t = typeof(takeDamageValue)
+    if _t ~= "boolean" and _t ~= "number" and _t ~= "string" then
         takeDamageValue = true
     end
     hitInstance:SetAttribute("TakeDamage", takeDamageValue)
@@ -2300,32 +2314,38 @@ _DAMAGE_ROUTER_NAME = "_AutoDamageEventRouter"
 
 
 def _detect_player_or_router_present(scripts: list["RbxScript"]) -> bool:
-    """Run when EITHER:
-      - a ``Player`` LocalScript still needs the ``FireServer`` patch, OR
-      - a ``Player`` LocalScript was already patched but the
-        ``_AutoDamageEventRouter`` server script is missing.
+    """Run when ANY of:
+      - a ``Player`` LocalScript still needs the ``FireServer`` patch
+      - a ``Player`` LocalScript is already patched but the router
+        script is absent (rehydrated re-conversion lost the router)
+      - a ``Player`` LocalScript is already patched AND a router
+        exists but its source is stale (re-conversion of an
+        already-patched output should refresh the router with any
+        round-to-round improvements — codex round-11 [P2])
 
-    Codex round-5 [P2]: on re-conversion from a rehydrated output, the
-    Player script is already patched (carries the
-    ``_AutoDamageRemoteEventInjected`` marker) but the router can be
-    pruned by intervening passes. Without re-checking the router, the
-    pack never runs and shots silently stop damaging server-side
-    enemies. Re-detecting on router-absent ensures the router gets
-    refreshed on every conversion regardless of how the Player script
-    was rehydrated.
+    The apply path compares router source byte-for-byte and only
+    rewrites on diff, so this detector being more permissive doesn't
+    re-write a fresh router.
     """
     if _detect_player_damage_attr_set(scripts):
         return True
-    # Already-patched Player + missing router → pack must run to
-    # re-emit the router.
     has_patched_player = any(
         s.name == "Player"
         and s.script_type == "LocalScript"
         and "_AutoDamageRemoteEventInjected" in s.source
         for s in scripts
     )
-    has_router = any(s.name == _DAMAGE_ROUTER_NAME for s in scripts)
-    return has_patched_player and not has_router
+    if not has_patched_player:
+        return False
+    router = next(
+        (s for s in scripts if s.name == _DAMAGE_ROUTER_NAME), None,
+    )
+    if router is None:
+        return True  # Missing — must emit.
+    # Stale router (source diverges from the canonical pack version)
+    # → refresh. ``_inject_player_damage_remote_event``'s router
+    # branch only writes when the source actually differs.
+    return router.source != _DAMAGE_ROUTER_SOURCE
 
 
 @patch_pack(
