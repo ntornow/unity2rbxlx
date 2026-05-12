@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import config as _config
 from config import (
@@ -51,7 +51,37 @@ PHASES: list[str] = [
 ]
 
 
-def _place_carries_adapter_marker(rbx_place: "RbxPlace | None") -> bool:
+@runtime_checkable
+class _ScriptLike(Protocol):
+    """Duck-type narrowing for the marker scan. Real callers pass
+    :class:`RbxScript`; tests pass minimal stubs. The scan only needs
+    ``.source`` — defining it as a Protocol keeps the helper typed
+    without dragging RbxScript into test fixtures.
+    """
+
+    source: str
+
+
+@runtime_checkable
+class _PartLike(Protocol):
+    """Duck-type narrowing for the recursive part walk."""
+
+    scripts: list[_ScriptLike]
+    children: list["_PartLike"]
+
+
+@runtime_checkable
+class _PlaceLike(Protocol):
+    """Duck-type narrowing for the place root the marker scan walks."""
+
+    scripts: list[_ScriptLike]
+    workspace_parts: list[_PartLike]
+    replicated_templates: list[_PartLike]
+
+
+def _place_carries_adapter_marker(
+    rbx_place: "_PlaceLike | RbxPlace | None",
+) -> bool:
     """Return True when any script anywhere in *rbx_place* carries the
     gameplay-adapter structural marker on its first line.
 
@@ -80,11 +110,11 @@ def _place_carries_adapter_marker(rbx_place: "RbxPlace | None") -> bool:
     if rbx_place is None:
         return False
 
-    def _has_marker(script: Any) -> bool:
+    def _has_marker(script: _ScriptLike) -> bool:
         src = getattr(script, "source", None) or ""
         return ADAPTER_STUB_MARKER in src
 
-    def _walk(parts: list) -> bool:
+    def _walk(parts: list[_PartLike]) -> bool:
         for part in parts:
             for s in getattr(part, "scripts", None) or []:
                 if _has_marker(s):
@@ -3082,12 +3112,11 @@ script.Disabled = true
 
     def _build_conversion_report(
         self, rbxlx_path: Path, result: dict, report_path: Path
-    ) -> Any:
+    ) -> "ConversionReport":
         """Assemble the structured ConversionReport for write_output."""
         from converter.report_generator import (
             ConversionReport, AssetSummary, ScriptSummary, MaterialSummary,
             ComponentSummary, SceneSummary, OutputSummary,
-            GameplayAdapterSummary, GameplayAdapterBinding,
         )
         script_types = {"Script": 0, "LocalScript": 0, "ModuleScript": 0}
         for s in (self.state.rbx_place.scripts or []):
@@ -3105,9 +3134,7 @@ script.Disabled = true
             else:
                 selected_scene = str(p)
 
-        gameplay_summary = self._build_gameplay_adapter_summary(
-            GameplayAdapterSummary, GameplayAdapterBinding,
-        )
+        gameplay_summary = self._build_gameplay_adapter_summary()
 
         return ConversionReport(
             unity_project_path=str(self.unity_project_path),
@@ -3139,21 +3166,24 @@ script.Disabled = true
         )
 
     def _build_gameplay_adapter_summary(
-        self, summary_cls: type, binding_cls: type,
-    ) -> Any:
+        self,
+    ) -> "GameplayAdapterSummary":
         """Render ``state.gameplay_matches`` and divergent classes (if
         any) into the ConversionReport section. Codex PR #73a-round-2
         flagged that the doc promised operator-friendly fields with
         no serialization path; this is that path.
         """
+        from converter.gameplay.integration import NodeBinding
         from converter.report_generator import (
+            GameplayAdapterBinding,
             GameplayAdapterDivergence,
             GameplayAdapterDivergentBinding,
+            GameplayAdapterSummary,
         )
 
         matches = self.state.gameplay_matches or []
         bindings = [
-            binding_cls(
+            GameplayAdapterBinding(
                 detector_name=m.detector_name,
                 diagnostic_name=m.diagnostic_name,
                 target_class_name=m.target_class_name,
@@ -3169,15 +3199,15 @@ script.Disabled = true
         # identity is the absolute script_path. Codex PR #73a-round-3
         # flagged that counting unique class_name silently merged them.
         unique_emitted_paths = {m.script_path for m in matches}
-        divergent_records = getattr(
-            self.state, "gameplay_divergent_classes", [],
-        ) or []
+        divergent_records = self.state.gameplay_divergent_classes or []
 
-        def _render_divergent_binding(node_binding: Any) -> Any:
+        def _render_divergent_binding(
+            node_binding: NodeBinding,
+        ) -> GameplayAdapterDivergentBinding:
             return GameplayAdapterDivergentBinding(
-                node_name=getattr(node_binding, "node_name", ""),
-                node_file_id=getattr(node_binding, "unity_file_id", ""),
-                component_file_id=getattr(node_binding, "component_file_id", ""),
+                node_name=node_binding.node_name,
+                node_file_id=node_binding.unity_file_id,
+                component_file_id=node_binding.component_file_id,
             )
 
         divergent = [
@@ -3190,7 +3220,7 @@ script.Disabled = true
             )
             for d in divergent_records
         ]
-        return summary_cls(
+        return GameplayAdapterSummary(
             enabled=bool(self.ctx.use_gameplay_adapters),
             total_classes_emitted=len(unique_emitted_paths),
             total_classes_divergent=len(divergent),
