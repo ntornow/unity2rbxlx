@@ -257,14 +257,30 @@ def main(verbose: bool) -> None:
               "HUDController). Default: none — the converter makes no "
               "game-genre assumptions and only emits scaffolding when "
               "explicitly requested.")
-@click.option("--use-gameplay-adapters", is_flag=True,
+@click.option("--use-gameplay-adapters/--no-use-gameplay-adapters",
+              default=True,
               help="Route door / projectile / damage patterns through "
               "the gameplay-adapter pipeline (composition-based "
               "detectors + Lua runtime composer) instead of the legacy "
-              "``script_coherence_packs`` regex packs. PR #73a slice: "
-              "door behaviour only. Default off — PR #74 flips this "
-              "on by default. Mutually exclusive with the legacy door "
-              "pack at pipeline level.")
+              "``script_coherence_packs`` regex packs. Default on as of "
+              "PR #74. To opt out, pass ``--legacy-gameplay-packs`` "
+              "instead — the two modes are mutually exclusive at the "
+              "pipeline level (passing ``--use-gameplay-adapters`` and "
+              "``--legacy-gameplay-packs`` together raises a usage "
+              "error). PR #77 removes this flag once legacy packs are "
+              "deleted in PR #76.")
+@click.option("--legacy-gameplay-packs", is_flag=True, default=False,
+              help="Force the legacy ``script_coherence_packs`` "
+              "regex-patch pipeline for door / projectile / damage "
+              "patterns. Disables the gameplay-adapter pipeline AND "
+              "suppresses emission of every adapter runtime module "
+              "under ``ReplicatedStorage.AutoGen`` (composer, "
+              "triggers, movement, lifetime, hit_detection, effects, "
+              "damage_protocol, gameplay) plus the always-on "
+              "``_GameplayServerBootstrap`` Script. Rollback lever for "
+              "the PR #74 default-on flip; will become a hard error "
+              "in PR #76 once the legacy packs are deleted. Mutually "
+              "exclusive with ``--use-gameplay-adapters``.")
 def convert(
     unity_project: str,
     output: str,
@@ -279,6 +295,7 @@ def convert(
     place_id: int | None,
     scaffolding: str | None,
     use_gameplay_adapters: bool,
+    legacy_gameplay_packs: bool,
 ) -> None:
     """Convert a Unity project to a Roblox experience.
 
@@ -292,6 +309,30 @@ def convert(
     """
     import config
     from converter.pipeline import Pipeline
+
+    # PR #74: mutex between adapter mode and legacy-pack mode. We only
+    # treat ``--use-gameplay-adapters`` as a user-intent signal when it
+    # was set EXPLICITLY on the command line (click's parameter source
+    # COMMANDLINE), not when it defaulted to True. Otherwise the new
+    # default-on flip would make ``--legacy-gameplay-packs`` impossible
+    # to use without also passing ``--no-use-gameplay-adapters``.
+    if legacy_gameplay_packs:
+        ctx_click = click.get_current_context()
+        adapter_source = ctx_click.get_parameter_source("use_gameplay_adapters")
+        if (
+            adapter_source == click.core.ParameterSource.COMMANDLINE
+            and use_gameplay_adapters
+        ):
+            raise click.UsageError(
+                "--use-gameplay-adapters and --legacy-gameplay-packs are "
+                "mutually exclusive. --legacy-gameplay-packs is the "
+                "rollback opt-out for the PR #74 default-on flip; pass "
+                "exactly one or neither.",
+            )
+        # Legacy mode wins: force adapters off so the rest of the pipeline
+        # (script classification, runtime module injection, rehydration
+        # prune) takes the pre-PR-#74 path.
+        use_gameplay_adapters = False
 
     project_path = Path(unity_project).resolve()
     output_path = Path(output).resolve()

@@ -27,6 +27,20 @@ require(script.Parent:WaitForChild("Effects"))
 -- LocalScript fires the legacy-pack-injected ``FireServer`` call.
 -- The module's body initializes the OnServerEvent connection on
 -- first require (server-side only) and is idempotent.
-require(script.Parent:WaitForChild("DamageProtocol"))
+--
+-- PR #74 codex round-2 [P2]: the converter omits DamageProtocol
+-- from ReplicatedStorage.AutoGen entirely when the project has no
+-- Player-damage signal (no Effect.Damage / Effect.Splash adapter
+-- match and no legacy ``FireServer(DamageEvent`` body-patch), so
+-- adapter-enabled projects that use ``DamageEvent`` for unrelated
+-- traffic don't get its OnServerEvent claimed. Use ``FindFirstChild``
+-- (NOT ``WaitForChild``) so the orchestrator finishes loading
+-- promptly in the absent case — a 5-second wait here would block
+-- every door/projectile-only adapter project from registering its
+-- families.
+local damageProtocol = script.Parent:FindFirstChild("DamageProtocol")
+if damageProtocol ~= nil then
+    require(damageProtocol)
+end
 
 return Composer

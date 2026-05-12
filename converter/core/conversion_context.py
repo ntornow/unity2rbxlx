@@ -118,12 +118,15 @@ class ConversionContext:
     # is empty.
     scaffolding: list[str] = field(default_factory=list)
 
-    # Gameplay-adapter rollout flag (PR #73a). When True, the gameplay
-    # detectors run during transpile and replace the matching legacy
-    # ``script_coherence_packs`` packs. Default False until PR #74
-    # flips it. Persisted so resumed builds use the same path the
-    # original conversion picked.
-    use_gameplay_adapters: bool = False
+    # Gameplay-adapter rollout flag (PR #73a; flipped on by default in
+    # PR #74). When True, the gameplay detectors run during transpile
+    # and replace the matching legacy ``script_coherence_packs`` packs;
+    # the adapter runtime modules under ``ReplicatedStorage.AutoGen``
+    # are also emitted. To opt out, pass ``--legacy-gameplay-packs`` on
+    # the CLI, which forces this field to False before the Pipeline
+    # constructor sees it (see ``u2r.py``). Persisted so resumed builds
+    # use the same path the original conversion picked.
+    use_gameplay_adapters: bool = True
 
     def __post_init__(self) -> None:
         # JSON load via `cls(**data)` populates storage_plan as a dict (the

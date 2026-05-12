@@ -145,6 +145,120 @@ def _place_carries_adapter_marker(
     return _walk(getattr(rbx_place, "replicated_templates", None) or [])
 
 
+_DAMAGE_CAPABILITY_KINDS: frozenset[str] = frozenset({
+    "effect.damage",
+    "effect.splash",
+})
+
+# PR #74 rehydration-aware prune pass. Removes legacy
+# coherence-pack artifacts BEFORE the adapter runtime injects its
+# replacements, so a re-conversion of an output that was previously
+# built with ``--legacy-gameplay-packs`` (or pre-PR-#73a, where
+# legacy was the only mode) doesn't leave both halves wired up.
+#
+# Three artifact categories:
+#
+#   - ``_AutoDamageEventRouter`` Script — the legacy
+#     ``player_damage_remote_event`` pack's server-side validator.
+#     Adapter ``DamageProtocol`` ModuleScript replaces it and binds
+#     ``OnServerEvent`` to the same RemoteEvent; double-emission would
+#     double-bind ``OnServerEvent`` and apply ``SetAttribute("TakeDamage")``
+#     twice per validated hit (the legacy pack's tier-2 apply path
+#     already prunes this when both adapters AND the pack run, but the
+#     pack only runs when its detector fires — so the central prune
+#     here is the floor).
+#   - ``_AutoFpsDoorTweenInjected`` block — appended to AI-transpiled
+#     Door.luau by the ``door_tween_open`` pack. When adapters now
+#     own Door behaviour, leaving the block behind double-tweens the
+#     sibling door mesh on every attribute change.
+#   - ``_AutoFpsHud`` ScreenGui — emitted by ``scaffolding.fps``
+#     when the user previously opted in via ``--scaffolding=fps``.
+#     Distinct from adapter artifacts but bundled with the prune
+#     surface per the design doc so a re-conversion that drops the
+#     ``fps`` scaffolding (or rolls back to ``--legacy-gameplay-packs``
+#     without ``fps`` scaffolding still active) cleans up the stale
+#     ScreenGui.
+_LEGACY_DAMAGE_ROUTER_NAME: str = "_AutoDamageEventRouter"
+_LEGACY_DOOR_TWEEN_MARKER: str = "-- _AutoFpsDoorTweenInjected"
+_LEGACY_FPS_HUD_ATTR: str = "_AutoFpsHud"
+
+
+def _strip_legacy_door_tween_block(source: str) -> tuple[str, bool]:
+    """Return *(new_source, was_stripped)* with any
+    ``_AutoFpsDoorTweenInjected`` block removed.
+
+    The legacy ``door_tween_open`` pack appends the block at the END
+    of the script via ``source.rstrip() + "\\n" + _DOOR_TWEEN_BLOCK``
+    (see ``script_coherence_packs.py:1775``). Slicing from the first
+    marker line to end-of-string is therefore both safe (the marker
+    line is the first line of the appended block) and complete
+    (everything after the marker IS the block).
+
+    Idempotent: stripping a script with no marker is a no-op.
+    """
+    idx = source.find(_LEGACY_DOOR_TWEEN_MARKER)
+    if idx == -1:
+        return source, False
+    # Walk backward to capture the newline (and any whitespace) that
+    # came immediately before the marker so the prune doesn't leave a
+    # dangling blank line.
+    cut = idx
+    while cut > 0 and source[cut - 1] in " \t":
+        cut -= 1
+    if cut > 0 and source[cut - 1] == "\n":
+        cut -= 1
+    return source[:cut].rstrip() + "\n", True
+
+# Substring the legacy ``player_damage_remote_event`` pack body-patch
+# leaves in every Player LocalScript it touches. Kept literal (no
+# regex) because the pack itself emits the exact string at
+# ``script_coherence_packs.py:2180`` and a structural pin here lets a
+# future refactor of either side land with a single failing test.
+_LEGACY_DAMAGE_FIRESERVER_MARKER: str = ':FindFirstChild("DamageEvent")'
+
+
+def _place_has_legacy_damage_fireserver(
+    rbx_place: "_PlaceLike | RbxPlace | None",
+) -> bool:
+    """Return True when any script in *rbx_place* carries the legacy
+    ``player_damage_remote_event`` body-patch marker.
+
+    PR #74 codex round-2 [P2]: DamageProtocol injection must gate on a
+    real Player-damage signal, not "any adapter match present". The
+    legacy pack still runs in tier-2 mode under adapters-on and
+    body-patches Player LocalScripts with a literal
+    ``FindFirstChild("DamageEvent")`` lookup; that's the off-adapter
+    half of the damage path and means the server-side validator MUST
+    be live to handle the client's FireServer call.
+
+    Walks the same surfaces as ``_place_carries_adapter_marker``
+    (global scripts, workspace parts, replicated templates) so
+    rehydrate-path detection works.
+    """
+    if rbx_place is None:
+        return False
+
+    def _has(script: _ScriptLike) -> bool:
+        src = getattr(script, "source", None) or ""
+        return _LEGACY_DAMAGE_FIRESERVER_MARKER in src
+
+    def _walk(parts: list[_PartLike]) -> bool:
+        for part in parts:
+            for s in getattr(part, "scripts", None) or []:
+                if _has(s):
+                    return True
+            if _walk(getattr(part, "children", None) or []):
+                return True
+        return False
+
+    for s in getattr(rbx_place, "scripts", None) or []:
+        if _has(s):
+            return True
+    if _walk(getattr(rbx_place, "workspace_parts", None) or []):
+        return True
+    return _walk(getattr(rbx_place, "replicated_templates", None) or [])
+
+
 def _carry_unconverted(
     animation_result: Any, entries: list[dict[str, str]],
 ) -> None:
@@ -229,7 +343,15 @@ class Pipeline:
         skip_upload: bool = False,
         skip_binary_rbxl: bool = False,
         scaffolding: frozenset[str] | None = None,
-        use_gameplay_adapters: bool = False,
+        # PR #74: default flipped to True. Pre-PR-#74 callers
+        # (tests, the legacy ``--legacy-gameplay-packs`` rollback path
+        # in ``u2r.py``) that want the legacy ``script_coherence_packs``
+        # behaviour must now pass ``use_gameplay_adapters=False``
+        # explicitly. Pipeline constructor default and
+        # ``ConversionContext`` default stay in lockstep so a Pipeline
+        # built with no flag and a freshly-constructed ctx don't
+        # silently disagree on which pipeline runs.
+        use_gameplay_adapters: bool = True,
     ) -> None:
         self.unity_project_path = self._find_unity_root(Path(unity_project_path).resolve())
         self.output_dir = Path(output_dir or OUTPUT_DIR).resolve()
@@ -273,14 +395,15 @@ class Pipeline:
             # ``Pipeline(scaffolding=["fsps"])`` would persist silently.
             self.apply_scaffolding(self._init_scaffolding)
 
-        # Gameplay-adapter rollout flag (PR #73a). Snapshotted at
-        # construction so resume() (which replaces ``self.ctx`` from
-        # disk) doesn't silently drop a flag passed via constructor.
-        # The snapshot is reapplied to ``self.ctx`` after rehydration —
-        # see ``resume`` for the matching application.
+        # Gameplay-adapter rollout flag (PR #73a; default flipped on in
+        # PR #74). Snapshotted at construction so resume() (which
+        # replaces ``self.ctx`` from disk) doesn't silently drop the
+        # caller's choice. The snapshot is reapplied to ``self.ctx``
+        # after rehydration — see ``resume`` for the matching
+        # application. Stored as the exact bool so the caller can
+        # also drive ctx OFF (the legacy-pack opt-out path uses this).
         self._init_use_gameplay_adapters: bool = bool(use_gameplay_adapters)
-        if self._init_use_gameplay_adapters:
-            self.ctx.use_gameplay_adapters = True
+        self.ctx.use_gameplay_adapters = self._init_use_gameplay_adapters
 
         # ``_fps_artifacts_at_init`` caches the backward-compat
         # migration signal BEFORE ``_subphase_emit_scripts_to_disk``
@@ -762,13 +885,16 @@ class Pipeline:
             # persisted entries are kept, the new request adds to them.
             if self._init_scaffolding:
                 self.apply_scaffolding(self._init_scaffolding)
-            # Re-apply the constructor's gameplay-adapter request after
+            # Re-apply the constructor's gameplay-adapter choice after
             # the ctx swap so resumed builds (``u2r.py publish`` rebuild,
-            # ``u2r.py convert --phase ... --use-gameplay-adapters``)
-            # honour the flag even if the persisted ctx was written
-            # before adapters existed. Additive — once True, stays True.
-            if self._init_use_gameplay_adapters:
-                self.ctx.use_gameplay_adapters = True
+            # ``u2r.py convert --phase ... --use-gameplay-adapters``,
+            # ``u2r.py convert --legacy-gameplay-packs``) honour the
+            # flag even if the persisted ctx was written before
+            # adapters existed (defaulted True since PR #74) or with
+            # the opposite choice. Constructor wins over persisted
+            # state — bidirectional since PR #74 (pre-#74 was
+            # additive: once True, stay True).
+            self.ctx.use_gameplay_adapters = self._init_use_gameplay_adapters
 
         log.info("=== Resuming pipeline from phase '%s' ===", phase)
         self.run_through(phase, run_after=True)
@@ -2180,6 +2306,170 @@ return table.concat(allData, "\\n")'''
         the in-memory state about to be serialized.
     A test asserts the actual call sequence in write_output matches this tuple.
     """
+
+    def _prune_legacy_gameplay_artifacts(self) -> int:
+        """PR #74: rehydration-aware prune pass for legacy
+        coherence-pack artifacts. Removes them BEFORE the adapter
+        runtime injects its replacements so re-conversion of an
+        output built with ``--legacy-gameplay-packs`` (or pre-PR-#73a)
+        doesn't leave both halves wired up.
+
+        Three surfaces, all idempotent:
+
+          * Drops every ``_AutoDamageEventRouter`` Script from the
+            global ``scripts`` list AND from any part-bound scripts.
+          * Strips the ``_AutoFpsDoorTweenInjected`` block from every
+            script's source.
+          * Drops every ``_AutoFpsHud``-tagged ScreenGui from
+            ``screen_guis``.
+
+        Returns the count of pruned items (one per script removed,
+        plus one per source modified, plus one per ScreenGui removed)
+        for logging. No-op when ``rbx_place`` is None.
+        """
+        place = self.state.rbx_place
+        if place is None:
+            return 0
+
+        pruned = 0
+
+        # 1. ``_AutoDamageEventRouter`` Script removal — global list +
+        # part-bound recursive walk. Part-bound shouldn't happen in
+        # practice (the pack always parents under ServerScriptService),
+        # but the walk costs nothing and guards against future
+        # rebinding bugs.
+        global_scripts = getattr(place, "scripts", None) or []
+        kept: list = []
+        for s in global_scripts:
+            if getattr(s, "name", None) == _LEGACY_DAMAGE_ROUTER_NAME:
+                pruned += 1
+                log.info(
+                    "[prune] Removed stale %s Script "
+                    "(adapter DamageProtocol supersedes it)",
+                    _LEGACY_DAMAGE_ROUTER_NAME,
+                )
+                continue
+            kept.append(s)
+        place.scripts = kept
+
+        def _prune_part_scripts(parts: list) -> None:
+            nonlocal pruned
+            for part in parts:
+                part_scripts = getattr(part, "scripts", None)
+                if part_scripts:
+                    surviving = []
+                    for s in part_scripts:
+                        if getattr(s, "name", None) == _LEGACY_DAMAGE_ROUTER_NAME:
+                            pruned += 1
+                            log.info(
+                                "[prune] Removed stale %s Script bound "
+                                "to part '%s'",
+                                _LEGACY_DAMAGE_ROUTER_NAME,
+                                getattr(part, "name", "?"),
+                            )
+                            continue
+                        surviving.append(s)
+                    part.scripts = surviving
+                children = getattr(part, "children", None)
+                if children:
+                    _prune_part_scripts(children)
+
+        _prune_part_scripts(getattr(place, "workspace_parts", None) or [])
+        _prune_part_scripts(getattr(place, "replicated_templates", None) or [])
+
+        # 2. ``_AutoFpsDoorTweenInjected`` block strip on every script
+        # source (the marker can only land on Door.luau today but the
+        # strip is name-agnostic so a future pack variant that uses
+        # the same marker is also cleaned).
+        def _strip_in_scripts(scripts: list) -> None:
+            nonlocal pruned
+            for s in scripts:
+                src = getattr(s, "source", None)
+                if not src or _LEGACY_DOOR_TWEEN_MARKER not in src:
+                    continue
+                new_src, stripped = _strip_legacy_door_tween_block(src)
+                if stripped:
+                    s.source = new_src
+                    pruned += 1
+                    log.info(
+                        "[prune] Stripped %s block from script '%s'",
+                        _LEGACY_DOOR_TWEEN_MARKER.strip("- "),
+                        getattr(s, "name", "?"),
+                    )
+
+        _strip_in_scripts(place.scripts)
+
+        def _strip_in_parts(parts: list) -> None:
+            for part in parts:
+                part_scripts = getattr(part, "scripts", None) or []
+                if part_scripts:
+                    _strip_in_scripts(part_scripts)
+                children = getattr(part, "children", None)
+                if children:
+                    _strip_in_parts(children)
+
+        _strip_in_parts(getattr(place, "workspace_parts", None) or [])
+        _strip_in_parts(getattr(place, "replicated_templates", None) or [])
+
+        # 3. ``_AutoFpsHud`` ScreenGui removal — bundled with the
+        # adapter prune per design doc, even though the HUD is
+        # scaffolding (not an adapter artifact). The ``"fps"``
+        # scaffolding opt-in re-emits a fresh HUD in this same
+        # write_output pass, so the prune is safe for the
+        # opt-in-this-run case too — the HUD-injection helper runs
+        # after this prune.
+        screen_guis = getattr(place, "screen_guis", None)
+        if screen_guis:
+            surviving_guis = []
+            for gui in screen_guis:
+                attrs = getattr(gui, "attributes", None) or {}
+                if attrs.get(_LEGACY_FPS_HUD_ATTR):
+                    pruned += 1
+                    log.info(
+                        "[prune] Removed stale %s-tagged ScreenGui '%s'",
+                        _LEGACY_FPS_HUD_ATTR,
+                        getattr(gui, "name", "?"),
+                    )
+                    continue
+                surviving_guis.append(gui)
+            place.screen_guis = surviving_guis
+
+        return pruned
+
+    def _damage_protocol_needed(self) -> bool:
+        """Return True when the project carries a Player-damage signal
+        that requires the ``DamageProtocol`` server-side validator.
+
+        PR #74 codex round-2 [P2]: the previous unconditional injection
+        force-claimed ``ReplicatedStorage.DamageEvent`` for every
+        adapter-enabled project (including door-only and projectile-only
+        matches that have no damage capability). That broke adapter
+        adoption on any project with unrelated ``DamageEvent`` traffic.
+
+        Two qualifying signals:
+
+          1. **Adapter path** — at least one ``GameplayMatch`` emitted a
+             damage-effect capability (``effect.damage`` or
+             ``effect.splash``). Captures bullets / explosions that the
+             gameplay-adapter pipeline routes through ``DamageEvent``.
+
+          2. **Legacy body-patch path** — the
+             ``player_damage_remote_event`` coherence pack body-patched
+             a Player LocalScript (the half that still runs in adapters-
+             on tier-2 mode) and left an inline
+             ``FindFirstChild("DamageEvent")`` lookup. That call needs
+             a server-side listener live or it FireServers into the void.
+
+        Both surfaces are scanned via the same place-walking helpers as
+        the adapter-marker scan so the rehydrate / publish-rebuild path
+        (``state.gameplay_matches`` empty but scripts already on disk)
+        sees the same answer as the fresh-conversion path.
+        """
+        for match in self.state.gameplay_matches:
+            for kind in match.capability_kinds:
+                if kind in _DAMAGE_CAPABILITY_KINDS:
+                    return True
+        return _place_has_legacy_damage_fireserver(self.state.rbx_place)
 
     def write_output(self) -> None:
         """Phase 6: Serialize the Roblox place to disk.
@@ -3866,14 +4156,50 @@ script.Disabled = true
             _place_carries_adapter_marker(self.state.rbx_place)
         )
         if self.ctx.use_gameplay_adapters and adapter_stubs_present:
+            # PR #74 rehydration-aware prune pass. Run BEFORE injecting
+            # adapter runtime modules so a re-conversion of an output
+            # that previously ran with ``--legacy-gameplay-packs`` (or
+            # pre-PR-#73a, where legacy was the only mode) doesn't
+            # leave both halves wired up — the legacy
+            # ``_AutoDamageEventRouter`` Script would double-bind
+            # ``OnServerEvent`` alongside ``DamageProtocol``, and a
+            # stale ``_AutoFpsDoorTweenInjected`` block on Door.luau
+            # would double-tween on every open/close. Idempotent and
+            # safe on the no-prior-legacy case (no-op when nothing
+            # matches).
+            pruned = self._prune_legacy_gameplay_artifacts()
+            if pruned:
+                log.info(
+                    "[write_output] Pruned %d stale legacy "
+                    "coherence-pack artifact(s) before adapter "
+                    "runtime injection.",
+                    pruned,
+                )
             from core.roblox_types import RbxScript as _GpRbxScript
             gameplay_runtime_dir = (
                 Path(__file__).parent.parent / "runtime" / "gameplay"
             )
+            # PR #74 codex round-2 [P2]: gate DamageProtocol on whether
+            # the project actually carries a Player-damage signal.
+            # Force-injecting it claims ``ReplicatedStorage.DamageEvent``
+            # globally and binds ``OnServerEvent`` to whatever exists at
+            # that name — collision risk for projects that use a
+            # ``DamageEvent`` name for unrelated networking. Two signals
+            # qualify: (a) an adapter match emitted a damage capability
+            # (``effect.damage`` / ``effect.splash``); (b) the legacy
+            # ``player_damage_remote_event`` pack body-patched a Player
+            # LocalScript, leaving an inline
+            # ``:FindFirstChild("DamageEvent")`` lookup that the server
+            # validator needs to be live for. The orchestrator's require
+            # chain is also conditional now (``FindFirstChild`` not
+            # ``WaitForChild`` on DamageProtocol) so omitting the module
+            # is a clean absence rather than a 5-second wait.
+            needs_damage_protocol = self._damage_protocol_needed()
+
             # Filename → ModuleScript name. The Gameplay orchestrator is
             # the entry point; family modules and Composer are siblings
             # under ReplicatedStorage.AutoGen.
-            gameplay_modules: tuple[tuple[str, str], ...] = (
+            base_modules: list[tuple[str, str]] = [
                 ("Composer", "composer.luau"),
                 ("Triggers", "triggers.luau"),
                 ("Movement", "movement.luau"),
@@ -3884,16 +4210,21 @@ script.Disabled = true
                 # the first ``Composer.run`` call.
                 ("HitDetection", "hit_detection.luau"),
                 ("Effects", "effects.luau"),
+            ]
+            if needs_damage_protocol:
                 # PR #73c: DamageProtocol owns the ``DamageEvent``
                 # RemoteEvent + server-side validator (origin replay,
                 # distance gate, value-preserving attribute mirror).
                 # Replaces the legacy ``_AutoDamageEventRouter`` Script
                 # that ``player_damage_remote_event`` emitted; the body-
-                # patch half of that pack still runs to inject
-                # ``FireServer`` into Player LocalScripts.
-                ("DamageProtocol", "damage_protocol.luau"),
-                ("Gameplay", "gameplay.luau"),
-            )
+                # patch half of that pack still runs to inject the
+                # ``FireServer`` call into Player LocalScripts. Gated
+                # since PR #74 — see ``_damage_protocol_needed``.
+                base_modules.append(
+                    ("DamageProtocol", "damage_protocol.luau"),
+                )
+            base_modules.append(("Gameplay", "gameplay.luau"))
+            gameplay_modules: tuple[tuple[str, str], ...] = tuple(base_modules)
             for module_name, filename in gameplay_modules:
                 module_path = gameplay_runtime_dir / filename
                 if not module_path.exists():
