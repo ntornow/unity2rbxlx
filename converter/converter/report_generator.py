@@ -83,6 +83,13 @@ class GameplayAdapterBinding:
     """One detector match recorded in ``conversion_report.json`` —
     everything the operator needs to write a ``.gameplay_deny.txt``
     line without re-reading the converter source.
+
+    ``source_path`` carries the absolute path of the scene or prefab
+    that produced the binding. Operators write
+    ``<source_path>#<node_file_id>`` to suppress one specific source —
+    bare file_ids alone collide across prefab assets (PR #73b prefab
+    walking exposed e.g. ``Battery_medium_05.prefab`` and
+    ``Antenna_lg.prefab`` both using ``&100000``).
     """
     detector_name: str = ""
     diagnostic_name: str = ""
@@ -92,6 +99,7 @@ class GameplayAdapterBinding:
     component_file_id: str = ""
     script_path: str = ""
     capability_kinds: list[str] = field(default_factory=list)
+    source_path: str = ""
 
 
 @dataclass
@@ -104,6 +112,7 @@ class GameplayAdapterDivergentBinding:
     node_name: str = ""
     node_file_id: str = ""
     component_file_id: str = ""
+    source_path: str = ""
 
 
 @dataclass

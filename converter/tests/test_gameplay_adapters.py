@@ -841,10 +841,15 @@ class TestProtocolConformance:
         assert det.name == "door"
 
     def test_all_detectors_present(self) -> None:
-        # PR #73a ships only the door detector. PR #73b adds bullet
-        # detectors here; this test pins the slice boundary.
+        # Slice-boundary pin. PR #73a registered ``door``; PR #73b adds
+        # ``turret_bullet`` + ``plane_bullet``. Updating this test is
+        # the deliberate signal that a new detector is shipping —
+        # forgetting to register here means the deny-list and dispatch
+        # would diverge.
         names = {d.name for d in ALL_DETECTORS}
         assert "door" in names
+        assert "turret_bullet" in names
+        assert "plane_bullet" in names
 
 
 # ---------------------------------------------------------------------------

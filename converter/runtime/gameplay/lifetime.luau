@@ -2,9 +2,10 @@
 --
 -- Owns the ``ctx.lifetime`` namespace.
 --
--- PR #73a ships ``Lifetime.Persistent`` only. ``Despawn`` and
--- ``OnFirstHit`` arrive in PR #73b.
+-- Ships ``Lifetime.Persistent`` (PR #73a) and ``Lifetime.Despawn``
+-- (PR #73b, projectile slice).
 
+local Debris = game:GetService("Debris")
 local Composer = require(script.Parent:WaitForChild("Composer"))
 
 local Lifetime = {}
@@ -17,6 +18,28 @@ function Lifetime.persistent(container: Instance, cap: {[string]: any}, ctx: {[s
     -- intentionally empty
 end
 
+-- ``Lifetime.Despawn`` schedules the container for destruction after
+-- ``cap.seconds`` Unity seconds (1:1 with Roblox seconds — only
+-- distances need stud-conversion). Maps to Unity ``Destroy(gameObject,
+-- t)``. Mirrors the legacy bullet pack's
+-- ``Debris:AddItem(container, fadeTime)``.
+--
+-- Per-instance override: ``fadeTime`` attribute on the container (or
+-- its primary part for Model containers) takes precedence so Unity
+-- inspector tuning survives — same pattern as Movement.Impulse and
+-- Effect.Damage.
+function Lifetime.despawn(container: Instance, cap: {[string]: any}, ctx: {[string]: any}): ()
+    local attrHost: Instance = container
+    if container:IsA("Model") then
+        attrHost = container.PrimaryPart or container
+    end
+    local overrideFade = attrHost:GetAttribute("fadeTime")
+    local seconds: number = (typeof(overrideFade) == "number" and overrideFade)
+        or (cap.seconds :: number)
+    Debris:AddItem(container, seconds)
+end
+
 Composer.register("lifetime.persistent", Lifetime.persistent)
+Composer.register("lifetime.despawn", Lifetime.despawn)
 
 return Lifetime

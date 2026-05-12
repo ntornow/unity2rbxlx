@@ -36,8 +36,14 @@ from typing import Protocol, TYPE_CHECKING, runtime_checkable
 from converter.gameplay.capabilities import (
     Behavior,
     ContainerResolver,
+    EffectDamage,
+    EffectSplash,
+    EffectSpawnTemplate,
+    HitDetectionRaycastSegment,
+    LifetimeDespawn,
     LifetimePersistent,
     MovementAttributeDrivenTween,
+    MovementImpulse,
     TriggerOnBoolAttribute,
 )
 
@@ -197,14 +203,181 @@ class DoorDetector:
 
 
 # ---------------------------------------------------------------------------
+# Projectile detectors (PR #73b)
+# ---------------------------------------------------------------------------
+
+# Defaults extracted from the canonical Unity sources
+# (``TurretBullet.cs``, ``PlaneBullet.cs`` in SimpleFPS). These are the
+# emit-time defaults; the runtime additionally honors per-instance
+# ``force`` / ``fadeTime`` / ``damage`` attributes serialized by
+# ``_extract_monobehaviour_attributes``, so Unity inspector overrides
+# carry through to runtime without forcing a per-instance Behavior
+# divergence at the IR level.
+_TURRET_BULLET_DEFAULTS: dict[str, float] = {
+    "fadeTime": 3.0,
+    "force": 60.0,
+    "damage": 10.0,
+}
+_PLANE_BULLET_DEFAULTS: dict[str, float] = {
+    "fadeTime": 6.0,
+    "force": 200.0,
+    "damage": 10.0,
+    "splash_radius": 2.0,
+}
+
+# Confirm regexes. Source-only, never used by ``primary()``. Both
+# detectors look for ``AddRelativeForce`` (the Unity impulse call) +
+# ``Destroy(gameObject, ...)`` (the fade timer). PlaneBullet additionally
+# requires ``OverlapSphere`` (the splash signal) — that's the source-
+# level discriminator between the two bullet variants, since both
+# have the same class shape (Rigidbody + Start + OnCollisionEnter).
+# Stable against the AI-output variations the legacy pack chased across
+# 12 review rounds (different local variable names, different timer
+# fade values) because we're matching the C# SOURCE here, not the AI's
+# transpiled Luau.
+_ADD_RELATIVE_FORCE_RE = re.compile(r'\b\w+\.AddRelativeForce\s*\(')
+_DESTROY_GAMEOBJECT_RE = re.compile(r'\bDestroy\s*\(\s*gameObject\b')
+_OVERLAP_SPHERE_RE = re.compile(r'\bPhysics\.OverlapSphere\s*\(')
+_INSTANTIATE_RE = re.compile(r'\bInstantiate\s*\(')
+
+
+class TurretBulletDetector:
+    """Detects Unity ``TurretBullet.cs``-style direct-hit bullets.
+
+    Primary signal (composition-only): the component is a MonoBehaviour
+    whose script class name is ``TurretBullet``.
+
+    Confirm signal: the C# body uses ``AddRelativeForce`` + ``Destroy(
+    gameObject, ...)`` AND does NOT use ``OverlapSphere`` (which would
+    indicate a splash bullet — PlaneBullet's signal). The negative
+    discriminator on ``OverlapSphere`` keeps a future refactor that
+    moves PlaneBullet's splash into a shared base class from
+    accidentally matching here.
+    """
+
+    name: str = "turret_bullet"
+
+    def primary(
+        self, node: "SceneNode", component: "ComponentData",
+    ) -> bool:
+        return _component_script_class(component) == "TurretBullet"
+
+    def confirm(
+        self,
+        node: "SceneNode",
+        component: "ComponentData",
+        source_csharp: str,
+    ) -> bool:
+        if not _ADD_RELATIVE_FORCE_RE.search(source_csharp):
+            return False
+        if not _DESTROY_GAMEOBJECT_RE.search(source_csharp):
+            return False
+        # Reject if the body looks splash-shaped — TurretBullet is
+        # direct-hit only.
+        if _OVERLAP_SPHERE_RE.search(source_csharp):
+            return False
+        return True
+
+    def behavior(
+        self,
+        node: "SceneNode",
+        component: "ComponentData",
+        source_csharp: str,
+    ) -> Behavior:
+        d = _TURRET_BULLET_DEFAULTS
+        return Behavior(
+            unity_file_id=node.file_id,
+            diagnostic_name="TurretBullet",
+            capabilities=(
+                MovementImpulse(
+                    direction_local=(0.0, 0.0, 1.0),
+                    force_unity=d["force"],
+                ),
+                LifetimeDespawn(seconds=d["fadeTime"]),
+                HitDetectionRaycastSegment(),
+                EffectDamage(value=d["damage"]),
+            ),
+            container_resolver=ContainerResolver(kind="self"),
+        )
+
+
+class PlaneBulletDetector:
+    """Detects Unity ``PlaneBullet.cs``-style splash bullets.
+
+    Primary signal (composition-only): the component is a MonoBehaviour
+    whose script class name is ``PlaneBullet``.
+
+    Confirm signal: ``AddRelativeForce`` + ``Destroy(gameObject, ...)``
+    + ``Physics.OverlapSphere`` + ``Instantiate``. The OverlapSphere
+    signal is the discriminator vs TurretBullet; ``Instantiate``
+    confirms the explosion-template clone Unity's PlaneBullet does in
+    ``OnCollisionEnter``.
+    """
+
+    name: str = "plane_bullet"
+
+    def primary(
+        self, node: "SceneNode", component: "ComponentData",
+    ) -> bool:
+        return _component_script_class(component) == "PlaneBullet"
+
+    def confirm(
+        self,
+        node: "SceneNode",
+        component: "ComponentData",
+        source_csharp: str,
+    ) -> bool:
+        return bool(
+            _ADD_RELATIVE_FORCE_RE.search(source_csharp)
+            and _DESTROY_GAMEOBJECT_RE.search(source_csharp)
+            and _OVERLAP_SPHERE_RE.search(source_csharp)
+            and _INSTANTIATE_RE.search(source_csharp)
+        )
+
+    def behavior(
+        self,
+        node: "SceneNode",
+        component: "ComponentData",
+        source_csharp: str,
+    ) -> Behavior:
+        d = _PLANE_BULLET_DEFAULTS
+        return Behavior(
+            unity_file_id=node.file_id,
+            diagnostic_name="PlaneBullet",
+            capabilities=(
+                MovementImpulse(
+                    direction_local=(0.0, 0.0, 1.0),
+                    force_unity=d["force"],
+                ),
+                LifetimeDespawn(seconds=d["fadeTime"]),
+                HitDetectionRaycastSegment(),
+                # SpawnTemplate runs BEFORE Splash so the explosion VFX
+                # spawns at the impact point even if Splash destroys
+                # the container after applying area damage. The
+                # ordering also matches Unity ``PlaneBullet.cs``
+                # ``OnCollisionEnter`` which Instantiates the explosion
+                # BEFORE running OverlapSphere damage.
+                EffectSpawnTemplate(name="Explosion"),
+                EffectSplash(
+                    radius_unity=d["splash_radius"],
+                    value=d["damage"],
+                ),
+            ),
+            container_resolver=ContainerResolver(kind="self"),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Multi-detector dispatch
 # ---------------------------------------------------------------------------
 
-# PR #73a registers only the door detector; #73b adds the bullet
-# detectors. New entries land here so the deny-list and dispatch share
-# a single source of truth.
+# PR #73a registers only the door detector; PR #73b adds the projectile
+# pair. New entries land here so the deny-list and dispatch share a
+# single source of truth.
 ALL_DETECTORS: tuple[Detector, ...] = (
     DoorDetector(),
+    TurretBulletDetector(),
+    PlaneBulletDetector(),
 )
 
 
@@ -225,6 +398,13 @@ def detect(
     matching either suppresses the detection. Per-component IDs let
     operators silence one component on a multi-component node without
     losing detection on the other components.
+
+    This entry point checks bare file_ids only; the source-qualified
+    form ``<source_path>#<file_id>`` is handled by
+    :func:`converter.gameplay.integration.classify_scripts` so callers
+    routing through the integration layer benefit from cross-prefab
+    disambiguation (codex PR #73b-round-1 P2). Direct callers of
+    ``detect()`` are still safe — the bare form matches every source.
     """
     if node.file_id in deny_list or component.file_id in deny_list:
         return None
@@ -253,8 +433,22 @@ DENY_LIST_FILENAME: str = ".gameplay_deny.txt"
 
 
 def load_deny_list(output_dir: str) -> frozenset[str]:
-    """Load ``<output_dir>/.gameplay_deny.txt`` — one Unity file_id per
-    line. Blank lines and ``#`` comments are skipped. Returns an empty
+    """Load ``<output_dir>/.gameplay_deny.txt`` — one entry per line.
+
+    Each line is either:
+      - A bare Unity ``file_id`` (matches every source that uses it).
+        Predates PR #73b; still works for scene-only bindings.
+      - A qualified ``<source_path>#<file_id>`` form. ``source_path``
+        is the absolute path of the scene or prefab that produced
+        the binding (matches what
+        ``conversion_report.json`` reports under
+        ``gameplay_adapters.bindings[].source_path``). Use this to
+        suppress one prefab's binding without affecting other
+        prefabs that share the same local ``file_id`` (codex PR
+        #73b-round-1 P2 — collisions like ``&100000`` are common
+        across prefab assets).
+
+    Blank lines and ``#`` comments are skipped. Returns an empty
     frozenset if the file is absent.
     """
     from pathlib import Path

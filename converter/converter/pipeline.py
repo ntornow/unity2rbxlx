@@ -51,6 +51,20 @@ PHASES: list[str] = [
 ]
 
 
+# Legacy coherence packs to force-disable whenever
+# ``ctx.use_gameplay_adapters`` is on. The adapter pipeline replaces
+# the AI-transpiled body of the matched class with a per-instance
+# Composer.run stub; if the matching legacy pack ALSO mutated the
+# transpile output, the two paths would fight over the same scripts.
+# Module-level constant so tests can pin the exact set and PR #73c
+# extends it (damage protocol) without growing a parallel test fixture
+# (codex PR #73b-round-2 P3).
+LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON: frozenset[str] = frozenset({
+    "door_tween_open",          # PR #73a
+    "bullet_physics_raycast",   # PR #73b
+})
+
+
 @runtime_checkable
 class _ScriptLike(Protocol):
     """Duck-type narrowing for the marker scan. Real callers pass
@@ -1670,11 +1684,19 @@ class Pipeline:
             # class no longer zeroes the whole pass. The pipeline lets
             # AI handle divergent classes by leaving them in
             # ``script_infos`` (their .cs path isn't in ``skip_paths``).
+            # PR #73b: pass the prefab library through so the adapter
+            # fires on prefab-internal MonoBehaviours (doors, bullets,
+            # pickups). Without this, runtime-spawned prefab instances
+            # never carry an adapter stub — the legacy coherence pack
+            # would be the only effective path. ``prefab_library`` may
+            # be None on an early-phase resume where prefabs haven't
+            # parsed yet; classify_scripts handles that.
             classification = classify_scripts(
                 parsed_scene=self.state.parsed_scene,
                 guid_index=self.state.guid_index,
                 script_infos=script_infos,
                 deny_list=deny_list,
+                prefab_library=self.state.prefab_library,
             )
             if classification.matches:
                 adapter_scripts, adapter_gameplay_matches = (
@@ -2406,14 +2428,17 @@ return table.concat(allData, "\\n")'''
         # Post-transpilation: fix script types based on cross-script dependencies.
         from converter.script_coherence import fix_require_classifications
         # Mutual exclusion with legacy coherence packs: when the
-        # gameplay adapters covered a behaviour (e.g. door tween), the
-        # matching legacy pack must NOT also run — they'd fight over
-        # the same scripts and double-bind (codex pushback on PR #72).
-        # PR #73a covers ``door_tween_open`` only; #73b/c add the
-        # bullet + damage packs to this list.
-        disabled_packs: frozenset[str] = frozenset()
-        if self.ctx.use_gameplay_adapters:
-            disabled_packs = frozenset({"door_tween_open"})
+        # gameplay adapters covered a behaviour (e.g. door tween,
+        # bullet physics), the matching legacy pack must NOT also run
+        # — they'd fight over the same scripts and double-bind (codex
+        # pushback on PR #72). The exact set lives at module level as
+        # ``LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON`` so tests pin the
+        # same constant.
+        disabled_packs: frozenset[str] = (
+            LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON
+            if self.ctx.use_gameplay_adapters
+            else frozenset()
+        )
         fixes = fix_require_classifications(
             self.state.rbx_place.scripts,
             disabled_packs=disabled_packs,
@@ -3192,6 +3217,7 @@ script.Disabled = true
                 component_file_id=m.component_file_id,
                 script_path=m.script_path,
                 capability_kinds=list(m.capability_kinds),
+                source_path=m.source_path,
             )
             for m in matches
         ]
@@ -3208,6 +3234,7 @@ script.Disabled = true
                 node_name=node_binding.node_name,
                 node_file_id=node_binding.unity_file_id,
                 component_file_id=node_binding.component_file_id,
+                source_path=node_binding.source_path,
             )
 
         divergent = [
@@ -3851,6 +3878,12 @@ script.Disabled = true
                 ("Triggers", "triggers.luau"),
                 ("Movement", "movement.luau"),
                 ("Lifetime", "lifetime.luau"),
+                # PR #73b: HitDetection + Effects families for the
+                # projectile slice. Order doesn't matter because the
+                # Gameplay orchestrator force-requires them all before
+                # the first ``Composer.run`` call.
+                ("HitDetection", "hit_detection.luau"),
+                ("Effects", "effects.luau"),
                 ("Gameplay", "gameplay.luau"),
             )
             for module_name, filename in gameplay_modules:
