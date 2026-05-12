@@ -535,7 +535,30 @@ codex pushback on PR #72 sharpened the slicing and added two cuts):
     transpilations would land). Add an Instance-level alias: at
     pipeline emit time, the converter ALSO drops a same-named
     `ModuleScript` at the original `ReplicatedStorage.AutoFpsEventDispatch`
-    location whose body just `return require(ReplicatedStorage.AutoGen.EventDispatch)`.
+    location.
+
+    The alias body uses `WaitForChild` chains (NOT direct dot-chains)
+    so early `require()` callers don't race against load order:
+    ```lua
+    -- ReplicatedStorage.AutoFpsEventDispatch (alias, emitted by PR #75)
+    return require(
+        game:GetService("ReplicatedStorage")
+            :WaitForChild("AutoGen")
+            :WaitForChild("EventDispatch")
+    )
+    ```
+
+    Overwrite policy at emit time: if a non-ModuleScript Instance
+    already exists at `ReplicatedStorage.AutoFpsEventDispatch` (a
+    user's Folder, a stale Script, a leftover BindableEvent from
+    a hand-edit), the converter logs a warning and skips the alias
+    emission for that output — the user's content wins. If an
+    existing ModuleScript is present, it's overwritten in place
+    (overwriting our own alias from a prior run is the common
+    case; overwriting a user-authored module is the same risk we
+    already accept across the converter's other auto-injected
+    modules and is documented in the conversion report).
+
     Already-converted outputs that call
     `WaitForChild("AutoFpsEventDispatch")` from their script bodies
     keep resolving. The user-script collision risk codex flagged is
