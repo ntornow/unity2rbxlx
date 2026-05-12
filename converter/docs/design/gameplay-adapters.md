@@ -312,27 +312,47 @@ This gives us:
 Codex review noted that C# substring matching is structurally the same
 problem as Luau-regex matching, one level up. To prevent future detector
 code from quietly violating "primary signal first," the detector API
-itself separates the two layers:
+itself separates the two layers AND binds detection to a SPECIFIC
+component (not the whole node — see "Detector input is a (node,
+component) pair" below):
 
 ```python
 class Detector(Protocol):
-    def primary(self, node: SceneNode) -> bool:
-        """Returns True iff Unity component composition is compatible
+    name: str
+
+    def primary(self, node: SceneNode, component: ComponentData) -> bool:
+        """Returns True iff *component*'s Unity composition is compatible
         with this behaviour. MUST NOT inspect source bodies. Composition-
-        only — Rigidbody/Collider/Animator/MonoBehaviour field shapes
-        from the parsed scene data. Tested with composition-only
-        fixtures (empty C# source)."""
-    def confirm(self, node: SceneNode, source_csharp: str) -> bool:
-        """Always called when primary() returns True. Substring/source
-        inspection lives here, named and scoped per detector. Acts as a
-        REJECTOR — returning False rules the detector out even if
-        primary() said yes. Cannot upgrade an Infeasible primary() to
-        Feasible (the API doesn't allow it)."""
-    def behavior(self, node: SceneNode, source_csharp: str) -> Behavior:
+        only — looks at component.component_type and the resolved
+        ``_script_class_name`` field populated by guid_index. Tested with
+        composition-only fixtures (empty C# source)."""
+    def confirm(
+        self, node: SceneNode, component: ComponentData, source_csharp: str,
+    ) -> bool:
+        """Always called when primary() returns True. Source is the C#
+        body of THIS component's class only. Acts as a REJECTOR —
+        returning False rules the detector out even if primary() said
+        yes. Cannot upgrade an Infeasible primary() to Feasible (the
+        API doesn't allow it)."""
+    def behavior(
+        self, node: SceneNode, component: ComponentData, source_csharp: str,
+    ) -> Behavior:
         """Build the per-instance Behavior. Receives source for VALUE
         extraction (default literals from script body), NOT for
         classification."""
 ```
+
+**Detector input is a (node, component) pair, not just a node.** Codex
+PR #73a-round-1 caught a bug in an earlier draft of this section: if a
+node carries TWO MonoBehaviours (Door + an unrelated user script), and
+the dispatcher iterated component sources while running `primary(node)`
+once per source, the unrelated script's body could `confirm` for the
+Door detector because `primary` voted yes (Door IS on the node) and
+`confirm`'s regex happens to match. Binding the protocol to a specific
+component closes that hole: `primary` checks the component's own class
+name; `confirm` reads only that component's class source. The dispatch
+in `converter.gameplay.detectors.detect` is the single enforcement
+point — every call site goes through it.
 
 Codex v3 raised a sharper concern about the earlier "tiebreaker on
 ambiguity only" form: if one detector's `primary()` is too broad, it
@@ -357,8 +377,24 @@ candidate names. Resolution is operator-driven via deny-list — no
 silent "pick the first match" heuristic.
 
 False positives are reported in `conversion_report.json` and rejectable via
-an output-dir deny-list (`<output>/.gameplay_deny.txt` — one
-`unity_file_id` per line).
+an output-dir deny-list (`<output>/.gameplay_deny.txt` — one ID per
+line; either a scene-node `unity_file_id` OR a component file_id is
+accepted, so an operator can suppress one MonoBehaviour on a multi-
+component node without losing detection on the others). The conversion
+report's `gameplay_adapters.bindings[]` entries carry `node_name`,
+`node_file_id`, `component_file_id`, `target_class_name`,
+`script_path` (absolute on disk; "relative" is a misnomer in #73a —
+the field name is `script_path` for that reason), `detector_name`,
+`diagnostic_name`, and `capability_kinds[]` (preserved in capability
+tuple order — see the dataflow contract) so an operator can write
+a deny-list line straight from the report without re-reading the
+converter. Divergent classes (per-instance shape mismatch) appear in
+`gameplay_adapters.divergent_classes[]` with `class_name`,
+`script_path`, `detail`, and structured `binding_a` / `binding_b`
+records (each carrying `node_name`, `node_file_id`,
+`component_file_id`) so the operator can deny-list either side
+precisely. Top-level counters: `total_classes_emitted` (unique by
+`script_path`), `total_classes_divergent`, and `total_bindings`.
 
 ### One runtime library per capability family
 
@@ -393,15 +429,19 @@ specifics — including how composition errors are caught at emit time, not
 runtime, and why namespacing prevents the local-variable collision problem
 that a flat shared-state approach would have.
 
-### Emit: per-instance behaviour table
+### Emit: behaviour table
 
-Per Unity scene node that matches at detection time, the converter emits a
-behaviour table and a short require-and-run stub:
+The IR is per-instance — `Behavior` carries a `unity_file_id`. PR #73a
+ships a per-class emitter with an equivalence check (see
+"Per-instance vs per-class emission" below); PR #73b extends to
+per-instance emission once a real divergent case shows up. The Lua
+form below is what the emitter writes for the matched class:
 
 ```lua
 -- TurretBullet.luau (converter-emitted; AI is skipped for matched behaviours)
-local Composer = require(game:GetService("ReplicatedStorage"):WaitForChild("AutoGen"):WaitForChild("Composer"))
-Composer.run(script.Parent, {
+local Gameplay = require(game:GetService("ReplicatedStorage"):WaitForChild("AutoGen"):WaitForChild("Gameplay"))
+local _container = script.Parent
+Gameplay.run(_container, {
     {kind = "movement.impulse", direction = Vector3.new(0, 0, 1), force = 60},
     {kind = "lifetime.despawn", seconds = 3},
     {kind = "hit_detection.raycast_segment"},
@@ -411,21 +451,84 @@ Composer.run(script.Parent, {
 
 ```lua
 -- Door.luau (per-instance — two Door prefabs with different offsets get
--- two different tables)
-local Composer = require(game:GetService("ReplicatedStorage"):WaitForChild("AutoGen"):WaitForChild("Composer"))
-Composer.run(script.Parent, {
+-- two different tables; the IIFE locates the moving door mesh from a
+-- sibling lookup with a bounded 5s wait)
+local Gameplay = require(game:GetService("ReplicatedStorage"):WaitForChild("AutoGen"):WaitForChild("Gameplay"))
+local _container = (function()
+    local _ascended = script.Parent.Parent or script.Parent
+    local _child = _ascended:WaitForChild("door", 5)
+    if _child == nil then
+        warn(string.format(
+            "[gameplay-adapter] container child %q missing under %s — adapter not bound",
+            "door", _ascended:GetFullName()
+        ))
+    end
+    return _child
+end)()
+if _container == nil then
+    warn("[gameplay-adapter] Door: container resolution returned nil, adapter not bound")
+    return
+end
+Gameplay.run(_container, {
     {kind = "trigger.on_bool_attribute", name = "open"},
     {kind = "movement.attribute_driven_tween",
-     target_offset = Vector3.new(0, 4, 0),
+     target_offset_unity = Vector3.new(0, 4, 0),
      open_duration = 1.0,
      close_duration = 1.0},
     {kind = "lifetime.persistent"},
 })
 ```
 
-The behaviour table is **per-instance data**, not class-level. Two doors
-with different open offsets get two different tables emitted. No
-`weapon_class` or `target_child_name` class-level leakage.
+Per-instance stubs require `AutoGen.Gameplay`, NOT `AutoGen.Composer`
+directly. `Gameplay` is an orchestrator ModuleScript that force-
+requires every family module (`Triggers`, `Movement`, `Lifetime`, ...)
+before re-exporting `Composer`. Stubs that hit `Composer` directly
+would race against family-registration order; the orchestrator dodge
+also avoids the cyclic-require pitfall (families require `Composer`,
+so `Composer` itself cannot require families — only the orchestrator
+can.)
+
+**Container resolution.** The `ContainerResolver` typed enum on
+`Behavior` (`self` / `ascend_then_child`) carries the per-instance
+metadata for locating the bind target. The `ascend_then_child` variant
+ALWAYS emits a bounded `:WaitForChild(name, 5)` plus a warn-and-return-
+nil path — codex PR #73a-round-1 flagged that an unbounded wait would
+deadlock the script forever on prefab drift, where the legacy door
+pack at least degraded to a no-op. The call site guards against nil
+before dispatching so a missing container doesn't poison `Gameplay.run`.
+
+**Per-instance vs per-class emission (PR #73a binding model).** The IR
+is per-instance by construction (`Behavior.unity_file_id` is the scene
+node it binds to). PR #73a emits ONE TranspiledScript per matched C#
+class plus an equivalence check that rejects divergent per-instance
+shapes:
+
+  - Within a single class, every per-node `Behavior` must share the
+    same shape (`(diagnostic_name, capabilities, container_resolver)`
+    — `unity_file_id` is intentionally excluded).
+  - If the shapes diverge, that class drops out of
+    `ClassificationResult.matches` and lands in
+    `ClassificationResult.divergent` (a tuple of
+    `DivergentClassRecord(class_name, script_path, error)`). The
+    pipeline reads `divergent` for the report; the matched class falls
+    through to the AI path because its `.cs` path was never removed
+    from `script_infos`. Per-instance distinct emission is a PR #73b
+    refinement — `classify_scripts` does NOT raise, and one divergent
+    class never disturbs another class's emission in the same pass.
+
+This keeps PR #73a small while preventing silent coalescing of distinct
+prefab variants. The conversion report still records every per-node
+binding so an operator can see all instances even when the emit is
+per-class.
+
+The behaviour table is **per-instance data**, not class-level — the
+`Behavior` IR carries `unity_file_id` and per-resolver metadata for
+each node. PR #73a emits ONE table per matched class plus an
+equivalence gate; two doors with different open offsets would land in
+`ClassificationResult.divergent` and fall back to AI today. PR #73b
+relaxes that gate by emitting one stub per scene node so genuine
+prefab-variant divergence is supported in-pipeline. Either way: no
+`weapon_class` or `target_child_name` class-level leakage in the IR.
 
 The composer reads `kind` and dispatches to the right runtime function;
 tuple order is preserved AND enforced against the capability dataflow
@@ -434,20 +537,64 @@ contract (see above) so a `hit_detection.raycast_segment` that reads
 that writes it. The composer is the only runtime entrypoint script
 consumers need to know about.
 
+### Cross-family signal handoff is on the public contract
+
+`Trigger.OnBoolAttribute` publishes two ctx slots, both declared in
+its `WRITES` set:
+
+  - `ctx.trigger.value` — the current normalized bool. Movement /
+    Effect read this synchronously to make decisions.
+  - `ctx.trigger.changed` — a BindableEvent fired AFTER each value
+    update. Downstream capabilities subscribe to it instead of
+    reaching back to the underlying Roblox attribute.
+
+The signal slot is part of the public dataflow contract, not an
+implementation backchannel. Codex PR #73a-round-1 pushed back that
+declaring a BindableEvent as just another string key understates the
+runtime coupling (BindableEvents carry type and lifetime semantics the
+validator can't see). The compromise for #73a is to surface signals
+explicitly in `WRITES` so the validator at least catches reader-after-
+writer ordering on signal subscribers. PR #73b will revisit whether
+signals should become a first-class capability output (typed
+`subscribe()` interface) rather than smuggling them through ctx.
+
 ### Pipeline integration
 
-`code_transpiler.transpile_scripts` gains a pre-AI classification step:
+`Pipeline.transpile_scripts` runs the classification step BEFORE the
+AI pass (the post-AI variant in an earlier #73a draft was reverted —
+codex PR #73a-round-1 flagged that overwriting AI output silently
+dropped matches whenever AI failed for the class):
 
-  1. For each Unity script class, run the gameplay detectors against the
-     scene-node bindings that reference that class.
-  2. For each scene node where detection returns a `Behavior`, emit the
-     per-instance stub directly (skip AI for that node).
-  3. For nodes that don't match, proceed with the existing AI path
+  1. Walk `parsed_scene.all_nodes`. For each `(node, component)` pair
+     where `component` is a MonoBehaviour with a resolvable script
+     class, run the detectors via `gameplay.integration.classify_scripts`.
+  2. Aggregate per-class. Equivalence-check every per-node `Behavior`
+     within a class (see "Per-instance vs per-class emission" above);
+     divergent classes drop out of `matches` and land in `divergent`.
+     Pipeline reads both buckets; it never catches an exception from
+     `classify_scripts`.
+  3. Build first-class `TranspiledScript` records via
+     `gameplay.integration.adapter_transpiled_scripts` and REMOVE
+     matched classes from the `script_infos` list fed to the AI
+     transpiler — no AI tokens are spent on matched classes.
+  4. Run the existing AI path on the remaining `script_infos`
      (`api_mappings.py` + `luau-analyze` reprompt loop).
+  5. Merge adapter TranspiledScripts onto the AI result. Adapter
+     scripts count under `TranspilationResult.total_gameplay_adapter`,
+     NOT `total_rule_based` — the strategies are distinct and the
+     conversion report's `scripts.counts` exposes both buckets so
+     downstream phases see honest accounting.
 
-The same `.cs` class can yield different stubs at different scene nodes if
-the prefab overrides (force, damage) differ — the detector reads per-node
-attributes.
+The pre-AI shape means a STABLE detector match (one that survives the
+per-class equivalence gate) is guaranteed to produce an adapter
+artifact — AI failure can no longer silently drop it. Divergent
+classes still fall back to AI, where AI failure is the only failure
+mode and is surfaced via ``conversion_report.json``'s
+``gameplay_adapters.divergent_classes[]``.
+
+The same `.cs` class can yield different stubs at different scene nodes
+once PR #73b enables per-instance emission; PR #73a's equivalence check
+makes the silent-coalescing failure mode loud.
 
 ### Genre neutrality
 
@@ -477,18 +624,50 @@ codex pushback on PR #72 sharpened the slicing and added two cuts):
   - **PR #72 (this):** design doc only.
 
   - **PR #73a:** framework + door vertical slice.
-    - CLI flag (default off).
-    - `Behavior` IR, capability dataclasses, ClassVar `READS`/`WRITES`,
-      emit-time validator (single-writer-per-key, reader-after-writer).
-    - Detector Protocol (`primary()` / `confirm()` / `behavior()`) +
-      `AmbiguousDetectionError`. Contract test that empty C# source
-      doesn't change `primary()` results.
-    - Composer (Lua) + family registry + `_GameplayBound` marker.
+    - CLI flag (default off). Persisted on
+      `ConversionContext.use_gameplay_adapters`; constructor snapshot
+      survives the resume() ctx swap.
+    - `Behavior` IR with `ContainerResolver` (`self` /
+      `ascend_then_child`), capability dataclasses, ClassVar
+      `READS`/`WRITES`, emit-time validator (single-writer-per-key,
+      reader-after-writer, namespace check).
+    - Detector Protocol with component-level binding
+      (`primary(node, component)` / `confirm(node, component, source)` /
+      `behavior(node, component, source)`) + `AmbiguousDetectionError`
+      carrying both node and component file_ids. Contract test that
+      empty C# source doesn't change `primary()` results.
+    - Pre-AI classification pipeline: `classify_scripts` runs against
+      the parsed scene BEFORE the AI transpiler; matched classes are
+      removed from the AI input list and replaced with first-class
+      `TranspiledScript`s. AI-failure no longer silently drops matches.
+    - Per-class emission with per-instance equivalence check:
+      `DivergentBehaviorsError` raises (and falls back to AI) when one
+      class produces non-equivalent Behaviors across nodes.
+    - Composer (Lua) + family registry + `_GameplayBound` marker, plus
+      a `Gameplay` orchestrator ModuleScript that force-requires every
+      family module to dodge the cyclic-require pitfall. Per-instance
+      stubs require `AutoGen.Gameplay`, never `AutoGen.Composer`
+      directly.
+    - Bounded `WaitForChild` (5s) + warn-and-return-nil path in
+      `ascend_then_child` resolver; call-site nil-guard before
+      `Gameplay.run`. Prefab drift no longer deadlocks script init.
     - Door slice end-to-end: `Trigger.OnBoolAttribute`,
-      `Movement.AttributeDrivenTween`, `Lifetime.Persistent`.
-    - Deny-list plumbing (`<output>/.gameplay_deny.txt`).
+      `Movement.AttributeDrivenTween`, `Lifetime.Persistent`. Trigger
+      publishes both `ctx.trigger.value` and `ctx.trigger.changed`
+      (BindableEvent) on `WRITES`; Movement subscribes via the signal.
+    - Mutual exclusion: `door_tween_open` legacy coherence pack is
+      force-disabled whenever the flag is on. Intentional rollout
+      posture — deny-listed nodes don't fall back to legacy.
+    - Runtime modules emitted under `ReplicatedStorage.AutoGen.<Name>`
+      via lazy Folder creation in `rbxlx_writer` (parent_path now
+      supports dotted paths).
+    - Deny-list plumbing (`<output>/.gameplay_deny.txt`): one ID per
+      line, accepts either a scene-node file_id OR a component file_id
+      so an operator can suppress one component on a multi-component
+      node without losing the others.
     - Cross-family contract tests — the door alone exercises
-      Trigger→Movement handoff via `ctx.trigger.value`.
+      Trigger→Movement handoff via `ctx.trigger.value` and
+      `ctx.trigger.changed`.
 
   - **PR #73b:** projectile vertical slice.
     - `Movement.Impulse`, `Lifetime.Despawn`,

@@ -207,11 +207,20 @@ def inject_require_calls(
     return injected
 
 
-def fix_require_classifications(scripts: list[RbxScript]) -> int:
+def fix_require_classifications(
+    scripts: list[RbxScript],
+    *,
+    disabled_packs: frozenset[str] = frozenset(),
+) -> int:
     """Reclassify scripts that are require()'d by other scripts as ModuleScripts.
 
     Also reclassifies scripts that return a table/function at the end
     (ModuleScript pattern) but were classified as Script.
+
+    ``disabled_packs`` is forwarded to ``script_coherence_packs.run_packs``
+    so gameplay-adapter coverage can suppress the legacy coherence
+    packs it replaces (see PR #73a — mutual exclusion at pipeline level
+    per the design doc).
 
     Returns the number of scripts reclassified.
     """
@@ -343,7 +352,7 @@ def fix_require_classifications(scripts: list[RbxScript]) -> int:
     # so non-FPS projects (Gamekit3D, BoatAttack, etc.) don't have FPS
     # rifle code injected into their scripts.
     from converter.script_coherence_packs import run_packs
-    fixes += run_packs(scripts)
+    fixes += run_packs(scripts, disabled=set(disabled_packs))
 
     # Pass 17: Remove require(Player) from scripts that reference it —
     # Player is now a LocalScript, not in ReplicatedStorage.

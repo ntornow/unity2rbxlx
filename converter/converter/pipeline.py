@@ -29,6 +29,7 @@ from core.unity_types import (
 from core.roblox_types import RbxPlace
 from converter.animation_converter import AnimationConversionResult
 from converter.code_transpiler import TranspilationResult
+from converter.gameplay.integration import GameplayMatch
 from converter.material_mapper import MaterialMapping
 from converter.scriptable_object_converter import AssetConversionResult
 from converter.sprite_extractor import SpriteExtractionResult
@@ -48,6 +49,56 @@ PHASES: list[str] = [
     "convert_scene",
     "write_output",
 ]
+
+
+def _place_carries_adapter_marker(rbx_place: "RbxPlace | None") -> bool:
+    """Return True when any script anywhere in *rbx_place* carries the
+    gameplay-adapter structural marker on its first line.
+
+    The marker (``ADAPTER_STUB_MARKER`` from
+    :mod:`converter.gameplay.composer`) is deliberately distinctive
+    so user comments / string literals can't false-positive. Codex
+    PR #73a-round-4 flagged that an earlier in-place inline scan only
+    walked workspace parts; this helper traverses every script-
+    bearing surface so rehydrate-path runtime-module injection sees
+    template-attached stubs too:
+
+      * ``rbx_place.scripts`` — service-parented scripts that
+        ``_bind_scripts_to_parts`` left in the global list.
+      * ``rbx_place.workspace_parts`` — recursive walk over parts and
+        their children, picking up bound Script-typed stubs.
+      * ``rbx_place.replicated_templates`` — recursive walk over
+        prefab template parts (``_attach_monobehaviour_scripts_to_templates``
+        copies adapter Scripts onto each template's tree).
+
+    Pure read; safe for any caller (write_output, tests, future
+    diagnostics). Returns False on a None / empty place rather than
+    raising.
+    """
+    from converter.gameplay.composer import ADAPTER_STUB_MARKER
+
+    if rbx_place is None:
+        return False
+
+    def _has_marker(script: Any) -> bool:
+        src = getattr(script, "source", None) or ""
+        return ADAPTER_STUB_MARKER in src
+
+    def _walk(parts: list) -> bool:
+        for part in parts:
+            for s in getattr(part, "scripts", None) or []:
+                if _has_marker(s):
+                    return True
+            if _walk(getattr(part, "children", None) or []):
+                return True
+        return False
+
+    for s in getattr(rbx_place, "scripts", None) or []:
+        if _has_marker(s):
+            return True
+    if _walk(getattr(rbx_place, "workspace_parts", None) or []):
+        return True
+    return _walk(getattr(rbx_place, "replicated_templates", None) or [])
 
 
 def _carry_unconverted(
@@ -103,6 +154,15 @@ class PipelineState:
     dependency_map: dict[str, list[str]] = field(default_factory=dict)
     scriptable_objects: AssetConversionResult | None = None
     sprite_result: SpriteExtractionResult | None = None
+    # Gameplay-adapter matches recorded during transpile_scripts when
+    # ``ctx.use_gameplay_adapters`` is True. Consumed by the report
+    # generator and the legacy-pack suppression check downstream.
+    gameplay_matches: list[GameplayMatch] = field(default_factory=list)
+    # Classes that the adapter pass classified but dropped because the
+    # per-instance Behaviors diverged. Pipeline lets AI handle these;
+    # the report surfaces the reason so operators understand why a
+    # class they expected to be adapter-handled was left alone.
+    gameplay_divergent_classes: list[object] = field(default_factory=list)
 
 
 class Pipeline:
@@ -125,6 +185,7 @@ class Pipeline:
         skip_upload: bool = False,
         skip_binary_rbxl: bool = False,
         scaffolding: frozenset[str] | None = None,
+        use_gameplay_adapters: bool = False,
     ) -> None:
         self.unity_project_path = self._find_unity_root(Path(unity_project_path).resolve())
         self.output_dir = Path(output_dir or OUTPUT_DIR).resolve()
@@ -167,6 +228,15 @@ class Pipeline:
             # fires here too — otherwise a typo'd
             # ``Pipeline(scaffolding=["fsps"])`` would persist silently.
             self.apply_scaffolding(self._init_scaffolding)
+
+        # Gameplay-adapter rollout flag (PR #73a). Snapshotted at
+        # construction so resume() (which replaces ``self.ctx`` from
+        # disk) doesn't silently drop a flag passed via constructor.
+        # The snapshot is reapplied to ``self.ctx`` after rehydration —
+        # see ``resume`` for the matching application.
+        self._init_use_gameplay_adapters: bool = bool(use_gameplay_adapters)
+        if self._init_use_gameplay_adapters:
+            self.ctx.use_gameplay_adapters = True
 
         # ``_fps_artifacts_at_init`` caches the backward-compat
         # migration signal BEFORE ``_subphase_emit_scripts_to_disk``
@@ -648,6 +718,13 @@ class Pipeline:
             # persisted entries are kept, the new request adds to them.
             if self._init_scaffolding:
                 self.apply_scaffolding(self._init_scaffolding)
+            # Re-apply the constructor's gameplay-adapter request after
+            # the ctx swap so resumed builds (``u2r.py publish`` rebuild,
+            # ``u2r.py convert --phase ... --use-gameplay-adapters``)
+            # honour the flag even if the persisted ctx was written
+            # before adapters existed. Additive — once True, stays True.
+            if self._init_use_gameplay_adapters:
+                self.ctx.use_gameplay_adapters = True
 
         log.info("=== Resuming pipeline from phase '%s' ===", phase)
         self.run_through(phase, run_after=True)
@@ -1522,7 +1599,17 @@ class Pipeline:
         """Phase 4: Transpile C# scripts to Luau."""
         log.info("[transpile_scripts] Analyzing scripts ...")
         from unity.script_analyzer import analyze_all_scripts  # type: ignore[import-untyped]
-        from converter.code_transpiler import transpile_scripts  # type: ignore[import-untyped]
+        from converter.code_transpiler import (  # type: ignore[import-untyped]
+            TranspiledScript,
+            transpile_scripts,
+        )
+
+        # Reset adapter state at the top of every transpile pass.
+        # Without this, a prior run's matches/divergences poison the
+        # current report and the rehydrate-marker scan — codex
+        # PR #73a-round-3 flagged the leak.
+        self.state.gameplay_matches = []
+        self.state.gameplay_divergent_classes = []
 
         script_infos = analyze_all_scripts(self.unity_project_path)
         self.ctx.total_scripts = len(script_infos)
@@ -1531,7 +1618,73 @@ class Pipeline:
             log.info("[transpile_scripts] No runtime scripts found")
             return
 
-        # Build cross-script dependency map from type references
+        # Gameplay adapters (PR #73a): classify BEFORE AI. Matched
+        # classes are removed from the AI input list and replaced
+        # with first-class TranspiledScript artifacts whose body is
+        # the per-instance Composer.run stub. Pre-AI classification
+        # closes the codex-flagged hole where a post-AI overwrite
+        # silently dropped matches whenever AI failed to produce an
+        # output for the class.
+        adapter_scripts: list[TranspiledScript] = []
+        adapter_gameplay_matches: list[GameplayMatch] = []
+        if self.ctx.use_gameplay_adapters:
+            from converter.gameplay.integration import (
+                adapter_transpiled_scripts,
+                classify_scripts,
+            )
+            from converter.gameplay.detectors import load_deny_list
+
+            deny_list = load_deny_list(str(self.output_dir))
+            # Per-class divergence is now recorded inside classify_scripts
+            # and lives on ``classification.divergent`` — one divergent
+            # class no longer zeroes the whole pass. The pipeline lets
+            # AI handle divergent classes by leaving them in
+            # ``script_infos`` (their .cs path isn't in ``skip_paths``).
+            classification = classify_scripts(
+                parsed_scene=self.state.parsed_scene,
+                guid_index=self.state.guid_index,
+                script_infos=script_infos,
+                deny_list=deny_list,
+            )
+            if classification.matches:
+                adapter_scripts, adapter_gameplay_matches = (
+                    adapter_transpiled_scripts(
+                        classification=classification,
+                        transpiled_script_cls=TranspiledScript,
+                    )
+                )
+                # Remove matched classes from the AI input list — they
+                # already have a TranspiledScript via the adapter path,
+                # and AI tokens spent on them would be both wasted and
+                # potentially overwritten in confusing ways.
+                skip_paths = {p.resolve() for p in classification.skip_paths}
+                script_infos = [
+                    si for si in script_infos
+                    if Path(si.path).resolve() not in skip_paths
+                ]
+                log.info(
+                    "[transpile_scripts] gameplay-adapters: %d "
+                    "class(es) classified pre-AI; %d total bindings "
+                    "across scene nodes",
+                    len(adapter_scripts),
+                    len(adapter_gameplay_matches),
+                )
+            if classification.divergent:
+                self.state.gameplay_divergent_classes = list(
+                    classification.divergent,
+                )
+                log.warning(
+                    "[transpile_scripts] gameplay-adapters: %d class(es) "
+                    "fell back to AI due to divergent per-instance "
+                    "behaviour: %s",
+                    len(classification.divergent),
+                    ", ".join(d.class_name for d in classification.divergent),
+                )
+
+        # Build cross-script dependency map from type references —
+        # restricted to the AI input list so deps to adapter-handled
+        # classes are dropped (their .luau is emitted by the adapter
+        # path and doesn't need cross-script require injection).
         project_classes = {si.class_name for si in script_infos if si.class_name}
         for si in script_infos:
             if si.class_name and si.referenced_types:
@@ -1550,6 +1703,23 @@ class Pipeline:
             api_key=_config.ANTHROPIC_API_KEY,
             serialized_field_refs=self.ctx.serialized_field_refs or None,
         )
+        # Merge adapter-emitted TranspiledScripts onto the result.
+        # Counted under ``total_gameplay_adapter`` rather than
+        # ``total_rule_based`` — the strategies are distinct and the
+        # ConversionReport surfaces both.
+        if adapter_scripts:
+            self.state.transpilation_result.scripts.extend(adapter_scripts)
+            self.state.transpilation_result.total_transpiled += len(adapter_scripts)
+            self.state.transpilation_result.total_gameplay_adapter += len(adapter_scripts)
+            self.state.gameplay_matches = adapter_gameplay_matches
+            log.info(
+                "[transpile_scripts] gameplay-adapters: %s",
+                ", ".join(
+                    f"{m.diagnostic_name}@{m.node_name}({m.unity_file_id})"
+                    for m in adapter_gameplay_matches
+                ),
+            )
+
         self.ctx.transpiled_scripts = self.state.transpilation_result.total_transpiled
         log.info(
             "[transpile_scripts] %d / %d scripts transpiled",
@@ -2205,7 +2375,19 @@ return table.concat(allData, "\\n")'''
 
         # Post-transpilation: fix script types based on cross-script dependencies.
         from converter.script_coherence import fix_require_classifications
-        fixes = fix_require_classifications(self.state.rbx_place.scripts)
+        # Mutual exclusion with legacy coherence packs: when the
+        # gameplay adapters covered a behaviour (e.g. door tween), the
+        # matching legacy pack must NOT also run — they'd fight over
+        # the same scripts and double-bind (codex pushback on PR #72).
+        # PR #73a covers ``door_tween_open`` only; #73b/c add the
+        # bullet + damage packs to this list.
+        disabled_packs: frozenset[str] = frozenset()
+        if self.ctx.use_gameplay_adapters:
+            disabled_packs = frozenset({"door_tween_open"})
+        fixes = fix_require_classifications(
+            self.state.rbx_place.scripts,
+            disabled_packs=disabled_packs,
+        )
         if fixes:
             log.info("[write_output] Reclassified %d scripts based on require() dependencies", fixes)
 
@@ -2905,6 +3087,7 @@ script.Disabled = true
         from converter.report_generator import (
             ConversionReport, AssetSummary, ScriptSummary, MaterialSummary,
             ComponentSummary, SceneSummary, OutputSummary,
+            GameplayAdapterSummary, GameplayAdapterBinding,
         )
         script_types = {"Script": 0, "LocalScript": 0, "ModuleScript": 0}
         for s in (self.state.rbx_place.scripts or []):
@@ -2921,6 +3104,10 @@ script.Disabled = true
                     selected_scene = p.name
             else:
                 selected_scene = str(p)
+
+        gameplay_summary = self._build_gameplay_adapter_summary(
+            GameplayAdapterSummary, GameplayAdapterBinding,
+        )
 
         return ConversionReport(
             unity_project_path=str(self.unity_project_path),
@@ -2948,6 +3135,68 @@ script.Disabled = true
                 scripts_in_place=result.get("scripts_written", 0),
                 report_path=str(report_path),
             ),
+            gameplay_adapters=gameplay_summary,
+        )
+
+    def _build_gameplay_adapter_summary(
+        self, summary_cls: type, binding_cls: type,
+    ) -> Any:
+        """Render ``state.gameplay_matches`` and divergent classes (if
+        any) into the ConversionReport section. Codex PR #73a-round-2
+        flagged that the doc promised operator-friendly fields with
+        no serialization path; this is that path.
+        """
+        from converter.report_generator import (
+            GameplayAdapterDivergence,
+            GameplayAdapterDivergentBinding,
+        )
+
+        matches = self.state.gameplay_matches or []
+        bindings = [
+            binding_cls(
+                detector_name=m.detector_name,
+                diagnostic_name=m.diagnostic_name,
+                target_class_name=m.target_class_name,
+                node_name=m.node_name,
+                node_file_id=m.node_file_id,
+                component_file_id=m.component_file_id,
+                script_path=m.script_path,
+                capability_kinds=list(m.capability_kinds),
+            )
+            for m in matches
+        ]
+        # Same-named classes from different .cs files are distinct;
+        # identity is the absolute script_path. Codex PR #73a-round-3
+        # flagged that counting unique class_name silently merged them.
+        unique_emitted_paths = {m.script_path for m in matches}
+        divergent_records = getattr(
+            self.state, "gameplay_divergent_classes", [],
+        ) or []
+
+        def _render_divergent_binding(node_binding: Any) -> Any:
+            return GameplayAdapterDivergentBinding(
+                node_name=getattr(node_binding, "node_name", ""),
+                node_file_id=getattr(node_binding, "unity_file_id", ""),
+                component_file_id=getattr(node_binding, "component_file_id", ""),
+            )
+
+        divergent = [
+            GameplayAdapterDivergence(
+                class_name=d.class_name,
+                script_path=str(d.script_path),
+                detail=str(d.error),
+                binding_a=_render_divergent_binding(d.error.binding_a),
+                binding_b=_render_divergent_binding(d.error.binding_b),
+            )
+            for d in divergent_records
+        ]
+        return summary_cls(
+            enabled=bool(self.ctx.use_gameplay_adapters),
+            total_classes_emitted=len(unique_emitted_paths),
+            total_classes_divergent=len(divergent),
+            total_bindings=len(bindings),
+            bindings=bindings,
+            divergent_classes=divergent,
         )
 
     # Marker substrings that identify converter-emitted scripts.
@@ -3539,6 +3788,64 @@ script.Disabled = true
         )
         if has_pool:
             modules_to_inject.append(("ObjectPool", "object_pool.luau"))
+
+        # Gameplay-adapter runtime (PR #73a): inject the composer +
+        # family modules under ReplicatedStorage.AutoGen so per-instance
+        # stubs that ``require(...AutoGen.Gameplay)`` can resolve.
+        # Trigger logic:
+        #   - Fresh conversion: ``state.gameplay_matches`` is populated
+        #     by transpile_scripts.
+        #   - Rehydrate / publish rebuild: ``state.gameplay_matches`` is
+        #     empty (it wasn't persisted) but adapter stubs may already
+        #     exist on disk. By this point ``_bind_scripts_to_parts``
+        #     has copied each Script-typed stub onto target
+        #     ``part.scripts`` and ``_attach_monobehaviour_scripts_to_templates``
+        #     has also copied them under each
+        #     ``rbx_place.replicated_templates`` tree. The scan helper
+        #     ``_place_carries_adapter_marker`` walks every script-
+        #     bearing surface (globals, workspace, templates) — codex
+        #     PR #73a-round-4 caught the missing templates traversal.
+        adapter_stubs_present = bool(self.state.gameplay_matches) or (
+            _place_carries_adapter_marker(self.state.rbx_place)
+        )
+        if self.ctx.use_gameplay_adapters and adapter_stubs_present:
+            from core.roblox_types import RbxScript as _GpRbxScript
+            gameplay_runtime_dir = (
+                Path(__file__).parent.parent / "runtime" / "gameplay"
+            )
+            # Filename → ModuleScript name. The Gameplay orchestrator is
+            # the entry point; family modules and Composer are siblings
+            # under ReplicatedStorage.AutoGen.
+            gameplay_modules: tuple[tuple[str, str], ...] = (
+                ("Composer", "composer.luau"),
+                ("Triggers", "triggers.luau"),
+                ("Movement", "movement.luau"),
+                ("Lifetime", "lifetime.luau"),
+                ("Gameplay", "gameplay.luau"),
+            )
+            for module_name, filename in gameplay_modules:
+                module_path = gameplay_runtime_dir / filename
+                if not module_path.exists():
+                    log.warning(
+                        "[write_output] gameplay-adapter module missing: %s",
+                        module_path,
+                    )
+                    continue
+                # Avoid duplicate injection across re-runs of write_output.
+                existing = [
+                    s for s in self.state.rbx_place.scripts
+                    if s.name == module_name
+                    and s.parent_path == "ReplicatedStorage.AutoGen"
+                ]
+                if existing:
+                    continue
+                self.state.rbx_place.scripts.append(_GpRbxScript(
+                    name=module_name,
+                    source=module_path.read_text(encoding="utf-8"),
+                    script_type="ModuleScript",
+                    parent_path="ReplicatedStorage.AutoGen",
+                ))
+                injected += 1
 
         # PickupRuntime removed — pickup scripts are now properly propagated
         # from base prefabs to variants via _bind_scripts_to_parts cloning.

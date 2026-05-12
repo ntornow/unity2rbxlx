@@ -118,6 +118,13 @@ class ConversionContext:
     # is empty.
     scaffolding: list[str] = field(default_factory=list)
 
+    # Gameplay-adapter rollout flag (PR #73a). When True, the gameplay
+    # detectors run during transpile and replace the matching legacy
+    # ``script_coherence_packs`` packs. Default False until PR #74
+    # flips it. Persisted so resumed builds use the same path the
+    # original conversion picked.
+    use_gameplay_adapters: bool = False
+
     def __post_init__(self) -> None:
         # JSON load via `cls(**data)` populates storage_plan as a dict (the
         # asdict() form). Reconstruct it as a StoragePlan when present so the
