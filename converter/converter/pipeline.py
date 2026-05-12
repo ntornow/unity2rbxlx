@@ -3884,6 +3884,14 @@ script.Disabled = true
                 # the first ``Composer.run`` call.
                 ("HitDetection", "hit_detection.luau"),
                 ("Effects", "effects.luau"),
+                # PR #73c: DamageProtocol owns the ``DamageEvent``
+                # RemoteEvent + server-side validator (origin replay,
+                # distance gate, value-preserving attribute mirror).
+                # Replaces the legacy ``_AutoDamageEventRouter`` Script
+                # that ``player_damage_remote_event`` emitted; the body-
+                # patch half of that pack still runs to inject
+                # ``FireServer`` into Player LocalScripts.
+                ("DamageProtocol", "damage_protocol.luau"),
                 ("Gameplay", "gameplay.luau"),
             )
             for module_name, filename in gameplay_modules:

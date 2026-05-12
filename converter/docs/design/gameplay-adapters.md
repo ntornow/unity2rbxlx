@@ -69,6 +69,35 @@ records under `converter/converter/gameplay/capabilities.py`:
     - `SpawnTemplate(name)` — clone `ReplicatedStorage.Templates.<name>`
       at impact (e.g. `Explosion`)
     - `ApplyAttribute(name, value)` — generic attribute write on hit target
+
+**`Effect.Damage` runtime contract** (added to the doc in PR #73c —
+codex PR #73b round-1 [P1] flagged that both invariants below are
+load-bearing and were previously implicit). Binding on implementers,
+tested in `tests/test_gameplay_adapters_projectile.py::TestDamagePlayerFilter`:
+
+  - **Player-tag gate.** ``Effects.damage`` applies damage ONLY when
+    the hit Instance's ancestor model is recognised as a Player.
+    Three-way check: (a) `Players:GetPlayerFromCharacter(model)`
+    resolves to a real Player; OR (b) the hit Instance carries the
+    `"Player"` CollectionService tag; OR (c) the model is named
+    `"Player"` (test scaffolding + the auto-injected FPS character).
+    Any one match means damage applies. Mirrors Unity
+    `TurretBullet.cs`'s `other.collider.tag == "Player"` filter —
+    NPCs / allied Humanoids MUST NOT take damage from a TurretBullet,
+    or any project with friendly characters regresses. The check is
+    inside `Effects.damage`'s impact subscription, indent-scoped so
+    a future refactor that wraps the damage call in a different
+    conditional fails the test gate.
+  - **Despawn-on-any-impact.** The bullet container is destroyed on
+    every impact — Player damage, non-Player Humanoid, OR wall hit.
+    Without this, raycast bullets persist past their first hit and
+    can damage multiple targets in a single frame, or worse, fly on
+    forever as ghost particles. The destroy call sits OUTSIDE the
+    `if isPlayer` branch so wall hits also clean up the container.
+    `Effect.Splash` and `Effect.SpawnTemplate` follow the same
+    pattern; whichever Effect runs LAST in the tuple owns the
+    `container:Destroy` (validator-enforced ordering ensures exactly
+    one destroyer).
   - **Trigger**
     - `OnEnter(tag_or_attribute_filter)` — `OnTriggerEnter` with tag match
     - `OnBoolAttribute(name)` — Animator-bool, e.g. door's `open`; publishes
@@ -380,7 +409,27 @@ False positives are reported in `conversion_report.json` and rejectable via
 an output-dir deny-list (`<output>/.gameplay_deny.txt` — one ID per
 line; either a scene-node `unity_file_id` OR a component file_id is
 accepted, so an operator can suppress one MonoBehaviour on a multi-
-component node without losing detection on the others). The conversion
+component node without losing detection on the others).
+
+**Deny-list entry forms (PR #73b — qualified form added in PR #73c
+doc-update):**
+
+  - **Bare `<file_id>`** — matches across every source that carries
+    that ID. The original PR #73a form. Still supported for backward
+    compatibility, but ambiguous after PR #73b's prefab walk.
+  - **Qualified `<source_path>#<file_id>`** — matches the file_id only
+    when it appears under the given absolute source path. Required
+    when two prefab assets share a local file_id (Unity's local IDs
+    are not globally unique across `.prefab` files; PR #73b prefab
+    walking made `&100000` a routine collision in SimpleFPS).
+
+A multi-match `AmbiguousDetectionError` log line surfaces all three
+deny-list forms an operator can paste — bare node_file_id, bare
+component_file_id, and the qualified `<source_path>#<id>` shape — so
+suppressing one specific prefab doesn't require an extra round trip
+to find the source path. Both forms can coexist in a single
+`.gameplay_deny.txt`; whichever matches first wins. Lines beginning
+with `#` are comments. The conversion
 report's `gameplay_adapters.bindings[]` entries carry `node_name`,
 `node_file_id`, `component_file_id`, `target_class_name`,
 `script_path` (absolute on disk; "relative" is a misnomer in #73a —
@@ -565,9 +614,30 @@ AI pass (the post-AI variant in an earlier #73a draft was reverted —
 codex PR #73a-round-1 flagged that overwriting AI output silently
 dropped matches whenever AI failed for the class):
 
-  1. Walk `parsed_scene.all_nodes`. For each `(node, component)` pair
-     where `component` is a MonoBehaviour with a resolvable script
-     class, run the detectors via `gameplay.integration.classify_scripts`.
+  1. Walk `parsed_scene.all_nodes` **AND every prefab template root**
+     in `prefab_library.prefabs[].root`. For each `(node, component)`
+     pair where `component` is a MonoBehaviour with a resolvable script
+     class, run the detectors via
+     `gameplay.integration.classify_scripts`. Every binding carries the
+     absolute `source_path` of the scene or prefab it came from so
+     deny-list checks (and operator reports) can disambiguate across
+     prefab assets that share local file_ids.
+
+     **Prefab traversal rationale** (added to the doc in PR #73c —
+     this load-bearing detail was missing from the #73a/#73b drafts).
+     Many Unity behaviours (doors, bullets, pickups) live exclusively
+     on `.prefab` roots and are instantiated at runtime by other
+     scripts (`Turret.cs` does `Instantiate(bulletPrefab)`); the
+     `main.unity` scene file itself carries no MonoBehaviour for them.
+     Without the prefab walk, neither the door slice (PR #73a) nor the
+     projectile slice (PR #73b) would fire end-to-end on a real
+     SimpleFPS conversion — the matched `.luau` is attached to the
+     prefab template part in `ReplicatedStorage.Templates.<name>`, so
+     every runtime clone (`Instantiate` → `Clone()` in Roblox)
+     inherits the adapter stub. PR #73b's prefab-walk extension
+     retroactively made PR #73a's door slice actually fire too —
+     SciFi_Door's MonoBehaviour also lives on the prefab template,
+     not the scene root.
   2. Aggregate per-class. Equivalence-check every per-node `Behavior`
      within a class (see "Per-instance vs per-class emission" above);
      divergent classes drop out of `matches` and land in `divergent`.
@@ -678,14 +748,40 @@ codex pushback on PR #72 sharpened the slicing and added two cuts):
     - End-to-end smoke: SimpleFPS bullet behaviour matches the legacy
       pack output side-by-side (regression diff on rbxlx).
 
-  - **PR #73c:** damage routing + cross-project smokes.
-    - `damage_protocol.luau` — client and server halves in one file.
-      Value-preserving (server mirrors client's payload verbatim,
-      coerces non-scalar to `true`), camera-origin replay, distance
-      gate, `AmbiguousDetectionError` on multi-match.
+  - **PR #73c:** damage routing + cross-project smokes + design-doc
+    catch-up.
+    - `damage_protocol.luau` — client and server halves in one file
+      under `runtime/gameplay/`. Owns `ReplicatedStorage.DamageEvent`
+      end-to-end: server-side `OnServerEvent` handler with type
+      guards → origin drift gate (`MAX_ORIGIN_DRIFT_STUDS = 20`) →
+      raycast replay from the client-supplied camera origin + dir →
+      distance gate via `MAX_SHOOT_RANGE_STUDS = 100m·3.571·1.5` →
+      value-preserving attribute mirror (non-scalar payloads coerce
+      to `true` so a malicious table can't crash `SetAttribute`).
+      Force-required by the `Gameplay` orchestrator; the legacy
+      `player_damage_remote_event` coherence pack's body-patch half
+      still runs (Player.cs LocalScripts still need their inline
+      `FireServer` call), but the legacy `_AutoDamageEventRouter`
+      Script is no longer emitted when adapter stubs are present, and
+      any stale legacy router from a prior adapters-off conversion is
+      removed so the two paths don't double-bind `OnServerEvent`.
     - Cross-project smoke matrix: SimpleFPS + Gamekit3D + ChopChop.
-      Each project's detectors run; the matches table is golden-tested
-      so detector regressions on non-FPS projects fail CI.
+      Two layers — real-source classification when the project tree
+      is checked out (pins TurretBullet / PlaneBullet / Door for
+      SimpleFPS; pins ZERO matches across Gamekit3D and ChopChop),
+      plus always-on synthetic-fixture rejection tests so developer
+      machines without the full `test_projects/` tree still catch
+      detector regressions. A detector inventory pin
+      (`ALL_DETECTORS` exact set) forces an explicit decision about
+      cross-project coverage whenever a new detector ships.
+    - Design-doc updates deferred from #73a/#73b: (a) prefab-template
+      walk in `classify_scripts` (the load-bearing detail that made
+      doors and bullets actually fire end-to-end on SimpleFPS); (b)
+      qualified `<source_path>#<file_id>` deny-list form alongside
+      the bare-file_id form (PR #73b made bare IDs ambiguous across
+      prefab assets); (c) `Effect.Damage` runtime contract (Player-
+      tag gate + despawn-on-any-impact). All three were already
+      shipped in code in #73b — PR #73c brings the doc into sync.
 
   - **PR #74:** flip default ON.
     - `--use-gameplay-adapters` defaults true.
