@@ -65,6 +65,12 @@ class TranspilationResult:
     total_ai: int = 0
     total_failed: int = 0
     total_flagged: int = 0
+    # Scripts produced by the gameplay-adapter pipeline
+    # (``strategy="gameplay_adapter"``). Tracked separately from
+    # rule_based so the accounting matches the doc — codex
+    # PR #73a-round-2 flagged that lumping them into rule_based was
+    # quietly false advertising.
+    total_gameplay_adapter: int = 0
     # Orphan :GetAttribute() reads found by the post-transpile shared-state
     # linter, in UNCONVERTED.md entry shape ({category, item, reason}).
     shared_state_warnings: list[dict[str, str]] = field(default_factory=list)
@@ -76,6 +82,7 @@ class TranspilationResult:
             "total": self.total_transpiled,
             "rule_based": self.total_rule_based,
             "ai": self.total_ai,
+            "gameplay_adapter": self.total_gameplay_adapter,
             "failed": self.total_failed,
             "flagged": self.total_flagged,
         }

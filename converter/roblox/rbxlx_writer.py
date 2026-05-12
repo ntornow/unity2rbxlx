@@ -1623,10 +1623,45 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, int]:
         "StarterPlayer.StarterCharacterScripts": starter_char_scripts_item,
         "StarterGui": starter_gui,
     }
+
+    def _resolve_nested_folder(path: str) -> ET.Element | None:
+        """Resolve a dotted parent_path that descends through Folder
+        children of a known top-level service. Currently used by the
+        gameplay-adapter pipeline to land its runtime modules under
+        ``ReplicatedStorage.AutoGen.<name>`` — Folder children are
+        created lazily and reused across calls.
+
+        Returns ``None`` if the head of the path doesn't resolve to a
+        known service, in which case the caller falls back to
+        script_type heuristics.
+        """
+        parts = path.split(".")
+        cur = _container_by_path.get(parts[0])
+        if cur is None:
+            return None
+        for segment in parts[1:]:
+            # Look for an existing Folder with this name; create one
+            # if not. Other class names take the first match by name.
+            child = None
+            for item in cur.findall("Item"):
+                name_el = item.find("Properties/string[@name='Name']")
+                if name_el is not None and name_el.text == segment:
+                    child = item
+                    break
+            if child is None:
+                child, _ = _make_item(cur, "Folder", segment)
+            cur = child
+        return cur
+
     for script in scripts:
         stype = getattr(script, "script_type", "Script")
         parent_path = getattr(script, "parent_path", None)
         target = _container_by_path.get(parent_path) if parent_path else None
+        if target is None and parent_path and "." in parent_path:
+            # Dotted paths (e.g. "ReplicatedStorage.AutoGen") route
+            # through the nested-folder resolver, which lazily creates
+            # the intermediate Folder instances.
+            target = _resolve_nested_folder(parent_path)
         if target is None:
             # Fallback: script_type-based heuristic (legacy path for scripts
             # without a storage plan, e.g. hand-edited rehydration).

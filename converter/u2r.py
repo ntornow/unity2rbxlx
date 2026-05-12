@@ -257,6 +257,14 @@ def main(verbose: bool) -> None:
               "HUDController). Default: none — the converter makes no "
               "game-genre assumptions and only emits scaffolding when "
               "explicitly requested.")
+@click.option("--use-gameplay-adapters", is_flag=True,
+              help="Route door / projectile / damage patterns through "
+              "the gameplay-adapter pipeline (composition-based "
+              "detectors + Lua runtime composer) instead of the legacy "
+              "``script_coherence_packs`` regex packs. PR #73a slice: "
+              "door behaviour only. Default off — PR #74 flips this "
+              "on by default. Mutually exclusive with the legacy door "
+              "pack at pipeline level.")
 def convert(
     unity_project: str,
     output: str,
@@ -270,6 +278,7 @@ def convert(
     universe_id: int | None,
     place_id: int | None,
     scaffolding: str | None,
+    use_gameplay_adapters: bool,
 ) -> None:
     """Convert a Unity project to a Roblox experience.
 
@@ -314,6 +323,7 @@ def convert(
         output_dir=output_path,
         skip_upload=no_upload,
         scaffolding=scaffolding_set,
+        use_gameplay_adapters=use_gameplay_adapters,
     )
 
     # Plumb --universe-id / --place-id into the pipeline context so the
