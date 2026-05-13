@@ -5176,7 +5176,16 @@ script.Disabled = true
         # (Composer, Gameplay, etc.) use less-collision-prone names
         # and intentionally write to the top-level cache per PR #73a
         # convention; only EventDispatch needs this AutoGen subdir.
-        canonical_source_path = "AutoGen/event_dispatch.luau"
+        #
+        # Round-1 codex [P1]: keep the filename stem matching the
+        # in-memory script ``name`` (``EventDispatch``). Rehydration
+        # derives the script's in-memory name from ``Path.stem``; if
+        # the disk filename were ``event_dispatch.luau`` the rehydrate
+        # would surface as ``name="event_dispatch"`` and the
+        # CapCase-keyed predicate / prune set would miss the rehydrated
+        # canonical entirely, breaking refresh idempotency and
+        # opt-out pruning.
+        canonical_source_path = "AutoGen/EventDispatch.luau"
         if existing_canonical:
             for s in existing_canonical:
                 if s.source != canonical_source:
@@ -5245,7 +5254,36 @@ script.Disabled = true
                 if s.source != _EVENT_DISPATCH_ALIAS_BODY:
                     s.source = _EVENT_DISPATCH_ALIAS_BODY
                     injected += 1
+                # Round-1 codex [P2]: pin ``parent_path`` to
+                # ``ReplicatedStorage`` on every refresh. The previous
+                # write may have been classified into ServerStorage
+                # (storage_classifier routes server-only-required
+                # ModuleScripts to ``ServerStorage``); the alias only
+                # functions if it lives at the historic
+                # ``ReplicatedStorage.AutoFpsEventDispatch`` path. Pin
+                # ``None`` so the rbxlx writer's default container
+                # (ReplicatedStorage for ModuleScripts) wins and so
+                # any future re-classification can't pull the alias
+                # out of replicated scope again.
+                if getattr(s, "parent_path", None) not in (
+                    None, "ReplicatedStorage",
+                ):
+                    s.parent_path = "ReplicatedStorage"
+                    injected += 1
+                # source_path on a fresh emit is unset (top-level
+                # cache write); on a rehydrated entry the path is
+                # already correct relative to ``scripts/``. Don't
+                # touch it — the disk-write finalizer keys off
+                # ``source_path`` when set so changing it here would
+                # leak the old file behind.
         else:
+            # Fresh emit: leave parent_path=None so the storage
+            # classifier doesn't see an explicit override and the
+            # rbxlx writer defaults the ModuleScript to
+            # ReplicatedStorage. Pinning ``"ReplicatedStorage"`` here
+            # would land in the same place but is redundant with the
+            # default and would diverge from the historic alias
+            # location if a future writer change moves the default.
             self.state.rbx_place.scripts.append(_GpRbxScript(
                 name=_EVENT_DISPATCH_ALIAS_NAME,
                 source=_EVENT_DISPATCH_ALIAS_BODY,

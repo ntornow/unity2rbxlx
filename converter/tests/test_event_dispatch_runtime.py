@@ -214,7 +214,7 @@ class TestPipelineInjectsEventDispatchOnOptIn:
     def test_canonical_uses_autogen_subdir_source_path(
         self, tmp_path: Path,
     ) -> None:
-        """The canonical writes to ``scripts/AutoGen/event_dispatch.luau``
+        """The canonical writes to ``scripts/AutoGen/EventDispatch.luau``
         so a user-authored ``EventDispatch.cs`` transpilation at
         ``scripts/EventDispatch.luau`` survives the finalize/rehydrate
         cycle without collision. Pinned because the on-disk collision
@@ -227,7 +227,7 @@ class TestPipelineInjectsEventDispatchOnOptIn:
             s for s in pl.state.rbx_place.scripts
             if s.name == _EVENT_DISPATCH_CANONICAL_NAME
         )
-        assert canonical.source_path == "AutoGen/event_dispatch.luau"
+        assert canonical.source_path == "AutoGen/EventDispatch.luau"
 
     def test_alias_body_uses_waitforchild_chain(self, tmp_path: Path) -> None:
         """The alias body must use a two-step ``WaitForChild`` chain
@@ -322,7 +322,7 @@ class TestPipelineInjectsEventDispatchOnOptIn:
         assert "-- User-authored EventDispatch" in user.source
         # User script gets the top-level disk path; canonical goes
         # under AutoGen/ to avoid collision.
-        assert canonical.source_path == "AutoGen/event_dispatch.luau"
+        assert canonical.source_path == "AutoGen/EventDispatch.luau"
 
     def test_canonical_idempotent_on_repeat_inject(
         self, tmp_path: Path,
@@ -344,6 +344,105 @@ class TestPipelineInjectsEventDispatchOnOptIn:
         )
         assert canonical_count == 1
         assert alias_count == 1
+
+
+class TestRehydrateRound1Regressions:
+    """PR #75 codex round-1 regression pins.
+
+    [P1] The canonical's on-disk filename stem MUST match the in-memory
+    ``name`` ("EventDispatch") so the rehydrate path
+    (``_rehydrate_scripts_from_disk``) reads it back under the same
+    ``name`` the refresh/prune predicates key on. A lowercase
+    ``event_dispatch.luau`` filename would deserialize as
+    ``name="event_dispatch"`` and break idempotency on every resume.
+
+    [P2] The alias refresh path MUST pin ``parent_path`` to
+    ``ReplicatedStorage`` even when an existing entry has been
+    classified elsewhere (e.g. a user-authored
+    ``AutoFpsEventDispatch.cs`` routed to ``ServerStorage`` by the
+    storage classifier). Without the pin the alias would refresh in
+    place but stay at the classified location, leaving the
+    historic ``ReplicatedStorage.AutoFpsEventDispatch`` path
+    unoccupied and pre-PR-#75 HUD requires unable to resolve.
+    """
+
+    def test_canonical_filename_stem_matches_in_memory_name(
+        self, tmp_path: Path,
+    ) -> None:
+        """The disk filename in ``source_path`` MUST be
+        ``EventDispatch.luau`` (CapCase stem), not the lowercase
+        ``event_dispatch.luau`` — rehydration derives the in-memory
+        ``name`` from ``Path.stem``.
+        """
+        pl = _make_pipeline_with_fps_opt_in(tmp_path, scaffolding=["fps"])
+        pl._inject_runtime_modules()
+        canonical = next(
+            s for s in pl.state.rbx_place.scripts
+            if s.name == _EVENT_DISPATCH_CANONICAL_NAME
+        )
+        # Filename component (everything after the last slash) is
+        # what ``Path.stem`` keys off after the rehydrate ``rglob``.
+        stem = Path(canonical.source_path).stem
+        assert stem == _EVENT_DISPATCH_CANONICAL_NAME, (
+            f"on-disk stem {stem!r} would deserialize as a different "
+            f"name than the predicate-keyed {_EVENT_DISPATCH_CANONICAL_NAME!r}; "
+            "rehydrate would never recognise the canonical and would "
+            "append a duplicate on every resume"
+        )
+
+    def test_alias_refresh_pins_parent_path_back_to_replicatedstorage(
+        self, tmp_path: Path,
+    ) -> None:
+        """If a rehydrated/classified alias ended up at a non-
+        ReplicatedStorage location (e.g. ``ServerStorage`` because a
+        user-authored same-named module was server-only), the alias
+        refresh must drag it back so the historic require path
+        ``ReplicatedStorage.AutoFpsEventDispatch`` resolves.
+        """
+        pl = _make_pipeline_with_fps_opt_in(tmp_path, scaffolding=["fps"])
+        pl.state.rbx_place.scripts.append(
+            RbxScript(
+                name=_EVENT_DISPATCH_ALIAS_NAME,
+                source="-- mis-classified user module body\n",
+                script_type="ModuleScript",
+                parent_path="ServerStorage",
+            )
+        )
+        pl._inject_runtime_modules()
+        alias = next(
+            s for s in pl.state.rbx_place.scripts
+            if s.name == _EVENT_DISPATCH_ALIAS_NAME
+        )
+        # parent_path forced back to either ``None`` (rbxlx writer's
+        # ModuleScript default routes to ReplicatedStorage) or the
+        # explicit string. ``"ServerStorage"`` would leave the alias
+        # unreachable from the historic require path.
+        assert alias.parent_path in (None, "ReplicatedStorage")
+
+    def test_alias_refresh_keeps_none_parent_path_untouched(
+        self, tmp_path: Path,
+    ) -> None:
+        """A rehydrated alias with ``parent_path=None`` (e.g. an entry
+        pre-classification or a fresh emit) must NOT be touched by
+        the refresh — the rbxlx writer's default routes None
+        ModuleScripts to ReplicatedStorage, which is where the alias
+        belongs.
+        """
+        pl = _make_pipeline_with_fps_opt_in(tmp_path, scaffolding=["fps"])
+        pl.state.rbx_place.scripts.append(
+            RbxScript(
+                name=_EVENT_DISPATCH_ALIAS_NAME,
+                source=_EVENT_DISPATCH_ALIAS_BODY,
+                script_type="ModuleScript",
+                parent_path=None,
+            )
+        )
+        pl._inject_runtime_modules()
+        alias = next(
+            s for s in pl.state.rbx_place.scripts
+            if s.name == _EVENT_DISPATCH_ALIAS_NAME
+        )
+        assert alias.parent_path is None
 
 
 class TestAliasOverwritePolicy:
