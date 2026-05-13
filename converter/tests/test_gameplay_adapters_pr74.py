@@ -318,7 +318,6 @@ class TestInteractiveAssemblyLegacyPath:
     interactive users can request legacy gameplay packs."""
 
     def test_assemble_has_legacy_gameplay_packs_option(self) -> None:
-        import click as _click
         from convert_interactive import assemble
 
         params = {p.name: p for p in assemble.params}
@@ -331,6 +330,26 @@ class TestInteractiveAssemblyLegacyPath:
             "convert_interactive assemble dropped the "
             "--use-gameplay-adapters flag — interactive flow "
             "diverged from u2r.py."
+        )
+
+    def test_transpile_has_legacy_gameplay_packs_option(self) -> None:
+        """PR #74 codex round-5 [P2]: the rollback lever must also be
+        on ``transpile`` — interactive users review scripts/ after
+        transpile and an operator who plans to finish with
+        ``--legacy-gameplay-packs`` at assemble needs the right Luau
+        out of this phase."""
+        from convert_interactive import transpile
+
+        params = {p.name: p for p in transpile.params}
+        assert "legacy_gameplay_packs" in params, (
+            "convert_interactive transpile is missing "
+            "--legacy-gameplay-packs — PR #74 codex round-5 [P2] "
+            "regressed."
+        )
+        assert "use_gameplay_adapters" in params, (
+            "convert_interactive transpile is missing "
+            "--use-gameplay-adapters — interactive transpile and "
+            "assemble disagree on the rollback contract."
         )
 
     def test_make_pipeline_forwards_use_gameplay_adapters(self) -> None:
@@ -373,6 +392,99 @@ class TestInteractiveAssemblyLegacyPath:
         ), (
             "_make_pipeline doesn't re-bind ctx.use_gameplay_adapters "
             "after the ctx swap — explicit caller choice lost."
+        )
+
+
+class TestFinalizeWalksBoundScripts:
+    """PR #74 codex round-5 [P3]: ``_subphase_finalize_scripts_to_disk``
+    must walk part-bound scripts (workspace_parts +
+    replicated_templates) so the on-disk ``scripts/*.luau`` cache
+    reflects every in-memory mutation. The rehydration prune pass
+    can mutate bound clones independently of the global list; a
+    global-only walk would silently leave the disk stale.
+    """
+
+    def test_finalize_writes_bound_script_source_to_disk(
+        self, tmp_path,
+    ) -> None:
+        """End-to-end: a bound clone whose source carries an obvious
+        marker must reach ``scripts/<name>.luau`` via finalize."""
+        import types
+
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir()
+        # Pre-existing disk file so the elif-existence check passes
+        # in the heuristic branch.
+        (scripts_dir / "BoundDoor.luau").write_text(
+            "stale-contents-from-prior-write", encoding="utf-8",
+        )
+
+        bound = types.SimpleNamespace(
+            name="BoundDoor",
+            source="-- final pruned source\nreturn nil",
+            source_path=None,
+        )
+        part = types.SimpleNamespace(
+            name="DoorPart",
+            scripts=[bound],
+            children=[],
+        )
+        place = types.SimpleNamespace(
+            scripts=[],
+            workspace_parts=[part],
+            replicated_templates=[],
+        )
+
+        # Minimal harness: bind a real Pipeline method to a fake self.
+        h = types.SimpleNamespace(
+            state=types.SimpleNamespace(rbx_place=place),
+            output_dir=tmp_path,
+        )
+        Pipeline._subphase_finalize_scripts_to_disk(h)
+
+        on_disk = (scripts_dir / "BoundDoor.luau").read_text(encoding="utf-8")
+        assert on_disk == "-- final pruned source\nreturn nil", (
+            "_subphase_finalize_scripts_to_disk didn't write the "
+            "bound script's in-memory source to disk — codex "
+            "PR #74 round-5 [P3] regressed."
+        )
+
+    def test_finalize_dedups_first_bound_script_by_identity(
+        self, tmp_path,
+    ) -> None:
+        """A script bound via the first-bind branch (same
+        ``RbxScript`` identity in both ``place.scripts`` and
+        ``part.scripts``) must only be written once — not twice."""
+        import types
+
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir()
+        (scripts_dir / "Door.luau").write_text("stale", encoding="utf-8")
+
+        shared = types.SimpleNamespace(
+            name="Door",
+            source="-- shared final source",
+            source_path=None,
+        )
+        part = types.SimpleNamespace(
+            name="DoorPart",
+            scripts=[shared],
+            children=[],
+        )
+        place = types.SimpleNamespace(
+            scripts=[shared],
+            workspace_parts=[part],
+            replicated_templates=[],
+        )
+        h = types.SimpleNamespace(
+            state=types.SimpleNamespace(rbx_place=place),
+            output_dir=tmp_path,
+        )
+        # No exception, single write, idempotent.
+        Pipeline._subphase_finalize_scripts_to_disk(h)
+        assert (
+            (scripts_dir / "Door.luau").read_text(encoding="utf-8")
+            == "-- shared final source"
         )
 
 

@@ -598,8 +598,23 @@ def materials(unity_project_path: str, output_dir: str) -> None:
               help="Anthropic API key (string or path to a key file).")
 @click.option("--no-ai", is_flag=True,
               help="Disable AI fallback; use rule-based transpilation only.")
+@click.option("--use-gameplay-adapters/--no-use-gameplay-adapters",
+              default=True,
+              help="Route door / projectile / damage patterns through "
+              "the gameplay-adapter pipeline. Default on as of PR #74. "
+              "Mutually exclusive with --legacy-gameplay-packs. Codex "
+              "PR #74 round-5 [P2]: the rollback lever must be on "
+              "``transpile`` too, not only ``assemble`` — interactive "
+              "users review their scripts/ after transpile, and "
+              "operators who intend to finish with --legacy-gameplay-packs "
+              "need the right Luau out of this phase.")
+@click.option("--legacy-gameplay-packs", is_flag=True, default=False,
+              help="Force the legacy script_coherence_packs pipeline. "
+              "Mutually exclusive with --use-gameplay-adapters.")
 def transpile(unity_project_path: str, output_dir: str,
-              api_key: str | None, no_ai: bool) -> None:
+              api_key: str | None, no_ai: bool,
+              use_gameplay_adapters: bool,
+              legacy_gameplay_packs: bool) -> None:
     """Phase 3b: transpile C# scripts to Luau."""
     if api_key:
         ak = Path(api_key)
@@ -608,7 +623,32 @@ def transpile(unity_project_path: str, output_dir: str,
     if no_ai:
         config.USE_AI_TRANSPILATION = False
 
-    pipeline = _make_pipeline(unity_project_path, output_dir)
+    # PR #74 codex round-5 [P2]: resolve the gameplay-mode tri-state
+    # the same way ``assemble`` (and ``u2r.py convert``) does. Only
+    # forward an explicit bool when the user passed a flag on the
+    # CLI; otherwise ``None`` so the persisted ctx wins on rehydrate.
+    ctx_click = click.get_current_context()
+    adapter_source = ctx_click.get_parameter_source("use_gameplay_adapters")
+    adapter_explicit = (
+        adapter_source == click.core.ParameterSource.COMMANDLINE
+    )
+    pipeline_use_gameplay_adapters: bool | None
+    if legacy_gameplay_packs:
+        if adapter_explicit and use_gameplay_adapters:
+            raise click.UsageError(
+                "--use-gameplay-adapters and --legacy-gameplay-packs "
+                "are mutually exclusive. Pass exactly one or neither.",
+            )
+        pipeline_use_gameplay_adapters = False
+    elif adapter_explicit:
+        pipeline_use_gameplay_adapters = use_gameplay_adapters
+    else:
+        pipeline_use_gameplay_adapters = None
+
+    pipeline = _make_pipeline(
+        unity_project_path, output_dir,
+        use_gameplay_adapters=pipeline_use_gameplay_adapters,
+    )
     try:
         _run_through(pipeline, "transpile_scripts")
     except Exception as exc:

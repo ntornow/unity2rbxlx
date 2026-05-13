@@ -3476,7 +3476,16 @@ script.Disabled = true
     def _subphase_finalize_scripts_to_disk(self) -> None:
         """Write every script's final source back to disk. Runs after every
         in-memory mutation so the on-disk ``scripts/`` tree mirrors what
-        gets serialized into the rbxlx."""
+        gets serialized into the rbxlx.
+
+        PR #74 codex round-5 [P3]: walks part-bound scripts too (not
+        just ``rbx_place.scripts``). The rehydration prune pass and
+        any future post-binding mutation can change the source on a
+        bound-script clone WITHOUT touching its global counterpart,
+        so a global-only walk would let the on-disk ``scripts/*.luau``
+        cache drift from the in-memory state. Per-script identity
+        dedup keeps the work O(scripts), not O(scripts × parts).
+        """
         # Final write: ensure .luau files on disk match the fully processed
         # sources (after require injection, reclassification, and all other
         # post-processing). Prefer the explicit source_path set by rehydration
@@ -3487,18 +3496,53 @@ script.Disabled = true
         # (bootstrap, FPS controller, runtime libs) that never had a disk
         # path to begin with.
         scripts_dir = self.output_dir / "scripts"
-        for s in self.state.rbx_place.scripts:
-            if getattr(s, "source_path", None):
-                out_path = scripts_dir / s.source_path
+
+        def _flush(s: object) -> None:
+            source = getattr(s, "source", None)
+            if source is None:
+                return
+            source_path = getattr(s, "source_path", None)
+            if source_path:
+                out_path = scripts_dir / source_path
                 out_path.parent.mkdir(parents=True, exist_ok=True)
-                out_path.write_text(s.source, encoding="utf-8")
-                continue
-            luau_path = scripts_dir / f"{s.name}.luau"
-            anim_path = scripts_dir / "animations" / f"{s.name}.luau"
+                out_path.write_text(source, encoding="utf-8")
+                return
+            name = getattr(s, "name", None)
+            if not name:
+                return
+            luau_path = scripts_dir / f"{name}.luau"
+            anim_path = scripts_dir / "animations" / f"{name}.luau"
             if anim_path.exists():
-                anim_path.write_text(s.source, encoding="utf-8")
+                anim_path.write_text(source, encoding="utf-8")
             elif luau_path.exists() or not (scripts_dir / "animations").exists():
-                luau_path.write_text(s.source, encoding="utf-8")
+                luau_path.write_text(source, encoding="utf-8")
+
+        # Identity-dedup so a script that's both in the global list
+        # AND bound to a part (the first-bind shares the RbxScript
+        # ref via ``part.scripts.append(script)``) doesn't write
+        # twice. ``id()`` keys handle the dataclass eq=True case too.
+        seen: set[int] = set()
+
+        def _flush_unique(s: object) -> None:
+            key = id(s)
+            if key in seen:
+                return
+            seen.add(key)
+            _flush(s)
+
+        for s in self.state.rbx_place.scripts:
+            _flush_unique(s)
+
+        def _walk(parts: list) -> None:
+            for part in parts:
+                for s in getattr(part, "scripts", None) or []:
+                    _flush_unique(s)
+                children = getattr(part, "children", None)
+                if children:
+                    _walk(children)
+
+        _walk(getattr(self.state.rbx_place, "workspace_parts", None) or [])
+        _walk(getattr(self.state.rbx_place, "replicated_templates", None) or [])
 
 
     def _write_unconverted_md(self) -> None:
