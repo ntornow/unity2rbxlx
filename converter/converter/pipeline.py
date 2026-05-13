@@ -150,6 +150,19 @@ _DAMAGE_CAPABILITY_KINDS: frozenset[str] = frozenset({
     "effect.splash",
 })
 
+# PR #74 codex round-4 [P1] signals — when scanning emitted adapter
+# stub source on disk (rehydrate / publish rebuild path,
+# ``state.gameplay_matches`` empty by design), look for the exact
+# capability-kind literals the composer emits. ``composer._lua_string``
+# wraps kind strings as double-quoted Lua literals, so the rendered
+# form is ``{kind = "effect.damage"`` / ``{kind = "effect.splash"``.
+# Substring match against the source — no regex needed because the
+# composer's output shape is stable (validated by composer tests).
+_DAMAGE_CAPABILITY_LUA_MARKERS: tuple[str, ...] = (
+    '{kind = "effect.damage"',
+    '{kind = "effect.splash"',
+)
+
 # PR #74 rehydration-aware prune pass. Removes legacy
 # coherence-pack artifacts BEFORE the adapter runtime injects its
 # replacements, so a re-conversion of an output that was previously
@@ -210,11 +223,20 @@ def _strip_legacy_door_tween_block(source: str) -> tuple[str, bool]:
     return source[:cut].rstrip() + "\n", True
 
 # Substring the legacy ``player_damage_remote_event`` pack body-patch
-# leaves in every Player LocalScript it touches. Kept literal (no
-# regex) because the pack itself emits the exact string at
-# ``script_coherence_packs.py:2180`` and a structural pin here lets a
-# future refactor of either side land with a single failing test.
-_LEGACY_DAMAGE_FIRESERVER_MARKER: str = ':FindFirstChild("DamageEvent")'
+# leaves in every Player LocalScript it touches. Pinned to the exact
+# pack-emitted line at ``script_coherence_packs.py:2180``. The
+# previous tier-1 substring ``:FindFirstChild("DamageEvent")`` was a
+# false-positive hazard (codex PR #74 round-4 [P2]): any unrelated
+# script that happened to look up a ``DamageEvent`` RemoteEvent
+# would also trip the probe, re-injecting DamageProtocol and
+# re-claiming the global RemoteEvent — the exact collision PR #74
+# is meant to avoid. The full assignment with ``local _de = ...
+# game:GetService("ReplicatedStorage"):FindFirstChild("DamageEvent")``
+# uniquely identifies the pack-injected body-patch.
+_LEGACY_DAMAGE_FIRESERVER_MARKER: str = (
+    'local _de = game:GetService("ReplicatedStorage")'
+    ':FindFirstChild("DamageEvent")'
+)
 
 
 def _place_has_legacy_damage_fireserver(
@@ -231,6 +253,11 @@ def _place_has_legacy_damage_fireserver(
     half of the damage path and means the server-side validator MUST
     be live to handle the client's FireServer call.
 
+    PR #74 codex round-4 [P2] tightened the marker from a bare
+    substring to the full ``local _de = ...`` assignment so user
+    code that incidentally looks up a ``DamageEvent`` instance can't
+    trip the probe.
+
     Walks the same surfaces as ``_place_carries_adapter_marker``
     (global scripts, workspace parts, replicated templates) so
     rehydrate-path detection works.
@@ -241,6 +268,50 @@ def _place_has_legacy_damage_fireserver(
     def _has(script: _ScriptLike) -> bool:
         src = getattr(script, "source", None) or ""
         return _LEGACY_DAMAGE_FIRESERVER_MARKER in src
+
+    def _walk(parts: list[_PartLike]) -> bool:
+        for part in parts:
+            for s in getattr(part, "scripts", None) or []:
+                if _has(s):
+                    return True
+            if _walk(getattr(part, "children", None) or []):
+                return True
+        return False
+
+    for s in getattr(rbx_place, "scripts", None) or []:
+        if _has(s):
+            return True
+    if _walk(getattr(rbx_place, "workspace_parts", None) or []):
+        return True
+    return _walk(getattr(rbx_place, "replicated_templates", None) or [])
+
+
+def _place_has_damage_adapter_stub(
+    rbx_place: "_PlaceLike | RbxPlace | None",
+) -> bool:
+    """Return True when any adapter stub in *rbx_place* declares a
+    damage-effect capability (``effect.damage`` or ``effect.splash``).
+
+    PR #74 codex round-4 [P1]: on resume / publish rebuild paths,
+    ``state.gameplay_matches`` is empty by design (transpile didn't
+    re-run). A damage-bearing adapter project (bullets / explosions
+    with no legacy body-patch) would lose DamageProtocol entirely
+    after a resume — server-side ``DamageEvent`` listener disappears
+    and damage stops working even though the original conversion
+    worked. Scanning emitted stub source for the composer's
+    capability-table literals (``{kind = "effect.damage"`` /
+    ``{kind = "effect.splash"``) recovers the signal without
+    re-running the transpile phase.
+
+    Walks the same surfaces as ``_place_carries_adapter_marker``
+    so prefab-template-bound stubs are seen too.
+    """
+    if rbx_place is None:
+        return False
+
+    def _has(script: _ScriptLike) -> bool:
+        src = getattr(script, "source", None) or ""
+        return any(marker in src for marker in _DAMAGE_CAPABILITY_LUA_MARKERS)
 
     def _walk(parts: list[_PartLike]) -> bool:
         for part in parts:
@@ -2546,29 +2617,48 @@ return table.concat(allData, "\\n")'''
         matches that have no damage capability). That broke adapter
         adoption on any project with unrelated ``DamageEvent`` traffic.
 
-        Two qualifying signals:
+        Three qualifying signals (any one is sufficient):
 
-          1. **Adapter path** — at least one ``GameplayMatch`` emitted a
-             damage-effect capability (``effect.damage`` or
-             ``effect.splash``). Captures bullets / explosions that the
-             gameplay-adapter pipeline routes through ``DamageEvent``.
+          1. **Fresh-conversion adapter path** — at least one
+             ``GameplayMatch`` emitted a damage-effect capability
+             (``effect.damage`` / ``effect.splash``). Populated by
+             ``transpile_scripts``; empty on rehydrate / publish
+             rebuild paths.
 
-          2. **Legacy body-patch path** — the
+          2. **Rehydrate-path adapter scan** — any script in
+             ``state.rbx_place`` (global + workspace + templates)
+             carries a composer-emitted damage capability literal
+             (``{kind = "effect.damage"`` / ``{kind = "effect.splash"``).
+             Covers ``u2r.py convert --phase write_output`` /
+             ``u2r.py publish`` / ``convert_interactive assemble``
+             where ``state.gameplay_matches`` is empty by design but
+             the previous conversion's adapter stubs are still on
+             disk. Codex PR #74 round-4 [P1] flagged that without
+             this signal, damage-bearing adapter resumes silently
+             lose their server-side listener.
+
+          3. **Legacy body-patch path** — the
              ``player_damage_remote_event`` coherence pack body-patched
              a Player LocalScript (the half that still runs in adapters-
-             on tier-2 mode) and left an inline
-             ``FindFirstChild("DamageEvent")`` lookup. That call needs
-             a server-side listener live or it FireServers into the void.
+             on tier-2 mode) and left the unique
+             ``local _de = game:GetService("ReplicatedStorage")``
+             ``:FindFirstChild("DamageEvent")`` assignment. That call
+             needs a server-side listener live or it FireServers into
+             the void. Codex PR #74 round-4 [P2] tightened the
+             literal to the full assignment so unrelated user code
+             that does a ``FindFirstChild("DamageEvent")`` lookup
+             can't accidentally trip the probe.
 
-        Both surfaces are scanned via the same place-walking helpers as
-        the adapter-marker scan so the rehydrate / publish-rebuild path
-        (``state.gameplay_matches`` empty but scripts already on disk)
-        sees the same answer as the fresh-conversion path.
+        All three surfaces are scanned via the same place-walking
+        helpers as the adapter-marker scan so rehydrate / publish-
+        rebuild paths see the same answer as fresh-conversion runs.
         """
         for match in self.state.gameplay_matches:
             for kind in match.capability_kinds:
                 if kind in _DAMAGE_CAPABILITY_KINDS:
                     return True
+        if _place_has_damage_adapter_stub(self.state.rbx_place):
+            return True
         return _place_has_legacy_damage_fireserver(self.state.rbx_place)
 
     def write_output(self) -> None:

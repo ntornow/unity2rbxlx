@@ -432,6 +432,119 @@ class TestPipelineInjection:
             "Pipeline gate and this test in lockstep."
         )
 
+    def test_damage_protocol_needed_rehydrates_via_adapter_stub_scan(
+        self,
+    ) -> None:
+        """PR #74 codex round-4 [P1]: on resume / publish rebuild,
+        ``state.gameplay_matches`` is empty by design. A damage-bearing
+        adapter project (bullets with ``effect.damage`` capability,
+        no legacy body-patch) must still be detected so DamageProtocol
+        gets re-injected and the server-side ``DamageEvent`` listener
+        stays live.
+
+        Detection signal: the composer's capability-table literal
+        ``{kind = "effect.damage"`` (or ``effect.splash``) on a stub
+        emitted to ``state.rbx_place.scripts`` by a previous run.
+        """
+        import types
+        from converter.pipeline import Pipeline
+
+        class _State:
+            def __init__(self) -> None:
+                self.gameplay_matches: list = []
+                self.rbx_place = types.SimpleNamespace(
+                    scripts=[
+                        types.SimpleNamespace(
+                            source=(
+                                "-- @@AUTOGEN_GAMEPLAY_ADAPTER@@ TurretBullet\n"
+                                "Gameplay.run(_container, {\n"
+                                '    {kind = "effect.damage", value = 10},\n'
+                                "})\n"
+                            ),
+                        ),
+                    ],
+                    workspace_parts=[],
+                    replicated_templates=[],
+                )
+
+        harness = types.SimpleNamespace(state=_State())
+        assert Pipeline._damage_protocol_needed(harness) is True, (
+            "rehydrate path missed an adapter stub carrying "
+            "effect.damage — codex PR #74 round-4 [P1] regressed."
+        )
+
+        # And the splash variant — same path, different capability kind.
+        class _StateSplash:
+            def __init__(self) -> None:
+                self.gameplay_matches: list = []
+                self.rbx_place = types.SimpleNamespace(
+                    scripts=[
+                        types.SimpleNamespace(
+                            source=(
+                                "-- @@AUTOGEN_GAMEPLAY_ADAPTER@@ Explosion\n"
+                                'Gameplay.run(_container, {\n'
+                                '    {kind = "effect.splash", radius_studs = 20},\n'
+                                "})\n"
+                            ),
+                        ),
+                    ],
+                    workspace_parts=[],
+                    replicated_templates=[],
+                )
+
+        harness_splash = types.SimpleNamespace(state=_StateSplash())
+        assert Pipeline._damage_protocol_needed(harness_splash) is True, (
+            "rehydrate path missed an adapter stub carrying "
+            "effect.splash — AoE damage routes lose their server "
+            "validator on resume."
+        )
+
+    def test_legacy_probe_rejects_bare_FindFirstChild_lookup(self) -> None:
+        """PR #74 codex round-4 [P2]: a bare
+        ``FindFirstChild("DamageEvent")`` lookup in an unrelated user
+        script must NOT trip the legacy-marker probe. The tighter
+        marker pins on the pack's full ``local _de = game:GetService
+        ("ReplicatedStorage"):FindFirstChild("DamageEvent")`` line.
+        Without this narrowing, adapter-enabled projects that
+        coincidentally look up a ``DamageEvent`` for unrelated
+        networking would re-trigger DamageProtocol injection —
+        the exact collision PR #74 is supposed to avoid.
+        """
+        import types
+        from converter.pipeline import Pipeline
+
+        class _State:
+            def __init__(self) -> None:
+                self.gameplay_matches: list = []
+                self.rbx_place = types.SimpleNamespace(
+                    scripts=[
+                        types.SimpleNamespace(
+                            source=(
+                                "-- user-authored script unrelated "
+                                "to the legacy damage pack\n"
+                                "local rs = game:GetService"
+                                "(\"ReplicatedStorage\")\n"
+                                "local myEvent = rs:FindFirstChild"
+                                "(\"DamageEvent\")\n"
+                                "if myEvent then\n"
+                                "    myEvent.OnClientEvent:Connect(...)\n"
+                                "end\n"
+                            ),
+                        ),
+                    ],
+                    workspace_parts=[],
+                    replicated_templates=[],
+                )
+
+        harness = types.SimpleNamespace(state=_State())
+        assert Pipeline._damage_protocol_needed(harness) is False, (
+            "_damage_protocol_needed false-positived on a bare "
+            "FindFirstChild('DamageEvent') user-code call — codex "
+            "PR #74 round-4 [P2] regressed. DamageProtocol would "
+            "re-claim ReplicatedStorage.DamageEvent for non-damage "
+            "projects."
+        )
+
     def test_server_bootstrap_emits_under_server_script_service(
         self,
     ) -> None:
