@@ -692,6 +692,83 @@ class TestRound3Regressions:
         # Survivor is at the real alias path.
         assert aliases[0].parent_path in (None, "ReplicatedStorage")
 
+    def test_classify_storage_skips_legacy_pre_marker_canonical(
+        self, tmp_path: Path,
+    ) -> None:
+        """Round-4 codex [P2]: a pre-marker (pre-PR-#74-round-9)
+        EventDispatch body lacks ``@@GAMEPLAY_RUNTIME_MODULE@@`` but
+        still starts with the canonical legacy header. The runtime
+        refresh predicate treats it as converter-owned via the
+        legacy-header fallback; the classifier-skip predicate must
+        do the same, otherwise a first-time preserve-scripts resume
+        of a pre-marker output still collides with a user
+        ``EventDispatch.cs`` in the name-keyed plan.
+        """
+        pl = _make_pipeline_with_fps_opt_in(tmp_path, scaffolding=["fps"])
+        # User-authored EventDispatch.cs transpilation — no marker,
+        # no AutoGen parent_path, no legacy header.
+        pl.state.rbx_place.scripts.append(
+            RbxScript(
+                name="EventDispatch",
+                source="-- user-authored EventDispatch.cs body\n",
+                script_type="LocalScript",
+            )
+        )
+        # Legacy pre-marker canonical body — starts with the canonical
+        # header but has no marker and no AutoGen parent_path (would
+        # come from a rehydrate of a pre-PR-#75 output).
+        pl.state.rbx_place.scripts.append(
+            RbxScript(
+                name="EventDispatch",
+                source=(
+                    "-- EventDispatch: cross-class connect helper for "
+                    "client event listeners.\n"
+                    "local EventDispatch = {}\nreturn EventDispatch\n"
+                ),
+                script_type="ModuleScript",
+            )
+        )
+        pl._classify_storage()
+        plan = pl.ctx.storage_plan
+        # User's LocalScript classified.
+        assert "EventDispatch" in (plan.client_scripts or [])
+        # Legacy converter-owned canonical NOT classified (no entry
+        # in shared_modules / server_modules under "EventDispatch").
+        assert "EventDispatch" not in (plan.shared_modules or [])
+        assert "EventDispatch" not in (plan.server_modules or [])
+
+    def test_classify_storage_skips_autogen_parented_module(
+        self, tmp_path: Path,
+    ) -> None:
+        """Round-4 codex [P2]: a script already routed to
+        ``ReplicatedStorage.AutoGen`` is converter-namespace-owned by
+        definition. The classifier-skip predicate must accept the
+        ``parent_path`` signal independent of the marker so a
+        rehydrated runtime module that lost its marker on a
+        hand-edit still bypasses the plan.
+        """
+        pl = _make_pipeline_with_fps_opt_in(tmp_path, scaffolding=["fps"])
+        pl.state.rbx_place.scripts.append(
+            RbxScript(
+                name="EventDispatch",
+                source="-- accidentally stripped marker\nlocal m = {}\nreturn m\n",
+                script_type="ModuleScript",
+                parent_path="ReplicatedStorage.AutoGen",
+            )
+        )
+        pl._classify_storage()
+        plan = pl.ctx.storage_plan
+        # Not in any plan bucket.
+        all_buckets = (
+            (plan.server_scripts or [])
+            + (plan.client_scripts or [])
+            + (plan.character_scripts or [])
+            + (plan.replicated_first_scripts or [])
+            + (plan.shared_modules or [])
+            + (plan.server_modules or [])
+        )
+        assert "EventDispatch" not in all_buckets
+
     def test_opt_out_prunes_offpath_marked_alias(
         self, tmp_path: Path,
     ) -> None:

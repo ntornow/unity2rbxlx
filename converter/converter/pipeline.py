@@ -4330,20 +4330,39 @@ script.Disabled = true
         # entries — ``_inject_runtime_modules`` pins their
         # ``parent_path`` + ``script_type`` directly each run.
         #
-        # Detection is marker-only: the source carries
-        # ``@@GAMEPLAY_RUNTIME_MODULE@@`` (canonical / gameplay-adapter
-        # modules) or ``@@AUTO_FPS_EVENT_DISPATCH_ALIAS@@`` (PR #75
-        # alias). A user-authored script with those literal magic
-        # strings would have to be intentional.
+        # Round-4 codex [P2]: detection must match the same
+        # signal set as the rehydrate refresh / prune predicates
+        # (``_is_converter_gameplay_runtime_module`` and
+        # ``_is_converter_alias``). Three accepted signals:
+        #   1. ``@@GAMEPLAY_RUNTIME_MODULE@@`` or
+        #      ``@@AUTO_FPS_EVENT_DISPATCH_ALIAS@@`` in source.
+        #   2. ``parent_path == "ReplicatedStorage.AutoGen"`` — the
+        #      converter-owned namespace.
+        #   3. Source starts with any
+        #      ``_LEGACY_GAMEPLAY_RUNTIME_PRE_MARKER_HEADERS`` prefix
+        #      (pre-PR-#74-round-9 canonical-body fallback used by
+        #      the runtime predicate; covers pre-PR-#75 alias bodies
+        #      that carried the canonical EventDispatch body too,
+        #      since alias and canonical shared their pre-PR-#75
+        #      header).
+        # A user script with those literal magic strings or an
+        # AutoGen parent_path would have to be intentional.
         all_scripts = self.state.rbx_place.scripts
         converter_owned: list = []
         user_or_unknown: list = []
+        legacy_headers = tuple(
+            _LEGACY_GAMEPLAY_RUNTIME_PRE_MARKER_HEADERS.values()
+        )
         for s in all_scripts:
             source = getattr(s, "source", None) or ""
-            if (
+            parent_path = getattr(s, "parent_path", None)
+            is_converter = (
                 GAMEPLAY_RUNTIME_MODULE_MARKER in source
                 or _EVENT_DISPATCH_ALIAS_MARKER in source
-            ):
+                or parent_path == "ReplicatedStorage.AutoGen"
+                or source.startswith(legacy_headers)
+            )
+            if is_converter:
                 converter_owned.append(s)
             else:
                 user_or_unknown.append(s)
