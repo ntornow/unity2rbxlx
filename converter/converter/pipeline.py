@@ -2458,26 +2458,38 @@ return table.concat(allData, "\\n")'''
 
         # 3. ``_AutoFpsHud`` ScreenGui removal — bundled with the
         # adapter prune per design doc, even though the HUD is
-        # scaffolding (not an adapter artifact). The ``"fps"``
-        # scaffolding opt-in re-emits a fresh HUD in this same
-        # write_output pass, so the prune is safe for the
-        # opt-in-this-run case too — the HUD-injection helper runs
-        # after this prune.
-        screen_guis = getattr(place, "screen_guis", None)
-        if screen_guis:
-            surviving_guis = []
-            for gui in screen_guis:
-                attrs = getattr(gui, "attributes", None) or {}
-                if attrs.get(_LEGACY_FPS_HUD_ATTR):
-                    pruned += 1
-                    log.info(
-                        "[prune] Removed stale %s-tagged ScreenGui '%s'",
-                        _LEGACY_FPS_HUD_ATTR,
-                        getattr(gui, "name", "?"),
-                    )
-                    continue
-                surviving_guis.append(gui)
-            place.screen_guis = surviving_guis
+        # scaffolding (not an adapter artifact).
+        #
+        # PR #74 codex round-3 [P1]: the SUBPHASE_ORDER runs
+        # ``_subphase_inject_autogen_scripts`` BEFORE
+        # ``_inject_runtime_modules`` (which calls this helper). So
+        # when ``"fps"`` scaffolding is active on THIS run, the
+        # freshly-emitted HUD already sits in ``place.screen_guis``
+        # by the time the prune fires. An unconditional
+        # ``_AutoFpsHud`` strip would wipe the just-emitted HUD on
+        # every adapter-enabled FPS conversion. Gate on
+        # ``"fps" not in self.scaffolding`` so the prune only fires
+        # when the operator is rolling BACK from a previous-run FPS
+        # opt-in to no FPS scaffolding this run — i.e. the genuine
+        # stale-artifact case.
+        if "fps" not in self.scaffolding:
+            screen_guis = getattr(place, "screen_guis", None)
+            if screen_guis:
+                surviving_guis = []
+                for gui in screen_guis:
+                    attrs = getattr(gui, "attributes", None) or {}
+                    if attrs.get(_LEGACY_FPS_HUD_ATTR):
+                        pruned += 1
+                        log.info(
+                            "[prune] Removed stale %s-tagged "
+                            "ScreenGui '%s' (FPS scaffolding no "
+                            "longer requested for this run)",
+                            _LEGACY_FPS_HUD_ATTR,
+                            getattr(gui, "name", "?"),
+                        )
+                        continue
+                    surviving_guis.append(gui)
+                place.screen_guis = surviving_guis
 
         return pruned
 

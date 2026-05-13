@@ -74,6 +74,61 @@ class TestDefaultFlip:
         )
 
 
+class TestPrePr74ContextRehydration:
+    """PR #74 codex round-3 [P1]: a ``conversion_context.json`` that
+    PREDATES PR #73a (no ``use_gameplay_adapters`` key) must rehydrate
+    as ``False`` (legacy mode), not silently inherit the new True
+    dataclass default. Otherwise pre-PR-#73a outputs flip into
+    adapter mode on the next resume, breaking the sticky-rollback
+    contract.
+    """
+
+    def test_missing_key_loads_as_legacy(self, tmp_path) -> None:
+        """A ctx JSON without the field rehydrates as False."""
+        import json
+
+        ctx_path = tmp_path / "conversion_context.json"
+        ctx_path.write_text(json.dumps({
+            "unity_project_path": "/tmp/old-project",
+            "selected_scene": "Main.unity",
+        }), encoding="utf-8")
+        loaded = ConversionContext.load(ctx_path)
+        assert loaded.use_gameplay_adapters is False, (
+            "ConversionContext.load() silently flipped a pre-PR-#73a "
+            "context into adapter mode — codex PR #74 round-3 [P1] "
+            "regressed."
+        )
+
+    def test_explicit_true_in_json_survives(self, tmp_path) -> None:
+        """A ctx JSON that explicitly has ``use_gameplay_adapters: true``
+        (a fresh PR-#73a-or-later conversion) must keep that value
+        through load() — the round-3 fix shouldn't accidentally
+        force True ctxs to False."""
+        import json
+
+        ctx_path = tmp_path / "conversion_context.json"
+        ctx_path.write_text(json.dumps({
+            "unity_project_path": "/tmp/new-project",
+            "use_gameplay_adapters": True,
+        }), encoding="utf-8")
+        loaded = ConversionContext.load(ctx_path)
+        assert loaded.use_gameplay_adapters is True
+
+    def test_explicit_false_in_json_survives(self, tmp_path) -> None:
+        """A ctx JSON that explicitly has ``use_gameplay_adapters: false``
+        (a ``--legacy-gameplay-packs`` conversion or a pre-PR-#74
+        default-off conversion) must keep that value through load()."""
+        import json
+
+        ctx_path = tmp_path / "conversion_context.json"
+        ctx_path.write_text(json.dumps({
+            "unity_project_path": "/tmp/legacy-project",
+            "use_gameplay_adapters": False,
+        }), encoding="utf-8")
+        loaded = ConversionContext.load(ctx_path)
+        assert loaded.use_gameplay_adapters is False
+
+
 class TestStickyRollbackContract:
     """PR #74 codex round-1 [P1]: a persisted
     ``ctx.use_gameplay_adapters=False`` (from an original
@@ -375,7 +430,13 @@ class TestPruneLegacyGameplayArtifacts:
             screen_guis=[],
         )
         state = types.SimpleNamespace(rbx_place=place)
-        return types.SimpleNamespace(state=state)
+        # ``scaffolding`` defaults empty here; per-test code can flip
+        # it to ``frozenset({"fps"})`` when exercising the round-3
+        # [P1] preserve-fresh-HUD gate.
+        return types.SimpleNamespace(
+            state=state,
+            scaffolding=frozenset(),
+        )
 
     def test_removes_global_damage_router_script(self) -> None:
         h = self._harness()
@@ -454,7 +515,10 @@ class TestPruneLegacyGameplayArtifacts:
         assert _LEGACY_DOOR_TWEEN_MARKER not in door.source
 
     def test_removes_auto_fps_hud_screen_gui(self) -> None:
+        """No ``"fps"`` in scaffolding this run → the HUD is a stale
+        rehydrate artifact and must be pruned."""
         h = self._harness()
+        h.scaffolding = frozenset()
         survivor = types.SimpleNamespace(
             name="UserHUD", attributes={},
         )
@@ -466,8 +530,35 @@ class TestPruneLegacyGameplayArtifacts:
         pruned = Pipeline._prune_legacy_gameplay_artifacts(h)
         assert pruned == 1
         assert h.state.rbx_place.screen_guis == [survivor], (
-            "_AutoFpsHud ScreenGui not removed."
+            "_AutoFpsHud ScreenGui not removed when fps scaffolding "
+            "is OFF this run."
         )
+
+    def test_preserves_auto_fps_hud_when_fps_scaffolding_active(
+        self,
+    ) -> None:
+        """PR #74 codex round-3 [P1]: SUBPHASE_ORDER runs
+        ``_subphase_inject_autogen_scripts`` BEFORE
+        ``_inject_runtime_modules`` (which calls the prune). When
+        ``"fps"`` scaffolding is active on this run, the freshly-
+        emitted HUD already sits in ``place.screen_guis`` by the
+        time the prune fires. An unconditional strip would delete
+        the just-emitted HUD on every adapter-enabled FPS conversion.
+        """
+        h = self._harness()
+        h.scaffolding = frozenset({"fps"})
+        fresh_hud = types.SimpleNamespace(
+            name="HUD",
+            attributes={_LEGACY_FPS_HUD_ATTR: True},
+        )
+        h.state.rbx_place.screen_guis = [fresh_hud]
+        pruned = Pipeline._prune_legacy_gameplay_artifacts(h)
+        assert pruned == 0, (
+            "Prune fired on a fresh _AutoFpsHud while fps scaffolding "
+            "is active — would wipe the just-emitted HUD on every "
+            "adapter-enabled FPS conversion."
+        )
+        assert h.state.rbx_place.screen_guis == [fresh_hud]
 
     def test_aggregates_all_three_surfaces(self) -> None:
         """A single re-conversion can hit all three at once; pin the
