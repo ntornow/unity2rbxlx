@@ -1427,7 +1427,85 @@ def _convert_node(
     # Clean up internal attributes
     part.attributes.pop("_HasLODGroup", None)
 
+    # -- Transform-hierarchy propagation wrap --
+    _wrap_geometry_with_children_into_model(part, node_name=node.name)
+
     return part
+
+
+def _wrap_geometry_with_children_into_model(part: "RbxPart", node_name: str) -> None:
+    """Wrap a geometry BasePart that has child transforms into a Model.
+
+    Unity Transforms propagate rotation/position to all child Transforms via
+    the parent-child hierarchy. Roblox ``BasePart.CFrame = …`` does NOT
+    propagate to descendant BaseParts — only ``Model:PivotTo(cf)`` does.
+    When a Unity node has BOTH visual geometry (mesh or primitive shape) AND
+    child transforms, AI-transpiled scripts that rotate the node via
+    ``setCFrame(node, cf)`` leave the children stuck at scene-time poses.
+    Concrete failure: a Turret rotating its weapon mesh leaves the muzzle
+    ``Origin`` Part pointing in the scene-time direction, so bullets fire
+    in a fixed line regardless of where the turret is aimed.
+    Wrapping such nodes in a Model whose children are
+    ``[original child transforms…, inner geometry part]`` makes
+    ``Model:PivotTo`` propagate to every descendant — restoring Unity
+    transform-hierarchy semantics in Roblox. The inner geometry part is
+    appended LAST so that name-based ``firstStructuralChild``-style
+    hierarchy walks (which iterate ``GetChildren()`` in declaration order)
+    still return the same first structural child they did before the wrap.
+    The fix is generic — covers any Unity prefab whose transform hierarchy
+    carries both a renderer and meaningful child transforms.
+    """
+    _has_geometry = part.class_name in ("Part", "MeshPart") and (
+        part.mesh_id is not None
+        or part.shape is not None
+    )
+    if not (_has_geometry and part.children):
+        return
+
+    from core.roblox_types import RbxPart as _RbxPart
+    inner = _RbxPart(
+        name=f"{node_name}_Mesh",
+        class_name=part.class_name,
+        cframe=part.cframe,
+        size=part.size,
+        unity_file_id=part.unity_file_id,
+    )
+    # Migrate visual / geometry properties from outer to the inner part.
+    inner.mesh_id = part.mesh_id
+    inner.initial_size = part.initial_size
+    inner.texture_id = part.texture_id
+    inner.shape = part.shape
+    inner.color = part.color
+    inner.material = part.material
+    inner.transparency = part.transparency
+    inner.reflectance = part.reflectance
+    inner.surface_appearance = part.surface_appearance
+    inner.anchored = part.anchored
+    inner.can_collide = part.can_collide
+    inner.can_query = part.can_query
+    inner.can_touch = part.can_touch
+    inner.cast_shadow = part.cast_shadow
+    inner.massless = part.massless
+    inner.custom_physical_properties = part.custom_physical_properties
+    inner.collision_fidelity = part.collision_fidelity
+    # Move geometry-specific attributes to inner. Other attributes (script
+    # class hints, prefab markers, gameplay tags) stay on the outer Model
+    # so scripts that walk by name still find them.
+    for _attr_key in list(part.attributes.keys()):
+        if _attr_key.startswith("_Scale") or _attr_key in (
+            "_MeshId", "_MeshFileId", "_TextureId", "_FbxImportScale",
+        ):
+            inner.attributes[_attr_key] = part.attributes.pop(_attr_key)
+    # Reset the outer to Model — visual properties now live on inner.
+    part.class_name = "Model"
+    part.mesh_id = None
+    part.initial_size = None
+    part.texture_id = None
+    part.shape = None
+    part.surface_appearance = None
+    # Append inner LAST so the original children's iteration order
+    # (relied on by name-based hierarchy walks) is preserved.
+    part.children.append(inner)
 
 
 # ---------------------------------------------------------------------------
@@ -4185,6 +4263,10 @@ def _convert_prefab_node(
     # local position (parent_pos) but NOT the scene hierarchy transforms
     # above the instance.  The composition pass at convert_scene applies
     # the parent scene node's CFrame to convert local → world positions.
+
+    # -- Transform-hierarchy propagation wrap (matches _convert_node) --
+    _wrap_geometry_with_children_into_model(part, node_name=node.name)
+
     return part
 
 

@@ -1213,6 +1213,109 @@ def _fix_door_global_player_lookup(scripts: list["RbxScript"]) -> int:
     return fixes
 
 
+# NOTE: A previous ``turret_spawn_from_weapon_cframe`` pack rewrote
+# ``spawnAt(..., getCFrame(tOrigin))`` to source from ``tWeapon`` instead.
+# That fix is now obsolete — replaced by a generic converter-level wrap
+# in ``scene_converter._wrap_geometry_with_children_into_model``: when a
+# Unity node has both visual geometry AND child transforms, the converter
+# emits a ``Model`` with the geometry as an inner child, so
+# ``Model:PivotTo`` propagates rotation to all descendants (including
+# ``tOrigin``). The Turret script's ``getCFrame(tOrigin)`` then returns
+# the correctly-aimed CFrame without a per-game patch.
+
+
+# ---------------------------------------------------------------------------
+# Pack: door_module_player_to_attribute
+# ---------------------------------------------------------------------------
+#
+# A second AI-transpile shape for Unity's ``other.GetComponent<Player>().hasKey``
+# probe: instead of ``_G.Player.hasKey()`` (handled by
+# ``door_global_player_to_attribute`` above), Claude sometimes emits a
+# ``getPlayerMod()`` / ``require(PlayerModule)`` pattern that calls
+# ``mod.hasKey()`` on the resolved module. Same coupling failure as the
+# ``_G`` shape:
+#
+#   1. ``Player.luau`` runs as a LocalScript whose ``gotKey`` flag is bound
+#      to the client's instance. A server-side ``require(Player)`` returns
+#      a separate server-side instance whose ``gotKey`` is always false.
+#   2. The fallback ``PlayerScripts.Player:GetAttribute("hasKey")`` reads
+#      an attribute on the wrong object — ``Pickup`` writes ``hasX`` on
+#      the ``Player`` instance (replicates), not on ``PlayerScripts.Player``.
+#
+# Rewrite ``local function playerHasX(playerInstance)`` to read directly
+# from the Player-instance attribute that the pickup pack writes.
+
+_DOOR_MODULE_PLAYER_HELPER_RE = re.compile(
+    r"local function (player[Hh]as\w+)\s*\(\s*(\w+)\s*\)"
+    r"(?P<body>.*?)"
+    r"^end$",
+    re.DOTALL | re.MULTILINE,
+)
+
+
+def _detect_door_module_player_lookup(scripts: list["RbxScript"]) -> bool:
+    for s in scripts:
+        if s.name != "Door":
+            continue
+        src = s.source or ""
+        # Cheap detector: the playerHas* helper plus a PlayerScripts
+        # lookup OR a getPlayerMod call. Both are unique to this AI shape.
+        if "playerHas" in src and ("getPlayerMod" in src or 'PlayerScripts' in src):
+            return True
+    return False
+
+
+@patch_pack(
+    name="door_module_player_to_attribute",
+    description="Rewrite ``playerHasX(playerInstance)`` helpers in Door "
+    "scripts whose AI body required the Player ModuleScript or read "
+    "``PlayerScripts.Player:GetAttribute`` to instead read "
+    "``playerInstance:GetAttribute('hasX')`` — the server-replicated "
+    "attribute the Pickup coherence pack writes. Without this, the Door "
+    "fires Touched but its key check returns false, so the door never "
+    "opens even after the player picks up the key.",
+    detect=_detect_door_module_player_lookup,
+    after=("pickup_remote_event_server",),
+)
+def _fix_door_module_player_lookup(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        if s.name != "Door":
+            continue
+        original = s.source
+
+        def _replace(m: "re.Match[str]") -> str:
+            fn_name = m.group(1)
+            arg_name = m.group(2)
+            body = m.group("body")
+            # Skip helpers that don't reference the module/PlayerScripts
+            # path — they're already correct.
+            if "getPlayerMod" not in body and "PlayerScripts" not in body:
+                return m.group(0)
+            # Derive attribute name from the function name:
+            # ``playerHasKey`` → ``hasKey``. Falls back to ``hasKey`` if
+            # the pattern doesn't yield a clean suffix.
+            suffix = fn_name[len("playerHas"):]
+            attr = ("has" + suffix) if suffix else "hasKey"
+            return (
+                f"local function {fn_name}({arg_name})\n"
+                f"    -- Pickup pack writes ``Player:SetAttribute({attr!r}, true)``\n"
+                f"    -- server-side on the Player instance — replicates to all\n"
+                f"    -- scripts. Door runs server-side, so this is the only\n"
+                f"    -- check that reflects state set by the client's pickup.\n"
+                f"    return {arg_name} ~= nil and {arg_name}:GetAttribute({attr!r}) == true\n"
+                f"end"
+            )
+
+        s.source = _DOOR_MODULE_PLAYER_HELPER_RE.sub(_replace, s.source)
+        if s.source != original:
+            fixes += 1
+            log.info(
+                "  Rewrote Door module-Player gameplay-flag lookups in '%s'", s.name,
+            )
+    return fixes
+
+
 # ---------------------------------------------------------------------------
 # Pack: fps_default_controls_off
 # ---------------------------------------------------------------------------
@@ -1958,6 +2061,24 @@ local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 
 local container = script.Parent
+
+-- Template-guard. The bullet template Script has ``RunContext = Server``,
+-- so Roblox runs it as a server script regardless of parent — including
+-- when it sits in ``ReplicatedStorage.Templates`` at place load. Without
+-- this guard, the template's own script applies velocity to the template
+-- and ``Debris:AddItem(container, fadeTime)`` destroys the template
+-- ``fadeTime`` seconds in. Subsequent ``Turret.luau`` ``template:Clone()``
+-- calls then return a Part with no Script child (clones of a destroyed
+-- instance), so the spawned bullets fall under gravity with no velocity
+-- and never damage the player.
+do
+    local p = container and container.Parent
+    if p and (p.Name == "Templates" or p:IsA("ServerStorage")
+        or p:IsA("ReplicatedStorage")) then
+        return
+    end
+end
+
 if container:IsA("Model") and not container.PrimaryPart then
     container.PrimaryPart = container:FindFirstChildWhichIsA("BasePart")
 end
@@ -2004,8 +2125,50 @@ antiG.Attachment0 = att0
 antiG.ApplyAtCenterOfMass = true
 antiG.Parent = rootPart
 
+-- Resolve aim direction. Bullets spawn at the Unity ``Origin`` empty,
+-- but its local rotation within the parent ``Weapon`` varies across
+-- prefab instances (some have identity orientation, some are flipped
+-- 158° — measured live on SimpleFPS turrets). Using the bullet's own
+-- LookVector fires backward on the rotated instances. Use the parent
+-- Weapon (or whatever container is two ancestors up — same depth as
+-- the Turret.luau ``firstStructuralChild(firstStructuralChild(...))``
+-- climb) which Turret.luau aims via ``CFrame.lookAt(weaponPos, targetPos)``
+-- every frame, so its LookVector reliably points at the player.
+local _aimCF = getCFrame()
+do
+    local _ancestor = container.Parent
+    while _ancestor and _ancestor ~= workspace do
+        if (_ancestor:IsA("Model") or _ancestor:IsA("BasePart"))
+            and _ancestor.Name == "Weapon" then
+            _aimCF = _ancestor:IsA("Model")
+                and _ancestor:GetPivot() or _ancestor.CFrame
+            break
+        end
+        _ancestor = _ancestor.Parent
+    end
+end
+
+-- Push the bullet 3 studs forward of the muzzle BEFORE applying
+-- velocity. Unity's ``Origin`` empty has no collider so spawning
+-- inside the weapon's mesh bounding volume is fine in Unity, but in
+-- Roblox the bullet's first-frame raycast back-traces from this
+-- in-mesh position and self-destructs against the weapon. Teleport
+-- via ``container.CFrame = …`` AFTER applying velocity also wipes
+-- ``AssemblyLinearVelocity`` back to zero — so order matters: push,
+-- THEN velocity.
+do
+    local _pushedCF = _aimCF + _aimCF.LookVector * 3
+    if container:IsA("Model") then
+        container:PivotTo(_pushedCF)
+    else
+        container.CFrame = _pushedCF
+    end
+end
+
 -- Initial velocity in stud-space (Unity m/s × STUDS_PER_METER).
-rootPart.AssemblyLinearVelocity = getCFrame().LookVector * (force * STUDS_PER_METER)
+-- Computed from the aim CFrame (parent Weapon when found, falling
+-- back to the bullet's own CFrame for non-turret bullets).
+rootPart.AssemblyLinearVelocity = _aimCF.LookVector * (force * STUDS_PER_METER)
 
 -- Trail for visible trajectory
 local att1 = Instance.new("Attachment")
