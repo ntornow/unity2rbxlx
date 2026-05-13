@@ -390,34 +390,152 @@ class TestRehydrateRound1Regressions:
             "append a duplicate on every resume"
         )
 
-    def test_alias_refresh_pins_parent_path_back_to_replicatedstorage(
+    def test_marker_alias_misclassified_to_server_storage_is_rescued(
         self, tmp_path: Path,
     ) -> None:
-        """If a rehydrated/classified alias ended up at a non-
-        ReplicatedStorage location (e.g. ``ServerStorage`` because a
-        user-authored same-named module was server-only), the alias
-        refresh must drag it back so the historic require path
-        ``ReplicatedStorage.AutoFpsEventDispatch`` resolves.
+        """Round-2 reconciliation: a rehydrated alias that carries
+        OUR alias marker (e.g. our own previous emit) but got moved
+        to ``ServerStorage`` by the storage classifier — perhaps no
+        HUD caller observed in this run — must be rescued back to
+        the alias path via the marker-recognition fallback. Without
+        the rescue the path-scoped policy would skip the refresh and
+        append a fresh alias, leaving a duplicate at the wrong
+        location.
         """
+        from converter.pipeline import _EVENT_DISPATCH_ALIAS_BODY
         pl = _make_pipeline_with_fps_opt_in(tmp_path, scaffolding=["fps"])
+        # Our previous alias emit moved to ServerStorage by classifier.
         pl.state.rbx_place.scripts.append(
             RbxScript(
                 name=_EVENT_DISPATCH_ALIAS_NAME,
-                source="-- mis-classified user module body\n",
+                source=_EVENT_DISPATCH_ALIAS_BODY,  # carries marker
                 script_type="ModuleScript",
                 parent_path="ServerStorage",
             )
         )
         pl._inject_runtime_modules()
+        # Exactly one alias entry — the rescued one.
+        alias_entries = [
+            s for s in pl.state.rbx_place.scripts
+            if s.name == _EVENT_DISPATCH_ALIAS_NAME
+        ]
+        assert len(alias_entries) == 1
+        # parent_path pulled back so the rbxlx writer routes to RS
+        # (None ⇒ ModuleScript default of ReplicatedStorage).
+        assert alias_entries[0].parent_path in (None, "ReplicatedStorage")
+
+    def test_unmarked_modulescript_at_server_storage_is_left_alone(
+        self, tmp_path: Path,
+    ) -> None:
+        """Round-2 [P2]: a user-authored ModuleScript named
+        ``AutoFpsEventDispatch`` parked in ``ServerStorage`` (i.e.
+        not at the alias path) is OUT of the overwrite policy.
+        Path-scoping leaves it untouched, and a fresh alias is
+        emitted at ReplicatedStorage.
+        """
+        pl = _make_pipeline_with_fps_opt_in(tmp_path, scaffolding=["fps"])
+        pl.state.rbx_place.scripts.append(
+            RbxScript(
+                name=_EVENT_DISPATCH_ALIAS_NAME,
+                source="-- user-authored, not converter-marker\n",
+                script_type="ModuleScript",
+                parent_path="ServerStorage",
+            )
+        )
+        pl._inject_runtime_modules()
+        alias_entries = [
+            s for s in pl.state.rbx_place.scripts
+            if s.name == _EVENT_DISPATCH_ALIAS_NAME
+        ]
+        # Two coexist: user at ServerStorage, alias at RS.
+        assert len(alias_entries) == 2
+        user_entry = next(
+            s for s in alias_entries
+            if s.parent_path == "ServerStorage"
+        )
+        alias_entry = next(
+            s for s in alias_entries
+            if s.parent_path in (None, "ReplicatedStorage")
+        )
+        # User's source preserved verbatim.
+        assert "-- user-authored, not converter-marker" in user_entry.source
+        # Alias body has the WaitForChild chain.
+        assert ":WaitForChild(\"AutoGen\")" in alias_entry.source
+
+    def test_alias_fresh_emit_has_source_path(
+        self, tmp_path: Path,
+    ) -> None:
+        """Round-2 codex [P3]: fresh-emit alias must carry a
+        ``source_path`` so the finalize-to-disk path writes
+        ``scripts/AutoFpsEventDispatch.luau`` regardless of whether
+        ``scripts/animations/`` exists. The name-based fallback in
+        ``_subphase_finalize_scripts_to_disk`` skips no-source_path
+        writes when an animations/ cache is present; without the
+        explicit source_path the alias would never reach disk on
+        projects with animation output, breaking preserve-scripts
+        resume.
+        """
+        pl = _make_pipeline_with_fps_opt_in(tmp_path, scaffolding=["fps"])
+        pl._inject_runtime_modules()
         alias = next(
             s for s in pl.state.rbx_place.scripts
             if s.name == _EVENT_DISPATCH_ALIAS_NAME
         )
-        # parent_path forced back to either ``None`` (rbxlx writer's
-        # ModuleScript default routes to ReplicatedStorage) or the
-        # explicit string. ``"ServerStorage"`` would leave the alias
-        # unreachable from the historic require path.
-        assert alias.parent_path in (None, "ReplicatedStorage")
+        assert alias.source_path == f"{_EVENT_DISPATCH_ALIAS_NAME}.luau"
+
+    def test_lowercase_canonical_migrated_on_fps_run(
+        self, tmp_path: Path,
+    ) -> None:
+        """Round-2 codex [P3]: an output produced by the round-1-buggy
+        commit on a case-sensitive filesystem has a stale
+        ``scripts/AutoGen/event_dispatch.luau`` (lowercase stem).
+        Rehydrate surfaces it as ``name="event_dispatch"`` — outside
+        the canonical name set, so the pre-pass leaves it. The
+        canonical refresh path must sweep it out before emitting the
+        CapCase stem; otherwise the upgrade leaves a dead duplicate
+        forever.
+        """
+        pl = _make_pipeline_with_fps_opt_in(tmp_path, scaffolding=["fps"])
+        # Simulated rehydrate of a pre-round-1-fix lowercase canonical.
+        legacy_marker_body = (
+            "-- @@GAMEPLAY_RUNTIME_MODULE@@ converter-owned (EventDispatch)\n"
+            "local EventDispatch = {}\n"
+            "return EventDispatch\n"
+        )
+        pl.state.rbx_place.scripts.append(
+            RbxScript(
+                name="event_dispatch",
+                source=legacy_marker_body,
+                script_type="ModuleScript",
+                parent_path="ReplicatedStorage.AutoGen",
+            )
+        )
+        pl._inject_runtime_modules()
+        names = [s.name for s in pl.state.rbx_place.scripts]
+        # Lowercase variant pruned.
+        assert "event_dispatch" not in names
+        # CapCase canonical present (the fresh emit).
+        assert _EVENT_DISPATCH_CANONICAL_NAME in names
+
+    def test_lowercase_user_script_not_swept_by_migration(
+        self, tmp_path: Path,
+    ) -> None:
+        """The migration sweep MUST NOT touch a user-authored script
+        that happens to be named ``event_dispatch`` but carries no
+        ``@@GAMEPLAY_RUNTIME_MODULE@@`` marker and no legacy header.
+        Marker-gated detection keeps user code intact.
+        """
+        pl = _make_pipeline_with_fps_opt_in(tmp_path, scaffolding=["fps"])
+        pl.state.rbx_place.scripts.append(
+            RbxScript(
+                name="event_dispatch",
+                source="-- user's event_dispatch helper (snake_case)\nreturn true\n",
+                script_type="ModuleScript",
+            )
+        )
+        pl._inject_runtime_modules()
+        names = [s.name for s in pl.state.rbx_place.scripts]
+        assert "event_dispatch" in names
 
     def test_alias_refresh_keeps_none_parent_path_untouched(
         self, tmp_path: Path,
@@ -655,6 +773,51 @@ class TestFpsOptOutPrunesRehydratedScaffolding:
         pl._subphase_inject_autogen_scripts()
         names = {s.name for s in pl.state.rbx_place.scripts}
         assert "FpsClient" not in names
+
+    def test_opt_out_keeps_user_script_named_alias_outside_path(
+        self, tmp_path: Path,
+    ) -> None:
+        """Round-2 codex [P2]: a user-authored ``Script`` named
+        ``AutoFpsEventDispatch`` parked in ``ServerScriptService``
+        (not at the alias path) must survive the opt-out prune. The
+        marker-gated pruner rejects it (wrong script_type, wrong
+        parent_path, no marker), preserving user code.
+        """
+        pl = self._make_pipeline(tmp_path)
+        pl.state.rbx_place.scripts.append(
+            RbxScript(
+                name=_EVENT_DISPATCH_ALIAS_NAME,
+                source="-- user-authored Script, no converter marker\n",
+                script_type="Script",
+                parent_path="ServerScriptService",
+            )
+        )
+        pl._subphase_inject_autogen_scripts()
+        names = [s.name for s in pl.state.rbx_place.scripts]
+        assert _EVENT_DISPATCH_ALIAS_NAME in names
+
+    def test_opt_out_keeps_user_module_named_alias_at_replicated(
+        self, tmp_path: Path,
+    ) -> None:
+        """Round-2 codex [P2] companion: a user-authored ModuleScript
+        named ``AutoFpsEventDispatch`` parked at ReplicatedStorage
+        but lacking the converter alias marker must also survive the
+        opt-out prune. The pruner gates on marker presence; user
+        content without the marker is left alone even at the alias
+        path.
+        """
+        pl = self._make_pipeline(tmp_path)
+        pl.state.rbx_place.scripts.append(
+            RbxScript(
+                name=_EVENT_DISPATCH_ALIAS_NAME,
+                source="-- user-authored ModuleScript, no marker\nreturn {}\n",
+                script_type="ModuleScript",
+                parent_path="ReplicatedStorage",
+            )
+        )
+        pl._subphase_inject_autogen_scripts()
+        names = [s.name for s in pl.state.rbx_place.scripts]
+        assert _EVENT_DISPATCH_ALIAS_NAME in names
 
     def test_opt_out_drops_autogen_event_dispatch_alias(
         self, tmp_path: Path,
