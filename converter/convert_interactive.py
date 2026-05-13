@@ -892,7 +892,20 @@ def assemble(unity_project_path: str, output_dir: str,
         scaffolding=scaffolding_list,
         use_gameplay_adapters=pipeline_use_gameplay_adapters,
     )
-    pipeline._retranspile = retranspile
+    # PR #74 codex round-8 [P2]: OR with the existing value rather
+    # than overwrite. ``_make_pipeline`` calls
+    # ``_invalidate_transpile_cache_for_mode_flip()`` when the
+    # explicit gameplay-mode override differs from the persisted
+    # ctx; that sets ``pipeline._retranspile = True`` so
+    # ``_subphase_emit_scripts_to_disk`` wipes the previous mode's
+    # ``scripts/`` cache. An unconditional ``pipeline._retranspile =
+    # retranspile`` write here clobbered that ``True`` back to the
+    # caller's flag — and if ``transpile_scripts`` runs zero scripts
+    # this pass (Unity project no longer has runtime C# files),
+    # the preserve-scripts fallback rehydrates the stale cache.
+    pipeline._retranspile = retranspile or getattr(
+        pipeline, "_retranspile", False,
+    )
 
     # Plumb --universe-id / --place-id into ctx so resolve_assets can run
     # headless mesh resolution on the first assemble invocation. Without

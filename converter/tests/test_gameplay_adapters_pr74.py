@@ -290,6 +290,47 @@ class TestModeFlipInvalidatesTranspileCache:
             "force an AI transpile call, which is wasteful."
         )
 
+    def test_interactive_assemble_preserves_invalidator_retranspile(
+        self,
+    ) -> None:
+        """PR #74 codex round-8 [P2]: ``convert_interactive
+        assemble`` must OR ``--retranspile`` with the invalidator's
+        ``_retranspile`` (set by ``_make_pipeline`` when the mode
+        flips). An unconditional assignment clobbers the True the
+        invalidator set, and ``_subphase_emit_scripts_to_disk`` falls
+        back to ``preserve_scripts`` if zero scripts transpile this
+        pass — silently rehydrating the previous-mode cache.
+        """
+        import inspect
+        from convert_interactive import assemble
+
+        # ``assemble`` is a click ``Command`` — get the underlying
+        # function via ``.callback`` for inspect.getsource. Walk
+        # line-by-line so a comment that mentions ``pipeline._retranspile``
+        # (the regression description in the surrounding comment) is
+        # skipped — we want the actual assignment statement.
+        src = inspect.getsource(assemble.callback)
+        assign_line = None
+        for raw in src.splitlines():
+            line = raw.lstrip()
+            if line.startswith("#"):
+                continue
+            if "pipeline._retranspile" in line and "=" in line:
+                assign_line = line
+                break
+        assert assign_line is not None, (
+            "convert_interactive assemble no longer assigns "
+            "pipeline._retranspile — premise broke."
+        )
+        # The fix uses ``or getattr(pipeline, "_retranspile", False)``
+        # so the invalidator's True survives.
+        assert "getattr(pipeline" in assign_line or " or " in assign_line, (
+            f"convert_interactive assemble unconditionally overwrites "
+            f"pipeline._retranspile — clobbers the invalidator's "
+            f"True. Codex PR #74 round-8 [P2] regressed.\n"
+            f"Line: {assign_line!r}"
+        )
+
     def test_make_pipeline_fires_invalidator_on_mode_flip(self) -> None:
         """convert_interactive._make_pipeline must mirror the
         resume() invalidation logic — otherwise interactive assemble
@@ -575,45 +616,116 @@ class TestRehydratedModuleMatchByName:
     a duplicate was appended.
     """
 
-    def test_inject_loop_matches_by_name_alone(self) -> None:
+    def test_inject_loop_uses_converter_module_predicate(self) -> None:
         """Source pin: the injection-loop's existing-match filter
-        must NOT include ``parent_path`` in the predicate (the
-        rehydrate-path bug). Backfilling the parent_path inside the
-        refresh branch is fine — that's the FIX — but the match
-        itself has to find rehydrated entries with parent_path=None.
+        must go through ``_is_converter_gameplay_runtime_module``.
+        Round-7 [P1] required matching rehydrated entries with
+        ``parent_path=None``; round-8 [P1] required NOT touching
+        user scripts that share a generic class name. The combined
+        predicate lives in the helper.
         """
         import inspect
         from converter.pipeline import Pipeline as _Pipeline
 
         src = inspect.getsource(_Pipeline._inject_runtime_modules)
-
-        # Find the `existing = [...]` list-comp that drives the
-        # gameplay-modules refresh branch. It must filter by
-        # ``s.name == module_name`` and NOT also gate on
-        # parent_path. Slice the source around the relevant `for
-        # module_name, filename in gameplay_modules:` loop.
         loop_idx = src.find("for module_name, filename in gameplay_modules:")
         assert loop_idx != -1, (
             "_inject_runtime_modules no longer has the "
             "gameplay_modules injection loop — test premise broke."
         )
-        loop_body = src[loop_idx : loop_idx + 2000]
-        # The list-comp lives within the first ~2000 chars of the loop.
+        loop_body = src[loop_idx : loop_idx + 2500]
         existing_idx = loop_body.find("existing = [")
         assert existing_idx != -1, (
             "_inject_runtime_modules dropped the existing-match "
             "list-comp."
         )
-        # Grab the comprehension body (10 lines after).
-        comp = "\n".join(loop_body[existing_idx:].splitlines()[:6])
-        assert "s.name == module_name" in comp, (
-            "Existing-match filter no longer keys off s.name — "
-            "rehydrated modules can't be found."
+        comp = "\n".join(loop_body[existing_idx:].splitlines()[:7])
+        assert "_is_converter_gameplay_runtime_module" in comp, (
+            "Existing-match list-comp no longer goes through "
+            "_is_converter_gameplay_runtime_module — name+"
+            "parent_path-only matching regresses codex PR #74 "
+            "round-8 [P1] (user scripts named Composer/Effects/etc. "
+            "would be clobbered)."
         )
-        assert "parent_path" not in comp, (
-            "Existing-match filter still references parent_path — "
-            "rehydrated modules have parent_path=None and the "
-            "filter misses them. Codex PR #74 round-7 [P1] regressed."
+
+    def test_predicate_accepts_rehydrated_no_parent_path(self) -> None:
+        """``_is_converter_gameplay_runtime_module`` must return True
+        for a rehydrated module: parent_path=None, source starts with
+        the canonical ``-- <filename-stem>`` or ``-- <module_name>``
+        header."""
+        import types
+        from converter.pipeline import _is_converter_gameplay_runtime_module
+
+        rehydrated = types.SimpleNamespace(
+            name="Composer",
+            parent_path=None,
+            source="-- composer.luau: per-instance behaviour composer.\n",
+        )
+        assert _is_converter_gameplay_runtime_module(
+            rehydrated, "Composer", "composer.luau",
+        ) is True, "Rehydrated converter module not recognised."
+
+        # Also accepts the alternate ``-- Composer:`` header that
+        # the in-tree composer.luau currently uses.
+        alt = types.SimpleNamespace(
+            name="Composer",
+            parent_path=None,
+            source="-- Composer: dispatch a Behavior's capability tuple\n",
+        )
+        assert _is_converter_gameplay_runtime_module(
+            alt, "Composer", "composer.luau",
+        ) is True
+
+    def test_predicate_rejects_user_script_with_module_name(self) -> None:
+        """Codex PR #74 round-8 [P1]: a user-authored script named
+        ``Composer`` or ``Effects`` with a non-converter source must
+        NOT match. Three rejection cases:
+          (a) parent_path routed to a user-meaningful location.
+          (b) parent_path=None but source doesn't start with the
+              converter header.
+          (c) parent_path=None but source has a completely different
+              comment line.
+        """
+        import types
+        from converter.pipeline import _is_converter_gameplay_runtime_module
+
+        # (a) classify_storage routed user Composer.cs → ReplicatedStorage
+        user_routed = types.SimpleNamespace(
+            name="Composer",
+            parent_path="ReplicatedStorage",
+            source="-- user-authored Composer module\n",
+        )
+        assert _is_converter_gameplay_runtime_module(
+            user_routed, "Composer", "composer.luau",
+        ) is False, (
+            "User script routed to ReplicatedStorage matched as "
+            "converter runtime module — round-8 [P1] regressed."
+        )
+
+        # (b) parent_path None but no recognisable header.
+        user_unrouted = types.SimpleNamespace(
+            name="Effects",
+            parent_path=None,
+            source="local Effects = {}\nreturn Effects\n",
+        )
+        assert _is_converter_gameplay_runtime_module(
+            user_unrouted, "Effects", "effects.luau",
+        ) is False, (
+            "User script with no header matched as converter "
+            "runtime module — round-8 [P1] regressed."
+        )
+
+        # (c) parent_path None with an unrelated comment.
+        user_with_unrelated_comment = types.SimpleNamespace(
+            name="Gameplay",
+            parent_path=None,
+            source="-- user gameplay manager\n",
+        )
+        assert _is_converter_gameplay_runtime_module(
+            user_with_unrelated_comment, "Gameplay", "gameplay.luau",
+        ) is False, (
+            "User script with unrelated comment matched on prefix "
+            "alone — predicate is too loose."
         )
 
     def test_refresh_branch_backfills_parent_path(self) -> None:

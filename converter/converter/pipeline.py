@@ -170,6 +170,58 @@ _ALL_GAMEPLAY_RUNTIME_MODULE_NAMES: frozenset[str] = frozenset({
     "Gameplay",
 })
 
+
+def _is_converter_gameplay_runtime_module(
+    script: _ScriptLike, module_name: str, filename: str,
+) -> bool:
+    """Return True when *script* is the converter's emitted version of
+    a named gameplay runtime module (either fresh in-memory or
+    rehydrated from a previous run), as opposed to a user-authored
+    script that happens to share the module's generic class name
+    (codex PR #74 round-8 [P1]).
+
+    Two acceptance paths:
+
+      1. ``parent_path == "ReplicatedStorage.AutoGen"`` — already
+         routed to the converter-owned namespace, either by the
+         current write_output pass or by a previous run that wrote
+         the path into ``conversion_plan.json``. Definitively the
+         converter's module.
+      2. ``parent_path is None`` AND the source's first line starts
+         with the canonical converter-runtime header prefix
+         (``"-- <filename-stem>"`` OR ``"-- <module_name>"``). This
+         covers the rehydrate path where
+         ``_rehydrate_scripts_from_disk`` couldn't restore
+         parent_path because ``conversion_plan.json`` was written
+         before runtime-module injection. User scripts named
+         ``Composer`` / ``Gameplay`` / etc. that have NO parent_path
+         after classify_storage rarely begin with a comment that
+         matches the runtime header shape — and never begin with
+         exactly ``"-- composer"`` etc. unless they ARE one of our
+         emitted modules.
+
+    Any other ``parent_path`` (e.g. ``"ReplicatedStorage"`` from
+    classify_storage routing a user ``Composer`` MonoBehaviour) is
+    treated as user-owned and left alone.
+    """
+    if getattr(script, "name", None) != module_name:
+        return False
+    parent = getattr(script, "parent_path", None)
+    if parent == "ReplicatedStorage.AutoGen":
+        return True
+    if parent is not None:
+        return False
+    source = getattr(script, "source", None) or ""
+    # Canonical first-line shape. Compare lowercased so casing
+    # drift across converter versions (e.g. ``-- Composer:`` vs
+    # ``-- composer.luau:``) doesn't false-negative.
+    first_line_lower = source[:96].lower()
+    filename_stem = filename.split(".", 1)[0].lower()
+    return (
+        first_line_lower.startswith(f"-- {filename_stem}")
+        or first_line_lower.startswith(f"-- {module_name.lower()}")
+    )
+
 # PR #74 codex round-4 [P1] signals — when scanning emitted adapter
 # stub source on disk (rehydrate / publish rebuild path,
 # ``state.gameplay_matches`` empty by design), look for the exact
@@ -4529,17 +4581,41 @@ script.Disabled = true
             current_module_names: frozenset[str] = frozenset(
                 name for name, _ in gameplay_modules
             )
+            # Build a lookup for the filename associated with each
+            # known module so the content-aware predicate can compare
+            # source headers. Names not in the current emit set use
+            # the canonical lowercase stem.
+            _all_module_filenames: dict[str, str] = {
+                "Composer": "composer.luau",
+                "Triggers": "triggers.luau",
+                "Movement": "movement.luau",
+                "Lifetime": "lifetime.luau",
+                "HitDetection": "hit_detection.luau",
+                "Effects": "effects.luau",
+                "DamageProtocol": "damage_protocol.luau",
+                "Gameplay": "gameplay.luau",
+            }
             kept: list = []
             for s in self.state.rbx_place.scripts:
+                name = getattr(s, "name", None)
                 if (
-                    getattr(s, "name", None) in _ALL_GAMEPLAY_RUNTIME_MODULE_NAMES
-                    and s.name not in current_module_names
+                    name in _ALL_GAMEPLAY_RUNTIME_MODULE_NAMES
+                    and name not in current_module_names
+                    and _is_converter_gameplay_runtime_module(
+                        s, name, _all_module_filenames[name],
+                    )
                 ):
+                    # PR #74 codex round-8 [P1]: name match alone is
+                    # insufficient — a user script named e.g.
+                    # ``Composer`` / ``Effects`` would be pruned. The
+                    # predicate above checks parent_path AND a
+                    # source-header signature so user scripts are
+                    # left alone.
                     log.info(
                         "[write_output] Pruned stale gameplay-adapter "
                         "module '%s' (not needed this run; "
                         "_damage_protocol_needed=%s)",
-                        s.name,
+                        name,
                         self._damage_protocol_needed(),
                     )
                     injected += 1  # count as a mutation for the log
@@ -4563,15 +4639,25 @@ script.Disabled = true
                 # version always lives on disk in
                 # ``converter/runtime/gameplay/``.
                 #
-                # PR #74 codex round-7 [P1]: match by name alone — see
-                # the prune-pass comment above. The match must also
-                # backfill the canonical ``parent_path`` so the rbxlx
-                # writer routes the refreshed script under
+                # PR #74 codex round-7 [P1]: match rehydrated entries
+                # (parent_path=None) AND fresh in-memory copies
+                # (parent_path="ReplicatedStorage.AutoGen"). PR #74
+                # codex round-8 [P1] tightened the predicate further —
+                # name+parent_path match alone would clobber a user
+                # script that happens to share a generic class name
+                # like ``Composer`` or ``Effects``. The
+                # ``_is_converter_gameplay_runtime_module`` helper
+                # adds a source-header signature check so user code
+                # is left alone. The match must also backfill the
+                # canonical ``parent_path`` so the rbxlx writer routes
+                # the refreshed script under
                 # ``ReplicatedStorage.AutoGen`` instead of the
                 # heuristic fallback path.
                 existing = [
                     s for s in self.state.rbx_place.scripts
-                    if s.name == module_name
+                    if _is_converter_gameplay_runtime_module(
+                        s, module_name, filename,
+                    )
                 ]
                 if existing:
                     refreshed = False
