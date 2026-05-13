@@ -769,6 +769,58 @@ class TestRound3Regressions:
         )
         assert "EventDispatch" not in all_buckets
 
+    def test_template_attach_prefers_user_script_over_canonical(
+        self, tmp_path: Path,
+    ) -> None:
+        """Round-5 codex [P2]: ``_attach_monobehaviour_scripts_to_templates``
+        builds its script-by-name index from the flat list first. The
+        canonical ``EventDispatch`` ModuleScript (appended by
+        ``_inject_runtime_modules``) shares the user's class name and
+        would otherwise shadow the user's MonoBehaviour Script,
+        tripping the subsequent ``script_type != "Script"`` guard and
+        skipping every template attachment.
+
+        Pin: the index now filters to ``script_type == "Script"`` so
+        the user's behaviour reaches the template parts.
+        """
+        from core.roblox_types import RbxPart
+        pl = _make_pipeline_with_fps_opt_in(tmp_path, scaffolding=["fps"])
+        # Mock a user MonoBehaviour transpiled to a Script.
+        user_script = RbxScript(
+            name="EventDispatch",
+            source="-- user MonoBehaviour body\nprint('user EventDispatch')\n",
+            script_type="Script",
+        )
+        # Canonical added by _inject_runtime_modules (a ModuleScript
+        # with the marker) — same flat-list location, sharing the
+        # name.
+        canonical = RbxScript(
+            name="EventDispatch",
+            source=(
+                "-- @@GAMEPLAY_RUNTIME_MODULE@@ converter-owned (EventDispatch)\n"
+                "return {}\n"
+            ),
+            script_type="ModuleScript",
+            parent_path="ReplicatedStorage.AutoGen",
+        )
+        # Order matters: canonical first to trigger the codex bug
+        # (canonical wins setdefault, user's Script never indexed).
+        pl.state.rbx_place.scripts.extend([canonical, user_script])
+        # Template part referencing the user's class.
+        template_part = RbxPart(name="UserPrefab", class_name="Part")
+        template_part.attributes["_ScriptClass"] = "EventDispatch"
+        pl.state.rbx_place.replicated_templates = [template_part]
+        pl._attach_monobehaviour_scripts_to_templates()
+        # User's Script was cloned onto the template.
+        attached_names = {s.name for s in (template_part.scripts or [])}
+        assert "EventDispatch" in attached_names
+        attached = next(
+            s for s in template_part.scripts if s.name == "EventDispatch"
+        )
+        # The Script — not the ModuleScript — wins.
+        assert attached.script_type == "Script"
+        assert "user MonoBehaviour body" in attached.source
+
     def test_opt_out_prunes_offpath_marked_alias(
         self, tmp_path: Path,
     ) -> None:

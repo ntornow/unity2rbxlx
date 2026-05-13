@@ -4700,17 +4700,34 @@ script.Disabled = true
         # currently live: the flat list + every workspace part's
         # ``.scripts`` (recursive). First-found wins; ties broken by
         # the flat list (most authoritative source).
+        #
+        # PR #75 codex round-5 [P2]: index is Script-only. A user-
+        # authored MonoBehaviour transpiles to ``script_type="Script"``;
+        # the canonical ``EventDispatch`` ModuleScript that
+        # ``_inject_runtime_modules`` adds shares the user's class
+        # name and would otherwise win the flat-list ``setdefault``
+        # (because adapter injection appends to the flat list before
+        # this pass runs in ``_generate_prefab_packages``). The
+        # subsequent ``script_type != "Script"`` guard would then
+        # silently skip the user's behaviour on every template clone.
+        # Excluding non-Script entries up-front keeps the canonical
+        # out of the index and lets the workspace walk surface the
+        # user's Script.
         scripts_by_name: dict[str, RbxScript] = {}
 
         def _collect(parts: list) -> None:
             for p in parts or []:
                 for s in getattr(p, "scripts", None) or []:
+                    if s.script_type != "Script":
+                        continue
                     if s.name not in scripts_by_name:
                         scripts_by_name[s.name] = s
                 _collect(getattr(p, "children", None) or [])
 
         # Flat list first (overrides any scene-attached duplicate).
         for s in self.state.rbx_place.scripts or []:
+            if s.script_type != "Script":
+                continue
             scripts_by_name.setdefault(s.name, s)
         _collect(self.state.rbx_place.workspace_parts or [])
 
