@@ -150,6 +150,17 @@ _DAMAGE_CAPABILITY_KINDS: frozenset[str] = frozenset({
     "effect.splash",
 })
 
+# PR #74 codex round-11 [P2]: capability kind unique to the door
+# adapter slice (Trigger.OnBoolAttribute → Movement.AttributeDrivenTween).
+# Used to gate the rehydration prune's ``_AutoFpsDoorTweenInjected``
+# block-strip: if a project has adapter stubs for projectile / damage
+# but the Door class was divergent / deny-listed / not detected, the
+# legacy door tween block IS the only door-open implementation and
+# the strip would silently break door animation. The strip now
+# fires only when a door adapter will land this run.
+_DOOR_ADAPTER_CAPABILITY_KIND: str = "movement.attribute_driven_tween"
+_DOOR_ADAPTER_LUA_MARKER: str = '{kind = "movement.attribute_driven_tween"'
+
 # PR #74 codex round-6 [P1]: the converter-owned module names under
 # ``ReplicatedStorage.AutoGen``. Used by the rehydrate-aware injection
 # pre-pass to identify scripts that the converter owns end-to-end, so
@@ -374,6 +385,55 @@ def _place_has_legacy_damage_fireserver(
     def _has(script: _ScriptLike) -> bool:
         src = getattr(script, "source", None) or ""
         return _LEGACY_DAMAGE_FIRESERVER_MARKER in src
+
+    def _walk(parts: list[_PartLike]) -> bool:
+        for part in parts:
+            for s in getattr(part, "scripts", None) or []:
+                if _has(s):
+                    return True
+            if _walk(getattr(part, "children", None) or []):
+                return True
+        return False
+
+    for s in getattr(rbx_place, "scripts", None) or []:
+        if _has(s):
+            return True
+    if _walk(getattr(rbx_place, "workspace_parts", None) or []):
+        return True
+    return _walk(getattr(rbx_place, "replicated_templates", None) or [])
+
+
+def _place_has_door_adapter_stub(
+    rbx_place: "_PlaceLike | RbxPlace | None",
+) -> bool:
+    """Return True when any adapter stub in *rbx_place* declares the
+    door-shaped ``movement.attribute_driven_tween`` capability.
+
+    PR #74 codex round-11 [P2]: companion to
+    ``_place_has_damage_adapter_stub`` — gates the legacy door tween
+    block strip on the rehydrate / publish-rebuild path so projects
+    that don't have a Door adapter (Door class divergent / denied)
+    don't lose their legacy door animation.
+
+    Same belt-and-suspenders predicate: the capability literal AND
+    the composer's ``ADAPTER_STUB_MARKER`` must both appear in the
+    same script, so a user / generated Luau that incidentally
+    mentions ``movement.attribute_driven_tween`` doesn't false-
+    positive.
+
+    Walks ``rbx_place.scripts`` + ``workspace_parts`` +
+    ``replicated_templates``.
+    """
+    from converter.gameplay.composer import ADAPTER_STUB_MARKER
+
+    if rbx_place is None:
+        return False
+
+    def _has(script: _ScriptLike) -> bool:
+        src = getattr(script, "source", None) or ""
+        if ADAPTER_STUB_MARKER not in src:
+            return False
+        return _DOOR_ADAPTER_LUA_MARKER in src
 
     def _walk(parts: list[_PartLike]) -> bool:
         for part in parts:
@@ -2673,35 +2733,59 @@ return table.concat(allData, "\\n")'''
         # source (the marker can only land on Door.luau today but the
         # strip is name-agnostic so a future pack variant that uses
         # the same marker is also cleaned).
-        def _strip_in_scripts(scripts: list) -> None:
-            nonlocal pruned
-            for s in scripts:
-                src = getattr(s, "source", None)
-                if not src or _LEGACY_DOOR_TWEEN_MARKER not in src:
-                    continue
-                new_src, stripped = _strip_legacy_door_tween_block(src)
-                if stripped:
-                    s.source = new_src
-                    pruned += 1
-                    log.info(
-                        "[prune] Stripped %s block from script '%s'",
-                        _LEGACY_DOOR_TWEEN_MARKER.strip("- "),
-                        getattr(s, "name", "?"),
-                    )
+        #
+        # PR #74 codex round-11 [P2]: only strip the legacy block when
+        # a door adapter will land this run. ``door_tween_open`` is
+        # globally disabled whenever ``ctx.use_gameplay_adapters`` is
+        # True (see ``LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON``), but on
+        # a resumed output that already contains the marker AND has
+        # no door adapter this run (Door class divergent / deny-listed
+        # / not detected), the legacy block is the ONLY door-open
+        # implementation. Stripping it would silently break door
+        # animation. ``_door_adapter_will_emit`` checks both fresh-
+        # match and rehydrate-stub signals.
+        if self._door_adapter_will_emit():
+            def _strip_in_scripts(scripts: list) -> None:
+                nonlocal pruned
+                for s in scripts:
+                    src = getattr(s, "source", None)
+                    if not src or _LEGACY_DOOR_TWEEN_MARKER not in src:
+                        continue
+                    new_src, stripped = _strip_legacy_door_tween_block(src)
+                    if stripped:
+                        s.source = new_src
+                        pruned += 1
+                        log.info(
+                            "[prune] Stripped %s block from script '%s'",
+                            _LEGACY_DOOR_TWEEN_MARKER.strip("- "),
+                            getattr(s, "name", "?"),
+                        )
 
-        _strip_in_scripts(place.scripts)
+            _strip_in_scripts(place.scripts)
 
-        def _strip_in_parts(parts: list) -> None:
-            for part in parts:
-                part_scripts = getattr(part, "scripts", None) or []
-                if part_scripts:
-                    _strip_in_scripts(part_scripts)
-                children = getattr(part, "children", None)
-                if children:
-                    _strip_in_parts(children)
+            def _strip_in_parts(parts: list) -> None:
+                for part in parts:
+                    part_scripts = getattr(part, "scripts", None) or []
+                    if part_scripts:
+                        _strip_in_scripts(part_scripts)
+                    children = getattr(part, "children", None)
+                    if children:
+                        _strip_in_parts(children)
 
-        _strip_in_parts(getattr(place, "workspace_parts", None) or [])
-        _strip_in_parts(getattr(place, "replicated_templates", None) or [])
+            _strip_in_parts(getattr(place, "workspace_parts", None) or [])
+            _strip_in_parts(getattr(place, "replicated_templates", None) or [])
+        elif any(
+            _LEGACY_DOOR_TWEEN_MARKER in (getattr(s, "source", None) or "")
+            for s in place.scripts
+        ):
+            # No door adapter this run — keep the legacy block but
+            # surface in the log so operators understand why a
+            # marker'd Door.luau survives.
+            log.info(
+                "[prune] Kept legacy %s block in Door.luau — "
+                "no door adapter will replace it this run.",
+                _LEGACY_DOOR_TWEEN_MARKER.strip("- "),
+            )
 
         # 3. ``_AutoFpsHud`` ScreenGui removal — bundled with the
         # adapter prune per design doc, even though the HUD is
@@ -2782,6 +2866,40 @@ return table.concat(allData, "\\n")'''
             "run. The previous mode's ``scripts/`` output would "
             "otherwise survive the resume.",
         )
+
+    def _door_adapter_will_emit(self) -> bool:
+        """Return True when a Door-shaped adapter replacement will
+        land this run (a ``GameplayMatch`` carrying the
+        ``movement.attribute_driven_tween`` capability) OR a
+        previously-emitted door adapter stub is rehydrated.
+
+        PR #74 codex round-11 [P2]: the legacy
+        ``_AutoFpsDoorTweenInjected`` block strip in
+        ``_prune_legacy_gameplay_artifacts`` must not fire when the
+        adapter pipeline doesn't replace the Door class this run
+        (e.g. Door is divergent / deny-listed / not detected).
+        Without this gate, a project with adapter stubs for some
+        OTHER class (projectiles, damage) but no Door adapter would
+        lose its only door-open implementation when the strip nukes
+        the legacy block.
+
+        Two signals (mirrors ``_damage_protocol_needed`` shape):
+
+          1. Fresh-conversion: ``state.gameplay_matches`` contains
+             at least one match with
+             ``movement.attribute_driven_tween`` in
+             ``capability_kinds``.
+          2. Rehydrate-path: a script in ``state.rbx_place`` carries
+             the composer-emitted Lua literal
+             ``{kind = "movement.attribute_driven_tween"`` AND the
+             ``ADAPTER_STUB_MARKER`` on the same stub (the
+             round-7 [P2] tightening — substring-only would
+             false-positive on user code).
+        """
+        for match in self.state.gameplay_matches:
+            if _DOOR_ADAPTER_CAPABILITY_KIND in match.capability_kinds:
+                return True
+        return _place_has_door_adapter_stub(self.state.rbx_place)
 
     def _damage_protocol_needed(self) -> bool:
         """Return True when the project carries a Player-damage signal

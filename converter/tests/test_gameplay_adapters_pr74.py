@@ -941,7 +941,9 @@ class TestPruneLegacyGameplayArtifacts:
     """End-to-end tests against the Pipeline method using a duck-typed
     state harness (no real Unity project needed)."""
 
-    def _harness(self) -> types.SimpleNamespace:
+    def _harness(
+        self, door_adapter_active: bool = True,
+    ) -> types.SimpleNamespace:
         place = types.SimpleNamespace(
             scripts=[],
             workspace_parts=[],
@@ -957,10 +959,14 @@ class TestPruneLegacyGameplayArtifacts:
         # out — these unit tests are pure-memory and don't care about
         # disk writes (the disk-cleanup contract is pinned by separate
         # ``TestPruneDeletesOnDisk`` tests).
+        # ``_door_adapter_will_emit`` is the round-11 [P2] gate on
+        # the legacy door tween strip. Most tests want the strip to
+        # fire (defaults True); the explicit gate-test flips it False.
         return types.SimpleNamespace(
             state=state,
             scaffolding=frozenset(),
             _delete_pruned_script_from_disk=lambda _: None,
+            _door_adapter_will_emit=lambda: door_adapter_active,
         )
 
     def test_removes_global_damage_router_script(self) -> None:
@@ -993,6 +999,37 @@ class TestPruneLegacyGameplayArtifacts:
         assert part.scripts == [survivor], (
             "_AutoDamageEventRouter not removed from a part-bound "
             "script list."
+        )
+
+    def test_keeps_door_tween_block_when_no_door_adapter(self) -> None:
+        """PR #74 codex round-11 [P2]: if the current run has no
+        Door adapter replacement (Door class divergent / deny-listed
+        / not detected), the legacy ``_AutoFpsDoorTweenInjected``
+        block IS the only door-open implementation. The strip MUST
+        be skipped so doors keep animating."""
+        h = self._harness(door_adapter_active=False)
+        door = types.SimpleNamespace(
+            name="Door",
+            source=(
+                "-- AI-transpiled Door body (no adapter replacement)\n"
+                "local Door = {}\n"
+                "return Door\n"
+                "\n"
+                "-- _AutoFpsDoorTweenInjected: door coherence pack\n"
+                "do\n"
+                "    -- legacy tween body — this is the only door-open\n"
+                "end\n"
+            ),
+        )
+        h.state.rbx_place.scripts = [door]
+        pruned = Pipeline._prune_legacy_gameplay_artifacts(h)
+        assert pruned == 0, (
+            "Door tween block stripped without a door adapter "
+            "replacement — codex PR #74 round-11 [P2] regressed."
+        )
+        assert _LEGACY_DOOR_TWEEN_MARKER in door.source, (
+            "Door tween block was stripped even though no door "
+            "adapter will replace it — door animation regression."
         )
 
     def test_strips_door_tween_block_from_global_script(self) -> None:
