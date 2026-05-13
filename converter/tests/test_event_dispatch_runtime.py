@@ -1,23 +1,29 @@
-"""Tests for the ``runtime/event_dispatch.luau`` ModuleScript and its
-auto-injection by the pipeline when FPS scaffolding is opted in.
+"""Tests for the ``runtime/gameplay/event_dispatch.luau`` ModuleScript
+and its auto-injection by the pipeline when FPS scaffolding is opted in.
 
-Pre-PR, ``connectClient(evt, handler)`` was inlined inside the
-auto-generated HUDController LocalScript — every consumer that wanted
-the BindableEvent vs RemoteEvent fork had to copy the body or accept
-the duplication. PR #3 of the FPS extraction work moves the helper
-into a shared runtime ModuleScript:
+PR #75 reorganization
+---------------------
+Pre-PR-#75, ``runtime/event_dispatch.luau`` was emitted directly under
+``ReplicatedStorage`` as ``AutoFpsEventDispatch``. PR #75 moves the
+canonical module under ``runtime/gameplay/`` so it sits next to the
+other gameplay runtime modules, parents it at
+``ReplicatedStorage.AutoGen.EventDispatch``, and emits a tiny compat
+alias at the historic ``ReplicatedStorage.AutoFpsEventDispatch``
+location.
 
-- ``runtime/event_dispatch.luau`` — emits ``EventDispatch.connectClient``.
-- ``Pipeline._inject_runtime_modules`` adds the module to
-  ``ReplicatedStorage`` whenever ``"fps" in self.scaffolding``, so
-  the HUDController's ``require(...:WaitForChild("EventDispatch"))``
-  resolves at runtime.
-- ``generate_hud_client_script`` no longer inlines the helper; it
-  ``require()``\\s the runtime module instead.
+Pinned invariants:
 
-Tests pin: the runtime module's source carries the canonical helper,
-the HUD controller script ``require``\\s instead of inlining, and the
-pipeline auto-injects the module on opt-in.
+  - Canonical module file lives at ``runtime/gameplay/event_dispatch.luau``
+    and carries the ``@@GAMEPLAY_RUNTIME_MODULE@@`` first-line marker.
+  - Pipeline emits canonical at ``ReplicatedStorage.AutoGen`` and the
+    alias at ``ReplicatedStorage.AutoFpsEventDispatch`` (alias body is
+    a ``WaitForChild`` chain that proxies to the canonical).
+  - Alias overwrite policy: skip emission when a non-ModuleScript
+    Instance already occupies the alias name; refresh in place when a
+    ModuleScript is there.
+  - Opt-out branch (rerun without ``--scaffolding=fps``) prunes both
+    canonical and alias, matched by ``_is_converter_gameplay_runtime_module``
+    so user-authored ``EventDispatch.cs`` transpilations survive.
 """
 from __future__ import annotations
 
@@ -25,12 +31,19 @@ from pathlib import Path
 
 import pytest
 
-from converter.pipeline import Pipeline
+from converter.pipeline import (
+    Pipeline,
+    _EVENT_DISPATCH_ALIAS_BODY,
+    _EVENT_DISPATCH_ALIAS_MARKER,
+    _EVENT_DISPATCH_ALIAS_NAME,
+    _EVENT_DISPATCH_CANONICAL_NAME,
+)
 from converter.scaffolding.fps import generate_hud_client_script
 from core.roblox_types import RbxPlace, RbxScript
 
 
 RUNTIME_DIR = Path(__file__).parent.parent / "runtime"
+GAMEPLAY_RUNTIME_DIR = RUNTIME_DIR / "gameplay"
 
 
 class TestEventDispatchModuleSource:
@@ -39,27 +52,36 @@ class TestEventDispatchModuleSource:
     refactor that drops the function or renames it can't slip past."""
 
     def test_module_file_exists(self) -> None:
-        path = RUNTIME_DIR / "event_dispatch.luau"
+        path = GAMEPLAY_RUNTIME_DIR / "event_dispatch.luau"
         assert path.exists(), (
-            f"runtime/event_dispatch.luau missing — "
-            "auto-injection will fail at WaitForChild"
+            f"runtime/gameplay/event_dispatch.luau missing — "
+            "auto-injection will fail at the canonical source read"
         )
 
+    def test_module_carries_gameplay_runtime_marker(self) -> None:
+        """PR #75: the canonical module must carry the
+        ``@@GAMEPLAY_RUNTIME_MODULE@@`` first-line marker so the
+        rehydrate predicate (``_is_converter_gameplay_runtime_module``)
+        recognises it across resume runs without false-positiving on a
+        user-authored ``EventDispatch.cs`` transpilation.
+        """
+        path = GAMEPLAY_RUNTIME_DIR / "event_dispatch.luau"
+        first_line = path.read_text(encoding="utf-8").splitlines()[0]
+        assert "@@GAMEPLAY_RUNTIME_MODULE@@" in first_line
+
     def test_module_exposes_connectclient_via_table_export(self) -> None:
-        path = RUNTIME_DIR / "event_dispatch.luau"
+        path = GAMEPLAY_RUNTIME_DIR / "event_dispatch.luau"
         source = path.read_text(encoding="utf-8")
         # Module table + named function + return.
         assert "local EventDispatch = {}" in source
         assert "function EventDispatch.connectClient" in source
-        assert "return EventDispatch" in source.splitlines()[-3:][0:5] or (
-            "return EventDispatch" in source
-        )
+        assert "return EventDispatch" in source
 
     def test_connectclient_dispatches_on_instance_class(self) -> None:
         """The body must fork on ``BindableEvent`` vs ``RemoteEvent``.
         Hard-coding either one breaks the producer-side flexibility
         that motivated the helper in the first place."""
-        source = (RUNTIME_DIR / "event_dispatch.luau").read_text(
+        source = (GAMEPLAY_RUNTIME_DIR / "event_dispatch.luau").read_text(
             encoding="utf-8",
         )
         assert 'evt:IsA("BindableEvent")' in source
@@ -71,19 +93,38 @@ class TestEventDispatchModuleSource:
         """Callers pass ``ReplicatedStorage:WaitForChild(name, timeout)``
         which can return nil on timeout. The helper must no-op cleanly
         rather than erroring."""
-        source = (RUNTIME_DIR / "event_dispatch.luau").read_text(
+        source = (GAMEPLAY_RUNTIME_DIR / "event_dispatch.luau").read_text(
             encoding="utf-8",
         )
         # First non-comment line of the body should be a nil guard.
         assert "if not evt then" in source
         assert "return" in source  # bare return after the nil guard
 
+    def test_pre_pr75_top_level_module_is_gone(self) -> None:
+        """PR #75 deletes ``runtime/event_dispatch.luau`` (moved under
+        ``runtime/gameplay/``). Leaving the legacy file behind would
+        let ``scaffolding/fps.py`` or any out-of-date import re-read
+        the pre-PR-#75 body — which lacks the
+        ``@@GAMEPLAY_RUNTIME_MODULE@@`` marker — and inject a stale
+        copy that the rehydrate predicate would silently leave in
+        place across the next refresh.
+        """
+        assert not (RUNTIME_DIR / "event_dispatch.luau").exists(), (
+            "Stale runtime/event_dispatch.luau should have been deleted "
+            "by PR #75 — canonical lives under runtime/gameplay/."
+        )
+
 
 class TestHudClientScriptRequiresEventDispatch:
     """The auto-generated HUDController LocalScript no longer inlines
-    ``connectClient`` — it requires the runtime module instead."""
+    ``connectClient`` — it requires the runtime module instead.
 
-    def test_hud_script_requires_event_dispatch(self) -> None:
+    PR #75 keeps the body unchanged (still pins ``AutoFpsEventDispatch``)
+    so already-converted outputs keep resolving via the alias. PR #78
+    will switch to ``AutoGen.EventDispatch`` and retire the alias.
+    """
+
+    def test_hud_script_requires_event_dispatch_via_alias(self) -> None:
         script = generate_hud_client_script()
         assert 'require(ReplicatedStorage:WaitForChild("AutoFpsEventDispatch"))' in (
             script.source
@@ -112,84 +153,145 @@ class TestHudClientScriptRequiresEventDispatch:
         )
 
 
+def _make_pipeline_with_fps_opt_in(
+    tmp_path: Path,
+    *,
+    scaffolding: list[str] | None = None,
+) -> Pipeline:
+    project = tmp_path / "fakeproject"
+    (project / "Assets").mkdir(parents=True)
+    out = tmp_path / "out"
+    out.mkdir()
+    pl = Pipeline(
+        unity_project_path=project,
+        output_dir=out,
+        scaffolding=scaffolding,
+    )
+    pl.state.rbx_place = RbxPlace(
+        scripts=[],
+        workspace_parts=[],
+        screen_guis=[],
+    )
+    return pl
+
+
 class TestPipelineInjectsEventDispatchOnOptIn:
-    """Pipeline auto-injects ``EventDispatch`` ModuleScript when
-    ``"fps" in self.scaffolding`` so the HUDController's require
-    resolves at runtime."""
+    """Pipeline auto-injects canonical ``EventDispatch`` under
+    ``ReplicatedStorage.AutoGen`` plus the ``AutoFpsEventDispatch``
+    alias when ``"fps" in self.scaffolding`` so the HUDController's
+    ``require`` resolves at runtime.
+    """
 
-    @staticmethod
-    def _make_pipeline_with_fps_opt_in(
-        tmp_path: Path,
-        *,
-        scaffolding: list[str] | None = None,
-    ) -> Pipeline:
-        project = tmp_path / "fakeproject"
-        (project / "Assets").mkdir(parents=True)
-        out = tmp_path / "out"
-        out.mkdir()
-        pl = Pipeline(
-            unity_project_path=project,
-            output_dir=out,
-            scaffolding=scaffolding,
-        )
-        pl.state.rbx_place = RbxPlace(
-            scripts=[],
-            workspace_parts=[],
-            screen_guis=[],
-        )
-        return pl
-
-    def test_event_dispatch_injected_on_fps_opt_in(
+    def test_canonical_and_alias_injected_on_fps_opt_in(
         self, tmp_path: Path,
     ) -> None:
-        pl = self._make_pipeline_with_fps_opt_in(
-            tmp_path, scaffolding=["fps"],
-        )
+        pl = _make_pipeline_with_fps_opt_in(tmp_path, scaffolding=["fps"])
         pl._inject_runtime_modules()
-        names = {s.name for s in pl.state.rbx_place.scripts}
-        assert "AutoFpsEventDispatch" in names, (
-            "AutoFpsEventDispatch ModuleScript must be auto-injected when "
-            "--scaffolding=fps is set; otherwise the auto-generated "
-            "HUDController crashes on require"
+        names = [s.name for s in pl.state.rbx_place.scripts]
+        assert _EVENT_DISPATCH_CANONICAL_NAME in names, (
+            "AutoGen.EventDispatch missing — HUDController will fail "
+            "at the canonical require"
+        )
+        assert _EVENT_DISPATCH_ALIAS_NAME in names, (
+            "AutoFpsEventDispatch alias missing — already-converted "
+            "HUD bodies pinning the historic name will fail to require"
         )
 
-    def test_event_dispatch_not_injected_without_fps_opt_in(
-        self, tmp_path: Path,
-    ) -> None:
-        """No opt-in → no auto-injection. The module is only useful
-        for the HUDController's require, so emitting it on every
-        conversion would just bloat non-FPS places."""
-        pl = self._make_pipeline_with_fps_opt_in(tmp_path, scaffolding=None)
-        pl._inject_runtime_modules()
-        names = {s.name for s in pl.state.rbx_place.scripts}
-        assert "AutoFpsEventDispatch" not in names
-
-    def test_event_dispatch_injected_as_modulescript(
-        self, tmp_path: Path,
-    ) -> None:
-        """Must be a ModuleScript so ``require()`` works. A LocalScript
-        or Script wouldn't be require-able from the HUDController."""
-        pl = self._make_pipeline_with_fps_opt_in(
-            tmp_path, scaffolding=["fps"],
-        )
-        pl._inject_runtime_modules()
-        ed = next(
-            s for s in pl.state.rbx_place.scripts if s.name == "AutoFpsEventDispatch"
-        )
-        assert ed.script_type == "ModuleScript"
-
-    def test_user_authored_eventdispatch_does_not_block_inject(
-        self, tmp_path: Path,
-    ) -> None:
-        """Codex finding [P2] (PR #70 round 3): a project that ships
-        its own ``EventDispatch.cs`` (transpiled to
-        ``EventDispatch.luau``) shouldn't suppress our injection.
-        Different name (``AutoFpsEventDispatch``) eliminates the
-        collision entirely — both can coexist on disk.
+    def test_canonical_parented_at_autogen(self, tmp_path: Path) -> None:
+        """Canonical must be parented at ``ReplicatedStorage.AutoGen``
+        so it cannot collide with a user-authored ``EventDispatch.cs``
+        that transpiles directly under ``ReplicatedStorage``.
         """
-        pl = self._make_pipeline_with_fps_opt_in(
-            tmp_path, scaffolding=["fps"],
+        pl = _make_pipeline_with_fps_opt_in(tmp_path, scaffolding=["fps"])
+        pl._inject_runtime_modules()
+        canonical = next(
+            s for s in pl.state.rbx_place.scripts
+            if s.name == _EVENT_DISPATCH_CANONICAL_NAME
         )
+        assert canonical.parent_path == "ReplicatedStorage.AutoGen"
+        assert canonical.script_type == "ModuleScript"
+
+    def test_canonical_uses_autogen_subdir_source_path(
+        self, tmp_path: Path,
+    ) -> None:
+        """The canonical writes to ``scripts/AutoGen/event_dispatch.luau``
+        so a user-authored ``EventDispatch.cs`` transpilation at
+        ``scripts/EventDispatch.luau`` survives the finalize/rehydrate
+        cycle without collision. Pinned because the on-disk collision
+        is the only realistic failure mode for a user-authored
+        ``EventDispatch.cs``.
+        """
+        pl = _make_pipeline_with_fps_opt_in(tmp_path, scaffolding=["fps"])
+        pl._inject_runtime_modules()
+        canonical = next(
+            s for s in pl.state.rbx_place.scripts
+            if s.name == _EVENT_DISPATCH_CANONICAL_NAME
+        )
+        assert canonical.source_path == "AutoGen/event_dispatch.luau"
+
+    def test_alias_body_uses_waitforchild_chain(self, tmp_path: Path) -> None:
+        """The alias body must use a two-step ``WaitForChild`` chain
+        (``AutoGen`` -> ``EventDispatch``) — not a direct dot-chain —
+        so early callers don't race load order.
+        """
+        pl = _make_pipeline_with_fps_opt_in(tmp_path, scaffolding=["fps"])
+        pl._inject_runtime_modules()
+        alias = next(
+            s for s in pl.state.rbx_place.scripts
+            if s.name == _EVENT_DISPATCH_ALIAS_NAME
+        )
+        assert ':WaitForChild("AutoGen")' in alias.source
+        assert ':WaitForChild("EventDispatch")' in alias.source
+        # Direct dot-chains skipped — the design-doc-mandated form is
+        # ``GetService("ReplicatedStorage"):WaitForChild(...):WaitForChild(...)``.
+        # Strip comment lines before scanning so the comment reference to
+        # the canonical path doesn't false-positive.
+        code_lines = [
+            line for line in alias.source.splitlines()
+            if not line.lstrip().startswith("--")
+        ]
+        code = "\n".join(code_lines)
+        assert "ReplicatedStorage.AutoGen.EventDispatch" not in code, (
+            "Alias body must use WaitForChild chain, not direct dot-chain "
+            f"-- got executable lines:\n{code}"
+        )
+        # Marker so the prune predicate / rehydrate path can distinguish
+        # an emitted alias from a user-authored same-named ModuleScript.
+        assert _EVENT_DISPATCH_ALIAS_MARKER in alias.source
+
+    def test_alias_is_modulescript(self, tmp_path: Path) -> None:
+        pl = _make_pipeline_with_fps_opt_in(tmp_path, scaffolding=["fps"])
+        pl._inject_runtime_modules()
+        alias = next(
+            s for s in pl.state.rbx_place.scripts
+            if s.name == _EVENT_DISPATCH_ALIAS_NAME
+        )
+        assert alias.script_type == "ModuleScript"
+
+    def test_neither_injected_without_fps_opt_in(self, tmp_path: Path) -> None:
+        """No opt-in → no auto-injection. Both canonical and alias
+        only matter for the HUDController's require chain, so emitting
+        them on every conversion would just bloat non-FPS places.
+        """
+        pl = _make_pipeline_with_fps_opt_in(tmp_path, scaffolding=None)
+        pl._inject_runtime_modules()
+        names = {s.name for s in pl.state.rbx_place.scripts}
+        assert _EVENT_DISPATCH_CANONICAL_NAME not in names
+        assert _EVENT_DISPATCH_ALIAS_NAME not in names
+
+    def test_user_authored_event_dispatch_coexists_with_canonical(
+        self, tmp_path: Path,
+    ) -> None:
+        """PR #75: a project that ships its own ``EventDispatch.cs``
+        transpiles to a top-level ``EventDispatch.luau`` parented under
+        ``ReplicatedStorage`` (not under ``AutoGen``). The canonical
+        EventDispatch coexists with it — same name, different
+        ``parent_path`` — because the predicate that decides which
+        entries to refresh keys off ``parent_path`` AND the
+        ``@@GAMEPLAY_RUNTIME_MODULE@@`` marker. The user's script
+        carries neither signal, so it's left alone.
+        """
+        pl = _make_pipeline_with_fps_opt_in(tmp_path, scaffolding=["fps"])
         pl.state.rbx_place.scripts.append(
             RbxScript(
                 name="EventDispatch",
@@ -201,27 +303,152 @@ class TestPipelineInjectsEventDispatchOnOptIn:
             )
         )
         pl._inject_runtime_modules()
-        names = [s.name for s in pl.state.rbx_place.scripts]
-        # Both coexist under distinct names.
-        assert names.count("EventDispatch") == 1
-        assert names.count("AutoFpsEventDispatch") == 1
+        ed_entries = [
+            s for s in pl.state.rbx_place.scripts
+            if s.name == _EVENT_DISPATCH_CANONICAL_NAME
+        ]
+        # Two ``EventDispatch`` entries with distinct parent_paths.
+        assert len(ed_entries) == 2
+        user = next(
+            s for s in ed_entries
+            if s.script_type == "LocalScript"
+        )
+        canonical = next(
+            s for s in ed_entries
+            if s.script_type == "ModuleScript"
+        )
+        assert canonical.parent_path == "ReplicatedStorage.AutoGen"
+        # User script untouched: original source preserved.
+        assert "-- User-authored EventDispatch" in user.source
+        # User script gets the top-level disk path; canonical goes
+        # under AutoGen/ to avoid collision.
+        assert canonical.source_path == "AutoGen/event_dispatch.luau"
 
-    def test_event_dispatch_idempotent_on_repeat_inject(
+    def test_canonical_idempotent_on_repeat_inject(
         self, tmp_path: Path,
     ) -> None:
-        """Calling ``_inject_runtime_modules`` twice must not append
-        a duplicate EventDispatch — the existing-script guard must
-        match by name (matching the convention for other runtime
-        modules in the same loop)."""
-        pl = self._make_pipeline_with_fps_opt_in(
-            tmp_path, scaffolding=["fps"],
-        )
+        """Calling ``_inject_runtime_modules`` twice must not append a
+        duplicate canonical EventDispatch — the refresh-in-place path
+        keys off ``_is_converter_gameplay_runtime_module``.
+        """
+        pl = _make_pipeline_with_fps_opt_in(tmp_path, scaffolding=["fps"])
         pl._inject_runtime_modules()
         pl._inject_runtime_modules()
-        ed_count = sum(
-            1 for s in pl.state.rbx_place.scripts if s.name == "AutoFpsEventDispatch"
+        canonical_count = sum(
+            1 for s in pl.state.rbx_place.scripts
+            if s.name == _EVENT_DISPATCH_CANONICAL_NAME
         )
-        assert ed_count == 1
+        alias_count = sum(
+            1 for s in pl.state.rbx_place.scripts
+            if s.name == _EVENT_DISPATCH_ALIAS_NAME
+        )
+        assert canonical_count == 1
+        assert alias_count == 1
+
+
+class TestAliasOverwritePolicy:
+    """PR #75 alias overwrite policy:
+
+      - non-ModuleScript at the alias name → log + skip emission
+      - existing ModuleScript at the alias name → refresh in place
+    """
+
+    def test_non_module_at_alias_path_skips_emission(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """If a user's Script/LocalScript already occupies
+        ``AutoFpsEventDispatch``, the converter logs a warning and
+        skips the alias emission — the user's content wins.
+        """
+        pl = _make_pipeline_with_fps_opt_in(tmp_path, scaffolding=["fps"])
+        # User's stale Script at the alias name (e.g. from a manual
+        # hand-edit, or a leftover non-ModuleScript Instance from a
+        # pre-PR-#75 era).
+        pl.state.rbx_place.scripts.append(
+            RbxScript(
+                name=_EVENT_DISPATCH_ALIAS_NAME,
+                source="-- user-authored Script at the alias name\n",
+                script_type="Script",
+            )
+        )
+        import logging
+        with caplog.at_level(logging.WARNING):
+            pl._inject_runtime_modules()
+        # Original non-ModuleScript entry preserved exactly once —
+        # no alias ModuleScript appended.
+        alias_entries = [
+            s for s in pl.state.rbx_place.scripts
+            if s.name == _EVENT_DISPATCH_ALIAS_NAME
+        ]
+        assert len(alias_entries) == 1
+        assert alias_entries[0].script_type == "Script"
+        assert "-- user-authored Script at the alias name" in (
+            alias_entries[0].source
+        )
+        # Warning surfaced so operators see the collision.
+        assert any(
+            "Skipping AutoFpsEventDispatch alias emission" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_existing_module_at_alias_path_is_refreshed(
+        self, tmp_path: Path,
+    ) -> None:
+        """A pre-PR-#75 ``AutoFpsEventDispatch`` ModuleScript (which
+        carried the full ``connectClient`` body) gets refreshed in
+        place to the new alias body (a ``WaitForChild`` chain).
+        Refresh — not append — keeps the on-disk path stable across
+        resume runs.
+        """
+        pl = _make_pipeline_with_fps_opt_in(tmp_path, scaffolding=["fps"])
+        legacy_body = (
+            "-- EventDispatch: cross-class connect helper for client event listeners.\n"
+            "local EventDispatch = {}\n"
+            "function EventDispatch.connectClient(evt, handler)\n"
+            "  -- legacy body\n"
+            "end\n"
+            "return EventDispatch\n"
+        )
+        pl.state.rbx_place.scripts.append(
+            RbxScript(
+                name=_EVENT_DISPATCH_ALIAS_NAME,
+                source=legacy_body,
+                script_type="ModuleScript",
+            )
+        )
+        pl._inject_runtime_modules()
+        alias_entries = [
+            s for s in pl.state.rbx_place.scripts
+            if s.name == _EVENT_DISPATCH_ALIAS_NAME
+        ]
+        # Single entry — refreshed in place.
+        assert len(alias_entries) == 1
+        # Body replaced with the WaitForChild chain.
+        assert ':WaitForChild("AutoGen")' in alias_entries[0].source
+        assert "-- legacy body" not in alias_entries[0].source
+
+    def test_alias_idempotent_when_already_current(
+        self, tmp_path: Path,
+    ) -> None:
+        """Running the inject when the alias body already matches the
+        canonical alias body produces zero mutations — important so
+        an idempotent re-emit doesn't churn the on-disk file.
+        """
+        pl = _make_pipeline_with_fps_opt_in(tmp_path, scaffolding=["fps"])
+        pl.state.rbx_place.scripts.append(
+            RbxScript(
+                name=_EVENT_DISPATCH_ALIAS_NAME,
+                source=_EVENT_DISPATCH_ALIAS_BODY,
+                script_type="ModuleScript",
+            )
+        )
+        before_source = pl.state.rbx_place.scripts[0].source
+        pl._inject_runtime_modules()
+        after_source = next(
+            s.source for s in pl.state.rbx_place.scripts
+            if s.name == _EVENT_DISPATCH_ALIAS_NAME
+        )
+        assert before_source == after_source
 
 
 class TestFpsOptOutPrunesRehydratedScaffolding:
@@ -238,6 +465,10 @@ class TestFpsOptOutPrunesRehydratedScaffolding:
     canonical marker, plus the HUD ScreenGui). Other auto-gen scripts
     — GameServerManager, CollisionGroupSetup, etc. — stay (they're
     always needed; the user may have hand-edited them).
+
+    PR #75 extends the prune set to include the canonical
+    ``AutoGen.EventDispatch`` (matched via predicate so user-authored
+    ``EventDispatch.cs`` transpilations survive).
     """
 
     @staticmethod
@@ -326,43 +557,64 @@ class TestFpsOptOutPrunesRehydratedScaffolding:
         names = {s.name for s in pl.state.rbx_place.scripts}
         assert "FpsClient" not in names
 
-    def test_opt_out_drops_autogen_event_dispatch_module(
+    def test_opt_out_drops_autogen_event_dispatch_alias(
         self, tmp_path: Path,
     ) -> None:
-        """Codex finding [P3] (PR #70 round 6): the renamed
-        ``AutoFpsEventDispatch`` ModuleScript must also be pruned on
-        opt-out. It's only injected for FPS scaffolding, so a
-        rehydrated copy on a non-FPS rerun is stale converter-owned
-        runtime code that would ship to the user's place.
+        """Codex finding [P3] (PR #70 round 6) + PR #75 extension:
+        the alias ``AutoFpsEventDispatch`` ModuleScript must be
+        pruned on opt-out. It's only injected for FPS scaffolding,
+        so a rehydrated copy on a non-FPS rerun is stale converter-
+        owned compat code that would ship to the user's place.
 
-        ``AutoFpsEventDispatch`` carries no per-line marker comment —
-        its name itself is the marker (the ``AutoFps`` prefix is
-        converter-namespace owned, distinct from a user-authored
-        ``EventDispatch``). Pruning is name-only.
+        ``AutoFpsEventDispatch`` is named-only pruned (the ``AutoFps``
+        prefix is converter-namespace-owned).
         """
         pl = self._make_pipeline(tmp_path)
         pl.state.rbx_place.scripts.append(
             RbxScript(
-                name="AutoFpsEventDispatch",
-                source=(
-                    "-- EventDispatch: cross-class connect helper.\n"
-                    "local EventDispatch = {}\n"
-                    "return EventDispatch\n"
-                ),
+                name=_EVENT_DISPATCH_ALIAS_NAME,
+                source=_EVENT_DISPATCH_ALIAS_BODY,
                 script_type="ModuleScript",
             )
         )
         pl._subphase_inject_autogen_scripts()
         names = {s.name for s in pl.state.rbx_place.scripts}
-        assert "AutoFpsEventDispatch" not in names
+        assert _EVENT_DISPATCH_ALIAS_NAME not in names
+
+    def test_opt_out_drops_canonical_event_dispatch_under_autogen(
+        self, tmp_path: Path,
+    ) -> None:
+        """PR #75: the canonical ``AutoGen.EventDispatch`` is FPS-
+        scaffolding-only too. A rehydrated copy on a non-FPS rerun
+        must be pruned — matched via the predicate (parent_path,
+        marker, or legacy header) so user-authored ``EventDispatch.cs``
+        transpilations survive.
+        """
+        pl = self._make_pipeline(tmp_path)
+        canonical_body = (
+            (GAMEPLAY_RUNTIME_DIR / "event_dispatch.luau").read_text(
+                encoding="utf-8",
+            )
+        )
+        pl.state.rbx_place.scripts.append(
+            RbxScript(
+                name=_EVENT_DISPATCH_CANONICAL_NAME,
+                source=canonical_body,
+                script_type="ModuleScript",
+                parent_path="ReplicatedStorage.AutoGen",
+            )
+        )
+        pl._subphase_inject_autogen_scripts()
+        names = {s.name for s in pl.state.rbx_place.scripts}
+        assert _EVENT_DISPATCH_CANONICAL_NAME not in names
 
     def test_opt_out_keeps_user_authored_event_dispatch_module(
         self, tmp_path: Path,
     ) -> None:
-        """A user-authored ``EventDispatch`` (no ``AutoFps`` prefix)
-        must survive opt-out. The prefix is the discriminator —
-        ``AUTO_FPS_EVENT_DISPATCH_NAME`` is specifically chosen to
-        avoid colliding with that name.
+        """A user-authored ``EventDispatch`` (no marker, no AutoGen
+        parent_path) must survive opt-out. The predicate rejects it
+        (no marker, no canonical parent_path, no legacy header
+        prefix) so the prune leaves it alone.
         """
         pl = self._make_pipeline(tmp_path)
         pl.state.rbx_place.scripts.append(

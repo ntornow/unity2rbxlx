@@ -715,49 +715,22 @@ def inject_fps_scripts(place: RbxPlace) -> int:
             "HUD listener already present from prior conversion)"
         )
 
-    # AutoFpsHudController requires the FPS-scoped event dispatch
-    # ModuleScript at runtime. Distinct name (``AutoFpsEventDispatch``)
-    # avoids collision with any user-authored ``EventDispatch`` script
-    # — e.g. a project that ships its own EventDispatch.cs would
-    # transpile to ``EventDispatch.luau`` and the disk finalizer's
-    # name-based filename collision would clobber one of the two.
-    # Pipeline's runtime-modules subphase also injects under this
-    # name; the existing-name dedupe below handles the duplicate.
-    has_autogen_event_dispatch = any(
-        s.name == AUTO_FPS_EVENT_DISPATCH_NAME
-        and s.script_type == "ModuleScript"
-        for s in place.scripts
-    )
-    if not has_autogen_event_dispatch:
-        place.scripts.append(_load_event_dispatch_module())
-        added += 1
-        log.info("Injected %s ModuleScript", AUTO_FPS_EVENT_DISPATCH_NAME)
+    # AutoFpsEventDispatch + canonical AutoGen.EventDispatch emission
+    # moved to ``Pipeline._inject_event_dispatch_with_alias`` in PR #75
+    # so the alias and the canonical ModuleScript ship together and the
+    # parent_path is set canonically at the pipeline layer. The HUD
+    # generator still pins ``WaitForChild("AutoFpsEventDispatch")``;
+    # PR #78 retires the alias after one full reconversion cycle.
 
     return added
 
 
-# Canonical name for the auto-injected FPS event-dispatch module.
+# Canonical name for the auto-injected FPS event-dispatch alias.
 # Distinct from a hypothetical user-authored ``EventDispatch`` script
 # so the disk write doesn't collide. The auto-generated HUDController
-# requires this exact name from ``ReplicatedStorage``; keep them
-# in sync via the ``AUTO_FPS_EVENT_DISPATCH_NAME`` constant.
+# requires this exact name from ``ReplicatedStorage``; the pipeline
+# emits an alias at this name that proxies to the canonical
+# ``ReplicatedStorage.AutoGen.EventDispatch`` ModuleScript (PR #75).
+# Kept here as the authoritative string constant so HUD-side code and
+# pipeline-side code can't drift.
 AUTO_FPS_EVENT_DISPATCH_NAME = "AutoFpsEventDispatch"
-
-
-def _load_event_dispatch_module() -> RbxScript:
-    """Load ``runtime/event_dispatch.luau`` from disk and wrap it as
-    the FPS-scoped ``AutoFpsEventDispatch`` ModuleScript.
-
-    Read at call time (not module import) so unit tests that don't
-    exercise the FPS path don't pay the disk read.
-    """
-    from pathlib import Path
-    runtime_path = (
-        Path(__file__).resolve().parent.parent.parent
-        / "runtime" / "event_dispatch.luau"
-    )
-    return RbxScript(
-        name=AUTO_FPS_EVENT_DISPATCH_NAME,
-        source=runtime_path.read_text(encoding="utf-8"),
-        script_type="ModuleScript",
-    )
