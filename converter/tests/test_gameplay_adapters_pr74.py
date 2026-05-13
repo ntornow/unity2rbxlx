@@ -461,6 +461,91 @@ class TestInteractiveAssemblyLegacyPath:
         )
 
 
+class TestPruneDeletesOnDisk:
+    """PR #74 codex round-10 [P2]: when the prune passes drop a
+    script from ``rbx_place.scripts``, also delete its cached
+    ``.luau`` from ``output/scripts/`` so the next
+    ``_rehydrate_scripts_from_disk`` doesn't resurrect it.
+    """
+
+    def test_delete_pruned_script_unlinks_named_file(
+        self, tmp_path,
+    ) -> None:
+        """Stub a Pipeline with output_dir + a real scripts/ dir,
+        write a fake on-disk ``.luau``, and verify
+        ``_delete_pruned_script_from_disk`` removes it."""
+        import types
+        from converter.pipeline import Pipeline
+
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir()
+        (scripts_dir / "DamageProtocol.luau").write_text(
+            "stale\n", encoding="utf-8",
+        )
+
+        h = types.SimpleNamespace(output_dir=tmp_path)
+        script = types.SimpleNamespace(
+            name="DamageProtocol", source_path=None,
+        )
+        Pipeline._delete_pruned_script_from_disk(h, script)
+
+        assert not (scripts_dir / "DamageProtocol.luau").exists(), (
+            "_delete_pruned_script_from_disk didn't unlink the "
+            "named .luau — codex PR #74 round-10 [P2] regressed."
+        )
+
+    def test_delete_pruned_script_uses_source_path_when_set(
+        self, tmp_path,
+    ) -> None:
+        """When the script carries a ``source_path``, that path wins
+        over the canonical ``<name>.luau`` (preserves nested-dir
+        routing)."""
+        import types
+        from converter.pipeline import Pipeline
+
+        scripts_dir = tmp_path / "scripts"
+        nested = scripts_dir / "subdir"
+        nested.mkdir(parents=True)
+        (nested / "_AutoDamageEventRouter.luau").write_text(
+            "stale\n", encoding="utf-8",
+        )
+        h = types.SimpleNamespace(output_dir=tmp_path)
+        script = types.SimpleNamespace(
+            name="_AutoDamageEventRouter",
+            source_path="subdir/_AutoDamageEventRouter.luau",
+        )
+        Pipeline._delete_pruned_script_from_disk(h, script)
+        assert not (nested / "_AutoDamageEventRouter.luau").exists()
+
+    def test_delete_pruned_script_no_op_when_file_missing(
+        self, tmp_path,
+    ) -> None:
+        """No raise when the file isn't on disk (idempotent + safe
+        to invoke on an already-deleted prune)."""
+        import types
+        from converter.pipeline import Pipeline
+
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir()
+        h = types.SimpleNamespace(output_dir=tmp_path)
+        script = types.SimpleNamespace(
+            name="NonExistent", source_path=None,
+        )
+        Pipeline._delete_pruned_script_from_disk(h, script)  # no raise
+
+    def test_delete_pruned_script_no_op_when_output_dir_missing(
+        self,
+    ) -> None:
+        """No raise when the pipeline has no output_dir (test harnesses
+        with duck-typed Pipeline stubs)."""
+        import types
+        from converter.pipeline import Pipeline
+
+        h = types.SimpleNamespace(output_dir=None)
+        script = types.SimpleNamespace(name="Whatever", source_path=None)
+        Pipeline._delete_pruned_script_from_disk(h, script)
+
+
 class TestFinalizeWalksBoundScripts:
     """PR #74 codex round-5 [P3]: ``_subphase_finalize_scripts_to_disk``
     must walk part-bound scripts (workspace_parts +
@@ -867,9 +952,15 @@ class TestPruneLegacyGameplayArtifacts:
         # ``scaffolding`` defaults empty here; per-test code can flip
         # it to ``frozenset({"fps"})`` when exercising the round-3
         # [P1] preserve-fresh-HUD gate.
+        # ``_delete_pruned_script_from_disk`` is a Pipeline instance
+        # method that the round-10 [P2] disk-cleanup invokes. Stub it
+        # out — these unit tests are pure-memory and don't care about
+        # disk writes (the disk-cleanup contract is pinned by separate
+        # ``TestPruneDeletesOnDisk`` tests).
         return types.SimpleNamespace(
             state=state,
             scaffolding=frozenset(),
+            _delete_pruned_script_from_disk=lambda _: None,
         )
 
     def test_removes_global_damage_router_script(self) -> None:

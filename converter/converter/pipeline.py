@@ -2543,6 +2543,54 @@ return table.concat(allData, "\\n")'''
     A test asserts the actual call sequence in write_output matches this tuple.
     """
 
+    def _delete_pruned_script_from_disk(self, script: object) -> None:
+        """PR #74 codex round-10 [P2]: when a script is pruned from
+        ``rbx_place.scripts`` (legacy artifact + stale gameplay
+        runtime module), also delete its cached ``.luau`` file from
+        ``output/scripts/`` so the next resume's
+        ``_rehydrate_scripts_from_disk()`` doesn't load it back.
+
+        Otherwise the in-memory prune doesn't stick: assemble /
+        publish rebuild paths rehydrate from disk, and the deleted
+        module reappears in ``rbx_place.scripts`` on every subsequent
+        run.
+
+        Uses the script's ``source_path`` when set (preserves nested-
+        dir routing), otherwise falls back to the canonical
+        ``<name>.luau`` at the top of ``scripts/``.
+
+        Defensive against missing/None ``output_dir`` (some test
+        harnesses use duck-typed Pipeline stubs that don't carry an
+        output_dir).
+        """
+        output_dir = getattr(self, "output_dir", None)
+        if output_dir is None:
+            return
+        scripts_dir = output_dir / "scripts"
+        if not scripts_dir.is_dir():
+            return
+        source_path = getattr(script, "source_path", None)
+        candidates: list[Path] = []
+        if source_path:
+            candidates.append(scripts_dir / source_path)
+        name = getattr(script, "name", None)
+        if name:
+            candidates.append(scripts_dir / f"{name}.luau")
+            candidates.append(scripts_dir / "animations" / f"{name}.luau")
+        for candidate in candidates:
+            if candidate.is_file():
+                try:
+                    candidate.unlink()
+                    log.info(
+                        "[prune] Deleted stale on-disk script: %s",
+                        candidate.relative_to(self.output_dir),
+                    )
+                except OSError as exc:
+                    log.warning(
+                        "[prune] Failed to unlink %s: %s",
+                        candidate, exc,
+                    )
+
     def _prune_legacy_gameplay_artifacts(self) -> int:
         """PR #74: rehydration-aware prune pass for legacy
         coherence-pack artifacts. Removes them BEFORE the adapter
@@ -2584,6 +2632,11 @@ return table.concat(allData, "\\n")'''
                     "(adapter DamageProtocol supersedes it)",
                     _LEGACY_DAMAGE_ROUTER_NAME,
                 )
+                # PR #74 codex round-10 [P2]: also delete the
+                # cached ``.luau`` on disk so the next resume's
+                # ``_rehydrate_scripts_from_disk`` doesn't load
+                # the pruned router back.
+                self._delete_pruned_script_from_disk(s)
                 continue
             kept.append(s)
         place.scripts = kept
@@ -2603,6 +2656,9 @@ return table.concat(allData, "\\n")'''
                                 _LEGACY_DAMAGE_ROUTER_NAME,
                                 getattr(part, "name", "?"),
                             )
+                            # round-10 [P2]: same disk-cache cleanup
+                            # for part-bound copies.
+                            self._delete_pruned_script_from_disk(s)
                             continue
                         surviving.append(s)
                     part.scripts = surviving
@@ -4652,6 +4708,11 @@ script.Disabled = true
                         name,
                         self._damage_protocol_needed(),
                     )
+                    # PR #74 codex round-10 [P2]: also delete the
+                    # cached ``.luau`` on disk so the next resume
+                    # doesn't rehydrate the pruned module back into
+                    # ``rbx_place.scripts``.
+                    self._delete_pruned_script_from_disk(s)
                     injected += 1  # count as a mutation for the log
                     continue
                 kept.append(s)
