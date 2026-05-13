@@ -310,19 +310,25 @@ def convert(
     import config
     from converter.pipeline import Pipeline
 
-    # PR #74: mutex between adapter mode and legacy-pack mode. We only
-    # treat ``--use-gameplay-adapters`` as a user-intent signal when it
-    # was set EXPLICITLY on the command line (click's parameter source
-    # COMMANDLINE), not when it defaulted to True. Otherwise the new
-    # default-on flip would make ``--legacy-gameplay-packs`` impossible
-    # to use without also passing ``--no-use-gameplay-adapters``.
+    # PR #74: mutex between adapter mode and legacy-pack mode. The
+    # Pipeline constructor takes a tri-state (``None`` = caller has
+    # no preference, preserve persisted ctx; ``True`` / ``False`` =
+    # explicit choice overrides persisted). We only forward an
+    # explicit bool when the user ACTUALLY passed a flag on this
+    # invocation (click's parameter source ``COMMANDLINE``); otherwise
+    # we forward ``None`` so a ``--phase`` resume of an output that
+    # was originally converted with ``--legacy-gameplay-packs``
+    # stays in legacy mode rather than silently flipping back to
+    # adapters (codex PR #74 round-1 [P1]).
+    ctx_click = click.get_current_context()
+    adapter_source = ctx_click.get_parameter_source("use_gameplay_adapters")
+    adapter_explicit = (
+        adapter_source == click.core.ParameterSource.COMMANDLINE
+    )
+
+    pipeline_use_gameplay_adapters: bool | None
     if legacy_gameplay_packs:
-        ctx_click = click.get_current_context()
-        adapter_source = ctx_click.get_parameter_source("use_gameplay_adapters")
-        if (
-            adapter_source == click.core.ParameterSource.COMMANDLINE
-            and use_gameplay_adapters
-        ):
+        if adapter_explicit and use_gameplay_adapters:
             raise click.UsageError(
                 "--use-gameplay-adapters and --legacy-gameplay-packs are "
                 "mutually exclusive. --legacy-gameplay-packs is the "
@@ -331,8 +337,19 @@ def convert(
             )
         # Legacy mode wins: force adapters off so the rest of the pipeline
         # (script classification, runtime module injection, rehydration
-        # prune) takes the pre-PR-#74 path.
-        use_gameplay_adapters = False
+        # prune) takes the pre-PR-#74 path. Explicit override beats any
+        # persisted ctx value.
+        pipeline_use_gameplay_adapters = False
+    elif adapter_explicit:
+        # User wrote ``--use-gameplay-adapters`` or
+        # ``--no-use-gameplay-adapters`` — honour exactly.
+        pipeline_use_gameplay_adapters = use_gameplay_adapters
+    else:
+        # No flag this run. Preserve the persisted ctx choice (sticky
+        # rollback for projects converted with ``--legacy-gameplay-packs``)
+        # OR fall through to the ConversionContext dataclass default
+        # (True since PR #74) when the ctx is fresh.
+        pipeline_use_gameplay_adapters = None
 
     project_path = Path(unity_project).resolve()
     output_path = Path(output).resolve()
@@ -364,7 +381,7 @@ def convert(
         output_dir=output_path,
         skip_upload=no_upload,
         scaffolding=scaffolding_set,
-        use_gameplay_adapters=use_gameplay_adapters,
+        use_gameplay_adapters=pipeline_use_gameplay_adapters,
     )
 
     # Plumb --universe-id / --place-id into the pipeline context so the

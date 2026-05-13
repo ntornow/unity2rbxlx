@@ -343,15 +343,30 @@ class Pipeline:
         skip_upload: bool = False,
         skip_binary_rbxl: bool = False,
         scaffolding: frozenset[str] | None = None,
-        # PR #74: default flipped to True. Pre-PR-#74 callers
-        # (tests, the legacy ``--legacy-gameplay-packs`` rollback path
-        # in ``u2r.py``) that want the legacy ``script_coherence_packs``
-        # behaviour must now pass ``use_gameplay_adapters=False``
-        # explicitly. Pipeline constructor default and
-        # ``ConversionContext`` default stay in lockstep so a Pipeline
-        # built with no flag and a freshly-constructed ctx don't
-        # silently disagree on which pipeline runs.
-        use_gameplay_adapters: bool = True,
+        # PR #74: tri-state.
+        #
+        #   * ``None`` (default) — caller has no preference; preserve
+        #     whatever the persisted ``ConversionContext`` carried.
+        #     For a fresh ctx (no rehydration) the dataclass default
+        #     (``True`` since PR #74) wins, so the adapter pipeline
+        #     runs by default. For a resumed ctx, the persisted value
+        #     wins — this is the sticky-rollback contract that codex
+        #     PR #74 round-1 [P1] flagged: if a project was originally
+        #     converted with ``--legacy-gameplay-packs``,
+        #     ``ctx.use_gameplay_adapters`` is ``False`` on disk and
+        #     ``convert --phase <x>`` MUST NOT silently flip it back
+        #     to True just because the caller didn't repeat the flag.
+        #   * ``True`` / ``False`` — caller explicitly chose this
+        #     run's mode (the CLI's ``--use-gameplay-adapters`` or
+        #     ``--legacy-gameplay-packs`` opt-out fired). Wins over
+        #     persisted state, both at construction and after
+        #     :meth:`resume`'s ctx swap.
+        #
+        # CLI callers compute "was the user explicit?" via
+        # ``click.get_current_context().get_parameter_source(...)`` and
+        # forward the corresponding bool. Test fixtures that want the
+        # pre-PR-#74 default-off posture must pass ``False`` explicitly.
+        use_gameplay_adapters: bool | None = None,
     ) -> None:
         self.unity_project_path = self._find_unity_root(Path(unity_project_path).resolve())
         self.output_dir = Path(output_dir or OUTPUT_DIR).resolve()
@@ -396,14 +411,22 @@ class Pipeline:
             self.apply_scaffolding(self._init_scaffolding)
 
         # Gameplay-adapter rollout flag (PR #73a; default flipped on in
-        # PR #74). Snapshotted at construction so resume() (which
-        # replaces ``self.ctx`` from disk) doesn't silently drop the
-        # caller's choice. The snapshot is reapplied to ``self.ctx``
-        # after rehydration — see ``resume`` for the matching
-        # application. Stored as the exact bool so the caller can
-        # also drive ctx OFF (the legacy-pack opt-out path uses this).
-        self._init_use_gameplay_adapters: bool = bool(use_gameplay_adapters)
-        self.ctx.use_gameplay_adapters = self._init_use_gameplay_adapters
+        # PR #74). Tri-state since PR #74 codex round-1 [P1]:
+        #
+        #   * ``None`` — caller didn't pass an explicit flag this run.
+        #     For a fresh ctx, leave ``ctx.use_gameplay_adapters`` at
+        #     its dataclass default (True since PR #74). For a
+        #     resumed ctx (see :meth:`resume`), the persisted value
+        #     wins — preserving sticky rollback for projects
+        #     originally converted with ``--legacy-gameplay-packs``.
+        #   * ``True`` / ``False`` — explicit caller choice; overrides
+        #     both the dataclass default AND any persisted value.
+        #
+        # Snapshotted so :meth:`resume`'s ctx swap can re-apply the
+        # explicit choice after replacing ``self.ctx`` from disk.
+        self._init_use_gameplay_adapters: bool | None = use_gameplay_adapters
+        if self._init_use_gameplay_adapters is not None:
+            self.ctx.use_gameplay_adapters = self._init_use_gameplay_adapters
 
         # ``_fps_artifacts_at_init`` caches the backward-compat
         # migration signal BEFORE ``_subphase_emit_scripts_to_disk``
@@ -885,16 +908,22 @@ class Pipeline:
             # persisted entries are kept, the new request adds to them.
             if self._init_scaffolding:
                 self.apply_scaffolding(self._init_scaffolding)
-            # Re-apply the constructor's gameplay-adapter choice after
-            # the ctx swap so resumed builds (``u2r.py publish`` rebuild,
-            # ``u2r.py convert --phase ... --use-gameplay-adapters``,
-            # ``u2r.py convert --legacy-gameplay-packs``) honour the
-            # flag even if the persisted ctx was written before
-            # adapters existed (defaulted True since PR #74) or with
-            # the opposite choice. Constructor wins over persisted
-            # state — bidirectional since PR #74 (pre-#74 was
-            # additive: once True, stay True).
-            self.ctx.use_gameplay_adapters = self._init_use_gameplay_adapters
+            # Re-apply the constructor's EXPLICIT gameplay-adapter
+            # choice after the ctx swap. The tri-state matters here:
+            #
+            #   * ``None`` — caller didn't pass a flag. Keep the
+            #     rehydrated ``ctx.use_gameplay_adapters`` as-is so a
+            #     project originally converted with
+            #     ``--legacy-gameplay-packs`` stays in legacy mode on
+            #     resume even if the user forgot to repeat the flag.
+            #     Codex PR #74 round-1 [P1] flagged the previous
+            #     bidirectional overwrite as breaking this contract.
+            #   * ``True`` / ``False`` — caller was explicit; their
+            #     choice wins over the persisted value.
+            if self._init_use_gameplay_adapters is not None:
+                self.ctx.use_gameplay_adapters = (
+                    self._init_use_gameplay_adapters
+                )
 
         log.info("=== Resuming pipeline from phase '%s' ===", phase)
         self.run_through(phase, run_after=True)

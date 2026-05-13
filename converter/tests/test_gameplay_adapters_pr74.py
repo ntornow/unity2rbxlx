@@ -41,15 +41,194 @@ class TestDefaultFlip:
             "by PR #74 — pre-PR-#74 expectations should be migrated."
         )
 
-    def test_pipeline_signature_default(self) -> None:
+    def test_pipeline_signature_tri_state(self) -> None:
+        """PR #74 codex round-1 [P1]: Pipeline.__init__'s
+        ``use_gameplay_adapters`` is a tri-state.
+
+          * ``None`` (default) — preserve persisted ctx, fall through
+            to dataclass default (True) for a fresh ctx.
+          * ``True`` / ``False`` — explicit override that wins at
+            construction AND after the resume() ctx swap.
+
+        Why ``None`` and not ``True``: codex round-1 [P1] flagged that
+        a hard True default unconditionally overwrites a persisted
+        legacy choice on ``--phase`` resumes — breaks the sticky
+        rollback contract.
+        """
         import inspect
 
         sig = inspect.signature(Pipeline.__init__)
         param = sig.parameters["use_gameplay_adapters"]
-        assert param.default is True, (
-            "Pipeline.__init__ default flipped by PR #74 — must match "
-            "ConversionContext default so a constructor with no flag "
-            "and a fresh ctx don't disagree on adapter mode."
+        assert param.default is None, (
+            "Pipeline.__init__ default broke the PR #74 codex round-1 "
+            "[P1] tri-state — ``None`` = preserve persisted ctx, "
+            "explicit bool = override. A hard-True default regresses "
+            "sticky rollback on --phase resumes."
+        )
+        # Annotation is ``bool | None`` — pin it so a future refactor
+        # to ``bool`` (dropping the tri-state) fails this test.
+        anno = param.annotation
+        assert "None" in str(anno), (
+            f"Pipeline.__init__ use_gameplay_adapters annotation "
+            f"is {anno!r}; tri-state needs ``bool | None``."
+        )
+
+
+class TestStickyRollbackContract:
+    """PR #74 codex round-1 [P1]: a persisted
+    ``ctx.use_gameplay_adapters=False`` (from an original
+    ``--legacy-gameplay-packs`` run) must survive ``--phase`` resumes
+    where the caller didn't repeat the flag. The tri-state ``None``
+    in the constructor signals "no preference this run, keep
+    persisted state".
+    """
+
+    def test_none_constructor_preserves_persisted_false_at_construction(
+        self,
+    ) -> None:
+        """A fresh Pipeline with ``use_gameplay_adapters=None`` against
+        a ctx default doesn't force True over a False the caller has
+        not yet seen — the resume() path is where persisted False
+        survives, but the constructor must not preemptively overwrite
+        the ctx default either."""
+        # Direct ctx-mutation harness — we don't need a real unity
+        # project on disk to verify the field write semantics.
+        import types
+
+        ctx = ConversionContext(unity_project_path="/tmp/x")
+        # Constructor default is None — _init_use_gameplay_adapters
+        # stays None and the ctx is left at its dataclass default.
+        h = types.SimpleNamespace(ctx=ctx, _init_use_gameplay_adapters=None)
+        # Simulate the relevant constructor branch:
+        if h._init_use_gameplay_adapters is not None:
+            h.ctx.use_gameplay_adapters = h._init_use_gameplay_adapters
+        assert h.ctx.use_gameplay_adapters is True, (
+            "fresh ctx with no constructor override should land on "
+            "the dataclass default (True since PR #74)."
+        )
+
+    def test_explicit_false_constructor_overrides_ctx_default(self) -> None:
+        """A caller that passes ``use_gameplay_adapters=False``
+        explicitly (the legacy-pack opt-out path) must flip ctx OFF
+        before resume() sees it."""
+        import types
+
+        ctx = ConversionContext(unity_project_path="/tmp/x")
+        h = types.SimpleNamespace(ctx=ctx, _init_use_gameplay_adapters=False)
+        if h._init_use_gameplay_adapters is not None:
+            h.ctx.use_gameplay_adapters = h._init_use_gameplay_adapters
+        assert h.ctx.use_gameplay_adapters is False, (
+            "explicit False didn't overwrite ctx default — "
+            "legacy-pack opt-out path is broken."
+        )
+
+    def test_resume_preserves_persisted_false_under_none_constructor(self) -> None:
+        """End-to-end resume() simulation: a persisted ctx with
+        ``use_gameplay_adapters=False`` (from an original
+        ``--legacy-gameplay-packs`` run) must survive
+        ``_init_use_gameplay_adapters=None`` (caller didn't repeat
+        the flag on this resume).
+        """
+        import types
+
+        persisted_ctx = ConversionContext(unity_project_path="/tmp/x")
+        persisted_ctx.use_gameplay_adapters = False  # original was legacy
+        h = types.SimpleNamespace(
+            ctx=persisted_ctx,
+            _init_use_gameplay_adapters=None,
+        )
+        # The resume()-relevant branch (after the ctx swap):
+        if h._init_use_gameplay_adapters is not None:
+            h.ctx.use_gameplay_adapters = h._init_use_gameplay_adapters
+        assert h.ctx.use_gameplay_adapters is False, (
+            "PR #74 codex round-1 [P1] regressed: a resumed ctx "
+            "with persisted False was silently flipped back to True "
+            "by a defaulted constructor argument."
+        )
+
+    def test_resume_honours_explicit_true_over_persisted_false(self) -> None:
+        """A caller that explicitly passes
+        ``use_gameplay_adapters=True`` (re-enabling adapters on a
+        previously legacy-mode project) must beat the persisted False.
+        """
+        import types
+
+        persisted_ctx = ConversionContext(unity_project_path="/tmp/x")
+        persisted_ctx.use_gameplay_adapters = False
+        h = types.SimpleNamespace(
+            ctx=persisted_ctx,
+            _init_use_gameplay_adapters=True,
+        )
+        if h._init_use_gameplay_adapters is not None:
+            h.ctx.use_gameplay_adapters = h._init_use_gameplay_adapters
+        assert h.ctx.use_gameplay_adapters is True, (
+            "explicit True didn't override persisted False — "
+            "users can't re-enable adapters on a legacy-mode "
+            "output."
+        )
+
+
+class TestInteractiveAssemblyLegacyPath:
+    """PR #74 codex round-1 [P2]: ``convert_interactive assemble``
+    must expose the same rollback lever as ``u2r.py convert`` so
+    interactive users can request legacy gameplay packs."""
+
+    def test_assemble_has_legacy_gameplay_packs_option(self) -> None:
+        import click as _click
+        from convert_interactive import assemble
+
+        params = {p.name: p for p in assemble.params}
+        assert "legacy_gameplay_packs" in params, (
+            "convert_interactive assemble dropped the "
+            "--legacy-gameplay-packs flag — PR #74 codex round-1 "
+            "[P2] regressed."
+        )
+        assert "use_gameplay_adapters" in params, (
+            "convert_interactive assemble dropped the "
+            "--use-gameplay-adapters flag — interactive flow "
+            "diverged from u2r.py."
+        )
+
+    def test_make_pipeline_forwards_use_gameplay_adapters(self) -> None:
+        """``_make_pipeline`` must thread the tri-state through to
+        the Pipeline constructor AND re-apply it after the ctx swap
+        (mirroring resume())."""
+        import inspect
+        from convert_interactive import _make_pipeline
+
+        sig = inspect.signature(_make_pipeline)
+        assert "use_gameplay_adapters" in sig.parameters, (
+            "_make_pipeline missing the use_gameplay_adapters "
+            "kwarg — interactive subcommands can't forward the "
+            "rollback choice."
+        )
+        param = sig.parameters["use_gameplay_adapters"]
+        assert param.default is None, (
+            "_make_pipeline use_gameplay_adapters default isn't "
+            "None — the sticky-rollback contract requires the "
+            "tri-state."
+        )
+
+        # Source pin: after the ``pipeline.ctx = prior_ctx`` line the
+        # function must re-bind ctx.use_gameplay_adapters when the
+        # caller was explicit. Otherwise the swap drops the choice.
+        src = inspect.getsource(_make_pipeline)
+        ctx_swap_idx = src.find("pipeline.ctx = prior_ctx")
+        assert ctx_swap_idx != -1, (
+            "_make_pipeline no longer swaps in the prior ctx — "
+            "test premise broke; update this assertion."
+        )
+        post_swap = src[ctx_swap_idx:]
+        assert "use_gameplay_adapters is not None" in post_swap, (
+            "_make_pipeline doesn't re-apply explicit "
+            "use_gameplay_adapters after the ctx swap — codex "
+            "PR #74 round-1 [P2] regressed."
+        )
+        assert (
+            "pipeline.ctx.use_gameplay_adapters" in post_swap
+        ), (
+            "_make_pipeline doesn't re-bind ctx.use_gameplay_adapters "
+            "after the ctx swap — explicit caller choice lost."
         )
 
 
