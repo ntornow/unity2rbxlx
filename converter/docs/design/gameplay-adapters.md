@@ -1179,19 +1179,18 @@ codex pushback on PR #72 sharpened the slicing and added two cuts):
     - Codifies the soak-and-delete exit criteria for PR #76 in a new
       `docs/design/gameplay-adapters-rollout.md` companion doc.
 
-  - **PR #75:** introduce `EventDispatch` runtime module under
-    `runtime/gameplay/event_dispatch.luau`, parented at runtime to a
-    converter-owned `ReplicatedStorage.AutoGen` Folder (NOT directly
-    under `ReplicatedStorage` where user-authored `EventDispatch.cs`
-    transpilations would land). Add an Instance-level alias: at
-    pipeline emit time, the converter ALSO drops a same-named
-    `ModuleScript` at the original `ReplicatedStorage.AutoFpsEventDispatch`
-    location.
-
-    The alias body uses `WaitForChild` chains (NOT direct dot-chains)
-    so early `require()` callers don't race against load order:
+  - **PR #75 (MERGED, 6 codex review rounds):** introduce
+    `EventDispatch` runtime module under
+    `runtime/gameplay/event_dispatch.luau` carrying the
+    `@@GAMEPLAY_RUNTIME_MODULE@@` first-line marker, parented at
+    runtime to a converter-owned `ReplicatedStorage.AutoGen` Folder
+    (NOT directly under `ReplicatedStorage` where user-authored
+    `EventDispatch.cs` transpilations would land). At pipeline emit
+    time the converter ALSO drops a same-named `ModuleScript` at the
+    original `ReplicatedStorage.AutoFpsEventDispatch` location, body:
     ```lua
-    -- ReplicatedStorage.AutoFpsEventDispatch (alias, emitted by PR #75)
+    -- @@AUTO_FPS_EVENT_DISPATCH_ALIAS@@ converter-owned (PR #75 compat alias).
+    -- ... (proxies historic name to ReplicatedStorage.AutoGen.EventDispatch)
     return require(
         game:GetService("ReplicatedStorage")
             :WaitForChild("AutoGen")
@@ -1199,22 +1198,115 @@ codex pushback on PR #72 sharpened the slicing and added two cuts):
     )
     ```
 
-    Overwrite policy at emit time: if a non-ModuleScript Instance
-    already exists at `ReplicatedStorage.AutoFpsEventDispatch` (a
-    user's Folder, a stale Script, a leftover BindableEvent from
-    a hand-edit), the converter logs a warning and skips the alias
-    emission for that output — the user's content wins. If an
-    existing ModuleScript is present, it's overwritten in place
-    (overwriting our own alias from a prior run is the common
-    case; overwriting a user-authored module is the same risk we
-    already accept across the converter's other auto-injected
-    modules and is documented in the conversion report).
+    Marker constants (`_EVENT_DISPATCH_CANONICAL_NAME`,
+    `_EVENT_DISPATCH_ALIAS_NAME`, `_EVENT_DISPATCH_ALIAS_MARKER`)
+    centralize the strings so the prune predicates, opt-out cleanup,
+    classifier-skip, and refresh paths can't drift.
 
-    Already-converted outputs that call
-    `WaitForChild("AutoFpsEventDispatch")` from their script bodies
-    keep resolving. The user-script collision risk codex flagged is
-    avoided because the new canonical name lives under `AutoGen/`,
-    not directly under RS.
+    Key shipped decisions across the six review rounds:
+
+      1. **Canonical filename stem matches in-memory name** (round-1
+         [P1]). On-disk path is `scripts/AutoGen/EventDispatch.luau`
+         — `Path.stem == "EventDispatch"` so the rehydrate path
+         deserializes back under the same name every refresh / prune
+         predicate keys on. Lowercase `event_dispatch.luau` would
+         break idempotency on every resume.
+
+      2. **Alias overwrite policy is path-scoped + marker-rescued**
+         (round-2 [P2] + round-3 [P3]).
+         - Path scope: only entries whose `parent_path` is `None`
+           or `"ReplicatedStorage"` participate in the policy. A
+           user `Script` named `AutoFpsEventDispatch` in
+           `ServerScriptService` is out of scope.
+         - Marker rescue: an entry carrying
+           `@@AUTO_FPS_EVENT_DISPATCH_ALIAS@@` (or the legacy
+           canonical body header) is rescued even from off-path so
+           a previously-classified-into-`ServerStorage` alias gets
+           refreshed + pinned back rather than left as a dangling
+           duplicate.
+         - Mixed-state dedup: when both an off-path rescue match
+           AND an at-path entry exist, keep the at-path entry,
+           prune the rest from in-memory + disk (matches PR #74
+           round-10 [P2] on-disk delete pattern).
+         - Non-ModuleScript at path: skip emission + log; user
+           content wins. Already-converted HUD requires will fail
+           until the user renames the colliding script, but the
+           user-authored content stays intact.
+         - Existing ModuleScript at path: refresh body in place
+           AND pin `parent_path` back to `ReplicatedStorage` (so a
+           same-named user module previously routed to
+           `ServerStorage` doesn't strand the alias off-path).
+
+      3. **Fresh-emit alias carries an explicit `source_path`**
+         (round-2 [P3]). The finalize-to-disk fallback skips
+         no-`source_path` writes when an `animations/` cache
+         exists, which would silently drop the alias on
+         animation-bearing projects.
+
+      4. **Canonical uses an `AutoGen/` subdir on disk** to avoid
+         collision with a user-authored `EventDispatch.cs`
+         transpilation that lands at top-level
+         `scripts/EventDispatch.luau`. Other adapter-runtime modules
+         (Composer, Gameplay, etc.) keep top-level disk paths per
+         PR #73a convention; EventDispatch is the only module
+         susceptible to a generic Unity-class-name collision.
+
+      5. **Lowercase migration sweep** (round-2 [P3]). Outputs
+         produced by the round-1-buggy commit on case-sensitive
+         filesystems carried a stale
+         `scripts/AutoGen/event_dispatch.luau` (lowercase stem).
+         Both `_inject_event_dispatch_with_alias` (on FPS-on runs)
+         and `_remove_rehydrated_fps_autogen` (on FPS-off runs)
+         marker-gate the prune so the upgrade path clears it
+         without touching user-authored snake_case scripts.
+
+      6. **Classifier-skip for converter-owned modules** (round-3
+         [P2] + round-4 [P2]). `_classify_storage` keeps modules
+         carrying the marker / parent_path `ReplicatedStorage.AutoGen` /
+         any `_LEGACY_GAMEPLAY_RUNTIME_PRE_MARKER_HEADERS` prefix
+         OUT of the plan. Otherwise the name-keyed plan bucket
+         collapsed the user's `EventDispatch.cs` and the canonical
+         into one entry, and the next rehydrate's `plan_lookup`
+         silently demoted the user's LocalScript into the
+         canonical's container (ModuleScript at ReplicatedStorage).
+         Detection signal set matches the runtime predicate's
+         (`_is_converter_gameplay_runtime_module`) so the upgrade
+         path closes for pre-marker outputs too.
+
+      7. **Template attach index filters to `script_type == "Script"`**
+         (round-5 [P2]). `_attach_monobehaviour_scripts_to_templates`
+         builds its name index flat-list-first; without the filter,
+         the canonical `EventDispatch` ModuleScript (added by
+         `_inject_runtime_modules`) shadows a user MonoBehaviour
+         literally named `EventDispatch` because the workspace
+         walk's `setdefault` no-ops on the existing key. Filtering
+         to Script-only up-front excludes the canonical and lets
+         the workspace walk surface the user's behaviour for
+         template clone.
+
+      8. **Opt-out path-scoped + marker-gated prune.** The opt-out
+         branch in `_subphase_inject_autogen_scripts` drops a
+         rehydrated `AutoFpsEventDispatch` (marker-gated, no path
+         scope on the marker detection so a misclassified previous
+         emit is still pruned) AND the canonical
+         `AutoGen.EventDispatch` (via
+         `_is_converter_gameplay_runtime_module` predicate). A
+         user-authored `EventDispatch.cs` (no marker, no AutoGen
+         parent_path, no legacy header) survives both the alias
+         prune and the canonical prune.
+
+      9. **`EventDispatch` is in `_ALL_GAMEPLAY_RUNTIME_MODULE_NAMES`
+         but gated on FPS scaffolding.** The adapter-mode pre-pass
+         normally prunes anything in that set that's not in the
+         current emit; the pre-pass extends `current_module_names`
+         with `EventDispatch` when `"fps" in self.scaffolding`,
+         keeping the freshly-emitted canonical alive while still
+         pruning it on adapter-mode-on + fps-opted-out runs (the
+         expected behaviour for a non-FPS resume of a former FPS
+         output).
+
+    The alias retires in PR #78 after one full reconversion cycle
+    confirms no converted output still references the old name.
 
   - **PR #76:** delete the three coherence packs. Exit criteria
     codified in `docs/design/gameplay-adapters-rollout.md` (added
