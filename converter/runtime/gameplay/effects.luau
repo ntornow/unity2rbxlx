@@ -1,3 +1,4 @@
+-- @@GAMEPLAY_RUNTIME_MODULE@@ converter-owned (Effects)
 -- effects.luau: Effect-family capability handlers.
 --
 -- Owns the ``ctx.effect`` namespace. Subscribes to

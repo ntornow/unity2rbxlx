@@ -171,56 +171,90 @@ _ALL_GAMEPLAY_RUNTIME_MODULE_NAMES: frozenset[str] = frozenset({
 })
 
 
+# Structural marker baked into the first line of every gameplay
+# runtime module under ``converter/runtime/gameplay/``. PR #74 codex
+# round-9 [P1] flagged that a header-prefix match like
+# ``startswith("-- gameplay")`` false-positives on user-authored
+# Luau (``-- gameplay manager``); a unique magic-string marker is
+# the robust signal. Composer + bootstrap + family modules + damage
+# protocol all carry this exact substring on their first line.
+GAMEPLAY_RUNTIME_MODULE_MARKER: str = "@@GAMEPLAY_RUNTIME_MODULE@@"
+
+
+# Pre-PR-#74-round-9 first-line signatures, kept as a back-compat
+# fallback so a rehydrate of an output produced BEFORE the structural
+# marker landed still matches. These are full canonical first-line
+# prefixes (not bare ``-- gameplay`` etc.), unique enough to not
+# false-positive on user code. New outputs always carry the
+# ``@@GAMEPLAY_RUNTIME_MODULE@@`` marker so this table is purely
+# transitional. Safe to delete once every operator has reconverted
+# at least once.
+_LEGACY_GAMEPLAY_RUNTIME_PRE_MARKER_HEADERS: dict[str, str] = {
+    "Composer": "-- Composer: dispatch a Behavior's capability tuple",
+    "Triggers": "-- triggers.luau: Trigger-family capability handlers.",
+    "Movement": "-- movement.luau: Movement-family capability handlers.",
+    "Lifetime": "-- lifetime.luau: Lifetime-family capability handlers.",
+    "HitDetection": "-- hit_detection.luau: HitDetection-family capability handlers.",
+    "Effects": "-- effects.luau: Effect-family capability handlers.",
+    "DamageProtocol": "-- damage_protocol.luau: client + server damage routing",
+    "Gameplay": "-- gameplay.luau: orchestrator + single entry point",
+    # _GameplayServerBootstrap uses a slightly different key — it's
+    # consulted via the bootstrap branch which passes the name
+    # directly.
+    "_GameplayServerBootstrap": (
+        "-- server_bootstrap.luau (parented to ServerScriptService at emit time)."
+    ),
+}
+
+
 def _is_converter_gameplay_runtime_module(
-    script: _ScriptLike, module_name: str, filename: str,
+    script: _ScriptLike, module_name: str, filename: str,  # noqa: ARG001
 ) -> bool:
     """Return True when *script* is the converter's emitted version of
     a named gameplay runtime module (either fresh in-memory or
     rehydrated from a previous run), as opposed to a user-authored
     script that happens to share the module's generic class name
-    (codex PR #74 round-8 [P1]).
+    (codex PR #74 round-8 [P1] and round-9 [P1]).
 
-    Two acceptance paths:
+    Three acceptance paths:
 
       1. ``parent_path == "ReplicatedStorage.AutoGen"`` — already
          routed to the converter-owned namespace, either by the
          current write_output pass or by a previous run that wrote
          the path into ``conversion_plan.json``. Definitively the
          converter's module.
-      2. ``parent_path is None`` AND the source's first line starts
-         with the canonical converter-runtime header prefix
-         (``"-- <filename-stem>"`` OR ``"-- <module_name>"``). This
-         covers the rehydrate path where
-         ``_rehydrate_scripts_from_disk`` couldn't restore
-         parent_path because ``conversion_plan.json`` was written
-         before runtime-module injection. User scripts named
-         ``Composer`` / ``Gameplay`` / etc. that have NO parent_path
-         after classify_storage rarely begin with a comment that
-         matches the runtime header shape — and never begin with
-         exactly ``"-- composer"`` etc. unless they ARE one of our
-         emitted modules.
+      2. Source contains the ``GAMEPLAY_RUNTIME_MODULE_MARKER``
+         structural marker. Every emitted runtime module carries
+         this magic substring on its first line (PR #74 round-9).
+         Intentionally unique enough that no user-authored script
+         could plausibly contain it.
+      3. **Pre-marker back-compat:** source starts with the
+         canonical pre-PR-#74-round-9 first line for *module_name*
+         (see ``_LEGACY_GAMEPLAY_RUNTIME_PRE_MARKER_HEADERS``). Lets
+         a rehydrate of an old output's runtime module still match
+         without falsing on user ``-- gameplay manager`` headers.
 
-    Any other ``parent_path`` (e.g. ``"ReplicatedStorage"`` from
-    classify_storage routing a user ``Composer`` MonoBehaviour) is
-    treated as user-owned and left alone.
+    *filename* is kept in the signature for API stability with the
+    earlier round-7/round-8 predicate shape; only ``module_name`` is
+    consulted now (path 3 keys off module_name).
+
+    Any other ``parent_path`` whose source carries neither marker
+    nor canonical pre-marker header (e.g. user ``Composer``
+    MonoBehaviour routed to ``"ReplicatedStorage"``) is treated as
+    user-owned and left alone.
     """
     if getattr(script, "name", None) != module_name:
         return False
     parent = getattr(script, "parent_path", None)
     if parent == "ReplicatedStorage.AutoGen":
         return True
-    if parent is not None:
-        return False
     source = getattr(script, "source", None) or ""
-    # Canonical first-line shape. Compare lowercased so casing
-    # drift across converter versions (e.g. ``-- Composer:`` vs
-    # ``-- composer.luau:``) doesn't false-negative.
-    first_line_lower = source[:96].lower()
-    filename_stem = filename.split(".", 1)[0].lower()
-    return (
-        first_line_lower.startswith(f"-- {filename_stem}")
-        or first_line_lower.startswith(f"-- {module_name.lower()}")
-    )
+    if GAMEPLAY_RUNTIME_MODULE_MARKER in source:
+        return True
+    legacy_header = _LEGACY_GAMEPLAY_RUNTIME_PRE_MARKER_HEADERS.get(module_name)
+    if legacy_header is not None and source.startswith(legacy_header):
+        return True
+    return False
 
 # PR #74 codex round-4 [P1] signals — when scanning emitted adapter
 # stub source on disk (rehydrate / publish rebuild path,

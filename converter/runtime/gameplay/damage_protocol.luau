@@ -1,3 +1,4 @@
+-- @@GAMEPLAY_RUNTIME_MODULE@@ converter-owned (DamageProtocol)
 -- damage_protocol.luau: client + server damage routing in one file.
 --
 -- Owns the ``ReplicatedStorage.DamageEvent`` RemoteEvent end-to-end —

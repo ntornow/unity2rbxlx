@@ -1,3 +1,4 @@
+-- @@GAMEPLAY_RUNTIME_MODULE@@ converter-owned (HitDetection)
 -- hit_detection.luau: HitDetection-family capability handlers.
 --
 -- Owns the ``ctx.hitDetection`` namespace. Publishes the impact CFrame

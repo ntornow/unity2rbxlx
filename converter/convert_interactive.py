@@ -669,15 +669,28 @@ def transpile(unity_project_path: str, output_dir: str,
     # Scoped wipe: clear only top-level stale .luau so animations/,
     # animation_data/, and scriptable_objects/ subdirs written by other
     # phases survive.
-    if result is not None and getattr(result, "scripts", None):
+    #
+    # PR #74 codex round-9 [P2]: a mode-flip run that produces zero
+    # transpiled scripts (Unity project no longer has runtime C#
+    # files, or every script matched an adapter and the legacy mode
+    # has no fallback) must STILL wipe the stale previous-mode
+    # ``.luau`` cache. ``_make_pipeline``'s
+    # ``_invalidate_transpile_cache_for_mode_flip()`` sets
+    # ``pipeline._retranspile = True`` whenever the explicit override
+    # differs from the persisted ctx; honour that signal here too,
+    # not just the ``result.scripts`` branch.
+    forced_wipe = bool(getattr(pipeline, "_retranspile", False))
+    has_scripts = bool(result is not None and getattr(result, "scripts", None))
+    if forced_wipe or has_scripts:
         scripts_dir = Path(output_dir).resolve() / "scripts"
         scripts_dir.mkdir(parents=True, exist_ok=True)
         for stale in scripts_dir.glob("*.luau"):
             stale.unlink()
-        for ts in result.scripts:
-            (scripts_dir / ts.output_filename).write_text(
-                ts.luau_source, encoding="utf-8",
-            )
+        if has_scripts:
+            for ts in result.scripts:
+                (scripts_dir / ts.output_filename).write_text(
+                    ts.luau_source, encoding="utf-8",
+                )
 
     flagged_files: list[dict] = []
     if result is not None and hasattr(result, "scripts"):

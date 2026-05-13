@@ -624,7 +624,11 @@ class TestPipelineInjection:
         # is parented to ServerScriptService AND typed as a Script (a
         # ModuleScript would have the same problem — it wouldn't
         # auto-run).
-        bootstrap_idx = src.find("server_bootstrap.luau")
+        # Use rfind because PR #74 round-9 added a legacy-header
+        # back-compat table near the top of pipeline.py that also
+        # mentions ``server_bootstrap.luau`` as a substring; the
+        # actual injection block is near the bottom of the file.
+        bootstrap_idx = src.rfind("server_bootstrap.luau")
         # Look in a generous window around the reference for both
         # markers; the actual injection block has grown over rounds
         # of codex review (PR #74 round-6 added a refresh branch;

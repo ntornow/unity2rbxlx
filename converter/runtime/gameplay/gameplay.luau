@@ -1,3 +1,4 @@
+-- @@GAMEPLAY_RUNTIME_MODULE@@ converter-owned (Gameplay)
 -- gameplay.luau: orchestrator + single entry point for per-instance
 -- behaviour stubs.
 --

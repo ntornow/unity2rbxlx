@@ -1,3 +1,4 @@
+-- @@GAMEPLAY_RUNTIME_MODULE@@ converter-owned (_GameplayServerBootstrap)
 -- server_bootstrap.luau (parented to ServerScriptService at emit time).
 --
 -- Force-loads the Gameplay orchestrator on server start so the

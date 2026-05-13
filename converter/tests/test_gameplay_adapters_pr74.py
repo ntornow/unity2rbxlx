@@ -331,6 +331,31 @@ class TestModeFlipInvalidatesTranspileCache:
             f"Line: {assign_line!r}"
         )
 
+    def test_interactive_transpile_wipes_stale_on_mode_flip(self) -> None:
+        """PR #74 codex round-9 [P2]: ``convert_interactive
+        transpile`` must wipe ``output/scripts/*.luau`` even when the
+        rerun produces zero transpiled scripts. The mode-flip
+        invalidator sets ``pipeline._retranspile = True``; honour
+        that as the wipe trigger, not just ``result.scripts``.
+        """
+        import inspect
+        from convert_interactive import transpile
+
+        src = inspect.getsource(transpile.callback)
+        # Pin the round-9 wipe gate. The fix uses
+        # ``forced_wipe = bool(getattr(pipeline, "_retranspile", False))``
+        # and OR'ed it into the wipe condition.
+        assert "_retranspile" in src, (
+            "convert_interactive transpile no longer references "
+            "pipeline._retranspile — the round-9 [P2] wipe gate "
+            "regressed."
+        )
+        assert "forced_wipe" in src or "or" in src, (
+            "convert_interactive transpile wipe still gates on "
+            "result.scripts alone — empty-transpile mode flip "
+            "leaves stale .luau."
+        )
+
     def test_make_pipeline_fires_invalidator_on_mode_flip(self) -> None:
         """convert_interactive._make_pipeline must mirror the
         resume() invalidation logic — otherwise interactive assemble
@@ -648,33 +673,65 @@ class TestRehydratedModuleMatchByName:
             "would be clobbered)."
         )
 
-    def test_predicate_accepts_rehydrated_no_parent_path(self) -> None:
-        """``_is_converter_gameplay_runtime_module`` must return True
-        for a rehydrated module: parent_path=None, source starts with
-        the canonical ``-- <filename-stem>`` or ``-- <module_name>``
-        header."""
+    def test_predicate_accepts_marker_bearing_rehydrated(self) -> None:
+        """PR #74 codex round-9 [P1]: the predicate's primary signal
+        for rehydrated modules (parent_path=None) is the
+        ``@@GAMEPLAY_RUNTIME_MODULE@@`` structural marker baked into
+        every runtime module under ``converter/runtime/gameplay/``.
+        """
+        import types
+        from converter.pipeline import (
+            _is_converter_gameplay_runtime_module,
+            GAMEPLAY_RUNTIME_MODULE_MARKER,
+        )
+
+        marker_bearing = types.SimpleNamespace(
+            name="Composer",
+            parent_path=None,
+            source=(
+                f"-- {GAMEPLAY_RUNTIME_MODULE_MARKER} converter-owned (Composer)\n"
+                "-- Composer: dispatch a Behavior's capability tuple\n"
+                "local Composer = {}\nreturn Composer\n"
+            ),
+        )
+        assert _is_converter_gameplay_runtime_module(
+            marker_bearing, "Composer", "composer.luau",
+        ) is True, (
+            "Marker-bearing rehydrated module not recognised — "
+            "codex PR #74 round-9 [P1] regressed."
+        )
+
+    def test_predicate_accepts_legacy_pre_marker_rehydrated(self) -> None:
+        """Back-compat: a rehydrate of an output that predates the
+        round-9 marker still matches via the
+        ``_LEGACY_GAMEPLAY_RUNTIME_PRE_MARKER_HEADERS`` table. Tests
+        the actual canonical first lines from the in-tree
+        ``converter/runtime/gameplay/*.luau`` shipped just before
+        round-9.
+        """
         import types
         from converter.pipeline import _is_converter_gameplay_runtime_module
 
-        rehydrated = types.SimpleNamespace(
-            name="Composer",
-            parent_path=None,
-            source="-- composer.luau: per-instance behaviour composer.\n",
-        )
-        assert _is_converter_gameplay_runtime_module(
-            rehydrated, "Composer", "composer.luau",
-        ) is True, "Rehydrated converter module not recognised."
-
-        # Also accepts the alternate ``-- Composer:`` header that
-        # the in-tree composer.luau currently uses.
-        alt = types.SimpleNamespace(
-            name="Composer",
-            parent_path=None,
-            source="-- Composer: dispatch a Behavior's capability tuple\n",
-        )
-        assert _is_converter_gameplay_runtime_module(
-            alt, "Composer", "composer.luau",
-        ) is True
+        # Canonical pre-marker first lines, matching the actual
+        # in-tree files just before PR #74 round-9 baked the marker.
+        legacy_fixtures = [
+            ("Composer", "-- Composer: dispatch a Behavior's capability tuple to per-family\n"),
+            ("Triggers", "-- triggers.luau: Trigger-family capability handlers.\n"),
+            ("Gameplay", "-- gameplay.luau: orchestrator + single entry point for per-instance\n"),
+            ("DamageProtocol", "-- damage_protocol.luau: client + server damage routing in one file.\n"),
+        ]
+        for module_name, header in legacy_fixtures:
+            script = types.SimpleNamespace(
+                name=module_name,
+                parent_path=None,
+                source=header + "-- (rest of file)\n",
+            )
+            assert _is_converter_gameplay_runtime_module(
+                script, module_name, f"{module_name.lower()}.luau",
+            ) is True, (
+                f"Pre-marker rehydrate of {module_name} not "
+                f"matched by the legacy-header back-compat table."
+            )
 
     def test_predicate_rejects_user_script_with_module_name(self) -> None:
         """Codex PR #74 round-8 [P1]: a user-authored script named

@@ -1,3 +1,4 @@
+-- @@GAMEPLAY_RUNTIME_MODULE@@ converter-owned (Triggers)
 -- triggers.luau: Trigger-family capability handlers.
 --
 -- Owns the ``ctx.trigger`` namespace. Other families read but never
