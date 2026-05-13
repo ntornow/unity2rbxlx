@@ -1,3 +1,4 @@
+-- @@GAMEPLAY_RUNTIME_MODULE@@ converter-owned (EventDispatch)
 -- EventDispatch: cross-class connect helper for client event listeners.
 --
 -- Connect a handler to either a server-fired ``RemoteEvent`` or a
@@ -7,14 +8,16 @@
 -- caller that hard-codes one crashes the moment the producer side
 -- swaps implementations.
 --
--- This module is auto-injected into ``ReplicatedStorage`` by the
--- converter when at least one consumer (currently the auto-generated
--- ``AutoFpsHudController``) requires it. Other scaffolding modules
--- emitted in the future can ``require`` it for the same dispatch
--- without re-implementing the fork.
+-- Parented at ``ReplicatedStorage.AutoGen.EventDispatch`` by the
+-- pipeline (PR #75). A compat alias at
+-- ``ReplicatedStorage.AutoFpsEventDispatch`` proxies to this module
+-- via a ``WaitForChild`` chain so already-converted outputs that pin
+-- the historic name keep resolving until PR #78 retires the alias.
 --
 -- Usage:
---   local EventDispatch = require(ReplicatedStorage:WaitForChild("EventDispatch"))
+--   local EventDispatch = require(
+--       ReplicatedStorage:WaitForChild("AutoGen"):WaitForChild("EventDispatch")
+--   )
 --   EventDispatch.connectClient(remoteOrBindable, function(payload)
 --       -- handler runs whether the producer is a RemoteEvent or BindableEvent
 --   end)

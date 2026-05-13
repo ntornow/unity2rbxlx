@@ -179,6 +179,14 @@ _ALL_GAMEPLAY_RUNTIME_MODULE_NAMES: frozenset[str] = frozenset({
     "Effects",
     "DamageProtocol",
     "Gameplay",
+    # PR #75: ``EventDispatch`` parented at ``ReplicatedStorage.AutoGen.EventDispatch``.
+    # Gated on ``"fps" in self.scaffolding`` rather than adapter mode
+    # (the only current consumer is the auto-generated HUDController),
+    # so the gameplay-modules pre-pass's ``current_module_names`` set
+    # is extended with this name when fps scaffolding is active —
+    # keeping it in this set means the opt-out / non-emit cases still
+    # prune a stale rehydrated copy via the shared rehydrate pre-pass.
+    "EventDispatch",
 })
 
 
@@ -209,6 +217,15 @@ _LEGACY_GAMEPLAY_RUNTIME_PRE_MARKER_HEADERS: dict[str, str] = {
     "Effects": "-- effects.luau: Effect-family capability handlers.",
     "DamageProtocol": "-- damage_protocol.luau: client + server damage routing",
     "Gameplay": "-- gameplay.luau: orchestrator + single entry point",
+    # PR #75 pre-marker fallback: pre-PR-#75 the canonical EventDispatch
+    # body lived at ``runtime/event_dispatch.luau`` (no marker, no
+    # AutoGen parenting) and was emitted directly under
+    # ``ReplicatedStorage`` as ``AutoFpsEventDispatch``. The body's
+    # historic first line is the canonical prefix below; rehydrating
+    # such an output (under the new canonical name ``EventDispatch``)
+    # via the predicate path is harmless — by the time the predicate
+    # runs the canonical version is being refreshed in-place anyway.
+    "EventDispatch": "-- EventDispatch: cross-class connect helper",
     # _GameplayServerBootstrap uses a slightly different key — it's
     # consulted via the bootstrap branch which passes the name
     # directly.
@@ -278,6 +295,46 @@ def _is_converter_gameplay_runtime_module(
 _DAMAGE_CAPABILITY_LUA_MARKERS: tuple[str, ...] = (
     '{kind = "effect.damage"',
     '{kind = "effect.splash"',
+)
+
+
+# PR #75 EventDispatch + AutoGen alias.
+#
+# Canonical EventDispatch module is emitted at
+# ``ReplicatedStorage.AutoGen.EventDispatch`` so it sits next to the
+# other gameplay-runtime modules and cannot collide with a user-authored
+# ``EventDispatch.cs`` (which transpiles directly under ReplicatedStorage).
+#
+# Compat alias ``ReplicatedStorage.AutoFpsEventDispatch`` is a tiny
+# ModuleScript that ``require``\s the canonical via ``WaitForChild``
+# chains — already-converted outputs that pinned the historic name
+# keep resolving until PR #78 retires the alias.
+_EVENT_DISPATCH_CANONICAL_NAME: str = "EventDispatch"
+_EVENT_DISPATCH_ALIAS_NAME: str = "AutoFpsEventDispatch"
+
+# Structural marker stamped at the top of the alias body so a future
+# rehydrate of an emitted alias can be distinguished from a hypothetical
+# user-authored ModuleScript named ``AutoFpsEventDispatch``. The
+# ``AutoFps`` prefix is already converter-namespace-owned, but the
+# marker keeps the prune predicate parity with the canonical (which
+# uses ``@@GAMEPLAY_RUNTIME_MODULE@@``).
+_EVENT_DISPATCH_ALIAS_MARKER: str = "@@AUTO_FPS_EVENT_DISPATCH_ALIAS@@"
+
+_EVENT_DISPATCH_ALIAS_BODY: str = (
+    "-- " + _EVENT_DISPATCH_ALIAS_MARKER + " converter-owned (PR #75 compat alias).\n"
+    "-- Proxies the historic ``ReplicatedStorage.AutoFpsEventDispatch``\n"
+    "-- name to the canonical module at\n"
+    "-- ``ReplicatedStorage.AutoGen.EventDispatch``. The two-step\n"
+    "-- ``WaitForChild`` chain (rather than a direct dot-chain) lets\n"
+    "-- early ``require`` callers wait out load order instead of\n"
+    "-- crashing on a missing child.\n"
+    "--\n"
+    "-- Retired by PR #78 once converted outputs stop pinning the old name.\n"
+    "return require(\n"
+    "\tgame:GetService(\"ReplicatedStorage\")\n"
+    "\t\t:WaitForChild(\"AutoGen\")\n"
+    "\t\t:WaitForChild(\"EventDispatch\")\n"
+    ")\n"
 )
 
 # PR #74 rehydration-aware prune pass. Removes legacy
@@ -3489,13 +3546,66 @@ return table.concat(allData, "\\n")'''
             "AutoFpsHudController", "FPSController", "HUDController",
             "FpsClient",
         }
-        # ``AutoFpsEventDispatch`` is an FPS-only ModuleScript whose
-        # source has no per-line marker comment — its name is the
-        # marker by design (the ``AutoFps`` prefix is converter-owned
-        # namespace, distinct from a user-authored ``EventDispatch``).
-        # Pruning by name only is safe because the prefix itself
-        # signals auto-gen origin.
-        fps_name_only = {"AutoFpsEventDispatch"}
+        # PR #75 round-2 codex [P2]: the alias prune is path+marker
+        # scoped, not name-only. Three signals identify a converter-
+        # emitted alias to prune:
+        #   1. The new alias body's ``@@AUTO_FPS_EVENT_DISPATCH_ALIAS@@``
+        #      marker (post-PR-#75 outputs).
+        #   2. The legacy canonical body's header line (pre-PR-#75
+        #      outputs where the alias name held the full canonical
+        #      ``connectClient`` body).
+        # Both forms are ModuleScripts parked at ReplicatedStorage; a
+        # user-authored ``Script`` / ``LocalScript`` named
+        # ``AutoFpsEventDispatch`` (or one parked in
+        # ServerScriptService) carries neither marker AND fails the
+        # type/parent_path scope, so it survives the prune.
+        legacy_alias_header = _LEGACY_GAMEPLAY_RUNTIME_PRE_MARKER_HEADERS[
+            _EVENT_DISPATCH_CANONICAL_NAME
+        ]
+        def _is_converter_alias(s: object) -> bool:
+            # Round-3 codex [P3]: marker-only detection, no path scope.
+            # A previously-emitted alias that was reclassified into
+            # ``ServerStorage`` (or anywhere off-path) by an
+            # intermediate run would survive the path-scoped check;
+            # the marker is the discriminator. ``script_type`` still
+            # gates this to ModuleScripts so a Script/LocalScript
+            # named ``AutoFpsEventDispatch`` (different type, no
+            # marker possible without intentional spoofing) is left
+            # alone.
+            if getattr(s, "name", None) != _EVENT_DISPATCH_ALIAS_NAME:
+                return False
+            if getattr(s, "script_type", None) != "ModuleScript":
+                return False
+            source = getattr(s, "source", None) or ""
+            return (
+                _EVENT_DISPATCH_ALIAS_MARKER in source
+                or source.startswith(legacy_alias_header)
+            )
+
+        # PR #75: ``AutoGen.EventDispatch`` (canonical) is also FPS-
+        # scaffolding-only. A user-authored ``EventDispatch.cs`` would
+        # transpile to a ModuleScript directly under ``ReplicatedStorage``
+        # (not under ``AutoGen``) and would not carry the
+        # ``@@GAMEPLAY_RUNTIME_MODULE@@`` marker, so the
+        # ``_is_converter_gameplay_runtime_module`` predicate
+        # distinguishes the two. Pruning by predicate match — not just
+        # by name — keeps user code intact.
+        #
+        # Round-2 codex [P3] migration sweep: a stale lowercase
+        # ``event_dispatch`` script can survive from outputs produced
+        # by the round-1 buggy commit (filename mismatch). Detect by
+        # the marker/header signature so the upgrade path clears it
+        # even though the in-memory name is ``"event_dispatch"`` (not
+        # in ``_ALL_GAMEPLAY_RUNTIME_MODULE_NAMES``).
+        def _is_lowercase_legacy_canonical(s: object) -> bool:
+            if getattr(s, "name", None) != "event_dispatch":
+                return False
+            source = getattr(s, "source", None) or ""
+            return (
+                GAMEPLAY_RUNTIME_MODULE_MARKER in source
+                or source.startswith(legacy_alias_header)
+            )
+
         original = self.state.rbx_place.scripts
         kept = [
             s for s in original
@@ -3504,10 +3614,23 @@ return table.concat(allData, "\\n")'''
                     s.name in fps_names
                     and any(m in s.source[:512] for m in fps_markers)
                 )
-                or s.name in fps_name_only
+                or _is_converter_alias(s)
+                or _is_converter_gameplay_runtime_module(
+                    s, _EVENT_DISPATCH_CANONICAL_NAME, "event_dispatch.luau",
+                )
+                or _is_lowercase_legacy_canonical(s)
             )
         ]
         removed_scripts = len(original) - len(kept)
+        # PR #75 codex round preempt: also delete pruned scripts from
+        # disk so the next resume's rehydrate doesn't resurrect them
+        # (matching PR #74 round-10 [P2] behaviour for the adapter-
+        # mode pre-pass). The opt-out branch doesn't carry the
+        # adapter-mode injected counter; the disk delete is purely
+        # cosmetic for the rehydrate invariant.
+        for s in original:
+            if s not in kept:
+                self._delete_pruned_script_from_disk(s)
         self.state.rbx_place.scripts = kept
 
         # The FPS HUD ScreenGui is identified by a marker attribute
@@ -4195,11 +4318,66 @@ script.Disabled = true
         from converter.storage_classifier import classify_storage
         import json as _json
 
+        # Round-3 codex [P2]: keep converter-owned runtime modules
+        # OUT of the classifier (and out of ``conversion_plan.json``).
+        # Two scripts named ``EventDispatch`` — the user's
+        # ``EventDispatch.cs`` transpilation and the canonical
+        # ``AutoGen/EventDispatch.luau`` — share the same stem; the
+        # classifier's name-keyed bucket buckets collapse them on the
+        # plan rebuild and the next preserve-scripts rehydrate then
+        # routes the user's script into the canonical's container,
+        # silently breaking it. Converter modules don't need plan
+        # entries — ``_inject_runtime_modules`` pins their
+        # ``parent_path`` + ``script_type`` directly each run.
+        #
+        # Round-4 codex [P2]: detection must match the same
+        # signal set as the rehydrate refresh / prune predicates
+        # (``_is_converter_gameplay_runtime_module`` and
+        # ``_is_converter_alias``). Three accepted signals:
+        #   1. ``@@GAMEPLAY_RUNTIME_MODULE@@`` or
+        #      ``@@AUTO_FPS_EVENT_DISPATCH_ALIAS@@`` in source.
+        #   2. ``parent_path == "ReplicatedStorage.AutoGen"`` — the
+        #      converter-owned namespace.
+        #   3. Source starts with any
+        #      ``_LEGACY_GAMEPLAY_RUNTIME_PRE_MARKER_HEADERS`` prefix
+        #      (pre-PR-#74-round-9 canonical-body fallback used by
+        #      the runtime predicate; covers pre-PR-#75 alias bodies
+        #      that carried the canonical EventDispatch body too,
+        #      since alias and canonical shared their pre-PR-#75
+        #      header).
+        # A user script with those literal magic strings or an
+        # AutoGen parent_path would have to be intentional.
+        all_scripts = self.state.rbx_place.scripts
+        converter_owned: list = []
+        user_or_unknown: list = []
+        legacy_headers = tuple(
+            _LEGACY_GAMEPLAY_RUNTIME_PRE_MARKER_HEADERS.values()
+        )
+        for s in all_scripts:
+            source = getattr(s, "source", None) or ""
+            parent_path = getattr(s, "parent_path", None)
+            is_converter = (
+                GAMEPLAY_RUNTIME_MODULE_MARKER in source
+                or _EVENT_DISPATCH_ALIAS_MARKER in source
+                or parent_path == "ReplicatedStorage.AutoGen"
+                or source.startswith(legacy_headers)
+            )
+            if is_converter:
+                converter_owned.append(s)
+            else:
+                user_or_unknown.append(s)
+
         plan = classify_storage(
-            self.state.rbx_place.scripts,
+            user_or_unknown,
             dependency_map=self.state.dependency_map or None,
         )
         self.ctx.storage_plan = plan
+        if converter_owned:
+            log.info(
+                "[classify_storage] Skipped %d converter-owned runtime "
+                "module(s) (parent_path managed by _inject_runtime_modules)",
+                len(converter_owned),
+            )
 
         # Record each script's subdir so rehydration can route it back.
         script_paths: dict[str, str] = {}
@@ -4522,17 +4700,34 @@ script.Disabled = true
         # currently live: the flat list + every workspace part's
         # ``.scripts`` (recursive). First-found wins; ties broken by
         # the flat list (most authoritative source).
+        #
+        # PR #75 codex round-5 [P2]: index is Script-only. A user-
+        # authored MonoBehaviour transpiles to ``script_type="Script"``;
+        # the canonical ``EventDispatch`` ModuleScript that
+        # ``_inject_runtime_modules`` adds shares the user's class
+        # name and would otherwise win the flat-list ``setdefault``
+        # (because adapter injection appends to the flat list before
+        # this pass runs in ``_generate_prefab_packages``). The
+        # subsequent ``script_type != "Script"`` guard would then
+        # silently skip the user's behaviour on every template clone.
+        # Excluding non-Script entries up-front keeps the canonical
+        # out of the index and lets the workspace walk surface the
+        # user's Script.
         scripts_by_name: dict[str, RbxScript] = {}
 
         def _collect(parts: list) -> None:
             for p in parts or []:
                 for s in getattr(p, "scripts", None) or []:
+                    if s.script_type != "Script":
+                        continue
                     if s.name not in scripts_by_name:
                         scripts_by_name[s.name] = s
                 _collect(getattr(p, "children", None) or [])
 
         # Flat list first (overrides any scene-attached duplicate).
         for s in self.state.rbx_place.scripts or []:
+            if s.script_type != "Script":
+                continue
             scripts_by_name.setdefault(s.name, s)
         _collect(self.state.rbx_place.workspace_parts or [])
 
@@ -4644,17 +4839,16 @@ script.Disabled = true
             modules_to_inject.append(("CharacterBridge", "physics_bridge.luau"))
         if has_sub_emitters:
             modules_to_inject.append(("SubEmitterRuntime", "sub_emitter_runtime.luau"))
-        # FPS scaffolding's auto-generated HUDController requires
-        # ``AutoFpsEventDispatch.connectClient`` from this runtime
-        # module to bridge RemoteEvent vs BindableEvent producers.
-        # Inject when opted in via ``--scaffolding=fps`` so the
-        # require resolves. Distinct ``AutoFps`` name avoids
-        # colliding with a user-authored ``EventDispatch.cs`` script.
-        if "fps" in self.scaffolding:
-            from converter.scaffolding.fps import AUTO_FPS_EVENT_DISPATCH_NAME
-            modules_to_inject.append(
-                (AUTO_FPS_EVENT_DISPATCH_NAME, "event_dispatch.luau"),
-            )
+        # PR #75: EventDispatch is now a gameplay runtime module
+        # parented at ``ReplicatedStorage.AutoGen.EventDispatch`` (was
+        # ``ReplicatedStorage.AutoFpsEventDispatch`` pre-PR-#75). A
+        # compat alias at the historic name stays in place until PR #78
+        # — emitted by ``_inject_event_dispatch_with_alias`` below.
+        #
+        # Gating is still ``"fps" in self.scaffolding`` because the
+        # only consumer today is the auto-generated HUDController; non-
+        # FPS conversions don't need the helper and shouldn't pay for
+        # two extra ModuleScripts.
 
         # Detect object pooling patterns in transpiled scripts
         has_pool = any(
@@ -4786,8 +4980,25 @@ script.Disabled = true
             # safe — any non-converter script named ``Composer`` /
             # ``Gameplay`` / etc. is a collision the converter would
             # already be hitting elsewhere.
-            current_module_names: frozenset[str] = frozenset(
+            current_module_names_set: set[str] = {
                 name for name, _ in gameplay_modules
+            }
+            # PR #75: ``EventDispatch`` is also a converter-owned
+            # gameplay-runtime module, but gated on FPS scaffolding
+            # rather than adapter mode (its sole consumer is the
+            # auto-generated HUDController). When fps scaffolding is
+            # active in THIS run, the canonical EventDispatch IS the
+            # current emit — keep it out of the prune set so the
+            # pre-pass doesn't strip it before
+            # ``_inject_event_dispatch_with_alias`` runs. When fps is
+            # NOT active, EventDispatch stays missing from
+            # ``current_module_names`` so the pre-pass deletes any
+            # stale rehydrated copy (mirroring the
+            # ``_damage_protocol_needed`` pattern for ``DamageProtocol``).
+            if "fps" in self.scaffolding:
+                current_module_names_set.add(_EVENT_DISPATCH_CANONICAL_NAME)
+            current_module_names: frozenset[str] = frozenset(
+                current_module_names_set,
             )
             # Build a lookup for the filename associated with each
             # known module so the content-aware predicate can compare
@@ -4802,6 +5013,11 @@ script.Disabled = true
                 "Effects": "effects.luau",
                 "DamageProtocol": "damage_protocol.luau",
                 "Gameplay": "gameplay.luau",
+                # PR #75: EventDispatch joins the pre-pass dictionary so
+                # the predicate's filename argument resolves to the
+                # canonical stem when the pre-pass walks a rehydrated
+                # name match.
+                _EVENT_DISPATCH_CANONICAL_NAME: "event_dispatch.luau",
             }
             kept: list = []
             for s in self.state.rbx_place.scripts:
@@ -4995,8 +5211,322 @@ script.Disabled = true
                     ))
                     injected += 1
 
+        # PR #75: EventDispatch + AutoFpsEventDispatch alias. Runs AFTER
+        # the gameplay-modules pre-pass so a stale rehydrated canonical
+        # ``EventDispatch`` has already been pruned in the
+        # adapter-mode + fps-opted-out case, and AFTER the modules_to_inject
+        # loop so no other injection clobbers our parent_path. Gated
+        # only on FPS scaffolding because the single consumer today is
+        # the auto-generated HUDController.
+        if "fps" in self.scaffolding:
+            injected += self._inject_event_dispatch_with_alias()
+
         if injected:
             log.info("[write_output] Injected %d runtime library modules", injected)
+
+    def _inject_event_dispatch_with_alias(self) -> int:
+        """Emit the canonical ``EventDispatch`` module under
+        ``ReplicatedStorage.AutoGen`` plus a compat alias at
+        ``ReplicatedStorage.AutoFpsEventDispatch`` (PR #75).
+
+        Returns the count of refresh / insert mutations applied. Idempotent:
+        running twice produces zero mutations on the second call when the
+        in-memory state already matches disk.
+
+        Canonical emit path mirrors the adapter-runtime emit loop —
+        refresh-in-place on a rehydrate match (``_is_converter_gameplay_runtime_module``
+        predicate), append a fresh entry otherwise, always pin
+        ``parent_path = "ReplicatedStorage.AutoGen"`` and
+        ``script_type = "ModuleScript"``.
+
+        Alias emit path implements the overwrite policy from the design
+        doc (PR #75 section):
+
+          - If an existing Instance at the alias name is **not** a
+            ModuleScript (e.g. a user's Folder/Script/BindableEvent
+            collided with the auto-name), the converter logs a warning
+            and skips alias emission — the user's content wins. Already-
+            converted outputs that reference the alias will fail to
+            ``require`` it but the user-authored content is preserved
+            intact; a manual conversion-report follow-up is required.
+          - If an existing ModuleScript is present, it's refreshed in
+            place. Overwriting our own alias from a prior run is the
+            common case; overwriting a user-authored ModuleScript that
+            happens to share the name is the same risk the converter
+            accepts for every other auto-injected module name (the
+            ``AutoFps`` prefix is converter-namespace-owned).
+        """
+        from core.roblox_types import RbxScript as _GpRbxScript
+        gameplay_runtime_dir = (
+            Path(__file__).parent.parent / "runtime" / "gameplay"
+        )
+        canonical_path = gameplay_runtime_dir / "event_dispatch.luau"
+        if not canonical_path.exists():
+            log.warning(
+                "[write_output] EventDispatch canonical module missing: %s",
+                canonical_path,
+            )
+            return 0
+        canonical_source = canonical_path.read_text(encoding="utf-8")
+        injected = 0
+
+        # Round-2 codex [P3] migration: outputs produced by the
+        # round-1-buggy commit on a case-sensitive filesystem can have
+        # a stale ``scripts/AutoGen/event_dispatch.luau`` (lowercase
+        # stem). Rehydrate surfaces it as ``name="event_dispatch"``,
+        # which is outside ``_ALL_GAMEPLAY_RUNTIME_MODULE_NAMES`` so
+        # the gameplay-modules pre-pass leaves it intact and the
+        # canonical refresh below doesn't match it either. Sweep here
+        # by marker / legacy-header so the upgrade clears it before
+        # we re-emit at the CapCase stem. Marker check keeps user-
+        # authored scripts safe.
+        legacy_header = _LEGACY_GAMEPLAY_RUNTIME_PRE_MARKER_HEADERS[
+            _EVENT_DISPATCH_CANONICAL_NAME
+        ]
+        kept_scripts = []
+        migrated = 0
+        for s in self.state.rbx_place.scripts:
+            if getattr(s, "name", None) == "event_dispatch":
+                src = getattr(s, "source", None) or ""
+                if (
+                    GAMEPLAY_RUNTIME_MODULE_MARKER in src
+                    or src.startswith(legacy_header)
+                ):
+                    self._delete_pruned_script_from_disk(s)
+                    migrated += 1
+                    continue
+            kept_scripts.append(s)
+        if migrated:
+            log.info(
+                "[write_output] Migrated %d stale lowercase "
+                "``event_dispatch`` runtime module(s) from a "
+                "pre-round-1 PR #75 output dir.",
+                migrated,
+            )
+            self.state.rbx_place.scripts = kept_scripts
+            injected += migrated  # surface in the mutation log
+
+        # --- Canonical: ReplicatedStorage.AutoGen.EventDispatch -------
+        # Match path mirrors the adapter-runtime emit loop. Predicate
+        # accepts: (a) ``parent_path == "ReplicatedStorage.AutoGen"``,
+        # (b) source carries ``@@GAMEPLAY_RUNTIME_MODULE@@``, or (c)
+        # legacy pre-marker first-line prefix from
+        # ``_LEGACY_GAMEPLAY_RUNTIME_PRE_MARKER_HEADERS["EventDispatch"]``.
+        # User-authored ``EventDispatch.cs`` transpilations carry none
+        # of those signals and are left alone.
+        existing_canonical = [
+            s for s in self.state.rbx_place.scripts
+            if _is_converter_gameplay_runtime_module(
+                s, _EVENT_DISPATCH_CANONICAL_NAME, "event_dispatch.luau",
+            )
+        ]
+        # PR #75: ``EventDispatch`` is uniquely susceptible to on-disk
+        # collisions with user-authored ``EventDispatch.cs`` (a generic
+        # Unity name pattern). Route the canonical to
+        # ``scripts/AutoGen/EventDispatch.luau`` so a transpiled user
+        # ``EventDispatch.cs`` (which lands at top-level
+        # ``scripts/EventDispatch.luau``) survives intact through the
+        # finalize / rehydrate cycle. Other adapter-runtime modules
+        # (Composer, Gameplay, etc.) use less-collision-prone names
+        # and intentionally write to the top-level cache per PR #73a
+        # convention; only EventDispatch needs this AutoGen subdir.
+        #
+        # Round-1 codex [P1]: keep the filename stem matching the
+        # in-memory script ``name`` (``EventDispatch``). Rehydration
+        # derives the script's in-memory name from ``Path.stem``; if
+        # the disk filename were ``event_dispatch.luau`` the rehydrate
+        # would surface as ``name="event_dispatch"`` and the
+        # CapCase-keyed predicate / prune set would miss the rehydrated
+        # canonical entirely, breaking refresh idempotency and
+        # opt-out pruning.
+        canonical_source_path = "AutoGen/EventDispatch.luau"
+        if existing_canonical:
+            for s in existing_canonical:
+                if s.source != canonical_source:
+                    s.source = canonical_source
+                    injected += 1
+                if getattr(s, "parent_path", None) != "ReplicatedStorage.AutoGen":
+                    s.parent_path = "ReplicatedStorage.AutoGen"
+                    injected += 1
+                if getattr(s, "script_type", None) != "ModuleScript":
+                    s.script_type = "ModuleScript"
+                    injected += 1
+                # Backfill source_path on rehydrate. Existing entries
+                # may carry the pre-PR-#75 top-level path
+                # ``scripts/EventDispatch.luau`` (from an output where
+                # the converter wrote there before AutoGen routing).
+                # Move them under ``AutoGen/`` so the next finalize
+                # writes the canonical to its proper subdir and the
+                # top-level path frees up for a user-authored
+                # ``EventDispatch.cs``.
+                if getattr(s, "source_path", None) != canonical_source_path:
+                    s.source_path = canonical_source_path
+                    injected += 1
+        else:
+            self.state.rbx_place.scripts.append(_GpRbxScript(
+                name=_EVENT_DISPATCH_CANONICAL_NAME,
+                source=canonical_source,
+                script_type="ModuleScript",
+                parent_path="ReplicatedStorage.AutoGen",
+                source_path=canonical_source_path,
+            ))
+            injected += 1
+
+        # --- Alias: ReplicatedStorage.AutoFpsEventDispatch ------------
+        # Round-2 codex [P2]: path-scoped overwrite policy. Only
+        # scripts whose ``parent_path`` lands at
+        # ``ReplicatedStorage`` participate in the alias overwrite
+        # decision. A user-authored ``Script`` named
+        # ``AutoFpsEventDispatch`` parked in ServerScriptService is
+        # NOT at the alias path; it should neither block the alias
+        # emission nor have its content disturbed. Without this scope
+        # the previous name-only check would suppress alias emission
+        # on FPS runs and the opt-out pruner would delete the user's
+        # ServerScriptService Script outright on non-FPS runs.
+        #
+        # Round-1 codex [P2] survivor: in the rare case the storage
+        # classifier moved a previously-emitted alias to ServerStorage
+        # (no HUD caller observed in this run, classifier default-
+        # routed it), the alias would land out-of-scope here and we'd
+        # append a duplicate. Rescue by marker so OUR previously-
+        # emitted alias is always recognised regardless of where the
+        # classifier parked it; the refresh path then pins parent_path
+        # back to None for the rbxlx writer's default route.
+        alias_path_parents = (None, "ReplicatedStorage")
+
+        def _is_our_alias_emit(s: object) -> bool:
+            if getattr(s, "name", None) != _EVENT_DISPATCH_ALIAS_NAME:
+                return False
+            if getattr(s, "script_type", None) != "ModuleScript":
+                return False
+            source = getattr(s, "source", None) or ""
+            return (
+                _EVENT_DISPATCH_ALIAS_MARKER in source
+                or source.startswith(legacy_header)
+            )
+
+        existing_alias_entries = [
+            s for s in self.state.rbx_place.scripts
+            if (
+                getattr(s, "name", None) == _EVENT_DISPATCH_ALIAS_NAME
+                and (
+                    getattr(s, "parent_path", None) in alias_path_parents
+                    or _is_our_alias_emit(s)
+                )
+            )
+        ]
+        non_module_alias = [
+            s for s in existing_alias_entries
+            if getattr(s, "script_type", None) != "ModuleScript"
+        ]
+        if non_module_alias:
+            # Overwrite policy: a non-ModuleScript Instance at the alias
+            # path wins. Log + skip emission so the user's content
+            # survives. ``already_converted`` outputs that pinned
+            # ``WaitForChild("AutoFpsEventDispatch")`` will fail to
+            # ``require`` it but the user-authored content is preserved.
+            log.warning(
+                "[write_output] Skipping AutoFpsEventDispatch alias "
+                "emission: a non-ModuleScript script_type=%s named %r "
+                "already occupies the alias path "
+                "(parent_path=%r). Already-converted outputs that pinned "
+                "``WaitForChild(\"AutoFpsEventDispatch\")`` may fail to "
+                "require the EventDispatch helper — rename the colliding "
+                "script to free the alias path, or wait for PR #78 to "
+                "retire the alias entirely.",
+                non_module_alias[0].script_type,
+                _EVENT_DISPATCH_ALIAS_NAME,
+                getattr(non_module_alias[0], "parent_path", None),
+            )
+            return injected
+        existing_alias_modules = [
+            s for s in existing_alias_entries
+            if getattr(s, "script_type", None) == "ModuleScript"
+        ]
+        if existing_alias_modules:
+            # Round-3 codex [P3] dedupe: if a stale marked alias was
+            # rescued off-path AND a separate ModuleScript already
+            # occupies the alias path, both end up here. Keep the
+            # first, prune the rest from in-memory state AND from
+            # disk so the next rehydrate doesn't resurrect the
+            # duplicate. Preference order: prefer the entry already
+            # at the alias path (so we don't strand its source_path
+            # at the rescue's off-path location).
+            on_path = [
+                s for s in existing_alias_modules
+                if getattr(s, "parent_path", None) in (
+                    None, "ReplicatedStorage",
+                )
+            ]
+            survivor = on_path[0] if on_path else existing_alias_modules[0]
+            duplicates = [s for s in existing_alias_modules if s is not survivor]
+            for dup in duplicates:
+                log.info(
+                    "[write_output] Dedup AutoFpsEventDispatch — "
+                    "removing %d duplicate alias entry/entries "
+                    "(stale rescue off parent_path=%r).",
+                    len(duplicates),
+                    getattr(dup, "parent_path", None),
+                )
+                self._delete_pruned_script_from_disk(dup)
+                try:
+                    self.state.rbx_place.scripts.remove(dup)
+                except ValueError:
+                    # Already removed (defensive — same object can't
+                    # survive identity-based ``remove`` twice).
+                    pass
+                injected += 1
+            s = survivor
+            if s.source != _EVENT_DISPATCH_ALIAS_BODY:
+                s.source = _EVENT_DISPATCH_ALIAS_BODY
+                injected += 1
+            # Round-1 codex [P2]: pin ``parent_path`` to
+            # ``ReplicatedStorage`` on every refresh. The previous
+            # write may have been classified into ServerStorage
+            # (storage_classifier routes server-only-required
+            # ModuleScripts to ``ServerStorage``); the alias only
+            # functions if it lives at the historic
+            # ``ReplicatedStorage.AutoFpsEventDispatch`` path. Pin
+            # ``None`` so the rbxlx writer's default container
+            # (ReplicatedStorage for ModuleScripts) wins and so any
+            # future re-classification can't pull the alias out of
+            # replicated scope again.
+            if getattr(s, "parent_path", None) not in (
+                None, "ReplicatedStorage",
+            ):
+                s.parent_path = "ReplicatedStorage"
+                injected += 1
+            # source_path on a fresh emit is unset (top-level cache
+            # write); on a rehydrated entry the path is already
+            # correct relative to ``scripts/``. Don't touch it — the
+            # disk-write finalizer keys off ``source_path`` when set
+            # so changing it here would leak the old file behind.
+        else:
+            # Fresh emit: leave parent_path=None so the storage
+            # classifier doesn't see an explicit override and the
+            # rbxlx writer defaults the ModuleScript to
+            # ReplicatedStorage. Pinning ``"ReplicatedStorage"`` here
+            # would land in the same place but is redundant with the
+            # default and would diverge from the historic alias
+            # location if a future writer change moves the default.
+            #
+            # Round-2 codex [P3]: explicit ``source_path`` so the
+            # finalize-to-disk pass always writes
+            # ``scripts/AutoFpsEventDispatch.luau`` regardless of
+            # whether ``scripts/animations/`` already exists. The
+            # name-based fallback path skips no-source_path writes
+            # when an animations/ cache is present (see
+            # ``_subphase_finalize_scripts_to_disk``), which would
+            # leave the alias absent from disk and break preserve-
+            # scripts resume on FPS projects that ship animations.
+            self.state.rbx_place.scripts.append(_GpRbxScript(
+                name=_EVENT_DISPATCH_ALIAS_NAME,
+                source=_EVENT_DISPATCH_ALIAS_BODY,
+                script_type="ModuleScript",
+                source_path=f"{_EVENT_DISPATCH_ALIAS_NAME}.luau",
+            ))
+            injected += 1
+        return injected
 
     def _run_phase(self, phase: str) -> None:
         """Execute a single phase with logging and context tracking."""
