@@ -150,6 +150,26 @@ _DAMAGE_CAPABILITY_KINDS: frozenset[str] = frozenset({
     "effect.splash",
 })
 
+# PR #74 codex round-6 [P1]: the converter-owned module names under
+# ``ReplicatedStorage.AutoGen``. Used by the rehydrate-aware injection
+# pre-pass to identify scripts that the converter owns end-to-end, so
+# a stale rehydrated module not needed by THIS run (e.g. an
+# adapters-on-but-no-damage resume of an output that used to have
+# damage) can be safely pruned. Names tracked in lockstep with the
+# composer (orchestrator) and the family modules under
+# ``converter/runtime/gameplay/``. Family modules added in later PRs
+# (e.g. ``EventDispatch`` in PR #75) extend this set.
+_ALL_GAMEPLAY_RUNTIME_MODULE_NAMES: frozenset[str] = frozenset({
+    "Composer",
+    "Triggers",
+    "Movement",
+    "Lifetime",
+    "HitDetection",
+    "Effects",
+    "DamageProtocol",
+    "Gameplay",
+})
+
 # PR #74 codex round-4 [P1] signals — when scanning emitted adapter
 # stub source on disk (rehydrate / publish rebuild path,
 # ``state.gameplay_matches`` empty by design), look for the exact
@@ -4459,6 +4479,54 @@ script.Disabled = true
                 )
             base_modules.append(("Gameplay", "gameplay.luau"))
             gameplay_modules: tuple[tuple[str, str], ...] = tuple(base_modules)
+
+            # PR #74 codex round-6 [P1]: refresh rehydrated runtime
+            # modules + prune stale ones. The previous skip-if-exists
+            # loop preserved whatever ``_rehydrate_scripts_from_disk``
+            # had loaded — which on a resume is the PREVIOUS run's
+            # source, not the current converter's. Two failure modes
+            # the round-6 [P1] called out:
+            #   * Stale ``Gameplay.luau`` still uses
+            #     ``WaitForChild("DamageProtocol")`` (pre-PR-#74
+            #     codex round-2 fix), so non-damage adapter projects
+            #     resumed against an older output ate a 5-second
+            #     startup stall.
+            #   * Stale ``DamageProtocol.luau`` survives even when
+            #     ``_damage_protocol_needed()`` returned False this
+            #     run — keeping the cross-feature
+            #     ``ReplicatedStorage.DamageEvent`` claim the gate is
+            #     supposed to release.
+            # Fix: build the SET of modules we want emitted (names of
+            # every entry in ``gameplay_modules`` plus the bootstrap),
+            # then in one pre-pass walk ``rbx_place.scripts`` under
+            # ``ReplicatedStorage.AutoGen`` and drop any script whose
+            # name is in the converter-owned namespace but NOT in the
+            # current emit set. The injection loop below then
+            # OVERWRITES the source on existing entries (matching
+            # name + parent_path) instead of skipping — so a refresh
+            # is mandatory whenever the converter version differs.
+            current_module_names: frozenset[str] = frozenset(
+                name for name, _ in gameplay_modules
+            )
+            kept: list = []
+            for s in self.state.rbx_place.scripts:
+                if (
+                    getattr(s, "parent_path", None) == "ReplicatedStorage.AutoGen"
+                    and getattr(s, "name", None) in _ALL_GAMEPLAY_RUNTIME_MODULE_NAMES
+                    and s.name not in current_module_names
+                ):
+                    log.info(
+                        "[write_output] Pruned stale gameplay-adapter "
+                        "module '%s' (not needed this run; "
+                        "_damage_protocol_needed=%s)",
+                        s.name,
+                        self._damage_protocol_needed(),
+                    )
+                    injected += 1  # count as a mutation for the log
+                    continue
+                kept.append(s)
+            self.state.rbx_place.scripts = kept
+
             for module_name, filename in gameplay_modules:
                 module_path = gameplay_runtime_dir / filename
                 if not module_path.exists():
@@ -4467,17 +4535,30 @@ script.Disabled = true
                         module_path,
                     )
                     continue
-                # Avoid duplicate injection across re-runs of write_output.
+                new_source = module_path.read_text(encoding="utf-8")
+                # PR #74 codex round-6 [P1]: refresh rather than skip.
+                # A rehydrated copy from a prior run is by definition
+                # stale relative to the current converter; the runtime
+                # modules are deterministic outputs and the canonical
+                # version always lives on disk in
+                # ``converter/runtime/gameplay/``.
                 existing = [
                     s for s in self.state.rbx_place.scripts
                     if s.name == module_name
                     and s.parent_path == "ReplicatedStorage.AutoGen"
                 ]
                 if existing:
+                    refreshed = False
+                    for s in existing:
+                        if s.source != new_source:
+                            s.source = new_source
+                            refreshed = True
+                    if refreshed:
+                        injected += 1  # count as a mutation for the log
                     continue
                 self.state.rbx_place.scripts.append(_GpRbxScript(
                     name=module_name,
-                    source=module_path.read_text(encoding="utf-8"),
+                    source=new_source,
                     script_type="ModuleScript",
                     parent_path="ReplicatedStorage.AutoGen",
                 ))
@@ -4499,15 +4580,27 @@ script.Disabled = true
             )
             if bootstrap_path.exists():
                 bootstrap_name = "_GameplayServerBootstrap"
+                bootstrap_source = bootstrap_path.read_text(encoding="utf-8")
                 existing_bootstrap = [
                     s for s in self.state.rbx_place.scripts
                     if s.name == bootstrap_name
                     and s.parent_path == "ServerScriptService"
                 ]
-                if not existing_bootstrap:
+                if existing_bootstrap:
+                    # PR #74 codex round-6 [P1]: refresh the rehydrated
+                    # bootstrap source so a resume against an older
+                    # output gets the current converter's version
+                    # (matters if a future fix updates the bootstrap
+                    # body — without the refresh the old source would
+                    # survive every resume).
+                    for s in existing_bootstrap:
+                        if s.source != bootstrap_source:
+                            s.source = bootstrap_source
+                            injected += 1
+                else:
                     self.state.rbx_place.scripts.append(_GpRbxScript(
                         name=bootstrap_name,
-                        source=bootstrap_path.read_text(encoding="utf-8"),
+                        source=bootstrap_source,
                         script_type="Script",
                         parent_path="ServerScriptService",
                     ))

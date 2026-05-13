@@ -488,6 +488,82 @@ class TestFinalizeWalksBoundScripts:
         )
 
 
+class TestRehydratedGameplayModulesRefresh:
+    """PR #74 codex round-6 [P1]: ``_inject_runtime_modules`` must
+    REFRESH rehydrated adapter runtime modules and PRUNE stale ones
+    that aren't needed this run. The previous skip-if-exists loop
+    preserved whatever ``_rehydrate_scripts_from_disk`` had loaded —
+    on a resume that's last run's source, not the current converter's.
+
+    Two regressions this guards against:
+
+      * Stale ``Gameplay.luau`` still using ``WaitForChild("DamageProtocol")``
+        (pre-PR-#74 round-2 fix) — every door/projectile-only adapter
+        project resumed against an older output would eat a 5-second
+        startup stall.
+      * Stale ``DamageProtocol.luau`` surviving when
+        ``_damage_protocol_needed()`` returned False this run — keeps
+        the cross-feature ``ReplicatedStorage.DamageEvent`` claim that
+        the PR #74 gate is supposed to release.
+    """
+
+    def test_inject_loop_calls_refresh_not_skip(self) -> None:
+        """Source pin: the gameplay-modules injection loop must
+        OVERWRITE existing entries instead of skipping. A future
+        refactor that reintroduces the skip-on-exist path regresses
+        the round-6 [P1] silently."""
+        import inspect
+        from converter.pipeline import Pipeline as _Pipeline
+
+        src = inspect.getsource(_Pipeline._inject_runtime_modules)
+        # Pin the refresh comment + the source-write line.
+        assert "refresh rather than skip" in src.lower() or (
+            "s.source = new_source" in src
+        ), (
+            "_inject_runtime_modules no longer refreshes rehydrated "
+            "gameplay-adapter modules — codex PR #74 round-6 [P1] "
+            "regressed."
+        )
+
+    def test_inject_loop_prunes_stale_module_not_in_emit_set(self) -> None:
+        """Source pin: the pre-pass walk must drop scripts whose name
+        is a converter-owned module name but NOT in the current
+        emit set."""
+        import inspect
+        from converter.pipeline import Pipeline as _Pipeline
+
+        src = inspect.getsource(_Pipeline._inject_runtime_modules)
+        assert "_ALL_GAMEPLAY_RUNTIME_MODULE_NAMES" in src, (
+            "_inject_runtime_modules no longer references the "
+            "converter-owned module name set — the prune pre-pass "
+            "can't identify stale modules to drop."
+        )
+        assert "current_module_names" in src, (
+            "_inject_runtime_modules no longer computes the "
+            "current emit set — round-6 [P1] prune is broken."
+        )
+
+    def test_known_module_set_is_complete(self) -> None:
+        """The pruning set must cover every module the injection
+        loop knows how to emit, or the rehydrate path leaves a
+        sub-stale module behind."""
+        from converter.pipeline import _ALL_GAMEPLAY_RUNTIME_MODULE_NAMES
+
+        # Pin every name that appears as the first element of
+        # ``base_modules`` / ``("DamageProtocol", ...)`` /
+        # ``("Gameplay", ...)`` in pipeline.py.
+        expected_min = {
+            "Composer", "Triggers", "Movement", "Lifetime",
+            "HitDetection", "Effects", "DamageProtocol", "Gameplay",
+        }
+        missing = expected_min - _ALL_GAMEPLAY_RUNTIME_MODULE_NAMES
+        assert not missing, (
+            f"_ALL_GAMEPLAY_RUNTIME_MODULE_NAMES missing: {missing}. "
+            "A rehydrated stale entry under one of these names would "
+            "survive the round-6 [P1] prune pass."
+        )
+
+
 class TestStripLegacyDoorTweenBlock:
     """Unit tests for the door-tween block strip helper."""
 
