@@ -563,6 +563,168 @@ class TestRehydrateRound1Regressions:
         assert alias.parent_path is None
 
 
+class TestRound3Regressions:
+    """PR #75 codex round-3 regression pins.
+
+    [P2] ``conversion_plan.json`` was stem-keyed; the canonical
+    ``AutoGen/EventDispatch.luau`` and a user-authored
+    ``EventDispatch.cs`` would collapse to one plan bucket and the
+    next preserve-scripts rehydrate would silently demote the user's
+    script into the canonical's container. Fix: classifier excludes
+    converter-owned runtime modules (detected by source markers).
+
+    [P3] Opt-out pruner was path-scoped on the alias check; a marked
+    alias previously moved off-path by a re-classification would
+    survive opt-out forever. Fix: marker-only detection in
+    ``_is_converter_alias`` (no path scope).
+
+    [P3] If both a stale off-path marked alias AND a ModuleScript at
+    the real alias path existed, both got refreshed and remained.
+    Fix: dedupe — keep one, prune the rest from in-memory + disk.
+    """
+
+    def test_classify_storage_skips_converter_owned_runtime_modules(
+        self, tmp_path: Path,
+    ) -> None:
+        """The classifier must not see canonical EventDispatch (marker
+        present) or alias (marker present). Their parent_path is
+        managed by ``_inject_runtime_modules``; including them in the
+        plan would collide with same-named user scripts on the next
+        rehydrate.
+        """
+        from converter.pipeline import _EVENT_DISPATCH_ALIAS_BODY
+        pl = _make_pipeline_with_fps_opt_in(tmp_path, scaffolding=["fps"])
+        # User-authored EventDispatch.cs transpilation.
+        pl.state.rbx_place.scripts.append(
+            RbxScript(
+                name="EventDispatch",
+                source="-- user EventDispatch.cs\n",
+                script_type="LocalScript",
+            )
+        )
+        # Canonical (carrying marker) — would normally be added by
+        # _inject_runtime_modules, simulate rehydrate ordering.
+        pl.state.rbx_place.scripts.append(
+            RbxScript(
+                name="EventDispatch",
+                source=(
+                    "-- @@GAMEPLAY_RUNTIME_MODULE@@ converter-owned (EventDispatch)\n"
+                    "local EventDispatch = {}\nreturn EventDispatch\n"
+                ),
+                script_type="ModuleScript",
+                parent_path="ReplicatedStorage.AutoGen",
+                source_path="AutoGen/EventDispatch.luau",
+            )
+        )
+        # Alias (carrying marker).
+        pl.state.rbx_place.scripts.append(
+            RbxScript(
+                name=_EVENT_DISPATCH_ALIAS_NAME,
+                source=_EVENT_DISPATCH_ALIAS_BODY,
+                script_type="ModuleScript",
+            )
+        )
+        pl._classify_storage()
+        plan = pl.ctx.storage_plan
+        # The classifier's decisions list must NOT include our
+        # converter-owned modules — they'd collide with the user's
+        # entry by name.
+        decision_names = {d["script"] for d in plan.decisions}
+        # The user's EventDispatch (LocalScript, no marker) IS in the plan.
+        assert "EventDispatch" in decision_names
+        # The plan's "shared_modules" / "server_modules" buckets must
+        # NOT contain the canonical or alias — they're marker-skipped.
+        all_modules = (
+            (plan.shared_modules or []) + (plan.server_modules or [])
+        )
+        assert _EVENT_DISPATCH_ALIAS_NAME not in all_modules
+        # The plan's client_scripts bucket has the user's EventDispatch
+        # exactly once — no collision.
+        client_with_name = [
+            n for n in (plan.client_scripts or [])
+            if n == "EventDispatch"
+        ]
+        # plan_lookup is keyed by stem; the user's entry must survive
+        # without being shadowed by our marker-bearing canonical.
+        assert "EventDispatch" not in all_modules, (
+            "canonical EventDispatch must not appear in shared_modules / "
+            "server_modules — would collide with user EventDispatch.cs "
+            "on rehydrate plan_lookup"
+        )
+
+    def test_offpath_marked_alias_is_deduped_when_real_alias_present(
+        self, tmp_path: Path,
+    ) -> None:
+        """Round-3 codex [P3]: if a stale marked alias was rescued
+        from ``ServerStorage`` AND a ModuleScript already occupies
+        the real alias path, the refresh path must keep one and
+        delete the duplicate.
+        """
+        from converter.pipeline import _EVENT_DISPATCH_ALIAS_BODY
+        pl = _make_pipeline_with_fps_opt_in(tmp_path, scaffolding=["fps"])
+        # Stale marked alias off-path (e.g. classified to ServerStorage
+        # in a previous run).
+        pl.state.rbx_place.scripts.append(
+            RbxScript(
+                name=_EVENT_DISPATCH_ALIAS_NAME,
+                source=_EVENT_DISPATCH_ALIAS_BODY,
+                script_type="ModuleScript",
+                parent_path="ServerStorage",
+            )
+        )
+        # At-path alias (e.g. classified or rehydrated from the
+        # correct location in the same run).
+        pl.state.rbx_place.scripts.append(
+            RbxScript(
+                name=_EVENT_DISPATCH_ALIAS_NAME,
+                source=_EVENT_DISPATCH_ALIAS_BODY,
+                script_type="ModuleScript",
+                parent_path="ReplicatedStorage",
+            )
+        )
+        pl._inject_runtime_modules()
+        aliases = [
+            s for s in pl.state.rbx_place.scripts
+            if s.name == _EVENT_DISPATCH_ALIAS_NAME
+        ]
+        # Exactly one alias after dedup.
+        assert len(aliases) == 1
+        # Survivor is at the real alias path.
+        assert aliases[0].parent_path in (None, "ReplicatedStorage")
+
+    def test_opt_out_prunes_offpath_marked_alias(
+        self, tmp_path: Path,
+    ) -> None:
+        """Round-3 codex [P3]: a marked alias previously moved to
+        ``ServerStorage`` (and never rescued back, e.g. an
+        intermediate adapter-mode-only resume) must still be pruned
+        on a follow-up no-FPS run. Marker-only detection — no path
+        scope — in ``_is_converter_alias``.
+        """
+        from converter.pipeline import _EVENT_DISPATCH_ALIAS_BODY
+        project = tmp_path / "fakeproject"
+        (project / "Assets").mkdir(parents=True)
+        out = tmp_path / "out"
+        out.mkdir()
+        pl = Pipeline(unity_project_path=project, output_dir=out)
+        pl.state.rbx_place = RbxPlace(
+            scripts=[],
+            workspace_parts=[],
+            screen_guis=[],
+        )
+        pl.state.rbx_place.scripts.append(
+            RbxScript(
+                name=_EVENT_DISPATCH_ALIAS_NAME,
+                source=_EVENT_DISPATCH_ALIAS_BODY,
+                script_type="ModuleScript",
+                parent_path="ServerStorage",
+            )
+        )
+        pl._subphase_inject_autogen_scripts()
+        names = [s.name for s in pl.state.rbx_place.scripts]
+        assert _EVENT_DISPATCH_ALIAS_NAME not in names
+
+
 class TestAliasOverwritePolicy:
     """PR #75 alias overwrite policy:
 

@@ -3563,11 +3563,18 @@ return table.concat(allData, "\\n")'''
             _EVENT_DISPATCH_CANONICAL_NAME
         ]
         def _is_converter_alias(s: object) -> bool:
+            # Round-3 codex [P3]: marker-only detection, no path scope.
+            # A previously-emitted alias that was reclassified into
+            # ``ServerStorage`` (or anywhere off-path) by an
+            # intermediate run would survive the path-scoped check;
+            # the marker is the discriminator. ``script_type`` still
+            # gates this to ModuleScripts so a Script/LocalScript
+            # named ``AutoFpsEventDispatch`` (different type, no
+            # marker possible without intentional spoofing) is left
+            # alone.
             if getattr(s, "name", None) != _EVENT_DISPATCH_ALIAS_NAME:
                 return False
             if getattr(s, "script_type", None) != "ModuleScript":
-                return False
-            if getattr(s, "parent_path", None) not in (None, "ReplicatedStorage"):
                 return False
             source = getattr(s, "source", None) or ""
             return (
@@ -4311,11 +4318,47 @@ script.Disabled = true
         from converter.storage_classifier import classify_storage
         import json as _json
 
+        # Round-3 codex [P2]: keep converter-owned runtime modules
+        # OUT of the classifier (and out of ``conversion_plan.json``).
+        # Two scripts named ``EventDispatch`` — the user's
+        # ``EventDispatch.cs`` transpilation and the canonical
+        # ``AutoGen/EventDispatch.luau`` — share the same stem; the
+        # classifier's name-keyed bucket buckets collapse them on the
+        # plan rebuild and the next preserve-scripts rehydrate then
+        # routes the user's script into the canonical's container,
+        # silently breaking it. Converter modules don't need plan
+        # entries — ``_inject_runtime_modules`` pins their
+        # ``parent_path`` + ``script_type`` directly each run.
+        #
+        # Detection is marker-only: the source carries
+        # ``@@GAMEPLAY_RUNTIME_MODULE@@`` (canonical / gameplay-adapter
+        # modules) or ``@@AUTO_FPS_EVENT_DISPATCH_ALIAS@@`` (PR #75
+        # alias). A user-authored script with those literal magic
+        # strings would have to be intentional.
+        all_scripts = self.state.rbx_place.scripts
+        converter_owned: list = []
+        user_or_unknown: list = []
+        for s in all_scripts:
+            source = getattr(s, "source", None) or ""
+            if (
+                GAMEPLAY_RUNTIME_MODULE_MARKER in source
+                or _EVENT_DISPATCH_ALIAS_MARKER in source
+            ):
+                converter_owned.append(s)
+            else:
+                user_or_unknown.append(s)
+
         plan = classify_storage(
-            self.state.rbx_place.scripts,
+            user_or_unknown,
             dependency_map=self.state.dependency_map or None,
         )
         self.ctx.storage_plan = plan
+        if converter_owned:
+            log.info(
+                "[classify_storage] Skipped %d converter-owned runtime "
+                "module(s) (parent_path managed by _inject_runtime_modules)",
+                len(converter_owned),
+            )
 
         # Record each script's subdir so rehydration can route it back.
         script_paths: dict[str, str] = {}
@@ -5365,32 +5408,63 @@ script.Disabled = true
             if getattr(s, "script_type", None) == "ModuleScript"
         ]
         if existing_alias_modules:
-            for s in existing_alias_modules:
-                if s.source != _EVENT_DISPATCH_ALIAS_BODY:
-                    s.source = _EVENT_DISPATCH_ALIAS_BODY
-                    injected += 1
-                # Round-1 codex [P2]: pin ``parent_path`` to
-                # ``ReplicatedStorage`` on every refresh. The previous
-                # write may have been classified into ServerStorage
-                # (storage_classifier routes server-only-required
-                # ModuleScripts to ``ServerStorage``); the alias only
-                # functions if it lives at the historic
-                # ``ReplicatedStorage.AutoFpsEventDispatch`` path. Pin
-                # ``None`` so the rbxlx writer's default container
-                # (ReplicatedStorage for ModuleScripts) wins and so
-                # any future re-classification can't pull the alias
-                # out of replicated scope again.
-                if getattr(s, "parent_path", None) not in (
+            # Round-3 codex [P3] dedupe: if a stale marked alias was
+            # rescued off-path AND a separate ModuleScript already
+            # occupies the alias path, both end up here. Keep the
+            # first, prune the rest from in-memory state AND from
+            # disk so the next rehydrate doesn't resurrect the
+            # duplicate. Preference order: prefer the entry already
+            # at the alias path (so we don't strand its source_path
+            # at the rescue's off-path location).
+            on_path = [
+                s for s in existing_alias_modules
+                if getattr(s, "parent_path", None) in (
                     None, "ReplicatedStorage",
-                ):
-                    s.parent_path = "ReplicatedStorage"
-                    injected += 1
-                # source_path on a fresh emit is unset (top-level
-                # cache write); on a rehydrated entry the path is
-                # already correct relative to ``scripts/``. Don't
-                # touch it — the disk-write finalizer keys off
-                # ``source_path`` when set so changing it here would
-                # leak the old file behind.
+                )
+            ]
+            survivor = on_path[0] if on_path else existing_alias_modules[0]
+            duplicates = [s for s in existing_alias_modules if s is not survivor]
+            for dup in duplicates:
+                log.info(
+                    "[write_output] Dedup AutoFpsEventDispatch — "
+                    "removing %d duplicate alias entry/entries "
+                    "(stale rescue off parent_path=%r).",
+                    len(duplicates),
+                    getattr(dup, "parent_path", None),
+                )
+                self._delete_pruned_script_from_disk(dup)
+                try:
+                    self.state.rbx_place.scripts.remove(dup)
+                except ValueError:
+                    # Already removed (defensive — same object can't
+                    # survive identity-based ``remove`` twice).
+                    pass
+                injected += 1
+            s = survivor
+            if s.source != _EVENT_DISPATCH_ALIAS_BODY:
+                s.source = _EVENT_DISPATCH_ALIAS_BODY
+                injected += 1
+            # Round-1 codex [P2]: pin ``parent_path`` to
+            # ``ReplicatedStorage`` on every refresh. The previous
+            # write may have been classified into ServerStorage
+            # (storage_classifier routes server-only-required
+            # ModuleScripts to ``ServerStorage``); the alias only
+            # functions if it lives at the historic
+            # ``ReplicatedStorage.AutoFpsEventDispatch`` path. Pin
+            # ``None`` so the rbxlx writer's default container
+            # (ReplicatedStorage for ModuleScripts) wins and so any
+            # future re-classification can't pull the alias out of
+            # replicated scope again.
+            if getattr(s, "parent_path", None) not in (
+                None, "ReplicatedStorage",
+            ):
+                s.parent_path = "ReplicatedStorage"
+                injected += 1
+            # source_path on a fresh emit is unset (top-level cache
+            # write); on a rehydrated entry the path is already
+            # correct relative to ``scripts/``. Don't touch it — the
+            # disk-write finalizer keys off ``source_path`` when set
+            # so changing it here would leak the old file behind.
         else:
             # Fresh emit: leave parent_path=None so the storage
             # classifier doesn't see an explicit override and the
