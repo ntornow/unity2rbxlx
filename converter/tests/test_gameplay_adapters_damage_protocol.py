@@ -499,6 +499,48 @@ class TestPipelineInjection:
             "validator on resume."
         )
 
+    def test_damage_stub_scan_requires_adapter_marker(self) -> None:
+        """PR #74 codex round-7 [P2]: ``_place_has_damage_adapter_stub``
+        previously matched on ``{kind = "effect.damage"`` alone. A
+        user / generated script that happened to contain that string
+        (e.g. a tutorial Luau file documenting the adapter format,
+        or an unrelated script that uses the same kind-table shape)
+        would trip the probe and re-inject DamageProtocol. The
+        composer's ``ADAPTER_STUB_MARKER`` is the unique structural
+        proof that the script is an adapter stub; the scan now
+        requires BOTH the marker AND the capability literal.
+        """
+        import types
+        from converter.pipeline import Pipeline
+
+        # Script that has the kind literal but NOT the
+        # ADAPTER_STUB_MARKER — must be rejected.
+        class _State:
+            def __init__(self) -> None:
+                self.gameplay_matches: list = []
+                self.rbx_place = types.SimpleNamespace(
+                    scripts=[
+                        types.SimpleNamespace(
+                            source=(
+                                "-- user-authored tutorial script\n"
+                                "local exampleCapability = "
+                                '{kind = "effect.damage", value = 10}\n'
+                                "return exampleCapability\n"
+                            ),
+                        ),
+                    ],
+                    workspace_parts=[],
+                    replicated_templates=[],
+                )
+
+        harness = types.SimpleNamespace(state=_State())
+        assert Pipeline._damage_protocol_needed(harness) is False, (
+            "_damage_protocol_needed false-positived on a user "
+            "script that mentions the kind literal but isn't an "
+            "actual adapter stub — codex PR #74 round-7 [P2] "
+            "regressed."
+        )
+
     def test_legacy_probe_rejects_bare_FindFirstChild_lookup(self) -> None:
         """PR #74 codex round-4 [P2]: a bare
         ``FindFirstChild("DamageEvent")`` lookup in an unrelated user
@@ -584,9 +626,11 @@ class TestPipelineInjection:
         # auto-run).
         bootstrap_idx = src.find("server_bootstrap.luau")
         # Look in a generous window around the reference for both
-        # markers; the actual injection block fits within ~1500 chars
-        # of the filename reference.
-        window = src[max(0, bootstrap_idx - 200) : bootstrap_idx + 1500]
+        # markers; the actual injection block has grown over rounds
+        # of codex review (PR #74 round-6 added a refresh branch;
+        # round-7 added parent_path/script_type backfills) so the
+        # window is intentionally wide.
+        window = src[max(0, bootstrap_idx - 200) : bootstrap_idx + 3000]
         assert '"ServerScriptService"' in window, (
             "pipeline.py references server_bootstrap.luau but the "
             "injection no longer parents it to ServerScriptService — "

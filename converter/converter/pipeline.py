@@ -323,14 +323,28 @@ def _place_has_damage_adapter_stub(
     ``{kind = "effect.splash"``) recovers the signal without
     re-running the transpile phase.
 
+    PR #74 codex round-7 [P2]: a capability-literal substring alone
+    is too loose — any user / generated Luau that contains
+    ``{kind = "effect.damage"`` as a string would trip the probe and
+    re-inject DamageProtocol, reclaiming
+    ``ReplicatedStorage.DamageEvent``. Tightened to ALSO require the
+    composer's ``ADAPTER_STUB_MARKER`` (the unique first-line
+    structural marker) in the same script. The composer emits both
+    in every adapter stub, so the AND check has zero false negatives
+    on real stubs and rejects everything else.
+
     Walks the same surfaces as ``_place_carries_adapter_marker``
     so prefab-template-bound stubs are seen too.
     """
+    from converter.gameplay.composer import ADAPTER_STUB_MARKER
+
     if rbx_place is None:
         return False
 
     def _has(script: _ScriptLike) -> bool:
         src = getattr(script, "source", None) or ""
+        if ADAPTER_STUB_MARKER not in src:
+            return False
         return any(marker in src for marker in _DAMAGE_CAPABILITY_LUA_MARKERS)
 
     def _walk(parts: list[_PartLike]) -> bool:
@@ -4496,23 +4510,29 @@ script.Disabled = true
             #     run — keeping the cross-feature
             #     ``ReplicatedStorage.DamageEvent`` claim the gate is
             #     supposed to release.
-            # Fix: build the SET of modules we want emitted (names of
-            # every entry in ``gameplay_modules`` plus the bootstrap),
-            # then in one pre-pass walk ``rbx_place.scripts`` under
-            # ``ReplicatedStorage.AutoGen`` and drop any script whose
-            # name is in the converter-owned namespace but NOT in the
-            # current emit set. The injection loop below then
-            # OVERWRITES the source on existing entries (matching
-            # name + parent_path) instead of skipping — so a refresh
-            # is mandatory whenever the converter version differs.
+            #
+            # PR #74 codex round-7 [P1]: match rehydrated modules by
+            # NAME alone (no parent_path filter). On rehydrate the
+            # modules come back with ``parent_path=None`` because
+            # ``_rehydrate_scripts_from_disk`` only restores parent
+            # paths from ``conversion_plan.json``, and that plan is
+            # written BEFORE runtime-module injection so the gameplay
+            # modules aren't in it. The previous round-6 match used
+            # ``parent_path == "ReplicatedStorage.AutoGen"`` and
+            # therefore missed every rehydrated copy, leaving stale
+            # modules in place while appending a fresh duplicate.
+            # The names in ``_ALL_GAMEPLAY_RUNTIME_MODULE_NAMES`` are
+            # reserved for the converter so name-only matching is
+            # safe — any non-converter script named ``Composer`` /
+            # ``Gameplay`` / etc. is a collision the converter would
+            # already be hitting elsewhere.
             current_module_names: frozenset[str] = frozenset(
                 name for name, _ in gameplay_modules
             )
             kept: list = []
             for s in self.state.rbx_place.scripts:
                 if (
-                    getattr(s, "parent_path", None) == "ReplicatedStorage.AutoGen"
-                    and getattr(s, "name", None) in _ALL_GAMEPLAY_RUNTIME_MODULE_NAMES
+                    getattr(s, "name", None) in _ALL_GAMEPLAY_RUNTIME_MODULE_NAMES
                     and s.name not in current_module_names
                 ):
                     log.info(
@@ -4542,16 +4562,35 @@ script.Disabled = true
                 # modules are deterministic outputs and the canonical
                 # version always lives on disk in
                 # ``converter/runtime/gameplay/``.
+                #
+                # PR #74 codex round-7 [P1]: match by name alone — see
+                # the prune-pass comment above. The match must also
+                # backfill the canonical ``parent_path`` so the rbxlx
+                # writer routes the refreshed script under
+                # ``ReplicatedStorage.AutoGen`` instead of the
+                # heuristic fallback path.
                 existing = [
                     s for s in self.state.rbx_place.scripts
                     if s.name == module_name
-                    and s.parent_path == "ReplicatedStorage.AutoGen"
                 ]
                 if existing:
                     refreshed = False
                     for s in existing:
                         if s.source != new_source:
                             s.source = new_source
+                            refreshed = True
+                        # Backfill canonical parent_path on rehydrate
+                        # (rehydrated scripts default to ``None`` for
+                        # modules that weren't in ``conversion_plan.json``).
+                        if getattr(s, "parent_path", None) != "ReplicatedStorage.AutoGen":
+                            s.parent_path = "ReplicatedStorage.AutoGen"
+                            refreshed = True
+                        # Same for script_type — rehydrate heuristic
+                        # may have classified an adapter module
+                        # ambiguously; the converter ships them as
+                        # ModuleScripts so pin that here.
+                        if getattr(s, "script_type", None) != "ModuleScript":
+                            s.script_type = "ModuleScript"
                             refreshed = True
                     if refreshed:
                         injected += 1  # count as a mutation for the log
@@ -4581,10 +4620,17 @@ script.Disabled = true
             if bootstrap_path.exists():
                 bootstrap_name = "_GameplayServerBootstrap"
                 bootstrap_source = bootstrap_path.read_text(encoding="utf-8")
+                # PR #74 codex round-7 [P1]: match by name alone. On
+                # rehydrate the bootstrap comes back with
+                # ``parent_path=None`` because
+                # ``conversion_plan.json`` is written before runtime
+                # injection. Filtering on ``parent_path ==
+                # "ServerScriptService"`` here would miss every
+                # rehydrated copy and append a duplicate. The name
+                # ``_GameplayServerBootstrap`` is converter-reserved.
                 existing_bootstrap = [
                     s for s in self.state.rbx_place.scripts
                     if s.name == bootstrap_name
-                    and s.parent_path == "ServerScriptService"
                 ]
                 if existing_bootstrap:
                     # PR #74 codex round-6 [P1]: refresh the rehydrated
@@ -4596,6 +4642,14 @@ script.Disabled = true
                     for s in existing_bootstrap:
                         if s.source != bootstrap_source:
                             s.source = bootstrap_source
+                            injected += 1
+                        # Round-7 [P1] backfill — same rationale as
+                        # the gameplay-module loop above.
+                        if getattr(s, "parent_path", None) != "ServerScriptService":
+                            s.parent_path = "ServerScriptService"
+                            injected += 1
+                        if getattr(s, "script_type", None) != "Script":
+                            s.script_type = "Script"
                             injected += 1
                 else:
                     self.state.rbx_place.scripts.append(_GpRbxScript(

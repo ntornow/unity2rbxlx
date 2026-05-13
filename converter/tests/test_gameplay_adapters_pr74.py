@@ -564,6 +564,83 @@ class TestRehydratedGameplayModulesRefresh:
         )
 
 
+class TestRehydratedModuleMatchByName:
+    """PR #74 codex round-7 [P1]: rehydrated runtime modules come
+    back from disk with ``parent_path=None`` because
+    ``_rehydrate_scripts_from_disk`` can only restore parent paths
+    from ``conversion_plan.json`` (written BEFORE runtime-module
+    injection so the gameplay modules aren't in it). The round-6
+    refresh path used ``parent_path == "ReplicatedStorage.AutoGen"``
+    in its match filter, so every rehydrated module fell through and
+    a duplicate was appended.
+    """
+
+    def test_inject_loop_matches_by_name_alone(self) -> None:
+        """Source pin: the injection-loop's existing-match filter
+        must NOT include ``parent_path`` in the predicate (the
+        rehydrate-path bug). Backfilling the parent_path inside the
+        refresh branch is fine — that's the FIX — but the match
+        itself has to find rehydrated entries with parent_path=None.
+        """
+        import inspect
+        from converter.pipeline import Pipeline as _Pipeline
+
+        src = inspect.getsource(_Pipeline._inject_runtime_modules)
+
+        # Find the `existing = [...]` list-comp that drives the
+        # gameplay-modules refresh branch. It must filter by
+        # ``s.name == module_name`` and NOT also gate on
+        # parent_path. Slice the source around the relevant `for
+        # module_name, filename in gameplay_modules:` loop.
+        loop_idx = src.find("for module_name, filename in gameplay_modules:")
+        assert loop_idx != -1, (
+            "_inject_runtime_modules no longer has the "
+            "gameplay_modules injection loop — test premise broke."
+        )
+        loop_body = src[loop_idx : loop_idx + 2000]
+        # The list-comp lives within the first ~2000 chars of the loop.
+        existing_idx = loop_body.find("existing = [")
+        assert existing_idx != -1, (
+            "_inject_runtime_modules dropped the existing-match "
+            "list-comp."
+        )
+        # Grab the comprehension body (10 lines after).
+        comp = "\n".join(loop_body[existing_idx:].splitlines()[:6])
+        assert "s.name == module_name" in comp, (
+            "Existing-match filter no longer keys off s.name — "
+            "rehydrated modules can't be found."
+        )
+        assert "parent_path" not in comp, (
+            "Existing-match filter still references parent_path — "
+            "rehydrated modules have parent_path=None and the "
+            "filter misses them. Codex PR #74 round-7 [P1] regressed."
+        )
+
+    def test_refresh_branch_backfills_parent_path(self) -> None:
+        """Source pin: the refresh branch must reassign
+        ``parent_path = "ReplicatedStorage.AutoGen"`` on rehydrated
+        entries so the rbxlx writer routes them correctly. Without
+        this the module ends up in the heuristic fallback path."""
+        import inspect
+        from converter.pipeline import Pipeline as _Pipeline
+
+        src = inspect.getsource(_Pipeline._inject_runtime_modules)
+        refresh_idx = src.find("if existing:")
+        assert refresh_idx != -1
+        refresh_block = src[refresh_idx : refresh_idx + 1500]
+        assert (
+            's.parent_path = "ReplicatedStorage.AutoGen"' in refresh_block
+        ), (
+            "Refresh branch doesn't backfill parent_path — codex "
+            "PR #74 round-7 [P1] regressed."
+        )
+        assert 's.script_type = "ModuleScript"' in refresh_block, (
+            "Refresh branch doesn't backfill script_type — a "
+            "rehydrated module classified as Script would route to "
+            "the wrong container."
+        )
+
+
 class TestStripLegacyDoorTweenBlock:
     """Unit tests for the door-tween block strip helper."""
 
