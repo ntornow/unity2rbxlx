@@ -934,21 +934,73 @@ codex pushback on PR #72 sharpened the slicing and added two cuts):
       tag gate + despawn-on-any-impact). All three were already
       shipped in code in #73b — PR #73c brings the doc into sync.
 
-  - **PR #74:** flip default ON.
-    - `--use-gameplay-adapters` defaults true.
-      `ConversionContext.use_gameplay_adapters` and
-      `Pipeline.__init__`'s default both flip in lockstep so a
-      Pipeline built with no flag and a freshly-constructed ctx
-      can't silently disagree on adapter mode.
-    - `--legacy-gameplay-packs` opt-out flag (default false). Click
-      shape: `--use-gameplay-adapters/--no-use-gameplay-adapters`
+  - **PR #74:** flip default ON. Eleven codex review rounds
+    (rounds 1–11) hardened the rollback / resume / cross-feature-
+    collision surfaces; the architectural decisions below carry
+    forward into every subsequent PR in the migration.
+    - **Default flip.** `ConversionContext.use_gameplay_adapters`
+      defaults to `True`. `Pipeline.__init__`'s
+      `use_gameplay_adapters` parameter is a **tri-state**
+      (`bool | None`, codex round-1 [P1]):
+        - `None` (default) — caller has no preference this run.
+          Constructor leaves `ctx.use_gameplay_adapters` at its
+          dataclass default for fresh ctx (`True`), and at the
+          persisted value for a resumed ctx. **Resume preserves
+          persisted state.**
+        - `True` / `False` — explicit caller choice. Wins over
+          persisted state both at construction and after
+          `Pipeline.resume()`'s ctx swap.
+      A hard `True` default would unconditionally overwrite a
+      persisted `False` on `--phase` resumes, breaking sticky
+      rollback for projects originally converted with
+      `--legacy-gameplay-packs`. The CLI seam computes "was the
+      user explicit?" via `click.get_parameter_source(...)` and
+      forwards the corresponding bool or `None`.
+    - **Mode-flip transpile-cache invalidation** (codex round-2
+      [P1] + round-8 [P2]). When an explicit override flips the
+      mode (e.g. `--legacy-gameplay-packs` against an originally
+      adapters-on output), the cached `scripts/*.luau` carries the
+      PREVIOUS mode's output and `_subphase_emit_scripts_to_disk`'s
+      preserve-scripts path would silently keep it. The flip is
+      detected at `Pipeline.resume()` AND
+      `convert_interactive._make_pipeline()` post-ctx-swap;
+      `Pipeline._invalidate_transpile_cache_for_mode_flip()` then
+      (a) sets `self._retranspile = True` so the disk-cache wipe
+      fires and (b) removes `"transpile_scripts"` from
+      `ctx.completed_phases` so the phase actually re-runs.
+      `convert_interactive` callers OR the caller's `--retranspile`
+      flag with the invalidator-set `_retranspile` so the True
+      survives — `pipeline._retranspile = retranspile or
+      getattr(pipeline, "_retranspile", False)`.
+    - **Pre-PR-#73a ctx → legacy** (codex round-3 [P1]).
+      `ConversionContext.load()` checks the raw JSON dict before
+      passing to `cls(**cleaned)`; when `use_gameplay_adapters` is
+      missing from the file (i.e. the ctx predates PR #73a), the
+      loader forces `False` instead of letting the new dataclass
+      default fill in `True`. Preserves sticky rollback for
+      pre-PR-#73a outputs that get resumed against PR-#74-or-later
+      converters.
+    - **`--legacy-gameplay-packs` opt-out flag** (default false).
+      Click shape: `--use-gameplay-adapters/--no-use-gameplay-adapters`
       (default True) PLUS the new `--legacy-gameplay-packs` boolean
       flag, so an operator who wants the legacy pipeline writes
       `--legacy-gameplay-packs` alone and the CLI's mutex check
       flips adapters off without requiring the explicit
-      `--no-use-gameplay-adapters`.
-    - The two modes are **mutually exclusive** at pipeline level.
-      Mutex resolution happens at the CLI seam via
+      `--no-use-gameplay-adapters`. **Exposed on all three CLI
+      entry points** (codex round-1 [P2] + round-5 [P2]): `u2r.py
+      convert`, `convert_interactive assemble`, and
+      `convert_interactive transpile`. The last one matters because
+      the interactive workflow has operators review `scripts/`
+      between `transpile` and `assemble`; an operator who plans to
+      finish with `--legacy-gameplay-packs` at assemble needs the
+      right Luau out of `transpile` too. `convert_interactive
+      transpile` also wipes `scripts/*.luau` when
+      `pipeline._retranspile` is True even on an empty-transpile
+      pass — covers the round-9 [P2] mode-flip case where the
+      Unity project has zero runtime C# files but the stale cache
+      would otherwise survive.
+    - **Mutually exclusive at pipeline level.** Mutex resolution
+      happens at the CLI seam via
       `click.get_current_context().get_parameter_source(
       "use_gameplay_adapters")`: passing `--legacy-gameplay-packs`
       AND an EXPLICIT `--use-gameplay-adapters` raises
@@ -959,72 +1011,171 @@ codex pushback on PR #72 sharpened the slicing and added two cuts):
       pushback on PR #72 flagged that running both produces
       double-binding (legacy mutates the transpiled body, adapter
       emits a new stub — they fight over the same scene parts).
-    - **DamageProtocol injection gating** (PR #74 codex round-2
-      [P2]). Before PR #74, `pipeline.py:3865-3919` force-injected
-      `damage_protocol.luau` whenever ANY adapter match was present
-      (door-only / projectile-only included). `damage_protocol.luau`
-      claims `ReplicatedStorage.DamageEvent` unconditionally and
-      binds `OnServerEvent` to any pre-existing RemoteEvent at that
-      name — a real cross-feature collision for adapter-enabled
-      projects that already use a `DamageEvent` for unrelated
-      traffic. PR #74 gates the injection on a Player-damage
-      signal via `Pipeline._damage_protocol_needed()`. Two
-      qualifying signals:
-        1. A `GameplayMatch` emitted an `effect.damage` or
-           `effect.splash` capability (adapter path — captures
-           bullets / explosions routed through `DamageEvent`).
-        2. Any script's source carries the literal
-           `FindFirstChild("DamageEvent")` marker that the legacy
-           `player_damage_remote_event` pack's body-patch leaves
-           in patched Player LocalScripts (tier-2 partial-disable
-           path — captures Player.cs FireServer wiring).
+    - **DamageProtocol injection gating — three signals** (PR #74
+      codex round-2 [P2] + round-4 [P1] + round-4 [P2] + round-7
+      [P2]). Before PR #74, the runtime-module injection force-
+      emitted `damage_protocol.luau` whenever ANY adapter match was
+      present (door-only / projectile-only included).
+      `damage_protocol.luau` claims `ReplicatedStorage.DamageEvent`
+      unconditionally and binds `OnServerEvent` to any pre-existing
+      RemoteEvent at that name — a real cross-feature collision for
+      adapter-enabled projects that already use a `DamageEvent` for
+      unrelated traffic. `Pipeline._damage_protocol_needed()` now
+      gates injection on **any one** of:
+        1. **Fresh-conversion adapter path.** A `GameplayMatch`
+           carries `effect.damage` or `effect.splash` in
+           `capability_kinds`. Captures bullets / explosions that
+           the gameplay-adapter pipeline routes through
+           `DamageEvent`. Pinned set:
+           `Pipeline._DAMAGE_CAPABILITY_KINDS`.
+        2. **Rehydrate-path adapter scan.** On resume / publish-
+           rebuild, `state.gameplay_matches` is empty by design.
+           `_place_has_damage_adapter_stub` walks every script-
+           bearing surface (`place.scripts` +
+           `workspace_parts` + `replicated_templates`) and looks
+           for the composer-emitted capability literal
+           (`{kind = "effect.damage"` / `{kind = "effect.splash"`)
+           **AND** the `ADAPTER_STUB_MARKER` (`@@AUTOGEN_GAMEPLAY_ADAPTER@@`)
+           in the same script. Both required so a user-authored
+           Luau that incidentally mentions the kind string (a
+           tutorial, a script that uses the same kind-table
+           shape) doesn't false-positive.
+        3. **Legacy body-patch path.** Any script's source
+           contains the FULL pack-emitted line `local _de =
+           game:GetService("ReplicatedStorage"):FindFirstChild(
+           "DamageEvent")`. The `local _de = ...` prefix is
+           pack-specific (composer never emits that variable
+           name) and uniquely identifies the body-patch. The
+           previous tier-1 substring `:FindFirstChild(
+           "DamageEvent")` false-positived on any user code that
+           coincidentally looked up a `DamageEvent` RemoteEvent.
       The orchestrator (`runtime/gameplay/gameplay.luau`) loads
-      DamageProtocol via `FindFirstChild` (NOT `WaitForChild`)
-      with a nil guard so the absent case is an immediate no-op
-      rather than a 5-second stall on every door/projectile-only
-      adapter project. The server bootstrap stays always-on when
-      adapters are on (`require(Gameplay)` is still useful for
-      registering Movement/Lifetime/Trigger/HitDetection/Effects
-      families at server start) — only DamageProtocol itself is
-      gated. Pinned by `Pipeline._DAMAGE_CAPABILITY_KINDS` +
-      `tests/test_gameplay_adapters_damage_protocol.py::
-      TestPipelineInjection::test_damage_protocol_needed_signals`.
-    - **Rehydration-aware prune pass.** On re-conversion of an
-      output that contains legacy artifacts
-      (`_AutoFpsDoorTweenInjected` marker,
-      `_AutoDamageEventRouter` script, `_AutoFpsHud*` ScreenGui
-      attribute), the pipeline removes them BEFORE adapters emit
-      their replacements, regardless of which mode produced the
-      artifacts. Implemented as
-      `Pipeline._prune_legacy_gameplay_artifacts()`, called from
-      the gameplay-adapter runtime-injection branch in
-      `_subphase_inject_runtime_libraries` (so it only fires when
-      adapters are on AND adapter stubs are present). Prunes
-      three surfaces in one pass:
+      DamageProtocol via `FindFirstChild` (NOT `WaitForChild`) with
+      a nil guard so the absent case is an immediate no-op rather
+      than a 5-second stall on every door/projectile-only adapter
+      project. The server bootstrap stays always-on when adapters
+      are on (`require(Gameplay)` is still useful for registering
+      Movement/Lifetime/Trigger/HitDetection/Effects families at
+      server start) — only DamageProtocol itself is gated. Pinned
+      by `tests/test_gameplay_adapters_damage_protocol.py::
+      TestPipelineInjection::{test_damage_protocol_needed_signals,
+      test_damage_protocol_needed_rehydrates_via_adapter_stub_scan,
+      test_legacy_probe_rejects_bare_FindFirstChild_lookup,
+      test_damage_stub_scan_requires_adapter_marker}`.
+    - **Runtime-module identity — structural marker + refresh-not-
+      skip + stale-prune** (codex round-6 [P1] + round-7 [P1] +
+      round-8 [P1] + round-9 [P1] + round-10 [P2]).
+      `_inject_runtime_modules` runs against `rbx_place.scripts`
+      which has typically already been hydrated from disk on
+      resume paths, so the previous run's adapter runtime modules
+      are sitting in place. Three coordinated decisions:
+        - **Structural marker.** Every gameplay runtime module
+          under `converter/runtime/gameplay/` (composer, triggers,
+          movement, lifetime, hit_detection, effects,
+          damage_protocol, gameplay, server_bootstrap) begins with
+          `-- @@GAMEPLAY_RUNTIME_MODULE@@`. The exact marker is
+          intentionally unique enough that no user-authored script
+          could plausibly carry it as a comment or string literal.
+        - **Identity predicate.**
+          `_is_converter_gameplay_runtime_module(script,
+          module_name, filename)` accepts three signals:
+          (a) `parent_path == "ReplicatedStorage.AutoGen"` (in-
+          memory canonical or plan-restored); (b) source contains
+          `GAMEPLAY_RUNTIME_MODULE_MARKER` (definitive
+          converter-owned); (c) source starts with one of the
+          canonical pre-marker first lines in
+          `_LEGACY_GAMEPLAY_RUNTIME_PRE_MARKER_HEADERS` (back-compat
+          for rehydrates of outputs produced before the round-9
+          marker landed — full canonical first lines, unique enough
+          to not false-positive on user code). A user
+          `Composer.cs` / `Effects.cs` / `Gameplay.cs` that
+          classify_storage routed to a non-AutoGen path AND whose
+          source carries none of these signals is treated as user-
+          owned and left alone.
+        - **Refresh-not-skip + canonical pre-pass prune.** The
+          injection loop overwrites the source on existing matches
+          (the runtime modules are deterministic outputs; the
+          canonical version always lives on disk in
+          `converter/runtime/gameplay/`). Backfills
+          `parent_path = "ReplicatedStorage.AutoGen"` and
+          `script_type = "ModuleScript"` on rehydrated entries
+          whose parent_path came back `None` (rehydrate happens
+          BEFORE `conversion_plan.json` has the gameplay-module
+          paths). A pre-pass walk drops any script whose name is
+          in `_ALL_GAMEPLAY_RUNTIME_MODULE_NAMES` but NOT in this
+          run's emit set (e.g. a stale `DamageProtocol.luau` from
+          a previous damage-bearing run that no longer qualifies)
+          AND whose identity predicate matches.
+        - **On-disk delete.**
+          `Pipeline._delete_pruned_script_from_disk(script)`
+          unlinks the cached `.luau` whenever a script is pruned
+          from `rbx_place.scripts`. Without this, the next
+          resume's `_rehydrate_scripts_from_disk` would load the
+          orphan back. Uses the script's `source_path` when set
+          (preserves nested-dir routing) and falls back to
+          `<name>.luau` at the top of `scripts/`. Idempotent;
+          no-op when the file is already gone or `output_dir` is
+          `None` (test-harness duck-typed Pipelines).
+    - **Rehydration-aware prune pass — three artifact surfaces.**
+      `Pipeline._prune_legacy_gameplay_artifacts()` runs at the
+      start of the gameplay-adapter runtime-injection branch in
+      `_subphase_inject_runtime_libraries` (only when
+      `ctx.use_gameplay_adapters` AND adapter stubs are present).
+      On re-conversion of an output that contains legacy artifacts
+      — regardless of which mode produced them — the prune
+      removes them BEFORE adapters emit their replacements. Three
+      surfaces with per-surface gating:
         - `_AutoDamageEventRouter` Script removal: global
           `place.scripts` list + part-bound recursive walk over
           `workspace_parts` and `replicated_templates`. Floors
           the legacy pack's tier-2 inline-prune at PR #73c — the
           pack only prunes when its detector fires, but the
-          central prune runs whenever adapters are on.
+          central prune runs whenever adapters are on. Always-on
+          when adapters are on (no per-surface gate).
         - `_AutoFpsDoorTweenInjected` block strip via
           `_strip_legacy_door_tween_block`. The legacy
           `door_tween_open` pack appends the block at end-of-
           script (`script_coherence_packs.py:1775`), so slicing
           from the first marker line to end-of-string is both
-          safe and complete. Idempotent on a no-marker source.
+          safe and complete. **Gated on
+          `_door_adapter_will_emit()`** (codex round-11 [P2]):
+          fires only when a door adapter (capability kind
+          `movement.attribute_driven_tween`) will replace it this
+          run, either via a fresh `GameplayMatch` or a rehydrate-
+          path adapter stub. Without this gate, a project where
+          the Door class was divergent / deny-listed / not
+          detected (but other adapters fired) would lose its only
+          door-open implementation. When the gate skips, a log
+          line surfaces the decision so operators understand why
+          a marker'd Door.luau survives.
         - `_AutoFpsHud` ScreenGui removal: drops every ScreenGui
           carrying the `attributes["_AutoFpsHud"] = True` marker
           from `place.screen_guis`. Bundled with the adapter
           prune even though the HUD is FPS-scaffolding (not an
           adapter artifact) per the design-doc surface
-          enumeration; the `"fps"` scaffolding opt-in re-emits a
-          fresh HUD later in the same write_output pass so
-          opt-in-this-run isn't a regression.
+          enumeration. **Gated on `"fps" not in self.scaffolding`**
+          (codex round-3 [P1]): the SUBPHASE_ORDER runs
+          `_subphase_inject_autogen_scripts` BEFORE
+          `_inject_runtime_modules`, so when `"fps"` scaffolding is
+          active this run the freshly-emitted HUD already sits in
+          `place.screen_guis` by the time the prune fires. An
+          unconditional strip would wipe the just-emitted HUD on
+          every adapter-enabled FPS conversion. The gate fires
+          only when the operator is rolling back from a previous-
+          run FPS opt-in to no FPS this run.
       Logs each prune so a rehydrate run is observable in
       conversion output. Pinned end-to-end by
       `tests/test_gameplay_adapters_pr74.py::
       TestPruneLegacyGameplayArtifacts`.
+    - **Finalize walks part-bound scripts** (codex round-5 [P3]).
+      `_subphase_finalize_scripts_to_disk` walks
+      `rbx_place.scripts` + `workspace_parts` +
+      `replicated_templates` with `id()`-based dedup, so a script
+      that's both in the global list and bound to a part (the
+      first-bind shared-ref case) writes exactly once and any
+      post-binding mutation (the prune mutating bound clones)
+      reaches disk. Identity-dedup keeps the work
+      `O(scripts)`, not `O(scripts × parts)`.
     - Codifies the soak-and-delete exit criteria for PR #76 in a new
       `docs/design/gameplay-adapters-rollout.md` companion doc.
 
