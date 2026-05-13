@@ -1,3 +1,4 @@
+-- @@GAMEPLAY_RUNTIME_MODULE@@ converter-owned (Lifetime)
 -- lifetime.luau: Lifetime-family capability handlers.
 --
 -- Owns the ``ctx.lifetime`` namespace.

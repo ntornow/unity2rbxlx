@@ -936,21 +936,95 @@ codex pushback on PR #72 sharpened the slicing and added two cuts):
 
   - **PR #74:** flip default ON.
     - `--use-gameplay-adapters` defaults true.
-    - `--legacy-gameplay-packs` opt-out flag.
-    - The two modes are **mutually exclusive** at pipeline level. The
-      pipeline asserts at startup: if `--legacy-gameplay-packs` is set,
-      adapter detection is disabled entirely and adapter runtime
-      modules are NOT emitted. If `--use-gameplay-adapters` is on,
-      legacy coherence packs are disabled entirely. Codex pushback on
-      PR #72 flagged that running both produces double-binding (legacy
-      mutates the transpiled body, adapter emits a new stub — they fight
-      over the same scene parts).
-    - Rehydration-aware prune pass: on re-conversion of an output that
-      contains legacy artifacts (`_AutoFpsDoorTweenInjected` marker,
-      `_AutoDamageEventRouter` script, `_AutoFpsHud*` GuiObjects), the
-      pipeline removes them BEFORE adapters emit their replacements,
-      regardless of which mode produced the artifacts. Prevents stale
-      half-state from poisoning the new path.
+      `ConversionContext.use_gameplay_adapters` and
+      `Pipeline.__init__`'s default both flip in lockstep so a
+      Pipeline built with no flag and a freshly-constructed ctx
+      can't silently disagree on adapter mode.
+    - `--legacy-gameplay-packs` opt-out flag (default false). Click
+      shape: `--use-gameplay-adapters/--no-use-gameplay-adapters`
+      (default True) PLUS the new `--legacy-gameplay-packs` boolean
+      flag, so an operator who wants the legacy pipeline writes
+      `--legacy-gameplay-packs` alone and the CLI's mutex check
+      flips adapters off without requiring the explicit
+      `--no-use-gameplay-adapters`.
+    - The two modes are **mutually exclusive** at pipeline level.
+      Mutex resolution happens at the CLI seam via
+      `click.get_current_context().get_parameter_source(
+      "use_gameplay_adapters")`: passing `--legacy-gameplay-packs`
+      AND an EXPLICIT `--use-gameplay-adapters` raises
+      `click.UsageError`. Passing `--legacy-gameplay-packs` alone
+      forces adapters off (legacy mode wins; the rest of the
+      pipeline takes the pre-PR-#74 path: no adapter detection, no
+      adapter runtime modules, no rehydration prune). Codex
+      pushback on PR #72 flagged that running both produces
+      double-binding (legacy mutates the transpiled body, adapter
+      emits a new stub — they fight over the same scene parts).
+    - **DamageProtocol injection gating** (PR #74 codex round-2
+      [P2]). Before PR #74, `pipeline.py:3865-3919` force-injected
+      `damage_protocol.luau` whenever ANY adapter match was present
+      (door-only / projectile-only included). `damage_protocol.luau`
+      claims `ReplicatedStorage.DamageEvent` unconditionally and
+      binds `OnServerEvent` to any pre-existing RemoteEvent at that
+      name — a real cross-feature collision for adapter-enabled
+      projects that already use a `DamageEvent` for unrelated
+      traffic. PR #74 gates the injection on a Player-damage
+      signal via `Pipeline._damage_protocol_needed()`. Two
+      qualifying signals:
+        1. A `GameplayMatch` emitted an `effect.damage` or
+           `effect.splash` capability (adapter path — captures
+           bullets / explosions routed through `DamageEvent`).
+        2. Any script's source carries the literal
+           `FindFirstChild("DamageEvent")` marker that the legacy
+           `player_damage_remote_event` pack's body-patch leaves
+           in patched Player LocalScripts (tier-2 partial-disable
+           path — captures Player.cs FireServer wiring).
+      The orchestrator (`runtime/gameplay/gameplay.luau`) loads
+      DamageProtocol via `FindFirstChild` (NOT `WaitForChild`)
+      with a nil guard so the absent case is an immediate no-op
+      rather than a 5-second stall on every door/projectile-only
+      adapter project. The server bootstrap stays always-on when
+      adapters are on (`require(Gameplay)` is still useful for
+      registering Movement/Lifetime/Trigger/HitDetection/Effects
+      families at server start) — only DamageProtocol itself is
+      gated. Pinned by `Pipeline._DAMAGE_CAPABILITY_KINDS` +
+      `tests/test_gameplay_adapters_damage_protocol.py::
+      TestPipelineInjection::test_damage_protocol_needed_signals`.
+    - **Rehydration-aware prune pass.** On re-conversion of an
+      output that contains legacy artifacts
+      (`_AutoFpsDoorTweenInjected` marker,
+      `_AutoDamageEventRouter` script, `_AutoFpsHud*` ScreenGui
+      attribute), the pipeline removes them BEFORE adapters emit
+      their replacements, regardless of which mode produced the
+      artifacts. Implemented as
+      `Pipeline._prune_legacy_gameplay_artifacts()`, called from
+      the gameplay-adapter runtime-injection branch in
+      `_subphase_inject_runtime_libraries` (so it only fires when
+      adapters are on AND adapter stubs are present). Prunes
+      three surfaces in one pass:
+        - `_AutoDamageEventRouter` Script removal: global
+          `place.scripts` list + part-bound recursive walk over
+          `workspace_parts` and `replicated_templates`. Floors
+          the legacy pack's tier-2 inline-prune at PR #73c — the
+          pack only prunes when its detector fires, but the
+          central prune runs whenever adapters are on.
+        - `_AutoFpsDoorTweenInjected` block strip via
+          `_strip_legacy_door_tween_block`. The legacy
+          `door_tween_open` pack appends the block at end-of-
+          script (`script_coherence_packs.py:1775`), so slicing
+          from the first marker line to end-of-string is both
+          safe and complete. Idempotent on a no-marker source.
+        - `_AutoFpsHud` ScreenGui removal: drops every ScreenGui
+          carrying the `attributes["_AutoFpsHud"] = True` marker
+          from `place.screen_guis`. Bundled with the adapter
+          prune even though the HUD is FPS-scaffolding (not an
+          adapter artifact) per the design-doc surface
+          enumeration; the `"fps"` scaffolding opt-in re-emits a
+          fresh HUD later in the same write_output pass so
+          opt-in-this-run isn't a regression.
+      Logs each prune so a rehydrate run is observable in
+      conversion output. Pinned end-to-end by
+      `tests/test_gameplay_adapters_pr74.py::
+      TestPruneLegacyGameplayArtifacts`.
     - Codifies the soak-and-delete exit criteria for PR #76 in a new
       `docs/design/gameplay-adapters-rollout.md` companion doc.
 

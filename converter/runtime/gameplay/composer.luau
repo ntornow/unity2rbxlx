@@ -1,3 +1,4 @@
+-- @@GAMEPLAY_RUNTIME_MODULE@@ converter-owned (Composer)
 -- Composer: dispatch a Behavior's capability tuple to per-family
 -- runtime modules. Wires the per-family ``ctx`` table through each
 -- capability in tuple order. The capability dataflow contract is

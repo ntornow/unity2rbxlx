@@ -145,6 +145,371 @@ def _place_carries_adapter_marker(
     return _walk(getattr(rbx_place, "replicated_templates", None) or [])
 
 
+_DAMAGE_CAPABILITY_KINDS: frozenset[str] = frozenset({
+    "effect.damage",
+    "effect.splash",
+})
+
+# PR #74 codex round-11 [P2]: capability kind unique to the door
+# adapter slice (Trigger.OnBoolAttribute → Movement.AttributeDrivenTween).
+# Used to gate the rehydration prune's ``_AutoFpsDoorTweenInjected``
+# block-strip: if a project has adapter stubs for projectile / damage
+# but the Door class was divergent / deny-listed / not detected, the
+# legacy door tween block IS the only door-open implementation and
+# the strip would silently break door animation. The strip now
+# fires only when a door adapter will land this run.
+_DOOR_ADAPTER_CAPABILITY_KIND: str = "movement.attribute_driven_tween"
+_DOOR_ADAPTER_LUA_MARKER: str = '{kind = "movement.attribute_driven_tween"'
+
+# PR #74 codex round-6 [P1]: the converter-owned module names under
+# ``ReplicatedStorage.AutoGen``. Used by the rehydrate-aware injection
+# pre-pass to identify scripts that the converter owns end-to-end, so
+# a stale rehydrated module not needed by THIS run (e.g. an
+# adapters-on-but-no-damage resume of an output that used to have
+# damage) can be safely pruned. Names tracked in lockstep with the
+# composer (orchestrator) and the family modules under
+# ``converter/runtime/gameplay/``. Family modules added in later PRs
+# (e.g. ``EventDispatch`` in PR #75) extend this set.
+_ALL_GAMEPLAY_RUNTIME_MODULE_NAMES: frozenset[str] = frozenset({
+    "Composer",
+    "Triggers",
+    "Movement",
+    "Lifetime",
+    "HitDetection",
+    "Effects",
+    "DamageProtocol",
+    "Gameplay",
+})
+
+
+# Structural marker baked into the first line of every gameplay
+# runtime module under ``converter/runtime/gameplay/``. PR #74 codex
+# round-9 [P1] flagged that a header-prefix match like
+# ``startswith("-- gameplay")`` false-positives on user-authored
+# Luau (``-- gameplay manager``); a unique magic-string marker is
+# the robust signal. Composer + bootstrap + family modules + damage
+# protocol all carry this exact substring on their first line.
+GAMEPLAY_RUNTIME_MODULE_MARKER: str = "@@GAMEPLAY_RUNTIME_MODULE@@"
+
+
+# Pre-PR-#74-round-9 first-line signatures, kept as a back-compat
+# fallback so a rehydrate of an output produced BEFORE the structural
+# marker landed still matches. These are full canonical first-line
+# prefixes (not bare ``-- gameplay`` etc.), unique enough to not
+# false-positive on user code. New outputs always carry the
+# ``@@GAMEPLAY_RUNTIME_MODULE@@`` marker so this table is purely
+# transitional. Safe to delete once every operator has reconverted
+# at least once.
+_LEGACY_GAMEPLAY_RUNTIME_PRE_MARKER_HEADERS: dict[str, str] = {
+    "Composer": "-- Composer: dispatch a Behavior's capability tuple",
+    "Triggers": "-- triggers.luau: Trigger-family capability handlers.",
+    "Movement": "-- movement.luau: Movement-family capability handlers.",
+    "Lifetime": "-- lifetime.luau: Lifetime-family capability handlers.",
+    "HitDetection": "-- hit_detection.luau: HitDetection-family capability handlers.",
+    "Effects": "-- effects.luau: Effect-family capability handlers.",
+    "DamageProtocol": "-- damage_protocol.luau: client + server damage routing",
+    "Gameplay": "-- gameplay.luau: orchestrator + single entry point",
+    # _GameplayServerBootstrap uses a slightly different key — it's
+    # consulted via the bootstrap branch which passes the name
+    # directly.
+    "_GameplayServerBootstrap": (
+        "-- server_bootstrap.luau (parented to ServerScriptService at emit time)."
+    ),
+}
+
+
+def _is_converter_gameplay_runtime_module(
+    script: _ScriptLike, module_name: str, filename: str,  # noqa: ARG001
+) -> bool:
+    """Return True when *script* is the converter's emitted version of
+    a named gameplay runtime module (either fresh in-memory or
+    rehydrated from a previous run), as opposed to a user-authored
+    script that happens to share the module's generic class name
+    (codex PR #74 round-8 [P1] and round-9 [P1]).
+
+    Three acceptance paths:
+
+      1. ``parent_path == "ReplicatedStorage.AutoGen"`` — already
+         routed to the converter-owned namespace, either by the
+         current write_output pass or by a previous run that wrote
+         the path into ``conversion_plan.json``. Definitively the
+         converter's module.
+      2. Source contains the ``GAMEPLAY_RUNTIME_MODULE_MARKER``
+         structural marker. Every emitted runtime module carries
+         this magic substring on its first line (PR #74 round-9).
+         Intentionally unique enough that no user-authored script
+         could plausibly contain it.
+      3. **Pre-marker back-compat:** source starts with the
+         canonical pre-PR-#74-round-9 first line for *module_name*
+         (see ``_LEGACY_GAMEPLAY_RUNTIME_PRE_MARKER_HEADERS``). Lets
+         a rehydrate of an old output's runtime module still match
+         without falsing on user ``-- gameplay manager`` headers.
+
+    *filename* is kept in the signature for API stability with the
+    earlier round-7/round-8 predicate shape; only ``module_name`` is
+    consulted now (path 3 keys off module_name).
+
+    Any other ``parent_path`` whose source carries neither marker
+    nor canonical pre-marker header (e.g. user ``Composer``
+    MonoBehaviour routed to ``"ReplicatedStorage"``) is treated as
+    user-owned and left alone.
+    """
+    if getattr(script, "name", None) != module_name:
+        return False
+    parent = getattr(script, "parent_path", None)
+    if parent == "ReplicatedStorage.AutoGen":
+        return True
+    source = getattr(script, "source", None) or ""
+    if GAMEPLAY_RUNTIME_MODULE_MARKER in source:
+        return True
+    legacy_header = _LEGACY_GAMEPLAY_RUNTIME_PRE_MARKER_HEADERS.get(module_name)
+    if legacy_header is not None and source.startswith(legacy_header):
+        return True
+    return False
+
+# PR #74 codex round-4 [P1] signals — when scanning emitted adapter
+# stub source on disk (rehydrate / publish rebuild path,
+# ``state.gameplay_matches`` empty by design), look for the exact
+# capability-kind literals the composer emits. ``composer._lua_string``
+# wraps kind strings as double-quoted Lua literals, so the rendered
+# form is ``{kind = "effect.damage"`` / ``{kind = "effect.splash"``.
+# Substring match against the source — no regex needed because the
+# composer's output shape is stable (validated by composer tests).
+_DAMAGE_CAPABILITY_LUA_MARKERS: tuple[str, ...] = (
+    '{kind = "effect.damage"',
+    '{kind = "effect.splash"',
+)
+
+# PR #74 rehydration-aware prune pass. Removes legacy
+# coherence-pack artifacts BEFORE the adapter runtime injects its
+# replacements, so a re-conversion of an output that was previously
+# built with ``--legacy-gameplay-packs`` (or pre-PR-#73a, where
+# legacy was the only mode) doesn't leave both halves wired up.
+#
+# Three artifact categories:
+#
+#   - ``_AutoDamageEventRouter`` Script — the legacy
+#     ``player_damage_remote_event`` pack's server-side validator.
+#     Adapter ``DamageProtocol`` ModuleScript replaces it and binds
+#     ``OnServerEvent`` to the same RemoteEvent; double-emission would
+#     double-bind ``OnServerEvent`` and apply ``SetAttribute("TakeDamage")``
+#     twice per validated hit (the legacy pack's tier-2 apply path
+#     already prunes this when both adapters AND the pack run, but the
+#     pack only runs when its detector fires — so the central prune
+#     here is the floor).
+#   - ``_AutoFpsDoorTweenInjected`` block — appended to AI-transpiled
+#     Door.luau by the ``door_tween_open`` pack. When adapters now
+#     own Door behaviour, leaving the block behind double-tweens the
+#     sibling door mesh on every attribute change.
+#   - ``_AutoFpsHud`` ScreenGui — emitted by ``scaffolding.fps``
+#     when the user previously opted in via ``--scaffolding=fps``.
+#     Distinct from adapter artifacts but bundled with the prune
+#     surface per the design doc so a re-conversion that drops the
+#     ``fps`` scaffolding (or rolls back to ``--legacy-gameplay-packs``
+#     without ``fps`` scaffolding still active) cleans up the stale
+#     ScreenGui.
+_LEGACY_DAMAGE_ROUTER_NAME: str = "_AutoDamageEventRouter"
+_LEGACY_DOOR_TWEEN_MARKER: str = "-- _AutoFpsDoorTweenInjected"
+_LEGACY_FPS_HUD_ATTR: str = "_AutoFpsHud"
+
+
+def _strip_legacy_door_tween_block(source: str) -> tuple[str, bool]:
+    """Return *(new_source, was_stripped)* with any
+    ``_AutoFpsDoorTweenInjected`` block removed.
+
+    The legacy ``door_tween_open`` pack appends the block at the END
+    of the script via ``source.rstrip() + "\\n" + _DOOR_TWEEN_BLOCK``
+    (see ``script_coherence_packs.py:1775``). Slicing from the first
+    marker line to end-of-string is therefore both safe (the marker
+    line is the first line of the appended block) and complete
+    (everything after the marker IS the block).
+
+    Idempotent: stripping a script with no marker is a no-op.
+    """
+    idx = source.find(_LEGACY_DOOR_TWEEN_MARKER)
+    if idx == -1:
+        return source, False
+    # Walk backward to capture the newline (and any whitespace) that
+    # came immediately before the marker so the prune doesn't leave a
+    # dangling blank line.
+    cut = idx
+    while cut > 0 and source[cut - 1] in " \t":
+        cut -= 1
+    if cut > 0 and source[cut - 1] == "\n":
+        cut -= 1
+    return source[:cut].rstrip() + "\n", True
+
+# Substring the legacy ``player_damage_remote_event`` pack body-patch
+# leaves in every Player LocalScript it touches. Pinned to the exact
+# pack-emitted line at ``script_coherence_packs.py:2180``. The
+# previous tier-1 substring ``:FindFirstChild("DamageEvent")`` was a
+# false-positive hazard (codex PR #74 round-4 [P2]): any unrelated
+# script that happened to look up a ``DamageEvent`` RemoteEvent
+# would also trip the probe, re-injecting DamageProtocol and
+# re-claiming the global RemoteEvent — the exact collision PR #74
+# is meant to avoid. The full assignment with ``local _de = ...
+# game:GetService("ReplicatedStorage"):FindFirstChild("DamageEvent")``
+# uniquely identifies the pack-injected body-patch.
+_LEGACY_DAMAGE_FIRESERVER_MARKER: str = (
+    'local _de = game:GetService("ReplicatedStorage")'
+    ':FindFirstChild("DamageEvent")'
+)
+
+
+def _place_has_legacy_damage_fireserver(
+    rbx_place: "_PlaceLike | RbxPlace | None",
+) -> bool:
+    """Return True when any script in *rbx_place* carries the legacy
+    ``player_damage_remote_event`` body-patch marker.
+
+    PR #74 codex round-2 [P2]: DamageProtocol injection must gate on a
+    real Player-damage signal, not "any adapter match present". The
+    legacy pack still runs in tier-2 mode under adapters-on and
+    body-patches Player LocalScripts with a literal
+    ``FindFirstChild("DamageEvent")`` lookup; that's the off-adapter
+    half of the damage path and means the server-side validator MUST
+    be live to handle the client's FireServer call.
+
+    PR #74 codex round-4 [P2] tightened the marker from a bare
+    substring to the full ``local _de = ...`` assignment so user
+    code that incidentally looks up a ``DamageEvent`` instance can't
+    trip the probe.
+
+    Walks the same surfaces as ``_place_carries_adapter_marker``
+    (global scripts, workspace parts, replicated templates) so
+    rehydrate-path detection works.
+    """
+    if rbx_place is None:
+        return False
+
+    def _has(script: _ScriptLike) -> bool:
+        src = getattr(script, "source", None) or ""
+        return _LEGACY_DAMAGE_FIRESERVER_MARKER in src
+
+    def _walk(parts: list[_PartLike]) -> bool:
+        for part in parts:
+            for s in getattr(part, "scripts", None) or []:
+                if _has(s):
+                    return True
+            if _walk(getattr(part, "children", None) or []):
+                return True
+        return False
+
+    for s in getattr(rbx_place, "scripts", None) or []:
+        if _has(s):
+            return True
+    if _walk(getattr(rbx_place, "workspace_parts", None) or []):
+        return True
+    return _walk(getattr(rbx_place, "replicated_templates", None) or [])
+
+
+def _place_has_door_adapter_stub(
+    rbx_place: "_PlaceLike | RbxPlace | None",
+) -> bool:
+    """Return True when any adapter stub in *rbx_place* declares the
+    door-shaped ``movement.attribute_driven_tween`` capability.
+
+    PR #74 codex round-11 [P2]: companion to
+    ``_place_has_damage_adapter_stub`` — gates the legacy door tween
+    block strip on the rehydrate / publish-rebuild path so projects
+    that don't have a Door adapter (Door class divergent / denied)
+    don't lose their legacy door animation.
+
+    Same belt-and-suspenders predicate: the capability literal AND
+    the composer's ``ADAPTER_STUB_MARKER`` must both appear in the
+    same script, so a user / generated Luau that incidentally
+    mentions ``movement.attribute_driven_tween`` doesn't false-
+    positive.
+
+    Walks ``rbx_place.scripts`` + ``workspace_parts`` +
+    ``replicated_templates``.
+    """
+    from converter.gameplay.composer import ADAPTER_STUB_MARKER
+
+    if rbx_place is None:
+        return False
+
+    def _has(script: _ScriptLike) -> bool:
+        src = getattr(script, "source", None) or ""
+        if ADAPTER_STUB_MARKER not in src:
+            return False
+        return _DOOR_ADAPTER_LUA_MARKER in src
+
+    def _walk(parts: list[_PartLike]) -> bool:
+        for part in parts:
+            for s in getattr(part, "scripts", None) or []:
+                if _has(s):
+                    return True
+            if _walk(getattr(part, "children", None) or []):
+                return True
+        return False
+
+    for s in getattr(rbx_place, "scripts", None) or []:
+        if _has(s):
+            return True
+    if _walk(getattr(rbx_place, "workspace_parts", None) or []):
+        return True
+    return _walk(getattr(rbx_place, "replicated_templates", None) or [])
+
+
+def _place_has_damage_adapter_stub(
+    rbx_place: "_PlaceLike | RbxPlace | None",
+) -> bool:
+    """Return True when any adapter stub in *rbx_place* declares a
+    damage-effect capability (``effect.damage`` or ``effect.splash``).
+
+    PR #74 codex round-4 [P1]: on resume / publish rebuild paths,
+    ``state.gameplay_matches`` is empty by design (transpile didn't
+    re-run). A damage-bearing adapter project (bullets / explosions
+    with no legacy body-patch) would lose DamageProtocol entirely
+    after a resume — server-side ``DamageEvent`` listener disappears
+    and damage stops working even though the original conversion
+    worked. Scanning emitted stub source for the composer's
+    capability-table literals (``{kind = "effect.damage"`` /
+    ``{kind = "effect.splash"``) recovers the signal without
+    re-running the transpile phase.
+
+    PR #74 codex round-7 [P2]: a capability-literal substring alone
+    is too loose — any user / generated Luau that contains
+    ``{kind = "effect.damage"`` as a string would trip the probe and
+    re-inject DamageProtocol, reclaiming
+    ``ReplicatedStorage.DamageEvent``. Tightened to ALSO require the
+    composer's ``ADAPTER_STUB_MARKER`` (the unique first-line
+    structural marker) in the same script. The composer emits both
+    in every adapter stub, so the AND check has zero false negatives
+    on real stubs and rejects everything else.
+
+    Walks the same surfaces as ``_place_carries_adapter_marker``
+    so prefab-template-bound stubs are seen too.
+    """
+    from converter.gameplay.composer import ADAPTER_STUB_MARKER
+
+    if rbx_place is None:
+        return False
+
+    def _has(script: _ScriptLike) -> bool:
+        src = getattr(script, "source", None) or ""
+        if ADAPTER_STUB_MARKER not in src:
+            return False
+        return any(marker in src for marker in _DAMAGE_CAPABILITY_LUA_MARKERS)
+
+    def _walk(parts: list[_PartLike]) -> bool:
+        for part in parts:
+            for s in getattr(part, "scripts", None) or []:
+                if _has(s):
+                    return True
+            if _walk(getattr(part, "children", None) or []):
+                return True
+        return False
+
+    for s in getattr(rbx_place, "scripts", None) or []:
+        if _has(s):
+            return True
+    if _walk(getattr(rbx_place, "workspace_parts", None) or []):
+        return True
+    return _walk(getattr(rbx_place, "replicated_templates", None) or [])
+
+
 def _carry_unconverted(
     animation_result: Any, entries: list[dict[str, str]],
 ) -> None:
@@ -229,7 +594,30 @@ class Pipeline:
         skip_upload: bool = False,
         skip_binary_rbxl: bool = False,
         scaffolding: frozenset[str] | None = None,
-        use_gameplay_adapters: bool = False,
+        # PR #74: tri-state.
+        #
+        #   * ``None`` (default) — caller has no preference; preserve
+        #     whatever the persisted ``ConversionContext`` carried.
+        #     For a fresh ctx (no rehydration) the dataclass default
+        #     (``True`` since PR #74) wins, so the adapter pipeline
+        #     runs by default. For a resumed ctx, the persisted value
+        #     wins — this is the sticky-rollback contract that codex
+        #     PR #74 round-1 [P1] flagged: if a project was originally
+        #     converted with ``--legacy-gameplay-packs``,
+        #     ``ctx.use_gameplay_adapters`` is ``False`` on disk and
+        #     ``convert --phase <x>`` MUST NOT silently flip it back
+        #     to True just because the caller didn't repeat the flag.
+        #   * ``True`` / ``False`` — caller explicitly chose this
+        #     run's mode (the CLI's ``--use-gameplay-adapters`` or
+        #     ``--legacy-gameplay-packs`` opt-out fired). Wins over
+        #     persisted state, both at construction and after
+        #     :meth:`resume`'s ctx swap.
+        #
+        # CLI callers compute "was the user explicit?" via
+        # ``click.get_current_context().get_parameter_source(...)`` and
+        # forward the corresponding bool. Test fixtures that want the
+        # pre-PR-#74 default-off posture must pass ``False`` explicitly.
+        use_gameplay_adapters: bool | None = None,
     ) -> None:
         self.unity_project_path = self._find_unity_root(Path(unity_project_path).resolve())
         self.output_dir = Path(output_dir or OUTPUT_DIR).resolve()
@@ -273,14 +661,23 @@ class Pipeline:
             # ``Pipeline(scaffolding=["fsps"])`` would persist silently.
             self.apply_scaffolding(self._init_scaffolding)
 
-        # Gameplay-adapter rollout flag (PR #73a). Snapshotted at
-        # construction so resume() (which replaces ``self.ctx`` from
-        # disk) doesn't silently drop a flag passed via constructor.
-        # The snapshot is reapplied to ``self.ctx`` after rehydration —
-        # see ``resume`` for the matching application.
-        self._init_use_gameplay_adapters: bool = bool(use_gameplay_adapters)
-        if self._init_use_gameplay_adapters:
-            self.ctx.use_gameplay_adapters = True
+        # Gameplay-adapter rollout flag (PR #73a; default flipped on in
+        # PR #74). Tri-state since PR #74 codex round-1 [P1]:
+        #
+        #   * ``None`` — caller didn't pass an explicit flag this run.
+        #     For a fresh ctx, leave ``ctx.use_gameplay_adapters`` at
+        #     its dataclass default (True since PR #74). For a
+        #     resumed ctx (see :meth:`resume`), the persisted value
+        #     wins — preserving sticky rollback for projects
+        #     originally converted with ``--legacy-gameplay-packs``.
+        #   * ``True`` / ``False`` — explicit caller choice; overrides
+        #     both the dataclass default AND any persisted value.
+        #
+        # Snapshotted so :meth:`resume`'s ctx swap can re-apply the
+        # explicit choice after replacing ``self.ctx`` from disk.
+        self._init_use_gameplay_adapters: bool | None = use_gameplay_adapters
+        if self._init_use_gameplay_adapters is not None:
+            self.ctx.use_gameplay_adapters = self._init_use_gameplay_adapters
 
         # ``_fps_artifacts_at_init`` caches the backward-compat
         # migration signal BEFORE ``_subphase_emit_scripts_to_disk``
@@ -762,13 +1159,38 @@ class Pipeline:
             # persisted entries are kept, the new request adds to them.
             if self._init_scaffolding:
                 self.apply_scaffolding(self._init_scaffolding)
-            # Re-apply the constructor's gameplay-adapter request after
-            # the ctx swap so resumed builds (``u2r.py publish`` rebuild,
-            # ``u2r.py convert --phase ... --use-gameplay-adapters``)
-            # honour the flag even if the persisted ctx was written
-            # before adapters existed. Additive — once True, stays True.
-            if self._init_use_gameplay_adapters:
-                self.ctx.use_gameplay_adapters = True
+            # Re-apply the constructor's EXPLICIT gameplay-adapter
+            # choice after the ctx swap. The tri-state matters here:
+            #
+            #   * ``None`` — caller didn't pass a flag. Keep the
+            #     rehydrated ``ctx.use_gameplay_adapters`` as-is so a
+            #     project originally converted with
+            #     ``--legacy-gameplay-packs`` stays in legacy mode on
+            #     resume even if the user forgot to repeat the flag.
+            #     Codex PR #74 round-1 [P1] flagged the previous
+            #     bidirectional overwrite as breaking this contract.
+            #   * ``True`` / ``False`` — caller was explicit; their
+            #     choice wins over the persisted value.
+            #
+            # PR #74 codex round-2 [P1]: an explicit override that
+            # CHANGES the persisted value must also force a
+            # retranspile. Otherwise ``_subphase_emit_scripts_to_disk``
+            # preserves the previous-mode ``.luau`` cache on disk and
+            # the rebuilt place silently stays in the old mode (adapter
+            # stubs survive a flip to legacy; legacy patched bodies
+            # survive a flip to adapters). Forcing retranspile here
+            # wipes ``scripts/`` and re-runs ``transpile_scripts`` so
+            # the on-disk scripts match the new mode.
+            if self._init_use_gameplay_adapters is not None:
+                mode_changed = (
+                    self.ctx.use_gameplay_adapters
+                    != self._init_use_gameplay_adapters
+                )
+                self.ctx.use_gameplay_adapters = (
+                    self._init_use_gameplay_adapters
+                )
+                if mode_changed:
+                    self._invalidate_transpile_cache_for_mode_flip()
 
         log.info("=== Resuming pipeline from phase '%s' ===", phase)
         self.run_through(phase, run_after=True)
@@ -2181,6 +2603,358 @@ return table.concat(allData, "\\n")'''
     A test asserts the actual call sequence in write_output matches this tuple.
     """
 
+    def _delete_pruned_script_from_disk(self, script: object) -> None:
+        """PR #74 codex round-10 [P2]: when a script is pruned from
+        ``rbx_place.scripts`` (legacy artifact + stale gameplay
+        runtime module), also delete its cached ``.luau`` file from
+        ``output/scripts/`` so the next resume's
+        ``_rehydrate_scripts_from_disk()`` doesn't load it back.
+
+        Otherwise the in-memory prune doesn't stick: assemble /
+        publish rebuild paths rehydrate from disk, and the deleted
+        module reappears in ``rbx_place.scripts`` on every subsequent
+        run.
+
+        Uses the script's ``source_path`` when set (preserves nested-
+        dir routing), otherwise falls back to the canonical
+        ``<name>.luau`` at the top of ``scripts/``.
+
+        Defensive against missing/None ``output_dir`` (some test
+        harnesses use duck-typed Pipeline stubs that don't carry an
+        output_dir).
+        """
+        output_dir = getattr(self, "output_dir", None)
+        if output_dir is None:
+            return
+        scripts_dir = output_dir / "scripts"
+        if not scripts_dir.is_dir():
+            return
+        source_path = getattr(script, "source_path", None)
+        candidates: list[Path] = []
+        if source_path:
+            candidates.append(scripts_dir / source_path)
+        name = getattr(script, "name", None)
+        if name:
+            candidates.append(scripts_dir / f"{name}.luau")
+            candidates.append(scripts_dir / "animations" / f"{name}.luau")
+        for candidate in candidates:
+            if candidate.is_file():
+                try:
+                    candidate.unlink()
+                    log.info(
+                        "[prune] Deleted stale on-disk script: %s",
+                        candidate.relative_to(self.output_dir),
+                    )
+                except OSError as exc:
+                    log.warning(
+                        "[prune] Failed to unlink %s: %s",
+                        candidate, exc,
+                    )
+
+    def _prune_legacy_gameplay_artifacts(self) -> int:
+        """PR #74: rehydration-aware prune pass for legacy
+        coherence-pack artifacts. Removes them BEFORE the adapter
+        runtime injects its replacements so re-conversion of an
+        output built with ``--legacy-gameplay-packs`` (or pre-PR-#73a)
+        doesn't leave both halves wired up.
+
+        Three surfaces, all idempotent:
+
+          * Drops every ``_AutoDamageEventRouter`` Script from the
+            global ``scripts`` list AND from any part-bound scripts.
+          * Strips the ``_AutoFpsDoorTweenInjected`` block from every
+            script's source.
+          * Drops every ``_AutoFpsHud``-tagged ScreenGui from
+            ``screen_guis``.
+
+        Returns the count of pruned items (one per script removed,
+        plus one per source modified, plus one per ScreenGui removed)
+        for logging. No-op when ``rbx_place`` is None.
+        """
+        place = self.state.rbx_place
+        if place is None:
+            return 0
+
+        pruned = 0
+
+        # 1. ``_AutoDamageEventRouter`` Script removal — global list +
+        # part-bound recursive walk. Part-bound shouldn't happen in
+        # practice (the pack always parents under ServerScriptService),
+        # but the walk costs nothing and guards against future
+        # rebinding bugs.
+        global_scripts = getattr(place, "scripts", None) or []
+        kept: list = []
+        for s in global_scripts:
+            if getattr(s, "name", None) == _LEGACY_DAMAGE_ROUTER_NAME:
+                pruned += 1
+                log.info(
+                    "[prune] Removed stale %s Script "
+                    "(adapter DamageProtocol supersedes it)",
+                    _LEGACY_DAMAGE_ROUTER_NAME,
+                )
+                # PR #74 codex round-10 [P2]: also delete the
+                # cached ``.luau`` on disk so the next resume's
+                # ``_rehydrate_scripts_from_disk`` doesn't load
+                # the pruned router back.
+                self._delete_pruned_script_from_disk(s)
+                continue
+            kept.append(s)
+        place.scripts = kept
+
+        def _prune_part_scripts(parts: list) -> None:
+            nonlocal pruned
+            for part in parts:
+                part_scripts = getattr(part, "scripts", None)
+                if part_scripts:
+                    surviving = []
+                    for s in part_scripts:
+                        if getattr(s, "name", None) == _LEGACY_DAMAGE_ROUTER_NAME:
+                            pruned += 1
+                            log.info(
+                                "[prune] Removed stale %s Script bound "
+                                "to part '%s'",
+                                _LEGACY_DAMAGE_ROUTER_NAME,
+                                getattr(part, "name", "?"),
+                            )
+                            # round-10 [P2]: same disk-cache cleanup
+                            # for part-bound copies.
+                            self._delete_pruned_script_from_disk(s)
+                            continue
+                        surviving.append(s)
+                    part.scripts = surviving
+                children = getattr(part, "children", None)
+                if children:
+                    _prune_part_scripts(children)
+
+        _prune_part_scripts(getattr(place, "workspace_parts", None) or [])
+        _prune_part_scripts(getattr(place, "replicated_templates", None) or [])
+
+        # 2. ``_AutoFpsDoorTweenInjected`` block strip on every script
+        # source (the marker can only land on Door.luau today but the
+        # strip is name-agnostic so a future pack variant that uses
+        # the same marker is also cleaned).
+        #
+        # PR #74 codex round-11 [P2]: only strip the legacy block when
+        # a door adapter will land this run. ``door_tween_open`` is
+        # globally disabled whenever ``ctx.use_gameplay_adapters`` is
+        # True (see ``LEGACY_PACKS_DISABLED_WHEN_ADAPTERS_ON``), but on
+        # a resumed output that already contains the marker AND has
+        # no door adapter this run (Door class divergent / deny-listed
+        # / not detected), the legacy block is the ONLY door-open
+        # implementation. Stripping it would silently break door
+        # animation. ``_door_adapter_will_emit`` checks both fresh-
+        # match and rehydrate-stub signals.
+        if self._door_adapter_will_emit():
+            def _strip_in_scripts(scripts: list) -> None:
+                nonlocal pruned
+                for s in scripts:
+                    src = getattr(s, "source", None)
+                    if not src or _LEGACY_DOOR_TWEEN_MARKER not in src:
+                        continue
+                    new_src, stripped = _strip_legacy_door_tween_block(src)
+                    if stripped:
+                        s.source = new_src
+                        pruned += 1
+                        log.info(
+                            "[prune] Stripped %s block from script '%s'",
+                            _LEGACY_DOOR_TWEEN_MARKER.strip("- "),
+                            getattr(s, "name", "?"),
+                        )
+
+            _strip_in_scripts(place.scripts)
+
+            def _strip_in_parts(parts: list) -> None:
+                for part in parts:
+                    part_scripts = getattr(part, "scripts", None) or []
+                    if part_scripts:
+                        _strip_in_scripts(part_scripts)
+                    children = getattr(part, "children", None)
+                    if children:
+                        _strip_in_parts(children)
+
+            _strip_in_parts(getattr(place, "workspace_parts", None) or [])
+            _strip_in_parts(getattr(place, "replicated_templates", None) or [])
+        elif any(
+            _LEGACY_DOOR_TWEEN_MARKER in (getattr(s, "source", None) or "")
+            for s in place.scripts
+        ):
+            # No door adapter this run — keep the legacy block but
+            # surface in the log so operators understand why a
+            # marker'd Door.luau survives.
+            log.info(
+                "[prune] Kept legacy %s block in Door.luau — "
+                "no door adapter will replace it this run.",
+                _LEGACY_DOOR_TWEEN_MARKER.strip("- "),
+            )
+
+        # 3. ``_AutoFpsHud`` ScreenGui removal — bundled with the
+        # adapter prune per design doc, even though the HUD is
+        # scaffolding (not an adapter artifact).
+        #
+        # PR #74 codex round-3 [P1]: the SUBPHASE_ORDER runs
+        # ``_subphase_inject_autogen_scripts`` BEFORE
+        # ``_inject_runtime_modules`` (which calls this helper). So
+        # when ``"fps"`` scaffolding is active on THIS run, the
+        # freshly-emitted HUD already sits in ``place.screen_guis``
+        # by the time the prune fires. An unconditional
+        # ``_AutoFpsHud`` strip would wipe the just-emitted HUD on
+        # every adapter-enabled FPS conversion. Gate on
+        # ``"fps" not in self.scaffolding`` so the prune only fires
+        # when the operator is rolling BACK from a previous-run FPS
+        # opt-in to no FPS scaffolding this run — i.e. the genuine
+        # stale-artifact case.
+        if "fps" not in self.scaffolding:
+            screen_guis = getattr(place, "screen_guis", None)
+            if screen_guis:
+                surviving_guis = []
+                for gui in screen_guis:
+                    attrs = getattr(gui, "attributes", None) or {}
+                    if attrs.get(_LEGACY_FPS_HUD_ATTR):
+                        pruned += 1
+                        log.info(
+                            "[prune] Removed stale %s-tagged "
+                            "ScreenGui '%s' (FPS scaffolding no "
+                            "longer requested for this run)",
+                            _LEGACY_FPS_HUD_ATTR,
+                            getattr(gui, "name", "?"),
+                        )
+                        continue
+                    surviving_guis.append(gui)
+                place.screen_guis = surviving_guis
+
+        return pruned
+
+    def _invalidate_transpile_cache_for_mode_flip(self) -> None:
+        """PR #74 codex round-2 [P1]: when the operator flips
+        gameplay mode on a resumed run (``--legacy-gameplay-packs``
+        after a previous adapters-on conversion, or
+        ``--use-gameplay-adapters`` after a previous legacy run), the
+        cached transpiled scripts in ``<output>/scripts/`` carry the
+        OLD mode's output — adapter stubs + ``ReplicatedStorage.AutoGen``
+        modules vs legacy-pack body-patched Player.cs.
+
+        ``_subphase_emit_scripts_to_disk`` checks
+        ``"transpile_scripts" in ctx.completed_phases`` AND
+        ``not self._retranspile`` to decide whether to preserve the
+        on-disk cache. Without invalidation, a rollback or re-enable
+        flip silently produces a place that still uses the previous
+        mode's runtime.
+
+        Three coordinated steps make the next ``transpile_scripts``
+        call do a fresh transpile:
+
+          1. Set ``self._retranspile = True`` so the preserve check
+             returns False even when ``transpile_scripts`` is in
+             ``completed_phases``.
+          2. Remove ``transpile_scripts`` from
+             ``ctx.completed_phases`` so the phase-gating logic
+             actually re-runs the phase (not just the on-disk
+             rewrite half).
+          3. Log loudly — silent retranspile on a ``--phase`` run is
+             surprising and operators need to know their resume just
+             cost an AI transpile call.
+        """
+        self._retranspile = True
+        if "transpile_scripts" in self.ctx.completed_phases:
+            self.ctx.completed_phases = [
+                p for p in self.ctx.completed_phases
+                if p != "transpile_scripts"
+            ]
+        log.warning(
+            "[resume] Gameplay-mode flip detected — invalidating "
+            "transpile cache and forcing a fresh ``transpile_scripts`` "
+            "run. The previous mode's ``scripts/`` output would "
+            "otherwise survive the resume.",
+        )
+
+    def _door_adapter_will_emit(self) -> bool:
+        """Return True when a Door-shaped adapter replacement will
+        land this run (a ``GameplayMatch`` carrying the
+        ``movement.attribute_driven_tween`` capability) OR a
+        previously-emitted door adapter stub is rehydrated.
+
+        PR #74 codex round-11 [P2]: the legacy
+        ``_AutoFpsDoorTweenInjected`` block strip in
+        ``_prune_legacy_gameplay_artifacts`` must not fire when the
+        adapter pipeline doesn't replace the Door class this run
+        (e.g. Door is divergent / deny-listed / not detected).
+        Without this gate, a project with adapter stubs for some
+        OTHER class (projectiles, damage) but no Door adapter would
+        lose its only door-open implementation when the strip nukes
+        the legacy block.
+
+        Two signals (mirrors ``_damage_protocol_needed`` shape):
+
+          1. Fresh-conversion: ``state.gameplay_matches`` contains
+             at least one match with
+             ``movement.attribute_driven_tween`` in
+             ``capability_kinds``.
+          2. Rehydrate-path: a script in ``state.rbx_place`` carries
+             the composer-emitted Lua literal
+             ``{kind = "movement.attribute_driven_tween"`` AND the
+             ``ADAPTER_STUB_MARKER`` on the same stub (the
+             round-7 [P2] tightening — substring-only would
+             false-positive on user code).
+        """
+        for match in self.state.gameplay_matches:
+            if _DOOR_ADAPTER_CAPABILITY_KIND in match.capability_kinds:
+                return True
+        return _place_has_door_adapter_stub(self.state.rbx_place)
+
+    def _damage_protocol_needed(self) -> bool:
+        """Return True when the project carries a Player-damage signal
+        that requires the ``DamageProtocol`` server-side validator.
+
+        PR #74 codex round-2 [P2]: the previous unconditional injection
+        force-claimed ``ReplicatedStorage.DamageEvent`` for every
+        adapter-enabled project (including door-only and projectile-only
+        matches that have no damage capability). That broke adapter
+        adoption on any project with unrelated ``DamageEvent`` traffic.
+
+        Three qualifying signals (any one is sufficient):
+
+          1. **Fresh-conversion adapter path** — at least one
+             ``GameplayMatch`` emitted a damage-effect capability
+             (``effect.damage`` / ``effect.splash``). Populated by
+             ``transpile_scripts``; empty on rehydrate / publish
+             rebuild paths.
+
+          2. **Rehydrate-path adapter scan** — any script in
+             ``state.rbx_place`` (global + workspace + templates)
+             carries a composer-emitted damage capability literal
+             (``{kind = "effect.damage"`` / ``{kind = "effect.splash"``).
+             Covers ``u2r.py convert --phase write_output`` /
+             ``u2r.py publish`` / ``convert_interactive assemble``
+             where ``state.gameplay_matches`` is empty by design but
+             the previous conversion's adapter stubs are still on
+             disk. Codex PR #74 round-4 [P1] flagged that without
+             this signal, damage-bearing adapter resumes silently
+             lose their server-side listener.
+
+          3. **Legacy body-patch path** — the
+             ``player_damage_remote_event`` coherence pack body-patched
+             a Player LocalScript (the half that still runs in adapters-
+             on tier-2 mode) and left the unique
+             ``local _de = game:GetService("ReplicatedStorage")``
+             ``:FindFirstChild("DamageEvent")`` assignment. That call
+             needs a server-side listener live or it FireServers into
+             the void. Codex PR #74 round-4 [P2] tightened the
+             literal to the full assignment so unrelated user code
+             that does a ``FindFirstChild("DamageEvent")`` lookup
+             can't accidentally trip the probe.
+
+        All three surfaces are scanned via the same place-walking
+        helpers as the adapter-marker scan so rehydrate / publish-
+        rebuild paths see the same answer as fresh-conversion runs.
+        """
+        for match in self.state.gameplay_matches:
+            for kind in match.capability_kinds:
+                if kind in _DAMAGE_CAPABILITY_KINDS:
+                    return True
+        if _place_has_damage_adapter_stub(self.state.rbx_place):
+            return True
+        return _place_has_legacy_damage_fireserver(self.state.rbx_place)
+
     def write_output(self) -> None:
         """Phase 6: Serialize the Roblox place to disk.
 
@@ -2996,7 +3770,16 @@ script.Disabled = true
     def _subphase_finalize_scripts_to_disk(self) -> None:
         """Write every script's final source back to disk. Runs after every
         in-memory mutation so the on-disk ``scripts/`` tree mirrors what
-        gets serialized into the rbxlx."""
+        gets serialized into the rbxlx.
+
+        PR #74 codex round-5 [P3]: walks part-bound scripts too (not
+        just ``rbx_place.scripts``). The rehydration prune pass and
+        any future post-binding mutation can change the source on a
+        bound-script clone WITHOUT touching its global counterpart,
+        so a global-only walk would let the on-disk ``scripts/*.luau``
+        cache drift from the in-memory state. Per-script identity
+        dedup keeps the work O(scripts), not O(scripts × parts).
+        """
         # Final write: ensure .luau files on disk match the fully processed
         # sources (after require injection, reclassification, and all other
         # post-processing). Prefer the explicit source_path set by rehydration
@@ -3007,18 +3790,53 @@ script.Disabled = true
         # (bootstrap, FPS controller, runtime libs) that never had a disk
         # path to begin with.
         scripts_dir = self.output_dir / "scripts"
-        for s in self.state.rbx_place.scripts:
-            if getattr(s, "source_path", None):
-                out_path = scripts_dir / s.source_path
+
+        def _flush(s: object) -> None:
+            source = getattr(s, "source", None)
+            if source is None:
+                return
+            source_path = getattr(s, "source_path", None)
+            if source_path:
+                out_path = scripts_dir / source_path
                 out_path.parent.mkdir(parents=True, exist_ok=True)
-                out_path.write_text(s.source, encoding="utf-8")
-                continue
-            luau_path = scripts_dir / f"{s.name}.luau"
-            anim_path = scripts_dir / "animations" / f"{s.name}.luau"
+                out_path.write_text(source, encoding="utf-8")
+                return
+            name = getattr(s, "name", None)
+            if not name:
+                return
+            luau_path = scripts_dir / f"{name}.luau"
+            anim_path = scripts_dir / "animations" / f"{name}.luau"
             if anim_path.exists():
-                anim_path.write_text(s.source, encoding="utf-8")
+                anim_path.write_text(source, encoding="utf-8")
             elif luau_path.exists() or not (scripts_dir / "animations").exists():
-                luau_path.write_text(s.source, encoding="utf-8")
+                luau_path.write_text(source, encoding="utf-8")
+
+        # Identity-dedup so a script that's both in the global list
+        # AND bound to a part (the first-bind shares the RbxScript
+        # ref via ``part.scripts.append(script)``) doesn't write
+        # twice. ``id()`` keys handle the dataclass eq=True case too.
+        seen: set[int] = set()
+
+        def _flush_unique(s: object) -> None:
+            key = id(s)
+            if key in seen:
+                return
+            seen.add(key)
+            _flush(s)
+
+        for s in self.state.rbx_place.scripts:
+            _flush_unique(s)
+
+        def _walk(parts: list) -> None:
+            for part in parts:
+                for s in getattr(part, "scripts", None) or []:
+                    _flush_unique(s)
+                children = getattr(part, "children", None)
+                if children:
+                    _walk(children)
+
+        _walk(getattr(self.state.rbx_place, "workspace_parts", None) or [])
+        _walk(getattr(self.state.rbx_place, "replicated_templates", None) or [])
 
 
     def _write_unconverted_md(self) -> None:
@@ -3866,14 +4684,50 @@ script.Disabled = true
             _place_carries_adapter_marker(self.state.rbx_place)
         )
         if self.ctx.use_gameplay_adapters and adapter_stubs_present:
+            # PR #74 rehydration-aware prune pass. Run BEFORE injecting
+            # adapter runtime modules so a re-conversion of an output
+            # that previously ran with ``--legacy-gameplay-packs`` (or
+            # pre-PR-#73a, where legacy was the only mode) doesn't
+            # leave both halves wired up — the legacy
+            # ``_AutoDamageEventRouter`` Script would double-bind
+            # ``OnServerEvent`` alongside ``DamageProtocol``, and a
+            # stale ``_AutoFpsDoorTweenInjected`` block on Door.luau
+            # would double-tween on every open/close. Idempotent and
+            # safe on the no-prior-legacy case (no-op when nothing
+            # matches).
+            pruned = self._prune_legacy_gameplay_artifacts()
+            if pruned:
+                log.info(
+                    "[write_output] Pruned %d stale legacy "
+                    "coherence-pack artifact(s) before adapter "
+                    "runtime injection.",
+                    pruned,
+                )
             from core.roblox_types import RbxScript as _GpRbxScript
             gameplay_runtime_dir = (
                 Path(__file__).parent.parent / "runtime" / "gameplay"
             )
+            # PR #74 codex round-2 [P2]: gate DamageProtocol on whether
+            # the project actually carries a Player-damage signal.
+            # Force-injecting it claims ``ReplicatedStorage.DamageEvent``
+            # globally and binds ``OnServerEvent`` to whatever exists at
+            # that name — collision risk for projects that use a
+            # ``DamageEvent`` name for unrelated networking. Two signals
+            # qualify: (a) an adapter match emitted a damage capability
+            # (``effect.damage`` / ``effect.splash``); (b) the legacy
+            # ``player_damage_remote_event`` pack body-patched a Player
+            # LocalScript, leaving an inline
+            # ``:FindFirstChild("DamageEvent")`` lookup that the server
+            # validator needs to be live for. The orchestrator's require
+            # chain is also conditional now (``FindFirstChild`` not
+            # ``WaitForChild`` on DamageProtocol) so omitting the module
+            # is a clean absence rather than a 5-second wait.
+            needs_damage_protocol = self._damage_protocol_needed()
+
             # Filename → ModuleScript name. The Gameplay orchestrator is
             # the entry point; family modules and Composer are siblings
             # under ReplicatedStorage.AutoGen.
-            gameplay_modules: tuple[tuple[str, str], ...] = (
+            base_modules: list[tuple[str, str]] = [
                 ("Composer", "composer.luau"),
                 ("Triggers", "triggers.luau"),
                 ("Movement", "movement.luau"),
@@ -3884,16 +4738,104 @@ script.Disabled = true
                 # the first ``Composer.run`` call.
                 ("HitDetection", "hit_detection.luau"),
                 ("Effects", "effects.luau"),
+            ]
+            if needs_damage_protocol:
                 # PR #73c: DamageProtocol owns the ``DamageEvent``
                 # RemoteEvent + server-side validator (origin replay,
                 # distance gate, value-preserving attribute mirror).
                 # Replaces the legacy ``_AutoDamageEventRouter`` Script
                 # that ``player_damage_remote_event`` emitted; the body-
-                # patch half of that pack still runs to inject
-                # ``FireServer`` into Player LocalScripts.
-                ("DamageProtocol", "damage_protocol.luau"),
-                ("Gameplay", "gameplay.luau"),
+                # patch half of that pack still runs to inject the
+                # ``FireServer`` call into Player LocalScripts. Gated
+                # since PR #74 — see ``_damage_protocol_needed``.
+                base_modules.append(
+                    ("DamageProtocol", "damage_protocol.luau"),
+                )
+            base_modules.append(("Gameplay", "gameplay.luau"))
+            gameplay_modules: tuple[tuple[str, str], ...] = tuple(base_modules)
+
+            # PR #74 codex round-6 [P1]: refresh rehydrated runtime
+            # modules + prune stale ones. The previous skip-if-exists
+            # loop preserved whatever ``_rehydrate_scripts_from_disk``
+            # had loaded — which on a resume is the PREVIOUS run's
+            # source, not the current converter's. Two failure modes
+            # the round-6 [P1] called out:
+            #   * Stale ``Gameplay.luau`` still uses
+            #     ``WaitForChild("DamageProtocol")`` (pre-PR-#74
+            #     codex round-2 fix), so non-damage adapter projects
+            #     resumed against an older output ate a 5-second
+            #     startup stall.
+            #   * Stale ``DamageProtocol.luau`` survives even when
+            #     ``_damage_protocol_needed()`` returned False this
+            #     run — keeping the cross-feature
+            #     ``ReplicatedStorage.DamageEvent`` claim the gate is
+            #     supposed to release.
+            #
+            # PR #74 codex round-7 [P1]: match rehydrated modules by
+            # NAME alone (no parent_path filter). On rehydrate the
+            # modules come back with ``parent_path=None`` because
+            # ``_rehydrate_scripts_from_disk`` only restores parent
+            # paths from ``conversion_plan.json``, and that plan is
+            # written BEFORE runtime-module injection so the gameplay
+            # modules aren't in it. The previous round-6 match used
+            # ``parent_path == "ReplicatedStorage.AutoGen"`` and
+            # therefore missed every rehydrated copy, leaving stale
+            # modules in place while appending a fresh duplicate.
+            # The names in ``_ALL_GAMEPLAY_RUNTIME_MODULE_NAMES`` are
+            # reserved for the converter so name-only matching is
+            # safe — any non-converter script named ``Composer`` /
+            # ``Gameplay`` / etc. is a collision the converter would
+            # already be hitting elsewhere.
+            current_module_names: frozenset[str] = frozenset(
+                name for name, _ in gameplay_modules
             )
+            # Build a lookup for the filename associated with each
+            # known module so the content-aware predicate can compare
+            # source headers. Names not in the current emit set use
+            # the canonical lowercase stem.
+            _all_module_filenames: dict[str, str] = {
+                "Composer": "composer.luau",
+                "Triggers": "triggers.luau",
+                "Movement": "movement.luau",
+                "Lifetime": "lifetime.luau",
+                "HitDetection": "hit_detection.luau",
+                "Effects": "effects.luau",
+                "DamageProtocol": "damage_protocol.luau",
+                "Gameplay": "gameplay.luau",
+            }
+            kept: list = []
+            for s in self.state.rbx_place.scripts:
+                name = getattr(s, "name", None)
+                if (
+                    name in _ALL_GAMEPLAY_RUNTIME_MODULE_NAMES
+                    and name not in current_module_names
+                    and _is_converter_gameplay_runtime_module(
+                        s, name, _all_module_filenames[name],
+                    )
+                ):
+                    # PR #74 codex round-8 [P1]: name match alone is
+                    # insufficient — a user script named e.g.
+                    # ``Composer`` / ``Effects`` would be pruned. The
+                    # predicate above checks parent_path AND a
+                    # source-header signature so user scripts are
+                    # left alone.
+                    log.info(
+                        "[write_output] Pruned stale gameplay-adapter "
+                        "module '%s' (not needed this run; "
+                        "_damage_protocol_needed=%s)",
+                        name,
+                        self._damage_protocol_needed(),
+                    )
+                    # PR #74 codex round-10 [P2]: also delete the
+                    # cached ``.luau`` on disk so the next resume
+                    # doesn't rehydrate the pruned module back into
+                    # ``rbx_place.scripts``.
+                    self._delete_pruned_script_from_disk(s)
+                    injected += 1  # count as a mutation for the log
+                    continue
+                kept.append(s)
+            self.state.rbx_place.scripts = kept
+
             for module_name, filename in gameplay_modules:
                 module_path = gameplay_runtime_dir / filename
                 if not module_path.exists():
@@ -3902,17 +4844,59 @@ script.Disabled = true
                         module_path,
                     )
                     continue
-                # Avoid duplicate injection across re-runs of write_output.
+                new_source = module_path.read_text(encoding="utf-8")
+                # PR #74 codex round-6 [P1]: refresh rather than skip.
+                # A rehydrated copy from a prior run is by definition
+                # stale relative to the current converter; the runtime
+                # modules are deterministic outputs and the canonical
+                # version always lives on disk in
+                # ``converter/runtime/gameplay/``.
+                #
+                # PR #74 codex round-7 [P1]: match rehydrated entries
+                # (parent_path=None) AND fresh in-memory copies
+                # (parent_path="ReplicatedStorage.AutoGen"). PR #74
+                # codex round-8 [P1] tightened the predicate further —
+                # name+parent_path match alone would clobber a user
+                # script that happens to share a generic class name
+                # like ``Composer`` or ``Effects``. The
+                # ``_is_converter_gameplay_runtime_module`` helper
+                # adds a source-header signature check so user code
+                # is left alone. The match must also backfill the
+                # canonical ``parent_path`` so the rbxlx writer routes
+                # the refreshed script under
+                # ``ReplicatedStorage.AutoGen`` instead of the
+                # heuristic fallback path.
                 existing = [
                     s for s in self.state.rbx_place.scripts
-                    if s.name == module_name
-                    and s.parent_path == "ReplicatedStorage.AutoGen"
+                    if _is_converter_gameplay_runtime_module(
+                        s, module_name, filename,
+                    )
                 ]
                 if existing:
+                    refreshed = False
+                    for s in existing:
+                        if s.source != new_source:
+                            s.source = new_source
+                            refreshed = True
+                        # Backfill canonical parent_path on rehydrate
+                        # (rehydrated scripts default to ``None`` for
+                        # modules that weren't in ``conversion_plan.json``).
+                        if getattr(s, "parent_path", None) != "ReplicatedStorage.AutoGen":
+                            s.parent_path = "ReplicatedStorage.AutoGen"
+                            refreshed = True
+                        # Same for script_type — rehydrate heuristic
+                        # may have classified an adapter module
+                        # ambiguously; the converter ships them as
+                        # ModuleScripts so pin that here.
+                        if getattr(s, "script_type", None) != "ModuleScript":
+                            s.script_type = "ModuleScript"
+                            refreshed = True
+                    if refreshed:
+                        injected += 1  # count as a mutation for the log
                     continue
                 self.state.rbx_place.scripts.append(_GpRbxScript(
                     name=module_name,
-                    source=module_path.read_text(encoding="utf-8"),
+                    source=new_source,
                     script_type="ModuleScript",
                     parent_path="ReplicatedStorage.AutoGen",
                 ))
@@ -3934,15 +4918,42 @@ script.Disabled = true
             )
             if bootstrap_path.exists():
                 bootstrap_name = "_GameplayServerBootstrap"
+                bootstrap_source = bootstrap_path.read_text(encoding="utf-8")
+                # PR #74 codex round-7 [P1]: match by name alone. On
+                # rehydrate the bootstrap comes back with
+                # ``parent_path=None`` because
+                # ``conversion_plan.json`` is written before runtime
+                # injection. Filtering on ``parent_path ==
+                # "ServerScriptService"`` here would miss every
+                # rehydrated copy and append a duplicate. The name
+                # ``_GameplayServerBootstrap`` is converter-reserved.
                 existing_bootstrap = [
                     s for s in self.state.rbx_place.scripts
                     if s.name == bootstrap_name
-                    and s.parent_path == "ServerScriptService"
                 ]
-                if not existing_bootstrap:
+                if existing_bootstrap:
+                    # PR #74 codex round-6 [P1]: refresh the rehydrated
+                    # bootstrap source so a resume against an older
+                    # output gets the current converter's version
+                    # (matters if a future fix updates the bootstrap
+                    # body — without the refresh the old source would
+                    # survive every resume).
+                    for s in existing_bootstrap:
+                        if s.source != bootstrap_source:
+                            s.source = bootstrap_source
+                            injected += 1
+                        # Round-7 [P1] backfill — same rationale as
+                        # the gameplay-module loop above.
+                        if getattr(s, "parent_path", None) != "ServerScriptService":
+                            s.parent_path = "ServerScriptService"
+                            injected += 1
+                        if getattr(s, "script_type", None) != "Script":
+                            s.script_type = "Script"
+                            injected += 1
+                else:
                     self.state.rbx_place.scripts.append(_GpRbxScript(
                         name=bootstrap_name,
-                        source=bootstrap_path.read_text(encoding="utf-8"),
+                        source=bootstrap_source,
                         script_type="Script",
                         parent_path="ServerScriptService",
                     ))

@@ -1,3 +1,4 @@
+-- @@GAMEPLAY_RUNTIME_MODULE@@ converter-owned (Movement)
 -- movement.luau: Movement-family capability handlers.
 --
 -- Owns the ``ctx.movement`` namespace.

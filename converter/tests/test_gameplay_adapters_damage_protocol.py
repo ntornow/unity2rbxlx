@@ -181,17 +181,49 @@ class TestDamageProtocolStructure:
             "calls won't resolve."
         )
 
-    def test_orchestrator_force_requires_damage_protocol(self) -> None:
-        """``gameplay.luau`` must force-require ``DamageProtocol`` so
-        the server router's OnServerEvent is bound before the first
-        adapter-stub ``Gameplay.run`` call. Without the require,
-        Players who shoot before any adapter binds would FireServer
-        into a RemoteEvent with no listener.
+    def test_orchestrator_conditionally_requires_damage_protocol(self) -> None:
+        """``gameplay.luau`` must require ``DamageProtocol`` when it's
+        present so the server router's OnServerEvent is bound before
+        the first adapter-stub ``Gameplay.run`` call. PR #74 codex
+        round-2 [P2] gated the converter side: ``DamageProtocol`` is
+        no longer emitted for adapter projects that lack a
+        Player-damage signal (no ``effect.damage`` / ``effect.splash``
+        match and no legacy ``FireServer(DamageEvent`` body-patch),
+        and the orchestrator's require has to be a clean absence
+        when the module is missing — not a 5-second ``WaitForChild``
+        stall on every door-only / projectile-only project.
+
+        Pin the conditional shape:
+
+          * Uses ``FindFirstChild`` (immediate, returns nil if absent).
+          * The require is guarded so a nil result is a no-op rather
+            than an error.
+          * The damage-bearing case still resolves: when the converter
+            emits ``DamageProtocol`` alongside the orchestrator,
+            ``FindFirstChild`` finds it and the require fires.
         """
         body = _gameplay_orchestrator_path().read_text(encoding="utf-8")
-        assert 'WaitForChild("DamageProtocol")' in body, (
-            "gameplay.luau orchestrator no longer force-requires "
-            "DamageProtocol — server router init is racy."
+        assert 'FindFirstChild("DamageProtocol")' in body, (
+            "gameplay.luau no longer probes DamageProtocol via "
+            "FindFirstChild — PR #74 [P2] gating regressed."
+        )
+        assert 'WaitForChild("DamageProtocol")' not in body, (
+            "gameplay.luau still uses WaitForChild for DamageProtocol "
+            "— would 5-second stall every door/projectile-only "
+            "adapter project. PR #74 [P2] fix regressed."
+        )
+        damage_idx = body.find('FindFirstChild("DamageProtocol")')
+        # The require call must appear within a short window after
+        # the FindFirstChild lookup AND be guarded by a nil check.
+        window = body[damage_idx : damage_idx + 200]
+        assert "if damageProtocol ~= nil" in window or "if damageProtocol" in window, (
+            "gameplay.luau requires DamageProtocol without a nil "
+            "guard — would error on door/projectile-only projects "
+            "where the converter omitted the module."
+        )
+        assert "require(damageProtocol)" in window, (
+            "gameplay.luau dropped the conditional require of "
+            "DamageProtocol — damage-bearing projects regress."
         )
 
     def test_server_init_guarded_by_RunService_IsServer(self) -> None:
@@ -243,9 +275,14 @@ class TestPipelineInjection:
     nil RemoteEvent).
     """
 
-    def test_damage_protocol_in_gameplay_modules_tuple(self) -> None:
-        """AST scan rather than substring scan so a comment mention
-        doesn't count. Pin the actual tuple-literal entry.
+    def test_damage_protocol_wired_into_gameplay_modules(self) -> None:
+        """AST scan for the (``"DamageProtocol"``, ``"damage_protocol.luau"``)
+        tuple literal anywhere in pipeline.py. PR #74 codex round-2
+        [P2] made the entry conditional (only appended when
+        ``_damage_protocol_needed`` returns True), so the scan is
+        looser than the pre-PR-#74 "must appear inside the
+        ``gameplay_modules`` tuple-of-tuples" check — but a tuple
+        of the right shape still has to exist in the source.
         """
         import ast
         import inspect
@@ -256,27 +293,298 @@ class TestPipelineInjection:
 
         found = False
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Tuple):
+            if not isinstance(node, ast.Tuple) or len(node.elts) != 2:
                 continue
-            # Each entry is a 2-tuple of string literals.
-            for elt in node.elts:
-                if not isinstance(elt, ast.Tuple) or len(elt.elts) != 2:
-                    continue
-                first, second = elt.elts
-                if (
-                    isinstance(first, ast.Constant)
-                    and first.value == "DamageProtocol"
-                    and isinstance(second, ast.Constant)
-                    and second.value == "damage_protocol.luau"
-                ):
-                    found = True
-                    break
-            if found:
+            first, second = node.elts
+            if (
+                isinstance(first, ast.Constant)
+                and first.value == "DamageProtocol"
+                and isinstance(second, ast.Constant)
+                and second.value == "damage_protocol.luau"
+            ):
+                found = True
                 break
         assert found, (
-            "pipeline.py's gameplay_modules tuple no longer carries "
-            "(\"DamageProtocol\", \"damage_protocol.luau\") — runtime "
-            "modules won't include the damage router."
+            "pipeline.py no longer carries a "
+            "(\"DamageProtocol\", \"damage_protocol.luau\") tuple — "
+            "runtime modules can't include the damage router on the "
+            "Player-damage path."
+        )
+
+    def test_damage_protocol_injection_is_gated(self) -> None:
+        """PR #74 codex round-2 [P2]: the DamageProtocol tuple must be
+        conditionally appended, not unconditionally included in the
+        module list. Pin the gating method exists AND the append is
+        inside an ``if`` block referring to it (so a future refactor
+        that drops the gate fails this test rather than silently
+        regressing the [P2]).
+        """
+        import inspect
+        from converter import pipeline as pipeline_mod
+
+        src = inspect.getsource(pipeline_mod)
+        assert "_damage_protocol_needed" in src, (
+            "pipeline.py no longer defines a _damage_protocol_needed "
+            "helper — PR #74 [P2] gating regressed."
+        )
+        # The append must be guarded by the gate. Scan for the local
+        # name binding pattern produced by the gating block:
+        #   needs_damage_protocol = self._damage_protocol_needed()
+        #   ...
+        #   if needs_damage_protocol:
+        #       base_modules.append(("DamageProtocol", "damage_protocol.luau"))
+        assert "needs_damage_protocol" in src, (
+            "pipeline.py no longer binds a needs_damage_protocol "
+            "local from _damage_protocol_needed — [P2] gating "
+            "regressed."
+        )
+        assert "if needs_damage_protocol" in src, (
+            "pipeline.py no longer branches on needs_damage_protocol "
+            "before appending DamageProtocol — [P2] gating regressed."
+        )
+
+    def test_damage_protocol_needed_signals(self) -> None:
+        """Unit-test ``_damage_protocol_needed`` against the two
+        documented signals (effect.damage / effect.splash capability
+        kind; legacy ``FindFirstChild("DamageEvent")`` body-patch
+        marker in any script source).
+
+        Built without a real Pipeline instance — the method is pure
+        over ``self.state.gameplay_matches`` and ``self.state.rbx_place``.
+        """
+        import types
+        from converter.pipeline import Pipeline, _DAMAGE_CAPABILITY_KINDS
+
+        # Minimal duck-typed state harness. _damage_protocol_needed
+        # only reads .state.gameplay_matches and .state.rbx_place.
+        class _M:
+            def __init__(self, kinds: tuple[str, ...]) -> None:
+                self.capability_kinds = kinds
+
+        class _State:
+            def __init__(self) -> None:
+                self.gameplay_matches: list = []
+                self.rbx_place = types.SimpleNamespace(
+                    scripts=[], workspace_parts=[], replicated_templates=[],
+                )
+
+        def _call(state) -> bool:
+            harness = types.SimpleNamespace(state=state)
+            return Pipeline._damage_protocol_needed(harness)
+
+        # No signal → False.
+        s = _State()
+        assert _call(s) is False, (
+            "_damage_protocol_needed returned True on an empty state "
+            "— would unnecessarily claim ReplicatedStorage.DamageEvent."
+        )
+
+        # Effect.damage capability → True.
+        s = _State()
+        s.gameplay_matches.append(_M(("movement.impulse", "effect.damage")))
+        assert _call(s) is True, (
+            "_damage_protocol_needed returned False for an "
+            "effect.damage match — projectile slice would drop the "
+            "server router."
+        )
+
+        # Effect.splash capability → True.
+        s = _State()
+        s.gameplay_matches.append(_M(("hit_detection.overlap_sphere", "effect.splash")))
+        assert _call(s) is True, (
+            "_damage_protocol_needed returned False for an "
+            "effect.splash match — AoE damage would no-op server-side."
+        )
+
+        # Non-damage capability only → False.
+        s = _State()
+        s.gameplay_matches.append(_M(("trigger.on_bool_attribute", "movement.attribute_driven_tween")))
+        assert _call(s) is False, (
+            "_damage_protocol_needed returned True for a door-only "
+            "match (trigger + tween, no damage capability) — the "
+            "PR #74 [P2] collision-risk gate regressed."
+        )
+
+        # Legacy body-patch marker present → True.
+        s = _State()
+        s.rbx_place.scripts = [
+            types.SimpleNamespace(
+                source=(
+                    'local _de = game:GetService("ReplicatedStorage")'
+                    ':FindFirstChild("DamageEvent")\n'
+                    "if _de then _de:FireServer(hitInst) end\n"
+                ),
+            ),
+        ]
+        assert _call(s) is True, (
+            "_damage_protocol_needed missed the legacy body-patch "
+            "marker — Player.cs body-patch path drops the server "
+            "validator."
+        )
+
+        # Sanity-pin the capability set so a future capability rename
+        # (e.g. ``effect.damage`` → ``effect.player_damage``) fails this
+        # test instead of silently dropping damage routing.
+        assert _DAMAGE_CAPABILITY_KINDS == frozenset({
+            "effect.damage", "effect.splash",
+        }), (
+            "Damage capability set drifted — update both the "
+            "Pipeline gate and this test in lockstep."
+        )
+
+    def test_damage_protocol_needed_rehydrates_via_adapter_stub_scan(
+        self,
+    ) -> None:
+        """PR #74 codex round-4 [P1]: on resume / publish rebuild,
+        ``state.gameplay_matches`` is empty by design. A damage-bearing
+        adapter project (bullets with ``effect.damage`` capability,
+        no legacy body-patch) must still be detected so DamageProtocol
+        gets re-injected and the server-side ``DamageEvent`` listener
+        stays live.
+
+        Detection signal: the composer's capability-table literal
+        ``{kind = "effect.damage"`` (or ``effect.splash``) on a stub
+        emitted to ``state.rbx_place.scripts`` by a previous run.
+        """
+        import types
+        from converter.pipeline import Pipeline
+
+        class _State:
+            def __init__(self) -> None:
+                self.gameplay_matches: list = []
+                self.rbx_place = types.SimpleNamespace(
+                    scripts=[
+                        types.SimpleNamespace(
+                            source=(
+                                "-- @@AUTOGEN_GAMEPLAY_ADAPTER@@ TurretBullet\n"
+                                "Gameplay.run(_container, {\n"
+                                '    {kind = "effect.damage", value = 10},\n'
+                                "})\n"
+                            ),
+                        ),
+                    ],
+                    workspace_parts=[],
+                    replicated_templates=[],
+                )
+
+        harness = types.SimpleNamespace(state=_State())
+        assert Pipeline._damage_protocol_needed(harness) is True, (
+            "rehydrate path missed an adapter stub carrying "
+            "effect.damage — codex PR #74 round-4 [P1] regressed."
+        )
+
+        # And the splash variant — same path, different capability kind.
+        class _StateSplash:
+            def __init__(self) -> None:
+                self.gameplay_matches: list = []
+                self.rbx_place = types.SimpleNamespace(
+                    scripts=[
+                        types.SimpleNamespace(
+                            source=(
+                                "-- @@AUTOGEN_GAMEPLAY_ADAPTER@@ Explosion\n"
+                                'Gameplay.run(_container, {\n'
+                                '    {kind = "effect.splash", radius_studs = 20},\n'
+                                "})\n"
+                            ),
+                        ),
+                    ],
+                    workspace_parts=[],
+                    replicated_templates=[],
+                )
+
+        harness_splash = types.SimpleNamespace(state=_StateSplash())
+        assert Pipeline._damage_protocol_needed(harness_splash) is True, (
+            "rehydrate path missed an adapter stub carrying "
+            "effect.splash — AoE damage routes lose their server "
+            "validator on resume."
+        )
+
+    def test_damage_stub_scan_requires_adapter_marker(self) -> None:
+        """PR #74 codex round-7 [P2]: ``_place_has_damage_adapter_stub``
+        previously matched on ``{kind = "effect.damage"`` alone. A
+        user / generated script that happened to contain that string
+        (e.g. a tutorial Luau file documenting the adapter format,
+        or an unrelated script that uses the same kind-table shape)
+        would trip the probe and re-inject DamageProtocol. The
+        composer's ``ADAPTER_STUB_MARKER`` is the unique structural
+        proof that the script is an adapter stub; the scan now
+        requires BOTH the marker AND the capability literal.
+        """
+        import types
+        from converter.pipeline import Pipeline
+
+        # Script that has the kind literal but NOT the
+        # ADAPTER_STUB_MARKER — must be rejected.
+        class _State:
+            def __init__(self) -> None:
+                self.gameplay_matches: list = []
+                self.rbx_place = types.SimpleNamespace(
+                    scripts=[
+                        types.SimpleNamespace(
+                            source=(
+                                "-- user-authored tutorial script\n"
+                                "local exampleCapability = "
+                                '{kind = "effect.damage", value = 10}\n'
+                                "return exampleCapability\n"
+                            ),
+                        ),
+                    ],
+                    workspace_parts=[],
+                    replicated_templates=[],
+                )
+
+        harness = types.SimpleNamespace(state=_State())
+        assert Pipeline._damage_protocol_needed(harness) is False, (
+            "_damage_protocol_needed false-positived on a user "
+            "script that mentions the kind literal but isn't an "
+            "actual adapter stub — codex PR #74 round-7 [P2] "
+            "regressed."
+        )
+
+    def test_legacy_probe_rejects_bare_FindFirstChild_lookup(self) -> None:
+        """PR #74 codex round-4 [P2]: a bare
+        ``FindFirstChild("DamageEvent")`` lookup in an unrelated user
+        script must NOT trip the legacy-marker probe. The tighter
+        marker pins on the pack's full ``local _de = game:GetService
+        ("ReplicatedStorage"):FindFirstChild("DamageEvent")`` line.
+        Without this narrowing, adapter-enabled projects that
+        coincidentally look up a ``DamageEvent`` for unrelated
+        networking would re-trigger DamageProtocol injection —
+        the exact collision PR #74 is supposed to avoid.
+        """
+        import types
+        from converter.pipeline import Pipeline
+
+        class _State:
+            def __init__(self) -> None:
+                self.gameplay_matches: list = []
+                self.rbx_place = types.SimpleNamespace(
+                    scripts=[
+                        types.SimpleNamespace(
+                            source=(
+                                "-- user-authored script unrelated "
+                                "to the legacy damage pack\n"
+                                "local rs = game:GetService"
+                                "(\"ReplicatedStorage\")\n"
+                                "local myEvent = rs:FindFirstChild"
+                                "(\"DamageEvent\")\n"
+                                "if myEvent then\n"
+                                "    myEvent.OnClientEvent:Connect(...)\n"
+                                "end\n"
+                            ),
+                        ),
+                    ],
+                    workspace_parts=[],
+                    replicated_templates=[],
+                )
+
+        harness = types.SimpleNamespace(state=_State())
+        assert Pipeline._damage_protocol_needed(harness) is False, (
+            "_damage_protocol_needed false-positived on a bare "
+            "FindFirstChild('DamageEvent') user-code call — codex "
+            "PR #74 round-4 [P2] regressed. DamageProtocol would "
+            "re-claim ReplicatedStorage.DamageEvent for non-damage "
+            "projects."
         )
 
     def test_server_bootstrap_emits_under_server_script_service(
@@ -316,11 +624,17 @@ class TestPipelineInjection:
         # is parented to ServerScriptService AND typed as a Script (a
         # ModuleScript would have the same problem — it wouldn't
         # auto-run).
-        bootstrap_idx = src.find("server_bootstrap.luau")
+        # Use rfind because PR #74 round-9 added a legacy-header
+        # back-compat table near the top of pipeline.py that also
+        # mentions ``server_bootstrap.luau`` as a substring; the
+        # actual injection block is near the bottom of the file.
+        bootstrap_idx = src.rfind("server_bootstrap.luau")
         # Look in a generous window around the reference for both
-        # markers; the actual injection block fits within ~1500 chars
-        # of the filename reference.
-        window = src[max(0, bootstrap_idx - 200) : bootstrap_idx + 1500]
+        # markers; the actual injection block has grown over rounds
+        # of codex review (PR #74 round-6 added a refresh branch;
+        # round-7 added parent_path/script_type backfills) so the
+        # window is intentionally wide.
+        window = src[max(0, bootstrap_idx - 200) : bootstrap_idx + 3000]
         assert '"ServerScriptService"' in window, (
             "pipeline.py references server_bootstrap.luau but the "
             "injection no longer parents it to ServerScriptService — "
