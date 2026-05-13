@@ -920,10 +920,26 @@ class Pipeline:
             #     bidirectional overwrite as breaking this contract.
             #   * ``True`` / ``False`` — caller was explicit; their
             #     choice wins over the persisted value.
+            #
+            # PR #74 codex round-2 [P1]: an explicit override that
+            # CHANGES the persisted value must also force a
+            # retranspile. Otherwise ``_subphase_emit_scripts_to_disk``
+            # preserves the previous-mode ``.luau`` cache on disk and
+            # the rebuilt place silently stays in the old mode (adapter
+            # stubs survive a flip to legacy; legacy patched bodies
+            # survive a flip to adapters). Forcing retranspile here
+            # wipes ``scripts/`` and re-runs ``transpile_scripts`` so
+            # the on-disk scripts match the new mode.
             if self._init_use_gameplay_adapters is not None:
+                mode_changed = (
+                    self.ctx.use_gameplay_adapters
+                    != self._init_use_gameplay_adapters
+                )
                 self.ctx.use_gameplay_adapters = (
                     self._init_use_gameplay_adapters
                 )
+                if mode_changed:
+                    self._invalidate_transpile_cache_for_mode_flip()
 
         log.info("=== Resuming pipeline from phase '%s' ===", phase)
         self.run_through(phase, run_after=True)
@@ -2464,6 +2480,49 @@ return table.concat(allData, "\\n")'''
             place.screen_guis = surviving_guis
 
         return pruned
+
+    def _invalidate_transpile_cache_for_mode_flip(self) -> None:
+        """PR #74 codex round-2 [P1]: when the operator flips
+        gameplay mode on a resumed run (``--legacy-gameplay-packs``
+        after a previous adapters-on conversion, or
+        ``--use-gameplay-adapters`` after a previous legacy run), the
+        cached transpiled scripts in ``<output>/scripts/`` carry the
+        OLD mode's output — adapter stubs + ``ReplicatedStorage.AutoGen``
+        modules vs legacy-pack body-patched Player.cs.
+
+        ``_subphase_emit_scripts_to_disk`` checks
+        ``"transpile_scripts" in ctx.completed_phases`` AND
+        ``not self._retranspile`` to decide whether to preserve the
+        on-disk cache. Without invalidation, a rollback or re-enable
+        flip silently produces a place that still uses the previous
+        mode's runtime.
+
+        Three coordinated steps make the next ``transpile_scripts``
+        call do a fresh transpile:
+
+          1. Set ``self._retranspile = True`` so the preserve check
+             returns False even when ``transpile_scripts`` is in
+             ``completed_phases``.
+          2. Remove ``transpile_scripts`` from
+             ``ctx.completed_phases`` so the phase-gating logic
+             actually re-runs the phase (not just the on-disk
+             rewrite half).
+          3. Log loudly — silent retranspile on a ``--phase`` run is
+             surprising and operators need to know their resume just
+             cost an AI transpile call.
+        """
+        self._retranspile = True
+        if "transpile_scripts" in self.ctx.completed_phases:
+            self.ctx.completed_phases = [
+                p for p in self.ctx.completed_phases
+                if p != "transpile_scripts"
+            ]
+        log.warning(
+            "[resume] Gameplay-mode flip detected — invalidating "
+            "transpile cache and forcing a fresh ``transpile_scripts`` "
+            "run. The previous mode's ``scripts/`` output would "
+            "otherwise survive the resume.",
+        )
 
     def _damage_protocol_needed(self) -> bool:
         """Return True when the project carries a Player-damage signal

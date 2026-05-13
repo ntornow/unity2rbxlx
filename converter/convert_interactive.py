@@ -231,8 +231,22 @@ def _make_pipeline(
         # post-swap re-application. ``None`` means "no preference this
         # run" so the persisted value stays — that's the sticky
         # rollback contract codex PR #74 round-1 [P1] anchored on.
+        #
+        # PR #74 codex round-2 [P1]: if the explicit override CHANGES
+        # the persisted value, invalidate the cached transpile output
+        # on disk. ``_subphase_emit_scripts_to_disk`` preserves
+        # ``scripts/`` whenever ``transpile_scripts`` is in
+        # ``completed_phases`` and ``--retranspile`` wasn't passed;
+        # without invalidation, a flip from adapters→legacy (or vice
+        # versa) silently keeps the previous mode's ``.luau`` cache
+        # and the rebuilt place stays in the old mode.
         if use_gameplay_adapters is not None:
+            mode_changed = (
+                pipeline.ctx.use_gameplay_adapters != use_gameplay_adapters
+            )
             pipeline.ctx.use_gameplay_adapters = use_gameplay_adapters
+            if mode_changed:
+                pipeline._invalidate_transpile_cache_for_mode_flip()
     return pipeline
 
 

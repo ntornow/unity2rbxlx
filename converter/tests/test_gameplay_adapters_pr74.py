@@ -168,6 +168,95 @@ class TestStickyRollbackContract:
         )
 
 
+class TestModeFlipInvalidatesTranspileCache:
+    """PR #74 codex round-2 [P1]: when the operator flips gameplay
+    mode on a resumed run (``--legacy-gameplay-packs`` after an
+    adapters-on conversion, or vice versa), the cached ``scripts/``
+    output on disk carries the previous mode. The override must
+    invalidate the cache so the next ``transpile_scripts`` produces
+    a fresh result for the new mode.
+    """
+
+    def _harness(
+        self, persisted: bool, completed: list[str] | None = None,
+    ) -> types.SimpleNamespace:
+        """Duck-typed harness for ``_invalidate_transpile_cache_for_mode_flip``
+        — the helper only touches ``ctx.completed_phases`` and
+        ``self._retranspile``."""
+        ctx = ConversionContext(unity_project_path="/tmp/x")
+        ctx.use_gameplay_adapters = persisted
+        ctx.completed_phases = list(completed or [])
+        return types.SimpleNamespace(ctx=ctx, _retranspile=False)
+
+    def test_invalidate_sets_retranspile_flag(self) -> None:
+        h = self._harness(persisted=False)
+        Pipeline._invalidate_transpile_cache_for_mode_flip(h)
+        assert h._retranspile is True, (
+            "_retranspile not set — _subphase_emit_scripts_to_disk "
+            "will preserve the old mode's scripts/ output."
+        )
+
+    def test_invalidate_removes_transpile_from_completed_phases(self) -> None:
+        h = self._harness(
+            persisted=False,
+            completed=["parse", "transpile_scripts", "convert_scene"],
+        )
+        Pipeline._invalidate_transpile_cache_for_mode_flip(h)
+        assert "transpile_scripts" not in h.ctx.completed_phases, (
+            "transpile_scripts left in completed_phases — phase will "
+            "be skipped on resume and the mode flip is nominal."
+        )
+        # Sibling phases must survive — we're only invalidating one.
+        assert h.ctx.completed_phases == ["parse", "convert_scene"]
+
+    def test_invalidate_idempotent_when_already_invalidated(self) -> None:
+        """Re-invoking the invalidator with transpile already absent
+        from completed_phases must NOT raise (e.g. fresh ctx)."""
+        h = self._harness(persisted=False, completed=["parse"])
+        Pipeline._invalidate_transpile_cache_for_mode_flip(h)
+        assert h._retranspile is True
+        assert h.ctx.completed_phases == ["parse"]
+
+    def test_resume_fires_invalidator_only_when_mode_flips(self) -> None:
+        """Source pin: resume() must call the invalidator only when
+        the explicit override CHANGES the persisted value, not on
+        every explicit re-affirm of the same mode (that would force
+        unnecessary AI transpile calls)."""
+        import inspect
+        from converter.pipeline import Pipeline as _Pipeline
+
+        src = inspect.getsource(_Pipeline.resume)
+        assert (
+            "mode_changed" in src
+            and "_invalidate_transpile_cache_for_mode_flip" in src
+        ), (
+            "resume() no longer guards the invalidator on "
+            "mode_changed — every explicit re-affirm would now "
+            "force an AI transpile call, which is wasteful."
+        )
+
+    def test_make_pipeline_fires_invalidator_on_mode_flip(self) -> None:
+        """convert_interactive._make_pipeline must mirror the
+        resume() invalidation logic — otherwise interactive assemble
+        with --legacy-gameplay-packs against an adapters-on output
+        produces a place that still uses adapters.
+        """
+        import inspect
+        from convert_interactive import _make_pipeline
+
+        src = inspect.getsource(_make_pipeline)
+        assert "_invalidate_transpile_cache_for_mode_flip" in src, (
+            "_make_pipeline doesn't invalidate the transpile cache "
+            "on mode flip — interactive assemble rollback path is "
+            "broken (codex PR #74 round-2 [P1])."
+        )
+        assert "mode_changed" in src, (
+            "_make_pipeline invalidator isn't gated on mode_changed "
+            "— would force a fresh transpile even on a no-op explicit "
+            "re-affirm."
+        )
+
+
 class TestInteractiveAssemblyLegacyPath:
     """PR #74 codex round-1 [P2]: ``convert_interactive assemble``
     must expose the same rollback lever as ``u2r.py convert`` so
