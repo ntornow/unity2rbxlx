@@ -1752,15 +1752,21 @@ class Pipeline:
         log.info("[resolve_assets] Resolving %d mesh assets via Luau Execution API...", len(mesh_assets))
 
         # Build resolve script: LoadAsset each Model ID, extract MeshPart data
-        # Process in batches to stay within script size limits
+        # Process in small batches with retries — Roblox's per-script Luau
+        # Execution timeout will kill a script that does too many LoadAsset
+        # calls in one go, and the API itself returns transient internal-
+        # error timeouts under load. Both classes of failure are recovered
+        # from by re-running with smaller batches and a retry loop.
         from roblox.cloud_api import execute_luau
 
-        batch_size = 20
+        batch_size = 4
+        max_retries = 3
         mesh_items = list(mesh_assets.items())
         all_results = []
 
         for batch_start in range(0, len(mesh_items), batch_size):
             batch = mesh_items[batch_start:batch_start + batch_size]
+            batch_num = batch_start // batch_size + 1
             models_lua = ",\n".join(
                 f'    {{id={v.replace("rbxassetid://", "")}, path="{k}"}}'
                 for k, v in batch
@@ -1781,28 +1787,43 @@ for _, entry in models do
                 d.TextureID ~= "" and d.TextureID or ""))
         end
     end
-    model:Destroy(); task.wait(0.3)
+    model:Destroy()
 end
 return table.concat(allData, "\\n")'''
 
-            result = execute_luau(api_key, universe_id, place_id, script)
-            if result and result.get("state") == "COMPLETE":
-                # Extract the return value from the result
-                outputs = result.get("output", {})
-                results_list = outputs.get("results", [])
-                if results_list:
-                    # The return value is in the first result
-                    ret = results_list[0]
-                    if isinstance(ret, dict):
-                        text = ret.get("value", "")
-                    else:
-                        text = str(ret)
-                    if text:
-                        all_results.extend(text.strip().split("\n"))
-                        log.info("[resolve_assets] Batch %d: resolved %d sub-meshes",
-                                 batch_start // batch_size + 1, len(text.strip().split("\n")))
-            else:
-                log.warning("[resolve_assets] Batch %d failed", batch_start // batch_size + 1)
+            success = False
+            for attempt in range(1, max_retries + 1):
+                result = execute_luau(api_key, universe_id, place_id, script)
+                if result and result.get("state") == "COMPLETE":
+                    outputs = result.get("output", {})
+                    results_list = outputs.get("results", [])
+                    if results_list:
+                        ret = results_list[0]
+                        if isinstance(ret, dict):
+                            text = ret.get("value", "")
+                        else:
+                            text = str(ret)
+                        if text:
+                            lines = text.strip().split("\n")
+                            all_results.extend(lines)
+                            log.info(
+                                "[resolve_assets] Batch %d (attempt %d): "
+                                "resolved %d sub-meshes",
+                                batch_num, attempt, len(lines),
+                            )
+                            success = True
+                            break
+                log.warning(
+                    "[resolve_assets] Batch %d attempt %d/%d failed",
+                    batch_num, attempt, max_retries,
+                )
+            if not success:
+                log.warning(
+                    "[resolve_assets] Batch %d giving up after %d attempts "
+                    "— those meshes stay unresolved; re-run resolve_assets "
+                    "to retry just the leftovers.",
+                    batch_num, max_retries,
+                )
 
         # Parse results into mesh_native_sizes and mesh_hierarchies
         if all_results:
