@@ -2012,15 +2012,17 @@ def _inject_door_tween(scripts: list["RbxScript"]) -> int:
 #     the current to catch tunnel-through hits
 #   - Adds a visible ``Trail`` so the trajectory reads in-game
 
-# Match ANY local-variable ApplyImpulse / Touched:Connect — the AI
-# transpile of Unity's bullet scripts uses different local names
-# across runs (``rootPart``, ``rb``, ``part``, ``container``, etc.).
-# Codex round-2 found PlaneBullet skipped because the prior regex
-# only matched the literal ``rootPart`` form. The bullet-name scope
-# (``TurretBullet`` / ``PlaneBullet`` only) still gates the pack
-# from touching unrelated impulse-using scripts.
+# Match ANY local-variable ApplyImpulse / AssemblyLinearVelocity write —
+# the AI transpile of Unity's bullet scripts uses different local names
+# across runs (``rootPart``, ``rb``, ``part``, ``container``, etc.) AND
+# different physics-init shapes (``:ApplyImpulse(...)`` vs direct
+# ``.AssemblyLinearVelocity = ...`` assignment). Codex round-2 caught
+# the local-name variance for PlaneBullet; this also covers the
+# AssemblyLinearVelocity shape observed in TurretBullet outputs. The
+# bullet-name scope (``TurretBullet`` / ``PlaneBullet`` only) still
+# gates the pack from touching unrelated velocity-writing scripts.
 _BULLET_DETECT_RE = re.compile(
-    r'\b\w+\s*:\s*ApplyImpulse\s*\(',
+    r'\b\w+\s*:\s*ApplyImpulse\s*\(|\b\w+\.AssemblyLinearVelocity\s*=',
 )
 _BULLET_TOUCHED_RE = re.compile(
     r'\b\w+\.Touched\s*:\s*Connect\b',
