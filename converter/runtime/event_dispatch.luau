@@ -1,4 +1,3 @@
--- @@GAMEPLAY_RUNTIME_MODULE@@ converter-owned (EventDispatch)
 -- EventDispatch: cross-class connect helper for client event listeners.
 --
 -- Connect a handler to either a server-fired ``RemoteEvent`` or a
@@ -8,15 +7,14 @@
 -- caller that hard-codes one crashes the moment the producer side
 -- swaps implementations.
 --
--- Parented at ``ReplicatedStorage.AutoGen.EventDispatch`` by the
--- pipeline (PR #75). A compat alias at
--- ``ReplicatedStorage.AutoFpsEventDispatch`` proxies to this module
--- via a ``WaitForChild`` chain so already-converted outputs that pin
--- the historic name keep resolving until PR #78 retires the alias.
+-- Parented at ``ReplicatedStorage.AutoFpsEventDispatch`` by FPS
+-- scaffolding. The auto-generated HUDController requires it by this
+-- exact name; ``AUTO_FPS_EVENT_DISPATCH_NAME`` in
+-- ``converter/scaffolding/fps.py`` is the authoritative constant.
 --
 -- Usage:
 --   local EventDispatch = require(
---       ReplicatedStorage:WaitForChild("AutoGen"):WaitForChild("EventDispatch")
+--       ReplicatedStorage:WaitForChild("AutoFpsEventDispatch")
 --   )
 --   EventDispatch.connectClient(remoteOrBindable, function(payload)
 --       -- handler runs whether the producer is a RemoteEvent or BindableEvent
@@ -28,8 +26,6 @@ local EventDispatch = {}
 --- Silently no-ops on ``nil`` so callers can pass the result of
 --- ``ReplicatedStorage:WaitForChild(name, timeout)`` directly without
 --- guarding for the timeout case.
---- @param evt Instance | nil  RemoteEvent or BindableEvent (or nil)
---- @param handler (...any) -> ()  callback receiving the event payload
 function EventDispatch.connectClient(evt, handler)
 	if not evt then
 		return

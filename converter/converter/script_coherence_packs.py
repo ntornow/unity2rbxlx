@@ -2676,10 +2676,6 @@ def _detect_player_or_router_present(scripts: list["RbxScript"]) -> bool:
         exists but its source is stale (re-conversion of an
         already-patched output should refresh the router with any
         round-to-round improvements — codex round-11 [P2])
-      - gameplay adapters are active AND a stale legacy router is
-        present (re-conversion that flipped ``--use-gameplay-adapters``
-        on; the apply path removes the legacy router so
-        ``damage_protocol.luau`` doesn't double-bind). PR #73c.
 
     The apply path compares router source byte-for-byte and only
     rewrites on diff, so this detector being more permissive doesn't
@@ -2696,16 +2692,6 @@ def _detect_player_or_router_present(scripts: list["RbxScript"]) -> bool:
     router = next(
         (s for s in scripts if s.name == _DAMAGE_ROUTER_NAME), None,
     )
-    # Adapters-active short-circuit: a legacy router lingering on disk
-    # would double-bind with damage_protocol.luau even if Player is
-    # already patched and the router source matches. Fire the apply
-    # path so it can remove the stale router.
-    from converter.gameplay.composer import ADAPTER_STUB_MARKER
-    adapters_active = any(
-        ADAPTER_STUB_MARKER in s.source for s in scripts
-    )
-    if adapters_active and router is not None:
-        return True
     if not has_patched_player:
         return False
     if router is None:
@@ -2790,42 +2776,9 @@ def _inject_player_damage_remote_event(scripts: list["RbxScript"]) -> int:
     # if a router with the canonical name exists, replace its source to
     # keep behaviour in sync with the pack version. Otherwise append a
     # new RbxScript to the list.
-    #
-    # PR #73c: when gameplay adapters are bound (any script carries
-    # ``ADAPTER_STUB_MARKER``), ``runtime/gameplay/damage_protocol.luau``
-    # takes over the router role — it owns the ``DamageEvent`` RemoteEvent
-    # AND the OnServerEvent handler with the same origin-replay + distance
-    # gate + value-preserving mirror semantics. Emitting both would
-    # double-bind ``OnServerEvent`` and apply ``SetAttribute("TakeDamage")``
-    # twice per validated hit. The body-patch above still runs because
-    # AI-transpiled Player LocalScripts still need the inline
-    # ``FireServer`` call; only the router half is suppressed. Also clear
-    # any stale legacy router script left over from a prior adapters-off
-    # conversion so re-running with adapters on doesn't leave both in
-    # place.
-    from converter.gameplay.composer import ADAPTER_STUB_MARKER
-    adapters_active = any(
-        ADAPTER_STUB_MARKER in s.source for s in scripts
-    )
     from core.roblox_types import RbxScript
     router_name = _DAMAGE_ROUTER_NAME
     existing = next((s for s in scripts if s.name == router_name), None)
-    if adapters_active:
-        if existing is not None:
-            scripts.remove(existing)
-            fixes += 1
-            log.info(
-                "  Removed stale %s (gameplay-adapter DamageProtocol "
-                "module supersedes it)",
-                router_name,
-            )
-        else:
-            log.debug(
-                "  Skipped %s emission (gameplay-adapter DamageProtocol "
-                "module supersedes it)",
-                router_name,
-            )
-        return fixes
     if existing is not None:
         if existing.source != _DAMAGE_ROUTER_SOURCE:
             existing.source = _DAMAGE_ROUTER_SOURCE

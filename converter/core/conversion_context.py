@@ -118,16 +118,6 @@ class ConversionContext:
     # is empty.
     scaffolding: list[str] = field(default_factory=list)
 
-    # Gameplay-adapter rollout flag (PR #73a; flipped on by default in
-    # PR #74). When True, the gameplay detectors run during transpile
-    # and replace the matching legacy ``script_coherence_packs`` packs;
-    # the adapter runtime modules under ``ReplicatedStorage.AutoGen``
-    # are also emitted. To opt out, pass ``--legacy-gameplay-packs`` on
-    # the CLI, which forces this field to False before the Pipeline
-    # constructor sees it (see ``u2r.py``). Persisted so resumed builds
-    # use the same path the original conversion picked.
-    use_gameplay_adapters: bool = True
-
     def __post_init__(self) -> None:
         # JSON load via `cls(**data)` populates storage_plan as a dict (the
         # asdict() form). Reconstruct it as a StoragePlan when present so the
@@ -196,21 +186,8 @@ class ConversionContext:
         marker added by ``save_sanitized``, or pre-ClassVar files where
         ``_SENSITIVE_FIELDS`` was serialized) so users can load redacted
         bug-report attachments without manual JSON surgery.
-
-        PR #74 codex round-3 [P1]: a ``conversion_context.json``
-        written before PR #73a doesn't carry the
-        ``use_gameplay_adapters`` field. The dataclass default
-        (True since PR #74) would silently rehydrate such a legacy
-        output into adapter mode on the next ``--phase write_output``
-        run. To preserve the sticky-rollback contract for pre-PR-#73a
-        outputs, treat a MISSING ``use_gameplay_adapters`` key as
-        ``False`` (legacy mode). New conversions always write the
-        field via ``asdict()`` so this only bites genuinely old
-        ctx files.
         """
         data = json.loads(path.read_text(encoding="utf-8"))
         known = {f.name for f in fields(cls)}
         cleaned = {k: v for k, v in data.items() if k in known}
-        if "use_gameplay_adapters" not in data:
-            cleaned["use_gameplay_adapters"] = False
         return cls(**cleaned)

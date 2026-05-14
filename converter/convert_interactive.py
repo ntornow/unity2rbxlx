@@ -143,7 +143,6 @@ def _make_pipeline(
     skip_upload: bool = False,
     skip_binary_rbxl: bool = False,
     scaffolding: Iterable[str] | None = None,
-    use_gameplay_adapters: bool | None = None,
 ) -> Pipeline:
     """Build a Pipeline and rehydrate ctx from disk if a previous run exists.
 
@@ -156,18 +155,6 @@ def _make_pipeline(
     ``conversion_context.json`` from prior runs — additive so a follow-up
     ``upload`` against an existing assemble doesn't drop the previously
     requested FPS scripts/HUD.
-
-    *use_gameplay_adapters* is the same tri-state the Pipeline
-    constructor takes (PR #74 codex round-1 [P1]): ``None`` means the
-    caller had no preference for this invocation, so the persisted
-    ``ctx.use_gameplay_adapters`` wins on rehydration; ``True`` /
-    ``False`` is an explicit override that beats persisted state.
-    Forwarded twice — once to the constructor (so a fresh ctx picks
-    the right default) AND once AFTER the ``pipeline.ctx = prior_ctx``
-    swap below (so the rehydrated ctx also honours the explicit
-    choice). Codex PR #74 round-1 [P2] flagged that without
-    rebinding, the only interactive entrypoints lose the rollback
-    lever the u2r.py CLI exposes.
     """
     out = Path(output_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -193,7 +180,6 @@ def _make_pipeline(
         skip_upload=skip_upload,
         skip_binary_rbxl=skip_binary_rbxl,
         scaffolding=scaffolding,
-        use_gameplay_adapters=use_gameplay_adapters,
     )
     if ctx_path.exists():
         prior_ctx = ConversionContext.load(ctx_path)
@@ -226,27 +212,6 @@ def _make_pipeline(
         # — the rehydrated ctx may carry persisted entries; the new
         # request adds to them (additive, idempotent).
         pipeline.apply_scaffolding(scaffolding)
-        # Re-apply the caller's EXPLICIT gameplay-adapter choice after
-        # the ctx swap, mirroring :meth:`Pipeline.resume`'s
-        # post-swap re-application. ``None`` means "no preference this
-        # run" so the persisted value stays — that's the sticky
-        # rollback contract codex PR #74 round-1 [P1] anchored on.
-        #
-        # PR #74 codex round-2 [P1]: if the explicit override CHANGES
-        # the persisted value, invalidate the cached transpile output
-        # on disk. ``_subphase_emit_scripts_to_disk`` preserves
-        # ``scripts/`` whenever ``transpile_scripts`` is in
-        # ``completed_phases`` and ``--retranspile`` wasn't passed;
-        # without invalidation, a flip from adapters→legacy (or vice
-        # versa) silently keeps the previous mode's ``.luau`` cache
-        # and the rebuilt place stays in the old mode.
-        if use_gameplay_adapters is not None:
-            mode_changed = (
-                pipeline.ctx.use_gameplay_adapters != use_gameplay_adapters
-            )
-            pipeline.ctx.use_gameplay_adapters = use_gameplay_adapters
-            if mode_changed:
-                pipeline._invalidate_transpile_cache_for_mode_flip()
     return pipeline
 
 
@@ -598,23 +563,8 @@ def materials(unity_project_path: str, output_dir: str) -> None:
               help="Anthropic API key (string or path to a key file).")
 @click.option("--no-ai", is_flag=True,
               help="Disable AI fallback; use rule-based transpilation only.")
-@click.option("--use-gameplay-adapters/--no-use-gameplay-adapters",
-              default=True,
-              help="Route door / projectile / damage patterns through "
-              "the gameplay-adapter pipeline. Default on as of PR #74. "
-              "Mutually exclusive with --legacy-gameplay-packs. Codex "
-              "PR #74 round-5 [P2]: the rollback lever must be on "
-              "``transpile`` too, not only ``assemble`` — interactive "
-              "users review their scripts/ after transpile, and "
-              "operators who intend to finish with --legacy-gameplay-packs "
-              "need the right Luau out of this phase.")
-@click.option("--legacy-gameplay-packs", is_flag=True, default=False,
-              help="Force the legacy script_coherence_packs pipeline. "
-              "Mutually exclusive with --use-gameplay-adapters.")
 def transpile(unity_project_path: str, output_dir: str,
-              api_key: str | None, no_ai: bool,
-              use_gameplay_adapters: bool,
-              legacy_gameplay_packs: bool) -> None:
+              api_key: str | None, no_ai: bool) -> None:
     """Phase 3b: transpile C# scripts to Luau."""
     if api_key:
         ak = Path(api_key)
@@ -623,32 +573,7 @@ def transpile(unity_project_path: str, output_dir: str,
     if no_ai:
         config.USE_AI_TRANSPILATION = False
 
-    # PR #74 codex round-5 [P2]: resolve the gameplay-mode tri-state
-    # the same way ``assemble`` (and ``u2r.py convert``) does. Only
-    # forward an explicit bool when the user passed a flag on the
-    # CLI; otherwise ``None`` so the persisted ctx wins on rehydrate.
-    ctx_click = click.get_current_context()
-    adapter_source = ctx_click.get_parameter_source("use_gameplay_adapters")
-    adapter_explicit = (
-        adapter_source == click.core.ParameterSource.COMMANDLINE
-    )
-    pipeline_use_gameplay_adapters: bool | None
-    if legacy_gameplay_packs:
-        if adapter_explicit and use_gameplay_adapters:
-            raise click.UsageError(
-                "--use-gameplay-adapters and --legacy-gameplay-packs "
-                "are mutually exclusive. Pass exactly one or neither.",
-            )
-        pipeline_use_gameplay_adapters = False
-    elif adapter_explicit:
-        pipeline_use_gameplay_adapters = use_gameplay_adapters
-    else:
-        pipeline_use_gameplay_adapters = None
-
-    pipeline = _make_pipeline(
-        unity_project_path, output_dir,
-        use_gameplay_adapters=pipeline_use_gameplay_adapters,
-    )
+    pipeline = _make_pipeline(unity_project_path, output_dir)
     try:
         _run_through(pipeline, "transpile_scripts")
     except Exception as exc:
@@ -669,16 +594,6 @@ def transpile(unity_project_path: str, output_dir: str,
     # Scoped wipe: clear only top-level stale .luau so animations/,
     # animation_data/, and scriptable_objects/ subdirs written by other
     # phases survive.
-    #
-    # PR #74 codex round-9 [P2]: a mode-flip run that produces zero
-    # transpiled scripts (Unity project no longer has runtime C#
-    # files, or every script matched an adapter and the legacy mode
-    # has no fallback) must STILL wipe the stale previous-mode
-    # ``.luau`` cache. ``_make_pipeline``'s
-    # ``_invalidate_transpile_cache_for_mode_flip()`` sets
-    # ``pipeline._retranspile = True`` whenever the explicit override
-    # differs from the persisted ctx; honour that signal here too,
-    # not just the ``result.scripts`` branch.
     forced_wipe = bool(getattr(pipeline, "_retranspile", False))
     has_scripts = bool(result is not None and getattr(result, "scripts", None))
     if forced_wipe or has_scripts:
@@ -813,26 +728,11 @@ def validate(output_dir: str, write: bool) -> None:
               "HUDController). Default: none. Persisted in "
               "conversion_context.json so subsequent ``upload`` re-runs "
               "against the same output dir reproduce the same scripts.")
-@click.option("--use-gameplay-adapters/--no-use-gameplay-adapters",
-              default=True,
-              help="Route door / projectile / damage patterns through "
-              "the gameplay-adapter pipeline. Default on as of PR #74. "
-              "Mutually exclusive with --legacy-gameplay-packs. Mirrors "
-              "u2r.py convert so interactive assemble has the same "
-              "rollback lever (codex PR #74 round-1 [P2]).")
-@click.option("--legacy-gameplay-packs", is_flag=True, default=False,
-              help="Force the legacy script_coherence_packs pipeline; "
-              "disables every adapter runtime module. Rollback lever "
-              "for the PR #74 default-on flip in the interactive "
-              "assemble flow. Mutually exclusive with "
-              "--use-gameplay-adapters.")
 def assemble(unity_project_path: str, output_dir: str,
              no_upload: bool, no_resolve: bool, retranspile: bool,
              api_key: str | None, creator_id: str | None,
              universe_id: int | None, place_id: int | None,
-             scaffolding: str | None,
-             use_gameplay_adapters: bool,
-             legacy_gameplay_packs: bool) -> None:
+             scaffolding: str | None) -> None:
     """Phase 4: upload assets, resolve, convert animations + scene, write .rbxlx."""
     # Resolve credentials from CLI -> env -> file (same precedence as u2r.py)
     # so users get the documented auto-discovery behavior. Without this,
@@ -873,52 +773,13 @@ def assemble(unity_project_path: str, output_dir: str,
     scaffolding_list = [
         s.strip().lower() for s in (scaffolding or "").split(",") if s.strip()
     ]
-    # Resolve the gameplay-mode tri-state the same way ``u2r.py
-    # convert`` does (codex PR #74 round-1 [P1] / [P2]). Only forward
-    # an explicit bool when the user passed a flag on the CLI —
-    # otherwise ``None`` so a re-assemble of an output originally
-    # converted with ``--legacy-gameplay-packs`` keeps its rollback
-    # choice sticky.
-    ctx_click = click.get_current_context()
-    adapter_source = ctx_click.get_parameter_source("use_gameplay_adapters")
-    adapter_explicit = (
-        adapter_source == click.core.ParameterSource.COMMANDLINE
-    )
-    pipeline_use_gameplay_adapters: bool | None
-    if legacy_gameplay_packs:
-        if adapter_explicit and use_gameplay_adapters:
-            raise click.UsageError(
-                "--use-gameplay-adapters and --legacy-gameplay-packs "
-                "are mutually exclusive. --legacy-gameplay-packs is "
-                "the rollback opt-out for the PR #74 default-on flip; "
-                "pass exactly one or neither.",
-            )
-        pipeline_use_gameplay_adapters = False
-    elif adapter_explicit:
-        pipeline_use_gameplay_adapters = use_gameplay_adapters
-    else:
-        pipeline_use_gameplay_adapters = None
 
     pipeline = _make_pipeline(
         unity_project_path, output_dir,
         skip_upload=no_upload,
         scaffolding=scaffolding_list,
-        use_gameplay_adapters=pipeline_use_gameplay_adapters,
     )
-    # PR #74 codex round-8 [P2]: OR with the existing value rather
-    # than overwrite. ``_make_pipeline`` calls
-    # ``_invalidate_transpile_cache_for_mode_flip()`` when the
-    # explicit gameplay-mode override differs from the persisted
-    # ctx; that sets ``pipeline._retranspile = True`` so
-    # ``_subphase_emit_scripts_to_disk`` wipes the previous mode's
-    # ``scripts/`` cache. An unconditional ``pipeline._retranspile =
-    # retranspile`` write here clobbered that ``True`` back to the
-    # caller's flag — and if ``transpile_scripts`` runs zero scripts
-    # this pass (Unity project no longer has runtime C# files),
-    # the preserve-scripts fallback rehydrates the stale cache.
-    pipeline._retranspile = retranspile or getattr(
-        pipeline, "_retranspile", False,
-    )
+    pipeline._retranspile = retranspile
 
     # Plumb --universe-id / --place-id into ctx so resolve_assets can run
     # headless mesh resolution on the first assemble invocation. Without

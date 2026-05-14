@@ -79,85 +79,6 @@ class OutputSummary:
 
 
 @dataclass
-class GameplayAdapterBinding:
-    """One detector match recorded in ``conversion_report.json`` —
-    everything the operator needs to write a ``.gameplay_deny.txt``
-    line without re-reading the converter source.
-
-    ``source_path`` carries the absolute path of the scene or prefab
-    that produced the binding. Operators write
-    ``<source_path>#<node_file_id>`` to suppress one specific source —
-    bare file_ids alone collide across prefab assets (PR #73b prefab
-    walking exposed e.g. ``Battery_medium_05.prefab`` and
-    ``Antenna_lg.prefab`` both using ``&100000``).
-    """
-    detector_name: str = ""
-    diagnostic_name: str = ""
-    target_class_name: str = ""
-    node_name: str = ""
-    node_file_id: str = ""
-    component_file_id: str = ""
-    script_path: str = ""
-    capability_kinds: list[str] = field(default_factory=list)
-    source_path: str = ""
-
-
-@dataclass
-class GameplayAdapterDivergentBinding:
-    """One of the two bindings that disagreed when a class fell into
-    ``GameplayAdapterDivergence``. Carries enough structure that an
-    operator can write a deny-list line targeting EITHER side without
-    re-parsing the free-form ``detail`` message.
-    """
-    node_name: str = ""
-    node_file_id: str = ""
-    component_file_id: str = ""
-    source_path: str = ""
-
-
-@dataclass
-class GameplayAdapterDivergence:
-    """One class that fell back to AI because its per-node Behaviors
-    diverged. Recorded so operators can see WHY a class they expected
-    to be adapter-handled was left to the AI path.
-    """
-    class_name: str = ""
-    script_path: str = ""
-    detail: str = ""
-    binding_a: GameplayAdapterDivergentBinding = field(
-        default_factory=GameplayAdapterDivergentBinding,
-    )
-    binding_b: GameplayAdapterDivergentBinding = field(
-        default_factory=GameplayAdapterDivergentBinding,
-    )
-
-
-@dataclass
-class GameplayAdapterSummary:
-    """Top-level gameplay-adapter section. Empty by default — only
-    populated when ``--use-gameplay-adapters`` is on and the pass ran.
-
-    Counters distinguish three states for clarity (codex
-    PR #73a-round-3 flagged the prior ``total_classes_matched`` as
-    ambiguous):
-      - ``total_classes_emitted``: classes whose adapter Behavior was
-        rendered into a TranspiledScript (unique by ``script_path``
-        so same-named classes from different .cs files don't collapse).
-      - ``total_classes_divergent``: classes that DID match detection
-        but were dropped because per-node Behaviors diverged. AI
-        handles those.
-      - ``total_bindings``: every (node, component) hit, including
-        multiple bindings of the same emitted class.
-    """
-    enabled: bool = False
-    total_classes_emitted: int = 0
-    total_classes_divergent: int = 0
-    total_bindings: int = 0
-    bindings: list[GameplayAdapterBinding] = field(default_factory=list)
-    divergent_classes: list[GameplayAdapterDivergence] = field(default_factory=list)
-
-
-@dataclass
 class ConversionReport:
     """Top-level conversion report written to disk after a completed run."""
     generated_at: str = field(
@@ -175,9 +96,6 @@ class ConversionReport:
     scene: SceneSummary = field(default_factory=SceneSummary)
     components: ComponentSummary = field(default_factory=ComponentSummary)
     output: OutputSummary = field(default_factory=OutputSummary)
-    gameplay_adapters: GameplayAdapterSummary = field(
-        default_factory=GameplayAdapterSummary,
-    )
 
 
 def generate_report(

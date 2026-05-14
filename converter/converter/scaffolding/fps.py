@@ -22,9 +22,18 @@ specific scaffolding lives under :mod:`converter.scaffolding`.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
+
 from core.roblox_types import RbxScript, RbxScreenGui, RbxUIElement, RbxPlace
 
 log = logging.getLogger(__name__)
+
+# Filesystem location of the AutoFpsEventDispatch ModuleScript body.
+# Lives at the top of ``converter/runtime/`` (no ``gameplay/`` subdir) —
+# matches the pre-PR-#75 layout that PR #80 restored.
+_EVENT_DISPATCH_LUAU = (
+    Path(__file__).resolve().parent.parent.parent / "runtime" / "event_dispatch.luau"
+)
 
 
 def detect_fps_game(place: RbxPlace) -> bool:
@@ -715,12 +724,24 @@ def inject_fps_scripts(place: RbxPlace) -> int:
             "HUD listener already present from prior conversion)"
         )
 
-    # AutoFpsEventDispatch + canonical AutoGen.EventDispatch emission
-    # moved to ``Pipeline._inject_event_dispatch_with_alias`` in PR #75
-    # so the alias and the canonical ModuleScript ship together and the
-    # parent_path is set canonically at the pipeline layer. The HUD
-    # generator still pins ``WaitForChild("AutoFpsEventDispatch")``;
-    # PR #78 retires the alias after one full reconversion cycle.
+    # AutoFpsEventDispatch ModuleScript at ReplicatedStorage. The
+    # generated HUD pins ``WaitForChild("AutoFpsEventDispatch")``; emit
+    # the module here so a ``--scaffolding=fps`` run is self-contained.
+    if not any(s.name == AUTO_FPS_EVENT_DISPATCH_NAME for s in place.scripts):
+        place.scripts.append(
+            RbxScript(
+                name=AUTO_FPS_EVENT_DISPATCH_NAME,
+                source=_EVENT_DISPATCH_LUAU.read_text(encoding="utf-8"),
+                script_type="ModuleScript",
+                parent_path="ReplicatedStorage",
+            )
+        )
+        added += 1
+        log.info("Injected AutoFpsEventDispatch ModuleScript")
+    else:
+        log.info(
+            "Skipping AutoFpsEventDispatch injection (already present)"
+        )
 
     return added
 
