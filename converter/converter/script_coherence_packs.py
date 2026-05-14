@@ -420,6 +420,90 @@ def _inject_fps_rifle_system(scripts: list["RbxScript"]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Pack: template_guard_self_destroying
+# ---------------------------------------------------------------------------
+#
+# Any Script attached to a prefab template under ``ReplicatedStorage.Templates``
+# with ``RunContext = Server`` runs at place load on the template itself —
+# regardless of whether the prefab is ever cloned. If that script destroys
+# its container (``container:Destroy()`` or ``Debris:AddItem(container,
+# fadeTime)``), it nukes the template, and downstream ``:Clone()`` calls
+# return Parts with no children → broken cloned instances OR
+# ``Templates:WaitForChild("...")`` hangs forever.
+#
+# PR #79 fixed this for bullet templates (TurretBullet, PlaneBullet) inside
+# ``bullet_physics_raycast``. But the same class of bug applies to ANY
+# self-destroying script that lands in a template (e.g.
+# ``ParticleSystemDestroyer`` on ``Templates.Explosion`` / ``Templates.Smoke``,
+# which destroys the templates ~6-10s after play start, blocking
+# ``Turret.luau`` from cloning Explosion when it dies). Generalize the
+# template-guard to ANY script with a self-destroying pattern.
+
+_SELF_DESTROY_RE = re.compile(
+    r'container\s*:\s*Destroy\s*\(\s*\)'
+    r'|Debris\s*:\s*AddItem\s*\(\s*container\s*,'
+)
+
+_TEMPLATE_GUARD_MARKER = "_AutoTemplateGuard"
+
+_TEMPLATE_GUARD_BLOCK = '''\
+-- ''' + _TEMPLATE_GUARD_MARKER + ''': bail when this script is running on a
+-- prefab template under ``ReplicatedStorage.Templates``. Server-context
+-- scripts run on the template itself at place load, so any self-destroy
+-- (container:Destroy / Debris:AddItem(container, …)) would nuke the
+-- template and break downstream :Clone() / WaitForChild calls.
+do
+\tlocal _p = script.Parent
+\twhile _p do
+\t\tif _p.Name == "Templates" and _p.Parent
+\t\t\tand _p.Parent:IsA("ReplicatedStorage")
+\t\tthen return end
+\t\t_p = _p.Parent
+\tend
+end
+
+'''
+
+
+def _detect_self_destroying_scripts(scripts: list["RbxScript"]) -> bool:
+    for s in scripts:
+        src = s.source or ""
+        if (
+            _SELF_DESTROY_RE.search(src)
+            and _TEMPLATE_GUARD_MARKER not in src
+        ):
+            return True
+    return False
+
+
+@patch_pack(
+    name="template_guard_self_destroying",
+    description="Prefix any Server-context Script that destroys its "
+    "``container`` (via ``container:Destroy()`` or "
+    "``Debris:AddItem(container, …)``) with a template-guard that "
+    "bails when the script's ancestor chain hits "
+    "``ReplicatedStorage.Templates``. Without this, every prefab "
+    "template script self-destroys at place load — blocking downstream "
+    "``:Clone()`` / ``WaitForChild`` callers.",
+    detect=_detect_self_destroying_scripts,
+)
+def _inject_template_guard(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        src = s.source or ""
+        if (
+            _SELF_DESTROY_RE.search(src)
+            and _TEMPLATE_GUARD_MARKER not in src
+        ):
+            s.source = _TEMPLATE_GUARD_BLOCK + src
+            fixes += 1
+            log.info(
+                "  Prefixed template-guard in self-destroying '%s'", s.name,
+            )
+    return fixes
+
+
+# ---------------------------------------------------------------------------
 # Pack: pickup_remote_event
 # ---------------------------------------------------------------------------
 
