@@ -420,6 +420,90 @@ def _inject_fps_rifle_system(scripts: list["RbxScript"]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Pack: template_guard_self_destroying
+# ---------------------------------------------------------------------------
+#
+# Any Script attached to a prefab template under ``ReplicatedStorage.Templates``
+# with ``RunContext = Server`` runs at place load on the template itself —
+# regardless of whether the prefab is ever cloned. If that script destroys
+# its container (``container:Destroy()`` or ``Debris:AddItem(container,
+# fadeTime)``), it nukes the template, and downstream ``:Clone()`` calls
+# return Parts with no children → broken cloned instances OR
+# ``Templates:WaitForChild("...")`` hangs forever.
+#
+# PR #79 fixed this for bullet templates (TurretBullet, PlaneBullet) inside
+# ``bullet_physics_raycast``. But the same class of bug applies to ANY
+# self-destroying script that lands in a template (e.g.
+# ``ParticleSystemDestroyer`` on ``Templates.Explosion`` / ``Templates.Smoke``,
+# which destroys the templates ~6-10s after play start, blocking
+# ``Turret.luau`` from cloning Explosion when it dies). Generalize the
+# template-guard to ANY script with a self-destroying pattern.
+
+_SELF_DESTROY_RE = re.compile(
+    r'container\s*:\s*Destroy\s*\(\s*\)'
+    r'|Debris\s*:\s*AddItem\s*\(\s*container\s*,'
+)
+
+_TEMPLATE_GUARD_MARKER = "_AutoTemplateGuard"
+
+_TEMPLATE_GUARD_BLOCK = '''\
+-- ''' + _TEMPLATE_GUARD_MARKER + ''': bail when this script is running on a
+-- prefab template under ``ReplicatedStorage.Templates``. Server-context
+-- scripts run on the template itself at place load, so any self-destroy
+-- (container:Destroy / Debris:AddItem(container, …)) would nuke the
+-- template and break downstream :Clone() / WaitForChild calls.
+do
+\tlocal _p = script.Parent
+\twhile _p do
+\t\tif _p.Name == "Templates" and _p.Parent
+\t\t\tand _p.Parent:IsA("ReplicatedStorage")
+\t\tthen return end
+\t\t_p = _p.Parent
+\tend
+end
+
+'''
+
+
+def _detect_self_destroying_scripts(scripts: list["RbxScript"]) -> bool:
+    for s in scripts:
+        src = s.source or ""
+        if (
+            _SELF_DESTROY_RE.search(src)
+            and _TEMPLATE_GUARD_MARKER not in src
+        ):
+            return True
+    return False
+
+
+@patch_pack(
+    name="template_guard_self_destroying",
+    description="Prefix any Server-context Script that destroys its "
+    "``container`` (via ``container:Destroy()`` or "
+    "``Debris:AddItem(container, …)``) with a template-guard that "
+    "bails when the script's ancestor chain hits "
+    "``ReplicatedStorage.Templates``. Without this, every prefab "
+    "template script self-destroys at place load — blocking downstream "
+    "``:Clone()`` / ``WaitForChild`` callers.",
+    detect=_detect_self_destroying_scripts,
+)
+def _inject_template_guard(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        src = s.source or ""
+        if (
+            _SELF_DESTROY_RE.search(src)
+            and _TEMPLATE_GUARD_MARKER not in src
+        ):
+            s.source = _TEMPLATE_GUARD_BLOCK + src
+            fixes += 1
+            log.info(
+                "  Prefixed template-guard in self-destroying '%s'", s.name,
+            )
+    return fixes
+
+
+# ---------------------------------------------------------------------------
 # Pack: pickup_remote_event
 # ---------------------------------------------------------------------------
 
@@ -596,6 +680,35 @@ def _convert_pickup_to_remote_event(scripts: list["RbxScript"]) -> int:
                 "  Promoted %d Pickup script:GetAttribute reads to walk-up search",
                 count2,
             )
+
+        # AI non-determinism: on some runs the transpiler emits the raw
+        # default ``local itemName = ""`` instead of
+        # ``script:GetAttribute("itemName")``. The above ``attr_pattern``
+        # only catches the latter shape, so the raw-default Pickup ends
+        # up firing the RemoteEvent with an empty itemName. Catch the
+        # raw-default case for the known Pickup serialized fields by
+        # name and rewrite to the same walk-up search the GetAttribute
+        # branch produces. Field allow-list is conservative — only
+        # known Unity Pickup.cs serialized fields are touched.
+        for field_name in ("itemName",):
+            raw_default_re = re.compile(
+                r'(local\s+' + field_name + r'\s*=\s*)"[^"]*"\s*$',
+                re.MULTILINE,
+            )
+            walk_up = (
+                r'\1(function() local _c=script.Parent; '
+                r'while _c do local v=_c:GetAttribute("' + field_name + r'"); '
+                r'if v ~= nil then return v end; _c=_c.Parent end; '
+                r'return "" end)()'
+            )
+            new_src3, count3 = raw_default_re.subn(walk_up, s.source)
+            if count3:
+                s.source = new_src3
+                fixes += count3
+                log.info(
+                    "  Promoted %d Pickup raw-default %r to walk-up search",
+                    count3, field_name,
+                )
 
         # Direct-RemoteEvent path: Pickups that already use FireClient
         # (``_PICKUP_REPLACEMENT`` body, hand-written shapes) skip the
@@ -1317,6 +1430,82 @@ def _fix_door_module_player_lookup(scripts: list["RbxScript"]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Pack: door_direct_character_attribute
+# ---------------------------------------------------------------------------
+#
+# Third AI-transpile shape for Unity's ``other.GetComponent<Player>().hasKey``
+# probe (after ``_G.Player.hasKey`` and the ``getPlayerMod()`` helper).
+# The AI sometimes emits a direct character-attribute read:
+#
+#   if char:GetAttribute("HasKey") then ... end
+#
+# Same coupling failure as the other two shapes:
+#   1. Pickup's coherence pack writes ``player:SetAttribute("has"..itemName, true)``
+#      on the Players[] instance (replicates server-side). It does NOT
+#      write to the character Model.
+#   2. ``HasKey`` (capital H) doesn't match what the Pickup pack writes
+#      (``hasKey``, lowercase). Even if the read target were right,
+#      the attribute name would mismatch.
+#
+# Rewrite to derive the Player instance from the character and read
+# the (lowercase) ``has<Suffix>`` attribute Pickup actually writes.
+
+_DOOR_DIRECT_ATTR_RE = re.compile(
+    r'([a-zA-Z_]\w*)\s*:\s*GetAttribute\(\s*"[Hh]as(\w+)"\s*\)'
+)
+
+
+def _detect_door_direct_character_attribute(scripts: list["RbxScript"]) -> bool:
+    for s in scripts:
+        if s.name != "Door":
+            continue
+        src = s.source or ""
+        if _DOOR_DIRECT_ATTR_RE.search(src):
+            return True
+    return False
+
+
+@patch_pack(
+    name="door_direct_character_attribute",
+    description="Rewrite ``<char>:GetAttribute('HasX')`` direct reads in "
+    "Door scripts to derive the Player instance from the character and "
+    "read the lowercase ``hasX`` attribute the Pickup coherence pack "
+    "writes server-side. Door runs server-side; character attributes "
+    "set by client LocalScripts don't replicate, so the read returns "
+    "nil and the door never opens.",
+    detect=_detect_door_direct_character_attribute,
+    after=("pickup_remote_event_server",),
+)
+def _fix_door_direct_character_attribute(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        if s.name != "Door":
+            continue
+        original = s.source
+
+        def _replace(m: "re.Match[str]") -> str:
+            char_var = m.group(1)
+            suffix = m.group(2)
+            attr = "has" + suffix
+            # Inline IIFE so the rewrite fits any expression position
+            # (condition, return, assignment). Players service is
+            # already imported at the top of Door.luau by api_mappings.
+            return (
+                f'(function() local _p = '
+                f'game:GetService("Players"):GetPlayerFromCharacter({char_var}); '
+                f'return _p and _p:GetAttribute("{attr}") == true end)()'
+            )
+
+        s.source = _DOOR_DIRECT_ATTR_RE.sub(_replace, s.source)
+        if s.source != original:
+            fixes += 1
+            log.info(
+                "  Rewrote Door direct char-attribute reads in '%s'", s.name,
+            )
+    return fixes
+
+
+# ---------------------------------------------------------------------------
 # Pack: fps_default_controls_off
 # ---------------------------------------------------------------------------
 
@@ -1907,15 +2096,17 @@ def _inject_door_tween(scripts: list["RbxScript"]) -> int:
 #     the current to catch tunnel-through hits
 #   - Adds a visible ``Trail`` so the trajectory reads in-game
 
-# Match ANY local-variable ApplyImpulse / Touched:Connect — the AI
-# transpile of Unity's bullet scripts uses different local names
-# across runs (``rootPart``, ``rb``, ``part``, ``container``, etc.).
-# Codex round-2 found PlaneBullet skipped because the prior regex
-# only matched the literal ``rootPart`` form. The bullet-name scope
-# (``TurretBullet`` / ``PlaneBullet`` only) still gates the pack
-# from touching unrelated impulse-using scripts.
+# Match ANY local-variable ApplyImpulse / AssemblyLinearVelocity write —
+# the AI transpile of Unity's bullet scripts uses different local names
+# across runs (``rootPart``, ``rb``, ``part``, ``container``, etc.) AND
+# different physics-init shapes (``:ApplyImpulse(...)`` vs direct
+# ``.AssemblyLinearVelocity = ...`` assignment). Codex round-2 caught
+# the local-name variance for PlaneBullet; this also covers the
+# AssemblyLinearVelocity shape observed in TurretBullet outputs. The
+# bullet-name scope (``TurretBullet`` / ``PlaneBullet`` only) still
+# gates the pack from touching unrelated velocity-writing scripts.
 _BULLET_DETECT_RE = re.compile(
-    r'\b\w+\s*:\s*ApplyImpulse\s*\(',
+    r'\b\w+\s*:\s*ApplyImpulse\s*\(|\b\w+\.AssemblyLinearVelocity\s*=',
 )
 _BULLET_TOUCHED_RE = re.compile(
     r'\b\w+\.Touched\s*:\s*Connect\b',
