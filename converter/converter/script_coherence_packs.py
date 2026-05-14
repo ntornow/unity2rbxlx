@@ -597,6 +597,35 @@ def _convert_pickup_to_remote_event(scripts: list["RbxScript"]) -> int:
                 count2,
             )
 
+        # AI non-determinism: on some runs the transpiler emits the raw
+        # default ``local itemName = ""`` instead of
+        # ``script:GetAttribute("itemName")``. The above ``attr_pattern``
+        # only catches the latter shape, so the raw-default Pickup ends
+        # up firing the RemoteEvent with an empty itemName. Catch the
+        # raw-default case for the known Pickup serialized fields by
+        # name and rewrite to the same walk-up search the GetAttribute
+        # branch produces. Field allow-list is conservative — only
+        # known Unity Pickup.cs serialized fields are touched.
+        for field_name in ("itemName",):
+            raw_default_re = re.compile(
+                r'(local\s+' + field_name + r'\s*=\s*)"[^"]*"\s*$',
+                re.MULTILINE,
+            )
+            walk_up = (
+                r'\1(function() local _c=script.Parent; '
+                r'while _c do local v=_c:GetAttribute("' + field_name + r'"); '
+                r'if v ~= nil then return v end; _c=_c.Parent end; '
+                r'return "" end)()'
+            )
+            new_src3, count3 = raw_default_re.subn(walk_up, s.source)
+            if count3:
+                s.source = new_src3
+                fixes += count3
+                log.info(
+                    "  Promoted %d Pickup raw-default %r to walk-up search",
+                    count3, field_name,
+                )
+
         # Direct-RemoteEvent path: Pickups that already use FireClient
         # (``_PICKUP_REPLACEMENT`` body, hand-written shapes) skip the
         # legacy SetAttribute -> FireClient rewrite above. Inject the
@@ -1312,6 +1341,82 @@ def _fix_door_module_player_lookup(scripts: list["RbxScript"]) -> int:
             fixes += 1
             log.info(
                 "  Rewrote Door module-Player gameplay-flag lookups in '%s'", s.name,
+            )
+    return fixes
+
+
+# ---------------------------------------------------------------------------
+# Pack: door_direct_character_attribute
+# ---------------------------------------------------------------------------
+#
+# Third AI-transpile shape for Unity's ``other.GetComponent<Player>().hasKey``
+# probe (after ``_G.Player.hasKey`` and the ``getPlayerMod()`` helper).
+# The AI sometimes emits a direct character-attribute read:
+#
+#   if char:GetAttribute("HasKey") then ... end
+#
+# Same coupling failure as the other two shapes:
+#   1. Pickup's coherence pack writes ``player:SetAttribute("has"..itemName, true)``
+#      on the Players[] instance (replicates server-side). It does NOT
+#      write to the character Model.
+#   2. ``HasKey`` (capital H) doesn't match what the Pickup pack writes
+#      (``hasKey``, lowercase). Even if the read target were right,
+#      the attribute name would mismatch.
+#
+# Rewrite to derive the Player instance from the character and read
+# the (lowercase) ``has<Suffix>`` attribute Pickup actually writes.
+
+_DOOR_DIRECT_ATTR_RE = re.compile(
+    r'([a-zA-Z_]\w*)\s*:\s*GetAttribute\(\s*"[Hh]as(\w+)"\s*\)'
+)
+
+
+def _detect_door_direct_character_attribute(scripts: list["RbxScript"]) -> bool:
+    for s in scripts:
+        if s.name != "Door":
+            continue
+        src = s.source or ""
+        if _DOOR_DIRECT_ATTR_RE.search(src):
+            return True
+    return False
+
+
+@patch_pack(
+    name="door_direct_character_attribute",
+    description="Rewrite ``<char>:GetAttribute('HasX')`` direct reads in "
+    "Door scripts to derive the Player instance from the character and "
+    "read the lowercase ``hasX`` attribute the Pickup coherence pack "
+    "writes server-side. Door runs server-side; character attributes "
+    "set by client LocalScripts don't replicate, so the read returns "
+    "nil and the door never opens.",
+    detect=_detect_door_direct_character_attribute,
+    after=("pickup_remote_event_server",),
+)
+def _fix_door_direct_character_attribute(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        if s.name != "Door":
+            continue
+        original = s.source
+
+        def _replace(m: "re.Match[str]") -> str:
+            char_var = m.group(1)
+            suffix = m.group(2)
+            attr = "has" + suffix
+            # Inline IIFE so the rewrite fits any expression position
+            # (condition, return, assignment). Players service is
+            # already imported at the top of Door.luau by api_mappings.
+            return (
+                f'(function() local _p = '
+                f'game:GetService("Players"):GetPlayerFromCharacter({char_var}); '
+                f'return _p and _p:GetAttribute("{attr}") == true end)()'
+            )
+
+        s.source = _DOOR_DIRECT_ATTR_RE.sub(_replace, s.source)
+        if s.source != original:
+            fixes += 1
+            log.info(
+                "  Rewrote Door direct char-attribute reads in '%s'", s.name,
             )
     return fixes
 
