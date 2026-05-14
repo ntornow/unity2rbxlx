@@ -1534,6 +1534,98 @@ class TestTriggerStayPollingPack:
         assert second == 0
 
 
+class TestDoorStripAiRotation:
+    """The ``door_strip_ai_rotation`` pack removes the AI-invented
+    ``tweenDoor`` / ``doorBaseCF`` rotation idiom from Door.luau.
+    Unity Door.cs only flips an Animator parameter; the actual motion
+    comes from the Animator clip (translated by the animation phase
+    into ``Anim_*_door_open``). The AI's rotation tween on the same
+    MeshPart fights the translation tween and the door visibly jitters.
+    """
+
+    @staticmethod
+    def _door_with_ai_rotation() -> RbxScript:
+        return RbxScript(
+            name="Door",
+            source=(
+                'local TweenService = game:GetService("TweenService")\n'
+                'local container = script.Parent\n'
+                'local function findDoor()\n'
+                '    local p = container.Parent\n'
+                '    return p and p:FindFirstChild("door")\n'
+                'end\n'
+                'local doorBaseCF = nil\n'
+                'local function captureDoorBase()\n'
+                '    local door = findDoor()\n'
+                '    if not door then return end\n'
+                '    doorBaseCF = door.CFrame\n'
+                'end\n'
+                'captureDoorBase()\n'
+                'local function tweenDoor(open)\n'
+                '    local door = findDoor()\n'
+                '    if not door or not doorBaseCF then return end\n'
+                '    local target = doorBaseCF * CFrame.Angles(0, math.rad(open and 90 or 0), 0)\n'
+                '    TweenService:Create(door, TweenInfo.new(0.5), {CFrame = target}):Play()\n'
+                'end\n'
+                'local function toggleDoor(value)\n'
+                '    local door = findDoor()\n'
+                '    if door then\n'
+                '        door:SetAttribute("open", value)\n'
+                '        tweenDoor(value)\n'
+                '    end\n'
+                'end\n'
+            ),
+            script_type="Script",
+        )
+
+    def test_detector_matches_ai_rotation_signature(self) -> None:
+        assert packs_module._detect_door_ai_rotation(
+            [self._door_with_ai_rotation()]
+        ) is True
+
+    def test_detector_skips_door_without_rotation(self) -> None:
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local container = script.Parent\n'
+                'local function toggleDoor(value)\n'
+                '    container:SetAttribute("open", value)\n'
+                'end\n'
+            ),
+            script_type="Script",
+        )
+        assert packs_module._detect_door_ai_rotation([s]) is False
+
+    def test_detector_skips_non_door_script(self) -> None:
+        s = RbxScript(
+            name="Spinner",
+            source='local cf = base * CFrame.Angles(0, math.rad(90), 0)\n',
+            script_type="Script",
+        )
+        assert packs_module._detect_door_ai_rotation([s]) is False
+
+    def test_apply_strips_rotation_and_preserves_setattribute(self) -> None:
+        s = self._door_with_ai_rotation()
+        fixes = packs_module._strip_door_ai_rotation([s])
+        assert fixes == 1
+        # Rotation idiom is gone
+        assert "doorBaseCF" not in s.source
+        assert "CFrame.Angles" not in s.source
+        assert "tweenDoor" not in s.source
+        assert "captureDoorBase" not in s.source
+        # The attribute write — which the animation driver listens to — survives
+        assert 'door:SetAttribute("open", value)' in s.source
+        # toggleDoor itself survives
+        assert "local function toggleDoor" in s.source
+
+    def test_apply_is_idempotent(self) -> None:
+        s = self._door_with_ai_rotation()
+        first = packs_module._strip_door_ai_rotation([s])
+        second = packs_module._strip_door_ai_rotation([s])
+        assert first == 1
+        assert second == 0
+
+
 class TestDoorTweenOpen:
     """The ``door_tween_open`` pack appends a TweenService listener to
     Door.luau so the sibling ``door`` mesh actually slides on attribute

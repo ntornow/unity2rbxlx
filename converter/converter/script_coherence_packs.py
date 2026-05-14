@@ -1506,6 +1506,104 @@ def _fix_door_direct_character_attribute(scripts: list["RbxScript"]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Pack: door_strip_ai_rotation
+# ---------------------------------------------------------------------------
+#
+# Unity's Door.cs::ToggleDoor only calls ``doorAnim.SetBool("open", value)``
+# — the Animator clip (``open.anim``) does the actual movement, which is
+# a +4m Y translation. The animation phase emits ``Anim_<Prefab>_door_open``
+# in ServerScriptService that listens to the ``open`` attribute and tweens
+# +14.28 studs Y.
+#
+# But the AI transpiler often *invents* its own door motion in Door.luau:
+# a ``tweenDoor`` helper that rotates the door 90° around Y via
+# ``CFrame.Angles``, captured against a ``doorBaseCF`` baseline. That
+# rotation fights the translation tween from ``Anim_*_door_open`` —
+# two TweenService tweens on the same ``door.CFrame`` overwrite each
+# other every frame, and the user sees the door spin in place / jitter
+# instead of sliding up.
+#
+# Strip the AI-invented rotation so the only motion comes from the
+# animation driver (or, when none exists, from the ``door_tween_open``
+# pack's injected fallback). The visible ``door:SetAttribute("open",
+# value)`` write is preserved — both the animation driver and the
+# fallback rely on it firing.
+
+_DOOR_BASE_CF_DECL_RE = re.compile(
+    r"^local doorBaseCF\s*=\s*nil\s*\n", re.MULTILINE,
+)
+_DOOR_CAPTURE_FN_RE = re.compile(
+    r"^local function captureDoorBase\s*\([^)]*\)\s*\n[\s\S]*?^end\s*\n",
+    re.MULTILINE,
+)
+_DOOR_CAPTURE_CALL_RE = re.compile(
+    r"^captureDoorBase\(\)\s*\n", re.MULTILINE,
+)
+_DOOR_TWEEN_FN_RE = re.compile(
+    r"^local function tweenDoor\s*\([^)]*\)\s*\n[\s\S]*?^end\s*\n",
+    re.MULTILINE,
+)
+_DOOR_TWEEN_CALL_RE = re.compile(
+    r"^[ \t]*tweenDoor\([^)]*\)\s*\n", re.MULTILINE,
+)
+_DOOR_ROTATION_SIGNATURE_RE = re.compile(
+    r"doorBaseCF\s*\*\s*CFrame\.Angles"
+)
+
+
+def _detect_door_ai_rotation(scripts: list["RbxScript"]) -> bool:
+    """Pack runs on any Door script that contains the
+    ``doorBaseCF * CFrame.Angles(...)`` rotation idiom — the unmistakable
+    signature of the AI-invented door swing. Avoids matching the
+    project-level ``door_tween_open`` injection (which uses Vector3
+    translation, not CFrame.Angles)."""
+    for s in scripts:
+        if s.name != "Door":
+            continue
+        if _DOOR_ROTATION_SIGNATURE_RE.search(s.source or ""):
+            return True
+    return False
+
+
+@patch_pack(
+    name="door_strip_ai_rotation",
+    description="Strip the AI-invented ``tweenDoor`` / ``doorBaseCF`` "
+    "rotation idiom from Door scripts. Unity Door.cs only flips an "
+    "Animator parameter; the actual door motion comes from the "
+    "Animator clip, which the converter translates into a "
+    "translation tween (Anim_*_door_open). The AI's extra 90° "
+    "rotation tween on the same MeshPart fights the translation, so "
+    "the door visibly jitters / does not slide open. Strip is "
+    "narrow: only removes the rotation helpers and call site; the "
+    "``door:SetAttribute(\"open\", value)`` write is preserved.",
+    detect=_detect_door_ai_rotation,
+    after=("door_direct_character_attribute",),
+)
+def _strip_door_ai_rotation(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        if s.name != "Door":
+            continue
+        if not _DOOR_ROTATION_SIGNATURE_RE.search(s.source or ""):
+            continue
+        original = s.source
+        src = original
+        src = _DOOR_TWEEN_CALL_RE.sub("", src)
+        src = _DOOR_TWEEN_FN_RE.sub("", src)
+        src = _DOOR_CAPTURE_CALL_RE.sub("", src)
+        src = _DOOR_CAPTURE_FN_RE.sub("", src)
+        src = _DOOR_BASE_CF_DECL_RE.sub("", src)
+        if src != original:
+            s.source = src
+            fixes += 1
+            log.info(
+                "  Stripped AI-invented rotation tween from Door '%s'",
+                s.name,
+            )
+    return fixes
+
+
+# ---------------------------------------------------------------------------
 # Pack: fps_default_controls_off
 # ---------------------------------------------------------------------------
 
