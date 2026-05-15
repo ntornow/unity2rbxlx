@@ -1106,26 +1106,30 @@ def generate_place_luau_chunked(
     mesh_cache: dict[str, str] | None = None,
     max_chunk_bytes: int = 3_500_000,
 ) -> list[str]:
-    """Generate chunked Luau scripts for large projects.
+    """Generate Luau scripts for a place, in execute_luau-sized chunks.
 
-    If the single script exceeds max_chunk_bytes, splits into:
-    - Chunk 1: Setup + first N parts + SavePlaceAsync
-    - Chunk 2: More parts + SavePlaceAsync
-    - ...
-    - Last chunk: Scripts + UI + SavePlaceAsync
+    Returns a list of script strings. When the generated script fits
+    under ``max_chunk_bytes`` the list has one entry; otherwise the
+    list contains a single oversized entry that the caller's per-chunk
+    size guard (``place_publisher._publish_chunks``) will reject with
+    ``PublishResult.exceeded_limit=True`` and a clear error.
 
-    Returns a list of script strings, each under max_chunk_bytes.
+    Real tree-splitting chunking is unimplemented (see comment below).
+    Honesty matters: we surface the single oversized entry so the
+    upstream guard fires, rather than pretending we'd successfully
+    chunked the payload.
     """
     full_script = generate_place_luau(place, mesh_cache)
     if len(full_script.encode("utf-8")) <= max_chunk_bytes:
         return [full_script]
 
-    log.info("Script too large (%.1f MB), splitting into chunks...",
-             len(full_script) / (1024 * 1024))
-
-    # For now, just return the full script with a warning.
-    # Full chunking support requires splitting the part tree, which is
-    # complex. The 4MB limit supports ~2000 parts per chunk.
+    log.warning(
+        "Generated place builder is %.1f MB — exceeds the per-chunk "
+        "%.1f MB target. Tree-aware splitting is not yet implemented; "
+        "place_publisher will reject this payload with exceeded_limit.",
+        len(full_script.encode("utf-8")) / (1024 * 1024),
+        max_chunk_bytes / (1024 * 1024),
+    )
     return [full_script]
 
 

@@ -1140,3 +1140,60 @@ class TestFixEmptyMeshParts:
         collider = model.children[1]
         # Has meaningful size — left visible
         assert collider.transparency == 0.0
+
+
+class TestFindCameraWorldTransform:
+    """``_find_camera`` used to read ``node.position`` / ``node.rotation``
+    directly — those are LOCAL transforms, so a camera parented under a
+    rotated/translated rig (typical FPS rig setup) landed at the wrong
+    world CFrame. Pin the contract that ancestor transforms compose.
+    """
+
+    def test_camera_under_translated_parent_uses_world_position(self):
+        from converter.scene_converter import _find_camera
+        from core.unity_types import SceneNode, ParsedScene
+        import config
+
+        class FakeCamera:
+            component_type = "Camera"
+            properties = {}
+
+        parent = SceneNode(
+            name="Rig",
+            file_id="parent",
+            active=True,
+            layer=0,
+            tag="Untagged",
+            components=[],
+            parent_file_id=None,
+            position=(10.0, 0.0, 0.0),
+            rotation=(0.0, 0.0, 0.0, 1.0),
+            scale=(1.0, 1.0, 1.0),
+        )
+        camera = SceneNode(
+            name="Camera",
+            file_id="cam",
+            active=True,
+            layer=0,
+            tag="Untagged",
+            components=[FakeCamera()],
+            parent_file_id="parent",
+            position=(0.0, 0.0, 0.0),
+            rotation=(0.0, 0.0, 0.0, 1.0),
+            scale=(1.0, 1.0, 1.0),
+        )
+        scene = ParsedScene(
+            scene_path=None,
+            all_nodes={"parent": parent, "cam": camera},
+            roots=[parent],
+        )
+        cfg = _find_camera(scene)
+        assert cfg is not None
+        # Parent at world x=10 (Unity), camera at local origin. Roblox X
+        # preserves the value but the world composition matters: a
+        # local-only read would put the camera at world x=0.
+        expected_x = 10.0 * config.STUDS_PER_METER
+        assert abs(cfg.cframe.x - expected_x) < 1e-3, (
+            f"Camera world X should reflect parent translation. "
+            f"Got {cfg.cframe.x}, expected {expected_x}"
+        )

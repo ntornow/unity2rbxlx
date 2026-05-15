@@ -1914,14 +1914,37 @@ def convert_skinned_mesh_renderer(
                 continue
 
         # Build C0: offset from parent bone center to joint (in parent's local space)
-        # The bone's local position relative to its parent IS the joint offset
+        # The bone's local position relative to its parent IS the joint offset.
+        # The local ROTATION must also flow through — bones with non-identity
+        # rest rotations (arms/spines/fingers are the obvious cases) get the
+        # wrong joint basis without it, and the rig starts from a pose that
+        # doesn't match the source FBX bind pose. Convert the Unity-quat to
+        # Roblox handedness, then bake the rotation matrix into C0.
         import config
+        from core.coordinate_system import (
+            unity_quat_to_roblox_quat,
+            quaternion_to_rotation_matrix,
+        )
         px = float(bone["pos"].get("x", 0.0)) * config.STUDS_PER_METER
         py = float(bone["pos"].get("y", 0.0)) * config.STUDS_PER_METER
         # Negate Z for Unity->Roblox coordinate conversion
         pz = -float(bone["pos"].get("z", 0.0)) * config.STUDS_PER_METER
 
-        c0 = RbxCFrame(x=px, y=py, z=pz)
+        rx = float(bone["rot"].get("x", 0.0))
+        ry = float(bone["rot"].get("y", 0.0))
+        rz = float(bone["rot"].get("z", 0.0))
+        rw = float(bone["rot"].get("w", 1.0))
+        rbx_qx, rbx_qy, rbx_qz, rbx_qw = unity_quat_to_roblox_quat(rx, ry, rz, rw)
+        r00, r01, r02, r10, r11, r12, r20, r21, r22 = (
+            quaternion_to_rotation_matrix(rbx_qx, rbx_qy, rbx_qz, rbx_qw)
+        )
+
+        c0 = RbxCFrame(
+            x=px, y=py, z=pz,
+            r00=r00, r01=r01, r02=r02,
+            r10=r10, r11=r11, r12=r12,
+            r20=r20, r21=r21, r22=r22,
+        )
 
         # C1 is identity (joint is at child bone's origin)
         c1 = RbxCFrame()
