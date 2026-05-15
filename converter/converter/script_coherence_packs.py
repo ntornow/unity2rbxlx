@@ -2114,10 +2114,26 @@ def _publish_producer_consumer_events(scripts: list["RbxScript"]) -> int:
     # Step 1: collect every event name the consumer side looks up in
     # ReplicatedStorage. Capitalized first letter to filter out variable
     # references like ``FindFirstChild(name)``.
+    #
+    # Track which consumer names look like they need a *Remote*Event
+    # (consumer uses ``OnClientEvent`` / ``OnServerEvent``) — we must
+    # NOT publish a BindableEvent under those names: BindableEvent has
+    # no OnClientEvent, the bridge would silently fail at runtime.
     consumer_names: set[str] = set()
+    remote_only_names: set[str] = set()
     for s in scripts:
-        for m in _RS_EVENT_LOOKUP_RE.finditer(s.source or ""):
-            consumer_names.add(m.group(1))
+        src = s.source or ""
+        for m in _RS_EVENT_LOOKUP_RE.finditer(src):
+            name = m.group(1)
+            consumer_names.add(name)
+            # If the consumer-side script uses an OnClientEvent /
+            # OnServerEvent connect against this name (via the lookup
+            # result's variable), flag the name as RemoteEvent-only.
+            # Cheap match: any ``OnClientEvent`` / ``OnServerEvent``
+            # occurrence in the same script is enough; producers under
+            # the same name will be skipped.
+            if "OnClientEvent" in src or "OnServerEvent" in src:
+                remote_only_names.add(name)
 
     if not consumer_names:
         return 0
@@ -2145,6 +2161,20 @@ def _publish_producer_consumer_events(scripts: list["RbxScript"]) -> int:
             candidates = {stem, stem + "Event"}
             for cand in candidates:
                 if cand in consumer_names:
+                    if cand in remote_only_names:
+                        # Consumer expects ``OnClientEvent`` /
+                        # ``OnServerEvent``, which BindableEvent does
+                        # not implement. Skip the publish — leaving the
+                        # producer untouched is safer than wiring a
+                        # BindableEvent into a RemoteEvent-shaped
+                        # consumer.
+                        log.debug(
+                            "  Skipping BindableEvent publish for '%s' "
+                            "→ '%s' in '%s': consumer uses "
+                            "On(Client|Server)Event (RemoteEvent only)",
+                            var, cand, s.name,
+                        )
+                        continue
                     published[var] = cand
                     break
 

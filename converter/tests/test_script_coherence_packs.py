@@ -2651,6 +2651,79 @@ class TestPlayerDamageRemoteEvent:
         )
 
 
+class TestProducerConsumerBindableEventGuard:
+    """``producer_consumer_bindable_events`` publishes a producer's
+    anonymous BindableEvent into ReplicatedStorage under the consumer's
+    expected name. But if the consumer uses ``OnClientEvent`` /
+    ``OnServerEvent`` (RemoteEvent-only API), the publish would wire a
+    BindableEvent into a RemoteEvent-shaped consumer — silently breaking
+    the bridge. The pack must skip in that case.
+    """
+
+    def test_skips_publish_when_consumer_uses_onclientevent(self) -> None:
+        from converter.script_coherence_packs import run_packs
+
+        producer = RbxScript(
+            name="Producer",
+            source=(
+                'local healthUpdateEvent = Instance.new("BindableEvent")\n'
+                'healthUpdateEvent:Fire(100)\n'
+            ),
+            script_type="Script",
+        )
+        consumer = RbxScript(
+            name="Consumer",
+            source=(
+                'local ReplicatedStorage = game:GetService("ReplicatedStorage")\n'
+                'local evt = ReplicatedStorage:WaitForChild("HealthUpdate")\n'
+                'evt.OnClientEvent:Connect(function(value) print(value) end)\n'
+            ),
+            script_type="LocalScript",
+        )
+        run_packs(
+            [producer, consumer],
+            enabled={"producer_consumer_bindable_events"},
+        )
+        # Producer source must NOT have been rewritten to publish into
+        # ReplicatedStorage — that would wire a BindableEvent into a
+        # consumer that calls OnClientEvent (which BindableEvent lacks).
+        assert "ReplicatedStorage" not in producer.source
+        assert ".Name =" not in producer.source
+
+    def test_publishes_when_consumer_uses_event_connect(self) -> None:
+        """BindableEvent's ``.Event:Connect`` is the same-process API,
+        so a producer/consumer pair using BindableEvent semantics SHOULD
+        still be bridged — only the OnClientEvent/OnServerEvent shape
+        is incompatible.
+        """
+        from converter.script_coherence_packs import run_packs
+
+        producer = RbxScript(
+            name="Producer",
+            source=(
+                'local pauseEvent = Instance.new("BindableEvent")\n'
+                'pauseEvent:Fire()\n'
+            ),
+            script_type="Script",
+        )
+        consumer = RbxScript(
+            name="Consumer",
+            source=(
+                'local ReplicatedStorage = game:GetService("ReplicatedStorage")\n'
+                'local evt = ReplicatedStorage:WaitForChild("Pause")\n'
+                'evt.Event:Connect(function() print("paused") end)\n'
+            ),
+            script_type="Script",
+        )
+        run_packs(
+            [producer, consumer],
+            enabled={"producer_consumer_bindable_events"},
+        )
+        # Producer must have been rewritten to publish under "Pause".
+        assert 'pauseEvent.Name = "Pause"' in producer.source
+        assert "ReplicatedStorage" in producer.source
+
+
 class TestTouchCallbackRangeStringBlanking:
     """``_touch_callback_ranges`` walks block-open/end keyword tokens with
     a depth counter. Without blanking string literals, a Luau keyword
