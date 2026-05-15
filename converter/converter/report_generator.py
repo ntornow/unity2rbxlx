@@ -96,6 +96,11 @@ class ConversionReport:
     scene: SceneSummary = field(default_factory=SceneSummary)
     components: ComponentSummary = field(default_factory=ComponentSummary)
     output: OutputSummary = field(default_factory=OutputSummary)
+    # Output of converter/semantic_validators.run_semantic_validators —
+    # shape is ``{total: int, counts_by_rule: {...}, issues: [...]}``.
+    # Defaults to empty so consumers that don't read the field aren't
+    # forced to update.
+    semantic_warnings: dict[str, Any] = field(default_factory=dict)
 
 
 def generate_report(

@@ -103,6 +103,9 @@ class PipelineState:
     dependency_map: dict[str, list[str]] = field(default_factory=dict)
     scriptable_objects: AssetConversionResult | None = None
     sprite_result: SpriteExtractionResult | None = None
+    # Output of converter/semantic_validators.run_semantic_validators
+    # — surfaced via conversion_report.json under ``semantic_warnings``.
+    semantic_report: object | None = None
 
 
 class Pipeline:
@@ -2056,6 +2059,32 @@ return table.concat(allData, "\\n")'''
         self._subphase_inject_mesh_loader()
 
         self._subphase_patch_setup_sounds()
+
+        # Semantic post-transpile validator (item #6 of the
+        # unity-conversion-fidelity-plan). Runs AFTER every script-
+        # mutating subphase (cohere, autogen, mesh-loader injection,
+        # setup-sounds patches) so the line numbers and snippets in
+        # ``conversion_report.json.semantic_warnings`` match the source
+        # that gets written to disk and serialised into the rbxlx.
+        #
+        # ``_bind_scripts_to_parts`` moves MonoBehaviour-style gameplay
+        # scripts out of the flat ``rbx_place.scripts`` list onto their
+        # owning parts. Collect every script in the tree so the
+        # validator sees the same set the rbxlx writer will serialise.
+        from converter.semantic_validators import run_semantic_validators
+        all_scripts = self._collect_all_scripts()
+        semantic_report = run_semantic_validators(all_scripts)
+        self.state.semantic_report = semantic_report
+        if semantic_report.issues:
+            log.info(
+                "[write_output] semantic validator: %d warning(s) "
+                "across %d rule(s)",
+                len(semantic_report.issues),
+                len(semantic_report.counts_by_rule),
+            )
+            for rule, count in semantic_report.counts_by_rule.items():
+                log.info("[write_output]   %s: %d", rule, count)
+
         self._subphase_finalize_scripts_to_disk()
 
         # Write the RBXLX file.
@@ -2825,6 +2854,48 @@ script.Disabled = true
                     "setupSounds(character)\n    -- Also search bound Part for sounds from MonoBehaviour fields\n    if script.Parent and script.Parent:IsA(\"BasePart\") then\n        setupSounds(script.Parent)\n    end",
                 )
 
+    def _collect_all_scripts(self) -> list:
+        """Return every script reachable from ``rbx_place`` for
+        semantic validation. Walks the flat list AND scripts under
+        ``workspace_parts`` / ``replicated_templates`` so part-bound
+        MonoBehaviour scripts get validated too.
+
+        Deduplicated by ``(name, source)`` rather than ``id()`` —
+        ``_attach_monobehaviour_scripts_to_templates`` and the
+        prefab-scoped animation copy passes clone one Luau body onto
+        many parts/templates. Without source-level dedup, the same
+        warning would get reported once per scene instance instead of
+        once per logical script. The on-disk finalize step still
+        flushes by ``id()`` (its concern is "every distinct object's
+        source has been persisted"), so the two walks intentionally
+        differ.
+        """
+        seen_keys: set[tuple] = set()
+        out: list = []
+
+        def _push(s: object) -> None:
+            name = getattr(s, "name", "") or ""
+            source = getattr(s, "source", "") or ""
+            key = (name, source)
+            if key in seen_keys:
+                return
+            seen_keys.add(key)
+            out.append(s)
+
+        for s in self.state.rbx_place.scripts or []:
+            _push(s)
+
+        def _walk(parts) -> None:
+            for part in parts or []:
+                for s in getattr(part, "scripts", None) or []:
+                    _push(s)
+                _walk(getattr(part, "children", None))
+
+        _walk(getattr(self.state.rbx_place, "workspace_parts", None))
+        _walk(getattr(self.state.rbx_place, "replicated_templates", None))
+        _walk(getattr(self.state.rbx_place, "server_storage_parts", None))
+        return out
+
     def _subphase_finalize_scripts_to_disk(self) -> None:
         """Write every script's final source back to disk. Runs after every
         in-memory mutation so the on-disk ``scripts/`` tree mirrors what
@@ -3035,6 +3106,13 @@ script.Disabled = true
             else:
                 selected_scene = str(p)
 
+        semantic_dict: dict = {}
+        sr = getattr(self.state, "semantic_report", None)
+        if sr is not None:
+            to_dict = getattr(sr, "to_dict", None)
+            if callable(to_dict):
+                semantic_dict = to_dict()
+
         return ConversionReport(
             unity_project_path=str(self.unity_project_path),
             output_dir=str(self.output_dir),
@@ -3061,6 +3139,7 @@ script.Disabled = true
                 scripts_in_place=result.get("scripts_written", 0),
                 report_path=str(report_path),
             ),
+            semantic_warnings=semantic_dict,
         )
 
     # Marker substrings that identify converter-emitted scripts.
@@ -3376,12 +3455,23 @@ script.Disabled = true
         if prefab_library is None or not getattr(prefab_library, "prefabs", None):
             return
 
+        # Opt-in escape hatch for projects whose runtime scripts were
+        # tuned against the historical centroid-pivot behaviour. Set
+        # ``U2R_LEGACY_PREFAB_PIVOT=1`` (or the equivalent setting in
+        # ``config``) to preserve the old wipe-to-identity contract for
+        # one release cycle while migrating.
+        import os
+        legacy_pivot = (
+            os.environ.get("U2R_LEGACY_PREFAB_PIVOT", "").lower()
+            in {"1", "true", "yes"}
+        )
         result = generate_prefab_packages(
             prefab_library=prefab_library,
             serialized_field_refs=self.ctx.serialized_field_refs or None,
             guid_index=self.state.guid_index,
             material_mappings=self.state.material_mappings,
             uploaded_assets=self.ctx.uploaded_assets,
+            legacy_prefab_pivot=legacy_pivot,
         )
 
         if not result.templates:
