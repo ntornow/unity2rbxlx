@@ -131,6 +131,119 @@ def _collect_referenced_prefab_names(
     return names
 
 
+_BASEPART_CLASSES = (
+    "Part", "MeshPart", "Cylinder", "Ball", "TrussPart",
+    "Seat", "VehicleSeat", "SpawnLocation",
+    "WedgePart", "CornerWedgePart",
+)
+
+
+def _first_baseparts_in_order(part: RbxPart) -> list[RbxPart]:
+    """Depth-first list of every BasePart-like descendant of ``part``.
+    Children are visited in declaration order; ``part`` itself is
+    excluded.
+    """
+    out: list[RbxPart] = []
+    stack = [part]
+    while stack:
+        cur = stack.pop()
+        if cur is not part and getattr(cur, "class_name", "Part") in _BASEPART_CLASSES:
+            out.append(cur)
+        # Reversed so the depth-first traversal returns
+        # children in declaration order.
+        for child in reversed(getattr(cur, "children", []) or []):
+            stack.append(child)
+    return out
+
+
+# Classes that are intentionally invisible in gameplay but are still
+# valid pivot anchors — e.g., SpawnLocation rendering is suppressed by
+# default but the part itself is the prefab's logical root.
+_TRANSPARENCY_IMMUNE = frozenset({
+    "SpawnLocation", "Seat", "VehicleSeat",
+})
+
+
+def _is_marker_part(p: RbxPart) -> bool:
+    """A marker is anything invisible (transparency >= 1) and not one
+    of the transparency-immune classes (SpawnLocation/Seat/VehicleSeat).
+    Visible Parts — with or without an explicit ``shape`` — are real
+    geometry: Roblox renders ``shape=None`` as a default Block. The
+    previous form ``Part with shape=None → marker`` over-filtered
+    plain-block prefab roots.
+    """
+    cls = getattr(p, "class_name", None)
+    transparency = getattr(p, "transparency", 0.0) or 0.0
+    if transparency >= 1.0 and cls not in _TRANSPARENCY_IMMUNE:
+        return True
+    return False
+
+
+def _find_root_anchor_part(
+    part: RbxPart, *, root_name: str | None = None,
+) -> RbxPart | None:
+    """Pick the wrapped root geometry, or ``None`` if no clear anchor.
+
+    Only fires on the wrapped-root shape — a Model whose direct
+    children include a ``<root>_Mesh`` child produced by
+    ``scene_converter._wrap_geometry_with_children_into_model``. That
+    wrap shape is the one the plan's algorithm explicitly targets:
+    geometry + child markers/triggers, where the geometry is the
+    intended pivot anchor.
+
+    Returns ``None`` for everything else (single-mesh templates,
+    multi-submesh FBX prefabs without a wrap, primitive-only models).
+    The caller then falls back to the legacy identity wipe, which
+    preserves prior behaviour for those shapes — the heuristic is
+    unreliable when there is no clear "wrapped root" signal.
+    """
+    """Pick the BasePart that represents the prefab root's geometry.
+
+    Order of preference:
+      1. A direct child named ``<root_name>_Mesh`` — the wrapped root
+         geometry inserted by
+         ``scene_converter._wrap_geometry_with_children_into_model``
+         when a Unity node has both a mesh AND child transforms.
+      2. A direct non-marker BasePart child — MeshPart, or a Part with
+         primitive shape / visible transparency. Excludes invisible
+         marker Parts (Origin, Muzzle, Spawn, …).
+      3. Any non-marker descendant BasePart, depth-first.
+      4. Any descendant BasePart at all (markers included) as a
+         last-resort fallback.
+
+    Returns ``None`` for an empty Model OR a single-part template
+    (no descendants). The caller falls through to the legacy
+    wipe-to-identity in that case — single-part templates' cframe
+    is the part's CFrame (not a Model WorldPivot), and the wipe lets
+    callers ``:Clone()`` and parent at origin without inheriting the
+    template's authored source position.
+
+    Known limitation: when a runtime script assigns
+    ``clone.PrimaryPart = ...`` before ``clone:PivotTo(...)``, Roblox
+    derives the pivot from PrimaryPart and ignores the WorldPivot
+    written here. Documented in
+    ``unity-conversion-fidelity-plan.md`` (#2 risks) — full resolution
+    requires emitting an explicit Model.PrimaryPart referent, which
+    the rbxlx writer does not currently support.
+    """
+    direct = part.children or []
+    # Candidates for the wrapped root child's name: the prefab's
+    # current name AND the pre-rename root GameObject name. The wrap
+    # function uses the GameObject's name; the caller may have since
+    # renamed ``part`` to the prefab asset name.
+    candidate_mesh_names = {f"{part.name}_Mesh"}
+    if root_name:
+        candidate_mesh_names.add(f"{root_name}_Mesh")
+    for c in direct:
+        if (
+            getattr(c, "name", None) in candidate_mesh_names
+            and getattr(c, "class_name", None) in _BASEPART_CLASSES
+            and not _is_marker_part(c)
+        ):
+            return c
+    return None
+
+
 def generate_prefab_packages(
     prefab_library: PrefabLibrary | None,
     serialized_field_refs: dict[str, dict[str, str]] | None,
@@ -138,6 +251,7 @@ def generate_prefab_packages(
     material_mappings: dict[str, MaterialMapping] | None = None,
     uploaded_assets: dict[str, str] | None = None,
     include_all: bool = False,
+    legacy_prefab_pivot: bool = False,
 ) -> PrefabPackagesResult:
     """Build ``ReplicatedStorage.Templates`` entries from Unity prefabs.
 
@@ -228,14 +342,65 @@ def generate_prefab_packages(
                 "reason": "_convert_prefab_node returned None (depth limit or empty)",
             })
             continue
+        # Capture the original root GameObject name before the rename
+        # so the anchor picker can still find the wrapped
+        # ``<root_name>_Mesh`` child that
+        # ``scene_converter._wrap_geometry_with_children_into_model``
+        # emitted (the wrap uses the GameObject's name, which may
+        # differ from the prefab asset name).
+        original_root_name = getattr(part, "name", None)
         # Force the top-level name to match the prefab name so
         # WaitForChild(name) resolves.
         part.name = name
-        # Prefabs live at (0, 0, 0) as templates — scripts set CFrame
-        # on clone. Strip any authored world-space translation the
-        # prefab parser may have preserved.
+        # Prefab template pivot:
+        # - Legacy (default-off, env ``U2R_LEGACY_PREFAB_PIVOT=1``):
+        #   wipe to identity. Studio's runtime then falls back to the
+        #   geometric centroid for ``Model:GetPivot()``.
+        # - New (default-on): set ``WorldPivot.Position`` to a root-
+        #   geometry anchor's world position. ``Model:GetPivot()``
+        #   then returns where the rendered root geometry sits, which
+        #   matches Unity ``Instantiate(prefab, target)`` for the
+        #   common case where the prefab root's Unity local is
+        #   ``(0, 0, 0)`` and FBX baking adds the only offset.
+        #
+        # Known limitations (full resolution = Layer B in
+        # ``docs/design/unity-conversion-fidelity-plan.md``):
+        # 1. When the anchor child has a non-zero Unity local position
+        #    (rare for typical wrapped prefabs), ``Model:PivotTo()``
+        #    lands the rendered geometry on the target instead of the
+        #    Unity root. The plan's full formula
+        #    ``WorldPivot = roblox_world - unity_local * scale``
+        #    requires Unity local positions threaded through the
+        #    ``RbxPart`` tree, which the converter does not yet carry.
+        # 2. When a runtime script assigns ``clone.PrimaryPart =``
+        #    before ``clone:PivotTo(...)``, Roblox derives the pivot
+        #    from PrimaryPart and ignores this WorldPivot. The rbxlx
+        #    writer does not currently emit ``Model.PrimaryPart``
+        #    referents, so we can't pre-pin a sane PrimaryPart.
         from core.roblox_types import RbxCFrame
-        part.cframe = RbxCFrame()
+        if legacy_prefab_pivot:
+            part.cframe = RbxCFrame()
+        else:
+            anchor = _find_root_anchor_part(part, root_name=original_root_name)
+            if anchor is None:
+                # Empty Model / single-part template: legacy wipe.
+                # ``part.cframe`` is the part's CFrame (Part/MeshPart)
+                # rather than a Model WorldPivot, so wiping lets
+                # callers ``:Clone()`` and parent at origin without
+                # inheriting the template's authored source position.
+                part.cframe = RbxCFrame()
+            else:
+                root_cf = part.cframe
+                anchor_cf = anchor.cframe
+                # Translation: anchor's world position so PivotTo lands
+                # the root geometry on the target. Rotation: prefab
+                # root's rotation, preserved verbatim.
+                part.cframe = RbxCFrame(
+                    x=anchor_cf.x, y=anchor_cf.y, z=anchor_cf.z,
+                    r00=root_cf.r00, r01=root_cf.r01, r02=root_cf.r02,
+                    r10=root_cf.r10, r11=root_cf.r11, r12=root_cf.r12,
+                    r20=root_cf.r20, r21=root_cf.r21, r22=root_cf.r22,
+                )
 
         # Tag variants with their parent template name so the runtime
         # spawner can compose at clone time (and so a follow-up parent-

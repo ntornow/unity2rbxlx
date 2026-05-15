@@ -203,6 +203,374 @@ class TestReplicatedTemplatesField:
         assert isinstance(p.replicated_templates, list)
 
 
+class TestWorldPivotPreservation:
+    """Item #2 of the unity-conversion-fidelity-plan: prefab templates
+    carry a meaningful ``WorldPivot`` so ``Model:GetPivot()`` returns a
+    per-prefab anchor instead of Studio's centroid fallback."""
+
+    def _model_with_child_at(self, name: str, child_pos: tuple[float, float, float]) -> RbxPart:
+        from core.roblox_types import RbxCFrame
+        child = RbxPart(
+            name=f"{name}.Child",
+            class_name="MeshPart",
+            cframe=RbxCFrame(x=child_pos[0], y=child_pos[1], z=child_pos[2]),
+        )
+        return RbxPart(
+            name=name, class_name="Model",
+            children=[child],
+        )
+
+    def test_wrapped_root_mesh_sets_pivot_to_anchor(self, monkeypatch):
+        # SimpleFPS-style wrapped prefab: ``_wrap_geometry_with_children``
+        # emits a ``<root>_Mesh`` child. The anchor lands there so
+        # ``Model:PivotTo(target)`` places the rendered root at target.
+        from core.roblox_types import RbxCFrame
+        wrapped = RbxPart(
+            name="Rifle_Mesh", class_name="MeshPart",
+            cframe=RbxCFrame(x=0.0, y=4.37, z=0.0),
+        )
+        rifle = RbxPart(
+            name="Rifle", class_name="Model", children=[wrapped],
+        )
+        monkeypatch.setattr(
+            "converter.scene_converter._convert_prefab_node",
+            lambda node, **_: rifle,
+        )
+        lib = _library(_prefab_template("Rifle"))
+        result = generate_prefab_packages(
+            lib, {"Assets/P.cs": {"r": "Rifle"}}, guid_index=None,
+        )
+        assert len(result.templates) == 1
+        cf = result.templates[0].cframe
+        assert cf.x == 0.0
+        assert abs(cf.y - 4.37) < 1e-9
+        assert cf.z == 0.0
+
+    def test_non_wrapped_prefab_falls_back_to_identity(self, monkeypatch):
+        """Anything that doesn't match the wrapped-root pattern (just
+        a child mesh with the original prefab name, or primitives, or
+        markers) falls back to the legacy identity wipe."""
+        rifle = self._model_with_child_at("Rifle", (0.0, 4.37, 0.0))
+        monkeypatch.setattr(
+            "converter.scene_converter._convert_prefab_node",
+            lambda node, **_: rifle,
+        )
+        lib = _library(_prefab_template("Rifle"))
+        result = generate_prefab_packages(
+            lib, {"Assets/P.cs": {"r": "Rifle"}}, guid_index=None,
+        )
+        cf = result.templates[0].cframe
+        assert cf.x == cf.y == cf.z == 0.0
+
+    def test_legacy_flag_wipes_pivot_to_identity(self, monkeypatch):
+        rifle = self._model_with_child_at("Rifle", (0.0, 4.37, 0.0))
+        monkeypatch.setattr(
+            "converter.scene_converter._convert_prefab_node",
+            lambda node, **_: rifle,
+        )
+        lib = _library(_prefab_template("Rifle"))
+        result = generate_prefab_packages(
+            lib, {"Assets/P.cs": {"r": "Rifle"}},
+            guid_index=None, legacy_prefab_pivot=True,
+        )
+        cf = result.templates[0].cframe
+        assert cf.x == cf.y == cf.z == 0.0
+
+    def test_empty_model_wipes_to_identity(self, monkeypatch):
+        """No descendants → legacy wipe. Single-part templates also
+        take this branch and rely on the wipe so callers can
+        ``:Clone()`` and parent at origin."""
+        empty = RbxPart(name="Empty", class_name="Model", children=[])
+        monkeypatch.setattr(
+            "converter.scene_converter._convert_prefab_node",
+            lambda node, **_: empty,
+        )
+        lib = _library(_prefab_template("Empty"))
+        result = generate_prefab_packages(
+            lib, {"Assets/P.cs": {"r": "Empty"}}, guid_index=None,
+        )
+        cf = result.templates[0].cframe
+        assert cf.x == cf.y == cf.z == 0.0
+        # Rotation also identity.
+        assert cf.r00 == 1.0 and cf.r11 == 1.0 and cf.r22 == 1.0
+
+    def test_single_part_template_wipes_to_identity(self, monkeypatch):
+        """Codex round-2 [P1]: a Part/MeshPart template without
+        children must wipe its CFrame so callers that just ``:Clone()``
+        and parent get a clone at origin, not at the prefab source's
+        baked position."""
+        from core.roblox_types import RbxCFrame
+        sole = RbxPart(
+            name="Bullet", class_name="MeshPart", children=[],
+            cframe=RbxCFrame(x=120.0, y=4.0, z=-37.0),  # authored pos
+        )
+        monkeypatch.setattr(
+            "converter.scene_converter._convert_prefab_node",
+            lambda node, **_: sole,
+        )
+        lib = _library(_prefab_template("Bullet"))
+        result = generate_prefab_packages(
+            lib, {"Assets/P.cs": {"r": "Bullet"}}, guid_index=None,
+        )
+        cf = result.templates[0].cframe
+        assert cf.x == cf.y == cf.z == 0.0
+
+    def test_prefers_wrapped_root_mesh_over_marker(self, monkeypatch):
+        """Codex [P1] regression: when ``_wrap_geometry_with_children``
+        wraps a root mesh + markers (Origin/Muzzle) into a Model, the
+        first DFS BasePart is a marker. The anchor picker must prefer
+        the ``<root>_Mesh`` child."""
+        from core.roblox_types import RbxCFrame
+        marker = RbxPart(
+            name="Origin", class_name="Part",
+            cframe=RbxCFrame(x=10.0, y=0.0, z=0.0),
+        )
+        muzzle = RbxPart(
+            name="Muzzle", class_name="Part",
+            cframe=RbxCFrame(x=20.0, y=0.0, z=0.0),
+        )
+        root_mesh = RbxPart(
+            name="Rifle_Mesh", class_name="MeshPart",
+            cframe=RbxCFrame(x=0.0, y=4.37, z=0.0),
+        )
+        rifle = RbxPart(
+            name="Rifle", class_name="Model",
+            # _wrap_geometry_with_children_into_model puts geometry LAST.
+            children=[marker, muzzle, root_mesh],
+        )
+        monkeypatch.setattr(
+            "converter.scene_converter._convert_prefab_node",
+            lambda node, **_: rifle,
+        )
+        lib = _library(_prefab_template("Rifle"))
+        result = generate_prefab_packages(
+            lib, {"Assets/P.cs": {"r": "Rifle"}}, guid_index=None,
+        )
+        cf = result.templates[0].cframe
+        # Pivot must land on Rifle_Mesh (0, 4.37, 0), NOT on the marker.
+        assert cf.x == 0.0
+        assert abs(cf.y - 4.37) < 1e-9
+        assert cf.z == 0.0
+
+    def test_multi_submesh_prefab_falls_back_to_identity(self, monkeypatch):
+        """Codex round-16 [P1]: a multi-submesh FBX prefab has no
+        ``<root>_Mesh`` wrap — direct children are the submeshes
+        themselves. The anchor heuristic must not pick the first
+        submesh as the pivot; fall back to identity instead."""
+        from core.roblox_types import RbxCFrame
+        sub1 = RbxPart(
+            name="Barrel", class_name="MeshPart",
+            cframe=RbxCFrame(x=0.0, y=0.0, z=0.0),
+            transparency=0.0,
+        )
+        sub2 = RbxPart(
+            name="Stock", class_name="MeshPart",
+            cframe=RbxCFrame(x=0.0, y=-1.0, z=0.0),
+            transparency=0.0,
+        )
+        sub3 = RbxPart(
+            name="Trigger", class_name="MeshPart",
+            cframe=RbxCFrame(x=0.5, y=-0.3, z=0.0),
+            transparency=0.0,
+        )
+        # No "Rifle_Mesh" child — pure multi-submesh layout.
+        m = RbxPart(
+            name="Rifle", class_name="Model",
+            children=[sub1, sub2, sub3],
+        )
+        monkeypatch.setattr(
+            "converter.scene_converter._convert_prefab_node",
+            lambda node, **_: m,
+        )
+        lib = _library(_prefab_template("Rifle"))
+        result = generate_prefab_packages(
+            lib, {"Assets/P.cs": {"r": "Rifle"}}, guid_index=None,
+        )
+        cf = result.templates[0].cframe
+        # Identity wipe — no clear anchor signal.
+        assert cf.x == cf.y == cf.z == 0.0
+
+    # ``test_prefers_meshpart_direct_child_over_marker_part`` removed
+    # when the anchor heuristic narrowed to wrapped-root only
+    # (round-16 [P1]) — non-wrapped layouts legacy-wipe. and cf.z == 0.0
+
+    # ``test_default_block_part_is_valid_anchor`` removed when the
+    # anchor heuristic narrowed to wrapped-root only (round-16 [P1]).
+    # Non-wrapped block-part layouts now legacy-wipe.
+
+    def test_trigger_only_prefab_falls_back_to_identity(self, monkeypatch):
+        """Codex round-12 [P2] regression: a prefab whose descendants
+        are ALL invisible markers/triggers must wipe to identity rather
+        than anchoring on one of the markers."""
+        from core.roblox_types import RbxCFrame
+        t1 = RbxPart(
+            name="TriggerA", class_name="Part",
+            cframe=RbxCFrame(x=5.0, y=0.0, z=0.0),
+            transparency=1.0,
+        )
+        t2 = RbxPart(
+            name="TriggerB", class_name="Part",
+            cframe=RbxCFrame(x=-5.0, y=0.0, z=0.0),
+            transparency=1.0,
+        )
+        m = RbxPart(
+            name="TriggerVolume", class_name="Model",
+            children=[t1, t2],
+        )
+        monkeypatch.setattr(
+            "converter.scene_converter._convert_prefab_node",
+            lambda node, **_: m,
+        )
+        lib = _library(_prefab_template("TriggerVolume"))
+        result = generate_prefab_packages(
+            lib, {"Assets/P.cs": {"r": "TriggerVolume"}}, guid_index=None,
+        )
+        cf = result.templates[0].cframe
+        # All children invisible → identity wipe.
+        assert cf.x == cf.y == cf.z == 0.0
+
+    def test_transparent_wrapped_root_mesh_falls_back(self, monkeypatch):
+        """Codex round-9 [P2]: when ``_wrap_geometry_with_children``
+        produces a TRANSPARENT ``<root>_Mesh``, the narrowed-scope
+        anchor picker rejects it (marker check) and the prefab falls
+        back to identity rather than anchoring on a visible sibling
+        with an arbitrary offset."""
+        from core.roblox_types import RbxCFrame
+        invisible_wrap = RbxPart(
+            name="Trigger_Mesh", class_name="MeshPart",
+            cframe=RbxCFrame(x=10.0, y=0.0, z=0.0),
+            transparency=1.0,
+        )
+        visible_sibling = RbxPart(
+            name="Body", class_name="MeshPart",
+            cframe=RbxCFrame(x=0.0, y=3.0, z=0.0),
+            transparency=0.0,
+        )
+        m = RbxPart(
+            name="Trigger", class_name="Model",
+            children=[invisible_wrap, visible_sibling],
+        )
+        monkeypatch.setattr(
+            "converter.scene_converter._convert_prefab_node",
+            lambda node, **_: m,
+        )
+        lib = _library(_prefab_template("Trigger"))
+        result = generate_prefab_packages(
+            lib, {"Assets/P.cs": {"r": "Trigger"}}, guid_index=None,
+        )
+        cf = result.templates[0].cframe
+        # Wrapped-root match is invisible → no anchor → identity wipe.
+        assert cf.x == cf.y == cf.z == 0.0
+
+    def test_non_wrapped_with_spawn_location_falls_back(self, monkeypatch):
+        """Non-wrapped layouts (no ``<root>_Mesh``) fall back to
+        identity per the narrowed-scope contract — including spawn-rig
+        templates whose only descendant is a SpawnLocation."""
+        from core.roblox_types import RbxCFrame
+        spawn = RbxPart(
+            name="Spawn", class_name="SpawnLocation",
+            cframe=RbxCFrame(x=0.0, y=1.0, z=0.0),
+        )
+        m = RbxPart(
+            name="SpawnRig", class_name="Model",
+            children=[spawn],
+        )
+        monkeypatch.setattr(
+            "converter.scene_converter._convert_prefab_node",
+            lambda node, **_: m,
+        )
+        lib = _library(_prefab_template("SpawnRig"))
+        result = generate_prefab_packages(
+            lib, {"Assets/P.cs": {"r": "SpawnRig"}}, guid_index=None,
+        )
+        cf = result.templates[0].cframe
+        assert cf.x == cf.y == cf.z == 0.0
+
+    # Note: round-5/7/8 tests for non-wrapped layouts (primitive
+    # geometry, invisible MeshPart proxies, marker Parts) were removed
+    # when the anchor heuristic was narrowed to wrapped-root only
+    # (round-16 [P1]). Non-wrapped layouts now legacy-wipe; the
+    # ``test_non_wrapped_prefab_falls_back_to_identity`` test above
+    # covers the new default. and cf.z == 0.0
+
+    def test_anchor_picker_uses_original_root_name_for_mesh_match(self, monkeypatch):
+        """Codex round-6 [P2]: when the prefab asset name differs from
+        the GameObject's root name, the wrapped ``<root>_Mesh`` child
+        was emitted using the GameObject's name. The anchor picker
+        must still find it after the prefab-name rename."""
+        from core.roblox_types import RbxCFrame
+        # GameObject named "RifleGO" produces a wrapped child named
+        # "RifleGO_Mesh". The prefab asset is named "Rifle".
+        marker = RbxPart(
+            name="Origin", class_name="Part",
+            cframe=RbxCFrame(x=10.0, y=0.0, z=0.0),
+            transparency=1.0,
+        )
+        wrapped_mesh = RbxPart(
+            name="RifleGO_Mesh", class_name="MeshPart",
+            cframe=RbxCFrame(x=0.0, y=4.37, z=0.0),
+        )
+        root_go = RbxPart(
+            name="RifleGO", class_name="Model",
+            children=[marker, wrapped_mesh],
+        )
+        monkeypatch.setattr(
+            "converter.scene_converter._convert_prefab_node",
+            lambda node, **_: root_go,
+        )
+        # Prefab asset name is "Rifle" (≠ GameObject "RifleGO").
+        lib = _library(_prefab_template("Rifle"))
+        result = generate_prefab_packages(
+            lib, {"Assets/P.cs": {"r": "Rifle"}}, guid_index=None,
+        )
+        cf = result.templates[0].cframe
+        # Anchor landed on RifleGO_Mesh (the wrapped root), NOT the
+        # marker, even though the prefab was renamed to "Rifle".
+        assert cf.x == 0.0 and abs(cf.y - 4.37) < 1e-9
+
+    def test_preserves_root_rotation_when_child_is_rotated(self, monkeypatch):
+        """Codex [P1] regression: the chosen child's rotation must NOT
+        be copied into ``WorldPivot``. The prefab root's rotation is
+        the authoritative orientation."""
+        from core.roblox_types import RbxCFrame
+        # Child has a 90° Y rotation; if we copy its basis the whole
+        # model spawns rotated.
+        rotated_child = RbxPart(
+            name="Rifle_Mesh", class_name="MeshPart",
+            cframe=RbxCFrame(
+                x=0.0, y=0.5, z=0.0,
+                r00=0.0, r01=0.0, r02=1.0,
+                r10=0.0, r11=1.0, r12=0.0,
+                r20=-1.0, r21=0.0, r22=0.0,
+            ),
+        )
+        root_rot = RbxCFrame(
+            x=0.0, y=0.0, z=0.0,
+            r00=1.0, r01=0.0, r02=0.0,
+            r10=0.0, r11=1.0, r12=0.0,
+            r20=0.0, r21=0.0, r22=1.0,
+        )
+        rifle = RbxPart(
+            name="Rifle", class_name="Model",
+            children=[rotated_child],
+            cframe=root_rot,
+        )
+        monkeypatch.setattr(
+            "converter.scene_converter._convert_prefab_node",
+            lambda node, **_: rifle,
+        )
+        lib = _library(_prefab_template("Rifle"))
+        result = generate_prefab_packages(
+            lib, {"Assets/P.cs": {"r": "Rifle"}}, guid_index=None,
+        )
+        cf = result.templates[0].cframe
+        # Translation came from the child.
+        assert abs(cf.y - 0.5) < 1e-9
+        # Rotation is the prefab root's identity, NOT the child's 90° Y.
+        assert cf.r00 == 1.0 and cf.r11 == 1.0 and cf.r22 == 1.0
+        assert cf.r02 == 0.0 and cf.r20 == 0.0
+
+
 class TestAttachPrefabScopedAnimationScripts:
     """Phase 5.9 deep-fix: prefab-scoped animation scripts must reach the
     template's ``scripts`` list (so cloning the template carries the
