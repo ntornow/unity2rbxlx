@@ -141,6 +141,12 @@ def _build_collision_fidelity_fixup_script(targets: list[dict]) -> str:
     script resolves each by descending from ``workspace`` so it doesn't
     have to walk every part in the place (an unbounded scan times out
     server-side on places with thousands of descendants).
+
+    A path segment may carry an ordinal disambiguator after ``#`` —
+    e.g. ``"Room/Wall#3"`` means "the 3rd child of Room whose Name is
+    ``Wall``" (1-indexed). Without this, ``FindFirstChild`` would
+    collapse every sibling-with-shared-name onto the first match, so
+    later MeshParts with concave fidelity never got recooked.
     """
     import json as _json
     payload = _json.dumps(targets)
@@ -152,7 +158,21 @@ local function resolve(path)
     local node = workspace
     for segment in string.gmatch(path, "[^/]+") do
         if not node then return nil end
-        node = node:FindFirstChild(segment)
+        local name, ord = string.match(segment, "^(.-)#(%d+)$")
+        if name then
+            local want = tonumber(ord)
+            local seen = 0
+            local found = nil
+            for _, child in ipairs(node:GetChildren()) do
+                if child.Name == name then
+                    seen = seen + 1
+                    if seen == want then found = child; break end
+                end
+            end
+            node = found
+        else
+            node = node:FindFirstChild(segment)
+        end
     end
     return node
 end
@@ -205,15 +225,36 @@ def _collect_collision_fidelity_targets(rbx_place) -> list[dict]:
     its workspace path (so the runtime fixup can resolve it without an
     O(N) scan), the mesh URL it should be cooked from, and the fidelity
     enum *name* (the runtime resolves via ``Enum.CollisionFidelity[name]``).
+
+    When several siblings share a name (Room has two ``Wall`` children),
+    append ``#N`` to disambiguate by 1-indexed ordinal among siblings of
+    the same name. The Luau resolver in
+    :func:`_build_collision_fidelity_fixup_script` understands this
+    suffix; without it, ``FindFirstChild`` collapses duplicates onto the
+    first match and later concave-fidelity MeshParts never get recooked.
     """
     _names = {1: "Hull", 3: "PreciseConvexDecomposition"}
     targets: list[dict] = []
 
     def _walk(parts, prefix: str):
-        for p in parts or []:
+        # First pass: count how many siblings share each name so we know
+        # which ones need disambiguators.
+        siblings = list(parts or [])
+        name_counts: dict[str, int] = {}
+        for s in siblings:
+            n = getattr(s, "name", None) or "Part"
+            name_counts[n] = name_counts.get(n, 0) + 1
+
+        seen_at_name: dict[str, int] = {}
+        for p in siblings:
             cls = getattr(p, "class_name", None) or "Part"
             name = getattr(p, "name", None) or "Part"
-            child_prefix = f"{prefix}/{name}" if prefix else name
+            if name_counts[name] > 1:
+                seen_at_name[name] = seen_at_name.get(name, 0) + 1
+                segment = f"{name}#{seen_at_name[name]}"
+            else:
+                segment = name
+            child_prefix = f"{prefix}/{segment}" if prefix else segment
             if cls == "MeshPart":
                 fid = getattr(p, "collision_fidelity", None)
                 mesh_id = getattr(p, "mesh_id", None) or ""

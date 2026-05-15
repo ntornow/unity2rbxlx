@@ -196,6 +196,19 @@ class Pipeline:
         # state, not a fresh conversion".
         self._is_resume: bool = False
 
+    def _add_warning(self, warning: str) -> None:
+        """Append *warning* to ``ctx.warnings`` once.
+
+        Phases like ``extract_assets`` can re-run multiple times (resume,
+        ``convert_interactive assemble`` retries, multi-scene loops).
+        Without dedupe, every re-run appends the same warning text to
+        the same list, so the final report shows N copies of one
+        failure. Dedupe by exact-string match — the warnings list is a
+        human-facing summary, not a structured event log.
+        """
+        if warning not in self.ctx.warnings:
+            self.ctx.warnings.append(warning)
+
     @property
     def scaffolding(self) -> frozenset[str]:
         """Return the active genre-scaffolding set as a frozenset.
@@ -784,7 +797,7 @@ class Pipeline:
             # didn't become ModuleScripts. Default log level hides debug.
             msg = f"ScriptableObject conversion failed: {exc}"
             log.warning("[extract_assets] %s", msg)
-            self.ctx.warnings.append(f"[extract_assets] {msg}")
+            self._add_warning(f"[extract_assets] {msg}")
 
         # Slice spritesheet textures into <output>/sprites/; expose the
         # GUID -> file map on ctx for SpriteRenderer consumers.
@@ -810,7 +823,7 @@ class Pipeline:
                 # missing sprites surface in the final report.
                 msg = f"Sprite extraction failed: {exc}"
                 log.warning("[extract_assets] %s", msg)
-                self.ctx.warnings.append(f"[extract_assets] {msg}")
+                self._add_warning(f"[extract_assets] {msg}")
 
         # Pre-compute FBX bounding boxes via trimesh for InitialSize fallback.
         # This runs only when mesh_native_sizes (from Studio resolution) are

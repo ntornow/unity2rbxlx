@@ -215,7 +215,16 @@ def _screen_audio_filename(name: str, relative_path: str) -> ModerationFinding |
         artist = match.group("artist").strip()
         title = match.group("title").strip()
         # Only flag if both parts look like real words (not asset pack names)
-        if len(artist) > 2 and len(title) > 2 and " " in artist or " " in title:
+        # AND at least one half contains a space (single-word artist+title
+        # like ``foo_bar`` is usually an asset-pack filename, not a song).
+        # ``and`` binds tighter than ``or``, so the parens are load-bearing:
+        # without them the title-only space check fires on its own and the
+        # length gate is bypassed.
+        if (
+            len(artist) > 2
+            and len(title) > 2
+            and (" " in artist or " " in title)
+        ):
             return ModerationFinding(
                 relative_path=relative_path,
                 kind="audio",
