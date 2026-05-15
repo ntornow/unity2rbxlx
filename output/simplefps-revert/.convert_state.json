@@ -1,0 +1,18 @@
+{
+  "completed_skill_phases": [
+    "discover",
+    "inventory",
+    "materials",
+    "transpile",
+    "validate",
+    "assemble",
+    "upload",
+    "report"
+  ],
+  "unity_project_path": "/Users/jiazou/workspace/unity2rbxlx/test_projects/SimpleFPS",
+  "rbxlx_path": "/Users/jiazou/workspace/unity2rbxlx/output/simplefps-revert/converted_place.rbxlx",
+  "universe_id": 10163878543,
+  "place_id": 117163526550862,
+  "success": true,
+  "report_path": "/Users/jiazou/workspace/unity2rbxlx/output/simplefps-revert/conversion_report.json"
+}

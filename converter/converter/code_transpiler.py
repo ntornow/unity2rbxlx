@@ -1321,20 +1321,25 @@ Lifecycle:
 -- conventions across projects: Collider, Trigger, TriggerZone, Detector,
 -- Sensor, Hitbox, Range, ProximityVolume, PickupTouchDetector. Names
 -- vary per project — don't assume any single one.
-local TRIGGER_NAMES = {"Collider", "Trigger", "TriggerZone", "Detector",
+local TRIGGER_NAMES = {"Colliders", "Collider", "Trigger", "TriggerZone", "Detector",
     "Sensor", "Hitbox", "Range", "ProximityVolume", "PickupTouchDetector"}
 local function findTriggerPart(parent)
     for _, n in ipairs(TRIGGER_NAMES) do
         local p = parent:FindFirstChild(n)
         if p and p:IsA("BasePart") then return p end
     end
-    -- Tier 2: any invisible BasePart child (no mesh, fully transparent).
+    -- Tier 2: the LARGEST invisible BasePart child (no mesh, fully transparent).
+    -- Volume-ranked so the script doesn't bind to tiny per-slot Parts
+    -- (SimpleFPS Machine has 1x1x1 "Item N" markers alongside a much
+    -- larger "Colliders" trigger; first-match would pick the wrong one).
+    local best, bestVol = nil, -1
     for _, c in ipairs(parent:GetChildren()) do
         if c:IsA("BasePart") and c.Transparency >= 1 and not c:IsA("MeshPart") then
-            return c
+            local v = c.Size.X * c.Size.Y * c.Size.Z
+            if v > bestVol then best, bestVol = c, v end
         end
     end
-    return nil
+    return best
 end
 local function findVisualTarget(parent)
     -- Tier 1: child Model (Unity pickups often wrap visible meshes in a Model).

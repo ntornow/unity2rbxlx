@@ -1,0 +1,476 @@
+{
+  "storage_plan": {
+    "server_scripts": [
+      "AfterburnerPhysicsForce",
+      "Displace",
+      "Door",
+      "ExplosionFireAndDebris",
+      "ExplosionPhysicsForce",
+      "ExtinguishableParticleSystem",
+      "GerstnerDisplace",
+      "HostilePlane",
+      "Machine",
+      "MeshContainer",
+      "Mine",
+      "ParticleSystemMultiplier",
+      "Pickup",
+      "Plane",
+      "PlaneBullet",
+      "PlaneTexture",
+      "SmokeParticles",
+      "SpawnPoint",
+      "SpecularLighting",
+      "Turret",
+      "TurretBullet",
+      "WaterBase",
+      "WaterBasic",
+      "WaterHoseParticles",
+      "Anim_Door_door_close",
+      "Anim_Door_door_open",
+      "Anim_HostilePlane_HostilePlane_Flying",
+      "Anim_PlaneHolder_PlaneHolder_holder1",
+      "Anim_PlaneHolder_PlaneHolder_holder2",
+      "Anim_PlaneHolder_PlaneHolder_holder3",
+      "Anim_HostilePlane_HostilePlane_Flying",
+      "Anim_PlaneHolder_PlaneHolder_holder1",
+      "Anim_PlaneHolder_PlaneHolder_holder2",
+      "Anim_PlaneHolder_PlaneHolder_holder3",
+      "Anim_Door_door_open",
+      "Anim_Door_door_close",
+      "_AutoDamageEventRouter"
+    ],
+    "client_scripts": [
+      "GameManager",
+      "Hose",
+      "HudControl",
+      "Player"
+    ],
+    "character_scripts": [],
+    "replicated_first_scripts": [],
+    "shared_modules": [
+      "Explosive",
+      "FireLight",
+      "Menu",
+      "ObjectResetter",
+      "ParticleSystemDestroyer",
+      "PlanarReflection",
+      "Water",
+      "WaterTile",
+      "PrefabSpawner"
+    ],
+    "server_modules": [],
+    "replicated_templates": [],
+    "server_templates": [],
+    "ui_templates": [],
+    "remote_events": [
+      "Ammo",
+      "AmmoUpdate",
+      "Collider",
+      "DamageEvent",
+      "Flare",
+      "Head",
+      "Health",
+      "HealthUpdate",
+      "Humanoid",
+      "HumanoidRootPart",
+      "ItemUpdate",
+      "PauseEvent",
+      "Pickup",
+      "PickupItemEvent",
+      "PickupTouchDetector",
+      "PlayerModule",
+      "PlayerScripts",
+      "Rifle",
+      "Templates",
+      "WeaponSlot",
+      "damageEvent",
+      "damageevent"
+    ],
+    "decisions": [
+      {
+        "script": "AfterburnerPhysicsForce",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Displace",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Door",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "ExplosionFireAndDebris",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "ExplosionPhysicsForce",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Explosive",
+        "script_type": "ModuleScript",
+        "container": "ReplicatedStorage",
+        "reason": "orphan module (no callers): default replicated"
+      },
+      {
+        "script": "ExtinguishableParticleSystem",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "FireLight",
+        "script_type": "ModuleScript",
+        "container": "ReplicatedStorage",
+        "reason": "orphan module (no callers): default replicated"
+      },
+      {
+        "script": "GameManager",
+        "script_type": "LocalScript",
+        "container": "StarterPlayer.StarterPlayerScripts",
+        "reason": "uses client-only APIs (LocalPlayer, UserInputService, etc.)"
+      },
+      {
+        "script": "GerstnerDisplace",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Hose",
+        "script_type": "LocalScript",
+        "container": "StarterPlayer.StarterPlayerScripts",
+        "reason": "uses client-only APIs (LocalPlayer, UserInputService, etc.)"
+      },
+      {
+        "script": "HostilePlane",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "HudControl",
+        "script_type": "LocalScript",
+        "container": "StarterPlayer.StarterPlayerScripts",
+        "reason": "uses client-only APIs (LocalPlayer, UserInputService, etc.)"
+      },
+      {
+        "script": "Machine",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Menu",
+        "script_type": "ModuleScript",
+        "container": "ReplicatedStorage",
+        "reason": "orphan module (no callers): default replicated"
+      },
+      {
+        "script": "MeshContainer",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Mine",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "ObjectResetter",
+        "script_type": "ModuleScript",
+        "container": "ReplicatedStorage",
+        "reason": "orphan module (no callers): default replicated"
+      },
+      {
+        "script": "ParticleSystemDestroyer",
+        "script_type": "ModuleScript",
+        "container": "ReplicatedStorage",
+        "reason": "orphan module (no callers): default replicated"
+      },
+      {
+        "script": "ParticleSystemMultiplier",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Pickup",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "PlanarReflection",
+        "script_type": "ModuleScript",
+        "container": "ReplicatedStorage",
+        "reason": "orphan module (no callers): default replicated"
+      },
+      {
+        "script": "Plane",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "PlaneBullet",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "PlaneTexture",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Player",
+        "script_type": "LocalScript",
+        "container": "StarterPlayer.StarterPlayerScripts",
+        "reason": "uses client-only APIs (LocalPlayer, UserInputService, etc.)"
+      },
+      {
+        "script": "SmokeParticles",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "SpawnPoint",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "SpecularLighting",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Turret",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "TurretBullet",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Water",
+        "script_type": "ModuleScript",
+        "container": "ReplicatedStorage",
+        "reason": "orphan module (no callers): default replicated"
+      },
+      {
+        "script": "WaterBase",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "WaterBasic",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "WaterHoseParticles",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "WaterTile",
+        "script_type": "ModuleScript",
+        "container": "ReplicatedStorage",
+        "reason": "orphan module (no callers): default replicated"
+      },
+      {
+        "script": "Anim_Door_door_close",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Anim_Door_door_open",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Anim_HostilePlane_HostilePlane_Flying",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Anim_PlaneHolder_PlaneHolder_holder1",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Anim_PlaneHolder_PlaneHolder_holder2",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Anim_PlaneHolder_PlaneHolder_holder3",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "PrefabSpawner",
+        "script_type": "ModuleScript",
+        "container": "ReplicatedStorage",
+        "reason": "orphan module (no callers): default replicated"
+      },
+      {
+        "script": "Anim_HostilePlane_HostilePlane_Flying",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Anim_PlaneHolder_PlaneHolder_holder1",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Anim_PlaneHolder_PlaneHolder_holder2",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Anim_PlaneHolder_PlaneHolder_holder3",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Anim_Door_door_open",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Anim_Door_door_close",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "_AutoDamageEventRouter",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      }
+    ],
+    "overrides_applied": []
+  },
+  "script_paths": {
+    "AfterburnerPhysicsForce": "AfterburnerPhysicsForce.luau",
+    "Displace": "Displace.luau",
+    "Door": "Door.luau",
+    "ExplosionFireAndDebris": "ExplosionFireAndDebris.luau",
+    "ExplosionPhysicsForce": "ExplosionPhysicsForce.luau",
+    "Explosive": "Explosive.luau",
+    "ExtinguishableParticleSystem": "ExtinguishableParticleSystem.luau",
+    "FireLight": "FireLight.luau",
+    "GameManager": "GameManager.luau",
+    "GerstnerDisplace": "GerstnerDisplace.luau",
+    "Hose": "Hose.luau",
+    "HostilePlane": "HostilePlane.luau",
+    "HudControl": "HudControl.luau",
+    "Machine": "Machine.luau",
+    "Menu": "Menu.luau",
+    "MeshContainer": "MeshContainer.luau",
+    "Mine": "Mine.luau",
+    "ObjectResetter": "ObjectResetter.luau",
+    "ParticleSystemDestroyer": "ParticleSystemDestroyer.luau",
+    "ParticleSystemMultiplier": "ParticleSystemMultiplier.luau",
+    "Pickup": "Pickup.luau",
+    "PlanarReflection": "PlanarReflection.luau",
+    "Plane": "Plane.luau",
+    "PlaneBullet": "PlaneBullet.luau",
+    "PlaneTexture": "PlaneTexture.luau",
+    "Player": "Player.luau",
+    "SmokeParticles": "SmokeParticles.luau",
+    "SpawnPoint": "SpawnPoint.luau",
+    "SpecularLighting": "SpecularLighting.luau",
+    "Turret": "Turret.luau",
+    "TurretBullet": "TurretBullet.luau",
+    "Water": "Water.luau",
+    "WaterBase": "WaterBase.luau",
+    "WaterBasic": "WaterBasic.luau",
+    "WaterHoseParticles": "WaterHoseParticles.luau",
+    "WaterTile": "WaterTile.luau",
+    "Anim_Door_door_close": "animations/Anim_Door_door_close.luau",
+    "Anim_Door_door_open": "animations/Anim_Door_door_open.luau",
+    "Anim_HostilePlane_HostilePlane_Flying": "animations/Anim_HostilePlane_HostilePlane_Flying.luau",
+    "Anim_PlaneHolder_PlaneHolder_holder1": "animations/Anim_PlaneHolder_PlaneHolder_holder1.luau",
+    "Anim_PlaneHolder_PlaneHolder_holder2": "animations/Anim_PlaneHolder_PlaneHolder_holder2.luau",
+    "Anim_PlaneHolder_PlaneHolder_holder3": "animations/Anim_PlaneHolder_PlaneHolder_holder3.luau",
+    "PrefabSpawner": "packages/PrefabSpawner.luau"
+  },
+  "animation_routing": {
+    "HostilePlane": {
+      "Flying": {
+        "target": "inline_tween",
+        "reason": "non-humanoid transform-only curves"
+      }
+    },
+    "Plane Flying": {
+      "__controller__": {
+        "target": "skipped",
+        "reason": "not referenced by any parsed scene"
+      }
+    },
+    "PlaneHolder": {
+      "holder1": {
+        "target": "inline_tween",
+        "reason": "non-humanoid transform-only curves"
+      },
+      "holder2": {
+        "target": "inline_tween",
+        "reason": "non-humanoid transform-only curves"
+      },
+      "holder3": {
+        "target": "inline_tween",
+        "reason": "non-humanoid transform-only curves"
+      }
+    },
+    "door": {
+      "open": {
+        "target": "inline_tween",
+        "reason": "non-humanoid transform-only curves"
+      },
+      "close": {
+        "target": "inline_tween",
+        "reason": "non-humanoid transform-only curves"
+      }
+    }
+  }
+}

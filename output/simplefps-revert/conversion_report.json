@@ -1,0 +1,64 @@
+{
+  "generated_at": "2026-05-15T08:54:27.704383+00:00",
+  "unity_project_path": "/Users/jiazou/workspace/unity2rbxlx/test_projects/SimpleFPS",
+  "output_dir": "/Users/jiazou/workspace/unity2rbxlx/output/simplefps-revert",
+  "duration_seconds": 0.0,
+  "success": true,
+  "errors": [],
+  "warnings": [],
+  "assets": {
+    "total": 192,
+    "by_kind": {
+      "Script": 28,
+      "LocalScript": 5,
+      "ModuleScript": 12,
+      "upload_errors": 0
+    },
+    "total_size_bytes": 0,
+    "duplicates_removed": 0
+  },
+  "materials": {
+    "total": 51,
+    "fully_converted": 50,
+    "partially_converted": 0,
+    "unconvertible": 0,
+    "texture_ops": 0,
+    "unconverted_md_path": ""
+  },
+  "scripts": {
+    "total": 36,
+    "succeeded": 36,
+    "flagged_for_review": 0,
+    "skipped": 0,
+    "ai_transpiled": 0,
+    "flagged_scripts": [],
+    "method_completeness_warnings": []
+  },
+  "scene": {
+    "selected_scene": "Assets/Scenes/main.unity",
+    "scenes_parsed": 0,
+    "total_game_objects": 87,
+    "prefabs_parsed": 0,
+    "prefab_instances_resolved": 0,
+    "meshes_decimated": 0,
+    "meshes_compliant": 0
+  },
+  "components": {
+    "total_encountered": 0,
+    "converted": 1111,
+    "dropped": 0,
+    "dropped_by_type": {},
+    "dropped_details": []
+  },
+  "output": {
+    "rbxl_path": "/Users/jiazou/workspace/unity2rbxlx/output/simplefps-revert/converted_place.rbxlx",
+    "parts_written": 1147,
+    "scripts_in_place": 46,
+    "report_path": "/Users/jiazou/workspace/unity2rbxlx/output/simplefps-revert/conversion_report.json",
+    "packages": {
+      "total_packages": 0,
+      "package_names": [],
+      "packages_dir": ""
+    }
+  }
+}

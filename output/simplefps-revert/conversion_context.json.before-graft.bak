@@ -1,0 +1,771 @@
+{
+  "unity_project_path": "/Users/jiazou/workspace/unity2rbxlx/test_projects/SimpleFPS",
+  "scene_paths": [
+    "/Users/jiazou/workspace/unity2rbxlx/test_projects/SimpleFPS/Assets/Scenes/main.unity",
+    "/Users/jiazou/workspace/unity2rbxlx/test_projects/SimpleFPS/Assets/Scenes/menu.unity"
+  ],
+  "selected_scene": "/Users/jiazou/workspace/unity2rbxlx/test_projects/SimpleFPS/Assets/Scenes/main.unity",
+  "completed_phases": [
+    "parse",
+    "extract_assets",
+    "moderate_assets",
+    "upload_assets",
+    "resolve_assets",
+    "convert_materials",
+    "transpile_scripts",
+    "convert_animations",
+    "convert_scene",
+    "write_output"
+  ],
+  "current_phase": "",
+  "uploaded_assets": {
+    "Assets/AssetPack/AT Mine/textures/1k/at_mine__albedo_1k.bmp": "rbxassetid://78498951899493",
+    "Assets/AssetPack/AT Mine/textures/1k/at_mine__ao_1k.bmp": "rbxassetid://111401078296116",
+    "Assets/AssetPack/AT Mine/textures/1k/at_mine__metallic_1k.bmp": "rbxassetid://77734184316555",
+    "Assets/AssetPack/AT Mine/textures/1k/at_mine__normal_1k.bmp": "rbxassetid://116344516361631",
+    "Assets/AssetPack/AT Mine/textures/256px/at_mine__albedo_256px.bmp": "rbxassetid://118605125217579",
+    "Assets/AssetPack/AT Mine/textures/256px/at_mine__ao_256px.bmp": "rbxassetid://74366481464501",
+    "Assets/AssetPack/AT Mine/textures/256px/at_mine__metallic_256px.bmp": "rbxassetid://112913860195224",
+    "Assets/AssetPack/AT Mine/textures/256px/at_mine__normal_256px.bmp": "rbxassetid://133627944973916",
+    "Assets/AssetPack/AT Mine/textures/2k/at_mine__albedo_2k.bmp": "rbxassetid://135767145758277",
+    "Assets/AssetPack/AT Mine/textures/2k/at_mine__ao_2k.bmp": "rbxassetid://114519238526425",
+    "Assets/AssetPack/AT Mine/textures/2k/at_mine__metallic_2k.bmp": "rbxassetid://137940268116877",
+    "Assets/AssetPack/AT Mine/textures/2k/at_mine__normal_2k.bmp": "rbxassetid://90888692291771",
+    "Assets/AssetPack/AT Mine/textures/512px/at_mine__albedo_512px.bmp": "rbxassetid://102818600268590",
+    "Assets/AssetPack/AT Mine/textures/512px/at_mine__ao_512px.bmp": "rbxassetid://132746206162736",
+    "Assets/AssetPack/AT Mine/textures/512px/at_mine__metallic_512px.bmp": "rbxassetid://122563610297003",
+    "Assets/AssetPack/AT Mine/textures/512px/at_mine__normal_512px.bmp": "rbxassetid://90707970735162",
+    "Assets/AssetPack/BarbedWireSet/Textures/barbedWire.psd": "rbxassetid://111631927134363",
+    "Assets/AssetPack/BarbedWireSet/Textures/barbedWireBump.psd": "rbxassetid://102470373456383",
+    "Assets/AssetPack/HornetRifle/Model/Materials/riffle_hornet_Material_AlbedoTransparency_orange.png": "rbxassetid://110096022374530",
+    "Assets/AssetPack/HornetRifle/Model/Materials/riffle_hornet_Material_MetallicSmoothness.png": "rbxassetid://112880740910661",
+    "Assets/AssetPack/HornetRifle/Model/Materials/riffle_hornet_Material_Normal.png": "rbxassetid://104123424128180",
+    "Assets/AssetPack/HornetRifle/Model/Materials/riffle_hornet_ambient_occlusion.png": "rbxassetid://78223221630516",
+    "Assets/AssetPack/JerryCan/jerrycans_prp_diffuse.png": "rbxassetid://122712525858996",
+    "Assets/AssetPack/Lens Flares/Art Assets/85mmflare.psd": "rbxassetid://140344857737295",
+    "Assets/AssetPack/Pallet/pallet01.png": "rbxassetid://111841548502827",
+    "Assets/AssetPack/Plane/Textures/World War II - Plane - Heavy Scratches.tga": "rbxassetid://77393471344652",
+    "Assets/AssetPack/Plane/Textures/World War II - Plane - Light Scratches.tga": "rbxassetid://123968679309257",
+    "Assets/AssetPack/Plane/Textures/World War II - Plane - Normal.tga": "rbxassetid://105967219293334",
+    "Assets/AssetPack/Plane/Textures/World War II - Propeller.tga": "rbxassetid://93303239732497",
+    "Assets/AssetPack/SciFi_Battery_Pack_free/Textures/battery.psd": "rbxassetid://94312009061067",
+    "Assets/AssetPack/SciFi_Battery_Pack_free/Textures/battery_damaged.psd": "rbxassetid://90696882699507",
+    "Assets/AssetPack/SciFi_Door/Textures/Door_DF.psd": "rbxassetid://115737373911581",
+    "Assets/AssetPack/SciFi_Door/Textures/Door_NM.png": "rbxassetid://73829144658917",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/Textures/Background_Grid.psd": "rbxassetid://100226052260001",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/Textures/Mod4Lightcone.psd": "rbxassetid://136468336071762",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/Textures/Mod4_blocks.psd": "rbxassetid://91584416456973",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/Textures/Mod4_blocks_NRM.png": "rbxassetid://94572661961550",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/Textures/Mod4_parts.psd": "rbxassetid://72251143892700",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/Textures/Mod4_parts_NRM.png": "rbxassetid://94392058999084",
+    "Assets/AssetPack/SciFi_Textures/tile 1/TILE1_Dwiths.tga": "rbxassetid://88785326557092",
+    "Assets/AssetPack/SciFi_Textures/tile 1/TILE1_N.tga": "rbxassetid://112192094576963",
+    "Assets/AssetPack/SciFi_Textures/tile 4/tileable 4_Dwiths.tga": "rbxassetid://121440091806342",
+    "Assets/AssetPack/SciFi_Textures/tile 4/tileable 4_n.tga": "rbxassetid://73172287738452",
+    "Assets/AssetPack/SciFi_Textures/tile 5/TILE5_N.tga": "rbxassetid://89422714381362",
+    "Assets/AssetPack/SciFi_Textures/tile 5/TILE5_dwiths.tga": "rbxassetid://124669492317454",
+    "Assets/AssetPack/SciFi_Textures/tile2/tilable2_dwith_s.tga": "rbxassetid://124992330322546",
+    "Assets/AssetPack/SciFi_Textures/tile2/tilable2_n.tga": "rbxassetid://113620406911496",
+    "Assets/AssetPack/SciFi_Textures/tile3/tileable 3_dwiths.tga": "rbxassetid://99269917676907",
+    "Assets/AssetPack/SciFi_Textures/tile3/tileable 3_n.tga": "rbxassetid://109408927872232",
+    "Assets/AssetPack/Simple Box Pack/Textures/Ammo_DEF.tga": "rbxassetid://129280194860366",
+    "Assets/AssetPack/Simple Box Pack/Textures/HP_DEF.tga": "rbxassetid://123644732417645",
+    "Assets/AssetPack/TallFence/Textures/chainlink.psd": "rbxassetid://76340954864561",
+    "Assets/AssetPack/TallFence/Textures/metal_01_d 1.tga": "rbxassetid://111396970032352",
+    "Assets/AssetPack/TallFence/Textures/metal_01_n.tga": "rbxassetid://113014400852997",
+    "Assets/AssetPack/Wispy Sky/Textures/SkyBox02b0001.tif": "rbxassetid://74982998233272",
+    "Assets/AssetPack/Wispy Sky/Textures/SkyBox02b0002.tif": "rbxassetid://111451030709666",
+    "Assets/AssetPack/Wispy Sky/Textures/SkyBox02b0003.tif": "rbxassetid://132082858439436",
+    "Assets/AssetPack/Wispy Sky/Textures/SkyBox02b0004.tif": "rbxassetid://85713952059313",
+    "Assets/AssetPack/Wispy Sky/Textures/SkyBox02b0005.tif": "rbxassetid://129577200640636",
+    "Assets/AssetPack/Wispy Sky/Textures/SkyBox02b0006.tif": "rbxassetid://133616094875052",
+    "Assets/AssetPack/WoodMadeProps/Models/Materials/crate01.png": "rbxassetid://86472870472815",
+    "Assets/AssetPack/WoodMadeProps/Models/Materials/wood01.png": "rbxassetid://116085110958071",
+    "Assets/AssetPack/wallConcreteRough/Textures/wallconcreterough_d.psd": "rbxassetid://84833414853557",
+    "Assets/AssetPack/wallConcreteRough/Textures/wallconcreterough_n.tga": "rbxassetid://83310030766740",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/BroadleafBark.tga": "rbxassetid://127383132311348",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/BroadleafBark_Normal.tga": "rbxassetid://101978137236709",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaf_Desktop_Atlas.tga": "rbxassetid://133739766592506",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaf_Desktop_Atlas_Billboards.tga": "rbxassetid://125972878971507",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaf_Desktop_Atlas_Billboards_Normal.tga": "rbxassetid://118948379805847",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaf_Desktop_Atlas_Normal.tga": "rbxassetid://93672625233182",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaf_Desktop_Atlas_Specular.tga": "rbxassetid://129115326443381",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaf_Mobile_Atlas.tga": "rbxassetid://91615026009975",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaf_Mobile_Atlas_Billboards.tga": "rbxassetid://76217151336846",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaf_Mobile_Atlas_Billboards_Normal.tga": "rbxassetid://96665302087955",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaf_Mobile_Atlas_Normal.tga": "rbxassetid://117462431246694",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaf_Mobile_Atlas_Specular.tga": "rbxassetid://90475801415798",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaves_Card_Desktop.tga": "rbxassetid://77435945960759",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaves_Card_Desktop_Normal.tga": "rbxassetid://99712714077141",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaves_Card_Desktop_Spec.tga": "rbxassetid://86435301745572",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaves_Desktop.tga": "rbxassetid://111163861760972",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaves_Desktop_Normal.tga": "rbxassetid://129305196011666",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaves_Desktop_Spec.tga": "rbxassetid://127165626443960",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaves_Mobile.tga": "rbxassetid://88067688480984",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaves_Mobile_Normal.tga": "rbxassetid://89995392234063",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaves_Mobile_Spec.tga": "rbxassetid://100824194755121",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Cap_01.tga": "rbxassetid://77584084712651",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Cap_01_Normal.tga": "rbxassetid://86194823396785",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Cap_02.tga": "rbxassetid://84235620567322",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Cap_02_Normal.tga": "rbxassetid://135812422032737",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/ClippedFrond.tga": "rbxassetid://84192148128451",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/ClippedFrond_Normal.tga": "rbxassetid://99831308516587",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/PalmBark.tga": "rbxassetid://129427725607720",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/PalmBark_Detail.tga": "rbxassetid://97566824058499",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/PalmBark_Detail_Normal.tga": "rbxassetid://92891287044461",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/PalmBark_Normal.tga": "rbxassetid://92940167463361",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/PalmFrond.tga": "rbxassetid://108480495668590",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/PalmFrond_Normal.tga": "rbxassetid://118818188083411",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/PalmFrond_Spec.tga": "rbxassetid://126886237884427",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/Palm_Desktop_Atlas.tga": "rbxassetid://77918138439062",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/Palm_Desktop_Atlas_Billboards.tga": "rbxassetid://89725898538666",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/Palm_Desktop_Atlas_Billboards_Normal.tga": "rbxassetid://83542209531234",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/Palm_Desktop_Atlas_Normal.tga": "rbxassetid://92696554692599",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/Palm_Desktop_Atlas_Specular.tga": "rbxassetid://113968053602931",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/Thumb_Palm_Desktop.jpg": "rbxassetid://87370244344928",
+    "Assets/Standard Assets/Environment/TerrainAssets/BillboardTextures/GrassFrond01AlbedoAlpha.psd": "rbxassetid://121556752673026",
+    "Assets/Standard Assets/Environment/TerrainAssets/BillboardTextures/GrassFrond02AlbedoAlpha.psd": "rbxassetid://128972801774621",
+    "Assets/Standard Assets/Environment/TerrainAssets/SurfaceTextures/CliffAlbedoSpecular.psd": "rbxassetid://79968788588460",
+    "Assets/Standard Assets/Environment/TerrainAssets/SurfaceTextures/GrassHillAlbedo.psd": "rbxassetid://92587379578138",
+    "Assets/Standard Assets/Environment/TerrainAssets/SurfaceTextures/GrassRockyAlbedo.psd": "rbxassetid://90261529064773",
+    "Assets/Standard Assets/Environment/TerrainAssets/SurfaceTextures/MudRockyAlbedoSpecular.bmp": "rbxassetid://90477483163210",
+    "Assets/Standard Assets/Environment/TerrainAssets/SurfaceTextures/MudRockyNormals.bmp": "rbxassetid://74289004602763",
+    "Assets/Standard Assets/Environment/TerrainAssets/SurfaceTextures/SandAlbedo.psd": "rbxassetid://88331141519567",
+    "Assets/Standard Assets/Environment/Water/Water/Textures/WaterBump.jpg": "rbxassetid://135408312958221",
+    "Assets/Standard Assets/Environment/Water/Water/Textures/WaterFresnel.psd": "rbxassetid://93962874320157",
+    "Assets/Standard Assets/Environment/Water/Water/Textures/WaterProDaytimeGradient.psd": "rbxassetid://130245021457738",
+    "Assets/Standard Assets/Environment/Water/Water/Textures/WaterProNighttimeGradient.psd": "rbxassetid://132322881450260",
+    "Assets/Standard Assets/Environment/Water/Water4/Textures/SimpleFoam.png": "rbxassetid://101709235871337",
+    "Assets/Standard Assets/Environment/Water/Water4/Textures/SmallWaves.png": "rbxassetid://103640044695975",
+    "Assets/Standard Assets/Environment/Water (Basic)/Textures/WaterBasicDaytimeGradient.psd": "rbxassetid://85206681426486",
+    "Assets/Standard Assets/Environment/Water (Basic)/Textures/WaterBasicNighttimeGradient.psd": "rbxassetid://83907390943341",
+    "Assets/Standard Assets/Environment/Water (Basic)/Textures/WaterBasicNormals.jpg": "rbxassetid://119915618900793",
+    "Assets/Standard Assets/ParticleSystems/Textures/ParticleBokeh.png": "rbxassetid://93573414282334",
+    "Assets/Standard Assets/ParticleSystems/Textures/ParticleCloudBlack.png": "rbxassetid://75331528089594",
+    "Assets/Standard Assets/ParticleSystems/Textures/ParticleCloudWhite.png": "rbxassetid://115450820352068",
+    "Assets/Standard Assets/ParticleSystems/Textures/ParticleFireballSheet.png": "rbxassetid://132906947112593",
+    "Assets/Standard Assets/ParticleSystems/Textures/ParticleFirecloud.png": "rbxassetid://90669192769827",
+    "Assets/Standard Assets/ParticleSystems/Textures/ParticleFlameLickSheet.png": "rbxassetid://72176597722779",
+    "Assets/Standard Assets/ParticleSystems/Textures/ParticleFlamesSheet.png": "rbxassetid://98424547541886",
+    "Assets/Standard Assets/ParticleSystems/Textures/ParticleFlare.png": "rbxassetid://139518252618754",
+    "Assets/Standard Assets/ParticleSystems/Textures/Spark.png": "rbxassetid://112487373584168",
+    "Assets/Standard Assets/ParticleSystems/Textures/SplashesFineParticle.png": "rbxassetid://79927003273234",
+    "Assets/Standard Assets/ParticleSystems/Textures/SplashesLargeParticle.png": "rbxassetid://123091791368977",
+    "Assets/Textures/esc.png": "rbxassetid://98936089961826",
+    "Assets/Textures/lmb.png": "rbxassetid://90354186301990",
+    "Assets/Textures/prop_keycard_nrm.tif": "rbxassetid://116255972359599",
+    "Assets/Textures/space.png": "rbxassetid://133723387980678",
+    "Assets/Textures/wasd.png": "rbxassetid://74697541125153",
+    "Assets/AssetPack/BarbedWireSet/barbedWireRoll.fbx": "rbxassetid://129444916226992",
+    "Assets/AssetPack/HornetRifle/Model/HornetRifle.fbx": "rbxassetid://130939794751918",
+    "Assets/AssetPack/JerryCan/jerrycan02_prp.fbx": "rbxassetid://74367257128066",
+    "Assets/AssetPack/Pallet/pallet03_prp.fbx": "rbxassetid://116885490196204",
+    "Assets/AssetPack/Plane/Models/World War II - Plane - Flying.fbx": "rbxassetid://104637676082046",
+    "Assets/AssetPack/Plane/Models/World War II - Plane - Ground.fbx": "rbxassetid://95230321139039",
+    "Assets/AssetPack/SciFi_Battery_Pack_free/FBX/Battery_medium_05.FBX": "rbxassetid://83093233320313",
+    "Assets/AssetPack/SciFi_Battery_Pack_free/FBX/Battery_small_06.FBX": "rbxassetid://113904101945064",
+    "Assets/AssetPack/SciFi_Door/SF_Door.fbx": "rbxassetid://118653356397569",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Antenna_lg.FBX": "rbxassetid://112878335558244",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Battery_double.FBX": "rbxassetid://71552999948793",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Battery_single.FBX": "rbxassetid://85732495379390",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/BoxBeltLG_sym.FBX": "rbxassetid://133021065693479",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Box_big_base.FBX": "rbxassetid://70982975059598",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Box_big_cap.FBX": "rbxassetid://100934583177762",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Box_big_tall.FBX": "rbxassetid://97729427128434",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Camera3.FBX": "rbxassetid://86591448354176",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Girder_Base.FBX": "rbxassetid://129650121148347",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Girder_Short.FBX": "rbxassetid://76511403888474",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Vent_Big.FBX": "rbxassetid://82309214327935",
+    "Assets/AssetPack/Simple Box Pack/Meshes/AMMO_FBX.FBX": "rbxassetid://93382587775553",
+    "Assets/AssetPack/Simple Box Pack/Meshes/HP_FBX.FBX": "rbxassetid://122629655910041",
+    "Assets/AssetPack/TallFence/tallfence.fbx": "rbxassetid://70528797154938",
+    "Assets/AssetPack/WoodMadeProps/Models/beam01.FBX": "rbxassetid://88505603377040",
+    "Assets/AssetPack/WoodMadeProps/Models/crate01.FBX": "rbxassetid://76341079440233",
+    "Assets/AssetPack/WoodMadeProps/Models/cylinder01.FBX": "rbxassetid://76374556846422",
+    "Assets/AssetPack/WoodMadeProps/Models/plank01.FBX": "rbxassetid://132727282105453",
+    "Assets/AssetPack/WoodMadeProps/Models/plank02.FBX": "rbxassetid://96964273633125",
+    "Assets/AssetPack/WoodMadeProps/Models/plank03a.FBX": "rbxassetid://111584171787564",
+    "Assets/AssetPack/WoodMadeProps/Models/plank03b.FBX": "rbxassetid://87088483675749",
+    "Assets/AssetPack/WoodMadeProps/Models/plank04.FBX": "rbxassetid://117851478073479",
+    "Assets/AssetPack/wallConcreteRough/wallConcreteRough.fbx": "rbxassetid://122027926212267",
+    "Assets/AssetPack/wallConcreteRough/wallConcreteRoughShort.fbx": "rbxassetid://138161498208835",
+    "Assets/Models/prop_keycard.fbx": "rbxassetid://74843140845967",
+    "Assets/Models/totem_01.fbx": "rbxassetid://100065853301416",
+    "Assets/Models/turret_01.fbx": "rbxassetid://115400444126329",
+    "Assets/Standard Assets/Environment/Water/Water/Models/WaterPlane.fbx": "rbxassetid://118831755993551",
+    "Assets/Standard Assets/Environment/Water/Water4/Models/OceanPlane.FBX": "rbxassetid://119295846936757",
+    "Assets/Standard Assets/Environment/Water (Basic)/Models/WaterBasicPlane.fbx": "rbxassetid://86019881801040",
+    "Assets/Sounds/ammo.mp3": "rbxassetid://81935925926691",
+    "Assets/Sounds/beach.mp3": "rbxassetid://90064117681603",
+    "Assets/Sounds/cannon.mp3": "rbxassetid://117501363682725",
+    "Assets/Sounds/door.mp3": "rbxassetid://133262216193849",
+    "Assets/Sounds/dryfire.mp3": "rbxassetid://114051454658537",
+    "Assets/Sounds/explosion.mp3": "rbxassetid://105944113125234",
+    "Assets/Sounds/forest.mp3": "rbxassetid://113870070475927",
+    "Assets/Sounds/gunshot.mp3": "rbxassetid://79924534148926",
+    "Assets/Sounds/health.mp3": "rbxassetid://132611916517910",
+    "Assets/Sounds/mine.mp3": "rbxassetid://75267553618817",
+    "Assets/Sounds/music.mp3": "rbxassetid://87660282049037",
+    "Assets/Sounds/pickup.mp3": "rbxassetid://118209857531386",
+    "Assets/Sounds/plane.mp3": "rbxassetid://77148530956263",
+    "Assets/Sounds/playerhit.mp3": "rbxassetid://75411340630488",
+    "Assets/Sounds/playerwalk.mp3": "rbxassetid://89370470082676",
+    "Assets/Sounds/turrethit.mp3": "rbxassetid://122395380086508"
+  },
+  "asset_upload_errors": [],
+  "universe_id": 10163878543,
+  "place_id": 117163526550862,
+  "experience_name": "",
+  "total_game_objects": 87,
+  "converted_parts": 1077,
+  "total_scripts": 36,
+  "transpiled_scripts": 36,
+  "total_materials": 51,
+  "converted_materials": 50,
+  "total_animations": 7,
+  "converted_animations": 6,
+  "warnings": [],
+  "errors": [],
+  "mesh_native_sizes": {},
+  "mesh_texture_ids": {},
+  "mesh_hierarchies": {},
+  "fbx_bounding_boxes": {
+    "Assets/AssetPack/HornetRifle/Model/HornetRifle.fbx": [
+      0.8271936178207397,
+      3.802738904953003,
+      1.1437103748321533
+    ],
+    "Assets/AssetPack/Plane/Models/World War II - Plane - Flying.fbx": [
+      2866.70458984375,
+      1851.0741271972656,
+      710.4402160644531
+    ],
+    "Assets/AssetPack/Plane/Models/World War II - Plane - Ground.fbx": [
+      3055.906982421875,
+      1967.1331176757812,
+      598.1778262257576
+    ],
+    "Assets/AssetPack/SciFi_Battery_Pack_free/FBX/Battery_medium_05.FBX": [
+      526.2354736328125,
+      402.41094970703125,
+      915.9842376708984
+    ],
+    "Assets/AssetPack/SciFi_Battery_Pack_free/FBX/Battery_small_06.FBX": [
+      811.6731262207031,
+      847.7745361328125,
+      1015.7207927703857
+    ],
+    "Assets/AssetPack/SciFi_Door/SF_Door.fbx": [
+      4.882572174072266,
+      0.7250714302062988,
+      4.939934730529785
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Antenna_lg.FBX": [
+      50.982994079589844,
+      40.277122497558594,
+      384.8507995605469
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Battery_double.FBX": [
+      150.0,
+      30.88731288909912,
+      150.0
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Battery_single.FBX": [
+      74.2708740234375,
+      30.88731288909912,
+      150.0
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/BoxBeltLG_sym.FBX": [
+      222.39627075195312,
+      222.39590454101562,
+      34.177791595458984
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Box_big_base.FBX": [
+      238.78077697753906,
+      238.780517578125,
+      55.63888931274414
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Box_big_cap.FBX": [
+      219.46311950683594,
+      200.0,
+      55.34521484375
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Box_big_tall.FBX": [
+      200.0,
+      200.0,
+      412.0
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Camera3.FBX": [
+      113.47954559326172,
+      121.27579879760742,
+      85.82931518554688
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Girder_Base.FBX": [
+      125.44340896606445,
+      42.387027740478516,
+      29.52655792236328
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Girder_Short.FBX": [
+      100.00003814697266,
+      25.193082809448242,
+      200.0
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Vent_Big.FBX": [
+      229.7635498046875,
+      200.0,
+      35.6695556640625
+    ],
+    "Assets/AssetPack/Simple Box Pack/Meshes/AMMO_FBX.FBX": [
+      60.21075439453125,
+      72.59718322753906,
+      33.464839935302734
+    ],
+    "Assets/AssetPack/Simple Box Pack/Meshes/HP_FBX.FBX": [
+      60.21075439453125,
+      72.59718322753906,
+      33.464839935302734
+    ],
+    "Assets/AssetPack/WoodMadeProps/Models/beam01.FBX": [
+      240.1093978881836,
+      13.804794311523438,
+      13.804179668426514
+    ],
+    "Assets/AssetPack/WoodMadeProps/Models/crate01.FBX": [
+      60.41735649108887,
+      60.41735649108887,
+      60.32521569728851
+    ],
+    "Assets/AssetPack/WoodMadeProps/Models/cylinder01.FBX": [
+      16.802515029907227,
+      16.802515029907227,
+      8.01230001449585
+    ],
+    "Assets/AssetPack/WoodMadeProps/Models/plank01.FBX": [
+      120.0,
+      10.0,
+      2.0
+    ],
+    "Assets/AssetPack/WoodMadeProps/Models/plank02.FBX": [
+      60.1082706451416,
+      5.032472133636475,
+      5.0232854671776295
+    ],
+    "Assets/AssetPack/WoodMadeProps/Models/plank03a.FBX": [
+      37.42569923400879,
+      22.490397453308105,
+      2.241943359375
+    ],
+    "Assets/AssetPack/WoodMadeProps/Models/plank03b.FBX": [
+      37.42569923400879,
+      22.490397453308105,
+      2.241943359375
+    ],
+    "Assets/AssetPack/WoodMadeProps/Models/plank04.FBX": [
+      39.93572425842285,
+      11.02888298034668,
+      5.023285388946533
+    ],
+    "Assets/Models/prop_keycard.fbx": [
+      89.05160903930664,
+      92.3212661743164,
+      5.505046606063843
+    ],
+    "Assets/Models/totem_01.fbx": [
+      1.966897964477539,
+      4.164636611938477,
+      5.41813325881958
+    ],
+    "Assets/Standard Assets/Environment/Water/Water/Models/WaterPlane.fbx": [
+      1.9999993443489075,
+      0.0,
+      1.9999987483024597
+    ],
+    "Assets/Standard Assets/Environment/Water/Water4/Models/OceanPlane.FBX": [
+      100.0,
+      6.123235057019227e-15,
+      100.00001907348633
+    ],
+    "Assets/Standard Assets/Environment/Water (Basic)/Models/WaterBasicPlane.fbx": [
+      1.9999993443489075,
+      0.0,
+      1.9999987483024597
+    ]
+  },
+  "scenes_metadata": {},
+  "comparison_scores": {},
+  "storage_plan": {
+    "server_scripts": [
+      "GerstnerDisplace",
+      "MeshContainer",
+      "PlaneTexture",
+      "Door",
+      "HostilePlane",
+      "Machine",
+      "Mine",
+      "Pickup",
+      "Plane",
+      "PlaneBullet",
+      "SpawnPoint",
+      "Turret",
+      "TurretBullet",
+      "SpecularLighting",
+      "Water",
+      "WaterTile",
+      "WaterBasic",
+      "AfterburnerPhysicsForce",
+      "ExplosionFireAndDebris",
+      "ExplosionPhysicsForce",
+      "Explosive",
+      "ExtinguishableParticleSystem",
+      "FireLight",
+      "SmokeParticles",
+      "WaterHoseParticles",
+      "ParticleSystemDestroyer",
+      "Anim_HostilePlane_HostilePlane_Flying",
+      "Anim_PlaneHolder_PlaneHolder_holder1",
+      "Anim_PlaneHolder_PlaneHolder_holder2",
+      "Anim_PlaneHolder_PlaneHolder_holder3",
+      "Anim_Door_door_open",
+      "Anim_Door_door_close",
+      "_AutoDamageEventRouter"
+    ],
+    "client_scripts": [
+      "GameManager",
+      "HudControl",
+      "Menu",
+      "Player",
+      "Hose"
+    ],
+    "character_scripts": [],
+    "replicated_first_scripts": [],
+    "shared_modules": [],
+    "server_modules": [
+      "Displace",
+      "WaterBase",
+      "PlanarReflection",
+      "ParticleSystemMultiplier",
+      "ObjectResetter"
+    ],
+    "replicated_templates": [],
+    "server_templates": [],
+    "ui_templates": [],
+    "remote_events": [
+      "Ammo",
+      "Collider",
+      "DamageEvent",
+      "Flare",
+      "Head",
+      "Health",
+      "Humanoid",
+      "HumanoidRootPart",
+      "PickupItemEvent",
+      "Player",
+      "PlayerModule",
+      "PlayerScripts",
+      "Rifle",
+      "Templates"
+    ],
+    "decisions": [
+      {
+        "script": "Displace",
+        "script_type": "ModuleScript",
+        "container": "ServerStorage",
+        "reason": "required only by server-side callers (1)"
+      },
+      {
+        "script": "GerstnerDisplace",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "MeshContainer",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "WaterBase",
+        "script_type": "ModuleScript",
+        "container": "ServerStorage",
+        "reason": "required only by server-side callers (2)"
+      },
+      {
+        "script": "PlaneTexture",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Door",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "GameManager",
+        "script_type": "LocalScript",
+        "container": "StarterPlayer.StarterPlayerScripts",
+        "reason": "uses client-only APIs (LocalPlayer, UserInputService, etc.)"
+      },
+      {
+        "script": "HostilePlane",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "HudControl",
+        "script_type": "LocalScript",
+        "container": "StarterPlayer.StarterPlayerScripts",
+        "reason": "uses client-only APIs (LocalPlayer, UserInputService, etc.)"
+      },
+      {
+        "script": "Machine",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Menu",
+        "script_type": "LocalScript",
+        "container": "StarterPlayer.StarterPlayerScripts",
+        "reason": "uses client-only APIs (LocalPlayer, UserInputService, etc.)"
+      },
+      {
+        "script": "Mine",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Pickup",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Plane",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "PlaneBullet",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Player",
+        "script_type": "LocalScript",
+        "container": "StarterPlayer.StarterPlayerScripts",
+        "reason": "uses client-only APIs (LocalPlayer, UserInputService, etc.)"
+      },
+      {
+        "script": "SpawnPoint",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Turret",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "TurretBullet",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "PlanarReflection",
+        "script_type": "ModuleScript",
+        "container": "ServerStorage",
+        "reason": "required only by server-side callers (1)"
+      },
+      {
+        "script": "SpecularLighting",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Water",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "WaterTile",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "WaterBasic",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "AfterburnerPhysicsForce",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "ExplosionFireAndDebris",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "ExplosionPhysicsForce",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Explosive",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "ExtinguishableParticleSystem",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "FireLight",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Hose",
+        "script_type": "LocalScript",
+        "container": "StarterPlayer.StarterPlayerScripts",
+        "reason": "uses client-only APIs (LocalPlayer, UserInputService, etc.)"
+      },
+      {
+        "script": "ParticleSystemMultiplier",
+        "script_type": "ModuleScript",
+        "container": "ServerStorage",
+        "reason": "required only by server-side callers (2)"
+      },
+      {
+        "script": "SmokeParticles",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "WaterHoseParticles",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "ObjectResetter",
+        "script_type": "ModuleScript",
+        "container": "ServerStorage",
+        "reason": "required only by server-side callers (1)"
+      },
+      {
+        "script": "ParticleSystemDestroyer",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Anim_HostilePlane_HostilePlane_Flying",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Anim_PlaneHolder_PlaneHolder_holder1",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Anim_PlaneHolder_PlaneHolder_holder2",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Anim_PlaneHolder_PlaneHolder_holder3",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Anim_Door_door_open",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "Anim_Door_door_close",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      },
+      {
+        "script": "_AutoDamageEventRouter",
+        "script_type": "Script",
+        "container": "ServerScriptService",
+        "reason": "server Script (default)"
+      }
+    ],
+    "overrides_applied": []
+  },
+  "sprite_guid_to_file": {
+    "5b49c3c412bf6c8469449a4c7c389066": "/Users/jiazou/workspace/unity2rbxlx/output/simplefps-revert/sprites/space.png",
+    "9e3fb36c7204cb94fbab15a54188c8a8": "/Users/jiazou/workspace/unity2rbxlx/output/simplefps-revert/sprites/esc.png",
+    "cf493bdd09dbc1246988f2351b2d7493": "/Users/jiazou/workspace/unity2rbxlx/output/simplefps-revert/sprites/wasd.png",
+    "923d77a14b2dc164cbb30693475ff993": "/Users/jiazou/workspace/unity2rbxlx/output/simplefps-revert/sprites/lmb.png"
+  },
+  "serialized_field_refs": {
+    "Assets/Scripts/HudControl.cs": {},
+    "Assets/Scripts/HostilePlane.cs": {
+      "shootSound": "audio:/Users/jiazou/workspace/unity2rbxlx/test_projects/SimpleFPS/Assets/Sounds/cannon.mp3",
+      "ammoPrefab": "PlaneBullet"
+    },
+    "Assets/Scripts/Mine.cs": {
+      "explosion": "Explosion"
+    },
+    "Assets/Scripts/Plane.cs": {
+      "flyingPlane": "Plane Flying"
+    },
+    "Assets/Scripts/PlaneBullet.cs": {
+      "explosion": "Explosion"
+    },
+    "Assets/Scripts/Player.cs": {
+      "riflePrefab": "Rifle",
+      "feedbackPrefab": "Flare",
+      "walkSound": "audio:/Users/jiazou/workspace/unity2rbxlx/test_projects/SimpleFPS/Assets/Sounds/playerwalk.mp3",
+      "shootSound": "audio:/Users/jiazou/workspace/unity2rbxlx/test_projects/SimpleFPS/Assets/Sounds/gunshot.mp3",
+      "dryFireSound": "audio:/Users/jiazou/workspace/unity2rbxlx/test_projects/SimpleFPS/Assets/Sounds/dryfire.mp3",
+      "hitSound": "audio:/Users/jiazou/workspace/unity2rbxlx/test_projects/SimpleFPS/Assets/Sounds/playerhit.mp3",
+      "pickAmmoSound": "audio:/Users/jiazou/workspace/unity2rbxlx/test_projects/SimpleFPS/Assets/Sounds/ammo.mp3",
+      "pickHealthSound": "audio:/Users/jiazou/workspace/unity2rbxlx/test_projects/SimpleFPS/Assets/Sounds/health.mp3",
+      "pickSound": "audio:/Users/jiazou/workspace/unity2rbxlx/test_projects/SimpleFPS/Assets/Sounds/pickup.mp3"
+    },
+    "Assets/Scripts/Turret.cs": {
+      "hitSound": "audio:/Users/jiazou/workspace/unity2rbxlx/test_projects/SimpleFPS/Assets/Sounds/turrethit.mp3",
+      "turretBullet": "TurretBullet",
+      "explosionPrefab": "Explosion",
+      "smokePrefab": "Smoke"
+    },
+    "Assets/Standard Assets/Environment/Water/Water/Scripts/WaterBase.cs": {}
+  },
+  "scaffolding": []
+}

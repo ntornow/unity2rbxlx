@@ -1,0 +1,14 @@
+{
+  "total_templates": 7,
+  "emitted_names": [
+    "Explosion",
+    "Flare",
+    "Plane Flying",
+    "PlaneBullet",
+    "Rifle",
+    "Smoke",
+    "TurretBullet"
+  ],
+  "referenced_but_missing": [],
+  "variant_chains": {}
+}
