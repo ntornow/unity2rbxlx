@@ -1450,9 +1450,17 @@ def _fix_door_module_player_lookup(scripts: list["RbxScript"]) -> int:
 # Rewrite to derive the Player instance from the character and read
 # the (lowercase) ``has<Suffix>`` attribute Pickup actually writes.
 
+# Capture the H/h prefix separately so we can distinguish the AI's
+# capital-Has emission (``HasKey``) from our own lowercase rewrite
+# (``hasKey``). Group 2 is the leading H/h; group 3 is the suffix word.
 _DOOR_DIRECT_ATTR_RE = re.compile(
-    r'([a-zA-Z_]\w*)\s*:\s*GetAttribute\(\s*"[Hh]as(\w+)"\s*\)'
+    r'([a-zA-Z_]\w*)\s*:\s*GetAttribute\(\s*"([Hh])as(\w+)"\s*\)'
 )
+
+# Variables already holding a Player instance — do NOT wrap these in
+# ``GetPlayerFromCharacter(...)``. The AI sometimes resolves Player itself
+# via a ``getPlayerFromPart`` helper before reaching the attribute read.
+_PLAYER_VARIABLE_NAMES = frozenset({"player", "plr", "_p"})
 
 
 def _detect_door_direct_character_attribute(scripts: list["RbxScript"]) -> bool:
@@ -1460,8 +1468,15 @@ def _detect_door_direct_character_attribute(scripts: list["RbxScript"]) -> bool:
         if s.name != "Door":
             continue
         src = s.source or ""
-        if _DOOR_DIRECT_ATTR_RE.search(src):
-            return True
+        # Only fire when the attribute name carries the AI's capital ``Has``
+        # prefix (``HasKey``). Lowercase ``hasX`` reads are the canonical
+        # post-rewrite shape and must not be rematched — otherwise the pack
+        # would re-wrap its own output on every coherence pass and produce
+        # nested ``GetPlayerFromCharacter(player)`` IIFEs that always return
+        # nil (the door never opens even with the key).
+        for m in _DOOR_DIRECT_ATTR_RE.finditer(src):
+            if m.group(2) == "H":
+                return True
     return False
 
 
@@ -1472,7 +1487,9 @@ def _detect_door_direct_character_attribute(scripts: list["RbxScript"]) -> bool:
     "read the lowercase ``hasX`` attribute the Pickup coherence pack "
     "writes server-side. Door runs server-side; character attributes "
     "set by client LocalScripts don't replicate, so the read returns "
-    "nil and the door never opens.",
+    "nil and the door never opens. Detect only matches the AI-emitted "
+    "capital-Has shape; rewrites use lowercase ``has`` so the pack is "
+    "idempotent (won't double-wrap on a second coherence pass).",
     detect=_detect_door_direct_character_attribute,
     after=("pickup_remote_event_server",),
 )
@@ -1485,8 +1502,20 @@ def _fix_door_direct_character_attribute(scripts: list["RbxScript"]) -> int:
 
         def _replace(m: "re.Match[str]") -> str:
             char_var = m.group(1)
-            suffix = m.group(2)
+            h_prefix = m.group(2)
+            suffix = m.group(3)
+            # Only rewrite the AI's capital-Has emission. Lowercase ``hasX``
+            # is the canonical post-rewrite shape — leave it alone so the
+            # pack is idempotent.
+            if h_prefix != "H":
+                return m.group(0)
             attr = "has" + suffix
+            if char_var in _PLAYER_VARIABLE_NAMES:
+                # Variable already holds a Player; only the attribute name
+                # is wrong (Pickup writes lowercase ``hasX``). Wrapping
+                # this in ``GetPlayerFromCharacter(player)`` would feed a
+                # Player where a Character is expected and produce nil.
+                return f'{char_var}:GetAttribute("{attr}") == true'
             # Inline IIFE so the rewrite fits any expression position
             # (condition, return, assignment). Players service is
             # already imported at the top of Door.luau by api_mappings.
@@ -1807,6 +1836,111 @@ def _add_trigger_stay_polling(scripts: list["RbxScript"]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Pack: turret_trigger_stay_polling_v2
+# ---------------------------------------------------------------------------
+#
+# Sibling of ``trigger_stay_polling`` for the AI's newer Turret emission
+# shape. The older pack expects ``getTBase`` / ``triggerCollider`` /
+# ``startEngaged`` / ``getForward(...)`` / ``model`` helpers — names a
+# different generation of the AI transpile used. Today's emission produces
+# ``tBase`` (variable), ``engagedUpdate(target)`` (function), ``container``,
+# and uses ``getCFrame(obj).LookVector`` instead of a ``getForward`` helper.
+# Without re-detection on the new shape, Touched only fires on initial
+# contact and a rotating Default-state turret never engages a player who
+# was outside the cone when they first touched the trigger.
+
+def _detect_turret_trigger_stay_polling_v2(scripts: list["RbxScript"]) -> bool:
+    for s in scripts:
+        if s.name != "Turret":
+            continue
+        src = s.source or ""
+        if "_AutoFpsTurretPoll" in src:
+            return False
+        # All four signals identify the new turret AI emission shape.
+        if (
+            "engagedUpdate" in src
+            and "isPlayerPart" in src
+            and "vectorAngle" in src
+            and "State.Engaged" in src
+            and "tBase" in src
+        ):
+            return True
+    return False
+
+
+@patch_pack(
+    name="turret_trigger_stay_polling_v2",
+    description=(
+        "Append a Heartbeat poll to Turret scripts emitted in the newer "
+        "AI shape (``tBase``/``engagedUpdate``/``container``). Mirrors "
+        "Unity's OnTriggerStay so a rotating turret eventually engages "
+        "a target whose first-contact angle was outside the cone."
+    ),
+    detect=_detect_turret_trigger_stay_polling_v2,
+)
+def _add_turret_trigger_stay_polling_v2(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    poll = (
+        "\n\n-- _AutoFpsTurretPoll: Unity OnTriggerStay equivalent. Roblox\n"
+        "-- .Touched fires only on initial contact; a rotating turret in the\n"
+        "-- Default state needs to re-test the line-of-sight cone every frame\n"
+        "-- in case its facing changed since the player touched the trigger.\n"
+        "do\n"
+        "    local _RunService = game:GetService(\"RunService\")\n"
+        "    local _lastCheck = 0\n"
+        "    _RunService.Heartbeat:Connect(function()\n"
+        "        if state == State.Engaged then return end\n"
+        "        if tick() - _lastCheck < 0.15 then return end\n"
+        "        _lastCheck = tick()\n"
+        "        if not tBase then return end\n"
+        "        local _basePos = getPosition(tBase)\n"
+        "        local _fwd = getCFrame(tBase).LookVector\n"
+        "        local _hits = workspace:GetPartBoundsInRadius(_basePos, sightRadius)\n"
+        "        for _, _hit in ipairs(_hits) do\n"
+        "            if isPlayerPart(_hit) then\n"
+        "                local _char = getCharacterFromTouch(_hit)\n"
+        "                if _char then\n"
+        "                    local _tp = _char:FindFirstChild(\"HumanoidRootPart\") or _hit\n"
+        "                    local _dir = _tp.Position - _basePos\n"
+        "                    if vectorAngle(_dir, _fwd) < 55 then\n"
+        "                        local _rp = RaycastParams.new()\n"
+        "                        _rp.FilterDescendantsInstances = {container}\n"
+        "                        _rp.FilterType = Enum.RaycastFilterType.Exclude\n"
+        "                        local _res = workspace:Raycast(_basePos, _dir.Unit * sightRadius, _rp)\n"
+        "                        if _res and isPlayerPart(_res.Instance) then\n"
+        "                            task.spawn(engagedUpdate, _char)\n"
+        "                            return\n"
+        "                        end\n"
+        "                    end\n"
+        "                end\n"
+        "            end\n"
+        "        end\n"
+        "    end)\n"
+        "end\n"
+    )
+    for s in scripts:
+        if s.name != "Turret":
+            continue
+        if "_AutoFpsTurretPoll" in s.source:
+            continue
+        # Same gate as detect — only patch scripts that actually have the
+        # required helpers in scope, otherwise the appended block would
+        # reference undefined names.
+        if not (
+            "engagedUpdate" in s.source
+            and "isPlayerPart" in s.source
+            and "vectorAngle" in s.source
+            and "State.Engaged" in s.source
+            and "tBase" in s.source
+        ):
+            continue
+        s.source = s.source.rstrip() + poll
+        fixes += 1
+        log.info("  Added OnTriggerStay polling loop (v2) to '%s'", s.name)
+    return fixes
+
+
+# ---------------------------------------------------------------------------
 # Pack: producer_consumer_bindable_events
 # ---------------------------------------------------------------------------
 #
@@ -2052,83 +2186,41 @@ _DOOR_TWEEN_BLOCK = """
 -- tweens it +14.28 studs Y (Unity 4m × STUDS_PER_METER) on open, back
 -- on close. Mecanim Animator → TweenService bridge.
 --
--- Per-door coexistence guard: skip if THIS door already has an
--- ``Anim_*door_*`` driver script wired to its parent (e.g. as a
--- WaitForChild target in ReplicatedStorage or as a script child of
--- the same prefab Model). Otherwise the project-level pack and the
--- per-door animation driver would both tween the same mesh on every
--- attribute change → overshoot/jitter (codex round-10 [P2]).
+-- Always wires the tween. The earlier ``_hasAnimDriver`` deferral was a
+-- false safety: the animation phase's auto-generated ``Anim_*_door_open``
+-- driver tweens by an unscaled +4 studs (raw Unity meters, missing
+-- STUDS_PER_METER), and its companion ``Anim_*_door_close`` ships a
+-- (0,0,0) close offset, so deferring left doors with imperceptible
+-- motion (or none at all). Tweening here unconditionally fixes the open
+-- motion; the AnimClip drivers' +4 stud overshoot is small enough that
+-- co-existence is a non-issue in practice.
 do
     local TweenService = game:GetService("TweenService")
     local _doorContainer = script.Parent
     local _parent = _doorContainer and _doorContainer.Parent
     local _doorMesh = _parent and _parent:FindFirstChild("door")
     if _doorMesh and _doorMesh:IsA("BasePart") then
-        -- Scan the door's parent prefab (and ReplicatedStorage if the
-        -- driver lives there) for an existing animation driver
-        -- whose name matches ``Anim_(<Prefab>_)?door_(open|close)``
-        -- (case-insensitive). When found, defer to it.
-        local function _hasAnimDriver()
-            local function _matchName(name)
-                local lower = string.lower(name)
-                if string.match(lower, "^anim_door_open$")
-                    or string.match(lower, "^anim_door_close$") then
-                    return true
-                end
-                if string.match(lower, "^anim_.+_door_open$")
-                    or string.match(lower, "^anim_.+_door_close$") then
-                    return true
-                end
-                return false
-            end
-            -- Walk the prefab Model's descendants.
-            if _parent then
-                for _, d in ipairs(_parent:GetDescendants()) do
-                    if d:IsA("Script") or d:IsA("LocalScript") then
-                        if _matchName(d.Name) then return true end
-                    end
-                end
-            end
-            -- Animation phase parents drivers under various services
-            -- depending on whether the driver is prefab-scoped or
-            -- scene-scoped:
-            --   - prefab-scoped:  ReplicatedStorage.Templates.<Prefab>
-            --                     (also a child of the prefab Model)
-            --   - scene-scoped:   ServerScriptService (round-11 [P1])
-            -- Scan all three to catch every shape.
-            for _, svcName in ipairs({"ReplicatedStorage", "ServerScriptService"}) do
-                local svc = game:GetService(svcName)
-                for _, d in ipairs(svc:GetDescendants()) do
-                    if d:IsA("Script") or d:IsA("LocalScript") then
-                        if _matchName(d.Name) then return true end
-                    end
-                end
-            end
-            return false
+        local _STUDS_PER_METER = 3.571
+        local _OPEN_OFFSET = Vector3.new(0, 4 * _STUDS_PER_METER, 0)
+        local _closedCFrame = _doorMesh.CFrame
+        local _openCFrame = _closedCFrame + _OPEN_OFFSET
+        local _currentTween
+        local function _animateTo(target)
+            if _currentTween then _currentTween:Cancel() end
+            _currentTween = TweenService:Create(
+                _doorMesh,
+                TweenInfo.new(1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+                { CFrame = target }
+            )
+            _currentTween:Play()
         end
-        if not _hasAnimDriver() then
-            local _STUDS_PER_METER = 3.571
-            local _OPEN_OFFSET = Vector3.new(0, 4 * _STUDS_PER_METER, 0)
-            local _closedCFrame = _doorMesh.CFrame
-            local _openCFrame = _closedCFrame + _OPEN_OFFSET
-            local _currentTween
-            local function _animateTo(target)
-                if _currentTween then _currentTween:Cancel() end
-                _currentTween = TweenService:Create(
-                    _doorMesh,
-                    TweenInfo.new(1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-                    { CFrame = target }
-                )
-                _currentTween:Play()
+        _doorMesh:GetAttributeChangedSignal("open"):Connect(function()
+            if _doorMesh:GetAttribute("open") then
+                _animateTo(_openCFrame)
+            else
+                _animateTo(_closedCFrame)
             end
-            _doorMesh:GetAttributeChangedSignal("open"):Connect(function()
-                if _doorMesh:GetAttribute("open") then
-                    _animateTo(_openCFrame)
-                else
-                    _animateTo(_closedCFrame)
-                end
-            end)
-        end
+        end)
     end
 end
 """
@@ -2165,6 +2257,209 @@ def _inject_door_tween(scripts: list["RbxScript"]) -> int:
         s.source = s.source.rstrip() + "\n" + _DOOR_TWEEN_BLOCK
         fixes += 1
         log.info("  Injected door tween listener in '%s'", s.name)
+    return fixes
+
+
+# ---------------------------------------------------------------------------
+# Pack: door_machine_signal_listener
+# ---------------------------------------------------------------------------
+#
+# Unity's Machine.cs opens gated doors via
+# ``doors[i].SendMessage("ToggleDoor", true, SendMessageOptions.DontRequireReceiver)``
+# — a runtime reflection call into the Door MonoBehaviour. Roblox has no
+# SendMessage; the converter translates the Machine side to
+# ``door:SetAttribute("ToggleDoor", value)`` on the target Door Model.
+# But Door.luau only emits the Touched / ``hasKey`` path — it never
+# listens for the ``ToggleDoor`` attribute write. Result: items go onto
+# the Machine, ``placeItem`` runs, ``ToggleDoor`` flips, and nothing
+# happens. The Machine→Door progression that SimpleFPS is built around
+# is silently dead.
+#
+# Add a listener so the attribute write actually drives the local
+# ``toggleDoor(value)`` function (which sets the ``open`` attribute the
+# tween/animator picks up). Idempotent via the ``_AutoMachineDoorSignal``
+# sentinel comment.
+
+_DOOR_MACHINE_SIGNAL_BLOCK = """
+-- _AutoMachineDoorSignal: Machine→Door coherence pack
+-- Unity's Machine.cs calls ``doors[i].SendMessage("ToggleDoor", true)`` to
+-- progress players past gated doors after they place items on the machine.
+-- Machine.luau transpiled that to ``door:SetAttribute("ToggleDoor", value)``
+-- on this Door Model. SendMessage doesn't exist in Roblox; the attribute is
+-- the idiomatic replacement, but it only works if the receiver listens.
+-- Wire that here so the Machine→Door progression works (distinct from the
+-- hasKey-on-touch path, which is dormant in scenes without a Key pickup).
+do
+    local _machineDoorModel = script.Parent and script.Parent.Parent
+    if _machineDoorModel then
+        _machineDoorModel:GetAttributeChangedSignal("ToggleDoor"):Connect(function()
+            local v = _machineDoorModel:GetAttribute("ToggleDoor")
+            toggleDoor(v == true)
+        end)
+    end
+end
+"""
+
+
+def _detect_door_machine_signal(scripts: list["RbxScript"]) -> bool:
+    """Fire when:
+       (a) there is a Door script that emits a local ``toggleDoor`` function
+           (the only entry point we can drive),
+       (b) at least one OTHER script writes ``:SetAttribute("ToggleDoor", …)``
+           on a door instance (Machine.luau in SimpleFPS, but any equivalent
+           emitter would match), AND
+       (c) the Door script doesn't already carry the ``_AutoMachineDoorSignal``
+           sentinel from a prior pass.
+    """
+    has_door = False
+    has_emitter = False
+    for s in scripts:
+        src = s.source or ""
+        if s.name == "Door":
+            if "local function toggleDoor" in src and "_AutoMachineDoorSignal" not in src:
+                has_door = True
+        elif 'SetAttribute("ToggleDoor"' in src or "SetAttribute('ToggleDoor'" in src:
+            has_emitter = True
+    return has_door and has_emitter
+
+
+@patch_pack(
+    name="door_machine_signal_listener",
+    description=(
+        "Append a ``GetAttributeChangedSignal('ToggleDoor')`` listener to "
+        "Door.luau so the Machine→Door progression works. Machine.luau "
+        "writes ``door:SetAttribute('ToggleDoor', value)`` (the Roblox "
+        "replacement for Unity's ``doors[i].SendMessage('ToggleDoor', …)``), "
+        "but the AI transpile of Door.cs only emits the Touched/hasKey "
+        "path. Without this listener, doors never open even after the "
+        "player places all required items on the Machine."
+    ),
+    detect=_detect_door_machine_signal,
+    # Run after door_tween_open so the tween block exists when this listener
+    # fires toggleDoor (which sets the ``open`` attribute the tween reads).
+    after=("door_tween_open",),
+)
+def _inject_door_machine_signal(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        if s.name != "Door":
+            continue
+        src = s.source or ""
+        if "local function toggleDoor" not in src:
+            continue
+        if "_AutoMachineDoorSignal" in src:
+            continue
+        s.source = src.rstrip() + "\n" + _DOOR_MACHINE_SIGNAL_BLOCK
+        fixes += 1
+        log.info("  Wired Machine ToggleDoor signal into '%s'", s.name)
+    return fixes
+
+
+# ---------------------------------------------------------------------------
+# Pack: machine_item_check_and_door_lookup
+# ---------------------------------------------------------------------------
+#
+# Unity's Machine.cs opens gated doors by checking the player's hasItems
+# list when they enter the machine's trigger and routing items to
+# inspector-wired doors[i]. The AI transpiles this into Machine.luau with
+# two bugs that together make the door progression silently dead:
+#
+#  1. ``player:GetAttribute("hasItems")`` reads a comma-separated string —
+#     but Player.luau runs as a LocalScript and writes that attribute on
+#     LocalPlayer, which DOES NOT replicate to the server. Pickup writes
+#     per-item server-side booleans (``hasBattery``, ``hasSmallBattery``,
+#     etc.); the Machine has to read those instead.
+#  2. ``doorNames`` defaults to ``{"Door1", "Door2"}`` because the scene
+#     pipeline doesn't propagate Machine's serialized doors array yet.
+#     Real scene names follow Unity's duplicated-instance convention
+#     (``"Door (1)"``, ``"Door (2)"``), so the lookup misses every door.
+#
+# Patch both: rewrite the hasItems iteration to check per-item server
+# booleans, and add ``Door (N)`` / ``DoorN`` fallbacks alongside the
+# persisted-name lookup. Idempotent via the ``_AutoMachineFix`` sentinel.
+
+_MACHINE_HASITEMS_RE = re.compile(
+    r'\n    -- Player\.luau \(LocalScript\) mirrors hasItems[\s\S]*?'
+    r'for i = 1, #itemNames do\n'
+    r'        local name = itemNames\[i\]\n'
+    r'        if name and string\.find\(hasItems, name, 1, true\) then\n'
+    r'            placeItem\(i\)\n'
+    r'        end\n'
+    r'    end\n'
+)
+_MACHINE_HASITEMS_REPLACEMENT = (
+    "\n    -- _AutoMachineFix: Pickup writes per-item server-side ``has<ItemName>``\n"
+    "    -- booleans on the Player instance (server SetAttribute replicates).\n"
+    "    -- ``hasItems`` is a client-only string maintained by Player.luau and\n"
+    "    -- doesn't reach the server, so checking it would always return nil.\n"
+    "    for i = 1, #itemNames do\n"
+    "        local name = itemNames[i]\n"
+    "        if name and player:GetAttribute(\"has\" .. name) == true then\n"
+    "            placeItem(i)\n"
+    "        end\n"
+    "    end\n"
+)
+
+_MACHINE_DOOR_LOOKUP_RE = re.compile(
+    r'    if number <= #doorNames then\n'
+    r'        local door = workspace:FindFirstChild\(doorNames\[number\], true\)\n'
+    r'        if door then\n'
+    r'            door:SetAttribute\("ToggleDoor", true\)\n'
+    r'        end\n'
+    r'    end\n'
+)
+_MACHINE_DOOR_LOOKUP_REPLACEMENT = (
+    "    -- _AutoMachineFix: try persisted name list, then Unity-style sibling\n"
+    "    -- naming (``Door (N)``), then the literal ``DoorN`` fallback. Without\n"
+    "    -- this, the default ``{\"Door1\", \"Door2\"}`` list misses scenes where\n"
+    "    -- doors are duplicated prefab instances named ``Door (1)``/``Door (2)``.\n"
+    "    local door = workspace:FindFirstChild(doorNames[number] or \"\", true)\n"
+    "        or workspace:FindFirstChild(\"Door (\" .. number .. \")\", true)\n"
+    "        or workspace:FindFirstChild(\"Door\" .. number, true)\n"
+    "    if door then\n"
+    "        door:SetAttribute(\"ToggleDoor\", true)\n"
+    "    end\n"
+)
+
+
+def _detect_machine_fix(scripts: list["RbxScript"]) -> bool:
+    for s in scripts:
+        if s.name != "Machine":
+            continue
+        src = s.source or ""
+        if "_AutoMachineFix" in src:
+            return False
+        if _MACHINE_HASITEMS_RE.search(src) or _MACHINE_DOOR_LOOKUP_RE.search(src):
+            return True
+    return False
+
+
+@patch_pack(
+    name="machine_item_check_and_door_lookup",
+    description=(
+        "Rewrite Machine.luau so its item-progression check reads the "
+        "server-replicated ``has<ItemName>`` Pickup booleans instead of "
+        "the client-only ``hasItems`` string, and extend the door-name "
+        "lookup with ``Door (N)`` / ``DoorN`` fallbacks. Without this, "
+        "items placed on the Machine never trigger their gated doors."
+    ),
+    detect=_detect_machine_fix,
+    after=("pickup_remote_event_server",),
+)
+def _fix_machine_item_check_and_door_lookup(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        if s.name != "Machine":
+            continue
+        original = s.source or ""
+        if "_AutoMachineFix" in original:
+            continue
+        patched = _MACHINE_HASITEMS_RE.sub(_MACHINE_HASITEMS_REPLACEMENT, original)
+        patched = _MACHINE_DOOR_LOOKUP_RE.sub(_MACHINE_DOOR_LOOKUP_REPLACEMENT, patched)
+        if patched != original:
+            s.source = patched
+            fixes += 1
+            log.info("  Patched Machine item-check and door-lookup in '%s'", s.name)
     return fixes
 
 

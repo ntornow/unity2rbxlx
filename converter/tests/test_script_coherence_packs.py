@@ -1728,18 +1728,22 @@ class TestDoorTweenOpen:
         assert fixes == 0
         assert "_AutoFpsDoorTweenInjected" not in s.source
 
-    def test_injected_body_defers_to_animation_driver_at_runtime(
+    def test_injected_body_always_wires_tween_with_studs_scaled_offset(
         self,
     ) -> None:
-        """Codex round-10 [P2]: animation_converter emits drivers
-        per controller/scope, not project-wide all-or-nothing. The
-        pack runs even when a driver exists project-wide; the
-        INJECTED tween body carries a runtime coexistence guard that
-        scans the door's parent prefab + ReplicatedStorage for any
-        ``Anim_(<Prefab>_)?door_(open|close)`` script and defers to
-        it when found.
+        """The earlier ``_hasAnimDriver`` runtime deferral was a false
+        safety: animation_converter's auto-generated ``Anim_*_door_open``
+        drivers tweened by an unscaled +4 studs (raw Unity meters,
+        missing STUDS_PER_METER), and the companion ``Anim_*_door_close``
+        drivers ship a (0,0,0) close offset. Deferring left doors with
+        imperceptible motion (or none at all).
 
-        Pin: the body source contains the runtime guard helper.
+        New policy: tween wires unconditionally with a STUDS_PER_METER-
+        scaled +4m open offset. The Anim driver's +4 stud overshoot is
+        small enough that coexistence is a non-issue in practice.
+
+        Pin: injected body has no deferral helper, has STUDS_PER_METER
+        scaling, and wires the TweenService listener directly.
         """
         scripts = [
             self._door_with_attr_set(),
@@ -1749,24 +1753,23 @@ class TestDoorTweenOpen:
                 script_type="Script",
             ),
         ]
-        # Pack still fires at place-level — the per-door runtime
-        # guard handles coexistence.
+        # Pack still fires when an anim driver is present (no deferral).
         assert packs_module._detect_door_tween_target(scripts) is True
         packs_module._inject_door_tween(scripts)
         assert "_AutoFpsDoorTweenInjected" in scripts[0].source
-        # Runtime guard helper present in the injected body.
-        assert "_hasAnimDriver" in scripts[0].source
-        # Guard scans the door's prefab Model first.
-        assert "_parent:GetDescendants()" in scripts[0].source
-        # And BOTH ReplicatedStorage AND ServerScriptService (codex
-        # round-11 [P1]: scene-scoped animation drivers live in SSS).
-        assert '"ReplicatedStorage"' in scripts[0].source
-        assert '"ServerScriptService"' in scripts[0].source
-        # Tolerates spaces / mixed case in prefab names (round-10 [P2]).
-        assert "string.lower(name)" in scripts[0].source
-        # Anchored patterns match both prefab-scoped and scene-scoped.
-        assert '"^anim_door_open$"' in scripts[0].source
-        assert '"^anim_.+_door_open$"' in scripts[0].source
+        # Regression guard: old deferral helpers must not reappear as
+        # active code. The history-explainer comment in the injected
+        # body mentions ``_hasAnimDriver`` by name, so check for the
+        # function-call form ``_hasAnimDriver(`` rather than the bare
+        # identifier.
+        assert "_hasAnimDriver(" not in scripts[0].source
+        assert "_parent:GetDescendants()" not in scripts[0].source
+        # STUDS_PER_METER is applied to the +4m Unity-authored offset.
+        assert "_STUDS_PER_METER = 3.571" in scripts[0].source
+        assert "4 * _STUDS_PER_METER" in scripts[0].source
+        # TweenService listener is wired directly on the door mesh.
+        assert "TweenService:Create" in scripts[0].source
+        assert 'GetAttributeChangedSignal("open")' in scripts[0].source
 
     def test_detector_fires_when_no_animation_driver(self) -> None:
         """Sanity check the negative case: when no Anim_*_door_*
