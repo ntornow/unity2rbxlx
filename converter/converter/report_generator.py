@@ -79,6 +79,31 @@ class OutputSummary:
 
 
 @dataclass
+class SemanticIssueSummary:
+    """One semantic-validator issue as serialised into the report.
+    Mirrors ``converter.semantic_validators.SemanticIssue`` — kept
+    here so this module owns the on-disk schema (no import cycle).
+    """
+    severity: str = "warning"
+    rule: str = ""
+    script: str = ""
+    line: int = 0
+    snippet: str = ""
+    explanation: str = ""
+    suggested_fix: str = ""
+    confidence: str = "high"
+
+
+@dataclass
+class SemanticWarningsSummary:
+    """Aggregate of ``run_semantic_validators`` output. Persists
+    under ``semantic_warnings`` in conversion_report.json."""
+    total: int = 0
+    counts_by_rule: dict[str, int] = field(default_factory=dict)
+    issues: list[SemanticIssueSummary] = field(default_factory=list)
+
+
+@dataclass
 class ConversionReport:
     """Top-level conversion report written to disk after a completed run."""
     generated_at: str = field(
@@ -96,11 +121,9 @@ class ConversionReport:
     scene: SceneSummary = field(default_factory=SceneSummary)
     components: ComponentSummary = field(default_factory=ComponentSummary)
     output: OutputSummary = field(default_factory=OutputSummary)
-    # Output of converter/semantic_validators.run_semantic_validators —
-    # shape is ``{total: int, counts_by_rule: {...}, issues: [...]}``.
-    # Defaults to empty so consumers that don't read the field aren't
-    # forced to update.
-    semantic_warnings: dict[str, Any] = field(default_factory=dict)
+    semantic_warnings: SemanticWarningsSummary = field(
+        default_factory=SemanticWarningsSummary,
+    )
 
 
 def generate_report(

@@ -3106,12 +3106,31 @@ script.Disabled = true
             else:
                 selected_scene = str(p)
 
-        semantic_dict: dict = {}
+        from converter.report_generator import (
+            SemanticIssueSummary, SemanticWarningsSummary,
+        )
+        semantic_summary = SemanticWarningsSummary()
         sr = getattr(self.state, "semantic_report", None)
         if sr is not None:
-            to_dict = getattr(sr, "to_dict", None)
-            if callable(to_dict):
-                semantic_dict = to_dict()
+            issues = getattr(sr, "issues", None) or []
+            counts = getattr(sr, "counts_by_rule", {}) or {}
+            semantic_summary = SemanticWarningsSummary(
+                total=len(issues),
+                counts_by_rule=dict(counts),
+                issues=[
+                    SemanticIssueSummary(
+                        severity=i.severity,
+                        rule=i.rule,
+                        script=i.script,
+                        line=i.line,
+                        snippet=i.snippet,
+                        explanation=i.explanation,
+                        suggested_fix=i.suggested_fix,
+                        confidence=i.confidence,
+                    )
+                    for i in issues
+                ],
+            )
 
         return ConversionReport(
             unity_project_path=str(self.unity_project_path),
@@ -3139,7 +3158,7 @@ script.Disabled = true
                 scripts_in_place=result.get("scripts_written", 0),
                 report_path=str(report_path),
             ),
-            semantic_warnings=semantic_dict,
+            semantic_warnings=semantic_summary,
         )
 
     # Marker substrings that identify converter-emitted scripts.
