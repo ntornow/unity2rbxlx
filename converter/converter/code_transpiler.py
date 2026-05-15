@@ -150,7 +150,14 @@ def transpile_scripts(
     # so each script's prompt can include the already-transpiled Luau of
     # its direct dependencies (Phase 4.3.1). Within a level scripts have
     # no dep on each other, so concurrent execution is preserved.
-    ai_results: dict[str, tuple[str, float, list[str]]] = {}  # class_name → (luau, confidence, warnings)
+    #
+    # Key on the disambiguated stem (which is unique per script) rather
+    # than ``info.class_name``. Two ``Utils.cs`` files in different
+    # folders share a class name; storing AI outputs by ``class_name``
+    # alone would overwrite the first script's Luau with the second's
+    # — Phase 3 then handed the same source file to both. The stem
+    # already has path-suffix disambiguation built in (lines below).
+    ai_results: dict[str, tuple[str, float, list[str]]] = {}
 
     # Map every pending script to a unique stem so the dep-graph code has
     # a stable key. Prefer the class name (keeps cross-reference matching
@@ -160,6 +167,10 @@ def transpile_scripts(
     # behaviour for legitimate cases like two Utils.cs in different dirs.
     file_sources: dict[str, str] = {}
     info_by_stem: dict[str, tuple[Any, str, str]] = {}
+    # Phase 3 needs to look up the AI result for each (info, csharp, type)
+    # tuple it processes; that lookup must hit the same stem we stored
+    # under, so remember stem-by-path here.
+    stem_by_path: dict[str, str] = {}
     for info, csharp_source, script_type in pending_scripts:
         base_stem = info.class_name or info.path.stem
         stem = base_stem
@@ -172,6 +183,7 @@ def transpile_scripts(
             )
         file_sources[stem] = csharp_source
         info_by_stem[stem] = (info, csharp_source, script_type)
+        stem_by_path[str(info.path)] = stem
 
     dep_graph, _class_map = _build_dependency_graph(file_sources)
     dep_levels = _compute_dependency_levels(dep_graph)
@@ -235,7 +247,7 @@ def transpile_scripts(
                             continue
                         info = info_by_stem[stem][0]
                         luau, confidence, warnings = outcome
-                        ai_results[info.class_name or str(info.path)] = outcome
+                        ai_results[stem] = outcome
                         # Only feed high-enough-confidence Luau into the
                         # dep-context cache; Phase 3 replaces anything
                         # under 0.1 with a stub, so publishing it here
@@ -253,16 +265,18 @@ def transpile_scripts(
                         continue
                     info = info_by_stem[stem_out][0]
                     luau, confidence, warnings = outcome
-                    ai_results[info.class_name or str(info.path)] = outcome
+                    ai_results[stem_out] = outcome
                     if luau and confidence >= 0.1:
                         transpiled_luau[stem_out] = luau
                     result.total_ai += 1
                     log.info("  %s: transpiled via %s (confidence %.2f)",
                              info.path.name, backend, confidence)
 
-    # Phase 3: Assemble results, falling back to rule-based where AI didn't produce output
+    # Phase 3: Assemble results, falling back to rule-based where AI didn't produce output.
+    # Use the disambiguated stem (path-keyed) so two scripts with the same
+    # class name don't collide on lookup.
     for info, csharp_source, script_type in pending_scripts:
-        key = info.class_name or str(info.path)
+        key = stem_by_path.get(str(info.path), info.class_name or str(info.path))
         luau, confidence, warnings, strategy = "", 0.0, [], "rule_based"
 
         if key in ai_results:

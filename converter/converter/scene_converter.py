@@ -1632,6 +1632,12 @@ def _process_components(
                         part._has_physical_collider = True
                 # Apply collider center offset to part CFrame position.
                 # Skip for Y-up FBX meshes where Roblox bakes mesh positions.
+                # ``center_offset`` is in the part's LOCAL space, so it
+                # must be rotated by the part's orientation before being
+                # added to the world position — otherwise a 90°-rotated
+                # node with ``m_Center = (1, 0, 0)`` would translate
+                # along world +X instead of along its local +X axis,
+                # landing the collider in the wrong place.
                 if center_offset != (0.0, 0.0, 0.0):
                     _skip_center = False
                     if hasattr(node, 'mesh_guid') and node.mesh_guid and guid_index:
@@ -1640,9 +1646,14 @@ def _process_components(
                             from core.coordinate_system import is_yup_fbx
                             _skip_center = is_yup_fbx(_co_fbx)
                     if not _skip_center:
-                        part.cframe.x += center_offset[0]
-                        part.cframe.y += center_offset[1]
-                        part.cframe.z += center_offset[2]
+                        cf = part.cframe
+                        ox, oy, oz = center_offset
+                        rx = cf.r00 * ox + cf.r01 * oy + cf.r02 * oz
+                        ry = cf.r10 * ox + cf.r11 * oy + cf.r12 * oz
+                        rz = cf.r20 * ox + cf.r21 * oy + cf.r22 * oz
+                        cf.x += rx
+                        cf.y += ry
+                        cf.z += rz
 
                 # MeshCollider → set CollisionFidelity based on convex flag
                 if ct == "MeshCollider":
@@ -4210,18 +4221,20 @@ def _convert_prefab_node(
                 except (ValueError, TypeError):
                     if isinstance(val, str) and val and len(val) < 100:
                         part.attributes[pp] = val
-            # Material override for this child
+            # Material override for this child.
+            # ``material_mappings`` is keyed by material GUID (see
+            # ``material_mapper.map_materials``), not by resolved path —
+            # the previous ``str(mat_path)`` lookup never matched in
+            # normal inputs and child material overrides silently no-op'd.
             elif pp.startswith("m_Materials.Array.data["):
                 obj_ref = mod.get("objectReference", {})
                 if isinstance(obj_ref, dict):
                     mat_guid = obj_ref.get("guid", "")
-                    if mat_guid and guid_index:
-                        mat_path = guid_index.resolve(mat_guid)
-                        if mat_path and str(mat_path) in material_mappings:
-                            mapping = material_mappings[str(mat_path)]
-                            base_color = getattr(mapping, "base_color", None)
-                            if base_color:
-                                part.color = (base_color[0], base_color[1], base_color[2])
+                    if mat_guid and mat_guid in material_mappings:
+                        mapping = material_mappings[mat_guid]
+                        base_color = getattr(mapping, "base_color", None)
+                        if base_color:
+                            part.color = (base_color[0], base_color[1], base_color[2])
 
     # Check if this node's components are disabled
     if disabled_components and hasattr(node, 'components'):

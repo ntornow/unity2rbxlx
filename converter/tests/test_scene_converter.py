@@ -561,6 +561,65 @@ class TestMixedColliderHandling:
         expected_diam = 3 * 2 * STUDS_PER_METER
         assert max(part.size) >= expected_diam - 0.01, "Trigger sphere should grow the Part size"
 
+    def test_collider_center_offset_rotated_with_part(self):
+        """Codex round-3: ``BoxCollider.m_Center`` is in the part's
+        local space. The previous code added the raw component values
+        to the part's CFrame position, which mis-placed the collider
+        on any rotated part. A part rotated 90° around Y with a
+        ``m_Center = (1, 0, 0)`` should shift the position along
+        the part's local +X axis (which under that rotation lands on
+        world -Z, not world +X).
+        """
+        from converter.scene_converter import _process_components
+        from core.roblox_types import RbxPart, RbxCFrame
+
+        class FakeBoxCollider:
+            component_type = "BoxCollider"
+            properties = {
+                "m_IsTrigger": 0,
+                "m_Size": {"x": 1, "y": 1, "z": 1},
+                "m_Center": {"x": 1, "y": 0, "z": 0},
+            }
+
+        class FakeNode:
+            name = "RotatedBox"
+            components = [FakeBoxCollider()]
+            mesh_guid = None
+
+        # 90° CCW rotation around Y: local +X → world -Z.
+        # Row-major rotation matrix:
+        #   [[ 0, 0,  1],
+        #    [ 0, 1,  0],
+        #    [-1, 0,  0]]
+        # so rotating local (1, 0, 0) yields world (0, 0, -1).
+        part = RbxPart(
+            name="RotatedBox",
+            size=(3.571, 3.571, 3.571),
+            cframe=RbxCFrame(
+                x=10.0, y=20.0, z=30.0,
+                r00=0.0, r01=0.0, r02=1.0,
+                r10=0.0, r11=1.0, r12=0.0,
+                r20=-1.0, r21=0.0, r22=0.0,
+            ),
+        )
+        _process_components(FakeNode(), part)
+
+        from config import STUDS_PER_METER
+        # m_Center=(1,0,0) in meters → (STUDS_PER_METER, 0, 0) studs
+        # rotated by the matrix above → (0, 0, -STUDS_PER_METER).
+        # Final position = original + rotated offset.
+        assert abs(part.cframe.x - 10.0) < 1e-4, (
+            f"X should be unchanged by local +X offset on this rotation, "
+            f"got {part.cframe.x}"
+        )
+        assert abs(part.cframe.y - 20.0) < 1e-4, (
+            f"Y should be unchanged, got {part.cframe.y}"
+        )
+        assert abs(part.cframe.z - (30.0 - STUDS_PER_METER)) < 1e-4, (
+            f"Local +X offset on Y=90° part must land on world -Z. "
+            f"Got Z={part.cframe.z}, expected {30.0 - STUDS_PER_METER}"
+        )
+
     def test_invisible_collider_stays_invisible(self):
         """Codex round-1 [P2]: an invisible collider proxy (no renderer
         + non-trigger collider) must keep ``transparency = 1.0``. Round-0

@@ -1426,6 +1426,11 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, int]:
     # Reset and pre-populate unity fileID → referent mapping
     # Pre-pass assigns referents so constraints can resolve Part1 before
     # the target part is serialized (avoids ordering dependency).
+    # Cover every serialized part tree that can host constraints —
+    # workspace, ReplicatedStorage.Templates prefabs, ServerStorage parts.
+    # Without this, a HingeConstraint inside a template/server-storage
+    # prefab serialized without a Part1 referent if its sibling was not
+    # in workspace_parts.
     _unity_fid_to_referent.clear()
     def _pre_register(parts: list) -> None:
         for p in parts:
@@ -1434,6 +1439,8 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, int]:
                 _unity_fid_to_referent[str(ufid)] = _ref_id()
             _pre_register(getattr(p, "children", None) or [])
     _pre_register(getattr(place, "workspace_parts", None) or [])
+    _pre_register(getattr(place, "replicated_templates", None) or [])
+    _pre_register(getattr(place, "server_storage_parts", None) or [])
 
     stats: dict[str, int] = {
         "parts_written": 0,
@@ -1645,12 +1652,13 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, int]:
 
     # Walk every script in the place: top-level (place.scripts) AND scripts
     # bound to parts (part.scripts) recursively. The auto-create scan must
-    # see both, because cross-trust-boundary RemoteEvents are most often
-    # referenced by inline scripts attached to pickup/turret/etc. models —
-    # if we only scanned place.scripts we'd miss the FireClient calls in
-    # Pickup-on-each-pickup-model and never create the matching RemoteEvent
-    # in ReplicatedStorage. Symptom of that bug: server FireClient becomes
-    # a no-op and the client never receives the pickup signal.
+    # see all trees that ship serialized scripts, not just workspace —
+    # otherwise a ``WaitForChild("PickupItemEvent")`` inside a script
+    # attached to a ReplicatedStorage.Templates prefab (or to a
+    # ServerStorage part) never causes its matching RemoteEvent to be
+    # created, and the cloned runtime instance hangs at WaitForChild
+    # forever. Symptom of that bug: server FireClient becomes a no-op
+    # and the client never receives the pickup signal.
     def _collect_all_scripts(_place) -> list:
         out: list = list(getattr(_place, "scripts", None) or [])
         def _walk(part_list):
@@ -1658,6 +1666,8 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, int]:
                 out.extend(getattr(p, "scripts", None) or [])
                 _walk(getattr(p, "children", None) or [])
         _walk(getattr(_place, "workspace_parts", None) or getattr(_place, "parts", None) or [])
+        _walk(getattr(_place, "replicated_templates", None) or [])
+        _walk(getattr(_place, "server_storage_parts", None) or [])
         return out
 
     _all_scripts = _collect_all_scripts(place)
