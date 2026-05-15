@@ -472,9 +472,15 @@ class Pipeline:
         self.state.parsed_scene = parse_scene(scene_paths[0])
         self.ctx.total_game_objects = len(self.state.parsed_scene.all_nodes)
 
-        # Run shared phases
+        # Run shared phases. ``resolve_assets`` belongs here too: without
+        # it, every per-scene ``convert_scene`` below would emit raw
+        # uploaded-mesh Model IDs that Studio cannot fetch as MeshIds —
+        # the multi-scene path used to silently skip resolution and
+        # produced visibly broken places. ``resolve_assets`` no-ops when
+        # ``--no-upload`` is set or no universe/place IDs are configured.
         for phase in ["extract_assets", "upload_assets", "convert_materials",
-                       "transpile_scripts", "convert_animations"]:
+                       "transpile_scripts", "convert_animations",
+                       "resolve_assets"]:
             self._run_phase(phase)
 
         # Per-scene: parse, convert, write
@@ -1620,14 +1626,21 @@ class Pipeline:
         Skips if mesh data is already populated (from a previous run or manual
         resolve step).
         """
-        # Check if all uploaded meshes have been resolved, not just some
-        uploaded_mesh_count = sum(
-            1 for k in self.ctx.uploaded_assets
+        # Check whether EVERY currently-uploaded mesh has a resolved entry.
+        # Count-based checks were not enough: a previous run that resolved
+        # {A, B, C} could leave mesh_native_sizes with 3 entries; if the
+        # current uploaded_assets is {D, E} after the user swapped meshes,
+        # resolved_count (3) >= uploaded_mesh_count (2) would falsely
+        # report "all resolved" and skip resolution of D and E entirely.
+        uploaded_mesh_keys = {
+            k for k in self.ctx.uploaded_assets
             if any(k.lower().endswith(ext) for ext in ('.fbx', '.obj'))
-        ) if self.ctx.uploaded_assets else 0
-        resolved_count = len(self.ctx.mesh_native_sizes) if self.ctx.mesh_native_sizes else 0
+        }
+        uploaded_mesh_count = len(uploaded_mesh_keys)
+        resolved_count = len(self.ctx.mesh_native_sizes)
         all_meshes_resolved = (
-            resolved_count > 0 and resolved_count >= uploaded_mesh_count
+            uploaded_mesh_count > 0
+            and uploaded_mesh_keys.issubset(self.ctx.mesh_native_sizes.keys())
         )
         if all_meshes_resolved:
             log.info(
@@ -1678,7 +1691,7 @@ class Pipeline:
         # When ALL meshes are already resolved, fall through to the
         # no-mesh validation+cache-refresh path below so a retarget still
         # updates .roblox_ids.json.
-        already_resolved = self.ctx.mesh_native_sizes or {}
+        already_resolved = self.ctx.mesh_native_sizes
         mesh_assets = {} if all_meshes_resolved else {
             k: v for k, v in self.ctx.uploaded_assets.items()
             if any(k.lower().endswith(ext) for ext in ('.fbx', '.obj'))
@@ -1858,7 +1871,7 @@ return table.concat(allData, "\\n")'''
             # prior mostly-complete resolution by overwriting it with this
             # run's smaller result set.
             merged_sizes = {**already_resolved, **mesh_native_sizes}
-            existing_hierarchies = self.ctx.mesh_hierarchies or {}
+            existing_hierarchies = self.ctx.mesh_hierarchies
             merged_hierarchies = {**existing_hierarchies, **mesh_hierarchies}
             self.ctx.mesh_native_sizes = merged_sizes
             self.ctx.mesh_hierarchies = merged_hierarchies
@@ -1901,16 +1914,16 @@ return table.concat(allData, "\\n")'''
             )
             log.info("[convert_scene] Loaded %d material mappings", len(self.state.material_mappings))
 
-        # Load mesh native sizes if available in context
+        # Load mesh native sizes if available in context.
+        # JSON-loaded entries may have stale shapes (e.g. truncated lists);
+        # validate per-value while trusting the dataclass-guaranteed dict.
         mesh_native_sizes = {}
-        raw_sizes = getattr(self.ctx, "mesh_native_sizes", None)
-        if isinstance(raw_sizes, dict):
-            for k, v in raw_sizes.items():
-                if isinstance(v, (list, tuple)) and len(v) == 3:
-                    mesh_native_sizes[k] = tuple(v)
+        for k, v in self.ctx.mesh_native_sizes.items():
+            if isinstance(v, (list, tuple)) and len(v) == 3:
+                mesh_native_sizes[k] = tuple(v)
 
         # Load mesh texture IDs if available in context
-        mesh_texture_ids = getattr(self.ctx, "mesh_texture_ids", None) or {}
+        mesh_texture_ids = self.ctx.mesh_texture_ids
 
         # Pre-seed the scene converter's prefab cache to avoid re-parsing
         if self.state.prefab_library and self.state.guid_index:
@@ -1920,15 +1933,14 @@ return table.concat(allData, "\\n")'''
                 _prefab_lib_cache[cache_key] = self.state.prefab_library
 
         # Load mesh hierarchies from context (populated by Studio resolution)
-        mesh_hierarchies = getattr(self.ctx, "mesh_hierarchies", None) or {}
+        mesh_hierarchies = self.ctx.mesh_hierarchies
 
-        # Load FBX bounding boxes (fallback for InitialSize when Studio not available)
+        # Load FBX bounding boxes (fallback for InitialSize when Studio not available).
+        # Validate per-value: JSON load may carry stale-shape entries.
         fbx_bounding_boxes: dict[str, tuple[float, float, float]] = {}
-        raw_bboxes = getattr(self.ctx, "fbx_bounding_boxes", None)
-        if isinstance(raw_bboxes, dict):
-            for k, v in raw_bboxes.items():
-                if isinstance(v, (list, tuple)) and len(v) == 3:
-                    fbx_bounding_boxes[k] = tuple(v)
+        for k, v in self.ctx.fbx_bounding_boxes.items():
+            if isinstance(v, (list, tuple)) and len(v) == 3:
+                fbx_bounding_boxes[k] = tuple(v)
 
         self.state.rbx_place = convert_scene(
             parsed_scene=self.state.parsed_scene,
@@ -2137,22 +2149,39 @@ return table.concat(allData, "\\n")'''
 
         # Post-process: strip local file paths from SurfaceAppearance textures.
         # Done via regex on raw XML to preserve CDATA sections in scripts.
+        # We only strip URLs that look like filesystem paths — Roblox
+        # ``rbxassetid://`` URLs and arbitrary ``http(s)://`` references
+        # are left alone (Studio resolves the former and tolerates the
+        # latter; a previous "anything-with-a-slash" filter would have
+        # eaten valid HTTP asset URLs along with local paths).
         import re as _re_post
         raw_xml = rbxlx_path.read_text(encoding="utf-8")
-        # Remove <Content name="..."><url>LOCAL_PATH</url></Content> entries
-        # where the URL is a local path (contains / or \ but not rbxassetid)
-        original_len = len(raw_xml)
-        pattern = r'<Content name="[^"]*">\s*<url>[^<]*(?:/|\\)[^<]*</url>\s*</Content>'
-        matches = list(_re_post.finditer(pattern, raw_xml))
-        stripped = 0
-        for m in matches:
-            if "rbxassetid" not in m.group():
-                stripped += 1
-        if stripped:
-            raw_xml = _re_post.sub(
-                lambda m: "" if "rbxassetid" not in m.group() else m.group(),
-                pattern, raw_xml,
+        pattern = r'<Content name="[^"]*">\s*<url>([^<]*)</url>\s*</Content>'
+
+        def _is_local_path(url: str) -> bool:
+            url = url.strip()
+            if not url:
+                return False
+            if url.startswith(("rbxassetid://", "http://", "https://")):
+                return False
+            # Local indicators: contains ``/`` or ``\``, or a Windows
+            # drive letter, or an explicit file:// scheme.
+            return (
+                url.startswith("file://")
+                or "/" in url
+                or "\\" in url
+                or (len(url) >= 2 and url[1] == ":")
             )
+
+        def _strip_if_local(m: "_re_post.Match[str]") -> str:
+            return "" if _is_local_path(m.group(1)) else m.group(0)
+
+        stripped = sum(
+            1 for m in _re_post.finditer(pattern, raw_xml)
+            if _is_local_path(m.group(1))
+        )
+        if stripped:
+            raw_xml = _re_post.sub(pattern, _strip_if_local, raw_xml)
             rbxlx_path.write_text(raw_xml, encoding="utf-8")
             log.info("[write_output] Stripped %d invalid local texture paths from SurfaceAppearances", stripped)
 

@@ -57,6 +57,36 @@ class TestCloudAPI:
         # Should handle gracefully (return None on failure)
         assert result is None
 
+    @patch("roblox.cloud_api.time.sleep")
+    @patch("roblox.cloud_api.requests.post")
+    def test_upload_retries_after_429_rate_limit_reset(
+        self, mock_post, mock_sleep, tmp_path,
+    ):
+        """When the first POST returns 429 with a rate-limit reset header,
+        the uploader must wait out the reset window and retry once —
+        otherwise the asset gets permanently dropped despite us having
+        paid the wait cost. Regression flagged by Codex review.
+        """
+        rate_limited = MagicMock()
+        rate_limited.status_code = 429
+        rate_limited.headers = {
+            "x-ratelimit-remaining": "0",
+            "x-ratelimit-reset": "1",
+        }
+        success = MagicMock()
+        success.status_code = 200
+        success.json.return_value = {"assetId": "987654321"}
+        success.headers = {"x-ratelimit-remaining": "50"}
+        mock_post.side_effect = [rate_limited, success]
+
+        from roblox.cloud_api import upload_image
+        test_img = tmp_path / "test.png"
+        test_img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
+        result = upload_image(test_img, "test-api-key", "12345", "User", "test")
+        assert result == "987654321"
+        # Two POSTs: the throttled attempt + the retry after sleeping.
+        assert mock_post.call_count == 2
+
 
 class TestProbeAssetAvailability:
     """`probe_asset_availability` classifies an uploaded asset as

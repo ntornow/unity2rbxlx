@@ -83,8 +83,14 @@ def _publish_chunks(
     from roblox.cloud_api import execute_luau
 
     total_bytes = sum(len(c) for c in chunks)
+    # The 4MB Open Cloud execute_luau cap is PER REQUEST — each chunk
+    # is submitted as its own request, so the size guard must measure
+    # the largest single chunk rather than the cumulative payload.
+    # A multi-chunk place totalling 20MB still publishes fine as long
+    # as no individual chunk crosses the cap.
+    max_chunk_bytes = max((len(c) for c in chunks), default=0)
 
-    if total_bytes > MAX_EXECUTE_LUAU_BYTES:
+    if max_chunk_bytes > MAX_EXECUTE_LUAU_BYTES:
         return PublishResult(
             success=False,
             chunks=len(chunks),
@@ -92,9 +98,9 @@ def _publish_chunks(
             exceeded_limit=True,
             script_path=script_path,
             error=(
-                f"Place builder script exceeds "
-                f"{MAX_EXECUTE_LUAU_BYTES // 1_000_000}MB limit "
-                f"({total_bytes / 1024 / 1024:.1f} MB). "
+                f"Place builder chunk exceeds "
+                f"{MAX_EXECUTE_LUAU_BYTES // 1_000_000}MB per-request limit "
+                f"(largest chunk {max_chunk_bytes / 1024 / 1024:.1f} MB). "
                 "Use the local rbxlx with the runtime MeshLoader instead."
             ),
         )

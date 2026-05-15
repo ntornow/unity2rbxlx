@@ -1112,6 +1112,97 @@ _LUA_BLOCK_OPEN_RE = re.compile(r'\b(?:function|if|for|while|do)\b')
 _LUA_END_RE = re.compile(r'\bend\b')
 
 
+def _blank_lua_strings_and_comments(source: str) -> str:
+    """Return *source* with comments and string-literal contents blanked
+    out (replaced with spaces), preserving offsets. Used by token-scanners
+    (e.g. ``_touch_callback_ranges``) so a Luau block keyword appearing
+    inside a string literal — ``error("function call failed")``,
+    ``warn("expected end of input")`` — doesn't corrupt depth tracking.
+
+    Handles:
+      * Quoted single-line strings (``"..."`` / ``'...'``) with backslash
+        escapes; an unterminated string stops at the newline.
+      * Long-bracket strings (``[[...]]`` / ``[==[ ... ]==]``).
+      * Long-bracket comments (``--[[...]]`` / ``--[==[ ... ]==]``).
+      * Line comments (``-- ...``).
+
+    The output has the same length as *source* and the same newline
+    positions, so character offsets remain valid.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(source)
+    while i < n:
+        ch = source[i]
+        # Line / long-bracket comments first so ``--[[`` isn't read as
+        # a string ``[[``.
+        if source.startswith("--", i):
+            if source.startswith("--[", i):
+                j = i + 3
+                eq_count = 0
+                while j < n and source[j] == "=":
+                    eq_count += 1
+                    j += 1
+                if j < n and source[j] == "[":
+                    close = "]" + "=" * eq_count + "]"
+                    end = source.find(close, j + 1)
+                    end = n if end == -1 else end + len(close)
+                    for c in source[i:end]:
+                        out.append("\n" if c == "\n" else " ")
+                    i = end
+                    continue
+            j = source.find("\n", i)
+            if j == -1:
+                out.append(" " * (n - i))
+                i = n
+            else:
+                out.append(" " * (j - i))
+                i = j
+            continue
+        if ch == "[":
+            j = i + 1
+            eq_count = 0
+            while j < n and source[j] == "=":
+                eq_count += 1
+                j += 1
+            if j < n and source[j] == "[":
+                close = "]" + "=" * eq_count + "]"
+                end = source.find(close, j + 1)
+                end = n if end == -1 else end + len(close)
+                # Keep the brackets but blank the contents so the scanner
+                # can still see the boundary characters as non-keywords.
+                content_start = j + 1
+                content_end = end - len(close) if end < n else n
+                out.append(source[i:content_start])
+                for c in source[content_start:content_end]:
+                    out.append("\n" if c == "\n" else " ")
+                out.append(source[content_end:end])
+                i = end
+                continue
+        if ch in ('"', "'"):
+            quote = ch
+            out.append(ch)
+            j = i + 1
+            while j < n:
+                if source[j] == "\\" and j + 1 < n:
+                    out.append("  ")
+                    j += 2
+                    continue
+                if source[j] == quote:
+                    out.append(source[j])
+                    j += 1
+                    break
+                if source[j] == "\n":
+                    break
+                out.append("\n" if source[j] == "\n" else " ")
+                j += 1
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _touch_callback_ranges(source: str) -> list[tuple[int, int, str]]:
     """Return the lexical ranges of every ``Touched``/``TouchEnded``
     callback in *source* as ``(body_start, body_end, param_name)``.
@@ -1125,14 +1216,17 @@ def _touch_callback_ranges(source: str) -> list[tuple[int, int, str]]:
 
     Implementation walks Lua block-opening tokens (``function``, ``if``,
     ``for``, ``while``) and ``end`` tokens with a depth counter to find
-    the matching end of each callback. Imperfect against tokens in
-    strings/comments but sufficient for converter-emitted code.
+    the matching end of each callback. Strings and comments are blanked
+    via :func:`_blank_lua_strings_and_comments` so block keywords inside
+    string literals (e.g. ``error("expected end")``) don't corrupt the
+    depth count.
     """
     ranges: list[tuple[int, int, str]] = []
-    for header in _TOUCH_CALLBACK_RE.finditer(source):
+    scan_source = _blank_lua_strings_and_comments(source)
+    for header in _TOUCH_CALLBACK_RE.finditer(scan_source):
         var = header.group(1)
         # Body starts right after the closing ``)`` of ``function(VAR)``.
-        header_close = source.find(')', header.end())
+        header_close = scan_source.find(')', header.end())
         if header_close == -1:
             continue
         body_start = header_close + 1
@@ -1150,9 +1244,9 @@ def _touch_callback_ranges(source: str) -> list[tuple[int, int, str]]:
         pos = body_start
         loop_pending_do = 0
         body_end: int | None = None
-        while pos < len(source):
-            open_m = _LUA_BLOCK_OPEN_RE.search(source, pos)
-            end_m = _LUA_END_RE.search(source, pos)
+        while pos < len(scan_source):
+            open_m = _LUA_BLOCK_OPEN_RE.search(scan_source, pos)
+            end_m = _LUA_END_RE.search(scan_source, pos)
             if end_m is None:
                 break
             if open_m is not None and open_m.start() < end_m.start():

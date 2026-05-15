@@ -169,10 +169,17 @@ def _upload_asset(
 
     try:
         response = _do_upload()
-        # Only retry on server errors, NOT on 429 (rate limit) - retrying makes it worse
+        # Retry once on transient server errors.
         if response.status_code in (500, 502, 503):
             logger.warning("Server error %d, retrying once...", response.status_code)
             time.sleep(5)
+            response = _do_upload()
+        # 429 (rate limit): honor the reset window and retry once. Without
+        # this, ``_handle_rate_limit`` below would sleep for nothing — the
+        # request would fall through to the hard-fail branch and the
+        # asset would be permanently marked failed for this run.
+        if response.status_code == 429:
+            _handle_rate_limit(response)
             response = _do_upload()
     except Exception:
         logger.exception("Failed to upload asset %s", file_path.name)
@@ -524,8 +531,8 @@ def execute_luau(
                         for entry in entries[:5]:
                             for msg in entry.get("messages", []):
                                 logger.error("  Luau log: %s", msg[:200])
-                except Exception:
-                    pass
+                except Exception as log_exc:
+                    logger.debug("Failed to fetch Luau task logs: %s", log_exc)
                 return None
             # PROCESSING — keep polling
         except Exception as exc:

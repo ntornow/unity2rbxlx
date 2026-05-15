@@ -193,6 +193,61 @@ class TestSizeGuard:
         assert result.exceeded_limit is True
         assert called == [], "execute_luau must not be called when oversized"
 
+    def test_size_guard_is_per_chunk_not_cumulative(self, tmp_path, monkeypatch):
+        """The 4MB cap is per execute_luau request. A place generating
+        many chunks whose SUM exceeds 4MB but each one of which fits
+        under the cap must publish successfully — earlier code rejected
+        the request based on cumulative bytes, which would block
+        otherwise-fine multi-chunk publishes for large places.
+        """
+        # Two chunks just under the per-request cap. Sum is roughly
+        # 2 * (MAX - 100) which exceeds the cap, but each chunk is fine.
+        ok_chunk = "y" * (MAX_EXECUTE_LUAU_BYTES - 100)
+        chunks = [ok_chunk, ok_chunk]
+        monkeypatch.setattr(
+            "roblox.luau_place_builder.generate_place_luau_chunked",
+            lambda rbx_place: chunks,
+        )
+
+        called: list[tuple] = []
+        monkeypatch.setattr(
+            "roblox.cloud_api.execute_luau",
+            lambda *a, **kw: called.append(a) or {"ok": True},
+        )
+
+        result = publish_place("k", 1, 2, object(), tmp_path)
+
+        assert result.success is True
+        assert result.exceeded_limit is False
+        assert len(called) == 2, "each chunk must be sent individually"
+
+    def test_size_guard_rejects_when_any_chunk_oversized(
+        self, tmp_path, monkeypatch
+    ):
+        """Even with several small chunks present, a single oversized
+        chunk must still fail the size guard — it would never publish.
+        """
+        chunks = [
+            "a" * 100,
+            "b" * (MAX_EXECUTE_LUAU_BYTES + 1),
+            "c" * 100,
+        ]
+        monkeypatch.setattr(
+            "roblox.luau_place_builder.generate_place_luau_chunked",
+            lambda rbx_place: chunks,
+        )
+
+        called: list[tuple] = []
+        monkeypatch.setattr(
+            "roblox.cloud_api.execute_luau",
+            lambda *a, **kw: called.append(a) or {"ok": True},
+        )
+
+        result = publish_place("k", 1, 2, object(), tmp_path)
+        assert result.success is False
+        assert result.exceeded_limit is True
+        assert called == [], "must not publish when any chunk exceeds the cap"
+
 
 class TestIdCacheMtimePriority:
     """When both .roblox_ids.json and resolve_ids.json exist (migration

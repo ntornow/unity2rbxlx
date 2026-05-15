@@ -585,30 +585,46 @@ _RUNSERVICE_CONNECT_RE = re.compile(
 
 def _collect_runservice_callback_bodies(source: str) -> list[str]:
     """Return every ``RunService.X:Connect(function ... end)`` callback
-    body as a substring. Uses ``function``/``end`` token counting to
-    find the matching close — light parser, not a full Luau parser.
+    body as a substring. Counts ``function``/``if``/``for``/``while``
+    / ``do`` opens against ``end`` closes so an inner ``if cond then
+    ... end`` doesn't prematurely close the body.
+
+    ``for``/``while`` consume their following ``do`` (which would
+    otherwise be counted as a standalone block open). A pure
+    ``do ... end`` is counted normally.
     """
     out: list[str] = []
     body_open_re = re.compile(
         r"RunService\s*\.\s*\w+\s*:\s*Connect\s*\(\s*function\s*\([^)]*\)"
     )
-    token_re = re.compile(r"\bfunction\b|\bend\b")
+    open_re = re.compile(r"\b(?:function|if|for|while|do)\b")
+    end_re = re.compile(r"\bend\b")
     for cm in body_open_re.finditer(source):
-        # Walk forward from end of the function() declaration counting
-        # ``function`` / ``end`` until the depth returns to 0.
         i = cm.end()
         depth = 1
-        last = i
-        for tm in token_re.finditer(source, i):
-            if tm.group() == "function":
-                depth += 1
-            else:
-                depth -= 1
-                if depth == 0:
-                    last = tm.start()
-                    break
-        else:
-            last = len(source)
+        last = len(source)
+        pos = i
+        loop_pending_do = 0
+        while pos < len(source):
+            om = open_re.search(source, pos)
+            em = end_re.search(source, pos)
+            if em is None:
+                break
+            if om is not None and om.start() < em.start():
+                kw = om.group()
+                if kw == "do" and loop_pending_do > 0:
+                    loop_pending_do -= 1
+                else:
+                    depth += 1
+                    if kw in ("for", "while"):
+                        loop_pending_do += 1
+                pos = om.end()
+                continue
+            depth -= 1
+            if depth == 0:
+                last = em.start()
+                break
+            pos = em.end()
         out.append(source[i:last])
     return out
 
