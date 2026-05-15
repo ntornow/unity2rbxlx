@@ -256,6 +256,27 @@ class TestCodexFix2DuplicateStems:
         graph, _ = _build_dependency_graph(sources)
         assert set(graph.keys()) == {"Utils", "Utils__abcdef"}
 
+    def test_ai_cache_key_no_field_boundary_collision(self):
+        """Codex round-3 [P2]: ``_cache_key(csharp + class + ...)`` used
+        plain string concatenation, so distinct inputs like
+        ``("ab", "c", ...)`` and ``("a", "bc", ...)`` produced the same
+        prehash and collided on the cache. ``_ai_cache_key`` now frames
+        each field with its length so the boundaries are unambiguous.
+        """
+        from converter.code_transpiler import _ai_cache_key
+
+        k1 = _ai_cache_key(
+            csharp_source="ab", class_name="c", script_type="Script",
+            project_context="", prompt_hash="P", model="claude",
+        )
+        k2 = _ai_cache_key(
+            csharp_source="a", class_name="bc", script_type="Script",
+            project_context="", prompt_hash="P", model="claude",
+        )
+        assert k1 != k2, (
+            "Field-boundary-ambiguous inputs must produce different keys."
+        )
+
     def test_ai_results_keyed_by_stem_not_class_name(
         self, tmp_path, monkeypatch,
     ):

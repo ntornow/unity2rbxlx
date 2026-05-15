@@ -1634,7 +1634,14 @@ def _ai_transpile(
 
     # Check cache first (include system prompt hash so prompt changes invalidate cache).
     _prompt_hash = hashlib.sha256(_AI_SYSTEM_PROMPT.encode()).hexdigest()[:16]
-    cache_key = _cache_key(csharp_source + class_name + script_type + project_context + _prompt_hash, model)
+    cache_key = _ai_cache_key(
+        csharp_source=csharp_source,
+        class_name=class_name,
+        script_type=script_type,
+        project_context=project_context,
+        prompt_hash=_prompt_hash,
+        model=model,
+    )
     cached = _load_cache(cache_key)
     if cached is not None:
         # Verify cached result passes lint — old caches may have syntax errors
@@ -1788,7 +1795,14 @@ def _claude_cli_transpile(
 
     # Check cache first (include class_name, script_type, and system prompt hash in key).
     _prompt_hash = hashlib.sha256(_AI_SYSTEM_PROMPT.encode()).hexdigest()[:16]
-    cache_key = _cache_key(csharp_source + class_name + script_type + project_context + _prompt_hash, "claude-cli-v4")
+    cache_key = _ai_cache_key(
+        csharp_source=csharp_source,
+        class_name=class_name,
+        script_type=script_type,
+        project_context=project_context,
+        prompt_hash=_prompt_hash,
+        model="claude-cli-v4",
+    )
     cached = _load_cache(cache_key)
     if cached is not None:
         # Verify cached result passes lint — old caches may have syntax errors
@@ -2153,6 +2167,31 @@ def _cache_key(source: str, model: str) -> str:
     """Generate a SHA-256 cache key for a source + model combination."""
     content = f"{model}:{source}"
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _ai_cache_key(
+    *,
+    csharp_source: str,
+    class_name: str,
+    script_type: str,
+    project_context: str,
+    prompt_hash: str,
+    model: str,
+) -> str:
+    """Build a cache key from the AI-transpile inputs without collisions.
+
+    Concatenating variable-length fields without separators lets
+    distinct inputs share a prehash:
+    ``("ab", "c", ...)`` and ``("a", "bc", ...)`` both yield "abc...".
+    Encode each field's length explicitly so the field boundaries are
+    unambiguous regardless of content.
+    """
+    parts = [
+        model, csharp_source, class_name, script_type,
+        project_context, prompt_hash,
+    ]
+    framed = "".join(f"{len(p)}:{p}|" for p in parts)
+    return hashlib.sha256(framed.encode("utf-8")).hexdigest()
 
 
 def _cache_path(key: str) -> Path:
