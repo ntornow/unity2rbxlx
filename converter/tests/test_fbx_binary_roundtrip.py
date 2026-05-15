@@ -28,9 +28,25 @@ from converter.fbx_binary import (
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 FBX_FIXTURE = REPO_ROOT / "test_projects" / "SimpleFPS" / "Assets" / "Models" / "prop_keycard.fbx"
 
+
+def _fbx_fixture_unavailable() -> bool:
+    # Nightly CI inits the SimpleFPS submodule with GIT_LFS_SKIP_SMUDGE=1
+    # because the upstream LFS quota is exhausted, so the .fbx path exists
+    # but holds an LFS pointer (~130 bytes of ASCII) instead of the real
+    # binary. read_fbx() then fails with "Not an FBX binary file". Treat
+    # both missing-file and LFS-pointer cases as unavailable.
+    if not FBX_FIXTURE.exists():
+        return True
+    try:
+        head = FBX_FIXTURE.read_bytes()[:64]
+    except OSError:
+        return True
+    return head.startswith(b"version https://git-lfs.github.com/")
+
+
 requires_fbx = pytest.mark.skipif(
-    not FBX_FIXTURE.exists(),
-    reason=f"FBX fixture missing: {FBX_FIXTURE} (SimpleFPS submodule not initialized?)",
+    _fbx_fixture_unavailable(),
+    reason=f"FBX fixture missing or LFS pointer: {FBX_FIXTURE}",
 )
 
 

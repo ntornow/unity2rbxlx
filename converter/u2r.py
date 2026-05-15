@@ -1596,7 +1596,12 @@ def eval_diff(baseline: str, current: str, fail_on_regression: bool) -> None:
     script_ratio, sa_with_textures, sounds_with_id.
 
     Metrics where LOWER is better: errors, warnings, sounds_empty,
-    conversion_time_s.
+    todo_placeholders, csharp_residue.
+
+    ``conversion_time_s`` is reported but NOT regression-gated: it varies
+    by CI hardware (baseline was captured on a different runner) and by
+    transient I/O, so any single-sample wall-clock delta is too noisy to
+    fail a nightly run on. Track it via the [changed] tag instead.
     """
     import json
 
@@ -1611,7 +1616,7 @@ def eval_diff(baseline: str, current: str, fail_on_regression: bool) -> None:
         "scripts_in_rbxlx", "surface_appearances", "converted_materials",
     }
     lower_is_better = {
-        "errors", "warnings", "sounds_empty", "conversion_time_s",
+        "errors", "warnings", "sounds_empty",
         "todo_placeholders", "csharp_residue",
     }
 
