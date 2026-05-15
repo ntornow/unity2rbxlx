@@ -3004,11 +3004,11 @@ def _find_camera(parsed_scene: ParsedScene) -> RbxCameraConfig | None:
     from core.coordinate_system import quat_multiply
 
     def _world_transform(
-        node: Any,
+        node: SceneNode,
     ) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
         """Walk the parent chain to compute a Unity-space world (pos, rot)."""
-        chain: list[Any] = []
-        cur: Any | None = node
+        chain: list[SceneNode] = []
+        cur: SceneNode | None = node
         seen: set[str] = set()
         while cur is not None:
             fid = str(getattr(cur, "file_id", "") or "")
