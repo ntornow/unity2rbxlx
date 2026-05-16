@@ -204,9 +204,12 @@ class TestReplicatedTemplatesField:
 
 
 class TestWorldPivotPreservation:
-    """Item #2 of the unity-conversion-fidelity-plan: prefab templates
-    carry a meaningful ``WorldPivot`` so ``Model:GetPivot()`` returns a
-    per-prefab anchor instead of Studio's centroid fallback."""
+    """Prefab templates must carry a meaningful ``WorldPivot`` so
+    ``Model:GetPivot()`` returns a per-prefab anchor instead of Studio's
+    geometric-centroid fallback. Without this, scripts that
+    ``Model:PivotTo(target)`` see the template placed by centroid (not
+    by the Unity prefab root), and per-prefab offset compensation has
+    to be baked into every consumer script."""
 
     def _model_with_child_at(self, name: str, child_pos: tuple[float, float, float]) -> RbxPart:
         from core.roblox_types import RbxCFrame

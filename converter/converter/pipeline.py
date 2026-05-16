@@ -2069,11 +2069,19 @@ return table.concat(allData, "\\n")'''
 
         self._subphase_patch_setup_sounds()
 
-        # Semantic post-transpile validator (item #6 of the
-        # unity-conversion-fidelity-plan). Runs AFTER every script-
-        # mutating subphase (cohere, autogen, mesh-loader injection,
-        # setup-sounds patches) so the line numbers and snippets in
-        # ``conversion_report.json.semantic_warnings`` match the source
+        # Semantic post-transpile validator. Catches the class of bugs
+        # that pass Luau syntax but break at runtime in Roblox-specific
+        # ways (weapon clones parented to character descendants, anchored
+        # parts with no weld, sub-meter Vector3 literals used in a
+        # studs-space context, hardcoded camera heights, etc.). Surfaces
+        # warnings to ``conversion_report.json.semantic_warnings``; no
+        # auto-fix — the rules over-detect by design, so a programmatic
+        # rewrite would regress legitimate stud-space sub-unit offsets
+        # (e.g. ``head.Position + Vector3.new(0, 0.5, 0)`` is correct).
+        #
+        # Runs AFTER every script-mutating subphase (cohere, autogen,
+        # mesh-loader injection, setup-sounds patches) so the line
+        # numbers and snippets the validator reports match the source
         # that gets written to disk and serialised into the rbxlx.
         #
         # ``_bind_scripts_to_parts`` moves MonoBehaviour-style gameplay
@@ -3032,6 +3040,14 @@ script.Disabled = true
                     "reason": warning,
                 })
 
+        # Scene conversion records dropped Unity component types —
+        # _SKIP_TYPES (no Roblox equivalent) plus unhandled types with no
+        # converter mapping. Each entry already carries its own category.
+        if self.state.rbx_place is not None:
+            for entry in getattr(self.state.rbx_place, "unconverted_components", None) or []:
+                category = entry.get("category", "component")
+                sections.setdefault(category, []).append(entry)
+
         out_path = self.output_dir / UNCONVERTED_FILENAME
         if not sections:
             if out_path.exists():
@@ -3041,10 +3057,11 @@ script.Disabled = true
         lines = [
             "# UNCONVERTED",
             "",
-            "Features the converter deliberately dropped from this run. "
-            "Each bullet is a feature that has no in-policy Roblox "
-            "equivalent (or requires source data the converter can't "
-            "parse yet). See TODO.md + the Phase 4 plan for roadmap.",
+            "Features dropped from this specific conversion run. Each "
+            "bullet had no in-policy Roblox equivalent, or required "
+            "source data the converter cannot parse yet. For the static "
+            "catalog of known gaps see `docs/UNSUPPORTED.md`; for roadmap "
+            "items see `TODO.md`.",
             "",
         ]
         for category in sorted(sections):

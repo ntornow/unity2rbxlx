@@ -8,11 +8,15 @@ because ``PlayerModule.CameraModule.TransparencyController`` writes
 ``LocalTransparencyModifier = 1`` on close-to-camera character children
 every frame.
 
-The runtime-side fix for that specific bug shipped in
-``output/simplefps-revert/scripts/Player.luau``, but the same class of
-bug recurs on any FPS-style Unity project until the converter learns to
-detect it. This module is the detection half — it emits structured
-warnings; the rewriting half is items #1 / #3 in the fidelity plan.
+The runtime-side fix for that specific bug shipped in the SimpleFPS
+output, but the same class of bug recurs on any FPS-style Unity project
+until the converter learns to detect it. This module is the detection
+half — it emits structured warnings only. Automatic rewriting is
+deliberately out of scope: the rules over-detect by design (sub-meter
+literals are sometimes legitimate stud-space offsets), so a programmatic
+rewrite would regress correct code. The FPS-weapon-mount class of bug
+gets a targeted fix via the ``fps_weapon_mount_inject`` patch pack in
+``script_coherence_packs.py``, not via this module.
 
 Public entry point: :func:`run_semantic_validators`. Returns a list of
 :class:`SemanticIssue` records.
@@ -43,8 +47,8 @@ log = logging.getLogger(__name__)
 class SemanticIssue:
     """One semantic warning surfaced by a rule.
 
-    Shape matches the JSON record in the fidelity plan so the report
-    writer can serialize a list of these directly via ``asdict``.
+    Serialised directly into ``conversion_report.json.semantic_warnings``
+    via ``asdict``; fields are stable wire format for downstream tools.
     """
     severity: str          # "warning" | "error"
     rule: str              # rule name (e.g. "weapon_clone_in_character")
@@ -493,7 +497,10 @@ def _rule_suspicious_meter_literal(
                     ),
                     suggested_fix=(
                         "Multiply each component by STUDS_PER_METER (3.571) "
-                        "or run item #1 of the fidelity plan to auto-scale."
+                        "if the source value is Unity meters. The warning "
+                        "can also be a false positive on legitimate stud-"
+                        "space sub-unit offsets (e.g. a half-stud camera "
+                        "lift above the head); inspect before rewriting."
                     ),
                     confidence="medium",
                 )

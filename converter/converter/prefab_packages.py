@@ -220,11 +220,12 @@ def _find_root_anchor_part(
 
     Known limitation: when a runtime script assigns
     ``clone.PrimaryPart = ...`` before ``clone:PivotTo(...)``, Roblox
-    derives the pivot from PrimaryPart and ignores the WorldPivot
-    written here. Documented in
-    ``unity-conversion-fidelity-plan.md`` (#2 risks) — full resolution
-    requires emitting an explicit Model.PrimaryPart referent, which
-    the rbxlx writer does not currently support.
+    derives the pivot from ``PrimaryPart.CFrame * PrimaryPart.PivotOffset``
+    and ignores the WorldPivot written here. Full resolution requires
+    emitting an explicit ``Model.PrimaryPart`` referent and writing
+    ``PivotOffset`` on that part — the rbxlx writer does not currently
+    support either, so a small per-part drift remains for templates
+    whose runtime callers set PrimaryPart eagerly.
     """
     direct = part.children or []
     # Candidates for the wrapped root child's name: the prefab's
@@ -363,14 +364,15 @@ def generate_prefab_packages(
         #   common case where the prefab root's Unity local is
         #   ``(0, 0, 0)`` and FBX baking adds the only offset.
         #
-        # Known limitations (full resolution = Layer B in
-        # ``docs/design/unity-conversion-fidelity-plan.md``):
+        # Known limitations (full resolution requires per-part Unity-
+        # local-position tracking and PrimaryPart emission, neither of
+        # which the converter currently has):
         # 1. When the anchor child has a non-zero Unity local position
         #    (rare for typical wrapped prefabs), ``Model:PivotTo()``
         #    lands the rendered geometry on the target instead of the
-        #    Unity root. The plan's full formula
+        #    Unity root. The exact formula
         #    ``WorldPivot = roblox_world - unity_local * scale``
-        #    requires Unity local positions threaded through the
+        #    requires threading Unity local positions through the
         #    ``RbxPart`` tree, which the converter does not yet carry.
         # 2. When a runtime script assigns ``clone.PrimaryPart =``
         #    before ``clone:PivotTo(...)``, Roblox derives the pivot

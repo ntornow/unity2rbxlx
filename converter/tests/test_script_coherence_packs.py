@@ -173,9 +173,9 @@ class TestRunPacksGating:
         assert order == ["first", "second"]
 
 
-class TestFpsRifleDetector:
-    """The fps_rifle_inject pack must auto-enable on FPS projects and
-    auto-disable on non-FPS projects. Both directions are critical:
+class TestFpsWeaponMountDetector:
+    """The fps_weapon_mount_inject pack must auto-enable on FPS projects
+    and auto-disable on non-FPS projects. Both directions are critical:
     enabling on Gamekit3D would inject FPS code into RPG scripts."""
 
     def test_detects_simplefps_pattern(self) -> None:
@@ -186,7 +186,7 @@ class TestFpsRifleDetector:
                 script_type="LocalScript",
             ),
         ]
-        assert packs_module._detect_fps_rifle_pickup(scripts) is True
+        assert packs_module._detect_fps_weapon_mount(scripts) is True
 
     def test_detects_riflePrefab_reference(self) -> None:
         scripts = [
@@ -196,7 +196,7 @@ class TestFpsRifleDetector:
                 script_type="Script",
             ),
         ]
-        assert packs_module._detect_fps_rifle_pickup(scripts) is True
+        assert packs_module._detect_fps_weapon_mount(scripts) is True
 
     def test_does_not_detect_on_non_fps(self) -> None:
         """Gamekit3D-style scripts should not trigger the pack."""
@@ -209,13 +209,14 @@ class TestFpsRifleDetector:
                 script_type="ModuleScript",
             ),
         ]
-        assert packs_module._detect_fps_rifle_pickup(scripts) is False
+        assert packs_module._detect_fps_weapon_mount(scripts) is False
 
 
-class TestFpsRifleInjection:
-    """The pack rewrites a stub GetRifle into the working version. Without
-    this, the SimpleFPS rifle is invisible/broken — same regression that
-    motivated the original Pass 14 in script_coherence."""
+class TestFpsWeaponMountInjection:
+    """The pack rewrites a stub GetRifle into the working version using
+    the registered ``WEAPON_MOUNTS`` entry. Without this, the SimpleFPS
+    rifle is invisible/broken — same regression that motivated the
+    original Pass 14 in script_coherence."""
 
     def _stub_player_script(self) -> RbxScript:
         """Synthetic script matching the post-AI-transpile stub the
@@ -240,7 +241,7 @@ class TestFpsRifleInjection:
 
     def test_injection_adds_rifle_clone_logic(self) -> None:
         s = self._stub_player_script()
-        fixes = packs_module._inject_fps_rifle_system([s])
+        fixes = packs_module._inject_fps_weapon_mounts([s])
         assert fixes == 1
         assert '_fpsRifle' in s.source
         assert 'rp:Clone' in s.source
@@ -248,8 +249,8 @@ class TestFpsRifleInjection:
 
     def test_injection_marker_prevents_double_apply(self) -> None:
         s = self._stub_player_script()
-        first = packs_module._inject_fps_rifle_system([s])
-        second = packs_module._inject_fps_rifle_system([s])
+        first = packs_module._inject_fps_weapon_mounts([s])
+        second = packs_module._inject_fps_weapon_mounts([s])
         assert first == 1
         assert second == 0  # marker prevents re-injection
 
@@ -706,7 +707,7 @@ class TestPickupRemoteEventDetectorIsGenreAgnostic:
     """Codex finding [P2]: ``door_global_player_to_attribute`` only works
     if ``pickup_remote_event_server`` runs to write the replicated
     server-side ``has<X>`` attribute. The Pickup pack used to gate on
-    ``_detect_fps_rifle_pickup``, which fires only on rifle markers
+    ``_detect_fps_weapon_mount``, which fires only on rifle markers
     (``riflePrefab``/``GetRifle``). A non-FPS project with key doors
     would have the Door rewritten to read ``GetAttribute("hasKey")`` on
     a flag nobody writes — leaving every key door permanently locked.

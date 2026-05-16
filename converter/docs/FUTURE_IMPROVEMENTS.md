@@ -203,3 +203,29 @@ movement for `NavMeshAgent`. Advanced cases not covered:
   obstacle metadata is captured as attributes but no runtime re-bake.
 
 Revisit if a project ships AI navigation that depends on these features.
+
+---
+
+## Generic FPS weapon-mount metadata extraction
+
+The `fps_weapon_mount_inject` patch pack in
+[`script_coherence_packs.py`](../converter/script_coherence_packs.py) is
+data-driven over a one-entry `WEAPON_MOUNTS` registry that today matches
+SimpleFPS exactly. Adding a second FPS test project surfaces two open
+questions worth resolving with a real signal:
+
+- **Mount metadata source.** Today's entry hardcodes prefab name, view
+  offset, and scale. A second project would justify extracting these
+  from Unity prefab YAML (Player MonoBehaviour fields + the weapon-mount
+  Transform's `localPosition` × `STUDS_PER_METER`) and persisting them
+  into `conversion_context.json` as an `fps_weapon_mounts` block, so
+  the registry becomes derived state rather than hand-authored.
+- **Detection generality.** The current detector anchors on function
+  name (`GetRifle`) and prefab name (`riflePrefab`). Two AI-transpiled
+  projects with different naming would justify anchoring on body shape
+  instead (a Clone() of a Templates child followed by a sentinel flag
+  flip) and using metadata as the source of truth.
+
+Not worth building speculatively — the hardcoded entry costs ~10 lines
+and covers the only FPS consumer. Revisit when a second FPS Unity
+project enters the test bench.

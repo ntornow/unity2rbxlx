@@ -165,23 +165,82 @@ def run_packs(
 
 
 # ---------------------------------------------------------------------------
+# FPS weapon-mount registry
+# ---------------------------------------------------------------------------
+#
+# Each ``WeaponMount`` entry parameterises one Unity FPS weapon-pickup
+# pattern: the world prefab name, the equip-function the AI transpiler
+# stubs out, the sentinel flag, view-space offset, scale, and the local
+# variable names the rewrite uses. Adding a second FPS weapon (e.g. a
+# pistol on a future test project) is a one-tuple append — no code
+# change to the detector or injection logic.
+#
+# Values are stored as the literal Lua-source fragments they emit, so
+# refactoring this registry from the previous SimpleFPS-hardcoded pack
+# produces byte-identical output for the existing test project.
+
+
+@dataclass(frozen=True)
+class WeaponMount:
+    prefab_name: str        # workspace prefab name (camelCase)
+    equip_function: str     # AI-stubbed function name on the Player controller
+    sentinel_var: str       # already-equipped flag, flipped to true on equip
+    scale_expr: str         # Lua-source fragment for rifle:ScaleTo(<expr>)
+    view_offset_expr: str   # Lua-source CFrame expression for camera-relative pose
+    marker_tag: str         # composed into ``-- _FPS_<tag>`` for idempotency
+    instance_var: str       # local that holds the cloned weapon Model
+    primary_var: str        # local that holds the weapon's PrimaryPart
+
+
+# Today's registry: one entry, replicating the SimpleFPS hardcoded values.
+WEAPON_MOUNTS: tuple[WeaponMount, ...] = (
+    WeaponMount(
+        prefab_name="riflePrefab",
+        equip_function="GetRifle",
+        sentinel_var="gotWeapon",
+        scale_expr="0.15",
+        view_offset_expr="CFrame.new(0.5, -0.5, -3)",
+        marker_tag="RIFLE_SYSTEM",
+        instance_var="_fpsRifle",
+        primary_var="_fpsRiflePrimary",
+    ),
+)
+
+
+def _prefab_alt_case(name: str) -> str:
+    """Return the upper-first-letter variant of a camelCase prefab name.
+
+    SimpleFPS stores the rifle prefab under either ``riflePrefab`` or
+    ``RiflePrefab`` depending on which Unity export pass ran. Emitting
+    both ``FindFirstChild`` lookups in the injected code handles both.
+    """
+    if not name:
+        return name
+    return name[:1].upper() + name[1:]
+
+
+# ---------------------------------------------------------------------------
 # Detectors
 # ---------------------------------------------------------------------------
 
-def _detect_fps_rifle_pickup(scripts: list["RbxScript"]) -> bool:
-    """Pack runs when any script references a rifle pickup pattern.
+def _detect_fps_weapon_mount(scripts: list["RbxScript"]) -> bool:
+    """Pack runs when any script references one of the registered FPS
+    weapon-mount patterns.
 
-    The Unity SimpleFPS sample (and any project copying its rifle pickup
-    convention) names the world prefab ``riflePrefab`` and exposes a
-    ``GetRifle`` function in the Player controller. Either marker is
-    enough to enable the pack.
+    A mount qualifies a script via either the prefab name (case variant
+    included) or the AI-stubbed equip function name. Either marker is
+    enough — Gamekit3D-style scripts contain neither and skip cleanly.
     """
-    return any(
-        "riflePrefab" in s.source
-        or "RiflePrefab" in s.source
-        or "GetRifle" in s.source
-        for s in scripts
-    )
+    for s in scripts:
+        src = s.source
+        for mount in WEAPON_MOUNTS:
+            if (
+                mount.prefab_name in src
+                or _prefab_alt_case(mount.prefab_name) in src
+                or mount.equip_function in src
+            ):
+                return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -312,110 +371,155 @@ end
 """
 
 
-@patch_pack(
-    name="fps_rifle_inject",
-    description="Inject a working FPS rifle pickup system into Player scripts "
-    "that the AI transpiler emits as a stub.",
-    detect=_detect_fps_rifle_pickup,
+# Client-side pickup detection is mount-agnostic — runs once per Player
+# script regardless of how many WeaponMount entries fired. The marker is
+# the leading comment line itself, so this remains byte-identical to the
+# pre-refactor output.
+_PICKUP_TOUCHED_MARKER = "-- Client-side pickup detection"
+_PICKUP_TOUCHED_CODE = (
+    '\n' + _PICKUP_TOUCHED_MARKER + '\n'
+    'if character then\n'
+    '    for _, part in character:GetChildren() do\n'
+    '        if part:IsA("BasePart") then\n'
+    '            part.Touched:Connect(function(other)\n'
+    '                local pm = other:FindFirstAncestorOfClass("Model")\n'
+    '                if pm and (pm.Name:lower():find("pickup") or pm:FindFirstChild("Pickup")) then\n'
+    '                    local sc = pm:FindFirstChild("Pickup") or pm:FindFirstChildWhichIsA("Script")\n'
+    '                    local iname = (sc and sc:GetAttribute("itemName"))\n'
+    '                        or pm:GetAttribute("itemName") or ""\n'
+    '                    if iname == "" and pm.Name:lower():find("rifle") then iname = "Rifle" end\n'
+    '                    if iname == "" and pm.Name:lower():find("key") then iname = "Key" end\n'
+    '                    if iname == "" and pm.Name:lower():find("ammo") then iname = "Ammo" end\n'
+    '                    if iname == "" and (pm.Name:lower():find("health") or pm.Name:lower():find("hp")) then iname = "Health" end\n'
+    '                    if iname ~= "" then getItem(iname); pm:Destroy() end\n'
+    '                end\n'
+    '            end)\n'
+    '        end\n'
+    '    end\n'
+    'end\n'
 )
-def _inject_fps_rifle_system(scripts: list["RbxScript"]) -> int:
-    """Replace the AI-generated GetRifle stub with a working version.
 
-    Steps:
-    1. Find riflePrefab in workspace
-    2. Clone, scale, make visible, weld sub-parts
-    3. Parent to workspace (not character) with anchored parts
-    4. Update position every frame in RenderStepped to follow camera
-    5. Add client-side Touched detection on character parts
+
+def _apply_weapon_mount(s: "RbxScript", mount: WeaponMount) -> bool:
+    """Rewrite the AI-stubbed equip path for one weapon mount.
+
+    Returns True iff this mount mutated the script. The caller appends
+    the mount-agnostic pickup-Touched block exactly once per script
+    after all mounts have run.
+    """
+    marker = f"-- _FPS_{mount.marker_tag}"
+    if mount.equip_function not in s.source:
+        return False
+    if marker in s.source:
+        return False
+
+    before = s.source
+
+    s.source = s.source.replace(
+        f"local {mount.sentinel_var} = false",
+        f"local {mount.sentinel_var} = false\n"
+        f"local {mount.instance_var} = nil  {marker}\n"
+        f"local {mount.primary_var} = nil",
+    )
+
+    body_re = re.compile(
+        rf"({mount.equip_function} = function\(\))(.*?)"
+        rf"(\n\s*{mount.sentinel_var} = true)",
+        re.DOTALL,
+    )
+    m = body_re.search(s.source)
+    if m:
+        alt = _prefab_alt_case(mount.prefab_name)
+        new_body = (
+            f'{mount.equip_function} = function()\n'
+            f'    if {mount.sentinel_var} then return end\n'
+            f'    local rp = workspace:FindFirstChild("{mount.prefab_name}", true)\n'
+            f'        or workspace:FindFirstChild("{alt}", true)\n'
+            f'    if not rp then return end\n'
+            f'    local rifle = rp:Clone()\n'
+            f'    if rifle:IsA("Model") then rifle:ScaleTo({mount.scale_expr}) end\n'
+            f'    local prim = rifle:FindFirstChildWhichIsA("BasePart")\n'
+            f'    if not prim then rifle:Destroy() return end\n'
+            f'    for _, p in rifle:GetDescendants() do\n'
+            f'        if p:IsA("BasePart") then\n'
+            f'            p.Transparency = 0\n'
+            f'            p.CanCollide = false\n'
+            f'            p.Anchored = true\n'
+            f'            if p ~= prim then\n'
+            f'                local w = Instance.new("WeldConstraint")\n'
+            f'                w.Part0 = p; w.Part1 = prim; w.Parent = p\n'
+            f'            end\n'
+            f'        end\n'
+            f'    end\n'
+            f'    rifle:PivotTo(workspace.CurrentCamera.CFrame * {mount.view_offset_expr})\n'
+            f'    rifle.Parent = workspace\n'
+            f'    {mount.instance_var} = rifle\n'
+            f'    {mount.primary_var} = prim\n'
+        )
+        s.source = s.source[: m.start()] + new_body + s.source[m.start(3):]
+
+    if "RunService.RenderStepped:Connect" in s.source:
+        s.source = s.source.replace(
+            "RunService.RenderStepped:Connect(function(dt)",
+            "RunService.RenderStepped:Connect(function(dt)\n"
+            f"    if {mount.instance_var} and {mount.primary_var} "
+            f"and {mount.primary_var}.Parent then\n"
+            f"        {mount.instance_var}:PivotTo("
+            f"workspace.CurrentCamera.CFrame * {mount.view_offset_expr})\n"
+            f"    end",
+        )
+
+    return s.source != before
+
+
+def _append_pickup_touched_block(s: "RbxScript") -> None:
+    if _PICKUP_TOUCHED_MARKER in s.source:
+        return
+    return_m = re.search(r"^return\b", s.source, re.MULTILINE)
+    if return_m:
+        s.source = (
+            s.source[: return_m.start()]
+            + _PICKUP_TOUCHED_CODE
+            + s.source[return_m.start():]
+        )
+    else:
+        s.source = s.source.rstrip() + "\n" + _PICKUP_TOUCHED_CODE
+
+
+@patch_pack(
+    name="fps_weapon_mount_inject",
+    description="Inject a working FPS weapon-mount system into Player "
+    "scripts that the AI transpiler emits as a stub. Driven by the "
+    "``WEAPON_MOUNTS`` registry — adding a second weapon means appending "
+    "one tuple, not writing new pack code.",
+    detect=_detect_fps_weapon_mount,
+)
+def _inject_fps_weapon_mounts(scripts: list["RbxScript"]) -> int:
+    """For each script, apply every registered weapon mount whose
+    markers fire, then emit the mount-agnostic pickup-Touched block once.
+
+    Each mount idempotency-guards on its own ``-- _FPS_<tag>`` marker;
+    the pickup-Touched block guards on the leading comment as its marker.
+
+    Steps per mount:
+    1. Find the prefab in workspace (camelCase or PascalCase variant)
+    2. Clone, scale, make visible, weld sub-parts to the PrimaryPart
+    3. Parent to workspace (not the character) with anchored parts
+    4. Splice a RenderStepped follower so pose tracks the camera
     """
     fixes = 0
     for s in scripts:
-        if 'GetRifle' not in s.source:
-            continue
-        if '-- _FPS_RIFLE_SYSTEM' in s.source:
-            continue
-
-        original = s.source
-
-        s.source = s.source.replace(
-            'local gotWeapon = false',
-            'local gotWeapon = false\nlocal _fpsRifle = nil  -- _FPS_RIFLE_SYSTEM\nlocal _fpsRiflePrimary = nil',
-        )
-
-        m = re.search(
-            r'(GetRifle = function\(\))(.*?)(\n\s*gotWeapon = true)',
-            s.source, re.DOTALL,
-        )
-        if m:
-            new_rifle = (
-                'GetRifle = function()\n'
-                '    if gotWeapon then return end\n'
-                '    local rp = workspace:FindFirstChild("riflePrefab", true)\n'
-                '        or workspace:FindFirstChild("RiflePrefab", true)\n'
-                '    if not rp then return end\n'
-                '    local rifle = rp:Clone()\n'
-                '    if rifle:IsA("Model") then rifle:ScaleTo(0.15) end\n'
-                '    local prim = rifle:FindFirstChildWhichIsA("BasePart")\n'
-                '    if not prim then rifle:Destroy() return end\n'
-                '    for _, p in rifle:GetDescendants() do\n'
-                '        if p:IsA("BasePart") then\n'
-                '            p.Transparency = 0\n'
-                '            p.CanCollide = false\n'
-                '            p.Anchored = true\n'
-                '            if p ~= prim then\n'
-                '                local w = Instance.new("WeldConstraint")\n'
-                '                w.Part0 = p; w.Part1 = prim; w.Parent = p\n'
-                '            end\n'
-                '        end\n'
-                '    end\n'
-                '    rifle:PivotTo(workspace.CurrentCamera.CFrame * CFrame.new(0.5, -0.5, -3))\n'
-                '    rifle.Parent = workspace\n'
-                '    _fpsRifle = rifle\n'
-                '    _fpsRiflePrimary = prim\n'
-            )
-            s.source = s.source[:m.start()] + new_rifle + s.source[m.start(3):]
-
-        if 'RunService.RenderStepped:Connect' in s.source:
-            s.source = s.source.replace(
-                'RunService.RenderStepped:Connect(function(dt)',
-                'RunService.RenderStepped:Connect(function(dt)\n'
-                '    if _fpsRifle and _fpsRiflePrimary and _fpsRiflePrimary.Parent then\n'
-                '        _fpsRifle:PivotTo(workspace.CurrentCamera.CFrame * CFrame.new(0.5, -0.5, -3))\n'
-                '    end',
-            )
-
-        touched_code = (
-            '\n-- Client-side pickup detection\n'
-            'if character then\n'
-            '    for _, part in character:GetChildren() do\n'
-            '        if part:IsA("BasePart") then\n'
-            '            part.Touched:Connect(function(other)\n'
-            '                local pm = other:FindFirstAncestorOfClass("Model")\n'
-            '                if pm and (pm.Name:lower():find("pickup") or pm:FindFirstChild("Pickup")) then\n'
-            '                    local sc = pm:FindFirstChild("Pickup") or pm:FindFirstChildWhichIsA("Script")\n'
-            '                    local iname = (sc and sc:GetAttribute("itemName"))\n'
-            '                        or pm:GetAttribute("itemName") or ""\n'
-            '                    if iname == "" and pm.Name:lower():find("rifle") then iname = "Rifle" end\n'
-            '                    if iname == "" and pm.Name:lower():find("key") then iname = "Key" end\n'
-            '                    if iname == "" and pm.Name:lower():find("ammo") then iname = "Ammo" end\n'
-            '                    if iname == "" and (pm.Name:lower():find("health") or pm.Name:lower():find("hp")) then iname = "Health" end\n'
-            '                    if iname ~= "" then getItem(iname); pm:Destroy() end\n'
-            '                end\n'
-            '            end)\n'
-            '        end\n'
-            '    end\n'
-            'end\n'
-        )
-        return_m = re.search(r'^return\b', s.source, re.MULTILINE)
-        if return_m:
-            s.source = s.source[:return_m.start()] + touched_code + s.source[return_m.start():]
-        else:
-            s.source = s.source.rstrip() + '\n' + touched_code
-
-        if s.source != original:
+        mutated = False
+        for mount in WEAPON_MOUNTS:
+            if _apply_weapon_mount(s, mount):
+                mutated = True
+                log.info(
+                    "  Injected FPS weapon mount %r in %r",
+                    mount.marker_tag, s.name,
+                )
+        if mutated:
+            _append_pickup_touched_block(s)
             fixes += 1
-            log.info("  Injected FPS rifle system in '%s'", s.name)
-
     return fixes
 
 
@@ -528,9 +632,9 @@ def _detect_pickup_setattribute_pattern(scripts: list["RbxScript"]) -> bool:
     miss the ``_pl:SetAttribute("has"..itemName, true)`` injection
     that ``door_global_player_to_attribute`` depends on.
 
-    Detector is intentionally name-agnostic — the previous gate
-    ``_detect_fps_rifle_pickup`` bound this to FPS-rifle projects only,
-    but pickup patterns appear in any genre.
+    Detector is intentionally name-agnostic — the previous gate reused
+    the FPS weapon-mount detector and bound this to FPS-rifle projects
+    only, but pickup patterns appear in any genre.
     """
     for s in scripts:
         if s.name != "Pickup":
@@ -834,7 +938,7 @@ def _canonicalize_pickup_remote_event(scripts: list["RbxScript"]) -> int:
     "just in FPS-rifle projects. Without this, broadening the server pack "
     "to any genre would remove the legacy client-side ``GetItem`` "
     "attribute trigger and leave non-FPS pickups silently unwired.",
-    after=("fps_rifle_inject", "pickup_remote_event_server", "pickup_visual_target"),
+    after=("fps_weapon_mount_inject", "pickup_remote_event_server", "pickup_visual_target"),
     detect=_detect_pickup_remote_event_in_use,
 )
 def _add_pickup_remote_listener(scripts: list["RbxScript"]) -> int:
