@@ -195,3 +195,53 @@ def convert_asset_files(unity_path: Path) -> AssetConversionResult:
             result.skipped += 1
 
     return result
+
+
+def resolve_unique_asset_names(assets: list[ConvertedAsset]) -> dict[int, str]:
+    """Assign a unique on-disk stem to each ConvertedAsset.
+
+    Two ScriptableObjects in different folders may share ``m_Name`` (e.g.
+    ``Settings.asset`` in ``Audio/`` and ``Settings.asset`` in ``Graphics/``).
+    Writing both as ``Settings.luau`` would let the second overwrite the
+    first on disk and the dedupe-by-name in ``write_output`` would silently
+    drop one from ``rbx_place.scripts``. Disambiguate collisions by
+    appending ``__<hash6>`` of the project-relative source path — same
+    scheme PR #87 used for duplicate C# class names.
+
+    The hash is anchored at ``Assets/`` (the Unity project root marker) so
+    converting the same project from different checkout roots emits the
+    same ModuleScript names, and stale hashed modules don't accumulate
+    in a preserved output tree.
+
+    Returns a mapping of ``id(asset)`` -> unique stem so callers can look
+    up each asset's resolved name without mutating the assets themselves.
+    """
+    import hashlib
+
+    def _project_relative(p: Path) -> str:
+        # Anchor at the Unity ``Assets`` segment so paths are stable
+        # across checkout roots. Fall back to the last three segments
+        # when no ``Assets`` is present (synthetic inputs in tests) —
+        # still enough to disambiguate same-named assets in distinct
+        # parent folders without leaking the developer's home directory.
+        parts = p.parts
+        for i, segment in enumerate(parts):
+            if segment == "Assets":
+                return "/".join(parts[i:])
+        return "/".join(parts[-3:])
+
+    by_name: dict[str, list[ConvertedAsset]] = {}
+    for asset in assets:
+        by_name.setdefault(asset.asset_name, []).append(asset)
+
+    resolved: dict[int, str] = {}
+    for name, group in by_name.items():
+        if len(group) == 1:
+            resolved[id(group[0])] = name
+            continue
+        for asset in group:
+            digest = hashlib.sha256(
+                _project_relative(asset.source_path).encode("utf-8")
+            ).hexdigest()[:6]
+            resolved[id(asset)] = f"{name}__{digest}"
+    return resolved

@@ -98,6 +98,168 @@ def test_write_output_attaches_scriptable_objects_as_module_scripts(tmp_path):
     )
 
 
+def test_so_unique_names_stable_across_checkout_roots():
+    """resolve_unique_asset_names must hash a project-relative path
+    (anchored at ``Assets/``) so the same converted project produces the
+    same hashed module name on every machine. Hashing the absolute path
+    leaks the developer's checkout root into the public ModuleScript
+    name.
+    """
+    from converter.scriptable_object_converter import (
+        ConvertedAsset, resolve_unique_asset_names,
+    )
+
+    # Same project, two different checkout roots.
+    assets_a = [
+        ConvertedAsset(
+            source_path=Path("/Users/alice/proj/Assets/Audio/Settings.asset"),
+            asset_name="Settings",
+            luau_source="-- audio\n",
+        ),
+        ConvertedAsset(
+            source_path=Path("/Users/alice/proj/Assets/Graphics/Settings.asset"),
+            asset_name="Settings",
+            luau_source="-- graphics\n",
+        ),
+    ]
+    assets_b = [
+        ConvertedAsset(
+            source_path=Path("/var/ci/build/123/Assets/Audio/Settings.asset"),
+            asset_name="Settings",
+            luau_source="-- audio\n",
+        ),
+        ConvertedAsset(
+            source_path=Path("/var/ci/build/123/Assets/Graphics/Settings.asset"),
+            asset_name="Settings",
+            luau_source="-- graphics\n",
+        ),
+    ]
+    names_a = sorted(resolve_unique_asset_names(assets_a).values())
+    names_b = sorted(resolve_unique_asset_names(assets_b).values())
+    assert names_a == names_b, (
+        f"unique names must be checkout-root-independent; "
+        f"got {names_a} vs {names_b}"
+    )
+
+
+def test_preserve_scripts_does_not_clobber_hand_edited_scriptable_objects(tmp_path):
+    """On the preserve_scripts path (transpile_scripts completed, no
+    retranspile, no fresh transpilation_result), the SO disk write must
+    leave existing files alone so hand-edits made between assemble and
+    upload survive the round-trip.
+    """
+    from converter.pipeline import Pipeline
+    from converter.scriptable_object_converter import (
+        AssetConversionResult, ConvertedAsset,
+    )
+    from core.roblox_types import RbxPlace
+
+    project = tmp_path / "proj"
+    (project / "Assets").mkdir(parents=True)
+    output = tmp_path / "out"
+    scripts_dir = output / "scripts"
+    so_dir = scripts_dir / "scriptable_objects"
+    so_dir.mkdir(parents=True)
+    # Simulate a prior assemble landing the module, then a hand-edit.
+    hand_edited = so_dir / "Inventory.luau"
+    hand_edited.write_text("-- hand-edited by user\nreturn { fixed = true }\n")
+
+    pipeline = Pipeline(
+        unity_project_path=project, output_dir=output, skip_upload=True,
+    )
+    pipeline.state.rbx_place = RbxPlace()
+    pipeline.state.scriptable_objects = AssetConversionResult(
+        assets=[
+            ConvertedAsset(
+                source_path=Path("/unity/Inventory.asset"),
+                asset_name="Inventory",
+                luau_source="-- original generated body\nreturn { fixed = false }\n",
+                field_count=1,
+            ),
+        ],
+        total=1,
+        converted=1,
+    )
+    pipeline.ctx.completed_phases.append("transpile_scripts")
+    # preserve_scripts branch: no retranspile, scripts_dir exists,
+    # no transpilation_result.
+    pipeline._retranspile = False
+    pipeline.state.transpilation_result = None
+
+    pipeline.write_output()
+
+    surviving = hand_edited.read_text()
+    assert "hand-edited by user" in surviving, (
+        "preserve_scripts must keep the user's hand-edited ScriptableObject "
+        f"module; got: {surviving!r}"
+    )
+
+
+def test_scriptable_objects_dedupe_by_folder_when_names_collide(tmp_path):
+    """Two ScriptableObjects with the same m_Name from different folders
+    (e.g. Audio/Settings.asset and Graphics/Settings.asset) must both
+    survive into the place. The old dedupe-by-name dropped one of them
+    AND let the disk write overwrite the first .luau file.
+    """
+    from converter.pipeline import Pipeline
+    from converter.scriptable_object_converter import (
+        AssetConversionResult, ConvertedAsset,
+    )
+    from core.roblox_types import RbxPlace
+
+    project = tmp_path / "proj"
+    (project / "Assets").mkdir(parents=True)
+    output = tmp_path / "out"
+
+    pipeline = Pipeline(
+        unity_project_path=project, output_dir=output, skip_upload=True,
+    )
+    pipeline.state.rbx_place = RbxPlace()
+    pipeline.state.scriptable_objects = AssetConversionResult(
+        assets=[
+            ConvertedAsset(
+                source_path=Path("/unity/Audio/Settings.asset"),
+                asset_name="Settings",
+                luau_source="-- audio settings\nreturn { domain = 'audio' }",
+                field_count=1,
+            ),
+            ConvertedAsset(
+                source_path=Path("/unity/Graphics/Settings.asset"),
+                asset_name="Settings",
+                luau_source="-- graphics settings\nreturn { domain = 'graphics' }",
+                field_count=1,
+            ),
+        ],
+        total=2,
+        converted=2,
+    )
+    pipeline.ctx.completed_phases.append("transpile_scripts")
+    pipeline._retranspile = True  # forces fresh-transpile branch
+
+    pipeline.write_output()
+
+    so_dir = output / "scripts" / "scriptable_objects"
+    luau_files = sorted(p.name for p in so_dir.glob("*.luau"))
+    assert len(luau_files) == 2, (
+        f"Both Settings.asset files must land on disk under unique names; "
+        f"got {luau_files}"
+    )
+    # Both luau files must carry the original distinct contents.
+    contents = {p.read_text() for p in so_dir.glob("*.luau")}
+    assert any("'audio'" in c for c in contents), "audio Settings payload missing"
+    assert any("'graphics'" in c for c in contents), "graphics Settings payload missing"
+
+    so_scripts = [
+        s for s in pipeline.state.rbx_place.scripts
+        if s.script_type == "ModuleScript" and s.source_path.startswith("scriptable_objects/")
+    ]
+    assert len(so_scripts) == 2, (
+        f"Both ScriptableObjects must attach to rbx_place; got {[s.name for s in so_scripts]}"
+    )
+    # Names should be distinct so the rbxlx writer doesn't collapse them.
+    assert len({s.name for s in so_scripts}) == 2
+
+
 def test_scriptable_objects_survive_fresh_transpile_rmtree(tmp_path):
     """write_output wipes scripts/ on the fresh-transpile path, but the SO
     disk write happens *after* the wipe so the files land correctly."""

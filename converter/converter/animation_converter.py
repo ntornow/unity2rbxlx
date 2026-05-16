@@ -377,6 +377,51 @@ def _parse_anim_binary(anim_path: Path) -> AnimClip | None:
     return None
 
 
+def _clamp_clip_to_window(clip: AnimClip, start_time: float, stop_time: float) -> None:
+    """Drop keyframes outside ``[start_time, stop_time]`` and rebase the
+    rest so the clip starts at t=0.
+
+    Unity stores a clip's source timeline in the .anim file but lets the
+    author crop the playable window via ``m_StartTime`` / ``m_StopTime``.
+    Without this pass, runtime code that reads ``kf.time`` runs the clip
+    over the wrong absolute range — e.g. a clip cropped to [2.5, 4.0]
+    plays from 2.5s with a 1.5s duration, so anything past frame 1 lands
+    outside the duration and the early frames never play.
+
+    Mutates ``clip`` in place. Empty curves (all keyframes outside the
+    window) are dropped from ``clip.curves``.
+    """
+    if stop_time <= start_time:
+        return
+    surviving: list[AnimCurve] = []
+    for curve in clip.curves:
+        kept = [
+            AnimKeyframe(
+                time=kf.time - start_time,
+                value=kf.value,
+                in_slope=kf.in_slope,
+                out_slope=kf.out_slope,
+            )
+            for kf in curve.keyframes
+            if start_time <= kf.time <= stop_time
+        ]
+        if kept:
+            curve.keyframes = kept
+            surviving.append(curve)
+    clip.curves = surviving
+    clip.events = [
+        AnimEvent(
+            time=evt.time - start_time,
+            function_name=evt.function_name,
+            int_parameter=evt.int_parameter,
+            float_parameter=evt.float_parameter,
+            string_parameter=evt.string_parameter,
+        )
+        for evt in clip.events
+        if start_time <= evt.time <= stop_time
+    ]
+
+
 def _parse_clip_body(body: dict[str, Any], source_path: Path) -> AnimClip:
     """Parse an AnimationClip document body into an AnimClip."""
     name = body.get("m_Name", source_path.stem)
@@ -434,6 +479,15 @@ def _parse_clip_body(body: dict[str, Any], source_path: Path) -> AnimClip:
                 float_parameter=float(event_data.get("floatParameter", 0)),
                 string_parameter=event_data.get("stringParameter", ""),
             ))
+
+    # Clamp keyframes and events to the playable [start_time, stop_time]
+    # window and rebase to 0. Unity authors can crop a clip to a sub-window
+    # of its source timeline (m_StartTime > 0); leaving raw absolute times
+    # in curves makes the runtime tween over the wrong range and fires
+    # events at the wrong moment. ``duration`` is already stop-start, so
+    # rebased times stay in [0, duration].
+    if start_time != 0.0 or stop_time != duration:
+        _clamp_clip_to_window(clip, start_time, stop_time)
 
     # Record unique paths so is_transform_only() and downstream routing can
     # inspect the clip without re-walking its curves.
@@ -1254,6 +1308,30 @@ def generate_tween_script(
     lines.append("local function playAnimation(target)")
     lines.append("\ttarget = target or _initialTarget")
 
+    # Schedule animation events FIRST so their task.delay() delays count
+    # from clip start, not from when the (blocking) tween chains finish.
+    # The curve helpers below emit Completed:Wait() calls — scheduling
+    # task.delay(0.5, ...) after them would fire ~0.5s after the entire
+    # clip finishes instead of 0.5s into the clip.
+    if clip.events:
+        lines.append("")
+        lines.append("\t-- Animation events (scheduled before tweens so delays count from clip start)")
+        for event in sorted(clip.events, key=lambda e: e.time):
+            delay = max(0, event.time)
+            if event.string_parameter:
+                lines.append(f'\ttask.delay({delay:.3f}, function() '
+                             f'if target:FindFirstChild("{event.function_name}") then '
+                             f'target:FindFirstChild("{event.function_name}"):Fire("{event.string_parameter}") end end)')
+            elif event.int_parameter:
+                lines.append(f'\ttask.delay({delay:.3f}, function() '
+                             f'if target:FindFirstChild("{event.function_name}") then '
+                             f'target:FindFirstChild("{event.function_name}"):Fire({event.int_parameter}) end end)')
+            else:
+                lines.append(f'\ttask.delay({delay:.3f}, function() '
+                             f'if target:FindFirstChild("{event.function_name}") then '
+                             f'target:FindFirstChild("{event.function_name}"):Fire() end end)')
+        lines.append("")
+
     if self_curves:
         _generate_curves_code(lines, self_curves, "target", clip, indent=1)
 
@@ -1276,25 +1354,6 @@ def generate_tween_script(
         lines.append(f"\tif {safe_var} then")
         _generate_curves_code(lines, curves, safe_var, clip, indent=2)
         lines.append(f"\tend")
-
-    # Fire animation events at their scheduled times
-    if clip.events:
-        lines.append("")
-        lines.append("\t-- Animation events")
-        for event in sorted(clip.events, key=lambda e: e.time):
-            delay = max(0, event.time)
-            if event.string_parameter:
-                lines.append(f'\ttask.delay({delay:.3f}, function() '
-                             f'if target:FindFirstChild("{event.function_name}") then '
-                             f'target:FindFirstChild("{event.function_name}"):Fire("{event.string_parameter}") end end)')
-            elif event.int_parameter:
-                lines.append(f'\ttask.delay({delay:.3f}, function() '
-                             f'if target:FindFirstChild("{event.function_name}") then '
-                             f'target:FindFirstChild("{event.function_name}"):Fire({event.int_parameter}) end end)')
-            else:
-                lines.append(f'\ttask.delay({delay:.3f}, function() '
-                             f'if target:FindFirstChild("{event.function_name}") then '
-                             f'target:FindFirstChild("{event.function_name}"):Fire() end end)')
 
     lines.append("end")
     lines.append("")
@@ -1838,47 +1897,81 @@ def export_controller_json(
 def export_clip_keyframes(clip: AnimClip) -> dict[str, Any]:
     """Export a clip's keyframes as a JSON-serializable dict for runtime playback.
 
+    Per-bone frames are merged across position / rotation / euler / scale
+    curves and time-sorted. The runtime consumer
+    (``animator_runtime.luau:_playKeyframeAnimation``) builds each frame's
+    CFrame from ``cf.x / .y / .z / .rx / .ry / .rz`` and defaults any
+    missing axis to 0 — so emitting per-curve frames (position keys for a
+    bone, then rotation keys for the same bone) produced partial frames
+    that snapped unset axes back to the origin and broke time ordering
+    (rotation keys appended after position keys had earlier timestamps,
+    yielding negative dt that the runtime then skipped). Merging by time
+    and carrying forward unchanged components keeps the rigged animation
+    coherent.
+
     Returns a dict with:
         duration: float
         bones: { boneName: [ {time, cf: {x,y,z,rx,ry,rz}} ] }
     """
-    bones: dict[str, list[dict]] = {}
 
+    def _curve_field_values(
+        curve_type: str, value: tuple[float, ...],
+    ) -> dict[str, float]:
+        if curve_type == "position":
+            return {
+                "x": round(value[0], 4),
+                "y": round(value[1], 4),
+                "z": round(-value[2], 4),  # Unity→Roblox Z negation
+            }
+        if curve_type == "euler":
+            return {
+                "rx": round(value[0], 2),
+                "ry": round(value[1], 2),
+                "rz": round(-value[2], 2),
+            }
+        if curve_type == "rotation":
+            ex, ey, ez = _quat_to_euler_degrees(*value[:4])
+            return {
+                "rx": round(ex, 2),
+                "ry": round(ey, 2),
+                "rz": round(-ez, 2),
+            }
+        if curve_type == "scale":
+            return {
+                "sx": round(value[0], 4),
+                "sy": round(value[1], 4),
+                "sz": round(value[2], 4),
+            }
+        return {}
+
+    # Group curves by destination bone, then merge by time so each emitted
+    # frame carries every property that any curve provides at that moment.
+    curves_by_bone: dict[str, list[AnimCurve]] = {}
     for curve in clip.curves:
-        # Extract bone name from animation path (e.g., "Armature/Spine/Chest" → "Chest")
-        # Also store the full path for hierarchical lookups
         bone_name = curve.path.split("/")[-1] if curve.path else "Root"
-        # Normalize: strip common prefixes like "mixamorig:" (Mixamo rigs)
+        # Strip common Mixamo prefix (``mixamorig:LeftFoot`` → ``LeftFoot``).
         if ":" in bone_name:
             bone_name = bone_name.split(":")[-1]
-        if bone_name not in bones:
-            bones[bone_name] = []
+        curves_by_bone.setdefault(bone_name, []).append(curve)
 
-        for kf in simplify_keyframes(curve.keyframes, max_count=10):
-            entry: dict[str, Any] = {"time": round(kf.time, 3)}
-            cf: dict[str, float] = {}
+    bones: dict[str, list[dict]] = {}
+    for bone_name, curves in curves_by_bone.items():
+        # Collect (time, field_values) per curve after simplifying each.
+        frames_by_time: dict[float, dict[str, float]] = {}
+        for curve in curves:
+            for kf in simplify_keyframes(curve.keyframes, max_count=10):
+                rounded_time = round(kf.time, 3)
+                slot = frames_by_time.setdefault(rounded_time, {})
+                slot.update(_curve_field_values(curve.property_type, kf.value))
 
-            if curve.property_type == "position":
-                cf["x"] = round(kf.value[0], 4)
-                cf["y"] = round(kf.value[1], 4)
-                cf["z"] = round(-kf.value[2], 4)  # Unity→Roblox Z negation
-            elif curve.property_type == "euler":
-                cf["rx"] = round(kf.value[0], 2)
-                cf["ry"] = round(kf.value[1], 2)
-                cf["rz"] = round(-kf.value[2], 2)
-            elif curve.property_type == "rotation":
-                # Convert quaternion to euler
-                ex, ey, ez = _quat_to_euler_degrees(*kf.value[:4])
-                cf["rx"] = round(ex, 2)
-                cf["ry"] = round(ey, 2)
-                cf["rz"] = round(-ez, 2)
-            elif curve.property_type == "scale":
-                cf["sx"] = round(kf.value[0], 4)
-                cf["sy"] = round(kf.value[1], 4)
-                cf["sz"] = round(kf.value[2], 4)
-
-            entry["cf"] = cf
-            bones[bone_name].append(entry)
+        # Sort frames by time and carry the last known component forward
+        # so the runtime never sees an unset axis snap to 0.
+        carried: dict[str, float] = {}
+        merged: list[dict] = []
+        for t in sorted(frames_by_time):
+            carried.update(frames_by_time[t])
+            merged.append({"time": t, "cf": dict(carried)})
+        bones[bone_name] = merged
 
     return {
         "duration": round(clip.duration, 3),

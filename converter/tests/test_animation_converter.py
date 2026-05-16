@@ -324,6 +324,87 @@ class TestAnimParsing:
         clip = parse_anim_file(tmp_path / "nonexistent.anim")
         assert clip is None
 
+    def test_parse_clip_with_non_zero_start_time_rebases_keyframes(
+        self, tmp_path: Path,
+    ) -> None:
+        """Unity authors can crop a clip to a sub-window of its source
+        timeline via m_StartTime / m_StopTime. Keyframes outside the
+        window must be dropped and the survivors rebased to 0 — otherwise
+        the runtime tweens over the wrong absolute range and never plays
+        the cropped portion correctly.
+        """
+        yaml_content = """\
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!74 &7400000
+AnimationClip:
+  m_ObjectHideFlags: 0
+  m_Name: cropped_window
+  m_PositionCurves:
+  - curve:
+      serializedVersion: 2
+      m_Curve:
+      - serializedVersion: 3
+        time: 0
+        value: {x: 0, y: 0, z: 0}
+      - serializedVersion: 3
+        time: 1
+        value: {x: 1, y: 0, z: 0}
+      - serializedVersion: 3
+        time: 2.5
+        value: {x: 2, y: 0, z: 0}
+      - serializedVersion: 3
+        time: 4
+        value: {x: 3, y: 0, z: 0}
+      - serializedVersion: 3
+        time: 5.5
+        value: {x: 4, y: 0, z: 0}
+      m_PreInfinity: 2
+      m_PostInfinity: 2
+    path: ''
+  m_RotationCurves: []
+  m_EulerCurves: []
+  m_ScaleCurves: []
+  m_SampleRate: 60
+  m_Events:
+  - time: 1.0
+    functionName: BeforeWindow
+  - time: 3.0
+    functionName: InsideWindow
+  - time: 6.0
+    functionName: AfterWindow
+  m_AnimationClipSettings:
+    serializedVersion: 2
+    m_StartTime: 2.0
+    m_StopTime: 5.0
+    m_LoopTime: 0
+"""
+        anim_file = tmp_path / "cropped.anim"
+        anim_file.write_text(yaml_content, encoding="utf-8")
+
+        clip = parse_anim_file(anim_file)
+        assert clip is not None
+        assert clip.duration == pytest.approx(3.0)
+
+        assert len(clip.curves) == 1
+        curve = clip.curves[0]
+        # Only the t=2.5 and t=4.0 keyframes fall inside [2.0, 5.0].
+        kf_times = [kf.time for kf in curve.keyframes]
+        assert kf_times == pytest.approx([0.5, 2.0]), (
+            f"Keyframes outside window must drop and survivors rebase to 0; "
+            f"got {kf_times}"
+        )
+        # Every surviving time must fit the duration window [0, 3].
+        for kf in curve.keyframes:
+            assert 0.0 <= kf.time <= clip.duration
+
+        # Events: t=1.0 is before window, t=3.0 inside (rebases to 1.0),
+        # t=6.0 after.
+        evt_names = [e.function_name for e in clip.events]
+        evt_times = [e.time for e in clip.events]
+        assert evt_names == ["InsideWindow"]
+        assert evt_times == pytest.approx([1.0])
+
     def test_parse_empty_curves(self, tmp_path: Path) -> None:
         """Handle anim files with no curves gracefully."""
         yaml_content = """\
@@ -875,6 +956,50 @@ class TestLuauGeneration:
         assert "Vector3.new" in luau
         # Should contain the Y offset of 4
         assert "4.0000" in luau
+
+    def test_animation_events_scheduled_before_blocking_tweens(self) -> None:
+        """task.delay(event.time, ...) must be emitted before the tween
+        chain inside playAnimation. The curve helpers emit
+        Completed:Wait() which blocks; scheduling events after them makes
+        them fire after the clip has already finished, not at the event's
+        clip-local time.
+        """
+        from converter.animation_converter import AnimEvent
+
+        clip = AnimClip(
+            name="event_clip",
+            duration=1.0,
+            loop=False,
+            sample_rate=60,
+            curves=[AnimCurve(
+                property_type="position",
+                path="",
+                keyframes=[
+                    AnimKeyframe(time=0.0, value=(0.0, 0.0, 0.0)),
+                    AnimKeyframe(time=1.0, value=(0.0, 4.0, 0.0)),
+                ],
+            )],
+            events=[
+                AnimEvent(time=0.5, function_name="MidEvent"),
+            ],
+        )
+
+        luau = generate_tween_script(clip)
+
+        # Locate the playAnimation body and confirm task.delay precedes any
+        # Completed:Wait() — the symptom: delay sits after the blocking
+        # tween chain so events fire after the clip finishes.
+        body = luau.split("function playAnimation(target)", 1)[1]
+        body = body.split("\nend\n", 1)[0]
+        delay_idx = body.find("task.delay")
+        wait_idx = body.find("Completed:Wait")
+        assert delay_idx != -1, "expected a task.delay for the event"
+        assert wait_idx != -1, "expected a Completed:Wait in tween chain"
+        assert delay_idx < wait_idx, (
+            "task.delay(event.time, ...) must be emitted before the "
+            "blocking Completed:Wait() so events fire at clip-local time, "
+            "not after the chain finishes"
+        )
 
     def test_generate_rotation_tween(self) -> None:
         """Generate a rotation tween script from quaternion keyframes."""
@@ -1515,6 +1640,68 @@ class TestAnimationDataExport:
         assert frames[1]["cf"]["x"] == 1.0
         # Z should be negated (Unity -> Roblox)
         assert frames[1]["cf"]["z"] == -3.0
+
+    def test_export_clip_keyframes_merges_curves_by_time(self):
+        """A bone with separate position and rotation curves whose
+        keyframes don't share timestamps must emit a single time-sorted
+        frame list where each frame carries every property the runtime
+        needs. The previous per-curve append produced negative dt
+        (rotation kf time < last position kf time) which the runtime
+        skipped, plus partial cf dicts that snapped unset axes to 0.
+        """
+        clip = AnimClip(
+            name="walk",
+            duration=1.0,
+            loop=False,
+            sample_rate=60,
+            curves=[
+                AnimCurve(
+                    property_type="position",
+                    path="Hips",
+                    keyframes=[
+                        AnimKeyframe(time=0.0, value=(0.0, 0.0, 0.0)),
+                        AnimKeyframe(time=1.0, value=(1.0, 2.0, 3.0)),
+                    ],
+                ),
+                AnimCurve(
+                    property_type="euler",
+                    path="Hips",
+                    keyframes=[
+                        # Rotation has a key at 0.5 that the old code put
+                        # after the t=1.0 position frame, producing
+                        # negative dt the runtime would drop.
+                        AnimKeyframe(time=0.5, value=(0.0, 90.0, 0.0)),
+                        AnimKeyframe(time=1.0, value=(0.0, 180.0, 0.0)),
+                    ],
+                ),
+            ],
+        )
+
+        data = export_clip_keyframes(clip)
+        frames = data["bones"]["Hips"]
+        times = [f["time"] for f in frames]
+        assert times == sorted(times), (
+            f"Per-bone frames must be time-sorted; got {times}"
+        )
+
+        # Each frame must carry every component the runtime reads — once
+        # rotation enters at t=0.5, position must carry forward, not snap
+        # back to (0,0,0).
+        mid_frame = next(f for f in frames if f["time"] == 0.5)
+        cf = mid_frame["cf"]
+        assert cf.get("ry") == 90.0
+        assert "x" in cf and "y" in cf and "z" in cf, (
+            f"position must carry forward into rotation-only frame; got cf={cf}"
+        )
+
+        # The t=1.0 frame must merge both position and rotation, not
+        # appear twice (once per curve).
+        end_frames = [f for f in frames if f["time"] == 1.0]
+        assert len(end_frames) == 1, (
+            f"frames sharing a timestamp must merge; got {end_frames}"
+        )
+        end_cf = end_frames[0]["cf"]
+        assert end_cf.get("x") == 1.0 and end_cf.get("ry") == 180.0
 
     def test_animation_data_modules_generated(self):
         """convert_animations populates animation_data_modules for controllers with clips."""
