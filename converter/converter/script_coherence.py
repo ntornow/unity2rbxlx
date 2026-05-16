@@ -31,7 +31,7 @@ from converter.script_coherence_packs import (  # noqa: F401  (re-exports)
     _convert_pickup_to_remote_event,
     _disable_default_controls_in_fps_scripts,
     _fix_pickup_visual_target,
-    _inject_fps_rifle_system,
+    _inject_fps_weapon_mounts,
 )
 
 log = logging.getLogger(__name__)
