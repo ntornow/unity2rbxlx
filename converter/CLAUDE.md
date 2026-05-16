@@ -30,9 +30,9 @@ Work autonomously with no questions — just churn forever making the converter 
 ### Progress tracking:
 - See [TODO.md](TODO.md) for comprehensive gap analysis and task list
 
-### Converter Status (as of 2026-04-12)
+### Converter Status (as of 2026-05-16)
 
-**1020 tests passing** (1020 fast in ~12s, 31 slow full-pipeline tests)
+**1340 tests** (1305 fast, 35 slow full-pipeline tests)
 **9 test projects** converting and validating clean with zero errors:
 - SimpleFPS (960 parts, 36 scripts), Gamekit3D (18,534 parts, 249 scripts)
 - SanAndreasUnity (270 scripts), ChopChop (275 scripts), RedRunner (87 scripts)
@@ -94,8 +94,8 @@ There are two CLIs that share the same `Pipeline` class and the same `conversion
    | `materials`  | … → convert_materials             | Maps Unity .mat → SurfaceAppearance |
    | `transpile`  | … → transpile_scripts             | C# → Luau (rule-based + AI) |
    | `validate`   | (none — runs `luau-analyze`)      | Syntax-checks `<output_dir>/scripts/` with luau-analyze |
-   | `assemble`   | upload_assets, resolve_assets, convert_animations, convert_scene, write_output | Produces `converted_place.rbxlx` |
-   | `upload`     | parse → convert_scene + headless place builder | Publishes via `execute_luau` |
+   | `assemble`   | full pipeline → write_output (skips `transpile_scripts` if cache intact and `--retranspile` not set) | Produces `converted_place.rbxlx`; cloud phases force-rerun |
+   | `upload`     | full pipeline → write_output (skips moderate/upload/resolve_assets always; also skips `transpile_scripts` when its cache is intact) → headless place builder | Publishes via `execute_luau` |
    | `report`     | (none — writes `conversion_report.json`) | Final summary |
 
    Each subcommand re-runs essential prerequisite phases on every invocation (matching `Pipeline.resume` semantics) so individual calls are self-contained — but state from previous calls is loaded from `conversion_context.json`.
@@ -119,15 +119,18 @@ Unity Project --> [Parser] --> Scene Graph (IR) --> [Converter] --> Roblox Outpu
 ### Pipeline Phases
 1. **Parse**: scene_parser + prefab_parser + guid_resolver -- parse Unity YAML
 2. **Extract Assets**: asset_extractor -- catalog and hash all assets (textures, meshes, audio)
-3. **Upload Assets**: cloud_api -- upload to Roblox Open Cloud (textures as Decal, meshes as Model, audio)
-4. **Resolve Assets** (Studio-required): InsertService:LoadAsset to get:
+3. **Moderate Assets**: pre-upload safety screen -- filenames, scripts, audio vs. Roblox Community Standards
+4. **Upload Assets**: cloud_api -- upload to Roblox Open Cloud (textures as Decal, meshes as Model, audio)
+5. **Resolve Assets** (Studio-required): InsertService:LoadAsset to get:
    - Mesh Model IDs → real MeshIds + sub-mesh hierarchy with sizes
    - Texture Decal IDs → Image IDs (SurfaceAppearance needs Image, not Decal)
-5. **Materials**: material_mapper -- Unity .mat files → Roblox SurfaceAppearance with uploaded texture URLs
-6. **Scripts**: code_transpiler -- C# -> Luau (rule-based + AI via Claude CLI)
-7. **Animations**: animation_converter -- .anim/.controller → TweenService Luau scripts
-8. **Convert Scene**: scene_converter + component_converter -- build Roblox data model
-9. **Output**: rbxlx_writer -- generate .rbxlx XML
+6. **Materials**: material_mapper -- Unity .mat files → Roblox SurfaceAppearance with uploaded texture URLs
+7. **Scripts**: code_transpiler -- C# -> Luau (rule-based + AI via Claude CLI)
+8. **Animations**: animation_converter -- .anim/.controller → TweenService Luau scripts
+9. **Convert Scene**: scene_converter + component_converter -- build Roblox data model
+10. **Output**: rbxlx_writer -- generate .rbxlx XML
+
+Authoritative ordering lives in `converter/converter/pipeline.py:PHASES`.
 
 ### Asset Resolution (Critical)
 After uploading FBX meshes via Open Cloud, the returned IDs are **Model** IDs, not Mesh IDs.
@@ -141,7 +144,7 @@ Similarly, uploaded texture Decal IDs must be resolved to Image IDs:
 2. Extract Image ID from `decal.Texture` URL
 3. Replace Decal IDs with Image IDs in `uploaded_assets`
 
-Use `resolve_assets.py` to generate the Luau scripts for these resolutions.
+Use `python u2r.py resolve <output_dir>` (backed by `roblox/studio_resolver.py`) to generate the Luau scripts for these resolutions.
 
 ### Mesh Sizing
 Roblox MeshPart uses Size and InitialSize:
@@ -168,8 +171,8 @@ Where:
 ## Running Tests
 ```bash
 cd converter
-python -m pytest tests/ -m "not slow" -v   # Fast suite: 1020 tests in ~12s
-python -m pytest tests/ -v                  # Full suite: 1029 tests in ~65s (includes CLI + Gamekit3D e2e)
+python -m pytest tests/ -m "not slow" -v   # Fast suite: 1305 tests
+python -m pytest tests/ -v                  # Full suite: 1340 tests (includes 35 slow e2e)
 ```
 
 ## Running Conversion

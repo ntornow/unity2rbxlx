@@ -26,7 +26,7 @@ from core.unity_types import (
     ParsedScene,
     PrefabLibrary,
 )
-from core.roblox_types import RbxPlace
+from core.roblox_types import RbxPlace, RbxScript
 from converter.animation_converter import AnimationConversionResult
 from converter.code_transpiler import TranspilationResult
 from converter.material_mapper import MaterialMapping
@@ -79,11 +79,9 @@ def _scene_needs_collision_recook(parts: list) -> bool:
     scenes for a slightly smaller place file.
     """
     for p in parts:
-        coll_fid = getattr(p, "collision_fidelity", None)
-        if coll_fid is not None and coll_fid != 0 and getattr(p, "mesh_id", None):
+        if p.collision_fidelity not in (None, 0) and p.mesh_id:
             return True
-        children = getattr(p, "children", None) or []
-        if children and _scene_needs_collision_recook(children):
+        if p.children and _scene_needs_collision_recook(p.children):
             return True
     return False
 
@@ -2009,40 +2007,26 @@ return table.concat(allData, "\\n")'''
     A test asserts the actual call sequence in write_output matches this tuple.
     """
 
-    def _delete_pruned_script_from_disk(self, script: object) -> None:
-        """PR #74 codex round-10 [P2]: when a script is pruned from
-        ``rbx_place.scripts`` (legacy artifact + stale gameplay
-        runtime module), also delete its cached ``.luau`` file from
-        ``output/scripts/`` so the next resume's
-        ``_rehydrate_scripts_from_disk()`` doesn't load it back.
+    def _delete_pruned_script_from_disk(self, script: RbxScript) -> None:
+        """Delete a pruned script's cached ``.luau`` file from disk.
 
-        Otherwise the in-memory prune doesn't stick: assemble /
-        publish rebuild paths rehydrate from disk, and the deleted
-        module reappears in ``rbx_place.scripts`` on every subsequent
-        run.
+        When a script is pruned from ``rbx_place.scripts`` (legacy
+        artifact or stale gameplay runtime module), the assemble /
+        publish rebuild paths rehydrate scripts from disk, so the
+        in-memory prune doesn't stick unless the on-disk file goes too.
 
-        Uses the script's ``source_path`` when set (preserves nested-
-        dir routing), otherwise falls back to the canonical
-        ``<name>.luau`` at the top of ``scripts/``.
-
-        Defensive against missing/None ``output_dir`` (some test
-        harnesses use duck-typed Pipeline stubs that don't carry an
-        output_dir).
+        Uses ``source_path`` when set (preserves nested-dir routing),
+        otherwise falls back to ``<name>.luau`` at the top of
+        ``scripts/`` and the ``animations/`` subdir.
         """
-        output_dir = getattr(self, "output_dir", None)
-        if output_dir is None:
-            return
-        scripts_dir = output_dir / "scripts"
+        scripts_dir = self.output_dir / "scripts"
         if not scripts_dir.is_dir():
             return
-        source_path = getattr(script, "source_path", None)
         candidates: list[Path] = []
-        if source_path:
-            candidates.append(scripts_dir / source_path)
-        name = getattr(script, "name", None)
-        if name:
-            candidates.append(scripts_dir / f"{name}.luau")
-            candidates.append(scripts_dir / "animations" / f"{name}.luau")
+        if script.source_path:
+            candidates.append(scripts_dir / script.source_path)
+        candidates.append(scripts_dir / f"{script.name}.luau")
+        candidates.append(scripts_dir / "animations" / f"{script.name}.luau")
         for candidate in candidates:
             if candidate.is_file():
                 try:
@@ -2259,7 +2243,6 @@ return table.concat(allData, "\\n")'''
             self._rehydrate_scripts_from_disk(scripts_dir)
 
         elif self.state.transpilation_result:
-            from core.roblox_types import RbxScript
             for ts in self.state.transpilation_result.scripts:
                 out_path = scripts_dir / ts.output_filename
                 out_path.write_text(ts.luau_source, encoding="utf-8")
@@ -2272,7 +2255,6 @@ return table.concat(allData, "\\n")'''
 
         # Write animation scripts to output directory AND add to RbxPlace.
         if self.state.animation_result and self.state.animation_result.generated_scripts:
-            from core.roblox_types import RbxScript
             anim_scripts_dir = scripts_dir / "animations"
             anim_scripts_dir.mkdir(parents=True, exist_ok=True)
             for script_name, luau_source in self.state.animation_result.generated_scripts:
@@ -2289,7 +2271,6 @@ return table.concat(allData, "\\n")'''
 
         # Write animation data ModuleScripts to ReplicatedStorage.
         if self.state.animation_result and self.state.animation_result.animation_data_modules:
-            from core.roblox_types import RbxScript
             anim_data_dir = scripts_dir / "animation_data"
             anim_data_dir.mkdir(parents=True, exist_ok=True)
             for module_name, module_source in self.state.animation_result.animation_data_modules:
@@ -2309,7 +2290,6 @@ return table.concat(allData, "\\n")'''
         # were resolved above to disambiguate folder collisions (Audio/Settings
         # vs Graphics/Settings) so the rbx_place.scripts list keeps both.
         if self.state.scriptable_objects:
-            from core.roblox_types import RbxScript
             existing = {s.name for s in self.state.rbx_place.scripts}
             added = 0
             for asset in self.state.scriptable_objects.assets:
@@ -2536,7 +2516,6 @@ return table.concat(allData, "\\n")'''
                 bootstrap_lines.append(f'    if not ok{i} then warn("[Bootstrap] {mod}: " .. tostring(err{i})) end')
                 bootstrap_lines.append(f'end')
                 bootstrap_lines.append('')
-            from core.roblox_types import RbxScript
             self.state.rbx_place.scripts.append(RbxScript(
                 name="ClientBootstrap",
                 source="\n".join(bootstrap_lines),
@@ -2767,7 +2746,6 @@ return table.concat(allData, "\\n")'''
         # and no runtime loading is needed. The MeshLoader would actively harm
         # rendering by replacing working meshes with potentially broken ones.
         if self.ctx.uploaded_assets and not self.ctx.mesh_hierarchies:
-            from core.roblox_types import RbxScript
             mesh_loader = '''-- Auto-generated mesh loader
 -- Replaces placeholder MeshParts with proper mesh geometry via CreateMeshPartAsync.
 -- Handles both real MeshIds (post-resolution) and Model IDs (pre-resolution).
@@ -3255,7 +3233,6 @@ script.Disabled = true
         ``_subphase_inject_autogen_scripts``, which removes rehydrated
         FPS auto-gen scripts when scaffolding doesn't include ``fps``.
         """
-        from core.roblox_types import RbxScript
 
         plan_lookup = self._load_storage_plan_for_rehydration()
         luau_files = sorted(scripts_dir.rglob("*.luau"))
@@ -3382,7 +3359,6 @@ script.Disabled = true
         Scripts placed as children of parts can use `script.Parent` to reference
         their target part directly — matching Unity's MonoBehaviour pattern.
         """
-        from core.roblox_types import RbxScript
 
         # Build index: script class name → RbxScript
         script_by_name: dict[str, RbxScript] = {}
@@ -3665,7 +3641,6 @@ script.Disabled = true
         out of the flat list into a scene-level part).
         """
         from copy import copy as _shallow_copy
-        from core.roblox_types import RbxScript
 
         templates = getattr(self.state.rbx_place, "replicated_templates", None)
         if not templates:
@@ -3764,7 +3739,6 @@ script.Disabled = true
         - Canvas/ScreenGui elements → inject event_system.luau
         - CharacterController attributes → inject physics_bridge.luau
         """
-        from core.roblox_types import RbxScript
         runtime_dir = Path(__file__).parent.parent / "runtime"
         injected = 0
 

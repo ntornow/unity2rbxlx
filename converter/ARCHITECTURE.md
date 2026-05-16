@@ -33,8 +33,8 @@ End-to-end CLI for one-shot conversions, CI/CD, batch jobs. No human in the loop
 | `materials`  | … → convert_materials             | Maps Unity .mat → SurfaceAppearance |
 | `transpile`  | … → transpile_scripts             | C# → Luau (rule-based + AI) |
 | `validate`   | (none — runs `luau-analyze`)      | Syntax-checks `<output_dir>/scripts/` with luau-analyze |
-| `assemble`   | upload_assets, resolve_assets, convert_animations, convert_scene, write_output | Produces `converted_place.rbxlx` |
-| `upload`     | parse → convert_scene + headless place builder | Publishes via `execute_luau` |
+| `assemble`   | full pipeline → write_output (skips `transpile_scripts` if cache intact and `--retranspile` not set) | Produces `converted_place.rbxlx`; cloud phases force-rerun |
+| `upload`     | full pipeline → write_output (skips moderate/upload/resolve_assets always; also skips `transpile_scripts` when its cache is intact) → headless place builder | Publishes via `execute_luau` |
 | `report`     | (none — writes `conversion_report.json`) | Final summary |
 
 The `/convert-unity` skill (`converter/.claude/skills/convert-unity/SKILL.md`) drives the interactive workflow. It pauses at each phase for human review (scene selection, material review, script review, scale strategy, etc.) and contains the Step 4.5 game-logic-porting playbook (architecture map, Unity↔Roblox divergence analysis, module-per-component rewrite, bootstrap wiring) that the pipeline cannot automate.
@@ -119,7 +119,7 @@ Where:
 
 ## Design Decisions
 
-- **Inline over runtime wrappers** — Unity APIs are translated to Luau at transpile time via `api_mappings.py` / `UTILITY_FUNCTIONS`, not via `require()`-able runtime modules. Only stateful runtimes survive (`animator_runtime`, `nav_mesh_runtime`, `event_system`, `physics_bridge`, `cinemachine_runtime`, plus feature runtimes for object pooling, pickups, sub-emitters). Nine runtime bridges were deleted in 2026-04. See `docs/design/inline-over-runtime-wrappers.md`.
+- **Inline over runtime wrappers** — Unity APIs are translated to Luau at transpile time via `api_mappings.py` / `UTILITY_FUNCTIONS`, not via `require()`-able runtime modules. Only stateful runtimes survive (`animator_runtime`, `nav_mesh_runtime`, `event_system`, `event_dispatch`, `physics_bridge`, `cinemachine_runtime`, plus feature runtimes for object pooling, pickups, sub-emitters). Nine runtime bridges were deleted in 2026-04. See `docs/design/inline-over-runtime-wrappers.md`.
 - **Conversion plan rehydration** — `conversion_plan.json` records `{script_type, parent_path}` for every transpiled script so the rehydration path (interactive `assemble --no-retranspile`, `upload` rebuild) reconstructs the exact same Roblox script-container layout as the fresh-transpile path. Phase 3 design.
 - **Upload publishes a rebuild, not the on-disk `.rbxlx`** — there is no `.rbxlx` reader; both publish paths reconstruct `rbx_place` rather than reading the file. See `CLAUDE.md` § Upload semantics. Reader is roadmapped in `docs/FUTURE_IMPROVEMENTS.md`.
 

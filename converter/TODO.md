@@ -21,8 +21,9 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   - PR #1 (#68): made FPS scaffolding opt-in via ``--scaffolding=fps``.
   - PR #2: split ``fps_client_generator.py`` into
     ``converter/scaffolding/fps.py`` (FPS-specific) and
-    ``converter/autogen.py`` (generic autogen scripts), with the
-    historic name kept as a thin re-export shim.
+    ``converter/autogen.py`` (generic autogen scripts). The
+    transitional re-export shim was deleted once all internal
+    callers had migrated.
 
   Earlier cleanup landed:
   - PR #3: extracted ``connectClient`` into
@@ -31,9 +32,6 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
     shared module instead of inlining the BindableEvent vs
     RemoteEvent fork.
 
-  Optional remaining cleanup:
-  - Eventually remove the ``fps_client_generator.py`` shim once any
-    external callers have migrated.
 
 - [ ] **P2 — Persistent prefab/asset cache.** Prefab library is in-memory only.
   SQLite or pickle cache keyed by `(GUID, mtime)` would halve pipeline time
@@ -69,14 +67,9 @@ The no-Any gate prevents new smuggling. Existing-offender cleanup has
 landed in dedicated PRs (#10 gate, storage_plan, ported-module signatures
 PR #34, PipelineState PR #36, trivial 3-fix + ConversionContext final 4).
 
-Remaining items:
-
-- [ ] **P2 — `scene_converter.py:180` `_mesh_hierarchies: dict[str, list[dict]]`.**
-  Module-level cache; the bare `dict` is missing-type-arg, not Any.
-  Tighten to `dict[str, list[MeshHierarchyEntry]]` for consistency
-  with `ConversionContext.mesh_hierarchies` (the TypedDict is in
-  `core/conversion_context.py`). Not flagged by the no-Any gate;
-  cleanup-only.
+No tracked remaining items. The `scene_converter.py` `mesh_hierarchies`
+field that previously lived here is already typed
+`dict[str, list[MeshHierarchyEntry]]` (see `scene_converter.py:177`).
 
 ---
 

@@ -11,6 +11,10 @@ items, see [`TODO.md`](../TODO.md). For architectural debt and bugs, see
 ## Quick Reference: What works
 
 The converter handles these features end-to-end with no manual steps.
+This is the inverse of the unsupported lists below — included so readers
+can confirm a feature IS supported before assuming a gap. The
+materials/shaders coverage is the most detailed; for component-level
+support see also `CLAUDE.md` § Supported Features.
 
 ### Materials and shaders
 
@@ -103,7 +107,7 @@ The converter handles these features end-to-end with no manual steps.
 | Client/Server/Module classification | Auto-detected from API usage |
 | Cross-script dependency injection | `require()` calls auto-inserted in topological order |
 | RemoteEvent auto-creation | From script analysis |
-| 5 runtime modules auto-injected | animator, nav mesh, event system, physics bridge, cinemachine |
+| Runtime modules auto-injected | animator, nav mesh, event system, event dispatch, physics bridge, cinemachine, object pool, pickup, sub-emitter |
 
 ---
 

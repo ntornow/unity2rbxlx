@@ -29,12 +29,12 @@ and round-trips correctly.
 
 ### Phase 4 — Pipeline integration polish
 
-The animation phase is wired in but doesn't yet:
-- Aggregate animator controller GUIDs from `PrefabTemplate` (only scenes do
-  this today; prefab-only references fall back to unscoped naming — see
-  TODO "Prefab-scoped animator controller GUID aggregation")
-- Emit per-prefab tween scripts for transform-only animations (only
-  per-scene today)
+Per-prefab tween emission landed (`animation_converter.py` has a
+`prefab_scoped` path that emits one tween script per prefab template and
+reparents it under `ReplicatedStorage.Templates.<Prefab>`). Remaining work:
+- Aggregate animator controller GUIDs from `PrefabTemplate` (only scenes
+  do this today; prefab-only references still fall back to unscoped
+  naming — see TODO "Prefab-scoped animator controller GUID aggregation")
 
 ### Phase 5 — Advanced features (out of scope until needed)
 
@@ -136,22 +136,13 @@ debt." This entry captures the strategic sequencing.
 
 ## Cross-script shared-state linter
 
-**Status:** Tracked in `TODO.md` as a P1 item, captured here because it's
-strategically larger than a typical bug fix.
-
-The PR 4 dependency-aware-context work showed that the AI transpiler can
-ignore prompt rules about cross-script state coordination (see archive:
-"Cross-script shared-state gap — prompt iteration insufficient"). The
-right fix is a post-transpile linter, not more prompt iteration.
-
-The linter would walk every generated `.luau` and find
-`:GetAttribute("X")` calls with no matching `:SetAttribute("X")` anywhere
-in the corpus AND a matching exported getter. Then either:
-
-- **(a) Auto-rewrite** — strict, requires high confidence in detection.
-- **(b) Surface to `UNCONVERTED.md`** — safer first landing.
-
-Option (b) until we have a regression corpus, then graduate to (a).
+**Status:** Shipped — `converter/converter/shared_state_linter.py`. The
+linter graduated directly to option (a) auto-rewrite: orphan
+`:GetAttribute("X")` calls that have a matching exported getter on a
+writer ModuleScript are rewritten to
+`require(script.Parent.<Module>).<getter>()`. Orphans without a matching
+exporter surface as UNCONVERTED entries. The pipeline invokes it from
+`Pipeline._run_transpile_phase` (see `pipeline.py:1583`).
 
 ---
 

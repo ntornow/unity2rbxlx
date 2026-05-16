@@ -3,15 +3,17 @@
 **Branch:** `phase-6-implementation`
 **Source plan:** [`MERGE_PLAN.md`](https://github.com/jiazou/unity-roblox-game-converter/blob/main/MERGE_PLAN.md) Phase 6 section
 **Date:** 2026-05-02
-**Status:** Codex-reviewed; ready to execute
+**Status:** Complete — all Phase 6 items landed. Retained as historical record.
 
 Phase 6 is the closeout pass after Phase 5. The original plan listed six items. Codex review of the v1 draft (consult mode, session `019de6f0…`) flagged a stack of stale references and overclaims that v1 missed. This v2 plan addresses every Codex pushback. Each work item has reproducible acceptance criteria.
+
+The "v2 status" column below captures the **pre-execution audit** that this plan was built against. Items marked PARTIAL/DONE here describe state at planning time; the plan has since been fully executed.
 
 ---
 
 ## Audit results vs original Phase 6 list
 
-| # | Original item | v2 status |
+| # | Original item | v2 status (at plan time) |
 |---|---|---|
 | 1 | Port docs from source `docs/` | **3 of 5 done; 2 superseded** — `UNSUPPORTED.md`, `KNOWN_ISSUES.md`, `FUTURE_IMPROVEMENTS.md` exist. `GAME_LOGIC_PORTING.md` and `MODULE_STATUS.md` superseded; reasoning recorded in P6.6. |
 | 2 | Final README + CLAUDE.md + ARCHITECTURE.md | **PARTIAL** — README has stale "Luau validator" + "VFX Graph and advanced particle sub-emitters" + "Skeletal/bone animations not supported" claims. CLAUDE.md "Key milestones achieved" still claims `Luau validator: 6,950 lines`. ARCHITECTURE.md missing `moderate_assets`, `luau-analyze`, design-decisions section. |
