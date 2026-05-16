@@ -2238,13 +2238,22 @@ return table.concat(allData, "\\n")'''
         # ScriptableObject ModuleScripts: write to disk *after* the optional
         # rmtree so the files survive into the output. Both the fresh-transpile
         # and preserved-script paths end up with the same files on disk.
+        # On the preserve path, only backfill files that aren't already
+        # there — never clobber a hand-edited ScriptableObject module.
+        so_unique_names: dict[int, str] = {}
         if self.state.scriptable_objects:
+            from converter.scriptable_object_converter import resolve_unique_asset_names
+            so_unique_names = resolve_unique_asset_names(
+                self.state.scriptable_objects.assets
+            )
             so_dir = scripts_dir / "scriptable_objects"
             so_dir.mkdir(parents=True, exist_ok=True)
             for asset in self.state.scriptable_objects.assets:
-                (so_dir / f"{asset.asset_name}.luau").write_text(
-                    asset.luau_source, encoding="utf-8",
-                )
+                stem = so_unique_names[id(asset)]
+                out_path = so_dir / f"{stem}.luau"
+                if preserve_scripts and out_path.exists():
+                    continue
+                out_path.write_text(asset.luau_source, encoding="utf-8")
 
         if preserve_scripts:
             self._rehydrate_scripts_from_disk(scripts_dir)
@@ -2296,20 +2305,24 @@ return table.concat(allData, "\\n")'''
                      len(self.state.animation_result.animation_data_modules))
 
         # Attach ScriptableObject ModuleScripts on the fresh-transpile path.
-        # Rehydration already picks them up from disk; dedupe by name.
+        # Rehydration already picks them up from disk; dedupe by name. Names
+        # were resolved above to disambiguate folder collisions (Audio/Settings
+        # vs Graphics/Settings) so the rbx_place.scripts list keeps both.
         if self.state.scriptable_objects:
             from core.roblox_types import RbxScript
             existing = {s.name for s in self.state.rbx_place.scripts}
             added = 0
             for asset in self.state.scriptable_objects.assets:
-                if asset.asset_name in existing:
+                stem = so_unique_names[id(asset)]
+                if stem in existing:
                     continue
                 self.state.rbx_place.scripts.append(RbxScript(
-                    name=asset.asset_name,
+                    name=stem,
                     source=asset.luau_source,
                     script_type="ModuleScript",
-                    source_path=f"scriptable_objects/{asset.asset_name}.luau",
+                    source_path=f"scriptable_objects/{stem}.luau",
                 ))
+                existing.add(stem)
                 added += 1
             if added:
                 log.info("[write_output] Added %d ScriptableObject ModuleScripts", added)
