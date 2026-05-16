@@ -806,6 +806,10 @@ def _emit_attachments(b: _LuauBuilder, part: RbxPart, var: str) -> None:
         _emit_trail(b, trail, var)
     for beam in part.beams or []:
         _emit_beam(b, beam, var)
+    # Bone Parts must exist BEFORE Motor6Ds resolve their Part0/Part1
+    # by name, or the FindFirstChild lookup returns nil and the joint
+    # silently does nothing.
+    _emit_bone_parts_for_motor6ds(b, part.motor6ds or [], var)
     for motor in part.motor6ds or []:
         _emit_motor6d(b, motor, var)
     for reverb in part.reverb_effects or []:
@@ -910,12 +914,57 @@ def _emit_beam(b: _LuauBuilder, bm: "RbxBeam", parent_var: str) -> None:
     b.line(f"b.Parent={parent_var} end")
 
 
+def _emit_bone_parts_for_motor6ds(
+    b: _LuauBuilder,
+    motor6ds: "list[RbxMotor6D]",
+    parent_var: str,
+) -> None:
+    """Emit hidden bone Parts for every Motor6D the part will publish.
+
+    Without this, ``_emit_motor6d`` falls back to
+    ``parent_var:FindFirstChild(name, true)`` to resolve ``Part0`` /
+    ``Part1`` — but skinned-mesh bones aren't sibling Parts of the mesh
+    in the converter's IR; they live only as Motor6D endpoint names.
+    The XML rbxlx writer creates a small transparent, anchored=false,
+    massless Part for each unique bone name (see
+    ``rbxlx_writer._make_bone_parts_and_motor6ds``). The headless Luau
+    path now does the same so rigged meshes actually animate instead
+    of silently failing with nil Part0/Part1.
+    """
+    if not motor6ds:
+        return
+    names: set[str] = set()
+    for m in motor6ds:
+        if m.part1_name:
+            names.add(m.part1_name)
+        if m.part0_name and m.part0_name != "HumanoidRootPart":
+            names.add(m.part0_name)
+    for name in sorted(names):
+        b.line("do local bp=Instance.new('Part')")
+        b.line(f"bp.Name={_luau_str(name)}")
+        b.line("bp.Transparency=1")
+        b.line("bp.CanCollide=false")
+        b.line("bp.CanQuery=false")
+        b.line("bp.Anchored=false")
+        b.line("bp.Massless=true")
+        b.line("bp.Size=Vector3.new(0.2,0.2,0.2)")
+        b.line("bp.TopSurface=Enum.SurfaceType.Smooth")
+        b.line("bp.BottomSurface=Enum.SurfaceType.Smooth")
+        b.line(f"bp.Parent={parent_var} end")
+
+
 def _emit_motor6d(b: _LuauBuilder, m: "RbxMotor6D", parent_var: str) -> None:
     b.line(f"do local m=Instance.new('Motor6D')")
     b.line(f"m.Name={_luau_str(m.name)}")
-    # Part0/Part1 resolved by name search in parent hierarchy
+    # Part0/Part1 resolved by name search in parent hierarchy.
+    # ``HumanoidRootPart`` aliases the parent mesh itself; everything
+    # else is a hidden bone Part created by
+    # ``_emit_bone_parts_for_motor6ds`` immediately above.
     if m.part0_name:
-        b.line(f"m.Part0={parent_var}:FindFirstChild({_luau_str(m.part0_name)},true)")
+        if m.part0_name == "HumanoidRootPart":
+            b.line(f"m.Part0={parent_var}")
+        else:
+            b.line(f"m.Part0={parent_var}:FindFirstChild({_luau_str(m.part0_name)},true)")
     if m.part1_name:
         b.line(f"m.Part1={parent_var}:FindFirstChild({_luau_str(m.part1_name)},true)")
     cf0 = m.c0
@@ -1106,26 +1155,30 @@ def generate_place_luau_chunked(
     mesh_cache: dict[str, str] | None = None,
     max_chunk_bytes: int = 3_500_000,
 ) -> list[str]:
-    """Generate chunked Luau scripts for large projects.
+    """Generate Luau scripts for a place, in execute_luau-sized chunks.
 
-    If the single script exceeds max_chunk_bytes, splits into:
-    - Chunk 1: Setup + first N parts + SavePlaceAsync
-    - Chunk 2: More parts + SavePlaceAsync
-    - ...
-    - Last chunk: Scripts + UI + SavePlaceAsync
+    Returns a list of script strings. When the generated script fits
+    under ``max_chunk_bytes`` the list has one entry; otherwise the
+    list contains a single oversized entry that the caller's per-chunk
+    size guard (``place_publisher._publish_chunks``) will reject with
+    ``PublishResult.exceeded_limit=True`` and a clear error.
 
-    Returns a list of script strings, each under max_chunk_bytes.
+    Real tree-splitting chunking is unimplemented (see comment below).
+    Honesty matters: we surface the single oversized entry so the
+    upstream guard fires, rather than pretending we'd successfully
+    chunked the payload.
     """
     full_script = generate_place_luau(place, mesh_cache)
     if len(full_script.encode("utf-8")) <= max_chunk_bytes:
         return [full_script]
 
-    log.info("Script too large (%.1f MB), splitting into chunks...",
-             len(full_script) / (1024 * 1024))
-
-    # For now, just return the full script with a warning.
-    # Full chunking support requires splitting the part tree, which is
-    # complex. The 4MB limit supports ~2000 parts per chunk.
+    log.warning(
+        "Generated place builder is %.1f MB — exceeds the per-chunk "
+        "%.1f MB target. Tree-aware splitting is not yet implemented; "
+        "place_publisher will reject this payload with exceeded_limit.",
+        len(full_script.encode("utf-8")) / (1024 * 1024),
+        max_chunk_bytes / (1024 * 1024),
+    )
     return [full_script]
 
 

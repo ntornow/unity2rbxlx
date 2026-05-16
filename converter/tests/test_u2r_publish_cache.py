@@ -554,3 +554,92 @@ class TestCollisionFidelityBatchAbort:
             "Late-completing earlier batch's SavePlaceAsync would clobber later "
             "batches' saves."
         )
+
+
+class TestPublishCliExitCodes:
+    """``u2r publish`` early-return error paths used to bare-``return``
+    out of the Click command, which sends exit code 0 to the shell.
+    CI / automation that checks ``$?`` then saw "success" despite the
+    publish never having run. Each error path must exit with code 1.
+    """
+
+    def test_missing_api_key_exits_non_zero(self, tmp_path, monkeypatch):
+        import config as _config
+        monkeypatch.setattr(_config, "ROBLOX_API_KEY", "")
+        monkeypatch.delenv("ROBLOX_API_KEY", raising=False)
+
+        # Output dir with conversion_context.json present so the publish
+        # flow reaches the API-key gate before any cache-path checks.
+        out = tmp_path / "out"
+        out.mkdir()
+        from core.conversion_context import ConversionContext
+        ctx = ConversionContext(unity_project_path=str(tmp_path / "FakeProject"))
+        ctx.save(out / "conversion_context.json")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["publish", str(out)],
+            catch_exceptions=False,
+        )
+        assert result.exit_code != 0, (
+            f"publish without API key must fail with non-zero exit. "
+            f"output:\n{result.output[:1500]}"
+        )
+        assert "API key required" in result.output
+
+    def test_missing_universe_or_place_id_exits_non_zero(
+        self, tmp_path, monkeypatch,
+    ):
+        import config as _config
+        monkeypatch.setattr(_config, "ROBLOX_API_KEY", "stub-key")
+
+        out = tmp_path / "out"
+        out.mkdir()
+        from core.conversion_context import ConversionContext
+        ctx = ConversionContext(unity_project_path=str(tmp_path / "FakeProject"))
+        ctx.save(out / "conversion_context.json")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["publish", str(out), "--api-key", "stub-key"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code != 0, (
+            f"publish without --universe-id/--place-id must fail non-zero. "
+            f"output:\n{result.output[:1500]}"
+        )
+        assert "--universe-id" in result.output
+
+    def test_missing_conversion_context_exits_non_zero(
+        self, tmp_path, monkeypatch,
+    ):
+        """Publish rebuild path needs conversion_context.json; if it's
+        absent we must fail loudly rather than appearing to succeed.
+        """
+        import config as _config
+        monkeypatch.setattr(_config, "ROBLOX_API_KEY", "stub-key")
+
+        out = tmp_path / "out"
+        out.mkdir()
+        # No place_builder.luau, no place_builder_chunks.json, no
+        # converted_place.rbxl — forces the publish_cached_chunks miss
+        # path that requires conversion_context.json.
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "publish", str(out),
+                "--api-key", "stub-key",
+                "--universe-id", "1",
+                "--place-id", "2",
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code != 0, (
+            f"publish without conversion_context.json must fail non-zero. "
+            f"output:\n{result.output[:1500]}"
+        )
+        assert "No conversion_context.json" in result.output

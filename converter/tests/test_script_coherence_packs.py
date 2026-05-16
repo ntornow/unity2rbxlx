@@ -2649,3 +2649,163 @@ class TestPlayerDamageRemoteEvent:
         assert guard_idx < set_idx, (
             "Type guard must run before SetAttribute receives the payload."
         )
+
+
+class TestProducerConsumerBindableEventGuard:
+    """``producer_consumer_bindable_events`` publishes a producer's
+    anonymous BindableEvent into ReplicatedStorage under the consumer's
+    expected name. But if the consumer uses ``OnClientEvent`` /
+    ``OnServerEvent`` (RemoteEvent-only API), the publish would wire a
+    BindableEvent into a RemoteEvent-shaped consumer — silently breaking
+    the bridge. The pack must skip in that case.
+    """
+
+    def test_skips_publish_when_consumer_uses_onclientevent(self) -> None:
+        from converter.script_coherence_packs import run_packs
+
+        producer = RbxScript(
+            name="Producer",
+            source=(
+                'local healthUpdateEvent = Instance.new("BindableEvent")\n'
+                'healthUpdateEvent:Fire(100)\n'
+            ),
+            script_type="Script",
+        )
+        consumer = RbxScript(
+            name="Consumer",
+            source=(
+                'local ReplicatedStorage = game:GetService("ReplicatedStorage")\n'
+                'local evt = ReplicatedStorage:WaitForChild("HealthUpdate")\n'
+                'evt.OnClientEvent:Connect(function(value) print(value) end)\n'
+            ),
+            script_type="LocalScript",
+        )
+        run_packs(
+            [producer, consumer],
+            enabled={"producer_consumer_bindable_events"},
+        )
+        # Producer source must NOT have been rewritten to publish into
+        # ReplicatedStorage — that would wire a BindableEvent into a
+        # consumer that calls OnClientEvent (which BindableEvent lacks).
+        assert "ReplicatedStorage" not in producer.source
+        assert ".Name =" not in producer.source
+
+    def test_publishes_when_consumer_uses_event_connect(self) -> None:
+        """BindableEvent's ``.Event:Connect`` is the same-process API,
+        so a producer/consumer pair using BindableEvent semantics SHOULD
+        still be bridged — only the OnClientEvent/OnServerEvent shape
+        is incompatible.
+        """
+        from converter.script_coherence_packs import run_packs
+
+        producer = RbxScript(
+            name="Producer",
+            source=(
+                'local pauseEvent = Instance.new("BindableEvent")\n'
+                'pauseEvent:Fire()\n'
+            ),
+            script_type="Script",
+        )
+        consumer = RbxScript(
+            name="Consumer",
+            source=(
+                'local ReplicatedStorage = game:GetService("ReplicatedStorage")\n'
+                'local evt = ReplicatedStorage:WaitForChild("Pause")\n'
+                'evt.Event:Connect(function() print("paused") end)\n'
+            ),
+            script_type="Script",
+        )
+        run_packs(
+            [producer, consumer],
+            enabled={"producer_consumer_bindable_events"},
+        )
+        # Producer must have been rewritten to publish under "Pause".
+        assert 'pauseEvent.Name = "Pause"' in producer.source
+        assert "ReplicatedStorage" in producer.source
+
+
+class TestTouchCallbackRangeStringBlanking:
+    """``_touch_callback_ranges`` walks block-open/end keyword tokens with
+    a depth counter. Without blanking string literals, a Luau keyword
+    appearing inside a string — ``error("function call failed")``,
+    ``warn("expected end of input")`` — corrupts the depth count and the
+    computed body end goes wrong, which can leave callers borrowing the
+    callback parameter at out-of-scope sites.
+    """
+
+    def test_string_literal_with_function_keyword_does_not_open_block(self) -> None:
+        # Single Touched handler; body contains a string literal carrying
+        # the word ``function``. The handler closes at the literal ``end``
+        # right before the trailing newline. If the string content were
+        # treated as code, depth would be 2 when we hit ``end``, causing
+        # the body_end to land far too late.
+        from converter.script_coherence_packs import _touch_callback_ranges
+
+        src = (
+            'part.Touched:Connect(function(other)\n'
+            '    error("function call failed")\n'
+            'end)\n'
+            'local after = "not in scope"\n'
+        )
+        ranges = _touch_callback_ranges(src)
+        assert len(ranges) == 1
+        body_start, body_end, var = ranges[0]
+        assert var == "other"
+        # ``body_end`` must be the position of the closing ``end`` for
+        # this callback — it should appear BEFORE the trailing line.
+        assert body_end < src.index('"not in scope"')
+
+    def test_string_literal_with_end_keyword_does_not_close_block(self) -> None:
+        from converter.script_coherence_packs import _touch_callback_ranges
+
+        src = (
+            'part.Touched:Connect(function(other)\n'
+            '    if other then\n'
+            '        warn("reached end of input")\n'
+            '    end\n'
+            'end)\n'
+            'local tail = 1\n'
+        )
+        ranges = _touch_callback_ranges(src)
+        assert len(ranges) == 1
+        body_start, body_end, var = ranges[0]
+        # The matching ``end`` is the LAST ``end`` of the snippet, not the
+        # one inside the inner if. Without string blanking, the inner
+        # ``end`` of input would balance the function depth too early.
+        last_end = src.rfind("end")
+        assert body_end == last_end
+
+    def test_long_bracket_string_with_block_keywords_is_blanked(self) -> None:
+        from converter.script_coherence_packs import _touch_callback_ranges
+
+        src = (
+            'part.Touched:Connect(function(other)\n'
+            '    local snippet = [[\n'
+            '        function fake() return end\n'
+            '        if true then end\n'
+            '    ]]\n'
+            '    print(snippet)\n'
+            'end)\n'
+        )
+        ranges = _touch_callback_ranges(src)
+        assert len(ranges) == 1
+        _, body_end, _ = ranges[0]
+        # The ``end`` keywords inside ``[[ ... ]]`` must NOT be counted.
+        # The real matching ``end`` is the last one in the snippet.
+        last_end = src.rfind("end")
+        assert body_end == last_end
+
+    def test_comment_with_keywords_does_not_break_scan(self) -> None:
+        from converter.script_coherence_packs import _touch_callback_ranges
+
+        src = (
+            'part.Touched:Connect(function(other)\n'
+            '    -- function foo() end if then\n'
+            '    print("hi")\n'
+            'end)\n'
+        )
+        ranges = _touch_callback_ranges(src)
+        assert len(ranges) == 1
+        _, body_end, _ = ranges[0]
+        last_end = src.rfind("end")
+        assert body_end == last_end

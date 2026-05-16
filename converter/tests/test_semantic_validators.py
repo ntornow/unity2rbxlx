@@ -550,6 +550,34 @@ class TestCameraAttachedNoPerFrame:
         )
         assert report.issues == []
 
+    def test_no_fire_when_pivot_to_lives_inside_if_block_in_callback(
+        self,
+    ) -> None:
+        """The callback-body collector used to count only ``function`` /
+        ``end``, so an inner ``if ... end`` truncated the body and a
+        ``rifle:PivotTo`` guarded by that ``if`` was treated as
+        out-of-callback — surfacing a false ``camera_attached_no_per_frame``
+        warning. Block-aware tracking must keep the PivotTo inside the
+        callback body.
+        """
+        src = (
+            'UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter\n'
+            'local rifle = riflePrefab:Clone()\n'
+            'rifle:PivotTo(camera.CFrame * CFrame.new(0.5, -0.5, -3))\n'
+            'RunService.RenderStepped:Connect(function(dt)\n'
+            '    if rifle and rifle.Parent then\n'
+            '        rifle:PivotTo(camera.CFrame * CFrame.new(0.5, -0.5, -3))\n'
+            '    end\n'
+            'end)\n'
+        )
+        report = run_semantic_validators(
+            [_script("Player", src)],
+            enabled_rules={"camera_attached_no_per_frame"},
+        )
+        # Per-frame update via the guarded PivotTo is enough — rule
+        # must NOT fire.
+        assert report.issues == []
+
 
 # ---------------------------------------------------------------------------
 # Rule 6: hardcoded_camera_height

@@ -189,6 +189,62 @@ class TestResolveAssetsContract:
         assert pipeline.ctx.universe_id == 99
         assert pipeline.ctx.place_id == 88
 
+    def test_stale_resolved_keys_do_not_suppress_new_resolution(
+        self, fake_unity_project, tmp_path, monkeypatch,
+    ):
+        """Codex review found that ``all_meshes_resolved`` used to
+        compare resolved-entry COUNT against current upload count.
+        A previous run that left mesh_native_sizes={A,B,C} (3 entries)
+        plus a current uploaded_assets={D,E} (2 entries) would compute
+        3 >= 2, declare "all resolved", and never resolve D or E.
+
+        The fix requires that every currently-uploaded mesh key be
+        present in mesh_native_sizes. With D/E unresolved, the phase
+        must proceed to the resolve loop.
+        """
+        _set_creds(monkeypatch)
+
+        pipeline = Pipeline(
+            unity_project_path=fake_unity_project,
+            output_dir=tmp_path / "out",
+            skip_upload=False,
+        )
+        # Stale resolution from a previous run — keys that no longer
+        # appear in the current uploaded_assets dict.
+        pipeline.ctx.mesh_native_sizes = {
+            "Assets/stale1.fbx": [1.0, 1.0, 1.0],
+            "Assets/stale2.fbx": [1.0, 1.0, 1.0],
+            "Assets/stale3.fbx": [1.0, 1.0, 1.0],
+        }
+        # Current uploads are different.
+        pipeline.ctx.uploaded_assets = {
+            "Assets/new1.fbx": "rbxassetid://1",
+            "Assets/new2.fbx": "rbxassetid://2",
+        }
+        pipeline.ctx.universe_id = 1234
+        pipeline.ctx.place_id = 5678
+
+        from roblox import cloud_api, id_cache
+        called: list[str] = []
+
+        def _stub(api_key, uid, pid, script, **_kw):
+            called.append(script)
+            return {"output": {"results": ["[]"]}}
+
+        monkeypatch.setattr(cloud_api, "execute_luau", _stub)
+        monkeypatch.setattr(id_cache, "write_ids", lambda *a, **k: None)
+
+        pipeline.resolve_assets()
+
+        # The phase must have called execute_luau to resolve new1/new2
+        # rather than short-circuiting on a stale count comparison.
+        assert called, (
+            "resolve_assets must actually resolve unresolved meshes "
+            "even when stale entries inflate the count."
+        )
+        joined = "\n".join(called)
+        assert "new1.fbx" in joined and "new2.fbx" in joined
+
 
 # ---------------------------------------------------------------------------
 # convert_interactive assemble CLI surface

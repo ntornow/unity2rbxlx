@@ -501,7 +501,8 @@ def publish(
                 click.echo(f"  (could not peek context for cred autodiscovery: {exc})")
 
     if not resolved_key:
-        click.echo("ERROR: API key required. Pass --api-key or create apikey file."); return
+        click.echo("ERROR: API key required. Pass --api-key or create apikey file.")
+        sys.exit(1)
     config.ROBLOX_API_KEY = resolved_key
     if resolved_cid:
         config.ROBLOX_CREATOR_ID = int(resolved_cid)
@@ -512,7 +513,8 @@ def publish(
         uid = uid or cached_uid
         pid = pid or cached_pid
     if not uid or not pid:
-        click.echo("ERROR: --universe-id and --place-id required (or cached in .roblox_ids.json)"); return
+        click.echo("ERROR: --universe-id and --place-id required (or cached in .roblox_ids.json)")
+        sys.exit(1)
 
     # ``--scaffolding`` only takes effect on the rebuild fallback —
     # the fast path uploads the cached ``.rbxl`` byte-for-byte, so
@@ -560,15 +562,18 @@ def publish(
         click.echo("No cached chunks found — rebuilding from Unity project.")
         ctx_path = output_path / "conversion_context.json"
         if not ctx_path.exists():
-            click.echo(f"ERROR: No conversion_context.json in {output_path}. Run 'convert' first."); return
+            click.echo(f"ERROR: No conversion_context.json in {output_path}. Run 'convert' first.")
+            sys.exit(1)
         prior_ctx = ConversionContext.load(ctx_path)
         if not prior_ctx.unity_project_path:
-            click.echo("ERROR: conversion_context.json has no unity_project_path."); return
+            click.echo("ERROR: conversion_context.json has no unity_project_path.")
+            sys.exit(1)
         if not Path(prior_ctx.unity_project_path).is_dir():
             click.echo(
                 f"ERROR: Unity project path missing: {prior_ctx.unity_project_path}\n"
                 "Re-run 'u2r.py convert' to regenerate the chunk cache."
-            ); return
+            )
+            sys.exit(1)
 
         scaffolding_list = [
             s.strip().lower()
@@ -697,7 +702,8 @@ def publish(
         pipeline.ctx.save(output_path / "conversion_context.json")
 
         if pipeline.state.rbx_place is None:
-            click.echo("ERROR: rbx_place is empty after rebuilding scene state."); return
+            click.echo("ERROR: rbx_place is empty after rebuilding scene state.")
+            sys.exit(1)
 
         result = publish_place(
             resolved_key, uid, pid, pipeline.state.rbx_place, output_path,

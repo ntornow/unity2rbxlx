@@ -1632,6 +1632,12 @@ def _process_components(
                         part._has_physical_collider = True
                 # Apply collider center offset to part CFrame position.
                 # Skip for Y-up FBX meshes where Roblox bakes mesh positions.
+                # ``center_offset`` is in the part's LOCAL space, so it
+                # must be rotated by the part's orientation before being
+                # added to the world position — otherwise a 90°-rotated
+                # node with ``m_Center = (1, 0, 0)`` would translate
+                # along world +X instead of along its local +X axis,
+                # landing the collider in the wrong place.
                 if center_offset != (0.0, 0.0, 0.0):
                     _skip_center = False
                     if hasattr(node, 'mesh_guid') and node.mesh_guid and guid_index:
@@ -1640,9 +1646,14 @@ def _process_components(
                             from core.coordinate_system import is_yup_fbx
                             _skip_center = is_yup_fbx(_co_fbx)
                     if not _skip_center:
-                        part.cframe.x += center_offset[0]
-                        part.cframe.y += center_offset[1]
-                        part.cframe.z += center_offset[2]
+                        cf = part.cframe
+                        ox, oy, oz = center_offset
+                        rx = cf.r00 * ox + cf.r01 * oy + cf.r02 * oz
+                        ry = cf.r10 * ox + cf.r11 * oy + cf.r12 * oz
+                        rz = cf.r20 * ox + cf.r21 * oy + cf.r22 * oz
+                        cf.x += rx
+                        cf.y += ry
+                        cf.z += rz
 
                 # MeshCollider → set CollisionFidelity based on convex flag
                 if ct == "MeshCollider":
@@ -2982,7 +2993,56 @@ def _resolve_asset_url(
 # ---------------------------------------------------------------------------
 
 def _find_camera(parsed_scene: ParsedScene) -> RbxCameraConfig | None:
-    """Find the first Camera component in the scene and build an RbxCameraConfig."""
+    """Find the first Camera component in the scene and build an RbxCameraConfig.
+
+    Composes the full ancestor chain into a world-space transform so a
+    camera parented under a rotated/translated rig (typical FPS rig
+    layout) lands at the right CFrame. The previous implementation used
+    ``node.position``/``node.rotation`` directly — those are LOCAL
+    transforms, so any non-root camera came out at the wrong place.
+    """
+    from core.coordinate_system import quat_multiply
+
+    def _world_transform(
+        node: SceneNode,
+    ) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+        """Walk the parent chain to compute a Unity-space world (pos, rot)."""
+        chain: list[SceneNode] = []
+        cur: SceneNode | None = node
+        seen: set[str] = set()
+        while cur is not None:
+            fid = str(getattr(cur, "file_id", "") or "")
+            if fid in seen:
+                break  # defensive: cycle guard
+            seen.add(fid)
+            chain.append(cur)
+            parent_fid = getattr(cur, "parent_file_id", None)
+            if parent_fid is None:
+                break
+            cur = parsed_scene.all_nodes.get(parent_fid)
+
+        world_pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        world_rot: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
+        # Walk from the topmost ancestor down to the node so each step
+        # composes (parent_rot, parent_pos) onto child_local.
+        for n in reversed(chain):
+            local_pos = getattr(n, "position", (0.0, 0.0, 0.0))
+            local_rot = getattr(n, "rotation", (0.0, 0.0, 0.0, 1.0))
+            scale = getattr(n, "scale", (1.0, 1.0, 1.0))
+            scaled_local = (
+                local_pos[0] * scale[0],
+                local_pos[1] * scale[1],
+                local_pos[2] * scale[2],
+            )
+            rotated = _quat_rotate(world_rot, list(scaled_local))
+            world_pos = (
+                world_pos[0] + rotated[0],
+                world_pos[1] + rotated[1],
+                world_pos[2] + rotated[2],
+            )
+            world_rot = quat_multiply(world_rot, tuple(local_rot))
+        return world_pos, world_rot
+
     for node in parsed_scene.all_nodes.values():
         for comp in node.components:
             if comp.component_type != "Camera":
@@ -2992,9 +3052,9 @@ def _find_camera(parsed_scene: ParsedScene) -> RbxCameraConfig | None:
             if config is None:
                 continue
 
-            # Apply the node's transform to the camera CFrame.
-            rx, ry, rz = unity_to_roblox_pos(*node.position)
-            rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*node.rotation)
+            world_pos, world_rot = _world_transform(node)
+            rx, ry, rz = unity_to_roblox_pos(*world_pos)
+            rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*world_rot)
             rot = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
 
             config.cframe = RbxCFrame(
@@ -3388,30 +3448,28 @@ def _convert_fbx_prefab_instance(
 
 
 def _apply_material_to_part(part, mat_mapping, uploaded_assets):
-    """Apply a material mapping to a part, creating SurfaceAppearance if textures exist."""
-    from core.roblox_types import RbxSurfaceAppearance
-    color_map = ""
-    normal_map = ""
-    if hasattr(mat_mapping, 'textures'):
-        for tex_name, tex_info in (mat_mapping.textures or {}).items():
-            if not isinstance(tex_info, dict):
-                continue
-            tex_guid = tex_info.get("guid", "")
-            if not tex_guid:
-                continue
-            # Find uploaded URL
-            for asset_key, asset_url in (uploaded_assets or {}).items():
-                if tex_guid in asset_key or asset_key.endswith(tex_guid):
-                    if "main" in tex_name.lower() or "albedo" in tex_name.lower() or "diffuse" in tex_name.lower() or tex_name == "_MainTex":
-                        color_map = asset_url
-                    elif "normal" in tex_name.lower() or "bump" in tex_name.lower():
-                        normal_map = asset_url
-                    break
+    """Apply a material mapping to a part, creating SurfaceAppearance if textures exist.
 
-    if color_map or normal_map:
+    Reads ``MaterialMapping.color_map_path`` / ``normal_map_path``
+    (already-resolved ``rbxassetid://`` URLs after the upload phase).
+    The previous implementation looked for a ``.textures`` attribute
+    that ``MaterialMapping`` doesn't have, so this function silently
+    no-op'd and FBX-prefab material overrides never applied a
+    ``SurfaceAppearance`` — leaving the caller's fallback texture scan
+    skipped (``_mat_applied=True``) and the part appearing untextured.
+    """
+    from core.roblox_types import RbxSurfaceAppearance
+    color_map = getattr(mat_mapping, "color_map_path", None) or ""
+    normal_map = getattr(mat_mapping, "normal_map_path", None) or ""
+    metalness_map = getattr(mat_mapping, "metalness_map_path", None) or ""
+    roughness_map = getattr(mat_mapping, "roughness_map_path", None) or ""
+
+    if color_map or normal_map or metalness_map or roughness_map:
         sa = RbxSurfaceAppearance(
-            color_map=color_map,
-            normal_map=normal_map,
+            color_map=color_map or None,
+            normal_map=normal_map or None,
+            metalness_map=metalness_map or None,
+            roughness_map=roughness_map or None,
         )
         part.surface_appearance = sa
 
@@ -4210,18 +4268,20 @@ def _convert_prefab_node(
                 except (ValueError, TypeError):
                     if isinstance(val, str) and val and len(val) < 100:
                         part.attributes[pp] = val
-            # Material override for this child
+            # Material override for this child.
+            # ``material_mappings`` is keyed by material GUID (see
+            # ``material_mapper.map_materials``), not by resolved path —
+            # the previous ``str(mat_path)`` lookup never matched in
+            # normal inputs and child material overrides silently no-op'd.
             elif pp.startswith("m_Materials.Array.data["):
                 obj_ref = mod.get("objectReference", {})
                 if isinstance(obj_ref, dict):
                     mat_guid = obj_ref.get("guid", "")
-                    if mat_guid and guid_index:
-                        mat_path = guid_index.resolve(mat_guid)
-                        if mat_path and str(mat_path) in material_mappings:
-                            mapping = material_mappings[str(mat_path)]
-                            base_color = getattr(mapping, "base_color", None)
-                            if base_color:
-                                part.color = (base_color[0], base_color[1], base_color[2])
+                    if mat_guid and mat_guid in material_mappings:
+                        mapping = material_mappings[mat_guid]
+                        base_color = getattr(mapping, "base_color", None)
+                        if base_color:
+                            part.color = (base_color[0], base_color[1], base_color[2])
 
     # Check if this node's components are disabled
     if disabled_components and hasattr(node, 'components'):

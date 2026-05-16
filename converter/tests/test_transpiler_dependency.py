@@ -255,3 +255,89 @@ class TestCodexFix2DuplicateStems:
         }
         graph, _ = _build_dependency_graph(sources)
         assert set(graph.keys()) == {"Utils", "Utils__abcdef"}
+
+    def test_ai_cache_key_no_field_boundary_collision(self):
+        """Codex round-3 [P2]: ``_cache_key(csharp + class + ...)`` used
+        plain string concatenation, so distinct inputs like
+        ``("ab", "c", ...)`` and ``("a", "bc", ...)`` produced the same
+        prehash and collided on the cache. ``_ai_cache_key`` now frames
+        each field with its length so the boundaries are unambiguous.
+        """
+        from converter.code_transpiler import _ai_cache_key
+
+        k1 = _ai_cache_key(
+            csharp_source="ab", class_name="c", script_type="Script",
+            project_context="", prompt_hash="P", model="claude",
+        )
+        k2 = _ai_cache_key(
+            csharp_source="a", class_name="bc", script_type="Script",
+            project_context="", prompt_hash="P", model="claude",
+        )
+        assert k1 != k2, (
+            "Field-boundary-ambiguous inputs must produce different keys."
+        )
+
+    def test_ai_results_keyed_by_stem_not_class_name(
+        self, tmp_path, monkeypatch,
+    ):
+        """Round-3 finding: ``ai_results`` used to be keyed by
+        ``info.class_name`` even though stems were disambiguated via
+        the path suffix. Two ``Utils.cs`` files in different folders
+        both produced ``info.class_name == "Utils"``, so the second
+        AI call overwrote the first and Phase 3 handed BOTH scripts
+        the same Luau output. Pin the contract: distinct paths get
+        distinct AI results.
+        """
+        from converter.code_transpiler import transpile_scripts
+        import converter.code_transpiler as ct_module
+
+        # Two distinct C# files sharing a class name.
+        f1 = tmp_path / "a" / "Utils.cs"
+        f2 = tmp_path / "b" / "Utils.cs"
+        f1.parent.mkdir(parents=True)
+        f2.parent.mkdir(parents=True)
+        f1.write_text("public class Utils { void A() {} }")
+        f2.write_text("public class Utils { void B() {} }")
+
+        # ScriptInfo stub matching the real shape consumed by
+        # transpile_scripts (info.path, info.class_name).
+        from dataclasses import dataclass
+
+        @dataclass
+        class _Info:
+            path: Path
+            class_name: str
+
+        script_infos = [
+            _Info(path=f1, class_name="Utils"),
+            _Info(path=f2, class_name="Utils"),
+        ]
+
+        # Force the AI path on; have the fake backend produce a Luau
+        # body that mentions the source path so we can prove each
+        # script kept its own result.
+        def _fake_ai(csharp_source, api_key, model, **kwargs):
+            # Echo the input so each call is distinguishable; the
+            # disambiguator should keep them from colliding.
+            return (f"-- transpiled from: {csharp_source}", 0.95, [])
+
+        monkeypatch.setattr(ct_module, "_ai_transpile", _fake_ai)
+        monkeypatch.setattr(ct_module, "_find_transpiler", lambda: "anthropic_api")
+        result = transpile_scripts(
+            unity_project_path=tmp_path,
+            script_infos=script_infos,
+            use_ai=True,
+            api_key="stub-key",
+        )
+
+        # Both scripts should be present in the output, with
+        # distinct Luau bodies (each echoing its own source).
+        luau_by_source = {ts.source_path: ts.luau_source for ts in result.scripts}
+        assert str(f1) in luau_by_source
+        assert str(f2) in luau_by_source
+        # Each script's Luau must contain the BODY of its own
+        # original source ("void A()" vs "void B()"). If the bug
+        # were still present, both would carry the same body.
+        assert "void A()" in luau_by_source[str(f1)]
+        assert "void B()" in luau_by_source[str(f2)]
+        assert luau_by_source[str(f1)] != luau_by_source[str(f2)]

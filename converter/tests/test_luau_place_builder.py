@@ -124,6 +124,57 @@ class TestLuauPlaceBuilder:
         chunks = generate_place_luau_chunked(place)
         assert len(chunks) == 1
 
+    def test_motor6d_emits_bone_parts_before_joint(self):
+        """Codex round-3 finding: the headless Luau path used to emit
+        Motor6Ds with ``FindFirstChild`` lookups for ``Part0`` /
+        ``Part1`` but never created the bone Parts those lookups
+        depend on. Without explicit bone parts, ``FindFirstChild``
+        returns nil and the joint silently does nothing — rigged
+        meshes don't animate.
+        """
+        from core.roblox_types import RbxMotor6D
+        place = RbxPlace()
+        part = RbxPart(
+            name="Rig", class_name="MeshPart",
+            cframe=RbxCFrame(), size=(1, 1, 1), anchored=True,
+            mesh_id="rbxassetid://1",
+        )
+        part.motor6ds.append(RbxMotor6D(
+            name="HipJoint",
+            part0_name="HumanoidRootPart",
+            part1_name="Spine",
+            c0=RbxCFrame(),
+            c1=RbxCFrame(),
+        ))
+        part.motor6ds.append(RbxMotor6D(
+            name="SpineToChest",
+            part0_name="Spine",
+            part1_name="Chest",
+            c0=RbxCFrame(),
+            c1=RbxCFrame(),
+        ))
+        place.workspace_parts.append(part)
+        script = generate_place_luau(place)
+
+        # Every non-HumanoidRootPart bone name must appear as a Part
+        # creation BEFORE the Motor6D references it. Look for the
+        # Name assignment specifically.
+        assert "bp.Name=\"Spine\"" in script
+        assert "bp.Name=\"Chest\"" in script
+        # And the Motor6D's Part0 for the HumanoidRootPart alias must
+        # resolve to the parent mesh directly (not via FindFirstChild
+        # which would search descendants and miss).
+        # Find the HipJoint Motor6D block and verify it uses the
+        # parent_var, not a FindFirstChild lookup for HumanoidRootPart.
+        spine_idx = script.find("bp.Name=\"Spine\"")
+        motor6d_idx = script.find("m.Name=\"HipJoint\"")
+        assert spine_idx >= 0 and motor6d_idx >= 0
+        assert spine_idx < motor6d_idx, (
+            "Bone Parts must be emitted BEFORE the Motor6Ds that "
+            "reference them; FindFirstChild on a not-yet-created "
+            "child returns nil."
+        )
+
     def test_child_hierarchy(self):
         place = RbxPlace()
         parent = RbxPart(name="Parent", class_name="Model",
