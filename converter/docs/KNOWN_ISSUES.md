@@ -49,11 +49,12 @@ files on phase failure.
 
 ### Modules import `config` directly
 
-**Files:** `converter/unity/guid_resolver.py:13`, `converter/converter/material_mapper.py`, `converter/converter/asset_extractor.py`
+**Files:** `converter/unity/guid_resolver.py:13`, `converter/unity/asset_extractor.py:11`
 
-CLAUDE.md's "no cross-import" spirit is broken by 3+ modules importing `config`
-directly. Couples them to the singleton, hurts testability, and is inconsistent
-with how other modules accept config via the `ConversionContext`.
+CLAUDE.md's "no cross-import" spirit is broken by two `unity/` modules
+importing `config.ASSET_EXT_TO_KIND` directly. Couples them to the
+singleton, hurts testability, and is inconsistent with how other modules
+accept config via the `ConversionContext`.
 
 **Fix:** thread relevant config values through function args / context object.
 
@@ -131,11 +132,13 @@ All test fixtures are minimal. No tests for:
 The eval suite (`u2r.py eval`) covers some of this on real projects but isn't
 a unit-test-style stress test.
 
-### Material texture operations not pixel-verified
+### Material texture operations not pixel-verified end-to-end
 
-Material mapper tests check that texture operations are *queued* but don't
-verify the pixel output. A bug in channel extraction or normal-map inversion
-would not be caught by current tests.
+`tests/test_image_processing.py` has pixel-level coverage for individual
+operations (`bake_ao`, `threshold_alpha`, `to_grayscale`). The gap: no
+integration test exercises the full material-mapper pipeline (channel
+extraction + normal-map inversion + AO bake composed end-to-end). Shader-
+specific texturing edge cases regress silently.
 
 ---
 
@@ -150,18 +153,6 @@ file won't record the interrupted phase, so resume may behave unexpectedly.
 
 **Fix:** wrap pipeline phases in a `try / except KeyboardInterrupt` that
 flushes the context to disk and exits cleanly.
-
-### `.asset` extension miscategorized as "unknown"
-
-**File:** `converter/config.py` (`ASSET_EXT_TO_KIND`)
-
-Unity `.asset` files map to `"unknown"` in the asset manifest, but
-`scriptable_object_converter.py` specifically processes `.asset` files. The
-manifest and report categorize ScriptableObjects as "unknown," which is
-misleading.
-
-**Fix:** add `".asset": "scriptable_object"` (or similar) to the kind map
-and update the asset extractor to honor it.
 
 ---
 

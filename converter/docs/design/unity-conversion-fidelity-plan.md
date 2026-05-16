@@ -1,6 +1,13 @@
 # Unity-to-Roblox Conversion Fidelity Plan
 
-Status: proposal. Author: derived from a SimpleFPS rifle-in-FPV debugging session (2026-05-15).
+Status: partially shipped. Author: derived from a SimpleFPS rifle-in-FPV debugging session (2026-05-15).
+
+- **#6 — Semantic post-transpile validator:** SHIPPED — `converter/converter/semantic_validators.py`.
+- **#2 — Preserve Unity prefab root as Model `WorldPivot`:** SHIPPED — `converter/converter/prefab_packages.py` (see `TestWorldPivotPreservation` in `tests/test_prefab_packages.py`).
+- **#1 — Unit conversion of Unity spatial literals:** PARTIAL — semantic validator warns on suspicious literals (e.g. small-magnitude `Vector3.new`) but does not auto-rewrite.
+- **#3 — Canonical FPS weapon template injection:** NOT shipped.
+
+The remaining items live as gaps the converter still has; the doc below is preserved as the design rationale for #1/#3 if and when they're revisited.
 
 ## Context
 
@@ -31,11 +38,11 @@ Catch the classes of bug that "passed Luau syntax but break at runtime in Roblox
 - Tells us empirically which rules fire on real test projects (SimpleFPS, Gamekit3D, ChopChop, etc.). That data informs prioritisation for #1/#3.
 - Same approach as the existing `luau-analyze` syntax gate — extends it to semantics.
 
-### Where
+### Where (as shipped)
 
-- New module: `converter/converter/semantic_validators.py`
-- New pipeline phase between `transpile`'s syntax check and `assemble`'s scene write. Hooked in `converter/converter/pipeline.py`.
-- Output: list of `Issue` records persisted to `conversion_report.json` under `semantic_warnings`, plus CLI surface via the transpile log.
+- Module: `converter/converter/semantic_validators.py`.
+- Invoked from `Pipeline.write_output` (see `pipeline.py:2083`) rather than as its own pipeline phase — the validator needs the post-bind script set after `_bind_scripts_to_parts` has moved gameplay scripts onto their parts.
+- Output: list of `Issue` records persisted to `conversion_report.json` under `semantic_warnings`, plus CLI surface via the `write_output` log.
 
 ### Rule set (initial)
 
