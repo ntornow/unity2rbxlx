@@ -60,8 +60,8 @@ jobs:
         with:
           submodules: false
 
-      # Only SimpleFPS has a .gitmodules mapping; the other 8 gitlinks under
-      # test_projects/ are dormant. Tests auto-skip unpopulated projects via
+      # SimpleFPS is the only test_projects/* entry wired to a submodule.
+      # Tests auto-skip unpopulated projects via
       # converter/tests/_project_paths.is_populated().
       - name: Init SimpleFPS submodule (skip LFS smudge)
         # The upstream repo's LFS quota is exhausted so binary assets cannot
@@ -257,10 +257,10 @@ jobs:
     timeout-minutes: 25
     env:
       # Path to the populated SimpleFPS Unity project on the self-hosted
-      # runner. test_projects/* in this repo are gitlinks with no
-      # .gitmodules, so CI cannot populate them; we point at a locally
-      # cloned Unity project instead. Override by setting a runner-level
-      # env var or repo variable if the path ever changes.
+      # runner. The smoke-test job checks out with submodules: false, so
+      # test_projects/SimpleFPS is an unpopulated gitlink here; we point at
+      # a locally cloned Unity project instead. Override by setting a
+      # runner-level env var or repo variable if the path ever changes.
       UNITY_SIMPLEFPS_DIR: /Users/jiazou/workspace/unity-3d-simplefps
     defaults:
       run:
@@ -269,6 +269,19 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: false
+
+      # The self-hosted runner keeps its workspace between runs. If a prior
+      # run left the tree dirty (stale untracked output/, half-checked-out
+      # submodule dirs) actions/checkout's own clean can fall short. Reset +
+      # hard-clean here so a corrupted workspace self-heals instead of
+      # needing a manual wipe — the failure mode behind the 2026-05-15
+      # nightly, where checkout left the converter/ dir missing.
+      - name: Heal stale self-hosted workspace
+        working-directory: ${{ github.workspace }}
+        run: |
+          git reset --hard HEAD
+          git clean -ffdx
+          test -d converter || { echo "::error::converter/ missing after checkout"; exit 1; }
 
       - name: Verify SimpleFPS source exists
         run: |
@@ -287,6 +300,7 @@ jobs:
           "$VENV/bin/python" -m pip install -e ".[dev]"
 
       - name: Convert SimpleFPS
+        timeout-minutes: 10
         run: |
           "$HOME/.unity2rbxlx-venv/bin/python" u2r.py convert "$UNITY_SIMPLEFPS_DIR" \
             -o "./output/SimpleFPS" \
@@ -296,6 +310,10 @@ jobs:
             --no-resolve
 
       - name: Run smoke test
+        # Step-level cap so a hung Roblox Studio fails this step in ~12min
+        # with a clear error instead of silently consuming the whole 25min
+        # job budget (the 2026-05-15 nightly hung to the job timeout here).
+        timeout-minutes: 12
         run: |
           # --scene all writes per-scene rbxlx files (main.rbxlx is the
           # gameplay scene — 944 parts / 51 scripts). There is no unified
