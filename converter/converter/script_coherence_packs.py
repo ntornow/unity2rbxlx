@@ -834,7 +834,7 @@ def _canonicalize_pickup_remote_event(scripts: list["RbxScript"]) -> int:
     "just in FPS-rifle projects. Without this, broadening the server pack "
     "to any genre would remove the legacy client-side ``GetItem`` "
     "attribute trigger and leave non-FPS pickups silently unwired.",
-    after=("fps_rifle_inject", "pickup_remote_event_server"),
+    after=("fps_rifle_inject", "pickup_remote_event_server", "pickup_visual_target"),
     detect=_detect_pickup_remote_event_in_use,
 )
 def _add_pickup_remote_listener(scripts: list["RbxScript"]) -> int:
