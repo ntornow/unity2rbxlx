@@ -19,6 +19,11 @@ _REJECTED_BRIDGES = [
     "physics_queries.luau",
     "animator_bridge.luau",
     "TransformAnimator.luau",
+    # Skeletal/character animation runtimes: retired because skeletal
+    # animation cannot be converted (see docs/UNSUPPORTED.md). Guard
+    # against either name reappearing.
+    "animator_runtime.luau",
+    "character_animator.luau",
 ]
 
 
@@ -89,14 +94,6 @@ def test_api_mappings_still_inlines_covered_apis():
         "OnCollisionEnter", "OnTriggerEnter",
     ]:
         assert hook in LIFECYCLE_MAP, f"Lifecycle hook {hook} missing from LIFECYCLE_MAP"
-
-
-def test_character_animator_has_consolidated_features():
-    source = (RUNTIME_DIR / "character_animator.luau").read_text()
-    for method in ["GetFloat", "GetBool", "GetInt", "Play",
-                    "Destroy", "_startBlendTree", "_updateBlendTree",
-                    "_lazyLoadTrack", "anyStateTransitions"]:
-        assert method in source, f"missing: {method}"
 
 
 def test_generated_transform_only_script_has_no_deleted_bridge_require():
@@ -189,20 +186,3 @@ def _require_arguments(source: str) -> list[str]:
             # Unbalanced — bail to avoid infinite loop.
             break
     return results
-
-
-def test_character_animator_luau_syntax():
-    source = (RUNTIME_DIR / "character_animator.luau").read_text()
-    lines = source.splitlines()
-
-    # No leftover --- docstring blocks (slop indicator)
-    triple_dash = [i for i, l in enumerate(lines, 1) if l.strip().startswith("---")]
-    assert not triple_dash, f"--- docstrings at lines {triple_dash}"
-
-    # Must return the module table
-    assert lines[-1].strip() == "return CharacterAnimator"
-
-    # Sanity: expected method count (22 functions after consolidation)
-    func_count = sum(1 for l in lines if l.strip().startswith("function ") or
-                     l.strip().startswith("local function "))
-    assert func_count >= 20, f"unexpectedly few functions: {func_count}"

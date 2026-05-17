@@ -20,25 +20,17 @@ import pytest
 
 from converter.animation_converter import (
     AnimClip,
-    AnimCondition,
     AnimCurve,
     AnimKeyframe,
     AnimParameter,
-    AnimState,
-    AnimTransition,
     AnimatorController,
-    AnimationConversionResult,
     BlendTree,
-    BlendTreeEntry,
     parse_anim_file,
     parse_controller_file,
     simplify_keyframes,
     generate_tween_script,
     discover_animations,
     convert_animations,
-    export_controller_json,
-    export_clip_keyframes,
-    generate_controller_bootstrap,
     _quat_to_euler_degrees,
 )
 
@@ -1416,17 +1408,11 @@ class TestPipelineIntegration:
 
 
 class TestStateMachineScriptRetired:
-    """PR1 of the character-animation plan retired ``generate_state_machine_script``.
+    """Humanoid AnimatorControllers emit no animation output.
 
-    It emitted an ``Anim_<ctrl>_StateMachine`` Script for any controller with
-    humanoid clips, transitions, and >= 2 states. That script only tweened one
-    Part's ``Position`` (not a skeleton) and was a redundant second
-    state-machine implementation alongside the ``CharacterAnimator`` runtime.
-
-    This test pins the post-retirement contract: such a controller no longer
-    emits a ``_StateMachine`` Script; its graph + bone keyframes go into the
-    ``AnimationData_*`` module that ``CharacterAnimator`` consumes (wired live
-    in PR2). See ``docs/design/character-animation.md``.
+    Skeletal/character animation is unsupported (see docs/UNSUPPORTED.md):
+    a humanoid controller emits neither a ``_StateMachine`` Script nor any
+    other animation script — its clips are surfaced to UNCONVERTED.md.
     """
 
     def test_humanoid_controller_with_transitions_emits_no_statemachine_script(
@@ -1537,230 +1523,37 @@ class TestStateMachineScriptRetired:
         guid_index = build_guid_index(tmp_path)
         result = convert_animations(tmp_path, guid_index=guid_index)
 
-        # No per-controller state-machine Script is emitted any more.
+        # No per-controller state-machine Script is emitted.
         sm_scripts = [n for n, _ in result.generated_scripts if n.endswith("_StateMachine")]
-        assert sm_scripts == [], f"generate_state_machine_script output not retired: {sm_scripts}"
+        assert sm_scripts == [], f"_StateMachine script not retired: {sm_scripts}"
 
-        # The controller graph + bone keyframes still flow into an
-        # AnimationData_* module for the CharacterAnimator runtime.
-        data_modules = [n for n, _ in result.animation_data_modules]
-        assert any("RetiredSMCtrl" in n for n in data_modules), data_modules
+        # The humanoid clip is unsupported — no animation script of any kind.
+        assert result.generated_scripts == [], result.generated_scripts
+
+        # The humanoid clip is surfaced to UNCONVERTED.md instead.
+        items = [e["item"] for e in result.unconverted if e["category"] == "animation_clip"]
+        assert any("Walk" in i for i in items), result.unconverted
+        for entry in result.unconverted:
+            if entry["category"] == "animation_clip" and "Walk" in entry["item"]:
+                assert "skeletal" in entry["reason"].lower()
 
 
 # ---------------------------------------------------------------------------
-# Animation data export (controller JSON + keyframe data)
+# Humanoid / skeletal clips are unsupported (see docs/UNSUPPORTED.md)
 # ---------------------------------------------------------------------------
 
-class TestAnimationDataExport:
+class TestHumanoidClipsUnsupported:
+    """Skeletal/character animation is unsupported: humanoid clips are
+    surfaced to UNCONVERTED.md and produce no animation script."""
 
-    def _make_controller_with_clip(self):
-        clip = AnimClip(
-            name="Walk",
-            duration=1.0,
-            loop=True,
-            sample_rate=30,
-            curves=[
-                AnimCurve(
-                    path="Hips",
-                    property_type="position",
-                    keyframes=[
-                        AnimKeyframe(time=0.0, value=(0.0, 0.0, 0.0)),
-                        AnimKeyframe(time=1.0, value=(1.0, 2.0, 3.0)),
-                    ],
-                ),
-            ],
-        )
-        ctrl = AnimatorController(
-            name="HumanoidCtrl",
-            states=[
-                AnimState(name="Idle", file_id="1", clip_guid="g1"),
-                AnimState(name="Walking", file_id="2", clip_guid="g2",
-                          transitions=[
-                              AnimTransition(
-                                  name="t", dst_state_file_id="1",
-                                  conditions=[AnimCondition(parameter="Speed", mode=4, threshold=0.1)],
-                              ),
-                          ]),
-            ],
-            parameters=[
-                AnimParameter(name="Speed", param_type=1, default_float=0.0),
-            ],
-            default_state_file_id="1",
-        )
-        return ctrl, clip
+    def test_humanoid_controller_surfaces_clip_to_unconverted(self):
+        import tempfile
 
-    def test_export_controller_json(self):
-        ctrl, _ = self._make_controller_with_clip()
-        data = export_controller_json(ctrl)
-        assert data["name"] == "HumanoidCtrl"
-        assert len(data["states"]) == 2
-        assert data["defaultState"] == "Idle"
-        assert data["parameters"][0]["name"] == "Speed"
-        assert data["parameters"][0]["type"] == "Float"
-        walking = [s for s in data["states"] if s["name"] == "Walking"][0]
-        assert walking["transitions"][0]["destination"] == "Idle"
-
-    def test_export_condition_modes(self):
-        """All 6 condition modes the character_animator supports are mapped."""
-        mode_map = {1: "If", 2: "IfNot", 3: "Greater", 4: "Less", 6: "Equals", 7: "NotEqual"}
-        conditions = []
-        for mode_int, mode_str in mode_map.items():
-            conditions.append(AnimCondition(parameter="p", mode=mode_int, threshold=0.5))
-        ctrl = AnimatorController(
-            name="C", states=[
-                AnimState(name="A", file_id="1", clip_guid="g1"),
-                AnimState(name="B", file_id="2", clip_guid="g2",
-                          transitions=[AnimTransition(name="t", dst_state_file_id="1", conditions=conditions)]),
-            ],
-            parameters=[AnimParameter(name="p", param_type=1, default_float=0.0)],
-            default_state_file_id="1",
-        )
-        data = export_controller_json(ctrl)
-        exported_modes = {c["mode"] for s in data["states"] for t in s["transitions"] for c in t["conditions"]}
-        assert exported_modes == set(mode_map.values())
-
-    def test_export_transition_fields_match_runtime(self):
-        """Transition fields include everything character_animator reads."""
-        ctrl, _ = self._make_controller_with_clip()
-        data = export_controller_json(ctrl)
-        walking = [s for s in data["states"] if s["name"] == "Walking"][0]
-        tr = walking["transitions"][0]
-        for field in ("destination", "conditions", "duration", "hasExitTime", "exitTime"):
-            assert field in tr, f"missing transition field: {field}"
-
-    def test_export_parameter_types(self):
-        """All Unity parameter types map to strings the runtime supports."""
-        ctrl = AnimatorController(
-            name="C", states=[AnimState(name="S", file_id="1", clip_guid="g")],
-            parameters=[
-                AnimParameter(name="f", param_type=1, default_float=1.5),
-                AnimParameter(name="i", param_type=3, default_int=7),
-                AnimParameter(name="b", param_type=4, default_bool=True),
-                AnimParameter(name="t", param_type=9),
-            ],
-            default_state_file_id="1",
-        )
-        data = export_controller_json(ctrl)
-        by_name = {p["name"]: p for p in data["parameters"]}
-        assert by_name["f"]["type"] == "Float" and by_name["f"]["defaultValue"] == 1.5
-        assert by_name["i"]["type"] == "Int" and by_name["i"]["defaultValue"] == 7
-        assert by_name["b"]["type"] == "Bool" and by_name["b"]["defaultValue"] is True
-        assert by_name["t"]["type"] == "Trigger"
-
-    def test_export_clip_keyframes(self):
-        _, clip = self._make_controller_with_clip()
-        data = export_clip_keyframes(clip)
-        assert data["duration"] == 1.0
-        assert "Hips" in data["bones"]
-        frames = data["bones"]["Hips"]
-        assert len(frames) == 2
-        assert frames[0]["time"] == 0.0
-        assert frames[1]["cf"]["x"] == 1.0
-        # Z should be negated (Unity -> Roblox)
-        assert frames[1]["cf"]["z"] == -3.0
-
-    def test_export_clip_keyframes_carries_loop_flag(self):
-        """PR2: the exported keyframe data carries the clip loop flag so
-        KeyframeTrack can default its Looped field."""
-        looping = AnimClip(
-            name="walk", duration=1.0, loop=True, sample_rate=30,
-            curves=[AnimCurve(
-                property_type="position", path="Hips",
-                keyframes=[
-                    AnimKeyframe(time=0.0, value=(0.0, 0.0, 0.0)),
-                    AnimKeyframe(time=1.0, value=(1.0, 0.0, 0.0)),
-                ],
-            )],
-        )
-        once = AnimClip(
-            name="jump", duration=1.0, loop=False, sample_rate=30,
-            curves=[AnimCurve(
-                property_type="position", path="Hips",
-                keyframes=[
-                    AnimKeyframe(time=0.0, value=(0.0, 0.0, 0.0)),
-                    AnimKeyframe(time=1.0, value=(1.0, 0.0, 0.0)),
-                ],
-            )],
-        )
-        assert export_clip_keyframes(looping)["loop"] is True
-        assert export_clip_keyframes(once)["loop"] is False
-
-    def test_export_clip_keyframes_merges_curves_by_time(self):
-        """A bone with separate position and rotation curves whose
-        keyframes don't share timestamps must emit a single time-sorted
-        frame list where each frame carries every property the runtime
-        needs. The previous per-curve append produced negative dt
-        (rotation kf time < last position kf time) which the runtime
-        skipped, plus partial cf dicts that snapped unset axes to 0.
-        """
-        clip = AnimClip(
-            name="walk",
-            duration=1.0,
-            loop=False,
-            sample_rate=60,
-            curves=[
-                AnimCurve(
-                    property_type="position",
-                    path="Hips",
-                    keyframes=[
-                        AnimKeyframe(time=0.0, value=(0.0, 0.0, 0.0)),
-                        AnimKeyframe(time=1.0, value=(1.0, 2.0, 3.0)),
-                    ],
-                ),
-                AnimCurve(
-                    property_type="euler",
-                    path="Hips",
-                    keyframes=[
-                        # Rotation has a key at 0.5 that the old code put
-                        # after the t=1.0 position frame, producing
-                        # negative dt the runtime would drop.
-                        AnimKeyframe(time=0.5, value=(0.0, 90.0, 0.0)),
-                        AnimKeyframe(time=1.0, value=(0.0, 180.0, 0.0)),
-                    ],
-                ),
-            ],
-        )
-
-        data = export_clip_keyframes(clip)
-        frames = data["bones"]["Hips"]
-        times = [f["time"] for f in frames]
-        assert times == sorted(times), (
-            f"Per-bone frames must be time-sorted; got {times}"
-        )
-
-        # Each frame must carry every component the runtime reads — once
-        # rotation enters at t=0.5, position must carry forward, not snap
-        # back to (0,0,0).
-        mid_frame = next(f for f in frames if f["time"] == 0.5)
-        cf = mid_frame["cf"]
-        assert cf.get("ry") == 90.0
-        assert "x" in cf and "y" in cf and "z" in cf, (
-            f"position must carry forward into rotation-only frame; got cf={cf}"
-        )
-
-        # The t=1.0 frame must merge both position and rotation, not
-        # appear twice (once per curve).
-        end_frames = [f for f in frames if f["time"] == 1.0]
-        assert len(end_frames) == 1, (
-            f"frames sharing a timestamp must merge; got {end_frames}"
-        )
-        end_cf = end_frames[0]["cf"]
-        assert end_cf.get("x") == 1.0 and end_cf.get("ry") == 180.0
-
-    def test_animation_data_modules_generated(self):
-        """convert_animations populates animation_data_modules for controllers with clips."""
-        import json
-        import tempfile, os
-
-        ctrl, clip = self._make_controller_with_clip()
-
-        # Create a minimal project structure with an .anim and .controller
         with tempfile.TemporaryDirectory() as tmpdir:
             assets = Path(tmpdir) / "Assets" / "Animations"
             assets.mkdir(parents=True)
 
-            # Write a minimal .anim file
-            anim_yaml = textwrap.dedent(f"""\
+            anim_yaml = textwrap.dedent("""\
                 %YAML 1.1
                 %TAG !u! tag:unity3d.com,2011:
                 --- !u!74 &7400000
@@ -1773,14 +1566,14 @@ class TestAnimationDataExport:
                       m_Curve:
                       - serializedVersion: 3
                         time: 0
-                        value: {{x: 0, y: 0, z: 0}}
-                        inSlope: {{x: 0, y: 0, z: 0}}
-                        outSlope: {{x: 0, y: 0, z: 0}}
+                        value: {x: 0, y: 0, z: 0}
+                        inSlope: {x: 0, y: 0, z: 0}
+                        outSlope: {x: 0, y: 0, z: 0}
                       - serializedVersion: 3
                         time: 1
-                        value: {{x: 1, y: 2, z: 3}}
-                        inSlope: {{x: 0, y: 0, z: 0}}
-                        outSlope: {{x: 0, y: 0, z: 0}}
+                        value: {x: 1, y: 2, z: 3}
+                        inSlope: {x: 0, y: 0, z: 0}
+                        outSlope: {x: 0, y: 0, z: 0}
                     path: Hips
                   m_RotationCurves: []
                   m_EulerCurves: []
@@ -1790,17 +1583,12 @@ class TestAnimationDataExport:
                     m_LoopTime: 1
                     m_StopTime: 1
             """)
-            anim_path = assets / "Walk.anim"
-            anim_path.write_text(anim_yaml)
-
-            # Write a .anim.meta to give it a GUID
-            meta = textwrap.dedent("""\
+            (assets / "Walk.anim").write_text(anim_yaml)
+            (assets / "Walk.anim.meta").write_text(textwrap.dedent("""\
                 fileFormatVersion: 2
                 guid: abcd1234abcd1234abcd1234abcd1234
-            """)
-            (assets / "Walk.anim.meta").write_text(meta)
+            """))
 
-            # Write a minimal .controller file referencing the clip
             ctrl_yaml = textwrap.dedent("""\
                 %YAML 1.1
                 %TAG !u! tag:unity3d.com,2011:
@@ -1808,12 +1596,7 @@ class TestAnimationDataExport:
                 AnimatorController:
                   m_ObjectHideFlags: 0
                   m_Name: HumanoidCtrl
-                  m_AnimatorParameters:
-                  - m_Name: Speed
-                    m_Type: 1
-                    m_DefaultFloat: 0
-                    m_DefaultInt: 0
-                    m_DefaultBool: 0
+                  m_AnimatorParameters: []
                   m_AnimatorLayers:
                   - serializedVersion: 5
                     m_Name: Base Layer
@@ -1837,22 +1620,83 @@ class TestAnimationDataExport:
                   m_Speed: 1
                   m_Transitions: []
             """)
-            ctrl_path = assets / "HumanoidCtrl.controller"
-            ctrl_path.write_text(ctrl_yaml)
+            (assets / "HumanoidCtrl.controller").write_text(ctrl_yaml)
 
             from unity.guid_resolver import build_guid_index
             guid_index = build_guid_index(Path(tmpdir))
             result = convert_animations(Path(tmpdir), guid_index=guid_index)
 
-            # Should have generated at least one animation data module
-            assert len(result.animation_data_modules) >= 1
-            module_name, module_source = result.animation_data_modules[0]
-            assert module_name.startswith("AnimationData_")
-            assert "HumanoidCtrl" in module_name
-            # Module should contain valid JSON inside the Luau source
-            assert "JSONDecode" in module_source
-            assert "controller" in module_source
-            assert "keyframes" in module_source
+            # No animation script of any kind is emitted for the humanoid clip.
+            assert result.generated_scripts == [], result.generated_scripts
+
+            # The clip is surfaced to UNCONVERTED.md.
+            clip_entries = [
+                e for e in result.unconverted
+                if e["category"] == "animation_clip" and "Walk" in e["item"]
+            ]
+            assert clip_entries, result.unconverted
+            assert "skeletal" in clip_entries[0]["reason"].lower()
+
+            # Routing records the clip as skipped, not character_animator.
+            routing = result.routing.get("HumanoidCtrl", {})
+            assert routing
+            for decision in routing.values():
+                assert decision["target"] == "skipped"
+
+    def test_orphan_humanoid_clip_surfaced_and_not_tweened(self):
+        """A standalone humanoid .anim with no controller is surfaced to
+        UNCONVERTED.md and produces no Anim_* script."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            assets = Path(tmpdir) / "Assets" / "Animations"
+            assets.mkdir(parents=True)
+
+            anim_yaml = textwrap.dedent("""\
+                %YAML 1.1
+                %TAG !u! tag:unity3d.com,2011:
+                --- !u!74 &7400000
+                AnimationClip:
+                  m_ObjectHideFlags: 0
+                  m_Name: OrphanWalk
+                  m_PositionCurves:
+                  - curve:
+                      serializedVersion: 2
+                      m_Curve:
+                      - serializedVersion: 3
+                        time: 0
+                        value: {x: 0, y: 0, z: 0}
+                        inSlope: {x: 0, y: 0, z: 0}
+                        outSlope: {x: 0, y: 0, z: 0}
+                      - serializedVersion: 3
+                        time: 1
+                        value: {x: 1, y: 2, z: 3}
+                        inSlope: {x: 0, y: 0, z: 0}
+                        outSlope: {x: 0, y: 0, z: 0}
+                    path: LeftUpperArm
+                  m_RotationCurves: []
+                  m_EulerCurves: []
+                  m_ScaleCurves: []
+                  m_AnimationClipSettings:
+                    serializedVersion: 2
+                    m_LoopTime: 1
+                    m_StopTime: 1
+            """)
+            (assets / "OrphanWalk.anim").write_text(anim_yaml)
+
+            result = convert_animations(Path(tmpdir))
+
+            # No Anim_* script for the orphan humanoid clip.
+            anim_scripts = [n for n, _ in result.generated_scripts if n.startswith("Anim_")]
+            assert anim_scripts == [], anim_scripts
+
+            # Surfaced to UNCONVERTED.md.
+            clip_entries = [
+                e for e in result.unconverted
+                if e["category"] == "animation_clip" and "OrphanWalk" in e["item"]
+            ]
+            assert clip_entries, result.unconverted
+            assert "skeletal" in clip_entries[0]["reason"].lower()
 
 
 class TestPhase45Routing:
@@ -2030,43 +1874,6 @@ class TestPhase45Routing:
         # Fallback clip_guid kept so the runtime has something to play.
         assert state.clip_guid == "cccccccccccccccccccccccccccccccc"
 
-    def test_export_blend_trees_resolved_clip_names(self) -> None:
-        """export_controller_json emits blendTrees with clip names resolved from GUID."""
-        bt = BlendTree(
-            name="Locomotion",
-            param="Speed",
-            entries=[
-                BlendTreeEntry(threshold=0.0, clip_guid="guid-idle"),
-                BlendTreeEntry(threshold=1.0, clip_guid="guid-run"),
-            ],
-        )
-        ctrl = AnimatorController(name="Player")
-        ctrl.blend_trees["Locomotion"] = bt
-        ctrl.states.append(AnimState(
-            name="Move", file_id="300", clip_guid="",
-            blend_tree_name="Locomotion",
-        ))
-        data = export_controller_json(ctrl, clip_name_by_guid={
-            "guid-idle": "Idle", "guid-run": "Run",
-        })
-        assert data["blendTrees"] == {
-            "Locomotion": {
-                "param": "Speed",
-                "clips": [
-                    {"clip": "Idle", "threshold": 0.0},
-                    {"clip": "Run", "threshold": 1.0},
-                ],
-            },
-        }
-        move = next(s for s in data["states"] if s["name"] == "Move")
-        assert move["blendTree"] == "Locomotion"
-
-    def test_export_blend_trees_absent_when_no_entries(self) -> None:
-        """No blendTrees key emitted when the controller has none."""
-        ctrl = AnimatorController(name="Empty")
-        data = export_controller_json(ctrl)
-        assert "blendTrees" not in data
-
     def test_routing_records_per_clip_decisions(self, tmp_path: Path) -> None:
         """convert_animations writes humanoid vs transform-only routing per clip."""
         # Build a minimal project: one transform-only clip + controller.
@@ -2128,9 +1935,6 @@ class TestPhase45Routing:
 
         assert "SpinCtrl" in result.routing
         assert result.routing["SpinCtrl"]["Spin"]["target"] == "inline_tween"
-        # No animation_data module for a pure-transform-only controller —
-        # the runtime JSON path is reserved for humanoid clips.
-        assert not any(name.startswith("AnimationData_Spin") for name, _ in result.animation_data_modules)
         # Transform-only clip produced an inline TweenService script.
         assert any(name.startswith("Anim_SpinCtrl_Spin") for name, _ in result.generated_scripts)
 
@@ -2170,7 +1974,6 @@ class TestPhase45Routing:
         )
         assert "Ghost" in result.routing
         assert result.routing["Ghost"]["__controller__"]["target"] == "skipped"
-        assert not result.animation_data_modules
 
     def test_same_name_controllers_dont_collide(self, tmp_path: Path) -> None:
         """Two AnimatorControllers sharing m_Name across distinct files emit
@@ -2275,17 +2078,15 @@ class TestPhase45Routing:
             f"generated script names must be unique, got {spin_scripts}"
         )
 
-    def test_same_name_clips_dont_collide_in_keyframes(self, tmp_path: Path) -> None:
-        """Two distinct AnimationClips with identical m_Name in one
-        controller both survive in the keyframes dict instead of one
-        silently shadowing the other; the collision is recorded as
-        UNCONVERTED so the user can see it."""
+    def test_same_name_humanoid_clips_both_surfaced_to_unconverted(self, tmp_path: Path) -> None:
+        """Two distinct humanoid AnimationClips with identical m_Name in
+        one controller are each surfaced to UNCONVERTED.md — both the
+        skeletal-unsupported entry and the duplicate-name collision."""
         assets = tmp_path / "Assets"
         assets.mkdir()
 
         # Two clips named "Walk" living at different paths — both touch
-        # a humanoid bone (Hips) so they route through character_animator
-        # and hit the per-controller keyframes dict-comprehension.
+        # a humanoid bone (Hips), so both are unsupported.
         for fname, guid in (("WalkA.anim", "a" * 32), ("WalkB.anim", "b" * 32)):
             (assets / fname).write_text(textwrap.dedent("""\
                 %YAML 1.1
@@ -2350,30 +2151,18 @@ class TestPhase45Routing:
         guid_index = build_guid_index(tmp_path)
         result = convert_animations(tmp_path, guid_index=guid_index)
 
-        # The animation_data_module must contain both clips' keyframes —
-        # not one silently shadowing the other.
-        assert len(result.animation_data_modules) == 1, (
-            f"expected exactly one animation_data module, got "
-            f"{[n for n, _ in result.animation_data_modules]}"
-        )
-        _, module_source = result.animation_data_modules[0]
-        # Two distinct, non-empty clip entries in the keyframes dict.
-        # When two clips share a name, both get a disambiguator so neither
-        # silently overwrites the other (compare to the prior behavior,
-        # where the dict-comprehension keyed on clip.name silently kept
-        # only the last clip).
-        import json
-        json_start = module_source.index("[==[") + 4
-        json_end = module_source.rindex("]==]")
-        data = json.loads(module_source[json_start:json_end])
-        keyframe_keys = list(data["keyframes"].keys())
-        assert len(keyframe_keys) == 2, (
-            f"expected two keyframe entries for two same-name clips, got "
-            f"{keyframe_keys}"
-        )
-        assert all(k.startswith("Walk") for k in keyframe_keys), keyframe_keys
+        # No animation script of any kind for unsupported humanoid clips.
+        assert result.generated_scripts == [], result.generated_scripts
 
-        # The collision is surfaced to UNCONVERTED so the user knows.
+        # Both clips are surfaced as skeletal/unsupported.
+        skeletal = [
+            entry for entry in result.unconverted
+            if entry.get("category") == "animation_clip"
+            and "skeletal" in entry.get("reason", "").lower()
+        ]
+        assert len(skeletal) == 2, result.unconverted
+
+        # The duplicate-name collision is also still surfaced.
         clip_collisions = [
             entry for entry in result.unconverted
             if entry.get("category") == "animation_clip"
@@ -2383,131 +2172,6 @@ class TestPhase45Routing:
             f"expected an UNCONVERTED entry for the duplicate clip name, "
             f"got {result.unconverted}"
         )
-
-    def test_same_name_clips_blend_tree_keys_match_keyframes(
-        self, tmp_path: Path
-    ) -> None:
-        """When a blend tree references two same-named clips, the
-        emitted ``blendTrees[*].clips[*].clip`` values must match keys
-        present in the ``keyframes`` dict — otherwise the runtime
-        looks up a name nothing emitted and silently plays nothing."""
-        assets = tmp_path / "Assets"
-        assets.mkdir()
-
-        # Two humanoid "Walk" clips at distinct paths.
-        for fname, guid in (("WalkA.anim", "a" * 32), ("WalkB.anim", "b" * 32)):
-            (assets / fname).write_text(textwrap.dedent("""\
-                %YAML 1.1
-                %TAG !u! tag:unity3d.com,2011:
-                --- !u!74 &7400000
-                AnimationClip:
-                  m_Name: Walk
-                  m_SampleRate: 30
-                  m_AnimationClipSettings:
-                    m_StartTime: 0
-                    m_StopTime: 1.0
-                    m_LoopTime: 1
-                  m_PositionCurves:
-                  - curve:
-                      m_Curve:
-                      - time: 0
-                        value: {x: 0, y: 0, z: 0}
-                      - time: 1
-                        value: {x: 1, y: 0, z: 0}
-                    path: Hips
-                  m_RotationCurves: []
-                  m_EulerCurves: []
-                  m_ScaleCurves: []
-                """))
-            (assets / fname).with_suffix(".anim.meta").write_text(
-                f"fileFormatVersion: 2\nguid: {guid}\n"
-            )
-
-        # State 1: directly references Walk-A (gets into clips_by_guid).
-        # State 2: blend tree referencing both Walks. Blend-tree leaf
-        # resolution registers Walk-A as the state's fallback clip_guid;
-        # State 1 already registers Walk-A. Walk-B reaches keyframes only
-        # via its own state. State 3 directly references Walk-B so both
-        # clips end up in humanoid_clips.
-        ctrl = assets / "Locomotion.controller"
-        ctrl.write_text(textwrap.dedent(f"""\
-            %YAML 1.1
-            %TAG !u! tag:unity3d.com,2011:
-            --- !u!91 &9100000
-            AnimatorController:
-              m_Name: Locomotion
-              m_AnimatorParameters:
-              - m_Name: Speed
-                m_Type: 1
-              m_AnimatorLayers:
-              - serializedVersion: 5
-                m_Name: Base Layer
-                m_StateMachine:
-                  fileID: 200
-            --- !u!1107 &200
-            AnimatorStateMachine:
-              m_ChildStates:
-              - m_State: {{fileID: 300}}
-              - m_State: {{fileID: 301}}
-              m_DefaultState: {{fileID: 300}}
-            --- !u!1102 &300
-            AnimatorState:
-              m_Name: Move
-              m_Motion: {{fileID: 400}}
-            --- !u!1102 &301
-            AnimatorState:
-              m_Name: WalkB_Direct
-              m_Motion:
-                fileID: 7400000
-                guid: {"b" * 32}
-                type: 2
-            --- !u!206 &400
-            BlendTree:
-              m_Name: MoveBlend
-              m_BlendType: 0
-              m_BlendParameter: Speed
-              m_Childs:
-              - m_Threshold: 0
-                m_Motion:
-                  guid: {"a" * 32}
-              - m_Threshold: 1
-                m_Motion:
-                  guid: {"b" * 32}
-            """))
-
-        from unity.guid_resolver import build_guid_index
-        guid_index = build_guid_index(tmp_path)
-        result = convert_animations(tmp_path, guid_index=guid_index)
-
-        assert len(result.animation_data_modules) == 1
-        _, module_source = result.animation_data_modules[0]
-
-        import json
-        json_start = module_source.index("[==[") + 4
-        json_end = module_source.rindex("]==]")
-        data = json.loads(module_source[json_start:json_end])
-
-        keyframe_keys = set(data["keyframes"].keys())
-        assert len(keyframe_keys) == 2, keyframe_keys
-
-        bt_clip_names = [
-            entry["clip"]
-            for bt in data["controller"].get("blendTrees", {}).values()
-            for entry in bt["clips"]
-        ]
-        assert len(bt_clip_names) == 2, bt_clip_names
-        # Every blend-tree clip reference must point at a real keyframe key.
-        # Without per-controller disambiguated clip-name resolution, both
-        # blend-tree entries would carry the bare "Walk" name and miss the
-        # disambiguated "Walk__<hash>" keyframe keys.
-        missing = [n for n in bt_clip_names if n not in keyframe_keys]
-        assert not missing, (
-            f"blend-tree references {missing} have no matching keyframe "
-            f"entry; keyframes={sorted(keyframe_keys)}"
-        )
-        # Both references must be distinct so the two clips actually play
-        # at the two different thresholds.
-        assert len(set(bt_clip_names)) == 2, bt_clip_names
 
     def test_binary_controller_emits_unconverted_entry(self, tmp_path: Path) -> None:
         """Phase 4.5b: binary .controller files surface in UNCONVERTED.md."""
@@ -2737,18 +2401,18 @@ class TestPhase45Routing:
         assert "inline-over-runtime-wrappers.md" in source
 
     def test_parsed_scenes_scene_prefix_applied(self, tmp_path: Path) -> None:
-        """Scene-scoped names: modules get prefixed by the scene stem."""
+        """Scene-scoped names: tween scripts get prefixed by the scene stem."""
         from core.unity_types import ParsedScene
         assets = tmp_path / "Assets"
         assets.mkdir()
-        # Humanoid clip so we emit JSON.
-        anim = assets / "Walk.anim"
+        # Transform-only clip (non-humanoid) so it emits an inline tween.
+        anim = assets / "Spin.anim"
         anim.write_text(textwrap.dedent("""\
             %YAML 1.1
             %TAG !u! tag:unity3d.com,2011:
             --- !u!74 &1
             AnimationClip:
-              m_Name: Walk
+              m_Name: Spin
               m_SampleRate: 30
               m_AnimationClipSettings:
                 m_StartTime: 0
@@ -2759,7 +2423,7 @@ class TestPhase45Routing:
                   m_Curve:
                   - time: 0
                     value: {x: 0, y: 0, z: 0}
-                path: Hips
+                path: Spinner
               m_RotationCurves: []
               m_EulerCurves: []
               m_ScaleCurves: []
@@ -2784,7 +2448,7 @@ class TestPhase45Routing:
               m_DefaultState: {{fileID: 300}}
             --- !u!1102 &300
             AnimatorState:
-              m_Name: Walk
+              m_Name: Spin
               m_Motion:
                 fileID: 7400000
                 guid: {"a" * 32}
@@ -2803,8 +2467,8 @@ class TestPhase45Routing:
         result = convert_animations(
             tmp_path, guid_index=guid_index, parsed_scenes=[scene_obj],
         )
-        module_names = [name for name, _ in result.animation_data_modules]
-        assert any(n == "AnimationData_Level1_Locomotion" for n in module_names), module_names
+        script_names = [name for name, _ in result.generated_scripts]
+        assert any(n.startswith("Anim_Level1_Locomotion") for n in script_names), script_names
 
 
 class TestPhase58PrefabControllerAggregation:
@@ -3853,318 +3517,3 @@ class TestPhase59PrefabScopedTweenScripts:
         # Base controller is no longer referenced.
         assert "c" * 32 not in variant.referenced_animator_controller_guids
 
-
-# ===========================================================================
-# PR2 (character-animation plan): tween backend end-to-end
-# ===========================================================================
-
-
-def _build_humanoid_controller_project(tmp_path: Path) -> tuple[Path, str]:
-    """Write a minimal Unity project with one humanoid clip + controller.
-
-    The clip touches the ``Hips`` bone so it routes through
-    character_animator (animation_data module + bootstrap), not inline
-    TweenService. Returns (project_root, controller_guid).
-    """
-    assets = tmp_path / "Assets"
-    assets.mkdir(exist_ok=True)
-    clip_guid = "c" * 32
-    ctrl_guid = "d" * 32
-
-    (assets / "Walk.anim").write_text(textwrap.dedent("""\
-        %YAML 1.1
-        %TAG !u! tag:unity3d.com,2011:
-        --- !u!74 &7400000
-        AnimationClip:
-          m_Name: Walk
-          m_SampleRate: 30
-          m_AnimationClipSettings:
-            m_StartTime: 0
-            m_StopTime: 1.0
-            m_LoopTime: 1
-          m_PositionCurves:
-          - curve:
-              m_Curve:
-              - time: 0
-                value: {x: 0, y: 0, z: 0}
-              - time: 1
-                value: {x: 1, y: 0, z: 0}
-            path: Hips
-          m_RotationCurves: []
-          m_EulerCurves: []
-          m_ScaleCurves: []
-        """))
-    (assets / "Walk.anim.meta").write_text(
-        f"fileFormatVersion: 2\nguid: {clip_guid}\n"
-    )
-
-    (assets / "Hero.controller").write_text(textwrap.dedent(f"""\
-        %YAML 1.1
-        %TAG !u! tag:unity3d.com,2011:
-        --- !u!91 &9100000
-        AnimatorController:
-          m_Name: Hero
-          m_AnimatorParameters:
-          - m_Name: Speed
-            m_Type: 1
-            m_DefaultFloat: 0
-          m_AnimatorLayers:
-          - m_Name: Base Layer
-            m_StateMachine: {{fileID: 200}}
-        --- !u!1107 &200
-        AnimatorStateMachine:
-          m_ChildStates:
-          - m_State: {{fileID: 301}}
-          m_DefaultState: {{fileID: 301}}
-        --- !u!1102 &301
-        AnimatorState:
-          m_Name: Walk
-          m_Motion:
-            fileID: 7400000
-            guid: {clip_guid}
-            type: 2
-        """))
-    (assets / "Hero.controller.meta").write_text(
-        f"fileFormatVersion: 2\nguid: {ctrl_guid}\n"
-    )
-    return tmp_path, ctrl_guid
-
-
-class TestControllerBootstrapCodegen:
-    """PR2 item 4/6: per-controller bootstrap Script generation + scoping."""
-
-    def test_bootstrap_requires_runtime_and_data_module(self) -> None:
-        src = generate_controller_bootstrap("AnimationData_Hero", "Hero")
-        assert 'FindFirstChild("CharacterAnimator")' in src
-        assert 'FindFirstChild("AnimationData_Hero")' in src
-        assert "require(CharacterAnimatorModule)" in src
-        assert "require(AnimationDataModule)" in src
-
-    def test_bootstrap_instantiates_registers_and_ticks(self) -> None:
-        src = generate_controller_bootstrap("AnimationData_Hero", "Hero")
-        assert "CharacterAnimator.new(animationData.controller, rig)" in src
-        assert "CharacterAnimator.Register(rig, instance)" in src
-        assert "instance:LoadKeyframes(animationData.keyframes)" in src
-        assert "RunService.Heartbeat:Connect" in src
-        assert "instance:Update(dt)" in src
-
-    def test_bootstrap_scene_scoped_uses_workspace_search(self) -> None:
-        src = generate_controller_bootstrap(
-            "AnimationData_Hero", "Hero", prefab_scoped=False,
-        )
-        assert 'workspace:FindFirstChild("Hero", true)' in src
-        assert "script.Parent" not in src
-
-    def test_bootstrap_prefab_scoped_prefers_script_parent(self) -> None:
-        """Mirror generate_tween_script's prefab binding: script.Parent
-        first, workspace fallback after — and in that order."""
-        src = generate_controller_bootstrap(
-            "AnimationData_Hero", "Hero", prefab_scoped=True,
-        )
-        assert "script.Parent" in src
-        assert "workspace:FindFirstChild" in src
-        assert src.index("script.Parent") < src.index("workspace:FindFirstChild")
-
-    def test_convert_animations_emits_bootstrap_for_humanoid_controller(
-        self, tmp_path: Path,
-    ) -> None:
-        from unity.guid_resolver import build_guid_index
-
-        project, _ = _build_humanoid_controller_project(tmp_path)
-        guid_index = build_guid_index(project)
-        result = convert_animations(project, guid_index=guid_index)
-
-        # The humanoid controller emits an AnimationData_* module ...
-        module_names = [n for n, _ in result.animation_data_modules]
-        assert "AnimationData_Hero" in module_names
-        # ... and a paired bootstrap Script.
-        script_names = [n for n, _ in result.generated_scripts]
-        assert "AnimBootstrap_Hero" in script_names
-        bootstrap = next(
-            s for n, s in result.generated_scripts if n == "AnimBootstrap_Hero"
-        )
-        assert 'FindFirstChild("AnimationData_Hero")' in bootstrap
-        # Scene-scoped (no parsed_scenes) → no script_scopes entry.
-        assert "AnimBootstrap_Hero" not in result.script_scopes
-
-    def test_bootstrap_prefab_scoped_recorded_in_script_scopes(
-        self, tmp_path: Path,
-    ) -> None:
-        from core.unity_types import (
-            ParsedScene,
-            PrefabInstanceData,
-            PrefabLibrary,
-            PrefabTemplate,
-        )
-        from unity.guid_resolver import build_guid_index
-        from unity.prefab_parser import aggregate_prefab_controller_refs
-
-        project, ctrl_guid = _build_humanoid_controller_project(tmp_path)
-        prefab = PrefabTemplate(
-            prefab_path=project / "Assets" / "Hero.prefab",
-            name="Hero",
-            referenced_animator_controller_guids={ctrl_guid},
-        )
-        library = PrefabLibrary(
-            prefabs=[prefab],
-            by_name={"Hero": prefab},
-            by_guid={"hero" + "0" * 28: prefab},
-        )
-        scene = ParsedScene(
-            scene_path=project / "Assets" / "Level1.unity",
-            prefab_instances=[PrefabInstanceData(
-                file_id="500",
-                source_prefab_guid="hero" + "0" * 28,
-                source_prefab_file_id="0",
-                transform_parent_file_id="0",
-                modifications=[],
-            )],
-        )
-        aggregate_prefab_controller_refs(scene, library)
-        guid_index = build_guid_index(project)
-        result = convert_animations(
-            project,
-            guid_index=guid_index,
-            parsed_scenes=[scene],
-            prefab_library=library,
-        )
-        # Prefab-scoped bootstrap: name carries the prefab prefix and the
-        # scope is recorded so the pipeline reparents it under the template.
-        assert "AnimBootstrap_Hero_Hero" in result.script_scopes
-        assert result.script_scopes["AnimBootstrap_Hero_Hero"] == "Hero"
-        bootstrap = next(
-            s for n, s in result.generated_scripts
-            if n == "AnimBootstrap_Hero_Hero"
-        )
-        assert "script.Parent" in bootstrap
-
-
-class TestTweenBackendDataContract:
-    """PR2 end-to-end: the humanoid path must emit AnimationData with real
-    bone keyframes, and the controller state's ``motion`` must resolve to a
-    key that exists in that keyframes dict.
-
-    Trash Dash end-to-end validation surfaced the gap this closes: a
-    controller can route through the CharacterAnimator path yet emit
-    ``bones: {}`` (Trash Dash's only converted controller was a UI
-    animation), and the existing bootstrap test only checked the Script was
-    emitted, not that the data behind it is coherent. The fixture
-    deliberately names the state (``Locomotion``) differently from its clip
-    (``WalkCycle``) so the motion-key resolution (PR2 item 1) is genuinely
-    exercised, not satisfied by an accidental name collision.
-    """
-
-    def test_humanoid_controller_emits_bones_and_resolves_motion_key(
-        self, tmp_path: Path,
-    ) -> None:
-        import json
-        from unity.guid_resolver import build_guid_index
-
-        assets = tmp_path / "Assets"
-        assets.mkdir()
-        clip_guid = "e" * 32
-
-        (assets / "WalkCycle.anim").write_text(textwrap.dedent("""\
-            %YAML 1.1
-            %TAG !u! tag:unity3d.com,2011:
-            --- !u!74 &7400000
-            AnimationClip:
-              m_Name: WalkCycle
-              m_SampleRate: 30
-              m_AnimationClipSettings:
-                m_StartTime: 0
-                m_StopTime: 1.0
-                m_LoopTime: 1
-              m_PositionCurves:
-              - curve:
-                  m_Curve:
-                  - time: 0
-                    value: {x: 0, y: 0, z: 0}
-                  - time: 0.5
-                    value: {x: 1, y: 2, z: 0}
-                  - time: 1
-                    value: {x: 0, y: 0, z: 0}
-                path: Hips
-              - curve:
-                  m_Curve:
-                  - time: 0
-                    value: {x: 0, y: 1, z: 0}
-                  - time: 1
-                    value: {x: 0, y: 3, z: 0}
-                path: Spine
-              m_RotationCurves: []
-              m_EulerCurves: []
-              m_ScaleCurves: []
-            """))
-        (assets / "WalkCycle.anim.meta").write_text(
-            f"fileFormatVersion: 2\nguid: {clip_guid}\n"
-        )
-        (assets / "Climber.controller").write_text(textwrap.dedent(f"""\
-            %YAML 1.1
-            %TAG !u! tag:unity3d.com,2011:
-            --- !u!91 &9100000
-            AnimatorController:
-              m_Name: Climber
-              m_AnimatorParameters: []
-              m_AnimatorLayers:
-              - m_Name: Base Layer
-                m_StateMachine: {{fileID: 200}}
-            --- !u!1107 &200
-            AnimatorStateMachine:
-              m_ChildStates:
-              - m_State: {{fileID: 301}}
-              m_DefaultState: {{fileID: 301}}
-            --- !u!1102 &301
-            AnimatorState:
-              m_Name: Locomotion
-              m_Motion:
-                fileID: 7400000
-                guid: {clip_guid}
-                type: 2
-            """))
-        (assets / "Climber.controller.meta").write_text(
-            "fileFormatVersion: 2\nguid: " + "f" * 32 + "\n"
-        )
-
-        guid_index = build_guid_index(tmp_path)
-        result = convert_animations(tmp_path, guid_index=guid_index)
-
-        # The AnimationData_* module carries the controller graph + keyframes.
-        data_mod = next(
-            (src for n, src in result.animation_data_modules
-             if n == "AnimationData_Climber"),
-            None,
-        )
-        assert data_mod is not None, [n for n, _ in result.animation_data_modules]
-        payload = json.loads(data_mod.split("[==[", 1)[1].rsplit("]==]", 1)[0])
-
-        # Keyframes carry real bone tracks — not an empty bones dict (the
-        # exact shape Trash Dash's UI controller produced).
-        keyframes = payload["keyframes"]
-        assert keyframes, "keyframes dict is empty"
-        clip_kf = next(iter(keyframes.values()))
-        bones = clip_kf["bones"]
-        assert set(bones) >= {"Hips", "Spine"}, sorted(bones)
-        assert len(bones["Hips"]) >= 2 and "cf" in bones["Hips"][0]
-
-        # Motion-key contract: the state's `motion` must be a key present in
-        # the keyframes dict (the clip display name) — NOT the state name.
-        state = payload["controller"]["states"][0]
-        assert state["name"] == "Locomotion"
-        assert state["motion"] in keyframes, (
-            f"motion {state['motion']!r} not in keyframes {sorted(keyframes)}"
-        )
-        assert state["motion"] != "Locomotion"  # resolved to the clip name
-
-        # A coherent bootstrap is paired with the module.
-        bootstrap = next(
-            (src for n, src in result.generated_scripts
-             if n == "AnimBootstrap_Climber"),
-            None,
-        )
-        assert bootstrap is not None
-        assert 'FindFirstChild("CharacterAnimator")' in bootstrap
-        assert 'FindFirstChild("AnimationData_Climber")' in bootstrap
-        assert "CharacterAnimator.new(animationData.controller, rig)" in bootstrap
-        assert "CharacterAnimator.Register(rig, instance)" in bootstrap
-        assert "Heartbeat" in bootstrap

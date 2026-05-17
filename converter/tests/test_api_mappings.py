@@ -51,42 +51,29 @@ def test_no_duplicate_keys(dict_name: str) -> None:
         pytest.fail(f"Duplicate keys in {dict_name}:\n{msg}")
 
 
-class TestAnimatorImperativeOps:
-    """PR2: imperative Animator.* ops dispatch to the CharacterAnimator
-    registry; scalar param ops stay on rig attributes."""
+class TestAnimatorOps:
+    """Skeletal animation is unsupported (see docs/UNSUPPORTED.md): there is
+    no animation runtime. All Animator.* ops degrade to harmless attribute
+    reads/writes so transpiled code still produces valid Luau."""
 
-    def test_imperative_ops_emit_dispatch(self) -> None:
+    def test_all_animator_ops_degrade_to_attributes(self) -> None:
         from converter.api_mappings import API_CALL_MAP
 
         for op in (
+            "Animator.SetBool",
+            "Animator.SetFloat",
+            "Animator.SetInteger",
             "Animator.SetTrigger",
             "Animator.ResetTrigger",
             "Animator.Play",
             "Animator.CrossFade",
             "Animator.CrossFadeInFixedTime",
         ):
-            mapping = API_CALL_MAP[op]
-            assert "animatorDispatch(" in mapping, (
-                f"{op} must route through the animatorDispatch helper, "
-                f"got {mapping!r}"
-            )
-            # No leftover placeholder AnimationTrack:Play() mapping.
-            assert mapping != "AnimationTrack:Play()", op
-
-    def test_scalar_param_ops_stay_on_attributes(self) -> None:
-        from converter.api_mappings import API_CALL_MAP
-
-        for op in ("Animator.SetBool", "Animator.SetFloat", "Animator.SetInteger"):
             assert API_CALL_MAP[op] == ":SetAttribute", op
         for op in ("Animator.GetBool", "Animator.GetFloat", "Animator.GetInteger"):
             assert API_CALL_MAP[op] == ":GetAttribute", op
 
-    def test_animator_dispatch_helper_defined(self) -> None:
+    def test_no_animator_dispatch_helper(self) -> None:
         from converter.api_mappings import UTILITY_FUNCTIONS
 
-        assert "animatorDispatch" in UTILITY_FUNCTIONS
-        helper = UTILITY_FUNCTIONS["animatorDispatch"]
-        assert "function animatorDispatch" in helper
-        # Resolves the runtime module and calls the registry dispatcher.
-        assert 'FindFirstChild("CharacterAnimator")' in helper
-        assert ".Dispatch(host, op, ...)" in helper
+        assert "animatorDispatch" not in UTILITY_FUNCTIONS
