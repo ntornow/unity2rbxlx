@@ -972,6 +972,36 @@ def upload(output_dir: str, api_key: str | None,
 
     rbxl_for_upload = out / "converted_place.rbxl"
     rbxlx_for_upload = out / "converted_place.rbxlx"
+    # upload constructs the pipeline with ``skip_binary_rbxl=True`` to avoid
+    # re-running the (slow-ish) xml→binary step every publish. That's fine
+    # when the on-disk ``.rbxl`` is current — but if a prior ``assemble``
+    # wrote a stale ``.rbxl`` and a more recent pipeline pass (or a hand-
+    # patch landing the xml writer fix) refreshed only the ``.rbxlx``, we
+    # would publish the stale binary and ship pre-fix property encodings
+    # (e.g. TextSize as TYPE_INT32 vs TYPE_FLOAT). Detect mtime skew and
+    # regenerate the binary from the up-to-date xml before publishing.
+    if (
+        rbxl_for_upload.exists()
+        and rbxlx_for_upload.exists()
+        and rbxl_for_upload.stat().st_mtime < rbxlx_for_upload.stat().st_mtime
+    ):
+        try:
+            from roblox.rbxl_binary_writer import xml_to_binary
+            xml_to_binary(rbxlx_for_upload)
+            log.info(
+                "[upload] Regenerated %s from newer %s "
+                "(prior .rbxl was older than the .rbxlx)",
+                rbxl_for_upload.name, rbxlx_for_upload.name,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning(
+                "[upload] Could not refresh stale .rbxl from .rbxlx (%s); "
+                "publishing the .rbxlx instead.", exc,
+            )
+            try:
+                rbxl_for_upload.unlink()
+            except OSError:
+                pass
     file_for_upload = rbxl_for_upload if rbxl_for_upload.exists() else (
         rbxlx_for_upload if rbxlx_for_upload.exists() else None
     )

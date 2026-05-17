@@ -274,6 +274,36 @@ class TestFpsWeaponMountInjection:
         run_packs([s])
         assert s.source == original
 
+    def test_injection_matches_real_transpiler_shape(self) -> None:
+        """Regression: real AI-transpile output uses Luau camelCase
+        function statements (``function getRifle()``), not the PascalCase
+        table-field form (``GetRifle = function()``) used in the original
+        stub fixture. Before this case was supported, the WeaponMount
+        pack silently no-oped on real SimpleFPS conversions, shipping a
+        broken AI-stubbed equip path and an invisible/floating rifle.
+        """
+        s = RbxScript(
+            name="Player",
+            source=(
+                "local riflePrefab = nil\n"
+                "local gotWeapon = false\n"
+                "local _fpsRifle, _fpsRiflePrimary\n"  # mimic transpiler decls
+                "function getRifle()\n"
+                "    -- AI stub does not actually clone the rifle\n"
+                "    gotWeapon = true\n"
+                "end\n"
+                "RunService.RenderStepped:Connect(function(dt)\n"
+                "end)\n"
+                "function getItem(name) end\n"
+            ),
+            script_type="LocalScript",
+        )
+        fixes = packs_module._inject_fps_weapon_mounts([s])
+        assert fixes == 1, "WeaponMount pack must fire on camelCase function-statement shape"
+        assert '_fpsRifle = rifle' in s.source, "rifle instance var must be assigned"
+        assert 'rp:Clone' in s.source
+        assert 'PivotTo(workspace.CurrentCamera.CFrame' in s.source
+
 
 class TestPickupRemoteEventServerAttr:
     """The ``pickup_remote_event_server`` pack rewrites
@@ -2810,3 +2840,379 @@ class TestTouchCallbackRangeStringBlanking:
         _, body_end, _ = ranges[0]
         last_end = src.rfind("end")
         assert body_end == last_end
+
+
+class TestLocalScriptApiShim:
+    """The ``localscript_api_shim`` pack emits a sibling
+    ``<Name>Shared`` ModuleScript whenever a LocalScript exposes a
+    public API table that another script `require()`s. Roblox refuses
+    to `require` a LocalScript, so without the shim every consumer
+    dies with 'Attempted to call require with invalid argument(s)'.
+    """
+
+    def _player_localscript(self) -> RbxScript:
+        """Canonical post-AI-transpile Player.luau shape: a LocalScript
+        with constants, a boolean-state accessor, and an assignment to
+        the backing var the accessor reads."""
+        return RbxScript(
+            name="Player",
+            source=(
+                "local Player = {}\n"
+                "local _maxHealth = 100\n"
+                "local _maxAmmo = 250\n"
+                "local gotKey = false\n"
+                "function Player.maxHealth() return _maxHealth end\n"
+                "function Player.maxAmmo() return _maxAmmo end\n"
+                "function Player.hasKey() return gotKey end\n"
+                "function getItem(name)\n"
+                "    if name == 'Key' then\n"
+                "        gotKey = true\n"
+                "    end\n"
+                "end\n"
+            ),
+            script_type="LocalScript",
+        )
+
+    def _consumer_shape_a(self) -> RbxScript:
+        """Shape A: direct `require(script.Parent.Player)`."""
+        return RbxScript(
+            name="HudControl",
+            source=(
+                "local Players = game:GetService('Players')\n"
+                "local Player = require(script.Parent.Player)\n"
+                "print(Player.maxAmmo(), Player.maxHealth())\n"
+            ),
+            script_type="LocalScript",
+        )
+
+    def _consumer_shape_b(self) -> RbxScript:
+        """Shape B: defensive descendant-loop fallback."""
+        return RbxScript(
+            name="Door",
+            source=(
+                "local Players = game:GetService('Players')\n"
+                "local playerModule\n"
+                "for _, d in ipairs(game:GetDescendants()) do\n"
+                "    if d.Name == \"Player\" and d:IsA(\"ModuleScript\") then\n"
+                "        playerModule = require(d)\n"
+                "        break\n"
+                "    end\n"
+                "end\n"
+                "local function playerHasKey()\n"
+                "    if playerModule then return playerModule.hasKey() end\n"
+                "    return false\n"
+                "end\n"
+            ),
+            script_type="Script",
+        )
+
+    def test_detector_fires_on_localscript_require(self) -> None:
+        from converter.script_coherence_packs import (
+            _detect_localscript_api_shim,
+        )
+        scripts = [self._player_localscript(), self._consumer_shape_a()]
+        assert _detect_localscript_api_shim(scripts) is True
+
+    def test_detector_skips_when_no_consumer(self) -> None:
+        from converter.script_coherence_packs import (
+            _detect_localscript_api_shim,
+        )
+        scripts = [self._player_localscript()]
+        assert _detect_localscript_api_shim(scripts) is False
+
+    def test_emits_shim_module_in_replicated_storage(self) -> None:
+        scripts = [self._player_localscript(), self._consumer_shape_a()]
+        fixes = packs_module._inject_localscript_api_shim(scripts)
+        assert fixes >= 1
+        # A new ModuleScript "PlayerShared" must be in the list.
+        shim = next((s for s in scripts if s.name == "PlayerShared"), None)
+        assert shim is not None
+        assert shim.script_type == "ModuleScript"
+        assert shim.parent_path == "ReplicatedStorage"
+        # Constants are inlined.
+        assert "function PlayerShared.maxHealth() return 100 end" in shim.source
+        assert "function PlayerShared.maxAmmo() return 250 end" in shim.source
+        # Boolean state is character-attribute-backed.
+        assert "PlayerShared.hasKey(character)" in shim.source
+        assert 'c:GetAttribute("hasKey") == true' in shim.source
+
+    def test_rewrites_shape_a_consumer(self) -> None:
+        consumer = self._consumer_shape_a()
+        scripts = [self._player_localscript(), consumer]
+        packs_module._inject_localscript_api_shim(scripts)
+        assert "require(script.Parent.Player)" not in consumer.source
+        assert 'WaitForChild("PlayerShared")' in consumer.source
+        # The marker is in place for idempotency.
+        assert "_AutoLocalScriptShim" in consumer.source
+
+    def test_rewrites_shape_a_waitforchild_variant(self) -> None:
+        """Regression: real AI-transpile output for HudControl emitted
+        ``require(script.Parent:WaitForChild("Player"))`` — a nested-paren
+        Shape A variant. A flat character-class regex stops at the inner
+        ``)`` and leaves a malformed outer ``require(...)``. The pack
+        must scan paren depth so the rewrite is well-formed.
+        """
+        consumer = RbxScript(
+            name="HudControl",
+            source=(
+                "local Player = require(script.Parent:WaitForChild(\"Player\"))\n"
+                "print(Player.maxHealth())\n"
+            ),
+            script_type="LocalScript",
+        )
+        scripts = [self._player_localscript(), consumer]
+        packs_module._inject_localscript_api_shim(scripts)
+        # The original WaitForChild-wrapped require is gone.
+        assert "script.Parent:WaitForChild(\"Player\")" not in consumer.source
+        # Replaced with the shim require, balanced parens intact.
+        assert 'WaitForChild("PlayerShared")' in consumer.source
+        # Source still parses as Luau (no orphan ``)`` from a malformed match).
+        # Cheap structural check: paren counts balance.
+        assert consumer.source.count("(") == consumer.source.count(")")
+
+    def test_rewrites_shape_b_consumer(self) -> None:
+        consumer = self._consumer_shape_b()
+        scripts = [self._player_localscript(), consumer]
+        packs_module._inject_localscript_api_shim(scripts)
+        # The descendant-loop is gone.
+        assert "GetDescendants()" not in consumer.source
+        assert 'd:IsA("ModuleScript")' not in consumer.source
+        # And replaced with a direct require to the shim.
+        assert 'WaitForChild("PlayerShared")' in consumer.source
+        assert "_AutoLocalScriptShim" in consumer.source
+
+    def test_mirrors_backing_var_writes_in_source(self) -> None:
+        """When the exporter has `function Player.hasKey() return gotKey end`
+        and `gotKey = true` somewhere, the pack injects an attribute mirror
+        so cross-script shim reads see the same value."""
+        exporter = self._player_localscript()
+        scripts = [exporter, self._consumer_shape_b()]
+        packs_module._inject_localscript_api_shim(scripts)
+        # The mirror line is right after the assignment.
+        assert 'character:SetAttribute("hasKey", true)' in exporter.source
+        assert "_AutoLocalScriptShimMirror" in exporter.source
+
+    def test_idempotent_on_second_pass(self) -> None:
+        scripts = [self._player_localscript(), self._consumer_shape_a()]
+        first = packs_module._inject_localscript_api_shim(scripts)
+        second = packs_module._inject_localscript_api_shim(scripts)
+        assert first >= 1
+        assert second == 0
+
+    def test_no_op_when_no_localscript_exporter(self) -> None:
+        scripts = [self._consumer_shape_a()]
+        original_count = len(scripts)
+        fixes = packs_module._inject_localscript_api_shim(scripts)
+        assert fixes == 0
+        assert len(scripts) == original_count
+
+
+class TestTemplateCloneVisibility:
+    """The ``template_clone_visibility`` pack adds a visibility + weld
+    fixup after every ``local x = cloneTemplate(...)`` line. Without it,
+    cloned prefab BaseParts inherit Transparency=1 from the hidden
+    template and the spawned weapon/effect is invisible in-game.
+    """
+
+    def _player_clone_rifle(self) -> RbxScript:
+        """Canonical post-AI-transpile getRifle shape: clones from the
+        Templates helper and re-parents to a weapon slot, with no per-
+        part visibility / weld setup."""
+        return RbxScript(
+            name="Player",
+            source=(
+                "local function cloneTemplate(name) end\n"
+                "local weaponSlot = Instance.new('Part')\n"
+                "function getRifle()\n"
+                "    local rifle = cloneTemplate(\"Rifle\")\n"
+                "    if rifle then\n"
+                "        if rifle:IsA('Model') then rifle:ScaleTo(0.2) end\n"
+                "        rifle.Parent = weaponSlot\n"
+                "    end\n"
+                "end\n"
+            ),
+            script_type="LocalScript",
+        )
+
+    def test_detector_fires_on_cloneTemplate_call(self) -> None:
+        from converter.script_coherence_packs import (
+            _detect_template_clone_visibility,
+        )
+        assert _detect_template_clone_visibility([self._player_clone_rifle()]) is True
+
+    def test_injection_sets_transparency_and_welds(self) -> None:
+        s = self._player_clone_rifle()
+        fixes = packs_module._inject_template_clone_visibility([s])
+        assert fixes >= 1
+        # Marker present for idempotency.
+        assert "_AutoTemplateCloneVisibility" in s.source
+        # Visibility + collision + massless settings applied per part.
+        assert "_p.Transparency = 0" in s.source
+        assert "_p.CanCollide = false" in s.source
+        assert "_p.Massless = true" in s.source
+        # WeldConstraint binds sub-parts to the primary.
+        assert "WeldConstraint" in s.source
+
+    def test_detector_fires_on_FindFirstChild_Clone_shape(self) -> None:
+        """The AI sometimes inlines the lookup as
+        ``Templates:FindFirstChild("X"):Clone()`` rather than using the
+        helper. The pack must recognise both shapes."""
+        s = RbxScript(
+            name="Spawner",
+            source=(
+                "function spawn()\n"
+                "    local bullet = Templates:FindFirstChild(\"Bullet\"):Clone()\n"
+                "    bullet.Parent = workspace\n"
+                "end\n"
+            ),
+            script_type="Script",
+        )
+        from converter.script_coherence_packs import (
+            _detect_template_clone_visibility,
+        )
+        assert _detect_template_clone_visibility([s]) is True
+        fixes = packs_module._inject_template_clone_visibility([s])
+        assert fixes >= 1
+        assert "_AutoTemplateCloneVisibility" in s.source
+
+    def test_idempotent_on_second_pass(self) -> None:
+        s = self._player_clone_rifle()
+        first = packs_module._inject_template_clone_visibility([s])
+        second = packs_module._inject_template_clone_visibility([s])
+        assert first >= 1
+        assert second == 0
+
+    def test_skips_when_visibility_already_present(self) -> None:
+        """When a developer (or a prior pack) already set Transparency=0
+        on the cloned variable nearby, don't pile on another fixup."""
+        s = RbxScript(
+            name="Player",
+            source=(
+                "function getRifle()\n"
+                "    local rifle = cloneTemplate(\"Rifle\")\n"
+                "    if rifle then\n"
+                "        for _, p in rifle:GetDescendants() do\n"
+                "            if p:IsA('BasePart') then p.Transparency = 0 end\n"
+                "        end\n"
+                "    end\n"
+                "end\n"
+            ),
+            script_type="LocalScript",
+        )
+        fixes = packs_module._inject_template_clone_visibility([s])
+        assert fixes == 0
+
+    def test_no_op_on_unrelated_script(self) -> None:
+        s = RbxScript(
+            name="GameLogic",
+            source="local x = 1 return x",
+            script_type="ModuleScript",
+        )
+        original = s.source
+        fixes = packs_module._inject_template_clone_visibility([s])
+        assert fixes == 0
+        assert s.source == original
+
+
+class TestProximityTriggerFanout:
+    """The ``proximity_trigger_fanout`` pack rewrites the AI's narrowed
+    ``triggerPart.Touched`` binding into a multi-part fanout with
+    ancestor-based character lookup. Fixes the class of step-on-entity
+    triggers (mines, pickups, pressure plates) that don't fire because
+    the player touches the body geometry, not the invisible trigger
+    sphere — or that fire on the sphere but reject accessory-mounted
+    touches via the ``otherPart.Parent`` lookup.
+    """
+
+    def _mine_shape(self) -> RbxScript:
+        """Canonical post-AI-transpile Mine.luau, mirroring exactly the
+        shape that ships from this pipeline against SimpleFPS."""
+        return RbxScript(
+            name="Mine",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                "local container = script.Parent\n"
+                "local triggered = false\n"
+                "local explodeTime = 1\n"
+                "local function findTriggerPart(p) return p end\n"
+                "local function Explode() end\n"
+                "\n"
+                "local triggerPart = findTriggerPart(container)\n"
+                "if triggerPart then\n"
+                "\ttriggerPart.Touched:Connect(function(otherPart)\n"
+                "\t\tif triggered then return end\n"
+                "\t\tlocal player = Players:GetPlayerFromCharacter(otherPart.Parent)\n"
+                "\t\tif player then\n"
+                "\t\t\ttriggered = true\n"
+                "\t\t\ttask.delay(explodeTime, Explode)\n"
+                "\t\tend\n"
+                "\tend)\n"
+                "end\n"
+            ),
+            script_type="Script",
+        )
+
+    def test_detector_fires_on_mine_shape(self) -> None:
+        s = self._mine_shape()
+        from converter.script_coherence_packs import (
+            _detect_proximity_trigger_fanout,
+        )
+        assert _detect_proximity_trigger_fanout([s]) is True
+
+    def test_rewrite_replaces_single_binding_with_fanout(self) -> None:
+        s = self._mine_shape()
+        fixes = packs_module._inject_proximity_trigger_fanout([s])
+        assert fixes == 1
+        # Marker is in place for idempotency.
+        assert "_AutoProximityTriggerFanout" in s.source
+        # The named handler replaces the anonymous binding.
+        assert "local function _onProximityTouched(otherPart)" in s.source
+        # Both BasePart and Model branches of the fanout are emitted.
+        assert "container:IsA(\"BasePart\")" in s.source
+        assert "container:IsA(\"Model\")" in s.source
+        # The character lookup is rewritten to ancestor-based.
+        assert (
+            'Players:GetPlayerFromCharacter(otherPart:FindFirstAncestorWhichIsA("Model"))'
+            in s.source
+        )
+        # The original narrow binding pattern is gone.
+        assert "triggerPart.Touched:Connect" not in s.source
+        # Handler body content (specific to mine) is preserved.
+        assert "task.delay(explodeTime, Explode)" in s.source
+
+    def test_idempotent_on_second_pass(self) -> None:
+        s = self._mine_shape()
+        first = packs_module._inject_proximity_trigger_fanout([s])
+        second = packs_module._inject_proximity_trigger_fanout([s])
+        assert first == 1
+        assert second == 0
+
+    def test_no_op_on_unrelated_script(self) -> None:
+        """Scripts without the ``findTriggerPart`` + single-part Touched
+        pattern must not be mutated. Pickup-style code that already does
+        its own multi-part fanout should be left alone."""
+        s = RbxScript(
+            name="Pickup",
+            source=(
+                "local container = script.Parent\n"
+                "for _, c in container:GetChildren() do\n"
+                "    if c:IsA('BasePart') then\n"
+                "        c.Touched:Connect(function(other) end)\n"
+                "    end\n"
+                "end\n"
+            ),
+            script_type="Script",
+        )
+        original = s.source
+        fixes = packs_module._inject_proximity_trigger_fanout([s])
+        assert fixes == 0
+        assert s.source == original
+
+    # TODO: re-add a test for the BasePart-fallback intermediate-statement
+    # shape once the regex can be widened without triggering catastrophic
+    # backtracking on the post-pack source. The earlier widening used a
+    # non-greedy negative-lookahead between the resolution and the bind
+    # which interacted badly with downstream coherence-pass regexes on
+    # the larger post-injection scripts. The narrower v4 regex still
+    # handles Mine in fresh transpiles where the AI emits the bind
+    # directly after the resolution.

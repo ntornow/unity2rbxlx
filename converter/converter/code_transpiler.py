@@ -1435,12 +1435,34 @@ UI:
 Camera (FPS/First-Person):
 - Set `camera.CameraType = Enum.CameraType.Scriptable` before controlling the camera
 - **CRITICAL**: In Unity, the camera is a child of the player and auto-follows position/rotation. In Roblox, the camera is INDEPENDENT — you must explicitly position it at the character's head every frame.
-- Use `character:FindFirstChild("Head").Position + Vector3.new(0, 0.5, 0)` for camera position
+- Use `character:FindFirstChild("HumanoidRootPart").Position + Vector3.new(0, 1.5, 0)` for camera position — **NOT** `Head.Position`. The Head bone bobs every step under Roblox's default walking animation; tracking it propagates that bob into the camera and produces a visible per-step shiver. The HumanoidRootPart is the physics root and is animation-stable; offset upward by ~1.5 studs to land near eye level.
 - Track yaw (mouse X) and pitch (mouse Y) as separate angles, combine into camera CFrame:
   `camera.CFrame = CFrame.new(headPos) * CFrame.Angles(0, yawAngle, 0) * CFrame.Angles(pitchAngle, 0, 0)`
+- **Mouse look (canonical FPS pattern)**: read `UserInputService:GetMouseDelta()` every frame inside the RenderStepped callback — NOT `UserInputService.InputChanged` with `input.Delta`. `GetMouseDelta()` is purpose-built for FPS: it returns the accumulated pixel delta since the last call and is reliable while `MouseBehavior = LockCenter`. The `InputChanged` MouseMovement event with `LockCenter` is flaky and loses deltas under high frame rates.
+  ```lua
+  local MOUSE_RAD_PER_PIXEL = 0.006  -- tune; ~0.003-0.012 feels right
+  RunService.RenderStepped:Connect(function(dt)
+      local d = UserInputService:GetMouseDelta()
+      yawAngle = yawAngle - d.X * MOUSE_RAD_PER_PIXEL
+      pitchAngle = math.clamp(pitchAngle - d.Y * MOUSE_RAD_PER_PIXEL, math.rad(minAngle), math.rad(maxAngle))
+      -- ... then position camera from yaw/pitch
+  end)
+  ```
+  Do NOT translate Unity's `sensitivity * Time.deltaTime * Input.GetAxis("MouseX")` literally — Unity's `GetAxis("Mouse*")` returns a smoothed/calibrated value, not raw pixels, so applying the Unity sensitivity directly to Roblox raw deltas produces ~50x too-fast (or 0 if InputChanged drops deltas) rotation. The radians-per-pixel constant above is the right scale for raw deltas.
 - Do NOT modify `rootPart.CFrame` for rotation — this conflicts with Roblox's Humanoid movement controller
 - For camera-relative movement, compute direction from camera yaw:
   `local moveDir = (CFrame.Angles(0, yawAngle, 0) * inputDir).Unit; humanoid:Move(moveDir)`
+
+Character movement speed (CRITICAL — Unity m/s vs Roblox studs/s):
+- Unity expresses controller speed in **m/s** (e.g., `public float speed = 6;`); Roblox `Humanoid.WalkSpeed` is in **studs/sec**. The pipeline constant is `STUDS_PER_METER = 3.571`, so the canonical translation is:
+  ```lua
+  -- once, at character bind (onCharacter / CharacterAdded)
+  humanoid.WalkSpeed = speed * 3.571  -- studs/sec
+  humanoid.JumpHeight = jumpSpeed * 3.571
+  -- then every frame, pass a UNIT direction (magnitude <= 1) — never scale it by speed:
+  humanoid:Move(moveDirection)
+  ```
+- Do NOT emit `humanoid:Move(moveDir * speed)` or `humanoid:Move(moveDir * (speed / 16))`. `Humanoid:Move(direction)` takes a direction whose magnitude is clamped to 1; multiplying by speed has no effect, and dividing by 16 (a magic number that conflates Roblox default WalkSpeed with Unity m/s) yields an effective walk speed of ~0.375 × WalkSpeed = far too slow. Configure WalkSpeed once; pass unit direction every frame.
 
 Physics:
 - `Physics.Raycast(origin, dir, dist)` → `workspace:Raycast(origin, dir * dist, RaycastParams.new())`
@@ -1448,6 +1470,17 @@ Physics:
 - `Rigidbody.AddForce` → `part:ApplyImpulse(force)`
 - `Rigidbody.isKinematic` → `part.Anchored`
 - `Physics.OverlapSphere` → `workspace:GetPartBoundsInRadius(center, radius)`
+
+Distance & radius units (CRITICAL — Unity m vs Roblox studs):
+- Every Unity physics distance and radius is in **metres**: `Physics.OverlapSphere(p, r)`, `Physics.Raycast(o, d, maxDistance)`, `Physics.SphereCast`, `Vector3.Distance(a,b) < r`, `RaycastHit.distance`, `Collider.bounds.extents`. Roblox `workspace:GetPartBoundsInRadius`, `workspace:Raycast`, and any spatial comparison use **studs**.
+- Multiply every Unity metre value by `STUDS_PER_METER = 3.571` when translating, or emit the literal Lua constant inline:
+  ```lua
+  -- Unity: Physics.OverlapSphere(transform.position, 2)
+  local hit = workspace:GetPartBoundsInRadius(getPosition(), 2 * 3.571)
+  -- Unity: Physics.Raycast(o, d, 100)
+  local r = workspace:Raycast(o, d.Unit * (100 * 3.571), params)
+  ```
+- Do NOT leave literal Unity-metre numbers in the emitted Roblox code. A 2-metre explosion radius rendered as `, 2)` in Roblox studs reaches barely past the mine's own collider — the player's HumanoidRootPart sits ~3 studs above the floor and would be **outside** a 2-stud sphere centred on the mine. The damage call silently does nothing. Same failure mode applies to every Unity-metres-in-Roblox-studs translation — scale all of them.
 
 Events & Communication:
 - `UnityEvent.AddListener(cb)` → `event:Connect(cb)`

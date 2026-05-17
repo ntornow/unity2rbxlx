@@ -400,6 +400,19 @@ _PICKUP_TOUCHED_CODE = (
 )
 
 
+def _equip_function_variants(name: str) -> tuple[str, ...]:
+    """Name variants under which the AI transpiler may have emitted the
+    equip function. Unity ships PascalCase (``GetRifle``); the Luau
+    convention favours camelCase (``getRifle``), so the post-transpile
+    output uses the latter. We support both.
+    """
+    if not name:
+        return ()
+    pascal = name[:1].upper() + name[1:]
+    camel = name[:1].lower() + name[1:]
+    return (camel,) if pascal == camel else (pascal, camel)
+
+
 def _apply_weapon_mount(s: "RbxScript", mount: WeaponMount) -> bool:
     """Rewrite the AI-stubbed equip path for one weapon mount.
 
@@ -408,7 +421,8 @@ def _apply_weapon_mount(s: "RbxScript", mount: WeaponMount) -> bool:
     after all mounts have run.
     """
     marker = f"-- _FPS_{mount.marker_tag}"
-    if mount.equip_function not in s.source:
+    variants = _equip_function_variants(mount.equip_function)
+    if not any(v in s.source for v in variants):
         return False
     if marker in s.source:
         return False
@@ -422,16 +436,30 @@ def _apply_weapon_mount(s: "RbxScript", mount: WeaponMount) -> bool:
         f"local {mount.primary_var} = nil",
     )
 
+    # Match three emitted shapes from the AI transpiler:
+    #   1. ``GetRifle = function()`` (table-field / forward-decl assignment)
+    #   2. ``function getRifle()`` (top-level function statement, Luau idiom)
+    #   3. ``local function getRifle()`` (local function statement)
+    # Body extends until the sentinel-set line that follows.
+    name_alt = "|".join(re.escape(v) for v in variants)
     body_re = re.compile(
-        rf"({mount.equip_function} = function\(\))(.*?)"
-        rf"(\n\s*{mount.sentinel_var} = true)",
+        rf"((?:local\s+)?function\s+(?:{name_alt})\s*\(\s*\)|(?:{name_alt})\s*=\s*function\s*\(\s*\))"
+        rf"(.*?)"
+        rf"(\n\s*{mount.sentinel_var}\s*=\s*true)",
         re.DOTALL,
     )
     m = body_re.search(s.source)
     if m:
         alt = _prefab_alt_case(mount.prefab_name)
+        # Preserve the matched header verbatim. The injection target may
+        # have been `GetRifle = function()` (table-field form) or
+        # `function getRifle()` (function-statement form, Luau idiom).
+        # Re-emitting the same header keeps the existing test fixtures
+        # byte-identical while letting real transpiler output (which
+        # uses the lowercase function-statement form) be rewritten too.
+        matched_header = m.group(1)
         new_body = (
-            f'{mount.equip_function} = function()\n'
+            f'{matched_header}\n'
             f'    if {mount.sentinel_var} then return end\n'
             f'    local rp = workspace:FindFirstChild("{mount.prefab_name}", true)\n'
             f'        or workspace:FindFirstChild("{alt}", true)\n'
@@ -3417,4 +3445,869 @@ def _inject_player_damage_remote_event(scripts: list["RbxScript"]) -> int:
         fixes += 1
         log.info("  Emitted %s server router script", router_name)
 
+    return fixes
+
+
+# ---------------------------------------------------------------------------
+# Pack: localscript_api_shim
+# ---------------------------------------------------------------------------
+#
+# Unity allows any MonoBehaviour to call `OtherClass.Method()` on a peer
+# class. The AI transpiler translates this as a Luau `require(...)` of the
+# peer script — but Roblox's `require` only works on ModuleScripts.
+# When the peer is a LocalScript (e.g., the SimpleFPS Player class lives
+# in StarterPlayerScripts, and Door/HudControl/Machine try to call
+# `Player.hasKey()` / `Player.maxAmmo()`), the require throws
+# "Attempted to call require with invalid argument(s)" at runtime and
+# the consumer script dies before it wires up any events or triggers.
+#
+# Two consumer shapes ship from the AI transpiler:
+#   Shape A (direct):
+#       local Player = require(script.Parent.Player)
+#   Shape B (defensive ModuleScript search):
+#       local playerModule
+#       for _, d in ipairs(game:GetDescendants()) do
+#           if d.Name == "Player" and d:IsA("ModuleScript") then
+#               playerModule = require(d); break
+#           end
+#       end
+#
+# Shape A fails immediately; Shape B silently degrades because no
+# matching ModuleScript exists. Both produce the same end-state: every
+# `<Target>.<method>()` call returns nil / false / errors.
+#
+# This pack fixes the bug class generally:
+#   1. Detect each LocalScript X with a public-API table (`local X = {}`
+#      followed by `function X.<method>(...)` definitions where the
+#      script's own name matches X).
+#   2. Generate a sibling ``<X>Shared`` ModuleScript under
+#      ReplicatedStorage that exposes X's public API for cross-script
+#      callers. The shim:
+#        - inlines literal constants (`function X.f() return 100 end`),
+#        - maps boolean state methods (`function X.hasKey() return
+#          gotKey end`) to character-attribute reads, so server and
+#          client callers both work,
+#        - leaves unknown shapes as stubs returning nil/false (logged).
+#   3. In X itself, mirror writes to backing vars into the character
+#      attribute that the shim reads. ``gotKey = true`` is followed by
+#      ``character:SetAttribute("hasKey", true)`` if a character is
+#      bound.
+#   4. Rewrite each consumer's ``require(...)`` (both Shape A and B)
+#      to require ``<X>Shared`` from ReplicatedStorage instead. Strip
+#      Shape B's descendant-loop because it's no longer needed.
+
+_LOCALSCRIPT_SHIM_MARKER = "_AutoLocalScriptShim"
+_LOCALSCRIPT_SHIM_MIRROR_MARKER = "_AutoLocalScriptShimMirror"
+
+# `function <Var>.<method>(<args>) return <expr> end` — single-expression
+# accessor methods. Captures method name and return expression so we can
+# classify each method's body shape.
+_API_METHOD_RE = re.compile(
+    r'function\s+(?P<var>[A-Za-z_]\w*)\s*\.\s*(?P<method>[A-Za-z_]\w*)'
+    r'\s*\(\s*\)\s*'
+    r'return\s+(?P<expr>[^\n]+?)\s+end',
+)
+
+# Numeric / string / boolean Luau literals (a permissive subset).
+_LITERAL_RE = re.compile(
+    r'^\s*(?:'
+    r'-?\d+(?:\.\d+)?'                # number
+    r'|true|false|nil'
+    r'|"[^"\n]*"|\'[^\'\n]*\''        # string
+    r')\s*$'
+)
+
+# Local declaration of an exporter table: `local Player = {}`
+_EXPORTER_DECL_RE = re.compile(
+    r'^[ \t]*local\s+(?P<var>[A-Za-z_]\w*)\s*=\s*\{\s*\}\s*$',
+    re.MULTILINE,
+)
+
+
+@dataclass(frozen=True)
+class _ApiMethod:
+    name: str          # public method name on the exporter (e.g. "hasKey")
+    return_expr: str   # the captured return expression
+    backing_var: str | None  # if return_expr is a bare identifier
+    literal_value: str | None  # if return_expr is a number/string/bool literal
+
+
+_LOCAL_LITERAL_DECL_RE = re.compile(
+    r'^[ \t]*local\s+(?P<var>[A-Za-z_]\w*)\s*=\s*(?P<value>[^\n]+?)\s*$',
+    re.MULTILINE,
+)
+
+
+def _build_local_literal_table(source: str) -> dict[str, str]:
+    """Map ``local <var> = <literal>`` declarations to their literal RHS,
+    but only when the var is **never reassigned** elsewhere in the
+    source — those are true compile-time constants and safe to inline.
+
+    Vars whose declaration RHS happens to be a literal but which get
+    written later (e.g., ``local gotKey = false`` followed by
+    ``gotKey = true`` inside an item-pickup handler) are mutable state,
+    not constants. Inlining them into the shim would freeze the
+    cross-script read at the initial value and break the gameplay flow.
+    """
+    candidates: dict[str, str] = {}
+    for m in _LOCAL_LITERAL_DECL_RE.finditer(source):
+        value = m.group("value").strip()
+        if _LITERAL_RE.match(value):
+            candidates[m.group("var")] = value
+
+    out: dict[str, str] = {}
+    for var, value in candidates.items():
+        # Look for any reassignment that isn't the original `local`
+        # declaration. The reassign pattern matches `<var> = ...` not
+        # preceded by `local ` on the same line.
+        reassign = re.compile(
+            r'^[ \t]*(?<!local\s)' + re.escape(var) + r'\s*='
+        )
+        is_reassigned = False
+        for line in source.splitlines():
+            if line.lstrip().startswith('local '):
+                continue
+            if reassign.match(line):
+                is_reassigned = True
+                break
+        if not is_reassigned:
+            out[var] = value
+    return out
+
+
+def _classify_api(target_src: str, exporter_var: str) -> list[_ApiMethod]:
+    """Parse the exporter's `function <Var>.<m>() return <expr> end`
+    definitions. Returns one entry per parameterless single-line accessor
+    we recognise. Methods that take arguments or have multi-line bodies
+    are skipped — those can't be safely lifted into a ModuleScript shim
+    because they may close over the LocalScript's runtime state.
+
+    A return of a bare identifier is dereferenced once against the
+    module-scope ``local X = <literal>`` table. Unity-style accessors
+    typically read a private backing field (``_maxHealth = 100``), so
+    one level of indirection is enough to classify constants correctly.
+    """
+    literal_locals = _build_local_literal_table(target_src)
+    out: list[_ApiMethod] = []
+    for m in _API_METHOD_RE.finditer(target_src):
+        if m.group("var") != exporter_var:
+            continue
+        method = m.group("method")
+        expr = m.group("expr").strip()
+        if _LITERAL_RE.match(expr):
+            out.append(_ApiMethod(method, expr, None, expr))
+        elif re.match(r'^[A-Za-z_]\w*$', expr):
+            # Bare identifier: dereference against module-scope literal
+            # locals first (covers `return _maxHealth` where _maxHealth
+            # is a numeric constant). If the identifier doesn't resolve
+            # to a literal, treat it as mutable backing state.
+            referenced = literal_locals.get(expr)
+            if referenced is not None:
+                out.append(_ApiMethod(method, expr, None, referenced))
+            else:
+                out.append(_ApiMethod(method, expr, expr, None))
+        else:
+            # Unknown shape; emit nothing for now. Future work could
+            # support `return Var.field` or simple table reads.
+            out.append(_ApiMethod(method, expr, None, None))
+    return out
+
+
+def _exporter_var_for_script(s: "RbxScript") -> str | None:
+    """Find the local exporter table whose name matches the script's
+    own name (e.g. ``local Player = {}`` in Player.luau).
+
+    Restricting to name-matched exporters avoids false positives on
+    scripts that happen to declare empty tables for unrelated reasons.
+    """
+    if not s.source:
+        return None
+    for m in _EXPORTER_DECL_RE.finditer(s.source):
+        if m.group("var") == s.name:
+            return s.name
+    return None
+
+
+_REQUIRE_CALL_RE = re.compile(
+    r'require\s*\(\s*[^)]+\)'
+)
+
+
+def _consumer_uses_target(consumer_src: str, target_name: str) -> bool:
+    """True if the consumer references *target_name* via any of the
+    name-resolution shapes the AI transpiler emits:
+
+    Shape A — direct sibling lookup, either field-style or WaitForChild:
+        script.Parent.<Name>
+        script.Parent:WaitForChild("<Name>")
+    Shape B — defensive descendant loop on game:GetDescendants():
+        d.Name == "<Name>" and d:IsA("ModuleScript")
+    Shape C — bare FindFirstChild / WaitForChild from a service root:
+        ReplicatedStorage:FindFirstChild("<Name>", true)
+        ServerStorage:WaitForChild("<Name>")
+
+    All of these end up calling ``require(...)`` on a LocalScript, and
+    all of them fail at runtime — so any of them is enough to count as
+    a consumer for shim-injection purposes.
+    """
+    if f'script.Parent.{target_name}' in consumer_src:
+        return True
+    if (
+        f'script.Parent:WaitForChild("{target_name}"' in consumer_src
+        or f"script.Parent:WaitForChild('{target_name}'" in consumer_src
+    ):
+        return True
+    if (
+        f'd.Name == "{target_name}"' in consumer_src
+        or f"d.Name == '{target_name}'" in consumer_src
+    ):
+        return True
+    if (
+        f'FindFirstChild("{target_name}"' in consumer_src
+        or f"FindFirstChild('{target_name}'" in consumer_src
+        or f'WaitForChild("{target_name}"' in consumer_src
+        or f"WaitForChild('{target_name}'" in consumer_src
+    ):
+        return True
+    return False
+
+
+def _build_shim_source(target_name: str, api: list[_ApiMethod]) -> str:
+    """Generate the `<Target>Shared` ModuleScript source. Constants inline
+    as direct method bodies; boolean-state accessors read character
+    attributes (with a `character` parameter the caller can pass, falling
+    back to LocalPlayer.Character for client-side callers); unknown
+    shapes return nil with a one-line warning comment so a human can spot
+    them quickly.
+    """
+    shim_var = f"{target_name}Shared"
+    lines: list[str] = [
+        f'-- {shim_var} (auto-emitted by {_LOCALSCRIPT_SHIM_MARKER})',
+        f'-- Cross-script API for {target_name} (a LocalScript) — '
+        f'consumers `require` this shim, not the LocalScript itself.',
+        '',
+        'local Players = game:GetService("Players")',
+        '',
+        f'local {shim_var} = {{}}',
+        '',
+        'local function _resolveCharacter(character)',
+        '    if character then return character end',
+        '    local lp = Players.LocalPlayer',
+        '    return lp and lp.Character or nil',
+        'end',
+        '',
+    ]
+    for entry in api:
+        if entry.literal_value is not None:
+            lines.append(
+                f'function {shim_var}.{entry.name}() '
+                f'return {entry.literal_value} end'
+            )
+        elif entry.backing_var is not None:
+            lines += [
+                f'function {shim_var}.{entry.name}(character)',
+                f'    local c = _resolveCharacter(character)',
+                f'    return c ~= nil and c:GetAttribute("{entry.name}") == true or false',
+                'end',
+            ]
+        else:
+            lines += [
+                f'-- WARNING: {target_name}.{entry.name}() body shape '
+                f'({entry.return_expr!r}) not auto-lifted; returns nil.',
+                f'function {shim_var}.{entry.name}() return nil end',
+            ]
+    lines.append('')
+    lines.append(f'return {shim_var}')
+    return '\n'.join(lines) + '\n'
+
+
+_SHIM_REQUIRE_TEMPLATE = (
+    'require(game:GetService("ReplicatedStorage")'
+    ':WaitForChild("{shim}"))'
+)
+
+
+# Shape A: `local <Var> = require(<expr containing target_name>)`. We
+# scan with paren-depth tracking so nested calls like
+# ``require(script.Parent:WaitForChild("Player"))`` rewrite cleanly —
+# a flat ``[^)]*?`` regex would stop at the inner close-paren and leave
+# the outer require malformed.
+_REQUIRE_PREFIX_RE = re.compile(r'(local\s+\w+\s*=\s*)require\s*\(')
+
+
+def _find_balanced_close(src: str, open_idx: int) -> int | None:
+    """Given the index of an opening ``(`` in *src*, return the index
+    of the matching ``)`` accounting for nested parens. Returns None if
+    unbalanced.
+    """
+    depth = 0
+    for i in range(open_idx, len(src)):
+        c = src[i]
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+
+def _rewrite_shape_a(src: str, target_name: str) -> tuple[str, int]:
+    shim_name = f"{target_name}Shared"
+    new_require = _SHIM_REQUIRE_TEMPLATE.format(shim=shim_name)
+    out_parts: list[str] = []
+    cursor = 0
+    fixes = 0
+    target_re = re.compile(r'\b' + re.escape(target_name) + r'\b')
+    while True:
+        m = _REQUIRE_PREFIX_RE.search(src, cursor)
+        if not m:
+            out_parts.append(src[cursor:])
+            break
+        # Locate the matching close-paren after the `require(`.
+        open_idx = m.end() - 1
+        close_idx = _find_balanced_close(src, open_idx)
+        if close_idx is None:
+            # Malformed source — skip past this prefix and keep going.
+            out_parts.append(src[cursor:m.end()])
+            cursor = m.end()
+            continue
+        require_inner = src[open_idx + 1:close_idx]
+        if not target_re.search(require_inner):
+            # Not our target — emit verbatim and advance.
+            out_parts.append(src[cursor:close_idx + 1])
+            cursor = close_idx + 1
+            continue
+        out_parts.append(src[cursor:m.start()])
+        out_parts.append(m.group(1) + new_require)
+        cursor = close_idx + 1
+        fixes += 1
+    return ''.join(out_parts), fixes
+
+
+# Shape B: defensive descendant loop. Match the canonical block:
+#   for _, d in ipairs(game:GetDescendants()) do
+#       if d.Name == "<target>" and d:IsA("ModuleScript") then
+#           <var> = require(d); break
+#       end
+#   end
+# Replace with a single require to the shim. We don't try to preserve
+# variable name beyond a marker — the consumer typically assigned
+# `playerModule` (or similar) just to call `playerModule.X()`; the
+# rewrite reassigns the same variable to the shim.
+_SHAPE_B_RE = re.compile(
+    r'for\s+_\s*,\s*d\s+in\s+ipairs\s*\(\s*game\s*:\s*GetDescendants\s*\(\s*\)\s*\)\s*do\s*\n'
+    r'\s*if\s+d\s*\.\s*Name\s*==\s*"(?P<target>[A-Za-z_]\w*)"\s+and\s+'
+    r'd\s*:\s*IsA\s*\(\s*"ModuleScript"\s*\)\s+then\s*\n'
+    r'\s*(?P<var>[A-Za-z_]\w*)\s*=\s*require\s*\(\s*d\s*\)\s*\n'
+    r'\s*break\s*\n'
+    r'\s*end\s*\n'
+    r'\s*end',
+    re.MULTILINE,
+)
+
+
+def _rewrite_shape_b(src: str, target_name: str) -> tuple[str, int]:
+    shim_name = f"{target_name}Shared"
+    fixes = 0
+
+    def _sub(m: re.Match[str]) -> str:
+        nonlocal fixes
+        if m.group("target") != target_name:
+            return m.group(0)
+        fixes += 1
+        var = m.group("var")
+        return f'{var} = {_SHIM_REQUIRE_TEMPLATE.format(shim=shim_name)}'
+
+    new_src = _SHAPE_B_RE.sub(_sub, src)
+    return new_src, fixes
+
+
+def _mirror_backing_var_assignments(
+    source_src: str, var_to_attr: dict[str, str]
+) -> tuple[str, int]:
+    """For each backing var that maps to an attribute, inject a
+    ``character:SetAttribute(<attr>, <value>)`` mirror after every
+    top-level-looking assignment to that var. Skips lines already
+    carrying the mirror marker so the rewrite is idempotent.
+    """
+    if not var_to_attr:
+        return source_src, 0
+    lines = source_src.splitlines(keepends=True)
+    out: list[str] = []
+    fixes = 0
+    # Pre-compile patterns once per backing var.
+    var_assign_patterns = {
+        var: re.compile(
+            r'^(?P<lead>[ \t]*)' + re.escape(var)
+            + r'\s*=\s*(?P<value>[^\n;]+?)\s*$'
+        )
+        for var in var_to_attr
+    }
+    for line in lines:
+        out.append(line)
+        if _LOCALSCRIPT_SHIM_MIRROR_MARKER in line:
+            continue
+        # Strip trailing newline for pattern matching
+        stripped = line.rstrip('\n')
+        for var, attr in var_to_attr.items():
+            m = var_assign_patterns[var].match(stripped)
+            if not m:
+                continue
+            lead = m.group("lead")
+            value = m.group("value")
+            # Skip if this looks like a function-body return (already
+            # covered by accessor) or a local declaration.
+            if value.startswith(('function', 'local')):
+                continue
+            mirror = (
+                f'{lead}if character then character:SetAttribute('
+                f'"{attr}", {value}) end  -- {_LOCALSCRIPT_SHIM_MIRROR_MARKER}\n'
+            )
+            out.append(mirror)
+            fixes += 1
+            break  # one mirror per assigned var per line
+    return ''.join(out), fixes
+
+
+def _detect_localscript_api_shim(scripts: list["RbxScript"]) -> bool:
+    """Detector fires when there's at least one LocalScript that exports
+    an API and at least one consumer script referencing it.
+    """
+    exporters = [
+        s for s in scripts
+        if s.script_type == "LocalScript"
+        and _exporter_var_for_script(s) is not None
+    ]
+    if not exporters:
+        return False
+    for exporter in exporters:
+        for consumer in scripts:
+            if consumer is exporter:
+                continue
+            src = consumer.source or ""
+            if (
+                f'-- {_LOCALSCRIPT_SHIM_MARKER}' in src
+            ):
+                # Already shimmed in a prior pack run.
+                continue
+            if not _consumer_uses_target(src, exporter.name):
+                continue
+            if _REQUIRE_CALL_RE.search(src):
+                return True
+    return False
+
+
+@patch_pack(
+    name="localscript_api_shim",
+    description="For each LocalScript that exposes a public API table "
+    "and is `require()`d by another script, emit a sibling "
+    "``<Name>Shared`` ModuleScript under ReplicatedStorage with a "
+    "character-attribute-backed implementation, mirror local-state "
+    "writes into character attributes inside the source LocalScript, "
+    "and rewrite consumer `require(...)` calls to point at the shim. "
+    "Fixes the runtime error 'Attempted to call require with invalid "
+    "argument(s)' that the AI transpiler produces whenever one Unity "
+    "MonoBehaviour calls a peer that lives on the client.",
+    detect=_detect_localscript_api_shim,
+)
+def _inject_localscript_api_shim(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+
+    # Discover exporters: name-matched `local X = {}` LocalScripts.
+    exporters: list[tuple["RbxScript", str, list[_ApiMethod]]] = []
+    for s in scripts:
+        if s.script_type != "LocalScript":
+            continue
+        exporter_var = _exporter_var_for_script(s)
+        if not exporter_var:
+            continue
+        api = _classify_api(s.source or "", exporter_var)
+        if not api:
+            continue
+        exporters.append((s, exporter_var, api))
+
+    if not exporters:
+        return 0
+
+    from core.roblox_types import RbxScript
+
+    for exporter_script, exporter_var, api in exporters:
+        # Confirm there's at least one consumer requiring this name.
+        used_by_consumer = any(
+            (c is not exporter_script)
+            and _consumer_uses_target(c.source or "", exporter_script.name)
+            and _REQUIRE_CALL_RE.search(c.source or "")
+            for c in scripts
+        )
+        if not used_by_consumer:
+            continue
+
+        shim_name = f"{exporter_script.name}Shared"
+
+        # 1. Emit (or refresh) the shim ModuleScript. Idempotent: replace
+        # source if a stale shim with the same name already exists.
+        shim_source = _build_shim_source(exporter_script.name, api)
+        existing_shim = next(
+            (s for s in scripts if s.name == shim_name), None,
+        )
+        if existing_shim is None:
+            scripts.append(
+                RbxScript(
+                    name=shim_name,
+                    source=shim_source,
+                    script_type="ModuleScript",
+                    parent_path="ReplicatedStorage",
+                )
+            )
+            fixes += 1
+            log.info(
+                "  Emitted %s shim ModuleScript with %d method(s)",
+                shim_name, len(api),
+            )
+        elif existing_shim.source != shim_source:
+            existing_shim.source = shim_source
+            fixes += 1
+            log.info("  Refreshed %s shim source", shim_name)
+
+        # 2. Inside the exporter LocalScript, mirror backing-var
+        # assignments to character attributes. Only the bool-state
+        # accessors have a backing var; constants don't need mirroring.
+        var_to_attr: dict[str, str] = {
+            entry.backing_var: entry.name
+            for entry in api
+            if entry.backing_var is not None
+        }
+        if var_to_attr:
+            mirrored, mirror_fixes = _mirror_backing_var_assignments(
+                exporter_script.source or "", var_to_attr,
+            )
+            if mirror_fixes:
+                exporter_script.source = mirrored
+                fixes += 1
+                log.info(
+                    "  Mirrored %d backing-var write(s) in %s into character "
+                    "attribute(s) %s",
+                    mirror_fixes, exporter_script.name,
+                    sorted(var_to_attr.values()),
+                )
+
+        # 3. Rewrite consumers.
+        for consumer in scripts:
+            if consumer is exporter_script or consumer.name == shim_name:
+                continue
+            if not _consumer_uses_target(
+                consumer.source or "", exporter_script.name,
+            ):
+                continue
+            src = consumer.source or ""
+            new_src, fixes_a = _rewrite_shape_a(src, exporter_script.name)
+            new_src, fixes_b = _rewrite_shape_b(new_src, exporter_script.name)
+            if fixes_a + fixes_b > 0:
+                # Annotate so the detector knows we've already run.
+                marker_comment = (
+                    f'-- {_LOCALSCRIPT_SHIM_MARKER}: consumer rewritten '
+                    f'to use ReplicatedStorage.{shim_name}\n'
+                )
+                if f'-- {_LOCALSCRIPT_SHIM_MARKER}' not in new_src:
+                    new_src = marker_comment + new_src
+                consumer.source = new_src
+                fixes += 1
+                log.info(
+                    "  Rewrote %s consumer (shapeA=%d shapeB=%d) to use %s",
+                    consumer.name, fixes_a, fixes_b, shim_name,
+                )
+
+    return fixes
+
+
+# ---------------------------------------------------------------------------
+# Pack: proximity_trigger_fanout
+# ---------------------------------------------------------------------------
+#
+# Unity ``OnTriggerEnter(Collider other)`` fires when ANY collider enters
+# ANY of the GameObject's child colliders. The AI transpiler emits a
+# narrowed Roblox equivalent that:
+#   1. resolves a single "trigger" Part via ``findTriggerPart(container)``
+#      (typically an invisible sphere child), and
+#   2. connects ``Touched`` only on that one Part.
+#
+# Two failure modes follow from this:
+#   (a) The player steps on the entity's BODY mesh (Mine, Pickup), not on
+#       an invisible trigger sphere — Touched never fires.
+#   (b) The handler resolves the character via
+#       ``Players:GetPlayerFromCharacter(otherPart.Parent)``, which is
+#       nil when the touching part is an Accessory/Tool descendant of the
+#       character (R15 hats, gear, etc.) — false negatives even when the
+#       trigger sphere does fire.
+#
+# This pack rewrites the narrowed pattern into a multi-part fanout:
+#   * connect Touched on every BasePart in the container (or on the
+#     container itself if it's a BasePart), and
+#   * use ``otherPart:FindFirstAncestorWhichIsA("Model")`` for the
+#     character lookup.
+#
+# Triggers any "step on it to activate" Unity entity (mines, pickups,
+# pressure plates) regardless of script name — generalising the original
+# Mine.luau-specific hack to the broader class.
+
+_PROXIMITY_TRIGGER_MARKER = "_AutoProximityTriggerFanout"
+
+# Multi-line match:
+#   local <var> = findTriggerPart(<container>)
+#   if <var> then
+#       <var>.Touched:Connect(function(<arg>)
+#           ...body...
+#       end)
+#   end
+#
+# The body content is captured non-greedily up to the closing ``end)``
+# of the Connect call, followed by the closing ``end`` of the ``if``.
+_PROXIMITY_TRIGGER_RE = re.compile(
+    r'(?P<lead>^[ \t]*)local\s+(?P<var>[a-zA-Z_]\w*)\s*=\s*findTriggerPart\s*\(\s*'
+    r'(?P<container>[a-zA-Z_]\w*)\s*\)\s*\n'
+    r'[ \t]*if\s+(?P=var)\s+then\s*\n'
+    r'(?P<connect_indent>[ \t]+)(?P=var)\s*\.\s*Touched\s*:\s*Connect\s*\(\s*'
+    r'function\s*\(\s*(?P<arg>[a-zA-Z_]\w*)\s*\)\s*\n'
+    r'(?P<body>(?:.*?\n)*?)'
+    r'(?P=connect_indent)end\s*\)\s*\n'
+    r'[ \t]*end\b',
+    re.MULTILINE,
+)
+
+
+def _detect_proximity_trigger_fanout(scripts: list["RbxScript"]) -> bool:
+    """Detector fires when ANY script has the narrowed ``findTriggerPart``
+    + single-part-Touched binding shape. Marker-guarded for idempotency.
+    """
+    for s in scripts:
+        src = s.source or ""
+        if (
+            _PROXIMITY_TRIGGER_MARKER not in src
+            and _PROXIMITY_TRIGGER_RE.search(src) is not None
+        ):
+            return True
+    return False
+
+
+def _rewrite_proximity_body(body: str, arg: str) -> str:
+    """Rewrite the captured Touched handler body to resolve the touching
+    character via ancestor lookup instead of the direct ``.Parent``.
+
+    Unity's ``OnTriggerEnter(Collider other)`` callback gives ``other`` the
+    immediate collider on the touching character — but R15 / accessory
+    parts in Roblox have the Accessory model as their immediate Parent,
+    not the character. Replace the AI's literal translation
+    (``other.Parent``) with ``other:FindFirstAncestorWhichIsA("Model")``
+    so the lookup also resolves accessory-mounted parts.
+    """
+    return re.sub(
+        rf"Players\s*:\s*GetPlayerFromCharacter\s*\(\s*{re.escape(arg)}\s*\.\s*Parent\s*\)",
+        f'Players:GetPlayerFromCharacter({arg}:FindFirstAncestorWhichIsA("Model"))',
+        body,
+    )
+
+
+@patch_pack(
+    name="proximity_trigger_fanout",
+    description="Rewrite single-part ``triggerPart.Touched:Connect(...)`` "
+    "patterns into a multi-part Touched fanout over every BasePart in "
+    "the container, with ancestor-based character lookup. Fixes "
+    "step-on-entity Unity triggers (mines, pickups, pressure plates) "
+    "whose visible body geometry was registering touches but whose "
+    "invisible AI-stubbed trigger sphere was not.",
+    detect=_detect_proximity_trigger_fanout,
+)
+def _inject_proximity_trigger_fanout(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        src = s.source or ""
+        if _PROXIMITY_TRIGGER_MARKER in src:
+            continue
+        m = _PROXIMITY_TRIGGER_RE.search(src)
+        if not m:
+            continue
+        lead = m.group("lead")
+        container = m.group("container")
+        arg = m.group("arg")
+        body = m.group("body")
+        rewritten_body = _rewrite_proximity_body(body, arg)
+        # Use a non-clashing function name; pin under the marker so the
+        # idempotency guard can find us on re-runs.
+        replacement = (
+            f"{lead}-- {_PROXIMITY_TRIGGER_MARKER}: connect Touched on every body\n"
+            f"{lead}-- part so step-on triggers (mines/pickups/pressure-plates) fire,\n"
+            f"{lead}-- and resolve the touching character via ancestor lookup so\n"
+            f"{lead}-- accessory-mounted touches also count.\n"
+            f"{lead}local function _onProximityTouched({arg})\n"
+            f"{rewritten_body}"
+            f"{lead}end\n"
+            f"{lead}if {container}:IsA(\"BasePart\") then\n"
+            f"{lead}\t{container}.Touched:Connect(_onProximityTouched)\n"
+            f"{lead}elseif {container}:IsA(\"Model\") then\n"
+            f"{lead}\tfor _, _d in ipairs({container}:GetDescendants()) do\n"
+            f"{lead}\t\tif _d:IsA(\"BasePart\") then\n"
+            f"{lead}\t\t\t_d.Touched:Connect(_onProximityTouched)\n"
+            f"{lead}\t\tend\n"
+            f"{lead}\tend\n"
+            f"{lead}end"
+        )
+        s.source = src[: m.start()] + replacement + src[m.end():]
+        fixes += 1
+        log.info(
+            "  Broadened proximity trigger in '%s' (container=%s arg=%s)",
+            s.name, container, arg,
+        )
+    return fixes
+
+
+# ---------------------------------------------------------------------------
+# Pack: template_clone_visibility
+# ---------------------------------------------------------------------------
+#
+# Unity prefab templates ship from the pipeline parented under
+# ``ReplicatedStorage.Templates`` with Transparency=1 on every BasePart
+# so the scene viewer doesn't render them. When a runtime script clones
+# one of these templates and re-parents the clone into the world (e.g.,
+# Player.luau's getRifle clones the Rifle template and attaches it to a
+# weapon-slot Part), the cloned BaseParts inherit Transparency=1 and the
+# weapon is invisible in-game.
+#
+# The original WeaponMount pack handled this for the SimpleFPS rifle by
+# wholesale-rewriting a stub-shaped ``GetRifle = function() ... end``
+# body. As the AI's transpile output drifted to use a ``cloneTemplate``
+# helper plus a ``function getRifle()`` statement, the WeaponMount
+# detector stopped matching and visible-rifle setup silently dropped.
+#
+# This pack is narrower and shape-tolerant: it splices a visibility +
+# weld fixup right after any line that clones a Template descendant and
+# re-parents it. The fixup:
+#   - sets Transparency=0, CanCollide=false, Massless=true on every
+#     BasePart in the clone,
+#   - welds non-primary parts to the model's PrimaryPart,
+#   - if a destination Part variable is detected (the script reparents
+#     the clone into a known weapon-slot-style holder), welds the
+#     primary to that holder so the clone rides along when the holder
+#     moves.
+#
+# Idempotent via the ``_AutoTemplateCloneVisibility`` marker.
+
+_TEMPLATE_CLONE_VISIBILITY_MARKER = "_AutoTemplateCloneVisibility"
+
+# Match `local <var> = cloneTemplate("<NAME>")` — the AI's helper for
+# pulling a prefab clone out of ReplicatedStorage.Templates. Also match
+# the equivalent inline lookup `local <var> = Templates:FindFirstChild
+# ("<NAME>"):Clone()` so future AI shapes don't slip past.
+_CLONE_TEMPLATE_RE = re.compile(
+    r'^(?P<lead>[ \t]*)local\s+(?P<var>[A-Za-z_]\w*)\s*=\s*'
+    r'(?:'
+    r'cloneTemplate\s*\(\s*["\'][A-Za-z_][\w]*["\']\s*\)'
+    r'|'
+    r'[A-Za-z_]\w*\s*:\s*FindFirstChild\s*\(\s*["\'][A-Za-z_][\w]*["\']\s*\)\s*:\s*Clone\s*\(\s*\)'
+    r')\s*$',
+    re.MULTILINE,
+)
+
+
+def _detect_template_clone_visibility(scripts: list["RbxScript"]) -> bool:
+    for s in scripts:
+        src = s.source or ""
+        if _TEMPLATE_CLONE_VISIBILITY_MARKER in src:
+            continue
+        if _CLONE_TEMPLATE_RE.search(src):
+            return True
+    return False
+
+
+def _has_visibility_already(src: str, var: str, start: int) -> bool:
+    """Heuristic: avoid double-inserting if a Transparency=0 assignment
+    on the clone's parts already appears within ~30 lines of the clone
+    line. Catches manual fixups so the pack doesn't pile on.
+    """
+    window = src[start:start + 1500]
+    if 'Transparency = 0' in window and var in window:
+        return True
+    return False
+
+
+def _emit_visibility_block(lead: str, var: str) -> str:
+    """Generate the visibility + weld fixup block. Tolerates both Model
+    and bare BasePart clones — ``var:IsA`` branches handle each.
+    """
+    indent = lead
+    return (
+        f"{indent}-- {_TEMPLATE_CLONE_VISIBILITY_MARKER}: make the cloned template visible\n"
+        f"{indent}-- (template parts ship Transparency=1) and weld sub-parts together.\n"
+        f"{indent}do\n"
+        f"{indent}\tlocal _clone = {var}\n"
+        f"{indent}\tif _clone then\n"
+        f"{indent}\t\tlocal _primary = nil\n"
+        f"{indent}\t\tif _clone:IsA(\"BasePart\") then\n"
+        f"{indent}\t\t\t_primary = _clone\n"
+        f"{indent}\t\telseif _clone:IsA(\"Model\") then\n"
+        f"{indent}\t\t\t_primary = _clone.PrimaryPart or _clone:FindFirstChildWhichIsA(\"BasePart\")\n"
+        f"{indent}\t\t\tif _clone.PrimaryPart == nil and _primary then\n"
+        f"{indent}\t\t\t\t_clone.PrimaryPart = _primary\n"
+        f"{indent}\t\t\tend\n"
+        f"{indent}\t\tend\n"
+        f"{indent}\t\tlocal _parts = (_clone:IsA(\"Model\")) and _clone:GetDescendants() or {{_clone}}\n"
+        f"{indent}\t\tfor _, _p in ipairs(_parts) do\n"
+        f"{indent}\t\t\tif _p:IsA(\"BasePart\") then\n"
+        f"{indent}\t\t\t\t_p.Transparency = 0\n"
+        f"{indent}\t\t\t\t_p.CanCollide = false\n"
+        f"{indent}\t\t\t\t_p.Massless = true\n"
+        f"{indent}\t\t\t\tif _primary and _p ~= _primary then\n"
+        f"{indent}\t\t\t\t\tlocal _w = Instance.new(\"WeldConstraint\")\n"
+        f"{indent}\t\t\t\t\t_w.Part0 = _primary\n"
+        f"{indent}\t\t\t\t\t_w.Part1 = _p\n"
+        f"{indent}\t\t\t\t\t_w.Parent = _p\n"
+        f"{indent}\t\t\t\tend\n"
+        f"{indent}\t\t\tend\n"
+        f"{indent}\t\tend\n"
+        f"{indent}\tend\n"
+        f"{indent}end\n"
+    )
+
+
+@patch_pack(
+    name="template_clone_visibility",
+    description="After every ``local x = cloneTemplate(...)`` or "
+    "``local x = Templates:FindFirstChild(...):Clone()`` line, splice "
+    "a fixup that sets Transparency=0 / CanCollide=false on each "
+    "BasePart of the clone and welds non-primary parts to the model's "
+    "PrimaryPart. Prevents invisible-clone bugs that happen when the "
+    "template (hidden in the scene with Transparency=1) is cloned and "
+    "re-parented into the world without per-part visibility resets.",
+    detect=_detect_template_clone_visibility,
+)
+def _inject_template_clone_visibility(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        src = s.source or ""
+        if _TEMPLATE_CLONE_VISIBILITY_MARKER in src:
+            continue
+        # Iterate over all clone lines, accumulating insertions from end
+        # to start so earlier insertions don't shift later match offsets.
+        matches = list(_CLONE_TEMPLATE_RE.finditer(src))
+        if not matches:
+            continue
+        for m in reversed(matches):
+            lead = m.group("lead")
+            var = m.group("var")
+            line_end = src.find('\n', m.end())
+            if line_end < 0:
+                line_end = len(src)
+            else:
+                line_end += 1
+            if _has_visibility_already(src, var, line_end):
+                continue
+            block = _emit_visibility_block(lead, var)
+            src = src[:line_end] + block + src[line_end:]
+            fixes += 1
+        if s.source != src:
+            s.source = src
+            log.info(
+                "  Inserted template-clone visibility fixup(s) in '%s'",
+                s.name,
+            )
     return fixes
