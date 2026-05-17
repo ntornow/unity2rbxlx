@@ -1388,21 +1388,8 @@ def _convert_node(
     if hasattr(node, "layer") and node.layer and node.layer != 0:
         part.attributes["UnityLayer"] = node.layer
 
-    # -- Animator component -> attributes for animation script targeting --
-    for comp in node.components:
-        if comp.component_type == "Animator":
-            part.attributes["HasAnimator"] = True
-            # Extract controller GUID for animation script matching
-            controller_ref = comp.properties.get("m_Controller", {})
-            if isinstance(controller_ref, dict):
-                ctrl_guid = controller_ref.get("guid", "")
-                if ctrl_guid and ctrl_guid != "0" * 32:
-                    part.attributes["AnimatorController"] = ctrl_guid
-            # Extract culling mode
-            cull_mode = comp.properties.get("m_CullingMode", 0)
-            if int(cull_mode) == 2:  # CullCompletely
-                part.attributes["AnimCullWhenOffscreen"] = True
-            break
+    # Animator components are intentionally not surfaced — skeletal/character
+    # animation is unsupported (see docs/UNSUPPORTED.md).
 
     # -- Children --
     # If this node has a LODGroup, skip lower LOD children (keep LOD0 only).

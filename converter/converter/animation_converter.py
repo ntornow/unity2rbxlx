@@ -21,7 +21,6 @@ of keyframes), we sample at reduced keyframe density and use sequential tweens.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import math
 from collections import Counter
@@ -76,11 +75,12 @@ def _disambiguate_by_source(items: list, label: str) -> dict[int, str]:
 # Unity humanoid-bone → Roblox R15 part name.
 #
 # Used by is_transform_only() to decide a clip's routing target:
-#   - any bone matches  → humanoid clip → character_animator.luau
+#   - any bone matches  → humanoid/skeletal clip → UNSUPPORTED (UNCONVERTED.md)
 #   - no bone matches   → transform-only → inline TweenService
 #
-# See docs/design/inline-over-runtime-wrappers.md for the policy that deletes
-# AnimatorBridge / TransformAnimator and mandates these two inline targets.
+# Skeletal/character animation cannot be converted: a Unity SkinnedMeshRenderer
+# becomes a single rigid MeshPart and Roblox has no automated/headless path to
+# a skinned MeshPart that deforms via Bone instances. See docs/UNSUPPORTED.md.
 # ---------------------------------------------------------------------------
 
 UNITY_TO_R15_BONE_MAP: dict[str, str] = {
@@ -107,6 +107,14 @@ UNITY_TO_R15_BONE_MAP: dict[str, str] = {
 }
 
 _HUMANOID_BONE_NAMES = frozenset(UNITY_TO_R15_BONE_MAP.keys())
+
+# Reason surfaced to UNCONVERTED.md for every humanoid/skeletal clip.
+_SKELETAL_UNSUPPORTED_REASON = (
+    "skeletal/character animation unsupported — a Unity SkinnedMeshRenderer "
+    "converts to a single rigid MeshPart, and Roblox has no automated/headless "
+    "path to a skinned MeshPart that deforms via Bone instances "
+    "(skinned-mesh import is Studio-3D-Importer-only); see docs/UNSUPPORTED.md"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -158,10 +166,11 @@ class AnimClip:
     def is_transform_only(self) -> bool:
         """True when no curve path references a humanoid bone.
 
-        Clips driving humanoid bones (Hips, Spine, LeftUpperArm, …) must
-        go through character_animator.luau so Roblox's Humanoid can play
-        them. Clips driving only arbitrary transform children (a spinning
-        platform, a bobbing door) can use inline TweenService instead.
+        Clips driving humanoid bones (Hips, Spine, LeftUpperArm, …) are
+        skeletal/character animation, which the converter cannot support
+        (see docs/UNSUPPORTED.md); they are surfaced to UNCONVERTED.md.
+        Clips driving only arbitrary transform children (a spinning
+        platform, a bobbing door) use inline TweenService instead.
 
         Returns False for empty clips — we can't route what we can't see.
         """
@@ -238,10 +247,9 @@ class BlendTreeEntry:
 class BlendTree:
     """A 1D Unity blend tree.
 
-    The Luau runtime at ``runtime/character_animator.luau`` expects the
-    emitted JSON shape ``{name -> {param, clips: [{clip, threshold}]}}``.
-    2D blend trees are not emitted; those states log a warning and fall
-    back to the first child clip in their state's ``clip_guid``.
+    Blend trees only ever appear inside AnimatorController state machines,
+    which drive skeletal/character animation — an unsupported feature
+    (see docs/UNSUPPORTED.md). Parsed for completeness only.
     """
     name: str
     param: str
@@ -266,13 +274,12 @@ class AnimationConversionResult:
     clips: list[AnimClip] = field(default_factory=list)
     controllers: list[AnimatorController] = field(default_factory=list)
     generated_scripts: list[tuple[str, str]] = field(default_factory=list)  # (name, luau_source)
-    animation_data_modules: list[tuple[str, str]] = field(default_factory=list)  # (name, luau_source)
     total_clips: int = 0
     total_controllers: int = 0
     total_scripts_generated: int = 0
     # Per-clip routing decisions.  Shape:
     #   { controller_name: { clip_name: { "target": str, "reason": str } } }
-    # "target" is one of: "character_animator", "inline_tween", "skipped".
+    # "target" is one of: "inline_tween", "skipped".
     # Serialized into conversion_plan.json under the "animation_routing" key
     # so rehydration and downstream consumers can see what got routed where.
     routing: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
@@ -1602,286 +1609,6 @@ def _generate_parameter_driven_playback(
             lines.append("playAnimation()")
 
 
-def export_controller_json(
-    controller: AnimatorController,
-    clip_name_by_guid: dict[str, str] | None = None,
-) -> dict[str, Any]:
-    """Export an AnimatorController as a JSON-serializable dict for the runtime.
-
-    The character_animator.luau expects this format for state machine evaluation.
-
-    When ``clip_name_by_guid`` is provided, each state's ``motion`` and the
-    BlendTree entries resolve their ``clip_guid`` → clip display name so the
-    runtime can look clips up by the same key the keyframes dict uses.
-    Without it, ``motion`` falls back to the state name and BlendTree entries
-    missing a name are dropped (they'd be unreachable).
-    """
-    clip_name_by_guid = clip_name_by_guid or {}
-    states = []
-    for state in controller.states:
-        transitions = []
-        for trans in state.transitions:
-            conditions = []
-            for cond in trans.conditions:
-                mode_names = {1: "If", 2: "IfNot", 3: "Greater", 4: "Less", 6: "Equals", 7: "NotEqual"}
-                conditions.append({
-                    "parameter": cond.parameter,
-                    "mode": mode_names.get(cond.mode, "If"),
-                    "threshold": cond.threshold,
-                })
-            transitions.append({
-                "destination": "",  # Filled below from file_id resolution
-                "dst_file_id": trans.dst_state_file_id,
-                "conditions": conditions,
-                "duration": trans.transition_duration,
-                "hasExitTime": trans.has_exit_time,
-                "exitTime": trans.exit_time,
-            })
-        # ``motion`` is the key the runtime uses to look a state's clip up
-        # in the keyframes dict. That dict is keyed by clip *display name*
-        # (see convert_animations: keyframes = {humanoid_display[id(clip)]:
-        # ...}), so ``motion`` must resolve to the same display name — NOT
-        # the state name, which collides with the keyframes key only by
-        # accident. Fall back to the state name for states with no clip.
-        state_entry: dict[str, Any] = {
-            "name": state.name,
-            "motion": clip_name_by_guid.get(state.clip_guid, state.name),
-            "speed": state.speed,
-            "transitions": transitions,
-        }
-        if state.blend_tree_name:
-            state_entry["blendTree"] = state.blend_tree_name
-        states.append(state_entry)
-
-    # Resolve transition destination names from file_id
-    state_name_by_fid = {s.file_id: s.name for s in controller.states}
-    for state_data in states:
-        for trans in state_data["transitions"]:
-            trans["destination"] = state_name_by_fid.get(trans.pop("dst_file_id", ""), "")
-
-    parameters = []
-    for param in controller.parameters:
-        type_names = {1: "Float", 3: "Int", 4: "Bool", 9: "Trigger"}
-        default_val: Any = 0
-        if param.param_type == 4:
-            default_val = param.default_bool
-        elif param.param_type == 1:
-            default_val = param.default_float
-        elif param.param_type == 3:
-            default_val = param.default_int
-        parameters.append({
-            "name": param.name,
-            "type": type_names.get(param.param_type, "Float"),
-            "defaultValue": default_val,
-        })
-
-    # Resolve blend-tree entries' clip_guid → clip_name for the Luau runtime.
-    blend_trees: dict[str, Any] = {}
-    for bt_name, bt in controller.blend_trees.items():
-        out_clips: list[dict[str, Any]] = []
-        for entry in bt.entries:
-            clip_name = entry.clip_name or clip_name_by_guid.get(entry.clip_guid, "")
-            if not clip_name:
-                continue
-            out_clips.append({"clip": clip_name, "threshold": entry.threshold})
-        if out_clips:
-            blend_trees[bt_name] = {"param": bt.param, "clips": out_clips}
-
-    result: dict[str, Any] = {
-        "name": controller.name,
-        "states": states,
-        "parameters": parameters,
-        "defaultState": state_name_by_fid.get(controller.default_state_file_id, ""),
-    }
-    if blend_trees:
-        result["blendTrees"] = blend_trees
-    return result
-
-
-def export_clip_keyframes(clip: AnimClip) -> dict[str, Any]:
-    """Export a clip's keyframes as a JSON-serializable dict for runtime playback.
-
-    Per-bone frames are merged across position / rotation / euler / scale
-    curves and time-sorted. The runtime consumer
-    (``character_animator.luau:_playKeyframeAnimation``) builds each frame's
-    CFrame from ``cf.x / .y / .z / .rx / .ry / .rz`` and defaults any
-    missing axis to 0 — so emitting per-curve frames (position keys for a
-    bone, then rotation keys for the same bone) produced partial frames
-    that snapped unset axes back to the origin and broke time ordering
-    (rotation keys appended after position keys had earlier timestamps,
-    yielding negative dt that the runtime then skipped). Merging by time
-    and carrying forward unchanged components keeps the rigged animation
-    coherent.
-
-    Returns a dict with:
-        duration: float
-        bones: { boneName: [ {time, cf: {x,y,z,rx,ry,rz}} ] }
-    """
-
-    def _curve_field_values(
-        curve_type: str, value: tuple[float, ...],
-    ) -> dict[str, float]:
-        if curve_type == "position":
-            return {
-                "x": round(value[0], 4),
-                "y": round(value[1], 4),
-                "z": round(-value[2], 4),  # Unity→Roblox Z negation
-            }
-        if curve_type == "euler":
-            return {
-                "rx": round(value[0], 2),
-                "ry": round(value[1], 2),
-                "rz": round(-value[2], 2),
-            }
-        if curve_type == "rotation":
-            ex, ey, ez = _quat_to_euler_degrees(*value[:4])
-            return {
-                "rx": round(ex, 2),
-                "ry": round(ey, 2),
-                "rz": round(-ez, 2),
-            }
-        if curve_type == "scale":
-            return {
-                "sx": round(value[0], 4),
-                "sy": round(value[1], 4),
-                "sz": round(value[2], 4),
-            }
-        return {}
-
-    # Group curves by destination bone, then merge by time so each emitted
-    # frame carries every property that any curve provides at that moment.
-    curves_by_bone: dict[str, list[AnimCurve]] = {}
-    for curve in clip.curves:
-        bone_name = curve.path.split("/")[-1] if curve.path else "Root"
-        # Strip common Mixamo prefix (``mixamorig:LeftFoot`` → ``LeftFoot``).
-        if ":" in bone_name:
-            bone_name = bone_name.split(":")[-1]
-        curves_by_bone.setdefault(bone_name, []).append(curve)
-
-    bones: dict[str, list[dict]] = {}
-    for bone_name, curves in curves_by_bone.items():
-        # Collect (time, field_values) per curve after simplifying each.
-        frames_by_time: dict[float, dict[str, float]] = {}
-        for curve in curves:
-            for kf in simplify_keyframes(curve.keyframes, max_count=10):
-                rounded_time = round(kf.time, 3)
-                slot = frames_by_time.setdefault(rounded_time, {})
-                slot.update(_curve_field_values(curve.property_type, kf.value))
-
-        # Sort frames by time and carry the last known component forward
-        # so the runtime never sees an unset axis snap to 0.
-        carried: dict[str, float] = {}
-        merged: list[dict] = []
-        for t in sorted(frames_by_time):
-            carried.update(frames_by_time[t])
-            merged.append({"time": t, "cf": dict(carried)})
-        bones[bone_name] = merged
-
-    return {
-        "duration": round(clip.duration, 3),
-        # The KeyframeTrack adapter defaults its ``Looped`` field from this
-        # flag; the runtime still overrides it per-state from the controller
-        # graph, but a track played outside a state (blend-tree leaf) honours
-        # the clip's own loop setting.
-        "loop": bool(clip.loop),
-        "bones": bones,
-    }
-
-
-def generate_controller_bootstrap(
-    module_name: str,
-    rig_name: str,
-    *,
-    prefab_scoped: bool = False,
-) -> str:
-    """Generate the per-controller bootstrap Script.
-
-    The bootstrap is the glue that makes the CharacterAnimator path actually
-    run for a rig (PR2 of the character-animation plan): it ``require``s the
-    CharacterAnimator runtime + the controller's ``AnimationData_*`` module,
-    finds the rig, instantiates ``CharacterAnimator.new(controllerData, rig)``,
-    registers it (``CharacterAnimator.Register``) so transpiled imperative
-    ``Animator.*`` calls resolve to it, loads the keyframe data, and ticks
-    ``:Update(dt)`` on ``RunService.Heartbeat``.
-
-    Args:
-        module_name: name of the ``AnimationData_*`` ModuleScript that holds
-            the exported controller graph + bone keyframes.
-        rig_name: name of the Roblox model/part that carries the rig — the
-            Animator host's GameObject name.
-        prefab_scoped: when True the bootstrap lives under a cloned
-            ``ReplicatedStorage.Templates.<Prefab>`` and binds to
-            ``script.Parent`` (this clone), falling back to a workspace
-            search for scene-baked instances. Mirrors the exact pattern
-            ``generate_tween_script`` uses so multi-instance prefabs each
-            drive their own clone instead of all racing onto whichever copy
-            ``workspace:FindFirstChild`` returns first.
-
-    Returns:
-        Luau source for a server Script.
-    """
-    lines: list[str] = []
-    lines.append(f"-- Auto-generated CharacterAnimator bootstrap for {module_name}")
-    lines.append("-- Wires the exported Unity AnimatorController to the")
-    lines.append("-- CharacterAnimator tween-backend runtime (PR2 of the")
-    lines.append("-- character-animation plan; see docs/design/character-animation.md).")
-    lines.append("--")
-    lines.append("-- SERVER-SIDE ONLY: transpiled Animator.* calls from a")
-    lines.append("-- LocalScript will not reach this server-bound instance")
-    lines.append("-- (see docs/UNSUPPORTED.md).")
-    lines.append("")
-    lines.append('local ReplicatedStorage = game:GetService("ReplicatedStorage")')
-    lines.append('local RunService = game:GetService("RunService")')
-    lines.append("")
-    lines.append('local CharacterAnimatorModule = ReplicatedStorage:FindFirstChild("CharacterAnimator")')
-    lines.append(f'local AnimationDataModule = ReplicatedStorage:FindFirstChild("{module_name}")')
-    lines.append("if not CharacterAnimatorModule or not AnimationDataModule then")
-    lines.append("    -- Runtime module or animation data missing; nothing to drive.")
-    lines.append("    return")
-    lines.append("end")
-    lines.append("local CharacterAnimator = require(CharacterAnimatorModule)")
-    lines.append("local animationData = require(AnimationDataModule)")
-    lines.append("")
-    if prefab_scoped:
-        lines.append("-- Prefab-scoped: prefer script.Parent (this clone), fall")
-        lines.append("-- back to a workspace search when running from a global container.")
-        lines.append("local rig")
-        lines.append("if script.Parent and (script.Parent:IsA('Model') or script.Parent:IsA('BasePart')) then")
-        if rig_name:
-            lines.append(f'    rig = script.Parent:FindFirstChild("{rig_name}", true) or script.Parent')
-        else:
-            lines.append("    rig = script.Parent")
-        lines.append("else")
-        if rig_name:
-            lines.append(f'    rig = workspace:FindFirstChild("{rig_name}", true)')
-        else:
-            lines.append("    rig = nil")
-        lines.append("end")
-    else:
-        if rig_name:
-            lines.append(f'local rig = workspace:FindFirstChild("{rig_name}", true)')
-        else:
-            lines.append("local rig = nil")
-    lines.append("if not rig then")
-    lines.append("    -- Rig not found; bootstrap will not run.")
-    lines.append("    return")
-    lines.append("end")
-    lines.append("")
-    lines.append("local instance = CharacterAnimator.new(animationData.controller, rig)")
-    lines.append("if animationData.keyframes then")
-    lines.append("    instance:LoadKeyframes(animationData.keyframes)")
-    lines.append("end")
-    lines.append("-- Register so transpiled imperative Animator.* calls resolve to")
-    lines.append("-- this instance (and drain any calls queued before this ran).")
-    lines.append("CharacterAnimator.Register(rig, instance)")
-    lines.append("")
-    lines.append("RunService.Heartbeat:Connect(function(dt)")
-    lines.append("    instance:Update(dt)")
-    lines.append("end)")
-    lines.append("")
-    return "\n".join(lines)
-
-
 # ---------------------------------------------------------------------------
 # Project-level animation discovery and conversion
 # ---------------------------------------------------------------------------
@@ -1937,10 +1664,11 @@ def convert_animations(
 ) -> AnimationConversionResult:
     """Convert all animations in a Unity project to Roblox Luau scripts.
 
-    Phase 4.5 routing: each clip is sent to exactly one target —
-      - humanoid clips (touch R15 bone names)  → character_animator.luau JSON
+    Routing: each clip is sent to exactly one target —
+      - humanoid clips (touch R15 bone names)  → UNSUPPORTED (UNCONVERTED.md)
       - transform-only clips (non-humanoid)    → inline TweenService Scripts
-    No ``require()`` of deleted bridge modules is emitted from either path.
+    Skeletal/character animation is not convertible (see docs/UNSUPPORTED.md);
+    humanoid clips are surfaced to UNCONVERTED.md, never tweened.
     Per-clip routing + reason is recorded on ``result.routing`` so the
     pipeline can persist it to ``conversion_plan.json``.
 
@@ -2173,12 +1901,11 @@ def convert_animations(
 
         # Partition the controller's clips by routing target. Disambiguate
         # clip names within each partition: two distinct clips that share
-        # a Unity-given name would otherwise collide in per_clip_routing,
-        # in inline-tween script names, and (for humanoid clips) in the
-        # character_animator keyframes dict — silently dropping all but
-        # the last entry. The collision is logged as UNCONVERTED so the
-        # user sees it; the affected entries get an 8-char source-path
-        # hash suffix so the data survives.
+        # a Unity-given name would otherwise collide in per_clip_routing
+        # and in inline-tween script names — silently dropping all but the
+        # last entry. The collision is logged as UNCONVERTED so the user
+        # sees it; the affected entries get an 8-char source-path hash
+        # suffix so the data survives.
         humanoid_clips: list[AnimClip] = []
         transform_only_clips: list[AnimClip] = []
         for clip in ctrl_clips:
@@ -2220,10 +1947,19 @@ def convert_animations(
                 "reason": "non-humanoid transform-only curves",
             }
         for clip in humanoid_clips:
+            # Skeletal/character animation is not convertible — a Unity
+            # SkinnedMeshRenderer becomes a single rigid MeshPart and
+            # Roblox has no automated/headless path to a skinned MeshPart
+            # that deforms via Bone instances. Surface to UNCONVERTED.md.
             per_clip_routing[humanoid_display[id(clip)]] = {
-                "target": "character_animator",
-                "reason": "humanoid bone targets or empty curve set",
+                "target": "skipped",
+                "reason": _SKELETAL_UNSUPPORTED_REASON,
             }
+            result.unconverted.append({
+                "category": "animation_clip",
+                "item": f"{ctrl_key}/{clip.name}",
+                "reason": _SKELETAL_UNSUPPORTED_REASON,
+            })
         result.routing[ctrl_key] = per_clip_routing
 
         # Emit per (scene, controller) pair.
@@ -2231,9 +1967,8 @@ def convert_animations(
             prefix = f"{scope}_" if scope else ""
 
             # Inline TweenService script for every transform-only clip.
-            # Humanoid clips do not get a per-controller Script here — the
-            # controller graph + bone keyframes go into the AnimationData_*
-            # module below, consumed by the CharacterAnimator runtime.
+            # Humanoid clips get no emission — skeletal/character animation
+            # is unsupported and was surfaced to UNCONVERTED.md above.
             for clip in transform_only_clips:
                 clip_disp = transform_display[id(clip)]
                 script_name = f"Anim_{prefix}{ctrl_key}_{clip_disp}"
@@ -2247,64 +1982,6 @@ def convert_animations(
                     result.generated_scripts.append((script_name, luau_source))
                     if scope_is_prefab:
                         result.script_scopes[script_name] = scope
-
-            # character_animator JSON module — emit only when at least one
-            # humanoid clip lands here. Transform-only clips are NOT
-            # bundled (they're inline Scripts above).
-            if humanoid_clips:
-                # Override the project-wide ``clip_name_by_guid`` with this
-                # controller's disambiguated names for clips this controller
-                # owns, so ``blendTrees[*].clips[*].clip`` matches the
-                # disambiguated keyframe keys below. Clips not in this
-                # controller's clips_by_guid keep their project-wide bare
-                # name, preserving pre-fix behavior for blend-tree leaf
-                # clips that aren't reachable through any state.
-                clip_display_by_id = {**humanoid_display, **transform_display}
-                ctrl_clip_name_by_guid: dict[str, str] = dict(clip_name_by_guid)
-                for guid, c in clips_by_guid.items():
-                    disp = clip_display_by_id.get(id(c))
-                    if disp is not None:
-                        ctrl_clip_name_by_guid[guid] = disp
-                controller_data = export_controller_json(
-                    ctrl, ctrl_clip_name_by_guid,
-                )
-                keyframes: dict[str, Any] = {
-                    humanoid_display[id(clip)]: export_clip_keyframes(clip)
-                    for clip in humanoid_clips
-                }
-                combined = {"controller": controller_data, "keyframes": keyframes}
-                module_name = f"AnimationData_{prefix}{ctrl_key}"
-                json_str = json.dumps(combined, indent=2)
-                module_source = (
-                    f"-- Auto-generated animation data for {module_name}\n"
-                    f"-- Consumed by character_animator.luau LoadKeyframes()\n"
-                    f"-- Policy: see docs/design/inline-over-runtime-wrappers.md\n"
-                    f"local data = game:GetService(\"HttpService\")"
-                    f":JSONDecode([==[{json_str}]==])\n"
-                    f"return data\n"
-                )
-                result.animation_data_modules.append((module_name, module_source))
-
-                # Per-controller bootstrap Script (PR2): requires the
-                # CharacterAnimator runtime + this AnimationData_* module,
-                # finds the rig, instantiates + registers the runtime, and
-                # ticks :Update(dt) on Heartbeat. Emitted as a generated
-                # Script so the pipeline parents it like other animation
-                # scripts; prefab-scoped emissions get the same
-                # script.Parent-first binding as the tween scripts and are
-                # recorded in script_scopes so the pipeline reparents them
-                # under ReplicatedStorage.Templates.<Prefab>.
-                bootstrap_name = f"AnimBootstrap_{prefix}{ctrl_key}"
-                bootstrap_source = generate_controller_bootstrap(
-                    module_name,
-                    ctrl.name,
-                    prefab_scoped=scope_is_prefab,
-                )
-                result.generated_scripts.append(
-                    (bootstrap_name, bootstrap_source)
-                )
-                if scope_is_prefab:
-                    result.script_scopes[bootstrap_name] = scope
 
     # Scene-scoped runs: UNCONVERTED entries were collected during
     # project-wide discovery, before the scene filter got applied.
@@ -2351,10 +2028,9 @@ def convert_animations(
                 filtered.append(entry)
         result.unconverted = filtered
 
-    # Standalone clips (no controller references them) — treated as
-    # transform-only if they match the predicate, else still dropped
-    # through generate_tween_script (which is the only non-bridge
-    # option available for orphaned clips).
+    # Standalone clips (no controller references them) — transform-only
+    # orphans get an inline TweenService script; humanoid/skeletal orphans
+    # are unsupported and surfaced to UNCONVERTED.md (never tweened).
     referenced_clips: set[str] = set()
     for ctrl in controllers:
         for state in ctrl.states:
@@ -2372,6 +2048,18 @@ def convert_animations(
     orphan_display = _disambiguate_by_source(orphan_clips, label="orphan")
     for clip in orphan_clips:
         disp = orphan_display[id(clip)]
+        if not clip.is_transform_only:
+            # Humanoid/skeletal orphan clip — unsupported, surface and skip.
+            result.unconverted.append({
+                "category": "animation_clip",
+                "item": f"__orphans__/{clip.name}",
+                "reason": _SKELETAL_UNSUPPORTED_REASON,
+            })
+            result.routing.setdefault("__orphans__", {})[disp] = {
+                "target": "skipped",
+                "reason": _SKELETAL_UNSUPPORTED_REASON,
+            }
+            continue
         if disp != clip.name:
             result.unconverted.append({
                 "category": "animation_clip",

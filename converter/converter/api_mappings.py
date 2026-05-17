@@ -223,27 +223,24 @@ API_CALL_MAP: dict[str, str] = {
     # -- Animation --
     # Animator.StringToHash handled by validator (extracts string argument directly)
     #
-    # Scalar parameters stay on the rig's attributes — the CharacterAnimator
-    # runtime reads initial values and connects GetAttributeChangedSignal per
-    # parameter at Register time, so a plain :SetAttribute on the rig host
-    # propagates into the state machine with no extra wiring.
+    # Skeletal/character animation is unsupported (see docs/UNSUPPORTED.md):
+    # there is no animation runtime. Animator parameter ops degrade to plain
+    # attribute reads/writes on the host so transpiled code still produces
+    # valid Luau — they have no animation effect.
     "Animator.SetBool": ":SetAttribute",
     "Animator.SetFloat": ":SetAttribute",
     "Animator.SetInteger": ":SetAttribute",
     "Animator.GetBool": ":GetAttribute",
     "Animator.GetFloat": ":GetAttribute",
     "Animator.GetInteger": ":GetAttribute",
-    # Imperative ops route to the CharacterAnimator module-level registry via
-    # the animatorDispatch helper (UTILITY_FUNCTIONS) — the rig host resolves
-    # to its CharacterAnimator instance. Calls that arrive before the
-    # per-controller bootstrap runs are queued and drained on Register.
-    # SERVER-SIDE ONLY: a transpiled call from a LocalScript will not reach
-    # the server-bound instance (see docs/UNSUPPORTED.md).
-    "Animator.SetTrigger": "animatorDispatch(host, 'SetTrigger', name)",
-    "Animator.ResetTrigger": "animatorDispatch(host, 'ResetTrigger', name)",
-    "Animator.Play": "animatorDispatch(host, 'Play', stateName)",
-    "Animator.CrossFade": "animatorDispatch(host, 'CrossFade', stateName, duration)",
-    "Animator.CrossFadeInFixedTime": "animatorDispatch(host, 'CrossFadeInFixedTime', stateName, duration)",
+    # Imperative ops (SetTrigger / Play / CrossFade …) have no runtime to
+    # dispatch to — skeletal animation is unsupported. They degrade to a
+    # harmless :SetAttribute so transpiled code stays valid Luau.
+    "Animator.SetTrigger": ":SetAttribute",
+    "Animator.ResetTrigger": ":SetAttribute",
+    "Animator.Play": ":SetAttribute",
+    "Animator.CrossFade": ":SetAttribute",
+    "Animator.CrossFadeInFixedTime": ":SetAttribute",
     "Animation.Play": "AnimationTrack:Play()",
     # -- Camera --
     "Camera.main": "workspace.CurrentCamera",
@@ -1064,19 +1061,5 @@ local function getSwipe(): string?
 \tlocal s = _lastSwipe
 \t_lastSwipe = nil
 \treturn s
-end""",
-    # Routes a transpiled imperative Animator.* call (SetTrigger / Play /
-    # CrossFade / ...) to the CharacterAnimator module-level registry. The
-    # rig host resolves to its CharacterAnimator instance; calls arriving
-    # before the per-controller bootstrap registers the host are queued by
-    # CharacterAnimator.Dispatch and drained on Register.
-    # SERVER-SIDE ONLY — a call from a LocalScript will not reach the
-    # server-bound instance (see docs/UNSUPPORTED.md).
-    "animatorDispatch": """\
-local function animatorDispatch(host: Instance?, op: string, ...)
-\tif not host then return end
-\tlocal CharacterAnimator = game:GetService("ReplicatedStorage"):FindFirstChild("CharacterAnimator")
-\tif not CharacterAnimator then return end
-\trequire(CharacterAnimator).Dispatch(host, op, ...)
 end""",
 }

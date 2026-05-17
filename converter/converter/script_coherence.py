@@ -839,13 +839,6 @@ def _fix_prefab_lookups(scripts: list[RbxScript]) -> int:
     # renaming the folder there flows through here automatically.
     from converter.prefab_packages import PREFAB_PACKAGES_FOLDER
     rs_resident_names = {PREFAB_PACKAGES_FOLDER}
-    # Runtime library ModuleScripts are injected into ReplicatedStorage by
-    # Pipeline._inject_runtime_modules, which runs AFTER this coherence pass —
-    # so they are not in `module_names` yet. CharacterAnimator in particular is
-    # looked up by the generated AnimBootstrap_* scripts (and the
-    # animatorDispatch helper) via ReplicatedStorage:FindFirstChild; that lookup
-    # is correct and must not be redirected to a workspace search.
-    rs_resident_names.add("CharacterAnimator")
 
     for s in scripts:
         original = s.source
