@@ -33,9 +33,11 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
     RemoteEvent fork.
 
 
-- [ ] **P2 — Persistent prefab/asset cache.** Prefab library is in-memory only.
-  SQLite or pickle cache keyed by `(GUID, mtime)` would halve pipeline time
-  for multi-scene projects and large games.
+- [ ] **P2 — Persistent prefab/asset cache.** Prefab library is in-memory
+  only; rebuilt from disk every conversion. Needs a cache-schema design
+  pass before code — see
+  [`docs/FUTURE_IMPROVEMENTS.md`](docs/FUTURE_IMPROVEMENTS.md)
+  § "Persistent prefab/asset cache".
 
 ## Materials & meshes
 
@@ -52,15 +54,19 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   producing different sets of Script Items. Harmonize the two paths so
   the test flips from xfail to xpass.
 - [ ] **P2 — Standalone `.rbxm` file output per prefab.** PR 5 deferred.
-  Toolbox convenience; no runtime dependency on this format.
+  Toolbox convenience; no runtime dependency. Design notes in
+  [`docs/FUTURE_IMPROVEMENTS.md`](docs/FUTURE_IMPROVEMENTS.md)
+  § "Standalone `.rbxm` per-prefab output".
 - [ ] **P2 — Visual-compare baseline screenshot (Phase 5.4 follow-up).**
   CI step is wired, gated on `eval_baseline_screenshots/SimpleFPS_main.png`
   existing. Commit a known-good baseline from the next clean smoke run
   to activate the SSIM 0.85 gate; until then the step warns and continues.
 - [ ] **P2 — Real-upload smoke secrets (Phase 5.2b / 5.3 follow-up).**
   CI jobs `real-upload-smoke` and `ai-convert-matrix` skip cleanly until
-  the repo secrets `ROBLOX_API_KEY`, `ROBLOX_UNIVERSE_ID`, `ROBLOX_PLACE_ID`,
-  and `ANTHROPIC_API_KEY` are configured. Wire them when CI billing allows.
+  their repo secrets are configured: `real-upload-smoke` needs
+  `ROBLOX_API_KEY`, `ROBLOX_UNIVERSE_ID`, `ROBLOX_PLACE_ID`, and
+  `ROBLOX_CREATOR_ID`; `ai-convert-matrix` needs `ANTHROPIC_API_KEY`.
+  Wire them when CI billing allows.
 ## Type-strictness debt (forward-only gate landed; cleanup separate)
 
 The no-Any gate prevents new smuggling. Existing-offender cleanup has

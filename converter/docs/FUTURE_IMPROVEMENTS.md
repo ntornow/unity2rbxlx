@@ -13,9 +13,23 @@ committed to as work.
 
 ## Animation system completion
 
-**Status:** Phases 0–2 landed. Animator runtime parses controllers, drives
-state machines, and supports 1D blend trees via `runtime/animator_runtime.luau`
-+ `animation_converter.py`. Phases 3–5 are open.
+**Status:** Phases 0–2 and 4 landed. Animator controllers transpile to
+self-contained per-controller `Anim_*_StateMachine` scripts
+(`animation_converter.py:generate_state_machine_script` — inline
+TweenService/RunService, no runtime `require`); other clips ship as inline
+`Anim_*` TweenService scripts. Phases 3 and 5 are open.
+
+> **Orphan-module debt.** `runtime/animator_runtime.luau` (the
+> `AnimatorRuntime` state-machine ModuleScript and its 1D blend-tree
+> support) and the `AnimationData_*` data modules are injected into output
+> when `HasAnimator` is set, but **no generated script `require`s or
+> instantiates them** — they are dead code in every converted project. The
+> Unity `Animator.*` API is translated inline by `api_mappings.py` to
+> `:SetAttribute` / `AnimationTrack:Play()`, bypassing the module entirely.
+> Resolve by either wiring a real `require(...AnimatorRuntime)` consumer or
+> deleting the orphan module + its injection. The same overstatement is
+> stale in `CLAUDE.md` ("5 runtime Luau modules auto-injected") and
+> `docs/design/inline-over-runtime-wrappers.md`.
 
 ### Phase 3 — `KeyframeSequence` export
 
@@ -26,15 +40,6 @@ to get asset IDs) works but adds an upload step and asset count.
 
 Trade-off: KeyframeSequence is a heavy XML structure, but it's deterministic
 and round-trips correctly.
-
-### Phase 4 — Pipeline integration polish
-
-Per-prefab tween emission landed (`animation_converter.py` has a
-`prefab_scoped` path that emits one tween script per prefab template and
-reparents it under `ReplicatedStorage.Templates.<Prefab>`). Remaining work:
-- Aggregate animator controller GUIDs from `PrefabTemplate` (only scenes
-  do this today; prefab-only references still fall back to unscoped
-  naming — see TODO "Prefab-scoped animator controller GUID aggregation")
 
 ### Phase 5 — Advanced features (out of scope until needed)
 
@@ -69,18 +74,12 @@ For each `.glb` / `.png` / `.ogg` file:
 Estimated savings on a re-run of SimpleFPS: 175 meshes × ~3s upload latency
 = 9+ minutes that becomes near-zero on cache hit.
 
-### Open Cloud asset audit baked into the pipeline
-
-`u2r.py audit-assets` exists and surfaces asset moderation rejections, but
-it's a separate command. Wiring it into `upload_assets` so rejected IDs
-never reach the rbxlx writer is the natural next step. Tracked as a
-follow-up note in archive (under "P0 — Animation asset 404 audit not run").
-
 ---
 
 ## Custom serializer evaluation: rbx-dom or rbxmk
 
-The current `rbxlx_writer.py` reimplements Roblox's binary format. The
+The current `rbxlx_writer.py` reimplements Roblox's XML place format
+(`rbxl_binary_writer.py` the binary variant). The
 research suggests rbx-dom is "the definitive industry standard" — our
 serializer misses internal properties (confirmed: `MeshPart.MeshId` set in
 XML is ignored by Studio).
@@ -109,40 +108,22 @@ binary dependency for marginal benefit.
 
 ## Type discipline across the whole repo
 
-The forward-only no-Any gate (PR #10) prevents new smuggling. The next
-strategic step is bringing the existing offenders under the principle:
+The forward-only no-Any gate (PR #10) prevents new smuggling.
 
-### Phase A — promote one file at a time
+### Phase A — promote existing offenders (landed)
 
-Each cleanup PR picks one file in the typed core (`pipeline.py`,
-`scene_converter.py`, `code_transpiler.py`, etc.), tightens its `Any`
-annotations to real types, and verifies via `mypy --strict` or `pyright
-strict` on that file alone.
-
-This is grunt work, but compounds: every promoted file makes the next
-easier (typed values flowing in mean fewer `Any` widening at the boundary).
+The file-by-file `Any` cleanup is complete: dedicated PRs tightened
+`storage_plan`, the ported-module signatures (PR #34), `PipelineState`
+(PR #36), and the trivial 3-fix + `ConversionContext` final 4. `TODO.md`
+§ "Type-strictness debt" no longer tracks any remaining files.
 
 ### Phase B — repo-wide type checker in CI
 
-Once the pile of `Any` is small enough, add `pyright` (or `mypy --strict`)
-as a CI gate. Initially scoped to `core/`, `unity/`, `roblox/` — the
-"data" layer. Then `converter/` (the orchestration layer) once that's
-clean.
-
-This is tracked at the file-by-file level in `TODO.md` § "Type-strictness
-debt." This entry captures the strategic sequencing.
-
----
-
-## Cross-script shared-state linter
-
-**Status:** Shipped — `converter/converter/shared_state_linter.py`. The
-linter graduated directly to option (a) auto-rewrite: orphan
-`:GetAttribute("X")` calls that have a matching exported getter on a
-writer ModuleScript are rewritten to
-`require(script.Parent.<Module>).<getter>()`. Orphans without a matching
-exporter surface as UNCONVERTED entries. The pipeline invokes it from
-`Pipeline._run_transpile_phase` (see `pipeline.py:1583`).
+CI today enforces only the forward-only no-Any gate
+(`tools/check_no_any.sh`). The strategic next step is adding `pyright`
+(or `mypy --strict`) as a full CI gate, initially scoped to `core/`,
+`unity/`, `roblox/` — the "data" layer — then `converter/` (the
+orchestration layer) once that's clean.
 
 ---
 
@@ -153,7 +134,7 @@ Roblox model files. Useful for Roblox Toolbox / sharing individual prefabs
 without the whole place. Not needed at runtime — gameplay uses the
 `ReplicatedStorage.Templates` path instead.
 
-Tracked as a small TODO; could expand into a richer per-prefab export
+Tracked as a P2 in `TODO.md`; could expand into a richer per-prefab export
 flow if a use case emerges (e.g. "export this Unity prefab as a Toolbox-
 ready model" CLI command).
 
