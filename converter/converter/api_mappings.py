@@ -235,13 +235,15 @@ API_CALL_MAP: dict[str, str] = {
     "Animator.GetInteger": ":GetAttribute",
     # Imperative ops (SetTrigger / Play / CrossFade …) have no runtime to
     # dispatch to — skeletal animation is unsupported. They degrade to a
-    # harmless :SetAttribute so transpiled code stays valid Luau.
+    # harmless :SetAttribute so transpiled code stays valid Luau. The legacy
+    # Animation component's Play() degrades the same way (there is no
+    # AnimationTrack runtime either).
     "Animator.SetTrigger": ":SetAttribute",
     "Animator.ResetTrigger": ":SetAttribute",
     "Animator.Play": ":SetAttribute",
     "Animator.CrossFade": ":SetAttribute",
     "Animator.CrossFadeInFixedTime": ":SetAttribute",
-    "Animation.Play": "AnimationTrack:Play()",
+    "Animation.Play": ":SetAttribute",
     # -- Camera --
     "Camera.main": "workspace.CurrentCamera",
     "Camera.fieldOfView": ".FieldOfView",
