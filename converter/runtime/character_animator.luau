@@ -1,7 +1,7 @@
 -- CharacterAnimator: state machine driven by exported Animator Controller JSON.
 --
 -- Controller format (from export_controller_json):
---   states:             [{name, motion, speed, loop, transitions, blendTree?}]
+--   states:             [{name, motion, speed, transitions, blendTree?, loop?}]
 --   transitions:        [{destination, conditions, duration, hasExitTime, exitTime}]
 --   conditions:         [{parameter, mode, threshold}]
 --   parameters:         [{name, type, defaultValue}]
@@ -418,7 +418,14 @@ function CharacterAnimator:_transitionTo(stateName, duration)
 		track = self:_keyframeTrackFor(newState.motion)
 	end
 	if track then
-		track.Looped = newState.loop ~= false
+		-- Only override the track's own loop flag when the controller state
+		-- explicitly carries one. export_controller_json does not emit
+		-- state.loop today, so a KeyframeTrack keeps the loop value it
+		-- derived from the clip — forcing Looped here would make one-shot
+		-- clips (jump, death, KO) loop forever.
+		if newState.loop ~= nil then
+			track.Looped = newState.loop ~= false
+		end
 		track:Play(duration)
 		local speed = newState.speed or 1
 		if speed ~= 1 then track:AdjustSpeed(speed) end
