@@ -295,14 +295,22 @@ def _make_particle_emitter(parent_xml: ET.Element, pe: RbxParticleEmitter) -> No
         ) + " "
     elif pe.color != (1.0, 1.0, 1.0):
         _add_color3(props, "Color", *pe.color[:3])
-    # Transparency -- prefer sequence if available
+    # ParticleEmitter.Transparency is always a NumberSequence in Roblox —
+    # there is no scalar Transparency property on ParticleEmitter (unlike
+    # BasePart). Emitting <float> here makes the binary writer encode the
+    # value as TYPE_FLOAT (0x04) instead of TYPE_NUMBERSEQUENCE (0x15),
+    # which deserializes in Studio as "Unexpected format 4 (expected 21)
+    # << NumberSequence << property values, name=Transparency". Always
+    # emit a NumberSequence, padding a scalar to a 2-keypoint constant
+    # curve (Roblox requires at least 2 keypoints).
+    ts = ET.SubElement(props, "NumberSequence", name="Transparency")
     if pe.transparency_sequence:
-        ts = ET.SubElement(props, "NumberSequence", name="Transparency")
         ts.text = " ".join(
             f"{t} {v} {e}" for t, v, e in pe.transparency_sequence
         ) + " "
     else:
-        _add_float(props, "Transparency", pe.transparency)
+        v = pe.transparency
+        ts.text = f"0 {v} 0 1 {v} 0 "
     _add_float(props, "LightEmission", pe.light_emission)
     if pe.texture:
         _add_content(props, "Texture", pe.texture)
@@ -608,7 +616,12 @@ def _make_ui_element(parent_xml: ET.Element, elem: RbxUIElement) -> None:
         _add_color3(props, "TextColor3", *elem.text_color[:3])
 
     if hasattr(elem, "text_size") and elem.text_size:
-        _add_int(props, "TextSize", elem.text_size)
+        # TextLabel/TextButton/TextBox.TextSize is a float in Roblox, not an
+        # int. Emitting <int> here makes the binary writer encode the value
+        # as TYPE_INT32 (0x03) instead of TYPE_FLOAT (0x04), which Studio
+        # rejects with "Unexpected format 3 (expected 4) << float <<
+        # property values, name=TextSize". Use _add_float.
+        _add_float(props, "TextSize", float(elem.text_size))
 
     # Text alignment + Font (token enums). Only emit when explicitly set so
     # elements without Unity Text data keep the Roblox defaults.

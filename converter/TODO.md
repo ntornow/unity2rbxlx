@@ -8,6 +8,65 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
 
 ## Pipeline / runtime gaps
 
+- [ ] **P1 — Genre-genericness follow-ups for FPS-leftward-migration PR (codex 2026-05-17).**
+  PR #96 shipped pipeline-level fixes for SimpleFPS gameplay bugs (mouse-look,
+  walk speed, mine trigger, rifle visibility, ParticleEmitter NumberSequence,
+  TextLabel TextSize float, stale .rbxl regen). Codex review on the branch
+  flagged six findings the PR explicitly defers — non-FPS Unity projects may
+  regress on any of these until follow-up lands.
+
+  - **P1.a — `localscript_api_shim` type-aware accessor classification.**
+    `_classify_api()` (`script_coherence_packs.py:_classify_api`) currently
+    treats any bare-identifier return (`return gotKey`) as boolean
+    backing-state and emits a hardcoded `c:GetAttribute(...) == true or false`
+    shim. Non-boolean APIs (ammo counts, cooldowns, enum/state IDs, inventory
+    quantities) silently become "always false". Fix: classify by inferring the
+    backing var's declared literal type (`= 0` → number, `= ""` → string, etc.)
+    and emit type-appropriate `GetAttribute` reads. Add mixed-type test
+    coverage in `tests/test_script_coherence_packs.py::TestLocalScriptApiShim`.
+  - **P1.b — `localscript_api_shim` server-side consumer fails.** The shim's
+    `_resolveCharacter(character)` (`script_coherence_packs.py:_build_shim_source`)
+    falls back to `Players.LocalPlayer.Character`, which is nil on server
+    Scripts. Door's `playerHasKey()` no-arg call therefore returns false
+    forever. Fix: detect call-site context (Script vs LocalScript) at the
+    consumer-rewrite stage and either (a) require an explicit `character`
+    argument and rewrite the call site to pass it, or (b) emit per-context
+    shim shapes. Add behavioural test (not just textual-rewrite assertion).
+  - **P1.c — `template_clone_visibility` over-broad detector.** The pack
+    matches ANY `cloneTemplate(...)` / `Templates:FindFirstChild(...):Clone()`
+    anywhere and blindly forces `Transparency=0`, `CanCollide=false`,
+    `Massless=true` + welds on every BasePart of the clone
+    (`script_coherence_packs.py:_inject_template_clone_visibility`). Non-FPS
+    projects will see invisible triggers, VFX helpers, physical props, vehicle
+    parts, and projectile clones mutated. Fix: narrow the detector to consumers
+    that re-parent the clone to a weapon-slot-style Part holder, OR gate on the
+    template's actual BaseParts being `Transparency=1` at clone time. The
+    existing `Spawner`/`Bullet` test fixture proves the over-fire path — flip
+    it to a no-op assertion.
+  - **P2.a — Gate FPS-specific transpiler rules.** The new rules in
+    `code_transpiler.py` mouse-look (raw `GetMouseDelta()` + radians-per-pixel
+    constant), HRP+1.5-stud camera, and `jumpSpeed → Humanoid.JumpHeight` are
+    first-person humanoid recipes, not generic CharacterController policy. The
+    walk-speed `WalkSpeed = speed × STUDS_PER_METER` rule and the physics-radii
+    Unity-m → studs rule are genuinely generic. Fix: wrap the FPS-shaped rules
+    in an explicit "ONLY for first-person / locked-mouse cameras" prelude so
+    the AI doesn't emit them on third-person, top-down, platformer, or vehicle
+    scripts.
+  - **P2.b — Genre-negative `run_packs()` regression fixtures.** All new
+    coherence pack tests cover "single unrelated script stays unchanged" but
+    nothing pins "BoatAttack-style / RedRunner-style / ChopChop-style script
+    set runs through `run_packs()` with zero pack fires." Add fixtures that
+    load each non-FPS test project's transpiled output (or a minimal stub of
+    it) and assert that none of the three new packs emit `<Name>Shared`,
+    rewrite Touched handlers, or splice visibility fixups.
+  - **P2.c — `convert_interactive.py upload` xml_to_binary error fallback.**
+    On `xml_to_binary()` exception the upload path deletes `.rbxl` and
+    "falls back" to uploading the `.rbxlx` (`convert_interactive.py:996`),
+    but the surrounding comments and `u2r.py:528` both state Open Cloud
+    rejects XML with HTTP 400. Fix: on regen failure, raise a hard error
+    instead of producing a guaranteed-failed publish — OR verify the XML path
+    actually works and delete the misleading "binary-only" comments.
+
 - [ ] **P3 — Optional component-aware autogen injection.** The
   remaining piece of the original FPS-extraction P1: replace the
   heuristic-based ``detect_fps_game`` with component-aware injection.

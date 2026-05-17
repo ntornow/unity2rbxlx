@@ -1435,7 +1435,7 @@ UI:
 Camera (FPS/First-Person):
 - Set `camera.CameraType = Enum.CameraType.Scriptable` before controlling the camera
 - **CRITICAL**: In Unity, the camera is a child of the player and auto-follows position/rotation. In Roblox, the camera is INDEPENDENT — you must explicitly position it at the character's head every frame.
-- Use `character:FindFirstChild("Head").Position + Vector3.new(0, 0.5, 0)` for camera position
+- Use `character:FindFirstChild("HumanoidRootPart").Position + Vector3.new(0, 1.5, 0)` for camera position — **NOT** `Head.Position`. The Head bone bobs every step under Roblox's default walking animation; tracking it propagates that bob into the camera and produces a visible per-step shiver. The HumanoidRootPart is the physics root and is animation-stable; offset upward by ~1.5 studs to land near eye level.
 - Track yaw (mouse X) and pitch (mouse Y) as separate angles, combine into camera CFrame:
   `camera.CFrame = CFrame.new(headPos) * CFrame.Angles(0, yawAngle, 0) * CFrame.Angles(pitchAngle, 0, 0)`
 - **Mouse look (canonical FPS pattern)**: read `UserInputService:GetMouseDelta()` every frame inside the RenderStepped callback — NOT `UserInputService.InputChanged` with `input.Delta`. `GetMouseDelta()` is purpose-built for FPS: it returns the accumulated pixel delta since the last call and is reliable while `MouseBehavior = LockCenter`. The `InputChanged` MouseMovement event with `LockCenter` is flaky and loses deltas under high frame rates.
