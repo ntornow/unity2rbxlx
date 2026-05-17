@@ -76,7 +76,7 @@ def _disambiguate_by_source(items: list, label: str) -> dict[int, str]:
 # Unity humanoid-bone → Roblox R15 part name.
 #
 # Used by is_transform_only() to decide a clip's routing target:
-#   - any bone matches  → humanoid clip → animator_runtime.luau
+#   - any bone matches  → humanoid clip → character_animator.luau
 #   - no bone matches   → transform-only → inline TweenService
 #
 # See docs/design/inline-over-runtime-wrappers.md for the policy that deletes
@@ -159,7 +159,7 @@ class AnimClip:
         """True when no curve path references a humanoid bone.
 
         Clips driving humanoid bones (Hips, Spine, LeftUpperArm, …) must
-        go through animator_runtime.luau so Roblox's Humanoid can play
+        go through character_animator.luau so Roblox's Humanoid can play
         them. Clips driving only arbitrary transform children (a spinning
         platform, a bobbing door) can use inline TweenService instead.
 
@@ -238,7 +238,7 @@ class BlendTreeEntry:
 class BlendTree:
     """A 1D Unity blend tree.
 
-    The Luau runtime at ``runtime/animator_runtime.luau`` expects the
+    The Luau runtime at ``runtime/character_animator.luau`` expects the
     emitted JSON shape ``{name -> {param, clips: [{clip, threshold}]}}``.
     2D blend trees are not emitted; those states log a warning and fall
     back to the first child clip in their state's ``clip_guid``.
@@ -272,7 +272,7 @@ class AnimationConversionResult:
     total_scripts_generated: int = 0
     # Per-clip routing decisions.  Shape:
     #   { controller_name: { clip_name: { "target": str, "reason": str } } }
-    # "target" is one of: "animator_runtime", "inline_tween", "skipped".
+    # "target" is one of: "character_animator", "inline_tween", "skipped".
     # Serialized into conversion_plan.json under the "animation_routing" key
     # so rehydration and downstream consumers can see what got routed where.
     routing: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
@@ -1812,7 +1812,7 @@ def export_controller_json(
 ) -> dict[str, Any]:
     """Export an AnimatorController as a JSON-serializable dict for the runtime.
 
-    The animator_runtime.luau expects this format for state machine evaluation.
+    The character_animator.luau expects this format for state machine evaluation.
 
     When ``clip_name_by_guid`` is provided, BlendTree entries resolve their
     ``clip_guid`` → ``clip_name`` so the runtime can look clips up by name.
@@ -1899,7 +1899,7 @@ def export_clip_keyframes(clip: AnimClip) -> dict[str, Any]:
 
     Per-bone frames are merged across position / rotation / euler / scale
     curves and time-sorted. The runtime consumer
-    (``animator_runtime.luau:_playKeyframeAnimation``) builds each frame's
+    (``character_animator.luau:_playKeyframeAnimation``) builds each frame's
     CFrame from ``cf.x / .y / .z / .rx / .ry / .rz`` and defaults any
     missing axis to 0 — so emitting per-curve frames (position keys for a
     bone, then rotation keys for the same bone) produced partial frames
@@ -2035,7 +2035,7 @@ def convert_animations(
     """Convert all animations in a Unity project to Roblox Luau scripts.
 
     Phase 4.5 routing: each clip is sent to exactly one target —
-      - humanoid clips (touch R15 bone names)  → animator_runtime.luau JSON
+      - humanoid clips (touch R15 bone names)  → character_animator.luau JSON
       - transform-only clips (non-humanoid)    → inline TweenService Scripts
     No ``require()`` of deleted bridge modules is emitted from either path.
     Per-clip routing + reason is recorded on ``result.routing`` so the
@@ -2272,7 +2272,7 @@ def convert_animations(
         # clip names within each partition: two distinct clips that share
         # a Unity-given name would otherwise collide in per_clip_routing,
         # in inline-tween script names, and (for humanoid clips) in the
-        # animator_runtime keyframes dict — silently dropping all but
+        # character_animator keyframes dict — silently dropping all but
         # the last entry. The collision is logged as UNCONVERTED so the
         # user sees it; the affected entries get an 8-char source-path
         # hash suffix so the data survives.
@@ -2318,7 +2318,7 @@ def convert_animations(
             }
         for clip in humanoid_clips:
             per_clip_routing[humanoid_display[id(clip)]] = {
-                "target": "animator_runtime",
+                "target": "character_animator",
                 "reason": "humanoid bone targets or empty curve set",
             }
         result.routing[ctrl_key] = per_clip_routing
@@ -2345,7 +2345,7 @@ def convert_animations(
 
             # Inline TweenService script for every transform-only clip,
             # regardless of state-machine presence — these never go
-            # through animator_runtime.
+            # through character_animator.
             for clip in transform_only_clips:
                 clip_disp = transform_display[id(clip)]
                 script_name = f"Anim_{prefix}{ctrl_key}_{clip_disp}"
@@ -2360,7 +2360,7 @@ def convert_animations(
                     if scope_is_prefab:
                         result.script_scopes[script_name] = scope
 
-            # animator_runtime JSON module — emit only when at least one
+            # character_animator JSON module — emit only when at least one
             # humanoid clip lands here. Transform-only clips are NOT
             # bundled (they're inline Scripts above).
             if humanoid_clips:
@@ -2389,7 +2389,7 @@ def convert_animations(
                 json_str = json.dumps(combined, indent=2)
                 module_source = (
                     f"-- Auto-generated animation data for {module_name}\n"
-                    f"-- Consumed by animator_runtime.luau LoadKeyframes()\n"
+                    f"-- Consumed by character_animator.luau LoadKeyframes()\n"
                     f"-- Policy: see docs/design/inline-over-runtime-wrappers.md\n"
                     f"local data = game:GetService(\"HttpService\")"
                     f":JSONDecode([==[{json_str}]==])\n"

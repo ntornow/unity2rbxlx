@@ -1583,7 +1583,7 @@ class TestAnimationDataExport:
         assert walking["transitions"][0]["destination"] == "Idle"
 
     def test_export_condition_modes(self):
-        """All 6 condition modes the animator_runtime supports are mapped."""
+        """All 6 condition modes the character_animator supports are mapped."""
         mode_map = {1: "If", 2: "IfNot", 3: "Greater", 4: "Less", 6: "Equals", 7: "NotEqual"}
         conditions = []
         for mode_int, mode_str in mode_map.items():
@@ -1602,7 +1602,7 @@ class TestAnimationDataExport:
         assert exported_modes == set(mode_map.values())
 
     def test_export_transition_fields_match_runtime(self):
-        """Transition fields include everything animator_runtime reads."""
+        """Transition fields include everything character_animator reads."""
         ctrl, _ = self._make_controller_with_clip()
         data = export_controller_json(ctrl)
         walking = [s for s in data["states"] if s["name"] == "Walking"][0]
@@ -2240,7 +2240,7 @@ class TestPhase45Routing:
         assets.mkdir()
 
         # Two clips named "Walk" living at different paths — both touch
-        # a humanoid bone (Hips) so they route through animator_runtime
+        # a humanoid bone (Hips) so they route through character_animator
         # and hit the per-controller keyframes dict-comprehension.
         for fname, guid in (("WalkA.anim", "a" * 32), ("WalkB.anim", "b" * 32)):
             (assets / fname).write_text(textwrap.dedent("""\

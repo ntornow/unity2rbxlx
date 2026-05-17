@@ -24,7 +24,7 @@ Unity games generate gameplay content at runtime — spawned enemies, level chun
 Pipeline injects the runtime animator and animator config modules into ReplicatedStorage. Spawn code wires per-clone:
 
 ```lua
-local Animator = require(ReplicatedStorage:WaitForChild("AnimatorRuntime"))
+local Animator = require(ReplicatedStorage:WaitForChild("CharacterAnimator"))
 local Config = require(ReplicatedStorage:WaitForChild(templateName .. "_AnimConfig"))
 local animator = Animator.new(clone, Config)
 table.insert(spawnedObjects, { model = clone, animator = animator })

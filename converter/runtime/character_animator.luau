@@ -1,4 +1,4 @@
--- AnimatorRuntime: state machine driven by exported Animator Controller JSON.
+-- CharacterAnimator: state machine driven by exported Animator Controller JSON.
 --
 -- Controller format (from export_controller_json):
 --   states:             [{name, motion, speed, loop, transitions, blendTree?}]
@@ -9,11 +9,11 @@
 --   blendTrees:         {name -> {param, clips: [{clip, threshold}]}} (optional)
 --   defaultState:       string (optional)
 
-local AnimatorRuntime = {}
-AnimatorRuntime.__index = AnimatorRuntime
+local CharacterAnimator = {}
+CharacterAnimator.__index = CharacterAnimator
 
-function AnimatorRuntime.new(controllerData, humanoidOrAnimController)
-	local self = setmetatable({}, AnimatorRuntime)
+function CharacterAnimator.new(controllerData, humanoidOrAnimController)
+	local self = setmetatable({}, CharacterAnimator)
 	self.controller = controllerData
 	self.animator = humanoidOrAnimController
 	self.parameters = {}
@@ -49,33 +49,33 @@ end
 
 -- Parameter setters
 
-function AnimatorRuntime:SetBool(name, value) self.parameters[name] = value end
-function AnimatorRuntime:SetFloat(name, value) self.parameters[name] = value end
-function AnimatorRuntime:SetInteger(name, value) self.parameters[name] = math.floor(value) end
+function CharacterAnimator:SetBool(name, value) self.parameters[name] = value end
+function CharacterAnimator:SetFloat(name, value) self.parameters[name] = value end
+function CharacterAnimator:SetInteger(name, value) self.parameters[name] = math.floor(value) end
 
-function AnimatorRuntime:SetTrigger(name)
+function CharacterAnimator:SetTrigger(name)
 	self.parameters[name] = true
 	task.defer(function() self.parameters[name] = false end)
 end
 
 -- Parameter getters
 
-function AnimatorRuntime:GetFloat(name) return self.parameters[name] or 0 end
-function AnimatorRuntime:GetBool(name) return self.parameters[name] or false end
-function AnimatorRuntime:GetInt(name) return self.parameters[name] or 0 end
+function CharacterAnimator:GetFloat(name) return self.parameters[name] or 0 end
+function CharacterAnimator:GetBool(name) return self.parameters[name] or false end
+function CharacterAnimator:GetInt(name) return self.parameters[name] or 0 end
 
 -- Jump directly to a state by name.
-function AnimatorRuntime:Play(stateName)
+function CharacterAnimator:Play(stateName)
 	for _, s in self.controller.states do
 		if s.name == stateName then
 			self:_transitionTo(stateName, 0.25)
 			return
 		end
 	end
-	warn("[AnimatorRuntime] Unknown state: " .. tostring(stateName))
+	warn("[CharacterAnimator] Unknown state: " .. tostring(stateName))
 end
 
-function AnimatorRuntime:_evaluateCondition(condition)
+function CharacterAnimator:_evaluateCondition(condition)
 	local val = self.parameters[condition.parameter]
 	if val == nil then return false end
 
@@ -90,7 +90,7 @@ function AnimatorRuntime:_evaluateCondition(condition)
 	return false
 end
 
-function AnimatorRuntime:_checkTransitions()
+function CharacterAnimator:_checkTransitions()
 	if not self.currentState then return end
 
 	local function tryTransition(transition)
@@ -119,7 +119,7 @@ function AnimatorRuntime:_checkTransitions()
 	end
 end
 
-function AnimatorRuntime:_transitionTo(stateName, duration)
+function CharacterAnimator:_transitionTo(stateName, duration)
 	local newState = nil
 	for _, s in self.controller.states do
 		if s.name == stateName then newState = s; break end
@@ -145,7 +145,7 @@ function AnimatorRuntime:_transitionTo(stateName, duration)
 	end
 end
 
-function AnimatorRuntime:Update(dt)
+function CharacterAnimator:Update(dt)
 	self.stateTime = self.stateTime + dt
 	self:_checkTransitions()
 	if self.currentState and self.currentState.blendTree and self.controller.blendTrees then
@@ -153,7 +153,7 @@ function AnimatorRuntime:Update(dt)
 	end
 end
 
-function AnimatorRuntime:LoadAnimations(animations)
+function CharacterAnimator:LoadAnimations(animations)
 	for name, animId in animations do
 		local anim = Instance.new("Animation")
 		anim.AnimationId = animId
@@ -161,7 +161,7 @@ function AnimatorRuntime:LoadAnimations(animations)
 	end
 end
 
-function AnimatorRuntime:_lazyLoadTrack(clipName)
+function CharacterAnimator:_lazyLoadTrack(clipName)
 	if self.tracks[clipName] then return self.tracks[clipName] end
 	if not self.animator then return nil end
 	local parent = self.animator.Parent
@@ -176,14 +176,14 @@ function AnimatorRuntime:_lazyLoadTrack(clipName)
 	end
 
 	if not self._warnedClips[clipName] then
-		warn("[AnimatorRuntime] Animation not found: " .. tostring(clipName))
+		warn("[CharacterAnimator] Animation not found: " .. tostring(clipName))
 		self._warnedClips[clipName] = true
 	end
 	return nil
 end
 
 -- 1D blend tree: start all tracks at weight 0, then interpolate per-frame.
-function AnimatorRuntime:_startBlendTree(blendTreeName)
+function CharacterAnimator:_startBlendTree(blendTreeName)
 	local bt = self.controller.blendTrees[blendTreeName]
 	if not bt or not bt.clips then return end
 	for _, entry in bt.clips do
@@ -196,7 +196,7 @@ function AnimatorRuntime:_startBlendTree(blendTreeName)
 	end
 end
 
-function AnimatorRuntime:_updateBlendTree(blendTreeName)
+function CharacterAnimator:_updateBlendTree(blendTreeName)
 	local bt = self.controller.blendTrees[blendTreeName]
 	if not bt or not bt.clips or #bt.clips == 0 then return end
 
@@ -230,11 +230,11 @@ function AnimatorRuntime:_updateBlendTree(blendTreeName)
 end
 
 -- TweenService-based bone animation fallback (no uploaded animation assets).
-function AnimatorRuntime:LoadKeyframes(keyframeData)
+function CharacterAnimator:LoadKeyframes(keyframeData)
 	self._keyframeData = keyframeData
 end
 
-function AnimatorRuntime:_playKeyframeAnimation(motionName, model, loop)
+function CharacterAnimator:_playKeyframeAnimation(motionName, model, loop)
 	local TweenService = game:GetService("TweenService")
 	if not self._keyframeData or not self._keyframeData[motionName] then return end
 
@@ -295,7 +295,7 @@ function AnimatorRuntime:_playKeyframeAnimation(motionName, model, loop)
 	end
 end
 
-function AnimatorRuntime:Destroy()
+function CharacterAnimator:Destroy()
 	for _, track in self.tracks do
 		track:Stop(0)
 		track:Destroy()
@@ -309,4 +309,4 @@ function AnimatorRuntime:Destroy()
 	end
 end
 
-return AnimatorRuntime
+return CharacterAnimator

@@ -65,7 +65,7 @@ The `converter/runtime/` directory is not empty after this policy. It still
 holds five legitimate runtime modules that are auto-injected into converted
 games:
 
- - `animator_runtime.luau` — Unity Animator Controller runtime (state
+ - `character_animator.luau` — Unity Animator Controller runtime (state
    machines, parameters, transitions, blend trees).
  - `nav_mesh_runtime.luau` — NavMeshAgent → `PathfindingService` runtime.
  - `event_system.luau` — `UnityEvent` wiring.
@@ -134,7 +134,7 @@ The nine wrappers that were removed under this policy:
    TweenService scripts.
  - `converter/runtime/animator_bridge.luau` — unique features (blend
    trees, getters, `Play()`, Any-state transitions, lazy track loading,
-   `Destroy()`) merged into `animator_runtime.luau`; deleted.
+   `Destroy()`) merged into `character_animator.luau`; deleted.
 
 And the orphaned scanner:
 

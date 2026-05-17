@@ -91,8 +91,8 @@ def test_api_mappings_still_inlines_covered_apis():
         assert hook in LIFECYCLE_MAP, f"Lifecycle hook {hook} missing from LIFECYCLE_MAP"
 
 
-def test_animator_runtime_has_consolidated_features():
-    source = (RUNTIME_DIR / "animator_runtime.luau").read_text()
+def test_character_animator_has_consolidated_features():
+    source = (RUNTIME_DIR / "character_animator.luau").read_text()
     for method in ["GetFloat", "GetBool", "GetInt", "Play",
                     "Destroy", "_startBlendTree", "_updateBlendTree",
                     "_lazyLoadTrack", "anyStateTransitions"]:
@@ -191,8 +191,8 @@ def _require_arguments(source: str) -> list[str]:
     return results
 
 
-def test_animator_runtime_luau_syntax():
-    source = (RUNTIME_DIR / "animator_runtime.luau").read_text()
+def test_character_animator_luau_syntax():
+    source = (RUNTIME_DIR / "character_animator.luau").read_text()
     lines = source.splitlines()
 
     # No leftover --- docstring blocks (slop indicator)
@@ -200,7 +200,7 @@ def test_animator_runtime_luau_syntax():
     assert not triple_dash, f"--- docstrings at lines {triple_dash}"
 
     # Must return the module table
-    assert lines[-1].strip() == "return AnimatorRuntime"
+    assert lines[-1].strip() == "return CharacterAnimator"
 
     # Sanity: expected method count (22 functions after consolidation)
     func_count = sum(1 for l in lines if l.strip().startswith("function ") or
