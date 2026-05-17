@@ -4037,3 +4037,134 @@ class TestControllerBootstrapCodegen:
             if n == "AnimBootstrap_Hero_Hero"
         )
         assert "script.Parent" in bootstrap
+
+
+class TestTweenBackendDataContract:
+    """PR2 end-to-end: the humanoid path must emit AnimationData with real
+    bone keyframes, and the controller state's ``motion`` must resolve to a
+    key that exists in that keyframes dict.
+
+    Trash Dash end-to-end validation surfaced the gap this closes: a
+    controller can route through the CharacterAnimator path yet emit
+    ``bones: {}`` (Trash Dash's only converted controller was a UI
+    animation), and the existing bootstrap test only checked the Script was
+    emitted, not that the data behind it is coherent. The fixture
+    deliberately names the state (``Locomotion``) differently from its clip
+    (``WalkCycle``) so the motion-key resolution (PR2 item 1) is genuinely
+    exercised, not satisfied by an accidental name collision.
+    """
+
+    def test_humanoid_controller_emits_bones_and_resolves_motion_key(
+        self, tmp_path: Path,
+    ) -> None:
+        import json
+        from unity.guid_resolver import build_guid_index
+
+        assets = tmp_path / "Assets"
+        assets.mkdir()
+        clip_guid = "e" * 32
+
+        (assets / "WalkCycle.anim").write_text(textwrap.dedent("""\
+            %YAML 1.1
+            %TAG !u! tag:unity3d.com,2011:
+            --- !u!74 &7400000
+            AnimationClip:
+              m_Name: WalkCycle
+              m_SampleRate: 30
+              m_AnimationClipSettings:
+                m_StartTime: 0
+                m_StopTime: 1.0
+                m_LoopTime: 1
+              m_PositionCurves:
+              - curve:
+                  m_Curve:
+                  - time: 0
+                    value: {x: 0, y: 0, z: 0}
+                  - time: 0.5
+                    value: {x: 1, y: 2, z: 0}
+                  - time: 1
+                    value: {x: 0, y: 0, z: 0}
+                path: Hips
+              - curve:
+                  m_Curve:
+                  - time: 0
+                    value: {x: 0, y: 1, z: 0}
+                  - time: 1
+                    value: {x: 0, y: 3, z: 0}
+                path: Spine
+              m_RotationCurves: []
+              m_EulerCurves: []
+              m_ScaleCurves: []
+            """))
+        (assets / "WalkCycle.anim.meta").write_text(
+            f"fileFormatVersion: 2\nguid: {clip_guid}\n"
+        )
+        (assets / "Climber.controller").write_text(textwrap.dedent(f"""\
+            %YAML 1.1
+            %TAG !u! tag:unity3d.com,2011:
+            --- !u!91 &9100000
+            AnimatorController:
+              m_Name: Climber
+              m_AnimatorParameters: []
+              m_AnimatorLayers:
+              - m_Name: Base Layer
+                m_StateMachine: {{fileID: 200}}
+            --- !u!1107 &200
+            AnimatorStateMachine:
+              m_ChildStates:
+              - m_State: {{fileID: 301}}
+              m_DefaultState: {{fileID: 301}}
+            --- !u!1102 &301
+            AnimatorState:
+              m_Name: Locomotion
+              m_Motion:
+                fileID: 7400000
+                guid: {clip_guid}
+                type: 2
+            """))
+        (assets / "Climber.controller.meta").write_text(
+            "fileFormatVersion: 2\nguid: " + "f" * 32 + "\n"
+        )
+
+        guid_index = build_guid_index(tmp_path)
+        result = convert_animations(tmp_path, guid_index=guid_index)
+
+        # The AnimationData_* module carries the controller graph + keyframes.
+        data_mod = next(
+            (src for n, src in result.animation_data_modules
+             if n == "AnimationData_Climber"),
+            None,
+        )
+        assert data_mod is not None, [n for n, _ in result.animation_data_modules]
+        payload = json.loads(data_mod.split("[==[", 1)[1].rsplit("]==]", 1)[0])
+
+        # Keyframes carry real bone tracks — not an empty bones dict (the
+        # exact shape Trash Dash's UI controller produced).
+        keyframes = payload["keyframes"]
+        assert keyframes, "keyframes dict is empty"
+        clip_kf = next(iter(keyframes.values()))
+        bones = clip_kf["bones"]
+        assert set(bones) >= {"Hips", "Spine"}, sorted(bones)
+        assert len(bones["Hips"]) >= 2 and "cf" in bones["Hips"][0]
+
+        # Motion-key contract: the state's `motion` must be a key present in
+        # the keyframes dict (the clip display name) — NOT the state name.
+        state = payload["controller"]["states"][0]
+        assert state["name"] == "Locomotion"
+        assert state["motion"] in keyframes, (
+            f"motion {state['motion']!r} not in keyframes {sorted(keyframes)}"
+        )
+        assert state["motion"] != "Locomotion"  # resolved to the clip name
+
+        # A coherent bootstrap is paired with the module.
+        bootstrap = next(
+            (src for n, src in result.generated_scripts
+             if n == "AnimBootstrap_Climber"),
+            None,
+        )
+        assert bootstrap is not None
+        assert 'FindFirstChild("CharacterAnimator")' in bootstrap
+        assert 'FindFirstChild("AnimationData_Climber")' in bootstrap
+        assert "CharacterAnimator.new(animationData.controller, rig)" in bootstrap
+        assert "CharacterAnimator.Register(rig, instance)" in bootstrap
+        assert "Heartbeat" in bootstrap
