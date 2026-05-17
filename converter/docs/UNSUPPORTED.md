@@ -84,7 +84,7 @@ support see also `CLAUDE.md` § Supported Features.
 | Feature | Notes |
 |---|---|
 | Property animations | TweenService scripts |
-| Skeletal animation (R15-mappable) | Motor6D bone chain via `animator_runtime.luau` |
+| Skeletal animation (R15-mappable) | Motor6D bone chain via `character_animator.luau` |
 | Animator state machine | Unified state machine script with parameter-driven transitions |
 | 1D blend trees | Linear interpolation between thresholds |
 | TransformAnimator (CFrame/Size curves) | Inline TweenService Scripts (per `inline-over-runtime-wrappers.md`) |

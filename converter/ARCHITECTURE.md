@@ -79,7 +79,7 @@ Upload publishing has two paths with different semantics: interactive `upload` r
    - Texture Decal IDs -> Image IDs (SurfaceAppearance needs Image, not Decal)
 6. **Materials**: material_mapper -- Unity .mat files -> Roblox SurfaceAppearance with uploaded texture URLs
 7. **Scripts**: code_transpiler -- C# -> Luau (rule-based + AI via Claude CLI), syntax-gated by `luau-analyze` + AI reprompt loop (replaces the former `luau_validator.py`, removed 2026-04-18)
-8. **Animations**: animation_converter -- .anim/.controller -> TweenService Luau scripts (transform-only) or animator_runtime (humanoid)
+8. **Animations**: animation_converter -- .anim/.controller -> TweenService Luau scripts (transform-only) or character_animator (humanoid)
 9. **Convert Scene**: scene_converter + component_converter -- build Roblox data model
 10. **Output**: rbxlx_writer -- generate .rbxlx XML; optional sibling .rbxl via `rbxl_binary_writer`
 
@@ -119,7 +119,7 @@ Where:
 
 ## Design Decisions
 
-- **Inline over runtime wrappers** — Unity APIs are translated to Luau at transpile time via `api_mappings.py` / `UTILITY_FUNCTIONS`, not via `require()`-able runtime modules. Only stateful runtimes survive (`animator_runtime`, `nav_mesh_runtime`, `event_system`, `event_dispatch`, `physics_bridge`, `cinemachine_runtime`, plus feature runtimes for object pooling, pickups, sub-emitters). Nine runtime bridges were deleted in 2026-04. See `docs/design/inline-over-runtime-wrappers.md`.
+- **Inline over runtime wrappers** — Unity APIs are translated to Luau at transpile time via `api_mappings.py` / `UTILITY_FUNCTIONS`, not via `require()`-able runtime modules. Only stateful runtimes survive (`character_animator`, `nav_mesh_runtime`, `event_system`, `event_dispatch`, `physics_bridge`, `cinemachine_runtime`, plus feature runtimes for object pooling, pickups, sub-emitters). Nine runtime bridges were deleted in 2026-04. See `docs/design/inline-over-runtime-wrappers.md`.
 - **Conversion plan rehydration** — `conversion_plan.json` records `{script_type, parent_path}` for every transpiled script so the rehydration path (interactive `assemble --no-retranspile`, `upload` rebuild) reconstructs the exact same Roblox script-container layout as the fresh-transpile path. Phase 3 design.
 - **Upload publishes a rebuild, not the on-disk `.rbxlx`** — there is no `.rbxlx` reader; both publish paths reconstruct `rbx_place` rather than reading the file. See `CLAUDE.md` § Upload semantics. Reader is roadmapped in `docs/FUTURE_IMPROVEMENTS.md`.
 

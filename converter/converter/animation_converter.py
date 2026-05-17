@@ -76,7 +76,7 @@ def _disambiguate_by_source(items: list, label: str) -> dict[int, str]:
 # Unity humanoid-bone → Roblox R15 part name.
 #
 # Used by is_transform_only() to decide a clip's routing target:
-#   - any bone matches  → humanoid clip → animator_runtime.luau
+#   - any bone matches  → humanoid clip → character_animator.luau
 #   - no bone matches   → transform-only → inline TweenService
 #
 # See docs/design/inline-over-runtime-wrappers.md for the policy that deletes
@@ -159,7 +159,7 @@ class AnimClip:
         """True when no curve path references a humanoid bone.
 
         Clips driving humanoid bones (Hips, Spine, LeftUpperArm, …) must
-        go through animator_runtime.luau so Roblox's Humanoid can play
+        go through character_animator.luau so Roblox's Humanoid can play
         them. Clips driving only arbitrary transform children (a spinning
         platform, a bobbing door) can use inline TweenService instead.
 
@@ -238,7 +238,7 @@ class BlendTreeEntry:
 class BlendTree:
     """A 1D Unity blend tree.
 
-    The Luau runtime at ``runtime/animator_runtime.luau`` expects the
+    The Luau runtime at ``runtime/character_animator.luau`` expects the
     emitted JSON shape ``{name -> {param, clips: [{clip, threshold}]}}``.
     2D blend trees are not emitted; those states log a warning and fall
     back to the first child clip in their state's ``clip_guid``.
@@ -272,7 +272,7 @@ class AnimationConversionResult:
     total_scripts_generated: int = 0
     # Per-clip routing decisions.  Shape:
     #   { controller_name: { clip_name: { "target": str, "reason": str } } }
-    # "target" is one of: "animator_runtime", "inline_tween", "skipped".
+    # "target" is one of: "character_animator", "inline_tween", "skipped".
     # Serialized into conversion_plan.json under the "animation_routing" key
     # so rehydration and downstream consumers can see what got routed where.
     routing: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
@@ -1602,217 +1602,13 @@ def _generate_parameter_driven_playback(
             lines.append("playAnimation()")
 
 
-# ---------------------------------------------------------------------------
-# Unified state machine script generation
-# ---------------------------------------------------------------------------
-
-def generate_state_machine_script(
-    controller: AnimatorController,
-    clips_by_guid: dict[str, AnimClip],
-    game_object_name: str = "",
-    *,
-    prefab_scoped: bool = False,
-) -> str:
-    """Generate a unified Luau state machine script for an AnimatorController.
-
-    Instead of separate scripts per clip, this generates a single script that:
-    - Defines all animation states with their clip playback
-    - Evaluates transition conditions each frame
-    - Switches states based on parameter values
-    - Supports exit-time transitions (play clip, then auto-transition)
-
-    Args:
-        controller: The parsed AnimatorController.
-        clips_by_guid: Dict mapping clip GUID to AnimClip.
-        game_object_name: Name of the target Roblox part/model.
-        prefab_scoped: When True, the script lives under a template
-            cloned via ``ReplicatedStorage.Templates.<Prefab>:Clone()``.
-            Target binding walks up from ``script.Parent`` so each clone's
-            state machine drives its own clone — a global ``workspace``
-            search would bind every clone to whichever copy
-            ``FindFirstChild(name, true)`` returns first.
-
-    Returns:
-        Luau source code as a string, or "" if no usable states.
-    """
-    # Build state info with resolved clips
-    states_with_clips: list[tuple[AnimState, AnimClip | None]] = []
-    state_by_fid: dict[str, AnimState] = {}
-    for state in controller.states:
-        clip = clips_by_guid.get(state.clip_guid)
-        states_with_clips.append((state, clip))
-        state_by_fid[state.file_id] = state
-
-    if not states_with_clips:
-        return ""
-
-    # Find default state
-    default_state = None
-    for state, clip in states_with_clips:
-        if state.file_id == controller.default_state_file_id:
-            default_state = state
-            break
-    if default_state is None and states_with_clips:
-        default_state = states_with_clips[0][0]
-
-    lines: list[str] = []
-    lines.append("-- Auto-generated Animator State Machine")
-    lines.append(f"-- Controller: {controller.name}")
-    lines.append(f"-- States: {len(states_with_clips)}, Parameters: {len(controller.parameters)}")
-    lines.append("")
-    lines.append('local TweenService = game:GetService("TweenService")')
-    lines.append('local RunService = game:GetService("RunService")')
-    lines.append("")
-
-    # Find target. Prefab-scoped scripts use a smart-binding lookup:
-    # prefer script.Parent (so each clone of a prefab template animates
-    # itself), fall back to workspace search (so the same script body
-    # also drives scene-baked instances when it lives in the global flat
-    # list). Searching within script.Parent for the controller name
-    # handles prefabs whose Animator sits on a child node, not the root.
-    target_name = game_object_name or controller.name
-    if prefab_scoped:
-        lines.append("-- Prefab-scoped: prefer script.Parent (this clone), fall")
-        lines.append("-- back to workspace search when running from a global container.")
-        lines.append("local target")
-        lines.append("if script.Parent and (script.Parent:IsA('Model') or script.Parent:IsA('BasePart')) then")
-        lines.append(f'    target = script.Parent:FindFirstChild("{target_name}", true) or script.Parent')
-        lines.append("else")
-        lines.append(f'    target = workspace:FindFirstChild("{target_name}", true)')
-        lines.append("end")
-    else:
-        lines.append(f'local target = workspace:FindFirstChild("{target_name}", true)')
-    lines.append("if not target then return end")
-    lines.append("if target:IsA('Model') then")
-    lines.append("    target = target.PrimaryPart or target:FindFirstChildWhichIsA('BasePart') or target")
-    lines.append("end")
-    lines.append("")
-
-    # Initialize parameters as attributes on the target
-    lines.append("-- Initialize parameters")
-    for param in controller.parameters:
-        if param.param_type == 4:  # Bool
-            lines.append(f'target:SetAttribute("{param.name}", {str(param.default_bool).lower()})')
-        elif param.param_type == 1:  # Float
-            lines.append(f'target:SetAttribute("{param.name}", {param.default_float})')
-        elif param.param_type == 3:  # Int
-            lines.append(f'target:SetAttribute("{param.name}", {param.default_int})')
-        elif param.param_type == 9:  # Trigger
-            lines.append(f'target:SetAttribute("{param.name}", false)')
-    lines.append("")
-
-    # Define state play functions
-    for state, clip in states_with_clips:
-        safe_name = state.name.replace(" ", "_").replace("-", "_")
-        if clip and clip.curves:
-            lines.append(f"local function play_{safe_name}()")
-            lines.append(f"\t-- Play animation: {clip.name} ({clip.duration:.2f}s)")
-            # Generate simplified tween for the first position/rotation curve
-            for curve in clip.curves[:3]:  # Limit to 3 curves per state
-                simplified = simplify_keyframes(curve.keyframes, max_count=5)
-                if len(simplified) >= 2:
-                    if curve.property_type == "position":
-                        kf_start = simplified[0]
-                        kf_end = simplified[-1]
-                        # Use delta between first and last keyframe for relative movement.
-                        # This correctly handles close animations that return to origin
-                        # (endpoint 0,0,0 with startpoint 0,4,0 → delta 0,-4,0).
-                        dx = kf_end.value[0] - kf_start.value[0]
-                        dy = kf_end.value[1] - kf_start.value[1]
-                        dz = -(kf_end.value[2] - kf_start.value[2])  # Z inversion
-                        lines.append(f"\tlocal info = TweenInfo.new({clip.duration:.2f})")
-                        lines.append(f"\tlocal tween = TweenService:Create(target, info, {{")
-                        lines.append(f"\t\tPosition = target.Position + Vector3.new({dx:.3f}, {dy:.3f}, {dz:.3f})")
-                        lines.append(f"\t}})")
-                        lines.append(f"\ttween:Play()")
-                        lines.append(f"\ttween.Completed:Wait()")
-            if not clip.curves:
-                lines.append(f"\ttask.wait({clip.duration:.2f})")
-            lines.append("end")
-        else:
-            lines.append(f"local function play_{safe_name}()")
-            lines.append(f"\ttask.wait(0.1) -- No animation data")
-            lines.append("end")
-        lines.append("")
-
-    # State machine loop
-    lines.append(f'local currentState = "{default_state.name if default_state else ""}"')
-    lines.append("")
-    lines.append("local function checkTransitions()")
-
-    for state, clip in states_with_clips:
-        safe_name = state.name.replace(" ", "_").replace("-", "_")
-        prefix = "if" if state == states_with_clips[0][0] else "elseif"
-        lines.append(f'\t{prefix} currentState == "{state.name}" then')
-
-        for trans in state.transitions:
-            dst_state = state_by_fid.get(trans.dst_state_file_id)
-            if not dst_state:
-                continue
-
-            if trans.conditions:
-                cond_parts = []
-                for cond in trans.conditions:
-                    attr_get = f'target:GetAttribute("{cond.parameter}")'
-                    if cond.mode == 1:  # If (true)
-                        cond_parts.append(f"{attr_get} == true")
-                    elif cond.mode == 2:  # IfNot (false)
-                        cond_parts.append(f"{attr_get} == false")
-                    elif cond.mode == 3:  # Greater
-                        cond_parts.append(f"({attr_get} or 0) > {cond.threshold}")
-                    elif cond.mode == 4:  # Less
-                        cond_parts.append(f"({attr_get} or 0) < {cond.threshold}")
-                    elif cond.mode == 6:  # Equals
-                        cond_parts.append(f"({attr_get} or 0) == {cond.threshold}")
-                    elif cond.mode == 7:  # NotEqual
-                        cond_parts.append(f"({attr_get} or 0) ~= {cond.threshold}")
-
-                if cond_parts:
-                    cond_str = " and ".join(cond_parts)
-                    lines.append(f'\t\tif {cond_str} then')
-                    lines.append(f'\t\t\tcurrentState = "{dst_state.name}"')
-                    # Reset triggers
-                    for cond in trans.conditions:
-                        param = next((p for p in controller.parameters if p.name == cond.parameter), None)
-                        if param and param.param_type == 9:  # Trigger
-                            lines.append(f'\t\t\ttarget:SetAttribute("{cond.parameter}", false)')
-                    lines.append(f"\t\t\treturn true")
-                    lines.append(f"\t\tend")
-            elif trans.has_exit_time:
-                lines.append(f'\t\t-- Auto-transition after exit time')
-                lines.append(f'\t\tcurrentState = "{dst_state.name}"')
-                lines.append(f"\t\treturn true")
-
-    if states_with_clips:
-        lines.append("\tend")
-    lines.append("\treturn false")
-    lines.append("end")
-    lines.append("")
-
-    # Main loop
-    lines.append("-- State machine main loop")
-    lines.append("while true do")
-    for state, clip in states_with_clips:
-        safe_name = state.name.replace(" ", "_").replace("-", "_")
-        prefix = "if" if state == states_with_clips[0][0] else "elseif"
-        lines.append(f'\t{prefix} currentState == "{state.name}" then')
-        lines.append(f"\t\tplay_{safe_name}()")
-    if states_with_clips:
-        lines.append("\tend")
-    lines.append("\tcheckTransitions()")
-    lines.append("\ttask.wait()")
-    lines.append("end")
-
-    return "\n".join(lines) + "\n"
-
-
 def export_controller_json(
     controller: AnimatorController,
     clip_name_by_guid: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Export an AnimatorController as a JSON-serializable dict for the runtime.
 
-    The animator_runtime.luau expects this format for state machine evaluation.
+    The character_animator.luau expects this format for state machine evaluation.
 
     When ``clip_name_by_guid`` is provided, BlendTree entries resolve their
     ``clip_guid`` → ``clip_name`` so the runtime can look clips up by name.
@@ -1899,7 +1695,7 @@ def export_clip_keyframes(clip: AnimClip) -> dict[str, Any]:
 
     Per-bone frames are merged across position / rotation / euler / scale
     curves and time-sorted. The runtime consumer
-    (``animator_runtime.luau:_playKeyframeAnimation``) builds each frame's
+    (``character_animator.luau:_playKeyframeAnimation``) builds each frame's
     CFrame from ``cf.x / .y / .z / .rx / .ry / .rz`` and defaults any
     missing axis to 0 — so emitting per-curve frames (position keys for a
     bone, then rotation keys for the same bone) produced partial frames
@@ -2035,7 +1831,7 @@ def convert_animations(
     """Convert all animations in a Unity project to Roblox Luau scripts.
 
     Phase 4.5 routing: each clip is sent to exactly one target —
-      - humanoid clips (touch R15 bone names)  → animator_runtime.luau JSON
+      - humanoid clips (touch R15 bone names)  → character_animator.luau JSON
       - transform-only clips (non-humanoid)    → inline TweenService Scripts
     No ``require()`` of deleted bridge modules is emitted from either path.
     Per-clip routing + reason is recorded on ``result.routing`` so the
@@ -2272,7 +2068,7 @@ def convert_animations(
         # clip names within each partition: two distinct clips that share
         # a Unity-given name would otherwise collide in per_clip_routing,
         # in inline-tween script names, and (for humanoid clips) in the
-        # animator_runtime keyframes dict — silently dropping all but
+        # character_animator keyframes dict — silently dropping all but
         # the last entry. The collision is logged as UNCONVERTED so the
         # user sees it; the affected entries get an 8-char source-path
         # hash suffix so the data survives.
@@ -2318,7 +2114,7 @@ def convert_animations(
             }
         for clip in humanoid_clips:
             per_clip_routing[humanoid_display[id(clip)]] = {
-                "target": "animator_runtime",
+                "target": "character_animator",
                 "reason": "humanoid bone targets or empty curve set",
             }
         result.routing[ctrl_key] = per_clip_routing
@@ -2327,25 +2123,10 @@ def convert_animations(
         for scope in scopes:
             prefix = f"{scope}_" if scope else ""
 
-            # State-machine script for humanoid clips when the controller
-            # has transitions — one script per scope.
-            has_transitions = any(s.transitions for s in ctrl.states)
-            if humanoid_clips and has_transitions and len(ctrl.states) >= 2:
-                script_name = f"Anim_{prefix}{ctrl_key}_StateMachine"
-                luau_source = generate_state_machine_script(
-                    controller=ctrl,
-                    clips_by_guid={g: c for g, c in clips_by_guid.items() if not c.is_transform_only},
-                    game_object_name=ctrl.name,
-                    prefab_scoped=scope_is_prefab,
-                )
-                if luau_source:
-                    result.generated_scripts.append((script_name, luau_source))
-                    if scope_is_prefab:
-                        result.script_scopes[script_name] = scope
-
-            # Inline TweenService script for every transform-only clip,
-            # regardless of state-machine presence — these never go
-            # through animator_runtime.
+            # Inline TweenService script for every transform-only clip.
+            # Humanoid clips do not get a per-controller Script here — the
+            # controller graph + bone keyframes go into the AnimationData_*
+            # module below, consumed by the CharacterAnimator runtime.
             for clip in transform_only_clips:
                 clip_disp = transform_display[id(clip)]
                 script_name = f"Anim_{prefix}{ctrl_key}_{clip_disp}"
@@ -2360,7 +2141,7 @@ def convert_animations(
                     if scope_is_prefab:
                         result.script_scopes[script_name] = scope
 
-            # animator_runtime JSON module — emit only when at least one
+            # character_animator JSON module — emit only when at least one
             # humanoid clip lands here. Transform-only clips are NOT
             # bundled (they're inline Scripts above).
             if humanoid_clips:
@@ -2389,7 +2170,7 @@ def convert_animations(
                 json_str = json.dumps(combined, indent=2)
                 module_source = (
                     f"-- Auto-generated animation data for {module_name}\n"
-                    f"-- Consumed by animator_runtime.luau LoadKeyframes()\n"
+                    f"-- Consumed by character_animator.luau LoadKeyframes()\n"
                     f"-- Policy: see docs/design/inline-over-runtime-wrappers.md\n"
                     f"local data = game:GetService(\"HttpService\")"
                     f":JSONDecode([==[{json_str}]==])\n"

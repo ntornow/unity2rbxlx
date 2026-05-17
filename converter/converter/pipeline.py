@@ -1584,7 +1584,7 @@ class Pipeline:
         )
 
     def convert_animations(self) -> None:
-        """Route Unity animations to animator_runtime or inline TweenService.
+        """Route Unity animations to character_animator or inline TweenService.
 
         When a parsed scene is available, pass it so the converter can
         filter controllers to those actually referenced and scene-scope
@@ -3751,7 +3751,7 @@ script.Disabled = true
         """Inject runtime library ModuleScripts when relevant features are detected.
 
         Scans the place's scripts and parts for features that need runtime support:
-        - HasAnimator attribute → inject animator_runtime.luau
+        - HasAnimator attribute → inject character_animator.luau
         - NavMeshAgent attributes → inject nav_mesh_runtime.luau
         - Canvas/ScreenGui elements → inject event_system.luau
         - CharacterController attributes → inject physics_bridge.luau
@@ -3796,7 +3796,7 @@ script.Disabled = true
         # Inject runtime modules as ModuleScripts in ReplicatedStorage
         modules_to_inject = []
         if has_animator:
-            modules_to_inject.append(("AnimatorRuntime", "animator_runtime.luau"))
+            modules_to_inject.append(("CharacterAnimator", "character_animator.luau"))
         if has_navmesh:
             modules_to_inject.append(("NavAgent", "nav_mesh_runtime.luau"))
         if has_ui:

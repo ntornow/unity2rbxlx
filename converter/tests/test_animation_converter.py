@@ -36,7 +36,6 @@ from converter.animation_converter import (
     generate_tween_script,
     discover_animations,
     convert_animations,
-    generate_state_machine_script,
     export_controller_json,
     export_clip_keyframes,
     _quat_to_euler_degrees,
@@ -1415,118 +1414,136 @@ class TestPipelineIntegration:
         assert state.animation_result is None
 
 
-class TestStateMachineGeneration:
-    """Tests for unified state machine script generation."""
+class TestStateMachineScriptRetired:
+    """PR1 of the character-animation plan retired ``generate_state_machine_script``.
 
-    def _make_controller_with_transitions(self) -> tuple[AnimatorController, dict[str, AnimClip]]:
-        """Create a controller with Idle→Walk→Run states and transitions."""
-        idle = AnimState(
-            name="Idle", file_id="100",
-            clip_guid="guid_idle", speed=1.0,
-            transitions=[
-                AnimTransition(
-                    name="IdleToWalk", dst_state_file_id="200",
-                    conditions=[AnimCondition(parameter="Speed", mode=3, threshold=0.1)],
-                ),
-            ],
-        )
-        walk = AnimState(
-            name="Walk", file_id="200",
-            clip_guid="guid_walk", speed=1.0,
-            transitions=[
-                AnimTransition(
-                    name="WalkToRun", dst_state_file_id="300",
-                    conditions=[AnimCondition(parameter="Speed", mode=3, threshold=5.0)],
-                ),
-                AnimTransition(
-                    name="WalkToIdle", dst_state_file_id="100",
-                    conditions=[AnimCondition(parameter="Speed", mode=4, threshold=0.1)],
-                ),
-            ],
-        )
-        run = AnimState(
-            name="Run", file_id="300",
-            clip_guid="guid_run", speed=1.5,
-            transitions=[
-                AnimTransition(
-                    name="RunToWalk", dst_state_file_id="200",
-                    conditions=[AnimCondition(parameter="Speed", mode=4, threshold=5.0)],
-                ),
-            ],
-        )
-        ctrl = AnimatorController(
-            name="CharacterAnimator",
-            parameters=[
-                AnimParameter(name="Speed", param_type=1, default_float=0.0),
-                AnimParameter(name="IsGrounded", param_type=4, default_bool=True),
-            ],
-            states=[idle, walk, run],
-            default_state_file_id="100",
-        )
-        clips = {
-            "guid_idle": AnimClip(name="Idle", duration=1.0, loop=True, sample_rate=30),
-            "guid_walk": AnimClip(name="Walk", duration=0.8, loop=True, sample_rate=30),
-            "guid_run": AnimClip(name="Run", duration=0.5, loop=True, sample_rate=30),
-        }
-        return ctrl, clips
+    It emitted an ``Anim_<ctrl>_StateMachine`` Script for any controller with
+    humanoid clips, transitions, and >= 2 states. That script only tweened one
+    Part's ``Position`` (not a skeleton) and was a redundant second
+    state-machine implementation alongside the ``CharacterAnimator`` runtime.
 
-    def test_state_machine_generates_output(self) -> None:
-        """State machine script should be generated for controllers with transitions."""
-        ctrl, clips = self._make_controller_with_transitions()
-        source = generate_state_machine_script(ctrl, clips, "Player")
-        assert source
-        assert "State Machine" in source
-        assert "CharacterAnimator" in source
+    This test pins the post-retirement contract: such a controller no longer
+    emits a ``_StateMachine`` Script; its graph + bone keyframes go into the
+    ``AnimationData_*`` module that ``CharacterAnimator`` consumes (wired live
+    in PR2). See ``docs/design/character-animation.md``.
+    """
 
-    def test_state_machine_has_all_states(self) -> None:
-        """All states should appear in the generated script."""
-        ctrl, clips = self._make_controller_with_transitions()
-        source = generate_state_machine_script(ctrl, clips)
-        assert "Idle" in source
-        assert "Walk" in source
-        assert "Run" in source
+    def test_humanoid_controller_with_transitions_emits_no_statemachine_script(
+        self, tmp_path: Path,
+    ) -> None:
+        assets = tmp_path / "Assets" / "Animations"
+        assets.mkdir(parents=True)
 
-    def test_state_machine_initializes_parameters(self) -> None:
-        """Parameters should be initialized as attributes."""
-        ctrl, clips = self._make_controller_with_transitions()
-        source = generate_state_machine_script(ctrl, clips)
-        assert 'SetAttribute("Speed"' in source
-        assert 'SetAttribute("IsGrounded"' in source
+        # Humanoid clip — a Hips curve makes it non-transform-only.
+        (assets / "Walk.anim").write_text(textwrap.dedent("""\
+            %YAML 1.1
+            %TAG !u! tag:unity3d.com,2011:
+            --- !u!74 &7400000
+            AnimationClip:
+              m_Name: Walk
+              m_PositionCurves:
+              - curve:
+                  serializedVersion: 2
+                  m_Curve:
+                  - serializedVersion: 3
+                    time: 0
+                    value: {x: 0, y: 0, z: 0}
+                    inSlope: {x: 0, y: 0, z: 0}
+                    outSlope: {x: 0, y: 0, z: 0}
+                  - serializedVersion: 3
+                    time: 1
+                    value: {x: 1, y: 2, z: 3}
+                    inSlope: {x: 0, y: 0, z: 0}
+                    outSlope: {x: 0, y: 0, z: 0}
+                path: Hips
+              m_RotationCurves: []
+              m_EulerCurves: []
+              m_ScaleCurves: []
+              m_AnimationClipSettings:
+                serializedVersion: 2
+                m_LoopTime: 1
+                m_StopTime: 1
+        """))
+        (assets / "Walk.anim.meta").write_text(textwrap.dedent("""\
+            fileFormatVersion: 2
+            guid: abcd1234abcd1234abcd1234abcd1234
+        """))
 
-    def test_state_machine_has_transitions(self) -> None:
-        """Transition conditions should appear in the script."""
-        ctrl, clips = self._make_controller_with_transitions()
-        source = generate_state_machine_script(ctrl, clips)
-        assert 'GetAttribute("Speed")' in source
-        assert "> 0.1" in source or "> 5" in source
+        # Controller with 2 states + a transition — this is exactly the
+        # `humanoid_clips and has_transitions and len(states) >= 2` branch
+        # that used to trigger generate_state_machine_script.
+        (assets / "RetiredSMCtrl.controller").write_text(textwrap.dedent("""\
+            %YAML 1.1
+            %TAG !u! tag:unity3d.com,2011:
+            --- !u!91 &9100000
+            AnimatorController:
+              m_Name: RetiredSMCtrl
+              m_AnimatorParameters:
+              - m_Name: Speed
+                m_Type: 1
+                m_DefaultFloat: 0
+                m_DefaultInt: 0
+                m_DefaultBool: 0
+              m_AnimatorLayers:
+              - serializedVersion: 5
+                m_Name: Base Layer
+                m_StateMachine:
+                  fileID: 300
+            --- !u!1107 &300
+            AnimatorStateMachine:
+              m_ChildStates:
+              - serializedVersion: 1
+                m_State:
+                  fileID: 400
+              - serializedVersion: 1
+                m_State:
+                  fileID: 401
+              m_DefaultState:
+                fileID: 400
+            --- !u!1101 &500
+            AnimatorStateTransition:
+              m_Name: IdleToWalk
+              m_Conditions:
+              - m_ConditionMode: 3
+                m_ConditionEvent: Speed
+                m_EventTreshold: 0.1
+              m_DstState: {fileID: 401}
+              m_TransitionDuration: 0.1
+              m_HasExitTime: 0
+              m_ExitTime: 0.9
+            --- !u!1102 &400
+            AnimatorState:
+              m_Name: Idle
+              m_Speed: 1
+              m_Transitions:
+              - {fileID: 500}
+              m_Motion:
+                fileID: 7400000
+                guid: abcd1234abcd1234abcd1234abcd1234
+                type: 2
+            --- !u!1102 &401
+            AnimatorState:
+              m_Name: Walk
+              m_Speed: 1
+              m_Transitions: []
+              m_Motion:
+                fileID: 7400000
+                guid: abcd1234abcd1234abcd1234abcd1234
+                type: 2
+        """))
 
-    def test_state_machine_default_state(self) -> None:
-        """Default state should be set to the controller's default."""
-        ctrl, clips = self._make_controller_with_transitions()
-        source = generate_state_machine_script(ctrl, clips)
-        assert 'currentState = "Idle"' in source
+        from unity.guid_resolver import build_guid_index
+        guid_index = build_guid_index(tmp_path)
+        result = convert_animations(tmp_path, guid_index=guid_index)
 
-    def test_state_machine_trigger_reset(self) -> None:
-        """Trigger parameters should be reset after firing."""
-        ctrl = AnimatorController(
-            name="DoorCtrl",
-            parameters=[AnimParameter(name="Open", param_type=9)],
-            states=[
-                AnimState(name="Closed", file_id="1", clip_guid="g1", transitions=[
-                    AnimTransition(name="t", dst_state_file_id="2",
-                                   conditions=[AnimCondition(parameter="Open", mode=1)]),
-                ]),
-                AnimState(name="Opened", file_id="2", clip_guid="g2"),
-            ],
-            default_state_file_id="1",
-        )
-        clips = {
-            "g1": AnimClip(name="Close", duration=0.5, loop=False, sample_rate=30),
-            "g2": AnimClip(name="Open", duration=0.5, loop=False, sample_rate=30),
-        }
-        source = generate_state_machine_script(ctrl, clips)
-        # Trigger should be reset to false after transition
-        assert 'SetAttribute("Open", false)' in source
+        # No per-controller state-machine Script is emitted any more.
+        sm_scripts = [n for n, _ in result.generated_scripts if n.endswith("_StateMachine")]
+        assert sm_scripts == [], f"generate_state_machine_script output not retired: {sm_scripts}"
+
+        # The controller graph + bone keyframes still flow into an
+        # AnimationData_* module for the CharacterAnimator runtime.
+        data_modules = [n for n, _ in result.animation_data_modules]
+        assert any("RetiredSMCtrl" in n for n in data_modules), data_modules
 
 
 # ---------------------------------------------------------------------------
@@ -1583,7 +1600,7 @@ class TestAnimationDataExport:
         assert walking["transitions"][0]["destination"] == "Idle"
 
     def test_export_condition_modes(self):
-        """All 6 condition modes the animator_runtime supports are mapped."""
+        """All 6 condition modes the character_animator supports are mapped."""
         mode_map = {1: "If", 2: "IfNot", 3: "Greater", 4: "Less", 6: "Equals", 7: "NotEqual"}
         conditions = []
         for mode_int, mode_str in mode_map.items():
@@ -1602,7 +1619,7 @@ class TestAnimationDataExport:
         assert exported_modes == set(mode_map.values())
 
     def test_export_transition_fields_match_runtime(self):
-        """Transition fields include everything animator_runtime reads."""
+        """Transition fields include everything character_animator reads."""
         ctrl, _ = self._make_controller_with_clip()
         data = export_controller_json(ctrl)
         walking = [s for s in data["states"] if s["name"] == "Walking"][0]
@@ -2240,7 +2257,7 @@ class TestPhase45Routing:
         assets.mkdir()
 
         # Two clips named "Walk" living at different paths — both touch
-        # a humanoid bone (Hips) so they route through animator_runtime
+        # a humanoid bone (Hips) so they route through character_animator
         # and hit the per-controller keyframes dict-comprehension.
         for fname, guid in (("WalkA.anim", "a" * 32), ("WalkB.anim", "b" * 32)):
             (assets / fname).write_text(textwrap.dedent("""\
