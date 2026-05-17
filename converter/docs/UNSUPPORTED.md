@@ -225,7 +225,7 @@ unimplemented:
 | Root motion extraction | Not supported |
 | Inverse kinematics | Not supported |
 | Binary `.controller` / `.anim` | Surfaced to `UNCONVERTED.md`; needs UnityPy or binary YAML parser |
-| Imperative `Animator.*` from a `LocalScript` | Not supported — the `CharacterAnimator` instance and its dispatch registry are server-side; transpiled `SetTrigger`/`Play`/`CrossFade` calls originating from a `LocalScript` will not reach it |
+| Imperative `Animator.*` from a `LocalScript` | Not supported — the `CharacterAnimator` runtime and its dispatch registry are server-side, so transpiled `SetTrigger`/`Play`/`CrossFade` calls from a `LocalScript` do not reach it. **TODO (revisit):** server-side was a PR2 scoping decision, not a settled design — reassess whether the character-animation runtime should live on the server, the client, or be replicated across both. |
 | Weighted keyframe blending (tween backend) | `KeyframeTrack:AdjustWeight` is a no-op stub; overlaying multiple keyframe tracks on one rig is not blended |
 
 ---
