@@ -20,7 +20,6 @@ import config
 from core.conversion_context import MeshHierarchyEntry
 from core.unity_types import (
     AssetManifest,
-    ComponentData,
     GuidIndex,
     ParsedScene,
     SceneNode,
@@ -29,13 +28,11 @@ from converter.material_mapper import MaterialMapping
 from core.roblox_types import (
     RbxCFrame,
     RbxCameraConfig,
-    RbxLight,
     RbxLightingConfig,
     RbxPart,
     RbxPlace,
     RbxSkyboxConfig,
     RbxSound,
-    RbxTerrain,
     RbxWaterRegion,
 )
 from core.coordinate_system import (
@@ -45,7 +42,6 @@ from core.coordinate_system import (
     unity_scale_to_roblox_size,
 )
 from converter.component_converter import (
-    CINEMACHINE_ALL_TYPES,
     CINEMACHINE_BRAIN_TYPES,
     CINEMACHINE_FREELOOK_TYPES,
     CINEMACHINE_VIRTUAL_CAMERA_TYPES,
@@ -1768,7 +1764,6 @@ def _process_components(
             radius = float(comp.properties.get("m_Radius", 0.5))
             step_offset = float(comp.properties.get("m_StepOffset", 0.3))
             slope_limit = float(comp.properties.get("m_SlopeLimit", 45.0))
-            skin_width = float(comp.properties.get("m_SkinWidth", 0.08))
             # Convert Unity move speed (m/s) to Roblox WalkSpeed (studs/s)
             # Unity CharacterController doesn't store speed directly, scripts set it
             part.attributes["_HasCharacterController"] = True
@@ -2847,7 +2842,6 @@ def _apply_directional_light(
 
             # Convert directional light rotation to ClockTime
             qx, qy, qz, qw = node.rotation
-            import math
             # Pitch from quaternion (X rotation in ZXY order)
             sinr = 2.0 * (qw * qx + qy * qz)
             cosr = 1.0 - 2.0 * (qx * qx + qy * qy)
@@ -3469,7 +3463,6 @@ def _convert_prefab_instance(
     uploaded_assets: dict[str, str],
 ) -> list[RbxPart]:
     """Convert a PrefabInstance into RbxParts by resolving its source prefab."""
-    from core.unity_types import PrefabInstanceData
 
     # Resolve prefab template
     resolved = guid_index.resolve(pi.source_prefab_guid) if guid_index else None
@@ -3629,7 +3622,6 @@ def _convert_prefab_instance(
         # an attribute on the resulting Part so scripts can read it.
         if not pp.startswith("m_") and not pp.startswith("Serialized"):
             # Simple scalar overrides (int/float/string/bool)
-            target_info = mod.get("target", {})
             if isinstance(val, str):
                 # Try numeric first
                 try:

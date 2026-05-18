@@ -14,7 +14,6 @@ import xml.etree.ElementTree as ET
 import xml.dom.minidom
 from pathlib import Path
 from uuid import uuid4
-from typing import Any
 
 from core.roblox_types import (
     RbxAttrValue,
@@ -39,7 +38,6 @@ from core.roblox_types import (
     RbxUIElement,
     RbxVideoFrame,
 )
-from core.coordinate_system import quaternion_to_rotation_matrix
 from roblox.materials import MATERIAL_NAME_TO_TOKEN, DEFAULT_MATERIAL_TOKEN
 
 log = logging.getLogger(__name__)
@@ -57,27 +55,6 @@ def _ref_id() -> str:
 # Maps Unity fileID → Roblox referent for constraint Part1 resolution.
 # Populated during _make_part, consumed during _make_constraint.
 _unity_fid_to_referent: dict[str, str] = {}
-
-
-def _quat_to_rotation_matrix(
-    qx: float, qy: float, qz: float, qw: float
-) -> tuple[float, float, float, float, float, float, float, float, float]:
-    """Convert a quaternion (x, y, z, w) to a 3x3 rotation matrix.
-
-    Returns the nine elements (R00, R01, R02, R10, R11, R12, R20, R21, R22)
-    suitable for embedding in an RBXLX ``<CoordinateFrame>`` element.
-    """
-    mat = quaternion_to_rotation_matrix(qx, qy, qz, qw)
-    # quaternion_to_rotation_matrix returns a 3x3 list-of-lists or flat tuple.
-    # Normalise to a flat 9-float tuple.
-    if isinstance(mat, (list, tuple)) and isinstance(mat[0], (list, tuple)):
-        return (
-            float(mat[0][0]), float(mat[0][1]), float(mat[0][2]),
-            float(mat[1][0]), float(mat[1][1]), float(mat[1][2]),
-            float(mat[2][0]), float(mat[2][1]), float(mat[2][2]),
-        )
-    # Already flat
-    return tuple(float(v) for v in mat[:9])  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
@@ -104,12 +81,6 @@ def _add_float(parent: ET.Element, name: str, value: float) -> ET.Element:
 
 def _add_int(parent: ET.Element, name: str, value: int) -> ET.Element:
     elem = ET.SubElement(parent, "int", name=name)
-    elem.text = str(value)
-    return elem
-
-
-def _add_double(parent: ET.Element, name: str, value: float) -> ET.Element:
-    elem = ET.SubElement(parent, "double", name=name)
     elem.text = str(value)
     return elem
 
@@ -174,13 +145,6 @@ def _add_content(parent: ET.Element, name: str, url: str) -> ET.Element:
     elem = ET.SubElement(parent, "Content", name=name)
     sub = ET.SubElement(elem, "url")
     sub.text = url
-    return elem
-
-
-def _add_binary_string(parent: ET.Element, name: str, b64_data: str) -> ET.Element:
-    """Add a BinaryString property (base64-encoded, wrapped in CDATA by _pretty_xml)."""
-    elem = ET.SubElement(parent, "BinaryString", name=name)
-    elem.text = b64_data
     return elem
 
 
@@ -257,8 +221,6 @@ def _make_light(parent_xml: ET.Element, light: RbxLight) -> None:
         _add_color3(props, "Color", *light.color[:3])
     if hasattr(light, "range"):
         _add_float(props, "Range", light.range)
-    if hasattr(light, "enabled"):
-        _add_bool(props, "Enabled", light.enabled)
     if hasattr(light, "angle") and light_class == "SpotLight":
         _add_float(props, "Angle", light.angle)
     if hasattr(light, "shadows"):
@@ -1346,7 +1308,6 @@ def _pretty_xml(root: ET.Element) -> str:
     # that minidom applied to the script source text.
     # Uses a scan-based approach instead of regex to avoid issues with non-greedy
     # matching across many elements with multiline content.
-    import html
 
     result = _wrap_elements_in_cdata(result, "ProtectedString")
     result = _wrap_elements_in_cdata(result, "BinaryString")

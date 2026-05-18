@@ -10,7 +10,6 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from converter.prefab_packages import (
-    PrefabPackagesResult,
     _collect_referenced_prefab_names,
     _SPAWNER_LUAU,
     generate_prefab_packages,

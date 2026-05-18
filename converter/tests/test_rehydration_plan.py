@@ -155,7 +155,7 @@ def test_final_rewrite_honors_source_path_for_nested_scripts(tmp_path):
     / reclassification) lands on the nested-dir file it came from — not in a
     duplicate copy at scripts/<name>.luau.
     """
-    from core.roblox_types import RbxScript, RbxPart
+    from core.roblox_types import RbxScript
 
     pipeline = _make_pipeline(tmp_path)
     scripts_dir = pipeline.output_dir / "scripts"

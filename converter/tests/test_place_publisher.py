@@ -17,9 +17,8 @@ Regression coverage for two real bugs caught on previous review passes:
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
-from roblox.id_cache import read_ids, write_ids, CANONICAL, LEGACY
+from roblox.id_cache import read_ids, CANONICAL, LEGACY
 from roblox.place_publisher import (
     CHUNKS_FILENAME,
     MAX_EXECUTE_LUAU_BYTES,
@@ -146,7 +145,6 @@ class TestPublishPlaceWritesCache:
     """
 
     def test_chunks_cache_written_on_publish(self, tmp_path, monkeypatch):
-        from roblox import place_publisher
 
         fake_chunks = ["a" * 100, "b" * 200]
         monkeypatch.setattr(

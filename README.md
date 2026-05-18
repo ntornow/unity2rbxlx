@@ -14,7 +14,7 @@ Converts Unity game projects into Roblox `.rbxlx` place files. Uses Python to or
 
 unity2rbxlx exposes the same pipeline through two interfaces:
 
-1. **`u2r.py` — non-interactive CLI.** Runs the entire pipeline end-to-end with no human in the loop. Use this for one-shot conversions, CI/CD, and batch jobs.
+1. **`u2r.py` — non-interactive CLI.** Runs pipeline phases end-to-end with no human in the loop. Use it for individual phases, `--phase` resumes, and CI. It does **not** perform the client/server architecture split ("Step 4.5"), so `u2r.py convert` requires the `--skip-architecture-step` acknowledgement and produces a game that crashes on the server — for a complete conversion use option 2.
 2. **`convert_interactive.py` — phase-by-phase CLI for the `/convert-unity` Claude Code skill.** Each pipeline phase becomes a Click subcommand that emits structured JSON, so a Claude Code session can pause for human review at any decision point (scene selection, material review, transpilation review, upload configuration, etc.).
 
 Both entry points share the same `Pipeline` class, the same `ConversionContext` state container, and the same `conversion_context.json` on disk — so you can start a conversion interactively, then finish it non-interactively (or vice versa).
@@ -61,20 +61,23 @@ All commands run from the `converter/` directory:
 ```bash
 cd converter
 
+# `u2r.py convert` does not perform Step 4.5 (client/server split) and
+# requires --skip-architecture-step. For a complete conversion use option 2.
+
 # Convert a Unity project (with asset upload)
-python u2r.py convert ../test_projects/SimpleFPS -o ./output/SimpleFPS --api-key ../apikey
+python u2r.py convert ../test_projects/SimpleFPS -o ./output/SimpleFPS --api-key ../apikey --skip-architecture-step
 
 # Convert without uploading assets
-python u2r.py convert ../test_projects/SimpleFPS -o ./output/SimpleFPS --no-upload
+python u2r.py convert ../test_projects/SimpleFPS -o ./output/SimpleFPS --no-upload --skip-architecture-step
 
 # Convert without AI transpilation (rule-based only, faster)
-python u2r.py convert ../test_projects/SimpleFPS -o ./output/SimpleFPS --no-ai
+python u2r.py convert ../test_projects/SimpleFPS -o ./output/SimpleFPS --no-ai --skip-architecture-step
 
 # Convert all scenes in a project
-python u2r.py convert ../test_projects/SimpleFPS -o ./output/SimpleFPS --scene all
+python u2r.py convert ../test_projects/SimpleFPS -o ./output/SimpleFPS --scene all --skip-architecture-step
 
 # Resume from a specific pipeline phase
-python u2r.py convert ../test_projects/SimpleFPS -o ./output/SimpleFPS --phase convert_scene
+python u2r.py convert ../test_projects/SimpleFPS -o ./output/SimpleFPS --phase convert_scene --skip-architecture-step
 
 # Analyze a Unity project without converting
 python u2r.py analyze ../test_projects/SimpleFPS

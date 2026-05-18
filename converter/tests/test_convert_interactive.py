@@ -954,7 +954,6 @@ class TestTranspileValidateWorkflow:
         self, tmp_path, monkeypatch,
     ):
         import convert_interactive
-        from convert_interactive import cli
         from converter.code_transpiler import TranspilationResult, TranspiledScript
 
         unity = tmp_path / "FakeProject"
@@ -1027,7 +1026,6 @@ class TestTranspileValidateWorkflow:
         (animations/, animation_data/, scriptable_objects/).
         """
         import convert_interactive
-        from convert_interactive import cli
         from converter.code_transpiler import TranspilationResult, TranspiledScript
 
         unity = tmp_path / "FakeProject"

@@ -4,18 +4,13 @@ test_prefab_variants.py -- Tests for prefab variant chain resolution.
 
 from __future__ import annotations
 
-import copy
-import textwrap
 from pathlib import Path
-from typing import Any
 
-import pytest
 
 from core.unity_types import (
     PrefabComponent,
     PrefabNode,
     PrefabTemplate,
-    PrefabLibrary,
 )
 from unity.prefab_parser import (
     _parse_single_prefab,

@@ -3124,7 +3124,7 @@ script.Disabled = true
     ) -> "ConversionReport":
         """Assemble the structured ConversionReport for write_output."""
         from converter.report_generator import (
-            ConversionReport, AssetSummary, ScriptSummary, MaterialSummary,
+            ConversionReport, AssetSummary, MaterialSummary,
             ComponentSummary, SceneSummary, OutputSummary,
         )
         script_types = {"Script": 0, "LocalScript": 0, "ModuleScript": 0}

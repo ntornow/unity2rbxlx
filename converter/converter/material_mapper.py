@@ -231,7 +231,6 @@ def map_materials(
     Returns:
         Dict mapping material GUID -> MaterialMapping.
     """
-    project = Path(unity_project_path).resolve()
     out = Path(output_dir).resolve()
     textures_dir = out / "textures"
     textures_dir.mkdir(parents=True, exist_ok=True)
@@ -454,7 +453,6 @@ def _parse_material(
     metallic_val = floats.get("_Metallic", 0.0)
     mapping.metallic = float(metallic_val)
     if not metallic_tex:
-        smoothness_val = floats.get("_Glossiness", 0.5)
         # No texture ops needed; values can be baked into uniform textures.
         if float(metallic_val) > 0.01:
             mapping.warnings.append(
@@ -602,7 +600,6 @@ def _parse_mat_yaml(raw: str) -> dict[str, Any] | None:
     regex-based parsing for the older data:/first:/second: format that
     PyYAML can't handle (duplicate keys get overwritten).
     """
-    import re
 
     # Strip the Unity YAML header line.
     lines = raw.split("\n")

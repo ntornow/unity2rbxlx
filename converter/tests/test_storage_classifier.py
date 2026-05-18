@@ -18,12 +18,10 @@ phase-4a-storage-classification.md describes. Exercises:
 
 from __future__ import annotations
 
-import pytest
 
 from core.roblox_types import RbxScript
 from converter.storage_classifier import (
     classify_storage,
-    StoragePlan,
     SERVER_SCRIPT_SERVICE,
     SERVER_STORAGE,
     REPLICATED_STORAGE,

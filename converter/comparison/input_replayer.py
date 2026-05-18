@@ -11,7 +11,7 @@ import logging
 import textwrap
 from typing import Any, Dict, List, Tuple
 
-from .input_recorder import InputEvent, InputSequence
+from .input_recorder import InputSequence
 
 logger = logging.getLogger(__name__)
 

@@ -28,8 +28,6 @@ def generate_stub(csharp_source: str, script_info: Any) -> str:
     fields: list[tuple[str, str, str]] = []  # (type, name, default)
     methods: list[tuple[str, str]] = []  # (name, params)
     uses_input = False
-    uses_physics = False
-    uses_audio = False
     uses_collision = False
 
     # Extract class info
@@ -65,8 +63,6 @@ def generate_stub(csharp_source: str, script_info: Any) -> str:
 
     # Detect feature usage
     uses_input = bool(re.search(r"Input\.(GetKey|GetAxis|GetMouse|GetButton)", csharp_source))
-    uses_physics = bool(re.search(r"Physics\.(Raycast|Overlap)", csharp_source))
-    uses_audio = bool(re.search(r"AudioSource", csharp_source))
     uses_collision = "OnCollisionEnter" in lifecycle_hooks or "OnTriggerEnter" in lifecycle_hooks
 
     # Build Luau

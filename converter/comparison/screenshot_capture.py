@@ -11,7 +11,6 @@ from __future__ import annotations
 import logging
 import subprocess
 import textwrap
-import time
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -363,7 +362,6 @@ def unity_camera_to_roblox(
         Dict with ``position`` (x, y, z), ``rotation`` (rx, ry, rz) in Roblox
         coordinates, and ``fov``.
     """
-    import math
 
     ux, uy, uz = position
     rx, ry, rz = rotation_euler

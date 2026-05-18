@@ -1,6 +1,5 @@
 """Integration tests for the full conversion pipeline."""
 
-import json
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -134,7 +133,6 @@ class TestSimpleFPSConversion:
     def test_skybox_extraction(self):
         from unity.scene_parser import parse_scene
         from unity.guid_resolver import build_guid_index
-        from converter.scene_converter import convert_scene
 
         idx = build_guid_index(SIMPLEFPS_DIR)
         scene = parse_scene(SIMPLEFPS_DIR / "Assets/Scenes/main.unity")
@@ -223,12 +221,10 @@ class TestRbxlxOutputQuality:
         return rbxlx_path
 
     def test_valid_xml(self, simplefps_rbxlx):
-        import xml.etree.ElementTree as ET
         tree = ET.parse(str(simplefps_rbxlx))
         assert tree.getroot().tag == "roblox"
 
     def test_no_invalid_classes(self, simplefps_rbxlx):
-        import xml.etree.ElementTree as ET
         tree = ET.parse(str(simplefps_rbxlx))
         valid = {
             "Workspace", "Terrain", "Part", "MeshPart", "Model", "SpawnLocation",
@@ -250,7 +246,6 @@ class TestRbxlxOutputQuality:
             assert cls in valid, f"Invalid class: {cls}"
 
     def test_no_local_file_paths(self, simplefps_rbxlx):
-        import xml.etree.ElementTree as ET
         tree = ET.parse(str(simplefps_rbxlx))
         for item in tree.iter("Content"):
             url = item.find("url")
@@ -259,19 +254,16 @@ class TestRbxlxOutputQuality:
                     f"Local path found: {url.text[:60]}"
 
     def test_materials_are_tokens(self, simplefps_rbxlx):
-        import xml.etree.ElementTree as ET
         tree = ET.parse(str(simplefps_rbxlx))
         string_mats = sum(1 for e in tree.iter("string") if e.get("name") == "Material")
         assert string_mats == 0, f"Found {string_mats} string Material properties (should be tokens)"
 
     def test_has_smooth_surfaces(self, simplefps_rbxlx):
-        import xml.etree.ElementTree as ET
         tree = ET.parse(str(simplefps_rbxlx))
         top = sum(1 for e in tree.iter("token") if e.get("name") == "TopSurface")
         assert top > 0, "No TopSurface tokens found"
 
     def test_streaming_disabled(self, simplefps_rbxlx):
-        import xml.etree.ElementTree as ET
         tree = ET.parse(str(simplefps_rbxlx))
         for item in tree.iter("Item"):
             if item.get("class") == "Workspace":
@@ -282,7 +274,6 @@ class TestRbxlxOutputQuality:
 
     def test_no_collider_compounding(self, simplefps_rbxlx):
         """Collider sizes should not compound exponentially."""
-        import xml.etree.ElementTree as ET
         tree = ET.parse(str(simplefps_rbxlx))
         # Check that no Part named "Collider" exceeds reasonable bounds
         for item in tree.iter("Item"):
@@ -308,7 +299,6 @@ class TestRbxlxOutputQuality:
 
     def test_material_variety(self, simplefps_rbxlx):
         """Scene should have multiple material types, not all Plastic."""
-        import xml.etree.ElementTree as ET
         tree = ET.parse(str(simplefps_rbxlx))
         materials = set()
         for item in tree.iter("Item"):
@@ -440,7 +430,8 @@ class TestCLIPipeline:
         converter_dir = str(Path(__file__).resolve().parent.parent)
         result = subprocess.run(
             [sys.executable, "u2r.py", "convert", str(SIMPLEFPS_DIR),
-             "-o", str(tmp_path / "output"), "--no-upload"],
+             "-o", str(tmp_path / "output"), "--no-upload",
+             "--skip-architecture-step"],
             capture_output=True, text=True,
             timeout=120,
             cwd=converter_dir,
@@ -458,7 +449,8 @@ class TestCLIPipeline:
         # Convert first
         subprocess.run(
             [sys.executable, "u2r.py", "convert", str(SIMPLEFPS_DIR),
-             "-o", str(tmp_path / "output"), "--no-upload"],
+             "-o", str(tmp_path / "output"), "--no-upload",
+             "--skip-architecture-step"],
             capture_output=True, text=True,
             timeout=120,
             cwd=converter_dir,
@@ -493,7 +485,6 @@ class TestEdgeCases:
     def test_special_characters_in_part_name(self, tmp_path):
         from core.roblox_types import RbxPart, RbxPlace
         from roblox.rbxlx_writer import write_rbxlx
-        import xml.etree.ElementTree as ET
 
         place = RbxPlace(workspace_parts=[
             RbxPart(name='Test <Part> & "Quotes"', class_name="Part"),
@@ -506,7 +497,6 @@ class TestEdgeCases:
     def test_unicode_part_name(self, tmp_path):
         from core.roblox_types import RbxPart, RbxPlace
         from roblox.rbxlx_writer import write_rbxlx
-        import xml.etree.ElementTree as ET
 
         place = RbxPlace(workspace_parts=[
             RbxPart(name="Ünïcödé Pärt", class_name="Part"),
@@ -519,7 +509,6 @@ class TestEdgeCases:
     def test_extreme_values(self, tmp_path):
         from core.roblox_types import RbxPart, RbxPlace, RbxCFrame
         from roblox.rbxlx_writer import write_rbxlx
-        import xml.etree.ElementTree as ET
 
         place = RbxPlace(workspace_parts=[
             RbxPart(

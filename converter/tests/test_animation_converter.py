@@ -24,7 +24,6 @@ from converter.animation_converter import (
     AnimKeyframe,
     AnimParameter,
     AnimatorController,
-    BlendTree,
     parse_anim_file,
     parse_controller_file,
     simplify_keyframes,
@@ -3453,7 +3452,6 @@ class TestPhase59PrefabScopedTweenScripts:
         is dropped and the override GUID takes its place.
         """
         from core.unity_types import (
-            PrefabComponent,
             PrefabNode,
             PrefabTemplate,
         )

@@ -435,7 +435,6 @@ def convert_rigidbody(
     mass = float(properties.get("m_Mass", 1.0))
     drag = float(properties.get("m_Drag", properties.get("m_LinearDrag", 0.0)))
     angular_drag = float(properties.get("m_AngularDrag", 0.05))
-    use_gravity = bool(int(properties.get("m_UseGravity", 1)))
 
     # Only set CustomPhysicalProperties if mass differs from default
     # Roblox density default is ~0.7 (based on default Part mass/volume ratio)
@@ -778,7 +777,6 @@ def convert_particle_system(properties: dict[str, Any]) -> RbxParticleEmitter | 
                      len(sub_list), ",".join(triggers))
 
     # Gravity modifier -> acceleration Y component
-    import config
     gravity_mod = _extract_scalar(main.get("gravityModifier", {}), default=0.0)
     if gravity_mod != 0.0:
         # Unity gravity is -9.81, Roblox is -196.2. gravity_mod multiplies Unity gravity.
@@ -1107,7 +1105,6 @@ def convert_joint(
         import config
         constraint.stiffness = float(properties.get("m_Spring", 0.0))
         constraint.damping = float(properties.get("m_Damper", 0.0))
-        min_dist = float(properties.get("m_MinDistance", 0.0))
         max_dist = float(properties.get("m_MaxDistance", 0.0))
         constraint.free_length = max_dist * config.STUDS_PER_METER
 
@@ -1864,8 +1861,6 @@ def convert_skinned_mesh_renderer(
     if scene_nodes is None:
         scene_nodes = {}
 
-    # Build a set of bone fileIDs for quick lookup
-    bone_fid_set = set(bone_file_ids)
 
     # Collect bone info: name, parent fileID, local transform
     bone_info: list[dict[str, Any]] = []

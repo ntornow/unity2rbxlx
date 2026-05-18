@@ -1390,10 +1390,6 @@ def _generate_curves_code(
     """Generate TweenService code for a set of curves targeting one object."""
     tab = "\t" * indent
 
-    # Collect all unique times across curves for this target
-    has_position = any(c.property_type == "position" for c in curves)
-    has_rotation = any(c.property_type in ("rotation", "euler") for c in curves)
-    has_scale = any(c.property_type == "scale" for c in curves)
 
     # For each curve type, generate sequential tweens
     for curve in curves:

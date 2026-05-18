@@ -16,6 +16,7 @@ venv/
 *.egg-info/
 
 # Converter output (generated, large)
+/output/
 converter/output/
 converter/eval_output/
 converter/eval_current.json

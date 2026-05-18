@@ -9,8 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.roblox_types import (
-    RbxPart, RbxCFrame, RbxScript, RbxSurfaceAppearance,
-    RbxLight, RbxSound, RbxPlace, RbxLightingConfig,
+    RbxPart, RbxCFrame, RbxScript, RbxPlace, RbxLightingConfig,
     RbxScreenGui, RbxUIElement,
 )
 

@@ -20,8 +20,6 @@ from unity.yaml_parser import (
     CID_CAMERA,
     CID_MESH_FILTER,
     CID_MESH_RENDERER,
-    CID_LIGHT,
-    CID_BOX_COLLIDER,
     CID_RENDER_SETTINGS,
 )
 

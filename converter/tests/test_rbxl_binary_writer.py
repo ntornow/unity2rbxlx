@@ -4,7 +4,6 @@ test_rbxl_binary_writer.py -- Unit tests for the XML-to-binary .rbxl converter.
 
 from __future__ import annotations
 
-from pathlib import Path
 from xml.etree import ElementTree as ET
 
 import pytest

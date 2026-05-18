@@ -81,7 +81,7 @@ Converts Unity game projects into playable Roblox experiences. Handles scene hie
 
 There are two CLIs that share the same `Pipeline` class and the same `conversion_context.json` on disk:
 
-1. **`u2r.py` — non-interactive end-to-end CLI.** Use this for one-shot conversions, CI, batch jobs, anything that should run without human-in-the-loop. Subcommands: `convert`, `publish`, `analyze`, `validate`, `resolve`, `compare`. See `python u2r.py --help`.
+1. **`u2r.py` — non-interactive end-to-end CLI.** Subcommands: `convert`, `publish`, `analyze`, `validate`, `resolve`, `compare`. See `python u2r.py --help`. **`convert` does NOT perform Step 4.5 (client/server split)** — it requires `--skip-architecture-step` and ships server-crashing UI modules. For a complete game conversion use the `/convert-unity` skill (entry 2); reserve `u2r.py` for individual phases, `--phase` resumes, and CI.
 
 2. **`convert_interactive.py` — phase-by-phase CLI for the `/convert-unity` Claude Code skill.** Each subcommand maps to a single skill phase, emits structured JSON to stdout, and persists state in `conversion_context.json`. Subcommands:
 

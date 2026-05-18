@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 
 from core.roblox_types import RbxScript
 from converter.semantic_validators import (

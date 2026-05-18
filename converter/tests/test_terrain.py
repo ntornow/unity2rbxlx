@@ -146,7 +146,7 @@ class TestTerrainSmoothGridEncoding:
 
     def test_smooth_grid_encoding(self):
         """Test that SmoothGrid encoder produces valid base64 data."""
-        from roblox.terrain_encoder import encode_smooth_grid, encode_physics_grid
+        from roblox.terrain_encoder import encode_smooth_grid
         import base64
 
         # Simple 3x3 heightmap: flat terrain at half height

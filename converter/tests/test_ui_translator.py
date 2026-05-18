@@ -1,6 +1,5 @@
 """Tests for ui_translator.py -- Unity Canvas to Roblox ScreenGui conversion."""
 
-import pytest
 from converter.ui_translator import _extract_rect_transform, _apply_text_properties
 from core.roblox_types import RbxUIElement
 

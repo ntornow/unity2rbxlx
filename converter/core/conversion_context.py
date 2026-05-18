@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field, asdict, fields
 from pathlib import Path
-from typing import Any, ClassVar, TYPE_CHECKING, TypedDict
+from typing import ClassVar, TYPE_CHECKING, TypedDict
 
 if TYPE_CHECKING:
     from converter.storage_classifier import StoragePlan

@@ -4,7 +4,6 @@ test_sprite_extractor.py -- Unit tests for sprite extraction from Unity spritesh
 
 from __future__ import annotations
 
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -12,7 +11,6 @@ import pytest
 from converter.sprite_extractor import (
     SpriteExtractionResult,
     SpriteRect,
-    SpriteSheetInfo,
     _parse_sprite_entries,
     _slice_sprite,
     parse_spritesheet_meta,

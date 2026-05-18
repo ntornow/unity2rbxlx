@@ -1,10 +1,9 @@
 """Tests for the Luau place builder module."""
 
-import pytest
 from roblox.luau_place_builder import generate_place_luau, generate_place_luau_chunked
 from core.roblox_types import (
     RbxCFrame, RbxLight, RbxPart, RbxPlace, RbxScript,
-    RbxSurfaceAppearance, RbxSound, RbxConstraint,
+    RbxSurfaceAppearance, RbxConstraint,
 )
 
 

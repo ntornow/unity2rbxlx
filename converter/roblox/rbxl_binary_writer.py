@@ -13,7 +13,7 @@ No other module is imported here (except stdlib + lz4).
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -492,7 +492,6 @@ def _default_for_property(class_name: str, prop_name: str, type_id: int) -> obje
 
 def _serialise_prop_values(type_id: int, values: list[object]) -> bytes:
     """Serialise an array of property values for one PROP chunk."""
-    n = len(values)
     buf = bytearray()
 
     if type_id == TYPE_STRING:

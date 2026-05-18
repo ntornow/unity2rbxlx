@@ -27,9 +27,8 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from roblox.health_check_injector import inject_health_check, HEALTH_CHECK_SCRIPT_NAME
+from roblox.health_check_injector import inject_health_check
 from roblox.studio_log_parser import (
-    StudioLogResult,
     find_new_log,
     get_studio_log_files,
     parse_log,

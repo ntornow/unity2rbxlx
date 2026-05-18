@@ -161,10 +161,7 @@ def parse_unity_scene_transforms(scene_path: str) -> dict[str, list[dict]]:
     Returns dict: name -> list of {name, unity_world_pos, unity_world_rot, type}.
     """
     from unity.scene_parser import parse_scene
-    from unity.guid_resolver import GuidIndex
 
-    project_root = Path(scene_path).parent.parent.parent
-    guid_index = GuidIndex(project_root)
     parsed = parse_scene(Path(scene_path))
     all_nodes = list(parsed.all_nodes.values())
 

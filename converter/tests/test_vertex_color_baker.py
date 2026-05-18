@@ -4,11 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 
 from converter.vertex_color_baker import (
     BakeResult,
-    VertexColorBakeResult,
     _unity_file_id_to_submesh_index,
     bake_vertex_colors_batch,
 )

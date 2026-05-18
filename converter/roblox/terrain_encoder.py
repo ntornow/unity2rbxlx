@@ -31,7 +31,6 @@ from __future__ import annotations
 import base64
 import logging
 import math
-from typing import Any
 
 import config
 
@@ -249,9 +248,6 @@ def encode_smooth_grid(
                 h01 * (1 - fx) * fz + h11 * fx * fz) * max_height_studs
 
     chunk_size = 32
-    chunks_x = int(math.ceil(grid_x / chunk_size))
-    chunks_y = int(math.ceil(grid_y / chunk_size))
-    chunks_z = int(math.ceil(grid_z / chunk_size))
 
     def _get_surface_material(gx: int, gz: int, h_studs: float) -> int:
         """Determine material for a voxel based on position."""
