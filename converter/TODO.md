@@ -105,6 +105,19 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   through `ReplicatedStorage.Templates`. Verify on a full upload run.
 ## Infrastructure
 
+- [ ] **P2 — Retire genre-specific scaffolding; make the converter fully
+  genre-agnostic.** `--scaffolding=fps` (`u2r.py convert`) injects FPS-genre
+  scripts (client controller LocalScript, HUD ScreenGui, HUDController) and
+  carries backward-compat machinery in `pipeline.py` — `_fps_artifacts_on_disk`,
+  `_fps_artifacts_at_init`, `apply_scaffolding`, plus the `converter/scaffolding`
+  module. This cuts against the stated "the converter makes no game-genre
+  assumptions" direction (the `--scaffolding` help text itself says so) and the
+  recent retire-character-animation / remove-gameplay-adapters trend. Bigger
+  refactor: remove the `scaffolding` module, the `--scaffolding` flag, and the
+  FPS artifact-detection code paths. Blocked on confirming no live conversion
+  flow relies on FPS scaffolding. Surfaced during the CLI parameter audit
+  (2026-05-18).
+
 - [ ] **P2 — Three-flow byte-equivalence: u2r.py vs convert_interactive.py
   divergence (Phase 5.1 follow-up).** The byte-equivalence test landed
   with `test_three_flows_produce_identical_rbxlx` xfailed because the

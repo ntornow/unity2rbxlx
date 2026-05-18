@@ -440,7 +440,8 @@ class TestCLIPipeline:
         converter_dir = str(Path(__file__).resolve().parent.parent)
         result = subprocess.run(
             [sys.executable, "u2r.py", "convert", str(SIMPLEFPS_DIR),
-             "-o", str(tmp_path / "output"), "--no-upload"],
+             "-o", str(tmp_path / "output"), "--no-upload",
+             "--skip-architecture-step"],
             capture_output=True, text=True,
             timeout=120,
             cwd=converter_dir,
@@ -458,7 +459,8 @@ class TestCLIPipeline:
         # Convert first
         subprocess.run(
             [sys.executable, "u2r.py", "convert", str(SIMPLEFPS_DIR),
-             "-o", str(tmp_path / "output"), "--no-upload"],
+             "-o", str(tmp_path / "output"), "--no-upload",
+             "--skip-architecture-step"],
             capture_output=True, text=True,
             timeout=120,
             cwd=converter_dir,

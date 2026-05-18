@@ -113,6 +113,7 @@ class TestThreeFlowByteEquivalence:
                 sys.executable, str(U2R_SCRIPT), "convert",
                 str(project), "-o", str(out_dir),
                 "--no-upload", "--no-ai", "--no-resolve",
+                "--skip-architecture-step",
             ],
             cwd=CONVERTER_ROOT,
         )
@@ -173,6 +174,7 @@ class TestThreeFlowByteEquivalence:
                 str(project), "-o", str(out_dir),
                 "--no-upload", "--no-ai", "--no-resolve",
                 "--phase", "convert_scene",
+                "--skip-architecture-step",
             ],
             cwd=CONVERTER_ROOT,
         )

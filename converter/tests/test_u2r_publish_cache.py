@@ -94,6 +94,7 @@ class TestRobloxIdsCacheTiming:
                 "--api-key", "stub-key",
                 "--universe-id", "999",
                 "--place-id", "888",
+                "--skip-architecture-step",
             ],
             catch_exceptions=False,
         )
@@ -490,6 +491,7 @@ class TestRobloxIdsCacheTiming:
                 "--api-key", "stub-key",
                 "--universe-id", "1234",
                 "--place-id", "5678",
+                "--skip-architecture-step",
             ],
             catch_exceptions=False,
         )

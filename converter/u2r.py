@@ -239,9 +239,13 @@ def main(verbose: bool) -> None:
 @click.option("--scene", "-s", type=str, default=None,
               help="Scene to convert (path, or 'all' for every scene)")
 @click.option("--phase", type=str, default=None,
-              help="Resume from a specific phase")
+              help="Resume from a phase; re-runs every incomplete "
+              "prerequisite phase, so --phase parse on a fresh output "
+              "dir is a full conversion")
 @click.option("--no-upload", is_flag=True, help="Skip asset upload")
-@click.option("--no-ai", is_flag=True, help="Disable AI transpilation")
+@click.option("--no-ai", is_flag=True,
+              help="Disable AI transpilation (rule-based only, lower "
+              "quality; for deterministic tests, not real conversions)")
 @click.option("--no-resolve", is_flag=True, help="Skip headless mesh resolution")
 @click.option("--api-key", type=str, default=None,
               help="Roblox Open Cloud API key (string or path to file)")
@@ -257,6 +261,11 @@ def main(verbose: bool) -> None:
               "HUDController). Default: none — the converter makes no "
               "game-genre assumptions and only emits scaffolding when "
               "explicitly requested.")
+@click.option("--skip-architecture-step", is_flag=True,
+              help="Acknowledge that this CLI does NOT perform the "
+              "client/server architecture step (Step 4.5); required to run "
+              "a full conversion. For a complete, playable result use the "
+              "/convert-unity skill instead.")
 def convert(
     unity_project: str,
     output: str,
@@ -270,17 +279,52 @@ def convert(
     universe_id: int | None,
     place_id: int | None,
     scaffolding: str | None,
+    skip_architecture_step: bool,
 ) -> None:
     """Convert a Unity project to a Roblox experience.
 
+    Every `convert` run needs --skip-architecture-step: this CLI does not
+    perform Step 4.5 (client/server split); the /convert-unity skill does.
+
     Examples:
 
-      python u2r.py convert path/to/UnityProject -o ./output
+      python u2r.py convert path/to/UnityProject -o ./output --skip-architecture-step
 
-      python u2r.py convert path/to/UnityProject -o ./output --api-key YOUR_KEY --creator-id 12345
+      python u2r.py convert path/to/UnityProject -o ./output --api-key YOUR_KEY --creator-id 12345 --skip-architecture-step
 
-      python u2r.py convert path/to/UnityProject -o ./output --api-key ./apikey --creator-id ./creator_id
+      python u2r.py convert path/to/UnityProject -o ./output --api-key ./apikey --creator-id ./creator_id --skip-architecture-step
     """
+    # u2r.py convert runs only Pipeline.PHASES, which never includes the
+    # client/server architecture split ("Step 4.5") — and a --phase resume
+    # re-runs every incomplete prerequisite, so `--phase parse` on a fresh
+    # output dir is a full conversion too. Every `convert` invocation
+    # therefore skips Step 4.5; require an explicit acknowledgement. The
+    # /convert-unity skill is the complete path. See converter/CLAUDE.md.
+    if not skip_architecture_step:
+        click.echo(
+            "ERROR: `u2r.py convert` does NOT perform the client/server "
+            "architecture step (Step 4.5). The converted game will ship UI "
+            "scripts that crash on the server.\n"
+            "  Complete, playable conversion: use the /convert-unity skill "
+            "(convert_interactive.py).\n"
+            "  Individual-phase / CI use of this CLI: pass "
+            "--skip-architecture-step to proceed anyway.",
+            err=True,
+        )
+        sys.exit(1)
+
+    # --scene all converts every scene from scratch via run_all_scenes(),
+    # which ignores --phase entirely. Reject the combination instead of
+    # silently discarding --phase.
+    if scene and scene.lower() == "all" and phase:
+        click.echo(
+            "ERROR: --scene all and --phase are mutually exclusive. "
+            "--scene all runs every scene from scratch; --phase resumes a "
+            "single scene. Pass only one.",
+            err=True,
+        )
+        sys.exit(1)
+
     import config
     from converter.pipeline import Pipeline
 
