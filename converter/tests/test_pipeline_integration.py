@@ -398,7 +398,13 @@ class TestPrefabParseSeam:
 
     def test_prefab_template_node_hierarchy_parsed(self):
         """simple_prefab has a root TestPrefab with a SubPart child; the
-        parser must build that two-node hierarchy with the child parented."""
+        parser must build that two-node hierarchy with the child parented,
+        and the parsed hierarchy must convert through scene_converter so the
+        child's world transform is composed against its parent's. Exercises
+        the prefab_parser -> scene_converter._convert_prefab_node seam."""
+        from converter.scene_converter import _convert_prefab_node
+        from config import STUDS_PER_METER
+
         template = _parse_single_prefab(SIMPLE_PREFAB)
         assert template.name == "simple_prefab"
         assert len(template.all_nodes) == 2
@@ -406,11 +412,36 @@ class TestPrefabParseSeam:
         names = {n.name for n in template.all_nodes.values()}
         assert names == {"TestPrefab", "SubPart"}
 
+        root = next(n for n in template.all_nodes.values() if n.name == "TestPrefab")
         sub = next(n for n in template.all_nodes.values() if n.name == "SubPart")
-        # SubPart's Transform m_Father points at TestPrefab's Transform.
-        assert sub.parent_file_id is not None
+        # SubPart's Transform m_Father points at TestPrefab's GameObject:
+        # parent_file_id must be the *actual* parent node's file_id, not
+        # merely non-None.
+        assert sub.parent_file_id == root.file_id
         # SubPart sits 1m above its parent (m_LocalPosition.y == 1).
         assert sub.position[1] == 1.0
+
+        # Chain into the converter: SubPart composed against TestPrefab's
+        # world transform (root at origin) must land 1m up in Roblox studs.
+        root_part = _convert_prefab_node(
+            root, None, {}, {},
+            parent_pos=[0.0, 0.0, 0.0],
+            parent_rot=[0.0, 0.0, 0.0, 1.0],
+            parent_scl=[1.0, 1.0, 1.0],
+        )
+        assert root_part is not None and root_part.name == "TestPrefab"
+
+        sub_part = _convert_prefab_node(
+            sub, None, {}, {},
+            parent_pos=[root_part.cframe.x, root_part.cframe.y, root_part.cframe.z],
+            parent_rot=[0.0, 0.0, 0.0, 1.0],
+            parent_scl=[1.0, 1.0, 1.0],
+        )
+        assert sub_part is not None and sub_part.name == "SubPart"
+        # Parent at origin + 1m local Y -> 1 * STUDS_PER_METER studs.
+        assert abs(sub_part.cframe.y - STUDS_PER_METER) < 0.5, (
+            f"child world Y not composed from parent: got {sub_part.cframe.y}"
+        )
 
     def test_prefab_node_converts_through_convert_prefab_node(self):
         """A PrefabNode from the parsed template must convert into an RbxPart
@@ -437,13 +468,54 @@ class TestPrefabParseSeam:
         )
 
     def test_variant_prefab_modifications_parsed(self):
-        """variant_prefab is a PrefabInstance (variant); the parser must
-        flag it as a variant and capture its property modifications so a
-        later scene_converter phase can apply them."""
+        """variant_prefab is a PrefabInstance (variant); the parser flags it
+        as a variant and captures its property modifications. The variant's
+        base prefab GUID is not resolvable from the bundled fixtures, so the
+        modifications are applied here onto a synthetic PrefabNode which is
+        then chained into scene_converter._convert_prefab_node — the
+        converted RbxPart must reflect the variant's overridden m_Name and
+        m_LocalPosition. Exercises prefab_parser -> scene_converter."""
+        from core.unity_types import PrefabNode
+        from converter.scene_converter import _convert_prefab_node
+        from config import STUDS_PER_METER
+
         template = _parse_single_prefab(VARIANT_PREFAB)
         assert template.is_variant is True
         assert template.source_prefab_guid == "aabbccdd11223344aabbccdd11223344"
         # The variant overrides m_Name and several transform components.
-        prop_paths = {m.get("propertyPath") for m in template.variant_modifications}
-        assert "m_Name" in prop_paths
-        assert "m_LocalPosition.x" in prop_paths
+        mods = {
+            m.get("propertyPath"): m.get("value")
+            for m in template.variant_modifications
+        }
+        assert "m_Name" in mods
+        assert "m_LocalPosition.x" in mods
+
+        # Apply the parsed variant modifications onto a base node, mirroring
+        # what the scene_converter variant-merge phase does.
+        node = PrefabNode(
+            name=str(mods["m_Name"]),
+            file_id="100",
+            active=True,
+            position=(
+                float(mods["m_LocalPosition.x"]),
+                float(mods["m_LocalPosition.y"]),
+                0.0,
+            ),
+        )
+
+        # Chain into the converter: the variant's modified name and position
+        # must survive into the converted RbxPart.
+        part = _convert_prefab_node(
+            node, None, {}, {},
+            parent_pos=[0.0, 0.0, 0.0],
+            parent_rot=[0.0, 0.0, 0.0, 1.0],
+            parent_scl=[1.0, 1.0, 1.0],
+        )
+        assert part is not None
+        assert part.name == "VariantPrefab", (
+            "variant m_Name override did not reach the converted part"
+        )
+        # Unity m_LocalPosition.y == 10m -> 10 * STUDS_PER_METER studs.
+        assert abs(part.cframe.y - 10.0 * STUDS_PER_METER) < 0.5, (
+            f"variant m_LocalPosition.y override not converted: got {part.cframe.y}"
+        )
