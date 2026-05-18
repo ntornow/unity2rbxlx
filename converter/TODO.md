@@ -135,6 +135,17 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   and surface to `UNCONVERTED.md` instead of issuing a doomed upload.
 ## Infrastructure
 
+- [ ] **P2 — Stale "Step 4.5" terminology.** The `/convert-unity` skill
+  renamed its game-logic-porting phase to 4a/4b/4c, but the old name
+  "Step 4.5" still appears in `README.md`, `converter/ARCHITECTURE.md`,
+  `converter/docs/design/merge-plan-phase-3-augmented.md`, and the
+  `--skip-architecture-step` gate code/docs from PR #109 (`u2r.py`,
+  `converter/CLAUDE.md`, `convert_interactive.py`). Rename game-logic-porting
+  "Step 4.5" -> "Step 4a" for consistency with `references/phase-4a-*.md`.
+  (The unrelated "Phase 4.5" animation-routing references in `pipeline.py` /
+  `scene_parser.py` / animation tests are a separate legacy numbering, out
+  of scope.)
+
 - [ ] **P2 — Three-flow byte-equivalence: u2r.py vs convert_interactive.py
   divergence (Phase 5.1 follow-up).** The byte-equivalence test landed
   with `test_three_flows_produce_identical_rbxlx` xfailed because the
