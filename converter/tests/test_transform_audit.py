@@ -17,6 +17,8 @@ from tools.transform_audit import (
     parse_unity_scene_transforms,
     compare_transforms,
     quat_angle_diff,
+)
+from core.coordinate_system import (
     quat_multiply,
     quat_rotate,
     unity_to_roblox_pos,

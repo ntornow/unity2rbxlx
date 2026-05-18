@@ -15,17 +15,18 @@ from pathlib import Path
 # Add converter to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import config
-
-
-STUDS_PER_METER = config.STUDS_PER_METER
-
 
 # ---------------------------------------------------------------------------
 # Quaternion math (canonical implementations in core.coordinate_system)
 # ---------------------------------------------------------------------------
 
-from core.coordinate_system import quat_multiply, quat_rotate  # noqa: E402
+from core.coordinate_system import (  # noqa: E402
+    quat_multiply,
+    quat_rotate,
+    roblox_quat_to_unity_quat,
+    roblox_to_unity_pos,
+    rotation_matrix_to_quat,
+)
 
 
 def quat_angle_diff(q1, q2):
@@ -33,50 +34,6 @@ def quat_angle_diff(q1, q2):
     dot = abs(q1[0]*q2[0] + q1[1]*q2[1] + q1[2]*q2[2] + q1[3]*q2[3])
     dot = min(1.0, dot)
     return math.degrees(2.0 * math.acos(dot))
-
-
-def unity_to_roblox_pos(x, y, z):
-    return (x * STUDS_PER_METER, y * STUDS_PER_METER, -z * STUDS_PER_METER)
-
-
-def roblox_to_unity_pos(rx, ry, rz):
-    return (rx / STUDS_PER_METER, ry / STUDS_PER_METER, -rz / STUDS_PER_METER)
-
-
-def rotation_matrix_to_quat(r):
-    """Convert 3x3 rotation matrix (row-major list of 9) to quaternion (x,y,z,w)."""
-    r00, r01, r02, r10, r11, r12, r20, r21, r22 = r
-    trace = r00 + r11 + r22
-    if trace > 0:
-        s = 0.5 / math.sqrt(trace + 1.0)
-        w = 0.25 / s
-        x = (r21 - r12) * s
-        y = (r02 - r20) * s
-        z = (r10 - r01) * s
-    elif r00 > r11 and r00 > r22:
-        s = 2.0 * math.sqrt(1.0 + r00 - r11 - r22)
-        w = (r21 - r12) / s
-        x = 0.25 * s
-        y = (r01 + r10) / s
-        z = (r02 + r20) / s
-    elif r11 > r22:
-        s = 2.0 * math.sqrt(1.0 + r11 - r00 - r22)
-        w = (r02 - r20) / s
-        x = (r01 + r10) / s
-        y = 0.25 * s
-        z = (r10 + r21) / s
-    else:
-        s = 2.0 * math.sqrt(1.0 + r22 - r00 - r11)
-        w = (r10 - r01) / s
-        x = (r02 + r20) / s
-        y = (r12 + r21) / s
-        z = 0.25 * s
-    return (x, y, z, w)
-
-
-def roblox_quat_to_unity_quat(rqx, rqy, rqz, rqw):
-    """Reverse of unity_quat_to_roblox_quat: (-qx, -qy, qz, qw) -> (qx, qy, qz, qw)."""
-    return (-rqx, -rqy, rqz, rqw)
 
 
 # ---------------------------------------------------------------------------

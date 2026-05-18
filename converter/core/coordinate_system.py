@@ -24,6 +24,17 @@ def unity_to_roblox_pos(
     return (x * STUDS_PER_METER, y * STUDS_PER_METER, -z * STUDS_PER_METER)
 
 
+def roblox_to_unity_pos(
+    rx: float, ry: float, rz: float,
+) -> tuple[float, float, float]:
+    """Convert a Roblox position (studs) back to Unity (meters, Z-negated).
+
+    Inverse of ``unity_to_roblox_pos``.
+    """
+    from config import STUDS_PER_METER
+    return (rx / STUDS_PER_METER, ry / STUDS_PER_METER, -rz / STUDS_PER_METER)
+
+
 def quat_multiply(
     a: tuple[float, float, float, float],
     b: tuple[float, float, float, float],
@@ -144,6 +155,16 @@ def unity_quat_to_roblox_quat(
     return (-qx, -qy, qz, qw)
 
 
+def roblox_quat_to_unity_quat(
+    qx: float, qy: float, qz: float, qw: float,
+) -> tuple[float, float, float, float]:
+    """Convert a Roblox quaternion back to Unity.
+
+    Inverse of ``unity_quat_to_roblox_quat`` (negates X and Y; involutive).
+    """
+    return (-qx, -qy, qz, qw)
+
+
 def quaternion_to_rotation_matrix(
     qx: float, qy: float, qz: float, qw: float,
 ) -> tuple[float, float, float,
@@ -185,6 +206,46 @@ def quaternion_to_rotation_matrix(
     r22 = 1.0 - 2.0 * (xx + yy)
 
     return (r00, r01, r02, r10, r11, r12, r20, r21, r22)
+
+
+def rotation_matrix_to_quat(
+    r: tuple[float, float, float,
+             float, float, float,
+             float, float, float],
+) -> tuple[float, float, float, float]:
+    """Convert a 3x3 rotation matrix (row-major R00..R22) to a quaternion.
+
+    Inverse of ``quaternion_to_rotation_matrix``. Returns (x, y, z, w).
+    Uses Shepperd's method — picks the largest diagonal pivot for
+    numerical stability.
+    """
+    r00, r01, r02, r10, r11, r12, r20, r21, r22 = r
+    trace = r00 + r11 + r22
+    if trace > 0:
+        s = 0.5 / math.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (r21 - r12) * s
+        y = (r02 - r20) * s
+        z = (r10 - r01) * s
+    elif r00 > r11 and r00 > r22:
+        s = 2.0 * math.sqrt(1.0 + r00 - r11 - r22)
+        w = (r21 - r12) / s
+        x = 0.25 * s
+        y = (r01 + r10) / s
+        z = (r02 + r20) / s
+    elif r11 > r22:
+        s = 2.0 * math.sqrt(1.0 + r11 - r00 - r22)
+        w = (r02 - r20) / s
+        x = (r01 + r10) / s
+        y = 0.25 * s
+        z = (r12 + r21) / s
+    else:
+        s = 2.0 * math.sqrt(1.0 + r22 - r00 - r11)
+        w = (r10 - r01) / s
+        x = (r02 + r20) / s
+        y = (r12 + r21) / s
+        z = 0.25 * s
+    return (x, y, z, w)
 
 
 def unity_transform_to_roblox_cframe(
