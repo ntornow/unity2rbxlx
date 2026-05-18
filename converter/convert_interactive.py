@@ -660,26 +660,19 @@ def validate(output_dir: str, write: bool) -> None:
         })
         return
 
-    import subprocess, shutil
-    analyzer = shutil.which("luau-analyze")
+    from utils.luau_analyze import syntax_errors_for_file
 
     files_with_fixes: list[dict] = []
     total_fixes = 0
     for path in sorted(candidates):
-        if analyzer:
-            result = subprocess.run(
-                [analyzer, str(path)],
-                capture_output=True, text=True, timeout=10,
-            )
-            errors = [l for l in (result.stdout + result.stderr).splitlines()
-                      if "SyntaxError" in l]
-            if errors:
-                files_with_fixes.append({
-                    "file": str(path.relative_to(out)),
-                    "fix_count": len(errors),
-                    "fixes": errors[:10],
-                })
-                total_fixes += len(errors)
+        errors = syntax_errors_for_file(path)
+        if errors:
+            files_with_fixes.append({
+                "file": str(path.relative_to(out)),
+                "fix_count": len(errors),
+                "fixes": errors[:10],
+            })
+            total_fixes += len(errors)
 
     _mark_skill_phase(out, "validate")
 

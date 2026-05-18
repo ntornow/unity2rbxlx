@@ -11,7 +11,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import re
 import subprocess
 import time
@@ -1439,36 +1438,10 @@ def _luau_syntax_check(luau_source: str) -> list[str]:
     """Run luau-analyze on the source and return SyntaxError lines.
 
     Returns an empty list if the source is syntactically valid.
-    Only reports SyntaxError lines — TypeErrors for unknown Roblox globals
-    are expected and filtered out.
+    Thin wrapper over ``utils.luau_analyze``, the shared analyzer runner.
     """
-    import shutil
-    analyzer = shutil.which("luau-analyze")
-    if not analyzer:
-        return []  # No analyzer available, skip check
-
-    import tempfile
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".luau", delete=False, encoding="utf-8") as f:
-        f.write(luau_source)
-        tmp_path = f.name
-
-    try:
-        result = subprocess.run(
-            [analyzer, tmp_path],
-            capture_output=True, text=True, timeout=10,
-        )
-        # Extract only SyntaxError lines
-        errors = []
-        for line in result.stdout.splitlines() + result.stderr.splitlines():
-            if "SyntaxError" in line:
-                # Strip the temp file path for cleaner error messages
-                clean = line.replace(tmp_path, "script")
-                errors.append(clean)
-        return errors
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return []
-    finally:
-        os.unlink(tmp_path)
+    from utils.luau_analyze import syntax_errors_for_source
+    return syntax_errors_for_source(luau_source)
 
 
 def _reprompt_fix(luau_source: str, syntax_errors: list[str], original_csharp: str = "") -> str:
