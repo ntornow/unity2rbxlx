@@ -17,6 +17,7 @@ from core.roblox_types import (
     RbxReverbSoundEffect, RbxSound, RbxTerrain, RbxTrail,
     RbxVideoFrame,
 )
+from unity.yaml_parser import ref_guid
 
 log = logging.getLogger(__name__)
 
@@ -149,7 +150,7 @@ def convert_audio(
     sound_id = ""
     audio_clip = properties.get("m_audioClip", {})
     if isinstance(audio_clip, dict):
-        guid = audio_clip.get("guid", "")
+        guid = (ref_guid(audio_clip) or "")
         if guid and guid_index and uploaded_assets:
             audio_path = guid_index.resolve(guid)
             if audio_path:
@@ -889,7 +890,7 @@ def convert_tilemap(
             tile_ref = tile_data.get("m_Tile", tile_data.get("tile", tile_data))
             if isinstance(tile_ref, dict):
                 file_id = tile_ref.get("fileID", 0)
-                if file_id == 0 and not tile_ref.get("guid"):
+                if file_id == 0 and not ref_guid(tile_ref):
                     continue  # Empty tile slot
         elif tile_data == 0 or tile_data is None:
             continue  # Empty tile
@@ -937,7 +938,7 @@ def convert_tilemap(
         if isinstance(tile_data, dict):
             sprite_ref = tile_data.get("m_Sprite", tile_data.get("sprite", {}))
             if isinstance(sprite_ref, dict):
-                guid = sprite_ref.get("guid", "")
+                guid = (ref_guid(sprite_ref) or "")
                 if guid:
                     tile_part.attributes["_SpriteGuid"] = guid
 
@@ -1039,7 +1040,7 @@ def convert_terrain(
     terrain_data_ref = properties.get("m_TerrainData", {})
     terrain_data_guid = ""
     if isinstance(terrain_data_ref, dict):
-        terrain_data_guid = terrain_data_ref.get("guid", "")
+        terrain_data_guid = (ref_guid(terrain_data_ref) or "")
 
     return RbxTerrain(
         position=node_position,
@@ -1773,7 +1774,7 @@ def convert_video_player(
     if not video_url:
         video_clip = properties.get("m_VideoClip", {})
         if isinstance(video_clip, dict):
-            guid = video_clip.get("guid", "")
+            guid = (ref_guid(video_clip) or "")
             if guid and guid_index and uploaded_assets:
                 video_path = guid_index.resolve(guid)
                 if video_path:

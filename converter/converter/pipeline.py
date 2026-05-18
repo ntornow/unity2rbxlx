@@ -32,6 +32,7 @@ from converter.code_transpiler import TranspilationResult
 from converter.material_mapper import MaterialMapping
 from converter.scriptable_object_converter import AssetConversionResult
 from converter.sprite_extractor import SpriteExtractionResult
+from unity.yaml_parser import ref_guid
 
 log = logging.getLogger(__name__)
 
@@ -1239,7 +1240,7 @@ class Pipeline:
                         if comp.component_type in ('MeshRenderer', 'SkinnedMeshRenderer'):
                             for mat_ref in comp.properties.get('m_Materials', []):
                                 if isinstance(mat_ref, dict):
-                                    guid = mat_ref.get('guid', '')
+                                    guid = (ref_guid(mat_ref) or '')
                                     if guid and guid != '0000000000000000f000000000000000':
                                         referenced_guids.add(guid)
                     for child in getattr(node, 'children', []):
@@ -1424,7 +1425,7 @@ class Pipeline:
                                 continue
                             for mat_ref in (comp.properties.get("m_Materials") or []):
                                 if isinstance(mat_ref, dict):
-                                    mg = mat_ref.get("guid", "")
+                                    mg = (ref_guid(mat_ref) or "")
                                     if mg:
                                         material_to_meshes.setdefault(mg, set()).add(
                                             (mesh_path, mesh_file_id)

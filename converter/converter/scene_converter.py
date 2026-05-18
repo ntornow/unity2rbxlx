@@ -26,6 +26,7 @@ from core.unity_types import (
     SceneNode,
 )
 from converter.material_mapper import MaterialMapping
+from unity.yaml_parser import ref_guid
 from core.roblox_types import (
     RbxCFrame,
     RbxCameraConfig,
@@ -1803,7 +1804,7 @@ def _process_components(
             # Extract sprite GUID for potential texture upload
             sprite_ref = comp.properties.get("m_Sprite", {})
             if isinstance(sprite_ref, dict):
-                sprite_guid = sprite_ref.get("guid", "")
+                sprite_guid = (ref_guid(sprite_ref) or "")
                 sprite_file_id = str(sprite_ref.get("fileID", ""))
                 if sprite_guid and sprite_guid != "0" * 32:
                     part.attributes["_SpriteGuid"] = sprite_guid
@@ -1905,7 +1906,7 @@ def _process_components(
             # Resolve PlayableAsset GUID for reference
             playable_ref = comp.properties.get("m_PlayableAsset", {})
             if isinstance(playable_ref, dict):
-                playable_guid = playable_ref.get("guid", "")
+                playable_guid = (ref_guid(playable_ref) or "")
                 if playable_guid:
                     part.attributes["_TimelineAssetGuid"] = playable_guid
 
@@ -2256,7 +2257,7 @@ def _extract_monobehaviour_attributes(
     # so multiple MonoBehaviours on the same GameObject all get bound.
     script_ref = properties.get("m_Script", {})
     if isinstance(script_ref, dict) and guid_index:
-        script_guid = script_ref.get("guid", "")
+        script_guid = (ref_guid(script_ref) or "")
         if script_guid:
             script_path = guid_index.resolve(script_guid)
             if script_path and script_path.suffix == ".cs":
@@ -2288,18 +2289,18 @@ def _extract_monobehaviour_attributes(
             # Object reference — resolve to asset and create appropriate child.
             # AudioClip (fileID=8300000) → Sound child
             # Prefab/mesh reference → store as attribute for script access
-            ref_guid = value.get("guid", "")
+            value_guid = (ref_guid(value) or "")
             ref_fid = str(value.get("fileID", ""))
-            if not ref_guid:
+            if not value_guid:
                 continue
-            ref_path = guid_index.resolve(ref_guid)
+            ref_path = guid_index.resolve(value_guid)
             if not ref_path:
                 continue
 
             if ref_fid == "8300000" or ref_path.suffix.lower() in (".mp3", ".wav", ".ogg"):
                 # AudioClip → create Sound child object
                 uploaded = uploaded_assets or {}
-                relative = guid_index.resolve_relative(ref_guid)
+                relative = guid_index.resolve_relative(value_guid)
                 sound_url = None
                 for skey in [str(relative), str(ref_path)] if relative else [str(ref_path)]:
                     if skey in uploaded:
@@ -2414,8 +2415,8 @@ def _extract_monobehaviour_attributes(
                         # sm["size"] is the native/initial size from Roblox;
                         # we must apply globalScale * unit_ratio * STUDS_PER_METER
                         # to get the correct visual size.
-                        import_scale = _get_fbx_import_scale(ref_guid, guid_index) if guid_index else 0.01
-                        unit_ratio = _get_fbx_unit_ratio(ref_guid, guid_index) if guid_index else 1.0
+                        import_scale = _get_fbx_import_scale(value_guid, guid_index) if guid_index else 0.01
+                        unit_ratio = _get_fbx_unit_ratio(value_guid, guid_index) if guid_index else 1.0
                         # If the reference is a prefab, use the resolved mesh GUID
                         if ref_path.suffix.lower() == ".prefab" and mesh_path != ref_path:
                             mesh_guid_for_scale = None
@@ -2497,7 +2498,7 @@ def _is_water_node(
         if comp.component_type in ("MeshRenderer", "SkinnedMeshRenderer"):
             for mat_ref in comp.properties.get("m_Materials", []):
                 if isinstance(mat_ref, dict):
-                    guid = mat_ref.get("guid", "")
+                    guid = (ref_guid(mat_ref) or "")
                     if guid and material_mappings:
                         mapping = material_mappings.get(guid)
                         if mapping and hasattr(mapping, "shader_name"):
@@ -2623,7 +2624,7 @@ def _apply_materials(
         if first_ref is None:
             continue
 
-        guid = first_ref.get("guid", "") if isinstance(first_ref, dict) else ""
+        guid = (ref_guid(first_ref) or "")
         if not guid or guid not in material_mappings:
             continue
 
@@ -2700,7 +2701,7 @@ def _blend_extra_material_colors(
         colors.append(part.color)
 
     for ref in extra_refs:
-        guid = ref.get("guid", "") if isinstance(ref, dict) else ""
+        guid = (ref_guid(ref) or "")
         if not guid or guid not in material_mappings:
             continue
         mapping = material_mappings[guid]
@@ -2747,7 +2748,7 @@ def _apply_prefab_materials(
         if first_ref is None:
             continue
 
-        guid = first_ref.get("guid", "") if isinstance(first_ref, dict) else ""
+        guid = (ref_guid(first_ref) or "")
         if not guid or guid not in material_mappings:
             continue
 
@@ -3156,7 +3157,7 @@ def _convert_fbx_prefab_instance(
         if pp.startswith("m_Materials.Array.data["):
             obj_ref = mod.get("objectReference", {})
             if isinstance(obj_ref, dict):
-                mg = obj_ref.get("guid", "")
+                mg = (ref_guid(obj_ref) or "")
                 if mg and mg != "0" * 32:
                     material_guids.append(mg)
             continue
@@ -3585,7 +3586,7 @@ def _convert_prefab_instance(
         if pp.startswith("m_Materials.Array.data["):
             obj_ref = mod.get("objectReference", {})
             if isinstance(obj_ref, dict):
-                guid = obj_ref.get("guid", "")
+                guid = (ref_guid(obj_ref) or "")
                 if guid:
                     material_override_guid = guid
             continue
@@ -4263,7 +4264,7 @@ def _convert_prefab_node(
             elif pp.startswith("m_Materials.Array.data["):
                 obj_ref = mod.get("objectReference", {})
                 if isinstance(obj_ref, dict):
-                    mat_guid = obj_ref.get("guid", "")
+                    mat_guid = (ref_guid(obj_ref) or "")
                     if mat_guid and mat_guid in material_mappings:
                         mapping = material_mappings[mat_guid]
                         base_color = getattr(mapping, "base_color", None)

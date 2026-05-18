@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from core.unity_types import GuidIndex, ParsedScene, PrefabLibrary
+from unity.yaml_parser import ref_guid
 
 # Unity MonoBehaviour fields that never hold author-visible serialized data —
 # they're engine-internal. Skipping them avoids false positives.
@@ -44,7 +45,7 @@ def _is_object_ref(value: Any) -> bool:
     """Return True when a YAML value looks like a Unity object reference."""
     if not isinstance(value, dict):
         return False
-    guid = value.get("guid", "")
+    guid = (ref_guid(value) or "")
     return bool(guid) and guid != "0" * 32
 
 
@@ -60,7 +61,7 @@ def _process_mono_properties(
     script_ref = props.get("m_Script", {})
     if not isinstance(script_ref, dict):
         return
-    script_guid = script_ref.get("guid", "")
+    script_guid = (ref_guid(script_ref) or "")
     if not script_guid:
         return
     script_path = guid_index.resolve(script_guid) if guid_index else None

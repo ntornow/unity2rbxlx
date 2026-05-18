@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from core.unity_types import GuidIndex, ParsedScene, PrefabLibrary
-from unity.yaml_parser import parse_documents, doc_body, is_text_yaml
+from unity.yaml_parser import parse_documents, doc_body, is_text_yaml, ref_guid
 
 log = logging.getLogger(__name__)
 
@@ -904,7 +904,7 @@ def _build_controller_from_docs(
         blend_tree_name = ""
 
         if isinstance(motion_ref, dict):
-            clip_guid = motion_ref.get("guid", "") or ""
+            clip_guid = (ref_guid(motion_ref) or "")
             if not clip_guid:
                 # Local fileID refers to a BlendTree doc in this same file.
                 motion_fid = str(motion_ref.get("fileID", ""))
@@ -1025,7 +1025,7 @@ def _parse_blend_tree(
         motion_ref = child.get("m_Motion", {})
         if not isinstance(motion_ref, dict):
             continue
-        guid = motion_ref.get("guid", "") or ""
+        guid = (ref_guid(motion_ref) or "")
         if not guid:
             # Nested blend tree → inline its first leaf clip. Also record
             # the nested tree as unconverted when it's 2D, so a 1D tree
@@ -1097,7 +1097,7 @@ def _first_leaf_clip_guid(
         child_motion = child.get("m_Motion", {})
         if not isinstance(child_motion, dict):
             continue
-        guid = child_motion.get("guid", "") or ""
+        guid = (ref_guid(child_motion) or "")
         if guid:
             return guid
         nested = _deref_motion(child_motion, docs_by_fid)
@@ -1804,7 +1804,7 @@ def convert_animations(
                     obj_ref = mod.get("objectReference") or {}
                     if not isinstance(obj_ref, dict):
                         continue
-                    override_guid = obj_ref.get("guid", "")
+                    override_guid = (ref_guid(obj_ref) or "")
                     if isinstance(override_guid, str) and override_guid:
                         instance_overrides_by_ctrl_guid.setdefault(
                             override_guid, set(),
@@ -2019,7 +2019,7 @@ def convert_animations(
                     filtered.append(entry)
             elif category == "animator_controller":
                 # Binary controllers only know their .meta guid.
-                guid = entry.get("guid", "")
+                guid = (ref_guid(entry) or "")
                 if guid and guid in any_scene_refs:
                     filtered.append(entry)
                 # If no guid recorded (no .meta), drop — we can't

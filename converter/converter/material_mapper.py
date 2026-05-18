@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from core.unity_types import GuidIndex
+from unity.yaml_parser import ref_guid
 
 log = logging.getLogger(__name__)
 
@@ -816,7 +817,7 @@ def _extract_shader_name(mat_data: dict[str, object], guid_index: GuidIndex | No
         if name:
             return name
         # Resolve shader GUID to file path to get shader name
-        shader_guid = shader.get("guid", "")
+        shader_guid = (ref_guid(shader) or "")
         if shader_guid and guid_index:
             shader_path = guid_index.resolve(shader_guid)
             if shader_path:
@@ -889,7 +890,7 @@ def _resolve_texture(
     if not isinstance(texture_ref, dict):
         return None
 
-    guid = texture_ref.get("guid", "")
+    guid = (ref_guid(texture_ref) or "")
     if not guid:
         return None
 

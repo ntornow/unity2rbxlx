@@ -12,6 +12,7 @@ from typing import Any
 
 from core.unity_types import SceneNode
 from core.roblox_types import RbxScreenGui, RbxUIElement
+from unity.yaml_parser import ref_guid
 
 log = logging.getLogger(__name__)
 
@@ -127,7 +128,7 @@ def _is_ui_image_mb(props: dict[str, Any]) -> bool:
     script = props.get("m_Script", {})
     if not isinstance(script, dict):
         return False
-    guid = script.get("guid", "")
+    guid = (ref_guid(script) or "")
     return isinstance(guid, str) and guid.startswith(_UI_IMAGE_SCRIPT_GUID_PREFIX)
 
 
@@ -553,7 +554,7 @@ def _apply_image_properties(element: RbxUIElement, props: dict[str, Any]) -> Non
     # Sprite/texture reference (GUID needs external resolution).
     sprite_ref = props.get("m_Sprite", props.get("m_Texture", {}))
     if isinstance(sprite_ref, dict):
-        guid = sprite_ref.get("guid", "")
+        guid = (ref_guid(sprite_ref) or "")
         # Skip null/empty GUIDs (Unity built-in default material)
         if guid and guid != "0000000000000000f000000000000000":
             element.image = f"guid://{guid}"

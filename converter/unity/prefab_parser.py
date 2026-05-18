@@ -390,7 +390,7 @@ def _set_nested_property(
         return  # Nothing to set for bare "Array"
 
     if isinstance(target, dict):
-        if obj_ref is not None and isinstance(obj_ref, dict) and obj_ref.get("guid"):
+        if obj_ref is not None and isinstance(obj_ref, dict) and ref_guid(obj_ref):
             target[last] = obj_ref
         elif value is not None:
             target[last] = value
@@ -617,7 +617,7 @@ def aggregate_prefab_controller_refs(
             obj_ref = mod.get("objectReference") or {}
             if not isinstance(obj_ref, dict):
                 continue
-            override_guid = obj_ref.get("guid", "")
+            override_guid = (ref_guid(obj_ref) or "")
             if isinstance(override_guid, str) and override_guid:
                 parsed_scene.referenced_animator_controller_guids.add(
                     override_guid
