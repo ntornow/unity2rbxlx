@@ -1483,6 +1483,58 @@ def _reprompt_fix(luau_source: str, syntax_errors: list[str], original_csharp: s
     return luau_source  # Return original if reprompt failed
 
 
+# A run of 4+ consecutive plain-English words — a near-zero false-positive
+# signal for natural-language prose. Luau statements never contain four bare
+# alphabetic words in a row.
+_PROSE_RUN = re.compile(r"[A-Za-z]+(?:\s+[A-Za-z]+){3,}")
+
+
+def _strip_trailing_prose(luau_source: str, errors: list[str]) -> str:
+    """Drop a trailing natural-language explanation appended by the AI.
+
+    The Claude CLI sometimes returns valid Luau followed by a prose summary
+    with no code fences, so ``_strip_code_fences`` can't catch it. The prose
+    lints as a wall of syntax errors. If the error region is prose-dominant
+    and removing it leaves a non-empty lint-clean head, return that head.
+    """
+    first_err: int | None = None
+    for err in errors:
+        m = re.search(r"\((\d+),\d+\)", err)
+        if m:
+            ln = int(m.group(1))
+            if first_err is None or ln < first_err:
+                first_err = ln
+    if first_err is None:
+        return luau_source
+
+    lines = luau_source.split("\n")
+    # First prose-like line at or after the first error. A Lua comment may
+    # legitimately hold prose, so those don't count as a cut point.
+    cut: int | None = None
+    for i in range(max(first_err - 1, 0), len(lines)):
+        if _PROSE_RUN.search(lines[i]) and not lines[i].lstrip().startswith("--"):
+            cut = i
+            break
+    if cut is None:
+        return luau_source
+
+    # The removed tail must be prose-dominant — not real code with one bad line.
+    tail = [ln for ln in lines[cut:] if ln.strip()]
+    prose_lines = sum(
+        1 for ln in tail
+        if not ln.lstrip().startswith("--") and _PROSE_RUN.search(ln)
+    )
+    if not tail or prose_lines / len(tail) < 0.5:
+        return luau_source
+
+    while cut > 0 and not lines[cut - 1].strip():
+        cut -= 1
+    head = "\n".join(lines[:cut]).rstrip() + "\n"
+    if head.strip() and not _luau_syntax_check(head):
+        return head
+    return luau_source
+
+
 def _lint_and_fix(luau_source: str, class_name: str = "",
                   original_csharp: str = "", max_retries: int = 2) -> tuple[str, list[str]]:
     """Run luau-analyze, reprompt Claude to fix syntax errors if found.
@@ -1492,6 +1544,11 @@ def _lint_and_fix(luau_source: str, class_name: str = "",
     warnings = []
     for attempt in range(max_retries + 1):
         errors = _luau_syntax_check(luau_source)
+        if errors:
+            trimmed = _strip_trailing_prose(luau_source, errors)
+            if trimmed != luau_source:
+                luau_source = trimmed
+                errors = _luau_syntax_check(luau_source)
         if not errors:
             if attempt > 0:
                 log.info("  [%s] Lint clean after %d reprompt(s)", class_name, attempt)
