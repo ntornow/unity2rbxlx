@@ -25,7 +25,7 @@ from core.unity_types import (
     SceneNode,
 )
 from converter.material_mapper import MaterialMapping
-from unity.yaml_parser import ref_guid
+from unity.yaml_parser import doc_body, extract_vec3, parse_documents, ref_guid
 from core.roblox_types import (
     RbxCFrame,
     RbxCameraConfig,
@@ -502,6 +502,13 @@ def _compute_mesh_size(
             )
             return size, initial_size
 
+    # Fallback: meshes embedded directly in a .prefab/.asset (legacy Asset
+    # Store packs) are never uploaded, so they have no native_sizes entry.
+    embedded = _compute_mesh_size_from_embedded_aabb(
+        unity_scale, mesh_guid, guid_index, mesh_file_id)
+    if embedded:
+        return embedded
+
     return None
 
 
@@ -509,6 +516,7 @@ def _compute_mesh_size_from_fbx_bbox(
     unity_scale: tuple[float, float, float],
     mesh_guid: str,
     guid_index: GuidIndex,
+    mesh_file_id: str | None = None,
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
     """Estimate Roblox MeshPart Size and InitialSize from FBX bounding box data.
 
@@ -521,8 +529,20 @@ def _compute_mesh_size_from_fbx_bbox(
         InitialSize ≈ fbx_bounding_box  (FBX file units ≈ Roblox studs)
         Size = InitialSize × import_scale × unit_ratio × STUDS_PER_METER × unity_scale
 
+    ``mesh_file_id`` is forwarded to the embedded-mesh fallback so multi-mesh
+    legacy assets resolve to the right sub-mesh.
+
     Returns (size, initial_size) or None if no bounding box is available.
     """
+    # Meshes embedded in a .prefab/.asset are never uploaded and have no FBX
+    # bbox; recover their size from the serialized Mesh AABB instead. This
+    # also covers conversions that resolved no meshes at all (mesh_native_sizes
+    # empty), where _compute_mesh_size is skipped and this is the first stop.
+    embedded = _compute_mesh_size_from_embedded_aabb(
+        unity_scale, mesh_guid, guid_index, mesh_file_id)
+    if embedded:
+        return embedded
+
     if not _ctx().fbx_bounding_boxes:
         return None
 
@@ -557,6 +577,100 @@ def _compute_mesh_size_from_fbx_bbox(
         abs(unity_scale[2]) * initial_size[2] * scale_factor,
     )
     return size, initial_size
+
+
+# Cache of {asset_path: {mesh_fileID: native_size_metres}} for embedded
+# meshes. Reset per conversion in convert_scene() so a re-run cannot serve a
+# previous run's geometry.
+_embedded_mesh_aabb_cache: dict[str, dict[str, tuple[float, float, float]]] = {}
+
+
+def _read_embedded_mesh_aabb(
+    asset_path: Path, mesh_file_id: str | None
+) -> tuple[float, float, float] | None:
+    """Return the native size (in metres) of a Mesh embedded in a Unity asset.
+
+    Legacy Asset Store content ships ``.prefab``/``.asset`` files saved with
+    Unity's NativeFormatImporter that embed mesh geometry directly as a
+    ``!u!43`` Mesh object instead of referencing an external ``.fbx``.  The
+    pipeline only uploads ``.fbx``/``.obj`` meshes, so embedded meshes never
+    get native dimensions and the size pipeline falls back to treating the
+    GameObject's dimensionless Transform scale as a metre size -- producing
+    parts several times too large (e.g. SimpleFPS's landmine).
+
+    Unity serialises every Mesh's axis-aligned bounding box as
+    ``m_LocalAABB.m_Extent`` (a half-size, in metres).  Reading that field
+    recovers a correct size without decoding the binary vertex buffer. The
+    shared :func:`parse_documents` reader handles stripped documents,
+    negative fileIDs, and YAML-style variation across Unity versions.
+
+    ``mesh_file_id`` is the MeshFilter's ``m_Mesh.fileID``; it disambiguates
+    assets that pack several meshes (LOD variants). When it is absent, a lone
+    embedded mesh is still unambiguous; an asset with several is not.
+
+    Returns ``(x, y, z)`` full size in metres, or ``None`` when the asset is
+    not a YAML mesh container or has no usable Mesh AABB.
+    """
+    if asset_path.suffix.lower() not in (".prefab", ".asset"):
+        return None
+    blocks = _embedded_mesh_aabb_cache.get(str(asset_path))
+    if blocks is None:
+        try:
+            text = asset_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            # Transient read failure -- don't cache it; let a later call retry.
+            return None
+        blocks = {}
+        for class_id, file_id, doc in parse_documents(text):
+            if class_id != 43:  # Unity classID 43 == Mesh
+                continue
+            extent = extract_vec3(doc_body(doc).get("m_LocalAABB", {}), "m_Extent")
+            size = (abs(extent[0]) * 2.0, abs(extent[1]) * 2.0, abs(extent[2]) * 2.0)
+            if max(size) > 1e-6:
+                blocks[file_id] = size
+            else:
+                log.debug("Embedded mesh %s in %s has no usable m_LocalAABB",
+                          file_id, asset_path.name)
+        _embedded_mesh_aabb_cache[str(asset_path)] = blocks
+    if mesh_file_id:
+        # An explicit fileID must match -- never guess a different mesh.
+        return blocks.get(mesh_file_id)
+    if len(blocks) == 1:
+        return next(iter(blocks.values()))
+    return None
+
+
+def _compute_mesh_size_from_embedded_aabb(
+    unity_scale: tuple[float, float, float],
+    mesh_guid: str,
+    guid_index: GuidIndex,
+    mesh_file_id: str | None = None,
+) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
+    """Estimate Roblox Size/InitialSize for a mesh embedded in a Unity asset.
+
+    Used when ``mesh_guid`` resolves to a ``.prefab``/``.asset`` that embeds
+    its Mesh geometry (see :func:`_read_embedded_mesh_aabb`). Such meshes are
+    never uploaded, so neither ``mesh_native_sizes`` nor ``fbx_bounding_boxes``
+    has an entry for them.
+
+    The embedded ``m_LocalAABB`` is already in Unity metres -- no FBX import
+    scale applies -- so ``Size = aabb × unity_scale × STUDS_PER_METER``.
+
+    Returns ``(size, initial_size)`` or ``None`` when no embedded mesh AABB
+    is available.
+    """
+    asset_path = guid_index.resolve(mesh_guid)
+    if not asset_path:
+        return None
+    native = _read_embedded_mesh_aabb(asset_path, mesh_file_id)
+    if not native:
+        return None
+    size = (
+        abs(unity_scale[0]) * native[0] * config.STUDS_PER_METER,
+        abs(unity_scale[1]) * native[1] * config.STUDS_PER_METER,
+        abs(unity_scale[2]) * native[2] * config.STUDS_PER_METER,
+    )
+    return size, native
 
 
 # Unity built-in mesh shapes.
@@ -673,8 +787,9 @@ def convert_scene(
     # below clears it so a subsequent convert_scene() doesn't inherit stale
     # data and so any helper invoked outside convert_scene fails loud
     # instead of silently reading the previous run's state.
-    global _current_ctx, _mesh_vertical_offset_cache
+    global _current_ctx, _mesh_vertical_offset_cache, _embedded_mesh_aabb_cache
     _mesh_vertical_offset_cache = {}
+    _embedded_mesh_aabb_cache = {}
     _current_ctx = SceneConversionContext(
         mesh_native_sizes=mesh_native_sizes or {},
         mesh_texture_ids=mesh_texture_ids or {},
@@ -1292,7 +1407,8 @@ def _convert_node(
                     sized = True
             # Fallback 1: use FBX bounding box from trimesh as InitialSize estimate.
             if not sized and guid_index and node.mesh_guid:
-                result = _compute_mesh_size_from_fbx_bbox(node.scale, node.mesh_guid, guid_index)
+                result = _compute_mesh_size_from_fbx_bbox(node.scale, node.mesh_guid, guid_index,
+                                                          mesh_file_id=node.mesh_file_id)
                 if result:
                     part.size, part.initial_size = result
                     sized = True
@@ -3802,7 +3918,9 @@ def _convert_prefab_instance(
                         part.size, part.initial_size = result
                         sized = True
                 if not sized and guid_index:
-                    result = _compute_mesh_size_from_fbx_bbox(combined_scl, root.mesh_guid, guid_index)
+                    result = _compute_mesh_size_from_fbx_bbox(
+                        combined_scl, root.mesh_guid, guid_index,
+                        mesh_file_id=root.mesh_file_id if hasattr(root, 'mesh_file_id') else None)
                     if result:
                         part.size, part.initial_size = result
                         sized = True
@@ -3947,7 +4065,9 @@ def _convert_prefab_instance(
                     sized = True
             if not sized and guid_index:
                 # Fallback 1: use FBX bounding box from trimesh
-                result = _compute_mesh_size_from_fbx_bbox(combined_scale, root.mesh_guid, guid_index)
+                result = _compute_mesh_size_from_fbx_bbox(
+                    combined_scale, root.mesh_guid, guid_index,
+                    mesh_file_id=root.mesh_file_id if hasattr(root, 'mesh_file_id') else None)
                 if result:
                     part.size, part.initial_size = result
                     sized = True
@@ -4238,7 +4358,9 @@ def _convert_prefab_node(
                 sized = True
         if not sized and guid_index:
             # Fallback 1: use FBX bounding box from trimesh
-            result = _compute_mesh_size_from_fbx_bbox(local_scl, node.mesh_guid, guid_index)
+            result = _compute_mesh_size_from_fbx_bbox(
+                local_scl, node.mesh_guid, guid_index,
+                mesh_file_id=node.mesh_file_id if hasattr(node, 'mesh_file_id') else None)
             if result:
                 part.size, part.initial_size = result
                 sized = True
