@@ -155,7 +155,7 @@ Order: P6.1 → P6.5 are doc edits in any order. P6.6 is a closing index entry. 
 **Edits:** Append a short "## Source docs not ported (and why)" section to `converter/docs/design/merge-plan-phase-3-augmented.md` (the existing closeout index — it's already there, just needs another section).
 
 Content: two bullets only.
-- `GAME_LOGIC_PORTING.md` — describes a 9-module Unity bridge layer that was deleted in dest. The Step 4.5 game-logic-porting playbook lives in `.claude/skills/convert-unity/references/phase-4b-*.md`.
+- `GAME_LOGIC_PORTING.md` — describes a 9-module Unity bridge layer that was deleted in dest. The Steps 4a-4c game-logic-porting playbook lives in `.claude/skills/convert-unity/references/phase-4b-*.md`.
 - `MODULE_STATUS.md` — 2026-04-07 status snapshot subsumed by `TODO.md` + per-PR conversion reports. Status snapshots should not be duplicated as canonical docs.
 
 (`material_mapping_research.md` was named in v1 but is out of scope: it's a research note, not in the original Phase 6 list.)

@@ -42,7 +42,7 @@ can answer "why isn't `GAME_LOGIC_PORTING.md` in dest?" without git archaeology.
   were deleted on dest in 2026-04 per the `inline-over-runtime-wrappers.md`
   policy; the ninth (`AnimatorBridge`) was merged into `animator_runtime.luau`.
   Porting the doc verbatim would re-introduce stale architectural narrative.
-  The Step 4.5 game-logic-porting playbook now lives in
+  The Steps 4a-4c game-logic-porting playbook now lives in
   `.claude/skills/convert-unity/references/phase-4b-*.md`.
 - **`MODULE_STATUS.md`** — 2026-04-07 status snapshot listing 14 modules with
   per-module gaps. Most gaps closed in Phase 4. Status snapshots should not be

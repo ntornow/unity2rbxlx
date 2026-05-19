@@ -1,12 +1,12 @@
 """
 test_u2r_architecture_gate.py -- ``u2r convert`` CLI gates / arg validation.
 
-1. Step-4.5 acknowledgement gate: ``u2r.py convert`` runs only
+1. Step 4a acknowledgement gate: ``u2r.py convert`` runs only
    ``Pipeline.PHASES``, which never includes the client/server architecture
-   split ("Step 4.5"). A ``--phase`` resume does not escape this: ``resume``
+   split ("Step 4a"). A ``--phase`` resume does not escape this: ``resume``
    re-runs every incomplete prerequisite, so ``--phase parse`` on a fresh
    output dir is a full conversion too. Every ``convert`` invocation therefore
-   skips Step 4.5, so the CLI requires ``--skip-architecture-step`` on *every*
+   skips Step 4a, so the CLI requires ``--skip-architecture-step`` on *every*
    ``convert`` run, ``--phase`` included.
 
 2. ``--scene all`` and ``--phase`` are mutually exclusive: ``--scene all``
@@ -55,7 +55,7 @@ def test_full_convert_without_ack_is_blocked(fake_unity_project, tmp_path):
         main, ["convert", str(fake_unity_project), "-o", str(tmp_path / "out")]
     )
     assert result.exit_code != 0
-    assert "Step 4.5" in result.output
+    assert "Step 4a" in result.output
     assert "/convert-unity" in result.output
 
 
@@ -69,7 +69,7 @@ def test_phase_resume_without_ack_is_blocked(fake_unity_project, tmp_path):
          "--phase", "parse"],
     )
     assert result.exit_code != 0
-    assert "Step 4.5" in result.output
+    assert "Step 4a" in result.output
 
 
 def test_ack_flag_bypasses_gate(fake_unity_project, tmp_path, monkeypatch):
@@ -80,7 +80,7 @@ def test_ack_flag_bypasses_gate(fake_unity_project, tmp_path, monkeypatch):
         ["convert", str(fake_unity_project), "-o", str(tmp_path / "out"),
          "--skip-architecture-step"],
     )
-    assert "Step 4.5" not in result.output           # gate did not fire
+    assert "Step 4a" not in result.output           # gate did not fire
     assert isinstance(result.exception, RuntimeError)  # reached the pipeline
     assert "REACHED_PIPELINE" in str(result.exception)
 
