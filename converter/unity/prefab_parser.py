@@ -98,6 +98,7 @@ def _parse_single_prefab(prefab_path: Path) -> PrefabTemplate:
             name=go.get("m_Name", "GameObject"),
             file_id=fid,
             active=bool(go.get("m_IsActive", 1)),
+            tag=go.get("m_TagString", "Untagged"),
         )
         template.all_nodes[fid] = node
 

@@ -263,7 +263,7 @@ def main(verbose: bool) -> None:
               "explicitly requested.")
 @click.option("--skip-architecture-step", is_flag=True,
               help="Acknowledge that this CLI does NOT perform the "
-              "client/server architecture step (Step 4.5); required to run "
+              "client/server architecture step (Step 4a); required to run "
               "a full conversion. For a complete, playable result use the "
               "/convert-unity skill instead.")
 def convert(
@@ -284,7 +284,7 @@ def convert(
     """Convert a Unity project to a Roblox experience.
 
     Every `convert` run needs --skip-architecture-step: this CLI does not
-    perform Step 4.5 (client/server split); the /convert-unity skill does.
+    perform Step 4a (client/server split); the /convert-unity skill does.
 
     Examples:
 
@@ -295,15 +295,15 @@ def convert(
       python u2r.py convert path/to/UnityProject -o ./output --api-key ./apikey --creator-id ./creator_id --skip-architecture-step
     """
     # u2r.py convert runs only Pipeline.PHASES, which never includes the
-    # client/server architecture split ("Step 4.5") — and a --phase resume
+    # client/server architecture split ("Step 4a") — and a --phase resume
     # re-runs every incomplete prerequisite, so `--phase parse` on a fresh
     # output dir is a full conversion too. Every `convert` invocation
-    # therefore skips Step 4.5; require an explicit acknowledgement. The
+    # therefore skips Step 4a; require an explicit acknowledgement. The
     # /convert-unity skill is the complete path. See converter/CLAUDE.md.
     if not skip_architecture_step:
         click.echo(
             "ERROR: `u2r.py convert` does NOT perform the client/server "
-            "architecture step (Step 4.5). The converted game will ship UI "
+            "architecture step (Step 4a). The converted game will ship UI "
             "scripts that crash on the server.\n"
             "  Complete, playable conversion: use the /convert-unity skill "
             "(convert_interactive.py).\n"

@@ -1501,6 +1501,20 @@ def _convert_node(
     if hasattr(node, "layer") and node.layer and node.layer != 0:
         part.attributes["UnityLayer"] = node.layer
 
+    # -- Main-camera rig marker --
+    # Unity's main-camera GameObject (and its children: weapon slots,
+    # viewmodels, HUD anchors) becomes a static Model here. Roblox's
+    # ``workspace.CurrentCamera`` is a separate live instance, so the
+    # converted Model just sits where the scene authored it. The auto-
+    # injected CameraRigFollower LocalScript pivots this Model onto the
+    # live camera each frame, so every camera-child object rides the
+    # player's view as it did under the Unity transform hierarchy.
+    # Gated on the ``MainCamera`` tag — Unity's authoritative, unique
+    # marker for the primary camera — so secondary cameras (minimap,
+    # etc.) are left alone.
+    if class_name == "Model" and node.tag == "MainCamera":
+        part.attributes["_MainCameraRig"] = True
+
     # Animator components are intentionally not surfaced — skeletal/character
     # animation is unsupported (see docs/UNSUPPORTED.md).
 
@@ -4303,6 +4317,15 @@ def _convert_prefab_node(
         size=rbx_size,
         anchored=True,
     )
+
+    # -- Main-camera rig marker --
+    # The main camera (and its weapon-slot / viewmodel children) is
+    # usually authored inside a prefab — e.g. SimpleFPS's Player.prefab.
+    # Tag the converted Model so the auto-injected CameraRigFollower can
+    # pivot it onto ``workspace.CurrentCamera`` each frame. Gated on the
+    # ``MainCamera`` tag, Unity's unique marker for the primary camera.
+    if class_name == "Model" and getattr(node, "tag", "Untagged") == "MainCamera":
+        part.attributes["_MainCameraRig"] = True
 
     if _builtin:
         shape_enum, flatten, base_meters = _builtin

@@ -14,7 +14,7 @@ Converts Unity game projects into Roblox `.rbxlx` place files. Uses Python to or
 
 unity2rbxlx exposes the same pipeline through two interfaces:
 
-1. **`u2r.py` — non-interactive CLI.** Runs pipeline phases end-to-end with no human in the loop. Use it for individual phases, `--phase` resumes, and CI. It does **not** perform the client/server architecture split ("Step 4.5"), so `u2r.py convert` requires the `--skip-architecture-step` acknowledgement and produces a game that crashes on the server — for a complete conversion use option 2.
+1. **`u2r.py` — non-interactive CLI.** Runs pipeline phases end-to-end with no human in the loop. Use it for individual phases, `--phase` resumes, and CI. It does **not** perform the client/server architecture split ("Step 4a"), so `u2r.py convert` requires the `--skip-architecture-step` acknowledgement and produces a game that crashes on the server — for a complete conversion use option 2.
 2. **`convert_interactive.py` — phase-by-phase CLI for the `/convert-unity` Claude Code skill.** Each pipeline phase becomes a Click subcommand that emits structured JSON, so a Claude Code session can pause for human review at any decision point (scene selection, material review, transpilation review, upload configuration, etc.).
 
 Both entry points share the same `Pipeline` class, the same `ConversionContext` state container, and the same `conversion_context.json` on disk — so you can start a conversion interactively, then finish it non-interactively (or vice versa).
@@ -61,7 +61,7 @@ All commands run from the `converter/` directory:
 ```bash
 cd converter
 
-# `u2r.py convert` does not perform Step 4.5 (client/server split) and
+# `u2r.py convert` does not perform Step 4a (client/server split) and
 # requires --skip-architecture-step. For a complete conversion use option 2.
 
 # Convert a Unity project (with asset upload)
@@ -133,7 +133,7 @@ The skill itself lives at `converter/.claude/skills/convert-unity/SKILL.md` and 
 
 - Asking the user about scene selection, material review choices, script review, scale strategy, etc.
 - Presenting flagged scripts for review and accepting edits
-- Step 4.5: collaborative game-logic porting (architecture map, Unity↔Roblox divergence analysis, module rewrite, bootstrap wiring)
+- Steps 4a-4c: collaborative game-logic porting (architecture map, Unity↔Roblox divergence analysis, module rewrite, bootstrap wiring)
 - Pausing on every error for human decision (retry / skip / abort)
 
 ### Post-upload asset resolution

@@ -288,8 +288,8 @@ def cli(verbose: bool) -> None:
     """Interactive Unity → Roblox conversion (one phase at a time).
 
     Used by the ``/convert-unity`` Claude Code skill, which runs the full
-    conversion including the client/server architecture step (Step 4.5).
-    ``u2r.py convert`` skips Step 4.5 — see converter/CLAUDE.md "Entry Points".
+    conversion including the client/server architecture step (Step 4a).
+    ``u2r.py convert`` skips Step 4a — see converter/CLAUDE.md "Entry Points".
     """
     from utils.logging_config import setup_logging
 

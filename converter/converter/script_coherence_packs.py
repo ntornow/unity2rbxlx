@@ -170,39 +170,43 @@ def run_packs(
 #
 # Each ``WeaponMount`` entry parameterises one Unity FPS weapon-pickup
 # pattern: the world prefab name, the equip-function the AI transpiler
-# stubs out, the sentinel flag, view-space offset, scale, and the local
-# variable names the rewrite uses. Adding a second FPS weapon (e.g. a
-# pistol on a future test project) is a one-tuple append — no code
-# change to the detector or injection logic.
+# stubs out, the sentinel flag, scale, and the local variable name the
+# rewrite uses. Adding a second FPS weapon (e.g. a pistol on a future
+# test project) is a one-tuple append — no code change to the detector
+# or injection logic.
 #
-# Values are stored as the literal Lua-source fragments they emit, so
-# refactoring this registry from the previous SimpleFPS-hardcoded pack
-# produces byte-identical output for the existing test project.
+# Camera tracking is NOT done here. Unity parents the weapon to a
+# camera-child "WeaponSlot" transform; the converter reproduces that
+# GameObject inside the ``_MainCameraRig`` Model, and the auto-injected
+# CameraRigFollower pivots that whole rig onto ``workspace.CurrentCamera``
+# each frame. The rewritten equip path just seats the cloned weapon into
+# the rig, so it rides the player's view with no per-weapon follower and
+# no hardcoded offset. ``fallback_offset_expr`` is used only when the
+# scene has no rig at all.
 
 
 @dataclass(frozen=True)
 class WeaponMount:
-    prefab_name: str        # workspace prefab name (camelCase)
-    equip_function: str     # AI-stubbed function name on the Player controller
-    sentinel_var: str       # already-equipped flag, flipped to true on equip
-    scale_expr: str         # Lua-source fragment for rifle:ScaleTo(<expr>)
-    view_offset_expr: str   # Lua-source CFrame expression for camera-relative pose
-    marker_tag: str         # composed into ``-- _FPS_<tag>`` for idempotency
-    instance_var: str       # local that holds the cloned weapon Model
-    primary_var: str        # local that holds the weapon's PrimaryPart
+    prefab_name: str           # workspace prefab name (camelCase)
+    equip_function: str        # AI-stubbed function name on the Player controller
+    sentinel_var: str          # already-equipped flag, flipped to true on equip
+    scale_expr: str            # Lua-source fragment for rifle:ScaleTo(<expr>)
+    fallback_offset_expr: str  # camera-relative CFrame, used ONLY when the
+                               # scene has no _MainCameraRig to seat into
+    marker_tag: str            # composed into ``-- _FPS_<tag>`` for idempotency
+    instance_var: str          # local that holds the cloned weapon Model
 
 
-# Today's registry: one entry, replicating the SimpleFPS hardcoded values.
+# Today's registry: one entry for the SimpleFPS rifle.
 WEAPON_MOUNTS: tuple[WeaponMount, ...] = (
     WeaponMount(
         prefab_name="riflePrefab",
         equip_function="GetRifle",
         sentinel_var="gotWeapon",
         scale_expr="0.15",
-        view_offset_expr="CFrame.new(0.5, -0.5, -3)",
+        fallback_offset_expr="CFrame.new(0.5, -0.5, -3)",
         marker_tag="RIFLE_SYSTEM",
         instance_var="_fpsRifle",
-        primary_var="_fpsRiflePrimary",
     ),
 )
 
@@ -440,8 +444,7 @@ def _apply_weapon_mount(s: "RbxScript", mount: WeaponMount) -> bool:
     s.source = s.source.replace(
         f"local {mount.sentinel_var} = false",
         f"local {mount.sentinel_var} = false\n"
-        f"local {mount.instance_var} = nil  {marker}\n"
-        f"local {mount.primary_var} = nil",
+        f"local {mount.instance_var} = nil  {marker}",
     )
 
     # Match three emitted shapes from the AI transpiler:
@@ -462,10 +465,15 @@ def _apply_weapon_mount(s: "RbxScript", mount: WeaponMount) -> bool:
         # Preserve the matched header verbatim. The injection target may
         # have been `GetRifle = function()` (table-field form) or
         # `function getRifle()` (function-statement form, Luau idiom).
-        # Re-emitting the same header keeps the existing test fixtures
-        # byte-identical while letting real transpiler output (which
-        # uses the lowercase function-statement form) be rewritten too.
         matched_header = m.group(1)
+        # The equipped weapon is seated into the converted Unity camera
+        # rig — the ``_MainCameraRig`` Model that the auto-injected
+        # CameraRigFollower pivots onto the live camera each frame.
+        # ``Model:PivotTo`` propagates to descendants, so a weapon
+        # parented anywhere under the rig rides the player's view with
+        # no per-weapon follower and no hardcoded offset. Seating order
+        # of preference: the Unity "WeaponSlot" object inside the rig →
+        # the rig Model itself → (no rig) a one-shot camera placement.
         new_body = (
             f'{matched_header}\n'
             f'    if {mount.sentinel_var} then return end\n'
@@ -481,29 +489,26 @@ def _apply_weapon_mount(s: "RbxScript", mount: WeaponMount) -> bool:
             f'            p.Transparency = 0\n'
             f'            p.CanCollide = false\n'
             f'            p.Anchored = true\n'
-            f'            if p ~= prim then\n'
-            f'                local w = Instance.new("WeldConstraint")\n'
-            f'                w.Part0 = p; w.Part1 = prim; w.Parent = p\n'
-            f'            end\n'
             f'        end\n'
             f'    end\n'
-            f'    rifle:PivotTo(workspace.CurrentCamera.CFrame * {mount.view_offset_expr})\n'
-            f'    rifle.Parent = workspace\n'
+            f'    local rig\n'
+            f'    for _, m in workspace:GetDescendants() do\n'
+            f'        if m:IsA("Model") and m:GetAttribute("_MainCameraRig") then rig = m break end\n'
+            f'    end\n'
+            f'    local slot = rig and rig:FindFirstChild("WeaponSlot", true)\n'
+            f'    if slot then\n'
+            f'        rifle:PivotTo(slot:IsA("Model") and slot:GetPivot() or slot.CFrame)\n'
+            f'        rifle.Parent = slot\n'
+            f'    elseif rig then\n'
+            f'        rifle:PivotTo(rig:GetPivot() * {mount.fallback_offset_expr})\n'
+            f'        rifle.Parent = rig\n'
+            f'    else\n'
+            f'        rifle:PivotTo(workspace.CurrentCamera.CFrame * {mount.fallback_offset_expr})\n'
+            f'        rifle.Parent = workspace\n'
+            f'    end\n'
             f'    {mount.instance_var} = rifle\n'
-            f'    {mount.primary_var} = prim\n'
         )
         s.source = s.source[: m.start()] + new_body + s.source[m.start(3):]
-
-    if "RunService.RenderStepped:Connect" in s.source:
-        s.source = s.source.replace(
-            "RunService.RenderStepped:Connect(function(dt)",
-            "RunService.RenderStepped:Connect(function(dt)\n"
-            f"    if {mount.instance_var} and {mount.primary_var} "
-            f"and {mount.primary_var}.Parent then\n"
-            f"        {mount.instance_var}:PivotTo("
-            f"workspace.CurrentCamera.CFrame * {mount.view_offset_expr})\n"
-            f"    end",
-        )
 
     return s.source != before
 
@@ -539,9 +544,11 @@ def _inject_fps_weapon_mounts(scripts: list["RbxScript"]) -> int:
 
     Steps per mount:
     1. Find the prefab in workspace (camelCase or PascalCase variant)
-    2. Clone, scale, make visible, weld sub-parts to the PrimaryPart
-    3. Parent to workspace (not the character) with anchored parts
-    4. Splice a RenderStepped follower so pose tracks the camera
+    2. Clone, scale, make visible (anchored parts)
+    3. Seat the clone into the converted Unity camera rig — the
+       ``_MainCameraRig`` Model the auto-injected CameraRigFollower
+       pivots onto the live camera, so the weapon rides the view with
+       no per-weapon follower and no hardcoded offset
     """
     fixes = 0
     for s in scripts:
@@ -1619,8 +1626,14 @@ def _fix_door_global_player_lookup(scripts: list["RbxScript"]) -> int:
 # Rewrite ``local function playerHasX(playerInstance)`` to read directly
 # from the Player-instance attribute that the pickup pack writes.
 
+# Match the ``playerHasX`` helper definition. ``\w*`` (not ``\w+``)
+# tolerates the zero-parameter shape — the AI transpiler emits both
+# ``playerHasKey(playerInstance)`` and, more recently, the bare
+# ``playerHasKey()`` form. The earlier ``\w+`` only matched the former,
+# so the pack silently no-oped on the bare shape and the door bug
+# survived (door never opens).
 _DOOR_MODULE_PLAYER_HELPER_RE = re.compile(
-    r"local function (player[Hh]as\w+)\s*\(\s*(\w+)\s*\)"
+    r"local function (?P<fn>player[Hh]as\w+)\s*\(\s*\w*\s*\)"
     r"(?P<body>.*?)"
     r"^end$",
     re.DOTALL | re.MULTILINE,
@@ -1656,33 +1669,69 @@ def _fix_door_module_player_lookup(scripts: list["RbxScript"]) -> int:
     for s in scripts:
         if s.name != "Door":
             continue
-        original = s.source
+        original = s.source or ""
+        src = original
+
+        # Step 1 — rewrite the helper body. The helper becomes a
+        # ``playerHasX(_part)`` that walks up from the touched part to
+        # the attribute the Pickup pack writes (on both the character
+        # Model and the Player instance, server-side — both replicate).
+        # Normalising every shape to a single ``_part`` parameter lets a
+        # zero-parameter caller pass the touch part directly (Step 2).
+        rewritten: dict[str, str] = {}  # fn name -> attr name
 
         def _replace(m: "re.Match[str]") -> str:
-            fn_name = m.group(1)
-            arg_name = m.group(2)
+            fn_name = m.group("fn")
             body = m.group("body")
             # Skip helpers that don't reference the module/PlayerScripts
             # path — they're already correct.
             if "getPlayerMod" not in body and "PlayerScripts" not in body:
                 return m.group(0)
             # Derive attribute name from the function name:
-            # ``playerHasKey`` → ``hasKey``. Falls back to ``hasKey`` if
-            # the pattern doesn't yield a clean suffix.
-            suffix = fn_name[len("playerHas"):]
+            # ``playerHasKey`` → ``hasKey``. ``len("playerHas")`` == 9
+            # covers both the ``playerHas`` and ``playerhas`` spellings.
+            suffix = fn_name[9:]
             attr = ("has" + suffix) if suffix else "hasKey"
+            rewritten[fn_name] = attr
             return (
-                f"local function {fn_name}({arg_name})\n"
-                f"    -- Pickup pack writes ``Player:SetAttribute({attr!r}, true)``\n"
-                f"    -- server-side on the Player instance — replicates to all\n"
-                f"    -- scripts. Door runs server-side, so this is the only\n"
-                f"    -- check that reflects state set by the client's pickup.\n"
-                f"    return {arg_name} ~= nil and {arg_name}:GetAttribute({attr!r}) == true\n"
+                f"local function {fn_name}(_part)\n"
+                f"    -- Pickup (a server Script) writes ``{attr}`` server-side\n"
+                f"    -- on the touching player's character Model AND Player\n"
+                f"    -- instance — both replicate. Door runs server-side; walk\n"
+                f"    -- up from the touched part to find that authoritative flag.\n"
+                f"    local _n = _part\n"
+                f"    while _n do\n"
+                f"        if _n:GetAttribute({attr!r}) == true then return true end\n"
+                f"        _n = _n.Parent\n"
+                f"    end\n"
+                f"    return false\n"
                 f"end"
             )
 
-        s.source = _DOOR_MODULE_PLAYER_HELPER_RE.sub(_replace, s.source)
-        if s.source != original:
+        src = _DOOR_MODULE_PLAYER_HELPER_RE.sub(_replace, src)
+
+        # Step 2 — empty-paren call sites (``playerHasKey()``) have no
+        # part to read from. Thread the enclosing handler's first
+        # parameter (the touched part) into each. Calls that already
+        # pass an argument are left alone — the walk-up body handles a
+        # part, character, or Player instance equally.
+        for fn_name in rewritten:
+            empty_call = re.compile(r"\b" + re.escape(fn_name) + r"\s*\(\s*\)")
+
+            def _thread_arg(cm: "re.Match[str]", _fn: str = fn_name) -> str:
+                preceding = src[: cm.start()]
+                enclosing = None
+                for fm in re.finditer(
+                    r"function\s*[\w.:]*\s*\(\s*([A-Za-z_]\w*)", preceding
+                ):
+                    enclosing = fm
+                arg = enclosing.group(1) if enclosing else "_part"
+                return f"{_fn}({arg})"
+
+            src = empty_call.sub(_thread_arg, src)
+
+        if src != original:
+            s.source = src
             fixes += 1
             log.info(
                 "  Rewrote Door module-Player gameplay-flag lookups in '%s'", s.name,
@@ -3610,6 +3659,31 @@ def _build_local_literal_table(source: str) -> dict[str, str]:
     return out
 
 
+def _is_boolean_state_var(source: str, var: str) -> bool:
+    """True iff every assignment to ``var`` (its ``local`` initializer and
+    every reassignment) has a boolean-literal RHS (``true`` / ``false``).
+
+    The shim's backing-var accessor is hardcoded to boolean semantics
+    (``c:GetAttribute(name) == true``) and the mirror writes the RHS into
+    a Roblox attribute — which can only hold value types, never
+    Instances. So a bare-identifier accessor (e.g. ``return character``)
+    may be lifted into the attribute-backed shim ONLY when the backing
+    var is genuinely boolean state. ``return character`` resolves to a
+    character Model — mirroring it emits ``SetAttribute(name, <Instance>)``,
+    which throws ``Instance is not a supported attribute type`` at runtime.
+    """
+    assign_re = re.compile(
+        r'^[ \t]*(?:local\s+)?' + re.escape(var) + r'\s*=\s*(?P<rhs>[^\n;]+?)\s*$',
+        re.MULTILINE,
+    )
+    saw_assignment = False
+    for m in assign_re.finditer(source):
+        saw_assignment = True
+        if m.group("rhs").strip() not in ("true", "false"):
+            return False
+    return saw_assignment
+
+
 def _classify_api(target_src: str, exporter_var: str) -> list[_ApiMethod]:
     """Parse the exporter's `function <Var>.<m>() return <expr> end`
     definitions. Returns one entry per parameterless single-line accessor
@@ -3639,8 +3713,15 @@ def _classify_api(target_src: str, exporter_var: str) -> list[_ApiMethod]:
             referenced = literal_locals.get(expr)
             if referenced is not None:
                 out.append(_ApiMethod(method, expr, None, referenced))
-            else:
+            elif _is_boolean_state_var(target_src, expr):
                 out.append(_ApiMethod(method, expr, expr, None))
+            else:
+                # Bare identifier holding non-boolean runtime state
+                # (e.g. `return character` -> a character Model). A
+                # Roblox attribute cannot carry it, so it is NOT a
+                # shimmable backing var; fall through to unknown-shape
+                # handling (the shim emits `return nil` with a warning).
+                out.append(_ApiMethod(method, expr, None, None))
         else:
             # Unknown shape; emit nothing for now. Future work could
             # support `return Var.field` or simple table reads.
@@ -4094,10 +4175,18 @@ _PROXIMITY_TRIGGER_MARKER = "_AutoProximityTriggerFanout"
 #       <var>.Touched:Connect(function(<arg>)
 #           ...body...
 #       end)
+#       ...rest (e.g. a sibling <var>.TouchEnded:Connect block)...
 #   end
 #
-# The body content is captured non-greedily up to the closing ``end)``
-# of the Connect call, followed by the closing ``end`` of the ``if``.
+# ``body`` is captured non-greedily and stops at the ``.Touched``
+# connect's OWN ``end)``. ``rest`` then captures everything else inside
+# the ``if`` block — crucially any sibling handler like
+# ``<var>.TouchEnded:Connect(...)`` — up to the ``if``'s closing ``end``
+# (at the same indent as the ``local`` line). Earlier the regex required
+# the ``if``-``end`` immediately after the ``.Touched`` ``end)``; when a
+# door also bound ``.TouchEnded`` the non-greedy ``body`` over-captured,
+# swallowing the first ``end)`` and producing a stray ``)`` in the
+# rewritten ``local function`` — invalid Luau.
 _PROXIMITY_TRIGGER_RE = re.compile(
     r'(?P<lead>^[ \t]*)local\s+(?P<var>[a-zA-Z_]\w*)\s*=\s*findTriggerPart\s*\(\s*'
     r'(?P<container>[a-zA-Z_]\w*)\s*\)\s*\n'
@@ -4106,7 +4195,8 @@ _PROXIMITY_TRIGGER_RE = re.compile(
     r'function\s*\(\s*(?P<arg>[a-zA-Z_]\w*)\s*\)\s*\n'
     r'(?P<body>(?:.*?\n)*?)'
     r'(?P=connect_indent)end\s*\)\s*\n'
-    r'[ \t]*end\b',
+    r'(?P<rest>(?:.*?\n)*?)'
+    r'(?P=lead)end\b',
     re.MULTILINE,
 )
 
@@ -4167,33 +4257,40 @@ def _inject_proximity_trigger_fanout(scripts: list["RbxScript"]) -> int:
         arg = m.group("arg")
         var = m.group("var")
         body = m.group("body")
+        rest = m.group("rest")
         rewritten_body = _rewrite_proximity_body(body, arg)
         # Preserve the ``local <var> = findTriggerPart(container)`` line
         # at the top of the new block. The captured body often still
         # references the trigger-part local (e.g. ``triggerPart:Find
         # FirstChildWhichIsA("Sound")``); dropping the definition would
         # produce ``nil:Find...`` calls inside _onProximityTouched.
-        # Keep the variable around for body-level reads even though the
-        # fanout below no longer uses it to bind Touched.
+        #
+        # ``rest`` carries any sibling handlers found inside the same
+        # ``if <var> then`` block (notably a ``<var>.TouchEnded:Connect``
+        # binding on doors). It is re-emitted verbatim inside the
+        # rebuilt ``if <var> then`` so those handlers — and the ``if``
+        # guard they depend on — survive the rewrite.
         replacement = (
             f"{lead}local {var} = findTriggerPart({container})\n"
             f"{lead}-- {_PROXIMITY_TRIGGER_MARKER}: connect Touched on every body\n"
             f"{lead}-- part so step-on triggers (mines/pickups/pressure-plates) fire,\n"
             f"{lead}-- and resolve the touching character via ancestor lookup so\n"
-            f"{lead}-- accessory-mounted touches also count. The {var} local is\n"
-            f"{lead}-- preserved so body-level references (e.g. nearby Sound\n"
-            f"{lead}-- lookups under the trigger part) still resolve.\n"
+            f"{lead}-- accessory-mounted touches also count. The {var} local and\n"
+            f"{lead}-- any sibling handlers (e.g. TouchEnded) are preserved.\n"
             f"{lead}local function _onProximityTouched({arg})\n"
             f"{rewritten_body}"
             f"{lead}end\n"
-            f"{lead}if {container}:IsA(\"BasePart\") then\n"
-            f"{lead}\t{container}.Touched:Connect(_onProximityTouched)\n"
-            f"{lead}elseif {container}:IsA(\"Model\") then\n"
-            f"{lead}\tfor _, _d in ipairs({container}:GetDescendants()) do\n"
-            f"{lead}\t\tif _d:IsA(\"BasePart\") then\n"
-            f"{lead}\t\t\t_d.Touched:Connect(_onProximityTouched)\n"
+            f"{lead}if {var} then\n"
+            f"{lead}\tif {container}:IsA(\"BasePart\") then\n"
+            f"{lead}\t\t{container}.Touched:Connect(_onProximityTouched)\n"
+            f"{lead}\telseif {container}:IsA(\"Model\") then\n"
+            f"{lead}\t\tfor _, _d in ipairs({container}:GetDescendants()) do\n"
+            f"{lead}\t\t\tif _d:IsA(\"BasePart\") then\n"
+            f"{lead}\t\t\t\t_d.Touched:Connect(_onProximityTouched)\n"
+            f"{lead}\t\t\tend\n"
             f"{lead}\t\tend\n"
             f"{lead}\tend\n"
+            f"{rest}"
             f"{lead}end"
         )
         s.source = src[: m.start()] + replacement + src[m.end():]
@@ -4353,5 +4450,116 @@ def _inject_template_clone_visibility(scripts: list["RbxScript"]) -> int:
             log.info(
                 "  Inserted template-clone visibility fixup(s) in '%s'",
                 s.name,
+            )
+    return fixes
+
+
+# ---------------------------------------------------------------------------
+# Pack: fps_camera_pitch_inversion
+# ---------------------------------------------------------------------------
+#
+# Unity's ``Input.GetAxis("Mouse Y")`` is positive-UP; Roblox's
+# ``UserInputService:GetMouseDelta().Y`` is positive-DOWN. A correct FPS
+# pitch combines two sign decisions with OPPOSITE polarity:
+#   - the mouse-delta accumulation: ``pitch = pitch +/- d.Y * k``
+#   - the camera application:        ``CFrame.Angles(+/- pitch, ...)``
+# Correct vertical look needs these two signs to disagree (e.g. the
+# canonical ``pitch = pitch - d.Y`` paired with ``CFrame.Angles(pitch)``,
+# which the transpiler prompt teaches).
+#
+# The AI transpiler sometimes emits AGREEING signs — observed shape:
+# ``pitch = pitch - d.Y`` together with ``CFrame.Angles(math.rad(-pitch))``
+# — which inverts vertical look (pushing the mouse forward tilts the view
+# down). Yaw is unaffected because it has no second negation.
+#
+# Fix: when the two signs agree, flip the MOUSE-delta line's sign. The
+# camera ``-pitch`` form is left intact on purpose — recoil kicks
+# (``pitch = pitch - 2``) and asymmetric pitch clamps are authored
+# against that convention, so flipping the camera term would break them.
+
+# Matches the mouse-delta pitch accumulation: ``<pv> = <pv> +/- <x>.Y``.
+# An optional ``math.clamp(`` wrapper is tolerated so the inline-clamp
+# shape (``pv = math.clamp(pv - d.Y * k, lo, hi)``) is handled too. The
+# match deliberately stops at ``.Y`` so any trailing ``* SENSITIVITY``
+# survives untouched.
+_PITCH_ACCUM_RE = re.compile(
+    r'^(?P<lead>[ \t]*)(?P<pv>[A-Za-z_]\w*)\s*=\s*'
+    r'(?P<wrap>math\.clamp\(\s*)?'
+    r'(?P=pv)\s*(?P<sign>[+-])\s*(?P<delta>[A-Za-z_]\w*\s*\.\s*Y)\b',
+    re.MULTILINE,
+)
+
+
+def _camera_pitch_sign_is_negated(src: str, pv: str) -> bool | None:
+    """Return True if the camera applies ``-<pv>`` inside a
+    ``CFrame.Angles`` call, False if it applies ``+<pv>``, None if no
+    such application is found.
+    """
+    m = re.search(
+        r'CFrame\.Angles\s*\(\s*(?:math\.rad\s*\(\s*)?(?P<cs>-?)\s*'
+        + re.escape(pv) + r'\b',
+        src,
+    )
+    if m is None:
+        return None
+    return m.group('cs') == '-'
+
+
+def _pitch_vars_to_flip(src: str) -> set[str]:
+    """Pitch vars whose mouse-delta sign AGREES with the camera
+    application sign — the inverted combination."""
+    out: set[str] = set()
+    for m in _PITCH_ACCUM_RE.finditer(src):
+        pv = m.group('pv')
+        negated = _camera_pitch_sign_is_negated(src, pv)
+        if negated is None:
+            continue
+        mouse_is_negative = m.group('sign') == '-'
+        if mouse_is_negative == negated:
+            out.add(pv)
+    return out
+
+
+def _detect_fps_camera_pitch_inversion(scripts: list["RbxScript"]) -> bool:
+    for s in scripts:
+        if _pitch_vars_to_flip(s.source or ""):
+            return True
+    return False
+
+
+@patch_pack(
+    name="fps_camera_pitch_inversion",
+    description="Flip the mouse-delta pitch accumulation sign when an "
+    "FPS controller pairs it with a same-sign camera CFrame.Angles "
+    "application. Roblox GetMouseDelta().Y is positive-down (vs Unity's "
+    "positive-up Mouse Y axis); a same-sign pairing inverts vertical "
+    "look so pushing the mouse forward tilts the view down.",
+    detect=_detect_fps_camera_pitch_inversion,
+)
+def _fix_fps_camera_pitch_inversion(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        src = s.source or ""
+        to_flip = _pitch_vars_to_flip(src)
+        if not to_flip:
+            continue
+
+        def _flip(m: "re.Match[str]") -> str:
+            pv = m.group('pv')
+            if pv not in to_flip:
+                return m.group(0)
+            new_sign = '+' if m.group('sign') == '-' else '-'
+            return (
+                f"{m.group('lead')}{pv} = "
+                f"{m.group('wrap') or ''}{pv} {new_sign} {m.group('delta')}"
+            )
+
+        new_src = _PITCH_ACCUM_RE.sub(_flip, src)
+        if new_src != src:
+            s.source = new_src
+            fixes += 1
+            log.info(
+                "  Fixed inverted FPS camera pitch in '%s' (vars: %s)",
+                s.name, sorted(to_flip),
             )
     return fixes

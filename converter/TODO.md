@@ -103,7 +103,106 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
 - [ ] **P2 — Full SurfaceAppearance round-trip through templates.** PR 5
   deferred. The smoke ran with `--no-upload` so real asset IDs never wired
   through `ReplicatedStorage.Templates`. Verify on a full upload run.
+
+- [ ] **P1 — `read_fbx` rejects FBX version >= 7500 (64-bit offsets).**
+  `fbx_binary.py:read_fbx` raises `NotImplementedError` for FBX 7500+
+  (FBX 2016 and newer — extremely common for modern Unity assets). Effect:
+  `mirror_fbx_handedness` catches the error and returns `False`, so the
+  pipeline (`pipeline.py:1122-1123`) uploads the **raw original** — no
+  handedness mirror, no bounding-box computation, no sub-mesh resolution.
+  Modern FBX silently degrade. Found in the trash-dash conversion run
+  (2026-05-18): `Cat.fbx` / `CatBase.fbx` / `Racoon.fbx` are all 7500;
+  raw upload of these heavily-rigged multi-skin character FBX is rejected
+  by Roblox Open Cloud with "Failed to parse the uploaded file".
+  Fix: extend `_read_node` / `_write_node` to handle 7500's 64-bit
+  EndOffset / NumProperties / PropertyListLen header fields. Note: even
+  with 7500 read support, complex skinned-character FBX still cannot go
+  through the Open Cloud mesh endpoint (see next item) — this fix recovers
+  handedness + bbox for *static* 7500 meshes.
+
+- [ ] **P2 — Skinned/animation-only FBX uploaded as meshes and rejected.**
+  Two sub-cases found in the trash-dash run (2026-05-18):
+  (a) Animation-only FBX (e.g. `Cat_Jump.fbx`, FBX 7400) contain a single
+  `Geometry` node with **zero vertices**. The asset extractor classifies
+  any `.fbx` as `kind="mesh"`; `mirror_fbx_handedness` finds the empty
+  Geometry node and returns `True` without checking vertex count, so the
+  empty file uploads and Roblox rejects it ("Cannot import file with no
+  mesh content"). 24 such files failed this way.
+  (b) Rigged character FBX (Skin/Cluster/Deformer nodes) cannot be ingested
+  by the Open Cloud mesh endpoint at all — consistent with the existing
+  `docs/UNSUPPORTED.md` skeletal-mesh limitation.
+  Fix: detect zero-vertex `Geometry` and skinned FBX pre-upload; skip them
+  and surface to `UNCONVERTED.md` instead of issuing a doomed upload.
 ## Infrastructure
+
+- [ ] **P1 — Converter doesn't wire ScreenGui enable/disable into the state
+  machine.** Trash-dash Mode-2 (2026-05-19): all 4 converted ScreenGuis
+  (`Loadout`, `Game`, `GameOver`, `Leaderboard`) ship with `Enabled=true`,
+  so they render stacked at once — an opaque white wall over the menu.
+  In Unity the `GameManager` state machine shows/hides canvases per state
+  (Loadout / Game / GameOver). The converter neither (a) sets non-initial
+  canvases `Enabled=false` at build time, nor (b) emits state-machine code
+  that toggles `ScreenGui.Enabled` on state transitions. Explore: where
+  Unity `Canvas`/`GameObject.SetActive` and per-state canvas wiring should
+  map to `ScreenGui.Enabled`, and why it is dropped. Note: `RbxScreenGui`
+  (`core/roblox_types.py`) currently has no `enabled` field, and neither writer
+  (`rbxlx_writer.py`, `luau_place_builder.py`) serializes `Enabled` — so the fix
+  needs `Enabled` plumbed through the type + both writers, plus the
+  state->visibility wiring. (This is its own gap — not the `classify_storage`
+  P1, which only mutates scripts.)
+
+- [ ] **P1 — Phase 4a.5 agent-override ingestion is unimplemented.**
+  `storage_classifier.py` ("Phase 4a.5") is correctly meant to run during Step 4a
+  — that is not the bug. The `/convert-unity` skill
+  (`references/phase-4a-storage-classification.md`) designs 4a.5 as: the classifier
+  emits a *proposed* `storage_plan` -> the agent reviews it -> the agent overrides
+  by editing `storage_plan` in `conversion_plan.json` -> 4b/downstream use the
+  overridden plan. `StoragePlan.overrides_applied` (`storage_classifier.py:113`) is
+  the field reserved for this. But the override half is never built:
+  - `classify_storage()` (`storage_classifier.py:119`) has no `existing_plan` /
+    `overrides` parameter — it builds a fresh `StoragePlan()` from scratch every call.
+  - `overrides_applied` is a declared field with a hopeful comment; nothing
+    populates it.
+  - `_classify_storage()` (`pipeline.py:3336`) calls the classifier with only
+    `scripts` + `dependency_map`, then unconditionally rewrites `conversion_plan.json`
+    (`pipeline.py:3356`) — and re-runs on every `write_output`. (Rehydration at
+    `pipeline.py:3242` does briefly read the prior `conversion_plan.json` to seed
+    `script_type`/`parent_path`, but `_classify_storage()` recomputes and overwrites
+    it later in the same `write_output()` pass.)
+  So an agent-edited `storage_plan` is silently discarded by the next `assemble`.
+  Confirmed in the trash-dash Mode-2 run (2026-05-19): Step 4a authored
+  1 server / 49 shared / 1 server-module / 8 overrides; after `assemble`,
+  `overrides_applied` was 0. Fix: do NOT make the whole prior plan sticky — that
+  would freeze stale auto-classifications and block future classifier improvements.
+  Instead persist *explicit manual overrides* separately (a `name -> container`
+  map), keep running fresh classification every time, then overlay only those
+  explicit overrides and populate `overrides_applied`. This is the real
+  plan->pipeline wiring gap — broader than the `--skip-architecture-step` gate
+  from PR #109.
+
+- [ ] **P1 — Storage classifier's ModuleScript path is fragile and under-tested.**
+  Container assignment splits into two unequal paths. `Script` / `LocalScript`
+  route by simple type rules (`Script` -> `ServerScriptService`, `LocalScript` ->
+  `StarterPlayerScripts`; `storage_classifier.py:338`) — robust, hard to get wrong.
+  `ModuleScript` routes by a caller-graph heuristic (`storage_classifier.py:309`)
+  that (a) **ignores the module's own client/server API surface** and infers only
+  from callers; (b) is fed a **regex-scanned** call graph (`storage_classifier.py:232`)
+  that the synthesized `or game:GetService("ServerStorage"):FindFirstChild(...)`
+  require-fallback (`script_coherence.py:69,183`) poisons into treating callers as
+  server-side; and (c) is then **not corrected** — both
+  `_fix_client_server_classification` (`script_coherence.py:423`) and
+  `_propagate_client_classification` (`script_coherence.py:392`) skip modules.
+  Every storage bug hit in the trash-dash run lives on this path. It is
+  **under-tested**: the primary test project SimpleFPS is 76% `Script` (and the
+  3+-client-API promotion guard at `script_coherence.py:136,237,281` keeps its big
+  client scripts as `LocalScript`s), so it routes *around* the buggy path;
+  `tests/test_storage_classifier.py` covers only toy module cases. trash-dash
+  (88% `ModuleScript`) is the first real module-heavy game to exercise it — and it
+  fell over. Fix direction: have the module router also inspect the module's own
+  client/server API surface (not callers only); extend the correction passes to
+  cover modules; harden the call graph against synthesized require-fallback
+  strings; add a module-heavy test project / fixtures. (Claude + Codex cross-model
+  analysis, 2026-05-19.)
 
 - [ ] **P2 — Retire genre-specific scaffolding; make the converter fully
   genre-agnostic.** `--scaffolding=fps` (`u2r.py convert`) injects FPS-genre

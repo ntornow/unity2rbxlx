@@ -245,7 +245,24 @@ class TestFpsWeaponMountInjection:
         assert fixes == 1
         assert '_fpsRifle' in s.source
         assert 'rp:Clone' in s.source
-        assert 'PivotTo(workspace.CurrentCamera.CFrame' in s.source
+
+    def test_injection_seats_rifle_into_camera_rig(self) -> None:
+        """The equipped weapon must be seated into the converted Unity
+        camera rig (the ``_MainCameraRig`` Model that the auto-injected
+        CameraRigFollower pivots onto the live camera), not pinned to a
+        hardcoded camera offset with a bespoke per-weapon follower.
+        """
+        s = self._stub_player_script()
+        packs_module._inject_fps_weapon_mounts([s])
+        # Equip path locates the rig and seats the rifle into its slot.
+        assert 'GetAttribute("_MainCameraRig")' in s.source
+        assert 'rig:FindFirstChild("WeaponSlot", true)' in s.source
+        assert 'rifle.Parent = slot' in s.source
+        # No per-weapon RenderStepped follower — the rig follower owns
+        # camera tracking now. The old follower keyed on a primary-part
+        # var; its absence proves the bespoke follower is gone.
+        assert '_fpsRiflePrimary' not in s.source
+        assert 'if _fpsRifle and' not in s.source
 
     def test_injection_marker_prevents_double_apply(self) -> None:
         s = self._stub_player_script()
@@ -287,7 +304,7 @@ class TestFpsWeaponMountInjection:
             source=(
                 "local riflePrefab = nil\n"
                 "local gotWeapon = false\n"
-                "local _fpsRifle, _fpsRiflePrimary\n"  # mimic transpiler decls
+                "local _fpsRifle\n"  # mimic transpiler decl
                 "function getRifle()\n"
                 "    -- AI stub does not actually clone the rifle\n"
                 "    gotWeapon = true\n"
@@ -302,7 +319,7 @@ class TestFpsWeaponMountInjection:
         assert fixes == 1, "WeaponMount pack must fire on camelCase function-statement shape"
         assert '_fpsRifle = rifle' in s.source, "rifle instance var must be assigned"
         assert 'rp:Clone' in s.source
-        assert 'PivotTo(workspace.CurrentCamera.CFrame' in s.source
+        assert 'rifle.Parent = slot' in s.source
 
 
 class TestPickupRemoteEventServerAttr:
@@ -3085,6 +3102,55 @@ class TestLocalScriptApiShim:
         assert fixes == 0
         assert len(scripts) == original_count
 
+    def test_instance_returning_accessor_not_mirrored(self) -> None:
+        """Regression: a bare-identifier accessor whose backing var holds
+        a non-boolean runtime value — ``function Player.getInstance()
+        return character end`` — must NOT be treated as boolean state.
+        The shim mirror used to emit ``character:SetAttribute(
+        "getInstance", char)``, and a Roblox attribute cannot hold an
+        Instance, so it threw ``Instance is not a supported attribute
+        type`` at runtime. The genuine boolean accessor (``hasKey``)
+        must still be mirrored.
+        """
+        exporter = RbxScript(
+            name="Player",
+            source=(
+                "local Player = {}\n"
+                "local gotKey = false\n"
+                "local character\n"
+                "function Player.hasKey() return gotKey end\n"
+                "function Player.getInstance() return character end\n"
+                "local function onCharacter(char)\n"
+                "    character = char\n"
+                "    gotKey = true\n"
+                "end\n"
+            ),
+            script_type="LocalScript",
+        )
+        scripts = [exporter, self._consumer_shape_a()]
+        packs_module._inject_localscript_api_shim(scripts)
+
+        # The Instance-typed accessor must not produce an attribute mirror.
+        assert 'SetAttribute("getInstance"' not in exporter.source
+        # The genuine boolean accessor still mirrors.
+        assert 'SetAttribute("hasKey"' in exporter.source
+        # The shim module must not pretend getInstance is boolean state;
+        # it falls through to the unknown-shape `return nil` handling.
+        shim = next((s for s in scripts if s.name == "PlayerShared"), None)
+        assert shim is not None
+        assert 'function PlayerShared.getInstance() return nil end' in shim.source
+        assert 'GetAttribute("getInstance")' not in shim.source
+
+    def test_is_boolean_state_var_classification(self) -> None:
+        src = (
+            "local gotKey = false\n"
+            "local character\n"
+            "gotKey = true\n"
+            "character = workspace\n"
+        )
+        assert packs_module._is_boolean_state_var(src, "gotKey") is True
+        assert packs_module._is_boolean_state_var(src, "character") is False
+
 
 class TestTemplateCloneVisibility:
     """The ``template_clone_visibility`` pack adds a visibility + weld
@@ -3329,6 +3395,75 @@ class TestProximityTriggerFanout:
         assert fixes == 0
         assert s.source == original
 
+    def test_door_with_touchended_sibling_handler(self) -> None:
+        """Regression: a Door binds both ``.Touched`` and ``.TouchEnded``
+        inside one ``if triggerPart then`` block. The body regex used to
+        over-capture — unable to stop at the Touched handler's own
+        ``end)`` (the ``if``-``end`` didn't follow it), it swallowed the
+        first ``end)`` and the TouchEnded binding, leaving a stray ``)``
+        in the rewritten ``local function`` and breaking every door
+        (`Door:99: Expected identifier ... got ')'`).
+
+        The fix must: produce a ``_onProximityTouched`` that closes with
+        a bare ``end``, preserve the ``.TouchEnded`` handler verbatim,
+        and keep the result valid Luau.
+        """
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                "local container = script.Parent\n"
+                "local function findTriggerPart(p) return p end\n"
+                "local function isPlayerPart(o) return true end\n"
+                "local function playerHasKey() return true end\n"
+                "local function toggleDoor(open) end\n"
+                "\n"
+                "local triggerPart = findTriggerPart(container)\n"
+                "if triggerPart then\n"
+                "    triggerPart.Touched:Connect(function(other)\n"
+                "        if isPlayerPart(other) then\n"
+                "            if playerHasKey() then toggleDoor(true) end\n"
+                "        end\n"
+                "    end)\n"
+                "    triggerPart.TouchEnded:Connect(function(other)\n"
+                "        if isPlayerPart(other) then\n"
+                "            if playerHasKey() then toggleDoor(false) end\n"
+                "        end\n"
+                "    end)\n"
+                "end\n"
+            ),
+            script_type="Script",
+        )
+        fixes = packs_module._inject_proximity_trigger_fanout([s])
+        assert fixes == 1
+        # The named handler closes with a bare `end` — no stray `)`.
+        assert "local function _onProximityTouched(other)" in s.source
+        # The _onProximityTouched body (between its declaration and the
+        # rebuilt `if triggerPart then`) must not carry a stray `end)`.
+        handler_body = s.source.split("_onProximityTouched(other)", 1)[1].split(
+            "if triggerPart then", 1
+        )[0]
+        assert "end)" not in handler_body, (
+            "_onProximityTouched body must not carry a stray end)"
+        )
+        # The sibling TouchEnded handler is preserved verbatim.
+        assert "triggerPart.TouchEnded:Connect(function(other)" in s.source
+        assert "toggleDoor(false)" in s.source
+        # The fanout is emitted.
+        assert 'container:IsA("BasePart")' in s.source
+        # Sanity: balanced block keywords. Each `if`/`for`/`while`/
+        # `function` opens one `end`; `elseif` reuses its `if`'s `end`,
+        # so it is subtracted from the `then` tally.
+        import re as _re
+        opens = (
+            len(_re.findall(r'\bthen\b', s.source))
+            - len(_re.findall(r'\belseif\b', s.source))
+            + len(_re.findall(r'\bdo\b', s.source))
+            + len(_re.findall(r'\bfunction\b', s.source))
+        )
+        closes = len(_re.findall(r'\bend\b', s.source))
+        assert opens == closes, f"unbalanced blocks: {opens} opens vs {closes} ends"
+
     # TODO: re-add a test for the BasePart-fallback intermediate-statement
     # shape once the regex can be widened without triggering catastrophic
     # backtracking on the post-pack source. The earlier widening used a
@@ -3337,3 +3472,149 @@ class TestProximityTriggerFanout:
     # the larger post-injection scripts. The narrower v4 regex still
     # handles Mine in fresh transpiles where the AI emits the bind
     # directly after the resolution.
+
+
+class TestDoorModulePlayerToAttribute:
+    """door_module_player_to_attribute rewrites a Door script's
+    ``playerHasKey()`` helper — which uselessly tries to require the
+    Player LocalScript on the server — into a server-side walk-up read
+    of the ``hasKey`` attribute the Pickup pack writes on the character.
+
+    Regression: the AI transpiler emits a ZERO-parameter
+    ``playerHasKey()``; the pack's helper regex required one parameter
+    (``\\w+``), so it silently no-oped and the door never opened.
+    """
+
+    def _door_zero_param(self) -> "RbxScript":
+        return RbxScript(
+            name="Door",
+            source=(
+                'local function getPlayerModule()\n'
+                '    local m = game:GetService("ReplicatedStorage"):FindFirstChild("Player", true)\n'
+                '    if m and m:IsA("ModuleScript") then return require(m) end\n'
+                '    return nil\n'
+                'end\n'
+                'local function playerHasKey()\n'
+                '    local PlayerModule = getPlayerModule()\n'
+                '    if PlayerModule and PlayerModule.hasKey then return PlayerModule.hasKey() end\n'
+                '    return false\n'
+                'end\n'
+                'local function _onProximityTouched(other)\n'
+                '    if isPlayerPart(other) then\n'
+                '        if playerHasKey() then toggleDoor(true) end\n'
+                '    end\n'
+                'end\n'
+                'triggerPart.TouchEnded:Connect(function(other)\n'
+                '    if isPlayerPart(other) then\n'
+                '        if playerHasKey() then toggleDoor(false) end\n'
+                '    end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+
+    def test_detector_fires_on_zero_param_shape(self) -> None:
+        assert packs_module._detect_door_module_player_lookup(
+            [self._door_zero_param()]
+        ) is True
+
+    def test_rewrites_zero_param_helper_and_call_sites(self) -> None:
+        s = self._door_zero_param()
+        fixes = packs_module._fix_door_module_player_lookup([s])
+        assert fixes == 1
+        # Helper now takes a part and walks up to the hasKey attribute.
+        assert "local function playerHasKey(_part)" in s.source
+        assert "GetAttribute('hasKey') == true" in s.source
+        # The broken module-require path is gone from the helper body.
+        helper_body = s.source.split("playerHasKey(_part)", 1)[1].split(
+            "\nend", 1
+        )[0]
+        assert "getPlayerModule()" not in helper_body
+        # Every empty-paren call site is threaded with the touch arg.
+        assert "playerHasKey(other)" in s.source
+        assert "playerHasKey()" not in s.source
+        # Both handlers (Touched + TouchEnded) were threaded.
+        assert s.source.count("playerHasKey(other)") == 2
+
+    def test_idempotent(self) -> None:
+        s = self._door_zero_param()
+        first = packs_module._fix_door_module_player_lookup([s])
+        second = packs_module._fix_door_module_player_lookup([s])
+        assert first == 1
+        assert second == 0
+
+    def test_no_op_on_non_door_script(self) -> None:
+        s = RbxScript(
+            name="Mine",
+            source="local function playerHasKey() return false end\n",
+            script_type="Script",
+        )
+        original = s.source
+        packs_module._fix_door_module_player_lookup([s])
+        assert s.source == original
+
+
+class TestFpsCameraPitchInversion:
+    """fps_camera_pitch_inversion flips the mouse-delta pitch sign when
+    it AGREES with the camera CFrame.Angles sign — the pairing that
+    inverts vertical look (Roblox GetMouseDelta().Y is positive-down,
+    vs Unity's positive-up Mouse Y axis).
+    """
+
+    def _inverted(self) -> "RbxScript":
+        return RbxScript(
+            name="Player",
+            source=(
+                "local d = UserInputService:GetMouseDelta()\n"
+                "yawAngle = yawAngle - d.X * MOUSE_RAD_PER_PIXEL\n"
+                "pitchDeg = pitchDeg - d.Y * MOUSE_DEG_PER_PIXEL\n"
+                "pitchDeg = math.clamp(pitchDeg, minAngle, maxAngle)\n"
+                "pitchDeg = pitchDeg - 2\n"
+                "camera.CFrame = CFrame.new(headPos)"
+                " * CFrame.Angles(0, yawAngle, 0)"
+                " * CFrame.Angles(math.rad(-pitchDeg), 0, 0)\n"
+            ),
+            script_type="LocalScript",
+        )
+
+    def test_detector_fires_on_inverted_pair(self) -> None:
+        assert packs_module._detect_fps_camera_pitch_inversion(
+            [self._inverted()]
+        ) is True
+
+    def test_flips_only_the_mouse_delta_line(self) -> None:
+        s = self._inverted()
+        fixes = packs_module._fix_fps_camera_pitch_inversion([s])
+        assert fixes == 1
+        # Mouse-delta pitch line is flipped to '+'.
+        assert "pitchDeg = pitchDeg + d.Y * MOUSE_DEG_PER_PIXEL" in s.source
+        # Yaw, the clamp, the recoil kick, and the camera term are all
+        # left untouched — flipping any of them would break something.
+        assert "yawAngle = yawAngle - d.X * MOUSE_RAD_PER_PIXEL" in s.source
+        assert "pitchDeg = math.clamp(pitchDeg, minAngle, maxAngle)" in s.source
+        assert "pitchDeg = pitchDeg - 2" in s.source
+        assert "CFrame.Angles(math.rad(-pitchDeg), 0, 0)" in s.source
+
+    def test_idempotent(self) -> None:
+        s = self._inverted()
+        first = packs_module._fix_fps_camera_pitch_inversion([s])
+        second = packs_module._fix_fps_camera_pitch_inversion([s])
+        assert first == 1
+        assert second == 0
+
+    def test_no_op_on_correct_pairing(self) -> None:
+        """`pitch - d.Y` paired with `CFrame.Angles(+pitch)` — signs
+        disagree, so it is the CORRECT combination and must not flip."""
+        s = RbxScript(
+            name="Player",
+            source=(
+                "pitchDeg = pitchDeg - d.Y * K\n"
+                "camera.CFrame = CFrame.Angles(0, yawAngle, 0)"
+                " * CFrame.Angles(pitchDeg, 0, 0)\n"
+            ),
+            script_type="LocalScript",
+        )
+        original = s.source
+        assert packs_module._detect_fps_camera_pitch_inversion([s]) is False
+        packs_module._fix_fps_camera_pitch_inversion([s])
+        assert s.source == original

@@ -81,7 +81,7 @@ Converts Unity game projects into playable Roblox experiences. Handles scene hie
 
 There are two CLIs that share the same `Pipeline` class and the same `conversion_context.json` on disk:
 
-1. **`u2r.py` — non-interactive end-to-end CLI.** Subcommands: `convert`, `publish`, `analyze`, `validate`, `resolve`, `compare`. See `python u2r.py --help`. **`convert` does NOT perform Step 4.5 (client/server split)** — it requires `--skip-architecture-step` and ships server-crashing UI modules. For a complete game conversion use the `/convert-unity` skill (entry 2); reserve `u2r.py` for individual phases, `--phase` resumes, and CI.
+1. **`u2r.py` — non-interactive end-to-end CLI.** Subcommands: `convert`, `publish`, `analyze`, `validate`, `resolve`, `compare`. See `python u2r.py --help`. **`convert` does NOT perform Step 4a (client/server split)** — it requires `--skip-architecture-step` and ships server-crashing UI modules. For a complete game conversion use the `/convert-unity` skill (entry 2); reserve `u2r.py` for individual phases, `--phase` resumes, and CI.
 
 2. **`convert_interactive.py` — phase-by-phase CLI for the `/convert-unity` Claude Code skill.** Each subcommand maps to a single skill phase, emits structured JSON to stdout, and persists state in `conversion_context.json`. Subcommands:
 
@@ -100,7 +100,7 @@ There are two CLIs that share the same `Pipeline` class and the same `conversion
 
    Each subcommand re-runs essential prerequisite phases on every invocation (matching `Pipeline.resume` semantics) so individual calls are self-contained — but state from previous calls is loaded from `conversion_context.json`.
 
-3. **`/convert-unity` skill** — `converter/.claude/skills/convert-unity/SKILL.md` is the institutional knowledge layer that Claude Code follows when walking a user through an interactive conversion. It encodes the Unity↔Roblox semantic gaps (Step 4.5: architecture map, divergence analysis, module rewrite, bootstrap wiring) that the pipeline cannot automate.
+3. **`/convert-unity` skill** — `converter/.claude/skills/convert-unity/SKILL.md` is the institutional knowledge layer that Claude Code follows when walking a user through an interactive conversion. It encodes the Unity↔Roblox semantic gaps (Steps 4a-4c: architecture map, divergence analysis, module rewrite, bootstrap wiring) that the pipeline cannot automate.
 
    See also `converter/.claude/skills/convert-unity/references/upload-patching.md` for upload-strategy details.
 

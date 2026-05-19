@@ -101,6 +101,7 @@ class PrefabNode:
     name: str
     file_id: str
     active: bool
+    tag: str = "Untagged"
     children: list[PrefabNode] = field(default_factory=list)
     parent_file_id: str | None = None
     position: tuple[float, float, float] = (0.0, 0.0, 0.0)
