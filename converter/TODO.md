@@ -144,8 +144,12 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   canvases `Enabled=false` at build time, nor (b) emits state-machine code
   that toggles `ScreenGui.Enabled` on state transitions. Explore: where
   Unity `Canvas`/`GameObject.SetActive` and per-state canvas wiring should
-  map to `ScreenGui.Enabled`, and why it is dropped. Likely related to the
-  `classify_storage` / Step-4a-plan-not-honored P1 above.
+  map to `ScreenGui.Enabled`, and why it is dropped. Note: `RbxScreenGui`
+  (`core/roblox_types.py`) currently has no `enabled` field, and neither writer
+  (`rbxlx_writer.py`, `luau_place_builder.py`) serializes `Enabled` — so the fix
+  needs `Enabled` plumbed through the type + both writers, plus the
+  state->visibility wiring. (This is its own gap — not the `classify_storage`
+  P1, which only mutates scripts.)
 
 - [ ] **P1 — Phase 4a.5 agent-override ingestion is unimplemented.**
   `storage_classifier.py` ("Phase 4a.5") is correctly meant to run during Step 4a
@@ -159,18 +163,22 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
     `overrides` parameter — it builds a fresh `StoragePlan()` from scratch every call.
   - `overrides_applied` is a declared field with a hopeful comment; nothing
     populates it.
-  - `_classify_storage()` (`pipeline.py:3335`) calls the classifier with only
+  - `_classify_storage()` (`pipeline.py:3336`) calls the classifier with only
     `scripts` + `dependency_map`, then unconditionally rewrites `conversion_plan.json`
-    (`pipeline.py:3356`) — and re-runs on every `write_output`.
+    (`pipeline.py:3356`) — and re-runs on every `write_output`. (Rehydration at
+    `pipeline.py:3242` does briefly read the prior `conversion_plan.json` to seed
+    `script_type`/`parent_path`, but `_classify_storage()` recomputes and overwrites
+    it later in the same `write_output()` pass.)
   So an agent-edited `storage_plan` is silently discarded by the next `assemble`.
   Confirmed in the trash-dash Mode-2 run (2026-05-19): Step 4a authored
   1 server / 49 shared / 1 server-module / 8 overrides; after `assemble`,
-  `overrides_applied` was 0. Fix (the stub is already there): give
-  `classify_storage()` an optional `existing_plan` arg that honors agent-set
-  containers and populates `overrides_applied`; have `_classify_storage()` read the
-  existing `conversion_plan.json` `storage_plan` and pass it in instead of
-  regenerating blind. This is the real plan->pipeline wiring gap — broader than the
-  `--skip-architecture-step` gate from PR #109.
+  `overrides_applied` was 0. Fix: do NOT make the whole prior plan sticky — that
+  would freeze stale auto-classifications and block future classifier improvements.
+  Instead persist *explicit manual overrides* separately (a `name -> container`
+  map), keep running fresh classification every time, then overlay only those
+  explicit overrides and populate `overrides_applied`. This is the real
+  plan->pipeline wiring gap — broader than the `--skip-architecture-step` gate
+  from PR #109.
 
 - [ ] **P2 — Retire genre-specific scaffolding; make the converter fully
   genre-agnostic.** `--scaffolding=fps` (`u2r.py convert`) injects FPS-genre
