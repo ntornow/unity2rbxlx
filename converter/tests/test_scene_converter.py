@@ -472,6 +472,238 @@ class TestMeshSizeFbxBboxFallback:
         assert abs(size[2] - 0.5 * 20.0 * f) < 0.01
 
 
+# A legacy NativeFormatImporter prefab embedding one Mesh as a !u!43 object,
+# modelled on SimpleFPS's at_mine_LOD3.prefab (real m_LocalAABB values).
+_EMBEDDED_MESH_PREFAB = """%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &107984
+GameObject:
+  m_Name: Mine
+--- !u!43 &4322892
+Mesh:
+  m_Name: AT_Mine_LOD3
+  serializedVersion: 11
+  m_SubMeshes:
+  - serializedVersion: 2
+    localAABB:
+      m_Center: {x: 0, y: 0, z: 0}
+      m_Extent: {x: 99, y: 99, z: 99}
+  m_LocalAABB:
+    m_Center: {x: -0.000000074505806, y: -0.0014436208, z: -0.021289438}
+    m_Extent: {x: 0.1615152, y: 0.048787132, z: 0.17490588}
+  m_MeshCompression: 0
+"""
+
+# Two embedded meshes in one asset (LOD variants) -- fileID is required to
+# pick one unambiguously.
+_MULTI_MESH_PREFAB = """%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!43 &111
+Mesh:
+  m_Name: LOD0
+  m_LocalAABB:
+    m_Center: {x: 0, y: 0, z: 0}
+    m_Extent: {x: 1, y: 2, z: 3}
+--- !u!43 &222
+Mesh:
+  m_Name: LOD1
+  m_LocalAABB:
+    m_Center: {x: 0, y: 0, z: 0}
+    m_Extent: {x: 4, y: 5, z: 6}
+"""
+
+
+class TestEmbeddedMeshAabb:
+    """Embedded-mesh size recovery for legacy .prefab/.asset packs."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self):
+        """The AABB cache is module-global; reset it around each test."""
+        import converter.scene_converter as sc
+        sc._embedded_mesh_aabb_cache.clear()
+        yield
+        sc._embedded_mesh_aabb_cache.clear()
+
+    def _make_guid_index(self, guid, abs_path):
+        class FakeGuidIndex:
+            project_root = Path("/fake/project")
+            def resolve(self, g):
+                return Path(abs_path) if g == guid else None
+            def resolve_relative(self, g):
+                return None
+        return FakeGuidIndex()
+
+    def test_reads_top_level_local_aabb(self, tmp_path):
+        """m_LocalAABB extent (half-size) becomes full size in metres."""
+        import converter.scene_converter as sc
+
+        prefab = tmp_path / "at_mine_LOD3.prefab"
+        prefab.write_text(_EMBEDDED_MESH_PREFAB, encoding="utf-8")
+
+        size = sc._read_embedded_mesh_aabb(prefab, "4322892")
+        assert size is not None
+        # Full size = 2 x extent; the per-submesh localAABB (99) is ignored.
+        assert abs(size[0] - 0.3230304) < 1e-5
+        assert abs(size[1] - 0.097574264) < 1e-5
+        assert abs(size[2] - 0.34981176) < 1e-5
+
+    def test_single_mesh_resolves_without_fileid(self, tmp_path):
+        """A lone embedded mesh is unambiguous even with no fileID hint."""
+        import converter.scene_converter as sc
+
+        prefab = tmp_path / "single.prefab"
+        prefab.write_text(_EMBEDDED_MESH_PREFAB, encoding="utf-8")
+        assert sc._read_embedded_mesh_aabb(prefab, None) is not None
+
+    def test_asset_extension_supported(self, tmp_path):
+        """A .asset container is parsed the same as a .prefab."""
+        import converter.scene_converter as sc
+
+        asset = tmp_path / "mesh.asset"
+        asset.write_text(_EMBEDDED_MESH_PREFAB, encoding="utf-8")
+        assert sc._read_embedded_mesh_aabb(asset, "4322892") is not None
+
+    def test_fbx_asset_returns_none(self, tmp_path):
+        """Only .prefab/.asset containers are parsed; .fbx is uploaded."""
+        import converter.scene_converter as sc
+
+        fbx = tmp_path / "model.fbx"
+        fbx.write_text(_EMBEDDED_MESH_PREFAB, encoding="utf-8")
+        assert sc._read_embedded_mesh_aabb(fbx, "4322892") is None
+
+    def test_multiple_meshes_need_fileid(self, tmp_path):
+        """With several embedded meshes and no fileID hint, bail (no guess)."""
+        import converter.scene_converter as sc
+
+        prefab = tmp_path / "lods.prefab"
+        prefab.write_text(_MULTI_MESH_PREFAB, encoding="utf-8")
+        assert sc._read_embedded_mesh_aabb(prefab, None) is None
+        # An explicit fileID resolves the right one.
+        assert sc._read_embedded_mesh_aabb(prefab, "222") == (8.0, 10.0, 12.0)
+
+    def test_unmatched_fileid_returns_none(self, tmp_path):
+        """A fileID that matches no embedded mesh never falls back to a guess."""
+        import converter.scene_converter as sc
+
+        prefab = tmp_path / "lods.prefab"
+        prefab.write_text(_MULTI_MESH_PREFAB, encoding="utf-8")
+        assert sc._read_embedded_mesh_aabb(prefab, "999") is None
+
+    def test_zero_extent_skipped(self, tmp_path):
+        """A degenerate zero-size AABB is not used as a mesh size."""
+        import converter.scene_converter as sc
+
+        prefab = tmp_path / "degenerate.prefab"
+        prefab.write_text(
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n"
+            "--- !u!43 &1\nMesh:\n  m_Name: Empty\n  m_LocalAABB:\n"
+            "    m_Center: {x: 0, y: 0, z: 0}\n"
+            "    m_Extent: {x: 0, y: 0, z: 0}\n",
+            encoding="utf-8",
+        )
+        assert sc._read_embedded_mesh_aabb(prefab, "1") is None
+
+    def test_mesh_without_aabb_skipped(self, tmp_path):
+        """A !u!43 block missing m_LocalAABB is skipped, not crashed on."""
+        import converter.scene_converter as sc
+
+        prefab = tmp_path / "no_aabb.prefab"
+        prefab.write_text(
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n"
+            "--- !u!43 &1\nMesh:\n  m_Name: NoAabb\n  m_MeshCompression: 0\n",
+            encoding="utf-8",
+        )
+        assert sc._read_embedded_mesh_aabb(prefab, "1") is None
+
+    def test_missing_file_returns_none(self, tmp_path):
+        """A non-existent asset path yields None without raising."""
+        import converter.scene_converter as sc
+
+        assert sc._read_embedded_mesh_aabb(tmp_path / "gone.prefab", "1") is None
+
+    def test_second_call_served_from_cache(self, tmp_path):
+        """The asset is parsed once; later calls reuse the cached AABBs."""
+        import converter.scene_converter as sc
+
+        prefab = tmp_path / "at_mine_LOD3.prefab"
+        prefab.write_text(_EMBEDDED_MESH_PREFAB, encoding="utf-8")
+        first = sc._read_embedded_mesh_aabb(prefab, "4322892")
+        assert str(prefab) in sc._embedded_mesh_aabb_cache
+        # Corrupt the file -- a cached read must still return the first result.
+        prefab.write_text("garbage", encoding="utf-8")
+        assert sc._read_embedded_mesh_aabb(prefab, "4322892") == first
+
+    def test_compute_mesh_size_uses_embedded_aabb(self, tmp_path):
+        """_compute_mesh_size recovers size for an unuploaded embedded mesh."""
+        import converter.scene_converter as sc
+        import config
+
+        prefab = tmp_path / "at_mine_LOD3.prefab"
+        prefab.write_text(_EMBEDDED_MESH_PREFAB, encoding="utf-8")
+        guid = "c95ed669496457245b94a76f843f0381"
+        gi = self._make_guid_index(guid, str(prefab))
+
+        with _scene_ctx():
+            result = sc._compute_mesh_size(
+                unity_scale=(2.5, 2.5, 2.5),
+                mesh_guid=guid,
+                guid_index=gi,
+                mesh_native_sizes={},
+                mesh_file_id="4322892",
+            )
+        assert result is not None
+        size, initial = result
+        f = config.STUDS_PER_METER
+        assert abs(size[0] - 0.3230304 * 2.5 * f) < 0.01
+        assert abs(size[1] - 0.097574264 * 2.5 * f) < 0.01
+        assert abs(size[2] - 0.34981176 * 2.5 * f) < 0.01
+        assert abs(initial[0] - 0.3230304) < 1e-5
+
+    def test_fbx_bbox_fallback_recovers_embedded_mesh(self, tmp_path):
+        """When no meshes resolved at all, the fbx-bbox stop still recovers
+        an embedded mesh -- the path a converter run with no uploads takes."""
+        import converter.scene_converter as sc
+        import config
+
+        prefab = tmp_path / "at_mine_LOD3.prefab"
+        prefab.write_text(_EMBEDDED_MESH_PREFAB, encoding="utf-8")
+        guid = "c95ed669496457245b94a76f843f0381"
+        gi = self._make_guid_index(guid, str(prefab))
+
+        with _scene_ctx(fbx_bounding_boxes={}):
+            result = sc._compute_mesh_size_from_fbx_bbox(
+                unity_scale=(1.0, 1.0, 1.0),
+                mesh_guid=guid,
+                guid_index=gi,
+            )
+        assert result is not None
+        size, _ = result
+        assert abs(size[0] - 0.3230304 * config.STUDS_PER_METER) < 0.01
+
+    def test_fbx_bbox_fallback_threads_fileid(self, tmp_path):
+        """The fbx-bbox fallback forwards mesh_file_id, so a multi-mesh
+        legacy asset still resolves the right sub-mesh with no uploads."""
+        import converter.scene_converter as sc
+        import config
+
+        prefab = tmp_path / "lods.prefab"
+        prefab.write_text(_MULTI_MESH_PREFAB, encoding="utf-8")
+        guid = "lodpackguid"
+        gi = self._make_guid_index(guid, str(prefab))
+
+        with _scene_ctx(fbx_bounding_boxes={}):
+            result = sc._compute_mesh_size_from_fbx_bbox(
+                unity_scale=(1.0, 1.0, 1.0),
+                mesh_guid=guid,
+                guid_index=gi,
+                mesh_file_id="222",
+            )
+        assert result is not None
+        size, initial = result
+        assert initial == (8.0, 10.0, 12.0)
+        assert abs(size[0] - 8.0 * config.STUDS_PER_METER) < 0.01
+
+
 class TestMeshVerticalOffsetSubMesh:
     """Test per-sub-mesh vertical offset selection."""
 
