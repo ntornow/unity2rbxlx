@@ -245,7 +245,24 @@ class TestFpsWeaponMountInjection:
         assert fixes == 1
         assert '_fpsRifle' in s.source
         assert 'rp:Clone' in s.source
-        assert 'PivotTo(workspace.CurrentCamera.CFrame' in s.source
+
+    def test_injection_seats_rifle_into_camera_rig(self) -> None:
+        """The equipped weapon must be seated into the converted Unity
+        camera rig (the ``_MainCameraRig`` Model that the auto-injected
+        CameraRigFollower pivots onto the live camera), not pinned to a
+        hardcoded camera offset with a bespoke per-weapon follower.
+        """
+        s = self._stub_player_script()
+        packs_module._inject_fps_weapon_mounts([s])
+        # Equip path locates the rig and seats the rifle into its slot.
+        assert 'GetAttribute("_MainCameraRig")' in s.source
+        assert 'rig:FindFirstChild("WeaponSlot", true)' in s.source
+        assert 'rifle.Parent = slot' in s.source
+        # No per-weapon RenderStepped follower — the rig follower owns
+        # camera tracking now. The old follower keyed on a primary-part
+        # var; its absence proves the bespoke follower is gone.
+        assert '_fpsRiflePrimary' not in s.source
+        assert 'if _fpsRifle and' not in s.source
 
     def test_injection_marker_prevents_double_apply(self) -> None:
         s = self._stub_player_script()
@@ -287,7 +304,7 @@ class TestFpsWeaponMountInjection:
             source=(
                 "local riflePrefab = nil\n"
                 "local gotWeapon = false\n"
-                "local _fpsRifle, _fpsRiflePrimary\n"  # mimic transpiler decls
+                "local _fpsRifle\n"  # mimic transpiler decl
                 "function getRifle()\n"
                 "    -- AI stub does not actually clone the rifle\n"
                 "    gotWeapon = true\n"
@@ -302,7 +319,7 @@ class TestFpsWeaponMountInjection:
         assert fixes == 1, "WeaponMount pack must fire on camelCase function-statement shape"
         assert '_fpsRifle = rifle' in s.source, "rifle instance var must be assigned"
         assert 'rp:Clone' in s.source
-        assert 'PivotTo(workspace.CurrentCamera.CFrame' in s.source
+        assert 'rifle.Parent = slot' in s.source
 
 
 class TestPickupRemoteEventServerAttr:

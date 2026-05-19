@@ -170,39 +170,43 @@ def run_packs(
 #
 # Each ``WeaponMount`` entry parameterises one Unity FPS weapon-pickup
 # pattern: the world prefab name, the equip-function the AI transpiler
-# stubs out, the sentinel flag, view-space offset, scale, and the local
-# variable names the rewrite uses. Adding a second FPS weapon (e.g. a
-# pistol on a future test project) is a one-tuple append — no code
-# change to the detector or injection logic.
+# stubs out, the sentinel flag, scale, and the local variable name the
+# rewrite uses. Adding a second FPS weapon (e.g. a pistol on a future
+# test project) is a one-tuple append — no code change to the detector
+# or injection logic.
 #
-# Values are stored as the literal Lua-source fragments they emit, so
-# refactoring this registry from the previous SimpleFPS-hardcoded pack
-# produces byte-identical output for the existing test project.
+# Camera tracking is NOT done here. Unity parents the weapon to a
+# camera-child "WeaponSlot" transform; the converter reproduces that
+# GameObject inside the ``_MainCameraRig`` Model, and the auto-injected
+# CameraRigFollower pivots that whole rig onto ``workspace.CurrentCamera``
+# each frame. The rewritten equip path just seats the cloned weapon into
+# the rig, so it rides the player's view with no per-weapon follower and
+# no hardcoded offset. ``fallback_offset_expr`` is used only when the
+# scene has no rig at all.
 
 
 @dataclass(frozen=True)
 class WeaponMount:
-    prefab_name: str        # workspace prefab name (camelCase)
-    equip_function: str     # AI-stubbed function name on the Player controller
-    sentinel_var: str       # already-equipped flag, flipped to true on equip
-    scale_expr: str         # Lua-source fragment for rifle:ScaleTo(<expr>)
-    view_offset_expr: str   # Lua-source CFrame expression for camera-relative pose
-    marker_tag: str         # composed into ``-- _FPS_<tag>`` for idempotency
-    instance_var: str       # local that holds the cloned weapon Model
-    primary_var: str        # local that holds the weapon's PrimaryPart
+    prefab_name: str           # workspace prefab name (camelCase)
+    equip_function: str        # AI-stubbed function name on the Player controller
+    sentinel_var: str          # already-equipped flag, flipped to true on equip
+    scale_expr: str            # Lua-source fragment for rifle:ScaleTo(<expr>)
+    fallback_offset_expr: str  # camera-relative CFrame, used ONLY when the
+                               # scene has no _MainCameraRig to seat into
+    marker_tag: str            # composed into ``-- _FPS_<tag>`` for idempotency
+    instance_var: str          # local that holds the cloned weapon Model
 
 
-# Today's registry: one entry, replicating the SimpleFPS hardcoded values.
+# Today's registry: one entry for the SimpleFPS rifle.
 WEAPON_MOUNTS: tuple[WeaponMount, ...] = (
     WeaponMount(
         prefab_name="riflePrefab",
         equip_function="GetRifle",
         sentinel_var="gotWeapon",
         scale_expr="0.15",
-        view_offset_expr="CFrame.new(0.5, -0.5, -3)",
+        fallback_offset_expr="CFrame.new(0.5, -0.5, -3)",
         marker_tag="RIFLE_SYSTEM",
         instance_var="_fpsRifle",
-        primary_var="_fpsRiflePrimary",
     ),
 )
 
@@ -440,8 +444,7 @@ def _apply_weapon_mount(s: "RbxScript", mount: WeaponMount) -> bool:
     s.source = s.source.replace(
         f"local {mount.sentinel_var} = false",
         f"local {mount.sentinel_var} = false\n"
-        f"local {mount.instance_var} = nil  {marker}\n"
-        f"local {mount.primary_var} = nil",
+        f"local {mount.instance_var} = nil  {marker}",
     )
 
     # Match three emitted shapes from the AI transpiler:
@@ -462,10 +465,15 @@ def _apply_weapon_mount(s: "RbxScript", mount: WeaponMount) -> bool:
         # Preserve the matched header verbatim. The injection target may
         # have been `GetRifle = function()` (table-field form) or
         # `function getRifle()` (function-statement form, Luau idiom).
-        # Re-emitting the same header keeps the existing test fixtures
-        # byte-identical while letting real transpiler output (which
-        # uses the lowercase function-statement form) be rewritten too.
         matched_header = m.group(1)
+        # The equipped weapon is seated into the converted Unity camera
+        # rig — the ``_MainCameraRig`` Model that the auto-injected
+        # CameraRigFollower pivots onto the live camera each frame.
+        # ``Model:PivotTo`` propagates to descendants, so a weapon
+        # parented anywhere under the rig rides the player's view with
+        # no per-weapon follower and no hardcoded offset. Seating order
+        # of preference: the Unity "WeaponSlot" object inside the rig →
+        # the rig Model itself → (no rig) a one-shot camera placement.
         new_body = (
             f'{matched_header}\n'
             f'    if {mount.sentinel_var} then return end\n'
@@ -481,29 +489,26 @@ def _apply_weapon_mount(s: "RbxScript", mount: WeaponMount) -> bool:
             f'            p.Transparency = 0\n'
             f'            p.CanCollide = false\n'
             f'            p.Anchored = true\n'
-            f'            if p ~= prim then\n'
-            f'                local w = Instance.new("WeldConstraint")\n'
-            f'                w.Part0 = p; w.Part1 = prim; w.Parent = p\n'
-            f'            end\n'
             f'        end\n'
             f'    end\n'
-            f'    rifle:PivotTo(workspace.CurrentCamera.CFrame * {mount.view_offset_expr})\n'
-            f'    rifle.Parent = workspace\n'
+            f'    local rig\n'
+            f'    for _, m in workspace:GetDescendants() do\n'
+            f'        if m:IsA("Model") and m:GetAttribute("_MainCameraRig") then rig = m break end\n'
+            f'    end\n'
+            f'    local slot = rig and rig:FindFirstChild("WeaponSlot", true)\n'
+            f'    if slot then\n'
+            f'        rifle:PivotTo(slot:IsA("Model") and slot:GetPivot() or slot.CFrame)\n'
+            f'        rifle.Parent = slot\n'
+            f'    elseif rig then\n'
+            f'        rifle:PivotTo(rig:GetPivot() * {mount.fallback_offset_expr})\n'
+            f'        rifle.Parent = rig\n'
+            f'    else\n'
+            f'        rifle:PivotTo(workspace.CurrentCamera.CFrame * {mount.fallback_offset_expr})\n'
+            f'        rifle.Parent = workspace\n'
+            f'    end\n'
             f'    {mount.instance_var} = rifle\n'
-            f'    {mount.primary_var} = prim\n'
         )
         s.source = s.source[: m.start()] + new_body + s.source[m.start(3):]
-
-    if "RunService.RenderStepped:Connect" in s.source:
-        s.source = s.source.replace(
-            "RunService.RenderStepped:Connect(function(dt)",
-            "RunService.RenderStepped:Connect(function(dt)\n"
-            f"    if {mount.instance_var} and {mount.primary_var} "
-            f"and {mount.primary_var}.Parent then\n"
-            f"        {mount.instance_var}:PivotTo("
-            f"workspace.CurrentCamera.CFrame * {mount.view_offset_expr})\n"
-            f"    end",
-        )
 
     return s.source != before
 
@@ -539,9 +544,11 @@ def _inject_fps_weapon_mounts(scripts: list["RbxScript"]) -> int:
 
     Steps per mount:
     1. Find the prefab in workspace (camelCase or PascalCase variant)
-    2. Clone, scale, make visible, weld sub-parts to the PrimaryPart
-    3. Parent to workspace (not the character) with anchored parts
-    4. Splice a RenderStepped follower so pose tracks the camera
+    2. Clone, scale, make visible (anchored parts)
+    3. Seat the clone into the converted Unity camera rig — the
+       ``_MainCameraRig`` Model the auto-injected CameraRigFollower
+       pivots onto the live camera, so the weapon rides the view with
+       no per-weapon follower and no hardcoded offset
     """
     fixes = 0
     for s in scripts:

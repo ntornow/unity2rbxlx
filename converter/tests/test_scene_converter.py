@@ -1197,3 +1197,58 @@ class TestFindCameraWorldTransform:
             f"Camera world X should reflect parent translation. "
             f"Got {cfg.cframe.x}, expected {expected_x}"
         )
+
+
+class TestMainCameraRig:
+    """The Unity main-camera GameObject becomes a Model tagged with the
+    ``_MainCameraRig`` attribute, so the auto-injected CameraRigFollower
+    can pivot it onto ``workspace.CurrentCamera`` each frame and every
+    camera-child object (weapon slots, viewmodels) rides the view.
+    """
+
+    def _camera_node(self, tag="MainCamera"):
+        from core.unity_types import SceneNode
+
+        class FakeCamera:
+            component_type = "Camera"
+            properties: dict = {}
+
+        # A child makes the node convert to a Model (the rig container).
+        child = SceneNode(
+            name="WeaponSlot", file_id="2", active=True, layer=0,
+            tag="Untagged", components=[], parent_file_id="1",
+            position=(0.4, -0.64, 0.6), rotation=(0.0, 0.0, 0.0, 1.0),
+            scale=(1.0, 1.0, 1.0),
+        )
+        return SceneNode(
+            name="Main Camera", file_id="1", active=True, layer=0,
+            tag=tag, components=[FakeCamera()], parent_file_id=None,
+            children=[child],
+            position=(0.0, 0.0, 0.0), rotation=(0.0, 0.0, 0.0, 1.0),
+            scale=(1.0, 1.0, 1.0),
+        )
+
+    def test_main_camera_tagged_as_rig(self):
+        from converter.scene_converter import _convert_node
+
+        with _scene_ctx():
+            part = _convert_node(self._camera_node(), None, {}, {})
+
+        assert part is not None
+        assert part.class_name == "Model", (
+            "A camera GameObject with children must become a Model."
+        )
+        assert part.attributes.get("_MainCameraRig") is True
+
+    def test_secondary_camera_not_tagged(self):
+        """A camera not tagged ``MainCamera`` (e.g. a minimap camera)
+        must NOT be marked as the rig — only one rig per scene."""
+        from converter.scene_converter import _convert_node
+
+        with _scene_ctx():
+            part = _convert_node(
+                self._camera_node(tag="Untagged"), None, {}, {}
+            )
+
+        assert part is not None
+        assert "_MainCameraRig" not in part.attributes
