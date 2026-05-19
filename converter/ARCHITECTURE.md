@@ -37,7 +37,7 @@ End-to-end CLI for one-shot conversions, CI/CD, batch jobs. No human in the loop
 | `upload`     | full pipeline → write_output (skips moderate/upload/resolve_assets always; also skips `transpile_scripts` when its cache is intact) → headless place builder | Publishes via `execute_luau` |
 | `report`     | (none — writes `conversion_report.json`) | Final summary |
 
-The `/convert-unity` skill (`converter/.claude/skills/convert-unity/SKILL.md`) drives the interactive workflow. It pauses at each phase for human review (scene selection, material review, script review, scale strategy, etc.) and contains the Step 4.5 game-logic-porting playbook (architecture map, Unity↔Roblox divergence analysis, module-per-component rewrite, bootstrap wiring) that the pipeline cannot automate.
+The `/convert-unity` skill (`converter/.claude/skills/convert-unity/SKILL.md`) drives the interactive workflow. It pauses at each phase for human review (scene selection, material review, script review, scale strategy, etc.) and contains the Steps 4a-4c game-logic-porting playbook (architecture map, Unity↔Roblox divergence analysis, module-per-component rewrite, bootstrap wiring) that the pipeline cannot automate.
 
 Upload publishing has two paths with different semantics: interactive `upload` rebuilds `rbx_place` from source on every run; `u2r.py publish` replays cached chunks at `<output>/place_builder_chunks.json` and falls back to a fresh rebuild only on cache miss. Manual `.rbxlx` publishing is via Roblox Studio (File → Publish to Roblox). See `CLAUDE.md` § Upload semantics for the full comparison; the skill-internal upload-strategy detail lives in the skill's `references/upload-patching.md`.
 
