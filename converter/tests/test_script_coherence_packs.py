@@ -304,6 +304,28 @@ class TestFpsWeaponMountInjection:
         assert 'rp:Clone' in s.source
         assert 'PivotTo(workspace.CurrentCamera.CFrame' in s.source
 
+    def test_mount_offset_derives_from_weapon_slot_scene_object(self) -> None:
+        """The viewmodel pose must be read from the converted Unity
+        WeaponSlot GameObject, not the hardcoded literal. Unity parents
+        the rifle to ``weaponSlot`` (a camera-child transform); the
+        converter reproduces that object in-scene, so the held rifle
+        should sit exactly where Unity authored it. A hardcoded camera
+        offset is the bug that left the rifle floating arbitrarily in
+        the player's field of view.
+        """
+        s = self._stub_player_script()
+        packs_module._inject_fps_weapon_mounts([s])
+        # The runtime helper must look up the WeaponSlot scene object and
+        # compute its pose relative to the parent camera Model.
+        assert '_fpsRifleGetMountOffset' in s.source
+        assert 'slot.Name == "WeaponSlot"' in s.source
+        assert 'GetPivot():ToObjectSpace(slot.CFrame)' in s.source
+        # Both the equip path and the per-frame follower must call the
+        # helper rather than embedding a fixed CFrame.
+        assert s.source.count('CFrame * _fpsRifleGetMountOffset()') == 2
+        # The hardcoded literal survives only as the in-helper fallback.
+        assert s.source.count('CFrame.new(0.5, -0.5, -3)') == 1
+
 
 class TestPickupRemoteEventServerAttr:
     """The ``pickup_remote_event_server`` pack rewrites

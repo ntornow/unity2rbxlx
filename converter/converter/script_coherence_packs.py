@@ -186,10 +186,16 @@ class WeaponMount:
     equip_function: str     # AI-stubbed function name on the Player controller
     sentinel_var: str       # already-equipped flag, flipped to true on equip
     scale_expr: str         # Lua-source fragment for rifle:ScaleTo(<expr>)
-    view_offset_expr: str   # Lua-source CFrame expression for camera-relative pose
+    view_offset_expr: str   # FALLBACK camera-relative CFrame, used only when
+                            # the converted scene has no ``slot_name`` object
     marker_tag: str         # composed into ``-- _FPS_<tag>`` for idempotency
     instance_var: str       # local that holds the cloned weapon Model
     primary_var: str        # local that holds the weapon's PrimaryPart
+    slot_name: str          # Unity weapon-slot GameObject name. Unity parents
+                            # the weapon to this camera-child transform; the
+                            # converter reproduces it in-scene, and the
+                            # injected code reads its pose so the held weapon
+                            # sits where Unity authored it (not at a guess).
 
 
 # Today's registry: one entry, replicating the SimpleFPS hardcoded values.
@@ -203,6 +209,7 @@ WEAPON_MOUNTS: tuple[WeaponMount, ...] = (
         marker_tag="RIFLE_SYSTEM",
         instance_var="_fpsRifle",
         primary_var="_fpsRiflePrimary",
+        slot_name="WeaponSlot",
     ),
 )
 
@@ -456,7 +463,41 @@ def _apply_weapon_mount(s: "RbxScript", mount: WeaponMount) -> bool:
         rf"(\n\s*{mount.sentinel_var}\s*=\s*true)",
         re.DOTALL,
     )
+    # Camera-relative mount-pose helper. Unity's equip path parents the
+    # weapon to a camera-child "slot" transform (SimpleFPS Player.cs:
+    # ``rifle.transform.SetParent(weaponSlot); localPosition = zero``).
+    # The converter already reproduces that ``slot_name`` GameObject in
+    # the Roblox scene as a Part under the camera Model, so the faithful
+    # viewmodel offset is that Part's pose relative to its parent Model
+    # — not a hardcoded CFrame. We read it once at runtime and cache it;
+    # ``view_offset_expr`` is only the fallback for scenes that have no
+    # such slot object.
+    offset_var = f"{mount.instance_var}MountOffset"
+    offset_fn = f"{mount.instance_var}GetMountOffset"
+    offset_helper = (
+        f'-- Camera-relative mount pose for the held {mount.prefab_name}.\n'
+        f'-- Unity parents the weapon to the "{mount.slot_name}" child of\n'
+        f'-- the camera; the converter reproduces that GameObject in-scene,\n'
+        f'-- so its pose relative to the camera Model is the authored\n'
+        f'-- viewmodel offset. Falls back to a literal only if absent.\n'
+        f'local {offset_var} = nil\n'
+        f'local function {offset_fn}()\n'
+        f'    if {offset_var} then return {offset_var} end\n'
+        f'    for _, slot in workspace:GetDescendants() do\n'
+        f'        if slot.Name == "{mount.slot_name}" and slot:IsA("BasePart") then\n'
+        f'            local camModel = slot.Parent\n'
+        f'            if camModel and camModel:IsA("Model") then\n'
+        f'                {offset_var} = camModel:GetPivot():ToObjectSpace(slot.CFrame)\n'
+        f'                return {offset_var}\n'
+        f'            end\n'
+        f'        end\n'
+        f'    end\n'
+        f'    return {mount.view_offset_expr}\n'
+        f'end\n'
+    )
+
     m = body_re.search(s.source)
+    body_rewritten = False
     if m:
         alt = _prefab_alt_case(mount.prefab_name)
         # Preserve the matched header verbatim. The injection target may
@@ -467,6 +508,7 @@ def _apply_weapon_mount(s: "RbxScript", mount: WeaponMount) -> bool:
         # uses the lowercase function-statement form) be rewritten too.
         matched_header = m.group(1)
         new_body = (
+            f'{offset_helper}'
             f'{matched_header}\n'
             f'    if {mount.sentinel_var} then return end\n'
             f'    local rp = workspace:FindFirstChild("{mount.prefab_name}", true)\n'
@@ -487,13 +529,19 @@ def _apply_weapon_mount(s: "RbxScript", mount: WeaponMount) -> bool:
             f'            end\n'
             f'        end\n'
             f'    end\n'
-            f'    rifle:PivotTo(workspace.CurrentCamera.CFrame * {mount.view_offset_expr})\n'
+            f'    rifle:PivotTo(workspace.CurrentCamera.CFrame * {offset_fn}())\n'
             f'    rifle.Parent = workspace\n'
             f'    {mount.instance_var} = rifle\n'
             f'    {mount.primary_var} = prim\n'
         )
         s.source = s.source[: m.start()] + new_body + s.source[m.start(3):]
+        body_rewritten = True
 
+    # The RenderStepped follower keeps the equipped weapon glued to the
+    # camera each frame. It can only call the offset helper when the body
+    # rewrite above actually emitted it; otherwise fall back to the
+    # literal so the spliced code never references an undefined helper.
+    follower_offset = f"{offset_fn}()" if body_rewritten else mount.view_offset_expr
     if "RunService.RenderStepped:Connect" in s.source:
         s.source = s.source.replace(
             "RunService.RenderStepped:Connect(function(dt)",
@@ -501,7 +549,7 @@ def _apply_weapon_mount(s: "RbxScript", mount: WeaponMount) -> bool:
             f"    if {mount.instance_var} and {mount.primary_var} "
             f"and {mount.primary_var}.Parent then\n"
             f"        {mount.instance_var}:PivotTo("
-            f"workspace.CurrentCamera.CFrame * {mount.view_offset_expr})\n"
+            f"workspace.CurrentCamera.CFrame * {follower_offset})\n"
             f"    end",
         )
 
