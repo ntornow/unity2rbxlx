@@ -4187,10 +4187,16 @@ _PROXIMITY_TRIGGER_MARKER = "_AutoProximityTriggerFanout"
 # door also bound ``.TouchEnded`` the non-greedy ``body`` over-captured,
 # swallowing the first ``end)`` and producing a stray ``)`` in the
 # rewritten ``local function`` — invalid Luau.
+# ``(?:[ \t]*(?:--[^\n]*)?\n)*`` after ``if <var> then`` tolerates blank
+# lines and `--` comment lines (the AI commonly emits an
+# ``-- OnTriggerEnter ...`` line between the ``if`` and the ``.Touched``
+# connect — without skipping it the door's Touched binding never matched
+# and the proximity fanout silently dropped Door.luau).
 _PROXIMITY_TRIGGER_RE = re.compile(
     r'(?P<lead>^[ \t]*)local\s+(?P<var>[a-zA-Z_]\w*)\s*=\s*findTriggerPart\s*\(\s*'
     r'(?P<container>[a-zA-Z_]\w*)\s*\)\s*\n'
     r'[ \t]*if\s+(?P=var)\s+then\s*\n'
+    r'(?:[ \t]*(?:--[^\n]*)?\n)*'
     r'(?P<connect_indent>[ \t]+)(?P=var)\s*\.\s*Touched\s*:\s*Connect\s*\(\s*'
     r'function\s*\(\s*(?P<arg>[a-zA-Z_]\w*)\s*\)\s*\n'
     r'(?P<body>(?:.*?\n)*?)'
@@ -4283,6 +4289,19 @@ def _inject_proximity_trigger_fanout(scripts: list["RbxScript"]) -> int:
             f"{lead}if {var} then\n"
             f"{lead}\tif {container}:IsA(\"BasePart\") then\n"
             f"{lead}\t\t{container}.Touched:Connect(_onProximityTouched)\n"
+            f"{lead}\t\t-- Also wire Touched on any invisible trigger-volume\n"
+            f"{lead}\t\t-- children. The pipeline emits a sibling-style child\n"
+            f"{lead}\t\t-- Part (named TriggerZone) when the same GameObject\n"
+            f"{lead}\t\t-- mixes a visible mesh with a trigger collider, so\n"
+            f"{lead}\t\t-- the original approach-radius detection still fires\n"
+            f"{lead}\t\t-- without depending on Touched against the small\n"
+            f"{lead}\t\t-- visible mesh.\n"
+            f"{lead}\t\tfor _, _tc in ipairs({container}:GetChildren()) do\n"
+            f"{lead}\t\t\tif _tc:IsA(\"BasePart\") and not _tc:IsA(\"MeshPart\")\n"
+            f"{lead}\t\t\t\tand _tc.Transparency >= 1 then\n"
+            f"{lead}\t\t\t\t_tc.Touched:Connect(_onProximityTouched)\n"
+            f"{lead}\t\t\tend\n"
+            f"{lead}\t\tend\n"
             f"{lead}\telseif {container}:IsA(\"Model\") then\n"
             f"{lead}\t\tfor _, _d in ipairs({container}:GetDescendants()) do\n"
             f"{lead}\t\t\tif _d:IsA(\"BasePart\") then\n"
@@ -4299,6 +4318,89 @@ def _inject_proximity_trigger_fanout(scripts: list["RbxScript"]) -> int:
             "  Broadened proximity trigger in '%s' (container=%s arg=%s)",
             s.name, container, arg,
         )
+    return fixes
+
+
+# ---------------------------------------------------------------------------
+# Pack: proximity_trigger_fanout_v2_migration
+# ---------------------------------------------------------------------------
+#
+# The original ``proximity_trigger_fanout`` rewrite (v1) only wired
+# ``Touched`` on the container itself in the ``container:IsA("BasePart")``
+# branch — i.e. it assumed the trigger volume *was* the visible Part.
+#
+# That assumption broke when the pipeline started emitting a separate
+# transparent child ``TriggerZone`` Part for nodes that mix a visible
+# mesh with a trigger collider (see ``scene_converter._process_components``).
+# After the mesh-vs-trigger fix, the visible Part is mesh-sized; the
+# trigger volume lives in a child Part. Scripts running the v1 fanout
+# only fire ``Touched`` on the small visible mesh — Unity-style "walk
+# near the door" detection regresses to "step directly on the mesh".
+#
+# v2 fanout adds a child-walk in the BasePart branch that connects
+# ``Touched`` on any invisible non-MeshPart child (the TriggerZone).
+# This migration upgrades existing v1-rewritten scripts that still ship
+# the old shape — detected by presence of the marker + absence of the
+# ``_tc`` child-walk loop the v2 emit introduces. Idempotent.
+
+_PROXIMITY_FANOUT_V2_NEEDLE = "for _, _tc in ipairs("
+
+_PROXIMITY_FANOUT_V1_BASEPART_RE = re.compile(
+    r'(?P<lead>[ \t]*)if\s+(?P<container>[a-zA-Z_]\w*)\s*:\s*IsA\(\s*["\']BasePart["\']\s*\)\s+then\s*\n'
+    r'(?P<inner>[ \t]+)(?P=container)\s*\.\s*Touched\s*:\s*Connect\s*\(\s*_onProximityTouched\s*\)\s*\n',
+)
+
+
+def _detect_proximity_fanout_v2_migration(scripts: list["RbxScript"]) -> bool:
+    """Fires on any script with the v1 fanout marker that lacks the v2
+    ``_tc`` child-walk needle. Marker without needle == stale shape."""
+    for s in scripts:
+        src = s.source or ""
+        if (
+            _PROXIMITY_TRIGGER_MARKER in src
+            and _PROXIMITY_FANOUT_V2_NEEDLE not in src
+            and _PROXIMITY_FANOUT_V1_BASEPART_RE.search(src) is not None
+        ):
+            return True
+    return False
+
+
+@patch_pack(
+    name="proximity_trigger_fanout_v2_migration",
+    description="Upgrade v1 ``proximity_trigger_fanout`` rewrites to "
+    "also wire Touched on invisible trigger-volume children "
+    "(TriggerZone Parts emitted by the pipeline when a GameObject "
+    "mixes a visible mesh with a trigger collider).",
+    detect=_detect_proximity_fanout_v2_migration,
+)
+def _inject_proximity_fanout_v2_migration(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        src = s.source or ""
+        if (
+            _PROXIMITY_TRIGGER_MARKER not in src
+            or _PROXIMITY_FANOUT_V2_NEEDLE in src
+        ):
+            continue
+        m = _PROXIMITY_FANOUT_V1_BASEPART_RE.search(src)
+        if not m:
+            continue
+        inner = m.group("inner")
+        container = m.group("container")
+        insertion = (
+            f"{inner}-- v2: also wire Touched on invisible trigger-volume\n"
+            f"{inner}-- children (TriggerZone Parts emitted by the pipeline\n"
+            f"{inner}-- when the GameObject mixes a visible mesh + trigger).\n"
+            f"{inner}for _, _tc in ipairs({container}:GetChildren()) do\n"
+            f"{inner}\tif _tc:IsA(\"BasePart\") and not _tc:IsA(\"MeshPart\")\n"
+            f"{inner}\t\tand _tc.Transparency >= 1 then\n"
+            f"{inner}\t\t_tc.Touched:Connect(_onProximityTouched)\n"
+            f"{inner}\tend\n"
+            f"{inner}end\n"
+        )
+        s.source = src[: m.end()] + insertion + src[m.end():]
+        fixes += 1
+        log.info("  Migrated proximity fanout v1 -> v2 in '%s'", s.name)
     return fixes
 
 

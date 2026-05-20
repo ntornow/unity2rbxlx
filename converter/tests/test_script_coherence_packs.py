@@ -3473,6 +3473,112 @@ class TestProximityTriggerFanout:
     # handles Mine in fresh transpiles where the AI emits the bind
     # directly after the resolution.
 
+    def test_rewrite_emits_v2_child_walk_in_basepart_branch(self) -> None:
+        """v2 fanout: when ``container`` is a BasePart, the rewrite must
+        also wire ``Touched`` on any invisible non-MeshPart child Part
+        (the ``TriggerZone`` the pipeline emits when a node mixes a
+        visible mesh with a trigger collider). Without this loop, the
+        approach-radius detection collapses to direct-contact-only on
+        the small visible mesh — see SimpleFPS Beach doors before this
+        fix.
+        """
+        s = self._mine_shape()
+        fixes = packs_module._inject_proximity_trigger_fanout([s])
+        assert fixes == 1
+        assert "for _, _tc in ipairs(container:GetChildren()) do" in s.source
+        assert "_tc:IsA(\"BasePart\")" in s.source
+        assert "not _tc:IsA(\"MeshPart\")" in s.source
+        assert "_tc.Transparency >= 1" in s.source
+        assert "_tc.Touched:Connect(_onProximityTouched)" in s.source
+
+    def test_regex_tolerates_comment_between_if_and_touched(self) -> None:
+        """Regression: Door.luau's AI emits an
+        ``-- OnTriggerEnter ...`` line between ``if triggerPart then``
+        and the ``triggerPart.Touched`` binding. The original regex
+        rejected this shape and the door silently never got the fanout
+        — leaving the door's only working approach trigger pointed at
+        the small visible mesh.
+        """
+        s = RbxScript(
+            name="Door",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                "local container = script.Parent\n"
+                "local function findTriggerPart(p) return p end\n"
+                "local function toggleDoor(v) end\n"
+                "\n"
+                "local triggerPart = findTriggerPart(container)\n"
+                "\n"
+                "if triggerPart then\n"
+                "\t-- OnTriggerEnter — player with the key entered\n"
+                "\ttriggerPart.Touched:Connect(function(otherPart)\n"
+                "\t\tlocal player = Players:GetPlayerFromCharacter(otherPart.Parent)\n"
+                "\t\tif player and player:GetAttribute(\"hasKey\") then\n"
+                "\t\t\ttoggleDoor(true)\n"
+                "\t\tend\n"
+                "\tend)\n"
+                "\n"
+                "\t-- OnTriggerExit — player with the key left\n"
+                "\ttriggerPart.TouchEnded:Connect(function(otherPart) end)\n"
+                "end\n"
+            ),
+            script_type="Script",
+        )
+        fixes = packs_module._inject_proximity_trigger_fanout([s])
+        assert fixes == 1, "Door-shape (comment before .Touched) didn't match"
+        assert "_AutoProximityTriggerFanout" in s.source
+        assert "for _, _tc in ipairs(container:GetChildren()) do" in s.source
+        # The `rest` capture preserves the sibling TouchEnded handler.
+        assert "triggerPart.TouchEnded:Connect" in s.source
+
+    def test_v1_to_v2_migration_upgrades_old_marker_scripts(self) -> None:
+        """Migration pack: a script already rewritten by v1 of the
+        fanout (marker present, no ``_tc`` child-walk) must be
+        upgraded so it also wires Touched on invisible trigger
+        children. Without this, conversions that re-use cached
+        scripts ship with the v1 shape forever, even after the
+        pipeline starts emitting ``TriggerZone`` child Parts."""
+        v1_shape = RbxScript(
+            name="OldMine",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                "local container = script.Parent\n"
+                "local function findTriggerPart(p) return p end\n"
+                "\n"
+                "local triggerPart = findTriggerPart(container)\n"
+                "-- _AutoProximityTriggerFanout: connect Touched on every body\n"
+                "-- (v1 shape — does not yet walk children for TriggerZone)\n"
+                "local function _onProximityTouched(otherPart)\n"
+                "\tlocal char = otherPart:FindFirstAncestorWhichIsA(\"Model\")\n"
+                "end\n"
+                "if triggerPart then\n"
+                "\tif container:IsA(\"BasePart\") then\n"
+                "\t\tcontainer.Touched:Connect(_onProximityTouched)\n"
+                "\telseif container:IsA(\"Model\") then\n"
+                "\t\tfor _, _d in ipairs(container:GetDescendants()) do\n"
+                "\t\t\tif _d:IsA(\"BasePart\") then\n"
+                "\t\t\t\t_d.Touched:Connect(_onProximityTouched)\n"
+                "\t\t\tend\n"
+                "\t\tend\n"
+                "\tend\n"
+                "end\n"
+            ),
+            script_type="Script",
+        )
+        from converter.script_coherence_packs import (
+            _detect_proximity_fanout_v2_migration,
+            _inject_proximity_fanout_v2_migration,
+        )
+        # Detector fires: marker + missing _tc child-walk.
+        assert _detect_proximity_fanout_v2_migration([v1_shape]) is True
+        fixes = _inject_proximity_fanout_v2_migration([v1_shape])
+        assert fixes == 1
+        assert "for _, _tc in ipairs(container:GetChildren()) do" in v1_shape.source
+        assert "_tc.Touched:Connect(_onProximityTouched)" in v1_shape.source
+        # Idempotent: re-running doesn't double-insert.
+        again = _inject_proximity_fanout_v2_migration([v1_shape])
+        assert again == 0
+
 
 class TestDoorModulePlayerToAttribute:
     """door_module_player_to_attribute rewrites a Door script's

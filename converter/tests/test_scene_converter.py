@@ -1600,6 +1600,25 @@ class TestTriggerVsMeshSizeAuthority:
             assert part.attributes.get(axis, 0) > 10.0, (
                 f"{axis} not recorded ({part.attributes.get(axis)})"
             )
+        # And the trigger is also emitted as a transparent CHILD Part so
+        # ``Touched``-based detection still fires at the original radius
+        # (without it, Touched on the small visible mesh only fires on
+        # direct contact — breaks Unity's "walk near the door" pattern).
+        trigger_children = [c for c in part.children if c.name == "TriggerZone"]
+        assert len(trigger_children) == 1, (
+            f"expected 1 TriggerZone child, got {len(trigger_children)}"
+        )
+        tz = trigger_children[0]
+        assert tz.transparency == 1.0
+        assert tz.can_collide is False
+        assert tz.can_query is True
+        assert tz.can_touch is True
+        # Sized to the trigger sphere (~14.28 studs).
+        assert tz.size[0] > 10.0 and tz.size[1] > 10.0 and tz.size[2] > 10.0, (
+            f"TriggerZone size {tz.size} too small — expected ~14.28 stud sphere"
+        )
+        # Ball shape for SphereCollider.
+        assert tz.shape == 0
 
     def test_trigger_alone_still_sizes_part(self):
         """Backward compatibility: when the trigger is the ONLY sized

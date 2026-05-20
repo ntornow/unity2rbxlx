@@ -1750,12 +1750,28 @@ def _process_components(
                         part.cframe.z += trigger_offset[2]
                 else:
                     # A visible mesh or non-trigger collider owns the
-                    # Part's Size/visibility. Record the trigger volume
-                    # so scripts can implement Unity-style proximity
-                    # detection via ``workspace:GetPartBoundsInRadius`` /
-                    # OverlapParams instead of relying on Touched on the
-                    # small visible Part (which only fires on direct
-                    # contact).
+                    # Part's Size/visibility. Two outputs:
+                    #
+                    # 1. Record the trigger volume on the visible Part as
+                    #    ``_Trigger*`` attributes so scripts that want to
+                    #    do an explicit OverlapParams / GetPartBoundsInRadius
+                    #    sweep can read the original Unity volume.
+                    #
+                    # 2. Emit a transparent child Part sized to the trigger
+                    #    volume so the auto-injected ``Touched`` fanout
+                    #    (and the AI's literal ``triggerPart.Touched``
+                    #    binding) still fires at the original approach
+                    #    radius. Without this child, Touched only fires
+                    #    on direct contact with the small visible mesh —
+                    #    breaking Unity's "walk near the door" / "approach
+                    #    the proximity zone" patterns (concrete case:
+                    #    SimpleFPS Beach doors, whose ``base`` GameObject
+                    #    mixes a thin floor-pad mesh with a 6m trigger
+                    #    sphere on the same node).
+                    #
+                    # The child is named ``TriggerZone`` so the existing
+                    # ``findTriggerPart`` helper (which checks a set of
+                    # TRIGGER_NAMES first) discovers it.
                     if part.attributes is None:
                         part.attributes = {}
                     shape_map = {"SphereCollider": "Sphere",
@@ -1769,6 +1785,36 @@ def _process_components(
                         part.attributes["_TriggerCenterX"] = float(trigger_offset[0])
                         part.attributes["_TriggerCenterY"] = float(trigger_offset[1])
                         part.attributes["_TriggerCenterZ"] = float(trigger_offset[2])
+
+                    # Child trigger Part — invisible, non-colliding,
+                    # query+touch enabled. Placed at the parent's world
+                    # CFrame plus the trigger's local-space center offset
+                    # (matching the pre-fix code's un-rotated offset
+                    # behavior at line ~1748 above — a separate concern).
+                    trigger_child_cframe = RbxCFrame(
+                        x=part.cframe.x + trigger_offset[0],
+                        y=part.cframe.y + trigger_offset[1],
+                        z=part.cframe.z + trigger_offset[2],
+                        r00=part.cframe.r00, r01=part.cframe.r01, r02=part.cframe.r02,
+                        r10=part.cframe.r10, r11=part.cframe.r11, r12=part.cframe.r12,
+                        r20=part.cframe.r20, r21=part.cframe.r21, r22=part.cframe.r22,
+                    )
+                    trigger_child = RbxPart(
+                        name="TriggerZone",
+                        class_name="Part",
+                        cframe=trigger_child_cframe,
+                        size=trigger_size,
+                        transparency=1.0,
+                        anchored=part.anchored,
+                        can_collide=False,
+                        can_query=True,
+                        can_touch=True,
+                        cast_shadow=False,
+                        massless=True,
+                    )
+                    if ct == "SphereCollider":
+                        trigger_child.shape = 0  # Ball
+                    part.children.append(trigger_child)
             else:
                 # Apply each collider against the original size to avoid
                 # compounding when multiple colliders exist on one node.
