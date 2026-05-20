@@ -246,23 +246,31 @@ class TestFpsWeaponMountInjection:
         assert '_fpsRifle' in s.source
         assert 'rp:Clone' in s.source
 
-    def test_injection_seats_rifle_into_camera_rig(self) -> None:
-        """The equipped weapon must be seated into the converted Unity
-        camera rig (the ``_MainCameraRig`` Model that the auto-injected
-        CameraRigFollower pivots onto the live camera), not pinned to a
-        hardcoded camera offset with a bespoke per-weapon follower.
+    def test_injection_emits_per_frame_follower_and_welds(self) -> None:
+        """The equipped weapon must (1) weld every part to its
+        PrimaryPart so the assembly moves as one, (2) parent under
+        ``workspace`` with anchored parts, and (3) splice a per-frame
+        ``RenderStepped`` follower that pivots the assembly to the
+        camera each frame. This is the shape that has historically
+        produced a visible viewmodel; the rig-parenting design that
+        replaced it in commit ``fdb01c1`` looked cleaner but stopped
+        being visible after fresh AI-transpile runs.
         """
         s = self._stub_player_script()
         packs_module._inject_fps_weapon_mounts([s])
-        # Equip path locates the rig and seats the rifle into its slot.
-        assert 'GetAttribute("_MainCameraRig")' in s.source
-        assert 'rig:FindFirstChild("WeaponSlot", true)' in s.source
-        assert 'rifle.Parent = slot' in s.source
-        # No per-weapon RenderStepped follower — the rig follower owns
-        # camera tracking now. The old follower keyed on a primary-part
-        # var; its absence proves the bespoke follower is gone.
-        assert '_fpsRiflePrimary' not in s.source
-        assert 'if _fpsRifle and' not in s.source
+        # Welds every sub-part to the PrimaryPart.
+        assert 'WeldConstraint' in s.source
+        assert 'w.Part0 = p; w.Part1 = prim' in s.source
+        # Initial pose: camera-relative at clone time.
+        assert (
+            'rifle:PivotTo(workspace.CurrentCamera.CFrame * CFrame.new(0.5, -0.5, -3))'
+            in s.source
+        )
+        assert 'rifle.Parent = workspace' in s.source
+        # Per-frame follower spliced onto the player's RenderStepped.
+        assert 'RunService.RenderStepped:Connect(function(dt)' in s.source
+        assert '_fpsRifle:PivotTo(workspace.CurrentCamera.CFrame' in s.source
+        assert '_fpsRiflePrimary and _fpsRiflePrimary.Parent' in s.source
 
     def test_injection_marker_prevents_double_apply(self) -> None:
         s = self._stub_player_script()
@@ -319,7 +327,10 @@ class TestFpsWeaponMountInjection:
         assert fixes == 1, "WeaponMount pack must fire on camelCase function-statement shape"
         assert '_fpsRifle = rifle' in s.source, "rifle instance var must be assigned"
         assert 'rp:Clone' in s.source
-        assert 'rifle.Parent = slot' in s.source
+        # Camera-relative parent + the per-frame Render follower this
+        # transpiler shape used to produce.
+        assert 'rifle.Parent = workspace' in s.source
+        assert '_fpsRifle:PivotTo(workspace.CurrentCamera.CFrame' in s.source
 
     def test_injection_looks_up_template_in_replicated_storage_first(self) -> None:
         """The prefab-packages writer parks every Unity prefab under
