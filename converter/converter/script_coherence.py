@@ -1266,17 +1266,54 @@ def _expose_local_script_events(scripts: list[RbxScript]) -> int:
     #
     # The producer pass above already named each cross-script event
     # ``<Key>`` and parented it to ``script`` -- so a runtime lookup of
-    # ``LocalPlayer.PlayerScripts:WaitForChild("<Producer>"):WaitForChild
-    # ("<Key>").Event`` resolves to the same BindableEvent.Event the
-    # ``Player.HealthUpdate`` etc. table-field assignments hold inside
-    # the producer.
+    # the producer LocalScript's container :WaitForChild("<Producer>"):
+    # WaitForChild("<Key>").Event resolves to the same BindableEvent.Event
+    # the ``Player.HealthUpdate`` etc. table-field assignments hold
+    # inside the producer.
     if not producers:
         return fixes
+    # Match both ``local <var> = require(...XShared)`` and the
+    # ``<var> = require(...XShared)`` shape-B assignment the
+    # ``_AutoLocalScriptShim``'s descendant-loop rewrite emits.
+    # The ``(?:local\s+)?`` makes ``local`` optional so codex [P2] is
+    # closed: previously shape-B consumers slipped past the detector
+    # and crashed at runtime on ``shim_table.HealthUpdate:Connect``.
     shim_require_re = re.compile(
-        r'^[ \t]*local\s+(?P<var>\w+)\s*=\s*require\([^\n]*WaitForChild'
+        r'^[ \t]*(?:local\s+)?(?P<var>\w+)\s*=\s*require\([^\n]*WaitForChild'
         r'\(\s*["\'](?P<mod>\w+)Shared["\']\s*\)[^\n]*\)',
         re.MULTILINE,
     )
+
+    # Resolve each producer's runtime container from its ``parent_path``
+    # (set by ``storage_classifier`` and ``rbxlx_writer``). Producers
+    # land in ``StarterPlayer.StarterPlayerScripts`` for most projects,
+    # but a project that classifies the controller as
+    # character-attached routes it to ``StarterCharacterScripts``
+    # instead. The Roblox runtime mirrors those into
+    # ``LocalPlayer.PlayerScripts`` or character-rooted ``Character``,
+    # respectively. Codex [P2] flagged the previous hardcoded
+    # ``PlayerScripts`` chain as broken for any non-default routing.
+    def _runtime_lookup_for_producer(prod_name: str) -> str:
+        # Find the producer script's parent_path among the input set.
+        prod_script = next((p for p in scripts if p.name == prod_name), None)
+        parent_path = (
+            (prod_script.parent_path or "") if prod_script is not None else ""
+        )
+        if "StarterCharacterScripts" in parent_path:
+            # Mirrored at runtime into the live character Model.
+            return (
+                f'(game:GetService("Players").LocalPlayer.Character or '
+                f'game:GetService("Players").LocalPlayer.CharacterAdded:Wait()):'
+                f'WaitForChild({prod_name!r})'
+            )
+        # Default: client controllers live in StarterPlayerScripts,
+        # which Roblox mirrors into ``LocalPlayer.PlayerScripts`` at
+        # runtime.
+        return (
+            f'game:GetService("Players").LocalPlayer:WaitForChild'
+            f'("PlayerScripts"):WaitForChild({prod_name!r})'
+        )
+
     for s in scripts:
         if s.name in producers:
             continue
@@ -1291,15 +1328,15 @@ def _expose_local_script_events(scripts: list[RbxScript]) -> int:
             continue
         connections_rewritten = 0
         for var, prod in shim_bindings.items():
+            producer_lookup = _runtime_lookup_for_producer(prod)
             for key in producers[prod]:
                 pat = re.compile(rf'\b{re.escape(var)}\.{re.escape(key)}:Connect\(')
+                repl = (
+                    f'({producer_lookup}:WaitForChild({key!r}).Event):Connect('
+                )
 
-                def _repl(_m: "re.Match[str]", _var=var, _prod=prod, _key=key) -> str:
-                    return (
-                        f'(game:GetService("Players").LocalPlayer:WaitForChild'
-                        f'("PlayerScripts"):WaitForChild({_prod!r}):'
-                        f'WaitForChild({_key!r}).Event):Connect('
-                    )
+                def _repl(_m: "re.Match[str]", _repl=repl) -> str:
+                    return _repl
                 new_src, n = pat.subn(_repl, s.source)
                 if n:
                     s.source = new_src

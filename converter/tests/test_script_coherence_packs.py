@@ -321,6 +321,30 @@ class TestFpsWeaponMountInjection:
         assert 'rp:Clone' in s.source
         assert 'rifle.Parent = slot' in s.source
 
+    def test_injection_looks_up_template_in_replicated_storage_first(self) -> None:
+        """The prefab-packages writer parks every Unity prefab under
+        ``ReplicatedStorage.Templates`` with its Roblox asset name (e.g.
+        ``Rifle``) -- NOT the Unity serialized-field name (e.g.
+        ``riflePrefab``). Pre-fix the pack emitted only a workspace
+        lookup for the camelCase field name, which never resolved, and
+        the AI's ``getRifle()`` bailed silently after every pickup --
+        the rifle was "picked up" (Pickup destroyed itself) but never
+        mounted on the player.
+        """
+        s = self._stub_player_script()
+        packs_module._inject_fps_weapon_mounts([s])
+        # The lookup probes ReplicatedStorage.Templates first.
+        assert (
+            'game:GetService("ReplicatedStorage"):FindFirstChild("Templates")'
+            in s.source
+        ), "Templates lookup missing"
+        # The Rifle template name is what the prefab-packages writer
+        # used (``Rifle``, not ``riflePrefab``).
+        assert 'templates:FindFirstChild("Rifle")' in s.source
+        # Workspace lookups remain as fallback (some legacy outputs
+        # placed the prefab in workspace).
+        assert 'workspace:FindFirstChild("riflePrefab"' in s.source
+
 
 class TestPickupRemoteEventServerAttr:
     """The ``pickup_remote_event_server`` pack rewrites

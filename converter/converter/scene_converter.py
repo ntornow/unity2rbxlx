@@ -2321,6 +2321,26 @@ def _process_components(
 # Mesh resolution
 # ---------------------------------------------------------------------------
 
+def _embedded_key_candidates(relative: str, file_id: str) -> list[str]:
+    """Generate synthetic-key variants for an embedded-mesh lookup.
+
+    The canonical key is ``{relative}#{file_id}``. Windows produces
+    relative paths with backslashes; POSIX uses forward slashes. A
+    ``conversion_context.json`` cached on Windows would otherwise miss
+    every lookup on macOS/Linux when reused -- the ordinary FBX/OBJ
+    lookup below this branch already builds both slash directions, so
+    do the same for synthetic keys. Codex review [P3].
+    """
+    keys = []
+    seen: set[str] = set()
+    for variant in (relative, relative.replace("\\", "/"), relative.replace("/", "\\")):
+        k = f"{variant}#{file_id}"
+        if k not in seen:
+            keys.append(k)
+            seen.add(k)
+    return keys
+
+
 def _resolve_sub_mesh(
     mesh_guid: str,
     mesh_file_id: str | None,
@@ -2348,16 +2368,21 @@ def _resolve_sub_mesh(
     # Resolve them here before falling through to the FBX/OBJ path so
     # the per-sub-mesh lookup never sees an empty hierarchies dict
     # for them.
+    #
+    # Normalise slash directions: a Windows-keyed context (``Assets\
+    # Foo.prefab#123``) reused on macOS/Linux would otherwise miss the
+    # uploaded entry. Codex review [P3].
     if (mesh_file_id and asset_path.suffix.lower() in (".prefab", ".asset")
             and relative is not None):
-        embedded_key = f"{relative}#{mesh_file_id}"
-        if embedded_key in _ctx().mesh_hierarchies:
-            sub_meshes = _ctx().mesh_hierarchies[embedded_key]
-            if sub_meshes:
-                # Synthesised embedded meshes carry exactly one sub-mesh
-                # (the OBJ we uploaded), so the first entry is always
-                # the right one — no file_id-to-index math needed.
-                return sub_meshes[0]
+        for embedded_key in _embedded_key_candidates(str(relative), str(mesh_file_id)):
+            if embedded_key in _ctx().mesh_hierarchies:
+                sub_meshes = _ctx().mesh_hierarchies[embedded_key]
+                if sub_meshes:
+                    # Synthesised embedded meshes carry exactly one
+                    # sub-mesh (the OBJ we uploaded), so the first
+                    # entry is always the right one — no
+                    # file_id-to-index math needed.
+                    return sub_meshes[0]
 
     for key in ([str(relative), str(asset_path)] if relative else [str(asset_path)]):
         if key in _ctx().mesh_hierarchies:
@@ -2422,11 +2447,13 @@ def _resolve_mesh_id(
     # ``<rel>#<file_id>`` key by ``pipeline._upload_embedded_meshes``. Check
     # that first so the regular path-string lookup never falls back to a
     # cube-decal render when the synthesised OBJ has been uploaded.
+    # Normalised slash variants so a context cached on Windows still
+    # matches when loaded on macOS/Linux. Codex review [P3].
     if (mesh_file_id and asset_path.suffix.lower() in (".prefab", ".asset")
             and relative is not None):
-        embedded_key = f"{relative}#{mesh_file_id}"
-        if embedded_key in uploaded_assets:
-            return uploaded_assets[embedded_key]
+        for embedded_key in _embedded_key_candidates(str(relative), str(mesh_file_id)):
+            if embedded_key in uploaded_assets:
+                return uploaded_assets[embedded_key]
 
     candidates = [str(asset_path)]
     if relative:

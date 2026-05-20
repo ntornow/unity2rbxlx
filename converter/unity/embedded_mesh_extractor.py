@@ -635,11 +635,13 @@ def _strip_extra_geometries_and_dependents(roots: list, keep) -> None:
         surviving_objects.append(child)
     objects_node.children = surviving_objects
 
-    # Second pass: drop Models whose only Geometry connection points at
-    # a removed Geometry. We approximate by gathering Connection records
-    # first, then deleting any Object whose ID only appears in dropped
-    # connections. Cheap heuristic: also drop Materials/Textures that
-    # are only referenced by dropped Models.
+    # Second pass: walk Connections to identify which Models the dropped
+    # Geometries belonged to, then prune those Models from Objects too.
+    # Without the Model prune, Roblox's FBX importer still instantiates
+    # every Model entry as a separate MeshPart (even ones whose Geometry
+    # link was removed), so ``resolve_assets`` returns N sub-meshes
+    # where N == Model count in the template. Codex review [P1]:
+    # "delete orphaned Model nodes when collapsing template FBXs".
     connections_node = None
     for r in roots:
         if r.name == b"Connections":
@@ -648,9 +650,47 @@ def _strip_extra_geometries_and_dependents(roots: list, keep) -> None:
     if connections_node is None:
         return
 
-    # Build object_id -> referenced_ids map.
+    # First identify Models linked to dropped Geometries via Connections.
+    # FBX 7.x Connection records: "C" with three string-typed props
+    # (relation, src_id, dst_id); object connections are "OO".
+    models_to_drop: set = set()
+    for conn in connections_node.children:
+        if conn.name != b"C" or len(conn.properties) < 3:
+            continue
+        src_id = conn.properties[1].value
+        dst_id = conn.properties[2].value
+        if dst_id in dropped_ids:
+            # src is the Model parenting this dropped Geometry.
+            models_to_drop.add(src_id)
+        elif src_id in dropped_ids:
+            # src=Geometry, dst=Model -- same relationship, opposite
+            # FBX convention.
+            models_to_drop.add(dst_id)
+
+    # Don't drop a Model that ALSO connects to the kept Geometry.
+    for conn in connections_node.children:
+        if conn.name != b"C" or len(conn.properties) < 3:
+            continue
+        src_id = conn.properties[1].value
+        dst_id = conn.properties[2].value
+        if dst_id == keep_id:
+            models_to_drop.discard(src_id)
+        if src_id == keep_id:
+            models_to_drop.discard(dst_id)
+
+    # Prune those Models from Objects.
+    surviving_objects = []
+    for child in objects_node.children:
+        if child.name == b"Model" and child.properties:
+            obj_id = child.properties[0].value
+            if obj_id in models_to_drop:
+                dropped_ids.add(obj_id)
+                continue
+        surviving_objects.append(child)
+    objects_node.children = surviving_objects
+
+    # Final pass: drop Connection records pointing at any dropped object.
     surviving_connections = []
-    referenced_by_keep: set = set()
     for conn in connections_node.children:
         if conn.name != b"C" or len(conn.properties) < 3:
             surviving_connections.append(conn)
@@ -660,12 +700,6 @@ def _strip_extra_geometries_and_dependents(roots: list, keep) -> None:
         if src_id in dropped_ids or dst_id in dropped_ids:
             continue
         surviving_connections.append(conn)
-        # Track what the kept geometry connects to so we don't drop its
-        # Model/Material/Texture chain.
-        if dst_id == keep_id:
-            referenced_by_keep.add(src_id)
-        if src_id == keep_id:
-            referenced_by_keep.add(dst_id)
     connections_node.children = surviving_connections
 
 

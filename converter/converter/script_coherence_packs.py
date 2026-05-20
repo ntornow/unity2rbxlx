@@ -195,6 +195,22 @@ class WeaponMount:
                                # scene has no _MainCameraRig to seat into
     marker_tag: str            # composed into ``-- _FPS_<tag>`` for idempotency
     instance_var: str          # local that holds the cloned weapon Model
+    # Asset name of the prefab as parented under ``ReplicatedStorage.Templates``
+    # by the prefab-packages writer. Derived from ``prefab_name`` by
+    # stripping a trailing ``Prefab``/``prefab`` and capitalising; override
+    # explicitly when the canonical asset name diverges from that
+    # convention.
+    template_name: str = ""
+
+
+def _default_template_name(prefab_name: str) -> str:
+    for suffix in ("Prefab", "prefab"):
+        if prefab_name.endswith(suffix):
+            stem = prefab_name[: -len(suffix)]
+            break
+    else:
+        stem = prefab_name
+    return (stem[:1].upper() + stem[1:]) if stem else prefab_name
 
 
 # Today's registry: one entry for the SimpleFPS rifle.
@@ -207,6 +223,10 @@ WEAPON_MOUNTS: tuple[WeaponMount, ...] = (
         fallback_offset_expr="CFrame.new(0.5, -0.5, -3)",
         marker_tag="RIFLE_SYSTEM",
         instance_var="_fpsRifle",
+        # ReplicatedStorage.Templates.Rifle — the prefab packer's canonical
+        # asset name (derived would yield the same result for this entry,
+        # but spelling it out makes the registry self-documenting).
+        template_name="Rifle",
     ),
 )
 
@@ -474,11 +494,24 @@ def _apply_weapon_mount(s: "RbxScript", mount: WeaponMount) -> bool:
         # no per-weapon follower and no hardcoded offset. Seating order
         # of preference: the Unity "WeaponSlot" object inside the rig →
         # the rig Model itself → (no rig) a one-shot camera placement.
+        # Canonical lookup: ``ReplicatedStorage.Templates.<TemplateName>``.
+        # The prefab-packages writer parks every Unity prefab there with
+        # its Roblox asset name (e.g. ``Rifle``), not the Unity
+        # serialized-field name (e.g. ``riflePrefab``). Before this fix
+        # the emitted code looked in ``workspace`` for the Unity
+        # camelCase field, which never resolves -- the AI's
+        # ``getRifle()`` bailed silently after every pickup and the
+        # rifle never mounted.
+        template_name = mount.template_name or _default_template_name(mount.prefab_name)
         new_body = (
             f'{matched_header}\n'
             f'    if {mount.sentinel_var} then return end\n'
-            f'    local rp = workspace:FindFirstChild("{mount.prefab_name}", true)\n'
-            f'        or workspace:FindFirstChild("{alt}", true)\n'
+            f'    local rp = (function()\n'
+            f'        local templates = game:GetService("ReplicatedStorage"):FindFirstChild("Templates")\n'
+            f'        return (templates and templates:FindFirstChild("{template_name}"))\n'
+            f'            or workspace:FindFirstChild("{mount.prefab_name}", true)\n'
+            f'            or workspace:FindFirstChild("{alt}", true)\n'
+            f'    end)()\n'
             f'    if not rp then return end\n'
             f'    local rifle = rp:Clone()\n'
             f'    if rifle:IsA("Model") then rifle:ScaleTo({mount.scale_expr}) end\n'
