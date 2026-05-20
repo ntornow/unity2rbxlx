@@ -564,9 +564,32 @@ def materials(unity_project_path: str, output_dir: str) -> None:
               help="Anthropic API key (string or path to a key file).")
 @click.option("--no-ai", is_flag=True,
               help="Disable AI fallback; use rule-based transpilation only.")
+@click.option("--scene-runtime",
+              type=click.Choice(["legacy", "auto", "generic"]),
+              default="legacy",
+              show_default=True,
+              help="Scene-runtime contract mode. 'auto'/'generic' route "
+                   "through the contract pipeline (PR4); rejected at "
+                   "this CLI until then. Use "
+                   "``python -m converter.tools.scene_runtime_spike`` "
+                   "to exercise the verifier without a full conversion.")
 def transpile(unity_project_path: str, output_dir: str,
-              api_key: str | None, no_ai: bool) -> None:
+              api_key: str | None, no_ai: bool, scene_runtime: str) -> None:
     """Phase 3b: transpile C# scripts to Luau."""
+    # PR3a: reject non-legacy modes until the host runtime lands in PR4.
+    if scene_runtime != "legacy":
+        _emit({
+            "phase": "transpile",
+            "success": False,
+            "errors": [
+                f"--scene-runtime={scene_runtime!r} is not yet supported. "
+                f"The host runtime lands in PR4 of the scene-runtime "
+                f"effort. Use python tools/scene_runtime_spike.py "
+                f"to exercise the contract verifier.",
+            ],
+        })
+        sys.exit(1)
+
     if api_key:
         ak = Path(api_key)
         key_value = ak.read_text().strip() if ak.is_file() else api_key.strip()

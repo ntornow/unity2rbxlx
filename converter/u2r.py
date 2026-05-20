@@ -16,6 +16,33 @@ from utils.logging_config import setup_logging
 from utils.script_cache import scripts_cache_intact
 
 
+def _enforce_scene_runtime_legacy_until_pr4(value: str) -> None:
+    """Reject ``--scene-runtime=auto|generic`` until the host runtime lands.
+
+    PR3a wires the flag at every conversion front door so PR3b/PR4 can
+    flip on the contract pipeline without re-touching CLI surfaces. The
+    host runtime (``runtime/scene_runtime.luau``) doesn't exist yet
+    though -- emitting ``ModuleScript``-target Luau under generic
+    without a host that ``require``s and instantiates them would just
+    produce dead modules. Reject at the CLI with a pointer at the
+    compliance-spike tool, which can exercise the contract verifier
+    without needing the runtime.
+    """
+    if value != "legacy":
+        raise click.UsageError(
+            f"--scene-runtime={value!r} is not yet supported. The host "
+            f"runtime that consumes contract-compliant ModuleScripts "
+            f"lands in PR4 of the scene-runtime effort (see "
+            f"converter/docs/design/scene-runtime-contract.md). To run "
+            f"the contract verifier on a project without the host, "
+            f"use (from the converter/ directory):\n\n"
+            f"  python tools/scene_runtime_spike.py <project>\n\n"
+            f"This will emit a compliance-spike report (per-module pre/"
+            f"post-reprompt verifier pass rate) without attempting a "
+            f"full conversion."
+        )
+
+
 def _scan_rbxl_collision_fidelity_targets(rbxl_path: Path) -> list[dict]:
     """Extract MeshParts whose ``CollisionFidelity`` is non-Default
     directly from a published ``.rbxl`` file. Used by ``u2r publish``
@@ -266,6 +293,18 @@ def main(verbose: bool) -> None:
               "client/server architecture step (Step 4a); required to run "
               "a full conversion. For a complete, playable result use the "
               "/convert-unity skill instead.")
+@click.option("--scene-runtime",
+              type=click.Choice(["legacy", "auto", "generic"]),
+              default="legacy",
+              show_default=True,
+              help="Scene-runtime contract mode. 'legacy' is the pre-PR3 "
+                   "pipeline (default, byte-identical). 'generic' and "
+                   "'auto' route through the contract pipeline; they "
+                   "land in PR4 of the scene-runtime effort and are "
+                   "rejected at this CLI until then. Use "
+                   "``python -m converter.tools.scene_runtime_spike`` "
+                   "to exercise the contract verifier on real projects "
+                   "before PR4.")
 def convert(
     unity_project: str,
     output: str,
@@ -280,6 +319,7 @@ def convert(
     place_id: int | None,
     scaffolding: str | None,
     skip_architecture_step: bool,
+    scene_runtime: str,
 ) -> None:
     """Convert a Unity project to a Roblox experience.
 
@@ -294,6 +334,12 @@ def convert(
 
       python u2r.py convert path/to/UnityProject -o ./output --api-key ./apikey --creator-id ./creator_id --skip-architecture-step
     """
+    # PR3a: gate non-legacy scene-runtime modes at the CLI until the
+    # host runtime lands in PR4. Reject before any pipeline setup --
+    # there's no way to honor the request and the user needs to know
+    # right away. See ``_enforce_scene_runtime_legacy_until_pr4``.
+    _enforce_scene_runtime_legacy_until_pr4(scene_runtime)
+
     # u2r.py convert runs only Pipeline.PHASES, which never includes the
     # client/server architecture split ("Step 4a") — and a --phase resume
     # re-runs every incomplete prerequisite, so `--phase parse` on a fresh
@@ -1441,7 +1487,14 @@ def audit_assets(output_dir: str, api_key: str | None, fail_on_reject: bool) -> 
               help="Directory for per-project conversion outputs.")
 @click.option("--baseline", type=click.Path(), default=None,
               help="Path to write eval_baseline.json (default: eval_output/eval_baseline.json).")
-def eval_cmd(output: str, baseline: str | None) -> None:
+@click.option("--scene-runtime",
+              type=click.Choice(["legacy", "auto", "generic"]),
+              default="legacy",
+              show_default=True,
+              help="Scene-runtime contract mode. 'auto'/'generic' route "
+                   "through the contract pipeline (PR4); rejected at "
+                   "this CLI until then.")
+def eval_cmd(output: str, baseline: str | None, scene_runtime: str) -> None:
     """Convert all test projects and capture quality metrics.
 
     Converts every populated project under ../test_projects/ with --no-upload,
@@ -1455,6 +1508,8 @@ def eval_cmd(output: str, baseline: str | None) -> None:
 
     from converter.pipeline import Pipeline
     import config
+
+    _enforce_scene_runtime_legacy_until_pr4(scene_runtime)
 
     config.USE_AI_TRANSPILATION = False  # deterministic rule-based for eval
 
