@@ -454,6 +454,168 @@ def _get_fbx_unit_ratio(
     return 1.0
 
 
+# ---------------------------------------------------------------------------
+# Mesh sizing — one input shape, one unit system, one formula
+# ---------------------------------------------------------------------------
+#
+# Before this refactor, sizing had three branches (per-sub-mesh resolved,
+# overall FBX bbox, embedded AABB) each applying its own scale-factor chain
+# to ``size`` values whose units were not commented. Two of the branches
+# treated ``size`` as "FBX vertex units interpreted as studs by Roblox" and
+# multiplied by ``import_scale × unit_ratio × STUDS_PER_METER``; the third
+# treated ``size`` as Unity metres and multiplied by ``STUDS_PER_METER``
+# only. PR #121 shifted embedded meshes from the third branch into the
+# first without changing the data shape, and ``_get_fbx_import_scale``
+# returned its default ``0.01`` for ``.prefab`` paths — Sizes dropped 100×
+# to ~0.029 studs and the writer's 0.05 floor absorbed the underflow.
+# Codex's read: "sizing was dispatched by lookup success, not by geometry
+# provenance".
+#
+# This adapter normalises every source to ``native_meters`` (the mesh's
+# actual real-world extent in metres) before any consumer sees it. Each
+# source kind owns its own conversion math; consumers apply exactly one
+# formula:
+#
+#     Size = unity_scale × native_meters × STUDS_PER_METER
+#
+# Adding a new source kind in the future just means writing another
+# adapter branch that fills ``native_meters`` — there is no path for a
+# downstream caller to pick the wrong scale chain by mistake.
+
+@dataclass(frozen=True)
+class _ResolvedMeshGeometry:
+    """One mesh's normalised dimensions + identifiers.
+
+    ``native_meters`` is the mesh's bounding-box extent in Unity metres,
+    regardless of source (Roblox-resolved FBX, FBX trimesh bbox cache, or
+    Unity ``m_LocalAABB``). ``initial_size_studs`` is the value the caller
+    should set on ``MeshPart.InitialSize`` — for resolved sources this is
+    what Roblox reported; for the embedded-AABB fallback we still use the
+    raw extent (it's what callers historically wrote).
+    """
+    native_meters: tuple[float, float, float]
+    initial_size_studs: tuple[float, float, float]
+    mesh_id: str | None = None
+    texture_id: str | None = None
+    provenance: str = ""   # "resolved_submesh" | "resolved_overall" | "fbx_bbox" | "embedded_aabb"
+
+
+def _native_meters_from_roblox_size(
+    roblox_size: tuple[float, float, float],
+    mesh_guid: str,
+    guid_index: GuidIndex,
+    asset_path: Path,
+) -> tuple[float, float, float]:
+    """Convert a Roblox-reported MeshPart size into Unity metres.
+
+    For ``.fbx``/``.obj`` uploads, Roblox interprets FBX vertex units as
+    studs, so the right conversion is ``size_studs × import_scale ×
+    unit_ratio`` (where import_scale × unit_ratio is the ``.meta``-derived
+    FBX-to-metres ratio). For ``.prefab``/``.asset`` embedded uploads,
+    we synthesise the FBX with vertex coords already in metres and the
+    ``.meta``-style scale doesn't apply — ``_get_fbx_import_scale`` /
+    ``_get_fbx_unit_ratio`` are owned by this adapter, NOT by the
+    callers, so a downstream regression can't reintroduce a 100× error
+    by accident.
+    """
+    if asset_path.suffix.lower() in (".prefab", ".asset"):
+        # Already metres (our synthesised FBX wrote metric vertex coords;
+        # ``_get_fbx_import_scale`` returns 1.0 for this case too, but
+        # short-circuiting here makes the unit invariant explicit).
+        return roblox_size
+    import_scale = _get_fbx_import_scale(mesh_guid, guid_index)
+    unit_ratio = _get_fbx_unit_ratio(mesh_guid, guid_index)
+    return (
+        roblox_size[0] * import_scale * unit_ratio,
+        roblox_size[1] * import_scale * unit_ratio,
+        roblox_size[2] * import_scale * unit_ratio,
+    )
+
+
+def _resolve_mesh_geometry(
+    mesh_guid: str,
+    guid_index: GuidIndex,
+    mesh_native_sizes: dict[str, tuple[float, float, float]],
+    mesh_file_id: str | None = None,
+    mesh_name: str | None = None,
+) -> _ResolvedMeshGeometry | None:
+    """Single dispatch from ``(mesh_guid, file_id)`` to a normalised
+    geometry record. Tries resolved-sub-mesh first, then resolved-overall,
+    then FBX trimesh bbox, then embedded-YAML AABB. Returns None when
+    nothing knows about this mesh.
+    """
+    asset_path = guid_index.resolve(mesh_guid)
+    if asset_path is None:
+        return None
+
+    # 1. Resolved sub-mesh via mesh_hierarchies. Mesh hierarchies that
+    # came from older context files may lack ``size`` (only ``position``
+    # and ``fileID`` were stored historically); skip them so the next
+    # adapter has a chance.
+    if mesh_file_id and _ctx().mesh_hierarchies:
+        sub_mesh = _resolve_sub_mesh(
+            mesh_guid, mesh_file_id, guid_index, mesh_name=mesh_name,
+        )
+        if sub_mesh and isinstance(sub_mesh.get("size"), (list, tuple)) and len(sub_mesh["size"]) >= 3:
+            roblox_size = (
+                float(sub_mesh["size"][0]),
+                float(sub_mesh["size"][1]),
+                float(sub_mesh["size"][2]),
+            )
+            return _ResolvedMeshGeometry(
+                native_meters=_native_meters_from_roblox_size(
+                    roblox_size, mesh_guid, guid_index, asset_path,
+                ),
+                initial_size_studs=roblox_size,
+                mesh_id=sub_mesh.get("meshId"),
+                texture_id=sub_mesh.get("textureId") or None,
+                provenance="resolved_submesh",
+            )
+
+    # 2. Resolved overall mesh via mesh_native_sizes (legacy single-mesh path).
+    relative = guid_index.resolve_relative(mesh_guid)
+    for key in [str(relative), str(asset_path)] if relative else [str(asset_path)]:
+        if key in mesh_native_sizes:
+            roblox_size = tuple(mesh_native_sizes[key])  # type: ignore[assignment]
+            return _ResolvedMeshGeometry(
+                native_meters=_native_meters_from_roblox_size(
+                    roblox_size, mesh_guid, guid_index, asset_path,
+                ),
+                initial_size_studs=roblox_size,
+                provenance="resolved_overall",
+            )
+
+    # 3. FBX bbox from trimesh cache.
+    if _ctx().fbx_bounding_boxes and asset_path.suffix.lower() in (".fbx", ".obj"):
+        bbox = None
+        for key in ([str(relative), str(asset_path)]
+                    if relative else [str(asset_path)]):
+            if key in _ctx().fbx_bounding_boxes:
+                bbox = _ctx().fbx_bounding_boxes[key]
+                break
+        if bbox is not None:
+            roblox_size = (bbox[0], bbox[1], bbox[2])
+            return _ResolvedMeshGeometry(
+                native_meters=_native_meters_from_roblox_size(
+                    roblox_size, mesh_guid, guid_index, asset_path,
+                ),
+                initial_size_studs=roblox_size,
+                provenance="fbx_bbox",
+            )
+
+    # 4. Embedded ``!u!43`` AABB inside a ``.prefab``/``.asset``.
+    if asset_path.suffix.lower() in (".prefab", ".asset"):
+        aabb = _read_embedded_mesh_aabb(asset_path, mesh_file_id)
+        if aabb is not None:
+            return _ResolvedMeshGeometry(
+                native_meters=aabb,                 # already metres
+                initial_size_studs=aabb,            # callers historically wrote this
+                provenance="embedded_aabb",
+            )
+
+    return None
+
+
 def _compute_mesh_size(
     unity_scale: tuple[float, float, float],
     mesh_guid: str,
@@ -462,64 +624,29 @@ def _compute_mesh_size(
     mesh_file_id: str | None = None,
     mesh_name: str | None = None,
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
-    """Compute Roblox MeshPart Size and InitialSize from Unity + Roblox data.
+    """Compute Roblox MeshPart Size and InitialSize.
 
-    Requires native sizes from Roblox LoadAsset (populated by the resolve step).
+    All source dispatch lives in ``_resolve_mesh_geometry``; here we apply
+    the single canonical formula::
 
-    When ``mesh_file_id`` is provided and the FBX has multiple sub-meshes in
-    mesh_hierarchies, uses the specific sub-mesh's native dimensions instead
-    of the overall FBX bounding box. Without this, all sub-meshes (frame, door,
-    base) would get the same size, causing overlapping/stretched geometry.
+        Size = abs(unity_scale) × native_meters × STUDS_PER_METER
 
-    InitialSize = native mesh bounding box from Roblox
-    Size = InitialSize × import_scale × unity_scale × STUDS_PER_METER
-    Roblox renders at Size/InitialSize = import_scale × unity_scale × STUDS_PER_METER
-
-    Returns (size, initial_size) or None if the mesh is not in native_sizes.
+    Returns ``(size, initial_size)`` or ``None`` if the mesh is unknown
+    to every source adapter.
     """
-    asset_path = guid_index.resolve(mesh_guid)
-    if not asset_path:
+    geo = _resolve_mesh_geometry(
+        mesh_guid, guid_index, mesh_native_sizes,
+        mesh_file_id=mesh_file_id, mesh_name=mesh_name,
+    )
+    if geo is None:
         return None
-
-    # Try per-sub-mesh sizing via mesh_hierarchies first
-    if mesh_file_id and _ctx().mesh_hierarchies:
-        sub_mesh = _resolve_sub_mesh(mesh_guid, mesh_file_id, guid_index, mesh_name=mesh_name)
-        if sub_mesh:
-            native = (sub_mesh["size"][0], sub_mesh["size"][1], sub_mesh["size"][2])
-            import_scale = _get_fbx_import_scale(mesh_guid, guid_index)
-            unit_ratio = _get_fbx_unit_ratio(mesh_guid, guid_index)
-            scale_factor = import_scale * unit_ratio * config.STUDS_PER_METER
-            size = (
-                abs(unity_scale[0]) * native[0] * scale_factor,
-                abs(unity_scale[1]) * native[1] * scale_factor,
-                abs(unity_scale[2]) * native[2] * scale_factor,
-            )
-            return size, native
-
-    # Fallback: use the overall FBX bounding box from mesh_native_sizes
-    relative = guid_index.resolve_relative(mesh_guid)
-    for key in [str(relative), str(asset_path)] if relative else [str(asset_path)]:
-        if key in mesh_native_sizes:
-            native = mesh_native_sizes[key]
-            import_scale = _get_fbx_import_scale(mesh_guid, guid_index)
-            unit_ratio = _get_fbx_unit_ratio(mesh_guid, guid_index)
-            initial_size = (native[0], native[1], native[2])
-            scale_factor = import_scale * unit_ratio * config.STUDS_PER_METER
-            size = (
-                abs(unity_scale[0]) * initial_size[0] * scale_factor,
-                abs(unity_scale[1]) * initial_size[1] * scale_factor,
-                abs(unity_scale[2]) * initial_size[2] * scale_factor,
-            )
-            return size, initial_size
-
-    # Fallback: meshes embedded directly in a .prefab/.asset (legacy Asset
-    # Store packs) are never uploaded, so they have no native_sizes entry.
-    embedded = _compute_mesh_size_from_embedded_aabb(
-        unity_scale, mesh_guid, guid_index, mesh_file_id)
-    if embedded:
-        return embedded
-
-    return None
+    spm = config.STUDS_PER_METER
+    size = (
+        abs(unity_scale[0]) * geo.native_meters[0] * spm,
+        abs(unity_scale[1]) * geo.native_meters[1] * spm,
+        abs(unity_scale[2]) * geo.native_meters[2] * spm,
+    )
+    return size, geo.initial_size_studs
 
 
 def _compute_mesh_size_from_fbx_bbox(
@@ -528,65 +655,32 @@ def _compute_mesh_size_from_fbx_bbox(
     guid_index: GuidIndex,
     mesh_file_id: str | None = None,
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
-    """Estimate Roblox MeshPart Size and InitialSize from FBX bounding box data.
+    """Estimate Roblox MeshPart Size and InitialSize when Studio asset
+    resolution is unavailable.
 
-    When Studio asset resolution is unavailable, we use trimesh-computed bounding
-    boxes as an approximation for InitialSize.  Roblox imports FBX vertex
-    positions directly, so the bounding box of the FBX geometry (in file units)
-    closely matches what Roblox reports as InitialSize (in studs).
+    Just delegates to ``_resolve_mesh_geometry``; the FBX trimesh bbox
+    branch lives there now (post-Commit-B refactor). Kept as a thin
+    wrapper so existing callers that haven't been migrated to the new
+    formula don't break, and so the call-site choice between "with
+    Studio resolution" (``_compute_mesh_size``) and "without"
+    (``_compute_mesh_size_from_fbx_bbox``) is still meaningful at the
+    call sites — the adapter falls through gracefully in both cases.
 
-    The formula mirrors _compute_mesh_size:
-        InitialSize ≈ fbx_bounding_box  (FBX file units ≈ Roblox studs)
-        Size = InitialSize × import_scale × unit_ratio × STUDS_PER_METER × unity_scale
-
-    ``mesh_file_id`` is forwarded to the embedded-mesh fallback so multi-mesh
-    legacy assets resolve to the right sub-mesh.
-
-    Returns (size, initial_size) or None if no bounding box is available.
+    Returns (size, initial_size) or None if no source knows the mesh.
     """
-    # Meshes embedded in a .prefab/.asset are never uploaded and have no FBX
-    # bbox; recover their size from the serialized Mesh AABB instead. This
-    # also covers conversions that resolved no meshes at all (mesh_native_sizes
-    # empty), where _compute_mesh_size is skipped and this is the first stop.
-    embedded = _compute_mesh_size_from_embedded_aabb(
-        unity_scale, mesh_guid, guid_index, mesh_file_id)
-    if embedded:
-        return embedded
-
-    if not _ctx().fbx_bounding_boxes:
-        return None
-
-    asset_path = guid_index.resolve(mesh_guid)
-    if not asset_path:
-        return None
-
-    relative = guid_index.resolve_relative(mesh_guid)
-    bbox = None
-    for key in [str(relative), str(asset_path)] if relative else [str(asset_path)]:
-        if key in _ctx().fbx_bounding_boxes:
-            bbox = _ctx().fbx_bounding_boxes[key]
-            break
-
-    if bbox is None:
-        return None
-
-    import_scale = _get_fbx_import_scale(mesh_guid, guid_index)
-    unit_ratio = _get_fbx_unit_ratio(mesh_guid, guid_index)
-
-    # FBX bbox is in file units.  Roblox's InitialSize for an uploaded FBX
-    # equals the raw vertex bounding box, so bbox ≈ InitialSize in studs.
-    initial_size = (bbox[0], bbox[1], bbox[2])
-
-    # Size = how we want Roblox to render the mesh.
-    # Roblox applies Size/InitialSize as the visual scale factor.
-    # We want: visual_scale = import_scale × unit_ratio × STUDS_PER_METER × unity_scale
-    scale_factor = import_scale * unit_ratio * config.STUDS_PER_METER
-    size = (
-        abs(unity_scale[0]) * initial_size[0] * scale_factor,
-        abs(unity_scale[1]) * initial_size[1] * scale_factor,
-        abs(unity_scale[2]) * initial_size[2] * scale_factor,
+    geo = _resolve_mesh_geometry(
+        mesh_guid, guid_index, mesh_native_sizes={},
+        mesh_file_id=mesh_file_id,
     )
-    return size, initial_size
+    if geo is None:
+        return None
+    spm = config.STUDS_PER_METER
+    size = (
+        abs(unity_scale[0]) * geo.native_meters[0] * spm,
+        abs(unity_scale[1]) * geo.native_meters[1] * spm,
+        abs(unity_scale[2]) * geo.native_meters[2] * spm,
+    )
+    return size, geo.initial_size_studs
 
 
 # Cache of {asset_path: {mesh_fileID: native_size_metres}} for embedded
