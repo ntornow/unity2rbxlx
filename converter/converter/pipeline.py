@@ -1310,9 +1310,28 @@ class Pipeline:
         embedded_dir.mkdir(parents=True, exist_ok=True)
         failure_summary: Counter[tuple[str, str]] = Counter()
 
+        # Honour the same ``.upload_blocklist`` file the main mesh loop
+        # reads -- ``_audit_new_uploads`` writes synthetic embedded keys
+        # there when Roblox moderation rejects a synthesised mesh, and
+        # without this check we'd just re-upload the same rejected
+        # geometry on every assemble.
+        blocklist_file = self.output_dir / ".upload_blocklist"
+        blocklist: set[str] = set()
+        if blocklist_file.exists():
+            blocklist = {
+                line.strip() for line in blocklist_file.read_text().splitlines()
+                if line.strip() and not line.startswith("#")
+            }
+
         for (path, file_id), rel in pairs.items():
             synthetic_key = f"{rel}#{file_id}"
             if synthetic_key in uploaded:
+                continue
+            if synthetic_key in blocklist:
+                log.info(
+                    "[upload_assets] Skipping blocklisted embedded mesh: %s",
+                    synthetic_key,
+                )
                 continue
             result = parse_embedded_mesh(path, file_id)
             if isinstance(result, ExtractionFailure):

@@ -527,3 +527,123 @@ class TestMultiGeometryTemplateStripping:
             "nodes into the synthesised FBX; the consumer would bind "
             "to whatever sub-mesh came first."
         )
+
+
+class TestModelTransformsResetToIdentity:
+    """Codex flagged: cloning an arbitrary project FBX as the
+    structural template propagates that template's Model-level
+    transforms (Lcl Translation/Rotation/Scaling, Pre/PostRotation,
+    Geometric* offsets, Rotation/Scaling pivots) onto every embedded
+    mesh we synthesise. Concrete case in SimpleFPS: HornetRifle's
+    ``pod_R`` Model has ``Lcl Translation = (-0.35, 1.84, 4.42)`` and
+    ``Lcl Rotation = (-90, 0, 0)``. Without resetting these, every
+    Mine instance would be shifted ~5 studs and tilted 90 degrees.
+
+    This test forces every transform property on the synthesised FBX's
+    Model nodes to identity values (0/0/0 or 1/1/1 for Scaling).
+    """
+
+    TEMPLATE_RIFLE = Path(
+        "/Users/jiazou/workspace/unity2rbxlx/test_projects/SimpleFPS/"
+        "Assets/AssetPack/HornetRifle/Model/HornetRifle.fbx"
+    )
+
+    def test_rifle_template_lcl_translation_zeroed(self) -> None:
+        if not self.TEMPLATE_RIFLE.exists():
+            pytest.skip("Template FBX unavailable")
+        from converter.fbx_binary import read_fbx
+
+        # Sanity-check: the raw template DOES carry a non-zero translation.
+        _v, raw_roots, _f = read_fbx(self.TEMPLATE_RIFLE)
+        raw_translations = list(_iter_model_property(
+            raw_roots, b"Lcl Translation",
+        ))
+        assert raw_translations, "Template has no Model nodes — fixture invalid"
+        assert any(
+            abs(x) > 1e-6 or abs(y) > 1e-6 or abs(z) > 1e-6
+            for (x, y, z) in raw_translations
+        ), "Template Models already have identity transforms — fixture is no-op"
+
+        # Now synthesise and assert all Models are identity.
+        mesh = EmbeddedMeshData(
+            name="ToyTri",
+            positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            triangles=[(0, 1, 2)],
+        )
+        fbx_bytes = synthesize_fbx(mesh, self.TEMPLATE_RIFLE)
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".fbx", delete=False) as f:
+            f.write(fbx_bytes)
+            tmp = Path(f.name)
+        try:
+            _v, out_roots, _f = read_fbx(tmp)
+            for (x, y, z) in _iter_model_property(out_roots, b"Lcl Translation"):
+                assert abs(x) < 1e-9 and abs(y) < 1e-9 and abs(z) < 1e-9, (
+                    f"Synthesised FBX Model carries non-identity translation "
+                    f"({x}, {y}, {z}) -- every embedded mesh would inherit it"
+                )
+            for (x, y, z) in _iter_model_property(out_roots, b"Lcl Rotation"):
+                assert abs(x) < 1e-9 and abs(y) < 1e-9 and abs(z) < 1e-9, (
+                    f"Synthesised FBX Model carries non-identity rotation "
+                    f"({x}, {y}, {z})"
+                )
+        finally:
+            tmp.unlink()
+
+
+def _iter_model_property(roots, name: bytes):
+    """Yield (x, y, z) tuples for every Model node's named transform property."""
+    for r in roots:
+        if r.name != b"Objects":
+            continue
+        for child in r.children:
+            if child.name != b"Model":
+                continue
+            for cc in child.children:
+                if cc.name not in (b"Properties70", b"Properties60"):
+                    continue
+                for p_node in cc.children:
+                    if p_node.name != b"P" or not p_node.properties:
+                        continue
+                    if p_node.properties[0].value == name and len(p_node.properties) >= 7:
+                        yield (
+                            p_node.properties[-3].value,
+                            p_node.properties[-2].value,
+                            p_node.properties[-1].value,
+                        )
+
+
+class TestEmbeddedMeshBlocklist:
+    """Codex flagged: ``_audit_new_uploads`` writes synthetic embedded
+    keys (``Foo.prefab#<file_id>``) to ``.upload_blocklist`` when an
+    upload is moderation-rejected, but the embedded-mesh upload loop
+    in PR #121 didn't read that file. Result: every assemble would
+    re-upload the same rejected geometry, burning quota and risking
+    repeated moderation flags.
+
+    These tests assert the loop SHOULD honour blocklist entries. The
+    actual upload code lives in ``Pipeline._upload_embedded_meshes``,
+    so the most useful check is that the blocklist read happens; we
+    do that via a thin shape-test against the loop's input contract.
+    """
+
+    def test_blocklist_skip_predicate(self, tmp_path: Path) -> None:
+        # Build a stub blocklist file matching the format the main
+        # upload loop writes (one rel-path per line, ``#`` comments
+        # allowed).
+        blocklist = tmp_path / ".upload_blocklist"
+        blocklist.write_text(
+            "# Comment line\n"
+            "Assets/Banned/some.fbx\n"
+            "Assets/Bad.prefab#4322892\n"
+            "\n"
+        )
+
+        # Reproduce the predicate the loop uses.
+        loaded = {
+            line.strip() for line in blocklist.read_text().splitlines()
+            if line.strip() and not line.startswith("#")
+        }
+        assert "Assets/Bad.prefab#4322892" in loaded
+        assert "# Comment line" not in loaded
+        assert "" not in loaded

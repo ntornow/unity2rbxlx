@@ -538,6 +538,65 @@ def _sanitize_name(name: str) -> str:
     return _NAME_SAFE_RE.sub("_", name) or "mesh"
 
 
+_TRANSFORM_PROP_NAMES = frozenset({
+    b"Lcl Translation", b"Lcl Rotation", b"Lcl Scaling",
+    b"PreRotation", b"PostRotation",
+    b"GeometricTranslation", b"GeometricRotation", b"GeometricScaling",
+    b"RotationOffset", b"ScalingOffset", b"RotationPivot", b"ScalingPivot",
+})
+
+
+def _identity_transform_props_on_models(roots: list) -> None:
+    """Reset every Model node's Lcl/Geometric/Pivot transform props to
+    identity.
+
+    The arbitrary-FBX template we clone (any project FBX with a Geometry
+    node) carries the original Model's translation/rotation/scaling --
+    e.g. HornetRifle's ``pod_R`` Model has ``Lcl Translation =
+    (-0.35, 1.84, 4.42)`` and ``Lcl Rotation = (-90, 0, 0)``. Without
+    this reset, every synthesised embedded mesh would inherit that
+    transform and land shifted/rotated relative to its scene placement.
+
+    Identity values:
+        Lcl Translation / Lcl Rotation / PreRotation / PostRotation /
+        Geometric* / *Offset / *Pivot → 0,0,0
+        Lcl Scaling                                                → 1,1,1
+    """
+    for r in roots:
+        if r.name != b"Objects":
+            continue
+        for child in r.children:
+            if child.name != b"Model":
+                continue
+            for cc in child.children:
+                if cc.name not in (b"Properties70", b"Properties60"):
+                    continue
+                for p_node in cc.children:
+                    if p_node.name != b"P" or not p_node.properties:
+                        continue
+                    pname = p_node.properties[0].value
+                    if pname not in _TRANSFORM_PROP_NAMES:
+                        continue
+                    # P-node properties layout (FBX 7.x):
+                    #   [name, type, sub_type, flags, x, y, z]
+                    # The last 3 are the vector components we override.
+                    if len(p_node.properties) >= 7:
+                        identity_z = (
+                            1.0 if pname == b"Lcl Scaling" else 0.0
+                        )
+                        identity_xy = (
+                            1.0 if pname == b"Lcl Scaling" else 0.0
+                        )
+                        # Each component is a Property dataclass; rebuild
+                        # type_code as 'D' (Float64) which FBX uses for
+                        # transform vectors.
+                        for idx, val in zip(
+                            (4, 5, 6), (identity_xy, identity_xy, identity_z),
+                        ):
+                            p_node.properties[idx].type_code = "D"
+                            p_node.properties[idx].value = val
+
+
 def _strip_extra_geometries_and_dependents(roots: list, keep) -> None:
     """Reduce a multi-Geometry FBX template to a single Geometry.
 
@@ -671,6 +730,7 @@ def synthesize_fbx(mesh: EmbeddedMeshData, template_fbx_path: Path) -> bytes:
     # MeshPart on the Roblox side.
     geo = geometries[0]
     _strip_extra_geometries_and_dependents(roots, keep=geo)
+    _identity_transform_props_on_models(roots)
 
     # Vertices: Float64 array (FBX type 'd'), flat (x1, y1, z1, x2, ...).
     verts_flat: list[float] = []
