@@ -598,8 +598,9 @@ def materials(unity_project_path: str, output_dir: str) -> None:
               show_default=True,
               help="Scene-runtime contract mode. 'legacy' is the pre-PR3 "
                    "pipeline (default). 'generic' routes through PR4's "
-                   "host runtime (Piece 6 services). 'auto' is reserved "
-                   "for PR5 and currently rejected.")
+                   "host runtime (Piece 6 services). 'auto' (PR5) routes "
+                   "through generic by default and falls back to legacy "
+                   "on any fail-closed signal.")
 @click.option("--clean", is_flag=True,
               help="PR3b: wipe + re-stamp the output dir before "
               "transpiling (mode-mismatch remediation).")
@@ -779,8 +780,9 @@ def validate(output_dir: str, write: bool) -> None:
               default="legacy",
               show_default=True,
               help="Scene-runtime contract mode. 'generic' routes "
-                   "through PR4's host runtime. 'auto' is reserved "
-                   "for PR5 and currently rejected.")
+                   "through PR4's host runtime. 'auto' (PR5) routes "
+                   "through generic by default and falls back to legacy "
+                   "on any fail-closed signal.")
 @click.option("--clean", is_flag=True,
               help="PR3b: wipe + re-stamp the output dir before "
               "assembling (mode-mismatch remediation).")
@@ -927,8 +929,9 @@ def assemble(unity_project_path: str, output_dir: str,
               default="legacy",
               show_default=True,
               help="Scene-runtime contract mode. Must match the output "
-                   "dir's stamp (or pass --clean). 'auto' reserved "
-                   "for PR5.")
+                   "dir's stamp (or pass --clean). 'auto' (PR5) routes "
+                   "through generic by default and falls back to legacy "
+                   "on any fail-closed signal.")
 @click.option("--clean", is_flag=True,
               help="PR3b: wipe + re-stamp the output dir before "
               "uploading (mode-mismatch remediation).")

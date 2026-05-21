@@ -3810,6 +3810,21 @@ script.Disabled = true
         # ``ctx.scene_runtime_mode = "generic"`` or, for the narrow
         # case of probing classify_storage in isolation, by setting
         # ``scene_runtime["__skip_domain_classifier__"] = True``.
+        #
+        # PR5 / R1-P1 (codex round 1): on auto-mode, snapshot the
+        # pre-classifier ``parent_path`` for every script BEFORE the
+        # classifier mutates them (the reachability sub-pass can hoist
+        # ``ServerStorage`` helpers to ``ReplicatedStorage`` -- a
+        # generic-only routing decision). ``_check_auto_fail_closed``
+        # later restores the snapshot when it falls back to legacy so
+        # the legacy .rbxlx doesn't ship with generic storage routing.
+        # The snapshot is only taken under auto -- explicit
+        # ``--scene-runtime=generic`` runs accept the classifier
+        # mutations as intended (and have no fallback path).
+        if self.ctx.scene_runtime_mode == "auto" and self.state.rbx_place.scripts:
+            self._auto_parent_path_snapshot = {
+                s.name: s.parent_path for s in self.state.rbx_place.scripts
+            }
         if (
             self.ctx.scene_runtime_mode != "legacy"
             and scene_runtime.get("modules")
@@ -4443,11 +4458,27 @@ script.Disabled = true
         try:
             script_infos = analyze_all_scripts(self.unity_project_path)
         except Exception as exc:  # noqa: BLE001
+            # PR5 / R1-P2 (codex round 1): on script_analyzer
+            # failure we cannot PROVE the project is safe for generic
+            # mode, so fall back to legacy rather than fail-open to
+            # generic. The fallback restores pre-classifier parent
+            # paths via the snapshot taken in ``_classify_storage``
+            # so the legacy .rbxlx doesn't carry generic storage
+            # routing.
             log.warning(
                 "[auto] script_analyzer failed during fail-closed scan "
-                "(%s); routing through generic without signal check", exc,
+                "(%s); falling back to legacy (cannot prove generic "
+                "safety without the fresh script list)", exc,
             )
-            self.ctx.scene_runtime_mode = "generic"
+            scene_runtime["auto_fail_closed"] = [{
+                "kind": "script_analyzer_failure",
+                "detail": (
+                    f"analyze_all_scripts raised {type(exc).__name__}: "
+                    f"{exc}"
+                ),
+            }]
+            self._restore_auto_parent_paths()
+            self.ctx.scene_runtime_mode = "legacy"
             return
 
         fail_closed = detect_fail_closed_signals(
@@ -4487,7 +4518,45 @@ script.Disabled = true
             "[auto] fallback summary by kind: %s",
             ", ".join(f"{k}={v}" for k, v in sorted(by_kind.items())),
         )
+        # PR5 / R1-P1: restore the pre-classifier parent_path snapshot
+        # so the legacy fallback .rbxlx doesn't ship with generic
+        # storage routing the classifier injected.
+        self._restore_auto_parent_paths()
         self.ctx.scene_runtime_mode = "legacy"
+
+    def _restore_auto_parent_paths(self) -> None:
+        """PR5 / R1-P1: revert classifier-driven ``parent_path``
+        mutations under auto-fallback.
+
+        ``_classify_storage`` snapshots ``{name -> parent_path}`` for
+        every RbxScript when ``scene_runtime_mode == "auto"`` BEFORE
+        the domain classifier runs. The reachability sub-pass mutates
+        ``script.parent_path`` (hoists client-reached helpers to
+        ``ReplicatedStorage``) -- that's a generic-only routing
+        decision. On auto-fallback this method writes the snapshotted
+        values back so the resulting .rbxlx ships the pre-classifier
+        legacy routing.
+
+        Idempotent: missing snapshot (snapshot was never taken --
+        e.g. tests calling the subphase in isolation, or no scripts
+        existed when ``_classify_storage`` ran) is a no-op. Scripts
+        added between the snapshot and now are left untouched (the
+        snapshot only covers scripts present at classifier time, by
+        name; the post-classifier ``_subphase_inject_*`` subphases
+        add new ones that the snapshot legitimately doesn't cover).
+        """
+        snapshot = getattr(self, "_auto_parent_path_snapshot", None)
+        if not snapshot:
+            return
+        for script in self.state.rbx_place.scripts:
+            if script.name in snapshot:
+                original = snapshot[script.name]
+                if script.parent_path != original:
+                    log.debug(
+                        "[auto] restoring %s parent_path: %r -> %r",
+                        script.name, script.parent_path, original,
+                    )
+                    script.parent_path = original
 
     def _subphase_inject_scene_runtime(self) -> None:
         """PR4: emit the scene-runtime host runtime + plan + entrypoints.

@@ -330,8 +330,10 @@ def main(verbose: bool) -> None:
               help="Scene-runtime contract mode. 'legacy' is the pre-PR3 "
                    "pipeline (default, byte-identical). 'generic' routes "
                    "through the PR4 host runtime (Piece 6 services + "
-                   "cross-domain report). 'auto' (try-generic-then-legacy) "
-                   "is reserved for PR5 and currently rejected. See "
+                   "cross-domain report). 'auto' (PR5) routes through "
+                   "generic by default and falls back to legacy on any "
+                   "fail-closed signal (verifier, require-graph, "
+                   "classifier conflicts). See "
                    "converter/docs/design/scene-runtime-contract.md.")
 @click.option("--clean", is_flag=True,
               help="Remediation for --scene-runtime mode mismatches: "
@@ -1553,9 +1555,10 @@ def audit_assets(output_dir: str, api_key: str | None, fail_on_reject: bool) -> 
               type=click.Choice(["legacy", "auto", "generic"]),
               default="legacy",
               show_default=True,
-              help="Scene-runtime contract mode. 'auto'/'generic' route "
-                   "through the contract pipeline (PR4); rejected at "
-                   "this CLI until then.")
+              help="Scene-runtime contract mode. 'generic' routes "
+                   "through the PR4 host runtime; 'auto' (PR5) routes "
+                   "through generic by default and falls back to legacy "
+                   "on any fail-closed signal.")
 @click.option("--clean", is_flag=True,
               help="PR3b: wipe per-project output dirs before "
               "converting (mode-mismatch remediation).")

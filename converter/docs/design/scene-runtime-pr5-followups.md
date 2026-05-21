@@ -156,10 +156,13 @@ auto-mode run hitting a fail-closed signal.
 
 **Status as of PR5 head:** PR5's fallback is "host emit suppressed
 + logged + auto_fail_closed payload on ctx". Byte-equivalence with
-``--scene-runtime=legacy`` is NOT guaranteed on the fallback path.
-Operators wanting hard byte-equivalence rerun with
-``--scene-runtime=legacy``. The trade-off is honest in logs and
-the publish summary.
+``--scene-runtime=legacy`` is NOT guaranteed on the fallback path
+(transpile-side artifacts), though PR5's R1-P1 absorption snapshots
++ restores classifier-driven ``parent_path`` mutations on
+fallback so storage routing matches legacy. Operators wanting
+hard byte-equivalence rerun with ``--scene-runtime=legacy``. The
+trade-off is honest in logs; the structured publish-summary
+surface for ``auto_fail_closed`` is the item 5 follow-up.
 
 ## 4. Per-module fallback coexistence
 

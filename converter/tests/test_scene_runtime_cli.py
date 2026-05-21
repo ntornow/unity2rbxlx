@@ -84,6 +84,38 @@ class TestConvertFlag:
             "no longer appear in the output."
         )
 
+    def test_help_text_no_longer_marks_auto_as_reserved(self):
+        """R1-P3 (codex round 1): the ``--help`` text must reflect that
+        ``auto`` is now user-reachable (PR5). Pre-PR5 the strings said
+        "reserved for PR5" or "currently rejected"; those phrases now
+        misleads operators reading the help on stable PR5+."""
+        runner = CliRunner()
+        for argv in (["convert", "--help"], ["eval", "--help"]):
+            result = runner.invoke(u2r_main, argv)
+            assert result.exit_code == 0
+            assert "auto" in result.output
+            assert "reserved for PR5" not in result.output, (
+                f"{' '.join(argv)} --help still says auto is reserved"
+            )
+            assert "currently rejected" not in result.output, (
+                f"{' '.join(argv)} --help still says auto is rejected"
+            )
+        for argv in (
+            ["transpile", "--help"],
+            ["assemble", "--help"],
+            ["upload", "--help"],
+        ):
+            result = runner.invoke(ci_cli, argv)
+            assert result.exit_code == 0
+            assert "reserved for PR5" not in result.output, (
+                f"convert_interactive {argv[0]} --help still says auto "
+                "is reserved"
+            )
+            assert "auto' reserved" not in result.output, (
+                f"convert_interactive {argv[0]} --help still says "
+                "'auto reserved'"
+            )
+
     def test_invalid_value_rejected_by_click(self, tmp_path):
         # Values outside the Choice set fail at parse time with a click
         # error (different from our PR3a fail-closed message).
