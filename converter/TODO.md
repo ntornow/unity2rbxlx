@@ -8,6 +8,52 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
 
 ## Pipeline / runtime gaps
 
+- [ ] **P1 — Door pack widening (PR #121 `371ab76`) has 1 fixture covering 1 of 3 emit shapes.** Claude review, 2026-05-21.
+  `_detect_door_module_player_lookup` + `_fix_door_module_player_lookup` were
+  widened to match three AI-emitted shapes: `playerHasKey(playerInstance)`,
+  `playerHasKey()`, and `getPlayerHasKey()`; PLUS three Player-resolution
+  paths: `getPlayerMod`, `PlayerScripts`, and
+  `script.Parent:FindFirstChild("Player")`. `TestDoorModulePlayerToAttribute`
+  has exactly one fixture (`_door_zero_param`) that exercises the first
+  shape with `getPlayerModule`. Neither `getPlayerHas*` nor the
+  sibling-require resolution path has a regression test. The
+  `coherence_packs_single_pass` memory warns this class of regression is
+  latent. Fix: add 2 fixtures for the missing shapes + 1 unit test on the
+  attribute-name derivation regex
+  (`^(?:get)?[pP]layer([Hh]as\w+)$`) in
+  `script_coherence_packs.py:1750-1762`.
+
+- [ ] **P2 — Weapon-mount pack "no `_MainCameraRig`" fallback freezes rifle in world space.** PR #121 review (codex, 2026-05-21).
+  `_apply_weapon_mount` in `script_coherence_packs.py` has three seating
+  branches: `WeaponSlot` (preferred), rig (fallback), workspace (last
+  resort). The last branch does ONE
+  `rifle:PivotTo(workspace.CurrentCamera.CFrame * fallback_offset_expr)`
+  then sets `rifle.Parent = workspace` with `Anchored = true` — so on a
+  non-FPS project (no rig), or one where the rig tag failed to land, the
+  rifle freezes in world coords. Fix: in the workspace branch, emit a
+  per-frame `RenderStepped` follower (the pre-fdb01c1 design) so the
+  weapon still tracks the camera even without rig parenting. Add a
+  fixture that exercises the no-rig path and asserts the follower is
+  present in that branch.
+
+- [ ] **P2 — Door-helper regex `(?:get)?[pP]layer[Hh]as\w+` over-matches.** PR #121 review (codex + Claude, 2026-05-21).
+  `script_coherence_packs.py:1670` — `[Hh]as\w+` matches `playerHash`,
+  `playerHasted`, `getPlayerHasher`, etc. The `s.name != "Door"`
+  early-exit narrows file scope but doesn't guarantee semantic intent.
+  Fix: tighten to `[Hh]as[A-Z]\w*` so the suffix must start with an
+  uppercase letter, matching the `HasKey`/`HasItems`/`HasFooBar`
+  camelCase convention. Eliminates `Hash`/`Hashed`/`Hasher` cleanly.
+
+- [ ] **P2 — Weapon-mount pack equip-function naming is undocumented and exact-spelling.** PR #121 review (codex + Claude, 2026-05-21).
+  `_equip_function_variants` handles Pascal/camel of the registry value
+  (`GetRifle` → `getRifle`), but a third emitted variant like `Get_Rifle`
+  or `GetRifleObject` would silently miss both detection AND rewrite.
+  Nothing documents what `WeaponMount.equip_function` is allowed to
+  contain. Fix: add a docstring constraint
+  (`equip_function must be a single PascalCase verb-noun pair, no
+  separators`), and consider a startup-time validator that asserts every
+  registry entry matches the expected shape.
+
 - [ ] **P1 — Genre-genericness follow-ups for FPS-leftward-migration PR (codex 2026-05-17).**
   PR #96 shipped pipeline-level fixes for SimpleFPS gameplay bugs (mouse-look,
   walk speed, mine trigger, rifle visibility, ParticleEmitter NumberSequence,
@@ -99,6 +145,50 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   § "Persistent prefab/asset cache".
 
 ## Materials & meshes
+
+- [ ] **P1 — Embedded-mesh resolver only warns on bad sub-mesh count, then ships arbitrary geometry.** PR #121 review (codex + Claude, 2026-05-21).
+  `pipeline.py:2101+` asserts the "embedded synthesised FBX must resolve to
+  exactly one sub-mesh" invariant via `log.warning`, but `_resolve_sub_mesh()`
+  still returns `sub_meshes[0]` for embedded keys when the invariant is
+  violated. The comment claims "loud-fail" but the implementation is
+  loud-warn. Result: when `_strip_extra_geometries_and_dependents` misses a
+  Geometry node, the conversion ships wrong geometry instead of falling back
+  safely. Fix: quarantine the bad key by removing it from `mesh_hierarchies`
+  + `mesh_native_sizes` and appending to `asset_upload_errors`, so the
+  face-decal fallback path in `scene_converter` takes over instead of binding
+  to a coincidence Geometry. Codex sketched the ~12-line diff in the review.
+
+- [ ] **P2 — Multi-sub-mesh sizing emitters still inline the scale chain (parallel to the adapter).** PR #121 review (codex + Claude, 2026-05-21).
+  Commit `141892d` centralised single-mesh sizing through
+  `scene_converter._native_meters_from_roblox_size` ("one input shape, one
+  formula"), but the multi-sub-mesh paths at `scene_converter.py:1465-67,
+  1535-36, 2798-09, 3603-04, 3625-26, 3679-80, 4189-90` (8 sites) still
+  compose `_get_fbx_import_scale × _get_fbx_unit_ratio × STUDS_PER_METER`
+  inline. No current double-scale bug because all 8 sites land on the
+  FBX path where the `.prefab`/`.asset` short-circuit is safe — but the
+  parallel implementations are exactly where the previous drift re-entered.
+  Fix: extract a `_mesh_scale_factor_studs_per_native(mesh_guid, guid_index)`
+  helper and route every call site through it; or update the commit message
+  + `_compute_mesh_size` module comment to say "FBX paths still inline,
+  embedded path funnels through the adapter."
+
+- [ ] **P2 — "No modern FBX template" silently degrades every embedded mesh.** PR #121 review (codex, 2026-05-21).
+  `pipeline.py:1245` (`_upload_embedded_meshes`): when no 7.x FBX template is
+  available, the function emits a `log.warning` and returns. Embedded meshes
+  fall back to face-decal rendering, but the conversion summary reports a
+  clean upload phase (nothing hits `asset_upload_errors`). Fix: append
+  per-embedded-key errors to `asset_upload_errors` so the conversion report
+  surfaces the degraded path.
+
+- [ ] **P2 — FBX template selection is non-deterministic + UpAxis-coupled.** PR #121 review (Claude, 2026-05-21).
+  `pipeline.py:1230-1244` picks the first FBX in `manifest.by_kind["mesh"]`
+  that has a Geometry node. (a) Order depends on filesystem walk — different
+  developers get different templates. (b) The template's `GlobalSettings.UpAxis`
+  carries over to every synthesised embedded mesh; if the first match was
+  Blender-exported Z-up, every embedded mesh rotates 90° around X. Fix:
+  sort candidates by `relative_path` for determinism, and filter to
+  `UpAxis == 1` (Y-up) OR normalise the synthesised FBX's UpAxis inside
+  `synthesize_fbx`.
 
 - [ ] **P2 — Full SurfaceAppearance round-trip through templates.** PR 5
   deferred. The smoke ran with `--no-upload` so real asset IDs never wired

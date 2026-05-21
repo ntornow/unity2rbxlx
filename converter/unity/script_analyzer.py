@@ -14,8 +14,12 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+# Base-less classes (helper / utility classes with no `: Base`) must match too
+# so the generic require graph can resolve them by stem. The base group stays
+# optional and `analyze_script` falls back to "" when the second capture is None
+# — preserving the legacy `base_class == "MonoBehaviour"` checks downstream.
 _RE_CLASS = re.compile(
-    r"(?:public\s+)?class\s+(\w+)\s*:\s*(\w+)",
+    r"(?:public\s+)?class\s+(\w+)(?:\s*:\s*(\w+))?",
 )
 _RE_LIFECYCLE = re.compile(
     r"(?:void|IEnumerator)\s+(Awake|Start|Update|FixedUpdate|LateUpdate|"
@@ -76,11 +80,13 @@ def analyze_script(script_path: str | Path) -> ScriptInfo:
         info.is_editor_script = "/Editor/" in rel
         info.is_test_script = "/Test" in rel
 
-    # Extract class info
+    # Extract class info. _RE_CLASS now matches base-less classes, so the
+    # second capture group can be None — coerce to "" so existing equality
+    # checks (`base_class == "MonoBehaviour"`, etc.) keep their semantics.
     m = _RE_CLASS.search(source)
     if m:
         info.class_name = m.group(1)
-        info.base_class = m.group(2)
+        info.base_class = m.group(2) or ""
 
     # Extract lifecycle hooks
     info.lifecycle_hooks = list({m.group(1) for m in _RE_LIFECYCLE.finditer(source)})

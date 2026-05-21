@@ -1255,6 +1255,133 @@ def _expose_local_script_events(scripts: list[RbxScript]) -> int:
             log.info("  Rewired %d cross-script event binding(s) in '%s'",
                      sum(len(producers[p]) for p in var_to_producer.values()),
                      s.name)
+
+    # Step 4 -- consumers rewritten by ``_AutoLocalScriptShim`` to
+    # ``require(<X>Shared)`` are invisible to the WaitForChild-based
+    # detection above (the shim swapped the producer-LocalScript Instance
+    # for a re-exporting ModuleScript that drops cross-script event
+    # signals). Detect those consumers separately and rewrite their
+    # ``<var>.<EventKey>:Connect`` calls to read the BindableEvent
+    # directly off the producer LocalScript instance.
+    #
+    # The producer pass above already named each cross-script event
+    # ``<Key>`` and parented it to ``script`` -- so a runtime lookup of
+    # the producer LocalScript's container :WaitForChild("<Producer>"):
+    # WaitForChild("<Key>").Event resolves to the same BindableEvent.Event
+    # the ``Player.HealthUpdate`` etc. table-field assignments hold
+    # inside the producer.
+    if not producers:
+        return fixes
+    # Match both ``local <var> = require(...XShared)`` and the
+    # ``<var> = require(...XShared)`` shape-B assignment the
+    # ``_AutoLocalScriptShim``'s descendant-loop rewrite emits.
+    # The ``(?:local\s+)?`` makes ``local`` optional so codex [P2] is
+    # closed: previously shape-B consumers slipped past the detector
+    # and crashed at runtime on ``shim_table.HealthUpdate:Connect``.
+    shim_require_re = re.compile(
+        r'^[ \t]*(?:local\s+)?(?P<var>\w+)\s*=\s*require\([^\n]*WaitForChild'
+        r'\(\s*["\'](?P<mod>\w+)Shared["\']\s*\)[^\n]*\)',
+        re.MULTILINE,
+    )
+
+    # Resolve each producer's runtime container from its ``parent_path``
+    # (set by ``storage_classifier`` and ``rbxlx_writer``). Producers
+    # land in ``StarterPlayer.StarterPlayerScripts`` for most projects,
+    # but a project that classifies the controller as
+    # character-attached routes it to ``StarterCharacterScripts``
+    # instead. The Roblox runtime mirrors those into
+    # ``LocalPlayer.PlayerScripts`` or character-rooted ``Character``,
+    # respectively. Codex [P2] flagged the previous hardcoded
+    # ``PlayerScripts`` chain as broken for any non-default routing.
+    def _runtime_lookup_for_producer(prod_name: str) -> str:
+        # Find the producer script's parent_path among the input set.
+        prod_script = next((p for p in scripts if p.name == prod_name), None)
+        parent_path = (
+            (prod_script.parent_path or "") if prod_script is not None else ""
+        )
+        if "StarterCharacterScripts" in parent_path:
+            # Mirrored at runtime into the live character Model.
+            return (
+                f'(game:GetService("Players").LocalPlayer.Character or '
+                f'game:GetService("Players").LocalPlayer.CharacterAdded:Wait()):'
+                f'WaitForChild({prod_name!r})'
+            )
+        # Default: client controllers live in StarterPlayerScripts,
+        # which Roblox mirrors into ``LocalPlayer.PlayerScripts`` at
+        # runtime.
+        return (
+            f'game:GetService("Players").LocalPlayer:WaitForChild'
+            f'("PlayerScripts"):WaitForChild({prod_name!r})'
+        )
+
+    # ``producer_local_name`` keeps the identifier we hoist the runtime
+    # lookup into per consumer. Hoisting matters: the runtime-lookup
+    # chain begins with ``game:GetService(...)``, so a naive
+    # ``(<chain>):Connect(...)`` rewrite emits lines that START with
+    # ``(``. Luau then sees the previous statement's trailing ``)``
+    # followed by ``(`` and raises an "ambiguous syntax" parse error
+    # ("this looks like an argument list for a function call, but
+    # could also be a start of new statement"). Hoisting to a local
+    # makes every rewritten Connect start with an identifier, which
+    # Luau parses unambiguously.
+    def _producer_local_name(prod: str) -> str:
+        return f"_AutoProducer_{prod}"
+
+    for s in scripts:
+        if s.name in producers:
+            continue
+        original = s.source
+        # ``<var> = require(...XShared)`` -> ``X`` is the producer name.
+        shim_bindings: dict[str, str] = {}
+        shim_require_end: dict[str, int] = {}  # producer -> match end offset
+        for m in shim_require_re.finditer(s.source):
+            prod_name = m.group("mod")
+            if prod_name in producers:
+                shim_bindings[m.group("var")] = prod_name
+                # Track the LAST require's end position per producer --
+                # that's where we insert the hoisted local declaration so
+                # it's in scope for every subsequent Connect rewrite.
+                shim_require_end[prod_name] = max(
+                    shim_require_end.get(prod_name, 0), m.end(),
+                )
+        if not shim_bindings:
+            continue
+        connections_rewritten = 0
+        for var, prod in shim_bindings.items():
+            producer_local = _producer_local_name(prod)
+            for key in producers[prod]:
+                pat = re.compile(rf'\b{re.escape(var)}\.{re.escape(key)}:Connect\(')
+                repl = (
+                    f'{producer_local}:WaitForChild({key!r}).Event:Connect('
+                )
+
+                def _repl(_m: "re.Match[str]", _repl=repl) -> str:
+                    return _repl
+                new_src, n = pat.subn(_repl, s.source)
+                if n:
+                    s.source = new_src
+                    connections_rewritten += n
+        # Inject one hoisted local per producer right after the
+        # matching require line. Sort by offset descending so later
+        # inserts don't shift earlier offsets.
+        if connections_rewritten:
+            producers_used = {p for p in shim_bindings.values()}
+            inserts: list[tuple[int, str]] = []
+            for prod in producers_used:
+                lookup = _runtime_lookup_for_producer(prod)
+                local_decl = (
+                    f"\nlocal {_producer_local_name(prod)} = {lookup}"
+                )
+                inserts.append((shim_require_end[prod], local_decl))
+            for offset, decl in sorted(inserts, key=lambda x: -x[0]):
+                s.source = s.source[:offset] + decl + s.source[offset:]
+        if connections_rewritten and s.source != original:
+            fixes += 1
+            log.info(
+                "  Re-routed %d shim-blocked event binding(s) in '%s' "
+                "to the producer LocalScript's BindableEvent children",
+                connections_rewritten, s.name,
+            )
     return fixes
 
 

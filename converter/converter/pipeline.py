@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, cast
 
 import config as _config
 from config import (
@@ -40,6 +40,12 @@ log = logging.getLogger(__name__)
 PHASES: list[str] = [
     "parse",
     "extract_assets",
+    # Plan the scene runtime artifact off parsed scenes + prefabs before
+    # any script-touching phase runs. Inert by default in PR1 — only the
+    # planner data lands in conversion_plan.json; the legacy transpile
+    # path doesn't consume it. PR3a opts in when ``--scene-runtime=generic``
+    # is requested.
+    "plan_scene_runtime",
     "moderate_assets",
     "upload_assets",
     "resolve_assets",
@@ -93,6 +99,12 @@ class PipelineState:
 
     guid_index: GuidIndex | None = None
     parsed_scene: ParsedScene | None = None
+    # All scenes parsed by the multi-scene driver before
+    # ``plan_scene_runtime`` runs — the planner needs every scene in one
+    # call so the per-scene namespacing in the artifact is consistent. In
+    # single-scene mode this stays empty and the planner reads from
+    # ``parsed_scene`` instead.
+    all_parsed_scenes: list[ParsedScene] = field(default_factory=list)
     asset_manifest: AssetManifest | None = None
     material_mappings: dict[str, MaterialMapping] = field(default_factory=dict)
     transpilation_result: TranspilationResult | None = None
@@ -477,11 +489,29 @@ class Pipeline:
 
         log.info("[multi] Found %d scenes to convert", len(scene_paths))
 
-        # Shared phases: extract + upload assets, materials, scripts, animations
-        # Use the first scene for initial parse (needed for asset extraction)
-        self.ctx.selected_scene = str(scene_paths[0])
+        # Parse EVERY scene up front. The plan_scene_runtime phase below
+        # needs the full set in one call so the per-scene namespacing in
+        # the artifact is consistent, and the per-scene loop further down
+        # gets to reuse the parsed result instead of re-parsing. Pre-PR1
+        # only the first scene was parsed before shared phases ran; that
+        # made the planner blind to every other scene's MonoBehaviours.
         from unity.scene_parser import parse_scene
-        self.state.parsed_scene = parse_scene(scene_paths[0])
+        all_parsed: list[ParsedScene] = []
+        for scene_path in scene_paths:
+            try:
+                all_parsed.append(parse_scene(scene_path))
+            except Exception as exc:
+                log.warning("[multi] Skipping unparseable %s: %s",
+                            scene_path.name, exc)
+        if not all_parsed:
+            log.warning("[multi] All scenes failed to parse")
+            return self.ctx
+        self.state.all_parsed_scenes = all_parsed
+        # Pre-select the first parseable scene as the "current" parsed
+        # scene for shared phases that consume a single scene
+        # (extract_assets reads textures referenced by it).
+        self.state.parsed_scene = all_parsed[0]
+        self.ctx.selected_scene = str(all_parsed[0].scene_path)
         self.ctx.total_game_objects = len(self.state.parsed_scene.all_nodes)
 
         # Run shared phases. ``resolve_assets`` belongs here too: without
@@ -490,23 +520,33 @@ class Pipeline:
         # the multi-scene path used to silently skip resolution and
         # produced visibly broken places. ``resolve_assets`` no-ops when
         # ``--no-upload`` is set or no universe/place IDs are configured.
-        for phase in ["extract_assets", "upload_assets", "convert_materials",
+        # ``plan_scene_runtime`` sits between extract_assets (which lazy-
+        # loads the prefab library) and transpile_scripts (PR3a will
+        # consume the artifact) — same slot as the single-scene driver.
+        for phase in ["extract_assets", "plan_scene_runtime",
+                       "upload_assets", "convert_materials",
                        "transpile_scripts", "convert_animations",
                        "resolve_assets"]:
             self._run_phase(phase)
 
-        # Per-scene: parse, convert, write
+        # Per-scene: convert, write. Reuses scenes pre-parsed above —
+        # parsing every scene twice was the pre-PR1 status quo and is the
+        # one cost the planner's "all scenes up front" move eliminates.
+        parsed_by_path: dict[str, ParsedScene] = {
+            str(p.scene_path): p for p in all_parsed
+        }
         for scene_path in scene_paths:
             scene_name = scene_path.stem
             log.info("[multi] === Converting scene: %s ===", scene_name)
 
             self.ctx.selected_scene = str(scene_path)
-            try:
-                self.state.parsed_scene = parse_scene(scene_path)
-            except Exception as exc:
-                log.warning("[multi] Failed to parse %s: %s", scene_name, exc)
+            parsed = parsed_by_path.get(str(scene_path))
+            if parsed is None:
+                # Lost a scene to a parse failure above; nothing to convert.
+                log.warning("[multi] Skipping %s — pre-parse missing",
+                            scene_name)
                 continue
-
+            self.state.parsed_scene = parsed
             self.ctx.total_game_objects = len(self.state.parsed_scene.all_nodes)
 
             # Convert scene
@@ -875,6 +915,69 @@ class Pipeline:
             len(refs), total,
         )
 
+    def plan_scene_runtime(self) -> None:
+        """Phase: build the project-level ``scene_runtime`` artifact.
+
+        Reads parsed scenes + the prefab library (lazy-loaded earlier by
+        ``extract_assets``) and emits the deterministic snapshot the host
+        runtime will consume in PR4. The artifact lands on
+        ``self.ctx.scene_runtime`` and round-trips through
+        ``conversion_context.json`` plus the persistence merge inside
+        ``_classify_storage`` so resumes reproduce it verbatim.
+
+        Inert by default in PR1 — only the planner data is written; no
+        legacy phase consumes it. PR3a opts in under
+        ``--scene-runtime=generic``.
+        """
+        from converter.scene_runtime_planner import plan_scene_runtime as _plan
+
+        # ``self.state.parsed_scene`` is the single-scene path; the
+        # multi-scene driver pre-parses every scene into
+        # ``self.state.all_parsed_scenes`` before invoking this phase so a
+        # single planner call sees them all (per-scene namespacing is
+        # already a planner invariant).
+        scenes_attr = getattr(self.state, "all_parsed_scenes", None)
+        scenes: list[ParsedScene]
+        if scenes_attr:
+            scenes = list(scenes_attr)
+        elif self.state.parsed_scene is not None:
+            scenes = [self.state.parsed_scene]
+        else:
+            scenes = []
+
+        if self.state.prefab_library is None:
+            # Multi-scene's pre-extract entry skipped the lazy load; force
+            # it here so prefab subplans are populated. Same fallback the
+            # serialized-field walk takes in ``_extract_serialized_field_refs``.
+            try:
+                from unity.prefab_parser import parse_prefabs
+                self.state.prefab_library = parse_prefabs(self.unity_project_path)
+            except Exception as exc:
+                log.warning(
+                    "[plan_scene_runtime] Could not parse prefabs: %s", exc,
+                )
+
+        artifact = _plan(
+            parsed_scenes=scenes,
+            prefab_library=self.state.prefab_library,
+            guid_index=self.state.guid_index,
+            unity_project_root=self.unity_project_path,
+        )
+        # Persist directly on the context; the structural type belongs to
+        # the planner module (avoids a core→converter dependency).
+        self.ctx.scene_runtime = dict(artifact)
+
+        modules = artifact["modules"]
+        runtime_bearing = sum(
+            1 for m in modules.values() if m.get("runtime_bearing")
+        )
+        log.info(
+            "[plan_scene_runtime] %d modules (%d runtime-bearing), "
+            "%d scene(s), %d prefab(s)",
+            len(modules), runtime_bearing,
+            len(artifact["scenes"]), len(artifact["prefabs"]),
+        )
+
     def _compute_fbx_bounding_boxes(self) -> None:
         """Scan all mesh assets and compute bounding boxes.
 
@@ -1153,6 +1256,16 @@ class Pipeline:
                     self.ctx.asset_upload_errors.append(rel)
                 time.sleep(0.3)  # Rate limit (Roblox Open Cloud allows ~60 req/min)
 
+        # Second pass: synthesise + upload meshes embedded in legacy
+        # ``.prefab``/``.asset`` files (Unity NativeFormatImporter format).
+        # The standard mesh loop above only handles external ``.fbx``/
+        # ``.obj`` -- pre-this-pass, mines/decorative props whose geometry
+        # lives inside a ``.prefab`` rendered as cube-decal Parts. See
+        # ``unity.embedded_mesh_extractor`` for the decoder rationale.
+        self._upload_embedded_meshes(
+            uploaded, new_uploads, api_key, creator_id, creator_type,
+        )
+
         log.info("[upload_assets] %d assets uploaded, %d errors",
                  len(uploaded), len(self.ctx.asset_upload_errors))
 
@@ -1164,6 +1277,206 @@ class Pipeline:
         # soft — if the metadata endpoint can't make up its mind, we assume
         # the asset is fine and leave it in place.
         self._audit_new_uploads(new_uploads, api_key)
+
+    def _upload_embedded_meshes(
+        self,
+        uploaded: dict[str, str],
+        new_uploads: list[tuple[str, str]],
+        api_key: str,
+        creator_id: str,
+        creator_type: str,
+    ) -> None:
+        """Synthesise + upload meshes embedded in ``.prefab``/``.asset`` files.
+
+        Walks the parsed scene + prefab library for ``MeshFilter`` references
+        whose GUID resolves to a ``.prefab``/``.asset`` (not ``.fbx``/``.obj``).
+        For each unique ``(asset_path, file_id)``, decodes the embedded
+        geometry, synthesises an ASCII OBJ, and uploads as a ``Model`` asset
+        under the synthetic key ``f"{rel_path}#{file_id}"``. ``_resolve_mesh_id``
+        and ``studio_resolver`` both check this key shape so the resolved
+        ``MeshId`` flows into the rbxlx exactly like a real FBX upload.
+
+        Failure modes from ``parse_embedded_mesh`` are logged once per
+        ``(source_key, reason)`` -- face-decal fallback remains the
+        recovery path for anything we cannot decode.
+        """
+        from collections import Counter
+        from unity.embedded_mesh_extractor import (
+            ExtractionFailure,
+            parse_embedded_mesh,
+            reset_cache as _reset_extractor_cache,
+            synthesize_fbx,
+        )
+        from roblox.cloud_api import upload_mesh
+
+        guid_index = self.state.guid_index
+        parsed_scene = self.state.parsed_scene
+        prefab_library = self.state.prefab_library
+        if guid_index is None:
+            return
+
+        # Pick any modern-FBX (version 7.x) file in the project as the
+        # structural template that ``synthesize_fbx`` will mutate to hold
+        # each embedded mesh's geometry. Roblox's Open Cloud assets API
+        # rejects ``model/obj`` uploads (``"Creating Model from a model/obj
+        # file is not supported yet."``), so we clone a known-good FBX
+        # and swap its Vertices + PolygonVertexIndex.
+        #
+        # Legacy FBX 6.x (``Version5`` root) files embed geometry inside
+        # the ``Model`` node and have no separate ``Geometry`` object --
+        # skip them. ``_find_geometry_nodes`` returns empty, which is
+        # the signal we use here.
+        from converter.fbx_binary import _find_geometry_nodes, read_fbx
+
+        manifest = self.state.asset_manifest
+        template_fbx: Path | None = None
+        if manifest is not None:
+            for asset in manifest.by_kind.get("mesh", []):
+                if asset.path.suffix.lower() != ".fbx" or not asset.path.exists():
+                    continue
+                try:
+                    _ver, _roots, _footer = read_fbx(asset.path)
+                except Exception:
+                    continue
+                if _find_geometry_nodes(_roots):
+                    template_fbx = asset.path
+                    log.info(
+                        "[upload_assets] Using %s as embedded-mesh template",
+                        asset.relative_path,
+                    )
+                    break
+        if template_fbx is None:
+            log.warning(
+                "[upload_assets] No modern-FBX (7.x) template available; "
+                "skipping embedded mesh uploads. The pipeline's face-decal "
+                "fallback will still render these Parts, but without their "
+                "real geometry."
+            )
+            return
+
+        # Fresh extractor cache per ``upload_assets`` invocation so a
+        # rerun never serves stale geometry from a previous run.
+        _reset_extractor_cache()
+
+        # Collect unique ``(resolved_path, file_id)`` -> relative_path
+        # for every MeshFilter that targets a legacy embedded mesh.
+        pairs: dict[tuple[Path, str], Path] = {}
+
+        def _maybe_collect(mesh_guid: str | None, mesh_file_id: str | None) -> None:
+            if not mesh_guid or not mesh_file_id:
+                return
+            resolved = guid_index.resolve(mesh_guid)
+            if resolved is None:
+                return
+            if resolved.suffix.lower() not in (".prefab", ".asset"):
+                return
+            rel = guid_index.resolve_relative(mesh_guid)
+            pairs[(resolved.resolve(), str(mesh_file_id))] = (
+                rel if rel is not None else Path(resolved.name)
+            )
+
+        if parsed_scene is not None:
+            # ``all_nodes`` is a ``dict[str, SceneNode]``; iterate ``.values()``
+            # so we get nodes, not file-ID strings. The previous iteration
+            # silently missed any embedded mesh referenced by a scene-level
+            # MeshFilter (prefab-library walks below still worked, which
+            # masked the bug for SimpleFPS).
+            for node in parsed_scene.all_nodes.values():
+                _maybe_collect(
+                    getattr(node, "mesh_guid", None),
+                    getattr(node, "mesh_file_id", None),
+                )
+
+        def _walk_prefab(node: object) -> None:
+            if node is None:
+                return
+            _maybe_collect(
+                getattr(node, "mesh_guid", None),
+                getattr(node, "mesh_file_id", None),
+            )
+            for child in getattr(node, "children", []) or []:
+                _walk_prefab(child)
+
+        if prefab_library is not None:
+            for tpl in prefab_library.by_name.values():
+                _walk_prefab(getattr(tpl, "root", None))
+
+        if not pairs:
+            return
+
+        log.info(
+            "[upload_assets] Uploading %d embedded-mesh assets (.prefab/.asset)...",
+            len(pairs),
+        )
+
+        embedded_dir = self.output_dir / "embedded_meshes"
+        embedded_dir.mkdir(parents=True, exist_ok=True)
+        failure_summary: Counter[tuple[str, str]] = Counter()
+
+        # Honour the same ``.upload_blocklist`` file the main mesh loop
+        # reads -- ``_audit_new_uploads`` writes synthetic embedded keys
+        # there when Roblox moderation rejects a synthesised mesh, and
+        # without this check we'd just re-upload the same rejected
+        # geometry on every assemble.
+        blocklist_file = self.output_dir / ".upload_blocklist"
+        blocklist: set[str] = set()
+        if blocklist_file.exists():
+            blocklist = {
+                line.strip() for line in blocklist_file.read_text().splitlines()
+                if line.strip() and not line.startswith("#")
+            }
+
+        for (path, file_id), rel in pairs.items():
+            synthetic_key = f"{rel}#{file_id}"
+            if synthetic_key in uploaded:
+                continue
+            if synthetic_key in blocklist:
+                log.info(
+                    "[upload_assets] Skipping blocklisted embedded mesh: %s",
+                    synthetic_key,
+                )
+                continue
+            result = parse_embedded_mesh(path, file_id)
+            if isinstance(result, ExtractionFailure):
+                # Deduped warning per ``(source_key, reason)`` -- the
+                # face-decal fallback in scene_converter already
+                # handles the render side.
+                failure_summary[(synthetic_key, result.reason)] += 1
+                continue
+            try:
+                fbx_bytes = synthesize_fbx(result, template_fbx)
+            except ValueError as exc:
+                log.warning(
+                    "[upload_assets]   FBX synthesis failed for %s#%s: %s",
+                    path.stem, file_id, exc,
+                )
+                self.ctx.asset_upload_errors.append(synthetic_key)
+                continue
+            fbx_path = embedded_dir / f"{path.stem}__{file_id}.fbx"
+            fbx_path.write_bytes(fbx_bytes)
+            asset_id = upload_mesh(
+                fbx_path, api_key, creator_id, creator_type, name=result.name,
+            )
+            if asset_id:
+                uploaded[synthetic_key] = f"rbxassetid://{asset_id}"
+                log.info(
+                    "[upload_assets]   embedded %s#%s -> rbxassetid://%s",
+                    path.stem, file_id, asset_id,
+                )
+                new_uploads.append((synthetic_key, asset_id))
+            else:
+                log.warning(
+                    "[upload_assets]   FAILED embedded %s#%s",
+                    path.stem, file_id,
+                )
+                self.ctx.asset_upload_errors.append(synthetic_key)
+            time.sleep(0.3)  # Same rate limit as the main mesh loop.
+
+        for (key, reason), count in failure_summary.items():
+            log.warning(
+                "[upload_assets] Skipped embedded mesh %s (%d node ref(s)): %s",
+                key, count, reason,
+            )
 
     def _audit_new_uploads(
         self,
@@ -1647,9 +1960,17 @@ class Pipeline:
         # current uploaded_assets is {D, E} after the user swapped meshes,
         # resolved_count (3) >= uploaded_mesh_count (2) would falsely
         # report "all resolved" and skip resolution of D and E entirely.
+        #
+        # Mesh-key predicate accepts both ``.fbx``/``.obj`` keys (the
+        # external-mesh upload path) and synthetic ``<rel>#<file_id>``
+        # keys (the embedded-mesh upload path -- see
+        # ``unity.embedded_mesh_extractor``). Hoisted to
+        # ``core.asset_keys`` so the Studio resolver and the scene
+        # converter use the same definition.
+        from core.asset_keys import is_mesh_asset_key as _is_mesh_key
+
         uploaded_mesh_keys = {
-            k for k in self.ctx.uploaded_assets
-            if any(k.lower().endswith(ext) for ext in ('.fbx', '.obj'))
+            k for k in self.ctx.uploaded_assets if _is_mesh_key(k)
         }
         uploaded_mesh_count = len(uploaded_mesh_keys)
         resolved_count = len(self.ctx.mesh_native_sizes)
@@ -1709,8 +2030,7 @@ class Pipeline:
         already_resolved = self.ctx.mesh_native_sizes
         mesh_assets = {} if all_meshes_resolved else {
             k: v for k, v in self.ctx.uploaded_assets.items()
-            if any(k.lower().endswith(ext) for ext in ('.fbx', '.obj'))
-            and k not in already_resolved
+            if _is_mesh_key(k) and k not in already_resolved
         }
 
         # No universe/place IDs. Open Cloud does not support universe
@@ -1880,6 +2200,29 @@ return table.concat(allData, "\\n")'''
                 if texture_id:
                     entry["textureId"] = texture_id
                 mesh_hierarchies[path].append(entry)
+
+            # Invariant: synthetic embedded-mesh keys MUST resolve to
+            # exactly one sub-mesh (our synthesised FBX has a single
+            # Geometry node by construction in
+            # ``unity.embedded_mesh_extractor.synthesize_fbx``). When
+            # the resolver returns more, the FBX template-cleanup
+            # leaked extra Geometries and ``sub_meshes[0]`` would
+            # silently bind to whichever Geometry the upload happened
+            # to enumerate first -- a correctness-by-coincidence bug.
+            # Loud-fail so the next leak is caught at conversion time,
+            # not via a Studio playtest.
+            from core.asset_keys import is_embedded_mesh_key
+            for k, subs in mesh_hierarchies.items():
+                if is_embedded_mesh_key(k) and len(subs) != 1:
+                    log.warning(
+                        "[resolve_assets] Embedded-mesh key %r resolved to "
+                        "%d sub-meshes (expected exactly 1). The FBX "
+                        "template likely shipped extra Geometry nodes that "
+                        "weren't stripped; sub_meshes[0] binding is now "
+                        "non-deterministic and may bind to the wrong "
+                        "geometry. Names: %s",
+                        k, len(subs), [s.get("name") for s in subs],
+                    )
 
             # Merge into existing tables instead of replacing. A transient
             # batch failure during a force-rerun would otherwise shrink a
@@ -3385,11 +3728,20 @@ script.Disabled = true
             animation_routing = getattr(self.state.animation_result, "routing", {}) or {}
 
         plan_path = self.output_dir / "conversion_plan.json"
+
+        # PR1 merge: the planner artifact stored on ``ctx.scene_runtime``
+        # (and any sticky ``domain_overrides`` an operator edited into a
+        # prior ``conversion_plan.json`` on disk) must survive this
+        # wholesale rewrite. Pre-PR1 ``_classify_storage`` emitted a fixed
+        # 3-key dict that silently dropped anything else.
+        scene_runtime = self._merge_scene_runtime(plan_path)
+
         plan_path.write_text(
             _json.dumps({
                 "storage_plan": plan.to_dict(),
                 "script_paths": script_paths,
                 "animation_routing": animation_routing,
+                "scene_runtime": scene_runtime,
             }, indent=2),
             encoding="utf-8",
         )
@@ -3398,6 +3750,57 @@ script.Disabled = true
             len(plan.decisions),
             plan_path.name,
         )
+
+    def _merge_scene_runtime(self, plan_path: Path) -> dict[str, object]:
+        """Compose the ``scene_runtime`` block written into
+        ``conversion_plan.json``.
+
+        Structural sub-blocks (``modules`` / ``scenes`` / ``prefabs``) come
+        from ``ctx.scene_runtime`` — recomputed each run by the
+        ``plan_scene_runtime`` phase. ``domain_overrides`` is **sticky**:
+        if an operator edited it into a prior on-disk plan, the value
+        wins over whatever the planner produced (planner emits ``{}``;
+        PR3b's classifier never touches this key). Unknown keys present
+        on disk are preserved too — forward-compatible with future
+        schema extensions without re-touching every consumer.
+        """
+        import json as _json
+
+        merged: dict[str, object] = dict(self.ctx.scene_runtime or {})
+
+        # On-disk plan may carry a sticky ``domain_overrides`` block from
+        # an operator edit or a previous run. Load it; ignore parse
+        # failures (worst case we lose the override, which is recorded in
+        # ctx.warnings rather than crashing classify_storage).
+        on_disk: dict[str, object] = {}
+        if plan_path.exists():
+            try:
+                raw = _json.loads(plan_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    sr = raw.get("scene_runtime")
+                    if isinstance(sr, dict):
+                        on_disk = cast("dict[str, object]", sr)
+            except Exception as exc:
+                log.debug(
+                    "[classify_storage] scene_runtime merge: "
+                    "ignoring unreadable plan: %s", exc,
+                )
+
+        # Sticky domain_overrides: on-disk value wins when present, even
+        # when empty — operator may have deliberately cleared it.
+        if "domain_overrides" in on_disk:
+            merged["domain_overrides"] = on_disk["domain_overrides"]
+        elif "domain_overrides" not in merged:
+            merged["domain_overrides"] = {}
+
+        # Forward-compat: anything else the on-disk plan carries under
+        # scene_runtime that we don't recompute (future schema additions)
+        # is preserved unless the planner output explicitly overwrites it.
+        for key, value in on_disk.items():
+            if key not in merged:
+                merged[key] = value
+
+        return merged
 
     def _bind_scripts_to_parts(self) -> None:
         """Bind transpiled scripts to their target parts using _ScriptClass attributes.

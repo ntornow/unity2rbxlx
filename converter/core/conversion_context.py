@@ -107,6 +107,16 @@ class ConversionContext:
     # and by 4.10 prefab packages (to know which prefabs to emit).
     serialized_field_refs: dict[str, dict[str, str]] = field(default_factory=dict)
 
+    # Project-level scene runtime artifact emitted by the
+    # ``plan_scene_runtime`` phase. Shape is pinned by
+    # ``converter.scene_runtime_planner.SceneRuntimeArtifact`` (modules /
+    # scenes / prefabs / domain_overrides). Stored loosely typed here to
+    # avoid a core→converter dependency; consumers narrow at the call site.
+    # PR1 emits the structural blocks; PR3b fills in per-module ``domain`` /
+    # ``container`` / ``module_path``. Survives ``_classify_storage``
+    # rewrites verbatim — see ``Pipeline._classify_storage``.
+    scene_runtime: dict[str, object] = field(default_factory=dict)
+
     # Opt-in genre scaffolding requested by the caller. Persisted as a
     # sorted ``list[str]`` for JSON-friendliness; the pipeline reads it
     # back as a frozenset. Currently recognised: ``"fps"`` (auto-injected

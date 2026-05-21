@@ -161,26 +161,91 @@ Revisit if a project ships AI navigation that depends on these features.
 
 ---
 
-## Generic FPS weapon-mount metadata extraction
+## Replace `fps_weapon_mount_inject` with a generic Unity-Instantiate lowering pass
 
 The `fps_weapon_mount_inject` patch pack in
-[`script_coherence_packs.py`](../converter/script_coherence_packs.py) is
-data-driven over a one-entry `WEAPON_MOUNTS` registry that today matches
-SimpleFPS exactly. Adding a second FPS test project surfaces two open
-questions worth resolving with a real signal:
+[`script_coherence_packs.py`](../converter/script_coherence_packs.py)
+is data-driven over a one-entry `WEAPON_MOUNTS` registry that today
+matches SimpleFPS exactly. **Don't extend the registry weapon-by-weapon.**
+A codex architecture review (PR #121, 2026-05-20) read the pack as
+"compensating for missing generic prefab/object-ref lowering" and
+flagged the registry approach as the wrong abstraction boundary:
 
-- **Mount metadata source.** Today's entry hardcodes prefab name, view
-  offset, and scale. A second project would justify extracting these
-  from Unity prefab YAML (Player MonoBehaviour fields + the weapon-mount
-  Transform's `localPosition` × `STUDS_PER_METER`) and persisting them
-  into `conversion_context.json` as an `fps_weapon_mounts` block, so
-  the registry becomes derived state rather than hand-authored.
-- **Detection generality.** The current detector anchors on function
-  name (`GetRifle`) and prefab name (`riflePrefab`). Two AI-transpiled
-  projects with different naming would justify anchoring on body shape
-  instead (a Clone() of a Templates child followed by a sentinel flag
-  flip) and using metadata as the source of truth.
+- It hardcodes the weapon (`riflePrefab → Rifle`).
+- It invents Roblox-side conventions Unity didn't author (the
+  `_MainCameraRig` attribute walk + `FindFirstChild("WeaponSlot")`
+  name search) instead of resolving the authored Inspector field.
+- `Instantiate + SetParent + local-transform reset` is generic
+  Unity — pickup spawners, projectile spawners, particle bursts all
+  use it. The same shape is currently handled by ~5 different
+  genre-aware packs (`bullet_physics_raycast`,
+  `pickup_remote_event_server`, `pickup_visual_target`,
+  `door_tween_open`, etc.). Each pack pattern-matches one
+  manifestation of the same Unity primitive.
 
-Not worth building speculatively — the hardcoded entry costs ~10 lines
-and covers the only FPS consumer. Revisit when a second FPS Unity
-project enters the test bench.
+The repo's existing generic resolver
+([`serialized_field_extractor.py`](../converter/serialized_field_extractor.py))
+covers GUID-backed prefab/audio refs but **does not cover non-GUID
+scene/prefab-local Transform refs** like `weaponSlot`. That gap is the
+real reason this pack exists.
+
+### Replacement blueprint
+
+1. **Extend serialized-ref extraction** to record non-GUID object refs
+   (Transform/GameObject Inspector fields) alongside the existing
+   prefab/audio entries. Output: a `_AutoRef_<fieldName>` attribute on
+   the converted Part (matching the existing `_AutoRef_*` convention
+   the prompt already mentions for prefab refs).
+2. **Stamp converted target objects** with a stable locator derived
+   from Unity identity (file IDs, scene paths), not a semantic name
+   search. `_MainCameraRig` works as scaffolding for the camera rig
+   itself — keep that — but the WeaponSlot child should be locatable
+   by its Unity Transform identity.
+3. **New `unity_instantiate_lowering` pass** that detects the
+   `Instantiate(<serializedPrefab>, ...) + SetParent(<serializedTransform>)
+   + local-transform reset` shape and rewrites it to canonical Luau:
+   clone from `ReplicatedStorage.Templates`, parent to the resolved
+   `_AutoRef_<field>`, reset local pose, preserve explicit scale.
+   Detection anchored on body shape (Instantiate-followed-by-SetParent),
+   not function name.
+4. **Keep prompt tightening as a hint only.** The transpile prompt
+   already says "use `ReplicatedStorage.Templates:WaitForChild(name)`
+   for prefab refs" ([`code_transpiler.py`](../converter/code_transpiler.py))
+   and `Instantiate(prefab) → prefab:Clone(); clone.Parent = workspace`.
+   AI doesn't reliably obey -- the lowering pass should ENFORCE the
+   shape, not hope for it.
+
+### Migration order (codex's specific recommendation)
+
+* Build the generic instantiate/object-ref lowering path first.
+* Switch the SimpleFPS rifle to it.
+* Leave `fps_weapon_mount_inject` as a fallback for one cycle.
+* Then delete the pack.
+* **Do not** genericize `pickup_remote_event_server` /
+  `bullet_physics_raycast` / `pickup_visual_target` in the same
+  sweep — those solve different problems (replication, physics model,
+  model-vs-trigger lowering), not Instantiate.
+* **Do** keep `_MainCameraRig` + `CameraRigFollower` scaffolding
+  ([`autogen.py`](../converter/autogen.py)). Codex called those out as
+  a legitimately good generic replacement for bespoke weapon-follow
+  code -- the hack is the weapon-mount pack, not the camera-rig
+  follower.
+
+### Trigger to do this work
+
+The current one-entry registry costs ~10 lines and covers SimpleFPS.
+The cost of NOT doing it is technical debt that compounds the next
+time a project ships:
+
+* A second weapon (even in SimpleFPS) — DON'T add a `WeaponMount`
+  tuple; do the lowering pass.
+* A second FPS project with different naming.
+* Any project that ships a non-weapon Inspector-Transform-ref
+  Instantiate pattern (item spawner referencing a `spawnSlot`,
+  projectile referencing a `muzzleTransform`, etc.). The first such
+  case won't have any pack catching it at all -- it just renders
+  broken.
+
+Probable trigger: the next time a SimpleFPS playtest surfaces a
+broken `Instantiate(prefab) + SetParent(transformField)` site that
+isn't a weapon. Or when a second FPS project enters the test bench.

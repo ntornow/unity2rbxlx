@@ -28,9 +28,14 @@ def generate_mesh_resolution_luau(
 
     Returns a list of Luau script strings, one per batch.
     """
+    # ``is_mesh_asset_key`` covers both ``.fbx``/``.obj`` paths and the
+    # synthetic ``<rel>#<file_id>`` keys minted by
+    # ``unity.embedded_mesh_extractor`` for legacy embedded meshes.
+    from core.asset_keys import is_mesh_asset_key
+
     mesh_entries = []
     for path, url in uploaded_assets.items():
-        if any(path.lower().endswith(ext) for ext in ['.fbx', '.obj']):
+        if is_mesh_asset_key(path):
             asset_id = url.replace("rbxassetid://", "")
             mesh_entries.append((path, int(asset_id)))
 

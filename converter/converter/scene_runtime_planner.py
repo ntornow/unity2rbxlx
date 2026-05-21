@@ -1,0 +1,819 @@
+"""scene_runtime_planner.py — Deterministic plan of every runtime-bearing
+MonoBehaviour the host runtime must instantiate.
+
+Built once per conversion before ``transpile_scripts``. Walks every scene
+and every prefab template, resolves each MonoBehaviour's ``m_Script`` to a
+canonical script id, and emits a per-instance / per-reference snapshot of
+what the Unity runtime would do at scene load — minus the engine.
+
+The output is the ``scene_runtime`` block persisted into
+``conversion_plan.json``. PR1 commits the schema and emits the structural
+fields (``stem``, ``class_name``, ``runtime_bearing``, instance / reference
+rows, stable ``prefab_id``s). Execution-domain fields (``domain``,
+``container``, ``module_path``) are added by PR3b — leaving them off the
+PR1 entries keeps the persistence merge in ``_classify_storage`` honest:
+old keys survive untouched, new keys fold in later.
+
+See ``converter/docs/design/scene-runtime-contract.md`` for the contract
+this module implements.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TypedDict, cast
+
+from core.unity_types import (
+    ComponentData,
+    GuidIndex,
+    ParsedScene,
+    PrefabLibrary,
+    PrefabNode,
+    PrefabTemplate,
+    SceneNode,
+)
+from unity.yaml_parser import ref_file_id, ref_guid
+
+
+# ---------------------------------------------------------------------------
+# Persisted schema (one ``scene_runtime`` block per conversion).
+#
+# Functional-form ``TypedDict`` is used for ``SceneRuntimeReference`` so the
+# ``from`` key (a Python keyword) can survive a JSON round-trip with the
+# spelling the contract pins. ``total=False`` on ``SceneRuntimeModule`` is
+# deliberate: PR3b will add ``domain`` / ``container`` / ``module_path``
+# without invalidating PR1-shaped artifacts on disk.
+# ---------------------------------------------------------------------------
+
+class SceneRuntimeModule(TypedDict, total=False):
+    """One row in ``scene_runtime.modules``. Keyed by canonical script id.
+
+    PR1 fields: ``stem``, ``class_name``, ``runtime_bearing``. PR3b adds
+    ``domain`` / ``container`` / ``module_path`` once the storage classifier
+    has run.
+    """
+
+    stem: str
+    class_name: str
+    runtime_bearing: bool
+
+
+class SceneRuntimeInstance(TypedDict):
+    """One MonoBehaviour instance attached to a scene or prefab GameObject."""
+
+    instance_id: str
+    script_id: str
+    game_object_id: str
+    active: bool
+    enabled: bool
+    # Scalar serialized fields only — non-scalar (refs) move to ``references``.
+    # Vector/Color-shaped structs are preserved as nested dicts so downstream
+    # consumers can read components without re-parsing.
+    config: dict[str, object]
+
+
+SceneRuntimeReference = TypedDict(
+    "SceneRuntimeReference",
+    {
+        "from": str,
+        "field": str,
+        "index": int | None,
+        # "component" | "gameobject" | "prefab" | "scriptable_object" | "asset"
+        # NOTE: ``component`` is reserved for peer-MonoBehaviour references --
+        # the only "components" PR2/PR4 give stable lookup surface to. Refs
+        # to built-in components (Rigidbody / Button / Collider / etc.)
+        # resolve to ``"gameobject"`` with the owning GO's id and an
+        # accompanying ``target_component_type`` so the host can search
+        # the GO for the right Roblox class. See the PR1 P1 codex finding.
+        "target_kind": str,
+        "target_ref": str,
+        "target_is_ui": bool,
+    },
+    total=True,
+)
+
+
+# Optional fields appended to a SceneRuntimeReference row. Kept separate from
+# the ``total=True`` shape so PR2/PR3a don't see schema breakage; PR4 reads
+# this when ``target_kind == "gameobject"`` and the field type was a built-in
+# component (Rigidbody, Button, AudioSource, etc.). Values are the Unity
+# component type name as it appears in the YAML (``Rigidbody``,
+# ``BoxCollider``, ``Button``, ``RectTransform``, ...).
+class SceneRuntimeReferenceExtra(TypedDict, total=False):
+    target_component_type: str
+
+
+class SceneRuntimeScene(TypedDict):
+    instances: list[SceneRuntimeInstance]
+    references: list[SceneRuntimeReference]
+    lifecycle_order: list[str]
+
+
+class SceneRuntimePrefab(TypedDict):
+    name: str
+    instances: list[SceneRuntimeInstance]
+    references: list[SceneRuntimeReference]
+    lifecycle_order: list[str]
+
+
+class SceneRuntimeArtifact(TypedDict):
+    modules: dict[str, SceneRuntimeModule]
+    scenes: dict[str, SceneRuntimeScene]
+    prefabs: dict[str, SceneRuntimePrefab]
+    # Operator-set ``script_id → "client" | "server"`` overrides. Read by
+    # PR3b's domain classifier; PR1 just preserves whatever's there.
+    domain_overrides: dict[str, str]
+
+
+# ---------------------------------------------------------------------------
+# Properties skipped during config / reference extraction. Mirrors the
+# ``serialized_field_extractor`` list — these are engine-internal keys, never
+# author-visible serialized data.
+# ---------------------------------------------------------------------------
+
+_MONO_INTERNAL_PROPS: frozenset[str] = frozenset({
+    "m_ObjectHideFlags",
+    "m_CorrespondingSourceObject",
+    "m_PrefabInstance",
+    "m_PrefabAsset",
+    "m_GameObject",
+    "m_Enabled",
+    "m_EditorHideFlags",
+    "m_Script",
+    "m_Name",
+    "m_EditorClassIdentifier",
+})
+
+# ScriptableObject-flavoured assets that surface from a serialized ref.
+_SCRIPTABLE_OBJECT_SUFFIX: str = ".asset"
+
+
+# ---------------------------------------------------------------------------
+# Identity helpers
+# ---------------------------------------------------------------------------
+
+def _scene_namespace(scene: ParsedScene, unity_project_root: Path | None) -> str:
+    """Stable identifier for a scene, used as the prefix for instance ids.
+
+    Project-relative path when computable, absolute path otherwise. Always a
+    forward-slashed string so JSON round-trips match across platforms.
+    """
+    return _relative_path_string(scene.scene_path, unity_project_root)
+
+
+def _relative_path_string(
+    path: Path, unity_project_root: Path | None,
+) -> str:
+    """Convert ``path`` to a forward-slashed project-relative string when
+    possible, falling back to a forward-slashed absolute string when the
+    path lives outside the project root or no root was supplied.
+    """
+    try:
+        if unity_project_root is not None:
+            rel = path.resolve().relative_to(unity_project_root.resolve())
+            return rel.as_posix()
+    except ValueError:
+        pass
+    return path.as_posix()
+
+
+def _prefab_stable_id(
+    template: PrefabTemplate,
+    guid_index: GuidIndex | None,
+    by_guid: dict[str, PrefabTemplate],
+    unity_project_root: Path | None,
+) -> str:
+    """Stable ``prefab_id`` = ``"<guid>:<project-relative-path>"``.
+
+    Bare name collides across folders (the design doc's whole reason for
+    this id shape); the GUID disambiguates while the path keeps the id
+    legible in dumps.
+    """
+    guid = ""
+    if guid_index is not None:
+        guid = guid_index.guid_for_path(template.prefab_path) or ""
+    if not guid:
+        # Fall back to the library's by_guid index (variants populate it
+        # before the library indexes meta GUIDs).
+        for g, t in by_guid.items():
+            if t is template:
+                guid = g
+                break
+    rel = _relative_path_string(template.prefab_path, unity_project_root)
+    return f"{guid}:{rel}" if guid else rel
+
+
+def _script_id_for(
+    mono_props: dict[str, object],
+    guid_index: GuidIndex | None,
+) -> str:
+    """Resolve a MonoBehaviour's ``m_Script`` to a canonical script id.
+
+    Prefers the .cs GUID (stable across project moves); falls back to the
+    project-relative ``.cs`` path when the GUID isn't resolvable. Returns
+    ``""`` when neither survives — caller is expected to skip the
+    MonoBehaviour rather than emit a row with no script attached.
+    """
+    script_ref = mono_props.get("m_Script")
+    if not isinstance(script_ref, dict):
+        return ""
+    guid = ref_guid(script_ref) or ""
+    if not guid:
+        return ""
+    if guid_index is not None:
+        path = guid_index.resolve(guid)
+        if path is not None and path.suffix == ".cs":
+            return guid
+        return ""
+    return guid
+
+
+# ---------------------------------------------------------------------------
+# UI detection — a target is "UI" when it (or an ancestor) carries a Canvas.
+# ---------------------------------------------------------------------------
+
+def _has_canvas(components: list[ComponentData]) -> bool:
+    for comp in components:
+        if comp.component_type == "Canvas":
+            return True
+    return False
+
+
+def _scene_ui_go_fids(scene: ParsedScene) -> set[str]:
+    """All GO fileIDs in the scene whose subtree is rooted at (or under) a
+    Canvas. PR1 marks reference rows that resolve into this set as
+    ``target_is_ui: true`` so PR3b's classifier can fold UI-bearing
+    instances into the client-domain signal without re-walking the scene.
+    """
+    ui: set[str] = set()
+
+    def _walk(node: SceneNode, in_canvas: bool) -> None:
+        is_canvas_subtree = in_canvas or _has_canvas(node.components)
+        if is_canvas_subtree:
+            ui.add(node.file_id)
+        for child in node.children:
+            _walk(child, is_canvas_subtree)
+
+    for root in scene.roots:
+        _walk(root, False)
+    return ui
+
+
+def _prefab_ui_go_fids(template: PrefabTemplate) -> set[str]:
+    """Same logic as ``_scene_ui_go_fids`` but for a prefab template."""
+    ui: set[str] = set()
+
+    def _prefab_has_canvas(node: PrefabNode) -> bool:
+        for comp in node.components:
+            if comp.component_type == "Canvas":
+                return True
+        return False
+
+    def _walk(node: PrefabNode, in_canvas: bool) -> None:
+        is_canvas_subtree = in_canvas or _prefab_has_canvas(node)
+        if is_canvas_subtree:
+            ui.add(node.file_id)
+        for child in node.children:
+            _walk(child, is_canvas_subtree)
+
+    if template.root is not None:
+        _walk(template.root, False)
+    return ui
+
+
+# ---------------------------------------------------------------------------
+# Reference / config classification.
+# ---------------------------------------------------------------------------
+
+def _is_object_ref(value: object) -> bool:
+    """Return True when a YAML value matches Unity's object-reference shape
+    — a dict carrying ``fileID`` (plus optional ``guid``). The zero-GUID
+    sentinel is still a reference; it just points inside the current file.
+    """
+    if not isinstance(value, dict):
+        return False
+    return "fileID" in value
+
+
+def _classify_reference(
+    value: dict[str, object],
+    guid_index: GuidIndex | None,
+    local_namespace: str,
+    local_go_fids: set[str],
+    ui_go_fids: set[str],
+    comp_fid_to_go_fid: dict[str, str],
+    mono_component_fids: set[str],
+    comp_fid_to_type: dict[str, str],
+    by_guid: dict[str, PrefabTemplate] | None,
+    unity_project_root: Path | None,
+) -> tuple[str, str, bool, str] | None:
+    """Resolve a single ref into
+    ``(target_kind, target_ref, target_is_ui, target_component_type)``.
+
+    Returns ``None`` when the ref is the zero-fileID null sentinel (Unity's
+    "unassigned" shape) — callers should skip those rows entirely so the
+    plan doesn't drown in nulls.
+
+    ``target_component_type`` is the empty string for every kind except
+    "gameobject"-from-built-in-component (Rigidbody / Button / RectTransform
+    / Collider / AudioSource / ...). It tells the host which component to
+    look up on the resolved GO. For peer-MonoBehaviour refs the kind stays
+    ``"component"`` and the host registry resolves the instance_id directly,
+    so the type field stays empty there too.
+    """
+    file_id_raw = value.get("fileID")
+    if file_id_raw in (0, "0", None):
+        # Unity's null ref — both fileID and guid are 0. Some fields also
+        # store ``{fileID: 0}`` for "deliberately empty"; either way nothing
+        # to wire.
+        guid = ref_guid(value) or ""
+        if not guid or guid == "0" * 32:
+            return None
+    file_id = str(file_id_raw) if file_id_raw is not None else ""
+
+    guid = ref_guid(value) or ""
+    if guid and guid != "0" * 32:
+        # Cross-asset reference.
+        if guid_index is not None:
+            path = guid_index.resolve(guid)
+            if path is not None:
+                suffix = path.suffix.lower()
+                if suffix == ".prefab":
+                    template = (by_guid or {}).get(guid)
+                    if template is not None:
+                        prefab_id = _prefab_stable_id(
+                            template, guid_index, by_guid or {},
+                            unity_project_root,
+                        )
+                    else:
+                        # Prefab GUID we can't resolve to a parsed template
+                        # (parse failure earlier in the pipeline). Use a
+                        # GUID-only id; PR3a's resolver fails closed.
+                        prefab_id = (
+                            f"{guid}:"
+                            f"{_relative_path_string(path, unity_project_root)}"
+                        )
+                    return ("prefab", prefab_id, False, "")
+                if suffix == _SCRIPTABLE_OBJECT_SUFFIX:
+                    return ("scriptable_object", guid, False, "")
+                return ("asset", guid, False, "")
+        # GUID present but unresolvable — record as asset with the raw guid.
+        return ("asset", guid, False, "")
+
+    # Local ref. ``file_id`` may identify either a GameObject (when it's a
+    # direct GO fid) or a Component (Transform / RectTransform / Button /
+    # MonoBehaviour / etc.). The UI signal lives at the GameObject level —
+    # a Canvas-subtree marker — so component refs must resolve through
+    # ``comp_fid_to_go_fid`` to the owning GO before the UI check, or any
+    # ``[SerializeField] Button quitBtn`` style field would be silently
+    # mislabeled ``target_is_ui=False``.
+    if not file_id:
+        return None
+    if file_id in local_go_fids:
+        # Direct GameObject reference. The schema's ``gameobject`` kind;
+        # no component type to attach.
+        owning_go = file_id
+        target_is_ui = owning_go in ui_go_fids
+        return ("gameobject", f"{local_namespace}:{file_id}", target_is_ui, "")
+    # Component reference. The schema only gives PR2/PR4 stable lookup for
+    # PEER MONOBEHAVIOURS via ``instance_id``; built-in components like
+    # ``Rigidbody`` / ``Button`` / ``RectTransform`` / ``Collider`` /
+    # ``AudioSource`` have no host-side instance id, so the host has to
+    # resolve them by walking the owning GameObject for the component
+    # class. Codex P1 finding: the prior implementation lumped both into
+    # ``target_kind="component"`` with a ``<namespace>:<component_fid>``
+    # ref the host couldn't resolve for built-in types.
+    owning_go = comp_fid_to_go_fid.get(file_id, "")
+    target_is_ui = owning_go in ui_go_fids if owning_go else False
+    if file_id in mono_component_fids:
+        # Peer MonoBehaviour: ref is the peer's instance_id (host registry
+        # looks it up directly). No component-type field needed.
+        return (
+            "component",
+            f"{local_namespace}:{file_id}",
+            target_is_ui,
+            "",
+        )
+    # Built-in component (or any non-MB component): resolve to the owning
+    # GameObject's id. The host walks the GO for the recorded component
+    # type. When ``comp_fid_to_go_fid`` can't resolve (cross-prefab ref to
+    # a component whose owner isn't in this walk's scope), fall back to
+    # the historical "component" kind so we don't silently drop the ref;
+    # the contract verifier will then surface the unresolvable target.
+    if not owning_go:
+        return (
+            "component",
+            f"{local_namespace}:{file_id}",
+            False,
+            comp_fid_to_type.get(file_id, ""),
+        )
+    return (
+        "gameobject",
+        f"{local_namespace}:{owning_go}",
+        target_is_ui,
+        comp_fid_to_type.get(file_id, ""),
+    )
+
+
+def _split_config_and_refs(
+    mono_props: dict[str, object],
+    namespace: str,
+    component_file_id: str,
+    guid_index: GuidIndex | None,
+    local_go_fids: set[str],
+    ui_go_fids: set[str],
+    comp_fid_to_go_fid: dict[str, str],
+    mono_component_fids: set[str],
+    comp_fid_to_type: dict[str, str],
+    by_guid: dict[str, PrefabTemplate] | None,
+    unity_project_root: Path | None,
+) -> tuple[dict[str, object], list[SceneRuntimeReference]]:
+    """Walk one MonoBehaviour's serialized fields. Scalars and structs go
+    into ``config``; object refs (single or array) become reference rows.
+    Returns ``(config, references)`` for that one component.
+    """
+    config: dict[str, object] = {}
+    refs: list[SceneRuntimeReference] = []
+    instance_id = f"{namespace}:{component_file_id}"
+
+    for key, value in mono_props.items():
+        if key in _MONO_INTERNAL_PROPS:
+            continue
+
+        if isinstance(value, list):
+            # Array field — may mix refs and plain values. Track the
+            # element index so the AI can rewire the array slot-by-slot.
+            # Null array slots are DROPPED rather than recorded under a
+            # synthetic ``target_kind: "null"`` — the contract enumerates
+            # five kinds (component/gameobject/prefab/scriptable_object/
+            # asset) and anything else violates the schema PR1 commits to.
+            # The AI sees the gap as a hole in the index sequence; the
+            # host treats it the same way Unity would (unassigned slot).
+            list_emitted_ref = False
+            scalar_elements: list[object] = []
+            for idx, element in enumerate(value):
+                if _is_object_ref(element):
+                    classified = _classify_reference(
+                        cast(dict[str, object], element), guid_index,
+                        namespace, local_go_fids, ui_go_fids,
+                        comp_fid_to_go_fid,
+                        mono_component_fids, comp_fid_to_type,
+                        by_guid, unity_project_root,
+                    )
+                    if classified is None:
+                        # Null sentinel — leave it out of refs entirely.
+                        list_emitted_ref = True
+                        continue
+                    target_kind, target_ref, target_is_ui, comp_type = classified
+                    row: SceneRuntimeReference = {
+                        "from": instance_id,
+                        "field": key,
+                        "index": idx,
+                        "target_kind": target_kind,
+                        "target_ref": target_ref,
+                        "target_is_ui": target_is_ui,
+                    }
+                    if comp_type:
+                        # SceneRuntimeReferenceExtra surface — added only
+                        # when the planner observed the built-in component
+                        # type and wants the host to know what to search
+                        # for on the resolved GameObject.
+                        cast(dict[str, object], row)["target_component_type"] = comp_type
+                    refs.append(row)
+                    list_emitted_ref = True
+                else:
+                    scalar_elements.append(element)
+            if not list_emitted_ref:
+                # Scalar-only array — keep it in config.
+                config[key] = scalar_elements
+            continue
+
+        if _is_object_ref(value):
+            classified = _classify_reference(
+                cast(dict[str, object], value), guid_index,
+                namespace, local_go_fids, ui_go_fids,
+                comp_fid_to_go_fid,
+                mono_component_fids, comp_fid_to_type,
+                by_guid, unity_project_root,
+            )
+            if classified is None:
+                continue
+            target_kind, target_ref, target_is_ui, comp_type = classified
+            row = {
+                "from": instance_id,
+                "field": key,
+                "index": None,
+                "target_kind": target_kind,
+                "target_ref": target_ref,
+                "target_is_ui": target_is_ui,
+            }
+            if comp_type:
+                cast(dict[str, object], row)["target_component_type"] = comp_type
+            refs.append(cast(SceneRuntimeReference, row))
+            continue
+
+        # Scalar or struct (Vector3 / Color / etc.) — stash verbatim.
+        config[key] = value
+
+    return config, refs
+
+
+# ---------------------------------------------------------------------------
+# Scene walk
+# ---------------------------------------------------------------------------
+
+def _walk_scene(
+    scene: ParsedScene,
+    namespace: str,
+    guid_index: GuidIndex | None,
+    by_guid: dict[str, PrefabTemplate],
+    unity_project_root: Path | None,
+    runtime_bearing: set[str],
+) -> SceneRuntimeScene:
+    """Build the per-scene block. DFS through scene roots so
+    ``lifecycle_order`` follows the hierarchy."""
+    instances: list[SceneRuntimeInstance] = []
+    references: list[SceneRuntimeReference] = []
+    lifecycle: list[str] = []
+
+    local_go_fids = set(scene.all_nodes.keys())
+    ui_go_fids = _scene_ui_go_fids(scene)
+    # ``comp_fid -> owning_go_fid`` so component refs (Transform / Button /
+    # RectTransform / sibling MonoBehaviours) propagate the UI signal
+    # through the owning GameObject — the lookup the contract relies on
+    # for ``target_is_ui``.
+    comp_fid_to_go_fid: dict[str, str] = {}
+    # ``comp_fid -> Unity component type name``. Populated alongside the
+    # owning-GO map; the codex P1 fix uses this to tell the host which
+    # built-in component (``Rigidbody`` / ``Button`` / ``BoxCollider`` /
+    # ...) to search for on the resolved GameObject when a serialized
+    # field references a non-MonoBehaviour component.
+    comp_fid_to_type: dict[str, str] = {}
+    # ``set(comp_fid)`` for components that ARE MonoBehaviours. Refs
+    # into this set keep ``target_kind="component"`` because PR2 stamps
+    # them with stable instance ids the host can look up directly.
+    mono_component_fids: set[str] = set()
+    for go_fid, n in scene.all_nodes.items():
+        for c in n.components:
+            comp_fid_to_go_fid[c.file_id] = go_fid
+            comp_fid_to_type[c.file_id] = c.component_type
+            if c.component_type == "MonoBehaviour":
+                mono_component_fids.add(c.file_id)
+
+    def _visit(node: SceneNode) -> None:
+        for comp in node.components:
+            if comp.component_type != "MonoBehaviour":
+                continue
+            script_id = _script_id_for(comp.properties, guid_index)
+            if not script_id:
+                continue
+            runtime_bearing.add(script_id)
+            enabled_raw = comp.properties.get("m_Enabled", 1)
+            enabled = bool(enabled_raw) if isinstance(enabled_raw, (int, bool)) else True
+
+            config, refs = _split_config_and_refs(
+                comp.properties, namespace, comp.file_id, guid_index,
+                local_go_fids, ui_go_fids, comp_fid_to_go_fid,
+                mono_component_fids, comp_fid_to_type,
+                by_guid, unity_project_root,
+            )
+
+            instance_id = f"{namespace}:{comp.file_id}"
+            instances.append({
+                "instance_id": instance_id,
+                "script_id": script_id,
+                "game_object_id": f"{namespace}:{node.file_id}",
+                "active": bool(node.active),
+                "enabled": enabled,
+                "config": config,
+            })
+            references.extend(refs)
+            lifecycle.append(instance_id)
+        for child in node.children:
+            _visit(child)
+
+    for root in scene.roots:
+        _visit(root)
+
+    return {
+        "instances": instances,
+        "references": references,
+        "lifecycle_order": lifecycle,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Prefab walk
+# ---------------------------------------------------------------------------
+
+def _walk_prefab(
+    template: PrefabTemplate,
+    prefab_id: str,
+    guid_index: GuidIndex | None,
+    by_guid: dict[str, PrefabTemplate],
+    unity_project_root: Path | None,
+    runtime_bearing: set[str],
+) -> SceneRuntimePrefab:
+    """Build the per-prefab block. Same shape as ``_walk_scene`` but the
+    namespace is the stable prefab id, instances are prefab-local, and
+    intra-prefab refs resolve against the prefab's own nodes."""
+    instances: list[SceneRuntimeInstance] = []
+    references: list[SceneRuntimeReference] = []
+    lifecycle: list[str] = []
+
+    local_go_fids = set(template.all_nodes.keys())
+    ui_go_fids = _prefab_ui_go_fids(template)
+    # Same comp_fid -> owning_go_fid map as in _walk_scene; mirrors the
+    # mapping prefab_parser builds when attaching components to PrefabNodes.
+    comp_fid_to_go_fid: dict[str, str] = {}
+    comp_fid_to_type: dict[str, str] = {}
+    mono_component_fids: set[str] = set()
+    for go_fid, n in template.all_nodes.items():
+        for c in n.components:
+            comp_fid_to_go_fid[c.file_id] = go_fid
+            comp_fid_to_type[c.file_id] = c.component_type
+            if c.component_type == "MonoBehaviour":
+                mono_component_fids.add(c.file_id)
+
+    def _visit(node: PrefabNode) -> None:
+        for comp in node.components:
+            if comp.component_type != "MonoBehaviour":
+                continue
+            script_id = _script_id_for(comp.properties, guid_index)
+            if not script_id:
+                continue
+            runtime_bearing.add(script_id)
+            enabled_raw = comp.properties.get("m_Enabled", 1)
+            enabled = bool(enabled_raw) if isinstance(enabled_raw, (int, bool)) else True
+
+            config, refs = _split_config_and_refs(
+                comp.properties, prefab_id, comp.file_id, guid_index,
+                local_go_fids, ui_go_fids, comp_fid_to_go_fid,
+                mono_component_fids, comp_fid_to_type,
+                by_guid, unity_project_root,
+            )
+
+            instance_id = f"{prefab_id}:{comp.file_id}"
+            instances.append({
+                "instance_id": instance_id,
+                "script_id": script_id,
+                "game_object_id": f"{prefab_id}:{node.file_id}",
+                "active": bool(node.active),
+                "enabled": enabled,
+                "config": config,
+            })
+            references.extend(refs)
+            lifecycle.append(instance_id)
+        for child in node.children:
+            _visit(child)
+
+    if template.root is not None:
+        _visit(template.root)
+
+    return {
+        "name": template.name,
+        "instances": instances,
+        "references": references,
+        "lifecycle_order": lifecycle,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Modules table (project-wide require graph).
+# ---------------------------------------------------------------------------
+
+def _build_modules_table(
+    guid_index: GuidIndex | None,
+    runtime_bearing: set[str],
+) -> dict[str, SceneRuntimeModule]:
+    """One row per ``.cs`` file in the project, keyed by canonical script
+    id (the .cs GUID). Stem-keyed lookup happens at the resolver level
+    (PR3a) — the source of truth here is GUID, which is what each
+    MonoBehaviour's ``m_Script`` points at.
+
+    ``class_name`` is filled best-effort via ``analyze_script``; helpers
+    without a parseable ``class`` keyword keep ``class_name=""`` and rely on
+    stem-keyed resolution. ``runtime_bearing`` is True for every script id
+    seen attached to a scene or prefab MonoBehaviour.
+    """
+    from unity.script_analyzer import analyze_script  # local — heavy regex compile
+
+    modules: dict[str, SceneRuntimeModule] = {}
+    if guid_index is None:
+        return modules
+
+    cs_entries = guid_index.filter_by_kind("script")
+    for script_guid, entry in cs_entries.items():
+        if entry.asset_path.suffix != ".cs":
+            continue
+        info = analyze_script(entry.asset_path)
+        modules[script_guid] = {
+            "stem": entry.asset_path.stem,
+            "class_name": info.class_name,
+            "runtime_bearing": script_guid in runtime_bearing,
+        }
+
+    # Scripts attached at runtime but absent from the guid index (e.g.,
+    # outside Assets/, dynamically loaded). Record them with empty stem
+    # so PR3a's resolver fails closed on the stem mismatch.
+    for script_id in runtime_bearing:
+        if script_id not in modules:
+            modules[script_id] = {
+                "stem": "",
+                "class_name": "",
+                "runtime_bearing": True,
+            }
+
+    return modules
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+def plan_scene_runtime(
+    parsed_scenes: list[ParsedScene],
+    prefab_library: PrefabLibrary | None,
+    guid_index: GuidIndex | None,
+    unity_project_root: Path | None = None,
+) -> SceneRuntimeArtifact:
+    """Build the project-level ``scene_runtime`` artifact.
+
+    Pure function over parsed inputs — safe to call from both single- and
+    multi-scene drivers. The returned dict is JSON-serializable and lands
+    verbatim in ``conversion_plan.json`` under the ``scene_runtime`` key.
+    """
+    by_guid: dict[str, PrefabTemplate] = (
+        dict(prefab_library.by_guid) if prefab_library is not None else {}
+    )
+
+    scenes_block: dict[str, SceneRuntimeScene] = {}
+    prefabs_block: dict[str, SceneRuntimePrefab] = {}
+    runtime_bearing: set[str] = set()
+
+    for scene in parsed_scenes:
+        namespace = _scene_namespace(scene, unity_project_root)
+        scenes_block[namespace] = _walk_scene(
+            scene, namespace, guid_index, by_guid,
+            unity_project_root, runtime_bearing,
+        )
+
+    if prefab_library is not None:
+        for template in prefab_library.prefabs:
+            prefab_id = _prefab_stable_id(
+                template, guid_index, by_guid, unity_project_root,
+            )
+            prefabs_block[prefab_id] = _walk_prefab(
+                template, prefab_id, guid_index, by_guid,
+                unity_project_root, runtime_bearing,
+            )
+
+    modules_block = _build_modules_table(guid_index, runtime_bearing)
+
+    return {
+        "modules": modules_block,
+        "scenes": scenes_block,
+        "prefabs": prefabs_block,
+        "domain_overrides": {},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Stem-keyed require graph (consumed by PR3a's require-resolution pass).
+#
+# The graph is a derivative view of the modules table — kept as a separate
+# helper so PR3a can call it without re-walking scenes. Stem collisions are
+# detected here and reported to the caller; PR3a is what actually
+# fail-closes on them.
+# ---------------------------------------------------------------------------
+
+class RequireGraph(TypedDict):
+    """Stem-keyed view of the modules table. ``by_stem[<stem>]`` maps to a
+    single script id when the stem is unique, and ``collisions`` lists the
+    stems that appear on more than one module. PR3a's resolver consults
+    ``by_stem`` for ``require("@scene_runtime/<stem>")`` and fails closed
+    when the stem is in ``collisions``.
+    """
+
+    by_stem: dict[str, str]
+    collisions: dict[str, list[str]]
+
+
+def build_require_graph(modules: dict[str, SceneRuntimeModule]) -> RequireGraph:
+    """Build the stem-keyed lookup. Collisions surface here; the enforcement
+    decision (fail closed under ``--scene-runtime=generic``) belongs to
+    PR3a so PR1 stays inert by default."""
+    by_stem: dict[str, str] = {}
+    collisions: dict[str, list[str]] = {}
+    seen: dict[str, list[str]] = {}
+    for script_id, mod in modules.items():
+        stem = mod.get("stem") or ""
+        if not stem:
+            continue
+        seen.setdefault(stem, []).append(script_id)
+    for stem, ids in seen.items():
+        if len(ids) == 1:
+            by_stem[stem] = ids[0]
+        else:
+            collisions[stem] = sorted(ids)
+    return {"by_stem": by_stem, "collisions": collisions}
