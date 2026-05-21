@@ -460,9 +460,16 @@ def convert(
     # PR3b: plumb the requested mode through to ctx so
     # _classify_storage's domain classifier knows whether to run.
     pipeline.ctx.scene_runtime_mode = scene_runtime
-    # PR6: plumb the playability-guard escape so write_output knows
-    # whether to downgrade or fail on missing plan + host emit.
-    pipeline.ctx.allow_nonplayable_output = allow_nonplayable_output
+    # PR6: plumb the playability-guard escape. Sticky opt-in --
+    # explicit True overrides persisted, False (the Click default)
+    # leaves the persisted value alone so a resume from a prior
+    # ``--allow-nonplayable-output`` conversion reproduces the same
+    # opt-in without the operator re-passing the flag. For
+    # ``--phase`` runs, this set is moot because ``Pipeline.resume``
+    # below blows ``self.ctx`` away with the on-disk copy; the value
+    # is reasserted post-resume.
+    if allow_nonplayable_output:
+        pipeline.ctx.allow_nonplayable_output = True
 
     # Plumb --universe-id / --place-id into the pipeline context so the
     # resolve_assets phase can run headless mesh resolution. Without this,
@@ -494,6 +501,16 @@ def convert(
 
     if phase:
         pipeline.resume(phase)
+        # PR6: ``Pipeline.resume`` swaps ``self.ctx`` for the on-disk
+        # copy after we set the CLI fields above. Re-assert here so
+        # ``--phase ... --allow-nonplayable-output`` actually downgrades
+        # the guard during the resumed write_output. Re-assert
+        # ``scene_runtime_mode`` for symmetry: the CLI choice on the
+        # resume invocation is authoritative, mirroring the
+        # ``_guard_scene_runtime_mode`` stamp check above.
+        pipeline.ctx.scene_runtime_mode = scene_runtime
+        if allow_nonplayable_output:
+            pipeline.ctx.allow_nonplayable_output = True
     else:
         pipeline.run_all()
 
@@ -763,10 +780,13 @@ def publish(
         # the requested mode (default legacy) so the domain classifier
         # doesn't mutate parent_path on a legacy rebuild.
         pipeline.ctx.scene_runtime_mode = scene_runtime
-        # PR6: thread the escape through the rebuild path too -- this
-        # is the branch that actually re-runs write_output (the cached
-        # ``.rbxl`` / chunked-cache fast paths above bypass it).
-        pipeline.ctx.allow_nonplayable_output = allow_nonplayable_output
+        # PR6: thread the escape through the rebuild path. Sticky
+        # opt-in -- explicit True overrides persisted; default False
+        # respects the persisted ctx (so a publish rebuild reproduces
+        # the original conversion's degraded-output opt-in without
+        # the operator re-passing the flag).
+        if allow_nonplayable_output:
+            pipeline.ctx.allow_nonplayable_output = True
         # Mark this rebuild path as an explicit resume so the
         # backward-compat FPS migration treats on-disk FPS scripts
         # as legitimately preserved rather than stale leftovers.
@@ -1666,6 +1686,9 @@ def eval_cmd(
             pipeline.ctx.scene_runtime_mode = _eval_scene_runtime
             # PR6: thread the escape so the eval driver doesn't abort
             # mid-suite when one project hits the playability guard.
+            # Eval always builds a fresh Pipeline per project so there
+            # is no persisted ctx to respect; we set unconditionally
+            # so ``False`` (the default) is the fail-closed behaviour.
             pipeline.ctx.allow_nonplayable_output = allow_nonplayable_output
             pipeline.run_all()
             elapsed = _time.monotonic() - t0

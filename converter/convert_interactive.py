@@ -633,11 +633,13 @@ def transpile(unity_project_path: str, output_dir: str,
     # PR3b: thread the requested mode into ctx so _classify_storage's
     # domain classifier knows whether to run.
     pipeline.ctx.scene_runtime_mode = scene_runtime
-    # PR6: thread the playability-guard escape. Transpile alone never
-    # reaches write_output, but ctx persists into the on-disk
-    # conversion_context.json so subsequent ``assemble`` runs against
-    # the same dir see the same opt-in without re-passing the flag.
-    pipeline.ctx.allow_nonplayable_output = allow_nonplayable_output
+    # PR6: thread the playability-guard escape. Sticky opt-in --
+    # explicit True overrides persisted; False (Click default) leaves
+    # the rehydrated ctx alone so subsequent ``assemble`` / ``upload``
+    # runs against the same dir reproduce the original opt-in without
+    # re-passing the flag.
+    if allow_nonplayable_output:
+        pipeline.ctx.allow_nonplayable_output = True
     try:
         _run_through(pipeline, "transpile_scripts")
     except Exception as exc:
@@ -862,9 +864,11 @@ def assemble(unity_project_path: str, output_dir: str,
     # PR3b: thread the requested mode into ctx so _classify_storage's
     # domain classifier knows whether to run.
     pipeline.ctx.scene_runtime_mode = scene_runtime
-    # PR6: thread the playability-guard escape so write_output's
-    # guard either fails closed or downgrades per the caller.
-    pipeline.ctx.allow_nonplayable_output = allow_nonplayable_output
+    # PR6: sticky opt-in -- explicit True overrides; False respects
+    # persisted (so an assemble rerun after a transpile that opted
+    # in still downgrades the guard automatically).
+    if allow_nonplayable_output:
+        pipeline.ctx.allow_nonplayable_output = True
 
     # Plumb --universe-id / --place-id into ctx so resolve_assets can run
     # headless mesh resolution on the first assemble invocation. Without
@@ -1045,10 +1049,10 @@ def upload(output_dir: str, api_key: str | None,
     # PR3b: honor the requested mode for the rebuild path. The default
     # legacy is the safe choice (this is upload, not transpile).
     pipeline.ctx.scene_runtime_mode = scene_runtime
-    # PR6: thread the playability-guard escape through the rebuild
-    # path so write_output's guard either fails or downgrades per the
-    # caller.
-    pipeline.ctx.allow_nonplayable_output = allow_nonplayable_output
+    # PR6: sticky opt-in -- explicit True overrides; False respects
+    # the persisted opt-in from the original assemble run.
+    if allow_nonplayable_output:
+        pipeline.ctx.allow_nonplayable_output = True
 
     # Rebuild rbx_place via the pipeline. Cloud side-effect phases
     # (moderate_assets, upload_assets, resolve_assets) are skipped because
