@@ -63,8 +63,21 @@ from converter.scene_runtime_planner import (
 )
 from converter.storage_classifier import (
     REPLICATED_STORAGE,
+    SERVER_SCRIPT_SERVICE,
     SERVER_STORAGE,
 )
+
+
+# Both ServerStorage and ServerScriptService are invisible to the client,
+# so a client-reachable helper parked in either container has the same
+# "client cannot require" problem and gets hoisted to ReplicatedStorage.
+# Pre-P1.1 the reachability pass only checked ServerStorage; helpers in
+# ServerScriptService stayed there and silently broke the client require
+# graph at runtime.
+_SERVER_CONTAINERS_FOR_REACHABILITY: frozenset[str] = frozenset({
+    SERVER_STORAGE,
+    SERVER_SCRIPT_SERVICE,
+})
 
 log = logging.getLogger(__name__)
 
@@ -151,30 +164,68 @@ _SERVER_RX = tuple(re.compile(p) for p in _GENERIC_SERVER_API_PATTERNS)
 _CSharpPattern = tuple[str, str, bool]
 
 
+# --- C# `using` import regex helpers ---
+#
+# A "using" line in C# can take several shapes the design doc all treats
+# as "this script imports namespace N":
+#   - ``using N;``                 -- ordinary import.
+#   - ``using static N.Member;``   -- static import of a member of N.
+#   - ``using Alias = N;``         -- alias for N (or any descendant).
+#   - ``using Alias = N.Sub;``     -- alias for a sub-namespace.
+# The codex P1 finding noted the old matcher only accepted form 1. We
+# expand to all four. The helper composes the alternation so each
+# namespace target only has to list its dotted prefix once.
+
+def _using_rx(namespace: str) -> str:
+    """Return a regex (string) matching any of the four C# ``using``
+    forms against ``namespace`` (a dotted name, e.g. ``"UnityEngine.UI"``).
+
+    All four forms must:
+      - sit at start of a (multiline) line modulo whitespace,
+      - end with a ``;``,
+    """
+    ns = re.escape(namespace)
+    return (
+        r"^\s*using\s+(?:"
+        # plain or static import: optional `static`, then namespace,
+        # optional `.Anything`, then `;`
+        rf"(?:static\s+)?{ns}(?:\.[\w.]+)?"
+        r"|"
+        # alias import: `Alias = namespace(.Anything)?`
+        rf"[A-Za-z_]\w*\s*=\s*{ns}(?:\.[\w.]+)?"
+        r")\s*;"
+    )
+
+
 _CS_STRONG_CLIENT: tuple[_CSharpPattern, ...] = (
     # Mirror / Netcode client-side annotations.
     (r"\[ClientRpc\b", "ClientRpc", True),
     (r"\[Client\b\]", "ClientAttribute", True),
     (r"\[ClientCallback\b", "ClientCallback", True),
-    # Unity UI namespace imports.
-    (r"^\s*using\s+UnityEngine\.UI\s*;", "using_UnityEngine_UI", False),
-    (r"^\s*using\s+TMPro\s*;", "using_TMPro", False),
-    (r"^\s*using\s+UnityEngine\.EventSystems\s*;",
+    # Unity UI namespace imports. The four `using` forms (plain, static,
+    # alias, alias-to-subspace) all count; see ``_using_rx``.
+    (_using_rx("UnityEngine.UI"), "using_UnityEngine_UI", False),
+    (_using_rx("TMPro"), "using_TMPro", False),
+    (_using_rx("UnityEngine.EventSystems"),
      "using_UnityEngine_EventSystems", False),
-    # Input
-    (r"\bInput\.(?:Get[A-Z]\w*|mousePosition|mouseScrollDelta|"
+    # Input. Anchor to start-of-expression so `someClass.Input.GetKey(...)`
+    # does NOT fire (the receiver `Input` is a Unity static type, not an
+    # instance member; `\b` alone permits a leading `.` member-access).
+    (r"(?<![.\w])Input\.(?:Get[A-Z]\w*|mousePosition|mouseScrollDelta|"
      r"touchCount|GetTouch|anyKey\b|anyKeyDown\b)",
      "Input_Get", False),
     # OnGUI methods (UI immediate-mode rendering — client-only).
     (r"\bvoid\s+OnGUI\s*\(\s*\)", "OnGUI_method", False),
-    # PlayerPrefs
-    (r"\bPlayerPrefs\.\w+\s*\(", "PlayerPrefs", False),
+    # PlayerPrefs — same start-of-expression anchor as Input.
+    (r"(?<![.\w])PlayerPrefs\.\w+\s*\(", "PlayerPrefs", False),
     # Cursor / Screen / Application.platform — client-only Unity APIs.
-    (r"\bCursor\.(?:visible|lockState|SetCursor)\b", "Cursor_API", False),
-    (r"\bScreen\.(?:width|height|fullScreen|orientation|"
+    # Same anchor: a user type called Cursor / Screen / Application via
+    # member access must not fire.
+    (r"(?<![.\w])Cursor\.(?:visible|lockState|SetCursor)\b", "Cursor_API", False),
+    (r"(?<![.\w])Screen\.(?:width|height|fullScreen|orientation|"
      r"currentResolution|resolutions)\b",
      "Screen_API", False),
-    (r"\bApplication\.platform\b", "Application_platform", False),
+    (r"(?<![.\w])Application\.platform\b", "Application_platform", False),
     # [SerializeField] field types pointing at UI components. Match on
     # the field type after [SerializeField] but before the field name.
     # We approximate with a lookbehind-free pattern: any [SerializeField]
@@ -191,8 +242,9 @@ _CS_STRONG_CLIENT: tuple[_CSharpPattern, ...] = (
 
 _CS_MODERATE_CLIENT: tuple[_CSharpPattern, ...] = (
     # Camera.main — per-player camera. Server scripts can read it but the
-    # idiom is overwhelmingly client.
-    (r"\bCamera\.main\b", "Camera_main", False),
+    # idiom is overwhelmingly client. Start-of-expression anchor: a user
+    # type called Camera reached via member access must not fire.
+    (r"(?<![.\w])Camera\.main\b", "Camera_main", False),
     # Animator playback APIs — see design doc rationale (moderate).
     (r"\bAnimator\b[^;]*\.(?:SetBool|SetFloat|SetInteger|SetTrigger|"
      r"CrossFade|Play|ResetTrigger)\s*\(",
@@ -218,10 +270,19 @@ _CS_STRONG_SERVER: tuple[_CSharpPattern, ...] = (
 )
 
 
-# Moderate server signals are derived at the class-graph level (e.g.,
-# require-graph reaches a NetworkBehaviour subclass) so they're not
-# table-driven here. Reserved for future expansion.
+# Moderate server signals come in two flavours:
+#   1. Regex-tabled (none today; reserved for future expansion).
+#   2. Graph-derived: stamped via ``moderate_server_extra`` injected into
+#      ``_collect_signals``. The require-graph-reaches-NetworkBehaviour
+#      signal (``network_behaviour_reachable``) is graph-derived because
+#      it depends on cross-module data the per-module pass can't see.
 _CS_MODERATE_SERVER: tuple[_CSharpPattern, ...] = ()
+
+
+# Name of the graph-derived moderate-server signal. Kept as a constant so
+# the planner-side stamping pass and the mirror_adoption_low annotated-
+# kind list can both reference it without string drift.
+_NETWORK_BEHAVIOUR_REACHABLE = "network_behaviour_reachable"
 
 
 def _compile_cs_table(
@@ -239,11 +300,175 @@ _CS_STRONG_SERVER_RX = _compile_cs_table(_CS_STRONG_SERVER)
 _CS_MODERATE_SERVER_RX = _compile_cs_table(_CS_MODERATE_SERVER)
 
 
-# Project-level Mirror/Netcode `using` import check for the
-# `mirror_adoption_low` heuristic.
-_RE_USING_MIRROR = re.compile(
-    r"^\s*using\s+(?:Mirror|Unity\.Netcode)\b", re.MULTILINE,
+# NetworkBehaviour detection: any class declaration that names
+# NetworkBehaviour (bare, Mirror-qualified, or Unity.Netcode-qualified)
+# in its base list. Match the colon + base list up through end of
+# class header (open brace) so we tolerate
+#     ``class Foo : NetworkBehaviour, IFoo {``
+# and
+#     ``class Foo : IBar, NetworkBehaviour {``
+# This is the planner-side detector for P1.3 (require graph reaches
+# NetworkBehaviour). Compiled once.
+_RE_NETWORK_BEHAVIOUR_CLASS = re.compile(
+    r"^\s*(?:public\s+|internal\s+|private\s+|protected\s+|"
+    r"abstract\s+|sealed\s+|static\s+|partial\s+|unsafe\s+)*"
+    r"class\s+[A-Za-z_]\w*"  # class name
+    r"(?:\s*<[^>]*>)?"  # optional generic parameter list
+    r"\s*:\s*[^{]*?"  # colon + base list (anything up to opening brace)
+    r"\b(?:NetworkBehaviour|Mirror\.NetworkBehaviour|"
+    r"Unity\.Netcode\.NetworkBehaviour)\b",
+    re.MULTILINE,
 )
+
+
+# Project-level Mirror/Netcode `using` import check for the
+# `mirror_adoption_low` heuristic. Same expanded-form coverage as
+# the per-module using patterns (plain / static / alias).
+_RE_USING_MIRROR = re.compile(
+    r"^\s*using\s+(?:"
+    r"(?:static\s+)?(?:Mirror|Unity\.Netcode)(?:\.[\w.]+)?"
+    r"|"
+    r"[A-Za-z_]\w*\s*=\s*(?:Mirror|Unity\.Netcode)(?:\.[\w.]+)?"
+    r")\s*;",
+    re.MULTILINE,
+)
+
+
+# ---------------------------------------------------------------------------
+# C# source pre-scrubber.
+#
+# Codex P1 finding: raw regex over the C# text false-positives on
+# commented or stringified API calls (``// using UnityEngine.UI;``,
+# ``"Input.GetKey"``). We strip the noisy spans BEFORE regex matching.
+#
+# We don't aim for a real lexer — that would require tracking
+# preprocessor directives, escape handling for interpolated strings'
+# embedded expressions, etc. Instead, we replace the contents of
+# comments and string/char literals with spaces. Newlines are
+# preserved so multi-line tracking by ``re.MULTILINE`` stays aligned
+# with source line numbers (useful for any future signal-location
+# reporting and avoids accidentally splicing tokens across lines).
+# ---------------------------------------------------------------------------
+
+def _strip_cs_noise(src: str) -> str:
+    """Replace comments / string + char literals in ``src`` with spaces.
+
+    Returns a same-length string (modulo trailing-NL invariants) so
+    regex line/column reporting still maps roughly back to original
+    source. Newlines are preserved verbatim so ``re.MULTILINE`` anchors
+    line up with the original.
+
+    Handles:
+      - ``// line comments`` (terminated by newline).
+      - ``/* block comments */`` (terminated by ``*/``).
+      - ``"strings"`` with ``\\`` escapes (single line).
+      - ``@"verbatim strings"`` (multi-line; ``""`` is an escaped quote).
+      - ``$"interpolated strings"`` (treated like regular strings;
+        embedded ``{...}`` content is NOT preserved — design tradeoff:
+        a Mirror RPC name interpolated into a log message would no
+        longer fire, but a stringified ``"Input.GetKey"`` won't either).
+      - ``'c'`` character literals.
+
+    NOT handled (acceptable for grep-style signal extraction):
+      - ``#if`` / ``#endif`` preprocessor regions (we don't pre-process).
+      - Raw string literals (``$@""...""``) — exotic.
+      - Identifiers prefixed with ``@`` (e.g. ``@class`` to escape the
+        keyword). The leading ``@`` doesn't change matching.
+    """
+    if not src:
+        return src
+    out: list[str] = []
+    n = len(src)
+    i = 0
+    while i < n:
+        c = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+        # Line comment
+        if c == "/" and nxt == "/":
+            # Scrub until end of line; keep the newline.
+            j = src.find("\n", i + 2)
+            if j == -1:
+                j = n
+            out.append(" " * (j - i))
+            i = j
+            continue
+        # Block comment
+        if c == "/" and nxt == "*":
+            j = src.find("*/", i + 2)
+            if j == -1:
+                # Unterminated block comment: scrub to end.
+                # Preserve newlines.
+                for ch in src[i:]:
+                    out.append("\n" if ch == "\n" else " ")
+                i = n
+                continue
+            # Scrub i..j+2, preserving newlines so re.MULTILINE lines up.
+            for ch in src[i:j + 2]:
+                out.append("\n" if ch == "\n" else " ")
+            i = j + 2
+            continue
+        # Verbatim string: @"..." (and interpolated-verbatim $@"...").
+        if (
+            c == "@"
+            and nxt == "\""
+        ) or (
+            c == "$" and i + 2 < n and src[i + 1] == "@" and src[i + 2] == "\""
+        ):
+            # Opening quote position.
+            start = i
+            i = i + 2 if c == "@" else i + 3
+            # Scan for closing `"` that isn't `""`.
+            while i < n:
+                if src[i] == "\"" and src[i + 1:i + 2] == "\"":
+                    i += 2
+                    continue
+                if src[i] == "\"":
+                    i += 1
+                    break
+                i += 1
+            for ch in src[start:i]:
+                out.append("\n" if ch == "\n" else " ")
+            continue
+        # Regular string or interpolated string: "..." or $"..."
+        if c == "\"" or (c == "$" and nxt == "\""):
+            start = i
+            i = i + 1 if c == "\"" else i + 2
+            while i < n:
+                ch = src[i]
+                if ch == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                if ch == "\"":
+                    i += 1
+                    break
+                if ch == "\n":
+                    # Unterminated string: bail out at end-of-line.
+                    break
+                i += 1
+            for sch in src[start:i]:
+                out.append("\n" if sch == "\n" else " ")
+            continue
+        # Char literal: '...' with `\` escapes.
+        if c == "'":
+            start = i
+            i += 1
+            while i < n:
+                ch = src[i]
+                if ch == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                if ch == "'":
+                    i += 1
+                    break
+                if ch == "\n":
+                    break
+                i += 1
+            for cch in src[start:i]:
+                out.append("\n" if cch == "\n" else " ")
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +583,15 @@ def classify_scene_runtime_domains(
     low_confidence: list[str] = []
     excluded: list[str] = []
 
+    # Pre-pass: compute the per-module set of moderate-server signal
+    # kinds that need cross-module data (require-graph reaches a
+    # NetworkBehaviour subclass). Empty under --networking=none per the
+    # design doc (the only graph-derived moderate-server signal is
+    # mirror_only).
+    network_reachable: set[str] = _compute_network_behaviour_reachable(
+        modules, dependency_map, _get_cs_source, networking,
+    )
+
     # Pass 1: per-module classification (signals → rule table → override).
     for script_id, module in modules.items():
         # Pre-stamp helpers + non-runtime-bearing rows. Helpers (not
@@ -370,12 +604,21 @@ def classify_scene_runtime_domains(
             _stamp_container_and_path(module, scripts_by_class)
             continue
 
+        # Graph-derived moderate-server signals injected per-module. Only
+        # ``network_behaviour_reachable`` exists today.
+        extra_moderate_server: tuple[str, ...] = (
+            (_NETWORK_BEHAVIOUR_REACHABLE,)
+            if script_id in network_reachable
+            else ()
+        )
+
         verdict, signals, instance_rows = _classify_module(
             script_id, module, scripts_by_class,
             per_instance_evidence.get(script_id, []),
             overrides.get(script_id),
             _get_cs_source(script_id),
             networking,
+            extra_moderate_server=extra_moderate_server,
         )
         module["domain"] = verdict
         module["domain_signals"] = signals
@@ -572,8 +815,17 @@ def _classify_module(
     override: str | None,
     cs_source: str,
     networking: str,
+    *,
+    extra_moderate_server: tuple[str, ...] = (),
 ) -> tuple[str, SceneRuntimeDomainSignals, list[SceneRuntimeDisplacedInstance]]:
-    """Return ``(domain, signals, displaced_instances)`` for one module."""
+    """Return ``(domain, signals, displaced_instances)`` for one module.
+
+    ``extra_moderate_server`` is the tuple of moderate-server signal kind
+    names sourced from the project-level pre-pass (graph-derived signals
+    that can't be answered by single-module C# scanning, e.g.
+    ``network_behaviour_reachable``). The signals get folded into the
+    moderate-server bucket alongside any table-driven hits.
+    """
     class_name = module.get("class_name", "")
     script = scripts_by_class.get(class_name)
     luau_source = script.source if script and script.source else ""
@@ -602,6 +854,7 @@ def _classify_module(
     # instance UI signal so we can decide whether to fire the conflict.
     code_counts = _collect_signals(
         cs_source, luau_source, [], networking,
+        extra_moderate_server=extra_moderate_server,
     )
     has_code_strong = (
         code_counts["strong_client"] + code_counts["strong_server"] > 0
@@ -628,6 +881,7 @@ def _classify_module(
     else:
         counts = _collect_signals(
             cs_source, luau_source, instance_evidence, networking,
+            extra_moderate_server=extra_moderate_server,
         )
 
     api = _classify_api_surface(luau_source)  # legacy field, kept for tests
@@ -717,6 +971,8 @@ def _collect_signals(
     luau_source: str,
     instance_evidence: list["_InstanceEvidence"],
     networking: str,
+    *,
+    extra_moderate_server: tuple[str, ...] = (),
 ) -> _SignalCounts:
     """Aggregate strong/moderate signal hits across all three channels.
 
@@ -724,6 +980,12 @@ def _collect_signals(
     channels (e.g., both C# and Luau pinning client) still counts once
     per channel listing but contributes only once to the strong/moderate
     bucket count.
+
+    ``extra_moderate_server`` lets the caller inject moderate-server
+    signal kinds whose source isn't the per-module signal channels
+    (graph-derived signals like ``network_behaviour_reachable``). They
+    are appended to ``cs_signals`` (closest existing channel) and added
+    to the moderate-server bucket.
     """
     cs_signals: list[str] = []
     luau_signals: list[str] = []
@@ -784,6 +1046,16 @@ def _collect_signals(
     if target_is_ui:
         instance_signals.append("target_is_ui")
         strong_client_kinds.add("target_is_ui")
+
+    # --- Graph-derived moderate-server signals ---
+    # Stamped by the caller after the project-level require-graph walk.
+    # Listed in cs_signals (it's the closest existing channel: the
+    # underlying evidence is the C# class hierarchy of a transitively-
+    # required module).
+    for kind in extra_moderate_server:
+        if kind not in moderate_server_kinds:
+            cs_signals.append(kind)
+            moderate_server_kinds.add(kind)
 
     return {
         "strong_client": len(strong_client_kinds),
@@ -876,9 +1148,13 @@ def _load_cs_source(
     if path is None or path.suffix != ".cs":
         return ""
     try:
-        return path.read_text(encoding="utf-8", errors="replace")
+        raw = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
+    # Strip comments / string + char literals BEFORE returning so every
+    # downstream regex pass sees only code tokens. Same-length output
+    # keeps line/column anchors stable for re.MULTILINE.
+    return _strip_cs_noise(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -1052,7 +1328,11 @@ def _apply_reachability_rule(
         if not helper_reached_by_client:
             continue
         current_container = script.parent_path or ""
-        if current_container == SERVER_STORAGE:
+        # Both ServerStorage AND ServerScriptService are invisible to
+        # the client require graph — the codex P1 found we only checked
+        # ServerStorage, so helpers in ServerScriptService stayed there
+        # and silently broke client requires at runtime.
+        if current_container in _SERVER_CONTAINERS_FOR_REACHABILITY:
             if helper_reached_by_server:
                 # Conflict: both sides want this helper.
                 module_id = class_to_script_id.get(helper_class)
@@ -1074,12 +1354,91 @@ def _apply_reachability_rule(
             if module_id and module_id in modules:
                 module_row = modules[module_id]
                 module_row["container"] = REPLICATED_STORAGE
+                # CRITICAL: also rewrite module_path. The Luau host
+                # resolves modules via ``module_path`` (see
+                # scene_runtime.luau:419-420 — ``resolveModule(scriptId,
+                # module_path)``), not via ``container``. Pre-P1.1 the
+                # hoist left ``module_path`` pointing at the old
+                # container; helpers hoisted into ReplicatedStorage
+                # still resolved to ``ServerStorage.X`` at runtime and
+                # silently failed. Use the same naming convention as
+                # ``_stamp_container_and_path``.
+                if script.name:
+                    module_row["module_path"] = (
+                        f"{REPLICATED_STORAGE}.{script.name}"
+                    )
                 signals = cast(
                     SceneRuntimeDomainSignals,
                     module_row.get("domain_signals", {}),
                 )
                 signals["reachability_forced_container"] = REPLICATED_STORAGE
                 module_row["domain_signals"] = signals
+
+
+def _compute_network_behaviour_reachable(
+    modules: dict[str, SceneRuntimeModule],
+    dependency_map: dict[str, list[str]] | None,
+    get_cs_source,  # type: ignore[no-untyped-def]
+    networking: str,
+) -> set[str]:
+    """Return the set of ``script_id``s whose transitive require graph
+    reaches a NetworkBehaviour subclass (excluding the script itself).
+
+    Implements the design doc's graph-derived moderate-server signal
+    (``network_behaviour_reachable``). Skipped under
+    ``--networking=none`` — the signal is mirror-only per the design
+    doc's signal table.
+
+    A module's own NetworkBehaviour-ness is already a STRONG-SERVER
+    signal (Rule-3 ``NetworkBehaviour_subclass``); this pass is about
+    indirect server-affinity via require edges.
+
+    Returns ``set()`` when dependency_map is empty or under
+    ``--networking=none``.
+    """
+    if not dependency_map or networking not in ("mirror", "netcode"):
+        return set()
+
+    # Build {class_name: is_network_behaviour}. We scan the (already-
+    # scrubbed-of-comments) C# source for the class-declaration regex.
+    class_to_script_id: dict[str, str] = {}
+    for script_id, module in modules.items():
+        class_name = module.get("class_name", "")
+        if class_name:
+            class_to_script_id.setdefault(class_name, script_id)
+
+    is_nb: dict[str, bool] = {}
+    for class_name, script_id in class_to_script_id.items():
+        src = get_cs_source(script_id)
+        is_nb[class_name] = bool(
+            src and _RE_NETWORK_BEHAVIOUR_CLASS.search(src)
+        )
+
+    # For each runtime-bearing module: walk its require closure, skip
+    # the module itself, see whether any reached class is NB.
+    reachable: set[str] = set()
+    for script_id, module in modules.items():
+        if not module.get("runtime_bearing"):
+            continue
+        class_name = module.get("class_name", "")
+        if not class_name:
+            continue
+        # Walk strictly downstream — exclude the seed class so a
+        # NetworkBehaviour itself doesn't stamp the moderate-server
+        # signal (it already trips strong-server via the table).
+        seeds: set[str] = set(dependency_map.get(class_name, ()))
+        closure = _closure(seeds, dependency_map)
+        # Add the immediate seeds too (``_closure`` returns the visited
+        # set after popping from a stack seeded with `seeds`, which
+        # already includes them — sanity check by union).
+        closure = closure | seeds
+        # Don't count the module's own class even if its require graph
+        # circles back.
+        closure.discard(class_name)
+        if any(is_nb.get(c) for c in closure):
+            reachable.add(script_id)
+
+    return reachable
 
 
 def _closure(
