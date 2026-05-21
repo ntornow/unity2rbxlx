@@ -653,7 +653,16 @@ local services = {
     resolveModule = resolveModule,
     workspaceFind = workspaceFind,
     findFirstChildWhichIsA = function(inst, class)
-        return inst and inst:FindFirstChildWhichIsA(class)
+        -- ``GetComponent("Rigidbody")`` etc. should hit a built-in
+        -- attached directly to the GameObject AS WELL as nested
+        -- children. Roblox's ``FindFirstChildWhichIsA`` skips the
+        -- instance itself, so a Part-rooted GameObject with
+        -- ``GetComponent("BasePart")`` returned nil pre-R3.
+        if not inst then return nil end
+        if type(inst.IsA) == "function" and inst:IsA(class) then
+            return inst
+        end
+        return inst:FindFirstChildWhichIsA(class)
     end,
     heartbeat = RunService.Heartbeat,
     fixedStep = 0.02,
@@ -761,7 +770,16 @@ local services = {
     resolveModule = resolveModule,
     workspaceFind = workspaceFind,
     findFirstChildWhichIsA = function(inst, class)
-        return inst and inst:FindFirstChildWhichIsA(class)
+        -- ``GetComponent("Rigidbody")`` etc. should hit a built-in
+        -- attached directly to the GameObject AS WELL as nested
+        -- children. Roblox's ``FindFirstChildWhichIsA`` skips the
+        -- instance itself, so a Part-rooted GameObject with
+        -- ``GetComponent("BasePart")`` returned nil pre-R3.
+        if not inst then return nil end
+        if type(inst.IsA) == "function" and inst:IsA(class) then
+            return inst
+        end
+        return inst:FindFirstChildWhichIsA(class)
     end,
     heartbeat = RunService.Heartbeat,
     fixedStep = 0.02,

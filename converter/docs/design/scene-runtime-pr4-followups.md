@@ -274,6 +274,45 @@ across `test_scene_runtime_host_behavior.py`,
 
 **P3:** none in round 2.
 
+### Codex review round 3 (2026-05-21)
+
+**P1 absorbed in-line** (all 3 fixed; regression tests in
+`test_scene_runtime_host_behavior.py`):
+
+- **R3-P1.1** `instantiatePrefab` bypassed the planner
+  ``active``/``enabled`` flag copy that the scene-boot path does, so a
+  dormant prefab instance immediately fired ``OnEnable`` + ``Start``.
+  Fix: mirror the scene-boot block (copy ``inst.active`` /
+  ``inst.enabled`` into ``_meta`` before ``_injectHostSurface``; also
+  hoist the per-instance tag indexing block). Test:
+  ``TestInstantiatePrefabDormantFlags``.
+- **R3-P1.2** ``_destroyComponent`` fired ``OnDestroy`` whenever
+  ``Awake`` ran, but the contract says BOTH ``OnDisable`` AND
+  ``OnDestroy`` are skipped when ``OnEnable`` never ran. Fix: gate
+  ``OnDestroy`` on ``everEnabled`` (``enableCalled || disableCalled``).
+  Tests: ``TestDormantDestroySkipsOnDestroy`` (dormant skip +
+  active-control fires).
+- **R3-P1.3** ``findFirstChildWhichIsA`` (Roblox) searches children
+  only, so ``self:GetComponent("Rigidbody")`` returned nil when the
+  host object was the ``BasePart`` itself. Fix: both entrypoints'
+  service helper now checks ``inst:IsA(class)`` before recursing.
+  Test: ``test_entrypoint_findfirstchild_helper_checks_self_first``.
+
+**P2 absorbed in-line:**
+
+- ``host:instantiatePrefab`` colon-form wrapper had four formals and
+  dropped ``externalRefs``. Fix: five-arg shape distinguishes colon
+  vs dotted reliably (mirrors the other host method wrappers). Test:
+  ``TestInstantiatePrefabColonFormPreservesExternalRefs``.
+- ``_replace_or_add`` matched by bare name only -- a user script
+  named e.g. ``SceneRuntime`` would be silently displaced. Fix:
+  per-target autogen markers; same-name scripts without the marker
+  are preserved and the emit logs a warning rather than overwriting.
+  Tests: ``TestAutogenDoesNotClobberUserNamedScripts`` x2 (user
+  preserved + prior autogen replaced).
+
+**P3:** none in round 3.
+
 ### Contract resolutions pinned in the design doc
 
 The three R2 P1s the user explicitly resolved are pinned in

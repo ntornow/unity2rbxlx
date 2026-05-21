@@ -377,6 +377,58 @@ class TestCrossDomainReportEdgeFreeRerun:
 # R2-P1.3: asset rewrite + scriptable_objects map populated in plan.
 # ---------------------------------------------------------------------------
 
+class TestAutogenDoesNotClobberUserNamedScripts:
+    """Codex round-3 P2: ``_replace_or_add`` previously replaced any
+    same-named script blindly. A user (or earlier converter pass)
+    script named ``SceneRuntime`` / ``SceneRuntimePlan`` / ... would
+    be silently dropped. The marker-gated replacement now keeps any
+    same-name script whose source does NOT carry our autogen marker."""
+
+    def test_user_named_scene_runtime_script_is_preserved(self, tmp_path):
+        p = _make_pipeline_with_ctx(
+            tmp_path, "generic", _runtime_bearing_plan(),
+        )
+        # Pre-seed a USER script named "SceneRuntime" that does NOT
+        # carry our autogen marker. The subphase must leave it alone.
+        user_script = RbxScript(
+            name="SceneRuntime",
+            source="-- USER OWNED do not delete\nreturn {}\n",
+            script_type="ModuleScript",
+            parent_path="ReplicatedStorage",
+        )
+        p.state.rbx_place.scripts.append(user_script)
+        p._subphase_inject_scene_runtime()
+        kept = [s for s in p.state.rbx_place.scripts if s.name == "SceneRuntime"]
+        assert any(s is user_script for s in kept), (
+            "user-owned SceneRuntime script must NOT be displaced; "
+            f"current scripts: {[s.name for s in p.state.rbx_place.scripts]}"
+        )
+
+    def test_prior_autogen_scene_runtime_is_replaced(self, tmp_path):
+        p = _make_pipeline_with_ctx(
+            tmp_path, "generic", _runtime_bearing_plan(),
+        )
+        # A prior autogen artifact carries the marker -- replacement OK.
+        prior = RbxScript(
+            name="SceneRuntime",
+            source="-- scene_runtime: PR4 generic host runtime\nold body\n",
+            script_type="ModuleScript",
+            parent_path="ReplicatedStorage",
+        )
+        p.state.rbx_place.scripts.append(prior)
+        p._subphase_inject_scene_runtime()
+        scene_runtime = [
+            s for s in p.state.rbx_place.scripts if s.name == "SceneRuntime"
+        ]
+        assert len(scene_runtime) == 1, (
+            f"prior autogen artifact must be replaced exactly once; "
+            f"got: {[s.source[:40] for s in scene_runtime]}"
+        )
+        assert "old body" not in scene_runtime[0].source, (
+            "fresh emit must overwrite prior autogen body"
+        )
+
+
 class TestAssetRefRewriteAndScriptableObjectsMap:
     """Codex round-2 P1.3 (contract resolution):
     - ``target_kind == "asset"`` refs persisted as Unity GUIDs must be

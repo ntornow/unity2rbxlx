@@ -222,12 +222,18 @@ function SceneRuntime:_makeHostSurface(owner)
 	local engine = self
 	local host
 	host = {
-		instantiatePrefab = function(prefab_id, parent, cframe, externalRefs)
-			-- Strip the colon-form receiver if present.
-			if prefab_id == host then
-				return engine:instantiatePrefab(parent, cframe, externalRefs, nil)
+		instantiatePrefab = function(arg1, arg2, arg3, arg4, arg5)
+			-- Colon form: host:instantiatePrefab(prefab_id, parent, cframe, externalRefs)
+			--   arg1 = host, arg2 = prefab_id, arg3 = parent, arg4 = cframe, arg5 = externalRefs
+			-- Dotted:      host.instantiatePrefab(prefab_id, parent, cframe, externalRefs)
+			--   arg1 = prefab_id, arg2 = parent, arg3 = cframe, arg4 = externalRefs
+			-- R3-P2: the four-arg colon-form wrapper dropped
+			-- externalRefs entirely by collapsing two arg shapes into
+			-- one set of formals. Five-arg shape preserves both.
+			if arg1 == host then
+				return engine:instantiatePrefab(arg2, arg3, arg4, arg5)
 			end
-			return engine:instantiatePrefab(prefab_id, parent, cframe, externalRefs)
+			return engine:instantiatePrefab(arg1, arg2, arg3, arg4)
 		end,
 		addComponent = function(arg1, arg2, arg3, arg4)
 			-- Dotted: addComponent(go, scriptId, config)
@@ -929,13 +935,18 @@ function SceneRuntime:_destroyComponent(comp)
 
 	local m = self._meta[comp]
 	if m then
-		-- ``OnDisable``/``OnDestroy`` are guaranteed-once and skipped
-		-- if OnEnable never ran.
+		-- Contract: BOTH ``OnDisable`` and ``OnDestroy`` are
+		-- guaranteed-once and skipped if ``OnEnable`` never ran. A
+		-- boot-dormant component that never satisfied the
+		-- active+enabled gate is torn down silently (no Awake-only
+		-- callbacks). R3-P1.2: previously OnDestroy fired whenever
+		-- Awake ran, violating the contract for dormant components.
+		local everEnabled = m.enableCalled or m.disableCalled
 		if m.enableCalled and not m.disableCalled then
 			m.disableCalled = true
 			self:_callMethod(comp, "OnDisable")
 		end
-		if m.awakeCalled then
+		if m.awakeCalled and everEnabled then
 			self:_callMethod(comp, "OnDestroy")
 		end
 	end
@@ -1038,6 +1049,28 @@ function SceneRuntime:instantiatePrefab(prefab_id, parent, cframe, externalRefs)
 		if comp then
 			componentByInstanceId[inst.instance_id] = comp
 			table.insert(componentList, comp)
+			-- Honor planner-supplied active/enabled/tag for prefab
+			-- instances exactly as the scene boot path does (R3-P1.1).
+			-- ``_injectHostSurface`` reads ``m.activeSelf`` /
+			-- ``m.enabled`` to decide whether to overwrite with
+			-- defaults; mirror the scene path so a prefab instance
+			-- booted dormant (``enabled=false`` / ``active=false``)
+			-- stays dormant until ``setEnabled`` / ``setActive``.
+			local m = self._meta[comp]
+			m.activeSelf = inst.active ~= false
+			m.enabled = inst.enabled ~= false
+			if inst.tag and inst.tag ~= "" then
+				m.tag = inst.tag
+				local list = self._byTag[inst.tag]
+				if not list then list = {}; self._byTag[inst.tag] = list end
+				local present = false
+				for _, x in ipairs(list) do
+					if x == goInst then present = true; break end
+				end
+				if goInst ~= nil and not present then
+					table.insert(list, goInst)
+				end
+			end
 		end
 	end
 	for _, comp in ipairs(componentList) do

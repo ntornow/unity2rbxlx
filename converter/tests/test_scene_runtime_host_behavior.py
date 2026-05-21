@@ -1706,3 +1706,265 @@ class TestScriptableObjectRefResolvesViaPlanMap:
             f"SO ref must resolve via scriptable_objects map; got: {out}, "
             f"err: {err}"
         )
+
+
+# ---------------------------------------------------------------------------
+# R3-P1.1: instantiatePrefab honors planner dormant flags
+# ---------------------------------------------------------------------------
+
+class TestInstantiatePrefabDormantFlags:
+    """Codex round-3 P1: ``instantiatePrefab`` previously bypassed the
+    planner ``active`` / ``enabled`` flag copy that the scene-boot path
+    does, so a dormant prefab instance (``enabled=false``) immediately
+    ran ``OnEnable`` + ``Start``."""
+
+    def test_prefab_instance_enabled_false_stays_dormant(self):
+        scenario = textwrap.dedent("""\
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            local onEnable = 0
+            local starts = 0
+            function Foo:OnEnable() onEnable = onEnable + 1 end
+            function Foo:Start() starts = starts + 1 end
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x"}},
+                scenes = {},
+                prefabs = {
+                    P = {
+                        template_name = "P",
+                        instances = {{instance_id = "P:1", script_id = "foo",
+                                      game_object_id = "go", active = true,
+                                      enabled = false, config = {}}},
+                        references = {},
+                        lifecycle_order = {"P:1"},
+                    },
+                },
+                domain_overrides = {},
+            }
+            local services = servicesFor(plan, {foo = Foo}, {})
+            services.clonePrefabTemplate = function(prefabId, parent, cframe)
+                return {Name = "Clone", _sceneRuntimeId = "clone-root",
+                        _children = {go = {Name = "Go",
+                                           _sceneRuntimeId = "go",
+                                           _children = {}}}}
+            end
+            services.resolveCloneChild = function(clone, goId)
+                return clone._children.go
+            end
+            local engine = SceneRuntime.new(services, plan)
+            engine:instantiatePrefab("P", nil, nil, nil)
+            runDeferred()
+            print("onEnable=" .. onEnable)
+            print("starts=" .. starts)
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, err
+        assert "onEnable=0" in out, (
+            f"dormant prefab instance must NOT fire OnEnable; got: {out}"
+        )
+        assert "starts=0" in out, (
+            f"dormant prefab instance must NOT fire Start; got: {out}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# R3-P1.2: dormant destroy skips OnDestroy
+# ---------------------------------------------------------------------------
+
+class TestDormantDestroySkipsOnDestroy:
+    """Codex round-3 P1: contract says BOTH OnDisable AND OnDestroy are
+    skipped when OnEnable never ran. A boot-dormant component destroyed
+    before activation must NOT fire OnDestroy."""
+
+    def test_dormant_then_destroy_skips_on_destroy(self):
+        scenario = textwrap.dedent("""\
+            local awakes = 0
+            local destroys = 0
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:Awake() awakes = awakes + 1 end
+            function Foo:OnDestroy() destroys = destroys + 1 end
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x"}},
+                scenes = {
+                    A = {
+                        instances = {{instance_id = "A:1", script_id = "foo",
+                                      game_object_id = "g", active = true,
+                                      enabled = false, config = {}}},
+                        references = {},
+                        lifecycle_order = {"A:1"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local go = {Name = "G", _sceneRuntimeId = "g", _children = {}}
+            local services = servicesFor(plan, {foo = Foo}, {g = go})
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+            local comp = engine:findObjectOfType('Foo')
+            engine:destroy(comp)
+            print("awakes=" .. awakes)
+            print("destroys=" .. destroys)
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, err
+        assert "awakes=1" in out, (
+            f"Awake must have fired at boot; got: {out}"
+        )
+        assert "destroys=0" in out, (
+            f"dormant component teardown must NOT fire OnDestroy; got: {out}"
+        )
+
+    def test_active_then_destroy_fires_on_destroy(self):
+        # Positive control: a live (active+enabled) component destroyed
+        # after boot DOES fire OnDestroy.
+        scenario = textwrap.dedent("""\
+            local destroys = 0
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:OnDestroy() destroys = destroys + 1 end
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x"}},
+                scenes = {
+                    A = {
+                        instances = {{instance_id = "A:1", script_id = "foo",
+                                      game_object_id = "g", active = true,
+                                      enabled = true, config = {}}},
+                        references = {},
+                        lifecycle_order = {"A:1"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local go = {Name = "G", _sceneRuntimeId = "g", _children = {}}
+            local services = servicesFor(plan, {foo = Foo}, {g = go})
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+            local comp = engine:findObjectOfType('Foo')
+            engine:destroy(comp)
+            print("destroys=" .. destroys)
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, err
+        assert "destroys=1" in out, (
+            f"active component teardown must fire OnDestroy; got: {out}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# R3-P1.3: GetComponent built-in fallback includes the GameObject itself.
+# ---------------------------------------------------------------------------
+
+class TestGetComponentBuiltinFallbackIncludesSelf:
+    """Codex round-3 P1: ``findFirstChildWhichIsA`` (Roblox) searches
+    children only, but the contract says ``self:GetComponent("Rigidbody")``
+    must return the GameObject itself when it IsA the named class. The
+    autogen entrypoints' service helper now checks ``inst:IsA(class)``
+    before the recursive child search.
+    """
+
+    def test_entrypoint_findfirstchild_helper_checks_self_first(self):
+        from converter.autogen import (
+            generate_scene_runtime_client_entrypoint,
+            generate_scene_runtime_server_entrypoint,
+        )
+        for gen in (
+            generate_scene_runtime_client_entrypoint,
+            generate_scene_runtime_server_entrypoint,
+        ):
+            src = gen().source
+            # The autogen-emitted helper must check IsA(class) before
+            # falling back to FindFirstChildWhichIsA. Search for the
+            # IsA-self pattern.
+            assert "inst:IsA(class)" in src, (
+                f"{gen.__name__} findFirstChildWhichIsA must check "
+                f"inst:IsA(class) so GetComponent on a Part-rooted GO "
+                f"finds the BasePart itself (R3-P1.3); got source: {src}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# R3-P2: host:instantiatePrefab colon-form preserves externalRefs.
+# ---------------------------------------------------------------------------
+
+class TestInstantiatePrefabColonFormPreservesExternalRefs:
+    """Codex round-3 P2: the colon-form wrapper for
+    ``host:instantiatePrefab(prefab_id, parent, cframe, externalRefs)``
+    previously dropped ``externalRefs`` because the wrapper collapsed
+    two arg shapes into four formals. Fix: five-arg shape distinguishes
+    colon vs dotted.
+    """
+
+    def test_colon_form_externalRefs_arrives(self):
+        scenario = textwrap.dedent("""\
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:Awake()
+                assert(self.injected == "override-value",
+                    "externalRefs must arrive on colon-form path")
+            end
+            -- A bootstrap component that calls host:instantiatePrefab(...).
+            local Boot = {} ; Boot.__index = Boot
+            function Boot.new(_) return setmetatable({}, Boot) end
+            function Boot:Awake()
+                self.host:instantiatePrefab("P", nil, nil, {
+                    ["P:1"] = {injected = "override-value"},
+                })
+            end
+            local plan = {
+                modules = {
+                    boot = {stem = "Boot", runtime_bearing = true,
+                            module_path = "x"},
+                    foo = {stem = "Foo", runtime_bearing = true,
+                            module_path = "y"},
+                },
+                scenes = {
+                    A = {
+                        instances = {{instance_id = "A:1", script_id = "boot",
+                                      game_object_id = "g", active = true,
+                                      enabled = true, config = {}}},
+                        references = {},
+                        lifecycle_order = {"A:1"},
+                    },
+                },
+                prefabs = {
+                    P = {
+                        template_name = "P",
+                        instances = {{instance_id = "P:1", script_id = "foo",
+                                      game_object_id = "pgo", active = true,
+                                      enabled = true, config = {}}},
+                        references = {},
+                        lifecycle_order = {"P:1"},
+                    },
+                },
+                domain_overrides = {},
+            }
+            local services = servicesFor(plan, {boot = Boot, foo = Foo},
+                                          {g = {Name = "G",
+                                                _sceneRuntimeId = "g",
+                                                _children = {}}})
+            services.clonePrefabTemplate = function(prefabId, parent, cframe)
+                return {Name = "Clone", _sceneRuntimeId = "clone-root",
+                        _children = {pgo = {Name = "Pgo",
+                                            _sceneRuntimeId = "pgo",
+                                            _children = {}}}}
+            end
+            services.resolveCloneChild = function(clone, goId)
+                return clone._children.pgo
+            end
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "DONE" in out, (
+            f"externalRefs must arrive on colon-form instantiatePrefab; "
+            f"got: {out}, err: {err}"
+        )
