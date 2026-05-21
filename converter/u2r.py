@@ -7,13 +7,39 @@ from __future__ import annotations
 import re
 import sys
 from pathlib import Path
+from typing import cast
 
 import click
 
 from unity.yaml_parser import is_text_yaml as _is_text_yaml
 from utils.credentials import resolve_credential as _resolve_credential
 from utils.logging_config import setup_logging
+from utils.scene_runtime_stamp import (
+    SceneRuntimeMode,
+    SceneRuntimeModeMismatch,
+    guard_or_clean_output_dir,
+)
 from utils.script_cache import scripts_cache_intact
+
+
+def _guard_scene_runtime_mode(
+    output_dir: Path, requested: str, clean: bool,
+) -> None:
+    """Front-door wrapper around ``guard_or_clean_output_dir``.
+
+    Translates a ``SceneRuntimeModeMismatch`` into a Click usage error
+    so the operator sees a clean CLI message rather than a stack trace.
+    Idempotent: matching stamp is a no-op; absent stamp on a fresh dir
+    writes the requested mode.
+    """
+    try:
+        guard_or_clean_output_dir(
+            output_dir,
+            cast(SceneRuntimeMode, requested),
+            clean=clean,
+        )
+    except SceneRuntimeModeMismatch as exc:
+        raise click.UsageError(str(exc)) from exc
 
 
 def _enforce_scene_runtime_legacy_until_pr4(value: str) -> None:
@@ -305,6 +331,12 @@ def main(verbose: bool) -> None:
                    "``python -m converter.tools.scene_runtime_spike`` "
                    "to exercise the contract verifier on real projects "
                    "before PR4.")
+@click.option("--clean", is_flag=True,
+              help="Remediation for --scene-runtime mode mismatches: "
+              "wipe the output directory and re-stamp it before "
+              "running any phase. Use when switching modes on an "
+              "existing output dir (e.g., legacy run on a "
+              "generic-stamped dir). PR3b.")
 def convert(
     unity_project: str,
     output: str,
@@ -320,6 +352,7 @@ def convert(
     scaffolding: str | None,
     skip_architecture_step: bool,
     scene_runtime: str,
+    clean: bool,
 ) -> None:
     """Convert a Unity project to a Roblox experience.
 
@@ -339,6 +372,11 @@ def convert(
     # there's no way to honor the request and the user needs to know
     # right away. See ``_enforce_scene_runtime_legacy_until_pr4``.
     _enforce_scene_runtime_legacy_until_pr4(scene_runtime)
+
+    # PR3b: stamp + mismatch guard. Runs BEFORE any phase, BEFORE
+    # ``scripts_cache_intact`` checks. ``--clean`` is the remediation
+    # path that wipes the output dir + restamps.
+    _guard_scene_runtime_mode(Path(output), scene_runtime, clean)
 
     # u2r.py convert runs only Pipeline.PHASES, which never includes the
     # client/server architecture split ("Step 4a") — and a --phase resume
@@ -404,6 +442,10 @@ def convert(
         skip_upload=no_upload,
         scaffolding=scaffolding_set,
     )
+
+    # PR3b: plumb the requested mode through to ctx so
+    # _classify_storage's domain classifier knows whether to run.
+    pipeline.ctx.scene_runtime_mode = scene_runtime
 
     # Plumb --universe-id / --place-id into the pipeline context so the
     # resolve_assets phase can run headless mesh resolution. Without this,
@@ -538,6 +580,16 @@ def convert(
               "rebuilding an output directory created before the "
               "scaffolding field existed and you want the FPS scripts/HUD "
               "back without re-running the full conversion.")
+@click.option("--scene-runtime",
+              type=click.Choice(["legacy", "auto", "generic"]),
+              default="legacy",
+              show_default=True,
+              help="Scene-runtime contract mode for the rebuild path. "
+                   "Must match the output dir's stamp (or pass --clean).")
+@click.option("--clean", is_flag=True,
+              help="Wipe the output directory before publishing (PR3b "
+              "mode-mismatch remediation). Use with --scene-runtime "
+              "when switching modes.")
 def publish(
     output_dir: str,
     api_key: str | None,
@@ -545,6 +597,8 @@ def publish(
     universe_id: int | None,
     place_id: int | None,
     scaffolding: str | None,
+    scene_runtime: str,
+    clean: bool,
 ) -> None:
     """Publish a previously converted place to Roblox with proper meshes.
 
@@ -557,6 +611,9 @@ def publish(
     """
     import config
     output_path = Path(output_dir).resolve()
+
+    _enforce_scene_runtime_legacy_until_pr4(scene_runtime)
+    _guard_scene_runtime_mode(output_path, scene_runtime, clean)
 
     from roblox.id_cache import read_ids, write_ids
     from roblox.place_publisher import (
@@ -677,6 +734,10 @@ def publish(
         pipeline.ctx = prior_ctx
         pipeline.ctx.universe_id = uid
         pipeline.ctx.place_id = pid
+        # PR3b: publish's rebuild path re-runs _classify_storage; honor
+        # the requested mode (default legacy) so the domain classifier
+        # doesn't mutate parent_path on a legacy rebuild.
+        pipeline.ctx.scene_runtime_mode = scene_runtime
         # Mark this rebuild path as an explicit resume so the
         # backward-compat FPS migration treats on-disk FPS scripts
         # as legitimately preserved rather than stale leftovers.
@@ -1494,7 +1555,12 @@ def audit_assets(output_dir: str, api_key: str | None, fail_on_reject: bool) -> 
               help="Scene-runtime contract mode. 'auto'/'generic' route "
                    "through the contract pipeline (PR4); rejected at "
                    "this CLI until then.")
-def eval_cmd(output: str, baseline: str | None, scene_runtime: str) -> None:
+@click.option("--clean", is_flag=True,
+              help="PR3b: wipe per-project output dirs before "
+              "converting (mode-mismatch remediation).")
+def eval_cmd(
+    output: str, baseline: str | None, scene_runtime: str, clean: bool,
+) -> None:
     """Convert all test projects and capture quality metrics.
 
     Converts every populated project under ../test_projects/ with --no-upload,
@@ -1516,6 +1582,12 @@ def eval_cmd(output: str, baseline: str | None, scene_runtime: str) -> None:
     test_projects_dir = Path(__file__).parent.parent / "test_projects"
     out_root = Path(output).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
+
+    # PR3b: per-project mode guard. The eval driver creates one output
+    # dir per project under out_root; guard each before reading it.
+    # ``--clean`` wipes per-project dirs if the stamps disagree.
+    _eval_clean = clean
+    _eval_scene_runtime = scene_runtime
 
     projects: list[tuple[str, Path]] = []
     if test_projects_dir.is_dir():
@@ -1542,6 +1614,11 @@ def eval_cmd(output: str, baseline: str | None, scene_runtime: str) -> None:
         proj_out = out_root / name
         proj_out.mkdir(parents=True, exist_ok=True)
 
+        # PR3b: per-project mode guard runs BEFORE the pipeline so a
+        # stale stamp from a prior --scene-runtime run is caught before
+        # any phase looks at the cache.
+        _guard_scene_runtime_mode(proj_out, _eval_scene_runtime, _eval_clean)
+
         t0 = _time.monotonic()
         try:
             pipeline = Pipeline(
@@ -1549,6 +1626,8 @@ def eval_cmd(output: str, baseline: str | None, scene_runtime: str) -> None:
                 output_dir=proj_out,
                 skip_upload=True,
             )
+            # PR3b: plumb mode to ctx so the domain classifier honors it.
+            pipeline.ctx.scene_runtime_mode = _eval_scene_runtime
             pipeline.run_all()
             elapsed = _time.monotonic() - t0
 

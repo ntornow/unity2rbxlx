@@ -128,6 +128,15 @@ class ConversionContext:
     # is empty.
     scaffolding: list[str] = field(default_factory=list)
 
+    # PR3b: requested scene-runtime contract mode. One of
+    # ``"legacy"`` / ``"auto"`` / ``"generic"``. Plumbed in from the
+    # front-door commands (``u2r convert/publish/eval``,
+    # ``convert_interactive transpile/assemble/upload``); read by
+    # ``Pipeline._classify_storage`` to gate the domain classifier
+    # so the legacy path stays byte-identical (per the design doc's
+    # "default output byte-identical" invariant carried over from PR3a).
+    scene_runtime_mode: str = "legacy"
+
     def __post_init__(self) -> None:
         # JSON load via `cls(**data)` populates storage_plan as a dict (the
         # asdict() form). Reconstruct it as a StoragePlan when present so the

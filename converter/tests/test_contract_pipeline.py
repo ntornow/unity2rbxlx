@@ -367,6 +367,62 @@ class TestTranspileWithContract:
         assert result.total_runtime_bearing == 1
 
 
+class TestStubStrategyFailClosed:
+    """PR3b carry-over from PR3a P2 #1.
+
+    When AI transpilation is unavailable (``use_ai=False``, backend
+    error, low confidence), runtime-bearing modules fall through to the
+    stub generator. The contract pipeline must surface this as a
+    ``stub_strategy`` fail-closed row so auto-mode can drop to legacy.
+    """
+
+    def test_stub_runtime_bearing_emits_stub_strategy_row(
+        self, two_script_project,
+    ) -> None:
+        proj, infos, scene_runtime = two_script_project
+        result = transpile_with_contract(
+            unity_project_path=proj,
+            script_infos=infos,
+            scene_runtime=scene_runtime,
+            use_ai=False,  # forces fallthrough to the stub generator
+        )
+        # Enemy is runtime-bearing; with use_ai=False it transpiles to a
+        # stub (or rule_based). Either way, ``strategy != "ai"`` and PR3b
+        # surfaces a fail-closed row.
+        stub_rows = [
+            f for f in result.fail_closed if f.kind == "stub_strategy"
+        ]
+        assert stub_rows, (
+            "No stub_strategy fail-closed row. PR3b's contract pipeline "
+            "must flag runtime-bearing modules that fell through to a "
+            "non-AI strategy."
+        )
+        enemy_row = next(
+            (f for f in stub_rows if "Enemy" in f.detail), None,
+        )
+        assert enemy_row is not None
+        # Detail names the strategy so the operator sees why.
+        assert "stub" in enemy_row.detail or "rule_based" in enemy_row.detail
+
+    def test_non_runtime_bearing_stub_does_not_fire(
+        self, two_script_project,
+    ) -> None:
+        proj, infos, scene_runtime = two_script_project
+        result = transpile_with_contract(
+            unity_project_path=proj,
+            script_infos=infos,
+            scene_runtime=scene_runtime,
+            use_ai=False,
+        )
+        # Helper is NOT runtime-bearing; even if it stubs, no row should
+        # name it.
+        helper_rows = [
+            f for f in result.fail_closed
+            if f.kind == "stub_strategy" and "Helper" in f.detail
+        ]
+        assert not helper_rows
+
+
 # ---------------------------------------------------------------------------
 # Pre/post-reprompt pass-rate accounting
 # ---------------------------------------------------------------------------

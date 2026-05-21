@@ -113,7 +113,13 @@ class FailClosed:
     ``kind`` field so the gate report can show why a project would have
     failed under ``auto``."""
 
-    kind: str    # "verifier" | "require_missing" | "require_collision"
+    # "verifier" | "require_missing" | "require_collision" |
+    # "runtime_bearing_collision" | "stub_strategy"
+    # ``stub_strategy``: AI fell through to the stub generator on a
+    # runtime-bearing module (backend disabled, transient error). The
+    # auto-mode fallback in PR3b treats this as operationally equivalent
+    # to a contract failure -- a stub can't host the runtime contract.
+    kind: str
     detail: str
 
 
@@ -345,6 +351,23 @@ def transpile_with_contract(
     for script in transpilation.scripts:
         if Path(script.source_path) not in runtime_bearing_paths:
             continue
+        # PR3b: stub_strategy fail-closed (carry-over from PR3a P2 #1).
+        # When the AI transpiler is unavailable / disabled / errored,
+        # ``code_transpiler.transpile`` falls through to the stub
+        # generator (``strategy="stub"``) which emits a placeholder
+        # ``print(...)`` body. A runtime-bearing module can't host the
+        # contract on stub output; ``auto`` mode must treat this as a
+        # fail-closed signal to fall back to legacy.
+        if script.strategy != "ai":
+            fail_closed.append(FailClosed(
+                kind="stub_strategy",
+                detail=(
+                    f"{Path(script.source_path).name}: runtime-bearing "
+                    f"module fell through to {script.strategy!r} strategy "
+                    f"(AI unavailable). Stub modules cannot satisfy the "
+                    f"runtime contract."
+                ),
+            ))
         post_warnings = [
             w for w in script.warnings if _is_post_reprompt_warning(w)
         ]

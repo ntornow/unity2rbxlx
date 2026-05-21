@@ -49,13 +49,61 @@ class SceneRuntimeModule(TypedDict, total=False):
     """One row in ``scene_runtime.modules``. Keyed by canonical script id.
 
     PR1 fields: ``stem``, ``class_name``, ``runtime_bearing``. PR3b adds
-    ``domain`` / ``container`` / ``module_path`` once the storage classifier
-    has run.
+    ``domain`` / ``container`` / ``module_path`` / ``domain_signals`` once
+    the storage classifier has run.
+
+    ``domain`` values: ``"client"`` | ``"server"`` | ``"legacy"`` (the last
+    when the contract conflict-resolution kicks the module back to the
+    legacy bootstrap path). ``container`` mirrors the storage_classifier
+    parent_path (``"ReplicatedStorage"`` / ``"ServerStorage"`` /
+    ``"ServerScriptService"`` / ``"StarterPlayer.StarterPlayerScripts"`` /
+    ``"StarterPlayer.StarterCharacterScripts"`` / ``"ReplicatedFirst"``).
+    ``module_path`` is the relative path the host runtime requires
+    (``"scripts/foo.luau"`` shape). ``domain_signals`` records why PR3b
+    chose what it did so PR4's report can attribute decisions to the
+    operator.
     """
 
     stem: str
     class_name: str
     runtime_bearing: bool
+    domain: str
+    container: str
+    module_path: str
+    domain_signals: "SceneRuntimeDomainSignals"
+
+
+class SceneRuntimeDomainSignals(TypedDict, total=False):
+    """Per-module audit trail for PR3b's domain classifier. All fields
+    optional — only the ones that fired show up in the persisted artifact.
+
+    ``api_surface``: ``"client"`` | ``"server"`` | ``"both"`` | ``"neither"``
+        — the verdict from the new generic-only API pattern table.
+    ``ui_signal``: True if at least one instance's references resolved
+        into a converted Canvas / UI subtree (``target_is_ui`` aggregation).
+    ``intra_class_conflict``: True if instances of this script produce
+        conflicting per-instance UI evidence AND the API surface was
+        ambiguous (``"neither"`` or contradicted by overrides).
+    ``override_applied``: True if the final ``domain`` came from
+        ``scene_runtime.domain_overrides`` rather than classifier inference.
+    ``low_confidence``: True when the verdict is the "neither signal,
+        defaulted to server" fallback — flagged so operators see what
+        the classifier wasn't sure about.
+    ``reachability_forced_container``: ``"ReplicatedStorage"`` if the
+        reachability rule moved this module from ServerStorage to RS to
+        satisfy a client require; absent otherwise.
+    ``fail_closed_reason``: ``"both_side_api"`` | ``"intra_class_conflict"``
+        | ``"reachability_conflict"`` — present only when ``domain`` is
+        ``"legacy"``.
+    """
+
+    api_surface: str
+    ui_signal: bool
+    intra_class_conflict: bool
+    override_applied: bool
+    low_confidence: bool
+    reachability_forced_container: str
+    fail_closed_reason: str
 
 
 class SceneRuntimeInstance(TypedDict):
@@ -116,13 +164,44 @@ class SceneRuntimePrefab(TypedDict):
     lifecycle_order: list[str]
 
 
-class SceneRuntimeArtifact(TypedDict):
+class SceneRuntimeDisplacedInstance(TypedDict):
+    """One row in ``scene_runtime.displaced_instances``: an instance whose
+    domain disagrees with the class's final ``domain`` (operator pinned the
+    class via ``domain_overrides`` despite intra-class conflict). PR4's
+    conversion-time report enumerates these so the operator sees which
+    instances won't execute their lifecycle on the chosen side.
+
+    ``scene``: the scene path or prefab id the instance lives in.
+    ``instance_id``: the per-instance id from PR1's planner.
+    ``game_object_id``: the host GameObject's stable id.
+    ``script_id``: which class the instance belongs to.
+    ``effective_domain``: what the class was forced to (``"client"`` or
+        ``"server"``).
+    ``inferred_domain``: what this individual instance's evidence
+        suggested (``"client"`` / ``"server"`` / ``"neither"``).
+    """
+
+    scene: str
+    instance_id: str
+    game_object_id: str
+    script_id: str
+    effective_domain: str
+    inferred_domain: str
+
+
+class SceneRuntimeArtifact(TypedDict, total=False):
     modules: dict[str, SceneRuntimeModule]
     scenes: dict[str, SceneRuntimeScene]
     prefabs: dict[str, SceneRuntimePrefab]
     # Operator-set ``script_id → "client" | "server"`` overrides. Read by
     # PR3b's domain classifier; PR1 just preserves whatever's there.
     domain_overrides: dict[str, str]
+    # PR3b populates these post-classify_storage. Optional so PR1/PR2/PR3a
+    # artifacts persisted to disk don't fail validation on resume.
+    displaced_instances: list[SceneRuntimeDisplacedInstance]
+    # Low-confidence verdicts (``script_id``s the operator may want to
+    # pin via ``domain_overrides``).
+    low_confidence_modules: list[str]
 
 
 # ---------------------------------------------------------------------------

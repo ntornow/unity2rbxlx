@@ -124,12 +124,80 @@ class TestSceneRuntimePersistence:
         raw = json.loads(
             (pipeline.output_dir / "conversion_plan.json").read_text()
         )
-        # ``guid-a`` is gone — structural refresh, not merge.
-        assert raw["scene_runtime"]["modules"] == {
-            "guid-b": {
-                "stem": "Bar", "class_name": "Bar", "runtime_bearing": True,
-            },
+        # ``guid-a`` is gone — structural refresh, not merge. PR3b adds
+        # ``domain`` / ``domain_signals`` etc. during _classify_storage,
+        # so assert subset rather than exact equality.
+        modules = raw["scene_runtime"]["modules"]
+        assert set(modules.keys()) == {"guid-b"}
+        assert modules["guid-b"]["stem"] == "Bar"
+        assert modules["guid-b"]["class_name"] == "Bar"
+        assert modules["guid-b"]["runtime_bearing"] is True
+
+    def test_legacy_mode_skips_domain_classifier(
+        self, tmp_path: Path,
+    ):
+        # PR3b P1 fix (codex review): when ctx.scene_runtime_mode is
+        # legacy (the default), _classify_storage must NOT run the
+        # domain classifier. Specifically, RbxScript.parent_path must
+        # not be mutated by the reachability sub-pass, otherwise legacy
+        # emit placement drifts vs pre-PR3b output (breaks PR3a's
+        # "byte-identical default" invariant).
+        #
+        # Setup uses a PR3b-only client signal (``RenderStepped``) so the
+        # legacy storage_classifier does NOT classify ClientA as client
+        # on its own. Only PR3b's expanded table would trigger the hoist,
+        # so the assertion (helper stays in legacy classifier's chosen
+        # container) cleanly distinguishes PR3b ran vs PR3b skipped.
+        pipeline = _make_pipeline(tmp_path)
+        _seed_scene_runtime(pipeline)
+        pipeline.ctx.scene_runtime["modules"]["guid-h"] = {
+            "stem": "Helper", "class_name": "Helper",
+            "runtime_bearing": True,
         }
+        from core.roblox_types import RbxScript
+        helper = RbxScript(
+            name="Helper", source="return {}", script_type="ModuleScript",
+        )
+        client = RbxScript(
+            name="ClientA",
+            # PR3b-only client signal -- not in legacy table.
+            source="RunService.RenderStepped:Connect(fn)",
+            script_type="ModuleScript",
+        )
+        pipeline.state.rbx_place.scripts = [client, helper]
+        pipeline.state.dependency_map = {"ClientA": ["Helper"]}
+
+        # Default scene_runtime_mode is "legacy" — classifier must skip.
+        assert pipeline.ctx.scene_runtime_mode == "legacy"
+        pipeline._classify_storage()
+
+        # parent_path NOT touched by PR3b. The legacy classifier put
+        # Helper somewhere — capture that to compare with the generic
+        # case below.
+        legacy_helper_path = helper.parent_path
+
+        # Re-run with generic mode; PR3b's classifier should now fire.
+        # Reset the helper to a known starting state so we can detect
+        # mutation cleanly. The reachability rule only fires when the
+        # current parent_path is ServerStorage.
+        from converter.storage_classifier import (
+            REPLICATED_STORAGE, SERVER_STORAGE,
+        )
+        helper.parent_path = SERVER_STORAGE
+        pipeline.ctx.scene_runtime_mode = "generic"
+        # Pre-set the client module's domain so reachability has a seed
+        # (the planner artifact in _seed_scene_runtime is intentionally
+        # minimal; we don't go through the full first-pass here).
+        pipeline.ctx.scene_runtime["modules"]["guid-a"] = {
+            "stem": "ClientA", "class_name": "ClientA",
+            "runtime_bearing": True,
+        }
+        pipeline._classify_storage()
+        assert helper.parent_path == REPLICATED_STORAGE, (
+            f"PR3b reachability rule did not hoist Helper under generic; "
+            f"got {helper.parent_path}. Legacy path returned "
+            f"{legacy_helper_path}."
+        )
 
     def test_resume_loads_scene_runtime_block_back_into_ctx(
         self, tmp_path: Path,

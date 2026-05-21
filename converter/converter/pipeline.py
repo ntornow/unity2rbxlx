@@ -3736,6 +3736,38 @@ script.Disabled = true
         # 3-key dict that silently dropped anything else.
         scene_runtime = self._merge_scene_runtime(plan_path)
 
+        # PR3b: stamp per-module ``domain`` / ``container`` / ``module_path``
+        # / ``domain_signals`` once the storage classifier has finalized
+        # every script's ``parent_path``. **Gated on
+        # ``ctx.scene_runtime_mode != "legacy"`` so the legacy emit path
+        # stays byte-identical** (per PR3a's "default output byte-identical"
+        # invariant). The reachability sub-pass mutates RbxScript.parent_path
+        # in service of the contract pipeline -- running it under legacy
+        # would shift script placement for ANY project whose code matches
+        # PR3b's new generic-only client patterns (RenderStepped, etc.)
+        # without an operator opt-in, which is exactly what PR3a's
+        # invariant prohibits.
+        #
+        # Tests can override the gate either by setting
+        # ``ctx.scene_runtime_mode = "generic"`` or, for the narrow
+        # case of probing classify_storage in isolation, by setting
+        # ``scene_runtime["__skip_domain_classifier__"] = True``.
+        if (
+            self.ctx.scene_runtime_mode != "legacy"
+            and scene_runtime.get("modules")
+            and not scene_runtime.get("__skip_domain_classifier__")
+        ):
+            from converter.scene_runtime_domain import (
+                classify_scene_runtime_domains,
+            )
+            report = classify_scene_runtime_domains(
+                cast("dict", scene_runtime),
+                self.state.rbx_place.scripts,
+                dependency_map=self.state.dependency_map or None,
+            )
+            scene_runtime["displaced_instances"] = report["displaced_instances"]
+            scene_runtime["low_confidence_modules"] = report["low_confidence_modules"]
+
         plan_path.write_text(
             _json.dumps({
                 "storage_plan": plan.to_dict(),
