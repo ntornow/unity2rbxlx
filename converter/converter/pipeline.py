@@ -2311,6 +2311,13 @@ return table.concat(allData, "\\n")'''
             mesh_hierarchies=mesh_hierarchies,
             fbx_bounding_boxes=fbx_bounding_boxes,
             unity_project_root=self.unity_project_path,
+            # PR3c: thread the planner artifact + mode through so the
+            # generic-only inactive-retention carve-out in ``_convert_node``
+            # can see which inactive GameObjects the host runtime needs to
+            # bind. Legacy mode passes an unused artifact (the carve-out
+            # gates on mode first), so legacy emit stays byte-identical.
+            scene_runtime=self.ctx.scene_runtime,
+            scene_runtime_mode=self.ctx.scene_runtime_mode,
         )
         # Count all parts recursively (including nested prefab children)
         def _count_parts(parts):

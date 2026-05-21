@@ -135,6 +135,8 @@ def _is_ui_image_mb(props: dict[str, Any]) -> bool:
 def convert_canvas(
     canvas_nodes: list[SceneNode],
     scene_namespace: str = "",
+    scene_runtime_mode: str = "legacy",
+    suppress_static_children_ids: frozenset[str] | None = None,
 ) -> list[RbxScreenGui]:
     """Convert a list of Unity Canvas root nodes to Roblox ScreenGui objects.
 
@@ -148,11 +150,29 @@ def convert_canvas(
         scene_namespace: Scene-runtime namespace string used as the
             ``_SceneRuntimeId`` prefix for stamped UI hosts. Empty string
             means stamping is skipped (synthetic / legacy callers).
+        scene_runtime_mode: PR3c — the requested scene-runtime contract
+            mode for this conversion. ``"generic"`` enables the
+            serialized-field child-suppression carve-out (Piece 4); any
+            other value (``"legacy"`` / ``"auto"`` / default) preserves
+            the pre-PR3c static-emit behavior byte-identically. Legacy
+            callers don't pass this and get the historical path.
+        suppress_static_children_ids: PR3c — set of
+            ``"<scene_namespace>:<file_id>"`` ids identifying UI
+            GameObjects whose runtime-bearing controller has a serialized
+            field referencing an asset / prefab. Under generic the static
+            child tree under those elements is dropped; the host runtime
+            instantiates the content via ``host.instantiatePrefab``.
+            Empty / None means no suppression (the generic test fires on
+            membership, so legacy passes ``None`` and gets the old path).
 
     Returns:
         List of RbxScreenGui objects.
     """
     results: list[RbxScreenGui] = []
+    suppress_ids = suppress_static_children_ids or frozenset()
+    suppression_active = (
+        scene_runtime_mode == "generic" and bool(suppress_ids)
+    )
 
     for canvas_node in canvas_nodes:
         screen_gui = RbxScreenGui(name=canvas_node.name)
@@ -167,7 +187,12 @@ def convert_canvas(
         _stamp_scene_runtime_id(screen_gui, canvas_node.file_id, scene_namespace)
 
         for child in canvas_node.children:
-            element = _convert_ui_element(child, scene_namespace)
+            element = _convert_ui_element(
+                child, scene_namespace,
+                suppress_static_children_ids=(
+                    suppress_ids if suppression_active else frozenset()
+                ),
+            )
             if element is not None:
                 screen_gui.elements.append(element)
 
@@ -268,6 +293,7 @@ def _apply_canvas_scaler(screen_gui: RbxScreenGui, canvas_node: SceneNode) -> No
 
 def _convert_ui_element(
     node: SceneNode, scene_namespace: str = "",
+    suppress_static_children_ids: frozenset[str] = frozenset(),
 ) -> RbxUIElement | None:
     """Recursively convert a SceneNode (under a Canvas) to an RbxUIElement.
 
@@ -279,6 +305,14 @@ def _convert_ui_element(
         scene_namespace: Scene-runtime namespace for ``_SceneRuntimeId``
             stamping; threaded through recursion so every descendant UI
             host gets stamped under the same ``<scene>:<fileID>`` scheme.
+        suppress_static_children_ids: PR3c — UI GameObject ids
+            (``"<scene_namespace>:<file_id>"``) whose runtime-bearing
+            controller owns an asset / prefab serialized field. Under
+            generic mode, those elements' static child trees are dropped
+            (the host runtime instantiates them via
+            ``host.instantiatePrefab``). Empty frozenset disables the
+            carve-out — legacy mode passes empty, so child emit is
+            byte-identical to pre-PR3c.
 
     Returns:
         An RbxUIElement, or None if the node should be skipped.
@@ -397,9 +431,27 @@ def _convert_ui_element(
     # Detect layout group components.
     _apply_layout_properties(element, node.components)
 
+    # PR3c carve-out (generic-only): if this UI GameObject's runtime-
+    # bearing controller has a serialized field referencing an asset or
+    # prefab, the host runtime is responsible for instantiating the
+    # static child tree at runtime (via ``host.instantiatePrefab``).
+    # Emitting them statically here would double-stamp the tree — runtime
+    # adds its copy and the static copy never goes away. We drop static
+    # descendants under this element; the stamped ``_SceneRuntimeId``
+    # plus the runtime's binding is the source of truth for what lives
+    # under it. Legacy mode never reaches this branch because the caller
+    # passes an empty ``suppress_static_children_ids``.
+    if scene_namespace and node.file_id:
+        sr_id = f"{scene_namespace}:{node.file_id}"
+        if sr_id in suppress_static_children_ids:
+            return element
+
     # Recurse into children.
     for child_node in node.children:
-        child_element = _convert_ui_element(child_node, scene_namespace)
+        child_element = _convert_ui_element(
+            child_node, scene_namespace,
+            suppress_static_children_ids=suppress_static_children_ids,
+        )
         if child_element is not None:
             element.children.append(child_element)
 

@@ -183,6 +183,24 @@ class SceneConversionContext:
     # (no scene_path or no project root available).
     scene_runtime_namespace: str = ""
 
+    # Requested scene-runtime contract mode for this conversion. Mirrors
+    # ``ConversionContext.scene_runtime_mode``; threaded into the per-call
+    # context so helpers can gate generic-only behavior (PR3c carve-outs:
+    # inactive-but-referenced retention in ``_convert_node`` / prefab
+    # instance conversion) without changing legacy output. Values:
+    # ``"legacy"`` (default — current behavior) / ``"auto"`` / ``"generic"``.
+    scene_runtime_mode: str = "legacy"
+
+    # Set of ``_SceneRuntimeId`` values (``"<scene>:<fileID>"``) the planner
+    # marked as runtime-referenced — either by appearing as a reference
+    # target in any scene's reference rows OR by hosting a runtime-bearing
+    # MonoBehaviour instance. Generic-mode-only consumer in ``_convert_node``
+    # / prefab-instance pruning: an inactive GameObject in this set is
+    # emitted dormant (so the host runtime can ``setActive(true)`` it
+    # later); inactive GOs not in this set continue to be pruned. Empty
+    # set under legacy mode → the prune branch is byte-identical to before.
+    scene_runtime_referenced_ids: set[str] = field(default_factory=set)
+
     # Outputs (accumulated during conversion, consumed before convert_scene returns)
     water_regions: list[RbxWaterRegion] = field(default_factory=list)
     unhandled_components: set[str] = field(default_factory=set)
@@ -978,6 +996,258 @@ def _compose_parts_with_parent_cframe(
             )
 
 
+# ---------------------------------------------------------------------------
+# PR3c — generic-only inactive-retention helpers (Piece 3 / Piece 4)
+# ---------------------------------------------------------------------------
+#
+# Under ``--scene-runtime=generic`` the host runtime needs inactive GameObjects
+# that runtime-bearing modules touch (either as the host of a runtime-bearing
+# MonoBehaviour or as the target of a serialized field on one) to land in the
+# converted place as **dormant** Roblox instances, so ``host.setActive(true)``
+# can light them up later. The legacy converter prunes all inactive GameObjects
+# unconditionally — under PR3c that remains the default; only the new
+# generic-only branch in ``_convert_node`` consults the set below to keep
+# inactive-but-referenced GOs around.
+
+def _collect_runtime_referenced_ids(
+    scene_runtime: dict[str, object] | None,
+) -> set[str]:
+    """Walk the planner artifact and collect every
+    ``"<scene>:<file_id>"`` / ``"<prefab_id>:<file_id>"`` id the host
+    runtime cares about for inactive-retention purposes.
+
+    A GameObject id is "runtime-referenced" if any of the following holds:
+
+      * It hosts a runtime-bearing MonoBehaviour instance
+        (``scene_runtime.scenes[*].instances[*].game_object_id`` or
+        ``scene_runtime.prefabs[*].instances[*].game_object_id``).
+      * It is the target of any serialized-field reference whose
+        ``target_kind`` is ``gameobject`` or ``component`` (the local-ref
+        kinds — asset/prefab/scriptable_object targets resolve to GUID-keyed
+        ids that don't appear in the scene tree).
+
+    Empty / missing artifact → empty set; the caller gates further on
+    ``scene_runtime_mode == "generic"`` so legacy never sees this set
+    populated.
+    """
+    if not scene_runtime:
+        return set()
+    referenced: set[str] = set()
+
+    # scenes[*]
+    scenes = scene_runtime.get("scenes", {})
+    if isinstance(scenes, dict):
+        for scene_block in scenes.values():
+            if not isinstance(scene_block, dict):
+                continue
+            for inst in scene_block.get("instances", []) or []:
+                if isinstance(inst, dict):
+                    go_id = inst.get("game_object_id")
+                    if isinstance(go_id, str) and go_id:
+                        referenced.add(go_id)
+            for ref in scene_block.get("references", []) or []:
+                if not isinstance(ref, dict):
+                    continue
+                tk = ref.get("target_kind")
+                tr = ref.get("target_ref")
+                if tk in ("gameobject", "component") and isinstance(tr, str) and tr:
+                    referenced.add(tr)
+
+    # prefabs[*] — prefab-internal ids never collide with scene ids
+    # (different namespace), so a single combined set is unambiguous.
+    prefabs = scene_runtime.get("prefabs", {})
+    if isinstance(prefabs, dict):
+        for prefab_block in prefabs.values():
+            if not isinstance(prefab_block, dict):
+                continue
+            for inst in prefab_block.get("instances", []) or []:
+                if isinstance(inst, dict):
+                    go_id = inst.get("game_object_id")
+                    if isinstance(go_id, str) and go_id:
+                        referenced.add(go_id)
+            for ref in prefab_block.get("references", []) or []:
+                if not isinstance(ref, dict):
+                    continue
+                tk = ref.get("target_kind")
+                tr = ref.get("target_ref")
+                if tk in ("gameobject", "component") and isinstance(tr, str) and tr:
+                    referenced.add(tr)
+
+    return referenced
+
+
+def _collect_ui_child_suppression_ids(
+    scene_runtime: dict[str, object] | None,
+) -> frozenset[str]:
+    """Build the set of UI GameObject ids whose static child trees the
+    converter should drop under generic mode (PR3c carve-out 2).
+
+    A UI element's children are suppressed iff a runtime-bearing
+    MonoBehaviour mounted on the same GameObject owns a serialized field
+    referencing an asset or prefab. Under generic the host runtime owns
+    instantiation of that content via ``host.instantiatePrefab`` —
+    emitting the static descendants AS WELL would double-stamp the tree
+    (runtime adds its copy; static copy never gets removed).
+
+    Algorithm:
+      1. Index each instance by ``instance_id → (script_id, game_object_id)``.
+      2. Walk references; for any row whose ``target_kind`` is ``asset`` or
+         ``prefab``, look up the source instance's module
+         (``modules[script_id]``) and check ``runtime_bearing == True``.
+      3. If so, add the source instance's ``game_object_id`` to the set.
+
+    A missing module row, missing ``runtime_bearing`` flag, or unknown
+    instance ref is silently skipped — under generic the planner is
+    authoritative; the carve-out fires only on confirmed signals. Empty
+    set under all uncertainty preserves the legacy static-emit path.
+    """
+    if not scene_runtime:
+        return frozenset()
+    modules = scene_runtime.get("modules", {})
+    if not isinstance(modules, dict):
+        return frozenset()
+
+    suppressed: set[str] = set()
+
+    def _process_block(block: object) -> None:
+        if not isinstance(block, dict):
+            return
+        # instance_id -> (script_id, game_object_id) lookup within the block.
+        # Scoping per-block matches the planner's namespace separation:
+        # scene instance_ids never collide with prefab instance_ids.
+        instance_lookup: dict[str, tuple[str, str]] = {}
+        for inst in block.get("instances", []) or []:
+            if not isinstance(inst, dict):
+                continue
+            iid = inst.get("instance_id")
+            sid = inst.get("script_id")
+            gid = inst.get("game_object_id")
+            if isinstance(iid, str) and isinstance(sid, str) and isinstance(gid, str):
+                instance_lookup[iid] = (sid, gid)
+
+        for ref in block.get("references", []) or []:
+            if not isinstance(ref, dict):
+                continue
+            tk = ref.get("target_kind")
+            if tk not in ("asset", "prefab"):
+                continue
+            src = ref.get("from")
+            if not isinstance(src, str):
+                continue
+            lookup = instance_lookup.get(src)
+            if lookup is None:
+                continue
+            script_id, game_object_id = lookup
+            module_row = modules.get(script_id)
+            if not isinstance(module_row, dict):
+                continue
+            if not module_row.get("runtime_bearing"):
+                continue
+            # Codex P1: when the domain classifier has already run
+            # (`module_row["domain"]` is populated), exclude fail-closed
+            # modules. PR3b's classifier may force a module to
+            # ``domain="legacy"`` (both-side API, intra-class conflict,
+            # reachability conflict); the host runtime never wires those
+            # modules, so the static UI subtree must persist. At
+            # ``convert_scene`` time the classifier hasn't run yet
+            # (subphase order: ``convert_scene`` → ``_classify_storage``),
+            # so the field is typically absent — in that case we fall
+            # back to ``runtime_bearing`` per the brief. This guard fires
+            # only when callers (or future architecture changes) thread
+            # a post-classify artifact in.
+            if module_row.get("domain") == "legacy":
+                continue
+            suppressed.add(game_object_id)
+
+    scenes = scene_runtime.get("scenes", {})
+    if isinstance(scenes, dict):
+        for scene_block in scenes.values():
+            _process_block(scene_block)
+    prefabs = scene_runtime.get("prefabs", {})
+    if isinstance(prefabs, dict):
+        for prefab_block in prefabs.values():
+            _process_block(prefab_block)
+
+    return frozenset(suppressed)
+
+
+def _scene_runtime_id_for(file_id: str) -> str:
+    """Build the ``"<scene_namespace>:<file_id>"`` lookup key for the
+    in-flight ``convert_scene`` call. Returns the empty string when either
+    side is empty (so callers can use string equality cleanly and the
+    membership test in ``scene_runtime_referenced_ids`` just misses)."""
+    ns = _ctx().scene_runtime_namespace
+    if not ns or not file_id:
+        return ""
+    return f"{ns}:{file_id}"
+
+
+def _emit_dormant_holder(
+    node: SceneNode, scene_nodes: dict[str, SceneNode],
+) -> RbxPart:
+    """Build the dormant Roblox Model for an inactive-but-referenced
+    GameObject under generic mode (PR3c carve-out).
+
+    The host runtime resolves the holder by ``_SceneRuntimeId`` and calls
+    ``host.setActive(true)`` to bring it online; until then it sits inert
+    in the workspace as a child-less Model marked ``_Active = false``.
+    Children of an inactive node are intentionally NOT recursed — the
+    runtime is responsible for populating them via ``instantiatePrefab``
+    or ``setActive`` cascades when it activates the parent. The world
+    CFrame is composed the same way as the active branch so the runtime
+    sees the GameObject in its authored location.
+    """
+    # World position + rotation composition mirrors the active branch in
+    # ``_convert_node`` — walk the parent chain, accumulating each
+    # ancestor's local position rotated into the running world frame and
+    # multiplying the running world rotation. A rotated authoring of an
+    # inactive GO must reactivate at the right ORIENTATION as well as the
+    # right position; emitting identity rotation lost the authored quat
+    # (codex P2). Kept local instead of factored to avoid perturbing the
+    # hot path for active conversion.
+    _chain: list[SceneNode] = []
+    _pf = node.parent_file_id
+    while _pf and _pf in scene_nodes:
+        _chain.append(scene_nodes[_pf])
+        _pf = scene_nodes[_pf].parent_file_id
+
+    world_pos = [0.0, 0.0, 0.0]
+    world_rot = [0.0, 0.0, 0.0, 1.0]  # identity quaternion (x,y,z,w)
+    for ancestor in reversed(_chain):
+        rotated = _quat_rotate(world_rot, list(ancestor.position))
+        world_pos[0] += rotated[0]
+        world_pos[1] += rotated[1]
+        world_pos[2] += rotated[2]
+        world_rot = _quat_multiply(world_rot, list(ancestor.rotation))
+
+    node_pos_rotated = _quat_rotate(world_rot, list(node.position))
+    wx = world_pos[0] + node_pos_rotated[0]
+    wy = world_pos[1] + node_pos_rotated[1]
+    wz = world_pos[2] + node_pos_rotated[2]
+    world_rot = _quat_multiply(world_rot, list(node.rotation))
+
+    rx, ry, rz = unity_to_roblox_pos(wx, wy, wz)
+    rqx, rqy, rqz, rqw = unity_quat_to_roblox_quat(*world_rot)
+    rot = quaternion_to_rotation_matrix(rqx, rqy, rqz, rqw)
+    holder = RbxPart(
+        name=node.name,
+        class_name="Model",
+        cframe=RbxCFrame(
+            x=rx, y=ry, z=rz,
+            r00=rot[0], r01=rot[1], r02=rot[2],
+            r10=rot[3], r11=rot[4], r12=rot[5],
+            r20=rot[6], r21=rot[7], r22=rot[8],
+        ),
+    )
+    # Stamp the holder with ``_SceneRuntimeId`` so the planner row binds
+    # to it the same way an active GameObject would. ``_Active = false``
+    # is the dormancy marker the host runtime reads to decide whether to
+    # run the lifecycle now or wait for ``setActive(true)``.
+    _stamp_scene_runtime_id(holder, node.file_id)
+    holder.attributes["_Active"] = False
+    return holder
+
+
 def convert_scene(
     parsed_scene: ParsedScene,
     guid_index: GuidIndex | None = None,
@@ -989,6 +1259,8 @@ def convert_scene(
     mesh_hierarchies: dict[str, list[dict]] | None = None,
     fbx_bounding_boxes: dict[str, tuple[float, float, float]] | None = None,
     unity_project_root: Path | None = None,
+    scene_runtime: dict[str, object] | None = None,
+    scene_runtime_mode: str = "legacy",
 ) -> RbxPlace:
     """Convert a parsed Unity scene to a Roblox place hierarchy.
 
@@ -1001,6 +1273,16 @@ def convert_scene(
         mesh_native_sizes: FBX path -> (x, y, z) native mesh size in Roblox studs.
         mesh_texture_ids: FBX path -> rbxassetid:// URL for embedded mesh textures.
         fbx_bounding_boxes: Relative path -> (w, h, d) in FBX file units from trimesh.
+        scene_runtime: The project-level ``scene_runtime`` planner artifact
+            (PR1 schema, populated by PR3b's domain classifier). Only consumed
+            under ``scene_runtime_mode == "generic"`` to drive the
+            inactive-but-referenced retention carve-out (PR3c). Optional /
+            unused under legacy — output is byte-identical to before PR3c.
+        scene_runtime_mode: Requested scene-runtime contract mode. One of
+            ``"legacy"`` (default) / ``"auto"`` / ``"generic"``. Plumbed
+            from the front-door commands via ``Pipeline.convert_scene``.
+            Generic-only carve-outs (inactive retention) read this and
+            never fire under legacy, keeping the legacy emit unchanged.
 
     Returns:
         An RbxPlace with workspace parts, lighting, camera, and scripts.
@@ -1035,6 +1317,16 @@ def convert_scene(
         scene_runtime_namespace=_scene_namespace(
             getattr(parsed_scene, "scene_path", None),
             _resolved_project_root,
+        ),
+        scene_runtime_mode=scene_runtime_mode,
+        # Empty set under legacy — the inactive-retention branch in
+        # ``_convert_node`` keys solely on membership here, so an empty
+        # set + legacy gate together keep the legacy prune-on-inactive
+        # path byte-identical to before PR3c.
+        scene_runtime_referenced_ids=(
+            _collect_runtime_referenced_ids(scene_runtime)
+            if scene_runtime_mode == "generic" and scene_runtime
+            else set()
         ),
     )
     if not _ctx().mesh_native_sizes:
@@ -1375,12 +1667,24 @@ def convert_scene(
     # Convert Unity Canvas UI elements to Roblox ScreenGuis. Pass the
     # scene namespace so UI hosts get ``_SceneRuntimeId`` stamps under the
     # same ``<scene>:<fileID>`` scheme as workspace parts (PR2, Piece 3).
+    # PR3c: thread the requested scene-runtime mode + the per-GO
+    # asset/prefab-serialized-field set so the generic-only child-
+    # suppression carve-out (Piece 4) can fire for runtime-bearing UI
+    # controllers. Legacy mode passes the empty set + mode="legacy" so
+    # the static-emit path is byte-identical to pre-PR3c.
     from converter.ui_translator import find_canvas_nodes, convert_canvas
     canvas_nodes = find_canvas_nodes(parsed_scene.roots)
     if canvas_nodes:
+        ui_suppress_ids = (
+            _collect_ui_child_suppression_ids(scene_runtime)
+            if scene_runtime_mode == "generic" and scene_runtime
+            else frozenset()
+        )
         place.screen_guis = convert_canvas(
             canvas_nodes,
             scene_namespace=_ctx().scene_runtime_namespace,
+            scene_runtime_mode=scene_runtime_mode,
+            suppress_static_children_ids=ui_suppress_ids,
         )
         log.info("Converted %d Canvas nodes to ScreenGuis", len(place.screen_guis))
 
@@ -1464,6 +1768,20 @@ def _convert_node(
     Returns None for nodes that should be skipped (inactive, editor-only).
     """
     if not node.active:
+        # PR3c carve-out (generic-only): inactive GameObjects that the
+        # planner marked as runtime-referenced — either as the host of a
+        # runtime-bearing MonoBehaviour or as the target of a
+        # serialized-field reference from one — are emitted as **dormant**
+        # Roblox Models. The host runtime needs them to exist (stamped with
+        # ``_SceneRuntimeId``) so ``host.setActive(true)`` can light them
+        # up later. Inactive GOs the planner didn't tag are still pruned
+        # exactly as before. Legacy mode skips this branch entirely (the
+        # set is empty under legacy + the mode check fails), keeping the
+        # legacy emit byte-identical to pre-PR3c.
+        if _ctx().scene_runtime_mode == "generic":
+            sr_id = _scene_runtime_id_for(node.file_id)
+            if sr_id and sr_id in _ctx().scene_runtime_referenced_ids:
+                return _emit_dormant_holder(node, scene_nodes or {})
         return None
 
     # Skip terrain nodes (handled separately by _collect_terrains).

@@ -11,7 +11,14 @@ actually consumes the artifact.
 
 Ordered by load-bearing-ness for downstream consumers.
 
-## 1. `scene_converter` inactive retention (generic-only)
+## ~~1. `scene_converter` inactive retention (generic-only)~~ — ABSORBED in PR3c
+
+**Status:** Shipped in PR3c (see the PR opened off
+`feat/scene-runtime-pr3c`). `_convert_node` gates the
+inactive-retention branch on
+`ctx.scene_runtime_mode == "generic"` AND membership in the
+planner-derived runtime-referenced id set; legacy emit is
+byte-unchanged (pinned by a snapshot test).
 
 **Where:** `converter/converter/scene_converter.py` — wherever
 `m_IsActive == 0` GameObjects are pruned today.
@@ -40,8 +47,14 @@ PR4's compliance work will exercise it for the first time, so the
 implementation is best landed adjacent to PR4 (or as a tightly-
 scoped PR3c).
 
-## 2. `ui_translator` asset/prefab serialized-field child suppression
-(generic-only)
+## ~~2. `ui_translator` asset/prefab serialized-field child suppression~~ — ABSORBED in PR3c
+
+**Status:** Shipped in PR3c (same PR as item #1). `convert_canvas`
+gains `scene_runtime_mode` + `suppress_static_children_ids` kwargs
+(both legacy defaults short-circuit the new branch). The static
+child tree under a UI controller is dropped iff the planner marked
+the controller `runtime_bearing` AND it owns an asset/prefab
+serialized-field ref. Legacy emit byte-unchanged (snapshot test).
 
 **Where:** `converter/converter/ui_translator.py` — UI conversion
 emit path; specifically where serialized-field references to
@@ -75,13 +88,37 @@ honor the original design wording without re-relitigating Piece 4.
 
 ## Carry-over markers
 
-- [ ] PR3c: implement `scene_converter` inactive retention; add the
-  test from PR3b's test matrix.
-- [ ] PR3c: implement `ui_translator` serialized-field child
-  suppression; add the matching test fixture.
+- [x] PR3c: implement `scene_converter` inactive retention; add the
+  test from PR3b's test matrix. — Shipped via the PR3c branch.
+- [x] PR3c: implement `ui_translator` serialized-field child
+  suppression; add the matching test fixture. — Shipped via the
+  PR3c branch.
 - [ ] Confirm PR4's host runtime exercises these carve-outs (i.e.,
   the runtime DOES instantiate prefabs + wire UI refs) before
   declaring the carve-outs "live."
+- [ ] **PR4 architecture gap** (codex P1 on PR3c review): the UI
+  child-suppression carve-out gates on
+  `scene_runtime.modules[script_id].runtime_bearing == True` AND
+  `domain != "legacy"`. Today the `domain` field is populated by
+  `_classify_storage` (a `write_output` subphase) which runs AFTER
+  `convert_scene`, so at suppression-decision time the field is
+  unset and the guard is dead code. Net effect: a runtime-bearing
+  module that later fails closed to `domain="legacy"` (both-side API,
+  intra-class conflict, reachability conflict) WILL have its UI
+  children dropped despite the host runtime never wiring it. PR4 has
+  two viable fixes:
+  (a) move domain classification into a new phase between
+      `transpile_scripts` and `convert_scene` so `convert_scene` sees
+      the final domain, OR
+  (b) defer UI child-suppression to a post-`_classify_storage` step
+      that walks `state.rbx_place.screen_guis` and prunes children
+      using the final `domain` field.
+  PR3c ships the runtime-bearing gate per the brief's literal
+  specification + a `domain="legacy"` exclusion that's structurally
+  correct for when the architecture is fixed; the suppression set
+  computation already returns an empty set when no runtime-bearing
+  modules exist, so the impact is bounded to fail-closed
+  controllers specifically.
 
 ## Additional codex P3 (from PR3b review)
 
