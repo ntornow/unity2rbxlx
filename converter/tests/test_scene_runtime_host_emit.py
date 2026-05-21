@@ -449,3 +449,160 @@ class TestRenderCrossDomainReport:
         a_pos = out.index("| A |")
         c_pos = out.index("| C |")
         assert a_pos < c_pos
+
+
+# ---------------------------------------------------------------------------
+# R4-P1.1 (absorbed PR5): per-place scene scoping for the embedded plan.
+#
+# The multi-scene pipeline writes one ``.rbxlx`` per scene; the embedded
+# ``SceneRuntimePlan`` must carry only the active scene's block so the
+# host's ``workspaceFind`` lookup doesn't try to bind components for
+# sister places' scenes (which would resolve to nil + log warnings on
+# every boot).
+# ---------------------------------------------------------------------------
+
+class TestPlanModulePerSceneScoping:
+    """R4-P1.1: ``generate_scene_runtime_plan_module(..., scene_namespace=k)``
+    embeds only ``scenes[k]`` -- modules / prefabs / domain_overrides /
+    scriptable_objects stay project-scoped.
+    """
+
+    def _multi_scene_artifact(self) -> dict:
+        return {
+            "modules": {
+                "a_sid": {"stem": "A", "runtime_bearing": True,
+                          "domain": "client", "module_path": "RS.A"},
+                "b_sid": {"stem": "B", "runtime_bearing": True,
+                          "domain": "server", "module_path": "RS.B"},
+            },
+            "scenes": {
+                "Assets/Scenes/Menu.unity": {
+                    "instances": [{
+                        "instance_id": "Assets/Scenes/Menu.unity:1",
+                        "script_id": "a_sid",
+                        "game_object_id": "Assets/Scenes/Menu.unity:1",
+                        "active": True, "enabled": True, "config": {},
+                    }],
+                    "references": [],
+                    "lifecycle_order": ["Assets/Scenes/Menu.unity:1"],
+                },
+                "Assets/Scenes/Gameplay.unity": {
+                    "instances": [{
+                        "instance_id": "Assets/Scenes/Gameplay.unity:2",
+                        "script_id": "b_sid",
+                        "game_object_id": "Assets/Scenes/Gameplay.unity:2",
+                        "active": True, "enabled": True, "config": {},
+                    }],
+                    "references": [],
+                    "lifecycle_order": ["Assets/Scenes/Gameplay.unity:2"],
+                },
+            },
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+
+    def test_scene_namespace_filter_drops_sister_scenes(self):
+        artifact = self._multi_scene_artifact()
+        script = generate_scene_runtime_plan_module(
+            artifact, scene_namespace="Assets/Scenes/Menu.unity",
+        )
+        # The Menu place's plan must carry the Menu scene block only.
+        assert "Menu.unity:1" in script.source
+        # Sister scene blocks must NOT appear -- pre-R4-P1.1 the entire
+        # project plan was embedded into every place.
+        assert "Gameplay.unity:2" not in script.source
+
+    def test_modules_table_not_filtered_by_scene_namespace(self):
+        """Modules are project-scoped (keyed by script_id). The host
+        needs every module's domain/container regardless of which
+        scene a particular instance lives in -- a prefab spawned at
+        runtime from scene A may carry a component whose module is
+        only structurally attached to scene B's hierarchy.
+        """
+        artifact = self._multi_scene_artifact()
+        script = generate_scene_runtime_plan_module(
+            artifact, scene_namespace="Assets/Scenes/Menu.unity",
+        )
+        # Both module rows survive the scene filter.
+        assert "a_sid" in script.source
+        assert "b_sid" in script.source
+
+    def test_unknown_namespace_emits_empty_scenes(self):
+        """A namespace not present in the planner artifact emits an
+        empty ``scenes`` table; the host still loads and the
+        runtime-bearing modules' instances simply never bind. This
+        is the safe failure mode -- better than embedding a sister
+        scene the host would try to wire.
+        """
+        artifact = self._multi_scene_artifact()
+        script = generate_scene_runtime_plan_module(
+            artifact, scene_namespace="Assets/Scenes/Missing.unity",
+        )
+        assert "Menu.unity:1" not in script.source
+        assert "Gameplay.unity:2" not in script.source
+        # Modules survive even when scenes scopes to nothing.
+        assert "a_sid" in script.source
+
+    def test_default_no_namespace_embeds_all_scenes(self):
+        """Backwards compatibility: callers that don't pass
+        ``scene_namespace`` get the pre-R4-P1.1 behaviour (full
+        ``scenes`` table embedded). Single-scene runs and tests rely
+        on this.
+        """
+        artifact = self._multi_scene_artifact()
+        script = generate_scene_runtime_plan_module(artifact)
+        assert "Menu.unity:1" in script.source
+        assert "Gameplay.unity:2" in script.source
+
+    def test_prefabs_and_overrides_not_filtered(self):
+        """``prefabs`` and ``domain_overrides`` are project-scoped --
+        the host can spawn a template prefab from any place.
+        """
+        artifact = self._multi_scene_artifact()
+        artifact["prefabs"] = {
+            "guid_xyz:Assets/Prefabs/Enemy.prefab": {
+                "template_name": "Enemy",
+                "instances": [], "references": [],
+                "lifecycle_order": [],
+            },
+        }
+        artifact["domain_overrides"] = {"a_sid": "client"}
+        script = generate_scene_runtime_plan_module(
+            artifact, scene_namespace="Assets/Scenes/Menu.unity",
+        )
+        assert "Enemy" in script.source
+        assert "domain_overrides" in script.source
+
+
+class TestComputeSceneNamespace:
+    """Cross-module helper used by ``_subphase_inject_scene_runtime``
+    to pick the per-place scene key. Stays in sync with the planner's
+    internal key derivation.
+    """
+
+    def test_project_relative_path_returned(self, tmp_path):
+        from converter.scene_runtime_planner import compute_scene_namespace
+        scene = tmp_path / "Assets" / "Scenes" / "Main.unity"
+        scene.parent.mkdir(parents=True)
+        scene.write_text("", encoding="utf-8")
+        ns = compute_scene_namespace(scene, tmp_path)
+        assert ns == "Assets/Scenes/Main.unity"
+
+    def test_absolute_fallback_when_outside_root(self, tmp_path):
+        from converter.scene_runtime_planner import compute_scene_namespace
+        outside = tmp_path / "Sibling.unity"
+        outside.write_text("", encoding="utf-8")
+        other_root = tmp_path / "OtherRoot"
+        other_root.mkdir()
+        ns = compute_scene_namespace(outside, other_root)
+        # Outside the project root => absolute path is returned.
+        assert ns.endswith("/Sibling.unity")
+
+    def test_none_root_returns_absolute_posix(self, tmp_path):
+        from converter.scene_runtime_planner import compute_scene_namespace
+        scene = tmp_path / "Solo.unity"
+        scene.write_text("", encoding="utf-8")
+        ns = compute_scene_namespace(scene, None)
+        assert ns.endswith("/Solo.unity")
+        # No backslashes; forward-slashed for JSON round-trip parity.
+        assert "\\" not in ns

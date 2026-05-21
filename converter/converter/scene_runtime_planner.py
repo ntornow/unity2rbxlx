@@ -276,6 +276,27 @@ def _scene_namespace(scene: ParsedScene, unity_project_root: Path | None) -> str
     return _relative_path_string(scene.scene_path, unity_project_root)
 
 
+def compute_scene_namespace(
+    scene_path: Path | str, unity_project_root: Path | None,
+) -> str:
+    """Public R4-P1.1 helper: scene path -> planner namespace.
+
+    The multi-scene pipeline writes one ``.rbxlx`` per scene; each
+    place's embedded ``SceneRuntimePlan`` must carry only that scene's
+    block from ``scene_runtime["scenes"]``. The planner keys the
+    scenes table by the same string this helper returns, so callers
+    derive the per-place key once and pass it to
+    ``generate_scene_runtime_plan_module(..., scene_namespace=...)``.
+
+    Args:
+        scene_path: Absolute or relative path to the ``.unity`` file.
+        unity_project_root: Project root; ``None`` falls back to the
+            absolute path. Mirrors the planner-internal helper so
+            single-scene and multi-scene runs converge on the same key.
+    """
+    return _relative_path_string(Path(scene_path), unity_project_root)
+
+
 def _relative_path_string(
     path: Path, unity_project_root: Path | None,
 ) -> str:

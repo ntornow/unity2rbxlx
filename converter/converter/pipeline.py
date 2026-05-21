@@ -4487,8 +4487,35 @@ script.Disabled = true
         self._build_scriptable_object_module_map(scene_runtime)
         self._rewrite_scene_runtime_asset_refs(scene_runtime)
 
+        # R4-P1.1 (absorbed PR5): scope ``scenes`` to the current
+        # place's scene namespace. The multi-scene pipeline emits one
+        # ``.rbxlx`` per scene (``run_all_scenes``); each place's plan
+        # must carry only its own scene block. ``parsed_scene`` is the
+        # active scene at write_output time (multi-scene loop resets
+        # it before convert_scene + write_output per iteration). For
+        # single-scene runs, the scoping is a no-op vs the legacy
+        # behaviour because there is exactly one scene block.
+        #
+        # The path-type guard below covers test fixtures using
+        # ``Pipeline.__new__`` + ``MagicMock`` state -- such state's
+        # ``parsed_scene.scene_path`` returns a MagicMock (not a
+        # ``Path``/``str``), and the unscoped fallback is the correct
+        # behaviour for those tests. Production callers always go
+        # through ``_run_phase``, which populates a real
+        # ``ParsedScene``.
+        scene_namespace: str | None = None
+        parsed_scene = getattr(self.state, "parsed_scene", None)
+        scene_path = getattr(parsed_scene, "scene_path", None) if parsed_scene else None
+        if isinstance(scene_path, (str, Path)):
+            from converter.scene_runtime_planner import compute_scene_namespace
+            project_path = getattr(self, "unity_project_path", None)
+            scene_namespace = compute_scene_namespace(
+                scene_path,
+                project_path if isinstance(project_path, Path) else None,
+            )
         _replace_or_add(generate_scene_runtime_plan_module(
             cast("dict", scene_runtime),
+            scene_namespace=scene_namespace,
         ))
         _replace_or_add(generate_scene_runtime_client_entrypoint())
         _replace_or_add(generate_scene_runtime_server_entrypoint())
