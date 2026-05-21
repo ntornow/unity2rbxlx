@@ -81,6 +81,24 @@ class RbxScript:
     # ...). ``None`` for scripts injected in-memory after rehydration (e.g.
     # bootstrap, FPS controller).
     source_path: str | None = None
+    # True when the script's body genuinely reads BasePart-only properties
+    # off ``script.Parent`` (or an alias) — ``.Position``, ``.CFrame``,
+    # ``.Touched``, ``.AssemblyLinearVelocity``, ``.Anchored``, ``.Size``,
+    # ``.Orientation``, ``.Velocity``. Computed by
+    # ``converter.script_coherence._detect_part_parent_requirement`` once
+    # during the coherence pass and persisted here so downstream stages
+    # (storage routing, the unbound-script guard, conversion report)
+    # all share the same answer.
+    #
+    # ``False`` is the safe default — scripts that *might* dereference a
+    # Part but don't actually access Part-only properties (e.g. defensive
+    # ``script.Parent:FindFirstChild(...)`` lookups) don't need a Part
+    # parent and shouldn't be gated by the BasePart guard. The guard
+    # in ``pipeline._disable_unbound_scripts`` reads this field so a
+    # LocalScript routed to PlayerScripts (where ``script.Parent`` is
+    # never a BasePart) doesn't get silently disabled by a catch-all
+    # regex matching defensive ``:FindFirstChild`` lookups.
+    requires_part_parent: bool = False
 
 
 @dataclass

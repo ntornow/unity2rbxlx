@@ -3767,47 +3767,83 @@ script.Disabled = true
             ]
             log.info("[write_output] Bound %d scripts to their target parts", bound_count)
 
-        # Disable unbound scripts that depend on script.Parent being a Part/Light/etc.
-        # These scripts are prefab components that couldn't be bound to parts.
-        # In SSS/RS, script.Parent is the service itself, so Position/CFrame/etc. will crash.
+        # Guard unbound scripts whose source actually reads BasePart-only
+        # properties off ``script.Parent`` and end up in a service-typed
+        # container (SSS/RS) where ``script.Parent`` is the service. The
+        # ``requires_part_parent`` field is computed once in
+        # script_coherence._detect_part_parent_requirement so this stage
+        # is a contract check, not a heuristic.
+        #
+        # Replaces a regex-based guess that pattern-matched any script
+        # mentioning ``script.Parent:FindFirstChild``, ``script.Parent.X``,
+        # or ``local x = script.Parent`` — those are generic Roblox
+        # idioms that don't require a BasePart parent, so LocalScripts
+        # routed to PlayerScripts (where ``script.Parent`` is
+        # PlayerScripts, never a BasePart) were silently disabled by
+        # the catch-all guard. The breakage was nondeterministic across
+        # AI transpile runs (latent since commit d31effc, 2026-03-29).
+        # See ``RbxScript.requires_part_parent`` for the rationale.
         import re
-        _parent_part_patterns = [
-            r'script\.Parent\.Position',
-            r'script\.Parent\.CFrame',
-            r'script\.Parent:FindFirstChild',
-            r'script\.Parent\.Touched',
-            r'script\.Parent\.AssemblyLinearVelocity',
-            r'local \w+ = script\.Parent\b',  # alias like `local part = script.Parent`
-        ]
-        # Scripts that already gate on ``script.Parent:IsA(...)`` carry
-        # their own conditional binding (smart-binding animation scripts
-        # do this — see generate_tween_script's prefab_scoped path).
-        # The blanket BasePart guard would short-circuit a Model-targeted
-        # check before it ever runs, breaking the script's own logic.
+        # Self-guarded scripts (smart-binding animation scripts already
+        # gate on ``script.Parent:IsA(...)``) still skip the wrap. The
+        # blanket BasePart guard would short-circuit their own Model
+        # check before it ran.
         _self_guard_patterns = (
             re.compile(r'script\.Parent\s*:\s*IsA\s*\(\s*["\']Model["\']'),
             re.compile(r'script\.Parent\s*:\s*IsA\s*\(\s*["\']BasePart["\']'),
         )
+        # Containers whose ``script.Parent`` is NOT a BasePart but also
+        # not service-typed. Scripts routed here that happen to be
+        # flagged ``requires_part_parent`` are a misconfiguration: they
+        # should have been Part-bound. Don't silently guard them; warn
+        # loudly so the conversion report makes the misroute visible.
+        _NON_PART_PLAYER_CONTAINERS = (
+            "StarterPlayer.StarterPlayerScripts",
+            "StarterPlayer.StarterCharacterScripts",
+            "StarterGui",
+        )
         disabled_count = 0
+        mis_routed_warn_count = 0
         for s in list(self.state.rbx_place.scripts):
             if s.script_type == "ModuleScript":
                 continue
-            needs_parent_part = any(
-                re.search(pat, s.source) for pat in _parent_part_patterns
-            )
-            if not needs_parent_part:
+            if not s.requires_part_parent:
                 continue
             if any(p.search(s.source) for p in _self_guard_patterns):
                 # Self-guarded — let the script make its own decision.
                 continue
-            # Wrap script with a parent type check
+            parent = s.parent_path or ""
+            if any(parent.startswith(prefix) for prefix in _NON_PART_PLAYER_CONTAINERS):
+                # Surfaces in conversion_report.json.warnings so the
+                # misroute is observable, instead of being papered over
+                # by a guard that silently no-ops the entire client.
+                msg = (
+                    f"[write_output] script '{s.name}' is flagged "
+                    f"requires_part_parent but routed to {parent} — "
+                    f"runtime BasePart access will fail. Bind the script "
+                    f"to a Part or relocate it; the guard intentionally "
+                    f"does NOT silently disable client/character scripts."
+                )
+                log.warning(msg)
+                self._add_warning(msg)
+                mis_routed_warn_count += 1
+                continue
+            # Wrap script with the runtime guard — last resort for
+            # genuinely-Part-bound scripts that landed in SSS/RS without
+            # a Part to attach to (unbound prefab components).
             guard = ('-- Guard: this script expects script.Parent to be a BasePart\n'
                      'if not script.Parent:IsA("BasePart") then return end\n\n')
             s.source = guard + s.source
             disabled_count += 1
-            log.debug("[write_output]   Added parent guard to '%s'", s.name)
+            log.debug("[write_output]   Added parent guard to '%s' (parent_path=%s)", s.name, parent)
         if disabled_count:
             log.info("[write_output] Added BasePart parent guards to %d unbound scripts", disabled_count)
+        if mis_routed_warn_count:
+            log.warning(
+                "[write_output] %d script(s) flagged requires_part_parent "
+                "but routed to client/character containers — see warnings above.",
+                mis_routed_warn_count,
+            )
 
     def _generate_prefab_packages(self) -> None:
         """Phase 4.10 — emit referenced prefabs as Models in

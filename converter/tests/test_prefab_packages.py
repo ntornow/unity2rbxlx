@@ -729,6 +729,106 @@ class TestAttachPrefabScopedAnimationScripts:
             "full source:\n" + anim_script.source
         )
 
+    def test_localscript_routed_to_starter_player_scripts_is_not_guarded(self, tmp_path):
+        """Regression for the BasePart-guard interaction bug discovered
+        2026-05-21: a LocalScript routed to StarterPlayerScripts whose
+        source contains ``script.Parent:FindFirstChild(...)`` (a
+        defensive sound lookup) MUST NOT receive the BasePart guard —
+        ``script.Parent`` is ``PlayerScripts`` at runtime, never a
+        BasePart, so the guard would silently no-op the entire client
+        Player controller. The old regex-based guard caught this case
+        and broke all gameplay non-deterministically based on whether
+        the AI happened to emit the pattern in Player.luau.
+
+        Phase 1 (the analyzer) sets ``requires_part_parent=False`` for
+        this script because ``:FindFirstChild`` works on any Instance.
+        Phase 2 (this guard) reads that flag and skips the wrap.
+        """
+        from core.roblox_types import RbxScript
+
+        pipeline = self._make_pipeline(tmp_path)
+        player_lua = RbxScript(
+            name="Player",
+            source=(
+                "local UserInputService = game:GetService('UserInputService')\n"
+                "local function setupSounds()\n"
+                "    local s = script.Parent:FindFirstChild('ShootSound')\n"
+                "    if s then s:Play() end\n"
+                "end\n"
+                "UserInputService.InputBegan:Connect(function() print('moved') end)\n"
+            ),
+            script_type="LocalScript",
+            parent_path="StarterPlayer.StarterPlayerScripts",
+            requires_part_parent=False,  # analyzer would set this
+        )
+        pipeline.state.rbx_place.scripts.append(player_lua)
+
+        pipeline._bind_scripts_to_parts()
+
+        assert 'if not script.Parent:IsA("BasePart") then return end' not in player_lua.source, (
+            "LocalScript routed to PlayerScripts must not be guard-wrapped; "
+            "the guard would silently disable the entire client. Source:\n"
+            + player_lua.source
+        )
+
+    def test_localscript_with_requires_part_parent_in_starter_player_warns(self, tmp_path):
+        """When a script is flagged ``requires_part_parent=True`` but
+        ends up routed to a client/character container (a converter
+        misconfiguration), the guard should NOT silently disable it.
+        Instead, surface a build-time warning so the misroute is
+        visible in the conversion report — silent failures are the
+        bug class we just spent two months tracking down."""
+        from core.roblox_types import RbxScript
+
+        pipeline = self._make_pipeline(tmp_path)
+        misrouted = RbxScript(
+            name="MisroutedPartScript",
+            source="print(script.Parent.Position)\n",
+            script_type="LocalScript",
+            parent_path="StarterPlayer.StarterPlayerScripts",
+            requires_part_parent=True,
+        )
+        pipeline.state.rbx_place.scripts.append(misrouted)
+
+        pipeline._bind_scripts_to_parts()
+
+        # Guard must NOT silently disable — let it crash visibly so we know.
+        assert 'if not script.Parent:IsA("BasePart") then return end' not in misrouted.source
+        # And a warning explaining the misroute should be in ctx.
+        assert any("MisroutedPartScript" in w and "requires_part_parent" in w
+                   for w in pipeline.ctx.warnings), (
+            f"expected a misroute warning for MisroutedPartScript, got: "
+            f"{pipeline.ctx.warnings}"
+        )
+
+    def test_server_script_requiring_part_routed_to_sss_still_guarded(self, tmp_path):
+        """Phase 2 preserves the guard's intended behavior for the case
+        that originally motivated it: a Server Script that genuinely
+        accesses ``script.Parent.Position`` and lands in
+        ServerScriptService (where ``script.Parent`` is the service).
+        Without the guard, that script would crash on every Heartbeat."""
+        from core.roblox_types import RbxScript
+
+        pipeline = self._make_pipeline(tmp_path)
+        orphan = RbxScript(
+            name="OrphanPhysicsForce",
+            source="while true do print(script.Parent.Position) task.wait() end\n",
+            script_type="Script",
+            parent_path="ServerScriptService",
+            requires_part_parent=True,
+        )
+        pipeline.state.rbx_place.scripts.append(orphan)
+
+        pipeline._bind_scripts_to_parts()
+
+        assert orphan.source.startswith(
+            "-- Guard: this script expects script.Parent to be a BasePart\n"
+            'if not script.Parent:IsA("BasePart") then return end\n'
+        ), (
+            "server script needing a Part parent + landing in SSS must "
+            "still receive the guard; source:\n" + orphan.source
+        )
+
 
 def _variant_template(name: str, source_prefab_guid: str | None = None):
     """Build a minimal variant-aware PrefabTemplate-like object for tests."""

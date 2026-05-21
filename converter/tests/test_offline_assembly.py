@@ -56,18 +56,18 @@ def _resolve_unity_project(snapshot_name: str, fallback_name: str) -> Path:
     """Find the Unity source for a snapshot.
 
     Resolution order, first hit wins:
-      1. ``test_projects/<fallback_name>`` submodule (if populated)
-      2. ``$UNITY2RBXLX_TEST_PROJECTS_ROOT/<fallback_name>``
-      3. ``_meta.source_unity_project`` baked into the snapshot — only
-         used when the path still exists on disk and looks like a real
-         Unity project. Lets the test self-locate the project that the
-         snapshot was captured from, even when it lives outside the
-         repo and no env var was set.
+      1. ``_meta.source_unity_project`` baked into the snapshot — when
+         present and the path still exists on disk. This is the
+         canonical source the snapshot was captured from; using it
+         guarantees the cache key (csharp_source, project_context, ...)
+         matches and the test runs against the exact files that
+         produced the committed asset IDs. Submodules can be missing
+         LFS-tracked files (heightmaps, large textures) that the
+         production project has on disk; preferring the baked path
+         dodges that trap.
+      2. ``test_projects/<fallback_name>`` submodule (if populated)
+      3. ``$UNITY2RBXLX_TEST_PROJECTS_ROOT/<fallback_name>``
     """
-    submodule_or_external = resolve_project(fallback_name)
-    if is_populated(submodule_or_external):
-        return submodule_or_external
-
     snap = _load_snapshot(snapshot_name)
     baked = snap.get("_meta", {}).get("source_unity_project", "")
     if baked:
@@ -75,7 +75,7 @@ def _resolve_unity_project(snapshot_name: str, fallback_name: str) -> Path:
         if is_populated(p):
             return p
 
-    return submodule_or_external
+    return resolve_project(fallback_name)
 
 
 # Resolved at import so the @skipif decorator below can read them.
