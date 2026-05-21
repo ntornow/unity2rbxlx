@@ -862,12 +862,35 @@ def _make_part(parent_xml: ET.Element, part: RbxPart) -> None:
             _add_cframe(props, "CFrame", part.cframe)
 
         # Size (capped at 2048 studs per axis for visual parts,
-        # but allow larger for invisible colliders like GroundCollider)
+        # but allow larger for invisible colliders like GroundCollider).
+        #
+        # The 0.05 floor catches degenerate inputs but used to do so
+        # silently -- a visible MeshPart clamped to 0.05^3 is
+        # effectively invisible and looked identical in the rbxlx
+        # to a correctly-sized MeshPart. Emit a one-line warning so
+        # the next sizing-pipeline regression is loud (concrete
+        # case: SimpleFPS Mines went invisible after PR #121 wired
+        # embedded meshes through the FBX-scale-aware code path with
+        # ``import_scale = 0.01`` mis-applied to metres-based AABB
+        # data; size dropped to ~0.029 studs and floored here
+        # without any signal).
         if hasattr(part, "size") and part.size:
             max_size = 2048.0 if (part.transparency or 0) < 1.0 else 16384.0
-            sx = min(max_size, max(0.05, part.size[0]))
-            sy = min(max_size, max(0.05, part.size[1]))
-            sz = min(max_size, max(0.05, part.size[2]))
+            raw_sx, raw_sy, raw_sz = part.size[0], part.size[1], part.size[2]
+            sx = min(max_size, max(0.05, raw_sx))
+            sy = min(max_size, max(0.05, raw_sy))
+            sz = min(max_size, max(0.05, raw_sz))
+            is_visible = (part.transparency or 0) < 1.0
+            floored = (raw_sx < 0.05 or raw_sy < 0.05 or raw_sz < 0.05)
+            has_mesh_id = bool(getattr(part, "mesh_id", None))
+            if is_visible and floored and has_mesh_id:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "[rbxlx_writer] Visible MeshPart %r floored to >=0.05 studs "
+                    "(raw=%.4fx%.4fx%.4f) -- the geometry will be invisible. "
+                    "Likely an upstream sizing-pipeline bug.",
+                    getattr(part, "name", "<unnamed>"), raw_sx, raw_sy, raw_sz,
+                )
             _add_vector3(props, "Size", sx, sy, sz)
 
         # Color

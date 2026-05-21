@@ -198,6 +198,26 @@ class TestFpsWeaponMountDetector:
         ]
         assert packs_module._detect_fps_weapon_mount(scripts) is True
 
+    def test_detects_camelCase_equip_function(self) -> None:
+        """The AI transpiler emits the equip function in Luau-idiomatic
+        camelCase (``function getRifle()``) even though the Unity source
+        ships PascalCase ``GetRifle``. The detector must match both -- a
+        regression in PR #121's validation found the pack silently
+        no-oped on every fresh transpile because the detector only
+        recognised the PascalCase spelling. The on-disk Player.luau in
+        prior runs only had the marker because of older PascalCase-era
+        runs; once the AI shifted, the pack stopped firing and the
+        rifle never mounted on the player.
+        """
+        scripts = [
+            RbxScript(
+                name="Player",
+                source="local getRifle\ngetRifle = function() end",
+                script_type="LocalScript",
+            ),
+        ]
+        assert packs_module._detect_fps_weapon_mount(scripts) is True
+
     def test_does_not_detect_on_non_fps(self) -> None:
         """Gamekit3D-style scripts should not trigger the pack."""
         scripts = [
@@ -250,7 +270,11 @@ class TestFpsWeaponMountInjection:
         """The equipped weapon must be seated into the converted Unity
         camera rig (the ``_MainCameraRig`` Model that the auto-injected
         CameraRigFollower pivots onto the live camera), not pinned to a
-        hardcoded camera offset with a bespoke per-weapon follower.
+        hardcoded camera offset with a bespoke per-weapon follower. The
+        per-frame-follower variant was tried in commit ``21b783a``'s
+        revert of ``fdb01c1`` and produced a rifle that floated in the
+        viewport rather than tracking the character — the rig design
+        is what gives the "player is holding it" feel.
         """
         s = self._stub_player_script()
         packs_module._inject_fps_weapon_mounts([s])
@@ -263,6 +287,33 @@ class TestFpsWeaponMountInjection:
         # var; its absence proves the bespoke follower is gone.
         assert '_fpsRiflePrimary' not in s.source
         assert 'if _fpsRifle and' not in s.source
+
+    def test_injection_clones_from_workspace_not_templates(self) -> None:
+        """The rifle source must be ``workspace:FindFirstChild`` --
+        the scene-placed instance the converter materialises from
+        Unity's Player.prefab -- NOT ``ReplicatedStorage.Templates``.
+        On real SimpleFPS conversions the two diverge structurally:
+        the workspace placement carries the full Unity prefab
+        (14 mesh parts including bipod/laser/pod-support, ~50-stud
+        bbox), while the Templates entry the prefab-packages writer
+        emits is a stripped variant (10 parts, ~8-stud bbox). After
+        ``ScaleTo(0.15)`` the Templates clone is ~6× smaller and
+        drops below the camera frustum at the authored slot offset.
+        PR #121's ``c65429b`` Templates-first lookup silently selected
+        the smaller variant and made the equipped weapon invisible
+        in-view — fixed by reverting to the pre-PR workspace source.
+        """
+        s = self._stub_player_script()
+        packs_module._inject_fps_weapon_mounts([s])
+        # Workspace lookup with both camelCase + PascalCase variants
+        # must be present (matches pre-PR getRifle shape).
+        assert 'workspace:FindFirstChild("riflePrefab", true)' in s.source
+        assert 'workspace:FindFirstChild("RiflePrefab", true)' in s.source
+        # The regression-introducing Templates-first lookup must be
+        # absent — selecting Templates over workspace ships a stripped
+        # rifle.
+        assert 'ReplicatedStorage"):FindFirstChild("Templates"' not in s.source
+        assert 'templates:FindFirstChild("Rifle"' not in s.source
 
     def test_injection_marker_prevents_double_apply(self) -> None:
         s = self._stub_player_script()

@@ -1153,6 +1153,16 @@ class Pipeline:
                     self.ctx.asset_upload_errors.append(rel)
                 time.sleep(0.3)  # Rate limit (Roblox Open Cloud allows ~60 req/min)
 
+        # Second pass: synthesise + upload meshes embedded in legacy
+        # ``.prefab``/``.asset`` files (Unity NativeFormatImporter format).
+        # The standard mesh loop above only handles external ``.fbx``/
+        # ``.obj`` -- pre-this-pass, mines/decorative props whose geometry
+        # lives inside a ``.prefab`` rendered as cube-decal Parts. See
+        # ``unity.embedded_mesh_extractor`` for the decoder rationale.
+        self._upload_embedded_meshes(
+            uploaded, new_uploads, api_key, creator_id, creator_type,
+        )
+
         log.info("[upload_assets] %d assets uploaded, %d errors",
                  len(uploaded), len(self.ctx.asset_upload_errors))
 
@@ -1164,6 +1174,206 @@ class Pipeline:
         # soft — if the metadata endpoint can't make up its mind, we assume
         # the asset is fine and leave it in place.
         self._audit_new_uploads(new_uploads, api_key)
+
+    def _upload_embedded_meshes(
+        self,
+        uploaded: dict[str, str],
+        new_uploads: list[tuple[str, str]],
+        api_key: str,
+        creator_id: str,
+        creator_type: str,
+    ) -> None:
+        """Synthesise + upload meshes embedded in ``.prefab``/``.asset`` files.
+
+        Walks the parsed scene + prefab library for ``MeshFilter`` references
+        whose GUID resolves to a ``.prefab``/``.asset`` (not ``.fbx``/``.obj``).
+        For each unique ``(asset_path, file_id)``, decodes the embedded
+        geometry, synthesises an ASCII OBJ, and uploads as a ``Model`` asset
+        under the synthetic key ``f"{rel_path}#{file_id}"``. ``_resolve_mesh_id``
+        and ``studio_resolver`` both check this key shape so the resolved
+        ``MeshId`` flows into the rbxlx exactly like a real FBX upload.
+
+        Failure modes from ``parse_embedded_mesh`` are logged once per
+        ``(source_key, reason)`` -- face-decal fallback remains the
+        recovery path for anything we cannot decode.
+        """
+        from collections import Counter
+        from unity.embedded_mesh_extractor import (
+            ExtractionFailure,
+            parse_embedded_mesh,
+            reset_cache as _reset_extractor_cache,
+            synthesize_fbx,
+        )
+        from roblox.cloud_api import upload_mesh
+
+        guid_index = self.state.guid_index
+        parsed_scene = self.state.parsed_scene
+        prefab_library = self.state.prefab_library
+        if guid_index is None:
+            return
+
+        # Pick any modern-FBX (version 7.x) file in the project as the
+        # structural template that ``synthesize_fbx`` will mutate to hold
+        # each embedded mesh's geometry. Roblox's Open Cloud assets API
+        # rejects ``model/obj`` uploads (``"Creating Model from a model/obj
+        # file is not supported yet."``), so we clone a known-good FBX
+        # and swap its Vertices + PolygonVertexIndex.
+        #
+        # Legacy FBX 6.x (``Version5`` root) files embed geometry inside
+        # the ``Model`` node and have no separate ``Geometry`` object --
+        # skip them. ``_find_geometry_nodes`` returns empty, which is
+        # the signal we use here.
+        from converter.fbx_binary import _find_geometry_nodes, read_fbx
+
+        manifest = self.state.asset_manifest
+        template_fbx: Path | None = None
+        if manifest is not None:
+            for asset in manifest.by_kind.get("mesh", []):
+                if asset.path.suffix.lower() != ".fbx" or not asset.path.exists():
+                    continue
+                try:
+                    _ver, _roots, _footer = read_fbx(asset.path)
+                except Exception:
+                    continue
+                if _find_geometry_nodes(_roots):
+                    template_fbx = asset.path
+                    log.info(
+                        "[upload_assets] Using %s as embedded-mesh template",
+                        asset.relative_path,
+                    )
+                    break
+        if template_fbx is None:
+            log.warning(
+                "[upload_assets] No modern-FBX (7.x) template available; "
+                "skipping embedded mesh uploads. The pipeline's face-decal "
+                "fallback will still render these Parts, but without their "
+                "real geometry."
+            )
+            return
+
+        # Fresh extractor cache per ``upload_assets`` invocation so a
+        # rerun never serves stale geometry from a previous run.
+        _reset_extractor_cache()
+
+        # Collect unique ``(resolved_path, file_id)`` -> relative_path
+        # for every MeshFilter that targets a legacy embedded mesh.
+        pairs: dict[tuple[Path, str], Path] = {}
+
+        def _maybe_collect(mesh_guid: str | None, mesh_file_id: str | None) -> None:
+            if not mesh_guid or not mesh_file_id:
+                return
+            resolved = guid_index.resolve(mesh_guid)
+            if resolved is None:
+                return
+            if resolved.suffix.lower() not in (".prefab", ".asset"):
+                return
+            rel = guid_index.resolve_relative(mesh_guid)
+            pairs[(resolved.resolve(), str(mesh_file_id))] = (
+                rel if rel is not None else Path(resolved.name)
+            )
+
+        if parsed_scene is not None:
+            # ``all_nodes`` is a ``dict[str, SceneNode]``; iterate ``.values()``
+            # so we get nodes, not file-ID strings. The previous iteration
+            # silently missed any embedded mesh referenced by a scene-level
+            # MeshFilter (prefab-library walks below still worked, which
+            # masked the bug for SimpleFPS).
+            for node in parsed_scene.all_nodes.values():
+                _maybe_collect(
+                    getattr(node, "mesh_guid", None),
+                    getattr(node, "mesh_file_id", None),
+                )
+
+        def _walk_prefab(node: object) -> None:
+            if node is None:
+                return
+            _maybe_collect(
+                getattr(node, "mesh_guid", None),
+                getattr(node, "mesh_file_id", None),
+            )
+            for child in getattr(node, "children", []) or []:
+                _walk_prefab(child)
+
+        if prefab_library is not None:
+            for tpl in prefab_library.by_name.values():
+                _walk_prefab(getattr(tpl, "root", None))
+
+        if not pairs:
+            return
+
+        log.info(
+            "[upload_assets] Uploading %d embedded-mesh assets (.prefab/.asset)...",
+            len(pairs),
+        )
+
+        embedded_dir = self.output_dir / "embedded_meshes"
+        embedded_dir.mkdir(parents=True, exist_ok=True)
+        failure_summary: Counter[tuple[str, str]] = Counter()
+
+        # Honour the same ``.upload_blocklist`` file the main mesh loop
+        # reads -- ``_audit_new_uploads`` writes synthetic embedded keys
+        # there when Roblox moderation rejects a synthesised mesh, and
+        # without this check we'd just re-upload the same rejected
+        # geometry on every assemble.
+        blocklist_file = self.output_dir / ".upload_blocklist"
+        blocklist: set[str] = set()
+        if blocklist_file.exists():
+            blocklist = {
+                line.strip() for line in blocklist_file.read_text().splitlines()
+                if line.strip() and not line.startswith("#")
+            }
+
+        for (path, file_id), rel in pairs.items():
+            synthetic_key = f"{rel}#{file_id}"
+            if synthetic_key in uploaded:
+                continue
+            if synthetic_key in blocklist:
+                log.info(
+                    "[upload_assets] Skipping blocklisted embedded mesh: %s",
+                    synthetic_key,
+                )
+                continue
+            result = parse_embedded_mesh(path, file_id)
+            if isinstance(result, ExtractionFailure):
+                # Deduped warning per ``(source_key, reason)`` -- the
+                # face-decal fallback in scene_converter already
+                # handles the render side.
+                failure_summary[(synthetic_key, result.reason)] += 1
+                continue
+            try:
+                fbx_bytes = synthesize_fbx(result, template_fbx)
+            except ValueError as exc:
+                log.warning(
+                    "[upload_assets]   FBX synthesis failed for %s#%s: %s",
+                    path.stem, file_id, exc,
+                )
+                self.ctx.asset_upload_errors.append(synthetic_key)
+                continue
+            fbx_path = embedded_dir / f"{path.stem}__{file_id}.fbx"
+            fbx_path.write_bytes(fbx_bytes)
+            asset_id = upload_mesh(
+                fbx_path, api_key, creator_id, creator_type, name=result.name,
+            )
+            if asset_id:
+                uploaded[synthetic_key] = f"rbxassetid://{asset_id}"
+                log.info(
+                    "[upload_assets]   embedded %s#%s -> rbxassetid://%s",
+                    path.stem, file_id, asset_id,
+                )
+                new_uploads.append((synthetic_key, asset_id))
+            else:
+                log.warning(
+                    "[upload_assets]   FAILED embedded %s#%s",
+                    path.stem, file_id,
+                )
+                self.ctx.asset_upload_errors.append(synthetic_key)
+            time.sleep(0.3)  # Same rate limit as the main mesh loop.
+
+        for (key, reason), count in failure_summary.items():
+            log.warning(
+                "[upload_assets] Skipped embedded mesh %s (%d node ref(s)): %s",
+                key, count, reason,
+            )
 
     def _audit_new_uploads(
         self,
@@ -1647,9 +1857,17 @@ class Pipeline:
         # current uploaded_assets is {D, E} after the user swapped meshes,
         # resolved_count (3) >= uploaded_mesh_count (2) would falsely
         # report "all resolved" and skip resolution of D and E entirely.
+        #
+        # Mesh-key predicate accepts both ``.fbx``/``.obj`` keys (the
+        # external-mesh upload path) and synthetic ``<rel>#<file_id>``
+        # keys (the embedded-mesh upload path -- see
+        # ``unity.embedded_mesh_extractor``). Hoisted to
+        # ``core.asset_keys`` so the Studio resolver and the scene
+        # converter use the same definition.
+        from core.asset_keys import is_mesh_asset_key as _is_mesh_key
+
         uploaded_mesh_keys = {
-            k for k in self.ctx.uploaded_assets
-            if any(k.lower().endswith(ext) for ext in ('.fbx', '.obj'))
+            k for k in self.ctx.uploaded_assets if _is_mesh_key(k)
         }
         uploaded_mesh_count = len(uploaded_mesh_keys)
         resolved_count = len(self.ctx.mesh_native_sizes)
@@ -1709,8 +1927,7 @@ class Pipeline:
         already_resolved = self.ctx.mesh_native_sizes
         mesh_assets = {} if all_meshes_resolved else {
             k: v for k, v in self.ctx.uploaded_assets.items()
-            if any(k.lower().endswith(ext) for ext in ('.fbx', '.obj'))
-            and k not in already_resolved
+            if _is_mesh_key(k) and k not in already_resolved
         }
 
         # No universe/place IDs. Open Cloud does not support universe
@@ -1880,6 +2097,29 @@ return table.concat(allData, "\\n")'''
                 if texture_id:
                     entry["textureId"] = texture_id
                 mesh_hierarchies[path].append(entry)
+
+            # Invariant: synthetic embedded-mesh keys MUST resolve to
+            # exactly one sub-mesh (our synthesised FBX has a single
+            # Geometry node by construction in
+            # ``unity.embedded_mesh_extractor.synthesize_fbx``). When
+            # the resolver returns more, the FBX template-cleanup
+            # leaked extra Geometries and ``sub_meshes[0]`` would
+            # silently bind to whichever Geometry the upload happened
+            # to enumerate first -- a correctness-by-coincidence bug.
+            # Loud-fail so the next leak is caught at conversion time,
+            # not via a Studio playtest.
+            from core.asset_keys import is_embedded_mesh_key
+            for k, subs in mesh_hierarchies.items():
+                if is_embedded_mesh_key(k) and len(subs) != 1:
+                    log.warning(
+                        "[resolve_assets] Embedded-mesh key %r resolved to "
+                        "%d sub-meshes (expected exactly 1). The FBX "
+                        "template likely shipped extra Geometry nodes that "
+                        "weren't stripped; sub_meshes[0] binding is now "
+                        "non-deterministic and may bind to the wrong "
+                        "geometry. Names: %s",
+                        k, len(subs), [s.get("name") for s in subs],
+                    )
 
             # Merge into existing tables instead of replacing. A transient
             # batch failure during a force-rerun would otherwise shrink a

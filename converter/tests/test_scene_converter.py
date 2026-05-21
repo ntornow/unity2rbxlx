@@ -1772,3 +1772,90 @@ class TestPrefabInstanceScaleNotDoubled:
             f"Part X size {part.size[0]:.3f} < 1.5: scale lost entirely "
             f"(expected ~2.86)"
         )
+
+
+class TestSyntheticEmbeddedKeySizingParity:
+    """When an embedded mesh is uploaded + resolved via Open Cloud,
+    ``_compute_mesh_size`` finds it in ``mesh_hierarchies`` BEFORE the
+    embedded-AABB fallback fires. Both paths must produce the same
+    Size for the same source mesh -- otherwise wiring the synthetic
+    key into ``mesh_hierarchies`` is a silent unit-system change.
+
+    Concrete regression this guards against: PR #121 made
+    ``_get_fbx_import_scale`` return ``0.01`` for ``.prefab`` paths,
+    so the resolved-sub-mesh formula computed Size = unity_scale *
+    native_meters * 0.01 * STUDS_PER_METER -- 100x too small. The
+    rbxlx writer's 0.05 floor then absorbed the underflow and Mines
+    went invisible. Asserting parity here would have caught it
+    without any Studio playtest.
+    """
+
+    def test_resolved_and_fallback_paths_produce_same_size(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        from converter import scene_converter as sc
+        from converter.scene_converter import SceneConversionContext
+        from core.unity_types import GuidIndex, GuidEntry
+
+        # Make ``_get_fbx_import_scale`` early-return 1.0 for .prefab
+        # paths in scope. Mocking the AABB reader removes the need for
+        # a real Unity YAML.
+        mesh_guid = "feedface" * 4
+        asset = tmp_path / "MyMesh.prefab"
+        asset.write_text("dummy")
+        guid_index = GuidIndex(project_root=tmp_path)
+        guid_index.guid_to_entry[mesh_guid] = GuidEntry(
+            guid=mesh_guid,
+            asset_path=asset.resolve(),
+            relative_path=asset.relative_to(tmp_path),
+            kind="prefab",
+        )
+        # Native size from the embedded AABB (in metres):
+        native_metres = (0.32, 0.10, 0.35)
+        monkeypatch.setattr(
+            "converter.scene_converter._read_embedded_mesh_aabb",
+            lambda asset_path, mesh_file_id: native_metres,
+        )
+
+        ctx = SceneConversionContext()
+        sc._current_ctx = ctx
+        try:
+            # Path 1: fallback (no mesh_hierarchies entry for the
+            # synthetic key) -> embedded-AABB branch.
+            unity_scale = (2.5, 2.5, 2.5)
+            fallback_result = sc._compute_mesh_size(
+                unity_scale, mesh_guid, guid_index,
+                mesh_native_sizes={},
+                mesh_file_id="4322892",
+            )
+            assert fallback_result is not None
+            fallback_size, _ = fallback_result
+
+            # Path 2: resolved (synthetic key present in mesh_hierarchies).
+            # The resolver gives back ``size`` in metres because our
+            # adapter normalises before populating the table.
+            ctx.mesh_hierarchies = {
+                "MyMesh.prefab#4322892": [
+                    {"name": "Embedded", "meshId": "rbxassetid://1",
+                     "size": list(native_metres), "position": [0, 0, 0]},
+                ],
+            }
+            resolved_result = sc._compute_mesh_size(
+                unity_scale, mesh_guid, guid_index,
+                mesh_native_sizes={},
+                mesh_file_id="4322892",
+            )
+            assert resolved_result is not None
+            resolved_size, _ = resolved_result
+        finally:
+            sc._current_ctx = None
+
+        # Both paths must agree within 1% (we tolerate float jitter
+        # in the import_scale/unit_ratio chain, not a 100x mismatch).
+        for axis in range(3):
+            a, b = fallback_size[axis], resolved_size[axis]
+            assert abs(a - b) / max(abs(a), 1e-6) < 0.01, (
+                f"Size axis {axis} disagrees between fallback and resolved "
+                f"paths: fallback={a:.4f} resolved={b:.4f} -- the embedded "
+                f"mesh would render at the wrong Size after upload."
+            )

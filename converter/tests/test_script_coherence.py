@@ -972,3 +972,88 @@ class TestFixPickupVisualTarget:
         # because the template doesn't have ``moveDown`` lowercase as a
         # bare function (it's wrapped) — verify it isn't double-replaced.
         assert s.source == first or fixes == 0
+
+
+class TestExposeLocalScriptEventsShimBlocked:
+    """When the ``_AutoLocalScriptShim`` pack rewrites a consumer to
+    ``require(<X>Shared)``, the original ``:WaitForChild("Player")``
+    binding is gone — so the existing consumer-rewrite step (which keys
+    off WaitForChild) can't find the consumer. Result before this fix:
+    ``Player.HealthUpdate:Connect(...)`` ran against the shim ModuleScript
+    table (which exposes ``hasKey``/``hasItems`` only, no event signals),
+    and crashed at runtime with "attempt to index nil with 'Connect'".
+
+    The shim-blocked fallback finds those require'd consumers and rewrites
+    each ``<var>.<EventKey>:Connect(...)`` to grab the BindableEvent
+    directly off the producer LocalScript instance via
+    ``LocalPlayer.PlayerScripts:WaitForChild(<Producer>):WaitForChild(<Key>).Event``.
+    """
+
+    def test_shim_require_consumer_gets_rewritten(self):
+        producer = RbxScript(
+            name="Player",
+            source=(
+                "local Player = {}\n"
+                'local healthEvent = Instance.new("BindableEvent")\n'
+                "Player.HealthUpdate = healthEvent.Event\n"
+            ),
+            script_type="LocalScript",
+        )
+        # Consumer post-shim: requires PlayerShared instead of binding
+        # the producer LocalScript instance.
+        consumer = RbxScript(
+            name="HudControl",
+            source=(
+                "local ReplicatedStorage = game:GetService(\"ReplicatedStorage\")\n"
+                "local Player = require(game:GetService(\"ReplicatedStorage\"):WaitForChild(\"PlayerShared\"))\n"
+                "Player.HealthUpdate:Connect(function() end)\n"
+            ),
+            script_type="LocalScript",
+        )
+        _expose_local_script_events([producer, consumer])
+        # ``Player.HealthUpdate:Connect`` is gone; the call now routes
+        # through the producer LocalScript's BindableEvent child via
+        # a hoisted local declaration.
+        assert "Player.HealthUpdate:Connect(" not in consumer.source
+        # Producer instance hoisted to a local once per consumer.
+        assert "local _AutoProducer_Player = " in consumer.source
+        assert "WaitForChild('Player')" in consumer.source
+        # Rewritten Connect starts with the hoisted identifier (not
+        # ``(``), so Luau parses it unambiguously. Anti-regression for
+        # the "this looks like an argument list for a function call,
+        # but could also be a start of new statement" parse error a
+        # naive ``(<chain>):Connect(...)`` rewrite would have triggered.
+        assert (
+            "_AutoProducer_Player:WaitForChild('HealthUpdate').Event:Connect("
+            in consumer.source
+        )
+        # No ``.Event):Connect`` -- the prior version wrapped each
+        # call site as ``(game:GetService(...).Event):Connect(...)``,
+        # which Luau parsed as the previous statement's argument list.
+        assert ").Event):Connect(" not in consumer.source
+
+    def test_no_shared_module_no_rewrite(self):
+        # When the consumer doesn't require a ``<X>Shared`` module, the
+        # shim-blocked path leaves it alone -- the regular consumer
+        # rewrite still owns that case.
+        producer = RbxScript(
+            name="Player",
+            source=(
+                "local Player = {}\n"
+                'local ev = Instance.new("BindableEvent")\n'
+                "Player.HealthUpdate = ev.Event\n"
+            ),
+            script_type="LocalScript",
+        )
+        consumer = RbxScript(
+            name="Misc",
+            source=(
+                "local ReplicatedStorage = game:GetService(\"ReplicatedStorage\")\n"
+                "local OtherModule = require(ReplicatedStorage:WaitForChild(\"OtherModule\"))\n"
+                "OtherModule.HealthUpdate:Connect(function() end)\n"
+            ),
+            script_type="LocalScript",
+        )
+        _expose_local_script_events([producer, consumer])
+        # OtherModule isn't a known producer's shim -> consumer untouched.
+        assert "OtherModule.HealthUpdate:Connect(" in consumer.source

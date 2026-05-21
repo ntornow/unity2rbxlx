@@ -187,7 +187,15 @@ def run_packs(
 
 @dataclass(frozen=True)
 class WeaponMount:
-    prefab_name: str           # workspace prefab name (camelCase)
+    prefab_name: str           # workspace prefab name (camelCase) — the
+                               # converter materialises the Unity prefab
+                               # at this name in workspace, with the full
+                               # mesh hierarchy (bipod, scope, etc.). The
+                               # pack clones from THIS instance, not from
+                               # ``ReplicatedStorage.Templates``, which
+                               # carries a stripped variant whose smaller
+                               # bbox drops below the camera frustum at
+                               # the authored slot offset.
     equip_function: str        # AI-stubbed function name on the Player controller
     sentinel_var: str          # already-equipped flag, flipped to true on equip
     scale_expr: str            # Lua-source fragment for rifle:ScaleTo(<expr>)
@@ -232,16 +240,24 @@ def _detect_fps_weapon_mount(scripts: list["RbxScript"]) -> bool:
     weapon-mount patterns.
 
     A mount qualifies a script via either the prefab name (case variant
-    included) or the AI-stubbed equip function name. Either marker is
-    enough — Gamekit3D-style scripts contain neither and skip cleanly.
+    included) or any spelling of the equip function name. The Unity
+    source ships PascalCase (``GetRifle``); the AI transpiler emits
+    camelCase (``getRifle``) by Luau convention -- the detector must
+    accept both for ``run_packs`` to actually fire the pack on real
+    transpile output. Pre-fix the detector only checked PascalCase, so
+    the pack silently no-oped on every fresh transpile and the marker
+    on disk only persisted from older PascalCase-era runs.
+    Gamekit3D-style scripts contain none of these markers and skip
+    cleanly.
     """
     for s in scripts:
         src = s.source
         for mount in WEAPON_MOUNTS:
+            equip_variants = _equip_function_variants(mount.equip_function)
             if (
                 mount.prefab_name in src
                 or _prefab_alt_case(mount.prefab_name) in src
-                or mount.equip_function in src
+                or any(v in src for v in equip_variants)
             ):
                 return True
     return False
@@ -474,6 +490,22 @@ def _apply_weapon_mount(s: "RbxScript", mount: WeaponMount) -> bool:
         # no per-weapon follower and no hardcoded offset. Seating order
         # of preference: the Unity "WeaponSlot" object inside the rig →
         # the rig Model itself → (no rig) a one-shot camera placement.
+        #
+        # Source the prefab from ``workspace`` (the scene-placed instance
+        # the converter materialises from Unity's Player.prefab) — NOT
+        # from ``ReplicatedStorage.Templates``. The two are structurally
+        # different on real conversions: the scene placement carries the
+        # full Unity prefab (e.g. SimpleFPS rifle has bipod legs + laser
+        # pointer + pod-support, 14 mesh parts, ~50-stud bbox), while
+        # the Templates entry the prefab-packages writer emits is a
+        # stripped variant (10 parts, ~8-stud bbox). After the same
+        # ``ScaleTo`` factor, the Templates clone is ~6× smaller and
+        # drops below the camera frustum at the authored slot offset.
+        # PR #121's ``c65429b`` introduced a Templates-first lookup that
+        # silently selected the smaller variant and made the held weapon
+        # invisible -- a regression the user surfaced as "I cannot see
+        # the rifle". The fallback case-variant probes the Pascal-case
+        # spelling of the same workspace name.
         new_body = (
             f'{matched_header}\n'
             f'    if {mount.sentinel_var} then return end\n'
@@ -482,8 +514,6 @@ def _apply_weapon_mount(s: "RbxScript", mount: WeaponMount) -> bool:
             f'    if not rp then return end\n'
             f'    local rifle = rp:Clone()\n'
             f'    if rifle:IsA("Model") then rifle:ScaleTo({mount.scale_expr}) end\n'
-            f'    local prim = rifle:FindFirstChildWhichIsA("BasePart")\n'
-            f'    if not prim then rifle:Destroy() return end\n'
             f'    for _, p in rifle:GetDescendants() do\n'
             f'        if p:IsA("BasePart") then\n'
             f'            p.Transparency = 0\n'
@@ -1626,14 +1656,18 @@ def _fix_door_global_player_lookup(scripts: list["RbxScript"]) -> int:
 # Rewrite ``local function playerHasX(playerInstance)`` to read directly
 # from the Player-instance attribute that the pickup pack writes.
 
-# Match the ``playerHasX`` helper definition. ``\w*`` (not ``\w+``)
-# tolerates the zero-parameter shape — the AI transpiler emits both
-# ``playerHasKey(playerInstance)`` and, more recently, the bare
-# ``playerHasKey()`` form. The earlier ``\w+`` only matched the former,
-# so the pack silently no-oped on the bare shape and the door bug
-# survived (door never opens).
+# Match the helper definition for any "does the player hold X" probe.
+# The AI transpiler emits at least three variants:
+#   * ``playerHasKey(playerInstance)``  — Unity-style helper, two-arg
+#   * ``playerHasKey()``                — bare/no-arg
+#   * ``getPlayerHasKey()``             — get-prefixed accessor
+# The earlier regex anchored the name at ``player[Hh]as``, which
+# silently rejected the ``getPlayerHas*`` shape and the door bug
+# survived (door never opened in PR #121's fresh-transpile validation).
+# ``(?:get)?[pP]layer[Hh]as\w+`` covers all three; the ``\w*`` for the
+# parameter list still tolerates zero args.
 _DOOR_MODULE_PLAYER_HELPER_RE = re.compile(
-    r"local function (?P<fn>player[Hh]as\w+)\s*\(\s*\w*\s*\)"
+    r"local function (?P<fn>(?:get)?[pP]layer[Hh]as\w+)\s*\(\s*\w*\s*\)"
     r"(?P<body>.*?)"
     r"^end$",
     re.DOTALL | re.MULTILINE,
@@ -1645,9 +1679,27 @@ def _detect_door_module_player_lookup(scripts: list["RbxScript"]) -> bool:
         if s.name != "Door":
             continue
         src = s.source or ""
-        # Cheap detector: the playerHas* helper plus a PlayerScripts
-        # lookup OR a getPlayerMod call. Both are unique to this AI shape.
-        if "playerHas" in src and ("getPlayerMod" in src or 'PlayerScripts' in src):
+        # Cheap detector: any ``playerHas*`` OR ``getPlayerHas*`` helper
+        # paired with one of three Player-resolution shapes the AI
+        # transpiler picks between:
+        #   1. ``getPlayerMod()`` helper
+        #   2. ``PlayerScripts.Player`` lookup
+        #   3. ``script.Parent:FindFirstChild("Player")`` sibling-module
+        #      ``require`` (the third shape the AI emits more recently;
+        #      previously the detector missed it because of the
+        #      ``"playerHas"`` substring being case-sensitive against
+        #      ``getPlayerHasKey``).
+        # ``casefold()`` lets us catch both ``playerHas`` and
+        # ``PlayerHas`` without enumerating every spelling.
+        lower = src.casefold()
+        helper_hit = "playerhas" in lower
+        resolution_hit = (
+            "getplayermod" in lower
+            or "PlayerScripts" in src
+            or 'FindFirstChild("Player")' in src
+            or "FindFirstChild('Player')" in src
+        )
+        if helper_hit and resolution_hit:
             return True
     return False
 
@@ -1683,15 +1735,30 @@ def _fix_door_module_player_lookup(scripts: list["RbxScript"]) -> int:
         def _replace(m: "re.Match[str]") -> str:
             fn_name = m.group("fn")
             body = m.group("body")
-            # Skip helpers that don't reference the module/PlayerScripts
-            # path — they're already correct.
-            if "getPlayerMod" not in body and "PlayerScripts" not in body:
+            # Skip helpers that don't reference one of the three
+            # broken Player-resolution shapes -- they're already correct.
+            if (
+                "getPlayerMod" not in body
+                and "PlayerScripts" not in body
+                and 'FindFirstChild("Player")' not in body
+                and "FindFirstChild('Player')" not in body
+            ):
                 return m.group(0)
             # Derive attribute name from the function name:
-            # ``playerHasKey`` → ``hasKey``. ``len("playerHas")`` == 9
-            # covers both the ``playerHas`` and ``playerhas`` spellings.
-            suffix = fn_name[9:]
-            attr = ("has" + suffix) if suffix else "hasKey"
+            #   ``playerHasKey``    -> ``hasKey``    (strip leading ``player``)
+            #   ``getPlayerHasKey`` -> ``hasKey``    (strip leading ``getPlayer``)
+            # Use a case-insensitive regex so both ``Player`` and
+            # ``player`` spellings are handled without hardcoding offsets.
+            import re as _re
+            suffix_match = _re.match(
+                r"^(?:get)?[pP]layer([Hh]as\w+)$", fn_name,
+            )
+            if suffix_match:
+                suffix = suffix_match.group(1)
+                # ``HasKey`` -> ``hasKey`` (camelCase attr)
+                attr = suffix[0].lower() + suffix[1:]
+            else:
+                attr = "hasKey"
             rewritten[fn_name] = attr
             return (
                 f"local function {fn_name}(_part)\n"
