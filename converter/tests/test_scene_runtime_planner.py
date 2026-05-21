@@ -578,6 +578,72 @@ class TestReferenceResolution:
         assert len(refs) == 1
         assert refs[0]["target_is_ui"] is True
 
+    def test_instance_owner_is_ui_stamped_for_canvas_host(
+        self, tmp_path: Path,
+    ):
+        # Classifier-v2: instance whose host GameObject lives under a
+        # Canvas gets ``instance_owner_is_ui=True``. The domain classifier
+        # reads this as a STRONG client signal.
+        scripts = tmp_path / "Assets" / "Scripts"
+        scripts.mkdir(parents=True)
+        cs = scripts / "HudPanel.cs"
+        cs.write_text("public class HudPanel : MonoBehaviour { }")
+        guid = "4" * 32
+        idx = _make_guid_index(tmp_path, {guid: (cs, "script")})
+
+        # GameObject id "10" lives directly under Canvas (id "200").
+        # When the MonoBehaviour attached to "10" is walked, the
+        # instance row should carry ``instance_owner_is_ui = True``.
+        mb_on_panel = _node("10", "HudPanel", components=[
+            ComponentData(
+                component_type="MonoBehaviour", file_id="20",
+                properties=_mb_props(guid, go_fid="10"),
+            )
+        ])
+        mb_on_panel.parent_file_id = "200"
+        canvas = _node(
+            "200", "Canvas",
+            components=[ComponentData(
+                component_type="Canvas", file_id="201", properties={}
+            )],
+            children=[mb_on_panel],
+        )
+        # Non-Canvas peer so we can confirm the flag isn't stamped
+        # universally.
+        plain = _node("30", "Plain", components=[
+            ComponentData(
+                component_type="MonoBehaviour", file_id="31",
+                properties=_mb_props(guid, go_fid="30"),
+            )
+        ])
+        scene = _scene(
+            tmp_path / "Assets" / "Scenes" / "UI.unity",
+            roots=[canvas, plain],
+            all_nodes={"10": mb_on_panel, "200": canvas, "30": plain},
+        )
+        artifact = plan_scene_runtime(
+            parsed_scenes=[scene], prefab_library=None,
+            guid_index=idx, unity_project_root=tmp_path,
+        )
+        scene_block = artifact["scenes"]["Assets/Scenes/UI.unity"]
+        ui_instance = next(
+            i for i in scene_block["instances"]
+            if i["game_object_id"].endswith(":10")
+        )
+        non_ui_instance = next(
+            i for i in scene_block["instances"]
+            if i["game_object_id"].endswith(":30")
+        )
+        # Per-instance flag stamped on the canvas-hosted MB but not the
+        # other one.
+        from typing import cast as _cast
+        assert _cast(dict, ui_instance).get(
+            "instance_owner_is_ui",
+        ) is True
+        assert "instance_owner_is_ui" not in _cast(
+            dict, non_ui_instance,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Multi-scene namespacing & script_id uniqueness

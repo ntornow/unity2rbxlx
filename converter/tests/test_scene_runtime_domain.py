@@ -98,9 +98,10 @@ class TestApiSurfaceClassification:
         classify_scene_runtime_domains(artifact, scripts)
         assert artifact["modules"]["guid-b"]["domain"] == "server"
 
-    def test_both_side_api_fails_closed_to_legacy(self) -> None:
-        # A script touching both sides is a contract conflict — no
-        # override resolves a code-disagrees-with-itself case.
+    def test_both_side_api_excludes_unresolvable(self) -> None:
+        # A script touching both sides is a contract conflict (Rule 1) —
+        # no override (except an explicit ``"excluded"`` ACK) resolves a
+        # code-disagrees-with-itself case.
         _, mod = _mk_module("guid-c", class_name="Mixed")
         artifact = _mk_artifact({"guid-c": mod})
         scripts = [_mk_script(
@@ -108,17 +109,33 @@ class TestApiSurfaceClassification:
             "local p = Players.LocalPlayer\nevt.OnServerEvent:Connect(fn)",
         )]
         report = classify_scene_runtime_domains(artifact, scripts)
-        assert artifact["modules"]["guid-c"]["domain"] == "legacy"
+        assert artifact["modules"]["guid-c"]["domain"] == "excluded"
         assert (artifact["modules"]["guid-c"]["domain_signals"]
                 ["fail_closed_reason"]) == "both_side_api"
         assert "guid-c" in report["fail_closed_modules"]
+        assert "guid-c" in report["excluded_modules"]
 
-    def test_neither_side_no_ui_defaults_server_low_confidence(self) -> None:
-        # No API + no UI → server-authoritative default, flagged.
+    def test_neither_side_no_ui_defaults_client_under_networking_none(self) -> None:
+        # No API + no UI under --networking=none → CLIENT default
+        # (single-player Unity port has no real "server"; the client is
+        # the only place author intent can run). Low-confidence flagged.
         _, mod = _mk_module("guid-d", class_name="Plain")
         artifact = _mk_artifact({"guid-d": mod})
         scripts = [_mk_script("Plain", "return {value = 1}")]
         report = classify_scene_runtime_domains(artifact, scripts)
+        assert artifact["modules"]["guid-d"]["domain"] == "client"
+        assert artifact["modules"]["guid-d"]["domain_signals"]["low_confidence"]
+        assert "guid-d" in report["low_confidence_modules"]
+
+    def test_neither_side_no_ui_defaults_server_under_networking_mirror(self) -> None:
+        # Same setup under --networking=mirror → server-authoritative
+        # fallback (matches the netcode-project default).
+        _, mod = _mk_module("guid-d", class_name="Plain")
+        artifact = _mk_artifact({"guid-d": mod})
+        scripts = [_mk_script("Plain", "return {value = 1}")]
+        report = classify_scene_runtime_domains(
+            artifact, scripts, networking="mirror",
+        )
         assert artifact["modules"]["guid-d"]["domain"] == "server"
         assert artifact["modules"]["guid-d"]["domain_signals"]["low_confidence"]
         assert "guid-d" in report["low_confidence_modules"]
@@ -192,9 +209,9 @@ class TestUISignalAggregation:
 # ---------------------------------------------------------------------------
 
 class TestIntraClassConflict:
-    def test_multi_context_without_override_fails_closed(self) -> None:
+    def test_multi_context_without_override_excludes(self) -> None:
         # One instance has a UI ref; another doesn't. API surface is
-        # neither-side. With no domain_overrides → legacy.
+        # neither-side. With no domain_overrides → excluded.
         _, mod = _mk_module("guid-mc", class_name="DualUse")
         scenes = {
             "Scene.unity": {
@@ -221,12 +238,12 @@ class TestIntraClassConflict:
         artifact = _mk_artifact({"guid-mc": mod}, scenes=scenes)
         scripts = [_mk_script("DualUse", "return {value = 1}")]
         report = classify_scene_runtime_domains(artifact, scripts)
-        assert artifact["modules"]["guid-mc"]["domain"] == "legacy"
+        assert artifact["modules"]["guid-mc"]["domain"] == "excluded"
         assert (artifact["modules"]["guid-mc"]["domain_signals"]
                 ["fail_closed_reason"]) == "intra_class_conflict"
         assert artifact["modules"]["guid-mc"]["domain_signals"]["intra_class_conflict"]
         assert "guid-mc" in report["fail_closed_modules"]
-        # No displaced rows emitted on legacy fail-closed; the operator
+        # No displaced rows emitted on excluded; the operator
         # needs to set an override to see the report.
         assert report["displaced_instances"] == []
 
@@ -277,10 +294,10 @@ class TestIntraClassConflict:
 # ---------------------------------------------------------------------------
 
 class TestReachability:
-    def test_client_reach_to_server_storage_fails_closed(self) -> None:
+    def test_client_reach_to_server_storage_excludes(self) -> None:
         # Client class A requires server-storage helper Helper.
         # Helper is also required by server class B → cannot hoist to
-        # ReplicatedStorage; fails closed.
+        # ReplicatedStorage; excluded.
         modules: dict[str, object] = dict([
             _mk_module("a", "ClientA"),
             _mk_module("b", "ServerB"),
@@ -299,10 +316,11 @@ class TestReachability:
         report = classify_scene_runtime_domains(
             artifact, scripts, dependency_map=dep_map,
         )
-        assert artifact["modules"]["h"]["domain"] == "legacy"
+        assert artifact["modules"]["h"]["domain"] == "excluded"
         assert (artifact["modules"]["h"]["domain_signals"]
                 ["fail_closed_reason"]) == "reachability_conflict"
         assert "h" in report["fail_closed_modules"]
+        assert "h" in report["excluded_modules"]
 
     def test_client_only_reach_hoists_helper_to_replicated_storage(self) -> None:
         # Helper required only by client side and parked in
@@ -349,7 +367,9 @@ class TestOperatorOverride:
         assert artifact["modules"]["guid-o"]["domain_signals"]["override_applied"]
 
     def test_override_cannot_rescue_both_side_api(self) -> None:
-        # Code disagreeing with itself stays legacy even with override.
+        # Code disagreeing with itself (Rule 1) stays excluded even with
+        # an override naming a side. Only ``"excluded"`` is accepted as
+        # the ACK; ``"client"`` / ``"server"`` are rejected.
         _, mod = _mk_module("guid-x", class_name="Mixed")
         artifact = _mk_artifact(
             {"guid-x": mod}, overrides={"guid-x": "client"},
@@ -359,7 +379,10 @@ class TestOperatorOverride:
             "local p = Players.LocalPlayer\nevt.OnServerEvent:Connect(fn)",
         )]
         classify_scene_runtime_domains(artifact, scripts)
-        assert artifact["modules"]["guid-x"]["domain"] == "legacy"
+        assert artifact["modules"]["guid-x"]["domain"] == "excluded"
+        assert artifact["modules"]["guid-x"]["domain_signals"].get(
+            "override_rejected"
+        ) is True
 
 
 # ---------------------------------------------------------------------------
@@ -454,13 +477,16 @@ class TestLegacyTablesUntouched:
 # ---------------------------------------------------------------------------
 
 class TestNonRuntimeBearingSkipped:
-    def test_non_runtime_bearing_modules_get_no_domain(self) -> None:
+    def test_non_runtime_bearing_modules_get_helper_domain(self) -> None:
+        # Classifier-v2: non-runtime-bearing rows are stamped ``"helper"``
+        # so the host runtime (which iterates by domain) cleanly skips them.
+        # The signal pipeline still doesn't apply — no domain_signals row.
         _, mod = _mk_module("guid-skip", class_name="Skip", runtime_bearing=False)
         artifact = _mk_artifact({"guid-skip": mod})
         scripts = [_mk_script("Skip", "local p = Players.LocalPlayer")]
         classify_scene_runtime_domains(artifact, scripts)
-        # Module row left untouched by the classifier.
-        assert "domain" not in artifact["modules"]["guid-skip"]
+        assert artifact["modules"]["guid-skip"]["domain"] == "helper"
+        assert "domain_signals" not in artifact["modules"]["guid-skip"]
 
 
 # ---------------------------------------------------------------------------

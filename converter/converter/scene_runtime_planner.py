@@ -48,20 +48,22 @@ from unity.yaml_parser import ref_file_id, ref_guid
 class SceneRuntimeModule(TypedDict, total=False):
     """One row in ``scene_runtime.modules``. Keyed by canonical script id.
 
-    PR1 fields: ``stem``, ``class_name``, ``runtime_bearing``. PR3b adds
-    ``domain`` / ``container`` / ``module_path`` / ``domain_signals`` once
-    the storage classifier has run.
+    PR1 fields: ``stem``, ``class_name``, ``runtime_bearing``. PR3b /
+    classifier-v2 add ``domain`` / ``container`` / ``module_path`` /
+    ``domain_signals`` once the storage classifier has run.
 
-    ``domain`` values: ``"client"`` | ``"server"`` | ``"legacy"`` (the last
-    when the contract conflict-resolution kicks the module back to the
-    legacy bootstrap path). ``container`` mirrors the storage_classifier
-    parent_path (``"ReplicatedStorage"`` / ``"ServerStorage"`` /
+    ``domain`` values: ``"client"`` | ``"server"`` | ``"helper"`` |
+    ``"excluded"``. (``"legacy"`` is REMOVED in classifier-v2 — see the
+    scene-runtime-domain-signals design doc. Existing on-disk artifacts
+    carrying ``"legacy"`` are migrated to ``"excluded"`` on first read.)
+    ``container`` mirrors the storage_classifier parent_path
+    (``"ReplicatedStorage"`` / ``"ServerStorage"`` /
     ``"ServerScriptService"`` / ``"StarterPlayer.StarterPlayerScripts"`` /
     ``"StarterPlayer.StarterCharacterScripts"`` / ``"ReplicatedFirst"``).
-    ``module_path`` is the relative path the host runtime requires
-    (``"scripts/foo.luau"`` shape). ``domain_signals`` records why PR3b
-    chose what it did so PR4's report can attribute decisions to the
-    operator.
+    ``module_path`` is the dotted DataModel path the host runtime
+    requires (``"ReplicatedStorage.Foo"``). ``domain_signals`` records
+    why the classifier chose what it did so the conversion report can
+    attribute decisions to the operator.
     """
 
     stem: str
@@ -74,33 +76,61 @@ class SceneRuntimeModule(TypedDict, total=False):
 
 
 class SceneRuntimeDomainSignals(TypedDict, total=False):
-    """Per-module audit trail for PR3b's domain classifier. All fields
+    """Per-module audit trail for the v2 domain classifier. All fields
     optional — only the ones that fired show up in the persisted artifact.
 
     ``api_surface``: ``"client"`` | ``"server"`` | ``"both"`` | ``"neither"``
-        — the verdict from the new generic-only API pattern table.
+        — verdict from the post-transpile Luau pattern scan (legacy
+        signal channel; kept for back-compat reads).
     ``ui_signal``: True if at least one instance's references resolved
         into a converted Canvas / UI subtree (``target_is_ui`` aggregation).
+    ``strong_client`` / ``strong_server`` / ``moderate_client`` /
+    ``moderate_server``: signal counts (v2 classifier). Each is the
+        number of distinct signal kinds that fired on this module
+        (deduped — multiple `Input.Get*` matches still count as one).
+    ``cs_signals``: list of signal kind names that fired from the C#
+        source channel. e.g. ``["using_UnityEngine_UI", "Input_Get",
+        "SerializeField_Text"]``.
+    ``luau_signals``: list of signal kind names that fired from the
+        post-transpile Luau channel. e.g. ``["LocalPlayer", "OnServerEvent"]``.
+    ``instance_signals``: list of signal kind names that fired from
+        per-instance evidence. e.g. ``["instance_owner_is_ui",
+        "target_is_ui"]``.
+    ``rule_applied``: which rule (1..7) determined the verdict before
+        any override. Useful for operator triage.
     ``intra_class_conflict``: True if instances of this script produce
         conflicting per-instance UI evidence AND the API surface was
         ambiguous (``"neither"`` or contradicted by overrides).
     ``override_applied``: True if the final ``domain`` came from
         ``scene_runtime.domain_overrides`` rather than classifier inference.
-    ``low_confidence``: True when the verdict is the "neither signal,
-        defaulted to server" fallback — flagged so operators see what
-        the classifier wasn't sure about.
+    ``override_rejected``: True if an override was supplied but
+        rejected (Rule-1 excluded → only ``"excluded"`` accepted).
+    ``low_confidence``: True when the verdict is the zero-signal
+        fallback path. Flagged so operators see what the classifier
+        wasn't sure about.
     ``reachability_forced_container``: ``"ReplicatedStorage"`` if the
-        reachability rule moved this module from ServerStorage to RS to
-        satisfy a client require; absent otherwise.
-    ``fail_closed_reason``: ``"both_side_api"`` | ``"intra_class_conflict"``
-        | ``"reachability_conflict"`` — present only when ``domain`` is
-        ``"legacy"``.
+        reachability rule moved this module from ServerStorage to RS
+        to satisfy a client require; absent otherwise.
+    ``fail_closed_reason``: ``"both_side_api"`` (Rule-1) |
+        ``"moderate_only_ambiguity"`` (Rule-4) |
+        ``"intra_class_conflict"`` |
+        ``"reachability_conflict"`` — present only when ``domain`` is
+        ``"excluded"``.
     """
 
     api_surface: str
     ui_signal: bool
+    strong_client: int
+    strong_server: int
+    moderate_client: int
+    moderate_server: int
+    cs_signals: list[str]
+    luau_signals: list[str]
+    instance_signals: list[str]
+    rule_applied: int
     intra_class_conflict: bool
     override_applied: bool
+    override_rejected: bool
     low_confidence: bool
     reachability_forced_container: str
     fail_closed_reason: str
@@ -128,8 +158,17 @@ class SceneRuntimeInstance(TypedDict):
 # runtime treats a missing key as "this GO has no parent in the planner
 # graph" and stops the upward walk. This mirrors the
 # ``SceneRuntimeReferenceExtra`` pattern.
+#
+# Classifier-v2 (domain signals redesign) appends
+# ``instance_owner_is_ui``: ``True`` iff the instance's host GameObject
+# lives under (or owns) a Canvas. The planner already computes
+# ``ui_go_fids`` per scene/prefab; this surfaces the per-instance
+# verdict so the domain classifier can fold "script attached to a UI
+# GameObject" into the strong-client signal pool without re-walking
+# the scene hierarchy. Default ``False`` when key missing.
 class SceneRuntimeInstanceExtra(TypedDict, total=False):
     parent_game_object_id: str
+    instance_owner_is_ui: bool
 
 
 SceneRuntimeReference = TypedDict(
@@ -711,6 +750,13 @@ def _walk_scene(
                 cast(dict[str, object], inst_row)["parent_game_object_id"] = (
                     f"{namespace}:{node.parent_file_id}"
                 )
+            # Classifier-v2: stamp ``instance_owner_is_ui`` when the host
+            # GameObject sits inside the Canvas subtree. This is the
+            # strongest available client-side signal — domain-signals
+            # design doc names it as a strong-client signal on par with
+            # ``[SerializeField] Text`` C# annotations.
+            if node.file_id in ui_go_fids:
+                cast(dict[str, object], inst_row)["instance_owner_is_ui"] = True
             instances.append(inst_row)
             references.extend(refs)
             lifecycle.append(instance_id)
@@ -793,6 +839,10 @@ def _walk_prefab(
                 cast(dict[str, object], inst_row)["parent_game_object_id"] = (
                     f"{prefab_id}:{node.parent_file_id}"
                 )
+            # Classifier-v2: per-instance UI ownership signal (see
+            # _walk_scene for rationale).
+            if node.file_id in ui_go_fids:
+                cast(dict[str, object], inst_row)["instance_owner_is_ui"] = True
             instances.append(inst_row)
             references.extend(refs)
             lifecycle.append(instance_id)

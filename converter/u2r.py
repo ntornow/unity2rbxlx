@@ -331,6 +331,21 @@ def main(verbose: bool) -> None:
               "running any phase. Use when switching modes on an "
               "existing output dir (e.g., legacy run on a "
               "generic-stamped dir). PR3b.")
+@click.option("--networking",
+              type=click.Choice(["none", "mirror", "netcode"]),
+              default="none",
+              show_default=True,
+              help="Networking mode for the domain classifier (v2). "
+                   "'none' = single-player Unity port (default; fallback "
+                   "= client). 'mirror' / 'netcode' = networked Unity "
+                   "project; Mirror-only signals fire and fallback = "
+                   "server. See "
+                   "converter/docs/design/scene-runtime-domain-signals.md.")
+@click.option("--strict-classification", is_flag=True,
+              help="Block transpile if any runtime-bearing module ends "
+                   "up low_confidence or excluded after override "
+                   "application. Use for production runs; leave off for "
+                   "iteration.")
 def convert(
     unity_project: str,
     output: str,
@@ -347,6 +362,8 @@ def convert(
     skip_architecture_step: bool,
     scene_runtime: str,
     clean: bool,
+    networking: str,
+    strict_classification: bool,
 ) -> None:
     """Convert a Unity project to a Roblox experience.
 
@@ -439,6 +456,9 @@ def convert(
     # PR3b: plumb the requested mode through to ctx so
     # _classify_storage's domain classifier knows whether to run.
     pipeline.ctx.scene_runtime_mode = scene_runtime
+    # Classifier-v2: plumb networking + strict-classification flags.
+    pipeline.ctx.networking_mode = networking
+    pipeline.ctx.strict_classification = strict_classification
 
     # Plumb --universe-id / --place-id into the pipeline context so the
     # resolve_assets phase can run headless mesh resolution. Without this,

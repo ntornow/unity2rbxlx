@@ -712,7 +712,11 @@ function SceneRuntime:_wireReferences(refs, componentByInstanceId,
 				end
 				if srcMeta and srcMeta.domain and tgtDomain
 				   and srcMeta.domain ~= "legacy"
+				   and srcMeta.domain ~= "excluded"
+				   and srcMeta.domain ~= "helper"
 				   and tgtDomain ~= "legacy"
+				   and tgtDomain ~= "excluded"
+				   and tgtDomain ~= "helper"
 				   and srcMeta.domain ~= tgtDomain then
 					self._warn(string.format(
 						"[scene_runtime] cross-domain ref %s(%s).%s -> %s(%s) -> injecting nil",
@@ -1384,7 +1388,10 @@ function SceneRuntime:start(domainFilter)
 	-- Phase 0: collect runtime-bearing module ids for this side.
 	local includeScriptId = {}
 	for sid, row in pairs(self._plan.modules or {}) do
-		if row.runtime_bearing and row.domain ~= "legacy" then
+		if row.runtime_bearing
+		   and row.domain ~= "legacy"
+		   and row.domain ~= "excluded"
+		   and row.domain ~= "helper" then
 			if (domainFilter == nil) or (row.domain == domainFilter) then
 				includeScriptId[sid] = true
 			end

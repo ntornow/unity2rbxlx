@@ -603,9 +603,21 @@ def materials(unity_project_path: str, output_dir: str) -> None:
 @click.option("--clean", is_flag=True,
               help="PR3b: wipe + re-stamp the output dir before "
               "transpiling (mode-mismatch remediation).")
+@click.option("--networking",
+              type=click.Choice(["none", "mirror", "netcode"]),
+              default="none",
+              show_default=True,
+              help="Networking mode for the domain classifier (v2). "
+                   "'none' = single-player Unity port (fallback = client). "
+                   "'mirror' / 'netcode' = networked project (fallback = "
+                   "server, Mirror-only signals active).")
+@click.option("--strict-classification", is_flag=True,
+              help="Block transpile if any runtime-bearing module ends up "
+                   "low_confidence or excluded after override application.")
 def transpile(unity_project_path: str, output_dir: str,
               api_key: str | None, no_ai: bool, scene_runtime: str,
-              clean: bool) -> None:
+              clean: bool, networking: str,
+              strict_classification: bool) -> None:
     """Phase 3b: transpile C# scripts to Luau."""
     # PR4: only ``auto`` is rejected (PR5 turf). ``generic`` flows
     # through the host runtime; see ``_enforce_scene_runtime_mode_supported``
@@ -639,6 +651,10 @@ def transpile(unity_project_path: str, output_dir: str,
     # PR3b: thread the requested mode into ctx so _classify_storage's
     # domain classifier knows whether to run.
     pipeline.ctx.scene_runtime_mode = scene_runtime
+    # Classifier-v2: networking + strict flags drive signal selection +
+    # zero-signal fallback inside the domain classifier.
+    pipeline.ctx.networking_mode = networking
+    pipeline.ctx.strict_classification = strict_classification
     try:
         _run_through(pipeline, "transpile_scripts")
     except Exception as exc:

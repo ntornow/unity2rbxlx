@@ -137,6 +137,19 @@ class ConversionContext:
     # "default output byte-identical" invariant carried over from PR3a).
     scene_runtime_mode: str = "legacy"
 
+    # Classifier-v2: requested networking mode for the domain classifier.
+    # ``"none"`` (default): single-player Unity ports — fallback = client.
+    # ``"mirror"`` / ``"netcode"``: networked Unity projects — fallback =
+    # server, Mirror-only signals active.
+    # See ``converter/docs/design/scene-runtime-domain-signals.md``.
+    networking_mode: str = "none"
+
+    # Classifier-v2: when True, the domain classifier still runs but the
+    # pipeline rejects the conversion if any runtime-bearing module
+    # comes out ``"excluded"`` or ``low_confidence`` after override
+    # application. Default off so iteration cycles aren't blocked.
+    strict_classification: bool = False
+
     def __post_init__(self) -> None:
         # JSON load via `cls(**data)` populates storage_plan as a dict (the
         # asdict() form). Reconstruct it as a StoragePlan when present so the

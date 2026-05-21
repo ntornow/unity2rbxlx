@@ -3883,14 +3883,50 @@ script.Disabled = true
         ):
             from converter.scene_runtime_domain import (
                 classify_scene_runtime_domains,
+                migrate_legacy_domain_values,
             )
+            # Migrate any pre-v2 ``"legacy"`` domain values lurking in the
+            # on-disk plan we just merged (the on-disk plan may have been
+            # produced by an older converter run). Idempotent.
+            migrate_legacy_domain_values(cast("dict", scene_runtime))
+            networking = getattr(self.ctx, "networking_mode", "none")
+            strict = bool(getattr(self.ctx, "strict_classification", False))
             report = classify_scene_runtime_domains(
                 cast("dict", scene_runtime),
                 self.state.rbx_place.scripts,
                 dependency_map=self.state.dependency_map or None,
+                guid_index=self.state.guid_index,
+                networking=networking,
+                strict=strict,
             )
             scene_runtime["displaced_instances"] = report["displaced_instances"]
             scene_runtime["low_confidence_modules"] = report["low_confidence_modules"]
+            scene_runtime["excluded_modules"] = report["excluded_modules"]
+            if report["mirror_adoption_low"]:
+                scene_runtime["mirror_adoption_low"] = True
+                self.ctx.warnings.append(
+                    f"[scene_runtime] --networking={networking} declared "
+                    "but adoption signals are sparse: few netcode annotations "
+                    "and/or zero `using Mirror`/`using Unity.Netcode` imports. "
+                    "Most modules will fall through to the server default. "
+                    "Consider --networking=none or expand annotations. "
+                    "See conversion report for module-level detail."
+                )
+            # Strict mode: surface the violation list as a hard error so
+            # the caller can abort before transpile. We raise here because
+            # the classifier runs in ``_classify_storage`` which is a
+            # pre-transpile phase, and the design doc says strict mode
+            # "blocks transpile" (not "fails at conversion-end").
+            if strict and report["strict_violations"]:
+                violations = "\n  - ".join(report["strict_violations"])
+                raise RuntimeError(
+                    "--strict-classification: domain classifier left "
+                    f"{len(report['strict_violations'])} runtime-bearing "
+                    "module(s) unresolved. Add "
+                    "scene_runtime.domain_overrides entries (or split the "
+                    "source class) before re-running:\n  - "
+                    + violations
+                )
 
         plan_path.write_text(
             _json.dumps({
@@ -3955,6 +3991,25 @@ script.Disabled = true
         for key, value in on_disk.items():
             if key not in merged:
                 merged[key] = value
+
+        # Classifier-v2 migration: rewrite pre-v2 ``domain="legacy"`` rows
+        # in the merged modules block. Idempotent. Cheap (dict scan).
+        try:
+            from converter.scene_runtime_domain import (
+                migrate_legacy_domain_values,
+            )
+            migrated = migrate_legacy_domain_values(
+                cast("dict", merged),
+            )
+            if migrated:
+                log.info(
+                    "[classify_storage] migrated %d legacy domain row(s) "
+                    "from on-disk plan to 'excluded'", migrated,
+                )
+        except Exception as exc:
+            log.debug(
+                "[classify_storage] legacy-domain migration skipped: %s", exc,
+            )
 
         return merged
 

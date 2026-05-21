@@ -1145,17 +1145,17 @@ def _collect_ui_child_suppression_ids(
                 continue
             # Codex P1: when the domain classifier has already run
             # (`module_row["domain"]` is populated), exclude fail-closed
-            # modules. PR3b's classifier may force a module to
-            # ``domain="legacy"`` (both-side API, intra-class conflict,
-            # reachability conflict); the host runtime never wires those
-            # modules, so the static UI subtree must persist. At
-            # ``convert_scene`` time the classifier hasn't run yet
-            # (subphase order: ``convert_scene`` → ``_classify_storage``),
-            # so the field is typically absent — in that case we fall
-            # back to ``runtime_bearing`` per the brief. This guard fires
-            # only when callers (or future architecture changes) thread
-            # a post-classify artifact in.
-            if module_row.get("domain") == "legacy":
+            # modules. The classifier may force a module to
+            # ``domain="excluded"`` (both-side API, intra-class
+            # conflict, reachability conflict, moderate-only ambiguity);
+            # the host runtime never wires those modules, so the static
+            # UI subtree must persist. At ``convert_scene`` time the
+            # classifier hasn't run yet (subphase order: ``convert_scene``
+            # → ``_classify_storage``), so the field is typically absent —
+            # in that case we fall back to ``runtime_bearing``.
+            # (``"legacy"`` is the pre-classifier-v2 spelling; kept here
+            # for on-disk artifacts that haven't been migrated yet.)
+            if module_row.get("domain") in ("excluded", "legacy"):
                 continue
             suppressed.add(game_object_id)
 

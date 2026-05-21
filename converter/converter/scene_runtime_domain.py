@@ -1,54 +1,55 @@
-"""scene_runtime_domain.py -- PR3b: execution-domain classifier for the
+"""scene_runtime_domain.py -- v2 execution-domain classifier for the
 contract pipeline.
 
 Runs after Phase 4a's storage classifier and after the PR1 planner has
 seeded ``scene_runtime.modules``. For every runtime-bearing module
 this assigns one of:
 
-  - ``"client"``  -- touches client-only API, or drives a converted
-                     Canvas / UI subtree.
-  - ``"server"``  -- touches server-only API, or touches neither side's
-                     API and drives no UI (authoritative default per
-                     the design doc; Roblox gameplay is server-auth).
-  - ``"legacy"``  -- contract conflict (both-side API, intra-class
-                     instance-domain disagreement without an operator
-                     override, or a reachability conflict). The module
-                     falls back to the legacy bootstrap path; the host
-                     runtime never instantiates it.
+  - ``"client"``   -- per the design doc rule table.
+  - ``"server"``   -- per the rule table.
+  - ``"helper"``   -- not runtime-bearing; pure utility module.
+  - ``"excluded"`` -- runtime-bearing but unresolvable (Rule-1 / Rule-4
+                      / reachability conflict). Recorded in the report;
+                      the host runtime never instantiates it.
 
-The classification table is **generic-only** -- a new table defined in
-this module. The legacy ``storage_classifier._CLIENT_ONLY_PATTERNS`` /
-``script_coherence._CLIENT_ONLY_PATTERNS`` tables are intentionally
-left byte-frozen; this table covers signals the converter emits today
-that the legacy tables miss (``RenderStepped``, ``:FireServer(``,
-``.OnClientEvent``, ``game.Workspace.CurrentCamera`` variants,
-``StarterGui`` variants).
+The v2 classifier consumes **three signal channels**:
 
-The classifier also folds in the PR1 planner's per-instance UI
-reference signal (each reference row carries ``target_is_ui: bool``
-populated when the ref resolves into a converted Canvas / UI subtree).
-The class verdict aggregates over instances -- any UI-bearing ref in
-any instance contributes the signal.
+  1. **C# source** (the strongest channel): looked up per-module via the
+     ``guid_index`` mapping ``script_id -> asset_path``. The C# tables
+     fire on Unity-specific patterns (``using UnityEngine.UI``,
+     ``[SerializeField] Text``, ``Input.Get*``, ``[ServerRpc]``, ...).
 
-Intra-class instance-domain conflict: when instances of the same
-class produce conflicting per-instance evidence (some UI-bearing,
-some not + non-UI subtree) **and** the API surface scan doesn't pin
-the class, the class is multi-context. Without
-``scene_runtime.domain_overrides`` the class fails closed to
-``"legacy"``. With an override the chosen side wins and the displaced
-instances surface in ``scene_runtime.displaced_instances``.
+  2. **Post-transpile Luau** (legacy PR3b channel; kept). The classifier
+     still scans the post-transpile body for Roblox-flavoured signals
+     (``Players.LocalPlayer``, ``:FireServer(``, ``.OnServerEvent``, ...).
 
-See ``converter/docs/design/scene-runtime-contract.md`` Piece 4 and
-the PR3b row of the PR table for the full contract.
+  3. **Per-instance evidence**: the planner stamps
+     ``instance_owner_is_ui`` per-instance when the host GameObject lives
+     in a Canvas subtree, and ``target_is_ui`` on UI-bearing refs. Both
+     contribute STRONG CLIENT signals (the design doc lists them on par
+     with ``[SerializeField] Text``).
+
+Signals are then bucketed into **strong** / **moderate** counts and
+resolved through the 7-rule table in the design doc. Operator overrides
+apply after the rule table with the rule-specific asymmetry from
+§"Operator override" (Rule-1 ``excluded`` accepts only ``"excluded"``;
+Rule-4 ``excluded`` and all other verdicts accept ``"client"`` /
+``"server"`` / ``"excluded"``).
+
+See ``converter/docs/design/scene-runtime-domain-signals.md`` for the
+full spec.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import re
+from pathlib import Path
 from typing import Iterable, TypedDict, cast
 
 from core.roblox_types import RbxScript
+from core.unity_types import GuidIndex
 
 from converter.scene_runtime_planner import (
     SceneRuntimeArtifact,
@@ -61,24 +62,31 @@ from converter.scene_runtime_planner import (
     SceneRuntimeScene,
 )
 from converter.storage_classifier import (
-    REPLICATED_FIRST,
     REPLICATED_STORAGE,
-    SERVER_SCRIPT_SERVICE,
     SERVER_STORAGE,
-    STARTER_CHARACTER_SCRIPTS,
-    STARTER_PLAYER_SCRIPTS,
 )
 
 log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Generic-only API pattern tables -- distinct from the legacy
-# ``storage_classifier._CLIENT_ONLY_PATTERNS`` and
-# ``script_coherence._CLIENT_ONLY_PATTERNS`` (both of which stay byte-
-# frozen per the design doc). These tables include signals the converter
-# actually emits today that the legacy tables miss; they're scoped to
-# the PR3b domain classifier only.
+# Networking mode
+# ---------------------------------------------------------------------------
+
+# Valid values for the ``--networking`` CLI flag.
+# - ``"none"``: single-player Unity ports. Default fallback = client.
+# - ``"mirror"``: Mirror-using networked Unity games. Mirror-only signals
+#     (e.g. ``[ServerRpc]``, ``[SyncVar]``) fire. Default fallback = server.
+# - ``"netcode"``: Unity.Netcode-using networked games. Same fallback
+#     behaviour as Mirror (server-authoritative).
+NetworkingMode = str  # "none" | "mirror" | "netcode"
+NETWORKING_MODES: tuple[str, ...] = ("none", "mirror", "netcode")
+DEFAULT_NETWORKING_MODE: str = "none"
+
+
+# ---------------------------------------------------------------------------
+# Luau signal tables (kept from PR3b; back-compat name retained for the
+# legacy-tables-byte-frozen tests in test_scene_runtime_domain.py).
 # ---------------------------------------------------------------------------
 
 _GENERIC_CLIENT_API_PATTERNS: tuple[str, ...] = (
@@ -126,28 +134,152 @@ _GENERIC_SERVER_API_PATTERNS: tuple[str, ...] = (
     r"\bIsServer\(\)",
 )
 
-# Compiled once. Module-level so verifier inspections of the table
-# don't pay re-compile cost.
+# Compiled once at module level.
 _CLIENT_RX = tuple(re.compile(p) for p in _GENERIC_CLIENT_API_PATTERNS)
 _SERVER_RX = tuple(re.compile(p) for p in _GENERIC_SERVER_API_PATTERNS)
 
 
 # ---------------------------------------------------------------------------
-# Report payload returned to callers (the pipeline stamps it onto
-# ``ctx.scene_runtime``; tests assert against it directly).
+# C# signal tables (v2 classifier).
+#
+# Patterns operate on the raw C# source text. Each row is
+# (regex, signal_name, mirror_only). Mirror-only rows fire only when
+# ``networking`` is ``"mirror"`` or ``"netcode"``; under ``"none"`` they
+# are ignored.
+# ---------------------------------------------------------------------------
+
+_CSharpPattern = tuple[str, str, bool]
+
+
+_CS_STRONG_CLIENT: tuple[_CSharpPattern, ...] = (
+    # Mirror / Netcode client-side annotations.
+    (r"\[ClientRpc\b", "ClientRpc", True),
+    (r"\[Client\b\]", "ClientAttribute", True),
+    (r"\[ClientCallback\b", "ClientCallback", True),
+    # Unity UI namespace imports.
+    (r"^\s*using\s+UnityEngine\.UI\s*;", "using_UnityEngine_UI", False),
+    (r"^\s*using\s+TMPro\s*;", "using_TMPro", False),
+    (r"^\s*using\s+UnityEngine\.EventSystems\s*;",
+     "using_UnityEngine_EventSystems", False),
+    # Input
+    (r"\bInput\.(?:Get[A-Z]\w*|mousePosition|mouseScrollDelta|"
+     r"touchCount|GetTouch|anyKey\b|anyKeyDown\b)",
+     "Input_Get", False),
+    # OnGUI methods (UI immediate-mode rendering — client-only).
+    (r"\bvoid\s+OnGUI\s*\(\s*\)", "OnGUI_method", False),
+    # PlayerPrefs
+    (r"\bPlayerPrefs\.\w+\s*\(", "PlayerPrefs", False),
+    # Cursor / Screen / Application.platform — client-only Unity APIs.
+    (r"\bCursor\.(?:visible|lockState|SetCursor)\b", "Cursor_API", False),
+    (r"\bScreen\.(?:width|height|fullScreen|orientation|"
+     r"currentResolution|resolutions)\b",
+     "Screen_API", False),
+    (r"\bApplication\.platform\b", "Application_platform", False),
+    # [SerializeField] field types pointing at UI components. Match on
+    # the field type after [SerializeField] but before the field name.
+    # We approximate with a lookbehind-free pattern: any [SerializeField]
+    # whose next non-attribute token names a known UI type. Robust enough
+    # for asset-store-style C# (SerializeField on its own line or inline
+    # with the type).
+    (r"\[SerializeField\][^;{}]*?\b"
+     r"(?:Text|Image|RawImage|Slider|Button|RectTransform|"
+     r"TMP_Text|TextMeshProUGUI|TextMeshPro|CanvasGroup|"
+     r"Canvas|ScrollRect|Toggle|Dropdown|InputField|TMP_InputField)\b",
+     "SerializeField_UI_type", False),
+)
+
+
+_CS_MODERATE_CLIENT: tuple[_CSharpPattern, ...] = (
+    # Camera.main — per-player camera. Server scripts can read it but the
+    # idiom is overwhelmingly client.
+    (r"\bCamera\.main\b", "Camera_main", False),
+    # Animator playback APIs — see design doc rationale (moderate).
+    (r"\bAnimator\b[^;]*\.(?:SetBool|SetFloat|SetInteger|SetTrigger|"
+     r"CrossFade|Play|ResetTrigger)\s*\(",
+     "Animator_playback", False),
+    # GetComponent<Animator>().Play(...) variant
+    (r"GetComponent<\s*Animator\s*>\(\)\.(?:SetBool|SetFloat|SetInteger|"
+     r"SetTrigger|CrossFade|Play|ResetTrigger)\s*\(",
+     "Animator_playback_GetComponent", False),
+)
+
+
+_CS_STRONG_SERVER: tuple[_CSharpPattern, ...] = (
+    # Mirror-only annotations.
+    (r"\[ServerRpc\b", "ServerRpc", True),
+    (r"\[Server\b\]", "ServerAttribute", True),
+    (r"\[ServerCallback\b", "ServerCallback", True),
+    (r"\[Command\b", "Command", True),  # Mirror legacy alias
+    (r"\[SyncVar\b", "SyncVar", True),
+    # NetworkBehaviour subclass (Mirror / Netcode).
+    (r":\s*(?:NetworkBehaviour|Mirror\.NetworkBehaviour|"
+     r"Unity\.Netcode\.NetworkBehaviour)\b",
+     "NetworkBehaviour_subclass", True),
+)
+
+
+# Moderate server signals are derived at the class-graph level (e.g.,
+# require-graph reaches a NetworkBehaviour subclass) so they're not
+# table-driven here. Reserved for future expansion.
+_CS_MODERATE_SERVER: tuple[_CSharpPattern, ...] = ()
+
+
+def _compile_cs_table(
+    patterns: tuple[_CSharpPattern, ...],
+) -> tuple[tuple[re.Pattern[str], str, bool], ...]:
+    return tuple(
+        (re.compile(p, re.MULTILINE), name, mirror_only)
+        for p, name, mirror_only in patterns
+    )
+
+
+_CS_STRONG_CLIENT_RX = _compile_cs_table(_CS_STRONG_CLIENT)
+_CS_MODERATE_CLIENT_RX = _compile_cs_table(_CS_MODERATE_CLIENT)
+_CS_STRONG_SERVER_RX = _compile_cs_table(_CS_STRONG_SERVER)
+_CS_MODERATE_SERVER_RX = _compile_cs_table(_CS_MODERATE_SERVER)
+
+
+# Project-level Mirror/Netcode `using` import check for the
+# `mirror_adoption_low` heuristic.
+_RE_USING_MIRROR = re.compile(
+    r"^\s*using\s+(?:Mirror|Unity\.Netcode)\b", re.MULTILINE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Report payload
 # ---------------------------------------------------------------------------
 
 class DomainClassifierReport(TypedDict):
     """Side-channel output of ``classify_scene_runtime_domains``.
 
-    Fields are merged onto ``scene_runtime`` in ``_classify_storage``
-    so downstream consumers (PR4 host runtime, operator inspection)
-    read everything from one place.
+    Surfaced onto ``scene_runtime`` in ``_classify_storage`` and read by
+    the conversion-report writer.
+
+    - ``displaced_instances`` -- instances disagreeing with their class's
+      final domain (operator-pinned conflicts).
+    - ``low_confidence_modules`` -- script_ids stamped low_confidence
+      (zero-signal fallback). Operator may want to pin via
+      ``domain_overrides``.
+    - ``excluded_modules`` -- script_ids the classifier kicked to
+      ``"excluded"`` (Rule-1, Rule-4, reachability, override-rejected).
+    - ``fail_closed_modules`` -- legacy alias for ``excluded_modules``.
+      Retained one release for downstream consumers; the conversion
+      report writes ``excluded_modules``.
+    - ``mirror_adoption_low`` -- present + True when ``--networking=
+      mirror|netcode`` was declared but the project's netcode-annotation
+      density falls below the heuristic threshold.
+    - ``strict_violations`` -- per the design doc §"Strict mode": modules
+      that would block transpile under ``--strict-classification`` (i.e.,
+      any low_confidence / excluded module after override application).
     """
 
     displaced_instances: list[SceneRuntimeDisplacedInstance]
     low_confidence_modules: list[str]
+    excluded_modules: list[str]
     fail_closed_modules: list[str]
+    mirror_adoption_low: bool
+    strict_violations: list[str]
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +291,9 @@ def classify_scene_runtime_domains(
     scripts: Iterable[RbxScript],
     *,
     dependency_map: dict[str, list[str]] | None = None,
+    guid_index: GuidIndex | None = None,
+    networking: str = DEFAULT_NETWORKING_MODE,
+    strict: bool = False,
 ) -> DomainClassifierReport:
     """Populate ``domain`` / ``container`` / ``module_path`` /
     ``domain_signals`` on every runtime-bearing module in
@@ -167,23 +302,34 @@ def classify_scene_runtime_domains(
     ``scripts`` must already carry their final ``parent_path`` (set by
     ``storage_classifier.classify_storage``). ``dependency_map`` is the
     same ``class_name -> [required_class_names]`` mapping
-    ``classify_storage`` uses; PR3b reuses it for the client-reachability
-    rule.
+    ``classify_storage`` uses; the classifier reuses it for the client-
+    reachability rule.
 
-    The returned report enumerates:
-      - ``displaced_instances`` -- instances disagreeing with their
-        class's final domain (operator-pinned conflicts).
-      - ``low_confidence_modules`` -- script_ids the classifier defaulted
-        to ``"server"`` because neither side's API + no UI signal
-        matched. Operator may want to pin these via
-        ``domain_overrides``.
-      - ``fail_closed_modules`` -- script_ids the classifier kicked back
-        to ``"legacy"`` (both-side API, intra-class conflict, or
-        reachability conflict).
+    ``guid_index`` provides the path lookup the C# signal channel
+    needs. When ``None`` the C# channel is skipped and the classifier
+    falls back to Luau-only signals (back-compat with tests that don't
+    plumb a guid_index).
+
+    ``networking`` selects the active signal set + the zero-signal
+    fallback (see design doc §"Target model"). ``"none"`` (default)
+    drops Mirror-only signals and falls back to ``"client"``; ``"mirror"``
+    and ``"netcode"`` enable Mirror-only signals and fall back to
+    ``"server"``.
+
+    ``strict`` (False by default) gates the strict-classification check.
+    The check itself does NOT raise here; callers (pipeline.py) decide
+    whether to abort. The report exposes ``strict_violations`` so the
+    caller can format an actionable error message.
 
     Pure function over its inputs except for the in-place mutation of
     ``scene_runtime.modules[*]``.
     """
+    if networking not in NETWORKING_MODES:
+        raise ValueError(
+            f"unknown networking mode {networking!r}; "
+            f"expected one of {NETWORKING_MODES}"
+        )
+
     modules = scene_runtime.get("modules", {})
     scenes = scene_runtime.get("scenes", {})
     prefabs = scene_runtime.get("prefabs", {})
@@ -196,55 +342,87 @@ def classify_scene_runtime_domains(
 
     per_instance_evidence = _gather_per_instance_evidence(scenes, prefabs)
 
+    # C# source text cached per script_id. We read on demand the first
+    # time a module is classified; helper modules + non-runtime-bearing
+    # rows don't pay the I/O.
+    cs_source_cache: dict[str, str] = {}
+
+    def _get_cs_source(script_id: str) -> str:
+        if script_id in cs_source_cache:
+            return cs_source_cache[script_id]
+        text = _load_cs_source(script_id, guid_index)
+        cs_source_cache[script_id] = text
+        return text
+
     displaced: list[SceneRuntimeDisplacedInstance] = []
     low_confidence: list[str] = []
-    fail_closed: list[str] = []
+    excluded: list[str] = []
 
-    # First pass: API surface + UI aggregation + intra-class conflict +
-    # override application. Reachability runs in pass 2 because it
-    # needs every module's first-pass domain to be set.
+    # Pass 1: per-module classification (signals → rule table → override).
     for script_id, module in modules.items():
+        # Pre-stamp helpers + non-runtime-bearing rows. Helpers (not
+        # runtime-bearing) become ``"helper"``; the host runtime never
+        # instantiates them but the module row still exists for require()
+        # resolution.
         if not module.get("runtime_bearing"):
+            # Don't overwrite a pre-existing helper marker on re-classify.
+            module["domain"] = "helper"
+            _stamp_container_and_path(module, scripts_by_class)
             continue
+
         verdict, signals, instance_rows = _classify_module(
             script_id, module, scripts_by_class,
             per_instance_evidence.get(script_id, []),
             overrides.get(script_id),
+            _get_cs_source(script_id),
+            networking,
         )
         module["domain"] = verdict
         module["domain_signals"] = signals
         _stamp_container_and_path(module, scripts_by_class)
         if signals.get("low_confidence"):
             low_confidence.append(script_id)
-        if verdict == "legacy":
-            fail_closed.append(script_id)
+        if verdict == "excluded":
+            excluded.append(script_id)
         if signals.get("override_applied") and signals.get("intra_class_conflict"):
             for row in instance_rows:
                 displaced.append(row)
 
-    # Second pass: client-domain require-graph reachability.
-    # Honors first-pass verdicts.
+    # Pass 2: client-domain require-graph reachability.
     if dependency_map:
         _apply_reachability_rule(
-            modules, dependency_map, scripts_by_class, fail_closed,
+            modules, dependency_map, scripts_by_class, excluded,
         )
+
+    # Pass 3: mirror_adoption_low heuristic (after classification so we
+    # have the runtime-bearing count post-overrides).
+    mirror_low = False
+    if networking in ("mirror", "netcode"):
+        mirror_low = _check_mirror_adoption(
+            modules, scripts_by_class, cs_source_cache, _get_cs_source,
+        )
+
+    # Pass 4: strict-classification violations enumeration. Always
+    # computed, never raised — callers decide policy.
+    strict_violations = sorted(set(low_confidence) | set(excluded))
 
     return DomainClassifierReport(
         displaced_instances=displaced,
         low_confidence_modules=low_confidence,
-        fail_closed_modules=fail_closed,
+        excluded_modules=excluded,
+        fail_closed_modules=excluded,
+        mirror_adoption_low=mirror_low,
+        strict_violations=strict_violations,
     )
 
 
-class CrossDomainEdge(TypedDict):
-    """One client<->server reference identified at conversion time.
+# ---------------------------------------------------------------------------
+# Cross-domain edge enumeration (kept from PR3b; updated to skip
+# ``"excluded"`` modules instead of ``"legacy"``).
+# ---------------------------------------------------------------------------
 
-    ``from_script`` / ``to_script`` are the canonical script ids; the
-    domains are the post-classifier verdicts. PR4's host runtime applies
-    the v1 cross-domain policy (inject ``nil`` + log) at start; this
-    Python-side enumeration lets ``write_output`` surface the boundary
-    to ``UNCONVERTED.md`` BEFORE the operator ships the place.
-    """
+class CrossDomainEdge(TypedDict):
+    """One client<->server reference identified at conversion time."""
 
     from_instance: str
     to_instance: str
@@ -257,6 +435,17 @@ class CrossDomainEdge(TypedDict):
     owner_ref: str
 
 
+# Domain values the cross-domain pass refuses to wire through.
+# - Helpers don't run lifecycle, so they can't generate cross-domain refs.
+# - Excluded modules aren't instantiated at all.
+# - ``"legacy"`` is the pre-classifier-v2 spelling; preserved here as a
+#   defensive skip for any on-disk plan that the migration pass hasn't
+#   already rewritten.
+_NON_RUNTIME_DOMAINS: frozenset[str] = frozenset(
+    {"", "helper", "excluded", "legacy"},
+)
+
+
 def compute_cross_domain_edges(
     scene_runtime: SceneRuntimeArtifact,
 ) -> list[CrossDomainEdge]:
@@ -265,7 +454,7 @@ def compute_cross_domain_edges(
     A reference qualifies iff:
       - ``target_kind == "component"`` (peer-MonoBehaviour ref)
       - Both source and target instances resolve to modules with
-        non-``"legacy"`` domains assigned by the classifier
+        execution domains in ``{"client", "server"}``
       - The two domains differ
 
     Pure function; does not mutate ``scene_runtime``.
@@ -274,7 +463,6 @@ def compute_cross_domain_edges(
     scenes = scene_runtime.get("scenes", {})
     prefabs = scene_runtime.get("prefabs", {})
 
-    # Build instance_id -> script_id lookup over scenes + prefabs.
     instance_to_script: dict[str, str] = {}
     for scene in scenes.values():
         for inst in scene.get("instances", []):
@@ -303,7 +491,8 @@ def compute_cross_domain_edges(
             tgt_mod = modules.get(tgt_sid, {})
             src_domain = src_mod.get("domain", "")
             tgt_domain = tgt_mod.get("domain", "")
-            if src_domain in ("", "legacy") or tgt_domain in ("", "legacy"):
+            if (src_domain in _NON_RUNTIME_DOMAINS
+                or tgt_domain in _NON_RUNTIME_DOMAINS):
                 continue
             if src_domain == tgt_domain:
                 continue
@@ -328,8 +517,52 @@ def compute_cross_domain_edges(
 
 
 # ---------------------------------------------------------------------------
-# Per-module classification
+# Artifact migration: domain == "legacy" -> "excluded".
+#
+# Applied to on-disk plans on first read. Idempotent.
 # ---------------------------------------------------------------------------
+
+def migrate_legacy_domain_values(scene_runtime: SceneRuntimeArtifact) -> int:
+    """Mutate ``scene_runtime.modules[*].domain`` in place, rewriting any
+    ``"legacy"`` value to ``"excluded"``. Returns the count of rows
+    migrated. Idempotent: re-running yields 0.
+
+    Also rewrites ``fail_closed_reason="both_side_api"`` /
+    ``"intra_class_conflict"`` rows untouched (their reasons still apply
+    under the new model) but stamps a migration breadcrumb so the
+    conversion report can surface the prior PR3b verdict.
+    """
+    modules = scene_runtime.get("modules", {})
+    count = 0
+    for module in modules.values():
+        if module.get("domain") == "legacy":
+            module["domain"] = "excluded"
+            signals = cast(
+                SceneRuntimeDomainSignals,
+                module.get("domain_signals", {}),
+            )
+            # Breadcrumb so the report can show "migrated from PR3b legacy".
+            signals.setdefault(
+                "fail_closed_reason", "legacy_artifact_migrated",
+            )
+            module["domain_signals"] = signals
+            count += 1
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Per-module classification: the design doc's 7-rule table.
+# ---------------------------------------------------------------------------
+
+class _SignalCounts(TypedDict):
+    strong_client: int
+    strong_server: int
+    moderate_client: int
+    moderate_server: int
+    cs_signals: list[str]
+    luau_signals: list[str]
+    instance_signals: list[str]
+
 
 def _classify_module(
     script_id: str,
@@ -337,82 +570,273 @@ def _classify_module(
     scripts_by_class: dict[str, RbxScript],
     instance_evidence: list["_InstanceEvidence"],
     override: str | None,
+    cs_source: str,
+    networking: str,
 ) -> tuple[str, SceneRuntimeDomainSignals, list[SceneRuntimeDisplacedInstance]]:
-    """Return ``(domain, signals, displaced_instances)`` for one module.
-
-    Inputs:
-      - ``script_id`` / ``module`` -- the row being classified.
-      - ``scripts_by_class`` -- transpiled RbxScripts keyed by class name.
-      - ``instance_evidence`` -- per-instance evidence collected by
-        ``_gather_per_instance_evidence``.
-      - ``override`` -- optional operator-set domain from
-        ``scene_runtime.domain_overrides``.
-    """
+    """Return ``(domain, signals, displaced_instances)`` for one module."""
     class_name = module.get("class_name", "")
     script = scripts_by_class.get(class_name)
-    source = script.source if script and script.source else ""
+    luau_source = script.source if script and script.source else ""
 
-    api = _classify_api_surface(source)
-    instance_ui = [ev for ev in instance_evidence if ev.has_ui_ref]
-    instance_nonui = [ev for ev in instance_evidence if not ev.has_ui_ref]
-    any_ui = bool(instance_ui)
+    # Compute UI-bearing instance status BEFORE we run _collect_signals,
+    # so we can decide whether to count per-instance UI as a strong-client
+    # signal (consistent across all instances) or treat it as an intra-
+    # class conflict (some instances UI, some not, and no code-level
+    # strong signal from C#/Luau pins the class).
+    instance_ui = [
+        ev for ev in instance_evidence
+        if ev.has_ui_ref or ev.owner_is_ui
+    ]
+    instance_nonui = [
+        ev for ev in instance_evidence
+        if not (ev.has_ui_ref or ev.owner_is_ui)
+    ]
+    multi_instance = len(instance_evidence) > 1
+    ui_consistent = (
+        not multi_instance
+        or len(instance_nonui) == 0
+        or len(instance_ui) == 0
+    )
+
+    # Pass 1: collect code-level signals (C# + Luau) WITHOUT the per-
+    # instance UI signal so we can decide whether to fire the conflict.
+    code_counts = _collect_signals(
+        cs_source, luau_source, [], networking,
+    )
+    has_code_strong = (
+        code_counts["strong_client"] + code_counts["strong_server"] > 0
+    )
+
+    # Intra-class conflict: instances disagree about UI evidence AND no
+    # code-level strong signal pins the class. (When code-level strong
+    # signals are present they're authoritative — a script that calls
+    # ``Players.LocalPlayer`` is client regardless of where its instances
+    # live.) Preserves PR3b's intra-class conflict semantics under the
+    # new model.
+    intra_conflict = (
+        not has_code_strong
+        and multi_instance
+        and len(instance_ui) > 0
+        and len(instance_nonui) > 0
+    )
+
+    # Pass 2: full signal collection. Skip per-instance UI when we've
+    # determined an intra-class conflict — otherwise the conflict would
+    # be drowned out by the (always-strong) target_is_ui signal.
+    if intra_conflict:
+        counts = code_counts
+    else:
+        counts = _collect_signals(
+            cs_source, luau_source, instance_evidence, networking,
+        )
+
+    api = _classify_api_surface(luau_source)  # legacy field, kept for tests
+    any_ui = (
+        bool(instance_ui)
+        or "instance_owner_is_ui" in counts["instance_signals"]
+        or "target_is_ui" in counts["instance_signals"]
+    )
 
     signals: SceneRuntimeDomainSignals = {
         "api_surface": api,
         "ui_signal": any_ui,
+        "strong_client": counts["strong_client"],
+        "strong_server": counts["strong_server"],
+        "moderate_client": counts["moderate_client"],
+        "moderate_server": counts["moderate_server"],
+        "cs_signals": list(counts["cs_signals"]),
+        "luau_signals": list(counts["luau_signals"]),
+        "instance_signals": list(counts["instance_signals"]),
     }
 
-    # Hard contract violation: both-side API → fail closed regardless
-    # of override (operator can't override a code-disagrees-with-itself
-    # case; the only fix is to split the class).
-    if api == "both":
-        signals["fail_closed_reason"] = "both_side_api"
-        return "legacy", signals, []
-
-    # Intra-class conflict: instances disagree about UI evidence AND
-    # API surface didn't pin the class to one side.
-    intra_conflict = (
-        api == "neither"
-        and len(instance_evidence) > 1
-        and len(instance_ui) > 0
-        and len(instance_nonui) > 0
+    # Apply the 7-rule table.
+    rule, base_verdict, fail_reason, low_conf = _apply_rule_table(
+        counts, networking,
     )
-    if intra_conflict:
+    signals["rule_applied"] = rule
+    if low_conf:
+        signals["low_confidence"] = True
+    if fail_reason:
+        signals["fail_closed_reason"] = fail_reason
+
+    # Intra-class conflict short-circuits when the rule table didn't
+    # already exclude on stronger evidence. Without an override, surface
+    # as excluded (matches PR3b semantics).
+    if intra_conflict and base_verdict not in ("excluded",):
         signals["intra_class_conflict"] = True
         if not override:
             signals["fail_closed_reason"] = "intra_class_conflict"
-            return "legacy", signals, []
-        # Override resolves the conflict; emit displaced report for
-        # whichever instances disagree with the chosen side.
-        signals["override_applied"] = True
-        displaced = _build_displaced_rows(
-            script_id, override, instance_ui, instance_nonui,
+            # Pop low_confidence — intra_conflict is a stronger reason.
+            signals.pop("low_confidence", None)
+            return "excluded", signals, []
+
+    # Operator override. Asymmetry from design doc §"Operator override":
+    # - Rule-1 ``excluded`` (both strong sides): only ``"excluded"`` is
+    #   accepted. Other override values are REJECTED (verdict stays
+    #   ``"excluded"``, ``override_rejected`` stamped).
+    # - All other verdicts (including Rule-4 ``excluded``): override may
+    #   be ``"client"`` | ``"server"`` | ``"excluded"``.
+    if override is not None:
+        if base_verdict == "excluded" and rule == 1:
+            # Rule-1: code disagrees with itself. Only ACK-and-skip allowed.
+            if override == "excluded":
+                signals["override_applied"] = True
+                return "excluded", signals, []
+            signals["override_rejected"] = True
+            return "excluded", signals, []
+        if override in ("client", "server", "excluded"):
+            signals["override_applied"] = True
+            # If there was an intra-class conflict and the operator pinned
+            # a side, emit the displaced report.
+            if intra_conflict:
+                displaced = _build_displaced_rows(
+                    script_id, override, instance_ui, instance_nonui,
+                )
+                # The override is the resolution; clear low_confidence
+                # because the operator made the call.
+                signals.pop("low_confidence", None)
+                return override, signals, displaced
+            # Clear low_confidence flag when an operator pin replaces it.
+            signals.pop("low_confidence", None)
+            # Clear fail_closed_reason if we're routing off excluded.
+            if override != "excluded":
+                signals.pop("fail_closed_reason", None)
+            return override, signals, []
+        # Unknown override value: ignore (treat as no override). Should
+        # have been validated upstream.
+        log.warning(
+            "[scene_runtime] unknown override value %r for %s; ignoring",
+            override, script_id,
         )
-        return override, signals, displaced
 
-    # Operator override always wins outside of contract-violation cases.
-    if override:
-        signals["override_applied"] = True
-        return override, signals, []
+    return base_verdict, signals, []
 
-    # API surface verdict.
-    if api == "client":
-        return "client", signals, []
-    if api == "server":
-        return "server", signals, []
 
-    # API is "neither"; consult UI signal.
-    if any_ui:
-        return "client", signals, []
+def _collect_signals(
+    cs_source: str,
+    luau_source: str,
+    instance_evidence: list["_InstanceEvidence"],
+    networking: str,
+) -> _SignalCounts:
+    """Aggregate strong/moderate signal hits across all three channels.
 
-    # Neither signal — server-authoritative default, flagged low-conf.
-    signals["low_confidence"] = True
-    return "server", signals, []
+    Each signal kind counts at most once. Same kind firing from multiple
+    channels (e.g., both C# and Luau pinning client) still counts once
+    per channel listing but contributes only once to the strong/moderate
+    bucket count.
+    """
+    cs_signals: list[str] = []
+    luau_signals: list[str] = []
+    instance_signals: list[str] = []
+    strong_client_kinds: set[str] = set()
+    strong_server_kinds: set[str] = set()
+    moderate_client_kinds: set[str] = set()
+    moderate_server_kinds: set[str] = set()
+
+    mirror_mode = networking in ("mirror", "netcode")
+
+    # --- C# channel ---
+    if cs_source:
+        for rx, name, mirror_only in _CS_STRONG_CLIENT_RX:
+            if mirror_only and not mirror_mode:
+                continue
+            if rx.search(cs_source):
+                cs_signals.append(name)
+                strong_client_kinds.add(name)
+        for rx, name, mirror_only in _CS_MODERATE_CLIENT_RX:
+            if mirror_only and not mirror_mode:
+                continue
+            if rx.search(cs_source):
+                cs_signals.append(name)
+                moderate_client_kinds.add(name)
+        for rx, name, mirror_only in _CS_STRONG_SERVER_RX:
+            if mirror_only and not mirror_mode:
+                continue
+            if rx.search(cs_source):
+                cs_signals.append(name)
+                strong_server_kinds.add(name)
+        for rx, name, mirror_only in _CS_MODERATE_SERVER_RX:
+            if mirror_only and not mirror_mode:
+                continue
+            if rx.search(cs_source):
+                cs_signals.append(name)
+                moderate_server_kinds.add(name)
+
+    # --- Luau channel (post-transpile) ---
+    # Roblox-flavoured patterns are STRONG signals per the design doc
+    # §"Strong client signals" / §"Strong server signals" tables.
+    if luau_source:
+        if any(rx.search(luau_source) for rx in _CLIENT_RX):
+            luau_signals.append("roblox_client_api")
+            strong_client_kinds.add("roblox_client_api")
+        if any(rx.search(luau_source) for rx in _SERVER_RX):
+            luau_signals.append("roblox_server_api")
+            strong_server_kinds.add("roblox_server_api")
+
+    # --- Per-instance channel ---
+    # instance_owner_is_ui is the strongest available client signal per
+    # the design doc — "Script attached to GameObject owning a Canvas".
+    owner_is_ui = any(getattr(ev, "owner_is_ui", False) for ev in instance_evidence)
+    target_is_ui = any(ev.has_ui_ref for ev in instance_evidence)
+    if owner_is_ui:
+        instance_signals.append("instance_owner_is_ui")
+        strong_client_kinds.add("instance_owner_is_ui")
+    if target_is_ui:
+        instance_signals.append("target_is_ui")
+        strong_client_kinds.add("target_is_ui")
+
+    return {
+        "strong_client": len(strong_client_kinds),
+        "strong_server": len(strong_server_kinds),
+        "moderate_client": len(moderate_client_kinds),
+        "moderate_server": len(moderate_server_kinds),
+        "cs_signals": cs_signals,
+        "luau_signals": luau_signals,
+        "instance_signals": instance_signals,
+    }
+
+
+def _apply_rule_table(
+    counts: _SignalCounts, networking: str,
+) -> tuple[int, str, str, bool]:
+    """Return ``(rule_number, verdict, fail_reason, low_confidence)``.
+
+    See design doc §"Resolution rules" for the table.
+    """
+    sc = counts["strong_client"]
+    ss = counts["strong_server"]
+    mc = counts["moderate_client"]
+    ms = counts["moderate_server"]
+
+    # Rule 1: both strong sides → excluded (unresolvable).
+    if sc > 0 and ss > 0:
+        return 1, "excluded", "both_side_api", False
+    # Rule 2: strong client only → client.
+    if sc > 0 and ss == 0:
+        return 2, "client", "", False
+    # Rule 3: strong server only → server.
+    if ss > 0 and sc == 0:
+        return 3, "server", "", False
+    # Rule 4: moderate-only with both sides → excluded.
+    if sc == 0 and ss == 0 and mc > 0 and ms > 0:
+        return 4, "excluded", "moderate_only_ambiguity", False
+    # Rule 5: moderate client only → client.
+    if sc == 0 and ss == 0 and mc > 0 and ms == 0:
+        return 5, "client", "", False
+    # Rule 6: moderate server only → server.
+    if sc == 0 and ss == 0 and ms > 0 and mc == 0:
+        return 6, "server", "", False
+    # Rule 7: all zero — mode-dependent fallback.
+    if networking == "none":
+        return 7, "client", "", True
+    # mirror / netcode → server-authoritative fallback.
+    return 7, "server", "", True
 
 
 def _classify_api_surface(source: str) -> str:
     """Return ``"client"`` / ``"server"`` / ``"both"`` / ``"neither"``
-    for a single script's body. Uses PR3b's generic-only pattern tables.
+    for a Luau body. Kept verbatim from PR3b for back-compat with the
+    legacy-tables-byte-frozen test in test_scene_runtime_domain.py.
     """
     if not source:
         return "neither"
@@ -428,19 +852,45 @@ def _classify_api_surface(source: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Per-instance evidence -- walk the planner's scenes/prefabs blocks
+# C# source loading
+# ---------------------------------------------------------------------------
+
+def _load_cs_source(
+    script_id: str, guid_index: GuidIndex | None,
+) -> str:
+    """Resolve ``script_id`` (a .cs file GUID) to its on-disk text.
+
+    Returns the empty string when:
+      - ``guid_index`` is ``None`` (tests, or pipelines without a
+        Unity project root),
+      - the script id isn't a real GUID known to the index,
+      - the resolved path isn't a .cs file,
+      - the file can't be read.
+    """
+    if guid_index is None or not script_id:
+        return ""
+    try:
+        path: Path | None = guid_index.resolve(script_id)
+    except Exception:
+        return ""
+    if path is None or path.suffix != ".cs":
+        return ""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Per-instance evidence
 # ---------------------------------------------------------------------------
 
 class _InstanceEvidence:
-    """One instance's contribution to the class's evidence pool.
-
-    Slots-only for ergonomics in tight loops; the persisted artifact
-    uses the ``SceneRuntimeDisplacedInstance`` TypedDict.
-    """
+    """One instance's contribution to the class's evidence pool."""
 
     __slots__ = (
         "owner_kind", "owner_ref", "instance_id", "game_object_id",
-        "script_id", "has_ui_ref",
+        "script_id", "has_ui_ref", "owner_is_ui",
     )
 
     def __init__(
@@ -451,6 +901,7 @@ class _InstanceEvidence:
         game_object_id: str,
         script_id: str,
         has_ui_ref: bool,
+        owner_is_ui: bool,
     ) -> None:
         self.owner_kind = owner_kind
         self.owner_ref = owner_ref
@@ -458,18 +909,14 @@ class _InstanceEvidence:
         self.game_object_id = game_object_id
         self.script_id = script_id
         self.has_ui_ref = has_ui_ref
+        self.owner_is_ui = owner_is_ui
 
 
 def _gather_per_instance_evidence(
     scenes: dict[str, SceneRuntimeScene],
     prefabs: dict[str, SceneRuntimePrefab],
 ) -> dict[str, list[_InstanceEvidence]]:
-    """Walk every instance in every scene + prefab; group by ``script_id``.
-
-    For each instance we mark ``has_ui_ref=True`` iff at least one of its
-    outgoing references carries ``target_is_ui=True`` (the PR1 planner
-    stamps this when a ref resolves into a converted Canvas / UI subtree).
-    """
+    """Walk every instance in every scene + prefab; group by ``script_id``."""
     out: dict[str, list[_InstanceEvidence]] = {}
 
     def _scan(
@@ -483,6 +930,11 @@ def _gather_per_instance_evidence(
             if ref.get("target_is_ui"):
                 ui_by_instance[ref["from"]] = True
         for inst in instances:
+            # ``instance_owner_is_ui`` lives in the extra fields stamped
+            # by the planner (total=False) — read it via .get on the
+            # underlying dict.
+            inst_dict = cast(dict[str, object], inst)
+            owner_is_ui = bool(inst_dict.get("instance_owner_is_ui", False))
             evidence = _InstanceEvidence(
                 owner_kind=owner_kind,
                 owner_ref=owner_ref,
@@ -490,6 +942,7 @@ def _gather_per_instance_evidence(
                 game_object_id=inst["game_object_id"],
                 script_id=inst["script_id"],
                 has_ui_ref=ui_by_instance.get(inst["instance_id"], False),
+                owner_is_ui=owner_is_ui,
             )
             out.setdefault(inst["script_id"], []).append(evidence)
 
@@ -508,13 +961,7 @@ def _build_displaced_rows(
     ui_evidence: list[_InstanceEvidence],
     nonui_evidence: list[_InstanceEvidence],
 ) -> list[SceneRuntimeDisplacedInstance]:
-    """Compose the report rows for instances that disagree with the
-    operator-pinned ``effective_domain``.
-
-    "Disagrees" means: the instance's local evidence pointed at the
-    other side. UI-bearing instances expect ``"client"``; non-UI
-    instances (under neither-signal API) expect ``"server"``.
-    """
+    """Compose displaced-instance rows for the conversion report."""
     rows: list[SceneRuntimeDisplacedInstance] = []
     for ev in ui_evidence:
         if effective_domain != "client":
@@ -550,22 +997,8 @@ def _build_displaced_rows(
 def _stamp_container_and_path(
     module: SceneRuntimeModule, scripts_by_class: dict[str, RbxScript],
 ) -> None:
-    """Copy storage_classifier's parent_path onto the module row, plus
-    the dotted DataModel path the host runtime requires().
-
-    The storage classifier has already routed scripts to their concrete
-    containers. PR3b doesn't second-guess that decision; it just makes
-    the choice visible in the artifact alongside ``domain``.
-
-    Contract (per scene-runtime-contract.md Piece 5 / R2-P1.1
-    resolution): ``module_path`` is the live Roblox DataModel path,
-    dot-joined (``"ReplicatedStorage.Foo"``,
-    ``"StarterPlayer.StarterPlayerScripts.Bar"``). The generated
-    SceneRuntimeClient/Server entrypoints walk
-    ``game:FindFirstChild(...)`` down the dotted path to resolve the
-    ModuleScript. Pre-R2 the planner emitted an on-disk path
-    (``"scripts/Foo.luau"``) the entrypoints could not resolve --
-    every runtime-bearing MonoBehaviour failed to require at boot.
+    """Copy storage_classifier's parent_path onto the module row, plus the
+    dotted DataModel path the host runtime requires().
     """
     script = scripts_by_class.get(module.get("class_name", ""))
     if script is None:
@@ -573,10 +1006,6 @@ def _stamp_container_and_path(
     container = script.parent_path or ""
     if container:
         module["container"] = container
-    # Module path: dotted DataModel path the host can FindFirstChild
-    # down. ``container`` is the same shape (e.g.
-    # ``"StarterPlayer.StarterPlayerScripts"``) -- joining with a "."
-    # produces a path Roblox's path-walker can navigate.
     if script.name and container:
         module["module_path"] = f"{container}.{script.name}"
 
@@ -589,16 +1018,13 @@ def _apply_reachability_rule(
     modules: dict[str, SceneRuntimeModule],
     dependency_map: dict[str, list[str]],
     scripts_by_class: dict[str, RbxScript],
-    fail_closed: list[str],
+    excluded: list[str],
 ) -> None:
-    """For every client-domain module, walk its transitive require
-    graph. Helpers required by client modules are forced to
-    ``ReplicatedStorage``; a conflict (same helper required by both
-    sides and the classifier wants ``ServerStorage``) fails the helper
-    closed to legacy.
+    """For every client-domain module, walk its transitive require graph.
 
-    Mutates ``modules`` in place; mutates the underlying RbxScripts'
-    ``parent_path`` for routed helpers.
+    Helpers required by client modules are forced to ``ReplicatedStorage``;
+    a conflict (same helper required by both sides AND parked in
+    ``ServerStorage``) excludes the helper from the runtime plan.
     """
     client_classes: set[str] = set()
     server_classes: set[str] = set()
@@ -614,13 +1040,6 @@ def _apply_reachability_rule(
         elif verdict == "server":
             server_classes.add(class_name)
 
-    # BFS each side's reachable helpers. A helper is "reached by X side"
-    # when at least one class on X side != helper itself transitively
-    # requires it. Excluding the helper from its own seed set captures
-    # the "required by *another* server class" criterion that resolves
-    # the test case where a server-classified helper is also required
-    # by a client (both sides want it -> fail closed).
-
     for helper_class, script in scripts_by_class.items():
         client_seeds = client_classes - {helper_class}
         server_seeds = server_classes - {helper_class}
@@ -632,24 +1051,22 @@ def _apply_reachability_rule(
         )
         if not helper_reached_by_client:
             continue
-        # Helper module reached by client side.
         current_container = script.parent_path or ""
         if current_container == SERVER_STORAGE:
             if helper_reached_by_server:
-                # Conflict: both sides want this helper but storage_classifier
-                # placed it in ServerStorage. Fail closed.
+                # Conflict: both sides want this helper.
                 module_id = class_to_script_id.get(helper_class)
                 if module_id and module_id in modules:
                     module_row = modules[module_id]
-                    module_row["domain"] = "legacy"
+                    module_row["domain"] = "excluded"
                     signals = cast(
                         SceneRuntimeDomainSignals,
                         module_row.get("domain_signals", {}),
                     )
                     signals["fail_closed_reason"] = "reachability_conflict"
                     module_row["domain_signals"] = signals
-                    if module_id not in fail_closed:
-                        fail_closed.append(module_id)
+                    if module_id not in excluded:
+                        excluded.append(module_id)
                 continue
             # Client-only-reach: hoist to ReplicatedStorage.
             script.parent_path = REPLICATED_STORAGE
@@ -683,13 +1100,86 @@ def _closure(
 
 
 # ---------------------------------------------------------------------------
-# Containers exported for callers that want to inspect classifier policy
-# without re-importing storage_classifier (the legacy table source).
+# mirror_adoption_low heuristic.
+# ---------------------------------------------------------------------------
+
+def _check_mirror_adoption(
+    modules: dict[str, SceneRuntimeModule],
+    scripts_by_class: dict[str, RbxScript],
+    cs_source_cache: dict[str, str],
+    get_cs_source,  # type: ignore[no-untyped-def]
+) -> bool:
+    """Return True when the project declared ``--networking=mirror|netcode``
+    but adoption signals are too sparse.
+
+    Threshold (from design doc §"Mirror-mode adoption heuristic"):
+      - Annotated classes count < ``max(2, ceil(0.05 × runtime_bearing))``, OR
+      - Project has zero ``using Mirror`` / ``using Unity.Netcode``
+        imports across all C# files in the cache.
+
+    Either condition fires the warning; the caller surfaces it in the
+    conversion report (does NOT block conversion).
+    """
+    runtime_bearing_count = 0
+    annotated_count = 0
+    for script_id, module in modules.items():
+        if not module.get("runtime_bearing"):
+            continue
+        runtime_bearing_count += 1
+        # Annotated = at least one Mirror-only signal fired (ServerRpc,
+        # ClientRpc, NetworkBehaviour subclass, SyncVar, etc.). Read off
+        # the persisted signals.
+        signals = cast(
+            SceneRuntimeDomainSignals,
+            module.get("domain_signals", {}),
+        )
+        cs_signals = signals.get("cs_signals", []) or []
+        mirror_annotation_kinds = (
+            "ServerRpc", "ClientRpc", "Server", "ServerAttribute",
+            "Client", "ClientAttribute", "ServerCallback",
+            "ClientCallback", "NetworkBehaviour_subclass",
+            "SyncVar", "Command",
+        )
+        if any(s in mirror_annotation_kinds for s in cs_signals):
+            annotated_count += 1
+
+    if runtime_bearing_count == 0:
+        return False
+
+    threshold = max(2, math.ceil(0.05 * runtime_bearing_count))
+    if annotated_count < threshold:
+        return True
+
+    # Imports-zero check: scan every loaded C# source for `using Mirror`
+    # or `using Unity.Netcode`. We're scanning the cache (already-loaded
+    # sources) — modules not yet visited won't have been read. For the
+    # heuristic that's acceptable: if the project uses Mirror anywhere
+    # important enough to land in scene_runtime.modules, at least one
+    # runtime-bearing module's C# source is in cache.
+    has_mirror_using = False
+    for src in cs_source_cache.values():
+        if src and _RE_USING_MIRROR.search(src):
+            has_mirror_using = True
+            break
+    if not has_mirror_using:
+        return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Public surface
 # ---------------------------------------------------------------------------
 
 __all__ = (
     "classify_scene_runtime_domains",
+    "compute_cross_domain_edges",
+    "migrate_legacy_domain_values",
     "DomainClassifierReport",
+    "CrossDomainEdge",
+    "NetworkingMode",
+    "NETWORKING_MODES",
+    "DEFAULT_NETWORKING_MODE",
     "_GENERIC_CLIENT_API_PATTERNS",
     "_GENERIC_SERVER_API_PATTERNS",
 )
