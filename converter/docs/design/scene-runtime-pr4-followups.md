@@ -207,6 +207,87 @@ surfaces in the upload phase, which is recoverable.
 
 **P3:** none in round 1.
 
+### Codex review round 2 (2026-05-21)
+
+**P1 absorbed in-line** (all 5 fixed in PR4 head; regression tests
+across `test_scene_runtime_host_behavior.py`,
+`test_scene_runtime_domain.py`, `test_scene_runtime_host_emit.py`,
+`test_scene_runtime_pipeline_emit.py`):
+
+- **R2-P1.1** `module_path` was an on-disk path (`"scripts/Foo.luau"`),
+  but the entrypoints walk `game:FindFirstChild(...)` for a live
+  DataModel path. Fix (user greenlit): planner's
+  `_stamp_container_and_path` now emits the dotted DataModel path
+  (`"ReplicatedStorage.Foo"` / `"StarterPlayer.StarterPlayerScripts.Bar"`);
+  both client + server entrypoints split on `"."`. Tests:
+  `TestModulePathIsDottedDataModelPath` x3;
+  `test_entrypoints_split_module_path_on_dot_not_slash`.
+- **R2-P1.2** `clonePrefabTemplate` (a) used the typo'd
+  `ScenePrefabs` folder when the real name is
+  `ReplicatedStorage.Templates`, and (b) fed the stable `prefab_id`
+  to `FindFirstChild`, but `prefab_packages` keys templates by bare
+  prefab name. Fix (user greenlit): added `template_name` to each
+  `SceneRuntimePrefab` row; entrypoints' `_resolveTemplate(prefab_id)`
+  reads `plan.prefabs[prefab_id].template_name` and looks that bare
+  name up under `Templates`. Tests:
+  `test_entrypoints_resolve_prefab_via_template_name_map`;
+  `TestPrefabSubplan` now asserts `template_name == "Enemy"`.
+- **R2-P1.3** asset refs persisted as raw Unity GUIDs (contract said
+  `rbxassetid://`); SO refs were also raw GUIDs the runtime fed to
+  `resolveModule` (always nil). Fix (user greenlit): mirror mesh
+  handling -- planner persists structural GUID; new pipeline
+  subphases `_rewrite_scene_runtime_asset_refs` (asset GUID ->
+  `rbxassetid://NNN` via `ctx.uploaded_assets`) and
+  `_build_scriptable_object_module_map` (SO guid -> dotted DataModel
+  path) run before the plan is encoded. Runtime
+  `_resolveReferenceTarget`'s `scriptable_object` branch now reads
+  `plan.scriptable_objects[guid]`. Tests:
+  `TestAssetRefRewriteAndScriptableObjectsMap` x3 (pipeline) +
+  `TestScriptableObjectRefResolvesViaPlanMap` (runtime harness).
+- **R2-P1.4** `setActive` only toggled the keyed bucket; child
+  `host.connect` subscriptions stayed live after a parent was
+  disabled. Fix: `setActive` walks via
+  `services.collectDescendantIds` (same DFS post-order
+  `destroy` uses) and applies the toggle to every descendant
+  component. Test: `TestSetActiveCascadesToSubtree`.
+- **R2-P1.5** a dormant component (booted `enabled=false` or
+  `active=false`) got `Awake` but permanently missed `Start`, even
+  after a later `setEnabled(true)` / `setActive(true)`. Fix:
+  `setActive` / `setEnabled` defer `Start` on the FIRST false->true
+  gate transition when `startCalled` is still false. Tests:
+  `TestLateReEnableFiresStartOnFirstTransition` x2 (one each for
+  `setEnabled` and `setActive` paths).
+
+**P2 absorbed in-line:**
+
+- **`_cancelAllTasks` passed wrapper tables to `task.cancel`** -- the
+  harness masked it because its fake `task.cancel` accepts any table
+  with a `.handle`, but real Roblox silently failed and leaked
+  repeating tasks past the owning component's `OnDestroy`. Fix:
+  unwrap `{handle=, method=}` entries before calling
+  `task.cancel`, mirroring `cancelInvoke`.
+- **Cross-domain report stale-block** -- the subphase only stripped
+  the prior block when new edges existed, so an edgeful -> edge-free
+  rerun left the stale section behind. Fix: always strip the marker
+  block on rerun, re-append only when edges exist. Tests:
+  `TestCrossDomainReportEdgeFreeRerun` x2.
+
+**P3:** none in round 2.
+
+### Contract resolutions pinned in the design doc
+
+The three R2 P1s the user explicitly resolved are pinned in
+`converter/docs/design/scene-runtime-contract.md`:
+
+- Piece 2 (`module_path`): dotted DataModel path.
+- Piece 2 (`SceneRuntimePrefab.template_name`): bare prefab name for
+  the `prefab_id -> ReplicatedStorage.Templates[name]` resolver.
+- Piece 2 (`scene_runtime.scriptable_objects`): guid -> dotted module
+  path map; asset GUIDs rewritten post-upload.
+- Piece 5: entrypoints' `_resolveTemplate(prefab_id)` + resolver detail.
+- Lifecycle section: `setActive` cascades; `Start` fires on first
+  active+enabled transition.
+
 ## Carry-over markers
 
 - [ ] PR4-followup: implement `scene_converter` inactive retention.

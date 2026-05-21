@@ -100,14 +100,26 @@ Luau — is the source of truth.
 prefab / ScriptableObject fields are `references` rows (Piece 2); the
 host injects a resolved value before `Awake`, keyed by `target_kind`:
 
-- `target_kind: asset` — host injects the `rbxassetid://…` string. Under
-  generic, the serialized-field extractor does **not** materialize child
-  `Sound`/`Model` instances (`runtime_mode`-gated; legacy unchanged).
+- `target_kind: asset` — host injects the `rbxassetid://…` string. The
+  planner persists the Unity GUID structurally; the post-upload subphase
+  `_rewrite_scene_runtime_asset_refs` rewrites every asset `target_ref`
+  to its `rbxassetid://…` using `ctx.uploaded_assets` (mirrors how mesh
+  ids work today). Refs whose GUID is unresolved keep the raw GUID so
+  the operator sees the unresolved reference rather than a silent drop.
+  Under generic, the serialized-field extractor does **not** materialize
+  child `Sound`/`Model` instances (`runtime_mode`-gated; legacy unchanged).
 - `target_kind: prefab` — host injects the stable `prefab_id` in
   `scene_runtime.prefabs`; modules pass it to `instantiatePrefab(...)`.
-  Never a bare `Clone()`.
+  Never a bare `Clone()`. The entrypoint resolves `prefab_id` →
+  `template_name` via `plan.prefabs[prefab_id].template_name`, then
+  looks the bare name up under `ReplicatedStorage.Templates` (the folder
+  `prefab_packages` emits into).
 - `target_kind: scriptable_object` — host injects the `require()`d SO
-  table; SO converter unchanged.
+  table; SO converter unchanged. The planner persists the Unity GUID;
+  the artifact also carries a `scene_runtime.scriptable_objects`
+  map (`guid → dotted DataModel module path`) populated by
+  `_build_scriptable_object_module_map`. The host runtime resolves each
+  SO ref via that map.
 
 **Singleton pattern (`static Instance = this`) is supported natively.**
 The Lua equivalent (`function X:Awake() X.Instance = self end`) is inside
@@ -212,7 +224,11 @@ scene_runtime:
     "<script_id>":
       stem:        "<emitted file stem>"        # canonical require key
       class_name:  "<C# class name>"            # informational; may be empty
-      module_path: "<resolved DataModel path>"  # UNIQUE physical ModuleScript
+      module_path: "<dotted DataModel path>"    # e.g. "ReplicatedStorage.Foo"
+                                                # OR "StarterPlayer.StarterPlayerScripts.Bar".
+                                                # The SceneRuntime entrypoints split this on "."
+                                                # and walk game:FindFirstChild() down the chain.
+                                                # R2-P1.1 contract resolution.
       runtime_bearing: bool                     # true = host instantiates
       domain:    "client" | "server"            # Piece 4; runtime_bearing only
       container: "<Roblox container path>"      # Piece 4
@@ -232,6 +248,11 @@ scene_runtime:
           target_kind: "component" | "gameobject" | "prefab"
                      | "scriptable_object" | "asset"
           target_ref:  "<instance_id | game_object_id | prefab_id | asset_id>"
+                       # For asset: GUID at plan time, rewritten to
+                       # rbxassetid://NNN by _rewrite_scene_runtime_asset_refs
+                       # before the plan ModuleScript is emitted. R2-P1.3.
+                       # For scriptable_object: Unity GUID; the host resolves
+                       # via scene_runtime.scriptable_objects below.
           target_is_ui: bool      # target inside a converted Canvas subtree
       lifecycle_order: ["<instance_id>", ...]   # scene-hierarchy DFS
   prefabs:                                      # per-template namespace
@@ -239,10 +260,24 @@ scene_runtime:
                                                 # project-relative path,
                                                 # NOT bare name (collides
                                                 # across folders like stems)
-      name:        "<prefab name>"              # informational
-      instances:   [ ... ]                      # prefab-local
-      references:  [ ... ]                      # intra-prefab + externalRefs
+      name:           "<prefab name>"           # informational
+      template_name:  "<bare prefab name>"      # R2-P1.2: resolves prefab_id ->
+                                                # ReplicatedStorage.Templates[name].
+                                                # Equals PrefabTemplate.name; the per-folder
+                                                # distinction lives in prefab_id (above).
+                                                # The entrypoints' _resolveTemplate(prefab_id)
+                                                # reads this to clone the right template.
+      instances:      [ ... ]                   # prefab-local
+      references:     [ ... ]                   # intra-prefab + externalRefs
       lifecycle_order: [ ... ]                  # prefab-local DFS
+  scriptable_objects:                           # R2-P1.3: guid -> dotted DataModel
+    "<unity_guid>": "<dotted module path>"      # module path (e.g.
+                                                # "ReplicatedStorage.Settings").
+                                                # Populated by
+                                                # _build_scriptable_object_module_map
+                                                # before the plan is encoded.
+                                                # The host runtime resolves every
+                                                # scriptable_object ref through this map.
   domain_overrides:                             # agent overrides, sub-key of
     "<script_id>": "client" | "server"          # scene_runtime (NOT top-level)
 ```
@@ -398,8 +433,21 @@ under generic (pre-transpile, Piece 1). This step assigns **placement**:
 - `SceneRuntimeClient` (LocalScript, StarterPlayerScripts) and
   `SceneRuntimeServer` (Script, ServerScriptService) — thin entrypoints
   that `require` the engine, filter the plan by `domain`, and start it.
+  They expose two resolver closures the engine reads through `services`:
+  - `resolveModule(scriptId, modulePath)` — splits `modulePath` on `"."`
+    and walks `game:FindFirstChild(...)` down the chain to load the
+    ModuleScript. The planner stamps `modulePath` as the dotted
+    DataModel path (R2-P1.1).
+  - `clonePrefabTemplate(prefabId, parent, cframe)` — looks up the
+    plan's `prefabs[prefabId].template_name` and clones
+    `ReplicatedStorage.Templates[template_name]` (R2-P1.2). The
+    `Templates` folder is what `prefab_packages` actually emits;
+    feeding the stable `prefabId` directly would never resolve because
+    templates are keyed by bare name.
 - The plan is embedded once as a ReplicatedStorage data ModuleScript,
-  generated from `conversion_plan.json` at `write_output`.
+  generated from `conversion_plan.json` at `write_output`. The encoder
+  emits the host-relevant keys only:
+  `modules / scenes / prefabs / domain_overrides / scriptable_objects`.
 
 These replace `ClientBootstrap`. `runtime/scene_runtime.luau` is reusable
 and never modified per-game.
@@ -486,10 +534,19 @@ Unity's order is partly undefined; the converter pins it:
    Cycles are safe because step 1 touched nothing.
 3. `Awake` — scene-hierarchy DFS, then per-GameObject component order.
 4. `OnEnable` — same order, **only** `active + enabled` instances.
-5. `Start` — **next tick** (`task.defer`), same order.
+5. `Start` — **next tick** (`task.defer`), same order. `Start` fires
+   **once** on the FIRST satisfaction of the `active && enabled` gate
+   — at boot for live instances, OR later via `setActive(true)` /
+   `setEnabled(true)` for instances booted dormant (R2-P1.5). Subsequent
+   true→false→true cycles do NOT re-fire `Start`.
 6. `Update`/`LateUpdate` on `Heartbeat`; `FixedUpdate` on a **fixed-step
    accumulator** (Unity's `FixedUpdate` is fixed-timestep).
 7. `OnDisable`/`OnDestroy` on teardown / `SetActive(false)` / `Destroy`.
+   `setActive(go, bool)` cascades to every component owned by a
+   descendant of `go` (DFS via `services.collectDescendantIds`), so a
+   parent toggled inactive suspends every descendant component's
+   `host.connect` subscriptions and bookkeeping. Matches Unity's
+   `activeInHierarchy` semantic (R2-P1.4).
 
 ## Runtime-spawned prefabs
 
