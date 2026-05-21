@@ -3736,6 +3736,30 @@ script.Disabled = true
         # 3-key dict that silently dropped anything else.
         scene_runtime = self._merge_scene_runtime(plan_path)
 
+        # PR3b: stamp per-module ``domain`` / ``container`` / ``module_path``
+        # / ``domain_signals`` once the storage classifier has finalized
+        # every script's ``parent_path``. Safe to run under legacy too --
+        # the planner only adds optional fields, the contract pipeline
+        # ignores them under legacy, and the host runtime only consumes
+        # them under generic. Caller can disable by setting
+        # ``scene_runtime["__skip_domain_classifier__"] = True`` on ctx;
+        # tests use that escape hatch when probing classify_storage in
+        # isolation.
+        if (
+            scene_runtime.get("modules")
+            and not scene_runtime.get("__skip_domain_classifier__")
+        ):
+            from converter.scene_runtime_domain import (
+                classify_scene_runtime_domains,
+            )
+            report = classify_scene_runtime_domains(
+                cast("dict", scene_runtime),
+                self.state.rbx_place.scripts,
+                dependency_map=self.state.dependency_map or None,
+            )
+            scene_runtime["displaced_instances"] = report["displaced_instances"]
+            scene_runtime["low_confidence_modules"] = report["low_confidence_modules"]
+
         plan_path.write_text(
             _json.dumps({
                 "storage_plan": plan.to_dict(),

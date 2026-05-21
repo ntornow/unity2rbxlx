@@ -124,12 +124,14 @@ class TestSceneRuntimePersistence:
         raw = json.loads(
             (pipeline.output_dir / "conversion_plan.json").read_text()
         )
-        # ``guid-a`` is gone — structural refresh, not merge.
-        assert raw["scene_runtime"]["modules"] == {
-            "guid-b": {
-                "stem": "Bar", "class_name": "Bar", "runtime_bearing": True,
-            },
-        }
+        # ``guid-a`` is gone — structural refresh, not merge. PR3b adds
+        # ``domain`` / ``domain_signals`` etc. during _classify_storage,
+        # so assert subset rather than exact equality.
+        modules = raw["scene_runtime"]["modules"]
+        assert set(modules.keys()) == {"guid-b"}
+        assert modules["guid-b"]["stem"] == "Bar"
+        assert modules["guid-b"]["class_name"] == "Bar"
+        assert modules["guid-b"]["runtime_bearing"] is True
 
     def test_resume_loads_scene_runtime_block_back_into_ctx(
         self, tmp_path: Path,
