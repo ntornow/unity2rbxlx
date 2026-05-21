@@ -5,7 +5,7 @@ Companion: `docs/architecture_critique.md`.
 
 ## In one paragraph
 
-Nine PRs (PR-A through PR-H, plus PR-E0 ordering audit) reshape three mega-files (`pipeline.py` 3897 LOC, `script_coherence_packs.py` 4667 LOC, `scene_converter.py` 4856 LOC) into focused modules without behavior change. Phase 1 (seven PRs including PR-E0) ships first; Phase 2 (two PRs) waits for the scene-runtime-contract effort to free up `scene_converter.py`. Total ~3.5 engineer-weeks of AI-driven work.
+Nine PRs (PR-A through PR-H, plus PR-E0 ordering audit) reshape three mega-files (`pipeline.py` 3897 LOC, `script_coherence_packs.py` 4667 LOC, `scene_converter.py` 4856 LOC) into focused modules without behavior change. **All nine PRs are held** until the scene-runtime-contract 9-PR effort merges into ntornow upstream — Phase 1 PRs touch only non-`scene_converter.py` files but are still held to avoid two concurrent multi-PR efforts diluting review attention (user decision, 2026-05-21). Phase 2 is additionally blocked by the `scene_converter.py` lock. Total ~3.5 engineer-weeks of AI-driven work once execution begins.
 
 ## Constraints
 
@@ -58,7 +58,7 @@ Per-PR sections below list only additions to this template.
 | 8 | PR-G — Eliminate `_ctx()` (50 sites) | 2 | 1.5 | scene-runtime landed | scene_converter |
 | 9 | PR-H — Split `scene_converter.py` → 11 modules | 2 | 4 | PR-G | scene_converter |
 
-After PR-B, lane C (PR-C → PR-D) and lane D (PR-E0 → PR-E → PR-F) can run in parallel worktrees. Phase 2 is strictly sequential.
+After execution unblocks (scene-runtime-contract lands upstream) and PR-B has merged, lane C (PR-C → PR-D) and lane D (PR-E0 → PR-E → PR-F) can run in parallel worktrees. Phase 2 is strictly sequential.
 
 ## PR detail
 
@@ -74,7 +74,12 @@ Extend `tests/test_byte_equivalence.py` with `TestFrozenBaseline`. New files: `t
 - The three `.sha256` files are committed and reproducible from `origin/main` HEAD by re-running the test.
 
 ### PR-C — `write_output` subphases + `PipelineServices`
-New `phases/services.py` with `PipelineServices` dataclass (decision #7). New `phases/output/` package, one module per `_subphase_*` method: `emit_scripts.py`, `cohere_scripts.py`, `inject_autogen.py` (264 LOC, includes pre-scaffolding migration at `pipeline.py:2370-2384`), `encode_terrain.py`, `inject_mesh_loader.py`, `patch_setup_sounds.py`, `finalize_scripts.py`. Each: `def <name>(state, ctx, services) -> None`. `Pipeline.write_output` becomes a ~30-line orchestrator. New regression test covers the previously-uncovered pre-scaffolding migration branch.
+New `phases/services.py` with `PipelineServices` dataclass (decision #7). New `phases/output/` package, one module per `_subphase_*` method: `emit_scripts.py`, `cohere_scripts.py`, `inject_autogen.py` (264 LOC, includes pre-scaffolding migration; locate via `grep -n 'Migrating pre-scaffolding' converter/converter/pipeline.py`), `encode_terrain.py`, `inject_mesh_loader.py`, `patch_setup_sounds.py`, `finalize_scripts.py`. Each: `def <name>(state, ctx, services) -> None`. `Pipeline.write_output` becomes a ~30-line orchestrator.
+
+**+ done criteria:**
+- `pipeline.py` line count drops from 3897 to ~3400 LOC.
+- New `tests/test_pre_scaffolding_resume.py` regression test passes (covers the previously-uncovered pre-scaffolding migration branch).
+- `python -c "from converter.phases.services import PipelineServices"` succeeds.
 
 ### PR-D — Pipeline dispatch + 14 phase modules
 
@@ -114,7 +119,7 @@ New `phases/services.py` with `PipelineServices` dataclass (decision #7). New `p
 
 **New test** `tests/test_pipeline_dispatch.py`: (a) `set(PHASE_FUNCS.keys()) == set(PHASES)`, (b) `run_phase('typo')` raises `KeyError`, (c) every dispatched callable signs `(state, ctx, services) -> None`.
 
-**+ done criteria:** `pipeline.py` ≤ 800 LOC; `class Pipeline` ≤ 15 methods; `python -c "from converter.pipeline import Pipeline; from converter.phases import PHASE_FUNCS"` succeeds; zero `pipeline.<phase_name>()` in `converter/tests/`.
+**+ done criteria:** `pipeline.py` ≤ 800 LOC; `class Pipeline` ≤ 15 methods; `python -c "from converter.pipeline import Pipeline; from converter.phases import PHASE_FUNCS"` succeeds; from the `converter/` directory, `grep -rn 'pipeline\.\(parse\|extract_assets\|moderate_assets\|upload_assets\|convert_materials\|transpile_scripts\|convert_animations\|resolve_assets\|convert_scene\|write_output\)\s*(' tests/` returns zero matches.
 
 ### PR-E0 — Pack ordering audit
 
@@ -145,9 +150,11 @@ Existing `script_coherence_packs.py` → ~15-line back-compat shim per decision 
 
 ### PR-G — Eliminate `_ctx()` in `scene_converter.py`
 
-Lands the deferred refactor at `scene_converter.py:161-165`. Removes module-global `_current_ctx` + `_ctx()` function (50 call sites). Helpers take `ctx: SceneConversionContext` as explicit parameter. `convert_scene()` instantiates ctx and threads it through `_convert_node`, `_process_components`, etc.
+Lands the deferred refactor that the file's own comment block defers to "when individual helper signatures are refactored to accept ctx explicitly" (located via `grep -n "deferred" converter/converter/scene_converter.py`). Removes the module-global `_current_ctx` attribute and the `_ctx()` accessor function. Every call site (located via `grep -n '_ctx()' converter/converter/scene_converter.py` — was 50 sites at 2026-05-21, will drift with the scene-runtime-contract effort) gets `ctx: SceneConversionContext` as an explicit parameter. `convert_scene()` instantiates ctx and threads it through `_convert_node`, `_process_components`, etc.
 
-**+ done criteria:** `grep -c "_ctx()\|_current_ctx" converter/converter/scene_converter.py` returns 0; new `test_no_module_global_ctx` deletes the attribute and runs `convert_scene()` — must not raise.
+**Drift note:** Because PR-G is gated on scene-runtime-contract landing first (which touches `scene_converter.py` heavily), the exact line numbers and call-site count WILL drift. Use grep, not hardcoded refs, during execution.
+
+**+ done criteria:** `grep -cE '_ctx\(\)|_current_ctx' converter/converter/scene_converter.py` returns 0; new `test_no_module_global_ctx` deletes the attribute (via `delattr(scene_converter, '_current_ctx')` if it still exists) and runs `convert_scene()` — must not raise.
 
 ### PR-H — Split `scene_converter.py`
 
@@ -215,10 +222,10 @@ When scene-runtime-contract PRs #122/#123/#124 + stacked PR3b→PR8 merge into n
 
 | Review | Trigger | Runs | Status |
 |---|---|---|---|
-| Eng Review | `/plan-eng-review` | 1 | CLEAR (PLAN) — 9 issues, 0 critical gaps, 9 decisions locked |
-| Codex Review | outside voice | 1 | issues_found — 5 findings, 3 promoted to decisions, 2 folded |
+| Eng Review | `/plan-eng-review` | 2 | CLEAR (PLAN) — round 2: 9 issues / 9 decisions locked. Round 4: 4 issues / all folded (PR-C done criteria, gating regression, PR-D path notation, PR-G drift wording). |
+| Codex Review | outside voice | 4 | issues_found — round 1 on critique, round 2 on plan v1, round 3 on compression diff, round 4 on compressed plan |
 | CEO / Design / DX | — | 0 | not applicable to refactor scope |
 
-**Cross-model:** Claude eng-review + Codex outside-voice converged on the dispatch-table approach and `_ctx()` priority. Codex caught the `(state, ctx)` signature being too narrow.
+**Cross-model:** Round 2 — Claude eng-review + codex converged on dispatch-table + `_ctx()` priority; codex caught the `(state, ctx)` signature being too narrow. Round 3 — codex caught canonicalization erosion, PR-B gate, services enumeration. Round 4 — codex caught gating contradiction (compressed plan silently reverted user-locked "all held" decision), PR-D path-notation ambiguity, PR-G line-number drift fragility.
 
 **Verdict:** ENG CLEARED — ready to execute once scene-runtime-contract lands.
