@@ -595,3 +595,42 @@ The three R2 P1s the user explicitly resolved are pinned in
       `_LUAU_BARE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")`.
       Tests: `test_unicode_identifier_keys_use_bracket_syntax` +
       `test_unicode_key_emit_parses_with_luau`.
+
+- [ ] **PR3c-arch-caveat (ESCALATED, NOT FIXED in PR4)**: move
+      `_classify_storage` to run BEFORE `convert_scene` so PR3c's
+      `module_row["domain"] == "legacy"` guard in
+      `scene_converter._compute_serialized_field_child_suppressions`
+      becomes effective. **A simple phase reorder is NOT viable.**
+      Hard dependencies surfaced during the 2026-05-21 PR4 attempt:
+        1. `_classify_storage` reads `self.state.rbx_place.scripts`,
+           but `rbx_place` is freshly constructed inside `convert_scene`
+           (`scene_converter.py:1011 place = RbxPlace()`). Running the
+           classifier first and then calling `convert_scene` drops the
+           classified script list onto the floor.
+        2. `_classify_storage` requires the in-memory script list to be
+           populated (`_subphase_emit_scripts_to_disk` does that today
+           by reading `state.transpilation_result` and appending to
+           `rbx_place.scripts`).
+        3. `_classify_storage` requires `_subphase_cohere_scripts` to
+           have run first (existing `SUBPHASE_ORDER` comment:
+           "Script→ModuleScript reclassification affects which storage
+           container each script belongs in").
+      Viable paths (each is bigger than a reorder and was NOT taken in
+      PR4):
+        (a) Restructure `convert_scene` to mutate an existing
+            `state.rbx_place` instead of returning a new one — then
+            move emit/cohere/classify ahead of it.
+        (b) Run a `classify_storage`-equivalent against
+            `state.transpilation_result.scripts` (TranspiledScript, not
+            RbxScript) pre-convert; stamp domain onto `ctx.scene_runtime`;
+            keep the existing `_classify_storage` subphase for parent_path.
+        (c) Have PR3c's guard read a pre-classify oracle (e.g. a thin
+            "module is fail-closed" predicate computed pre-convert).
+      The PR4 brief's hard rule (`If the reorder surfaces an unexpected
+      dependency, STOP and escalate`) applies. PR3c's guard remains the
+      conservative fallback the suppression set already has
+      (`module_row.get("runtime_bearing")`) — fail-closed UI controllers
+      under generic still lose their static subtree without host
+      re-population, which the PR3c comment already documents. Pick (a)
+      / (b) / (c) in a follow-up PR with explicit byte-equivalence
+      coverage.
