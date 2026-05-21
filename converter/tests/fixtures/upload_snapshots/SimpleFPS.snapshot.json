@@ -1,0 +1,1323 @@
+{
+  "_meta": {
+    "captured_at": "2026-05-21T07:24:54.640352+00:00",
+    "project_name": "SimpleFPS",
+    "schema_version": 1,
+    "source_output_dir": "/Users/jiazou/workspace/unity2rbxlx/converter/output/SimpleFPS_run_2026-05-19",
+    "source_unity_project": "/Users/jiazou/workspace/unity2rbxlx/test_projects/SimpleFPS"
+  },
+  "asset_upload_errors": [
+    "Assets/AssetPack/HornetRifle/Model/Materials/riffle_hornet_Material_Normal.png",
+    "Assets/Textures/prop_keycard_dff.tif (moderation rejected)",
+    "Assets/Sounds/music1.mp3 (moderation rejected)",
+    "Assets/AssetPack/AT Mine/at_mine_LOD3.prefab#4322892",
+    "Assets/AssetPack/AT Mine/at_mine_LOD3.prefab#4322892"
+  ],
+  "mesh_hierarchies": {
+    "Assets/AssetPack/AT Mine/at_mine_LOD3.prefab#4322892": [
+      {
+        "meshId": "rbxassetid://132834596075608",
+        "name": "pod_R",
+        "position": [
+          -0.0,
+          0.0014,
+          0.0213
+        ],
+        "size": [
+          0.323,
+          0.0976,
+          0.3498
+        ]
+      }
+    ],
+    "Assets/AssetPack/BarbedWireSet/barbedWireRoll.fbx": [
+      {
+        "meshId": "rbxassetid://71312148508898",
+        "name": "polySurface95",
+        "position": [
+          0.0,
+          0.3856,
+          0.0024
+        ],
+        "size": [
+          7.5633,
+          0.8369,
+          0.8404
+        ]
+      }
+    ],
+    "Assets/AssetPack/HornetRifle/Model/HornetRifle.fbx": [
+      {
+        "meshId": "rbxassetid://77487717722879",
+        "name": "pod_R",
+        "position": [
+          0.1852,
+          1.2358,
+          -4.405
+        ],
+        "size": [
+          0.4226,
+          1.4603,
+          0.2664
+        ]
+      },
+      {
+        "meshId": "rbxassetid://127098657937026",
+        "name": "pod_support",
+        "position": [
+          0.0,
+          1.8603,
+          -4.4312
+        ],
+        "size": [
+          0.7796,
+          0.2904,
+          0.4516
+        ]
+      },
+      {
+        "meshId": "rbxassetid://128542898666057",
+        "name": "pod_L",
+        "position": [
+          -0.1852,
+          1.2358,
+          -4.415
+        ],
+        "size": [
+          0.4226,
+          1.4603,
+          0.2664
+        ]
+      },
+      {
+        "meshId": "rbxassetid://116782682578371",
+        "name": "snip_barrel",
+        "position": [
+          0.0,
+          2.2262,
+          -2.216
+        ],
+        "size": [
+          0.3603,
+          0.3603,
+          3.4128
+        ]
+      },
+      {
+        "meshId": "rbxassetid://85855625716467",
+        "name": "barrel",
+        "position": [
+          0.0,
+          2.2178,
+          -4.33
+        ],
+        "size": [
+          0.4744,
+          0.4744,
+          1.1945
+        ]
+      },
+      {
+        "meshId": "rbxassetid://117710393255110",
+        "name": "laser_pointer",
+        "position": [
+          0.3653,
+          2.5034,
+          -4.1966
+        ],
+        "size": [
+          0.3706,
+          0.3419,
+          1.3417
+        ]
+      },
+      {
+        "meshId": "rbxassetid://101519427166475",
+        "name": "handguard",
+        "position": [
+          0.0,
+          1.8214,
+          -2.848
+        ],
+        "size": [
+          0.5157,
+          0.3839,
+          2.3832
+        ]
+      },
+      {
+        "meshId": "rbxassetid://96145562060408",
+        "name": "trigger",
+        "position": [
+          0.0,
+          1.5647,
+          0.9826
+        ],
+        "size": [
+          0.0539,
+          0.2767,
+          0.5343
+        ]
+      },
+      {
+        "meshId": "rbxassetid://103085386064980",
+        "name": "butt_stock",
+        "position": [
+          0.0,
+          1.6092,
+          -0.7356
+        ],
+        "size": [
+          0.4083,
+          1.7977,
+          4.1463
+        ]
+      },
+      {
+        "meshId": "rbxassetid://121829683662378",
+        "name": "optical",
+        "position": [
+          0.0,
+          3.0476,
+          1.2747
+        ],
+        "size": [
+          0.8272,
+          1.1437,
+          3.8027
+        ]
+      },
+      {
+        "meshId": "rbxassetid://84411014438435",
+        "name": "top_cover",
+        "position": [
+          -0.7,
+          2.1948,
+          -7.5135
+        ],
+        "size": [
+          0.7629,
+          1.0593,
+          6.7549
+        ]
+      },
+      {
+        "meshId": "rbxassetid://108618300614936",
+        "name": "magazine_slot",
+        "position": [
+          0.0,
+          1.676,
+          -0.1148
+        ],
+        "size": [
+          0.3856,
+          0.7082,
+          1.0346
+        ]
+      },
+      {
+        "meshId": "rbxassetid://71485529980221",
+        "name": "magazine",
+        "position": [
+          0.0,
+          1.2505,
+          0.028
+        ],
+        "size": [
+          0.2076,
+          1.3772,
+          0.9442
+        ]
+      },
+      {
+        "meshId": "rbxassetid://76727983004555",
+        "name": "Handle",
+        "position": [
+          0.0,
+          1.2241,
+          1.1459
+        ],
+        "size": [
+          0.3922,
+          1.5326,
+          2.5908
+        ]
+      }
+    ],
+    "Assets/AssetPack/JerryCan/jerrycan02_prp.fbx": [
+      {
+        "meshId": "rbxassetid://92635253616886",
+        "name": "jerrycan_nato02_prp_1",
+        "position": [
+          -0.0,
+          0.2633,
+          0.0
+        ],
+        "size": [
+          0.1506,
+          0.5253,
+          0.3897
+        ]
+      }
+    ],
+    "Assets/AssetPack/Pallet/pallet03_prp.fbx": [
+      {
+        "meshId": "rbxassetid://97694104148511",
+        "name": "pallet03_1",
+        "position": [
+          -0.0006,
+          0.705,
+          0.1071
+        ],
+        "size": [
+          1.4171,
+          1.409,
+          1.5464
+        ]
+      }
+    ],
+    "Assets/AssetPack/Plane/Models/World War II - Plane - Flying.fbx": [
+      {
+        "meshId": "rbxassetid://74321624437301",
+        "name": "World War II - Plane Flying",
+        "position": [
+          0.0,
+          59.2453,
+          353.4915
+        ],
+        "size": [
+          2048.0,
+          507.545,
+          1322.4243
+        ]
+      }
+    ],
+    "Assets/AssetPack/Plane/Models/World War II - Plane - Ground.fbx": [
+      {
+        "meshId": "rbxassetid://128064076420570",
+        "name": "World War II - Plane - Ground",
+        "position": [
+          0.9958,
+          198.1296,
+          336.0662
+        ],
+        "size": [
+          2048.0,
+          400.8853,
+          1318.3282
+        ]
+      }
+    ],
+    "Assets/AssetPack/SciFi_Battery_Pack_free/FBX/Battery_medium_05.FBX": [
+      {
+        "meshId": "rbxassetid://99000019760853",
+        "name": "Battery_medium_05",
+        "position": [
+          1084.5541,
+          241.582,
+          0.4673
+        ],
+        "size": [
+          198.8513,
+          152.0611,
+          182.1231
+        ]
+      }
+    ],
+    "Assets/AssetPack/SciFi_Battery_Pack_free/FBX/Battery_small_06.FBX": [
+      {
+        "meshId": "rbxassetid://84076426176076",
+        "name": "Battery_small_06",
+        "position": [
+          -1.2942,
+          100.9768,
+          -44.3261
+        ],
+        "size": [
+          161.3832,
+          201.9535,
+          168.5611
+        ]
+      }
+    ],
+    "Assets/AssetPack/SciFi_Door/SF_Door.fbx": [
+      {
+        "meshId": "rbxassetid://91281862080666",
+        "name": "frame_col",
+        "position": [
+          0.001,
+          3.2236,
+          0.0033
+        ],
+        "size": [
+          7.3855,
+          6.4793,
+          1.5661
+        ]
+      },
+      {
+        "meshId": "rbxassetid://127600461286666",
+        "name": "base",
+        "position": [
+          -0.0185,
+          0.1427,
+          0.0
+        ],
+        "size": [
+          4.9545,
+          0.1522,
+          2.0236
+        ]
+      },
+      {
+        "meshId": "rbxassetid://116203370925472",
+        "name": "door",
+        "position": [
+          0.0,
+          2.6557,
+          0.0
+        ],
+        "size": [
+          4.8826,
+          4.9399,
+          0.7251
+        ]
+      },
+      {
+        "meshId": "rbxassetid://122666502073966",
+        "name": "frame",
+        "position": [
+          0.001,
+          3.222,
+          -0.0054
+        ],
+        "size": [
+          7.3162,
+          6.4206,
+          1.5347
+        ]
+      }
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Antenna_lg.FBX": [
+      {
+        "meshId": "rbxassetid://104696039241670",
+        "name": "Antenna_lg",
+        "position": [
+          -0.0,
+          0.0,
+          0.0
+        ],
+        "size": [
+          50.983,
+          384.8508,
+          40.2771
+        ]
+      }
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Battery_double.FBX": [
+      {
+        "meshId": "rbxassetid://123395074083829",
+        "name": "Battery_double",
+        "position": [
+          0.0,
+          0.0,
+          14.1932
+        ],
+        "size": [
+          150.0,
+          150.0,
+          30.8873
+        ]
+      }
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Battery_single.FBX": [
+      {
+        "meshId": "rbxassetid://126281848829178",
+        "name": "Battery_single",
+        "position": [
+          -0.0001,
+          0.0,
+          14.1932
+        ],
+        "size": [
+          74.2709,
+          150.0,
+          30.8873
+        ]
+      }
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/BoxBeltLG_sym.FBX": [
+      {
+        "meshId": "rbxassetid://133124145025410",
+        "name": "BoxBeltLG_sym",
+        "position": [
+          -0.0001,
+          -0.0,
+          0.0
+        ],
+        "size": [
+          222.3963,
+          34.1778,
+          222.3959
+        ]
+      }
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Box_big_base.FBX": [
+      {
+        "meshId": "rbxassetid://114403052594254",
+        "name": "Box_big_base",
+        "position": [
+          0.0004,
+          0.0,
+          0.0
+        ],
+        "size": [
+          238.7808,
+          55.6389,
+          238.7805
+        ]
+      }
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Box_big_cap.FBX": [
+      {
+        "meshId": "rbxassetid://93589213257712",
+        "name": "Box_big_cap",
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "size": [
+          219.4631,
+          55.3452,
+          200.0
+        ]
+      }
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Box_big_tall.FBX": [
+      {
+        "meshId": "rbxassetid://88690896829169",
+        "name": "Box_big_tall",
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "size": [
+          200.0,
+          412.0,
+          200.0
+        ]
+      }
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Camera3.FBX": [
+      {
+        "meshId": "rbxassetid://95321211260125",
+        "name": "Camera3",
+        "position": [
+          -0.0,
+          0.0,
+          -0.0
+        ],
+        "size": [
+          113.4795,
+          85.8293,
+          121.2758
+        ]
+      }
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Girder_Base.FBX": [
+      {
+        "meshId": "rbxassetid://118372598903780",
+        "name": "Girder_Base",
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "size": [
+          125.4434,
+          29.5266,
+          42.387
+        ]
+      }
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Girder_Short.FBX": [
+      {
+        "meshId": "rbxassetid://127260533336614",
+        "name": "Girder_Short",
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "size": [
+          100.0,
+          200.0,
+          25.1931
+        ]
+      }
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Vent_Big.FBX": [
+      {
+        "meshId": "rbxassetid://70430875848201",
+        "name": "Vent_Big",
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "size": [
+          229.7635,
+          35.6696,
+          200.0
+        ]
+      }
+    ],
+    "Assets/AssetPack/Simple Box Pack/Meshes/AMMO_FBX.FBX": [
+      {
+        "meshId": "rbxassetid://139509360003938",
+        "name": "ChamferBox003",
+        "position": [
+          -281.4424,
+          51.9123,
+          -56.5824
+        ],
+        "size": [
+          60.2107,
+          33.4648,
+          72.5972
+        ]
+      }
+    ],
+    "Assets/AssetPack/Simple Box Pack/Meshes/HP_FBX.FBX": [
+      {
+        "meshId": "rbxassetid://70568449558358",
+        "name": "ChamferBox001",
+        "position": [
+          -10.4816,
+          55.7213,
+          -15.4447
+        ],
+        "size": [
+          60.2108,
+          33.4648,
+          72.5972
+        ]
+      }
+    ],
+    "Assets/AssetPack/TallFence/tallfence.fbx": [
+      {
+        "meshId": "rbxassetid://104765766427457",
+        "name": "polySurface6",
+        "position": [
+          -4.7623,
+          2.06,
+          0.0
+        ],
+        "size": [
+          9.8173,
+          4.1644,
+          0.2775
+        ]
+      },
+      {
+        "meshId": "rbxassetid://86979086357613",
+        "name": "polySurface7",
+        "position": [
+          -4.8422,
+          1.908,
+          -0.2047
+        ],
+        "size": [
+          9.73,
+          3.4055,
+          0.3203
+        ]
+      }
+    ],
+    "Assets/AssetPack/WoodMadeProps/Models/beam01.FBX": [
+      {
+        "meshId": "rbxassetid://123555087469133",
+        "name": "Beam01",
+        "position": [
+          0.4268,
+          0.0,
+          0.0236
+        ],
+        "size": [
+          240.1094,
+          13.8042,
+          13.8048
+        ]
+      }
+    ],
+    "Assets/AssetPack/WoodMadeProps/Models/crate01.FBX": [
+      {
+        "meshId": "rbxassetid://116357171117923",
+        "name": "Crate01",
+        "position": [
+          -0.0321,
+          29.8652,
+          0.0321
+        ],
+        "size": [
+          60.4174,
+          60.3252,
+          60.4174
+        ]
+      }
+    ],
+    "Assets/AssetPack/WoodMadeProps/Models/cylinder01.FBX": [
+      {
+        "meshId": "rbxassetid://127927933119792",
+        "name": "Cylinder01",
+        "position": [
+          0.0,
+          2.4278,
+          0.0
+        ],
+        "size": [
+          16.8025,
+          8.0123,
+          16.8025
+        ]
+      }
+    ],
+    "Assets/AssetPack/WoodMadeProps/Models/plank01.FBX": [
+      {
+        "meshId": "rbxassetid://129108453287711",
+        "name": "Plank01",
+        "position": [
+          0.0,
+          1.0,
+          0.0
+        ],
+        "size": [
+          120.0,
+          2.0,
+          10.0
+        ]
+      }
+    ],
+    "Assets/AssetPack/WoodMadeProps/Models/plank02.FBX": [
+      {
+        "meshId": "rbxassetid://116622562023220",
+        "name": "Plank02",
+        "position": [
+          -0.0557,
+          2.5695,
+          -0.0667
+        ],
+        "size": [
+          60.1083,
+          5.0233,
+          5.0325
+        ]
+      }
+    ],
+    "Assets/AssetPack/WoodMadeProps/Models/plank03a.FBX": [
+      {
+        "meshId": "rbxassetid://79846956856537",
+        "name": "Plank03a",
+        "position": [
+          0.1481,
+          0.0985,
+          -0.0791
+        ],
+        "size": [
+          37.4257,
+          2.2419,
+          22.4904
+        ]
+      }
+    ],
+    "Assets/AssetPack/WoodMadeProps/Models/plank03b.FBX": [
+      {
+        "meshId": "rbxassetid://101595163786585",
+        "name": "Plank03b",
+        "position": [
+          0.1481,
+          0.0985,
+          -0.0791
+        ],
+        "size": [
+          37.4257,
+          2.2419,
+          22.4904
+        ]
+      }
+    ],
+    "Assets/AssetPack/WoodMadeProps/Models/plank04.FBX": [
+      {
+        "meshId": "rbxassetid://90477796166272",
+        "name": "Plank04",
+        "position": [
+          -0.0132,
+          2.5695,
+          -21.6624
+        ],
+        "size": [
+          39.9357,
+          5.0233,
+          11.0289
+        ]
+      }
+    ],
+    "Assets/AssetPack/wallConcreteRough/wallConcreteRough.fbx": [
+      {
+        "meshId": "rbxassetid://80942989209961",
+        "name": "pCube2",
+        "position": [
+          0.0,
+          0.6596,
+          0.0126
+        ],
+        "size": [
+          24.0,
+          1.3192,
+          0.5715
+        ]
+      }
+    ],
+    "Assets/AssetPack/wallConcreteRough/wallConcreteRoughShort.fbx": [
+      {
+        "meshId": "rbxassetid://72193386869927",
+        "name": "pCube3",
+        "position": [
+          -0.0,
+          0.6539,
+          0.0
+        ],
+        "size": [
+          2.88,
+          1.3078,
+          0.5067
+        ]
+      }
+    ],
+    "Assets/Models/prop_keycard.fbx": [
+      {
+        "meshId": "rbxassetid://140421381023082",
+        "name": "prop_keycard_card",
+        "position": [
+          -0.0067,
+          -62.5549,
+          0.0
+        ],
+        "size": [
+          89.0516,
+          92.3213,
+          5.505
+        ]
+      }
+    ],
+    "Assets/Models/totem_01.fbx": [
+      {
+        "meshId": "rbxassetid://72763966131786",
+        "name": "Totem",
+        "position": [
+          0.0,
+          -0.0208,
+          0.0
+        ],
+        "size": [
+          0.0197,
+          0.0416,
+          0.0542
+        ]
+      }
+    ],
+    "Assets/Models/turret_01.fbx": [
+      {
+        "meshId": "rbxassetid://131808790001026",
+        "name": "Tower",
+        "position": [
+          0.0,
+          -0.0073,
+          0.0
+        ],
+        "size": [
+          0.0185,
+          0.0145,
+          0.0185
+        ]
+      },
+      {
+        "meshId": "rbxassetid://106944681292416",
+        "name": "TurretBase",
+        "position": [
+          0.0,
+          -0.0196,
+          0.0
+        ],
+        "size": [
+          0.0124,
+          0.0102,
+          0.0124
+        ]
+      },
+      {
+        "meshId": "rbxassetid://98911805887303",
+        "name": "Turret",
+        "position": [
+          -0.0,
+          -0.0239,
+          -0.0004
+        ],
+        "size": [
+          0.0098,
+          0.0095,
+          0.0197
+        ]
+      }
+    ],
+    "Assets/Standard Assets/Environment/Water (Basic)/Models/WaterBasicPlane.fbx": [
+      {
+        "meshId": "rbxassetid://119901568822862",
+        "name": "WaterBasicPlane",
+        "position": [
+          0.0,
+          -0.0,
+          -0.0
+        ],
+        "size": [
+          2.0,
+          0.001,
+          2.0
+        ]
+      }
+    ],
+    "Assets/Standard Assets/Environment/Water/Water/Models/WaterPlane.fbx": [
+      {
+        "meshId": "rbxassetid://119901568822862",
+        "name": "waterPlaneMesh",
+        "position": [
+          0.0,
+          -0.0,
+          -0.0
+        ],
+        "size": [
+          2.0,
+          0.001,
+          2.0
+        ]
+      }
+    ],
+    "Assets/Standard Assets/Environment/Water/Water4/Models/OceanPlane.FBX": [
+      {
+        "meshId": "rbxassetid://100617311927042",
+        "name": "OceanPlane",
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "size": [
+          100.0,
+          0.001,
+          100.0
+        ]
+      }
+    ]
+  },
+  "mesh_native_sizes": {
+    "Assets/AssetPack/AT Mine/at_mine_LOD3.prefab#4322892": [
+      0.323,
+      0.0976,
+      0.3498
+    ],
+    "Assets/AssetPack/BarbedWireSet/barbedWireRoll.fbx": [
+      7.5633,
+      0.8369,
+      0.8404
+    ],
+    "Assets/AssetPack/HornetRifle/Model/HornetRifle.fbx": [
+      0.4226,
+      1.4603,
+      0.2664
+    ],
+    "Assets/AssetPack/JerryCan/jerrycan02_prp.fbx": [
+      0.1506,
+      0.5253,
+      0.3897
+    ],
+    "Assets/AssetPack/Pallet/pallet03_prp.fbx": [
+      1.4171,
+      1.409,
+      1.5464
+    ],
+    "Assets/AssetPack/Plane/Models/World War II - Plane - Flying.fbx": [
+      2048.0,
+      507.545,
+      1322.4243
+    ],
+    "Assets/AssetPack/Plane/Models/World War II - Plane - Ground.fbx": [
+      2048.0,
+      400.8853,
+      1318.3282
+    ],
+    "Assets/AssetPack/SciFi_Battery_Pack_free/FBX/Battery_medium_05.FBX": [
+      198.8513,
+      152.0611,
+      182.1231
+    ],
+    "Assets/AssetPack/SciFi_Battery_Pack_free/FBX/Battery_small_06.FBX": [
+      161.3832,
+      201.9535,
+      168.5611
+    ],
+    "Assets/AssetPack/SciFi_Door/SF_Door.fbx": [
+      7.3855,
+      6.4793,
+      1.5661
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Antenna_lg.FBX": [
+      50.983,
+      384.8508,
+      40.2771
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Battery_double.FBX": [
+      150.0,
+      150.0,
+      30.8873
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Battery_single.FBX": [
+      74.2709,
+      150.0,
+      30.8873
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/BoxBeltLG_sym.FBX": [
+      222.3963,
+      34.1778,
+      222.3959
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Box_big_base.FBX": [
+      238.7808,
+      55.6389,
+      238.7805
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Box_big_cap.FBX": [
+      219.4631,
+      55.3452,
+      200.0
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Box_big_tall.FBX": [
+      200.0,
+      412.0,
+      200.0
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Camera3.FBX": [
+      113.4795,
+      85.8293,
+      121.2758
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Girder_Base.FBX": [
+      125.4434,
+      29.5266,
+      42.387
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Girder_Short.FBX": [
+      100.0,
+      200.0,
+      25.1931
+    ],
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Vent_Big.FBX": [
+      229.7635,
+      35.6696,
+      200.0
+    ],
+    "Assets/AssetPack/Simple Box Pack/Meshes/AMMO_FBX.FBX": [
+      60.2107,
+      33.4648,
+      72.5972
+    ],
+    "Assets/AssetPack/Simple Box Pack/Meshes/HP_FBX.FBX": [
+      60.2108,
+      33.4648,
+      72.5972
+    ],
+    "Assets/AssetPack/TallFence/tallfence.fbx": [
+      9.8173,
+      4.1644,
+      0.2775
+    ],
+    "Assets/AssetPack/WoodMadeProps/Models/beam01.FBX": [
+      240.1094,
+      13.8042,
+      13.8048
+    ],
+    "Assets/AssetPack/WoodMadeProps/Models/crate01.FBX": [
+      60.4174,
+      60.3252,
+      60.4174
+    ],
+    "Assets/AssetPack/WoodMadeProps/Models/cylinder01.FBX": [
+      16.8025,
+      8.0123,
+      16.8025
+    ],
+    "Assets/AssetPack/WoodMadeProps/Models/plank01.FBX": [
+      120.0,
+      2.0,
+      10.0
+    ],
+    "Assets/AssetPack/WoodMadeProps/Models/plank02.FBX": [
+      60.1083,
+      5.0233,
+      5.0325
+    ],
+    "Assets/AssetPack/WoodMadeProps/Models/plank03a.FBX": [
+      37.4257,
+      2.2419,
+      22.4904
+    ],
+    "Assets/AssetPack/WoodMadeProps/Models/plank03b.FBX": [
+      37.4257,
+      2.2419,
+      22.4904
+    ],
+    "Assets/AssetPack/WoodMadeProps/Models/plank04.FBX": [
+      39.9357,
+      5.0233,
+      11.0289
+    ],
+    "Assets/AssetPack/wallConcreteRough/wallConcreteRough.fbx": [
+      24.0,
+      1.3192,
+      0.5715
+    ],
+    "Assets/AssetPack/wallConcreteRough/wallConcreteRoughShort.fbx": [
+      2.88,
+      1.3078,
+      0.5067
+    ],
+    "Assets/Models/prop_keycard.fbx": [
+      89.0516,
+      92.3213,
+      5.505
+    ],
+    "Assets/Models/totem_01.fbx": [
+      0.0197,
+      0.0416,
+      0.0542
+    ],
+    "Assets/Models/turret_01.fbx": [
+      0.0185,
+      0.0145,
+      0.0185
+    ],
+    "Assets/Standard Assets/Environment/Water (Basic)/Models/WaterBasicPlane.fbx": [
+      2.0,
+      0.001,
+      2.0
+    ],
+    "Assets/Standard Assets/Environment/Water/Water/Models/WaterPlane.fbx": [
+      2.0,
+      0.001,
+      2.0
+    ],
+    "Assets/Standard Assets/Environment/Water/Water4/Models/OceanPlane.FBX": [
+      100.0,
+      0.001,
+      100.0
+    ]
+  },
+  "place_id": 119199160205962,
+  "universe_id": 10009229513,
+  "uploaded_assets": {
+    "Assets/AssetPack/AT Mine/at_mine_LOD3.prefab#4322892": "rbxassetid://121317134883074",
+    "Assets/AssetPack/AT Mine/textures/1k/at_mine__albedo_1k.bmp": "rbxassetid://126054623913433",
+    "Assets/AssetPack/AT Mine/textures/1k/at_mine__ao_1k.bmp": "rbxassetid://125584522527469",
+    "Assets/AssetPack/AT Mine/textures/1k/at_mine__metallic_1k.bmp": "rbxassetid://130722142177272",
+    "Assets/AssetPack/AT Mine/textures/1k/at_mine__normal_1k.bmp": "rbxassetid://97839509535095",
+    "Assets/AssetPack/AT Mine/textures/256px/at_mine__albedo_256px.bmp": "rbxassetid://129272934625012",
+    "Assets/AssetPack/AT Mine/textures/256px/at_mine__ao_256px.bmp": "rbxassetid://108810375036723",
+    "Assets/AssetPack/AT Mine/textures/256px/at_mine__metallic_256px.bmp": "rbxassetid://75301357129633",
+    "Assets/AssetPack/AT Mine/textures/256px/at_mine__normal_256px.bmp": "rbxassetid://112522386173225",
+    "Assets/AssetPack/AT Mine/textures/2k/at_mine__albedo_2k.bmp": "rbxassetid://87752361294183",
+    "Assets/AssetPack/AT Mine/textures/2k/at_mine__ao_2k.bmp": "rbxassetid://129718319602437",
+    "Assets/AssetPack/AT Mine/textures/2k/at_mine__metallic_2k.bmp": "rbxassetid://121997330096294",
+    "Assets/AssetPack/AT Mine/textures/2k/at_mine__normal_2k.bmp": "rbxassetid://118340419996837",
+    "Assets/AssetPack/AT Mine/textures/512px/at_mine__albedo_512px.bmp": "rbxassetid://75775096784541",
+    "Assets/AssetPack/AT Mine/textures/512px/at_mine__ao_512px.bmp": "rbxassetid://97205177097883",
+    "Assets/AssetPack/AT Mine/textures/512px/at_mine__metallic_512px.bmp": "rbxassetid://138615052868418",
+    "Assets/AssetPack/AT Mine/textures/512px/at_mine__normal_512px.bmp": "rbxassetid://129959945474123",
+    "Assets/AssetPack/BarbedWireSet/Textures/barbedWire.psd": "rbxassetid://138131405128784",
+    "Assets/AssetPack/BarbedWireSet/Textures/barbedWireBump.psd": "rbxassetid://106696412174012",
+    "Assets/AssetPack/BarbedWireSet/barbedWireRoll.fbx": "rbxassetid://83379652165353",
+    "Assets/AssetPack/HornetRifle/Model/HornetRifle.fbx": "rbxassetid://84668849401935",
+    "Assets/AssetPack/HornetRifle/Model/Materials/riffle_hornet_Material_AlbedoTransparency_orange.png": "rbxassetid://138207981911648",
+    "Assets/AssetPack/HornetRifle/Model/Materials/riffle_hornet_Material_MetallicSmoothness.png": "rbxassetid://139048319001460",
+    "Assets/AssetPack/HornetRifle/Model/Materials/riffle_hornet_Material_Normal.png": "rbxassetid://118452662864886",
+    "Assets/AssetPack/HornetRifle/Model/Materials/riffle_hornet_ambient_occlusion.png": "rbxassetid://127062388141212",
+    "Assets/AssetPack/JerryCan/jerrycan02_prp.fbx": "rbxassetid://102275302228792",
+    "Assets/AssetPack/JerryCan/jerrycans_prp_diffuse.png": "rbxassetid://111223420856168",
+    "Assets/AssetPack/Lens Flares/Art Assets/85mmflare.psd": "rbxassetid://131115299364014",
+    "Assets/AssetPack/Pallet/pallet01.png": "rbxassetid://80474169427891",
+    "Assets/AssetPack/Pallet/pallet03_prp.fbx": "rbxassetid://104508756236087",
+    "Assets/AssetPack/Plane/Models/World War II - Plane - Flying.fbx": "rbxassetid://77739895503103",
+    "Assets/AssetPack/Plane/Models/World War II - Plane - Ground.fbx": "rbxassetid://124223356382360",
+    "Assets/AssetPack/Plane/Textures/World War II - Plane - Heavy Scratches.tga": "rbxassetid://93548128487431",
+    "Assets/AssetPack/Plane/Textures/World War II - Plane - Light Scratches.tga": "rbxassetid://123725871178951",
+    "Assets/AssetPack/Plane/Textures/World War II - Plane - Normal.tga": "rbxassetid://87115834486394",
+    "Assets/AssetPack/Plane/Textures/World War II - Propeller.tga": "rbxassetid://98536907217016",
+    "Assets/AssetPack/SciFi_Battery_Pack_free/FBX/Battery_medium_05.FBX": "rbxassetid://138275721773247",
+    "Assets/AssetPack/SciFi_Battery_Pack_free/FBX/Battery_small_06.FBX": "rbxassetid://117708429240624",
+    "Assets/AssetPack/SciFi_Battery_Pack_free/Textures/battery.psd": "rbxassetid://78147123952154",
+    "Assets/AssetPack/SciFi_Battery_Pack_free/Textures/battery_damaged.psd": "rbxassetid://93524390492725",
+    "Assets/AssetPack/SciFi_Door/SF_Door.fbx": "rbxassetid://75855518765131",
+    "Assets/AssetPack/SciFi_Door/Textures/Door_DF.psd": "rbxassetid://109807338328224",
+    "Assets/AssetPack/SciFi_Door/Textures/Door_NM.png": "rbxassetid://91951882327304",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Antenna_lg.FBX": "rbxassetid://75987343535307",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Battery_double.FBX": "rbxassetid://122356829651144",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Battery_single.FBX": "rbxassetid://137957814141897",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/BoxBeltLG_sym.FBX": "rbxassetid://118733569634343",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Box_big_base.FBX": "rbxassetid://135991125667996",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Box_big_cap.FBX": "rbxassetid://114061150839397",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Box_big_tall.FBX": "rbxassetid://80691296750814",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Camera3.FBX": "rbxassetid://73097012073545",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Girder_Base.FBX": "rbxassetid://125861546788051",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Girder_Short.FBX": "rbxassetid://136207028825421",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/FBX/Vent_Big.FBX": "rbxassetid://95809791713959",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/Textures/Background_Grid.psd": "rbxassetid://138512208329125",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/Textures/Mod4Lightcone.psd": "rbxassetid://121727461283706",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/Textures/Mod4_blocks.psd": "rbxassetid://72857269937674",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/Textures/Mod4_blocks_NRM.png": "rbxassetid://71642075598202",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/Textures/Mod4_parts.psd": "rbxassetid://139930717076643",
+    "Assets/AssetPack/SciFi_Modular_Pack_Free/Textures/Mod4_parts_NRM.png": "rbxassetid://127124179582701",
+    "Assets/AssetPack/SciFi_Textures/tile 1/TILE1_Dwiths.tga": "rbxassetid://128721639156313",
+    "Assets/AssetPack/SciFi_Textures/tile 1/TILE1_N.tga": "rbxassetid://71971134672432",
+    "Assets/AssetPack/SciFi_Textures/tile 4/tileable 4_Dwiths.tga": "rbxassetid://79039606101539",
+    "Assets/AssetPack/SciFi_Textures/tile 4/tileable 4_n.tga": "rbxassetid://85903305293726",
+    "Assets/AssetPack/SciFi_Textures/tile 5/TILE5_N.tga": "rbxassetid://111970097518273",
+    "Assets/AssetPack/SciFi_Textures/tile 5/TILE5_dwiths.tga": "rbxassetid://93198309986499",
+    "Assets/AssetPack/SciFi_Textures/tile2/tilable2_dwith_s.tga": "rbxassetid://100665630851674",
+    "Assets/AssetPack/SciFi_Textures/tile2/tilable2_n.tga": "rbxassetid://138762727218657",
+    "Assets/AssetPack/SciFi_Textures/tile3/tileable 3_dwiths.tga": "rbxassetid://74340013820119",
+    "Assets/AssetPack/SciFi_Textures/tile3/tileable 3_n.tga": "rbxassetid://119152191184104",
+    "Assets/AssetPack/Simple Box Pack/Meshes/AMMO_FBX.FBX": "rbxassetid://140245393958781",
+    "Assets/AssetPack/Simple Box Pack/Meshes/HP_FBX.FBX": "rbxassetid://97919939592893",
+    "Assets/AssetPack/Simple Box Pack/Textures/Ammo_DEF.tga": "rbxassetid://96832885994615",
+    "Assets/AssetPack/Simple Box Pack/Textures/HP_DEF.tga": "rbxassetid://82903999613053",
+    "Assets/AssetPack/TallFence/Textures/chainlink.psd": "rbxassetid://120049387742768",
+    "Assets/AssetPack/TallFence/Textures/metal_01_d 1.tga": "rbxassetid://86743968916449",
+    "Assets/AssetPack/TallFence/Textures/metal_01_n.tga": "rbxassetid://83076384351298",
+    "Assets/AssetPack/TallFence/tallfence.fbx": "rbxassetid://72223056923400",
+    "Assets/AssetPack/Wispy Sky/Textures/SkyBox02b0001.tif": "rbxassetid://108981176428274",
+    "Assets/AssetPack/Wispy Sky/Textures/SkyBox02b0002.tif": "rbxassetid://101580186344112",
+    "Assets/AssetPack/Wispy Sky/Textures/SkyBox02b0003.tif": "rbxassetid://107057354524958",
+    "Assets/AssetPack/Wispy Sky/Textures/SkyBox02b0004.tif": "rbxassetid://77524760212075",
+    "Assets/AssetPack/Wispy Sky/Textures/SkyBox02b0005.tif": "rbxassetid://124469562204737",
+    "Assets/AssetPack/Wispy Sky/Textures/SkyBox02b0006.tif": "rbxassetid://94521895710384",
+    "Assets/AssetPack/WoodMadeProps/Models/Materials/crate01.png": "rbxassetid://124172484639522",
+    "Assets/AssetPack/WoodMadeProps/Models/Materials/wood01.png": "rbxassetid://79746477868575",
+    "Assets/AssetPack/WoodMadeProps/Models/beam01.FBX": "rbxassetid://94230890789884",
+    "Assets/AssetPack/WoodMadeProps/Models/crate01.FBX": "rbxassetid://128722113237941",
+    "Assets/AssetPack/WoodMadeProps/Models/cylinder01.FBX": "rbxassetid://88881562193029",
+    "Assets/AssetPack/WoodMadeProps/Models/plank01.FBX": "rbxassetid://130371955320720",
+    "Assets/AssetPack/WoodMadeProps/Models/plank02.FBX": "rbxassetid://104633627412873",
+    "Assets/AssetPack/WoodMadeProps/Models/plank03a.FBX": "rbxassetid://132563794388035",
+    "Assets/AssetPack/WoodMadeProps/Models/plank03b.FBX": "rbxassetid://127252738701399",
+    "Assets/AssetPack/WoodMadeProps/Models/plank04.FBX": "rbxassetid://108816084101386",
+    "Assets/AssetPack/wallConcreteRough/Textures/wallconcreterough_d.psd": "rbxassetid://93521426318948",
+    "Assets/AssetPack/wallConcreteRough/Textures/wallconcreterough_n.tga": "rbxassetid://112117953463003",
+    "Assets/AssetPack/wallConcreteRough/wallConcreteRough.fbx": "rbxassetid://75823933096451",
+    "Assets/AssetPack/wallConcreteRough/wallConcreteRoughShort.fbx": "rbxassetid://117385081410045",
+    "Assets/Models/prop_keycard.fbx": "rbxassetid://84829950767733",
+    "Assets/Models/totem_01.fbx": "rbxassetid://116850092173792",
+    "Assets/Models/turret_01.fbx": "rbxassetid://90112102896895",
+    "Assets/Sounds/ammo.mp3": "rbxassetid://83985310150989",
+    "Assets/Sounds/beach.mp3": "rbxassetid://80750642294800",
+    "Assets/Sounds/cannon.mp3": "rbxassetid://84838235484297",
+    "Assets/Sounds/door.mp3": "rbxassetid://79875734010137",
+    "Assets/Sounds/dryfire.mp3": "rbxassetid://121650330623875",
+    "Assets/Sounds/explosion.mp3": "rbxassetid://132026836183232",
+    "Assets/Sounds/forest.mp3": "rbxassetid://83972992091444",
+    "Assets/Sounds/gunshot.mp3": "rbxassetid://139875403032723",
+    "Assets/Sounds/health.mp3": "rbxassetid://103357741046561",
+    "Assets/Sounds/mine.mp3": "rbxassetid://76593257583906",
+    "Assets/Sounds/music.mp3": "rbxassetid://113757061114320",
+    "Assets/Sounds/pickup.mp3": "rbxassetid://137242400920164",
+    "Assets/Sounds/plane.mp3": "rbxassetid://75716395344811",
+    "Assets/Sounds/playerhit.mp3": "rbxassetid://121399683358550",
+    "Assets/Sounds/playerwalk.mp3": "rbxassetid://111441667919443",
+    "Assets/Sounds/turrethit.mp3": "rbxassetid://138661222835894",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/BroadleafBark.tga": "rbxassetid://91573493224208",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/BroadleafBark_Normal.tga": "rbxassetid://98539414022302",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaf_Desktop_Atlas.tga": "rbxassetid://79672883331374",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaf_Desktop_Atlas_Billboards.tga": "rbxassetid://87384723780187",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaf_Desktop_Atlas_Billboards_Normal.tga": "rbxassetid://115952260721446",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaf_Desktop_Atlas_Normal.tga": "rbxassetid://114279386158949",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaf_Desktop_Atlas_Specular.tga": "rbxassetid://114964437998888",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaf_Mobile_Atlas.tga": "rbxassetid://139021294065277",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaf_Mobile_Atlas_Billboards.tga": "rbxassetid://75585977128189",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaf_Mobile_Atlas_Billboards_Normal.tga": "rbxassetid://125303784073633",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaf_Mobile_Atlas_Normal.tga": "rbxassetid://131251636410235",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaf_Mobile_Atlas_Specular.tga": "rbxassetid://133227583846809",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaves_Card_Desktop.tga": "rbxassetid://118211946021532",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaves_Card_Desktop_Normal.tga": "rbxassetid://127479969159912",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaves_Card_Desktop_Spec.tga": "rbxassetid://126120559967460",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaves_Desktop.tga": "rbxassetid://76644536296567",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaves_Desktop_Normal.tga": "rbxassetid://74522763731889",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaves_Desktop_Spec.tga": "rbxassetid://80556536064581",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaves_Mobile.tga": "rbxassetid://121810958697498",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaves_Mobile_Normal.tga": "rbxassetid://88104919487042",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Broadleaves_Mobile_Spec.tga": "rbxassetid://87173848770165",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Cap_01.tga": "rbxassetid://137033221366116",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Cap_01_Normal.tga": "rbxassetid://110443244121259",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Cap_02.tga": "rbxassetid://135608073540576",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/Cap_02_Normal.tga": "rbxassetid://85905242094846",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/ClippedFrond.tga": "rbxassetid://81705758836598",
+    "Assets/Standard Assets/Environment/SpeedTree/Broadleaf/ClippedFrond_Normal.tga": "rbxassetid://86959874339900",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/PalmBark.tga": "rbxassetid://116596516604245",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/PalmBark_Detail.tga": "rbxassetid://91749558543662",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/PalmBark_Detail_Normal.tga": "rbxassetid://122927266076852",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/PalmBark_Normal.tga": "rbxassetid://107033081902556",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/PalmFrond.tga": "rbxassetid://91808174705297",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/PalmFrond_Normal.tga": "rbxassetid://126389601313142",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/PalmFrond_Spec.tga": "rbxassetid://80423588870650",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/Palm_Desktop_Atlas.tga": "rbxassetid://121835261532626",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/Palm_Desktop_Atlas_Billboards.tga": "rbxassetid://71418286419245",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/Palm_Desktop_Atlas_Billboards_Normal.tga": "rbxassetid://84709410903242",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/Palm_Desktop_Atlas_Normal.tga": "rbxassetid://119524866466894",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/Palm_Desktop_Atlas_Specular.tga": "rbxassetid://108689922016078",
+    "Assets/Standard Assets/Environment/SpeedTree/Palm/Thumb_Palm_Desktop.jpg": "rbxassetid://140649974799593",
+    "Assets/Standard Assets/Environment/TerrainAssets/BillboardTextures/GrassFrond01AlbedoAlpha.psd": "rbxassetid://98551377696455",
+    "Assets/Standard Assets/Environment/TerrainAssets/BillboardTextures/GrassFrond02AlbedoAlpha.psd": "rbxassetid://87853401357658",
+    "Assets/Standard Assets/Environment/TerrainAssets/SurfaceTextures/CliffAlbedoSpecular.psd": "rbxassetid://88717357284595",
+    "Assets/Standard Assets/Environment/TerrainAssets/SurfaceTextures/GrassHillAlbedo.psd": "rbxassetid://134132578619678",
+    "Assets/Standard Assets/Environment/TerrainAssets/SurfaceTextures/GrassRockyAlbedo.psd": "rbxassetid://111819457655157",
+    "Assets/Standard Assets/Environment/TerrainAssets/SurfaceTextures/MudRockyAlbedoSpecular.bmp": "rbxassetid://98578186267526",
+    "Assets/Standard Assets/Environment/TerrainAssets/SurfaceTextures/MudRockyNormals.bmp": "rbxassetid://119993517473230",
+    "Assets/Standard Assets/Environment/TerrainAssets/SurfaceTextures/SandAlbedo.psd": "rbxassetid://116176480012767",
+    "Assets/Standard Assets/Environment/Water (Basic)/Models/WaterBasicPlane.fbx": "rbxassetid://130040951400076",
+    "Assets/Standard Assets/Environment/Water (Basic)/Textures/WaterBasicDaytimeGradient.psd": "rbxassetid://93059647498526",
+    "Assets/Standard Assets/Environment/Water (Basic)/Textures/WaterBasicNighttimeGradient.psd": "rbxassetid://107349828978241",
+    "Assets/Standard Assets/Environment/Water (Basic)/Textures/WaterBasicNormals.jpg": "rbxassetid://128611189270978",
+    "Assets/Standard Assets/Environment/Water/Water/Models/WaterPlane.fbx": "rbxassetid://86733594516787",
+    "Assets/Standard Assets/Environment/Water/Water/Textures/WaterBump.jpg": "rbxassetid://130939541936027",
+    "Assets/Standard Assets/Environment/Water/Water/Textures/WaterFresnel.psd": "rbxassetid://93246550534290",
+    "Assets/Standard Assets/Environment/Water/Water/Textures/WaterProDaytimeGradient.psd": "rbxassetid://100827085371669",
+    "Assets/Standard Assets/Environment/Water/Water/Textures/WaterProNighttimeGradient.psd": "rbxassetid://116164925942119",
+    "Assets/Standard Assets/Environment/Water/Water4/Models/OceanPlane.FBX": "rbxassetid://138231200538546",
+    "Assets/Standard Assets/Environment/Water/Water4/Textures/SimpleFoam.png": "rbxassetid://127394646662099",
+    "Assets/Standard Assets/Environment/Water/Water4/Textures/SmallWaves.png": "rbxassetid://112208272043348",
+    "Assets/Standard Assets/ParticleSystems/Textures/ParticleBokeh.png": "rbxassetid://132787119406990",
+    "Assets/Standard Assets/ParticleSystems/Textures/ParticleCloudBlack.png": "rbxassetid://113190532120432",
+    "Assets/Standard Assets/ParticleSystems/Textures/ParticleCloudWhite.png": "rbxassetid://115438882168170",
+    "Assets/Standard Assets/ParticleSystems/Textures/ParticleFireballSheet.png": "rbxassetid://120649360447221",
+    "Assets/Standard Assets/ParticleSystems/Textures/ParticleFirecloud.png": "rbxassetid://92360522650923",
+    "Assets/Standard Assets/ParticleSystems/Textures/ParticleFlameLickSheet.png": "rbxassetid://74181617315421",
+    "Assets/Standard Assets/ParticleSystems/Textures/ParticleFlamesSheet.png": "rbxassetid://119370349881915",
+    "Assets/Standard Assets/ParticleSystems/Textures/ParticleFlare.png": "rbxassetid://78784286424858",
+    "Assets/Standard Assets/ParticleSystems/Textures/Spark.png": "rbxassetid://117447694196152",
+    "Assets/Standard Assets/ParticleSystems/Textures/SplashesFineParticle.png": "rbxassetid://103158869082237",
+    "Assets/Standard Assets/ParticleSystems/Textures/SplashesLargeParticle.png": "rbxassetid://103938889836018",
+    "Assets/Textures/esc.png": "rbxassetid://72198044890462",
+    "Assets/Textures/lmb.png": "rbxassetid://79810485403324",
+    "Assets/Textures/prop_keycard_nrm.tif": "rbxassetid://122936796754109",
+    "Assets/Textures/space.png": "rbxassetid://81477195505393",
+    "Assets/Textures/wasd.png": "rbxassetid://134564056065954"
+  }
+}

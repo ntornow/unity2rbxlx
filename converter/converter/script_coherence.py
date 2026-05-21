@@ -306,6 +306,16 @@ def fix_require_classifications(
     # also be a LocalScript (otherwise B's LocalPlayer calls will be nil).
     fixes += _propagate_client_classification(scripts, script_by_name)
 
+    # Pass 4.5: Detect which scripts genuinely need a BasePart parent at
+    # runtime (read .Position/.CFrame/.Touched/etc. off script.Parent).
+    # Sets RbxScript.requires_part_parent — a first-class field consumed
+    # downstream by pipeline._disable_unbound_scripts (gates the BasePart
+    # guard on this contract, replacing the blanket regex that silently
+    # disabled LocalScripts routed to PlayerScripts). Runs after pass 3
+    # (script type finalized) so the detected requirement matches the
+    # script_type that pipeline will guard against.
+    fixes += _detect_part_parent_requirement(scripts)
+
     # Pass 5: Guard script.Parent access in reclassified ModuleScripts.
     # When a script is reclassified to ModuleScript and moved to ReplicatedStorage,
     # script.Parent becomes ReplicatedStorage (not the original game object).
@@ -449,48 +459,132 @@ def _fix_client_server_classification(scripts: list[RbxScript]) -> int:
     return fixes
 
 
+# BasePart-only properties / events. If a script reads any of these off
+# ``script.Parent`` (or an alias rooted there), its parent MUST be a
+# BasePart at runtime — otherwise the access errors. ``.FindFirstChild``,
+# ``:WaitForChild``, ``:GetChildren`` etc. work on any Instance and are
+# explicitly NOT in this set; those are the defensive lookups that the
+# old regex-based guard misclassified, silently disabling LocalScripts
+# routed to PlayerScripts (where ``script.Parent`` is PlayerScripts,
+# never a BasePart).
+_PART_ONLY_PROPS: tuple[str, ...] = (
+    ".Position",
+    ".CFrame",
+    ".Size",
+    ".Orientation",
+    ".Rotation",
+    ".Velocity",
+    ".AssemblyLinearVelocity",
+    ".AssemblyAngularVelocity",
+    ".Anchored",
+    ".CanCollide",
+    ".CanTouch",
+    ".CanQuery",
+    ".Massless",
+    ".Touched:",
+    ".TouchEnded:",
+    ".Material",
+    ".Transparency",
+    ".Reflectance",
+    ".Color",
+    ".BrickColor",
+)
+
+
+def _detect_part_parent_requirement(scripts: list[RbxScript]) -> int:
+    """Set ``RbxScript.requires_part_parent`` for scripts that actually
+    read BasePart-only properties off ``script.Parent`` (or an alias).
+
+    Replaces the regex-based guess in ``pipeline._disable_unbound_scripts``
+    with a single semantic analysis run once during coherence. Stored as
+    first-class data on ``RbxScript`` so the storage classifier, the
+    binder, and the unbound-script gate all share the same answer.
+
+    Alias tracking follows the existing pattern in
+    :func:`_guard_script_parent_access`: any ``local NAME = script.Parent``
+    declaration adds ``NAME`` to the alias set, and subsequent property
+    reads off ``NAME.X`` are treated as ``script.Parent.X`` reads.
+
+    Returns the number of scripts that ended up flagged. A return value
+    of 0 is normal for projects with no part-bound MonoBehaviour scripts
+    (pure-UI or pure-LocalScript projects).
+    """
+    flagged = 0
+    for s in scripts:
+        if s.requires_part_parent:
+            continue  # Already flagged on a prior pass; idempotent.
+
+        aliases: set[str] = set()
+        needs_part = False
+
+        for line in s.source.split("\n"):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("--"):
+                continue
+            # Record aliases. `local part = script.Parent` and `local p, q
+            # = script.Parent, something` are the common shapes; the regex
+            # below catches the simple form which covers >95% of cases.
+            alias_m = re.match(r"local\s+(\w+)\s*=\s*script\.Parent\b", stripped)
+            if alias_m:
+                aliases.add(alias_m.group(1))
+            # Check whether this line reads a Part-only property off
+            # script.Parent or any known alias.
+            candidates = ("script.Parent",) + tuple(aliases)
+            for name in candidates:
+                if name not in stripped:
+                    continue
+                for prop in _PART_ONLY_PROPS:
+                    if (name + prop) in stripped:
+                        needs_part = True
+                        break
+                if needs_part:
+                    break
+            if needs_part:
+                break
+
+        if needs_part:
+            s.requires_part_parent = True
+            flagged += 1
+            log.debug("[coherence] requires_part_parent=True: %s", s.name)
+
+    if flagged:
+        log.info(
+            "[coherence] %d script(s) flagged requires_part_parent — "
+            "their guard / routing decisions will respect this contract.",
+            flagged,
+        )
+    return flagged
+
+
 def _guard_script_parent_access(scripts: list[RbxScript]) -> int:
-    """Add early-return guard to ModuleScripts that use script.Parent for runtime access.
+    """Add early-return guard to ModuleScripts whose Part-parent contract
+    can't be honored when they get hoisted into ReplicatedStorage.
 
-    When a script is reclassified to ModuleScript in ReplicatedStorage,
-    script.Parent is ReplicatedStorage (not a game object). Code that accesses
-    .CFrame, .Position, .Size, .Touched etc. on script.Parent will crash.
+    When a script is reclassified to ModuleScript and routed to
+    ``ReplicatedStorage``, ``script.Parent`` is the service itself
+    (not a game object). Reading ``.CFrame``, ``.Position``, ``.Size``,
+    ``.Touched``, ``.Material``, ``.Anchored`` etc. off it then errors
+    at runtime.
 
-    This injects a guard after the module table declaration that returns early
-    if script.Parent is not a BasePart/Model/Folder.
+    Consumes :attr:`RbxScript.requires_part_parent` (set by
+    :func:`_detect_part_parent_requirement` upstream in the coherence
+    sequence) as the single source of truth for "does this script
+    actually depend on a BasePart parent". A previous implementation
+    duplicated that detection here with a narrower property list and
+    silently drifted from the upstream gate — a ModuleScript reading
+    e.g. ``.Transparency`` or ``.Material`` got flagged by the upstream
+    pass but missed by this one, so it shipped unguarded and crashed
+    in ReplicatedStorage. Sharing the field eliminates that drift.
     """
     fixes = 0
-    _RUNTIME_PROPS = ['.Position', '.CFrame', '.Size', '.Orientation',
-                      '.Touched:', '.Anchored']
 
     for s in scripts:
         if s.script_type != "ModuleScript":
             continue
+        if not s.requires_part_parent:
+            continue
         if '-- Guard: skip runtime' in s.source:
             continue  # Already guarded
-
-        # Check for script.Parent or alias usage with runtime properties
-        has_runtime = False
-        aliases = set()
-        for line in s.source.split('\n'):
-            stripped = line.strip()
-            if stripped.startswith('--'):
-                continue
-            # Track aliases: `local part = script.Parent`
-            m = re.match(r'local\s+(\w+)\s*=\s*script\.Parent\b', stripped)
-            if m:
-                aliases.add(m.group(1))
-            # Check for runtime property access at module scope
-            check_names = ['script.Parent'] + list(aliases)
-            for name in check_names:
-                if name in stripped and any(p in stripped for p in _RUNTIME_PROPS):
-                    has_runtime = True
-                    break
-            if has_runtime:
-                break
-
-        if not has_runtime:
-            continue
 
         # Find the module table declaration and insert guard after it
         module_m = re.search(r'^return\s+(\w+)\s*$', s.source, re.MULTILINE)
@@ -1038,7 +1132,7 @@ def _fix_clone_visibility(scripts: list[RbxScript]) -> int:
 
 
 def _remove_stale_player_requires(scripts: list[RbxScript]) -> int:
-    """Rewrite Player-as-module references when Player is actually a LocalScript.
+    r"""Rewrite Player-as-module references when Player is actually a LocalScript.
 
     When the AI transpiler emits something like:
 
@@ -1051,11 +1145,19 @@ def _remove_stale_player_requires(scripts: list[RbxScript]) -> int:
     invalid argument(s)" at runtime, killing the whole script).
 
     Strategy: redirect the binding to ``Players.LocalPlayer:WaitForChild
-    ("PlayerScripts"):WaitForChild("Player")`` (NOT ``script.Parent`` —
-    pipeline.write_output's BasePart-guard heuristic regexes
-    ``local \w+ = script.Parent\b`` and would prepend an early-exit guard
-    to any script whose parent is StarterPlayerScripts). Then stub out
+    ("PlayerScripts"):WaitForChild("Player")``. Then stub out
     ``require(NAME)`` since LocalScripts cannot be required.
+
+    Historical note: the verbose ``Players.LocalPlayer.PlayerScripts``
+    path used to exist specifically to dodge the regex in
+    ``pipeline._disable_unbound_scripts`` that matched
+    ``local \w+ = script.Parent\b`` and silently added a BasePart guard
+    to LocalScripts routed to PlayerScripts. That guard is now gated on
+    :attr:`RbxScript.requires_part_parent` (Phase 2 of the Option D
+    refactor on 2026-05-21), so ``script.Parent:WaitForChild("Player")``
+    would now work just as well. The verbose form is preserved for
+    output stability — existing test fixtures and project conversions
+    expect this exact shape, and the runtime behavior is identical.
 
     Restricted to LocalScripts only — server-side code has no LocalPlayer.
     """
@@ -1111,12 +1213,9 @@ def _remove_stale_player_requires(scripts: list[RbxScript]) -> int:
             indent = bind_match.group("indent")
             # Redirect the binding to the actual LocalScript location at runtime.
             # Use the LocalPlayer.PlayerScripts path (works for any sibling
-            # LocalScript) rather than `script.Parent`, because `script.Parent`
-            # accesses trigger the BasePart-parent-guard heuristic in
-            # pipeline.write_output (`local \w+ = script.Parent\b` matches any
-            # script.Parent alias and adds an `if not script.Parent:IsA("BasePart")
-            # then return end` prelude that would early-exit a client script
-            # whose parent is StarterPlayerScripts).
+            # LocalScript). See the docstring's historical note — under
+            # Option D Phase 2 ``script.Parent`` would also be safe here,
+            # but the verbose form is preserved for output stability.
             s.source = re.sub(
                 r'^\s*local\s+\w+\s*=\s*[^\n]*:WaitForChild\(\s*["\']Player["\']\s*\)[^\n]*$',
                 f'{indent}local {varname} = game:GetService("Players").LocalPlayer:WaitForChild("PlayerScripts"):WaitForChild("Player")',

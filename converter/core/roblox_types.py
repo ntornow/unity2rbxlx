@@ -81,6 +81,37 @@ class RbxScript:
     # ...). ``None`` for scripts injected in-memory after rehydration (e.g.
     # bootstrap, FPS controller).
     source_path: str | None = None
+    # True when the script's body genuinely reads BasePart-only properties
+    # off ``script.Parent`` (or an alias) — ``.Position``, ``.CFrame``,
+    # ``.Touched``, ``.AssemblyLinearVelocity``, ``.Anchored``, ``.Size``,
+    # ``.Orientation``, ``.Material``, ``.Transparency``, etc.; full list
+    # in ``converter.script_coherence._PART_ONLY_PROPS``. Computed once by
+    # ``converter.script_coherence._detect_part_parent_requirement`` during
+    # the coherence pass, before storage classification + binding.
+    #
+    # Current consumers (not yet exhaustive):
+    #   * ``script_coherence._guard_script_parent_access`` — injects a
+    #     ``script.Parent:IsA("BasePart") or :IsA("Model") or :IsA("Folder")``
+    #     early-return into flagged ModuleScripts that get hoisted into
+    #     ReplicatedStorage.
+    #   * ``pipeline._disable_unbound_scripts`` — gates the catch-all
+    #     ``if not script.Parent:IsA("BasePart") then return end`` guard
+    #     on this field. Without the field, the guard's regex matched
+    #     defensive ``script.Parent:FindFirstChild`` lookups and silently
+    #     disabled LocalScripts routed to PlayerScripts (where
+    #     ``script.Parent`` is PlayerScripts, never a BasePart).
+    #
+    # NOT yet consumed by ``storage_classifier`` — that's a future
+    # refinement (e.g. refuse to route a flagged script to
+    # StarterPlayerScripts; bind it to a Part first, or surface a
+    # build-time misroute warning).
+    #
+    # ``False`` is the safe default — defensive ``:FindFirstChild`` /
+    # ``:WaitForChild`` access works on any Instance and shouldn't
+    # trigger the BasePart guard. Over-flagging (false positives) is
+    # safer than under-flagging — it just preserves the historical
+    # guard behavior for more scripts.
+    requires_part_parent: bool = False
 
 
 @dataclass

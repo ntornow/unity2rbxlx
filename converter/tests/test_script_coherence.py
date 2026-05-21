@@ -1057,3 +1057,167 @@ class TestExposeLocalScriptEventsShimBlocked:
         _expose_local_script_events([producer, consumer])
         # OtherModule isn't a known producer's shim -> consumer untouched.
         assert "OtherModule.HealthUpdate:Connect(" in consumer.source
+
+
+# ---------------------------------------------------------------------------
+# requires_part_parent detection
+# ---------------------------------------------------------------------------
+
+from converter.script_coherence import _detect_part_parent_requirement  # noqa: E402
+
+
+class TestDetectPartParentRequirement:
+    """Set RbxScript.requires_part_parent only when a script genuinely
+    reads BasePart-only properties off script.Parent (or an alias).
+
+    Replaces the regex-based guess in pipeline._disable_unbound_scripts
+    that misclassified defensive ``script.Parent:FindFirstChild(...)``
+    calls as BasePart requirements, silently disabling LocalScripts
+    routed to PlayerScripts (where script.Parent is never a BasePart).
+    """
+
+    def test_position_access_flags_script(self):
+        s = RbxScript(
+            name="X",
+            source="print(script.Parent.Position)",
+            script_type="Script",
+        )
+        n = _detect_part_parent_requirement([s])
+        assert n == 1
+        assert s.requires_part_parent is True
+
+    def test_cframe_access_flags_script(self):
+        s = RbxScript(
+            name="X", source="local c = script.Parent.CFrame", script_type="Script",
+        )
+        _detect_part_parent_requirement([s])
+        assert s.requires_part_parent is True
+
+    def test_touched_event_flags_script(self):
+        s = RbxScript(
+            name="X",
+            source='script.Parent.Touched:Connect(function() end)',
+            script_type="Script",
+        )
+        _detect_part_parent_requirement([s])
+        assert s.requires_part_parent is True
+
+    def test_anchored_flag_flags_script(self):
+        s = RbxScript(
+            name="X",
+            source="script.Parent.Anchored = true",
+            script_type="Script",
+        )
+        _detect_part_parent_requirement([s])
+        assert s.requires_part_parent is True
+
+    def test_alias_to_position_flags_script(self):
+        s = RbxScript(
+            name="X",
+            source=(
+                "local part = script.Parent\n"
+                "print(part.Position)\n"
+            ),
+            script_type="Script",
+        )
+        _detect_part_parent_requirement([s])
+        assert s.requires_part_parent is True
+
+    def test_findfirstchild_alone_does_NOT_flag(self):
+        """The regression case: ``script.Parent:FindFirstChild(...)``
+        is generic Roblox — works on PlayerScripts, ReplicatedStorage,
+        ServerScriptService etc. Should not trip the BasePart guard."""
+        s = RbxScript(
+            name="Player",
+            source=(
+                "local sound = script.Parent:FindFirstChild('ShootSound')\n"
+                "if sound then sound:Play() end\n"
+            ),
+            script_type="LocalScript",
+        )
+        _detect_part_parent_requirement([s])
+        assert s.requires_part_parent is False
+
+    def test_alias_alone_does_NOT_flag(self):
+        """``local part = script.Parent`` alone proves nothing — the
+        alias might be used only for child lookups, not Part property
+        reads. The detector requires actual Part-property access."""
+        s = RbxScript(
+            name="X",
+            source=(
+                "local part = script.Parent\n"
+                "local child = part:WaitForChild('Foo')\n"
+                "print(child.Name)\n"
+            ),
+            script_type="Script",
+        )
+        _detect_part_parent_requirement([s])
+        assert s.requires_part_parent is False
+
+    def test_waitforchild_does_NOT_flag(self):
+        s = RbxScript(
+            name="X",
+            source='local x = script.Parent:WaitForChild("Foo")',
+            script_type="Script",
+        )
+        _detect_part_parent_requirement([s])
+        assert s.requires_part_parent is False
+
+    def test_comment_with_position_does_NOT_flag(self):
+        s = RbxScript(
+            name="X",
+            source=(
+                "-- script.Parent.Position is set elsewhere\n"
+                "print('hi')\n"
+            ),
+            script_type="Script",
+        )
+        _detect_part_parent_requirement([s])
+        assert s.requires_part_parent is False
+
+    def test_idempotent_on_already_flagged(self):
+        s = RbxScript(
+            name="X",
+            source="print(script.Parent.Position)",
+            script_type="Script",
+            requires_part_parent=True,
+        )
+        # Should still return False additions (no new flags).
+        n = _detect_part_parent_requirement([s])
+        assert n == 0
+        assert s.requires_part_parent is True
+
+    def test_module_script_with_runtime_access_flagged(self):
+        """ModuleScripts that read Part properties off script.Parent are
+        flagged just like Scripts — the field is type-agnostic. The
+        existing _guard_script_parent_access pass injects a runtime
+        guard for these; the field is the data feed."""
+        s = RbxScript(
+            name="X",
+            source=(
+                "local M = {}\n"
+                "function M.start() print(script.Parent.CFrame) end\n"
+                "return M\n"
+            ),
+            script_type="ModuleScript",
+        )
+        _detect_part_parent_requirement([s])
+        assert s.requires_part_parent is True
+
+    def test_mixed_batch_flags_only_the_part_ones(self):
+        scripts = [
+            RbxScript(name="A", source="print(script.Parent.Position)",
+                      script_type="Script"),
+            RbxScript(name="B", source="print('plain')", script_type="Script"),
+            RbxScript(name="C", source="script.Parent:FindFirstChild('X')",
+                      script_type="LocalScript"),
+            RbxScript(name="D",
+                      source="local p = script.Parent\np.Anchored = false",
+                      script_type="Script"),
+        ]
+        n = _detect_part_parent_requirement(scripts)
+        assert n == 2
+        assert scripts[0].requires_part_parent is True
+        assert scripts[1].requires_part_parent is False
+        assert scripts[2].requires_part_parent is False
+        assert scripts[3].requires_part_parent is True
