@@ -2234,6 +2234,7 @@ return table.concat(allData, "\\n")'''
         "_subphase_encode_terrain",
         "_subphase_inject_mesh_loader",
         "_subphase_patch_setup_sounds",
+        "_subphase_inject_test_seams",
         "_subphase_finalize_scripts_to_disk",
     )
     """Order in which write_output() invokes its subphases.
@@ -2312,6 +2313,8 @@ return table.concat(allData, "\\n")'''
         self._subphase_inject_mesh_loader()
 
         self._subphase_patch_setup_sounds()
+
+        self._subphase_inject_test_seams()
 
         # Semantic post-transpile validator. Catches the class of bugs
         # that pass Luau syntax but break at runtime in Roblox-specific
@@ -3151,6 +3154,35 @@ script.Disabled = true
                     "setupSounds(character)",
                     "setupSounds(character)\n    -- Also search bound Part for sounds from MonoBehaviour fields\n    if script.Parent and script.Parent:IsA(\"BasePart\") then\n        setupSounds(script.Parent)\n    end",
                 )
+
+    def _subphase_inject_test_seams(self) -> None:
+        """Inject Luau test seams into emitted scripts.
+
+        Currently a single seam: the ``_getMouseDelta()`` indirection
+        that lets offline Studio-driven tests stuff a one-shot mouse
+        delta via ``_G._mockMouseDelta``. UserInputService is a locked
+        Instance whose service methods cannot be monkey-patched from
+        Luau, and the MCP plugin's synthesized mouse-motion events
+        carry zero Delta, so this is the only way to exercise the
+        camera-yaw poll loop from an automated test. The injector is a
+        no-op for any script that doesn't call ``GetMouseDelta()`` and
+        is idempotent within a single conversion.
+
+        Runs after ``_subphase_inject_autogen_scripts`` so both
+        transpiled scripts (e.g. SimpleFPS Player.luau) AND the
+        autogen FPS scaffolding from ``converter/scaffolding/fps.py``
+        get the seam.
+        """
+        from converter.test_seam_injector import inject_test_seams
+
+        all_scripts = self._collect_all_scripts()
+        changed = inject_test_seams(all_scripts)
+        if changed:
+            log.info(
+                "[write_output] test-seam injector rewrote %d script(s) "
+                "with _getMouseDelta() indirection",
+                changed,
+            )
 
     def _collect_all_scripts(self) -> list:
         """Return every script reachable from ``rbx_place`` for

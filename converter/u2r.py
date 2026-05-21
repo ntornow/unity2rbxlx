@@ -1075,6 +1075,110 @@ def resolve(output_dir: str) -> None:
     click.echo(f"  5. Re-run: python u2r.py convert <project> -o {output_dir} --phase convert_scene")
 
 
+@main.command("snapshot-ids")
+@click.argument("output_dir", type=click.Path(exists=True))
+@click.option("--out", "-o", type=click.Path(), required=True,
+              help="Path to write the snapshot JSON.")
+@click.option("--project-name", type=str, default=None,
+              help="Project label baked into the snapshot for traceability "
+                   "(default: output_dir basename).")
+def snapshot_ids(output_dir: str, out: str, project_name: str | None) -> None:
+    """Snapshot uploaded asset IDs + mesh resolutions from a prior conversion.
+
+    Reads ``conversion_context.json`` and ``.roblox_ids.json`` from a real
+    converted ``output_dir`` and writes a compact JSON fixture suitable for
+    seeding offline-assembly tests. The snapshot lets a test rebuild the
+    place file against real Roblox asset IDs without touching Open Cloud.
+
+    No secrets are written — uploaded_assets values are public ``rbxassetid://``
+    strings and the universe/place IDs are already public after a place is
+    created. Safe to commit to version control.
+    """
+    import json
+    from datetime import datetime, timezone
+
+    src = Path(output_dir)
+    ctx_path = src / "conversion_context.json"
+    if not ctx_path.exists():
+        click.echo(f"Error: {ctx_path} not found. Snapshot requires a prior "
+                   f"conversion to seed from.", err=True)
+        sys.exit(1)
+
+    ctx = json.loads(ctx_path.read_text())
+    uploaded = ctx.get("uploaded_assets", {}) or {}
+    mesh_sizes = ctx.get("mesh_native_sizes", {}) or {}
+    mesh_hier = ctx.get("mesh_hierarchies", {}) or {}
+    # Moderation rejections and other intentional skips look like
+    # "<relative path> (<reason>)" in ctx.asset_upload_errors. The
+    # offline-assembly drift gate must know which manifest assets were
+    # legitimately skipped so it doesn't flag them as snapshot drift.
+    upload_errors = list(ctx.get("asset_upload_errors", []) or [])
+
+    if not uploaded:
+        click.echo(f"Error: {ctx_path} has no uploaded_assets — this output "
+                   f"was produced with --no-upload. Nothing to snapshot.",
+                   err=True)
+        sys.exit(1)
+
+    # Universe/place IDs live in the shared id_cache. Prefer the cache file
+    # over ctx fields because the cache is the canonical store (ctx fields
+    # are populated from it on resume).
+    from roblox.id_cache import read_ids
+    universe_id, place_id = read_ids(src)
+    if not universe_id:
+        universe_id = ctx.get("universe_id")
+    if not place_id:
+        place_id = ctx.get("place_id")
+
+    # Bake the Unity project path the snapshot was captured from so the
+    # offline-assembly test can locate the same source without forcing the
+    # user to set a project-specific env var. Falls back to the empty
+    # string when the source ctx didn't record one (very old conversions).
+    unity_project_path = ctx.get("unity_project_path", "")
+
+    snapshot = {
+        "_meta": {
+            "project_name": project_name or src.name,
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "source_output_dir": str(src.resolve()),
+            "source_unity_project": unity_project_path,
+            "schema_version": 1,
+        },
+        "universe_id": universe_id,
+        "place_id": place_id,
+        "uploaded_assets": uploaded,
+        "mesh_native_sizes": mesh_sizes,
+        "mesh_hierarchies": mesh_hier,
+        "asset_upload_errors": upload_errors,
+    }
+
+    out_path = Path(out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(
+        json.dumps(snapshot, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    # Summary so the caller can sanity-check before committing the file
+    mesh_keys = [k for k in uploaded
+                 if k.lower().endswith((".fbx", ".obj")) or "#" in k]
+    tex_keys = [k for k in uploaded
+                if k.lower().endswith((".png", ".jpg", ".jpeg", ".bmp",
+                                       ".tga", ".tif", ".tiff", ".psd"))]
+    audio_keys = [k for k in uploaded
+                  if k.lower().endswith((".mp3", ".ogg", ".wav", ".flac"))]
+
+    click.echo(f"Snapshot written: {out_path}")
+    click.echo(f"  uploaded_assets: {len(uploaded)} "
+               f"({len(mesh_keys)} meshes, {len(tex_keys)} textures, "
+               f"{len(audio_keys)} audio)")
+    click.echo(f"  mesh_native_sizes: {len(mesh_sizes)}")
+    click.echo(f"  mesh_hierarchies: {len(mesh_hier)}")
+    click.echo(f"  asset_upload_errors: {len(upload_errors)}")
+    click.echo(f"  universe/place: {universe_id}/{place_id}")
+    click.echo(f"  size: {out_path.stat().st_size:,} bytes")
+
+
 @main.command()
 @click.argument("unity_project", type=click.Path(exists=True))
 @click.option("--output", "-o", type=click.Path(), default="./output")

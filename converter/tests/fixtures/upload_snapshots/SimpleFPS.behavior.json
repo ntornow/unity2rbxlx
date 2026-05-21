@@ -1,0 +1,189 @@
+{
+  "_schema": {
+    "version": 1,
+    "doc": "Behavior fixtures consumed by tests/test_studio_behavior.py. Each fixture runs in a Roblox Studio Play session against the assembled converted_place.rbxlx. The harness wraps setup_luau and assert_luau with a preamble that defines plr, char, hrp, hum, cam, _G._state (a table persistent across execute_luau calls), and _findVisible (helper that returns the first non-transparent BasePart in a Model — avoids picking up the invisible PickupTouchDetector trigger that SimpleFPS attaches to pickup roots).",
+    "preamble": "local Players = game:GetService('Players'); local plr = Players.LocalPlayer; local char = plr.Character or plr.CharacterAdded:Wait(); local hrp = char:WaitForChild('HumanoidRootPart'); local hum = char:WaitForChild('Humanoid'); local cam = workspace.CurrentCamera; _G._state = _G._state or {}; local function _findVisible(model) if not model then return nil end; if model:IsA('BasePart') then return model end; if model.PrimaryPart and model.PrimaryPart.Transparency < 0.99 then return model.PrimaryPart end; for _, c in ipairs(model:GetDescendants()) do if c:IsA('BasePart') and c.Transparency < 0.99 then return c end end; return model:FindFirstChildWhichIsA('BasePart', true) end",
+    "input_sequence_kinds": {
+      "keyboard": "{action: 'keyDown'|'keyUp'|'keyPress', key_code: <Roblox KeyCode name>, wait_time_ms?: number}",
+      "mouse_move": "moveTo via mcp__Roblox_Studio__user_mouse_input — note that Delta is reported as (0,0), so cannot drive GetMouseDelta polling; use _G._mockMouseDelta instead via setup_luau",
+      "mouse_click": "left/right click via mcp__Roblox_Studio__user_mouse_input",
+      "mock_mouse_delta": "stuff a one-shot Vector2 into _G._mockMouseDelta — consumed by the _getMouseDelta() test seam injected by converter/test_seam_injector.py"
+    },
+    "dry_run_notes_2026_05_21": "All 1, 2a-d, 4a, 4b, 5 pass cleanly. 6 pickup sets hasRifle=true but the converter doesn't currently spawn a viewmodel (no Rifle Model under character, no camera-attached mount) — fixture asserts gameplay state only. 7-9 deferred from dry-run because they damage/kill the character."
+  },
+  "fixtures": [
+    {
+      "id": "spawn_lands_on_walkable_floor",
+      "feature": "1. After spawn, I do not drop in the water — stay on the dock.",
+      "play_mode": true,
+      "wait_seconds": 3.0,
+      "assert_luau": "return hum.Health > 0 and hum.FloorMaterial ~= Enum.Material.Air and hum.FloorMaterial ~= Enum.Material.Water",
+      "expect": true,
+      "evidence_on_fail": ["screen_capture", "console_tail"]
+    },
+    {
+      "id": "wasd_w_moves_forward",
+      "feature": "2. The W key moves the player forward (camera-relative).",
+      "play_mode": true,
+      "setup_luau": "_G._state.p0 = hrp.Position; _G._state.fwd = cam.CFrame.LookVector",
+      "input_sequence": [
+        { "kind": "keyboard", "key_code": "W", "action": "keyDown" },
+        { "kind": "keyboard", "action": "wait", "wait_time_ms": 1000 },
+        { "kind": "keyboard", "key_code": "W", "action": "keyUp" }
+      ],
+      "wait_seconds": 0.3,
+      "assert_luau": "local d = hrp.Position - _G._state.p0; return d:Dot(_G._state.fwd) > 2",
+      "expect": true
+    },
+    {
+      "id": "wasd_s_moves_backward",
+      "feature": "2. The S key moves the player backward.",
+      "play_mode": true,
+      "setup_luau": "_G._state.p0 = hrp.Position; _G._state.back = -cam.CFrame.LookVector",
+      "input_sequence": [
+        { "kind": "keyboard", "key_code": "S", "action": "keyDown" },
+        { "kind": "keyboard", "action": "wait", "wait_time_ms": 1000 },
+        { "kind": "keyboard", "key_code": "S", "action": "keyUp" }
+      ],
+      "wait_seconds": 0.3,
+      "assert_luau": "local d = hrp.Position - _G._state.p0; return d:Dot(_G._state.back) > 2",
+      "expect": true
+    },
+    {
+      "id": "wasd_a_strafes_left",
+      "feature": "2. The A key strafes left.",
+      "play_mode": true,
+      "setup_luau": "_G._state.p0 = hrp.Position; _G._state.left = -cam.CFrame.RightVector",
+      "input_sequence": [
+        { "kind": "keyboard", "key_code": "A", "action": "keyDown" },
+        { "kind": "keyboard", "action": "wait", "wait_time_ms": 1000 },
+        { "kind": "keyboard", "key_code": "A", "action": "keyUp" }
+      ],
+      "wait_seconds": 0.3,
+      "assert_luau": "local d = hrp.Position - _G._state.p0; return d:Dot(_G._state.left) > 2",
+      "expect": true
+    },
+    {
+      "id": "wasd_d_strafes_right",
+      "feature": "2. The D key strafes right.",
+      "play_mode": true,
+      "setup_luau": "_G._state.p0 = hrp.Position; _G._state.right = cam.CFrame.RightVector",
+      "input_sequence": [
+        { "kind": "keyboard", "key_code": "D", "action": "keyDown" },
+        { "kind": "keyboard", "action": "wait", "wait_time_ms": 1000 },
+        { "kind": "keyboard", "key_code": "D", "action": "keyUp" }
+      ],
+      "wait_seconds": 0.3,
+      "assert_luau": "local d = hrp.Position - _G._state.p0; return d:Dot(_G._state.right) > 2",
+      "expect": true
+    },
+    {
+      "id": "mouse_yaw_rotates_camera",
+      "feature": "3. Mouse motion yaws the camera. Uses the _G._mockMouseDelta test seam — MCP-synthesized mouse motion carries Delta=(0,0) and UserInputService is a locked Instance, so this is the only way to exercise the camera-yaw poll. Requires the place file to have been assembled with the test seam (converter/test_seam_injector.py) injected.",
+      "play_mode": true,
+      "setup_luau": "_G._state.look0 = cam.CFrame.LookVector; _G._mockMouseDelta = Vector2.new(400, 0)",
+      "wait_seconds": 0.5,
+      "assert_luau": "local cos = math.clamp(cam.CFrame.LookVector:Dot(_G._state.look0), -1, 1); return math.deg(math.acos(cos)) > 3",
+      "expect": true
+    },
+    {
+      "id": "mouse_pitch_rotates_camera",
+      "feature": "3. Vertical mouse motion pitches the camera.",
+      "play_mode": true,
+      "setup_luau": "_G._state.look0 = cam.CFrame.LookVector; _G._mockMouseDelta = Vector2.new(0, 300)",
+      "wait_seconds": 0.5,
+      "assert_luau": "local cos = math.clamp(cam.CFrame.LookVector:Dot(_G._state.look0), -1, 1); return math.deg(math.acos(cos)) > 3",
+      "expect": true
+    },
+    {
+      "id": "cardkey_animates_in_place",
+      "feature": "4a. The card key has visible animation before pickup. The visible part is the 'Key' MeshPart under the KeyPickup model — _findVisible skips the invisible PickupTouchDetector trigger.",
+      "play_mode": true,
+      "setup_luau": "local k = workspace:FindFirstChild('KeyPickup', true); _G._state.p = _findVisible(k); _G._state.cf0 = _G._state.p and _G._state.p.CFrame",
+      "wait_seconds": 1.5,
+      "assert_luau": "if not _G._state.p then return false end; local moved = (_G._state.p.Position - _G._state.cf0.Position).Magnitude > 0.05; local rotated = (_G._state.p.CFrame.RightVector - _G._state.cf0.RightVector).Magnitude > 0.05; return moved or rotated",
+      "expect": true
+    },
+    {
+      "id": "walk_to_cardkey_picks_it_up",
+      "feature": "4b. Walking onto the card key picks it up. Pickup is signaled by char:GetAttribute('hasKey') == true (see Door.luau:83).",
+      "play_mode": true,
+      "setup_luau": "local k = workspace:FindFirstChild('KeyPickup', true); local touch = (k and (k:FindFirstChild('PickupTouchDetector') or _findVisible(k))); hrp.CFrame = CFrame.new(touch.Position + Vector3.new(0, 3, 0))",
+      "wait_seconds": 2.0,
+      "assert_luau": "return char:GetAttribute('hasKey') == true",
+      "expect": true
+    },
+    {
+      "id": "door_opens_with_key",
+      "feature": "5. With the card key held, walking up to the nearest door opens it. The nearest Door (by world distance) is selected dynamically — Beach.Door in the current SimpleFPS scene. The visible/animated child under the Door model is named 'door' (lowercase).",
+      "depends_on": ["walk_to_cardkey_picks_it_up"],
+      "play_mode": true,
+      "setup_luau": "local nearest, bestDist = nil, math.huge; for _, x in ipairs(workspace:GetDescendants()) do if x.Name == 'Door' and x:IsA('Model') then local pp = _findVisible(x); if pp then local d = (pp.Position - hrp.Position).Magnitude; if d < bestDist then nearest = x; bestDist = d end end end end; local door_mesh = nearest and (nearest:FindFirstChild('door') or _findVisible(nearest)); _G._state.p = door_mesh; _G._state.cf0 = door_mesh.CFrame; hrp.CFrame = CFrame.new(door_mesh.Position - door_mesh.CFrame.LookVector * 6 + Vector3.new(0, 2, 0))",
+      "wait_seconds": 2.5,
+      "assert_luau": "local p = _G._state.p; if p:GetAttribute('open') == true then return true end; local dPos = (p.Position - _G._state.cf0.Position).Magnitude; local dRot = (p.CFrame.LookVector - _G._state.cf0.LookVector).Magnitude; return dPos > 1 or dRot > 0.2",
+      "expect": true
+    },
+    {
+      "id": "rifle_picked_up_sets_hasRifle",
+      "feature": "6a. Walking onto the rifle pickup sets char:GetAttribute('hasRifle') == true. The converter currently does NOT spawn a viewmodel under the character or camera — that's a separate gap tracked in docs/UNSUPPORTED.md. This fixture asserts the gameplay-state outcome only.",
+      "play_mode": true,
+      "setup_luau": "local r = workspace:FindFirstChild('RiflePickup', true); local touch = r and (r:FindFirstChild('PickupTouchDetector') or _findVisible(r)); hrp.CFrame = CFrame.new(touch.Position + Vector3.new(0, 3, 0))",
+      "wait_seconds": 2.0,
+      "assert_luau": "return char:GetAttribute('hasRifle') == true",
+      "expect": true
+    },
+    {
+      "id": "rifle_visible_in_viewport",
+      "feature": "6b. The rifle is visible in the player's field of view. SOFT-EXPECTED-FAIL today: no viewmodel exists in the current converted SimpleFPS output. When the converter adds a camera-attached viewmodel (or character-attached weapon model) this fixture should start passing without modification.",
+      "depends_on": ["rifle_picked_up_sets_hasRifle"],
+      "play_mode": true,
+      "wait_seconds": 0.5,
+      "assert_luau": "local r = char:FindFirstChild('Rifle', true) or char:FindFirstChild('FPS_Weapon_Mount', true) or cam:FindFirstChild('Rifle', true) or cam:FindFirstChild('Viewmodel', true); local tip = r and _findVisible(r); if not tip then return false end; local sp, on = cam:WorldToViewportPoint(tip.Position); return on and sp.Z > 0 and sp.X > 0 and sp.X < cam.ViewportSize.X and sp.Y > 0 and sp.Y < cam.ViewportSize.Y",
+      "expect": true
+    },
+    {
+      "id": "shoot_fires_remote_or_bullet",
+      "feature": "7a. Left click fires a bullet. Detection prioritizes the RemoteEvent path (Player.luau:343 _AutoDamageRemoteEventInjected fires per-shot) but also counts new Bullet parts in workspace as a fallback.",
+      "depends_on": ["rifle_picked_up_sets_hasRifle"],
+      "play_mode": true,
+      "setup_luau": "_G._state.shots = 0; _G._state.shotConns = _G._state.shotConns or {}; for _, c in ipairs(_G._state.shotConns) do c:Disconnect() end; _G._state.shotConns = {}; local RS = game:GetService('ReplicatedStorage'); for _, e in ipairs(RS:GetDescendants()) do if e:IsA('RemoteEvent') and e.Name:lower():match('fire') then table.insert(_G._state.shotConns, e.OnClientEvent:Connect(function() _G._state.shots = _G._state.shots + 1 end)) end end; _G._state.bulletsBefore = 0; for _, p in ipairs(workspace:GetDescendants()) do if p.Name:lower():match('bullet') then _G._state.bulletsBefore = _G._state.bulletsBefore + 1 end end",
+      "input_sequence": [
+        { "kind": "mouse_click", "button": "left" }
+      ],
+      "wait_seconds": 0.5,
+      "assert_luau": "if _G._state.shots > 0 then return true end; local n = 0; for _, p in ipairs(workspace:GetDescendants()) do if p.Name:lower():match('bullet') then n = n + 1 end end; return n > _G._state.bulletsBefore",
+      "expect": true
+    },
+    {
+      "id": "shoot_plays_sound",
+      "feature": "7b. Shooting plays a sound. Hooks the Played signal on every Sound whose name contains shoot/fire/rifle/gun before clicking, then counts plays.",
+      "depends_on": ["rifle_picked_up_sets_hasRifle"],
+      "play_mode": true,
+      "setup_luau": "_G._state.played = 0; _G._state.soundConns = _G._state.soundConns or {}; for _, c in ipairs(_G._state.soundConns) do c:Disconnect() end; _G._state.soundConns = {}; for _, s in ipairs(workspace:GetDescendants()) do if s:IsA('Sound') then local n = s.Name:lower(); if n:match('shoot') or n:match('fire') or n:match('rifle') or n:match('gun') then table.insert(_G._state.soundConns, s.Played:Connect(function() _G._state.played = _G._state.played + 1 end)) end end end",
+      "input_sequence": [
+        { "kind": "mouse_click", "button": "left" }
+      ],
+      "wait_seconds": 0.5,
+      "assert_luau": "return _G._state.played > 0",
+      "expect": true
+    },
+    {
+      "id": "mine_damages_player",
+      "feature": "8. Walking to a mine triggers damage. Accepts either health drop or character despawn (mine explosion can kill instantly).",
+      "play_mode": true,
+      "setup_luau": "_G._state.h0 = hum.Health; local m = workspace:FindFirstChild('Mine', true); local p = _findVisible(m); hrp.CFrame = CFrame.new(p.Position + Vector3.new(0, 3, 0))",
+      "wait_seconds": 3.0,
+      "assert_luau": "return (char.Parent == nil) or hum.Health < _G._state.h0",
+      "expect": true
+    },
+    {
+      "id": "turrets_target_and_damage_player",
+      "feature": "9. The turret pair identifies the player and damages them. Asserts (a) the turret has rotated to face the player AND (b) damage occurred. Picks the first Turret model in the scene — both turrets in the pair share the same Turret class so either suffices.",
+      "play_mode": true,
+      "setup_luau": "_G._state.h0 = hum.Health; local turrets = {}; for _, x in ipairs(workspace:GetDescendants()) do if x.Name == 'Turret' and x:IsA('Model') then table.insert(turrets, x) end end; _G._state.t = turrets[1]; local p = _findVisible(_G._state.t); hrp.CFrame = CFrame.new(p.Position + p.CFrame.LookVector * 18 + Vector3.new(0, 3, 0))",
+      "wait_seconds": 5.0,
+      "assert_luau": "local p = _findVisible(_G._state.t); local dirToMe = (hrp.Position - p.Position).Unit; local aimed = p.CFrame.LookVector:Dot(dirToMe) > 0.6; local damaged = (char.Parent == nil) or hum.Health < _G._state.h0; return aimed and damaged",
+      "expect": true
+    }
+  ]
+}

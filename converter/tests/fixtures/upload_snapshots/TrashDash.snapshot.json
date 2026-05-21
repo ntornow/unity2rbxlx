@@ -1,0 +1,4795 @@
+{
+  "_meta": {
+    "captured_at": "2026-05-21T03:26:29.253382+00:00",
+    "project_name": "TrashDash",
+    "schema_version": 1,
+    "source_output_dir": "/Users/jiazou/workspace/unity2rbxlx/converter/output/trash-dash-fresh-2026-05-18",
+    "source_unity_project": "/Users/jiazou/workspace/trash-dash"
+  },
+  "asset_upload_errors": [
+    "Assets/Animation/Cat_Death.fbx",
+    "Assets/Animation/Cat_Death2.fbx",
+    "Assets/Animation/Cat_Death3.fbx",
+    "Assets/Animation/Cat_Falling.fbx",
+    "Assets/Animation/Cat_ForbiddenDance.fbx",
+    "Assets/Animation/Cat_HappyDance.fbx",
+    "Assets/Animation/Cat_HitHighWall.fbx",
+    "Assets/Animation/Cat_HitWall1.fbx",
+    "Assets/Animation/Cat_Idle1.fbx",
+    "Assets/Animation/Cat_Idle2.fbx",
+    "Assets/Animation/Cat_Idle4.fbx",
+    "Assets/Animation/Cat_IdleHappy.fbx",
+    "Assets/Animation/Cat_IdleSad.fbx",
+    "Assets/Animation/Cat_Jump.fbx",
+    "Assets/Animation/Cat_RunLong.fbx",
+    "Assets/Animation/Cat_RunShort.fbx",
+    "Assets/Animation/Cat_RunShort2.fbx",
+    "Assets/Animation/Cat_Slide.fbx",
+    "Assets/Animation/Cat_Start.fbx",
+    "Assets/Animation/Dog_Death.fbx",
+    "Assets/Animation/Dog_Idle.fbx",
+    "Assets/Animation/Dog_Run.fbx",
+    "Assets/Animation/Rat_Death.fbx",
+    "Assets/Animation/Rat_Run.fbx",
+    "Assets/Models/Cat.fbx",
+    "Assets/Models/CatBase.fbx",
+    "Assets/Models/NightTime/Garage03Night.fbx",
+    "Assets/Models/Racoon.fbx",
+    "Assets/Animation/Cat_Death.fbx",
+    "Assets/Animation/Cat_Death2.fbx",
+    "Assets/Animation/Cat_Death3.fbx",
+    "Assets/Animation/Cat_Falling.fbx",
+    "Assets/Animation/Cat_ForbiddenDance.fbx",
+    "Assets/Animation/Cat_HappyDance.fbx",
+    "Assets/Animation/Cat_HitHighWall.fbx",
+    "Assets/Animation/Cat_HitWall1.fbx",
+    "Assets/Animation/Cat_Idle1.fbx",
+    "Assets/Animation/Cat_Idle2.fbx",
+    "Assets/Animation/Cat_Idle4.fbx",
+    "Assets/Animation/Cat_IdleHappy.fbx",
+    "Assets/Animation/Cat_IdleSad.fbx",
+    "Assets/Animation/Cat_Jump.fbx",
+    "Assets/Animation/Cat_RunLong.fbx",
+    "Assets/Animation/Cat_RunShort.fbx",
+    "Assets/Animation/Cat_RunShort2.fbx",
+    "Assets/Animation/Cat_Slide.fbx",
+    "Assets/Animation/Cat_Start.fbx",
+    "Assets/Animation/Dog_Death.fbx",
+    "Assets/Animation/Dog_Idle.fbx",
+    "Assets/Animation/Dog_Run.fbx",
+    "Assets/Animation/Rat_Death.fbx",
+    "Assets/Animation/Rat_Run.fbx",
+    "Assets/Models/Cat.fbx",
+    "Assets/Models/CatBase.fbx",
+    "Assets/Models/Racoon.fbx",
+    "Assets/Animation/Cat_Death.fbx",
+    "Assets/Animation/Cat_Death2.fbx",
+    "Assets/Animation/Cat_Death3.fbx",
+    "Assets/Animation/Cat_Falling.fbx",
+    "Assets/Animation/Cat_ForbiddenDance.fbx",
+    "Assets/Animation/Cat_HappyDance.fbx",
+    "Assets/Animation/Cat_HitHighWall.fbx",
+    "Assets/Animation/Cat_HitWall1.fbx",
+    "Assets/Animation/Cat_Idle1.fbx",
+    "Assets/Animation/Cat_Idle2.fbx",
+    "Assets/Animation/Cat_Idle4.fbx",
+    "Assets/Animation/Cat_IdleHappy.fbx",
+    "Assets/Animation/Cat_IdleSad.fbx",
+    "Assets/Animation/Cat_Jump.fbx",
+    "Assets/Animation/Cat_RunLong.fbx",
+    "Assets/Animation/Cat_RunShort.fbx",
+    "Assets/Animation/Cat_RunShort2.fbx",
+    "Assets/Animation/Cat_Slide.fbx",
+    "Assets/Animation/Cat_Start.fbx",
+    "Assets/Animation/Dog_Death.fbx",
+    "Assets/Animation/Dog_Idle.fbx",
+    "Assets/Animation/Dog_Run.fbx",
+    "Assets/Animation/Rat_Death.fbx",
+    "Assets/Animation/Rat_Run.fbx",
+    "Assets/Models/Cat.fbx",
+    "Assets/Models/CatBase.fbx",
+    "Assets/Models/Racoon.fbx"
+  ],
+  "mesh_hierarchies": {
+    "Assets/Animation/MenuActors.fbx": [
+      {
+        "meshId": "rbxassetid://110277717553364",
+        "name": "Car3:Car1Body",
+        "position": [
+          246.9468,
+          113.3428,
+          1663.8738
+        ],
+        "size": [
+          153.2304,
+          200.3806,
+          290.5701
+        ]
+      },
+      {
+        "meshId": "rbxassetid://84892497249707",
+        "name": "Car3:Car1FrontWheels",
+        "position": [
+          244.8405,
+          18.7543,
+          1582.663
+        ],
+        "size": [
+          121.9623,
+          37.7192,
+          41.8733
+        ]
+      },
+      {
+        "meshId": "rbxassetid://114101912746512",
+        "name": "Car3:Car1RearWheels",
+        "position": [
+          244.8405,
+          18.7543,
+          1742.3147
+        ],
+        "size": [
+          132.6915,
+          40.0151,
+          41.6246
+        ]
+      },
+      {
+        "meshId": "rbxassetid://120726097141857",
+        "name": "Car3:Car2FrontWheels",
+        "position": [
+          -1366.2175,
+          18.0708,
+          -87.8215
+        ],
+        "size": [
+          36.6938,
+          34.9596,
+          147.1551
+        ]
+      },
+      {
+        "meshId": "rbxassetid://132543436287459",
+        "name": "Car3:Car2RearWheels",
+        "position": [
+          -1521.1555,
+          17.8305,
+          -89.6848
+        ],
+        "size": [
+          38.5248,
+          34.7254,
+          149.2994
+        ]
+      },
+      {
+        "meshId": "rbxassetid://120672215266496",
+        "name": "Car3:Car2Body",
+        "position": [
+          -1430.8542,
+          119.4794,
+          -86.6856
+        ],
+        "size": [
+          278.0326,
+          231.6192,
+          152.0885
+        ]
+      },
+      {
+        "meshId": "rbxassetid://117312493374984",
+        "name": "Rat_OnPlaceRun_Final1:RatMesh",
+        "position": [
+          0.0,
+          64.6534,
+          36.0728
+        ],
+        "size": [
+          135.8155,
+          130.0669,
+          180.0829
+        ]
+      },
+      {
+        "meshId": "rbxassetid://82213875450282",
+        "name": "DogRun_Final:DogMesh",
+        "position": [
+          -0.0226,
+          65.8394,
+          -9.9302
+        ],
+        "size": [
+          60.1624,
+          131.3799,
+          190.3969
+        ]
+      },
+      {
+        "meshId": "rbxassetid://122263897238716",
+        "name": "CatMesh",
+        "position": [
+          0.0033,
+          56.3915,
+          10.1082
+        ],
+        "size": [
+          92.3554,
+          112.6417,
+          69.1522
+        ]
+      }
+    ],
+    "Assets/Animation/MenuEnvironmentProps.fbx": [
+      {
+        "meshId": "rbxassetid://124664196224360",
+        "name": "BinBottom",
+        "position": [
+          -77.0548,
+          73.6118,
+          -326.8377
+        ],
+        "size": [
+          98.7907,
+          117.4004,
+          83.8494
+        ]
+      },
+      {
+        "meshId": "rbxassetid://121512595655535",
+        "name": "BinLid",
+        "position": [
+          -76.8497,
+          140.2921,
+          -326.8378
+        ],
+        "size": [
+          89.3492,
+          24.886,
+          87.9919
+        ]
+      },
+      {
+        "meshId": "rbxassetid://70397469073271",
+        "name": "GrassClump",
+        "position": [
+          -233.2301,
+          49.3199,
+          -570.2394
+        ],
+        "size": [
+          91.2509,
+          68.3186,
+          65.297
+        ]
+      },
+      {
+        "meshId": "rbxassetid://100461470271715",
+        "name": "GrassClump6",
+        "position": [
+          -257.5836,
+          45.7677,
+          -522.4626
+        ],
+        "size": [
+          96.403,
+          66.766,
+          54.1863
+        ]
+      },
+      {
+        "meshId": "rbxassetid://93394629699233",
+        "name": "GrassClump7",
+        "position": [
+          -237.6285,
+          48.8613,
+          -480.1755
+        ],
+        "size": [
+          81.3532,
+          53.6827,
+          38.2736
+        ]
+      },
+      {
+        "meshId": "rbxassetid://98152410798102",
+        "name": "GrassClump1",
+        "position": [
+          -196.9301,
+          42.4389,
+          -495.7405
+        ],
+        "size": [
+          96.4033,
+          66.766,
+          54.1862
+        ]
+      },
+      {
+        "meshId": "rbxassetid://91586240100356",
+        "name": "GrassClump2",
+        "position": [
+          -178.824,
+          51.0955,
+          -496.666
+        ],
+        "size": [
+          100.8104,
+          66.766,
+          49.176
+        ]
+      },
+      {
+        "meshId": "rbxassetid://126731334381991",
+        "name": "GrassClump3",
+        "position": [
+          -135.4285,
+          58.6285,
+          -518.9673
+        ],
+        "size": [
+          96.404,
+          66.766,
+          54.1863
+        ]
+      },
+      {
+        "meshId": "rbxassetid://114808878909484",
+        "name": "GrassClump9",
+        "position": [
+          -137.2587,
+          45.7346,
+          -445.7812
+        ],
+        "size": [
+          80.7048,
+          66.8073,
+          79.5431
+        ]
+      },
+      {
+        "meshId": "rbxassetid://109840273517048",
+        "name": "GrassClump8",
+        "position": [
+          -158.4599,
+          47.1177,
+          -472.6681
+        ],
+        "size": [
+          72.021,
+          53.7978,
+          41.6563
+        ]
+      },
+      {
+        "meshId": "rbxassetid://86985714898427",
+        "name": "GrassClump5",
+        "position": [
+          -111.6467,
+          42.4389,
+          -502.9218
+        ],
+        "size": [
+          96.403,
+          66.766,
+          54.1861
+        ]
+      },
+      {
+        "meshId": "rbxassetid://137984114637217",
+        "name": "GrassClump4",
+        "position": [
+          -69.1243,
+          54.6688,
+          -494.5143
+        ],
+        "size": [
+          96.4035,
+          66.7659,
+          54.1861
+        ]
+      },
+      {
+        "meshId": "rbxassetid://122757024587462",
+        "name": "GrassPlane",
+        "position": [
+          -167.9449,
+          18.8765,
+          -531.3082
+        ],
+        "size": [
+          331.4546,
+          38.986,
+          286.0397
+        ]
+      },
+      {
+        "meshId": "rbxassetid://99979283404498",
+        "name": "DumppsterLid",
+        "position": [
+          -508.115,
+          178.6056,
+          435.6721
+        ],
+        "size": [
+          228.7043,
+          50.0558,
+          240.5907
+        ]
+      },
+      {
+        "meshId": "rbxassetid://85714745456722",
+        "name": "DumpsterBottom",
+        "position": [
+          -574.1508,
+          90.8396,
+          396.0693
+        ],
+        "size": [
+          368.2679,
+          225.5878,
+          323.7296
+        ]
+      },
+      {
+        "meshId": "rbxassetid://116085210267479",
+        "name": "WheelyBinBottom",
+        "position": [
+          -616.4016,
+          101.4457,
+          114.8182
+        ],
+        "size": [
+          178.5596,
+          204.145,
+          178.6646
+        ]
+      },
+      {
+        "meshId": "rbxassetid://137231164149011",
+        "name": "WheelyBinTop",
+        "position": [
+          -667.1401,
+          262.3857,
+          156.2514
+        ],
+        "size": [
+          79.1957,
+          133.3215,
+          89.2065
+        ]
+      },
+      {
+        "meshId": "rbxassetid://107511187115741",
+        "name": "Tree",
+        "position": [
+          -915.1697,
+          439.1184,
+          404.4114
+        ],
+        "size": [
+          554.1988,
+          878.2368,
+          621.095
+        ]
+      },
+      {
+        "meshId": "rbxassetid://133980060837769",
+        "name": "TreeLeaves",
+        "position": [
+          -933.8389,
+          663.7978,
+          91.9835
+        ],
+        "size": [
+          187.928,
+          250.0665,
+          250.0553
+        ]
+      },
+      {
+        "meshId": "rbxassetid://85615990999671",
+        "name": "TreeLeaves1",
+        "position": [
+          -773.3607,
+          483.9201,
+          247.6206
+        ],
+        "size": [
+          248.1514,
+          219.9377,
+          308.1114
+        ]
+      },
+      {
+        "meshId": "rbxassetid://127514632756408",
+        "name": "TreeLeaves2",
+        "position": [
+          -885.4178,
+          745.9712,
+          252.4413
+        ],
+        "size": [
+          255.4771,
+          234.7451,
+          274.1187
+        ]
+      },
+      {
+        "meshId": "rbxassetid://125783616663280",
+        "name": "TreeLeaves3",
+        "position": [
+          -757.2903,
+          719.2224,
+          346.968
+        ],
+        "size": [
+          250.6107,
+          293.044,
+          267.6622
+        ]
+      },
+      {
+        "meshId": "rbxassetid://136730887649884",
+        "name": "TreeLeaves4",
+        "position": [
+          -620.864,
+          588.9764,
+          302.5273
+        ],
+        "size": [
+          252.2857,
+          227.6718,
+          276.2782
+        ]
+      },
+      {
+        "meshId": "rbxassetid://127817402883772",
+        "name": "TreeLeaves5",
+        "position": [
+          -714.6901,
+          647.6475,
+          502.4898
+        ],
+        "size": [
+          237.9637,
+          291.5939,
+          218.0635
+        ]
+      },
+      {
+        "meshId": "rbxassetid://73925529218574",
+        "name": "TreeLeaves6",
+        "position": [
+          -820.9786,
+          770.5082,
+          633.992
+        ],
+        "size": [
+          240.6907,
+          336.5806,
+          212.9247
+        ]
+      },
+      {
+        "meshId": "rbxassetid://86390744451173",
+        "name": "TreeLeaves7",
+        "position": [
+          -825.5258,
+          935.0028,
+          468.9702
+        ],
+        "size": [
+          235.6784,
+          353.93,
+          211.7873
+        ]
+      },
+      {
+        "meshId": "rbxassetid://90126434811144",
+        "name": "TreeLeaves8",
+        "position": [
+          -762.1912,
+          635.2569,
+          677.8171
+        ],
+        "size": [
+          247.6263,
+          223.0211,
+          254.595
+        ]
+      },
+      {
+        "meshId": "rbxassetid://76323214888122",
+        "name": "TreeLeaves9",
+        "position": [
+          -946.8784,
+          986.6083,
+          365.5427
+        ],
+        "size": [
+          211.2345,
+          356.0178,
+          211.3488
+        ]
+      },
+      {
+        "meshId": "rbxassetid://100606263057611",
+        "name": "TreeLeaves10",
+        "position": [
+          -927.4739,
+          882.8577,
+          245.8778
+        ],
+        "size": [
+          241.095,
+          254.3771,
+          268.9856
+        ]
+      },
+      {
+        "meshId": "rbxassetid://139344511608362",
+        "name": "TreeLeaves11",
+        "position": [
+          -989.0967,
+          821.4282,
+          510.1472
+        ],
+        "size": [
+          159.6057,
+          290.8066,
+          247.6574
+        ]
+      },
+      {
+        "meshId": "rbxassetid://83709783472919",
+        "name": "TreeLeaves12",
+        "position": [
+          -949.9539,
+          700.9662,
+          673.58
+        ],
+        "size": [
+          237.569,
+          254.1611,
+          245.8427
+        ]
+      },
+      {
+        "meshId": "rbxassetid://102525232747849",
+        "name": "TreeLeaves13",
+        "position": [
+          -1065.4608,
+          573.1993,
+          607.8889
+        ],
+        "size": [
+          243.9241,
+          224.9495,
+          302.2168
+        ]
+      },
+      {
+        "meshId": "rbxassetid://70930194574659",
+        "name": "TreeLeaves14",
+        "position": [
+          -1150.0029,
+          707.5629,
+          520.5259
+        ],
+        "size": [
+          197.0126,
+          342.2412,
+          213.6722
+        ]
+      },
+      {
+        "meshId": "rbxassetid://102439748869434",
+        "name": "TreeLeaves15",
+        "position": [
+          -1111.0874,
+          745.2437,
+          331.9736
+        ],
+        "size": [
+          314.5455,
+          234.8727,
+          170.502
+        ]
+      },
+      {
+        "meshId": "rbxassetid://135280243653760",
+        "name": "TreeLeaves16",
+        "position": [
+          -1135.4796,
+          549.962,
+          312.8538
+        ],
+        "size": [
+          286.4478,
+          261.1731,
+          198.8276
+        ]
+      },
+      {
+        "meshId": "rbxassetid://138622842486871",
+        "name": "TreeLeaves17",
+        "position": [
+          -1072.6736,
+          609.8737,
+          165.4066
+        ],
+        "size": [
+          226.3711,
+          251.8697,
+          269.2489
+        ]
+      }
+    ],
+    "Assets/Animation/ObstacleBin.fbx": [
+      {
+        "meshId": "rbxassetid://85801791067841",
+        "name": "BinBase",
+        "position": [
+          -0.2531,
+          72.3904,
+          1.3785
+        ],
+        "size": [
+          121.9394,
+          144.9099,
+          103.4969
+        ]
+      },
+      {
+        "meshId": "rbxassetid://93876599527690",
+        "name": "BinTop",
+        "position": [
+          0.0,
+          150.1103,
+          0.141
+        ],
+        "size": [
+          110.2859,
+          30.7173,
+          108.6104
+        ]
+      }
+    ],
+    "Assets/Animation/ObstacleRoadWorksBarrierHigh_Death.fbx": [
+      {
+        "meshId": "rbxassetid://74649672314212",
+        "name": "RoadWorksBarrierHigh",
+        "position": [
+          -0.3476,
+          -93.7315,
+          0.0
+        ],
+        "size": [
+          496.7748,
+          157.621,
+          42.5657
+        ]
+      }
+    ],
+    "Assets/Animation/ObstacleRoadWorksBarrierLow_Death.fbx": [
+      {
+        "meshId": "rbxassetid://140492408886345",
+        "name": "RoadWorksBarrierLow",
+        "position": [
+          0.3337,
+          -35.9861,
+          0.0
+        ],
+        "size": [
+          401.543,
+          73.6213,
+          42.5657
+        ]
+      }
+    ],
+    "Assets/Animation/ObstacleRoadWorksBarrier_Death.fbx": [
+      {
+        "meshId": "rbxassetid://138416232903198",
+        "name": "RoadWorksBarrier01",
+        "position": [
+          -0.9359,
+          -82.6537,
+          -1.398
+        ],
+        "size": [
+          165.799,
+          154.964,
+          42.5657
+        ]
+      }
+    ],
+    "Assets/Animation/ObstacleWheelyBin.fbx": [
+      {
+        "meshId": "rbxassetid://89901929402134",
+        "name": "WheelyBinBody",
+        "position": [
+          -6.05,
+          99.0825,
+          -0.0
+        ],
+        "size": [
+          140.4084,
+          199.3045,
+          130.5933
+        ]
+      },
+      {
+        "meshId": "rbxassetid://133168166422761",
+        "name": "WheelyBinTop",
+        "position": [
+          -10.3844,
+          202.6902,
+          0.0
+        ],
+        "size": [
+          135.8057,
+          21.7033,
+          110.9944
+        ]
+      },
+      {
+        "meshId": "rbxassetid://129618315407283",
+        "name": "TrashBag",
+        "position": [
+          0.0,
+          149.0159,
+          -0.6595
+        ],
+        "size": [
+          86.118,
+          86.118,
+          81.9031
+        ]
+      }
+    ],
+    "Assets/Animation/ObstacleWorkCone_Death.fbx": [
+      {
+        "meshId": "rbxassetid://87077215317569",
+        "name": "RoadWorkCone",
+        "position": [
+          0.0,
+          -50.671,
+          0.0
+        ],
+        "size": [
+          61.9604,
+          101.3421,
+          61.9604
+        ]
+      }
+    ],
+    "Assets/Models/Clover.fbx": [
+      {
+        "meshId": "rbxassetid://111436538697283",
+        "name": "Clover",
+        "position": [
+          0.0,
+          -1.7206,
+          0.0656
+        ],
+        "size": [
+          45.1152,
+          48.5564,
+          6.7048
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Apartments01.fbx": [
+      {
+        "meshId": "rbxassetid://126387059401278",
+        "name": "Apartments01",
+        "position": [
+          -820.3296,
+          582.8369,
+          -438.4349
+        ],
+        "size": [
+          1069.5117,
+          1165.6741,
+          1796.1461
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Apartments02.fbx": [
+      {
+        "meshId": "rbxassetid://129901244047907",
+        "name": "Apartments02",
+        "position": [
+          -825.0811,
+          857.9079,
+          -426.373
+        ],
+        "size": [
+          1059.6064,
+          1715.8162,
+          1778.9989
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Apartments03.fbx": [
+      {
+        "meshId": "rbxassetid://120346355294297",
+        "name": "Apartments03",
+        "position": [
+          -825.0811,
+          857.9079,
+          -426.373
+        ],
+        "size": [
+          1059.6064,
+          1715.8162,
+          1778.9989
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Apartments04.fbx": [
+      {
+        "meshId": "rbxassetid://114723585985415",
+        "name": "Apartments04",
+        "position": [
+          -824.9788,
+          582.8369,
+          -438.4349
+        ],
+        "size": [
+          1060.2134,
+          1165.6741,
+          1796.1461
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/BackgroundBuilding01.fbx": [
+      {
+        "meshId": "rbxassetid://132963429650152",
+        "name": "BackgroundBuilding01",
+        "position": [
+          -488.2224,
+          894.4092,
+          -1.0827
+        ],
+        "size": [
+          1060.2134,
+          1738.3733,
+          921.442
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/BackgroundBuilding02.fbx": [
+      {
+        "meshId": "rbxassetid://74119134444809",
+        "name": "BackgroundBuilding02",
+        "position": [
+          -488.2224,
+          894.4092,
+          -1.0827
+        ],
+        "size": [
+          1060.2134,
+          1738.3733,
+          921.442
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/BackgroundCircle.FBX": [
+      {
+        "meshId": "rbxassetid://124931772556296",
+        "name": "BackgroundCircle",
+        "position": [
+          0.0,
+          -54.9999,
+          0.0
+        ],
+        "size": [
+          220.0,
+          110.0002,
+          0.001
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Bin01.fbx": [
+      {
+        "meshId": "rbxassetid://139453953932906",
+        "name": "Bin01",
+        "position": [
+          -0.2532,
+          84.9947,
+          -0.0
+        ],
+        "size": [
+          121.9394,
+          170.1184,
+          108.6104
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/BinBagClosed.fbx": [
+      {
+        "meshId": "rbxassetid://140475264357416",
+        "name": "BinBagClosed",
+        "position": [
+          -861.4679,
+          55.3145,
+          0.0
+        ],
+        "size": [
+          89.5365,
+          117.2769,
+          109.8478
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/BinBagOpen.fbx": [
+      {
+        "meshId": "rbxassetid://132505884974699",
+        "name": "BinBagOpen",
+        "position": [
+          -863.2462,
+          39.125,
+          0.0
+        ],
+        "size": [
+          85.4816,
+          85.225,
+          116.7746
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/BrickWall.fbx": [
+      {
+        "meshId": "rbxassetid://129384183463710",
+        "name": "BrickWall01",
+        "position": [
+          5.3995,
+          170.4446,
+          -0.0001
+        ],
+        "size": [
+          78.8548,
+          352.4056,
+          911.7238
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Car01.fbx": [
+      {
+        "meshId": "rbxassetid://88217033896490",
+        "name": "Car2FrontWheels",
+        "position": [
+          0.0,
+          18.0808,
+          -65.3837
+        ],
+        "size": [
+          147.1658,
+          35.2223,
+          35.2224
+        ]
+      },
+      {
+        "meshId": "rbxassetid://114368561298207",
+        "name": "Car2RearWheels",
+        "position": [
+          0.0,
+          17.8305,
+          89.5654
+        ],
+        "size": [
+          149.3102,
+          34.9678,
+          37.0628
+        ]
+      },
+      {
+        "meshId": "rbxassetid://82536841088934",
+        "name": "Car2Body",
+        "position": [
+          0.1994,
+          119.5019,
+          -0.366
+        ],
+        "size": [
+          152.073,
+          231.5945,
+          277.2859
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Car02.fbx": [
+      {
+        "meshId": "rbxassetid://89296821700991",
+        "name": "Car1Body",
+        "position": [
+          1.9123,
+          113.1148,
+          -1.1537
+        ],
+        "size": [
+          153.2375,
+          201.0443,
+          290.5737
+        ]
+      },
+      {
+        "meshId": "rbxassetid://101572316796117",
+        "name": "Car1FrontWheels",
+        "position": [
+          0.5987,
+          18.7543,
+          -82.347
+        ],
+        "size": [
+          121.9623,
+          39.9746,
+          39.9746
+        ]
+      },
+      {
+        "meshId": "rbxassetid://81798538458004",
+        "name": "Car1RearWheels",
+        "position": [
+          0.5987,
+          18.7543,
+          77.3047
+        ],
+        "size": [
+          132.6915,
+          39.9746,
+          39.9746
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/ClothesLine01.fbx": [
+      {
+        "meshId": "rbxassetid://117180738230895",
+        "name": "ClothesLine01",
+        "position": [
+          2.3297,
+          -80.5007,
+          -0.0001
+        ],
+        "size": [
+          14.3793,
+          189.9775,
+          1038.8552
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/ClothesLine02.fbx": [
+      {
+        "meshId": "rbxassetid://83166080195517",
+        "name": "ClothesLine02",
+        "position": [
+          8.7515,
+          -75.2864,
+          -0.0001
+        ],
+        "size": [
+          31.0174,
+          195.1154,
+          1038.8552
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/ClothesLine03.fbx": [
+      {
+        "meshId": "rbxassetid://87085599538316",
+        "name": "ClothesLine03",
+        "position": [
+          2.3297,
+          -85.5949,
+          -0.0001
+        ],
+        "size": [
+          14.3794,
+          200.1659,
+          1038.8552
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Cloud01.fbx": [
+      {
+        "meshId": "rbxassetid://116524628984436",
+        "name": "Cloud01",
+        "position": [
+          0.0001,
+          0.0,
+          -908.2242
+        ],
+        "size": [
+          338.7067,
+          165.6647,
+          2048.0
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Cloud02.fbx": [
+      {
+        "meshId": "rbxassetid://102010228100806",
+        "name": "Cloud02",
+        "position": [
+          5.3329,
+          26.8415,
+          -854.8741
+        ],
+        "size": [
+          341.6636,
+          247.9403,
+          2048.0
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Cloud03.fbx": [
+      {
+        "meshId": "rbxassetid://83495115734972",
+        "name": "Cloud03",
+        "position": [
+          6.5829,
+          -0.7638,
+          -872.5891
+        ],
+        "size": [
+          209.1891,
+          151.9255,
+          2048.0
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/DumpsterBlue.fbx": [
+      {
+        "meshId": "rbxassetid://82536740312478",
+        "name": "DumpsterBlue",
+        "position": [
+          -0.1266,
+          112.7939,
+          0.0
+        ],
+        "size": [
+          192.719,
+          225.5878,
+          325.4463
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/DumpsterGreen.fbx": [
+      {
+        "meshId": "rbxassetid://118299633592773",
+        "name": "DumpsterGreen",
+        "position": [
+          -0.1266,
+          112.7939,
+          0.0
+        ],
+        "size": [
+          192.719,
+          225.5878,
+          325.4463
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/DumpsterRed.fbx": [
+      {
+        "meshId": "rbxassetid://127539352438974",
+        "name": "DumpsterRed",
+        "position": [
+          -0.1266,
+          112.7939,
+          0.0
+        ],
+        "size": [
+          192.719,
+          225.5878,
+          325.4463
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Fan.fbx": [
+      {
+        "meshId": "rbxassetid://121817598603641",
+        "name": "Fan",
+        "position": [
+          -4.1382,
+          0.0,
+          0.0
+        ],
+        "size": [
+          48.6733,
+          157.2204,
+          157.2204
+        ]
+      },
+      {
+        "meshId": "rbxassetid://139530425931217",
+        "name": "FanBlades",
+        "position": [
+          7.0501,
+          0.0,
+          0.0
+        ],
+        "size": [
+          18.1895,
+          108.4863,
+          108.4863
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/FarBackBuilding01.fbx": [
+      {
+        "meshId": "rbxassetid://74993573520778",
+        "name": "FarBackBuilding01",
+        "position": [
+          0.0,
+          321.6062,
+          -0.0
+        ],
+        "size": [
+          2048.0,
+          717.4108,
+          272.753
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/FarBackBuilding02.fbx": [
+      {
+        "meshId": "rbxassetid://131124923027492",
+        "name": "FarBackBuilding02",
+        "position": [
+          -0.0001,
+          315.3489,
+          -114.2769
+        ],
+        "size": [
+          2048.0,
+          704.8964,
+          501.3068
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/FarBackBuilding03.fbx": [
+      {
+        "meshId": "rbxassetid://113621464873688",
+        "name": "FarBackBuilding03",
+        "position": [
+          0.0001,
+          337.9264,
+          -236.8677
+        ],
+        "size": [
+          2047.9999,
+          750.0513,
+          746.4883
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/FireEscape.fbx": [
+      {
+        "meshId": "rbxassetid://129925652733327",
+        "name": "FireEscape",
+        "position": [
+          -42.2465,
+          551.7732,
+          -223.7935
+        ],
+        "size": [
+          287.683,
+          1513.5903,
+          626.8184
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Garage01.fbx": [
+      {
+        "meshId": "rbxassetid://116288013160584",
+        "name": "Garage01",
+        "position": [
+          -652.5383,
+          307.4599,
+          0.0
+        ],
+        "size": [
+          764.8374,
+          594.4561,
+          769.1111
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Garage02.fbx": [
+      {
+        "meshId": "rbxassetid://130782771034879",
+        "name": "Garage02",
+        "position": [
+          -652.5383,
+          307.4599,
+          0.0
+        ],
+        "size": [
+          764.8374,
+          594.4561,
+          769.1111
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Garage03.fbx": [
+      {
+        "meshId": "rbxassetid://107902239855504",
+        "name": "Garage03",
+        "position": [
+          -659.8704,
+          230.163,
+          0.0
+        ],
+        "size": [
+          784.451,
+          460.3261,
+          769.1111
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Garage04.fbx": [
+      {
+        "meshId": "rbxassetid://80273984772170",
+        "name": "Garage04",
+        "position": [
+          -659.8704,
+          230.163,
+          0.0
+        ],
+        "size": [
+          784.451,
+          460.3261,
+          769.1111
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Garage05.fbx": [
+      {
+        "meshId": "rbxassetid://70450195254819",
+        "name": "Garage05",
+        "position": [
+          -659.8704,
+          266.654,
+          0.0
+        ],
+        "size": [
+          784.451,
+          533.308,
+          1159.3357
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Garage06.fbx": [
+      {
+        "meshId": "rbxassetid://140519186768422",
+        "name": "Garage06",
+        "position": [
+          -659.8704,
+          266.654,
+          0.0
+        ],
+        "size": [
+          784.451,
+          533.308,
+          1159.3357
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/GrassClump01.fbx": [
+      {
+        "meshId": "rbxassetid://100406797673342",
+        "name": "GrassClump",
+        "position": [
+          -5.8763,
+          42.5533,
+          -12.4409
+        ],
+        "size": [
+          99.1103,
+          85.1067,
+          51.5681
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/House.fbx": [
+      {
+        "meshId": "rbxassetid://101007600404624",
+        "name": "House",
+        "position": [
+          -1396.9988,
+          607.2203,
+          -388.6482
+        ],
+        "size": [
+          2047.9999,
+          1214.4407,
+          1654.9302
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/House02.fbx": [
+      {
+        "meshId": "rbxassetid://134828493121359",
+        "name": "House02",
+        "position": [
+          -1396.9988,
+          607.2203,
+          -388.6482
+        ],
+        "size": [
+          2047.9999,
+          1214.4407,
+          1654.9302
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/House03.fbx": [
+      {
+        "meshId": "rbxassetid://107570799553761",
+        "name": "House03",
+        "position": [
+          -1396.9988,
+          607.2203,
+          -388.6482
+        ],
+        "size": [
+          2047.9999,
+          1214.4407,
+          1654.9302
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/ManHole.fbx": [
+      {
+        "meshId": "rbxassetid://97347334433324",
+        "name": "ManHole01",
+        "position": [
+          0.0,
+          7.069,
+          0.0
+        ],
+        "size": [
+          117.4725,
+          17.8792,
+          117.4687
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Pipes.fbx": [
+      {
+        "meshId": "rbxassetid://84334528361689",
+        "name": "Pipes",
+        "position": [
+          -0.0002,
+          0.0,
+          -0.0
+        ],
+        "size": [
+          41.6352,
+          676.9192,
+          580.1997
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/PlasteredWall01.fbx": [
+      {
+        "meshId": "rbxassetid://92676533055712",
+        "name": "PlasteredWall01",
+        "position": [
+          5.3995,
+          170.2079,
+          -0.0001
+        ],
+        "size": [
+          78.8548,
+          351.9358,
+          911.7238
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/PlasteredWall02.fbx": [
+      {
+        "meshId": "rbxassetid://88119608762563",
+        "name": "PlasteredWall02",
+        "position": [
+          5.3995,
+          169.339,
+          -0.0001
+        ],
+        "size": [
+          78.8548,
+          353.6736,
+          911.7238
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Road01.fbx": [
+      {
+        "meshId": "rbxassetid://127417383982879",
+        "name": "Road01",
+        "position": [
+          -0.3121,
+          7.0065,
+          -0.0001
+        ],
+        "size": [
+          2048.0,
+          14.4757,
+          893.7098
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Road02.fbx": [
+      {
+        "meshId": "rbxassetid://113151281073089",
+        "name": "Road02",
+        "position": [
+          -0.3121,
+          8.9151,
+          -0.0
+        ],
+        "size": [
+          2048.0,
+          18.2923,
+          893.7099
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Road03.fbx": [
+      {
+        "meshId": "rbxassetid://73608030656964",
+        "name": "Road03",
+        "position": [
+          90.0649,
+          6.3882,
+          -0.0001
+        ],
+        "size": [
+          2048.0,
+          13.1985,
+          814.8562
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Road04.fbx": [
+      {
+        "meshId": "rbxassetid://134382204240991",
+        "name": "Road04",
+        "position": [
+          0.0,
+          5.872,
+          -0.0
+        ],
+        "size": [
+          2048.0,
+          12.1315,
+          748.98
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/RoadWorksArrow.fbx": [
+      {
+        "meshId": "rbxassetid://99448907161545",
+        "name": "RoadWorksArrow",
+        "position": [
+          0.0,
+          90.2171,
+          -50.5602
+        ],
+        "size": [
+          151.2891,
+          199.8001,
+          118.6902
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/RoadWorksBarrier01.fbx": [
+      {
+        "meshId": "rbxassetid://100057728955132",
+        "name": "RoadWorksBarrier01",
+        "position": [
+          61.6166,
+          81.6272,
+          0.0
+        ],
+        "size": [
+          165.799,
+          154.964,
+          42.5657
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/RoadWorksBarrier02.fbx": [
+      {
+        "meshId": "rbxassetid://106775313314323",
+        "name": "RoadWorksBarrier02",
+        "position": [
+          114.5426,
+          81.6272,
+          0.0
+        ],
+        "size": [
+          271.6509,
+          154.964,
+          42.5657
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/RoadWorksBarrier03.fbx": [
+      {
+        "meshId": "rbxassetid://75617864213118",
+        "name": "RoadWorksBarrier03",
+        "position": [
+          179.4886,
+          81.6272,
+          0.0
+        ],
+        "size": [
+          401.543,
+          154.964,
+          42.5657
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/RoadWorksBarrierHigh.fbx": [
+      {
+        "meshId": "rbxassetid://121127530231146",
+        "name": "RoadWorksBarrierHigh",
+        "position": [
+          0.0,
+          93.7315,
+          0.0
+        ],
+        "size": [
+          496.7748,
+          157.621,
+          42.5657
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/RoadWorksBarrierLow.fbx": [
+      {
+        "meshId": "rbxassetid://128280245491816",
+        "name": "RoadWorksBarrierLow",
+        "position": [
+          -0.3337,
+          35.9861,
+          0.0
+        ],
+        "size": [
+          401.543,
+          73.6213,
+          42.5657
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/RoadWorksCone.fbx": [
+      {
+        "meshId": "rbxassetid://75291085850715",
+        "name": "RoadWorkCone",
+        "position": [
+          0.0,
+          50.671,
+          0.0
+        ],
+        "size": [
+          61.9604,
+          101.3421,
+          61.9604
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/SkipBlue.fbx": [
+      {
+        "meshId": "rbxassetid://117953045372843",
+        "name": "SkipBlue",
+        "position": [
+          0.0,
+          114.7019,
+          -0.0
+        ],
+        "size": [
+          334.3633,
+          229.5671,
+          540.1211
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/SkipRed.fbx": [
+      {
+        "meshId": "rbxassetid://76487319292442",
+        "name": "SkipRed",
+        "position": [
+          0.0,
+          114.7019,
+          -0.0
+        ],
+        "size": [
+          334.3633,
+          229.5671,
+          540.1211
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/SkipYellow.fbx": [
+      {
+        "meshId": "rbxassetid://70915522277530",
+        "name": "SkipYellow",
+        "position": [
+          0.0,
+          114.7019,
+          -0.0
+        ],
+        "size": [
+          334.3633,
+          229.5671,
+          540.1211
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Sky.fbx": [
+      {
+        "meshId": "rbxassetid://101217845513515",
+        "name": "Sky",
+        "position": [
+          -1174.6455,
+          410.9882,
+          -2451.4673
+        ],
+        "size": [
+          2048.0,
+          1873.8257,
+          1024.0006
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/StoneWall.fbx": [
+      {
+        "meshId": "rbxassetid://136485771260076",
+        "name": "StoneWall",
+        "position": [
+          5.3995,
+          172.7113,
+          -0.0001
+        ],
+        "size": [
+          78.8548,
+          346.9427,
+          911.7238
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/StreetLight.fbx": [
+      {
+        "meshId": "rbxassetid://78866000179337",
+        "name": "StreetLight",
+        "position": [
+          135.0795,
+          329.7331,
+          0.497
+        ],
+        "size": [
+          307.8162,
+          676.6012,
+          41.3576
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/TelegraphPole01.fbx": [
+      {
+        "meshId": "rbxassetid://86535848601423",
+        "name": "TelegraphPole01",
+        "position": [
+          -5.2759,
+          339.7642,
+          17.362
+        ],
+        "size": [
+          228.5664,
+          679.5284,
+          71.7446
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/TelegraphPole02.fbx": [
+      {
+        "meshId": "rbxassetid://133391870021828",
+        "name": "TelegraphPole02",
+        "position": [
+          -5.2759,
+          339.7642,
+          7.075
+        ],
+        "size": [
+          228.5664,
+          679.5284,
+          51.1707
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/TelegraphWires.fbx": [
+      {
+        "meshId": "rbxassetid://77661451959448",
+        "name": "TelegraphWires",
+        "position": [
+          -0.0001,
+          0.0,
+          -371.903
+        ],
+        "size": [
+          203.3842,
+          20.7465,
+          743.8061
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Tree01.fbx": [
+      {
+        "meshId": "rbxassetid://90906067636186",
+        "name": "Tree01",
+        "position": [
+          -17.2594,
+          582.3086,
+          25.5947
+        ],
+        "size": [
+          768.2565,
+          1164.6172,
+          816.1489
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Warehouse01.fbx": [
+      {
+        "meshId": "rbxassetid://113029034194802",
+        "name": "Warehouse01",
+        "position": [
+          -1291.9128,
+          811.7581,
+          -5.0338
+        ],
+        "size": [
+          1986.7183,
+          1629.9727,
+          1811.6436
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Warehouse02.fbx": [
+      {
+        "meshId": "rbxassetid://79797927318703",
+        "name": "Warehouse02",
+        "position": [
+          -7129.6362,
+          1022.0863,
+          1569.863
+        ],
+        "size": [
+          1314.9547,
+          2047.9999,
+          1867.4399
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Warehouse03.fbx": [
+      {
+        "meshId": "rbxassetid://80787503744198",
+        "name": "Warehouse03",
+        "position": [
+          -8207.4219,
+          616.3055,
+          4123.936
+        ],
+        "size": [
+          1520.9194,
+          1239.4329,
+          2048.0
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/WheelyBinBlue.fbx": [
+      {
+        "meshId": "rbxassetid://102004164025954",
+        "name": "WheelyBinBlue",
+        "position": [
+          -7.0666,
+          106.486,
+          0.0
+        ],
+        "size": [
+          142.4415,
+          214.1116,
+          130.5933
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/WheelyBinGreen.fbx": [
+      {
+        "meshId": "rbxassetid://74346092968140",
+        "name": "WheelyBinGreen",
+        "position": [
+          -7.0666,
+          106.486,
+          0.0
+        ],
+        "size": [
+          142.4415,
+          214.1116,
+          130.5933
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/WheelyBinRed.fbx": [
+      {
+        "meshId": "rbxassetid://70885532052116",
+        "name": "WheelyBinRed",
+        "position": [
+          -7.0666,
+          106.486,
+          0.0
+        ],
+        "size": [
+          142.4415,
+          214.1116,
+          130.5933
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/Wire.fbx": [
+      {
+        "meshId": "rbxassetid://71135178798482",
+        "name": "Wire",
+        "position": [
+          -0.0153,
+          0.0,
+          -371.903
+        ],
+        "size": [
+          6.9595,
+          20.7465,
+          743.806
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/WoodFence01.fbx": [
+      {
+        "meshId": "rbxassetid://139827848163574",
+        "name": "WoodFence01",
+        "position": [
+          -301.0433,
+          109.8921,
+          3.56
+        ],
+        "size": [
+          21.7281,
+          213.5678,
+          856.5104
+        ]
+      }
+    ],
+    "Assets/Models/Daytime/WoodFence02.fbx": [
+      {
+        "meshId": "rbxassetid://137229647201404",
+        "name": "WoodFence02",
+        "position": [
+          -301.0433,
+          96.1496,
+          3.56
+        ],
+        "size": [
+          21.7282,
+          186.0829,
+          846.959
+        ]
+      }
+    ],
+    "Assets/Models/Dog.FBX": [
+      {
+        "meshId": "rbxassetid://95409218462820",
+        "name": "DogMesh",
+        "position": [
+          -0.0226,
+          65.8394,
+          -9.9302
+        ],
+        "size": [
+          60.1624,
+          131.3799,
+          190.3969
+        ]
+      }
+    ],
+    "Assets/Models/Fishbone.fbx": [
+      {
+        "meshId": "rbxassetid://106795657775137",
+        "name": "Fishbone2",
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "size": [
+          43.4568,
+          22.4945,
+          11.4934
+        ]
+      }
+    ],
+    "Assets/Models/Heart.fbx": [
+      {
+        "meshId": "rbxassetid://75558272334068",
+        "name": "Heart",
+        "position": [
+          0.0,
+          -8.7125,
+          0.0
+        ],
+        "size": [
+          41.56,
+          39.3043,
+          14.4479
+        ]
+      }
+    ],
+    "Assets/Models/Magnet.fbx": [
+      {
+        "meshId": "rbxassetid://108175400971940",
+        "name": "Magnet",
+        "position": [
+          0.0,
+          0.0,
+          -0.0
+        ],
+        "size": [
+          33.6068,
+          35.6658,
+          8.019
+        ]
+      }
+    ],
+    "Assets/Models/Multiply.fbx": [
+      {
+        "meshId": "rbxassetid://124566603847593",
+        "name": "Multiplyer",
+        "position": [
+          1.2986,
+          -0.0001,
+          0.0002
+        ],
+        "size": [
+          49.5077,
+          41.5958,
+          7.1241
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/Apartments01Night.fbx": [
+      {
+        "meshId": "rbxassetid://91577704858176",
+        "name": "Apartments01Night",
+        "position": [
+          -820.3296,
+          582.8369,
+          -438.4349
+        ],
+        "size": [
+          1069.5117,
+          1165.6741,
+          1796.1461
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/Apartments02Night.fbx": [
+      {
+        "meshId": "rbxassetid://128302575735487",
+        "name": "Apartments02Night",
+        "position": [
+          -825.0811,
+          857.9079,
+          -426.373
+        ],
+        "size": [
+          1059.6064,
+          1715.8162,
+          1778.9989
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/Apartments03Night.fbx": [
+      {
+        "meshId": "rbxassetid://80039207990188",
+        "name": "Apartments03Night",
+        "position": [
+          -825.0811,
+          857.9079,
+          -426.373
+        ],
+        "size": [
+          1059.6064,
+          1715.8162,
+          1778.9989
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/Apartments04Night.fbx": [
+      {
+        "meshId": "rbxassetid://83784441018296",
+        "name": "Apartments04Night",
+        "position": [
+          -824.9788,
+          582.8369,
+          -438.4349
+        ],
+        "size": [
+          1060.2134,
+          1165.6741,
+          1796.1461
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/BackgroundBuilding01Night.fbx": [
+      {
+        "meshId": "rbxassetid://122913484974189",
+        "name": "BackgroundBuilding01Night",
+        "position": [
+          -488.2224,
+          894.4092,
+          -1.0827
+        ],
+        "size": [
+          1060.2134,
+          1738.3733,
+          921.442
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/BackgroundBuilding02Night.fbx": [
+      {
+        "meshId": "rbxassetid://95726238433517",
+        "name": "BackgroundBuilding02Night",
+        "position": [
+          -488.2224,
+          894.4092,
+          -1.0827
+        ],
+        "size": [
+          1060.2134,
+          1738.3733,
+          921.442
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/BackgroundCircleNight.FBX": [
+      {
+        "meshId": "rbxassetid://134677692967592",
+        "name": "BackgroundCircleNight",
+        "position": [
+          0.0,
+          -54.9999,
+          0.0
+        ],
+        "size": [
+          220.0,
+          110.0002,
+          0.001
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/Bin01Night.fbx": [
+      {
+        "meshId": "rbxassetid://128117816432323",
+        "name": "Bin01Night",
+        "position": [
+          -0.2532,
+          84.9947,
+          -0.0
+        ],
+        "size": [
+          121.9394,
+          170.1184,
+          108.6104
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/BinBagClosedNight.fbx": [
+      {
+        "meshId": "rbxassetid://74977719289819",
+        "name": "BinBagClosedNight",
+        "position": [
+          -0.0,
+          55.3145,
+          0.0
+        ],
+        "size": [
+          89.5365,
+          117.2769,
+          109.8478
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/BinBagOpenNight.fbx": [
+      {
+        "meshId": "rbxassetid://109514155076293",
+        "name": "BinBagOpenNight",
+        "position": [
+          0.0,
+          39.2886,
+          0.0
+        ],
+        "size": [
+          85.4816,
+          85.225,
+          116.7746
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/BrickWall01Night.fbx": [
+      {
+        "meshId": "rbxassetid://88418231076478",
+        "name": "BrickWall01Night",
+        "position": [
+          5.3995,
+          170.4446,
+          -0.0001
+        ],
+        "size": [
+          78.8548,
+          352.4056,
+          911.7238
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/Car01Night.fbx": [
+      {
+        "meshId": "rbxassetid://117479212872987",
+        "name": "Car1Night",
+        "position": [
+          1.9123,
+          106.202,
+          -1.1537
+        ],
+        "size": [
+          153.2375,
+          214.8699,
+          290.5736
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/Car02Night.fbx": [
+      {
+        "meshId": "rbxassetid://128931306729702",
+        "name": "Car2Night",
+        "position": [
+          0.1994,
+          117.8229,
+          -0.366
+        ],
+        "size": [
+          152.0731,
+          234.9525,
+          277.2859
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/ClothesLine01Night.fbx": [
+      {
+        "meshId": "rbxassetid://92751079556727",
+        "name": "ClothesLine01Night",
+        "position": [
+          2.3297,
+          -80.5007,
+          -0.0001
+        ],
+        "size": [
+          14.3793,
+          189.9775,
+          1038.8552
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/ClothesLine02Night.fbx": [
+      {
+        "meshId": "rbxassetid://135586318730425",
+        "name": "ClothesLine02Night",
+        "position": [
+          8.7515,
+          -75.2864,
+          -0.0001
+        ],
+        "size": [
+          31.0174,
+          195.1154,
+          1038.8552
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/ClothesLine03Night.fbx": [
+      {
+        "meshId": "rbxassetid://131681441840077",
+        "name": "ClothesLine03Night",
+        "position": [
+          2.3297,
+          -85.5949,
+          -0.0001
+        ],
+        "size": [
+          14.3794,
+          200.1659,
+          1038.8552
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/Cloud01Night.fbx": [
+      {
+        "meshId": "rbxassetid://105833036741312",
+        "name": "Cloud01Night",
+        "position": [
+          0.0001,
+          0.0,
+          -908.2242
+        ],
+        "size": [
+          338.7067,
+          165.6647,
+          2048.0
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/Cloud02Night.fbx": [
+      {
+        "meshId": "rbxassetid://79152944515579",
+        "name": "Cloud02Night",
+        "position": [
+          5.3329,
+          26.8415,
+          -854.8741
+        ],
+        "size": [
+          341.6636,
+          247.9403,
+          2048.0
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/Cloud03Night.fbx": [
+      {
+        "meshId": "rbxassetid://119000624270947",
+        "name": "Cloud03Night",
+        "position": [
+          6.5829,
+          -0.7638,
+          -872.5891
+        ],
+        "size": [
+          209.1891,
+          151.9255,
+          2048.0
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/CloverNight.fbx": [
+      {
+        "meshId": "rbxassetid://83985509402108",
+        "name": "CloverNight",
+        "position": [
+          0.0,
+          -1.7206,
+          0.0656
+        ],
+        "size": [
+          45.1152,
+          48.5564,
+          6.7048
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/DumpsterBlueNight.fbx": [
+      {
+        "meshId": "rbxassetid://96437677603891",
+        "name": "DumpsterBlueNight",
+        "position": [
+          -0.1266,
+          112.7939,
+          0.0
+        ],
+        "size": [
+          192.719,
+          225.5878,
+          325.4463
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/DumpsterGreenNight.fbx": [
+      {
+        "meshId": "rbxassetid://86775459270122",
+        "name": "DumpsterGreenNight",
+        "position": [
+          -0.1266,
+          112.7939,
+          0.0
+        ],
+        "size": [
+          192.719,
+          225.5878,
+          325.4463
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/DumpsterRedNight.fbx": [
+      {
+        "meshId": "rbxassetid://79971016226462",
+        "name": "DumpsterRedNight",
+        "position": [
+          -0.1266,
+          112.7939,
+          0.0
+        ],
+        "size": [
+          192.719,
+          225.5878,
+          325.4463
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/FanNight.fbx": [
+      {
+        "meshId": "rbxassetid://76955429112738",
+        "name": "FanNight",
+        "position": [
+          -4.1382,
+          0.0,
+          0.0
+        ],
+        "size": [
+          48.6733,
+          157.2204,
+          157.2204
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/FarBackBuilding01Night.fbx": [
+      {
+        "meshId": "rbxassetid://131993676878786",
+        "name": "FarBackBuilding01Night",
+        "position": [
+          0.0,
+          321.6062,
+          -0.0
+        ],
+        "size": [
+          2048.0,
+          717.4108,
+          272.753
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/FarBackBuilding02Night.fbx": [
+      {
+        "meshId": "rbxassetid://132932665345461",
+        "name": "FarBackBuilding02Night",
+        "position": [
+          -0.0001,
+          315.3489,
+          -114.2769
+        ],
+        "size": [
+          2048.0,
+          704.8964,
+          501.3068
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/FarBackBuilding03Night.fbx": [
+      {
+        "meshId": "rbxassetid://92918537201832",
+        "name": "FarBackBuilding03Night",
+        "position": [
+          0.0001,
+          337.9264,
+          -236.8677
+        ],
+        "size": [
+          2047.9999,
+          750.0513,
+          746.4883
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/FireEscapeNight.fbx": [
+      {
+        "meshId": "rbxassetid://101661733179408",
+        "name": "FireEscapeNight",
+        "position": [
+          -42.2465,
+          551.7732,
+          -223.7935
+        ],
+        "size": [
+          287.683,
+          1513.5903,
+          626.8184
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/FishboneNight.fbx": [
+      {
+        "meshId": "rbxassetid://94325970743643",
+        "name": "FishboneNight",
+        "position": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "size": [
+          43.4568,
+          22.4945,
+          11.4934
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/Garage01Night.fbx": [
+      {
+        "meshId": "rbxassetid://76647022773992",
+        "name": "Garage01Night",
+        "position": [
+          -652.5383,
+          307.4599,
+          0.0
+        ],
+        "size": [
+          764.8374,
+          594.4561,
+          769.1111
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/Garage02Night.fbx": [
+      {
+        "meshId": "rbxassetid://77799622401883",
+        "name": "Garage02Night",
+        "position": [
+          -652.5383,
+          307.4599,
+          0.0
+        ],
+        "size": [
+          764.8374,
+          594.4561,
+          769.1111
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/Garage03Night.fbx": [
+      {
+        "meshId": "rbxassetid://105177132630455",
+        "name": "Garage03Night",
+        "position": [
+          -659.8704,
+          230.163,
+          0.0
+        ],
+        "size": [
+          784.451,
+          460.3261,
+          769.1111
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/Garage04Night.fbx": [
+      {
+        "meshId": "rbxassetid://95092792002959",
+        "name": "Garage04Night",
+        "position": [
+          -659.8704,
+          230.163,
+          0.0
+        ],
+        "size": [
+          784.451,
+          460.3261,
+          769.1111
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/Garage05Night.fbx": [
+      {
+        "meshId": "rbxassetid://123476341013093",
+        "name": "Garage05Night",
+        "position": [
+          -659.8704,
+          266.654,
+          0.0
+        ],
+        "size": [
+          784.451,
+          533.308,
+          1159.3357
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/Garage06Night.fbx": [
+      {
+        "meshId": "rbxassetid://120804017238249",
+        "name": "Garage06Night",
+        "position": [
+          -659.8704,
+          266.654,
+          0.0
+        ],
+        "size": [
+          784.451,
+          533.308,
+          1159.3357
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/GrassClumpNight.fbx": [
+      {
+        "meshId": "rbxassetid://94669239167797",
+        "name": "GrassClumpNight",
+        "position": [
+          -5.8763,
+          42.5533,
+          -12.4409
+        ],
+        "size": [
+          99.1103,
+          85.1067,
+          51.5681
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/HeartNight.fbx": [
+      {
+        "meshId": "rbxassetid://118089906828192",
+        "name": "HeartNight",
+        "position": [
+          0.0,
+          -8.7125,
+          0.0
+        ],
+        "size": [
+          41.56,
+          39.3043,
+          14.4479
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/House01Night.fbx": [
+      {
+        "meshId": "rbxassetid://79470117497486",
+        "name": "House01Night",
+        "position": [
+          -1396.9988,
+          607.2203,
+          -388.6482
+        ],
+        "size": [
+          2047.9999,
+          1214.4407,
+          1654.9302
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/House02Night.fbx": [
+      {
+        "meshId": "rbxassetid://111035645862604",
+        "name": "House02Night",
+        "position": [
+          -1396.9988,
+          607.2203,
+          -388.6482
+        ],
+        "size": [
+          2047.9999,
+          1214.4407,
+          1654.9302
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/House03Night.fbx": [
+      {
+        "meshId": "rbxassetid://96981264195433",
+        "name": "House03Night",
+        "position": [
+          -1396.9988,
+          607.2203,
+          -388.6482
+        ],
+        "size": [
+          2047.9999,
+          1214.4407,
+          1654.9302
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/LightCone.fbx": [
+      {
+        "meshId": "rbxassetid://76231535060092",
+        "name": "LightCone",
+        "position": [
+          74.3047,
+          -326.7191,
+          0.0
+        ],
+        "size": [
+          591.1798,
+          638.8973,
+          582.1985
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/LightGlowPlane.fbx": [
+      {
+        "meshId": "rbxassetid://114811994813688",
+        "name": "Plane045",
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "size": [
+          463.1484,
+          0.001,
+          305.0288
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/LightPool.fbx": [
+      {
+        "meshId": "rbxassetid://98195882659729",
+        "name": "LightPool",
+        "position": [
+          0.0,
+          8.5019,
+          -10.2653
+        ],
+        "size": [
+          806.9468,
+          15.6065,
+          785.9845
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/LightPool02.fbx": [
+      {
+        "meshId": "rbxassetid://76810570519099",
+        "name": "LightPool02",
+        "position": [
+          0.0,
+          8.5019,
+          -10.2653
+        ],
+        "size": [
+          806.9468,
+          15.6065,
+          785.9845
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/MagnetNight.fbx": [
+      {
+        "meshId": "rbxassetid://76719702279830",
+        "name": "MagnetNight",
+        "position": [
+          0.0,
+          0.0,
+          -0.0
+        ],
+        "size": [
+          33.6068,
+          35.6658,
+          8.019
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/ManHole01Night.fbx": [
+      {
+        "meshId": "rbxassetid://86613942357279",
+        "name": "ManHole01Night",
+        "position": [
+          0.0,
+          7.069,
+          0.0
+        ],
+        "size": [
+          117.4725,
+          17.8792,
+          117.4687
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/MultiplyerNight.fbx": [
+      {
+        "meshId": "rbxassetid://121214269574142",
+        "name": "MultiplyerNight",
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "size": [
+          41.7936,
+          41.7936,
+          8.7203
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/ObstacleBinNight.fbx": [
+      {
+        "meshId": "rbxassetid://125147287265493",
+        "name": "BinBaseNight",
+        "position": [
+          -0.2531,
+          72.3904,
+          1.3785
+        ],
+        "size": [
+          121.9394,
+          144.9099,
+          103.4969
+        ]
+      },
+      {
+        "meshId": "rbxassetid://137181008100193",
+        "name": "BinTopNight",
+        "position": [
+          0.0,
+          150.1103,
+          0.141
+        ],
+        "size": [
+          110.2859,
+          30.7173,
+          108.6104
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/ObstacleWheelyBinNight.fbx": [
+      {
+        "meshId": "rbxassetid://107838341192371",
+        "name": "WheelyBinBodyNight",
+        "position": [
+          -6.05,
+          99.0825,
+          -0.0
+        ],
+        "size": [
+          140.4084,
+          199.3045,
+          130.5933
+        ]
+      },
+      {
+        "meshId": "rbxassetid://133850899068222",
+        "name": "TrashBagNight",
+        "position": [
+          0.0,
+          149.0159,
+          -0.6595
+        ],
+        "size": [
+          86.118,
+          86.118,
+          81.9031
+        ]
+      },
+      {
+        "meshId": "rbxassetid://124124295313377",
+        "name": "WheelyBinTopNight",
+        "position": [
+          -10.3845,
+          202.6902,
+          -0.0
+        ],
+        "size": [
+          135.8057,
+          21.7033,
+          110.9944
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/PipesNight.fbx": [
+      {
+        "meshId": "rbxassetid://121495577254288",
+        "name": "PipesNight",
+        "position": [
+          -0.0002,
+          332.5106,
+          -0.0
+        ],
+        "size": [
+          41.6352,
+          676.9192,
+          580.1997
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/PlasteredWall01Night.fbx": [
+      {
+        "meshId": "rbxassetid://134097863452149",
+        "name": "PlasteredWall01Night",
+        "position": [
+          5.3995,
+          170.2079,
+          -0.0001
+        ],
+        "size": [
+          78.8548,
+          351.9358,
+          911.7238
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/PlasteredWall02Night.fbx": [
+      {
+        "meshId": "rbxassetid://87316269048653",
+        "name": "PlasteredWall02Night",
+        "position": [
+          5.3995,
+          169.339,
+          -0.0001
+        ],
+        "size": [
+          78.8548,
+          353.6736,
+          911.7238
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/Road01Night.fbx": [
+      {
+        "meshId": "rbxassetid://140303205497551",
+        "name": "Road01Night",
+        "position": [
+          -0.3121,
+          7.0065,
+          -0.0001
+        ],
+        "size": [
+          2048.0,
+          14.4757,
+          893.7098
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/Road02Night.fbx": [
+      {
+        "meshId": "rbxassetid://85857594589047",
+        "name": "Road02Night",
+        "position": [
+          -0.3121,
+          8.9151,
+          -0.0
+        ],
+        "size": [
+          2048.0,
+          18.2923,
+          893.7099
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/Road03Night.fbx": [
+      {
+        "meshId": "rbxassetid://77859812376574",
+        "name": "Road03Night",
+        "position": [
+          90.0649,
+          6.3882,
+          -0.0001
+        ],
+        "size": [
+          2048.0,
+          13.1985,
+          814.8562
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/Road04Night.fbx": [
+      {
+        "meshId": "rbxassetid://98988309675923",
+        "name": "Road04Night",
+        "position": [
+          0.0,
+          5.872,
+          -0.0
+        ],
+        "size": [
+          2048.0,
+          12.1315,
+          748.98
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/RoadWorkConeNight.fbx": [
+      {
+        "meshId": "rbxassetid://75197099360111",
+        "name": "RoadWorkConeNight",
+        "position": [
+          0.0,
+          50.671,
+          0.0
+        ],
+        "size": [
+          61.9604,
+          101.3421,
+          61.9604
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/RoadWorksArrowNight.fbx": [
+      {
+        "meshId": "rbxassetid://115232666081202",
+        "name": "RoadWorksArrowNight",
+        "position": [
+          0.0,
+          90.2171,
+          -50.5602
+        ],
+        "size": [
+          151.2891,
+          199.8001,
+          118.6902
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/RoadWorksBarrier01Night.fbx": [
+      {
+        "meshId": "rbxassetid://136452394912193",
+        "name": "RoadWorksBarrier01Night",
+        "position": [
+          61.6166,
+          81.6272,
+          0.0
+        ],
+        "size": [
+          165.799,
+          154.964,
+          42.5657
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/RoadWorksBarrier02Night.fbx": [
+      {
+        "meshId": "rbxassetid://132667503437735",
+        "name": "RoadWorksBarrier02Night",
+        "position": [
+          114.5426,
+          81.6272,
+          0.0
+        ],
+        "size": [
+          271.6509,
+          154.964,
+          42.5657
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/RoadWorksBarrier03Night.fbx": [
+      {
+        "meshId": "rbxassetid://108977890270092",
+        "name": "RoadWorksBarrier03Night",
+        "position": [
+          179.4886,
+          81.6272,
+          0.0
+        ],
+        "size": [
+          401.543,
+          154.964,
+          42.5657
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/RoadWorksBarrierHighNight.fbx": [
+      {
+        "meshId": "rbxassetid://83030265608513",
+        "name": "RoadWorksBarrierHighNight",
+        "position": [
+          0.0,
+          93.7315,
+          0.0
+        ],
+        "size": [
+          496.7748,
+          157.621,
+          42.5657
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/RoadWorksBarrierLowNight.fbx": [
+      {
+        "meshId": "rbxassetid://109465771054787",
+        "name": "RoadWorksBarrierLowNight",
+        "position": [
+          -0.3337,
+          35.9861,
+          0.0
+        ],
+        "size": [
+          401.543,
+          73.6213,
+          42.5657
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/SardinesNight.fbx": [
+      {
+        "meshId": "rbxassetid://119339805967282",
+        "name": "SardinesNight",
+        "position": [
+          2.9166,
+          4.4801,
+          -2.899
+        ],
+        "size": [
+          34.8718,
+          28.4361,
+          31.2715
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/SkipBlueNight.fbx": [
+      {
+        "meshId": "rbxassetid://124694461995106",
+        "name": "SkipBlueNight",
+        "position": [
+          0.0,
+          114.7019,
+          -0.0
+        ],
+        "size": [
+          334.3633,
+          229.5671,
+          540.1211
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/SkipRedNight.fbx": [
+      {
+        "meshId": "rbxassetid://90764367002261",
+        "name": "SkipRedNight",
+        "position": [
+          0.0,
+          114.7019,
+          -0.0
+        ],
+        "size": [
+          334.3633,
+          229.5671,
+          540.1211
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/SkipYellowNight.fbx": [
+      {
+        "meshId": "rbxassetid://115987095713159",
+        "name": "SkipYellowNight",
+        "position": [
+          0.0,
+          114.7019,
+          -0.0
+        ],
+        "size": [
+          334.3633,
+          229.5671,
+          540.1211
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/SkyNight.fbx": [
+      {
+        "meshId": "rbxassetid://135229645241648",
+        "name": "SkyNight",
+        "position": [
+          -0.0,
+          410.9882,
+          -511.9998
+        ],
+        "size": [
+          2048.0,
+          1873.8257,
+          1024.0005
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/StarInnerNight.fbx": [
+      {
+        "meshId": "rbxassetid://89731292235257",
+        "name": "StarInnerNight",
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "size": [
+          53.2005,
+          51.7823,
+          9.8168
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/StoneWallNight.fbx": [
+      {
+        "meshId": "rbxassetid://96837004589526",
+        "name": "StoneWallNight",
+        "position": [
+          5.3995,
+          172.7113,
+          -0.0001
+        ],
+        "size": [
+          78.8548,
+          346.9427,
+          911.7238
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/StreetLightNight.fbx": [
+      {
+        "meshId": "rbxassetid://90402064386252",
+        "name": "StreetLightNight",
+        "position": [
+          135.0795,
+          329.7331,
+          0.497
+        ],
+        "size": [
+          307.8162,
+          676.6012,
+          41.3576
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/TelegraphPole01Night.fbx": [
+      {
+        "meshId": "rbxassetid://129394257861995",
+        "name": "TelegraphPole01Night",
+        "position": [
+          -5.2759,
+          339.7642,
+          17.362
+        ],
+        "size": [
+          228.5664,
+          679.5284,
+          71.7446
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/TelegraphPole02Night.fbx": [
+      {
+        "meshId": "rbxassetid://137843790802836",
+        "name": "TelegraphPole02Night",
+        "position": [
+          -5.2759,
+          339.7642,
+          7.075
+        ],
+        "size": [
+          228.5664,
+          679.5284,
+          51.1707
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/TelegraphWiresNight.fbx": [
+      {
+        "meshId": "rbxassetid://96820539884068",
+        "name": "TelegraphWiresNight",
+        "position": [
+          -0.0001,
+          0.0,
+          -371.903
+        ],
+        "size": [
+          203.3842,
+          20.7465,
+          743.8061
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/Tree01Night.fbx": [
+      {
+        "meshId": "rbxassetid://137295480472093",
+        "name": "Tree01Night",
+        "position": [
+          -17.2594,
+          582.3086,
+          25.5947
+        ],
+        "size": [
+          768.2565,
+          1164.6172,
+          816.1489
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/Warehouse01Night.fbx": [
+      {
+        "meshId": "rbxassetid://121327764149990",
+        "name": "Warehouse01Night",
+        "position": [
+          -1291.9128,
+          811.7581,
+          -5.0338
+        ],
+        "size": [
+          1986.7183,
+          1629.9727,
+          1811.6436
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/Warehouse02Night.fbx": [
+      {
+        "meshId": "rbxassetid://121498091948617",
+        "name": "Warehouse02Night",
+        "position": [
+          -724.5494,
+          1022.0863,
+          -529.4524
+        ],
+        "size": [
+          1314.9543,
+          2047.9999,
+          1867.4396
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/Warehouse03Night.fbx": [
+      {
+        "meshId": "rbxassetid://99824935475737",
+        "name": "Warehouse03Night",
+        "position": [
+          -818.6938,
+          616.3057,
+          -710.7239
+        ],
+        "size": [
+          1520.9197,
+          1239.4331,
+          2048.0
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/WheelyBinBlueNight.fbx": [
+      {
+        "meshId": "rbxassetid://139655875438611",
+        "name": "WheelyBinBlueNight",
+        "position": [
+          -7.0666,
+          106.486,
+          0.0
+        ],
+        "size": [
+          142.4415,
+          214.1116,
+          130.5933
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/WheelyBinGreenNight.fbx": [
+      {
+        "meshId": "rbxassetid://103520730489698",
+        "name": "WheelyBinGreenNight",
+        "position": [
+          -7.0666,
+          106.486,
+          0.0
+        ],
+        "size": [
+          142.4415,
+          214.1116,
+          130.5933
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/WheelyBinRedNight.fbx": [
+      {
+        "meshId": "rbxassetid://106082786985997",
+        "name": "WheelyBinRedNight",
+        "position": [
+          -7.0666,
+          106.486,
+          0.0
+        ],
+        "size": [
+          142.4415,
+          214.1116,
+          130.5933
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/WireNight.fbx": [
+      {
+        "meshId": "rbxassetid://85635675161151",
+        "name": "WireNight",
+        "position": [
+          -0.0153,
+          0.0,
+          -371.903
+        ],
+        "size": [
+          6.9595,
+          20.7465,
+          743.806
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/WoodFence01Night.fbx": [
+      {
+        "meshId": "rbxassetid://96142723638498",
+        "name": "WoodFence01Night",
+        "position": [
+          -301.0433,
+          109.8921,
+          3.56
+        ],
+        "size": [
+          21.7281,
+          213.5678,
+          856.5104
+        ]
+      }
+    ],
+    "Assets/Models/NightTime/WoodFence02Night.fbx": [
+      {
+        "meshId": "rbxassetid://87719204979436",
+        "name": "WoodFence02Night",
+        "position": [
+          -301.0433,
+          96.1496,
+          3.56
+        ],
+        "size": [
+          21.7282,
+          186.0829,
+          846.959
+        ]
+      }
+    ],
+    "Assets/Models/RaccoonBase.fbx": [
+      {
+        "meshId": "rbxassetid://120473248311624",
+        "name": "RacoonMesh",
+        "position": [
+          0.0,
+          57.3905,
+          5.3059
+        ],
+        "size": [
+          95.4823,
+          114.7974,
+          72.4471
+        ]
+      }
+    ],
+    "Assets/Models/Rat.fbx": [
+      {
+        "meshId": "rbxassetid://102088130620328",
+        "name": "RatMesh",
+        "position": [
+          0.0,
+          -64.6534,
+          36.0728
+        ],
+        "size": [
+          135.8155,
+          130.0669,
+          180.0829
+        ]
+      }
+    ],
+    "Assets/Models/Sardines.fbx": [
+      {
+        "meshId": "rbxassetid://90439764329938",
+        "name": "Sardines",
+        "position": [
+          2.9166,
+          4.4801,
+          -2.899
+        ],
+        "size": [
+          34.8718,
+          28.4361,
+          31.2715
+        ]
+      }
+    ],
+    "Assets/Models/Shield.fbx": [
+      {
+        "meshId": "rbxassetid://98732466001244",
+        "name": "Sphere001",
+        "position": [
+          0.0,
+          64.8529,
+          -15.5263
+        ],
+        "size": [
+          139.742,
+          134.4233,
+          108.6893
+        ]
+      }
+    ],
+    "Assets/Models/Star.fbx": [
+      {
+        "meshId": "rbxassetid://75690774173432",
+        "name": "Star",
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "size": [
+          53.2005,
+          51.7823,
+          9.8168
+        ]
+      }
+    ]
+  },
+  "mesh_native_sizes": {
+    "Assets/Animation/MenuActors.fbx": [
+      153.2304,
+      200.3806,
+      290.5701
+    ],
+    "Assets/Animation/MenuEnvironmentProps.fbx": [
+      98.7907,
+      117.4004,
+      83.8494
+    ],
+    "Assets/Animation/ObstacleBin.fbx": [
+      121.9394,
+      144.9099,
+      103.4969
+    ],
+    "Assets/Animation/ObstacleRoadWorksBarrierHigh_Death.fbx": [
+      496.7748,
+      157.621,
+      42.5657
+    ],
+    "Assets/Animation/ObstacleRoadWorksBarrierLow_Death.fbx": [
+      401.543,
+      73.6213,
+      42.5657
+    ],
+    "Assets/Animation/ObstacleRoadWorksBarrier_Death.fbx": [
+      165.799,
+      154.964,
+      42.5657
+    ],
+    "Assets/Animation/ObstacleWheelyBin.fbx": [
+      140.4084,
+      199.3045,
+      130.5933
+    ],
+    "Assets/Animation/ObstacleWorkCone_Death.fbx": [
+      61.9604,
+      101.3421,
+      61.9604
+    ],
+    "Assets/Models/Clover.fbx": [
+      45.1152,
+      48.5564,
+      6.7048
+    ],
+    "Assets/Models/Daytime/Apartments01.fbx": [
+      1069.5117,
+      1165.6741,
+      1796.1461
+    ],
+    "Assets/Models/Daytime/Apartments02.fbx": [
+      1059.6064,
+      1715.8162,
+      1778.9989
+    ],
+    "Assets/Models/Daytime/Apartments03.fbx": [
+      1059.6064,
+      1715.8162,
+      1778.9989
+    ],
+    "Assets/Models/Daytime/Apartments04.fbx": [
+      1060.2134,
+      1165.6741,
+      1796.1461
+    ],
+    "Assets/Models/Daytime/BackgroundBuilding01.fbx": [
+      1060.2134,
+      1738.3733,
+      921.442
+    ],
+    "Assets/Models/Daytime/BackgroundBuilding02.fbx": [
+      1060.2134,
+      1738.3733,
+      921.442
+    ],
+    "Assets/Models/Daytime/BackgroundCircle.FBX": [
+      220.0,
+      110.0002,
+      0.001
+    ],
+    "Assets/Models/Daytime/Bin01.fbx": [
+      121.9394,
+      170.1184,
+      108.6104
+    ],
+    "Assets/Models/Daytime/BinBagClosed.fbx": [
+      89.5365,
+      117.2769,
+      109.8478
+    ],
+    "Assets/Models/Daytime/BinBagOpen.fbx": [
+      85.4816,
+      85.225,
+      116.7746
+    ],
+    "Assets/Models/Daytime/BrickWall.fbx": [
+      78.8548,
+      352.4056,
+      911.7238
+    ],
+    "Assets/Models/Daytime/Car01.fbx": [
+      147.1658,
+      35.2223,
+      35.2224
+    ],
+    "Assets/Models/Daytime/Car02.fbx": [
+      153.2375,
+      201.0443,
+      290.5737
+    ],
+    "Assets/Models/Daytime/ClothesLine01.fbx": [
+      14.3793,
+      189.9775,
+      1038.8552
+    ],
+    "Assets/Models/Daytime/ClothesLine02.fbx": [
+      31.0174,
+      195.1154,
+      1038.8552
+    ],
+    "Assets/Models/Daytime/ClothesLine03.fbx": [
+      14.3794,
+      200.1659,
+      1038.8552
+    ],
+    "Assets/Models/Daytime/Cloud01.fbx": [
+      338.7067,
+      165.6647,
+      2048.0
+    ],
+    "Assets/Models/Daytime/Cloud02.fbx": [
+      341.6636,
+      247.9403,
+      2048.0
+    ],
+    "Assets/Models/Daytime/Cloud03.fbx": [
+      209.1891,
+      151.9255,
+      2048.0
+    ],
+    "Assets/Models/Daytime/DumpsterBlue.fbx": [
+      192.719,
+      225.5878,
+      325.4463
+    ],
+    "Assets/Models/Daytime/DumpsterGreen.fbx": [
+      192.719,
+      225.5878,
+      325.4463
+    ],
+    "Assets/Models/Daytime/DumpsterRed.fbx": [
+      192.719,
+      225.5878,
+      325.4463
+    ],
+    "Assets/Models/Daytime/Fan.fbx": [
+      48.6733,
+      157.2204,
+      157.2204
+    ],
+    "Assets/Models/Daytime/FarBackBuilding01.fbx": [
+      2048.0,
+      717.4108,
+      272.753
+    ],
+    "Assets/Models/Daytime/FarBackBuilding02.fbx": [
+      2048.0,
+      704.8964,
+      501.3068
+    ],
+    "Assets/Models/Daytime/FarBackBuilding03.fbx": [
+      2047.9999,
+      750.0513,
+      746.4883
+    ],
+    "Assets/Models/Daytime/FireEscape.fbx": [
+      287.683,
+      1513.5903,
+      626.8184
+    ],
+    "Assets/Models/Daytime/Garage01.fbx": [
+      764.8374,
+      594.4561,
+      769.1111
+    ],
+    "Assets/Models/Daytime/Garage02.fbx": [
+      764.8374,
+      594.4561,
+      769.1111
+    ],
+    "Assets/Models/Daytime/Garage03.fbx": [
+      784.451,
+      460.3261,
+      769.1111
+    ],
+    "Assets/Models/Daytime/Garage04.fbx": [
+      784.451,
+      460.3261,
+      769.1111
+    ],
+    "Assets/Models/Daytime/Garage05.fbx": [
+      784.451,
+      533.308,
+      1159.3357
+    ],
+    "Assets/Models/Daytime/Garage06.fbx": [
+      784.451,
+      533.308,
+      1159.3357
+    ],
+    "Assets/Models/Daytime/GrassClump01.fbx": [
+      99.1103,
+      85.1067,
+      51.5681
+    ],
+    "Assets/Models/Daytime/House.fbx": [
+      2047.9999,
+      1214.4407,
+      1654.9302
+    ],
+    "Assets/Models/Daytime/House02.fbx": [
+      2047.9999,
+      1214.4407,
+      1654.9302
+    ],
+    "Assets/Models/Daytime/House03.fbx": [
+      2047.9999,
+      1214.4407,
+      1654.9302
+    ],
+    "Assets/Models/Daytime/ManHole.fbx": [
+      117.4725,
+      17.8792,
+      117.4687
+    ],
+    "Assets/Models/Daytime/Pipes.fbx": [
+      41.6352,
+      676.9192,
+      580.1997
+    ],
+    "Assets/Models/Daytime/PlasteredWall01.fbx": [
+      78.8548,
+      351.9358,
+      911.7238
+    ],
+    "Assets/Models/Daytime/PlasteredWall02.fbx": [
+      78.8548,
+      353.6736,
+      911.7238
+    ],
+    "Assets/Models/Daytime/Road01.fbx": [
+      2048.0,
+      14.4757,
+      893.7098
+    ],
+    "Assets/Models/Daytime/Road02.fbx": [
+      2048.0,
+      18.2923,
+      893.7099
+    ],
+    "Assets/Models/Daytime/Road03.fbx": [
+      2048.0,
+      13.1985,
+      814.8562
+    ],
+    "Assets/Models/Daytime/Road04.fbx": [
+      2048.0,
+      12.1315,
+      748.98
+    ],
+    "Assets/Models/Daytime/RoadWorksArrow.fbx": [
+      151.2891,
+      199.8001,
+      118.6902
+    ],
+    "Assets/Models/Daytime/RoadWorksBarrier01.fbx": [
+      165.799,
+      154.964,
+      42.5657
+    ],
+    "Assets/Models/Daytime/RoadWorksBarrier02.fbx": [
+      271.6509,
+      154.964,
+      42.5657
+    ],
+    "Assets/Models/Daytime/RoadWorksBarrier03.fbx": [
+      401.543,
+      154.964,
+      42.5657
+    ],
+    "Assets/Models/Daytime/RoadWorksBarrierHigh.fbx": [
+      496.7748,
+      157.621,
+      42.5657
+    ],
+    "Assets/Models/Daytime/RoadWorksBarrierLow.fbx": [
+      401.543,
+      73.6213,
+      42.5657
+    ],
+    "Assets/Models/Daytime/RoadWorksCone.fbx": [
+      61.9604,
+      101.3421,
+      61.9604
+    ],
+    "Assets/Models/Daytime/SkipBlue.fbx": [
+      334.3633,
+      229.5671,
+      540.1211
+    ],
+    "Assets/Models/Daytime/SkipRed.fbx": [
+      334.3633,
+      229.5671,
+      540.1211
+    ],
+    "Assets/Models/Daytime/SkipYellow.fbx": [
+      334.3633,
+      229.5671,
+      540.1211
+    ],
+    "Assets/Models/Daytime/Sky.fbx": [
+      2048.0,
+      1873.8257,
+      1024.0006
+    ],
+    "Assets/Models/Daytime/StoneWall.fbx": [
+      78.8548,
+      346.9427,
+      911.7238
+    ],
+    "Assets/Models/Daytime/StreetLight.fbx": [
+      307.8162,
+      676.6012,
+      41.3576
+    ],
+    "Assets/Models/Daytime/TelegraphPole01.fbx": [
+      228.5664,
+      679.5284,
+      71.7446
+    ],
+    "Assets/Models/Daytime/TelegraphPole02.fbx": [
+      228.5664,
+      679.5284,
+      51.1707
+    ],
+    "Assets/Models/Daytime/TelegraphWires.fbx": [
+      203.3842,
+      20.7465,
+      743.8061
+    ],
+    "Assets/Models/Daytime/Tree01.fbx": [
+      768.2565,
+      1164.6172,
+      816.1489
+    ],
+    "Assets/Models/Daytime/Warehouse01.fbx": [
+      1986.7183,
+      1629.9727,
+      1811.6436
+    ],
+    "Assets/Models/Daytime/Warehouse02.fbx": [
+      1314.9547,
+      2047.9999,
+      1867.4399
+    ],
+    "Assets/Models/Daytime/Warehouse03.fbx": [
+      1520.9194,
+      1239.4329,
+      2048.0
+    ],
+    "Assets/Models/Daytime/WheelyBinBlue.fbx": [
+      142.4415,
+      214.1116,
+      130.5933
+    ],
+    "Assets/Models/Daytime/WheelyBinGreen.fbx": [
+      142.4415,
+      214.1116,
+      130.5933
+    ],
+    "Assets/Models/Daytime/WheelyBinRed.fbx": [
+      142.4415,
+      214.1116,
+      130.5933
+    ],
+    "Assets/Models/Daytime/Wire.fbx": [
+      6.9595,
+      20.7465,
+      743.806
+    ],
+    "Assets/Models/Daytime/WoodFence01.fbx": [
+      21.7281,
+      213.5678,
+      856.5104
+    ],
+    "Assets/Models/Daytime/WoodFence02.fbx": [
+      21.7282,
+      186.0829,
+      846.959
+    ],
+    "Assets/Models/Dog.FBX": [
+      60.1624,
+      131.3799,
+      190.3969
+    ],
+    "Assets/Models/Fishbone.fbx": [
+      43.4568,
+      22.4945,
+      11.4934
+    ],
+    "Assets/Models/Heart.fbx": [
+      41.56,
+      39.3043,
+      14.4479
+    ],
+    "Assets/Models/Magnet.fbx": [
+      33.6068,
+      35.6658,
+      8.019
+    ],
+    "Assets/Models/Multiply.fbx": [
+      49.5077,
+      41.5958,
+      7.1241
+    ],
+    "Assets/Models/NightTime/Apartments01Night.fbx": [
+      1069.5117,
+      1165.6741,
+      1796.1461
+    ],
+    "Assets/Models/NightTime/Apartments02Night.fbx": [
+      1059.6064,
+      1715.8162,
+      1778.9989
+    ],
+    "Assets/Models/NightTime/Apartments03Night.fbx": [
+      1059.6064,
+      1715.8162,
+      1778.9989
+    ],
+    "Assets/Models/NightTime/Apartments04Night.fbx": [
+      1060.2134,
+      1165.6741,
+      1796.1461
+    ],
+    "Assets/Models/NightTime/BackgroundBuilding01Night.fbx": [
+      1060.2134,
+      1738.3733,
+      921.442
+    ],
+    "Assets/Models/NightTime/BackgroundBuilding02Night.fbx": [
+      1060.2134,
+      1738.3733,
+      921.442
+    ],
+    "Assets/Models/NightTime/BackgroundCircleNight.FBX": [
+      220.0,
+      110.0002,
+      0.001
+    ],
+    "Assets/Models/NightTime/Bin01Night.fbx": [
+      121.9394,
+      170.1184,
+      108.6104
+    ],
+    "Assets/Models/NightTime/BinBagClosedNight.fbx": [
+      89.5365,
+      117.2769,
+      109.8478
+    ],
+    "Assets/Models/NightTime/BinBagOpenNight.fbx": [
+      85.4816,
+      85.225,
+      116.7746
+    ],
+    "Assets/Models/NightTime/BrickWall01Night.fbx": [
+      78.8548,
+      352.4056,
+      911.7238
+    ],
+    "Assets/Models/NightTime/Car01Night.fbx": [
+      153.2375,
+      214.8699,
+      290.5736
+    ],
+    "Assets/Models/NightTime/Car02Night.fbx": [
+      152.0731,
+      234.9525,
+      277.2859
+    ],
+    "Assets/Models/NightTime/ClothesLine01Night.fbx": [
+      14.3793,
+      189.9775,
+      1038.8552
+    ],
+    "Assets/Models/NightTime/ClothesLine02Night.fbx": [
+      31.0174,
+      195.1154,
+      1038.8552
+    ],
+    "Assets/Models/NightTime/ClothesLine03Night.fbx": [
+      14.3794,
+      200.1659,
+      1038.8552
+    ],
+    "Assets/Models/NightTime/Cloud01Night.fbx": [
+      338.7067,
+      165.6647,
+      2048.0
+    ],
+    "Assets/Models/NightTime/Cloud02Night.fbx": [
+      341.6636,
+      247.9403,
+      2048.0
+    ],
+    "Assets/Models/NightTime/Cloud03Night.fbx": [
+      209.1891,
+      151.9255,
+      2048.0
+    ],
+    "Assets/Models/NightTime/CloverNight.fbx": [
+      45.1152,
+      48.5564,
+      6.7048
+    ],
+    "Assets/Models/NightTime/DumpsterBlueNight.fbx": [
+      192.719,
+      225.5878,
+      325.4463
+    ],
+    "Assets/Models/NightTime/DumpsterGreenNight.fbx": [
+      192.719,
+      225.5878,
+      325.4463
+    ],
+    "Assets/Models/NightTime/DumpsterRedNight.fbx": [
+      192.719,
+      225.5878,
+      325.4463
+    ],
+    "Assets/Models/NightTime/FanNight.fbx": [
+      48.6733,
+      157.2204,
+      157.2204
+    ],
+    "Assets/Models/NightTime/FarBackBuilding01Night.fbx": [
+      2048.0,
+      717.4108,
+      272.753
+    ],
+    "Assets/Models/NightTime/FarBackBuilding02Night.fbx": [
+      2048.0,
+      704.8964,
+      501.3068
+    ],
+    "Assets/Models/NightTime/FarBackBuilding03Night.fbx": [
+      2047.9999,
+      750.0513,
+      746.4883
+    ],
+    "Assets/Models/NightTime/FireEscapeNight.fbx": [
+      287.683,
+      1513.5903,
+      626.8184
+    ],
+    "Assets/Models/NightTime/FishboneNight.fbx": [
+      43.4568,
+      22.4945,
+      11.4934
+    ],
+    "Assets/Models/NightTime/Garage01Night.fbx": [
+      764.8374,
+      594.4561,
+      769.1111
+    ],
+    "Assets/Models/NightTime/Garage02Night.fbx": [
+      764.8374,
+      594.4561,
+      769.1111
+    ],
+    "Assets/Models/NightTime/Garage03Night.fbx": [
+      784.451,
+      460.3261,
+      769.1111
+    ],
+    "Assets/Models/NightTime/Garage04Night.fbx": [
+      784.451,
+      460.3261,
+      769.1111
+    ],
+    "Assets/Models/NightTime/Garage05Night.fbx": [
+      784.451,
+      533.308,
+      1159.3357
+    ],
+    "Assets/Models/NightTime/Garage06Night.fbx": [
+      784.451,
+      533.308,
+      1159.3357
+    ],
+    "Assets/Models/NightTime/GrassClumpNight.fbx": [
+      99.1103,
+      85.1067,
+      51.5681
+    ],
+    "Assets/Models/NightTime/HeartNight.fbx": [
+      41.56,
+      39.3043,
+      14.4479
+    ],
+    "Assets/Models/NightTime/House01Night.fbx": [
+      2047.9999,
+      1214.4407,
+      1654.9302
+    ],
+    "Assets/Models/NightTime/House02Night.fbx": [
+      2047.9999,
+      1214.4407,
+      1654.9302
+    ],
+    "Assets/Models/NightTime/House03Night.fbx": [
+      2047.9999,
+      1214.4407,
+      1654.9302
+    ],
+    "Assets/Models/NightTime/LightCone.fbx": [
+      591.1798,
+      638.8973,
+      582.1985
+    ],
+    "Assets/Models/NightTime/LightGlowPlane.fbx": [
+      463.1484,
+      0.001,
+      305.0288
+    ],
+    "Assets/Models/NightTime/LightPool.fbx": [
+      806.9468,
+      15.6065,
+      785.9845
+    ],
+    "Assets/Models/NightTime/LightPool02.fbx": [
+      806.9468,
+      15.6065,
+      785.9845
+    ],
+    "Assets/Models/NightTime/MagnetNight.fbx": [
+      33.6068,
+      35.6658,
+      8.019
+    ],
+    "Assets/Models/NightTime/ManHole01Night.fbx": [
+      117.4725,
+      17.8792,
+      117.4687
+    ],
+    "Assets/Models/NightTime/MultiplyerNight.fbx": [
+      41.7936,
+      41.7936,
+      8.7203
+    ],
+    "Assets/Models/NightTime/ObstacleBinNight.fbx": [
+      121.9394,
+      144.9099,
+      103.4969
+    ],
+    "Assets/Models/NightTime/ObstacleWheelyBinNight.fbx": [
+      140.4084,
+      199.3045,
+      130.5933
+    ],
+    "Assets/Models/NightTime/PipesNight.fbx": [
+      41.6352,
+      676.9192,
+      580.1997
+    ],
+    "Assets/Models/NightTime/PlasteredWall01Night.fbx": [
+      78.8548,
+      351.9358,
+      911.7238
+    ],
+    "Assets/Models/NightTime/PlasteredWall02Night.fbx": [
+      78.8548,
+      353.6736,
+      911.7238
+    ],
+    "Assets/Models/NightTime/Road01Night.fbx": [
+      2048.0,
+      14.4757,
+      893.7098
+    ],
+    "Assets/Models/NightTime/Road02Night.fbx": [
+      2048.0,
+      18.2923,
+      893.7099
+    ],
+    "Assets/Models/NightTime/Road03Night.fbx": [
+      2048.0,
+      13.1985,
+      814.8562
+    ],
+    "Assets/Models/NightTime/Road04Night.fbx": [
+      2048.0,
+      12.1315,
+      748.98
+    ],
+    "Assets/Models/NightTime/RoadWorkConeNight.fbx": [
+      61.9604,
+      101.3421,
+      61.9604
+    ],
+    "Assets/Models/NightTime/RoadWorksArrowNight.fbx": [
+      151.2891,
+      199.8001,
+      118.6902
+    ],
+    "Assets/Models/NightTime/RoadWorksBarrier01Night.fbx": [
+      165.799,
+      154.964,
+      42.5657
+    ],
+    "Assets/Models/NightTime/RoadWorksBarrier02Night.fbx": [
+      271.6509,
+      154.964,
+      42.5657
+    ],
+    "Assets/Models/NightTime/RoadWorksBarrier03Night.fbx": [
+      401.543,
+      154.964,
+      42.5657
+    ],
+    "Assets/Models/NightTime/RoadWorksBarrierHighNight.fbx": [
+      496.7748,
+      157.621,
+      42.5657
+    ],
+    "Assets/Models/NightTime/RoadWorksBarrierLowNight.fbx": [
+      401.543,
+      73.6213,
+      42.5657
+    ],
+    "Assets/Models/NightTime/SardinesNight.fbx": [
+      34.8718,
+      28.4361,
+      31.2715
+    ],
+    "Assets/Models/NightTime/SkipBlueNight.fbx": [
+      334.3633,
+      229.5671,
+      540.1211
+    ],
+    "Assets/Models/NightTime/SkipRedNight.fbx": [
+      334.3633,
+      229.5671,
+      540.1211
+    ],
+    "Assets/Models/NightTime/SkipYellowNight.fbx": [
+      334.3633,
+      229.5671,
+      540.1211
+    ],
+    "Assets/Models/NightTime/SkyNight.fbx": [
+      2048.0,
+      1873.8257,
+      1024.0005
+    ],
+    "Assets/Models/NightTime/StarInnerNight.fbx": [
+      53.2005,
+      51.7823,
+      9.8168
+    ],
+    "Assets/Models/NightTime/StoneWallNight.fbx": [
+      78.8548,
+      346.9427,
+      911.7238
+    ],
+    "Assets/Models/NightTime/StreetLightNight.fbx": [
+      307.8162,
+      676.6012,
+      41.3576
+    ],
+    "Assets/Models/NightTime/TelegraphPole01Night.fbx": [
+      228.5664,
+      679.5284,
+      71.7446
+    ],
+    "Assets/Models/NightTime/TelegraphPole02Night.fbx": [
+      228.5664,
+      679.5284,
+      51.1707
+    ],
+    "Assets/Models/NightTime/TelegraphWiresNight.fbx": [
+      203.3842,
+      20.7465,
+      743.8061
+    ],
+    "Assets/Models/NightTime/Tree01Night.fbx": [
+      768.2565,
+      1164.6172,
+      816.1489
+    ],
+    "Assets/Models/NightTime/Warehouse01Night.fbx": [
+      1986.7183,
+      1629.9727,
+      1811.6436
+    ],
+    "Assets/Models/NightTime/Warehouse02Night.fbx": [
+      1314.9543,
+      2047.9999,
+      1867.4396
+    ],
+    "Assets/Models/NightTime/Warehouse03Night.fbx": [
+      1520.9197,
+      1239.4331,
+      2048.0
+    ],
+    "Assets/Models/NightTime/WheelyBinBlueNight.fbx": [
+      142.4415,
+      214.1116,
+      130.5933
+    ],
+    "Assets/Models/NightTime/WheelyBinGreenNight.fbx": [
+      142.4415,
+      214.1116,
+      130.5933
+    ],
+    "Assets/Models/NightTime/WheelyBinRedNight.fbx": [
+      142.4415,
+      214.1116,
+      130.5933
+    ],
+    "Assets/Models/NightTime/WireNight.fbx": [
+      6.9595,
+      20.7465,
+      743.806
+    ],
+    "Assets/Models/NightTime/WoodFence01Night.fbx": [
+      21.7281,
+      213.5678,
+      856.5104
+    ],
+    "Assets/Models/NightTime/WoodFence02Night.fbx": [
+      21.7282,
+      186.0829,
+      846.959
+    ],
+    "Assets/Models/RaccoonBase.fbx": [
+      95.4823,
+      114.7974,
+      72.4471
+    ],
+    "Assets/Models/Rat.fbx": [
+      135.8155,
+      130.0669,
+      180.0829
+    ],
+    "Assets/Models/Sardines.fbx": [
+      34.8718,
+      28.4361,
+      31.2715
+    ],
+    "Assets/Models/Shield.fbx": [
+      139.742,
+      134.4233,
+      108.6893
+    ],
+    "Assets/Models/Star.fbx": [
+      53.2005,
+      51.7823,
+      9.8168
+    ]
+  },
+  "place_id": 120528417090133,
+  "universe_id": 10184038585,
+  "uploaded_assets": {
+    "Assets/Animation/MenuActors.fbx": "rbxassetid://137278737983890",
+    "Assets/Animation/MenuEnvironmentProps.fbx": "rbxassetid://102503998171481",
+    "Assets/Animation/ObstacleBin.fbx": "rbxassetid://93728765989361",
+    "Assets/Animation/ObstacleRoadWorksBarrierHigh_Death.fbx": "rbxassetid://83432225338176",
+    "Assets/Animation/ObstacleRoadWorksBarrierLow_Death.fbx": "rbxassetid://133673864940210",
+    "Assets/Animation/ObstacleRoadWorksBarrier_Death.fbx": "rbxassetid://81869528416407",
+    "Assets/Animation/ObstacleWheelyBin.fbx": "rbxassetid://77709223569901",
+    "Assets/Animation/ObstacleWorkCone_Death.fbx": "rbxassetid://101007100004928",
+    "Assets/Models/Clover.fbx": "rbxassetid://132471704152088",
+    "Assets/Models/Daytime/Apartments01.fbx": "rbxassetid://99123908109246",
+    "Assets/Models/Daytime/Apartments02.fbx": "rbxassetid://82203625090626",
+    "Assets/Models/Daytime/Apartments03.fbx": "rbxassetid://97069559021364",
+    "Assets/Models/Daytime/Apartments04.fbx": "rbxassetid://79978853205612",
+    "Assets/Models/Daytime/BackgroundBuilding01.fbx": "rbxassetid://125639720727545",
+    "Assets/Models/Daytime/BackgroundBuilding02.fbx": "rbxassetid://130743665422383",
+    "Assets/Models/Daytime/BackgroundCircle.FBX": "rbxassetid://113888472364743",
+    "Assets/Models/Daytime/Bin01.fbx": "rbxassetid://81430914239274",
+    "Assets/Models/Daytime/BinBagClosed.fbx": "rbxassetid://137330154565803",
+    "Assets/Models/Daytime/BinBagOpen.fbx": "rbxassetid://82941963536534",
+    "Assets/Models/Daytime/BrickWall.fbx": "rbxassetid://71778292310296",
+    "Assets/Models/Daytime/Car01.fbx": "rbxassetid://101502421310324",
+    "Assets/Models/Daytime/Car02.fbx": "rbxassetid://73186092669766",
+    "Assets/Models/Daytime/ClothesLine01.fbx": "rbxassetid://95193462721991",
+    "Assets/Models/Daytime/ClothesLine02.fbx": "rbxassetid://92418175872066",
+    "Assets/Models/Daytime/ClothesLine03.fbx": "rbxassetid://92530529579186",
+    "Assets/Models/Daytime/Cloud01.fbx": "rbxassetid://130687497566834",
+    "Assets/Models/Daytime/Cloud02.fbx": "rbxassetid://92681431772815",
+    "Assets/Models/Daytime/Cloud03.fbx": "rbxassetid://99582626410983",
+    "Assets/Models/Daytime/DumpsterBlue.fbx": "rbxassetid://116533339819228",
+    "Assets/Models/Daytime/DumpsterGreen.fbx": "rbxassetid://103634747326892",
+    "Assets/Models/Daytime/DumpsterRed.fbx": "rbxassetid://97909990226874",
+    "Assets/Models/Daytime/Fan.fbx": "rbxassetid://84713406753034",
+    "Assets/Models/Daytime/FarBackBuilding01.fbx": "rbxassetid://133041944621963",
+    "Assets/Models/Daytime/FarBackBuilding02.fbx": "rbxassetid://122986334931099",
+    "Assets/Models/Daytime/FarBackBuilding03.fbx": "rbxassetid://122192769631168",
+    "Assets/Models/Daytime/FireEscape.fbx": "rbxassetid://130488819771003",
+    "Assets/Models/Daytime/Garage01.fbx": "rbxassetid://105425531434694",
+    "Assets/Models/Daytime/Garage02.fbx": "rbxassetid://97146973671046",
+    "Assets/Models/Daytime/Garage03.fbx": "rbxassetid://74625661578869",
+    "Assets/Models/Daytime/Garage04.fbx": "rbxassetid://116428082259035",
+    "Assets/Models/Daytime/Garage05.fbx": "rbxassetid://126266238251987",
+    "Assets/Models/Daytime/Garage06.fbx": "rbxassetid://74150721802554",
+    "Assets/Models/Daytime/GrassClump01.fbx": "rbxassetid://132673513984296",
+    "Assets/Models/Daytime/House.fbx": "rbxassetid://100372360363416",
+    "Assets/Models/Daytime/House02.fbx": "rbxassetid://115829411991641",
+    "Assets/Models/Daytime/House03.fbx": "rbxassetid://132715713983494",
+    "Assets/Models/Daytime/ManHole.fbx": "rbxassetid://99084656388123",
+    "Assets/Models/Daytime/Pipes.fbx": "rbxassetid://79884844509716",
+    "Assets/Models/Daytime/PlasteredWall01.fbx": "rbxassetid://94574809145170",
+    "Assets/Models/Daytime/PlasteredWall02.fbx": "rbxassetid://101902351084426",
+    "Assets/Models/Daytime/Road01.fbx": "rbxassetid://136451118936020",
+    "Assets/Models/Daytime/Road02.fbx": "rbxassetid://103977675137179",
+    "Assets/Models/Daytime/Road03.fbx": "rbxassetid://136420973322047",
+    "Assets/Models/Daytime/Road04.fbx": "rbxassetid://107052430463490",
+    "Assets/Models/Daytime/RoadWorksArrow.fbx": "rbxassetid://87074314899584",
+    "Assets/Models/Daytime/RoadWorksBarrier01.fbx": "rbxassetid://86410365677294",
+    "Assets/Models/Daytime/RoadWorksBarrier02.fbx": "rbxassetid://100420800785786",
+    "Assets/Models/Daytime/RoadWorksBarrier03.fbx": "rbxassetid://93483188745433",
+    "Assets/Models/Daytime/RoadWorksBarrierHigh.fbx": "rbxassetid://101507897407067",
+    "Assets/Models/Daytime/RoadWorksBarrierLow.fbx": "rbxassetid://93874835730180",
+    "Assets/Models/Daytime/RoadWorksCone.fbx": "rbxassetid://115446266078220",
+    "Assets/Models/Daytime/SkipBlue.fbx": "rbxassetid://116383661874191",
+    "Assets/Models/Daytime/SkipRed.fbx": "rbxassetid://91138932822311",
+    "Assets/Models/Daytime/SkipYellow.fbx": "rbxassetid://107155826850874",
+    "Assets/Models/Daytime/Sky.fbx": "rbxassetid://96286035407028",
+    "Assets/Models/Daytime/StoneWall.fbx": "rbxassetid://98838055703552",
+    "Assets/Models/Daytime/StreetLight.fbx": "rbxassetid://73767691978916",
+    "Assets/Models/Daytime/TelegraphPole01.fbx": "rbxassetid://90174959237357",
+    "Assets/Models/Daytime/TelegraphPole02.fbx": "rbxassetid://140672408796521",
+    "Assets/Models/Daytime/TelegraphWires.fbx": "rbxassetid://98602824808066",
+    "Assets/Models/Daytime/Tree01.fbx": "rbxassetid://126811513695352",
+    "Assets/Models/Daytime/Warehouse01.fbx": "rbxassetid://136482652292237",
+    "Assets/Models/Daytime/Warehouse02.fbx": "rbxassetid://105011905541878",
+    "Assets/Models/Daytime/Warehouse03.fbx": "rbxassetid://124736587384461",
+    "Assets/Models/Daytime/WheelyBinBlue.fbx": "rbxassetid://97615985264376",
+    "Assets/Models/Daytime/WheelyBinGreen.fbx": "rbxassetid://75163674799384",
+    "Assets/Models/Daytime/WheelyBinRed.fbx": "rbxassetid://96453369773947",
+    "Assets/Models/Daytime/Wire.fbx": "rbxassetid://131879926216685",
+    "Assets/Models/Daytime/WoodFence01.fbx": "rbxassetid://112043169069827",
+    "Assets/Models/Daytime/WoodFence02.fbx": "rbxassetid://139774359452278",
+    "Assets/Models/Dog.FBX": "rbxassetid://96853353881589",
+    "Assets/Models/Fishbone.fbx": "rbxassetid://80466532567496",
+    "Assets/Models/Heart.fbx": "rbxassetid://122639487185700",
+    "Assets/Models/Magnet.fbx": "rbxassetid://126427001950477",
+    "Assets/Models/Multiply.fbx": "rbxassetid://115764317262035",
+    "Assets/Models/NightTime/Apartments01Night.fbx": "rbxassetid://140558247146083",
+    "Assets/Models/NightTime/Apartments02Night.fbx": "rbxassetid://135270051896881",
+    "Assets/Models/NightTime/Apartments03Night.fbx": "rbxassetid://138198459176216",
+    "Assets/Models/NightTime/Apartments04Night.fbx": "rbxassetid://132475757654456",
+    "Assets/Models/NightTime/BackgroundBuilding01Night.fbx": "rbxassetid://102168325994739",
+    "Assets/Models/NightTime/BackgroundBuilding02Night.fbx": "rbxassetid://79758399557921",
+    "Assets/Models/NightTime/BackgroundCircleNight.FBX": "rbxassetid://114746015469076",
+    "Assets/Models/NightTime/Bin01Night.fbx": "rbxassetid://91831766108234",
+    "Assets/Models/NightTime/BinBagClosedNight.fbx": "rbxassetid://74885503721413",
+    "Assets/Models/NightTime/BinBagOpenNight.fbx": "rbxassetid://98925763873569",
+    "Assets/Models/NightTime/BrickWall01Night.fbx": "rbxassetid://136052263381957",
+    "Assets/Models/NightTime/Car01Night.fbx": "rbxassetid://96461137247111",
+    "Assets/Models/NightTime/Car02Night.fbx": "rbxassetid://133855711011062",
+    "Assets/Models/NightTime/ClothesLine01Night.fbx": "rbxassetid://102719802873487",
+    "Assets/Models/NightTime/ClothesLine02Night.fbx": "rbxassetid://113328632644055",
+    "Assets/Models/NightTime/ClothesLine03Night.fbx": "rbxassetid://107699393766154",
+    "Assets/Models/NightTime/Cloud01Night.fbx": "rbxassetid://80018709391170",
+    "Assets/Models/NightTime/Cloud02Night.fbx": "rbxassetid://127064107746739",
+    "Assets/Models/NightTime/Cloud03Night.fbx": "rbxassetid://75095120652129",
+    "Assets/Models/NightTime/CloverNight.fbx": "rbxassetid://84649248696687",
+    "Assets/Models/NightTime/DumpsterBlueNight.fbx": "rbxassetid://109396679212455",
+    "Assets/Models/NightTime/DumpsterGreenNight.fbx": "rbxassetid://90478484268123",
+    "Assets/Models/NightTime/DumpsterRedNight.fbx": "rbxassetid://117509505974877",
+    "Assets/Models/NightTime/FanNight.fbx": "rbxassetid://132795583294115",
+    "Assets/Models/NightTime/FarBackBuilding01Night.fbx": "rbxassetid://91579255918634",
+    "Assets/Models/NightTime/FarBackBuilding02Night.fbx": "rbxassetid://102242368095919",
+    "Assets/Models/NightTime/FarBackBuilding03Night.fbx": "rbxassetid://94645261416983",
+    "Assets/Models/NightTime/FireEscapeNight.fbx": "rbxassetid://134078597591170",
+    "Assets/Models/NightTime/FishboneNight.fbx": "rbxassetid://124917125934047",
+    "Assets/Models/NightTime/Garage01Night.fbx": "rbxassetid://138156044397455",
+    "Assets/Models/NightTime/Garage02Night.fbx": "rbxassetid://104709648872468",
+    "Assets/Models/NightTime/Garage03Night.fbx": "rbxassetid://87510711459414",
+    "Assets/Models/NightTime/Garage04Night.fbx": "rbxassetid://112733035682205",
+    "Assets/Models/NightTime/Garage05Night.fbx": "rbxassetid://109038809183031",
+    "Assets/Models/NightTime/Garage06Night.fbx": "rbxassetid://120830014328671",
+    "Assets/Models/NightTime/GrassClumpNight.fbx": "rbxassetid://85549480587754",
+    "Assets/Models/NightTime/HeartNight.fbx": "rbxassetid://134642880061445",
+    "Assets/Models/NightTime/House01Night.fbx": "rbxassetid://93437268649073",
+    "Assets/Models/NightTime/House02Night.fbx": "rbxassetid://73336616353459",
+    "Assets/Models/NightTime/House03Night.fbx": "rbxassetid://74762660818650",
+    "Assets/Models/NightTime/LightCone.fbx": "rbxassetid://86725781901060",
+    "Assets/Models/NightTime/LightGlowPlane.fbx": "rbxassetid://126734925931279",
+    "Assets/Models/NightTime/LightPool.fbx": "rbxassetid://138505629013097",
+    "Assets/Models/NightTime/LightPool02.fbx": "rbxassetid://133049134129022",
+    "Assets/Models/NightTime/MagnetNight.fbx": "rbxassetid://95111427709846",
+    "Assets/Models/NightTime/ManHole01Night.fbx": "rbxassetid://136179211060411",
+    "Assets/Models/NightTime/MultiplyerNight.fbx": "rbxassetid://91715754934275",
+    "Assets/Models/NightTime/ObstacleBinNight.fbx": "rbxassetid://96252634181124",
+    "Assets/Models/NightTime/ObstacleWheelyBinNight.fbx": "rbxassetid://98302376098203",
+    "Assets/Models/NightTime/PipesNight.fbx": "rbxassetid://86900957570347",
+    "Assets/Models/NightTime/PlasteredWall01Night.fbx": "rbxassetid://135539360633256",
+    "Assets/Models/NightTime/PlasteredWall02Night.fbx": "rbxassetid://125975830000671",
+    "Assets/Models/NightTime/Road01Night.fbx": "rbxassetid://127435024851937",
+    "Assets/Models/NightTime/Road02Night.fbx": "rbxassetid://135149852996648",
+    "Assets/Models/NightTime/Road03Night.fbx": "rbxassetid://116615247403895",
+    "Assets/Models/NightTime/Road04Night.fbx": "rbxassetid://136967915374854",
+    "Assets/Models/NightTime/RoadWorkConeNight.fbx": "rbxassetid://95159824466834",
+    "Assets/Models/NightTime/RoadWorksArrowNight.fbx": "rbxassetid://126219045549988",
+    "Assets/Models/NightTime/RoadWorksBarrier01Night.fbx": "rbxassetid://109957039091552",
+    "Assets/Models/NightTime/RoadWorksBarrier02Night.fbx": "rbxassetid://119026099906563",
+    "Assets/Models/NightTime/RoadWorksBarrier03Night.fbx": "rbxassetid://107075467426184",
+    "Assets/Models/NightTime/RoadWorksBarrierHighNight.fbx": "rbxassetid://72415928813981",
+    "Assets/Models/NightTime/RoadWorksBarrierLowNight.fbx": "rbxassetid://132606471762486",
+    "Assets/Models/NightTime/SardinesNight.fbx": "rbxassetid://115188395725503",
+    "Assets/Models/NightTime/SkipBlueNight.fbx": "rbxassetid://75740791434175",
+    "Assets/Models/NightTime/SkipRedNight.fbx": "rbxassetid://119687908953179",
+    "Assets/Models/NightTime/SkipYellowNight.fbx": "rbxassetid://136032538291732",
+    "Assets/Models/NightTime/SkyNight.fbx": "rbxassetid://131792653682071",
+    "Assets/Models/NightTime/StarInnerNight.fbx": "rbxassetid://83599518195898",
+    "Assets/Models/NightTime/StoneWallNight.fbx": "rbxassetid://74758235347134",
+    "Assets/Models/NightTime/StreetLightNight.fbx": "rbxassetid://96817395964692",
+    "Assets/Models/NightTime/TelegraphPole01Night.fbx": "rbxassetid://92080564507433",
+    "Assets/Models/NightTime/TelegraphPole02Night.fbx": "rbxassetid://85593262498513",
+    "Assets/Models/NightTime/TelegraphWiresNight.fbx": "rbxassetid://75359245800729",
+    "Assets/Models/NightTime/Tree01Night.fbx": "rbxassetid://85850916030372",
+    "Assets/Models/NightTime/Warehouse01Night.fbx": "rbxassetid://122334501658033",
+    "Assets/Models/NightTime/Warehouse02Night.fbx": "rbxassetid://104117562013089",
+    "Assets/Models/NightTime/Warehouse03Night.fbx": "rbxassetid://117316146977712",
+    "Assets/Models/NightTime/WheelyBinBlueNight.fbx": "rbxassetid://82632950838113",
+    "Assets/Models/NightTime/WheelyBinGreenNight.fbx": "rbxassetid://81318041790066",
+    "Assets/Models/NightTime/WheelyBinRedNight.fbx": "rbxassetid://104665292846174",
+    "Assets/Models/NightTime/WireNight.fbx": "rbxassetid://93391754376950",
+    "Assets/Models/NightTime/WoodFence01Night.fbx": "rbxassetid://82447357335804",
+    "Assets/Models/NightTime/WoodFence02Night.fbx": "rbxassetid://132225761286010",
+    "Assets/Models/RaccoonBase.fbx": "rbxassetid://74256557915710",
+    "Assets/Models/Rat.fbx": "rbxassetid://137797984707538",
+    "Assets/Models/Sardines.fbx": "rbxassetid://120215066489645",
+    "Assets/Models/Shield.fbx": "rbxassetid://132387223834780",
+    "Assets/Models/Star.fbx": "rbxassetid://72512552302872",
+    "Assets/Sounds/Music/DeathLoop.ogg": "rbxassetid://97472591960156",
+    "Assets/Sounds/Music/MenuTheme.ogg": "rbxassetid://85412610451899",
+    "Assets/Sounds/SFX/4321.ogg": "rbxassetid://116817428120223",
+    "Assets/Sounds/SFX/ButtonPresses.ogg": "rbxassetid://75133261978163",
+    "Assets/Sounds/SFX/Cat/CatDeath.ogg": "rbxassetid://90639204541218",
+    "Assets/Sounds/SFX/Cat/CatInjured.ogg": "rbxassetid://135954027794637",
+    "Assets/Sounds/SFX/Cat/CatJump.ogg": "rbxassetid://78517796966123",
+    "Assets/Sounds/SFX/Death.ogg": "rbxassetid://88426910815265",
+    "Assets/Sounds/SFX/Dog/DogGrowlLoop1.ogg": "rbxassetid://128941828329664",
+    "Assets/Sounds/SFX/Dog/DogGrowlLoop2.ogg": "rbxassetid://72136687825225",
+    "Assets/Sounds/SFX/Dog/DogHit.ogg": "rbxassetid://83073339941159",
+    "Assets/Sounds/SFX/FishboneCollection.ogg": "rbxassetid://96719598735990",
+    "Assets/Sounds/SFX/Invincible.ogg": "rbxassetid://107949339939285",
+    "Assets/Sounds/SFX/Magnet.ogg": "rbxassetid://113364212465767",
+    "Assets/Sounds/SFX/MenuClaimMission.ogg": "rbxassetid://74069052697813",
+    "Assets/Sounds/SFX/PowerUp.ogg": "rbxassetid://70746844872385",
+    "Assets/Sounds/SFX/PremiumCurrency.ogg": "rbxassetid://113142062580654",
+    "Assets/Sounds/SFX/Raccoon/RaccoonDead.ogg": "rbxassetid://114630155887204",
+    "Assets/Sounds/SFX/Raccoon/RaccoonHurt.ogg": "rbxassetid://108320654295730",
+    "Assets/Sounds/SFX/Raccoon/RaccoonJump.ogg": "rbxassetid://73106664839443",
+    "Assets/Sounds/SFX/Rat/RatHit.ogg": "rbxassetid://136089435834367",
+    "Assets/Sounds/SFX/Rat/RatLoop1.ogg": "rbxassetid://72425317884864",
+    "Assets/Sounds/SFX/Rat/RatLoop2.ogg": "rbxassetid://107173654320659",
+    "Assets/Sounds/SFX/Slide.ogg": "rbxassetid://97459431411880",
+    "Assets/Sounds/SFX/TrafficCone.ogg": "rbxassetid://83693537542534",
+    "Assets/Sounds/SFX/TrashCan.ogg": "rbxassetid://72382735644575",
+    "Assets/Sounds/SFX/WheelieBin.ogg": "rbxassetid://117807579027723",
+    "Assets/Sounds/SFX/WoodenBarrier.ogg": "rbxassetid://77413548786977",
+    "Assets/Sounds/Stems/STEMSMainTrackMono.ogg": "rbxassetid://86959349008334",
+    "Assets/Sounds/Stems/STEMSSpeed1BongosMono.ogg": "rbxassetid://90177918463151",
+    "Assets/Sounds/Stems/STEMSSpeed1HatsMono.ogg": "rbxassetid://91178197530381",
+    "Assets/Sounds/Stems/STEMSSpeed2Choir.ogg": "rbxassetid://83695737095599",
+    "Assets/Sounds/Stems/STEMSSpeed2ChoirMono.ogg": "rbxassetid://80625991492640",
+    "Assets/Sounds/Stems/STEMSSpeed3StringsMono.ogg": "rbxassetid://118494683568408",
+    "Assets/Sounds/Stems/STEMSSpeed4SynthMono.ogg": "rbxassetid://108495048918216",
+    "Assets/Textures/BinAlbedo.tif": "rbxassetid://117727535421788",
+    "Assets/Textures/BinBagsAlbedo.tif": "rbxassetid://91633780300820",
+    "Assets/Textures/BinNightAlbedo.tif": "rbxassetid://138501913738278",
+    "Assets/Textures/BlobShadow.png": "rbxassetid://87104649660097",
+    "Assets/Textures/BrickWallAlbedo.tif": "rbxassetid://100590676967772",
+    "Assets/Textures/Car01Albedo.tif": "rbxassetid://139279901025597",
+    "Assets/Textures/Car02Albedo.tif": "rbxassetid://118057417998623",
+    "Assets/Textures/CatAlbedo.tif": "rbxassetid://138998348824979",
+    "Assets/Textures/CloverAlbedo.tif": "rbxassetid://123773854310171",
+    "Assets/Textures/ConstructionWorkerAlbedo.tif": "rbxassetid://123432629686506",
+    "Assets/Textures/CorrugatedMetalAlbedo.tif": "rbxassetid://80514386673107",
+    "Assets/Textures/DogAlbedo.tif": "rbxassetid://121033467084129",
+    "Assets/Textures/DogNightAlbedo.tif": "rbxassetid://113561313946154",
+    "Assets/Textures/DumpsterAlbedo.tif": "rbxassetid://130218750460169",
+    "Assets/Textures/FishboneAlbedo.tif": "rbxassetid://81869168884955",
+    "Assets/Textures/Grad.tif": "rbxassetid://117664018722235",
+    "Assets/Textures/Graffiti/Graffiti01.png": "rbxassetid://99066515923539",
+    "Assets/Textures/Graffiti/Graffiti02.png": "rbxassetid://92532686199518",
+    "Assets/Textures/Graffiti/Graffiti03.png": "rbxassetid://85414198678709",
+    "Assets/Textures/Graffiti/Graffiti04.png": "rbxassetid://99146710840119",
+    "Assets/Textures/Graffiti/Graffiti05.png": "rbxassetid://130940393471070",
+    "Assets/Textures/Graffiti/Graffiti06.png": "rbxassetid://88652683110516",
+    "Assets/Textures/Graffiti/Graffiti07.png": "rbxassetid://115928032368898",
+    "Assets/Textures/Graffiti/Graffiti08.png": "rbxassetid://126574747536352",
+    "Assets/Textures/Graffiti/Graffiti09.png": "rbxassetid://78565493073098",
+    "Assets/Textures/Graffiti/Graffiti10.png": "rbxassetid://107228083986858",
+    "Assets/Textures/Graffiti/Graffiti11.png": "rbxassetid://82670446068025",
+    "Assets/Textures/Graffiti/Graffiti12.png": "rbxassetid://77795482849212",
+    "Assets/Textures/Graffiti/Graffiti13.png": "rbxassetid://134132130230495",
+    "Assets/Textures/GrassGradientAlbedo.tif": "rbxassetid://88307263537023",
+    "Assets/Textures/HeartAlbedo.tif": "rbxassetid://85839780520127",
+    "Assets/Textures/HeartParticle.png": "rbxassetid://106680840330854",
+    "Assets/Textures/LightGlowSquareAlbedo.tif": "rbxassetid://80575808006906",
+    "Assets/Textures/LightPoolAlbedo.tif": "rbxassetid://89418334350822",
+    "Assets/Textures/MagnetAlbedo.tif": "rbxassetid://89314606949154",
+    "Assets/Textures/MagnetSparks.png": "rbxassetid://101012958920379",
+    "Assets/Textures/ManHoleAlbedo.tif": "rbxassetid://84010821145939",
+    "Assets/Textures/MultiplierParticle.png": "rbxassetid://87287710286612",
+    "Assets/Textures/Particle01.png": "rbxassetid://109843344925801",
+    "Assets/Textures/PartyHatBowtieAlbedo.tif": "rbxassetid://96219855378570",
+    "Assets/Textures/PipeAlbedo.tif": "rbxassetid://130585552558961",
+    "Assets/Textures/PlasterAlbedo.tif": "rbxassetid://93421772673362",
+    "Assets/Textures/Puff.png": "rbxassetid://72841027801858",
+    "Assets/Textures/RacoonAlbedo.tif": "rbxassetid://75667583485929",
+    "Assets/Textures/RatAlbedo.tif": "rbxassetid://139733202528318",
+    "Assets/Textures/RatNightAlbedo.tif": "rbxassetid://123178675581737",
+    "Assets/Textures/RubbishAlbedo.tif": "rbxassetid://74715197682821",
+    "Assets/Textures/SardinesGoldAlbedo.tif": "rbxassetid://130961211343500",
+    "Assets/Textures/SkipAlbedo.tif": "rbxassetid://84906630181907",
+    "Assets/Textures/SlatsAlbedo.tif": "rbxassetid://129614227971197",
+    "Assets/Textures/SmokePuff.png": "rbxassetid://135683026160588",
+    "Assets/Textures/Sparkle.png": "rbxassetid://113381949582743",
+    "Assets/Textures/Star.png": "rbxassetid://86732727079842",
+    "Assets/Textures/StarAlbedo.png": "rbxassetid://120890788624231",
+    "Assets/Textures/StoneWallAlbedo.tif": "rbxassetid://121930461825559",
+    "Assets/Textures/TreeBranchAlbedo.png": "rbxassetid://73025400026300",
+    "Assets/Textures/WarningLightAlbedo.tif": "rbxassetid://82720890335750",
+    "Assets/Textures/WashingLineClothesAlbedo.png": "rbxassetid://85454014760350",
+    "Assets/Textures/WheelyBinAlbedo.tif": "rbxassetid://134529538734515",
+    "Assets/UI/Logo.png": "rbxassetid://91464739194648",
+    "Assets/UI/StoreIcon.png": "rbxassetid://120768316240619",
+    "Assets/UI/UIBorderTransparent.png": "rbxassetid://138818738561964",
+    "Assets/UI/UISpritesheet.png": "rbxassetid://123715113861109",
+    "Assets/UI/Unity.png": "rbxassetid://103121254233852",
+    "Packages/com.unity.asset-store-tools/Editor/AssetStoreUploader/Icons/open-in-browser.png": "rbxassetid://93668802792383",
+    "Packages/com.unity.asset-store-tools/Editor/AssetStoreUploader/Icons/publisher_portal_black.png": "rbxassetid://81196491556484",
+    "Packages/com.unity.asset-store-tools/Editor/AssetStoreUploader/Icons/publisher_portal_white.png": "rbxassetid://132250259835140",
+    "Packages/com.unity.asset-store-tools/Editor/AssetStoreValidator/Icons/error.png": "rbxassetid://79649191739417",
+    "Packages/com.unity.asset-store-tools/Editor/AssetStoreValidator/Icons/error_d.png": "rbxassetid://121143178026262",
+    "Packages/com.unity.asset-store-tools/Editor/AssetStoreValidator/Icons/success.png": "rbxassetid://78408076096137",
+    "Packages/com.unity.asset-store-tools/Editor/AssetStoreValidator/Icons/success_d.png": "rbxassetid://115225981044300",
+    "Packages/com.unity.asset-store-tools/Editor/AssetStoreValidator/Icons/undefined.png": "rbxassetid://105762832994743",
+    "Packages/com.unity.asset-store-tools/Editor/AssetStoreValidator/Icons/undefined_d.png": "rbxassetid://136529950276237",
+    "Packages/com.unity.asset-store-tools/Editor/AssetStoreValidator/Icons/warning.png": "rbxassetid://118824985693871",
+    "Packages/com.unity.asset-store-tools/Editor/AssetStoreValidator/Icons/warning_d.png": "rbxassetid://92858875703742"
+  }
+}
