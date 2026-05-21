@@ -236,6 +236,97 @@ def classify_scene_runtime_domains(
     )
 
 
+class CrossDomainEdge(TypedDict):
+    """One client<->server reference identified at conversion time.
+
+    ``from_script`` / ``to_script`` are the canonical script ids; the
+    domains are the post-classifier verdicts. PR4's host runtime applies
+    the v1 cross-domain policy (inject ``nil`` + log) at start; this
+    Python-side enumeration lets ``write_output`` surface the boundary
+    to ``UNCONVERTED.md`` BEFORE the operator ships the place.
+    """
+
+    from_instance: str
+    to_instance: str
+    from_script: str
+    to_script: str
+    field: str
+    from_domain: str
+    to_domain: str
+    owner_kind: str
+    owner_ref: str
+
+
+def compute_cross_domain_edges(
+    scene_runtime: SceneRuntimeArtifact,
+) -> list[CrossDomainEdge]:
+    """Enumerate every cross-domain serialized reference in the plan.
+
+    A reference qualifies iff:
+      - ``target_kind == "component"`` (peer-MonoBehaviour ref)
+      - Both source and target instances resolve to modules with
+        non-``"legacy"`` domains assigned by the classifier
+      - The two domains differ
+
+    Pure function; does not mutate ``scene_runtime``.
+    """
+    modules = scene_runtime.get("modules", {})
+    scenes = scene_runtime.get("scenes", {})
+    prefabs = scene_runtime.get("prefabs", {})
+
+    # Build instance_id -> script_id lookup over scenes + prefabs.
+    instance_to_script: dict[str, str] = {}
+    for scene in scenes.values():
+        for inst in scene.get("instances", []):
+            instance_to_script[inst["instance_id"]] = inst["script_id"]
+    for prefab in prefabs.values():
+        for inst in prefab.get("instances", []):
+            instance_to_script[inst["instance_id"]] = inst["script_id"]
+
+    out: list[CrossDomainEdge] = []
+
+    def _scan(
+        owner_kind: str,
+        owner_ref: str,
+        references: list[SceneRuntimeReference],
+    ) -> None:
+        for ref in references:
+            if ref.get("target_kind") != "component":
+                continue
+            src_inst = ref.get("from", "")
+            tgt_inst = ref.get("target_ref", "")
+            src_sid = instance_to_script.get(src_inst, "")
+            tgt_sid = instance_to_script.get(tgt_inst, "")
+            if not src_sid or not tgt_sid:
+                continue
+            src_mod = modules.get(src_sid, {})
+            tgt_mod = modules.get(tgt_sid, {})
+            src_domain = src_mod.get("domain", "")
+            tgt_domain = tgt_mod.get("domain", "")
+            if src_domain in ("", "legacy") or tgt_domain in ("", "legacy"):
+                continue
+            if src_domain == tgt_domain:
+                continue
+            out.append(CrossDomainEdge(
+                from_instance=src_inst,
+                to_instance=tgt_inst,
+                from_script=src_sid,
+                to_script=tgt_sid,
+                field=ref.get("field", ""),
+                from_domain=src_domain,
+                to_domain=tgt_domain,
+                owner_kind=owner_kind,
+                owner_ref=owner_ref,
+            ))
+
+    for key, scene in scenes.items():
+        _scan("scene", key, scene.get("references", []))
+    for key, prefab in prefabs.items():
+        _scan("prefab", key, prefab.get("references", []))
+
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Per-module classification
 # ---------------------------------------------------------------------------
@@ -348,18 +439,21 @@ class _InstanceEvidence:
     """
 
     __slots__ = (
-        "scene", "instance_id", "game_object_id", "script_id", "has_ui_ref",
+        "owner_kind", "owner_ref", "instance_id", "game_object_id",
+        "script_id", "has_ui_ref",
     )
 
     def __init__(
         self,
-        scene: str,
+        owner_kind: str,
+        owner_ref: str,
         instance_id: str,
         game_object_id: str,
         script_id: str,
         has_ui_ref: bool,
     ) -> None:
-        self.scene = scene
+        self.owner_kind = owner_kind
+        self.owner_ref = owner_ref
         self.instance_id = instance_id
         self.game_object_id = game_object_id
         self.script_id = script_id
@@ -379,7 +473,8 @@ def _gather_per_instance_evidence(
     out: dict[str, list[_InstanceEvidence]] = {}
 
     def _scan(
-        scene_key: str,
+        owner_kind: str,
+        owner_ref: str,
         instances: list[SceneRuntimeInstance],
         references: list[SceneRuntimeReference],
     ) -> None:
@@ -389,7 +484,8 @@ def _gather_per_instance_evidence(
                 ui_by_instance[ref["from"]] = True
         for inst in instances:
             evidence = _InstanceEvidence(
-                scene=scene_key,
+                owner_kind=owner_kind,
+                owner_ref=owner_ref,
                 instance_id=inst["instance_id"],
                 game_object_id=inst["game_object_id"],
                 script_id=inst["script_id"],
@@ -398,9 +494,11 @@ def _gather_per_instance_evidence(
             out.setdefault(inst["script_id"], []).append(evidence)
 
     for key, scene in scenes.items():
-        _scan(key, scene.get("instances", []), scene.get("references", []))
+        _scan("scene", key, scene.get("instances", []),
+              scene.get("references", []))
     for key, prefab in prefabs.items():
-        _scan(key, prefab.get("instances", []), prefab.get("references", []))
+        _scan("prefab", key, prefab.get("instances", []),
+              prefab.get("references", []))
     return out
 
 
@@ -421,7 +519,9 @@ def _build_displaced_rows(
     for ev in ui_evidence:
         if effective_domain != "client":
             rows.append({
-                "scene": ev.scene,
+                "owner_kind": ev.owner_kind,
+                "owner_ref": ev.owner_ref,
+                "scene": ev.owner_ref,
                 "instance_id": ev.instance_id,
                 "game_object_id": ev.game_object_id,
                 "script_id": script_id,
@@ -431,7 +531,9 @@ def _build_displaced_rows(
     for ev in nonui_evidence:
         if effective_domain != "server":
             rows.append({
-                "scene": ev.scene,
+                "owner_kind": ev.owner_kind,
+                "owner_ref": ev.owner_ref,
+                "scene": ev.owner_ref,
                 "instance_id": ev.instance_id,
                 "game_object_id": ev.game_object_id,
                 "script_id": script_id,
@@ -449,11 +551,21 @@ def _stamp_container_and_path(
     module: SceneRuntimeModule, scripts_by_class: dict[str, RbxScript],
 ) -> None:
     """Copy storage_classifier's parent_path onto the module row, plus
-    a relative module_path the host runtime can require.
+    the dotted DataModel path the host runtime requires().
 
     The storage classifier has already routed scripts to their concrete
     containers. PR3b doesn't second-guess that decision; it just makes
     the choice visible in the artifact alongside ``domain``.
+
+    Contract (per scene-runtime-contract.md Piece 5 / R2-P1.1
+    resolution): ``module_path`` is the live Roblox DataModel path,
+    dot-joined (``"ReplicatedStorage.Foo"``,
+    ``"StarterPlayer.StarterPlayerScripts.Bar"``). The generated
+    SceneRuntimeClient/Server entrypoints walk
+    ``game:FindFirstChild(...)`` down the dotted path to resolve the
+    ModuleScript. Pre-R2 the planner emitted an on-disk path
+    (``"scripts/Foo.luau"``) the entrypoints could not resolve --
+    every runtime-bearing MonoBehaviour failed to require at boot.
     """
     script = scripts_by_class.get(module.get("class_name", ""))
     if script is None:
@@ -461,11 +573,12 @@ def _stamp_container_and_path(
     container = script.parent_path or ""
     if container:
         module["container"] = container
-    # Module path: scripts always land under ``scripts/`` per the
-    # pipeline's emit phase. The stem is the canonical script id key,
-    # but the *file* name follows the RbxScript.name (class name).
-    if script.name:
-        module["module_path"] = f"scripts/{script.name}.luau"
+    # Module path: dotted DataModel path the host can FindFirstChild
+    # down. ``container`` is the same shape (e.g.
+    # ``"StarterPlayer.StarterPlayerScripts"``) -- joining with a "."
+    # produces a path Roblox's path-walker can navigate.
+    if script.name and container:
+        module["module_path"] = f"{container}.{script.name}"
 
 
 # ---------------------------------------------------------------------------

@@ -2341,6 +2341,7 @@ return table.concat(allData, "\\n")'''
         "_bind_scripts_to_parts",
         "_subphase_inject_autogen_scripts",
         "_inject_runtime_modules",
+        "_subphase_inject_scene_runtime",
         "_generate_prefab_packages",
         "_subphase_encode_terrain",
         "_subphase_inject_mesh_loader",
@@ -2418,6 +2419,7 @@ return table.concat(allData, "\\n")'''
         self._bind_scripts_to_parts()
         self._subphase_inject_autogen_scripts()
         self._inject_runtime_modules()
+        self._subphase_inject_scene_runtime()
         self._generate_prefab_packages()
         self._subphase_encode_terrain()
         self._subphase_inject_mesh_loader()
@@ -3416,34 +3418,76 @@ script.Disabled = true
                 category = entry.get("category", "component")
                 sections.setdefault(category, []).append(entry)
 
+        # R5-P1 fix: the scene-runtime cross-domain edge block is a
+        # cross-domain artefact, not a category in ``sections``. Pre-R5
+        # ``_subphase_inject_scene_runtime`` wrote it directly mid-
+        # pipeline, but this writer runs LATER and rewrote the file from
+        # scratch -- silently clobbering the cross-domain block on every
+        # rerun. The fix: ``_subphase_inject_scene_runtime`` stages the
+        # edges on ``ctx.scene_runtime["cross_domain_edges"]`` only, and
+        # the final UNCONVERTED.md write happens here -- the single
+        # source of truth for the file's contents.
+        cross_domain_edges = []
+        scene_runtime_ctx = self.ctx.scene_runtime or {}
+        if isinstance(scene_runtime_ctx, dict):
+            raw_edges = scene_runtime_ctx.get("cross_domain_edges") or []
+            if isinstance(raw_edges, list):
+                cross_domain_edges = [dict(e) for e in raw_edges if isinstance(e, dict)]
+
         out_path = self.output_dir / UNCONVERTED_FILENAME
-        if not sections:
+        if not sections and not cross_domain_edges:
             if out_path.exists():
                 out_path.unlink()
             return
 
-        lines = [
-            "# UNCONVERTED",
-            "",
-            "Features dropped from this specific conversion run. Each "
-            "bullet had no in-policy Roblox equivalent, or required "
-            "source data the converter cannot parse yet. For the static "
-            "catalog of known gaps see `docs/UNSUPPORTED.md`; for roadmap "
-            "items see `TODO.md`.",
-            "",
-        ]
-        for category in sorted(sections):
-            lines.append(f"## {category}")
-            lines.append("")
-            for entry in sections[category]:
-                item = entry.get("item", "?")
-                reason = entry.get("reason", "")
-                lines.append(f"- `{item}` — {reason}")
-            lines.append("")
+        lines: list[str] = []
+        if sections:
+            lines.extend([
+                "# UNCONVERTED",
+                "",
+                "Features dropped from this specific conversion run. Each "
+                "bullet had no in-policy Roblox equivalent, or required "
+                "source data the converter cannot parse yet. For the static "
+                "catalog of known gaps see `docs/UNSUPPORTED.md`; for roadmap "
+                "items see `TODO.md`.",
+                "",
+            ])
+            for category in sorted(sections):
+                lines.append(f"## {category}")
+                lines.append("")
+                for entry in sections[category]:
+                    item = entry.get("item", "?")
+                    reason = entry.get("reason", "")
+                    lines.append(f"- `{item}` — {reason}")
+                lines.append("")
+        elif cross_domain_edges:
+            # No standard unconverted entries, but cross-domain edges
+            # still need a file. Emit a minimal header so the cross-
+            # domain block has context.
+            lines.extend([
+                "# UNCONVERTED",
+                "",
+                "Cross-domain references the host runtime injects ``nil`` "
+                "for at start. See the table below.",
+                "",
+            ])
+
+        if cross_domain_edges:
+            from converter.autogen import render_cross_domain_report
+            report_md = render_cross_domain_report(cross_domain_edges)
+            if report_md:
+                # render_cross_domain_report already terminates with a
+                # newline; splitlines() drops the trailing blank so the
+                # join doesn't double-newline.
+                lines.extend(report_md.rstrip("\n").split("\n"))
+                lines.append("")
+
         out_path.write_text("\n".join(lines), encoding="utf-8")
         log.info(
-            "[write_output] UNCONVERTED.md written (%d entries across %d categories)",
+            "[write_output] UNCONVERTED.md written "
+            "(%d entries across %d categories, %d cross-domain edges)",
             sum(len(v) for v in sections.values()), len(sections),
+            len(cross_domain_edges),
         )
 
     # ------------------------------------------------------------------
@@ -4315,6 +4359,310 @@ script.Disabled = true
 
         if injected:
             log.info("[write_output] Injected %d runtime library modules", injected)
+
+    def _subphase_inject_scene_runtime(self) -> None:
+        """PR4: emit the scene-runtime host runtime + plan + entrypoints.
+
+        Only fires when ``ctx.scene_runtime_mode == "generic"`` and the
+        plan carries at least one runtime-bearing module. Injects four
+        scripts:
+
+          - ``SceneRuntime`` (ReplicatedStorage ModuleScript) -- the
+            host engine from ``converter/runtime/scene_runtime.luau``.
+          - ``SceneRuntimePlan`` (ReplicatedStorage ModuleScript) -- the
+            per-place plan, derived from ``conversion_plan.json``.
+          - ``SceneRuntimeClient`` (StarterPlayerScripts LocalScript) --
+            wires the engine to client services + ``start("client")``.
+          - ``SceneRuntimeServer`` (ServerScriptService Script) --
+            mirrors the client entrypoint for the ``server`` domain.
+
+        Also stamps the conversion-time cross-domain edge report onto
+        ``ctx.scene_runtime`` and appends it to ``UNCONVERTED.md``.
+        The host runtime applies the v1 nil-injection policy at start;
+        the conversion-time emit lets operators see the boundary
+        before they ship the place.
+
+        Idempotent: re-runs (incremental ``--phase write_output``)
+        overwrite previous SceneRuntime* scripts in place.
+        """
+        if self.ctx.scene_runtime_mode != "generic":
+            return
+        if self.state.rbx_place is None:
+            return
+
+        scene_runtime = self.ctx.scene_runtime or {}
+        modules = scene_runtime.get("modules", {})
+        runtime_bearing = [
+            sid for sid, row in modules.items()
+            if row.get("runtime_bearing")
+        ]
+        if not runtime_bearing:
+            log.info(
+                "[write_output] scene-runtime generic mode: no "
+                "runtime-bearing modules; skipping host runtime emit"
+            )
+            return
+
+        from converter.autogen import (
+            generate_scene_runtime_client_entrypoint,
+            generate_scene_runtime_plan_module,
+            generate_scene_runtime_server_entrypoint,
+        )
+        from converter.scene_runtime_domain import compute_cross_domain_edges
+
+        runtime_dir = Path(__file__).parent.parent / "runtime"
+        host_path = runtime_dir / "scene_runtime.luau"
+        existing_names = {s.name for s in self.state.rbx_place.scripts}
+
+        # R3-P2: a user (or earlier converter pass) script named e.g.
+        # ``SceneRuntime`` must NOT be silently displaced by the autogen
+        # emit. Replace only scripts whose source carries the autogen
+        # marker we stamped on prior runs (and the runtime engine source
+        # which we identify by the comment at its top). The marker shape
+        # matches what each generator emits.
+        _AUTOGEN_MARKERS: dict[str, str] = {
+            "SceneRuntime": "-- scene_runtime: PR4 generic host runtime",
+            "SceneRuntimePlan": (
+                "-- SceneRuntimePlan (auto-generated by Unity converter; PR4)"
+            ),
+            "SceneRuntimeClient": (
+                "-- SceneRuntimeClient (auto-generated; "
+                "PR4 scene-runtime host entrypoint)"
+            ),
+            "SceneRuntimeServer": (
+                "-- SceneRuntimeServer (auto-generated; "
+                "PR4 scene-runtime host entrypoint)"
+            ),
+        }
+
+        def _replace_or_add(script: RbxScript) -> None:
+            marker = _AUTOGEN_MARKERS.get(script.name, "")
+            new_scripts: list[RbxScript] = []
+            user_owned = False
+            for s in self.state.rbx_place.scripts:
+                if s.name != script.name:
+                    new_scripts.append(s)
+                    continue
+                # Same-name collision. Drop only if it's a prior autogen
+                # artifact (carries our marker); otherwise keep the
+                # user-owned script and skip the emit.
+                if marker and marker in (s.source or ""):
+                    continue
+                new_scripts.append(s)
+                user_owned = True
+            if user_owned:
+                log.warning(
+                    "[write_output] scene-runtime generic: a non-autogen "
+                    "script named %r already exists; skipping autogen "
+                    "emit to avoid clobbering user-owned content",
+                    script.name,
+                )
+                self.state.rbx_place.scripts = new_scripts
+                return
+            self.state.rbx_place.scripts = new_scripts
+            self.state.rbx_place.scripts.append(script)
+
+        if host_path.exists():
+            host_source = host_path.read_text(encoding="utf-8")
+            _replace_or_add(RbxScript(
+                name="SceneRuntime",
+                source=host_source,
+                script_type="ModuleScript",
+                parent_path="ReplicatedStorage",
+            ))
+        else:
+            log.warning(
+                "[write_output] scene-runtime host runtime missing at %s; "
+                "skipping (the place will fail to bind runtime-bearing "
+                "modules at start)", host_path,
+            )
+            return
+
+        # R2-P1.3 (contract resolution): rewrite asset/SO refs before
+        # embedding the plan. Assets become ``rbxassetid://...``;
+        # ScriptableObjects get a ``guid -> dotted module path`` map the
+        # host runtime consults at ref-resolution time. Both mutations
+        # happen in-place on ``scene_runtime`` so the embedded plan
+        # ModuleScript reflects the final shape.
+        self._build_scriptable_object_module_map(scene_runtime)
+        self._rewrite_scene_runtime_asset_refs(scene_runtime)
+
+        _replace_or_add(generate_scene_runtime_plan_module(
+            cast("dict", scene_runtime),
+        ))
+        _replace_or_add(generate_scene_runtime_client_entrypoint())
+        _replace_or_add(generate_scene_runtime_server_entrypoint())
+
+        edges = compute_cross_domain_edges(
+            cast("dict", scene_runtime),
+        )
+        # R5-P1 fix: store edges on ctx ONLY. The actual UNCONVERTED.md
+        # write is owned by ``_write_unconverted_md`` (single source of
+        # truth for the file). Pre-R5 this subphase wrote the cross-
+        # domain block directly here, but ``_write_unconverted_md``
+        # runs LATER in write_output and rewrites the file from scratch
+        # -- so the mid-pipeline append got clobbered every time. Tests
+        # and downstream consumers still read the edges via
+        # ``ctx.scene_runtime["cross_domain_edges"]``.
+        scene_runtime["cross_domain_edges"] = list(edges)
+        if edges:
+            log.info(
+                "[write_output] scene-runtime generic: %d cross-domain "
+                "edges staged for UNCONVERTED.md", len(edges),
+            )
+        injected_total = 4
+        if "SceneRuntime" in existing_names:
+            injected_total -= 0  # we always replace, so count remains
+        log.info(
+            "[write_output] scene-runtime generic: injected host runtime, "
+            "plan, and entrypoints (%d runtime-bearing modules)",
+            len(runtime_bearing),
+        )
+
+    def _build_scriptable_object_module_map(
+        self, scene_runtime: dict[str, object],
+    ) -> None:
+        """R2-P1.3: build ``scene_runtime.scriptable_objects`` -- a
+        ``guid -> dotted DataModel path`` map covering every emitted SO
+        ModuleScript. The host runtime resolves ``scriptable_object``
+        ref rows by looking the persisted GUID up in this map and
+        requiring the resulting module path.
+
+        Source of truth: ``self.state.scriptable_objects`` (the SO
+        converter result) + ``self.state.guid_index`` (path -> GUID).
+        Container resolves via the SO RbxScript's ``parent_path`` -- the
+        same shape ``_stamp_container_and_path`` writes for runtime-
+        bearing modules.
+
+        Idempotent: rebuilds the map every run; legacy plans that lacked
+        the map still resolve via the runtime's fallback passthrough
+        (returns ``nil`` rather than crashing).
+        """
+        from converter.scriptable_object_converter import (
+            AssetConversionResult,
+            resolve_unique_asset_names,
+        )
+        so_state = getattr(self.state, "scriptable_objects", None)
+        if not isinstance(so_state, AssetConversionResult):
+            return
+        if not so_state.assets:
+            return
+        guid_index = getattr(self.state, "guid_index", None)
+        if guid_index is None:
+            return
+        unique = resolve_unique_asset_names(so_state.assets)
+        # Reverse-lookup: source_path -> guid. Resolved paths in the
+        # GuidIndex may be absolute; the SO converter records the absolute
+        # path too, so reuse ``guid_for_path`` (which normalises via
+        # ``Path.resolve()``) where possible. Build the explicit reverse
+        # map here so a single absolute-vs-relative skew doesn't drop the
+        # entire scriptable_objects map.
+        path_to_guid: dict[Path, str] = {}
+        for guid, entry in guid_index.guid_to_entry.items():
+            path_to_guid[entry.asset_path] = guid
+            try:
+                path_to_guid[entry.asset_path.resolve()] = guid
+            except (OSError, RuntimeError):
+                pass
+        # rbx_place.scripts carries the final parent_path each SO was
+        # routed to by storage_classifier. Build a stem -> parent_path
+        # lookup keyed by the unique-asset-name resolver's stems.
+        place_scripts_by_name: dict[str, str] = {}
+        for script in self.state.rbx_place.scripts:
+            container = getattr(script, "parent_path", None) or "ReplicatedStorage"
+            place_scripts_by_name[script.name] = container
+        so_map: dict[str, str] = {}
+        for asset in so_state.assets:
+            stem = unique.get(id(asset))
+            if not stem:
+                continue
+            guid = path_to_guid.get(asset.source_path)
+            if not guid:
+                try:
+                    guid = path_to_guid.get(asset.source_path.resolve())
+                except (OSError, RuntimeError):
+                    guid = None
+            if not guid:
+                continue
+            container = place_scripts_by_name.get(stem, "ReplicatedStorage")
+            so_map[guid] = f"{container}.{stem}"
+        if so_map:
+            scene_runtime["scriptable_objects"] = so_map
+            log.info(
+                "[write_output] scene-runtime generic: emitted %d "
+                "scriptable_object refs in plan map", len(so_map),
+            )
+
+    def _rewrite_scene_runtime_asset_refs(
+        self, scene_runtime: dict[str, object],
+    ) -> None:
+        """R2-P1.3: rewrite every ``target_kind == "asset"`` reference's
+        ``target_ref`` from raw Unity GUID to ``rbxassetid://...`` using
+        ``ctx.uploaded_assets`` as the source of truth. The contract
+        states asset refs arrive at the runtime in rbxassetid form;
+        pre-fix the planner persisted the GUID and no later pass
+        rewrote it, so module fields backed by sprites/sounds got the
+        literal GUID string instead of a usable asset id.
+
+        Idempotent: refs already in ``rbxassetid://`` form are left
+        untouched. Unresolvable GUIDs (no entry in uploaded_assets) keep
+        the raw GUID so the operator sees the unresolved reference
+        rather than silently dropping the ref.
+        """
+        from core.unity_types import GuidIndex
+        uploaded = self.ctx.uploaded_assets or {}
+        guid_index = getattr(self.state, "guid_index", None)
+        if not uploaded or not isinstance(guid_index, GuidIndex):
+            return
+
+        def _resolve(guid: str) -> str | None:
+            path = guid_index.resolve(guid)
+            if path is None:
+                return None
+            # uploaded_assets is keyed by string (project-relative or
+            # absolute path, depending on the producer). Try the resolved
+            # path string first, then a string-cast pass.
+            for key in (str(path), path.as_posix()):
+                if key in uploaded:
+                    return uploaded[key]
+            return None
+
+        def _rewrite_ref_list(refs: list) -> int:
+            n = 0
+            for ref in refs:
+                if not isinstance(ref, dict):
+                    continue
+                if ref.get("target_kind") != "asset":
+                    continue
+                target = ref.get("target_ref", "")
+                if not isinstance(target, str) or target.startswith("rbxassetid://"):
+                    continue
+                asset_url = _resolve(target)
+                if asset_url:
+                    ref["target_ref"] = asset_url
+                    n += 1
+            return n
+
+        total = 0
+        scenes = scene_runtime.get("scenes", {})
+        if isinstance(scenes, dict):
+            for scene in scenes.values():
+                if isinstance(scene, dict):
+                    refs = scene.get("references", [])
+                    if isinstance(refs, list):
+                        total += _rewrite_ref_list(refs)
+        prefabs = scene_runtime.get("prefabs", {})
+        if isinstance(prefabs, dict):
+            for prefab in prefabs.values():
+                if isinstance(prefab, dict):
+                    refs = prefab.get("references", [])
+                    if isinstance(refs, list):
+                        total += _rewrite_ref_list(refs)
+        if total:
+            log.info(
+                "[write_output] scene-runtime generic: rewrote %d asset "
+                "refs to rbxassetid form", total,
+            )
 
     def _run_phase(self, phase: str) -> None:
         """Execute a single phase with logging and context tracking."""

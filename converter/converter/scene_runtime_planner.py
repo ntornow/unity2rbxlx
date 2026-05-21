@@ -120,6 +120,18 @@ class SceneRuntimeInstance(TypedDict):
     config: dict[str, object]
 
 
+# Optional fields appended to a SceneRuntimeInstance row. Kept separate from
+# the ``total=True`` shape so PR1-shaped artifacts on disk stay valid; PR4
+# reads ``parent_game_object_id`` to walk ancestors when computing
+# ``activeInHierarchy`` (Unity's "AND every ancestor's activeSelf" gate).
+# Scene roots get NO key here (TypedDict total=False allows missing); the
+# runtime treats a missing key as "this GO has no parent in the planner
+# graph" and stops the upward walk. This mirrors the
+# ``SceneRuntimeReferenceExtra`` pattern.
+class SceneRuntimeInstanceExtra(TypedDict, total=False):
+    parent_game_object_id: str
+
+
 SceneRuntimeReference = TypedDict(
     "SceneRuntimeReference",
     {
@@ -159,6 +171,13 @@ class SceneRuntimeScene(TypedDict):
 
 class SceneRuntimePrefab(TypedDict):
     name: str
+    # R2-P1.2: bare template name as emitted under
+    # ``ReplicatedStorage.Templates`` by ``prefab_packages``. The stable
+    # ``prefab_id`` (the key in ``scene_runtime.prefabs``) carries the
+    # GUID + path; the host runtime can't feed that to
+    # ``Templates:FindFirstChild(...)`` directly, so the planner persists
+    # the bare name here. Always equals ``PrefabTemplate.name``.
+    template_name: str
     instances: list[SceneRuntimeInstance]
     references: list[SceneRuntimeReference]
     lifecycle_order: list[str]
@@ -171,7 +190,15 @@ class SceneRuntimeDisplacedInstance(TypedDict):
     conversion-time report enumerates these so the operator sees which
     instances won't execute their lifecycle on the chosen side.
 
-    ``scene``: the scene path or prefab id the instance lives in.
+    ``owner_kind``: ``"scene"`` or ``"prefab"`` -- which planner block
+        the instance lives in.
+    ``owner_ref``: the scene path (``owner_kind == "scene"``) or stable
+        prefab id (``owner_kind == "prefab"``).
+    ``scene``: legacy alias for ``owner_ref`` (PR3b shipped only this
+        field; PR4 split it into ``owner_kind`` + ``owner_ref`` so the
+        report can render the two cases distinctly without re-parsing
+        the value). Kept populated for one release; readers should
+        migrate to the split pair.
     ``instance_id``: the per-instance id from PR1's planner.
     ``game_object_id``: the host GameObject's stable id.
     ``script_id``: which class the instance belongs to.
@@ -181,6 +208,8 @@ class SceneRuntimeDisplacedInstance(TypedDict):
         suggested (``"client"`` / ``"server"`` / ``"neither"``).
     """
 
+    owner_kind: str
+    owner_ref: str
     scene: str
     instance_id: str
     game_object_id: str
@@ -202,6 +231,13 @@ class SceneRuntimeArtifact(TypedDict, total=False):
     # Low-confidence verdicts (``script_id``s the operator may want to
     # pin via ``domain_overrides``).
     low_confidence_modules: list[str]
+    # R2-P1.3: Unity GUID -> dotted DataModel path for emitted SO
+    # ModuleScripts. Populated by ``_subphase_inject_scene_runtime`` once
+    # the SO converter has produced its asset list and storage_classifier
+    # has chosen each module's container. The host runtime's
+    # ``scriptable_object`` ref resolver looks the persisted GUID up in
+    # this map and ``require``s the resulting module path.
+    scriptable_objects: dict[str, str]
 
 
 # ---------------------------------------------------------------------------
@@ -658,14 +694,24 @@ def _walk_scene(
             )
 
             instance_id = f"{namespace}:{comp.file_id}"
-            instances.append({
+            inst_row: SceneRuntimeInstance = {
                 "instance_id": instance_id,
                 "script_id": script_id,
                 "game_object_id": f"{namespace}:{node.file_id}",
                 "active": bool(node.active),
                 "enabled": enabled,
                 "config": config,
-            })
+            }
+            # R5-P1.2: parent edge so the host runtime can walk ancestors
+            # when computing ``activeInHierarchy``. Scene roots get no
+            # key (the SceneRuntimeInstanceExtra TypedDict is total=False,
+            # so a missing key means "no parent in the planner graph"
+            # and the runtime stops the upward walk).
+            if node.parent_file_id is not None:
+                cast(dict[str, object], inst_row)["parent_game_object_id"] = (
+                    f"{namespace}:{node.parent_file_id}"
+                )
+            instances.append(inst_row)
             references.extend(refs)
             lifecycle.append(instance_id)
         for child in node.children:
@@ -733,14 +779,21 @@ def _walk_prefab(
             )
 
             instance_id = f"{prefab_id}:{comp.file_id}"
-            instances.append({
+            inst_row: SceneRuntimeInstance = {
                 "instance_id": instance_id,
                 "script_id": script_id,
                 "game_object_id": f"{prefab_id}:{node.file_id}",
                 "active": bool(node.active),
                 "enabled": enabled,
                 "config": config,
-            })
+            }
+            # R5-P1.2: parent edge for the host runtime's ancestor walk.
+            # Prefab roots get no key (total=False).
+            if node.parent_file_id is not None:
+                cast(dict[str, object], inst_row)["parent_game_object_id"] = (
+                    f"{prefab_id}:{node.parent_file_id}"
+                )
+            instances.append(inst_row)
             references.extend(refs)
             lifecycle.append(instance_id)
         for child in node.children:
@@ -751,6 +804,9 @@ def _walk_prefab(
 
     return {
         "name": template.name,
+        # R2-P1.2: bare template name resolves prefab_id ->
+        # ReplicatedStorage.Templates[name] for runtime lookup.
+        "template_name": template.name,
         "instances": instances,
         "references": references,
         "lifecycle_order": lifecycle,

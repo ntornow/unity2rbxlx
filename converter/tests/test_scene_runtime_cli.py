@@ -1,9 +1,11 @@
 """test_scene_runtime_cli.py -- CLI front-door surface for ``--scene-runtime``.
 
-PR3a wires the flag at every conversion front door so PR3b/PR4 can flip
-on the contract pipeline without re-touching CLI plumbing. The host
-runtime doesn't exist yet, so 'auto' and 'generic' must be rejected
-at the CLI with a clear error message pointing at the spike tool.
+PR3a wired the flag at every conversion front door; PR4 lifts the
+hard-rejection of ``generic`` and lights up the host runtime path.
+``auto`` is still rejected because its fallback-routing decision lands
+in PR5 with its canary projects. ``generic`` flows through to the
+pipeline; bad downstream state (no Unity project, etc.) surfaces
+normally.
 
 Front doors covered:
   * ``u2r.py convert``        -- main conversion command
@@ -48,26 +50,28 @@ class TestConvertFlag:
         for choice in ("legacy", "auto", "generic"):
             assert choice in result.output
 
-    def test_generic_rejected_with_spike_pointer(self, tmp_path):
-        # Need an existing directory for the positional ``unity_project``.
-        # The CLI rejects before any project parsing happens; tmp_path
-        # is sufficient as a placeholder.
+    def test_generic_no_longer_rejected_at_cli(self, tmp_path):
+        # PR4: ``generic`` is accepted at the CLI. It may still fail
+        # downstream because ``tmp_path`` isn't a real Unity project,
+        # but the failure should NOT be the PR3a-era spike-pointer
+        # rejection. Assert the absence of the legacy rejection text.
         runner = CliRunner()
         result = runner.invoke(u2r_main, [
             "convert", str(tmp_path),
             "--skip-architecture-step",
             "--scene-runtime=generic",
         ])
-        assert result.exit_code != 0, (
-            "--scene-runtime=generic should be rejected at the CLI until "
-            "PR4 lands the host runtime."
-        )
-        assert "scene_runtime_spike" in result.output, (
-            "Rejection message must point at the spike tool so users can "
-            "still exercise the contract verifier."
+        # We don't assert exit_code here -- a fake Unity project will
+        # error somewhere in the pipeline; what matters is the legacy
+        # PR3a rejection text is gone.
+        assert "scene_runtime_spike" not in result.output, (
+            "PR4 lifted the generic CLI gate; the spike-tool pointer "
+            "should no longer appear in the output."
         )
 
-    def test_auto_rejected(self, tmp_path):
+    def test_auto_still_rejected(self, tmp_path):
+        # PR5 owns ``auto`` (try-generic-then-legacy with canary
+        # projects); PR4 keeps it rejected at the CLI.
         runner = CliRunner()
         result = runner.invoke(u2r_main, [
             "convert", str(tmp_path),
@@ -76,6 +80,10 @@ class TestConvertFlag:
         ])
         assert result.exit_code != 0
         assert "auto" in result.output
+        assert "PR5" in result.output, (
+            "auto rejection should attribute deferral to PR5 so users "
+            "see the timeline."
+        )
 
     def test_invalid_value_rejected_by_click(self, tmp_path):
         # Values outside the Choice set fail at parse time with a click
@@ -102,13 +110,13 @@ class TestEvalFlag:
         assert result.exit_code == 0
         assert "--scene-runtime" in result.output
 
-    def test_eval_rejects_generic(self):
-        # ``eval`` accepts no positional args; the flag check happens
-        # before any test_projects parsing.
+    def test_eval_still_rejects_auto(self):
+        # PR4: ``generic`` is accepted at eval; ``auto`` is the only
+        # remaining CLI-level rejection (PR5 turf).
         runner = CliRunner()
-        result = runner.invoke(u2r_main, ["eval", "--scene-runtime=generic"])
+        result = runner.invoke(u2r_main, ["eval", "--scene-runtime=auto"])
         assert result.exit_code != 0
-        assert "scene_runtime_spike" in result.output
+        assert "auto" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -123,12 +131,10 @@ class TestInteractiveTranspileFlag:
         assert result.exit_code == 0
         assert "--scene-runtime" in result.output
 
-    def test_generic_rejected_with_structured_json(self, tmp_path):
-        # The interactive CLI emits structured JSON on errors. Verify
-        # the rejection lands in that channel rather than as raw stderr.
+    def test_auto_rejected_with_structured_json(self, tmp_path):
+        # PR4: ``auto`` is the remaining CLI-rejected mode (PR5 turf).
+        # The interactive CLI emits structured JSON on errors.
         runner = CliRunner()
-        # Need a directory for unity_project_path; tmp_path will do --
-        # the flag check runs before any project parsing.
         project = tmp_path / "project"
         project.mkdir()
         output = tmp_path / "output"
@@ -136,12 +142,10 @@ class TestInteractiveTranspileFlag:
             "transpile",
             str(project),
             str(output),
-            "--scene-runtime=generic",
+            "--scene-runtime=auto",
         ])
         assert result.exit_code != 0
         # ``_emit`` prints a (multi-line indented) JSON object to stdout.
-        # Parse the whole output buffer between the first ``{`` and the
-        # last ``}``.
         start = result.output.find("{")
         end = result.output.rfind("}")
         payload = None
@@ -156,8 +160,8 @@ class TestInteractiveTranspileFlag:
         )
         assert payload.get("phase") == "transpile"
         assert payload.get("success") is False
-        assert any("scene_runtime_spike" in e for e in payload.get("errors", [])), (
-            f"rejection error message must point at the spike tool: {payload}"
+        assert any("PR5" in e for e in payload.get("errors", [])), (
+            f"auto rejection should attribute deferral to PR5: {payload}"
         )
 
 

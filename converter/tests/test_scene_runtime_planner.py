@@ -740,6 +740,16 @@ class TestPrefabSubplan:
             assert sub["name"] == "Enemy"
             assert len(sub["instances"]) == 1
             assert sub["instances"][0]["instance_id"].startswith(f"{k}:")
+            # R2-P1.2: the bare template_name resolves a stable prefab_id
+            # to the entry under ReplicatedStorage.Templates. Same-named
+            # prefabs in different folders share template_name -- the
+            # collision is intentional (prefab_packages emits one per
+            # bare name; the planner can't pre-disambiguate without
+            # changing the legacy emit path).
+            assert sub["template_name"] == "Enemy", (
+                f"prefab subplan must carry the bare template name "
+                f"(R2-P1.2); got {sub.get('template_name')!r}"
+            )
 
     def test_prefab_reference_from_scene_resolves_to_stable_id(
         self, tmp_path: Path,

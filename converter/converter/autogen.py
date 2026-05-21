@@ -20,9 +20,26 @@ in :mod:`converter.scaffolding`; this module stays project-agnostic.
 from __future__ import annotations
 
 import logging
+import re
+
 from core.roblox_types import RbxScript
 
 log = logging.getLogger(__name__)
+
+
+# Luau bare-identifier rule (ASCII only). Python's ``str.isidentifier``
+# accepts PEP 3131 Unicode letters which Luau's lexer rejects, so
+# ``_plan_to_luau`` must use this regex to decide bare-vs-bracketed keys.
+_LUAU_BARE_IDENT_RE: re.Pattern[str] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Luau reserved keywords that can't be used as bare table keys even
+# when they match the identifier regex.
+_LUAU_RESERVED_KEYWORDS: frozenset[str] = frozenset({
+    "and", "break", "do", "else", "elseif", "end",
+    "false", "for", "function", "if", "in", "local",
+    "nil", "not", "or", "repeat", "return", "then",
+    "true", "until", "while", "continue",
+})
 
 
 def generate_game_server_script() -> RbxScript:
@@ -450,4 +467,483 @@ end)
         script_type="LocalScript",
     )
 
+
+# ---------------------------------------------------------------------------
+# PR4: scene-runtime host entrypoints + plan ModuleScript
+# ---------------------------------------------------------------------------
+
+def _plan_to_luau(plan: dict) -> str:
+    """Render the scene-runtime plan as a Luau-literal ``return {...}``.
+
+    Encodes the strict subset of the planner artifact the host runtime
+    actually reads (modules / scenes / prefabs / domain_overrides /
+    displaced_instances). The encoder mirrors a JSON dump but emits
+    Luau table syntax so the ModuleScript is parsable and the host
+    can ``require`` it without going through JSONDecode.
+    """
+    def _encode(value: object, depth: int = 0) -> str:
+        pad = "    " * (depth + 1)
+        close_pad = "    " * depth
+        if value is None:
+            return "nil"
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            # Roblox Luau accepts standard numeric literals; bool was
+            # already filtered above (bool is int subclass).
+            return repr(value)
+        if isinstance(value, str):
+            # Escape per Lua long-string rules; falling back to short
+            # string with explicit backslash escapes to keep the encoder
+            # trivially predictable.
+            escaped = (value.replace("\\", "\\\\")
+                            .replace("\"", "\\\"")
+                            .replace("\n", "\\n")
+                            .replace("\r", "\\r"))
+            return f"\"{escaped}\""
+        if isinstance(value, list):
+            if not value:
+                return "{}"
+            parts = [f"{pad}{_encode(v, depth + 1)}" for v in value]
+            return "{\n" + ",\n".join(parts) + f",\n{close_pad}}}"
+        if isinstance(value, dict):
+            if not value:
+                return "{}"
+            parts = []
+            for k, v in value.items():
+                key_str = str(k)
+                # Reserved Luau keywords + non-identifier keys need
+                # bracket-syntax.
+                #
+                # R4-P2.2: Python's ``str.isidentifier()`` accepts
+                # Unicode identifier characters per PEP 3131
+                # (``"变量".isidentifier() == True``). Luau's lexer is
+                # ASCII-only, so an unquoted Unicode key is a parse
+                # error. Tighten to an explicit ASCII regex; anything
+                # else gets bracket-quoted.
+                if (_LUAU_BARE_IDENT_RE.match(key_str) is not None
+                        and key_str not in _LUAU_RESERVED_KEYWORDS):
+                    encoded_key = key_str
+                else:
+                    encoded_key = f"[{_encode(key_str)}]"
+                parts.append(f"{pad}{encoded_key} = {_encode(v, depth + 1)}")
+            return "{\n" + ",\n".join(parts) + f",\n{close_pad}}}"
+        # Last-resort: stringify; never reached for planner artifacts.
+        return _encode(str(value), depth)
+
+    return _encode(plan, 0)
+
+
+# Keys of the planner artifact relevant to the host runtime. Other keys
+# (operator-only diagnostic surfaces like ``low_confidence_modules``) are
+# intentionally elided from the embedded plan -- the host doesn't read
+# them and they bloat the place's plan ModuleScript.
+#
+# ``scriptable_objects`` is the R2-P1.3 guid -> dotted-DataModel-path map
+# the host's ScriptableObject ref resolver consults; populated by
+# ``_subphase_inject_scene_runtime`` before this encoder runs.
+_PLAN_KEYS_FOR_HOST: tuple[str, ...] = (
+    "modules", "scenes", "prefabs", "domain_overrides",
+    "scriptable_objects",
+)
+
+
+def generate_scene_runtime_plan_module(scene_runtime: dict) -> RbxScript:
+    """Emit the per-place ``SceneRuntimePlan`` ModuleScript.
+
+    The PR1 planner persists the full artifact in
+    ``conversion_plan.json``. PR4 embeds the host-relevant subset into
+    the place as a ReplicatedStorage ModuleScript so the host runtime
+    can ``require`` it without filesystem access at game time.
+    """
+    plan_subset: dict = {
+        k: scene_runtime.get(k, {} if k != "modules" else {})
+        for k in _PLAN_KEYS_FOR_HOST
+        if k in scene_runtime
+    }
+    body = _plan_to_luau(plan_subset)
+    source = (
+        "-- SceneRuntimePlan (auto-generated by Unity converter; PR4)\n"
+        "-- Per-place plan consumed by SceneRuntimeClient/Server via\n"
+        "-- runtime/scene_runtime.luau. Shape mirrors\n"
+        "-- ``scene_runtime`` in conversion_plan.json (modules / scenes\n"
+        "-- / prefabs / domain_overrides).\n"
+        "return " + body + "\n"
+    )
+    return RbxScript(
+        name="SceneRuntimePlan",
+        source=source,
+        script_type="ModuleScript",
+        parent_path="ReplicatedStorage",
+    )
+
+
+# Production entrypoint sources. The host runtime module is shared; each
+# entrypoint wires it to its side's Roblox services and the embedded
+# plan, then calls ``engine:start(domainFilter)``.
+
+_SCENE_RUNTIME_CLIENT_SOURCE: str = '''\
+-- SceneRuntimeClient (auto-generated; PR4 scene-runtime host entrypoint).
+-- Wires the generic host runtime (ReplicatedStorage.SceneRuntime) to
+-- Roblox client-side services + the embedded plan, then drives the
+-- ``client`` domain partition's lifecycle.
+
+local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+
+-- Resolve the live ``PlayerGui`` for the local player so UI-bound
+-- ``_SceneRuntimeId`` lookups hit the interactive UI tree (Players
+-- clone StarterGui into PlayerGui at spawn; runtime components must
+-- attach to the live clone, not the template).
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer and LocalPlayer:WaitForChild("PlayerGui", 10)
+
+local SceneRuntime = require(RS:WaitForChild("SceneRuntime"))
+local Plan = require(RS:WaitForChild("SceneRuntimePlan"))
+
+local function workspaceFind(sceneRuntimeId)
+    -- Linear scan; production builds may cache as needed. Hosts are
+    -- stamped on the logical GameObject only (PR2), so this is
+    -- bounded by the runtime-bearing GameObject count.
+    for _, inst in workspace:GetDescendants() do
+        if inst:GetAttribute("_SceneRuntimeId") == sceneRuntimeId then
+            return inst
+        end
+    end
+    -- UI lives under PlayerGui at runtime (StarterGui is the template
+    -- that gets cloned per-player). Fall back to StarterGui only when
+    -- PlayerGui isn't available (edge case during early lifecycle).
+    if PlayerGui then
+        for _, gui in PlayerGui:GetDescendants() do
+            if gui:GetAttribute("_SceneRuntimeId") == sceneRuntimeId then
+                return gui
+            end
+        end
+    else
+        for _, gui in game:GetService("StarterGui"):GetDescendants() do
+            if gui:GetAttribute("_SceneRuntimeId") == sceneRuntimeId then
+                return gui
+            end
+        end
+    end
+    return nil
+end
+
+local function resolveModule(scriptId, modulePath)
+    -- modulePath is the live DataModel path, dot-joined
+    -- (``"ReplicatedStorage.Foo"`` /
+    -- ``"StarterPlayer.StarterPlayerScripts.Bar"``). The planner stamps
+    -- this in scene_runtime_domain._stamp_container_and_path; the host
+    -- splits on "." and walks game:FindFirstChild(...) down the chain.
+    if type(modulePath) ~= "string" or modulePath == "" then return nil end
+    local parts = string.split(modulePath, ".")
+    local node = game
+    for _, part in ipairs(parts) do
+        node = node:FindFirstChild(part)
+        if not node then return nil end
+    end
+    if node:IsA("ModuleScript") then
+        local ok, mod = pcall(require, node)
+        if ok then return mod end
+    end
+    return nil
+end
+
+-- SceneRuntimePlan carries ``plan.prefabs[prefab_id].template_name``
+-- (R2-P1.2 resolution): the bare template name prefab_packages emitted
+-- under ReplicatedStorage.Templates. Look up via that map so the
+-- stable prefab_id resolves to the right Templates entry even when
+-- two prefabs share a bare name in different folders.
+local function _resolveTemplate(prefabId)
+    local prefab = (Plan.prefabs or {})[prefabId]
+    local templateName = prefab and prefab.template_name
+    if type(templateName) ~= "string" or templateName == "" then
+        return nil
+    end
+    local templates = RS:FindFirstChild("Templates")
+    if not templates then return nil end
+    return templates:FindFirstChild(templateName)
+end
+
+local services = {
+    task = task,
+    warn = warn,
+    resolveModule = resolveModule,
+    workspaceFind = workspaceFind,
+    findFirstChildWhichIsA = function(inst, class)
+        -- ``GetComponent("Rigidbody")`` etc. should hit a built-in
+        -- attached directly to the GameObject AS WELL as nested
+        -- children. Roblox's ``FindFirstChildWhichIsA`` skips the
+        -- instance itself, so a Part-rooted GameObject with
+        -- ``GetComponent("BasePart")`` returned nil pre-R3.
+        if not inst then return nil end
+        if type(inst.IsA) == "function" and inst:IsA(class) then
+            return inst
+        end
+        return inst:FindFirstChildWhichIsA(class)
+    end,
+    heartbeat = RunService.Heartbeat,
+    fixedStep = 0.02,
+    now = function() return os.clock() end,
+    getInstanceId = function(inst)
+        return inst and inst:GetAttribute("_SceneRuntimeId")
+    end,
+    clonePrefabTemplate = function(prefabId, parent, cframe)
+        local tpl = _resolveTemplate(prefabId)
+        if not tpl then return nil end
+        local clone = tpl:Clone()
+        if parent then clone.Parent = parent end
+        if cframe and clone:IsA("Model") then
+            clone:PivotTo(cframe)
+        end
+        return clone
+    end,
+    resolveCloneChild = function(clone, gameObjectId)
+        for _, d in clone:GetDescendants() do
+            if d:GetAttribute("_SceneRuntimeId") == gameObjectId then
+                return d
+            end
+        end
+        return clone
+    end,
+    collectDescendantIds = function(inst)
+        -- DFS post-order (children deepest-first, then self), per the
+        -- design doc's recursive-teardown contract. Reversing
+        -- ``GetDescendants`` (BFS) is NOT equivalent.
+        local out = {}
+        local function walk(node)
+            for _, child in node:GetChildren() do
+                walk(child)
+            end
+            local id = node:GetAttribute("_SceneRuntimeId")
+            if id then table.insert(out, id) end
+        end
+        walk(inst)
+        return out
+    end,
+    collectSubtreeIdsWithParents = function(inst)
+        -- R4-P1.2: DFS preorder (root first, then children) with each
+        -- entry carrying its parent id so the host's setActive cascade
+        -- can recompute ``activeInHierarchy`` correctly. Returns a list
+        -- of ``{id = "...", parentId = "..." | nil}`` records; entries
+        -- whose Roblox Instance has no ``_SceneRuntimeId`` are dropped
+        -- but the walk still descends through them (mirrors how the
+        -- existing collectDescendantIds skips unstamped nodes).
+        local out = {}
+        local function walk(node, parentId)
+            local id = node:GetAttribute("_SceneRuntimeId")
+            if id then
+                table.insert(out, {id = id, parentId = parentId})
+            end
+            local childParentId = id or parentId
+            for _, child in node:GetChildren() do
+                walk(child, childParentId)
+            end
+        end
+        walk(inst, nil)
+        return out
+    end,
+    destroyInstance = function(inst)
+        if inst and inst.Destroy then inst:Destroy() end
+    end,
+}
+
+local engine = SceneRuntime.new(services, Plan)
+engine:start("client")
+'''
+
+
+_SCENE_RUNTIME_SERVER_SOURCE: str = '''\
+-- SceneRuntimeServer (auto-generated; PR4 scene-runtime host entrypoint).
+-- Mirrors SceneRuntimeClient but drives the ``server`` domain partition.
+
+local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local SceneRuntime = require(RS:WaitForChild("SceneRuntime"))
+local Plan = require(RS:WaitForChild("SceneRuntimePlan"))
+
+local function workspaceFind(sceneRuntimeId)
+    for _, inst in workspace:GetDescendants() do
+        if inst:GetAttribute("_SceneRuntimeId") == sceneRuntimeId then
+            return inst
+        end
+    end
+    return nil
+end
+
+local function resolveModule(scriptId, modulePath)
+    -- modulePath is the live DataModel path, dot-joined
+    -- (``"ReplicatedStorage.Foo"`` /
+    -- ``"ServerScriptService.Bar"``). Matches client entrypoint.
+    if type(modulePath) ~= "string" or modulePath == "" then return nil end
+    local parts = string.split(modulePath, ".")
+    local node = game
+    for _, part in ipairs(parts) do
+        node = node:FindFirstChild(part)
+        if not node then return nil end
+    end
+    if node:IsA("ModuleScript") then
+        local ok, mod = pcall(require, node)
+        if ok then return mod end
+    end
+    return nil
+end
+
+-- See SceneRuntimeClient for the rationale: prefab templates live
+-- under ReplicatedStorage.Templates keyed by bare prefab name; the
+-- plan's ``template_name`` field bridges the stable prefab_id.
+local function _resolveTemplate(prefabId)
+    local prefab = (Plan.prefabs or {})[prefabId]
+    local templateName = prefab and prefab.template_name
+    if type(templateName) ~= "string" or templateName == "" then
+        return nil
+    end
+    local templates = RS:FindFirstChild("Templates")
+    if not templates then return nil end
+    return templates:FindFirstChild(templateName)
+end
+
+local services = {
+    task = task,
+    warn = warn,
+    resolveModule = resolveModule,
+    workspaceFind = workspaceFind,
+    findFirstChildWhichIsA = function(inst, class)
+        -- ``GetComponent("Rigidbody")`` etc. should hit a built-in
+        -- attached directly to the GameObject AS WELL as nested
+        -- children. Roblox's ``FindFirstChildWhichIsA`` skips the
+        -- instance itself, so a Part-rooted GameObject with
+        -- ``GetComponent("BasePart")`` returned nil pre-R3.
+        if not inst then return nil end
+        if type(inst.IsA) == "function" and inst:IsA(class) then
+            return inst
+        end
+        return inst:FindFirstChildWhichIsA(class)
+    end,
+    heartbeat = RunService.Heartbeat,
+    fixedStep = 0.02,
+    now = function() return os.clock() end,
+    getInstanceId = function(inst)
+        return inst and inst:GetAttribute("_SceneRuntimeId")
+    end,
+    clonePrefabTemplate = function(prefabId, parent, cframe)
+        local tpl = _resolveTemplate(prefabId)
+        if not tpl then return nil end
+        local clone = tpl:Clone()
+        if parent then clone.Parent = parent end
+        if cframe and clone:IsA("Model") then
+            clone:PivotTo(cframe)
+        end
+        return clone
+    end,
+    resolveCloneChild = function(clone, gameObjectId)
+        for _, d in clone:GetDescendants() do
+            if d:GetAttribute("_SceneRuntimeId") == gameObjectId then
+                return d
+            end
+        end
+        return clone
+    end,
+    collectDescendantIds = function(inst)
+        -- DFS post-order (children deepest-first, then self), per the
+        -- design doc's recursive-teardown contract. Reversing
+        -- ``GetDescendants`` (BFS) is NOT equivalent.
+        local out = {}
+        local function walk(node)
+            for _, child in node:GetChildren() do
+                walk(child)
+            end
+            local id = node:GetAttribute("_SceneRuntimeId")
+            if id then table.insert(out, id) end
+        end
+        walk(inst)
+        return out
+    end,
+    collectSubtreeIdsWithParents = function(inst)
+        -- R4-P1.2: DFS preorder (root first, then children) with each
+        -- entry carrying its parent id so the host's setActive cascade
+        -- can recompute ``activeInHierarchy`` correctly. Returns a list
+        -- of ``{id = "...", parentId = "..." | nil}`` records; entries
+        -- whose Roblox Instance has no ``_SceneRuntimeId`` are dropped
+        -- but the walk still descends through them (mirrors how the
+        -- existing collectDescendantIds skips unstamped nodes).
+        local out = {}
+        local function walk(node, parentId)
+            local id = node:GetAttribute("_SceneRuntimeId")
+            if id then
+                table.insert(out, {id = id, parentId = parentId})
+            end
+            local childParentId = id or parentId
+            for _, child in node:GetChildren() do
+                walk(child, childParentId)
+            end
+        end
+        walk(inst, nil)
+        return out
+    end,
+    destroyInstance = function(inst)
+        if inst and inst.Destroy then inst:Destroy() end
+    end,
+}
+
+local engine = SceneRuntime.new(services, Plan)
+engine:start("server")
+'''
+
+
+def generate_scene_runtime_client_entrypoint() -> RbxScript:
+    """LocalScript that boots the host runtime's client partition."""
+    return RbxScript(
+        name="SceneRuntimeClient",
+        source=_SCENE_RUNTIME_CLIENT_SOURCE,
+        script_type="LocalScript",
+        parent_path="StarterPlayer.StarterPlayerScripts",
+    )
+
+
+def generate_scene_runtime_server_entrypoint() -> RbxScript:
+    """Server Script that boots the host runtime's server partition."""
+    return RbxScript(
+        name="SceneRuntimeServer",
+        source=_SCENE_RUNTIME_SERVER_SOURCE,
+        script_type="Script",
+        parent_path="ServerScriptService",
+    )
+
+
+def render_cross_domain_report(edges: list) -> str:
+    """Render the conversion-time cross-domain edge report.
+
+    ``edges`` is a list of dicts shaped like
+    ``{"from_script": ..., "to_script": ..., "field": ...,
+       "from_domain": ..., "to_domain": ...}``.
+
+    The host runtime injects ``nil`` for these refs at start (v1
+    cross-domain policy); this report lets operators see the boundary
+    before runtime. Output is plaintext suitable for appending to
+    ``UNCONVERTED.md``.
+    """
+    if not edges:
+        return ""
+    lines = [
+        "## Cross-domain references (scene-runtime v1)",
+        "",
+        ("The host runtime injects ``nil`` for these serialized references "
+         "and logs a warning at start. Brokering (RemoteEvent/attribute-mirror "
+         "stubs) is deferred per the design doc."),
+        "",
+        f"Total edges: {len(edges)}",
+        "",
+        "| From class | Domain | Field | -> | To class | Domain |",
+        "|---|---|---|---|---|---|",
+    ]
+    for e in edges:
+        lines.append(
+            f"| {e.get('from_script','?')} | {e.get('from_domain','?')} | "
+            f"{e.get('field','?')} | -> | {e.get('to_script','?')} | "
+            f"{e.get('to_domain','?')} |"
+        )
+    return "\n".join(lines) + "\n"
 

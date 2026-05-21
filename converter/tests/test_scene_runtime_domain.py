@@ -461,3 +461,60 @@ class TestNonRuntimeBearingSkipped:
         classify_scene_runtime_domains(artifact, scripts)
         # Module row left untouched by the classifier.
         assert "domain" not in artifact["modules"]["guid-skip"]
+
+
+# ---------------------------------------------------------------------------
+# R2-P1.1: module_path is the dotted DataModel path.
+# ---------------------------------------------------------------------------
+
+class TestModulePathIsDottedDataModelPath:
+    """Codex round-2 P1: ``module_path`` is what the SceneRuntime
+    entrypoints feed to ``game:FindFirstChild(...)``; it MUST be the
+    live Roblox DataModel path, dot-joined. Pre-fix the planner stamped
+    an on-disk path (``"scripts/Foo.luau"``) and every runtime-bearing
+    MonoBehaviour failed to require at boot in production.
+    """
+
+    def test_replicated_storage_module_gets_dotted_path(self) -> None:
+        _, mod = _mk_module("guid-foo", class_name="Foo")
+        artifact = _mk_artifact({"guid-foo": mod})
+        scripts = [_mk_script(
+            "Foo", "local p = Players.LocalPlayer",
+            parent_path=REPLICATED_STORAGE,
+        )]
+        classify_scene_runtime_domains(artifact, scripts)
+        path = artifact["modules"]["guid-foo"].get("module_path")
+        assert path == "ReplicatedStorage.Foo", (
+            f"replicated_storage module must get dotted DataModel path; "
+            f"got {path!r}"
+        )
+
+    def test_starter_player_scripts_module_gets_full_dotted_path(self) -> None:
+        _, mod = _mk_module("guid-bar", class_name="Bar")
+        artifact = _mk_artifact({"guid-bar": mod})
+        scripts = [_mk_script(
+            "Bar", "local p = Players.LocalPlayer",
+            parent_path=STARTER_PLAYER_SCRIPTS,
+        )]
+        classify_scene_runtime_domains(artifact, scripts)
+        path = artifact["modules"]["guid-bar"].get("module_path")
+        assert path == "StarterPlayer.StarterPlayerScripts.Bar", (
+            f"StarterPlayer modules must keep the nested dotted shape; "
+            f"got {path!r}"
+        )
+
+    def test_module_path_is_not_scripts_slash_filename(self) -> None:
+        """Negative regression: pre-fix shape must not reappear."""
+        _, mod = _mk_module("guid-baz", class_name="Baz")
+        artifact = _mk_artifact({"guid-baz": mod})
+        scripts = [_mk_script(
+            "Baz", ":FireServer(", parent_path=REPLICATED_STORAGE,
+        )]
+        classify_scene_runtime_domains(artifact, scripts)
+        path = artifact["modules"]["guid-baz"].get("module_path") or ""
+        assert "/" not in path, (
+            f"module_path must not use the legacy scripts/ shape; got {path!r}"
+        )
+        assert not path.endswith(".luau"), (
+            f"module_path is a DataModel path, not a file path; got {path!r}"
+        )

@@ -596,11 +596,10 @@ def materials(unity_project_path: str, output_dir: str) -> None:
               type=click.Choice(["legacy", "auto", "generic"]),
               default="legacy",
               show_default=True,
-              help="Scene-runtime contract mode. 'auto'/'generic' route "
-                   "through the contract pipeline (PR4); rejected at "
-                   "this CLI until then. Use "
-                   "``python -m converter.tools.scene_runtime_spike`` "
-                   "to exercise the verifier without a full conversion.")
+              help="Scene-runtime contract mode. 'legacy' is the pre-PR3 "
+                   "pipeline (default). 'generic' routes through PR4's "
+                   "host runtime (Piece 6 services). 'auto' is reserved "
+                   "for PR5 and currently rejected.")
 @click.option("--clean", is_flag=True,
               help="PR3b: wipe + re-stamp the output dir before "
               "transpiling (mode-mismatch remediation).")
@@ -608,16 +607,18 @@ def transpile(unity_project_path: str, output_dir: str,
               api_key: str | None, no_ai: bool, scene_runtime: str,
               clean: bool) -> None:
     """Phase 3b: transpile C# scripts to Luau."""
-    # PR3a: reject non-legacy modes until the host runtime lands in PR4.
-    if scene_runtime != "legacy":
+    # PR4: only ``auto`` is rejected (PR5 turf). ``generic`` flows
+    # through the host runtime; see ``_enforce_scene_runtime_mode_supported``
+    # in u2r.py for the shared rationale.
+    if scene_runtime == "auto":
         _emit({
             "phase": "transpile",
             "success": False,
             "errors": [
-                f"--scene-runtime={scene_runtime!r} is not yet supported. "
-                f"The host runtime lands in PR4 of the scene-runtime "
-                f"effort. Use python tools/scene_runtime_spike.py "
-                f"to exercise the contract verifier.",
+                "--scene-runtime=auto is not yet supported. PR4 lights "
+                "up 'generic'; 'auto' lands in PR5 alongside its "
+                "fallback-routing canaries. Use --scene-runtime=generic "
+                "for the contract pipeline.",
             ],
         })
         sys.exit(1)
@@ -789,9 +790,9 @@ def validate(output_dir: str, write: bool) -> None:
               type=click.Choice(["legacy", "auto", "generic"]),
               default="legacy",
               show_default=True,
-              help="Scene-runtime contract mode. 'auto'/'generic' route "
-                   "through the contract pipeline (PR4); rejected at "
-                   "this CLI until then.")
+              help="Scene-runtime contract mode. 'generic' routes "
+                   "through PR4's host runtime. 'auto' is reserved "
+                   "for PR5 and currently rejected.")
 @click.option("--clean", is_flag=True,
               help="PR3b: wipe + re-stamp the output dir before "
               "assembling (mode-mismatch remediation).")
@@ -802,12 +803,13 @@ def assemble(unity_project_path: str, output_dir: str,
              scaffolding: str | None,
              scene_runtime: str, clean: bool) -> None:
     """Phase 4: upload assets, resolve, convert animations + scene, write .rbxlx."""
-    # PR3a/PR3b: reject non-legacy + guard the mode stamp before any phase.
-    if scene_runtime != "legacy":
+    # PR4: only ``auto`` is still rejected (PR5 turf).
+    if scene_runtime == "auto":
         _emit({
             "phase": "assemble", "success": False, "errors": [
-                f"--scene-runtime={scene_runtime!r} is not yet supported. "
-                f"The host runtime lands in PR4 of the scene-runtime effort."
+                "--scene-runtime=auto is not yet supported. PR4 lights "
+                "up 'generic'; 'auto' lands in PR5. Use "
+                "--scene-runtime=generic for the contract pipeline.",
             ],
         })
         sys.exit(1)
@@ -946,8 +948,8 @@ def assemble(unity_project_path: str, output_dir: str,
               default="legacy",
               show_default=True,
               help="Scene-runtime contract mode. Must match the output "
-                   "dir's stamp (or pass --clean). Non-legacy rejected "
-                   "until PR4.")
+                   "dir's stamp (or pass --clean). 'auto' reserved "
+                   "for PR5.")
 @click.option("--clean", is_flag=True,
               help="PR3b: wipe + re-stamp the output dir before "
               "uploading (mode-mismatch remediation).")
@@ -956,12 +958,13 @@ def upload(output_dir: str, api_key: str | None,
            scene_runtime: str, clean: bool) -> None:
     """Publish the .rbxlx to Roblox via headless place builder."""
     out = Path(output_dir).resolve()
-    # PR3a/PR3b: reject non-legacy + guard the mode stamp.
-    if scene_runtime != "legacy":
+    # PR4: only ``auto`` is still rejected (PR5 turf).
+    if scene_runtime == "auto":
         _emit({
             "phase": "upload", "success": False, "errors": [
-                f"--scene-runtime={scene_runtime!r} is not yet supported. "
-                f"The host runtime lands in PR4 of the scene-runtime effort."
+                "--scene-runtime=auto is not yet supported. PR4 lights "
+                "up 'generic'; 'auto' lands in PR5. Use "
+                "--scene-runtime=generic for the contract pipeline.",
             ],
         })
         sys.exit(1)

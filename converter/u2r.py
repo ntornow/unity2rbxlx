@@ -42,30 +42,26 @@ def _guard_scene_runtime_mode(
         raise click.UsageError(str(exc)) from exc
 
 
-def _enforce_scene_runtime_legacy_until_pr4(value: str) -> None:
-    """Reject ``--scene-runtime=auto|generic`` until the host runtime lands.
+def _enforce_scene_runtime_mode_supported(value: str) -> None:
+    """Reject ``--scene-runtime`` modes that PR4 hasn't wired yet.
 
-    PR3a wires the flag at every conversion front door so PR3b/PR4 can
-    flip on the contract pipeline without re-touching CLI surfaces. The
-    host runtime (``runtime/scene_runtime.luau``) doesn't exist yet
-    though -- emitting ``ModuleScript``-target Luau under generic
-    without a host that ``require``s and instantiates them would just
-    produce dead modules. Reject at the CLI with a pointer at the
-    compliance-spike tool, which can exercise the contract verifier
-    without needing the runtime.
+    PR3a wired the flag at every conversion front door. PR4 lights up
+    ``generic`` (host runtime ``runtime/scene_runtime.luau`` + Piece 6
+    services); ``auto`` is still rejected because its fallback-routing
+    decision (try ``generic`` -> on any fail-closed trigger fall back
+    to a clean ``legacy`` dir) lands in PR5 with the canary projects
+    that exercise the trigger surface. The PR4 row in the design doc
+    keeps ``auto`` deferred — see
+    ``converter/docs/design/scene-runtime-contract.md``.
     """
-    if value != "legacy":
+    if value == "auto":
         raise click.UsageError(
-            f"--scene-runtime={value!r} is not yet supported. The host "
-            f"runtime that consumes contract-compliant ModuleScripts "
-            f"lands in PR4 of the scene-runtime effort (see "
-            f"converter/docs/design/scene-runtime-contract.md). To run "
-            f"the contract verifier on a project without the host, "
-            f"use (from the converter/ directory):\n\n"
-            f"  python tools/scene_runtime_spike.py <project>\n\n"
-            f"This will emit a compliance-spike report (per-module pre/"
-            f"post-reprompt verifier pass rate) without attempting a "
-            f"full conversion."
+            "--scene-runtime=auto is not yet supported. PR4 lights up "
+            "'generic'; 'auto' lands in PR5 alongside the canary "
+            "projects that exercise its fallback-routing decision. "
+            "Use --scene-runtime=generic for the contract pipeline or "
+            "--scene-runtime=legacy (default) for the pre-contract "
+            "pipeline. See converter/docs/design/scene-runtime-contract.md."
         )
 
 
@@ -324,13 +320,11 @@ def main(verbose: bool) -> None:
               default="legacy",
               show_default=True,
               help="Scene-runtime contract mode. 'legacy' is the pre-PR3 "
-                   "pipeline (default, byte-identical). 'generic' and "
-                   "'auto' route through the contract pipeline; they "
-                   "land in PR4 of the scene-runtime effort and are "
-                   "rejected at this CLI until then. Use "
-                   "``python -m converter.tools.scene_runtime_spike`` "
-                   "to exercise the contract verifier on real projects "
-                   "before PR4.")
+                   "pipeline (default, byte-identical). 'generic' routes "
+                   "through the PR4 host runtime (Piece 6 services + "
+                   "cross-domain report). 'auto' (try-generic-then-legacy) "
+                   "is reserved for PR5 and currently rejected. See "
+                   "converter/docs/design/scene-runtime-contract.md.")
 @click.option("--clean", is_flag=True,
               help="Remediation for --scene-runtime mode mismatches: "
               "wipe the output directory and re-stamp it before "
@@ -367,11 +361,10 @@ def convert(
 
       python u2r.py convert path/to/UnityProject -o ./output --api-key ./apikey --creator-id ./creator_id --skip-architecture-step
     """
-    # PR3a: gate non-legacy scene-runtime modes at the CLI until the
-    # host runtime lands in PR4. Reject before any pipeline setup --
-    # there's no way to honor the request and the user needs to know
-    # right away. See ``_enforce_scene_runtime_legacy_until_pr4``.
-    _enforce_scene_runtime_legacy_until_pr4(scene_runtime)
+    # PR4: gate ``auto`` (PR5 turf) at the CLI; ``generic`` is now
+    # accepted. PR3a's hard-reject of every non-legacy mode is gone --
+    # see ``_enforce_scene_runtime_mode_supported``.
+    _enforce_scene_runtime_mode_supported(scene_runtime)
 
     # PR3b: stamp + mismatch guard. Runs BEFORE any phase, BEFORE
     # ``scripts_cache_intact`` checks. ``--clean`` is the remediation
@@ -612,7 +605,7 @@ def publish(
     import config
     output_path = Path(output_dir).resolve()
 
-    _enforce_scene_runtime_legacy_until_pr4(scene_runtime)
+    _enforce_scene_runtime_mode_supported(scene_runtime)
     _guard_scene_runtime_mode(output_path, scene_runtime, clean)
 
     from roblox.id_cache import read_ids, write_ids
@@ -1575,7 +1568,7 @@ def eval_cmd(
     from converter.pipeline import Pipeline
     import config
 
-    _enforce_scene_runtime_legacy_until_pr4(scene_runtime)
+    _enforce_scene_runtime_mode_supported(scene_runtime)
 
     config.USE_AI_TRANSPILATION = False  # deterministic rule-based for eval
 
