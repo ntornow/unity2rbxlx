@@ -151,7 +151,19 @@ class TestGenericModeRoutesThroughContractPipeline:
             "Legacy transpile_scripts must NOT be called under generic "
             "mode -- the contract pipeline is the only valid producer."
         )
+        # Pin the FULL kwarg contract for transpile_with_contract --
+        # missing any of these on the call site would either disable
+        # the contract verifier or fail to thread the planner artifact.
+        assert mock_contract.call_args.args == ()
         kwargs = mock_contract.call_args.kwargs
+        assert set(kwargs.keys()) == {
+            "unity_project_path",
+            "script_infos",
+            "scene_runtime",
+            "use_ai",
+            "api_key",
+            "serialized_field_refs",
+        }
         assert kwargs["script_infos"] == infos
         assert kwargs["scene_runtime"] is pipeline.ctx.scene_runtime
         # Verify the result landed on the state.
@@ -198,15 +210,26 @@ class TestGenericModeRoutesThroughContractPipeline:
         # branch, this assertion explodes -- which is the point. PR3a's
         # invariant ("legacy emit byte-unchanged") relies on the legacy
         # entry receiving no new kwargs.
+        assert mock_legacy.call_args.args == (), (
+            "Legacy transpile_scripts must be called keyword-only -- "
+            "positional args would mask a kwarg drift in this assertion."
+        )
         kwargs = mock_legacy.call_args.kwargs
-        assert "runtime_mode" not in kwargs
-        assert "runtime_bearing_paths" not in kwargs
-        # And the legacy-relevant ones must be there.
-        assert "unity_project_path" in kwargs
-        assert "script_infos" in kwargs
-        assert "use_ai" in kwargs
-        assert "api_key" in kwargs
-        assert "serialized_field_refs" in kwargs
+        # The set of kwargs must be EXACTLY the pre-PR3a set. Asserting
+        # the exact set (not just absence of the new ones + presence of
+        # the old ones) catches any future kwarg drift -- including
+        # additions we haven't yet thought to forbid.
+        assert set(kwargs.keys()) == {
+            "unity_project_path",
+            "script_infos",
+            "use_ai",
+            "api_key",
+            "serialized_field_refs",
+        }, (
+            f"Legacy transpile_scripts kwarg set drifted from the "
+            f"pre-PR3a contract: {sorted(kwargs.keys())}. Any addition "
+            f"would risk changing legacy-mode output."
+        )
 
     def test_auto_mode_falls_back_to_legacy(self, tmp_path: Path) -> None:
         """``auto`` is PR5's territory -- under PR3-era plumbing the
