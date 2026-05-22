@@ -1414,6 +1414,8 @@ def _generate_position_tweens(
     tab: str,
 ) -> None:
     """Generate TweenService code for position keyframes."""
+    import config
+
     lines.append(f"{tab}-- Position animation ({len(keyframes)} keyframes)")
     lines.append(f"{tab}local basePos = {target_var}.Position")
 
@@ -1422,9 +1424,20 @@ def _generate_position_tweens(
         curr = keyframes[i]
         dt = max(curr.time - prev.time, 0.001)
 
-        # Unity position offset -> Roblox position offset
-        # Apply coordinate system conversion: Unity (x,y,z) -> Roblox (x,y,-z)
-        x, y, z = curr.value[0], curr.value[1], -curr.value[2]
+        # Unity position offset -> Roblox position offset.
+        # Two conversions, both mandatory:
+        #   1. Coordinate system: Unity (x,y,z) -> Roblox (x,y,-z).
+        #   2. Units: Unity authors curves in METRES, Roblox parts live in
+        #      STUDS, so every offset component scales by STUDS_PER_METER
+        #      (the same factor every other geometry/physics translation
+        #      applies — component_converter, terrain, etc). Without it a
+        #      4 m door-open curve tweens by a barely-perceptible +4 studs
+        #      instead of the correct +14.28; this is the unscaled-offset
+        #      bug the legacy door_tween coherence pack existed to mask.
+        s = config.STUDS_PER_METER
+        x = curr.value[0] * s
+        y = curr.value[1] * s
+        z = -curr.value[2] * s
 
         lines.append(f"{tab}local tweenInfo{i} = TweenInfo.new({dt:.4f}, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut)")
         lines.append(f"{tab}local tween{i} = TweenService:Create({target_var}, tweenInfo{i}, {{")

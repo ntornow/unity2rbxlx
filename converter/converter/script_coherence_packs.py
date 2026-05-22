@@ -543,35 +543,18 @@ def _apply_weapon_mount(s: "RbxScript", mount: WeaponMount) -> bool:
     return s.source != before
 
 
-def _insert_before_terminal_return(source: str, block: str) -> str:
-    """Splice ``block`` into ``source`` just BEFORE the module's terminal
-    ``return <X>`` (a column-0 ``^return`` match), or append it when there
-    is no such return.
-
-    Generic scene-runtime modules end in ``return <Class>``; a statement
-    placed after that return is illegal Luau ("Expected <eof>, got ...").
-    Legacy targets are top-level Scripts with no terminal return, so the
-    block is simply appended. This mirrors the return-aware discipline in
-    ``script_coherence.fix_require_classifications`` (the column-0
-    ``^return\\b`` match is robust to multi-line table bodies and to
-    ``return`` keywords nested inside functions/if-blocks).
-    """
-    return_m = re.search(r"^return\b", source, re.MULTILINE)
-    if return_m:
-        return (
-            source[: return_m.start()].rstrip()
-            + "\n"
-            + block.strip("\n")
-            + "\n\n"
-            + source[return_m.start():]
-        )
-    return source.rstrip() + "\n" + block
-
-
 def _append_pickup_touched_block(s: "RbxScript") -> None:
     if _PICKUP_TOUCHED_MARKER in s.source:
         return
-    s.source = _insert_before_terminal_return(s.source, _PICKUP_TOUCHED_CODE)
+    return_m = re.search(r"^return\b", s.source, re.MULTILINE)
+    if return_m:
+        s.source = (
+            s.source[: return_m.start()]
+            + _PICKUP_TOUCHED_CODE
+            + s.source[return_m.start():]
+        )
+    else:
+        s.source = s.source.rstrip() + "\n" + _PICKUP_TOUCHED_CODE
 
 
 @patch_pack(
@@ -1086,7 +1069,11 @@ def _add_pickup_remote_listener(scripts: list["RbxScript"]) -> int:
         '    end)\n'
         'end\n'
     )
-    s.source = _insert_before_terminal_return(s.source, listener)
+    return_m = re.search(r'^return\b', s.source, re.MULTILINE)
+    if return_m:
+        s.source = s.source[:return_m.start()] + listener + s.source[return_m.start():]
+    else:
+        s.source = s.source.rstrip() + '\n' + listener
     fixes += 1
     log.info("  Added PickupItemEvent OnClientEvent listener in '%s'", s.name)
     return fixes
@@ -2405,8 +2392,8 @@ def _add_trigger_stay_polling(scripts: list["RbxScript"]) -> int:
             and ("getSightRadius" in s.source or "sightRadius" in s.source)
         ):
             continue
-        _poll_block = (
-            poll_marker + " Unity OnTriggerStay equivalent — Touched fires\n"
+        s.source += (
+            "\n\n" + poll_marker + " Unity OnTriggerStay equivalent — Touched fires\n"
             "-- only on part-touch *events*, but Unity OnTriggerStay re-runs every\n"
             "-- physics frame. Polling lets a rotating turret eventually pick up\n"
             "-- a target whose initial-contact angle was outside the engagement cone.\n"
@@ -2445,7 +2432,6 @@ def _add_trigger_stay_polling(scripts: list["RbxScript"]) -> int:
             "    end)\n"
             "end\n"
         )
-        s.source = _insert_before_terminal_return(s.source, _poll_block)
         fixes += 1
         log.info("  Added OnTriggerStay polling loop to '%s'", s.name)
     return fixes
@@ -2550,7 +2536,7 @@ def _add_turret_trigger_stay_polling_v2(scripts: list["RbxScript"]) -> int:
             and "tBase" in s.source
         ):
             continue
-        s.source = _insert_before_terminal_return(s.source, poll)
+        s.source = s.source.rstrip() + poll
         fixes += 1
         log.info("  Added OnTriggerStay polling loop (v2) to '%s'", s.name)
     return fixes
@@ -2900,7 +2886,7 @@ def _inject_door_tween(scripts: list["RbxScript"]) -> int:
             or "_AutoFpsDoorTweenInjected" in s.source
         ):
             continue
-        s.source = _insert_before_terminal_return(s.source, _DOOR_TWEEN_BLOCK)
+        s.source = s.source.rstrip() + "\n" + _DOOR_TWEEN_BLOCK
         fixes += 1
         log.info("  Injected door tween listener in '%s'", s.name)
     return fixes
@@ -2995,7 +2981,7 @@ def _inject_door_machine_signal(scripts: list["RbxScript"]) -> int:
             continue
         if "_AutoMachineDoorSignal" in src:
             continue
-        s.source = _insert_before_terminal_return(src, _DOOR_MACHINE_SIGNAL_BLOCK)
+        s.source = src.rstrip() + "\n" + _DOOR_MACHINE_SIGNAL_BLOCK
         fixes += 1
         log.info("  Wired Machine ToggleDoor signal into '%s'", s.name)
     return fixes

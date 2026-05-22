@@ -2765,6 +2765,9 @@ return table.concat(allData, "\\n")'''
         cross-script ``require()`` calls, and reclassify Script→ModuleScript
         based on require dependencies."""
         # Post-transpilation: rewrite asset references in scripts.
+        # ``rewrite_asset_references`` is on the generic scene-runtime
+        # contract allowlist (see docs/design/scene-runtime-contract.md),
+        # so it runs unconditionally in BOTH modes.
         from converter.script_asset_rewriter import rewrite_asset_references
         rewrites = rewrite_asset_references(
             self.state.rbx_place.scripts,
@@ -2773,6 +2776,24 @@ return table.concat(allData, "\\n")'''
         )
         if rewrites:
             log.info("[write_output] Rewrote asset references in %d scripts", rewrites)
+
+        # The remaining passes — cross-script require injection and the
+        # require-reclassification / coherence packs (``run_packs``) — are
+        # LEGACY repair passes. The scene-runtime contract is an allowlist:
+        # under generic mode ALL legacy repair passes are OFF (see
+        # docs/design/scene-runtime-contract.md:151-169, which names
+        # ``script_coherence_packs`` and ``fix_require_classifications``
+        # explicitly). Generic resolves requires via the contract
+        # pipeline's own ``resolve_requires``; running the legacy packs
+        # in generic injects dead ``script.Parent``-based blocks into
+        # ModuleScripts (e.g. the door-tween pack on the Door module).
+        if self.ctx.scene_runtime_mode == "generic":
+            log.info(
+                "[write_output] Skipping legacy require-injection and "
+                "coherence packs in generic scene-runtime mode "
+                "(contract allowlist; requires resolved by contract pipeline)"
+            )
+            return
 
         # Inject require() calls for cross-script class dependencies.
         if self.state.dependency_map and self.state.rbx_place.scripts:
