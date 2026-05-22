@@ -1,78 +1,17 @@
 # Unity -> Roblox Game Converter
 
-## Autonomous Work Plan (2026-03-24)
+## Safety
 
-Work autonomously with no questions — just churn forever making the converter comprehensive.
+Non-negotiable for any Studio/MCP operation:
 
-**CRITICAL: NEVER STOP WORKING. NEVER present a summary and wait. After completing ANY task, IMMEDIATELY start the next one. The loop is: improve → test → convert → compare → identify gaps → improve. This loop runs FOREVER with zero pauses. If you find yourself about to write a "summary" or "here's what was accomplished" — STOP and instead start the next improvement.**
+- **Agas Map of London.** **NEVER** connect to, send MCP commands to, or interact with the Studio instance titled "Agas Map of London", and **NEVER** send osascript that could affect it. It is a separate user project that must not be touched under any circumstances.
+- **Verify `game.Name`** before executing ANY MCP command — this is the check that confirms the target is the converter's place, not Agas Map.
+- **Stay general-purpose.** No hardcoded, game-specific values: the converter must work for ALL Unity games, not just the bundled test projects.
 
-1. **Identify ALL gaps** between converter capability and Unity/Roblox features → write to TODO.md
-2. **Build proper test harness** for rbxlx loading in Studio (osascript, command line, MCP verification)
-3. **Work through TODO list** one by one, fixing each gap
-4. **Once done, repeat from step 1** — re-analyze for remaining gaps
-
-### Rules:
-- No asking questions or permissions — just do the right thing
-- Store progress in CLAUDE.md and TODO files
-- Use osascript to control Studio (open files, close, reopen)
-- Test harness should verify rbxlx files load correctly
-- No hardcoded values — converter must be general-purpose for ALL Unity games
-- ALWAYS verify `game.Name` before executing ANY MCP commands (critical safety check)
-- Research first, build correctly, don't hack or guess
-- Everything should be fully automatic by running `u2r.py`
-
-### CRITICAL SAFETY: Agas Map of London
-- **NEVER** connect to, send MCP commands to, or interact with the Studio instance titled "Agas Map of London"
-- **NEVER** send osascript commands that could affect it
-- Before ANY Studio/MCP operation, verify the target is the converter's place, NOT Agas Map
-- This is a separate user project that must not be touched under any circumstances
-
-### Progress tracking:
-- See [TODO.md](TODO.md) for comprehensive gap analysis and task list
-
-### Converter Status (as of 2026-05-16)
-
-**1340 tests** (1305 fast, 35 slow full-pipeline tests)
-**9 test projects** converting and validating clean with zero errors:
-- SimpleFPS (960 parts, 36 scripts), Gamekit3D (18,534 parts, 249 scripts)
-- SanAndreasUnity (270 scripts), ChopChop (275 scripts), RedRunner (87 scripts)
-- BoatAttack (55 scripts), BossRoom (195 scripts), 3D-Platformer (7 scripts), PrefabWorkflows (6,582 parts)
-
-**Recent session (2026-04-11/12):**
-- Rifle pickup end-to-end fix for SimpleFPS: script:GetAttribute walk-up lookup, RemoteEvent created at script-init (no race), getRifle idempotency, shoot() cleanup, cloud_api strict asset-ID validation.
-- Rifle sub-mesh textures: prefab-referenced materials now applied as SurfaceAppearance to FBX sub-mesh MeshParts in `_extract_monobehaviour_attributes`.
-- setupSounds broadening: ModuleScript-reclassified Player scripts now fall back to workspace search for a host Part's Sound children.
-- Merged PR #1 (`/convert-unity` skill + phase-by-phase interactive CLI, +2,809 lines).
-- CI wired (`.github/workflows/test.yml`), ANTHROPIC_API_KEY lazy binding, phase-4.5 doc staleness pass.
-
-**Key milestones achieved:**
-- P0/P1/P2: ALL resolved (terrain, scripts, content properties, sub-mesh materials, physics, UI, etc.)
-- **Headless mesh resolution**: Luau Execution API → CreateMeshPartAsync + SavePlaceAsync. 328/328 meshes render as proper 3D geometry in Studio edit mode. Requires caller to supply a pre-created `--universe-id` / `--place-id` (Open Cloud does not support universe creation via API-key auth). After the first run, IDs are cached in `<output>/.roblox_ids.json` and the pipeline runs one-command.
-- **One-command pipeline** (once IDs are cached): `u2r.py convert` → generates rbxlx + publishes to Roblox with proper meshes
-- **Placement accuracy**: Per-sub-mesh vertical offsets, scene hierarchy composition for prefab children, all doors/turrets/pickups at correct positions. 176/176 scripts valid Luau syntax. Mixed collider handling (physical + trigger).
-- **SimpleFPS gameplay verified**: Game starts clean, 0 script errors, water fills, terrain renders, HUD works, spawn points correct, all materials applied (0 default gray).
-- **Performance**: Terrain encoding 2.4x faster via inlined _get_voxel (eliminated 13.8M function calls). SimpleFPS write_output: 8.0s→3.4s. Precomputed height grids + chunk skipping from prior session.
-- SmoothGrid terrain: World-space chunk coordinates with Z inversion
-- Luau place builder: 700KB script reconstructs entire place headlessly (parts, meshes, scripts, terrain, lighting, UI)
-- SurfaceAppearance: Full PBR in rbxlx, Texture fallback for headless mode
-- Luau syntax gate: `luau-analyze` + AI reprompt loop in `code_transpiler.py` (replaced regex `luau_validator.py`, removed 2026-04-18)
-- Script transpilation: 99.7% success rate across all projects
-- Bone name resolution: Mixamo prefix stripping, case-insensitive matching
-
-**See [TODO.md](TODO.md) for remaining open items.**
-
-### Development History (2026-03-24 through 2026-03-28)
-
-Detailed session-by-session progress is in git history. Key milestones:
-- **2026-03-24**: Initial gap analysis, terrain SmoothGrid, SSS scripts, script coherence, LOD filtering, NavMesh. 250 tests.
-- **2026-03-25**: Rule-based transpiler (try/catch, for loops, foreach), 50+ API mappings, video/reverb/cinemachine/particles, terrain splat maps, skeletal animation, prefab variants, CSafeLoader (7.5x faster YAML). 308 tests.
-- **2026-03-26**: Prefab hierarchy orphans fixed (0 remaining), multi-scene conversion, nested project auto-detection, lambdas, collection initializers, Mathf/LINQ/DOTween utility functions, switch/case, out/ref params, null-conditional/coalescing, yield/coroutines, property get/set, type-check patterns. 374 tests.
-- **2026-03-27 (30+ sessions)**: Massive Luau quality push — 200+ validator patterns added. Block balance (stack-based end tracking), cross-script dependency injection, CDATA wrapping fix, bare receiver fix, generic type stripping, Physics API fixes, Vector3 immutability, Color constants, comprehensive C# declaration/attribute/operator cleanup, Input axis mapping, property getter inlining, missing module return insertion, for-loop fallback to while. 888 tests.
-- **2026-03-28**: SmoothGrid format fully reverse-engineered (6-bit material, occupancy, axis swap, 22 materials confirmed). Rigidbody physics (CustomPhysicalProperties), MeshCollider CollisionFidelity, Cinemachine camera runtime, test suite optimization (@slow markers). 888 tests.
-
-### Full upload test (2026-03-25):
-- SimpleFPS: 194 assets uploaded (0 errors), 26 Model IDs resolved, 328 meshes loaded
-- Terrain + water + loaded meshes visible in Studio
+> Test counts, converter status, and session-by-session history are intentionally
+> not kept in this file — those snapshots go stale. Active work lives in
+> [TODO.md](TODO.md); completed work and per-PR execution logs live in
+> [TODO_archive.md](TODO_archive.md); detailed history is in git.
 
 ## Overview
 Converts Unity game projects into playable Roblox experiences. Handles scene hierarchy, materials, C# -> Luau transpilation, mesh processing, animation conversion, and asset upload.
