@@ -15,7 +15,23 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from roblox import studio_launcher
-from roblox.studio_launcher import StudioCloseError, close_running_studio_or_fail
+from roblox.studio_launcher import (
+    StudioCloseError,
+    _EDITOR_PROC_PATTERN,
+    close_running_studio_or_fail,
+)
+
+
+def test_kill_pattern_targets_editor_not_mcp_proxy():
+    # The pgrep/pkill pattern must match the Studio editor process but NOT the
+    # StudioMCP proxy (killing it severs the MCP connection) or the crash
+    # handler. Substring containment mirrors how ``pkill -f`` matches.
+    editor = "/Applications/RobloxStudio.app/Contents/MacOS/RobloxStudio /tmp/place.rbxlx"
+    proxy = "/Applications/RobloxStudio.app/Contents/MacOS/StudioMCP"
+    crash = "/Applications/RobloxStudio.app/Contents/MacOS/RobloxCrashHandler --studioPid 1"
+    assert _EDITOR_PROC_PATTERN in editor
+    assert _EDITOR_PROC_PATTERN not in proxy
+    assert _EDITOR_PROC_PATTERN not in crash
 
 
 class _FakeClock:
@@ -52,7 +68,7 @@ def test_graceful_sigterm_no_escalation(run_mock, _sys):
         studio_launcher, "is_studio_running", side_effect=lambda: next(states)
     ):
         close_running_studio_or_fail()
-    assert _cmds(run_mock) == [["pkill", "-f", "RobloxStudio"]]  # SIGTERM only
+    assert _cmds(run_mock) == [["pkill", "-f", "MacOS/RobloxStudio"]]  # SIGTERM only
 
 
 @mock.patch("platform.system", return_value="Darwin")
@@ -68,8 +84,8 @@ def test_escalates_to_sigkill_when_sigterm_trapped(run_mock, _sys):
     ):
         close_running_studio_or_fail(timeout=30)
     cmds = _cmds(run_mock)
-    assert ["pkill", "-f", "RobloxStudio"] in cmds
-    assert ["pkill", "-9", "-f", "RobloxStudio"] in cmds
+    assert ["pkill", "-f", "MacOS/RobloxStudio"] in cmds
+    assert ["pkill", "-9", "-f", "MacOS/RobloxStudio"] in cmds
 
 
 @mock.patch("platform.system", return_value="Darwin")
@@ -81,7 +97,7 @@ def test_raises_when_process_never_dies(run_mock, _sys):
         with pytest.raises(StudioCloseError):
             close_running_studio_or_fail(timeout=2)
     # It still escalated to SIGKILL before giving up.
-    assert ["pkill", "-9", "-f", "RobloxStudio"] in _cmds(run_mock)
+    assert ["pkill", "-9", "-f", "MacOS/RobloxStudio"] in _cmds(run_mock)
 
 
 @mock.patch("platform.system", return_value="Windows")

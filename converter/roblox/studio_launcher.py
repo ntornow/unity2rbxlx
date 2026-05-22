@@ -16,6 +16,15 @@ from config import STUDIO_PATH
 
 logger = logging.getLogger(__name__)
 
+# Match the Studio EDITOR process only. A bare ``RobloxStudio`` pattern also
+# matches ``.../Contents/MacOS/StudioMCP`` (the proxy that bridges the MCP
+# client <-> Studio) and ``.../MacOS/RobloxCrashHandler``, so pgrep/pkill on it
+# reported the proxy as "Studio" and — worse — tore the MCP connection down on
+# every teardown. The editor binary path is ``.../MacOS/RobloxStudio`` while the
+# proxy is ``.../MacOS/StudioMCP``, so this narrower fragment hits the editor
+# alone and leaves the MCP proxy alive across close/relaunch.
+_EDITOR_PROC_PATTERN = "MacOS/RobloxStudio"
+
 
 def launch_studio(
     place_id: int | None = None,
@@ -91,7 +100,7 @@ def is_studio_running() -> bool:
             return "RobloxStudioBeta.exe" in result.stdout
         else:
             result = subprocess.run(
-                ["pgrep", "-f", "RobloxStudio"],
+                ["pgrep", "-f", _EDITOR_PROC_PATTERN],
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -176,12 +185,13 @@ def close_running_studio_or_fail(timeout: float = 30) -> None:
         # ``taskkill /F`` is already a forceful terminate.
         _send(["taskkill", "/F", "/IM", "RobloxStudioBeta.exe"])
     else:
-        # ``pkill -f`` matches the same string ``pgrep -f`` would find, so
-        # it signals every Studio Helper + main process. Send SIGTERM
+        # ``pkill -f`` matches the same editor pattern ``pgrep -f`` finds —
+        # crucially NOT the StudioMCP proxy (see ``_EDITOR_PROC_PATTERN``), so
+        # closing Studio no longer severs the MCP connection. Send SIGTERM
         # first (graceful), but Studio traps SIGTERM to raise a "save
         # changes?" dialog and stays alive — so if it survives a short
         # grace period, escalate to SIGKILL, which a dialog cannot catch.
-        _send(["pkill", "-f", "RobloxStudio"])
+        _send(["pkill", "-f", _EDITOR_PROC_PATTERN])
         grace_deadline = min(time.monotonic() + 5.0, deadline)
         while time.monotonic() < grace_deadline:
             if not is_studio_running():
@@ -191,7 +201,7 @@ def close_running_studio_or_fail(timeout: float = 30) -> None:
         logger.warning(
             "Studio survived SIGTERM (likely a save dialog); escalating to SIGKILL"
         )
-        _send(["pkill", "-9", "-f", "RobloxStudio"])
+        _send(["pkill", "-9", "-f", _EDITOR_PROC_PATTERN])
 
     # Wait for the process to actually leave the table — kill is
     # asynchronous on macOS especially.
