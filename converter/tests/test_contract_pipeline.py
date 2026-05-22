@@ -281,6 +281,85 @@ class TestApplyRequireResolutions:
 
 
 # ---------------------------------------------------------------------------
+# require-graph GUID fallback (Bug C). The SimpleFPS generic conversion
+# shipped ``local Player = require(82ce6eb266b269f46b359c96d9d0500d)`` in
+# Machine.luau / HudControl.luau / HostilePlane.luau. The AI emitted the
+# correct ``require("@scene_runtime/Player")`` sentinel; the bug was in
+# ``_build_require_graph``: when the planner artifact carries no
+# ``module_path`` for Player, the fallback used the script_id (the raw
+# .cs GUID), and ``_apply_require_resolutions`` spliced that bare hex blob
+# into ``require(<GUID>)`` -- illegal Luau ("Malformed number"). The fix
+# falls back to a runtime container lookup keyed by file stem.
+# ---------------------------------------------------------------------------
+
+class TestRequireGraphGuidFallback:
+    """Regression: a module with no ``module_path`` must resolve to a
+    valid Luau require target, never a raw GUID."""
+
+    _PLAYER_GUID = "82ce6eb266b269f46b359c96d9d0500d"
+
+    def _script_with(self, source: str) -> TranspiledScript:
+        return TranspiledScript(
+            source_path="Machine.cs",
+            output_filename="Machine.luau",
+            csharp_source="",
+            luau_source=source,
+            strategy="ai",
+            confidence=0.9,
+            script_type="ModuleScript",
+        )
+
+    def test_module_path_absent_resolves_to_valid_target(self):
+        from converter.contract_pipeline import (
+            _apply_require_resolutions,
+            _build_require_graph,
+        )
+        # Planner artifact for Player WITHOUT a ``module_path`` -- exactly
+        # the SimpleFPS generic shape. ``ids[0]`` is the .cs GUID.
+        modules = {
+            self._PLAYER_GUID: {
+                "stem": "Player",
+                "class_name": "Player",
+                "runtime_bearing": True,
+            },
+        }
+        by_stem, collisions = _build_require_graph(modules)
+        # The bug: by_stem["Player"] used to be the raw GUID. Now it must
+        # be a valid runtime lookup expression (no bare hex token).
+        assert by_stem["Player"] != self._PLAYER_GUID
+        assert self._PLAYER_GUID not in by_stem["Player"]
+        assert 'FindFirstChild("Player"' in by_stem["Player"]
+
+        # End-to-end: the sentinel the AI emits resolves + rewrites into a
+        # valid require, NOT ``require(<bareGUID>)``.
+        script = self._script_with(
+            'local Player = require("@scene_runtime/Player")\n'
+            "local Machine = {}\nreturn Machine\n"
+        )
+        rows = resolve_requires([script], by_stem, collisions)
+        assert len(rows) == 1 and rows[0].reason == "ok"
+        _apply_require_resolutions([script], rows)
+        assert "@scene_runtime" not in script.luau_source
+        assert self._PLAYER_GUID not in script.luau_source
+        assert 'require(game:GetService("ReplicatedStorage")' in (
+            script.luau_source
+        )
+
+    def test_module_path_present_is_preferred(self):
+        # When the planner DID set a module_path, it wins over the fallback.
+        from converter.contract_pipeline import _build_require_graph
+        modules = {
+            self._PLAYER_GUID: {
+                "stem": "Player",
+                "runtime_bearing": True,
+                "module_path": "ReplicatedStorage.Modules.Player",
+            },
+        }
+        by_stem, _ = _build_require_graph(modules)
+        assert by_stem["Player"] == "ReplicatedStorage.Modules.Player"
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator -- driven with use_ai=False so the AI is never called.
 # ---------------------------------------------------------------------------
 

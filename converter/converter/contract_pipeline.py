@@ -215,6 +215,23 @@ _RE_SCENE_RUNTIME_REQUIRE = re.compile(
     r"""require\s*\(\s*['"]@scene_runtime/([\w]+)['"]\s*\)""",
 )
 
+def _container_lookup_expr(stem: str) -> str:
+    """A runtime require-target expression that locates a sibling module
+    by file stem at load time -- the shape the rest of the pipeline emits
+    for resolved sibling requires.
+
+    Used as the ``by_stem`` fallback when the planner artifact carries no
+    explicit ``module_path`` for a module. Replaces the historical
+    script_id (raw .cs GUID) fallback, which produced an illegal
+    ``require(<bareGUID>)`` ("Malformed number") in the generated module.
+    """
+    return (
+        'game:GetService("ReplicatedStorage"):FindFirstChild('
+        f'"{stem}", true) or '
+        'game:GetService("ServerStorage"):FindFirstChild('
+        f'"{stem}", true)'
+    )
+
 
 def resolve_requires(
     scripts: list[TranspiledScript],
@@ -555,7 +572,16 @@ def _build_require_graph(
     for stem, ids in seen.items():
         if len(ids) == 1:
             mod = modules[ids[0]]
-            resolved = mod.get("module_path") or ids[0]
+            # Prefer the planner's ``module_path`` when present. When it is
+            # absent (PR1 artifacts omit it until the storage classifier
+            # runs), the historical fallback used the script_id -- the .cs
+            # GUID. But ``_apply_require_resolutions`` splices that value
+            # verbatim into ``require(<value>)``, and a bare hex GUID is
+            # illegal Luau ("Malformed number"): the converted module won't
+            # load. Fall back instead to a runtime container lookup keyed by
+            # the file stem -- the same shape the rest of the pipeline emits
+            # for resolved sibling requires.
+            resolved = mod.get("module_path") or _container_lookup_expr(stem)
             by_stem[stem] = resolved
         else:
             collisions[stem] = sorted(ids)
