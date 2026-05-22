@@ -8,6 +8,8 @@ wait for it to become ready.
 from __future__ import annotations
 
 import logging
+import os
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -146,24 +148,76 @@ class StudioCloseError(RuntimeError):
     every running Studio process within the allotted timeout."""
 
 
-def close_running_studio_or_fail(timeout: float = 30) -> None:
-    """Force-close any running Roblox Studio instance.
+def _pid_alive(pid: int) -> bool:
+    """True if *pid* is a live process (signal-0 probe)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by another user
+    return True
 
-    Used by the ``/e2e-test`` skill's ``--close-and-relaunch`` flag
-    (Codex finding #1: re-opening a regenerated rbxlx in an already-running
-    Studio doesn't actually reload the DataModel; the only honest signal
-    that a fresh rbxlx is loaded is a fresh Studio process). Defaults to
-    a no-op if Studio isn't running.
+
+def _close_pid(pid: int, timeout: float) -> None:
+    """SIGTERM → grace → SIGKILL a single editor PID, within one deadline.
+
+    Used by the e2e teardown so it closes ONLY the editor it launched, leaving
+    concurrent Studio editors from other projects untouched.
+    """
+    if not _pid_alive(pid):
+        logger.info("close: pid %d not running", pid)
+        return
+    deadline = time.monotonic() + timeout
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    grace_deadline = min(time.monotonic() + 5.0, deadline)
+    while time.monotonic() < grace_deadline:
+        if not _pid_alive(pid):
+            logger.info("close: pid %d exited on SIGTERM", pid)
+            return
+        time.sleep(0.5)
+    logger.warning("pid %d survived SIGTERM (save dialog?); escalating to SIGKILL", pid)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.5)
+    raise StudioCloseError(f"pid {pid} still running after {timeout:.0f}s")
+
+
+def close_running_studio_or_fail(timeout: float = 30, pid: int | None = None) -> None:
+    """Force-close a running Roblox Studio editor.
+
+    Used by the ``/e2e-test`` skill's ``--close-and-relaunch`` flag and its
+    Step-8 teardown (Codex finding #1: re-opening a regenerated rbxlx in an
+    already-running Studio doesn't reload the DataModel; the only honest signal
+    that a fresh rbxlx is loaded is a fresh Studio process). No-op if nothing
+    is running.
 
     Parameters
     ----------
     timeout:
-        Max seconds to wait for the process to actually exit after the
-        kill signal. Raises ``StudioCloseError`` on timeout so the
-        caller can surface a real failure instead of silently
-        continuing with a stale Studio.
+        Max seconds to wait for the process to exit after the kill signal.
+        Raises ``StudioCloseError`` on timeout.
+    pid:
+        If given, close ONLY this editor process (PID-targeted), so concurrent
+        Studio editors from other projects are left alone — preferred for the
+        teardown, which knows the PID it launched. If ``None``, falls back to a
+        pattern-based kill of every editor (used by ``--close-and-relaunch``,
+        which has no PID for the pre-existing instance). Neither path touches
+        the StudioMCP proxy (see ``_EDITOR_PROC_PATTERN``).
     """
     import platform
+
+    if pid is not None:
+        _close_pid(pid, timeout)
+        return
 
     if not is_studio_running():
         logger.info("close_running_studio_or_fail: no Studio process detected")

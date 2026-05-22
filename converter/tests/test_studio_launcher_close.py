@@ -6,6 +6,7 @@ the graceful fast-path, the Windows path, and the give-up failure mode —
 all without spawning real processes (subprocess + clock are mocked).
 """
 
+import signal
 import sys
 from pathlib import Path
 from unittest import mock
@@ -98,6 +99,47 @@ def test_raises_when_process_never_dies(run_mock, _sys):
             close_running_studio_or_fail(timeout=2)
     # It still escalated to SIGKILL before giving up.
     assert ["pkill", "-9", "-f", "MacOS/RobloxStudio"] in _cmds(run_mock)
+
+
+class TestPidTargetedClose:
+    """close_running_studio_or_fail(pid=...) closes only that editor PID —
+    leaving other projects' Studios (and the StudioMCP proxy) untouched —
+    using the same SIGTERM -> SIGKILL escalation, via os.kill not pkill."""
+
+    @mock.patch("roblox.studio_launcher.os.kill")
+    def test_noop_when_pid_dead(self, kill_mock):
+        with mock.patch.object(studio_launcher, "_pid_alive", return_value=False):
+            close_running_studio_or_fail(pid=4242)
+        kill_mock.assert_not_called()
+
+    @mock.patch("roblox.studio_launcher.os.kill")
+    def test_pid_dies_on_sigterm(self, kill_mock):
+        states = iter([True, False])  # alive initially, gone by first grace poll
+        with mock.patch.object(studio_launcher, "time", _FakeClock()), mock.patch.object(
+            studio_launcher, "_pid_alive", side_effect=lambda p: next(states)
+        ):
+            close_running_studio_or_fail(timeout=30, pid=4242)
+        sigs = [c.args[1] for c in kill_mock.call_args_list]
+        assert sigs == [signal.SIGTERM]  # no escalation
+        assert all(c.args[0] == 4242 for c in kill_mock.call_args_list)
+
+    @mock.patch("roblox.studio_launcher.os.kill")
+    def test_pid_survives_sigterm_then_sigkill(self, kill_mock):
+        with mock.patch.object(studio_launcher, "time", _FakeClock()), mock.patch.object(
+            studio_launcher, "_pid_alive", side_effect=lambda p: len(kill_mock.call_args_list) < 2
+        ):
+            close_running_studio_or_fail(timeout=30, pid=4242)
+        sigs = [c.args[1] for c in kill_mock.call_args_list]
+        assert signal.SIGTERM in sigs and signal.SIGKILL in sigs
+
+    @mock.patch("roblox.studio_launcher.os.kill")
+    def test_pid_never_dies_raises(self, kill_mock):
+        with mock.patch.object(studio_launcher, "time", _FakeClock()), mock.patch.object(
+            studio_launcher, "_pid_alive", return_value=True
+        ):
+            with pytest.raises(StudioCloseError):
+                close_running_studio_or_fail(timeout=2, pid=4242)
+        assert signal.SIGKILL in [c.args[1] for c in kill_mock.call_args_list]
 
 
 @mock.patch("platform.system", return_value="Windows")
