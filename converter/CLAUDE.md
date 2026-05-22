@@ -174,6 +174,11 @@ cd converter
 python -m pytest tests/ -m "not slow" -v   # Fast suite: 1305 tests
 python -m pytest tests/ -v                  # Full suite: 1340 tests (includes 35 slow e2e)
 ```
+**Run the full fast suite (`pytest -m "not slow"`) before any PR, not just touched files** — shared-constant edits break tests elsewhere (e.g. a frozen cache-key prompt).
+
+## Workflow Discipline
+- **Set the goal before the structure.** Restate the user's goal in one sentence and confirm it, then spike the riskiest unknown first. Splitting one goal into separately-named sub-deliverables before validating it is the warning sign.
+- **Never pipe long-running commands to `tail`/`head`** — output buffers and looks hung. Redirect to a file.
 
 ## Running Conversion
 ```bash
@@ -202,7 +207,7 @@ Two paths publish to Roblox; they have different "what gets published" semantics
 | **`u2r.py publish`** | **Replays cached chunks** — `<output>/place_builder_chunks.json` first, then `<output>/place_builder.luau` for older conversions (`roblox/place_publisher.py:publish_cached_chunks`, two-tier fallback). Both shapes preserve the assembled state byte-for-byte. Falls back to a fresh Pipeline rebuild **only when both cache shapes are missing**. | When you want to re-publish the assembled state without re-running the converter (e.g., after a transient upload failure), or when the Unity project has been moved/archived. See `u2r.py:208–290` and `roblox/place_publisher.py:153–230`. |
 | **Studio manual publish** | Whatever is in the local `converted_place.rbxlx` (you edit it in Studio first). | When you want to publish a hand-edited `.rbxlx`. There is no `.rbxlx` reader on the dest side, so this is the only path that publishes the reviewed file directly. Roadmapped in `docs/FUTURE_IMPROVEMENTS.md`. |
 
-The historical "deferred fix C2" (upload publishes a fresh rebuild, not the reviewed `.rbxlx`) is closed by this documentation + the runtime warning + the `u2r.py publish` cached-chunks fast path. Implementing an `.rbxlx` reader is roadmap, not Phase 6.
+The known limitation — interactive `upload` publishes a fresh rebuild, not the reviewed `.rbxlx` — is addressed by this documentation + the runtime warning + the `u2r.py publish` cached-chunks fast path. Implementing an `.rbxlx` reader is roadmap work.
 
 ## Reference Documentation
 
