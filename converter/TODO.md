@@ -8,11 +8,12 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
 
 ## Refactor effort — held
 
-- [ ] **P2 — Refactor plan held until scene-runtime-contract 9-PR effort lands (2026-05-21).**
-  See `docs/refactor_plan.md` on branch `arch-critique`. 8-PR sequence (PR-A → PR-H) targets the AI-hostile file concentrations (`pipeline.py` 3897 LOC, `script_coherence_packs.py` 4667 LOC, `scene_converter.py` 4856 LOC). All PRs held until ntornow upstream merges scene-runtime PR1-PR8 (drafts #122/#123/#124 plus PR3b→PR8 chain).
-  - Plan went through `/plan-eng-review` with codex outside voice; 9 decisions locked.
-  - Before starting PR-A, re-baseline frozen-snapshot hashes against current `origin/main` HEAD (file line numbers in plan may drift).
-  - PR-E will need to update P1.a/P1.b/P1.c entries below to point at new file locations under `coherence/packs/misc.py`.
+- [ ] **P2 — Refactor plan held until scene-runtime-contract fully lands (re-baselined 2026-05-22).**
+  See `docs/refactor_plan.md` on branch `arch-critique`. 8-PR sequence (PR-B → PR-H; PR-A dropped, absorbed by upstream CLAUDE.md trim) targets the AI-hostile file concentrations (`pipeline.py` 4724 LOC, `script_coherence_packs.py` 5051 LOC, `scene_converter.py` 5542 LOC — all grew since the original plan). Held until ntornow upstream merges scene-runtime PR5-PR8 (PR1/2/3a/3b/3c/4 already landed).
+  - Plan went through `/plan-eng-review` twice + 4 codex rounds; 9 decisions locked.
+  - PR-B reframed onto upstream's `tests/test_offline_assembly.py` harness (PR #129).
+  - Pack count is now 27 (was 24); PR-E0 audit + PR-E names assertion updated.
+  - PR-E will rewrite P1.a/P1.b/P1.c entries below to point at new `coherence/packs/misc.py` locations.
 
 ---
 

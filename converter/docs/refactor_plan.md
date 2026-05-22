@@ -1,15 +1,26 @@
 # Refactor Plan — Resolve AI-Hostile Concentrations
 
-Status: **eng-reviewed, held** until scene-runtime-contract 9-PR effort lands upstream.
+Status: **eng-reviewed, held** until scene-runtime-contract effort fully lands upstream.
 Companion: `docs/architecture_critique.md`.
+Re-baselined 2026-05-22 against upstream/main after 68 commits (see "Drift re-baseline" below).
 
 ## In one paragraph
 
-Nine PRs (PR-A through PR-H, plus PR-E0 ordering audit) reshape three mega-files (`pipeline.py` 3897 LOC, `script_coherence_packs.py` 4667 LOC, `scene_converter.py` 4856 LOC) into focused modules without behavior change. **All nine PRs are held** until the scene-runtime-contract 9-PR effort merges into ntornow upstream — Phase 1 PRs touch only non-`scene_converter.py` files but are still held to avoid two concurrent multi-PR efforts diluting review attention (user decision, 2026-05-21). Phase 2 is additionally blocked by the `scene_converter.py` lock. Total ~3.5 engineer-weeks of AI-driven work once execution begins.
+Eight PRs (PR-B through PR-H, plus PR-E0 ordering audit) reshape three mega-files (`pipeline.py` 4724 LOC, `script_coherence_packs.py` 5051 LOC, `scene_converter.py` 5542 LOC) into focused modules without behavior change. (PR-A — the `CLAUDE.md` trim — was absorbed by upstream PR #137/#138 and dropped.) **All PRs are held** until the scene-runtime-contract effort fully lands upstream: PR1/2/3a/3b/3c/4 have merged; PR5-PR8 remain. Phase 1 PRs touch only non-`scene_converter.py` files but are still held to avoid two concurrent multi-PR efforts diluting review attention (user decision, reaffirmed 2026-05-22). Phase 2 is additionally blocked by the `scene_converter.py` lock. Total ~3 engineer-weeks once execution begins.
+
+## Drift re-baseline (2026-05-22)
+
+68 upstream commits merged since the original plan. Material changes folded in:
+- **Mega-files grew:** `pipeline.py` 3897→4724, `script_coherence_packs.py` 4667→5051, `scene_converter.py` 4856→5542. All LOC targets below updated; the refactor is more urgent, not less.
+- **scene-runtime-contract ~2/3 landed:** PR1/2/3a/3b/3c/4 merged (note PR3c was added mid-effort). PR5-8 pending. `scene_converter.py` still churning → Phase 2 stays blocked; hold on Phase 1 reaffirmed.
+- **PR-A dropped:** upstream PR #137/#138 already trimmed `CLAUDE.md` 322→266 and added Safety + Workflow Discipline sections. Residual trim not worth a standalone PR.
+- **PR-B reframed:** upstream PR #129 landed `tests/test_offline_assembly.py` (offline full-conversion regression + `u2r.py snapshot-ids` refresh CLI). PR-B now adds a frozen-hash assertion on top of that harness instead of extending `test_byte_equivalence.py`.
+- **Pack count 24→27:** PR #139 added packs (transform-child indexing, door key-flag). PR-E0 audit + PR-E names assertion updated to 27; new packs need theme-module placement.
+- **`_ctx()` 50→58 sites:** PR-G already uses grep-target wording, no structural change.
 
 ## Constraints
 
-- **`scene_converter.py` is locked** until scene-runtime-contract PRs #122/#123/#124 + stacked PR3b→PR8 merge upstream. Three worktrees touch it today.
+- **`scene_converter.py` is locked** until scene-runtime-contract PR5-PR8 merge upstream (PR1/2/3a/3b/3c/4 already landed as of 2026-05-22). The remaining PRs still churn this file.
 - **No-Any CI gate** per `[[no_any_ci_gate]]`: every PR runs `bash converter/tools/check_no_any.sh`.
 - **Branch off `origin/main`**, target ntornow upstream (`[[fork_pr_base_repo]]`).
 - **Reviewable size:** ≤1500 lines of real diff per PR; pure renames don't count.
@@ -25,13 +36,13 @@ Nine PRs (PR-A through PR-H, plus PR-E0 ordering audit) reshape three mega-files
    - Sets are sorted before hashing: `unhandled_components`, asset GUID sets.
    - UUID referents normalized via existing `_REFERENT_RE` in `tests/test_byte_equivalence.py`.
    - Excluded fields: `generated_at` timestamps, `mtime`, absolute temp paths.
-5. **Golden test home:** extend existing `tests/test_byte_equivalence.py` with `TestFrozenBaseline`. No new file.
-6. **Baselines:** SimpleFPS + Gamekit3D + 3D-Platformer (text YAML / scale stress / BINARY YAML).
+5. **Golden test home:** add a frozen-hash assertion on top of upstream's `tests/test_offline_assembly.py` (offline full-conversion regression + committed asset-ID snapshots + `u2r.py snapshot-ids` refresh CLI). Do NOT extend `test_byte_equivalence.py` — the offline-assembly harness already does the offline conversion. *(Reframed 2026-05-22.)*
+6. **Baselines:** SimpleFPS + Gamekit3D + 3D-Platformer (text YAML / scale stress / BINARY YAML), gated by `_has_project()` skipif.
 7. **Phase signature:** `(state: PipelineState, ctx: ConversionContext, services: PipelineServices)`. New `PipelineServices` dataclass has two halves:
    - Config fields: `output_dir`, `skip_binary_rbxl`, `context_path`, `is_resume`, `fps_artifacts_at_init`.
    - Bound helper callables (the 8 cross-cutting helpers extracted from `class Pipeline`): `classify_storage`, `bind_scripts_to_parts`, `rehydrate_scripts_from_disk`, `inject_runtime_modules`, `generate_prefab_packages`, `collect_all_scripts`, `collect_method_warnings`, `apply_scaffolding`.
 8. **Test rewrites in PR-D:** 16+ sites calling `pipeline.<phase>()` rewrite to `pipeline.run_phase('<phase>')`.
-9. **PR-E0 prelude:** audit pack execution order on `origin/main`; add explicit `@patch_pack(after=...)` edges so the split can't reorder behavior.
+9. **PR-E0 prelude:** audit pack execution order on `origin/main`; add explicit `@patch_pack(after=...)` edges so the split can't reorder behavior. **27 packs as of 2026-05-22** (was 24; PR #139 added transform-child-indexing + door key-flag packs).
 
 ## Per-PR done criteria (template)
 
@@ -48,36 +59,40 @@ Per-PR sections below list only additions to this template.
 
 | # | PR | Phase | Days | Depends on | Touches |
 |---|----|------:|----:|---|---|
-| 1 | PR-A — Trim `converter/CLAUDE.md` 322→150 | 1 | 0.5 | — | docs |
-| 2 | PR-B — Frozen baselines in `test_byte_equivalence.py` | 1 | 1.5 | — | tests |
-| 3 | PR-C — `write_output` → `phases/output/*` + `PipelineServices` | 1 | 3 | PR-B | pipeline |
-| 4 | PR-D — Pipeline dispatch table + 14 phase modules + test rewrites | 1 | 4 | PR-C | pipeline, tests |
-| 5 | PR-E0 — Pack ordering audit + `after=` edges | 1 | 1 | PR-B | coherence |
-| 6 | PR-E — Split `script_coherence_packs.py` | 1 | 2 | PR-E0 | coherence |
-| 7 | PR-F — Mirror split of `test_script_coherence_packs.py` | 1 | 1 | PR-E | tests |
-| 8 | PR-G — Eliminate `_ctx()` (50 sites) | 2 | 1.5 | scene-runtime landed | scene_converter |
-| 9 | PR-H — Split `scene_converter.py` → 11 modules | 2 | 4 | PR-G | scene_converter |
+| — | ~~PR-A — Trim `CLAUDE.md`~~ | — | — | — | **absorbed by upstream PR #137/#138** |
+| 1 | PR-B — Frozen-hash assertion on `test_offline_assembly.py` | 1 | 1 | — | tests |
+| 2 | PR-C — `write_output` → `phases/output/*` + `PipelineServices` | 1 | 3 | PR-B | pipeline |
+| 3 | PR-D — Pipeline dispatch table + 14 phase modules + test rewrites | 1 | 4 | PR-C | pipeline, tests |
+| 4 | PR-E0 — Pack ordering audit + `after=` edges (27 packs) | 1 | 1 | PR-B | coherence |
+| 5 | PR-E — Split `script_coherence_packs.py` | 1 | 2 | PR-E0 | coherence |
+| 6 | PR-F — Mirror split of `test_script_coherence_packs.py` | 1 | 1 | PR-E | tests |
+| 7 | PR-G — Eliminate `_ctx()` (~58 sites, use grep) | 2 | 1.5 | scene-runtime landed | scene_converter |
+| 8 | PR-H — Split `scene_converter.py` → 11 modules | 2 | 4 | PR-G | scene_converter |
 
 After execution unblocks (scene-runtime-contract lands upstream) and PR-B has merged, lane C (PR-C → PR-D) and lane D (PR-E0 → PR-E → PR-F) can run in parallel worktrees. Phase 2 is strictly sequential.
 
 ## PR detail
 
-### PR-A — `CLAUDE.md` trim
-Cut: Autonomous Work Plan, Recent Session blocks, Development History (2026-03-24 → -28), Full upload test (2026-03-25). Keep: bug fix protocol, upload semantics, coordinate system, test projects, CLI commands, mesh sizing, asset resolution, inline-over-runtime, Roblox safety rules. ~1.5K tokens saved per session.
+### ~~PR-A — `CLAUDE.md` trim~~ (DROPPED — absorbed upstream)
+Upstream PR #137/#138 already trimmed `converter/CLAUDE.md` 322→266 LOC (dropped stale status snapshots, added Safety + Workflow Discipline sections). The residual trim is not worth a standalone PR. Any final ~20-line cleanup folds into PR-C's branch if convenient.
 
-### PR-B — Frozen baselines
-Extend `tests/test_byte_equivalence.py` with `TestFrozenBaseline`. New files: `tests/golden/{simplefps,gamekit3d,platformer}.rbxlx.sha256`; `tests/golden/canonicalize.py` implementing the scheme from decision #4. Determinism guard runs each conversion twice on the test host and asserts canonical hash matches before comparing to baseline.
+### PR-B — Frozen-hash assertion on the offline-assembly harness
+Build on upstream's `tests/test_offline_assembly.py` (PR #129), which already runs an offline full conversion (`skip_upload`, pre-seeded asset-ID snapshot) and checks the assembled rbxlx shape. PR-B ADDS a frozen canonical-hash assertion:
+- New: `tests/golden/{simplefps,gamekit3d,platformer}.canonical.sha256` + `tests/golden/canonicalize.py` (scheme from decision #4).
+- Extend the existing offline-assembly fixtures: after assembly, `assert sha256(canonicalize(assembled)) == committed_baseline` for each project.
+- Reuse `u2r.py snapshot-ids` for asset-ID refresh; document a parallel baseline-refresh step for the canonical hashes.
+- Determinism guard: run each assembly twice; canonical hashes must match before comparing to the committed baseline.
 
 **+ done criteria** (PR-B specific — the template's "frozen baselines unchanged" criterion doesn't apply yet because PR-B is what creates them):
-- `pytest -m slow tests/test_byte_equivalence.py::TestFrozenBaseline` passes on `origin/main` HEAD with all three baselines.
-- Determinism guard exercised: each baseline runs twice on the test host with matching canonical hashes BEFORE comparing to the checked-in `.sha256`.
-- The three `.sha256` files are committed and reproducible from `origin/main` HEAD by re-running the test.
+- The three `.canonical.sha256` files are committed and reproducible from `origin/main` HEAD by re-running the offline-assembly test.
+- Determinism guard exercised (two runs match) before the baseline comparison.
+- `bash converter/tools/check_no_any.sh` passes.
 
 ### PR-C — `write_output` subphases + `PipelineServices`
 New `phases/services.py` with `PipelineServices` dataclass (decision #7). New `phases/output/` package, one module per `_subphase_*` method: `emit_scripts.py`, `cohere_scripts.py`, `inject_autogen.py` (264 LOC, includes pre-scaffolding migration; locate via `grep -n 'Migrating pre-scaffolding' converter/converter/pipeline.py`), `encode_terrain.py`, `inject_mesh_loader.py`, `patch_setup_sounds.py`, `finalize_scripts.py`. Each: `def <name>(state, ctx, services) -> None`. `Pipeline.write_output` becomes a ~30-line orchestrator.
 
 **+ done criteria:**
-- `pipeline.py` line count drops from 3897 to ~3400 LOC.
+- `pipeline.py` line count drops from 4724 to ~4200 LOC (extracting the ~500-LOC write_output region).
 - New `tests/test_pre_scaffolding_resume.py` regression test passes (covers the previously-uncovered pre-scaffolding migration branch).
 - `python -c "from converter.phases.services import PipelineServices"` succeeds.
 
@@ -140,9 +155,11 @@ New `converter/converter/coherence/`:
 | `packs/proximity.py` | Trigger stay polling, proximity fanout | 400 |
 | `packs/misc.py` | Template clone visibility (`_inject_template_clone_visibility`), LocalScript API shim (`_build_shim_source`, `_classify_api`), BindableEvent guard, self-destroying template guard + `_SELF_DESTROY_RE`, `_TEMPLATE_GUARD_*` | 700 |
 
-Existing `script_coherence_packs.py` → ~15-line back-compat shim per decision #2.
+Existing `script_coherence_packs.py` (now 5051 LOC) → ~15-line back-compat shim per decision #2.
 
-**+ done criteria:** No file in `coherence/` exceeds 1100 LOC; names assertion on 24 specific pack names (not just count); `TestPackOrderFrozenOnMain` still passes; `TODO.md` P1.a/P1.b/P1.c entries rewritten to point at new `coherence/packs/misc.py` locations.
+**New packs to place (added by PR #139, 2026-05-22):** transform-child indexing → `packs/proximity.py` or a new `packs/transforms.py` if it doesn't fit; door key-flag → `packs/doors.py`. Confirm placement against the actual pack names during PR-E0.
+
+**+ done criteria:** No file in `coherence/` exceeds 1100 LOC (re-check `packs/fps.py` and `packs/pickups.py` against the +384 LOC growth — may need a 6th pack module); names assertion on **27** specific pack names (not just count); `TestPackOrderFrozenOnMain` still passes; `TODO.md` P1.a/P1.b/P1.c entries rewritten to point at new `coherence/packs/misc.py` locations.
 
 ### PR-F — Mirror test split
 
@@ -190,7 +207,8 @@ Old `scene_converter.py` → back-compat shim.
 
 ## Re-use, don't rebuild
 
-- `tests/test_byte_equivalence.py` — UUID-referent normalization + flow-equivalence. PR-B extends.
+- `tests/test_offline_assembly.py` (upstream PR #129) — offline full-conversion regression + `u2r.py snapshot-ids` refresh. **PR-B builds its frozen-hash assertion on this.**
+- `tests/test_byte_equivalence.py` — UUID-referent normalization (`_REFERENT_RE`) + flow-equivalence. PR-B's `canonicalize.py` reuses the referent normalization.
 - `tests/test_pipeline_e2e.py` — 7-project end-to-end harness. Baselines plug in.
 - `tests/_project_paths.py` — `_has_project(...)` skipif pattern.
 - `converter/converter/scaffolding/` — precedent for the `phases/` directory layout.
@@ -206,7 +224,7 @@ Old `scene_converter.py` → back-compat shim.
 | PR-D | Phase-module import error / missing `services` field | Test collection + e2e |
 | PR-D | Test still calls deleted `pipeline.parse()` | Collection failure |
 | PR-E0 | Missing `after=` edge | `TestPackOrderFrozenOnMain` |
-| PR-E | Pack module not imported in `coherence/__init__.py` | Names assertion (24 specific names) |
+| PR-E | Pack module not imported in `coherence/__init__.py` | Names assertion (27 specific names) |
 | PR-G | Helper still references `_ctx()` after grep | No-global-state test |
 | PR-H | Circular import between `scene/` modules | Smoke import test |
 
@@ -214,7 +232,7 @@ No critical silent gaps.
 
 ## Next step
 
-When scene-runtime-contract PRs #122/#123/#124 + stacked PR3b→PR8 merge into ntornow upstream: re-baseline file line numbers (may have drifted), then execute PR-A → PR-B → PR-C → PR-D → PR-E0 → PR-E → PR-F. Phase 2 (PR-G → PR-H) follows.
+When scene-runtime-contract PR5-PR8 merge into ntornow upstream (PR1-4 + 3c already landed): re-baseline file line numbers and the pack set (may drift further), then execute PR-B → PR-C → PR-D → PR-E0 → PR-E → PR-F. Phase 2 (PR-G → PR-H) follows. PR-A is dropped (absorbed upstream).
 
 ---
 
@@ -228,4 +246,4 @@ When scene-runtime-contract PRs #122/#123/#124 + stacked PR3b→PR8 merge into n
 
 **Cross-model:** Round 2 — Claude eng-review + codex converged on dispatch-table + `_ctx()` priority; codex caught the `(state, ctx)` signature being too narrow. Round 3 — codex caught canonicalization erosion, PR-B gate, services enumeration. Round 4 — codex caught gating contradiction (compressed plan silently reverted user-locked "all held" decision), PR-D path-notation ambiguity, PR-G line-number drift fragility.
 
-**Verdict:** ENG CLEARED — ready to execute once scene-runtime-contract lands.
+**Verdict:** ENG CLEARED — ready to execute once scene-runtime-contract (PR5-PR8) lands. Re-baselined against upstream/main 2026-05-22 (68 commits): PR-A dropped, PR-B reframed onto offline-assembly harness, all LOC + pack-count figures refreshed.
