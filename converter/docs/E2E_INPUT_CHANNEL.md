@@ -18,7 +18,8 @@ delta when a test is.
 
 | Attribute | Owner | Type | Semantics |
 |---|---|---|---|
-| `workspace.E2EMouseSeq` | test sets, client reads | `number` (monotonic int) | A monotonically increasing sequence number. The client tracks its own `lastSeenSeq` and only consumes a delta when `seq > lastSeenSeq`. Re-using the same seq number is a no-op. |
+| `workspace.E2EMouseSeq` | test sets, client reads | `number` (monotonic int) | A monotonically increasing sequence number. The client consumes a delta only when `seq > E2EMouseAckSeq`. Re-using the same seq number is a no-op. |
+| `workspace.E2EMouseAckSeq` | client sets, client reads | `number` | The last seq the client consumed. Stored as an attribute (not a Lua upvalue) so consumption is one-shot, reload-safe, and identical between the scaffolding and the coherence-pack-injected form. The test never touches it. |
 | `workspace.E2EMouseDeltaX` | test sets, client reads | `number` (pixels) | Horizontal mouse delta. Added to `UserInputService:GetMouseDelta().X` for one frame. |
 | `workspace.E2EMouseDeltaY` | test sets, client reads | `number` (pixels) | Vertical mouse delta. Added to `UserInputService:GetMouseDelta().Y` for one frame. |
 
@@ -26,7 +27,7 @@ The seq number is what makes the channel **a queue, not a mailbox**.
 Without it, two consecutive identical writes (e.g.
 `E2EMouseDeltaX = 400` twice) would collapse into one — Roblox
 attributes coalesce repeated identical values. The client guards on
-`seq > lastSeenSeq`, so:
+`seq > E2EMouseAckSeq`, so:
 
 - One bump of `seq` = one frame of injected delta consumed.
 - Re-bumping `seq` with new delta values = a second injection.
@@ -37,22 +38,32 @@ attributes coalesce repeated identical values. The client guards on
 
 ## Where it's read
 
-Two call sites in the converter — both must stay in sync:
+Two places, both using the identical ack-attribute shape:
 
 1. `converter/converter/scaffolding/fps.py` — the auto-generated FPS
    scaffolding's `updateCamera()`. This script ships verbatim into
    projects that match the FPS heuristic (e.g. SimpleFPS) when no
    user-authored Player controller exists.
 
-2. `converter/converter/code_transpiler.py` — the AI system prompt's
-   "Mouse look (canonical FPS pattern)" snippet. When the AI transpiles
-   a Unity FPS controller into Player.luau, the emitted code follows
-   this pattern and includes the seq-guarded E2E read.
+2. The `fps_e2e_mouse_channel` **coherence pack**
+   (`converter/converter/script_coherence_packs.py`) — injects the
+   channel block immediately after each
+   `local <d> = <uis>:GetMouseDelta()` assignment in AI-transpiled
+   mouse-look code, post-transpile.
 
-If you change one site, change the other. The grep regression test in
-`tests/test_fps_scaffolding_e2e_channel.py` pins the scaffolding side;
-the prompt-invariant test in `tests/test_ai_system_prompt.py` pins the
-AI side.
+**Why a coherence pack and not the transpiler prompt:**
+`_AI_SYSTEM_PROMPT` is a cache key —
+`tests/test_scene_runtime_transpiler.py::TestPromptIsolation`
+freezes it byte-for-byte against `origin/main`, because any edit
+invalidates every legacy project's LLM cache (forcing slow cold
+re-transpiles; this is exactly what caused a Player.cs transpile
+timeout during PR-B1's first live run). A coherence pack runs after
+transpilation and is cache-key-neutral. The pack is idempotent (guards
+on the `E2EMouseAckSeq` marker) so re-runs don't double-inject.
+
+Both sites are pinned by
+`tests/test_fps_scaffolding_e2e_channel.py` (scaffolding grep +
+pack inject/idempotency/no-op).
 
 ## Where it's written
 
@@ -97,22 +108,23 @@ helper that encapsulates the seq-bump-and-set so fixtures stay terse.
 - **Frame-rate races:** test sets delta then waits 0.5s; client may
   have run RenderStepped twice in that window. Without seq, the second
   RenderStepped would re-consume the same value. With seq, the second
-  RenderStepped sees `seq == lastSeenSeq` and ignores it.
+  RenderStepped sees `seq == E2EMouseAckSeq` and ignores it.
 - **Test author errors:** forgetting to bump seq while setting deltas
   is a silent no-op rather than a confusing intermittent failure.
 
 ## The seq is session-monotonic — never reset it
 
 `E2EMouseSeq` must climb monotonically for the **whole Play session**.
-The client's `_lastE2ESeq` only ever increases and never resets, so if
-a fixture's reset helper clears `E2EMouseSeq` back to 0/nil, the next
-`_pumpMouse` produces `seq = 1` again — which the client has already
-seen (`1 > _lastE2ESeq` is false), so the injection is silently
-dropped. This bit the second mouse-look fixture in the first live run:
-yaw passed (seq 0→1) but pitch failed (reset → seq back to 1, client
-already at 1, ignored).
+`E2EMouseAckSeq` only ever increases (the client writes it on each
+consume) and is never reset, so if a fixture's reset helper clears
+`E2EMouseSeq` back to 0/nil, the next `_pumpMouse` produces `seq = 1`
+again — which the client has already acked (`1 > E2EMouseAckSeq` is
+false), so the injection is silently dropped. This bit the second
+mouse-look fixture in PR-B1's first live run: yaw passed (seq 0→1) but
+pitch failed (reset → seq back to 1, client already acked 1, ignored).
 
 The fix: a fixture's `_reset()` may zero `E2EMouseDeltaX/Y` but must
-**not** touch `E2EMouseSeq`. `_pumpMouse` then increments from the
-current value, so the sequence keeps climbing 1, 2, 3, … across
-fixtures and every pump is consumed exactly once.
+**not** touch `E2EMouseSeq` (and must never touch `E2EMouseAckSeq`,
+which is client-owned). `_pumpMouse` then increments seq from the
+current value, so it keeps climbing 1, 2, 3, … across fixtures and
+every pump is consumed exactly once.

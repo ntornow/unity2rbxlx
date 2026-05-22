@@ -158,12 +158,13 @@ camera.CameraType = Enum.CameraType.Scriptable
 
 -- E2E test input channel. See docs/E2E_INPUT_CHANNEL.md.
 -- Production-safe: when no test is running, the attributes are unset
--- (nil -> coerced to 0) and updateCamera() behaves identically to
--- "real mouse delta only". When the /e2e-test skill is driving the
--- session, it bumps workspace.E2EMouseSeq + sets the delta values
--- *before* a frame; the next updateCamera() consumes them additively
--- and advances _lastE2ESeq so each bump fires exactly once.
-local _lastE2ESeq = 0
+-- (nil -> coerced to 0) so this block is a no-op and updateCamera()
+-- behaves identically to "real mouse delta only". When the /e2e-test
+-- skill is driving the session, it bumps workspace.E2EMouseSeq + sets
+-- the delta values *before* a frame; the client acks via
+-- workspace.E2EMouseAckSeq so each bump is consumed exactly once
+-- (ack lives in an attribute, not an upvalue, so it survives script
+-- reloads and matches the coherence-pack-injected form for AI scripts).
 
 local function updateCamera()
 	local character = player.Character
@@ -173,8 +174,8 @@ local function updateCamera()
 
 	local delta = UserInputService:GetMouseDelta()
 	local seq = workspace:GetAttribute("E2EMouseSeq") or 0
-	if seq > _lastE2ESeq then
-		_lastE2ESeq = seq
+	if seq > (workspace:GetAttribute("E2EMouseAckSeq") or 0) then
+		workspace:SetAttribute("E2EMouseAckSeq", seq)
 		local ex = workspace:GetAttribute("E2EMouseDeltaX") or 0
 		local ey = workspace:GetAttribute("E2EMouseDeltaY") or 0
 		delta = Vector2.new(delta.X + ex, delta.Y + ey)

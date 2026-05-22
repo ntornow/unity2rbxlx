@@ -4732,3 +4732,95 @@ def _fix_fps_camera_pitch_inversion(scripts: list["RbxScript"]) -> int:
                 s.name, sorted(to_flip),
             )
     return fixes
+
+
+# ---------------------------------------------------------------------------
+# Pack: fps_e2e_mouse_channel
+# ---------------------------------------------------------------------------
+#
+# The /e2e-test skill drives mouse-look through a workspace attribute
+# channel because MCP's user_mouse_input synthesises Delta=(0,0) and so
+# can't exercise UserInputService:GetMouseDelta() polling (the canonical
+# FPS pattern). See docs/E2E_INPUT_CHANNEL.md.
+#
+# This pack injects the channel read into AI-transpiled mouse-look code.
+# It does NOT live in the transpiler prompt: _AI_SYSTEM_PROMPT is a cache
+# key (test_scene_runtime_transpiler.py freezes it byte-for-byte), so
+# editing it would invalidate every legacy project's LLM cache. A
+# coherence pack runs post-transpile and is cache-key-neutral.
+#
+# The injected block is production-safe: workspace attributes default to
+# nil -> 0, so when no test is driving the session the seq guard never
+# fires and behaviour is identical to raw GetMouseDelta(). The client
+# acks via E2EMouseAckSeq (an attribute, not an upvalue) so each test
+# `_pumpMouse` bump is consumed exactly once and the form is reload-safe.
+# The matching scaffolding (scaffolding/fps.py) uses the same shape.
+
+# Matches an assignment of GetMouseDelta() to a local: ``local d =
+# UserInputService:GetMouseDelta()``. Captures indentation + the var so
+# the injected block reuses both. Tolerates an explicit
+# ``game:GetService("UserInputService")`` receiver or a pre-bound local.
+_GET_MOUSE_DELTA_RE = re.compile(
+    r'^(?P<lead>[ \t]*)local\s+(?P<var>[A-Za-z_]\w*)\s*=\s*'
+    r'(?P<recv>[A-Za-z_][\w.:()" ]*?):GetMouseDelta\(\)\s*$',
+    re.MULTILINE,
+)
+
+_E2E_CHANNEL_MARKER = "E2EMouseAckSeq"
+
+
+def _detect_fps_e2e_mouse_channel(scripts: list["RbxScript"]) -> bool:
+    for s in scripts:
+        src = s.source or ""
+        if _GET_MOUSE_DELTA_RE.search(src) and _E2E_CHANNEL_MARKER not in src:
+            return True
+    return False
+
+
+@patch_pack(
+    name="fps_e2e_mouse_channel",
+    description="Inject the workspace E2E mouse-delta input channel after "
+    "each `local <d> = <uis>:GetMouseDelta()` assignment so the /e2e-test "
+    "skill can drive camera yaw/pitch (MCP synthesises Delta=(0,0)). "
+    "Production-safe: attributes default to nil so the block is a no-op in "
+    "normal play. See docs/E2E_INPUT_CHANNEL.md.",
+    # Run AFTER the pitch-inversion fix so the sign-flip operates on the
+    # raw pitch line; both edit different lines, but ordering keeps the
+    # transform deterministic.
+    after=("fps_camera_pitch_inversion",),
+    detect=_detect_fps_e2e_mouse_channel,
+)
+def _fix_fps_e2e_mouse_channel(scripts: list["RbxScript"]) -> int:
+    fixes = 0
+    for s in scripts:
+        src = s.source or ""
+        if _E2E_CHANNEL_MARKER in src:
+            continue  # already injected (idempotent)
+        if not _GET_MOUSE_DELTA_RE.search(src):
+            continue
+
+        def _inject(m: "re.Match[str]") -> str:
+            lead = m.group("lead")
+            var = m.group("var")
+            orig = m.group(0)
+            block = (
+                f'\n{lead}-- E2E test input channel (see docs/E2E_INPUT_CHANNEL.md):'
+                f' additive mouse delta, no-op when unset.'
+                f'\n{lead}local _e2eSeq = workspace:GetAttribute("E2EMouseSeq") or 0'
+                f'\n{lead}if _e2eSeq > (workspace:GetAttribute("E2EMouseAckSeq") or 0) then'
+                f'\n{lead}\tworkspace:SetAttribute("E2EMouseAckSeq", _e2eSeq)'
+                f'\n{lead}\t{var} = Vector2.new('
+                f'{var}.X + (workspace:GetAttribute("E2EMouseDeltaX") or 0), '
+                f'{var}.Y + (workspace:GetAttribute("E2EMouseDeltaY") or 0))'
+                f'\n{lead}end'
+            )
+            return orig + block
+
+        # Only inject at the FIRST GetMouseDelta site — a controller polls
+        # it once per frame; multiple injections would double-apply.
+        new_src, n = _GET_MOUSE_DELTA_RE.subn(_inject, src, count=1)
+        if n and new_src != src:
+            s.source = new_src
+            fixes += 1
+            log.info("  Injected E2E mouse channel into '%s'", s.name)
+    return fixes

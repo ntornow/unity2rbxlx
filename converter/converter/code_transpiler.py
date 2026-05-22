@@ -824,21 +824,8 @@ Camera (FPS/First-Person):
 - **Mouse look (canonical FPS pattern)**: read `UserInputService:GetMouseDelta()` every frame inside the RenderStepped callback — NOT `UserInputService.InputChanged` with `input.Delta`. `GetMouseDelta()` is purpose-built for FPS: it returns the accumulated pixel delta since the last call and is reliable while `MouseBehavior = LockCenter`. The `InputChanged` MouseMovement event with `LockCenter` is flaky and loses deltas under high frame rates.
   ```lua
   local MOUSE_RAD_PER_PIXEL = 0.006  -- tune; ~0.003-0.012 feels right
-  -- E2E test input channel (see docs/E2E_INPUT_CHANNEL.md). Production-safe:
-  -- attributes default to nil -> 0 so this block is a no-op in normal play.
-  -- The /e2e-test skill bumps workspace.E2EMouseSeq + sets DeltaX/Y before a
-  -- frame; the seq guard makes each bump fire exactly once.
-  local _lastE2ESeq = 0
   RunService.RenderStepped:Connect(function(dt)
       local d = UserInputService:GetMouseDelta()
-      local seq = workspace:GetAttribute("E2EMouseSeq") or 0
-      if seq > _lastE2ESeq then
-          _lastE2ESeq = seq
-          d = Vector2.new(
-              d.X + (workspace:GetAttribute("E2EMouseDeltaX") or 0),
-              d.Y + (workspace:GetAttribute("E2EMouseDeltaY") or 0)
-          )
-      end
       yawAngle = yawAngle - d.X * MOUSE_RAD_PER_PIXEL
       pitchAngle = math.clamp(pitchAngle - d.Y * MOUSE_RAD_PER_PIXEL, math.rad(minAngle), math.rad(maxAngle))
       -- ... then position camera from yaw/pitch

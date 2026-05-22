@@ -80,7 +80,7 @@
     },
     {
       "id": "mouse_yaw_rotates_camera",
-      "feature": "3. Mouse motion yaws the camera. Uses the workspace E2E mouse channel (see docs/E2E_INPUT_CHANNEL.md) — MCP synthesises Delta=(0,0) for user_mouse_input so this channel is the only working path. _pumpMouse bumps E2EMouseSeq + sets DeltaX/Y; scaffolding/fps.py + AI-emitted Player.luau both read the channel additively for one frame.",
+      "feature": "3. Mouse motion yaws the camera. Uses the workspace E2E mouse channel (see docs/E2E_INPUT_CHANNEL.md) — MCP synthesises Delta=(0,0) for user_mouse_input so this channel is the only working path. _pumpMouse bumps E2EMouseSeq + sets DeltaX/Y; the client (scaffolding/fps.py, or AI-transpiled Player.luau via the fps_e2e_mouse_channel coherence pack) reads the channel additively for one frame and acks via E2EMouseAckSeq.",
       "play_mode": true,
       "setup_luau": "_reset(); _G._state.look0 = cam.CFrame.LookVector; _pumpMouse(400, 0)",
       "wait_seconds": 0.2,
