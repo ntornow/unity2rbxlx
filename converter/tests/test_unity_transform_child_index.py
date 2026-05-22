@@ -64,6 +64,24 @@ class TestNoFalsePositives:
         s = _run(src)
         assert s.source == src
 
+    def test_inside_string_literal_not_rewritten(self):
+        src = 'print("container:GetChildren()[1]")\n'
+        s = _run(src)
+        assert s.source == src
+        assert "__unityChild" not in s.source
+
+    def test_inside_comment_not_rewritten(self):
+        src = "-- see node:GetChildren()[2] for the old behavior\n"
+        s = _run(src)
+        assert s.source == src
+
+    def test_code_match_rewritten_string_match_preserved(self):
+        # Real code match is rewritten; a same-line comment occurrence is left.
+        src = "local b = container:GetChildren()[1] -- cf x:GetChildren()[9]\n"
+        s = _run(src)
+        assert "__unityChild(container, 1)" in s.source
+        assert "x:GetChildren()[9]" in s.source  # comment preserved verbatim
+
 
 class TestIdempotency:
     def test_running_twice_equals_once(self):

@@ -1244,8 +1244,39 @@ end
 """
 
 
+def _luau_pos_is_code(source: str, pos: int) -> bool:
+    """True if char index ``pos`` is real code, not inside a string or a
+    ``--`` comment.
+
+    Scans from the start of ``pos``'s line, tracking single/double-quoted
+    strings (with backslash escapes) and ``--`` line comments — the only forms
+    the transpiler emits. Multi-line ``[[ ]]`` strings/comments aren't modeled;
+    they don't occur in transpiled output.
+    """
+    i = source.rfind("\n", 0, pos) + 1
+    quote: str | None = None
+    while i < pos:
+        ch = source[i]
+        if quote is not None:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "-" and i + 1 < pos and source[i + 1] == "-":
+            return False  # rest of the line (incl. pos) is a comment
+        i += 1
+    return quote is None
+
+
 def _detect_unity_transform_child_index(scripts: list["RbxScript"]) -> bool:
-    return any(_GETCHILDREN_INDEX_RE.search(s.source) for s in scripts)
+    return any(
+        _luau_pos_is_code(s.source, m.start())
+        for s in scripts
+        for m in _GETCHILDREN_INDEX_RE.finditer(s.source)
+    )
 
 
 @patch_pack(
@@ -1258,14 +1289,24 @@ def _detect_unity_transform_child_index(scripts: list["RbxScript"]) -> bool:
 def _fix_unity_transform_child_index(scripts: list["RbxScript"]) -> int:
     fixes = 0
     for s in scripts:
-        new_source, n = _GETCHILDREN_INDEX_RE.subn(r"__unityChild(\1, \2)", s.source)
-        if n == 0:
+        count = 0
+
+        def _repl(m: "re.Match[str]", _src: str = s.source) -> str:
+            nonlocal count
+            # Skip matches inside string literals / comments.
+            if not _luau_pos_is_code(_src, m.start()):
+                return m.group(0)
+            count += 1
+            return f"__unityChild({m.group(1)}, {m.group(2)})"
+
+        new_source = _GETCHILDREN_INDEX_RE.sub(_repl, s.source)
+        if count == 0:
             continue
         if "local function __unityChild(" not in new_source:
             new_source = _UNITY_CHILD_HELPER + "\n" + new_source
         s.source = new_source
-        fixes += n
-        log.info("  %s: rewrote %d GetChildren()[n] -> __unityChild()", s.name, n)
+        fixes += count
+        log.info("  %s: rewrote %d GetChildren()[n] -> __unityChild()", s.name, count)
     return fixes
 
 
@@ -1349,7 +1390,11 @@ def _fix_door_player_flag_location(scripts: list["RbxScript"]) -> int:
         func_src = s.source[start:end_idx]
         if "HumanoidRootPart" not in func_src or "GetAttribute" not in func_src:
             continue
-        flag = _extract_attr_name(func_src)
+        # Extract the flag from the HumanoidRootPart read specifically — the
+        # GetAttribute that follows the ``...FindFirstChild("HumanoidRootPart")``
+        # resolution — so an earlier unrelated GetAttribute (e.g. a "Locked"
+        # probe) isn't mistaken for the key flag.
+        flag = _extract_attr_name(func_src[func_src.find("HumanoidRootPart"):])
         if not flag:
             continue
         canonical = (

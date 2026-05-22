@@ -168,6 +168,10 @@ def close_running_studio_or_fail(timeout: float = 30) -> None:
         except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
             raise StudioCloseError(f"close signal failed: {exc}") from exc
 
+    # One overall budget. The SIGTERM grace and the post-kill wait are both
+    # carved out of this single deadline (not charged the full timeout twice).
+    deadline = time.monotonic() + timeout
+
     if system == "Windows":
         # ``taskkill /F`` is already a forceful terminate.
         _send(["taskkill", "/F", "/IM", "RobloxStudioBeta.exe"])
@@ -178,7 +182,7 @@ def close_running_studio_or_fail(timeout: float = 30) -> None:
         # changes?" dialog and stays alive — so if it survives a short
         # grace period, escalate to SIGKILL, which a dialog cannot catch.
         _send(["pkill", "-f", "RobloxStudio"])
-        grace_deadline = time.monotonic() + min(5.0, timeout)
+        grace_deadline = min(time.monotonic() + 5.0, deadline)
         while time.monotonic() < grace_deadline:
             if not is_studio_running():
                 logger.info("close_running_studio_or_fail: Studio exited on SIGTERM")
@@ -191,7 +195,6 @@ def close_running_studio_or_fail(timeout: float = 30) -> None:
 
     # Wait for the process to actually leave the table — kill is
     # asynchronous on macOS especially.
-    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if not is_studio_running():
             logger.info("close_running_studio_or_fail: Studio process exited")

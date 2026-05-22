@@ -71,6 +71,26 @@ class TestScoping:
         s = _run(src, name="NotADoor")
         assert s.source == src
 
+    def test_earlier_unrelated_getattribute_not_used_as_flag(self):
+        # A probe before the HumanoidRootPart read must NOT be mistaken for the
+        # key flag — the flag is the one read off the HumanoidRootPart.
+        src = (
+            'local Players = game:GetService("Players")\n'
+            "local function playerWithKey(otherPart)\n"
+            "\tlocal model = otherPart and otherPart.Parent\n"
+            "\tif not model then return false end\n"
+            '\tif otherPart:GetAttribute("Locked") then return false end\n'
+            "\tlocal player = Players:GetPlayerFromCharacter(model)\n"
+            "\tif not player then return false end\n"
+            '\tlocal rootPart = model:FindFirstChild("HumanoidRootPart")\n'
+            "\tif not rootPart then return false end\n"
+            '\treturn rootPart:GetAttribute("hasKey") == true\n'
+            "end\n"
+        )
+        s = _run(src)
+        assert 'player:GetAttribute("hasKey") == true' in s.source
+        assert 'GetAttribute("Locked")' not in s.source
+
     def test_door_without_hrp_read_untouched(self):
         # Already-correct door (reads player) must not be rewritten.
         src = (
