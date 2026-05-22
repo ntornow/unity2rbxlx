@@ -130,3 +130,63 @@ def wait_for_studio_ready(timeout: float = 60) -> bool:
 
     logger.warning("Timed out waiting for Roblox Studio after %.0fs", timeout)
     return False
+
+
+class StudioCloseError(RuntimeError):
+    """Raised when ``close_running_studio_or_fail`` could not terminate
+    every running Studio process within the allotted timeout."""
+
+
+def close_running_studio_or_fail(timeout: float = 30) -> None:
+    """Force-close any running Roblox Studio instance.
+
+    Used by the ``/e2e-test`` skill's ``--close-and-relaunch`` flag
+    (Codex finding #1: re-opening a regenerated rbxlx in an already-running
+    Studio doesn't actually reload the DataModel; the only honest signal
+    that a fresh rbxlx is loaded is a fresh Studio process). Defaults to
+    a no-op if Studio isn't running.
+
+    Parameters
+    ----------
+    timeout:
+        Max seconds to wait for the process to actually exit after the
+        kill signal. Raises ``StudioCloseError`` on timeout so the
+        caller can surface a real failure instead of silently
+        continuing with a stale Studio.
+    """
+    import platform
+
+    if not is_studio_running():
+        logger.info("close_running_studio_or_fail: no Studio process detected")
+        return
+
+    system = platform.system()
+    try:
+        if system == "Windows":
+            # ``taskkill /F`` is the only reliable terminate on Windows.
+            subprocess.run(
+                ["taskkill", "/F", "/IM", "RobloxStudioBeta.exe"],
+                capture_output=True, text=True, timeout=10,
+            )
+        else:
+            # ``pkill -f`` matches the same string ``pgrep -f`` would
+            # find, so it terminates every Studio Helper + main process.
+            subprocess.run(
+                ["pkill", "-f", "RobloxStudio"],
+                capture_output=True, text=True, timeout=10,
+            )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        raise StudioCloseError(f"close signal failed: {exc}") from exc
+
+    # Wait for the process to actually leave the table — kill is
+    # asynchronous on macOS especially.
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not is_studio_running():
+            logger.info("close_running_studio_or_fail: Studio process exited")
+            return
+        time.sleep(0.5)
+
+    raise StudioCloseError(
+        f"Studio still running after {timeout:.0f}s — terminate manually and retry"
+    )

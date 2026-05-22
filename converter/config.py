@@ -15,10 +15,31 @@ UNITY_PROJECT_PATH: Path = Path(os.environ.get("UNITY_PROJECT_PATH", "./unity_pr
 OUTPUT_DIR: Path = Path(os.environ.get("OUTPUT_DIR", "./output"))
 TEMP_DIR: Path = Path(os.environ.get("TEMP_DIR", "./tmp"))
 
+def _default_studio_path() -> str:
+    """Best-effort default for the Roblox Studio executable per platform.
+
+    An empty default resolves to ``Path(".")``, which the launcher then
+    tries to exec — yielding a confusing "Permission denied launching
+    Studio: ." The /e2e-test skill's Studio-launch step depends on this
+    resolving to a real binary, so default to each platform's standard
+    install location and let ``ROBLOX_STUDIO_PATH`` override.
+    """
+    import platform
+    system = platform.system()
+    if system == "Darwin":
+        return "/Applications/RobloxStudio.app/Contents/MacOS/RobloxStudio"
+    if system == "Windows":
+        local = os.environ.get("LOCALAPPDATA", "")
+        if local:
+            # Versioned install dir; the launcher's bootstrapper symlink.
+            return os.path.join(local, "Roblox", "Versions", "RobloxStudioBeta.exe")
+    return ""
+
+
 STUDIO_PATH: Path = Path(
     os.environ.get(
         "ROBLOX_STUDIO_PATH",
-        "",
+        _default_studio_path(),
     )
 )
 
@@ -98,6 +119,15 @@ MAX_SCENE_DEPTH: int = 64
 USE_AI_TRANSPILATION: bool = True  # Always use AI as primary, rule-based as fallback
 TRANSPILATION_CONFIDENCE_THRESHOLD: float = float(os.environ.get("TRANSPILATION_CONFIDENCE_THRESHOLD", "0.7"))
 AI_TRANSPILE_FIRST: bool = True  # Try AI before rule-based
+
+# Per-call wall-clock ceiling for the `claude -p` CLI transpile (and each
+# lint/contract reprompt). A large controller script (e.g. SimpleFPS's
+# 307-line Player.cs) cold-transpiles well past the old hardcoded 600s,
+# so the offline-assembly e2e test — which intentionally runs cold, no
+# cache reliance — would time out mid-script and silently fall back to a
+# stub. 1200s gives a generous cold-transpile budget; override via env
+# for slower machines or even larger scripts.
+CLAUDE_CLI_TIMEOUT_SECONDS: int = int(os.environ.get("CLAUDE_CLI_TIMEOUT_SECONDS", "1200"))
 
 # ---------------------------------------------------------------------------
 # LLM cache

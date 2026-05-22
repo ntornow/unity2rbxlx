@@ -165,16 +165,60 @@ def _convert_default(ctype: str, default: str) -> str:
     return "nil"
 
 
+_LUAU_KEYWORDS = frozenset({
+    "and", "break", "do", "else", "elseif", "end", "false", "for",
+    "function", "if", "in", "local", "nil", "not", "or", "repeat",
+    "return", "then", "true", "until", "while",
+    # Luau adds these reserved contextually but rejecting them here
+    # is safer than risking parser ambiguity in generated stubs.
+    "continue", "type", "export",
+})
+
+
+def _is_luau_identifier(s: str) -> bool:
+    if not s or not (s[0].isalpha() or s[0] == "_"):
+        return False
+    if not all(c.isalnum() or c == "_" for c in s):
+        return False
+    return s not in _LUAU_KEYWORDS
+
+
 def _convert_params(params: str) -> str:
-    """Convert C# parameter list to Luau."""
+    """Convert a C# parameter list to a Luau parameter list.
+
+    Naive token-tail extraction broke on default-value params like
+    ``bool stopMoving = true`` -- ``parts[-1]`` would yield the literal
+    ``true``, producing ``local function Foo(true)`` which fails to
+    parse. Strip the ``= <default>`` tail first, then pick the
+    rightmost token on the LHS as the name, and finally substitute
+    ``_argN`` for anything that isn't a legal Luau identifier (out/ref
+    qualifiers, generic angle-brackets, etc.) so the stub remains
+    syntactically valid.
+    """
     if not params.strip():
         return ""
     result = []
-    for p in params.split(","):
+    for i, p in enumerate(params.split(",")):
         p = p.strip()
+        # Drop default value — everything after the first ``=``.
+        eq = p.find("=")
+        if eq >= 0:
+            p = p[:eq].strip()
+        # Drop angle-bracket generics: ``List<int> items`` → ``List items``
+        # but more importantly stops `<int>` tokens from polluting splits.
+        while "<" in p and ">" in p:
+            lt = p.find("<")
+            gt = p.find(">", lt)
+            if gt < 0:
+                break
+            p = (p[:lt] + p[gt + 1:]).strip()
         parts = p.split()
-        if len(parts) >= 2:
-            result.append(parts[-1])
-        elif parts:
-            result.append(parts[0])
+        # Strip C# parameter qualifiers (``ref``, ``out``, ``in``, ``params``)
+        # so the name we pick is the actual variable name, not a keyword.
+        while parts and parts[0] in ("ref", "out", "in", "params", "this"):
+            parts = parts[1:]
+        name = parts[-1] if parts else ""
+        if not _is_luau_identifier(name):
+            name = f"_arg{i + 1}"
+        result.append(name)
     return ", ".join(result)

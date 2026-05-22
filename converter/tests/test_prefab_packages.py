@@ -694,40 +694,11 @@ class TestAttachPrefabScopedAnimationScripts:
 
         pipeline._attach_prefab_scoped_animation_scripts_to_templates()  # must not raise
 
-    def test_self_guarded_script_skips_baseparts_guard(self, tmp_path):
-        """A smart-binding script that already self-guards via
-        ``script.Parent:IsA("Model")`` must not get the unconditional
-        BasePart guard prepended — that would short-circuit the
-        script's own conditional before it runs, breaking both the
-        flat-list and template-attached copies."""
-        from core.roblox_types import RbxPart, RbxScript
-
-        pipeline = self._make_pipeline(tmp_path)
-        smart_source = (
-            "if script.Parent and (script.Parent:IsA('Model') "
-            "or script.Parent:IsA('BasePart')) then\n"
-            "  local target = script.Parent:FindFirstChild('Vehicle', true)\n"
-            "else\n"
-            "  local target = workspace:FindFirstChild('Vehicle', true)\n"
-            "end\n"
-        )
-        anim_script = RbxScript(
-            name="Anim_Vehicle_Wheel_Spin",
-            source=smart_source,
-            script_type="Script",
-            parent_path="ServerScriptService",
-        )
-        pipeline.state.rbx_place.scripts.append(anim_script)
-        pipeline.state.rbx_place.workspace_parts.append(
-            RbxPart(name="Anchor", class_name="Part"),
-        )
-
-        pipeline._bind_scripts_to_parts()
-
-        assert "if not script.Parent:IsA(\"BasePart\") then return end" not in anim_script.source, (
-            "self-guarded script must not receive the BasePart-only guard; "
-            "full source:\n" + anim_script.source
-        )
+    # NOTE: BasePart-guard policy tests (self-guard, localscript-routing,
+    # warn-loud-on-misroute, server-script-still-guarded) live in
+    # tests/test_unbound_script_guard.py — they're about
+    # ``pipeline._disable_unbound_scripts`` policy, not about prefab
+    # packaging. Moved 2026-05-21 per PR review.
 
 
 def _variant_template(name: str, source_prefab_guid: str | None = None):

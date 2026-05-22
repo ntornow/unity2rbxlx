@@ -107,6 +107,16 @@ class ConversionContext:
     # and by 4.10 prefab packages (to know which prefabs to emit).
     serialized_field_refs: dict[str, dict[str, str]] = field(default_factory=dict)
 
+    # Project-level scene runtime artifact emitted by the
+    # ``plan_scene_runtime`` phase. Shape is pinned by
+    # ``converter.scene_runtime_planner.SceneRuntimeArtifact`` (modules /
+    # scenes / prefabs / domain_overrides). Stored loosely typed here to
+    # avoid a core→converter dependency; consumers narrow at the call site.
+    # PR1 emits the structural blocks; PR3b fills in per-module ``domain`` /
+    # ``container`` / ``module_path``. Survives ``_classify_storage``
+    # rewrites verbatim — see ``Pipeline._classify_storage``.
+    scene_runtime: dict[str, object] = field(default_factory=dict)
+
     # Opt-in genre scaffolding requested by the caller. Persisted as a
     # sorted ``list[str]`` for JSON-friendliness; the pipeline reads it
     # back as a frozenset. Currently recognised: ``"fps"`` (auto-injected
@@ -117,6 +127,15 @@ class ConversionContext:
     # of dropping the FPS scripts because the in-memory Pipeline default
     # is empty.
     scaffolding: list[str] = field(default_factory=list)
+
+    # PR3b: requested scene-runtime contract mode. One of
+    # ``"legacy"`` / ``"auto"`` / ``"generic"``. Plumbed in from the
+    # front-door commands (``u2r convert/publish/eval``,
+    # ``convert_interactive transpile/assemble/upload``); read by
+    # ``Pipeline._classify_storage`` to gate the domain classifier
+    # so the legacy path stays byte-identical (per the design doc's
+    # "default output byte-identical" invariant carried over from PR3a).
+    scene_runtime_mode: str = "legacy"
 
     def __post_init__(self) -> None:
         # JSON load via `cls(**data)` populates storage_plan as a dict (the

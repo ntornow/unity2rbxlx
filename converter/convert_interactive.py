@@ -46,7 +46,7 @@ import sys
 import time
 from pathlib import Path
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, cast
 
 import click
 
@@ -54,6 +54,11 @@ import config
 from converter.pipeline import PHASES, Pipeline
 from core.conversion_context import ConversionContext
 from utils.credentials import resolve_credential as _resolve_credential
+from utils.scene_runtime_stamp import (
+    SceneRuntimeMode,
+    SceneRuntimeModeMismatch,
+    guard_or_clean_output_dir,
+)
 from utils.script_cache import scripts_cache_intact
 
 log = logging.getLogger(__name__)
@@ -123,6 +128,29 @@ def _save_skill_state(output_dir: Path, state: dict) -> None:
 def _emit(data: dict) -> None:
     """Print a JSON document to stdout for the skill to consume."""
     click.echo(json.dumps(data, indent=2, default=str))
+
+
+def _guard_scene_runtime_mode_or_emit(
+    phase: str,
+    output_dir: Path,
+    requested: str,
+    clean: bool,
+) -> None:
+    """PR3b: front-door stamp/mismatch guard for the skill commands.
+
+    On a mismatch, emits the skill's JSON error envelope and exits 1 so
+    the caller doesn't see a stack trace. The skill's caller (Claude
+    Code) reads ``errors`` and surfaces it directly.
+    """
+    try:
+        guard_or_clean_output_dir(
+            output_dir,
+            cast(SceneRuntimeMode, requested),
+            clean=clean,
+        )
+    except SceneRuntimeModeMismatch as exc:
+        _emit({"phase": phase, "success": False, "errors": [str(exc)]})
+        sys.exit(1)
 
 
 def _mark_skill_phase(output_dir: Path, phase: str, **extras: Any) -> None:
@@ -564,9 +592,42 @@ def materials(unity_project_path: str, output_dir: str) -> None:
               help="Anthropic API key (string or path to a key file).")
 @click.option("--no-ai", is_flag=True,
               help="Disable AI fallback; use rule-based transpilation only.")
+@click.option("--scene-runtime",
+              type=click.Choice(["legacy", "auto", "generic"]),
+              default="legacy",
+              show_default=True,
+              help="Scene-runtime contract mode. 'legacy' is the pre-PR3 "
+                   "pipeline (default). 'generic' routes through PR4's "
+                   "host runtime (Piece 6 services). 'auto' is reserved "
+                   "for PR5 and currently rejected.")
+@click.option("--clean", is_flag=True,
+              help="PR3b: wipe + re-stamp the output dir before "
+              "transpiling (mode-mismatch remediation).")
 def transpile(unity_project_path: str, output_dir: str,
-              api_key: str | None, no_ai: bool) -> None:
+              api_key: str | None, no_ai: bool, scene_runtime: str,
+              clean: bool) -> None:
     """Phase 3b: transpile C# scripts to Luau."""
+    # PR4: only ``auto`` is rejected (PR5 turf). ``generic`` flows
+    # through the host runtime; see ``_enforce_scene_runtime_mode_supported``
+    # in u2r.py for the shared rationale.
+    if scene_runtime == "auto":
+        _emit({
+            "phase": "transpile",
+            "success": False,
+            "errors": [
+                "--scene-runtime=auto is not yet supported. PR4 lights "
+                "up 'generic'; 'auto' lands in PR5 alongside its "
+                "fallback-routing canaries. Use --scene-runtime=generic "
+                "for the contract pipeline.",
+            ],
+        })
+        sys.exit(1)
+
+    # PR3b: mode stamp + mismatch guard at the front door.
+    _guard_scene_runtime_mode_or_emit(
+        "transpile", Path(output_dir).resolve(), scene_runtime, clean,
+    )
+
     if api_key:
         ak = Path(api_key)
         key_value = ak.read_text().strip() if ak.is_file() else api_key.strip()
@@ -575,6 +636,9 @@ def transpile(unity_project_path: str, output_dir: str,
         config.USE_AI_TRANSPILATION = False
 
     pipeline = _make_pipeline(unity_project_path, output_dir)
+    # PR3b: thread the requested mode into ctx so _classify_storage's
+    # domain classifier knows whether to run.
+    pipeline.ctx.scene_runtime_mode = scene_runtime
     try:
         _run_through(pipeline, "transpile_scripts")
     except Exception as exc:
@@ -722,12 +786,36 @@ def validate(output_dir: str, write: bool) -> None:
               "HUDController). Default: none. Persisted in "
               "conversion_context.json so subsequent ``upload`` re-runs "
               "against the same output dir reproduce the same scripts.")
+@click.option("--scene-runtime",
+              type=click.Choice(["legacy", "auto", "generic"]),
+              default="legacy",
+              show_default=True,
+              help="Scene-runtime contract mode. 'generic' routes "
+                   "through PR4's host runtime. 'auto' is reserved "
+                   "for PR5 and currently rejected.")
+@click.option("--clean", is_flag=True,
+              help="PR3b: wipe + re-stamp the output dir before "
+              "assembling (mode-mismatch remediation).")
 def assemble(unity_project_path: str, output_dir: str,
              no_upload: bool, no_resolve: bool, retranspile: bool,
              api_key: str | None, creator_id: str | None,
              universe_id: int | None, place_id: int | None,
-             scaffolding: str | None) -> None:
+             scaffolding: str | None,
+             scene_runtime: str, clean: bool) -> None:
     """Phase 4: upload assets, resolve, convert animations + scene, write .rbxlx."""
+    # PR4: only ``auto`` is still rejected (PR5 turf).
+    if scene_runtime == "auto":
+        _emit({
+            "phase": "assemble", "success": False, "errors": [
+                "--scene-runtime=auto is not yet supported. PR4 lights "
+                "up 'generic'; 'auto' lands in PR5. Use "
+                "--scene-runtime=generic for the contract pipeline.",
+            ],
+        })
+        sys.exit(1)
+    _guard_scene_runtime_mode_or_emit(
+        "assemble", Path(output_dir).resolve(), scene_runtime, clean,
+    )
     # Resolve credentials from CLI -> env -> file (same precedence as u2r.py)
     # so users get the documented auto-discovery behavior. Without this,
     # assemble without --api-key silently ran with an empty config, every
@@ -774,6 +862,9 @@ def assemble(unity_project_path: str, output_dir: str,
         scaffolding=scaffolding_list,
     )
     pipeline._retranspile = retranspile
+    # PR3b: thread the requested mode into ctx so _classify_storage's
+    # domain classifier knows whether to run.
+    pipeline.ctx.scene_runtime_mode = scene_runtime
 
     # Plumb --universe-id / --place-id into ctx so resolve_assets can run
     # headless mesh resolution on the first assemble invocation. Without
@@ -852,10 +943,32 @@ def assemble(unity_project_path: str, output_dir: str,
               help="Roblox Universe ID (cached after first use).")
 @click.option("--place-id", type=int, default=None,
               help="Roblox Place ID (cached after first use).")
+@click.option("--scene-runtime",
+              type=click.Choice(["legacy", "auto", "generic"]),
+              default="legacy",
+              show_default=True,
+              help="Scene-runtime contract mode. Must match the output "
+                   "dir's stamp (or pass --clean). 'auto' reserved "
+                   "for PR5.")
+@click.option("--clean", is_flag=True,
+              help="PR3b: wipe + re-stamp the output dir before "
+              "uploading (mode-mismatch remediation).")
 def upload(output_dir: str, api_key: str | None,
-           universe_id: int | None, place_id: int | None) -> None:
+           universe_id: int | None, place_id: int | None,
+           scene_runtime: str, clean: bool) -> None:
     """Publish the .rbxlx to Roblox via headless place builder."""
     out = Path(output_dir).resolve()
+    # PR4: only ``auto`` is still rejected (PR5 turf).
+    if scene_runtime == "auto":
+        _emit({
+            "phase": "upload", "success": False, "errors": [
+                "--scene-runtime=auto is not yet supported. PR4 lights "
+                "up 'generic'; 'auto' lands in PR5. Use "
+                "--scene-runtime=generic for the contract pipeline.",
+            ],
+        })
+        sys.exit(1)
+    _guard_scene_runtime_mode_or_emit("upload", out, scene_runtime, clean)
     ctx_path = _context_path(out)
     if not ctx_path.exists():
         _emit({
@@ -930,6 +1043,9 @@ def upload(output_dir: str, api_key: str | None,
     pipeline = _make_pipeline(None, out, skip_binary_rbxl=True)
     pipeline.ctx.universe_id = uid
     pipeline.ctx.place_id = pid
+    # PR3b: honor the requested mode for the rebuild path. The default
+    # legacy is the safe choice (this is upload, not transpile).
+    pipeline.ctx.scene_runtime_mode = scene_runtime
 
     # Rebuild rbx_place via the pipeline. Cloud side-effect phases
     # (moderate_assets, upload_assets, resolve_assets) are skipped because

@@ -16,11 +16,12 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from config import (
     ANTHROPIC_MODEL,
     ANTHROPIC_MAX_TOKENS,
+    CLAUDE_CLI_TIMEOUT_SECONDS,
     LLM_CACHE_DIR,
     LLM_CACHE_ENABLED,
     LLM_CACHE_TTL_SECONDS,
@@ -77,6 +78,9 @@ class TranspilationResult:
 # Public API
 # ---------------------------------------------------------------------------
 
+RuntimeMode = Literal["legacy", "generic"]
+
+
 def transpile_scripts(
     unity_project_path: str | Path,
     script_infos: list[Any],
@@ -84,6 +88,9 @@ def transpile_scripts(
     api_key: str = "",
     max_concurrent: int = 10,
     serialized_field_refs: dict[str, dict[str, str]] | None = None,
+    *,
+    runtime_mode: RuntimeMode = "legacy",
+    runtime_bearing_paths: frozenset[Path] | None = None,
 ) -> TranspilationResult:
     """Transpile a list of C# scripts to Luau.
 
@@ -98,10 +105,23 @@ def transpile_scripts(
             script's prompt gets the relevant subset appended so the AI
             can emit real ``ReplicatedStorage.Templates:WaitForChild(...)``
             calls for inspector-assigned prefab fields instead of ``nil``.
+        runtime_mode: ``"legacy"`` (default — byte-identical to pre-PR3a
+            behaviour) or ``"generic"`` for the scene-runtime contract
+            pipeline. Under ``"generic"`` the transpiler swaps in
+            ``_GENERIC_RUNTIME_PROMPT`` for runtime-bearing scripts. The
+            cache key already incorporates the prompt hash, so generic
+            and legacy outputs land in disjoint cache namespaces.
+        runtime_bearing_paths: Under ``runtime_mode="generic"`` this is
+            the set of ``info.path`` values for MonoBehaviours marked
+            ``runtime_bearing=True`` in the planner's ``scene_runtime``
+            artifact. Each one is forced to ``ModuleScript`` target +
+            generic prompt regardless of what ``_classify_script_type``
+            would have inferred. Ignored under ``"legacy"``.
 
     Returns:
         TranspilationResult with all transpiled scripts and summary counts.
     """
+    runtime_bearing_paths = runtime_bearing_paths or frozenset()
     result = TranspilationResult()
 
     # Build project context for AI transpilation
@@ -136,6 +156,13 @@ def transpile_scripts(
             continue
 
         script_type = _classify_script_type(csharp_source, info)
+        # Generic-runtime target switch: every runtime-bearing
+        # MonoBehaviour must emit as a ``ModuleScript`` because the host
+        # ``require``s it and instantiates the returned class table. If
+        # the prompt said "return a class table" but the user message
+        # asked for a Server Script, the AI produces inconsistent output.
+        if runtime_mode == "generic" and info.path in runtime_bearing_paths:
+            script_type = "ModuleScript"
         pending_scripts.append((info, csharp_source, script_type))
 
     # Phase 2: AI transpilation — dependency-aware, processed in level order
@@ -189,6 +216,22 @@ def transpile_scripts(
             if triple is None:
                 return stem, None
             info, csharp_source, script_type = triple
+            # PER-SCRIPT runtime mode: the scene-runtime contract only
+            # applies to host-instantiated MonoBehaviours. A non-runtime-
+            # bearing script (LocalScript, helper module, ScriptableObject
+            # converter target) under ``runtime_mode="generic"`` MUST stay
+            # on the legacy prompt + skip the contract verifier; the
+            # contract was never meant to constrain those modules.
+            # Without this gate the generic prompt tells a LocalScript
+            # "return a class table for the host to instantiate," which
+            # is nonsense for input/UI/audio scripts and produces
+            # mis-transpiled output that the verifier then rejects on
+            # rules the contract never intended for it.
+            effective_runtime_mode: RuntimeMode = (
+                "generic"
+                if runtime_mode == "generic" and info.path in runtime_bearing_paths
+                else "legacy"
+            )
             scoped = _build_scoped_context(stem, dep_graph, file_sources, transpiled_luau)
             field_ctx = _build_serialized_field_context(
                 info.path, unity_project_path, serialized_field_refs,
@@ -202,6 +245,7 @@ def transpile_scripts(
                         class_name=info.class_name,
                         script_type=script_type,
                         project_context=context,
+                        runtime_mode=effective_runtime_mode,
                     )
                 elif backend == "anthropic_api" and api_key:
                     luau, confidence, warnings = _ai_transpile(
@@ -209,6 +253,7 @@ def transpile_scripts(
                         class_name=info.class_name,
                         script_type=script_type,
                         project_context=context,
+                        runtime_mode=effective_runtime_mode,
                     )
                 else:
                     return stem, None
@@ -982,6 +1027,462 @@ return ClassName  -- (only for ModuleScripts)
 """
 
 
+# ---------------------------------------------------------------------------
+# Generic-runtime system prompt -- selected only under ``--scene-runtime=
+# generic``. Additive: ``_AI_SYSTEM_PROMPT`` above is byte-frozen so the
+# legacy transpile cache is never invalidated by edits to this prompt.
+#
+# The cache key already incorporates ``prompt_hash`` (see ``_ai_cache_key``),
+# so generic and legacy outputs land in disjoint cache namespaces by
+# construction -- no extra plumbing needed.
+#
+# The contract this prompt teaches lives in
+# ``converter/docs/design/scene-runtime-contract.md`` (Pieces 1 + 6). The
+# host runtime (``runtime/scene_runtime.luau``) lands in PR4; this prompt
+# documents the host surface the AI is expected to target.
+# ---------------------------------------------------------------------------
+
+_GENERIC_RUNTIME_PROMPT = """\
+You are an expert Unity C# → Roblox Luau transpiler. Convert the given C# script to a contract-compliant Roblox Luau **ModuleScript**. The host runtime (lands in PR4 of the scene-runtime effort) constructs each MonoBehaviour, injects the host surface, and drives lifecycle. Your job is to emit the class table the host instantiates.
+
+CRITICAL: Output ONLY valid Luau code. No markdown fences. No explanations. No prose.
+
+## Module shape (THE contract — do not deviate)
+
+Every output is a ModuleScript that **returns a class table**. The class table contains:
+
+- A pure constructor `new(config) -> instance`.
+- Zero or more lifecycle methods, each a normal Luau method on the class table.
+- Helper methods.
+
+There is **NO side-effect at module scope**. NO top-level `RunService.Heartbeat:Connect`, NO top-level `:Connect(...)`, NO top-level `:Clone()`, NO top-level calls of any kind. Module scope is for `local` declarations of literals, function definitions, and the final `return`.
+
+Skeleton:
+```luau
+local Class = {}
+Class.__index = Class
+
+function Class.new(config)
+    local self = setmetatable({}, Class)
+    -- Read scalar config; do NOT touch self.host, peer components, or workspace here.
+    self.speed = config.speed or 12
+    return self
+end
+
+function Class:Awake()
+    -- Host surface IS bound here. Wire signals, look up peers.
+end
+
+function Class:Start()
+    -- Runs one tick after Awake; same execution-domain rules apply.
+end
+
+function Class:Update(dt)
+    -- Per-frame. Host drives this from Heartbeat. Do NOT Connect Heartbeat yourself.
+end
+
+return Class
+```
+
+Optional lifecycle methods (all are `(self)` or `(self, dt)`): `Awake`, `OnEnable`, `Start`, `Update`, `FixedUpdate`, `LateUpdate`, `OnDisable`, `OnDestroy`. Omit any that the source doesn't need.
+
+## Constructor purity (rule e)
+
+`Class.new(config)` body must NOT read `self.host` and must NOT call `self:GetComponent(...)`. The host surface isn't bound until **after** `new()` returns. Touching it inside `new` breaks reference-cycle injection. Read only the scalar `config` table the host hands you. Defer everything else to `Awake`.
+
+## Injected host surface (available from `Awake` onward)
+
+Set on `self` by the host before `Awake` runs:
+
+- `self.gameObject` — the Roblox Instance for this component's GameObject.
+- `self.transform` — alias of `self.gameObject` (Roblox has no separate Transform).
+- `self.instance` — alias for raw-Instance code.
+- `self.enabled` — per-component flag; writes fire `OnEnable`/`OnDisable`.
+- `self:GetComponent(name)` — peer-component lookup. For converted MonoBehaviours returns the peer module instance; for built-in types (`Rigidbody`, `Collider`, `AudioSource`, `Animator`, …) falls through to a Roblox class search on `self.gameObject`.
+- `self.host` — engine handle; see "Host services" below.
+
+## Host services (`self.host`)
+
+- `self.host.instantiatePrefab(prefab_id, parent, cframe, externalRefs?)` — replaces Unity `Instantiate(prefab)`. `prefab_id` is injected for you on serialized prefab fields; you NEVER construct it. Returns a `gameObject` Instance whose components have lifecycle already running.
+- `self.host.addComponent(go, scriptId, config?)` — replaces Unity `AddComponent<T>()`. Runs `Awake → OnEnable → Start` on the new instance, returns it.
+- `self.host.destroy(target)` — replaces Unity `Destroy(target)`. DFS teardown; runs `OnDisable → OnDestroy` deepest-first; idempotent.
+- `self.host.setActive(gameObject, bool)` — replaces `GameObject.SetActive`. Toggles `activeInHierarchy` and fires `OnEnable`/`OnDisable` down the subtree.
+- `self.host.findObjectOfType(name)` / `self.host.findGameObject(name)` / `self.host.findGameObjectsWithTag(tag)` — replaces Unity's `FindObjectOfType` / `GameObject.Find` / `FindGameObjectsWithTag`. Sees inactive objects (which `workspace:FindFirstChild` cannot).
+- `self.host.invoke(self, method, delay)` / `invokeRepeating(self, method, delay, period)` / `cancelInvoke(self, method?)` — replaces Unity `MonoBehaviour.Invoke`. Lifetime-coupled: the host cancels every scheduled invocation on this component's `OnDestroy`. Do NOT use `task.delay`/`task.spawn` for lifecycle-bound work — raw schedulers don't cancel on teardown.
+- `self.host.startCoroutine(self, fn)` — replaces Unity `StartCoroutine`. Lifecycle-scoped; cancelled on `OnDestroy`.
+- `self.host:connect(signal, fn)` — lifecycle-scoped event subscription (see "Unity message callbacks" below).
+
+## Serialized field injection
+
+`config` carries **scalars only**. Asset / prefab / ScriptableObject fields are resolved separately and injected on `self` by name before `Awake`:
+
+- Asset fields → `self.<fieldName>` is a `rbxassetid://…` string.
+- Prefab fields → `self.<fieldName>` is a `prefab_id`. Pass it to `self.host.instantiatePrefab(self.<fieldName>, ...)`. NEVER construct a `prefab_id`.
+- ScriptableObject fields → `self.<fieldName>` is the SO's table.
+
+You read these from `self` inside lifecycle methods, NOT from `config`.
+
+## Unity message callbacks (rule f — strictly enforced)
+
+Roblox does NOT dispatch by name. The following Unity callbacks must **never** appear as members of the class table — neither as `function Class:OnTriggerEnter(...)`, nor as `Class.OnTriggerEnter = function(...)`, nor as a `OnTriggerEnter = function(...)` entry inside a returned table literal:
+
+`OnTriggerEnter`, `OnTriggerExit`, `OnTriggerStay`, `OnCollisionEnter`, `OnCollisionExit`, `OnCollisionStay`, `OnMouseDown`, `OnMouseUp`, `OnMouseEnter`, `OnMouseExit`, `OnMouseOver`, `OnMouseDrag`.
+
+The contract-compliant replacement is `self.host:connect(signal, fn)` wired **in `Awake`**:
+
+```luau
+function Class:Awake()
+    self.host:connect(self.gameObject.Touched, function(other)
+        -- the body that used to live in OnTriggerEnter(other)
+    end)
+end
+```
+
+- Call site is `Awake` ONLY. The host's `connect` wrapper handles the `enable`/`disable` cycling, so re-registering in `OnEnable` would double-subscribe.
+- Dispatch is gated on `active && enabled` (same condition as `OnEnable`). The host disconnects on the gate's true→false transition and rearms on false→true. On `OnDestroy` every subscription is disconnected.
+- Use `self.gameObject.Touched` for OnTriggerEnter/OnCollisionEnter (Roblox unifies trigger + collision into one event; gate on `CanTouch` / collision group if you need to distinguish).
+- Raw `signal:Connect(fn)` is still legal for cases that want connection-survives-disable semantics, but NOT for the twelve names above.
+
+## Cross-script requires
+
+Project class imports use the contract-pinned shape:
+
+```luau
+local Other = require("@scene_runtime/Other")
+```
+
+The string is `@scene_runtime/<stem>`, where `<stem>` is the file stem of the dependency (e.g. `Player` for `Player.cs`). The require resolver fails closed on a missing stem or a stem that collides across folders — your job is just to use the shape.
+
+## Singleton pattern
+
+`static Instance = this` is supported via the canonical Lua pattern. Do it inside `Awake`, not at module scope:
+
+```luau
+function Class:Awake()
+    Class.Instance = self
+end
+```
+
+## Lifecycle execution order
+
+The host pins the order (Unity's is partly undefined):
+
+1. `Class.new(config)` for every instance.
+2. Host injects surface + references on every instance. Cycles are safe because step 1 touched nothing.
+3. `Awake` — scene-hierarchy DFS, then per-GameObject component order.
+4. `OnEnable` — same order, only `active && enabled` instances.
+5. `Start` — next tick (`task.defer`), same order.
+6. `Update`/`LateUpdate` on `Heartbeat`; `FixedUpdate` on a fixed-step accumulator.
+7. `OnDisable`/`OnDestroy` on teardown.
+
+You don't connect to RunService. You implement the methods; the host calls them.
+
+## Translating Unity APIs
+
+The Unity → Roblox API mapping below covers patterns inside method bodies. Module-scope rules above always win.
+
+### Lifecycle hooks (method bodies)
+- `Awake() / Start()` → method body of `Class:Awake()` / `Class:Start()`.
+- `Update() / LateUpdate()` → method body of `Class:Update(dt)` / `Class:LateUpdate(dt)`. The `dt` argument is provided by the host.
+- `FixedUpdate()` → method body of `Class:FixedUpdate(dt)`.
+- `OnEnable() / OnDisable() / OnDestroy()` → method body of the corresponding methods.
+- `Invoke("Method", delay)` → `self.host.invoke(self, "Method", delay)`.
+- `InvokeRepeating(...)` → `self.host.invokeRepeating(self, ...)`.
+- `CancelInvoke()` → `self.host.cancelInvoke(self)`.
+- `StartCoroutine(Routine())` → `self.host.startCoroutine(self, function() ... end)`.
+
+### Trigger / collision / mouse (host:connect, never name-dispatch)
+- `OnTriggerEnter / Exit / Stay` → `self.host:connect(self.gameObject.Touched, function(other) ... end)` in `Awake`.
+- `OnCollisionEnter / Exit / Stay` → same shape; Roblox `.Touched` covers both unless code distinguishes by impulse.
+- `OnMouse*` → `self.host:connect(self.gameObject.MouseClick / MouseEnter / MouseLeave, ...)` if the GameObject has a `ClickDetector`; otherwise log unsupported.
+
+### Component access
+- `GetComponent<T>()` / `GetComponent("Name")` → `self:GetComponent("T")`.
+- `GetComponentInChildren / Parent` → walk `self.gameObject:GetDescendants()` / `:GetAncestors()` and filter; the host registry doesn't index across hierarchy.
+- `gameObject.AddComponent<T>()` → `self.host.addComponent(self.gameObject, "T", configTable)`.
+- `gameObject.SetActive(b)` → `self.host.setActive(self.gameObject, b)`.
+- `Instantiate(prefab)` / `Instantiate(prefab, pos, rot)` → `self.host.instantiatePrefab(self.<prefabField>, parent, cframe)`. `self.<prefabField>` is injected from the serialized prefab reference — never `prefab:Clone()`.
+- `Destroy(target)` / `Destroy(target, delay)` → `self.host.destroy(target)` immediately, or `self.host.invoke(self, function() self.host.destroy(target) end, delay)` if a delay is meaningful.
+- `FindObjectOfType<T>()` → `self.host.findObjectOfType("T")`.
+- `GameObject.Find("Name")` → `self.host.findGameObject("Name")`.
+- `GameObject.FindGameObjectsWithTag("Tag")` → `self.host.findGameObjectsWithTag("Tag")`.
+
+### Transform
+- `transform.position` → `self.gameObject:GetPivot().Position` (read) / `self.gameObject:PivotTo(CFrame.new(p))` (write).
+- `transform.rotation` → `self.gameObject:GetPivot()` (CFrame holds rotation) / `self.gameObject:PivotTo(self.gameObject:GetPivot() * rot)` (compose).
+- `transform.forward / right / up` → `self.gameObject:GetPivot().LookVector / RightVector / UpVector`.
+- `transform.localScale` → `self.gameObject.Size` for BasePart, `self.gameObject:ScaleTo(s)` for Model.
+- `transform.Translate(v)` → `self.gameObject:PivotTo(self.gameObject:GetPivot() + v)`.
+- `transform.Rotate(...)` → `self.gameObject:PivotTo(self.gameObject:GetPivot() * CFrame.Angles(...))`.
+
+### Distance & radius units (CRITICAL — Unity m vs Roblox studs)
+- Every Unity physics distance / radius is in **metres**. Roblox spatial APIs use **studs**.
+- Multiply Unity literals by `STUDS_PER_METER = 3.571` (or emit the constant inline):
+  - `Physics.OverlapSphere(p, 2)` → `workspace:GetPartBoundsInRadius(p, 2 * 3.571)`.
+  - `Physics.Raycast(o, d, 100)` → `workspace:Raycast(o, d.Unit * (100 * 3.571), params)`.
+  - `Vector3.Distance(a,b) < r` → `(a - b).Magnitude < r * 3.571`.
+- Do NOT leave bare Unity-metre numbers in the emitted code.
+
+### Character speed (Unity m/s vs Roblox studs/s)
+- `humanoid.WalkSpeed = speed * 3.571` (configure ONCE on character bind).
+- `humanoid:Move(direction)` (pass a UNIT direction every frame; never scale).
+
+### Physics primitives
+- `Physics.Raycast(o, d, dist)` → `workspace:Raycast(o, d.Unit * (dist * 3.571), RaycastParams.new())`.
+- `Rigidbody.velocity` → `part.AssemblyLinearVelocity`.
+- `Rigidbody.AddForce(f)` → `part:ApplyImpulse(f)`.
+- `Rigidbody.isKinematic = b` → `part.Anchored = b`.
+
+### Input
+- `Input.GetKey / GetKeyDown / GetKeyUp` → `UserInputService:IsKeyDown(Enum.KeyCode.X)`.
+- `Input.GetMouseButton` → `UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)`.
+- `Camera.main` → `workspace.CurrentCamera`.
+- DO NOT use `Enum.KeyCode.Escape` for pause menus — Roblox reserves Escape. Use `P` or `Tab`.
+
+### Audio
+- `AudioSource.Play()` → `sound:Play()` where `sound = self:GetComponent("AudioSource")`.
+- `AudioSource.clip` → `sound.SoundId`.
+- `AudioSource.volume / pitch / loop` → `sound.Volume / PlaybackSpeed / Looped`.
+
+### Events
+- `UnityEvent.AddListener(cb)` → `event:Connect(cb)`. Wire in `Awake` via `self.host:connect` if `event` lives on `self.gameObject` and should respect enable/disable; otherwise plain `:Connect` is fine.
+- `event?.Invoke(args)` → `if event then event:Fire(args) end`.
+
+### Coroutines
+- `StartCoroutine(Func())` → `self.host.startCoroutine(self, Func)`.
+- `yield return new WaitForSeconds(n)` → `task.wait(n)` inside the coroutine body.
+- `yield return null` → `task.wait()` inside the coroutine body.
+
+### Math
+- `Mathf.X` → `math.x` (lowercase).
+- `Mathf.Lerp(a,b,t)` → `a + (b - a) * t`.
+- `Mathf.Infinity` → `math.huge`.
+- `Random.Range(a, b)` → `math.random(a, b)` (integers) / `math.random() * (b - a) + a` (floats).
+- `Vector3.Distance(a,b)` → `(a - b).Magnitude` (then scale by STUDS_PER_METER if comparing against a Unity metre).
+- `Vector3.Dot(a,b)` → `a:Dot(b)`; `Vector3.Cross(a,b)` → `a:Cross(b)`.
+- `Vector3.normalized` / `.magnitude` → `.Unit` / `.Magnitude`.
+- `Quaternion.Euler(x,y,z)` → `CFrame.Angles(math.rad(x), math.rad(y), math.rad(z))`.
+- `Quaternion.LookRotation(fwd)` → `CFrame.lookAt(pos, pos + fwd)`.
+
+### Strings
+- `string.Format("{0} {1}", a, b)` → `string.format("%s %s", a, b)`.
+- `$"text {expr}"` → `string.format("text %s", tostring(expr))` or concat with `..`.
+- `.StartsWith / EndsWith / Substring / Contains / Trim / Split` → standard Luau `string.*` equivalents.
+
+### Collections
+- `List<T>` / `T[]` → Luau table `{}` (1-indexed; convert 0-based loops).
+- `.Add / .Remove / .Contains / .Count` → `table.insert / table.remove / table.find / #tbl`.
+- `Dictionary<K,V>` → Luau table.
+- `foreach (var x in coll)` → `for _, x in coll do`.
+- LINQ → inline loops; no LINQ runtime.
+
+## Luau syntax (MUST follow exactly)
+
+- NO braces for blocks — use `then`/`do`/`end`.
+- NO semicolons; NO type annotations; NO access modifiers.
+- NO compound assignment (`x += 1` → `x = x + 1`).
+- C# logical operators: `&&` → `and`, `||` → `or`, `!expr` → `not expr`, `!=` → `~=`.
+- `null` → `nil`. String concat: `..` not `+`. Length: `#arr`. Continue is legal in Roblox Luau.
+- Tables are 1-indexed.
+- Bitwise: `bit32.band / bor / lshift / rshift`.
+
+## Logging
+- `Debug.Log / LogWarning / LogError` → `print` / `warn` (Roblox has no error log channel; `error()` aborts, which is rarely what `LogError` means in Unity).
+
+## Animation
+- Skeletal animation is NOT supported (Roblox has no automated skinned-mesh pipeline).
+- `Animator.SetBool / SetFloat / SetInteger / SetTrigger / ResetTrigger / Play / CrossFade` → `self.gameObject:SetAttribute("ParamName", value)`. Inert degradation; the parameter is recorded but drives no skeleton. NEVER emit `AnimationTrack:Play()`.
+
+## Unconverted methods
+
+When a Unity API has NO faithful Luau translation, emit a stub method whose body is a single `-- UNCONVERTED: <reason>` comment. Do NOT silently drop methods. Reasons: reflection, unsafe code, editor-only APIs, screen capture, etc.
+
+## Important final rules
+
+- Convert the ENTIRE class. Do not skip methods or simplify logic.
+- Preserve all game logic, conditions, and calculations.
+- C# events with no Roblox event analog → `BindableEvent` field on the class, fired/connected explicitly.
+- C# properties with `get`/`set` side effects → field + accessor methods (`getX(self)` / `setX(self, v)`); plain auto-properties → fields.
+- Interfaces / abstract classes → ModuleScript with table of functions; no client-of-the-host surface unless the implementing class registers them.
+- Enums → table with named numeric values: `local Dir = { Left = 0, Right = 1 }` at module scope (this is a side-effect-free `local`, allowed).
+- Do NOT emit `Heartbeat:Connect`, `RenderStepped:Connect`, or any `:Connect` at module scope. Method bodies only.
+- Do NOT emit `script.Parent`, `workspace`-rooted lookups, `game:GetService(...)` at module scope. Use the injected `self.gameObject`, peer `self:GetComponent`, and `self.host.*` services from method bodies.
+"""
+
+
+def _select_prompt(runtime_mode: RuntimeMode) -> tuple[str, str]:
+    """Return ``(prompt, prompt_hash)`` for the active runtime mode.
+
+    The hash drives ``_ai_cache_key``'s namespace — generic and legacy
+    outputs are cached separately by construction. Truncated to 16 hex
+    chars to match the historical key shape (the cache file format
+    stores the full key elsewhere)."""
+    prompt = _AI_SYSTEM_PROMPT if runtime_mode == "legacy" else _GENERIC_RUNTIME_PROMPT
+    return prompt, hashlib.sha256(prompt.encode()).hexdigest()[:16]
+
+
+def _format_contract_violations(violations) -> str:
+    """Build the AI-facing violation summary for the contract reprompt.
+
+    The shape is deliberate: numbered list, ``[rule X] line N:`` prefix,
+    one line per violation. The AI reliably parses this format better
+    than free-form prose -- and it surfaces the rule letter so the model
+    has a chance to recall the contract's section.
+    """
+    return "\n".join(
+        f"{i + 1}. [rule {v.rule}] line {v.line}: {v.message}"
+        for i, v in enumerate(violations)
+    )
+
+
+def _contract_reprompt_user_message(
+    csharp_source: str, broken_luau: str, violations_text: str,
+) -> str:
+    """User-message body for the one-shot contract reprompt.
+
+    Shared between the Anthropic-API and Claude-CLI backends -- the same
+    backend that produced the broken output is asked to fix it (per the
+    PR3a kickoff decision: symmetric reprompt path)."""
+    return (
+        "Your previous output violates the scene-runtime contract.\n\n"
+        "VIOLATIONS:\n"
+        f"{violations_text}\n\n"
+        "Re-emit the ModuleScript with these violations fixed. Follow the "
+        "contract rules in the system prompt -- module-scope side-effects "
+        "are forbidden, constructors must be pure, and Unity message "
+        "callbacks (``OnTriggerEnter`` etc.) must be wired via "
+        "``self.host:connect(...)`` in ``Awake``, not bound on the class "
+        "table.\n\n"
+        "Output ONLY the corrected Luau ModuleScript. No markdown fences. "
+        "No explanations. No prose.\n\n"
+        "ORIGINAL C#:\n"
+        f"```csharp\n{csharp_source}\n```\n\n"
+        "PREVIOUS (BROKEN) LUAU:\n"
+        f"```luau\n{broken_luau}\n```"
+    )
+
+
+def _refresh_contract_warnings(
+    luau_source: str, cached_warnings: list[str],
+) -> list[str]:
+    """Replace cached contract-verifier warnings with a fresh re-verify.
+
+    On a cache hit under ``runtime_mode="generic"`` the stored ``warnings``
+    list contains the previous verifier's verdict on this Luau -- which
+    may be stale if the verifier was bugfixed in the meantime. The
+    cached *Luau* is still the AI's actual output; only the *verdict*
+    may have drifted. Re-runs the verifier and rebuilds the
+    ``contract-verifier-pre`` / ``contract-verifier`` tags for the
+    cached source. Non-contract warnings (luau-analyze syntax notes,
+    UNCONVERTED method warnings, etc.) survive untouched.
+
+    ``-pre`` warnings are intentionally dropped on a cache hit: we
+    don't know whether the cached output was the first attempt or the
+    reprompt. The spike's pre/post accounting reads ``-pre`` to count
+    reprompt-rescued modules; on cache replay that distinction is
+    unrecoverable, so we treat the cached output as "first attempt
+    clean" if the current verifier passes.
+    """
+    from converter.runtime_contract import verify_module
+    non_contract = [
+        w for w in cached_warnings
+        if not w.startswith("contract-verifier")
+    ]
+    result = verify_module(luau_source)
+    if result.ok:
+        return non_contract
+    return non_contract + [
+        f"contract-verifier (rule {v.rule}, line {v.line}): {v.message}"
+        for v in result.violations
+    ]
+
+
+def _verify_and_reprompt(
+    luau_source: str,
+    csharp_source: str,
+    runtime_mode: RuntimeMode,
+    reprompt_call,
+) -> tuple[str, list[str]]:
+    """Run the contract verifier; on violations call ``reprompt_call`` ONCE.
+
+    ``reprompt_call`` is a closure each backend defines -- it accepts the
+    fully-formed user message and returns the raw AI response text (or
+    ``None`` on backend failure). The verifier runs again on the
+    reprompt's output; remaining violations are recorded as warnings
+    that flow into the ``TranspiledScript.warnings`` list. Per design
+    doc Piece 1: one reprompt per module, no retries.
+
+    Under ``runtime_mode == "legacy"`` this is a no-op -- the legacy
+    pipeline has its own repair layer; the contract verifier is generic-
+    only by design (the bottom of the design doc's "What already exists"
+    section explicitly preserves legacy's repair passes).
+
+    Warnings carry two distinct tags so the compliance spike can compute
+    pre/post-reprompt pass rates from the returned list alone:
+
+      * ``contract-verifier-pre`` -- a violation the FIRST AI output had.
+        Emitted only when reprompt was actually called.
+      * ``contract-verifier`` -- a violation that survived the reprompt
+        (and therefore routes to project-level fail-closed).
+
+    A module with only ``-pre`` warnings means the reprompt fixed
+    everything; a module with both means partial fix; a module with no
+    warnings means the first attempt was already compliant.
+    """
+    if runtime_mode != "generic":
+        return luau_source, []
+
+    from converter.runtime_contract import verify_module
+
+    initial = verify_module(luau_source)
+    if initial.ok:
+        return luau_source, []
+
+    # Record the pre-reprompt violations as ``-pre`` warnings before the
+    # reprompt has a chance to fix them. They survive even on a
+    # successful reprompt so the spike can measure delta.
+    pre_warnings = [
+        f"contract-verifier-pre (rule {v.rule}, line {v.line}): {v.message}"
+        for v in initial.violations
+    ]
+
+    violations_text = _format_contract_violations(initial.violations)
+    user_msg = _contract_reprompt_user_message(
+        csharp_source, luau_source, violations_text,
+    )
+    new_text = reprompt_call(user_msg)
+    if not new_text:
+        # Backend reprompt failed (e.g. CLI unavailable, API error). Keep
+        # the original output and surface every violation as a post-
+        # warning too -- backend failure is operationally equivalent to
+        # "reprompt didn't fix anything".
+        return luau_source, pre_warnings + [
+            f"contract-verifier (rule {v.rule}, line {v.line}): {v.message}"
+            for v in initial.violations
+        ]
+
+    new_luau = _strip_code_fences(new_text)
+    if not new_luau:
+        return luau_source, pre_warnings + [
+            f"contract-verifier (rule {v.rule}, line {v.line}): {v.message}"
+            for v in initial.violations
+        ]
+
+    second = verify_module(new_luau)
+    if second.ok:
+        # Reprompt fixed everything. Pre-warnings are still surfaced so
+        # the spike can count "reprompt-rescued" modules separately from
+        # "first-attempt clean" modules.
+        return new_luau, pre_warnings
+    # Still failing after one reprompt -- per design doc this routes to
+    # project-wide legacy fallback. Carry the remaining violations as
+    # ``contract-verifier`` warnings; the orchestrator decides.
+    return new_luau, pre_warnings + [
+        f"contract-verifier (rule {v.rule}, line {v.line}): {v.message}"
+        for v in second.violations
+    ]
+
+
 def _ai_transpile(
     csharp_source: str,
     api_key: str,
@@ -989,6 +1490,7 @@ def _ai_transpile(
     class_name: str = "",
     script_type: str = "Script",
     project_context: str = "",
+    runtime_mode: RuntimeMode = "legacy",
 ) -> tuple[str, float, list[str]]:
     """Transpile C# source to Luau using the Claude API.
 
@@ -999,6 +1501,9 @@ def _ai_transpile(
         class_name: Name of the C# class being transpiled.
         script_type: Target script type (Script, LocalScript, ModuleScript).
         project_context: Additional context about the project (classes, dependencies).
+        runtime_mode: ``"legacy"`` selects ``_AI_SYSTEM_PROMPT`` (the
+            byte-frozen legacy prompt). ``"generic"`` selects
+            ``_GENERIC_RUNTIME_PROMPT`` (Pieces 1+6 host contract).
 
     Returns:
         Tuple of (luau_source, confidence, warnings).
@@ -1009,7 +1514,7 @@ def _ai_transpile(
     warnings: list[str] = []
 
     # Check cache first (include system prompt hash so prompt changes invalidate cache).
-    _prompt_hash = hashlib.sha256(_AI_SYSTEM_PROMPT.encode()).hexdigest()[:16]
+    system_prompt, _prompt_hash = _select_prompt(runtime_mode)
     cache_key = _ai_cache_key(
         csharp_source=csharp_source,
         class_name=class_name,
@@ -1025,7 +1530,17 @@ def _ai_transpile(
         cached_errors = _luau_syntax_check(luau_cached)
         if not cached_errors:
             log.debug("AI transpilation cache hit for %s (lint clean)", cache_key[:12])
-            return luau_cached, cached["confidence"], cached.get("warnings", [])
+            cached_warnings = list(cached.get("warnings", []))
+            # Generic-runtime contract verifier: re-run on cache hit so a
+            # verifier bugfix (or rule change) invalidates the stored
+            # contract-warning tags. The cached Luau is still valid -- it
+            # IS the AI's post-reprompt output -- but the warning summary
+            # may reflect a stale verifier verdict.
+            if runtime_mode == "generic":
+                cached_warnings = _refresh_contract_warnings(
+                    luau_cached, cached_warnings,
+                )
+            return luau_cached, cached["confidence"], cached_warnings
         else:
             log.info("  [%s] Cache hit but %d syntax error(s) — re-transpiling",
                      class_name, len(cached_errors))
@@ -1059,7 +1574,7 @@ def _ai_transpile(
         response = client.messages.create(
             model=model,
             max_tokens=ANTHROPIC_MAX_TOKENS,
-            system=_AI_SYSTEM_PROMPT,
+            system=system_prompt,
             messages=[
                 {
                     "role": "user",
@@ -1085,6 +1600,31 @@ def _ai_transpile(
         luau_source, class_name=class_name, original_csharp=csharp_source,
     )
     warnings.extend(lint_warnings)
+
+    # Generic-runtime contract verify + one-shot reprompt. Reuses the same
+    # Anthropic API client + system prompt; only the user message changes
+    # to include violation feedback.
+    def _api_reprompt(reprompt_user_msg: str) -> str | None:
+        try:
+            resp = client.messages.create(
+                model=model,
+                max_tokens=ANTHROPIC_MAX_TOKENS,
+                system=system_prompt,
+                messages=[{"role": "user", "content": reprompt_user_msg}],
+            )
+        except Exception as exc:  # pragma: no cover - backend failure path
+            log.warning("Contract reprompt API call failed: %s", exc)
+            return None
+        text = ""
+        for block in resp.content:
+            if hasattr(block, "text"):
+                text += block.text
+        return text or None
+
+    luau_source, contract_warnings = _verify_and_reprompt(
+        luau_source, csharp_source, runtime_mode, _api_reprompt,
+    )
+    warnings.extend(contract_warnings)
 
     # AI transpilation gets a baseline confidence based on output quality.
     confidence = 0.75
@@ -1156,11 +1696,15 @@ def _claude_cli_transpile(
     class_name: str = "",
     script_type: str = "Script",
     project_context: str = "",
+    runtime_mode: RuntimeMode = "legacy",
 ) -> tuple[str, float, list[str]]:
     """Transpile C# to Luau by invoking Claude Code CLI.
 
     Requires 'claude' to be on PATH. No API key needed since Claude Code
-    handles its own authentication.
+    handles its own authentication. ``runtime_mode`` selects the system
+    prompt symmetric to ``_ai_transpile`` -- the cache key includes the
+    selected prompt's hash, so generic and legacy outputs occupy
+    disjoint cache namespaces.
 
     Returns:
         Tuple of (luau_source, confidence, warnings).
@@ -1170,7 +1714,7 @@ def _claude_cli_transpile(
     warnings: list[str] = []
 
     # Check cache first (include class_name, script_type, and system prompt hash in key).
-    _prompt_hash = hashlib.sha256(_AI_SYSTEM_PROMPT.encode()).hexdigest()[:16]
+    system_prompt, _prompt_hash = _select_prompt(runtime_mode)
     cache_key = _ai_cache_key(
         csharp_source=csharp_source,
         class_name=class_name,
@@ -1186,7 +1730,12 @@ def _claude_cli_transpile(
         cached_errors = _luau_syntax_check(luau_cached)
         if not cached_errors:
             log.debug("Claude CLI cache hit for %s (lint clean)", cache_key[:12])
-            return luau_cached, cached["confidence"], cached.get("warnings", [])
+            cached_warnings = list(cached.get("warnings", []))
+            if runtime_mode == "generic":
+                cached_warnings = _refresh_contract_warnings(
+                    luau_cached, cached_warnings,
+                )
+            return luau_cached, cached["confidence"], cached_warnings
         else:
             log.info("  [%s] Cache hit but %d syntax error(s) — re-transpiling",
                      class_name, len(cached_errors))
@@ -1210,12 +1759,12 @@ def _claude_cli_transpile(
         context += f"\n{project_context}"
 
     prompt = (
-        f"{_AI_SYSTEM_PROMPT}\n{context}\n\n"
+        f"{system_prompt}\n{context}\n\n"
         f"Convert this Unity C# script to Roblox Luau:\n\n"
         f"```csharp\n{csharp_source}\n```"
     )
 
-    claude_timeout = 600
+    claude_timeout = CLAUDE_CLI_TIMEOUT_SECONDS
     try:
         result = subprocess.run(
             [claude_path, "-p", prompt, "--output-format", "text"],
@@ -1240,6 +1789,27 @@ def _claude_cli_transpile(
         luau_source, class_name=class_name, original_csharp=csharp_source,
     )
     warnings.extend(lint_warnings)
+
+    # Generic-runtime contract verify + one-shot reprompt. The reprompt
+    # path mirrors the API backend: same CLI, same system prompt, only
+    # the user message differs to carry violation feedback.
+    def _cli_reprompt(reprompt_user_msg: str) -> str | None:
+        cli_prompt = f"{system_prompt}\n\n{reprompt_user_msg}"
+        try:
+            r = subprocess.run(
+                [claude_path, "-p", cli_prompt, "--output-format", "text"],
+                capture_output=True, text=True, timeout=claude_timeout,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):  # pragma: no cover
+            return None
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        return r.stdout
+
+    luau_source, contract_warnings = _verify_and_reprompt(
+        luau_source, csharp_source, runtime_mode, _cli_reprompt,
+    )
+    warnings.extend(contract_warnings)
 
     # Score confidence.
     confidence = 0.75

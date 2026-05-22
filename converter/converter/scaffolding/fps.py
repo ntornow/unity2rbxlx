@@ -156,6 +156,16 @@ local MAX_PITCH = math.rad(80)
 local camera = workspace.CurrentCamera
 camera.CameraType = Enum.CameraType.Scriptable
 
+-- E2E test input channel. See docs/E2E_INPUT_CHANNEL.md.
+-- Production-safe: when no test is running, the attributes are unset
+-- (nil -> coerced to 0) so this block is a no-op and updateCamera()
+-- behaves identically to "real mouse delta only". When the /e2e-test
+-- skill is driving the session, it bumps workspace.E2EMouseSeq + sets
+-- the delta values *before* a frame; the client acks via
+-- workspace.E2EMouseAckSeq so each bump is consumed exactly once
+-- (ack lives in an attribute, not an upvalue, so it survives script
+-- reloads and matches the coherence-pack-injected form for AI scripts).
+
 local function updateCamera()
 	local character = player.Character
 	if not character then return end
@@ -163,6 +173,13 @@ local function updateCamera()
 	if not head then return end
 
 	local delta = UserInputService:GetMouseDelta()
+	local seq = workspace:GetAttribute("E2EMouseSeq") or 0
+	if seq > (workspace:GetAttribute("E2EMouseAckSeq") or 0) then
+		workspace:SetAttribute("E2EMouseAckSeq", seq)
+		local ex = workspace:GetAttribute("E2EMouseDeltaX") or 0
+		local ey = workspace:GetAttribute("E2EMouseDeltaY") or 0
+		delta = Vector2.new(delta.X + ex, delta.Y + ey)
+	end
 	yawAngle = yawAngle - delta.X * SENSITIVITY
 	pitchAngle = math.clamp(pitchAngle - delta.Y * SENSITIVITY, -MAX_PITCH, MAX_PITCH)
 

@@ -1051,6 +1051,12 @@ def _emit_screen_gui(b: _LuauBuilder, gui: RbxScreenGui) -> None:
         b.line("g.ResetOnSpawn=true")
     else:
         b.line("g.ResetOnSpawn=false")
+    # Mirror the rbxlx_writer's AttributesSerialize emission: under the
+    # headless place builder, attributes only land in the live place when
+    # we issue ``SetAttribute`` calls explicitly. Without this, the PR2
+    # ``_SceneRuntimeId`` (and any CanvasScaler reference resolution
+    # attributes) silently drop from luau-built places.
+    _emit_attributes(b, gui.attributes or {}, "g")
     for elem in gui.elements:
         _emit_ui_element(b, elem, "g")
     b.line("g.Parent=SG")
@@ -1097,6 +1103,9 @@ def _emit_ui_element(b: _LuauBuilder, elem: RbxUIElement, parent_var: str) -> No
             b.line(f"lay.CellSize=UDim2.new(0,{cs[0]},0,{cs[1]})")
             b.line(f"lay.CellPadding=UDim2.new(0,{elem.layout_padding},0,{elem.layout_padding})")
         b.line(f"lay.Parent={var}")
+    # Emit attributes (e.g. PR2 ``_SceneRuntimeId``, ``_OnClick`` button
+    # wiring) so the headless builder matches rbxlx_writer's UI surface.
+    _emit_attributes(b, elem.attributes or {}, var)
     for child in elem.children:
         _emit_ui_element(b, child, var)
     b.line(f"{var}.Parent={parent_var}")

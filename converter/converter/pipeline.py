@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, cast
 
 import config as _config
 from config import (
@@ -40,6 +40,12 @@ log = logging.getLogger(__name__)
 PHASES: list[str] = [
     "parse",
     "extract_assets",
+    # Plan the scene runtime artifact off parsed scenes + prefabs before
+    # any script-touching phase runs. Inert by default in PR1 — only the
+    # planner data lands in conversion_plan.json; the legacy transpile
+    # path doesn't consume it. PR3a opts in when ``--scene-runtime=generic``
+    # is requested.
+    "plan_scene_runtime",
     "moderate_assets",
     "upload_assets",
     "resolve_assets",
@@ -93,6 +99,12 @@ class PipelineState:
 
     guid_index: GuidIndex | None = None
     parsed_scene: ParsedScene | None = None
+    # All scenes parsed by the multi-scene driver before
+    # ``plan_scene_runtime`` runs — the planner needs every scene in one
+    # call so the per-scene namespacing in the artifact is consistent. In
+    # single-scene mode this stays empty and the planner reads from
+    # ``parsed_scene`` instead.
+    all_parsed_scenes: list[ParsedScene] = field(default_factory=list)
     asset_manifest: AssetManifest | None = None
     material_mappings: dict[str, MaterialMapping] = field(default_factory=dict)
     transpilation_result: TranspilationResult | None = None
@@ -477,11 +489,29 @@ class Pipeline:
 
         log.info("[multi] Found %d scenes to convert", len(scene_paths))
 
-        # Shared phases: extract + upload assets, materials, scripts, animations
-        # Use the first scene for initial parse (needed for asset extraction)
-        self.ctx.selected_scene = str(scene_paths[0])
+        # Parse EVERY scene up front. The plan_scene_runtime phase below
+        # needs the full set in one call so the per-scene namespacing in
+        # the artifact is consistent, and the per-scene loop further down
+        # gets to reuse the parsed result instead of re-parsing. Pre-PR1
+        # only the first scene was parsed before shared phases ran; that
+        # made the planner blind to every other scene's MonoBehaviours.
         from unity.scene_parser import parse_scene
-        self.state.parsed_scene = parse_scene(scene_paths[0])
+        all_parsed: list[ParsedScene] = []
+        for scene_path in scene_paths:
+            try:
+                all_parsed.append(parse_scene(scene_path))
+            except Exception as exc:
+                log.warning("[multi] Skipping unparseable %s: %s",
+                            scene_path.name, exc)
+        if not all_parsed:
+            log.warning("[multi] All scenes failed to parse")
+            return self.ctx
+        self.state.all_parsed_scenes = all_parsed
+        # Pre-select the first parseable scene as the "current" parsed
+        # scene for shared phases that consume a single scene
+        # (extract_assets reads textures referenced by it).
+        self.state.parsed_scene = all_parsed[0]
+        self.ctx.selected_scene = str(all_parsed[0].scene_path)
         self.ctx.total_game_objects = len(self.state.parsed_scene.all_nodes)
 
         # Run shared phases. ``resolve_assets`` belongs here too: without
@@ -490,23 +520,33 @@ class Pipeline:
         # the multi-scene path used to silently skip resolution and
         # produced visibly broken places. ``resolve_assets`` no-ops when
         # ``--no-upload`` is set or no universe/place IDs are configured.
-        for phase in ["extract_assets", "upload_assets", "convert_materials",
+        # ``plan_scene_runtime`` sits between extract_assets (which lazy-
+        # loads the prefab library) and transpile_scripts (PR3a will
+        # consume the artifact) — same slot as the single-scene driver.
+        for phase in ["extract_assets", "plan_scene_runtime",
+                       "upload_assets", "convert_materials",
                        "transpile_scripts", "convert_animations",
                        "resolve_assets"]:
             self._run_phase(phase)
 
-        # Per-scene: parse, convert, write
+        # Per-scene: convert, write. Reuses scenes pre-parsed above —
+        # parsing every scene twice was the pre-PR1 status quo and is the
+        # one cost the planner's "all scenes up front" move eliminates.
+        parsed_by_path: dict[str, ParsedScene] = {
+            str(p.scene_path): p for p in all_parsed
+        }
         for scene_path in scene_paths:
             scene_name = scene_path.stem
             log.info("[multi] === Converting scene: %s ===", scene_name)
 
             self.ctx.selected_scene = str(scene_path)
-            try:
-                self.state.parsed_scene = parse_scene(scene_path)
-            except Exception as exc:
-                log.warning("[multi] Failed to parse %s: %s", scene_name, exc)
+            parsed = parsed_by_path.get(str(scene_path))
+            if parsed is None:
+                # Lost a scene to a parse failure above; nothing to convert.
+                log.warning("[multi] Skipping %s — pre-parse missing",
+                            scene_name)
                 continue
-
+            self.state.parsed_scene = parsed
             self.ctx.total_game_objects = len(self.state.parsed_scene.all_nodes)
 
             # Convert scene
@@ -873,6 +913,69 @@ class Pipeline:
         log.info(
             "[extract_assets] Serialized field refs: %d scripts, %d fields",
             len(refs), total,
+        )
+
+    def plan_scene_runtime(self) -> None:
+        """Phase: build the project-level ``scene_runtime`` artifact.
+
+        Reads parsed scenes + the prefab library (lazy-loaded earlier by
+        ``extract_assets``) and emits the deterministic snapshot the host
+        runtime will consume in PR4. The artifact lands on
+        ``self.ctx.scene_runtime`` and round-trips through
+        ``conversion_context.json`` plus the persistence merge inside
+        ``_classify_storage`` so resumes reproduce it verbatim.
+
+        Inert by default in PR1 — only the planner data is written; no
+        legacy phase consumes it. PR3a opts in under
+        ``--scene-runtime=generic``.
+        """
+        from converter.scene_runtime_planner import plan_scene_runtime as _plan
+
+        # ``self.state.parsed_scene`` is the single-scene path; the
+        # multi-scene driver pre-parses every scene into
+        # ``self.state.all_parsed_scenes`` before invoking this phase so a
+        # single planner call sees them all (per-scene namespacing is
+        # already a planner invariant).
+        scenes_attr = getattr(self.state, "all_parsed_scenes", None)
+        scenes: list[ParsedScene]
+        if scenes_attr:
+            scenes = list(scenes_attr)
+        elif self.state.parsed_scene is not None:
+            scenes = [self.state.parsed_scene]
+        else:
+            scenes = []
+
+        if self.state.prefab_library is None:
+            # Multi-scene's pre-extract entry skipped the lazy load; force
+            # it here so prefab subplans are populated. Same fallback the
+            # serialized-field walk takes in ``_extract_serialized_field_refs``.
+            try:
+                from unity.prefab_parser import parse_prefabs
+                self.state.prefab_library = parse_prefabs(self.unity_project_path)
+            except Exception as exc:
+                log.warning(
+                    "[plan_scene_runtime] Could not parse prefabs: %s", exc,
+                )
+
+        artifact = _plan(
+            parsed_scenes=scenes,
+            prefab_library=self.state.prefab_library,
+            guid_index=self.state.guid_index,
+            unity_project_root=self.unity_project_path,
+        )
+        # Persist directly on the context; the structural type belongs to
+        # the planner module (avoids a core→converter dependency).
+        self.ctx.scene_runtime = dict(artifact)
+
+        modules = artifact["modules"]
+        runtime_bearing = sum(
+            1 for m in modules.values() if m.get("runtime_bearing")
+        )
+        log.info(
+            "[plan_scene_runtime] %d modules (%d runtime-bearing), "
+            "%d scene(s), %d prefab(s)",
+            len(modules), runtime_bearing,
+            len(artifact["scenes"]), len(artifact["prefabs"]),
         )
 
     def _compute_fbx_bounding_boxes(self) -> None:
@@ -2207,6 +2310,14 @@ return table.concat(allData, "\\n")'''
             mesh_texture_ids=mesh_texture_ids,
             mesh_hierarchies=mesh_hierarchies,
             fbx_bounding_boxes=fbx_bounding_boxes,
+            unity_project_root=self.unity_project_path,
+            # PR3c: thread the planner artifact + mode through so the
+            # generic-only inactive-retention carve-out in ``_convert_node``
+            # can see which inactive GameObjects the host runtime needs to
+            # bind. Legacy mode passes an unused artifact (the carve-out
+            # gates on mode first), so legacy emit stays byte-identical.
+            scene_runtime=self.ctx.scene_runtime,
+            scene_runtime_mode=self.ctx.scene_runtime_mode,
         )
         # Count all parts recursively (including nested prefab children)
         def _count_parts(parts):
@@ -2230,6 +2341,7 @@ return table.concat(allData, "\\n")'''
         "_bind_scripts_to_parts",
         "_subphase_inject_autogen_scripts",
         "_inject_runtime_modules",
+        "_subphase_inject_scene_runtime",
         "_generate_prefab_packages",
         "_subphase_encode_terrain",
         "_subphase_inject_mesh_loader",
@@ -2307,6 +2419,7 @@ return table.concat(allData, "\\n")'''
         self._bind_scripts_to_parts()
         self._subphase_inject_autogen_scripts()
         self._inject_runtime_modules()
+        self._subphase_inject_scene_runtime()
         self._generate_prefab_packages()
         self._subphase_encode_terrain()
         self._subphase_inject_mesh_loader()
@@ -3305,34 +3418,76 @@ script.Disabled = true
                 category = entry.get("category", "component")
                 sections.setdefault(category, []).append(entry)
 
+        # R5-P1 fix: the scene-runtime cross-domain edge block is a
+        # cross-domain artefact, not a category in ``sections``. Pre-R5
+        # ``_subphase_inject_scene_runtime`` wrote it directly mid-
+        # pipeline, but this writer runs LATER and rewrote the file from
+        # scratch -- silently clobbering the cross-domain block on every
+        # rerun. The fix: ``_subphase_inject_scene_runtime`` stages the
+        # edges on ``ctx.scene_runtime["cross_domain_edges"]`` only, and
+        # the final UNCONVERTED.md write happens here -- the single
+        # source of truth for the file's contents.
+        cross_domain_edges = []
+        scene_runtime_ctx = self.ctx.scene_runtime or {}
+        if isinstance(scene_runtime_ctx, dict):
+            raw_edges = scene_runtime_ctx.get("cross_domain_edges") or []
+            if isinstance(raw_edges, list):
+                cross_domain_edges = [dict(e) for e in raw_edges if isinstance(e, dict)]
+
         out_path = self.output_dir / UNCONVERTED_FILENAME
-        if not sections:
+        if not sections and not cross_domain_edges:
             if out_path.exists():
                 out_path.unlink()
             return
 
-        lines = [
-            "# UNCONVERTED",
-            "",
-            "Features dropped from this specific conversion run. Each "
-            "bullet had no in-policy Roblox equivalent, or required "
-            "source data the converter cannot parse yet. For the static "
-            "catalog of known gaps see `docs/UNSUPPORTED.md`; for roadmap "
-            "items see `TODO.md`.",
-            "",
-        ]
-        for category in sorted(sections):
-            lines.append(f"## {category}")
-            lines.append("")
-            for entry in sections[category]:
-                item = entry.get("item", "?")
-                reason = entry.get("reason", "")
-                lines.append(f"- `{item}` — {reason}")
-            lines.append("")
+        lines: list[str] = []
+        if sections:
+            lines.extend([
+                "# UNCONVERTED",
+                "",
+                "Features dropped from this specific conversion run. Each "
+                "bullet had no in-policy Roblox equivalent, or required "
+                "source data the converter cannot parse yet. For the static "
+                "catalog of known gaps see `docs/UNSUPPORTED.md`; for roadmap "
+                "items see `TODO.md`.",
+                "",
+            ])
+            for category in sorted(sections):
+                lines.append(f"## {category}")
+                lines.append("")
+                for entry in sections[category]:
+                    item = entry.get("item", "?")
+                    reason = entry.get("reason", "")
+                    lines.append(f"- `{item}` — {reason}")
+                lines.append("")
+        elif cross_domain_edges:
+            # No standard unconverted entries, but cross-domain edges
+            # still need a file. Emit a minimal header so the cross-
+            # domain block has context.
+            lines.extend([
+                "# UNCONVERTED",
+                "",
+                "Cross-domain references the host runtime injects ``nil`` "
+                "for at start. See the table below.",
+                "",
+            ])
+
+        if cross_domain_edges:
+            from converter.autogen import render_cross_domain_report
+            report_md = render_cross_domain_report(cross_domain_edges)
+            if report_md:
+                # render_cross_domain_report already terminates with a
+                # newline; splitlines() drops the trailing blank so the
+                # join doesn't double-newline.
+                lines.extend(report_md.rstrip("\n").split("\n"))
+                lines.append("")
+
         out_path.write_text("\n".join(lines), encoding="utf-8")
         log.info(
-            "[write_output] UNCONVERTED.md written (%d entries across %d categories)",
+            "[write_output] UNCONVERTED.md written "
+            "(%d entries across %d categories, %d cross-domain edges)",
             sum(len(v) for v in sections.values()), len(sections),
+            len(cross_domain_edges),
         )
 
     # ------------------------------------------------------------------
@@ -3624,11 +3779,52 @@ script.Disabled = true
             animation_routing = getattr(self.state.animation_result, "routing", {}) or {}
 
         plan_path = self.output_dir / "conversion_plan.json"
+
+        # PR1 merge: the planner artifact stored on ``ctx.scene_runtime``
+        # (and any sticky ``domain_overrides`` an operator edited into a
+        # prior ``conversion_plan.json`` on disk) must survive this
+        # wholesale rewrite. Pre-PR1 ``_classify_storage`` emitted a fixed
+        # 3-key dict that silently dropped anything else.
+        scene_runtime = self._merge_scene_runtime(plan_path)
+
+        # PR3b: stamp per-module ``domain`` / ``container`` / ``module_path``
+        # / ``domain_signals`` once the storage classifier has finalized
+        # every script's ``parent_path``. **Gated on
+        # ``ctx.scene_runtime_mode != "legacy"`` so the legacy emit path
+        # stays byte-identical** (per PR3a's "default output byte-identical"
+        # invariant). The reachability sub-pass mutates RbxScript.parent_path
+        # in service of the contract pipeline -- running it under legacy
+        # would shift script placement for ANY project whose code matches
+        # PR3b's new generic-only client patterns (RenderStepped, etc.)
+        # without an operator opt-in, which is exactly what PR3a's
+        # invariant prohibits.
+        #
+        # Tests can override the gate either by setting
+        # ``ctx.scene_runtime_mode = "generic"`` or, for the narrow
+        # case of probing classify_storage in isolation, by setting
+        # ``scene_runtime["__skip_domain_classifier__"] = True``.
+        if (
+            self.ctx.scene_runtime_mode != "legacy"
+            and scene_runtime.get("modules")
+            and not scene_runtime.get("__skip_domain_classifier__")
+        ):
+            from converter.scene_runtime_domain import (
+                classify_scene_runtime_domains,
+            )
+            report = classify_scene_runtime_domains(
+                cast("dict", scene_runtime),
+                self.state.rbx_place.scripts,
+                dependency_map=self.state.dependency_map or None,
+            )
+            scene_runtime["displaced_instances"] = report["displaced_instances"]
+            scene_runtime["low_confidence_modules"] = report["low_confidence_modules"]
+
         plan_path.write_text(
             _json.dumps({
                 "storage_plan": plan.to_dict(),
                 "script_paths": script_paths,
                 "animation_routing": animation_routing,
+                "scene_runtime": scene_runtime,
             }, indent=2),
             encoding="utf-8",
         )
@@ -3637,6 +3833,57 @@ script.Disabled = true
             len(plan.decisions),
             plan_path.name,
         )
+
+    def _merge_scene_runtime(self, plan_path: Path) -> dict[str, object]:
+        """Compose the ``scene_runtime`` block written into
+        ``conversion_plan.json``.
+
+        Structural sub-blocks (``modules`` / ``scenes`` / ``prefabs``) come
+        from ``ctx.scene_runtime`` — recomputed each run by the
+        ``plan_scene_runtime`` phase. ``domain_overrides`` is **sticky**:
+        if an operator edited it into a prior on-disk plan, the value
+        wins over whatever the planner produced (planner emits ``{}``;
+        PR3b's classifier never touches this key). Unknown keys present
+        on disk are preserved too — forward-compatible with future
+        schema extensions without re-touching every consumer.
+        """
+        import json as _json
+
+        merged: dict[str, object] = dict(self.ctx.scene_runtime or {})
+
+        # On-disk plan may carry a sticky ``domain_overrides`` block from
+        # an operator edit or a previous run. Load it; ignore parse
+        # failures (worst case we lose the override, which is recorded in
+        # ctx.warnings rather than crashing classify_storage).
+        on_disk: dict[str, object] = {}
+        if plan_path.exists():
+            try:
+                raw = _json.loads(plan_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    sr = raw.get("scene_runtime")
+                    if isinstance(sr, dict):
+                        on_disk = cast("dict[str, object]", sr)
+            except Exception as exc:
+                log.debug(
+                    "[classify_storage] scene_runtime merge: "
+                    "ignoring unreadable plan: %s", exc,
+                )
+
+        # Sticky domain_overrides: on-disk value wins when present, even
+        # when empty — operator may have deliberately cleared it.
+        if "domain_overrides" in on_disk:
+            merged["domain_overrides"] = on_disk["domain_overrides"]
+        elif "domain_overrides" not in merged:
+            merged["domain_overrides"] = {}
+
+        # Forward-compat: anything else the on-disk plan carries under
+        # scene_runtime that we don't recompute (future schema additions)
+        # is preserved unless the planner output explicitly overwrites it.
+        for key, value in on_disk.items():
+            if key not in merged:
+                merged[key] = value
+
+        return merged
 
     def _bind_scripts_to_parts(self) -> None:
         """Bind transpiled scripts to their target parts using _ScriptClass attributes.
@@ -3735,47 +3982,83 @@ script.Disabled = true
             ]
             log.info("[write_output] Bound %d scripts to their target parts", bound_count)
 
-        # Disable unbound scripts that depend on script.Parent being a Part/Light/etc.
-        # These scripts are prefab components that couldn't be bound to parts.
-        # In SSS/RS, script.Parent is the service itself, so Position/CFrame/etc. will crash.
+        # Guard unbound scripts whose source actually reads BasePart-only
+        # properties off ``script.Parent`` and end up in a service-typed
+        # container (SSS/RS) where ``script.Parent`` is the service. The
+        # ``requires_part_parent`` field is computed once in
+        # script_coherence._detect_part_parent_requirement so this stage
+        # is a contract check, not a heuristic.
+        #
+        # Replaces a regex-based guess that pattern-matched any script
+        # mentioning ``script.Parent:FindFirstChild``, ``script.Parent.X``,
+        # or ``local x = script.Parent`` — those are generic Roblox
+        # idioms that don't require a BasePart parent, so LocalScripts
+        # routed to PlayerScripts (where ``script.Parent`` is
+        # PlayerScripts, never a BasePart) were silently disabled by
+        # the catch-all guard. The breakage was nondeterministic across
+        # AI transpile runs (latent since commit d31effc, 2026-03-29).
+        # See ``RbxScript.requires_part_parent`` for the rationale.
         import re
-        _parent_part_patterns = [
-            r'script\.Parent\.Position',
-            r'script\.Parent\.CFrame',
-            r'script\.Parent:FindFirstChild',
-            r'script\.Parent\.Touched',
-            r'script\.Parent\.AssemblyLinearVelocity',
-            r'local \w+ = script\.Parent\b',  # alias like `local part = script.Parent`
-        ]
-        # Scripts that already gate on ``script.Parent:IsA(...)`` carry
-        # their own conditional binding (smart-binding animation scripts
-        # do this — see generate_tween_script's prefab_scoped path).
-        # The blanket BasePart guard would short-circuit a Model-targeted
-        # check before it ever runs, breaking the script's own logic.
+        # Self-guarded scripts (smart-binding animation scripts already
+        # gate on ``script.Parent:IsA(...)``) still skip the wrap. The
+        # blanket BasePart guard would short-circuit their own Model
+        # check before it ran.
         _self_guard_patterns = (
             re.compile(r'script\.Parent\s*:\s*IsA\s*\(\s*["\']Model["\']'),
             re.compile(r'script\.Parent\s*:\s*IsA\s*\(\s*["\']BasePart["\']'),
         )
+        # Containers whose ``script.Parent`` is NOT a BasePart but also
+        # not service-typed. Scripts routed here that happen to be
+        # flagged ``requires_part_parent`` are a misconfiguration: they
+        # should have been Part-bound. Don't silently guard them; warn
+        # loudly so the conversion report makes the misroute visible.
+        _NON_PART_PLAYER_CONTAINERS = (
+            "StarterPlayer.StarterPlayerScripts",
+            "StarterPlayer.StarterCharacterScripts",
+            "StarterGui",
+        )
         disabled_count = 0
+        mis_routed_warn_count = 0
         for s in list(self.state.rbx_place.scripts):
             if s.script_type == "ModuleScript":
                 continue
-            needs_parent_part = any(
-                re.search(pat, s.source) for pat in _parent_part_patterns
-            )
-            if not needs_parent_part:
+            if not s.requires_part_parent:
                 continue
             if any(p.search(s.source) for p in _self_guard_patterns):
                 # Self-guarded — let the script make its own decision.
                 continue
-            # Wrap script with a parent type check
+            parent = s.parent_path or ""
+            if any(parent.startswith(prefix) for prefix in _NON_PART_PLAYER_CONTAINERS):
+                # Surfaces in conversion_report.json.warnings so the
+                # misroute is observable, instead of being papered over
+                # by a guard that silently no-ops the entire client.
+                msg = (
+                    f"[write_output] script '{s.name}' is flagged "
+                    f"requires_part_parent but routed to {parent} — "
+                    f"runtime BasePart access will fail. Bind the script "
+                    f"to a Part or relocate it; the guard intentionally "
+                    f"does NOT silently disable client/character scripts."
+                )
+                log.warning(msg)
+                self._add_warning(msg)
+                mis_routed_warn_count += 1
+                continue
+            # Wrap script with the runtime guard — last resort for
+            # genuinely-Part-bound scripts that landed in SSS/RS without
+            # a Part to attach to (unbound prefab components).
             guard = ('-- Guard: this script expects script.Parent to be a BasePart\n'
                      'if not script.Parent:IsA("BasePart") then return end\n\n')
             s.source = guard + s.source
             disabled_count += 1
-            log.debug("[write_output]   Added parent guard to '%s'", s.name)
+            log.debug("[write_output]   Added parent guard to '%s' (parent_path=%s)", s.name, parent)
         if disabled_count:
             log.info("[write_output] Added BasePart parent guards to %d unbound scripts", disabled_count)
+        if mis_routed_warn_count:
+            log.warning(
+                "[write_output] %d script(s) flagged requires_part_parent "
+                "but routed to client/character containers — see warnings above.",
+                mis_routed_warn_count,
+            )
 
     def _generate_prefab_packages(self) -> None:
         """Phase 4.10 — emit referenced prefabs as Models in
@@ -4112,6 +4395,310 @@ script.Disabled = true
 
         if injected:
             log.info("[write_output] Injected %d runtime library modules", injected)
+
+    def _subphase_inject_scene_runtime(self) -> None:
+        """PR4: emit the scene-runtime host runtime + plan + entrypoints.
+
+        Only fires when ``ctx.scene_runtime_mode == "generic"`` and the
+        plan carries at least one runtime-bearing module. Injects four
+        scripts:
+
+          - ``SceneRuntime`` (ReplicatedStorage ModuleScript) -- the
+            host engine from ``converter/runtime/scene_runtime.luau``.
+          - ``SceneRuntimePlan`` (ReplicatedStorage ModuleScript) -- the
+            per-place plan, derived from ``conversion_plan.json``.
+          - ``SceneRuntimeClient`` (StarterPlayerScripts LocalScript) --
+            wires the engine to client services + ``start("client")``.
+          - ``SceneRuntimeServer`` (ServerScriptService Script) --
+            mirrors the client entrypoint for the ``server`` domain.
+
+        Also stamps the conversion-time cross-domain edge report onto
+        ``ctx.scene_runtime`` and appends it to ``UNCONVERTED.md``.
+        The host runtime applies the v1 nil-injection policy at start;
+        the conversion-time emit lets operators see the boundary
+        before they ship the place.
+
+        Idempotent: re-runs (incremental ``--phase write_output``)
+        overwrite previous SceneRuntime* scripts in place.
+        """
+        if self.ctx.scene_runtime_mode != "generic":
+            return
+        if self.state.rbx_place is None:
+            return
+
+        scene_runtime = self.ctx.scene_runtime or {}
+        modules = scene_runtime.get("modules", {})
+        runtime_bearing = [
+            sid for sid, row in modules.items()
+            if row.get("runtime_bearing")
+        ]
+        if not runtime_bearing:
+            log.info(
+                "[write_output] scene-runtime generic mode: no "
+                "runtime-bearing modules; skipping host runtime emit"
+            )
+            return
+
+        from converter.autogen import (
+            generate_scene_runtime_client_entrypoint,
+            generate_scene_runtime_plan_module,
+            generate_scene_runtime_server_entrypoint,
+        )
+        from converter.scene_runtime_domain import compute_cross_domain_edges
+
+        runtime_dir = Path(__file__).parent.parent / "runtime"
+        host_path = runtime_dir / "scene_runtime.luau"
+        existing_names = {s.name for s in self.state.rbx_place.scripts}
+
+        # R3-P2: a user (or earlier converter pass) script named e.g.
+        # ``SceneRuntime`` must NOT be silently displaced by the autogen
+        # emit. Replace only scripts whose source carries the autogen
+        # marker we stamped on prior runs (and the runtime engine source
+        # which we identify by the comment at its top). The marker shape
+        # matches what each generator emits.
+        _AUTOGEN_MARKERS: dict[str, str] = {
+            "SceneRuntime": "-- scene_runtime: PR4 generic host runtime",
+            "SceneRuntimePlan": (
+                "-- SceneRuntimePlan (auto-generated by Unity converter; PR4)"
+            ),
+            "SceneRuntimeClient": (
+                "-- SceneRuntimeClient (auto-generated; "
+                "PR4 scene-runtime host entrypoint)"
+            ),
+            "SceneRuntimeServer": (
+                "-- SceneRuntimeServer (auto-generated; "
+                "PR4 scene-runtime host entrypoint)"
+            ),
+        }
+
+        def _replace_or_add(script: RbxScript) -> None:
+            marker = _AUTOGEN_MARKERS.get(script.name, "")
+            new_scripts: list[RbxScript] = []
+            user_owned = False
+            for s in self.state.rbx_place.scripts:
+                if s.name != script.name:
+                    new_scripts.append(s)
+                    continue
+                # Same-name collision. Drop only if it's a prior autogen
+                # artifact (carries our marker); otherwise keep the
+                # user-owned script and skip the emit.
+                if marker and marker in (s.source or ""):
+                    continue
+                new_scripts.append(s)
+                user_owned = True
+            if user_owned:
+                log.warning(
+                    "[write_output] scene-runtime generic: a non-autogen "
+                    "script named %r already exists; skipping autogen "
+                    "emit to avoid clobbering user-owned content",
+                    script.name,
+                )
+                self.state.rbx_place.scripts = new_scripts
+                return
+            self.state.rbx_place.scripts = new_scripts
+            self.state.rbx_place.scripts.append(script)
+
+        if host_path.exists():
+            host_source = host_path.read_text(encoding="utf-8")
+            _replace_or_add(RbxScript(
+                name="SceneRuntime",
+                source=host_source,
+                script_type="ModuleScript",
+                parent_path="ReplicatedStorage",
+            ))
+        else:
+            log.warning(
+                "[write_output] scene-runtime host runtime missing at %s; "
+                "skipping (the place will fail to bind runtime-bearing "
+                "modules at start)", host_path,
+            )
+            return
+
+        # R2-P1.3 (contract resolution): rewrite asset/SO refs before
+        # embedding the plan. Assets become ``rbxassetid://...``;
+        # ScriptableObjects get a ``guid -> dotted module path`` map the
+        # host runtime consults at ref-resolution time. Both mutations
+        # happen in-place on ``scene_runtime`` so the embedded plan
+        # ModuleScript reflects the final shape.
+        self._build_scriptable_object_module_map(scene_runtime)
+        self._rewrite_scene_runtime_asset_refs(scene_runtime)
+
+        _replace_or_add(generate_scene_runtime_plan_module(
+            cast("dict", scene_runtime),
+        ))
+        _replace_or_add(generate_scene_runtime_client_entrypoint())
+        _replace_or_add(generate_scene_runtime_server_entrypoint())
+
+        edges = compute_cross_domain_edges(
+            cast("dict", scene_runtime),
+        )
+        # R5-P1 fix: store edges on ctx ONLY. The actual UNCONVERTED.md
+        # write is owned by ``_write_unconverted_md`` (single source of
+        # truth for the file). Pre-R5 this subphase wrote the cross-
+        # domain block directly here, but ``_write_unconverted_md``
+        # runs LATER in write_output and rewrites the file from scratch
+        # -- so the mid-pipeline append got clobbered every time. Tests
+        # and downstream consumers still read the edges via
+        # ``ctx.scene_runtime["cross_domain_edges"]``.
+        scene_runtime["cross_domain_edges"] = list(edges)
+        if edges:
+            log.info(
+                "[write_output] scene-runtime generic: %d cross-domain "
+                "edges staged for UNCONVERTED.md", len(edges),
+            )
+        injected_total = 4
+        if "SceneRuntime" in existing_names:
+            injected_total -= 0  # we always replace, so count remains
+        log.info(
+            "[write_output] scene-runtime generic: injected host runtime, "
+            "plan, and entrypoints (%d runtime-bearing modules)",
+            len(runtime_bearing),
+        )
+
+    def _build_scriptable_object_module_map(
+        self, scene_runtime: dict[str, object],
+    ) -> None:
+        """R2-P1.3: build ``scene_runtime.scriptable_objects`` -- a
+        ``guid -> dotted DataModel path`` map covering every emitted SO
+        ModuleScript. The host runtime resolves ``scriptable_object``
+        ref rows by looking the persisted GUID up in this map and
+        requiring the resulting module path.
+
+        Source of truth: ``self.state.scriptable_objects`` (the SO
+        converter result) + ``self.state.guid_index`` (path -> GUID).
+        Container resolves via the SO RbxScript's ``parent_path`` -- the
+        same shape ``_stamp_container_and_path`` writes for runtime-
+        bearing modules.
+
+        Idempotent: rebuilds the map every run; legacy plans that lacked
+        the map still resolve via the runtime's fallback passthrough
+        (returns ``nil`` rather than crashing).
+        """
+        from converter.scriptable_object_converter import (
+            AssetConversionResult,
+            resolve_unique_asset_names,
+        )
+        so_state = getattr(self.state, "scriptable_objects", None)
+        if not isinstance(so_state, AssetConversionResult):
+            return
+        if not so_state.assets:
+            return
+        guid_index = getattr(self.state, "guid_index", None)
+        if guid_index is None:
+            return
+        unique = resolve_unique_asset_names(so_state.assets)
+        # Reverse-lookup: source_path -> guid. Resolved paths in the
+        # GuidIndex may be absolute; the SO converter records the absolute
+        # path too, so reuse ``guid_for_path`` (which normalises via
+        # ``Path.resolve()``) where possible. Build the explicit reverse
+        # map here so a single absolute-vs-relative skew doesn't drop the
+        # entire scriptable_objects map.
+        path_to_guid: dict[Path, str] = {}
+        for guid, entry in guid_index.guid_to_entry.items():
+            path_to_guid[entry.asset_path] = guid
+            try:
+                path_to_guid[entry.asset_path.resolve()] = guid
+            except (OSError, RuntimeError):
+                pass
+        # rbx_place.scripts carries the final parent_path each SO was
+        # routed to by storage_classifier. Build a stem -> parent_path
+        # lookup keyed by the unique-asset-name resolver's stems.
+        place_scripts_by_name: dict[str, str] = {}
+        for script in self.state.rbx_place.scripts:
+            container = getattr(script, "parent_path", None) or "ReplicatedStorage"
+            place_scripts_by_name[script.name] = container
+        so_map: dict[str, str] = {}
+        for asset in so_state.assets:
+            stem = unique.get(id(asset))
+            if not stem:
+                continue
+            guid = path_to_guid.get(asset.source_path)
+            if not guid:
+                try:
+                    guid = path_to_guid.get(asset.source_path.resolve())
+                except (OSError, RuntimeError):
+                    guid = None
+            if not guid:
+                continue
+            container = place_scripts_by_name.get(stem, "ReplicatedStorage")
+            so_map[guid] = f"{container}.{stem}"
+        if so_map:
+            scene_runtime["scriptable_objects"] = so_map
+            log.info(
+                "[write_output] scene-runtime generic: emitted %d "
+                "scriptable_object refs in plan map", len(so_map),
+            )
+
+    def _rewrite_scene_runtime_asset_refs(
+        self, scene_runtime: dict[str, object],
+    ) -> None:
+        """R2-P1.3: rewrite every ``target_kind == "asset"`` reference's
+        ``target_ref`` from raw Unity GUID to ``rbxassetid://...`` using
+        ``ctx.uploaded_assets`` as the source of truth. The contract
+        states asset refs arrive at the runtime in rbxassetid form;
+        pre-fix the planner persisted the GUID and no later pass
+        rewrote it, so module fields backed by sprites/sounds got the
+        literal GUID string instead of a usable asset id.
+
+        Idempotent: refs already in ``rbxassetid://`` form are left
+        untouched. Unresolvable GUIDs (no entry in uploaded_assets) keep
+        the raw GUID so the operator sees the unresolved reference
+        rather than silently dropping the ref.
+        """
+        from core.unity_types import GuidIndex
+        uploaded = self.ctx.uploaded_assets or {}
+        guid_index = getattr(self.state, "guid_index", None)
+        if not uploaded or not isinstance(guid_index, GuidIndex):
+            return
+
+        def _resolve(guid: str) -> str | None:
+            path = guid_index.resolve(guid)
+            if path is None:
+                return None
+            # uploaded_assets is keyed by string (project-relative or
+            # absolute path, depending on the producer). Try the resolved
+            # path string first, then a string-cast pass.
+            for key in (str(path), path.as_posix()):
+                if key in uploaded:
+                    return uploaded[key]
+            return None
+
+        def _rewrite_ref_list(refs: list) -> int:
+            n = 0
+            for ref in refs:
+                if not isinstance(ref, dict):
+                    continue
+                if ref.get("target_kind") != "asset":
+                    continue
+                target = ref.get("target_ref", "")
+                if not isinstance(target, str) or target.startswith("rbxassetid://"):
+                    continue
+                asset_url = _resolve(target)
+                if asset_url:
+                    ref["target_ref"] = asset_url
+                    n += 1
+            return n
+
+        total = 0
+        scenes = scene_runtime.get("scenes", {})
+        if isinstance(scenes, dict):
+            for scene in scenes.values():
+                if isinstance(scene, dict):
+                    refs = scene.get("references", [])
+                    if isinstance(refs, list):
+                        total += _rewrite_ref_list(refs)
+        prefabs = scene_runtime.get("prefabs", {})
+        if isinstance(prefabs, dict):
+            for prefab in prefabs.values():
+                if isinstance(prefab, dict):
+                    refs = prefab.get("references", [])
+                    if isinstance(refs, list):
+                        total += _rewrite_ref_list(refs)
+        if total:
+            log.info(
+                "[write_output] scene-runtime generic: rewrote %d asset "
+                "refs to rbxassetid form", total,
+            )
 
     def _run_phase(self, phase: str) -> None:
         """Execute a single phase with logging and context tracking."""
