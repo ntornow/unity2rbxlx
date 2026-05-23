@@ -1018,16 +1018,26 @@ def _build_modules_table(
             base_by_class[info.class_name] = info.base_class
 
     for script_guid, (stem, class_name, base_class, has_hook) in analyzed.items():
-        # A class is a component if it extends a Unity component base
-        # (directly or transitively) OR it overrides a Unity lifecycle hook
-        # (Awake/Start/Update/...). The lifecycle-hook signal catches
-        # components whose base class lives in an external package/DLL
-        # (e.g. Photon's ``MonoBehaviourPunCallbacks``) that the
-        # project-local inheritance walk can't see -- without it those would
-        # wrongly fall back to legacy ``script.Parent`` mode.
+        # A class is a component if either:
+        #   (1) it extends a known Unity component base (directly or
+        #       transitively via the project-local inheritance walk), OR
+        #   (2) it overrides a Unity lifecycle hook AND has a non-empty
+        #       immediate base class -- a base class the resolver couldn't
+        #       prove is a component (external DLL like Photon's
+        #       ``MonoBehaviourPunCallbacks``, Mirror's ``NetworkBehaviour``
+        #       in an unwalkable package) but the presence of inheritance
+        #       plus a lifecycle hook is strong enough evidence to route
+        #       through the host contract.
+        #
+        # The ``base_class != ""`` guard is what blocks the original false-
+        # positive from the first pass (Codex P2): plain helper classes
+        # like ``class Stopwatch { void Start() {} }`` -- no base, just a
+        # method that happens to be named ``Start`` -- were being forced
+        # through the host-bound generic contract. Requiring inheritance
+        # rules them out without giving up the external-base case.
         is_component = (
             _resolves_to_component(class_name, base_class, base_by_class)
-            or has_hook
+            or (has_hook and base_class != "")
         )
         modules[script_guid] = {
             "stem": stem,

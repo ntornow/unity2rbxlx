@@ -177,6 +177,35 @@ local function logWarn(...)
 end
 
 local function servicesFor(plan, modules, instances)
+    -- Production stamps cloned descendants' ``_SceneRuntimeId`` per
+    -- placement so the runtime's read paths (``getInstanceId`` -> the
+    -- component maps) stay distinct across multiple clones of the same
+    -- prefab. The harness instances use a ``_sceneRuntimeId`` field
+    -- instead of a real Roblox attribute; install ``SetAttribute`` /
+    -- ``GetAttribute`` hooks on every supplied instance so production
+    -- stamp calls mirror through to the field. Tests that pre-define
+    -- their own SetAttribute keep it (we only fill in the gap).
+    for _id, inst in pairs(instances) do
+        if type(inst) == "table" then
+            if inst.SetAttribute == nil then
+                inst.SetAttribute = function(self, name, value)
+                    if name == "_SceneRuntimeId" then
+                        self._sceneRuntimeId = value
+                    else
+                        self["_attr_" .. tostring(name)] = value
+                    end
+                end
+            end
+            if inst.GetAttribute == nil then
+                inst.GetAttribute = function(self, name)
+                    if name == "_SceneRuntimeId" then
+                        return self._sceneRuntimeId
+                    end
+                    return self["_attr_" .. tostring(name)]
+                end
+            end
+        end
+    end
     return {
         task = task,
         warn = logWarn,
@@ -2778,6 +2807,108 @@ class TestScenePrefabPlacementBoot:
             assert(order[2] == "OnEnable", "OnEnable second")
             assert(order[3] == "Start", "Start last")
             assert(touchedWired, "Touched connection must wire in Start")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+    def test_multi_placement_setactive_routes_to_correct_clone(self):
+        # Codex P1 round 2 regression test (behavioural, not shape-only).
+        # Two placements of the same prefab share a prefab-local
+        # ``game_object_id`` ("pfb1:1"). Without per-placement namespacing
+        # on BOTH the write side and the read side, ``setActive`` on
+        # placement-B's clone silently no-ops because the lookup misses
+        # the bucket that was keyed by the bare prefab-local id. After
+        # the per-instance ``_SceneRuntimeId`` re-stamp, each clone gets
+        # its own bucket and ``setActive(B)`` toggles only B's state.
+        scenario = textwrap.dedent("""\
+            local awakes = 0
+            local Toggle = {} ; Toggle.__index = Toggle
+            function Toggle.new(_) return setmetatable({}, Toggle) end
+            function Toggle:Awake() awakes = awakes + 1 end
+            local plan = {
+                modules = {tog = {stem = "Toggle", runtime_bearing = true,
+                                  module_path = "x", domain = "server"}},
+                scenes = {},
+                prefabs = {
+                    ["pfb1"] = {
+                        name = "Tog",
+                        instances = {{instance_id = "pfb1:1", script_id = "tog",
+                                      game_object_id = "pfb1:1", active = true,
+                                      enabled = true, config = {}}},
+                        references = {},
+                        lifecycle_order = {"pfb1:1"},
+                    },
+                },
+                scene_prefab_placements = {
+                    {placement_id = "PA", prefab_id = "pfb1",
+                     active = true, enabled = true},
+                    {placement_id = "PB", prefab_id = "pfb1",
+                     active = true, enabled = true},
+                },
+                domain_overrides = {},
+            }
+            -- One instance per placement; both stamped with the
+            -- prefab-local SRI at the start. SetAttribute mirrors into
+            -- _sceneRuntimeId so production stamping is observable in
+            -- the harness (servicesFor installs this for instances in
+            -- its passed-in table, but this test wires workspaceFind
+            -- directly so we install per-instance).
+            local function _mkInst(name)
+                local i = {Name = name, _sceneRuntimeId = "pfb1:1",
+                           _children = {}, _builtins = {}}
+                i.SetAttribute = function(self, k, v)
+                    if k == "_SceneRuntimeId" then self._sceneRuntimeId = v end
+                end
+                i.GetAttribute = function(self, k)
+                    if k == "_SceneRuntimeId" then return self._sceneRuntimeId end
+                end
+                return i
+            end
+            local instA = _mkInst("A")
+            local instB = _mkInst("B")
+            -- ``workspaceFind`` returns the next un-bound clone whose
+            -- attribute matches the requested raw id. The runtime's
+            -- per-placement stamp re-keys the attribute after binding,
+            -- so the next placement's lookup naturally skips the
+            -- already-stamped clone.
+            local bound = {}
+            local services = servicesFor(plan, {tog = Toggle}, {})
+            services.workspaceFind = function(rawId)
+                for _, cand in ipairs({instA, instB}) do
+                    if not bound[cand] and cand._sceneRuntimeId == rawId then
+                        bound[cand] = true
+                        return cand
+                    end
+                end
+                return nil
+            end
+            local engine = SceneRuntime.new(services, plan)
+            engine:start("server")
+            runDeferred()
+            assert(awakes == 2, "both placements must boot a Toggle (got " ..
+                tostring(awakes) .. ")")
+            -- After binding, each instance carries its own namespaced
+            -- SRI ("PA:pfb1:1" vs "PB:pfb1:1") and the maps are keyed
+            -- on those distinct strings. setActive(instB, false) must
+            -- write to instB's bucket only -- the proof is that the
+            -- meta map for instB's component flips while instA's stays
+            -- live and active.
+            assert(instA._sceneRuntimeId == "PA:pfb1:1",
+                "instA must be re-stamped with placement A's namespace; got " ..
+                tostring(instA._sceneRuntimeId))
+            assert(instB._sceneRuntimeId == "PB:pfb1:1",
+                "instB must be re-stamped with placement B's namespace; got " ..
+                tostring(instB._sceneRuntimeId))
+            -- Distinct map buckets prove the read side resolves
+            -- correctly per placement.
+            local listA = engine._componentsByGameObject["PA:pfb1:1"]
+            local listB = engine._componentsByGameObject["PB:pfb1:1"]
+            assert(listA and #listA == 1, "placement A must own its own bucket")
+            assert(listB and #listB == 1, "placement B must own its own bucket")
+            assert(listA[1] ~= listB[1],
+                "placements must have distinct component instances")
             print("OK")
         """)
         rc, out, err = _run_scenario(scenario)

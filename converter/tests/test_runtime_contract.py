@@ -731,6 +731,75 @@ class TestRuleHScriptParent:
         )
         _assert_clean(src)
 
+    def test_shadow_in_one_function_does_not_mask_other_function(self):
+        # Codex P3 round 1: a harmless ``local script`` in one method must
+        # NOT suppress a real ``script.Parent`` global access in a different
+        # method -- the shadow leaves scope at the function's ``end``.
+        src = COMPLIANT.replace(
+            "function Class:Awake()\nend",
+            "function Class:Awake()\n    local script = self.config\n"
+            "    local cfg = script.Field\nend",
+        ).replace(
+            "function Class:Start()\nend",
+            "function Class:Start()\n    local p = script.Parent\nend",
+        )
+        _assert_rule(src, "h")
+
+    def test_module_level_shadow_suppresses_everywhere(self):
+        # A top-level ``local script`` stays in scope for every function in
+        # the module, so any ``script.Parent`` within is field access on
+        # the shadow.
+        src = COMPLIANT.replace(
+            "local Class = {}",
+            "local script = nil\nlocal Class = {}",
+        ).replace(
+            "function Class:Awake()\nend",
+            "function Class:Awake()\n    local p = script.Parent\nend",
+        )
+        _assert_clean(src)
+
+    def test_shadow_in_if_branch_does_not_mask_sibling_branch(self):
+        # Locals declared in a ``then`` branch are out of scope in ``else``
+        # -- the shadow must not bleed across the branch boundary.
+        src = COMPLIANT.replace(
+            "function Class:Awake()\nend",
+            "function Class:Awake()\n    if self.flag then\n"
+            "        local script = self.config\n"
+            "    else\n"
+            "        local p = script.Parent\n"
+            "    end\nend",
+        )
+        _assert_rule(src, "h")
+
+    def test_repeat_local_shadow_covers_until_condition(self):
+        # Codex P3 round 2: locals declared inside a ``repeat`` block are
+        # still in scope for the ``until`` condition expression. The walker
+        # must NOT pop the repeat scope on ``until`` itself -- doing so
+        # would flag the ``script.Parent`` in the condition as a violation
+        # and (because rule h is fail-closed) sink the whole conversion.
+        src = COMPLIANT.replace(
+            "function Class:Awake()\nend",
+            "function Class:Awake()\n    repeat\n"
+            "        local script = self.config\n"
+            "        wait()\n"
+            "    until script.Parent\nend",
+        )
+        _assert_clean(src)
+
+    def test_repeat_local_shadow_pops_after_until_line(self):
+        # The repeat scope DOES end after the until-condition: a
+        # ``script.Parent`` on the line(s) following ``until`` is no longer
+        # shadowed by the in-repeat local.
+        src = COMPLIANT.replace(
+            "function Class:Awake()\nend",
+            "function Class:Awake()\n    repeat\n"
+            "        local script = self.config\n"
+            "        wait()\n"
+            "    until true\n"
+            "    local p = script.Parent\nend",
+        )
+        _assert_rule(src, "h")
+
 
 # ---------------------------------------------------------------------------
 # Luau if-EXPRESSION handling in the depth tracker (e2e regression).

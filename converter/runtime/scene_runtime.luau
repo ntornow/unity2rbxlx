@@ -224,6 +224,16 @@ function SceneRuntime.new(services, plan)
 	-- down without re-walking).
 	self._prefabClones = {}
 
+	-- Monotonic counter for runtime-spawn placement ids. Each
+	-- ``instantiatePrefab`` mints ``_rt_<seq>`` and stamps every cloned
+	-- descendant's ``_SceneRuntimeId`` with that prefix so internal map
+	-- keys (``_componentsByGameObject``, ``_goActiveSelf``, ...) and the
+	-- read-path resolvers (``services.getInstanceId`` / the cascade
+	-- helpers) agree on a per-placement identity. Without this the
+	-- prefab-local goid collides across placements and ``setActive`` /
+	-- ``destroy`` on the second clone silently no-ops.
+	self._rtPlacementSeq = 0
+
 	-- FixedUpdate accumulator.
 	self._fixedStep = services.fixedStep or (1 / 50)
 	self._fixedAccum = 0
@@ -1527,27 +1537,69 @@ end
 -- the same global lookup the scene boot path uses. For a SINGLE placement
 -- this returns the one correct clone descendant (duplicate-placement
 -- identity is tier 2).
-function SceneRuntime:_constructPrefabClone(clone, prefab, prefab_id, includeScriptId, externalRefs)
+-- Compose a placement-scoped GameObject id from a prefab-local one.
+-- Returns ``placement_id .. ":" .. goid`` when both are present and non-empty;
+-- otherwise returns ``goid`` unchanged. Centralised so every read AND write
+-- site agrees on the encoding (the round-1 fix only namespaced writes and
+-- left ``setActive`` / ``destroy`` to look up by the raw goid, silently
+-- no-opping on multi-placement clones -- Codex P1 round 2).
+local function _idWithPlacement(placement_id, goid)
+	if placement_id ~= nil and placement_id ~= "" and goid ~= nil then
+		return placement_id .. ":" .. goid
+	end
+	return goid
+end
+
+function SceneRuntime:_constructPrefabClone(clone, prefab, prefab_id, includeScriptId, externalRefs, placement_id)
 	-- Build a per-instance map for the prefab subplan; references are
 	-- prefab-local so the same logic applies as for scenes.
+	--
+	-- ``placement_id`` namespaces every prefab-local game_object_id used
+	-- in this construction. The Roblox lookup goes by the prefab-local
+	-- (un-namespaced) id BEFORE stamping -- after we find the live clone
+	-- descendant, we SetAttribute its ``_SceneRuntimeId`` to the
+	-- namespaced id so the runtime's read paths (``getInstanceId`` ->
+	-- ``_componentsByGameObject`` / ``_goActiveSelf`` / ``_goParentId``)
+	-- all agree on this clone's identity. The next placement's iteration
+	-- of the SAME prefab_id then sees the previous clone's attribute
+	-- mismatch and skips it, binding to a different workspace clone.
+	-- A nil/empty placement_id is a no-op for stamping -- preserves
+	-- legacy single-placement / harness behaviour.
 	local componentByInstanceId = {}
 	local componentList = {}
 	local instanceById = {}
 	for _, inst in ipairs(prefab.instances or {}) do
 		instanceById[inst.instance_id] = inst
 		if (includeScriptId == nil) or includeScriptId[inst.script_id] then
+			local ns_goid = _idWithPlacement(placement_id, inst.game_object_id)
 			-- Map intra-prefab game_object_id to the actual Roblox child via
 			-- the services helper (production: walk by _SceneRuntimeId
 			-- under the clone; harness: pass-through). With no clone root,
-			-- resolve the live placement clone globally by id.
+			-- resolve the live placement clone globally by id. Looks up by
+			-- the un-namespaced id since the workspace attribute has not
+			-- yet been re-stamped at this point.
 			local goInst
 			if clone ~= nil then
 				goInst = self._services.resolveCloneChild(clone, inst.game_object_id)
 			else
 				goInst = self._services.workspaceFind(inst.game_object_id)
 			end
+			-- Re-stamp this single instance's _SceneRuntimeId with the
+			-- namespaced id so every downstream read (getInstanceId,
+			-- collectDescendantIds, ...) returns ns_goid. Per-instance
+			-- (not a one-shot walk) so each placement of the same prefab
+			-- gets its own stamps even when the placements share a
+			-- workspace ancestor walk. Best-effort: harness instances
+			-- without ``SetAttribute`` rely on the mirror hook
+			-- ``servicesFor`` installs.
+			if goInst ~= nil and placement_id ~= nil and placement_id ~= ""
+			   and ns_goid ~= inst.game_object_id then
+				pcall(function()
+					goInst:SetAttribute("_SceneRuntimeId", ns_goid)
+				end)
+			end
 			local comp = self:_buildComponent(
-				inst.script_id, goInst, inst.game_object_id,
+				inst.script_id, goInst, ns_goid,
 				(goInst and goInst.Name) or "", inst.config or {},
 				"prefab", prefab_id)
 			if comp then
@@ -1612,10 +1664,20 @@ function SceneRuntime:instantiatePrefab(prefab_id, parent, cframe, externalRefs)
 	if not clone then return nil end
 	self._prefabClones[clone] = prefab_id
 
+	-- Mint a runtime placement id so this clone's component maps don't
+	-- collide with any other placement of the same prefab (scene-placed or
+	-- another runtime spawn). ``_constructPrefabClone`` re-stamps each
+	-- found descendant's ``_SceneRuntimeId`` to ``placement_id:goid`` so
+	-- the read paths (``setActive`` / ``destroy`` / cascade) -- which all
+	-- resolve via ``getInstanceId`` -> the stamped attribute -- agree on
+	-- this clone's identity.
+	self._rtPlacementSeq = self._rtPlacementSeq + 1
+	local placement_id = "_rt_" .. tostring(self._rtPlacementSeq)
+
 	-- Unfiltered construction (a runtime spawn isn't domain-gated), then
 	-- run the lifecycle as its own batch.
 	local componentList = self:_constructPrefabClone(
-		clone, prefab, prefab_id, nil, externalRefs)
+		clone, prefab, prefab_id, nil, externalRefs, placement_id)
 	self:_runAwakeEnableStart(componentList)
 	return clone
 end
@@ -1814,14 +1876,27 @@ function SceneRuntime:start(domainFilter)
 		local prefab_id = placement.prefab_id
 		local prefab = (self._plan.prefabs or {})[prefab_id]
 		if prefab then
+			local p_placement_id = placement.placement_id or ""
+
+			-- Resolve a workspace clone that no prior placement has bound; the
+			-- scoped ``resolveCloneChild`` walk inside ``_constructPrefabClone``
+			-- then finds the placement's specific sub-Instances. Falls back to
+			-- ``nil`` (workspaceFind path) if no clone is found, preserving
+			-- prior single-instance behaviour.
+			local placement_clone = _findUnboundClonePerPrefab(prefab, prefab_id)
+
 			-- Seed ``_goParentId``/``_goActiveSelf`` for the placement's
 			-- GameObjects, parity with the scene boot pre-pass. Prefab
-			-- instances carry prefab-local parent edges; the placement
-			-- ROOT additionally hangs off the scene parent GameObject so
-			-- the activeInHierarchy walk can reach into the scene tree.
+			-- instances carry prefab-local parent edges that we namespace
+			-- with the placement id so each clone gets its own entries
+			-- (the un-namespaced shape collided across placements); the
+			-- placement ROOT additionally hangs off the scene parent
+			-- GameObject (a scene id, NOT prefab-local) so the
+			-- activeInHierarchy walk can reach into the scene tree.
 			for _, inst in ipairs(prefab.instances or {}) do
 				if includeScriptId[inst.script_id] then
-					local goId = inst.game_object_id
+					local goId = _idWithPlacement(
+						p_placement_id, inst.game_object_id)
 					if goId then
 						if self._goActiveSelf[goId] == nil then
 							self._goActiveSelf[goId] = (inst.active ~= false)
@@ -1830,8 +1905,14 @@ function SceneRuntime:start(domainFilter)
 						local parentId = inst.parent_game_object_id
 						if parentId == nil then
 							-- Prefab root: bind it to the scene parent GO so
-							-- the ancestor walk continues upward.
+							-- the ancestor walk continues upward. The scene
+							-- parent id is NOT prefab-local, so it stays
+							-- un-namespaced.
 							parentId = placement.parent_game_object_id
+						else
+							-- Intra-prefab edge: namespace it to match the
+							-- child's namespaced goId.
+							parentId = _idWithPlacement(p_placement_id, parentId)
 						end
 						if parentId and self._goParentId[goId] == nil then
 							self._goParentId[goId] = parentId
@@ -1840,14 +1921,9 @@ function SceneRuntime:start(domainFilter)
 				end
 			end
 
-			-- Resolve a workspace clone that no prior placement has bound; the
-			-- scoped ``resolveCloneChild`` walk inside ``_constructPrefabClone``
-			-- then finds the placement's specific sub-Instances. Falls back to
-			-- ``nil`` (workspaceFind path) if no clone is found, preserving
-			-- prior single-instance behaviour.
-			local placement_clone = _findUnboundClonePerPrefab(prefab, prefab_id)
 			local componentList = self:_constructPrefabClone(
-				placement_clone, prefab, prefab_id, includeScriptId, nil)
+				placement_clone, prefab, prefab_id, includeScriptId, nil,
+				p_placement_id)
 			self:_runAwakeEnableStart(componentList)
 		end
 	end

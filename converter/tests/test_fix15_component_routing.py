@@ -13,7 +13,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from converter.scene_runtime_planner import _resolves_to_component  # noqa: E402
+from converter.scene_runtime_planner import (  # noqa: E402
+    _resolves_to_component,
+    _build_modules_table,
+)
 from converter.contract_pipeline import (  # noqa: E402
     FailClosed,
     _component_class_paths,
@@ -22,6 +25,7 @@ from converter.contract_pipeline import (  # noqa: E402
 from converter.pipeline import _contract_failure_errors  # noqa: E402
 from converter.code_transpiler import _inert_component_stub  # noqa: E402
 from converter.runtime_contract import verify_module  # noqa: E402
+from core.unity_types import GuidEntry, GuidIndex  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +61,97 @@ class TestResolvesToComponent:
         # A pathological self/mutual cycle must not loop forever.
         base_by_class = {"A": "B", "B": "A"}
         assert not _resolves_to_component("A", "B", base_by_class)
+
+
+# ---------------------------------------------------------------------------
+# is_component_class predicate behavior (Codex P2 round 1 + round 2)
+#
+# The predicate at scene_runtime_planner._build_modules_table line ~1028
+# routes classes to either the host-bound generic contract (component) or
+# the legacy ``script.Parent`` path. Both directions of misclassification
+# are user-visible: a plain helper forced through the generic contract may
+# emit a ModuleScript that throws on require; a real external-base
+# MonoBehaviour forced through legacy emits ``script.Parent`` that throws
+# at runtime. Round-1 tightening fixed the first; round-2 widening
+# (``base_class != ""``) fixed the regression on the second.
+# ---------------------------------------------------------------------------
+
+def _drop_cs(tmp_path: Path, stem: str, source: str) -> tuple[str, GuidEntry]:
+    p = tmp_path / f"{stem}.cs"
+    p.write_text(source, encoding="utf-8")
+    guid = f"guid-{stem.lower()}"
+    return guid, GuidEntry(
+        guid=guid, asset_path=p, relative_path=Path(p.name), kind="script",
+    )
+
+
+def _index_for(entries: list[GuidEntry]) -> GuidIndex:
+    return GuidIndex(
+        project_root=Path("/proj"),
+        guid_to_entry={e.guid: e for e in entries},
+        path_to_guid={e.asset_path.resolve(): e.guid for e in entries},
+    )
+
+
+class TestComponentClassPredicate:
+
+    def test_plain_helper_class_with_start_is_not_component(self, tmp_path):
+        # Codex P2 round 1 catch: ``class Stopwatch { void Start() {} }`` --
+        # a helper with no base whose method just happens to be named
+        # ``Start`` -- must NOT be classified as a Unity component.
+        guid, entry = _drop_cs(tmp_path, "Stopwatch", (
+            "public class Stopwatch {\n"
+            "    public void Start() {}\n"
+            "}\n"
+        ))
+        modules = _build_modules_table(_index_for([entry]), set())
+        assert modules[guid]["is_component_class"] is False
+
+    def test_helper_class_without_hooks_is_not_component(self, tmp_path):
+        # Sanity: no hook, no base -> not a component.
+        guid, entry = _drop_cs(tmp_path, "DamageMath", (
+            "public class DamageMath {\n"
+            "    public static int Compute(int a) { return a; }\n"
+            "}\n"
+        ))
+        modules = _build_modules_table(_index_for([entry]), set())
+        assert modules[guid]["is_component_class"] is False
+
+    def test_direct_monobehaviour_is_component(self, tmp_path):
+        guid, entry = _drop_cs(tmp_path, "Player", (
+            "public class Player : MonoBehaviour {\n"
+            "    void Awake() {}\n"
+            "}\n"
+        ))
+        modules = _build_modules_table(_index_for([entry]), set())
+        assert modules[guid]["is_component_class"] is True
+
+    def test_external_base_with_lifecycle_hook_is_component(self, tmp_path):
+        # Codex P2 round 2 catch: a class inheriting from an EXTERNAL
+        # MonoBehaviour-derived base (e.g. Photon's
+        # MonoBehaviourPunCallbacks, Mirror's NetworkBehaviour in an
+        # unwalkable package) plus a lifecycle hook must still route
+        # through the host-bound generic contract -- the round-1
+        # narrowing (requiring has_unity_api) wrongly dropped these
+        # back into the legacy ``script.Parent`` path.
+        guid, entry = _drop_cs(tmp_path, "LobbyManager", (
+            "public class LobbyManager : MonoBehaviourPunCallbacks {\n"
+            "    void Start() {}\n"
+            "}\n"
+        ))
+        modules = _build_modules_table(_index_for([entry]), set())
+        assert modules[guid]["is_component_class"] is True
+
+    def test_external_base_without_hook_is_not_component(self, tmp_path):
+        # An external base alone is not enough -- without a lifecycle
+        # hook, treat as a plain class (no over-classification).
+        guid, entry = _drop_cs(tmp_path, "Helper", (
+            "public class Helper : SomeExternalClass {\n"
+            "    public void DoStuff() {}\n"
+            "}\n"
+        ))
+        modules = _build_modules_table(_index_for([entry]), set())
+        assert modules[guid]["is_component_class"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -164,3 +259,29 @@ class TestInertComponentStub:
         src = _inert_component_stub("Weird-Name 2", "x")
         assert "local Weird_Name_2 = {}" in src
         assert verify_module(src).ok
+
+    def test_inert_stub_digit_leading_stem_gets_underscore_prefix(self):
+        # Codex P2 round 1: Luau identifiers cannot start with a digit, so
+        # ``2DWater.cs`` must be prefixed (``_2DWater``); the regex-only
+        # verifier silently accepts the invalid identifier and the place
+        # ships a ModuleScript that explodes on require().
+        src = _inert_component_stub("2DWater", "x")
+        assert "local _2DWater = {}" in src
+        assert verify_module(src).ok
+        # Sanity: digit-leading AND non-identifier chars compose correctly.
+        src2 = _inert_component_stub("3D-Effect", "x")
+        assert "local _3D_Effect = {}" in src2
+        assert verify_module(src2).ok
+
+    def test_inert_stub_luau_keyword_stem_gets_underscore_prefix(self):
+        # Codex review round 2: file stems that happen to be Luau reserved
+        # words (``end.cs``, ``do.cs``, ``return.cs``, ...) survive the
+        # non-word sanitize unchanged and emit ``local end = {}`` -- a
+        # syntax error the regex verifier cannot detect. Prefix with ``_``.
+        for kw in ("end", "do", "local", "function", "return", "then",
+                   "else", "if", "for", "while", "repeat", "until",
+                   "break", "continue", "nil", "true", "false",
+                   "and", "or", "not", "in"):
+            src = _inert_component_stub(kw, "x")
+            assert f"local _{kw} = {{}}" in src, kw
+            assert verify_module(src).ok, kw

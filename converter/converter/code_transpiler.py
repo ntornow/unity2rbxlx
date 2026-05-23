@@ -722,6 +722,15 @@ def _is_visual_only_script(script_path: Path, source: str) -> bool:
 
 
 _RE_NON_IDENT = re.compile(r"\W")
+_RE_IDENT_LEADING_DIGIT = re.compile(r"^\d")
+# Luau reserved words (keywords + reserved literals). A file stem that happens
+# to be one of these (e.g. ``end.cs``) emits ``local end = {}`` which is a
+# syntax error -- prepend an underscore so the identifier becomes valid.
+_LUAU_RESERVED: frozenset[str] = frozenset({
+    "and", "break", "continue", "do", "else", "elseif", "end", "false",
+    "for", "function", "if", "in", "local", "nil", "not", "or", "repeat",
+    "return", "then", "true", "until", "while",
+})
 
 
 def _inert_component_stub(stem: str, reason: str) -> str:
@@ -731,8 +740,19 @@ def _inert_component_stub(stem: str, reason: str) -> str:
     The host still ``require``s + instantiates component classes, so the stub
     must return a real class table with a no-op ``new`` / ``Awake`` -- a bare
     ``print(...)`` stub returns nil and both fails the contract's return rule
-    and throws on require. This shape passes every verifier rule (a-h)."""
+    and throws on require. This shape passes every verifier rule (a-h).
+
+    The class name is derived from ``stem`` with three sanitization passes so
+    the emitted ``local <cls> = {}`` is always a valid Luau identifier:
+    (1) non-word chars become ``_`` (``Weird-Name 2`` -> ``Weird_Name_2``);
+    (2) a leading digit gets an ``_`` prefix (``2DWater`` -> ``_2DWater``);
+    (3) a stem that lands on a Luau reserved word gets the same prefix
+    (``end`` -> ``_end``). The verifier is regex-only (no Luau parser) so it
+    cannot catch any of these silently-invalid identifiers downstream.
+    """
     cls = _RE_NON_IDENT.sub("_", stem) or "Stub"
+    if _RE_IDENT_LEADING_DIGIT.match(cls) or cls in _LUAU_RESERVED:
+        cls = "_" + cls
     return (
         f"-- {stem}: {reason} -- inert stub (host-instantiable, no-op).\n"
         f"local {cls} = {{}}\n"

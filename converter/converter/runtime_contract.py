@@ -896,25 +896,89 @@ def _check_gameobject_touch(stripped: str, source: str) -> list[Violation]:
 # skipped entirely.
 # ---------------------------------------------------------------------------
 
-_RE_H_SCRIPT_PARENT = re.compile(r"\bscript\s*\.\s*Parent\b")
-_RE_H_SCRIPT_SHADOWED = re.compile(r"\blocal\s+script\b")
+# Scope-aware token scan: ``script`` shadowed by a ``local`` only suppresses
+# violations within the SAME lexical scope (or an outer scope still in scope).
+# A harmless ``local script = self.config`` inside one function must not mask
+# a real ``script.Parent`` global access elsewhere in the module -- the
+# original module-wide bail was the Codex P3 finding on Fix #15. The walker
+# maintains a stack of scopes (one bool per enclosing block; True means
+# ``script`` is shadowed at this scope) and pushes/pops on Lua block
+# keywords.
+#
+# ``repeat...until`` has a special wrinkle: locals declared inside the
+# ``repeat`` block remain in scope for the ``until`` condition expression.
+# Popping on the ``until`` keyword itself would falsely flag
+# ``repeat local script = ... until script.Parent`` (Codex R2 finding). We
+# defer the pop to the first token whose position is past the end of the
+# until-condition line -- in practice every realistic until-condition fits
+# on a single line, and the safe direction (delaying the pop) errs toward
+# fewer false positives, matching the rule's existing bias.
+_RE_H_TOKENS = re.compile(
+    r"\blocal\s+script\b"
+    r"|\bscript\s*\.\s*Parent\b"
+    r"|\bfunction\b"
+    r"|\bdo\b"
+    r"|\bthen\b"
+    r"|\brepeat\b"
+    r"|\belseif\b"
+    r"|\belse\b"
+    r"|\bend\b"
+    r"|\buntil\b"
+)
 
 
 def _check_script_parent(stripped: str, source: str) -> list[Violation]:
     out: list[Violation] = []
-    if _RE_H_SCRIPT_SHADOWED.search(stripped):
-        return out
-    for m in _RE_H_SCRIPT_PARENT.finditer(stripped):
-        line = source.count("\n", 0, m.start()) + 1
-        out.append(Violation(
-            rule="h",
-            line=line,
-            message=(
-                "``script.Parent`` is the legacy Roblox idiom and does not "
-                "exist for a host-instantiated component module: the class "
-                "table is shared across instances and has no parent edge to "
-                "the GameObject it drives. Reach the instance through "
-                "``self.gameObject`` (and its host helpers) instead."
-            ),
-        ))
+    scopes: list[bool] = [False]  # module scope at index 0
+    # Position past which a pending repeat-scope pop should fire. The pop
+    # is triggered before processing the first token at or beyond this
+    # position (effectively "after the until expression's line").
+    pending_repeat_pop_at: int | None = None
+
+    for m in _RE_H_TOKENS.finditer(stripped):
+        if (pending_repeat_pop_at is not None
+                and m.start() >= pending_repeat_pop_at):
+            if len(scopes) > 1:
+                scopes.pop()
+            pending_repeat_pop_at = None
+
+        tok = m.group(0)
+        if tok.startswith("local"):
+            scopes[-1] = True
+        elif tok.startswith("script"):
+            if any(scopes):
+                continue
+            line = source.count("\n", 0, m.start()) + 1
+            out.append(Violation(
+                rule="h",
+                line=line,
+                message=(
+                    "``script.Parent`` is the legacy Roblox idiom and does not "
+                    "exist for a host-instantiated component module: the class "
+                    "table is shared across instances and has no parent edge to "
+                    "the GameObject it drives. Reach the instance through "
+                    "``self.gameObject`` (and its host helpers) instead."
+                ),
+            ))
+        elif tok in ("function", "do", "then", "repeat"):
+            scopes.append(False)
+        elif tok == "end":
+            if len(scopes) > 1:
+                scopes.pop()
+        elif tok == "until":
+            # Defer pop -- locals declared in the repeat block remain in
+            # scope through the until condition expression. The expression
+            # is taken to end at the next newline (line-based heuristic).
+            if len(scopes) > 1 and pending_repeat_pop_at is None:
+                eol = stripped.find("\n", m.end())
+                pending_repeat_pop_at = eol if eol != -1 else len(stripped)
+        elif tok == "else":
+            if len(scopes) > 1:
+                scopes.pop()
+            scopes.append(False)
+        elif tok == "elseif":
+            if len(scopes) > 1:
+                scopes.pop()
+            # The following ``then`` pushes the new branch scope.
+
     return out
