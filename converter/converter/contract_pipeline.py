@@ -267,6 +267,41 @@ def resolve_requires(
     return out
 
 
+def _apply_require_resolutions(
+    scripts: list[TranspiledScript],
+    resolutions: list[RequireResolution],
+) -> None:
+    """Rewrite ``require("@scene_runtime/<stem>") -> require(<module_path>)``
+    in place on each ``TranspiledScript.luau_source``.
+
+    Only ``reason == "ok"`` rows are applied. Missing-stem / stem-collision
+    rows are left untouched so the orchestrator's fail-closed surface still
+    carries the original literal (and the verifier's downstream signal
+    keeps firing). The single-pass nature of the resolutions list means
+    each ``(script, stem)`` is rewritten at most once -- safe to call
+    after ``resolve_requires`` returns."""
+    resolved_by_script: dict[str, dict[str, str]] = {}
+    for r in resolutions:
+        if r.reason != "ok" or r.resolved_to is None:
+            continue
+        resolved_by_script.setdefault(r.from_script, {})[r.stem] = r.resolved_to
+    for script in scripts:
+        rewrites = resolved_by_script.get(script.source_path)
+        if not rewrites:
+            continue
+        src = script.luau_source
+        for stem, target in rewrites.items():
+            # Match the contract idiom in single OR double quotes; mirror
+            # ``_RE_SCENE_RUNTIME_REQUIRE`` so the resolver and rewriter
+            # never disagree about what counts as a require site.
+            src = re.sub(
+                rf'''require\s*\(\s*['"]@scene_runtime/{re.escape(stem)}['"]\s*\)''',
+                f'require({target})',
+                src,
+            )
+        script.luau_source = src
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -327,6 +362,13 @@ def transpile_with_contract(
     require_resolutions = resolve_requires(
         transpilation.scripts, by_stem, collisions,
     )
+    # Apply OK resolutions back to the script sources. ``resolve_requires``
+    # is inspection-only -- without this rewrite the literal
+    # ``require("@scene_runtime/<stem>")`` ships verbatim to Roblox where
+    # the ``@scene_runtime`` alias fails to resolve. Missing-stem /
+    # collision rows stay verbatim so the verifier's fail-closed signal
+    # carries forward.
+    _apply_require_resolutions(transpilation.scripts, require_resolutions)
 
     # Aggregate fail-closed reasons. Verifier failures are recorded per
     # module via warnings; convert them to FailClosed rows here so the

@@ -1877,13 +1877,57 @@ class Pipeline:
             log.info("[transpile_scripts] Built dependency map: %d scripts with %d cross-references",
                      len(self.state.dependency_map), total_deps)
 
-        self.state.transpilation_result = transpile_scripts(
-            unity_project_path=self.unity_project_path,
-            script_infos=script_infos,
-            use_ai=_config.USE_AI_TRANSPILATION,
-            api_key=_config.ANTHROPIC_API_KEY,
-            serialized_field_refs=self.ctx.serialized_field_refs or None,
-        )
+        if self.ctx.scene_runtime_mode == "generic":
+            # Generic path: route through the contract pipeline so
+            # runtime-bearing MonoBehaviours get the generic prompt,
+            # ModuleScript target flip, verifier + reprompt, and
+            # require-resolution pass. PR3a built the orchestrator;
+            # this wiring completes PR3a's "runtime_mode threaded
+            # through transpiler" deliverable (the legacy entry never
+            # passed ``runtime_mode``, so without this branch every
+            # ``--scene-runtime=generic`` run silently transpiled in
+            # legacy mode and produced non-compliant modules).
+            from converter.contract_pipeline import transpile_with_contract
+            contract_result = transpile_with_contract(
+                unity_project_path=self.unity_project_path,
+                script_infos=script_infos,
+                scene_runtime=self.ctx.scene_runtime,
+                use_ai=_config.USE_AI_TRANSPILATION,
+                api_key=_config.ANTHROPIC_API_KEY,
+                serialized_field_refs=self.ctx.serialized_field_refs or None,
+            )
+            self.state.transpilation_result = contract_result.transpilation
+            # Plumb contract telemetry to ctx so downstream consumers
+            # (PR5 auto-mode fallback decision, post-run reports) can
+            # read it without re-running the orchestrator. ``setdefault``
+            # preserves rows from prior runs in a resume flow; the
+            # generic-mode pipeline only transpiles once per conversion
+            # but resume paths replay the phase.
+            fail_closed_rows = self.ctx.scene_runtime.setdefault(
+                "contract_fail_closed", [],
+            )
+            assert isinstance(fail_closed_rows, list)
+            fail_closed_rows.extend(
+                {"kind": fc.kind, "detail": fc.detail}
+                for fc in contract_result.fail_closed
+            )
+            # ``runtime_bearing_paths`` is a frozenset[Path]; JSON the
+            # ctx serializes through can't carry either type. Store a
+            # sorted list of strings so a resume round-trip is stable.
+            self.ctx.scene_runtime["runtime_bearing_paths"] = sorted(
+                str(p) for p in contract_result.runtime_bearing_paths
+            )
+        else:
+            # Legacy path -- must stay byte-identical to pre-PR3a
+            # behaviour. Do NOT thread ``runtime_mode`` or any other
+            # new kwargs here; legacy emit is a tested invariant.
+            self.state.transpilation_result = transpile_scripts(
+                unity_project_path=self.unity_project_path,
+                script_infos=script_infos,
+                use_ai=_config.USE_AI_TRANSPILATION,
+                api_key=_config.ANTHROPIC_API_KEY,
+                serialized_field_refs=self.ctx.serialized_field_refs or None,
+            )
 
         self.ctx.transpiled_scripts = self.state.transpilation_result.total_transpiled
         log.info(
@@ -2848,11 +2892,40 @@ return table.concat(allData, "\\n")'''
                 for s in self.state.rbx_place.scripts
             )
         )
+        # Generic-runtime mode: PR4's host runtime owns the lifecycle of
+        # every runtime-bearing MonoBehaviour. If the legacy bootstrap
+        # also requires them, their top-level code fires once via the
+        # bootstrap and then ``host.require`` instantiates them again —
+        # double-loading the module AND violating the contract's
+        # "no top-level side effects" rule (the AI emitted side-effect-
+        # free class tables; only the host knows how to wire them).
+        # Under legacy mode ``runtime_bearing_stems`` is empty and this
+        # filter is a no-op, preserving the byte-identical legacy emit
+        # invariant.
+        runtime_bearing_stems: set[str] = set()
+        if self.ctx.scene_runtime_mode == "generic":
+            sr_modules_obj = (self.ctx.scene_runtime or {}).get("modules", {})
+            if isinstance(sr_modules_obj, dict):
+                for module in sr_modules_obj.values():
+                    if not isinstance(module, dict):
+                        continue
+                    if not module.get("runtime_bearing"):
+                        continue
+                    stem = module.get("stem")
+                    if isinstance(stem, str) and stem:
+                        runtime_bearing_stems.add(stem)
         side_effect_modules = []
         for s in self.state.rbx_place.scripts:
             if s.script_type != "ModuleScript":
                 continue
             if not any(_re.search(p, s.source) for p in _side_effect_patterns):
+                continue
+            if s.name in runtime_bearing_stems:
+                log.info(
+                    "[write_output] Skipping bootstrap require of '%s' "
+                    "(runtime-bearing — host runtime owns lifecycle)",
+                    s.name,
+                )
                 continue
             if has_fps_controller and any(
                 _re.search(p, s.source) for p in _anti_fps_patterns

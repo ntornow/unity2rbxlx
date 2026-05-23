@@ -178,6 +178,109 @@ class TestResolveRequires:
 
 
 # ---------------------------------------------------------------------------
+# Require-rewrite (PR3b follow-up): ``resolve_requires`` is inspection-only;
+# ``_apply_require_resolutions`` mutates ``luau_source`` so the literal
+# ``require("@scene_runtime/<stem>")`` never ships to Roblox. The
+# ``@scene_runtime`` alias has no Studio-side definition; without this
+# rewrite the converted place crashes on first require.
+# ---------------------------------------------------------------------------
+
+class TestApplyRequireResolutions:
+    """Regression tests for the inspection -> mutation gap that Codex
+    surfaced on PR #134. The rewriter is invoked from
+    ``transpile_with_contract`` immediately after ``resolve_requires``."""
+
+    def _script_with(
+        self, source: str, source_path: str = "Foo.cs",
+    ) -> TranspiledScript:
+        return TranspiledScript(
+            source_path=source_path,
+            output_filename=Path(source_path).stem + ".luau",
+            csharp_source="",
+            luau_source=source,
+            strategy="ai",
+            confidence=0.9,
+            script_type="ModuleScript",
+        )
+
+    def test_ok_resolutions_rewrite_source(self):
+        from converter.contract_pipeline import _apply_require_resolutions
+        script = self._script_with(
+            'local F = require("@scene_runtime/Foo")\nreturn {}\n'
+        )
+        resolutions = [RequireResolution(
+            from_script="Foo.cs",
+            stem="Foo",
+            resolved_to="ReplicatedStorage.Foo",
+            reason="ok",
+        )]
+        _apply_require_resolutions([script], resolutions)
+        assert script.luau_source == (
+            'local F = require(ReplicatedStorage.Foo)\nreturn {}\n'
+        )
+        assert "@scene_runtime" not in script.luau_source
+
+    def test_missing_stem_unchanged(self):
+        from converter.contract_pipeline import _apply_require_resolutions
+        original = 'local G = require("@scene_runtime/Ghost")\nreturn {}\n'
+        script = self._script_with(original)
+        resolutions = [RequireResolution(
+            from_script="Foo.cs",
+            stem="Ghost",
+            resolved_to=None,
+            reason="missing_stem",
+        )]
+        _apply_require_resolutions([script], resolutions)
+        # The fail-closed signal MUST carry forward to Roblox so the
+        # verifier-equivalent at load time still fires the right error.
+        assert script.luau_source == original
+
+    def test_stem_collision_unchanged(self):
+        from converter.contract_pipeline import _apply_require_resolutions
+        original = 'local U = require("@scene_runtime/Utils")\nreturn {}\n'
+        script = self._script_with(original)
+        resolutions = [RequireResolution(
+            from_script="Foo.cs",
+            stem="Utils",
+            resolved_to=None,
+            reason="stem_collision",
+        )]
+        _apply_require_resolutions([script], resolutions)
+        assert script.luau_source == original
+
+    def test_multiple_requires_per_script(self):
+        from converter.contract_pipeline import _apply_require_resolutions
+        script = self._script_with(
+            'local A = require("@scene_runtime/A")\n'
+            'local B = require("@scene_runtime/B")\n'
+            'return {}\n'
+        )
+        resolutions = [
+            RequireResolution("Foo.cs", "A", "ReplicatedStorage.A", "ok"),
+            RequireResolution("Foo.cs", "B", "ServerScriptService.B", "ok"),
+        ]
+        _apply_require_resolutions([script], resolutions)
+        assert "require(ReplicatedStorage.A)" in script.luau_source
+        assert "require(ServerScriptService.B)" in script.luau_source
+        assert "@scene_runtime" not in script.luau_source
+
+    def test_single_quotes_handled(self):
+        from converter.contract_pipeline import _apply_require_resolutions
+        script = self._script_with(
+            "local F = require('@scene_runtime/Foo')\nreturn {}\n"
+        )
+        resolutions = [RequireResolution(
+            from_script="Foo.cs",
+            stem="Foo",
+            resolved_to="ReplicatedStorage.Foo",
+            reason="ok",
+        )]
+        _apply_require_resolutions([script], resolutions)
+        assert "require(ReplicatedStorage.Foo)" in script.luau_source
+        assert "@scene_runtime" not in script.luau_source
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator -- driven with use_ai=False so the AI is never called.
 # ---------------------------------------------------------------------------
 
