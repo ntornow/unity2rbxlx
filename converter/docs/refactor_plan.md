@@ -2,15 +2,26 @@
 
 Status: **eng-reviewed, held** until scene-runtime-contract effort fully lands upstream.
 Companion: `docs/architecture_critique.md`.
-Re-baselined 2026-05-22 against upstream/main after 68 commits (see "Drift re-baseline" below).
+Re-baselined 2026-05-22 (68 upstream commits) and again 2026-05-23 (9 more commits) — see "Drift re-baseline" below.
 
 ## In one paragraph
 
-Eight PRs (PR-B through PR-H, plus PR-E0 ordering audit) reshape three mega-files (`pipeline.py` 4724 LOC, `script_coherence_packs.py` 5051 LOC, `scene_converter.py` 5542 LOC) into focused modules without behavior change. (PR-A — the `CLAUDE.md` trim — was absorbed by upstream PR #137/#138 and dropped.) **All PRs are held** until the scene-runtime-contract effort fully lands upstream: PR1/2/3a/3b/3c/4 have merged; PR5-PR8 remain. Phase 1 PRs touch only non-`scene_converter.py` files but are still held to avoid two concurrent multi-PR efforts diluting review attention (user decision, reaffirmed 2026-05-22). Phase 2 is additionally blocked by the `scene_converter.py` lock. Total ~3 engineer-weeks once execution begins.
+Eight PRs (PR-B through PR-H, plus PR-E0 ordering audit) reshape three mega-files (`pipeline.py` 4917 LOC, `script_coherence_packs.py` 5051 LOC, `scene_converter.py` 5542 LOC) into focused modules without behavior change. (PR-A — the `CLAUDE.md` trim — was absorbed by upstream PR #137/#138 and dropped.) **All PRs are held** until the scene-runtime-contract effort fully lands upstream: PR1/2/3a/3b/3c/4 plus the wiring-fix (#134) and classifier-v2 (#135) have merged; PR5-PR8 remain. Phase 1 PRs touch only non-`scene_converter.py` files but are still held to avoid two concurrent multi-PR efforts diluting review attention (user decision, reaffirmed 2026-05-23). Phase 2 is additionally blocked by the `scene_converter.py` lock. Total ~3 engineer-weeks once execution begins.
 
-## Drift re-baseline (2026-05-22)
+## Drift re-baseline
 
-68 upstream commits merged since the original plan. Material changes folded in:
+### 2026-05-23 (9 upstream commits since 2026-05-22 merge)
+
+Light drift this round:
+- **`pipeline.py` grew +193 LOC** (4724 → 4917) from PR #134 (pipeline-wiring fix for PR3a gap) and PR #135 (classifier-v2 redesign). PR-C's "extract ~500 LOC write_output region" target updates accordingly: 4917 → ~4400 (was 4724 → ~4200).
+- **`scene_converter.py` unchanged** (5542), **`script_coherence_packs.py` unchanged** (5051), pack count still 27, `_ctx()` still 58 sites.
+- **PR #134 + PR #135 landed** — classifier-v2 was the last separately-tracked scene-runtime side-effort.
+- **PR5-PR8 still pending** → gate unchanged, hold continues.
+- **No plan structure changes.** Lightweight LOC refresh only.
+
+### 2026-05-22 (68 upstream commits since original plan)
+
+Material changes folded in:
 - **Mega-files grew:** `pipeline.py` 3897→4724, `script_coherence_packs.py` 4667→5051, `scene_converter.py` 4856→5542. All LOC targets below updated; the refactor is more urgent, not less.
 - **scene-runtime-contract ~2/3 landed:** PR1/2/3a/3b/3c/4 merged (note PR3c was added mid-effort). PR5-8 pending. `scene_converter.py` still churning → Phase 2 stays blocked; hold on Phase 1 reaffirmed.
 - **PR-A dropped:** upstream PR #137/#138 already trimmed `CLAUDE.md` 322→266 and added Safety + Workflow Discipline sections. Residual trim not worth a standalone PR.
@@ -92,7 +103,7 @@ Build on upstream's `tests/test_offline_assembly.py` (PR #129), which already ru
 New `phases/services.py` with `PipelineServices` dataclass (decision #7). New `phases/output/` package, one module per `_subphase_*` method: `emit_scripts.py`, `cohere_scripts.py`, `inject_autogen.py` (264 LOC, includes pre-scaffolding migration; locate via `grep -n 'Migrating pre-scaffolding' converter/converter/pipeline.py`), `encode_terrain.py`, `inject_mesh_loader.py`, `patch_setup_sounds.py`, `finalize_scripts.py`. Each: `def <name>(state, ctx, services) -> None`. `Pipeline.write_output` becomes a ~30-line orchestrator.
 
 **+ done criteria:**
-- `pipeline.py` line count drops from 4724 to ~4200 LOC (extracting the ~500-LOC write_output region).
+- `pipeline.py` line count drops from 4917 to ~4400 LOC (extracting the ~500-LOC write_output region; baseline updated 2026-05-23).
 - New `tests/test_pre_scaffolding_resume.py` regression test passes (covers the previously-uncovered pre-scaffolding migration branch).
 - `python -c "from converter.phases.services import PipelineServices"` succeeds.
 
@@ -246,4 +257,4 @@ When scene-runtime-contract PR5-PR8 merge into ntornow upstream (PR1-4 + 3c alre
 
 **Cross-model:** Round 2 — Claude eng-review + codex converged on dispatch-table + `_ctx()` priority; codex caught the `(state, ctx)` signature being too narrow. Round 3 — codex caught canonicalization erosion, PR-B gate, services enumeration. Round 4 — codex caught gating contradiction (compressed plan silently reverted user-locked "all held" decision), PR-D path-notation ambiguity, PR-G line-number drift fragility.
 
-**Verdict:** ENG CLEARED — ready to execute once scene-runtime-contract (PR5-PR8) lands. Re-baselined against upstream/main 2026-05-22 (68 commits): PR-A dropped, PR-B reframed onto offline-assembly harness, all LOC + pack-count figures refreshed.
+**Verdict:** ENG CLEARED — ready to execute once scene-runtime-contract (PR5-PR8) lands. Re-baselined against upstream/main 2026-05-22 (68 commits): PR-A dropped, PR-B reframed onto offline-assembly harness, all LOC + pack-count figures refreshed. Augmented 2026-05-23 (9 more commits): `pipeline.py` +193 LOC from PR #134/#135 classifier-v2 work; PR-C target shifted accordingly. No structural plan changes — gate still in place.
