@@ -110,11 +110,6 @@ local _CLASS_TRANSFORM_SELF = "__transform_self__"
 _UNITY_TO_ROBLOX_CLASS.Transform = _CLASS_TRANSFORM_SELF
 _UNITY_TO_ROBLOX_CLASS.RectTransform = _CLASS_TRANSFORM_SELF
 
-local function _unityToRobloxClass(name: string): string?
-	local mapped = _UNITY_TO_ROBLOX_CLASS[name]
-	return mapped
-end
-
 -- ---------------------------------------------------------------------
 -- Service surface accepted by ``SceneRuntime.new``.
 --
@@ -769,7 +764,7 @@ function SceneRuntime:_injectHostSurface(instance, gameObjectInstance, gameObjec
 		-- to its Roblox equivalent before calling IsA/findFirstChildWhichIsA;
 		-- Roblox's class hierarchy doesn't know names like "Rigidbody".
 		if engine._services.findFirstChildWhichIsA then
-			local mapped = _unityToRobloxClass(name)
+			local mapped = _UNITY_TO_ROBLOX_CLASS[name]
 			if mapped == _CLASS_TRANSFORM_SELF then
 				-- Unity's Transform is intrinsic to every GameObject;
 				-- the Roblox equivalent is the GameObject's root instance.
@@ -971,13 +966,6 @@ end
 -- ---------------------------------------------------------------------
 -- Lifecycle (deterministic order from the design doc)
 -- ---------------------------------------------------------------------
-
-local function _safeCall(fn, ...)
-	if type(fn) ~= "function" then return end
-	local ok, err = pcall(fn, ...)
-	if not ok then return false, err end
-	return true
-end
 
 function SceneRuntime:_callMethod(instance, name, ...)
 	local class = self._meta[instance].classTable

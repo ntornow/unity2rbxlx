@@ -610,6 +610,109 @@ class TestHostInvokeCancellation:
 
 
 # ---------------------------------------------------------------------------
+# Delayed-Destroy emission shape — pins both the runtime contract
+# (``invoke`` requires a string method, NOT a function literal) AND the
+# correct ``startCoroutine + task.wait + destroy`` pattern that the
+# generic prompt teaches as the Unity ``Destroy(target, delay)``
+# translation. See ``_GENERIC_RUNTIME_PROMPT`` in code_transpiler.py.
+# ---------------------------------------------------------------------------
+
+class TestDelayedDestroyPattern:
+
+    def test_startCoroutine_plus_wait_plus_destroy_fires_after_delay(self):
+        # The taught pattern for ``Destroy(target, delay)``:
+        #   self.host.startCoroutine(self, function()
+        #       task.wait(delay); self.host.destroy(target) end)
+        # Verifies the pattern actually destroys after the delay elapses
+        # (proves the correct prompt teaching is end-to-end correct).
+        scenario = textwrap.dedent("""\
+            local destroyed = 0
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:OnDestroy() destroyed = destroyed + 1 end
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x"}},
+                scenes = {
+                    A = {
+                        instances = {{instance_id = "A:1", script_id = "foo",
+                                      game_object_id = "g", active = true,
+                                      enabled = true, config = {}}},
+                        references = {},
+                        lifecycle_order = {"A:1"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local services = servicesFor(plan, {foo = Foo}, {
+                g = {Name = "G", _sceneRuntimeId = "g", _children = {}},
+            })
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+            local comp = engine:findObjectOfType("Foo")
+            -- Emulate the AI-emitted pattern for ``Destroy(target, delay)``.
+            engine:startCoroutine(comp, function()
+                task.wait(1.0); engine:destroy(comp)
+            end)
+            -- Coroutine runs the body synchronously up to the first wait;
+            -- the mock ``task.wait`` is a no-op so destroy() runs immediately.
+            print("destroyed=" .. destroyed)
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, err
+        assert "destroyed=1" in out, (
+            "startCoroutine+wait+destroy must fire OnDestroy; got " + out
+        )
+
+    def test_invoke_with_function_method_is_silent_no_op(self):
+        # Regression guard against the previous BROKEN prompt teaching:
+        #   self.host.invoke(self, function() ... end, delay)
+        # ``invoke`` uses ``method`` as a STRING key into the class table;
+        # a function literal is not a key, so the scheduled body never
+        # runs (silent no-op). This pins the contract -- if a future
+        # change ever widens ``invoke`` to accept function-typed methods
+        # without an explicit design decision, this test must be
+        # re-evaluated.
+        scenario = textwrap.dedent("""\
+            local destroyed = 0
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:OnDestroy() destroyed = destroyed + 1 end
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x"}},
+                scenes = {
+                    A = {
+                        instances = {{instance_id = "A:1", script_id = "foo",
+                                      game_object_id = "g", active = true,
+                                      enabled = true, config = {}}},
+                        references = {},
+                        lifecycle_order = {"A:1"},
+                    },
+                },
+                prefabs = {}, domain_overrides = {},
+            }
+            local services = servicesFor(plan, {foo = Foo}, {
+                g = {Name = "G", _sceneRuntimeId = "g", _children = {}},
+            })
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+            local comp = engine:findObjectOfType("Foo")
+            -- The BROKEN AI emission: function-typed method argument.
+            engine:invoke(comp, function() engine:destroy(comp) end, 1.0)
+            advanceTime(2.0)
+            print("destroyed=" .. destroyed)
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, err
+        assert "destroyed=0" in out, (
+            "invoke must NOT dispatch function-typed methods; got " + out
+        )
+
+
+# ---------------------------------------------------------------------------
 # host.destroy DFS deepest-first; idempotent
 # ---------------------------------------------------------------------------
 

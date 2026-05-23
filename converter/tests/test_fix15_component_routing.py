@@ -190,8 +190,8 @@ class TestComponentClassPathSelection:
 
     def test_spawned_component_is_a_generic_path_but_not_runtime_bearing(self):
         modules, infos, placed, spawned, plain = self._modules_and_infos()
-        comp_paths, _ = _component_class_paths(modules, infos, "/proj")
-        bearing_paths, _ = _runtime_bearing_paths(modules, infos, "/proj")
+        comp_paths, _ = _component_class_paths(modules, infos)
+        bearing_paths, _ = _runtime_bearing_paths(modules, infos)
 
         # The spawned-only component routes generic (gets the contract)...
         assert spawned in comp_paths
@@ -208,7 +208,7 @@ class TestComponentClassPathSelection:
         placed = Path("/proj/Assets/Player.cs")
         modules = {"g": {"stem": "Player", "runtime_bearing": True}}
         infos = [_Info(placed)]
-        comp_paths, _ = _component_class_paths(modules, infos, "/proj")
+        comp_paths, _ = _component_class_paths(modules, infos)
         assert placed in comp_paths
 
 

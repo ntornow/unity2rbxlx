@@ -1343,7 +1343,7 @@ The Unity → Roblox API mapping below covers patterns inside method bodies. Mod
 - `gameObject.AddComponent<T>()` → `self.host.addComponent(self.gameObject, "T", configTable)`.
 - `gameObject.SetActive(b)` → `self.host.setActive(self.gameObject, b)`.
 - `Instantiate(prefab)` / `Instantiate(prefab, pos, rot)` → `self.host.instantiatePrefab(self.<prefabField>, parent, cframe)`. `self.<prefabField>` is injected from the serialized prefab reference — never `prefab:Clone()`.
-- `Destroy(target)` / `Destroy(target, delay)` → `self.host.destroy(target)` immediately, or `self.host.invoke(self, function() self.host.destroy(target) end, delay)` if a delay is meaningful.
+- `Destroy(target)` / `Destroy(target, delay)` → `self.host.destroy(target)` immediately, or `self.host.startCoroutine(self, function() task.wait(delay); self.host.destroy(target) end)` if a delay is meaningful. NEVER pass a function literal to `self.host.invoke` — `invoke` dispatches by string method name (it indexes the class table by ``method``), so a function-typed argument is silently dropped.
 - `FindObjectOfType<T>()` → `self.host.findObjectOfType("T")`.
 - `GameObject.Find("Name")` → `self.host.findGameObject("Name")`.
 - `GameObject.FindGameObjectsWithTag("Tag")` → `self.host.findGameObjectsWithTag("Tag")`.

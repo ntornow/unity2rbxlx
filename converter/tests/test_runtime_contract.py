@@ -304,6 +304,40 @@ class TestRuleE:
         )
         _assert_rule(src, "e")
 
+    def test_colon_form_constructor_rejected(self):
+        # Shape violation: ``function Class:new(config)`` is sugar for
+        # ``function Class.new(self, config)``, but the host runtime calls
+        # ``module_table.new(config)`` (one arg). Under colon form,
+        # ``config`` binds to ``self`` and the real config is dropped --
+        # silent gameplay corruption. The verifier rejects the form so
+        # the reprompt teaches the correct dot form.
+        src = (
+            'local Class = {}\n'
+            'Class.__index = Class\n'
+            'function Class:new(config)\n'
+            '    local self = setmetatable({}, Class)\n'
+            '    self.speed = config.speed or 12\n'
+            '    return self\n'
+            'end\n'
+            'return Class\n'
+        )
+        _assert_rule(src, "e")
+
+    def test_dot_form_constructor_with_pure_body_passes(self):
+        # Spec form: ``function Class.new(config) ... end``. No host
+        # access, just config reads. Must NOT trip the new shape check.
+        src = (
+            'local Class = {}\n'
+            'Class.__index = Class\n'
+            'function Class.new(config)\n'
+            '    local self = setmetatable({}, Class)\n'
+            '    self.speed = config.speed or 12\n'
+            '    return self\n'
+            'end\n'
+            'return Class\n'
+        )
+        _assert_clean(src)
+
 
 # ---------------------------------------------------------------------------
 # Rule (f) -- Unity message callbacks bound on the class table.

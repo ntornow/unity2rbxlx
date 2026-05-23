@@ -97,6 +97,40 @@ class TestPromptIsolation:
 
 
 # ---------------------------------------------------------------------------
+# Specific delayed-Destroy emission shape pinned in the generic prompt.
+# ``host.invoke(self, function() ... end, delay)`` silently no-ops because
+# the runtime uses ``method`` as a string key into the class table; the
+# correct primitive is ``startCoroutine + task.wait + destroy``. See
+# ``TestDelayedDestroyPattern`` in test_scene_runtime_host_behavior.py
+# for the matching behavioral coverage.
+# ---------------------------------------------------------------------------
+
+class TestGenericPromptDelayedDestroyShape:
+
+    def test_prompt_does_not_teach_invoke_with_function_method(self):
+        # Catches regression to the broken shape. Substring is precise
+        # enough that it would only match the bad teaching, not a
+        # legitimate ``self.host.invoke(self, "MethodName", delay)`` use.
+        bad = 'self.host.invoke(self, function()'
+        assert bad not in _GENERIC_RUNTIME_PROMPT, (
+            f"Generic prompt still teaches the broken {bad!r} shape -- "
+            "``invoke`` dispatches by string method name; a function "
+            "literal is silently dropped (no-op)."
+        )
+
+    def test_prompt_teaches_startCoroutine_for_delayed_destroy(self):
+        # Pin the corrected teaching so future edits don't regress to
+        # ``task.delay`` (uncancelled on teardown -> leaks past destroy)
+        # or back to ``invoke``.
+        good = 'self.host.startCoroutine(self, function() task.wait(delay); self.host.destroy(target) end)'
+        assert good in _GENERIC_RUNTIME_PROMPT, (
+            f"Generic prompt missing the canonical delayed-destroy "
+            f"shape {good!r}. ``startCoroutine`` is host-tracked and "
+            "cancels on OnDestroy; raw ``task.delay`` leaks past teardown."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Cache key namespace -- ``_ai_cache_key`` already takes ``prompt_hash``,
 # so generic vs legacy outputs cannot share a cache file by construction.
 # ---------------------------------------------------------------------------

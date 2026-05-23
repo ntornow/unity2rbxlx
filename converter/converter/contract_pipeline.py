@@ -356,13 +356,13 @@ def transpile_with_contract(
     """
     modules: dict[str, _SceneRuntimeModule] = scene_runtime.get("modules", {}) or {}
     runtime_bearing_paths, bearing_collisions = _runtime_bearing_paths(
-        modules, script_infos, unity_project_path,
+        modules, script_infos,
     )
     # The generic contract applies to every component class, not just the
     # placed/instance-backed ones — a MonoBehaviour spawned at runtime still
     # runs host-bound and must not ship as a legacy ``script.Parent`` Script.
     component_class_paths, component_collisions = _component_class_paths(
-        modules, script_infos, unity_project_path,
+        modules, script_infos,
     )
 
     log.info(
@@ -528,7 +528,6 @@ class _BearingCollision:
 def _runtime_bearing_paths(
     modules: dict[str, _SceneRuntimeModule],
     script_infos: list[ScriptInfo],
-    unity_project_root: str | Path,
 ) -> tuple[frozenset[Path], list[_BearingCollision]]:
     """Map ``scene_runtime.modules`` -> ``(paths, collisions)``.
 
@@ -552,7 +551,6 @@ def _runtime_bearing_paths(
 def _component_class_paths(
     modules: dict[str, _SceneRuntimeModule],
     script_infos: list[ScriptInfo],
-    unity_project_root: str | Path,
 ) -> tuple[frozenset[Path], list[_BearingCollision]]:
     """Like ``_runtime_bearing_paths`` but selects every component-class
     module, not just instance-backed ones.

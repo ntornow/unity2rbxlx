@@ -653,14 +653,20 @@ def _check_module_return(statements, source: str) -> list[Violation]:
 # bound until after ``new()`` returns.
 # ---------------------------------------------------------------------------
 
-# Match ``function CLASS:new(...)`` / ``function CLASS.new(self, ...)`` /
-# ``new = function(self, ...)`` (table-literal entry). Capture the body
-# slice up to the matching ``end``.
+# Match ``function CLASS.new(self, ...)`` (canonical dot form per spec) and
+# ``new = function(self, ...)`` (table-literal entry). The host runtime calls
+# ``module_table.new(config)`` (see scene_runtime.luau:_buildComponent); a
+# colon-form ``function CLASS:new(config)`` would bind ``config`` to ``self``
+# and silently lose the real config, so it's rejected as a SHAPE violation
+# (``_RE_CONSTRUCTOR_COLON_FORM`` below).
 _RE_CONSTRUCTOR_METHOD = re.compile(
-    r"function\s+[\w.]+\s*[:.]\s*new\s*\(",
+    r"function\s+[\w.]+\s*\.\s*new\s*\(",
 )
 _RE_CONSTRUCTOR_LITERAL = re.compile(
     r"\bnew\s*=\s*function\s*\(",
+)
+_RE_CONSTRUCTOR_COLON_FORM = re.compile(
+    r"function\s+[\w.]+\s*:\s*new\s*\(",
 )
 
 _FORBIDDEN_IN_NEW = [
@@ -673,6 +679,22 @@ _FORBIDDEN_IN_NEW = [
 
 def _check_constructor_purity(stripped: str, source: str) -> list[Violation]:
     out: list[Violation] = []
+    # Shape violation: colon-form constructors break the runtime's
+    # ``module_table.new(config)`` call (config becomes self).
+    for m in _RE_CONSTRUCTOR_COLON_FORM.finditer(stripped):
+        line = source.count("\n", 0, m.start()) + 1
+        out.append(Violation(
+            rule="e",
+            line=line,
+            message=(
+                "constructor declared with colon form ``Class:new(...)``. "
+                "The host calls ``module_table.new(config)`` (dot form); "
+                "a colon-form constructor receives ``config`` as ``self`` "
+                "and silently drops the real config. Use "
+                "``function Class.new(config)`` instead."
+            ),
+        ))
+    # Purity violation: host surface isn't bound until after new() returns.
     for pat in (_RE_CONSTRUCTOR_METHOD, _RE_CONSTRUCTOR_LITERAL):
         for m in pat.finditer(stripped):
             body, body_start = _extract_function_body(stripped, m.end())
