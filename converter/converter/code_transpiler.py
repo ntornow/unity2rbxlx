@@ -1422,7 +1422,7 @@ When a Unity API has NO faithful Luau translation, emit a stub method whose body
 
 - Convert the ENTIRE class. Do not skip methods or simplify logic.
 - Preserve all game logic, conditions, and calculations.
-- C# events with no Roblox event analog → `BindableEvent` field on the class, fired/connected explicitly.
+- C# events with no Roblox event analog → `BindableEvent` field on the class, fired/connected explicitly. For a **static C# event** (e.g. `Player.HealthUpdate`) that other scripts in the project subscribe to, set `.Name` to the event name AND `.Parent = game:GetService("ReplicatedStorage")` when you create it, so cross-script readers can find it via `ReplicatedStorage:FindFirstChild("HealthUpdate"):Connect(...)`. Idempotent: `Player.HealthUpdate = Player.HealthUpdate or (function() local b = Instance.new("BindableEvent"); b.Name = "HealthUpdate"; b.Parent = game:GetService("ReplicatedStorage"); return b end)()`. An unparented BindableEvent is invisible to every other script.
 - C# properties with `get`/`set` side effects → field + accessor methods (`getX(self)` / `setX(self, v)`); plain auto-properties → fields.
 - Interfaces / abstract classes → ModuleScript with table of functions; no client-of-the-host surface unless the implementing class registers them.
 - Enums → table with named numeric values: `local Dir = { Left = 0, Right = 1 }` at module scope (this is a side-effect-free `local`, allowed).
