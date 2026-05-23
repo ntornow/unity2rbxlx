@@ -1,7 +1,7 @@
 ---
 name: e2e-test
 description: Unified end-to-end test for a converted Unity project. Runs the AI conversion offline (no upload/publish), launches Studio with the produced rbxlx, drives the gameplay-feature fixtures via Studio MCP, and writes a combined pass/fail report.
-argument-hint: <project> [--close-and-relaunch] [--only fixture_ids]
+argument-hint: <project> [--close-and-relaunch] [--only fixture_ids] [--generic]
 allowed-tools:
   - Bash(python3 -m tests.studio_behavior_driver *)
   - Bash(python3 -m pytest *)
@@ -127,6 +127,27 @@ python3 -m pytest -m slow \
 
 (For projects other than SimpleFPS, swap the test method. V1 only ships
 SimpleFPS; the test parameterization is task #6.)
+
+**Scene-runtime mode.** The conversion test is mode-aware via the
+`E2E_SCENE_RUNTIME_MODE` env var. The documented default is **legacy**
+(top-level auto-running Scripts) — omit the var to get it. When
+`--generic` is passed, add `E2E_SCENE_RUNTIME_MODE=generic` to the env
+block so the test drives the scene-runtime contract (ModuleScripts
+hosted by an embedded `SceneRuntime`, single-player `networking_mode`)
+and adds assertions that the embedded `SceneRuntimePlan` carries
+`scene_prefab_placements` and `SceneRuntime` defines `_constructPrefabClone`:
+
+```bash
+E2E_SCENE_RUNTIME_MODE=generic \
+E2E_OUTPUT_DIR="${CONV_DIR}" E2E_RUN_ID="${RUN_ID}" \
+python3 -m pytest -m slow \
+  tests/test_offline_assembly.py::TestOfflineAssembly::test_simplefps_assembly_with_cached_ids \
+  -v --tb=short --no-header
+```
+
+The resulting `conversion_manifest.json` records `scene_runtime_mode`, so
+the gameplay half (Steps 4-7) plays whichever build the conversion
+produced.
 
 If pytest exits non-zero: write the combined report with
 `conversion.passed = false` + `gameplay = null`, print the summary line,

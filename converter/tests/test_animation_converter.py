@@ -945,8 +945,45 @@ class TestLuauGeneration:
         assert "playAnimation" in luau
         assert "Position" in luau
         assert "Vector3.new" in luau
-        # Should contain the Y offset of 4
-        assert "4.0000" in luau
+        # The 4 m Unity Y offset must be scaled to studs (4 * 3.571 =
+        # 14.284), NOT emitted raw. Raw +4 studs is the unscaled-offset
+        # bug the legacy door_tween coherence pack existed to mask.
+        assert "14.2840" in luau
+        assert "Vector3.new(0.0000, 4.0000, 0.0000)" not in luau
+
+    def test_position_tween_scales_offset_to_studs(self) -> None:
+        """Regression: a Unity position curve in METRES must be tweened in
+        STUDS (offset * config.STUDS_PER_METER). A 4 m door-open curve
+        should produce a +14.284 stud Y offset, not a raw +4. Before the
+        scale fix the inline_tween driver moved the door by an imperceptible
+        +4 studs, which is why the legacy door_tween pack masked it."""
+        import config
+
+        clip = AnimClip(
+            name="door_open",
+            duration=1.0,
+            loop=False,
+            sample_rate=60,
+            curves=[AnimCurve(
+                property_type="position",
+                path="",
+                keyframes=[
+                    AnimKeyframe(time=0.0, value=(0.0, 0.0, 0.0)),
+                    AnimKeyframe(time=1.0, value=(1.0, 4.0, 2.0)),
+                ],
+            )],
+        )
+
+        luau = generate_tween_script(clip)
+
+        s = config.STUDS_PER_METER
+        # x, y scaled positive; z negated (coord conversion) then scaled.
+        expected = f"Vector3.new({1.0 * s:.4f}, {4.0 * s:.4f}, {-2.0 * s:.4f})"
+        assert expected in luau, (
+            f"expected scaled offset {expected!r} in:\n{luau}"
+        )
+        # The raw, unscaled offset must NOT appear.
+        assert "Vector3.new(1.0000, 4.0000, -2.0000)" not in luau
 
     def test_animation_events_scheduled_before_blocking_tweens(self) -> None:
         """task.delay(event.time, ...) must be emitted before the tween

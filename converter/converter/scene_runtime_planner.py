@@ -69,6 +69,17 @@ class SceneRuntimeModule(TypedDict, total=False):
     stem: str
     class_name: str
     runtime_bearing: bool
+    # ``is_component_class`` is True when the script is a Unity component
+    # (extends MonoBehaviour / NetworkBehaviour directly OR transitively
+    # through a project-local base). It is BROADER than ``runtime_bearing``:
+    # a component spawned only at runtime (Instantiate) is a component class
+    # but is not instance-backed in any walked scene/prefab, so it is NOT
+    # runtime_bearing. The generic transpile contract (ModuleScript target +
+    # generic prompt + verifier) keys off THIS flag, not placement, because
+    # in Unity every component runs host-bound (``self.gameObject``) whether
+    # authored or Instantiate()-spawned. ``runtime_bearing`` stays
+    # placement-based so it still drives only what the host boots at start.
+    is_component_class: bool
     domain: str
     container: str
     module_path: str
@@ -222,6 +233,38 @@ class SceneRuntimePrefab(TypedDict):
     lifecycle_order: list[str]
 
 
+class SceneRuntimeScenePrefabPlacement(TypedDict):
+    """One pre-placed prefab instance authored directly into a scene.
+
+    Tier-1 boot row (Bug B). The runtime resolves the placement's live
+    clone via the prefab subplan's stamped ``_SceneRuntimeId`` ids and
+    runs the prefab's component lifecycle once at ``start()``.
+
+    ``placement_id``: stable per-placement id, ``"<scene_ns>:<pi_fid>"``,
+        namespaced exactly like scene ``game_object_id``s.
+    ``prefab_id``: the stable prefab id (key into ``scene_runtime.prefabs``),
+        computed via ``_prefab_stable_id`` so it matches the subplan key.
+    ``active`` / ``enabled``: default ``True`` for tier 1 (per-placement
+        ``m_Modifications`` overrides are tier 3; read straight through
+        only when cleanly available).
+    """
+
+    placement_id: str
+    prefab_id: str
+    active: bool
+    enabled: bool
+
+
+# Optional fields appended to a placement row (total=False so on-disk
+# artifacts without the key stay valid). ``parent_game_object_id`` is the
+# scene GameObject the placement is parented under, derived by mapping
+# ``PrefabInstanceData.transform_parent_file_id`` through
+# ``scene.transform_fid_to_go_fid``. Omitted for root placements (no
+# resolvable parent) — mirrors the ``SceneRuntimeInstanceExtra`` pattern.
+class SceneRuntimeScenePrefabPlacementExtra(TypedDict, total=False):
+    parent_game_object_id: str
+
+
 class SceneRuntimeDisplacedInstance(TypedDict):
     """One row in ``scene_runtime.displaced_instances``: an instance whose
     domain disagrees with the class's final ``domain`` (operator pinned the
@@ -277,6 +320,12 @@ class SceneRuntimeArtifact(TypedDict, total=False):
     # ``scriptable_object`` ref resolver looks the persisted GUID up in
     # this map and ``require``s the resulting module path.
     scriptable_objects: dict[str, str]
+    # Bug B tier 1: pre-placed prefab instances authored into scenes. The
+    # runtime boots these at ``start()`` (the scene loop only walks logical
+    # scene GameObjects, never PrefabInstance documents — so prefab gameplay
+    # scripts never ran). YAML scenes only: binary scenes don't populate
+    # ``transform_fid_to_go_fid`` so they emit no placements (tracked gap).
+    scene_prefab_placements: list[SceneRuntimeScenePrefabPlacement]
 
 
 # ---------------------------------------------------------------------------
@@ -864,6 +913,67 @@ def _walk_prefab(
 
 
 # ---------------------------------------------------------------------------
+# Pre-placed prefab instances (Bug B tier 1).
+# ---------------------------------------------------------------------------
+
+def _walk_scene_prefab_placements(
+    scene: ParsedScene,
+    namespace: str,
+    guid_index: GuidIndex | None,
+    by_guid: dict[str, PrefabTemplate],
+    unity_project_root: Path | None,
+) -> list[SceneRuntimeScenePrefabPlacement]:
+    """Emit one placement row per ``PrefabInstance`` authored into the scene.
+
+    Each row binds a placement to its prefab subplan via the same stable
+    ``prefab_id`` the subplan is keyed under (``_prefab_stable_id``). The
+    runtime boots the placement's clone using that subplan's instances.
+
+    ``parent_game_object_id`` derivation: ``PrefabInstanceData`` carries a
+    ``transform_parent_file_id`` (a Transform fileID), NOT a GameObject id.
+    Map it through ``scene.transform_fid_to_go_fid`` (populated by the YAML
+    parser) to recover the parent GameObject id. Binary scenes leave that
+    map empty, so binary placements emit without a parent key (tracked gap).
+
+    Tier 1 reads ``active``/``enabled`` as ``True`` defaults: per-placement
+    ``m_Modifications`` (including ``m_IsActive``) is tier-3 work.
+    """
+    placements: list[SceneRuntimeScenePrefabPlacement] = []
+    fid_to_go = scene.transform_fid_to_go_fid or {}
+
+    for pi in scene.prefab_instances:
+        guid = pi.source_prefab_guid
+        if not guid:
+            continue
+        template = by_guid.get(guid)
+        if template is None:
+            # No subplan to boot against — skip silently (matches the
+            # converter's "unresolvable source prefab" skip at
+            # scene_converter._convert_prefab_instance).
+            continue
+        prefab_id = _prefab_stable_id(
+            template, guid_index, by_guid, unity_project_root,
+        )
+        row: SceneRuntimeScenePrefabPlacement = {
+            "placement_id": f"{namespace}:{pi.file_id}",
+            "prefab_id": prefab_id,
+            "active": True,
+            "enabled": True,
+        }
+        # Map the PrefabInstance's parent Transform fileID to the owning
+        # scene GameObject id. Omit the key when the map lacks the entry
+        # (root placement, or binary scene with no transform map).
+        parent_go_fid = fid_to_go.get(pi.transform_parent_file_id)
+        if parent_go_fid:
+            cast(dict[str, object], row)["parent_game_object_id"] = (
+                f"{namespace}:{parent_go_fid}"
+            )
+        placements.append(row)
+
+    return placements
+
+
+# ---------------------------------------------------------------------------
 # Modules table (project-wide require graph).
 # ---------------------------------------------------------------------------
 
@@ -888,28 +998,99 @@ def _build_modules_table(
         return modules
 
     cs_entries = guid_index.filter_by_kind("script")
+    # First pass: analyze every .cs once and remember its immediate base
+    # class so the SECOND pass can resolve component-ness across a project-
+    # local inheritance chain (analyze_script only records the immediate
+    # base). e.g. ``Turret : Weapon`` + ``Weapon : MonoBehaviour`` ⇒ Turret
+    # is a component even though its immediate base is ``Weapon``.
+    # guid -> (stem, class_name, base_class, has_lifecycle_hook)
+    analyzed: dict[str, tuple[str, str, str, bool]] = {}
+    base_by_class: dict[str, str] = {}
     for script_guid, entry in cs_entries.items():
         if entry.asset_path.suffix != ".cs":
             continue
         info = analyze_script(entry.asset_path)
+        analyzed[script_guid] = (
+            entry.asset_path.stem, info.class_name, info.base_class,
+            bool(info.lifecycle_hooks),
+        )
+        if info.class_name:
+            base_by_class[info.class_name] = info.base_class
+
+    for script_guid, (stem, class_name, base_class, has_hook) in analyzed.items():
+        # A class is a component if either:
+        #   (1) it extends a known Unity component base (directly or
+        #       transitively via the project-local inheritance walk), OR
+        #   (2) it overrides a Unity lifecycle hook AND has a non-empty
+        #       immediate base class -- a base class the resolver couldn't
+        #       prove is a component (external DLL like Photon's
+        #       ``MonoBehaviourPunCallbacks``, Mirror's ``NetworkBehaviour``
+        #       in an unwalkable package) but the presence of inheritance
+        #       plus a lifecycle hook is strong enough evidence to route
+        #       through the host contract.
+        #
+        # The ``base_class != ""`` guard is what blocks the original false-
+        # positive from the first pass (Codex P2): plain helper classes
+        # like ``class Stopwatch { void Start() {} }`` -- no base, just a
+        # method that happens to be named ``Start`` -- were being forced
+        # through the host-bound generic contract. Requiring inheritance
+        # rules them out without giving up the external-base case.
+        is_component = (
+            _resolves_to_component(class_name, base_class, base_by_class)
+            or (has_hook and base_class != "")
+        )
         modules[script_guid] = {
-            "stem": entry.asset_path.stem,
-            "class_name": info.class_name,
+            "stem": stem,
+            "class_name": class_name,
             "runtime_bearing": script_guid in runtime_bearing,
+            "is_component_class": is_component,
         }
 
     # Scripts attached at runtime but absent from the guid index (e.g.,
     # outside Assets/, dynamically loaded). Record them with empty stem
-    # so PR3a's resolver fails closed on the stem mismatch.
+    # so PR3a's resolver fails closed on the stem mismatch. They are
+    # instance-backed (in ``runtime_bearing``), so treat them as components.
     for script_id in runtime_bearing:
         if script_id not in modules:
             modules[script_id] = {
                 "stem": "",
                 "class_name": "",
                 "runtime_bearing": True,
+                "is_component_class": True,
             }
 
     return modules
+
+
+# Unity component base classes. A script extending any of these (directly
+# or transitively) is a component and must convert host-bound, never legacy.
+# ``NetworkBehaviour`` covers Mirror / legacy UNet networked components.
+_COMPONENT_BASE_CLASSES = frozenset({"MonoBehaviour", "NetworkBehaviour"})
+
+
+def _resolves_to_component(
+    class_name: str,
+    base_class: str,
+    base_by_class: dict[str, str],
+) -> bool:
+    """True when ``class_name`` extends a Unity component base directly or
+    through a project-local chain.
+
+    Walks ``base_class -> its base -> ...`` using ``base_by_class`` (the
+    project's class->immediate-base map). Stops at a known component base,
+    at an unknown/external base (not in the map), or on a cycle. The chain
+    is project-bounded, so external bases like ``NetworkBehaviour`` (defined
+    in a package, not in ``base_by_class``) are caught by the direct
+    ``_COMPONENT_BASE_CLASSES`` membership check on each hop.
+    """
+    seen: set[str] = set()
+    current = base_class
+    while current and current not in seen:
+        if current in _COMPONENT_BASE_CLASSES:
+            return True
+        seen.add(current)
+        current = base_by_class.get(current, "")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -934,6 +1115,7 @@ def plan_scene_runtime(
 
     scenes_block: dict[str, SceneRuntimeScene] = {}
     prefabs_block: dict[str, SceneRuntimePrefab] = {}
+    placements_block: list[SceneRuntimeScenePrefabPlacement] = []
     runtime_bearing: set[str] = set()
 
     for scene in parsed_scenes:
@@ -942,6 +1124,12 @@ def plan_scene_runtime(
             scene, namespace, guid_index, by_guid,
             unity_project_root, runtime_bearing,
         )
+        # Bug B tier 1: pre-placed prefab instances. The subplans they bind
+        # to are built below; placements only need the stable prefab_id,
+        # which ``_prefab_stable_id`` computes deterministically.
+        placements_block.extend(_walk_scene_prefab_placements(
+            scene, namespace, guid_index, by_guid, unity_project_root,
+        ))
 
     if prefab_library is not None:
         for template in prefab_library.prefabs:
@@ -959,6 +1147,7 @@ def plan_scene_runtime(
         "modules": modules_block,
         "scenes": scenes_block,
         "prefabs": prefabs_block,
+        "scene_prefab_placements": placements_block,
         "domain_overrides": {},
     }
 

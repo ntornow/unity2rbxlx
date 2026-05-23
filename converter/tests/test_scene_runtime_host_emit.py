@@ -254,6 +254,51 @@ class TestEntrypointGenerators:
         assert script.source.strip().startswith("--")
         assert "return" in script.source
 
+    def test_plan_module_embeds_scene_prefab_placements(self):
+        """Bug B tier-1 regression: ``scene_prefab_placements`` must
+        survive the ``_PLAN_KEYS_FOR_HOST`` allowlist filter and land in
+        the embedded plan ModuleScript.
+
+        The on-disk ``conversion_plan.json`` had 252 placements but the
+        allowlist dropped the key, so the embedded plan carried zero rows
+        and the runtime boot loop iterated nothing. This asserts the
+        placements (id + prefab_id) reach the emitted Luau source.
+        """
+        placements = [
+            {
+                "placement_id": "main:1001",
+                "prefab_id": "Crate__abc123",
+                "active": True,
+                "enabled": True,
+            },
+            {
+                "placement_id": "main:1002",
+                "prefab_id": "Barrel__def456",
+                "active": True,
+                "enabled": False,
+            },
+        ]
+        script = generate_scene_runtime_plan_module({
+            "modules": {}, "scenes": {}, "prefabs": {},
+            "scene_prefab_placements": placements,
+        })
+        src = script.source
+        assert "scene_prefab_placements" in src, (
+            "embedded plan must carry the scene_prefab_placements key; "
+            "if missing, the _PLAN_KEYS_FOR_HOST allowlist dropped it"
+        )
+        # Each placement's identifying fields must appear in the emitted
+        # Luau literal so the host boot loop has rows to iterate.
+        for row in placements:
+            assert row["placement_id"] in src, (
+                f"placement_id {row['placement_id']!r} missing from "
+                f"embedded plan source"
+            )
+            assert row["prefab_id"] in src, (
+                f"prefab_id {row['prefab_id']!r} missing from embedded "
+                f"plan source"
+            )
+
     def test_entrypoints_split_module_path_on_dot_not_slash(self):
         """R2-P1.1: ``module_path`` is the dotted DataModel path. Both
         client and server entrypoints must split on ``"."`` so they can

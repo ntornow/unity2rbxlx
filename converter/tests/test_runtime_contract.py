@@ -283,7 +283,7 @@ class TestRuleE:
             '    return setmetatable({}, Class)\n'
             'end\n'
             'function Class:Awake()\n'
-            '    self.host:connect(self.gameObject.Touched, function() end)\n'
+            '    self.host:connectGameObjectSignal(self.gameObject, "Touched", function() end)\n'
             'end\n'
             'return Class\n'
         )
@@ -341,14 +341,18 @@ class TestRuleF:
         _assert_rule(src, "f")
 
     def test_host_connect_in_awake_passes(self):
-        # The canonical good shape from Piece 6.
+        # The canonical good shape from Piece 6: GameObject touch events go
+        # through the host helper (``self.gameObject`` may be a Model).
         src = (
             'local Class = {}\n'
             'function Class.new(config)\n'
             '    return setmetatable({}, Class)\n'
             'end\n'
             'function Class:Awake()\n'
-            '    self.host:connect(self.gameObject.Touched, function(other) end)\n'
+            '    self.host:connectGameObjectSignal(self.gameObject, "Touched", function(other)\n'
+            '        local plr = self.host.playerFromTouch(other)\n'
+            '        if plr then end\n'
+            '    end)\n'
             'end\n'
             'return Class\n'
         )
@@ -364,6 +368,57 @@ class TestRuleF:
                 'return Class\n'
             )
             _assert_rule(src, "f")
+
+
+# ---------------------------------------------------------------------------
+# Rule (g) -- GameObject ``.Touched`` / ``.TouchEnded`` on a raw GameObject.
+# ``self.gameObject`` may be a Model; ``.Touched`` is BasePart-only and
+# throws. The compliant shape goes through
+# ``self.host:connectGameObjectSignal(self.gameObject, "Touched", fn)``.
+# ---------------------------------------------------------------------------
+
+class TestRuleG:
+
+    def test_gameobject_touched_rejected(self):
+        src = (
+            'local Class = {}\n'
+            'function Class:Awake()\n'
+            '    self.host:connect(self.gameObject.Touched, function(other) end)\n'
+            'end\n'
+            'return Class\n'
+        )
+        _assert_rule(src, "g")
+
+    def test_gameobject_touchended_rejected(self):
+        src = (
+            'local Class = {}\n'
+            'function Class:Awake()\n'
+            '    self.host:connect(self.gameObject.TouchEnded, function(other) end)\n'
+            'end\n'
+            'return Class\n'
+        )
+        _assert_rule(src, "g")
+
+    def test_connect_gameobject_signal_passes(self):
+        src = (
+            'local Class = {}\n'
+            'function Class:Awake()\n'
+            '    self.host:connectGameObjectSignal(self.gameObject, "Touched", function(other) end)\n'
+            'end\n'
+            'return Class\n'
+        )
+        _assert_clean(src)
+
+    def test_message_mentions_helper(self):
+        src = (
+            'local Class = {}\n'
+            'function Class:Awake()\n'
+            '    self.host:connect(self.gameObject.Touched, function(other) end)\n'
+            'end\n'
+            'return Class\n'
+        )
+        v = [x for x in verify_module(src).violations if x.rule == "g"][0]
+        assert "connectGameObjectSignal" in v.message
 
 
 # ---------------------------------------------------------------------------
@@ -609,3 +664,217 @@ class TestLifecycleConstants:
             "OnMouseExit", "OnMouseOver", "OnMouseDrag",
         }
         assert UNITY_MESSAGE_CALLBACKS == expected
+
+
+# ---------------------------------------------------------------------------
+# Rule (h) -- ``script.Parent`` legacy idiom in a host-bound module.
+# (Fix #15: component classes now route through the generic contract, so the
+# verifier must reject the legacy ``script.Parent`` form that throws at boot.)
+# ---------------------------------------------------------------------------
+
+class TestRuleHScriptParent:
+
+    def test_bare_script_parent_flagged(self):
+        src = COMPLIANT.replace(
+            "function Class:Awake()\nend",
+            "function Class:Awake()\n    local p = script.Parent\nend",
+        )
+        _assert_rule(src, "h")
+
+    def test_script_parent_cframe_flagged(self):
+        # The exact crashing shape from the bug report.
+        src = COMPLIANT.replace(
+            "function Class:Start()\nend",
+            "function Class:Start()\n    script.Parent.CFrame = CFrame.new()\nend",
+        )
+        _assert_rule(src, "h")
+
+    def test_script_parent_in_string_not_flagged(self):
+        # Runs on stripped source -- a literal in a string must not fire.
+        src = COMPLIANT.replace(
+            "function Class:Awake()\nend",
+            'function Class:Awake()\n    warn("do not use script.Parent here")\nend',
+        )
+        _assert_clean(src)
+
+    def test_script_parent_in_comment_not_flagged(self):
+        src = COMPLIANT.replace(
+            "function Class:Awake()\nend",
+            "function Class:Awake()\n    -- legacy code used script.Parent\nend",
+        )
+        _assert_clean(src)
+
+    def test_identifier_ending_in_script_not_flagged(self):
+        # ``\bscript\b`` anchors: ``myscript.Parent`` is a different symbol.
+        src = COMPLIANT.replace(
+            "function Class:Awake()\nend",
+            "function Class:Awake()\n    local x = myscript.Parent\nend",
+        )
+        _assert_clean(src)
+
+    def test_self_gameobject_is_the_compliant_shape(self):
+        # The canonical replacement for script.Parent passes clean.
+        src = COMPLIANT.replace(
+            "function Class:Start()\nend",
+            "function Class:Start()\n    self.gameObject.CFrame = CFrame.new()\nend",
+        )
+        _assert_clean(src)
+
+    def test_shadowed_local_script_not_flagged(self):
+        # ``script`` shadowed by a local => ``script.Parent`` is field access
+        # on that local table, not the Roblox global. Biased toward no false
+        # positive because fail-closed now hard-errors the conversion.
+        src = COMPLIANT.replace(
+            "function Class:Awake()\nend",
+            "function Class:Awake()\n    local script = self.config\n"
+            "    local p = script.Parent\nend",
+        )
+        _assert_clean(src)
+
+    def test_shadow_in_one_function_does_not_mask_other_function(self):
+        # Codex P3 round 1: a harmless ``local script`` in one method must
+        # NOT suppress a real ``script.Parent`` global access in a different
+        # method -- the shadow leaves scope at the function's ``end``.
+        src = COMPLIANT.replace(
+            "function Class:Awake()\nend",
+            "function Class:Awake()\n    local script = self.config\n"
+            "    local cfg = script.Field\nend",
+        ).replace(
+            "function Class:Start()\nend",
+            "function Class:Start()\n    local p = script.Parent\nend",
+        )
+        _assert_rule(src, "h")
+
+    def test_module_level_shadow_suppresses_everywhere(self):
+        # A top-level ``local script`` stays in scope for every function in
+        # the module, so any ``script.Parent`` within is field access on
+        # the shadow.
+        src = COMPLIANT.replace(
+            "local Class = {}",
+            "local script = nil\nlocal Class = {}",
+        ).replace(
+            "function Class:Awake()\nend",
+            "function Class:Awake()\n    local p = script.Parent\nend",
+        )
+        _assert_clean(src)
+
+    def test_shadow_in_if_branch_does_not_mask_sibling_branch(self):
+        # Locals declared in a ``then`` branch are out of scope in ``else``
+        # -- the shadow must not bleed across the branch boundary.
+        src = COMPLIANT.replace(
+            "function Class:Awake()\nend",
+            "function Class:Awake()\n    if self.flag then\n"
+            "        local script = self.config\n"
+            "    else\n"
+            "        local p = script.Parent\n"
+            "    end\nend",
+        )
+        _assert_rule(src, "h")
+
+    def test_repeat_local_shadow_covers_until_condition(self):
+        # Codex P3 round 2: locals declared inside a ``repeat`` block are
+        # still in scope for the ``until`` condition expression. The walker
+        # must NOT pop the repeat scope on ``until`` itself -- doing so
+        # would flag the ``script.Parent`` in the condition as a violation
+        # and (because rule h is fail-closed) sink the whole conversion.
+        src = COMPLIANT.replace(
+            "function Class:Awake()\nend",
+            "function Class:Awake()\n    repeat\n"
+            "        local script = self.config\n"
+            "        wait()\n"
+            "    until script.Parent\nend",
+        )
+        _assert_clean(src)
+
+    def test_repeat_local_shadow_pops_after_until_line(self):
+        # The repeat scope DOES end after the until-condition: a
+        # ``script.Parent`` on the line(s) following ``until`` is no longer
+        # shadowed by the in-repeat local.
+        src = COMPLIANT.replace(
+            "function Class:Awake()\nend",
+            "function Class:Awake()\n    repeat\n"
+            "        local script = self.config\n"
+            "        wait()\n"
+            "    until true\n"
+            "    local p = script.Parent\nend",
+        )
+        _assert_rule(src, "h")
+
+
+# ---------------------------------------------------------------------------
+# Luau if-EXPRESSION handling in the depth tracker (e2e regression).
+# Turret transpiled clean but rule (d) false-fired because the depth tracker
+# treated ``self.x = if cond then a else b`` (an if-EXPRESSION, no ``end``)
+# as a block-opening if-statement. With Fix A promoting fail-closed to
+# ctx.errors, that turned a silent over-count into a hard failure on any
+# module using idiomatic if-expressions for config defaults.
+# ---------------------------------------------------------------------------
+
+class TestIfExpressionDepthTracking:
+
+    def test_if_expression_in_constructor_does_not_break_return(self):
+        # Module uses if-expression on RHS of an assignment in :Awake().
+        # The depth tracker must NOT count this ``if`` as a block-open, so
+        # the top-level ``return Class`` is still seen at depth 0.
+        src = (
+            'local Class = {}\n'
+            'Class.__index = Class\n'
+            'function Class.new(config)\n'
+            '    local self = setmetatable({}, Class)\n'
+            '    self.rotate = if config.rotate ~= nil then config.rotate else true\n'
+            '    return self\n'
+            'end\n'
+            'function Class:Awake()\n'
+            'end\n'
+            'return Class\n'
+        )
+        _assert_clean(src)
+
+    def test_return_value_if_expression_is_not_a_block(self):
+        # ``return if cond then a else b`` — ``return`` precedes ``if`` in
+        # expression position. Module still has a top-level return.
+        src = (
+            'local Class = {}\n'
+            'Class.__index = Class\n'
+            'function Class.new()\n'
+            '    return if math.random() > 0.5 then 1 else 2\n'
+            'end\n'
+            'function Class:Awake()\n'
+            'end\n'
+            'return Class\n'
+        )
+        _assert_clean(src)
+
+    def test_real_if_statement_still_opens_a_block(self):
+        # Statement-position ``if`` (start of statement, preceded by block
+        # body) MUST still open a block — otherwise rule (d) would no longer
+        # detect a missing end. A module whose constructor's if-statement
+        # never closes should be malformed; here the if-statement is well-
+        # formed so the module is clean.
+        src = (
+            'local Class = {}\n'
+            'Class.__index = Class\n'
+            'function Class.new(config)\n'
+            '    local self = setmetatable({}, Class)\n'
+            '    if config then\n'
+            '        self.config = config\n'
+            '    end\n'
+            '    return self\n'
+            'end\n'
+            'return Class\n'
+        )
+        _assert_clean(src)
+
+    def test_module_missing_return_still_flagged(self):
+        # Sanity: with the if-expression bias toward statement-if, a module
+        # that legitimately lacks a top-level return must still fire rule (d).
+        src = (
+            'local Class = {}\n'
+            'function Class.new()\n'
+            '    local self = {}\n'
+            '    self.x = if true then 1 else 2\n'
+            '    return self\n'
+            'end\n'
+            # no top-level ``return Class``
+        )
+        _assert_rule(src, "d")

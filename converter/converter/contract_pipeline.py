@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict
@@ -40,6 +41,7 @@ from typing import TypedDict
 from converter.code_transpiler import (
     TranspilationResult,
     TranspiledScript,
+    _is_visual_only_script,
     transpile_scripts,
 )
 from unity.script_analyzer import ScriptInfo
@@ -215,6 +217,23 @@ _RE_SCENE_RUNTIME_REQUIRE = re.compile(
     r"""require\s*\(\s*['"]@scene_runtime/([\w]+)['"]\s*\)""",
 )
 
+def _container_lookup_expr(stem: str) -> str:
+    """A runtime require-target expression that locates a sibling module
+    by file stem at load time -- the shape the rest of the pipeline emits
+    for resolved sibling requires.
+
+    Used as the ``by_stem`` fallback when the planner artifact carries no
+    explicit ``module_path`` for a module. Replaces the historical
+    script_id (raw .cs GUID) fallback, which produced an illegal
+    ``require(<bareGUID>)`` ("Malformed number") in the generated module.
+    """
+    return (
+        'game:GetService("ReplicatedStorage"):FindFirstChild('
+        f'"{stem}", true) or '
+        'game:GetService("ServerStorage"):FindFirstChild('
+        f'"{stem}", true)'
+    )
+
 
 def resolve_requires(
     scripts: list[TranspiledScript],
@@ -339,11 +358,17 @@ def transpile_with_contract(
     runtime_bearing_paths, bearing_collisions = _runtime_bearing_paths(
         modules, script_infos, unity_project_path,
     )
+    # The generic contract applies to every component class, not just the
+    # placed/instance-backed ones — a MonoBehaviour spawned at runtime still
+    # runs host-bound and must not ship as a legacy ``script.Parent`` Script.
+    component_class_paths, component_collisions = _component_class_paths(
+        modules, script_infos, unity_project_path,
+    )
 
     log.info(
-        "[contract] %d runtime-bearing MonoBehaviour(s) selected from "
-        "scene_runtime.modules",
-        len(runtime_bearing_paths),
+        "[contract] %d component-class module(s) selected for the generic "
+        "contract (%d of them instance-backed / boot at start)",
+        len(component_class_paths), len(runtime_bearing_paths),
     )
 
     transpilation = transpile_scripts(
@@ -355,6 +380,7 @@ def transpile_with_contract(
         serialized_field_refs=serialized_field_refs,
         runtime_mode="generic",
         runtime_bearing_paths=runtime_bearing_paths,
+        component_class_paths=component_class_paths,
     )
 
     # Build the stem-keyed require graph from the planner's modules table.
@@ -374,15 +400,21 @@ def transpile_with_contract(
     # module via warnings; convert them to FailClosed rows here so the
     # orchestrator's caller has one place to read project status.
     fail_closed: list[FailClosed] = []
-    # Surface runtime-bearing stem collisions FIRST -- they were never
-    # part of ``runtime_bearing_paths``, so the per-script verifier loop
-    # below couldn't have flagged them. Without this surface the modules
-    # silently disappear (codex P1 finding on PR3a).
-    for collision in bearing_collisions:
+    # Surface stem collisions FIRST -- a colliding stem was never added to
+    # the path sets, so the per-script verifier loop below can't flag it.
+    # Without this surface the module silently disappears (codex P1 finding
+    # on PR3a). Component-class collisions subsume runtime-bearing ones
+    # (every placed MonoBehaviour is a component class), so iterate the
+    # superset and dedupe by stem.
+    seen_collision_stems: set[str] = set()
+    for collision in (*bearing_collisions, *component_collisions):
+        if collision.stem in seen_collision_stems:
+            continue
+        seen_collision_stems.add(collision.stem)
         fail_closed.append(FailClosed(
             kind="runtime_bearing_collision",
             detail=(
-                f"runtime-bearing stem {collision.stem!r} matches "
+                f"component-class stem {collision.stem!r} matches "
                 f"{len(collision.paths)} .cs files: "
                 + ", ".join(p.name for p in collision.paths)
                 + ". Disambiguate by renaming or adding "
@@ -391,20 +423,31 @@ def transpile_with_contract(
             ),
         ))
     for script in transpilation.scripts:
-        if Path(script.source_path) not in runtime_bearing_paths:
+        # Verify + fail-close every component class, not just placed ones:
+        # a runtime-spawned MonoBehaviour that comes back broken (stub or
+        # surviving violation) would still throw when first instantiated.
+        if Path(script.source_path) not in component_class_paths:
             continue
         # PR3b: stub_strategy fail-closed (carry-over from PR3a P2 #1).
         # When the AI transpiler is unavailable / disabled / errored,
         # ``code_transpiler.transpile`` falls through to the stub
         # generator (``strategy="stub"``) which emits a placeholder
-        # ``print(...)`` body. A runtime-bearing module can't host the
+        # ``print(...)`` body. A component module can't host the
         # contract on stub output; ``auto`` mode must treat this as a
         # fail-closed signal to fall back to legacy.
-        if script.strategy != "ai":
+        #
+        # EXCEPTION: a visual-only script (water shader, particle visual)
+        # has no Roblox equivalent and is INTENTIONALLY stubbed -- in
+        # generic mode that stub is a contract-valid inert ModuleScript
+        # (see ``_inert_component_stub``), so it is a legitimate terminal
+        # state, not an AI failure. Only genuine fallthrough fails closed.
+        if script.strategy != "ai" and not _is_visual_only_script(
+            Path(script.source_path), script.csharp_source,
+        ):
             fail_closed.append(FailClosed(
                 kind="stub_strategy",
                 detail=(
-                    f"{Path(script.source_path).name}: runtime-bearing "
+                    f"{Path(script.source_path).name}: component-class "
                     f"module fell through to {script.strategy!r} strategy "
                     f"(AI unavailable). Stub modules cannot satisfy the "
                     f"runtime contract."
@@ -501,11 +544,58 @@ def _runtime_bearing_paths(
         stem = info.path.stem
         by_stem.setdefault(stem, []).append(info.path)
 
+    return _join_module_paths(
+        modules, by_stem, lambda m: bool(m.get("runtime_bearing")),
+    )
+
+
+def _component_class_paths(
+    modules: dict[str, _SceneRuntimeModule],
+    script_infos: list[ScriptInfo],
+    unity_project_root: str | Path,
+) -> tuple[frozenset[Path], list[_BearingCollision]]:
+    """Like ``_runtime_bearing_paths`` but selects every component-class
+    module, not just instance-backed ones.
+
+    This is the set that drives the generic contract (ModuleScript target +
+    generic prompt + verifier + fail-closed): in Unity every component runs
+    host-bound whether authored into a scene or ``Instantiate()``-spawned,
+    so a runtime-spawned MonoBehaviour must NOT be emitted as a legacy
+    ``script.Parent`` Script. It is a SUPERSET of the runtime-bearing set.
+    Placement (``runtime_bearing``) still governs only what the host boots
+    at scene start, which is built from the planner's instance walk, not
+    from this set.
+
+    Selection is ``is_component_class OR runtime_bearing``: the OR encodes
+    the invariant that every instance-backed module is a component, and
+    keeps back-compat for ``scene_runtime`` artifacts serialized before the
+    ``is_component_class`` field existed (a resume on such an artifact still
+    routes placed MonoBehaviours to the generic contract as it did before,
+    just without the new spawned-only coverage until re-planned)."""
+    by_stem: dict[str, list[Path]] = {}
+    for info in script_infos:
+        by_stem.setdefault(info.path.stem, []).append(info.path)
+    return _join_module_paths(
+        modules,
+        by_stem,
+        lambda m: bool(m.get("is_component_class") or m.get("runtime_bearing")),
+    )
+
+
+def _join_module_paths(
+    modules: dict[str, _SceneRuntimeModule],
+    by_stem: dict[str, list[Path]],
+    selects: Callable[[_SceneRuntimeModule], bool],
+) -> tuple[frozenset[Path], list[_BearingCollision]]:
+    """Join modules matching ``selects`` to their unambiguous ``.cs`` path.
+    Stem collisions (two .cs files share a stem) become ``_BearingCollision``
+    rows the orchestrator turns into fail-closed reasons, rather than
+    silently dropping the module to legacy."""
     paths: set[Path] = set()
     collisions: list[_BearingCollision] = []
     seen_collision_stems: set[str] = set()
     for module in modules.values():
-        if not module.get("runtime_bearing"):
+        if not selects(module):
             continue
         stem = module.get("stem") or ""
         if not stem:
@@ -522,8 +612,8 @@ def _runtime_bearing_paths(
                 ))
                 log.warning(
                     "[contract] stem %r appears on %d .cs files; cannot "
-                    "select a runtime-bearing path without disambiguation. "
-                    "Surfacing as a project-level fail-closed reason.",
+                    "select a path without disambiguation. Surfacing as a "
+                    "project-level fail-closed reason.",
                     stem, len(candidates),
                 )
             continue
@@ -555,7 +645,16 @@ def _build_require_graph(
     for stem, ids in seen.items():
         if len(ids) == 1:
             mod = modules[ids[0]]
-            resolved = mod.get("module_path") or ids[0]
+            # Prefer the planner's ``module_path`` when present. When it is
+            # absent (PR1 artifacts omit it until the storage classifier
+            # runs), the historical fallback used the script_id -- the .cs
+            # GUID. But ``_apply_require_resolutions`` splices that value
+            # verbatim into ``require(<value>)``, and a bare hex GUID is
+            # illegal Luau ("Malformed number"): the converted module won't
+            # load. Fall back instead to a runtime container lookup keyed by
+            # the file stem -- the same shape the rest of the pipeline emits
+            # for resolved sibling requires.
+            resolved = mod.get("module_path") or _container_lookup_expr(stem)
             by_stem[stem] = resolved
         else:
             collisions[stem] = sorted(ids)

@@ -205,6 +205,86 @@ class TestPipelineE2E:
         not is_populated(SIMPLEFPS_PATH),
         reason="SimpleFPS test project not available",
     )
+    def test_simplefps_embeds_scene_prefab_placements(self, tmp_path):
+        """Bug B tier-1 regression: the embedded host plan must carry the
+        pre-placed prefab placements, and the SceneRuntime engine must
+        carry the boot helper that constructs their clones.
+
+        Previously the ``_PLAN_KEYS_FOR_HOST`` allowlist dropped
+        ``scene_prefab_placements`` so the on-disk plan had ~252 rows but
+        the embedded ``SceneRuntimePlan`` ModuleScript had zero, and the
+        runtime boot loop iterated nothing.
+        """
+        from converter.pipeline import Pipeline
+        import xml.etree.ElementTree as ET
+
+        project = SIMPLEFPS_PATH
+        pipeline = Pipeline(
+            unity_project_path=project,
+            output_dir=tmp_path,
+            skip_upload=True,
+        )
+        # The scene-runtime host modules (SceneRuntime / SceneRuntimePlan)
+        # are only embedded under the generic contract mode; the legacy
+        # default emits neither, so the placement embed can't be exercised
+        # without opting in here.
+        pipeline.context.scene_runtime_mode = "generic"
+        pipeline.run_all()
+
+        rbxlx_files = list(tmp_path.glob("*.rbxlx"))
+        assert len(rbxlx_files) > 0
+        tree = ET.parse(str(rbxlx_files[0]))
+
+        def _module_source(name: str) -> str:
+            """Return the Luau Source of the embedded ModuleScript named
+            ``name`` (e.g. ``SceneRuntimePlan`` / ``SceneRuntime``)."""
+            for item in tree.iter("Item"):
+                if item.get("class") != "ModuleScript":
+                    continue
+                props = item.find("Properties")
+                if props is None:
+                    continue
+                item_name = next(
+                    (s.text for s in props.iter("string")
+                     if s.get("name") == "Name"),
+                    None,
+                )
+                if item_name != name:
+                    continue
+                source_el = next(
+                    (p for p in props.iter("ProtectedString")
+                     if p.get("name") == "Source"),
+                    None,
+                )
+                if source_el is not None and source_el.text:
+                    return source_el.text
+            return ""
+
+        plan_src = _module_source("SceneRuntimePlan")
+        assert plan_src, "embedded SceneRuntimePlan ModuleScript not found"
+        assert "scene_prefab_placements" in plan_src, (
+            "embedded SceneRuntimePlan must carry scene_prefab_placements; "
+            "the _PLAN_KEYS_FOR_HOST allowlist must include the key"
+        )
+        # Each placement row carries a ``placement_id``; count them as a
+        # proxy for non-empty placements. SimpleFPS authors ~252.
+        placement_rows = plan_src.count("placement_id")
+        assert placement_rows > 50, (
+            f"embedded plan should carry the pre-placed prefab placements "
+            f"(SimpleFPS has ~252); found {placement_rows} placement_id rows"
+        )
+
+        runtime_src = _module_source("SceneRuntime")
+        assert runtime_src, "embedded SceneRuntime ModuleScript not found"
+        assert "_constructPrefabClone" in runtime_src, (
+            "SceneRuntime engine must carry the tier-1 boot helper "
+            "_constructPrefabClone"
+        )
+
+    @pytest.mark.skipif(
+        not is_populated(SIMPLEFPS_PATH),
+        reason="SimpleFPS test project not available",
+    )
     def test_simplefps_no_orphans(self, tmp_path):
         """Verify all prefab instances are parented (zero orphans)."""
         from converter.pipeline import Pipeline

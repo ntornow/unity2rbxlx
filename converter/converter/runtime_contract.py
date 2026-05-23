@@ -102,6 +102,8 @@ def verify_module(source: str) -> VerificationResult:
     violations.extend(_check_lifecycle_assignments(statements, stripped))
     violations.extend(_check_constructor_purity(stripped, source))
     violations.extend(_check_unity_message_callbacks(statements, stripped, source))
+    violations.extend(_check_gameobject_touch(stripped, source))
+    violations.extend(_check_script_parent(stripped, source))
 
     # Source order for reprompt readability. Tie-break on rule letter so
     # output is deterministic across runs.
@@ -242,6 +244,49 @@ _TOKEN_RE = re.compile(
 _BLOCK_OPEN = frozenset({"function", "do", "if", "repeat"})
 _BLOCK_CLOSE = frozenset({"end", "until"})
 
+# Luau supports ``if`` as an EXPRESSION (``x = if cond then a else b``)
+# which has NO closing ``end`` -- distinct from the ``if`` STATEMENT
+# (``if cond then ... end``). Treating every ``if`` as a block-opener
+# over-counts depth on every if-expression and corrupts every rule that
+# consumes ``_iter_top_level_statements`` (rule d false-positives the
+# top-level return, etc.). The AI emits if-expressions naturally on config
+# defaults, so without this gate any module with one fails closed.
+#
+# An ``if`` is an EXPRESSION when the previous significant token is in an
+# expression-introducing position: ``=`` / ``(`` / ``,`` / ``{`` / ``[``
+# (RHS, argument, element), an arithmetic / comparison / concat operator,
+# or one of ``return`` / ``and`` / ``or`` / ``not``. Anything else (block
+# boundary, ``then`` / ``else`` / ``do`` keyword body, file start) starts
+# an if-STATEMENT.
+_EXPR_IF_PRECEDING_CHARS = frozenset("=,({[+*/%^<>~|")
+_EXPR_IF_PRECEDING_WORDS = frozenset({"return", "and", "or", "not"})
+
+
+def _is_expression_if(stripped: str, if_pos: int) -> bool:
+    """True iff the ``if`` token at ``if_pos`` introduces a Luau
+    if-EXPRESSION (no closing ``end``) rather than an if-statement."""
+    i = if_pos - 1
+    while i >= 0 and stripped[i].isspace():
+        i -= 1
+    if i < 0:
+        return False
+    ch = stripped[i]
+    if ch in _EXPR_IF_PRECEDING_CHARS:
+        return True
+    # Word: walk back over identifier chars and check membership. ``-`` is
+    # deliberately NOT in the char set: a unary ``-`` precedes an
+    # if-expression but a statement-level binary subtraction can also
+    # precede a fresh ``if`` statement on the next line; biasing toward
+    # statement-if (over-count) on ``-`` matches valid code more often than
+    # biasing toward expression-if (under-count would miss real if-blocks).
+    if ch.isalnum() or ch == "_":
+        j = i
+        while j >= 0 and (stripped[j].isalnum() or stripped[j] == "_"):
+            j -= 1
+        word = stripped[j + 1:i + 1]
+        return word in _EXPR_IF_PRECEDING_WORDS
+    return False
+
 
 @dataclass(frozen=True)
 class _Statement:
@@ -313,7 +358,10 @@ def _iter_top_level_statements(stripped: str, original: str):
         # Track depth changes.
         if kind == "word":
             if tok in _BLOCK_OPEN:
-                block += 1
+                if tok == "if" and _is_expression_if(stripped, m.start()):
+                    pass  # Luau if-EXPRESSION: no ``end`` to match.
+                else:
+                    block += 1
             elif tok in _BLOCK_CLOSE:
                 # ``end`` / ``until`` -- never let it go negative.
                 if block > 0:
@@ -679,6 +727,8 @@ def _extract_function_body(stripped: str, args_start: int):
             continue
         tok = tok_match.group()
         if tok in _BLOCK_OPEN:
+            if tok == "if" and _is_expression_if(stripped, tok_match.start()):
+                continue  # Luau if-expression: no ``end`` to match.
             block += 1
         elif tok in _BLOCK_CLOSE:
             block -= 1
@@ -778,4 +828,157 @@ def _check_returned_table_literal(statements, stripped: str, source: str, seen: 
                     f"``self.host:connect(...)`` inside ``Awake`` instead."
                 ),
             ))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Rule (g) -- GameObject ``.Touched`` / ``.TouchEnded`` on a raw GameObject.
+#
+# ``self.gameObject`` is frequently a Roblox ``Model`` (prefab placement);
+# ``.Touched`` / ``.TouchEnded`` are ``BasePart``-only signals and throw on
+# a Model (``Touched is not a valid member of Model``). The contract-
+# compliant shape resolves a touch part through the host:
+#
+#   self.host:connectGameObjectSignal(self.gameObject, "Touched", fn)
+#
+# Flag any ``<expr>.gameObject.Touched`` / ``.TouchEnded`` member access
+# (the broken idiom passed straight to ``host:connect``). The host helper
+# uses a string signal name, so the compliant shape never names ``.Touched``
+# as a member access -- this fires only on the broken pattern.
+# ---------------------------------------------------------------------------
+
+_RE_G_GAMEOBJECT_TOUCH = re.compile(
+    r"\.\s*gameObject\s*\.\s*(Touched|TouchEnded)\b",
+)
+
+
+def _check_gameobject_touch(stripped: str, source: str) -> list[Violation]:
+    out: list[Violation] = []
+    for m in _RE_G_GAMEOBJECT_TOUCH.finditer(stripped):
+        signal = m.group(1)
+        line = source.count("\n", 0, m.start()) + 1
+        out.append(Violation(
+            rule="g",
+            line=line,
+            message=(
+                f"``self.gameObject.{signal}`` accesses a BasePart-only "
+                f"signal on a GameObject that may be a Model (it throws on "
+                f"a Model). Use "
+                f"``self.host:connectGameObjectSignal(self.gameObject, "
+                f"\"{signal}\", fn)`` instead, which resolves a touch part."
+            ),
+        ))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Rule (h) -- ``script.Parent`` (the legacy Roblox idiom) in a host-bound
+# component module.
+#
+# A scene-runtime module is a class table the host ``require``s and
+# instantiates, handing it ``self.gameObject``. It has NO ``script.Parent``
+# relationship to the instance it drives -- a component class is shared by
+# every instance, and (when emitted as a detached ``Script``) ``script.Parent``
+# is whatever container the file landed in, not the GameObject. The legacy
+# transpile mode produces ``script.Parent`` / ``script.Parent.CFrame`` and
+# those throw at runtime (e.g. ``CFrame`` is nil on ServerScriptService).
+# A component MUST reach its instance through ``self.gameObject`` instead.
+#
+# ``\bscript\b`` anchors so identifiers like ``myscript.Parent`` don't match;
+# runs on the stripped source so a ``script.Parent`` in a string/comment is
+# not flagged. This is a BACKSTOP for the common legacy shape, not a complete
+# static guarantee -- the primary enforcement is routing components through
+# the generic prompt (which never emits ``script.Parent``). It is biased
+# toward FEWER false positives (a false fail-closed would sink an otherwise
+# good conversion now that fail-closed promotes to a hard error): if the
+# module shadows ``script`` with a local of the same name, ``script.Parent``
+# is field access on that local, not the Roblox global, so the check is
+# skipped entirely.
+# ---------------------------------------------------------------------------
+
+# Scope-aware token scan: ``script`` shadowed by a ``local`` only suppresses
+# violations within the SAME lexical scope (or an outer scope still in scope).
+# A harmless ``local script = self.config`` inside one function must not mask
+# a real ``script.Parent`` global access elsewhere in the module -- the
+# original module-wide bail was the Codex P3 finding on Fix #15. The walker
+# maintains a stack of scopes (one bool per enclosing block; True means
+# ``script`` is shadowed at this scope) and pushes/pops on Lua block
+# keywords.
+#
+# ``repeat...until`` has a special wrinkle: locals declared inside the
+# ``repeat`` block remain in scope for the ``until`` condition expression.
+# Popping on the ``until`` keyword itself would falsely flag
+# ``repeat local script = ... until script.Parent`` (Codex R2 finding). We
+# defer the pop to the first token whose position is past the end of the
+# until-condition line -- in practice every realistic until-condition fits
+# on a single line, and the safe direction (delaying the pop) errs toward
+# fewer false positives, matching the rule's existing bias.
+_RE_H_TOKENS = re.compile(
+    r"\blocal\s+script\b"
+    r"|\bscript\s*\.\s*Parent\b"
+    r"|\bfunction\b"
+    r"|\bdo\b"
+    r"|\bthen\b"
+    r"|\brepeat\b"
+    r"|\belseif\b"
+    r"|\belse\b"
+    r"|\bend\b"
+    r"|\buntil\b"
+)
+
+
+def _check_script_parent(stripped: str, source: str) -> list[Violation]:
+    out: list[Violation] = []
+    scopes: list[bool] = [False]  # module scope at index 0
+    # Position past which a pending repeat-scope pop should fire. The pop
+    # is triggered before processing the first token at or beyond this
+    # position (effectively "after the until expression's line").
+    pending_repeat_pop_at: int | None = None
+
+    for m in _RE_H_TOKENS.finditer(stripped):
+        if (pending_repeat_pop_at is not None
+                and m.start() >= pending_repeat_pop_at):
+            if len(scopes) > 1:
+                scopes.pop()
+            pending_repeat_pop_at = None
+
+        tok = m.group(0)
+        if tok.startswith("local"):
+            scopes[-1] = True
+        elif tok.startswith("script"):
+            if any(scopes):
+                continue
+            line = source.count("\n", 0, m.start()) + 1
+            out.append(Violation(
+                rule="h",
+                line=line,
+                message=(
+                    "``script.Parent`` is the legacy Roblox idiom and does not "
+                    "exist for a host-instantiated component module: the class "
+                    "table is shared across instances and has no parent edge to "
+                    "the GameObject it drives. Reach the instance through "
+                    "``self.gameObject`` (and its host helpers) instead."
+                ),
+            ))
+        elif tok in ("function", "do", "then", "repeat"):
+            scopes.append(False)
+        elif tok == "end":
+            if len(scopes) > 1:
+                scopes.pop()
+        elif tok == "until":
+            # Defer pop -- locals declared in the repeat block remain in
+            # scope through the until condition expression. The expression
+            # is taken to end at the next newline (line-based heuristic).
+            if len(scopes) > 1 and pending_repeat_pop_at is None:
+                eol = stripped.find("\n", m.end())
+                pending_repeat_pop_at = eol if eol != -1 else len(stripped)
+        elif tok == "else":
+            if len(scopes) > 1:
+                scopes.pop()
+            scopes.append(False)
+        elif tok == "elseif":
+            if len(scopes) > 1:
+                scopes.pop()
+            # The following ``then`` pushes the new branch scope.
+
     return out

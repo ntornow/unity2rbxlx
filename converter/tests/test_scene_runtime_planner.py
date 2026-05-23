@@ -19,11 +19,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import pytest
+
 from core.unity_types import (
     ComponentData,
     GuidEntry,
     GuidIndex,
     ParsedScene,
+    PrefabInstanceData,
     PrefabLibrary,
     PrefabNode,
     PrefabTemplate,
@@ -132,11 +135,13 @@ class TestPlanShape:
             unity_project_root=tmp_path,
         )
         assert set(artifact.keys()) == {
-            "modules", "scenes", "prefabs", "domain_overrides",
+            "modules", "scenes", "prefabs", "scene_prefab_placements",
+            "domain_overrides",
         }
         assert artifact["modules"] == {}
         assert artifact["scenes"] == {}
         assert artifact["prefabs"] == {}
+        assert artifact["scene_prefab_placements"] == []
         assert artifact["domain_overrides"] == {}
 
     def test_single_scene_emits_instance_with_scalar_config(self, tmp_path: Path):
@@ -965,3 +970,170 @@ class TestRequireGraph:
         graph = build_require_graph(modules)
         assert graph["by_stem"] == {}
         assert graph["collisions"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Bug B tier 1: pre-placed prefab instances → scene_prefab_placements
+# ---------------------------------------------------------------------------
+
+class TestScenePrefabPlacements:
+    def _door_prefab(
+        self, tmp_path: Path, script_guid: str,
+    ) -> tuple[PrefabTemplate, Path]:
+        cs = tmp_path / "Assets" / "Scripts" / "Door.cs"
+        cs.parent.mkdir(parents=True, exist_ok=True)
+        cs.write_text("public class Door : MonoBehaviour { }")
+        prefab_abs = tmp_path / "Assets" / "Prefabs" / "Door.prefab"
+        prefab_abs.parent.mkdir(parents=True, exist_ok=True)
+        prefab_abs.touch()
+        root = PrefabNode(
+            name="Door", file_id="1000", active=True, tag="Untagged",
+        )
+        root.components = [
+            ComponentData(
+                component_type="MonoBehaviour", file_id="1100",
+                properties=_mb_props(script_guid, go_fid="1000"),
+            )
+        ]
+        template = PrefabTemplate(
+            prefab_path=prefab_abs, name="Door", root=root,
+            all_nodes={"1000": root},
+        )
+        return template, cs
+
+    def test_single_placement_emits_row_bound_to_prefab_subplan(
+        self, tmp_path: Path,
+    ):
+        script_guid = "d" * 32
+        tmpl, cs = self._door_prefab(tmp_path, script_guid)
+        prefab_guid = "dd" + "0" * 30
+        idx = _make_guid_index(tmp_path, {
+            script_guid: (cs, "script"),
+            prefab_guid: (tmpl.prefab_path, "prefab"),
+        })
+        lib = PrefabLibrary()
+        lib.prefabs.append(tmpl)
+        lib.by_guid[prefab_guid] = tmpl
+
+        scene = _scene(
+            tmp_path / "Assets" / "Scenes" / "Level.unity", roots=[],
+        )
+        scene.prefab_instances = [PrefabInstanceData(
+            file_id="555",
+            source_prefab_guid=prefab_guid,
+            source_prefab_file_id="0",
+            transform_parent_file_id="",
+            modifications=[],
+        )]
+
+        artifact = plan_scene_runtime(
+            parsed_scenes=[scene], prefab_library=lib, guid_index=idx,
+            unity_project_root=tmp_path,
+        )
+
+        placements = artifact["scene_prefab_placements"]
+        assert len(placements) == 1
+        row = placements[0]
+        # placement_id is the placement's own scene fileID, scene-namespaced.
+        assert row["placement_id"] == "Assets/Scenes/Level.unity:555"
+        # prefab_id matches the subplan key (so the runtime can look it up).
+        assert row["prefab_id"] in artifact["prefabs"]
+        assert row["prefab_id"] == f"{prefab_guid}:Assets/Prefabs/Door.prefab"
+        # Tier 1 defaults active/enabled true; root placement → no parent key.
+        assert row["active"] is True
+        assert row["enabled"] is True
+        assert "parent_game_object_id" not in row
+
+    def test_parent_game_object_id_resolves_via_transform_fid_map(
+        self, tmp_path: Path,
+    ):
+        script_guid = "d" * 32
+        tmpl, cs = self._door_prefab(tmp_path, script_guid)
+        prefab_guid = "dd" + "0" * 30
+        idx = _make_guid_index(tmp_path, {
+            script_guid: (cs, "script"),
+            prefab_guid: (tmpl.prefab_path, "prefab"),
+        })
+        lib = PrefabLibrary()
+        lib.prefabs.append(tmpl)
+        lib.by_guid[prefab_guid] = tmpl
+
+        # A scene parent GameObject "300", whose Transform has fileID "301".
+        parent_go = _node("300", "Room")
+        scene = _scene(
+            tmp_path / "Assets" / "Scenes" / "Level.unity", roots=[parent_go],
+        )
+        # The YAML parser populates this Transform-fileID → GO-fileID map.
+        scene.transform_fid_to_go_fid = {"301": "300"}
+        scene.prefab_instances = [PrefabInstanceData(
+            file_id="555",
+            source_prefab_guid=prefab_guid,
+            source_prefab_file_id="0",
+            transform_parent_file_id="301",  # the parent's Transform fileID
+            modifications=[],
+        )]
+
+        artifact = plan_scene_runtime(
+            parsed_scenes=[scene], prefab_library=lib, guid_index=idx,
+            unity_project_root=tmp_path,
+        )
+
+        row = artifact["scene_prefab_placements"][0]
+        assert row["parent_game_object_id"] == "Assets/Scenes/Level.unity:300"
+
+    def test_unresolvable_source_prefab_skipped(self, tmp_path: Path):
+        # A placement whose source prefab GUID has no template in the
+        # library produces no placement row (nothing to boot against).
+        idx = _make_guid_index(tmp_path, {})
+        lib = PrefabLibrary()
+        scene = _scene(
+            tmp_path / "Assets" / "Scenes" / "Level.unity", roots=[],
+        )
+        scene.prefab_instances = [PrefabInstanceData(
+            file_id="555",
+            source_prefab_guid="f" * 32,
+            source_prefab_file_id="0",
+            transform_parent_file_id="",
+            modifications=[],
+        )]
+        artifact = plan_scene_runtime(
+            parsed_scenes=[scene], prefab_library=lib, guid_index=idx,
+            unity_project_root=tmp_path,
+        )
+        assert artifact["scene_prefab_placements"] == []
+
+    def test_binary_scene_emits_no_parent_when_transform_map_empty(
+        self, tmp_path: Path,
+    ):
+        # Binary scenes don't populate transform_fid_to_go_fid
+        # (binary_scene_parser.py). A placement still emits but omits the
+        # parent key — documented gap, full binary placement support is
+        # out of scope all tiers.
+        script_guid = "d" * 32
+        tmpl, cs = self._door_prefab(tmp_path, script_guid)
+        prefab_guid = "dd" + "0" * 30
+        idx = _make_guid_index(tmp_path, {
+            script_guid: (cs, "script"),
+            prefab_guid: (tmpl.prefab_path, "prefab"),
+        })
+        lib = PrefabLibrary()
+        lib.prefabs.append(tmpl)
+        lib.by_guid[prefab_guid] = tmpl
+        scene = _scene(
+            tmp_path / "Assets" / "Scenes" / "Level.unity", roots=[],
+        )
+        scene.transform_fid_to_go_fid = {}  # binary scene leaves this empty
+        scene.prefab_instances = [PrefabInstanceData(
+            file_id="555",
+            source_prefab_guid=prefab_guid,
+            source_prefab_file_id="0",
+            transform_parent_file_id="301",  # would-be parent, unmappable
+            modifications=[],
+        )]
+        artifact = plan_scene_runtime(
+            parsed_scenes=[scene], prefab_library=lib, guid_index=idx,
+            unity_project_root=tmp_path,
+        )
+        placements = artifact["scene_prefab_placements"]
+        assert len(placements) == 1
+        assert "parent_game_object_id" not in placements[0]

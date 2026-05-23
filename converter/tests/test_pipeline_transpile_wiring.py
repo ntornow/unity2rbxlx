@@ -373,3 +373,80 @@ class TestTranspileShortCircuitOnNoScripts:
 
         assert not mock_contract.called
         assert not mock_legacy.called
+
+
+# ---------------------------------------------------------------------------
+# Legacy repair passes gated OFF in generic mode (contract allowlist).
+#
+# ``Pipeline._subphase_cohere_scripts`` runs three post-transpile passes:
+#   1. ``rewrite_asset_references`` — allowlisted, runs in BOTH modes.
+#   2. ``inject_require_calls`` — legacy require injection, OFF in generic.
+#   3. ``fix_require_classifications`` -> ``run_packs`` — legacy coherence
+#      packs, OFF in generic.
+#
+# The scene-runtime contract (docs/design/scene-runtime-contract.md:151-169)
+# is an allowlist: ALL legacy repair passes are OFF in generic. Before this
+# gate, the legacy door-tween pack ran in generic and appended a dead
+# ``script.Parent``-based ``do...end`` block to the generic Door ModuleScript.
+# ---------------------------------------------------------------------------
+
+
+def _make_generic_door_script():
+    """A generic-mode Door ModuleScript shaped like SimpleFPS's: flips the
+    ``open`` attribute on a sibling ``door`` mesh, ends with ``return Door``.
+    Trips the ``door_tween_open`` pack detector."""
+    from core.roblox_types import RbxScript
+
+    return RbxScript(
+        name="Door",
+        source=(
+            "local Door = {}\n"
+            "Door.__index = Door\n\n"
+            "function Door:getDoorAnim()\n"
+            '    return self.gameObject.Parent:FindFirstChild("door")\n'
+            "end\n\n"
+            "function Door:ToggleDoor(value)\n"
+            "    local doorAnim = self:getDoorAnim()\n"
+            "    if doorAnim then\n"
+            '        doorAnim:SetAttribute("open", value)\n'
+            "    end\n"
+            "end\n\n"
+            "return Door\n"
+        ),
+        script_type="ModuleScript",
+    )
+
+
+class TestLegacyRepairPassesGatedInGeneric:
+
+    def test_generic_mode_skips_coherence_packs_on_door(
+        self, tmp_path: Path,
+    ) -> None:
+        """In generic mode the legacy door-tween pack must NOT run, so the
+        Door module gets no ``_AutoFpsDoorTweenInjected`` block, no appended
+        ``do`` block, and still ends with its terminal ``return Door``."""
+        pipeline = _make_pipeline(tmp_path)
+        pipeline.ctx.scene_runtime_mode = "generic"
+        door = _make_generic_door_script()
+        pipeline.state.rbx_place.scripts = [door]
+
+        pipeline._subphase_cohere_scripts()
+
+        assert "_AutoFpsDoorTweenInjected" not in door.source
+        assert "script.Parent" not in door.source
+        assert door.source.rstrip().endswith("return Door")
+
+    def test_legacy_mode_still_runs_coherence_packs_on_door(
+        self, tmp_path: Path,
+    ) -> None:
+        """Legacy mode is unchanged: the door-tween pack still fires and
+        injects its block (proving the gate is mode-specific, not a global
+        disable)."""
+        pipeline = _make_pipeline(tmp_path)
+        assert pipeline.ctx.scene_runtime_mode == "legacy"
+        door = _make_generic_door_script()
+        pipeline.state.rbx_place.scripts = [door]
+
+        pipeline._subphase_cohere_scripts()
+
+        assert "_AutoFpsDoorTweenInjected" in door.source

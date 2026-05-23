@@ -65,6 +65,19 @@ def _e2e_output_dir(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def _scene_runtime_mode() -> str:
+    """Return the scene-runtime mode the offline-assembly test should drive.
+
+    Honours ``E2E_SCENE_RUNTIME_MODE`` (set by the ``/e2e-test`` skill).
+    Defaults to ``"legacy"`` so a run with the env var unset is
+    byte-identical to the historical behaviour: ctx loads from disk in
+    legacy mode and scripts emit as auto-running top-level Scripts. When
+    set to ``"generic"`` the test drives the scene-runtime contract
+    (ModuleScripts hosted by an embedded SceneRuntime).
+    """
+    return os.environ.get("E2E_SCENE_RUNTIME_MODE", "legacy")
+
+
 def _write_conversion_manifest(
     output_dir: Path,
     *,
@@ -72,6 +85,7 @@ def _write_conversion_manifest(
     rbxlx_path: Path,
     started_at: str,
     started_monotonic: float,
+    scene_runtime_mode: str = "legacy",
 ) -> None:
     """Emit the conversion_manifest.json artifact contract.
 
@@ -89,6 +103,7 @@ def _write_conversion_manifest(
         "project": project,
         "run_id": os.environ.get("E2E_RUN_ID", "unset"),
         "rbxlx_path": str(rbxlx_path.resolve()),
+        "scene_runtime_mode": scene_runtime_mode,
         "started_at": started_at,
         "finished_at": finished_at,
         "duration_seconds": duration_seconds,
@@ -285,6 +300,70 @@ def _assert_mesh_ids_match_snapshot(rbxlx_path: Path, snapshot: dict) -> None:
     )
 
 
+def _module_script_source(rbxlx_path: Path, module_name: str) -> str:
+    """Return the embedded Source of the ModuleScript named *module_name*.
+
+    Parses the rbxlx with ElementTree, finds the ``<Item
+    class="ModuleScript">`` whose ``<string name="Name">`` matches, and
+    returns the text of its ``<ProtectedString name="Source">`` (CDATA is
+    surfaced as element text). Returns ``""`` when the module is absent so
+    callers can assert on emptiness with a clear message.
+    """
+    import xml.etree.ElementTree as ET
+
+    tree = ET.parse(rbxlx_path)
+    for item in tree.iter("Item"):
+        if item.get("class") != "ModuleScript":
+            continue
+        props = item.find("Properties")
+        if props is None:
+            continue
+        name_el = props.find('./string[@name="Name"]')
+        if name_el is None or (name_el.text or "") != module_name:
+            continue
+        src_el = props.find('./ProtectedString[@name="Source"]')
+        return (src_el.text or "") if src_el is not None else ""
+    return ""
+
+
+def _assert_generic_scene_runtime(rbxlx_path: Path) -> None:
+    """Generic-mode assertions: tier-1 prefab placements reach the host.
+
+    1. The embedded ``SceneRuntimePlan`` ModuleScript carries
+       ``scene_prefab_placements`` with > 50 placement rows (SimpleFPS has
+       ~252; we count ``placement_id`` occurrences in the plan source).
+    2. The embedded ``SceneRuntime`` ModuleScript source defines
+       ``_constructPrefabClone`` (the boot path that instantiates the
+       pre-placed prefab clones).
+    """
+    plan_src = _module_script_source(rbxlx_path, "SceneRuntimePlan")
+    assert plan_src, (
+        "generic mode produced no SceneRuntimePlan ModuleScript — the "
+        "scene-runtime host plan was never embedded."
+    )
+    assert "scene_prefab_placements" in plan_src, (
+        "SceneRuntimePlan does not carry scene_prefab_placements — the "
+        "planner did not emit prefab placements or autogen dropped the "
+        "_PLAN_KEYS_FOR_HOST key."
+    )
+    placement_rows = plan_src.count("placement_id")
+    assert placement_rows > 50, (
+        f"SceneRuntimePlan carries only {placement_rows} placement rows "
+        f"(expected > 50; SimpleFPS has ~252). Prefab placements are not "
+        f"reaching the embedded plan."
+    )
+
+    runtime_src = _module_script_source(rbxlx_path, "SceneRuntime")
+    assert runtime_src, (
+        "generic mode produced no SceneRuntime ModuleScript — the "
+        "scene-runtime host was never embedded."
+    )
+    assert "_constructPrefabClone" in runtime_src, (
+        "SceneRuntime source is missing _constructPrefabClone — the "
+        "tier-1 prefab-clone boot path is absent from the host runtime."
+    )
+
+
 def _assert_place_builder_chunks_publishable(rbx_place) -> None:
     """Generate the place-builder Luau chunks and assert publish viability.
 
@@ -417,6 +496,17 @@ class TestOfflineAssembly:
         # uploaded_assets/mesh maps already populated, so load the ctx
         # explicitly before running.
         pipeline.ctx = ConversionContext.load(pipeline._context_path)
+
+        # Scene-runtime mode is env-driven (default "legacy" — byte-identical
+        # to the historical behaviour). When "generic", drive the
+        # scene-runtime contract (ModuleScripts hosted by an embedded
+        # SceneRuntime) in single-player config. ConversionContext.load
+        # defaults to legacy, so we override after load and before run_all().
+        mode = _scene_runtime_mode()
+        if mode == "generic":
+            pipeline.ctx.scene_runtime_mode = "generic"
+            pipeline.ctx.networking_mode = "none"
+
         ctx = pipeline.run_all()
 
         # Drift gate first — most actionable failure when snapshot is stale.
@@ -430,6 +520,27 @@ class TestOfflineAssembly:
         rbxlx = rbxlx_files[0]
         _assert_no_placeholder_ids(rbxlx)
         _assert_mesh_ids_match_snapshot(rbxlx, snapshot)
+
+        # Generic-mode only: assert the scene-runtime contract embeds the
+        # tier-1 prefab placements + boot path. Legacy assertions above
+        # still run in both modes.
+        if mode == "generic":
+            # Fail-closed gate (Fix #15 Root A): a runtime-bearing module
+            # that survives reprompt still broken promotes a "contract
+            # failed closed" error onto ctx.errors. run_all() does not raise
+            # on it and the rbxlx still gets written, so without this
+            # assertion a structurally-broken place (e.g. a stubbed
+            # Player.luau that throws at boot) would pass the suite green.
+            contract_failures = [
+                e for e in ctx.errors
+                if "scene-runtime contract failed closed" in e
+            ]
+            assert not contract_failures, (
+                "generic conversion shipped with contract fail-closed "
+                "errors — the place will throw at boot:\n  "
+                + "\n  ".join(contract_failures)
+            )
+            _assert_generic_scene_runtime(rbxlx)
 
         # Publish-stage artifact (still no cloud)
         rbx_place = getattr(ctx, "rbx_place", None) or pipeline.state.rbx_place
@@ -450,6 +561,7 @@ class TestOfflineAssembly:
             rbxlx_path=rbxlx,
             started_at=started_at,
             started_monotonic=started_monotonic,
+            scene_runtime_mode=mode,
         )
 
     @pytest.mark.skipif(

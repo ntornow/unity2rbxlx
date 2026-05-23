@@ -139,6 +139,11 @@ end
 --   fixedStep      -- number (seconds) for FixedUpdate accumulator
 --                     (Unity's default is 0.02).
 --   now            -- ``function() -> number`` (monotonic seconds).
+--   players        -- the ``Players`` service (or a stub exposing
+--                     ``GetPlayerFromCharacter``). Used by
+--                     ``playerFromTouch`` / ``isPlayerTouch`` to
+--                     normalize a touched BasePart to its owning Player.
+--                     Optional: nil -> ``playerFromTouch`` returns nil.
 -- ---------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------
@@ -218,6 +223,16 @@ function SceneRuntime.new(services, plan)
 	-- Instance (so ``destroy(clone)`` can find the descendants to tear
 	-- down without re-walking).
 	self._prefabClones = {}
+
+	-- Monotonic counter for runtime-spawn placement ids. Each
+	-- ``instantiatePrefab`` mints ``_rt_<seq>`` and stamps every cloned
+	-- descendant's ``_SceneRuntimeId`` with that prefix so internal map
+	-- keys (``_componentsByGameObject``, ``_goActiveSelf``, ...) and the
+	-- read-path resolvers (``services.getInstanceId`` / the cascade
+	-- helpers) agree on a per-placement identity. Without this the
+	-- prefab-local goid collides across placements and ``setActive`` /
+	-- ``destroy`` on the second clone silently no-ops.
+	self._rtPlacementSeq = 0
 
 	-- FixedUpdate accumulator.
 	self._fixedStep = services.fixedStep or (1 / 50)
@@ -303,6 +318,166 @@ function SceneRuntime:_unregister(componentInstance)
 		end
 	end
 	self._meta[componentInstance] = nil
+end
+
+-- ---------------------------------------------------------------------
+-- Touch / collision helpers (Piece 6 -- generic touch contract)
+--
+-- A prefab-placement component's ``self.gameObject`` is a Roblox
+-- ``Model`` (the resolved Instance is the placed prefab root), but the
+-- contract taught ``self.host:connect(self.gameObject.Touched, ...)`` --
+-- and ``.Touched`` is a ``BasePart``-only signal. On a Model it threw
+-- ``Touched is not a valid member of Model`` and every Pickup / Door /
+-- Turret died in ``Awake``. ``getTouchPart`` resolves a representative
+-- BasePart to host the signal; ``connectGameObjectSignal`` wires it
+-- through the lifecycle-tracked ``connect`` machinery so the
+-- subscription is gated / disarmed / cleaned up exactly like
+-- ``self.host:connect``.
+--
+-- Selection logic mirrors the legacy (non-generic) trigger-part finder
+-- the generic contract regressed (code_transpiler.py findTriggerPart).
+-- PrimaryPart is deliberately NOT used as the key: it carries pivot
+-- semantics and PrimaryPart emission is documented unsupported.
+-- ---------------------------------------------------------------------
+
+-- Synthetic / authored trigger-child names the converter (or a Unity
+-- prefab author) emits for proximity volumes. ``TriggerZone`` is the
+-- synthetic child scene_converter emits for a Unity Collider-with-trigger.
+local _TRIGGER_CHILD_NAMES: {string} = {
+	"TriggerZone", "Trigger", "Collider", "Colliders", "Detector",
+	"Sensor", "Hitbox", "Range", "ProximityVolume", "PickupTouchDetector",
+}
+
+local function _isBasePart(inst): boolean
+	return inst ~= nil
+		and type(inst.IsA) == "function"
+		and inst:IsA("BasePart")
+end
+
+-- Returns true when ``inst`` looks like an explicitly-named trigger
+-- volume (matches a known name OR has ``*TouchDetector*`` / ``*Trigger*``
+-- in its name) that can actually receive touches.
+local function _looksLikeNamedTrigger(inst): boolean
+	if not _isBasePart(inst) then return false end
+	if inst.CanTouch == false then return false end
+	local name = inst.Name
+	for _, n in ipairs(_TRIGGER_CHILD_NAMES) do
+		if name == n then return true end
+	end
+	if string.find(name, "TouchDetector") or string.find(name, "Trigger") then
+		return true
+	end
+	return false
+end
+
+-- ``getTouchPart(go) -> BasePart?``: resolve a representative part to
+-- host a Touched/TouchEnded signal for a GameObject.
+--   * BasePart  -> itself.
+--   * Model     -> tiered descendant search:
+--       (1) a named trigger child (TriggerZone / *TouchDetector* /
+--           *Trigger* ...) with CanTouch;
+--       (2) the first invisible (Transparency>=0.99) non-MeshPart
+--           BasePart with CanTouch;
+--       (3) the first BasePart descendant.
+--     PrimaryPart is never the primary key.
+--   * anything else / no part -> nil.
+function SceneRuntime:getTouchPart(go)
+	if go == nil then return nil end
+	if _isBasePart(go) then
+		return go
+	end
+	if type(go.IsA) ~= "function" or not go:IsA("Model") then
+		return nil
+	end
+	local descendants = go:GetDescendants()
+	-- Tier 1: an explicitly-named trigger child.
+	for _, d in ipairs(descendants) do
+		if _looksLikeNamedTrigger(d) then
+			return d
+		end
+	end
+	-- Tier 2: an invisible non-mesh trigger volume with CanTouch.
+	for _, d in ipairs(descendants) do
+		if _isBasePart(d)
+			and d.CanTouch ~= false
+			and (d.Transparency or 0) >= 0.99
+			and not d:IsA("MeshPart")
+		then
+			return d
+		end
+	end
+	-- Tier 3: any BasePart descendant.
+	for _, d in ipairs(descendants) do
+		if _isBasePart(d) then
+			return d
+		end
+	end
+	return nil
+end
+
+-- ``connectGameObjectSignal(comp, go, signalName, fn) -> connection?``:
+-- resolve the touch part via ``getTouchPart`` and connect
+-- ``part[signalName]`` (e.g. "Touched" / "TouchEnded") through the
+-- lifecycle-tracked ``connect`` machinery. Fails soft (warns + returns
+-- nil) when no part resolves -- never throws.
+function SceneRuntime:connectGameObjectSignal(comp, go, signalName, fn)
+	assert(type(fn) == "function",
+		"connectGameObjectSignal: fn must be function")
+	assert(type(signalName) == "string" and signalName ~= "",
+		"connectGameObjectSignal: signalName required")
+	local part = self:getTouchPart(go)
+	if part == nil then
+		self._warn(string.format(
+			"[scene_runtime] connectGameObjectSignal: no touch part on %s",
+			tostring(go)))
+		return nil
+	end
+	local signal = part[signalName]
+	if signal == nil then
+		self._warn(string.format(
+			"[scene_runtime] connectGameObjectSignal: %s has no %s signal",
+			tostring(part), tostring(signalName)))
+		return nil
+	end
+	return self:connect(comp, signal, fn)
+end
+
+-- ``playerFromTouch(other) -> Player?``: given the BasePart that fired a
+-- Touched signal, walk ancestors to the character Model and return the
+-- owning Player. R15 / accessory parts have the Accessory model as their
+-- immediate parent, so a flat ``other.Parent`` lookup misses them --
+-- ``FindFirstAncestorWhichIsA("Model")`` resolves both. Mirrors the
+-- working pattern in pickup_runtime.luau + the script_coherence rewrite.
+function SceneRuntime:playerFromTouch(other)
+	if other == nil then return nil end
+	local players = self._services.players
+	if players == nil then return nil end
+	-- Walk ancestors looking for the character Model -- a Model that
+	-- carries a Humanoid. This handles BOTH the common case (limb whose
+	-- immediate Parent is the character) AND accessory-mounted parts
+	-- (handle -> Accessory model -> character), where a single
+	-- ``other.Parent`` or nearest-ancestor-Model lookup picks the wrong
+	-- Model. Cap the climb so a deep workspace tree can't loop forever.
+	local node = other.Parent
+	local guard = 0
+	while node ~= nil and guard < 16 do
+		guard += 1
+		if type(node.IsA) == "function" and node:IsA("Model")
+			and type(node.FindFirstChildWhichIsA) == "function"
+			and node:FindFirstChildWhichIsA("Humanoid")
+		then
+			return players:GetPlayerFromCharacter(node)
+		end
+		node = node.Parent
+	end
+	return nil
+end
+
+-- ``isPlayerTouch(other) -> boolean``: convenience boolean wrapper around
+-- ``playerFromTouch`` for the common ``if self.host.isPlayerTouch(other)``
+-- gate.
+function SceneRuntime:isPlayerTouch(other)
+	return self:playerFromTouch(other) ~= nil
 end
 
 -- ---------------------------------------------------------------------
@@ -398,6 +573,38 @@ function SceneRuntime:_makeHostSurface(owner)
 				return engine:connect(owner, arg2, arg3)
 			end
 			return engine:connect(arg1, arg2, arg3)
+		end,
+		getTouchPart = function(arg1, arg2)
+			-- Colon: host:getTouchPart(go) -> arg1=host, arg2=go
+			-- Dotted: host.getTouchPart(go) -> arg1=go
+			if arg1 == host then
+				return engine:getTouchPart(arg2)
+			end
+			return engine:getTouchPart(arg1)
+		end,
+		connectGameObjectSignal = function(arg1, arg2, arg3, arg4)
+			-- Colon: host:connectGameObjectSignal(go, signalName, fn)
+			--   arg1=host, arg2=go, arg3=signalName, arg4=fn
+			-- Dotted: host.connectGameObjectSignal(go, signalName, fn)
+			--   arg1=go, arg2=signalName, arg3=fn
+			-- The contract teaches the colon form; the subscription is
+			-- owned by ``owner`` so it tears down with the component.
+			if arg1 == host then
+				return engine:connectGameObjectSignal(owner, arg2, arg3, arg4)
+			end
+			return engine:connectGameObjectSignal(owner, arg1, arg2, arg3)
+		end,
+		playerFromTouch = function(arg1, arg2)
+			if arg1 == host then
+				return engine:playerFromTouch(arg2)
+			end
+			return engine:playerFromTouch(arg1)
+		end,
+		isPlayerTouch = function(arg1, arg2)
+			if arg1 == host then
+				return engine:isPlayerTouch(arg2)
+			end
+			return engine:isPlayerTouch(arg1)
 		end,
 	}
 	return host
@@ -626,13 +833,26 @@ end
 -- Reference wiring
 -- ---------------------------------------------------------------------
 
-function SceneRuntime:_resolveReferenceTarget(refRow, componentByInstanceId)
+function SceneRuntime:_resolveReferenceTarget(refRow, componentByInstanceId, placement_id)
 	local target_kind = refRow.target_kind
 	local target_ref = refRow.target_ref
 	if target_kind == "component" then
 		return componentByInstanceId[target_ref]
 	elseif target_kind == "gameobject" then
 		-- Resolve to the Roblox Instance via _SceneRuntimeId attribute.
+		-- Inside a prefab placement (``placement_id`` non-empty), every
+		-- cloned descendant's SRI has been re-stamped to
+		-- ``<placement>:<raw>`` so the workspace lookup must use the same
+		-- namespace; the harness path (with no upfront re-stamp) falls
+		-- back to the raw lookup. Codex round-3: without this branch the
+		-- intra-prefab gameobject refs resolve to nil (production) or to
+		-- the wrong placement's clone (when multiple placements share a
+		-- raw SRI).
+		if placement_id ~= nil and placement_id ~= "" then
+			local ns_ref = placement_id .. ":" .. target_ref
+			local hit = self._services.workspaceFind(ns_ref)
+			if hit ~= nil then return hit end
+		end
 		return self._services.workspaceFind(target_ref)
 	elseif target_kind == "prefab" then
 		-- The host injects the stable prefab_id; modules pass it to
@@ -681,7 +901,8 @@ function SceneRuntime:_assignFieldOnComponent(instance, field, index, value)
 end
 
 function SceneRuntime:_wireReferences(refs, componentByInstanceId,
-                                       crossDomainEdges, instanceById)
+                                       crossDomainEdges, instanceById,
+                                       placement_id)
 	-- ``instanceById`` is the planner's per-scene/prefab
 	-- instance_id -> instance row map, used to resolve a target's
 	-- ``script_id`` (and therefore its domain via plan.modules) even
@@ -690,11 +911,19 @@ function SceneRuntime:_wireReferences(refs, componentByInstanceId,
 	-- process ("client" or "server"), so the opposite-side component
 	-- never exists locally -- the cross-domain log + edge tracking
 	-- must be plan-based, not registry-based.
+	--
+	-- ``placement_id`` (optional): when wiring references for an
+	-- intra-prefab placement, the runtime has re-stamped every cloned
+	-- descendant's ``_SceneRuntimeId`` to ``<placement>:<raw>``. Pass it
+	-- through so ``gameobject`` ref lookups namespace their target_ref
+	-- the same way -- otherwise the ref resolves to nil (or to a
+	-- different placement's clone whose SRI happens to still be raw).
 	local modules = self._plan.modules or {}
 	for _, ref in ipairs(refs) do
 		local sourceComp = componentByInstanceId[ref["from"]]
 		if sourceComp ~= nil then
-			local target = self:_resolveReferenceTarget(ref, componentByInstanceId)
+			local target = self:_resolveReferenceTarget(
+				ref, componentByInstanceId, placement_id)
 			-- Cross-domain policy: if both source module and target
 			-- module have assigned non-legacy domains and they differ,
 			-- inject ``nil`` and surface the edge. Resolve via the plan
@@ -1245,7 +1474,15 @@ function SceneRuntime:destroy(target)
 		self:_destroyComponent(target)
 		return
 	end
-	if type(target) ~= "table" then return end
+	-- Otherwise target is a Roblox Instance (userdata in real Luau; the test
+	-- harness substitutes a table). ``type()`` distinguishes those: live
+	-- Roblox Models are ``"userdata"`` not ``"table"``, so the old guard
+	-- ``type(target) ~= "table"`` early-returned on EVERY real Instance,
+	-- silently turning ``host.destroy(self.gameObject)`` into a no-op for
+	-- e.g. ``Pickup``'s on-touch cleanup. Accept either shape; reject only
+	-- primitives / nil where the descendant walk has nothing to chew on.
+	local t = type(target)
+	if t ~= "table" and t ~= "userdata" then return end
 	-- Walk the Roblox instance tree deepest-first via the services.
 	if self._services.collectDescendantIds then
 		local ids = self._services.collectDescendantIds(target)
@@ -1298,6 +1535,236 @@ end
 -- Prefab instantiation
 -- ---------------------------------------------------------------------
 
+-- Construct (but do NOT run the lifecycle for) the components of a prefab
+-- subplan against a live ``clone`` root. Shared by ``instantiatePrefab``
+-- (runtime script-triggered spawn) and ``start()``'s pre-placed-placement
+-- boot (Bug B tier 1). Returns the constructed ``componentList`` ready to
+-- hand to ``_runAwakeEnableStart``; the caller owns the lifecycle batch so
+-- placement boots can append to the global Awake/OnEnable/Start ordering.
+--
+-- ``includeScriptId`` (optional): when a table, only instances whose
+-- ``script_id`` is a key are constructed (domain filtering for the boot
+-- path). When nil, every instance is constructed — ``instantiatePrefab``'s
+-- original unfiltered behavior (a runtime spawn isn't domain-gated).
+--
+-- ``externalRefs`` (optional): caller-supplied per-instance field overrides
+-- applied after intra-prefab references wire (``instantiatePrefab`` only).
+--
+-- ``clone`` resolution: when a clone root Instance is supplied
+-- (``instantiatePrefab``), prefab-local GameObject ids resolve via
+-- ``resolveCloneChild(clone, id)`` scoped under that clone. When ``clone``
+-- is nil (``start()``'s pre-placed-placement boot, Bug B tier 1), the
+-- placement clone already lives in the live tree stamped with its
+-- prefab-local ``_SceneRuntimeId``s, so ids resolve via ``workspaceFind`` —
+-- the same global lookup the scene boot path uses. For a SINGLE placement
+-- this returns the one correct clone descendant (duplicate-placement
+-- identity is tier 2).
+-- Compose a placement-scoped GameObject id from a prefab-local one.
+-- Returns ``placement_id .. ":" .. goid`` when both are present and non-empty;
+-- otherwise returns ``goid`` unchanged. Centralised so every read AND write
+-- site agrees on the encoding (the round-1 fix only namespaced writes and
+-- left ``setActive`` / ``destroy`` to look up by the raw goid, silently
+-- no-opping on multi-placement clones -- Codex P1 round 2).
+local function _idWithPlacement(placement_id, goid)
+	if placement_id ~= nil and placement_id ~= "" and goid ~= nil then
+		return placement_id .. ":" .. goid
+	end
+	return goid
+end
+
+function SceneRuntime:_constructPrefabClone(clone, prefab, prefab_id, includeScriptId, externalRefs, placement_id)
+	-- Build a per-instance map for the prefab subplan; references are
+	-- prefab-local so the same logic applies as for scenes.
+	--
+	-- ``placement_id`` namespaces every prefab-local game_object_id used
+	-- in this construction. The Roblox lookup goes by the prefab-local
+	-- (un-namespaced) id BEFORE stamping -- after we find the live clone
+	-- descendant, we SetAttribute its ``_SceneRuntimeId`` to the
+	-- namespaced id so the runtime's read paths (``getInstanceId`` ->
+	-- ``_componentsByGameObject`` / ``_goActiveSelf`` / ``_goParentId``)
+	-- all agree on this clone's identity. The next placement's iteration
+	-- of the SAME prefab_id then sees the previous clone's attribute
+	-- mismatch and skips it, binding to a different workspace clone.
+	-- A nil/empty placement_id is a no-op for stamping -- preserves
+	-- legacy single-placement / harness behaviour.
+	local componentByInstanceId = {}
+	local componentList = {}
+	local instanceById = {}
+
+	-- UPFRONT walk: re-stamp every cloned descendant whose ``_SceneRuntimeId``
+	-- starts with this prefab's namespace (``<prefab_id>:``) so the final
+	-- attribute reads ``<placement_id>:<old_sri>``. This covers BOTH MB-
+	-- bearing hosts (which the per-component loop revisits) and unscripted
+	-- ancestors / non-MB descendants that the loop never sees. Skipping the
+	-- non-MB nodes (the round-2 round-1 design) left the parent map keyed
+	-- on ``<placement>:child -> <placement>:root`` while ``root``'s
+	-- ``_SceneRuntimeId`` stayed raw, so ``setActive(root, false)`` wrote
+	-- to the wrong key and ``setActive(child, true)`` cascade missed the
+	-- inactive ancestor (Codex R3). One walk per placement, before the
+	-- per-component loop, means every later lookup (here AND in
+	-- ``_wireReferences``) sees a consistently namespaced view.
+	local function _stamp_descendants_upfront()
+		if clone == nil or placement_id == nil or placement_id == ""
+		   or prefab_id == nil or prefab_id == "" then
+			return
+		end
+		local prefix = prefab_id .. ":"
+		-- ``clone`` may be a MID-level prefab node: the planner only emits
+		-- MB-bearing rows in ``prefab.instances``, so when no MonoBehaviour
+		-- sits at the authored prefab root, ``_findUnboundClonePerPrefab``
+		-- resolves to a descendant (the first one that DOES carry an MB).
+		-- Walk UP via ``.Parent`` while the parent's _SceneRuntimeId still
+		-- carries this prefab's namespace -- that ancestor IS part of the
+		-- placement and must be stamped or its raw SRI keeps aliasing
+		-- across placements (Codex R4: ``setActive(Root, false)`` on the
+		-- unscripted root writes to the shared raw key and the cascade
+		-- through ``<placement>:child -> <placement>:root`` misses it).
+		-- 128 is a generous depth budget for any realistic prefab.
+		local root = clone
+		local depth = 0
+		while depth < 128 do
+			local p_ok, parent = pcall(function() return root.Parent end)
+			if not p_ok or parent == nil then break end
+			local sri_ok, parent_sri = pcall(function()
+				return parent:GetAttribute("_SceneRuntimeId")
+			end)
+			if not sri_ok or type(parent_sri) ~= "string"
+			   or string.sub(parent_sri, 1, #prefix) ~= prefix then
+				break
+			end
+			root = parent
+			depth = depth + 1
+		end
+		local function _rewrite(node)
+			local sri_ok, sri = pcall(function()
+				return node:GetAttribute("_SceneRuntimeId")
+			end)
+			if sri_ok and type(sri) == "string"
+			   and string.sub(sri, 1, #prefix) == prefix then
+				pcall(function()
+					node:SetAttribute("_SceneRuntimeId",
+						placement_id .. ":" .. sri)
+				end)
+			end
+		end
+		_rewrite(root)
+		local ok, descs = pcall(function() return root:GetDescendants() end)
+		if ok and type(descs) == "table" then
+			for _, d in ipairs(descs) do
+				_rewrite(d)
+			end
+		end
+	end
+	_stamp_descendants_upfront()
+
+	-- Cache prefab-local goid -> live Instance: a prefab GameObject can host
+	-- MULTIPLE MonoBehaviours, so the same ``inst.game_object_id`` appears
+	-- multiple times in ``prefab.instances``. Looking up (and especially
+	-- stamping) more than once would either bind later rows to the wrong
+	-- Instance (round-2 bug) or leave them with ``nil`` gameObject.
+	local goInstByGoid = {}
+	for _, inst in ipairs(prefab.instances or {}) do
+		instanceById[inst.instance_id] = inst
+		if (includeScriptId == nil) or includeScriptId[inst.script_id] then
+			local ns_goid = _idWithPlacement(placement_id, inst.game_object_id)
+			-- Resolve the live Roblox child. Try NS first: production
+			-- placements have their cloned descendants' SRIs already re-
+			-- stamped namespaced by the upfront walk, so the ns lookup is
+			-- the universal production hit. Fall back to the RAW id for
+			-- the harness path (synthetic clone without ``GetDescendants``,
+			-- so the upfront walk was a no-op and the SRI is still raw).
+			-- ``resolveCloneChild`` returns nil on miss (the prior sentinel-
+			-- on-miss behaviour was changed in R3 because it made this
+			-- fallback ambiguous).
+			local goInst = goInstByGoid[inst.game_object_id]
+			if goInst == nil then
+				if clone ~= nil then
+					if ns_goid ~= inst.game_object_id then
+						goInst = self._services.resolveCloneChild(clone, ns_goid)
+					end
+					if goInst == nil then
+						goInst = self._services.resolveCloneChild(
+							clone, inst.game_object_id)
+					end
+				else
+					if ns_goid ~= inst.game_object_id then
+						goInst = self._services.workspaceFind(ns_goid)
+					end
+					if goInst == nil then
+						goInst = self._services.workspaceFind(inst.game_object_id)
+					end
+				end
+				goInstByGoid[inst.game_object_id] = goInst
+				-- Best-effort per-instance stamp for the harness path or
+				-- any Instance whose SRI the upfront walk did not touch
+				-- (e.g. found via raw fallback after the walk missed). A
+				-- second SetAttribute on an already-namespaced attribute
+				-- is harmless because the upfront walk only rewrites
+				-- prefab-prefix-matching SRIs.
+				if goInst ~= nil and placement_id ~= nil and placement_id ~= ""
+				   and ns_goid ~= inst.game_object_id then
+					local sri_ok, cur = pcall(function()
+						return goInst:GetAttribute("_SceneRuntimeId")
+					end)
+					if not sri_ok or cur ~= ns_goid then
+						pcall(function()
+							goInst:SetAttribute("_SceneRuntimeId", ns_goid)
+						end)
+					end
+				end
+			end
+			local comp = self:_buildComponent(
+				inst.script_id, goInst, ns_goid,
+				(goInst and goInst.Name) or "", inst.config or {},
+				"prefab", prefab_id)
+			if comp then
+				componentByInstanceId[inst.instance_id] = comp
+				table.insert(componentList, comp)
+				-- Honor planner-supplied active/enabled/tag for prefab
+				-- instances exactly as the scene boot path does (R3-P1.1).
+				-- ``_injectHostSurface`` reads ``m.activeSelf`` /
+				-- ``m.enabled`` to decide whether to overwrite with
+				-- defaults; mirror the scene path so a prefab instance
+				-- booted dormant (``enabled=false`` / ``active=false``)
+				-- stays dormant until ``setEnabled`` / ``setActive``.
+				local m = self._meta[comp]
+				m.activeSelf = inst.active ~= false
+				m.enabled = inst.enabled ~= false
+				if inst.tag and inst.tag ~= "" then
+					m.tag = inst.tag
+					local list = self._byTag[inst.tag]
+					if not list then list = {}; self._byTag[inst.tag] = list end
+					local present = false
+					for _, x in ipairs(list) do
+						if x == goInst then present = true; break end
+					end
+					if goInst ~= nil and not present then
+						table.insert(list, goInst)
+					end
+				end
+			end
+		end
+	end
+	for _, comp in ipairs(componentList) do
+		local m = self._meta[comp]
+		self:_injectHostSurface(comp, m and m.gameObjectInstance, m and m.gameObjectId)
+	end
+	self:_wireReferences(prefab.references or {}, componentByInstanceId, nil,
+		instanceById, placement_id)
+	-- Caller-supplied externals override matching wired refs.
+	if type(externalRefs) == "table" then
+		for instId, fields in pairs(externalRefs) do
+			local comp = componentByInstanceId[instId]
+			if comp and type(fields) == "table" then
+				for k, v in pairs(fields) do
+					comp[k] = v
+				end
+			end
+		end
+	end
+	return componentList
+end
+
 function SceneRuntime:instantiatePrefab(prefab_id, parent, cframe, externalRefs)
 	local prefab = (self._plan.prefabs or {})[prefab_id]
 	if not prefab then
@@ -1312,65 +1779,20 @@ function SceneRuntime:instantiatePrefab(prefab_id, parent, cframe, externalRefs)
 	if not clone then return nil end
 	self._prefabClones[clone] = prefab_id
 
-	-- Build a per-instance map for the prefab subplan; references are
-	-- prefab-local so the same logic applies as for scenes.
-	local componentByInstanceId = {}
-	local componentList = {}
-	local instanceById = {}
-	for _, inst in ipairs(prefab.instances or {}) do
-		instanceById[inst.instance_id] = inst
-		-- Map intra-prefab game_object_id to the actual Roblox child via
-		-- the services helper (production: walk by _SceneRuntimeId
-		-- under the clone; harness: pass-through).
-		local goInst = self._services.resolveCloneChild(clone, inst.game_object_id)
-		local comp = self:_buildComponent(
-			inst.script_id, goInst, inst.game_object_id,
-			(goInst and goInst.Name) or "", inst.config or {},
-			"prefab", prefab_id)
-		if comp then
-			componentByInstanceId[inst.instance_id] = comp
-			table.insert(componentList, comp)
-			-- Honor planner-supplied active/enabled/tag for prefab
-			-- instances exactly as the scene boot path does (R3-P1.1).
-			-- ``_injectHostSurface`` reads ``m.activeSelf`` /
-			-- ``m.enabled`` to decide whether to overwrite with
-			-- defaults; mirror the scene path so a prefab instance
-			-- booted dormant (``enabled=false`` / ``active=false``)
-			-- stays dormant until ``setEnabled`` / ``setActive``.
-			local m = self._meta[comp]
-			m.activeSelf = inst.active ~= false
-			m.enabled = inst.enabled ~= false
-			if inst.tag and inst.tag ~= "" then
-				m.tag = inst.tag
-				local list = self._byTag[inst.tag]
-				if not list then list = {}; self._byTag[inst.tag] = list end
-				local present = false
-				for _, x in ipairs(list) do
-					if x == goInst then present = true; break end
-				end
-				if goInst ~= nil and not present then
-					table.insert(list, goInst)
-				end
-			end
-		end
-	end
-	for _, comp in ipairs(componentList) do
-		local m = self._meta[comp]
-		self:_injectHostSurface(comp, m and m.gameObjectInstance, m and m.gameObjectId)
-	end
-	self:_wireReferences(prefab.references or {}, componentByInstanceId, nil,
-		instanceById)
-	-- Caller-supplied externals override matching wired refs.
-	if type(externalRefs) == "table" then
-		for instId, fields in pairs(externalRefs) do
-			local comp = componentByInstanceId[instId]
-			if comp and type(fields) == "table" then
-				for k, v in pairs(fields) do
-					comp[k] = v
-				end
-			end
-		end
-	end
+	-- Mint a runtime placement id so this clone's component maps don't
+	-- collide with any other placement of the same prefab (scene-placed or
+	-- another runtime spawn). ``_constructPrefabClone`` re-stamps each
+	-- found descendant's ``_SceneRuntimeId`` to ``placement_id:goid`` so
+	-- the read paths (``setActive`` / ``destroy`` / cascade) -- which all
+	-- resolve via ``getInstanceId`` -> the stamped attribute -- agree on
+	-- this clone's identity.
+	self._rtPlacementSeq = self._rtPlacementSeq + 1
+	local placement_id = "_rt_" .. tostring(self._rtPlacementSeq)
+
+	-- Unfiltered construction (a runtime spawn isn't domain-gated), then
+	-- run the lifecycle as its own batch.
+	local componentList = self:_constructPrefabClone(
+		clone, prefab, prefab_id, nil, externalRefs, placement_id)
 	self:_runAwakeEnableStart(componentList)
 	return clone
 end
@@ -1488,6 +1910,137 @@ function SceneRuntime:start(domainFilter)
 
 		-- Steps 3-5: Awake -> OnEnable -> Start.
 		self:_runAwakeEnableStart(lifecycleList)
+	end
+
+	-- Bug B tier 1: boot pre-placed prefab instances. The scene loop only
+	-- walks logical scene GameObjects; PrefabInstance documents authored
+	-- into the scene were never booted, so Door/Turret/animation scripts
+	-- on pre-placed prefabs never ran. Each placement's clone already lives
+	-- in the converted tree (stamped with prefab-local ``_SceneRuntimeId``s
+	-- by ``scene_converter._convert_prefab_instance``); reuse the prefab
+	-- component-construction path scoped to that clone, filtered by
+	-- ``domainFilter`` (same gate as the scene loop), and run them as one
+	-- more ``_runAwakeEnableStart`` batch. Appending a batch preserves the
+	-- global Awake-before-Start ordering: ``_runAwakeEnableStart`` defers
+	-- every ``Start`` via ``task.defer`` and ``start()`` never yields, so
+	-- every batch's Awake/OnEnable runs before any batch's Start.
+	local placements = self._plan.scene_prefab_placements or {}
+	-- Determinism: sort placements by ``placement_id`` so boot order is
+	-- stable across runs (the plan list order is parser-dependent).
+	local placementOrder = {}
+	for idx, placement in ipairs(placements) do
+		table.insert(placementOrder, {idx = idx, id = placement.placement_id or ""})
+	end
+	table.sort(placementOrder, function(a, b)
+		if a.id == b.id then return a.idx < b.idx end
+		return a.id < b.id
+	end)
+
+	-- Multi-instance prefab placements all share the same template-level
+	-- ``_SceneRuntimeId`` stamp (the converter does NOT mint a per-placement
+	-- unique id today), so a naive ``workspaceFind`` returns the FIRST
+	-- workspace clone for EVERY placement and only that one gets its
+	-- MonoBehaviours wired. Track clones we've already bound and skip them
+	-- on subsequent placements so each scene_prefab_placement binds to a
+	-- DIFFERENT workspace clone. Ordering is workspace-iteration-stable;
+	-- functionally each clone just needs ANY bound MonoBehaviour of the
+	-- right type since per-placement configs from the same prefab are
+	-- identical.
+	local boundClones = {}
+	local function _findUnboundClonePerPrefab(prefab, prefab_id)
+		-- Discover the template's prefab-root file_id: the instance row whose
+		-- parent_game_object_id is nil (or the smallest file_id in the
+		-- subtree if everything has a parent — robust to planner shapes).
+		local root_goid
+		for _, inst in ipairs(prefab.instances or {}) do
+			if inst.parent_game_object_id == nil then
+				root_goid = inst.game_object_id
+				break
+			end
+		end
+		if not root_goid then
+			-- Fallback: any instance's parent_game_object_id; pick one that
+			-- ISN'T present as another instance's game_object_id (i.e. the
+			-- root that hangs off the scene).
+			local present = {}
+			for _, inst in ipairs(prefab.instances or {}) do
+				present[inst.game_object_id] = true
+			end
+			for _, inst in ipairs(prefab.instances or {}) do
+				local p = inst.parent_game_object_id
+				if p and not present[p] then root_goid = p; break end
+			end
+		end
+		if not root_goid then return nil end
+		-- Guard against the unit-test stub workspace, which doesn't
+		-- implement ``GetDescendants`` / ``GetAttribute``.
+		local ok, descs = pcall(function() return workspace:GetDescendants() end)
+		if not ok or type(descs) ~= "table" then return nil end
+		for _, d in ipairs(descs) do
+			local sri_ok, sri = pcall(function() return d:GetAttribute("_SceneRuntimeId") end)
+			if sri_ok and sri == root_goid and not boundClones[d] then
+				boundClones[d] = true
+				return d
+			end
+		end
+		return nil
+	end
+
+	for _, entry in ipairs(placementOrder) do
+		local placement = placements[entry.idx]
+		local prefab_id = placement.prefab_id
+		local prefab = (self._plan.prefabs or {})[prefab_id]
+		if prefab then
+			local p_placement_id = placement.placement_id or ""
+
+			-- Resolve a workspace clone that no prior placement has bound; the
+			-- scoped ``resolveCloneChild`` walk inside ``_constructPrefabClone``
+			-- then finds the placement's specific sub-Instances. Falls back to
+			-- ``nil`` (workspaceFind path) if no clone is found, preserving
+			-- prior single-instance behaviour.
+			local placement_clone = _findUnboundClonePerPrefab(prefab, prefab_id)
+
+			-- Seed ``_goParentId``/``_goActiveSelf`` for the placement's
+			-- GameObjects, parity with the scene boot pre-pass. Prefab
+			-- instances carry prefab-local parent edges that we namespace
+			-- with the placement id so each clone gets its own entries
+			-- (the un-namespaced shape collided across placements); the
+			-- placement ROOT additionally hangs off the scene parent
+			-- GameObject (a scene id, NOT prefab-local) so the
+			-- activeInHierarchy walk can reach into the scene tree.
+			for _, inst in ipairs(prefab.instances or {}) do
+				if includeScriptId[inst.script_id] then
+					local goId = _idWithPlacement(
+						p_placement_id, inst.game_object_id)
+					if goId then
+						if self._goActiveSelf[goId] == nil then
+							self._goActiveSelf[goId] = (inst.active ~= false)
+								and (placement.active ~= false)
+						end
+						local parentId = inst.parent_game_object_id
+						if parentId == nil then
+							-- Prefab root: bind it to the scene parent GO so
+							-- the ancestor walk continues upward. The scene
+							-- parent id is NOT prefab-local, so it stays
+							-- un-namespaced.
+							parentId = placement.parent_game_object_id
+						else
+							-- Intra-prefab edge: namespace it to match the
+							-- child's namespaced goId.
+							parentId = _idWithPlacement(p_placement_id, parentId)
+						end
+						if parentId and self._goParentId[goId] == nil then
+							self._goParentId[goId] = parentId
+						end
+					end
+				end
+			end
+
+			local componentList = self:_constructPrefabClone(
+				placement_clone, prefab, prefab_id, includeScriptId, nil,
+				p_placement_id)
+			self:_runAwakeEnableStart(componentList)
+		end
 	end
 
 	-- Step 6: update loops via heartbeat + fixed-step accumulator.

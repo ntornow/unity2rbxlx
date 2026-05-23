@@ -154,6 +154,28 @@ local getItemRemote = Instance.new("RemoteEvent")
 getItemRemote.Name = "PlayerGetItem"
 getItemRemote.Parent = ReplicatedStorage
 
+-- Canonical shared-flag mirror. Client-side scripts (Player.luau) FireServer
+-- this when they record a player flag (hasKey, hasRifle, ...). The server
+-- sets the Attribute on BOTH the character Model and the Player Instance so
+-- cross-domain readers (server-domain Door, etc.) see the change. Server-set
+-- attributes replicate down to every client, so client-side reads still work.
+local sharedFlagRemote = Instance.new("RemoteEvent")
+sharedFlagRemote.Name = "PlayerSetSharedFlag"
+sharedFlagRemote.Parent = ReplicatedStorage
+
+sharedFlagRemote.OnServerEvent:Connect(function(player, flagName, value)
+    if type(flagName) ~= "string" or flagName == "" then return end
+    -- Whitelist: only "hasX" / "got*" style identifiers, no nested attribute
+    -- chains and nothing past 64 chars to keep the surface small + sane.
+    if #flagName > 64 or not string.match(flagName, "^[%w_]+$") then return end
+    -- Booleans / numbers / strings only -- skip tables/instances/nil-clears.
+    local t = type(value)
+    if t ~= "boolean" and t ~= "number" and t ~= "string" then return end
+    player:SetAttribute(flagName, value)
+    local char = player.Character
+    if char then char:SetAttribute(flagName, value) end
+end)
+
 -- Visual hit feedback
 local function flashHitPart(part)
     local ok, orig = pcall(function() return part.Color end)
@@ -544,7 +566,7 @@ def _plan_to_luau(plan: dict) -> str:
 # ``_subphase_inject_scene_runtime`` before this encoder runs.
 _PLAN_KEYS_FOR_HOST: tuple[str, ...] = (
     "modules", "scenes", "prefabs", "domain_overrides",
-    "scriptable_objects",
+    "scriptable_objects", "scene_prefab_placements",
 )
 
 
@@ -686,6 +708,7 @@ local services = {
     heartbeat = RunService.Heartbeat,
     fixedStep = 0.02,
     now = function() return os.clock() end,
+    players = Players,
     getInstanceId = function(inst)
         return inst and inst:GetAttribute("_SceneRuntimeId")
     end,
@@ -700,12 +723,20 @@ local services = {
         return clone
     end,
     resolveCloneChild = function(clone, gameObjectId)
+        -- Check the clone root first (its own SRI may match -- the
+        -- per-placement upfront stamp also rewrites the root attribute),
+        -- then descendants. Returns nil on miss so callers can fall back
+        -- to a different lookup id without confusing "miss" with "the
+        -- root IS the match" (the prior sentinel-clone behaviour).
+        if clone:GetAttribute("_SceneRuntimeId") == gameObjectId then
+            return clone
+        end
         for _, d in clone:GetDescendants() do
             if d:GetAttribute("_SceneRuntimeId") == gameObjectId then
                 return d
             end
         end
-        return clone
+        return nil
     end,
     collectDescendantIds = function(inst)
         -- DFS post-order (children deepest-first, then self), per the
@@ -760,6 +791,7 @@ _SCENE_RUNTIME_SERVER_SOURCE: str = '''\
 
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
 
 local SceneRuntime = require(RS:WaitForChild("SceneRuntime"))
 local Plan = require(RS:WaitForChild("SceneRuntimePlan"))
@@ -825,6 +857,7 @@ local services = {
     heartbeat = RunService.Heartbeat,
     fixedStep = 0.02,
     now = function() return os.clock() end,
+    players = Players,
     getInstanceId = function(inst)
         return inst and inst:GetAttribute("_SceneRuntimeId")
     end,
@@ -839,12 +872,20 @@ local services = {
         return clone
     end,
     resolveCloneChild = function(clone, gameObjectId)
+        -- Check the clone root first (its own SRI may match -- the
+        -- per-placement upfront stamp also rewrites the root attribute),
+        -- then descendants. Returns nil on miss so callers can fall back
+        -- to a different lookup id without confusing "miss" with "the
+        -- root IS the match" (the prior sentinel-clone behaviour).
+        if clone:GetAttribute("_SceneRuntimeId") == gameObjectId then
+            return clone
+        end
         for _, d in clone:GetDescendants() do
             if d:GetAttribute("_SceneRuntimeId") == gameObjectId then
                 return d
             end
         end
-        return clone
+        return nil
     end,
     collectDescendantIds = function(inst)
         -- DFS post-order (children deepest-first, then self), per the

@@ -91,6 +91,7 @@ def transpile_scripts(
     *,
     runtime_mode: RuntimeMode = "legacy",
     runtime_bearing_paths: frozenset[Path] | None = None,
+    component_class_paths: frozenset[Path] | None = None,
 ) -> TranspilationResult:
     """Transpile a list of C# scripts to Luau.
 
@@ -114,14 +115,29 @@ def transpile_scripts(
         runtime_bearing_paths: Under ``runtime_mode="generic"`` this is
             the set of ``info.path`` values for MonoBehaviours marked
             ``runtime_bearing=True`` in the planner's ``scene_runtime``
-            artifact. Each one is forced to ``ModuleScript`` target +
-            generic prompt regardless of what ``_classify_script_type``
-            would have inferred. Ignored under ``"legacy"``.
+            artifact (placement-based — what the host boots at start).
+            Ignored under ``"legacy"``.
+        component_class_paths: Under ``runtime_mode="generic"`` the set of
+            ``info.path`` values for ALL component classes (extends
+            MonoBehaviour/NetworkBehaviour, placed or runtime-spawned).
+            This is what actually gates generic treatment: each one is
+            forced to ``ModuleScript`` target + generic prompt + verifier,
+            because a component runs host-bound whether authored or
+            ``Instantiate()``-spawned. Defaults to ``runtime_bearing_paths``
+            when not supplied (legacy callers / direct unit tests).
 
     Returns:
         TranspilationResult with all transpiled scripts and summary counts.
     """
     runtime_bearing_paths = runtime_bearing_paths or frozenset()
+    # The generic mode/target gate keys off component-ness, not placement.
+    # Fall back to runtime_bearing_paths so callers that predate the split
+    # (and direct unit tests) keep their existing behaviour.
+    generic_paths = (
+        component_class_paths
+        if component_class_paths is not None
+        else runtime_bearing_paths
+    )
     result = TranspilationResult()
 
     # Build project context for AI transpilation
@@ -139,16 +155,38 @@ def transpile_scripts(
             result.total_failed += 1
             continue
 
-        # Auto-stub visual/rendering scripts that can't work in Roblox
+        # Auto-stub visual/rendering scripts that can't work in Roblox.
         if _is_visual_only_script(script_path, csharp_source):
+            # A visual-only component class (e.g. a water-shader
+            # MonoBehaviour) is still routed through the generic contract,
+            # so its stub must be a VALID inert ModuleScript: an empty class
+            # table the host can ``require`` + instantiate harmlessly. The
+            # legacy ``print(...)`` form returns nil, which (a) fails the
+            # contract's return rule and (b) throws when the host requires
+            # it. Non-generic / non-component visual scripts keep the plain
+            # legacy stub.
+            is_generic_component = (
+                runtime_mode == "generic" and script_path in generic_paths
+            )
+            if is_generic_component:
+                luau_source = _inert_component_stub(
+                    script_path.stem, "Unity visual/rendering effect (no Roblox equivalent)",
+                )
+                stub_script_type = "ModuleScript"
+            else:
+                luau_source = (
+                    f'-- {script_path.stem}: Unity visual/rendering effect '
+                    f'(no Roblox equivalent)\nprint("{script_path.stem} loaded")'
+                )
+                stub_script_type = "Script"
             result.scripts.append(TranspiledScript(
                 source_path=str(script_path),
                 output_filename=script_path.stem + ".luau",
                 csharp_source=csharp_source,
-                luau_source=f'-- {script_path.stem}: Unity visual/rendering effect (no Roblox equivalent)\nprint("{script_path.stem} loaded")',
+                luau_source=luau_source,
                 strategy="stub",
                 confidence=1.0,
-                script_type="Script",
+                script_type=stub_script_type,
             ))
             result.total_transpiled += 1
             result.total_rule_based += 1
@@ -161,7 +199,7 @@ def transpile_scripts(
         # ``require``s it and instantiates the returned class table. If
         # the prompt said "return a class table" but the user message
         # asked for a Server Script, the AI produces inconsistent output.
-        if runtime_mode == "generic" and info.path in runtime_bearing_paths:
+        if runtime_mode == "generic" and info.path in generic_paths:
             script_type = "ModuleScript"
         pending_scripts.append((info, csharp_source, script_type))
 
@@ -216,20 +254,21 @@ def transpile_scripts(
             if triple is None:
                 return stem, None
             info, csharp_source, script_type = triple
-            # PER-SCRIPT runtime mode: the scene-runtime contract only
-            # applies to host-instantiated MonoBehaviours. A non-runtime-
-            # bearing script (LocalScript, helper module, ScriptableObject
-            # converter target) under ``runtime_mode="generic"`` MUST stay
-            # on the legacy prompt + skip the contract verifier; the
-            # contract was never meant to constrain those modules.
-            # Without this gate the generic prompt tells a LocalScript
-            # "return a class table for the host to instantiate," which
-            # is nonsense for input/UI/audio scripts and produces
-            # mis-transpiled output that the verifier then rejects on
-            # rules the contract never intended for it.
+            # PER-SCRIPT runtime mode: the scene-runtime contract applies to
+            # every component class (``info.path in generic_paths`` — extends
+            # MonoBehaviour/NetworkBehaviour, placed OR runtime-spawned),
+            # because a component always runs host-bound (``self.gameObject``)
+            # in Unity. A non-component script (plain class, ScriptableObject
+            # converter target, editor util) under ``runtime_mode="generic"``
+            # MUST stay on the legacy prompt + skip the contract verifier;
+            # the contract was never meant to constrain those modules.
+            # Without this gate the generic prompt tells a plain helper
+            # "return a class table for the host to instantiate," which is
+            # nonsense and produces mis-transpiled output the verifier then
+            # rejects on rules the contract never intended for it.
             effective_runtime_mode: RuntimeMode = (
                 "generic"
-                if runtime_mode == "generic" and info.path in runtime_bearing_paths
+                if runtime_mode == "generic" and info.path in generic_paths
                 else "legacy"
             )
             scoped = _build_scoped_context(stem, dep_graph, file_sources, transpiled_luau)
@@ -682,6 +721,51 @@ def _is_visual_only_script(script_path: Path, source: str) -> bool:
     return False
 
 
+_RE_NON_IDENT = re.compile(r"\W")
+_RE_IDENT_LEADING_DIGIT = re.compile(r"^\d")
+# Luau reserved words (keywords + reserved literals). A file stem that happens
+# to be one of these (e.g. ``end.cs``) emits ``local end = {}`` which is a
+# syntax error -- prepend an underscore so the identifier becomes valid.
+_LUAU_RESERVED: frozenset[str] = frozenset({
+    "and", "break", "continue", "do", "else", "elseif", "end", "false",
+    "for", "function", "if", "in", "local", "nil", "not", "or", "repeat",
+    "return", "then", "true", "until", "while",
+})
+
+
+def _inert_component_stub(stem: str, reason: str) -> str:
+    """A contract-valid, inert scene-runtime ModuleScript for a component
+    class that has no Roblox equivalent (e.g. a water-shader MonoBehaviour).
+
+    The host still ``require``s + instantiates component classes, so the stub
+    must return a real class table with a no-op ``new`` / ``Awake`` -- a bare
+    ``print(...)`` stub returns nil and both fails the contract's return rule
+    and throws on require. This shape passes every verifier rule (a-h).
+
+    The class name is derived from ``stem`` with three sanitization passes so
+    the emitted ``local <cls> = {}`` is always a valid Luau identifier:
+    (1) non-word chars become ``_`` (``Weird-Name 2`` -> ``Weird_Name_2``);
+    (2) a leading digit gets an ``_`` prefix (``2DWater`` -> ``_2DWater``);
+    (3) a stem that lands on a Luau reserved word gets the same prefix
+    (``end`` -> ``_end``). The verifier is regex-only (no Luau parser) so it
+    cannot catch any of these silently-invalid identifiers downstream.
+    """
+    cls = _RE_NON_IDENT.sub("_", stem) or "Stub"
+    if _RE_IDENT_LEADING_DIGIT.match(cls) or cls in _LUAU_RESERVED:
+        cls = "_" + cls
+    return (
+        f"-- {stem}: {reason} -- inert stub (host-instantiable, no-op).\n"
+        f"local {cls} = {{}}\n"
+        f"{cls}.__index = {cls}\n\n"
+        f"function {cls}.new(config)\n"
+        f"    return setmetatable({{ config = config }}, {cls})\n"
+        f"end\n\n"
+        f"function {cls}:Awake()\n"
+        f"end\n\n"
+        f"return {cls}\n"
+    )
+
+
 # ---------------------------------------------------------------------------
 # AI-powered transpilation
 # ---------------------------------------------------------------------------
@@ -1097,6 +1181,12 @@ Set on `self` by the host before `Awake` runs:
 - `self.gameObject` — the Roblox Instance for this component's GameObject.
 - `self.transform` — alias of `self.gameObject` (Roblox has no separate Transform).
 - `self.instance` — alias for raw-Instance code.
+
+NEVER use `script.Parent` (or `script` at all) to reach the GameObject. This
+module is a class table the host requires once and instantiates per GameObject;
+it has no `script.Parent` edge to any instance. Always go through
+`self.gameObject`. `script.Parent` is the legacy idiom and is rejected by the
+contract verifier.
 - `self.enabled` — per-component flag; writes fire `OnEnable`/`OnDisable`.
 - `self:GetComponent(name)` — peer-component lookup. For converted MonoBehaviours returns the peer module instance; for built-in types (`Rigidbody`, `Collider`, `AudioSource`, `Animator`, …) falls through to a Roblox class search on `self.gameObject`.
 - `self.host` — engine handle; see "Host services" below.
@@ -1128,19 +1218,40 @@ Roblox does NOT dispatch by name. The following Unity callbacks must **never** a
 
 `OnTriggerEnter`, `OnTriggerExit`, `OnTriggerStay`, `OnCollisionEnter`, `OnCollisionExit`, `OnCollisionStay`, `OnMouseDown`, `OnMouseUp`, `OnMouseEnter`, `OnMouseExit`, `OnMouseOver`, `OnMouseDrag`.
 
-The contract-compliant replacement is `self.host:connect(signal, fn)` wired **in `Awake`**:
+The contract-compliant replacement for a **GameObject touch** is
+`self.host:connectGameObjectSignal(self.gameObject, "Touched", fn)` wired
+**in `Awake`** (NOT `self.host:connect(self.gameObject.Touched, ...)`):
 
 ```luau
 function Class:Awake()
-    self.host:connect(self.gameObject.Touched, function(other)
-        -- the body that used to live in OnTriggerEnter(other)
+    self.host:connectGameObjectSignal(self.gameObject, "Touched", function(other)
+        -- the body that used to live in OnTriggerEnter(other).
+        local plr = self.host.playerFromTouch(other)
+        if not plr then return end  -- ignore non-player touches
+        -- ... use plr / plr.Character ...
     end)
 end
 ```
 
+- `self.gameObject` may be a **Model** (prefab placement) or a BasePart.
+  `.Touched` is a BasePart-only signal and THROWS on a Model. NEVER write
+  `self.host:connect(self.gameObject.Touched, ...)`. Always go through
+  `self.host:connectGameObjectSignal(self.gameObject, "Touched", fn)` (and
+  `"TouchEnded"` for OnTriggerExit) — the host resolves a representative
+  touch part on the Model for you.
 - Call site is `Awake` ONLY. The host's `connect` wrapper handles the `enable`/`disable` cycling, so re-registering in `OnEnable` would double-subscribe.
 - Dispatch is gated on `active && enabled` (same condition as `OnEnable`). The host disconnects on the gate's true→false transition and rearms on false→true. On `OnDestroy` every subscription is disconnected.
-- Use `self.gameObject.Touched` for OnTriggerEnter/OnCollisionEnter (Roblox unifies trigger + collision into one event; gate on `CanTouch` / collision group if you need to distinguish).
+- `connectGameObjectSignal(self.gameObject, "Touched", fn)` covers both
+  OnTriggerEnter and OnCollisionEnter (Roblox unifies trigger + collision
+  into one event; gate on `CanTouch` / collision group if you need to
+  distinguish).
+- **Detecting the player inside a touch callback**: the `other` argument is
+  the raw touched BasePart (a character limb/accessory), NOT the character
+  Model — so `CollectionService:HasTag(other, "Player")` and
+  `other.tag == "Player"` NEVER match. Use the host normalization helper:
+  `local plr = self.host.playerFromTouch(other); if plr then ... end`, or the
+  boolean form `if self.host.isPlayerTouch(other) then ... end`. It walks
+  ancestors to the character Model and returns the owning Player.
 - Raw `signal:Connect(fn)` is still legal for cases that want connection-survives-disable semantics, but NOT for the twelve names above.
 
 ## Cross-script requires
@@ -1152,6 +1263,35 @@ local Other = require("@scene_runtime/Other")
 ```
 
 The string is `@scene_runtime/<stem>`, where `<stem>` is the file stem of the dependency (e.g. `Player` for `Player.cs`). The require resolver fails closed on a missing stem or a stem that collides across folders — your job is just to use the shape.
+
+## Cross-script shared state (canonical Attribute mirror)
+
+When a method records a flag that OTHER scripts will read — e.g. the player picked up a Key (Door checks "has the player a Key?"), a HUD value, a "got rifle" flag, a damage marker — write the canonical Roblox **Attribute** mirror alongside your local Lua-field update. An internal field on the MonoBehaviour instance (`self.gotKey = true`) is visible only to THAT instance; cross-script readers can ONLY see Roblox Instance Attributes (which also replicate across server/client). The canonical store is the character Model AND the Player Instance.
+
+When a `MonoBehaviour` records picked-up items in a `GetItem(itemName)`-style method, ALWAYS write the attribute mirror BEFORE the local-field update. **AND** mirror server-side via the autogen ``PlayerSetSharedFlag`` RemoteEvent so server-domain readers (Door, etc.) see the change too. Roblox attributes set by the client do NOT replicate to the server; the RemoteEvent makes the write authoritative.
+
+```luau
+function Player:GetItem(itemName)
+    -- Canonical attribute mirror: cross-script readers (Door, HUD) see ``has<Item>``.
+    if itemName and itemName ~= "" then
+        local _flag = "has" .. itemName  -- "hasKey", "hasRifle", ...
+        local _plr = game:GetService("Players").LocalPlayer
+        if _plr then _plr:SetAttribute(_flag, true) end
+        local _char = _plr and _plr.Character
+        if _char then _char:SetAttribute(_flag, true) end
+        -- Server-side mirror so cross-domain readers see it. ``PlayerSetSharedFlag``
+        -- is a RemoteEvent created at boot by the autogen server entrypoint; it
+        -- accepts (flagName, value) and writes the canonical Attribute server-side.
+        local _rs = game:GetService("ReplicatedStorage")
+        local _sf = _rs:FindFirstChild("PlayerSetSharedFlag")
+        if _sf then _sf:FireServer(_flag, true) end
+    end
+    -- ... then your local state update
+    if itemName == "Key" then self.gotKey = true end
+end
+```
+
+The same pattern applies for any other "shared player flag" mutation (a `RecoverHealth` that should replicate, a `gotWeapon = true` write, etc.). Without this Attribute mirror, gameplay readers in other scripts will silently miss the state change. NEVER skip the mirror just because your local code path also stores the field; the field is for internal use, the Attribute is the cross-script contract.
 
 ## Singleton pattern
 
@@ -1191,9 +1331,10 @@ The Unity → Roblox API mapping below covers patterns inside method bodies. Mod
 - `CancelInvoke()` → `self.host.cancelInvoke(self)`.
 - `StartCoroutine(Routine())` → `self.host.startCoroutine(self, function() ... end)`.
 
-### Trigger / collision / mouse (host:connect, never name-dispatch)
-- `OnTriggerEnter / Exit / Stay` → `self.host:connect(self.gameObject.Touched, function(other) ... end)` in `Awake`.
+### Trigger / collision / mouse (host:connectGameObjectSignal, never name-dispatch)
+- `OnTriggerEnter / Exit / Stay` → `self.host:connectGameObjectSignal(self.gameObject, "Touched", function(other) ... end)` in `Awake` (use `"TouchEnded"` for Exit). NEVER `self.host:connect(self.gameObject.Touched, ...)` — `self.gameObject` may be a Model and `.Touched` throws on a Model.
 - `OnCollisionEnter / Exit / Stay` → same shape; Roblox `.Touched` covers both unless code distinguishes by impulse.
+- Player gate inside the callback: `local plr = self.host.playerFromTouch(other); if plr then ... end` (or `if self.host.isPlayerTouch(other) then`). NEVER `CollectionService:HasTag(other, "Player")` or `other.tag == "Player"` — `other` is a raw character limb, not the tagged character Model.
 - `OnMouse*` → `self.host:connect(self.gameObject.MouseClick / MouseEnter / MouseLeave, ...)` if the GameObject has a `ClickDetector`; otherwise log unsupported.
 
 ### Component access
@@ -1301,7 +1442,7 @@ When a Unity API has NO faithful Luau translation, emit a stub method whose body
 
 - Convert the ENTIRE class. Do not skip methods or simplify logic.
 - Preserve all game logic, conditions, and calculations.
-- C# events with no Roblox event analog → `BindableEvent` field on the class, fired/connected explicitly.
+- C# events with no Roblox event analog → `BindableEvent` field on the class, fired/connected explicitly. For a **static C# event** (e.g. `Player.HealthUpdate`) that other scripts in the project subscribe to, set `.Name` to the event name AND `.Parent = game:GetService("ReplicatedStorage")` when you create it, so cross-script readers can find it via `ReplicatedStorage:FindFirstChild("HealthUpdate"):Connect(...)`. Idempotent: `Player.HealthUpdate = Player.HealthUpdate or (function() local b = Instance.new("BindableEvent"); b.Name = "HealthUpdate"; b.Parent = game:GetService("ReplicatedStorage"); return b end)()`. An unparented BindableEvent is invisible to every other script.
 - C# properties with `get`/`set` side effects → field + accessor methods (`getX(self)` / `setX(self, v)`); plain auto-properties → fields.
 - Interfaces / abstract classes → ModuleScript with table of functions; no client-of-the-host surface unless the implementing class registers them.
 - Enums → table with named numeric values: `local Dir = { Left = 0, Right = 1 }` at module scope (this is a side-effect-free `local`, allowed).
