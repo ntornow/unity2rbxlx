@@ -438,6 +438,113 @@ class TestRuleE:
         )
         _assert_rule(bad, "e")
 
+    def test_nested_return_inside_function_does_not_misanchor_export(self):
+        # R2 P1 regression: previously the export-name detection scanned
+        # the WHOLE stripped source with a MULTILINE regex and took
+        # "last match wins". A nested function body containing
+        # ``return Helper`` placed AFTER the module's real ``return Class``
+        # would misanchor ``exported_class`` to ``"Helper"``, then skip the
+        # colon-form check on the exported ``function Class:new(config)``.
+        #
+        # The fix walks the parsed top-level statement list so only the
+        # module's TERMINAL top-level return counts.
+        src = (
+            'local Helper = {}\n'
+            'function Helper.new() return setmetatable({}, Helper) end\n'
+            '\n'
+            'local Class = {}\n'
+            'Class.__index = Class\n'
+            'function Class:new(config)\n'  # EXPORTED colon-form — must reject
+            '    local self = setmetatable({}, Class)\n'
+            '    self.speed = config.speed or 12\n'
+            '    return self\n'
+            'end\n'
+            '\n'
+            '-- Nested function that ALSO contains ``return Helper`` --\n'
+            '-- in the OLD regex this would misanchor exported_class\n'
+            '-- to "Helper", so the colon-form check on Class:new would\n'
+            '-- skip and the bug would slip through.\n'
+            'function Class:get_helper()\n'
+            '    return Helper\n'  # nested return, NOT module export
+            'end\n'
+            '\n'
+            'return Class\n'  # real module export
+        )
+        _assert_rule(src, "e")
+
+    def test_setmetatable_export_anchors_correctly(self):
+        # R2 P1 regression: ``return setmetatable(Class, mt)`` is the
+        # most common Luau OO export idiom but is not a bare identifier.
+        # Previously the export-name detection missed it, fell back to
+        # the conservative "any canonical constructor allows colon-form"
+        # rule, and allowed an exported colon-form constructor when an
+        # internal helper had a dot-form one. Identical symptom to the
+        # original R1 P1 bug, just hidden behind setmetatable.
+        bug_shape = (
+            'local Helper = {}\n'
+            'function Helper.new() return setmetatable({}, Helper) end\n'  # helper dot
+            '\n'
+            'local Class = {}\n'
+            'Class.__index = Class\n'
+            'function Class:new(config)\n'  # EXPORTED colon-form — must reject
+            '    local self = setmetatable({}, Class)\n'
+            '    self.speed = config.speed or 12\n'
+            '    return self\n'
+            'end\n'
+            '\n'
+            'return setmetatable(Class, {__call = function(_, c) return Class.new(c) end})\n'
+        )
+        _assert_rule(bug_shape, "e")
+
+        # Mirror case: helper colon-form + exported dot-form via setmetatable
+        # should pass clean.
+        clean = (
+            'local Helper = {}\n'
+            'Helper.__index = Helper\n'
+            'function Helper:new() return setmetatable({}, Helper) end\n'  # helper colon
+            '\n'
+            'local Class = {}\n'
+            'Class.__index = Class\n'
+            'function Class.new(config)\n'  # exported dot — correct
+            '    local self = setmetatable({}, Class)\n'
+            '    self.helper = Helper:new()\n'
+            '    return self\n'
+            'end\n'
+            '\n'
+            'return setmetatable(Class, {__call = function(_, c) return Class.new(c) end})\n'
+        )
+        _assert_clean(clean)
+
+    def test_colon_form_helper_with_host_access_still_rejected(self):
+        # R2 P2 regression guard: the previous narrowing dropped colon-form
+        # from the purity sweep, so a helper class's ``Helper:new()`` body
+        # could read ``self.host`` without being flagged -- crashes at boot
+        # because ``self.host`` is nil at construction time.
+        #
+        # The exported class's colon-form is intentionally not the test
+        # subject here -- it gets caught by the SHAPE check above. This
+        # test pins that PURITY violations are still emitted on helper
+        # colon-form constructors.
+        src = (
+            'local Helper = {}\n'
+            'Helper.__index = Helper\n'
+            'function Helper:new()\n'
+            '    local self = setmetatable({}, Helper)\n'
+            '    self.host.invoke(self, "Tick", 1)\n'  # rule (e) violation
+            '    return self\n'
+            'end\n'
+            '\n'
+            'local Class = {}\n'
+            'function Class.new(config)\n'  # exported, canonical
+            '    local self = setmetatable({}, Class)\n'
+            '    self.helper = Helper:new()\n'
+            '    return self\n'
+            'end\n'
+            '\n'
+            'return Class\n'
+        )
+        _assert_rule(src, "e")
+
 
 # ---------------------------------------------------------------------------
 # Rule (f) -- Unity message callbacks bound on the class table.

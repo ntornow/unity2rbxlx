@@ -100,7 +100,7 @@ def verify_module(source: str) -> VerificationResult:
     violations.extend(_check_top_level_statements(statements, stripped))
     violations.extend(_check_module_return(statements, source))
     violations.extend(_check_lifecycle_assignments(statements, stripped))
-    violations.extend(_check_constructor_purity(stripped, source))
+    violations.extend(_check_constructor_purity(stripped, source, statements))
     violations.extend(_check_unity_message_callbacks(statements, stripped, source))
     violations.extend(_check_gameobject_touch(stripped, source))
     violations.extend(_check_script_parent(stripped, source))
@@ -670,14 +670,17 @@ _RE_CONSTRUCTOR_LITERAL = re.compile(
 _RE_CONSTRUCTOR_COLON_FORM = re.compile(
     r"function\s+([\w.]+)\s*:\s*new\s*\(",
 )
-# Bare-identifier ``return X`` at the end of the module identifies the
-# exported class -- ``X`` is what the runtime calls ``.new(config)`` on.
-# Returns of table literals or complex expressions (``return setmetatable(...)``)
-# don't surface a name; we fall back to the conservative
-# "any-canonical-constructor-allows-colon-form-elsewhere" rule in that case.
-_RE_MODULE_RETURN_NAME = re.compile(
+# Identify the exported class from the module's TERMINAL top-level
+# return statement. Two recognized shapes:
+#   - bare identifier:  ``return X``
+#   - common Luau OO:   ``return setmetatable(X, mt)``
+# Anything else (table literal, factory call, multi-value) yields no
+# name and we fall back to the conservative rule.
+_RE_RETURN_BARE_IDENT = re.compile(
     r"^\s*return\s+([A-Za-z_]\w*)\s*$",
-    re.MULTILINE,
+)
+_RE_RETURN_SETMETATABLE = re.compile(
+    r"^\s*return\s+setmetatable\s*\(\s*([A-Za-z_]\w*)\s*,",
 )
 
 _FORBIDDEN_IN_NEW = [
@@ -688,18 +691,40 @@ _FORBIDDEN_IN_NEW = [
 ]
 
 
-def _check_constructor_purity(stripped: str, source: str) -> list[Violation]:
+def _exported_class_name(statements) -> str | None:
+    """Return the identifier the module exports via its terminal
+    top-level ``return``, or ``None`` if the return shape doesn't
+    surface a name (table literal, factory call, multi-value, etc.).
+
+    Walks ``statements`` (the parsed top-level statement list, from
+    ``_iter_top_level_statements``) so nested function bodies cannot
+    inject a misleading ``return Helper`` that re-binds the export.
+    """
+    last_return_text: str | None = None
+    for stmt in statements:
+        if _RE_RETURN.match(stmt.text):
+            last_return_text = stmt.text
+    if last_return_text is None:
+        return None
+    m = _RE_RETURN_BARE_IDENT.match(last_return_text)
+    if m:
+        return m.group(1)
+    m = _RE_RETURN_SETMETATABLE.match(last_return_text)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _check_constructor_purity(stripped: str, source: str, statements) -> list[Violation]:
     out: list[Violation] = []
 
-    # Identify the exported class from ``return X`` at module scope.
-    # Last match wins for modules with multiple top-level returns (rare
-    # but possible via early-exit branches).
-    exported_class: str | None = None
-    for m in _RE_MODULE_RETURN_NAME.finditer(stripped):
-        exported_class = m.group(1)
+    # Identify the exported class from the module's TERMINAL top-level
+    # return -- inspected via the parsed statement list so a nested
+    # function's own ``return Helper`` can't misanchor the check.
+    exported_class = _exported_class_name(statements)
 
-    # Conservative fallback used when the export is a table literal or a
-    # complex expression and we can't anchor on a name.
+    # Conservative fallback used when the export is a shape we can't
+    # name-anchor on (table literal, factory call, multi-value return).
     has_canonical_constructor = (
         _RE_CONSTRUCTOR_METHOD.search(stripped) is not None
         or _RE_CONSTRUCTOR_LITERAL.search(stripped) is not None
@@ -748,7 +773,10 @@ def _check_constructor_purity(stripped: str, source: str) -> list[Violation]:
             ),
         ))
     # Purity violation: host surface isn't bound until after new() returns.
-    for pat in (_RE_CONSTRUCTOR_METHOD, _RE_CONSTRUCTOR_LITERAL):
+    # ALL three constructor shapes get the sweep -- a helper class's
+    # colon-form ``Helper:new()`` can still read ``self.host`` (which is
+    # nil at construction time) and crash at boot.
+    for pat in (_RE_CONSTRUCTOR_METHOD, _RE_CONSTRUCTOR_LITERAL, _RE_CONSTRUCTOR_COLON_FORM):
         for m in pat.finditer(stripped):
             body, body_start = _extract_function_body(stripped, m.end())
             if body is None:
