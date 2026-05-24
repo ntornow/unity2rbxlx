@@ -84,30 +84,70 @@ conversion this skill validates.
 
 ### Step 0: Preflight
 
-Parse `<project>` from arguments (required). Parse `--close-and-relaunch`
-and `--only <ids>` (optional). Bind the parsed arguments to shell
-variables that every later step (Step 3 assemble invocation,
-Step 3.5 validator, etc.) references by name:
+**Working directory.** Every later python invocation is relative to
+the converter root (`convert_interactive.py` is there;
+`tests/_project_paths.py` and `tools/validate_e2e_conversion.py`
+are imported via paths anchored on `converter/`). Anchor the cwd
+once at the top of Step 0 so the rest of the skill is invocation-
+location-agnostic:
 
 ```bash
-PROJECT="<project>"                                   # e.g. "SimpleFPS"
-SCENE_RUNTIME_MODE="legacy"                           # default
-[[ "$*" == *--generic* ]] && SCENE_RUNTIME_MODE="generic"
-UNITY_PROJECT_PATH="$(python3 -c "
-import sys
-sys.path.insert(0, 'tests')
-from _project_paths import resolve_project
-print(resolve_project('${PROJECT}'))
-")"
+cd "$(git rev-parse --show-toplevel)/converter"
+```
+
+**Argument parsing.** Walk the argv as discrete tokens (a substring
+glob like `*--generic*` would false-match `--generics`, `--no-generic-X`,
+or a project name containing the literal `--generic`):
+
+```bash
+PROJECT=""
+SCENE_RUNTIME_MODE="legacy"
+CLOSE_AND_RELAUNCH=0
+ONLY_FIXTURES=""
+while (( "$#" )); do
+    case "$1" in
+        --generic)            SCENE_RUNTIME_MODE="generic" ; shift ;;
+        --close-and-relaunch) CLOSE_AND_RELAUNCH=1         ; shift ;;
+        --only)               ONLY_FIXTURES="$2"           ; shift 2 ;;
+        --*)                  echo "unknown flag: $1" >&2  ; exit 64 ;;
+        *)                    if [[ -z "$PROJECT" ]]; then
+                                  PROJECT="$1"; shift
+                              else
+                                  echo "extra positional: $1" >&2; exit 64
+                              fi ;;
+    esac
+done
+[[ -z "$PROJECT" ]] && { echo "missing <project> argument" >&2; exit 64; }
+```
+
+**Project path resolution.** Pass `PROJECT` via environment, not
+shell-interpolation into the python heredoc (a project name with a
+single quote would break parse; `';) ;import os; os.system("…")` would
+execute):
+
+```bash
+UNITY_PROJECT_PATH="$(PROJECT="$PROJECT" python3 -c '
+import os, sys
+sys.path.insert(0, "tests")
+from _project_paths import resolve_project, is_populated
+p = resolve_project(os.environ["PROJECT"])
+if not is_populated(p):
+    sys.exit(f"resolve_project returned an unpopulated path: {p} -- check that "
+             f"the snapshot or test_projects submodule exists for "
+             f"{os.environ[\"PROJECT\"]!r}")
+print(p)
+')" || exit 1
 ```
 
 `UNITY_PROJECT_PATH` is the resolved filesystem path /convert-unity's
 phases take as their `<unity_project_path>` argument. The resolver
 honours the snapshot's baked `source_unity_project`, the bundled
 `test_projects/<project>` submodule, and `$UNITY2RBXLX_TEST_PROJECTS_ROOT`
-in that order (see `tests/_project_paths.py:resolve_project`).
+in that order (see `tests/_project_paths.py:resolve_project`). The
+`is_populated` check turns a silent submodule-uninitialised case into
+a loud Step 0 failure rather than a downstream assemble crash.
 
-Validate the behavior fixtures file exists and is well-formed:
+**Behavior-fixture validation:**
 
 ```bash
 python3 -m tests.studio_behavior_driver validate "${PROJECT}"
@@ -194,15 +234,17 @@ Invoke the `/convert-unity` skill with the project's Unity path and
    and `${CONV_DIR}/.roblox_ids.json` from
    `tests/fixtures/upload_snapshots/<project>.snapshot.json` so any
    asset whose ID is already in the snapshot is treated as
-   already-uploaded:
+   already-uploaded. Pass both inputs via env (a `<project>` arg
+   containing a single quote would break a shell-interpolated
+   heredoc):
    ```bash
-   python3 -c "
-   import sys
-   sys.path.insert(0, 'tests')
+   CONV_DIR="$CONV_DIR" PROJECT="$PROJECT" python3 -c '
+   import os, sys
+   sys.path.insert(0, "tests")
    from test_offline_assembly import _seed_output_dir, _load_snapshot
    from pathlib import Path
-   _seed_output_dir(Path('${CONV_DIR}'), _load_snapshot('${PROJECT}'))
-   "
+   _seed_output_dir(Path(os.environ["CONV_DIR"]), _load_snapshot(os.environ["PROJECT"]))
+   '
    ```
    Then run `assemble` with `--no-upload`. Template the
    `--scene-runtime` flag from the mode bound in Step 0 — a missing
