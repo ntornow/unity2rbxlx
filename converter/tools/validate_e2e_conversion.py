@@ -76,17 +76,19 @@ def main() -> int:
         print(f"ERROR: output_dir does not exist: {output_dir}", file=sys.stderr)
         return 2
 
-    # Reuse the assertion helpers committed in test_offline_assembly.
-    # Underscored names are a project boundary smell; landing this
-    # validator without first refactoring those helpers is the smaller
-    # surface change. Codex P2 carry-over: publish the helpers as a
-    # non-test-private module so this import doesn't look private.
-    from tests.test_offline_assembly import (
-        _assert_generic_scene_runtime,
-        _assert_mesh_ids_match_snapshot,
-        _assert_no_placeholder_ids,
-        _load_snapshot,
-        _run_luau_analyze,
+    # Shared post-conversion assertion helpers live in their own
+    # module so production-adjacent code doesn't reach into
+    # underscored test internals. ``tests.conversion_assertions`` has
+    # no import-time side effects (unlike ``test_offline_assembly``,
+    # which resolves SIMPLEFPS_PROJECT / TRASHDASH_PROJECT at module
+    # load via pytest.skip-on-missing), so importing it here is safe
+    # outside a pytest run regardless of fixture availability.
+    from tests.conversion_assertions import (
+        assert_generic_scene_runtime,
+        assert_mesh_ids_match_snapshot,
+        assert_no_placeholder_ids,
+        load_snapshot,
+        run_luau_analyze,
     )
 
     # 1) rbxlx exists
@@ -98,15 +100,13 @@ def main() -> int:
     print(f"OK   rbxlx present: {rbxlx.name}")
 
     # 2) snapshot loads cleanly
-    # ``_load_snapshot`` calls ``pytest.skip(...)`` on a missing
+    # ``load_snapshot`` calls ``pytest.skip(...)`` on a missing
     # fixture; outside pytest, ``pytest.skip`` raises
-    # ``_pytest.outcomes.Skipped`` -- NOT ``SystemExit``. Catching
-    # ``SystemExit`` here would have been dead code; catch the
-    # actual outcome class explicitly so a missing snapshot
-    # surfaces as a clean FAIL line, not an unhandled traceback.
-    # The path check up front makes the helper's pytest.skip path
-    # unreachable in practice; the Skipped catch is belt-and-braces
-    # in case the fixture-resolution shape ever changes.
+    # ``_pytest.outcomes.Skipped`` (subclass of BaseException, NOT
+    # ``SystemExit``). The path check up front makes the helper's
+    # pytest.skip path unreachable in practice; the Skipped catch
+    # below is belt-and-braces in case the fixture-resolution shape
+    # ever changes.
     snapshot_path = (
         Path(__file__).resolve().parent.parent
         / "tests" / "fixtures" / "upload_snapshots"
@@ -119,7 +119,7 @@ def main() -> int:
         )
         return 1
     try:
-        snapshot = _load_snapshot(project_name)
+        snapshot = load_snapshot(project_name)
     except BaseException as exc:
         # Pytest's Skipped derives from BaseException, not Exception.
         # Filter by class name so we don't swallow real bugs (KeyboardInterrupt, etc).
@@ -134,7 +134,7 @@ def main() -> int:
 
     # 3) no rbxassetid://0 placeholders
     try:
-        _assert_no_placeholder_ids(rbxlx)
+        assert_no_placeholder_ids(rbxlx)
     except AssertionError as e:
         print(f"FAIL: placeholder IDs in rbxlx: {e}", file=sys.stderr)
         return 1
@@ -142,7 +142,7 @@ def main() -> int:
 
     # 4) mesh IDs match snapshot
     try:
-        _assert_mesh_ids_match_snapshot(rbxlx, snapshot)
+        assert_mesh_ids_match_snapshot(rbxlx, snapshot)
     except AssertionError as e:
         print(f"FAIL: mesh ID mismatch vs snapshot: {e}", file=sys.stderr)
         return 1
@@ -151,7 +151,7 @@ def main() -> int:
     # 5) generic-mode runtime contract embedded
     if mode == "generic":
         try:
-            _assert_generic_scene_runtime(rbxlx)
+            assert_generic_scene_runtime(rbxlx)
         except AssertionError as e:
             print(
                 f"FAIL: generic scene-runtime contract incomplete: {e}",
@@ -163,7 +163,7 @@ def main() -> int:
     # 6) luau-analyze clean (soft-skip when not installed)
     scripts_dir = output_dir / "scripts"
     if scripts_dir.is_dir():
-        passed, failed, fails = _run_luau_analyze(scripts_dir)
+        passed, failed, fails = run_luau_analyze(scripts_dir)
         if failed > 0:
             print(
                 f"FAIL: luau-analyze found {failed} error(s):\n  "

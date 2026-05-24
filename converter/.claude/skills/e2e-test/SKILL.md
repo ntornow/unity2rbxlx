@@ -251,9 +251,9 @@ Invoke the `/convert-unity` skill with the project's Unity path and
    CONV_DIR="$CONV_DIR" PROJECT="$PROJECT" python3 -c '
    import os, sys
    sys.path.insert(0, "tests")
-   from test_offline_assembly import _seed_output_dir, _load_snapshot
+   from conversion_assertions import seed_output_dir, load_snapshot
    from pathlib import Path
-   _seed_output_dir(Path(os.environ["CONV_DIR"]), _load_snapshot(os.environ["PROJECT"]))
+   seed_output_dir(Path(os.environ["CONV_DIR"]), load_snapshot(os.environ["PROJECT"]))
    '
    ```
    Then run `assemble` with `--no-upload`. Template the
