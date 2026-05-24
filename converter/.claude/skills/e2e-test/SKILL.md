@@ -128,6 +128,39 @@ python3 -m pytest -m slow \
 (For projects other than SimpleFPS, swap the test method. V1 only ships
 SimpleFPS; the test parameterization is task #6.)
 
+**/convert-unity phase coverage.** The conversion test seeds two
+project-specific fixtures so it covers the /convert-unity phases that
+are normally agent-driven (and thus would otherwise be silently
+skipped by a direct Pipeline invocation):
+
+| Phase | Fixture | Mechanism |
+|---|---|---|
+| **4a (Plan)** | `tests/fixtures/conversion_plans/<Project>.plan.json` | Seeded into `output_dir/conversion_plan.json` BEFORE `Pipeline.run_all()`. The classifier's `_merge_scene_runtime` preserves `scene_runtime.domain_overrides`. No-op when fixture absent. |
+| **4c (Reactive fixups)** | `tests/fixtures/fixups/<project>_fixups.py` | `apply(output_dir, ctx)` runs AFTER `Pipeline.run_all()` and BEFORE the rbxlx assertions. No-op when module absent. |
+
+So the offline test now covers Steps 1, 2, 3, 4a, 4b, 4c, and 5
+(moderate + assemble). Steps 0 (preflight), 6 (upload), and 7 (final
+report) are still skipped by design — Step 6 is gated by `skip_upload=True`
+on the Pipeline; Step 0 and 7 are just env / wrap-up.
+
+**Refreshing the 4a / 4c fixtures.** When a new test fixture exposes a
+classifier misclassification (4a) or a residual transpiler gap (4c),
+the workflow is:
+
+1. Run `/convert-unity` interactively against the project to the point
+   where the misclassification surfaces.
+2. For 4a: edit the relevant `domain_overrides` in
+   `conversion_plan.json`, then copy the agent-authored top-level keys
+   into `tests/fixtures/conversion_plans/<Project>.plan.json` (drop
+   pipeline-generated keys like `script_paths` / `animation_routing` /
+   `scene_runtime.modules`).
+3. For 4c: codify the post-transpile patch as a deterministic edit in
+   `tests/fixtures/fixups/<project>_fixups.py`'s `apply()` function.
+4. Re-run `/e2e-test` to verify the fixture closes the gap.
+
+See `tests/fixtures/conversion_plans/README.md` and
+`tests/fixtures/fixups/README.md` for the format details.
+
 **Scene-runtime mode.** The conversion test is mode-aware via the
 `E2E_SCENE_RUNTIME_MODE` env var. The documented default is **legacy**
 (top-level auto-running Scripts) — omit the var to get it. When

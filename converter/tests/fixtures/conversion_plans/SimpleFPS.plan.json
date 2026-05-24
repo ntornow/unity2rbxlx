@@ -1,0 +1,16 @@
+{
+  "_comment": "Step 4a (Plan) fixture for SimpleFPS. See ./README.md for what each key does and how to refresh.",
+
+  "scene_runtime": {
+    "_comment": "domain_overrides is the load-bearing 4a knob — _merge_scene_runtime() preserves these across classifier reruns. Add entries as e2e fixtures expose misclassifications (e.g. Turret routing client when it should be server).",
+    "domain_overrides": {}
+  },
+
+  "_aspirational_keys_documented_for_future_wiring": {
+    "_comment": "These are documented in phase-4a-overview.md but the pipeline does not yet consume them. Listed here so we can populate them when the wiring lands.",
+    "architecture_map": {},
+    "divergence_overrides": {},
+    "templates_manifest": {},
+    "module_boundaries": {}
+  }
+}

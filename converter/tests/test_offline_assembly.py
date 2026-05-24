@@ -121,6 +121,60 @@ def _load_snapshot(name: str) -> dict:
     return json.loads(path.read_text())
 
 
+def _maybe_seed_conversion_plan(output_dir: Path, project_name: str) -> bool:
+    """Step 4a coverage: seed an agent-authored ``conversion_plan.json``
+    fixture into the output dir BEFORE ``Pipeline.run_all()`` runs.
+
+    The pipeline's classifier rerun honors pre-existing
+    ``scene_runtime.domain_overrides`` via ``_merge_scene_runtime``
+    (see ``pipeline.py:_classify_storage``), so seeding the plan is the
+    test-only mechanism that exercises Step 4a of the /convert-unity
+    workflow without an interactive agent walk.
+
+    Returns True if a fixture was seeded, False if no fixture exists
+    for this project. No-op (and harmless) when the fixture file is
+    absent — the pipeline will fall back to classifier defaults exactly
+    as it did before this hook existed.
+
+    See ``tests/fixtures/conversion_plans/README.md`` for the format and
+    refresh procedure.
+    """
+    fixture_dir = Path(__file__).parent / "fixtures" / "conversion_plans"
+    fixture_path = fixture_dir / f"{project_name}.plan.json"
+    if not fixture_path.exists():
+        return False
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "conversion_plan.json").write_text(
+        fixture_path.read_text(encoding="utf-8"), encoding="utf-8",
+    )
+    return True
+
+
+def _maybe_apply_fixups(output_dir: Path, ctx, project_name: str) -> bool:
+    """Step 4c coverage: invoke a project-specific fixup module that
+    codifies the post-transpile patches /convert-unity's Step 4c would
+    apply by hand.
+
+    Looks for ``tests.fixtures.fixups.<project_name_lower>_fixups`` and
+    calls its ``apply(output_dir, ctx)``. Returns True if a fixup module
+    was found and run, False otherwise. Module absence is a quiet no-op
+    — projects without a fixup module get the same behaviour as before
+    this hook existed.
+
+    See ``tests/fixtures/fixups/README.md`` for the module shape and
+    refresh procedure.
+    """
+    import importlib
+    normalized = project_name.lower().replace("-", "").replace("_", "")
+    module_name = f"tests.fixtures.fixups.{normalized}_fixups"
+    try:
+        mod = importlib.import_module(module_name)
+    except ImportError:
+        return False
+    mod.apply(output_dir, ctx)
+    return True
+
+
 def _resolve_unity_project(snapshot_name: str, fallback_name: str) -> Path:
     """Find the Unity source for a snapshot.
 
@@ -483,6 +537,11 @@ class TestOfflineAssembly:
 
         snapshot = _load_snapshot("SimpleFPS")
         _seed_output_dir(output_dir, snapshot)
+        # Step 4a (Plan) coverage: seed agent-authored conversion_plan.json
+        # so the classifier's ``_merge_scene_runtime`` picks up any
+        # ``scene_runtime.domain_overrides`` the fixture commits. No-op
+        # when the fixture is absent.
+        _maybe_seed_conversion_plan(output_dir, "SimpleFPS")
 
         from core.conversion_context import ConversionContext
         pipeline = Pipeline(
@@ -508,6 +567,11 @@ class TestOfflineAssembly:
             pipeline.ctx.networking_mode = "none"
 
         ctx = pipeline.run_all()
+
+        # Step 4c (Reactive fixups) coverage: apply project-specific
+        # post-transpile patches that the deterministic pipeline can't
+        # close. No-op when no fixup module exists for this project.
+        _maybe_apply_fixups(output_dir, ctx, "SimpleFPS")
 
         # Drift gate first — most actionable failure when snapshot is stale.
         manifest = pipeline.state.asset_manifest
@@ -580,6 +644,8 @@ class TestOfflineAssembly:
 
         snapshot = _load_snapshot("TrashDash")
         _seed_output_dir(tmp_path, snapshot)
+        # Step 4a coverage — no-op when fixture absent.
+        _maybe_seed_conversion_plan(tmp_path, "TrashDash")
 
         from core.conversion_context import ConversionContext
         pipeline = Pipeline(
@@ -589,6 +655,9 @@ class TestOfflineAssembly:
         )
         pipeline.ctx = ConversionContext.load(pipeline._context_path)
         ctx = pipeline.run_all()
+
+        # Step 4c coverage — no-op when fixup module absent.
+        _maybe_apply_fixups(tmp_path, ctx, "TrashDash")
 
         manifest = pipeline.state.asset_manifest
         assert manifest is not None
@@ -671,3 +740,57 @@ class TestConversionManifest:
         # Normal pytest runs: helper must not litter the test's tmp_path
         # with skill artifacts.
         assert not (tmp_path / "conversion_manifest.json").exists()
+
+
+class TestStep4aPlanSeed:
+    """Fast unit tests for ``_maybe_seed_conversion_plan`` — the Step 4a
+    coverage hook. The full slow test ``test_simplefps_assembly_with_cached_ids``
+    exercises it end-to-end through Pipeline; these tests pin the
+    contract without paying the ~24 min cold-conversion cost.
+    """
+
+    def test_seeds_when_fixture_exists(self, tmp_path: Path) -> None:
+        # SimpleFPS has a fixture committed at
+        # tests/fixtures/conversion_plans/SimpleFPS.plan.json. Seed it
+        # and verify both the return value and the on-disk artifact.
+        seeded = _maybe_seed_conversion_plan(tmp_path, "SimpleFPS")
+        assert seeded is True
+        plan_path = tmp_path / "conversion_plan.json"
+        assert plan_path.exists()
+        plan = json.loads(plan_path.read_text())
+        # The load-bearing key the pipeline actually consumes today.
+        assert "scene_runtime" in plan
+        assert "domain_overrides" in plan["scene_runtime"]
+
+    def test_no_op_when_fixture_absent(self, tmp_path: Path) -> None:
+        # A project name with no committed fixture must be a silent
+        # no-op so existing test methods keep working unchanged.
+        seeded = _maybe_seed_conversion_plan(tmp_path, "NonExistentProject")
+        assert seeded is False
+        assert not (tmp_path / "conversion_plan.json").exists()
+
+
+class TestStep4cFixups:
+    """Fast unit tests for ``_maybe_apply_fixups`` — the Step 4c coverage
+    hook. Same rationale as ``TestStep4aPlanSeed``.
+    """
+
+    def test_invokes_fixup_module_when_present(self, tmp_path: Path) -> None:
+        # SimpleFPS has a fixup module at
+        # tests/fixtures/fixups/simplefps_fixups.py (currently no-op).
+        # Verify ``_maybe_apply_fixups`` imports and calls it.
+        applied = _maybe_apply_fixups(tmp_path, ctx=None, project_name="SimpleFPS")
+        assert applied is True
+
+    def test_no_op_when_fixup_module_absent(self, tmp_path: Path) -> None:
+        applied = _maybe_apply_fixups(tmp_path, ctx=None, project_name="NonExistentProject")
+        assert applied is False
+
+    def test_project_name_normalization(self, tmp_path: Path) -> None:
+        # ``trash-dash`` -> looks up ``trashdash_fixups``; ``Simple_FPS`` ->
+        # ``simplefps_fixups``. Verify the normalization rule lines up
+        # with the committed file naming.
+        # SimpleFPS file is simplefps_fixups.py — case-insensitive lookup.
+        assert _maybe_apply_fixups(tmp_path, None, "simplefps") is True
+        assert _maybe_apply_fixups(tmp_path, None, "SIMPLEFPS") is True
+        assert _maybe_apply_fixups(tmp_path, None, "Simple-FPS") is True
