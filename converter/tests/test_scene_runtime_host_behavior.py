@@ -1669,7 +1669,16 @@ class TestPrefabComponentReceivesGameObject:
         This is the regression anchor for the runtime side. The
         converter-side unit tests in ``test_prefab_packages.py`` lock in
         the stamping itself; this test locks in the contract that the
-        host runtime uses those stamps to wire ``self.gameObject``."""
+        host runtime uses those stamps to wire ``self.gameObject``.
+
+        NOTE: this test exercises the raw-id fallback in resolveCloneChild
+        (scene_runtime.luau:1673-1676), not the namespaced rewrite path
+        (scene_runtime.luau:1626-1644). The clone table doesn't install
+        GetAttribute/SetAttribute mocks, so the upfront walk no-ops. The
+        test still proves the load-bearing contract: a cloned prefab
+        descendant binds to a non-nil self.gameObject after the
+        converter stamps SRIs on the template tree. A stricter follow-up
+        could install attribute mocks and exercise both paths."""
         scenario = textwrap.dedent("""\
             local capturedGo = nil
             local Foo = {} ; Foo.__index = Foo

@@ -6,6 +6,9 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -1356,4 +1359,202 @@ class TestTemplateSceneRuntimeIdStamping:
         assert sri == f"{guid}:Assets/Prefabs/Plain.prefab:1", (
             "MB-less prefab template must still carry SRI for lookup parity "
             "with scene-instantiated prefabs"
+        )
+
+    # -----------------------------------------------------------------
+    # PR #145 follow-up: converter/planner _prefab_stable_id parity
+    # -----------------------------------------------------------------
+    #
+    # Both ``scene_converter._prefab_stable_id`` and
+    # ``scene_runtime_planner._prefab_stable_id`` claim (via docstrings /
+    # comments) to mirror each other and produce identical namespaces.
+    # Both Codex and Claude flagged this on PR #145 as a latent drift trap:
+    # production works because both get the SAME ``unity_project_path``,
+    # but the helpers diverge on edge cases. These tests pin the contract.
+    #
+    # CONTRACT under test: for any (template, guid_index, by_guid,
+    # project_root) tuple, ``conv_stable(...) == plan_stable(...)``.
+    #
+    # The happy path agrees. Two scenarios DO drift today (xfail markers
+    # below + ``docs/design/scene-runtime-pr2-followups.md`` §7):
+    #   - ``project_root=None`` with a resolvable guid: converter returns
+    #     ``guid`` (no path); planner returns ``f"{guid}:{abs_path}"``.
+    #   - Prefab path outside ``project_root``: converter returns ``""``;
+    #     planner returns ``f"{guid}:{abs_path}"``.
+    # The fix belongs in a separate PR (align both on the conservative
+    # "skip on outside-root / no-root" rule; matches scene_namespace
+    # posture). See docs §7.
+
+    def test_prefab_stable_id_parity_happy_path(self, tmp_path):
+        """Happy path: valid template, guid_index resolving the path, and
+        a project_root that contains the prefab. Both helpers must agree.
+
+        Codex/Claude review of PR #145 flagged the drift risk on edge
+        cases (project_root None; prefab path outside the project root).
+        This case is the load-bearing one — every real conversion takes
+        this path — and is the contract that template stamping
+        (conversion-time) and the plan's ``game_object_id`` format
+        (used by the runtime's ``resolveCloneChild`` lookup) match.
+        """
+        from converter.scene_converter import _prefab_stable_id as conv_stable
+        from converter.scene_runtime_planner import (
+            _prefab_stable_id as plan_stable,
+        )
+        guid = "e" * 32
+        prefab_path = tmp_path / "Assets" / "Prefabs" / "Crate.prefab"
+        prefab_path.parent.mkdir(parents=True)
+        prefab_path.write_text("")
+        template = _real_prefab_template(
+            "Crate", prefab_path=prefab_path, root_file_id="1",
+        )
+        from core.unity_types import PrefabLibrary
+        lib = PrefabLibrary(prefabs=[template], by_guid={guid: template})
+        guid_index = _guid_index_for(tmp_path, prefab_path, guid)
+
+        conv = conv_stable(template, guid_index, lib.by_guid, tmp_path)
+        plan = plan_stable(template, guid_index, lib.by_guid, tmp_path)
+        assert conv == plan, (
+            f"happy-path drift: conv={conv!r} plan={plan!r}"
+        )
+        # And the canonical shape so a future change can't silently
+        # collapse both helpers to the empty string and "pass" parity.
+        assert conv == f"{guid}:Assets/Prefabs/Crate.prefab"
+
+    def test_prefab_stable_id_parity_by_guid_fallback(self, tmp_path):
+        """When ``guid_index`` is None but the template is registered in
+        the library's ``by_guid`` map (the prefab-variant path before
+        meta GUIDs are indexed), both helpers must take the same
+        fallback branch and emit identical ids."""
+        from converter.scene_converter import _prefab_stable_id as conv_stable
+        from converter.scene_runtime_planner import (
+            _prefab_stable_id as plan_stable,
+        )
+        guid = "f" * 32
+        prefab_path = tmp_path / "Assets" / "Prefabs" / "Variant.prefab"
+        prefab_path.parent.mkdir(parents=True)
+        prefab_path.write_text("")
+        template = _real_prefab_template(
+            "Variant", prefab_path=prefab_path, root_file_id="1",
+        )
+        from core.unity_types import PrefabLibrary
+        lib = PrefabLibrary(prefabs=[template], by_guid={guid: template})
+
+        # guid_index=None — must fall back to lib.by_guid.
+        conv = conv_stable(template, None, lib.by_guid, tmp_path)
+        plan = plan_stable(template, None, lib.by_guid, tmp_path)
+        assert conv == plan, (
+            f"by_guid-fallback drift: conv={conv!r} plan={plan!r}"
+        )
+        assert conv == f"{guid}:Assets/Prefabs/Variant.prefab"
+
+    def test_prefab_stable_id_parity_no_guid_with_root(self, tmp_path):
+        """No guid resolvable but a valid project_root: both helpers
+        return the bare project-relative path (no guid prefix). This is
+        the unstable-name fallback for templates that have a prefab
+        path but no resolvable GUID."""
+        from converter.scene_converter import _prefab_stable_id as conv_stable
+        from converter.scene_runtime_planner import (
+            _prefab_stable_id as plan_stable,
+        )
+        prefab_path = tmp_path / "Assets" / "Prefabs" / "NoGuid.prefab"
+        prefab_path.parent.mkdir(parents=True)
+        prefab_path.write_text("")
+        template = _real_prefab_template(
+            "NoGuid", prefab_path=prefab_path, root_file_id="1",
+        )
+        from core.unity_types import PrefabLibrary
+        # by_guid empty AND guid_index=None → no guid resolvable.
+        lib = PrefabLibrary(prefabs=[template], by_guid={})
+
+        conv = conv_stable(template, None, lib.by_guid, tmp_path)
+        plan = plan_stable(template, None, lib.by_guid, tmp_path)
+        assert conv == plan, (
+            f"no-guid-with-root drift: conv={conv!r} plan={plan!r}"
+        )
+        assert conv == "Assets/Prefabs/NoGuid.prefab"
+
+    @pytest.mark.xfail(
+        reason=(
+            "latent: scene_converter._prefab_stable_id and "
+            "scene_runtime_planner._prefab_stable_id drift on "
+            "project_root=None. Converter returns just `guid`; planner "
+            "returns f'{guid}:{abs_path}'. See "
+            "docs/design/scene-runtime-pr2-followups.md §7."
+        ),
+        strict=True,
+    )
+    def test_prefab_stable_id_parity_project_root_none(self, tmp_path):
+        """When ``unity_project_root`` is None the two helpers diverge
+        (xfail). The converter short-circuits to ``guid`` (no path
+        segment at all); the planner falls back to the absolute path
+        and emits ``f'{guid}:{abs_path}'``. Production never hits this
+        because the pipeline always supplies a project root, but the
+        helpers claim to mirror each other and this case violates that
+        claim. Fix belongs in a separate PR (constraint: do NOT change
+        either helper as part of PR #145; that's out of scope)."""
+        from converter.scene_converter import _prefab_stable_id as conv_stable
+        from converter.scene_runtime_planner import (
+            _prefab_stable_id as plan_stable,
+        )
+        guid = "1" * 32
+        prefab_path = tmp_path / "Assets" / "Prefabs" / "NoRoot.prefab"
+        prefab_path.parent.mkdir(parents=True)
+        prefab_path.write_text("")
+        template = _real_prefab_template(
+            "NoRoot", prefab_path=prefab_path, root_file_id="1",
+        )
+        from core.unity_types import PrefabLibrary
+        lib = PrefabLibrary(prefabs=[template], by_guid={guid: template})
+        # guid_index resolves the guid; project_root=None is the divergent input.
+        guid_index = _guid_index_for(tmp_path, prefab_path, guid)
+
+        conv = conv_stable(template, guid_index, lib.by_guid, None)
+        plan = plan_stable(template, guid_index, lib.by_guid, None)
+        assert conv == plan, (
+            f"project_root=None drift: conv={conv!r} plan={plan!r}"
+        )
+
+    @pytest.mark.xfail(
+        reason=(
+            "latent: scene_converter._prefab_stable_id and "
+            "scene_runtime_planner._prefab_stable_id drift when the "
+            "prefab path is outside `unity_project_root`. Converter "
+            "returns ''; planner falls back to the absolute path and "
+            "emits f'{guid}:{abs_path}'. See "
+            "docs/design/scene-runtime-pr2-followups.md §7."
+        ),
+        strict=True,
+    )
+    def test_prefab_stable_id_parity_prefab_outside_root(self, tmp_path):
+        """Prefab lives outside the project root (xfail). Converter
+        treats this like ``_scene_namespace`` outside-root (returns
+        '' to skip stamping); planner falls back to the absolute path.
+        Production never hits this because Unity prefabs always live
+        under ``Assets/``, but the asymmetry is a latent footgun for
+        out-of-tree assets or symlinked project layouts. Fix is
+        out-of-scope for PR #145."""
+        from converter.scene_converter import _prefab_stable_id as conv_stable
+        from converter.scene_runtime_planner import (
+            _prefab_stable_id as plan_stable,
+        )
+        # Project root = tmp_path/proj, prefab in tmp_path/external (sibling).
+        project_root = tmp_path / "proj"
+        project_root.mkdir()
+        external_dir = tmp_path / "external"
+        external_dir.mkdir()
+        prefab_path = external_dir / "Loose.prefab"
+        prefab_path.write_text("")
+        guid = "2" * 32
+        template = _real_prefab_template(
+            "Loose", prefab_path=prefab_path, root_file_id="1",
+        )
+        from core.unity_types import PrefabLibrary
+        lib = PrefabLibrary(prefabs=[template], by_guid={guid: template})
+        # guid_index has the prefab at its absolute (outside-root) path.
+        guid_index = _guid_index_for(project_root, prefab_path, guid)
+
+        conv = conv_stable(template, guid_index, lib.by_guid, project_root)
+        plan = plan_stable(template, guid_index, lib.by_guid, project_root)
+        assert conv == plan, (
+            f"prefab-outside-root drift: conv={conv!r} plan={plan!r}"
         )

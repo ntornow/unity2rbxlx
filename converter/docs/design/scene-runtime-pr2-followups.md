@@ -152,7 +152,53 @@ the scene-instantiation path uses (`_convert_prefab_instance`'s
 `_SceneRuntimeId` values on a `ReplicatedStorage.Templates` entry
 match the value the scene-stamped clone would carry.
 
-## 7. Nested `Canvas` children routed through the wrong UI path
+## 7. `_prefab_stable_id` parity drift between converter and planner
+
+**Status:** Latent — discovered by PR #145 review (Codex + Claude both
+flagged it independently). Two `xfail` tests in
+`converter/tests/test_prefab_packages.py::TestTemplateSceneRuntimeIdStamping`
+(`test_prefab_stable_id_parity_project_root_none` and
+`test_prefab_stable_id_parity_prefab_outside_root`) pin the divergence.
+
+**Where:**
+- `converter/converter/scene_converter.py:298-341` — `_prefab_stable_id`
+  (the conversion-time stamping helper).
+- `converter/converter/scene_runtime_planner.py:383-406` — `_prefab_stable_id`
+  (the planner's `game_object_id` builder).
+
+Both helpers' docstrings claim to mirror each other. They DO agree on
+the happy path (valid `guid_index`, `by_guid`, and `project_root` that
+contains the prefab) — that's what every production run hits, which is
+why this hasn't broken anything yet. They diverge on two edge cases:
+
+1. **`unity_project_root=None`**: converter returns just `guid` (no path
+   segment); planner returns `f"{guid}:{abs_path}"` via
+   `_relative_path_string`'s absolute-path fallback.
+2. **Prefab path outside `unity_project_root`**: converter returns `""`
+   (matching `_scene_namespace`'s "skip on outside-root" rule); planner
+   falls back to `f"{guid}:{abs_path}"`.
+
+**Why it matters:** if a future caller hits either edge case (e.g.
+asset paths outside `Assets/`, or a pipeline reorg that defers
+`unity_project_path` plumbing), the converter's stamp on a template
+won't match the `game_object_id` the planner emits, and the runtime's
+`resolveCloneChild` lookup will silently miss — same failure mode PR
+#145 just fixed for the unstamped-template case (cloned descendant
+boots with `self.gameObject = nil`).
+
+**Scope (separate PR):** align both helpers on the conservative
+"skip stamping / return empty" posture used by `_scene_namespace`
+for outside-root scenes (also called out in §2 above for that helper).
+Either:
+- Update planner to return `""` instead of falling back to absolute
+  paths, OR
+- Update converter to fall back to absolute paths, matching planner.
+
+The first is cleaner and matches the §2 resolution direction. Both
+options need the planner's "outside root" snapshot tests updated.
+Tests: flip both `xfail` markers to passing once the helpers align.
+
+## 8. Nested `Canvas` children routed through the wrong UI path
 
 **Where:** `converter/converter/ui_translator.py:find_canvas_nodes`
 (and the `_convert_ui_element` consumer of its output).
