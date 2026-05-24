@@ -1,15 +1,16 @@
 ---
 name: e2e-test
-description: Unified end-to-end test for a converted Unity project. Runs the AI conversion offline (no upload/publish), launches Studio with the produced rbxlx, drives the gameplay-feature fixtures via Studio MCP, and writes a combined pass/fail report.
+description: End-to-end test for a converted Unity project. Delegates the full conversion (including agent-driven Steps 4a and 4c) to /convert-unity, then launches Studio with the produced rbxlx, drives the gameplay-feature fixtures via Studio MCP, and writes a combined pass/fail report. Upload step (6) is skipped — cached asset IDs from the project's upload snapshot are pre-seeded.
 argument-hint: <project> [--close-and-relaunch] [--only fixture_ids] [--generic]
 allowed-tools:
   - Bash(python3 -m tests.studio_behavior_driver *)
-  - Bash(python3 -m pytest *)
+  - Bash(python3 convert_interactive.py *)
   - Bash(python3 -c *)
   - Bash(mkdir *)
   - Bash(date *)
   - Bash(openssl rand *)
   - Bash(cat *)
+  - Bash(realpath *)
   - Read
   - Write
   - mcp__Roblox_Studio__list_roblox_studios
@@ -29,10 +30,20 @@ the test the user originally asked for ("automated real test that does
 the full conversion modulo upload/publish"). Trigger model is manual +
 nightly, not per-PR CI.
 
-The test has two halves: an **offline conversion** (AI transpile +
-assemble, no upload/publish) and a **gameplay verification** (drive the
-behavior fixtures in a Studio Play session). They run as one motion —
-there is no separate trigger for the gameplay half.
+The test has two halves: an **offline conversion** (delegated to
+`/convert-unity`, which walks all phases 1–5 including the agent-driven
+4a Plan and 4c Reactive fixups; phase 6 upload is skipped) and a
+**gameplay verification** (drive the behavior fixtures in a Studio Play
+session). They run as one motion — there is no separate trigger for the
+gameplay half.
+
+The conversion half is **not** a pytest harness. Earlier iterations
+shortcut /convert-unity by calling `Pipeline.run_all()` directly through
+`test_offline_assembly`; that silently skipped 4a (classifier overrides)
+and 4c (residual transpiler gaps) because both are agent-driven and have
+no pipeline command. The /e2e-test discipline now is: the same
+conversion an operator would do interactively via /convert-unity is the
+conversion this skill validates.
 
 ## House rules
 
@@ -40,6 +51,11 @@ there is no separate trigger for the gameplay half.
   single exit code. A conversion failure short-circuits the gameplay
   verification with exit 2 (the rbxlx never built; there's nothing to
   play).
+- **Delegate the conversion to /convert-unity.** Don't reach into
+  pytest harnesses or call `Pipeline.run_all()` directly. The agent
+  walking /e2e-test walks /convert-unity's phases inline (Step 3
+  below). The only test-only carve-out is pre-seeding cached asset IDs
+  so phase 6 upload is skipped.
 - **Fresh Studio process for this run.** Re-opening a regenerated
   rbxlx in an already-running Studio does NOT reload the in-memory
   DataModel — so this run must own a *newly-launched* Studio process.
@@ -59,7 +75,7 @@ there is no separate trigger for the gameplay half.
 | Code | Meaning |
 |---|---|
 | 0 | Conversion passed and all gameplay fixtures passed |
-| 2 | Conversion (offline-assembly pytest) failed; gameplay verification skipped |
+| 2 | /convert-unity conversion failed (any phase 1–5); gameplay verification skipped |
 | 3 | Studio liveness/handshake failed (couldn't get a verified Studio in 180s — includes "no new Studio appeared in `list_roblox_studios` after launch" and "E2ERunId handshake didn't echo back") |
 | 4 | Conversion passed but ≥1 gameplay fixture failed |
 
@@ -116,50 +132,91 @@ If that raises, surface the error and exit 3. After the close, re-run
 the snapshot above so `PRE_LAUNCH_STUDIO_IDS` reflects the
 post-cleanup state (likely empty).
 
-### Step 3: Offline AI conversion
+### Step 3: Full conversion via `/convert-unity`
+
+This skill is the playback-verification harness. The conversion itself
+is **owned by `/convert-unity`** — invoke that skill, let it walk every
+phase (including the agent-driven 4a Plan and 4c Reactive fixups), and
+capture the produced rbxlx. No test-only shortcut around the agent work
+that `/convert-unity` is the canonical home for.
+
+**Why:** offline pytest harnesses (`test_offline_assembly`) bypass 4a/4c
+by going direct to `Pipeline.run_all()`. That makes them fast but
+gives false confidence — classifier misclassifications and residual
+transpiler gaps the agent would catch in /convert-unity slip through.
+Calling /convert-unity here keeps /e2e-test as the high-fidelity
+end-to-end test it claims to be.
+
+#### What to invoke
+
+Invoke the `/convert-unity` skill with the project's Unity path and
+`${CONV_DIR}` as the output dir. As the agent driving /e2e-test, walk
+/convert-unity's phases inline:
+
+1. **Phases 1–3** (discover / inventory / materials): run the
+   `convert_interactive.py` commands from /convert-unity's SKILL.md
+   verbatim.
+2. **Phase 4a (Plan)**: agent-driven. Read
+   `references/phase-4a-*.md` and emit `conversion_plan.json` per the
+   sub-phase walk. Decide autonomously based on each file's Factors
+   block; the design doc rule applies — escalate only on genuine
+   ambiguity.
+3. **Phase 4b (Transpile)**: run `convert_interactive.py transpile`
+   then `validate --write`.
+4. **Phase 4c (Reactive fixups)**: agent-driven. Read
+   `references/phase-4c-*.md` and apply project-specific post-transpile
+   patches.
+5. **Phase 5 (Assemble)**: pre-seed `${CONV_DIR}/conversion_context.json`
+   and `${CONV_DIR}/.roblox_ids.json` from
+   `tests/fixtures/upload_snapshots/<project>.snapshot.json` BEFORE
+   running `assemble`, so the upload phase reuses cached IDs instead
+   of touching Open Cloud. The skill exports `_seed_output_dir` for
+   this; the simplest path is:
+   ```bash
+   python3 -c "
+   import sys, json
+   sys.path.insert(0, 'tests')
+   from test_offline_assembly import _seed_output_dir, _load_snapshot
+   from pathlib import Path
+   _seed_output_dir(Path('${CONV_DIR}'), _load_snapshot('${PROJECT}'))
+   "
+   ```
+   Then run `assemble` per /convert-unity's SKILL.md. Pass
+   `--universe-id` / `--place-id` from the seeded `.roblox_ids.json`
+   when prompted.
+6. **Phase 6 (Upload)**: **SKIP** — this is a test, no Open Cloud
+   round-trip. Done after assemble.
+
+The agent owns each /convert-unity decision (autonomous per
+/convert-unity's "agent decides" rule). The only places /e2e-test
+should pre-decide for /convert-unity are:
+  - "scene-runtime mode" (pass through to /convert-unity's decisions:
+    `--generic` here ↔ generic-mode emission in /convert-unity's
+    Step 4 planning + transpile flags).
+  - "skip Step 6 upload" (the test contract — never upload during
+    /e2e-test).
+
+**Scene-runtime mode.** When `--generic` was passed to /e2e-test,
+ensure /convert-unity's `transpile` and `assemble` phases run with
+`--scene-runtime=generic` (and the planning in 4a accounts for the
+generic ModuleScript + host contract). Default is legacy.
+
+#### Outcome capture
+
+After /convert-unity finishes, `${CONV_DIR}/converted_place.rbxlx`
+exists. Capture its absolute path into `RBXLX_PATH`:
 
 ```bash
-E2E_OUTPUT_DIR="${CONV_DIR}" E2E_RUN_ID="${RUN_ID}" \
-python3 -m pytest -m slow \
-  tests/test_offline_assembly.py::TestOfflineAssembly::test_simplefps_assembly_with_cached_ids \
-  -v --tb=short --no-header
+RBXLX_PATH="$(realpath "${CONV_DIR}/converted_place.rbxlx")"
 ```
 
-(For projects other than SimpleFPS, swap the test method. V1 only ships
-SimpleFPS; the test parameterization is task #6.)
+If the rbxlx is missing (any phase failed): write the combined report
+with `conversion.passed = false` + `gameplay = null`, print the
+summary line, exit 2.
 
-**Scene-runtime mode.** The conversion test is mode-aware via the
-`E2E_SCENE_RUNTIME_MODE` env var. The documented default is **legacy**
-(top-level auto-running Scripts) — omit the var to get it. When
-`--generic` is passed, add `E2E_SCENE_RUNTIME_MODE=generic` to the env
-block so the test drives the scene-runtime contract (ModuleScripts
-hosted by an embedded `SceneRuntime`, single-player `networking_mode`)
-and adds assertions that the embedded `SceneRuntimePlan` carries
-`scene_prefab_placements` and `SceneRuntime` defines `_constructPrefabClone`:
-
-```bash
-E2E_SCENE_RUNTIME_MODE=generic \
-E2E_OUTPUT_DIR="${CONV_DIR}" E2E_RUN_ID="${RUN_ID}" \
-python3 -m pytest -m slow \
-  tests/test_offline_assembly.py::TestOfflineAssembly::test_simplefps_assembly_with_cached_ids \
-  -v --tb=short --no-header
-```
-
-The resulting `conversion_manifest.json` records `scene_runtime_mode`, so
-the gameplay half (Steps 4-7) plays whichever build the conversion
-produced.
-
-If pytest exits non-zero: write the combined report with
-`conversion.passed = false` + `gameplay = null`, print the summary line,
-exit 2.
-
-Otherwise read `${CONV_DIR}/conversion_manifest.json`:
-
-```bash
-cat "${CONV_DIR}/conversion_manifest.json"
-```
-
-Capture `rbxlx_path`, `duration_seconds`.
+Also write a `${CONV_DIR}/conversion_manifest.json` for the report
+schema — same shape as before, the agent fills it in based on the
+/convert-unity run's start/end timestamps and the rbxlx path.
 
 ### Step 4: Launch Studio + 3-step readiness probe
 
