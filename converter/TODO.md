@@ -144,6 +144,77 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   [`docs/FUTURE_IMPROVEMENTS.md`](docs/FUTURE_IMPROVEMENTS.md)
   § "Persistent prefab/asset cache".
 
+- [ ] **P0 — Player.Update throws "Move is not a valid member of Part" 12x/sec.**
+  Live SimpleFPS playtest, 2026-05-25. Root cause at
+  `runtime/scene_runtime.luau:80` — `CharacterController = "BasePart"`
+  in `_UNITY_TO_ROBLOX_CLASS`. `GetComponent("CharacterController")` →
+  `findFirstChildWhichIsA(playerPart, "BasePart")`; the wrapped helper
+  in `converter/autogen.py` does `if inst:IsA(class) then return inst`,
+  returns the player Part. AI-faithful `self.control:Move(motion)` then
+  throws. Compounded: WASD input is silently dead because
+  `self.control.isGrounded` is nil on a Part. The mapping is
+  semantically wrong — Unity's CharacterController is a movement
+  controller; Roblox's nearest equivalent is `Humanoid`.
+
+  Two-part fix:
+  1. Remove `CharacterController = "BasePart"` from
+     `_UNITY_TO_ROBLOX_CLASS` so `GetComponent` returns nil for unmapped
+     types. The wrapped helper's IsA-on-self shortcut also needs
+     guarding: when `name` isn't mapped, skip the helper entirely.
+  2. Provide a real Humanoid-backed CharacterController shim — expose
+     `:Move(motion)`, `:SimpleMove(speed)`, `.isGrounded` over the
+     player's Humanoid. Binding step: Player.luau's `self.gameObject`
+     is the scene Player Part, but the actual character (with Humanoid)
+     is spawned separately by Roblox — the shim's `GetComponent` path
+     resolves `LocalPlayer.Character:WaitForChild("Humanoid")` for
+     player-controlled characters.
+
+  Test plan:
+  - Unit test: `GetComponent("CharacterController")` on a non-Humanoid
+    GameObject returns nil.
+  - Integration test: bind to a Humanoid-mocked character; assert the
+    shim's `:Move(direction)` forwards to `humanoid:Move(direction.Unit,
+    false)`, `.isGrounded` reads `humanoid.FloorMaterial ~= Enum.Material.Air`.
+  - Live: SimpleFPS playthrough, console shows no "Move is not a valid
+    member of Part" errors; WASD movement actually moves the character.
+
+- [ ] **P1 — HudControl missing `game:GetService("ReplicatedStorage")` causes "did not return a table".**
+  Live SimpleFPS playtest, 2026-05-25. `HudControl.luau:1` has
+  `local Player = require(ReplicatedStorage.Player)` but no
+  `local ReplicatedStorage = game:GetService("ReplicatedStorage")` line
+  above. Top-level throw → module never reaches `return HudControl` →
+  scene_runtime reports `module ... did not return a table`. Other
+  modules that require Player (HostilePlane, GameManager) have the
+  service-getter line. Suspected ordering bug: cross-script
+  dependency injection (auto-prepends `require(ReplicatedStorage.X)`
+  for any peer-module reference) runs AFTER the service-getter
+  injector (`api_mappings.py:721-735` `SERVICE_IMPORTS`). When the
+  getter injector ran on HudControl's AI output, `ReplicatedStorage`
+  wasn't referenced yet; later the require auto-injector added the
+  line, leaving the symbol undefined.
+
+  Fix: make the two injectors dependency-aware. Either (a) run
+  service-getter injection AFTER cross-script require injection, or
+  (b) merge into a single preamble-emission pass that walks the FINAL
+  script body once, discovers every referenced service + every
+  required module, and emits a deterministic preamble. Option (b) is
+  cleaner — eliminates the ordering risk entirely.
+
+  Test plan:
+  - Golden-file regression in `tests/test_code_transpiler.py` (or a
+    new `tests/test_preamble_injection.py`): synthesize a script with
+    no service references in the AI body, cross-script-inject
+    `require(ReplicatedStorage.X)`, assert emitted file contains
+    `local ReplicatedStorage = game:GetService("ReplicatedStorage")`
+    BEFORE the first `require(ReplicatedStorage...)`.
+  - Run the fast suite — many existing tests assert script preamble
+    shape and will catch regressions.
+
+  See `docs/design/scene-runtime-architecture-ir.md` for the deeper
+  cross-domain refactor that also subsumes a class of these injector
+  ordering issues; this is the surgical fix without waiting for the
+  architecture-IR work.
+
 ## Materials & meshes
 
 - [ ] **P1 — Embedded-mesh resolver only warns on bad sub-mesh count, then ships arbitrary geometry.** PR #121 review (codex + Claude, 2026-05-21).
