@@ -3775,3 +3775,213 @@ class TestFpsCameraPitchInversion:
         assert packs_module._detect_fps_camera_pitch_inversion([s]) is False
         packs_module._fix_fps_camera_pitch_inversion([s])
         assert s.source == original
+
+
+# ---------------------------------------------------------------------------
+# Pack: turret_canonical_spatial_child (issue #146)
+# ---------------------------------------------------------------------------
+
+# Verbatim slice of the AI-transpile-broken Turret.luau (output of a cold
+# /e2e-test conversion 2026-05-24). The naive-first-child anti-pattern
+# appears three times — tBase, tWeapon, tOrigin. Each crashes at runtime
+# the moment Turret:_handleTouched calls tBase():GetPivot() because the
+# SimpleFPS turret prefab's first child is `HitSound` (a `Sound`, not a
+# BasePart/Model).
+_BROKEN_TURRET_LUAU = '''\
+local State = {
+    Default = 0,
+    Engaged = 1,
+    Search = 2,
+}
+
+local STUDS_PER_METER = 3.571
+
+local Turret = {}
+Turret.__index = Turret
+
+function Turret.new(config)
+    local self = setmetatable({}, Turret)
+    return self
+end
+
+function Turret:tBase()
+    local children = self.gameObject:GetChildren()
+    return children[1]
+end
+
+function Turret:tWeapon()
+    local b = self:tBase()
+    if not b then return nil end
+    local children = b:GetChildren()
+    return children[1]
+end
+
+function Turret:tOrigin()
+    local w = self:tWeapon()
+    if not w then return nil end
+    local children = w:GetChildren()
+    return children[1]
+end
+
+return Turret
+'''
+
+
+class TestTurretCanonicalSpatialChildDetector:
+    def test_detects_broken_turret(self) -> None:
+        s = RbxScript(
+            name="Turret",
+            source=_BROKEN_TURRET_LUAU,
+            script_type="ModuleScript",
+        )
+        assert packs_module._detect_turret_canonical_spatial_child([s]) is True
+
+    def test_skips_non_turret_scripts_with_same_pattern(self) -> None:
+        """Identity-gated on `s.name == 'Turret'`. A different script
+        with the exact same anti-pattern must not fire — this pack is
+        scoped to the Turret prefab's geometric assumptions."""
+        s = RbxScript(
+            name="Pickup",
+            source=_BROKEN_TURRET_LUAU.replace("Turret", "Pickup"),
+            script_type="ModuleScript",
+        )
+        assert packs_module._detect_turret_canonical_spatial_child([s]) is False
+
+    def test_skips_already_canonical_turret(self) -> None:
+        """Turret that already filters by BasePart/Model must not
+        trigger the pack — there's no anti-pattern to rewrite."""
+        canonical = '''\
+local Turret = {}
+Turret.__index = Turret
+
+local function firstSpatialChild(inst)
+    for _, c in inst:GetChildren() do
+        if c:IsA("BasePart") or c:IsA("Model") then return c end
+    end
+    return nil
+end
+
+function Turret:tBase()
+    return firstSpatialChild(self.gameObject)
+end
+
+return Turret
+'''
+        s = RbxScript(
+            name="Turret", source=canonical, script_type="ModuleScript",
+        )
+        assert packs_module._detect_turret_canonical_spatial_child([s]) is False
+
+    def test_skips_when_no_turret_present(self) -> None:
+        """No Turret script in the batch → detector returns False even
+        if other scripts have ``children[1]`` somewhere."""
+        scripts = [
+            RbxScript(
+                name="Mine",
+                source="local x = inst:GetChildren()[1]\n",
+                script_type="ModuleScript",
+            ),
+        ]
+        assert packs_module._detect_turret_canonical_spatial_child(scripts) is False
+
+
+class TestTurretCanonicalSpatialChildApply:
+    def test_rewrites_three_methods_and_injects_helper(self) -> None:
+        s = RbxScript(
+            name="Turret",
+            source=_BROKEN_TURRET_LUAU,
+            script_type="ModuleScript",
+        )
+        fixes = packs_module._fix_turret_canonical_spatial_child([s])
+        assert fixes == 1  # one script edited
+        # Helper present
+        assert "local function firstSpatialChild" in s.source
+        # Three rewrites — every naive pair is replaced
+        assert "local children = self.gameObject:GetChildren()" not in s.source
+        assert "local children = b:GetChildren()" not in s.source
+        assert "local children = w:GetChildren()" not in s.source
+        assert "return children[1]" not in s.source
+        # Each call site uses the helper with the original walked expression
+        assert "return firstSpatialChild(self.gameObject)" in s.source
+        assert "return firstSpatialChild(b)" in s.source
+        assert "return firstSpatialChild(w)" in s.source
+        # Original ``if not b then return nil end`` early-return preserved
+        # (the helper redundantly nil-checks; harmless).
+        assert "if not b then return nil end" in s.source
+        assert "if not w then return nil end" in s.source
+
+    def test_idempotent_on_second_apply(self) -> None:
+        """Twice-call invariant: second apply produces no further edits
+        and the source is byte-identical to the first-call output.
+        Defense against latent helper double-injection."""
+        s = RbxScript(
+            name="Turret",
+            source=_BROKEN_TURRET_LUAU,
+            script_type="ModuleScript",
+        )
+        first = packs_module._fix_turret_canonical_spatial_child([s])
+        after_first = s.source
+        second = packs_module._fix_turret_canonical_spatial_child([s])
+        assert first == 1
+        assert second == 0
+        assert s.source == after_first
+        # Helper appears exactly once
+        assert s.source.count("local function firstSpatialChild") == 1
+
+    def test_helper_injected_at_correct_anchor(self) -> None:
+        """The helper sits between ``Turret.__index = Turret`` and the
+        first ``function Turret.new`` — so every method that follows
+        has it in scope."""
+        s = RbxScript(
+            name="Turret",
+            source=_BROKEN_TURRET_LUAU,
+            script_type="ModuleScript",
+        )
+        packs_module._fix_turret_canonical_spatial_child([s])
+        anchor_idx = s.source.find("Turret.__index = Turret")
+        helper_idx = s.source.find("local function firstSpatialChild")
+        first_method_idx = s.source.find("function Turret.new")
+        assert anchor_idx != -1
+        assert helper_idx != -1
+        assert first_method_idx != -1
+        assert anchor_idx < helper_idx < first_method_idx
+
+    def test_skips_turret_without_anchor(self, caplog) -> None:
+        """Defensive: a Turret script that matches the anti-pattern but
+        lacks the ``Turret.__index = Turret`` anchor isn't in canonical
+        shape — the pack logs a warning and skips rather than injecting
+        a helper into the wrong place."""
+        unanchored = (
+            'local Turret = {}\n'
+            '-- no Turret.__index = Turret anchor\n'
+            'function Turret:tBase()\n'
+            '    local children = self.gameObject:GetChildren()\n'
+            '    return children[1]\n'
+            'end\n'
+        )
+        s = RbxScript(
+            name="Turret", source=unanchored, script_type="ModuleScript",
+        )
+        import logging
+        with caplog.at_level(logging.WARNING):
+            fixes = packs_module._fix_turret_canonical_spatial_child([s])
+        assert fixes == 0
+        assert s.source == unanchored
+        assert any(
+            "no `Turret.__index = Turret` anchor" in rec.message
+            for rec in caplog.records
+        )
+
+    def test_runs_via_registry_with_detector(self) -> None:
+        """End-to-end through ``run_packs``: detector fires on a broken
+        Turret and the registered pack rewrites it. Validates that the
+        pack is wired into the registry (not just unit-callable)."""
+        s = RbxScript(
+            name="Turret",
+            source=_BROKEN_TURRET_LUAU,
+            script_type="ModuleScript",
+        )
+        total = run_packs([s], enabled={"turret_canonical_spatial_child"})
+        assert total == 1
+        assert "local function firstSpatialChild" in s.source
+        assert "return children[1]" not in s.source

@@ -5049,3 +5049,147 @@ def _fix_fps_e2e_mouse_channel(scripts: list["RbxScript"]) -> int:
             fixes += 1
             log.info("  Injected E2E mouse channel into '%s'", s.name)
     return fixes
+
+
+# ---------------------------------------------------------------------------
+# Pack: turret_canonical_spatial_child
+# ---------------------------------------------------------------------------
+#
+# The Claude-CLI C#-to-Luau transpiler is non-deterministic for Turret-style
+# "spatial child" finder methods. Unity's source pattern is roughly
+# ``Transform t = transform.GetChild(0)`` — return the first child
+# Transform. Roblox Models have no Transform equivalent; spatial children
+# are anything matching ``IsA("BasePart")`` or ``IsA("Model")``. The
+# canonical post-transpile shape is a small helper that filters:
+#
+#     local function firstSpatialChild(inst)
+#         for _, c in inst:GetChildren() do
+#             if c:IsA("BasePart") or c:IsA("Model") then return c end
+#         end
+#         return nil
+#     end
+#
+# A cold re-transpile may instead emit the naive shape
+#
+#     function Turret:tBase()
+#         local children = self.gameObject:GetChildren()
+#         return children[1]
+#     end
+#
+# which returns whatever is first in ``GetChildren()`` — for the SimpleFPS
+# turret prefab that's ``HitSound`` (a ``Sound``). Engagement crashes on
+# the next ``:GetPivot()`` call with "GetPivot is not a valid member of
+# Sound". The bug is silent: ``Touched`` fires, the script enters
+# ``_handleTouched``, but every engagement path errors out before bullets
+# can spawn. See issue #146 for the live diagnosis.
+#
+# This pack is identity-gated on ``s.name == "Turret"`` plus the
+# structural anti-pattern (``local children = X:GetChildren()``
+# immediately followed by ``return children[1]`` at matching indent).
+# When detected it (a) injects the canonical ``firstSpatialChild`` helper
+# once at module scope, then (b) rewrites every anti-pattern pair to
+# ``return firstSpatialChild(X)`` preserving the original expression.
+#
+# Idempotent: a second ``apply`` finds no anti-pattern (because the first
+# call rewrote them all) and the marker check guards against a duplicate
+# helper insertion. A twice-call unit test pins the invariant.
+
+_TURRET_FIRST_SPATIAL_HELPER_MARKER = "local function firstSpatialChild"
+
+_TURRET_FIRST_SPATIAL_HELPER_BODY = (
+    "local function firstSpatialChild(inst)\n"
+    "    if not inst then return nil end\n"
+    "    for _, c in inst:GetChildren() do\n"
+    '        if c:IsA("BasePart") or c:IsA("Model") then\n'
+    "            return c\n"
+    "        end\n"
+    "    end\n"
+    "    return nil\n"
+    "end\n"
+)
+
+# ``local children = <expr>:GetChildren()`` immediately followed by
+# ``return children[1]`` at the same indent. The named-backref on the
+# indent prevents matches across an unrelated ``children`` declaration
+# at a different nesting level.
+_TURRET_NAIVE_FIRST_CHILD_RE = re.compile(
+    r"^(?P<indent>[ \t]*)local children = (?P<expr>[^\n]+?):GetChildren\(\)\n"
+    r"(?P=indent)return children\[1\]\n",
+    re.MULTILINE,
+)
+
+
+def _detect_turret_canonical_spatial_child(
+    scripts: list["RbxScript"],
+) -> bool:
+    for s in scripts:
+        if s.name != "Turret":
+            continue
+        src = s.source or ""
+        if _TURRET_NAIVE_FIRST_CHILD_RE.search(src):
+            return True
+    return False
+
+
+@patch_pack(
+    name="turret_canonical_spatial_child",
+    description=(
+        "Rewrite Turret-script naive `local children = X:GetChildren(); "
+        "return children[1]` spatial-child finders to use a canonical "
+        "`firstSpatialChild` helper that filters by `IsA('BasePart')` or "
+        "`IsA('Model')`. AI-transpile non-determinism for Turret prefabs "
+        "sometimes emits the wrong shape; for SimpleFPS turret models "
+        "child[1] is a `Sound` (HitSound) and engagement crashes on "
+        "`:GetPivot()`. See issue #146."
+    ),
+    detect=_detect_turret_canonical_spatial_child,
+)
+def _fix_turret_canonical_spatial_child(
+    scripts: list["RbxScript"],
+) -> int:
+    fixes = 0
+    for s in scripts:
+        if s.name != "Turret":
+            continue
+        src = s.source or ""
+        if not _TURRET_NAIVE_FIRST_CHILD_RE.search(src):
+            continue
+        # Inject the helper once at module scope. The anchor ``Turret.
+        # __index = Turret`` is the canonical post-``new`` shape every
+        # AI-transpiled Turret carries; without it the script isn't in
+        # recognisable shape and the pack bails (defensive).
+        if _TURRET_FIRST_SPATIAL_HELPER_MARKER not in src:
+            anchor = "Turret.__index = Turret\n"
+            idx = src.find(anchor)
+            if idx == -1:
+                log.warning(
+                    "  Turret script %r matched the naive-first-child "
+                    "pattern but has no `Turret.__index = Turret` anchor; "
+                    "skipping helper injection (rewrite would leave "
+                    "undefined `firstSpatialChild` calls).",
+                    s.name,
+                )
+                continue
+            insert_at = idx + len(anchor)
+            src = (
+                src[:insert_at]
+                + "\n"
+                + _TURRET_FIRST_SPATIAL_HELPER_BODY
+                + src[insert_at:]
+            )
+
+        def _replace(m: "re.Match[str]") -> str:
+            return (
+                f"{m.group('indent')}"
+                f"return firstSpatialChild({m.group('expr')})\n"
+            )
+
+        new_src, n = _TURRET_NAIVE_FIRST_CHILD_RE.subn(_replace, src)
+        if n and new_src != s.source:
+            s.source = new_src
+            fixes += 1
+            log.info(
+                "  Rewrote %d naive spatial-child finder(s) in '%s'",
+                n, s.name,
+            )
+    return fixes
