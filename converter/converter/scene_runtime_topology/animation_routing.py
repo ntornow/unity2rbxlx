@@ -40,6 +40,7 @@ Public surface:
 from __future__ import annotations
 
 from typing import Literal, TypedDict, cast
+from urllib.parse import quote, unquote
 
 from converter.scene_runtime_planner import (
     SceneRuntimeArtifact,
@@ -57,6 +58,21 @@ from converter.scene_runtime_topology.lifecycle_roles import (
 # different modules can't drift.
 ORPHAN_SCOPE: str = "__orphans__"
 NO_CTRL_KEY: str = "__none__"
+
+
+# Routing status enum. Replaces the older ``__orphan__`` magic-string
+# sentinel that codex flagged as fail-OPEN: stamping every unresolved
+# driver lookup as "orphan" hid resolver bugs behind invariant skips.
+# With an explicit status:
+#   - ``resolved``: a driver was found in this scope and routes the
+#     animation. Invariants 1 + 6 enforce its module + domain.
+#   - ``unresolved``: same-scope resolution found 0 or 2+ candidates
+#     (Phase 1 narrowing limitation). Invariants 1 + 6 skip; the
+#     animation falls back to today's server placement; Phase 2's
+#     C#-source narrowing pass will reduce these.
+#   - ``orphan``: deliberately orphan (project-wide orphan clip with
+#     no controller / no scope). Invariants 1 + 6 skip.
+AnimationRoutingStatus = Literal["resolved", "unresolved", "orphan"]
 
 
 # Domains an animation script is allowed to land in. ``"helper"`` and
@@ -111,6 +127,7 @@ class AnimationDriverEntry(TypedDict, total=False):
     """
 
     stable_id: str
+    routing_status: AnimationRoutingStatus
     driver_module_guid: str
     domain: AnimationDomain
     script_class: AnimationScriptClass
@@ -120,26 +137,64 @@ class AnimationDriverEntry(TypedDict, total=False):
     bridge_group_id: str | None
 
 
+# Characters reserved for the stable_id grammar. Percent-encoded inside
+# each segment so a Unity name containing ``:`` or ``%`` (rare but legal)
+# can't collide with the separator and produce a non-injective mapping
+# (codex W6).
+_STABLE_ID_RESERVED = ":%"
+
+
+def _escape_segment(value: str) -> str:
+    """Percent-encode the stable_id grammar reserved chars in one segment.
+
+    Reserved: ``:`` (separator) and ``%`` (escape marker). Unity allows
+    both in asset names (uncommon but legal). Percent-encoding makes the
+    `compute_stable_id` mapping injective: two distinct segment tuples
+    can NEVER produce the same string.
+    """
+    return quote(value, safe="", encoding="utf-8")
+
+
+def _unescape_segment(value: str) -> str:
+    """Inverse of ``_escape_segment``. Exposed for diagnostic / report
+    code that wants to render a stable_id back to its display form.
+    """
+    return unquote(value, encoding="utf-8")
+
+
 def compute_stable_id(
     scope: str, ctrl_key: str | None, clip_disp: str,
 ) -> str:
     """Build the artifact key for an emitted animation script.
 
-    Format: ``<scope>:<ctrl_key|__none__>:<clip_disp>``.
+    Format: ``<scope>:<ctrl_key|__none__>:<clip_disp>`` with each segment
+    percent-encoded against the reserved chars ``:`` and ``%``. The
+    encoding is injective — distinct segment tuples never produce the
+    same string (codex W6 fix).
 
-    Uniqueness is guaranteed by the same ``_disambiguate_by_source``
-    pass in animation_converter that gives ``ctrl_key`` + ``clip_disp``
-    their suffix hashes on collision (animation_converter.py:1925-1927).
-    The package consumes the disambiguated values so a project where two
-    different controllers share a Unity-given name still produces a
-    unique stable_id per emitted Anim_* script.
+    ``scope`` is the planner-stable scope identifier the topology
+    consumes (a scene namespace like ``Assets/Scenes/Main.unity`` or a
+    stable prefab id like ``<guid>:Assets/Prefabs/Door.prefab``).
+    Display-only strings (bare prefab names) belong in EmittedAnimation
+    `scope_display`, not here — see build_topology's `EmittedAnimation`
+    docstring for the contract.
+
+    Uniqueness of the (ctrl_key, clip_disp) pair within a scope is
+    enforced upstream by ``_disambiguate_by_source`` in
+    animation_converter (which appends a sha8 suffix on Unity-name
+    collisions). The package's invariant 3 in build_topology is the
+    backstop that catches any drift.
 
     For orphan clips (no controller), the caller passes ``ctrl_key=None``
     and the sentinel ``__none__`` is substituted. For project-wide
     orphans the caller also passes ``scope=ORPHAN_SCOPE``.
     """
     ck = ctrl_key if ctrl_key else NO_CTRL_KEY
-    return f"{scope}:{ck}:{clip_disp}"
+    return (
+        f"{_escape_segment(scope)}"
+        f":{_escape_segment(ck)}"
+        f":{_escape_segment(clip_disp)}"
+    )
 
 
 def derive_observed_target(
@@ -289,6 +344,7 @@ def _script_class_for_domain(domain: AnimationDomain) -> AnimationScriptClass:
 def build_animation_driver_entry(
     *,
     stable_id: str,
+    routing_status: AnimationRoutingStatus,
     driver_module_guid: str,
     domain: AnimationDomain,
     observed_attribute: str,
@@ -296,14 +352,21 @@ def build_animation_driver_entry(
 ) -> AnimationDriverEntry:
     """Compose a fully-populated ``animation_drivers`` entry.
 
+    ``routing_status`` distinguishes:
+      - ``"resolved"``: ``driver_module_guid`` is a real module guid
+        and invariants 1 + 6 will enforce the link.
+      - ``"unresolved"``: same-scope driver couldn't be picked
+        deterministically (no candidate, or 2+ candidates — Phase 2's
+        C# narrowing pass will improve this). ``driver_module_guid``
+        is empty; the animation falls back to today's server placement;
+        invariants 1 + 6 skip.
+      - ``"orphan"``: deliberately orphan (project-wide orphan clip).
+        ``driver_module_guid`` is empty; invariants skip.
+
     Phase 1 hardcodes ``lifecycle_role = "auto_run"`` (every animation
     script runs on load — no requireable / loader / character-attached
     animations in Phase 1) and ``bridge_group_id = None`` (animation
     inherits driver's domain → writer + reader co-resident → no bridge).
-
-    Phase 2b will revisit ``bridge_group_id`` when transpile-emitted
-    bridges arrive; the schema field exists in Phase 1 so the migration
-    is additive, not a schema bump.
     """
     script_class: AnimationScriptClass = _script_class_for_domain(domain)
     lifecycle_role: LifecycleRole = derive_module_lifecycle_role(
@@ -314,6 +377,7 @@ def build_animation_driver_entry(
     )
     return {
         "stable_id": stable_id,
+        "routing_status": routing_status,
         "driver_module_guid": driver_module_guid,
         "domain": domain,
         "script_class": script_class,
@@ -328,6 +392,7 @@ __all__ = (
     "AnimationDomain",
     "AnimationDriverEntry",
     "AnimationObservedTarget",
+    "AnimationRoutingStatus",
     "AnimationScriptClass",
     "NO_CTRL_KEY",
     "ORPHAN_SCOPE",

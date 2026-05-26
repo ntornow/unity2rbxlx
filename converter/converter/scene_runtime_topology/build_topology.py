@@ -41,6 +41,7 @@ Phase 1 invariants (per design doc §"topology artifact" + the review's
 
 from __future__ import annotations
 
+import logging
 from typing import TypedDict, cast
 
 from core.roblox_types import RbxScript
@@ -48,8 +49,10 @@ from core.unity_types import GuidIndex
 
 from converter.scene_runtime_planner import SceneRuntimeArtifact
 from converter.scene_runtime_topology.animation_routing import (
+    AnimationDomain,
     AnimationDriverEntry,
     AnimationObservedTarget,
+    AnimationRoutingStatus,
     build_animation_driver_entry,
     compute_stable_id,
     derive_observed_target,
@@ -64,6 +67,8 @@ from converter.scene_runtime_topology.lifecycle_roles import (
     LifecycleRole,
     derive_module_lifecycle_role,
 )
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -285,12 +290,24 @@ def _build_modules_block(
 
         provenance: TopologyProvenance = {}
         if guid_index is not None and script_id:
+            # ``resolve_relative`` returns the project-relative path
+            # (which is what the TopologyProvenance docstring promises).
+            # ``resolve`` returns the absolute path — earlier drafts
+            # used it and shipped the wrong contract (codex W5). Falls
+            # back to absolute when the relative form is unavailable.
             try:
-                path = guid_index.resolve(script_id)
+                rel = guid_index.resolve_relative(script_id)
             except Exception:
-                path = None
-            if path is not None:
-                provenance["source_path"] = path.as_posix()
+                rel = None
+            if rel is not None:
+                provenance["source_path"] = rel.as_posix()
+            else:
+                try:
+                    abs_path = guid_index.resolve(script_id)
+                except Exception:
+                    abs_path = None
+                if abs_path is not None:
+                    provenance["source_path"] = abs_path.as_posix()
 
         entry: TopologyModuleEntry = {
             "stem": stem,
@@ -308,18 +325,26 @@ def _build_animation_drivers_block(
     scene_runtime: SceneRuntimeArtifact,
     emitted_animations: list[EmittedAnimation],
 ) -> dict[str, AnimationDriverEntry]:
-    """One AnimationDriverEntry per EmittedAnimation row.
+    """One AnimationDriverEntry per EmittedAnimation row, with explicit
+    ``routing_status`` distinguishing resolved / unresolved / orphan.
 
-    Driver resolution falls back to ``"server"`` placement when
-    ``resolve_driver`` finds no candidate — same as today's animation
-    converter, preserving back-compat for projects without same-scope
-    driver matches.
+    Replaces the older ``__orphan__`` magic-string sentinel (codex B1)
+    that conflated "deliberately orphan" with "driver lookup failed".
+    Each row now carries:
+      - ``routing_status="resolved"`` + a real ``driver_module_guid``
+        (invariants 1 + 6 enforce the link), OR
+      - ``routing_status="unresolved"`` + empty ``driver_module_guid``
+        + fallback ``domain="server"`` (Phase 2's C#-source narrowing
+        pass will turn unresolved → resolved as it lands).
+      - ``routing_status="orphan"`` + empty ``driver_module_guid`` +
+        ``domain="server"`` (deliberately orphan project-wide clip).
 
-    Stable_id uniqueness is enforced by Phase 1 invariant 3 (raises if
-    two emitted animations collide on the same stable_id, which would
-    indicate the disambiguator pass failed upstream).
+    Unresolved rows are LOGGED as a structured warning (one line per
+    build) so the operator + the CI metric see when Phase 2 narrowing
+    would have helped — failing visible, not silently.
     """
     out: dict[str, AnimationDriverEntry] = {}
+    unresolved_rows: list[str] = []
     for row in emitted_animations:
         scope_display = row.get("scope_display", "")
         ctrl_key = row.get("ctrl_key", "")
@@ -328,16 +353,40 @@ def _build_animation_drivers_block(
 
         scope_kind = row.get("scope_kind", "")
         scope_ref = row.get("scope_ref", "")
-        resolved = resolve_driver(
-            scene_runtime, scope_kind=scope_kind, scope_ref=scope_ref,
-        )
-        if resolved is None:
-            # Fallback: no driver found → preserve today's server placement.
+
+        routing_status: AnimationRoutingStatus
+        driver_module_guid: str
+        domain: AnimationDomain
+        if scope_kind == "orphan":
+            routing_status = "orphan"
             driver_module_guid = ""
             domain = "server"
         else:
-            driver_module_guid, driver_domain = resolved
-            domain = driver_domain
+            resolved = resolve_driver(
+                scene_runtime, scope_kind=scope_kind, scope_ref=scope_ref,
+            )
+            if resolved is None:
+                routing_status = "unresolved"
+                driver_module_guid = ""
+                domain = "server"
+                unresolved_rows.append(stable_id)
+            else:
+                driver_module_guid, driver_domain = resolved
+                # ``resolve_driver`` guarantees domain ∈ {"client","server"}
+                # (filters out helper / excluded modules); the cast below
+                # is type-narrowing for mypy + the Literal contract.
+                if driver_domain not in ("client", "server"):
+                    # Defense in depth — should never fire because
+                    # resolve_driver already filtered, but if it does
+                    # mark unresolved rather than silently rewrite to
+                    # server (codex W8 / domain Literal erasure).
+                    routing_status = "unresolved"
+                    driver_module_guid = ""
+                    domain = "server"
+                    unresolved_rows.append(stable_id)
+                else:
+                    routing_status = "resolved"
+                    domain = cast(AnimationDomain, driver_domain)
 
         observed_attribute = row.get("observed_attribute", "")
         curve_paths_obj = row.get("curve_paths", [])
@@ -349,29 +398,23 @@ def _build_animation_drivers_block(
             curve_paths, prefab_scoped=prefab_scoped,
         )
 
-        # If the driver fallback fired, ``driver_module_guid`` is empty;
-        # the entry is still emitted (so dedupe + invariant 3 work), but
-        # invariants 1 + 6 will reject it. Phase 1 callers that hit the
-        # fallback are signalling a missing driver in their input data —
-        # surface it loudly, don't silently route.
-        if not driver_module_guid:
-            # Phase 1 deliberate gap: orphan animations have no driver.
-            # Use a sentinel so invariants can distinguish "deliberately
-            # orphan" from "driver lookup failed silently."
-            driver_module_guid = "__orphan__"
-            domain = "server"
-
-        domain_literal = cast("str", domain)
-        if domain_literal not in ("client", "server"):
-            domain_literal = "server"
         entry = build_animation_driver_entry(
             stable_id=stable_id,
+            routing_status=routing_status,
             driver_module_guid=driver_module_guid,
-            domain=cast("str", domain_literal),  # type: ignore[arg-type]
+            domain=domain,
             observed_attribute=observed_attribute,
             observed_target=observed_target,
         )
         out[stable_id] = entry
+
+    if unresolved_rows:
+        log.warning(
+            "[scene_runtime_topology] %d animation(s) routed to fallback "
+            "server domain (no same-scope driver). Phase 2 narrowing will "
+            "improve this. First few: %s",
+            len(unresolved_rows), unresolved_rows[:5],
+        )
     return out
 
 
@@ -399,39 +442,37 @@ def _enforce_invariants(
     animation_drivers = artifact.get("animation_drivers", {})
     edges = artifact.get("cross_domain_edges", [])
 
-    # Invariant 1 + 6 (cross-checked here):
-    #   - driver_module_guid resolves to a modules entry
-    #   - animation.domain matches the driver's module domain
-    #   - driver's domain in {"client","server"}
+    # Invariant 1 + 6: applied ONLY to resolved entries. Unresolved /
+    # orphan entries have empty ``driver_module_guid`` by design (Phase
+    # 1 narrowing limitation / deliberate orphan) and skip both checks.
+    # The tautological "anim_domain == driver_domain" check from the
+    # earlier draft is dropped — the entry's domain is built FROM the
+    # driver's domain in ``_build_animation_drivers_block``, so the
+    # equality could never fail by construction (subagent finding #1).
     for stable_id, anim in animation_drivers.items():
-        driver_guid = anim.get("driver_module_guid", "")
-        if driver_guid == "__orphan__":
-            # Phase 1 deliberate-orphan sentinel — skip invariants 1 + 6.
-            # The build still includes the entry so Phase 2 can extend
-            # driver resolution without changing the artifact shape.
+        status = anim.get("routing_status", "")
+        if status != "resolved":
+            # ``unresolved`` / ``orphan`` rows skip both invariants by
+            # design. The status field is itself the audit trail —
+            # absence of "resolved" means downstream consumers should
+            # treat the placement as best-effort.
             continue
-        if driver_guid not in modules_block:
+        driver_guid = anim.get("driver_module_guid", "")
+        if not driver_guid or driver_guid not in modules_block:
             _abort(
                 1,
-                f"animation driver {stable_id!r} references unknown "
+                f"resolved animation driver {stable_id!r} references unknown "
                 f"module guid {driver_guid!r}",
                 row=anim,
             )
         driver_module = modules_block[driver_guid]
         driver_domain = driver_module.get("domain", "")
-        anim_domain = anim.get("domain", "")
         if driver_domain not in _VALID_RUNTIME_DOMAINS:
             _abort(
                 6,
-                f"animation driver {stable_id!r}'s module {driver_guid!r} has "
-                f"non-runtime domain {driver_domain!r} (must be client or server)",
-                row=anim,
-            )
-        if anim_domain != driver_domain:
-            _abort(
-                1,
-                f"animation driver {stable_id!r} domain {anim_domain!r} "
-                f"does not match its driver module's domain {driver_domain!r}",
+                f"resolved animation driver {stable_id!r}'s module "
+                f"{driver_guid!r} has non-runtime domain {driver_domain!r} "
+                f"(must be client or server)",
                 row=anim,
             )
 
