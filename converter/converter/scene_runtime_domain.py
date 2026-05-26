@@ -660,103 +660,19 @@ def classify_scene_runtime_domains(
 
 
 # ---------------------------------------------------------------------------
-# Cross-domain edge enumeration (kept from PR3b; updated to skip
-# ``"excluded"`` modules instead of ``"legacy"``).
+# Cross-domain edge enumeration — relocated to
+# ``scene_runtime_topology.cross_domain_edges`` in Phase 1. This module
+# re-exports the public surface (``CrossDomainEdge``,
+# ``compute_cross_domain_edges``) for back-compat with pipeline.py + tests
+# that import from here. Phase 2a will update those importers and remove
+# this re-export.
 # ---------------------------------------------------------------------------
 
-class CrossDomainEdge(TypedDict):
-    """One client<->server reference identified at conversion time."""
-
-    from_instance: str
-    to_instance: str
-    from_script: str
-    to_script: str
-    field: str
-    from_domain: str
-    to_domain: str
-    owner_kind: str
-    owner_ref: str
-
-
-# Domain values the cross-domain pass refuses to wire through.
-# - Helpers don't run lifecycle, so they can't generate cross-domain refs.
-# - Excluded modules aren't instantiated at all.
-# - ``"legacy"`` is the pre-classifier-v2 spelling; preserved here as a
-#   defensive skip for any on-disk plan that the migration pass hasn't
-#   already rewritten.
-_NON_RUNTIME_DOMAINS: frozenset[str] = frozenset(
-    {"", "helper", "excluded", "legacy"},
+from converter.scene_runtime_topology.cross_domain_edges import (  # noqa: E402
+    NON_RUNTIME_DOMAINS as _NON_RUNTIME_DOMAINS,
+    CrossDomainEdge,
+    compute_cross_domain_edges,
 )
-
-
-def compute_cross_domain_edges(
-    scene_runtime: SceneRuntimeArtifact,
-) -> list[CrossDomainEdge]:
-    """Enumerate every cross-domain serialized reference in the plan.
-
-    A reference qualifies iff:
-      - ``target_kind == "component"`` (peer-MonoBehaviour ref)
-      - Both source and target instances resolve to modules with
-        execution domains in ``{"client", "server"}``
-      - The two domains differ
-
-    Pure function; does not mutate ``scene_runtime``.
-    """
-    modules = scene_runtime.get("modules", {})
-    scenes = scene_runtime.get("scenes", {})
-    prefabs = scene_runtime.get("prefabs", {})
-
-    instance_to_script: dict[str, str] = {}
-    for scene in scenes.values():
-        for inst in scene.get("instances", []):
-            instance_to_script[inst["instance_id"]] = inst["script_id"]
-    for prefab in prefabs.values():
-        for inst in prefab.get("instances", []):
-            instance_to_script[inst["instance_id"]] = inst["script_id"]
-
-    out: list[CrossDomainEdge] = []
-
-    def _scan(
-        owner_kind: str,
-        owner_ref: str,
-        references: list[SceneRuntimeReference],
-    ) -> None:
-        for ref in references:
-            if ref.get("target_kind") != "component":
-                continue
-            src_inst = ref.get("from", "")
-            tgt_inst = ref.get("target_ref", "")
-            src_sid = instance_to_script.get(src_inst, "")
-            tgt_sid = instance_to_script.get(tgt_inst, "")
-            if not src_sid or not tgt_sid:
-                continue
-            src_mod = modules.get(src_sid, {})
-            tgt_mod = modules.get(tgt_sid, {})
-            src_domain = src_mod.get("domain", "")
-            tgt_domain = tgt_mod.get("domain", "")
-            if (src_domain in _NON_RUNTIME_DOMAINS
-                or tgt_domain in _NON_RUNTIME_DOMAINS):
-                continue
-            if src_domain == tgt_domain:
-                continue
-            out.append(CrossDomainEdge(
-                from_instance=src_inst,
-                to_instance=tgt_inst,
-                from_script=src_sid,
-                to_script=tgt_sid,
-                field=ref.get("field", ""),
-                from_domain=src_domain,
-                to_domain=tgt_domain,
-                owner_kind=owner_kind,
-                owner_ref=owner_ref,
-            ))
-
-    for key, scene in scenes.items():
-        _scan("scene", key, scene.get("references", []))
-    for key, prefab in prefabs.items():
-        _scan("prefab", key, prefab.get("references", []))
-
-    return out
 
 
 # ---------------------------------------------------------------------------
