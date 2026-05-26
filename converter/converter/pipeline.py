@@ -4241,25 +4241,31 @@ script.Disabled = true
                 applied_client += 1
                 # F1: patch the storage_plan buckets so the on-disk
                 # plan matches the live RbxScript metadata. Remove
-                # from server_scripts (where classify_storage placed
-                # it because the body looked like a server tween) +
-                # add to client_scripts. List-membership check is
-                # O(n) but the lists are short.
-                if sname in plan.server_scripts:
+                # ALL occurrences from server_scripts (the
+                # ``while``-loop guards against a corrupted/duplicated
+                # bucket; classifier output is unique today, but this
+                # is the kind of resilience the audit trail benefits
+                # from — see codex iter-1 review).
+                while sname in plan.server_scripts:
                     plan.server_scripts.remove(sname)
                 if sname not in plan.client_scripts:
                     plan.client_scripts.append(sname)
-                # Audit trail: storage_plan.decisions records the move
-                # so a future debug session can trace why this script
-                # ended up where it did.
+                # Audit trail: storage_plan.decisions records the
+                # final placement using the SAME schema classifier
+                # writes (``script`` / ``script_type`` / ``container``
+                # / ``reason``) with a ``source="topology"``
+                # discriminator. Consumers iterating ``decisions`` can
+                # index any of the canonical 4 keys uniformly across
+                # both sources.
                 plan.decisions.append({
                     "script": sname,
-                    "from": "ServerScriptService",
-                    "to": "StarterPlayer.StarterPlayerScripts",
+                    "script_type": "LocalScript",
+                    "container": "StarterPlayer.StarterPlayerScripts",
                     "reason": (
                         "topology: animation_drivers driver_domain=client "
                         f"(driver_module_guid={entry.get('driver_module_guid', '')})"
                     ),
+                    "source": "topology",
                 })
             elif script_class == "Script" and domain == "server":
                 # Already script_type="Script"; just stamp parent_path

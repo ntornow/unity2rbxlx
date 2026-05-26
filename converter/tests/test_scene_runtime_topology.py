@@ -1080,11 +1080,16 @@ class TestApplyTopologyToRbxScripts:
         assert "Anim_Door_door_open" not in plan.server_scripts
         assert "Anim_Door_door_open" in plan.client_scripts
         assert "GameManager" in plan.server_scripts  # unchanged
-        # Audit trail recorded.
+        # Audit trail recorded with the same shape classify_storage
+        # writes (script / script_type / container / reason +
+        # ``source`` discriminator). Forward-compat: a downstream
+        # consumer iterating ``plan.decisions`` can index the
+        # canonical 4 keys uniformly across both sources.
         moves = [d for d in plan.decisions if d.get("script") == "Anim_Door_door_open"]
         assert len(moves) == 1
-        assert moves[0]["from"] == "ServerScriptService"
-        assert moves[0]["to"] == "StarterPlayer.StarterPlayerScripts"
+        assert moves[0]["script_type"] == "LocalScript"
+        assert moves[0]["container"] == "StarterPlayer.StarterPlayerScripts"
+        assert moves[0]["source"] == "topology"
         assert "topology" in moves[0]["reason"]
         # The persisted artifact lands at scene_runtime["topology"].
         assert "topology" in scene_runtime

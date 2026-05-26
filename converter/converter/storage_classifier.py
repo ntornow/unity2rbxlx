@@ -106,7 +106,17 @@ class StoragePlan:
     # RemoteEvents / RemoteFunctions (always ReplicatedStorage by Roblox rules)
     remote_events: list[str] = field(default_factory=list)
 
-    # Audit trail: ("script_name", "original_container", "assigned_container", "reason")
+    # Audit trail. Each entry is a dict carrying:
+    #   ``script``       — script name
+    #   ``script_type``  — final ``Script`` / ``LocalScript`` / ``ModuleScript``
+    #   ``container``    — final dotted DataModel path
+    #   ``reason``       — human-readable decision rationale
+    #   ``source``       — ``"classifier"`` (regex-based) or ``"topology"``
+    #                      (scene_runtime_topology overrides — added in
+    #                      PR #148 / scene-runtime topology authority).
+    # Forward-compat: consumers iterating ``decisions`` index ``script`` /
+    # ``script_type`` / ``container`` / ``reason`` uniformly; ``source``
+    # is the discriminator for future per-source filtering.
     decisions: list[dict[str, str]] = field(default_factory=list)
 
     # Agent-applied overrides from manual editing of conversion_plan.json.
@@ -184,6 +194,7 @@ def classify_storage(
             "script_type": s.script_type,
             "container": container,
             "reason": reason,
+            "source": "classifier",
         })
         _append_to_bucket(plan, s.name, s.script_type, container)
 
