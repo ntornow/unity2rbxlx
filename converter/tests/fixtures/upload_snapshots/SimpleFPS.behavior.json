@@ -120,12 +120,12 @@
     },
     {
       "id": "door_opens_with_key",
-      "feature": "5. With the card key held, walking up to the nearest door opens it. The nearest Door (by world distance) is selected dynamically — Beach.Door in the current SimpleFPS scene. The visible/animated child under the Door model is named 'door' (lowercase).",
+      "feature": "5. With the card key held, walking up to the nearest door opens it — the door VISUAL physically moves. The nearest Door (by world distance) is selected dynamically — Beach.Door in the current SimpleFPS scene. The visible/animated child under the Door model is named 'door' (lowercase). Assertion REQUIRES visible motion (translate ≥1 stud OR LookVector rotation ≥0.2); the prior accept-on-attribute-only branch was dropped on 2026-05-26 because it silently passed on configurations where the attribute flipped server-side but the visual tween never ran (Phase 1 + property-based Animator access surfaced the gap).",
       "depends_on": ["walk_to_cardkey_picks_it_up"],
       "play_mode": true,
       "setup_luau": "_reset(); local nearest, bestDist = nil, math.huge; for _, x in ipairs(workspace:GetDescendants()) do if x.Name == 'Door' and x:IsA('Model') then local pp = _findVisible(x); if pp then local d = (pp.Position - hrp.Position).Magnitude; if d < bestDist then nearest = x; bestDist = d end end end end; local door_mesh = nearest and (nearest:FindFirstChild('door') or _findVisible(nearest)); _G._state.p = door_mesh; _G._state.cf0 = door_mesh.CFrame; hrp.CFrame = CFrame.new(door_mesh.Position - door_mesh.CFrame.LookVector * 6 + Vector3.new(0, 2, 0))",
       "wait_seconds": 2.5,
-      "assert_luau": "local p = _G._state.p; if p:GetAttribute('open') == true then return true end; local dPos = (p.Position - _G._state.cf0.Position).Magnitude; local dRot = (p.CFrame.LookVector - _G._state.cf0.LookVector).Magnitude; return dPos > 1 or dRot > 0.2",
+      "assert_luau": "local p = _G._state.p; local dPos = (p.Position - _G._state.cf0.Position).Magnitude; local dRot = (p.CFrame.LookVector - _G._state.cf0.LookVector).Magnitude; return dPos > 1 or dRot > 0.2",
       "expect": true
     },
     {

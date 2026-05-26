@@ -28,8 +28,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from core.unity_types import GuidIndex, ParsedScene, PrefabLibrary
+from core.unity_types import GuidIndex, ParsedScene, PrefabLibrary, PrefabTemplate
 from unity.yaml_parser import parse_documents, doc_body, is_text_yaml, ref_guid
+
+# ``EmittedAnimation`` is the input contract for the topology coordinator.
+# Each emission appends one row; pipeline.py feeds the list to
+# ``scene_runtime_topology.build_topology`` after classify_storage runs.
+from converter.scene_runtime_topology.build_topology import EmittedAnimation
+from converter.scene_runtime_topology.animation_routing import ORPHAN_SCOPE
 
 log = logging.getLogger(__name__)
 
@@ -295,6 +301,18 @@ class AnimationConversionResult:
     # the template carries the animation driver. Scripts with a scene-
     # scope or no scope stay in the place's flat script list.
     script_scopes: dict[str, str] = field(default_factory=dict)
+    # Per-emission rowset for the topology coordinator (Phase 1, PR #148
+    # of the scene-runtime topology authority refactor). One entry per
+    # row appended to ``generated_scripts``. Pipeline.py feeds this list
+    # to ``scene_runtime_topology.build_topology`` after classify_storage
+    # populates module domains; the resulting artifact tells the
+    # animation-script writer which ``script_type`` + ``parent_path`` to
+    # stamp on each ``RbxScript``. Each row's ``scope_ref`` is the
+    # PLANNER-STABLE identifier (prefab_id or scene namespace) so the
+    # topology resolver can index into ``scene_runtime["prefabs"]`` /
+    # ``["scenes"]`` directly — see EmittedAnimation's docstring for the
+    # contract.
+    emitted_animations: list[EmittedAnimation] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -1706,6 +1724,70 @@ def convert_animations(
         unity_project_path, guid_index, unconverted_out=unconverted,
     )
 
+    # Scope-ref lookups for the topology coordinator (Phase 1, PR #148).
+    # ``scope_ref`` MUST be the PLANNER-STABLE identifier so the topology
+    # resolver can index into ``scene_runtime["prefabs"]`` /
+    # ``scene_runtime["scenes"]`` directly — see EmittedAnimation's
+    # docstring for the contract. We build the lookups by mirroring the
+    # planner's stable-id derivation (a leading-underscore helper there,
+    # not imported to avoid coupling on a private surface).
+    _topology_prefab_id_by_template_name: dict[str, str] = {}
+    _topology_prefab_name_collisions: dict[str, list[str]] = {}
+    if prefab_library is not None:
+        for _guid, _template in prefab_library.by_guid.items():
+            try:
+                _rel = _template.prefab_path.resolve().relative_to(
+                    unity_project_path.resolve(),
+                ).as_posix()
+            except ValueError:
+                _rel = _template.prefab_path.as_posix()
+            _prefab_id = f"{_guid}:{_rel}"
+            # Name collisions across prefabs are an existing
+            # animation_converter limitation: ``prefabs_per_controller``
+            # keys off ``prefab.name``, so when two distinct prefabs
+            # share a Unity-given name the upstream emission collapses
+            # them into one scope before reaching the topology lookup.
+            # Phase 1's lookup inherits this — first-wins on
+            # ``setdefault``. The codex review of slices 8/9/10 flagged
+            # this with empirical evidence (SimpleFPS has 23 "Standard",
+            # 9 "Pickable", 5 "tile" duplicate-named prefabs). The real
+            # fix lives in ``prefabs_per_controller``'s keying (Phase 2
+            # or a follow-up cleanup). Until then, RECORD collisions so
+            # they surface in the log + are debuggable, instead of
+            # vanishing silently.
+            _existing = _topology_prefab_id_by_template_name.get(_template.name)
+            if _existing is None:
+                _topology_prefab_id_by_template_name[_template.name] = _prefab_id
+            elif _existing != _prefab_id:
+                _topology_prefab_name_collisions.setdefault(
+                    _template.name, [_existing],
+                ).append(_prefab_id)
+    if _topology_prefab_name_collisions:
+        # One log line per colliding name. The list ordering is
+        # insertion order (first prefab id is the one the topology
+        # actually uses; the others are recorded for debug).
+        for _name, _ids in _topology_prefab_name_collisions.items():
+            log.warning(
+                "[topology] prefab template name %r appears on %d distinct "
+                "prefabs; topology will resolve animations from this scope "
+                "to the FIRST prefab_id only (%r). Other prefab_ids that "
+                "would have routed to the same scope are invisible to the "
+                "topology resolver: %r. Fixing this requires changing the "
+                "upstream prefabs_per_controller keying.",
+                _name, len(_ids), _ids[0], _ids[1:],
+            )
+    _topology_scene_namespace_by_stem: dict[str, str] = {}
+    for _scene in (parsed_scenes or ()):
+        try:
+            _rel = _scene.scene_path.resolve().relative_to(
+                unity_project_path.resolve(),
+            ).as_posix()
+        except ValueError:
+            _rel = _scene.scene_path.as_posix()
+        _topology_scene_namespace_by_stem.setdefault(
+            _scene.scene_path.stem, _rel,
+        )
+
     result = AnimationConversionResult(
         clips=clips,
         controllers=controllers,
@@ -1991,6 +2073,44 @@ def convert_animations(
                     result.generated_scripts.append((script_name, luau_source))
                     if scope_is_prefab:
                         result.script_scopes[script_name] = scope
+                    # Topology coordinator input (Phase 1 PR #148). The
+                    # scope_ref MUST resolve into scene_runtime keying;
+                    # an empty ``scope`` (unscoped controller emission)
+                    # has no planner-side counterpart and gets
+                    # scope_kind="orphan" so the resolver short-circuits.
+                    if scope:
+                        if scope_is_prefab:
+                            _scope_kind = "prefab"
+                            _scope_ref = (
+                                _topology_prefab_id_by_template_name.get(scope, "")
+                            )
+                        else:
+                            _scope_kind = "scene"
+                            _scope_ref = (
+                                _topology_scene_namespace_by_stem.get(scope, "")
+                            )
+                    else:
+                        _scope_kind = "orphan"
+                        _scope_ref = ""
+                    # Primary parameter name for ``observed_attribute``:
+                    # the first bool / int / trigger param the
+                    # controller defines (autoplay clips have none).
+                    _observed_attribute = ""
+                    for _param in ctrl.parameters:
+                        if _param.param_type in (3, 4, 9):  # Int / Bool / Trigger
+                            _observed_attribute = _param.name
+                            break
+                    result.emitted_animations.append(EmittedAnimation(
+                        scope_kind=_scope_kind,
+                        scope_ref=_scope_ref,
+                        scope_display=scope or ORPHAN_SCOPE,
+                        ctrl_key=ctrl_key,
+                        clip_disp=clip_disp,
+                        script_name=script_name,
+                        observed_attribute=_observed_attribute,
+                        curve_paths=[c.path for c in clip.curves],
+                        prefab_scoped=scope_is_prefab,
+                    ))
 
     # Scene-scoped runs: UNCONVERTED entries were collected during
     # project-wide discovery, before the scene filter got applied.
@@ -2086,6 +2206,20 @@ def convert_animations(
                 "target": "inline_tween",
                 "reason": "no controller references this clip",
             }
+            # Orphan clips have no controller + no scope. The topology
+            # coordinator marks these ``routing_status="orphan"`` and
+            # invariants 1/6 skip them by design (no driver to inherit).
+            result.emitted_animations.append(EmittedAnimation(
+                scope_kind="orphan",
+                scope_ref="",
+                scope_display=ORPHAN_SCOPE,
+                ctrl_key="",
+                clip_disp=disp,
+                script_name=script_name,
+                observed_attribute="",
+                curve_paths=[c.path for c in clip.curves],
+                prefab_scoped=False,
+            ))
 
     result.total_scripts_generated = len(result.generated_scripts)
 

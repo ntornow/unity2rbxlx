@@ -4039,6 +4039,26 @@ script.Disabled = true
                     + violations
                 )
 
+            # Scene-runtime topology (Phase 1, PR #148). Runs AFTER the
+            # classifier has populated ``modules[*].domain`` and BEFORE
+            # the on-disk plan is written. Consumes the per-emission
+            # rowset animation_converter accumulated + the script
+            # objects' final ``script_type`` to build the topology
+            # artifact, then applies the artifact's animation_drivers
+            # decisions to the corresponding ``Anim_*`` RbxScripts
+            # (script_type + parent_path) so the topology is the
+            # authority for animation placement.
+            #
+            # ``plan`` is passed so the same call can patch the legacy
+            # storage_plan buckets in-place (move topology-flipped
+            # Anim_* names from server_scripts → client_scripts). This
+            # honors the design doc's §Migration discipline rule:
+            # "Each phase deletes the displaced logic in the same PR
+            # that wires the new consumer." Without this, the on-disk
+            # plan contradicts the live RbxScript metadata + the
+            # scene_runtime.topology block.
+            self._build_and_apply_topology(scene_runtime, plan)
+
         plan_path.write_text(
             _json.dumps({
                 "storage_plan": plan.to_dict(),
@@ -4052,6 +4072,219 @@ script.Disabled = true
             "[classify_storage] %d scripts classified (plan written to %s)",
             len(plan.decisions),
             plan_path.name,
+        )
+
+    def _build_and_apply_topology(
+        self,
+        scene_runtime: dict[str, object],
+        plan: "StoragePlan",
+    ) -> None:
+        """Phase 1, PR #148 of the scene-runtime topology authority refactor.
+
+        Build the topology artifact + apply its animation_drivers decisions
+        to the corresponding ``Anim_*`` RbxScripts. Called inside
+        ``_classify_storage`` AFTER ``classify_scene_runtime_domains``
+        populates module domains + BEFORE the on-disk plan is written.
+
+        The artifact lands at ``scene_runtime["topology"]`` per design
+        doc open-question D4 (option b). Consumers should read through
+        this method's outputs / the package's accessor surface — not by
+        indexing the dict directly — so a future relocation to a
+        sidecar file is a one-file change.
+
+        For each ``Anim_*`` script the topology returns a
+        ``routing_status`` + ``script_class``. Resolved entries override
+        the RbxScript's ``script_type`` (Script→LocalScript for client
+        drivers) and ``parent_path`` (ServerScriptService →
+        StarterPlayer.StarterPlayerScripts). Unresolved + orphan
+        entries leave the RbxScript at today's server placement.
+
+        ``plan`` is also patched in-place to reflect the topology
+        overrides: a Script→LocalScript flip moves the script name from
+        ``plan.server_scripts`` to ``plan.client_scripts`` so the
+        on-disk ``conversion_plan.json`` doesn't contradict the live
+        RbxScript metadata or the persisted ``scene_runtime.topology``
+        block. This honors the design doc's §Migration discipline
+        ("Each phase deletes the displaced logic in the same PR that
+        wires the new consumer") for the Anim_* slice; non-animation
+        scripts continue through classify_storage's regex pass until
+        Phase 2a wires script_storage as a bound consumer.
+        """
+        if self.state.rbx_place is None:
+            return
+        if (
+            self.state.animation_result is None
+            or not getattr(
+                self.state.animation_result, "emitted_animations", None,
+            )
+        ):
+            # No animation emissions → nothing to route. Skip the
+            # build_topology call to keep test fixtures that omit
+            # animation_result green.
+            return
+
+        from converter.scene_runtime_topology.build_topology import (
+            build_topology,
+        )
+
+        scripts_by_class: dict[str, RbxScript] = {}
+        for s in self.state.rbx_place.scripts:
+            if s.name:
+                scripts_by_class.setdefault(s.name, s)
+
+        try:
+            artifact = build_topology(
+                scene_runtime=cast(
+                    "SceneRuntimeArtifact", scene_runtime,
+                ),
+                emitted_animations=list(
+                    self.state.animation_result.emitted_animations,
+                ),
+                scripts_by_class=scripts_by_class,
+                guid_index=self.state.guid_index,
+            )
+        except Exception as exc:
+            # Topology invariants are fail-closed by design, but
+            # surfacing the exact context here helps an operator triage
+            # before the build aborts.
+            log.error(
+                "[topology] build_topology raised: %s — aborting build "
+                "before the on-disk plan is finalized.", exc,
+            )
+            raise
+
+        # Persist the artifact under the scene_runtime block. Consumers
+        # (animation_converter post-emission, contract_pipeline in
+        # Phase 3) read through this key.
+        scene_runtime["topology"] = cast("object", artifact)
+
+        # Apply animation_drivers decisions to the matching Anim_*
+        # RbxScripts. Today's _subphase_emit_scripts_to_disk created
+        # them all as ``script_type="Script"``; topology overrides
+        # ``Script→LocalScript`` for client-driven scripts + stamps the
+        # corresponding ``parent_path``. Unresolved + orphan entries
+        # preserve today's server placement.
+        animation_drivers = artifact.get("animation_drivers", {})
+        if not animation_drivers:
+            return
+        # Index drivers by script_name so the apply loop is O(n).
+        drivers_by_script_name: dict[str, dict[str, object]] = {}
+        for row in self.state.animation_result.emitted_animations:
+            script_name = row.get("script_name", "")
+            if not script_name:
+                continue
+            from converter.scene_runtime_topology.animation_routing import (
+                compute_stable_id, ORPHAN_SCOPE,
+            )
+            _scope_ref = row.get("scope_ref", "")
+            _scope_segment = _scope_ref if _scope_ref else ORPHAN_SCOPE
+            sid = compute_stable_id(
+                _scope_segment,
+                row.get("ctrl_key", "") or None,
+                row.get("clip_disp", ""),
+            )
+            entry = animation_drivers.get(sid)
+            if entry is not None:
+                drivers_by_script_name[script_name] = cast(
+                    "dict[str, object]", entry,
+                )
+        # Walk the live RbxScripts once; for each one with a matching
+        # animation_drivers entry, apply the topology decision AND patch
+        # the storage_plan bucket so the on-disk artifact stays
+        # consistent with the in-memory state.
+        # Counts (F4): summary log distinguishes "we resolved a driver
+        # and the script existed" (applied) from "driver resolved but
+        # the named script wasn't in rbx_place" (unmatched — consumer
+        # drift) from "topology emitted a row but the routing_status
+        # was unresolved/orphan" (skipped — Phase 1 acknowledged gap).
+        # Without these counters a silent zero-mutation case looks the
+        # same as a healthy run.
+        applied_client = 0
+        applied_server = 0
+        skipped_unresolved = 0
+        skipped_orphan = 0
+        unmatched = 0
+        scripts_by_name: dict[str, RbxScript] = {
+            s.name: s for s in self.state.rbx_place.scripts if s.name
+        }
+        for sname, entry in drivers_by_script_name.items():
+            routing_status = entry.get("routing_status", "")
+            if routing_status == "unresolved":
+                skipped_unresolved += 1
+                continue
+            if routing_status == "orphan":
+                skipped_orphan += 1
+                continue
+            script = scripts_by_name.get(sname)
+            if script is None:
+                # Topology said this script should be routed, but no
+                # RbxScript with that name exists. Indicates upstream
+                # drift between animation_converter's
+                # ``generated_scripts`` and the script object list. Log
+                # individually + count.
+                unmatched += 1
+                log.warning(
+                    "[topology] animation_drivers row %r has no "
+                    "matching RbxScript in rbx_place — consumer drift?",
+                    sname,
+                )
+                continue
+            script_class_obj = entry.get("script_class", "")
+            domain_obj = entry.get("domain", "")
+            script_class = (
+                script_class_obj if isinstance(script_class_obj, str) else ""
+            )
+            domain = domain_obj if isinstance(domain_obj, str) else ""
+            if script_class == "LocalScript" and domain == "client":
+                script.script_type = "LocalScript"
+                script.parent_path = "StarterPlayer.StarterPlayerScripts"
+                applied_client += 1
+                # F1: patch the storage_plan buckets so the on-disk
+                # plan matches the live RbxScript metadata. Remove
+                # ALL occurrences from server_scripts (the
+                # ``while``-loop guards against a corrupted/duplicated
+                # bucket; classifier output is unique today, but this
+                # is the kind of resilience the audit trail benefits
+                # from — see codex iter-1 review).
+                while sname in plan.server_scripts:
+                    plan.server_scripts.remove(sname)
+                if sname not in plan.client_scripts:
+                    plan.client_scripts.append(sname)
+                # Audit trail: storage_plan.decisions records the
+                # final placement using the SAME schema classifier
+                # writes (``script`` / ``script_type`` / ``container``
+                # / ``reason``) with a ``source="topology"``
+                # discriminator. Consumers iterating ``decisions`` can
+                # index any of the canonical 4 keys uniformly across
+                # both sources.
+                plan.decisions.append({
+                    "script": sname,
+                    "script_type": "LocalScript",
+                    "container": "StarterPlayer.StarterPlayerScripts",
+                    "reason": (
+                        "topology: animation_drivers driver_domain=client "
+                        f"(driver_module_guid={entry.get('driver_module_guid', '')})"
+                    ),
+                    "source": "topology",
+                })
+            elif script_class == "Script" and domain == "server":
+                # Already script_type="Script"; just stamp parent_path
+                # so storage_classifier doesn't second-guess via its
+                # regex pass.
+                script.script_type = "Script"
+                script.parent_path = "ServerScriptService"
+                applied_server += 1
+                # No plan-bucket change needed — already in
+                # ``server_scripts`` from the legacy classifier pass.
+
+        log.info(
+            "[topology] animation_drivers applied: "
+            "%d client, %d server (resolved); "
+            "%d unresolved, %d orphan (preserved server fallback); "
+            "%d unmatched (consumer drift).",
+            applied_client, applied_server,
+            skipped_unresolved, skipped_orphan,
+            unmatched,
         )
 
     def _merge_scene_runtime(self, plan_path: Path) -> dict[str, object]:
