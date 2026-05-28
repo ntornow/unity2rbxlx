@@ -318,6 +318,7 @@ def build_topology(
     scripts_by_class: dict[str, RbxScript],
     guid_index: GuidIndex | None = None,
     dependency_map: dict[str, list[str]] | None = None,
+    preserved_animation_drivers: dict[str, AnimationDriverEntry] | None = None,
 ) -> TopologyArtifact:
     """Assemble the topology artifact + enforce 8 emit-time invariants.
 
@@ -338,6 +339,21 @@ def build_topology(
     ``None`` (the default) emits an empty ``caller_graph`` — back-compat
     for Phase 1 callers that pre-date slice 3 and for legacy-mode
     invocations.
+
+    ``preserved_animation_drivers`` (Phase 2a slice 3 round 4) supports
+    the resume path where ``convert_animations`` did NOT run this build
+    but a prior conversion's ``animation_drivers`` block lives on the
+    rehydrated ``scene_runtime.topology``. Pass the prior block via
+    this parameter and ``emitted_animations=[]``; build_topology
+    uses the preserved drivers verbatim instead of rebuilding from
+    (empty) emissions. Invariant 3 (emission ↔ driver 1:1) is SKIPPED
+    in this mode because we don't have the original emissions to
+    cross-check. Invariants 1 + 4 + 5 + 6 still run on the preserved
+    block; if the persisted artifact was valid when first written,
+    those still hold (or the build aborts with a clear message). The
+    canonical caller for this mode is
+    ``pipeline._build_and_apply_topology`` when
+    ``self.state.animation_result is None``.
 
     Returns the artifact dict ready to merge into
     ``scene_runtime["topology"]``.
@@ -369,9 +385,16 @@ def build_topology(
         scene_runtime, scripts_by_class, guid_index,
     )
     edges_block = compute_cross_domain_edges(scene_runtime)
-    animation_drivers_block = _build_animation_drivers_block(
-        scene_runtime, emitted_animations,
-    )
+    if preserved_animation_drivers is not None:
+        # Resume path: caller supplied prior animation_drivers. Skip
+        # the build_from_emissions step. Invariant 3 will be skipped
+        # in _enforce_invariants because we don't have emissions to
+        # cross-check (see `_skip_invariant_3` flag passed below).
+        animation_drivers_block = preserved_animation_drivers
+    else:
+        animation_drivers_block = _build_animation_drivers_block(
+            scene_runtime, emitted_animations,
+        )
     caller_graph_block = _build_caller_graph_block(
         dependency_map,
         class_to_script_id=class_to_script_id,
@@ -392,6 +415,7 @@ def build_topology(
         artifact,
         emitted_animations=emitted_animations,
         scene_runtime=scene_runtime,
+        skip_invariant_3=preserved_animation_drivers is not None,
     )
     return artifact
 
@@ -828,6 +852,7 @@ def _enforce_invariants(
     *,
     emitted_animations: list[EmittedAnimation],
     scene_runtime: SceneRuntimeArtifact,
+    skip_invariant_3: bool = False,
 ) -> None:
     """Apply the post-derivation emit-time invariants. Raises on any
     violation.
@@ -840,6 +865,15 @@ def _enforce_invariants(
     Invariant 9 (the input-collision check) lives in
     ``_detect_caller_graph_collisions`` and runs pre-derivation, NOT
     here — see that helper's docstring for rationale.
+
+    ``skip_invariant_3`` (Phase 2a slice 3 round 4) bypasses the
+    emission ↔ driver 1:1 cross-check when the caller supplied
+    ``preserved_animation_drivers``. We don't have the original
+    emissions to cross-check against (the persisted artifact dropped
+    them when it was first written). Invariants 1, 4, 5, 6 still run
+    on the preserved drivers block — if the prior build was valid
+    those still hold; if the persisted artifact has been hand-edited
+    into an invalid state, those catch it.
     """
     modules_block = artifact.get("modules", {})
     animation_drivers = artifact.get("animation_drivers", {})
@@ -900,42 +934,48 @@ def _enforce_invariants(
     # must map to a stable_id present in animation_drivers (no script
     # without an entry), and each animation_drivers key must originate
     # from an emission (no spurious entries).
-    expected_stable_ids: dict[str, str] = {}
-    for row in emitted_animations:
-        # Mirror the keying choice in _build_animation_drivers_block:
-        # scope_ref (planner-stable) for the segment, ORPHAN_SCOPE
-        # sentinel when empty.
-        scope_ref = row.get("scope_ref", "")
-        scope_segment = scope_ref if scope_ref else ORPHAN_SCOPE
-        sid = compute_stable_id(
-            scope_segment,
-            row.get("ctrl_key", "") or None,
-            row.get("clip_disp", ""),
-        )
-        if sid in expected_stable_ids:
-            _abort(
-                3,
-                f"two emitted animations collide on stable_id {sid!r}: "
-                f"{expected_stable_ids[sid]!r} and {row.get('script_name', '')!r} "
-                f"— upstream disambiguator failed",
-                row=row,
+    #
+    # Skipped on the preserved-drivers resume path: we don't have
+    # original emissions to cross-check (see ``skip_invariant_3``).
+    # Invariants 4-8 below still run — they validate the preserved
+    # block's internal shape, which guards against on-disk tampering.
+    if not skip_invariant_3:
+        expected_stable_ids: dict[str, str] = {}
+        for row in emitted_animations:
+            # Mirror the keying choice in _build_animation_drivers_block:
+            # scope_ref (planner-stable) for the segment, ORPHAN_SCOPE
+            # sentinel when empty.
+            scope_ref = row.get("scope_ref", "")
+            scope_segment = scope_ref if scope_ref else ORPHAN_SCOPE
+            sid = compute_stable_id(
+                scope_segment,
+                row.get("ctrl_key", "") or None,
+                row.get("clip_disp", ""),
             )
-        expected_stable_ids[sid] = row.get("script_name", "")
-    for sid in animation_drivers:
-        if sid not in expected_stable_ids:
-            _abort(
-                3,
-                f"animation driver {sid!r} has no corresponding emission",
-                row=animation_drivers[sid],
-            )
-    for sid, script_name in expected_stable_ids.items():
-        if sid not in animation_drivers:
-            _abort(
-                3,
-                f"emitted animation {script_name!r} has no driver entry "
-                f"(stable_id {sid!r})",
-                row={"script_name": script_name, "stable_id": sid},
-            )
+            if sid in expected_stable_ids:
+                _abort(
+                    3,
+                    f"two emitted animations collide on stable_id {sid!r}: "
+                    f"{expected_stable_ids[sid]!r} and {row.get('script_name', '')!r} "
+                    f"— upstream disambiguator failed",
+                    row=row,
+                )
+            expected_stable_ids[sid] = row.get("script_name", "")
+        for sid in animation_drivers:
+            if sid not in expected_stable_ids:
+                _abort(
+                    3,
+                    f"animation driver {sid!r} has no corresponding emission",
+                    row=animation_drivers[sid],
+                )
+        for sid, script_name in expected_stable_ids.items():
+            if sid not in animation_drivers:
+                _abort(
+                    3,
+                    f"emitted animation {script_name!r} has no driver entry "
+                    f"(stable_id {sid!r})",
+                    row={"script_name": script_name, "stable_id": sid},
+                )
 
     # Invariant 4: every lifecycle_role in the closed enum. The Literal
     # type makes this true at the type system level; we still check at

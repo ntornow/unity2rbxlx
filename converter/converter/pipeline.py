@@ -4125,37 +4125,46 @@ script.Disabled = true
         if self.state.rbx_place is None:
             return
 
-        # Phase 2a slice 3 round 3 fix (codex P1 — resume erases
-        # animation_drivers): distinguish three cases:
+        # Phase 2a slice 3 round 4 fix (Claude P1.A + P1.B): the
+        # round-3 "early return when animation_result is None" guard
+        # over-fired in two ways. (1) It fired on legitimate
+        # fresh-no-animations paths (--no-animations flag, projects
+        # without .anim files, test paths skipping convert_animations)
+        # and regressed slice 3 round 1's "topology always built"
+        # goal. (2) It preserved the WHOLE persisted topology on
+        # resume, including a now-stale caller_graph alongside a
+        # freshly-rebuilt state.dependency_map — silent divergence
+        # by construction.
         #
-        #   (a) animation_result is None  → resume path; convert_animations
-        #       didn't run. The persisted scene_runtime.topology block
-        #       (if any) holds animation routing from a prior conversion
-        #       that we MUST NOT overwrite with `animation_drivers={}`.
-        #       Skip the rebuild entirely; preserve persisted topology.
-        #   (b) animation_result is populated, emitted_animations == []
-        #       → fresh conversion with no animations. caller_graph
-        #       still needs to be built (slice 3 round 1 goal). Pass
-        #       empty list; build_topology returns artifact with empty
-        #       animation_drivers + populated modules + caller_graph.
-        #   (c) animation_result has emissions → normal path. Build
-        #       fresh with the emissions.
-        #
-        # The pre-round-3 fallback "defaulted both (a) and (b) to []"
-        # caused codex's regression: case (a) silently dropped prior
-        # animation_drivers from the persisted plan.
-        if self.state.animation_result is None:
-            # Case (a): resume. Don't rebuild — let the persisted
-            # topology stand. caller_graph may be stale on resume;
-            # slice 5+ that consumes it must either force-rerun
-            # convert_animations or accept the staleness.
-            return
+        # The structural fix is to ALWAYS rebuild modules + edges +
+        # caller_graph from current state, AND preserve the prior
+        # animation_drivers block ONLY when we lack fresh emission
+        # data. The prior topology block lives at
+        # ``scene_runtime["topology"]`` after ``_merge_scene_runtime``
+        # rehydrates it from a previous ``conversion_plan.json``;
+        # ``animation_result is None`` is the signal for "no fresh
+        # emissions available."
+        prior_topology = scene_runtime.get("topology", {})
+        if not isinstance(prior_topology, dict):
+            prior_topology = {}
 
-        emitted_animations: list = list(
-            getattr(
-                self.state.animation_result, "emitted_animations", [],
-            ) or [],
-        )
+        if self.state.animation_result is not None:
+            # Fresh animation data available (covers fresh-with-anims
+            # AND fresh-no-anims — emitted_animations is just empty
+            # in the latter).
+            emitted_animations: list = list(
+                self.state.animation_result.emitted_animations,
+            )
+            preserved_animation_drivers = None
+        else:
+            # No fresh animation data this build. If the persisted
+            # topology has a prior animation_drivers block, preserve
+            # it; otherwise emit empty (first-time-no-anims resume).
+            emitted_animations = []
+            pad = prior_topology.get("animation_drivers", {})
+            preserved_animation_drivers = (
+                pad if isinstance(pad, dict) and pad else None
+            )
 
         from converter.scene_runtime_topology.build_topology import (
             build_topology,
@@ -4180,6 +4189,12 @@ script.Disabled = true
                 # incoming-edge view). `None` is treated as empty
                 # graph — back-compat for callers pre-dating slice 3.
                 dependency_map=self.state.dependency_map or None,
+                # Phase 2a slice 3 round 4: preserve prior
+                # animation_drivers on resume / no-fresh-emissions
+                # builds (caller computed above). Build_topology
+                # uses the preserved block verbatim and skips
+                # invariant 3 — see its docstring for the contract.
+                preserved_animation_drivers=preserved_animation_drivers,
             )
         except Exception as exc:
             # Topology invariants are fail-closed by design, but
@@ -4204,6 +4219,18 @@ script.Disabled = true
         # preserve today's server placement.
         animation_drivers = artifact.get("animation_drivers", {})
         if not animation_drivers:
+            return
+        # The application loop below maps emissions → drivers by
+        # script_name. On resume (animation_result is None) we have
+        # preserved drivers but no fresh emissions to walk. The
+        # persisted animation_drivers in scene_runtime["topology"]
+        # survives the rebuild and downstream readers consult it;
+        # RbxScripts on resume rely on their persisted parent_path
+        # from the cached conversion. Skipping the apply loop here is
+        # the slice-3-scoped fix; deeper resume semantics for
+        # RbxScript application are pre-existing scope (slice 3 round
+        # 4 fix didn't introduce this resume gap).
+        if self.state.animation_result is None:
             return
         # Index drivers by script_name so the apply loop is O(n).
         drivers_by_script_name: dict[str, dict[str, object]] = {}

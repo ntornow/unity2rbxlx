@@ -2235,54 +2235,61 @@ class TestApplyTopologyToRbxScripts:
         assert topo.get("modules") == {}
         assert topo.get("caller_graph") == {}
 
-    def test_resume_with_animation_result_none_preserves_topology(
+    def test_resume_with_animation_result_none_preserves_animation_drivers(
         self, tmp_path: Path,
     ) -> None:
-        """Slice 3 round 3 (codex P1): on resume where
+        """Slice 3 round 4 (Claude P1.A/P1.B): on resume where
         convert_animations didn't run, ``state.animation_result``
-        is None but the persisted ``scene_runtime.topology`` block
-        already has animation_drivers from a prior conversion.
-        Pre-round-3 my "default emitted_animations to []" change
-        rebuilt the artifact and silently overwrote the prior
-        animation_drivers with ``{}``. The round-3 fix detects the
-        resume signature (``animation_result is None``) and SKIPS
-        the rebuild — preserving the persisted topology.
+        is None and the persisted ``scene_runtime.topology`` block
+        carries animation_drivers from a prior conversion. The
+        round-4 fix preserves the animation_drivers block verbatim
+        while REBUILDING modules + caller_graph + cross_domain_edges
+        from current state — avoids both (1) silent erasure of prior
+        drivers (round 3 P1) and (2) stale caller_graph alongside
+        fresh dependency_map (round 4 P1.B).
 
-        Refs: pipeline.py:_build_and_apply_topology resume guard;
-        codex review of slice 3 round 3 P1.
+        Refs: pipeline.py:_build_and_apply_topology round 4 fix;
+        build_topology.py ``preserved_animation_drivers`` contract.
         """
         from types import SimpleNamespace
         from converter.pipeline import Pipeline
         from core.roblox_types import RbxPlace
-        artifact = _mk_artifact()
+        artifact = _mk_artifact(modules={
+            "guid-foo": _mk_module("Foo", "client"),
+        })
         scene_runtime = cast("dict[str, object]", artifact)
         # Pre-existing topology block from a prior conversion run.
-        # Simulate a populated animation_drivers block that the
-        # resume path must NOT erase.
-        prior_topology = {
-            "modules": {},
-            "animation_drivers": {
-                "guid-prior:Door:open": {
-                    "stable_id": "guid-prior:Door:open",
-                    "routing_status": "resolved",
-                    "driver_module_guid": "guid-prior-door",
-                    "domain": "client",
-                    "script_class": "LocalScript",
-                    "lifecycle_role": "auto_run",
-                    "observed_attribute": "Open",
-                    "observed_target": {
-                        "kind": "self", "name": "", "scope": "workspace",
-                    },
-                    "bridge_group_id": None,
+        prior_animation_drivers = {
+            "guid-prior:Door:open": {
+                "stable_id": "guid-prior:Door:open",
+                "routing_status": "resolved",
+                "driver_module_guid": "guid-prior-door",
+                "domain": "client",
+                "script_class": "LocalScript",
+                "lifecycle_role": "auto_run",
+                "observed_attribute": "Open",
+                "observed_target": {
+                    "kind": "self", "name": "", "scope": "workspace",
                 },
+                "bridge_group_id": None,
             },
-            "cross_domain_edges": [],
-            "caller_graph": {},
         }
+        prior_topology = {
+            "modules": {},  # stale — should get rebuilt
+            "animation_drivers": prior_animation_drivers,
+            "cross_domain_edges": [],
+            "caller_graph": {},  # stale — should get rebuilt
+        }
+        # The prior topology MUST include a module entry for the
+        # driver_module_guid `guid-prior-door` — invariant 1 will fire
+        # otherwise. For the resume test, add the prior driver module
+        # to scene_runtime.modules so the freshly-built modules_block
+        # includes it.
+        scene_runtime["modules"]["guid-prior-door"] = _mk_module(  # type: ignore[index]
+            "PriorDoor", "client",
+        )
         scene_runtime["topology"] = prior_topology
 
-        # Mock pipeline shape with animation_result=None — the resume
-        # signal.
         pipeline = Pipeline.__new__(Pipeline)
         pipeline.output_dir = tmp_path
         rbx_place = RbxPlace()
@@ -2297,9 +2304,58 @@ class TestApplyTopologyToRbxScripts:
         plan = TestApplyTopologyToRbxScripts._mk_plan()
         pipeline._build_and_apply_topology(scene_runtime, plan)
 
-        # Prior topology preserved untouched.
-        assert scene_runtime["topology"] is prior_topology
+        # Topology block IS rebuilt (not preserved as-is)…
+        rebuilt = scene_runtime["topology"]
+        assert rebuilt is not prior_topology
+        # …and modules block reflects CURRENT scene_runtime (has Foo + PriorDoor)
+        assert "guid-foo" in rebuilt["modules"]  # type: ignore[index]
+        assert "guid-prior-door" in rebuilt["modules"]  # type: ignore[index]
+        # …animation_drivers preserved verbatim from prior topology
         assert (
-            scene_runtime["topology"]["animation_drivers"]  # type: ignore[index]
-            == prior_topology["animation_drivers"]
+            rebuilt["animation_drivers"]  # type: ignore[index]
+            == prior_animation_drivers
         )
+
+    def test_fresh_no_animations_still_builds_caller_graph(
+        self, tmp_path: Path,
+    ) -> None:
+        """Slice 3 round 4 — fresh conversion with no animations
+        (animation_result populated but emitted_animations==[]).
+        Pre-round-4 the `animation_result is None` short-circuit
+        also fired here in some code paths, regressing slice 3
+        round 1's "topology always built" goal. Round 4 distinguishes
+        by checking animation_result identity vs emission contents.
+
+        Verifies: caller_graph IS built; topology block IS written;
+        animation_drivers is empty (no fresh emissions).
+        """
+        from types import SimpleNamespace
+        from converter.pipeline import Pipeline
+        from converter.animation_converter import AnimationConversionResult
+        from core.roblox_types import RbxPlace
+        artifact = _mk_artifact(modules={
+            "guid-caller": _mk_module("Caller", "client"),
+            "guid-target": _mk_module("Target", "client"),
+        })
+        scene_runtime = cast("dict[str, object]", artifact)
+
+        pipeline = Pipeline.__new__(Pipeline)
+        pipeline.output_dir = tmp_path
+        rbx_place = RbxPlace()
+        rbx_place.scripts = [_mk_rbx_script("Caller", "LocalScript")]
+        anim_result = AnimationConversionResult()
+        anim_result.emitted_animations = []  # populated but empty
+        pipeline.state = SimpleNamespace(
+            rbx_place=rbx_place,
+            animation_result=anim_result,  # <-- populated, not None
+            guid_index=None,
+            dependency_map={"Caller": ["Target"]},
+        )
+
+        plan = TestApplyTopologyToRbxScripts._mk_plan()
+        pipeline._build_and_apply_topology(scene_runtime, plan)
+
+        # Topology block written, caller_graph populated, animation_drivers empty.
+        topo = scene_runtime["topology"]
+        assert topo["caller_graph"] == {"guid-target": ["guid-caller"]}  # type: ignore[index]
+        assert topo["animation_drivers"] == {}  # type: ignore[index]
