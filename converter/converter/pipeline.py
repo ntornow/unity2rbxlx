@@ -4195,10 +4195,22 @@ script.Disabled = true
             build_topology,
         )
 
-        scripts_by_class: dict[str, RbxScript] = {}
-        for s in self.state.rbx_place.scripts:
-            if s.name:
-                scripts_by_class.setdefault(s.name, s)
+        # Phase 2a slice 4 round 3 review (Claude P1.A): use the
+        # shared ``build_scripts_by_class_name`` helper so the
+        # pipeline + planner share ONE source of truth for the
+        # class_name → script join. Pre-fix the pipeline keyed by
+        # ``script.name`` (file stem) but downstream consumers
+        # (build_topology._build_modules_block) looked up via
+        # module rows' ``class_name`` — same name-vs-class-name
+        # conflation slice 4 round 2 fixed in the planner.
+        from converter.scene_runtime_planner import (
+            build_scripts_by_class_name,
+        )
+        modules_in = scene_runtime.get("modules", {}) or {}
+        scripts_by_class = build_scripts_by_class_name(
+            self.state.rbx_place.scripts,
+            cast("dict", modules_in),
+        )
 
         try:
             artifact = build_topology(

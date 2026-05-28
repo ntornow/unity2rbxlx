@@ -543,6 +543,112 @@ class TestTopologyEmissionShape:
         signals = helper_module.get("domain_signals", {})
         assert signals.get("reachability_forced_container") == "ReplicatedStorage"
 
+    def test_build_scripts_by_class_name_helper(self) -> None:
+        """Slice 4 round 3 review (Claude P1.A): the shared
+        ``build_scripts_by_class_name`` helper joins modules' class_name
+        to scripts via a primary-then-fallback strategy. Direct unit
+        test of the helper covers all three join cases.
+
+        Refs: scene_runtime_planner.build_scripts_by_class_name;
+        Phase 2a slice 4 round 3 review.
+        """
+        from converter.scene_runtime_planner import (
+            build_scripts_by_class_name,
+        )
+        modules: dict[str, dict[str, object]] = {
+            "guid-foo": {"stem": "Foo", "class_name": "Foo"},
+            "guid-boot": {"stem": "Bootstrap", "class_name": "GameInit"},
+            "guid-orphan": {"stem": "Orphan", "class_name": "Orphan"},
+            "guid-empty-cn": {"stem": "Whatever", "class_name": ""},
+        }
+        scripts = [
+            RbxScript(name="Foo", source="", script_type="Script"),
+            # GameInit has no script named "GameInit"; fallback to
+            # the Bootstrap script (matches module.stem).
+            RbxScript(name="Bootstrap", source="", script_type="ModuleScript"),
+            # Orphan has no matching script (neither name nor stem
+            # matches an existing script) — entry omitted.
+            # No script for guid-empty-cn either, but it's skipped
+            # at class_name == "" check.
+        ]
+        result = build_scripts_by_class_name(scripts, modules)
+        # Direct match.
+        assert "Foo" in result
+        assert result["Foo"].name == "Foo"
+        # Fallback match: class_name → stem.
+        assert "GameInit" in result
+        assert result["GameInit"].name == "Bootstrap"
+        # No match: omitted.
+        assert "Orphan" not in result
+        # Empty class_name: never joined.
+        assert "" not in result
+
+    def test_topology_build_modules_handles_class_name_stem_mismatch(
+        self, tmp_path: Path,
+    ) -> None:
+        """Slice 4 round 3 review (Claude P1.A end-to-end): when
+        ``_build_modules_block`` is invoked via the pipeline (which
+        now uses the shared helper), a module with
+        ``class_name="GameInit"`` and a script with
+        ``name="Bootstrap"`` correctly resolves through the fallback
+        join and the topology row emits ``script_class`` matching
+        the actual RbxScript.script_type.
+
+        Pre-round-3 the pipeline-built scripts_by_class was keyed by
+        ``script.name``, so ``_build_modules_block.scripts_by_class.get
+        ("GameInit")`` returned None, falling through to
+        ``script_class="ModuleScript"`` regardless of the actual
+        script_type. This test pins the corrected behavior.
+
+        Refs: pipeline.py:_build_and_apply_topology + scene_runtime_
+        planner.build_scripts_by_class_name; Phase 2a slice 4 round 3.
+        """
+        from types import SimpleNamespace
+        from converter.pipeline import Pipeline
+        from converter.animation_converter import AnimationConversionResult
+        from converter.code_transpiler import TranspilationResult
+        from core.roblox_types import RbxPlace, RbxScript
+        artifact = _mk_artifact(modules={
+            # Module declares class_name="GameInit" but file stem
+            # is "Bootstrap" (the script's name).
+            "guid-init": {
+                "stem": "Bootstrap",
+                "class_name": "GameInit",
+                "runtime_bearing": True,
+                "domain": "client",
+                "character_attached": False,
+                "is_loader": False,
+            },
+        })
+        scene_runtime = cast("dict[str, object]", artifact)
+
+        pipeline = Pipeline.__new__(Pipeline)
+        pipeline.output_dir = tmp_path
+        rbx_place = RbxPlace()
+        # Script.name == "Bootstrap" (file stem), NOT class_name.
+        # script_type is LocalScript — topology should reflect it.
+        rbx_place.scripts = [
+            RbxScript(name="Bootstrap", source="", script_type="LocalScript"),
+        ]
+        anim_result = AnimationConversionResult()
+        anim_result.emitted_animations = []
+        pipeline.state = SimpleNamespace(
+            rbx_place=rbx_place,
+            animation_result=anim_result,
+            guid_index=None,
+            dependency_map={},
+            transpilation_result=TranspilationResult(),
+        )
+
+        plan = TestApplyTopologyToRbxScripts._mk_plan()
+        pipeline._build_and_apply_topology(scene_runtime, plan)
+
+        topo_module = scene_runtime["topology"]["modules"]["guid-init"]  # type: ignore[index]
+        # Pre-fix this would have defaulted to "ModuleScript"; post-fix
+        # the fallback join finds the Bootstrap script and surfaces its
+        # actual script_type.
+        assert topo_module["script_class"] == "LocalScript"
+
     def test_invariant_10_module_path_equals_container_is_legal(
         self,
     ) -> None:

@@ -569,44 +569,18 @@ def classify_scene_runtime_domains(
     prefabs = scene_runtime.get("prefabs", {})
     overrides = scene_runtime.get("domain_overrides", {})
 
-    # Phase 2a slice 4 round 2 review (Claude P1.B): the dict named
-    # ``scripts_by_class`` was historically keyed by ``script.name``
-    # (the file stem), but downstream consumers (``_apply_reachability_rule``
-    # at line 1228+, ``_stamp_container_and_path`` at line 1188) USE
-    # the key as a class_name — looking up via module rows'
-    # ``class_name`` field. When a C# file's stem differs from its
-    # declared class name (e.g. ``Bootstrap.cs`` containing
-    # ``class GameInit``), that join failed silently → the rule never
-    # fired on the right helper. Build the dict keyed by class_name
-    # via a name-fallback-to-stem join: for each module row's
-    # class_name, find the script whose name matches the class_name
-    # first; if that misses, fall back to matching the module row's
-    # ``stem`` (which is the file stem === ``RbxScript.name`` in the
-    # output_filename-derived case). Misses on BOTH paths mean we
-    # genuinely cannot link script ↔ module — leave the entry out
-    # of the dict (the reachability rule will skip; equivalent to
-    # today's behavior for the join-missed case).
-    script_by_name: dict[str, RbxScript] = {}
-    for script in scripts:
-        if script.name:
-            script_by_name.setdefault(script.name, script)
-    scripts_by_class: dict[str, RbxScript] = {}
-    for _script_id, module in modules.items():
-        cn_obj = module.get("class_name", "")
-        cn = cn_obj if isinstance(cn_obj, str) else ""
-        if not cn:
-            continue
-        # Primary join: script.name == class_name.
-        s = script_by_name.get(cn)
-        if s is None:
-            # Fallback join: script.name == module.stem (file stem
-            # — the case where class_name differs from file name).
-            stem_obj = module.get("stem", "")
-            stem = stem_obj if isinstance(stem_obj, str) else ""
-            if stem:
-                s = script_by_name.get(stem)
-        if s is not None:
-            scripts_by_class.setdefault(cn, s)
+    # Phase 2a slice 4 round 3 review (Claude P1.A): use the shared
+    # ``build_scripts_by_class_name`` helper so the planner +
+    # pipeline share ONE source of truth for the class_name → script
+    # join. Pre-fix this loop duplicated the same logic that lived
+    # at the pipeline boundary, creating a drift surface.
+    from converter.scene_runtime_planner import (
+        build_scripts_by_class_name,
+    )
+    scripts_list = list(scripts)
+    scripts_by_class = build_scripts_by_class_name(
+        scripts_list, cast("dict", modules),
+    )
 
     per_instance_evidence = _gather_per_instance_evidence(scenes, prefabs)
 

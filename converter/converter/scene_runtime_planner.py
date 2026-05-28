@@ -30,6 +30,7 @@ from typing import TypedDict, cast
 # the public `REPLICATED_FIRST_HINTS` name to enable this share.
 from converter.storage_classifier import REPLICATED_FIRST_HINTS
 
+from core.roblox_types import RbxScript
 from core.unity_types import (
     ComponentData,
     GuidIndex,
@@ -1103,6 +1104,70 @@ def _build_modules_table(
             }
 
     return modules
+
+
+# ---------------------------------------------------------------------------
+# Shared script-by-class-name join (Phase 2a slice 4 round 3).
+# ---------------------------------------------------------------------------
+
+def build_scripts_by_class_name(
+    scripts: list[RbxScript],
+    modules: dict[str, "SceneRuntimeModule | dict[str, object]"],
+) -> dict[str, RbxScript]:
+    """Build a class_name-keyed RbxScript index via primary-then-
+    fallback join.
+
+    For each ``SceneRuntimeModule`` row's ``class_name``, find the
+    matching ``RbxScript`` by:
+      1. Primary join: ``script.name == class_name`` (the typical
+         case where C# class name and emitted file name match).
+      2. Fallback join: ``script.name == module.stem`` (the case
+         where a C# file's declared class name differs from its
+         file stem — e.g. ``Bootstrap.cs`` containing
+         ``class GameInit``).
+
+    Misses on BOTH joins mean we cannot link the script to the
+    module — the entry is omitted from the dict.
+
+    Phase 2a slice 4 round 2 + round 3 review (Claude P1.B): this
+    helper is the single source of truth for the join used by both
+    ``module_domain.classify_scene_runtime_domains`` (the planner's
+    reachability rule) and ``pipeline._build_and_apply_topology``
+    (the topology orchestrator). Duplicating the logic across the
+    two callers was a drift surface — extracting it here keeps both
+    paths in lock-step.
+
+    Behavior note: scripts with empty ``name`` are skipped (they
+    can't be addressed via the join). Scripts present in ``scripts``
+    but with no corresponding ``modules`` row are also omitted —
+    pre-slice-4 the planner's reachability rule would iterate them
+    but the closure check would filter them out anyway (orphan
+    scripts aren't in client_classes or server_classes), so this
+    is behavior-neutral for production.
+    """
+    script_by_name: dict[str, RbxScript] = {}
+    for s in scripts:
+        if s.name:
+            script_by_name.setdefault(s.name, s)
+    out: dict[str, RbxScript] = {}
+    for _script_id, module in modules.items():
+        if not isinstance(module, dict):
+            continue
+        cn_obj = module.get("class_name", "")
+        cn = cn_obj if isinstance(cn_obj, str) else ""
+        if not cn:
+            continue
+        # Primary join: script.name == class_name.
+        joined = script_by_name.get(cn)
+        if joined is None:
+            # Fallback join: script.name == module.stem.
+            stem_obj = module.get("stem", "")
+            stem = stem_obj if isinstance(stem_obj, str) else ""
+            if stem:
+                joined = script_by_name.get(stem)
+        if joined is not None:
+            out.setdefault(cn, joined)
+    return out
 
 
 # ---------------------------------------------------------------------------
