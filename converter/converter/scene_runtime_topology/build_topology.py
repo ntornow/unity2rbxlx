@@ -59,14 +59,18 @@ Phase 1 invariants (per design doc §"topology artifact" + the review's
      3 added this invariant so a future change to
      ``derive_module_lifecycle_role`` can't silently produce a
      "loader" role on a server-domain module.
-  9. No ``class_name`` collision in ``scene_runtime.modules`` is
-     touched by ``dependency_map`` (Phase 2a slice 3 round 1). When two
-     modules share a class_name AND that name appears as a caller or
-     callee in dependency_map, the curated ``caller_graph`` would
-     silently route edges to one script_id and zero the other —
-     slice 5's consumer reads under-routed placement. Fails closed
-     here so the underlying defect (dependency_map keyspace is
-     class_name, not script_id) is surfaced rather than encoded.
+Coherence policy (Phase 2a slice 3 round 2) — NOT a fail-closed
+invariant: when ``scene_runtime.modules`` contains a ``class_name``
+collision (two scripts sharing a class_name) AND that name is
+touched by ``dependency_map``, ``_detect_caller_graph_collisions``
+excludes it from ``caller_graph`` translation. The colliding scripts
+appear as orphan rows (no callers) in the curated view; slice 5's
+decision tree routes them to ReplicatedStorage per its orphan-module
+rule. A WARNING is logged per collision. The legacy pipeline
+silently mis-routed these projects pre-slice-3; this policy keeps
+them converting while preventing slice 5 from receiving lossy edges.
+The deep fix (promote dependency_map's keyspace to script_id) lives
+in a future slice.
 """
 
 from __future__ import annotations
@@ -333,6 +337,26 @@ def build_topology(
     violation. No warnings, no soft-fails — the design doc commits to
     fail-closed on emit.
     """
+    # Detect class_name collisions in scene_runtime.modules that are
+    # touched by dependency_map BEFORE block-building. Codex slice 3
+    # round 2 P1 flagged the prior fail-closed invariant 9 as a
+    # regression for projects with two scripts sharing a class_name
+    # (the legacy pipeline silently processes these — lossy but
+    # ships). The structural choice here is DEGRADED SERVICE: detect
+    # the collisions, log a structured warning, and let
+    # `_build_caller_graph_block` exclude those class_names entirely
+    # from the curated view. Slice 5's consumer sees partial-but-
+    # truthful data for the colliding scripts (no callers known →
+    # ReplicatedStorage fallback per `_decide_script_container`'s
+    # orphan-module rule), never lossy mis-routed data.
+    #
+    # The deep fix is to key dependency_map by script_id at planner
+    # construction (eliminates the keyspace ambiguity entirely);
+    # tracked for a future slice.
+    colliding_classes = _detect_caller_graph_collisions(
+        scene_runtime, dependency_map,
+    )
+
     modules_block = _build_modules_block(
         scene_runtime, scripts_by_class, guid_index,
     )
@@ -341,7 +365,7 @@ def build_topology(
         scene_runtime, emitted_animations,
     )
     caller_graph_block = _build_caller_graph_block(
-        scene_runtime, dependency_map,
+        scene_runtime, dependency_map, excluded_class_names=colliding_classes,
     )
 
     artifact: TopologyArtifact = {
@@ -352,11 +376,12 @@ def build_topology(
     }
 
     # Invariants run AFTER assembly so they can cross-reference blocks.
+    # (Invariant 9 is the exception — it's an INPUT validator and ran
+    # before block-building via _validate_caller_graph_inputs.)
     _enforce_invariants(
         artifact,
         emitted_animations=emitted_animations,
         scene_runtime=scene_runtime,
-        dependency_map=dependency_map,
     )
     return artifact
 
@@ -559,6 +584,8 @@ def _build_animation_drivers_block(
 def _build_caller_graph_block(
     scene_runtime: SceneRuntimeArtifact,
     dependency_map: dict[str, list[str]] | None,
+    *,
+    excluded_class_names: frozenset[str] = frozenset(),
 ) -> dict[str, list[str]]:
     """Curate the planner's outgoing dependency_map into the topology's
     incoming ``caller_graph`` view.
@@ -596,18 +623,24 @@ def _build_caller_graph_block(
     ``class_name`` are skipped at indexing time — they have no callable
     identity.
 
-    **Class_name collision handling** (slice 3 round 1 review,
-    Claude P1-1): when two modules share a class_name AND the
-    dependency_map names that class_name (caller or callee), the
-    translation is FUNDAMENTALLY LOSSY because dependency_map's
+    **Class_name collision handling** (slice 3 round 2 review,
+    codex P1 + Claude P1): when two modules share a class_name AND
+    the dependency_map names that class_name (caller or callee), the
+    translation would be FUNDAMENTALLY LOSSY because dependency_map's
     keyspace (class_name) doesn't uniquely identify a script_id.
-    First-write keeps the deterministic mapping, but slice 5's
-    consumer would still receive lossy edges. Invariant 9 in
-    ``_enforce_invariants`` fails closed when such a collision is
-    actually used — surfaces the underlying defect (dependency_map
-    isn't script_id-keyed at the planner) rather than silently
-    mis-routing edges. The full fix lives in a future slice that
-    promotes dependency_map's keyspace to script_id.
+    Rather than fail closed (which would regress projects with
+    duplicate class names that the legacy pipeline silently
+    processes), this builder applies a DEGRADED-SERVICE contract:
+    ``excluded_class_names`` (computed by
+    ``_detect_caller_graph_collisions`` pre-derivation) is the set
+    of colliding class_names. Both the caller and callee paths skip
+    them entirely, leaving the colliding scripts as orphan rows in
+    the curated view. Slice 5's ``_decide_script_container`` falls
+    back to ReplicatedStorage for callerless ModuleScripts (its
+    explicit "orphan module" rule). The operator sees a warning per
+    collision in the build log and can split the colliding class to
+    restore precise routing. The deep fix lives in a future slice
+    that promotes dependency_map's keyspace to script_id.
 
     Returns empty dict when ``dependency_map`` is None or empty
     (back-compat for Phase 1 callers + legacy-mode invocations).
@@ -621,18 +654,27 @@ def _build_caller_graph_block(
     class_to_script_id: dict[str, str] = {}
     for script_id, module in modules_in.items():
         class_name_obj = module.get("class_name", "")
-        if isinstance(class_name_obj, str) and class_name_obj:
-            # First-write wins — consistent with `_build_modules_block`'s
-            # `scripts_by_class.setdefault(s.name, s)` policy. Two
-            # `Utils.cs` files map to the FIRST `Utils` script_id; the
-            # second one's caller_graph edges land on the first's row.
-            # Invariant 9 (below) fails the build closed if this
-            # collision actually affects dependency_map — surfacing the
-            # underlying defect instead of silently mis-routing.
-            class_to_script_id.setdefault(class_name_obj, script_id)
+        if not isinstance(class_name_obj, str) or not class_name_obj:
+            continue
+        if class_name_obj in excluded_class_names:
+            # Colliding class names are excluded from the translation
+            # index — degraded-service contract. The scripts still
+            # appear in the modules block (built independently);
+            # caller_graph just doesn't reference them.
+            continue
+        # First-write wins among non-colliding rows — consistent with
+        # `_build_modules_block`'s `scripts_by_class.setdefault`
+        # policy. (For non-colliding class names there's only one
+        # script_id, so first-write and last-write are the same.)
+        class_to_script_id.setdefault(class_name_obj, script_id)
 
     callers_by_script_id: dict[str, list[str]] = {}
     for caller_class, callee_classes in dependency_map.items():
+        if caller_class in excluded_class_names:
+            # Colliding caller_class: we can't determine which actual
+            # script_id authored the edge. Skip entirely (degraded
+            # service per the docstring).
+            continue
         caller_id = class_to_script_id.get(caller_class)
         if caller_id is None:
             # Caller class isn't in the planner's modules — it doesn't
@@ -640,6 +682,9 @@ def _build_caller_graph_block(
             # is unobservable from the topology's script_id keyspace.
             continue
         for callee_class in callee_classes:
+            if callee_class in excluded_class_names:
+                # Colliding callee: same degraded-service rule.
+                continue
             callee_id = class_to_script_id.get(callee_class)
             if callee_id is None:
                 continue
@@ -672,6 +717,83 @@ def callers_of(
 
 
 # ---------------------------------------------------------------------------
+# Pre-derivation collision detection (Phase 2a slice 3 round 2)
+# ---------------------------------------------------------------------------
+
+def _detect_caller_graph_collisions(
+    scene_runtime: SceneRuntimeArtifact,
+    dependency_map: dict[str, list[str]] | None,
+) -> frozenset[str]:
+    """Detect ``class_name`` collisions in ``scene_runtime.modules``
+    that are touched by ``dependency_map``. Returns the colliding
+    class_names so the caller_graph builder can EXCLUDE them from
+    translation (degraded-service contract — see ``build_topology``
+    docstring for rationale).
+
+    Logs a structured WARNING listing each collision: class_name +
+    the competing script_ids + an explicit "promote dependency_map's
+    keyspace to script_id" remediation hint. Operators see the
+    warning in the build log; the conversion proceeds with
+    partial-but-truthful caller_graph data for the colliding scripts
+    (they appear in the graph as ZERO-caller modules — slice 5's
+    decision tree falls back to ReplicatedStorage, the orphan-module
+    rule's safe default).
+
+    Lives OUTSIDE ``_enforce_invariants`` (which validates artifact
+    outputs) because this check operates on INPUTS and informs the
+    derivation. Running it pre-derivation keeps the producer
+    structurally aware of the excluded class_names (Claude review
+    slice 3 round 2 P1).
+
+    Empty return when ``dependency_map`` is None/empty or no
+    collisions exist.
+    """
+    if not dependency_map:
+        return frozenset()
+    modules_in = cast(
+        dict[str, dict[str, object]], scene_runtime.get("modules", {}),
+    )
+    class_to_script_ids: dict[str, list[str]] = {}
+    for script_id, module in modules_in.items():
+        cn_obj = module.get("class_name", "")
+        if isinstance(cn_obj, str) and cn_obj:
+            class_to_script_ids.setdefault(cn_obj, []).append(script_id)
+
+    # Find class_names with > 1 script_ids AND touched by dep_map.
+    touched_classes: set[str] = set(dependency_map.keys())
+    for callees in dependency_map.values():
+        for c in callees:
+            if isinstance(c, str):
+                touched_classes.add(c)
+
+    colliding: set[str] = set()
+    for cn, sids in class_to_script_ids.items():
+        if len(sids) <= 1:
+            continue
+        if cn not in touched_classes:
+            continue
+        colliding.add(cn)
+
+    if colliding:
+        # One log entry per collision so operators can grep + count.
+        for cn in sorted(colliding):
+            sids = sorted(class_to_script_ids[cn])
+            log.warning(
+                "[scene_runtime_topology] class_name %r maps to %d "
+                "script_ids %r AND appears in dependency_map; "
+                "excluding from caller_graph (lossy class_name "
+                "keyspace). slice 5 consumer will see these as "
+                "orphan modules and route to ReplicatedStorage. "
+                "Promote dependency_map's keyspace to script_id at "
+                "planner construction or split the colliding class "
+                "to restore precise routing.",
+                cn, len(sids), sids,
+            )
+
+    return frozenset(colliding)
+
+
+# ---------------------------------------------------------------------------
 # Invariants
 # ---------------------------------------------------------------------------
 
@@ -683,19 +805,18 @@ def _enforce_invariants(
     *,
     emitted_animations: list[EmittedAnimation],
     scene_runtime: SceneRuntimeArtifact,
-    dependency_map: dict[str, list[str]] | None = None,
 ) -> None:
-    """Apply the emit-time invariants. Raises on any violation.
+    """Apply the post-derivation emit-time invariants. Raises on any
+    violation.
 
     Each invariant is a single ``for`` loop with a clear failure
     message. The errors are catchable (``TopologyInvariantError``) so
     test code can assert specific invariant numbers without scraping
     log output.
 
-    ``dependency_map`` (slice 3 round 1) is passed through so invariant
-    9 can verify the class_name → script_id translation in
-    ``_build_caller_graph_block`` wasn't lossy for any class name the
-    map actually references.
+    Invariant 9 (the input-collision check) lives in
+    ``_validate_caller_graph_inputs`` and runs pre-derivation, NOT
+    here — see that helper's docstring for rationale.
     """
     modules_block = artifact.get("modules", {})
     animation_drivers = artifact.get("animation_drivers", {})
@@ -932,54 +1053,11 @@ def _enforce_invariants(
                 row=planner_module,
             )
 
-    # Invariant 9 (Phase 2a slice 3 round 1): class_name collisions in
-    # `scene_runtime.modules` are LOSSY for caller_graph translation
-    # because dependency_map's keyspace is class_name (not script_id).
-    # When two modules share a class_name AND that class_name appears
-    # in dependency_map (as a caller or callee), the curation step
-    # silently routes the edge to the FIRST script_id (per
-    # `_build_caller_graph_block`'s `setdefault` policy) and the
-    # second script_id receives a zero-caller view for what may be a
-    # real require()-edge. Slice 5's decision tree would under-route
-    # the loser's placement.
-    #
-    # The deep fix is to key dependency_map by script_id at planner
-    # construction (pipeline.py:1942-1950); slice 3 catches the
-    # collision here so the lossy data never reaches slice 5+
-    # consumers. Future slice that migrates the keyspace can remove
-    # this invariant.
-    if dependency_map:
-        planner_modules_for_inv9 = cast(
-            dict[str, dict[str, object]],
-            scene_runtime.get("modules", {}),
-        )
-        class_to_script_ids: dict[str, list[str]] = {}
-        for script_id, module in planner_modules_for_inv9.items():
-            cn = module.get("class_name", "")
-            if isinstance(cn, str) and cn:
-                class_to_script_ids.setdefault(cn, []).append(script_id)
-        # Find class_names with > 1 script_ids AND touched by dep_map.
-        touched_classes_caller = set(dependency_map.keys())
-        touched_classes_callee: set[str] = set()
-        for callees in dependency_map.values():
-            for c in callees:
-                if isinstance(c, str):
-                    touched_classes_callee.add(c)
-        touched_classes = touched_classes_caller | touched_classes_callee
-        for cn, sids in class_to_script_ids.items():
-            if len(sids) <= 1:
-                continue
-            if cn not in touched_classes:
-                continue
-            _abort(
-                9,
-                f"class_name {cn!r} maps to {len(sids)} script_ids "
-                f"({sorted(sids)!r}) AND appears in dependency_map; "
-                f"caller_graph translation is lossy. Promote "
-                f"dependency_map's keyspace to script_id at planner "
-                f"construction or split the colliding class.",
-                row={"class_name": cn, "script_ids": sorted(sids)},
-            )
+    # Invariant 9 lives in `_validate_caller_graph_inputs` (called
+    # pre-derivation from `build_topology`). It's an INPUT validator,
+    # not an output one — keeping it here would let a future producer
+    # added between derivation and output validation leak the lossy
+    # data before invariant 9 fires (Claude review slice 3 round 2 P1).
 
 
 __all__ = (

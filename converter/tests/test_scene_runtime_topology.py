@@ -1774,47 +1774,23 @@ class TestCallerGraphCuration:
         # Original graph unchanged.
         assert graph["guid-bar"] == ["guid-foo"]
 
-    def test_invariant_9_class_name_collision_in_dependency_map_aborts(
-        self,
+    def test_class_name_collision_excluded_from_caller_graph(
+        self, caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """When two modules share a class_name AND that name IS
-        touched by dependency_map (caller or callee), invariant 9
-        fails closed — caller_graph translation would be lossy and
-        slice 5's consumer would under-route the loser's placement.
+        """Slice 3 round 2 (codex P1 / Claude P1) degraded-service
+        contract: when two modules share a class_name AND that name
+        appears in dependency_map, the colliding class is EXCLUDED
+        from caller_graph translation (rather than aborting the
+        build). Both caller-side and callee-side appearances are
+        skipped. The colliding scripts appear as orphan rows (no
+        callers) in the curated view; slice 5's decision tree
+        falls back to ReplicatedStorage. A warning is logged per
+        collision.
 
-        Slice 3 round 1 — Claude P1-1: surfaces the underlying defect
-        (dependency_map's keyspace is class_name, not script_id)
-        rather than silently mis-routing edges.
-
-        Refs: build_topology.py invariant 9 block; Phase 2a slice 3
-        round 1 review.
+        Refs: build_topology._detect_caller_graph_collisions;
+        Phase 2a slice 3 round 2 review.
         """
-        sr = _mk_artifact(modules={
-            "guid-first": _mk_module("Utils", "client"),
-            "guid-second": _mk_module(
-                "Utils", "client", class_name="Utils",
-            ),
-            "guid-caller": _mk_module("Caller", "client"),
-        })
-        # Utils now in dep_map as a callee — the collision matters.
-        with pytest.raises(TopologyInvariantError) as excinfo:
-            build_topology(
-                scene_runtime=sr,
-                emitted_animations=[],
-                scripts_by_class={},
-                dependency_map={"Caller": ["Utils"]},
-            )
-        msg = str(excinfo.value)
-        assert "invariant 9" in msg
-        assert "Utils" in msg
-
-    def test_invariant_9_collision_not_in_dep_map_does_not_abort(
-        self,
-    ) -> None:
-        """Collision that doesn't affect dependency_map is harmless and
-        does NOT trip invariant 9 — the lossy translation only matters
-        when the colliding name is actually used as a caller or
-        callee."""
+        import logging
         sr = _mk_artifact(modules={
             "guid-first": _mk_module("Utils", "client"),
             "guid-second": _mk_module(
@@ -1823,8 +1799,70 @@ class TestCallerGraphCuration:
             "guid-caller": _mk_module("Caller", "client"),
             "guid-target": _mk_module("Target", "client"),
         })
-        # `Utils` is colliding but not in dep_map — invariant 9 lets it
-        # pass; caller_graph just doesn't reference Utils.
+        caplog.set_level(
+            logging.WARNING,
+            logger="converter.scene_runtime_topology.build_topology",
+        )
+        # Caller→Utils (collision touch) + Caller→Target (no collision).
+        # Build should succeed; only the non-colliding edge should land
+        # in the graph.
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={},
+            dependency_map={"Caller": ["Utils", "Target"]},
+        )
+        # Utils collision excluded; Target edge preserved.
+        assert artifact["caller_graph"] == {
+            "guid-target": ["guid-caller"],
+        }
+        # Warning logged with the offending class_name + remediation.
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+        ]
+        assert any("Utils" in r.getMessage() for r in warnings), (
+            f"expected warning naming the colliding class: {warnings!r}"
+        )
+
+    def test_class_name_collision_as_caller_also_excluded(
+        self,
+    ) -> None:
+        """The exclusion applies symmetrically: a colliding class as
+        the CALLER side of dependency_map is also skipped (we can't
+        determine which Utils script_id authored the edge)."""
+        sr = _mk_artifact(modules={
+            "guid-first": _mk_module("Utils", "client"),
+            "guid-second": _mk_module(
+                "Utils", "client", class_name="Utils",
+            ),
+            "guid-target": _mk_module("Target", "client"),
+        })
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={},
+            dependency_map={"Utils": ["Target"]},
+        )
+        # No edges in caller_graph — Utils caller is excluded.
+        assert artifact["caller_graph"] == {}
+
+    def test_collision_not_in_dep_map_is_harmless(self) -> None:
+        """Collision that doesn't affect dependency_map is harmless
+        and produces no warning + no exclusion — the lossy translation
+        only matters when the colliding name is actually used.
+
+        Slice 3 round 2 refinement of the round 1 invariant 9 test.
+        """
+        sr = _mk_artifact(modules={
+            "guid-first": _mk_module("Utils", "client"),
+            "guid-second": _mk_module(
+                "Utils", "client", class_name="Utils",
+            ),
+            "guid-caller": _mk_module("Caller", "client"),
+            "guid-target": _mk_module("Target", "client"),
+        })
+        # `Utils` colliding but not in dep_map — no exclusion.
         artifact = build_topology(
             scene_runtime=sr,
             emitted_animations=[],
