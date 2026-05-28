@@ -663,6 +663,71 @@ class TestTopologyInvariants:
         )
         assert "guid-helper" in artifact["modules"]
 
+    def test_backfill_lifecycle_role_inputs_unblocks_resumed_pre_slice2_plan(
+        self,
+    ) -> None:
+        """The migration helper makes a pre-slice-2 scene_runtime artifact
+        invariant-7-clean. Replicates the user-resume scenario the Claude
+        review (round 2 on slice 2) flagged as P1: an on-disk plan
+        without the two new fields would otherwise hard-abort when
+        build_topology runs.
+
+        Verifies single-source-of-truth: `is_loader` is derived from the
+        same REPLICATED_FIRST_HINTS regex the planner uses, so a backfill
+        of a 'Loader.cs' stem produces is_loader=True (matches what a
+        fresh replan would emit on the same project). Pairs that
+        bool with a LocalScript script-class binding so
+        ``derive_module_lifecycle_role`` returns ``"loader"`` (the
+        ModuleScript path correctly falls through to ``"requireable"``
+        per the codex P2 gate — covered separately in
+        ``TestLifecycleRoleDerivation``).
+
+        Refs: scene_runtime_planner.backfill_lifecycle_role_inputs;
+        pipeline._classify_storage call site.
+        """
+        from converter.scene_runtime_planner import (
+            backfill_lifecycle_role_inputs,
+        )
+        # Pre-slice-2 shape: runtime_bearing module without the new keys.
+        # `LevelLoader` matches REPLICATED_FIRST_HINTS, so the backfill
+        # should stamp is_loader=True.
+        sr = _mk_artifact(modules={
+            "guid-x": {
+                "stem": "LevelLoader",
+                "class_name": "LevelLoader",
+                "runtime_bearing": True,
+                "domain": "client",
+            },
+            "guid-helper": {
+                # Non-runtime-bearing row — backfill must skip it.
+                "stem": "Helper", "class_name": "Helper",
+                "runtime_bearing": False,
+            },
+        })
+        count = backfill_lifecycle_role_inputs(cast("dict", sr))
+        assert count == 1  # Only the runtime_bearing row mutated.
+        runtime_row = sr["modules"]["guid-x"]  # type: ignore[index]
+        assert runtime_row["character_attached"] is False
+        assert runtime_row["is_loader"] is True  # regex matched on 'Loader'
+        # Non-runtime-bearing row untouched.
+        helper_row = sr["modules"]["guid-helper"]  # type: ignore[index]
+        assert "character_attached" not in helper_row
+        assert "is_loader" not in helper_row
+        # And the now-backfilled artifact survives invariant 7.
+        # Pair with a LocalScript binding so lifecycle_role derives
+        # to "loader" (the executable-script branch).
+        scripts_by_class = {
+            "LevelLoader": _mk_rbx_script("LevelLoader", "LocalScript"),
+        }
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class=scripts_by_class,
+        )
+        assert artifact["modules"]["guid-x"]["lifecycle_role"] == "loader"
+        # Idempotent: re-running the backfill yields 0 mutations.
+        assert backfill_lifecycle_role_inputs(cast("dict", sr)) == 0
+
 
 # ===========================================================================
 # CATEGORY 3: routing_status path coverage
@@ -911,12 +976,39 @@ class TestLifecycleRoleDerivation:
         assert role == "character_attached"
 
     def test_loader_wins_over_script_class(self) -> None:
-        """``is_loader=True`` overrides class-driven defaults."""
+        """``is_loader=True`` overrides class-driven defaults for
+        ``Script`` / ``LocalScript`` — ReplicatedFirst placement assumes
+        the script auto-runs."""
         role = derive_module_lifecycle_role(
             domain="client", script_class="LocalScript",
             character_attached=False, is_loader=True,
         )
         assert role == "loader"
+
+    def test_is_loader_with_module_script_falls_through_to_requireable(
+        self,
+    ) -> None:
+        """``is_loader=True`` does NOT promote a ``ModuleScript`` to
+        ``"loader"``. A ModuleScript can't auto-run, so ReplicatedFirst
+        placement is meaningless for it — matches
+        ``storage_classifier._decide_script_container``'s explicit
+        ``script_type != "ModuleScript"`` gate.
+
+        Without this gate the topology row's ``lifecycle_role`` would
+        disagree with what storage_classifier actually places (codex
+        review 2026-05-28 P2 on slice 2: a ``LoadingUtils`` helper
+        required by a real Loader script lands in ReplicatedStorage
+        under the storage path, but the topology row would have
+        emitted ``lifecycle_role="loader"`` pre-gate).
+
+        Refs: lifecycle_roles.py:107-108 (gated branch);
+        storage_classifier.py:319 (the parallel gate).
+        """
+        role = derive_module_lifecycle_role(
+            domain="client", script_class="ModuleScript",
+            character_attached=False, is_loader=True,
+        )
+        assert role == "requireable"
 
     def test_local_script_routes_auto_run(self) -> None:
         role = derive_module_lifecycle_role(

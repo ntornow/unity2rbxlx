@@ -1105,6 +1105,63 @@ def _build_modules_table(
     return modules
 
 
+# ---------------------------------------------------------------------------
+# Artifact migration: pre-slice-2 plans lack `character_attached` /
+# `is_loader` on their `runtime_bearing` rows. Applied to on-disk plans
+# on first read after slice 2 lands. Idempotent.
+# ---------------------------------------------------------------------------
+
+def backfill_lifecycle_role_inputs(scene_runtime: dict[str, object]) -> int:
+    """Stamp `character_attached` + `is_loader` on every runtime-bearing
+    module row that lacks them. Returns the count of rows mutated.
+
+    The use case is a user resuming a conversion whose
+    `conversion_context.json` was written by a pre-slice-2 converter.
+    Without this backfill, `build_topology`'s invariant 7 would
+    hard-abort the resume on every runtime-bearing module row that
+    lacks the two new keys (Claude review 2026-05-28 P1).
+
+    Migration semantics (single-source-of-truth with the planner):
+      - `is_loader` is derived from ``REPLICATED_FIRST_HINTS`` on the
+        stem — the same rule ``_build_modules_table`` uses at planner
+        construction time. Drift between this backfill and the planner
+        would mean a resumed run's modules disagree with a freshly
+        replanned run on identical stems.
+      - `character_attached` defaults to False. Slice 5 plumbs the
+        real signal from scene_converter's player-character walk; in
+        the meantime, False is the same value the planner stamps for
+        every row today, so the backfill is behavior-neutral relative
+        to a planner re-run on the same project.
+
+    Non-runtime-bearing rows are exempt from invariant 7 and are not
+    touched. Already-stamped rows are not touched (idempotent —
+    re-running this backfill yields 0).
+    """
+    modules_obj = scene_runtime.get("modules", {})
+    if not isinstance(modules_obj, dict):
+        return 0
+    count = 0
+    for module in modules_obj.values():
+        if not isinstance(module, dict):
+            continue
+        if not bool(module.get("runtime_bearing", False)):
+            continue
+        mutated = False
+        if "is_loader" not in module:
+            stem_obj = module.get("stem", "")
+            stem = stem_obj if isinstance(stem_obj, str) else ""
+            module["is_loader"] = bool(
+                REPLICATED_FIRST_HINTS.search(stem),
+            )
+            mutated = True
+        if "character_attached" not in module:
+            module["character_attached"] = False
+            mutated = True
+        if mutated:
+            count += 1
+    return count
+
+
 # Unity component base classes. A script extending any of these (directly
 # or transitively) is a component and must convert host-bound, never legacy.
 # ``NetworkBehaviour`` covers Mirror / legacy UNet networked components.

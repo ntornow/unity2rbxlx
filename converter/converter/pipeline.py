@@ -3991,10 +3991,22 @@ script.Disabled = true
                 classify_scene_runtime_domains,
                 migrate_legacy_domain_values,
             )
+            from converter.scene_runtime_planner import (
+                backfill_lifecycle_role_inputs,
+            )
             # Migrate any pre-v2 ``"legacy"`` domain values lurking in the
             # on-disk plan we just merged (the on-disk plan may have been
             # produced by an older converter run). Idempotent.
             migrate_legacy_domain_values(cast("dict", scene_runtime))
+            # Phase 2a slice 2: backfill ``character_attached`` /
+            # ``is_loader`` on runtime-bearing module rows that pre-date
+            # slice 2. Without this, a user resuming a pre-slice-2
+            # conversion hits ``build_topology`` invariant 7 on every
+            # runtime-bearing row. The backfill uses the same
+            # ``REPLICATED_FIRST_HINTS`` regex the planner stamps with,
+            # so a resume produces the same artifact a fresh replan
+            # would. Idempotent.
+            backfill_lifecycle_role_inputs(cast("dict", scene_runtime))
             networking = getattr(self.ctx, "networking_mode", "none")
             strict = bool(getattr(self.ctx, "strict_classification", False))
             report = classify_scene_runtime_domains(
