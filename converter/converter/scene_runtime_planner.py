@@ -1238,6 +1238,125 @@ def build_scripts_by_class_name(
 
 
 # ---------------------------------------------------------------------------
+# Intrinsic script_class derivation (Phase 2a slice 5 step 1).
+#
+# The cycle this breaks: pre-slice-5, ``build_topology._build_modules_block``
+# read ``RbxScript.script_type`` AFTER ``storage_classifier.classify_storage``
+# had mutated it (the LocalScript-in-SSS coercion + StarterPlayerScripts /
+# StarterCharacterScripts post-pass at ``storage_classifier.py:185-194``).
+# That made topology a DOWNSTREAM consumer of storage routing — but the
+# design contract has topology AUTHORITY over storage. Slice 5 reorders
+# the pipeline so topology runs FIRST; this helper centralizes the
+# script_class signal so the contract is explicit and the read site is
+# guarded by a named contract rather than relying on positional pipeline
+# ordering alone.
+# ---------------------------------------------------------------------------
+
+def derive_intrinsic_script_class(script: RbxScript | None) -> str:
+    """Return the intrinsic Roblox script class for ``script``.
+
+    "Intrinsic" means the value derived purely from the C# source by
+    ``code_transpiler._classify_script_type`` (Script / LocalScript /
+    ModuleScript). At pipeline call sites BEFORE
+    ``storage_classifier.classify_storage`` runs, ``RbxScript.script_type``
+    still holds that intrinsic value — no other code path mutates the
+    field between transpile and classify.
+
+    Pre-slice-5 ``_build_modules_block`` read ``script.script_type``
+    directly. It worked because build_topology ran AFTER the classifier
+    inside ``_classify_storage`` — but it CONFLATED two readings: the
+    intrinsic C# signal and the post-coercion routing artefact. Slice 5
+    reorders the pipeline so build_topology runs BEFORE the classifier
+    mutation pass, and consumers go through this helper so the
+    contract is named ("intrinsic") rather than incidental ("whatever
+    script_type happens to hold at call time").
+
+    Returns ``"ModuleScript"`` when ``script`` is ``None`` or when its
+    ``script_type`` is empty/missing. Same safe default as the
+    pre-slice-5 inline derivation (``build_topology.py:534-537``).
+    """
+    if script is None:
+        return "ModuleScript"
+    intrinsic = script.script_type
+    if not intrinsic:
+        return "ModuleScript"
+    return intrinsic
+
+
+# ---------------------------------------------------------------------------
+# Topology join helper: RbxScript → script_id (Phase 2a slice 5 step 3).
+#
+# Slice 6 will need to look up a ``TopologyModuleEntry`` from an
+# ``RbxScript`` (the storage-classifier decision tree iterates RbxScripts
+# but topology is keyed by script_id). The class_name keyspace is the
+# canonical join channel (same one ``build_scripts_by_class_name`` uses
+# in reverse). This helper builds the FORWARD index so slice 6 can do
+# ``script_id_by_name[s.name]`` → topology entry in one hop.
+# ---------------------------------------------------------------------------
+
+def build_script_id_by_name(
+    scripts: list[RbxScript],
+    modules: dict[str, "SceneRuntimeModule | dict[str, object]"],
+) -> dict[str, str]:
+    """Build a ``script.name -> script_id`` index via the canonical
+    class_name join (primary-then-fallback), with collision exclusion.
+
+    Mirrors ``build_scripts_by_class_name`` (which produces the reverse
+    direction). Both consume ``compute_class_name_collisions`` so the
+    degraded-service contract stays uniform: a class_name shared by
+    two modules excludes BOTH from the index. The consumer (slice 6's
+    ``_decide_script_container_from_topology``) falls through to its
+    orphan-routing branch when ``script_id_by_name.get(script.name)``
+    returns ``None``.
+
+    The join uses the SAME primary-then-fallback rule as
+    ``build_scripts_by_class_name``:
+      1. Primary join: ``script.name == module.class_name``.
+      2. Fallback join: ``script.name == module.stem`` (C# class name
+         differs from file stem — e.g. ``Bootstrap.cs`` contains
+         ``class GameInit``).
+
+    Scripts with empty ``name`` are skipped (cannot be addressed via
+    the join). Scripts not present in any ``modules`` row are also
+    omitted — the consumer treats them as orphans.
+    """
+    # Forward index from class_name + stem to script_id, with the same
+    # collision-exclusion contract.
+    colliding_class_names = compute_class_name_collisions(modules)
+    script_id_by_class_name: dict[str, str] = {}
+    script_id_by_stem: dict[str, str] = {}
+    for script_id, module in modules.items():
+        if not isinstance(module, dict):
+            continue
+        cn_obj = module.get("class_name", "")
+        cn = cn_obj if isinstance(cn_obj, str) else ""
+        if cn and cn not in colliding_class_names:
+            # FIRST-WRITE wins — the colliding-class set has already
+            # excluded ambiguous keys, so any remaining duplicates are
+            # benign (e.g. multiple references to the same canonical row).
+            script_id_by_class_name.setdefault(cn, script_id)
+        stem_obj = module.get("stem", "")
+        stem = stem_obj if isinstance(stem_obj, str) else ""
+        if stem and stem != cn:
+            # Stem-fallback index. Skip when stem == class_name (the
+            # primary index already covers it).
+            script_id_by_stem.setdefault(stem, script_id)
+
+    out: dict[str, str] = {}
+    for s in scripts:
+        if not s.name:
+            continue
+        # Primary lookup: script.name as class_name.
+        sid = script_id_by_class_name.get(s.name)
+        if sid is None:
+            # Fallback lookup: script.name as stem.
+            sid = script_id_by_stem.get(s.name)
+        if sid is not None:
+            out[s.name] = sid
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Artifact migration: pre-slice-2 plans lack `character_attached` /
 # `is_loader` on their `runtime_bearing` rows. Applied to on-disk plans
 # on first read after slice 2 lands. Idempotent.

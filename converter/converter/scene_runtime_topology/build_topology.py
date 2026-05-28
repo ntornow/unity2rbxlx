@@ -111,7 +111,15 @@ from typing import TypedDict, cast
 from core.roblox_types import RbxScript
 from core.unity_types import GuidIndex
 
-from converter.scene_runtime_planner import SceneRuntimeArtifact
+# Phase 2a slice 5 step 1: script_class derivation is centralized in
+# ``scene_runtime_planner.derive_intrinsic_script_class`` so the helper's
+# docstring documents the "intrinsic = pre-classifier" contract. Pre-
+# slice-5 the inline derivation read ``RbxScript.script_type`` directly,
+# which silently coupled topology to the classifier's coercion pass.
+from converter.scene_runtime_planner import (
+    SceneRuntimeArtifact,
+    derive_intrinsic_script_class,
+)
 from converter.scene_runtime_topology.animation_routing import (
     AnimationDomain,
     AnimationDriverEntry,
@@ -501,11 +509,16 @@ def _build_modules_block(
 ) -> dict[str, TopologyModuleEntry]:
     """One TopologyModuleEntry per ``scene_runtime.modules`` row.
 
-    ``script_class`` reads off ``RbxScript.script_type`` when an emitted
-    script exists for the module's class_name. Helpers without an
-    emitted script (the planner records them but storage_classifier
-    didn't synthesize a body) default to ``"ModuleScript"`` — they're
-    require-target shape.
+    ``script_class`` reads through
+    ``scene_runtime_planner.derive_intrinsic_script_class`` (Phase 2a
+    slice 5 step 1): the intrinsic (pre-classifier) C# code-analysis
+    signal set by ``code_transpiler._classify_script_type``. The
+    pipeline contract is that build_topology runs BEFORE
+    ``storage_classifier.classify_storage``'s post-pass mutations, so
+    ``RbxScript.script_type`` still carries the intrinsic value at this
+    read site. Helpers without an emitted script (the planner records
+    them but storage_classifier didn't synthesize a body) default to
+    ``"ModuleScript"`` — they're require-target shape.
 
     ``lifecycle_role`` derives from domain + script_class +
     character_attached + is_loader via ``derive_module_lifecycle_role``.
@@ -530,11 +543,17 @@ def _build_modules_block(
         domain_obj = module.get("domain", "")
         domain = domain_obj if isinstance(domain_obj, str) else ""
 
+        # Phase 2a slice 5 step 1: read ``script_class`` through the
+        # centralized helper. The helper documents the "intrinsic =
+        # pre-classifier" contract so the read site is guarded by a
+        # named contract rather than relying on positional pipeline
+        # ordering alone. Behaviorally identical to the pre-slice-5
+        # inline form (``script.script_type`` when set, else
+        # ``"ModuleScript"``) — the contract change is structural, not
+        # observable in the artifact for callers that respect the
+        # ordering invariant.
         script = scripts_by_class.get(class_name)
-        if script is not None and script.script_type:
-            script_class = script.script_type
-        else:
-            script_class = "ModuleScript"
+        script_class = derive_intrinsic_script_class(script)
 
         # Phase 2a slice 2: read lifecycle-role inputs from the planner
         # row. `bool(module.get(..., False))` is defensive against
