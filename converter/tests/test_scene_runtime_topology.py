@@ -663,6 +663,123 @@ class TestTopologyInvariants:
         )
         assert "guid-helper" in artifact["modules"]
 
+    def test_invariant_8_loader_role_with_false_is_loader_aborts(
+        self,
+    ) -> None:
+        """``lifecycle_role="loader"`` with ``is_loader=False`` is
+        structurally impossible from `derive_module_lifecycle_role` but
+        an external-provenance artifact (hand-edited plan, future
+        derivation regression) could produce it. Invariant 8 catches
+        that drift.
+
+        Refs: build_topology.py invariant 8 block; Phase 2a slice 2
+        round 3.
+        """
+        from converter.scene_runtime_topology.build_topology import (
+            _enforce_invariants,
+        )
+        artifact = {
+            "modules": {
+                "guid-x": {
+                    "stem": "Loader", "domain": "client",
+                    "script_class": "LocalScript",
+                    "lifecycle_role": "loader",
+                    "character_attached": False,
+                    "is_loader": False,  # contradicts the role
+                    "bridge_group_id": None,
+                    "provenance": {},
+                },
+            },
+            "animation_drivers": {},
+            "cross_domain_edges": [],
+        }
+        with pytest.raises(TopologyInvariantError) as excinfo:
+            _enforce_invariants(
+                cast("dict", artifact),
+                emitted_animations=[],
+                scene_runtime=_mk_artifact(modules={
+                    "guid-x": _mk_module(
+                        "Loader", "client", is_loader=False,
+                    ),
+                }),
+            )
+        msg = str(excinfo.value)
+        assert "invariant 8" in msg
+        assert "is_loader=False" in msg
+
+    def test_invariant_8_loader_role_with_server_domain_aborts(
+        self,
+    ) -> None:
+        """A "loader" role on a server-domain module violates
+        invariant 8: ReplicatedFirst is client-only by definition."""
+        from converter.scene_runtime_topology.build_topology import (
+            _enforce_invariants,
+        )
+        artifact = {
+            "modules": {
+                "guid-x": {
+                    "stem": "Loader", "domain": "server",
+                    "script_class": "Script",
+                    "lifecycle_role": "loader",
+                    "character_attached": False,
+                    "is_loader": True,
+                    "bridge_group_id": None,
+                    "provenance": {},
+                },
+            },
+            "animation_drivers": {},
+            "cross_domain_edges": [],
+        }
+        with pytest.raises(TopologyInvariantError) as excinfo:
+            _enforce_invariants(
+                cast("dict", artifact),
+                emitted_animations=[],
+                scene_runtime=_mk_artifact(modules={
+                    "guid-x": _mk_module(
+                        "Loader", "server", is_loader=True,
+                    ),
+                }),
+            )
+        msg = str(excinfo.value)
+        assert "invariant 8" in msg
+        assert "client-domain" in msg
+
+    def test_invariant_8_allows_is_loader_true_with_auto_run_role(
+        self,
+    ) -> None:
+        """The deliberate raw-hint-vs-gated-decision divergence:
+        ``is_loader=True`` may legitimately coexist with
+        ``lifecycle_role="auto_run"`` when a gate fires (e.g. a
+        server-domain script whose stem matches the loader regex).
+        Invariant 8 only enforces ONE direction — `loader → bools`,
+        not `bool → loader`.
+
+        Refs: TopologyModuleEntry field-semantic contract docstring;
+        build_topology.py invariant 8.
+        """
+        # Server-domain "BootstrapServer.cs" matches REPLICATED_FIRST_HINTS
+        # but the loader gate drops it (domain != "client"), so the role
+        # falls through to "auto_run". The raw is_loader=True remains on
+        # the topology entry as audit info.
+        sr = _mk_artifact(modules={
+            "guid-srv": _mk_module(
+                "BootstrapServer", "server", is_loader=True,
+            ),
+        })
+        scripts_by_class = {
+            "BootstrapServer": _mk_rbx_script(
+                "BootstrapServer", "Script",
+            ),
+        }
+        # Should NOT raise. Build + assert the deliberate divergence.
+        artifact = build_topology(
+            scene_runtime=sr, emitted_animations=[],
+            scripts_by_class=scripts_by_class,
+        )
+        entry = artifact["modules"]["guid-srv"]
+        assert entry["is_loader"] is True
+        assert entry["lifecycle_role"] == "auto_run"
+
     def test_backfill_lifecycle_role_inputs_unblocks_resumed_pre_slice2_plan(
         self,
     ) -> None:

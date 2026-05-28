@@ -43,6 +43,22 @@ Phase 1 invariants (per design doc §"topology artifact" + the review's
      bypass the planner — without it, lifecycle_role derivation
      silently defaults the missing inputs to False and the topology
      row misrepresents the underlying script.
+  8. ``lifecycle_role`` is consistent with the gated inputs on every
+     ``modules`` entry (Phase 2a slice 2 round 3). One-way implications:
+       - ``lifecycle_role == "loader"`` ⇒ ``is_loader == True`` AND
+         ``script_class in {"Script", "LocalScript"}`` AND
+         ``domain == "client"`` (matches the gate inside
+         ``derive_module_lifecycle_role``).
+       - ``lifecycle_role == "character_attached"`` ⇒
+         ``character_attached == True`` AND ``domain == "client"``.
+     The opposite direction is NOT required: ``is_loader=True`` may
+     legitimately coexist with ``lifecycle_role != "loader"`` when one
+     of the gates fired (e.g. a server-domain loader-named script is
+     auto_run, not loader — the bool preserves the raw planner
+     observation while the role is the gated decision). Slice 2 round
+     3 added this invariant so a future change to
+     ``derive_module_lifecycle_role`` can't silently produce a
+     "loader" role on a server-domain module.
 """
 
 from __future__ import annotations
@@ -159,16 +175,46 @@ class TopologyModuleEntry(TypedDict, total=False):
     Distinct from ``SceneRuntimeModule`` (the planner's per-module row
     on ``scene_runtime.modules``): planner row is structural facts about
     the script's instances and dependencies; topology row is the
-    placement decision. They share ``stem`` + ``domain`` +
-    ``character_attached`` + ``is_loader`` (mirrored from planner) and
-    diverge on the derived fields.
+    placement decision plus its provenance.
+
+    **Field-semantic contract (Phase 2a slice 2 round 3):**
+
+    ``character_attached`` and ``is_loader`` on the topology entry are
+    **raw planner hints**, mirrored verbatim from the planner row. They
+    are the OBSERVATIONS the planner made (a name match against
+    `REPLICATED_FIRST_HINTS`, a scene_converter character-attachment
+    flag in slice 5+). They are NOT post-derivation effective values.
+
+    ``lifecycle_role`` is the **gated decision** the topology layer
+    produces by feeding the bools + ``domain`` + ``script_class`` into
+    ``derive_module_lifecycle_role``. Three gates apply:
+      - ``character_attached`` honored only when ``domain == "client"``
+      - ``is_loader`` honored only when ``domain == "client"`` AND
+        ``script_class in {"Script", "LocalScript"}``
+      - Both fall through to the class-driven default when their gate
+        fires (``auto_run`` for Script/LocalScript, ``requireable`` for
+        ModuleScript)
+
+    Consequence: a topology row CAN have ``is_loader=True`` but
+    ``lifecycle_role`` other than ``"loader"`` — e.g. a
+    server-domain ``BootstrapServer.cs`` will have
+    ``is_loader=True, lifecycle_role="auto_run"``. This is **deliberate
+    and documented**: the bool preserves the audit trail of what the
+    planner observed; lifecycle_role is what the runtime should do.
+    The divergence is a feature, not a bug — slice 5's storage_classifier
+    rewrite reads ``lifecycle_role`` for placement, NOT the raw bools.
+
+    Invariant 8 (slice 2 round 3) pins the one-way implication so a
+    future derivation change can't silently break the relationship:
+    ``lifecycle_role == "loader"`` implies the gated bools were all
+    truthy at derivation time, and ditto for
+    ``lifecycle_role == "character_attached"``.
 
     Phase 1 populates: ``stem``, ``domain``, ``script_class``,
     ``lifecycle_role``, ``provenance``. Phase 2a slice 2 adds
-    ``character_attached`` + ``is_loader`` (mirrored from planner so
-    slice 5's storage_classifier rewrite reads a single canonical
-    surface). ``bridge_group_id`` is populated when the module
-    participates in a cross-domain edge; otherwise ``None``.
+    ``character_attached`` + ``is_loader``. ``bridge_group_id`` is
+    populated when the module participates in a cross-domain edge;
+    otherwise ``None``.
     """
 
     stem: str
@@ -634,6 +680,62 @@ def _enforce_invariants(
                 f"found in cross_domain_edges ids {sorted(edge_ids)!r}",
                 row=entry,
             )
+
+    # Invariant 8 (Phase 2a slice 2 round 3): lifecycle_role
+    # consistent with gated inputs. One-way implication: if the role
+    # is "loader" or "character_attached", the inputs that produced it
+    # must satisfy the gates inside derive_module_lifecycle_role.
+    # The OPPOSITE direction is NOT enforced — `is_loader=True` may
+    # coexist with `lifecycle_role != "loader"` when a gate fired
+    # (this is the deliberate raw-hint-vs-gated-decision divergence
+    # documented on TopologyModuleEntry).
+    for guid, mod_entry in modules_block.items():
+        role = mod_entry.get("lifecycle_role", "")
+        if role == "loader":
+            if not mod_entry.get("is_loader", False):
+                _abort(
+                    8,
+                    f"module {guid!r} has lifecycle_role='loader' but "
+                    f"is_loader=False — derive_module_lifecycle_role's "
+                    f"loader branch requires is_loader=True",
+                    row=mod_entry,
+                )
+            sc = mod_entry.get("script_class", "")
+            if sc not in ("Script", "LocalScript"):
+                _abort(
+                    8,
+                    f"module {guid!r} has lifecycle_role='loader' but "
+                    f"script_class={sc!r} — only Script/LocalScript "
+                    f"can be loaders",
+                    row=mod_entry,
+                )
+            if mod_entry.get("domain", "") != "client":
+                _abort(
+                    8,
+                    f"module {guid!r} has lifecycle_role='loader' but "
+                    f"domain={mod_entry.get('domain', '')!r} — "
+                    f"loaders are always client-domain",
+                    row=mod_entry,
+                )
+        elif role == "character_attached":
+            if not mod_entry.get("character_attached", False):
+                _abort(
+                    8,
+                    f"module {guid!r} has "
+                    f"lifecycle_role='character_attached' but "
+                    f"character_attached=False",
+                    row=mod_entry,
+                )
+            if mod_entry.get("domain", "") != "client":
+                _abort(
+                    8,
+                    f"module {guid!r} has "
+                    f"lifecycle_role='character_attached' but "
+                    f"domain={mod_entry.get('domain', '')!r} — "
+                    f"character-attached scripts are always "
+                    f"client-domain",
+                    row=mod_entry,
+                )
 
     # Invariant 7 (Phase 2a slice 2): every runtime-bearing planner row
     # must carry both `character_attached` and `is_loader` booleans.
