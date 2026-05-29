@@ -606,20 +606,40 @@ re-planned 2026-05-30 after the slice 8 arch review found the original
       `scripts == []` check above `assert topology_inputs is not None`
       at the new call site, OR conditional the assert.
 
-    After slice 9b, slice 10 can delete the
-    `_stamp_container_and_path` writes at
-    `module_domain.py:880, 886, 891` (the writers of the removed
-    field).
+    After slice 9b, slice 10 inherits a **two-ended** scope (NOT just
+    write-deletion as originally framed): see the slice 10 entry below.
 
     Estimated 2-3 review rounds; net diff likely slightly negative
     (more deletions than additions).
 
-- **Slice 10** (after slice 9): delete the three `_stamp_container_and_path`
-  placement-mutation call sites at
-  `scene_runtime_topology/module_domain.py:880, 886, 891`. Depends on
-  slice 9 (`build_topology` no longer reads the stamped fields). The
-  function itself can stay or be deleted; the goal is to remove the
-  side-effect mutations.
+- **Slice 10** (after slice 9): **two-ended**, not just write-deletion.
+  Both slice 9b reviewers (Claude + Codex) and the implementer
+  independently identified that `build_topology._build_modules_block:629`
+  STILL reads `domain_signals["reachability_forced_container"]`
+  (the planner-row audit signal) as the SOURCE for the surviving
+  `reachability_required_container` field on `TopologyModuleEntry`.
+  Slice 10 must therefore:
+
+    1. **Switch the read site** at `_build_modules_block:629` from
+       `domain_signals["reachability_forced_container"]` to a different
+       source. Options to be picked by slice 10's arch review:
+       - **Option a:** read from `module_row["container"]` if it
+         already captures the needed semantic.
+       - **Option b:** recompute from `reachability_requirements[sid]`
+         (which is the underlying analysis output anyway).
+    2. **Then retire the writes** of the planner-row audit signal at
+       `scene_runtime_topology/module_domain.py:955` and `:1743`
+       (formerly numbered `:880, :886, :891` pre-slice-9b). The order
+       matters: switching the read MUST land before deleting the writes,
+       otherwise the surviving `reachability_required_container` field
+       loses its source.
+    3. **Migrate external tests** that assert the planner-row audit
+       signal directly: `test_module_domain_prepass.py:1184`,
+       `test_scene_runtime_domain.py:347`,
+       `test_scene_runtime_domain_v2.py:712`. They'll need migration or
+       deletion depending on what slice 10's arch review picks for #1.
+
+  Depends on slice 9b (the field is dropped from `TopologyModuleEntry`).
 
 - **Slice 11** (last): final test migration. Sweep remaining tests that
   assert pre-Phase-2a behavior or rely on the late stamping. Must come
@@ -874,6 +894,16 @@ while the topology work is multi-PR.
 
 ## Revision history
 
+- **2026-05-30** — slice 10 scope expanded after slice 9b R1 review:
+  both reviewers (Claude + Codex) and the implementer independently
+  identified that `_build_modules_block:629` still reads the
+  planner-row audit signal (`domain_signals["reachability_forced_container"]`)
+  as a source for the surviving topology-entry field
+  (`reachability_required_container`). Slice 10 is now **two-ended**:
+  switch the read site first (to `module_row["container"]` or a
+  recompute from `reachability_requirements[sid]`), then retire the
+  writes at `module_domain.py:955` and `:1743`. Original framing
+  ("slice 10 can delete the writes") was too optimistic.
 - **2026-05-30** — slice 9b path chosen: Option C (drop
   `reachability_forced_container`) after parallel Claude + Codex
   audits independently verified no production code uses the field for
