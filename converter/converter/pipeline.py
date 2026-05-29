@@ -3930,41 +3930,18 @@ script.Disabled = true
         output directory.
 
         Safe to call multiple times — the classifier is idempotent.
-
-        Phase 2a slice 5 step 2 ordering (the cycle break):
-
-          1. ``_merge_scene_runtime`` — load on-disk scene_runtime (sticky
-             ``domain_overrides`` + any prior topology).
-          2. ``_build_topology`` — build the topology artifact from
-             PRE-CLASSIFIER state. ``RbxScript.script_type`` still carries
-             the intrinsic value set by ``code_transpiler._classify_script_type``
-             (step 1's contract). Module ``domain`` is empty at this point —
-             animation_drivers built here become ``unresolved`` (they're
-             rebuilt in step 5 once domain is stamped).
-          3. ``classify_storage`` — the legacy regex-based routing pass.
-             Preserved unchanged until slice 6.
-          4. ``classify_scene_runtime_domains`` — stamps ``domain`` /
-             ``container`` / ``module_path`` on each module row.
-          5. ``_apply_topology_animation_routings`` — rebuild the topology
-             with post-classifier domain (so animation_drivers resolve
-             correctly), then apply the animation_drivers decisions to the
-             matching ``Anim_*`` RbxScripts + patch the storage_plan
-             buckets. Mirrors the pre-slice-5 ``_build_and_apply_topology``
-             apply-phase behavior.
-
-        The cycle break: in step 2, ``build_topology`` derives
-        ``script_class`` from intrinsic signals via
-        ``scene_runtime_planner.derive_intrinsic_script_class`` rather than
-        from the already-mutated ``RbxScript.script_type``. Slice 6's
-        decision tree will consume the step-2 (pre-classifier) artifact
-        so the storage decisions can branch on topology facts without
-        re-introducing the cycle.
         """
         if self.state.rbx_place is None or not self.state.rbx_place.scripts:
             return
 
         from converter.storage_classifier import classify_storage
         import json as _json
+
+        plan = classify_storage(
+            self.state.rbx_place.scripts,
+            dependency_map=self.state.dependency_map or None,
+        )
+        self.ctx.storage_plan = plan
 
         # Record each script's subdir so rehydration can route it back.
         script_paths: dict[str, str] = {}
@@ -3982,48 +3959,12 @@ script.Disabled = true
 
         plan_path = self.output_dir / "conversion_plan.json"
 
-        # Phase 2a slice 5 step 2: load scene_runtime + build topology
-        # BEFORE classify_storage runs. The topology built here reads
-        # PRE-classifier ``RbxScript.script_type`` (the intrinsic
-        # ``_classify_script_type`` output, never mutated by the
-        # classifier post-pass at storage_classifier.py:185-194). Module
-        # ``domain`` is empty at this point, so animation_drivers all
-        # land at ``routing_status="unresolved"`` — they're rebuilt in
-        # step 5 (``_apply_topology_animation_routings``) once the
-        # domain classifier has populated ``module["domain"]``.
+        # PR1 merge: the planner artifact stored on ``ctx.scene_runtime``
+        # (and any sticky ``domain_overrides`` an operator edited into a
+        # prior ``conversion_plan.json`` on disk) must survive this
+        # wholesale rewrite. Pre-PR1 ``_classify_storage`` emitted a fixed
+        # 3-key dict that silently dropped anything else.
         scene_runtime = self._merge_scene_runtime(plan_path)
-        topology_built = False
-        if (
-            self.ctx.scene_runtime_mode != "legacy"
-            and scene_runtime.get("modules")
-            and not scene_runtime.get("__skip_domain_classifier__")
-        ):
-            # Pre-classifier migration + backfill: these were previously
-            # called inside the gated block at line ~4041-4050, right
-            # before ``classify_scene_runtime_domains``. Slice 5 step 2
-            # moved the topology BUILD to run before
-            # ``classify_storage``; the build's invariant 7 requires
-            # ``character_attached`` / ``is_loader`` on every
-            # runtime-bearing planner row, so the backfill MUST run
-            # before the build. Idempotent — running them here AND in
-            # the later block at line ~4045 is fine (no-op on the
-            # second call).
-            from converter.scene_runtime_domain import (
-                migrate_legacy_domain_values,
-            )
-            from converter.scene_runtime_planner import (
-                backfill_lifecycle_role_inputs,
-            )
-            migrate_legacy_domain_values(cast("dict", scene_runtime))
-            backfill_lifecycle_role_inputs(cast("dict", scene_runtime))
-            self._build_topology(scene_runtime)
-            topology_built = True
-
-        plan = classify_storage(
-            self.state.rbx_place.scripts,
-            dependency_map=self.state.dependency_map or None,
-        )
-        self.ctx.storage_plan = plan
 
         # PR3b: stamp per-module ``domain`` / ``container`` / ``module_path``
         # / ``domain_signals`` once the storage classifier has finalized
@@ -4110,30 +4051,25 @@ script.Disabled = true
                     + violations
                 )
 
-            # Phase 2a slice 5 step 2: REBUILD the topology now that
-            # ``classify_scene_runtime_domains`` has stamped
-            # ``module[*].domain``. The first build (line ~4001) read
-            # PRE-classifier ``RbxScript.script_type`` for intrinsic
-            # ``script_class`` (correct per the cycle-break contract);
-            # this second build reads the same intrinsic value (the
-            # storage_classifier's post-pass at lines 185-194 mutates
-            # ``script_type`` ONLY for the small set of LocalScript-
-            # in-SSS / character-script edges — for the typical case
-            # the value is unchanged, and where it IS changed, the
-            # intrinsic value remains the authoritative reading per
-            # ``derive_intrinsic_script_class``'s contract) AND
-            # post-classifier ``module[*].domain``, so
-            # ``animation_drivers`` resolve correctly.
-            #
-            # The artifact again lands at ``scene_runtime["topology"]``,
-            # overwriting the step-2 pre-classifier artifact. Slice 6's
-            # decision tree consumer will read it at the step-2 point
-            # (before the rebuild) so its inputs are pure intrinsic.
+            # Scene-runtime topology (Phase 1, PR #148). Runs AFTER the
+            # classifier has populated ``modules[*].domain`` and BEFORE
+            # the on-disk plan is written. Consumes the per-emission
+            # rowset animation_converter accumulated + the script
+            # objects' final ``script_type`` to build the topology
+            # artifact, then applies the artifact's animation_drivers
+            # decisions to the corresponding ``Anim_*`` RbxScripts
+            # (script_type + parent_path) so the topology is the
+            # authority for animation placement.
             #
             # ``plan`` is passed so the same call can patch the legacy
             # storage_plan buckets in-place (move topology-flipped
-            # Anim_* names from server_scripts → client_scripts).
-            self._apply_topology_animation_routings(scene_runtime, plan)
+            # Anim_* names from server_scripts → client_scripts). This
+            # honors the design doc's §Migration discipline rule:
+            # "Each phase deletes the displaced logic in the same PR
+            # that wires the new consumer." Without this, the on-disk
+            # plan contradicts the live RbxScript metadata + the
+            # scene_runtime.topology block.
+            self._build_and_apply_topology(scene_runtime, plan)
 
         plan_path.write_text(
             _json.dumps({
@@ -4155,71 +4091,18 @@ script.Disabled = true
         scene_runtime: dict[str, object],
         plan: "StoragePlan",
     ) -> None:
-        """Pre-slice-5 entry point preserved as a thin compatibility
-        wrapper. Builds the topology AND applies animation_drivers
-        decisions in one call — the original Phase 1 (PR #148) shape.
+        """Phase 1, PR #148 of the scene-runtime topology authority refactor.
 
-        Slice 5 step 2 split the build (must run pre-classifier so
-        ``script_class`` is intrinsic) from the apply (must run
-        post-classifier so ``animation_drivers`` resolve). Inside
-        ``_classify_storage`` the pipeline calls them at the right
-        points; this wrapper preserves the single-call shape for
-        tests / external callers that drive both halves at once with a
-        scene_runtime that already carries classifier-stamped domain.
+        Build the topology artifact + apply its animation_drivers decisions
+        to the corresponding ``Anim_*`` RbxScripts. Called inside
+        ``_classify_storage`` AFTER ``classify_scene_runtime_domains``
+        populates module domains + BEFORE the on-disk plan is written.
 
-        Equivalent to ``_apply_topology_animation_routings`` —
-        ``_apply_topology_animation_routings`` itself rebuilds the
-        topology before applying, so calling the apply method is
-        sufficient.
-        """
-        self._apply_topology_animation_routings(scene_runtime, plan)
-
-    def _build_topology(
-        self,
-        scene_runtime: dict[str, object],
-    ) -> None:
-        """Phase 2a slice 5 step 2: build the topology artifact without
-        applying its animation_drivers decisions.
-
-        Called from ``_classify_storage`` at TWO call sites:
-
-          1. **Pre-classifier** (slice 5 cycle-break): BEFORE
-             ``classify_storage`` runs. At this call site,
-             ``RbxScript.script_type`` still carries the intrinsic value
-             set by ``code_transpiler._classify_script_type`` (no
-             classifier mutation has happened yet), so
-             ``derive_intrinsic_script_class`` reads the correct
-             contract. Module ``domain`` is empty at this point so
-             ``animation_drivers`` build as ``unresolved``.
-
-          2. **Post-classifier** (inside
-             ``_apply_topology_animation_routings``): after
-             ``classify_scene_runtime_domains`` has stamped
-             ``module[*].domain``, so ``resolve_driver`` finds the
-             driver module's runtime domain and ``animation_drivers``
-             rebuild as ``resolved``. The artifact overwrites
-             ``scene_runtime["topology"]`` and the apply step (the
-             second-call sibling) reads the rebuilt animation_drivers.
-
-        The two builds use the same intrinsic ``script_class`` reading
-        path (``derive_intrinsic_script_class``) so the field stays
-        stable across the two calls — that's the cycle break. Slice 6's
-        decision tree consumer reads the pre-classifier artifact (call
-        site 1), so its inputs are guaranteed pre-classifier.
-        """
-        if self.state.rbx_place is None:
-            return
-        self._build_topology_artifact(scene_runtime)
-
-    def _apply_topology_animation_routings(
-        self,
-        scene_runtime: dict[str, object],
-        plan: "StoragePlan",
-    ) -> None:
-        """Phase 2a slice 5 step 2 (apply phase). Rebuild the topology
-        with classifier-stamped ``module[*].domain`` and apply the
-        ``animation_drivers`` decisions to the matching ``Anim_*``
-        RbxScripts.
+        The artifact lands at ``scene_runtime["topology"]`` per design
+        doc open-question D4 (option b). Consumers should read through
+        this method's outputs / the package's accessor surface — not by
+        indexing the dict directly — so a future relocation to a
+        sidecar file is a one-file change.
 
         For each ``Anim_*`` script the topology returns a
         ``routing_status`` + ``script_class``. Resolved entries override
@@ -4237,25 +4120,139 @@ script.Disabled = true
         ("Each phase deletes the displaced logic in the same PR that
         wires the new consumer") for the Anim_* slice; non-animation
         scripts continue through classify_storage's regex pass until
-        slice 6 wires script_storage as a bound consumer.
-
-        Pre-slice-5 the build + apply were a single method
-        ``_build_and_apply_topology``; slice 5 split them so the BUILD
-        can happen pre-classifier (cycle break) while the APPLY stays
-        post-classifier (needs the storage_plan to patch buckets).
+        Phase 2a wires script_storage as a bound consumer.
         """
         if self.state.rbx_place is None:
             return
 
-        # Second build — now with classifier-stamped domain so
-        # ``resolve_driver`` finds drivers and ``animation_drivers``
-        # resolve correctly. Overwrites the pre-classifier artifact at
-        # ``scene_runtime["topology"]`` (slice 6 reads it BEFORE this
-        # overwrite at the pre-classifier call site, so its inputs are
-        # guaranteed pre-classifier).
-        artifact = self._build_topology_artifact(scene_runtime)
-        if artifact is None:
-            return
+        # Phase 2a slice 3 round 4 fix (Claude P1.A + P1.B): the
+        # round-3 "early return when animation_result is None" guard
+        # over-fired in two ways. (1) It fired on legitimate
+        # fresh-no-animations paths (--no-animations flag, projects
+        # without .anim files, test paths skipping convert_animations)
+        # and regressed slice 3 round 1's "topology always built"
+        # goal. (2) It preserved the WHOLE persisted topology on
+        # resume, including a now-stale caller_graph alongside a
+        # freshly-rebuilt state.dependency_map — silent divergence
+        # by construction.
+        #
+        # The structural fix is to ALWAYS rebuild modules + edges +
+        # caller_graph from current state, AND preserve the prior
+        # animation_drivers block ONLY when we lack fresh emission
+        # data. The prior topology block lives at
+        # ``scene_runtime["topology"]`` after ``_merge_scene_runtime``
+        # rehydrates it from a previous ``conversion_plan.json``;
+        # ``animation_result is None`` is the signal for "no fresh
+        # emissions available."
+        prior_topology = scene_runtime.get("topology", {})
+        if not isinstance(prior_topology, dict):
+            prior_topology = {}
+
+        if self.state.animation_result is not None:
+            # Fresh animation data available (covers fresh-with-anims
+            # AND fresh-no-anims — emitted_animations is just empty
+            # in the latter).
+            emitted_animations: list = list(
+                self.state.animation_result.emitted_animations,
+            )
+            preserved_animation_drivers = None
+        else:
+            # No fresh animation data this build. If the persisted
+            # topology has a prior animation_drivers block, preserve
+            # it; otherwise emit empty (first-time-no-anims resume).
+            emitted_animations = []
+            pad = prior_topology.get("animation_drivers", {})
+            preserved_animation_drivers = (
+                pad if isinstance(pad, dict) and pad else None
+            )
+
+        # Phase 2a slice 3 round 5 (codex P2): on
+        # assemble-without-retranspile workflows, ``transpile_scripts``
+        # doesn't rerun and ``state.dependency_map`` stays empty —
+        # preserve the prior ``caller_graph`` so we don't overwrite
+        # it with ``{}``.
+        #
+        # Round 6 (codex P2): use ``transpilation_result`` rather
+        # than the dep_map's truthiness as the "did transpile run
+        # this invocation?" signal. A genuine retranspile that
+        # removes the last cross-script reference ALSO leaves
+        # dep_map empty — using dep_map alone would silently carry
+        # forward stale callers in that case. ``transpilation_result``
+        # is set IFF transpile_scripts ran this invocation (both are
+        # populated in the same code path, pipeline.py:1942-1971);
+        # an empty dep_map alongside a populated transpilation_result
+        # is the legitimate "ran with no edges" case (use the empty
+        # fresh graph, don't preserve).
+        if self.state.transpilation_result is not None:
+            preserved_caller_graph = None
+        else:
+            pcg = prior_topology.get("caller_graph", {})
+            preserved_caller_graph = (
+                pcg if isinstance(pcg, dict) and pcg else None
+            )
+
+        from converter.scene_runtime_topology.build_topology import (
+            build_topology,
+        )
+
+        # Phase 2a slice 4 round 3 review (Claude P1.A): use the
+        # shared ``build_scripts_by_class_name`` helper so the
+        # pipeline + planner share ONE source of truth for the
+        # class_name → script join. Pre-fix the pipeline keyed by
+        # ``script.name`` (file stem) but downstream consumers
+        # (build_topology._build_modules_block) looked up via
+        # module rows' ``class_name`` — same name-vs-class-name
+        # conflation slice 4 round 2 fixed in the planner.
+        from converter.scene_runtime_planner import (
+            build_scripts_by_class_name,
+        )
+        modules_in = scene_runtime.get("modules", {}) or {}
+        scripts_by_class = build_scripts_by_class_name(
+            self.state.rbx_place.scripts,
+            cast("dict", modules_in),
+        )
+
+        try:
+            artifact = build_topology(
+                scene_runtime=cast(
+                    "SceneRuntimeArtifact", scene_runtime,
+                ),
+                emitted_animations=emitted_animations,
+                scripts_by_class=scripts_by_class,
+                guid_index=self.state.guid_index,
+                # Phase 2a slice 3: pass the planner's class-keyed
+                # dependency_map so build_topology can curate it into
+                # the artifact's `caller_graph` (script_id-keyed
+                # incoming-edge view). `None` is treated as empty
+                # graph — back-compat for callers pre-dating slice 3.
+                dependency_map=self.state.dependency_map or None,
+                # Phase 2a slice 3 round 4: preserve prior
+                # animation_drivers on resume / no-fresh-emissions
+                # builds (caller computed above). Build_topology
+                # uses the preserved block verbatim and skips
+                # invariant 3 — see its docstring for the contract.
+                preserved_animation_drivers=preserved_animation_drivers,
+                # Phase 2a slice 3 round 5: preserve prior
+                # caller_graph on assemble-no-retranspile workflows
+                # where state.dependency_map is empty. Without this
+                # the prior populated graph would be overwritten
+                # with {} on every assemble rerun.
+                preserved_caller_graph=preserved_caller_graph,
+            )
+        except Exception as exc:
+            # Topology invariants are fail-closed by design, but
+            # surfacing the exact context here helps an operator triage
+            # before the build aborts.
+            log.error(
+                "[topology] build_topology raised: %s — aborting build "
+                "before the on-disk plan is finalized.", exc,
+            )
+            raise
+
+        # Persist the artifact under the scene_runtime block. Consumers
+        # (animation_converter post-emission, contract_pipeline in
+        # Phase 3) read through this key.
+        scene_runtime["topology"] = cast("object", artifact)
 
         # Apply animation_drivers decisions to the matching Anim_*
         # RbxScripts. Today's _subphase_emit_scripts_to_disk created
@@ -4397,155 +4394,6 @@ script.Disabled = true
             skipped_unresolved, skipped_orphan,
             unmatched,
         )
-
-    def _build_topology_artifact(
-        self,
-        scene_runtime: dict[str, object],
-    ) -> "TopologyArtifact | None":
-        """Internal helper: assemble the topology artifact and persist
-        it to ``scene_runtime["topology"]``. Returns the artifact, or
-        ``None`` when state lacks the minimum inputs (no rbx_place).
-
-        Slice 5 step 2 split: this helper is called from BOTH the
-        pre-classifier ``_build_topology`` (cycle-break) and the
-        post-classifier ``_apply_topology_animation_routings`` (apply
-        phase). The first invocation captures intrinsic script_class
-        with empty module domain (animation_drivers all unresolved);
-        the second invocation overwrites with classifier-stamped
-        domain so animation_drivers resolve correctly.
-        """
-        if self.state.rbx_place is None:
-            return None
-
-        # Phase 2a slice 3 round 4 fix (Claude P1.A + P1.B): the
-        # round-3 "early return when animation_result is None" guard
-        # over-fired in two ways. (1) It fired on legitimate
-        # fresh-no-animations paths (--no-animations flag, projects
-        # without .anim files, test paths skipping convert_animations)
-        # and regressed slice 3 round 1's "topology always built"
-        # goal. (2) It preserved the WHOLE persisted topology on
-        # resume, including a now-stale caller_graph alongside a
-        # freshly-rebuilt state.dependency_map — silent divergence
-        # by construction.
-        #
-        # The structural fix is to ALWAYS rebuild modules + edges +
-        # caller_graph from current state, AND preserve the prior
-        # animation_drivers block ONLY when we lack fresh emission
-        # data. The prior topology block lives at
-        # ``scene_runtime["topology"]`` after ``_merge_scene_runtime``
-        # rehydrates it from a previous ``conversion_plan.json``;
-        # ``animation_result is None`` is the signal for "no fresh
-        # emissions available."
-        prior_topology = scene_runtime.get("topology", {})
-        if not isinstance(prior_topology, dict):
-            prior_topology = {}
-
-        if self.state.animation_result is not None:
-            # Fresh animation data available (covers fresh-with-anims
-            # AND fresh-no-anims — emitted_animations is just empty
-            # in the latter).
-            emitted_animations: list = list(
-                self.state.animation_result.emitted_animations,
-            )
-            preserved_animation_drivers = None
-        else:
-            # No fresh animation data this build. If the persisted
-            # topology has a prior animation_drivers block, preserve
-            # it; otherwise emit empty (first-time-no-anims resume).
-            emitted_animations = []
-            pad = prior_topology.get("animation_drivers", {})
-            preserved_animation_drivers = (
-                pad if isinstance(pad, dict) and pad else None
-            )
-
-        # Phase 2a slice 3 round 5 (codex P2): on
-        # assemble-without-retranspile workflows, ``transpile_scripts``
-        # doesn't rerun and ``state.dependency_map`` stays empty —
-        # preserve the prior ``caller_graph`` so we don't overwrite
-        # it with ``{}``.
-        #
-        # Round 6 (codex P2): use ``transpilation_result`` rather
-        # than the dep_map's truthiness as the "did transpile run
-        # this invocation?" signal. A genuine retranspile that
-        # removes the last cross-script reference ALSO leaves
-        # dep_map empty — using dep_map alone would silently carry
-        # forward stale callers in that case. ``transpilation_result``
-        # is set IFF transpile_scripts ran this invocation (both are
-        # populated in the same code path, pipeline.py:1942-1971);
-        # an empty dep_map alongside a populated transpilation_result
-        # is the legitimate "ran with no edges" case (use the empty
-        # fresh graph, don't preserve).
-        if self.state.transpilation_result is not None:
-            preserved_caller_graph = None
-        else:
-            pcg = prior_topology.get("caller_graph", {})
-            preserved_caller_graph = (
-                pcg if isinstance(pcg, dict) and pcg else None
-            )
-
-        from converter.scene_runtime_topology.build_topology import (
-            build_topology,
-        )
-
-        # Phase 2a slice 4 round 3 review (Claude P1.A): use the
-        # shared ``build_scripts_by_class_name`` helper so the
-        # pipeline + planner share ONE source of truth for the
-        # class_name → script join. Pre-fix the pipeline keyed by
-        # ``script.name`` (file stem) but downstream consumers
-        # (build_topology._build_modules_block) looked up via
-        # module rows' ``class_name`` — same name-vs-class-name
-        # conflation slice 4 round 2 fixed in the planner.
-        from converter.scene_runtime_planner import (
-            build_scripts_by_class_name,
-        )
-        modules_in = scene_runtime.get("modules", {}) or {}
-        scripts_by_class = build_scripts_by_class_name(
-            self.state.rbx_place.scripts,
-            cast("dict", modules_in),
-        )
-
-        try:
-            artifact = build_topology(
-                scene_runtime=cast(
-                    "SceneRuntimeArtifact", scene_runtime,
-                ),
-                emitted_animations=emitted_animations,
-                scripts_by_class=scripts_by_class,
-                guid_index=self.state.guid_index,
-                # Phase 2a slice 3: pass the planner's class-keyed
-                # dependency_map so build_topology can curate it into
-                # the artifact's `caller_graph` (script_id-keyed
-                # incoming-edge view). `None` is treated as empty
-                # graph — back-compat for callers pre-dating slice 3.
-                dependency_map=self.state.dependency_map or None,
-                # Phase 2a slice 3 round 4: preserve prior
-                # animation_drivers on resume / no-fresh-emissions
-                # builds (caller computed above). Build_topology
-                # uses the preserved block verbatim and skips
-                # invariant 3 — see its docstring for the contract.
-                preserved_animation_drivers=preserved_animation_drivers,
-                # Phase 2a slice 3 round 5: preserve prior
-                # caller_graph on assemble-no-retranspile workflows
-                # where state.dependency_map is empty. Without this
-                # the prior populated graph would be overwritten
-                # with {} on every assemble rerun.
-                preserved_caller_graph=preserved_caller_graph,
-            )
-        except Exception as exc:
-            # Topology invariants are fail-closed by design, but
-            # surfacing the exact context here helps an operator triage
-            # before the build aborts.
-            log.error(
-                "[topology] build_topology raised: %s — aborting build "
-                "before the on-disk plan is finalized.", exc,
-            )
-            raise
-
-        # Persist the artifact under the scene_runtime block. Consumers
-        # (animation_converter post-emission, contract_pipeline in
-        # Phase 3) read through this key.
-        scene_runtime["topology"] = cast("object", artifact)
-        return artifact
 
     def _merge_scene_runtime(self, plan_path: Path) -> dict[str, object]:
         """Compose the ``scene_runtime`` block written into
