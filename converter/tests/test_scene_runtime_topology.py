@@ -3379,3 +3379,318 @@ class TestIntrinsicScriptTypeRoundTwoContract:
         drivers = topo["animation_drivers"]
         assert cached_sid in drivers
         assert drivers[cached_sid]["routing_status"] == "resolved"
+
+
+# ===========================================================================
+# Phase 2a slice 9a: TopologyInputs plumbing + #10 fold-in
+# ===========================================================================
+
+
+class TestSlice9aTopologyInputsPlumbing:
+    """Slice 9a deliverables:
+
+    1. ``_build_and_apply_topology`` receives ``topology_inputs`` (from
+       the prepass) and threads its inverted ``script_id_by_name``
+       through ``build_topology`` as ``script_by_sid``.
+    2. ``--phase=write_output`` resume reproduces the same artifact
+       (no persistence needed; the prepass re-runs because
+       ``materialize_and_classify`` is essential).
+    3. Followup task #10 fold-in: two modules with colliding
+       ``class_name`` but distinct stems get correct script_class on
+       the topology entry (where today they'd silently fall through
+       to ``"ModuleScript"`` because ``scripts_by_class`` excludes
+       colliding class_names).
+
+    The byte-equivalence of ``module_path`` /
+    ``reachability_forced_container`` on the topology entry is NOT
+    tested here — that's slice 9b's domain. Slice 9a preserves
+    today's stamped-field semantics; only the script_class join
+    changes.
+    """
+
+    @staticmethod
+    def _mk_pipeline_with_topology_inputs(
+        *, scripts: list[RbxScript], tmp_path: Path,
+    ):
+        """Build a Pipeline forge identical to
+        ``TestApplyTopologyToRbxScripts._mk_pipeline`` but parameterised
+        for slice 9a's tests (no emitted_animations needed)."""
+        from types import SimpleNamespace
+        from converter.pipeline import Pipeline
+        from converter.animation_converter import AnimationConversionResult
+        from converter.code_transpiler import TranspilationResult
+        from core.roblox_types import RbxPlace
+        pipeline = Pipeline.__new__(Pipeline)
+        pipeline.output_dir = tmp_path
+        rbx_place = RbxPlace()
+        rbx_place.scripts = scripts
+        anim_result = AnimationConversionResult()
+        anim_result.emitted_animations = []
+        pipeline.state = SimpleNamespace(
+            rbx_place=rbx_place,
+            animation_result=anim_result,
+            guid_index=None,
+            dependency_map={},
+            transpilation_result=TranspilationResult(),
+        )
+        return pipeline
+
+    @staticmethod
+    def _mk_topology_inputs(*, script_id_by_name: dict[str, str]):
+        """Synthesize a minimal ``TopologyInputs`` for tests that drive
+        ``_build_and_apply_topology`` directly. Only
+        ``script_id_by_name`` is consumed by the slice 9a code path;
+        the other fields default to empty/legacy.
+        """
+        from converter.scene_runtime_topology.module_domain import (
+            TopologyInputs,
+        )
+        return TopologyInputs(
+            domains={},
+            reachability_requirements={},
+            lifecycle_roles={},
+            script_id_by_name=script_id_by_name,
+            caller_graph={},
+            transpile_ran=True,
+        )
+
+    def test_plumbing_passes_topology_inputs_through_to_modules_block(
+        self, tmp_path: Path,
+    ) -> None:
+        """Slice 9a deliverable 1: when ``topology_inputs`` is provided,
+        ``_build_and_apply_topology`` builds a ``script_by_sid`` map
+        from ``topology_inputs.script_id_by_name`` and threads it to
+        ``build_topology``, which uses it in ``_build_modules_block``.
+
+        Witness: a script flagged with a non-default
+        ``intrinsic_script_type`` on the rbx_place side maps to the
+        topology entry's ``script_class`` via the script_id join. If
+        the kwarg weren't being plumbed through, the legacy
+        class_name join would still pick the same script for the
+        simple-non-colliding case — so this test pairs with the
+        collision test below for full coverage of the new path.
+        """
+        sr = _mk_artifact(
+            modules={"guid-hud": _mk_module("HudControl", "client")},
+        )
+        scene_runtime = cast("dict[str, object]", sr)
+        hud_script = _mk_rbx_script("HudControl", "LocalScript")
+        hud_script.intrinsic_script_type = "LocalScript"
+
+        pipeline = self._mk_pipeline_with_topology_inputs(
+            scripts=[hud_script], tmp_path=tmp_path,
+        )
+        # Plan must be empty (no animation drivers in this fixture).
+        from converter.storage_classifier import StoragePlan
+        plan = StoragePlan()
+
+        topology_inputs = self._mk_topology_inputs(
+            script_id_by_name={"HudControl": "guid-hud"},
+        )
+        pipeline._build_and_apply_topology(
+            scene_runtime, plan, topology_inputs=topology_inputs,
+        )
+        topo = scene_runtime["topology"]
+        assert isinstance(topo, dict)
+        assert "guid-hud" in topo["modules"]  # type: ignore[index]
+        # Slice 9a #10 fold-in: the script_id join landed the same
+        # script the class_name join would have, so script_class is
+        # preserved at "LocalScript". Slice 9b will recompute
+        # module_path / reachability_forced_container; here we just
+        # assert the new join didn't regress the script_class output.
+        entry = topo["modules"]["guid-hud"]  # type: ignore[index]
+        assert entry["script_class"] == "LocalScript"
+
+    def test_resume_parity_assemble_no_retranspile_reuses_prepass_output(
+        self, tmp_path: Path,
+    ) -> None:
+        """Slice 9a deliverable 2: an assemble-no-retranspile resume
+        (``transpilation_result is None``, fresh prepass run) produces
+        a topology artifact whose ``modules`` block has the same
+        ``script_class`` as a fresh run.
+
+        Slice 6 + 9a guarantee this structurally: the prepass runs on
+        every invocation because ``materialize_and_classify`` is in
+        ESSENTIAL_PHASES (pipeline.py:612). ``topology_inputs`` is NOT
+        persisted onto ``StoragePlan``; it's recomputed each run from
+        ``scene_runtime`` + ``rbx_place.scripts``.
+        """
+        from types import SimpleNamespace
+        from converter.pipeline import Pipeline
+        from converter.animation_converter import AnimationConversionResult
+        from core.roblox_types import RbxPlace
+        from converter.storage_classifier import StoragePlan
+
+        sr = _mk_artifact(
+            modules={"guid-hud": _mk_module("HudControl", "client")},
+        )
+        scene_runtime_fresh = cast("dict[str, object]", sr)
+        scene_runtime_resume = cast(
+            "dict[str, object]",
+            _mk_artifact(
+                modules={"guid-hud": _mk_module("HudControl", "client")},
+            ),
+        )
+        hud_script_fresh = _mk_rbx_script("HudControl", "LocalScript")
+        hud_script_fresh.intrinsic_script_type = "LocalScript"
+        hud_script_resume = _mk_rbx_script("HudControl", "LocalScript")
+        hud_script_resume.intrinsic_script_type = "LocalScript"
+
+        topology_inputs = self._mk_topology_inputs(
+            script_id_by_name={"HudControl": "guid-hud"},
+        )
+
+        # Fresh run.
+        fresh_pipeline = self._mk_pipeline_with_topology_inputs(
+            scripts=[hud_script_fresh], tmp_path=tmp_path,
+        )
+        fresh_pipeline._build_and_apply_topology(
+            scene_runtime_fresh, StoragePlan(),
+            topology_inputs=topology_inputs,
+        )
+
+        # Resume run: simulate assemble-no-retranspile by setting
+        # ``transpilation_result=None`` (the slice 3 round 6 signal).
+        # The prepass would still produce the same topology_inputs in
+        # production because script_id_by_name is recomputed from
+        # rbx_place.scripts + modules, which are identical here.
+        resume_pipeline = Pipeline.__new__(Pipeline)
+        resume_pipeline.output_dir = tmp_path
+        rbx_place = RbxPlace()
+        rbx_place.scripts = [hud_script_resume]
+        anim_result = AnimationConversionResult()
+        anim_result.emitted_animations = []
+        resume_pipeline.state = SimpleNamespace(
+            rbx_place=rbx_place,
+            animation_result=anim_result,
+            guid_index=None,
+            dependency_map={},
+            transpilation_result=None,  # resume signal
+        )
+        resume_pipeline._build_and_apply_topology(
+            scene_runtime_resume, StoragePlan(),
+            topology_inputs=topology_inputs,
+        )
+
+        # Same script_class on both runs.
+        fresh_entry = scene_runtime_fresh["topology"]["modules"]["guid-hud"]  # type: ignore[index]
+        resume_entry = scene_runtime_resume["topology"]["modules"]["guid-hud"]  # type: ignore[index]
+        assert fresh_entry["script_class"] == resume_entry["script_class"]
+        # Slice 9a invariant: module_path / reachability_forced_container
+        # are byte-equivalent across fresh + resume (they read off the
+        # stamped row fields in slice 9a; slice 9b changes the recompute).
+        assert fresh_entry["module_path"] == resume_entry["module_path"]
+        assert (
+            fresh_entry["reachability_forced_container"]
+            == resume_entry["reachability_forced_container"]
+        )
+
+    def test_followup_10_colliding_class_name_distinct_stems_resolves_via_sid_join(
+        self, tmp_path: Path,
+    ) -> None:
+        """Slice 9a deliverable 3 (#10 fold-in): two modules with
+        colliding ``class_name`` but distinct stems both reach the
+        topology entry with the correct ``script_class``.
+
+        Pre-fold-in: ``scripts_by_class`` (built via
+        ``build_scripts_by_class_name``) excludes the colliding
+        class_name entirely per the slice-3 degraded-service
+        contract, so ``_build_modules_block`` silently fell through
+        to ``derive_intrinsic_script_class(None) == "ModuleScript"``
+        for BOTH rows. ``build_script_id_by_name`` already uses the
+        SAME class_name + stem (with collision exclusion on BOTH
+        keyspaces) join — when class_name collides but stems are
+        distinct, the stem fallback resolves both rows correctly.
+
+        Inverting ``script_id_by_name`` into ``script_by_sid`` carries
+        that resolution through to ``_build_modules_block``: BOTH
+        rows now get their intrinsic script_class from their actual
+        script row.
+
+        Source-of-truth pin (Codex prediction): "asymmetric joins if
+        ``script_class`` keeps old class-name-only lookup at
+        ``build_topology.py:529``" — this test closes that P1.
+        """
+        # Two modules with colliding class_name "Shared" but distinct
+        # stems "Bootstrap" + "GameInit". Real-world cause: two
+        # ``.cs`` files declaring ``class Shared`` (e.g. nested
+        # partial classes, or a sloppy refactor); the planner gives
+        # them distinct stems but the same class_name.
+        sr = _mk_artifact(modules={
+            "guid-bootstrap": _mk_module(
+                "Bootstrap", "client", class_name="Shared",
+            ),
+            "guid-gameinit": _mk_module(
+                "GameInit", "server", class_name="Shared",
+            ),
+        })
+        scene_runtime = cast("dict[str, object]", sr)
+        # Scripts emitted with FILE STEM as name (the convention
+        # ``code_transpiler`` follows when class != stem) but
+        # distinct intrinsic_script_type values.
+        bootstrap_script = _mk_rbx_script("Bootstrap", "LocalScript")
+        bootstrap_script.intrinsic_script_type = "LocalScript"
+        gameinit_script = _mk_rbx_script("GameInit", "Script")
+        gameinit_script.intrinsic_script_type = "Script"
+
+        pipeline = self._mk_pipeline_with_topology_inputs(
+            scripts=[bootstrap_script, gameinit_script],
+            tmp_path=tmp_path,
+        )
+        from converter.storage_classifier import StoragePlan
+        plan = StoragePlan()
+
+        # ``build_script_id_by_name`` would resolve via the stem
+        # fallback (class_name "Shared" excluded; stems "Bootstrap"
+        # / "GameInit" distinct and not colliding). Synthesize the
+        # output here so the test is hermetic w.r.t. the
+        # planner-side helper but mirrors what the real prepass
+        # produces in this collision shape.
+        topology_inputs = self._mk_topology_inputs(
+            script_id_by_name={
+                "Bootstrap": "guid-bootstrap",
+                "GameInit": "guid-gameinit",
+            },
+        )
+        pipeline._build_and_apply_topology(
+            scene_runtime, plan, topology_inputs=topology_inputs,
+        )
+
+        topo = scene_runtime["topology"]
+        assert isinstance(topo, dict)
+        # BOTH rows get their actual script_class from the script_id
+        # join — pre-fold-in BOTH would have been "ModuleScript".
+        bootstrap_entry = topo["modules"]["guid-bootstrap"]  # type: ignore[index]
+        gameinit_entry = topo["modules"]["guid-gameinit"]  # type: ignore[index]
+        assert bootstrap_entry["script_class"] == "LocalScript"
+        assert gameinit_entry["script_class"] == "Script"
+
+    def test_followup_10_legacy_class_name_join_runs_when_topology_inputs_is_None(
+        self, tmp_path: Path,
+    ) -> None:
+        """Back-compat: ``script_by_sid=None`` (the default for callers
+        that don't carry topology_inputs) → ``_build_modules_block``
+        falls back to the legacy class_name join via
+        ``scripts_by_class``. Demonstrates the kwarg is opt-in and
+        does not regress callers that haven't migrated.
+        """
+        sr = _mk_artifact(
+            modules={"guid-hud": _mk_module("HudControl", "client")},
+        )
+        scene_runtime = cast("dict[str, object]", sr)
+        hud_script = _mk_rbx_script("HudControl", "LocalScript")
+        hud_script.intrinsic_script_type = "LocalScript"
+        pipeline = self._mk_pipeline_with_topology_inputs(
+            scripts=[hud_script], tmp_path=tmp_path,
+        )
+        from converter.storage_classifier import StoragePlan
+        # No topology_inputs passed — kwarg defaults to None.
+        pipeline._build_and_apply_topology(
+            scene_runtime, StoragePlan(),
+        )
+        topo = scene_runtime["topology"]
+        assert isinstance(topo, dict)
+        entry = topo["modules"]["guid-hud"]  # type: ignore[index]
+        # Legacy class_name join still resolved HudControl correctly
+        # (no collision), so script_class is "LocalScript".
+        assert entry["script_class"] == "LocalScript"
