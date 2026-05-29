@@ -135,11 +135,15 @@ def test_topology_script_class_survives_classify_rehydrate_cycle(
 
     Fixture is purpose-built so the cycle has a witness: ``HudControl``
     is intrinsically a ``Script`` but gets coerced to ``LocalScript``
-    by classify_storage's client-only-API regex pass. Pre-round-3 the
-    rebuild's ``script_class`` flipped to ``"LocalScript"`` (round-2
-    fallback path) — this test fails on that regression. Post-round-3
-    it stays at ``"Script"`` because the intrinsic survives the round
-    trip on the ``StoragePlan.decisions[]`` row.
+    by classify_storage's post-decision auto-correction (originally
+    triggered by the regex client-only-API pass; slice 7 migrated the
+    witness to ``lifecycle_role == "character_attached"`` which routes
+    to ``StarterCharacterScripts`` and triggers the same coercion).
+    Pre-round-3 the rebuild's ``script_class`` flipped to
+    ``"LocalScript"`` (round-2 fallback path) — this test fails on
+    that regression. Post-round-3 it stays at ``"Script"`` because the
+    intrinsic survives the round trip on the ``StoragePlan.decisions[]``
+    row.
     """
     pipeline = _make_pipeline(tmp_path)
     scripts = _mk_scripts()
@@ -150,14 +154,36 @@ def test_topology_script_class_survives_classify_rehydrate_cycle(
     # is the invariant the round-trip must preserve.
     intrinsic_pre = {s.name: s.intrinsic_script_type for s in scripts}
 
+    # Phase 2a slice 7 (2026-05-30): the regex-API client-only paths
+    # were deleted. The "Script -> LocalScript coercion" witness now
+    # uses ``lifecycle_role == "character_attached"`` (a topology
+    # signal) to route HudControl to StarterCharacterScripts, which
+    # triggers the post-decision auto-correction (Script ->
+    # LocalScript) in classify_storage. Same mutation surface, same
+    # rehydration round-trip; different upstream trigger.
+    from converter.scene_runtime_topology.module_domain import (
+        TopologyInputs,
+    )
+    topology_inputs: TopologyInputs = {
+        "domains": {"guid-hud": "client", "guid-settings": "client"},
+        "reachability_requirements": {},
+        "lifecycle_roles": {"guid-hud": "character_attached"},
+        "script_id_by_name": {
+            "HudControl": "guid-hud", "Settings": "guid-settings",
+        },
+        "caller_graph": {},
+        "transpile_ran": True,
+    }
+
     # ---- STEP 2: classify (mutates script_type but not intrinsic). ----
-    plan = classify_storage(scripts)
+    plan = classify_storage(scripts, topology_inputs=topology_inputs)
     # Witness: classify_storage demoted HudControl's mutable script_type
-    # to LocalScript (StarterPlayer container) while leaving the
-    # immutable intrinsic_script_type at the transpiler's "Script".
+    # to LocalScript (StarterCharacter container under slice 7's
+    # topology path) while leaving the immutable intrinsic_script_type
+    # at the transpiler's "Script".
     hud = next(s for s in scripts if s.name == "HudControl")
     assert hud.script_type == "LocalScript", (
-        "fixture invariant: HudControl must trip the client-only "
+        "fixture invariant: HudControl must trip the character_attached "
         "coercion path so the parity test has a witness"
     )
     assert hud.intrinsic_script_type == "Script", (

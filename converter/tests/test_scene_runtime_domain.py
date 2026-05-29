@@ -415,51 +415,37 @@ class TestLegacyTablesUntouched:
         joined = "\n".join(patterns)
         return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
-    def test_storage_classifier_client_only_patterns_unchanged(self) -> None:
-        """The legacy table must not drift. PR3b's classifier uses a
-        SEPARATE table in ``scene_runtime_domain._GENERIC_CLIENT_API_PATTERNS``;
-        the legacy ``storage_classifier._CLIENT_ONLY_PATTERNS`` stays
-        byte-frozen.
+    def test_storage_classifier_client_only_patterns_deleted(self) -> None:
+        """Phase 2a slice 7 (2026-05-30): the legacy
+        ``storage_classifier._CLIENT_ONLY_PATTERNS`` /
+        ``_SERVER_ONLY_PATTERNS`` regex tables were DELETED. Domain
+        classification now happens upstream via the slice-6
+        ``infer_module_domains`` prepass, and slice 7's
+        ``_decide_script_container_from_topology`` consumes the
+        per-module domain verdict instead of running regex against
+        Luau bodies.
 
-        On a drive-by edit to the legacy table this test fails with the
-        new digest in the error message; update the pinned constant
-        DELIBERATELY in a separate, explicitly reviewed PR.
+        This test was previously a byte-freeze on the legacy tables;
+        it now asserts the tables ARE absent (deletion is intentional
+        + complete) and that the PR3b ``_GENERIC_CLIENT_API_PATTERNS``
+        used by ``scene_runtime_domain`` still exists with the
+        distinguishing signals it carries.
         """
         from converter import storage_classifier as legacy
-        actual = self._table_digest(legacy._CLIENT_ONLY_PATTERNS)
-        # First run: pin the digest in this test if the constant above
-        # is a placeholder. We assert table SHAPE invariants in tandem
-        # so a stale placeholder doesn't silently pass.
-        assert len(legacy._CLIENT_ONLY_PATTERNS) >= 10, (
-            "Legacy client table size unexpectedly small — likely a "
-            "regression that dropped patterns."
+        assert not hasattr(legacy, "_CLIENT_ONLY_PATTERNS"), (
+            "Slice 7 deleted _CLIENT_ONLY_PATTERNS; re-introducing it "
+            "duplicates the domain inference now owned by "
+            "scene_runtime_topology.infer_module_domains."
         )
-        # Cross-contamination check still meaningful.
-        assert set(legacy._CLIENT_ONLY_PATTERNS) != set(
-            _GENERIC_CLIENT_API_PATTERNS,
-        ), "PR3b's generic client table must NOT equal the legacy table"
-        # Sanity check on the new table's distinguishing signals.
+        assert not hasattr(legacy, "_SERVER_ONLY_PATTERNS"), (
+            "Slice 7 deleted _SERVER_ONLY_PATTERNS; re-introducing it "
+            "duplicates the domain inference now owned by "
+            "scene_runtime_topology.infer_module_domains."
+        )
+        # The PR3b generic table in scene_runtime_domain still
+        # carries its distinguishing signals.
         assert any("RenderStepped" in p for p in _GENERIC_CLIENT_API_PATTERNS)
         assert any(":FireServer" in p for p in _GENERIC_CLIENT_API_PATTERNS)
-        # And the legacy table does NOT have those (proves no
-        # accidental edits to the legacy file).
-        assert not any(
-            "RenderStepped" in p for p in legacy._CLIENT_ONLY_PATTERNS
-        ), (
-            "Legacy client table grew a RenderStepped pattern — PR3b "
-            "must NOT touch the legacy table; add to "
-            "_GENERIC_CLIENT_API_PATTERNS instead."
-        )
-        assert not any(
-            ":FireServer" in p for p in legacy._CLIENT_ONLY_PATTERNS
-        ), (
-            "Legacy client table grew a :FireServer pattern — PR3b "
-            "must NOT touch the legacy table; add to "
-            "_GENERIC_CLIENT_API_PATTERNS instead."
-        )
-        # Echo the digest for an operator updating the pinned constant.
-        # Not a failure; intentional logging via assertion message.
-        _ = actual  # captured for debugger inspection
 
     def test_script_coherence_client_only_patterns_unchanged(self) -> None:
         from converter import script_coherence as legacy

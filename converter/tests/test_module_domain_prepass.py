@@ -341,82 +341,45 @@ class TestNoParentPathInEarlyPrepass:
 
 
 class TestClassifyStorageTopologyInputsKwarg:
-    """Slice 6 commit 4 (rework): ``classify_storage`` accepts a
-    ``topology_inputs`` kwarg. The legacy decision tree is UNCHANGED
-    in slice 6; slice 7's rewrite will fork on the kwarg.
+    """Phase 2a slice 6/7: ``classify_storage`` accepts a
+    ``topology_inputs`` kwarg. Slice 6 plumbed it as a no-op; slice 7
+    inverts the consumer -- when supplied, the topology-driven tree
+    OWNS the decision and the legacy six-rule path becomes a
+    per-script fallback (None kwarg, script_id_by_name miss, or
+    transpile_ran=False unconstrained-helper case).
 
-    Parity assertion here: same scripts in, same StoragePlan out
-    whether the kwarg is ``None`` or supplied. Per the slice-6
-    "save raw facts, recompute conclusions" rule, the kwarg is NOT
-    persisted onto ``StoragePlan`` -- it is always recomputed by the
-    pipeline on every run. That rule is upheld by the absence of a
-    ``StoragePlan.topology_inputs`` field; this class therefore only
-    asserts decision-tree parity, NOT persistence.
+    Per the slice-6 "save raw facts, recompute conclusions" rule
+    ``topology_inputs`` is NOT persisted onto ``StoragePlan`` -- the
+    pipeline always recomputes it. That rule remains upheld by the
+    absence of a ``StoragePlan.topology_inputs`` field.
+
+    Slice-6's ``test_topology_inputs_kwarg_is_no_op_on_decisions`` was
+    DELETED in slice 7: its premise (kwarg is byte-no-op) is exactly
+    what slice 7 inverts. The replacement assertion -- that the
+    topology branch consumes the kwarg and produces a different
+    output for the same script when topology says so -- lives in
+    ``TestSlice7TopologyDecisionTree`` (test_storage_classifier.py).
     """
 
     def test_legacy_path_wins_when_topology_inputs_none(self) -> None:
+        """Without ``topology_inputs``, the legacy fallback path runs.
+
+        Slice 7 deleted the regex-API client/server toucher detection,
+        so the legacy path routes purely by ``script_type``. Script A
+        (a ``Script``) lands in ServerScriptService; ModuleScript B
+        with a Script caller is server-only -> ServerStorage.
+        """
         from converter.storage_classifier import classify_storage
 
         scripts = [
             RbxScript(name="A", source="Players.LocalPlayer", script_type="Script"),
             RbxScript(name="B", source="return {}", script_type="ModuleScript"),
         ]
-        plan = classify_storage(scripts, dependency_map={"A": ["B"]})
-        # Legacy six-rule sequence put A in StarterPlayerScripts
-        # (client-only API) and B in ReplicatedStorage (required by
-        # client-side caller).
-        assert scripts[0].parent_path == STARTER_PLAYER_SCRIPTS
-        assert scripts[1].parent_path == REPLICATED_STORAGE
-
-    def test_topology_inputs_kwarg_is_no_op_on_decisions(self) -> None:
-        """Slice 6 must NOT change ``_decide_script_container``'s
-        output. Pass an arbitrary ``topology_inputs`` -- buckets +
-        per-script ``parent_path`` should be IDENTICAL to the
-        ``None``-kwarg call.
-        """
-        from converter.scene_runtime_topology.module_domain import (
-            TopologyInputs,
-        )
-        from converter.storage_classifier import classify_storage
-
-        def _mk_scripts() -> list[RbxScript]:
-            return [
-                RbxScript(
-                    name="A", source="Players.LocalPlayer",
-                    script_type="Script",
-                ),
-                RbxScript(
-                    name="B", source="return {}",
-                    script_type="ModuleScript",
-                ),
-            ]
-
-        scripts_a = _mk_scripts()
-        plan_a = classify_storage(scripts_a, dependency_map={"A": ["B"]})
-
-        # Supply an arbitrary (but well-typed) topology_inputs blob.
-        inputs: TopologyInputs = {
-            "domains": {"g-a": "client", "g-b": "helper"},
-            "reachability_requirements": {"g-b": REPLICATED_STORAGE},
-            "lifecycle_roles": {"g-a": "auto_run"},
-            "script_id_by_name": {"A": "g-a", "B": "g-b"},
-            "caller_graph": {"g-b": ["g-a"]},
-            "transpile_ran": True,
-        }
-        scripts_b = _mk_scripts()
-        plan_b = classify_storage(
-            scripts_b, dependency_map={"A": ["B"]},
-            topology_inputs=inputs,
-        )
-
-        # Buckets + parent_paths byte-identical between the two runs.
-        assert plan_a.server_scripts == plan_b.server_scripts
-        assert plan_a.client_scripts == plan_b.client_scripts
-        assert plan_a.shared_modules == plan_b.shared_modules
-        assert plan_a.server_modules == plan_b.server_modules
-        assert [s.parent_path for s in scripts_a] == [
-            s.parent_path for s in scripts_b
-        ]
+        classify_storage(scripts, dependency_map={"A": ["B"]})
+        # A is a Script -> SSS by default (no LocalScript type).
+        assert scripts[0].parent_path == SERVER_SCRIPT_SERVICE
+        # B is required only by a Script caller -> SS.
+        assert scripts[1].parent_path == SERVER_STORAGE
 
 
 class TestTopologyInputsTranspileRan:
