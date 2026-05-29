@@ -53,6 +53,16 @@ PHASES: list[str] = [
     "transpile_scripts",
     "convert_animations",
     "convert_scene",
+    # Phase 2a slice 8: ``materialize_and_classify`` lifts script
+    # materialization (emit-to-disk), the post-transpile coherence pass,
+    # and storage classification out of ``write_output`` into a sibling
+    # phase. The phase is empty in this slice's first commit; subsequent
+    # commits lift the three subphases in order. After the lift,
+    # ``write_output`` consumes the persisted ``StoragePlan`` and a
+    # populated ``rbx_place.scripts`` instead of computing them itself.
+    # Placement rationale: must run AFTER ``convert_scene`` because
+    # ``rbx_place`` (the script container) is only created there.
+    "materialize_and_classify",
     "write_output",
 ]
 
@@ -2525,6 +2535,58 @@ return table.concat(allData, "\\n")'''
                         "[prune] Failed to unlink %s: %s",
                         candidate, exc,
                     )
+
+    MATERIALIZE_AND_CLASSIFY_ORDER: tuple[str, ...] = (
+        # Phase 2a slice 8: lifted out of ``write_output``. The exact
+        # subphases in this tuple are filled in over subsequent slice 8
+        # commits; the constant exists so the no-op first commit still
+        # exposes the canonical ordering hook for tests.
+    )
+    """Order in which :meth:`materialize_and_classify` invokes its subphases.
+
+    Empty in slice 8 commit 1 (phase introduced empty). Subsequent
+    commits lift ``_subphase_emit_scripts_to_disk``,
+    ``_subphase_cohere_scripts``, and ``_classify_storage`` into it from
+    ``SUBPHASE_ORDER`` in that order. Ordering rationale (carried over
+    from ``SUBPHASE_ORDER``):
+
+    - cohere must run AFTER emit (needs scripts in place)
+    - classify must run AFTER cohere (Script→ModuleScript reclassification
+      affects which storage container each script belongs in)
+    """
+
+    def materialize_and_classify(self) -> None:
+        """Phase: materialize the script set + cohere + classify storage.
+
+        Phase 2a slice 8: lifts the three subphases
+        (:meth:`_subphase_emit_scripts_to_disk`,
+        :meth:`_subphase_cohere_scripts`, :meth:`_classify_storage`) out
+        of :meth:`write_output` so a single ordered phase computes the
+        authoritative script set + storage plan upstream of
+        ``write_output``. ``write_output`` then consumes the persisted
+        ``StoragePlan`` and the populated ``rbx_place.scripts`` instead
+        of computing them itself.
+
+        Slice 8 lifts the subphases over multiple commits; this method
+        is the orchestration hook. The first commit introduces the phase
+        empty; subsequent commits move emit → cohere → classify into it.
+        """
+        log.info("[materialize_and_classify] Starting ...")
+
+        if self.state.rbx_place is None:
+            log.warning(
+                "[materialize_and_classify] No RbxPlace -- skipping "
+                "(convert_scene was a no-op or hasn't run)"
+            )
+            return
+
+        # Subphases are lifted in over subsequent slice 8 commits in the
+        # order declared in :data:`MATERIALIZE_AND_CLASSIFY_ORDER`. Each
+        # lift commit moves one method's invocation from ``write_output``
+        # to here and updates the constant.
+        # COMMIT 1 (this commit): no subphases yet — phase is a sequencing
+        # placeholder so ``--phase=materialize_and_classify`` resumes work
+        # immediately and downstream tests can land in the same PR.
 
     def write_output(self) -> None:
         """Phase 6: Serialize the Roblox place to disk.
