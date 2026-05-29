@@ -233,3 +233,9 @@ Do NOT consume:
   R2/R3/R4 review history. The reviews are accurate about
   staleness bugs in the PERSISTED design; they're irrelevant under
   the rework rule.
+- **`TestSlice6OrchestratorByteParity` reminder.** A test in
+  `test_module_domain_prepass.py` (`TestSlice6OrchestratorByteParity`)
+  asserts that the legacy orchestrator's output is byte-identical to
+  slice 5. Slice 7's rewiring of `classify_scene_runtime_domains`
+  will need to either preserve those assertions or explicitly update
+  them with documented rationale. Don't silently let them drift.
