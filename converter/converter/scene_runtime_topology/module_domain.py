@@ -9,6 +9,39 @@ move out to ``script_storage``, signal tables consolidate, etc.). For
 Phase 1 the goal is structural: the topology package owns domain
 classification.
 
+Phase 2a slice 6 split the public entry point into three pure-ish
+functions that can run before ``classify_storage`` and a single late
+finalizer that runs after. The legacy entry point
+``classify_scene_runtime_domains`` is preserved as a thin orchestrator
+of those four pieces, byte-identical in behavior to the pre-split
+implementation:
+
+  - ``infer_module_domains`` (early, pure) -- per-module domain inference
+    via the 7-rule signal table. NO ``parent_path`` reads, NO mutation
+    of ``scene_runtime``.
+  - ``derive_reachability_requirements`` (early, pure) -- decides which
+    helper modules MUST land in ReplicatedStorage (client require-graph
+    reach) or excluded (both-sides conflict). NO ``parent_path`` reads,
+    NO mutation.
+  - ``finalize_topology_containers`` (late, mutating) -- stamps
+    ``domain`` / ``domain_signals`` / ``container`` / ``module_path`` /
+    ``reachability_forced_container`` onto every module row using the
+    early-derived domain map + reachability requirements + the now-
+    final ``parent_path`` from ``classify_storage``. This is the ONLY
+    place ``parent_path`` is read by the topology classifier today.
+  - ``classify_scene_runtime_domains`` -- coordinator. Calls the three
+    above in order and builds the ``DomainClassifierReport``.
+
+Slice-6 split rationale: ``_classify_module`` consumes only the C#
+source, post-transpile Luau, per-instance evidence, overrides, and
+networking-mode flags — it never reads ``parent_path``. By extracting
+that pure piece (``infer_module_domains``) we can run it BEFORE
+``classify_storage`` and feed the resulting domain map back into
+storage decision-making (slice 7 will rewrite ``_decide_script_container``
+on top of that channel). Slice 6 itself just plumbs the prepass; the
+storage decision tree is unchanged, gated on a kwarg fork in
+``classify_storage``.
+
 Public entry point: ``classify_scene_runtime_domains``. Runs after the
 storage classifier seeds ``scene_runtime.modules`` and after the
 planner has populated instance / reference rows. Assigns each
@@ -514,6 +547,229 @@ class DomainClassifierReport(TypedDict):
     fail_closed_modules: list[str]
     mirror_adoption_low: bool
     strict_violations: list[str]
+
+
+# ---------------------------------------------------------------------------
+# Slice 6 early prepass: domain inference + reachability requirements.
+#
+# These two functions are PURE OVER THEIR INPUTS — no ``parent_path``
+# reads, no mutation of ``scene_runtime``. They can run BEFORE
+# ``classify_storage`` so storage decisions can consult their output.
+# The legacy entry point ``classify_scene_runtime_domains`` is rebuilt
+# on top of these (plus ``finalize_topology_containers``) and is
+# byte-identical in observable behavior.
+# ---------------------------------------------------------------------------
+
+
+class _DomainInferenceResult(TypedDict):
+    """Per-module output of ``infer_module_domains``.
+
+    Carries everything the late finalizer needs to mirror onto the
+    module row — domain verdict, signals, and the displaced/excluded
+    bookkeeping the legacy pipeline accumulates. Defined as a TypedDict
+    rather than a tuple so the keys stay self-documenting where slice
+    7's storage decision tree will read them.
+    """
+
+    domain: str
+    signals: SceneRuntimeDomainSignals
+    displaced_instances: list[SceneRuntimeDisplacedInstance]
+    low_confidence: bool
+    excluded: bool
+
+
+def infer_module_domains(
+    scene_runtime: SceneRuntimeArtifact,
+    scripts: Iterable[RbxScript],
+    *,
+    dependency_map: dict[str, list[str]] | None = None,
+    guid_index: GuidIndex | None = None,
+    networking: str = DEFAULT_NETWORKING_MODE,
+) -> dict[str, _DomainInferenceResult]:
+    """Return ``{script_id: _DomainInferenceResult}`` for every module row.
+
+    Pure over its inputs:
+      - reads ``scene_runtime.modules`` / ``.scenes`` / ``.prefabs`` /
+        ``.domain_overrides`` for signal collection ONLY.
+      - reads ``RbxScript.source`` (Luau post-transpile body) through
+        ``scripts_by_class``.
+      - reads C# source via ``guid_index`` when present.
+      - does NOT read ``RbxScript.parent_path``. (Belt-and-suspenders:
+        the ``test_module_domain_no_parent_path_in_inference`` AST
+        check asserts no ``parent_path`` token appears in any function
+        reachable from here.)
+      - does NOT mutate ``scene_runtime`` or any ``RbxScript``.
+
+    The result is consumed by:
+      - ``derive_reachability_requirements`` (early, immediately after).
+      - ``finalize_topology_containers`` (late, after ``classify_storage``).
+      - slice 7's ``_decide_script_container`` rewrite (storage decisions
+        consult ``domain`` directly instead of re-running the API regex).
+
+    Helper / non-runtime-bearing rows produce a ``"helper"`` verdict
+    with empty signals (matching what ``_stamp_container_and_path``
+    would have stamped for them in the legacy single-pass path).
+    """
+    if networking not in NETWORKING_MODES:
+        raise ValueError(
+            f"unknown networking mode {networking!r}; "
+            f"expected one of {NETWORKING_MODES}"
+        )
+
+    modules = scene_runtime.get("modules", {})
+    scenes = scene_runtime.get("scenes", {})
+    prefabs = scene_runtime.get("prefabs", {})
+    overrides = scene_runtime.get("domain_overrides", {})
+
+    from converter.scene_runtime_planner import (
+        build_scripts_by_class_name,
+    )
+    scripts_list = list(scripts)
+    scripts_by_class = build_scripts_by_class_name(
+        scripts_list, cast("dict", modules),
+    )
+
+    per_instance_evidence = _gather_per_instance_evidence(scenes, prefabs)
+
+    cs_source_cache: dict[str, str] = {}
+
+    def _get_cs_source(script_id: str) -> str:
+        if script_id in cs_source_cache:
+            return cs_source_cache[script_id]
+        text = _load_cs_source(script_id, guid_index)
+        cs_source_cache[script_id] = text
+        return text
+
+    network_reachable: set[str] = _compute_network_behaviour_reachable(
+        modules, dependency_map, _get_cs_source, networking,
+    )
+
+    out: dict[str, _DomainInferenceResult] = {}
+    for script_id, module in modules.items():
+        if not module.get("runtime_bearing"):
+            # Pre-stamp helpers + non-runtime-bearing rows. The finalizer
+            # mirrors these onto the module row plus the (post-classify_storage)
+            # container/module_path.
+            out[script_id] = _DomainInferenceResult(
+                domain="helper",
+                signals=cast(SceneRuntimeDomainSignals, {}),
+                displaced_instances=[],
+                low_confidence=False,
+                excluded=False,
+            )
+            continue
+
+        extra_moderate_server: tuple[str, ...] = (
+            (_NETWORK_BEHAVIOUR_REACHABLE,)
+            if script_id in network_reachable
+            else ()
+        )
+
+        verdict, signals, instance_rows = _classify_module(
+            script_id, module, scripts_by_class,
+            per_instance_evidence.get(script_id, []),
+            overrides.get(script_id),
+            _get_cs_source(script_id),
+            networking,
+            extra_moderate_server=extra_moderate_server,
+        )
+        low_conf = bool(signals.get("low_confidence"))
+        excluded = verdict == "excluded"
+        displaced: list[SceneRuntimeDisplacedInstance] = []
+        if signals.get("override_applied") and signals.get("intra_class_conflict"):
+            displaced = list(instance_rows)
+
+        out[script_id] = _DomainInferenceResult(
+            domain=verdict,
+            signals=signals,
+            displaced_instances=displaced,
+            low_confidence=low_conf,
+            excluded=excluded,
+        )
+
+    return out
+
+
+def derive_reachability_requirements(
+    scene_runtime: SceneRuntimeArtifact,
+    scripts: Iterable[RbxScript],
+    domain_results: dict[str, _DomainInferenceResult],
+    *,
+    dependency_map: dict[str, list[str]] | None = None,
+) -> dict[str, str]:
+    """Return ``{script_id: required_container}`` for helpers that the
+    client require-graph reaches.
+
+    Pure: reads ``modules[*].class_name`` + ``modules[*].domain`` from
+    the freshly-inferred ``domain_results`` (NOT from the module rows,
+    which still carry stale domains until the finalizer runs). Does
+    NOT read ``parent_path``. Does NOT mutate anything.
+
+    Required-container value is either:
+      - ``REPLICATED_STORAGE`` -- helper reached by client only; must
+        live where the client require-graph can see it.
+      - ``"__excluded__"`` -- helper reached by BOTH client and server
+        require-graphs. The finalizer routes these to ``"excluded"``
+        domain with ``fail_closed_reason="reachability_conflict"``.
+
+    Helpers not in the map are unconstrained — storage_classifier's
+    legacy decision tree picks their container (slice 7 will route the
+    unconstrained ones via the topology decision tree).
+    """
+    if not dependency_map:
+        return {}
+
+    modules = scene_runtime.get("modules", {})
+    from converter.scene_runtime_planner import (
+        build_scripts_by_class_name,
+        compute_class_name_collisions,
+    )
+    scripts_list = list(scripts)
+    scripts_by_class = build_scripts_by_class_name(
+        scripts_list, cast("dict", modules),
+    )
+    colliding_class_names = compute_class_name_collisions(modules)
+
+    client_classes: set[str] = set()
+    server_classes: set[str] = set()
+    class_to_script_id: dict[str, str] = {}
+    for script_id, module in modules.items():
+        class_name = module.get("class_name", "")
+        if not class_name:
+            continue
+        if class_name in colliding_class_names:
+            continue
+        class_to_script_id.setdefault(class_name, script_id)
+        # Read domain from domain_results, NOT from module["domain"] —
+        # the module rows haven't been stamped yet at the early prepass
+        # call site.
+        result = domain_results.get(script_id)
+        verdict = result["domain"] if result is not None else ""
+        if verdict == "client":
+            client_classes.add(class_name)
+        elif verdict == "server":
+            server_classes.add(class_name)
+
+    requirements: dict[str, str] = {}
+    for helper_class, _script in scripts_by_class.items():
+        client_seeds = client_classes - {helper_class}
+        server_seeds = server_classes - {helper_class}
+        helper_reached_by_client = (
+            helper_class in _closure(client_seeds, dependency_map)
+        )
+        helper_reached_by_server = (
+            helper_class in _closure(server_seeds, dependency_map)
+        )
+        if not helper_reached_by_client:
+            continue
+        module_id = class_to_script_id.get(helper_class)
+        if not module_id:
+            continue
+        if helper_reached_by_server:
+            requirements[module_id] = "__excluded__"
+        else:
+            requirements[module_id] = REPLICATED_STORAGE
+    return requirements
 
 
 # ---------------------------------------------------------------------------
@@ -1472,6 +1728,8 @@ def _check_mirror_adoption(
 
 __all__ = (
     "classify_scene_runtime_domains",
+    "derive_reachability_requirements",
+    "infer_module_domains",
     "migrate_legacy_domain_values",
     "DomainClassifierReport",
     "NetworkingMode",
