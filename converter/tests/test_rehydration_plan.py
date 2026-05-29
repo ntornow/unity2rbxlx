@@ -49,12 +49,20 @@ def test_load_storage_plan_returns_category_lookup(tmp_path):
     })
 
     lookup = pipeline._load_storage_plan_for_rehydration()
-    assert lookup["GameManager"] == ("Script", "ServerScriptService")
-    assert lookup["InputHandler"] == ("LocalScript", "StarterPlayer.StarterPlayerScripts")
-    assert lookup["PlayerMove"] == ("LocalScript", "StarterPlayer.StarterCharacterScripts")
-    assert lookup["Loading"] == ("ModuleScript", "ReplicatedFirst")
-    assert lookup["Constants"] == ("ModuleScript", "ReplicatedStorage")
-    assert lookup["Secrets"] == ("ModuleScript", "ServerStorage")
+    # Phase 2a slice 5 round 3: tuple is now (script_type, parent_path,
+    # intrinsic_script_type). ``None`` for plans without a decisions
+    # rowset (pre-round-3 / fixture-only) — the rehydrate path falls
+    # back to ``derive_intrinsic_script_class``'s heuristic.
+    assert lookup["GameManager"] == ("Script", "ServerScriptService", None)
+    assert lookup["InputHandler"] == (
+        "LocalScript", "StarterPlayer.StarterPlayerScripts", None,
+    )
+    assert lookup["PlayerMove"] == (
+        "LocalScript", "StarterPlayer.StarterCharacterScripts", None,
+    )
+    assert lookup["Loading"] == ("ModuleScript", "ReplicatedFirst", None)
+    assert lookup["Constants"] == ("ModuleScript", "ReplicatedStorage", None)
+    assert lookup["Secrets"] == ("ModuleScript", "ServerStorage", None)
 
 
 def test_rehydration_uses_plan_over_heuristic(tmp_path):

@@ -26,7 +26,7 @@ from core.unity_types import (
     ParsedScene,
     PrefabLibrary,
 )
-from core.roblox_types import RbxPlace, RbxScript
+from core.roblox_types import RbxPlace, RbxScript, ScriptType
 from converter.animation_converter import AnimationConversionResult
 from converter.code_transpiler import TranspilationResult
 from converter.material_mapper import MaterialMapping
@@ -3885,8 +3885,15 @@ script.Disabled = true
 
             source = luau_path.read_text(encoding="utf-8")
 
+            # Phase 2a slice 5 round 3: ``intrinsic_script_type`` is
+            # restored from the on-disk plan when the producing run
+            # stamped it. ``None`` for orphans (no plan row) and for
+            # rows that pre-date round 3 — both cases leave the field
+            # unset, falling through to the documented
+            # ``derive_intrinsic_script_class`` heuristic.
+            intrinsic_type: str | None = None
             if name in plan_lookup:
-                script_type, parent_path = plan_lookup[name]
+                script_type, parent_path, intrinsic_type = plan_lookup[name]
                 from_plan += 1
             else:
                 script_type = "Script"
@@ -3896,10 +3903,18 @@ script.Disabled = true
                 elif "game.Players.LocalPlayer" in source or "UserInputService" in source:
                     script_type = "LocalScript"
 
+            # ``intrinsic_script_type`` is a ``ScriptType | None``
+            # literal; only forward a known-valid value.
+            intrinsic_arg: ScriptType | None = (
+                cast(ScriptType, intrinsic_type)
+                if intrinsic_type in ("Script", "LocalScript", "ModuleScript")
+                else None
+            )
             script = RbxScript(
                 name=name,
                 source=source,
-                script_type=script_type,
+                script_type=cast(ScriptType, script_type),
+                intrinsic_script_type=intrinsic_arg,
                 source_path=str(luau_path.relative_to(scripts_dir)),
             )
             if parent_path and hasattr(script, "parent_path"):
@@ -3912,10 +3927,23 @@ script.Disabled = true
             rehydrated, from_plan, rehydrated - from_plan,
         )
 
-    def _load_storage_plan_for_rehydration(self) -> dict[str, tuple[str, str | None]]:
-        """Load conversion_plan.json into `name -> (script_type, parent_path)`.
+    def _load_storage_plan_for_rehydration(
+        self,
+    ) -> dict[str, tuple[str, str | None, str | None]]:
+        """Load conversion_plan.json into
+        ``name -> (script_type, parent_path, intrinsic_script_type)``.
 
         Returns {} on missing or malformed plan.
+
+        Phase 2a slice 5 round 3: ``intrinsic_script_type`` is the
+        immutable transpile-time class persisted on each
+        ``storage_plan.decisions[]`` row. It is read from the decisions
+        rowset (NOT the bucket map, which only reflects the post-
+        classifier ``script_type``). If a row is missing the field
+        (older serialized plan), ``None`` is returned and the rehydrate
+        path leaves ``RbxScript.intrinsic_script_type`` unset, falling
+        back to the documented ``script_type`` heuristic in
+        ``derive_intrinsic_script_class``. Additive, backward-compat.
         """
         plan_path = self.output_dir / "conversion_plan.json"
         if not plan_path.exists():
@@ -3929,6 +3957,24 @@ script.Disabled = true
             return {}
 
         plan = raw.get("storage_plan") or {}
+        # Build a per-script ``intrinsic_script_type`` lookup from the
+        # decisions rowset. A given script may have multiple decision
+        # rows (classifier + topology override); the LAST row wins so
+        # the topology authority's stamp survives. ``None`` for rows
+        # whose stamp was unknown at classification time.
+        intrinsic_by_name: dict[str, str | None] = {}
+        for row in plan.get("decisions", []) or []:
+            if not isinstance(row, dict):
+                continue
+            sname_obj = row.get("script")
+            if not isinstance(sname_obj, str) or not sname_obj:
+                continue
+            # ``get`` returns ``None`` if the row pre-dates round 3 —
+            # falls through to the heuristic fallback.
+            val_obj = row.get("intrinsic_script_type")
+            val = val_obj if isinstance(val_obj, str) else None
+            intrinsic_by_name[sname_obj] = val
+
         category_map = [
             ("server_scripts",           "Script",       "ServerScriptService"),
             ("client_scripts",           "LocalScript",  "StarterPlayer.StarterPlayerScripts"),
@@ -3937,10 +3983,14 @@ script.Disabled = true
             ("shared_modules",           "ModuleScript", "ReplicatedStorage"),
             ("server_modules",           "ModuleScript", "ServerStorage"),
         ]
-        lookup: dict[str, tuple[str, str | None]] = {}
+        lookup: dict[str, tuple[str, str | None, str | None]] = {}
         for cat_key, script_type, parent_path in category_map:
             for name in plan.get(cat_key, []) or []:
-                lookup[name] = (script_type, parent_path)
+                lookup[name] = (
+                    script_type,
+                    parent_path,
+                    intrinsic_by_name.get(name),
+                )
         return lookup
 
     def _classify_storage(self) -> None:
@@ -4386,10 +4436,15 @@ script.Disabled = true
                 # / ``reason``) with a ``source="topology"``
                 # discriminator. Consumers iterating ``decisions`` can
                 # index any of the canonical 4 keys uniformly across
-                # both sources.
+                # both sources. ``intrinsic_script_type`` is the
+                # script's immutable transpile-time class
+                # (slice 5 round 3) — preserve it from the live
+                # RbxScript so resume-rehydration restores it instead
+                # of falling back to the post-coercion ``script_type``.
                 plan.decisions.append({
                     "script": sname,
                     "script_type": "LocalScript",
+                    "intrinsic_script_type": script.intrinsic_script_type,
                     "container": "StarterPlayer.StarterPlayerScripts",
                     "reason": (
                         "topology: animation_drivers driver_domain=client "

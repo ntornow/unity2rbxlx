@@ -112,17 +112,37 @@ class StoragePlan:
     remote_events: list[str] = field(default_factory=list)
 
     # Audit trail. Each entry is a dict carrying:
-    #   ``script``       — script name
-    #   ``script_type``  — final ``Script`` / ``LocalScript`` / ``ModuleScript``
-    #   ``container``    — final dotted DataModel path
-    #   ``reason``       — human-readable decision rationale
-    #   ``source``       — ``"classifier"`` (regex-based) or ``"topology"``
-    #                      (scene_runtime_topology overrides — added in
-    #                      PR #148 / scene-runtime topology authority).
+    #   ``script``                 — script name
+    #   ``script_type``            — final ``Script`` / ``LocalScript`` /
+    #                                ``ModuleScript`` (post-classifier;
+    #                                may have been coerced from the
+    #                                intrinsic value).
+    #   ``intrinsic_script_type``  — Phase 2a slice 5 round 3: the
+    #                                immutable transpile-time class
+    #                                (``RbxScript.intrinsic_script_type``)
+    #                                captured BEFORE this classifier's
+    #                                ``Script→LocalScript`` coercion. May
+    #                                be ``None`` for scripts produced
+    #                                outside the transpile path (older
+    #                                construction sites that have not been
+    #                                migrated to stamp the field). Used by
+    #                                ``pipeline._rehydrate_scripts_from_disk``
+    #                                to restore the immutable field on
+    #                                resume so the cycle classifier→
+    #                                rehydrate→classifier preserves the
+    #                                intrinsic reading.
+    #   ``container``              — final dotted DataModel path
+    #   ``reason``                 — human-readable decision rationale
+    #   ``source``                 — ``"classifier"`` (regex-based) or
+    #                                ``"topology"`` (scene_runtime_topology
+    #                                overrides — added in PR #148 /
+    #                                scene-runtime topology authority).
     # Forward-compat: consumers iterating ``decisions`` index ``script`` /
     # ``script_type`` / ``container`` / ``reason`` uniformly; ``source``
-    # is the discriminator for future per-source filtering.
-    decisions: list[dict[str, str]] = field(default_factory=list)
+    # is the discriminator for future per-source filtering. Values are
+    # ``str`` for every key EXCEPT ``intrinsic_script_type`` which may be
+    # ``None`` (older / non-transpile construction paths).
+    decisions: list[dict[str, str | None]] = field(default_factory=list)
 
     # Agent-applied overrides from manual editing of conversion_plan.json.
     overrides_applied: list[dict[str, str]] = field(default_factory=list)
@@ -194,9 +214,21 @@ def classify_storage(
                 reason += " (forced to StarterPlayerScripts: LocalScript cannot live in SSS)"
         # ModuleScripts keep whatever container was chosen.
 
+        # Phase 2a slice 5 round 3: persist the immutable
+        # ``intrinsic_script_type`` alongside the (potentially-coerced)
+        # ``script_type``. The intrinsic field is set ONCE at RbxScript
+        # construction and never mutated, so reading it after the
+        # coercion above still returns the transpile-time value. Stored
+        # so ``pipeline._rehydrate_scripts_from_disk`` can restore it on
+        # resume and the cycle ``classify→rehydrate→classify`` preserves
+        # the intrinsic reading. ``None`` for non-transpile construction
+        # paths that have not yet been migrated to stamp the field; the
+        # rehydration path treats that as "fall back to script_type"
+        # which preserves the pre-round-3 behaviour for those paths.
         plan.decisions.append({
             "script": s.name,
             "script_type": s.script_type,
+            "intrinsic_script_type": s.intrinsic_script_type,
             "container": container,
             "reason": reason,
             "source": "classifier",
