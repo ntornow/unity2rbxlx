@@ -2483,7 +2483,7 @@ return table.concat(allData, "\\n")'''
     SUBPHASE_ORDER: tuple[str, ...] = (
         # ``_subphase_emit_scripts_to_disk`` lifted to
         # ``materialize_and_classify`` in slice 8 commit 2.
-        "_subphase_cohere_scripts",
+        # ``_subphase_cohere_scripts`` lifted in slice 8 commit 3.
         "_classify_storage",
         "_bind_scripts_to_parts",
         "_subphase_inject_autogen_scripts",
@@ -2546,8 +2546,10 @@ return table.concat(allData, "\\n")'''
 
     MATERIALIZE_AND_CLASSIFY_ORDER: tuple[str, ...] = (
         # Phase 2a slice 8: lifted out of ``write_output``. ``emit`` lifted
-        # in commit 2; ``cohere`` + ``classify`` follow in commits 3-4.
+        # in commit 2; ``cohere`` lifted in commit 3; ``classify`` follows
+        # in commit 4.
         "_subphase_emit_scripts_to_disk",
+        "_subphase_cohere_scripts",
     )
     """Order in which :meth:`materialize_and_classify` invokes its subphases.
 
@@ -2592,6 +2594,7 @@ return table.concat(allData, "\\n")'''
         # lift commit moves one method's invocation from ``write_output``
         # to here and updates the constant.
         self._subphase_emit_scripts_to_disk()
+        self._subphase_cohere_scripts()
 
     def write_output(self) -> None:
         """Phase 6: Serialize the Roblox place to disk.
@@ -2609,10 +2612,10 @@ return table.concat(allData, "\\n")'''
         # write_output is the assembly + serialization pipeline. Each subphase
         # below mutates self.state.rbx_place and/or writes files to self.output_dir.
         # Order is load-bearing — see SUBPHASE_ORDER for dependency rationale.
-        # Phase 2a slice 8 commit 2: ``_subphase_emit_scripts_to_disk`` is
-        # the responsibility of ``materialize_and_classify``; write_output
-        # now consumes ``rbx_place.scripts`` populated by the upstream phase.
-        self._subphase_cohere_scripts()
+        # Phase 2a slice 8 commits 2-3: ``_subphase_emit_scripts_to_disk``
+        # and ``_subphase_cohere_scripts`` are owned by
+        # ``materialize_and_classify``; write_output consumes the cohered
+        # ``rbx_place.scripts`` list and the persisted ``StoragePlan``.
         self._classify_storage()
         self._bind_scripts_to_parts()
         self._subphase_inject_autogen_scripts()
