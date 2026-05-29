@@ -593,9 +593,12 @@ class TopologyInputs(TypedDict):
 
     Slice 6 plumbs this through ``classify_storage`` as a
     no-op-on-default kwarg; slice 7 flips ``_decide_script_container``
-    to consume it. Persisted onto ``StoragePlan`` so rehydration can
-    restore it on resume (mirrors slice 5's
-    ``intrinsic_script_type`` persistence pattern).
+    to consume it. Threaded through ``classify_storage`` as a kwarg;
+    NOT persisted (slice 6 rule: save raw facts, never persist derived
+    conclusions). Always recomputed from current operator inputs via
+    ``Pipeline._maybe_run_topology_prepass`` on every invocation,
+    including ``--phase=write_output`` resumes (the prepass is in
+    ``ESSENTIAL_PHASES``).
     """
 
     # ``script_id`` -> domain verdict from ``infer_module_domains``.
