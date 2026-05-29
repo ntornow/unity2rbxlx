@@ -1,8 +1,9 @@
 # Scene-runtime topology authority
 
-**Status:** in-flight (revised 2026-05-29 to reflect Phase 2a slice 5-7
-decisions). Phase 1 shipped. Phase 2a is mid-flight: slices 1-6 shipped
-(PRs #150, #151, #152); slice 7 next; slices 8-11 follow.
+**Status:** in-flight (revised 2026-05-30 to reflect the Phase 2a slice 8
+arch-review re-plan; the prior 2026-05-29 revision captured slice 5-7
+decisions). Phase 1 shipped. Phase 2a is mid-flight: slices 1-7 shipped
+(PRs #150, #151, #152, plus slice 7); slice 8 next; slices 9-11 follow.
 **Owner:** unity2rbxlx converter team.
 **Related:** `scene-runtime-contract.md` (the contract this layer implements),
 `scene-runtime-domain-signals.md` (today's domain classifier, becomes the
@@ -415,22 +416,28 @@ When `transpile_ran is True` and a script is missing from
 NOT engaged, because empty under those conditions indicates a real bug we
 want loud.
 
-## High-priority followup TODOs (out of scope for slice 7)
+## High-priority followup TODOs (tracked, not in slice plan)
 
-These are tracked tasks surfaced during slice 5-7 review and are NOT part of
-slice 7's deliverable. Listed here so future readers know they exist:
+These are tracked tasks surfaced during slice 5-8 review and are NOT part of
+the in-flight slice's deliverable. Listed here so future readers know they
+exist:
 
 1. **`infer_module_domains` misclassifies Roblox-dead Unity rendering
    helpers.** Unity-only render helpers (`WaterBase`, `PlanarReflection`,
    `Displace`) currently classify as server-only. They have no Roblox runtime
    equivalent and should be filtered. Investigate whether a dedicated
    dead-code pruning pass is required, or whether the existing domain-signal
-   detector can be tightened.
+   detector can be tightened. (Task #8.)
 2. **Transpiler dependency-analysis false positives.** Example: `Plane.cs` is
    getting an injected `require(GameManager)` despite no reference to
    GameManager in the C# source. The dependency analyzer is over-counting.
    Investigate root cause before this lands a wrong-classifier bug onto a
-   downstream consumer.
+   downstream consumer. (Task #9.)
+3. **Symmetric `class_name`-collision fix at
+   `build_topology._build_modules_block:529`.** Surfaced during the slice 8
+   arch review alongside the slice 9 recompute work. **Consider folding into
+   slice 9** since slice 9 is already touching that code path; flag in
+   slice 9's brief. (Task #10.)
 
 ## Phase plan
 
@@ -488,7 +495,9 @@ Lower risk than transpile-emit changes; an earlier checkpoint per Codex's
 round-1 review. Phase 2a is split into **11 slices** (revised from the
 original 10-slice plan during the slice 5-7 review cycle: original slice 5
 was re-scoped because its premise was wrong, and original slice 6 was split
-into 6 + 7 once the pipeline-extraction surface area grew):
+into 6 + 7 once the pipeline-extraction surface area grew; slices 8-11 were
+re-planned 2026-05-30 after the slice 8 arch review found the original
+"move classify earlier" infeasible — see revision history).
 
 - **Slices 1-4** (shipped, PR #150 at HEAD `fea6ec7`): foundation —
   planner helpers, canonical `class_name` helpers, `caller_graph`,
@@ -504,41 +513,93 @@ into 6 + 7 once the pipeline-extraction surface area grew):
   kwarg through `classify_storage` (legacy path still wins when `None`).
   Crucially, slice 6 did NOT persist `topology_inputs` — see the
   "Persistence rule" section below.
-- **Slice 7** (next): `_decide_script_container` rewrite consuming
+- **Slice 7** (shipped): `_decide_script_container` rewrite consuming
   `topology_inputs`. This is where the corrected decision tree above
-  becomes live code.
-- **Slices 8-11**: complete bound-consumer migration (was 7-10 in the
-  original plan). Migrates the remaining six-rule consumers, deletes
-  duplicated regex API detection, deletes the placement mutations in
-  `scene_runtime_domain` (`_apply_reachability_rule`'s `parent_path`
-  mutation, etc.), and broadens the schema-compat fixture surface.
+  became live code.
+- **Slice 8** (next): introduce a new `materialize_and_classify` pipeline
+  phase. Lift `_subphase_emit_scripts_to_disk`, `_subphase_cohere_scripts`,
+  and `_classify_storage` out of `write_output` into a new phase running
+  between `convert_animations` and `convert_scene` (or wherever the
+  dependency graph places it cleanly). Goal: make slice 6's "save raw
+  facts, recompute conclusions" rule visible in the phase graph — emit +
+  cohere produce the authoritative script set; classify produces the
+  storage plan; both run upstream of `write_output`.
 
-**Deliverables (unchanged in intent across all 11 slices):**
+  **Acceptance gate (CRITICAL):** golden-output diff over bundled test
+  projects (SimpleFPS, Gamekit3D, RedRunner, 3D-Platformer at minimum)
+  shows **zero** `parent_path` drift on autogen / runtime-injection
+  scripts. Autogen scripts (`GameServerManager`, `CollisionGroupSetup`,
+  `NavAgent`, `EventSystem`, `CinemachineRuntime`, etc.) get appended
+  AFTER classify today; the lift means they're either never classified or
+  need a follow-on classify-pass before `write_output`.
+
+  The autogen-classify gap is the structural risk. Slice 8 must either
+  (a) move autogen-script construction earlier so they get classified by
+  the lifted phase, or (b) add a small post-emit classify-pass in
+  `write_output` for late-appended scripts. **Option (a) preferred;
+  (b) is the safety net.**
+
+- **Slice 9** (after slice 8): refactor
+  `build_topology._build_modules_block` (lines 567-602 today) to recompute
+  `module_path` / `reachability_forced_container` from canonical helpers
+  + raw inputs instead of reading mutated `scene_runtime.modules[*]`
+  fields. This is the structural prep for slice 10's deletion and must
+  come **before** slice 10. Per Codex's slice 8 finding incorporated into
+  this revised plan.
+
+  **Consider folding in followup task #10** (symmetric class_name-collision
+  fix at `build_topology._build_modules_block:529`) since slice 9 is
+  touching the same code; flag in slice 9's brief.
+
+- **Slice 10** (after slice 9): delete the three `_stamp_container_and_path`
+  placement-mutation call sites at
+  `scene_runtime_topology/module_domain.py:880, 886, 891`. Depends on
+  slice 9 (`build_topology` no longer reads the stamped fields). The
+  function itself can stay or be deleted; the goal is to remove the
+  side-effect mutations.
+
+- **Slice 11** (last): final test migration. Sweep remaining tests that
+  assert pre-Phase-2a behavior or rely on the late stamping. Must come
+  last so it doesn't churn against still-live behavior.
+
+**Dropped from the original plan:** the original slice 10 — "wire
+remaining consumers (incl. `contract_pipeline`) through the persisted
+topology artifact" — is **not** in the revised plan. Codex flagged that
+`contract_pipeline` runs during `transpile_scripts` BEFORE the artifact
+exists, so the "wire through artifact" idea doesn't fit. The contract
+verifier work moves to Phase 3 where it's actually scheduled.
+
+**Deliverables (intent across all 11 slices):**
 
 1. **Rewrite `_decide_script_container` to read topology facts.** The
    regex-based API detection (`_scripts_with_client_apis`,
    `_scripts_with_server_apis`) is DELETED — topology already provides
    domain. The decision tree above replaces the current six-rule
-   sequence. (Slice 7.)
+   sequence. (Slice 7, shipped.)
 
-2. **Move `_classify_storage` out of `write_output`** into the transpile
-   phase (run right after `scene_runtime_topology` produces the
-   artifact). `write_output` consumes the persisted decisions, doesn't
-   recompute. This addresses Codex's round-4 critique: *"deciding storage
-   during write_output is late and likely wrong."* (Slice 6 did the
-   ordering work; slice 7+ consume it.)
+2. **Lift emit + cohere + classify out of `write_output`** into a new
+   `materialize_and_classify` phase. Classify produces the storage plan
+   upstream of `write_output`; `write_output` consumes persisted
+   decisions, doesn't recompute. This addresses Codex's round-4 critique:
+   *"deciding storage during write_output is late and likely wrong."*
+   (Slice 8 — replaces the original "move `_classify_storage` out of
+   `write_output`" plan with the broader phase-introduction that also
+   carries emit + cohere with it.)
 
-3. **Delete the placement mutations in `scene_runtime_domain`** (the
-   `_apply_reachability_rule` `parent_path` mutation, etc.). Storage
-   decisions live in `script_storage.py` exclusively after Phase 2a;
-   topology emits facts only. (Slices 8-11.)
+3. **Refactor `build_topology._build_modules_block` to recompute from
+   canonical helpers** instead of reading stamped mutations. (Slice 9.)
 
-4. **Schema-compat test** (Codex round-1, formalized round-3): a frozen
+4. **Delete the placement mutations in `scene_runtime_domain`** (the
+   three `_stamp_container_and_path` sites). Storage decisions live in
+   `script_storage.py` exclusively after Phase 2a; topology emits facts
+   only. (Slice 10.)
+
+5. **Schema-compat test** (Codex round-1, formalized round-3): a frozen
    fixture artifact in `tests/fixtures/topology/` consumed by
    `animation_converter`, `script_storage`, and (later) the contract
    verifier — all parsed and acted upon WITHOUT rerunning planning.
    Guards against planner/consumer drift. (Initial fixture shipped in
-   slice 4; broadened in slices 8-11.)
+   slice 4; final test migration in slice 11.)
 
 **What this resolves:**
 
@@ -750,6 +811,19 @@ while the topology work is multi-PR.
 
 ## Revision history
 
+- **2026-05-30** — Phase 2a slices 8-11 revised after the slice 8 arch
+  review (parallel Claude + Codex) found the original "move classify
+  earlier" infeasible. New plan: lift emit + cohere + classify together
+  as a new `materialize_and_classify` phase (slice 8); `build_topology`
+  recomputes via canonical helpers (slice 9); delete the three
+  `_stamp_container_and_path` placement mutations at
+  `module_domain.py:880, 886, 891` (slice 10); test sweep (slice 11).
+  Original slice 10 "wire `contract_pipeline` through artifact" dropped —
+  `contract_pipeline` runs pre-artifact (during `transpile_scripts`); its
+  rework moves to Phase 3 where it's already scheduled. Added followup
+  task #10 (symmetric `class_name`-collision fix at
+  `build_topology._build_modules_block:529`) with a note to consider
+  folding it into slice 9. Marked slice 7 as shipped.
 - **2026-05-29** — reflected Phase 2a slice 5-7 decisions:
   - Renumbered slice plan from 10 slices to 11 slices (original slice 5
     re-scoped; original slice 6 split into 6 + 7).
