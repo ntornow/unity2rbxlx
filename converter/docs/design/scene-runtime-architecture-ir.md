@@ -547,9 +547,43 @@ re-planned 2026-05-30 after the slice 8 arch review found the original
   come **before** slice 10. Per Codex's slice 8 finding incorporated into
   this revised plan.
 
-  **Consider folding in followup task #10** (symmetric class_name-collision
-  fix at `build_topology._build_modules_block:529`) since slice 9 is
-  touching the same code; flag in slice 9's brief.
+  **Split into 9a (unambiguous plumbing + #10 fold-in) and 9b (recompute,
+  deferred for an A/B decision).** Pre-implementation synthesis (parallel
+  Claude + Codex) found that naive recompute of
+  `reachability_forced_container` is NOT provably row-equivalent: today's
+  stamp is gated by `current_container not in
+  _SERVER_CONTAINERS_FOR_REACHABILITY` (`module_domain.py:935-948`), so a
+  helper already in `ReplicatedStorage` gets an empty signal today but
+  would get a non-empty value under naive recompute from
+  `reachability_requirements[sid]`. The semantic-shift question
+  ("rule applies" vs "rule fired") is genuine; defer the A/B call until
+  9a ships and we have code-level evidence.
+
+  - **Slice 9a** (next): plumb `topology_inputs` through
+    `_build_and_apply_topology` (`pipeline.py:4587`, called at
+    `pipeline.py:4344`) — currently the prepass produces
+    `topology_inputs` but the apply step doesn't receive it. Persist
+    for `--phase=write_output` resumes (mirroring slice 5/6 patterns;
+    `topology_inputs` itself stays out of `StoragePlan` per the slice 6
+    persistence rule — plumbing means in-memory pass-through plus the
+    existing `transpile_ran is False` resume path). **Fold in followup
+    task #10** (symmetric `class_name`-collision fix at
+    `build_topology._build_modules_block:529`): invert
+    `build_script_id_by_name` into a `script_by_sid` map and consume it
+    in `_build_modules_block` (same pattern as slice 7 R4 at
+    `pipeline.py:4343-4348`). **No recompute** of
+    `reachability_forced_container` or `module_path` yet — byte-equivalence
+    of `_build_modules_block`'s output for those fields must be preserved.
+    Estimated ~150-200 LOC, 3-4 review rounds.
+  - **Slice 9b** (deferred until 9a ships): recompute
+    `module_path` / `reachability_forced_container` from canonical
+    helpers + raw inputs. **Decision pending:** Option A — accept the
+    "rule applies" semantic shift (recompute unconditionally from
+    `reachability_requirements[sid]`); Option B — add a `hoist_fired:
+    bool` raw fact to `TopologyInputs` so recompute preserves
+    byte-equivalence with today's `current_container not in
+    _SERVER_CONTAINERS_FOR_REACHABILITY` gate. Pick A vs B after 9a
+    lands and we can read the recompute call site against real code.
 
 - **Slice 10** (after slice 9): delete the three `_stamp_container_and_path`
   placement-mutation call sites at
@@ -811,6 +845,21 @@ while the topology work is multi-PR.
 
 ## Revision history
 
+- **2026-05-30** — slice 9 split into 9a (plumbing + #10 fold-in,
+  unambiguous) and 9b (recompute, deferred until 9a ships + user picks
+  A vs B). Codex caught the semantic-shift issue: today's
+  `reachability_forced_container` value depends on whether the late
+  hoist branch FIRED (gated by `current_container not in
+  _SERVER_CONTAINERS_FOR_REACHABILITY` at `module_domain.py:935-948`),
+  not just whether reachability was REQUIRED — these diverge under
+  naive recompute (e.g., a helper already in `ReplicatedStorage`). 9a
+  carries the unambiguous work (plumb `topology_inputs` into
+  `_build_and_apply_topology`, persist for `--phase=write_output`
+  resumes, fold in followup #10's symmetric `class_name`-collision fix
+  via inverting `build_script_id_by_name` into a `script_by_sid` map);
+  9b carries the recompute under an A (accept semantic shift) vs B
+  (add `hoist_fired: bool` raw fact for byte-equivalence) decision
+  deferred for code-level evidence.
 - **2026-05-30** — Phase 2a slices 8-11 revised after the slice 8 arch
   review (parallel Claude + Codex) found the original "move classify
   earlier" infeasible. New plan: lift emit + cohere + classify together
