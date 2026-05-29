@@ -14,17 +14,43 @@ Slice 8 chose Option (b) — the late-append safety net
 (``_classify_late_appended_scripts``) stamps the rbxlx_writer default
 container on any script whose generator left ``parent_path = None``.
 
-This file pins the golden routing table for every autogen / runtime /
-scene-runtime script the converter knows how to inject. If any one of
-these drifts, the test fails with a concrete diff — providing the
-"zero drift" witness the design doc requires.
+Round 2 hardening (Option a from the R1 review): the test exercises
+the REAL ``_subphase_inject_*`` paths so a new autogen factory wired
+into one of those subphases is caught automatically by the drift
+check — not silently dropped because the test fixture didn't know to
+list it. The synthetic ``RbxScript`` stubs the R1 test used couldn't
+detect that drift mode.
 
-The table mirrors the rbxlx_writer fallback at
-``roblox/rbxlx_writer.py:1620-1632`` (the slice-8 lift does NOT
-change writer behavior — late-appended scripts are still routed by
-the same default; this safety net just stamps that default
-explicitly so it becomes auditable in the data model rather than
-implicit in the serializer).
+The pre-injection state below is engineered to trip every detector
+in the three injection subphases:
+
+- ``_subphase_inject_autogen_scripts``:
+  - ``UnityLayer`` attribute on a part → ``CollisionGroupSetup``.
+  - ``GameServerManager`` always emits (no precondition).
+  - MeshPart with ``collision_fidelity != 0`` and a ``mesh_id`` →
+    ``CollisionFidelityRecook``.
+  - ``_MainCameraRig`` attribute on a part → ``CameraRigFollower``.
+  - A user ModuleScript with ``RenderStepped:Connect`` →
+    ``ClientBootstrap`` (LocalScript that requires side-effect modules).
+- ``_inject_runtime_modules``:
+  - ``_HasNavMeshAgent`` attribute on a part → ``NavAgent``.
+  - At least one ``RbxScreenGui`` in the place → ``EventSystem``.
+  - ``_HasCharacterController`` attribute → ``CharacterBridge``.
+  - ``_HasSubEmitters`` attribute on a particle emitter →
+    ``SubEmitterRuntime``.
+  - A user script with object-pool patterns (``pool.GetNew`` etc.)
+    → ``ObjectPool``.
+  - ``CinemachineVCam`` attribute → ``CinemachineRuntime``.
+- ``_subphase_inject_scene_runtime``:
+  - ``ctx.scene_runtime_mode == "generic"`` AND ``ctx.scene_runtime``
+    carries at least one runtime-bearing module → ``SceneRuntime``,
+    ``SceneRuntimePlan``, ``SceneRuntimeClient``, ``SceneRuntimeServer``.
+
+After all three injection subphases run on this engineered state,
+``_classify_late_appended_scripts`` runs and the golden table below
+pins every known autogen / runtime / scene-runtime script's
+``script_type`` + ``parent_path``. ANY drift fails this gate with a
+concrete diff.
 """
 from __future__ import annotations
 
@@ -33,16 +59,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from converter.autogen import (  # noqa: E402
-    generate_camera_rig_follower_script,
-    generate_collision_fidelity_recook_script,
-    generate_collision_group_script,
-    generate_game_server_script,
-    generate_scene_runtime_client_entrypoint,
-    generate_scene_runtime_server_entrypoint,
-)
 from converter.pipeline import Pipeline  # noqa: E402
-from core.roblox_types import RbxPlace, RbxScript  # noqa: E402
+from core.roblox_types import (  # noqa: E402
+    RbxPart,
+    RbxParticleEmitter,
+    RbxPlace,
+    RbxScreenGui,
+    RbxScript,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +106,11 @@ GOLDEN_PARENT_PATHS: dict[str, tuple[str, str]] = {
     "SubEmitterRuntime":         ("ModuleScript", "ReplicatedStorage"),
     # CinemachineRuntime LocalScript — no explicit parent_path → SPS
     "CinemachineRuntime":        ("LocalScript", "StarterPlayer.StarterPlayerScripts"),
+    # Scene-runtime host runtime module — stamped explicitly in
+    # _subphase_inject_scene_runtime (pipeline.py:5587-5591). Round 2
+    # caught this gap: the R1 synthetic-stub fixture omitted it
+    # entirely because the test didn't run real injection.
+    "SceneRuntime":              ("ModuleScript", "ReplicatedStorage"),
     # Scene-runtime entrypoints — generators set parent_path EXPLICITLY
     # in autogen.py:599/943/953. The safety net must NOT touch these.
     "SceneRuntimePlan":          ("ModuleScript", "ReplicatedStorage"),
@@ -98,56 +127,110 @@ def _make_pipeline(tmp_path: Path) -> Pipeline:
     return Pipeline(str(unity_project), str(output))
 
 
-def _construct_autogen_scripts() -> list[RbxScript]:
-    """Build a synthetic post-injection script set covering every
-    well-known autogen / runtime / scene-runtime script.
+def _engineer_pre_injection_state(pipeline: Pipeline) -> None:
+    """Construct a ``RbxPlace`` and ``ctx.scene_runtime`` state that trips
+    every detector in the three ``_subphase_inject_*`` paths.
 
-    Uses the REAL generator factories where one exists; for runtime
-    library modules (NavAgent, etc.) which are constructed inline in
-    ``_inject_runtime_modules``, we mirror their construction here.
+    This is the round 2 hardening (Option a): instead of pre-stamping
+    synthetic stubs, build state that makes the REAL injection
+    subphases produce the autogen scripts we want to classify-check.
+    A new autogen factory added to one of these subphases will appear
+    in ``state.rbx_place.scripts`` after injection and be caught by
+    the drift check below (whereas the R1 synthetic-stub test would
+    silently miss it).
     """
-    scripts: list[RbxScript] = []
+    place = RbxPlace()
 
-    # autogen.py factories (Scripts with no parent_path)
-    scripts.append(generate_game_server_script())
-    scripts.append(generate_collision_group_script())
-    scripts.append(generate_collision_fidelity_recook_script())
-    # autogen.py factories (LocalScript with no parent_path)
-    scripts.append(generate_camera_rig_follower_script())
-    # ClientBootstrap (LocalScript constructed inline in pipeline)
-    scripts.append(RbxScript(
-        name="ClientBootstrap",
-        source="-- bootstrap stub",
-        script_type="LocalScript",
-    ))
-    # Runtime library ModuleScripts (constructed inline in
-    # _inject_runtime_modules with NO explicit parent_path)
-    for name in ("NavAgent", "EventSystem", "CharacterBridge",
-                 "ObjectPool", "SubEmitterRuntime"):
-        scripts.append(RbxScript(
-            name=name,
-            source="-- runtime module stub",
-            script_type="ModuleScript",
-        ))
-    # CinemachineRuntime LocalScript (no parent_path)
-    scripts.append(RbxScript(
-        name="CinemachineRuntime",
-        source="-- cinemachine stub",
-        script_type="LocalScript",
-    ))
-    # Scene-runtime entrypoints (factories stamp parent_path explicitly)
-    scripts.append(generate_scene_runtime_client_entrypoint())
-    scripts.append(generate_scene_runtime_server_entrypoint())
-    # SceneRuntimePlan is generated by generate_scene_runtime_plan_module
-    # which requires a plan dict; mirror its construction here.
-    scripts.append(RbxScript(
-        name="SceneRuntimePlan",
-        source="-- plan module stub",
+    # ---- Workspace parts engineered to trip every attribute detector ----
+    # _subphase_inject_autogen_scripts:
+    #   UnityLayer → CollisionGroupSetup
+    #   _MainCameraRig → CameraRigFollower
+    # _inject_runtime_modules:
+    #   _HasNavMeshAgent → NavAgent
+    #   _HasCharacterController → CharacterBridge
+    #   CinemachineVCam → CinemachineRuntime
+    #   particle_emitters with _HasSubEmitters → SubEmitterRuntime
+    detector_part = RbxPart(
+        name="DetectorPart",
+        attributes={
+            "UnityLayer": "Default",
+            "_MainCameraRig": True,
+            "_HasNavMeshAgent": True,
+            "_HasCharacterController": True,
+            "CinemachineVCam": True,
+        },
+        particle_emitters=[
+            RbxParticleEmitter(attributes={"_HasSubEmitters": True}),
+        ],
+    )
+
+    # _scene_needs_collision_recook walks parts looking for a MeshPart with
+    # collision_fidelity != 0/None AND mesh_id set. Add a MeshPart sibling
+    # so CollisionFidelityRecook fires.
+    mesh_part = RbxPart(
+        name="MeshDetectorPart",
+        class_name="MeshPart",
+        mesh_id="rbxassetid://0",
+        collision_fidelity=1,  # Hull
+    )
+
+    place.workspace_parts = [detector_part, mesh_part]
+
+    # ---- ScreenGui → has_ui → EventSystem ----
+    place.screen_guis = [RbxScreenGui(name="HUD")]
+
+    # ---- User scripts that trigger ClientBootstrap + ObjectPool ----
+    # ClientBootstrap requires at least one ModuleScript with a side-
+    # effect pattern (RenderStepped:Connect / Heartbeat:Connect / etc.).
+    user_side_effect_module = RbxScript(
+        name="UserSideEffectModule",
+        source=(
+            "local RunService = game:GetService('RunService')\n"
+            "RunService.RenderStepped:Connect(function() end)\n"
+            "return {}\n"
+        ),
         script_type="ModuleScript",
-        parent_path="ReplicatedStorage",
-    ))
+    )
+    # ObjectPool fires when ANY transpiled script source mentions ``pool``
+    # AND one of the pool API verbs (GetNew / pool.Free / pool.Get).
+    user_pool_script = RbxScript(
+        name="UserPoolUser",
+        source=(
+            "local pool = require(script.Pool)\n"
+            "local obj = pool:GetNew()\n"
+        ),
+        script_type="Script",
+    )
+    place.scripts = [user_side_effect_module, user_pool_script]
 
-    return scripts
+    pipeline.state.rbx_place = place
+
+    # ---- Scene-runtime: generic mode with a runtime-bearing module ----
+    # _subphase_inject_scene_runtime only fires when scene_runtime_mode
+    # is "generic" AND the plan carries at least one runtime-bearing
+    # module. Stage a minimal plan that satisfies both.
+    pipeline.ctx.scene_runtime_mode = "generic"
+    pipeline.ctx.scene_runtime = {
+        "modules": {
+            "fixture_stable_id_0": {
+                "stem": "FixtureBehaviour",
+                "runtime_bearing": True,
+                "domain": "client",
+            },
+        },
+    }
+
+
+def _run_real_injection_subphases(pipeline: Pipeline) -> None:
+    """Drive the three real ``_subphase_inject_*`` paths in the same
+    order ``write_output`` does. This is the load-bearing hardening:
+    new autogen factories wired into one of these subphases must
+    appear in ``rbx_place.scripts`` after this call OR the drift
+    check below catches the mismatch.
+    """
+    pipeline._subphase_inject_autogen_scripts()
+    pipeline._inject_runtime_modules()
+    pipeline._subphase_inject_scene_runtime()
 
 
 class TestAutogenClassifyAcceptanceGate:
@@ -155,19 +238,32 @@ class TestAutogenClassifyAcceptanceGate:
     ZERO ``parent_path`` drift on autogen / runtime-injection scripts
     after the lift. The Option (b) safety net stamps the
     rbxlx_writer-default container explicitly; this test pins what
-    "default" means for every known autogen script."""
+    "default" means for every known autogen script.
+
+    Round 2 hardening: exercises the real ``_subphase_inject_*`` paths
+    so a new autogen factory drifting silently in or out of the
+    injection set is caught — the R1 synthetic-stub test would have
+    missed that drift mode.
+    """
 
     def test_every_known_autogen_script_gets_golden_parent_path(
         self, tmp_path: Path,
     ) -> None:
         pipeline = _make_pipeline(tmp_path)
-        pipeline.state.rbx_place = RbxPlace()
-        pipeline.state.rbx_place.scripts = _construct_autogen_scripts()
+        _engineer_pre_injection_state(pipeline)
 
-        # Mimic the write_output ordering: after all the injection
-        # subphases, the safety-net pass runs.
+        # Drive the three real injection subphases — this is the
+        # hardening: new autogen factories wired into one of these
+        # paths land in the rbx_place.scripts list and are surfaced
+        # to the drift check below. Pre-R2 the test stamped a
+        # synthetic list and silently missed that drift mode.
+        _run_real_injection_subphases(pipeline)
+
+        # Mirror write_output's ordering: the safety-net pass runs
+        # AFTER the three injection subphases.
         pipeline._classify_late_appended_scripts()
 
+        assert pipeline.state.rbx_place is not None
         actual = {s.name: (s.script_type, s.parent_path)
                   for s in pipeline.state.rbx_place.scripts}
 
@@ -177,7 +273,10 @@ class TestAutogenClassifyAcceptanceGate:
         ):
             if name not in actual:
                 drift.append(
-                    f"  {name}: NOT INJECTED (test fixture stale?)"
+                    f"  {name}: NOT INJECTED by real "
+                    f"_subphase_inject_* paths (a detector regressed, "
+                    f"a factory drifted, or the test state needs "
+                    f"updating for a new precondition)"
                 )
                 continue
             got_type, got_path = actual[name]
@@ -204,23 +303,46 @@ class TestAutogenClassifyAcceptanceGate:
         EXPLICITLY (autogen.py:599 / 943 / 953). The safety-net pass
         must NOT overwrite an explicitly-set parent_path — this is the
         "scripts with explicit parent_path pass through untouched"
-        contract."""
-        client = generate_scene_runtime_client_entrypoint()
-        server = generate_scene_runtime_server_entrypoint()
-        assert client.parent_path == "StarterPlayer.StarterPlayerScripts"
-        assert server.parent_path == "ServerScriptService"
+        contract.
 
+        Exercises the real ``_subphase_inject_scene_runtime`` path so a
+        regression that drops the explicit ``parent_path`` from the
+        generator (or the subphase) is caught at the boundary, not
+        just at the generator unit-test level.
+        """
         pipeline = _make_pipeline(tmp_path)
-        pipeline.state.rbx_place = RbxPlace()
-        pipeline.state.rbx_place.scripts = [client, server]
+        _engineer_pre_injection_state(pipeline)
 
-        # Pre-state captured.
-        pre_client = pipeline.state.rbx_place.scripts[0].parent_path
-        pre_server = pipeline.state.rbx_place.scripts[1].parent_path
+        # Drive ONLY the scene-runtime injection — other injections
+        # are exercised in the test above; here we want a tight focus
+        # on "the safety net does not touch explicit parent_paths".
+        pipeline._subphase_inject_scene_runtime()
+
+        assert pipeline.state.rbx_place is not None
+        pre_paths: dict[str, str | None] = {
+            s.name: s.parent_path
+            for s in pipeline.state.rbx_place.scripts
+            if s.name in ("SceneRuntimeClient", "SceneRuntimeServer",
+                           "SceneRuntimePlan", "SceneRuntime")
+        }
+        # The generators stamp explicit paths; sanity-check we got them.
+        assert pre_paths.get("SceneRuntimeClient") == (
+            "StarterPlayer.StarterPlayerScripts"
+        ), pre_paths
+        assert pre_paths.get("SceneRuntimeServer") == "ServerScriptService", pre_paths
+        assert pre_paths.get("SceneRuntimePlan") == "ReplicatedStorage", pre_paths
 
         pipeline._classify_late_appended_scripts()
 
         # Post-state must match pre-state — the safety net did not
         # touch already-explicit parent_paths.
-        assert pipeline.state.rbx_place.scripts[0].parent_path == pre_client
-        assert pipeline.state.rbx_place.scripts[1].parent_path == pre_server
+        post_paths: dict[str, str | None] = {
+            s.name: s.parent_path
+            for s in pipeline.state.rbx_place.scripts
+            if s.name in pre_paths
+        }
+        for name, pre in pre_paths.items():
+            assert post_paths[name] == pre, (
+                f"Safety net overwrote explicit parent_path on {name}: "
+                f"{pre!r} → {post_paths[name]!r}"
+            )
