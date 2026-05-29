@@ -371,6 +371,7 @@ def build_topology(
     dependency_map: dict[str, list[str]] | None = None,
     preserved_animation_drivers: dict[str, AnimationDriverEntry] | None = None,
     preserved_caller_graph: dict[str, list[str]] | None = None,
+    script_by_sid: dict[str, RbxScript] | None = None,
 ) -> TopologyArtifact:
     """Assemble the topology artifact + enforce 8 emit-time invariants.
 
@@ -420,6 +421,24 @@ def build_topology(
     dependency_map to detect collisions on); the preserved graph's
     correctness derives from when it was first computed.
 
+    ``script_by_sid`` (Phase 2a slice 9a, followup task #10 fold-in):
+    optional ``script_id -> RbxScript`` map built from the canonical
+    ``build_script_id_by_name`` helper (inverted: ``s.name -> sid``
+    becomes ``sid -> s``). When provided, ``_build_modules_block``
+    joins on ``script_id`` directly instead of the class_name-only
+    ``scripts_by_class`` lookup at ``_build_modules_block:529``. This
+    closes the asymmetric-join hole slice 7 round 4 already fixed at
+    the prepass boundary: two modules whose ``class_name`` collides
+    but whose ``stem`` is distinct pass the prepass / classify_storage
+    join via the stem fallback, but were silently dropped to
+    ``script_class="ModuleScript"`` at this site because the class_name
+    keyspace excludes them. The slice-3 degraded-service contract on
+    BOTH keyspaces still holds — modules whose class_name + stem both
+    collide (or both miss) are absent from ``script_by_sid`` and fall
+    through to the same safe-default outcome as before.
+    ``None`` (the default) preserves the legacy class_name-only join,
+    keeping back-compat for callers that don't carry topology_inputs.
+
     Returns the artifact dict ready to merge into
     ``scene_runtime["topology"]``.
 
@@ -442,6 +461,7 @@ def build_topology(
 
     modules_block = _build_modules_block(
         scene_runtime, scripts_by_class, guid_index,
+        script_by_sid=script_by_sid,
     )
     edges_block = compute_cross_domain_edges(scene_runtime)
     if preserved_animation_drivers is not None:
@@ -482,6 +502,8 @@ def _build_modules_block(
     scene_runtime: SceneRuntimeArtifact,
     scripts_by_class: dict[str, RbxScript],
     guid_index: GuidIndex | None,
+    *,
+    script_by_sid: dict[str, RbxScript] | None = None,
 ) -> dict[str, TopologyModuleEntry]:
     """One TopologyModuleEntry per ``scene_runtime.modules`` row.
 
@@ -496,6 +518,15 @@ def _build_modules_block(
     coercion. Helpers without an emitted script (the planner records
     them but storage_classifier didn't synthesize a body) default to
     ``"ModuleScript"`` — they're require-target shape.
+
+    Phase 2a slice 9a (followup task #10 fold-in): when
+    ``script_by_sid`` is provided, the script-row join uses
+    ``script_id`` (the loop variable, i.e. the ``modules_in`` dict
+    key) instead of the class_name-only ``scripts_by_class`` lookup.
+    Identical to the slice 7 round 4 fix at the prepass boundary —
+    closes the same asymmetric-join hole here on the late-assembly
+    side. When ``script_by_sid`` is ``None`` the legacy class_name
+    join still runs (back-compat for callers that haven't migrated).
 
     ``lifecycle_role`` derives from domain + script_class +
     character_attached + is_loader via ``derive_module_lifecycle_role``.
@@ -526,7 +557,18 @@ def _build_modules_block(
         # construction time, so the answer is independent of the
         # mutable ``script_type`` field that ``classify_storage`` and
         # the topology animation_drivers apply phase reassign.
-        script = scripts_by_class.get(class_name)
+        #
+        # Phase 2a slice 9a (#10 fold-in): when the caller supplied
+        # ``script_by_sid`` (built from the canonical
+        # ``build_script_id_by_name`` helper), use the script_id-keyed
+        # join. The two-keyspace (class_name + stem) collision-excluded
+        # producer behind ``build_script_id_by_name`` admits the
+        # colliding-class_name-but-distinct-stems case that the
+        # class_name-only ``scripts_by_class`` excludes.
+        if script_by_sid is not None:
+            script = script_by_sid.get(script_id)
+        else:
+            script = scripts_by_class.get(class_name)
         script_class = derive_intrinsic_script_class(script)
 
         # Phase 2a slice 2: read lifecycle-role inputs from the planner

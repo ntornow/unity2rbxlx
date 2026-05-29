@@ -4756,6 +4756,33 @@ script.Disabled = true
             cast("dict", modules_in),
         )
 
+        # Phase 2a slice 9a (followup task #10 fold-in): invert
+        # ``topology_inputs.script_id_by_name`` (``s.name -> sid``,
+        # built via the canonical ``build_script_id_by_name`` helper
+        # which honors collision exclusion on BOTH the class_name and
+        # stem keyspaces) into ``sid -> RbxScript``. Pass to
+        # ``build_topology`` so ``_build_modules_block`` can join on
+        # ``script_id`` directly instead of the class_name-only
+        # ``scripts_by_class`` lookup — closes the same
+        # asymmetric-join hole slice 7 round 4 fixed at the prepass
+        # boundary, this time on the late-assembly side. Modules
+        # whose class_name + stem both collide (or both miss) are
+        # absent from ``script_id_by_name`` and therefore also absent
+        # from ``script_by_sid``; ``_build_modules_block`` then falls
+        # through to ``derive_intrinsic_script_class(None)`` ->
+        # ``"ModuleScript"``, the same safe-default outcome
+        # ``scripts_by_class`` already produces for those rows.
+        script_by_sid: dict[str, RbxScript] | None = None
+        if topology_inputs is not None:
+            scripts_by_name: dict[str, RbxScript] = {
+                s.name: s for s in self.state.rbx_place.scripts if s.name
+            }
+            script_by_sid = {
+                sid: scripts_by_name[script_name]
+                for script_name, sid in topology_inputs["script_id_by_name"].items()
+                if script_name in scripts_by_name
+            }
+
         try:
             artifact = build_topology(
                 scene_runtime=cast(
@@ -4782,6 +4809,10 @@ script.Disabled = true
                 # the prior populated graph would be overwritten
                 # with {} on every assemble rerun.
                 preserved_caller_graph=preserved_caller_graph,
+                # Phase 2a slice 9a (#10 fold-in): script_id-keyed
+                # join for ``_build_modules_block`` (see block
+                # comment above for the asymmetric-join rationale).
+                script_by_sid=script_by_sid,
             )
         except Exception as exc:
             # Topology invariants are fail-closed by design, but
