@@ -701,7 +701,7 @@ def _decide_script_container_from_topology(
     if domain == "client":
         return STARTER_PLAYER_SCRIPTS, (
             "topology: script_type=Script with client domain "
-            "(replaces legacy _CLIENT_ONLY_PATTERNS branch)"
+            "(client-only API surface)"
         )
     return SERVER_SCRIPT_SERVICE, "topology: server Script (default)"
 

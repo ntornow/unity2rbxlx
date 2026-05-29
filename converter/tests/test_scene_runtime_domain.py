@@ -415,33 +415,92 @@ class TestLegacyTablesUntouched:
         joined = "\n".join(patterns)
         return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
-    def test_storage_classifier_client_only_patterns_deleted(self) -> None:
-        """Phase 2a slice 7 (2026-05-30): the legacy
-        ``storage_classifier._CLIENT_ONLY_PATTERNS`` /
-        ``_SERVER_ONLY_PATTERNS`` regex tables were DELETED. Domain
-        classification now happens upstream via the slice-6
-        ``infer_module_domains`` prepass, and slice 7's
-        ``_decide_script_container_from_topology`` consumes the
-        per-module domain verdict instead of running regex against
-        Luau bodies.
+    def test_storage_classifier_client_only_patterns_restored_as_fallback_only(
+        self,
+    ) -> None:
+        """Phase 2a slice 7 round 3 (2026-05-30, Codex R2 P1 #4).
 
-        This test was previously a byte-freeze on the legacy tables;
-        it now asserts the tables ARE absent (deletion is intentional
-        + complete) and that the PR3b ``_GENERIC_CLIENT_API_PATTERNS``
-        used by ``scene_runtime_domain`` still exists with the
-        distinguishing signals it carries.
+        The legacy ``storage_classifier._CLIENT_ONLY_PATTERNS`` /
+        ``_SERVER_ONLY_PATTERNS`` regex tables were originally deleted
+        in slice 7 because the topology path consumes
+        ``infer_module_domains`` upstream. Round 2 review found this
+        silently degraded the LEGACY FALLBACK path -- a Script using
+        ``Players.LocalPlayer`` that escapes
+        ``code_transpiler._classify_script_type``'s promotion would
+        land in the fallback as ``script_type == "Script"`` and route
+        to ServerScriptService where ``LocalPlayer`` is nil at runtime.
+
+        Round 3 RESTORES the patterns as **FALLBACK-PATH ONLY**
+        infrastructure (Option C from ``slice-7-r2-decision.md``).
+        This test now pins:
+
+        1. The tables exist (deletion was the regression; restoration
+           is the round-3 fix).
+        2. They are consumed via the FALLBACK-ONLY helpers
+           ``_scripts_with_client_apis`` /
+           ``_scripts_with_server_apis``.
+        3. The topology decision tree
+           (``_decide_script_container_from_topology``) does NOT
+           reference them -- the topology path still uses
+           ``infer_module_domains`` upstream.
+
+        The PR3b generic table in scene_runtime_domain still carries
+        its distinguishing signals (verified at the bottom of this
+        test).
         """
+        import inspect
+
         from converter import storage_classifier as legacy
-        assert not hasattr(legacy, "_CLIENT_ONLY_PATTERNS"), (
-            "Slice 7 deleted _CLIENT_ONLY_PATTERNS; re-introducing it "
-            "duplicates the domain inference now owned by "
-            "scene_runtime_topology.infer_module_domains."
+
+        # The patterns exist (round-3 restoration).
+        assert hasattr(legacy, "_CLIENT_ONLY_PATTERNS"), (
+            "Slice 7 round 3 restored _CLIENT_ONLY_PATTERNS as "
+            "FALLBACK-PATH ONLY infrastructure (Codex R2 P1 #4)."
         )
-        assert not hasattr(legacy, "_SERVER_ONLY_PATTERNS"), (
-            "Slice 7 deleted _SERVER_ONLY_PATTERNS; re-introducing it "
-            "duplicates the domain inference now owned by "
-            "scene_runtime_topology.infer_module_domains."
+        assert hasattr(legacy, "_SERVER_ONLY_PATTERNS"), (
+            "Slice 7 round 3 restored _SERVER_ONLY_PATTERNS as "
+            "FALLBACK-PATH ONLY infrastructure (Codex R2 P1 #4)."
         )
+
+        # The patterns are consumed ONLY by the fallback helpers.
+        assert hasattr(legacy, "_scripts_with_client_apis")
+        assert hasattr(legacy, "_scripts_with_server_apis")
+
+        # The topology decision tree MUST NOT reference these
+        # constants. Inspect the function's source to enforce the
+        # contract — a future edit that adds them would silently
+        # break the slice-7 "topology owns domain inference" design.
+        # Strip comment lines first so the docstring + inline comments
+        # that mention "legacy _CLIENT_ONLY_PATTERNS branch" for
+        # historical context don't trip the gate.
+        topology_src = inspect.getsource(
+            legacy._decide_script_container_from_topology,
+        )
+        topology_code_lines = [
+            line for line in topology_src.splitlines()
+            if not line.lstrip().startswith("#")
+        ]
+        topology_code = "\n".join(topology_code_lines)
+        # Also strip the function's docstring (between the first pair
+        # of triple-quotes) — the rationale doc references the
+        # legacy names for historical context.
+        if '"""' in topology_code:
+            first = topology_code.index('"""')
+            second = topology_code.index('"""', first + 3)
+            topology_code = (
+                topology_code[:first] + topology_code[second + 3:]
+            )
+        assert "_CLIENT_ONLY_PATTERNS" not in topology_code, (
+            "Topology path must not reference _CLIENT_ONLY_PATTERNS "
+            "-- it owns domain inference via infer_module_domains."
+        )
+        assert "_SERVER_ONLY_PATTERNS" not in topology_code, (
+            "Topology path must not reference _SERVER_ONLY_PATTERNS "
+            "-- it owns domain inference via infer_module_domains."
+        )
+        assert "_scripts_with_client_apis" not in topology_code
+        assert "_scripts_with_server_apis" not in topology_code
+
         # The PR3b generic table in scene_runtime_domain still
         # carries its distinguishing signals.
         assert any("RenderStepped" in p for p in _GENERIC_CLIENT_API_PATTERNS)

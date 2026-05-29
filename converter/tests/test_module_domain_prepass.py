@@ -364,22 +364,32 @@ class TestClassifyStorageTopologyInputsKwarg:
     def test_legacy_path_wins_when_topology_inputs_none(self) -> None:
         """Without ``topology_inputs``, the legacy fallback path runs.
 
-        Slice 7 deleted the regex-API client/server toucher detection,
-        so the legacy path routes purely by ``script_type``. Script A
-        (a ``Script``) lands in ServerScriptService; ModuleScript B
-        with a Script caller is server-only -> ServerStorage.
+        Slice 7 round 3 (Codex R2 P1 #4): the legacy path consults
+        the restored ``client_touchers`` / ``server_touchers`` sets.
+        Script A uses ``Players.LocalPlayer`` -> routes to
+        StarterPlayerScripts (auto-coerced to LocalScript) via the
+        legacy ``_CLIENT_ONLY_PATTERNS`` branch. ModuleScript B is
+        required by A; A is now a client-side caller, so B lands in
+        ReplicatedStorage (legacy "at least one client-side"
+        ModuleScript branch).
         """
-        from converter.storage_classifier import classify_storage
+        from converter.storage_classifier import (
+            classify_storage,
+            REPLICATED_STORAGE,
+            STARTER_PLAYER_SCRIPTS,
+        )
 
         scripts = [
             RbxScript(name="A", source="Players.LocalPlayer", script_type="Script"),
             RbxScript(name="B", source="return {}", script_type="ModuleScript"),
         ]
         classify_storage(scripts, dependency_map={"A": ["B"]})
-        # A is a Script -> SSS by default (no LocalScript type).
-        assert scripts[0].parent_path == SERVER_SCRIPT_SERVICE
-        # B is required only by a Script caller -> SS.
-        assert scripts[1].parent_path == SERVER_STORAGE
+        # A matches _CLIENT_ONLY_PATTERNS -> SPS (round-3 restored).
+        assert scripts[0].parent_path == STARTER_PLAYER_SCRIPTS
+        assert scripts[0].script_type == "LocalScript"  # auto-coerced
+        # B is required by A (client-side per touchers OR via the
+        # auto-coerced LocalScript type) -> RS.
+        assert scripts[1].parent_path == REPLICATED_STORAGE
 
 
 class TestTopologyInputsTranspileRan:
