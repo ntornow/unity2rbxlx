@@ -4210,9 +4210,25 @@ script.Disabled = true
           - Reads ``lifecycle_role`` off each module row (when set
             already by ``plan_scene_runtime``).
 
-        The returned ``TopologyInputs`` is persisted onto
-        ``StoragePlan`` by ``classify_storage`` so rehydration can
-        restore it on resume (slice 6 commit 4).
+        The returned ``TopologyInputs`` is NOT persisted onto
+        ``StoragePlan``. Per the slice-6 "save raw facts, recompute
+        conclusions" rule, ``domains`` and ``reachability_requirements``
+        depend on operator-editable inputs
+        (``scene_runtime.domain_overrides``, ``networking_mode``) +
+        current source, so they are recomputed by this function on
+        every run -- including assemble-no-retranspile resumes. On
+        resume, ``state.dependency_map`` is empty (set only inside
+        ``transpile_scripts``); ``derive_reachability_requirements``
+        intentionally returns ``{}`` in that case, and slice 7's
+        consumer falls back to the "unconstrained helper" path for
+        any module not present in the requirements map. This is the
+        same trade slice 3 already accepts for ``caller_graph``;
+        ``caller_graph`` itself remains persisted via
+        ``resolve_caller_graph``'s ``preserved_caller_graph`` path,
+        which is the explicit non-recomputable exception (it depends
+        on the transpile-time ``dependency_map`` surface that is
+        absent on no-transpile resumes). See ``slice-6.md`` handoff
+        for the rule + the two-point Codex amendment.
         """
         if self.ctx.scene_runtime_mode == "legacy":
             return None
