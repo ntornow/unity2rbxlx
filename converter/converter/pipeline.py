@@ -4361,14 +4361,25 @@ script.Disabled = true
             # is reached; the kwarg's ``None`` default exists so unit
             # tests + future callers can still invoke the method
             # without forcing the prepass dependency.
-            assert topology_inputs is not None, (
-                "slice 9a invariant: ``topology_inputs`` must be set "
-                "whenever ``_build_and_apply_topology`` is reached "
-                "via ``_classify_storage`` — same gate as the prepass."
-            )
-            self._build_and_apply_topology(
-                scene_runtime, plan, topology_inputs=topology_inputs,
-            )
+            #
+            # Phase 2a slice 9b R1 fold-in: the prepass also returns
+            # ``None`` when ``rbx_place.scripts`` is empty
+            # (``_maybe_run_topology_prepass`` line ~4440). The
+            # ``_classify_storage`` early-return at line ~4193 today
+            # covers the same condition, so this branch's gate
+            # (``modules`` non-empty + not legacy + not probe-skip)
+            # cannot legitimately be reached with empty scripts.
+            # Guard defensively anyway — a future caller that bypasses
+            # the early return (e.g. unit test rebinding state mid-
+            # method, an injected mid-method hook) should NOT crash
+            # the topology branch, just skip it. The check is
+            # conservative: ``topology_inputs is None`` is exactly the
+            # signal that the prepass declined to run.
+            if topology_inputs is not None:
+                self._build_and_apply_topology(
+                    scene_runtime, plan,
+                    topology_inputs=topology_inputs,
+                )
 
         plan_path.write_text(
             _json.dumps({

@@ -27,7 +27,6 @@
       "lifecycle_role": "auto_run",
       "module_path": "",
       "provenance": {},
-      "reachability_forced_container": "",
       "reachability_required_container": "",
       "script_class": "LocalScript",
       "stem": "AnimatorTarget"
@@ -40,7 +39,6 @@
       "lifecycle_role": "auto_run",
       "module_path": "",
       "provenance": {},
-      "reachability_forced_container": "",
       "reachability_required_container": "",
       "script_class": "LocalScript",
       "stem": "Door"
@@ -53,7 +51,6 @@
       "lifecycle_role": "auto_run",
       "module_path": "",
       "provenance": {},
-      "reachability_forced_container": "",
       "reachability_required_container": "",
       "script_class": "LocalScript",
       "stem": "HudControl"
@@ -66,7 +63,6 @@
       "lifecycle_role": "auto_run",
       "module_path": "",
       "provenance": {},
-      "reachability_forced_container": "",
       "reachability_required_container": "",
       "script_class": "Script",
       "stem": "SpawnManager"
