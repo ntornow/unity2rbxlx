@@ -3782,3 +3782,455 @@ class TestSlice9bR1DegenerateFixture:
         # No plan written: storage_plan stays None (early-return
         # before any classify_storage call).
         assert pipeline.ctx.storage_plan is None
+
+
+class TestSlice10ReachabilityRequirementsNormalization:
+    """Phase 2a slice 10: ``build_topology._build_modules_block`` reads
+    ``reachability_required_container`` from
+    ``TopologyInputs.reachability_requirements[sid]`` normalized
+    through the same predicate gate
+    ``finalize_topology_containers`` uses
+    (``current_container in _SERVER_CONTAINERS_FOR_REACHABILITY``).
+
+    These tests pin all four normalization cases AND assert
+    byte-equivalence to today's planner-row audit signal observable
+    for the same upstream → read-site flow. Crucially, the fixtures
+    do NOT pre-stamp ``domain_signals["reachability_forced_container"]``
+    on the module rows — they exercise the real upstream producer
+    (``derive_reachability_requirements``) so a producer/consumer
+    mismatch would surface as a test failure (the slice-7 lesson the
+    brief calls out: pre-stamped fixtures mask producer/consumer
+    asymmetries).
+    """
+
+    def _build_artifact(
+        self, *, helper_parent_path: str, dep_map: dict[str, list[str]],
+        requirements: dict[str, str] | None = None,
+    ):
+        """Construct a scene_runtime + RbxScripts pair with one
+        ClientA module + one Helper module, where helper_script is
+        seated in ``helper_parent_path``. When ``requirements`` is
+        provided, it pins the slice-10 reachability_requirements map
+        directly; when ``None``, the caller is expected to derive it.
+        Returns ``(scene_runtime, scripts, helper_script)``.
+        """
+        sr = _mk_artifact(modules={
+            "guid-client": _mk_module("ClientA", "client"),
+            "guid-helper": {
+                "stem": "Helper", "class_name": "Helper",
+                "runtime_bearing": False,
+                "is_loader": False, "character_attached": False,
+            },
+        })
+        helper_script = RbxScript(
+            name="Helper", source="-- helper",
+            script_type="ModuleScript",
+            parent_path=helper_parent_path,
+        )
+        client_script = _mk_rbx_script("ClientA", "LocalScript")
+        return sr, [client_script, helper_script], helper_script
+
+    def _build_topology_with_reqs(
+        self,
+        sr,
+        scripts,
+        helper_script: RbxScript,
+        client_script: RbxScript,
+        *,
+        reachability_requirements: dict[str, str] | None,
+    ):
+        """Helper: build the topology block directly with the supplied
+        requirements map. Mirrors the production wiring at
+        ``pipeline._build_and_apply_topology``.
+        """
+        from converter.scene_runtime_topology.build_topology import (
+            build_topology,
+        )
+        return build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={
+                "ClientA": client_script,
+                "Helper": helper_script,
+            },
+            reachability_requirements=reachability_requirements,
+        )
+
+    def test_case_1_requirement_missing_emits_empty_string(self) -> None:
+        """Helper not in ``reachability_requirements`` (non-helper,
+        or unconstrained helper) -> ``""``. Matches today's empty
+        audit signal for the same rows.
+        """
+        sr, scripts, helper = self._build_artifact(
+            helper_parent_path="ServerStorage",
+            dep_map={},
+        )
+        artifact = self._build_topology_with_reqs(
+            sr, scripts, helper, scripts[0],
+            # Empty map: helper is not in the dict.
+            reachability_requirements={},
+        )
+        entry = artifact["modules"]["guid-helper"]
+        assert entry["reachability_required_container"] == ""
+
+    def test_case_2_excluded_sentinel_emits_empty_string(self) -> None:
+        """``reachability_requirements[sid] == "__excluded__"`` (helper
+        reached by BOTH client and server require-graphs) -> ``""``.
+
+        Today: the conflict path in ``finalize_topology_containers``
+        stamps ``fail_closed_reason`` but NEVER writes
+        ``reachability_forced_container``, so the audit signal stays
+        empty. Slice 10 collapses the sentinel to ``""`` at the read
+        site (the conflict semantic is owned by
+        ``fail_closed_reason``, not the topology entry surface).
+        """
+        sr, scripts, helper = self._build_artifact(
+            helper_parent_path="ServerStorage",
+            dep_map={},
+        )
+        artifact = self._build_topology_with_reqs(
+            sr, scripts, helper, scripts[0],
+            reachability_requirements={"guid-helper": "__excluded__"},
+        )
+        entry = artifact["modules"]["guid-helper"]
+        assert entry["reachability_required_container"] == ""
+
+    def test_case_3_replicated_storage_with_gated_container_emits_replicated_storage(
+        self,
+    ) -> None:
+        """``requirement == "ReplicatedStorage"`` AND helper currently
+        in ``_SERVER_CONTAINERS_FOR_REACHABILITY`` (the late-hoist
+        gate fires) -> ``"ReplicatedStorage"``. Mirrors today's
+        planner audit signal stamp from the late hoist arm
+        (module_domain.py:947-955 pre-slice-10).
+
+        Fixture invariant 10 setup: invariant 10 enforces
+        ``module_path.startswith(f"{required}.")``; when the gate
+        fires the late hoist arm rewrites ``module_path`` to
+        ``"ReplicatedStorage.<name>"`` in lockstep. We pre-stamp
+        ``module_path`` on the synthetic module row to satisfy that
+        coherence, then assert the slice-10 read site surfaces
+        ``"ReplicatedStorage"`` from the normalization.
+        """
+        from converter.scene_runtime_topology.module_domain import (
+            _SERVER_CONTAINERS_FOR_REACHABILITY,
+        )
+        # Both gated containers exercise the same arm; covering both
+        # pins the predicate identity (codex P1.2 from slice 4: the
+        # legacy check missed ServerScriptService).
+        for gated in sorted(_SERVER_CONTAINERS_FOR_REACHABILITY):
+            sr, scripts, helper = self._build_artifact(
+                helper_parent_path=gated,
+                dep_map={},
+            )
+            # Pre-stamp module_path to mirror the late-hoist
+            # triple-write (script.parent_path + module.container +
+            # module.module_path move in lockstep). The gate check
+            # at the read site uses script.parent_path; the late hoist
+            # arm would have mutated parent_path AND module_path; for
+            # this synthetic fixture we manually establish the
+            # pre-hoist parent_path (the gate input) but keep the
+            # post-hoist module_path (invariant 10 input) coherent.
+            modules = sr["modules"]
+            modules["guid-helper"]["module_path"] = (  # type: ignore[index]
+                "ReplicatedStorage.Helper"
+            )
+            artifact = self._build_topology_with_reqs(
+                sr, scripts, helper, scripts[0],
+                reachability_requirements={
+                    "guid-helper": "ReplicatedStorage",
+                },
+            )
+            entry = artifact["modules"]["guid-helper"]
+            assert entry["reachability_required_container"] == (
+                "ReplicatedStorage"
+            ), (
+                f"gated={gated!r}: expected 'ReplicatedStorage', got "
+                f"{entry['reachability_required_container']!r}"
+            )
+
+    def test_case_4_replicated_storage_with_nonserver_container_emits_empty_string(
+        self,
+    ) -> None:
+        """``requirement == "ReplicatedStorage"`` AND helper already
+        in a non-gated container -> ``""``. Mirrors today's behavior:
+        the late hoist arm's gate at module_domain.py:939
+        short-circuits when ``current_container`` is not in
+        ``_SERVER_CONTAINERS_FOR_REACHABILITY``, so the audit signal
+        stays empty. The semantic alignment with slice 7's
+        production behavior (the
+        ``_decide_script_container_from_topology`` pre-empt also
+        leaves parent_path = ReplicatedStorage when the requirement
+        fires).
+        """
+        for non_gated in [
+            "ReplicatedStorage",
+            "Workspace",
+            "StarterPlayer.StarterPlayerScripts",
+            "ReplicatedFirst",
+            "",  # the empty-container case (defensively normalize)
+        ]:
+            sr, scripts, helper = self._build_artifact(
+                helper_parent_path=non_gated,
+                dep_map={},
+            )
+            artifact = self._build_topology_with_reqs(
+                sr, scripts, helper, scripts[0],
+                reachability_requirements={
+                    "guid-helper": "ReplicatedStorage",
+                },
+            )
+            entry = artifact["modules"]["guid-helper"]
+            assert entry["reachability_required_container"] == "", (
+                f"non_gated={non_gated!r}: expected '', got "
+                f"{entry['reachability_required_container']!r}"
+            )
+
+    def test_byte_equivalence_to_legacy_audit_signal_through_real_upstream(
+        self,
+    ) -> None:
+        """Drive ``derive_reachability_requirements`` (the real
+        upstream producer) end-to-end on a fixture that exercises
+        each of the 4 normalization cases, then compare the
+        slice-10 normalized output against the legacy audit signal
+        the pre-slice-10 ``finalize_topology_containers`` would have
+        stamped for the SAME pipeline run.
+
+        The legacy audit signal value is what
+        ``finalize_topology_containers`` writes when its gate fires:
+        the gate checks ``script.parent_path`` AT THE TIME OF THE
+        FINALIZER. After slice 7's
+        ``_decide_script_container_from_topology`` runs in production,
+        ``parent_path`` is already at the requirement's target — so
+        the gate short-circuits and the audit signal stayed empty.
+        This test isolates the producer/consumer flow on a fixture
+        with parent_path already at "ServerStorage" (the slice-4
+        seed shape) so the gate would have fired pre-slice-10 — and
+        asserts the slice-10 normalized output matches that
+        post-gate signal byte-for-byte.
+
+        Slice 7 lesson (per the slice 10 brief): the normalization
+        test must exercise the real upstream → read-site flow, not
+        pre-stamp ``domain_signals`` directly.
+        """
+        from converter.scene_runtime_domain import (
+            derive_reachability_requirements,
+            infer_module_domains,
+        )
+
+        # Set up: 4 helpers exercising all 4 cases.
+        sr = _mk_artifact(modules={
+            # Case 1: non-helper / unconstrained — no dep edge
+            "guid-client": _mk_module("ClientA", "client"),
+            "guid-helper-unconstrained": {
+                "stem": "Unconstrained", "class_name": "Unconstrained",
+                "runtime_bearing": False,
+                "is_loader": False, "character_attached": False,
+            },
+            # Case 2: helper reached by BOTH client and server
+            "guid-server": _mk_module("ServerA", "server"),
+            "guid-helper-conflict": {
+                "stem": "Conflict", "class_name": "Conflict",
+                "runtime_bearing": False,
+                "is_loader": False, "character_attached": False,
+            },
+            # Case 3: client-only, in gated container — gate fires
+            "guid-helper-hoist": {
+                "stem": "NeedsHoist", "class_name": "NeedsHoist",
+                "runtime_bearing": False,
+                "is_loader": False, "character_attached": False,
+            },
+            # Case 4: client-only, already in non-gated container
+            "guid-helper-already-rs": {
+                "stem": "AlreadyRS", "class_name": "AlreadyRS",
+                "runtime_bearing": False,
+                "is_loader": False, "character_attached": False,
+            },
+        })
+        # Pin the runtime-bearing modules' domains via the operator
+        # override surface so ``infer_module_domains`` doesn't fall
+        # through to the zero-signal path (the synthetic empty C#
+        # sources don't carry strong signals). Helpers are
+        # ``runtime_bearing=False`` so they short-circuit to
+        # ``domain="helper"`` regardless.
+        sr["domain_overrides"] = {  # type: ignore[index]
+            "guid-client": "client",
+            "guid-server": "server",
+        }
+
+        # Scripts: helper-hoist starts in ServerStorage (gated);
+        # helper-already-rs starts in ReplicatedStorage (non-gated).
+        client_script = _mk_rbx_script("ClientA", "LocalScript")
+        server_script = _mk_rbx_script("ServerA", "Script")
+        helper_unconstrained = RbxScript(
+            name="Unconstrained", source="-- u",
+            script_type="ModuleScript",
+            parent_path="ServerStorage",
+        )
+        helper_conflict = RbxScript(
+            name="Conflict", source="-- c",
+            script_type="ModuleScript",
+            parent_path="ServerStorage",
+        )
+        helper_hoist = RbxScript(
+            name="NeedsHoist", source="-- h",
+            script_type="ModuleScript",
+            parent_path="ServerStorage",
+        )
+        helper_already_rs = RbxScript(
+            name="AlreadyRS", source="-- r",
+            script_type="ModuleScript",
+            parent_path="ReplicatedStorage",
+        )
+        scripts = [
+            client_script, server_script,
+            helper_unconstrained, helper_conflict,
+            helper_hoist, helper_already_rs,
+        ]
+        # dep_map by class_name:
+        # ClientA -> NeedsHoist, AlreadyRS, Conflict
+        # ServerA -> Conflict
+        dep_map = {
+            "ClientA": ["NeedsHoist", "AlreadyRS", "Conflict"],
+            "ServerA": ["Conflict"],
+        }
+
+        # Real upstream: produce ``reachability_requirements`` the
+        # way ``_maybe_run_topology_prepass`` does.
+        domain_results = infer_module_domains(
+            cast("dict", sr),
+            scripts,
+            dependency_map=dep_map,
+        )
+        reqs = derive_reachability_requirements(
+            cast("dict", sr),
+            scripts,
+            domain_results,
+            dependency_map=dep_map,
+        )
+
+        # The producer should have classified:
+        #   - Unconstrained: NOT in reqs (no client dep edge)
+        #   - Conflict: "__excluded__" (both client + server reach it)
+        #   - NeedsHoist: "ReplicatedStorage" (client-only reach)
+        #   - AlreadyRS: "ReplicatedStorage" (client-only reach)
+        assert "guid-helper-unconstrained" not in reqs
+        assert reqs.get("guid-helper-conflict") == "__excluded__"
+        assert reqs.get("guid-helper-hoist") == "ReplicatedStorage"
+        assert reqs.get("guid-helper-already-rs") == "ReplicatedStorage"
+
+        # Pre-stamp module_path on the rows whose normalization will
+        # emit a non-empty ``reachability_required_container`` to
+        # satisfy invariant 10's ``module_path`` <-> required-container
+        # coherence check. In production this stamping happens via
+        # ``_stamp_container_and_path`` + the late hoist arm inside
+        # ``finalize_topology_containers``; we mimic the post-finalizer
+        # module_path while keeping ``script.parent_path`` at the
+        # pre-finalizer value the legacy audit signal's gate would
+        # have checked. This pins the producer/consumer link
+        # (``derive_reachability_requirements`` → slice-10 normalized
+        # read) without entangling the test with the late finalizer's
+        # parent_path mutation.
+        modules = sr["modules"]
+        modules["guid-helper-hoist"]["module_path"] = (  # type: ignore[index]
+            "ReplicatedStorage.NeedsHoist"
+        )
+
+        # Build topology BEFORE running the late finalizer (so
+        # parent_path is still the pre-hoist value the legacy audit
+        # signal's gate would have checked).
+        from converter.scene_runtime_topology.build_topology import (
+            build_topology,
+        )
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={
+                "ClientA": client_script,
+                "ServerA": server_script,
+                "Unconstrained": helper_unconstrained,
+                "Conflict": helper_conflict,
+                "NeedsHoist": helper_hoist,
+                "AlreadyRS": helper_already_rs,
+            },
+            reachability_requirements=reqs,
+        )
+
+        # Byte-equivalent to the legacy audit signal observable for
+        # the matching upstream state:
+        #   - Unconstrained: today's audit = "" (no gate). Slice 10 = ""
+        #     (requirement missing -> "").
+        #   - Conflict: today's audit = "" (conflict arm at
+        #     module_domain.py:917-935 stamps fail_closed_reason but
+        #     NEVER reachability_forced_container).
+        #     Slice 10 = "" ("__excluded__" -> "").
+        #   - NeedsHoist: today's audit = "ReplicatedStorage" (the
+        #     hoist arm fires: parent_path="ServerStorage" is in the
+        #     gated set). Slice 10 = "ReplicatedStorage" (case 3).
+        #   - AlreadyRS: today's audit = "" (gate at
+        #     module_domain.py:939 short-circuits: parent_path
+        #     ="ReplicatedStorage" is NOT in the gated set).
+        #     Slice 10 = "" (case 4).
+        expected = {
+            "guid-helper-unconstrained": "",
+            "guid-helper-conflict": "",
+            "guid-helper-hoist": "ReplicatedStorage",
+            "guid-helper-already-rs": "",
+        }
+        for sid, want in expected.items():
+            got = artifact["modules"][sid]["reachability_required_container"]
+            assert got == want, (
+                f"sid={sid!r}: slice-10 normalized output {got!r} "
+                f"diverges from legacy audit signal {want!r}"
+            )
+
+    def test_normalize_helper_is_pure_and_handles_unrecognized_values(
+        self,
+    ) -> None:
+        """Direct unit test on the normalization helper itself.
+
+        Pinning purity (no module state mutation) and the
+        defensive fall-through for unrecognized requirement values.
+        Today's universe is ``{REPLICATED_STORAGE, "__excluded__"}``
+        per ``derive_reachability_requirements``; the helper
+        collapses anything else to ``""`` so a future producer
+        adding a new value doesn't silently surface a bogus
+        container on the topology entry without an explicit
+        opt-in.
+        """
+        from converter.scene_runtime_topology.build_topology import (
+            _normalize_reachability_requirement,
+        )
+        from converter.scene_runtime_topology.module_domain import (
+            _SERVER_CONTAINERS_FOR_REACHABILITY,
+        )
+
+        # None / missing.
+        assert _normalize_reachability_requirement(None, "") == ""
+        assert _normalize_reachability_requirement(None, "ServerStorage") == ""
+
+        # Sentinel.
+        assert _normalize_reachability_requirement("__excluded__", "") == ""
+        assert _normalize_reachability_requirement(
+            "__excluded__", "ServerStorage",
+        ) == ""
+
+        # ReplicatedStorage + gated -> ReplicatedStorage.
+        for gated in _SERVER_CONTAINERS_FOR_REACHABILITY:
+            assert _normalize_reachability_requirement(
+                "ReplicatedStorage", gated,
+            ) == "ReplicatedStorage"
+
+        # ReplicatedStorage + non-gated -> "".
+        for non_gated in [
+            "ReplicatedStorage", "Workspace",
+            "StarterPlayer.StarterPlayerScripts", "ReplicatedFirst", "",
+        ]:
+            assert _normalize_reachability_requirement(
+                "ReplicatedStorage", non_gated,
+            ) == ""
+
+        # Unrecognized value -> "" (defensive fall-through).
+        assert _normalize_reachability_requirement(
+            "SomeFutureContainer", "ServerStorage",
+        ) == ""
