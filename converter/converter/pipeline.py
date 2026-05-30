@@ -4784,6 +4784,12 @@ script.Disabled = true
         # ``"ModuleScript"``, the same safe-default outcome
         # ``scripts_by_class`` already produces for those rows.
         script_by_sid: dict[str, RbxScript] | None = None
+        # Phase 2a slice 10: also plumb the raw analysis output so
+        # ``_build_modules_block`` reads ``reachability_required_container``
+        # from ``TopologyInputs.reachability_requirements`` rather than
+        # the planner-row audit signal. See the slice-10 block comment
+        # in ``build_topology._build_modules_block``.
+        reachability_requirements: dict[str, str] | None = None
         if topology_inputs is not None:
             scripts_by_name: dict[str, RbxScript] = {
                 s.name: s for s in self.state.rbx_place.scripts if s.name
@@ -4793,6 +4799,9 @@ script.Disabled = true
                 for script_name, sid in topology_inputs["script_id_by_name"].items()
                 if script_name in scripts_by_name
             }
+            reachability_requirements = (
+                topology_inputs["reachability_requirements"]
+            )
 
         try:
             artifact = build_topology(
@@ -4824,6 +4833,10 @@ script.Disabled = true
                 # join for ``_build_modules_block`` (see block
                 # comment above for the asymmetric-join rationale).
                 script_by_sid=script_by_sid,
+                # Phase 2a slice 10: raw analysis output for the
+                # topology entry's ``reachability_required_container``
+                # surface. See block comment above.
+                reachability_requirements=reachability_requirements,
             )
         except Exception as exc:
             # Topology invariants are fail-closed by design, but

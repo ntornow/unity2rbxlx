@@ -135,6 +135,16 @@ from converter.scene_runtime_topology.lifecycle_roles import (
     LifecycleRole,
     derive_module_lifecycle_role,
 )
+# Phase 2a slice 10: import the predicate gate sibling
+# ``finalize_topology_containers`` uses to decide whether to fire the
+# late hoist. The topology read site reproduces the same gate so the
+# new ``reachability_required_container`` value matches the dropped
+# audit signal byte-for-byte in all four normalization cases (see
+# ``_normalize_reachability_requirement`` for the case enumeration).
+from converter.scene_runtime_topology.module_domain import (
+    _SERVER_CONTAINERS_FOR_REACHABILITY,
+)
+from converter.storage_classifier import REPLICATED_STORAGE
 
 log = logging.getLogger(__name__)
 
@@ -372,6 +382,7 @@ def build_topology(
     preserved_animation_drivers: dict[str, AnimationDriverEntry] | None = None,
     preserved_caller_graph: dict[str, list[str]] | None = None,
     script_by_sid: dict[str, RbxScript] | None = None,
+    reachability_requirements: dict[str, str] | None = None,
 ) -> TopologyArtifact:
     """Assemble the topology artifact + enforce 8 emit-time invariants.
 
@@ -439,6 +450,22 @@ def build_topology(
     ``None`` (the default) preserves the legacy class_name-only join,
     keeping back-compat for callers that don't carry topology_inputs.
 
+    ``reachability_requirements`` (Phase 2a slice 10): the
+    ``{script_id: "ReplicatedStorage" | "__excluded__"}`` map
+    ``derive_reachability_requirements`` produced earlier in the prepass
+    (lives on ``TopologyInputs.reachability_requirements``). Slice 10
+    switched the topology entry's ``reachability_required_container``
+    source from the planner-row audit signal
+    (``domain_signals["reachability_forced_container"]``) to this raw
+    analysis fact, per slice 6's "save raw facts, recompute conclusions"
+    rule. Normalized through the same late-hoist predicate
+    ``finalize_topology_containers`` uses (``current_container in
+    _SERVER_CONTAINERS_FOR_REACHABILITY``) so the emitted value is still
+    exactly ``"ReplicatedStorage"`` (gate fired) or ``""`` (gate did
+    not fire / no requirement). ``None`` (the default) makes the read
+    fall back to the legacy audit-signal read site for back-compat with
+    callers that don't carry the prepass output.
+
     Returns the artifact dict ready to merge into
     ``scene_runtime["topology"]``.
 
@@ -462,6 +489,7 @@ def build_topology(
     modules_block = _build_modules_block(
         scene_runtime, scripts_by_class, guid_index,
         script_by_sid=script_by_sid,
+        reachability_requirements=reachability_requirements,
     )
     edges_block = compute_cross_domain_edges(scene_runtime)
     if preserved_animation_drivers is not None:
@@ -498,12 +526,62 @@ def build_topology(
 # Block builders
 # ---------------------------------------------------------------------------
 
+def _normalize_reachability_requirement(
+    requirement: str | None, current_container: str,
+) -> str:
+    """Phase 2a slice 10: project the raw analysis output
+    ``reachability_requirements[sid]`` onto the same surface the
+    dropped audit signal ``domain_signals["reachability_forced_container"]``
+    used to carry, so the topology entry's
+    ``reachability_required_container`` value is byte-equivalent to
+    today's read across all four cases:
+
+    1. ``requirement is None`` (missing / non-helper / unconstrained
+       helper) -> ``""`` -- the audit signal was never written.
+    2. ``requirement == "__excluded__"`` (helper reached by BOTH client
+       and server) -> ``""`` -- the conflict path in
+       ``finalize_topology_containers`` does NOT stamp
+       ``reachability_forced_container`` (only ``fail_closed_reason``).
+    3. ``requirement == "ReplicatedStorage"`` AND
+       ``current_container in _SERVER_CONTAINERS_FOR_REACHABILITY``
+       (hoist gate fires) -> ``"ReplicatedStorage"`` -- mirrors the
+       late-hoist stamp at module_domain.py:947-955.
+    4. ``requirement == "ReplicatedStorage"`` AND helper is already
+       outside the gated containers (e.g. already in ReplicatedStorage
+       or Workspace) -> ``""`` -- the late hoist gate at
+       module_domain.py:939 short-circuits, so the audit signal stayed
+       unset. Today's read site sees ``""``; we preserve that here so
+       slice 10 is an internal-source swap, not a semantic change.
+
+    The gate predicate is intentionally re-applied here rather than
+    encoded into the raw map: ``reachability_requirements`` is the
+    raw analysis fact (pure over ``domain_results`` +
+    ``dependency_map``); the audit signal is the legacy CONCLUSION
+    of "raw fact AND gate fired". Slice 6's persistence rule says
+    save raw facts and recompute conclusions, so the gate lives at
+    the read site that consumes the conclusion.
+    """
+    if requirement is None:
+        return ""
+    if requirement == "__excluded__":
+        return ""
+    if requirement == REPLICATED_STORAGE:
+        if current_container in _SERVER_CONTAINERS_FOR_REACHABILITY:
+            return REPLICATED_STORAGE
+        return ""
+    # Any future requirement values we don't recognize collapse to
+    # the empty default. Today's universe is {REPLICATED_STORAGE,
+    # "__excluded__"} per ``derive_reachability_requirements``.
+    return ""
+
+
 def _build_modules_block(
     scene_runtime: SceneRuntimeArtifact,
     scripts_by_class: dict[str, RbxScript],
     guid_index: GuidIndex | None,
     *,
     script_by_sid: dict[str, RbxScript] | None = None,
+    reachability_requirements: dict[str, str] | None = None,
 ) -> dict[str, TopologyModuleEntry]:
     """One TopologyModuleEntry per ``scene_runtime.modules`` row.
 
@@ -607,27 +685,71 @@ def _build_modules_block(
                     provenance["source_path"] = abs_path.as_posix()
 
         # Phase 2a slice 4 — read the reachability pair from the
-        # planner row. The planner stamps these in
-        # `_apply_reachability_rule` + `_stamp_container_and_path`
-        # (module_domain.py); empty strings indicate "rule did not
-        # fire for this module" (the default for non-helper modules
-        # and for helpers in non-server containers pre-rule).
+        # planner row's mutation-driven surface. ``module_path`` is
+        # the host-runtime require target stamped by
+        # ``_stamp_container_and_path`` + the late hoist arm of
+        # ``finalize_topology_containers``.
         module_path_obj = module.get("module_path", "")
         module_path = module_path_obj if isinstance(module_path_obj, str) else ""
-        # `reachability_required_container` is the topology's
-        # consumer-facing name for the rule-derived REQUIREMENT.
-        # The planner-side audit lives at
-        # `domain_signals.reachability_forced_container` (set by
-        # `_apply_reachability_rule` when the hoist fires); when the
-        # rule fires the planner mutates `container` + `module_path`
-        # in lockstep with that audit, so the audit signal IS the
-        # required-container value for non-degenerate runs. Slice 9b
-        # dropped the parallel topology-side mirror; the
-        # required-container surface is the single source of truth.
-        signals_obj = module.get("domain_signals", {})
-        signals = signals_obj if isinstance(signals_obj, dict) else {}
-        rfc_obj = signals.get("reachability_forced_container", "")
-        reachability_required = rfc_obj if isinstance(rfc_obj, str) else ""
+
+        # Phase 2a slice 10: ``reachability_required_container``
+        # SOURCE switched from the planner-row audit signal
+        # ``domain_signals["reachability_forced_container"]`` to the
+        # raw analysis fact ``reachability_requirements[sid]`` (lives
+        # on ``TopologyInputs.reachability_requirements``, produced by
+        # ``derive_reachability_requirements``). Normalized through
+        # ``_normalize_reachability_requirement`` so the emitted value
+        # is byte-equivalent to today's read across all four cases
+        # (None / "__excluded__" / RS-needs-hoist / RS-already-outside-
+        # gated-containers). Per slice 6's persistence rule we save
+        # raw facts and recompute conclusions at the consumer; the
+        # late-hoist predicate gate
+        # ``current_container in _SERVER_CONTAINERS_FOR_REACHABILITY``
+        # is the "recompute" step.
+        #
+        # ``reachability_requirements is None`` is the back-compat
+        # fallback for callers that haven't migrated to pass
+        # ``TopologyInputs`` through (legacy test paths, future
+        # external embedders). In that case we read the legacy audit
+        # signal so build_topology still emits a coherent entry. The
+        # pipeline call site (``_build_and_apply_topology``) always
+        # passes the prepass output, so production runs go through the
+        # primary path.
+        reachability_required: str
+        if reachability_requirements is not None:
+            # Determine the helper's CURRENT container -- the script
+            # row's ``parent_path``, which ``classify_storage`` and
+            # the late hoist arm have already stamped at this point in
+            # the pipeline. Falls back to the module row's
+            # ``container`` when the script lookup miss (e.g. modules
+            # whose class_name + stem both collide / both miss are
+            # absent from ``script_by_sid`` AND ``scripts_by_class``).
+            # The fallback mirrors the legacy "the planner stamps
+            # ``container`` in lockstep with the audit signal"
+            # contract.
+            current_container = ""
+            if script is not None:
+                pp = script.parent_path or ""
+                current_container = pp
+            else:
+                container_obj = module.get("container", "")
+                if isinstance(container_obj, str):
+                    current_container = container_obj
+            reachability_required = _normalize_reachability_requirement(
+                reachability_requirements.get(script_id),
+                current_container,
+            )
+        else:
+            # Back-compat fallback: read the legacy audit signal. Used
+            # by legacy callers and a handful of unit-test paths that
+            # don't carry a TopologyInputs through. Retire when the
+            # last such caller migrates.
+            signals_obj = module.get("domain_signals", {})
+            signals = signals_obj if isinstance(signals_obj, dict) else {}
+            rfc_obj = signals.get("reachability_forced_container", "")
+            reachability_required = (
+                rfc_obj if isinstance(rfc_obj, str) else ""
+            )
 
         entry: TopologyModuleEntry = {
             "stem": stem,
