@@ -127,7 +127,7 @@ from converter.scene_runtime_topology.animation_routing import (
     resolve_driver,
 )
 from converter.scene_runtime_topology.bridge_emit import (
-    SYNTHESIZED_LISTENER_ID_PREFIX,
+    SYNTHESIZED_LISTENER_ID_PREFIXES,
 )
 from converter.scene_runtime_topology.cross_domain_edges import (
     CrossDomainEdge,
@@ -1441,12 +1441,16 @@ def _enforce_invariants(
     # Invariant 2b (Phase 2b slice 2): every
     # ``cross_domain_edge_candidates[*].bridge_member_scripts[*].ref``
     # resolves to either a real script_id in the modules block OR a
-    # synthesized listener id (a string with the
-    # ``__bridge_listener__`` prefix slice 2's
-    # ``bridge_emit.synthesize_listener_id`` allocates). Catches the
-    # Claude arch review risk #2 (silent slice 2 / slice 3 id drift)
-    # by ensuring a ref shape slice 3 will dereference at emit time
-    # is well-formed BEFORE slice 3 runs.
+    # synthesized listener id (a string with one of the prefixes in
+    # ``bridge_emit.SYNTHESIZED_LISTENER_ID_PREFIXES`` slice 2's
+    # ``bridge_emit.synthesize_listener_id`` allocates). Slice 2 R2
+    # (2026-05-31): the helper now emits per-direction prefixes
+    # (``__bridge_listener_server__`` for client->server,
+    # ``__bridge_listener_client__`` for server->client) so this
+    # invariant accepts EITHER shape. Catches the Claude arch review
+    # risk #2 (silent slice 2 / slice 3 id drift) by ensuring a ref
+    # shape slice 3 will dereference at emit time is well-formed
+    # BEFORE slice 3 runs.
     real_script_ids = set(modules_block.keys())
     for cand in candidates:
         members = cand.get("bridge_member_scripts", [])
@@ -1466,15 +1470,18 @@ def _enforce_invariants(
                 )
             if ref in real_script_ids:
                 continue
-            if ref.startswith(SYNTHESIZED_LISTENER_ID_PREFIX):
+            if any(
+                ref.startswith(prefix)
+                for prefix in SYNTHESIZED_LISTENER_ID_PREFIXES
+            ):
                 continue
             _abort(
                 2,
                 f"cross_domain_edge_candidates row has a "
                 f"bridge_member_scripts ref {ref!r} that is neither "
                 f"a real script_id in modules nor a synthesized "
-                f"listener id (prefix "
-                f"{SYNTHESIZED_LISTENER_ID_PREFIX!r}). "
+                f"listener id (one of prefixes "
+                f"{SYNTHESIZED_LISTENER_ID_PREFIXES!r}). "
                 f"Slice 3's emitter would dereference an invalid id.",
                 row=cand,
             )

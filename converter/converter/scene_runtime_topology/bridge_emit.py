@@ -17,47 +17,97 @@ slice 2 would catch the breakage on slice 3 builds, but only AFTER
 silently shipping a stale artifact on slice 2-only builds. Centralizing
 the synthesis here prevents that drift.
 
+Slice 2 R2 (2026-05-31): the bridge direction matters. A
+client-originated edge needs a SERVER listener (``:FireServer`` ->
+``OnServerEvent``); a server-originated edge needs a CLIENT listener
+(``:FireClient``/``:FireAllClients`` -> ``OnClientEvent``). The
+listener-id helper takes an explicit ``direction`` so slice 3 emits the
+correct ``RbxScript`` script_type at the correct DataModel location and
+the candidate-`ref`-validity invariant recognizes BOTH synthesized
+prefixes.
+
 Slice 3 will add the rest of the module (the actual rewriter +
 RemoteEvent/Script synthesizers). Slice 2 is intentionally minimal.
 """
 
 from __future__ import annotations
 
+from typing import Literal
 
-# Distinct prefix so the candidate-ref-validity invariant in
+
+# Distinct prefixes so the candidate-ref-validity invariant in
 # ``build_topology._enforce_invariants`` can recognize a synthesized id
 # without consulting the modules block. Real script ids never start with
 # a leading underscore-block pattern in this codebase (they're either
 # Unity GUIDs or planner-derived ``<stem>-<idx>`` strings), so collision
 # with a legitimate script id is impossible by construction.
-SYNTHESIZED_LISTENER_ID_PREFIX = "__bridge_listener__"
+#
+# Slice 2 R2: two distinct prefixes (one per direction) so the invariant
+# can recognize either shape, and so dumps make the direction visible
+# at a glance during triage.
+SYNTHESIZED_SERVER_LISTENER_ID_PREFIX = "__bridge_listener_server__"
+SYNTHESIZED_CLIENT_LISTENER_ID_PREFIX = "__bridge_listener_client__"
+
+# All synthesized-listener prefixes the invariant must accept. Closed
+# tuple so adding a future direction (if one ever exists) forces a code
+# edit here rather than a silent drift.
+SYNTHESIZED_LISTENER_ID_PREFIXES: tuple[str, ...] = (
+    SYNTHESIZED_SERVER_LISTENER_ID_PREFIX,
+    SYNTHESIZED_CLIENT_LISTENER_ID_PREFIX,
+)
 
 
-def synthesize_listener_id(event_name: str) -> str:
-    """Return the deterministic script_id for the server-side listener
-    that ``slice 3``'s emitter will synthesize for ``event_name``.
+BridgeDirection = Literal["client_to_server", "server_to_client"]
 
-    The id is stable across runs given the same ``event_name``; slice 2's
-    enrichment pass writes this value into
-    ``bridge_member_scripts[*].ref`` for the ``server_listener`` role,
-    and slice 3's emitter uses the same helper when it allocates the
-    synthesized listener ``RbxScript`` -- so the artifact and the
-    emitted script agree by construction, not by parallel reinvention.
+
+def synthesize_listener_id(
+    event_name: str,
+    *,
+    direction: BridgeDirection,
+) -> str:
+    """Return the deterministic script_id for the listener that
+    ``slice 3``'s emitter will synthesize for ``event_name``.
+
+    ``direction``:
+      - ``"client_to_server"`` (client producer -> server listener):
+        emitter rewrites ``SetAttribute`` to ``:FireServer(target, v)``;
+        the synthesized listener subscribes via ``OnServerEvent``.
+      - ``"server_to_client"`` (server producer -> client listener):
+        emitter rewrites ``SetAttribute`` to ``:FireClient(target, v)``
+        or ``:FireAllClients(v)``; the synthesized listener subscribes
+        via ``OnClientEvent``.
+
+    The id is stable across runs given the same ``(event_name,
+    direction)`` pair; slice 2's enrichment pass writes this value into
+    ``bridge_member_scripts[*].ref`` for the listener role, and slice
+    3's emitter uses the same helper when it allocates the synthesized
+    listener ``RbxScript`` -- so the artifact and the emitted script
+    agree by construction, not by parallel reinvention.
 
     ``event_name`` is the locked ``PickupItemEvent`` literal for
     shared-attribute candidates (see
     ``cross_domain_edges.SHARED_ATTRIBUTE_SEEDS``) or the derived
     ``<owner>_Set<Field>`` string for component-ref edges.
 
-    Returns a string with the ``__bridge_listener__`` prefix so the
+    Returns a string with the per-direction prefix so the
     candidate-`ref`-validity invariant in
     ``build_topology._enforce_invariants`` can recognize a synthesized
     id without consulting the modules block.
     """
-    return f"{SYNTHESIZED_LISTENER_ID_PREFIX}{event_name}"
+    if direction == "client_to_server":
+        return f"{SYNTHESIZED_SERVER_LISTENER_ID_PREFIX}{event_name}"
+    # direction == "server_to_client" -- the only other allowed value.
+    # The ``Literal`` type closes the set; this branch covers the
+    # remaining variant explicitly so a future direction-string
+    # extension fails the type-check rather than silently emitting one
+    # of the two prefixes.
+    return f"{SYNTHESIZED_CLIENT_LISTENER_ID_PREFIX}{event_name}"
 
 
 __all__ = (
-    "SYNTHESIZED_LISTENER_ID_PREFIX",
+    "BridgeDirection",
+    "SYNTHESIZED_CLIENT_LISTENER_ID_PREFIX",
+    "SYNTHESIZED_LISTENER_ID_PREFIXES",
+    "SYNTHESIZED_SERVER_LISTENER_ID_PREFIX",
     "synthesize_listener_id",
 )

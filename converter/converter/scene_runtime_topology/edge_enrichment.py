@@ -4,24 +4,45 @@ Runs inside ``Pipeline._maybe_run_topology_prepass`` AFTER the two
 structural producers (``compute_cross_domain_edges`` +
 ``compute_shared_attribute_candidates``) emit their raw rows.
 
-Slice 2's enrichment fills ``bridge_member_scripts`` on every row:
+Slice 2's enrichment fills ``bridge_member_scripts`` on every row,
+branching on ``edge["from_domain"]`` (the producer's domain) so the
+emitted caller / listener roles match the bridge direction slice 3
+will actually emit:
 
-  - **Component-ref edges** (resolved):
+  - **client -> server** (``from_domain == "client"``):
       - ``client_caller`` = ``edge["from_script"]``
-      - ``server_listener`` = ``synthesize_listener_id(event_name)``
-        (slice 3's emitter uses the SAME helper -- the artifact and
-        the emitted script_id agree by construction).
-      - ``anim_listener`` = ``edge["to_script"]``
+      - ``server_listener`` = ``synthesize_listener_id(
+          event_name, direction="client_to_server")``
+        Slice 3 rewrites the producer's ``SetAttribute`` to
+        ``<event>:FireServer(target, v)``; the listener subscribes
+        via ``OnServerEvent``.
+  - **server -> client** (``from_domain == "server"``):
+      - ``server_caller`` = ``edge["from_script"]``
+      - ``client_listener`` = ``synthesize_listener_id(
+          event_name, direction="server_to_client")``
+        Slice 3 rewrites to ``<event>:FireClient(target, v)`` or
+        ``:FireAllClients(v)``; the listener subscribes via
+        ``OnClientEvent``.
+  - **anything else** (``from_domain`` is ``""``, ``helper``,
+    ``excluded``, ``legacy``, or any non-runtime value): the row is
+    downgraded to ``resolution.strategy == "excluded"`` and
+    ``bridge_member_scripts`` is left EMPTY. Slice 3 skips excluded
+    rows. The producers normally drop these rows via
+    ``NON_RUNTIME_DOMAINS``; the defensive downgrade here catches
+    upstream-input edges (e.g. on-disk plans, direct callers without
+    a ``domains_override``) that slipped through.
 
-  - **Shared-attribute candidates** (fan-out):
-      - ``client_caller`` = ``edge["from_script"]``
-      - ``server_listener`` = ``synthesize_listener_id(event_name)``
-      - ``consumer`` (zero or more) = one row per ``script_id`` whose
-        post-transpile Luau source contains
-        ``:GetAttribute("has...")`` matching the seed's
-        ``attribute_template``. Discovered via the same regex-walk
-        pattern ``shared_state_linter.py:24,103`` uses for orphan
-        GetAttribute detection.
+  For **component-ref edges only**, an ``anim_listener`` member is also
+  emitted (= ``edge["to_script"]``). The animation receiver script is
+  domain-independent: whichever direction the bridge flows, the
+  consumer script that ``edge["to_script"]`` names is the same.
+
+  For **shared-attribute candidates** (fan-out): zero or more
+  ``consumer`` rows -- one per ``script_id`` whose post-transpile Luau
+  source contains ``:GetAttribute("has...")`` matching the seed's
+  ``attribute_template``. Discovered via the same regex-walk pattern
+  ``shared_state_linter.py:24,103`` uses for orphan GetAttribute
+  detection.
 
 The Luau-scan pass runs ONLY when
 ``state.transpilation_result is not None`` (fresh transpile this
@@ -41,10 +62,12 @@ prepass level where ``TopologyInputs`` data + the live
 
 from __future__ import annotations
 
+import logging
 import re
 
 from converter.code_transpiler import TranspiledScript
 from converter.scene_runtime_topology.bridge_emit import (
+    BridgeDirection,
     synthesize_listener_id,
 )
 from converter.scene_runtime_topology.cross_domain_edges import (
@@ -55,6 +78,45 @@ from converter.scene_runtime_topology.cross_domain_edges import (
     SHARED_ATTRIBUTE_SEEDS,
     SharedAttributeSeed,
 )
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _direction_for_from_domain(
+    from_domain: str,
+) -> BridgeDirection | None:
+    """Map ``edge["from_domain"]`` to the bridge direction slice 3
+    will emit, or ``None`` if the producer's domain is not a real
+    runtime domain.
+
+    The two real-domain branches are mutually exclusive; everything
+    else (``""``, ``helper``, ``excluded``, ``legacy``, future spellings)
+    returns ``None`` so the caller can downgrade the row to
+    ``excluded``. Slice 1's producers already filter
+    ``NON_RUNTIME_DOMAINS`` so this should not fire on producer
+    output -- it's a defensive fallthrough for direct callers (resume,
+    tests, on-disk artifacts) feeding pre-built rows into the
+    enrichment pass.
+    """
+    if from_domain == "client":
+        return "client_to_server"
+    if from_domain == "server":
+        return "server_to_client"
+    return None
+
+
+def _bridge_roles_for_direction(
+    direction: BridgeDirection,
+) -> tuple[str, str]:
+    """Return ``(caller_role, listener_role)`` for the bridge direction.
+
+    Closed enum -- the four role names are documented in
+    ``BridgeMember.role`` and validated by slice 3's emitter contract.
+    """
+    if direction == "client_to_server":
+        return "client_caller", "server_listener"
+    # direction == "server_to_client" by ``BridgeDirection`` exhaustion.
+    return "server_caller", "client_listener"
 
 
 def _build_get_attribute_regex(attribute_template: str) -> re.Pattern[str]:
@@ -176,30 +238,59 @@ def enrich_cross_domain_edges(
     transpiled_scripts: list[TranspiledScript] | None,
     script_id_by_name: dict[str, str],
 ) -> tuple[list[CrossDomainEdge], list[CrossDomainEdge]]:
-    """Populate ``bridge_member_scripts`` on every row.
+    """Populate ``bridge_member_scripts`` on every row, direction-aware.
+
+    Each row's ``from_domain`` selects the bridge direction:
+      - ``"client"`` -> ``client_caller`` + ``server_listener`` pair;
+        component-ref edges also carry ``anim_listener`` (=
+        ``to_script``).
+      - ``"server"`` -> ``server_caller`` + ``client_listener`` pair
+        (matches the locked Pickup case per the
+        ``pickup_remote_event_server`` pack contract); component-ref
+        edges also carry ``anim_listener``.
+      - anything else (``""``, ``helper``, ``excluded``, ``legacy``,
+        future spellings) -> the row is downgraded to
+        ``resolution.strategy == "excluded"`` and
+        ``bridge_member_scripts`` is left empty; slice 3 skips
+        ``excluded`` rows. A DEBUG-level log line records the drop.
 
     ``transpiled_scripts`` is ``None`` on the resume path
     (``state.transpilation_result is None``). On resume the
     Luau-scan pass cannot run; candidate rows receive only the
-    ``client_caller`` + ``server_listener`` members (no ``consumer``
-    rows). Slice 3 falls back to broadcast emission when
-    ``consumer`` rows are empty.
+    caller + listener members (no ``consumer`` rows). Slice 3 falls
+    back to broadcast emission when ``consumer`` rows are empty.
 
     Pure function: returns new lists of new ``CrossDomainEdge`` rows;
     the input lists + rows are NOT mutated.
     """
-    # Component-ref edges: deterministic 3-member bridge unit.
+    # Component-ref edges: deterministic 3-member bridge unit when the
+    # producer's ``from_domain`` resolves to a real direction; an
+    # ``excluded`` downgrade with empty ``bridge_member_scripts`` when
+    # it doesn't (defensive: producers already filter
+    # ``NON_RUNTIME_DOMAINS``, but direct-caller / on-disk inputs may
+    # supply pre-built rows with unknown domains).
     enriched_edges: list[CrossDomainEdge] = []
     for edge in edges:
         event_name = edge["resolution"]["event_name"]
+        direction = _direction_for_from_domain(edge["from_domain"])
+        if direction is None:
+            _LOGGER.debug(
+                "edge_enrichment: dropping component-ref edge with "
+                "unknown from_domain %r (event_name=%r, from_script=%r); "
+                "downgrading resolution.strategy to 'excluded'.",
+                edge["from_domain"], event_name, edge["from_script"],
+            )
+            enriched_edges.append(_excluded(edge))
+            continue
+        caller_role, listener_role = _bridge_roles_for_direction(direction)
         bridge_members: list[BridgeMember] = [
             BridgeMember(
-                role="client_caller",
+                role=caller_role,
                 ref=edge["from_script"],
             ),
             BridgeMember(
-                role="server_listener",
-                ref=synthesize_listener_id(event_name),
+                role=listener_role,
+                ref=synthesize_listener_id(event_name, direction=direction),
             ),
             BridgeMember(
                 role="anim_listener",
@@ -208,19 +299,36 @@ def enrich_cross_domain_edges(
         ]
         enriched_edges.append(_replace_bridge_members(edge, bridge_members))
 
-    # Shared-attribute candidates: client_caller + server_listener +
-    # zero-or-more consumer rows from the Luau scan.
+    # Shared-attribute candidates: caller + listener (direction-aware) +
+    # zero-or-more consumer rows from the Luau scan. ``Pickup`` is
+    # server-originated per the existing ``pickup_remote_event_server``
+    # pack contract (``script_coherence_packs.py:380-394``), so the
+    # locked ``PickupItemEvent`` candidate is expected to land here as
+    # ``server -> client`` once domain inference matches the pack
+    # contract.
     enriched_candidates: list[CrossDomainEdge] = []
     for cand in candidates:
         event_name = cand["resolution"]["event_name"]
+        direction = _direction_for_from_domain(cand["from_domain"])
+        if direction is None:
+            _LOGGER.debug(
+                "edge_enrichment: dropping shared-attribute candidate "
+                "with unknown from_domain %r (event_name=%r, "
+                "from_script=%r); downgrading resolution.strategy to "
+                "'excluded'.",
+                cand["from_domain"], event_name, cand["from_script"],
+            )
+            enriched_candidates.append(_excluded(cand))
+            continue
+        caller_role, listener_role = _bridge_roles_for_direction(direction)
         bridge_members = [
             BridgeMember(
-                role="client_caller",
+                role=caller_role,
                 ref=cand["from_script"],
             ),
             BridgeMember(
-                role="server_listener",
-                ref=synthesize_listener_id(event_name),
+                role=listener_role,
+                ref=synthesize_listener_id(event_name, direction=direction),
             ),
         ]
         if transpiled_scripts is not None:
@@ -271,6 +379,39 @@ def _replace_bridge_members(
             event_name=edge["resolution"]["event_name"],
         ),
         bridge_member_scripts=new_members,
+        payload=PayloadSpec(
+            attribute_name=edge["payload"]["attribute_name"],
+            schema=edge["payload"]["schema"],
+        ),
+    )
+
+
+def _excluded(edge: CrossDomainEdge) -> CrossDomainEdge:
+    """Return a new ``CrossDomainEdge`` with ``resolution.strategy``
+    downgraded to ``"excluded"`` and ``bridge_member_scripts`` cleared.
+
+    Used when ``edge["from_domain"]`` does not resolve to a known
+    bridge direction (``client`` / ``server``). Slice 3's emitter
+    skips ``excluded`` rows. The ``event_name`` is preserved so dumps
+    keep their debug-triage signal.
+    """
+    return CrossDomainEdge(
+        id=edge["id"],
+        kind=edge["kind"],
+        from_instance=edge["from_instance"],
+        to_instance=edge["to_instance"],
+        from_script=edge["from_script"],
+        to_script=edge["to_script"],
+        field=edge["field"],
+        from_domain=edge["from_domain"],
+        to_domain=edge["to_domain"],
+        owner_kind=edge["owner_kind"],
+        owner_ref=edge["owner_ref"],
+        resolution=ResolutionSpec(
+            strategy="excluded",
+            event_name=edge["resolution"]["event_name"],
+        ),
+        bridge_member_scripts=[],
         payload=PayloadSpec(
             attribute_name=edge["payload"]["attribute_name"],
             schema=edge["payload"]["schema"],

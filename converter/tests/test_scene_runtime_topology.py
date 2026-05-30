@@ -5223,7 +5223,7 @@ class TestPhase2bSlice2EnrichmentAndRelocation:
             "bridge_member_scripts": [
                 {"role": "client_caller", "ref": "sid_a"},
                 {"role": "server_listener",
-                 "ref": "__bridge_listener__Test_SetOpen"},
+                 "ref": "__bridge_listener_server__Test_SetOpen"},
                 {"role": "anim_listener", "ref": "sid_b"},
             ],
             "payload": {"attribute_name": "open", "schema": "unknown"},
@@ -5260,9 +5260,13 @@ class TestPhase2bSlice2EnrichmentAndRelocation:
         assert artifact["cross_domain_edges"][0]["id"] == "test::injected::edge"
 
     def test_enrichment_populates_bridge_members_component_ref(self) -> None:
-        """A component-ref edge is enriched with a 3-member bridge unit:
-        ``client_caller`` = ``from_script``, ``server_listener`` =
-        synthesized id from the helper, ``anim_listener`` = ``to_script``.
+        """A CLIENT-originated component-ref edge is enriched with a
+        3-member bridge unit: ``client_caller`` = ``from_script``,
+        ``server_listener`` = synthesized id from the helper,
+        ``anim_listener`` = ``to_script``. (R2: this is now the
+        client->server direction case; see
+        ``test_enrichment_handles_server_to_client_direction`` for the
+        opposite direction.)
         """
         from converter.pipeline import Pipeline
         from converter.scene_runtime_topology.bridge_emit import (
@@ -5343,7 +5347,7 @@ class TestPhase2bSlice2EnrichmentAndRelocation:
         roles_to_refs = {m["role"]: m["ref"] for m in members}
         assert roles_to_refs["client_caller"] == "door_sid"
         assert roles_to_refs["server_listener"] == synthesize_listener_id(
-            "Door_SetOpen",
+            "Door_SetOpen", direction="client_to_server",
         )
         assert roles_to_refs["anim_listener"] == "anim_sid"
 
@@ -5351,24 +5355,35 @@ class TestPhase2bSlice2EnrichmentAndRelocation:
         self,
     ) -> None:
         """A shared-attribute candidate (Pickup) is enriched with
-        ``client_caller`` + ``server_listener`` + one ``consumer`` row
+        ``server_caller`` + ``client_listener`` + one ``consumer`` row
         per script whose Luau source reads ``:GetAttribute("has...")``
         matching the seed template.
+
+        R2 (2026-05-31): the locked Pickup case is SERVER-originated
+        per the existing ``pickup_remote_event_server`` pack contract
+        at ``script_coherence_packs.py:380-394`` (Pickup's
+        ``Touched``-handler writes the ``has<itemName>`` attribute
+        server-side and fires ``PickupItemEvent:FireClient(_pl,
+        itemName)``). The fixture pins Pickup's domain to ``server``
+        via ``domain_overrides`` so the enrichment sees the correct
+        direction; this also matches the slice 3 emitter contract
+        (``:FireClient`` rewrite, ``OnClientEvent`` listener).
         """
         from converter.code_transpiler import TranspiledScript
         from converter.pipeline import Pipeline
 
         pickup = RbxScript(name="Pickup", source="-- p", script_type="Script")
         # ``Reader`` is a peer script that reads the bridged attribute.
+        # Lives on the CLIENT side (where the broadcast lands).
         reader = RbxScript(
             name="Reader",
             source='local v = plr:GetAttribute("hasKey")',
-            script_type="Script",
+            script_type="LocalScript",
         )
         # ``Bystander`` does NOT read the attribute -- the scan must
         # skip it.
         bystander = RbxScript(
-            name="Bystander", source="-- empty", script_type="Script",
+            name="Bystander", source="-- empty", script_type="LocalScript",
         )
         # ``script_id_by_name`` is built by the prepass from
         # ``RbxScript.name`` lookups against the modules block; provide
@@ -5377,7 +5392,7 @@ class TestPhase2bSlice2EnrichmentAndRelocation:
             "modules": {
                 "pickup_sid": {
                     "stem": "Pickup", "class_name": "Pickup",
-                    "runtime_bearing": True, "domain": "client",
+                    "runtime_bearing": True, "domain": "server",
                     "character_attached": False, "is_loader": False,
                     "module_path": "ReplicatedStorage.Pickup",
                 },
@@ -5408,7 +5423,11 @@ class TestPhase2bSlice2EnrichmentAndRelocation:
                 },
             },
             "prefabs": {},
-            "domain_overrides": {},
+            # R2: pin Pickup to server per the pack contract -- the
+            # ``"-- p"`` placeholder source carries no signal and
+            # would otherwise resolve to the Rule-7 low-confidence
+            # default.
+            "domain_overrides": {"pickup_sid": "server"},
         }
         # Build the post-transpile Luau-source list the prepass scans.
         transpiled = [
@@ -5445,17 +5464,29 @@ class TestPhase2bSlice2EnrichmentAndRelocation:
         consumer_refs = [m["ref"] for m in members if m["role"] == "consumer"]
         # ``Reader`` matched the regex; ``Bystander`` did not.
         assert consumer_refs == ["reader_sid"]
-        # client_caller + server_listener also present.
+        # R2: server-originated bridge -> ``server_caller`` +
+        # ``client_listener`` (NOT ``client_caller`` /
+        # ``server_listener``).
         roles = {m["role"] for m in members}
-        assert {"client_caller", "server_listener", "consumer"}.issubset(roles)
+        assert {"server_caller", "client_listener", "consumer"}.issubset(roles)
+        roles_to_refs = {m["role"]: m["ref"] for m in members}
+        assert roles_to_refs["server_caller"] == "pickup_sid"
+        # The synthesized listener id carries the client prefix.
+        assert roles_to_refs["client_listener"].startswith(
+            "__bridge_listener_client__",
+        )
 
     def test_enrichment_empty_on_resume(self) -> None:
         """The Luau-scan pass cannot run on the resume path
         (``state.transpilation_result is None``). Slice 2 documents this
         by leaving ``consumer`` rows EMPTY -- slice 3 will fall back to
-        broadcast emission. The other 2 bridge members
-        (``client_caller`` + ``server_listener``) still populate
-        because they're derivable from the candidate row alone.
+        broadcast emission. The other 2 bridge members (caller +
+        listener) still populate because they're derivable from the
+        candidate row alone.
+
+        R2 (2026-05-31): Pickup is server-originated per the pack
+        contract; the caller/listener pair is therefore
+        ``server_caller`` + ``client_listener``.
         """
         from converter.pipeline import Pipeline
 
@@ -5464,7 +5495,7 @@ class TestPhase2bSlice2EnrichmentAndRelocation:
             "modules": {
                 "pickup_sid": {
                     "stem": "Pickup", "class_name": "Pickup",
-                    "runtime_bearing": True, "domain": "client",
+                    "runtime_bearing": True, "domain": "server",
                     "character_attached": False, "is_loader": False,
                     "module_path": "ReplicatedStorage.Pickup",
                 },
@@ -5483,7 +5514,8 @@ class TestPhase2bSlice2EnrichmentAndRelocation:
                 },
             },
             "prefabs": {},
-            "domain_overrides": {},
+            # R2: pin Pickup to server (matches the pack contract).
+            "domain_overrides": {"pickup_sid": "server"},
         }
         pipeline = self._build_pipeline_with(
             scripts=[pickup],
@@ -5493,12 +5525,261 @@ class TestPhase2bSlice2EnrichmentAndRelocation:
         assert out is not None
         cand = out["cross_domain_edge_candidates"][0]
         members = cand["bridge_member_scripts"]
-        # Resume: client_caller + server_listener present, but ZERO
+        # Resume: server_caller + client_listener present, but ZERO
         # consumer rows (the scan didn't run).
         roles_seen = [m["role"] for m in members]
         assert "consumer" not in roles_seen
-        assert "client_caller" in roles_seen
-        assert "server_listener" in roles_seen
+        assert "server_caller" in roles_seen
+        assert "client_listener" in roles_seen
+
+    # ------------------------------------------------------------------
+    # R2 (2026-05-31): direction-aware enrichment tests. Codex R2 caught
+    # the P1 -- the previous enrichment hardcoded client->server and
+    # mis-labeled server-originated rows (most importantly the locked
+    # Pickup candidate, breaking Mitigation alpha for slice 3).
+    # ------------------------------------------------------------------
+
+    def test_enrichment_handles_server_to_client_direction(self) -> None:
+        """A SERVER-originated component-ref edge enriches with
+        ``server_caller`` (= ``from_script``) + a synthesized
+        ``client_listener`` (id prefixed
+        ``__bridge_listener_client__``) + ``anim_listener``
+        (direction-independent = ``to_script``).
+
+        Direct ``enrich_cross_domain_edges`` call: synthesizes a
+        pre-built ``CrossDomainEdge`` whose ``from_domain == "server"``
+        and asserts the enrichment branches on direction.
+        """
+        from converter.scene_runtime_topology.bridge_emit import (
+            SYNTHESIZED_CLIENT_LISTENER_ID_PREFIX,
+            synthesize_listener_id,
+        )
+        from converter.scene_runtime_topology.cross_domain_edges import (
+            CrossDomainEdge,
+            PayloadSpec,
+            ResolutionSpec,
+        )
+        from converter.scene_runtime_topology.edge_enrichment import (
+            enrich_cross_domain_edges,
+        )
+
+        edge = CrossDomainEdge(
+            id="A.unity:1::flag::A.unity:2",
+            kind="attribute_write",
+            from_instance="A.unity:1",
+            to_instance="A.unity:2",
+            from_script="pickup_sid",   # server-side producer
+            to_script="hud_sid",        # client-side consumer
+            field="flag",
+            from_domain="server",
+            to_domain="client",
+            owner_kind="scene",
+            owner_ref="A.unity",
+            resolution=ResolutionSpec(
+                strategy="remote_event_bridge",
+                event_name="Pickup_SetFlag",
+            ),
+            bridge_member_scripts=[],
+            payload=PayloadSpec(attribute_name="flag", schema="unknown"),
+        )
+        enriched_edges, enriched_candidates = enrich_cross_domain_edges(
+            edges=[edge],
+            candidates=[],
+            transpiled_scripts=None,
+            script_id_by_name={},
+        )
+        assert len(enriched_edges) == 1
+        assert enriched_candidates == []
+        members = enriched_edges[0]["bridge_member_scripts"]
+        roles_to_refs = {m["role"]: m["ref"] for m in members}
+        # Server-originated -> server_caller + client_listener +
+        # anim_listener (direction-independent).
+        assert set(roles_to_refs.keys()) == {
+            "server_caller", "client_listener", "anim_listener",
+        }
+        assert roles_to_refs["server_caller"] == "pickup_sid"
+        assert roles_to_refs["client_listener"] == synthesize_listener_id(
+            "Pickup_SetFlag", direction="server_to_client",
+        )
+        assert roles_to_refs["client_listener"].startswith(
+            SYNTHESIZED_CLIENT_LISTENER_ID_PREFIX,
+        )
+        assert roles_to_refs["anim_listener"] == "hud_sid"
+        # The synthesized id is DIFFERENT from the client_to_server
+        # shape -- two distinct prefixes per direction.
+        assert roles_to_refs["client_listener"] != synthesize_listener_id(
+            "Pickup_SetFlag", direction="client_to_server",
+        )
+        # Resolution stays ``remote_event_bridge`` (not downgraded);
+        # only unknown-direction rows downgrade to ``excluded``.
+        assert enriched_edges[0]["resolution"]["strategy"] == (
+            "remote_event_bridge"
+        )
+
+    def test_enrichment_excludes_edge_with_unknown_direction(self) -> None:
+        """A pre-built edge whose ``from_domain`` is not a known
+        runtime domain (``""``, ``"helper"``, etc.) is downgraded to
+        ``resolution.strategy == "excluded"`` and gets an EMPTY
+        ``bridge_member_scripts``. Slice 3 skips ``excluded`` rows.
+
+        Defensive: producers already filter ``NON_RUNTIME_DOMAINS``,
+        but on-disk plans / direct callers / future producers may
+        feed such rows; the downgrade keeps the artifact
+        well-formed.
+        """
+        from converter.scene_runtime_topology.cross_domain_edges import (
+            CrossDomainEdge,
+            PayloadSpec,
+            ResolutionSpec,
+        )
+        from converter.scene_runtime_topology.edge_enrichment import (
+            enrich_cross_domain_edges,
+        )
+
+        # Two unknown-direction rows: one as a component-ref edge,
+        # one as a shared-attribute candidate.
+        bad_edge = CrossDomainEdge(
+            id="X:1::peer::X:2",
+            kind="attribute_write",
+            from_instance="X:1", to_instance="X:2",
+            from_script="a", to_script="b",
+            field="peer",
+            from_domain="",  # unknown direction.
+            to_domain="server",
+            owner_kind="scene", owner_ref="X.unity",
+            resolution=ResolutionSpec(
+                strategy="remote_event_bridge",
+                event_name="A_SetPeer",
+            ),
+            bridge_member_scripts=[],
+            payload=PayloadSpec(attribute_name="peer", schema="unknown"),
+        )
+        bad_cand = CrossDomainEdge(
+            id="shared_attr::X.unity::X:3::PickupItemEvent",
+            kind="attribute_write",
+            from_instance="X:3", to_instance="",
+            from_script="c", to_script="",
+            field="has<itemName>",
+            from_domain="helper",  # also unknown (non-runtime).
+            to_domain="",
+            owner_kind="scene", owner_ref="X.unity",
+            resolution=ResolutionSpec(
+                strategy="remote_event_bridge",
+                event_name="PickupItemEvent",
+            ),
+            bridge_member_scripts=[],
+            payload=PayloadSpec(
+                attribute_name="has<itemName>", schema="bool",
+            ),
+        )
+        enriched_edges, enriched_candidates = enrich_cross_domain_edges(
+            edges=[bad_edge],
+            candidates=[bad_cand],
+            transpiled_scripts=None,
+            script_id_by_name={},
+        )
+        # Component-ref edge: downgraded + empty bridge.
+        assert len(enriched_edges) == 1
+        assert enriched_edges[0]["resolution"]["strategy"] == "excluded"
+        assert enriched_edges[0]["bridge_member_scripts"] == []
+        # event_name preserved for debug triage.
+        assert enriched_edges[0]["resolution"]["event_name"] == "A_SetPeer"
+        # Shared-attribute candidate: downgraded + empty bridge.
+        assert len(enriched_candidates) == 1
+        assert enriched_candidates[0]["resolution"]["strategy"] == "excluded"
+        assert enriched_candidates[0]["bridge_member_scripts"] == []
+        assert enriched_candidates[0]["resolution"]["event_name"] == (
+            "PickupItemEvent"
+        )
+
+    def test_invariant_2b_accepts_both_listener_prefixes(self) -> None:
+        """The candidate-`ref`-validity invariant in
+        ``build_topology._enforce_invariants`` accepts EITHER
+        synthesized-listener prefix:
+        ``__bridge_listener_server__`` (client->server direction)
+        AND ``__bridge_listener_client__`` (server->client). Pre-R2
+        only one prefix existed; R2 added the second so the invariant
+        must recognize both shapes or it would falsely abort
+        legitimate server-originated bridges.
+        """
+        from converter.scene_runtime_topology.bridge_emit import (
+            SYNTHESIZED_CLIENT_LISTENER_ID_PREFIX,
+            SYNTHESIZED_SERVER_LISTENER_ID_PREFIX,
+        )
+
+        sr = _mk_artifact()
+        sr_dict = cast(dict[str, object], sr)
+        sr_dict["modules"] = {
+            "sid_client": {
+                "stem": "C", "class_name": "C",
+                "runtime_bearing": True, "domain": "client",
+                "character_attached": False, "is_loader": False,
+            },
+            "sid_server": {
+                "stem": "S", "class_name": "S",
+                "runtime_bearing": True, "domain": "server",
+                "character_attached": False, "is_loader": False,
+            },
+        }
+        cand_client_to_server = {
+            "id": "shared_attr::X::1::EvA",
+            "kind": "attribute_write",
+            "from_instance": "i1", "to_instance": "",
+            "from_script": "sid_client", "to_script": "",
+            "field": "has<itemName>",
+            "from_domain": "client", "to_domain": "",
+            "owner_kind": "scene", "owner_ref": "X.unity",
+            "resolution": {
+                "strategy": "remote_event_bridge",
+                "event_name": "EvA",
+            },
+            "bridge_member_scripts": [
+                {"role": "client_caller", "ref": "sid_client"},
+                # Server-listener prefix shape.
+                {"role": "server_listener",
+                 "ref": f"{SYNTHESIZED_SERVER_LISTENER_ID_PREFIX}EvA"},
+            ],
+            "payload": {"attribute_name": "has<itemName>", "schema": "bool"},
+        }
+        cand_server_to_client = {
+            "id": "shared_attr::X::2::EvB",
+            "kind": "attribute_write",
+            "from_instance": "i2", "to_instance": "",
+            "from_script": "sid_server", "to_script": "",
+            "field": "has<itemName>",
+            "from_domain": "server", "to_domain": "",
+            "owner_kind": "scene", "owner_ref": "X.unity",
+            "resolution": {
+                "strategy": "remote_event_bridge",
+                "event_name": "EvB",
+            },
+            "bridge_member_scripts": [
+                {"role": "server_caller", "ref": "sid_server"},
+                # Client-listener prefix shape (the R2 addition).
+                {"role": "client_listener",
+                 "ref": f"{SYNTHESIZED_CLIENT_LISTENER_ID_PREFIX}EvB"},
+            ],
+            "payload": {"attribute_name": "has<itemName>", "schema": "bool"},
+        }
+        # Both candidates must pass the invariant (no abort).
+        artifact = build_topology(
+            scene_runtime=cast(SceneRuntimeArtifact, sr_dict),
+            emitted_animations=[],
+            scripts_by_class={
+                "C": _mk_rbx_script("C", "LocalScript"),
+                "S": _mk_rbx_script("S", "Script"),
+            },
+            cross_domain_edges_input=[],
+            cross_domain_edge_candidates_input=[
+                cast("object", cand_client_to_server),  # type: ignore[arg-type]
+                cast("object", cand_server_to_client),  # type: ignore[arg-type]
+            ],
+        )
+        # Both candidates landed in the artifact verbatim.
+        cands = artifact["cross_domain_edge_candidates"]
+        assert len(cands) == 2
+        event_names = {c["resolution"]["event_name"] for c in cands}
+        assert event_names == {"EvA", "EvB"}
 
     def test_event_name_invariant_fires_only_on_semantic_collisions(
         self,
@@ -5551,7 +5832,7 @@ class TestPhase2bSlice2EnrichmentAndRelocation:
             "bridge_member_scripts": [
                 {"role": "client_caller", "ref": "sid_a"},
                 {"role": "server_listener",
-                 "ref": "__bridge_listener__PickupItemEvent"},
+                 "ref": "__bridge_listener_server__PickupItemEvent"},
                 {"role": "anim_listener", "ref": "sid_b"},
             ],
             # DIFFERENT attribute_name from the candidate below ->
@@ -5573,7 +5854,7 @@ class TestPhase2bSlice2EnrichmentAndRelocation:
             "bridge_member_scripts": [
                 {"role": "client_caller", "ref": "sid_a"},
                 {"role": "server_listener",
-                 "ref": "__bridge_listener__PickupItemEvent"},
+                 "ref": "__bridge_listener_server__PickupItemEvent"},
             ],
             "payload": {"attribute_name": "has<itemName>", "schema": "bool"},
         }
@@ -5795,7 +6076,7 @@ class TestPhase2bSlice2EnrichmentAndRelocation:
             "bridge_member_scripts": [
                 {"role": "client_caller", "ref": "door_sid"},
                 {"role": "server_listener",
-                 "ref": "__bridge_listener__Door_SetOpen"},
+                 "ref": "__bridge_listener_server__Door_SetOpen"},
                 {"role": "anim_listener", "ref": "anim_sid"},
             ],
             "payload": {"attribute_name": "open", "schema": "unknown"},
@@ -5838,7 +6119,9 @@ class TestPhase2bSlice2EnrichmentAndRelocation:
         """Slice 2's candidate-`ref`-validity invariant: every
         ``bridge_member_scripts[*].ref`` in a candidate must be either a
         real script_id in the modules block OR a synthesized listener
-        id (``__bridge_listener__`` prefix). A bogus string aborts.
+        id (one of the per-direction
+        ``__bridge_listener_(server|client)__`` prefixes). A bogus
+        string aborts.
         """
         sr = _mk_artifact()
         sr_dict = cast(dict[str, object], sr)
@@ -5885,24 +6168,43 @@ class TestPhase2bSlice2EnrichmentAndRelocation:
 
     def test_synthesize_listener_id_deterministic(self) -> None:
         """The synthesized listener id is stable across calls given
-        the same ``event_name``. Slice 3's emitter must produce the
-        same id slice 2 writes into ``bridge_member_scripts[*].ref``
-        -- this test pins that determinism so a hash/seed/random
-        slipping into the helper would fail loudly.
+        the same ``(event_name, direction)`` pair. Slice 3's emitter
+        must produce the same id slice 2 writes into
+        ``bridge_member_scripts[*].ref`` -- this test pins that
+        determinism so a hash/seed/random slipping into the helper
+        would fail loudly.
+
+        R2 (2026-05-31): the helper now takes a ``direction`` kwarg
+        and emits per-direction prefixes; this test pins both shapes.
         """
         from converter.scene_runtime_topology.bridge_emit import (
-            SYNTHESIZED_LISTENER_ID_PREFIX,
+            SYNTHESIZED_CLIENT_LISTENER_ID_PREFIX,
+            SYNTHESIZED_SERVER_LISTENER_ID_PREFIX,
             synthesize_listener_id,
         )
 
-        a1 = synthesize_listener_id("PickupItemEvent")
-        a2 = synthesize_listener_id("PickupItemEvent")
+        # client -> server direction: server listener prefix.
+        a1 = synthesize_listener_id(
+            "PickupItemEvent", direction="client_to_server",
+        )
+        a2 = synthesize_listener_id(
+            "PickupItemEvent", direction="client_to_server",
+        )
         assert a1 == a2
-        assert a1.startswith(SYNTHESIZED_LISTENER_ID_PREFIX)
+        assert a1.startswith(SYNTHESIZED_SERVER_LISTENER_ID_PREFIX)
         # Different event_names produce different ids.
-        b = synthesize_listener_id("Door_SetOpen")
+        b = synthesize_listener_id(
+            "Door_SetOpen", direction="client_to_server",
+        )
         assert b != a1
-        assert b.startswith(SYNTHESIZED_LISTENER_ID_PREFIX)
+        assert b.startswith(SYNTHESIZED_SERVER_LISTENER_ID_PREFIX)
+        # server -> client direction: client listener prefix (distinct
+        # from the server prefix so dumps make direction visible).
+        c = synthesize_listener_id(
+            "PickupItemEvent", direction="server_to_client",
+        )
+        assert c.startswith(SYNTHESIZED_CLIENT_LISTENER_ID_PREFIX)
+        assert c != a1
 
     def test_derive_event_name_rejects_empty_field(self) -> None:
         """Slice 2 P3 carry-forward from slice 1: a component-ref edge

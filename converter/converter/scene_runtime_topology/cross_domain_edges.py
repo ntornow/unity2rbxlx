@@ -75,26 +75,48 @@ from converter.scene_runtime_planner import (
 class BridgeMember(TypedDict):
     """One script (or RemoteEvent) participating in a bridge.
 
-    ``role`` values:
-      - ``"client_caller"``: the script_id whose ``SetAttribute`` slice
-        3's rewriter will replace with ``<event_name>:FireServer``. For
-        a component-ref edge this is ``edge["from_script"]``; for a
-        shared-attribute candidate this is the Pickup-class script_id.
-      - ``"server_listener"``: a SYNTHESIZED script_id (NOT a real
-        module row id) for the server-side listener slice 3 will
-        emit. Derived via
-        ``bridge_emit.synthesize_listener_id(event_name)`` so the id
-        slice 2 writes here and the id slice 3 stamps on the
-        emitted ``RbxScript`` agree by construction. The
-        candidate-`ref`-validity invariant in
-        ``build_topology._enforce_invariants`` recognizes the
-        synthesized-id prefix.
+    ``role`` values are a CLOSED enum (per slice 2 R2, 2026-05-31):
+    ``client_caller``, ``server_caller``, ``client_listener``,
+    ``server_listener``, ``anim_listener``, ``consumer``. Slice 3 may
+    add ``remote_event`` (reserved -- see end of this docstring).
+
+    Direction-aware caller/listener pairing (slice 2 R2):
+      - ``"client_caller"`` + ``"server_listener"``: a client-originated
+        bridge (``from_domain == "client"``). Slice 3's rewriter
+        replaces the producer's ``SetAttribute`` with
+        ``<event_name>:FireServer(target, v)``; the synthesized
+        listener subscribes via ``OnServerEvent``.
+      - ``"server_caller"`` + ``"client_listener"``: a server-originated
+        bridge (``from_domain == "server"`` -- the locked Pickup
+        candidate lives here, matching the
+        ``pickup_remote_event_server`` pack contract at
+        ``script_coherence_packs.py:380-394``). Slice 3 rewrites to
+        ``<event_name>:FireClient(target, v)`` or
+        ``:FireAllClients(v)``; the listener subscribes via
+        ``OnClientEvent``.
+
+    Per-role contracts:
+      - ``"client_caller"`` / ``"server_caller"``: the script_id whose
+        ``SetAttribute`` slice 3 will rewrite. For a component-ref edge
+        this is ``edge["from_script"]``; for a shared-attribute
+        candidate this is the producer-class script_id.
+      - ``"server_listener"`` / ``"client_listener"``: a SYNTHESIZED
+        script_id (NOT a real module row id) for the listener slice
+        3 will emit. Derived via
+        ``bridge_emit.synthesize_listener_id(event_name,
+        direction=...)`` so the id slice 2 writes here and the id
+        slice 3 stamps on the emitted ``RbxScript`` agree by
+        construction. The candidate-`ref`-validity invariant in
+        ``build_topology._enforce_invariants`` recognizes BOTH
+        per-direction prefixes.
       - ``"anim_listener"``: for component-ref edges only -- the
         receiver script that consumes the bridged attribute. Equals
-        ``edge["to_script"]``. Fan-out (shared-attribute) candidates
-        DO NOT carry an ``anim_listener`` (consumers are dynamic at
-        runtime via ``GetAttributeChangedSignal``; slice 2's Luau-scan
-        pass discovers any STATIC readers and emits them under the
+        ``edge["to_script"]``. Direction-independent (the consumer
+        script is the same regardless of which side fires). Fan-out
+        (shared-attribute) candidates DO NOT carry an
+        ``anim_listener`` (consumers are dynamic at runtime via
+        ``GetAttributeChangedSignal``; slice 2's Luau-scan pass
+        discovers any STATIC readers and emits them under the
         ``"consumer"`` role).
       - ``"consumer"``: for shared-attribute candidates only -- one
         per ``script_id`` whose post-transpile Luau source reads the
@@ -105,13 +127,13 @@ class BridgeMember(TypedDict):
         empty.
 
     ``ref`` is the consumer-readable identifier the bridge emitter
-    (slice 3) will dereference: a script_id for ``client_caller`` /
-    ``anim_listener`` / ``consumer``, a synthesized id for
-    ``server_listener``. ``remote_event`` role is reserved for slice
-    3's emitter to optionally stamp the dotted DataModel path of the
-    synthesized ``RemoteEvent`` -- slice 2 does not emit
-    ``remote_event`` rows (the path is fully derivable from
-    ``event_name`` at slice 3 emit time).
+    (slice 3) will dereference: a script_id for caller / anim_listener
+    / consumer roles, a synthesized id for the listener role.
+    ``remote_event`` role is reserved for slice 3's emitter to
+    optionally stamp the dotted DataModel path of the synthesized
+    ``RemoteEvent`` -- slice 2 does not emit ``remote_event`` rows
+    (the path is fully derivable from ``event_name`` at slice 3 emit
+    time).
     """
 
     role: str
