@@ -144,7 +144,8 @@ jobs:
             --scene all \
             --no-upload \
             --no-ai \
-            --no-resolve
+            --no-resolve \
+            --skip-architecture-step
 
       - name: Validate generated rbxlx
         if: steps.convert.outcome == 'success'
@@ -307,7 +308,8 @@ jobs:
             --scene all \
             --no-upload \
             --no-ai \
-            --no-resolve
+            --no-resolve \
+            --skip-architecture-step
 
       - name: Run smoke test
         # Step-level cap so a hung Roblox Studio fails this step in ~12min
@@ -452,7 +454,8 @@ jobs:
             -o "./output/SimpleFPS_ai" \
             --scene all \
             --no-upload \
-            --no-resolve
+            --no-resolve \
+            --skip-architecture-step
 
       - name: Validate AI conversion (placeholder warnings allowed)
         if: steps.keycheck.outputs.no-key != 'true'
@@ -570,7 +573,8 @@ jobs:
             --no-ai \
             --creator-id "${{ secrets.ROBLOX_CREATOR_ID }}" \
             --universe-id "${{ secrets.ROBLOX_UNIVERSE_ID }}" \
-            --place-id "${{ secrets.ROBLOX_PLACE_ID }}"
+            --place-id "${{ secrets.ROBLOX_PLACE_ID }}" \
+            --skip-architecture-step
 
       - name: Validate upload run with strict asset IDs (5.2a)
         if: steps.keycheck.outputs.no-key != 'true'
