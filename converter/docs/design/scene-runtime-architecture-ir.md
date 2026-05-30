@@ -25,7 +25,10 @@ Today the converter independently decides:
 - where that module's script lands (`storage_classifier.py`, but also
   `scene_runtime_domain._stamp_container_and_path` /
   `_apply_reachability_rule`, and a re-derivation inside
-  `pipeline._classify_storage`)
+  `pipeline._classify_storage`) — historical context as of pre-Phase-2a;
+  slice 6 split `_apply_reachability_rule` into
+  `derive_reachability_requirements` + `finalize_topology_containers`,
+  and slice 11 deleted the now-dead original implementation
 - what class the script gets (Script / LocalScript / ModuleScript — split
   across `storage_classifier`, `animation_converter`, and
   `code_transpiler._classify_script_type` plus a generic-mode override)
@@ -163,12 +166,20 @@ Phase 4B consumers (structurally bound; NO independent topology decisions):
                                   obeyed the artifact + completeness checks
 
 DELETED (logic absorbed by topology):
-- storage_classifier._scripts_with_client_apis  (duplicates module_domain)
-- storage_classifier._scripts_with_server_apis  (duplicates module_domain)
+- storage_classifier._scripts_with_client_apis  (NB: slice 7 R3 RESTORED
+  these as FALLBACK-PATH-ONLY infrastructure; the topology decision tree
+  at _decide_script_container_from_topology consumes TopologyInputs.domains
+  exclusively and never reads the regex sets. They are reached only when
+  topology_inputs is None / sid lookup misses / the slice-6
+  unconstrained-helper gate sends a ModuleScript to legacy fallback.)
+- storage_classifier._scripts_with_server_apis  (same fallback-only contract
+  as the client counterpart above)
 - pipeline._classify_storage's classifier block (mis-layered re-derivation)
-- scene_runtime_domain._stamp_container_and_path mutations  (placement
-  decisions move into script_storage; topology emits facts, not mutations
-  of live RbxScript)
+- scene_runtime_domain._stamp_container_and_path's AUDIT-SIGNAL WRITES
+  (the parallel ``signals["reachability_forced_container"] = ...`` write
+  was retired in slice 10; the function itself is retained as the canonical
+  container + module_path writer for finalize_topology_containers --
+  ``_stamp_container_and_path`` is still LIVE at module_domain.py:880/886/891)
 - animation_converter's hardcoded ServerScriptService routing
 - code_transpiler._classify_script_type's generic-mode override
 ```
@@ -343,8 +354,12 @@ out-of-band structural flag needed for this branch.
 
 What MOVES OUT to topology:
 - `_scripts_with_client_apis` regex (duplicates `module_domain` signal
-  detection) — deleted
-- `_scripts_with_server_apis` regex — deleted
+  detection) — **restricted to fallback path only** (slice 7 R3). The
+  topology decision tree never reads it; it is consumed only by
+  `_decide_script_container_legacy` when the slice-6 unconstrained-
+  helper gate (`storage_classifier.py:575-587`) sends a ModuleScript
+  to the legacy six-rule path on no-transpile resume.
+- `_scripts_with_server_apis` regex — same fallback-only contract
 - Implicit re-derivation of domain via API analysis — deleted
 
 What STAYS in `script_storage.py`:
@@ -641,9 +656,40 @@ re-planned 2026-05-30 after the slice 8 arch review found the original
 
   Depends on slice 9b (the field is dropped from `TopologyModuleEntry`).
 
-- **Slice 11** (last): final test migration. Sweep remaining tests that
-  assert pre-Phase-2a behavior or rely on the late stamping. Must come
-  last so it doesn't churn against still-live behavior.
+- **Slice 11** (last, **shipped 2026-05-30**): cleanup-only close-out.
+  Three independent edits picked by parallel Claude + Codex arch review:
+
+    1. **Fix two P3 pin-test gaps from the slice 10 handoff.**
+       (a) Rewrite `test_storage_classifier_routing_unaffected_by_resume_empty_required_container`
+       to drive `classify_storage` (the OUTER gate) instead of probing
+       `_decide_script_container_from_topology` directly — the inner
+       probe bypassed the slice-6 unconstrained-helper short-circuit at
+       `storage_classifier.py:575-587` and asserted a property the
+       production path does NOT exhibit on a no-transpile resume.
+       (b) Delete the tautological
+       `test_transpile_ran_flag_is_plumbed_but_not_consulted_at_artifact_read_site`
+       (called `build_topology()` twice with identical args; the
+       function has no `transpile_ran` kwarg) and replace it with a
+       producer/consumer pin in `test_storage_classifier.py` asserting
+       `TopologyInputs.transpile_ran` flips the gate.
+    2. **Delete dead `_apply_reachability_rule`** (~130 LOC) at
+       `module_domain.py:1623-1753` plus the shim import at
+       `scene_runtime_domain.py:47`. No callers since slice 6; the
+       deletion was promised in the function's own `.. deprecated::`
+       docstring and deferred for hypothetical flag-day safety.
+    3. **Patch this design doc** to match shipped reality (regex
+       helpers RESTORED as fallback-only in slice 7 R3;
+       `_stamp_container_and_path` retained as canonical container+path
+       writer, only its audit-signal writes retired in slice 10).
+
+  Stale-test cleanup retired
+  `test_reachability_pair_populated_when_rule_fired` (seeded the
+  removed planner-row audit signal directly) and dropped the audit-
+  signal tail of `test_planner_rule_invisible_to_empty_name_scripts`.
+  All `_scripts_with_client_apis` / `reachability_forced_container`
+  mentions in surviving tests are **negative-assertion regression
+  guards** (pin the slice 7 R3 fallback-only contract or the slice 9b
+  field-removal) and were INTENTIONALLY kept.
 
 **Dropped from the original plan:** the original slice 10 — "wire
 remaining consumers (incl. `contract_pipeline`) through the persisted
@@ -656,9 +702,18 @@ verifier work moves to Phase 3 where it's actually scheduled.
 
 1. **Rewrite `_decide_script_container` to read topology facts.** The
    regex-based API detection (`_scripts_with_client_apis`,
-   `_scripts_with_server_apis`) is DELETED — topology already provides
-   domain. The decision tree above replaces the current six-rule
-   sequence. (Slice 7, shipped.)
+   `_scripts_with_server_apis`) is **restricted to the legacy fallback
+   path**; the topology decision tree does NOT consume them. Slice 7
+   round 1 deleted the helpers outright, but slice 7 R3 RESTORED them
+   as fallback-only infrastructure after the deletion silently degraded
+   the legacy path (the slice-6 unconstrained-helper gate at
+   `storage_classifier.py:575-587` and the `script_id_by_name` miss
+   path both fall through to `_decide_script_container_legacy`, which
+   needs the regex sets). The contract is pinned by
+   `test_storage_classifier_client_only_patterns_restored_as_fallback_only`
+   in `test_scene_runtime_domain.py`. The decision tree above replaces
+   the current six-rule sequence on the topology path. (Slice 7
+   shipped + slice 7 R3 amendment.)
 
 2. **Lift emit + cohere + classify out of `write_output`** into a new
    `materialize_and_classify` phase. Classify produces the storage plan
@@ -672,10 +727,22 @@ verifier work moves to Phase 3 where it's actually scheduled.
 3. **Refactor `build_topology._build_modules_block` to recompute from
    canonical helpers** instead of reading stamped mutations. (Slice 9.)
 
-4. **Delete the placement mutations in `scene_runtime_domain`** (the
-   three `_stamp_container_and_path` sites). Storage decisions live in
-   `script_storage.py` exclusively after Phase 2a; topology emits facts
-   only. (Slice 10.)
+4. **Retire the planner-row audit-signal writes** at
+   `module_domain.py:955` and `:1743` (the parallel
+   ``signals["reachability_forced_container"] = ...`` mutation).
+   `_build_modules_block` now sources `reachability_required_container`
+   from `TopologyInputs.reachability_requirements` normalized through
+   the late-hoist predicate gate, NOT from the retired audit signal.
+   (Slice 10, two-ended after slice 9b R1 review.) NOTE: this
+   deliverable's earlier framing -- "delete the three
+   `_stamp_container_and_path` sites" -- was retired. The function
+   ITSELF (``module_domain.py:1603-1616``) remains LIVE as the
+   canonical container + module_path writer for
+   `finalize_topology_containers` (call sites at
+   `module_domain.py:880, 886, 891`); only its audit-signal
+   side-write was removed. "Placement decisions live in
+   `script_storage.py` exclusively, topology emits facts only" is a
+   future-phase north star, not a shipped Phase-2a deliverable.
 
 5. **Schema-compat test** (Codex round-1, formalized round-3): a frozen
    fixture artifact in `tests/fixtures/topology/` consumed by
@@ -894,6 +961,25 @@ while the topology work is multi-PR.
 
 ## Revision history
 
+- **2026-05-30** — slice 11 (Phase 2a close-out) shipped: cleanup-only
+  scope picked by parallel Claude + Codex arch review. Three commits:
+  (1) test-only -- fixed two P3 pin-test gaps from the slice 10 handoff
+  (rewrote `test_storage_classifier_routing_unaffected_by_resume_empty_required_container`
+  to drive `classify_storage` instead of the inner-helper probe;
+  deleted tautological
+  `test_transpile_ran_flag_is_plumbed_but_not_consulted_at_artifact_read_site`
+  and replaced with a producer/consumer pin in `test_storage_classifier.py`);
+  retired stale `test_reachability_pair_populated_when_rule_fired` and
+  the audit-signal tail of `test_planner_rule_invisible_to_empty_name_scripts`.
+  (2) Deleted dead `_apply_reachability_rule` (~130 LOC) plus the shim
+  import at `scene_runtime_domain.py:47` -- promised in the deprecated
+  docstring since slice 6, deferred for hypothetical flag-day safety
+  on a function with zero in-repo callers. (3) Patched this design doc
+  to match shipped reality: Deliverable 1 (regex helpers RESTORED as
+  fallback-only in slice 7 R3, not deleted); Deliverable 4 (slice 10
+  retired audit-signal WRITES, NOT `_stamp_container_and_path` itself
+  -- the function is retained as the canonical container + module_path
+  writer at `module_domain.py:880/886/891`).
 - **2026-05-30** — slice 10 scope expanded after slice 9b R1 review:
   both reviewers (Claude + Codex) and the implementer independently
   identified that `_build_modules_block:629` still reads the
@@ -931,6 +1017,10 @@ while the topology work is multi-PR.
   recomputes via canonical helpers (slice 9); delete the three
   `_stamp_container_and_path` placement mutations at
   `module_domain.py:880, 886, 891` (slice 10); test sweep (slice 11).
+  (Subsequent revision: slice 10 narrowed to retiring the audit-signal
+  WRITES only; `_stamp_container_and_path` itself was kept as the
+  canonical container+path writer. See the slice 10 + slice 11
+  revision entries above for the shipped scope.)
   Original slice 10 "wire `contract_pipeline` through artifact" dropped —
   `contract_pipeline` runs pre-artifact (during `transpile_scripts`); its
   rework moves to Phase 3 where it's already scheduled. Added followup

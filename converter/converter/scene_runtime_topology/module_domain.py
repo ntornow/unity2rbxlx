@@ -1618,139 +1618,24 @@ def _stamp_container_and_path(
 
 # ---------------------------------------------------------------------------
 # Reachability rule (client require graph must not reach ServerStorage)
+#
+# Phase 2a slice 11: the legacy ``_apply_reachability_rule`` was deleted
+# here. It had no callers since slice 6 (its docstring promised slice 7
+# would delete it; the deletion was deferred for flag-day safety on a
+# function that turned out to have no out-of-tree callers either). Its
+# behavior was split into two pieces during slice 6:
+#
+#   - ``derive_reachability_requirements`` runs EARLY (before
+#     ``classify_storage``) and computes the
+#     ``{script_id: required_container}`` mapping. PURE: no
+#     ``parent_path`` reads, no mutation.
+#   - ``finalize_topology_containers`` runs LATE (after
+#     ``classify_storage``) and applies the requirements atomically
+#     onto module rows + ``RbxScript.parent_path``, preserving the
+#     legacy predicate gate
+#     (``current_container in _SERVER_CONTAINERS_FOR_REACHABILITY``)
+#     so the behavior delta is zero.
 # ---------------------------------------------------------------------------
-
-def _apply_reachability_rule(
-    modules: dict[str, SceneRuntimeModule],
-    dependency_map: dict[str, list[str]],
-    scripts_by_class: dict[str, RbxScript],
-    excluded: list[str],
-) -> None:
-    """For every client-domain module, walk its transitive require graph.
-
-    Helpers required by client modules are forced to ``ReplicatedStorage``;
-    a conflict (same helper required by both sides AND parked in
-    ``ServerStorage``) excludes the helper from the runtime plan.
-
-    .. deprecated::
-        Phase 2a slice 6 split this rule into two pieces and no
-        longer invokes the function:
-
-          - ``derive_reachability_requirements`` runs EARLY
-            (before ``classify_storage``) and computes the
-            ``{script_id: required_container}`` mapping. PURE: no
-            ``parent_path`` reads, no mutation.
-          - ``finalize_topology_containers`` runs LATE (after
-            ``classify_storage``) and applies the requirements
-            atomically onto module rows + ``RbxScript.parent_path``,
-            preserving this function's predicate gate
-            (``current_container in _SERVER_CONTAINERS_FOR_REACHABILITY``)
-            so the behavior delta is zero.
-
-        The function stays alive in slice 6 so out-of-tree callers
-        don't break flag-day; slice 7 deletes it along with the
-        regex-API detectors. NO NEW CALL SITES.
-    """
-    # Phase 2a slice 4 round 5 review (Claude P1.2): consume the
-    # unified ``compute_class_name_collisions`` set so the rule's
-    # closure seeds + class_to_script_id index honor the same
-    # exclusion contract as ``build_scripts_by_class_name`` and
-    # ``_detect_caller_graph_collisions``. Pre-round-5 this loop
-    # used silent first-write ``setdefault`` and the closure walked
-    # colliding seeds — the same lossy class_name routing the other
-    # sites now exclude.
-    from converter.scene_runtime_planner import (
-        compute_class_name_collisions,
-    )
-    colliding_class_names = compute_class_name_collisions(modules)
-    client_classes: set[str] = set()
-    server_classes: set[str] = set()
-    class_to_script_id: dict[str, str] = {}
-    for script_id, module in modules.items():
-        class_name = module.get("class_name", "")
-        if not class_name:
-            continue
-        if class_name in colliding_class_names:
-            # Skip colliding class_names — same degraded-service
-            # contract used by the other two sites.
-            continue
-        class_to_script_id.setdefault(class_name, script_id)
-        verdict = module.get("domain")
-        if verdict == "client":
-            client_classes.add(class_name)
-        elif verdict == "server":
-            server_classes.add(class_name)
-
-    for helper_class, script in scripts_by_class.items():
-        client_seeds = client_classes - {helper_class}
-        server_seeds = server_classes - {helper_class}
-        helper_reached_by_client = (
-            helper_class in _closure(client_seeds, dependency_map)
-        )
-        helper_reached_by_server = (
-            helper_class in _closure(server_seeds, dependency_map)
-        )
-        if not helper_reached_by_client:
-            continue
-        current_container = script.parent_path or ""
-        # Both ServerStorage AND ServerScriptService are invisible to
-        # the client require graph — the codex P1 found we only checked
-        # ServerStorage, so helpers in ServerScriptService stayed there
-        # and silently broke client requires at runtime.
-        if current_container in _SERVER_CONTAINERS_FOR_REACHABILITY:
-            if helper_reached_by_server:
-                # Conflict: both sides want this helper.
-                module_id = class_to_script_id.get(helper_class)
-                if module_id and module_id in modules:
-                    module_row = modules[module_id]
-                    module_row["domain"] = "excluded"
-                    signals = cast(
-                        SceneRuntimeDomainSignals,
-                        module_row.get("domain_signals", {}),
-                    )
-                    signals["fail_closed_reason"] = "reachability_conflict"
-                    module_row["domain_signals"] = signals
-                    if module_id not in excluded:
-                        excluded.append(module_id)
-                continue
-            # Client-only-reach: hoist to ReplicatedStorage.
-            # Note (Phase 2a slice 4 round 2 review): empty-name
-            # scripts cannot reach this loop body — they're filtered
-            # out at ``script_by_name`` construction (line 574, the
-            # ``if script.name:`` guard upstream). The atomic
-            # triple-write below is therefore correct without an
-            # empty-name gate. If a future change relaxes the
-            # upstream filter, the triple-write atomicity codified
-            # by invariant 10 would catch any half-stamped row.
-            #
-            # Phase 2a slice 10: the parallel
-            # ``signals["reachability_forced_container"] = REPLICATED_STORAGE``
-            # write was retired from the active hoist arm in
-            # ``finalize_topology_containers`` and from this dead-code
-            # mirror, since the consumer at
-            # ``build_topology._build_modules_block`` now reads from
-            # the raw analysis map normalized through the same gate.
-            # This function (``_apply_reachability_rule``) has had no
-            # callers since slice 6 (see the ``.. deprecated::`` note
-            # in its docstring) -- the cleanup keeps the dead copy
-            # consistent with the live arm.
-            script.parent_path = REPLICATED_STORAGE
-            module_id = class_to_script_id.get(helper_class)
-            if module_id and module_id in modules:
-                module_row = modules[module_id]
-                module_row["container"] = REPLICATED_STORAGE
-                # CRITICAL: also rewrite module_path. The Luau host
-                # resolves modules via ``module_path`` (see
-                # scene_runtime.luau:419-420 — ``resolveModule(scriptId,
-                # module_path)``), not via ``container``. Pre-P1.1 the
-                # hoist left ``module_path`` pointing at the old
-                # container; helpers hoisted into ReplicatedStorage
-                # still resolved to ``ServerStorage.X`` at runtime and
-                # silently failed. Use the same naming convention as
-                # ``_stamp_container_and_path``.
-                module_row["module_path"] = (
-                    f"{REPLICATED_STORAGE}.{script.name}"
-                )
 
 
 def _compute_network_behaviour_reachable(

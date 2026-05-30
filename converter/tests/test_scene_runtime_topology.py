@@ -324,44 +324,6 @@ class TestTopologyEmissionShape:
         assert entry["module_path"] == ""
         assert "reachability_forced_container" not in entry
 
-    def test_reachability_pair_populated_when_rule_fired(self) -> None:
-        """Slice 4 (narrowed by slice 9b): when the planner's
-        reachability rule fires on a module, topology mirrors the
-        coordinated pair. The test seeds the planner-side
-        ``domain_signals.reachability_forced_container`` audit
-        directly (simulating the post-_apply_reachability_rule state)
-        and asserts the TopologyModuleEntry surfaces it as
-        ``reachability_required_container``.
-
-        Refs: module_domain.py:1261-1284 (planner triple-write);
-        build_topology.py reachability-pair stamp; slice 9b drops
-        the parallel ``reachability_forced_container`` mirror on the
-        topology entry.
-        """
-        sr = _mk_artifact(modules={
-            "guid-helper": {
-                "stem": "Helper", "class_name": "Helper",
-                "runtime_bearing": True,
-                "domain": "helper",
-                "container": "ReplicatedStorage",
-                "module_path": "ReplicatedStorage.Helper",
-                "domain_signals": {
-                    "reachability_forced_container": "ReplicatedStorage",
-                },
-                "character_attached": False,
-                "is_loader": False,
-            },
-        })
-        artifact = build_topology(
-            scene_runtime=sr,
-            emitted_animations=[],
-            scripts_by_class={},
-        )
-        entry = artifact["modules"]["guid-helper"]
-        assert entry["reachability_required_container"] == "ReplicatedStorage"
-        assert entry["module_path"] == "ReplicatedStorage.Helper"
-        assert "reachability_forced_container" not in entry
-
     def test_planner_rule_end_to_end_satisfies_invariant_10(self) -> None:
         """Slice 4 round 1 review (Claude P1.3); slice 9b narrows
         invariant 10 to module_path ↔ container coherence: drive the
@@ -531,9 +493,14 @@ class TestTopologyEmissionShape:
         # Domain stays "helper" (initial state for non-runtime-bearing
         # modules per _classify_module's helper short-circuit).
         assert helper_module.get("domain") == "helper"
-        # No reachability stamp — fields absent / empty.
-        signals = helper_module.get("domain_signals", {})
-        assert signals.get("reachability_forced_container", "") == ""
+        # Phase 2a slice 11: the parallel audit-signal assertion on
+        # ``domain_signals["reachability_forced_container"]`` was
+        # dropped -- slice 10 retired that planner-row write surface.
+        # The ``domain == "helper"`` assertion above is the load-
+        # bearing pin; the legacy hoist observable lives in the
+        # triple-write at ``finalize_topology_containers``
+        # (``module_domain.py:937-959``), which on this fixture never
+        # fires because the empty-name filter upstream gates it out.
 
     def test_planner_rule_fires_when_class_name_differs_from_file_stem(
         self,
@@ -4381,150 +4348,117 @@ class TestSlice10R2NoTranspileResumeSemantics:
         (``storage_classifier.py:645``), not via the topology entry's
         ``reachability_required_container`` field.
 
-        This test pins that read path by driving
-        ``_decide_script_container_from_topology`` with the same empty
-        ``reachability_requirements`` map a no-transpile resume hands
-        the classifier. Storage routing falls back to the
-        caller-domain ModuleScript decision tree (the same routing
-        the pre-slice-10 classifier produced on resume), demonstrating
-        that the slice 10 R2 trade does not change any storage
-        decision the converter makes on resume.
+        Phase 2a slice 11 P3 fix: rewritten to drive ``classify_storage``
+        (the OUTER gate) instead of probing
+        ``_decide_script_container_from_topology`` directly. Calling the
+        inner helper bypassed the slice-6 unconstrained-helper short-
+        circuit at ``storage_classifier.py:575-587`` -- the gate that
+        ACTUALLY runs on a no-transpile resume routes a
+        ``ModuleScript`` with ``transpile_ran=False`` AND no
+        reachability requirement to ``_decide_script_container_legacy``.
+        The original test asserted a property the production path does
+        NOT exhibit on resume; the rewrite asserts the property the
+        production path DOES exhibit.
+
+        Fixture: ``transpile_ran=False``, empty
+        ``reachability_requirements``, helper ``ModuleScript`` with one
+        client caller. Expected routing: helper lands in
+        ``ReplicatedStorage`` via the LEGACY caller-domain fallback,
+        with the exact reason string emitted by
+        ``_decide_script_container_legacy`` at
+        ``storage_classifier.py:783-786``. The reason must NOT carry
+        the ``"topology:"`` prefix emitted by the topology decision
+        tree at ``storage_classifier.py:638-706`` -- the gate routed
+        around it.
 
         If a future change re-routes the classifier to consult the
-        topology entry's ``reachability_required_container`` (and
-        therefore couples storage routing to the regenerated-on-
-        resume signal), this test will fail because the resume map
-        is empty AND the entry field is ``""``.
+        topology entry's ``reachability_required_container`` (or
+        otherwise lets the topology tree run on a no-transpile resume
+        with empty requirements), this test will fail because the
+        emitted reason would carry the ``"topology:"`` prefix.
         """
         from converter.scene_runtime_topology.module_domain import (
             TopologyInputs,
         )
-        from converter.storage_classifier import (
-            _decide_script_container_from_topology,
-        )
+        from converter.storage_classifier import classify_storage
 
-        # Helper has no entry in reachability_requirements (the no-
-        # transpile resume shape). The classifier must therefore NOT
-        # produce a ``topology: reachability_required_container=...``
-        # reason -- that branch is gated on
-        # ``reachability_requirements[sid] is not None``.
         helper_script = RbxScript(
             name="Helper", source="-- helper",
             script_type="ModuleScript",
             parent_path="ServerStorage",
         )
-        topology_inputs = TopologyInputs(
-            domains={"guid-client": "client", "guid-helper": "helper"},
+        client_script = RbxScript(
+            name="ClientA",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'local lp = Players.LocalPlayer\n'
+                'local Helper = require(game:GetService(\n'
+                '    "ReplicatedStorage"\n'
+                '):FindFirstChild("Helper"))'
+            ),
+            script_type="LocalScript",
+            parent_path="StarterPlayer.StarterPlayerScripts",
+        )
+        topology_inputs: TopologyInputs = {
+            "domains": {"guid-client": "client", "guid-helper": "helper"},
             # Empty dict: the no-transpile resume signature from
             # ``derive_reachability_requirements``'s
             # ``if not dependency_map: return {}`` contract.
-            reachability_requirements={},
-            lifecycle_roles={
+            "reachability_requirements": {},
+            "lifecycle_roles": {
                 "guid-client": "",
                 "guid-helper": "",
             },
-            script_id_by_name={
+            "script_id_by_name": {
                 "ClientA": "guid-client",
                 "Helper": "guid-helper",
             },
-            # Helper is reached by ClientA (client-domain caller); on
-            # a FRESH run the late-hoist rule would have stamped
-            # ``"ReplicatedStorage"`` here, but on resume we lose that
-            # signal. The classifier's ModuleScript branch still
-            # routes to ReplicatedStorage via caller-domain analysis
-            # (step 4 in ``_decide_script_container_from_topology``'s
-            # decision tree), so the storage outcome is unchanged.
-            caller_graph={"guid-helper": ["guid-client"]},
-            transpile_ran=False,
-        )
+            "caller_graph": {"guid-helper": ["guid-client"]},
+            # No-transpile resume signal. Combined with the empty
+            # requirements map + ``script_type == "ModuleScript"`` this
+            # triggers the slice-6 unconstrained-helper gate at
+            # ``storage_classifier.py:575-587`` -- the fall-through to
+            # ``_decide_script_container_legacy``.
+            "transpile_ran": False,
+        }
 
-        container, reason = _decide_script_container_from_topology(
-            helper_script, sid="guid-helper",
+        plan = classify_storage(
+            [client_script, helper_script],
             topology_inputs=topology_inputs,
         )
-        # The decision MUST NOT come from the
-        # reachability_required_container path (which is gated on
-        # the empty map and short-circuits). It comes from the
-        # caller-domain ModuleScript path -- the documented fallback
-        # that preserves the pre-slice-10 storage outcome on resume.
-        assert "reachability_required_container=" not in reason, (
-            "Storage classifier should NOT have consulted the topology "
-            "entry's reachability_required_container on resume; the "
-            "slice 10 R2 documentation states this branch is unreachable "
-            "when reachability_requirements is empty. Reason emitted: "
-            f"{reason!r}"
-        )
-        # And the routing outcome lands at ReplicatedStorage via the
-        # client-caller ModuleScript branch -- byte-equivalent to the
-        # pre-slice-10 resume outcome for the same fixture.
-        assert container == "ReplicatedStorage", (
-            f"Expected ReplicatedStorage from client-caller ModuleScript "
-            f"branch, got {container!r} ({reason!r})"
+
+        # Helper lands at ReplicatedStorage via the legacy caller-
+        # domain ModuleScript path -- byte-equivalent to the pre-
+        # slice-10 resume outcome.
+        assert helper_script.parent_path == "ReplicatedStorage", (
+            f"Expected ReplicatedStorage from legacy caller-domain "
+            f"ModuleScript fallback, got {helper_script.parent_path!r}"
         )
 
-    def test_transpile_ran_flag_is_plumbed_but_not_consulted_at_artifact_read_site(
-        self, tmp_path: Path,
-    ) -> None:
-        """``TopologyInputs.transpile_ran`` (wired in
-        ``pipeline.py:4622``) is intentionally NOT consulted by the
-        slice-10 ``_build_modules_block`` read site (per slice 10 R2
-        Option Y).
-
-        Witness: flipping ``transpile_ran`` between ``True`` and
-        ``False`` while keeping ``reachability_requirements={}`` does
-        NOT change the emitted ``reachability_required_container``
-        for any module. If a future change starts consulting
-        ``transpile_ran`` at the read site (e.g. to revive the legacy
-        audit-signal fallback on resume), the output divergence will
-        surface here. Document and update the slice 10 R2 docstring
-        together.
-        """
-        sr = _mk_artifact(modules={
-            "guid-helper": {
-                "stem": "Helper", "class_name": "Helper",
-                "runtime_bearing": False,
-                "is_loader": False, "character_attached": False,
-            },
-        })
-        helper_script = RbxScript(
-            name="Helper", source="-- helper",
-            script_type="ModuleScript",
-            parent_path="ServerStorage",
+        # The reason MUST be the exact legacy caller-domain string
+        # emitted by ``_decide_script_container_legacy`` at
+        # ``storage_classifier.py:783-786``. If the topology tree had
+        # run instead, the reason would start with the ``"topology:"``
+        # prefix emitted at ``storage_classifier.py:638-706``.
+        helper_reasons = {
+            d["script"]: d["reason"]
+            for d in plan.decisions
+            if d["script"] == "Helper"
+        }
+        helper_reason = helper_reasons["Helper"]
+        assert helper_reason == (
+            "required by 1 caller(s), at least one client-side"
+        ), (
+            "Expected the legacy caller-domain reason from "
+            "_decide_script_container_legacy; the unconstrained-helper "
+            "gate should have routed around the topology tree. "
+            f"Got: {helper_reason!r}"
         )
-
-        from converter.scene_runtime_topology.build_topology import (
-            build_topology,
-        )
-
-        # Pass 1: transpile_ran=True (fresh-run signal) + empty reqs.
-        artifact_fresh = build_topology(
-            scene_runtime=cast(SceneRuntimeArtifact, sr),
-            emitted_animations=[],
-            scripts_by_class={"Helper": helper_script},
-            reachability_requirements={},
-        )
-        # Pass 2: same call but conceptually under transpile_ran=False
-        # (resume signal). The read site does NOT branch on this; the
-        # only knob it sees is ``reachability_requirements``. Drive
-        # the same call to demonstrate the read-site output is
-        # determined by the requirements map alone.
-        artifact_resume = build_topology(
-            scene_runtime=cast(SceneRuntimeArtifact, sr),
-            emitted_animations=[],
-            scripts_by_class={"Helper": helper_script},
-            reachability_requirements={},
-        )
-
-        # Byte-identical entries: the artifact read site is a pure
-        # function of (modules, scripts_by_class, reachability_requirements)
-        # -- transpile_ran is NOT in that signature. Slice 10 R2
-        # documents this intent at build_topology.py:_build_modules_block.
-        fresh_entry = artifact_fresh["modules"]["guid-helper"]
-        resume_entry = artifact_resume["modules"]["guid-helper"]
-        assert (
-            fresh_entry["reachability_required_container"]
-            == resume_entry["reachability_required_container"]
-            == ""
+        assert not helper_reason.startswith("topology:"), (
+            "Reason carries the topology-tree prefix -- the slice-6 "
+            "unconstrained-helper gate did NOT route to legacy on "
+            "transpile_ran=False + empty reachability_requirements. "
+            f"Reason: {helper_reason!r}"
         )
 
     def test_artifact_field_carries_no_persistence_machinery(

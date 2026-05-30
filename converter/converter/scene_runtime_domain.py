@@ -44,7 +44,6 @@ from converter.scene_runtime_topology.module_domain import (
     _RE_USING_MIRROR,
     _SERVER_CONTAINERS_FOR_REACHABILITY,
     _SERVER_RX,
-    _apply_reachability_rule,
     _apply_rule_table,
     _build_displaced_rows,
     _check_mirror_adoption,
