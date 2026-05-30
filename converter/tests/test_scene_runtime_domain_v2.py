@@ -708,10 +708,10 @@ class TestReachabilityHoist:
         helper_row = artifact["modules"]["g-helper"]
         assert helper_row["container"] == REPLICATED_STORAGE
         assert helper_row["module_path"] == "ReplicatedStorage.Helper"
-        assert (
-            helper_row["domain_signals"]["reachability_forced_container"]
-            == REPLICATED_STORAGE
-        )
+        # Phase 2a slice 10: the parallel planner-row audit signal
+        # ``domain_signals["reachability_forced_container"]`` was
+        # retired. The hoist observable is pinned by the container +
+        # module_path triple-write above (invariant 10).
 
     def test_hoist_from_server_script_service_rewrites_module_path(
         self,

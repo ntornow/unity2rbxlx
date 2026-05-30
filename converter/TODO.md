@@ -144,6 +144,36 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   [`docs/FUTURE_IMPROVEMENTS.md`](docs/FUTURE_IMPROVEMENTS.md)
   § "Persistent prefab/asset cache".
 
+- [ ] **P1 — Upstream classifier misroutes Roblox-dead Unity-rendering
+  modules to server-only.** Phase 2a slice 7 audit, 2026-05-30.
+  `infer_module_domains` classifies Unity-rendering helpers (`WaterBase`,
+  `PlanarReflection`, `Displace`) as server-only because their only
+  observed callers happen to be server-side. But the modules' Unity APIs
+  (`OnWillRenderObject`, Camera-based reflection rendering,
+  `Shader.EnableKeyword`) have no Roblox equivalent — the modules
+  effectively run as dead code in the converted output. Routing them to
+  `ServerStorage` based on caller-graph evidence is technically correct
+  given the inputs, but ships dead modules to the wrong container.
+  Fix shape: either (a) a dead-code pruning pass that drops modules whose
+  bodies are dominated by Unity APIs without Roblox equivalents, or
+  (b) an upstream classifier signal that detects "Roblox-dead" modules
+  and short-circuits their domain inference. Option (a) is the more
+  general fix.
+
+- [ ] **P1 — Transpiler false-positive `require()` injection poisons
+  storage classification.** Phase 2a slice 7 audit, 2026-05-30. The
+  converter's transpile / coherence-pack stage injects
+  `require(GameManager)` into `Plane.luau` even though the original
+  `Plane.cs` Unity source has no reference to `GameManager`. This
+  pollutes the caller_graph the storage classifier consumes —
+  `GameManager` (a cursor / scene-management singleton that should be
+  client-side) routes to `ServerStorage` because the spurious require
+  makes it look server-required. The right fix is at the injection
+  site, not the classifier: constrain require-injection to symbols
+  actually referenced in the transpiled body. Add a guard pass that
+  walks injected requires and drops any whose target symbol does not
+  appear elsewhere in the script.
+
 ## Materials & meshes
 
 - [ ] **P1 — Embedded-mesh resolver only warns on bad sub-mesh count, then ships arbitrary geometry.** PR #121 review (codex + Claude, 2026-05-21).

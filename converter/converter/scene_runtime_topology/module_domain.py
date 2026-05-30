@@ -939,21 +939,24 @@ def finalize_topology_containers(
         if current_container not in _SERVER_CONTAINERS_FOR_REACHABILITY:
             continue
         # Atomic triple-write: script.parent_path + module.container +
-        # module.module_path + signals.reachability_forced_container.
-        # Slice 4 round 2 codified this as invariant 10 — see the
-        # docstring on ``_apply_reachability_rule`` for the empty-name
-        # guard discussion.
+        # module.module_path. Slice 4 round 2 codified this as
+        # invariant 10 — see the docstring on
+        # ``_apply_reachability_rule`` for the empty-name guard
+        # discussion.
+        #
+        # Phase 2a slice 10: the parallel
+        # ``signals["reachability_forced_container"] = REPLICATED_STORAGE``
+        # write was retired. ``build_topology._build_modules_block``
+        # now derives ``reachability_required_container`` from the
+        # raw ``reachability_requirements`` map normalized through the
+        # same gate above, so the planner-row audit signal had no
+        # remaining production consumer (only the three external
+        # tests migrated in slice 10 commit 3 still asserted it).
         script.parent_path = REPLICATED_STORAGE
         module_row["container"] = REPLICATED_STORAGE
         module_row["module_path"] = (
             f"{REPLICATED_STORAGE}.{script.name}"
         )
-        signals = cast(
-            SceneRuntimeDomainSignals,
-            module_row.get("domain_signals", {}),
-        )
-        signals["reachability_forced_container"] = REPLICATED_STORAGE
-        module_row["domain_signals"] = signals
 
     return excluded
 
@@ -1719,6 +1722,18 @@ def _apply_reachability_rule(
             # empty-name gate. If a future change relaxes the
             # upstream filter, the triple-write atomicity codified
             # by invariant 10 would catch any half-stamped row.
+            #
+            # Phase 2a slice 10: the parallel
+            # ``signals["reachability_forced_container"] = REPLICATED_STORAGE``
+            # write was retired from the active hoist arm in
+            # ``finalize_topology_containers`` and from this dead-code
+            # mirror, since the consumer at
+            # ``build_topology._build_modules_block`` now reads from
+            # the raw analysis map normalized through the same gate.
+            # This function (``_apply_reachability_rule``) has had no
+            # callers since slice 6 (see the ``.. deprecated::`` note
+            # in its docstring) -- the cleanup keeps the dead copy
+            # consistent with the live arm.
             script.parent_path = REPLICATED_STORAGE
             module_id = class_to_script_id.get(helper_class)
             if module_id and module_id in modules:
@@ -1736,12 +1751,6 @@ def _apply_reachability_rule(
                 module_row["module_path"] = (
                     f"{REPLICATED_STORAGE}.{script.name}"
                 )
-                signals = cast(
-                    SceneRuntimeDomainSignals,
-                    module_row.get("domain_signals", {}),
-                )
-                signals["reachability_forced_container"] = REPLICATED_STORAGE
-                module_row["domain_signals"] = signals
 
 
 def _compute_network_behaviour_reachable(
