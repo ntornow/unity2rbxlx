@@ -343,8 +343,12 @@ class TestReachability:
         )
         assert helper_script.parent_path == REPLICATED_STORAGE
         assert artifact["modules"]["h"]["container"] == REPLICATED_STORAGE
-        assert (artifact["modules"]["h"]["domain_signals"]
-                ["reachability_forced_container"]) == REPLICATED_STORAGE
+        # Phase 2a slice 10: the parallel planner-row audit signal
+        # ``domain_signals["reachability_forced_container"]`` was
+        # retired. The hoist observable is pinned by
+        # ``script.parent_path`` + ``module.container`` above; the
+        # raw analysis fact moved to
+        # ``TopologyInputs.reachability_requirements``.
 
 
 # ---------------------------------------------------------------------------

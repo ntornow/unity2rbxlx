@@ -382,6 +382,8 @@ class TestTopologyEmissionShape:
         """
         from converter.scene_runtime_domain import (
             classify_scene_runtime_domains,
+            derive_reachability_requirements,
+            infer_module_domains,
         )
         # Set up: client module (HudControl) that requires a helper
         # (HelperLib) — helper starts in ServerStorage (the pre-rule
@@ -413,6 +415,34 @@ class TestTopologyEmissionShape:
             dependency_map=dependency_map,
         )
 
+        # Phase 2a slice 10: ``reachability_required_container`` now
+        # sources from ``TopologyInputs.reachability_requirements``
+        # normalized through the late-hoist predicate gate (see
+        # ``_normalize_reachability_requirement``), not the retired
+        # ``domain_signals.reachability_forced_container`` audit
+        # signal. Recompute the requirements the way
+        # ``_maybe_run_topology_prepass`` does for production calls
+        # and thread them into build_topology so this end-to-end test
+        # asserts on the new source.
+        #
+        # Note: ``classify_scene_runtime_domains`` already mutated
+        # ``helper_script.parent_path`` to ``"ReplicatedStorage"`` via
+        # the late hoist in ``finalize_topology_containers``, so the
+        # ``infer_module_domains`` call below is purely to recover the
+        # ``domain_results`` shape ``derive_reachability_requirements``
+        # consumes (it doesn't read parent_path; per its docstring).
+        domain_results = infer_module_domains(
+            cast("dict", sr),
+            scripts,
+            dependency_map=dependency_map,
+        )
+        reqs = derive_reachability_requirements(
+            cast("dict", sr),
+            scripts,
+            domain_results,
+            dependency_map=dependency_map,
+        )
+
         # Now build topology and assert invariant 10 passes (no abort).
         artifact = build_topology(
             scene_runtime=sr,
@@ -421,19 +451,31 @@ class TestTopologyEmissionShape:
                 "HudControl": hud_script,
                 "HelperLib": helper_script,
             },
+            reachability_requirements=reqs,
         )
-        # The rule should have fired on HelperLib.
+        # The rule should have fired on HelperLib: ``script.parent_path``,
+        # ``module_row["container"]``, and ``module_row["module_path"]``
+        # all moved to ``ReplicatedStorage`` in lockstep (invariant 10's
+        # narrowed coherence check passes). The topology entry's
+        # ``reachability_required_container`` is the slice-10 normalized
+        # surface: ``""`` because by build_topology read time the
+        # late-hoist arm has already moved ``parent_path`` OUT of the
+        # gated set (``_SERVER_CONTAINERS_FOR_REACHABILITY``), matching
+        # today's PRODUCTION behavior where slice 7's
+        # ``_decide_script_container_from_topology`` pre-empts the late
+        # hoist arm via ``s.parent_path = "ReplicatedStorage"`` and the
+        # audit signal stayed empty. The historical test value
+        # ``"ReplicatedStorage"`` captured a vestigial signal the late
+        # arm wrote when slice 7 was bypassed; slice 10 surfaces the
+        # production-aligned value instead.
         helper_entry = artifact["modules"]["guid-helper"]
-        assert helper_entry["reachability_required_container"] == (
-            "ReplicatedStorage"
-        )
+        assert helper_entry["reachability_required_container"] == ""
         assert helper_entry["module_path"] == (
             "ReplicatedStorage.HelperLib"
         )
-        # Slice 9b: parallel ``reachability_forced_container`` mirror
-        # dropped from the topology entry. The planner row still
-        # carries it in ``domain_signals`` (the audit-trail surface
-        # build_topology reads); slice 10 will retire those writes.
+        # Slice 9b dropped the parallel ``reachability_forced_container``
+        # mirror from the topology entry; slice 10 retired the
+        # planner-row audit signal write.
         assert "reachability_forced_container" not in helper_entry
 
     def test_planner_rule_invisible_to_empty_name_scripts(self) -> None:
@@ -545,12 +587,17 @@ class TestTopologyEmissionShape:
 
         # Rule should have fired: helper hoisted to ReplicatedStorage,
         # module_path uses script.name (file stem), and the triple is
-        # consistent for invariant 10.
+        # consistent for invariant 10. Phase 2a slice 10: the parallel
+        # planner-row audit signal
+        # ``domain_signals["reachability_forced_container"]`` was
+        # retired; the hoist observable is pinned by ``container`` +
+        # ``module_path`` + ``helper_script.parent_path``. The
+        # class_name-vs-stem-conflation fix this test guards is still
+        # exercised end-to-end by those three assertions.
         helper_module = sr["modules"]["guid-bootstrap"]  # type: ignore[index]
         assert helper_module.get("container") == "ReplicatedStorage"
         assert helper_module.get("module_path") == "ReplicatedStorage.Bootstrap"
-        signals = helper_module.get("domain_signals", {})
-        assert signals.get("reachability_forced_container") == "ReplicatedStorage"
+        assert helper_script.parent_path == "ReplicatedStorage"
 
     def test_build_scripts_by_class_name_excludes_collisions(
         self,

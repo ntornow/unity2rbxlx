@@ -1180,7 +1180,12 @@ class TestSlice6OrchestratorByteParity:
         helper_row = artifact["modules"]["g-helper"]
         assert helper_row["container"] == REPLICATED_STORAGE
         assert helper_row["module_path"] == "ReplicatedStorage.Helper"
-        assert (
-            helper_row["domain_signals"]["reachability_forced_container"]
-            == REPLICATED_STORAGE
-        )
+        # Phase 2a slice 10: the parallel planner-row audit signal
+        # ``domain_signals["reachability_forced_container"]`` was
+        # retired alongside the topology consumer switch to
+        # ``reachability_requirements[sid]``. The hoist observable is
+        # still pinned by the container + module_path triple-write
+        # above (invariant 10). The raw analysis fact lives on
+        # ``TopologyInputs.reachability_requirements`` -- exercised
+        # by the orchestrator end-to-end via the topology consumer
+        # tests in ``test_scene_runtime_topology.py``.
