@@ -4248,9 +4248,13 @@ script.Disabled = true
         from converter.scene_runtime_planner import (
             backfill_lifecycle_role_inputs,
             build_script_id_by_name,
+            derive_intrinsic_script_class,
         )
         from converter.scene_runtime_topology.build_topology import (
             resolve_caller_graph,
+        )
+        from converter.scene_runtime_topology.lifecycle_roles import (
+            derive_module_lifecycle_role,
         )
         from converter.scene_runtime_topology.module_domain import (
             TopologyInputs,
@@ -4312,12 +4316,83 @@ script.Disabled = true
         domains: dict[str, str] = {
             sid: res["domain"] for sid, res in domain_results.items()
         }
-        lifecycle_roles: dict[str, str] = {}
+        # Slice 7 round 2 (Codex P1 #2 fix): compute ``lifecycle_role``
+        # INLINE here so the storage classifier's slice-7 decision tree
+        # actually sees a populated dict on a fresh run. Pre-round-2
+        # this dict was populated by reading
+        # ``row.get("lifecycle_role")``, but no upstream stamper writes
+        # that key onto the source row -- ``build_topology._build_modules_block``
+        # computes it for the artifact entry but does not mutate the
+        # row, and the planner stamps only the RAW inputs
+        # (``is_loader`` / ``character_attached``). So the prepass
+        # produced an empty dict, the consumer at
+        # ``storage_classifier._decide_script_container_from_topology``
+        # got ``""`` for every sid, and the ``character_attached`` /
+        # ``loader`` branches were dead in production. Unit tests
+        # passed because ``_mk_topology_inputs`` pre-stamped the dict
+        # directly, bypassing the producer/consumer ordering.
+        #
+        # Option A.2 from the round 1 decision doc: recompute inline
+        # via ``derive_module_lifecycle_role`` -- no row mutation. The
+        # late ``build_topology._build_modules_block`` also calls
+        # ``derive_module_lifecycle_role`` with the same inputs, so
+        # the prepass dict and the artifact entry are byte-identical.
+        # See ``slice-7-r1-decision.md`` for the verification chain.
+        #
+        # Round 4 (R3 review P2-NEW-B): unify the prepass join key with
+        # the routing join key. Pre-R4 the prepass joined on class_name
+        # only (via ``build_scripts_by_class_name``) but the routing
+        # path in ``_decide_script_container_from_topology`` joined on
+        # ``script_id_by_name`` (class_name with stem fallback, both
+        # collision-excluded). Disagreement case: two modules with
+        # colliding ``class_name`` but distinct stems pass routing's
+        # lookup via the stem fallback, but the prepass excludes them
+        # both (class_name collision) and silently demotes
+        # ``character_attached`` / ``loader`` to the default role —
+        # exactly the failure mode the slice-3 contract was designed
+        # to surface.
+        #
+        # Fix (option c per memory's "canonical contract" rule):
+        # invert ``script_id_by_name`` to build a ``script_by_sid``
+        # map keyed on the same join the routing path uses. One source
+        # of truth for class_name + stem + collision exclusion across
+        # both consumers. ``build_scripts_by_class_name`` is still
+        # used downstream by ``_build_and_apply_topology`` /
+        # ``_build_modules_block`` for the class_name keyspace there
+        # (see TODO in this method's R4 commit message for the
+        # symmetric follow-up).
         modules_dict = cast("dict[str, dict[str, object]]", modules)
+        scripts_by_name: dict[str, RbxScript] = {
+            s.name: s for s in self.state.rbx_place.scripts if s.name
+        }
+        # Invert ``script_id_by_name`` (``script.name -> sid``) to
+        # ``sid -> RbxScript``. Both directions share the SAME
+        # collision-exclusion contract because they're derived from the
+        # same producer. Modules whose class_name + stem both collide
+        # (or both miss) are absent from ``script_id_by_name`` and
+        # therefore also absent from ``script_by_sid`` — the prepass
+        # then drops them to ``script_class=""`` /
+        # ``derive_intrinsic_script_class(None)``, which is the
+        # safe-default outcome the slice-3 contract specifies.
+        script_by_sid: dict[str, RbxScript] = {
+            sid: scripts_by_name[script_name]
+            for script_name, sid in script_id_by_name.items()
+            if script_name in scripts_by_name
+        }
+        lifecycle_roles: dict[str, str] = {}
         for sid, row in modules_dict.items():
-            role = row.get("lifecycle_role", "")
-            if isinstance(role, str) and role:
-                lifecycle_roles[sid] = role
+            script = script_by_sid.get(sid)
+            script_class = derive_intrinsic_script_class(script)
+            module_domain = domains.get(sid, "")
+            character_attached = bool(row.get("character_attached", False))
+            is_loader = bool(row.get("is_loader", False))
+            role = derive_module_lifecycle_role(
+                domain=module_domain,
+                script_class=script_class,
+                character_attached=character_attached,
+                is_loader=is_loader,
+            )
+            lifecycle_roles[sid] = role
 
         return TopologyInputs(
             domains=domains,
@@ -4325,6 +4400,15 @@ script.Disabled = true
             lifecycle_roles=lifecycle_roles,
             script_id_by_name=script_id_by_name,
             caller_graph=caller_graph,
+            # Slice 7: raw fact -- did transpile run this invocation?
+            # ``state.transpilation_result is not None`` is the
+            # canonical signal (see slice 3 round 5 + slice 6 handoff).
+            # Lets the consumer distinguish "no-transpile resume with
+            # degraded reachability_requirements" from "real
+            # classification bug." Per the slice-6 persistence rule
+            # this is a RAW FACT about pipeline execution, not a
+            # derived conclusion, so it is safe to carry.
+            transpile_ran=self.state.transpilation_result is not None,
         )
 
     def _build_and_apply_topology(

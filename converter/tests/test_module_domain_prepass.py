@@ -341,81 +341,816 @@ class TestNoParentPathInEarlyPrepass:
 
 
 class TestClassifyStorageTopologyInputsKwarg:
-    """Slice 6 commit 4 (rework): ``classify_storage`` accepts a
-    ``topology_inputs`` kwarg. The legacy decision tree is UNCHANGED
-    in slice 6; slice 7's rewrite will fork on the kwarg.
+    """Phase 2a slice 6/7: ``classify_storage`` accepts a
+    ``topology_inputs`` kwarg. Slice 6 plumbed it as a no-op; slice 7
+    inverts the consumer -- when supplied, the topology-driven tree
+    OWNS the decision and the legacy six-rule path becomes a
+    per-script fallback (None kwarg, script_id_by_name miss, or
+    transpile_ran=False unconstrained-helper case).
 
-    Parity assertion here: same scripts in, same StoragePlan out
-    whether the kwarg is ``None`` or supplied. Per the slice-6
-    "save raw facts, recompute conclusions" rule, the kwarg is NOT
-    persisted onto ``StoragePlan`` -- it is always recomputed by the
-    pipeline on every run. That rule is upheld by the absence of a
-    ``StoragePlan.topology_inputs`` field; this class therefore only
-    asserts decision-tree parity, NOT persistence.
+    Per the slice-6 "save raw facts, recompute conclusions" rule
+    ``topology_inputs`` is NOT persisted onto ``StoragePlan`` -- the
+    pipeline always recomputes it. That rule remains upheld by the
+    absence of a ``StoragePlan.topology_inputs`` field.
+
+    Slice-6's ``test_topology_inputs_kwarg_is_no_op_on_decisions`` was
+    DELETED in slice 7: its premise (kwarg is byte-no-op) is exactly
+    what slice 7 inverts. The replacement assertion -- that the
+    topology branch consumes the kwarg and produces a different
+    output for the same script when topology says so -- lives in
+    ``TestSlice7TopologyDecisionTree`` (test_storage_classifier.py).
     """
 
     def test_legacy_path_wins_when_topology_inputs_none(self) -> None:
-        from converter.storage_classifier import classify_storage
+        """Without ``topology_inputs``, the legacy fallback path runs.
+
+        Slice 7 round 3 (Codex R2 P1 #4): the legacy path consults
+        the restored ``client_touchers`` / ``server_touchers`` sets.
+        Script A uses ``Players.LocalPlayer`` -> routes to
+        StarterPlayerScripts (auto-coerced to LocalScript) via the
+        legacy ``_CLIENT_ONLY_PATTERNS`` branch. ModuleScript B is
+        required by A; A is now a client-side caller, so B lands in
+        ReplicatedStorage (legacy "at least one client-side"
+        ModuleScript branch).
+        """
+        from converter.storage_classifier import (
+            classify_storage,
+            REPLICATED_STORAGE,
+            STARTER_PLAYER_SCRIPTS,
+        )
 
         scripts = [
             RbxScript(name="A", source="Players.LocalPlayer", script_type="Script"),
             RbxScript(name="B", source="return {}", script_type="ModuleScript"),
         ]
-        plan = classify_storage(scripts, dependency_map={"A": ["B"]})
-        # Legacy six-rule sequence put A in StarterPlayerScripts
-        # (client-only API) and B in ReplicatedStorage (required by
-        # client-side caller).
+        classify_storage(scripts, dependency_map={"A": ["B"]})
+        # A matches _CLIENT_ONLY_PATTERNS -> SPS (round-3 restored).
         assert scripts[0].parent_path == STARTER_PLAYER_SCRIPTS
+        assert scripts[0].script_type == "LocalScript"  # auto-coerced
+        # B is required by A (client-side per touchers OR via the
+        # auto-coerced LocalScript type) -> RS.
         assert scripts[1].parent_path == REPLICATED_STORAGE
 
-    def test_topology_inputs_kwarg_is_no_op_on_decisions(self) -> None:
-        """Slice 6 must NOT change ``_decide_script_container``'s
-        output. Pass an arbitrary ``topology_inputs`` -- buckets +
-        per-script ``parent_path`` should be IDENTICAL to the
-        ``None``-kwarg call.
-        """
+
+class TestTopologyInputsTranspileRan:
+    """Phase 2a slice 7 — ``TopologyInputs.transpile_ran`` is a raw
+    fact about pipeline execution sourced from
+    ``state.transpilation_result is not None`` in
+    ``Pipeline._maybe_run_topology_prepass``.
+
+    Lets the slice-7 consumer distinguish two structurally-identical
+    "empty ``reachability_requirements``" cases without persisting a
+    derived conclusion:
+      * ``transpile_ran is False`` — assemble-no-retranspile resume;
+        empty reqs is expected; per-script fallback to legacy.
+      * ``transpile_ran is True`` — analysis genuinely produced no
+        constraint; topology tree applies (helper is unconstrained).
+    """
+
+    def test_field_present_on_typed_dict(self) -> None:
+        """Sanity: the field exists in the TypedDict schema and is
+        typed ``bool``."""
         from converter.scene_runtime_topology.module_domain import (
             TopologyInputs,
         )
-        from converter.storage_classifier import classify_storage
 
-        def _mk_scripts() -> list[RbxScript]:
-            return [
-                RbxScript(
-                    name="A", source="Players.LocalPlayer",
-                    script_type="Script",
-                ),
-                RbxScript(
-                    name="B", source="return {}",
-                    script_type="ModuleScript",
-                ),
-            ]
+        # ``__annotations__`` is the TypedDict surface; the new field
+        # must show up alongside the other five. The module uses
+        # ``from __future__ import annotations`` so the value may be a
+        # ``ForwardRef`` -- match by its ``__forward_arg__`` (or by
+        # the type directly when not deferred).
+        annotations = TopologyInputs.__annotations__
+        assert "transpile_ran" in annotations
+        ann = annotations["transpile_ran"]
+        forward_arg = getattr(ann, "__forward_arg__", None)
+        assert forward_arg == "bool" or ann is bool
 
-        scripts_a = _mk_scripts()
-        plan_a = classify_storage(scripts_a, dependency_map={"A": ["B"]})
+    def test_prepass_sets_true_when_transpile_ran(self) -> None:
+        """Construct a minimal pipeline state with
+        ``transpilation_result`` populated; the prepass must stamp
+        ``transpile_ran=True``."""
+        from unittest.mock import MagicMock
+        from converter.pipeline import Pipeline
 
-        # Supply an arbitrary (but well-typed) topology_inputs blob.
-        inputs: TopologyInputs = {
-            "domains": {"g-a": "client", "g-b": "helper"},
-            "reachability_requirements": {"g-b": REPLICATED_STORAGE},
-            "lifecycle_roles": {"g-a": "auto_run"},
-            "script_id_by_name": {"A": "g-a", "B": "g-b"},
-            "caller_graph": {"g-b": ["g-a"]},
+        # Spy a minimal Pipeline -- only the attrs ``_maybe_run_topology_prepass``
+        # actually reaches.
+        pipeline = MagicMock(spec=Pipeline)
+        pipeline.ctx = MagicMock()
+        pipeline.ctx.scene_runtime_mode = "modern"
+        pipeline.ctx.networking_mode = "none"
+        pipeline.state = MagicMock()
+        pipeline.state.transpilation_result = MagicMock()  # truthy
+        pipeline.state.dependency_map = {}
+        pipeline.state.guid_index = None
+        pipeline.state.rbx_place = MagicMock()
+        pipeline.state.rbx_place.scripts = []  # empty -> early-return None
+        scene_runtime: dict[str, object] = {
+            "modules": {},  # empty -> prepass returns None
         }
-        scripts_b = _mk_scripts()
-        plan_b = classify_storage(
-            scripts_b, dependency_map={"A": ["B"]},
-            topology_inputs=inputs,
+
+        # With empty modules the prepass returns None (gate rejects).
+        result = Pipeline._maybe_run_topology_prepass(
+            pipeline, scene_runtime,
+        )
+        assert result is None
+
+    def test_prepass_carries_transpile_ran_through(self) -> None:
+        """The full-path test: a non-trivial scene_runtime with at
+        least one module + script causes the prepass to return a
+        populated ``TopologyInputs`` whose ``transpile_ran`` mirrors
+        ``state.transpilation_result is not None``.
+
+        Asserted for both branches:
+          * ``transpilation_result is not None`` -> True
+          * ``transpilation_result is None`` -> False
+        """
+        from unittest.mock import MagicMock
+        from converter.pipeline import Pipeline
+
+        def _build_pipeline(*, has_transpile_result: bool) -> Pipeline:
+            p = MagicMock(spec=Pipeline)
+            p.ctx = MagicMock()
+            p.ctx.scene_runtime_mode = "modern"
+            p.ctx.networking_mode = "none"
+            p.state = MagicMock()
+            p.state.transpilation_result = (
+                MagicMock() if has_transpile_result else None
+            )
+            p.state.dependency_map = {}
+            p.state.guid_index = None
+            p.state.rbx_place = MagicMock()
+            # Provide one runtime-bearing script + matching module so
+            # the gate accepts.
+            p.state.rbx_place.scripts = [
+                RbxScript(name="X", source="return {}", script_type="ModuleScript"),
+            ]
+            return p
+
+        scene_runtime: dict[str, object] = {
+            "modules": {
+                "g-x": {
+                    "stem": "X", "class_name": "X",
+                    "runtime_bearing": True,
+                    "lifecycle_role": "requireable",
+                },
+            },
+            "scenes": {},
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+
+        # Branch 1: transpile ran.
+        p_true = _build_pipeline(has_transpile_result=True)
+        out_true = Pipeline._maybe_run_topology_prepass(p_true, scene_runtime)
+        assert out_true is not None
+        assert out_true["transpile_ran"] is True
+
+        # Branch 2: no-transpile resume.
+        p_false = _build_pipeline(has_transpile_result=False)
+        out_false = Pipeline._maybe_run_topology_prepass(p_false, scene_runtime)
+        assert out_false is not None
+        assert out_false["transpile_ran"] is False
+
+
+class TestSlice7Round2LifecycleRoleStamping:
+    """Phase 2a slice 7 ROUND 2 (2026-05-30) — verify
+    ``_maybe_run_topology_prepass`` computes ``lifecycle_role`` INLINE
+    from the raw planner-stamped facts (``is_loader``,
+    ``character_attached``, plus the live domain + intrinsic
+    script_class). Round 1 had populated the dict by reading
+    ``row.get("lifecycle_role")`` off the source row, but no upstream
+    stamper writes that key -- the dict came out empty on fresh runs
+    and the slice-7 decision tree's lifecycle pinpoints (
+    ``character_attached`` / ``loader``) were dead in production.
+
+    These tests deliberately do NOT pre-stamp ``lifecycle_role`` on
+    the input rows. A passing assertion proves the role was computed
+    by the prepass itself, NOT supplied by a fixture.
+    """
+
+    def _build_pipeline_with(self, *, scripts: list[RbxScript]):
+        from unittest.mock import MagicMock
+        from converter.pipeline import Pipeline
+
+        p = MagicMock(spec=Pipeline)
+        p.ctx = MagicMock()
+        p.ctx.scene_runtime_mode = "modern"
+        p.ctx.networking_mode = "none"
+        p.state = MagicMock()
+        p.state.transpilation_result = MagicMock()  # truthy
+        p.state.dependency_map = {}
+        p.state.guid_index = None
+        p.state.rbx_place = MagicMock()
+        p.state.rbx_place.scripts = scripts
+        return p
+
+    def test_loader_lifecycle_role_computed_when_no_row_stamp(self) -> None:
+        """A client-domain ``Script`` row with ``is_loader=True`` and
+        NO pre-stamped ``lifecycle_role`` produces
+        ``lifecycle_roles["sid"] == "loader"`` after the prepass runs.
+
+        Guards against the round 1 bug shape (consumer reads a key
+        the producer never writes).
+        """
+        from converter.pipeline import Pipeline
+
+        scripts = [
+            RbxScript(
+                name="Boot",
+                source="local p = game.Players.LocalPlayer",
+                script_type="Script",
+            ),
+        ]
+        scene_runtime: dict[str, object] = {
+            "modules": {
+                "g-boot": {
+                    "stem": "Boot",
+                    "class_name": "Boot",
+                    "runtime_bearing": True,
+                    "is_loader": True,
+                    "character_attached": False,
+                    # Intentionally NO "lifecycle_role" key on the row.
+                },
+            },
+            "scenes": {},
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+        pipeline = self._build_pipeline_with(scripts=scripts)
+        out = Pipeline._maybe_run_topology_prepass(pipeline, scene_runtime)
+        assert out is not None
+        assert out["lifecycle_roles"].get("g-boot") == "loader", (
+            "prepass must compute lifecycle_role inline from raw facts "
+            "(is_loader=True + client-domain Script + no row pre-stamp)"
+        )
+        # Slice 6 contract: prepass does NOT mutate the source row.
+        assert "lifecycle_role" not in scene_runtime["modules"]["g-boot"]  # type: ignore[index]
+
+    def test_character_attached_lifecycle_role_computed_in_prepass(
+        self,
+    ) -> None:
+        """A client-domain script with ``character_attached=True`` and
+        NO pre-stamped ``lifecycle_role`` resolves to
+        ``"character_attached"`` after the prepass runs.
+        """
+        from converter.pipeline import Pipeline
+
+        scripts = [
+            RbxScript(
+                name="Hud",
+                source="local p = game.Players.LocalPlayer\nprint(p.Name)",
+                script_type="LocalScript",
+            ),
+        ]
+        scene_runtime: dict[str, object] = {
+            "modules": {
+                "g-hud": {
+                    "stem": "Hud",
+                    "class_name": "Hud",
+                    "runtime_bearing": True,
+                    "is_loader": False,
+                    "character_attached": True,
+                },
+            },
+            "scenes": {},
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+        pipeline = self._build_pipeline_with(scripts=scripts)
+        out = Pipeline._maybe_run_topology_prepass(pipeline, scene_runtime)
+        assert out is not None
+        assert out["lifecycle_roles"].get("g-hud") == "character_attached"
+
+    def test_module_script_with_loader_hint_stays_requireable(self) -> None:
+        """``derive_module_lifecycle_role`` gates ``is_loader`` on
+        ``script_class != "ModuleScript"``. A ModuleScript with
+        ``is_loader=True`` resolves to ``requireable``, NOT ``loader``
+        -- matches storage_classifier's "ModuleScript skip" rule.
+        """
+        from converter.pipeline import Pipeline
+
+        scripts = [
+            RbxScript(
+                name="LoadingUtils",
+                source="return {}",
+                script_type="ModuleScript",
+            ),
+        ]
+        scene_runtime: dict[str, object] = {
+            "modules": {
+                "g-loading": {
+                    "stem": "LoadingUtils",
+                    "class_name": "LoadingUtils",
+                    "runtime_bearing": True,
+                    "is_loader": True,
+                    "character_attached": False,
+                },
+            },
+            "scenes": {},
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+        pipeline = self._build_pipeline_with(scripts=scripts)
+        out = Pipeline._maybe_run_topology_prepass(pipeline, scene_runtime)
+        assert out is not None
+        assert out["lifecycle_roles"].get("g-loading") == "requireable"
+
+    def test_module_script_with_character_attached_stays_requireable(
+        self,
+    ) -> None:
+        """Slice 7 round 3 (Claude P2 fix). ``derive_module_lifecycle_role``
+        now gates ``character_attached`` symmetrically with ``is_loader``:
+        ``script_class != "ModuleScript"``. A ModuleScript with
+        ``character_attached=True`` resolves to ``requireable``, NOT
+        ``character_attached`` -- a ModuleScript in
+        StarterCharacterScripts does not auto-run on character spawn
+        (Roblox only auto-instantiates Script / LocalScript there), so
+        the assignment would silently be inert.
+        """
+        from converter.pipeline import Pipeline
+
+        scripts = [
+            RbxScript(
+                name="CharacterHelper",
+                source="return {}",
+                script_type="ModuleScript",
+            ),
+        ]
+        scene_runtime: dict[str, object] = {
+            "modules": {
+                "g-char-helper": {
+                    "stem": "CharacterHelper",
+                    "class_name": "CharacterHelper",
+                    "runtime_bearing": True,
+                    "is_loader": False,
+                    "character_attached": True,
+                },
+            },
+            "scenes": {},
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+        pipeline = self._build_pipeline_with(scripts=scripts)
+        out = Pipeline._maybe_run_topology_prepass(pipeline, scene_runtime)
+        assert out is not None
+        # MUST NOT be "character_attached"; ModuleScript falls through
+        # to the class-driven default ("requireable").
+        assert out["lifecycle_roles"].get("g-char-helper") == "requireable"
+        assert (
+            out["lifecycle_roles"].get("g-char-helper")
+            != "character_attached"
         )
 
-        # Buckets + parent_paths byte-identical between the two runs.
-        assert plan_a.server_scripts == plan_b.server_scripts
-        assert plan_a.client_scripts == plan_b.client_scripts
-        assert plan_a.shared_modules == plan_b.shared_modules
-        assert plan_a.server_modules == plan_b.server_modules
-        assert [s.parent_path for s in scripts_a] == [
-            s.parent_path for s in scripts_b
+    def test_auto_run_default_for_plain_client_script(self) -> None:
+        """A plain client-domain script with no special facts resolves
+        to ``"auto_run"``.
+        """
+        from converter.pipeline import Pipeline
+
+        scripts = [
+            RbxScript(
+                name="Camera",
+                source="local p = game.Players.LocalPlayer",
+                script_type="LocalScript",
+            ),
         ]
+        scene_runtime: dict[str, object] = {
+            "modules": {
+                "g-cam": {
+                    "stem": "Camera",
+                    "class_name": "Camera",
+                    "runtime_bearing": True,
+                    "is_loader": False,
+                    "character_attached": False,
+                },
+            },
+            "scenes": {},
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+        pipeline = self._build_pipeline_with(scripts=scripts)
+        out = Pipeline._maybe_run_topology_prepass(pipeline, scene_runtime)
+        assert out is not None
+        assert out["lifecycle_roles"].get("g-cam") == "auto_run"
+
+    def test_prepass_join_unified_with_routing_on_class_name_collision(
+        self,
+    ) -> None:
+        """Round 4 (R3 review P2-NEW-B). When two modules share a
+        ``class_name`` but have DISTINCT stems, the lifecycle-role
+        prepass MUST still reach the lifecycle assignment for both
+        rows — same as the routing join in
+        ``_decide_script_container_from_topology``.
+
+        Pre-R4 the prepass joined on class_name only via
+        ``build_scripts_by_class_name`` (collision-exclude on
+        class_name), but the routing path joined on
+        ``script_id_by_name`` (collision-exclude on BOTH class_name
+        AND stem, with class_name → stem fallback). Disagreement
+        case: two modules with colliding ``class_name="X"`` but
+        distinct stems ``a`` / ``b`` were excluded from the prepass
+        index (their script_class fell back to ``""``), which
+        silently demoted their ``character_attached`` / ``loader``
+        lifecycle roles to the default ``"auto_run"`` branch — the
+        exact silent-demotion failure mode the slice-3
+        degraded-service contract was designed to surface.
+
+        R4 unifies the prepass on ``build_script_id_by_name`` (the
+        canonical helper) and inverts it to a sid → RbxScript map.
+        Both rows now reach the lifecycle assignment via the stem
+        fallback the routing path already uses.
+
+        This test pins the unification: two scripts named ``a`` and
+        ``b`` (distinct stems) with colliding ``class_name="X"``
+        and non-default lifecycle attrs MUST land in
+        ``lifecycle_roles`` with their derived roles
+        (``loader`` and ``character_attached``), NOT the empty-string
+        default that ``derive_module_lifecycle_role`` returns when
+        ``script_class`` is also empty.
+        """
+        from converter.pipeline import Pipeline
+
+        # Two scripts: file stems "a" / "b" matching the modules'
+        # distinct stem field. Their class_name both collide as "X" —
+        # the collision excludes the class_name keyspace, so the
+        # canonical helper falls back to stem (which is collision-free).
+        scripts = [
+            RbxScript(
+                # script.name == module.stem ("a") triggers the stem
+                # fallback inside ``build_script_id_by_name``.
+                name="a",
+                source="local p = game.Players.LocalPlayer",
+                script_type="Script",
+            ),
+            RbxScript(
+                name="b",
+                source=(
+                    "local p = game.Players.LocalPlayer\n"
+                    "print(p.Character)"
+                ),
+                script_type="LocalScript",
+            ),
+        ]
+        scene_runtime: dict[str, object] = {
+            "modules": {
+                "g-a": {
+                    # Colliding class_name, distinct stem.
+                    "stem": "a", "class_name": "X",
+                    "runtime_bearing": True,
+                    "is_loader": True, "character_attached": False,
+                },
+                "g-b": {
+                    "stem": "b", "class_name": "X",
+                    "runtime_bearing": True,
+                    "is_loader": False, "character_attached": True,
+                },
+            },
+            "scenes": {},
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+        pipeline = self._build_pipeline_with(scripts=scripts)
+        out = Pipeline._maybe_run_topology_prepass(pipeline, scene_runtime)
+        assert out is not None
+
+        # Both rows reach lifecycle_roles via the canonical helper's
+        # stem fallback (collision-exclude removed them from
+        # class_name keyspace; stems "a"/"b" are collision-free).
+        # If the prepass still used ``build_scripts_by_class_name``,
+        # both sids would silently get ``""`` script_class and the
+        # ``is_loader`` / ``character_attached`` gates inside
+        # ``derive_module_lifecycle_role`` would NOT fire — they'd
+        # demote to ``"auto_run"`` (the default for empty script_class
+        # + client domain).
+        assert out["lifecycle_roles"].get("g-a") == "loader", (
+            f"g-a (class_name='X' collision, stem='a' unique) must "
+            f"reach the loader lifecycle role via the canonical "
+            f"stem-fallback join; got "
+            f"{out['lifecycle_roles'].get('g-a')!r}"
+        )
+        assert out["lifecycle_roles"].get("g-b") == "character_attached", (
+            f"g-b (class_name='X' collision, stem='b' unique) must "
+            f"reach the character_attached lifecycle role via the "
+            f"canonical stem-fallback join; got "
+            f"{out['lifecycle_roles'].get('g-b')!r}"
+        )
+
+        # Routing parity check: ``script_id_by_name`` (the routing
+        # path's join) ALSO resolved both scripts via the stem
+        # fallback. Pin the contract that the prepass and routing
+        # paths share ONE source of truth.
+        assert out["script_id_by_name"].get("a") == "g-a"
+        assert out["script_id_by_name"].get("b") == "g-b"
+
+    def test_prepass_lifecycle_roles_parity_with_build_topology(
+        self,
+    ) -> None:
+        """The prepass and the late ``build_topology._build_modules_block``
+        must compute IDENTICAL ``lifecycle_role`` values. Both call
+        ``derive_module_lifecycle_role`` with the same raw inputs;
+        this test asserts that invariant directly rather than relying
+        on it.
+
+        Builds a 3-module fixture (Script+loader, LocalScript+
+        character_attached, ModuleScript), runs the prepass, then runs
+        ``_build_modules_block`` independently with the same inputs,
+        and compares the lifecycle_role per sid.
+        """
+        from converter.pipeline import Pipeline
+        from converter.scene_runtime_planner import (
+            build_scripts_by_class_name,
+        )
+        from converter.scene_runtime_topology.build_topology import (
+            _build_modules_block,
+        )
+
+        scripts = [
+            RbxScript(
+                name="Boot",
+                source="local p = game.Players.LocalPlayer",
+                script_type="Script",
+            ),
+            RbxScript(
+                name="Hud",
+                source="local p = game.Players.LocalPlayer\nprint(p.Name)",
+                script_type="LocalScript",
+            ),
+            RbxScript(
+                name="Util",
+                source="return {}",
+                script_type="ModuleScript",
+            ),
+        ]
+        modules: dict[str, dict[str, object]] = {
+            "g-boot": {
+                "stem": "Boot", "class_name": "Boot",
+                "runtime_bearing": True,
+                "is_loader": True, "character_attached": False,
+            },
+            "g-hud": {
+                "stem": "Hud", "class_name": "Hud",
+                "runtime_bearing": True,
+                "is_loader": False, "character_attached": True,
+            },
+            "g-util": {
+                "stem": "Util", "class_name": "Util",
+                "runtime_bearing": True,
+                "is_loader": False, "character_attached": False,
+            },
+        }
+        scene_runtime: dict[str, object] = {
+            "modules": modules,
+            "scenes": {},
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+
+        pipeline = self._build_pipeline_with(scripts=scripts)
+        out = Pipeline._maybe_run_topology_prepass(pipeline, scene_runtime)
+        assert out is not None
+
+        # The prepass populates ``domain`` on rows (via
+        # ``classify_scene_runtime_domains`` upstream) -- emulate that
+        # by reading the prepass's classifier results into the rows
+        # before ``_build_modules_block`` consumes them. The prepass
+        # does NOT mutate the row (slice 6 contract), so we copy the
+        # ``domains`` output onto rows for the parity comparison's
+        # ``_build_modules_block`` call.
+        for sid, dom in out["domains"].items():
+            modules[sid]["domain"] = dom
+
+        artifact = cast(SceneRuntimeArtifact, scene_runtime)
+        scripts_by_class = build_scripts_by_class_name(
+            scripts, cast("dict[str, object]", modules),
+        )
+        modules_block = _build_modules_block(
+            artifact, scripts_by_class, guid_index=None,
+        )
+
+        # Parity: every sid in the prepass dict has the same
+        # lifecycle_role in the build_topology artifact entry.
+        for sid, role in out["lifecycle_roles"].items():
+            assert sid in modules_block, (
+                f"sid {sid!r} present in prepass roles but missing from "
+                "modules_block -- producer/consumer mismatch"
+            )
+            assert modules_block[sid]["lifecycle_role"] == role, (
+                f"lifecycle_role parity violation for {sid!r}: "
+                f"prepass={role!r} vs build_topology="
+                f"{modules_block[sid]['lifecycle_role']!r}"
+            )
+
+
+class TestSlice7Round2EndToEndPrepassClassify:
+    """Phase 2a slice 7 ROUND 2 (2026-05-30) — END-TO-END guard against
+    the fixture-masking failure mode that hid the round-1 bug.
+
+    Round 1's unit tests in ``TestSlice7TopologyDecisionTree`` all
+    constructed ``TopologyInputs`` directly via ``_mk_topology_inputs``
+    with ``lifecycle_roles={...}`` pre-stamped, completely bypassing
+    the producer/consumer ordering. That is how a "consumer reads a
+    key the producer never writes" bug shipped to a green test suite.
+
+    These tests run the REAL pipeline ordering:
+      1. ``_maybe_run_topology_prepass`` (the producer)
+      2. ``classify_storage(..., topology_inputs=out)`` (the consumer)
+
+    A lifecycle-role-driven branch firing here PROVES the round-2 fix
+    is in place; if the producer ever stops writing the dict, this
+    test fails -- not the unit tests that rely on a fixture.
+    """
+
+    def _build_pipeline_with(self, *, scripts: list[RbxScript]):
+        from unittest.mock import MagicMock
+        from converter.pipeline import Pipeline
+
+        p = MagicMock(spec=Pipeline)
+        p.ctx = MagicMock()
+        p.ctx.scene_runtime_mode = "modern"
+        p.ctx.networking_mode = "none"
+        p.state = MagicMock()
+        p.state.transpilation_result = MagicMock()  # truthy
+        p.state.dependency_map = {}
+        p.state.guid_index = None
+        p.state.rbx_place = MagicMock()
+        p.state.rbx_place.scripts = scripts
+        return p
+
+    def test_loader_routes_to_replicated_first_via_prepass(self) -> None:
+        """A client-Script with ``is_loader=True`` -> ReplicatedFirst,
+        with NO pre-stamped ``lifecycle_role`` on the row OR in
+        topology_inputs."""
+        from converter.pipeline import Pipeline
+        from converter.storage_classifier import (
+            REPLICATED_FIRST, classify_storage,
+        )
+
+        boot = RbxScript(
+            name="Boot",
+            source="local p = game.Players.LocalPlayer",
+            script_type="Script",
+        )
+        scene_runtime: dict[str, object] = {
+            "modules": {
+                "g-boot": {
+                    "stem": "Boot", "class_name": "Boot",
+                    "runtime_bearing": True,
+                    "is_loader": True, "character_attached": False,
+                },
+            },
+            "scenes": {},
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+        pipeline = self._build_pipeline_with(scripts=[boot])
+        topology_inputs = Pipeline._maybe_run_topology_prepass(
+            pipeline, scene_runtime,
+        )
+        assert topology_inputs is not None
+
+        plan = classify_storage(
+            [boot], topology_inputs=topology_inputs,
+        )
+        assert boot.parent_path == REPLICATED_FIRST, (
+            "loader lifecycle_role pinpoint must fire on the REAL "
+            "prepass -> classifier pipeline (not just on pre-stamped "
+            "fixture inputs)"
+        )
+        reasons = {d["script"]: d["reason"] for d in plan.decisions}
+        assert "lifecycle_role=loader" in reasons["Boot"]
+
+    def test_character_attached_routes_to_starter_character_via_prepass(
+        self,
+    ) -> None:
+        """A client-LocalScript with ``character_attached=True`` ->
+        StarterCharacterScripts via REAL prepass -> classifier.
+        """
+        from converter.pipeline import Pipeline
+        from converter.storage_classifier import (
+            STARTER_CHARACTER_SCRIPTS, classify_storage,
+        )
+
+        hud = RbxScript(
+            name="Hud",
+            source="local p = game.Players.LocalPlayer\nprint(p.Name)",
+            script_type="LocalScript",
+        )
+        scene_runtime: dict[str, object] = {
+            "modules": {
+                "g-hud": {
+                    "stem": "Hud", "class_name": "Hud",
+                    "runtime_bearing": True,
+                    "is_loader": False, "character_attached": True,
+                },
+            },
+            "scenes": {},
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+        pipeline = self._build_pipeline_with(scripts=[hud])
+        topology_inputs = Pipeline._maybe_run_topology_prepass(
+            pipeline, scene_runtime,
+        )
+        assert topology_inputs is not None
+
+        plan = classify_storage(
+            [hud], topology_inputs=topology_inputs,
+        )
+        assert hud.parent_path == STARTER_CHARACTER_SCRIPTS
+        assert hud.name in plan.character_scripts
+
+    def test_client_domain_script_routes_to_sps_via_prepass(self) -> None:
+        """Round-2 client-Script branch: end-to-end check that a
+        client-domain ``Script`` (one upstream missed for
+        ``LocalScript`` promotion) lands in StarterPlayerScripts on
+        the real producer -> consumer pipeline. Guards against
+        recurrence of P1 #1 + #3.
+        """
+        from converter.pipeline import Pipeline
+        from converter.storage_classifier import (
+            STARTER_PLAYER_SCRIPTS, classify_storage,
+        )
+
+        # A script using ``Players.LocalPlayer`` only -- not a UI/
+        # input API -- so ``code_transpiler._classify_script_type``
+        # would NOT promote it to LocalScript. The simulated
+        # ``script_type="Script"`` here mirrors that miss.
+        s = RbxScript(
+            name="LocalPlayerOnly",
+            source="local p = game.Players.LocalPlayer\nprint(p.Name)",
+            script_type="Script",
+        )
+        scene_runtime: dict[str, object] = {
+            "modules": {
+                "g-lp": {
+                    "stem": "LocalPlayerOnly",
+                    "class_name": "LocalPlayerOnly",
+                    "runtime_bearing": True,
+                    "is_loader": False, "character_attached": False,
+                },
+            },
+            "scenes": {},
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+        pipeline = self._build_pipeline_with(scripts=[s])
+        topology_inputs = Pipeline._maybe_run_topology_prepass(
+            pipeline, scene_runtime,
+        )
+        assert topology_inputs is not None
+        # Sanity: the prepass classified the module as client.
+        assert topology_inputs["domains"].get("g-lp") == "client"
+
+        plan = classify_storage(
+            [s], topology_inputs=topology_inputs,
+        )
+        assert s.parent_path == STARTER_PLAYER_SCRIPTS
+        assert s.script_type == "LocalScript"  # in-flow coercion
+        assert s.name in plan.client_scripts
+
+    def test_server_script_still_routes_to_sss_via_prepass(self) -> None:
+        """Counterpart guard: a server-domain Script with no lifecycle
+        pinpoints still lands in SSS through the real pipeline. Proves
+        the new client-Script branch does NOT swallow server cases.
+        """
+        from converter.pipeline import Pipeline
+        from converter.storage_classifier import (
+            SERVER_SCRIPT_SERVICE, classify_storage,
+        )
+
+        s = RbxScript(
+            name="WorldManager",
+            source=(
+                "local dss = game:GetService('DataStoreService')\n"
+                "local rem = nil\n"
+                "rem.OnServerEvent:Connect(function() end)"
+            ),
+            script_type="Script",
+        )
+        scene_runtime: dict[str, object] = {
+            "modules": {
+                "g-world": {
+                    "stem": "WorldManager",
+                    "class_name": "WorldManager",
+                    "runtime_bearing": True,
+                    "is_loader": False, "character_attached": False,
+                },
+            },
+            "scenes": {},
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+        pipeline = self._build_pipeline_with(scripts=[s])
+        topology_inputs = Pipeline._maybe_run_topology_prepass(
+            pipeline, scene_runtime,
+        )
+        assert topology_inputs is not None
+
+        plan = classify_storage(
+            [s], topology_inputs=topology_inputs,
+        )
+        assert s.parent_path == SERVER_SCRIPT_SERVICE
+        assert s.name in plan.server_scripts
 
 
 class TestSlice6OrchestratorByteParity:

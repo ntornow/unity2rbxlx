@@ -415,51 +415,96 @@ class TestLegacyTablesUntouched:
         joined = "\n".join(patterns)
         return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
-    def test_storage_classifier_client_only_patterns_unchanged(self) -> None:
-        """The legacy table must not drift. PR3b's classifier uses a
-        SEPARATE table in ``scene_runtime_domain._GENERIC_CLIENT_API_PATTERNS``;
-        the legacy ``storage_classifier._CLIENT_ONLY_PATTERNS`` stays
-        byte-frozen.
+    def test_storage_classifier_client_only_patterns_restored_as_fallback_only(
+        self,
+    ) -> None:
+        """Phase 2a slice 7 round 3 (2026-05-30, Codex R2 P1 #4).
 
-        On a drive-by edit to the legacy table this test fails with the
-        new digest in the error message; update the pinned constant
-        DELIBERATELY in a separate, explicitly reviewed PR.
+        The legacy ``storage_classifier._CLIENT_ONLY_PATTERNS`` /
+        ``_SERVER_ONLY_PATTERNS`` regex tables were originally deleted
+        in slice 7 because the topology path consumes
+        ``infer_module_domains`` upstream. Round 2 review found this
+        silently degraded the LEGACY FALLBACK path -- a Script using
+        ``Players.LocalPlayer`` that escapes
+        ``code_transpiler._classify_script_type``'s promotion would
+        land in the fallback as ``script_type == "Script"`` and route
+        to ServerScriptService where ``LocalPlayer`` is nil at runtime.
+
+        Round 3 RESTORES the patterns as **FALLBACK-PATH ONLY**
+        infrastructure (Option C from ``slice-7-r2-decision.md``).
+        This test now pins:
+
+        1. The tables exist (deletion was the regression; restoration
+           is the round-3 fix).
+        2. They are consumed via the FALLBACK-ONLY helpers
+           ``_scripts_with_client_apis`` /
+           ``_scripts_with_server_apis``.
+        3. The topology decision tree
+           (``_decide_script_container_from_topology``) does NOT
+           reference them -- the topology path still uses
+           ``infer_module_domains`` upstream.
+
+        The PR3b generic table in scene_runtime_domain still carries
+        its distinguishing signals (verified at the bottom of this
+        test).
         """
+        import inspect
+
         from converter import storage_classifier as legacy
-        actual = self._table_digest(legacy._CLIENT_ONLY_PATTERNS)
-        # First run: pin the digest in this test if the constant above
-        # is a placeholder. We assert table SHAPE invariants in tandem
-        # so a stale placeholder doesn't silently pass.
-        assert len(legacy._CLIENT_ONLY_PATTERNS) >= 10, (
-            "Legacy client table size unexpectedly small — likely a "
-            "regression that dropped patterns."
+
+        # The patterns exist (round-3 restoration).
+        assert hasattr(legacy, "_CLIENT_ONLY_PATTERNS"), (
+            "Slice 7 round 3 restored _CLIENT_ONLY_PATTERNS as "
+            "FALLBACK-PATH ONLY infrastructure (Codex R2 P1 #4)."
         )
-        # Cross-contamination check still meaningful.
-        assert set(legacy._CLIENT_ONLY_PATTERNS) != set(
-            _GENERIC_CLIENT_API_PATTERNS,
-        ), "PR3b's generic client table must NOT equal the legacy table"
-        # Sanity check on the new table's distinguishing signals.
+        assert hasattr(legacy, "_SERVER_ONLY_PATTERNS"), (
+            "Slice 7 round 3 restored _SERVER_ONLY_PATTERNS as "
+            "FALLBACK-PATH ONLY infrastructure (Codex R2 P1 #4)."
+        )
+
+        # The patterns are consumed ONLY by the fallback helpers.
+        assert hasattr(legacy, "_scripts_with_client_apis")
+        assert hasattr(legacy, "_scripts_with_server_apis")
+
+        # The topology decision tree MUST NOT reference these
+        # constants. Inspect the function's source to enforce the
+        # contract — a future edit that adds them would silently
+        # break the slice-7 "topology owns domain inference" design.
+        # Strip comment lines first so the docstring + inline comments
+        # that mention "legacy _CLIENT_ONLY_PATTERNS branch" for
+        # historical context don't trip the gate.
+        topology_src = inspect.getsource(
+            legacy._decide_script_container_from_topology,
+        )
+        topology_code_lines = [
+            line for line in topology_src.splitlines()
+            if not line.lstrip().startswith("#")
+        ]
+        topology_code = "\n".join(topology_code_lines)
+        # Also strip the function's docstring (between the first pair
+        # of triple-quotes) — the rationale doc references the
+        # legacy names for historical context.
+        if '"""' in topology_code:
+            first = topology_code.index('"""')
+            second = topology_code.index('"""', first + 3)
+            topology_code = (
+                topology_code[:first] + topology_code[second + 3:]
+            )
+        assert "_CLIENT_ONLY_PATTERNS" not in topology_code, (
+            "Topology path must not reference _CLIENT_ONLY_PATTERNS "
+            "-- it owns domain inference via infer_module_domains."
+        )
+        assert "_SERVER_ONLY_PATTERNS" not in topology_code, (
+            "Topology path must not reference _SERVER_ONLY_PATTERNS "
+            "-- it owns domain inference via infer_module_domains."
+        )
+        assert "_scripts_with_client_apis" not in topology_code
+        assert "_scripts_with_server_apis" not in topology_code
+
+        # The PR3b generic table in scene_runtime_domain still
+        # carries its distinguishing signals.
         assert any("RenderStepped" in p for p in _GENERIC_CLIENT_API_PATTERNS)
         assert any(":FireServer" in p for p in _GENERIC_CLIENT_API_PATTERNS)
-        # And the legacy table does NOT have those (proves no
-        # accidental edits to the legacy file).
-        assert not any(
-            "RenderStepped" in p for p in legacy._CLIENT_ONLY_PATTERNS
-        ), (
-            "Legacy client table grew a RenderStepped pattern — PR3b "
-            "must NOT touch the legacy table; add to "
-            "_GENERIC_CLIENT_API_PATTERNS instead."
-        )
-        assert not any(
-            ":FireServer" in p for p in legacy._CLIENT_ONLY_PATTERNS
-        ), (
-            "Legacy client table grew a :FireServer pattern — PR3b "
-            "must NOT touch the legacy table; add to "
-            "_GENERIC_CLIENT_API_PATTERNS instead."
-        )
-        # Echo the digest for an operator updating the pinned constant.
-        # Not a failure; intentional logging via assertion message.
-        _ = actual  # captured for debugger inspection
 
     def test_script_coherence_client_only_patterns_unchanged(self) -> None:
         from converter import script_coherence as legacy

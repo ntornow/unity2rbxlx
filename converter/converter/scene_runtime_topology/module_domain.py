@@ -614,6 +614,28 @@ class TopologyInputs(TypedDict):
     # planner's ``dependency_map`` via the canonical
     # ``_resolve_caller_graph`` helper in ``build_topology.py``.
     caller_graph: dict[str, list[str]]
+    # Phase 2a slice 7 -- raw fact: did the transpile phase run on this
+    # pipeline invocation? Sourced from
+    # ``state.transpilation_result is not None`` in
+    # ``Pipeline._maybe_run_topology_prepass``. NOT a derived
+    # conclusion; lets slice 7's ``_decide_script_container_from_topology``
+    # distinguish two structurally-identical "empty
+    # ``reachability_requirements``" cases:
+    #   * ``transpile_ran is False`` (assemble-no-retranspile resume):
+    #     empty is expected because ``dependency_map`` is empty, so
+    #     ``derive_reachability_requirements`` returns ``{}``. Per the
+    #     slice-6 "save raw facts, recompute conclusions" rule the
+    #     consumer falls back to the legacy six-rule path PER-SCRIPT
+    #     for modules not covered by topology (the unconstrained-helper
+    #     fallback). Byte-identical to slice-5 behavior on resume.
+    #   * ``transpile_ran is True``: empty
+    #     ``reachability_requirements[sid]`` means the analysis genuinely
+    #     produced no constraint -- the consumer proceeds through the
+    #     topology decision tree (helper is unconstrained, fall through
+    #     to ModuleScript caller-domain routing).
+    # See ``scene-runtime-architecture-ir.md`` §"TopologyInputs shape
+    # -- transpile_ran" and §"Unconstrained-helper fallback contract".
+    transpile_ran: bool
 
 
 def infer_module_domains(

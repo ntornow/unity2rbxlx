@@ -127,8 +127,24 @@ def derive_module_lifecycle_role(
     ``storage_classifier._decide_script_container``'s
     ``script_type != "ModuleScript"`` skip (codex review 2026-05-28
     P2 on slice 2 initial).
+
+    ``character_attached`` is symmetrically gated by
+    ``script_class != "ModuleScript"`` (slice 7 round 3, Claude P2
+    finding): a ModuleScript placed in StarterCharacterScripts does
+    not auto-run on character spawn — Roblox only auto-instantiates
+    Script / LocalScript under StarterCharacterScripts. A
+    ModuleScript whose name pattern triggered ``character_attached``
+    falls through to ``"requireable"``, matching the parallel
+    storage_classifier ModuleScript skip and preventing silently
+    inert StarterCharacterScripts placements. The
+    ``character_attached`` gate is now exactly symmetric to
+    ``is_loader``.
     """
-    if character_attached and domain == "client":
+    if (
+        character_attached
+        and script_class in ("Script", "LocalScript")
+        and domain == "client"
+    ):
         return "character_attached"
     if (
         is_loader

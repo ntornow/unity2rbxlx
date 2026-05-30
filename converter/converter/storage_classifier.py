@@ -11,17 +11,40 @@ Every module needs an explicit container. This module answers, per script:
 Output: a StoragePlan with a concrete parent_path on each RbxScript.
 rbxlx_writer.py and luau_place_builder.py route by parent_path.
 
-Rules (first match wins):
+Phase 2a slice 7 (2026-05-30): when ``topology_inputs`` is provided
+(every non-legacy run), ``_decide_script_container`` consults the
+topology-driven decision tree below FIRST. The legacy six-rule path
+is preserved as a per-script fallback for the unconstrained-helper
+contract (see ``_decide_script_container_from_topology`` docstring).
 
-  - client-only API surface       -> StarterPlayerScripts (LocalScript)
-  - character-attached            -> StarterCharacterScripts (LocalScript)
-  - name hint *Loading* / *Boot*  -> ReplicatedFirst
-  - ModuleScript reached by client -> ReplicatedStorage
-  - ModuleScript only server      -> ServerStorage
-  - otherwise                     -> ServerScriptService
+Decision tree (first-match-wins) when ``topology_inputs`` is provided:
 
-Ambiguity: default to ReplicatedStorage. Misplacing into ReplicatedStorage
-degrades security; misplacing into ServerStorage breaks the game.
+  1. ``lifecycle_role == "character_attached"`` -> StarterCharacterScripts
+  2. ``lifecycle_role == "loader"`` -> ReplicatedFirst
+  3. ``reachability_required_container`` present -> that container
+     (``"__excluded__"`` sentinel hoists to ReplicatedStorage)
+  4. ModuleScript -> route by ``topology_inputs.domains`` + caller_graph
+     * any client-domain caller -> ReplicatedStorage
+     * all callers server-domain -> ServerStorage
+     * orphan / unknown -> ReplicatedStorage (conservative)
+  5. LocalScript -> StarterPlayerScripts
+  6. Script -> ServerScriptService
+
+Legacy six-rule (slice-5 byte-parity) path, used when:
+  * ``topology_inputs is None`` (legacy mode / probe flag), OR
+  * topology says this script has no signal AND
+    ``transpile_ran is False`` (no-transpile resume; degraded
+    reachability per the unconstrained-helper contract), OR
+  * ``script_id_by_name`` cannot resolve ``s.name`` (degraded service
+    contract on stem/class_name collisions).
+
+Hard constraints (enforced AFTER the decision tree, defense in depth):
+  * LocalScript in ServerScriptService -> ConstraintViolation
+  * ReplicatedFirst + ModuleScript -> ConstraintViolation
+
+Ambiguity (legacy path only): default to ReplicatedStorage. Misplacing
+into ReplicatedStorage degrades security; misplacing into ServerStorage
+breaks the game.
 """
 
 from __future__ import annotations
@@ -49,7 +72,20 @@ STARTER_CHARACTER_SCRIPTS = "StarterPlayer.StarterCharacterScripts"
 STARTER_GUI = "StarterGui"
 
 
-# APIs that ONLY work on the client — any script touching these must run client-side.
+# Phase 2a slice 7 round 3 (2026-05-30): the regex-based client-only /
+# server-only API pattern lists were originally DELETED in slice 7
+# because the topology path consumes ``infer_module_domains`` upstream
+# (via the slice-6 prepass). HOWEVER, round 2 review (Codex R2 P1 #4)
+# found this silently degraded the LEGACY FALLBACK path -- a Script
+# using ``Players.LocalPlayer`` that escapes
+# ``code_transpiler._classify_script_type``'s Script -> LocalScript
+# promotion would land in the fallback as ``script_type == "Script"``
+# and route to ServerScriptService where ``LocalPlayer`` is nil at
+# runtime. Round 3 restores the patterns + helpers as
+# **FALLBACK-PATH ONLY** infrastructure. The topology path does NOT
+# consume them. See ``_scripts_with_client_apis`` and
+# ``_scripts_with_server_apis`` below for the contract and deletion
+# pre-condition.
 _CLIENT_ONLY_PATTERNS = [
     r"Players\.LocalPlayer",
     r'GetService\(["\']Players["\']\)\.LocalPlayer',
@@ -65,7 +101,8 @@ _CLIENT_ONLY_PATTERNS = [
     r'GetService\(["\']GuiService["\']\)',
 ]
 
-# APIs that ONLY work on the server.
+# APIs that ONLY work on the server. FALLBACK-PATH ONLY (see
+# ``_scripts_with_server_apis``).
 _SERVER_ONLY_PATTERNS = [
     r"\.OnServerEvent",
     r":FireClient\(",
@@ -205,18 +242,25 @@ def classify_storage(
     script_by_name: dict[str, RbxScript] = {s.name: s for s in scripts}
 
     call_graph = _build_call_graph(scripts, dependency_map)
-    client_touchers = _scripts_with_client_apis(scripts)
-    server_touchers = _scripts_with_server_apis(scripts)
+    # Phase 2a slice 7 round 3 (2026-05-30): client_touchers /
+    # server_touchers regex sets are restored as **FALLBACK-PATH ONLY**
+    # inputs. The topology path consumes ``topology_inputs.domains``
+    # instead and never reads these sets. ``_decide_script_container``
+    # threads them only into ``_decide_script_container_legacy``;
+    # ``_decide_script_container_from_topology`` never sees them.
+    # See ``_scripts_with_client_apis`` for the deletion contract.
+    fallback_client_touchers = _scripts_with_client_apis(scripts)
+    fallback_server_touchers = _scripts_with_server_apis(scripts)
 
     for s in scripts:
         container, reason = _decide_script_container(
             s,
             call_graph=call_graph,
-            client_touchers=client_touchers,
-            server_touchers=server_touchers,
             character_set=character_set,
             script_by_name=script_by_name,
             topology_inputs=topology_inputs,
+            fallback_client_touchers=fallback_client_touchers,
+            fallback_server_touchers=fallback_server_touchers,
         )
         s.parent_path = container
 
@@ -231,11 +275,20 @@ def classify_storage(
         elif container == SERVER_SCRIPT_SERVICE:
             if s.script_type == "LocalScript":
                 # Client script in SSS would never run — keep LocalScript, place
-                # in StarterPlayerScripts instead.
+                # in StarterPlayerScripts instead. Defense-in-depth: this is
+                # also caught by ``_enforce_hard_constraints`` below (slice 7),
+                # but the in-flow correction preserves the legacy auto-heal
+                # behavior callers expect.
                 s.parent_path = STARTER_PLAYER_SCRIPTS
                 container = STARTER_PLAYER_SCRIPTS
                 reason += " (forced to StarterPlayerScripts: LocalScript cannot live in SSS)"
         # ModuleScripts keep whatever container was chosen.
+
+        # Phase 2a slice 7: hard-constraint post-validator. These
+        # checks are belt-and-suspenders -- the in-flow corrections
+        # above SHOULD prevent the violations, but the validator
+        # raises if a future edit slips through.
+        _enforce_hard_constraints(s, container)
 
         # Phase 2a slice 5 round 3: persist the immutable
         # ``intrinsic_script_type`` alongside the (potentially-coerced)
@@ -259,6 +312,11 @@ def classify_storage(
         _append_to_bucket(plan, s.name, s.script_type, container)
 
     _collect_remote_event_names(plan, scripts)
+    # Slice 7: derive client_touchers from the just-computed plan
+    # buckets instead of the deleted regex set. Any script that
+    # landed in a client-side container is a client-side caller from
+    # the template-routing perspective.
+    client_touchers = set(plan.client_scripts) | set(plan.character_scripts)
     _assign_template_containers(
         plan,
         template_names=template_names,
@@ -290,7 +348,32 @@ def _build_call_graph(
     scripts: list[RbxScript],
     dependency_map: dict[str, list[str]] | None,
 ) -> dict[str, set[str]]:
-    """Return caller -> set(callees) built from dependency_map or source scan."""
+    """Return caller -> set(callees) built from dependency_map + source scan.
+
+    **FALLBACK-PATH ONLY** -- the legacy decision tree
+    (``_decide_script_container_legacy``) consults this graph. The
+    topology path uses
+    ``topology_inputs["caller_graph"]`` instead, which is built by
+    ``scene_runtime_topology.build_topology.resolve_caller_graph`` as
+    a pure ``dependency_map`` projection (no source-scan).
+
+    Round 3 (Codex R2 P1 #5): the source-scan augmentation below is
+    INTENTIONALLY kept on the legacy path. ``dependency_map`` is
+    produced by the C# analyzer and misses ``require()`` calls
+    injected post-transpile (coherence packs / runtime helpers /
+    generic-mode callees discovered post-hoc). The legacy fallback
+    fires precisely in degraded-topology cases (no transpile this
+    run, ``script_id_by_name`` miss, etc.) where post-analyzer
+    requires are exactly the requires the topology pipeline could
+    not see. Removing the source-scan from the legacy path would
+    silently regress server-private modules to ReplicatedStorage.
+
+    The topology ``caller_graph`` stays as a pure projection because
+    the topology path's domain inference + reachability solver
+    already cover the cases this scanner targets when they have
+    valid inputs. Will be deleted from the legacy path when the
+    legacy path itself is deleted (post-topology-coverage extension).
+    """
     graph: dict[str, set[str]] = {s.name: set() for s in scripts}
     script_names = set(graph.keys())
 
@@ -300,9 +383,11 @@ def _build_call_graph(
                 continue
             graph[caller].update(c for c in callees if c in script_names)
 
-    # Always augment with source-scan: dependency_map is from C# analyzer and may
-    # miss require() calls injected post-transpile. Walk each `require(...)` and
-    # extract candidate names from its full body — including nested parens like
+    # FALLBACK-PATH ONLY source-scan augmentation (see docstring).
+    # Always augment: dependency_map is from C# analyzer and may
+    # miss require() calls injected post-transpile. Walk each
+    # `require(...)` and extract candidate names from its full body
+    # — including nested parens like
     # `require(game:GetService("ServerStorage"):FindFirstChild("Utility"))`.
     quoted_pat = re.compile(r'["\'](\w+)["\']')
     dotted_pat = re.compile(r'\.(\w+)')
@@ -343,8 +428,29 @@ def _balanced_paren_body(source: str, start: int) -> str:
     return source[start:end]
 
 
+class ConstraintViolation(ValueError):
+    """Raised when ``_enforce_hard_constraints`` detects an
+    impossible-to-honor (script_type, container) pair.
+
+    Phase 2a slice 7: defense-in-depth post-validator. The decision
+    tree should not normally produce these, but the validator catches
+    drift if a future edit introduces it.
+    """
+
+
 def _scripts_with_client_apis(scripts: list[RbxScript]) -> set[str]:
-    """Names of scripts whose source matches any client-only API pattern."""
+    """Names of scripts whose source matches any client-only API pattern.
+
+    **FALLBACK-PATH ONLY** -- used by ``_decide_script_container_legacy``
+    when topology data is degraded (the legacy mode, the
+    ``script_id_by_name`` miss case, or the
+    ``transpile_ran=False`` + missing-``reachability_requirements``
+    no-transpile-resume case). The topology path uses
+    ``infer_module_domains`` instead and MUST NOT call this helper.
+
+    Will be deleted when topology coverage extends to cover the
+    no-transpile resume case (see ``slice-7-r2-decision.md`` Option C).
+    """
     return {
         s.name for s in scripts
         if any(re.search(p, s.source) for p in _CLIENT_ONLY_PATTERNS)
@@ -352,7 +458,18 @@ def _scripts_with_client_apis(scripts: list[RbxScript]) -> set[str]:
 
 
 def _scripts_with_server_apis(scripts: list[RbxScript]) -> set[str]:
-    """Names of scripts whose source matches any server-only API pattern."""
+    """Names of scripts whose source matches any server-only API pattern.
+
+    **FALLBACK-PATH ONLY** -- used by ``_decide_script_container_legacy``
+    when topology data is degraded (the legacy mode, the
+    ``script_id_by_name`` miss case, or the
+    ``transpile_ran=False`` + missing-``reachability_requirements``
+    no-transpile-resume case). The topology path uses
+    ``infer_module_domains`` instead and MUST NOT call this helper.
+
+    Will be deleted when topology coverage extends to cover the
+    no-transpile resume case (see ``slice-7-r2-decision.md`` Option C).
+    """
     return {
         s.name for s in scripts
         if any(re.search(p, s.source) for p in _SERVER_ONLY_PATTERNS)
@@ -363,27 +480,273 @@ def _decide_script_container(
     s: RbxScript,
     *,
     call_graph: dict[str, set[str]],
-    client_touchers: set[str],
-    server_touchers: set[str],
     character_set: set[str],
     script_by_name: dict[str, RbxScript],
     topology_inputs: "TopologyInputs | None" = None,
+    fallback_client_touchers: set[str] | None = None,
+    fallback_server_touchers: set[str] | None = None,
 ) -> tuple[str, str]:
     """Return (container, reason) for a single script.
 
-    Phase 2a slice 6: ``topology_inputs`` is plumbed through but NOT
-    yet consumed. The six-rule legacy decision sequence below runs
-    unchanged whether the kwarg is provided or not. Slice 7 will
-    fork on ``topology_inputs is not None`` and route through a
-    topology-driven decision tree; the legacy branch will then be
-    removed atomically with the regex-API detectors. Keeping the
-    plumbing inert in slice 6 means ``test_storage_classifier.py``'s
-    19 tests pass byte-for-byte against the unchanged legacy path.
+    Phase 2a slice 7 (2026-05-30): forks on ``topology_inputs``. When
+    ``topology_inputs is not None`` (every non-legacy pipeline run),
+    the topology-driven decision tree owns the call. The legacy path
+    is preserved as a per-script fallback for two narrow cases the
+    topology path can't service:
+
+    1. ``topology_inputs is None`` (legacy mode / probe flag / no
+       modules / no scripts -- see ``_maybe_run_topology_prepass``
+       gate). Caller uses ``classify_storage`` without the prepass.
+
+    2. ``script_id_by_name.get(s.name) is None`` (degraded-service
+       contract on stem/class_name collisions; see
+       ``scene_runtime_planner.build_script_id_by_name``). The
+       topology layer cannot identify ``s`` so the tree can't apply.
+
+    3. ``topology_inputs.transpile_ran is False`` AND the script is a
+       ModuleScript that's NOT in
+       ``topology_inputs.reachability_requirements`` (assemble-no-
+       retranspile resume; reachability is empty by design because
+       ``dependency_map`` is empty -- see the slice-6 handoff). The
+       unconstrained-helper contract says fall back PER-SCRIPT, not
+       globally; helpers that ARE covered by topology still route
+       through the tree.
+
+    Per-script fallback (rather than whole-pipeline) keeps the
+    topology fix surface intact for the scripts that ARE covered.
+
+    ``fallback_client_touchers`` / ``fallback_server_touchers`` are
+    **FALLBACK-PATH-ONLY** inputs (round 3, Codex R2 P1 #4 fix). They
+    are forwarded into ``_decide_script_container_legacy`` so the
+    legacy fallback recovers the pre-slice-7
+    ``_CLIENT_ONLY_PATTERNS`` / ``_SERVER_ONLY_PATTERNS`` semantic for
+    Scripts that escape ``code_transpiler._classify_script_type``'s
+    promotion. The TOPOLOGY path
+    (``_decide_script_container_from_topology``) does NOT receive
+    them. Default ``None`` so callers in tests that construct the
+    helper directly stay backward-compatible (an empty set is treated
+    as "no client/server-touching scripts").
     """
-    # Slice 6: ``topology_inputs`` intentionally unused below. Asserting
-    # this here (with the underscored alias) keeps mypy happy without
-    # silencing the "unused parameter" lint at the call site.
-    _ = topology_inputs
+    client_touchers = (
+        fallback_client_touchers
+        if fallback_client_touchers is not None
+        else set()
+    )
+    server_touchers = (
+        fallback_server_touchers
+        if fallback_server_touchers is not None
+        else set()
+    )
+
+    # ------------------------------------------------------------------
+    # Fallback gates -- evaluated BEFORE the topology tree dereferences
+    # any sid.
+    # ------------------------------------------------------------------
+    if topology_inputs is None:
+        return _decide_script_container_legacy(
+            s,
+            call_graph=call_graph,
+            character_set=character_set,
+            script_by_name=script_by_name,
+            client_touchers=client_touchers,
+            server_touchers=server_touchers,
+        )
+
+    sid = topology_inputs["script_id_by_name"].get(s.name)
+    if sid is None:
+        # Degraded-service contract: cannot identify this script in
+        # the topology layer. Fall back to the legacy decision tree
+        # for THIS script only.
+        return _decide_script_container_legacy(
+            s,
+            call_graph=call_graph,
+            character_set=character_set,
+            script_by_name=script_by_name,
+            client_touchers=client_touchers,
+            server_touchers=server_touchers,
+        )
+
+    # Unconstrained-helper contract (Codex amendment 1, slice-6
+    # handoff). When the pipeline is in no-transpile-resume mode the
+    # reachability_requirements map is empty BY DESIGN. ModuleScripts
+    # not covered by reachability fall back to legacy per-script,
+    # NOT to the topology tree's "orphan -> RS" branch (which would
+    # silently regress server-only modules to RS on resume).
+    if (
+        s.script_type == "ModuleScript"
+        and not topology_inputs["transpile_ran"]
+        and sid not in topology_inputs["reachability_requirements"]
+    ):
+        return _decide_script_container_legacy(
+            s,
+            call_graph=call_graph,
+            character_set=character_set,
+            script_by_name=script_by_name,
+            client_touchers=client_touchers,
+            server_touchers=server_touchers,
+        )
+
+    return _decide_script_container_from_topology(
+        s, sid=sid, topology_inputs=topology_inputs,
+    )
+
+
+def _decide_script_container_from_topology(
+    s: RbxScript,
+    *,
+    sid: str,
+    topology_inputs: "TopologyInputs",
+) -> tuple[str, str]:
+    """Slice-7 topology-driven decision tree.
+
+    First-match-wins, generic over Unity input. The tree
+    consumes ONLY ``topology_inputs`` (per-module domain verdict +
+    reachability requirements + caller graph + lifecycle roles) and
+    the script's own ``script_type``. No source-text inputs.
+
+    Order:
+      1. ``lifecycle_role == "character_attached"`` -> StarterCharacterScripts
+      2. ``lifecycle_role == "loader"`` -> ReplicatedFirst
+      3. ``reachability_requirements[sid]`` present -> that container
+         * sentinel ``"__excluded__"`` (helper reached by BOTH client
+           and server require-graphs) -> ReplicatedStorage with the
+           ``reachability_conflict`` reason. The
+           ``finalize_topology_containers`` late pass then stamps the
+           ``fail_closed_reason`` on the module row.
+      4. ModuleScript -> route by caller-domain (consulting
+         ``caller_graph[sid]`` -> ``domains[caller_sid]``)
+         * any client-domain caller -> ReplicatedStorage
+         * all server-domain callers -> ServerStorage (faithful to
+           the analysis -- if topology says server-only, trust it)
+         * orphan / unknown -> ReplicatedStorage (conservative)
+      5. LocalScript -> StarterPlayerScripts
+      6. ``script_type == "Script"`` with ``domain == "client"`` ->
+         StarterPlayerScripts (round-2 patch -- restores the
+         pre-slice-7 ``_CLIENT_ONLY_PATTERNS`` regex semantic for
+         the narrow case where ``code_transpiler._classify_script_type``
+         did NOT promote ``Script`` to ``LocalScript`` but
+         ``infer_module_domains`` still classified the module as
+         client-domain. The downstream auto-coercion at
+         ``classify_storage`` flips ``script_type`` to ``LocalScript``
+         so ``_enforce_hard_constraints`` does not raise.)
+      7. Script -> ServerScriptService
+
+    See ``scene-runtime-architecture-ir.md`` §"script_storage.py --
+    bound deterministic mapper" for the design rationale.
+    """
+    lifecycle_role = topology_inputs["lifecycle_roles"].get(sid, "")
+    if lifecycle_role == "character_attached":
+        return STARTER_CHARACTER_SCRIPTS, (
+            "topology: lifecycle_role=character_attached"
+        )
+    if lifecycle_role == "loader":
+        return REPLICATED_FIRST, "topology: lifecycle_role=loader"
+
+    requirement = topology_inputs["reachability_requirements"].get(sid)
+    if requirement is not None:
+        if requirement == "__excluded__":
+            return REPLICATED_STORAGE, (
+                "topology: reachability_conflict "
+                "(reached by both client+server require-graphs)"
+            )
+        return requirement, (
+            f"topology: reachability_required_container={requirement}"
+        )
+
+    if s.script_type == "ModuleScript":
+        callers = topology_inputs["caller_graph"].get(sid, [])
+        if not callers:
+            return REPLICATED_STORAGE, (
+                "topology: orphan ModuleScript (no callers): default replicated"
+            )
+        caller_domains: set[str] = set()
+        for caller_sid in callers:
+            d = topology_inputs["domains"].get(caller_sid, "")
+            if d:
+                caller_domains.add(d)
+        if "client" in caller_domains:
+            return REPLICATED_STORAGE, (
+                f"topology: ModuleScript required by {len(callers)} caller(s), "
+                "at least one client-domain"
+            )
+        if caller_domains == {"server"}:
+            return SERVER_STORAGE, (
+                f"topology: ModuleScript required only by server-domain "
+                f"callers ({len(callers)})"
+            )
+        # Mixed unknown / helper callers, no client signal -> default
+        # to RS so any late-added caller can reach it.
+        return REPLICATED_STORAGE, (
+            f"topology: ModuleScript required by {len(callers)} caller(s), "
+            "no client/server domain signal: default replicated"
+        )
+
+    if s.script_type == "LocalScript":
+        return STARTER_PLAYER_SCRIPTS, "topology: LocalScript (default container)"
+
+    # script_type == "Script". Slice 7 round 2 (Codex R1 P1 #1+#3):
+    # check the client-domain branch BEFORE falling through to SSS.
+    # Restores the pre-slice-7 ``_CLIENT_ONLY_PATTERNS`` regex
+    # semantic for the narrow case where
+    # ``code_transpiler._classify_script_type`` left ``script_type``
+    # as ``Script`` but the upstream domain classifier flagged the
+    # module as client-domain (e.g. uses ``Players.LocalPlayer``
+    # without any of the API substrings that drive
+    # ``_classify_script_type``'s ``Script -> LocalScript`` promotion).
+    # The auto-coercion at ``classify_storage`` lines 237-239 then
+    # flips ``script_type`` to ``LocalScript`` so the resulting
+    # placement satisfies the Roblox engine constraint
+    # ``_enforce_hard_constraints`` checks for.
+    domain = topology_inputs["domains"].get(sid, "")
+    if domain == "client":
+        return STARTER_PLAYER_SCRIPTS, (
+            "topology: script_type=Script with client domain "
+            "(client-only API surface)"
+        )
+    return SERVER_SCRIPT_SERVICE, "topology: server Script (default)"
+
+
+def _decide_script_container_legacy(
+    s: RbxScript,
+    *,
+    call_graph: dict[str, set[str]],
+    character_set: set[str],
+    script_by_name: dict[str, RbxScript],
+    client_touchers: set[str] | None = None,
+    server_touchers: set[str] | None = None,
+) -> tuple[str, str]:
+    """Legacy fallback decision tree.
+
+    Phase 2a slice 7: this is the per-script fallback for the three
+    cases documented on ``_decide_script_container``. Compared to
+    slice 5's legacy path the ModuleScript caller-domain detection
+    still relies on ``script_type`` alone (the topology path's domain
+    classification is upstream of this fallback).
+
+    Round 3 (Codex R2 P1 #4): restored the
+    ``_CLIENT_ONLY_PATTERNS`` / ``_SERVER_ONLY_PATTERNS`` regex-set
+    branches via ``client_touchers`` / ``server_touchers``. A Script
+    using ``Players.LocalPlayer`` (or any other client-only API)
+    that escapes ``code_transpiler._classify_script_type``'s
+    Script -> LocalScript promotion would otherwise default to
+    ServerScriptService where ``LocalPlayer`` is nil at runtime.
+    These kwargs are populated by ``classify_storage`` from
+    ``_scripts_with_client_apis`` / ``_scripts_with_server_apis``
+    -- both of which are documented as **FALLBACK-PATH ONLY** infra.
+    The topology decision tree
+    (``_decide_script_container_from_topology``) does NOT consume
+    these sets.
+
+    ``client_touchers`` / ``server_touchers`` default to ``None`` so
+    direct callers in tests stay backward-compatible (treated as
+    empty sets -- no Scripts with client/server API surface to
+    promote).
+
+    Tests in ``test_storage_classifier.py`` exercise this path
+    directly (none of them pass ``topology_inputs``).
+    """
+    client_touchers = client_touchers if client_touchers is not None else set()
+    server_touchers = server_touchers if server_touchers is not None else set()
 
     # Character-attached scripts go to StarterCharacterScripts.
     if s.name in character_set:
@@ -402,12 +765,19 @@ def _decide_script_container(
             return REPLICATED_STORAGE, "orphan module (no callers): default replicated"
 
         caller_is_client = any(
-            (c in client_touchers) or _caller_is_local_script(c, script_by_name)
-            for c in callers
+            _caller_is_local_script(c, script_by_name) for c in callers
         )
         caller_is_server = any(
-            (c in server_touchers) or _caller_is_server_script(c, script_by_name)
-            for c in callers
+            _caller_is_server_script(c, script_by_name) for c in callers
+        )
+        # Round 3: a caller in client_touchers is a client-domain
+        # caller even if its ``script_type`` is still ``Script``
+        # (escaped the promotion). Symmetric for server_touchers.
+        caller_is_client = caller_is_client or any(
+            c in client_touchers for c in callers
+        )
+        caller_is_server = caller_is_server or any(
+            c in server_touchers for c in callers
         )
 
         if caller_is_client:
@@ -422,16 +792,74 @@ def _decide_script_container(
             f"required by {len(callers)} caller(s), client/server unknown: default replicated"
         )
 
-    # Scripts with client-only APIs must be LocalScripts.
-    if s.name in client_touchers and s.name not in server_touchers:
-        return STARTER_PLAYER_SCRIPTS, "uses client-only APIs (LocalPlayer, UserInputService, etc.)"
-
     # LocalScripts default to StarterPlayerScripts.
     if s.script_type == "LocalScript":
         return STARTER_PLAYER_SCRIPTS, "LocalScript (default container)"
 
+    # Round 3 (Codex R2 P1 #4): a Script with client-only API
+    # surface that escaped ``_classify_script_type``'s
+    # ``Script -> LocalScript`` promotion routes to
+    # StarterPlayerScripts. The downstream auto-coercion at
+    # ``classify_storage`` flips ``script_type`` to ``LocalScript``
+    # so ``_enforce_hard_constraints`` does not raise.
+    #
+    # Round 4 (this slice's R3 review, P1 reclassification from
+    # P2-NEW-A): the ``and s.name not in server_touchers`` guard
+    # mirrors legacy slice-6 line 426. Without it, a Script that
+    # touches BOTH ``Players.LocalPlayer`` AND ``DataStoreService``
+    # would coerce to ``LocalScript`` in SPS — but ``DataStoreService``
+    # is server-only and raises "DataStoreService cannot be used on
+    # the client" at runtime. Legacy fail-CLOSED to server (drop
+    # through to the ``server_touchers`` branch / default SSS); slice
+    # 7 R3 had inverted the failure mode to fail-OPEN to client.
+    # Restoring the guard re-establishes the legacy contract: a
+    # dual-surface Script lands in SSS where the server APIs work,
+    # even if some client-side calls fail there (server can call
+    # client-replicated APIs in many cases; the inverse is much
+    # less recoverable).
+    if s.name in client_touchers and s.name not in server_touchers:
+        return STARTER_PLAYER_SCRIPTS, (
+            "fallback: Script with client-only API surface "
+            "(legacy _CLIENT_ONLY_PATTERNS branch)"
+        )
+    if s.name in server_touchers:
+        return SERVER_SCRIPT_SERVICE, (
+            "fallback: Script with server-only API surface "
+            "(legacy _SERVER_ONLY_PATTERNS branch)"
+        )
+
     # Everything else is a server Script.
     return SERVER_SCRIPT_SERVICE, "server Script (default)"
+
+
+def _enforce_hard_constraints(s: RbxScript, container: str) -> None:
+    """Post-decision hard-constraint validator.
+
+    Phase 2a slice 7: defense-in-depth check. The decision tree +
+    in-flow corrections should never produce these pairs, but the
+    validator raises if a future edit slips through. The constraints
+    encode Roblox-engine impossibilities:
+
+      * LocalScript in ServerScriptService -- would silently never
+        run (engine ignores LocalScripts under server services).
+      * ReplicatedFirst + ModuleScript -- ReplicatedFirst is for
+        executable scripts that run before full replication;
+        ModuleScripts there are inert.
+
+    Raises ``ConstraintViolation`` with the offending pair when
+    triggered.
+    """
+    if s.script_type == "LocalScript" and container == SERVER_SCRIPT_SERVICE:
+        raise ConstraintViolation(
+            f"LocalScript {s.name!r} cannot live in {SERVER_SCRIPT_SERVICE} "
+            "-- Roblox engine ignores LocalScripts under server services."
+        )
+    if container == REPLICATED_FIRST and s.script_type == "ModuleScript":
+        raise ConstraintViolation(
+            f"ModuleScript {s.name!r} cannot live in {REPLICATED_FIRST} "
+            "-- the container is for executable scripts; ModuleScripts "
+            "there are inert."
+        )
 
 
 def _find_callers(target: str, call_graph: dict[str, set[str]]) -> set[str]:
