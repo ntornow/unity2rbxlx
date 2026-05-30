@@ -3917,6 +3917,8 @@ class TestSlice9aTopologyInputsPlumbing:
             script_id_by_name=script_id_by_name,
             caller_graph={},
             transpile_ran=True,
+            cross_domain_edges=[],
+            cross_domain_edge_candidates=[],
         )
 
     def test_plumbing_passes_topology_inputs_through_to_modules_block(
@@ -4775,6 +4777,8 @@ class TestSlice10R2NoTranspileResumeSemantics:
             script_id_by_name=script_id_by_name,
             caller_graph={},
             transpile_ran=False,
+            cross_domain_edges=[],
+            cross_domain_edge_candidates=[],
         )
 
     def test_resume_regenerates_required_container_to_empty_string_for_all_modules(
@@ -5030,3 +5034,691 @@ class TestSlice10R2NoTranspileResumeSemantics:
         # NO shadow copies of upstream raw facts on the artifact entry.
         assert "reachability_requirements" not in entry
         assert "transpile_ran" not in entry
+
+
+class TestPhase2bSlice2EnrichmentAndRelocation:
+    """Phase 2b slice 2 — producers + enrichment relocate into
+    ``Pipeline._maybe_run_topology_prepass``; ``TopologyInputs`` grows
+    two new fields; ``build_topology`` becomes pure-assembly;
+    duplicate-event_name + bridge-member-ref invariants added; P3
+    carry-forward from slice 1 (sorted iteration + empty-field
+    rejection) lands.
+
+    Refs: design doc Phase 2b deliverable 1 (slice 2 section);
+    Claude arch review risks #1-3 (2026-05-30); slice 1 handoff P3.
+    """
+
+    @staticmethod
+    def _build_pipeline_with(
+        *,
+        scripts: list[RbxScript],
+        transpilation_result_scripts: "list | None" = None,
+    ):
+        """Synthesize a minimal Pipeline spy that reaches the
+        ``_maybe_run_topology_prepass`` body. Mirrors the pattern from
+        ``test_module_domain_prepass.py``'s ``TestSlice7Round2*``.
+
+        ``transpilation_result_scripts`` controls the Luau-scan branch
+        of slice 2 enrichment:
+          - ``None`` -> ``state.transpilation_result is None``
+            (resume case); consumer rows stay empty.
+          - non-None list -> ``state.transpilation_result`` is set
+            with the supplied scripts; the Luau-scan pass runs.
+        """
+        from unittest.mock import MagicMock
+        from converter.code_transpiler import TranspilationResult
+        from converter.pipeline import Pipeline
+
+        p = MagicMock(spec=Pipeline)
+        p.ctx = MagicMock()
+        p.ctx.scene_runtime_mode = "modern"
+        p.ctx.networking_mode = "none"
+        p.state = MagicMock()
+        if transpilation_result_scripts is None:
+            p.state.transpilation_result = None
+        else:
+            tr = TranspilationResult()
+            tr.scripts = transpilation_result_scripts
+            p.state.transpilation_result = tr
+        p.state.dependency_map = {}
+        p.state.guid_index = None
+        p.state.rbx_place = MagicMock()
+        p.state.rbx_place.scripts = scripts
+        return p
+
+    def test_topology_inputs_carries_edges(self) -> None:
+        """``_maybe_run_topology_prepass`` produces a ``TopologyInputs``
+        whose ``cross_domain_edges`` + ``cross_domain_edge_candidates``
+        are populated from the structural producers. Slice 1 produced
+        these inside ``build_topology``; slice 2 relocates them to the
+        prepass.
+        """
+        from converter.pipeline import Pipeline
+
+        door = RbxScript(name="Door", source="-- d", script_type="Script")
+        anim = RbxScript(name="Anim", source="-- a", script_type="Script")
+        pickup = RbxScript(name="Pickup", source="-- p", script_type="Script")
+        scene_runtime: dict[str, object] = {
+            "modules": {
+                "door_sid": {
+                    "stem": "Door", "class_name": "Door",
+                    "runtime_bearing": True, "domain": "client",
+                    "character_attached": False, "is_loader": False,
+                    "module_path": "ReplicatedStorage.Door",
+                },
+                "anim_sid": {
+                    "stem": "Anim", "class_name": "Anim",
+                    "runtime_bearing": True, "domain": "server",
+                    "character_attached": False, "is_loader": False,
+                    "module_path": "ReplicatedStorage.Anim",
+                },
+                "pickup_sid": {
+                    "stem": "Pickup", "class_name": "Pickup",
+                    "runtime_bearing": True, "domain": "client",
+                    "character_attached": False, "is_loader": False,
+                    "module_path": "ReplicatedStorage.Pickup",
+                },
+            },
+            "scenes": {
+                "Mixed.unity": {
+                    "instances": [
+                        {"instance_id": "Mixed.unity:1",
+                         "script_id": "door_sid",
+                         "game_object_id": "Mixed.unity:1",
+                         "active": True, "enabled": True, "config": {}},
+                        {"instance_id": "Mixed.unity:2",
+                         "script_id": "anim_sid",
+                         "game_object_id": "Mixed.unity:2",
+                         "active": True, "enabled": True, "config": {}},
+                        {"instance_id": "Mixed.unity:3",
+                         "script_id": "pickup_sid",
+                         "game_object_id": "Mixed.unity:3",
+                         "active": True, "enabled": True,
+                         "config": {"itemName": "Key"}},
+                    ],
+                    "references": [{
+                        "from": "Mixed.unity:1",
+                        "field": "open",
+                        "index": None,
+                        "target_kind": "component",
+                        "target_ref": "Mixed.unity:2",
+                        "target_is_ui": False,
+                    }],
+                    "lifecycle_order": [
+                        "Mixed.unity:1", "Mixed.unity:2", "Mixed.unity:3",
+                    ],
+                },
+            },
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+        pipeline = self._build_pipeline_with(
+            scripts=[door, anim, pickup],
+            transpilation_result_scripts=[],
+        )
+        out = Pipeline._maybe_run_topology_prepass(pipeline, scene_runtime)
+        assert out is not None
+        # Component-ref edge present in the edges bucket on TopologyInputs.
+        assert len(out["cross_domain_edges"]) == 1
+        edge = out["cross_domain_edges"][0]
+        assert edge["from_script"] == "door_sid"
+        assert edge["to_script"] == "anim_sid"
+        # Shared-attribute candidate present in the candidates bucket.
+        assert len(out["cross_domain_edge_candidates"]) == 1
+        cand = out["cross_domain_edge_candidates"][0]
+        assert cand["from_script"] == "pickup_sid"
+        assert cand["resolution"]["event_name"] == "PickupItemEvent"
+
+    def test_build_topology_consumes_edges_from_inputs(self) -> None:
+        """``build_topology`` no longer calls the producers when
+        ``cross_domain_edges_input`` / ``cross_domain_edge_candidates_input``
+        are supplied: the artifact carries EXACTLY what was passed in,
+        not what the producer would derive from ``scene_runtime``.
+
+        Injects an artificial edge that does NOT correspond to any
+        reference in the plan; if ``build_topology`` were still
+        calling the producer it would emit zero edges from this plan.
+        Asserting the artificial edge survives proves the read site
+        consults the input parameter.
+        """
+        # Plan with zero scenes/prefabs, so the producer would emit
+        # zero edges if invoked.
+        sr = _mk_artifact()
+        injected_edge = {
+            "id": "test::injected::edge",
+            "kind": "attribute_write",
+            "from_instance": "i1", "to_instance": "i2",
+            "from_script": "sid_a", "to_script": "sid_b",
+            "field": "open",
+            "from_domain": "client", "to_domain": "server",
+            "owner_kind": "scene", "owner_ref": "X.unity",
+            "resolution": {
+                "strategy": "remote_event_bridge",
+                "event_name": "Test_SetOpen",
+            },
+            "bridge_member_scripts": [
+                {"role": "client_caller", "ref": "sid_a"},
+                {"role": "server_listener",
+                 "ref": "__bridge_listener__Test_SetOpen"},
+                {"role": "anim_listener", "ref": "sid_b"},
+            ],
+            "payload": {"attribute_name": "open", "schema": "unknown"},
+        }
+        # Provide modules so invariant 7 isn't tripped + the candidate
+        # ref invariant accepts ``sid_a``/``sid_b``.
+        sr_dict = cast(dict[str, object], sr)
+        sr_dict["modules"] = {
+            "sid_a": {
+                "stem": "A", "class_name": "A",
+                "runtime_bearing": True, "domain": "client",
+                "character_attached": False, "is_loader": False,
+            },
+            "sid_b": {
+                "stem": "B", "class_name": "B",
+                "runtime_bearing": True, "domain": "server",
+                "character_attached": False, "is_loader": False,
+            },
+        }
+        artifact = build_topology(
+            scene_runtime=cast(SceneRuntimeArtifact, sr_dict),
+            emitted_animations=[],
+            scripts_by_class={
+                "A": _mk_rbx_script("A", "LocalScript"),
+                "B": _mk_rbx_script("B", "Script"),
+            },
+            cross_domain_edges_input=[cast(  # type: ignore[arg-type]
+                "object", injected_edge,
+            )],
+            cross_domain_edge_candidates_input=[],
+        )
+        # The artifact carries the INJECTED edge verbatim.
+        assert len(artifact["cross_domain_edges"]) == 1
+        assert artifact["cross_domain_edges"][0]["id"] == "test::injected::edge"
+
+    def test_enrichment_populates_bridge_members_component_ref(self) -> None:
+        """A component-ref edge is enriched with a 3-member bridge unit:
+        ``client_caller`` = ``from_script``, ``server_listener`` =
+        synthesized id from the helper, ``anim_listener`` = ``to_script``.
+        """
+        from converter.pipeline import Pipeline
+        from converter.scene_runtime_topology.bridge_emit import (
+            synthesize_listener_id,
+        )
+
+        door = RbxScript(name="Door", source="-- d", script_type="Script")
+        anim = RbxScript(name="Anim", source="-- a", script_type="Script")
+        scene_runtime: dict[str, object] = {
+            "modules": {
+                "door_sid": {
+                    "stem": "Door", "class_name": "Door",
+                    "runtime_bearing": True, "domain": "client",
+                    "character_attached": False, "is_loader": False,
+                    "module_path": "ReplicatedStorage.Door",
+                },
+                "anim_sid": {
+                    "stem": "Anim", "class_name": "Anim",
+                    "runtime_bearing": True, "domain": "server",
+                    "character_attached": False, "is_loader": False,
+                    "module_path": "ReplicatedStorage.Anim",
+                },
+            },
+            "scenes": {
+                "A.unity": {
+                    "instances": [
+                        {"instance_id": "A.unity:1",
+                         "script_id": "door_sid",
+                         "game_object_id": "A.unity:1",
+                         "active": True, "enabled": True, "config": {}},
+                        {"instance_id": "A.unity:2",
+                         "script_id": "anim_sid",
+                         "game_object_id": "A.unity:2",
+                         "active": True, "enabled": True, "config": {}},
+                    ],
+                    "references": [{
+                        "from": "A.unity:1",
+                        "field": "open",
+                        "index": None,
+                        "target_kind": "component",
+                        "target_ref": "A.unity:2",
+                        "target_is_ui": False,
+                    }],
+                    "lifecycle_order": ["A.unity:1", "A.unity:2"],
+                },
+            },
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+        pipeline = self._build_pipeline_with(
+            scripts=[door, anim],
+            transpilation_result_scripts=[],
+        )
+        out = Pipeline._maybe_run_topology_prepass(pipeline, scene_runtime)
+        assert out is not None
+        edge = out["cross_domain_edges"][0]
+        members = edge["bridge_member_scripts"]
+        roles_to_refs = {m["role"]: m["ref"] for m in members}
+        assert roles_to_refs["client_caller"] == "door_sid"
+        assert roles_to_refs["server_listener"] == synthesize_listener_id(
+            "Door_SetOpen",
+        )
+        assert roles_to_refs["anim_listener"] == "anim_sid"
+
+    def test_enrichment_populates_bridge_members_shared_attribute(
+        self,
+    ) -> None:
+        """A shared-attribute candidate (Pickup) is enriched with
+        ``client_caller`` + ``server_listener`` + one ``consumer`` row
+        per script whose Luau source reads ``:GetAttribute("has...")``
+        matching the seed template.
+        """
+        from converter.code_transpiler import TranspiledScript
+        from converter.pipeline import Pipeline
+
+        pickup = RbxScript(name="Pickup", source="-- p", script_type="Script")
+        # ``Reader`` is a peer script that reads the bridged attribute.
+        reader = RbxScript(
+            name="Reader",
+            source='local v = plr:GetAttribute("hasKey")',
+            script_type="Script",
+        )
+        # ``Bystander`` does NOT read the attribute -- the scan must
+        # skip it.
+        bystander = RbxScript(
+            name="Bystander", source="-- empty", script_type="Script",
+        )
+        # ``script_id_by_name`` is built by the prepass from
+        # ``RbxScript.name`` lookups against the modules block; provide
+        # matching module rows so ``Reader`` resolves to ``reader_sid``.
+        scene_runtime: dict[str, object] = {
+            "modules": {
+                "pickup_sid": {
+                    "stem": "Pickup", "class_name": "Pickup",
+                    "runtime_bearing": True, "domain": "client",
+                    "character_attached": False, "is_loader": False,
+                    "module_path": "ReplicatedStorage.Pickup",
+                },
+                "reader_sid": {
+                    "stem": "Reader", "class_name": "Reader",
+                    "runtime_bearing": True, "domain": "client",
+                    "character_attached": False, "is_loader": False,
+                    "module_path": "ReplicatedStorage.Reader",
+                },
+                "bystander_sid": {
+                    "stem": "Bystander", "class_name": "Bystander",
+                    "runtime_bearing": True, "domain": "client",
+                    "character_attached": False, "is_loader": False,
+                    "module_path": "ReplicatedStorage.Bystander",
+                },
+            },
+            "scenes": {
+                "Level.unity": {
+                    "instances": [
+                        {"instance_id": "Level.unity:1",
+                         "script_id": "pickup_sid",
+                         "game_object_id": "Level.unity:1",
+                         "active": True, "enabled": True,
+                         "config": {"itemName": "Key"}},
+                    ],
+                    "references": [],
+                    "lifecycle_order": ["Level.unity:1"],
+                },
+            },
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+        # Build the post-transpile Luau-source list the prepass scans.
+        transpiled = [
+            TranspiledScript(
+                source_path="Pickup.cs",
+                output_filename="Pickup.luau",
+                csharp_source="// pickup",
+                luau_source="-- pickup",
+                strategy="ai", confidence=1.0,
+            ),
+            TranspiledScript(
+                source_path="Reader.cs",
+                output_filename="Reader.luau",
+                csharp_source="// reader",
+                luau_source='local v = plr:GetAttribute("hasKey")',
+                strategy="ai", confidence=1.0,
+            ),
+            TranspiledScript(
+                source_path="Bystander.cs",
+                output_filename="Bystander.luau",
+                csharp_source="// bystander",
+                luau_source="-- empty",
+                strategy="ai", confidence=1.0,
+            ),
+        ]
+        pipeline = self._build_pipeline_with(
+            scripts=[pickup, reader, bystander],
+            transpilation_result_scripts=transpiled,
+        )
+        out = Pipeline._maybe_run_topology_prepass(pipeline, scene_runtime)
+        assert out is not None
+        cand = out["cross_domain_edge_candidates"][0]
+        members = cand["bridge_member_scripts"]
+        consumer_refs = [m["ref"] for m in members if m["role"] == "consumer"]
+        # ``Reader`` matched the regex; ``Bystander`` did not.
+        assert consumer_refs == ["reader_sid"]
+        # client_caller + server_listener also present.
+        roles = {m["role"] for m in members}
+        assert {"client_caller", "server_listener", "consumer"}.issubset(roles)
+
+    def test_enrichment_empty_on_resume(self) -> None:
+        """The Luau-scan pass cannot run on the resume path
+        (``state.transpilation_result is None``). Slice 2 documents this
+        by leaving ``consumer`` rows EMPTY -- slice 3 will fall back to
+        broadcast emission. The other 2 bridge members
+        (``client_caller`` + ``server_listener``) still populate
+        because they're derivable from the candidate row alone.
+        """
+        from converter.pipeline import Pipeline
+
+        pickup = RbxScript(name="Pickup", source="-- p", script_type="Script")
+        scene_runtime: dict[str, object] = {
+            "modules": {
+                "pickup_sid": {
+                    "stem": "Pickup", "class_name": "Pickup",
+                    "runtime_bearing": True, "domain": "client",
+                    "character_attached": False, "is_loader": False,
+                    "module_path": "ReplicatedStorage.Pickup",
+                },
+            },
+            "scenes": {
+                "Level.unity": {
+                    "instances": [
+                        {"instance_id": "Level.unity:1",
+                         "script_id": "pickup_sid",
+                         "game_object_id": "Level.unity:1",
+                         "active": True, "enabled": True,
+                         "config": {"itemName": "Key"}},
+                    ],
+                    "references": [],
+                    "lifecycle_order": ["Level.unity:1"],
+                },
+            },
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+        pipeline = self._build_pipeline_with(
+            scripts=[pickup],
+            transpilation_result_scripts=None,  # resume
+        )
+        out = Pipeline._maybe_run_topology_prepass(pipeline, scene_runtime)
+        assert out is not None
+        cand = out["cross_domain_edge_candidates"][0]
+        members = cand["bridge_member_scripts"]
+        # Resume: client_caller + server_listener present, but ZERO
+        # consumer rows (the scan didn't run).
+        roles_seen = [m["role"] for m in members]
+        assert "consumer" not in roles_seen
+        assert "client_caller" in roles_seen
+        assert "server_listener" in roles_seen
+
+    def test_duplicate_event_name_invariant_across_buckets(self) -> None:
+        """Slice 2's duplicate-event_name invariant scans BOTH buckets:
+        a component-ref edge whose derived ``<owner>_Set<Field>`` event
+        name COLLIDES with the locked ``"PickupItemEvent"`` literal
+        used by the Pickup candidate must abort the build. Per Claude
+        arch review risk #1 (2026-05-30).
+
+        We synthesize the collision by constructing an injected edge
+        whose ``resolution.event_name`` is ``"PickupItemEvent"`` and a
+        candidate also carrying the same name -- the producer doesn't
+        derive this literal in real plans, so we inject directly.
+        """
+        sr = _mk_artifact()
+        sr_dict = cast(dict[str, object], sr)
+        sr_dict["modules"] = {
+            "sid_a": {
+                "stem": "A", "class_name": "A",
+                "runtime_bearing": True, "domain": "client",
+                "character_attached": False, "is_loader": False,
+            },
+            "sid_b": {
+                "stem": "B", "class_name": "B",
+                "runtime_bearing": True, "domain": "server",
+                "character_attached": False, "is_loader": False,
+            },
+        }
+        injected_edge = {
+            "id": "test::injected::collision",
+            "kind": "attribute_write",
+            "from_instance": "i1", "to_instance": "i2",
+            "from_script": "sid_a", "to_script": "sid_b",
+            "field": "open",
+            "from_domain": "client", "to_domain": "server",
+            "owner_kind": "scene", "owner_ref": "X.unity",
+            "resolution": {
+                "strategy": "remote_event_bridge",
+                # Collides literally with the locked Pickup name.
+                "event_name": "PickupItemEvent",
+            },
+            "bridge_member_scripts": [
+                {"role": "client_caller", "ref": "sid_a"},
+                {"role": "server_listener",
+                 "ref": "__bridge_listener__PickupItemEvent"},
+                {"role": "anim_listener", "ref": "sid_b"},
+            ],
+            "payload": {"attribute_name": "open", "schema": "unknown"},
+        }
+        injected_candidate = {
+            "id": "shared_attr::test::cand::PickupItemEvent",
+            "kind": "attribute_write",
+            "from_instance": "i3", "to_instance": "",
+            "from_script": "sid_a", "to_script": "",
+            "field": "has<itemName>",
+            "from_domain": "client", "to_domain": "",
+            "owner_kind": "scene", "owner_ref": "X.unity",
+            "resolution": {
+                "strategy": "remote_event_bridge",
+                "event_name": "PickupItemEvent",
+            },
+            "bridge_member_scripts": [
+                {"role": "client_caller", "ref": "sid_a"},
+                {"role": "server_listener",
+                 "ref": "__bridge_listener__PickupItemEvent"},
+            ],
+            "payload": {"attribute_name": "has<itemName>", "schema": "bool"},
+        }
+        with pytest.raises(TopologyInvariantError) as exc:
+            build_topology(
+                scene_runtime=cast(SceneRuntimeArtifact, sr_dict),
+                emitted_animations=[],
+                scripts_by_class={
+                    "A": _mk_rbx_script("A", "LocalScript"),
+                    "B": _mk_rbx_script("B", "Script"),
+                },
+                cross_domain_edges_input=[cast(  # type: ignore[arg-type]
+                    "object", injected_edge,
+                )],
+                cross_domain_edge_candidates_input=[cast(  # type: ignore[arg-type]
+                    "object", injected_candidate,
+                )],
+            )
+        assert "duplicate cross-domain event_name" in str(exc.value)
+        assert "PickupItemEvent" in str(exc.value)
+
+    def test_candidate_bridge_member_ref_must_resolve(self) -> None:
+        """Slice 2's candidate-`ref`-validity invariant: every
+        ``bridge_member_scripts[*].ref`` in a candidate must be either a
+        real script_id in the modules block OR a synthesized listener
+        id (``__bridge_listener__`` prefix). A bogus string aborts.
+        """
+        sr = _mk_artifact()
+        sr_dict = cast(dict[str, object], sr)
+        sr_dict["modules"] = {
+            "real_sid": {
+                "stem": "Real", "class_name": "Real",
+                "runtime_bearing": True, "domain": "client",
+                "character_attached": False, "is_loader": False,
+            },
+        }
+        bogus_candidate = {
+            "id": "shared_attr::test::bogus::PickupItemEvent",
+            "kind": "attribute_write",
+            "from_instance": "i1", "to_instance": "",
+            "from_script": "real_sid", "to_script": "",
+            "field": "has<itemName>",
+            "from_domain": "client", "to_domain": "",
+            "owner_kind": "scene", "owner_ref": "X.unity",
+            "resolution": {
+                "strategy": "remote_event_bridge",
+                "event_name": "PickupItemEvent",
+            },
+            "bridge_member_scripts": [
+                {"role": "client_caller", "ref": "real_sid"},
+                # Bogus: neither a real script_id nor a synthesized id.
+                {"role": "consumer", "ref": "ghost_sid_does_not_exist"},
+            ],
+            "payload": {"attribute_name": "has<itemName>", "schema": "bool"},
+        }
+        with pytest.raises(TopologyInvariantError) as exc:
+            build_topology(
+                scene_runtime=cast(SceneRuntimeArtifact, sr_dict),
+                emitted_animations=[],
+                scripts_by_class={
+                    "Real": _mk_rbx_script("Real", "LocalScript"),
+                },
+                cross_domain_edges_input=[],
+                cross_domain_edge_candidates_input=[cast(  # type: ignore[arg-type]
+                    "object", bogus_candidate,
+                )],
+            )
+        assert "ghost_sid_does_not_exist" in str(exc.value)
+        assert "synthesized listener id" in str(exc.value)
+
+    def test_synthesize_listener_id_deterministic(self) -> None:
+        """The synthesized listener id is stable across calls given
+        the same ``event_name``. Slice 3's emitter must produce the
+        same id slice 2 writes into ``bridge_member_scripts[*].ref``
+        -- this test pins that determinism so a hash/seed/random
+        slipping into the helper would fail loudly.
+        """
+        from converter.scene_runtime_topology.bridge_emit import (
+            SYNTHESIZED_LISTENER_ID_PREFIX,
+            synthesize_listener_id,
+        )
+
+        a1 = synthesize_listener_id("PickupItemEvent")
+        a2 = synthesize_listener_id("PickupItemEvent")
+        assert a1 == a2
+        assert a1.startswith(SYNTHESIZED_LISTENER_ID_PREFIX)
+        # Different event_names produce different ids.
+        b = synthesize_listener_id("Door_SetOpen")
+        assert b != a1
+        assert b.startswith(SYNTHESIZED_LISTENER_ID_PREFIX)
+
+    def test_derive_event_name_rejects_empty_field(self) -> None:
+        """Slice 2 P3 carry-forward from slice 1: a component-ref edge
+        whose ``field`` is empty must NOT produce a fragile
+        ``<owner>_Set`` event name. The producer drops the row;
+        ``_derive_event_name_from_owner_field`` returns ``None`` on
+        the empty input.
+        """
+        from converter.scene_runtime_topology.cross_domain_edges import (
+            _derive_event_name_from_owner_field,
+        )
+
+        # Helper-level: empty field -> None.
+        assert _derive_event_name_from_owner_field("Door", "") is None
+        # Non-empty field still works.
+        assert _derive_event_name_from_owner_field("Door", "open") == (
+            "Door_SetOpen"
+        )
+
+        # End-to-end: a plan whose only reference has ``field=""`` emits
+        # ZERO edges (the row is dropped, not coerced to ``Door_Set``).
+        plan = _mk_edge_artifact(
+            src_class="Door", field="",
+            src_domain="client", tgt_domain="server",
+        )
+        edges = compute_cross_domain_edges(plan)  # type: ignore[arg-type]
+        assert edges == []
+
+    def test_producers_use_sorted_iteration_order(self) -> None:
+        """Slice 1 left two producers with inconsistent iteration order
+        (``compute_cross_domain_edges`` dict-insertion;
+        ``compute_shared_attribute_candidates`` sorted). Slice 2's P3
+        carry-forward harmonizes both on sorted iteration so the
+        combined enrichment output is byte-stable across upstream dict
+        insertion-order changes.
+
+        We synthesize a plan with two scenes inserted in REVERSE
+        alphabetic order; both producers emit rows in ALPHABETIC order.
+        """
+        plan: dict[str, object] = {
+            "modules": {
+                "door_sid": {
+                    "stem": "Door", "class_name": "Door",
+                    "runtime_bearing": True, "domain": "client",
+                    "module_path": "ReplicatedStorage.Door",
+                },
+                "anim_sid": {
+                    "stem": "Anim", "class_name": "Anim",
+                    "runtime_bearing": True, "domain": "server",
+                    "module_path": "ReplicatedStorage.Anim",
+                },
+                "pickup_sid": {
+                    "stem": "Pickup", "class_name": "Pickup",
+                    "runtime_bearing": True, "domain": "client",
+                    "module_path": "ReplicatedStorage.Pickup",
+                },
+            },
+            # Insertion order = ['Z.unity', 'A.unity']; sorted = ['A', 'Z'].
+            "scenes": {
+                "Z.unity": {
+                    "instances": [
+                        {"instance_id": "Z.unity:1", "script_id": "door_sid",
+                         "game_object_id": "Z.unity:1", "active": True,
+                         "enabled": True, "config": {}},
+                        {"instance_id": "Z.unity:2", "script_id": "anim_sid",
+                         "game_object_id": "Z.unity:2", "active": True,
+                         "enabled": True, "config": {}},
+                        {"instance_id": "Z.unity:3", "script_id": "pickup_sid",
+                         "game_object_id": "Z.unity:3", "active": True,
+                         "enabled": True, "config": {"itemName": "Z"}},
+                    ],
+                    "references": [{
+                        "from": "Z.unity:1", "field": "open",
+                        "index": None, "target_kind": "component",
+                        "target_ref": "Z.unity:2", "target_is_ui": False,
+                    }],
+                    "lifecycle_order": [
+                        "Z.unity:1", "Z.unity:2", "Z.unity:3",
+                    ],
+                },
+                "A.unity": {
+                    "instances": [
+                        {"instance_id": "A.unity:1", "script_id": "door_sid",
+                         "game_object_id": "A.unity:1", "active": True,
+                         "enabled": True, "config": {}},
+                        {"instance_id": "A.unity:2", "script_id": "anim_sid",
+                         "game_object_id": "A.unity:2", "active": True,
+                         "enabled": True, "config": {}},
+                        {"instance_id": "A.unity:3", "script_id": "pickup_sid",
+                         "game_object_id": "A.unity:3", "active": True,
+                         "enabled": True, "config": {"itemName": "A"}},
+                    ],
+                    "references": [{
+                        "from": "A.unity:1", "field": "open",
+                        "index": None, "target_kind": "component",
+                        "target_ref": "A.unity:2", "target_is_ui": False,
+                    }],
+                    "lifecycle_order": [
+                        "A.unity:1", "A.unity:2", "A.unity:3",
+                    ],
+                },
+            },
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+        edges = compute_cross_domain_edges(plan)  # type: ignore[arg-type]
+        cands = compute_shared_attribute_candidates(
+            plan,  # type: ignore[arg-type]
+        )
+        # Component-ref edges: ``A.unity`` first (sorted key), then ``Z.unity``.
+        assert [e["owner_ref"] for e in edges] == ["A.unity", "Z.unity"]
+        # Shared-attr candidates: same order.
+        assert [c["owner_ref"] for c in cands] == ["A.unity", "Z.unity"]

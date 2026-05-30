@@ -74,15 +74,43 @@ from converter.scene_runtime_planner import (
 class BridgeMember(TypedDict):
     """One script (or RemoteEvent) participating in a bridge.
 
-    ``role`` values are the design doc's 4-script unit (``client_caller``,
-    ``server_listener``, ``remote_event``, ``anim_listener``). Slice 1
-    leaves the list empty on every emitted edge; slice 2 populates it
-    after enrichment resolves the listeners.
+    ``role`` values:
+      - ``"client_caller"``: the script_id whose ``SetAttribute`` slice
+        3's rewriter will replace with ``<event_name>:FireServer``. For
+        a component-ref edge this is ``edge["from_script"]``; for a
+        shared-attribute candidate this is the Pickup-class script_id.
+      - ``"server_listener"``: a SYNTHESIZED script_id (NOT a real
+        module row id) for the server-side listener slice 3 will
+        emit. Derived via
+        ``bridge_emit.synthesize_listener_id(event_name)`` so the id
+        slice 2 writes here and the id slice 3 stamps on the
+        emitted ``RbxScript`` agree by construction. The
+        candidate-`ref`-validity invariant in
+        ``build_topology._enforce_invariants`` recognizes the
+        synthesized-id prefix.
+      - ``"anim_listener"``: for component-ref edges only -- the
+        receiver script that consumes the bridged attribute. Equals
+        ``edge["to_script"]``. Fan-out (shared-attribute) candidates
+        DO NOT carry an ``anim_listener`` (consumers are dynamic at
+        runtime via ``GetAttributeChangedSignal``; slice 2's Luau-scan
+        pass discovers any STATIC readers and emits them under the
+        ``"consumer"`` role).
+      - ``"consumer"``: for shared-attribute candidates only -- one
+        per ``script_id`` whose post-transpile Luau source reads the
+        bridged attribute via ``:GetAttribute("has...")``. Slice 2's
+        Luau-scan pass emits one row per matched script. Empty on
+        the resume path (``state.transpilation_result is None``) --
+        slice 3 falls back to broadcast emission when this list is
+        empty.
 
-    ``ref`` is the consumer-readable identifier the bridge emitter (slice
-    3) will dereference (a script id, a GUID, or a dotted DataModel path
-    for ``remote_event``). Format intentionally unconstrained so slice 2
-    can pick the right kind per role.
+    ``ref`` is the consumer-readable identifier the bridge emitter
+    (slice 3) will dereference: a script_id for ``client_caller`` /
+    ``anim_listener`` / ``consumer``, a synthesized id for
+    ``server_listener``. ``remote_event`` role is reserved for slice
+    3's emitter to optionally stamp the dotted DataModel path of the
+    synthesized ``RemoteEvent`` -- slice 2 does not emit
+    ``remote_event`` rows (the path is fully derivable from
+    ``event_name`` at slice 3 emit time).
     """
 
     role: str
@@ -295,21 +323,28 @@ def shared_attribute_candidate_id(
     return f"shared_attr::{owner_ref}::{instance_id}::{event_name}"
 
 
-def _derive_event_name_from_owner_field(owner_class: str, field: str) -> str:
+def _derive_event_name_from_owner_field(
+    owner_class: str, field: str,
+) -> str | None:
     """Component-ref edges: deterministic ``<owner>_Set<Field>`` event
     name per design doc L239 (the ``Door_SetOpen`` example).
 
     ``field`` is capitalized only at its first character; multi-word
     camelCase fields (``isOpen`` → ``IsOpen``) keep internal casing so
-    the name is human-recognizable. Empty field yields
-    ``<owner>_Set`` rather than asserting — slice 2's enrichment can
-    detect and reject the empty-field shape if needed; slice 1 stays
-    permissive so a malformed input doesn't crash the producer.
+    the name is human-recognizable.
+
+    Phase 2b slice 2 (P3 carry-forward from slice 1): returns ``None``
+    when ``field`` is empty. An empty-field component-ref edge has no
+    semantic content (the producer has no field to write) -- emitting
+    ``<owner>_Set`` would create a fragile event name + collide with
+    every other empty-field edge from the same owner class. The
+    structural-producer ``compute_cross_domain_edges`` skips edges
+    whose event name is ``None``, so the empty-field row never reaches
+    enrichment.
     """
     if not field:
-        capitalized = ""
-    else:
-        capitalized = field[0].upper() + field[1:]
+        return None
+    capitalized = field[0].upper() + field[1:]
     return f"{owner_class}_Set{capitalized}"
 
 
@@ -331,6 +366,18 @@ def compute_cross_domain_edges(
     ``"same_domain_no_bridge"`` once it cross-checks finalized domains
     against the live module table. ``bridge_member_scripts`` stays
     empty until slice 2 fills it.
+
+    Phase 2b slice 2 (P3 carry-forward from slice 1):
+      - Iterates ``scenes`` and ``prefabs`` in SORTED key order so the
+        combined output across both producers is stable across runs
+        even when the upstream planner reorders its dict insertions.
+        Matches ``compute_shared_attribute_candidates`` (which already
+        sorted) so the two producers feed deterministically into the
+        enrichment pass.
+      - Skips edges whose ``field`` is empty (the producer has no
+        attribute to write; ``_derive_event_name_from_owner_field``
+        returns ``None`` on that input and the row is dropped here
+        rather than emitting a fragile ``<owner>_Set`` event name).
 
     Pure function; does not mutate ``scene_runtime``.
     """
@@ -386,6 +433,11 @@ def compute_cross_domain_edges(
             event_name = _derive_event_name_from_owner_field(
                 owner_class, field,
             )
+            if event_name is None:
+                # Slice 2 P3 carry-forward: skip empty-field rows
+                # rather than emit a fragile ``<owner>_Set`` event
+                # name. The producer has no attribute to write here.
+                continue
             out.append(CrossDomainEdge(
                 id=deterministic_edge_id(src_inst, field, tgt_inst),
                 kind="attribute_write",
@@ -409,9 +461,11 @@ def compute_cross_domain_edges(
                 ),
             ))
 
-    for key, scene in scenes.items():
+    for key in sorted(scenes.keys()):
+        scene = scenes[key]
         _scan("scene", key, scene.get("references", []))
-    for key, prefab in prefabs.items():
+    for key in sorted(prefabs.keys()):
+        prefab = prefabs[key]
         _scan("prefab", key, prefab.get("references", []))
 
     return out
@@ -436,9 +490,12 @@ def compute_shared_attribute_candidates(
 
     Iteration order is deterministic: scenes (sorted by key, then
     instance list order), then prefabs (sorted by key, then instance
-    list order). Stable across runs given the same input. Matches the
-    `_scan` traversal order in ``compute_cross_domain_edges`` so the
-    concatenated output in ``build_topology`` stays sortable.
+    list order). Phase 2b slice 2 unifies the two producers on this
+    sorted-iteration shape (``compute_cross_domain_edges`` previously
+    used dict-insertion order; both now sort). Stable across runs
+    given the same input independent of upstream dict insertion order
+    — required by the enrichment pass that feeds both producers'
+    outputs into a single duplicate-event-name check.
 
     Pure function; does not mutate ``scene_runtime``.
     """
