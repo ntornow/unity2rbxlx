@@ -5092,12 +5092,36 @@ class TestPhase2bSlice2EnrichmentAndRelocation:
         are populated from the structural producers. Slice 1 produced
         these inside ``build_topology``; slice 2 relocates them to the
         prepass.
+
+        R1 P1-A fix (2026-05-31): the script sources here carry REAL
+        client / server signals so ``infer_module_domains`` (which the
+        prepass calls and feeds into the producers via
+        ``domains_override``) returns the expected client/server split.
+        Pre-R1 this test silently relied on the buggy producers reading
+        the stamped ``"domain"`` value off the modules dict; with the
+        override in place the source-level signals must drive the
+        inference for the cross-domain edge to be detected.
         """
         from converter.pipeline import Pipeline
 
-        door = RbxScript(name="Door", source="-- d", script_type="Script")
-        anim = RbxScript(name="Anim", source="-- a", script_type="Script")
-        pickup = RbxScript(name="Pickup", source="-- p", script_type="Script")
+        door = RbxScript(
+            name="Door",
+            source=(
+                "local rs = game:GetService(\"RunService\")\n"
+                "rs.RenderStepped:Connect(function() end)\n"
+            ),
+            script_type="LocalScript",
+        )
+        anim = RbxScript(
+            name="Anim",
+            source=(
+                "local rs = game:GetService(\"ReplicatedStorage\")\n"
+                "local re = rs:WaitForChild(\"E\")\n"
+                "re.OnServerEvent:Connect(function() end)\n"
+            ),
+            script_type="Script",
+        )
+        pickup = RbxScript(name="Pickup", source="-- p", script_type="LocalScript")
         scene_runtime: dict[str, object] = {
             "modules": {
                 "door_sid": {
@@ -5245,8 +5269,28 @@ class TestPhase2bSlice2EnrichmentAndRelocation:
             synthesize_listener_id,
         )
 
-        door = RbxScript(name="Door", source="-- d", script_type="Script")
-        anim = RbxScript(name="Anim", source="-- a", script_type="Script")
+        # R1 P1-A fix (2026-05-31): script sources carry real
+        # client / server signals so ``infer_module_domains`` returns
+        # the expected client/server split. The producers now consult
+        # the inferred ``domains_override`` instead of the stamped
+        # ``"domain"`` value on the modules dict.
+        door = RbxScript(
+            name="Door",
+            source=(
+                "local rs = game:GetService(\"RunService\")\n"
+                "rs.RenderStepped:Connect(function() end)\n"
+            ),
+            script_type="LocalScript",
+        )
+        anim = RbxScript(
+            name="Anim",
+            source=(
+                "local rs = game:GetService(\"ReplicatedStorage\")\n"
+                "local re = rs:WaitForChild(\"E\")\n"
+                "re.OnServerEvent:Connect(function() end)\n"
+            ),
+            script_type="Script",
+        )
         scene_runtime: dict[str, object] = {
             "modules": {
                 "door_sid": {
@@ -5456,17 +5500,26 @@ class TestPhase2bSlice2EnrichmentAndRelocation:
         assert "client_caller" in roles_seen
         assert "server_listener" in roles_seen
 
-    def test_duplicate_event_name_invariant_across_buckets(self) -> None:
-        """Slice 2's duplicate-event_name invariant scans BOTH buckets:
-        a component-ref edge whose derived ``<owner>_Set<Field>`` event
-        name COLLIDES with the locked ``"PickupItemEvent"`` literal
-        used by the Pickup candidate must abort the build. Per Claude
-        arch review risk #1 (2026-05-30).
+    def test_event_name_invariant_fires_only_on_semantic_collisions(
+        self,
+    ) -> None:
+        """Slice 2's event_name invariant fires ONLY on a SEMANTIC
+        collision: two edges sharing the same ``event_name`` but with
+        DIFFERENT ``payload.attribute_name``. Edges sharing both
+        ``event_name`` AND ``payload.attribute_name`` are the same
+        logical bridge instantiated multiple times -- no abort.
 
-        We synthesize the collision by constructing an injected edge
-        whose ``resolution.event_name`` is ``"PickupItemEvent"`` and a
-        candidate also carrying the same name -- the producer doesn't
-        derive this literal in real plans, so we inject directly.
+        This test exercises the true-collision case: a component-ref
+        edge with ``payload.attribute_name="open"`` and a candidate
+        with ``payload.attribute_name="has<itemName>"`` both carrying
+        ``event_name="PickupItemEvent"``. Two distinct cross-domain
+        writes routing through one RemoteEvent -- fail-closed.
+
+        R1 P1-B fix (2026-05-31): pre-R1 the invariant aborted on any
+        repeated ``event_name``, which broke the common case of
+        multiple Pickup candidates sharing the locked
+        ``"PickupItemEvent"`` (Mitigation α). The refined invariant
+        only fires on heterogeneous ``payload.attribute_name``.
         """
         sr = _mk_artifact()
         sr_dict = cast(dict[str, object], sr)
@@ -5501,6 +5554,8 @@ class TestPhase2bSlice2EnrichmentAndRelocation:
                  "ref": "__bridge_listener__PickupItemEvent"},
                 {"role": "anim_listener", "ref": "sid_b"},
             ],
+            # DIFFERENT attribute_name from the candidate below ->
+            # semantic collision -> abort.
             "payload": {"attribute_name": "open", "schema": "unknown"},
         }
         injected_candidate = {
@@ -5537,8 +5592,247 @@ class TestPhase2bSlice2EnrichmentAndRelocation:
                     "object", injected_candidate,
                 )],
             )
-        assert "duplicate cross-domain event_name" in str(exc.value)
+        assert "semantic collision on cross-domain event_name" in str(exc.value)
         assert "PickupItemEvent" in str(exc.value)
+        # The new abort message names the heterogeneous attribute_name
+        # set so triage can see WHAT collided.
+        assert "has<itemName>" in str(exc.value)
+        assert "'open'" in str(exc.value)
+
+    def test_fresh_run_emits_edges_via_domains_override(self) -> None:
+        """P1-A regression guard (R1 fix, 2026-05-31): on a fresh run,
+        ``scene_runtime["modules"][sid]["domain"]`` is EMPTY -- the
+        classifier hasn't stamped it back yet at the moment
+        ``_maybe_run_topology_prepass`` calls the producers. Without
+        the ``domains_override`` kwarg the producers see ``""`` for
+        every src+tgt domain and the ``NON_RUNTIME_DOMAINS`` filter
+        drops every otherwise-valid cross-domain edge.
+
+        We synthesize the fresh-run state by leaving every module's
+        ``domain`` as ``""`` AND giving the scripts real signals so
+        ``infer_module_domains`` (which the prepass calls) populates
+        the local ``domains`` dict the override is fed from. The
+        edges bucket must be NON-EMPTY at the prepass output.
+        """
+        from converter.pipeline import Pipeline
+
+        door = RbxScript(
+            name="Door",
+            source=(
+                "local rs = game:GetService(\"RunService\")\n"
+                "rs.RenderStepped:Connect(function() end)\n"
+            ),
+            script_type="LocalScript",
+        )
+        anim = RbxScript(
+            name="Anim",
+            source=(
+                "local rs = game:GetService(\"ReplicatedStorage\")\n"
+                "local re = rs:WaitForChild(\"E\")\n"
+                "re.OnServerEvent:Connect(function() end)\n"
+            ),
+            script_type="Script",
+        )
+        # Fresh-run shape: EVERY module's ``domain`` is empty string.
+        # The classifier (which would stamp these) runs AFTER the
+        # prepass. Pre-R1 producers read these blanks and dropped
+        # every edge.
+        scene_runtime: dict[str, object] = {
+            "modules": {
+                "door_sid": {
+                    "stem": "Door", "class_name": "Door",
+                    "runtime_bearing": True, "domain": "",
+                    "character_attached": False, "is_loader": False,
+                    "module_path": "ReplicatedStorage.Door",
+                },
+                "anim_sid": {
+                    "stem": "Anim", "class_name": "Anim",
+                    "runtime_bearing": True, "domain": "",
+                    "character_attached": False, "is_loader": False,
+                    "module_path": "ReplicatedStorage.Anim",
+                },
+            },
+            "scenes": {
+                "Fresh.unity": {
+                    "instances": [
+                        {"instance_id": "Fresh.unity:1",
+                         "script_id": "door_sid",
+                         "game_object_id": "Fresh.unity:1",
+                         "active": True, "enabled": True, "config": {}},
+                        {"instance_id": "Fresh.unity:2",
+                         "script_id": "anim_sid",
+                         "game_object_id": "Fresh.unity:2",
+                         "active": True, "enabled": True, "config": {}},
+                    ],
+                    "references": [{
+                        "from": "Fresh.unity:1",
+                        "field": "open",
+                        "index": None,
+                        "target_kind": "component",
+                        "target_ref": "Fresh.unity:2",
+                        "target_is_ui": False,
+                    }],
+                    "lifecycle_order": [
+                        "Fresh.unity:1", "Fresh.unity:2",
+                    ],
+                },
+            },
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+        pipeline = self._build_pipeline_with(
+            scripts=[door, anim],
+            transpilation_result_scripts=[],
+        )
+        out = Pipeline._maybe_run_topology_prepass(pipeline, scene_runtime)
+        assert out is not None
+        # The edge MUST be present despite the empty
+        # ``domain`` stamps -- override kicks in.
+        edges = out["cross_domain_edges"]
+        assert len(edges) == 1, (
+            f"P1-A regression: prepass dropped all cross-domain edges "
+            f"on fresh-run state (modules[*].domain=='\"\"'). The "
+            f"producers should have consulted ``domains_override``. "
+            f"Got edges={edges!r}."
+        )
+        edge = edges[0]
+        assert edge["from_script"] == "door_sid"
+        assert edge["to_script"] == "anim_sid"
+        assert edge["from_domain"] == "client"
+        assert edge["to_domain"] == "server"
+
+    def test_multi_pickup_no_invariant_abort(self) -> None:
+        """P1-B regression guard (R1 fix, 2026-05-31): multiple Pickup
+        instances all carry the locked ``"PickupItemEvent"`` event name
+        and the SAME ``payload.attribute_name="has<itemName>"``
+        template. This is intentional reuse (Mitigation α), NOT a
+        semantic collision -- the refined invariant must accept it.
+
+        Pre-R1 this aborted the topology build for any scene with
+        more than one Pickup -- a common case.
+        """
+        sr = _mk_artifact(modules={
+            "pickup_sid": {
+                "stem": "Pickup", "class_name": "Pickup",
+                "runtime_bearing": True, "domain": "client",
+                "character_attached": False, "is_loader": False,
+            },
+        }, scenes={
+            "Pickups.unity": {
+                "instances": [
+                    {"instance_id": "Pickups.unity:1",
+                     "script_id": "pickup_sid",
+                     "game_object_id": "Pickups.unity:1",
+                     "active": True, "enabled": True,
+                     "config": {"itemName": "Key"}},
+                    {"instance_id": "Pickups.unity:2",
+                     "script_id": "pickup_sid",
+                     "game_object_id": "Pickups.unity:2",
+                     "active": True, "enabled": True,
+                     "config": {"itemName": "Map"}},
+                ],
+                "references": [],
+                "lifecycle_order": [
+                    "Pickups.unity:1", "Pickups.unity:2",
+                ],
+            },
+        })
+
+        # Run the producer to get two candidates (one per Pickup
+        # instance) sharing event_name="PickupItemEvent" and
+        # payload.attribute_name="has<itemName>".
+        candidates = compute_shared_attribute_candidates(sr)
+        assert len(candidates) == 2
+        assert {c["resolution"]["event_name"] for c in candidates} == {
+            "PickupItemEvent",
+        }
+        assert {c["payload"]["attribute_name"] for c in candidates} == {
+            "has<itemName>",
+        }
+
+        # build_topology must NOT abort.
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={
+                "Pickup": _mk_rbx_script("Pickup", "LocalScript"),
+            },
+            cross_domain_edges_input=[],
+            cross_domain_edge_candidates_input=cast(
+                "list[object]", candidates,
+            ),
+        )
+        # Both candidates survive into the artifact.
+        cand_block = artifact["cross_domain_edge_candidates"]
+        assert len(cand_block) == 2
+
+    def test_multi_door_cross_domain_no_invariant_abort(self) -> None:
+        """P1-B regression guard (R1 fix, 2026-05-31): two component-ref
+        cross-domain edges sharing the SAME ``<owner>_Set<Field>``
+        event_name derivation (e.g. two Door MonoBehaviours each
+        referencing an Animator on the same ``open`` field) AND the
+        same ``payload.attribute_name="open"`` are intentional reuse
+        of one logical bridge across multiple instances, NOT a
+        semantic collision.
+
+        Pre-R1 this aborted any scene with more than one cross-domain
+        Door reference -- a common case in any multi-door level.
+        """
+        # Two doors both ref an Animator on field 'open'. Both edges
+        # derive event_name='Door_SetOpen' and payload.attribute_name='open'.
+        edge_one = {
+            "id": "deterministic::edge::1",
+            "kind": "attribute_write",
+            "from_instance": "S:1", "to_instance": "S:2",
+            "from_script": "door_sid", "to_script": "anim_sid",
+            "field": "open",
+            "from_domain": "client", "to_domain": "server",
+            "owner_kind": "scene", "owner_ref": "X.unity",
+            "resolution": {
+                "strategy": "remote_event_bridge",
+                "event_name": "Door_SetOpen",
+            },
+            "bridge_member_scripts": [
+                {"role": "client_caller", "ref": "door_sid"},
+                {"role": "server_listener",
+                 "ref": "__bridge_listener__Door_SetOpen"},
+                {"role": "anim_listener", "ref": "anim_sid"},
+            ],
+            "payload": {"attribute_name": "open", "schema": "unknown"},
+        }
+        edge_two = {
+            **edge_one,
+            "id": "deterministic::edge::2",
+            "from_instance": "S:3", "to_instance": "S:4",
+        }
+
+        sr = _mk_artifact(modules={
+            "door_sid": {
+                "stem": "Door", "class_name": "Door",
+                "runtime_bearing": True, "domain": "client",
+                "character_attached": False, "is_loader": False,
+            },
+            "anim_sid": {
+                "stem": "Anim", "class_name": "Anim",
+                "runtime_bearing": True, "domain": "server",
+                "character_attached": False, "is_loader": False,
+            },
+        })
+        # No abort -- both edges describe the same logical bridge.
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={
+                "Door": _mk_rbx_script("Door", "LocalScript"),
+                "Anim": _mk_rbx_script("Anim", "Script"),
+            },
+            cross_domain_edges_input=cast(
+                "list[object]", [edge_one, edge_two],
+            ),
+            cross_domain_edge_candidates_input=[],
+        )
+        edges_block = artifact["cross_domain_edges"]
+        assert len(edges_block) == 2
 
     def test_candidate_bridge_member_ref_must_resolve(self) -> None:
         """Slice 2's candidate-`ref`-validity invariant: every

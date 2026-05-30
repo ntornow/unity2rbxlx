@@ -1374,21 +1374,30 @@ def _enforce_invariants(
                 row=edge,
             )
 
-    # Invariant 2a (Phase 2b slice 2): no two rows across BOTH the
-    # edges + candidates buckets share the same
-    # ``resolution.event_name``. The locked ``"PickupItemEvent"``
-    # candidate could collide with a component-ref edge whose
-    # ``<owner>_Set<Field>`` derivation produces the same literal
-    # string (Claude arch review risk #1, 2026-05-30). The collision
-    # would silently route two distinct cross-domain writes through
-    # the same RemoteEvent at slice 3 emit time — fail-closed here.
+    # Invariant 2a (Phase 2b slice 2): no SEMANTIC collision on
+    # ``resolution.event_name`` across BOTH the edges + candidates
+    # buckets. A "semantic collision" is two edges sharing the same
+    # ``event_name`` but with DIFFERENT ``payload.attribute_name`` (or
+    # ``kind``) — i.e. two distinct cross-domain writes that would
+    # route through the same RemoteEvent at slice 3 emit time.
     #
-    # We scan both buckets together because the duplicate is just as
-    # bad WITHIN a bucket as ACROSS them: two component-ref edges
-    # whose owner+field derive the same name, two candidates from
-    # different seeds with the same event_name (future), or one of
-    # each.
-    event_name_owners: dict[str, str] = {}
+    # R1 refinement (Phase 2b slice 2 R1 P1-B fix, 2026-05-31):
+    # pre-R1 the invariant aborted on ANY repeated ``event_name``.
+    # That broke intentional reuse — multiple Pickup candidates all
+    # carry the locked ``"PickupItemEvent"`` (Mitigation α), and
+    # multiple cross-domain ``Door.open`` component-ref edges all
+    # derive ``"Door_SetOpen"`` from ``<owner>_Set<Field>`` without
+    # an instance qualifier. Both are the SAME logical bridge
+    # instantiated multiple times, not a collision.
+    #
+    # The refined check groups rows by ``event_name`` and only fires
+    # when a group has heterogeneous ``payload.attribute_name`` (or
+    # ``kind``). Two rows sharing both ``event_name`` AND
+    # ``payload.attribute_name`` (and ``kind``) ARE the same logical
+    # bridge — no abort. Two rows sharing ``event_name`` but with
+    # different ``payload.attribute_name`` ARE a true name collision
+    # — fail-closed.
+    by_event_name: dict[str, list[dict[str, object]]] = {}
     for row in list(edges) + list(candidates):
         resolution = row.get("resolution", {})
         if not isinstance(resolution, dict):
@@ -1396,20 +1405,38 @@ def _enforce_invariants(
         ev = resolution.get("event_name", "")
         if not isinstance(ev, str) or not ev:
             continue
-        if ev in event_name_owners:
+        by_event_name.setdefault(ev, []).append(cast("dict[str, object]", row))
+    for ev, rows in by_event_name.items():
+        if len(rows) <= 1:
+            continue
+        # Defensive depth: every row in the group must share BOTH
+        # ``payload.attribute_name`` and ``kind``. A mismatch on
+        # either is a true semantic collision.
+        attr_names: set[str] = set()
+        kinds: set[str] = set()
+        for r in rows:
+            payload = r.get("payload", {})
+            if isinstance(payload, dict):
+                an = payload.get("attribute_name", "")
+                if isinstance(an, str):
+                    attr_names.add(an)
+            k = r.get("kind", "")
+            if isinstance(k, str):
+                kinds.add(k)
+        if len(attr_names) > 1 or len(kinds) > 1:
             _abort(
                 2,
-                f"duplicate cross-domain event_name {ev!r} "
-                f"(also owned by {event_name_owners[ev]!r}) -- two "
-                f"distinct cross-domain writes would route through "
-                f"the same RemoteEvent at emit time. Slice 1's "
-                f"<owner>_Set<Field> derivation may have collided "
-                f"with the locked ``PickupItemEvent`` literal, or "
-                f"two component-ref edges share an owner+field "
-                f"derivation by coincidence.",
-                row=row,
+                f"semantic collision on cross-domain event_name {ev!r}: "
+                f"two distinct cross-domain writes (different "
+                f"attribute_name={sorted(attr_names)!r} or "
+                f"kind={sorted(kinds)!r}) share event_name -- this "
+                f"is a name collision, not intentional reuse. Slice "
+                f"1's ``<owner>_Set<Field>`` derivation may have "
+                f"collided with the locked ``PickupItemEvent`` "
+                f"literal, or two distinct bridge semantics share an "
+                f"event_name by coincidence.",
+                row=rows[0],
             )
-        event_name_owners[ev] = row.get("id", "")
 
     # Invariant 2b (Phase 2b slice 2): every
     # ``cross_domain_edge_candidates[*].bridge_member_scripts[*].ref``

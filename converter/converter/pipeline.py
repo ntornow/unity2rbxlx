@@ -4628,9 +4628,26 @@ script.Disabled = true
         scene_runtime_typed = cast(
             "SceneRuntimeArtifact", scene_runtime,
         )
-        component_ref_edges = compute_cross_domain_edges(scene_runtime_typed)
+        # P1-A fix (Phase 2b slice 2 R1, 2026-05-31): the prepass runs
+        # BEFORE ``classify_scene_runtime_domains()`` stamps
+        # ``modules[*].domain`` back onto ``scene_runtime``. The
+        # producers internally read ``modules.get(sid, {}).get("domain", "")``,
+        # so on a fresh run every domain reads as ``""`` and the
+        # ``NON_RUNTIME_DOMAINS`` filter drops every edge. Pass the
+        # locally-computed ``domains`` dict (populated above from
+        # ``infer_module_domains``) as the override so the producers
+        # see the inferred values. Slice 1 worked because it ran late
+        # in ``build_topology`` after the classifier had stamped; the
+        # relocation broke that timing, and the override restores it
+        # without requiring the classifier to run earlier in the
+        # pipeline.
+        component_ref_edges = compute_cross_domain_edges(
+            scene_runtime_typed,
+            domains_override=domains,
+        )
         shared_attribute_candidates = compute_shared_attribute_candidates(
             scene_runtime_typed,
+            domains_override=domains,
         )
         # Resume case (state.transpilation_result is None): pass None
         # to the enricher; consumer rows stay empty (slice 3 falls back

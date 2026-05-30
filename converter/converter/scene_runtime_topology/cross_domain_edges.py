@@ -62,6 +62,7 @@ restructuring is scope creep slice 1's brief explicitly excludes.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, TypedDict, cast
 
@@ -350,6 +351,8 @@ def _derive_event_name_from_owner_field(
 
 def compute_cross_domain_edges(
     scene_runtime: SceneRuntimeArtifact,
+    *,
+    domains_override: Mapping[str, str] | None = None,
 ) -> list[CrossDomainEdge]:
     """Enumerate every cross-domain serialized reference in the plan.
 
@@ -379,6 +382,18 @@ def compute_cross_domain_edges(
         returns ``None`` on that input and the row is dropped here
         rather than emitting a fragile ``<owner>_Set`` event name).
 
+    ``domains_override`` (Phase 2b slice 2 R1 P1-A fix): when supplied,
+    consulted FIRST for each script_id's domain. Falls back to
+    ``scene_runtime["modules"][sid]["domain"]`` only when
+    ``domains_override.get(sid)`` is missing or empty. Required by the
+    prepass call site (``pipeline.py`` ``_maybe_run_topology_prepass``)
+    which runs BEFORE ``classify_scene_runtime_domains()`` stamps
+    domains back onto ``scene_runtime`` — without the override, every
+    edge on a fresh run sees ``""`` for both src + tgt domain and gets
+    dropped by the ``NON_RUNTIME_DOMAINS`` filter. Direct callers
+    (e.g. tests, the report writer) that pass already-stamped
+    artifacts can omit the kwarg and the fallback path keeps working.
+
     Pure function; does not mutate ``scene_runtime``.
     """
     modules = cast(dict[str, dict[str, object]], scene_runtime.get("modules", {}))
@@ -403,6 +418,18 @@ def compute_cross_domain_edges(
         stem = mod.get("stem", "")
         return stem if isinstance(stem, str) else ""
 
+    def _resolve_domain(script_id: str) -> str:
+        # P1-A fix: consult ``domains_override`` first (the prepass's
+        # already-inferred-but-not-yet-stamped domains), then fall
+        # back to the on-row stamped value (direct callers / resume).
+        if domains_override is not None:
+            override_val = domains_override.get(script_id, "")
+            if isinstance(override_val, str) and override_val:
+                return override_val
+        mod = modules.get(script_id, {})
+        domain_obj = mod.get("domain", "")
+        return domain_obj if isinstance(domain_obj, str) else ""
+
     def _scan(
         owner_kind: str,
         owner_ref: str,
@@ -417,12 +444,8 @@ def compute_cross_domain_edges(
             tgt_sid = instance_to_script.get(tgt_inst, "")
             if not src_sid or not tgt_sid:
                 continue
-            src_mod = modules.get(src_sid, {})
-            tgt_mod = modules.get(tgt_sid, {})
-            src_domain_obj = src_mod.get("domain", "")
-            tgt_domain_obj = tgt_mod.get("domain", "")
-            src_domain = src_domain_obj if isinstance(src_domain_obj, str) else ""
-            tgt_domain = tgt_domain_obj if isinstance(tgt_domain_obj, str) else ""
+            src_domain = _resolve_domain(src_sid)
+            tgt_domain = _resolve_domain(tgt_sid)
             if (src_domain in NON_RUNTIME_DOMAINS
                     or tgt_domain in NON_RUNTIME_DOMAINS):
                 continue
@@ -473,6 +496,8 @@ def compute_cross_domain_edges(
 
 def compute_shared_attribute_candidates(
     scene_runtime: SceneRuntimeArtifact,
+    *,
+    domains_override: Mapping[str, str] | None = None,
 ) -> list[CrossDomainEdge]:
     """Enumerate every scene/prefab instance whose component class
     matches a ``SHARED_ATTRIBUTE_SEEDS`` row.
@@ -496,6 +521,15 @@ def compute_shared_attribute_candidates(
     given the same input independent of upstream dict insertion order
     — required by the enrichment pass that feeds both producers'
     outputs into a single duplicate-event-name check.
+
+    ``domains_override`` (Phase 2b slice 2 R1 P1-A fix): when supplied,
+    consulted FIRST for each script_id's ``from_domain`` stamping.
+    Falls back to ``scene_runtime["modules"][sid]["domain"]`` only
+    when the override is missing or empty. Required by the prepass
+    call site (``pipeline.py`` ``_maybe_run_topology_prepass``) which
+    runs BEFORE ``classify_scene_runtime_domains()`` writes domains
+    back onto ``scene_runtime`` — without the override, every
+    candidate row would carry ``from_domain=""`` on fresh runs.
 
     Pure function; does not mutate ``scene_runtime``.
     """
@@ -523,6 +557,13 @@ def compute_shared_attribute_candidates(
         return stem if isinstance(stem, str) else ""
 
     def _module_domain(script_id: str) -> str:
+        # P1-A fix: consult ``domains_override`` first (the prepass's
+        # already-inferred-but-not-yet-stamped domains), then fall
+        # back to the on-row stamped value (direct callers / resume).
+        if domains_override is not None:
+            override_val = domains_override.get(script_id, "")
+            if isinstance(override_val, str) and override_val:
+                return override_val
         mod = modules.get(script_id, {})
         domain = mod.get("domain", "")
         return domain if isinstance(domain, str) else ""
