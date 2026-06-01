@@ -175,11 +175,19 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   `dependency_map`; the prescribed injection-site guard would NOT have
   fixed generic mode, where `inject_require_calls` doesn't even run).
   **Fix (at the source, helps both modes):** exclude the type args of
-  runtime-lookup generics (`FindObjectOfType<T>` / `GetComponent<T>` /
-  `AddComponent<T>` / …) from `referenced_types` — they resolve at
-  runtime via the host, never as a module require. Genuine deps are still
-  captured via the new/field/param/base patterns. See
-  `_RUNTIME_LOOKUP_GENERIC_METHODS` in `script_analyzer.py`.
+  GLOBAL scene-lookup generics (`FindObjectOfType<T>` /
+  `FindObjectsOfType<T>`) from `referenced_types` — they locate an
+  already-existing instance, creating no dependency edge and no module
+  require. Genuine deps are still captured via the new/field/param/base
+  patterns. See `_GLOBAL_LOOKUP_GENERIC_METHODS` in `script_analyzer.py`.
+  **Scoped narrowly (Codex review):** COMPONENT-lookup generics
+  (`GetComponent<T>` / `AddComponent<T>` / `TryGetComponent<T>` / …) are
+  NOT excluded — they're real peer edges the caller_graph / reachability
+  consumers (`resolve_caller_graph`, `derive_reachability_requirements`,
+  `_compute_network_behaviour_reachable`) need; dropping them would orphan
+  a component referenced only that way. (Whether a component-lookup edge
+  should ALSO drive a `require()` is a separate, pre-existing concern at
+  the injection site.)
 
 ## Materials & meshes
 

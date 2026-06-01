@@ -36,19 +36,29 @@ _RE_SERIALIZED_FIELD = re.compile(
     r"\[SerializeField\]\s*(?:private\s+)?(\w+)\s+(\w+)",
 )
 
-# Generic methods whose type argument is resolved at RUNTIME by the host
-# (component / scene lookups), NOT a module the calling script must
-# ``require()``. The type arg of e.g. ``FindObjectOfType<GameManager>()`` is
-# NOT a cross-script require dependency — counting it poisons
-# ``dependency_map`` and misroutes the target in storage classification.
-# (If the type is genuinely required it appears via a field/``new``/param/
-# base reference, which the other extractor patterns capture.)
-_RUNTIME_LOOKUP_GENERIC_METHODS = frozenset({
-    "FindObjectOfType", "FindObjectsOfType",
-    "GetComponent", "GetComponents",
-    "GetComponentInChildren", "GetComponentsInChildren",
-    "GetComponentInParent", "GetComponentsInParent",
-    "TryGetComponent", "AddComponent",
+# GLOBAL scene-lookup generics whose type argument is NOT a dependency
+# edge at all: ``FindObjectOfType<T>()`` locates an ALREADY-EXISTING
+# instance of T somewhere in the scene. T's reachability/placement comes
+# from its own scene authoring or instantiation — NOT from the finder — so
+# the finder creates no structural relationship and no ``require()`` need.
+# Counting the type arg poisons ``dependency_map`` (e.g. ``Plane`` doing
+# ``FindObjectOfType<GameManager>()`` misroutes ``GameManager`` to
+# ServerStorage). If T is genuinely required it appears via a
+# field/``new``/param/base reference, captured by the other patterns.
+#
+# NOTE (Codex review, 2026-06-01): this set is deliberately LIMITED to
+# GLOBAL lookups. ``GetComponent<T>`` / ``AddComponent<T>`` /
+# ``TryGetComponent<T>`` / ``GetComponentInChildren<T>`` etc. are NOT here:
+# those reference a PEER component (or, for ``AddComponent``, create it),
+# which IS a real dependency edge that ``dependency_map`` feeds to
+# ``resolve_caller_graph`` / ``derive_reachability_requirements`` /
+# ``_compute_network_behaviour_reachable`` — none of which re-scan these
+# APIs. Dropping a component-lookup edge would ORPHAN a component that's
+# referenced only that way. (Whether such edges should also drive a
+# ``require()`` is a separate, pre-existing concern at the injection site,
+# out of scope here.)
+_GLOBAL_LOOKUP_GENERIC_METHODS = frozenset({
+    "FindObjectOfType", "FindObjectsOfType", "FindObjectOfTypeAll",
 })
 
 CLIENT_APIS = frozenset({
@@ -128,22 +138,24 @@ def analyze_script(script_path: str | Path) -> ScriptInfo:
     for m2 in re.finditer(r'\bnew\s+([A-Z]\w+)\s*\(', source):
         _type_refs.add(m2.group(1))
     # Generic type args: List<TypeName>, Dictionary<K, TypeName>.
-    # EXCLUDE the type arg of RUNTIME-LOOKUP generic calls
-    # (``FindObjectOfType<T>``, ``GetComponent<T>``, ``AddComponent<T>``,
-    # …): those resolve T at runtime via the host, NOT as a module the
-    # script must ``require()``. Counting them poisons ``dependency_map``
-    # (which feeds BOTH the legacy require-injector AND the topology
-    # caller_graph), e.g. ``Plane`` calling ``FindObjectOfType<GameManager>()``
-    # makes ``GameManager`` look required-by-a-server-script and misroutes
-    # it to ServerStorage. If T is genuinely require-worthy it's captured
-    # by the new/field/param/base patterns instead. See TODO.md
-    # "Transpiler false-positive require() injection".
+    # EXCLUDE the type arg of GLOBAL scene-lookup generics
+    # (``FindObjectOfType<T>`` etc.): those locate an already-existing T,
+    # creating no dependency edge and no ``require()`` need. Counting them
+    # poisons ``dependency_map`` (which feeds the legacy require-injector
+    # AND the topology caller_graph), e.g. ``Plane`` calling
+    # ``FindObjectOfType<GameManager>()`` misroutes ``GameManager`` to
+    # ServerStorage. Component-lookup generics (``GetComponent<T>`` /
+    # ``AddComponent<T>`` / …) are NOT excluded — they are real peer edges
+    # the reachability consumers need (see _GLOBAL_LOOKUP_GENERIC_METHODS).
+    # If T is genuinely require-worthy it's also captured by the
+    # new/field/param/base patterns. See TODO.md "Transpiler false-positive
+    # require() injection".
     # Capture the optional token immediately before ``<`` so we can tell a
-    # runtime-lookup method (``GetComponent<Foo>``) from a collection type
-    # (``List<Foo>``).
+    # global-lookup method (``FindObjectOfType<Foo>``) from a collection
+    # type (``List<Foo>``) or a component lookup (``GetComponent<Foo>``).
     for m2 in re.finditer(r'(\w+)?\s*<\s*([A-Z]\w+)', source):
         preceding = m2.group(1) or ""
-        if preceding in _RUNTIME_LOOKUP_GENERIC_METHODS:
+        if preceding in _GLOBAL_LOOKUP_GENERIC_METHODS:
             continue
         _type_refs.add(m2.group(2))
     # Method parameters: (TypeName param, ...)

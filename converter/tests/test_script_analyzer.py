@@ -81,16 +81,22 @@ class TestAnalyzeScriptBaseless:
         assert info.suggested_type == "Script"
 
 
-class TestReferencedTypesRuntimeLookupExclusion:
-    """``referenced_types`` must NOT count the type arg of a RUNTIME-LOOKUP
-    generic (``FindObjectOfType<T>`` / ``GetComponent<T>`` / …) as a
-    cross-script dependency — those resolve T at runtime via the host, not
-    as a module the script must ``require()``. Counting them poisons
-    ``dependency_map`` and misroutes the target in storage classification
-    (TODO.md "Transpiler false-positive require() injection").
+class TestReferencedTypesGlobalLookupExclusion:
+    """``referenced_types`` must NOT count the type arg of a GLOBAL
+    scene-lookup generic (``FindObjectOfType<T>``) as a dependency — that
+    locates an already-existing T, creating no edge and no ``require()``
+    need. Counting it poisons ``dependency_map`` and misroutes the target
+    in storage classification (TODO.md "Transpiler false-positive
+    require() injection").
 
-    Tests 1-2 FAIL against the pre-fix regex (which captured the arg);
-    tests 3-4 guard against over-tightening + losing genuine deps.
+    But COMPONENT-lookup generics (``GetComponent<T>`` / ``AddComponent<T>``)
+    ARE real peer edges the reachability consumers need — they must STILL be
+    captured (Codex review 2026-06-01: dropping them would orphan a
+    component referenced only that way).
+
+    test_findobjectoftype FAILS against the pre-fix regex (captured the
+    arg); the rest guard the boundaries — global-lookup excluded, but
+    component-lookup / collection / genuine deps preserved.
     """
 
     def _refs(self, tmp_path: Path, name: str, body: str) -> list[str]:
@@ -103,20 +109,30 @@ class TestReferencedTypesRuntimeLookupExclusion:
         return analyze_script(cs).referenced_types
 
     def test_findobjectoftype_arg_is_not_a_dependency(self, tmp_path: Path):
-        # The Plane→GameManager false edge: a runtime scene lookup, not a
-        # require dependency.
+        # The Plane→GameManager false edge: a global scene lookup, not a
+        # dependency.
         refs = self._refs(
             tmp_path, "Plane",
             "  void Start() { var gm = FindObjectOfType<GameManager>(); }",
         )
         assert "GameManager" not in refs
 
-    def test_getcomponent_arg_is_not_a_dependency(self, tmp_path: Path):
+    def test_getcomponent_arg_is_still_a_dependency(self, tmp_path: Path):
+        # Component-lookup: a REAL peer edge the caller_graph / reachability
+        # consumers need. Must NOT be dropped (Codex review 2026-06-01).
         refs = self._refs(
             tmp_path, "Mover",
-            "  void Start() { var r = GetComponent<Rigidbody2DCustom>(); }",
+            "  void Start() { var r = GetComponent<Movement>(); }",
         )
-        assert "Rigidbody2DCustom" not in refs
+        assert "Movement" in refs
+
+    def test_addcomponent_arg_is_still_a_dependency(self, tmp_path: Path):
+        # AddComponent literally CREATES the peer at runtime — a real edge.
+        refs = self._refs(
+            tmp_path, "Rig",
+            "  void Start() { gameObject.AddComponent<Health>(); }",
+        )
+        assert "Health" in refs
 
     def test_collection_generic_arg_still_captured(self, tmp_path: Path):
         # Don't over-tighten: a collection generic IS a real type reference.
@@ -127,7 +143,7 @@ class TestReferencedTypesRuntimeLookupExclusion:
         assert "ItemDef" in refs
 
     def test_type_required_elsewhere_still_captured(self, tmp_path: Path):
-        # Referenced BOTH via a runtime lookup AND a real ``new`` — the
+        # Referenced BOTH via a global lookup AND a real ``new`` — the
         # ``new`` path must still register it as a dependency.
         refs = self._refs(
             tmp_path, "Spawner",
