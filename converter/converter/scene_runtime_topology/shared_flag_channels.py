@@ -91,19 +91,33 @@ CANONICAL_STORES: tuple[str, ...] = ("Character", "Player")
 # server-domain reader (the canonical Door-reads-hasKey case).
 _FUNNEL_WRITER_DOMAIN = "client"
 
-# Match a ``<target>:GetAttribute("name")`` literal read. The attr
-# placeholder is a NON-QUOTE run (``[^"']+``), NOT identifier-only:
-# the pickup path builds shared-flag names from the raw ``itemName``
-# (``"has" .. itemName``), so legitimate flags include spaces, hyphens
-# and leading digits (``"hasRed Key"``, ``"hasKey-A"``, ``"has3rdGem"``).
-# An identifier-only class would miss those reads → empty ``read_names``
-# → the step-2 gate disables a needed funnel. This restores the slice-2
-# R4 broadening (Codex P3 there) that the fresh re-implementation lost.
-# Codex R1 P2-B, 2026-06-01. The closing quote is back-referenced to the
-# opening one so mismatched quote styles don't span across args.
+# Match a ``<target>:GetAttribute("name")`` literal read. The attr scan
+# must match the RUNTIME ALLOWLIST: the ``PlayerSetSharedFlag`` server
+# listener in ``autogen.py`` does
+# ``if #flagName > 64 or not string.match(flagName, "^[%w_]+$") then return end``
+# — it DROPS any flag name with chars outside ``[%w_]`` (alphanumeric +
+# underscore) or longer than 64. That mirrors Roblox's own attribute-name
+# constraint: ``"hasRed Key"`` (space) and ``"hasKey-A"`` (hyphen) are NOT
+# valid Roblox attribute names and the runtime cannot deliver them.
+# Empirically every ``GetAttribute`` name in the live transpile cache is
+# identifier-safe. So the capture is ``\w+`` (Python ``\w`` == ``[A-Za-z0-9_]``,
+# == Lua ``%w`` + ``_``); ``\w+`` allows a leading digit, exactly matching
+# ``^[%w_]+$``. The length cap (<=64) is enforced below. The closing quote
+# is back-referenced to the opening one so mismatched quote styles don't
+# span across args.
+#
+# SUPERSEDES the slice-2 R4 broadening (``[^"']+?``, restored at R2): that
+# change recorded impossible attribute names (spaces/hyphens) the funnel's
+# ``^[%w_]+$`` filter can never deliver, making the fact claim runtime
+# coverage that doesn't exist. Codex R2 P2, 2026-06-01.
 _GET_ATTR_RE = re.compile(
-    r""":GetAttribute\(\s*(?P<q>['"])(?P<attr>[^"']+?)(?P=q)\s*\)""",
+    r""":GetAttribute\(\s*(?P<q>['"])(?P<attr>\w+)(?P=q)\s*\)""",
 )
+
+# Mirror the funnel listener's length cap (``#flagName > 64``): a captured
+# name longer than this is dropped by the runtime, so the fact must not
+# record it. Codex R2 P2, 2026-06-01.
+_MAX_FLAG_NAME_LEN = 64
 
 
 class SharedFlagChannel(TypedDict):
@@ -204,6 +218,17 @@ def compute_shared_flag_channels(
             # False. Mirror the resume fail-open: keep the funnel. We do
             # NOT add to ``read_names`` (no domain to attribute it to), so
             # the name set stays unpolluted.
+            #
+            # Codex R2 P3, 2026-06-01 — but a ``LocalScript`` is provably
+            # CLIENT from its ``script_type`` alone (no script_id mapping
+            # needed). The funnel writer is also client-domain, so a
+            # client reader is SAME-DOMAIN, not cross-domain — it must NOT
+            # fail open and keep the funnel on. Only fail open for a
+            # ``Script`` (server) or a genuinely ambiguous type
+            # (ModuleScript / unknown), where the reader's domain truly
+            # cannot be ruled same-side.
+            if ts.script_type == "LocalScript":
+                continue
             if _GET_ATTR_RE.search(ts.luau_source):
                 fail_open_present = True
             continue
@@ -219,7 +244,13 @@ def compute_shared_flag_channels(
                 or reader_domain == _FUNNEL_WRITER_DOMAIN):
             continue
         for match in _GET_ATTR_RE.finditer(ts.luau_source):
-            read_names.add(match.group("attr"))
+            attr = match.group("attr")
+            # Mirror the funnel's ``#flagName > 64`` cap: a longer name is
+            # dropped by the runtime listener, so the fact must not record
+            # it. Codex R2 P2, 2026-06-01.
+            if len(attr) > _MAX_FLAG_NAME_LEN:
+                continue
+            read_names.add(attr)
             reader_domains.add(reader_domain)
 
     return {

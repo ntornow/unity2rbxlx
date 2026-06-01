@@ -5459,7 +5459,11 @@ class TestPhase2bSlice2EnrichmentAndRelocation:
 # ===========================================================================
 
 
-def _mk_transpiled(output_filename: str, luau_source: str):
+def _mk_transpiled(
+    output_filename: str,
+    luau_source: str,
+    script_type: str = "Script",
+):
     """One ``TranspiledScript`` for the reader scan."""
     from converter.code_transpiler import TranspiledScript
 
@@ -5470,6 +5474,7 @@ def _mk_transpiled(output_filename: str, luau_source: str):
         luau_source=luau_source,
         strategy="ai",
         confidence=1.0,
+        script_type=script_type,
     )
 
 
@@ -5543,19 +5548,30 @@ class TestSharedFlagChannels:
             assert channel["read_names"] == [], nonruntime
             assert channel["reader_domains"] == [], nonruntime
 
-    def test_shared_flag_channels_matches_non_identifier_flag_names(
+    def test_shared_flag_channels_rejects_non_runtime_attr_names(
         self,
     ) -> None:
-        """Non-identifier shared-flag names (spaces, hyphens, leading
-        digit) ARE captured — the pickup path builds flags from the raw
-        ``itemName`` (``"has" .. itemName``). Regression guard for the
-        slice-2 R4 broadening. Codex R1 P2-B, 2026-06-01."""
+        """The scan must match the RUNTIME ALLOWLIST. The
+        ``PlayerSetSharedFlag`` server listener in ``autogen.py`` does
+        ``if #flagName > 64 or not string.match(flagName, "^[%w_]+$")
+        then return end`` — names with spaces or hyphens are NOT valid
+        Roblox attribute names and the runtime DROPS them, so they must
+        NOT be recorded. Identifier-safe names (``\\w+``, incl. a leading
+        digit) ARE recorded; a name > 64 chars is dropped (length cap).
+
+        SUPERSEDES ``test_shared_flag_channels_matches_non_identifier_flag_names``
+        (the slice-2 R4 broadening), which asserted the now-incorrect
+        behavior of recording impossible attribute names. Codex R2 P2,
+        2026-06-01."""
+        long_name = "h" * 65  # > 64 -> runtime drops it
         scripts = [
             _mk_transpiled(
                 "Door.luau",
-                'local a = part:GetAttribute("hasRed Key")\n'
-                'local b = part:GetAttribute("hasKey-A")\n'
-                'local c = part:GetAttribute("has3rdGem")',
+                'local a = part:GetAttribute("hasRed Key")\n'   # space -> dropped
+                'local b = part:GetAttribute("hasKey-A")\n'     # hyphen -> dropped
+                'local c = part:GetAttribute("has3rdGem")\n'    # \\w+ -> kept
+                'local d = part:GetAttribute("hasKey")\n'       # \\w+ -> kept
+                f'local e = part:GetAttribute("{long_name}")',  # >64 -> dropped
             ),
         ]
         out = compute_shared_flag_channels(
@@ -5565,9 +5581,68 @@ class TestSharedFlagChannels:
         )
         channel = out["PlayerSetSharedFlag"]
         assert channel["present"] is True
-        assert "hasRed Key" in channel["read_names"]
-        assert "hasKey-A" in channel["read_names"]
+        # Non-runtime names are NOT recorded (runtime would drop them).
+        assert "hasRed Key" not in channel["read_names"]
+        assert "hasKey-A" not in channel["read_names"]
+        assert long_name not in channel["read_names"]
+        # Identifier-safe names ARE recorded.
         assert "has3rdGem" in channel["read_names"]
+        assert "hasKey" in channel["read_names"]
+
+    def test_shared_flag_channels_fail_open_skips_localscript_reader(
+        self,
+    ) -> None:
+        """An unmappable ``LocalScript`` reader is provably CLIENT from
+        its ``script_type`` alone. The funnel writer is also client-domain,
+        so it's a SAME-DOMAIN read — it must NOT fail open and keep the
+        funnel on. An unmappable ``Script`` (server) with the same read
+        DOES fail open (cross-domain). Codex R2 P3, 2026-06-01."""
+        # Provably-client LocalScript -> no fail-open.
+        client = compute_shared_flag_channels(
+            transpiled_scripts=[
+                _mk_transpiled(
+                    "Hud.luau",
+                    'local v = plr:GetAttribute("hasKey")',
+                    script_type="LocalScript",
+                ),
+            ],
+            script_id_by_name={},  # unmappable
+            domains={},
+        )
+        assert client["PlayerSetSharedFlag"]["present"] is False
+        assert client["PlayerSetSharedFlag"]["read_names"] == []
+
+        # Server Script -> fail open (domain truly ambiguous w/o mapping).
+        server = compute_shared_flag_channels(
+            transpiled_scripts=[
+                _mk_transpiled(
+                    "Door.luau",
+                    'local v = part:GetAttribute("hasKey")',
+                    script_type="Script",
+                ),
+            ],
+            script_id_by_name={},  # unmappable
+            domains={},
+        )
+        assert server["PlayerSetSharedFlag"]["present"] is True
+        assert server["PlayerSetSharedFlag"]["read_names"] == []
+
+    def test_shared_flag_channels_two_reads_on_one_line(self) -> None:
+        """Two ``GetAttribute`` reads on one line are captured as two
+        separate names, not merged into one span. Trivially safe with the
+        ``\\w+`` capture, but pin it. Claude R2 P3 follow-up."""
+        scripts = [
+            _mk_transpiled(
+                "Door.luau",
+                'a:GetAttribute("hasA") b:GetAttribute("hasB")',
+            ),
+        ]
+        out = compute_shared_flag_channels(
+            transpiled_scripts=scripts,
+            script_id_by_name={"Door": "door_sid"},
+            domains={"door_sid": "server"},
+        )
+        assert out["PlayerSetSharedFlag"]["read_names"] == ["hasA", "hasB"]
 
     def test_shared_flag_channels_fail_open_on_unmappable_reader(
         self,
