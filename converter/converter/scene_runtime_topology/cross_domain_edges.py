@@ -541,6 +541,8 @@ def compute_cross_domain_edges(
 
 def compute_shared_attribute_candidates(
     scene_runtime: SceneRuntimeArtifact,
+    *,
+    domains_override: Mapping[str, str] | None = None,
 ) -> list[CrossDomainEdge]:
     """Enumerate every scene/prefab instance whose component class
     matches a ``SHARED_ATTRIBUTE_SEEDS`` row.
@@ -565,15 +567,37 @@ def compute_shared_attribute_candidates(
     — required by the enrichment pass that feeds both producers'
     outputs into a single duplicate-event-name check.
 
-    Note (Phase 2b slice 2 R3, 2026-05-31): unlike
-    ``compute_cross_domain_edges``, this producer does NOT take a
-    ``domains_override``. Each candidate's ``from_domain`` is set from
-    the matched seed's ``producer_domain`` — the converter's runtime
-    bridge contract is authoritative for seeded patterns, NOT
-    ``infer_module_domains`` (which would mislabel a low-signal Pickup
-    as ``"client"`` via Rule 7). The inferred domain is irrelevant to
-    a seeded candidate's bridge direction, so the override the
-    component-ref producer needs has no role here.
+    **Domain handling (Phase 2b slice 2 R3 + R4, 2026-05-31).** Two
+    distinct uses of the module's classified domain, deliberately
+    separated:
+
+    1. **Bridge DIRECTION** is the seed's ``producer_domain``, NOT the
+       inferred domain. ``infer_module_domains`` would mislabel a
+       low-signal Pickup as ``"client"`` (Rule 7); the seed encodes the
+       converter's runtime bridge contract (server-originated for
+       Pickup, matching the ``:FireClient`` pack at
+       ``script_coherence_packs.py:380-394``). So a runtime-domain or
+       not-yet-classified producer always gets ``from_domain =
+       seed.producer_domain``.
+
+    2. **Explicit exclusion** (R4, Codex P2) IS honored. If the
+       module's resolved domain is an EXPLICIT non-runtime
+       classification — ``"helper"`` / ``"excluded"`` / ``"legacy"``,
+       i.e. ``NON_RUNTIME_DOMAINS`` minus the empty string — the seed
+       match is DROPPED: a deliberately opted-out producer must not
+       emit a live bridge candidate, or the artifact contradicts itself
+       (``modules[sid].domain == "excluded"`` alongside a ``"server"``
+       candidate). The empty string ``""`` is NOT an exclusion: it is
+       the fresh-run "not yet classified" state (the prepass runs
+       before the classifier stamps domains back). Dropping on ``""``
+       would reintroduce the slice-2 R1 P1-A bug (every fresh-run
+       candidate vanishing).
+
+    ``domains_override`` supplies the resolved domain for the exclusion
+    check (the prepass's already-inferred, override-aware ``domains``
+    dict), falling back to the on-row stamped ``modules[sid].domain``.
+    It is used ONLY to detect explicit exclusion — never to set the
+    bridge direction (that stays the seed's job).
 
     Pure function; does not mutate ``scene_runtime``.
     """
@@ -600,6 +624,18 @@ def compute_shared_attribute_candidates(
         stem = mod.get("stem", "")
         return stem if isinstance(stem, str) else ""
 
+    def _resolved_domain(script_id: str) -> str:
+        # Override first (prepass's inferred + operator-override-aware
+        # domains), then the on-row stamped value. Used ONLY for the
+        # explicit-exclusion check below — never for bridge direction.
+        if domains_override is not None:
+            override_val = domains_override.get(script_id, "")
+            if isinstance(override_val, str) and override_val:
+                return override_val
+        mod = modules.get(script_id, {})
+        domain = mod.get("domain", "")
+        return domain if isinstance(domain, str) else ""
+
     def _emit_for_owner(
         owner_kind: str, owner_ref: str,
         instances: list[dict[str, object]],
@@ -619,15 +655,22 @@ def compute_shared_attribute_candidates(
             )
             if not instance_id:
                 continue
+            # R4 (Codex P2, 2026-05-31): honor EXPLICIT exclusion. A
+            # module deliberately classified/overridden to a non-runtime
+            # domain (helper/excluded/legacy — NOT the empty "" fresh-run
+            # state) opted out; drop the seed match rather than emit a
+            # live server candidate that contradicts the artifact. ""
+            # is NOT an exclusion (see docstring): keep it.
+            resolved = _resolved_domain(script_id)
+            if resolved and resolved in NON_RUNTIME_DOMAINS:
+                continue
             # R3 (2026-05-31): the seed's ``producer_domain`` is the
-            # bridge direction the converter's runtime contract REQUIRES
-            # — authoritative over whatever ``infer_module_domains``
-            # says about the producer's source. The inferred domain
-            # (``_module_domain``) is only the structural signal for
-            # FINDING the producer instance; the bridge direction is the
-            # seed's to declare. For Pickup this is ``"server"`` (the
-            # existing pack fires ``:FireClient``); inference Rule 7
-            # would mislabel it ``"client"`` on a low-signal source.
+            # bridge DIRECTION the runtime contract REQUIRES —
+            # authoritative over the inferred domain. The resolved
+            # domain above gates exclusion only; it never sets
+            # direction. For Pickup this is ``"server"`` (the pack
+            # fires ``:FireClient``); inference Rule 7 would mislabel
+            # it ``"client"`` on a low-signal source.
             from_domain = seed.producer_domain
             out.append(CrossDomainEdge(
                 id=shared_attribute_candidate_id(

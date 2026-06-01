@@ -145,10 +145,18 @@ def _build_get_attribute_regex(attribute_template: str) -> re.Pattern[str]:
     elif len(parts) == 2:
         prefix = re.escape(parts[0])
         suffix = re.escape(parts[1])
-        # Match identifier-safe chars in the placeholder slot. The
-        # actual per-instance values are Roblox attribute names
-        # (e.g. ``hasKey``), so identifier-safe is the right class.
-        body = prefix + r"[A-Za-z_][A-Za-z0-9_]*" + suffix
+        # Match any non-quote run in the placeholder slot. R4 (Codex
+        # P3, 2026-05-31): the per-instance value is the raw serialized
+        # ``itemName`` concatenated into ``"has" .. itemName`` by the
+        # Pickup rewrite, so a project with ``Red Key`` / ``Key-A`` /
+        # ``3rdGem`` produces valid ``GetAttribute("hasRed Key")`` reads
+        # that an identifier-only class (``[A-Za-z_][A-Za-z0-9_]*``)
+        # would silently miss — under-populating ``bridge_member_scripts``
+        # for those pickups. ``[^"']`` (lazy) matches any attribute-name
+        # character up to the closing quote, anchored by the literal
+        # prefix/suffix; it is a prefix-wildcard by intent (any
+        # ``has<X>`` read is a candidate consumer).
+        body = prefix + r"[^\"']*?" + suffix
     else:
         # Multi-placeholder templates: refuse rather than guess.
         # Slice 1's seed table only has single-placeholder rows; a

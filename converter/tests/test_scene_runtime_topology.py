@@ -2118,45 +2118,61 @@ class TestPhase2bSlice1R1CandidateBucketWiring:
         assert len(artifact_edges["cross_domain_edges"]) == 1
         assert artifact_edges["cross_domain_edge_candidates"] == []
 
-    def test_seed_producer_domain_overrides_module_classification(
-        self,
-    ) -> None:
-        """R3 (2026-05-31): the seed's ``producer_domain`` is the SOLE
-        authority for a seeded candidate's ``from_domain`` — it
-        overrides ANY module-level classification, including
-        NON_RUNTIME values like ``"excluded"``.
+    def test_explicitly_excluded_pickup_drops_candidate(self) -> None:
+        """R4 (Codex P2, 2026-05-31): a Pickup whose module is
+        EXPLICITLY classified non-runtime (``"excluded"`` / ``"helper"``
+        / ``"legacy"``) is a deliberate opt-out — the candidate is
+        DROPPED, not emitted. Emitting a live ``"server"`` candidate for
+        an excluded module would make the artifact self-contradictory
+        (``modules[sid].domain == "excluded"`` alongside a server
+        candidate).
 
-        Why the seed wins even over ``"excluded"``: at
-        ``compute_shared_attribute_candidates`` time the module's
-        classified domain is unreliable. On a FRESH run it is unstamped
-        (``""``), which is itself in ``NON_RUNTIME_DOMAINS`` — so
-        ``"excluded"`` and ``"not-yet-classified"`` are
-        indistinguishable here. Respecting the module classification
-        would reintroduce the P1-A bug Codex caught at R1 (fresh-run
-        producers seeing ``""`` and dropping everything). The seed is
-        the only reliable signal for a bundled pattern, so it governs
-        unconditionally.
-
-        This also preserves the original Claude-P2-1 property: the
-        candidate producer does NOT silently drop the row (unlike
-        ``compute_cross_domain_edges``, which filters NON_RUNTIME).
-        The row is always emitted; its direction comes from the seed.
-
-        NOTE for R3/R4 review: if a reviewer believes a genuinely
-        ``"excluded"`` Pickup should suppress the bridge entirely,
-        that is a follow-on — it requires a reliable
-        exclude-vs-unstamped signal this producer does not have.
+        This SUPERSEDES the R3 call (which let the seed override even
+        ``"excluded"``). The R3 worry — that ``""`` and ``"excluded"``
+        are indistinguishable — was resolved by recognizing they are
+        NOT: ``""`` is fresh-run "not yet classified" (keep), the others
+        are explicit opt-outs (drop). See
+        ``test_unstamped_pickup_still_emits_candidate`` for the ``""``
+        side.
         """
-        # Module is stamped ``"excluded"`` — the seed must override it.
         plan = _mk_shared_attr_artifact(producer_domain="excluded")
+        # Direct call: ``_resolved_domain`` falls back to the on-row
+        # stamped ``"excluded"`` (no override needed to detect it).
         candidates = compute_shared_attribute_candidates(
             plan,  # type: ignore[arg-type]
         )
-        assert len(candidates) == 1
-        # Seed wins: ``"server"`` (Pickup's runtime contract), NOT the
-        # module's ``"excluded"`` classification.
+        assert candidates == [], (
+            "an explicitly-excluded Pickup must not emit a live bridge "
+            "candidate (Codex R4 P2)"
+        )
+        # Same for the other explicit non-runtime spellings.
+        for excluded_spelling in ("helper", "legacy"):
+            plan_x = _mk_shared_attr_artifact(
+                producer_domain=excluded_spelling,
+            )
+            assert compute_shared_attribute_candidates(
+                plan_x,  # type: ignore[arg-type]
+            ) == [], f"{excluded_spelling!r} producer must also drop"
+
+    def test_unstamped_pickup_still_emits_candidate(self) -> None:
+        """R4 companion to the exclusion test: ``""`` (fresh-run
+        not-yet-classified) is NOT an exclusion. The candidate is still
+        emitted with the seed's ``producer_domain`` direction. Dropping
+        on ``""`` would reintroduce the slice-2 R1 P1-A bug (fresh-run
+        candidates vanishing because the prepass runs before the
+        classifier stamps domains back).
+        """
+        # ``""`` is the fresh-run unstamped state.
+        plan = _mk_shared_attr_artifact(producer_domain="")
+        candidates = compute_shared_attribute_candidates(
+            plan,  # type: ignore[arg-type]
+        )
+        assert len(candidates) == 1, (
+            "unstamped ('') Pickup must still emit — '' is fresh-run, "
+            "not an explicit exclusion (P1-A regression guard)"
+        )
+        # Direction still from the seed.
         assert candidates[0]["from_domain"] == "server"
-        # Still emitted, no silent drop.
         assert candidates[0]["from_script"] == "pickup_sid"
         assert (
             candidates[0]["resolution"]["event_name"] == "PickupItemEvent"
@@ -5762,6 +5778,36 @@ class TestPhase2bSlice2EnrichmentAndRelocation:
         assert enriched_candidates[0]["resolution"]["event_name"] == (
             "PickupItemEvent"
         )
+
+    def test_get_attribute_scan_matches_non_identifier_item_names(
+        self,
+    ) -> None:
+        """R4 (Codex P3, 2026-05-31): the ``has<itemName>`` consumer
+        scan must match readers built from non-identifier item names.
+        The Pickup rewrite emits ``GetAttribute("has" .. itemName)``, so
+        ``itemName = "Red Key"`` produces ``GetAttribute("hasRed Key")``
+        — a valid read that an identifier-only placeholder class
+        (``[A-Za-z_][A-Za-z0-9_]*``) silently missed, under-populating
+        ``bridge_member_scripts`` for those pickups.
+        """
+        from converter.scene_runtime_topology.edge_enrichment import (
+            _build_get_attribute_regex,
+        )
+
+        rx = _build_get_attribute_regex("has<itemName>")
+        # Non-identifier item names that real projects use.
+        for item in ("Red Key", "Key-A", "3rdGem", "Key.2"):
+            luau = f'local v = plr:GetAttribute("has{item}")'
+            assert rx.search(luau) is not None, (
+                f"scan must match reader for item {item!r}; the "
+                f"identifier-only class missed non-identifier names"
+            )
+        # Plain identifier names still match (no regression).
+        assert rx.search('plr:GetAttribute("hasKey")') is not None
+        # Single-quoted reads still match.
+        assert rx.search("plr:GetAttribute('hasKey')") is not None
+        # A non-``has`` attribute read must NOT match.
+        assert rx.search('plr:GetAttribute("gotKey")') is None
 
     def test_invariant_2b_accepts_both_listener_prefixes(self) -> None:
         """The candidate-`ref`-validity invariant in
