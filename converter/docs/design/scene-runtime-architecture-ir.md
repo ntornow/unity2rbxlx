@@ -382,6 +382,66 @@ What STAYS in `script_storage.py`:
   class check, etc.)
 - Name-hint loader detection (combined with topology's lifecycle_role hint)
 
+## Roblox-dead module handling (TODO #8)
+
+Some Unity modules are **Roblox-dead**: rendering / shader / camera-effect
+helpers (the SimpleFPS water cluster — `WaterBase`, `Displace`,
+`PlanarReflection`, `WaterTile`, `SpecularLighting`, `GerstnerDisplace`, …)
+whose transpiled body does nothing executable in Roblox. Left alone they were
+misrouted into `ServerStorage` by the caller-domain rule (their only callers are
+server-default leaf Scripts → `caller_domains == {"server"}`), shipping dead
+code in the wrong container. See the grounding facts + LOCKED DECISIONS in
+[`roblox-dead-module-routing-brief.md`](roblox-dead-module-routing-brief.md).
+
+**Detector (generic, no game-specific names) — `converter/roblox_dead_modules.py`.**
+Definition **D3 (both-agree) + HARD VETO**:
+- *Input prior (weak):* the fraction of the module's C# API references that
+  resolve to a REAL (non-stub) mapping in `API_CALL_MAP` ∪ `TYPE_MAP`
+  (`-- no equivalent` comment stubs AND absent entries both count as unmapped).
+  "Dominated by unmapped" (real coverage ≤ ~0.49) ⇒ dead-leaning. The surface
+  excludes `using`/`namespace` directives, the module's own class name, and
+  structural/lifecycle tokens, so a trivial empty MonoBehaviour abstains.
+- *Output confirmation (decisive):* the **post-coherence** Luau body is inert —
+  only class-table boilerplate / comments / `print` / empty lifecycle handlers /
+  `require`s, with no genuine Roblox effect. Uses the converter's own
+  deterministic stub markers as strong signals (structural, not regex-on-AI).
+- *Hard veto:* any single genuine Roblox effect (`Instance.new`, `.Parent =`, a
+  real property write, a RemoteEvent/BindableEvent fire, a DataStore/service
+  mutation, a genuinely-mapped call) ⇒ NOT dead, regardless of fraction. The
+  converter-injected `PrimaryPart`/`script.Parent` guard idiom is excluded.
+
+A module is dead iff input agrees AND output inert AND no veto.
+
+**Pass placement.** `pipeline._subphase_analyze_dead_modules` runs **between
+`_subphase_cohere_scripts` and `_classify_storage`** (the post-coherence Luau —
+the decisive output signal + the injected require edges — only exists there). It
+is eligible only for ModuleScripts whose transpile strategy is `ai`/`stub`
+(deterministic): a `rule_based`/`hybrid` fallback can emit an inert TODO-skeleton
+for a REAL gameplay module, so its inertness is not trusted. The verdict is a
+TRANSIENT `PipelineState.dead_modules` (never persisted; abstains entirely on a
+no-transpile resume, where the storage plan was already computed by the
+transpiling run — honoring the recompute-only rule below).
+
+**Routing consumer (B).** `classify_storage(dead_modules=…)` routes a dead
+ModuleScript to `ReplicatedStorage` regardless of caller-domain, in **both** the
+topology path (`_decide_script_container_from_topology`) and the legacy path
+(`_decide_script_container_legacy`, whose `"…server-side callers"` reason text is
+the cached symptom). The dead body is already an inert stub, so SceneRuntime
+applies no effect; RS keeps it reachable for any surviving requirer.
+
+**Prune consumer (A) — closure safety.**
+`pipeline._subphase_prune_dead_module_closures` DROPS a dead module from
+`rbx_place.scripts` (+ `_delete_pruned_script_from_disk`) **only when its entire
+require-closure is also dead** — no live (non-dead) module requires it. The
+closure is computed from the **FINAL EMITTED LUAU** injected-require edges
+(`RS:FindFirstChild(name) or SS:FindFirstChild(name)`), NOT `dependency_map`
+(which misses post-transpile injected requires). A dead-but-live-required module
+stays emitted and falls back to the B reroute (so no surviving `require()`
+becomes `require(nil)`, per the brief's GF8). Runtime-bearing generic-mode
+components are never pruned (would dangle a `SceneRuntimePlan` row) — they stay
+inert. Geometry is untouched (built in separate scene_converter branches), so
+pruning the scripts causes no visual regression.
+
 ## Persistence rule: save raw facts; always recompute conclusions
 
 This rule was adopted during the slice 6 review cycle (2026-05-29) after four
@@ -452,10 +512,11 @@ exist:
 
 1. **`infer_module_domains` misclassifies Roblox-dead Unity rendering
    helpers.** Unity-only render helpers (`WaterBase`, `PlanarReflection`,
-   `Displace`) currently classify as server-only. They have no Roblox runtime
-   equivalent and should be filtered. Investigate whether a dedicated
-   dead-code pruning pass is required, or whether the existing domain-signal
-   detector can be tightened. (Task #8.)
+   `Displace`) classified as server-only and got caller-domain-routed into
+   `ServerStorage`. **RESOLVED (Task #8):** the actual route was caller-domain
+   storage routing (not `infer_module_domains`); fixed with a generic
+   Roblox-dead detector + dual-path RS reroute + closure-safe prune pass. See
+   the "Roblox-dead module handling" section above + the brief. (Task #8.)
 2. **Transpiler dependency-analysis false positives.** Example: `Plane.cs` is
    getting an injected `require(GameManager)` despite no reference to
    GameManager in the C# source. The dependency analyzer is over-counting.
