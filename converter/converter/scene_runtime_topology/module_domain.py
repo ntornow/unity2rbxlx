@@ -106,6 +106,9 @@ from converter.scene_runtime_planner import (
 from converter.scene_runtime_topology.cross_domain_edges import (
     CrossDomainEdge,
 )
+from converter.scene_runtime_topology.shared_flag_channels import (
+    SharedFlagChannels,
+)
 from converter.storage_classifier import (
     REPLICATED_STORAGE,
     SERVER_SCRIPT_SERVICE,
@@ -594,44 +597,44 @@ class TopologyInputs(TypedDict):
     ``scene_runtime`` + the planner's ``dependency_map`` — NO
     ``parent_path`` reads.
 
-    Phase 2b slice 2 grows this dict with TWO NEW fields:
-    ``cross_domain_edges`` + ``cross_domain_edge_candidates``. The
-    structural producers from ``cross_domain_edges.py`` (component-ref
-    + shared-attribute) relocate from ``build_topology`` into
-    ``_maybe_run_topology_prepass`` so the post-transpile enrichment
-    pass that follows can run in the same scope as the prepass
-    (with ``state.transpilation_result``, ``domains``,
+    Phase 2b carries the cross-domain facts on this dict:
+    ``cross_domain_edges`` (Class 1, component-ref) +
+    ``shared_flag_channels`` (Class 2, dynamic shared-flag funnel). They
+    are produced in ``_maybe_run_topology_prepass`` so the post-transpile
+    reader scan / enrichment that backs them runs in the same scope as
+    the prepass (with ``state.transpilation_result``, ``domains``,
     ``script_id_by_name`` all in hand). ``build_topology`` becomes
-    pure-assembly: it reads these two fields off ``TopologyInputs``
-    and writes them straight into the artifact dict; the producers
-    are no longer called from inside the assembler.
+    pure-assembly: it reads these fields off ``TopologyInputs`` and
+    writes them straight into the artifact dict; the producers are no
+    longer called from inside the assembler.
 
-    The two new fields hold the slice 2-enriched rows:
-      - ``cross_domain_edges``: fully-resolved component-ref edges with
-        ``from_*`` AND ``to_*`` populated. ``bridge_member_scripts``
-        carries ``client_caller``, ``server_listener``,
-        ``anim_listener`` rows (slice 2 enrichment fills these).
-      - ``cross_domain_edge_candidates``: fan-out shared-attribute
-        candidates with empty ``to_*`` (one Pickup fans to N
-        consumers; slice 3's emitter broadcasts via ``FireAllClients``).
-        ``bridge_member_scripts`` carries ``client_caller``,
-        ``server_listener``, and zero-or-more ``consumer`` rows
-        (slice 2 Luau-scan discovers static readers; resume path
-        with no transpilation_result leaves consumers empty and
-        slice 3 falls back to broadcast).
+    **Phase 2b reframe (2026-06-01).** The empirical whole-plan review
+    split cross-domain authority into two bridge classes. The slices-1-2
+    ``cross_domain_edge_candidates`` bucket (the
+    ``compute_shared_attribute_candidates`` fan-out) mis-modeled the
+    dynamic shared-flag class AS the static component-ref class and was
+    RETIRED. It is replaced by ``shared_flag_channels`` — the channel
+    fact (read-name set + reader domains + canonical store + present
+    gate). See ``shared_flag_channels.py``.
 
-    Slice 6 plumbs this through ``classify_storage`` as a
-    no-op-on-default kwarg; slice 7 flips ``_decide_script_container``
-    to consume it. Threaded through ``classify_storage`` as a kwarg;
+    The fields hold:
+      - ``cross_domain_edges``: fully-resolved component-ref (Class 1)
+        edges with ``from_*`` AND ``to_*`` populated.
+        ``bridge_member_scripts`` carries caller / listener /
+        ``anim_listener`` rows (``edge_enrichment`` fills these).
+      - ``shared_flag_channels``: the ``PlayerSetSharedFlag`` channel
+        record (Class 2). Recomputed from the live reader scan every run.
+
+    Threaded through ``classify_storage`` as a no-op-on-default kwarg;
     NOT persisted (slice 6 rule: save raw facts, never persist derived
     conclusions). Always recomputed from current operator inputs via
     ``Pipeline._maybe_run_topology_prepass`` on every invocation,
     including ``--phase=write_output`` resumes (the prepass is in
-    ``ESSENTIAL_PHASES``). The Phase 2b slice 2 edge fields are also
-    NOT persisted -- they're recomputed from
-    ``scene_runtime`` + the producer functions + the live
-    ``transpilation_result`` on every run, per the slice-6 "save raw
-    facts, recompute conclusions" rule.
+    ``ESSENTIAL_PHASES``). The Phase 2b cross-domain fields are likewise
+    recomputed every run from ``scene_runtime`` + the producer functions
+    + the live ``transpilation_result``, per the slice-6 "save raw facts,
+    recompute conclusions" rule (the ``caller_graph``-style recompute
+    pattern; there is no preserve path for them).
     """
 
     # ``script_id`` -> domain verdict from ``infer_module_domains``.
@@ -672,23 +675,24 @@ class TopologyInputs(TypedDict):
     # See ``scene-runtime-architecture-ir.md`` §"TopologyInputs shape
     # -- transpile_ran" and §"Unconstrained-helper fallback contract".
     transpile_ran: bool
-    # Phase 2b slice 2: produced + enriched by
+    # Phase 2b (Class 1): produced + enriched by
     # ``Pipeline._maybe_run_topology_prepass``. Fully-resolved
     # component-ref cross-domain edges (one row per peer-MonoBehaviour
     # serialized reference whose endpoints sit in different runtime
     # domains). ``build_topology`` reads from here and writes straight
     # into the artifact -- it no longer calls the producer itself.
-    # ``bridge_member_scripts`` populated by slice 2 enrichment.
+    # ``bridge_member_scripts`` populated by ``edge_enrichment``.
     cross_domain_edges: list[CrossDomainEdge]
-    # Phase 2b slice 2: produced + enriched by
-    # ``Pipeline._maybe_run_topology_prepass``. Fan-out shared-attribute
-    # candidates (one row per producer instance whose component class
-    # matches a ``SHARED_ATTRIBUTE_SEEDS`` row). ``to_*`` empty by
-    # design -- one producer fans out to N consumers. Slice 2 enrichment
-    # populates ``bridge_member_scripts`` with ``client_caller`` +
-    # synthesized ``server_listener`` + zero-or-more ``consumer`` rows
-    # (Luau-scan over post-transpile ``:GetAttribute("has...")`` reads).
-    cross_domain_edge_candidates: list[CrossDomainEdge]
+    # Phase 2b (Class 2): the ``PlayerSetSharedFlag`` funnel channel
+    # fact, computed by ``compute_shared_flag_channels`` from the live
+    # reader scan. Records the literal flag names read cross-domain, the
+    # reader domains, the constant canonical store, and the ``present``
+    # gate. Recompute-only (``caller_graph``-style; no preserve path);
+    # fails open on a no-transpile resume (``present: True`` with empty
+    # ``read_names``). Replaces the retired
+    # ``cross_domain_edge_candidates`` bucket. See
+    # ``shared_flag_channels.py``.
+    shared_flag_channels: SharedFlagChannels
 
 
 def infer_module_domains(

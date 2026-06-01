@@ -17,7 +17,6 @@
     }
   },
   "caller_graph": {},
-  "cross_domain_edge_candidates": [],
   "cross_domain_edges": [],
   "modules": {
     "guid-animator-target": {
@@ -67,6 +66,17 @@
       "reachability_required_container": "",
       "script_class": "Script",
       "stem": "SpawnManager"
+    }
+  },
+  "shared_flag_channels": {
+    "PlayerSetSharedFlag": {
+      "canonical_stores": [
+        "Character",
+        "Player"
+      ],
+      "present": true,
+      "read_names": [],
+      "reader_domains": []
     }
   }
 }
