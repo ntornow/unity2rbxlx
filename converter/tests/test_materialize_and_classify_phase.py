@@ -74,6 +74,9 @@ def _parse_materialize_and_classify_call_sequence() -> list[str]:
             # Match the lifted subphases (all underscored) but drop
             # logging-only calls (no log calls in this method today).
             if name.startswith("_subphase_") or name == "_classify_storage":
+                # ``_runtime_bearing_module_names`` is a helper invoked from
+                # within ``_subphase_prune_dead_module_closures``, never from
+                # the phase orchestrator -- it won't appear at this level.
                 calls.append(name)
         break
     return calls
@@ -115,14 +118,17 @@ class TestSubphaseOrderInvariant:
     def test_constant_is_defined(self) -> None:
         assert hasattr(Pipeline, "MATERIALIZE_AND_CLASSIFY_ORDER")
         assert isinstance(Pipeline.MATERIALIZE_AND_CLASSIFY_ORDER, tuple)
-        assert len(Pipeline.MATERIALIZE_AND_CLASSIFY_ORDER) == 3, (
-            "Slice 8 lifts three subphases: emit, cohere, classify."
+        assert len(Pipeline.MATERIALIZE_AND_CLASSIFY_ORDER) == 5, (
+            "Slice 8 lifted emit, cohere, classify; TODO #8 inserted the "
+            "dead-module analysis + prune passes between cohere and classify."
         )
 
-    def test_constant_lists_the_three_lifted_subphases(self) -> None:
+    def test_constant_lists_the_lifted_subphases(self) -> None:
         assert Pipeline.MATERIALIZE_AND_CLASSIFY_ORDER == (
             "_subphase_emit_scripts_to_disk",
             "_subphase_cohere_scripts",
+            "_subphase_analyze_dead_modules",
+            "_subphase_prune_dead_module_closures",
             "_classify_storage",
         )
 
