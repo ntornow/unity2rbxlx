@@ -160,19 +160,26 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   and short-circuits their domain inference. Option (a) is the more
   general fix.
 
-- [ ] **P1 — Transpiler false-positive `require()` injection poisons
-  storage classification.** Phase 2a slice 7 audit, 2026-05-30. The
-  converter's transpile / coherence-pack stage injects
-  `require(GameManager)` into `Plane.luau` even though the original
-  `Plane.cs` Unity source has no reference to `GameManager`. This
-  pollutes the caller_graph the storage classifier consumes —
-  `GameManager` (a cursor / scene-management singleton that should be
-  client-side) routes to `ServerStorage` because the spurious require
-  makes it look server-required. The right fix is at the injection
-  site, not the classifier: constrain require-injection to symbols
-  actually referenced in the transpiled body. Add a guard pass that
-  walks injected requires and drops any whose target symbol does not
-  appear elsewhere in the script.
+- [x] **P1 — Transpiler false-positive `require()` injection poisons
+  storage classification.** Phase 2a slice 7 audit, 2026-05-30. FIXED
+  2026-06-01 (`fix/dead-require-from-runtime-lookup-generics`).
+  **Corrected root cause (the audit's framing was incomplete):** the
+  `Plane→GameManager` false edge is NOT a phantom — `Plane.cs` references
+  `GameManager` via `FindObjectOfType<GameManager>()` (a RUNTIME scene
+  lookup → `self.host.findObjectOfType("GameManager")`). The reference
+  extractor's generic-type-arg regex (`script_analyzer.py`
+  `<\s*([A-Z]\w+)`) captured that runtime-lookup type arg as a
+  `referenced_type` → `dependency_map["Plane"]=[GameManager]`. That single
+  fault poisoned BOTH consumers: the legacy require-injector AND the
+  GENERIC-mode topology `caller_graph` (built directly from
+  `dependency_map`; the prescribed injection-site guard would NOT have
+  fixed generic mode, where `inject_require_calls` doesn't even run).
+  **Fix (at the source, helps both modes):** exclude the type args of
+  runtime-lookup generics (`FindObjectOfType<T>` / `GetComponent<T>` /
+  `AddComponent<T>` / …) from `referenced_types` — they resolve at
+  runtime via the host, never as a module require. Genuine deps are still
+  captured via the new/field/param/base patterns. See
+  `_RUNTIME_LOOKUP_GENERIC_METHODS` in `script_analyzer.py`.
 
 ## Materials & meshes
 

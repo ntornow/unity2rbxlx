@@ -79,3 +79,61 @@ class TestAnalyzeScriptBaseless:
         # The Awake hook + MonoBehaviour base still routes to Script —
         # PR1 must not regress the legacy classifier.
         assert info.suggested_type == "Script"
+
+
+class TestReferencedTypesRuntimeLookupExclusion:
+    """``referenced_types`` must NOT count the type arg of a RUNTIME-LOOKUP
+    generic (``FindObjectOfType<T>`` / ``GetComponent<T>`` / …) as a
+    cross-script dependency — those resolve T at runtime via the host, not
+    as a module the script must ``require()``. Counting them poisons
+    ``dependency_map`` and misroutes the target in storage classification
+    (TODO.md "Transpiler false-positive require() injection").
+
+    Tests 1-2 FAIL against the pre-fix regex (which captured the arg);
+    tests 3-4 guard against over-tightening + losing genuine deps.
+    """
+
+    def _refs(self, tmp_path: Path, name: str, body: str) -> list[str]:
+        cs = tmp_path / f"{name}.cs"
+        cs.write_text(
+            f"using UnityEngine;\npublic class {name} : MonoBehaviour {{\n"
+            f"{body}\n}}\n",
+            encoding="utf-8",
+        )
+        return analyze_script(cs).referenced_types
+
+    def test_findobjectoftype_arg_is_not_a_dependency(self, tmp_path: Path):
+        # The Plane→GameManager false edge: a runtime scene lookup, not a
+        # require dependency.
+        refs = self._refs(
+            tmp_path, "Plane",
+            "  void Start() { var gm = FindObjectOfType<GameManager>(); }",
+        )
+        assert "GameManager" not in refs
+
+    def test_getcomponent_arg_is_not_a_dependency(self, tmp_path: Path):
+        refs = self._refs(
+            tmp_path, "Mover",
+            "  void Start() { var r = GetComponent<Rigidbody2DCustom>(); }",
+        )
+        assert "Rigidbody2DCustom" not in refs
+
+    def test_collection_generic_arg_still_captured(self, tmp_path: Path):
+        # Don't over-tighten: a collection generic IS a real type reference.
+        refs = self._refs(
+            tmp_path, "Inventory",
+            "  private System.Collections.Generic.List<ItemDef> items;",
+        )
+        assert "ItemDef" in refs
+
+    def test_type_required_elsewhere_still_captured(self, tmp_path: Path):
+        # Referenced BOTH via a runtime lookup AND a real ``new`` — the
+        # ``new`` path must still register it as a dependency.
+        refs = self._refs(
+            tmp_path, "Spawner",
+            "  void Start() {\n"
+            "    var gm = FindObjectOfType<GameManager>();\n"
+            "    var fresh = new GameManager();\n"
+            "  }",
+        )
+        assert "GameManager" in refs

@@ -36,6 +36,21 @@ _RE_SERIALIZED_FIELD = re.compile(
     r"\[SerializeField\]\s*(?:private\s+)?(\w+)\s+(\w+)",
 )
 
+# Generic methods whose type argument is resolved at RUNTIME by the host
+# (component / scene lookups), NOT a module the calling script must
+# ``require()``. The type arg of e.g. ``FindObjectOfType<GameManager>()`` is
+# NOT a cross-script require dependency — counting it poisons
+# ``dependency_map`` and misroutes the target in storage classification.
+# (If the type is genuinely required it appears via a field/``new``/param/
+# base reference, which the other extractor patterns capture.)
+_RUNTIME_LOOKUP_GENERIC_METHODS = frozenset({
+    "FindObjectOfType", "FindObjectsOfType",
+    "GetComponent", "GetComponents",
+    "GetComponentInChildren", "GetComponentsInChildren",
+    "GetComponentInParent", "GetComponentsInParent",
+    "TryGetComponent", "AddComponent",
+})
+
 CLIENT_APIS = frozenset({
     "Input.GetKey", "Input.GetKeyDown", "Input.GetKeyUp",
     "Input.GetMouseButton", "Input.GetMouseButtonDown",
@@ -112,9 +127,25 @@ def analyze_script(script_path: str | Path) -> ScriptInfo:
     # Constructor calls: new TypeName(
     for m2 in re.finditer(r'\bnew\s+([A-Z]\w+)\s*\(', source):
         _type_refs.add(m2.group(1))
-    # Generic type args: List<TypeName>, Dictionary<K, TypeName>
-    for m2 in re.finditer(r'<\s*([A-Z]\w+)', source):
-        _type_refs.add(m2.group(1))
+    # Generic type args: List<TypeName>, Dictionary<K, TypeName>.
+    # EXCLUDE the type arg of RUNTIME-LOOKUP generic calls
+    # (``FindObjectOfType<T>``, ``GetComponent<T>``, ``AddComponent<T>``,
+    # …): those resolve T at runtime via the host, NOT as a module the
+    # script must ``require()``. Counting them poisons ``dependency_map``
+    # (which feeds BOTH the legacy require-injector AND the topology
+    # caller_graph), e.g. ``Plane`` calling ``FindObjectOfType<GameManager>()``
+    # makes ``GameManager`` look required-by-a-server-script and misroutes
+    # it to ServerStorage. If T is genuinely require-worthy it's captured
+    # by the new/field/param/base patterns instead. See TODO.md
+    # "Transpiler false-positive require() injection".
+    # Capture the optional token immediately before ``<`` so we can tell a
+    # runtime-lookup method (``GetComponent<Foo>``) from a collection type
+    # (``List<Foo>``).
+    for m2 in re.finditer(r'(\w+)?\s*<\s*([A-Z]\w+)', source):
+        preceding = m2.group(1) or ""
+        if preceding in _RUNTIME_LOOKUP_GENERIC_METHODS:
+            continue
+        _type_refs.add(m2.group(2))
     # Method parameters: (TypeName param, ...)
     for m2 in re.finditer(r'[,(]\s*([A-Z]\w+)\s+\w+', source):
         _type_refs.add(m2.group(1))
