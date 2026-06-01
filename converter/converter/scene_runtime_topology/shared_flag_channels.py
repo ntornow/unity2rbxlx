@@ -69,6 +69,9 @@ import re
 from typing import TypedDict
 
 from converter.code_transpiler import TranspiledScript
+from converter.scene_runtime_topology.cross_domain_edges import (
+    NON_RUNTIME_DOMAINS,
+)
 
 # The single funnel RemoteEvent every dynamic shared-flag write rides
 # through (``code_transpiler.py`` ``mirrorFlag`` prompt +
@@ -88,11 +91,18 @@ CANONICAL_STORES: tuple[str, ...] = ("Character", "Player")
 # server-domain reader (the canonical Door-reads-hasKey case).
 _FUNNEL_WRITER_DOMAIN = "client"
 
-# Match a ``<target>:GetAttribute("name")`` literal read. Mirrors the
-# canonical scanner in ``shared_state_linter.py:31-34`` — identifier-safe
-# attribute names, no extra args. Reusable scan, not a new invention.
+# Match a ``<target>:GetAttribute("name")`` literal read. The attr
+# placeholder is a NON-QUOTE run (``[^"']+``), NOT identifier-only:
+# the pickup path builds shared-flag names from the raw ``itemName``
+# (``"has" .. itemName``), so legitimate flags include spaces, hyphens
+# and leading digits (``"hasRed Key"``, ``"hasKey-A"``, ``"has3rdGem"``).
+# An identifier-only class would miss those reads → empty ``read_names``
+# → the step-2 gate disables a needed funnel. This restores the slice-2
+# R4 broadening (Codex P3 there) that the fresh re-implementation lost.
+# Codex R1 P2-B, 2026-06-01. The closing quote is back-referenced to the
+# opening one so mismatched quote styles don't span across args.
 _GET_ATTR_RE = re.compile(
-    r":GetAttribute\(\s*['\"](?P<attr>[A-Za-z_][\w]*)['\"]\s*\)",
+    r""":GetAttribute\(\s*(?P<q>['"])(?P<attr>[^"']+?)(?P=q)\s*\)""",
 )
 
 
@@ -175,17 +185,38 @@ def compute_shared_flag_channels(
 
     read_names: set[str] = set()
     reader_domains: set[str] = set()
+    # Fail-open signal for Fix 3 (below): a reader that HAS a qualifying
+    # GetAttribute read but whose script_id can't be resolved. We can't
+    # attribute its domain, but a missing mapping must not become NEGATIVE
+    # evidence that disables the funnel.
+    fail_open_present = False
     for ts in transpiled_scripts:
         if ":GetAttribute(" not in ts.luau_source:
             continue
         reader_sid = _script_id_for_transpiled(ts, script_id_by_name)
         if not reader_sid:
+            # Codex R1 P3, 2026-06-01 — fail open on unmappable reader.
+            # ``build_script_id_by_name`` deliberately omits ambiguous
+            # names (class/stem collisions), so this is reachable on real
+            # projects. Silently dropping a script that HAS a qualifying
+            # read turns missing-mapping into negative evidence → if it's
+            # the only server-side reader, ``present`` would wrongly be
+            # False. Mirror the resume fail-open: keep the funnel. We do
+            # NOT add to ``read_names`` (no domain to attribute it to), so
+            # the name set stays unpolluted.
+            if _GET_ATTR_RE.search(ts.luau_source):
+                fail_open_present = True
             continue
         reader_domain = domains.get(reader_sid, "")
         # Cross-domain iff the reader's domain differs from the funnel's
-        # writer side. An empty / unknown reader domain is NOT
-        # cross-domain (we cannot prove it crosses the boundary).
-        if not reader_domain or reader_domain == _FUNNEL_WRITER_DOMAIN:
+        # writer side. A NON_RUNTIME reader domain (``""``/``"helper"``/
+        # ``"excluded"``/``"legacy"``) is never emitted at runtime, so it
+        # must NOT pollute ``read_names`` or set ``present`` — it cannot
+        # actually read the flag at runtime. Codex R1 P2-A, 2026-06-01.
+        # (``not reader_domain`` is subsumed since ``"" in
+        # NON_RUNTIME_DOMAINS``; behavior is equivalent.)
+        if (reader_domain in NON_RUNTIME_DOMAINS
+                or reader_domain == _FUNNEL_WRITER_DOMAIN):
             continue
         for match in _GET_ATTR_RE.finditer(ts.luau_source):
             read_names.add(match.group("attr"))
@@ -196,7 +227,9 @@ def compute_shared_flag_channels(
             read_names=sorted(read_names),
             reader_domains=sorted(reader_domains),
             canonical_stores=sorted(CANONICAL_STORES),
-            present=bool(read_names),
+            # ``present`` from mapped readers OR the fail-open signal for
+            # an unmappable-but-qualifying reader (Codex R1 P3).
+            present=bool(read_names) or fail_open_present,
         ),
     }
 

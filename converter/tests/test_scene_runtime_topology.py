@@ -5522,6 +5522,90 @@ class TestSharedFlagChannels:
         assert channel["read_names"] == []
         assert channel["reader_domains"] == []
 
+    def test_shared_flag_channels_excludes_non_runtime_reader(self) -> None:
+        """A reader whose domain is a NON_RUNTIME domain
+        (``"excluded"``/``"helper"``) is never emitted at runtime, so it
+        must NOT pollute ``read_names`` or set ``present``. If it is the
+        ONLY reader, ``present: False``. Codex R1 P2-A, 2026-06-01."""
+        for nonruntime in ("excluded", "helper"):
+            scripts = [
+                _mk_transpiled(
+                    "Dead.luau", 'local v = part:GetAttribute("hasKey")',
+                ),
+            ]
+            out = compute_shared_flag_channels(
+                transpiled_scripts=scripts,
+                script_id_by_name={"Dead": "dead_sid"},
+                domains={"dead_sid": nonruntime},
+            )
+            channel = out["PlayerSetSharedFlag"]
+            assert channel["present"] is False, nonruntime
+            assert channel["read_names"] == [], nonruntime
+            assert channel["reader_domains"] == [], nonruntime
+
+    def test_shared_flag_channels_matches_non_identifier_flag_names(
+        self,
+    ) -> None:
+        """Non-identifier shared-flag names (spaces, hyphens, leading
+        digit) ARE captured — the pickup path builds flags from the raw
+        ``itemName`` (``"has" .. itemName``). Regression guard for the
+        slice-2 R4 broadening. Codex R1 P2-B, 2026-06-01."""
+        scripts = [
+            _mk_transpiled(
+                "Door.luau",
+                'local a = part:GetAttribute("hasRed Key")\n'
+                'local b = part:GetAttribute("hasKey-A")\n'
+                'local c = part:GetAttribute("has3rdGem")',
+            ),
+        ]
+        out = compute_shared_flag_channels(
+            transpiled_scripts=scripts,
+            script_id_by_name={"Door": "door_sid"},
+            domains={"door_sid": "server"},
+        )
+        channel = out["PlayerSetSharedFlag"]
+        assert channel["present"] is True
+        assert "hasRed Key" in channel["read_names"]
+        assert "hasKey-A" in channel["read_names"]
+        assert "has3rdGem" in channel["read_names"]
+
+    def test_shared_flag_channels_fail_open_on_unmappable_reader(
+        self,
+    ) -> None:
+        """An unmappable reader (name absent from ``script_id_by_name``,
+        e.g. dropped by ``build_script_id_by_name`` on a class/stem
+        collision) that HAS a qualifying ``GetAttribute`` read must NOT
+        become negative evidence. As the only reader it FAILS OPEN:
+        ``present: True``; ``read_names`` stays empty (unattributable).
+        A scene with NO GetAttribute reads still yields ``present: False``
+        on a fresh run, so fail-open is specific to the
+        unmappable-but-has-read case. Codex R1 P3, 2026-06-01."""
+        # Unmappable reader with a qualifying read -> fail open.
+        scripts = [
+            _mk_transpiled(
+                "Ambiguous.luau", 'local v = part:GetAttribute("hasKey")',
+            ),
+        ]
+        out = compute_shared_flag_channels(
+            transpiled_scripts=scripts,
+            script_id_by_name={},  # name not present -> unmappable
+            domains={},
+        )
+        channel = out["PlayerSetSharedFlag"]
+        assert channel["present"] is True
+        assert channel["read_names"] == []
+
+        # Fresh run, no GetAttribute reads anywhere -> stays False
+        # (fail-open is NOT blanket).
+        no_reads = compute_shared_flag_channels(
+            transpiled_scripts=[
+                _mk_transpiled("Plain.luau", "local v = 1 + 2"),
+            ],
+            script_id_by_name={"Plain": "plain_sid"},
+            domains={"plain_sid": "server"},
+        )
+        assert no_reads["PlayerSetSharedFlag"]["present"] is False
+
     def test_shared_flag_channels_resume_fail_open(self) -> None:
         """On a no-transpile resume (``transpiled_scripts is None``) the
         scan source is absent. The fact FAILS OPEN: ``present: True``
