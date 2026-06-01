@@ -8,6 +8,35 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
 
 ## Pipeline / runtime gaps
 
+- [ ] **P1 — Shared-flag name sanitization is unowned (pre-existing; surfaced by Phase 2b reframe, 2026-06-01).**
+  The generator builds the shared-flag attribute name as `"has" .. itemName`
+  with NO sanitization (`code_transpiler` `_GENERIC_RUNTIME_PROMPT`,
+  `script_coherence_packs`, and `scene_converter._apply_gameplay_attributes`
+  derives `itemName`/`ItemType` from the raw prefab name). But the
+  `PlayerSetSharedFlag` funnel listener rejects `^[%w_]+$` violations
+  (`autogen.py`), AND Roblox `SetAttribute` itself rejects names with
+  spaces/hyphens. So an `itemName` like `"Red Key"` produces `hasRed Key`,
+  which (a) errors on the client `SetAttribute`, (b) is dropped by the
+  funnel, (c) is read as nil by the server. Fix: a CANONICAL sanitizer
+  applied at the source so writer + reader + funnel + Roblox all agree on a
+  `[%w_]` name; then the `shared_flag_channels` scan's `\w+` charset is
+  correct by construction. Until then `shared_flag_channels` deliberately
+  scans `\w+` (matches the runtime allowlist) — non-conforming flags are
+  recorded nowhere because the bridge can't deliver them regardless.
+  Touches `code_transpiler` / `scene_converter` / packs — its own slice,
+  NOT topology work.
+
+- [ ] **P2 — Topology prepass reads pre-coherence `script_type` (pre-existing; surfaced 2026-06-01).**
+  `_maybe_run_topology_prepass` scans `state.transpilation_result.scripts`,
+  whose `script_type` is PRE-coherence. `script_coherence._fix_client_server_classification`
+  can later flip LocalScript→Script (server-only APIs). Any topology
+  consumer that branches on a reader's client/server-ness from the
+  pre-coherence type can be wrong (e.g. `shared_flag_channels` intentionally
+  does NOT suppress fail-open on `script_type` for this reason). Fix: an
+  authoritative post-coherence domain signal available to the prepass, OR
+  move the relevant decision post-coherence. Decide when a consumer
+  genuinely needs authoritative per-reader domain.
+
 - [ ] **P1 — Door pack widening (PR #121 `371ab76`) has 1 fixture covering 1 of 3 emit shapes.** Claude review, 2026-05-21.
   `_detect_door_module_player_lookup` + `_fix_door_module_player_lookup` were
   widened to match three AI-emitted shapes: `playerHasKey(playerInstance)`,

@@ -12,7 +12,13 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Iterable, Mapping
+from typing import TYPE_CHECKING
 from typing import Any, cast
+
+if TYPE_CHECKING:
+    from converter.scene_runtime_topology.shared_flag_channels import (
+        SharedFlagChannels,
+    )
 
 import config as _config
 from config import (
@@ -139,6 +145,24 @@ class PipelineState:
     # Output of converter/semantic_validators.run_semantic_validators
     # — surfaced via conversion_report.json under ``semantic_warnings``.
     semantic_report: object | None = None
+    # Phase 2b reframe step 2 (R2): TRANSIENT stash of the Class-2
+    # shared-flag channel fact for the ``PlayerSetSharedFlag`` funnel
+    # gate. Set fresh by ``_maybe_run_topology_prepass`` every run at the
+    # point ``compute_shared_flag_channels`` produces it (including the
+    # no-transpile resume fail-open path, where it records ``present:
+    # True``). This is the ONLY ctx/state surface the step-2 gate
+    # (``_shared_flag_funnel_present``) reads — it is NEVER fed into
+    # ``_merge_scene_runtime`` and NEVER persisted, so it cannot re-stale
+    # a recompute-only derived fact (the "save raw facts, recompute
+    # conclusions" rule). The persisted copy in
+    # ``conversion_plan.json`` under ``scene_runtime.topology
+    # .shared_flag_channels`` stays for Phase 3 to read from the plan;
+    # this in-memory stash exists ONLY because the late merged-local
+    # ``scene_runtime`` dict (which carries ``topology``) is never
+    # written back to ``ctx.scene_runtime``, so the gate cannot reach it
+    # off ctx. ``None`` until the prepass runs → gate defaults to
+    # fail-safe ``True`` (legacy mode never computes it, keep the funnel).
+    shared_flag_channels: "SharedFlagChannels | None" = None
 
 
 class Pipeline:
@@ -3037,6 +3061,58 @@ return table.concat(allData, "\\n")'''
                 stamped,
             )
 
+    def _shared_flag_funnel_present(self) -> bool:
+        """Read the ``PlayerSetSharedFlag`` gate from the topology fact.
+
+        Phase 2b reframe step 2 (R2): the topology prepass
+        (``_maybe_run_topology_prepass``, run inside
+        ``materialize_and_classify`` BEFORE ``write_output``) computes the
+        Class-2 shared-flag channel fact via
+        ``compute_shared_flag_channels`` and stashes it on the TRANSIENT
+        run-scoped field ``self.state.shared_flag_channels``. The
+        ``present`` flag is ``True`` iff a cross-domain server reader of a
+        shared flag exists on a fresh transpile (and ``True`` as the
+        resume / unmappable-reader fail-open).
+
+        R2 NO-OP FIX: this previously read
+        ``ctx.scene_runtime["topology"]["shared_flag_channels"]``, but
+        ``ctx.scene_runtime`` is the planner's PRE-topology structural
+        dict — the ``topology`` block is built only on the MERGED LOCAL
+        dict inside ``_classify_storage`` (``_merge_scene_runtime``
+        returns a fresh copy) and is never written back to
+        ``ctx.scene_runtime``, persisted to ``conversion_plan.json``
+        instead. So in real conversions the old lookup always missed →
+        fail-open default → the funnel stayed unconditional (the gate was
+        a production no-op). The transient stash is the run-scoped surface
+        that actually carries the fact into ``write_output``. The persisted
+        ``topology["shared_flag_channels"]`` copy stays for Phase 3 to read
+        from the plan; it is intentionally NOT the gate's read site, to
+        avoid writing the merged dict back to ``ctx.scene_runtime`` (which
+        would re-stale a recompute-only fact through
+        ``_merge_scene_runtime``).
+
+        FAIL-SAFE DEFAULT ``True``: when the stash is unset (legacy mode,
+        which never runs the prepass; or any code path that reaches
+        ``write_output`` without ``_classify_storage``) keep the funnel —
+        that is exactly today's unconditional behavior, strictly no worse.
+        The gate only NARROWS the funnel when the stashed fact
+        authoritatively says ``present: False``.
+
+        Strict typing: reads the typed ``SharedFlagChannels`` stash. No
+        ``Any``.
+        """
+        from converter.scene_runtime_topology.shared_flag_channels import (
+            FUNNEL_EVENT_NAME,
+        )
+
+        channels = self.state.shared_flag_channels
+        if channels is None:
+            return True
+        channel = channels.get(FUNNEL_EVENT_NAME)
+        if channel is None:
+            return True
+        return channel["present"]
+
     def _subphase_inject_autogen_scripts(self) -> None:
         """Synthesize project-bootstrap scripts: collision-group setup,
         GameServerManager spawn handling, ClientBootstrap that requires
@@ -3102,8 +3178,21 @@ return table.concat(allData, "\\n")'''
         from converter.autogen import generate_game_server_script
         existing_server_mgr = [s for s in self.state.rbx_place.scripts if s.name == "GameServerManager"]
         if not existing_server_mgr:
-            self.state.rbx_place.scripts.append(generate_game_server_script())
-            log.info("[write_output] Injected GameServerManager script")
+            # Phase 2b slice 3: gate the PlayerSetSharedFlag funnel on the
+            # shared_flag_channels topology fact (fail-safe True when the
+            # fact is absent). The rest of GameServerManager is always
+            # injected.
+            include_funnel = self._shared_flag_funnel_present()
+            self.state.rbx_place.scripts.append(
+                generate_game_server_script(
+                    include_shared_flag_funnel=include_funnel,
+                )
+            )
+            log.info(
+                "[write_output] Injected GameServerManager script "
+                "(shared-flag funnel %s)",
+                "included" if include_funnel else "omitted",
+            )
 
         # Auto-generate CollisionFidelityRecook server script when ANY
         # MeshPart in the scene has a non-Default ``collision_fidelity``.
@@ -4190,6 +4279,17 @@ script.Disabled = true
 
         Safe to call multiple times — the classifier is idempotent.
         """
+        # Phase 2b reframe step 2 R3 (Codex P3, 2026-06-01): reset the
+        # shared-flag stash at the START of every classification attempt —
+        # BEFORE the no-scripts early-return below — so the funnel-gate
+        # decision is SCENE-LOCAL. Otherwise a multi-scene driver reusing
+        # this Pipeline state could leak a prior scene's ``present=False``
+        # verdict into a later scene that skips classification (no user
+        # scripts) → ``write_output`` would omit the funnel instead of
+        # taking the documented fail-open path. Clearing here means a
+        # skipped/early-returned classify leaves the stash ``None`` → the
+        # gate reads fail-open ``True`` (keep the funnel).
+        self.state.shared_flag_channels = None
         if self.state.rbx_place is None or not self.state.rbx_place.scripts:
             return
 
@@ -4466,10 +4566,12 @@ script.Disabled = true
         )
         from converter.scene_runtime_topology.cross_domain_edges import (
             compute_cross_domain_edges,
-            compute_shared_attribute_candidates,
         )
         from converter.scene_runtime_topology.edge_enrichment import (
             enrich_cross_domain_edges,
+        )
+        from converter.scene_runtime_topology.shared_flag_channels import (
+            compute_shared_flag_channels,
         )
         from converter.scene_runtime_topology.lifecycle_roles import (
             derive_module_lifecycle_role,
@@ -4612,65 +4714,75 @@ script.Disabled = true
             )
             lifecycle_roles[sid] = role
 
-        # Phase 2b slice 2: structural producers + enrichment relocated
-        # from ``build_topology`` into the prepass so they share scope
-        # with ``transpilation_result`` + ``script_id_by_name``. The
-        # producers themselves are pure over ``scene_runtime`` -- they
-        # ran fine inside ``build_topology`` in slice 1; what
-        # specifically required the relocation is the ENRICHMENT pass,
-        # which Luau-scans ``transpilation_result.scripts`` to discover
-        # static consumers of shared-attribute candidates. That signal
-        # only exists at the prepass boundary (slice 6's
-        # ``transpile_ran`` already encodes it). ``build_topology`` is
-        # now pure-assembly: it reads ``cross_domain_edges`` +
-        # ``cross_domain_edge_candidates`` off ``TopologyInputs``
-        # rather than calling the producers itself.
+        # Phase 2b: cross-domain facts produced here so they share scope
+        # with ``transpilation_result`` + ``script_id_by_name`` + the
+        # inferred ``domains``. Two classes (design doc §"Phase 2b"):
+        #   - Class 1 (component-ref): ``compute_cross_domain_edges`` +
+        #     ``edge_enrichment`` (pure over ``scene_runtime``).
+        #   - Class 2 (dynamic shared-flag): ``compute_shared_flag_channels``
+        #     scans the live ``transpilation_result`` for cross-domain
+        #     ``:GetAttribute("...")`` reads.
+        # ``build_topology`` is pure-assembly: it reads
+        # ``cross_domain_edges`` + ``shared_flag_channels`` off
+        # ``TopologyInputs`` rather than calling the producers itself.
+        #
+        # Reframe (2026-06-01): the slices-1-2
+        # ``compute_shared_attribute_candidates`` fan-out producer was
+        # RETIRED (it mis-modeled Class 2 as Class 1); the
+        # ``shared_flag_channels`` fact replaces it.
         scene_runtime_typed = cast(
             "SceneRuntimeArtifact", scene_runtime,
         )
         # P1-A fix (Phase 2b slice 2 R1, 2026-05-31): the prepass runs
         # BEFORE ``classify_scene_runtime_domains()`` stamps
         # ``modules[*].domain`` back onto ``scene_runtime``. The
-        # producers internally read ``modules.get(sid, {}).get("domain", "")``,
+        # producer internally reads ``modules.get(sid, {}).get("domain", "")``,
         # so on a fresh run every domain reads as ``""`` and the
         # ``NON_RUNTIME_DOMAINS`` filter drops every edge. Pass the
         # locally-computed ``domains`` dict (populated above from
-        # ``infer_module_domains``) as the override so the producers
-        # see the inferred values. Slice 1 worked because it ran late
-        # in ``build_topology`` after the classifier had stamped; the
-        # relocation broke that timing, and the override restores it
-        # without requiring the classifier to run earlier in the
-        # pipeline.
+        # ``infer_module_domains``) as the override so the producer sees
+        # the inferred values.
         component_ref_edges = compute_cross_domain_edges(
             scene_runtime_typed,
             domains_override=domains,
         )
-        # R4 (Codex P2, 2026-05-31): pass ``domains_override`` so the
-        # candidate producer can DROP seeds on explicitly-excluded
-        # producers (helper/excluded/legacy). The bridge DIRECTION still
-        # comes from the seed's ``producer_domain`` (R3); the override is
-        # consulted only for the exclusion gate, and ``""`` (fresh-run
-        # unstamped) is NOT treated as an exclusion. See
-        # compute_shared_attribute_candidates.
-        shared_attribute_candidates = compute_shared_attribute_candidates(
-            scene_runtime_typed,
-            domains_override=domains,
+        enriched_edges = enrich_cross_domain_edges(
+            edges=component_ref_edges,
         )
-        # Resume case (state.transpilation_result is None): pass None
-        # to the enricher; consumer rows stay empty (slice 3 falls back
-        # to broadcast). Fresh case: scan the post-transpile Luau
-        # source for :GetAttribute reads that match a seed template.
+        # Class 2 — shared-flag channel fact. Resume case
+        # (state.transpilation_result is None): the reader scan source is
+        # absent, so ``compute_shared_flag_channels`` FAILS OPEN
+        # (``present: True`` with empty ``read_names``) — the step-2 gate
+        # keeps the funnel rather than disabling it on missing evidence.
+        # Fresh case: scan post-transpile Luau for cross-domain
+        # ``:GetAttribute("...")`` reads.
         transpiled_scripts_for_scan = (
             self.state.transpilation_result.scripts
             if self.state.transpilation_result is not None
             else None
         )
-        enriched_edges, enriched_candidates = enrich_cross_domain_edges(
-            edges=component_ref_edges,
-            candidates=shared_attribute_candidates,
+        shared_flag_channels = compute_shared_flag_channels(
             transpiled_scripts=transpiled_scripts_for_scan,
             script_id_by_name=script_id_by_name,
+            domains=domains,
         )
+        # Phase 2b reframe step 2 (R2): stash the fact on the TRANSIENT
+        # run-scoped ``state`` so the step-2 funnel gate
+        # (``_shared_flag_funnel_present``, read in ``write_output``) can
+        # reach it. The gate previously read
+        # ``ctx.scene_runtime["topology"]["shared_flag_channels"]``, but
+        # ``ctx.scene_runtime`` is the planner's PRE-topology dict — the
+        # ``topology`` block is built only on the MERGED LOCAL dict
+        # (``_merge_scene_runtime`` returns a fresh copy) and is never
+        # written back to ctx, so that read always missed → fail-open →
+        # the gate was a production NO-OP. ``state`` is rebuilt fresh
+        # every run (incl. resume, where this code re-runs and stashes the
+        # fail-open ``present: True``), is never persisted, and is never
+        # fed into ``_merge_scene_runtime``, so this does not re-stale the
+        # recompute-only fact. The persisted copy in
+        # ``scene_runtime.topology`` stays for Phase 3 to read from the
+        # plan.
+        self.state.shared_flag_channels = shared_flag_channels
 
         return TopologyInputs(
             domains=domains,
@@ -4699,14 +4811,16 @@ script.Disabled = true
             # so the wiring is load-bearing for storage routing even
             # though it is not consumed by the topology artifact read.
             transpile_ran=self.state.transpilation_result is not None,
-            # Phase 2b slice 2: edges + candidates carried on
-            # ``TopologyInputs`` so ``build_topology`` is pure-assembly.
-            # The producers ran above; enrichment populated
-            # ``bridge_member_scripts``. ``build_topology`` reads these
-            # off ``TopologyInputs`` and writes them straight into the
-            # artifact dict; it no longer calls the producers itself.
+            # Phase 2b: cross-domain facts carried on ``TopologyInputs``
+            # so ``build_topology`` is pure-assembly. The producer ran
+            # above; ``edge_enrichment`` populated ``bridge_member_scripts``
+            # on the component-ref edges; ``compute_shared_flag_channels``
+            # produced the Class-2 funnel channel fact (recompute-only,
+            # fail-open on resume). ``build_topology`` reads these off
+            # ``TopologyInputs`` and writes them straight into the
+            # artifact dict.
             cross_domain_edges=enriched_edges,
-            cross_domain_edge_candidates=enriched_candidates,
+            shared_flag_channels=shared_flag_channels,
         )
 
     def _build_and_apply_topology(
@@ -4877,11 +4991,11 @@ script.Disabled = true
         # the planner-row audit signal. See the slice-10 block comment
         # in ``build_topology._build_modules_block``.
         reachability_requirements: dict[str, str] | None = None
-        # Phase 2b slice 2: ``build_topology`` is pure-assembly for
-        # cross-domain edges; the prepass produces + enriches them,
-        # we forward them via these inputs.
+        # Phase 2b: ``build_topology`` is pure-assembly for the
+        # cross-domain facts; the prepass produces them, we forward them
+        # via these inputs.
         cross_domain_edges_input: "list[CrossDomainEdge] | None" = None
-        cross_domain_edge_candidates_input: "list[CrossDomainEdge] | None" = None
+        shared_flag_channels_input: "SharedFlagChannels | None" = None
         if topology_inputs is not None:
             scripts_by_name: dict[str, RbxScript] = {
                 s.name: s for s in self.state.rbx_place.scripts if s.name
@@ -4897,8 +5011,8 @@ script.Disabled = true
             cross_domain_edges_input = topology_inputs[
                 "cross_domain_edges"
             ]
-            cross_domain_edge_candidates_input = topology_inputs[
-                "cross_domain_edge_candidates"
+            shared_flag_channels_input = topology_inputs[
+                "shared_flag_channels"
             ]
 
         try:
@@ -4935,14 +5049,11 @@ script.Disabled = true
                 # topology entry's ``reachability_required_container``
                 # surface. See block comment above.
                 reachability_requirements=reachability_requirements,
-                # Phase 2b slice 2: pure-assembly handoff for the
-                # two edge buckets. The prepass produced + enriched
-                # them; build_topology writes them straight into the
-                # artifact dict.
+                # Phase 2b: pure-assembly handoff for the cross-domain
+                # facts. The prepass produced them; build_topology writes
+                # them straight into the artifact dict.
                 cross_domain_edges_input=cross_domain_edges_input,
-                cross_domain_edge_candidates_input=(
-                    cross_domain_edge_candidates_input
-                ),
+                shared_flag_channels_input=shared_flag_channels_input,
             )
         except Exception as exc:
             # Topology invariants are fail-closed by design, but

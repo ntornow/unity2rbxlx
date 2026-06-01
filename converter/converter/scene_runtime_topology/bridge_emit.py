@@ -78,21 +78,18 @@ def synthesize_listener_id(
         via ``OnClientEvent``.
 
     The id is stable across runs given the same ``(event_name,
-    direction)`` pair; slice 2's enrichment pass writes this value into
-    ``bridge_member_scripts[*].ref`` for the listener role, and slice
-    3's emitter uses the same helper when it allocates the synthesized
-    listener ``RbxScript`` -- so the artifact and the emitted script
-    agree by construction, not by parallel reinvention.
+    direction)`` pair; ``edge_enrichment`` writes this value into
+    ``bridge_member_scripts[*].ref`` for the listener role of a
+    component-ref edge, and a later emitter uses the same helper when it
+    allocates the synthesized listener ``RbxScript`` -- so the artifact
+    and the emitted script agree by construction, not by parallel
+    reinvention.
 
-    ``event_name`` is the locked ``PickupItemEvent`` literal for
-    shared-attribute candidates (see
-    ``cross_domain_edges.SHARED_ATTRIBUTE_SEEDS``) or the derived
-    ``<owner>_Set<Field>`` string for component-ref edges.
+    ``event_name`` is the derived ``<owner>_Set<Field>`` string for
+    component-ref edges.
 
-    Returns a string with the per-direction prefix so the
-    candidate-`ref`-validity invariant in
-    ``build_topology._enforce_invariants`` can recognize a synthesized
-    id without consulting the modules block.
+    Returns a string with the per-direction prefix so a consumer can
+    recognize a synthesized id without consulting the modules block.
     """
     if direction == "client_to_server":
         return f"{SYNTHESIZED_SERVER_LISTENER_ID_PREFIX}{event_name}"
