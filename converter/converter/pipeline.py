@@ -4464,6 +4464,13 @@ script.Disabled = true
         from converter.scene_runtime_topology.build_topology import (
             resolve_caller_graph,
         )
+        from converter.scene_runtime_topology.cross_domain_edges import (
+            compute_cross_domain_edges,
+            compute_shared_attribute_candidates,
+        )
+        from converter.scene_runtime_topology.edge_enrichment import (
+            enrich_cross_domain_edges,
+        )
         from converter.scene_runtime_topology.lifecycle_roles import (
             derive_module_lifecycle_role,
         )
@@ -4605,6 +4612,66 @@ script.Disabled = true
             )
             lifecycle_roles[sid] = role
 
+        # Phase 2b slice 2: structural producers + enrichment relocated
+        # from ``build_topology`` into the prepass so they share scope
+        # with ``transpilation_result`` + ``script_id_by_name``. The
+        # producers themselves are pure over ``scene_runtime`` -- they
+        # ran fine inside ``build_topology`` in slice 1; what
+        # specifically required the relocation is the ENRICHMENT pass,
+        # which Luau-scans ``transpilation_result.scripts`` to discover
+        # static consumers of shared-attribute candidates. That signal
+        # only exists at the prepass boundary (slice 6's
+        # ``transpile_ran`` already encodes it). ``build_topology`` is
+        # now pure-assembly: it reads ``cross_domain_edges`` +
+        # ``cross_domain_edge_candidates`` off ``TopologyInputs``
+        # rather than calling the producers itself.
+        scene_runtime_typed = cast(
+            "SceneRuntimeArtifact", scene_runtime,
+        )
+        # P1-A fix (Phase 2b slice 2 R1, 2026-05-31): the prepass runs
+        # BEFORE ``classify_scene_runtime_domains()`` stamps
+        # ``modules[*].domain`` back onto ``scene_runtime``. The
+        # producers internally read ``modules.get(sid, {}).get("domain", "")``,
+        # so on a fresh run every domain reads as ``""`` and the
+        # ``NON_RUNTIME_DOMAINS`` filter drops every edge. Pass the
+        # locally-computed ``domains`` dict (populated above from
+        # ``infer_module_domains``) as the override so the producers
+        # see the inferred values. Slice 1 worked because it ran late
+        # in ``build_topology`` after the classifier had stamped; the
+        # relocation broke that timing, and the override restores it
+        # without requiring the classifier to run earlier in the
+        # pipeline.
+        component_ref_edges = compute_cross_domain_edges(
+            scene_runtime_typed,
+            domains_override=domains,
+        )
+        # R4 (Codex P2, 2026-05-31): pass ``domains_override`` so the
+        # candidate producer can DROP seeds on explicitly-excluded
+        # producers (helper/excluded/legacy). The bridge DIRECTION still
+        # comes from the seed's ``producer_domain`` (R3); the override is
+        # consulted only for the exclusion gate, and ``""`` (fresh-run
+        # unstamped) is NOT treated as an exclusion. See
+        # compute_shared_attribute_candidates.
+        shared_attribute_candidates = compute_shared_attribute_candidates(
+            scene_runtime_typed,
+            domains_override=domains,
+        )
+        # Resume case (state.transpilation_result is None): pass None
+        # to the enricher; consumer rows stay empty (slice 3 falls back
+        # to broadcast). Fresh case: scan the post-transpile Luau
+        # source for :GetAttribute reads that match a seed template.
+        transpiled_scripts_for_scan = (
+            self.state.transpilation_result.scripts
+            if self.state.transpilation_result is not None
+            else None
+        )
+        enriched_edges, enriched_candidates = enrich_cross_domain_edges(
+            edges=component_ref_edges,
+            candidates=shared_attribute_candidates,
+            transpiled_scripts=transpiled_scripts_for_scan,
+            script_id_by_name=script_id_by_name,
+        )
+
         return TopologyInputs(
             domains=domains,
             reachability_requirements=reqs,
@@ -4632,6 +4699,14 @@ script.Disabled = true
             # so the wiring is load-bearing for storage routing even
             # though it is not consumed by the topology artifact read.
             transpile_ran=self.state.transpilation_result is not None,
+            # Phase 2b slice 2: edges + candidates carried on
+            # ``TopologyInputs`` so ``build_topology`` is pure-assembly.
+            # The producers ran above; enrichment populated
+            # ``bridge_member_scripts``. ``build_topology`` reads these
+            # off ``TopologyInputs`` and writes them straight into the
+            # artifact dict; it no longer calls the producers itself.
+            cross_domain_edges=enriched_edges,
+            cross_domain_edge_candidates=enriched_candidates,
         )
 
     def _build_and_apply_topology(
@@ -4802,6 +4877,11 @@ script.Disabled = true
         # the planner-row audit signal. See the slice-10 block comment
         # in ``build_topology._build_modules_block``.
         reachability_requirements: dict[str, str] | None = None
+        # Phase 2b slice 2: ``build_topology`` is pure-assembly for
+        # cross-domain edges; the prepass produces + enriches them,
+        # we forward them via these inputs.
+        cross_domain_edges_input: "list[CrossDomainEdge] | None" = None
+        cross_domain_edge_candidates_input: "list[CrossDomainEdge] | None" = None
         if topology_inputs is not None:
             scripts_by_name: dict[str, RbxScript] = {
                 s.name: s for s in self.state.rbx_place.scripts if s.name
@@ -4814,6 +4894,12 @@ script.Disabled = true
             reachability_requirements = (
                 topology_inputs["reachability_requirements"]
             )
+            cross_domain_edges_input = topology_inputs[
+                "cross_domain_edges"
+            ]
+            cross_domain_edge_candidates_input = topology_inputs[
+                "cross_domain_edge_candidates"
+            ]
 
         try:
             artifact = build_topology(
@@ -4849,6 +4935,14 @@ script.Disabled = true
                 # topology entry's ``reachability_required_container``
                 # surface. See block comment above.
                 reachability_requirements=reachability_requirements,
+                # Phase 2b slice 2: pure-assembly handoff for the
+                # two edge buckets. The prepass produced + enriched
+                # them; build_topology writes them straight into the
+                # artifact dict.
+                cross_domain_edges_input=cross_domain_edges_input,
+                cross_domain_edge_candidates_input=(
+                    cross_domain_edge_candidates_input
+                ),
             )
         except Exception as exc:
             # Topology invariants are fail-closed by design, but

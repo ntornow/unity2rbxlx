@@ -782,20 +782,50 @@ move) is structurally blocked.
 
 **Deliverables:**
 
-1. **Two-stage edge derivation.**
-   - **Structural candidate pass (pre-transpile).** Off `plan_scene_runtime`
-     (`pipeline.py:40-48`), enumerate edge candidates from (a) today's
-     `target_kind=="component"` peer-MonoBehaviour serialized references
-     in `scenes/prefabs.references`, AND (b) a new `shared_attribute`
-     candidate kind seeded from the hardcoded `PlayerSetSharedFlag`
-     allowlist at `code_transpiler.py:1267-1288` (lifted to a topology
-     input table — data, not code). Both kinds emit `kind:
-     "attribute_write"` in the artifact; the derivation source stays as
-     internal metadata.
-   - **Enrichment pass (post-transpile, inside `_maybe_run_topology_prepass`).**
-     Resolve `domains`, `bridge_member_scripts`, and `resolution.event_name`
-     for each candidate. The duplicate-`event_name` invariant lives
-     HERE, not in slice 1 — real names aren't known until enrichment.
+1. **Two-stage edge derivation, both stages inside `_maybe_run_topology_prepass`.**
+   - **Producers** (`compute_cross_domain_edges` +
+     `compute_shared_attribute_candidates`) enumerate edge candidates
+     from (a) `target_kind=="component"` peer-MonoBehaviour serialized
+     references in `scenes/prefabs.references`, AND (b) a new
+     `shared_attribute` candidate kind seeded from `SHARED_ATTRIBUTE_SEEDS`
+     (the structural pre-transpile equivalent of the hardcoded
+     `PlayerSetSharedFlag` allowlist at `code_transpiler.py:1267-1288`).
+     Both kinds emit `kind: "attribute_write"`. Slice 1 placed producers
+     inside `build_topology`; **slice 2 relocates them into
+     `_maybe_run_topology_prepass`** so enrichment runs in the same scope
+     with `TopologyInputs` available.
+   - **Enrichment** resolves `bridge_member_scripts` and finalizes
+     `resolution.event_name` for each candidate. The duplicate-`event_name`
+     invariant scans BOTH buckets HERE (component-ref edges in
+     `cross_domain_edges` + fan-out candidates in
+     `cross_domain_edge_candidates`) — names aren't known until enrichment
+     and a collision across buckets is just as bad as within. Lives in
+     `_maybe_run_topology_prepass` per the slice 2 Q2 call.
+   - **`TopologyInputs` grows two new fields** (slice 2): `cross_domain_edges:
+     list[CrossDomainEdge]` and `cross_domain_edge_candidates: list[CrossDomainEdge]`.
+     `build_topology` becomes pure-assembly, reading edges from
+     `TopologyInputs` instead of calling producers itself.
+   - **Two-bucket separation preserved** (slice 2 Q1 = B, unanimous):
+     `cross_domain_edges` holds fully-resolved single-consumer edges;
+     `cross_domain_edge_candidates` holds fan-out / multi-consumer edges
+     with empty `to_*` but populated `bridge_member_scripts`. Invariant
+     2 (`build_topology.py:1316-1330`) stays narrow on
+     `cross_domain_edges`; slice 2 adds a candidate-specific invariant
+     validating `bridge_member_scripts[*].ref` resolves to a real
+     script_id.
+   - **Consumer discovery for fan-out** (slice 2 Q3 = A): reuse the
+     existing post-transpile Luau-scan pattern from
+     `shared_state_linter.py:24,103`. Scan
+     `state.transpilation_result.scripts[*].luau_source` for
+     `:GetAttribute("has...")` patterns matching the seed table; the
+     matched script ids populate `bridge_member_scripts`. This is the
+     canonical existing mechanism for attribute-read discovery in this
+     codebase; reusing it avoids inventing new regex on AI output.
+   - **Synthesized server-listener id scheme committed in slice 2** so
+     slice 3's emitter honors the same shape: a helper
+     `bridge_emit.synthesize_listener_id(event_name) -> str` lives with
+     slice 2's enrichment and is RE-IMPORTED by slice 3's emitter. One
+     function, two callers; no silent mismatch.
 
 2. **Post-transpile, pre-pack bridge emitter.** New module
    `scene_runtime_topology/bridge_emit.py`. Runs in
@@ -849,7 +879,7 @@ move) is structurally blocked.
 | Slice | Scope | Rounds |
 |---|---|---|
 | 1 | Edge schema extension (`kind: "attribute_write"`, `resolution`, `bridge_member_scripts`) + pre-transpile structural candidate pass (both component-ref and shared_attribute candidates, latter seeded from `PlayerSetSharedFlag` data). No emit, no consumer. Persisted-bytes change only in `conversion_plan.json`. | 2 |
-| 2 | Post-transpile enrichment inside `_maybe_run_topology_prepass`. Resolve domains + `bridge_member_scripts` + final `event_name`s. Duplicate-`event_name` invariant lives here. No emit. | 2-3 |
+| 2 | **Producers RELOCATE from `build_topology` into `_maybe_run_topology_prepass`.** Enrichment runs there too. `TopologyInputs` grows `cross_domain_edges` + `cross_domain_edge_candidates`. `build_topology` becomes pure-assembly. Consumer discovery via `shared_state_linter` Luau-scan reuse. Duplicate-`event_name` invariant scans BOTH buckets. Candidate-specific invariant: `bridge_member_scripts[*].ref` resolves to a real script_id. P3 carry-forward from slice 1: unify producer iteration order; tighten `_derive_event_name_from_owner_field` on empty field. No emit. | 2-3 |
 | 3 | Consumer: `scene_runtime_topology/bridge_emit.py`. Idempotent. Gated on `self.state.transpilation_result is not None`. Delete `_GENERIC_RUNTIME_PROMPT` `PlayerSetSharedFlag` special case. | 3-4 |
 | 4 | Detangle Pickup walk-up `GetAttribute` compensation into a separate pack. Update the 6 `after=("pickup_remote_event_server",)` consumers to depend on the new `bridge_emit` ordering anchor. Document the canonical-form acceptance criterion (replaces byte-equivalence). | 2-3 |
 | 5 | Delete `_convert_pickup_to_remote_event` apply fn + helpers. Verify all 6 downstream packs work, specifically: `pickup_remote_event_client` regex detector still matches `"PickupItemEvent"`; `pickup_visual_target` template still produces a working pickup. Full e2e on SimpleFPS. | 3-4 |
@@ -1070,6 +1100,19 @@ while the topology work is multi-PR.
 
 ## Revision history
 
+- **2026-05-30** — Slice 2 design lock (post-slice-1, pre-slice-2-impl).
+  Parallel arch review (Claude design subagent + `codex exec`) on the
+  three slice 2 architectural questions returned: Q1 = B (unanimous,
+  keep buckets separate); Q2 = divergent (Codex A inside the existing
+  prepass, Claude C new helper) — user broke the tie on Codex A; Q3 = A
+  (reuse `shared_state_linter` post-transpile Luau-scan pattern,
+  unanimous). Doc updates: deliverable 1 expanded to spell out producer
+  RELOCATION from `build_topology` into `_maybe_run_topology_prepass`,
+  the `TopologyInputs` field growth, the BOTH-buckets duplicate-`event_name`
+  invariant, the candidate-specific invariant, the
+  `bridge_emit.synthesize_listener_id` shared helper. Slice 2 table row
+  updated to match. Reviews on disk at
+  `/tmp/topology/phase2b-slice2-{claude-arch,codex-raw.log,design-brief}.md`.
 - **2026-05-30** — Phase 2b section rewritten BEFORE slice 1 implementer
   runs (per `update-design-doc-before-implementation` memory rule). Two
   parallel architectural reviews (Claude design subagent + `codex exec`

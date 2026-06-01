@@ -126,6 +126,9 @@ from converter.scene_runtime_topology.animation_routing import (
     derive_observed_target,
     resolve_driver,
 )
+from converter.scene_runtime_topology.bridge_emit import (
+    SYNTHESIZED_LISTENER_ID_PREFIXES,
+)
 from converter.scene_runtime_topology.cross_domain_edges import (
     CrossDomainEdge,
     compute_cross_domain_edges,
@@ -398,6 +401,8 @@ def build_topology(
     preserved_caller_graph: dict[str, list[str]] | None = None,
     script_by_sid: dict[str, RbxScript] | None = None,
     reachability_requirements: dict[str, str] | None = None,
+    cross_domain_edges_input: list[CrossDomainEdge] | None = None,
+    cross_domain_edge_candidates_input: list[CrossDomainEdge] | None = None,
 ) -> TopologyArtifact:
     """Assemble the topology artifact + enforce 8 emit-time invariants.
 
@@ -506,29 +511,44 @@ def build_topology(
         script_by_sid=script_by_sid,
         reachability_requirements=reachability_requirements,
     )
-    # Phase 2b slice 1: two producers feed two SEPARATE artifact buckets.
-    # 1) component-ref edges (today's path; cross-domain peer-MonoBehaviour
-    #    serialized references) -> ``cross_domain_edges``. Fully resolved:
-    #    every row has runtime ``from_domain`` + ``to_domain`` and passes
-    #    invariant 2.
-    # 2) shared-attribute candidates (new; structurally seeded from
-    #    ``SHARED_ATTRIBUTE_SEEDS``, replaces the hardcoded
-    #    ``PlayerSetSharedFlag`` prompt block once slice 3 lands the
-    #    bridge emitter) -> ``cross_domain_edge_candidates``. Fan-out
-    #    shape: ``to_*`` empty until slice 2 enrichment resolves consumers.
+    # Phase 2b slice 2: ``build_topology`` is pure-assembly for the
+    # two edge buckets. The producers
+    # (``compute_cross_domain_edges`` + ``compute_shared_attribute_candidates``)
+    # MOVED into ``Pipeline._maybe_run_topology_prepass`` so they
+    # share scope with ``transpilation_result`` (used by the
+    # post-transpile enrichment pass) + ``script_id_by_name``. The
+    # enriched rows arrive here via ``cross_domain_edges_input`` /
+    # ``cross_domain_edge_candidates_input``.
     #
-    # R1 (codex P1, 2026-05-30): the two outputs were concatenated into
-    # ``cross_domain_edges`` in the initial slice-1 commit, which crashed
-    # invariant 2 on any real conversion containing a Pickup instance
-    # (``to_domain=""`` -> not in ``_VALID_RUNTIME_DOMAINS`` -> abort).
-    # Separating into two buckets resolves the conflict structurally:
-    # invariant 2 keeps its fully-resolved-only contract on the edges
-    # bucket; the candidates bucket carries unenriched rows for slice 2.
-    component_ref_edges = compute_cross_domain_edges(scene_runtime)
-    shared_attribute_candidates = compute_shared_attribute_candidates(
-        scene_runtime,
-    )
-    edges_block = component_ref_edges
+    # Slice 1's two-bucket separation (R1 codex P1, 2026-05-30) is
+    # preserved: ``cross_domain_edges`` carries fully-resolved
+    # component-ref edges; ``cross_domain_edge_candidates`` carries
+    # fan-out shared-attribute candidates with empty ``to_*``.
+    # Invariant 2 stays narrow on the edges bucket; slice 2's new
+    # candidate-`ref`-validity invariant runs on the candidates
+    # bucket.
+    #
+    # Back-compat path: when neither input is supplied (legacy callers
+    # that haven't migrated, e.g. unit-test fixtures invoking
+    # ``build_topology`` directly without the prepass), fall back to
+    # running the producers in-line as in slice 1. This preserves
+    # byte-equivalence for callers outside the
+    # ``_maybe_run_topology_prepass`` -> ``build_topology`` pipeline.
+    # NOTE: the back-compat path does NOT run enrichment -- direct
+    # ``build_topology`` callers without the prepass don't have
+    # ``transpilation_result`` to scan, so emitted rows carry empty
+    # ``bridge_member_scripts``. Slice 3's emitter is wired through
+    # the prepass path; the back-compat path is for tests + tools.
+    if cross_domain_edges_input is not None:
+        edges_block = cross_domain_edges_input
+    else:
+        edges_block = compute_cross_domain_edges(scene_runtime)
+    if cross_domain_edge_candidates_input is not None:
+        shared_attribute_candidates = cross_domain_edge_candidates_input
+    else:
+        shared_attribute_candidates = compute_shared_attribute_candidates(
+            scene_runtime,
+        )
     if preserved_animation_drivers is not None:
         # Resume path: caller supplied prior animation_drivers. Skip
         # the build_from_emissions step. Invariant 3 will be skipped
@@ -1276,6 +1296,10 @@ def _enforce_invariants(
     modules_block = artifact.get("modules", {})
     animation_drivers = artifact.get("animation_drivers", {})
     edges = artifact.get("cross_domain_edges", [])
+    # Phase 2b slice 2: candidates bucket carries fan-out
+    # shared-attribute rows. New slice 2 invariants iterate this
+    # bucket; existing invariants 2 + 5 stay narrow on ``edges``.
+    candidates = artifact.get("cross_domain_edge_candidates", [])
 
     # Invariant 1 + 6: applied ONLY to resolved entries. Unresolved /
     # orphan entries have empty ``driver_module_guid`` by design (Phase
@@ -1348,6 +1372,118 @@ def _enforce_invariants(
                 f"cross-domain edge has non-runtime domain "
                 f"(from={from_domain!r}, to={to_domain!r})",
                 row=edge,
+            )
+
+    # Invariant 2a (Phase 2b slice 2): no SEMANTIC collision on
+    # ``resolution.event_name`` across BOTH the edges + candidates
+    # buckets. A "semantic collision" is two edges sharing the same
+    # ``event_name`` but with DIFFERENT ``payload.attribute_name`` (or
+    # ``kind``) — i.e. two distinct cross-domain writes that would
+    # route through the same RemoteEvent at slice 3 emit time.
+    #
+    # R1 refinement (Phase 2b slice 2 R1 P1-B fix, 2026-05-31):
+    # pre-R1 the invariant aborted on ANY repeated ``event_name``.
+    # That broke intentional reuse — multiple Pickup candidates all
+    # carry the locked ``"PickupItemEvent"`` (Mitigation α), and
+    # multiple cross-domain ``Door.open`` component-ref edges all
+    # derive ``"Door_SetOpen"`` from ``<owner>_Set<Field>`` without
+    # an instance qualifier. Both are the SAME logical bridge
+    # instantiated multiple times, not a collision.
+    #
+    # The refined check groups rows by ``event_name`` and only fires
+    # when a group has heterogeneous ``payload.attribute_name`` (or
+    # ``kind``). Two rows sharing both ``event_name`` AND
+    # ``payload.attribute_name`` (and ``kind``) ARE the same logical
+    # bridge — no abort. Two rows sharing ``event_name`` but with
+    # different ``payload.attribute_name`` ARE a true name collision
+    # — fail-closed.
+    by_event_name: dict[str, list[dict[str, object]]] = {}
+    for row in list(edges) + list(candidates):
+        resolution = row.get("resolution", {})
+        if not isinstance(resolution, dict):
+            continue
+        ev = resolution.get("event_name", "")
+        if not isinstance(ev, str) or not ev:
+            continue
+        by_event_name.setdefault(ev, []).append(cast("dict[str, object]", row))
+    for ev, rows in by_event_name.items():
+        if len(rows) <= 1:
+            continue
+        # Defensive depth: every row in the group must share BOTH
+        # ``payload.attribute_name`` and ``kind``. A mismatch on
+        # either is a true semantic collision.
+        attr_names: set[str] = set()
+        kinds: set[str] = set()
+        for r in rows:
+            payload = r.get("payload", {})
+            if isinstance(payload, dict):
+                an = payload.get("attribute_name", "")
+                if isinstance(an, str):
+                    attr_names.add(an)
+            k = r.get("kind", "")
+            if isinstance(k, str):
+                kinds.add(k)
+        if len(attr_names) > 1 or len(kinds) > 1:
+            _abort(
+                2,
+                f"semantic collision on cross-domain event_name {ev!r}: "
+                f"two distinct cross-domain writes (different "
+                f"attribute_name={sorted(attr_names)!r} or "
+                f"kind={sorted(kinds)!r}) share event_name -- this "
+                f"is a name collision, not intentional reuse. Slice "
+                f"1's ``<owner>_Set<Field>`` derivation may have "
+                f"collided with the locked ``PickupItemEvent`` "
+                f"literal, or two distinct bridge semantics share an "
+                f"event_name by coincidence.",
+                row=rows[0],
+            )
+
+    # Invariant 2b (Phase 2b slice 2): every
+    # ``cross_domain_edge_candidates[*].bridge_member_scripts[*].ref``
+    # resolves to either a real script_id in the modules block OR a
+    # synthesized listener id (a string with one of the prefixes in
+    # ``bridge_emit.SYNTHESIZED_LISTENER_ID_PREFIXES`` slice 2's
+    # ``bridge_emit.synthesize_listener_id`` allocates). Slice 2 R2
+    # (2026-05-31): the helper now emits per-direction prefixes
+    # (``__bridge_listener_server__`` for client->server,
+    # ``__bridge_listener_client__`` for server->client) so this
+    # invariant accepts EITHER shape. Catches the Claude arch review
+    # risk #2 (silent slice 2 / slice 3 id drift) by ensuring a ref
+    # shape slice 3 will dereference at emit time is well-formed
+    # BEFORE slice 3 runs.
+    real_script_ids = set(modules_block.keys())
+    for cand in candidates:
+        members = cand.get("bridge_member_scripts", [])
+        if not isinstance(members, list):
+            continue
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+            ref = member.get("ref", "")
+            if not isinstance(ref, str) or not ref:
+                _abort(
+                    2,
+                    f"cross_domain_edge_candidates row has a "
+                    f"bridge_member_scripts entry with empty ref "
+                    f"(role={member.get('role', '')!r})",
+                    row=cand,
+                )
+            if ref in real_script_ids:
+                continue
+            if any(
+                ref.startswith(prefix)
+                for prefix in SYNTHESIZED_LISTENER_ID_PREFIXES
+            ):
+                continue
+            _abort(
+                2,
+                f"cross_domain_edge_candidates row has a "
+                f"bridge_member_scripts ref {ref!r} that is neither "
+                f"a real script_id in modules nor a synthesized "
+                f"listener id (one of prefixes "
+                f"{SYNTHESIZED_LISTENER_ID_PREFIXES!r}). "
+                f"Slice 3's emitter would dereference an invalid id.",
+                row=cand,
             )
 
     # Invariant 3: every emitted Anim_* script has exactly one

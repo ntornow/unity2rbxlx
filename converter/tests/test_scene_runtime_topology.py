@@ -1775,8 +1775,13 @@ class TestPhase2bSlice1ExtendedSchema:
         assert cand["to_instance"] == ""
         assert cand["to_script"] == ""
         assert cand["to_domain"] == ""
-        # Producer domain is captured when known.
-        assert cand["from_domain"] == "client"
+        # R3 (2026-05-31): ``from_domain`` comes from the seed's
+        # ``producer_domain`` (the runtime bridge contract), NOT from
+        # the module's classified/inferred domain. The Pickup seed is
+        # server-originated (the existing pack fires ``:FireClient``),
+        # so the candidate is ``"server"`` even though
+        # ``_mk_shared_attr_artifact`` stamps the module as ``"client"``.
+        assert cand["from_domain"] == "server"
         # Slice 2 fills this.
         assert cand["bridge_member_scripts"] == []
         # Attribute template — slice 3 resolves ``<itemName>``.
@@ -2113,32 +2118,114 @@ class TestPhase2bSlice1R1CandidateBucketWiring:
         assert len(artifact_edges["cross_domain_edges"]) == 1
         assert artifact_edges["cross_domain_edge_candidates"] == []
 
-    def test_excluded_domain_pickup_still_emits_candidate(self) -> None:
-        """Claude P2-1 pin. ``compute_shared_attribute_candidates`` does
-        NOT skip NON_RUNTIME ``from_domain`` producers — by design,
-        because the bucket separation now makes that safe (invariant 2
-        only iterates ``cross_domain_edges``, the fully-resolved bucket).
+    def test_explicitly_excluded_pickup_drops_candidate(self) -> None:
+        """R4 (Codex P2, 2026-05-31): a Pickup whose module is
+        EXPLICITLY classified non-runtime (``"excluded"`` / ``"helper"``
+        / ``"legacy"``) is a deliberate opt-out — the candidate is
+        DROPPED, not emitted. Emitting a live ``"server"`` candidate for
+        an excluded module would make the artifact self-contradictory
+        (``modules[sid].domain == "excluded"`` alongside a server
+        candidate).
 
-        A Pickup whose producer module is ``domain == "excluded"`` still
-        emits a candidate; slice 2 enrichment will downgrade
-        ``resolution.strategy`` to ``"excluded"`` rather than dropping it.
-        This is INTENTIONALLY asymmetric with
-        ``compute_cross_domain_edges`` which DOES filter NON_RUNTIME —
-        component-ref edges have no "downgrade" semantics so dropping
-        is the only safe move there, but candidates' fan-out shape
-        lets slice 2 record the exclusion explicitly.
+        This SUPERSEDES the R3 call (which let the seed override even
+        ``"excluded"``). The R3 worry — that ``""`` and ``"excluded"``
+        are indistinguishable — was resolved by recognizing they are
+        NOT: ``""`` is fresh-run "not yet classified" (keep), the others
+        are explicit opt-outs (drop). See
+        ``test_unstamped_pickup_still_emits_candidate`` for the ``""``
+        side.
         """
         plan = _mk_shared_attr_artifact(producer_domain="excluded")
+        # Direct call: ``_resolved_domain`` falls back to the on-row
+        # stamped ``"excluded"`` (no override needed to detect it).
         candidates = compute_shared_attribute_candidates(
             plan,  # type: ignore[arg-type]
         )
-        assert len(candidates) == 1
-        assert candidates[0]["from_domain"] == "excluded"
-        # Still emitted, no silent drop.
+        assert candidates == [], (
+            "an explicitly-excluded Pickup must not emit a live bridge "
+            "candidate (Codex R4 P2)"
+        )
+        # Same for the other explicit non-runtime spellings.
+        for excluded_spelling in ("helper", "legacy"):
+            plan_x = _mk_shared_attr_artifact(
+                producer_domain=excluded_spelling,
+            )
+            assert compute_shared_attribute_candidates(
+                plan_x,  # type: ignore[arg-type]
+            ) == [], f"{excluded_spelling!r} producer must also drop"
+
+    def test_unstamped_pickup_still_emits_candidate(self) -> None:
+        """R4 companion to the exclusion test: ``""`` (fresh-run
+        not-yet-classified) is NOT an exclusion. The candidate is still
+        emitted with the seed's ``producer_domain`` direction. Dropping
+        on ``""`` would reintroduce the slice-2 R1 P1-A bug (fresh-run
+        candidates vanishing because the prepass runs before the
+        classifier stamps domains back).
+        """
+        # ``""`` is the fresh-run unstamped state.
+        plan = _mk_shared_attr_artifact(producer_domain="")
+        candidates = compute_shared_attribute_candidates(
+            plan,  # type: ignore[arg-type]
+        )
+        assert len(candidates) == 1, (
+            "unstamped ('') Pickup must still emit — '' is fresh-run, "
+            "not an explicit exclusion (P1-A regression guard)"
+        )
+        # Direction still from the seed.
+        assert candidates[0]["from_domain"] == "server"
         assert candidates[0]["from_script"] == "pickup_sid"
         assert (
             candidates[0]["resolution"]["event_name"] == "PickupItemEvent"
         )
+
+    def test_pickup_seed_pins_producer_domain_to_server_against_inferred_client(
+        self,
+    ) -> None:
+        """R3 production-correctness regression guard. In production,
+        ``infer_module_domains`` (Rule 7) defaults a low-signal
+        ``Pickup.cs`` (plain MonoBehaviour, ``OnTriggerEnter``, no
+        Network APIs) to low-confidence ``"client"``. R2's
+        direction-aware enrichment was correct, but the SIGNAL feeding
+        it (the candidate's ``from_domain``) was production-wrong — it
+        followed the inferred ``"client"`` and inverted the bridge.
+
+        With the seed's ``producer_domain="server"``, the candidate is
+        ``"server"`` regardless of inference, so enrichment produces the
+        correct server->client roles matching the existing
+        ``pickup_remote_event_server`` pack contract
+        (``:FireClient`` at ``script_coherence_packs.py:380-394``).
+        """
+        from converter.scene_runtime_topology.edge_enrichment import (
+            enrich_cross_domain_edges,
+        )
+
+        # Realistic fresh-run shape: module stamped ``"client"`` (what
+        # Rule 7 inference would produce). The seed must override it.
+        plan = _mk_shared_attr_artifact(producer_domain="client")
+        candidates = compute_shared_attribute_candidates(
+            plan,  # type: ignore[arg-type]
+        )
+        assert len(candidates) == 1
+        assert candidates[0]["from_domain"] == "server", (
+            "seed producer_domain='server' must override the inferred "
+            "'client' so the bridge direction matches the pack contract"
+        )
+
+        # Enrichment must then produce server->client roles.
+        _edges, enriched = enrich_cross_domain_edges(
+            edges=[],
+            candidates=candidates,
+            transpiled_scripts=None,
+            script_id_by_name={},
+        )
+        roles = {m["role"] for m in enriched[0]["bridge_member_scripts"]}
+        assert "server_caller" in roles
+        listener_refs = [
+            m["ref"] for m in enriched[0]["bridge_member_scripts"]
+            if m["role"] == "client_listener"
+        ]
+        assert len(listener_refs) == 1
+        assert listener_refs[0].startswith("__bridge_listener_client__")
 
 
 # ===========================================================================
@@ -3917,6 +4004,8 @@ class TestSlice9aTopologyInputsPlumbing:
             script_id_by_name=script_id_by_name,
             caller_graph={},
             transpile_ran=True,
+            cross_domain_edges=[],
+            cross_domain_edge_candidates=[],
         )
 
     def test_plumbing_passes_topology_inputs_through_to_modules_block(
@@ -4775,6 +4864,8 @@ class TestSlice10R2NoTranspileResumeSemantics:
             script_id_by_name=script_id_by_name,
             caller_graph={},
             transpile_ran=False,
+            cross_domain_edges=[],
+            cross_domain_edge_candidates=[],
         )
 
     def test_resume_regenerates_required_container_to_empty_string_for_all_modules(
@@ -5030,3 +5121,1317 @@ class TestSlice10R2NoTranspileResumeSemantics:
         # NO shadow copies of upstream raw facts on the artifact entry.
         assert "reachability_requirements" not in entry
         assert "transpile_ran" not in entry
+
+
+class TestPhase2bSlice2EnrichmentAndRelocation:
+    """Phase 2b slice 2 — producers + enrichment relocate into
+    ``Pipeline._maybe_run_topology_prepass``; ``TopologyInputs`` grows
+    two new fields; ``build_topology`` becomes pure-assembly;
+    duplicate-event_name + bridge-member-ref invariants added; P3
+    carry-forward from slice 1 (sorted iteration + empty-field
+    rejection) lands.
+
+    Refs: design doc Phase 2b deliverable 1 (slice 2 section);
+    Claude arch review risks #1-3 (2026-05-30); slice 1 handoff P3.
+    """
+
+    @staticmethod
+    def _build_pipeline_with(
+        *,
+        scripts: list[RbxScript],
+        transpilation_result_scripts: "list | None" = None,
+    ):
+        """Synthesize a minimal Pipeline spy that reaches the
+        ``_maybe_run_topology_prepass`` body. Mirrors the pattern from
+        ``test_module_domain_prepass.py``'s ``TestSlice7Round2*``.
+
+        ``transpilation_result_scripts`` controls the Luau-scan branch
+        of slice 2 enrichment:
+          - ``None`` -> ``state.transpilation_result is None``
+            (resume case); consumer rows stay empty.
+          - non-None list -> ``state.transpilation_result`` is set
+            with the supplied scripts; the Luau-scan pass runs.
+        """
+        from unittest.mock import MagicMock
+        from converter.code_transpiler import TranspilationResult
+        from converter.pipeline import Pipeline
+
+        p = MagicMock(spec=Pipeline)
+        p.ctx = MagicMock()
+        p.ctx.scene_runtime_mode = "modern"
+        p.ctx.networking_mode = "none"
+        p.state = MagicMock()
+        if transpilation_result_scripts is None:
+            p.state.transpilation_result = None
+        else:
+            tr = TranspilationResult()
+            tr.scripts = transpilation_result_scripts
+            p.state.transpilation_result = tr
+        p.state.dependency_map = {}
+        p.state.guid_index = None
+        p.state.rbx_place = MagicMock()
+        p.state.rbx_place.scripts = scripts
+        return p
+
+    def test_topology_inputs_carries_edges(self) -> None:
+        """``_maybe_run_topology_prepass`` produces a ``TopologyInputs``
+        whose ``cross_domain_edges`` + ``cross_domain_edge_candidates``
+        are populated from the structural producers. Slice 1 produced
+        these inside ``build_topology``; slice 2 relocates them to the
+        prepass.
+
+        R1 P1-A fix (2026-05-31): the script sources here carry REAL
+        client / server signals so ``infer_module_domains`` (which the
+        prepass calls and feeds into the producers via
+        ``domains_override``) returns the expected client/server split.
+        Pre-R1 this test silently relied on the buggy producers reading
+        the stamped ``"domain"`` value off the modules dict; with the
+        override in place the source-level signals must drive the
+        inference for the cross-domain edge to be detected.
+        """
+        from converter.pipeline import Pipeline
+
+        door = RbxScript(
+            name="Door",
+            source=(
+                "local rs = game:GetService(\"RunService\")\n"
+                "rs.RenderStepped:Connect(function() end)\n"
+            ),
+            script_type="LocalScript",
+        )
+        anim = RbxScript(
+            name="Anim",
+            source=(
+                "local rs = game:GetService(\"ReplicatedStorage\")\n"
+                "local re = rs:WaitForChild(\"E\")\n"
+                "re.OnServerEvent:Connect(function() end)\n"
+            ),
+            script_type="Script",
+        )
+        pickup = RbxScript(name="Pickup", source="-- p", script_type="LocalScript")
+        scene_runtime: dict[str, object] = {
+            "modules": {
+                "door_sid": {
+                    "stem": "Door", "class_name": "Door",
+                    "runtime_bearing": True, "domain": "client",
+                    "character_attached": False, "is_loader": False,
+                    "module_path": "ReplicatedStorage.Door",
+                },
+                "anim_sid": {
+                    "stem": "Anim", "class_name": "Anim",
+                    "runtime_bearing": True, "domain": "server",
+                    "character_attached": False, "is_loader": False,
+                    "module_path": "ReplicatedStorage.Anim",
+                },
+                "pickup_sid": {
+                    "stem": "Pickup", "class_name": "Pickup",
+                    "runtime_bearing": True, "domain": "client",
+                    "character_attached": False, "is_loader": False,
+                    "module_path": "ReplicatedStorage.Pickup",
+                },
+            },
+            "scenes": {
+                "Mixed.unity": {
+                    "instances": [
+                        {"instance_id": "Mixed.unity:1",
+                         "script_id": "door_sid",
+                         "game_object_id": "Mixed.unity:1",
+                         "active": True, "enabled": True, "config": {}},
+                        {"instance_id": "Mixed.unity:2",
+                         "script_id": "anim_sid",
+                         "game_object_id": "Mixed.unity:2",
+                         "active": True, "enabled": True, "config": {}},
+                        {"instance_id": "Mixed.unity:3",
+                         "script_id": "pickup_sid",
+                         "game_object_id": "Mixed.unity:3",
+                         "active": True, "enabled": True,
+                         "config": {"itemName": "Key"}},
+                    ],
+                    "references": [{
+                        "from": "Mixed.unity:1",
+                        "field": "open",
+                        "index": None,
+                        "target_kind": "component",
+                        "target_ref": "Mixed.unity:2",
+                        "target_is_ui": False,
+                    }],
+                    "lifecycle_order": [
+                        "Mixed.unity:1", "Mixed.unity:2", "Mixed.unity:3",
+                    ],
+                },
+            },
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+        pipeline = self._build_pipeline_with(
+            scripts=[door, anim, pickup],
+            transpilation_result_scripts=[],
+        )
+        out = Pipeline._maybe_run_topology_prepass(pipeline, scene_runtime)
+        assert out is not None
+        # Component-ref edge present in the edges bucket on TopologyInputs.
+        assert len(out["cross_domain_edges"]) == 1
+        edge = out["cross_domain_edges"][0]
+        assert edge["from_script"] == "door_sid"
+        assert edge["to_script"] == "anim_sid"
+        # Shared-attribute candidate present in the candidates bucket.
+        assert len(out["cross_domain_edge_candidates"]) == 1
+        cand = out["cross_domain_edge_candidates"][0]
+        assert cand["from_script"] == "pickup_sid"
+        assert cand["resolution"]["event_name"] == "PickupItemEvent"
+
+    def test_build_topology_consumes_edges_from_inputs(self) -> None:
+        """``build_topology`` no longer calls the producers when
+        ``cross_domain_edges_input`` / ``cross_domain_edge_candidates_input``
+        are supplied: the artifact carries EXACTLY what was passed in,
+        not what the producer would derive from ``scene_runtime``.
+
+        Injects an artificial edge that does NOT correspond to any
+        reference in the plan; if ``build_topology`` were still
+        calling the producer it would emit zero edges from this plan.
+        Asserting the artificial edge survives proves the read site
+        consults the input parameter.
+        """
+        # Plan with zero scenes/prefabs, so the producer would emit
+        # zero edges if invoked.
+        sr = _mk_artifact()
+        injected_edge = {
+            "id": "test::injected::edge",
+            "kind": "attribute_write",
+            "from_instance": "i1", "to_instance": "i2",
+            "from_script": "sid_a", "to_script": "sid_b",
+            "field": "open",
+            "from_domain": "client", "to_domain": "server",
+            "owner_kind": "scene", "owner_ref": "X.unity",
+            "resolution": {
+                "strategy": "remote_event_bridge",
+                "event_name": "Test_SetOpen",
+            },
+            "bridge_member_scripts": [
+                {"role": "client_caller", "ref": "sid_a"},
+                {"role": "server_listener",
+                 "ref": "__bridge_listener_server__Test_SetOpen"},
+                {"role": "anim_listener", "ref": "sid_b"},
+            ],
+            "payload": {"attribute_name": "open", "schema": "unknown"},
+        }
+        # Provide modules so invariant 7 isn't tripped + the candidate
+        # ref invariant accepts ``sid_a``/``sid_b``.
+        sr_dict = cast(dict[str, object], sr)
+        sr_dict["modules"] = {
+            "sid_a": {
+                "stem": "A", "class_name": "A",
+                "runtime_bearing": True, "domain": "client",
+                "character_attached": False, "is_loader": False,
+            },
+            "sid_b": {
+                "stem": "B", "class_name": "B",
+                "runtime_bearing": True, "domain": "server",
+                "character_attached": False, "is_loader": False,
+            },
+        }
+        artifact = build_topology(
+            scene_runtime=cast(SceneRuntimeArtifact, sr_dict),
+            emitted_animations=[],
+            scripts_by_class={
+                "A": _mk_rbx_script("A", "LocalScript"),
+                "B": _mk_rbx_script("B", "Script"),
+            },
+            cross_domain_edges_input=[cast(  # type: ignore[arg-type]
+                "object", injected_edge,
+            )],
+            cross_domain_edge_candidates_input=[],
+        )
+        # The artifact carries the INJECTED edge verbatim.
+        assert len(artifact["cross_domain_edges"]) == 1
+        assert artifact["cross_domain_edges"][0]["id"] == "test::injected::edge"
+
+    def test_enrichment_populates_bridge_members_component_ref(self) -> None:
+        """A CLIENT-originated component-ref edge is enriched with a
+        3-member bridge unit: ``client_caller`` = ``from_script``,
+        ``server_listener`` = synthesized id from the helper,
+        ``anim_listener`` = ``to_script``. (R2: this is now the
+        client->server direction case; see
+        ``test_enrichment_handles_server_to_client_direction`` for the
+        opposite direction.)
+        """
+        from converter.pipeline import Pipeline
+        from converter.scene_runtime_topology.bridge_emit import (
+            synthesize_listener_id,
+        )
+
+        # R1 P1-A fix (2026-05-31): script sources carry real
+        # client / server signals so ``infer_module_domains`` returns
+        # the expected client/server split. The producers now consult
+        # the inferred ``domains_override`` instead of the stamped
+        # ``"domain"`` value on the modules dict.
+        door = RbxScript(
+            name="Door",
+            source=(
+                "local rs = game:GetService(\"RunService\")\n"
+                "rs.RenderStepped:Connect(function() end)\n"
+            ),
+            script_type="LocalScript",
+        )
+        anim = RbxScript(
+            name="Anim",
+            source=(
+                "local rs = game:GetService(\"ReplicatedStorage\")\n"
+                "local re = rs:WaitForChild(\"E\")\n"
+                "re.OnServerEvent:Connect(function() end)\n"
+            ),
+            script_type="Script",
+        )
+        scene_runtime: dict[str, object] = {
+            "modules": {
+                "door_sid": {
+                    "stem": "Door", "class_name": "Door",
+                    "runtime_bearing": True, "domain": "client",
+                    "character_attached": False, "is_loader": False,
+                    "module_path": "ReplicatedStorage.Door",
+                },
+                "anim_sid": {
+                    "stem": "Anim", "class_name": "Anim",
+                    "runtime_bearing": True, "domain": "server",
+                    "character_attached": False, "is_loader": False,
+                    "module_path": "ReplicatedStorage.Anim",
+                },
+            },
+            "scenes": {
+                "A.unity": {
+                    "instances": [
+                        {"instance_id": "A.unity:1",
+                         "script_id": "door_sid",
+                         "game_object_id": "A.unity:1",
+                         "active": True, "enabled": True, "config": {}},
+                        {"instance_id": "A.unity:2",
+                         "script_id": "anim_sid",
+                         "game_object_id": "A.unity:2",
+                         "active": True, "enabled": True, "config": {}},
+                    ],
+                    "references": [{
+                        "from": "A.unity:1",
+                        "field": "open",
+                        "index": None,
+                        "target_kind": "component",
+                        "target_ref": "A.unity:2",
+                        "target_is_ui": False,
+                    }],
+                    "lifecycle_order": ["A.unity:1", "A.unity:2"],
+                },
+            },
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+        pipeline = self._build_pipeline_with(
+            scripts=[door, anim],
+            transpilation_result_scripts=[],
+        )
+        out = Pipeline._maybe_run_topology_prepass(pipeline, scene_runtime)
+        assert out is not None
+        edge = out["cross_domain_edges"][0]
+        members = edge["bridge_member_scripts"]
+        roles_to_refs = {m["role"]: m["ref"] for m in members}
+        assert roles_to_refs["client_caller"] == "door_sid"
+        assert roles_to_refs["server_listener"] == synthesize_listener_id(
+            "Door_SetOpen", direction="client_to_server",
+        )
+        assert roles_to_refs["anim_listener"] == "anim_sid"
+
+    def test_enrichment_populates_bridge_members_shared_attribute(
+        self,
+    ) -> None:
+        """A shared-attribute candidate (Pickup) is enriched with
+        ``server_caller`` + ``client_listener`` + one ``consumer`` row
+        per script whose Luau source reads ``:GetAttribute("has...")``
+        matching the seed template.
+
+        R2 (2026-05-31): the locked Pickup case is SERVER-originated
+        per the existing ``pickup_remote_event_server`` pack contract
+        at ``script_coherence_packs.py:380-394`` (Pickup's
+        ``Touched``-handler writes the ``has<itemName>`` attribute
+        server-side and fires ``PickupItemEvent:FireClient(_pl,
+        itemName)``). The fixture pins Pickup's domain to ``server``
+        via ``domain_overrides`` so the enrichment sees the correct
+        direction; this also matches the slice 3 emitter contract
+        (``:FireClient`` rewrite, ``OnClientEvent`` listener).
+        """
+        from converter.code_transpiler import TranspiledScript
+        from converter.pipeline import Pipeline
+
+        pickup = RbxScript(name="Pickup", source="-- p", script_type="Script")
+        # ``Reader`` is a peer script that reads the bridged attribute.
+        # Lives on the CLIENT side (where the broadcast lands).
+        reader = RbxScript(
+            name="Reader",
+            source='local v = plr:GetAttribute("hasKey")',
+            script_type="LocalScript",
+        )
+        # ``Bystander`` does NOT read the attribute -- the scan must
+        # skip it.
+        bystander = RbxScript(
+            name="Bystander", source="-- empty", script_type="LocalScript",
+        )
+        # ``script_id_by_name`` is built by the prepass from
+        # ``RbxScript.name`` lookups against the modules block; provide
+        # matching module rows so ``Reader`` resolves to ``reader_sid``.
+        scene_runtime: dict[str, object] = {
+            "modules": {
+                "pickup_sid": {
+                    "stem": "Pickup", "class_name": "Pickup",
+                    "runtime_bearing": True, "domain": "server",
+                    "character_attached": False, "is_loader": False,
+                    "module_path": "ReplicatedStorage.Pickup",
+                },
+                "reader_sid": {
+                    "stem": "Reader", "class_name": "Reader",
+                    "runtime_bearing": True, "domain": "client",
+                    "character_attached": False, "is_loader": False,
+                    "module_path": "ReplicatedStorage.Reader",
+                },
+                "bystander_sid": {
+                    "stem": "Bystander", "class_name": "Bystander",
+                    "runtime_bearing": True, "domain": "client",
+                    "character_attached": False, "is_loader": False,
+                    "module_path": "ReplicatedStorage.Bystander",
+                },
+            },
+            "scenes": {
+                "Level.unity": {
+                    "instances": [
+                        {"instance_id": "Level.unity:1",
+                         "script_id": "pickup_sid",
+                         "game_object_id": "Level.unity:1",
+                         "active": True, "enabled": True,
+                         "config": {"itemName": "Key"}},
+                    ],
+                    "references": [],
+                    "lifecycle_order": ["Level.unity:1"],
+                },
+            },
+            "prefabs": {},
+            # R2: pin Pickup to server per the pack contract -- the
+            # ``"-- p"`` placeholder source carries no signal and
+            # would otherwise resolve to the Rule-7 low-confidence
+            # default.
+            "domain_overrides": {"pickup_sid": "server"},
+        }
+        # Build the post-transpile Luau-source list the prepass scans.
+        transpiled = [
+            TranspiledScript(
+                source_path="Pickup.cs",
+                output_filename="Pickup.luau",
+                csharp_source="// pickup",
+                luau_source="-- pickup",
+                strategy="ai", confidence=1.0,
+            ),
+            TranspiledScript(
+                source_path="Reader.cs",
+                output_filename="Reader.luau",
+                csharp_source="// reader",
+                luau_source='local v = plr:GetAttribute("hasKey")',
+                strategy="ai", confidence=1.0,
+            ),
+            TranspiledScript(
+                source_path="Bystander.cs",
+                output_filename="Bystander.luau",
+                csharp_source="// bystander",
+                luau_source="-- empty",
+                strategy="ai", confidence=1.0,
+            ),
+        ]
+        pipeline = self._build_pipeline_with(
+            scripts=[pickup, reader, bystander],
+            transpilation_result_scripts=transpiled,
+        )
+        out = Pipeline._maybe_run_topology_prepass(pipeline, scene_runtime)
+        assert out is not None
+        cand = out["cross_domain_edge_candidates"][0]
+        members = cand["bridge_member_scripts"]
+        consumer_refs = [m["ref"] for m in members if m["role"] == "consumer"]
+        # ``Reader`` matched the regex; ``Bystander`` did not.
+        assert consumer_refs == ["reader_sid"]
+        # R2: server-originated bridge -> ``server_caller`` +
+        # ``client_listener`` (NOT ``client_caller`` /
+        # ``server_listener``).
+        roles = {m["role"] for m in members}
+        assert {"server_caller", "client_listener", "consumer"}.issubset(roles)
+        roles_to_refs = {m["role"]: m["ref"] for m in members}
+        assert roles_to_refs["server_caller"] == "pickup_sid"
+        # The synthesized listener id carries the client prefix.
+        assert roles_to_refs["client_listener"].startswith(
+            "__bridge_listener_client__",
+        )
+
+    def test_enrichment_empty_on_resume(self) -> None:
+        """The Luau-scan pass cannot run on the resume path
+        (``state.transpilation_result is None``). Slice 2 documents this
+        by leaving ``consumer`` rows EMPTY -- slice 3 will fall back to
+        broadcast emission. The other 2 bridge members (caller +
+        listener) still populate because they're derivable from the
+        candidate row alone.
+
+        R2 (2026-05-31): Pickup is server-originated per the pack
+        contract; the caller/listener pair is therefore
+        ``server_caller`` + ``client_listener``.
+        """
+        from converter.pipeline import Pipeline
+
+        pickup = RbxScript(name="Pickup", source="-- p", script_type="Script")
+        scene_runtime: dict[str, object] = {
+            "modules": {
+                "pickup_sid": {
+                    "stem": "Pickup", "class_name": "Pickup",
+                    "runtime_bearing": True, "domain": "server",
+                    "character_attached": False, "is_loader": False,
+                    "module_path": "ReplicatedStorage.Pickup",
+                },
+            },
+            "scenes": {
+                "Level.unity": {
+                    "instances": [
+                        {"instance_id": "Level.unity:1",
+                         "script_id": "pickup_sid",
+                         "game_object_id": "Level.unity:1",
+                         "active": True, "enabled": True,
+                         "config": {"itemName": "Key"}},
+                    ],
+                    "references": [],
+                    "lifecycle_order": ["Level.unity:1"],
+                },
+            },
+            "prefabs": {},
+            # R2: pin Pickup to server (matches the pack contract).
+            "domain_overrides": {"pickup_sid": "server"},
+        }
+        pipeline = self._build_pipeline_with(
+            scripts=[pickup],
+            transpilation_result_scripts=None,  # resume
+        )
+        out = Pipeline._maybe_run_topology_prepass(pipeline, scene_runtime)
+        assert out is not None
+        cand = out["cross_domain_edge_candidates"][0]
+        members = cand["bridge_member_scripts"]
+        # Resume: server_caller + client_listener present, but ZERO
+        # consumer rows (the scan didn't run).
+        roles_seen = [m["role"] for m in members]
+        assert "consumer" not in roles_seen
+        assert "server_caller" in roles_seen
+        assert "client_listener" in roles_seen
+
+    # ------------------------------------------------------------------
+    # R2 (2026-05-31): direction-aware enrichment tests. Codex R2 caught
+    # the P1 -- the previous enrichment hardcoded client->server and
+    # mis-labeled server-originated rows (most importantly the locked
+    # Pickup candidate, breaking Mitigation alpha for slice 3).
+    # ------------------------------------------------------------------
+
+    def test_enrichment_handles_server_to_client_direction(self) -> None:
+        """A SERVER-originated component-ref edge enriches with
+        ``server_caller`` (= ``from_script``) + a synthesized
+        ``client_listener`` (id prefixed
+        ``__bridge_listener_client__``) + ``anim_listener``
+        (direction-independent = ``to_script``).
+
+        Direct ``enrich_cross_domain_edges`` call: synthesizes a
+        pre-built ``CrossDomainEdge`` whose ``from_domain == "server"``
+        and asserts the enrichment branches on direction.
+        """
+        from converter.scene_runtime_topology.bridge_emit import (
+            SYNTHESIZED_CLIENT_LISTENER_ID_PREFIX,
+            synthesize_listener_id,
+        )
+        from converter.scene_runtime_topology.cross_domain_edges import (
+            CrossDomainEdge,
+            PayloadSpec,
+            ResolutionSpec,
+        )
+        from converter.scene_runtime_topology.edge_enrichment import (
+            enrich_cross_domain_edges,
+        )
+
+        edge = CrossDomainEdge(
+            id="A.unity:1::flag::A.unity:2",
+            kind="attribute_write",
+            from_instance="A.unity:1",
+            to_instance="A.unity:2",
+            from_script="pickup_sid",   # server-side producer
+            to_script="hud_sid",        # client-side consumer
+            field="flag",
+            from_domain="server",
+            to_domain="client",
+            owner_kind="scene",
+            owner_ref="A.unity",
+            resolution=ResolutionSpec(
+                strategy="remote_event_bridge",
+                event_name="Pickup_SetFlag",
+            ),
+            bridge_member_scripts=[],
+            payload=PayloadSpec(attribute_name="flag", schema="unknown"),
+        )
+        enriched_edges, enriched_candidates = enrich_cross_domain_edges(
+            edges=[edge],
+            candidates=[],
+            transpiled_scripts=None,
+            script_id_by_name={},
+        )
+        assert len(enriched_edges) == 1
+        assert enriched_candidates == []
+        members = enriched_edges[0]["bridge_member_scripts"]
+        roles_to_refs = {m["role"]: m["ref"] for m in members}
+        # Server-originated -> server_caller + client_listener +
+        # anim_listener (direction-independent).
+        assert set(roles_to_refs.keys()) == {
+            "server_caller", "client_listener", "anim_listener",
+        }
+        assert roles_to_refs["server_caller"] == "pickup_sid"
+        assert roles_to_refs["client_listener"] == synthesize_listener_id(
+            "Pickup_SetFlag", direction="server_to_client",
+        )
+        assert roles_to_refs["client_listener"].startswith(
+            SYNTHESIZED_CLIENT_LISTENER_ID_PREFIX,
+        )
+        assert roles_to_refs["anim_listener"] == "hud_sid"
+        # The synthesized id is DIFFERENT from the client_to_server
+        # shape -- two distinct prefixes per direction.
+        assert roles_to_refs["client_listener"] != synthesize_listener_id(
+            "Pickup_SetFlag", direction="client_to_server",
+        )
+        # Resolution stays ``remote_event_bridge`` (not downgraded);
+        # only unknown-direction rows downgrade to ``excluded``.
+        assert enriched_edges[0]["resolution"]["strategy"] == (
+            "remote_event_bridge"
+        )
+
+    def test_enrichment_excludes_edge_with_unknown_direction(self) -> None:
+        """A pre-built edge whose ``from_domain`` is not a known
+        runtime domain (``""``, ``"helper"``, etc.) is downgraded to
+        ``resolution.strategy == "excluded"`` and gets an EMPTY
+        ``bridge_member_scripts``. Slice 3 skips ``excluded`` rows.
+
+        Defensive: producers already filter ``NON_RUNTIME_DOMAINS``,
+        but on-disk plans / direct callers / future producers may
+        feed such rows; the downgrade keeps the artifact
+        well-formed.
+        """
+        from converter.scene_runtime_topology.cross_domain_edges import (
+            CrossDomainEdge,
+            PayloadSpec,
+            ResolutionSpec,
+        )
+        from converter.scene_runtime_topology.edge_enrichment import (
+            enrich_cross_domain_edges,
+        )
+
+        # Two unknown-direction rows: one as a component-ref edge,
+        # one as a shared-attribute candidate.
+        bad_edge = CrossDomainEdge(
+            id="X:1::peer::X:2",
+            kind="attribute_write",
+            from_instance="X:1", to_instance="X:2",
+            from_script="a", to_script="b",
+            field="peer",
+            from_domain="",  # unknown direction.
+            to_domain="server",
+            owner_kind="scene", owner_ref="X.unity",
+            resolution=ResolutionSpec(
+                strategy="remote_event_bridge",
+                event_name="A_SetPeer",
+            ),
+            bridge_member_scripts=[],
+            payload=PayloadSpec(attribute_name="peer", schema="unknown"),
+        )
+        bad_cand = CrossDomainEdge(
+            id="shared_attr::X.unity::X:3::PickupItemEvent",
+            kind="attribute_write",
+            from_instance="X:3", to_instance="",
+            from_script="c", to_script="",
+            field="has<itemName>",
+            from_domain="helper",  # also unknown (non-runtime).
+            to_domain="",
+            owner_kind="scene", owner_ref="X.unity",
+            resolution=ResolutionSpec(
+                strategy="remote_event_bridge",
+                event_name="PickupItemEvent",
+            ),
+            bridge_member_scripts=[],
+            payload=PayloadSpec(
+                attribute_name="has<itemName>", schema="bool",
+            ),
+        )
+        enriched_edges, enriched_candidates = enrich_cross_domain_edges(
+            edges=[bad_edge],
+            candidates=[bad_cand],
+            transpiled_scripts=None,
+            script_id_by_name={},
+        )
+        # Component-ref edge: downgraded + empty bridge.
+        assert len(enriched_edges) == 1
+        assert enriched_edges[0]["resolution"]["strategy"] == "excluded"
+        assert enriched_edges[0]["bridge_member_scripts"] == []
+        # event_name preserved for debug triage.
+        assert enriched_edges[0]["resolution"]["event_name"] == "A_SetPeer"
+        # Shared-attribute candidate: downgraded + empty bridge.
+        assert len(enriched_candidates) == 1
+        assert enriched_candidates[0]["resolution"]["strategy"] == "excluded"
+        assert enriched_candidates[0]["bridge_member_scripts"] == []
+        assert enriched_candidates[0]["resolution"]["event_name"] == (
+            "PickupItemEvent"
+        )
+
+    def test_get_attribute_scan_matches_non_identifier_item_names(
+        self,
+    ) -> None:
+        """R4 (Codex P3, 2026-05-31): the ``has<itemName>`` consumer
+        scan must match readers built from non-identifier item names.
+        The Pickup rewrite emits ``GetAttribute("has" .. itemName)``, so
+        ``itemName = "Red Key"`` produces ``GetAttribute("hasRed Key")``
+        — a valid read that an identifier-only placeholder class
+        (``[A-Za-z_][A-Za-z0-9_]*``) silently missed, under-populating
+        ``bridge_member_scripts`` for those pickups.
+        """
+        from converter.scene_runtime_topology.edge_enrichment import (
+            _build_get_attribute_regex,
+        )
+
+        rx = _build_get_attribute_regex("has<itemName>")
+        # Non-identifier item names that real projects use.
+        for item in ("Red Key", "Key-A", "3rdGem", "Key.2"):
+            luau = f'local v = plr:GetAttribute("has{item}")'
+            assert rx.search(luau) is not None, (
+                f"scan must match reader for item {item!r}; the "
+                f"identifier-only class missed non-identifier names"
+            )
+        # Plain identifier names still match (no regression).
+        assert rx.search('plr:GetAttribute("hasKey")') is not None
+        # Single-quoted reads still match.
+        assert rx.search("plr:GetAttribute('hasKey')") is not None
+        # A non-``has`` attribute read must NOT match.
+        assert rx.search('plr:GetAttribute("gotKey")') is None
+
+    def test_invariant_2b_accepts_both_listener_prefixes(self) -> None:
+        """The candidate-`ref`-validity invariant in
+        ``build_topology._enforce_invariants`` accepts EITHER
+        synthesized-listener prefix:
+        ``__bridge_listener_server__`` (client->server direction)
+        AND ``__bridge_listener_client__`` (server->client). Pre-R2
+        only one prefix existed; R2 added the second so the invariant
+        must recognize both shapes or it would falsely abort
+        legitimate server-originated bridges.
+        """
+        from converter.scene_runtime_topology.bridge_emit import (
+            SYNTHESIZED_CLIENT_LISTENER_ID_PREFIX,
+            SYNTHESIZED_SERVER_LISTENER_ID_PREFIX,
+        )
+
+        sr = _mk_artifact()
+        sr_dict = cast(dict[str, object], sr)
+        sr_dict["modules"] = {
+            "sid_client": {
+                "stem": "C", "class_name": "C",
+                "runtime_bearing": True, "domain": "client",
+                "character_attached": False, "is_loader": False,
+            },
+            "sid_server": {
+                "stem": "S", "class_name": "S",
+                "runtime_bearing": True, "domain": "server",
+                "character_attached": False, "is_loader": False,
+            },
+        }
+        cand_client_to_server = {
+            "id": "shared_attr::X::1::EvA",
+            "kind": "attribute_write",
+            "from_instance": "i1", "to_instance": "",
+            "from_script": "sid_client", "to_script": "",
+            "field": "has<itemName>",
+            "from_domain": "client", "to_domain": "",
+            "owner_kind": "scene", "owner_ref": "X.unity",
+            "resolution": {
+                "strategy": "remote_event_bridge",
+                "event_name": "EvA",
+            },
+            "bridge_member_scripts": [
+                {"role": "client_caller", "ref": "sid_client"},
+                # Server-listener prefix shape.
+                {"role": "server_listener",
+                 "ref": f"{SYNTHESIZED_SERVER_LISTENER_ID_PREFIX}EvA"},
+            ],
+            "payload": {"attribute_name": "has<itemName>", "schema": "bool"},
+        }
+        cand_server_to_client = {
+            "id": "shared_attr::X::2::EvB",
+            "kind": "attribute_write",
+            "from_instance": "i2", "to_instance": "",
+            "from_script": "sid_server", "to_script": "",
+            "field": "has<itemName>",
+            "from_domain": "server", "to_domain": "",
+            "owner_kind": "scene", "owner_ref": "X.unity",
+            "resolution": {
+                "strategy": "remote_event_bridge",
+                "event_name": "EvB",
+            },
+            "bridge_member_scripts": [
+                {"role": "server_caller", "ref": "sid_server"},
+                # Client-listener prefix shape (the R2 addition).
+                {"role": "client_listener",
+                 "ref": f"{SYNTHESIZED_CLIENT_LISTENER_ID_PREFIX}EvB"},
+            ],
+            "payload": {"attribute_name": "has<itemName>", "schema": "bool"},
+        }
+        # Both candidates must pass the invariant (no abort).
+        artifact = build_topology(
+            scene_runtime=cast(SceneRuntimeArtifact, sr_dict),
+            emitted_animations=[],
+            scripts_by_class={
+                "C": _mk_rbx_script("C", "LocalScript"),
+                "S": _mk_rbx_script("S", "Script"),
+            },
+            cross_domain_edges_input=[],
+            cross_domain_edge_candidates_input=[
+                cast("object", cand_client_to_server),  # type: ignore[arg-type]
+                cast("object", cand_server_to_client),  # type: ignore[arg-type]
+            ],
+        )
+        # Both candidates landed in the artifact verbatim.
+        cands = artifact["cross_domain_edge_candidates"]
+        assert len(cands) == 2
+        event_names = {c["resolution"]["event_name"] for c in cands}
+        assert event_names == {"EvA", "EvB"}
+
+    def test_event_name_invariant_fires_only_on_semantic_collisions(
+        self,
+    ) -> None:
+        """Slice 2's event_name invariant fires ONLY on a SEMANTIC
+        collision: two edges sharing the same ``event_name`` but with
+        DIFFERENT ``payload.attribute_name``. Edges sharing both
+        ``event_name`` AND ``payload.attribute_name`` are the same
+        logical bridge instantiated multiple times -- no abort.
+
+        This test exercises the true-collision case: a component-ref
+        edge with ``payload.attribute_name="open"`` and a candidate
+        with ``payload.attribute_name="has<itemName>"`` both carrying
+        ``event_name="PickupItemEvent"``. Two distinct cross-domain
+        writes routing through one RemoteEvent -- fail-closed.
+
+        R1 P1-B fix (2026-05-31): pre-R1 the invariant aborted on any
+        repeated ``event_name``, which broke the common case of
+        multiple Pickup candidates sharing the locked
+        ``"PickupItemEvent"`` (Mitigation α). The refined invariant
+        only fires on heterogeneous ``payload.attribute_name``.
+        """
+        sr = _mk_artifact()
+        sr_dict = cast(dict[str, object], sr)
+        sr_dict["modules"] = {
+            "sid_a": {
+                "stem": "A", "class_name": "A",
+                "runtime_bearing": True, "domain": "client",
+                "character_attached": False, "is_loader": False,
+            },
+            "sid_b": {
+                "stem": "B", "class_name": "B",
+                "runtime_bearing": True, "domain": "server",
+                "character_attached": False, "is_loader": False,
+            },
+        }
+        injected_edge = {
+            "id": "test::injected::collision",
+            "kind": "attribute_write",
+            "from_instance": "i1", "to_instance": "i2",
+            "from_script": "sid_a", "to_script": "sid_b",
+            "field": "open",
+            "from_domain": "client", "to_domain": "server",
+            "owner_kind": "scene", "owner_ref": "X.unity",
+            "resolution": {
+                "strategy": "remote_event_bridge",
+                # Collides literally with the locked Pickup name.
+                "event_name": "PickupItemEvent",
+            },
+            "bridge_member_scripts": [
+                {"role": "client_caller", "ref": "sid_a"},
+                {"role": "server_listener",
+                 "ref": "__bridge_listener_server__PickupItemEvent"},
+                {"role": "anim_listener", "ref": "sid_b"},
+            ],
+            # DIFFERENT attribute_name from the candidate below ->
+            # semantic collision -> abort.
+            "payload": {"attribute_name": "open", "schema": "unknown"},
+        }
+        injected_candidate = {
+            "id": "shared_attr::test::cand::PickupItemEvent",
+            "kind": "attribute_write",
+            "from_instance": "i3", "to_instance": "",
+            "from_script": "sid_a", "to_script": "",
+            "field": "has<itemName>",
+            "from_domain": "client", "to_domain": "",
+            "owner_kind": "scene", "owner_ref": "X.unity",
+            "resolution": {
+                "strategy": "remote_event_bridge",
+                "event_name": "PickupItemEvent",
+            },
+            "bridge_member_scripts": [
+                {"role": "client_caller", "ref": "sid_a"},
+                {"role": "server_listener",
+                 "ref": "__bridge_listener_server__PickupItemEvent"},
+            ],
+            "payload": {"attribute_name": "has<itemName>", "schema": "bool"},
+        }
+        with pytest.raises(TopologyInvariantError) as exc:
+            build_topology(
+                scene_runtime=cast(SceneRuntimeArtifact, sr_dict),
+                emitted_animations=[],
+                scripts_by_class={
+                    "A": _mk_rbx_script("A", "LocalScript"),
+                    "B": _mk_rbx_script("B", "Script"),
+                },
+                cross_domain_edges_input=[cast(  # type: ignore[arg-type]
+                    "object", injected_edge,
+                )],
+                cross_domain_edge_candidates_input=[cast(  # type: ignore[arg-type]
+                    "object", injected_candidate,
+                )],
+            )
+        assert "semantic collision on cross-domain event_name" in str(exc.value)
+        assert "PickupItemEvent" in str(exc.value)
+        # The new abort message names the heterogeneous attribute_name
+        # set so triage can see WHAT collided.
+        assert "has<itemName>" in str(exc.value)
+        assert "'open'" in str(exc.value)
+
+    def test_fresh_run_emits_edges_via_domains_override(self) -> None:
+        """P1-A regression guard (R1 fix, 2026-05-31): on a fresh run,
+        ``scene_runtime["modules"][sid]["domain"]`` is EMPTY -- the
+        classifier hasn't stamped it back yet at the moment
+        ``_maybe_run_topology_prepass`` calls the producers. Without
+        the ``domains_override`` kwarg the producers see ``""`` for
+        every src+tgt domain and the ``NON_RUNTIME_DOMAINS`` filter
+        drops every otherwise-valid cross-domain edge.
+
+        We synthesize the fresh-run state by leaving every module's
+        ``domain`` as ``""`` AND giving the scripts real signals so
+        ``infer_module_domains`` (which the prepass calls) populates
+        the local ``domains`` dict the override is fed from. The
+        edges bucket must be NON-EMPTY at the prepass output.
+        """
+        from converter.pipeline import Pipeline
+
+        door = RbxScript(
+            name="Door",
+            source=(
+                "local rs = game:GetService(\"RunService\")\n"
+                "rs.RenderStepped:Connect(function() end)\n"
+            ),
+            script_type="LocalScript",
+        )
+        anim = RbxScript(
+            name="Anim",
+            source=(
+                "local rs = game:GetService(\"ReplicatedStorage\")\n"
+                "local re = rs:WaitForChild(\"E\")\n"
+                "re.OnServerEvent:Connect(function() end)\n"
+            ),
+            script_type="Script",
+        )
+        # Fresh-run shape: EVERY module's ``domain`` is empty string.
+        # The classifier (which would stamp these) runs AFTER the
+        # prepass. Pre-R1 producers read these blanks and dropped
+        # every edge.
+        scene_runtime: dict[str, object] = {
+            "modules": {
+                "door_sid": {
+                    "stem": "Door", "class_name": "Door",
+                    "runtime_bearing": True, "domain": "",
+                    "character_attached": False, "is_loader": False,
+                    "module_path": "ReplicatedStorage.Door",
+                },
+                "anim_sid": {
+                    "stem": "Anim", "class_name": "Anim",
+                    "runtime_bearing": True, "domain": "",
+                    "character_attached": False, "is_loader": False,
+                    "module_path": "ReplicatedStorage.Anim",
+                },
+            },
+            "scenes": {
+                "Fresh.unity": {
+                    "instances": [
+                        {"instance_id": "Fresh.unity:1",
+                         "script_id": "door_sid",
+                         "game_object_id": "Fresh.unity:1",
+                         "active": True, "enabled": True, "config": {}},
+                        {"instance_id": "Fresh.unity:2",
+                         "script_id": "anim_sid",
+                         "game_object_id": "Fresh.unity:2",
+                         "active": True, "enabled": True, "config": {}},
+                    ],
+                    "references": [{
+                        "from": "Fresh.unity:1",
+                        "field": "open",
+                        "index": None,
+                        "target_kind": "component",
+                        "target_ref": "Fresh.unity:2",
+                        "target_is_ui": False,
+                    }],
+                    "lifecycle_order": [
+                        "Fresh.unity:1", "Fresh.unity:2",
+                    ],
+                },
+            },
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+        pipeline = self._build_pipeline_with(
+            scripts=[door, anim],
+            transpilation_result_scripts=[],
+        )
+        out = Pipeline._maybe_run_topology_prepass(pipeline, scene_runtime)
+        assert out is not None
+        # The edge MUST be present despite the empty
+        # ``domain`` stamps -- override kicks in.
+        edges = out["cross_domain_edges"]
+        assert len(edges) == 1, (
+            f"P1-A regression: prepass dropped all cross-domain edges "
+            f"on fresh-run state (modules[*].domain=='\"\"'). The "
+            f"producers should have consulted ``domains_override``. "
+            f"Got edges={edges!r}."
+        )
+        edge = edges[0]
+        assert edge["from_script"] == "door_sid"
+        assert edge["to_script"] == "anim_sid"
+        assert edge["from_domain"] == "client"
+        assert edge["to_domain"] == "server"
+
+    def test_multi_pickup_no_invariant_abort(self) -> None:
+        """P1-B regression guard (R1 fix, 2026-05-31): multiple Pickup
+        instances all carry the locked ``"PickupItemEvent"`` event name
+        and the SAME ``payload.attribute_name="has<itemName>"``
+        template. This is intentional reuse (Mitigation α), NOT a
+        semantic collision -- the refined invariant must accept it.
+
+        Pre-R1 this aborted the topology build for any scene with
+        more than one Pickup -- a common case.
+        """
+        sr = _mk_artifact(modules={
+            "pickup_sid": {
+                "stem": "Pickup", "class_name": "Pickup",
+                "runtime_bearing": True, "domain": "client",
+                "character_attached": False, "is_loader": False,
+            },
+        }, scenes={
+            "Pickups.unity": {
+                "instances": [
+                    {"instance_id": "Pickups.unity:1",
+                     "script_id": "pickup_sid",
+                     "game_object_id": "Pickups.unity:1",
+                     "active": True, "enabled": True,
+                     "config": {"itemName": "Key"}},
+                    {"instance_id": "Pickups.unity:2",
+                     "script_id": "pickup_sid",
+                     "game_object_id": "Pickups.unity:2",
+                     "active": True, "enabled": True,
+                     "config": {"itemName": "Map"}},
+                ],
+                "references": [],
+                "lifecycle_order": [
+                    "Pickups.unity:1", "Pickups.unity:2",
+                ],
+            },
+        })
+
+        # Run the producer to get two candidates (one per Pickup
+        # instance) sharing event_name="PickupItemEvent" and
+        # payload.attribute_name="has<itemName>".
+        candidates = compute_shared_attribute_candidates(sr)
+        assert len(candidates) == 2
+        assert {c["resolution"]["event_name"] for c in candidates} == {
+            "PickupItemEvent",
+        }
+        assert {c["payload"]["attribute_name"] for c in candidates} == {
+            "has<itemName>",
+        }
+
+        # build_topology must NOT abort.
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={
+                "Pickup": _mk_rbx_script("Pickup", "LocalScript"),
+            },
+            cross_domain_edges_input=[],
+            cross_domain_edge_candidates_input=cast(
+                "list[object]", candidates,
+            ),
+        )
+        # Both candidates survive into the artifact.
+        cand_block = artifact["cross_domain_edge_candidates"]
+        assert len(cand_block) == 2
+
+    def test_multi_door_cross_domain_no_invariant_abort(self) -> None:
+        """P1-B regression guard (R1 fix, 2026-05-31): two component-ref
+        cross-domain edges sharing the SAME ``<owner>_Set<Field>``
+        event_name derivation (e.g. two Door MonoBehaviours each
+        referencing an Animator on the same ``open`` field) AND the
+        same ``payload.attribute_name="open"`` are intentional reuse
+        of one logical bridge across multiple instances, NOT a
+        semantic collision.
+
+        Pre-R1 this aborted any scene with more than one cross-domain
+        Door reference -- a common case in any multi-door level.
+        """
+        # Two doors both ref an Animator on field 'open'. Both edges
+        # derive event_name='Door_SetOpen' and payload.attribute_name='open'.
+        edge_one = {
+            "id": "deterministic::edge::1",
+            "kind": "attribute_write",
+            "from_instance": "S:1", "to_instance": "S:2",
+            "from_script": "door_sid", "to_script": "anim_sid",
+            "field": "open",
+            "from_domain": "client", "to_domain": "server",
+            "owner_kind": "scene", "owner_ref": "X.unity",
+            "resolution": {
+                "strategy": "remote_event_bridge",
+                "event_name": "Door_SetOpen",
+            },
+            "bridge_member_scripts": [
+                {"role": "client_caller", "ref": "door_sid"},
+                {"role": "server_listener",
+                 "ref": "__bridge_listener_server__Door_SetOpen"},
+                {"role": "anim_listener", "ref": "anim_sid"},
+            ],
+            "payload": {"attribute_name": "open", "schema": "unknown"},
+        }
+        edge_two = {
+            **edge_one,
+            "id": "deterministic::edge::2",
+            "from_instance": "S:3", "to_instance": "S:4",
+        }
+
+        sr = _mk_artifact(modules={
+            "door_sid": {
+                "stem": "Door", "class_name": "Door",
+                "runtime_bearing": True, "domain": "client",
+                "character_attached": False, "is_loader": False,
+            },
+            "anim_sid": {
+                "stem": "Anim", "class_name": "Anim",
+                "runtime_bearing": True, "domain": "server",
+                "character_attached": False, "is_loader": False,
+            },
+        })
+        # No abort -- both edges describe the same logical bridge.
+        artifact = build_topology(
+            scene_runtime=sr,
+            emitted_animations=[],
+            scripts_by_class={
+                "Door": _mk_rbx_script("Door", "LocalScript"),
+                "Anim": _mk_rbx_script("Anim", "Script"),
+            },
+            cross_domain_edges_input=cast(
+                "list[object]", [edge_one, edge_two],
+            ),
+            cross_domain_edge_candidates_input=[],
+        )
+        edges_block = artifact["cross_domain_edges"]
+        assert len(edges_block) == 2
+
+    def test_candidate_bridge_member_ref_must_resolve(self) -> None:
+        """Slice 2's candidate-`ref`-validity invariant: every
+        ``bridge_member_scripts[*].ref`` in a candidate must be either a
+        real script_id in the modules block OR a synthesized listener
+        id (one of the per-direction
+        ``__bridge_listener_(server|client)__`` prefixes). A bogus
+        string aborts.
+        """
+        sr = _mk_artifact()
+        sr_dict = cast(dict[str, object], sr)
+        sr_dict["modules"] = {
+            "real_sid": {
+                "stem": "Real", "class_name": "Real",
+                "runtime_bearing": True, "domain": "client",
+                "character_attached": False, "is_loader": False,
+            },
+        }
+        bogus_candidate = {
+            "id": "shared_attr::test::bogus::PickupItemEvent",
+            "kind": "attribute_write",
+            "from_instance": "i1", "to_instance": "",
+            "from_script": "real_sid", "to_script": "",
+            "field": "has<itemName>",
+            "from_domain": "client", "to_domain": "",
+            "owner_kind": "scene", "owner_ref": "X.unity",
+            "resolution": {
+                "strategy": "remote_event_bridge",
+                "event_name": "PickupItemEvent",
+            },
+            "bridge_member_scripts": [
+                {"role": "client_caller", "ref": "real_sid"},
+                # Bogus: neither a real script_id nor a synthesized id.
+                {"role": "consumer", "ref": "ghost_sid_does_not_exist"},
+            ],
+            "payload": {"attribute_name": "has<itemName>", "schema": "bool"},
+        }
+        with pytest.raises(TopologyInvariantError) as exc:
+            build_topology(
+                scene_runtime=cast(SceneRuntimeArtifact, sr_dict),
+                emitted_animations=[],
+                scripts_by_class={
+                    "Real": _mk_rbx_script("Real", "LocalScript"),
+                },
+                cross_domain_edges_input=[],
+                cross_domain_edge_candidates_input=[cast(  # type: ignore[arg-type]
+                    "object", bogus_candidate,
+                )],
+            )
+        assert "ghost_sid_does_not_exist" in str(exc.value)
+        assert "synthesized listener id" in str(exc.value)
+
+    def test_synthesize_listener_id_deterministic(self) -> None:
+        """The synthesized listener id is stable across calls given
+        the same ``(event_name, direction)`` pair. Slice 3's emitter
+        must produce the same id slice 2 writes into
+        ``bridge_member_scripts[*].ref`` -- this test pins that
+        determinism so a hash/seed/random slipping into the helper
+        would fail loudly.
+
+        R2 (2026-05-31): the helper now takes a ``direction`` kwarg
+        and emits per-direction prefixes; this test pins both shapes.
+        """
+        from converter.scene_runtime_topology.bridge_emit import (
+            SYNTHESIZED_CLIENT_LISTENER_ID_PREFIX,
+            SYNTHESIZED_SERVER_LISTENER_ID_PREFIX,
+            synthesize_listener_id,
+        )
+
+        # client -> server direction: server listener prefix.
+        a1 = synthesize_listener_id(
+            "PickupItemEvent", direction="client_to_server",
+        )
+        a2 = synthesize_listener_id(
+            "PickupItemEvent", direction="client_to_server",
+        )
+        assert a1 == a2
+        assert a1.startswith(SYNTHESIZED_SERVER_LISTENER_ID_PREFIX)
+        # Different event_names produce different ids.
+        b = synthesize_listener_id(
+            "Door_SetOpen", direction="client_to_server",
+        )
+        assert b != a1
+        assert b.startswith(SYNTHESIZED_SERVER_LISTENER_ID_PREFIX)
+        # server -> client direction: client listener prefix (distinct
+        # from the server prefix so dumps make direction visible).
+        c = synthesize_listener_id(
+            "PickupItemEvent", direction="server_to_client",
+        )
+        assert c.startswith(SYNTHESIZED_CLIENT_LISTENER_ID_PREFIX)
+        assert c != a1
+
+    def test_derive_event_name_rejects_empty_field(self) -> None:
+        """Slice 2 P3 carry-forward from slice 1: a component-ref edge
+        whose ``field`` is empty must NOT produce a fragile
+        ``<owner>_Set`` event name. The producer drops the row;
+        ``_derive_event_name_from_owner_field`` returns ``None`` on
+        the empty input.
+        """
+        from converter.scene_runtime_topology.cross_domain_edges import (
+            _derive_event_name_from_owner_field,
+        )
+
+        # Helper-level: empty field -> None.
+        assert _derive_event_name_from_owner_field("Door", "") is None
+        # Non-empty field still works.
+        assert _derive_event_name_from_owner_field("Door", "open") == (
+            "Door_SetOpen"
+        )
+
+        # End-to-end: a plan whose only reference has ``field=""`` emits
+        # ZERO edges (the row is dropped, not coerced to ``Door_Set``).
+        plan = _mk_edge_artifact(
+            src_class="Door", field="",
+            src_domain="client", tgt_domain="server",
+        )
+        edges = compute_cross_domain_edges(plan)  # type: ignore[arg-type]
+        assert edges == []
+
+    def test_producers_use_sorted_iteration_order(self) -> None:
+        """Slice 1 left two producers with inconsistent iteration order
+        (``compute_cross_domain_edges`` dict-insertion;
+        ``compute_shared_attribute_candidates`` sorted). Slice 2's P3
+        carry-forward harmonizes both on sorted iteration so the
+        combined enrichment output is byte-stable across upstream dict
+        insertion-order changes.
+
+        We synthesize a plan with two scenes inserted in REVERSE
+        alphabetic order; both producers emit rows in ALPHABETIC order.
+        """
+        plan: dict[str, object] = {
+            "modules": {
+                "door_sid": {
+                    "stem": "Door", "class_name": "Door",
+                    "runtime_bearing": True, "domain": "client",
+                    "module_path": "ReplicatedStorage.Door",
+                },
+                "anim_sid": {
+                    "stem": "Anim", "class_name": "Anim",
+                    "runtime_bearing": True, "domain": "server",
+                    "module_path": "ReplicatedStorage.Anim",
+                },
+                "pickup_sid": {
+                    "stem": "Pickup", "class_name": "Pickup",
+                    "runtime_bearing": True, "domain": "client",
+                    "module_path": "ReplicatedStorage.Pickup",
+                },
+            },
+            # Insertion order = ['Z.unity', 'A.unity']; sorted = ['A', 'Z'].
+            "scenes": {
+                "Z.unity": {
+                    "instances": [
+                        {"instance_id": "Z.unity:1", "script_id": "door_sid",
+                         "game_object_id": "Z.unity:1", "active": True,
+                         "enabled": True, "config": {}},
+                        {"instance_id": "Z.unity:2", "script_id": "anim_sid",
+                         "game_object_id": "Z.unity:2", "active": True,
+                         "enabled": True, "config": {}},
+                        {"instance_id": "Z.unity:3", "script_id": "pickup_sid",
+                         "game_object_id": "Z.unity:3", "active": True,
+                         "enabled": True, "config": {"itemName": "Z"}},
+                    ],
+                    "references": [{
+                        "from": "Z.unity:1", "field": "open",
+                        "index": None, "target_kind": "component",
+                        "target_ref": "Z.unity:2", "target_is_ui": False,
+                    }],
+                    "lifecycle_order": [
+                        "Z.unity:1", "Z.unity:2", "Z.unity:3",
+                    ],
+                },
+                "A.unity": {
+                    "instances": [
+                        {"instance_id": "A.unity:1", "script_id": "door_sid",
+                         "game_object_id": "A.unity:1", "active": True,
+                         "enabled": True, "config": {}},
+                        {"instance_id": "A.unity:2", "script_id": "anim_sid",
+                         "game_object_id": "A.unity:2", "active": True,
+                         "enabled": True, "config": {}},
+                        {"instance_id": "A.unity:3", "script_id": "pickup_sid",
+                         "game_object_id": "A.unity:3", "active": True,
+                         "enabled": True, "config": {"itemName": "A"}},
+                    ],
+                    "references": [{
+                        "from": "A.unity:1", "field": "open",
+                        "index": None, "target_kind": "component",
+                        "target_ref": "A.unity:2", "target_is_ui": False,
+                    }],
+                    "lifecycle_order": [
+                        "A.unity:1", "A.unity:2", "A.unity:3",
+                    ],
+                },
+            },
+            "prefabs": {},
+            "domain_overrides": {},
+        }
+        edges = compute_cross_domain_edges(plan)  # type: ignore[arg-type]
+        cands = compute_shared_attribute_candidates(
+            plan,  # type: ignore[arg-type]
+        )
+        # Component-ref edges: ``A.unity`` first (sorted key), then ``Z.unity``.
+        assert [e["owner_ref"] for e in edges] == ["A.unity", "Z.unity"]
+        # Shared-attr candidates: same order.
+        assert [c["owner_ref"] for c in cands] == ["A.unity", "Z.unity"]

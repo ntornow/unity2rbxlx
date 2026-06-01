@@ -62,6 +62,7 @@ restructuring is scope creep slice 1's brief explicitly excludes.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, TypedDict, cast
 
@@ -74,15 +75,65 @@ from converter.scene_runtime_planner import (
 class BridgeMember(TypedDict):
     """One script (or RemoteEvent) participating in a bridge.
 
-    ``role`` values are the design doc's 4-script unit (``client_caller``,
-    ``server_listener``, ``remote_event``, ``anim_listener``). Slice 1
-    leaves the list empty on every emitted edge; slice 2 populates it
-    after enrichment resolves the listeners.
+    ``role`` values are a CLOSED enum (per slice 2 R2, 2026-05-31):
+    ``client_caller``, ``server_caller``, ``client_listener``,
+    ``server_listener``, ``anim_listener``, ``consumer``. Slice 3 may
+    add ``remote_event`` (reserved -- see end of this docstring).
 
-    ``ref`` is the consumer-readable identifier the bridge emitter (slice
-    3) will dereference (a script id, a GUID, or a dotted DataModel path
-    for ``remote_event``). Format intentionally unconstrained so slice 2
-    can pick the right kind per role.
+    Direction-aware caller/listener pairing (slice 2 R2):
+      - ``"client_caller"`` + ``"server_listener"``: a client-originated
+        bridge (``from_domain == "client"``). Slice 3's rewriter
+        replaces the producer's ``SetAttribute`` with
+        ``<event_name>:FireServer(target, v)``; the synthesized
+        listener subscribes via ``OnServerEvent``.
+      - ``"server_caller"`` + ``"client_listener"``: a server-originated
+        bridge (``from_domain == "server"`` -- the locked Pickup
+        candidate lives here, matching the
+        ``pickup_remote_event_server`` pack contract at
+        ``script_coherence_packs.py:380-394``). Slice 3 rewrites to
+        ``<event_name>:FireClient(target, v)`` or
+        ``:FireAllClients(v)``; the listener subscribes via
+        ``OnClientEvent``.
+
+    Per-role contracts:
+      - ``"client_caller"`` / ``"server_caller"``: the script_id whose
+        ``SetAttribute`` slice 3 will rewrite. For a component-ref edge
+        this is ``edge["from_script"]``; for a shared-attribute
+        candidate this is the producer-class script_id.
+      - ``"server_listener"`` / ``"client_listener"``: a SYNTHESIZED
+        script_id (NOT a real module row id) for the listener slice
+        3 will emit. Derived via
+        ``bridge_emit.synthesize_listener_id(event_name,
+        direction=...)`` so the id slice 2 writes here and the id
+        slice 3 stamps on the emitted ``RbxScript`` agree by
+        construction. The candidate-`ref`-validity invariant in
+        ``build_topology._enforce_invariants`` recognizes BOTH
+        per-direction prefixes.
+      - ``"anim_listener"``: for component-ref edges only -- the
+        receiver script that consumes the bridged attribute. Equals
+        ``edge["to_script"]``. Direction-independent (the consumer
+        script is the same regardless of which side fires). Fan-out
+        (shared-attribute) candidates DO NOT carry an
+        ``anim_listener`` (consumers are dynamic at runtime via
+        ``GetAttributeChangedSignal``; slice 2's Luau-scan pass
+        discovers any STATIC readers and emits them under the
+        ``"consumer"`` role).
+      - ``"consumer"``: for shared-attribute candidates only -- one
+        per ``script_id`` whose post-transpile Luau source reads the
+        bridged attribute via ``:GetAttribute("has...")``. Slice 2's
+        Luau-scan pass emits one row per matched script. Empty on
+        the resume path (``state.transpilation_result is None``) --
+        slice 3 falls back to broadcast emission when this list is
+        empty.
+
+    ``ref`` is the consumer-readable identifier the bridge emitter
+    (slice 3) will dereference: a script_id for caller / anim_listener
+    / consumer roles, a synthesized id for the listener role.
+    ``remote_event`` role is reserved for slice 3's emitter to
+    optionally stamp the dotted DataModel path of the synthesized
+    ``RemoteEvent`` -- slice 2 does not emit ``remote_event`` rows
+    (the path is fully derivable from ``event_name`` at slice 3 emit
+    time).
     """
 
     role: str
@@ -205,11 +256,27 @@ class SharedAttributeSeed:
     here because the producer pass walks the SCENE — it does not know
     the per-instance ``itemName`` config without re-resolving every
     instance, which would invert the candidate enumeration cost.
+
+    ``producer_domain`` (R3, 2026-05-31): the bridge direction the
+    converter's runtime contract REQUIRES for this pattern. Encoded
+    here because ``infer_module_domains`` (``module_domain.py``
+    Rule 7) defaults low-signal producers to ``"client"`` — for the
+    locked Pickup case, the existing ``pickup_remote_event_server``
+    pack at ``script_coherence_packs.py:380-394`` fires
+    ``:FireClient`` (server-originated), so the seeded candidate
+    MUST be tagged ``"server"`` regardless of what inference says
+    about ``Pickup.cs``'s source. ``compute_shared_attribute_candidates``
+    uses this field for the candidate's ``from_domain`` — the inferred
+    domain remains the structural signal for FINDING the producer
+    instance, but the seed encodes the bridge direction (the runtime
+    contract is authoritative for seeded patterns; inference is a
+    tool for instance discovery, not for naming the contract).
     """
 
     producer_class_name: str
     remote_event_name: str
     attribute_template: str
+    producer_domain: Literal["client", "server"]
 
 
 # Phase 2b slice 1: structural pre-transpile seed table. The table seeds
@@ -260,6 +327,13 @@ SHARED_ATTRIBUTE_SEEDS: tuple[SharedAttributeSeed, ...] = (
         producer_class_name="Pickup",
         remote_event_name="PickupItemEvent",
         attribute_template="has<itemName>",
+        # R3 (2026-05-31): server-originated. The existing
+        # ``pickup_remote_event_server`` pack fires ``:FireClient``
+        # (``script_coherence_packs.py:380-394``), so the bridge runs
+        # server->client. ``infer_module_domains`` Rule 7 would
+        # default Pickup.cs to low-confidence ``"client"``; the seed
+        # overrides that for the bridge direction.
+        producer_domain="server",
     ),
 )
 
@@ -295,26 +369,35 @@ def shared_attribute_candidate_id(
     return f"shared_attr::{owner_ref}::{instance_id}::{event_name}"
 
 
-def _derive_event_name_from_owner_field(owner_class: str, field: str) -> str:
+def _derive_event_name_from_owner_field(
+    owner_class: str, field: str,
+) -> str | None:
     """Component-ref edges: deterministic ``<owner>_Set<Field>`` event
     name per design doc L239 (the ``Door_SetOpen`` example).
 
     ``field`` is capitalized only at its first character; multi-word
     camelCase fields (``isOpen`` → ``IsOpen``) keep internal casing so
-    the name is human-recognizable. Empty field yields
-    ``<owner>_Set`` rather than asserting — slice 2's enrichment can
-    detect and reject the empty-field shape if needed; slice 1 stays
-    permissive so a malformed input doesn't crash the producer.
+    the name is human-recognizable.
+
+    Phase 2b slice 2 (P3 carry-forward from slice 1): returns ``None``
+    when ``field`` is empty. An empty-field component-ref edge has no
+    semantic content (the producer has no field to write) -- emitting
+    ``<owner>_Set`` would create a fragile event name + collide with
+    every other empty-field edge from the same owner class. The
+    structural-producer ``compute_cross_domain_edges`` skips edges
+    whose event name is ``None``, so the empty-field row never reaches
+    enrichment.
     """
     if not field:
-        capitalized = ""
-    else:
-        capitalized = field[0].upper() + field[1:]
+        return None
+    capitalized = field[0].upper() + field[1:]
     return f"{owner_class}_Set{capitalized}"
 
 
 def compute_cross_domain_edges(
     scene_runtime: SceneRuntimeArtifact,
+    *,
+    domains_override: Mapping[str, str] | None = None,
 ) -> list[CrossDomainEdge]:
     """Enumerate every cross-domain serialized reference in the plan.
 
@@ -331,6 +414,30 @@ def compute_cross_domain_edges(
     ``"same_domain_no_bridge"`` once it cross-checks finalized domains
     against the live module table. ``bridge_member_scripts`` stays
     empty until slice 2 fills it.
+
+    Phase 2b slice 2 (P3 carry-forward from slice 1):
+      - Iterates ``scenes`` and ``prefabs`` in SORTED key order so the
+        combined output across both producers is stable across runs
+        even when the upstream planner reorders its dict insertions.
+        Matches ``compute_shared_attribute_candidates`` (which already
+        sorted) so the two producers feed deterministically into the
+        enrichment pass.
+      - Skips edges whose ``field`` is empty (the producer has no
+        attribute to write; ``_derive_event_name_from_owner_field``
+        returns ``None`` on that input and the row is dropped here
+        rather than emitting a fragile ``<owner>_Set`` event name).
+
+    ``domains_override`` (Phase 2b slice 2 R1 P1-A fix): when supplied,
+    consulted FIRST for each script_id's domain. Falls back to
+    ``scene_runtime["modules"][sid]["domain"]`` only when
+    ``domains_override.get(sid)`` is missing or empty. Required by the
+    prepass call site (``pipeline.py`` ``_maybe_run_topology_prepass``)
+    which runs BEFORE ``classify_scene_runtime_domains()`` stamps
+    domains back onto ``scene_runtime`` — without the override, every
+    edge on a fresh run sees ``""`` for both src + tgt domain and gets
+    dropped by the ``NON_RUNTIME_DOMAINS`` filter. Direct callers
+    (e.g. tests, the report writer) that pass already-stamped
+    artifacts can omit the kwarg and the fallback path keeps working.
 
     Pure function; does not mutate ``scene_runtime``.
     """
@@ -356,6 +463,18 @@ def compute_cross_domain_edges(
         stem = mod.get("stem", "")
         return stem if isinstance(stem, str) else ""
 
+    def _resolve_domain(script_id: str) -> str:
+        # P1-A fix: consult ``domains_override`` first (the prepass's
+        # already-inferred-but-not-yet-stamped domains), then fall
+        # back to the on-row stamped value (direct callers / resume).
+        if domains_override is not None:
+            override_val = domains_override.get(script_id, "")
+            if isinstance(override_val, str) and override_val:
+                return override_val
+        mod = modules.get(script_id, {})
+        domain_obj = mod.get("domain", "")
+        return domain_obj if isinstance(domain_obj, str) else ""
+
     def _scan(
         owner_kind: str,
         owner_ref: str,
@@ -370,12 +489,8 @@ def compute_cross_domain_edges(
             tgt_sid = instance_to_script.get(tgt_inst, "")
             if not src_sid or not tgt_sid:
                 continue
-            src_mod = modules.get(src_sid, {})
-            tgt_mod = modules.get(tgt_sid, {})
-            src_domain_obj = src_mod.get("domain", "")
-            tgt_domain_obj = tgt_mod.get("domain", "")
-            src_domain = src_domain_obj if isinstance(src_domain_obj, str) else ""
-            tgt_domain = tgt_domain_obj if isinstance(tgt_domain_obj, str) else ""
+            src_domain = _resolve_domain(src_sid)
+            tgt_domain = _resolve_domain(tgt_sid)
             if (src_domain in NON_RUNTIME_DOMAINS
                     or tgt_domain in NON_RUNTIME_DOMAINS):
                 continue
@@ -386,6 +501,11 @@ def compute_cross_domain_edges(
             event_name = _derive_event_name_from_owner_field(
                 owner_class, field,
             )
+            if event_name is None:
+                # Slice 2 P3 carry-forward: skip empty-field rows
+                # rather than emit a fragile ``<owner>_Set`` event
+                # name. The producer has no attribute to write here.
+                continue
             out.append(CrossDomainEdge(
                 id=deterministic_edge_id(src_inst, field, tgt_inst),
                 kind="attribute_write",
@@ -409,9 +529,11 @@ def compute_cross_domain_edges(
                 ),
             ))
 
-    for key, scene in scenes.items():
+    for key in sorted(scenes.keys()):
+        scene = scenes[key]
         _scan("scene", key, scene.get("references", []))
-    for key, prefab in prefabs.items():
+    for key in sorted(prefabs.keys()):
+        prefab = prefabs[key]
         _scan("prefab", key, prefab.get("references", []))
 
     return out
@@ -419,6 +541,8 @@ def compute_cross_domain_edges(
 
 def compute_shared_attribute_candidates(
     scene_runtime: SceneRuntimeArtifact,
+    *,
+    domains_override: Mapping[str, str] | None = None,
 ) -> list[CrossDomainEdge]:
     """Enumerate every scene/prefab instance whose component class
     matches a ``SHARED_ATTRIBUTE_SEEDS`` row.
@@ -436,9 +560,44 @@ def compute_shared_attribute_candidates(
 
     Iteration order is deterministic: scenes (sorted by key, then
     instance list order), then prefabs (sorted by key, then instance
-    list order). Stable across runs given the same input. Matches the
-    `_scan` traversal order in ``compute_cross_domain_edges`` so the
-    concatenated output in ``build_topology`` stays sortable.
+    list order). Phase 2b slice 2 unifies the two producers on this
+    sorted-iteration shape (``compute_cross_domain_edges`` previously
+    used dict-insertion order; both now sort). Stable across runs
+    given the same input independent of upstream dict insertion order
+    — required by the enrichment pass that feeds both producers'
+    outputs into a single duplicate-event-name check.
+
+    **Domain handling (Phase 2b slice 2 R3 + R4, 2026-05-31).** Two
+    distinct uses of the module's classified domain, deliberately
+    separated:
+
+    1. **Bridge DIRECTION** is the seed's ``producer_domain``, NOT the
+       inferred domain. ``infer_module_domains`` would mislabel a
+       low-signal Pickup as ``"client"`` (Rule 7); the seed encodes the
+       converter's runtime bridge contract (server-originated for
+       Pickup, matching the ``:FireClient`` pack at
+       ``script_coherence_packs.py:380-394``). So a runtime-domain or
+       not-yet-classified producer always gets ``from_domain =
+       seed.producer_domain``.
+
+    2. **Explicit exclusion** (R4, Codex P2) IS honored. If the
+       module's resolved domain is an EXPLICIT non-runtime
+       classification — ``"helper"`` / ``"excluded"`` / ``"legacy"``,
+       i.e. ``NON_RUNTIME_DOMAINS`` minus the empty string — the seed
+       match is DROPPED: a deliberately opted-out producer must not
+       emit a live bridge candidate, or the artifact contradicts itself
+       (``modules[sid].domain == "excluded"`` alongside a ``"server"``
+       candidate). The empty string ``""`` is NOT an exclusion: it is
+       the fresh-run "not yet classified" state (the prepass runs
+       before the classifier stamps domains back). Dropping on ``""``
+       would reintroduce the slice-2 R1 P1-A bug (every fresh-run
+       candidate vanishing).
+
+    ``domains_override`` supplies the resolved domain for the exclusion
+    check (the prepass's already-inferred, override-aware ``domains``
+    dict), falling back to the on-row stamped ``modules[sid].domain``.
+    It is used ONLY to detect explicit exclusion — never to set the
+    bridge direction (that stays the seed's job).
 
     Pure function; does not mutate ``scene_runtime``.
     """
@@ -465,7 +624,14 @@ def compute_shared_attribute_candidates(
         stem = mod.get("stem", "")
         return stem if isinstance(stem, str) else ""
 
-    def _module_domain(script_id: str) -> str:
+    def _resolved_domain(script_id: str) -> str:
+        # Override first (prepass's inferred + operator-override-aware
+        # domains), then the on-row stamped value. Used ONLY for the
+        # explicit-exclusion check below — never for bridge direction.
+        if domains_override is not None:
+            override_val = domains_override.get(script_id, "")
+            if isinstance(override_val, str) and override_val:
+                return override_val
         mod = modules.get(script_id, {})
         domain = mod.get("domain", "")
         return domain if isinstance(domain, str) else ""
@@ -489,7 +655,23 @@ def compute_shared_attribute_candidates(
             )
             if not instance_id:
                 continue
-            from_domain = _module_domain(script_id)
+            # R4 (Codex P2, 2026-05-31): honor EXPLICIT exclusion. A
+            # module deliberately classified/overridden to a non-runtime
+            # domain (helper/excluded/legacy — NOT the empty "" fresh-run
+            # state) opted out; drop the seed match rather than emit a
+            # live server candidate that contradicts the artifact. ""
+            # is NOT an exclusion (see docstring): keep it.
+            resolved = _resolved_domain(script_id)
+            if resolved and resolved in NON_RUNTIME_DOMAINS:
+                continue
+            # R3 (2026-05-31): the seed's ``producer_domain`` is the
+            # bridge DIRECTION the runtime contract REQUIRES —
+            # authoritative over the inferred domain. The resolved
+            # domain above gates exclusion only; it never sets
+            # direction. For Pickup this is ``"server"`` (the pack
+            # fires ``:FireClient``); inference Rule 7 would mislabel
+            # it ``"client"`` on a low-signal source.
+            from_domain = seed.producer_domain
             out.append(CrossDomainEdge(
                 id=shared_attribute_candidate_id(
                     owner_ref, instance_id, seed.remote_event_name,

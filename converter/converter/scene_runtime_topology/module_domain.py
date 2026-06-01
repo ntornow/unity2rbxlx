@@ -103,6 +103,9 @@ from converter.scene_runtime_planner import (
     SceneRuntimeReference,
     SceneRuntimeScene,
 )
+from converter.scene_runtime_topology.cross_domain_edges import (
+    CrossDomainEdge,
+)
 from converter.storage_classifier import (
     REPLICATED_STORAGE,
     SERVER_SCRIPT_SERVICE,
@@ -591,6 +594,32 @@ class TopologyInputs(TypedDict):
     ``scene_runtime`` + the planner's ``dependency_map`` — NO
     ``parent_path`` reads.
 
+    Phase 2b slice 2 grows this dict with TWO NEW fields:
+    ``cross_domain_edges`` + ``cross_domain_edge_candidates``. The
+    structural producers from ``cross_domain_edges.py`` (component-ref
+    + shared-attribute) relocate from ``build_topology`` into
+    ``_maybe_run_topology_prepass`` so the post-transpile enrichment
+    pass that follows can run in the same scope as the prepass
+    (with ``state.transpilation_result``, ``domains``,
+    ``script_id_by_name`` all in hand). ``build_topology`` becomes
+    pure-assembly: it reads these two fields off ``TopologyInputs``
+    and writes them straight into the artifact dict; the producers
+    are no longer called from inside the assembler.
+
+    The two new fields hold the slice 2-enriched rows:
+      - ``cross_domain_edges``: fully-resolved component-ref edges with
+        ``from_*`` AND ``to_*`` populated. ``bridge_member_scripts``
+        carries ``client_caller``, ``server_listener``,
+        ``anim_listener`` rows (slice 2 enrichment fills these).
+      - ``cross_domain_edge_candidates``: fan-out shared-attribute
+        candidates with empty ``to_*`` (one Pickup fans to N
+        consumers; slice 3's emitter broadcasts via ``FireAllClients``).
+        ``bridge_member_scripts`` carries ``client_caller``,
+        ``server_listener``, and zero-or-more ``consumer`` rows
+        (slice 2 Luau-scan discovers static readers; resume path
+        with no transpilation_result leaves consumers empty and
+        slice 3 falls back to broadcast).
+
     Slice 6 plumbs this through ``classify_storage`` as a
     no-op-on-default kwarg; slice 7 flips ``_decide_script_container``
     to consume it. Threaded through ``classify_storage`` as a kwarg;
@@ -598,7 +627,11 @@ class TopologyInputs(TypedDict):
     conclusions). Always recomputed from current operator inputs via
     ``Pipeline._maybe_run_topology_prepass`` on every invocation,
     including ``--phase=write_output`` resumes (the prepass is in
-    ``ESSENTIAL_PHASES``).
+    ``ESSENTIAL_PHASES``). The Phase 2b slice 2 edge fields are also
+    NOT persisted -- they're recomputed from
+    ``scene_runtime`` + the producer functions + the live
+    ``transpilation_result`` on every run, per the slice-6 "save raw
+    facts, recompute conclusions" rule.
     """
 
     # ``script_id`` -> domain verdict from ``infer_module_domains``.
@@ -639,6 +672,23 @@ class TopologyInputs(TypedDict):
     # See ``scene-runtime-architecture-ir.md`` §"TopologyInputs shape
     # -- transpile_ran" and §"Unconstrained-helper fallback contract".
     transpile_ran: bool
+    # Phase 2b slice 2: produced + enriched by
+    # ``Pipeline._maybe_run_topology_prepass``. Fully-resolved
+    # component-ref cross-domain edges (one row per peer-MonoBehaviour
+    # serialized reference whose endpoints sit in different runtime
+    # domains). ``build_topology`` reads from here and writes straight
+    # into the artifact -- it no longer calls the producer itself.
+    # ``bridge_member_scripts`` populated by slice 2 enrichment.
+    cross_domain_edges: list[CrossDomainEdge]
+    # Phase 2b slice 2: produced + enriched by
+    # ``Pipeline._maybe_run_topology_prepass``. Fan-out shared-attribute
+    # candidates (one row per producer instance whose component class
+    # matches a ``SHARED_ATTRIBUTE_SEEDS`` row). ``to_*`` empty by
+    # design -- one producer fans out to N consumers. Slice 2 enrichment
+    # populates ``bridge_member_scripts`` with ``client_caller`` +
+    # synthesized ``server_listener`` + zero-or-more ``consumer`` rows
+    # (Luau-scan over post-transpile ``:GetAttribute("has...")`` reads).
+    cross_domain_edge_candidates: list[CrossDomainEdge]
 
 
 def infer_module_domains(
