@@ -922,11 +922,26 @@ literal scan is impossible — the writer name is runtime-computed.
    artifact field + assembly (`build_topology.py:353-367,563`), the
    candidate-specific invariants (`build_topology.py:1442-1482`), and the
    ~30+ seed/candidate tests (`test_scene_runtime_topology.py` slice-1/2/R3/R4
-   blocks). The gate read-site: the topology prepass writes the fact onto
-   `ctx.scene_runtime` (read at the autogen-inject site,
-   `_subphase_inject_autogen_scripts`, `pipeline.py:3101`); the prepass runs
-   in `materialize_and_classify` BEFORE `write_output`, so the fact is
-   available at injection time.
+   blocks). The gate read-site (**corrected, step-2 R2**): the topology prepass
+   (`_maybe_run_topology_prepass`) stashes the computed
+   `shared_flag_channels` fact on the TRANSIENT, run-scoped field
+   `self.state.shared_flag_channels` (a `SharedFlagChannels | None` on
+   `PipelineState`); the gate `_shared_flag_funnel_present` reads THAT stash
+   at the autogen-inject site (`_subphase_inject_autogen_scripts`). The prepass
+   runs in `materialize_and_classify` BEFORE `write_output`, so the stash is
+   set by injection time. **It does NOT read `ctx.scene_runtime["topology"]`**
+   — the original framing was wrong: `ctx.scene_runtime` is the planner's
+   PRE-topology dict (set once at the planner phase) and the `topology` block
+   is built only on the MERGED LOCAL dict inside `_classify_storage`
+   (`_merge_scene_runtime` returns a fresh copy) and is NEVER written back to
+   ctx. Reading off ctx therefore always missed → fail-open → the gate was a
+   production NO-OP (tests passed only by manually seeding
+   `ctx.scene_runtime["topology"]`). The transient stash is fed by the prepass
+   on EVERY run (incl. the resume fail-open `present: True`), is never fed into
+   `_merge_scene_runtime`, and is never persisted — so it does not re-stale the
+   recompute-only fact. The persisted `topology["shared_flag_channels"]` in
+   `conversion_plan.json` REMAINS the authority for **Phase 3** to read from
+   the plan; it is just not the in-run gate's read site.
 
 4. **Legacy-only pack retirement (unchanged, slices 4-5).** The
    `pickup_remote_event_server` pack and its 6 `after=(…)` dependents are

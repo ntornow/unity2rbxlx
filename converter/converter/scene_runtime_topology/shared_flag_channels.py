@@ -29,8 +29,12 @@ slice 3 gates the autogen injection on it.
       }
     }
 
-  - ``read_names``: literal ``:GetAttribute("...")`` reads whose reader
-    resolves to a domain DIFFERENT from where the funnel writes. The
+  - ``read_names``: ``:GetAttribute("...")`` reads — AND
+    ``:GetAttributeChangedSignal("...")`` signal subscriptions (a reader
+    whose only shared-flag access is waiting for the flag to change is
+    still a cross-domain reader; Phase 3 deliverable #2 lists this form)
+    — whose reader resolves to a domain DIFFERENT from where the funnel
+    writes. The
     funnel write is client-originated (``mirrorFlag`` fires from the
     client; the server's ``OnServerEvent`` listener sets the attribute),
     so the canonical cross-domain reader is server-domain. Sourced from
@@ -110,8 +114,17 @@ _FUNNEL_WRITER_DOMAIN = "client"
 # change recorded impossible attribute names (spaces/hyphens) the funnel's
 # ``^[%w_]+$`` filter can never deliver, making the fact claim runtime
 # coverage that doesn't exist. Codex R2 P2, 2026-06-01.
+# Also matches ``:GetAttributeChangedSignal("name")`` — a server reader
+# whose ONLY shared-flag access is the *signal* form (waits for the flag
+# to change rather than reading its current value) is just as much a
+# cross-domain reader as the literal ``:GetAttribute("name")`` form, and
+# Phase 3 deliverable #2 explicitly lists ``GetAttributeChangedSignal``
+# readers. The optional ``ChangedSignal`` group keeps one regex for both;
+# the ``\w+`` charset + <=64 cap + quote backreference are unchanged
+# (Roblox attribute-name constraint == the funnel's ``^[%w_]+$`` filter).
+# Claude R1 P2, 2026-06-01.
 _GET_ATTR_RE = re.compile(
-    r""":GetAttribute\(\s*(?P<q>['"])(?P<attr>\w+)(?P=q)\s*\)""",
+    r""":GetAttribute(?:ChangedSignal)?\(\s*(?P<q>['"])(?P<attr>\w+)(?P=q)\s*\)""",
 )
 
 # Mirror the funnel listener's length cap (``#flagName > 64``): a captured
@@ -205,7 +218,12 @@ def compute_shared_flag_channels(
     # evidence that disables the funnel.
     fail_open_present = False
     for ts in transpiled_scripts:
-        if ":GetAttribute(" not in ts.luau_source:
+        # Early skip: ``:GetAttribute`` is the shared prefix of BOTH the
+        # literal read (``:GetAttribute(``) and the signal form
+        # (``:GetAttributeChangedSignal(``) the regex now matches. Using
+        # the prefix (no trailing ``(``) keeps both in scope. Claude R1
+        # P2, 2026-06-01.
+        if ":GetAttribute" not in ts.luau_source:
             continue
         reader_sid = _script_id_for_transpiled(ts, script_id_by_name)
         if not reader_sid:

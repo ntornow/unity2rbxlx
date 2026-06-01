@@ -12,7 +12,13 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Iterable, Mapping
+from typing import TYPE_CHECKING
 from typing import Any, cast
+
+if TYPE_CHECKING:
+    from converter.scene_runtime_topology.shared_flag_channels import (
+        SharedFlagChannels,
+    )
 
 import config as _config
 from config import (
@@ -139,6 +145,24 @@ class PipelineState:
     # Output of converter/semantic_validators.run_semantic_validators
     # — surfaced via conversion_report.json under ``semantic_warnings``.
     semantic_report: object | None = None
+    # Phase 2b reframe step 2 (R2): TRANSIENT stash of the Class-2
+    # shared-flag channel fact for the ``PlayerSetSharedFlag`` funnel
+    # gate. Set fresh by ``_maybe_run_topology_prepass`` every run at the
+    # point ``compute_shared_flag_channels`` produces it (including the
+    # no-transpile resume fail-open path, where it records ``present:
+    # True``). This is the ONLY ctx/state surface the step-2 gate
+    # (``_shared_flag_funnel_present``) reads — it is NEVER fed into
+    # ``_merge_scene_runtime`` and NEVER persisted, so it cannot re-stale
+    # a recompute-only derived fact (the "save raw facts, recompute
+    # conclusions" rule). The persisted copy in
+    # ``conversion_plan.json`` under ``scene_runtime.topology
+    # .shared_flag_channels`` stays for Phase 3 to read from the plan;
+    # this in-memory stash exists ONLY because the late merged-local
+    # ``scene_runtime`` dict (which carries ``topology``) is never
+    # written back to ``ctx.scene_runtime``, so the gate cannot reach it
+    # off ctx. ``None`` until the prepass runs → gate defaults to
+    # fail-safe ``True`` (legacy mode never computes it, keep the funnel).
+    shared_flag_channels: "SharedFlagChannels | None" = None
 
 
 class Pipeline:
@@ -3040,43 +3064,54 @@ return table.concat(allData, "\\n")'''
     def _shared_flag_funnel_present(self) -> bool:
         """Read the ``PlayerSetSharedFlag`` gate from the topology fact.
 
-        Phase 2b slice 3: the topology prepass (``build_topology`` in
-        ``materialize_and_classify``) writes
-        ``scene_runtime["topology"]["shared_flag_channels"]
-        ["PlayerSetSharedFlag"]["present"]`` — ``True`` iff a cross-domain
-        server reader of a shared flag exists on a fresh transpile (and
-        ``True`` as the resume / unmappable-reader fail-open). That phase
-        runs BEFORE ``write_output`` (where the autogen injection lives),
-        so the fact is on ``ctx.scene_runtime`` by the time this reads it.
+        Phase 2b reframe step 2 (R2): the topology prepass
+        (``_maybe_run_topology_prepass``, run inside
+        ``materialize_and_classify`` BEFORE ``write_output``) computes the
+        Class-2 shared-flag channel fact via
+        ``compute_shared_flag_channels`` and stashes it on the TRANSIENT
+        run-scoped field ``self.state.shared_flag_channels``. The
+        ``present`` flag is ``True`` iff a cross-domain server reader of a
+        shared flag exists on a fresh transpile (and ``True`` as the
+        resume / unmappable-reader fail-open).
 
-        FAIL-SAFE DEFAULT ``True``: when the topology block is absent
-        (legacy mode, no topology, or any shape surprise) keep the funnel
-        — that is exactly today's unconditional behavior, strictly no
-        worse. The gate only NARROWS the funnel when the fact authoritatively
-        says ``present: False``.
+        R2 NO-OP FIX: this previously read
+        ``ctx.scene_runtime["topology"]["shared_flag_channels"]``, but
+        ``ctx.scene_runtime`` is the planner's PRE-topology structural
+        dict — the ``topology`` block is built only on the MERGED LOCAL
+        dict inside ``_classify_storage`` (``_merge_scene_runtime``
+        returns a fresh copy) and is never written back to
+        ``ctx.scene_runtime``, persisted to ``conversion_plan.json``
+        instead. So in real conversions the old lookup always missed →
+        fail-open default → the funnel stayed unconditional (the gate was
+        a production no-op). The transient stash is the run-scoped surface
+        that actually carries the fact into ``write_output``. The persisted
+        ``topology["shared_flag_channels"]`` copy stays for Phase 3 to read
+        from the plan; it is intentionally NOT the gate's read site, to
+        avoid writing the merged dict back to ``ctx.scene_runtime`` (which
+        would re-stale a recompute-only fact through
+        ``_merge_scene_runtime``).
 
-        Strict typing: ``ctx.scene_runtime`` is ``dict[str, object]``, so
-        each nested level is narrowed with ``isinstance`` before the next
-        lookup; ``present`` is coerced to ``bool``. No ``Any``.
+        FAIL-SAFE DEFAULT ``True``: when the stash is unset (legacy mode,
+        which never runs the prepass; or any code path that reaches
+        ``write_output`` without ``_classify_storage``) keep the funnel —
+        that is exactly today's unconditional behavior, strictly no worse.
+        The gate only NARROWS the funnel when the stashed fact
+        authoritatively says ``present: False``.
+
+        Strict typing: reads the typed ``SharedFlagChannels`` stash. No
+        ``Any``.
         """
         from converter.scene_runtime_topology.shared_flag_channels import (
             FUNNEL_EVENT_NAME,
         )
 
-        scene_runtime = self.ctx.scene_runtime or {}
-        topology = scene_runtime.get("topology")
-        if not isinstance(topology, dict):
-            return True
-        channels = topology.get("shared_flag_channels")
-        if not isinstance(channels, dict):
+        channels = self.state.shared_flag_channels
+        if channels is None:
             return True
         channel = channels.get(FUNNEL_EVENT_NAME)
-        if not isinstance(channel, dict):
+        if channel is None:
             return True
-        present = channel.get("present", True)
-        if not isinstance(present, bool):
-            return True
-        return present
+        return channel["present"]
 
     def _subphase_inject_autogen_scripts(self) -> None:
         """Synthesize project-bootstrap scripts: collision-group setup,
@@ -4720,6 +4755,23 @@ script.Disabled = true
             script_id_by_name=script_id_by_name,
             domains=domains,
         )
+        # Phase 2b reframe step 2 (R2): stash the fact on the TRANSIENT
+        # run-scoped ``state`` so the step-2 funnel gate
+        # (``_shared_flag_funnel_present``, read in ``write_output``) can
+        # reach it. The gate previously read
+        # ``ctx.scene_runtime["topology"]["shared_flag_channels"]``, but
+        # ``ctx.scene_runtime`` is the planner's PRE-topology dict — the
+        # ``topology`` block is built only on the MERGED LOCAL dict
+        # (``_merge_scene_runtime`` returns a fresh copy) and is never
+        # written back to ctx, so that read always missed → fail-open →
+        # the gate was a production NO-OP. ``state`` is rebuilt fresh
+        # every run (incl. resume, where this code re-runs and stashes the
+        # fail-open ``present: True``), is never persisted, and is never
+        # fed into ``_merge_scene_runtime``, so this does not re-stale the
+        # recompute-only fact. The persisted copy in
+        # ``scene_runtime.topology`` stays for Phase 3 to read from the
+        # plan.
+        self.state.shared_flag_channels = shared_flag_channels
 
         return TopologyInputs(
             domains=domains,

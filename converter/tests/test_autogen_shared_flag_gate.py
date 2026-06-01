@@ -16,11 +16,18 @@ Two layers of coverage:
    pre-slice-3 monolith) or omits ONLY that block (``False``), keeping
    ``PlayerShoot`` + ``PlayerGetItem`` + spawn handling unconditional.
 
-2. ``_subphase_inject_autogen_scripts`` pipeline gate: reads
-   ``present`` off ``ctx.scene_runtime["topology"]["shared_flag_channels"]
-   ["PlayerSetSharedFlag"]`` and threads it into the generator. ``False`` →
-   funnel omitted; ``True`` / absent fact (legacy) / resume-shape → funnel
+2. ``_subphase_inject_autogen_scripts`` pipeline gate: reads ``present``
+   off the TRANSIENT stash ``self.state.shared_flag_channels`` (step-2 R2:
+   the gate's read site moved off ``ctx.scene_runtime["topology"]``, which
+   was a production no-op — ``ctx.scene_runtime`` is the planner's
+   pre-topology dict, and the ``topology`` block is built only on the merged
+   local dict and never written back to ctx). ``present: False`` → funnel
+   omitted; ``present: True`` / unset stash (legacy) / resume-shape → funnel
    kept (fail-safe). The ``if not existing_server_mgr`` guard injects once.
+
+   See ``test_shared_flag_funnel_realpath.py`` for the REAL-WIRING
+   integration test that drives the actual prepass→classify→inject path
+   (the regression guard for the no-op these unit tests masked).
 """
 from __future__ import annotations
 
@@ -31,6 +38,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from converter.autogen import generate_game_server_script  # noqa: E402
 from converter.pipeline import Pipeline  # noqa: E402
+from converter.scene_runtime_topology.shared_flag_channels import (  # noqa: E402
+    FUNNEL_EVENT_NAME,
+    SharedFlagChannel,
+    SharedFlagChannels,
+)
 from core.roblox_types import RbxPlace  # noqa: E402
 
 
@@ -119,12 +131,20 @@ def _make_pipeline(tmp_path: Path) -> Pipeline:
     return Pipeline(str(unity_project), str(output))
 
 
-def _stage(pipeline: Pipeline, scene_runtime: dict[str, object]) -> None:
-    """Stage a minimal place + scene_runtime so
+def _stage(
+    pipeline: Pipeline,
+    channels: SharedFlagChannels | None,
+) -> None:
+    """Stage a minimal place + TRANSIENT stash so
     ``_subphase_inject_autogen_scripts`` runs and injects
-    GameServerManager."""
+    GameServerManager.
+
+    Step-2 R2: the gate reads ``state.shared_flag_channels`` (the
+    run-scoped stash the prepass sets), NOT ``ctx.scene_runtime``. These
+    Layer-2 tests therefore set the stash directly. ``None`` models the
+    legacy / no-prepass case (stash never set)."""
     pipeline.state.rbx_place = RbxPlace()
-    pipeline.ctx.scene_runtime = scene_runtime
+    pipeline.state.shared_flag_channels = channels
 
 
 def _game_server_source(pipeline: Pipeline) -> str:
@@ -139,18 +159,14 @@ def _game_server_source(pipeline: Pipeline) -> str:
     return mgrs[0].source
 
 
-def _channel(present: bool) -> dict[str, object]:
+def _channel(present: bool) -> SharedFlagChannels:
     return {
-        "topology": {
-            "shared_flag_channels": {
-                _FUNNEL_EVENT_NAME: {
-                    "read_names": ["hasKey"] if present else [],
-                    "reader_domains": ["server"] if present else [],
-                    "canonical_stores": ["Character", "Player"],
-                    "present": present,
-                },
-            },
-        },
+        FUNNEL_EVENT_NAME: SharedFlagChannel(
+            read_names=["hasKey"] if present else [],
+            reader_domains=["server"] if present else [],
+            canonical_stores=["Character", "Player"],
+            present=present,
+        ),
     }
 
 
@@ -174,23 +190,24 @@ class TestSharedFlagFunnelGate:
         assert _FUNNEL_EVENT_NAME in src
         assert _FUNNEL_LISTENER in src
 
-    def test_absent_topology_fails_open(self, tmp_path: Path) -> None:
-        """No topology block at all (legacy mode / no topology pass) →
+    def test_unset_stash_fails_open(self, tmp_path: Path) -> None:
+        """Stash never set (legacy mode / no topology prepass) →
         fail-safe to today's unconditional injection."""
         pipeline = _make_pipeline(tmp_path)
-        _stage(pipeline, {})  # no "topology" key
+        _stage(pipeline, None)  # stash unset
         pipeline._subphase_inject_autogen_scripts()
         src = _game_server_source(pipeline)
         assert _FUNNEL_EVENT_NAME in src
         assert _FUNNEL_LISTENER in src
 
-    def test_topology_without_channels_fails_open(
+    def test_stash_without_funnel_channel_fails_open(
         self, tmp_path: Path,
     ) -> None:
-        """Topology block present but no ``shared_flag_channels`` (e.g.
-        an older topology shape) → fail-safe to funnel-included."""
+        """Stash present but missing the ``PlayerSetSharedFlag`` key (a
+        future multi-funnel shape, or a partial fact) → fail-safe to
+        funnel-included."""
         pipeline = _make_pipeline(tmp_path)
-        _stage(pipeline, {"topology": {"animation_drivers": {}}})
+        _stage(pipeline, {})  # SharedFlagChannels with no funnel key
         pipeline._subphase_inject_autogen_scripts()
         src = _game_server_source(pipeline)
         assert _FUNNEL_EVENT_NAME in src
@@ -199,17 +216,13 @@ class TestSharedFlagFunnelGate:
         """Step-1 resume fail-open shape (``present: True`` with empty
         ``read_names``) → funnel kept."""
         pipeline = _make_pipeline(tmp_path)
-        resume = {
-            "topology": {
-                "shared_flag_channels": {
-                    _FUNNEL_EVENT_NAME: {
-                        "read_names": [],
-                        "reader_domains": [],
-                        "canonical_stores": ["Character", "Player"],
-                        "present": True,
-                    },
-                },
-            },
+        resume: SharedFlagChannels = {
+            FUNNEL_EVENT_NAME: SharedFlagChannel(
+                read_names=[],
+                reader_domains=[],
+                canonical_stores=["Character", "Player"],
+                present=True,
+            ),
         }
         _stage(pipeline, resume)
         pipeline._subphase_inject_autogen_scripts()
@@ -218,23 +231,18 @@ class TestSharedFlagFunnelGate:
         assert _FUNNEL_LISTENER in src
 
     def test_helper_reads_present_directly(self, tmp_path: Path) -> None:
-        """The typed accessor returns the fact's ``present`` value and
-        defaults True on every absent / malformed shape."""
+        """The typed accessor returns the stashed fact's ``present`` value
+        and defaults True when the stash is unset or missing the funnel
+        channel."""
         pipeline = _make_pipeline(tmp_path)
-        pipeline.ctx.scene_runtime = _channel(present=False)
+        pipeline.state.shared_flag_channels = _channel(present=False)
         assert pipeline._shared_flag_funnel_present() is False
-        pipeline.ctx.scene_runtime = _channel(present=True)
+        pipeline.state.shared_flag_channels = _channel(present=True)
         assert pipeline._shared_flag_funnel_present() is True
-        pipeline.ctx.scene_runtime = {}
+        pipeline.state.shared_flag_channels = None
         assert pipeline._shared_flag_funnel_present() is True
-        # Malformed present (non-bool) → fail-safe True.
-        pipeline.ctx.scene_runtime = {
-            "topology": {
-                "shared_flag_channels": {
-                    _FUNNEL_EVENT_NAME: {"present": "yes"},
-                },
-            },
-        }
+        # Stash present but no funnel channel → fail-safe True.
+        pipeline.state.shared_flag_channels = {}
         assert pipeline._shared_flag_funnel_present() is True
 
     def test_idempotent_single_injection(self, tmp_path: Path) -> None:

@@ -5508,6 +5508,38 @@ class TestSharedFlagChannels:
         assert "hasKey" in channel["read_names"]
         assert channel["reader_domains"] == ["server"]
 
+    def test_shared_flag_channels_matches_get_attribute_changed_signal(
+        self,
+    ) -> None:
+        """A server reader whose ONLY shared-flag access is the SIGNAL
+        form ``:GetAttributeChangedSignal("hasKey")`` (no literal
+        ``:GetAttribute("hasKey")`` read) is still a cross-domain reader:
+        ``hasKey`` lands in ``read_names`` and ``present: True``.
+
+        Pre-fix the scan matched only ``:GetAttribute(`` — the
+        ``ChangedSignal`` infix broke that substring AND the regex, so a
+        reader that only WATCHES the flag (rather than reading its current
+        value) was invisible → ``present: False`` → the funnel was wrongly
+        dropped → the watched signal would never fire. Phase 3 deliverable
+        #2 explicitly lists ``GetAttributeChangedSignal`` readers.
+        Claude R1 P2, 2026-06-01.
+        """
+        scripts = [
+            _mk_transpiled(
+                "Door.luau",
+                'part:GetAttributeChangedSignal("hasKey"):Connect(fn)',
+            ),
+        ]
+        out = compute_shared_flag_channels(
+            transpiled_scripts=scripts,
+            script_id_by_name={"Door": "door_sid"},
+            domains={"door_sid": "server"},
+        )
+        channel = out["PlayerSetSharedFlag"]
+        assert channel["present"] is True
+        assert "hasKey" in channel["read_names"]
+        assert channel["reader_domains"] == ["server"]
+
     def test_shared_flag_channels_empty_when_no_cross_domain_reader(
         self,
     ) -> None:
