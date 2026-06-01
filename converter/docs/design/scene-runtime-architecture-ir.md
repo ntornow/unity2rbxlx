@@ -170,9 +170,11 @@ Phase 4B consumers (structurally bound; NO independent topology decisions):
 │                                 re-classify domain.
 ├── animation_converter.py      ← rewrite to read animation_routing for
 │                                 placement + emission shape
-├── code_transpiler.py          ← rewrite to read domain + cross_domain_edges
-│                                 for emission: FireServer for bridge writes,
-│                                 SetAttribute for same-domain
+├── code_transpiler.py          ← Class-1 (component-ref) only: domain +
+│                                 cross_domain_edges. Class-2 (shared-flag)
+│                                 is NOT a transpiler rewrite — the funnel
+│                                 stays (see 2026-06-01 reframe); topology
+│                                 gates+records it.
 └── contract_pipeline.py        ← Phase 3 verifier; enforces consumers
                                   obeyed the artifact + completeness checks
 
@@ -858,25 +860,73 @@ literal scan is impossible — the writer name is runtime-computed.
 2. **Class 2 — shared-flag channel: gate + record (fork ii, Claude+Codex
    unanimous).** Retire the `SHARED_ATTRIBUTE_SEEDS` table and the
    shared-flag `CrossDomainEdge` rows (`cross_domain_edge_candidates`). Replace
-   with a distinct **`shared_flag_channels`** topology fact block carrying:
-   the set of LITERAL flag names read cross-domain (from the existing
-   `shared_state_linter`-style reader scan, slice 2's one reusable piece),
-   their reader domains, and the canonical store(s) the funnel must write
-   (`Player` + `Character`). Slice 3 then **gates** autogen's funnel
-   injection on this fact (emit the `PlayerSetSharedFlag` funnel *only when*
-   a cross-domain shared-flag reader exists, instead of unconditionally) and
-   **records** the channel. The runtime funnel mechanism (prompt + autogen
-   listener) is KEPT — it is the irreducible runtime bridge for dynamic
-   names. **No per-attribute emitter; no producer Luau rewrite; the
+   with a distinct **`shared_flag_channels`** topology fact block. Slice 3
+   then **gates** autogen's funnel injection on this fact (emit the
+   `PlayerSetSharedFlag` funnel *only when* the fact says a cross-domain
+   shared-flag reader exists, instead of unconditionally) and **records**
+   the channel. The runtime funnel mechanism (prompt + autogen listener) is
+   KEPT — it is the irreducible runtime bridge for dynamic names. **No
+   per-attribute emitter; no producer Luau rewrite; the
    `_GENERIC_RUNTIME_PROMPT` funnel guidance STAYS** (deleting it forces a
    cold re-transpile and there is nothing to replace it with — the funnel is
    the generic mechanism).
+
+   **`shared_flag_channels` schema (concrete, per doc-review):** a SINGLE
+   artifact block — there is one funnel (`PlayerSetSharedFlag`), so one
+   channel record, not per-flag rows:
+   ```
+   "shared_flag_channels": {
+     "PlayerSetSharedFlag": {
+       "read_names": ["hasKey", "hasGasCan", ...],  # literal flags read cross-domain
+       "reader_domains": ["server", ...],           # domains that READ a flag
+       "canonical_stores": ["Player", "Character"], # CONSTANT — what the funnel writes
+       "present": true                               # the gate: funnel injected iff true
+     }
+   }
+   ```
+   - `read_names` comes from the existing `shared_state_linter`-style reader
+     scan (slice 2's one reusable piece): literal `GetAttribute("...")` reads
+     whose reader resolves to a domain different from the writer side.
+   - `canonical_stores` is a CONSTANT recorded from the funnel's fixed
+     behavior (`autogen.py:174-176` writes both `Player` and `Character`),
+     NOT a per-read derivation — so slice 3 needs no new signal to record it.
+     (Recording the reader's OWN store, for the Phase 3 coverage check, is a
+     Phase 3 detail — see Phase 3 #2 — not a slice-3 blocker.)
+   - "Coverage" in Phase 3 #2 means: a literal read name ∈ `read_names`
+     (exact membership; `read_names` IS the set of covered literals — the
+     "name/template" wording is reconciled to exact-name membership here).
+
+   **RESUME behavior — the gate FAILS OPEN (settled per doc-review; this is
+   the one genuinely-new design call).** The reader scan source
+   (`state.transpilation_result.scripts`) is ABSENT on a no-transpile
+   resume (`--phase=write_output`, `transpilation_result is None`,
+   `pipeline.py:4659-4667`). A recompute-only fact would then recompute to
+   an EMPTY `read_names` → the gate would WRONGLY disable a needed funnel.
+   So: when `transpilation_result is None`, the gate does NOT tighten — it
+   falls back to today's UNCONDITIONAL injection (`present: true`,
+   `read_names` omitted/unknown). The gate only narrows the funnel on a
+   FRESH transpile where the scan is authoritative. This mirrors the
+   existing resume-degradation contract slice 2 already documents (no
+   consumer rows on resume → broadcast fallback) and the `transpile_ran`
+   pattern. Slice-3 tests MUST pin both: fresh-no-reader → funnel gated OFF;
+   resume-`transpilation_result is None` → funnel KEPT.
 
 3. **Fix the slice-2 persistence-contract drift.** `TopologyInputs` documents
    these facts as recompute-only / not persisted (`module_domain.py:623`,
    the "save raw facts, recompute conclusions" rule), but slice 2 persists
    `cross_domain_edge_candidates` (`build_topology.py:563`). The
    `shared_flag_channels` rework must honor the recompute-only contract.
+   **The slices-1-2 revision must also retire the now-orphaned surfaces
+   that the `cross_domain_edge_candidates` bucket carries** (or CI breaks):
+   the `TopologyInputs` candidate field (`module_domain.py:597-621`), the
+   artifact field + assembly (`build_topology.py:353-367,563`), the
+   candidate-specific invariants (`build_topology.py:1442-1482`), and the
+   ~30+ seed/candidate tests (`test_scene_runtime_topology.py` slice-1/2/R3/R4
+   blocks). The gate read-site: the topology prepass writes the fact onto
+   `ctx.scene_runtime` (read at the autogen-inject site,
+   `_subphase_inject_autogen_scripts`, `pipeline.py:3101`); the prepass runs
+   in `materialize_and_classify` BEFORE `write_output`, so the fact is
+   available at injection time.
 
 4. **Legacy-only pack retirement (unchanged, slices 4-5).** The
    `pickup_remote_event_server` pack and its 6 `after=(…)` dependents are
@@ -929,12 +979,18 @@ flip to fail-closed.
    - **Class 2 (dynamic shared flag):** for every LITERAL
      `GetAttribute("hasX")`/`GetAttributeChangedSignal("hasX")` reader in a
      server domain, require coverage by EITHER a same-domain literal writer
-     OR a `shared_flag_channels` entry whose name/template covers that literal
-     name AND whose recorded canonical store(s) (`Player` + `Character`) match
-     where the reader reads. "Funnel present" alone is insufficient — the
-     coverage MUST include the specific read name and the canonical store, so
-     this check catches the canonical-store mismatch class (the original door
-     bug: written on Player, read on Character).
+     OR a `shared_flag_channels` entry where (1) the literal name is a member
+     of `read_names` (exact membership — `read_names` IS the covered set) AND
+     (2) the reader's OWN store (the object it reads — `Player` vs `Character`
+     vs some other Instance) is a member of the channel's `canonical_stores`.
+     "Funnel present" alone is insufficient — coverage MUST include the
+     specific read name and the reader's store, so this catches the
+     canonical-store mismatch class (the original door bug: funnel wrote
+     Player, reader read the character Model). **Phase-3-specific signal:**
+     the reader's own store is NOT recorded by slice 3's `read_names` scan
+     (which captures the flag name, not the read target); Phase 3's verifier
+     extends the scan to capture the read TARGET so it can check store
+     membership. This is a Phase 3 deliverable, not a slice-3 prerequisite.
    Otherwise fail with the offending file:line + a pointer to the missing
    channel/edge.
 
@@ -1019,12 +1075,17 @@ component-ref tests stay; the shared-flag tests move from "edge emitter" to
   (recompute-only contract); assert a scene with no cross-domain shared-flag
   reader records an empty channel set.
 - **Slice 3 (gate + record):** with a cross-domain shared-flag reader
-  present, assert the `PlayerSetSharedFlag` funnel IS injected and the
-  `shared_flag_channels` fact is recorded; with NO such reader, assert the
-  funnel is NOT injected (the gate — topology is now authoritative). Assert
-  the `_GENERIC_RUNTIME_PROMPT` funnel guidance is UNCHANGED (no cold
-  re-transpile) and no producer Luau is rewritten. Idempotency: re-run; the
-  funnel is injected exactly once (`if not existing_server_mgr` guard holds).
+  present (FRESH transpile), assert the `PlayerSetSharedFlag` funnel IS
+  injected and the `shared_flag_channels` fact is recorded; with NO such
+  reader (FRESH transpile), assert the funnel is NOT injected (the gate —
+  topology is now authoritative). **Resume fail-open:** with
+  `transpilation_result is None` (no-transpile resume) and NO discoverable
+  reader, assert the funnel is STILL injected (the gate does not tighten when
+  the scan source is absent — see deliverable 2's RESUME behavior; prevents
+  disabling a needed funnel on resume). Assert the `_GENERIC_RUNTIME_PROMPT`
+  funnel guidance is UNCHANGED (no cold re-transpile) and no producer Luau is
+  rewritten. Idempotency: re-run; the funnel is injected exactly once
+  (`if not existing_server_mgr` guard holds).
 - **Slice 4 (detangle + ordering):** the extracted
   `pickup_attribute_walkup` pack still applies the walk-up
   `GetAttribute` repair under the new ordering; each of the 6
@@ -1065,7 +1126,7 @@ component-ref tests stay; the shared-flag tests move from "edge emitter" to
 |---|---|---|---|
 | Topology artifact schema proves insufficient mid-migration | medium | high | Lightweight invariant checks (Codex round-1) catch contradictions early; Phase 1 ships with a SINGLE concrete consumer (animation_converter) before promising the schema to other phases |
 | **Planner/consumer skew during phased rollout** (Codex round-3) | medium | high | Schema-compat test cut + frozen-fixture round-trip test prevents drift; topology version field in artifact so consumers can detect mismatches |
-| Phase 2b's `pickup_remote_event_server` pack migration regresses Pickup | medium | medium | Canonical-form (not literal-byte) equivalence regression with documented diff allowlist; walk-up `GetAttribute` compensation extracted to `pickup_attribute_walkup` BEFORE pack deletion; PickupItemEvent name locked for the existing edge so the 3 downstream hardcoded sites continue to match unmodified |
+| Phase 2b's `pickup_remote_event_server` pack migration regresses Pickup (legacy mode only) | medium | medium | Canonical-form (not literal-byte) equivalence regression with documented diff allowlist; walk-up `GetAttribute` compensation extracted to `pickup_attribute_walkup` BEFORE pack deletion. NOTE (2026-06-01 reframe): the pack + its `PickupItemEvent` name are LEGACY-mode-only; the generic-mode shared-flag bridge is the funnel, gated+recorded by topology (no `PickupItemEvent` lock in the generic path). |
 | Phase 2b's edge derivation reordering (Path B) is structurally blocked | n/a | n/a | (resolved 2026-05-30) Path C decision in deliverable 1 splits derivation into structural-candidate (pre-transpile) + enrichment (post-transpile); rewriter is post-transpile, pre-pack. Cited evidence: `pipeline.py:2566-2618`, `scene-runtime-pr4-followups.md:600-626` |
 | Phase 3 fail-closed mode breaks newly-converted external projects | medium | high | Shadow-mode metrics first; corpus audit across bundled projects; one-release escape hatch (env var to revert to warnings) |
 | `lifecycle_role` enum proves insufficient for future cases | low | low | Closed enum + optional metadata bag (Codex round-4) — non-placement-affecting hints go in the bag, structural roles go in the enum; future enum extensions are backward-compatible |
@@ -1106,9 +1167,11 @@ Phase 2a PR (script_storage as bound consumer ──────┤  depends on 
              schema-compat test cut)                │
         │                                           │
         ▼                                           │
-Phase 2b PR (code_transpiler bridge emission + ─────┤  depends on Phase 2a's
-             retire pickup_remote_event_server)     │  artifact + multiplayer
-        │                                           │  fix shape
+Phase 2b PR (Class-1 component-ref edges +         ┤  depends on Phase 2a's
+             topology gates+records the Class-2     │  artifact + multiplayer
+             shared-flag funnel; retire legacy      │  fix shape
+             pickup_remote_event_server pack)       │
+        │                                           │
         ▼                                           │
 Phase 3 PR (contract verifier shadow → fail-closed) ┘  depends on PR A (correct
                                                        _UNITY_TO_ROBLOX_CLASS)
