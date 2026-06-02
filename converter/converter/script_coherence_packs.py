@@ -25,10 +25,19 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from core.flag_names import luau_flag_sanitize_expr
+
 if TYPE_CHECKING:
     from core.roblox_types import RbxScript
 
 log = logging.getLogger(__name__)
+
+# The ONE emitted shape for the runtime-built shared-flag name. Every pack
+# writer and the dynamic Machine reader concatenate this onto ``"has"`` so
+# all emitted call sites are byte-identical and agree with the funnel gate.
+# ``itemName``-sourced sites use this; the Machine reader uses ``name``.
+_FLAG_SANITIZE_ITEMNAME = luau_flag_sanitize_expr("itemName")
+_FLAG_SANITIZE_NAME = luau_flag_sanitize_expr("name")
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +276,7 @@ def _detect_fps_weapon_mount(scripts: list["RbxScript"]) -> bool:
 # Pack: fps_rifle_pickup
 # ---------------------------------------------------------------------------
 
-_PICKUP_REPLACEMENT = """local RunService = game:GetService("RunService")
+_PICKUP_REPLACEMENT = f"""local RunService = game:GetService("RunService")
 local Debris = game:GetService("Debris")
 
 local container = script.Parent
@@ -386,7 +395,7 @@ if touchPart then
 \t\t\t-- attributes set server-side to every client, so the client-side
 \t\t\t-- Player.luau reads keep working too.
 \t\t\tif itemName and itemName ~= "" then
-\t\t\t\tlocal _flag = "has" .. itemName
+\t\t\t\tlocal _flag = "has" .. {_FLAG_SANITIZE_ITEMNAME}
 \t\t\t\tif character then character:SetAttribute(_flag, true) end
 \t\t\t\tplayer:SetAttribute(_flag, true)
 \t\t\tend
@@ -734,20 +743,25 @@ def _detect_pickup_setattribute_pattern(scripts: list["RbxScript"]) -> bool:
     return False
 
 
-# The server-attr write the pack injects, in both shapes it has emitted:
+# The server-attr write the pack injects, in the shapes it has emitted:
 #   - legacy literal: ``<recv>:SetAttribute("has" .. itemName, true)``
-#   - current ``_flag`` local: ``local _flag = "has" .. itemName`` followed
-#     by ``<recv>:SetAttribute(_flag, true)``
+#   - ``_flag`` local: ``local _flag = "has" .. itemName`` followed by
+#     ``<recv>:SetAttribute(_flag, true)``
+#   - CURRENT sanitized form: ``local _flag = "has" .. (itemName:gsub(...))``
+#     (the name is sanitized to ``[%w_]`` before concatenation; see
+#     ``core.flag_names``).
 # Matching the ``"has" .. itemName`` concat directly (rather than any
 # ``SetAttribute("has"...)``) avoids false-skipping Pickups that init
 # unrelated has-flags before firing. The ``_flag = "has" .. itemName``
-# assignment is the unique marker of the current rewrite/inject output;
-# without this alternative the guard never recognizes an already-converted
-# Pickup, so re-running the pack appends duplicate ``has<X>`` blocks.
+# assignment is the unique marker of the rewrite/inject output; without
+# this alternative the guard never recognizes an already-converted Pickup,
+# so re-running the pack appends duplicate ``has<X>`` blocks. The trailing
+# ``itemName`` may now be wrapped in the ``(itemName:gsub(...))`` sanitizer,
+# so the ``itemName`` token is matched with an optional ``(`` prefix.
 _PICKUP_HAS_ATTR_INJECTED_RE = re.compile(
-    r':\s*SetAttribute\s*\(\s*"has"\s*\.\.\s*itemName\s*,\s*true\s*\)'
+    r':\s*SetAttribute\s*\(\s*"has"\s*\.\.\s*\(?\s*itemName\b'
     r'|'
-    r'_flag\s*=\s*"has"\s*\.\.\s*itemName'
+    r'_flag\s*=\s*"has"\s*\.\.\s*\(?\s*itemName\b'
 )
 
 
@@ -829,7 +843,7 @@ def _convert_pickup_to_remote_event(scripts: list["RbxScript"]) -> int:
                 '\t\t\t-- the character (touching model is what its Touched handler has);\n'
                 '\t\t\t-- HUD-style scripts may only have the Player ref.\n'
                 '\t\t\tif itemName and itemName ~= "" then\n'
-                '\t\t\t\tlocal _flag = "has" .. itemName\n'
+                f'\t\t\t\tlocal _flag = "has" .. {_FLAG_SANITIZE_ITEMNAME}\n'
                 '\t\t\t\tif _char then _char:SetAttribute(_flag, true) end\n'
                 '\t\t\t\tif _pl then _pl:SetAttribute(_flag, true) end\n'
                 '\t\t\tend\n'
@@ -956,7 +970,7 @@ def _inject_has_attribute_before_fireclient(s: "RbxScript") -> int:
         # which Door never read — key-protected doors stayed locked.
         return (
             f'if {player_var} and itemName and itemName ~= "" then '
-            f'local _flag = "has" .. itemName; '
+            f'local _flag = "has" .. {_FLAG_SANITIZE_ITEMNAME}; '
             f'{player_var}:SetAttribute(_flag, true); '
             f'local _ch = {player_var}.Character; '
             f'if _ch then _ch:SetAttribute(_flag, true) end '
@@ -3026,7 +3040,7 @@ _MACHINE_HASITEMS_REPLACEMENT = (
     "    -- doesn't reach the server, so checking it would always return nil.\n"
     "    for i = 1, #itemNames do\n"
     "        local name = itemNames[i]\n"
-    "        if name and player:GetAttribute(\"has\" .. name) == true then\n"
+    f"        if name and player:GetAttribute(\"has\" .. {_FLAG_SANITIZE_NAME}) == true then\n"
     "            placeItem(i)\n"
     "        end\n"
     "    end\n"

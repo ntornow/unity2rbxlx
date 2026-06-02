@@ -1262,7 +1262,11 @@ When a `MonoBehaviour` records picked-up items in a `GetItem(itemName)`-style me
 function Player:GetItem(itemName)
     -- Canonical attribute mirror: cross-script readers (Door, HUD) see ``has<Item>``.
     if itemName and itemName ~= "" then
-        local _flag = "has" .. itemName  -- "hasKey", "hasRifle", ...
+        -- Sanitize the name to ``[%w_]`` before concatenating: Roblox
+        -- attribute names (and the ``PlayerSetSharedFlag`` funnel's
+        -- ``^[%w_]+$`` gate) reject spaces/hyphens, so a name like
+        -- "Red Key" must become "Red_Key" or the write is silently dropped.
+        local _flag = "has" .. (itemName:gsub("[^%w_]+", "_"))  -- "hasKey", "hasRed_Key", ...
         local _plr = game:GetService("Players").LocalPlayer
         if _plr then _plr:SetAttribute(_flag, true) end
         local _char = _plr and _plr.Character
@@ -1279,7 +1283,7 @@ function Player:GetItem(itemName)
 end
 ```
 
-The same pattern applies for any other "shared player flag" mutation (a `RecoverHealth` that should replicate, a `gotWeapon = true` write, etc.). Without this Attribute mirror, gameplay readers in other scripts will silently miss the state change. NEVER skip the mirror just because your local code path also stores the field; the field is for internal use, the Attribute is the cross-script contract.
+The same pattern applies for any other "shared player flag" mutation (a `RecoverHealth` that should replicate, a `gotWeapon = true` write, etc.). Without this Attribute mirror, gameplay readers in other scripts will silently miss the state change. NEVER skip the mirror just because your local code path also stores the field; the field is for internal use, the Attribute is the cross-script contract. ALWAYS sanitize any runtime-built flag name to the `[%w_]` charset before concatenating it onto `"has"` — wrap the dynamic part in `(name:gsub("[^%w_]+", "_"))` — because Roblox attribute names and the `PlayerSetSharedFlag` funnel both reject spaces, hyphens, and other punctuation, so an un-sanitized name like `"Red Key"` is silently dropped.
 
 ## Singleton pattern
 
