@@ -212,3 +212,42 @@ class TestClassifyScriptTypeHarmonization:
         """
         source = "public interface IShootable { void Hit(); }"
         assert _classify_script_type(source, self._info()) == "ModuleScript"
+
+
+class TestBaselessHelperSuggestedScript:
+    """A base-less helper class the analyzer wrongly suggests as "Script"
+    (because it has a coincidentally lifecycle-named method, e.g. Update())
+    must classify as ModuleScript — generic mode skips the legacy
+    require-promotion pass, so a stray Script would fail every require() of the
+    helper (the real MeshContainer bug). A class WITH a base (incl. an indirect
+    MonoBehaviour subclass) keeps "Script".
+    """
+
+    def _info(self, suggested: str, base_class: str = ""):
+        ns = SimpleNamespace()
+        ns.suggested_type = suggested
+        ns.base_class = base_class
+        return ns
+
+    def test_baseless_helper_suggested_script_becomes_modulescript(self):
+        # MeshContainer's shape: no base, a plain Update() method.
+        source = "public class MeshContainer { void Update() {} }"
+        info = self._info(suggested="Script", base_class="")
+        assert _classify_script_type(source, info) == "ModuleScript"
+
+    def test_indirect_monobehaviour_subclass_stays_script(self):
+        # Turret : Weapon, Weapon : MonoBehaviour — base_class is non-empty, so
+        # the planner-recognized indirect component must NOT be flipped.
+        source = "public class Turret : Weapon { void Start() {} }"
+        info = self._info(suggested="Script", base_class="Weapon")
+        assert _classify_script_type(source, info) == "Script"
+
+    def test_external_monobehaviour_base_stays_script(self):
+        source = "public class LobbyManager : MonoBehaviourPunCallbacks {}"
+        info = self._info(suggested="Script", base_class="MonoBehaviourPunCallbacks")
+        assert _classify_script_type(source, info) == "Script"
+
+    def test_direct_monobehaviour_stays_script(self):
+        source = "public class Enemy : MonoBehaviour { void Update() {} }"
+        info = self._info(suggested="Script", base_class="MonoBehaviour")
+        assert _classify_script_type(source, info) == "Script"

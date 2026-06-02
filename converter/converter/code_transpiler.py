@@ -2007,8 +2007,23 @@ def _classify_script_type(csharp_source: str, info: Any) -> str:
     # Use the analyzer's suggestion as the primary signal.
     if hasattr(info, "suggested_type"):
         suggested = info.suggested_type
-        if suggested in ("Script", "LocalScript", "ModuleScript"):
+        if suggested in ("LocalScript", "ModuleScript"):
             return suggested
+        # Honor a "Script" suggestion ONLY for a class that HAS a base class: it
+        # may be a MonoBehaviour (direct) or an indirect MonoBehaviour subclass
+        # (e.g. ``Turret : Weapon``, ``MonoBehaviourPunCallbacks``) that the
+        # planner treats as a runtime component. A BASE-LESS class
+        # (``base_class == ""``) suggested "Script" only because of a
+        # coincidentally lifecycle-named method (e.g. a plain helper with an
+        # ``Update()``) is NOT an auto-run component — fall through to the
+        # non-MonoBehaviour → ModuleScript fallback so it ships as a require-only
+        # ModuleScript. In legacy mode the require-promotion coherence pass
+        # corrected this; generic mode skips that pass, so an uncorrected
+        # "Script" would fail every ``require()`` of the helper. (Gate on the
+        # analyzer's structured ``base_class``, not a ``"monobehaviour" in
+        # source`` grep, which false-positives on comments / ``using static``.)
+        if suggested == "Script" and (getattr(info, "base_class", "") or ""):
+            return "Script"
 
     # Fallback: analyze the source directly.
     source_lower = csharp_source.lower()
