@@ -433,3 +433,104 @@ class TestCheckAConsumerCompliance:
         ]
         result = verify_contract(topology, scripts)  # type: ignore[arg-type]
         assert [v for v in result.violations if v.check == "consumer_compliance"] == []
+
+
+# ---------------------------------------------------------------------------
+# Check B -- component availability (GetComponent reachability)
+# ---------------------------------------------------------------------------
+
+from converter.contract_verifier import _runtime_class_map  # noqa: E402
+
+
+def _run_check_b(source: str, *, peer_stems: list[str] | None = None
+                 ) -> list[ContractViolation]:
+    """Run the verifier over one script body + a topology whose modules supply
+    the given peer stems. Returns only component_availability violations."""
+    modules = {}
+    for i, stem in enumerate(peer_stems or []):
+        modules[f"g{i}"] = {"stem": stem, "domain": "client",
+                            "module_path": f"ReplicatedStorage.{stem}"}
+    if not modules:
+        modules = {"g": {"stem": "Anchor", "domain": "client",
+                        "module_path": "ReplicatedStorage.Anchor"}}
+    topology = {"modules": modules}
+    scripts = [RbxScript(name="S", source=source, script_type="ModuleScript",
+                        parent_path="ReplicatedStorage")]
+    result = verify_contract(topology, scripts)  # type: ignore[arg-type]
+    return [v for v in result.violations if v.check == "component_availability"]
+
+
+class TestRuntimeClassMap:
+    """Exhaustive guard: pin the FULL parsed key/value set so any runtime-file
+    refactor that drops/renames an entry (or breaks the parser) fails loudly,
+    not silently (which would become a check-B false positive)."""
+
+    def test_keys_are_exactly_the_runtime_table(self) -> None:
+        keys, _ = _runtime_class_map()
+        assert keys == frozenset({
+            "Rigidbody", "Rigidbody2D", "BoxCollider", "SphereCollider",
+            "CapsuleCollider", "MeshCollider", "WheelCollider",
+            "CharacterController", "MeshRenderer", "SkinnedMeshRenderer",
+            "MeshFilter", "Camera", "Light", "AudioSource", "AudioListener",
+            "Animator", "Animation", "Button", "Image", "RawImage", "Text",
+            "Canvas", "ParticleSystem", "TrailRenderer", "LineRenderer",
+            "Transform", "RectTransform",
+        })
+
+    def test_values_include_known_and_sentinel(self) -> None:
+        _, values = _runtime_class_map()
+        # The runtime CharacterController->BasePart mapping (NOT Humanoid) and
+        # the Transform sentinel must both be present.
+        assert "BasePart" in values
+        assert "ParticleEmitter" in values
+        assert "__transform_self__" in values
+
+    def test_character_controller_maps_to_basepart(self) -> None:
+        keys, _ = _runtime_class_map()
+        assert "CharacterController" in keys
+
+
+class TestCheckBComponentAvailability:
+    def test_unmapped_component_is_flagged(self) -> None:
+        """Collider is neither a runtime-map key nor value nor peer nor
+        allowlist -> resolves to nil -> flagged."""
+        vs = _run_check_b('local c = self:GetComponent("Collider")')
+        assert len(vs) == 1
+        assert vs[0].identity == "component_availability:S:Collider"
+
+    def test_mapped_unity_type_not_flagged(self) -> None:
+        assert _run_check_b('self:GetComponent("Rigidbody")') == []
+
+    def test_roblox_class_value_not_flagged(self) -> None:
+        assert _run_check_b('self:GetComponent("BasePart")') == []
+
+    def test_allowlisted_roblox_class_not_flagged(self) -> None:
+        """Humanoid is NOT a runtime-map value -> the explicit allowlist is what
+        keeps this legitimate direct-Roblox-class pass from false-positiving."""
+        assert _run_check_b('self:GetComponent("Humanoid")') == []
+
+    def test_peer_module_not_flagged(self) -> None:
+        assert _run_check_b('self:GetComponent("Turret")',
+                            peer_stems=["Turret"]) == []
+
+    def test_transform_sentinel_key_not_flagged(self) -> None:
+        assert _run_check_b('self:GetComponent("Transform")') == []
+
+    def test_get_component_in_children_is_scanned(self) -> None:
+        vs = _run_check_b('self:GetComponentInChildren("Collider")')
+        assert len(vs) == 1
+
+    def test_non_literal_arg_is_skipped(self) -> None:
+        """A variable arg cannot be resolved statically -> not flagged (the
+        documented coverage hole)."""
+        assert _run_check_b('self:GetComponent(typeName)') == []
+
+    def test_plural_get_components_not_matched(self) -> None:
+        """GetComponents (plural, list semantics) is a different bug class and
+        must not be matched by the singular regex."""
+        assert _run_check_b('self:GetComponents("Collider")') == []
+
+    def test_repeated_unmapped_dedups_per_script(self) -> None:
+        src = ('self:GetComponent("Collider")\n'
+               'local x = self:GetComponent("Collider")')
+        assert len(_run_check_b(src)) == 1

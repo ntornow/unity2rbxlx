@@ -30,7 +30,10 @@ imported from their real modules for concrete typing — no ``Any``.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
 
 from converter.scene_runtime_topology.build_topology import TopologyArtifact
 from core.roblox_types import RbxScript
@@ -123,6 +126,9 @@ def verify_contract(
 
     # Check A — consumer compliance (domain⟂placement consistency).
     violations.extend(_check_consumer_compliance(topology, scripts))
+
+    # Check B — component availability (GetComponent reachability).
+    violations.extend(_check_component_availability(topology, scripts))
 
     return ContractVerifierResult(violations=violations)
 
@@ -355,3 +361,145 @@ def stash_violations(
         existing_rows.append(violation_to_dict(v))
         appended += 1
     return appended
+
+
+# ---------------------------------------------------------------------------
+# Check B — component availability (GetComponent reachability)
+# ---------------------------------------------------------------------------
+#
+# Generic mode emits the peer form ``self:GetComponent("X")``
+# (code_transpiler.py:1329). At runtime (scene_runtime.luau:752-780) X resolves
+# to: a peer converted-MonoBehaviour (by stem/scriptId) -> else
+# ``_UNITY_TO_ROBLOX_CLASS[X]`` -> else ``findFirstChildWhichIsA(X)``. An X that
+# is none of those returns nil, so any subsequent use/method-call errors. Check
+# B flags those unreachable sites.
+#
+# SCOPE (slice 2): reachability only. Method-validity (X maps to a Roblox class
+# that lacks the called method — the CharacterController->BasePart->:Move()
+# anecdote) is DEFERRED: the repo has no Roblox class->method database, and the
+# transpiler already routes CharacterController.Move/.SimpleMove/.isGrounded
+# through a bridge (api_mappings API_CALL_MAP), so that anecdote is largely
+# already handled. Documented gap, not silently dropped.
+#
+# COVERAGE: only STRING-LITERAL args are checked. A non-literal arg
+# (``self:GetComponent(typeVar)``) cannot be resolved statically and is skipped
+# — so a future fail-closed flip of check B covers literal-arg sites only.
+
+# Matches ``:GetComponent("X")`` / ``:GetComponentInChildren("X")`` /
+# ``:GetComponentInParent("X")`` with a string-literal arg. Does NOT match the
+# plural ``GetComponents`` (list semantics, different bug class) because a
+# literal "(" must follow the optional In*/Parent suffix.
+_GETCOMPONENT_RE = re.compile(
+    r""":GetComponent(?:InChildren|InParent)?\s*\(\s*['"]([A-Za-z_]\w*)['"]""",
+)
+
+# Roblox classes converted (or hand-edited) code may legitimately pass to
+# GetComponent directly — runtime ``findFirstChildWhichIsA`` resolves them, so
+# they must NOT be flagged. The runtime map's VALUES already cover the
+# transpiler's own outputs; this allowlist guards the fail-closed flip against
+# legitimate direct-Roblox-class passes the values set happens to miss. Biased
+# to ABSTAIN: an over-broad allowlist only suppresses warnings (fails open),
+# which is the safe direction for a shadow→fail-closed check. Never flag a name
+# the runtime can resolve.
+_ROBLOX_CLASS_ALLOWLIST = frozenset({
+    "Humanoid", "HumanoidRootPart", "Seat", "VehicleSeat",
+    "ClickDetector", "ProximityPrompt", "Sound", "SoundGroup",
+    "Camera", "BasePart", "MeshPart", "Part", "UnionOperation", "Model",
+    "ParticleEmitter", "Beam", "Trail", "Light", "PointLight",
+    "SpotLight", "SurfaceLight", "Attachment",
+    "SurfaceGui", "BillboardGui", "ScreenGui", "Frame",
+    "TextLabel", "TextButton", "TextBox", "ImageLabel", "ImageButton",
+    "GuiButton", "Decal", "Texture", "Weld", "WeldConstraint", "Motor6D",
+    "Highlight", "Folder", "Configuration",
+})
+
+
+@lru_cache(maxsize=1)
+def _runtime_class_map() -> tuple[frozenset[str], frozenset[str]]:
+    """Parse ``_UNITY_TO_ROBLOX_CLASS`` from ``runtime/scene_runtime.luau`` and
+    return ``(keys, values)``.
+
+    This is the single source of truth check B trusts (the locked decision:
+    trust the RUNTIME map, which differs from Python ``TYPE_MAP`` — e.g.
+    CharacterController -> "BasePart" here vs "Humanoid" there). Parsed, not
+    duplicated, so the verifier and the runtime never drift. An EXHAUSTIVE
+    guard test (``test_runtime_class_map_*``) pins the full parsed key/value
+    set so a runtime-file refactor that drops/renames an entry fails loudly.
+    Cached: the file never changes within a process.
+    """
+    path = Path(__file__).resolve().parent.parent / "runtime" / "scene_runtime.luau"
+    text = path.read_text(encoding="utf-8")
+    keys: set[str] = set()
+    values: set[str] = set()
+    # Block-bounded: the table body from ``= {`` to the first line that is a
+    # bare ``}`` (the table's close). Avoids matching ``Ident = "Str"`` pairs
+    # elsewhere in the file.
+    block = re.search(
+        r"local\s+_UNITY_TO_ROBLOX_CLASS[^=]*=\s*\{(.*?)\n\}",
+        text,
+        re.DOTALL,
+    )
+    if block is not None:
+        for key, value in re.findall(r'(\w+)\s*=\s*"([^"]+)"', block.group(1)):
+            keys.add(key)
+            values.add(value)
+    # Sentinel assigns outside the table literal:
+    #   _UNITY_TO_ROBLOX_CLASS.Transform = _CLASS_TRANSFORM_SELF
+    for key in re.findall(r"_UNITY_TO_ROBLOX_CLASS\.(\w+)\s*=", text):
+        keys.add(key)
+    sentinel = re.search(r'_CLASS_TRANSFORM_SELF\s*=\s*"([^"]+)"', text)
+    if sentinel is not None:
+        values.add(sentinel.group(1))
+    return frozenset(keys), frozenset(values)
+
+
+def _check_component_availability(
+    topology: TopologyArtifact,
+    scripts: list[RbxScript],
+) -> list[ContractViolation]:
+    """Flag ``GetComponent("X")`` sites whose ``X`` resolves to nil at runtime.
+    See the section comment above + design doc §Phase 3 check #3."""
+    keys, values = _runtime_class_map()
+
+    # Peer converted-MonoBehaviours are reachable by stem OR class_name (the
+    # runtime peer lookup matches m.stem or m.scriptId; the AI emits the C#
+    # class name, which is the stem in the common case and the class_name when
+    # they differ — include both to avoid a stem≠class-name false positive).
+    peer: set[str] = set()
+    modules = topology.get("modules") or {}
+    for module in modules.values():
+        if not isinstance(module, dict):
+            continue
+        for field_name in ("stem", "class_name"):
+            value = module.get(field_name)
+            if isinstance(value, str) and value:
+                peer.add(value)
+
+    reachable = peer | set(keys) | set(values) | _ROBLOX_CLASS_ALLOWLIST
+
+    violations: list[ContractViolation] = []
+    seen: set[tuple[str, str]] = set()
+    for script in scripts:
+        source = script.source or ""
+        for match in _GETCOMPONENT_RE.finditer(source):
+            x = match.group(1)
+            if x in reachable:
+                continue
+            key = (script.name, x)
+            if key in seen:
+                continue
+            seen.add(key)
+            violations.append(
+                ContractViolation(
+                    check="component_availability",
+                    severity="warning",
+                    script=script.name,
+                    detail=(
+                        f"GetComponent({x!r}) resolves to nil — {x!r} is not a "
+                        f"converted component, a mapped Unity type, or a known "
+                        f"Roblox class; the result will error when used"
+                    ),
+                    identity=f"component_availability:{script.name}:{x}",
+                )
+            )
+    return violations
