@@ -1,9 +1,12 @@
 # Scene-runtime topology authority
 
-**Status:** in-flight (revised 2026-05-30 to reflect the Phase 2a slice 8
-arch-review re-plan; the prior 2026-05-29 revision captured slice 5-7
-decisions). Phase 1 shipped. Phase 2a is mid-flight: slices 1-7 shipped
-(PRs #150, #151, #152, plus slice 7); slice 8 next; slices 9-11 follow.
+**Status:** in-flight (revised 2026-06-02 to reflect the Phase 3 arch-review
+re-plan; the prior 2026-05-30 revision captured the Phase 2a slice 8 re-plan).
+Phases 1, 2a, and 2b shipped (merged through PR #161; slice-7 followups #162/#163;
+#165/#166 open). **Phase 3 (this revision): plan locked after parallel
+Claude+Codex arch review — see §"Phase 3" below for the corrected scope, the
+5-slice breakdown, and the decisions that differ from this doc's original
+deliverable text.**
 **Owner:** unity2rbxlx converter team.
 **Related:** `scene-runtime-contract.md` (the contract this layer implements),
 `scene-runtime-domain-signals.md` (today's domain classifier, becomes the
@@ -1031,16 +1034,42 @@ literal scan is impossible — the writer name is runtime-computed.
   cross, written to which canonical store) for Phase 3 to verify; the
   legacy game-specific `PickupItemEvent` pack is retired in legacy mode.
 
-### Phase 3 — Contract verifier in `contract_pipeline.py`
+### Phase 3 — Contract verifier (new `contract_verifier.py`)
 
-Build-time enforcement layer. Shadow mode first; corpus-warning audit;
-flip to fail-closed.
+Build-time enforcement layer that proves every emitted artifact obeys the
+topology authority. Shadow mode first; corpus audit; **per-check** flip to
+fail-closed. **Scope corrected 2026-06-02 after a Claude+Codex parallel arch
+review against the merged code (original deliverable text preserved in git):**
 
-**Deliverables:**
+- **NOT `contract_pipeline.py`.** That module is a *transpile-time* orchestrator
+  (`pipeline.transpile_scripts`, gated `scene_runtime_mode == "generic"`,
+  `pipeline.py:2015`) and runs before script placement exists. The verifier
+  needs the FULL topology artifact + final `RbxScript.parent_path` + emitted
+  Luau, which only coexist after `_build_and_apply_topology` (inside
+  `materialize_and_classify`, `pipeline.py:4730`). → **new module
+  `contract_verifier.py`, invoked immediately after `_build_and_apply_topology`
+  using the in-scope merged `scene_runtime` dict.** Plumbing hazard:
+  `scene_runtime["topology"]` is written to the merged local dict +
+  `conversion_plan.json` but NOT back to `ctx.scene_runtime`, so a later
+  `write_output` hook would see no topology — the call site must use the merged
+  dict.
+- **Generic-mode only** (the whole topology path is gated `!= "legacy"`,
+  `pipeline.py:4608-4612`). Runnability spike (2026-06-02): a generic-mode cold
+  conversion of SimpleFPS reaches the topology stage and emits the full artifact
+  + 34 Luau scripts — corpus viable.
 
-1. **Consumer compliance check.** For every emitted artifact (animation
-   script placement, transpiled Luau body, storage decision), verify it
-   matches the topology artifact. Build fails on divergence.
+**Deliverables (checks):**
+
+1. **Consumer-compliance check (check A).** Verify each emitted script's final
+   placement (`RbxScript.parent_path` / `script_type`) matches the topology
+   decision. The artifact carries no final `container` field (only
+   `domain`/`script_class`(intrinsic)/`lifecycle_role`/`module_path`), so the
+   storage classifier's final decision is **stamped into the artifact** (new
+   field) and the verifier checks `parent_path == stamped container`. Includes a
+   **domain-consistency invariant**: a `domain == "server"` module must never be
+   a `LocalScript` (and vice-versa) — surfaces the type-before-domain class
+   generic mode otherwise leaves latent (`storage_classifier.py:719-720`; the
+   #166 defensive warning is the producer-side half).
 
 2. **Cross-domain attribute access check.** Re-specified 2026-06-01 for the
    two bridge classes (the original "every `SetAttribute` writer +
@@ -1070,21 +1099,52 @@ flip to fail-closed.
    Otherwise fail with the offending file:line + a pointer to the missing
    channel/edge.
 
-3. **Component availability check.** For every `GetComponent("X"):Method()`
-   call in the emitted Luau, verify `X` is in `_UNITY_TO_ROBLOX_CLASS` AND
-   `Method` is a valid method of the mapped Roblox class. (Catches Bug 1
-   recurrence — the `CharacterController = "BasePart"` mapping bug.)
+3. **Component-availability check (check B).** Keyed off the **runtime**
+   `_UNITY_TO_ROBLOX_CLASS` (`runtime/scene_runtime.luau:71`) — the table that
+   actually resolves `GetComponent` at runtime — NOT Python `api_mappings.TYPE_MAP`
+   (the two disagree: runtime `CharacterController → BasePart`, Python →
+   `Humanoid`; `BasePart`-has-no-`.Move()` is the catch). For every resolved
+   `:FindFirstChildWhichIsA("Y")` GetComponent site, verify `Y` is reachable (a
+   peer converted-MonoBehaviour, a runtime `_UNITY_TO_ROBLOX_CLASS` target, or a
+   real Roblox class) and that any following `:Method()` is valid on the mapped
+   class. MUST exclude the peer `self:GetComponent(name)` form (resolved at
+   runtime against the host component table, `scene_runtime.luau:753-760`). Do
+   NOT unify the two maps — they serve different roles.
 
-4. **Shadow-mode rollout (Codex round-1 amendment).** Ships first as
-   warnings + a structured metric (`contract_check_violations`) counted
-   across a broader corpus (every bundled test project). Audit + fix
-   real offenders. Flip to fail-closed only when the metric is zero
-   across a representative cold conversion of every bundled test project,
-   plus a one-release escape hatch.
+4. **Shadow-mode rollout + metric.** Every check ships first as warnings + a
+   structured `contract_check_violations` metric on `ConversionReport`
+   (`report_generator.py`) and `ctx.scene_runtime` (mirroring the existing
+   `contract_fail_closed` plumbing, `pipeline.py:2041`). Resume-idempotent: the
+   verifier re-runs on any `materialize_and_classify` resume, so dedupe by
+   violation identity (mirror `if msg not in ctx.errors`). A one-release env-var
+   escape hatch (precedent `U2R_LEGACY_PREFAB_PIVOT`) is read at the
+   error-promotion gate (compute-the-metric-but-don't-abort), not at verifier
+   entry, so the shadow metric stays populated even when the hatch suppresses
+   the fail.
 
-5. **Per Codex:** *"Clean on bundled test projects is necessary, not
-   sufficient. The failure mode at flip is newly converted external
-   projects failing on latent patterns your fixtures do not cover."*
+5. **Per-check independent flip.** Each check flips shadow → fail-closed on its
+   own cadence once its metric is clean across the runnable corpus — NOT all
+   together. Corpus = the subset of bundled projects that complete a generic-mode
+   cold conversion; `log()` every excluded project + reason (no silent cap).
+   Exercising checks B/C requires AI transpilation (stub Luau can't be scanned;
+   check A works on stubs). *Per Codex: clean on bundled projects is necessary,
+   not sufficient — external projects surface latent patterns; the env-var hatch
+   covers the flip.*
+
+#### Slice breakdown (each an independently-reviewed stacked PR)
+
+- **Slice 0** — runnability spike (done; SimpleFPS viable) + verifier skeleton:
+  `contract_verifier.py`, the post-materialize hook (with the topology-restage
+  fix), the `contract_check_violations` metric + report field, the inert env-var
+  escape hatch, resume-idempotent dedup. Smoke check only.
+- **Slice 1** — check A (consumer compliance) + domain-consistency invariant;
+  stamp the final container into the artifact.
+- **Slice 2** — check B (GetComponent), keyed off runtime `_UNITY_TO_ROBLOX_CLASS`
+  + peer-module set.
+- **Slice 3** — check C (cross-domain attribute) + the reader-store scan
+  extension (Phase 3 #2 above).
+- **Slice 4** — corpus shadow audit (AI transpile) + per-check flip behind the
+  env-var hatch.
 
 ## Migration discipline
 
