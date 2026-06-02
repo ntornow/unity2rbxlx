@@ -1178,8 +1178,17 @@ review against the merged code (original deliverable text preserved in git):**
 - **Slice 2** — check B (GetComponent reachability), keyed off the PARSED runtime
   `_UNITY_TO_ROBLOX_CLASS` + peer set (stem ∪ script_id) + Roblox-class
   allowlist. Reachability only; method-validity deferred.
-- **Slice 3** — check C (cross-domain attribute) + the reader-store scan
-  extension (Phase 3 #2 above).
+- **Slice 3** — check C = a STRUCTURAL cross-domain-edge bridging invariant
+  (read directly off `cross_domain_edges`: every runtime client↔server edge
+  MUST be `remote_event_bridge`). Zero-FP regression guard. The original
+  literal `SetAttribute`/`GetAttribute` Luau-scan reconciliation was REVERTED
+  after the codex slice-3 review found it false-positives on (P1) Class-2
+  shared-flag literal mirrors (modeled in `shared_flag_channels`, not edges)
+  and (P2) the writer×reader Cartesian over reused field names (the emitted
+  Luau carries no instance identity to match the edge granularity). **Class-2
+  store-mismatch DEFERRED** (phantom post-coherence + brittle + the
+  `present==False` alternative is vacuous) — known deferred false-negative,
+  needs a pre-coherence hook + adversarial review.
 - **Slice 4** — corpus shadow audit (AI transpile) + per-check flip behind the
   env-var hatch.
 

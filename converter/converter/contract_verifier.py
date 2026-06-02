@@ -130,6 +130,9 @@ def verify_contract(
     # Check B — component availability (GetComponent reachability).
     violations.extend(_check_component_availability(topology, scripts))
 
+    # Check C — cross-domain attribute access (Class-1 component-ref edges).
+    violations.extend(_check_cross_domain_attribute(topology, scripts))
+
     return ContractVerifierResult(violations=violations)
 
 
@@ -562,4 +565,90 @@ def _check_component_availability(
                     identity=f"component_availability:{script.name}@{ppath}:{x}",
                 )
             )
+    return violations
+
+
+# ---------------------------------------------------------------------------
+# Check C — cross-domain attribute access (Class-1 component-ref edges)
+# ---------------------------------------------------------------------------
+#
+# SCOPE (slice 3): a STRUCTURAL edge-invariant check, read directly off the
+# topology's ``cross_domain_edges`` — NOT a Luau scan. For every edge whose
+# ``from_domain`` and ``to_domain`` are both RUNTIME (client/server) and
+# DIFFERENT, ``resolution.strategy`` MUST be ``"remote_event_bridge"``; an
+# unbridged runtime-cross-domain edge means the cross-process write never
+# reaches the reader. Zero false positives (no field-name pairing, no Luau
+# parsing, no shared-flag confusion); currently-satisfied (the producer stamps
+# remote_event_bridge for runtime cross-domain edges) but a real regression
+# guard if a future producer/enrichment change leaves one unbridged.
+#
+# WHY NOT a literal Luau scan (the original slice-3 plan, reverted after the
+# codex slice-3 review): scanning ``SetAttribute("X")``/``GetAttribute("X")``
+# sites and pairing them by field name is FALSE-POSITIVE-prone in two ways the
+# emitted Luau can't disambiguate:
+#   * P1 — it flags legitimate Class-2 shared-flag literal mirrors
+#     (``character:SetAttribute("hasKey")`` + server ``player:GetAttribute(
+#     "hasKey")``), which are modeled in ``shared_flag_channels``, NOT in
+#     ``cross_domain_edges`` — so they have no Class-1 edge by design;
+#   * P2 — the writer×reader Cartesian over a shared field name (``open``,
+#     ``TakeDamage``) pairs UNRELATED sites: the emitted Luau carries no
+#     instance identity, so it can't match the edge's real
+#     (from_instance, field, to_instance) granularity.
+#
+# DEFERRED (Class-2 dynamic shared-flag store mismatch — the door bug): the
+# topology does NOT record the reader's OWN store, and the verifier runs
+# POST-coherence (pipeline.py:4759) where the ``door_player_flag_location`` pack
+# has already rewritten the wrong-store read to ``player:`` — so a store-mismatch
+# scan is both brittle regex-on-AI-output AND phantom on the corpus. The
+# ``present == False`` coverage alternative is vacuous (``present =
+# bool(read_names) or fail_open_present``). Class-2 needs a PRE-coherence hook +
+# adversarial review; recorded as a known deferred false-negative.
+
+_RUNTIME_DOMAINS = frozenset({"client", "server"})
+
+
+def _check_cross_domain_attribute(
+    topology: TopologyArtifact,
+    scripts: list[RbxScript],
+) -> list[ContractViolation]:
+    """Structural cross-domain-edge bridging invariant. See section comment.
+    ``scripts`` is unused (the check reads the structured edges, not Luau)."""
+    violations: list[ContractViolation] = []
+    for edge in topology.get("cross_domain_edges") or []:
+        if not isinstance(edge, dict):
+            continue
+        from_d = str(edge.get("from_domain") or "")
+        to_d = str(edge.get("to_domain") or "")
+        # Only runtime-to-runtime, cross-domain edges require a bridge. A
+        # non-runtime endpoint (helper/excluded/"") is legitimately excluded;
+        # a same-domain edge needs no bridge.
+        if from_d not in _RUNTIME_DOMAINS or to_d not in _RUNTIME_DOMAINS:
+            continue
+        if from_d == to_d:
+            continue
+        resolution = edge.get("resolution")
+        strategy = (
+            resolution.get("strategy") if isinstance(resolution, dict) else ""
+        )
+        if strategy == "remote_event_bridge":
+            continue  # correctly bridged
+        field_name = str(edge.get("field") or "")
+        edge_id = str(
+            edge.get("id")
+            or f"{edge.get('from_script')}::{field_name}::{edge.get('to_script')}"
+        )
+        violations.append(
+            ContractViolation(
+                check="cross_domain_attribute",
+                severity="warning",
+                script=field_name,
+                detail=(
+                    f"cross-domain edge {edge_id!r} (field {field_name!r}, "
+                    f"{from_d!r}→{to_d!r}) has resolution strategy "
+                    f"{str(strategy)!r}, not 'remote_event_bridge' — the "
+                    f"cross-process write never reaches the reader"
+                ),
+                identity=f"cross_domain_attribute:{edge_id}",
+            )
+        )
     return violations
