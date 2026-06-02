@@ -3010,19 +3010,37 @@ return table.concat(allData, "\\n")'''
         (and non-existent in practice) shape, and the routing/prune consumers
         operate on modules.
 
-        Stores the result on ``self.state.dead_modules`` (transient; never
-        persisted). On a no-transpile resume there is no fresh C# surface to
-        measure the input prior, so the verdict abstains entirely (empty set)
-        -- the storage plan was already computed on the run that transpiled.
+        Stores the result on ``self.state.dead_modules`` AND persists it to
+        ``ctx.dead_modules`` (round-trips through ``conversion_context.json``).
+        On a no-transpile resume (preserve-scripts / ``--phase=write_output``,
+        ``transpilation_result`` is None) the input prior cannot be recomputed
+        from C#, so this REUSES the persisted set from the run that transpiled.
+        Without that reuse the verdict would abstain (empty) and the downstream
+        ``_classify_storage`` would re-route the previously-dead modules back
+        into ServerStorage, overwriting the prior plan.
         """
         self.state.dead_modules = frozenset()
         if self.state.rbx_place is None or not self.state.rbx_place.scripts:
             return
         # The input-side prior needs the original C# source. It only exists on
         # a fresh transpile (``transpilation_result``); a resume rehydrates
-        # Luau from disk without the C#. Abstain on resume.
+        # Luau from disk without the C#. On resume, reuse the persisted verdict
+        # (consistent with how _classify_storage preserves prior decisions when
+        # transpilation_result is absent) instead of abstaining.
         result = self.state.transpilation_result
         if result is None or not result.scripts:
+            persisted = getattr(self.ctx, "dead_modules", None) or []
+            # Only retain names that are still present in the emitted place, so a
+            # stale verdict for a removed script never lingers.
+            present = {s.name for s in self.state.rbx_place.scripts}
+            reused = frozenset(n for n in persisted if n in present)
+            self.state.dead_modules = reused
+            if reused:
+                log.info(
+                    "[dead-modules] resume (no transpile): reusing %d persisted "
+                    "Roblox-dead verdict(s): %s",
+                    len(reused), ", ".join(sorted(reused)),
+                )
             return
 
         from converter.roblox_dead_modules import classify_module_dead
@@ -3067,6 +3085,9 @@ return table.concat(allData, "\\n")'''
                     s.name, verdict.reason,
                 )
         self.state.dead_modules = frozenset(dead)
+        # Persist for no-transpile resumes (preserve-scripts / write_output),
+        # where the input prior can't be recomputed. Sorted list for stable JSON.
+        self.ctx.dead_modules = sorted(dead)
         if dead:
             log.info(
                 "[dead-modules] %d Roblox-dead module(s): %s",
