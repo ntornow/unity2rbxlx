@@ -477,13 +477,17 @@ class TestRuntimeClassMap:
             "Transform", "RectTransform",
         })
 
-    def test_values_include_known_and_sentinel(self) -> None:
+    def test_values_are_exactly_the_runtime_table(self) -> None:
+        """Exhaustive on VALUES too (review P2b): a renamed/dropped value
+        silently shrinks the reachable set → a future false positive, so pin
+        the full set, not just membership."""
         _, values = _runtime_class_map()
-        # The runtime CharacterController->BasePart mapping (NOT Humanoid) and
-        # the Transform sentinel must both be present.
-        assert "BasePart" in values
-        assert "ParticleEmitter" in values
-        assert "__transform_self__" in values
+        assert values == frozenset({
+            "BasePart", "MeshPart", "Camera", "Light", "Sound",
+            "AnimationController", "GuiButton", "ImageLabel", "TextLabel",
+            "ScreenGui", "ParticleEmitter", "Trail", "Beam",
+            "__transform_self__",
+        })
 
     def test_character_controller_maps_to_basepart(self) -> None:
         keys, _ = _runtime_class_map()
@@ -516,9 +520,29 @@ class TestCheckBComponentAvailability:
     def test_transform_sentinel_key_not_flagged(self) -> None:
         assert _run_check_b('self:GetComponent("Transform")') == []
 
-    def test_get_component_in_children_is_scanned(self) -> None:
-        vs = _run_check_b('self:GetComponentInChildren("Collider")')
-        assert len(vs) == 1
+    def test_get_component_in_children_not_matched(self) -> None:
+        """GetComponentInChildren/InParent are lowered by the transpiler to a
+        hierarchy WALK (not a _UNITY_TO_ROBLOX_CLASS resolution), so check B's
+        reachability model doesn't apply — the regex must NOT match them
+        (review P3)."""
+        assert _run_check_b('self:GetComponentInChildren("Collider")') == []
+        assert _run_check_b('self:GetComponentInParent("Collider")') == []
+
+    def test_commented_out_getcomponent_not_flagged(self) -> None:
+        """A commented-out call must not produce a violation (review P2)."""
+        assert _run_check_b('-- self:GetComponent("Collider")') == []
+        assert _run_check_b('--[[ self:GetComponent("Collider") ]]') == []
+
+    def test_peer_reachable_by_script_id_key(self) -> None:
+        """The runtime peer lookup matches stem OR scriptId; scriptId is the
+        topology modules dict key, so a GetComponent on it is reachable."""
+        topology = {"modules": {"the-guid": {"stem": "Foo", "domain": "client",
+                    "module_path": "ReplicatedStorage.Foo"}}}
+        scripts = [RbxScript(name="S", source='self:GetComponent("the-guid")',
+                            script_type="ModuleScript", parent_path="ReplicatedStorage")]
+        result = verify_contract(topology, scripts)  # type: ignore[arg-type]
+        assert [v for v in result.violations
+                if v.check == "component_availability"] == []
 
     def test_non_literal_arg_is_skipped(self) -> None:
         """A variable arg cannot be resolved statically -> not flagged (the

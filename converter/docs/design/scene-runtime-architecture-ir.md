@@ -1129,7 +1129,7 @@ review against the merged code (original deliverable text preserved in git):**
    converted-MonoBehaviour → else `_UNITY_TO_ROBLOX_CLASS[X]` →
    `findFirstChildWhichIsA(mapped or X)` → **nil** if unknown (subsequent use
    errors). Check B flags `:GetComponent[InChildren|InParent]("X")` literal-arg
-   sites where `X` is UNREACHABLE: not a peer (module `stem` ∪ `class_name`),
+   sites where `X` is UNREACHABLE: not a peer (module `stem` ∪ `script_id`, matching the runtime peer lookup),
    not a `_UNITY_TO_ROBLOX_CLASS` key, not one of its values, not in an explicit
    minimal Roblox-class allowlist. The allowlist exists because the emitted arg
    is always a Unity name or peer class name (never a Roblox class), so the
@@ -1176,7 +1176,7 @@ review against the merged code (original deliverable text preserved in git):**
 - **Slice 1** — check A = domain⟂placement consistency (modules only; NO
   container stamp — see check #1 above). Animation_drivers deferred.
 - **Slice 2** — check B (GetComponent reachability), keyed off the PARSED runtime
-  `_UNITY_TO_ROBLOX_CLASS` + peer set (stem ∪ class_name) + Roblox-class
+  `_UNITY_TO_ROBLOX_CLASS` + peer set (stem ∪ script_id) + Roblox-class
   allowlist. Reachability only; method-validity deferred.
 - **Slice 3** — check C (cross-domain attribute) + the reader-store scan
   extension (Phase 3 #2 above).

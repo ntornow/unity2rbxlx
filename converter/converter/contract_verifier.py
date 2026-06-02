@@ -385,13 +385,28 @@ def stash_violations(
 # (``self:GetComponent(typeVar)``) cannot be resolved statically and is skipped
 # — so a future fail-closed flip of check B covers literal-arg sites only.
 
-# Matches ``:GetComponent("X")`` / ``:GetComponentInChildren("X")`` /
-# ``:GetComponentInParent("X")`` with a string-literal arg. Does NOT match the
-# plural ``GetComponents`` (list semantics, different bug class) because a
-# literal "(" must follow the optional In*/Parent suffix.
+# Matches ``:GetComponent("X")`` with a string-literal arg ONLY. Deliberately
+# does NOT match:
+#   * the plural ``GetComponents`` (list semantics, different bug class) — a
+#     literal "(" must follow "GetComponent", and "GetComponents(" has an "s";
+#   * ``GetComponentInChildren`` / ``GetComponentInParent`` — the transpiler
+#     lowers those to a GetDescendants()/GetAncestors() hierarchy WALK
+#     (code_transpiler.py:1330), not a ``_UNITY_TO_ROBLOX_CLASS`` resolution, so
+#     check B's reachability model does not apply to them (review P3).
 _GETCOMPONENT_RE = re.compile(
-    r""":GetComponent(?:InChildren|InParent)?\s*\(\s*['"]([A-Za-z_]\w*)['"]""",
+    r""":GetComponent\s*\(\s*['"]([A-Za-z_]\w*)['"]""",
 )
+
+
+def _strip_luau_comments(source: str) -> str:
+    """Remove Luau comments so the GetComponent scan doesn't fire on a
+    commented-out call (review P2). Strips ``--[[ ... ]]`` block comments first,
+    then ``-- ...`` to end-of-line. Imperfect inside string literals (a ``--``
+    in a string truncates the line), but that only DROPS a would-be match —
+    never creates one — which is the safe direction (we never want to flag a
+    GetComponent that lives inside a string anyway)."""
+    no_block = re.sub(r"--\[\[.*?\]\]", "", source, flags=re.DOTALL)
+    return re.sub(r"--[^\n]*", "", no_block)
 
 # Roblox classes converted (or hand-edited) code may legitimately pass to
 # GetComponent directly — runtime ``findFirstChildWhichIsA`` resolves them, so
@@ -461,26 +476,31 @@ def _check_component_availability(
     See the section comment above + design doc §Phase 3 check #3."""
     keys, values = _runtime_class_map()
 
-    # Peer converted-MonoBehaviours are reachable by stem OR class_name (the
-    # runtime peer lookup matches m.stem or m.scriptId; the AI emits the C#
-    # class name, which is the stem in the common case and the class_name when
-    # they differ — include both to avoid a stem≠class-name false positive).
+    # Peer converted-MonoBehaviours are reachable exactly as the runtime
+    # resolves them: ``m.stem == name or m.scriptId == name``
+    # (scene_runtime.luau:758). ``scriptId`` is the topology ``modules`` dict
+    # KEY. (Review P1: an earlier draft used ``class_name``, which the runtime
+    # never checks AND which ``TopologyModuleEntry`` never carries — a dead
+    # clause. A peer whose stem ≠ its C# class name genuinely does NOT resolve
+    # by class name at runtime, so flagging such a GetComponent is correct, not
+    # a false positive.)
     peer: set[str] = set()
     modules = topology.get("modules") or {}
-    for module in modules.values():
+    for script_id, module in modules.items():
+        if script_id:
+            peer.add(str(script_id))
         if not isinstance(module, dict):
             continue
-        for field_name in ("stem", "class_name"):
-            value = module.get(field_name)
-            if isinstance(value, str) and value:
-                peer.add(value)
+        stem = module.get("stem")
+        if isinstance(stem, str) and stem:
+            peer.add(stem)
 
     reachable = peer | set(keys) | set(values) | _ROBLOX_CLASS_ALLOWLIST
 
     violations: list[ContractViolation] = []
     seen: set[tuple[str, str]] = set()
     for script in scripts:
-        source = script.source or ""
+        source = _strip_luau_comments(script.source or "")
         for match in _GETCOMPONENT_RE.finditer(source):
             x = match.group(1)
             if x in reachable:
