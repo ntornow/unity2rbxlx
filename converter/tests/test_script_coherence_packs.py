@@ -474,8 +474,10 @@ class TestPickupRemoteEventServerAttr:
         assert packs_module._detect_pickup_setattribute_pattern([s]) is True
         packs_module._convert_pickup_to_remote_event([s])
         # The pack writes the dynamic ``has``+itemName flag on the Player
-        # AND derives the character to set the flag on the model too.
-        assert '"has" .. itemName' in s.source
+        # AND derives the character to set the flag on the model too. The
+        # itemName is sanitized to ``[%w_]`` (the funnel/Roblox attribute
+        # charset) before concatenation.
+        assert '"has" .. (itemName:gsub("[^%w_]+", "_"))' in s.source
         assert ':SetAttribute(_flag, true)' in s.source
         # Character branch is present (line resolves player.Character).
         assert 'Character' in s.source
@@ -509,9 +511,10 @@ class TestPickupRemoteEventServerAttr:
         )
         packs_module._convert_pickup_to_remote_event([s])
         # The pack writes the dynamic ``has``+itemName flag on the Player
-        # via the extracted ``_flag`` local.
+        # via the extracted ``_flag`` local. itemName is sanitized to
+        # ``[%w_]`` before concatenation.
         assert ':SetAttribute(_flag, true)' in s.source
-        assert '"has" .. itemName' in s.source
+        assert '"has" .. (itemName:gsub("[^%w_]+", "_"))' in s.source
         # Character branch present so server-side Door consumers also see it.
         assert '.Character' in s.source
         # Order: SetAttribute write must precede FireClient.
@@ -3985,3 +3988,108 @@ class TestTurretCanonicalSpatialChildApply:
         assert total == 1
         assert "local function firstSpatialChild" in s.source
         assert "return children[1]" not in s.source
+
+
+class TestSharedFlagSanitizationInPacks:
+    """Every runtime ``"has" .. name`` site emits the IDENTICAL canonical
+    inline gsub sanitizer (from ``core.flag_names``), agrees with the
+    funnel's ``^[%w_]+$`` gate, and stays SimpleFPS byte-identical for
+    clean item names.
+    """
+
+    # The single canonical emitted shape, derived from the one constant.
+    _ITEMNAME = '(itemName:gsub("[^%w_]+", "_"))'
+    _NAME = '(name:gsub("[^%w_]+", "_"))'
+
+    def _ai_transpiled_pickup(self) -> RbxScript:
+        return RbxScript(
+            name="Pickup",
+            source=(
+                'local Players = game:GetService("Players")\n'
+                'local itemName = script:GetAttribute("itemName") or ""\n'
+                'triggerPart.Touched:Connect(function(otherPart)\n'
+                '    local character = otherPart:FindFirstAncestorOfClass("Model")\n'
+                '    if not character then return end\n'
+                '    local player = Players:GetPlayerFromCharacter(character)\n'
+                '    if not player then return end\n'
+                '    character:SetAttribute("GetItem", itemName)\n'
+                '    container:Destroy()\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+
+    def test_pickup_replacement_template_uses_canonical_sanitizer(self) -> None:
+        # The static _PICKUP_REPLACEMENT template writer emits the
+        # sanitized shape (built from the one shared constant).
+        assert (
+            f'local _flag = "has" .. {self._ITEMNAME}'
+            in packs_module._PICKUP_REPLACEMENT
+        )
+
+    def test_convert_pickup_writer_uses_canonical_sanitizer(self) -> None:
+        s = self._ai_transpiled_pickup()
+        packs_module._convert_pickup_to_remote_event([s])
+        assert f'"has" .. {self._ITEMNAME}' in s.source
+
+    def test_fireclient_inject_writer_uses_canonical_sanitizer(self) -> None:
+        s = RbxScript(
+            name="Pickup",
+            source=(
+                'local _pe = game:GetService("ReplicatedStorage")'
+                ':FindFirstChild("PickupItemEvent")\n'
+                'triggerPart.Touched:Connect(function(otherPart)\n'
+                '    local character = otherPart:FindFirstAncestorOfClass("Model")\n'
+                '    local player = game:GetService("Players")'
+                ':GetPlayerFromCharacter(character)\n'
+                '    if _pe and player then _pe:FireClient(player, itemName) end\n'
+                'end)\n'
+            ),
+            script_type="Script",
+        )
+        packs_module._convert_pickup_to_remote_event([s])
+        assert f'"has" .. {self._ITEMNAME}' in s.source
+
+    def test_machine_dynamic_reader_uses_canonical_sanitizer(self) -> None:
+        # The Machine dynamic reader builds the SAME canonical name so
+        # writer and reader agree (the Door-bug class: one canonical
+        # derivation).
+        assert (
+            f'player:GetAttribute("has" .. {self._NAME})'
+            in packs_module._MACHINE_HASITEMS_REPLACEMENT
+        )
+
+    def test_emitted_name_passes_funnel_gate_for_dirty_input(self) -> None:
+        # Prove the contract end-to-end at the value level: a dirty item
+        # name sanitized by the Python util produces a token that the
+        # funnel's ^[%w_]+$ gate accepts (the Luau gsub is its byte mirror).
+        import re as _re
+        from core.flag_names import canonical_flag_token
+        token = canonical_flag_token("Red Key")
+        assert token == "Red_Key"
+        flag = "has" + token
+        assert _re.match(r"^[A-Za-z0-9_]+$", flag)  # mirrors Lua ^[%w_]+$
+
+    def test_simplefps_clean_item_is_byte_identical_modulo_wrap(self) -> None:
+        # SimpleFPS uses clean names (Key/Rifle). The sanitizer is a no-op
+        # on the VALUE, so literal GetAttribute("hasKey") readers still
+        # match at runtime. At the emit level the only change is the
+        # (no-op-for-clean-input) gsub wrap around itemName.
+        s = self._ai_transpiled_pickup()
+        packs_module._convert_pickup_to_remote_event([s])
+        # The wrap is present; a clean "Key" runtime value gsubs to "Key".
+        assert f'"has" .. {self._ITEMNAME}' in s.source
+        from core.flag_names import canonical_flag_token
+        assert canonical_flag_token("Key") == "Key"
+
+    def test_twice_run_packs_does_not_double_wrap(self) -> None:
+        # Coherence-pack twice-call rule: a second run_packs() pass must
+        # not append a second sanitized block nor double-wrap the gsub.
+        s = self._ai_transpiled_pickup()
+        run_packs([s])
+        first = s.source
+        run_packs([s])
+        assert s.source == first
+        # Exactly one sanitizer wrap (no nested gsub).
+        assert s.source.count(self._ITEMNAME) == 1
+        assert 'gsub("[^%w_]+", "_"):gsub' not in s.source
