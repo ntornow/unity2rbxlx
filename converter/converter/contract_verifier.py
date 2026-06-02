@@ -232,11 +232,21 @@ def _domain_placement_violation(
                 f"container {parent_path!r}",
             )
     elif domain == "client":
-        if script_type == "Script" and family == "server":
+        if family == "server":
+            # ANY client-domain module in a server-only container is wrong:
+            # the client cannot reach ServerStorage/ServerScriptService, so a
+            # client ModuleScript there can't be required and a client Script
+            # there never runs client-side. (Codex slice-1 review P2: the
+            # earlier `script_type == "Script"` gate missed the ModuleScript
+            # case, which `_decide_script_container_from_topology` can produce
+            # from caller domains alone.) ReplicatedStorage is NEUTRAL so it is
+            # not in this family — no false positive on the legit shared-module
+            # case.
             return _mk(
-                "client-script-in-server-container",
-                f"client-domain module {name!r} emitted as an auto-run Script "
-                f"in server-only container {parent_path!r}",
+                "client-in-server-container",
+                f"client-domain module {name!r} ({script_type}) placed in "
+                f"server-only container {parent_path!r} — unreachable by the "
+                f"client",
             )
     elif domain == "helper":
         if script_type in ("Script", "LocalScript"):
@@ -268,8 +278,15 @@ def _check_consumer_compliance(
     if not modules:
         return violations
 
+    # Check A is "modules only" this slice — exclude generated animation
+    # scripts from the join so an Anim_* name that collides with a user module
+    # stem doesn't downgrade that module's real check to an "unverifiable" info
+    # row (Codex slice-1 review P3 false-negative). Animation drivers get their
+    # own check in a later slice.
     scripts_by_name: dict[str, list[RbxScript]] = {}
     for s in scripts:
+        if s.name.startswith("Anim_"):
+            continue
         scripts_by_name.setdefault(s.name, []).append(s)
 
     for sid, module in modules.items():

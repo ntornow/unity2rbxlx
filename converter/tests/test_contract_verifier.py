@@ -335,10 +335,18 @@ class TestCheckAConsumerCompliance:
         assert len(vs) == 1
         assert "client-only" in vs[0].detail
 
-    def test_client_autorun_script_in_server_container_is_flagged(self) -> None:
+    def test_client_script_in_server_container_is_flagged(self) -> None:
         vs = _warnings(_run_check_a("client", "Script", "ServerScriptService"))
         assert len(vs) == 1
-        assert vs[0].identity.endswith("client-script-in-server-container")
+        assert vs[0].identity.endswith("client-in-server-container")
+
+    def test_client_modulescript_in_server_storage_is_flagged(self) -> None:
+        """Codex slice-1 P2: a client-domain ModuleScript in ServerStorage can't
+        be required by the client — must flag regardless of script_type (the
+        earlier Script-only gate missed this)."""
+        vs = _warnings(_run_check_a("client", "ModuleScript", "ServerStorage"))
+        assert len(vs) == 1
+        assert vs[0].identity.endswith("client-in-server-container")
 
     def test_helper_autorun_is_flagged(self) -> None:
         vs = _warnings(_run_check_a("helper", "Script", "ServerScriptService"))
@@ -393,6 +401,26 @@ class TestCheckAConsumerCompliance:
         assert _warnings(
             _run_check_a("helper", "ModuleScript", "ReplicatedFirst")
         ) == []
+
+    def test_anim_scripts_excluded_from_join(self) -> None:
+        """Codex slice-1 P3: generated Anim_* scripts are excluded from the
+        check-A join, so an Anim_* script cannot collide with a real module's
+        name and downgrade its check to 'unverifiable' info. Here the module
+        'Door' (server LocalScript → a real violation) is still flagged even
+        though an 'Anim_Door' script is also present."""
+        topology = {"modules": {"g": {"stem": "Door", "domain": "server",
+                    "module_path": "StarterPlayer.StarterPlayerScripts.Door"}}}
+        scripts = [
+            RbxScript(name="Door", source="", script_type="LocalScript",
+                      parent_path="StarterPlayer.StarterPlayerScripts"),
+            RbxScript(name="Anim_Door", source="", script_type="Script",
+                      parent_path="ServerScriptService"),
+        ]
+        result = verify_contract(topology, scripts)  # type: ignore[arg-type]
+        ca = [v for v in result.violations if v.check == "consumer_compliance"]
+        assert len(ca) == 1
+        assert ca[0].severity == "warning"
+        assert ca[0].identity.endswith("server-localscript")
 
     # --- join robustness (DQ4) ----------------------------------------------
 
