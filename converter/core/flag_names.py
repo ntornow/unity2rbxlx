@@ -7,10 +7,17 @@ with no sanitization, so a name like ``"Red Key"`` produces ``"hasRed Key"``
 attribute-name characters) and the ``PlayerSetSharedFlag`` funnel listener
 drops (``^[%w_]+$``). The result is a silent cross-domain gameplay break.
 
-This module is the SINGLE canonical definition of the sanitizer so the
-Python source path (``scene_converter`` ItemType / itemName) and the
-emitted Luau runtime path (transpiler prompt + coherence packs) produce
-byte-identical tokens for ASCII input.
+Sanitization happens at the RUNTIME ``"has" .. name`` concat site only (the
+emitted Luau gsub from :func:`luau_flag_sanitize_expr`). It is deliberately
+NOT applied to the ``itemName`` / ``ItemType`` attribute VALUES in
+``scene_converter``: those are gameplay payloads (forwarded raw to
+``GetItem`` / ``pickup_runtime`` dispatch), so sanitizing them would corrupt
+dirty-name pickups. Sanitizing only the derived flag keeps the raw value
+intact for gameplay while the cross-script flag stays ``[%w_]``-valid.
+
+:func:`sanitize_flag_stem` is the Python REFERENCE MIRROR of the emitted
+Luau gsub — identical bytes on ASCII input. It is the executable spec used by
+parity tests; production sanitization is the emitted Luau, not this function.
 
 **Sanitizer spec (ASCII-explicit, Python + Luau byte-identical for ASCII):**
 Replace each contiguous run of ``[^A-Za-z0-9_]`` with a single ``_``.
@@ -19,9 +26,19 @@ Replace each contiguous run of ``[^A-Za-z0-9_]`` with a single ``_``.
   ``\\w`` charset, because Python 3 ``\\w`` is Unicode-aware and would
   diverge from Lua's byte-oriented ``%w``.
 - Luau (emitted): ``(<expr>:gsub("[^%w_]+", "_"))``.
-- No case change. MUST be a no-op on clean identifiers
-  (``sanitize("Key") == "Key"``) so SimpleFPS's existing literal
-  ``GetAttribute("hasKey")`` readers keep matching.
+- No case change. A no-op on clean identifiers (``sanitize_flag_stem("Key")
+  == "Key"``) so SimpleFPS's existing literal ``GetAttribute("hasKey")``
+  readers keep matching.
+
+**Degenerate edges (consistent writer/reader, documented not guarded):** the
+runtime gsub cannot "skip", so (a) a name whose ``"has" + stem`` exceeds the
+funnel's 64-char cap is dropped by the funnel listener (``autogen.py``) —
+consistently, the flag just doesn't mirror cross-domain; (b) an all-symbol
+name (``"+++"``) collapses to the single flag ``"has_"``, so distinct
+all-symbol items would share it. Both require pathological item names; writer
+and reader still agree (no split-brain). A runtime guard is intentionally NOT
+added — it would add fragile inline conditionals to the AI prompt for a
+vanishingly rare input.
 """
 from __future__ import annotations
 
@@ -30,12 +47,6 @@ import re
 # Single canonical Python sanitizer regex. ASCII-explicit by design: a
 # Unicode-aware ``\w`` would diverge from Lua's byte-oriented ``%w``.
 _FLAG_TOKEN_RE = re.compile(r"[^A-Za-z0-9_]+")
-
-# Mirror the ``PlayerSetSharedFlag`` funnel listener's length cap
-# (``#flagName > 64``). ``"has" + stem`` must fit, so the stem budget is
-# 64 minus the 3-char ``"has"`` prefix.
-_HAS_PREFIX = "has"
-_MAX_FLAG_NAME_LEN = 64
 
 # The ONE canonical inline Luau sanitizer expression, as a ``str.format``
 # template. Every emitted runtime site (transpiler prompt + coherence
@@ -52,34 +63,23 @@ _MAX_FLAG_NAME_LEN = 64
 _LUAU_FLAG_SANITIZE = '({expr}:gsub("[^%w_]+", "_"))'
 
 
-def canonical_flag_token(name: str) -> str | None:
-    """Return the sanitized shared-flag stem for ``name``, or ``None`` to skip.
+def sanitize_flag_stem(name: str) -> str:
+    """Python reference mirror of the emitted Luau flag sanitizer.
 
     Replaces each contiguous run of ``[^A-Za-z0-9_]`` with a single ``_``.
-    No case change. A no-op on clean identifiers.
-
-    Returns ``None`` (caller skips the mirror) when:
-      - ``name`` is empty,
-      - ``name`` contains no original ASCII alphanumeric (sanitizes to
-        only underscores), or
-      - ``"has" + stem`` would exceed the funnel's 64-char cap.
+    No case change; a no-op on clean identifiers. Byte-identical to
+    ``(name:gsub("[^%w_]+", "_"))`` for ASCII input. Not called in
+    production (the runtime Luau is authoritative) — this is the executable
+    spec used by parity tests.
     """
-    if not name:
-        return None
-    stem = _FLAG_TOKEN_RE.sub("_", name)
-    # No original ASCII alphanumeric → token carries no identity; skip.
-    if not any(c.isascii() and c.isalnum() for c in name):
-        return None
-    if len(_HAS_PREFIX) + len(stem) > _MAX_FLAG_NAME_LEN:
-        return None
-    return stem
+    return _FLAG_TOKEN_RE.sub("_", name)
 
 
 def luau_flag_sanitize_expr(expr: str) -> str:
     """Return the canonical inline Luau ``gsub`` sanitizer wrapping ``expr``.
 
     ``expr`` is the Luau expression yielding the raw name (e.g. ``itemName``
-    or ``name``). The emitted shape is ``(<expr>):gsub("[^%w_]+", "_")`` —
-    the byte-identical mirror of :func:`canonical_flag_token` for ASCII.
+    or ``name``). The emitted shape is ``(<expr>:gsub("[^%w_]+", "_"))`` —
+    the byte-identical mirror of :func:`sanitize_flag_stem` for ASCII.
     """
     return _LUAU_FLAG_SANITIZE.format(expr=expr)

@@ -4064,8 +4064,8 @@ class TestSharedFlagSanitizationInPacks:
         # name sanitized by the Python util produces a token that the
         # funnel's ^[%w_]+$ gate accepts (the Luau gsub is its byte mirror).
         import re as _re
-        from core.flag_names import canonical_flag_token
-        token = canonical_flag_token("Red Key")
+        from core.flag_names import sanitize_flag_stem
+        token = sanitize_flag_stem("Red Key")
         assert token == "Red_Key"
         flag = "has" + token
         assert _re.match(r"^[A-Za-z0-9_]+$", flag)  # mirrors Lua ^[%w_]+$
@@ -4079,8 +4079,8 @@ class TestSharedFlagSanitizationInPacks:
         packs_module._convert_pickup_to_remote_event([s])
         # The wrap is present; a clean "Key" runtime value gsubs to "Key".
         assert f'"has" .. {self._ITEMNAME}' in s.source
-        from core.flag_names import canonical_flag_token
-        assert canonical_flag_token("Key") == "Key"
+        from core.flag_names import sanitize_flag_stem
+        assert sanitize_flag_stem("Key") == "Key"
 
     def test_twice_run_packs_does_not_double_wrap(self) -> None:
         # Coherence-pack twice-call rule: a second run_packs() pass must

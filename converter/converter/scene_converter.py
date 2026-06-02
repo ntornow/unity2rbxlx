@@ -18,7 +18,6 @@ from typing import Any
 import config
 
 from core.conversion_context import MeshHierarchyEntry
-from core.flag_names import canonical_flag_token
 from core.unity_types import (
     AssetManifest,
     GuidIndex,
@@ -3139,16 +3138,14 @@ def _extract_monobehaviour_attributes(
             part.attributes[attr_name] = value
         elif isinstance(value, str) and len(value) < 100:
             attr_name = key[2:] if key.startswith("m_") else key
-            # ``itemName`` is the source of the cross-script shared-flag name
-            # (``"has" .. itemName``). Sanitize it here so the serialized
-            # value already matches the funnel's ``^[%w_]+$`` gate; the
-            # runtime gsub is the byte-identical mirror (defense in depth).
-            # Leave the raw value when it has no sanitizable identity.
-            if attr_name == "itemName":
-                _token = canonical_flag_token(value)
-                part.attributes[attr_name] = _token if _token is not None else value
-            else:
-                part.attributes[attr_name] = value
+            # ``itemName`` is a gameplay payload, NOT a flag stem: pickup
+            # scripts forward it raw via ``PickupItemEvent:FireClient(.., itemName)``
+            # and the client listener calls ``GetItem(itemName)``. Sanitizing it
+            # here would corrupt that dispatch/label for dirty-name items. The
+            # cross-script shared-flag name (``"has" .. itemName``) is sanitized
+            # at the RUNTIME concat site instead (the emitted Luau gsub), so the
+            # raw value flows to gameplay unchanged while the flag stays valid.
+            part.attributes[attr_name] = value
         elif isinstance(value, bool):
             attr_name = key[2:] if key.startswith("m_") else key
             part.attributes[attr_name] = value
@@ -3947,12 +3944,10 @@ def _apply_gameplay_attributes(part: RbxPart, name: str) -> None:
         item_type = name.replace('Pickup', '').replace('pickup', '').strip()
         if not item_type:
             item_type = 'Generic'
-        # ItemType feeds the cross-script shared-flag name (``"has" .. ItemType``),
-        # so sanitize it to the funnel's ``^[%w_]+$`` charset here. The runtime
-        # gsub is the byte-identical mirror. A name with no sanitizable
-        # identity falls back to 'Generic'.
-        _token = canonical_flag_token(item_type)
-        item_type = _token if _token is not None else 'Generic'
+        # ItemType is a gameplay payload, NOT a flag stem: pickup_runtime.luau
+        # reads it and dispatches via ``SetAttribute("GetItem", itemType)``.
+        # Keep it RAW so dirty-name items dispatch correctly; the shared-flag
+        # name (``"has" .. ItemType``) is sanitized at the runtime concat site.
         part.attributes['IsPickup'] = True
         part.attributes['ItemType'] = item_type
         if part.class_name == 'Model' and part.children:
