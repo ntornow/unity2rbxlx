@@ -1,18 +1,5 @@
-"""test_contract_verifier.py -- Phase 3 slice 0 (shadow-mode skeleton).
-
-Drives the REAL ``contract_verifier`` code + the pipeline hook. Each test
-is built so a green result PROVES the wiring rather than passing for the
-wrong reason:
-
-  - The smoke check fires IFF the topology lacks ``modules`` -- so the
-    "zero violations" case genuinely depends on the input being inspected.
-  - The idempotency test calls the stash helper twice and asserts the row
-    count is stable (resume-replay safety).
-  - The hook test seeds ``ctx.scene_runtime`` with a topology that WOULD
-    fire the smoke check, but passes a DIFFERENT ``scene_runtime`` (with a
-    populated topology) into ``_run_contract_verifier`` -- asserting the
-    hook reads the passed dict, not ``ctx.scene_runtime``.
-"""
+"""Tests for the Phase 3 contract verifier (checks A/B/C) and its pipeline
+hook. Tests are built so a green result proves the wiring, not a non-match."""
 
 from __future__ import annotations
 
@@ -24,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from converter.contract_verifier import (  # noqa: E402
     ContractViolation,
     ContractVerifierResult,
+    _runtime_class_map,
     stash_violations,
     verify_contract,
     violation_to_dict,
@@ -466,9 +454,6 @@ class TestCheckAConsumerCompliance:
 # ---------------------------------------------------------------------------
 # Check B -- component availability (GetComponent reachability)
 # ---------------------------------------------------------------------------
-
-from converter.contract_verifier import _runtime_class_map  # noqa: E402
-
 
 def _run_check_b(source: str, *, peer_stems: list[str] | None = None
                  ) -> list[ContractViolation]:

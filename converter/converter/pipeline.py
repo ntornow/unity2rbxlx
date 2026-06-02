@@ -4310,8 +4310,7 @@ script.Disabled = true
                 ],
             )
 
-        # Phase 3 contract verifier (shadow mode): summarise the violation
-        # rows the verifier stashed on ctx during _classify_storage.
+        # Summarize the contract-verifier rows stashed on ctx.
         contract_rows = cast(
             "list[dict[str, str]]",
             self.ctx.scene_runtime.get("contract_check_violations", []),
@@ -4747,16 +4746,10 @@ script.Disabled = true
                     scene_runtime, plan,
                     topology_inputs=topology_inputs,
                 )
-                # Phase 3 slice 0: run the (shadow-mode) contract verifier
-                # now that the full topology artifact + final script
-                # placements coexist. ``scene_runtime["topology"]`` is
-                # populated on THIS merged local dict inside
-                # ``_build_and_apply_topology`` (it is NOT copied back to
-                # ``ctx.scene_runtime``), so the verifier must read it from
-                # the in-scope dict. Defensive guard: only run when topology
-                # is actually present.
-                if scene_runtime.get("topology"):
-                    self._run_contract_verifier(scene_runtime)
+                # Phase 3: run the shadow-mode contract verifier now that the
+                # topology artifact + final placements coexist. Unconditional so
+                # the verifier's smoke check can fire if topology is missing.
+                self._run_contract_verifier(scene_runtime)
 
         plan_path.write_text(
             _json.dumps({
@@ -4774,59 +4767,34 @@ script.Disabled = true
         )
 
     def _run_contract_verifier(self, scene_runtime: dict[str, object]) -> None:
-        """Phase 3 slice 0: run the shadow-mode contract verifier and stash
-        its violations on ``ctx.scene_runtime``.
+        """Run the shadow-mode contract verifier and store the current run's
+        violations on ``ctx.scene_runtime``.
 
-        Called from ``_classify_storage`` immediately after
-        ``_build_and_apply_topology`` (inside the non-legacy /
-        ``topology_inputs is not None`` gate), when ``scene_runtime`` carries
-        a populated ``topology`` block.
-
-        Reads topology from the passed ``scene_runtime`` (the merged local
-        dict that ``_build_and_apply_topology`` writes to) — NOT from
-        ``self.ctx.scene_runtime``, which never receives the topology block.
-
-        SHADOW MODE: violations are recorded to the
-        ``contract_check_violations`` metric only; we do NOT append to
-        ``ctx.errors`` in slice 0 (no check has flipped to fail-closed yet).
+        Reads topology from the PASSED ``scene_runtime`` (the merged local dict
+        ``_build_and_apply_topology`` writes to), NOT ``ctx.scene_runtime``
+        which never receives the topology block. Shadow mode: records the
+        ``contract_check_violations`` metric only, never ``ctx.errors``.
         """
-        import os as _os
+        import os
 
         from converter import contract_verifier
 
-        # Env-var hatch. Slice 0's verifier is shadow-only, so this hatch
-        # just disables the (already non-fatal) verifier. The fail-closed
-        # PROMOTION gate — and its own env hatch evaluated at the
-        # error-promotion point — lands when the first check flips to
-        # fail-closed (slice 4).
-        disable = _os.environ.get("U2R_CONTRACT_VERIFIER_DISABLE", "")
-        if disable.strip().lower() in ("1", "true", "yes"):
-            log.info(
-                "[contract_verifier] disabled via "
-                "U2R_CONTRACT_VERIFIER_DISABLE=%r; skipping",
-                disable,
-            )
+        # Shadow-only disable hatch; the fail-closed promotion gate gets its own
+        # hatch in slice 4.
+        if os.environ.get("U2R_CONTRACT_VERIFIER_DISABLE", "").strip().lower() in (
+            "1", "true", "yes",
+        ):
+            log.info("[contract_verifier] disabled via env; skipping")
             return
 
         topology = cast("TopologyArtifact", scene_runtime.get("topology", {}))
         scripts = list(self.state.rbx_place.scripts or [])
+        result = contract_verifier.verify_contract(topology, scripts)
 
-        result = contract_verifier.verify_contract(
-            topology, scripts, mode="shadow",
-        )
-
-        # Stash to ctx (NOT the local scene_runtime) so downstream report
-        # assembly can read it. The verifier OWNS the
-        # ``contract_check_violations`` key and is deterministic over its
-        # inputs, so each run REPLACES the rows with the current result --
-        # we do NOT append to whatever was loaded from a prior run's
-        # ``conversion_context.json``. ``ctx.scene_runtime`` persists +
-        # reloads across a resume (core/conversion_context.py:118,177), so an
-        # append-only stash would keep a stale violation forever even after
-        # the underlying issue is fixed and the current run is clean (codex
-        # slice-0 review P2). ``stash_violations`` still dedups identities
-        # WITHIN this run's result; the fresh list it fills overwrites the
-        # reloaded one.
+        # REPLACE the rows (not append): ``ctx.scene_runtime`` persists + reloads
+        # across a resume (conversion_context.json), so an append-only stash
+        # would keep a stale violation forever after the issue is fixed. The
+        # verifier owns this key and is deterministic over its inputs.
         rows: list[dict[str, str]] = []
         contract_verifier.stash_violations(rows, result)
         self.ctx.scene_runtime["contract_check_violations"] = rows
