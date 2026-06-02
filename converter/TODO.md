@@ -173,21 +173,28 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   [`docs/FUTURE_IMPROVEMENTS.md`](docs/FUTURE_IMPROVEMENTS.md)
   § "Persistent prefab/asset cache".
 
-- [ ] **P1 — Upstream classifier misroutes Roblox-dead Unity-rendering
-  modules to server-only.** Phase 2a slice 7 audit, 2026-05-30.
-  `infer_module_domains` classifies Unity-rendering helpers (`WaterBase`,
-  `PlanarReflection`, `Displace`) as server-only because their only
-  observed callers happen to be server-side. But the modules' Unity APIs
-  (`OnWillRenderObject`, Camera-based reflection rendering,
-  `Shader.EnableKeyword`) have no Roblox equivalent — the modules
-  effectively run as dead code in the converted output. Routing them to
-  `ServerStorage` based on caller-graph evidence is technically correct
-  given the inputs, but ships dead modules to the wrong container.
-  Fix shape: either (a) a dead-code pruning pass that drops modules whose
-  bodies are dominated by Unity APIs without Roblox equivalents, or
-  (b) an upstream classifier signal that detects "Roblox-dead" modules
-  and short-circuits their domain inference. Option (a) is the more
-  general fix.
+- [x] **P1 — Upstream classifier misroutes Roblox-dead Unity-rendering
+  modules to server-only.** Phase 2a slice 7 audit, 2026-05-30. FIXED
+  2026-06-01 (`fix/roblox-dead-module-routing`). **Corrected root cause
+  (audit framing was imprecise, like sibling #9):** the misroute is NOT
+  `infer_module_domains` stamping these server — zero-signal modules hit
+  Rule 7 → `client` under `networking="none"`. It is the **caller-domain
+  storage routing** (`storage_classifier._decide_script_container_*`)
+  pulling a self-requiring cluster of Roblox-dead rendering modules into
+  `ServerStorage` because their callers default to server. Also found: the
+  existing `code_transpiler._is_visual_only_script` already classified
+  "visual-only" but via a **hardcoded game class-name list** (the only
+  reason `WaterBase`/`Displace` were caught) and never propagated the
+  verdict to routing. **Fix (hybrid C + D3 definition):** a generic,
+  behavior-based `roblox_dead_modules` detector (input mapping-coverage
+  prior + decisive post-coherence output-inertness + hard veto; NO class
+  names) replaces the hardcoded heuristic; dead modules are routed out of
+  `ServerStorage` to `ReplicatedStorage` (BOTH topology + legacy paths) and
+  a closure-safe prune pass drops fully-dead require-closures (never a
+  module with a live requirer; closure computed from emitted Luau). See
+  `docs/design/roblox-dead-module-routing-brief.md` (LOCKED DECISIONS) +
+  `docs/design/scene-runtime-architecture-ir.md` § "Roblox-dead module
+  handling" + `.claude/handoffs/task-8-roblox-dead-modules.md`.
 
 - [x] **P1 — Transpiler false-positive `require()` injection poisons
   storage classification.** Phase 2a slice 7 audit, 2026-05-30. FIXED

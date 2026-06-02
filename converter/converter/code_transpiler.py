@@ -684,41 +684,29 @@ def _build_project_context(script_infos: list[Any]) -> str:
 
 
 def _is_visual_only_script(script_path: Path, source: str) -> bool:
-    """Detect scripts that are Unity rendering/visual-only and can't work in Roblox.
+    """Transpile-time gate: should this C# script be auto-stubbed as a
+    Roblox-dead visual/rendering helper?
 
-    Conservative: only stub scripts that genuinely have no Roblox equivalent.
-    Gameplay scripts (collision, resetting, timers) should always be transpiled.
+    This is the INPUT-SIDE (C#-only) half of the generic Roblox-dead detector
+    (``converter.roblox_dead_modules``). At transpile time no Luau body exists
+    yet, so the decisive OUTPUT-side confirmation runs later in the
+    post-coherence dead-module pass (``pipeline._subphase_analyze_dead_modules``). This
+    gate uses the mapping-coverage prior + a C#-source gameplay veto:
+
+      * a C# body with gameplay-bearing behavior (Instantiate, GetComponent,
+        input, transform mutation, physics) is NEVER stubbed; and
+      * a body whose API surface is dominated by unmapped APIs IS stubbed.
+
+    Replaces the former hardcoded class-name list (``waterbase`` / ``displace``
+    / ...) with the generic coverage-driven prior, so a renamed rendering
+    helper (``OceanShimmer`` with the same body shape) is stubbed by behavior,
+    not name. Some dead helpers that use ``GetComponent`` (e.g.
+    ``PlanarReflection``) are NOT caught here -- they transpile normally and the
+    decisive post-coherence pass flags them on their inert output.
     """
-    name = script_path.stem.lower()
+    from converter.roblox_dead_modules import is_input_side_dead
 
-    # Gameplay indicators — if present, NEVER stub
-    gameplay_indicators = [
-        "OnCollision", "OnTrigger", "Rigidbody", "GetComponent",
-        "Instantiate", "Destroy(", "SendMessage", "StartCoroutine",
-        "Input.", "KeyCode.", "transform.position", "transform.rotation",
-        "AddForce", "velocity", "Health", "Damage", "Timer",
-    ]
-    if any(ind in source for ind in gameplay_indicators):
-        return False
-
-    # Known visual-only script name patterns (rendering/shader effects only)
-    visual_keywords = [
-        "planarreflection", "specularlighting", "waterbase", "watertile",
-        "waterbasic", "gerstnerdisplace", "displace", "meshcontainer",
-        "planetexture",
-    ]
-    if name in visual_keywords:
-        return True
-
-    # Scripts that primarily manipulate shaders/renderers/materials
-    shader_indicators = ["Shader.", "Material.", "Renderer.", "renderer.material",
-                         "OnRenderImage", "OnWillRenderObject", "RenderTexture",
-                         "Graphics.Blit"]
-    shader_count = sum(1 for s in shader_indicators if s in source)
-    if shader_count >= 2:
-        return True
-
-    return False
+    return is_input_side_dead(source)
 
 
 _RE_NON_IDENT = re.compile(r"\W")

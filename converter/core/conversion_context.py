@@ -150,6 +150,16 @@ class ConversionContext:
     # application. Default off so iteration cycles aren't blocked.
     strict_classification: bool = False
 
+    # TODO #8 (Roblox-dead module routing): module names the post-coherence
+    # dead-module pass flagged Roblox-dead on the run that transpiled. Persisted
+    # as a sorted ``list[str]`` for JSON-friendliness; the pipeline reads it back
+    # as a frozenset. Round-trips through ``conversion_context.json`` so a
+    # no-transpile resume (preserve-scripts / ``--phase=write_output``, where
+    # ``transpilation_result`` is None and the input prior cannot be recomputed)
+    # reuses the prior verdict instead of re-routing the previously-dead modules
+    # back into ServerStorage. Empty by default.
+    dead_modules: list[str] = field(default_factory=list)
+
     def __post_init__(self) -> None:
         # JSON load via `cls(**data)` populates storage_plan as a dict (the
         # asdict() form). Reconstruct it as a StoragePlan when present so the

@@ -164,6 +164,16 @@ class PipelineState:
     # fail-safe ``True`` (legacy mode never computes it, keep the funnel).
     shared_flag_channels: "SharedFlagChannels | None" = None
 
+    # TODO #8 (Roblox-dead module routing): TRANSIENT set of module names the
+    # post-coherence dead-module pass (``_subphase_analyze_dead_modules``) flagged as
+    # Roblox-dead (inert visual/rendering helpers). Recomputed every run from
+    # the just-transpiled C# + post-coherence Luau; never persisted. Consumed
+    # by ``_classify_storage`` (routes dead modules out of ServerStorage) and
+    # ``_subphase_prune_dead_module_closures`` (drops fully-dead require-closures).
+    # Empty on no-transpile resumes (no fresh C# surface to measure) -- the
+    # storage plan was already computed on the fresh run that produced it.
+    dead_modules: frozenset[str] = frozenset()
+
 
 class Pipeline:
     """Orchestrates the full Unity -> Roblox conversion pipeline.
@@ -2593,6 +2603,8 @@ return table.concat(allData, "\\n")'''
         # in commit 4.
         "_subphase_emit_scripts_to_disk",
         "_subphase_cohere_scripts",
+        "_subphase_analyze_dead_modules",
+        "_subphase_prune_dead_module_closures",
         "_classify_storage",
     )
     """Order in which :meth:`materialize_and_classify` invokes its subphases.
@@ -2639,6 +2651,8 @@ return table.concat(allData, "\\n")'''
         # first because cohere/classify both walk ``rbx_place.scripts``.
         self._subphase_emit_scripts_to_disk()
         self._subphase_cohere_scripts()
+        self._subphase_analyze_dead_modules()
+        self._subphase_prune_dead_module_closures()
         self._classify_storage()
 
     def write_output(self) -> None:
@@ -2980,6 +2994,242 @@ return table.concat(allData, "\\n")'''
         fixes = fix_require_classifications(self.state.rbx_place.scripts)
         if fixes:
             log.info("[write_output] Reclassified %d scripts based on require() dependencies", fixes)
+
+    def _subphase_analyze_dead_modules(self) -> None:
+        """TODO #8: compute the per-module Roblox-dead verdict.
+
+        Runs AFTER cohere (so the post-coherence Luau body exists -- the
+        decisive OUTPUT-side inertness/veto signal) and BEFORE classify (so
+        the verdict can drive storage routing) and BEFORE the prune pass.
+
+        D3 (both-agree) + HARD VETO, computed by
+        ``converter.roblox_dead_modules.classify_module_dead`` from each
+        module's ORIGINAL C# source (input-side mapping-coverage prior) +
+        its post-coherence Luau body (output-side inertness / veto). Only
+        ModuleScripts are eligible -- a dead Script/LocalScript is a different
+        (and non-existent in practice) shape, and the routing/prune consumers
+        operate on modules.
+
+        Stores the result on ``self.state.dead_modules`` AND persists it to
+        ``ctx.dead_modules`` (round-trips through ``conversion_context.json``).
+        On a no-transpile resume (preserve-scripts / ``--phase=write_output``,
+        ``transpilation_result`` is None) the input prior cannot be recomputed
+        from C#, so this REUSES the persisted set from the run that transpiled
+        -- but RE-VALIDATES each persisted name against its CURRENT rehydrated
+        Luau body first. A module that was dead at last transpile but has since
+        been HAND-EDITED to add real Roblox logic is dropped from the dead set,
+        so the prune / reroute-inert consumers never clobber the user's edit (the
+        supported preserve-scripts / hand-edit workflow). Without the reuse the
+        verdict would abstain (empty) and ``_classify_storage`` would re-route
+        the still-dead modules back into ServerStorage; without the revalidation
+        a hand-edited module would be wrongly pruned/rerouted-inert.
+        """
+        self.state.dead_modules = frozenset()
+        if self.state.rbx_place is None or not self.state.rbx_place.scripts:
+            return
+        # The input-side prior needs the original C# source. It only exists on
+        # a fresh transpile (``transpilation_result``); a resume rehydrates
+        # Luau from disk without the C#. On resume, reuse the persisted verdict
+        # (consistent with how _classify_storage preserves prior decisions when
+        # transpilation_result is absent) instead of abstaining.
+        result = self.state.transpilation_result
+        if result is None or not result.scripts:
+            from converter.roblox_dead_modules import (
+                has_genuine_roblox_effect,
+                is_output_inert,
+            )
+
+            persisted = getattr(self.ctx, "dead_modules", None) or []
+            persisted_set = set(persisted)
+            # RE-VALIDATE each persisted-dead verdict against its CURRENT
+            # rehydrated Luau body. ``materialize_and_classify`` rehydrates the
+            # on-disk ``*.luau`` first, so a module that was dead at last
+            # transpile but has since been HAND-EDITED to add real Roblox logic
+            # must be DROPPED from the dead set -- otherwise the prune /
+            # reroute-inert consumers would clobber the user's edit (the
+            # supported preserve-scripts / hand-edit workflow). The C# input
+            # prior does NOT need re-measuring: C# is unchanged by a Luau hand-
+            # edit and the verdict was measured dead-leaning at transpile time;
+            # the decisive OUTPUT signal is what a hand-edit changes. Keep a
+            # module dead ONLY when its current body is still output-inert and
+            # not vetoed.
+            reused: set[str] = set()
+            dropped: list[str] = []
+            for s in self.state.rbx_place.scripts:
+                if s.name not in persisted_set:
+                    continue
+                if is_output_inert(s.source) and not has_genuine_roblox_effect(
+                    s.source
+                ):
+                    reused.add(s.name)
+                else:
+                    dropped.append(s.name)
+            self.state.dead_modules = frozenset(reused)
+            if reused:
+                log.info(
+                    "[dead-modules] resume (no transpile): revalidated %d "
+                    "persisted Roblox-dead verdict(s) against current Luau: %s",
+                    len(reused), ", ".join(sorted(reused)),
+                )
+            if dropped:
+                log.info(
+                    "[dead-modules] resume (no transpile): dropped %d persisted "
+                    "verdict(s) whose current Luau is no longer inert "
+                    "(hand-edited): %s",
+                    len(dropped), ", ".join(sorted(dropped)),
+                )
+            return
+
+        from converter.roblox_dead_modules import classify_module_dead
+
+        # Map module name -> (original C# source, transpile strategy). Keyed by
+        # output filename stem, which equals RbxScript.name for transpiled
+        # scripts.
+        csharp_by_name: dict[str, str] = {}
+        strategy_by_name: dict[str, str] = {}
+        for ts in result.scripts:
+            stem = Path(ts.output_filename).stem
+            csharp_by_name.setdefault(stem, ts.csharp_source)
+            strategy_by_name.setdefault(stem, ts.strategy)
+
+        # The OUTPUT-inert signal is only DECISIVE for deterministic strategies:
+        # ``ai`` (the model produced an inert body on a real attempt) and
+        # ``stub`` (the converter deterministically stubbed a visual-only
+        # script). A ``rule_based`` / ``hybrid`` FALLBACK can emit an inert
+        # TODO-skeleton for a REAL gameplay module (e.g. when the AI was
+        # disabled / failed), so trusting its inert body would over-flag.
+        _DECISIVE_STRATEGIES = frozenset({"ai", "stub"})
+
+        dead: set[str] = set()
+        for s in self.state.rbx_place.scripts:
+            if s.script_type != "ModuleScript":
+                continue
+            csharp = csharp_by_name.get(s.name)
+            if csharp is None:
+                # No C# source for this module (injected runtime helper,
+                # autogen, etc.) -- never a Roblox-dead Unity module.
+                continue
+            if strategy_by_name.get(s.name) not in _DECISIVE_STRATEGIES:
+                # Non-deterministic fallback body -- inertness is unreliable.
+                continue
+            verdict = classify_module_dead(
+                s.name, csharp_source=csharp, luau_source=s.source,
+            )
+            if verdict.is_dead:
+                dead.add(s.name)
+                log.info(
+                    "[dead-modules] %s flagged Roblox-dead: %s",
+                    s.name, verdict.reason,
+                )
+        self.state.dead_modules = frozenset(dead)
+        # Persist for no-transpile resumes (preserve-scripts / write_output),
+        # where the input prior can't be recomputed. Sorted list for stable JSON.
+        self.ctx.dead_modules = sorted(dead)
+        if dead:
+            log.info(
+                "[dead-modules] %d Roblox-dead module(s): %s",
+                len(dead), ", ".join(sorted(dead)),
+            )
+
+    def _subphase_prune_dead_module_closures(self) -> None:
+        """TODO #8: DROP dead modules whose ENTIRE require-closure is dead.
+
+        A dead module is safe to remove from output (and disk) ONLY when every
+        module that ``require``s it is ALSO dead (GF8 / LOCKED DECISION):
+        otherwise a surviving ``require()`` resolves to ``nil`` and hard-crashes
+        (``require(nil)``). The require-closure is computed from the FINAL
+        EMITTED LUAU injected-require edges (NOT ``dependency_map``, which misses
+        post-transpile injected requires).
+
+        Dead modules with a LIVE requirer are NOT pruned -- they stay emitted
+        and the routing consumer (``_classify_storage`` /
+        ``storage_classifier``) reroutes them out of ServerStorage to
+        ReplicatedStorage as inert host-loadable stubs (the B fallback). This
+        keeps the surviving ``require()`` resolvable.
+
+        Runs BEFORE ``_classify_storage`` so pruned modules never enter the
+        storage plan.
+        """
+        if self.state.rbx_place is None or not self.state.rbx_place.scripts:
+            return
+        dead = self.state.dead_modules
+        if not dead:
+            return
+
+        from converter.roblox_dead_modules import (
+            compute_prunable_dead,
+            extract_require_edges,
+        )
+
+        scripts = self.state.rbx_place.scripts
+        known_names = frozenset(s.name for s in scripts)
+        require_edges: dict[str, set[str]] = {
+            s.name: extract_require_edges(s.source, known_names) for s in scripts
+        }
+        partition = compute_prunable_dead(dead, require_edges)
+        prunable = partition.prunable
+        if not prunable:
+            log.info(
+                "[dead-modules] no fully-dead require-closures to prune "
+                "(%d dead module(s) kept inert with live requirers)",
+                len(partition.keep_inert),
+            )
+            return
+
+        # Do NOT prune a runtime-bearing generic-mode component if it would
+        # leave a dangling SceneRuntimePlan row -- keep those inert instead
+        # (LOCKED DECISION: prefer inert for safety). A module that appears in
+        # the scene_runtime plan's runtime-bearing module set is excluded from
+        # the prune set here; it stays emitted (and is rerouted by the storage
+        # consumer). Orphan dead code (the SimpleFPS water cluster -- placed in
+        # ZERO scenes) carries no plan row and IS prunable.
+        plan_bearing = self._runtime_bearing_module_names()
+        unsafe = prunable & plan_bearing
+        if unsafe:
+            log.info(
+                "[dead-modules] keeping %d dead module(s) inert (runtime-bearing "
+                "plan rows, prune unsafe): %s",
+                len(unsafe), ", ".join(sorted(unsafe)),
+            )
+        to_prune = prunable - plan_bearing
+        if not to_prune:
+            return
+
+        kept = [s for s in scripts if s.name not in to_prune]
+        for s in scripts:
+            if s.name in to_prune:
+                self._delete_pruned_script_from_disk(s)
+        self.state.rbx_place.scripts = kept
+        log.info(
+            "[dead-modules] pruned %d fully-dead module(s) from output: %s",
+            len(to_prune), ", ".join(sorted(to_prune)),
+        )
+
+    def _runtime_bearing_module_names(self) -> frozenset[str]:
+        """Return the set of module class names the scene_runtime plan marks
+        runtime-bearing (instantiated at runtime).
+
+        Used by the prune pass to avoid dropping a module that has a live
+        SceneRuntimePlan row (which would leave a dangling instantiation).
+        Reads ``ctx.scene_runtime['modules']`` (the merged planner artifact).
+        Empty in legacy mode (no scene_runtime), which is correct -- legacy
+        emits no SceneRuntimePlan.
+        """
+        scene_runtime = getattr(self.ctx, "scene_runtime", None)
+        if not isinstance(scene_runtime, dict):
+            return frozenset()
+        modules = scene_runtime.get("modules")
+        if not isinstance(modules, dict):
+            return frozenset()
+        names: set[str] = set()
+        for row in modules.values():
+            if not isinstance(row, dict):
+                continue
+            if row.get("runtime_bearing"):
+                cn = row.get("class_name") or row.get("stem")
+                if isinstance(cn, str) and cn:
+                    names.add(cn)
+        return frozenset(names)
 
     # Default container fallbacks for ``_classify_late_appended_scripts``.
     # Mirrors the rbxlx_writer's script_type-based fallback (see
@@ -4315,6 +4565,7 @@ script.Disabled = true
             self.state.rbx_place.scripts,
             dependency_map=self.state.dependency_map or None,
             topology_inputs=topology_inputs,
+            dead_modules=self.state.dead_modules or None,
         )
         self.ctx.storage_plan = plan
 

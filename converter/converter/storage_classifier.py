@@ -199,6 +199,7 @@ def classify_storage(
     template_names: Iterable[str] | None = None,
     template_spawn_callers: dict[str, list[str]] | None = None,
     topology_inputs: "TopologyInputs | None" = None,
+    dead_modules: frozenset[str] | None = None,
 ) -> StoragePlan:
     """Assign each script a concrete parent_path and build a StoragePlan.
 
@@ -234,10 +235,26 @@ def classify_storage(
             ``reachability_requirements`` collapses to ``{}`` and
             slice 7 falls back to the "unconstrained helper" path).
 
+        dead_modules: Names of Roblox-dead ModuleScripts (rendering/visual
+            helpers with no Roblox runtime effect), computed once by the
+            post-coherence dead-module pass
+            (``pipeline._subphase_analyze_dead_modules`` via
+            ``converter.roblox_dead_modules``). A dead ModuleScript is routed
+            OUT of ServerStorage to ReplicatedStorage regardless of
+            caller-domain, in BOTH the topology and legacy paths -- caller-
+            domain routing would otherwise pull a self-contained dead cluster
+            into ServerStorage (the reported symptom). The module body is
+            already an inert stub (no-op lifecycle), so SceneRuntime never
+            applies any effect; rerouting to RS keeps it reachable for any
+            surviving requirer without parking dead code in a server-private
+            container. ``None`` (the default) preserves pre-fix behavior for
+            direct test callers that do not run the dead-module pass.
+
     Returns:
         StoragePlan describing every container assignment with an audit trail.
     """
     plan = StoragePlan()
+    dead_set: frozenset[str] = dead_modules or frozenset()
     character_set = set(character_script_names or [])
     script_by_name: dict[str, RbxScript] = {s.name: s for s in scripts}
 
@@ -261,6 +278,7 @@ def classify_storage(
             topology_inputs=topology_inputs,
             fallback_client_touchers=fallback_client_touchers,
             fallback_server_touchers=fallback_server_touchers,
+            dead_modules=dead_set,
         )
         s.parent_path = container
 
@@ -485,6 +503,7 @@ def _decide_script_container(
     topology_inputs: "TopologyInputs | None" = None,
     fallback_client_touchers: set[str] | None = None,
     fallback_server_touchers: set[str] | None = None,
+    dead_modules: frozenset[str] | None = None,
 ) -> tuple[str, str]:
     """Return (container, reason) for a single script.
 
@@ -537,6 +556,7 @@ def _decide_script_container(
         if fallback_server_touchers is not None
         else set()
     )
+    dead_set: frozenset[str] = dead_modules or frozenset()
 
     # ------------------------------------------------------------------
     # Fallback gates -- evaluated BEFORE the topology tree dereferences
@@ -550,6 +570,7 @@ def _decide_script_container(
             script_by_name=script_by_name,
             client_touchers=client_touchers,
             server_touchers=server_touchers,
+            dead_modules=dead_set,
         )
 
     sid = topology_inputs["script_id_by_name"].get(s.name)
@@ -564,6 +585,7 @@ def _decide_script_container(
             script_by_name=script_by_name,
             client_touchers=client_touchers,
             server_touchers=server_touchers,
+            dead_modules=dead_set,
         )
 
     # Unconstrained-helper contract (Codex amendment 1, slice-6
@@ -584,10 +606,11 @@ def _decide_script_container(
             script_by_name=script_by_name,
             client_touchers=client_touchers,
             server_touchers=server_touchers,
+            dead_modules=dead_set,
         )
 
     return _decide_script_container_from_topology(
-        s, sid=sid, topology_inputs=topology_inputs,
+        s, sid=sid, topology_inputs=topology_inputs, dead_modules=dead_set,
     )
 
 
@@ -596,6 +619,7 @@ def _decide_script_container_from_topology(
     *,
     sid: str,
     topology_inputs: "TopologyInputs",
+    dead_modules: frozenset[str] | None = None,
 ) -> tuple[str, str]:
     """Slice-7 topology-driven decision tree.
 
@@ -654,6 +678,17 @@ def _decide_script_container_from_topology(
         )
 
     if s.script_type == "ModuleScript":
+        # Roblox-dead module: route OUT of ServerStorage to ReplicatedStorage
+        # regardless of caller-domain. The caller-domain rule below would pull
+        # a self-contained dead rendering cluster (whose only callers are
+        # server-default leaf Scripts) into ServerStorage -- the reported
+        # symptom. The body is already an inert stub, so RS is the neutral,
+        # reachable home. (See pipeline._subphase_analyze_dead_modules.)
+        if dead_modules and s.name in dead_modules:
+            return REPLICATED_STORAGE, (
+                "topology: Roblox-dead module (inert visual/rendering helper): "
+                "routed to ReplicatedStorage (no caller-domain ServerStorage)"
+            )
         callers = topology_inputs["caller_graph"].get(sid, [])
         if not callers:
             return REPLICATED_STORAGE, (
@@ -714,6 +749,7 @@ def _decide_script_container_legacy(
     script_by_name: dict[str, RbxScript],
     client_touchers: set[str] | None = None,
     server_touchers: set[str] | None = None,
+    dead_modules: frozenset[str] | None = None,
 ) -> tuple[str, str]:
     """Legacy fallback decision tree.
 
@@ -758,6 +794,16 @@ def _decide_script_container_legacy(
 
     # ModuleScripts: route by who requires them.
     if s.script_type == "ModuleScript":
+        # Roblox-dead module: route OUT of ServerStorage to ReplicatedStorage
+        # regardless of caller domain. The cached SimpleFPS symptom uses THIS
+        # path's ``...server-side callers`` reason text, so the dead reroute
+        # must fire here too (LOCKED DECISION: fix both paths). The body is an
+        # inert stub; RS is the neutral, reachable home.
+        if dead_modules and s.name in dead_modules:
+            return REPLICATED_STORAGE, (
+                "Roblox-dead module (inert visual/rendering helper): "
+                "routed to ReplicatedStorage (no caller-domain ServerStorage)"
+            )
         callers = _find_callers(s.name, call_graph)
         if not callers:
             # Orphan module — nobody requires it. Default to ReplicatedStorage
