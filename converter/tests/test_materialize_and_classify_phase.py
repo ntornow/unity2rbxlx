@@ -132,6 +132,23 @@ class TestSubphaseOrderInvariant:
             "_classify_storage",
         )
 
+    def test_cohere_runs_before_classify_for_type_authority(self) -> None:
+        """P2 invariant (2026-06-02): ``_subphase_cohere_scripts`` (which in
+        LEGACY mode runs ``_fix_client_server_classification`` to correct
+        ``script_type`` from client/server API source) MUST run before
+        ``_classify_storage`` (which routes BY ``script_type``). If a future
+        refactor reordered these, storage routing would read an uncorrected
+        type and could misroute (e.g. a server-domain script left as a
+        LocalScript → StarterPlayerScripts). The generic-mode gap (coherence
+        off by contract) is surfaced defensively by a warning in
+        ``_decide_script_container_from_topology``; this test guards the
+        legacy correction path's ordering.
+        """
+        order = Pipeline.MATERIALIZE_AND_CLASSIFY_ORDER
+        assert order.index("_subphase_cohere_scripts") < order.index(
+            "_classify_storage"
+        ), "cohere (type-fix) must precede classify (routes by script_type)"
+
     def test_method_body_matches_constant(self) -> None:
         actual = _parse_materialize_and_classify_call_sequence()
         expected = list(Pipeline.MATERIALIZE_AND_CLASSIFY_ORDER)

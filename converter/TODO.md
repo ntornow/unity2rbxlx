@@ -26,16 +26,31 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
   Touches `code_transpiler` / `scene_converter` / packs — its own slice,
   NOT topology work.
 
-- [ ] **P2 — Topology prepass reads pre-coherence `script_type` (pre-existing; surfaced 2026-06-01).**
-  `_maybe_run_topology_prepass` scans `state.transpilation_result.scripts`,
-  whose `script_type` is PRE-coherence. `script_coherence._fix_client_server_classification`
-  can later flip LocalScript→Script (server-only APIs). Any topology
-  consumer that branches on a reader's client/server-ness from the
-  pre-coherence type can be wrong (e.g. `shared_flag_channels` intentionally
-  does NOT suppress fail-open on `script_type` for this reason). Fix: an
-  authoritative post-coherence domain signal available to the prepass, OR
-  move the relevant decision post-coherence. Decide when a consumer
-  genuinely needs authoritative per-reader domain.
+- [x] **P2 — Topology prepass reads pre-coherence `script_type` (pre-existing; surfaced 2026-06-01).**
+  CLOSED 2026-06-02 (`fix/topology-script-type-authority-guard`): the stated
+  premise was IMPRECISE (verified empirically + Claude/Codex review). Findings:
+  (1) the prepass runs INSIDE `_classify_storage`, which is AFTER
+  `_subphase_cohere_scripts` in `MATERIALIZE_AND_CLASSIFY_ORDER` — so in LEGACY
+  mode `script_type` is already corrected before routing reads it; (2)
+  `infer_module_domains` derives `domains` from SOURCE/evidence, NOT
+  `script_type`, so the `domains` map (the main topology output storage
+  consumes) is never polluted by a pre-coherence type; (3) the only genuine
+  pre-coherence read is `compute_shared_flag_channels(transpiled_scripts=…)`,
+  which already FAILS OPEN and deliberately doesn't suppress on `script_type`;
+  (4) `lifecycle_roles` uses the immutable `intrinsic_script_type`. So NO
+  current consumer needs an authoritative post-coherence domain it doesn't
+  already have. The one residual is a LATENT generic-mode gap (Codex): generic
+  skips the client/server type-fix by contract, and
+  `_decide_script_container_from_topology` routes `LocalScript` by type before
+  domain — a stale/uncorrected `LocalScript` with server-domain source would
+  misroute to StarterPlayerScripts. Not demonstrated on a real project
+  (generic forces runtime-bearing→ModuleScript; `_classify_script_type` is
+  source-based; resume rehydrates a consistent type+source pair). Shipped a
+  light guard: a defensive WARNING on the LocalScript/server-domain conflict
+  (no routing change, no contract violation) + a regression test pinning the
+  legacy cohere-before-classify ordering. A full type↔domain reconciliation in
+  generic mode (crossing the generic contract boundary) is deferred as
+  unjustified for a latent, unprovable edge.
 
 - [ ] **P1 — Door pack widening (PR #121 `371ab76`) has 1 fixture covering 1 of 3 emit shapes.** Claude review, 2026-05-21.
   `_detect_door_module_player_lookup` + `_fix_door_module_player_lookup` were

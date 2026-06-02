@@ -717,6 +717,25 @@ def _decide_script_container_from_topology(
         )
 
     if s.script_type == "LocalScript":
+        # Defensive surface for the latent type/domain conflict (Codex,
+        # 2026-06-02): routing is BY script_type here — a LocalScript MUST
+        # land in a client container (Roblox engine constraint). The
+        # source-derived ``domains`` verdict is independent of script_type;
+        # if it says "server" while the type is LocalScript, the type is
+        # likely mis-classified. In LEGACY mode
+        # ``_fix_client_server_classification`` corrects the type BEFORE this
+        # runs; in GENERIC mode that pass is off by contract, so a
+        # stale/uncorrected LocalScript can survive. We do NOT silently
+        # reroute (a LocalScript in ServerScriptService would not run) — we
+        # WARN so the conflict is diagnosable instead of an invisible misroute.
+        if topology_inputs["domains"].get(sid, "") == "server":
+            log.warning(
+                "[storage] LocalScript %r has server-domain source but is "
+                "routed to StarterPlayerScripts by its script_type; the type "
+                "is likely mis-classified (generic mode skips client/server "
+                "type reconciliation). script_id=%s",
+                s.name, sid,
+            )
         return STARTER_PLAYER_SCRIPTS, "topology: LocalScript (default container)"
 
     # script_type == "Script". Slice 7 round 2 (Codex R1 P1 #1+#3):

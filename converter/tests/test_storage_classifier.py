@@ -80,6 +80,62 @@ def test_client_local_script_lands_in_starter_player_scripts():
     assert s.name in plan.client_scripts
 
 
+def test_localscript_with_server_domain_warns_but_routes_client(caplog):
+    """P2 guard (Codex, 2026-06-02): a LocalScript whose source-derived
+    domain is ``server`` is a type/domain conflict (the type is likely
+    mis-classified — in generic mode the client/server type-fix is off by
+    contract). Routing is unchanged (a LocalScript MUST go to a client
+    container; SSS would not run it), but the conflict is WARNED so it is
+    diagnosable instead of an invisible misroute.
+    """
+    import logging
+    from converter.scene_runtime_topology.module_domain import TopologyInputs
+
+    s = _make_script("StaleClient", "print('x')", script_type="LocalScript")
+    inputs: TopologyInputs = {
+        "domains": {"g-stale": "server"},  # conflict: server domain, LocalScript type
+        "reachability_requirements": {},
+        "lifecycle_roles": {},
+        "script_id_by_name": {"StaleClient": "g-stale"},
+        "caller_graph": {},
+        "transpile_ran": True,
+    }
+    with caplog.at_level(logging.WARNING, logger="converter.storage_classifier"):
+        plan = classify_storage([s], topology_inputs=inputs)
+
+    # Routing unchanged — LocalScript still lands client-side.
+    assert s.parent_path == STARTER_PLAYER_SCRIPTS
+    assert s.name in plan.client_scripts
+    # ...but the type/domain conflict was surfaced.
+    assert any(
+        "server-domain source" in r.message and "StaleClient" in r.message
+        for r in caplog.records
+    ), "expected a warning surfacing the LocalScript/server-domain conflict"
+
+
+def test_localscript_with_client_domain_does_not_warn(caplog):
+    """Control: a LocalScript with a matching client domain is NOT a
+    conflict and must not warn."""
+    import logging
+    from converter.scene_runtime_topology.module_domain import TopologyInputs
+
+    s = _make_script("RealClient", "print('x')", script_type="LocalScript")
+    inputs: TopologyInputs = {
+        "domains": {"g-real": "client"},
+        "reachability_requirements": {},
+        "lifecycle_roles": {},
+        "script_id_by_name": {"RealClient": "g-real"},
+        "caller_graph": {},
+        "transpile_ran": True,
+    }
+    with caplog.at_level(logging.WARNING, logger="converter.storage_classifier"):
+        classify_storage([s], topology_inputs=inputs)
+
+    assert not any(
+        "server-domain source" in r.message for r in caplog.records
+    ), "client-domain LocalScript must not trigger the conflict warning"
+
+
 def test_server_only_api_stays_server():
     s = _make_script(
         "ServerManager",
