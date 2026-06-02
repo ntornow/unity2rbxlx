@@ -16,6 +16,9 @@ from typing import TYPE_CHECKING
 from typing import Any, cast
 
 if TYPE_CHECKING:
+    from converter.scene_runtime_topology.build_topology import (
+        TopologyArtifact,
+    )
     from converter.scene_runtime_topology.shared_flag_channels import (
         SharedFlagChannels,
     )
@@ -4307,6 +4310,17 @@ script.Disabled = true
                 ],
             )
 
+        # Phase 3 contract verifier (shadow mode): summarise the violation
+        # rows the verifier stashed on ctx during _classify_storage.
+        contract_rows = cast(
+            "list[dict[str, str]]",
+            self.ctx.scene_runtime.get("contract_check_violations", []),
+        )
+        contract_by_check: dict[str, int] = {}
+        for row in contract_rows:
+            check = str(row.get("check", ""))
+            contract_by_check[check] = contract_by_check.get(check, 0) + 1
+
         return ConversionReport(
             unity_project_path=str(self.unity_project_path),
             output_dir=str(self.output_dir),
@@ -4334,6 +4348,8 @@ script.Disabled = true
                 report_path=str(report_path),
             ),
             semantic_warnings=semantic_summary,
+            contract_check_violations=len(contract_rows),
+            contract_violations_by_check=contract_by_check,
         )
 
     # Marker substrings that identify converter-emitted scripts.
@@ -4731,6 +4747,16 @@ script.Disabled = true
                     scene_runtime, plan,
                     topology_inputs=topology_inputs,
                 )
+                # Phase 3 slice 0: run the (shadow-mode) contract verifier
+                # now that the full topology artifact + final script
+                # placements coexist. ``scene_runtime["topology"]`` is
+                # populated on THIS merged local dict inside
+                # ``_build_and_apply_topology`` (it is NOT copied back to
+                # ``ctx.scene_runtime``), so the verifier must read it from
+                # the in-scope dict. Defensive guard: only run when topology
+                # is actually present.
+                if scene_runtime.get("topology"):
+                    self._run_contract_verifier(scene_runtime)
 
         plan_path.write_text(
             _json.dumps({
@@ -4745,6 +4771,65 @@ script.Disabled = true
             "[classify_storage] %d scripts classified (plan written to %s)",
             len(plan.decisions),
             plan_path.name,
+        )
+
+    def _run_contract_verifier(self, scene_runtime: dict) -> None:
+        """Phase 3 slice 0: run the shadow-mode contract verifier and stash
+        its violations on ``ctx.scene_runtime``.
+
+        Called from ``_classify_storage`` immediately after
+        ``_build_and_apply_topology`` (inside the non-legacy /
+        ``topology_inputs is not None`` gate), when ``scene_runtime`` carries
+        a populated ``topology`` block.
+
+        Reads topology from the passed ``scene_runtime`` (the merged local
+        dict that ``_build_and_apply_topology`` writes to) — NOT from
+        ``self.ctx.scene_runtime``, which never receives the topology block.
+
+        SHADOW MODE: violations are recorded to the
+        ``contract_check_violations`` metric only; we do NOT append to
+        ``ctx.errors`` in slice 0 (no check has flipped to fail-closed yet).
+        """
+        import os as _os
+
+        from converter import contract_verifier
+
+        # Env-var hatch. Slice 0's verifier is shadow-only, so this hatch
+        # just disables the (already non-fatal) verifier. The fail-closed
+        # PROMOTION gate — and its own env hatch evaluated at the
+        # error-promotion point — lands when the first check flips to
+        # fail-closed (slice 4).
+        disable = _os.environ.get("U2R_CONTRACT_VERIFIER_DISABLE", "")
+        if disable.strip().lower() in ("1", "true", "yes"):
+            log.info(
+                "[contract_verifier] disabled via "
+                "U2R_CONTRACT_VERIFIER_DISABLE=%r; skipping",
+                disable,
+            )
+            return
+
+        topology = cast("TopologyArtifact", scene_runtime.get("topology", {}))
+        scripts = list(self.state.rbx_place.scripts or [])
+
+        result = contract_verifier.verify_contract(
+            topology, scripts, mode="shadow",
+        )
+
+        # Stash to ctx (NOT the local scene_runtime) so downstream report
+        # assembly can read it. ``setdefault`` + identity-dedup mirrors the
+        # ``contract_fail_closed`` plumbing (pipeline.py:2041) so a resume
+        # replay of this phase does not double-count.
+        rows = cast(
+            "list[dict[str, str]]",
+            self.ctx.scene_runtime.setdefault("contract_check_violations", []),
+        )
+        appended = contract_verifier.stash_violations(rows, result)
+        log.info(
+            "[contract_verifier] shadow run: %d violation(s) total, "
+            "%d new this run (%r)",
+            result.total(),
+            appended,
+            result.counts_by_check(),
         )
 
     def _maybe_run_topology_prepass(

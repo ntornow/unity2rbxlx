@@ -124,6 +124,11 @@ class ConversionReport:
     semantic_warnings: SemanticWarningsSummary = field(
         default_factory=SemanticWarningsSummary,
     )
+    # Phase 3 contract verifier (shadow mode in slice 0). Total count of
+    # contract violations recorded on ``ctx.scene_runtime`` plus a
+    # per-check breakdown. Populated in ``pipeline._build_conversion_report``.
+    contract_check_violations: int = 0
+    contract_violations_by_check: dict[str, int] = field(default_factory=dict)
 
 
 def generate_report(
