@@ -5,17 +5,23 @@ topology authority. See the design doc §"Phase 3 — Contract verifier (new
 ``contract_verifier.py``)" in
 ``docs/design/scene-runtime-architecture-ir.md``.
 
-**Slice 0 (this file): shadow mode + skeleton only.** The three real checks
-land in later slices:
+**Shadow mode** — every check records warnings only; the per-check flip to
+fail-closed lands in slice 4. Checks:
 
-  * Slice 1 — check A (consumer compliance) + domain-consistency invariant.
-  * Slice 2 — check B (component availability / GetComponent).
-  * Slice 3 — check C (cross-domain attribute access).
-
-For now the module runs a single trivial **smoke check** that genuinely
-depends on its input (it fires iff the topology artifact lacks a ``modules``
-key), so tests can prove the data actually reaches the verifier rather than
-passing green for the wrong reason.
+  * smoke (slice 0) — fires iff the topology artifact lacks a ``modules`` key,
+    proving the data path reaches the verifier.
+  * **check A — consumer compliance (slice 1, this file).** Reconciles each
+    module's INDEPENDENT ``domain`` against its emitted (``script_type``,
+    container-family of ``parent_path``). This is NOT a "placement == topology"
+    comparison: the artifact's ``container``/``module_path`` is mirrored from
+    ``RbxScript.parent_path`` (``module_domain.py:1666``), so that would be
+    tautological. ``domain`` is the only independent signal (source-derived,
+    never reads ``parent_path``/``script_type``), so a domain⟂placement
+    mismatch is the real bug (e.g. a server-domain module emitted as a
+    LocalScript that never runs server-side). Modules only — animation_drivers
+    are deferred (their domain↔script_class is consistent by construction).
+  * check B (component availability / GetComponent) — slice 2.
+  * check C (cross-domain attribute access) — slice 3.
 
 The module is deliberately import-light (no heavy pipeline imports) so it
 stays unit-testable in isolation. ``RbxScript`` and ``TopologyArtifact`` are
@@ -91,10 +97,8 @@ def verify_contract(
     or is empty). When the topology carries modules → zero violations. This
     proves the data path is wired end-to-end.
 
-    ``mode`` is "shadow" in slice 0 and is threaded through for the eventual
-    per-check fail-closed flip (slice 4); it does not change behavior yet.
-    ``scripts`` is unused in slice 0 (the real checks in slices 1-3 consume
-    it) but is part of the locked signature.
+    ``mode`` is "shadow" and is threaded through for the eventual per-check
+    fail-closed flip (slice 4); it does not change behavior yet.
     """
     violations: list[ContractViolation] = []
 
@@ -117,7 +121,218 @@ def verify_contract(
             )
         )
 
+    # Check A — consumer compliance (domain⟂placement consistency).
+    violations.extend(_check_consumer_compliance(topology, scripts))
+
     return ContractVerifierResult(violations=violations)
+
+
+# ---------------------------------------------------------------------------
+# Check A — consumer compliance (domain ⟂ placement consistency)
+# ---------------------------------------------------------------------------
+
+# Container families. The check fires only on a CONFIDENT family mismatch; an
+# unrecognized ``parent_path`` (e.g. Workspace, a nested model path) maps to
+# "other" and is never flagged.
+_SERVER_ONLY_CONTAINERS = frozenset({"ServerScriptService", "ServerStorage"})
+_NEUTRAL_CONTAINERS = frozenset({"ReplicatedStorage"})
+
+
+def _container_family(parent_path: str) -> str:
+    """Classify a final ``parent_path`` into "server" | "client" | "neutral"
+    | "other".
+
+    ReplicatedStorage is NEUTRAL — requireable by either side, so a module of
+    any domain may legitimately live there (the doc's §"storage ≠ domain"
+    cases 1-3, 6). Client-only containers are matched by substring so the
+    dotted ``StarterPlayer.StarterPlayerScripts`` /
+    ``StarterPlayer.StarterCharacterScripts`` forms and a bare
+    ``ReplicatedFirst`` all classify as client.
+    """
+    # Module ``parent_path`` values are always TOP-LEVEL container strings
+    # (the storage classifier + reachability path only ever emit
+    # "ServerScriptService"/"ServerStorage"/"ReplicatedStorage"/"ReplicatedFirst"
+    # /"StarterPlayer.Starter*Scripts"). A dotted "ServerStorage.Foo" would fall
+    # through to "other" and escape the check — that is intentional and
+    # currently unreachable for modules; do NOT "fix" it into a substring match
+    # on the server set (that would re-introduce false positives on names that
+    # merely contain a container token).
+    if parent_path in _SERVER_ONLY_CONTAINERS:
+        return "server"
+    if parent_path in _NEUTRAL_CONTAINERS:
+        return "neutral"
+    if (
+        "StarterPlayer" in parent_path
+        or "StarterCharacter" in parent_path
+        or parent_path == "ReplicatedFirst"
+    ):
+        return "client"
+    return "other"
+
+
+def _join_name(module: object) -> str:
+    """The emitted-script name to join a topology module row to its
+    ``RbxScript``.
+
+    Prefer the last segment of ``module_path`` (built as
+    ``f"{container}.{script.name}"`` in ``_stamp_container_and_path``, so its
+    tail IS ``script.name`` by construction — robust even when the C# class
+    name differs from the file stem). Fall back to ``stem`` when no
+    ``module_path`` was stamped.
+    """
+    if not isinstance(module, dict):
+        return ""
+    module_path = str(module.get("module_path") or "")
+    if module_path:
+        return module_path.rsplit(".", 1)[-1]
+    # Stem fallback: ``module_path`` is unstamped only when the module's
+    # ``RbxScript.parent_path`` was empty (``_stamp_container_and_path``
+    # requires a truthy container). Then ``stem`` may differ from the emitted
+    # ``RbxScript.name`` (C# class name ≠ file stem), risking a mis-join — but an
+    # empty ``parent_path`` also makes ``_container_family("") == "other"``, so
+    # only the container-independent type rules could fire. Low-risk edge.
+    return str(module.get("stem") or "")
+
+
+def _domain_placement_violation(
+    sid: str,
+    name: str,
+    domain: str,
+    script_type: str,
+    parent_path: str,
+    family: str,
+) -> ContractViolation | None:
+    """Apply the domain⟂placement consistency table. Returns a warning-severity
+    ``ContractViolation`` on a mismatch, else ``None``.
+
+    Does NOT duplicate the storage classifier's hard ``ConstraintViolation``s
+    (LocalScript-in-ServerScriptService, ModuleScript-in-ReplicatedFirst,
+    ``storage_classifier.py:898``) — those abort before the verifier runs.
+    """
+    def _mk(reason_key: str, detail: str) -> ContractViolation:
+        return ContractViolation(
+            check="consumer_compliance",
+            severity="warning",
+            script=name,
+            detail=detail,
+            identity=f"consumer_compliance:{sid}:{reason_key}",
+        )
+
+    if domain == "server":
+        if script_type == "LocalScript":
+            return _mk(
+                "server-localscript",
+                f"server-domain module {name!r} emitted as a LocalScript "
+                f"— a LocalScript never runs on the server",
+            )
+        if family == "client":
+            return _mk(
+                "server-in-client-container",
+                f"server-domain module {name!r} placed in client-only "
+                f"container {parent_path!r}",
+            )
+    elif domain == "client":
+        if family == "server":
+            # ANY client-domain module in a server-only container is wrong:
+            # the client cannot reach ServerStorage/ServerScriptService, so a
+            # client ModuleScript there can't be required and a client Script
+            # there never runs client-side. (Codex slice-1 review P2: the
+            # earlier `script_type == "Script"` gate missed the ModuleScript
+            # case, which `_decide_script_container_from_topology` can produce
+            # from caller domains alone.) ReplicatedStorage is NEUTRAL so it is
+            # not in this family — no false positive on the legit shared-module
+            # case.
+            return _mk(
+                "client-in-server-container",
+                f"client-domain module {name!r} ({script_type}) placed in "
+                f"server-only container {parent_path!r} — unreachable by the "
+                f"client",
+            )
+    elif domain == "helper":
+        if script_type in ("Script", "LocalScript"):
+            return _mk(
+                "helper-autorun",
+                f"helper module {name!r} emitted as auto-run {script_type} "
+                f"— helpers are require-only ModuleScripts",
+            )
+        # Container is intentionally NOT checked for helpers: a reachability
+        # hoist can legitimately place a client-reachable helper in a
+        # client-only container.
+    elif domain == "excluded":
+        return _mk(
+            "excluded-but-emitted",
+            f"module {name!r} is domain=excluded but still emitted a script "
+            f"({script_type} in {parent_path!r})",
+        )
+    return None
+
+
+def _check_consumer_compliance(
+    topology: TopologyArtifact,
+    scripts: list[RbxScript],
+) -> list[ContractViolation]:
+    """Reconcile each module's independent ``domain`` against its emitted
+    placement. See the module docstring + design doc §Phase 3 check #1."""
+    violations: list[ContractViolation] = []
+    modules = topology.get("modules") or {}
+    if not modules:
+        return violations
+
+    # Check A is "modules only" this slice — exclude generated animation
+    # scripts from the join so an Anim_* name that collides with a user module
+    # stem doesn't downgrade that module's real check to an "unverifiable" info
+    # row (Codex slice-1 review P3 false-negative). Animation drivers get their
+    # own check in a later slice.
+    scripts_by_name: dict[str, list[RbxScript]] = {}
+    for s in scripts:
+        if s.name.startswith("Anim_"):
+            continue
+        scripts_by_name.setdefault(s.name, []).append(s)
+
+    for sid, module in modules.items():
+        if not isinstance(module, dict):
+            continue
+        domain = str(module.get("domain") or "")
+        if domain not in ("client", "server", "helper", "excluded"):
+            # No domain / unknown value — nothing independent to reconcile.
+            continue
+        name = _join_name(module)
+        if not name:
+            continue
+        matches = scripts_by_name.get(name, [])
+        if len(matches) != 1:
+            # DQ4(a): an ambiguous / missing join is UNVERIFIABLE. Record it
+            # (no silent gap) but do NOT raise a real violation — stem/name
+            # collisions are already surfaced by the storage classifier, and a
+            # verifier should not double-fail on a known-degraded join.
+            violations.append(
+                ContractViolation(
+                    check="consumer_compliance",
+                    severity="info",
+                    script=name,
+                    detail=(
+                        f"unverifiable: module {sid!r} (name {name!r}) joined "
+                        f"to {len(matches)} emitted script(s); placement not "
+                        f"checked"
+                    ),
+                    identity=f"consumer_compliance:{sid}:unverifiable",
+                )
+            )
+            continue
+        script = matches[0]
+        parent_path = script.parent_path or ""
+        violation = _domain_placement_violation(
+            sid,
+            name,
+            domain,
+            script.script_type,
+            parent_path,
+            _container_family(parent_path),
+        )
+        if violation is not None:
+            violations.append(violation)
+
+    return violations
 
 
 def violation_to_dict(violation: ContractViolation) -> dict[str, str]:

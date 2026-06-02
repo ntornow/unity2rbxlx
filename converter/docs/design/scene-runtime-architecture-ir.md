@@ -1060,16 +1060,39 @@ review against the merged code (original deliverable text preserved in git):**
 
 **Deliverables (checks):**
 
-1. **Consumer-compliance check (check A).** Verify each emitted script's final
-   placement (`RbxScript.parent_path` / `script_type`) matches the topology
-   decision. The artifact carries no final `container` field (only
-   `domain`/`script_class`(intrinsic)/`lifecycle_role`/`module_path`), so the
-   storage classifier's final decision is **stamped into the artifact** (new
-   field) and the verifier checks `parent_path == stamped container`. Includes a
-   **domain-consistency invariant**: a `domain == "server"` module must never be
-   a `LocalScript` (and vice-versa) — surfaces the type-before-domain class
-   generic mode otherwise leaves latent (`storage_classifier.py:719-720`; the
-   #166 defensive warning is the producer-side half).
+1. **Consumer-compliance check (check A) = domain⟂placement consistency.**
+   Slice-1 arch review (2026-06-02) corrected the mechanism: do NOT "stamp the
+   final container and compare" — the artifact's `container`/`module_path` is
+   MIRRORED from `RbxScript.parent_path` (`module_domain.py:1666-1670`, set after
+   `classify_storage`), so that comparison is tautological (green-for-the-wrong-
+   reason). The only INDEPENDENT signal is `domain` (source-derived; never reads
+   `parent_path`/`script_type` — CI-guarded by
+   `test_infer_module_domains_does_not_read_parent_path`). So check A reconciles
+   the independent `domain` against the emitted (`script_type`, container-family
+   of `parent_path`) via a consistency table. Container families: SERVER_ONLY =
+   {ServerScriptService, ServerStorage}; CLIENT_ONLY = {StarterPlayerScripts,
+   StarterCharacterScripts, ReplicatedFirst}; NEUTRAL = {ReplicatedStorage}.
+   - **server:** violation if `LocalScript` (never runs server-side — the GF11
+     type-before-domain latent class, `storage_classifier.py:719-720`) OR
+     `parent_path ∈ CLIENT_ONLY`.
+   - **client:** violation if `script_type == "Script"` AND `parent_path ∈
+     SERVER_ONLY` (client logic auto-running on the server).
+   - **helper:** violation if `script_type ∈ {Script, LocalScript}` (a helper is
+     require-only). Container is NOT checked for helpers (a reachability hoist can
+     legitimately place a client-reachable helper in a CLIENT_ONLY container).
+   - **excluded:** if it still joined to an emitted RbxScript → "excluded but
+     emitted" violation; else skip.
+   Scope: **modules only this slice.** `animation_drivers` are deferred — their
+   `domain↔script_class` is consistent by construction (build_topology invariant
+   4) and they use a different (display-name) join, so there's no contradiction
+   for check A to find there yet. Unverifiable joins (stem/name collision) are
+   skipped with a recorded `severity:"info"` row (no silent gap). Must NOT
+   duplicate the storage classifier's hard `ConstraintViolation`s
+   (LocalScript-in-SSS, ModuleScript-in-ReplicatedFirst,
+   `storage_classifier.py:898-908`). **Known gap (out of scope):** a server-secret
+   module wrongly placed in NEUTRAL ReplicatedStorage (a replication leak) is
+   structurally undetectable here — the artifact carries no "server-private"
+   signal; record for a future slice, don't imply coverage.
 
 2. **Cross-domain attribute access check.** Re-specified 2026-06-01 for the
    two bridge classes (the original "every `SetAttribute` writer +
@@ -1137,8 +1160,8 @@ review against the merged code (original deliverable text preserved in git):**
   `contract_verifier.py`, the post-materialize hook (with the topology-restage
   fix), the `contract_check_violations` metric + report field, the inert env-var
   escape hatch, resume-idempotent dedup. Smoke check only.
-- **Slice 1** — check A (consumer compliance) + domain-consistency invariant;
-  stamp the final container into the artifact.
+- **Slice 1** — check A = domain⟂placement consistency (modules only; NO
+  container stamp — see check #1 above). Animation_drivers deferred.
 - **Slice 2** — check B (GetComponent), keyed off runtime `_UNITY_TO_ROBLOX_CLASS`
   + peer-module set.
 - **Slice 3** — check C (cross-domain attribute) + the reader-store scan
