@@ -1178,8 +1178,17 @@ review against the merged code (original deliverable text preserved in git):**
 - **Slice 2** — check B (GetComponent reachability), keyed off the PARSED runtime
   `_UNITY_TO_ROBLOX_CLASS` + peer set (stem ∪ script_id) + Roblox-class
   allowlist. Reachability only; method-validity deferred.
-- **Slice 3** — check C (cross-domain attribute) + the reader-store scan
-  extension (Phase 3 #2 above).
+- **Slice 3** — check C **Class-1 only** (static component-ref edge
+  reconciliation: a cross-domain literal `SetAttribute`/`GetAttribute` pair
+  must be covered by a `remote_event_bridge` edge, matched on script identity).
+  **Class-2 (dynamic shared-flag store mismatch) DEFERRED** — slice-3 arch
+  review (2026-06-02) found it is (a) PHANTOM on the corpus: the verifier runs
+  POST-coherence and the `door_player_flag_location` pack already rewrites the
+  wrong-store read to `player:` before the scan; (b) brittle regex on AI output
+  (the reader's store is a Luau variable the topology doesn't record — GF7);
+  and the `present==False` coverage alternative is VACUOUS (`present =
+  bool(read_names) or fail_open`). Class-2 needs a PRE-coherence hook +
+  adversarial review; recorded as a known deferred false-negative.
 - **Slice 4** — corpus shadow audit (AI transpile) + per-check flip behind the
   env-var hatch.
 

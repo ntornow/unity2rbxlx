@@ -558,3 +558,114 @@ class TestCheckBComponentAvailability:
         src = ('self:GetComponent("Collider")\n'
                'local x = self:GetComponent("Collider")')
         assert len(_run_check_b(src)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Check C -- cross-domain attribute access (Class-1 component-ref edges)
+# ---------------------------------------------------------------------------
+
+def _topo_two_modules(d_writer: str, d_reader: str, *, edge_field: str | None = None):
+    """Two modules (writer sid 'w', reader sid 'r') with given domains, and an
+    optional remote_event_bridge edge covering (w, edge_field, r)."""
+    topo: dict = {
+        "modules": {
+            "w": {"stem": "Writer", "domain": d_writer,
+                  "module_path": "ServerScriptService.Writer"},
+            "r": {"stem": "Reader", "domain": d_reader,
+                  "module_path": "ReplicatedStorage.Reader"},
+        },
+        "cross_domain_edges": [],
+    }
+    if edge_field is not None:
+        topo["cross_domain_edges"].append({
+            "from_script": "w", "to_script": "r", "field": edge_field,
+            "from_domain": d_writer, "to_domain": d_reader,
+            "resolution": {"strategy": "remote_event_bridge",
+                           "event_name": "X"},
+        })
+    return topo
+
+
+def _scripts_wr(write_field: str, read_field: str):
+    return [
+        RbxScript(name="Writer", source=f'self:SetAttribute("{write_field}", true)',
+                  script_type="Script", parent_path="ServerScriptService"),
+        RbxScript(name="Reader", source=f'x:GetAttribute("{read_field}")',
+                  script_type="ModuleScript", parent_path="ReplicatedStorage"),
+    ]
+
+
+def _check_c(topo, scripts) -> list[ContractViolation]:
+    result = verify_contract(topo, scripts)  # type: ignore[arg-type]
+    return [v for v in result.violations if v.check == "cross_domain_attribute"]
+
+
+class TestCheckCCrossDomainAttribute:
+    def test_uncovered_cross_domain_pair_flagged(self) -> None:
+        vs = _check_c(_topo_two_modules("server", "client"),
+                      _scripts_wr("open", "open"))
+        assert len(vs) == 1
+        assert vs[0].identity == "cross_domain_attribute:w:open:r"
+
+    def test_covered_by_bridge_edge_not_flagged(self) -> None:
+        vs = _check_c(_topo_two_modules("server", "client", edge_field="open"),
+                      _scripts_wr("open", "open"))
+        assert vs == []
+
+    def test_same_domain_pair_not_flagged(self) -> None:
+        vs = _check_c(_topo_two_modules("server", "server"),
+                      _scripts_wr("open", "open"))
+        assert vs == []
+
+    def test_edge_for_other_field_does_not_cover(self) -> None:
+        """An edge covering a DIFFERENT field must not suppress the violation
+        (identity match on field is required — field names collide across
+        unrelated modules)."""
+        vs = _check_c(_topo_two_modules("server", "client", edge_field="shut"),
+                      _scripts_wr("open", "open"))
+        assert len(vs) == 1
+
+    def test_non_bridge_strategy_does_not_cover(self) -> None:
+        topo = _topo_two_modules("server", "client", edge_field="open")
+        topo["cross_domain_edges"][0]["resolution"]["strategy"] = "excluded"
+        vs = _check_c(topo, _scripts_wr("open", "open"))
+        assert len(vs) == 1
+
+    def test_different_field_write_read_no_pair(self) -> None:
+        """Writer writes 'a', reader reads 'b' -> no shared field -> no pair."""
+        vs = _check_c(_topo_two_modules("server", "client"),
+                      _scripts_wr("a", "b"))
+        assert vs == []
+
+    def test_commented_setattribute_not_counted(self) -> None:
+        scripts = [
+            RbxScript(name="Writer", source='-- self:SetAttribute("open", true)',
+                      script_type="Script", parent_path="ServerScriptService"),
+            RbxScript(name="Reader", source='x:GetAttribute("open")',
+                      script_type="ModuleScript", parent_path="ReplicatedStorage"),
+        ]
+        assert _check_c(_topo_two_modules("server", "client"), scripts) == []
+
+    def test_colliding_name_abstains(self) -> None:
+        """Two modules whose emitted name collides -> name_to_sid drops it ->
+        the site is unjoinable -> abstain (no flag), no silent crash."""
+        topo = {
+            "modules": {
+                "w": {"stem": "Dup", "domain": "server",
+                      "module_path": "ServerScriptService.Dup"},
+                "w2": {"stem": "Dup", "domain": "client",
+                       "module_path": "ReplicatedStorage.Dup"},
+                "r": {"stem": "Reader", "domain": "client",
+                      "module_path": "ReplicatedStorage.Reader"},
+            },
+            "cross_domain_edges": [],
+        }
+        scripts = [
+            RbxScript(name="Dup", source='self:SetAttribute("open", true)',
+                      script_type="Script", parent_path="ServerScriptService"),
+            RbxScript(name="Reader", source='x:GetAttribute("open")',
+                      script_type="ModuleScript", parent_path="ReplicatedStorage"),
+        ]
+        # "Dup" name maps to 2 sids -> dropped from name_to_sid -> writer site
+        # unjoinable -> no cross-domain pair -> no violation.
+        assert _check_c(topo, scripts) == []
