@@ -290,54 +290,72 @@ def _strip_require_calls(source: str) -> str:
     out: list[str] = []
     i = 0
     n = len(source)
-    while True:
-        m = source.find("require(", i)
-        if m == -1:
-            out.append(source[i:])
-            return "".join(out)
-        # A match inside a larger identifier or a member call (``myRequire(``,
-        # ``x.require(``, ``x:require(``) is a different call — keep it (and its
-        # args) in the scan. Left-anchor on a non-word/dot/colon boundary,
-        # mirroring the ``(?<![.\w])`` C# anchors (``:`` added for Luau methods).
-        if m > 0 and (source[m - 1].isalnum() or source[m - 1] in "_.:"):
-            out.append(source[i:m + 1])  # keep through the 'r'; re-search after
-            i = m + 1
-            continue
-        out.append(source[i:m])
-        depth = 0
-        j = m + len("require")  # positioned at the '('
-        closed = False
-        in_str: str | None = None  # active string quote, or None
-        escaped = False
-        while j < n:
-            c = source[j]
-            if in_str is not None:
-                # Inside a string literal: parens don't count toward depth
-                # (codex review: ``require(foo(")") or ...)`` must not close
-                # early on the ``)`` inside ``")"``).
-                if escaped:
-                    escaped = False
-                elif c == "\\":
-                    escaped = True
-                elif c == in_str:
-                    in_str = None
-            elif c in ("'", '"'):
-                in_str = c
-            elif c == "(":
-                depth += 1
-            elif c == ")":
-                depth -= 1
-                if depth == 0:
-                    j += 1
-                    closed = True
+    while i < n:
+        c = source[i]
+        # Skip quoted strings verbatim: a ``require(`` (or its args) that lives
+        # INSIDE a string literal is data, not a call (codex review: a literal
+        # ``"require(" .. game:GetService("ServerStorage")`` must not strip the
+        # real GetService). Comments / long brackets are already gone via
+        # _strip_luau_noise, so only short strings remain to guard here.
+        if c == '"' or c == "'":
+            out.append(c)
+            i += 1
+            while i < n:
+                d = source[i]
+                out.append(d)
+                i += 1
+                if d == "\\" and i < n:
+                    out.append(source[i])
+                    i += 1
+                elif d == c:
                     break
-            j += 1
-        if not closed:
-            # Unterminated require(...) (malformed/truncated Luau): don't drop
-            # the tail — keep it verbatim so downstream signals survive.
-            out.append(source[m:])
-            return "".join(out)
-        i = j  # resume after the closing ')'
+            continue
+        # Standalone ``require`` identifier (not ``myRequire`` / ``x.require`` /
+        # ``x:require``), optional whitespace, then ``(``.
+        if (
+            c == "r"
+            and source.startswith("require", i)
+            and (i == 0 or not (source[i - 1].isalnum() or source[i - 1] in "_.:"))
+        ):
+            k = i + len("require")
+            while k < n and source[k] in " \t":
+                k += 1
+            if k < n and source[k] == "(":
+                depth = 0
+                j = k
+                closed = False
+                in_str: str | None = None
+                escaped = False
+                while j < n:
+                    d = source[j]
+                    if in_str is not None:
+                        if escaped:
+                            escaped = False
+                        elif d == "\\":
+                            escaped = True
+                        elif d == in_str:
+                            in_str = None
+                    elif d in ("'", '"'):
+                        in_str = d
+                    elif d == "(":
+                        depth += 1
+                    elif d == ")":
+                        depth -= 1
+                        if depth == 0:
+                            j += 1
+                            closed = True
+                            break
+                    j += 1
+                if not closed:
+                    # Unterminated require(...): keep the tail verbatim so
+                    # downstream signals survive.
+                    out.append(source[i:])
+                    return "".join(out)
+                i = j  # drop the whole require(...) span
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
 
 
 # ---------------------------------------------------------------------------

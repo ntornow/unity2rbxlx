@@ -1165,6 +1165,17 @@ class TestStripRequireCallsScanner:
         src = f'require(foo(")") or {self._SS})'
         assert "ServerStorage" not in _strip_require_calls(src)
 
+    def test_require_inside_string_literal_is_not_stripped(self) -> None:
+        # codex round-3 P2: a ``require(`` that lives inside a string literal is
+        # data, not a call — it must not strip the real GetService after it.
+        SS = 'game:GetService("ServerStorage")'
+        kept = _strip_require_calls('local s = "require(" .. ' + SS + ' .. ")"')
+        assert "ServerStorage" in kept
+
+    def test_require_with_whitespace_before_paren_is_stripped(self) -> None:
+        SS = 'game:GetService("ServerStorage")'
+        assert "ServerStorage" not in _strip_require_calls('require (' + SS + ')')
+
     def test_escaped_quote_in_require_string(self) -> None:
         # A backslash-escaped quote inside the string must not terminate it
         # early. Built via chr(92) so the escaping is unambiguous in this source.

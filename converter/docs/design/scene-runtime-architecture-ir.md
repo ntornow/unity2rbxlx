@@ -1277,16 +1277,23 @@ now in-scope Phase 3 work. (The HudControl signal fix is already shipped in #174
   `cross_domain_attribute` joined `FAIL_CLOSED_CHECKS`. All three contract checks
   (A/B/C) are now fail-closed; only the `smoke` wiring check stays shadow.
 
-**Post-implementation review follow-up (Claude code review 2026-06-03; codex was
-rate-limited, re-run before merge):** the two `_strip_require_calls` bugs it found
-(no left word-boundary → `myRequire(` over-stripped; unterminated `require(` blanked
-the tail) are FIXED with regression tests. DEFERRED (pre-existing, broader blast
-radius — own slice): the Luau domain-signal scan in `_collect_signals` runs the
-client/server API regexes over RAW source, so a commented-out `-- :FireServer(` or a
-string literal `"OnServerEvent"` counts as a real strong signal (same FP class the
-require fix addressed, never generalized). Fix = strip Luau comments/strings (reuse
-`contract_verifier._strip_luau_comments`, extended for strings) before the API scan;
-validate classification deltas across the corpus first.
+**Post-implementation review (Claude + codex, 2026-06-03 — multiple rounds).**
+Findings and resolutions:
+- Claude: two `_strip_require_calls` bugs (no left word-boundary; unterminated
+  `require(` blanked the tail) — FIXED + tests.
+- Codex round 1 (NO-SHIP): **P0** the fail-closed promotion was append-only into the
+  persisted `ctx.errors` (stale `success=False` across a clean/fail-open resume) —
+  FIXED with REPLACE semantics (`CONTRACT_ERROR_PREFIX`) + resume tests. **P1** the
+  corpus gate was vacuous for B/C — FIXED with pinned coverage facts + a corpus-wide
+  non-vacuity assertion + B/C negative controls. **P2** `_strip_require_calls`
+  over-stripped `x:require(` and miscounted `)` in strings — FIXED.
+- Codex round 2 (NO-SHIP): the regex scanner still didn't understand Luau comments
+  or long-bracket strings, and the partial fix over-consumed across a commented
+  `require(`. RESOLVED by replacing the regex approach with a single-pass lexer
+  (`_strip_luau_noise`): strips comments + `[[..]]`/`[=[..]=]` strings (keeping short
+  quoted strings) before the require-strip and the API scan. This also closes the
+  earlier deferred item (the raw-source comment/string FP). Zero corpus
+  classification drift; lexer regression tests added.
 
 ## Migration discipline
 
