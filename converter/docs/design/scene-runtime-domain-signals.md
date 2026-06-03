@@ -294,16 +294,33 @@ when:
 report with kind `unresolvable_execution_domain` and a `detail`
 listing the conflicting signals.
 
+**Operator override recourse is ASYMMETRIC by the conflict's nature**
+(`module_domain._classify_module`; Phase 3 slice 5, Claude+Codex review
+2026-06-03). `excluded` is a terminal analysis verdict, not a runnable
+domain — the generic boot loop (`scene_runtime.luau` `SceneRuntime:start`)
+never constructs `excluded`/`helper`/`legacy` modules. The recourse the
+operator has depends on WHY it's excluded:
+
+| Exclusion class | `domain_overrides` recourse |
+|---|---|
+| **Rule 1 `both_side_api`** (code emits strong client AND strong server — the class disagrees with itself, usually a real source bug) | Side overrides are **REJECTED** (`override_rejected` stamped); only an explicit `"excluded"` override (ACK-and-skip) is accepted. The correct fix is to **split the C# class**. Do NOT pin a side — it would ship a half-broken module whose opposite-side API silently never runs. |
+| **Ambiguity classes** (Rule 4 moderate-only, Rule 7 zero-signal, reachability conflict) | The operator MAY pin `client`/`server` — the conflict is the classifier's uncertainty, not the code's. The pin PRESERVES an audit trail (`override_routed_off_excluded` + `overridden_excluded_reason` in `domain_signals`) and emits a warning that the opposite-side behavior won't run. |
+
 **Behavior depends on `--strict-classification`**:
 
 | Strict mode | Behavior |
 |-------------|----------|
-| ON (default for production) | Conversion BLOCKS before transpile. Operator must add `scene_runtime.domain_overrides` for each `excluded` module OR split the source class to remove the conflict. |
-| OFF (default for iteration) | Conversion proceeds. `excluded` modules are NOT instantiated by either host runtime — the `SceneRuntimePlan` lists them but with `execution_domain = "excluded"` so the runtime skips lifecycle wiring. The conversion report lists them prominently. The converted place runs without those modules — silently broken for the affected behavior, but no crash. |
+| ON (default for production) | Conversion BLOCKS before transpile. Operator resolves each `excluded` module per the recourse table above (side override only for ambiguity classes; Rule 1 → ACK-and-skip or split the source). |
+| OFF (legacy mode iteration) | `excluded` modules are not instantiated; the report lists them. **Generic mode is NOT silent:** the Phase 3 contract verifier's check A (flipped fail-closed, slice 4b) promotes an emitted-but-`excluded` runtime-bearing module to a conversion error (`conversion_report.success = False`), so a dead-emit fails the build loudly rather than shipping a place with silently-missing behavior. |
 
-**No silent fallback to a pre-contract path.** Either the
-operator resolves the conflict, or the module's execution_domain
-stays `excluded`.
+**No silent fallback to a pre-contract path, and no silent dead emit.**
+Either the operator resolves the conflict, or the module stays `excluded`
+and (in generic mode) the conversion fails loudly.
+
+**There is no `shared`/both-sides runnable domain.** The generic runtime
+admits only `client`/`server` as runnable; "construct on both sides" would
+be new double-lifecycle semantics, not a fallback. A genuinely dual-domain
+class must be split or run under a non-generic mode.
 
 ## Strict classification mode
 

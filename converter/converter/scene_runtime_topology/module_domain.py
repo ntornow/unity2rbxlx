@@ -1376,9 +1376,28 @@ def _classify_module(
                 return override, signals, displaced
             # Clear low_confidence flag when an operator pin replaces it.
             signals.pop("low_confidence", None)
-            # Clear fail_closed_reason if we're routing off excluded.
+            # Routing a formerly-``excluded`` module onto a side: the runtime
+            # only constructs ``client``/``server``, so the pin is what makes it
+            # ship. PRESERVE the original fail-closed reason as an audit trail
+            # (do NOT silently drop it — the operator forced a side onto a
+            # verdict the classifier couldn't resolve, and the opposite-side
+            # behavior will NOT run). Move it off ``fail_closed_reason`` (which
+            # is excluded-only by contract) onto a sticky field + warn. Rule-1
+            # never reaches here (rejected above), so this only covers the
+            # ambiguity classes (Rule-4 moderate-only, Rule-7 low-confidence).
             if override != "excluded":
-                signals.pop("fail_closed_reason", None)
+                reason = signals.pop("fail_closed_reason", None)
+                if base_verdict == "excluded":
+                    signals["override_routed_off_excluded"] = True
+                    if reason is not None:
+                        signals["overridden_excluded_reason"] = reason
+                    log.warning(
+                        "[scene_runtime] %s: operator override pinned a "
+                        "formerly-excluded module (%s) to %r; opposite-side "
+                        "behavior will not run — confirm the source is not "
+                        "genuinely dual-domain",
+                        script_id, reason or "unresolved", override,
+                    )
             return override, signals, []
         # Unknown override value: ignore (treat as no override). Should
         # have been validated upstream.

@@ -29,6 +29,9 @@ from converter.scene_runtime_domain import (  # noqa: E402
     migrate_legacy_domain_values,
 )
 from converter.scene_runtime_planner import SceneRuntimeArtifact  # noqa: E402
+from converter.scene_runtime_topology.module_domain import (  # noqa: E402
+    _classify_module,
+)
 from converter.storage_classifier import (  # noqa: E402
     REPLICATED_STORAGE,
     SERVER_SCRIPT_SERVICE,
@@ -1074,3 +1077,49 @@ class TestRequireFallbackNotAServerSignal:
         classify_scene_runtime_domains(artifact, [_mk_script("Vault", src)])
         sig = artifact["modules"]["g"]["domain_signals"]
         assert "roblox_server_api" in sig["luau_signals"]
+
+
+# ---------------------------------------------------------------------------
+# excluded -> side override preserves the audit trail (slice-5 contract)
+# ---------------------------------------------------------------------------
+
+class TestExcludedSideOverrideAuditTrail:
+    """When an operator pins a formerly-`excluded` (ambiguity-class) module to a
+    side, the original fail-closed reason must be PRESERVED as an audit trail
+    (not silently dropped) + a warning surfaced — the opposite-side behavior
+    won't run. Rule-1 both_side_api is NOT reachable here (rejected upstream)."""
+
+    def _classify(self, override, networking="none"):
+        # Camera.main -> moderate-client; extra_moderate_server -> moderate-server
+        # => Rule 4 (moderate-only ambiguity) -> excluded, then override.
+        return _classify_module(
+            "g",
+            {"stem": "Cam", "class_name": "Cam", "runtime_bearing": True},
+            {},  # scripts_by_class
+            [],  # instance_evidence
+            override,
+            "void Update() { var c = Camera.main; }",  # cs_source
+            networking,
+            extra_moderate_server=("network_behaviour_reachable",),
+        )
+
+    def test_rule4_excluded_baseline(self) -> None:
+        domain, signals, _ = self._classify(None)
+        assert domain == "excluded"
+        assert signals["fail_closed_reason"] == "moderate_only_ambiguity"
+
+    def test_side_override_preserves_reason_and_warns(self) -> None:
+        domain, signals, _ = self._classify("server")
+        assert domain == "server"
+        assert signals.get("override_applied") is True
+        # Audit trail preserved off the excluded-only fail_closed_reason field.
+        assert signals.get("override_routed_off_excluded") is True
+        assert signals.get("overridden_excluded_reason") == "moderate_only_ambiguity"
+        # fail_closed_reason must NOT linger on a now-runnable module.
+        assert "fail_closed_reason" not in signals
+
+    def test_excluded_override_keeps_excluded_no_audit_flag(self) -> None:
+        # Pinning back to excluded is not "routing off excluded" — no audit flag.
+        domain, signals, _ = self._classify("excluded")
+        assert domain == "excluded"
+        assert signals.get("override_routed_off_excluded") is None
