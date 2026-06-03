@@ -200,6 +200,46 @@ _CLIENT_RX = tuple(re.compile(p) for p in _GENERIC_CLIENT_API_PATTERNS)
 _SERVER_RX = tuple(re.compile(p) for p in _GENERIC_SERVER_API_PATTERNS)
 
 
+def _strip_require_calls(source: str) -> str:
+    """Blank out ``require(...)`` call expressions before the Luau domain-signal
+    scan.
+
+    A ``require`` argument is a MODULE-RESOLUTION path, not domain logic — and
+    the generic transpiler routinely emits a defensive
+    ``require(RS:FindFirstChild("X") or game:GetService("ServerStorage")
+    :FindFirstChild("X"))`` fallback for a cross-script require. Scanning that
+    fallback for API signals is a category error: the ``GetService("ServerStorage")``
+    in it would otherwise count as a STRONG server signal and fail-close an
+    obvious client module (e.g. ``HudControl``, a UI HUD) to ``excluded`` — which
+    in generic mode is a dead emit (the boot loop never constructs it). Strips
+    for BOTH channels (a require path is never client- OR server-domain evidence).
+    Balanced-paren aware so a nested ``GetService(...)`` inside the args is
+    consumed with it.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(source)
+    while True:
+        m = source.find("require(", i)
+        if m == -1:
+            out.append(source[i:])
+            return "".join(out)
+        out.append(source[i:m])
+        depth = 0
+        j = m + len("require")  # positioned at the '('
+        while j < n:
+            c = source[j]
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    j += 1
+                    break
+            j += 1
+        i = j  # resume after the closing ')'
+
+
 # ---------------------------------------------------------------------------
 # C# signal tables (v2 classifier).
 #
@@ -1412,10 +1452,14 @@ def _collect_signals(
     # Roblox-flavoured patterns are STRONG signals per the design doc
     # §"Strong client signals" / §"Strong server signals" tables.
     if luau_source:
-        if any(rx.search(luau_source) for rx in _CLIENT_RX):
+        # Module-resolution ``require(...)`` paths are not domain logic; strip
+        # them so a converter-emitted ServerStorage require-fallback can't pose
+        # as a strong server signal (see _strip_require_calls).
+        scan_src = _strip_require_calls(luau_source)
+        if any(rx.search(scan_src) for rx in _CLIENT_RX):
             luau_signals.append("roblox_client_api")
             strong_client_kinds.add("roblox_client_api")
-        if any(rx.search(luau_source) for rx in _SERVER_RX):
+        if any(rx.search(scan_src) for rx in _SERVER_RX):
             luau_signals.append("roblox_server_api")
             strong_server_kinds.add("roblox_server_api")
 

@@ -1032,3 +1032,45 @@ class TestStrictModeEarlyGate:
         # And the original artifact must NOT have been mutated (the dry
         # run was on a deep copy).
         assert "domain" not in artifact["modules"]["g"]
+
+
+# ---------------------------------------------------------------------------
+# require(...) module-resolution paths are not domain signals (slice-4 fix)
+# ---------------------------------------------------------------------------
+
+class TestRequireFallbackNotAServerSignal:
+    """A converter-emitted ``require(... or game:GetService("ServerStorage")
+    :FindFirstChild("X"))`` fallback is MODULE RESOLUTION, not server logic. It
+    must not contribute a server signal — else an obvious client module (the HUD)
+    fail-closes to ``excluded`` and dead-emits (the boot loop never constructs it).
+    See ``module_domain._strip_require_calls``."""
+
+    _REQUIRE_FALLBACK = (
+        'local Player = require(game:GetService("ReplicatedStorage")'
+        ':FindFirstChild("Player", true) or game:GetService("ServerStorage")'
+        ':FindFirstChild("Player", true))\n'
+    )
+
+    def test_require_serverstorage_fallback_is_not_a_server_signal(self) -> None:
+        _, mod = _mk_module("g", "Hud")
+        artifact = _mk_artifact({"g": mod})
+        # The require fallback is the ONLY server-ish text; plus a clear client
+        # signal so the module has a real domain to resolve to.
+        src = self._REQUIRE_FALLBACK + (
+            'game:GetService("UserInputService").InputBegan:Connect(function() end)\n'
+        )
+        classify_scene_runtime_domains(artifact, [_mk_script("Hud", src)])
+        sig = artifact["modules"]["g"]["domain_signals"]
+        assert "roblox_server_api" not in sig["luau_signals"]
+        assert sig["strong_server"] == 0
+        assert artifact["modules"]["g"]["domain"] == "client"
+
+    def test_real_serverstorage_usage_outside_require_still_fires(self) -> None:
+        # Positive control: a ServerStorage access that is NOT a require path is
+        # real server logic and must still count.
+        _, mod = _mk_module("g", "Vault")
+        artifact = _mk_artifact({"g": mod})
+        src = 'local s = game:GetService("ServerStorage")\ns.Data.Value = 1\n'
+        classify_scene_runtime_domains(artifact, [_mk_script("Vault", src)])
+        sig = artifact["modules"]["g"]["domain_signals"]
+        assert "roblox_server_api" in sig["luau_signals"]
