@@ -56,7 +56,9 @@ class TestDetect:
     def test_fires_on_flattened_fps(self) -> None:
         s = RbxScript(name="Player", source=_FLATTENED_FPS, script_type="ModuleScript")
         assert packs._detect_fps_camera_yaw_lost([s]) is True
-        assert packs._fps_yaw_object(s) == "self.gameObject"
+        edits = packs._fps_yaw_camera_edits(s)
+        assert len(edits) == 1
+        assert edits[0][1] == "self.gameObject"
 
     def test_no_op_without_body_yaw(self) -> None:
         """A pitch-only camera rebuild alone (no body yaw in the same
@@ -86,6 +88,22 @@ class TestDetect:
         )
         s = RbxScript(name="A", source=src, script_type="ModuleScript")
         assert packs._detect_fps_camera_yaw_lost([s]) is False
+
+    def test_no_op_on_body_turn_with_roll(self) -> None:
+        """A body turn that also rolls (leaning/banking) --
+        CFrame.Angles(0, yaw, roll) -- is NOT yaw-only; injecting its full
+        .Rotation would leak roll into the camera, so it must not match."""
+        src = (
+            "local C = {}\n"
+            "function C:f()\n"
+            "    self.go:PivotTo(self.go:GetPivot() * CFrame.Angles(0, yaw, self.lean))\n"
+            "    cam.CFrame = CFrame.new(pos) * CFrame.Angles(p, 0, 0)\n"
+            "end\n"
+            "return C\n"
+        )
+        s = RbxScript(name="C", source=src, script_type="ModuleScript")
+        assert packs._detect_fps_camera_yaw_lost([s]) is False
+        assert packs._fix_fps_camera_yaw_from_player_pivot([s]) == 0
 
     def test_string_and_comment_are_not_signals(self) -> None:
         """The camera fingerprint inside a string/comment must not trip
@@ -123,6 +141,32 @@ class TestApply:
         assert packs._detect_fps_camera_yaw_lost([s]) is False
         # Exactly one yaw injection -- no double-apply.
         assert s.source.count("GetPivot().Rotation") == 1
+
+    def test_camera_uses_nearest_preceding_yaw_source(self) -> None:
+        """With two yaw-only PivotTo calls (e.g. weapon/viewmodel sway
+        BEFORE the player turn), the camera must inherit the yaw from the
+        body turn nearest-preceding the camera write -- the player -- not a
+        script-wide first match (the weapon)."""
+        src = (
+            "local C = {}\n"
+            "function C:Rotate()\n"
+            "    self.weapon:PivotTo(self.weapon:GetPivot() * CFrame.Angles(0, sway, 0))\n"
+            "    self.player:PivotTo(self.player:GetPivot() * CFrame.Angles(0, yaw, 0))\n"
+            "    self.cam.CFrame = CFrame.new(pos) * CFrame.Angles(p, 0, 0)\n"
+            "end\n"
+            "return C\n"
+        )
+        s = RbxScript(name="C", source=src, script_type="ModuleScript")
+        edits = packs._fps_yaw_camera_edits(s)
+        assert len(edits) == 1
+        assert edits[0][1] == "self.player"
+        packs._fix_fps_camera_yaw_from_player_pivot([s])
+        assert (
+            "self.cam.CFrame = CFrame.new(pos) * self.player:GetPivot().Rotation"
+            " * CFrame.Angles(p, 0, 0)" in s.source
+        )
+        # The weapon sway PivotTo is untouched.
+        assert "self.weapon:PivotTo(self.weapon:GetPivot() * CFrame.Angles(0, sway, 0))" in s.source
 
     def test_no_change_on_non_fps(self) -> None:
         src = "local M = {}\nreturn M\n"

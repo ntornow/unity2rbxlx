@@ -5257,15 +5257,18 @@ def _fix_turret_canonical_spatial_child(
 # the same offsets. Position-follow is deliberately out of scope -- the
 # reported symptom is yaw only, and pitch+position already behave.
 
-# Yaw-only body turn: ``<obj>:PivotTo(<obj>:GetPivot() * CFrame.Angles(0, ...``.
-# The literal ``0`` in the pitch (X) slot is the yaw-only fingerprint and the
-# backreference ties both ``<obj>`` mentions to the same object. We stop at
-# the ``0,`` -- matching the (possibly nested-paren) yaw expression and close
-# paren is unnecessary to establish the fingerprint or capture ``<obj>``.
+# Yaw-only body turn:
+#   <obj>:PivotTo(<obj>:GetPivot() * CFrame.Angles(0, <yaw>, 0))
+# The pitch (X) AND roll (Z) operands are literal ``0`` -- the yaw-only
+# fingerprint. Requiring roll == 0 (not just pitch) excludes leaning/banking
+# bodies (CFrame.Angles(0, yaw, roll)) whose full ``.Rotation`` would leak
+# roll into the camera. ``yaw`` is any comma-free expression (e.g.
+# ``-math.rad(yaw)``). The backreference ties both ``<obj>`` mentions to the
+# same object.
 _FPS_BODY_YAW_RE = re.compile(
     r"(?P<obj>[A-Za-z_][\w.]*)\s*:PivotTo\(\s*"
     r"(?P=obj)\s*:GetPivot\(\)\s*\*\s*"
-    r"CFrame\.Angles\(\s*0\s*,"
+    r"CFrame\.Angles\(\s*0\s*,\s*[^,]+?\s*,\s*0\s*\)"
 )
 
 # Pitch-only camera world rebuild:
@@ -5281,26 +5284,40 @@ _FPS_CAM_PITCH_ONLY_RE = re.compile(
 )
 
 
-def _fps_yaw_object(s: "RbxScript") -> str | None:
-    """Return the body object a script yaws (yaw-only) AND for which it
-    rebuilds a pitch-only camera CFrame -- i.e. the flattened FPS rig.
+def _fps_yaw_camera_edits(s: "RbxScript") -> list[tuple[int, str]]:
+    """Return ``[(insert_offset, yaw_obj), ...]`` -- one per pitch-only
+    camera rebuild in a flattened FPS controller.
+
+    For each camera site the yaw source is the yaw-only body turn
+    NEAREST-PRECEDING it (the canonical "yaw the body, then read it into
+    the camera" order), falling back to the nearest following one when no
+    body turn precedes. Correlating per-site -- rather than a script-wide
+    first match -- means a separate yaw-only ``PivotTo`` elsewhere (e.g.
+    weapon/viewmodel sway) can't hijack the camera's yaw source.
 
     Both probes run on the comment/string-blanked view so tokens inside
-    string/comment literals are never signals. Returns the ``<obj>`` to
-    source the world yaw from, or ``None`` when the script isn't a
-    flattened FPS look controller.
+    string/comment literals are never signals; the returned offsets are
+    valid in the real source (blanking preserves length + offsets). Empty
+    list ==> not a flattened FPS look controller.
     """
     blanked = _blank_lua_strings_and_comments(s.source or "")
-    body = _FPS_BODY_YAW_RE.search(blanked)
-    if not body:
-        return None
-    if not _FPS_CAM_PITCH_ONLY_RE.search(blanked):
-        return None
-    return body.group("obj")
+    sources = [(m.start(), m.group("obj")) for m in _FPS_BODY_YAW_RE.finditer(blanked)]
+    if not sources:
+        return []
+    edits: list[tuple[int, str]] = []
+    for m in _FPS_CAM_PITCH_ONLY_RE.finditer(blanked):
+        at = m.start("angles")
+        preceding = [(off, obj) for off, obj in sources if off < at]
+        if preceding:
+            obj = max(preceding, key=lambda t: t[0])[1]
+        else:
+            obj = min(sources, key=lambda t: t[0])[1]  # nearest following
+        edits.append((at, obj))
+    return edits
 
 
 def _detect_fps_camera_yaw_lost(scripts: list["RbxScript"]) -> bool:
-    return any(_fps_yaw_object(s) is not None for s in scripts)
+    return any(_fps_yaw_camera_edits(s) for s in scripts)
 
 
 @patch_pack(
@@ -5321,28 +5338,23 @@ def _detect_fps_camera_yaw_lost(scripts: list["RbxScript"]) -> bool:
 def _fix_fps_camera_yaw_from_player_pivot(scripts: list["RbxScript"]) -> int:
     fixes = 0
     for s in scripts:
-        obj = _fps_yaw_object(s)
-        if obj is None:
+        edits = _fps_yaw_camera_edits(s)
+        if not edits:
             continue
         raw = s.source or ""
-        blanked = _blank_lua_strings_and_comments(raw)
-        # Collect insert points (start of each pitch-only ``CFrame.Angles``)
-        # from the blanked view; offsets are valid in the real source too.
-        # Once rewritten the camera line reads
+        # Splice right-to-left so earlier offsets stay valid. Once rewritten
+        # the camera line reads
         # ``CFrame.new(pos) * obj:GetPivot().Rotation * CFrame.Angles(...)``,
         # which no longer matches (the regex requires ``CFrame.Angles``
         # immediately after the ``new(...) *``), so the pack is idempotent.
-        points = [m.start("angles") for m in _FPS_CAM_PITCH_ONLY_RE.finditer(blanked)]
-        if not points:
-            continue
         new_src = raw
-        for at in sorted(points, reverse=True):
+        for at, obj in sorted(edits, key=lambda e: e[0], reverse=True):
             new_src = new_src[:at] + f"{obj}:GetPivot().Rotation * " + new_src[at:]
         if new_src != raw:
             s.source = new_src
-            fixes += len(points)
+            fixes += len(edits)
             log.info(
-                "  Restored FPS camera yaw in '%s' (%d site(s), from %s)",
-                s.name, len(points), obj,
+                "  Restored FPS camera yaw in '%s' (%d site(s): %s)",
+                s.name, len(edits), ", ".join(obj for _, obj in edits),
             )
     return fixes
