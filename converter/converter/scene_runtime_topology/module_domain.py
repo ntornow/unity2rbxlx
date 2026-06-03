@@ -269,6 +269,48 @@ def _strip_luau_noise(source: str) -> str:
     return "".join(out)
 
 
+def _string_content_mask(text: str) -> list[bool]:
+    """Mark every character that lies INSIDE a quoted-string literal's content
+    (between the delimiters, escapes included) as ``True``; code positions and
+    the quote delimiters themselves are ``False``.
+
+    Callers pass text that has already had comments + long-bracket strings
+    removed (``_strip_luau_noise``); only short ``"..."`` / ``'...'`` strings
+    remain. The mask lets the API scan count a pattern only when its match
+    STARTS in code — so a literal like ``"x.OnServerEvent"`` or
+    ``'GetService("ServerStorage")'`` is data, not a signal, while a real
+    ``GetService("ServerStorage")`` CALL (which starts at the ``G`` in code,
+    its string arg merely nested) still fires."""
+    mask = [False] * len(text)
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"' or c == "'":
+            i += 1
+            while i < n:
+                d = text[i]
+                if d == "\\" and i + 1 < n:
+                    mask[i] = True
+                    mask[i + 1] = True
+                    i += 2
+                    continue
+                if d == c:
+                    break
+                mask[i] = True
+                i += 1
+            i += 1  # past the closing delimiter
+            continue
+        i += 1
+    return mask
+
+
+def _api_pattern_fires(rx: "re.Pattern[str]", text: str, in_string: list[bool]) -> bool:
+    """True iff ``rx`` matches ``text`` with the match starting in CODE (not
+    inside a string literal). Token-aware replacement for a bare
+    ``rx.search(text)`` so string CONTENTS never manufacture an API signal."""
+    return any(not in_string[m.start()] for m in rx.finditer(text))
+
+
 def _strip_require_calls(source: str) -> str:
     """Blank out ``require(...)`` call expressions before the Luau domain-signal
     scan.
@@ -1595,10 +1637,13 @@ def _collect_signals(
         # emitted ServerStorage require-fallback should count as a signal
         # (see _strip_luau_noise / _strip_require_calls).
         scan_src = _strip_require_calls(_strip_luau_noise(luau_source))
-        if any(rx.search(scan_src) for rx in _CLIENT_RX):
+        # Token-aware: a pattern only counts when its match starts in CODE, so
+        # an API token sitting inside a string literal (data) is not a signal.
+        in_string = _string_content_mask(scan_src)
+        if any(_api_pattern_fires(rx, scan_src, in_string) for rx in _CLIENT_RX):
             luau_signals.append("roblox_client_api")
             strong_client_kinds.add("roblox_client_api")
-        if any(rx.search(scan_src) for rx in _SERVER_RX):
+        if any(_api_pattern_fires(rx, scan_src, in_string) for rx in _SERVER_RX):
             luau_signals.append("roblox_server_api")
             strong_server_kinds.add("roblox_server_api")
 

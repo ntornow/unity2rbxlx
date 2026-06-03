@@ -30,9 +30,11 @@ from converter.scene_runtime_domain import (  # noqa: E402
 )
 from converter.scene_runtime_planner import SceneRuntimeArtifact  # noqa: E402
 from converter.scene_runtime_topology.module_domain import (  # noqa: E402
+    _api_pattern_fires,
     _classify_module,
     _strip_luau_noise,
     _strip_require_calls,
+    _string_content_mask,
 )
 from converter.storage_classifier import (  # noqa: E402
     REPLICATED_STORAGE,
@@ -1223,3 +1225,45 @@ class TestStripLuauNoise:
 
     def test_unterminated_long_comment_consumes_to_eof(self) -> None:
         assert self._SS not in self._scan('--[[ ' + self._SS)
+
+
+# ---------------------------------------------------------------------------
+# Token-aware API scan: string CONTENTS aren't signals (codex round-3 #2)
+# ---------------------------------------------------------------------------
+
+class TestTokenAwareApiScan:
+    def _fires(self, src, patterns):
+        text = _strip_require_calls(_strip_luau_noise(src))
+        mask = _string_content_mask(text)
+        return any(_api_pattern_fires(rx, text, mask) for rx in patterns)
+
+    def _server(self, src):
+        from converter.scene_runtime_topology.module_domain import _SERVER_RX
+        return self._fires(src, _SERVER_RX)
+
+    def _client(self, src):
+        from converter.scene_runtime_topology.module_domain import _CLIENT_RX
+        return self._fires(src, _CLIENT_RX)
+
+    def test_api_token_inside_string_is_not_a_signal(self) -> None:
+        assert not self._server('local s = "x.OnServerEvent"')
+        assert not self._client('local s = "Players.LocalPlayer"')
+
+    def test_whole_call_as_string_literal_is_not_a_signal(self) -> None:
+        # The GetService("ServerStorage") text inside an OUTER (single-quoted)
+        # Luau string is data, not a call.
+        src = "local s = 'game:GetService(\"ServerStorage\")'"
+        assert not self._server(src)
+
+    def test_real_call_still_fires(self) -> None:
+        assert self._server('remote.OnServerEvent:Connect(fn)')
+        assert self._server('local s = game:GetService("ServerStorage")')
+        assert self._client('local p = game.Players.LocalPlayer')
+
+    def test_code_signal_beside_decoy_string_still_fires(self) -> None:
+        assert self._server('local s = "x.OnServerEvent"\nremote.OnServerEvent:Connect(f)')
+
+    def test_string_content_mask_marks_only_inside(self) -> None:
+        text = 'a"bc"d'
+        # positions: a=0 "=1 b=2 c=3 "=4 d=5 -> inside = b,c (2,3)
+        assert _string_content_mask(text) == [False, False, True, True, False, False]
