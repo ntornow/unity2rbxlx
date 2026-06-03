@@ -300,12 +300,13 @@ def stash_violations(
 #     clean after the require-fallback signal fix.
 #   * component_availability (B): flipped — SimpleFPS exercises it (20 literal-arg
 #     GetComponent sites); all reachable.
-#   * cross_domain_attribute (C): STILL SHADOW — SimpleFPS has 0 cross-domain
-#     edges, so its "clean" metric is vacuous. C flips only once a corpus project
-#     with runtime client<->server edges validates it. (Class-2 store-mismatch is
-#     a separate deferred backstop — see the design doc §"Phase 3" slice 4d.)
+#   * cross_domain_attribute (C): flipped — the MiniNet networked corpus project
+#     (slice 6) exercises it (1 runtime client<->server edge, correctly bridged);
+#     SimpleFPS alone has 0 edges, which is why a second project was needed.
+#     (Class-2 store-mismatch is a separate deferred backstop — see the design
+#     doc §"Phase 3" slice 4d.)
 FAIL_CLOSED_CHECKS: frozenset[str] = frozenset(
-    {"consumer_compliance", "component_availability"}
+    {"consumer_compliance", "component_availability", "cross_domain_attribute"}
 )
 
 

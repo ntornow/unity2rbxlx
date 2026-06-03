@@ -669,16 +669,17 @@ def _topo_one_module(domain: str, name: str = "Mod", parent: str = "ReplicatedSt
 
 
 class TestFailClosedErrors:
-    def test_checks_a_and_b_are_flipped(self) -> None:
-        # A (consumer_compliance) and B (component_availability) flipped — both
-        # are exercised + clean on the SimpleFPS corpus.
+    def test_checks_abc_are_flipped(self) -> None:
+        # All three contract checks flipped: A/B exercised+clean on SimpleFPS,
+        # C exercised+clean on the MiniNet networked corpus project (slice 6/7).
         assert "consumer_compliance" in FAIL_CLOSED_CHECKS
         assert "component_availability" in FAIL_CLOSED_CHECKS
+        assert "cross_domain_attribute" in FAIL_CLOSED_CHECKS
 
-    def test_check_c_is_still_shadow(self) -> None:
-        # C (cross_domain_attribute) stays metric-only: SimpleFPS has 0
-        # cross-domain edges, so its corpus metric is vacuous (not validation).
-        assert "cross_domain_attribute" not in FAIL_CLOSED_CHECKS
+    def test_smoke_stays_shadow(self) -> None:
+        # ``smoke`` is a wiring sanity check (topology reached the verifier
+        # empty), not a contract check — it stays metric-only, never promotes.
+        assert "smoke" not in FAIL_CLOSED_CHECKS
 
     def test_flipped_check_warning_promotes(self) -> None:
         # helper domain emitted as an auto-run Script -> consumer_compliance warning.
@@ -689,13 +690,12 @@ class TestFailClosedErrors:
         assert errs[0].startswith("[contract:consumer_compliance]")
 
     def test_shadow_check_warning_does_not_promote(self) -> None:
-        # A check-C (cross_domain_attribute) warning exists but C is NOT flipped,
-        # so it stays metric-only and promotes nothing.
-        result = verify_contract(
-            _topo_edge("client", "server", "same_domain_no_bridge"), []  # type: ignore[arg-type]
-        )
+        # The ``smoke`` check is not in FAIL_CLOSED_CHECKS, so its warning
+        # (empty topology) stays metric-only and promotes nothing — even though
+        # all three contract checks (A/B/C) now flip.
+        result = verify_contract({}, [])  # missing modules -> smoke warning
         assert any(
-            v.check == "cross_domain_attribute" and v.severity == "warning"
+            v.check == "smoke" and v.severity == "warning"
             for v in result.violations
         )
         assert fail_closed_errors(result) == []

@@ -1218,11 +1218,11 @@ review against the merged code (original deliverable text preserved in git):**
   - **4c — flip check B** (component_availability). Validated on real AI Luau via
     4a: the SimpleFPS fixture has 20 literal-arg `GetComponent` sites, all
     reachable (B is exercised, not vacuously clean). Added to `FAIL_CLOSED_CHECKS`.
-  - **4d — check C STAYS SHADOW (not flipped).** SimpleFPS has **0 cross-domain
-    edges**, so check C's "0 violations" is vacuous — flipping it would be
-    green-for-the-wrong-reason. C flips only once the runnable corpus includes a
-    project with runtime client↔server edges that actually exercises it (no
-    silent cap: the gap is logged, not papered over). Document Class-2
+  - **4d — check C deferred to slice 7 (now done).** SimpleFPS has **0
+    cross-domain edges**, so check C's "0 violations" on it is vacuous — it could
+    not flip on the single-domain corpus. C flips in slice 7 once slice 6 adds a
+    project with real runtime client↔server edges (no silent cap; the gap was
+    logged, then closed). Document Class-2
     store-mismatch as a DEFERRED backstop. **Corrected rationale (empirical,
     2026-06-03):** a real generic-mode SimpleFPS conversion emits the door read
     as `plr:GetAttribute("hasKey")` where `plr = host.playerFromTouch(other)` =
@@ -1261,18 +1261,21 @@ now in-scope Phase 3 work. (The HudControl signal fix is already shipped in #174
   explicit operator opt-in ("I accept the half-broken risk"), not an automatic
   re-route, and the default stays loud-fail. No auto-routing; no `excluded`
   redefinition (helper already covers non-runtime-bearing).
-- **Slice 6 — networked corpus project (lift the single-domain ceiling).** The whole
-  bundled corpus is SimpleFPS, which is single-player / entirely `domain=client`
-  (0 cross-domain edges) — so checks A/B are validated on exactly one game and
-  check C is structurally unvalidatable. Add a MINIMAL networked Unity fixture
-  project to `test_projects/` (a couple of `NetworkBehaviour` scripts with a
-  `[Command]` + `[ClientRpc]` producing client→server and server→client edges),
-  get it through a generic-mode conversion, and add it to
-  `tools/regen_contract_corpus.py`'s `CORPUS`. Diversifies A/B coverage and is the
-  prerequisite for slice 7. Independent of slice 5.
-- **Slice 7 — flip check C.** Once slice 6's project yields real
-  `cross_domain_edges` and check C's metric is clean across the expanded corpus,
-  add `cross_domain_attribute` to `FAIL_CLOSED_CHECKS`. Depends on slice 6.
+- **Slice 6 — networked corpus project (DONE).** The bundled corpus was only
+  SimpleFPS — single-player, entirely `domain=client` (0 cross-domain edges) — so
+  A/B were validated on one game and C was structurally unvalidatable. Added a
+  minimal networked fixture, `tests/fixtures/corpus_projects/MiniNet`: a
+  client-domain `ClientCtl` (UI MonoBehaviour) holding a serialized reference to a
+  server-domain `ServerCtl` (`NetworkBehaviour` + `[Command]`/`[SyncVar]`). Under
+  `--networking=mirror` the converter classifies them client/server and the
+  serialized component reference yields one runtime client↔server
+  `cross_domain_edge` (auto-bridged → `remote_event_bridge`). `CORPUS` in
+  `regen_contract_corpus.py` now carries per-project `networking` + path (in-repo
+  fixture vs submodule projects-root). MiniNet's captured fixture exercises check C
+  (1 edge) with 0 violations.
+- **Slice 7 — flip check C (DONE).** With MiniNet exercising C cleanly,
+  `cross_domain_attribute` joined `FAIL_CLOSED_CHECKS`. All three contract checks
+  (A/B/C) are now fail-closed; only the `smoke` wiring check stays shadow.
 
 ## Migration discipline
 
