@@ -1,0 +1,111 @@
+{
+  "captured_via": "u2r.py convert --scene-runtime=generic (real AI)",
+  "expected_counts": {},
+  "project": "MiniNet",
+  "scripts": [
+    {
+      "intrinsic_script_type": "ModuleScript",
+      "name": "ClientCtl",
+      "parent_path": "ReplicatedStorage",
+      "requires_part_parent": false,
+      "script_type": "ModuleScript",
+      "source": "local ClientCtl = {}\nClientCtl.__index = ClientCtl\n\nfunction ClientCtl.new(config)\n    local self = setmetatable({}, ClientCtl)\n    -- No serialized scalars; ``target`` (peer ServerCtl) and ``statusLabel``\n    -- (Text/TextLabel) are reference fields injected on self before Awake.\n    return self\nend\n\nfunction ClientCtl:Update(dt)\n    local UserInputService = game:GetService(\"UserInputService\")\n    if UserInputService:IsKeyDown(Enum.KeyCode.E) and self.target ~= nil then\n        self.target:CmdActivate()\n    end\n    if self.statusLabel ~= nil then\n        self.statusLabel.Text = \"ready\"\n    end\nend\n\nreturn ClientCtl",
+      "source_path": "ClientCtl.luau"
+    },
+    {
+      "intrinsic_script_type": "ModuleScript",
+      "name": "ServerCtl",
+      "parent_path": "ReplicatedStorage",
+      "requires_part_parent": false,
+      "script_type": "ModuleScript",
+      "source": "local ServerCtl = {}\nServerCtl.__index = ServerCtl\n\nfunction ServerCtl.new(config)\n    local self = setmetatable({}, ServerCtl)\n    -- [SyncVar] scalar default; the replicating mirror is written in Awake/CmdActivate.\n    self.activated = config.activated or false\n    return self\nend\n\nfunction ServerCtl:Awake()\n    -- [SyncVar] canonical mirror: publish the initial value as a replicating Attribute\n    -- so clients and cross-script readers observe it.\n    self.gameObject:SetAttribute(\"activated\", self.activated)\nend\n\nfunction ServerCtl:CmdActivate()\n    -- [Command] body: server-authoritative state change.\n    self.activated = true\n    -- [SyncVar] mirror: Attributes replicate server -> client, matching Mirror sync semantics.\n    self.gameObject:SetAttribute(\"activated\", true)\nend\n\nreturn ServerCtl",
+      "source_path": "ServerCtl.luau"
+    }
+  ],
+  "topology": {
+    "animation_drivers": {},
+    "caller_graph": {
+      "5e51e51e5e51e51e5e51e51e5e51e51e": [
+        "c0ffee00c0ffee00c0ffee00c0ffee00"
+      ]
+    },
+    "cross_domain_edges": [
+      {
+        "bridge_member_scripts": [
+          {
+            "ref": "c0ffee00c0ffee00c0ffee00c0ffee00",
+            "role": "client_caller"
+          },
+          {
+            "ref": "__bridge_listener_server__ClientCtl_SetTarget",
+            "role": "server_listener"
+          },
+          {
+            "ref": "5e51e51e5e51e51e5e51e51e5e51e51e",
+            "role": "anim_listener"
+          }
+        ],
+        "field": "target",
+        "from_domain": "client",
+        "from_instance": "Assets/Scenes/main.unity:102",
+        "from_script": "c0ffee00c0ffee00c0ffee00c0ffee00",
+        "id": "Assets/Scenes/main.unity:102::target::Assets/Scenes/main.unity:202",
+        "kind": "attribute_write",
+        "owner_kind": "scene",
+        "owner_ref": "Assets/Scenes/main.unity",
+        "payload": {
+          "attribute_name": "target",
+          "schema": "unknown"
+        },
+        "resolution": {
+          "event_name": "ClientCtl_SetTarget",
+          "strategy": "remote_event_bridge"
+        },
+        "to_domain": "server",
+        "to_instance": "Assets/Scenes/main.unity:202",
+        "to_script": "5e51e51e5e51e51e5e51e51e5e51e51e"
+      }
+    ],
+    "modules": {
+      "5e51e51e5e51e51e5e51e51e5e51e51e": {
+        "bridge_group_id": null,
+        "character_attached": false,
+        "domain": "server",
+        "is_loader": false,
+        "lifecycle_role": "requireable",
+        "module_path": "ReplicatedStorage.ServerCtl",
+        "provenance": {
+          "source_path": "Assets/Scripts/ServerCtl.cs"
+        },
+        "reachability_required_container": "",
+        "script_class": "ModuleScript",
+        "stem": "ServerCtl"
+      },
+      "c0ffee00c0ffee00c0ffee00c0ffee00": {
+        "bridge_group_id": null,
+        "character_attached": false,
+        "domain": "client",
+        "is_loader": false,
+        "lifecycle_role": "requireable",
+        "module_path": "ReplicatedStorage.ClientCtl",
+        "provenance": {
+          "source_path": "Assets/Scripts/ClientCtl.cs"
+        },
+        "reachability_required_container": "",
+        "script_class": "ModuleScript",
+        "stem": "ClientCtl"
+      }
+    },
+    "shared_flag_channels": {
+      "PlayerSetSharedFlag": {
+        "canonical_stores": [
+          "Character",
+          "Player"
+        ],
+        "present": false,
+        "read_names": [],
+        "reader_domains": []
+      }
+    }
+  }
+}

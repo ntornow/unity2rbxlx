@@ -45,9 +45,19 @@ _REPO = Path(__file__).resolve().parent.parent  # converter/
 sys.path.insert(0, str(_REPO))
 
 # Projects known to complete a generic-mode cold conversion (see design doc
-# §"Phase 3" slice 4). Add a project here only after confirming it converts.
-CORPUS: dict[str, str] = {
-    "SimpleFPS": "SimpleFPS",
+# §"Phase 3" slice 4/6). Add a project here only after confirming it converts.
+# Each spec: ``networking`` mode, and EXACTLY ONE of:
+#   ``under_projects_root`` — path under CONTRACT_CORPUS_PROJECTS_ROOT (default
+#     ../test_projects; the bundled git-submodule projects live there), or
+#   ``under_repo`` — path under the converter/ repo (committed in-tree fixtures
+#     like the MiniNet networked project that exercises check C — SimpleFPS is
+#     single-domain so it has 0 cross-domain edges).
+CORPUS: dict[str, dict[str, str]] = {
+    "SimpleFPS": {"networking": "none", "under_projects_root": "SimpleFPS"},
+    "MiniNet": {
+        "networking": "mirror",
+        "under_repo": "tests/fixtures/corpus_projects/MiniNet",
+    },
 }
 
 # RbxScript fields the verifier reads (check A: script_type/parent_path/name;
@@ -69,7 +79,7 @@ class _CaptureDone(Exception):
     """Sentinel raised after the hook fires to abort the slow downstream steps."""
 
 
-def _capture(project: str, project_path: Path) -> dict[str, object]:
+def _capture(project: str, project_path: Path, networking: str) -> dict[str, object]:
     from converter.contract_verifier import verify_contract
     from converter.pipeline import Pipeline
 
@@ -93,6 +103,7 @@ def _capture(project: str, project_path: Path) -> dict[str, object]:
                 skip_upload=True,
             )
             pipeline.ctx.scene_runtime_mode = "generic"
+            pipeline.ctx.networking_mode = networking
             try:
                 pipeline.run_all()
             except _CaptureDone:
@@ -139,9 +150,19 @@ def _capture(project: str, project_path: Path) -> dict[str, object]:
     }
 
 
+def _resolve_project_path(spec: dict[str, str], projects_root: Path) -> Path:
+    if "under_projects_root" in spec:
+        return projects_root / spec["under_projects_root"]
+    if "under_repo" in spec:
+        return _REPO / spec["under_repo"]
+    raise SystemExit(
+        f"corpus spec {spec!r} has neither under_projects_root nor under_repo"
+    )
+
+
 def main(argv: list[str]) -> int:
     projects = argv or list(CORPUS)
-    root = Path(
+    projects_root = Path(
         os.environ.get(
             "CONTRACT_CORPUS_PROJECTS_ROOT", str(_REPO.parent / "test_projects")
         )
@@ -149,14 +170,19 @@ def main(argv: list[str]) -> int:
     for project in projects:
         if project not in CORPUS:
             raise SystemExit(f"unknown corpus project {project!r}; known: {list(CORPUS)}")
-        project_path = root / CORPUS[project]
+        spec = CORPUS[project]
+        project_path = _resolve_project_path(spec, projects_root)
         if not project_path.exists():
             raise SystemExit(
-                f"[{project}] unity project not found at {project_path} — set "
-                f"CONTRACT_CORPUS_PROJECTS_ROOT to a populated test_projects dir"
+                f"[{project}] unity project not found at {project_path} — for a "
+                f"projects-root project set CONTRACT_CORPUS_PROJECTS_ROOT to a "
+                f"populated test_projects dir"
             )
-        print(f"[{project}] converting (generic mode) from {project_path} ...")
-        fixture = _capture(project, project_path)
+        print(
+            f"[{project}] converting (generic, networking={spec['networking']}) "
+            f"from {project_path} ..."
+        )
+        fixture = _capture(project, project_path, spec["networking"])
         out_dir = _FIXTURE_ROOT / project
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / "fixture.json"
