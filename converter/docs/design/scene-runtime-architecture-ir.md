@@ -1186,11 +1186,56 @@ review against the merged code (original deliverable text preserved in git):**
   shared-flag literal mirrors (modeled in `shared_flag_channels`, not edges)
   and (P2) the writer×reader Cartesian over reused field names (the emitted
   Luau carries no instance identity to match the edge granularity). **Class-2
-  store-mismatch DEFERRED** (phantom post-coherence + brittle + the
-  `present==False` alternative is vacuous) — known deferred false-negative,
-  needs a pre-coherence hook + adversarial review.
-- **Slice 4** — corpus shadow audit (AI transpile) + per-check flip behind the
-  env-var hatch.
+  store-mismatch DEFERRED** as a backstop-only check with no corpus true-positive
+  — see slice 4d for the corrected rationale (the earlier "phantom /
+  pre-coherence hook" framing was wrong).
+- **Slice 4** — corpus shadow audit + per-check fail-closed flip behind the
+  env-var hatch. Decomposed (Claude+Codex review 2026-06-03):
+  - **4a — fast corpus harness.** `tools/regen_contract_corpus.py` captures
+    `(topology, scripts)` from a REAL generic-mode AI conversion per runnable
+    bundled project (the topology dict only exists in the in-scope merged
+    `scene_runtime`, so capture is via a hook monkeypatch, not a JSON
+    reconstruct). `tests/test_contract_corpus.py` replays each committed fixture
+    through the LIVE `_run_contract_verifier` hook (NOT the bare `verify_contract`
+    pure fn — the flip lands in the hook, so a pure-fn gate is
+    green-for-the-wrong-reason on wiring drift). Anti-tautology: regen REFUSES to
+    write a fixture with any real (`warning`) violation, and the test pins
+    per-check counts — so a dirty baseline or a new-violation regression both
+    fail loudly. This is the gate each flip must pass.
+  - **4b — per-check flip gate + flip A.** `contract_verifier.FAIL_CLOSED_CHECKS`
+    (a frozenset; `consumer_compliance` joins it) + `fail_closed_errors(result)`.
+    The promotion gate in `_run_contract_verifier` appends a flipped check's
+    `warning` rows to `ctx.errors` (→ `conversion_report.success=False`), reading
+    the slice-4 hatch `U2R_CONTRACT_VERIFIER_FAIL_OPEN` AT the gate
+    (compute-the-metric-but-don't-abort; distinct from the entry-level
+    `U2R_CONTRACT_VERIFIER_DISABLE`). Deduped against `ctx.errors`
+    (resume-idempotent). `info` rows and shadow checks never promote. Flip check A
+    first (stub-validatable, producer bug fixed via the require-fallback signal fix
+    + #172, lowest FP risk). NOTE: flipping A required a producer fix first — the
+    `_strip_require_calls` signal fix in `module_domain.py` (a converter-emitted
+    `require(...ServerStorage...)` fallback was posing as a strong server signal,
+    fail-closing the HUD to a dead-emit `excluded`); the corpus gate (4a) caught it.
+  - **4c — flip check B** (component_availability). Validated on real AI Luau via
+    4a: the SimpleFPS fixture has 20 literal-arg `GetComponent` sites, all
+    reachable (B is exercised, not vacuously clean). Added to `FAIL_CLOSED_CHECKS`.
+  - **4d — check C STAYS SHADOW (not flipped).** SimpleFPS has **0 cross-domain
+    edges**, so check C's "0 violations" is vacuous — flipping it would be
+    green-for-the-wrong-reason. C flips only once the runnable corpus includes a
+    project with runtime client↔server edges that actually exercises it (no
+    silent cap: the gap is logged, not papered over). Document Class-2
+    store-mismatch as a DEFERRED backstop. **Corrected rationale (empirical,
+    2026-06-03):** a real generic-mode SimpleFPS conversion emits the door read
+    as `plr:GetAttribute("hasKey")` where `plr = host.playerFromTouch(other)` =
+    the Player instance = the CORRECT store. Generic mode steers every touch
+    script through the `playerFromTouch` host helper — structural store-correctness
+    at transpile time. So Class-2 has no corpus true-positive. It is NOT a phantom
+    (the door packs are off in generic — `pipeline.py` `_subphase_cohere_scripts`
+    early-returns) and does NOT need a pre-coherence hook (verification belongs on
+    the FINAL artifact; a pre-coherence gate is the destructive-gate-before-
+    decisive-check anti-pattern). The future Class-2 arm, if ever needed, is a
+    store-aware orphan check on the final generic Luau, gated on a real uncovered
+    true-positive. SEPARATE follow-up (different bug class): the spike showed no
+    `SetAttribute("hasKey")` writer — a potential orphan-read (missing-write) bug.
 
 ## Migration discipline
 

@@ -285,6 +285,42 @@ def stash_violations(
 
 
 # ---------------------------------------------------------------------------
+# Per-check fail-closed flip (slice 4)
+# ---------------------------------------------------------------------------
+#
+# A check flips from shadow (warning-only metric) to fail-closed PER-CHECK, on
+# its own cadence, only after its metric is clean across the runnable corpus
+# (``tests/test_contract_corpus.py``). A flipped check's ``warning`` violations
+# promote to ``ctx.errors`` at the pipeline gate (``conversion_report.success``
+# becomes False). ``info`` rows (unverifiable joins) and shadow checks never
+# promote. Add a check name here ONLY once its corpus gate is green AND the
+# corpus actually EXERCISES it (a vacuous "0 violations because 0 relevant
+# constructs" is not validation).
+#   * consumer_compliance (A): flipped — SimpleFPS exercises it (module domains);
+#     clean after the require-fallback signal fix.
+#   * component_availability (B): flipped — SimpleFPS exercises it (20 literal-arg
+#     GetComponent sites); all reachable.
+#   * cross_domain_attribute (C): STILL SHADOW — SimpleFPS has 0 cross-domain
+#     edges, so its "clean" metric is vacuous. C flips only once a corpus project
+#     with runtime client<->server edges validates it. (Class-2 store-mismatch is
+#     a separate deferred backstop — see the design doc §"Phase 3" slice 4d.)
+FAIL_CLOSED_CHECKS: frozenset[str] = frozenset(
+    {"consumer_compliance", "component_availability"}
+)
+
+
+def fail_closed_errors(result: ContractVerifierResult) -> list[str]:
+    """Error strings the pipeline promotes to ``ctx.errors`` — one per real
+    (``warning``) violation of a check in ``FAIL_CLOSED_CHECKS``. Shadow checks
+    and ``info`` rows produce nothing (they stay metric-only)."""
+    return [
+        f"[contract:{v.check}] {v.script}: {v.detail}"
+        for v in result.violations
+        if v.severity == "warning" and v.check in FAIL_CLOSED_CHECKS
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Check B — component availability (GetComponent reachability)
 # ---------------------------------------------------------------------------
 #

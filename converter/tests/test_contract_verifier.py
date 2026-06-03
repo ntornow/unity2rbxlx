@@ -9,9 +9,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from converter.contract_verifier import (  # noqa: E402
+    FAIL_CLOSED_CHECKS,
     ContractViolation,
     ContractVerifierResult,
     _runtime_class_map,
+    fail_closed_errors,
     stash_violations,
     verify_contract,
     violation_to_dict,
@@ -652,3 +654,99 @@ class TestCheckCCrossDomainAttribute:
         topo = _topo_edge("client", "server", "remote_event_bridge")
         del topo["cross_domain_edges"][0]["resolution"]
         assert len(_check_c(topo)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Per-check fail-closed flip (slice 4)
+# ---------------------------------------------------------------------------
+
+def _topo_one_module(domain: str, name: str = "Mod", parent: str = "ReplicatedStorage") -> dict:
+    return {
+        "modules": {
+            "guid-1": {"stem": name, "domain": domain, "module_path": f"{parent}.{name}"}
+        }
+    }
+
+
+class TestFailClosedErrors:
+    def test_checks_a_and_b_are_flipped(self) -> None:
+        # A (consumer_compliance) and B (component_availability) flipped — both
+        # are exercised + clean on the SimpleFPS corpus.
+        assert "consumer_compliance" in FAIL_CLOSED_CHECKS
+        assert "component_availability" in FAIL_CLOSED_CHECKS
+
+    def test_check_c_is_still_shadow(self) -> None:
+        # C (cross_domain_attribute) stays metric-only: SimpleFPS has 0
+        # cross-domain edges, so its corpus metric is vacuous (not validation).
+        assert "cross_domain_attribute" not in FAIL_CLOSED_CHECKS
+
+    def test_flipped_check_warning_promotes(self) -> None:
+        # helper domain emitted as an auto-run Script -> consumer_compliance warning.
+        topo = _topo_one_module("helper")
+        scripts = [RbxScript(name="Mod", source="", script_type="Script", parent_path="ReplicatedStorage")]
+        errs = fail_closed_errors(verify_contract(topo, scripts))  # type: ignore[arg-type]
+        assert len(errs) == 1
+        assert errs[0].startswith("[contract:consumer_compliance]")
+
+    def test_shadow_check_warning_does_not_promote(self) -> None:
+        # A check-C (cross_domain_attribute) warning exists but C is NOT flipped,
+        # so it stays metric-only and promotes nothing.
+        result = verify_contract(
+            _topo_edge("client", "server", "same_domain_no_bridge"), []  # type: ignore[arg-type]
+        )
+        assert any(
+            v.check == "cross_domain_attribute" and v.severity == "warning"
+            for v in result.violations
+        )
+        assert fail_closed_errors(result) == []
+
+    def test_info_row_does_not_promote(self) -> None:
+        # Module joins to 0 emitted scripts -> unverifiable info row, never an error.
+        topo = _topo_one_module("client")
+        result = verify_contract(topo, [])  # type: ignore[arg-type]
+        assert any(
+            v.check == "consumer_compliance" and v.severity == "info"
+            for v in result.violations
+        )
+        assert fail_closed_errors(result) == []
+
+
+class TestFailClosedHookPromotion:
+    def _seed(self, tmp_path: Path) -> Pipeline:
+        pipeline = _make_pipeline(tmp_path)
+        pipeline.ctx.scene_runtime = {}
+        pipeline.state.rbx_place.scripts = [
+            RbxScript(name="Mod", source="", script_type="Script", parent_path="ReplicatedStorage")
+        ]
+        return pipeline
+
+    def test_hook_promotes_flipped_warning_to_ctx_errors(self, tmp_path: Path) -> None:
+        pipeline = self._seed(tmp_path)
+        pipeline._run_contract_verifier({"topology": _topo_one_module("helper")})
+        assert any("[contract:consumer_compliance]" in e for e in pipeline.ctx.errors)
+        # Metric is still recorded alongside the promotion.
+        assert pipeline.ctx.scene_runtime.get("contract_check_violations")
+
+    def test_hook_promotion_is_resume_idempotent(self, tmp_path: Path) -> None:
+        pipeline = self._seed(tmp_path)
+        pipeline._run_contract_verifier({"topology": _topo_one_module("helper")})
+        pipeline._run_contract_verifier({"topology": _topo_one_module("helper")})
+        hits = [e for e in pipeline.ctx.errors if "[contract:consumer_compliance]" in e]
+        assert len(hits) == 1
+
+    def test_fail_open_hatch_suppresses_promotion(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("U2R_CONTRACT_VERIFIER_FAIL_OPEN", "1")
+        pipeline = self._seed(tmp_path)
+        pipeline._run_contract_verifier({"topology": _topo_one_module("helper")})
+        # Hatch suppresses the abort but the metric stays populated.
+        assert not any("[contract:consumer_compliance]" in e for e in pipeline.ctx.errors)
+        assert pipeline.ctx.scene_runtime.get("contract_check_violations")
+
+    def test_clean_topology_promotes_nothing(self, tmp_path: Path) -> None:
+        pipeline = _make_pipeline(tmp_path)
+        pipeline.ctx.scene_runtime = {}
+        pipeline.state.rbx_place.scripts = [
+            RbxScript(name="Mod", source="", script_type="ModuleScript", parent_path="ReplicatedStorage")
+        ]
+        pipeline._run_contract_verifier({"topology": _topo_one_module("helper")})
+        assert not any("[contract:" in e for e in pipeline.ctx.errors)

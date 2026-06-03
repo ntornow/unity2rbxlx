@@ -4804,6 +4804,32 @@ script.Disabled = true
             result.counts_by_check(),
         )
 
+        # Slice-4 per-check fail-closed promotion. The metric above is always
+        # recorded (shadow). Here a FLIPPED check's ``warning`` rows
+        # (``FAIL_CLOSED_CHECKS``) promote to ``ctx.errors``, so
+        # ``conversion_report.success`` becomes False on a real contract
+        # breach. The escape hatch is read AT THIS GATE
+        # (compute-the-metric-but-don't-abort), distinct from the
+        # shadow-disable hatch at entry — so the metric stays populated even
+        # when promotion is suppressed for a release. Deduped against
+        # ``ctx.errors`` to stay resume-idempotent (mirrors the
+        # ``contract_fail_closed`` promotion).
+        if os.environ.get(
+            "U2R_CONTRACT_VERIFIER_FAIL_OPEN", "").strip().lower() in (
+            "1", "true", "yes",
+        ):
+            promotable = contract_verifier.fail_closed_errors(result)
+            if promotable:
+                log.warning(
+                    "[contract_verifier] %d fail-closed violation(s) suppressed "
+                    "via U2R_CONTRACT_VERIFIER_FAIL_OPEN (metric only)",
+                    len(promotable),
+                )
+        else:
+            for msg in contract_verifier.fail_closed_errors(result):
+                if msg not in self.ctx.errors:
+                    self.ctx.errors.append(msg)
+
     def _maybe_run_topology_prepass(
         self,
         scene_runtime: dict[str, object],
