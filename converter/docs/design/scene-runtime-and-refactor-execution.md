@@ -8,7 +8,7 @@
 
 PR#127 holds **all** refactor PRs until "scene-runtime-contract PR5–PR8 land upstream," for two reasons: (1) avoid two multi-PR efforts diluting review attention; (2) Phase 2 (`scene_converter.py`) is "additionally blocked" because the remaining scene-runtime PRs churn that file. Two facts have changed:
 
-1. **scene-runtime did not land as #122–#133.** It landed via phases; we retired the #131/#132/#133 drafts and the remainder is the narrower **recut**: Slice T (Turret lowering) + Slice H (HudControl domain) → PR6 guard → PR7 flip → PR8 retire. Its file footprint is `contract_pipeline.py`, `scene_runtime_planner.py`, `scene_runtime_domain.py`, `pipeline.py` (one guard method), `script_coherence_packs.py` (delete 5 packs), `scaffolding/`.
+1. **scene-runtime did not land as #122–#133.** It landed via phases; we retired the #131/#132/#133 drafts and the remainder is the narrower **recut**: Slice T (Turret lowering) + Slice H (HudControl domain) → PR6 guard → PR7 flip → PR8 retire. Its file footprint is `contract_pipeline.py`, `scene_runtime_topology/module_domain.py` (the post-PR#148 domain authority — `scene_runtime_domain.py` is a back-compat shim), `pipeline.py` (one guard method), `script_coherence_packs.py` (delete 5 packs), `scaffolding/`. Slice H must also satisfy the fail-closed **`contract_verifier`** (PR#148 Phase 3) — coherent client domain + container + LocalScript, see the recut plan.
 2. **`scene_converter.py` is decoupled from the recut.** Verified: closed PR5/6/8 touch `scene_converter.py` **0 times**; recent main churn on it is flag-names/meshes, not scene-runtime. The "Phase 2 blocked by the scene_converter lock" condition has **expired**. UI/Pause completeness lives in `ui_translator.py` (854 LOC, not a split target); Slice T's lowering lives in `contract_pipeline.py`. So `scene_converter.py` can be held frozen through its own split.
 
 Net: the file PR#127 flagged as the **worst** (`scene_converter.py`, 5553 LOC, `_ctx()` hidden state at ~58 sites) is the one that is **now executable**, while the genuine collisions are localized to two files.
@@ -30,7 +30,7 @@ The blanket "hold everything" collapses to **one** surgical gate, not two: **bot
 
 > **Correction (parallel-review, 2026-06-04):** the first draft gated the pipeline split behind **PR6**. That is wrong. PR8 — not PR6 — is the dominant `pipeline.py` churn from the recut: it rewrites the file **365+/516−** and **deletes `apply_scaffolding` + the `scaffolding` property + `_init_scaffolding`**, which PR-D's *frozen `Pipeline` public API* (refactor_plan.md:138) and `PipelineServices` *bound helpers* (refactor_plan.md:54) both retain. PR-C/PR-D authored before PR8 would bake deleted methods into the dispatch contract. **Gate the pipeline split behind PR8.** PR6's guard (+1 method) is absorbed into the same post-PR8 baseline.
 >
-> **Third collision surface:** the `plan_scene_runtime` **phase** (pipeline.py:57) calls `scene_runtime_planner` + `scene_runtime_domain` — **Slice H's files**. PR-D's phase-module enumeration mentions `plan_scene_runtime` **zero** times (also omits `materialize_and_classify`). So PR-D's table is stale *and* must relocate Slice H's call sites — sequence PR-D **after Slice H**, and refresh the enumeration at re-baseline.
+> **Third collision surface:** the `plan_scene_runtime` **phase** (pipeline.py:57) calls `scene_runtime_planner`, and the domain classifier (`scene_runtime_topology/module_domain.py` — **Slice H's file**) runs in the classify/`materialize_and_classify` phase. PR-D's phase-module enumeration mentions `plan_scene_runtime` **zero** times (also omits `materialize_and_classify`). So PR-D's table is stale *and* its phase split brushes the same phases Slice H edits — sequence PR-D **after Slice H**, and refresh the enumeration at re-baseline.
 
 ## Three-track plan
 
@@ -66,7 +66,7 @@ The two efforts have **opposite** definitions of "correct," so the shared baseli
 
 - **Refactor (Tracks 2,3) = byte-equivalence** against the **legacy-mode** frozen hash. A split must never change output.
 - **scene-runtime (Track 1):** which steps move the *legacy* baseline:
-  - **Slice T, Slice H** — `contract_pipeline.py`/planner run **generic-only**; legacy output is byte-identical → **do not move the baseline** (validated by the canary/Studio, not the hash).
+  - **Slice T** — `contract_pipeline.py` is **generic-only** (`runtime_mode="generic"`) → legacy byte-identical, no baseline move. **Slice H** edits the domain classifier (`module_domain.py`), which feeds the *generic* host-emit; legacy script emission doesn't consult the domain verdict → expected baseline-neutral, **but confirm at re-baseline** (the classifier also runs in the classify phase). Both validated by the canary/Studio, not the hash.
   - **PR6 guard** — write_output gate; emits no new legacy content → baseline-neutral.
   - **PR7 default flip** — changes the *default* mode, not legacy output; **PR-B's explicit `mode=legacy` freeze is immune.**
   - **PR8** — deletes the FPS coherence packs, which run in **legacy** and rewrite SimpleFPS scripts → **moves the legacy SimpleFPS frozen hash.** This is the one ★ re-freeze.
@@ -76,6 +76,12 @@ The two efforts have **opposite** definitions of "correct," so the shared baseli
 
 - **Claude (adversarial):** found 3 real holes — pipeline split was wrongly gated behind PR6 (PR8 deletes `apply_scaffolding`/`scaffolding` that PR-D binds + rewrites `pipeline.py` 881 L); `plan_scene_runtime` phase is a third collision surface calling Slice H's files and is absent from PR-D's enumeration; harness ★ markers were on generic-only steps. All three verified against the repo and folded above.
 - **codex:** unavailable (WSS transport down all attempts). Its five collision questions were instead answered by direct repo inspection: (1) PR8 is the last recut step → one gate suffices; (2) `test_offline_assembly` modes off `E2E_SCENE_RUNTIME_MODE` default `legacy` → PR7-immune; (3) `contract_pipeline` is `runtime_mode="generic"` → no legacy leak; (4) PR8 owns the re-freeze, no deadlock; (5) `scene_converter.py` imports neither `pipeline` nor `scene_runtime_*`; the only shared test (`test_pipeline_write_output_subphases`) is pipeline-side, already behind the PR8 gate. Re-run codex when connectivity returns for the formal second voice.
+
+### Second pass (PR#177 extensive review) — corrections folded
+A deeper repo-verified pass (Claude subagent + codex both blocked by infra; done by direct inspection) caught that the docs predated **PR#148's topology refactor**:
+- **Slice H file was wrong** — `scene_runtime_domain.py` is a back-compat **shim**; the domain authority is `scene_runtime_topology/module_domain.py` (`:324` cites `HudControl` as the canonical mis-`excluded` example). Corrected throughout.
+- **Slice H must satisfy the fail-closed `contract_verifier`** (PR#148 Phase 3): flipping the domain to client is insufficient — it must produce a coherent client domain + client-reachable container + LocalScript, or trip `client-in-server-container`/`server-localscript`. Added to the recut plan.
+- **PR#127's refactor plan predates `scene_runtime_topology/` + `contract_verifier.py`** — both are clean, well-factored new modules (not mega-files), so **no new split target**, but the plan's file census should note them. Not a collision; a completeness note.
 
 ## Preserved from PR#127 (not redesigned)
 
