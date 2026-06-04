@@ -426,6 +426,19 @@ def transpile_with_contract(
         log.info("[contract] movement-facet lowering retargeted %d player "
                  "controller(s) to the character Humanoid", moved)
 
+    # Child-index lowering (allowlisted deterministic lowering pass): the
+    # transpiler flattens Unity ``transform.GetChild(n)`` to
+    # ``<recv>:GetChildren()[n+1]``, which returns the injected non-spatial
+    # child (e.g. the AudioSource->Sound stamped at child index 0 of a Part),
+    # so a following ``:GetPivot()`` crashes. Resolve each such site to the
+    # N-th SPATIAL child instead. Structure-gated (the GetChildren()[literal]
+    # emission shape), never per-game; see child_index_lowering.py.
+    from converter.child_index_lowering import lower_child_index
+    lowered_children = lower_child_index(transpilation.scripts)
+    if lowered_children:
+        log.info("[contract] child-index lowering resolved GetChild sites "
+                 "in %d script(s) to the N-th spatial child", lowered_children)
+
     # Aggregate fail-closed reasons. Verifier failures are recorded per
     # module via warnings; convert them to FailClosed rows here so the
     # orchestrator's caller has one place to read project status.
