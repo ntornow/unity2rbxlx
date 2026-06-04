@@ -604,6 +604,477 @@ class TestDeferredR2Fixes:
         assert "HudB.Start" not in lines, out
 
 
+class TestDeferredR3Fixes:
+    """Fix-round-3 findings (codex r3 + Claude r3):
+
+      * BLOCKING: the engine registry ``_componentByInstanceId`` was keyed by
+        the RAW prefab-local instance_id, so two boot placements of the same
+        UI prefab collided -- placement-1's deferred component could bind to
+        placement-2's peer. AND ``_unregister`` never cleared registry entries
+        (a destroyed component could be bound by a later deferred resolve).
+        Fix: placement-scoped registry key + clear on unregister/destroy.
+      * MAJOR: cross-host deferred->deferred refs only got eventually
+        back-patched, so the earlier-completing host Awoke/Started with a nil
+        ref. Fix: dependency-aware batching -- a group waits for the groups it
+        references before running its lifecycle (KEEPING the r2 property that
+        UNRELATED never-resolving hosts don't stall a resolved host); a
+        never-resolving dependency times out -> proceed with nil + warn.
+    """
+
+    @staticmethod
+    def _mknode_helper() -> str:
+        # A prefab-clone descendant node with GetDescendants / Get/SetAttribute
+        # mirroring the production attribute stamp into ``_sceneRuntimeId``.
+        return textwrap.dedent("""\
+            local function _mkNode(name, sri)
+                local n = {Name = name, _sceneRuntimeId = sri,
+                           _children = {}, _builtins = {}, Parent = nil}
+                n.SetAttribute = function(self, k, v)
+                    if k == "_SceneRuntimeId" then self._sceneRuntimeId = v end
+                end
+                n.GetAttribute = function(self, k)
+                    if k == "_SceneRuntimeId" then return self._sceneRuntimeId end
+                end
+                n.GetDescendants = function(self)
+                    local out = {}
+                    local function walk(node)
+                        for _, child in pairs(node._children or {}) do
+                            table.insert(out, child)
+                            walk(child)
+                        end
+                    end
+                    walk(self)
+                    return out
+                end
+                return n
+            end
+        """)
+
+    def test_multi_placement_binds_each_to_its_own_clone_peer(self):
+        # Two boot placements (PA, PB) of the SAME UI prefab. The prefab hosts
+        # two UI-owned instances on DIFFERENT hosts: ``Hud`` (host
+        # ``pfb:hudhost``, holds an intra-prefab component ref to ``Peer``) and
+        # ``Peer`` (host ``pfb:peerhost``). Every host clone misses at boot so
+        # all four deferred groups (PA/PB x Hud/Peer) wait on ``awaitUiHost``.
+        #
+        # To FORCE the placement-collision the fix targets, the resolution is
+        # interleaved: BOTH Peer hosts resolve first (so the engine registry's
+        # raw ``pfb:peer`` key ends up holding the LAST-registered Peer -- PB's
+        # -- pre-fix), THEN both Hud hosts resolve and wire their ref. Pre-fix
+        # (raw registry key) both Huds read the same raw key and bind PB's
+        # Peer; with the placement-scoped key each Hud binds ITS OWN Peer.
+        scenario = textwrap.dedent("""\
+            local binds = {}
+            local parked = {}   -- queue of parked Hud-host resolver threads
+
+            local Hud = {} ; Hud.__index = Hud
+            function Hud.new(_) return setmetatable({peer = nil}, Hud) end
+            function Hud:Awake()
+                local mine = self.gameObject and self.gameObject.Name
+                local got = self.peer and self.peer.gameObject
+                          and self.peer.gameObject.Name
+                binds[tostring(mine)] = tostring(got)
+            end
+
+            local Peer = {} ; Peer.__index = Peer
+            function Peer.new(_) return setmetatable({}, Peer) end
+
+            local plan = {
+                modules = {
+                    hud  = {stem = "Hud",  runtime_bearing = true, module_path = "x"},
+                    peer = {stem = "Peer", runtime_bearing = true, module_path = "x"},
+                },
+                scenes = {},
+                prefabs = {
+                    ["pfb"] = {
+                        name = "Pf",
+                        instances = {
+                            {instance_id = "pfb:hud", script_id = "hud",
+                             game_object_id = "pfb:hudhost", active = true,
+                             enabled = true, config = {},
+                             instance_owner_is_ui = true},
+                            {instance_id = "pfb:peer", script_id = "peer",
+                             game_object_id = "pfb:peerhost", active = true,
+                             enabled = true, config = {},
+                             instance_owner_is_ui = true},
+                        },
+                        references = {
+                            {["from"] = "pfb:hud", field = "peer", index = nil,
+                             target_kind = "component", target_ref = "pfb:peer"},
+                        },
+                        lifecycle_order = {"pfb:peer", "pfb:hud"},
+                    },
+                },
+                scene_prefab_placements = {
+                    {placement_id = "PA", prefab_id = "pfb",
+                     active = true, enabled = true},
+                    {placement_id = "PB", prefab_id = "pfb",
+                     active = true, enabled = true},
+                },
+                domain_overrides = {},
+            }
+
+            -- Per-placement clones. ``_findUnboundClonePerPrefab`` resolves a
+            -- distinct clone per placement (root_goid == the prefab root); the
+            -- per-instance host descendants carry the prefab-local host SRIs.
+            -- The prefab root_goid inferred by _findUnboundClonePerPrefab is
+            -- the first instance with no parent -> ``pfb:hudhost`` (the Hud
+            -- instance's host). So the clone ROOT carries that SRI; the Peer
+            -- host is a sibling descendant. (resolveCloneChild is stubbed to
+            -- miss so every instance defers regardless.)
+            local function _mkClone(hudName, peerName)
+                local hudHost = {Name = hudName, _sceneRuntimeId = "pfb:hudhost",
+                                 _children = {}}
+                local peerHost = {Name = peerName, _sceneRuntimeId = "pfb:peerhost",
+                                  _children = {}}
+                for _, n in ipairs({hudHost, peerHost}) do
+                    n.SetAttribute = function(self, k, v)
+                        if k == "_SceneRuntimeId" then self._sceneRuntimeId = v end
+                    end
+                    n.GetAttribute = function(self, k)
+                        if k == "_SceneRuntimeId" then return self._sceneRuntimeId end
+                    end
+                    n.GetDescendants = function(self) return {} end
+                end
+                return hudHost, peerHost
+            end
+            local hudA, peerA = _mkClone("hudA", "peerA")
+            local hudB, peerB = _mkClone("hudB", "peerB")
+            -- workspace returns the two distinct placement roots (Hud hosts).
+            local boundCount = 0
+            workspace = {GetDescendants = function(self) return {hudA, hudB} end}
+
+            local services = servicesFor(plan, {hud = Hud, peer = Peer}, {})
+            services.resolveCloneChild = function(clone, goid) return nil end
+            services.getInstanceId = function(inst) return inst and inst._sceneRuntimeId end
+
+            -- Real-coroutine spawn so the Hud-host resolvers can park while the
+            -- Peer hosts resolve first.
+            local realSpawn = {}
+            function realSpawn.spawn(fn, ...)
+                local co = coroutine.create(fn)
+                coroutine.resume(co, ...)
+                return co
+            end
+            services.task = setmetatable(realSpawn, {__index = services.task})
+
+            -- Peer hosts resolve immediately; Hud hosts PARK (queued) so both
+            -- Peers register before either Hud wires.
+            local cloneByHud = {["PA:pfb:hudhost"] = hudA, ["PB:pfb:hudhost"] = hudB}
+            local cloneByPeer = {["PA:pfb:peerhost"] = peerA, ["PB:pfb:peerhost"] = peerB}
+            services.awaitUiHost = function(scopedId)
+                if cloneByPeer[scopedId] then return cloneByPeer[scopedId] end
+                if cloneByHud[scopedId] then
+                    table.insert(parked,
+                        {thread = coroutine.running(), id = scopedId})
+                    coroutine.yield()
+                    return cloneByHud[scopedId]
+                end
+                return nil
+            end
+
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            -- Both Peers have registered; now resume the parked Hud resolvers
+            -- (each returns its host clone and completes its group).
+            for _, p in ipairs(parked) do
+                coroutine.resume(p.thread)
+            end
+            runDeferred()
+
+            print("PA=" .. tostring(binds["hudA"]))
+            print("PB=" .. tostring(binds["hudB"]))
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        assert "DONE" in lines, out
+        # Each placement's Hud bound to ITS OWN clone's Peer (no cross-
+        # placement collision). Pre-fix both bound to peerB (raw-key last
+        # writer wins) -> PA=peerB.
+        assert "PA=peerA" in lines, out
+        assert "PB=peerB" in lines, out
+
+    def test_unregister_clears_registry_so_destroyed_comp_not_bound(self):
+        # A deferred component A holds a ref to a deferred component B on a
+        # DIFFERENT host. B is built (registers in the engine map), then
+        # DESTROYED before A's group wires. Pre-fix the destroyed B lingered in
+        # ``_componentByInstanceId`` and A bound the dead comp. With unregister
+        # clearing the entry, A's ref to the destroyed B resolves to nil.
+        scenario = textwrap.dedent("""\
+            local events = {}
+
+            local A = {} ; A.__index = A
+            function A.new(_) return setmetatable({b = nil}, A) end
+            function A:Awake()
+                events.aBound = (self.b ~= nil)
+            end
+
+            local B = {} ; B.__index = B
+            function B.new(_) return setmetatable({}, B) end
+
+            local plan = {
+                modules = {
+                    a = {stem = "A", runtime_bearing = true, module_path = "x"},
+                    b = {stem = "B", runtime_bearing = true, module_path = "x"},
+                },
+                scenes = {
+                    S = {
+                        instances = {
+                            {instance_id = "S:a", script_id = "a",
+                             game_object_id = "aId", active = true,
+                             enabled = true, config = {},
+                             instance_owner_is_ui = true},
+                            {instance_id = "S:b", script_id = "b",
+                             game_object_id = "bId", active = true,
+                             enabled = true, config = {},
+                             instance_owner_is_ui = true},
+                        },
+                        references = {
+                            {["from"] = "S:a", field = "b", index = nil,
+                             target_kind = "component", target_ref = "S:b"},
+                        },
+                        lifecycle_order = {"S:b", "S:a"},
+                    },
+                },
+                prefabs = {},
+                domain_overrides = {},
+            }
+
+            local services = servicesFor(plan, {a = A, b = B}, {})
+            local aClone = {Name = "A", _sceneRuntimeId = "aId", _children = {}}
+            local bClone = {Name = "B", _sceneRuntimeId = "bId", _children = {}}
+
+            -- B's group resolves FIRST and builds + registers B; we then
+            -- DESTROY B before A's group resolves. Drive ordering by hand: B's
+            -- resolver returns its clone immediately; A's resolver destroys B
+            -- (already built, since dependency-ordering completes B first) and
+            -- then returns A's clone.
+            services.awaitUiHost = function(id)
+                if id == "bId" then return bClone end
+                if id == "aId" then
+                    -- A depends on B, so B's group has completed + registered
+                    -- B by now. Destroy B's component; ``_unregister`` must
+                    -- clear the engine registry entry so A's pending ref to B
+                    -- resolves to nil rather than the dead component.
+                    local found = engineRef:findObjectOfType("B")
+                    if found then engineRef:destroy(found) end
+                    return aClone
+                end
+                return nil
+            end
+
+            engineRef = SceneRuntime.new(services, plan)
+            engineRef:start(nil)
+            runDeferred()
+
+            print("A_BOUND=" .. tostring(events.aBound))
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        assert "DONE" in lines, out
+        # A's ref to the DESTROYED B resolved to nil (registry entry cleared),
+        # NOT to the dead component. Pre-fix: A_BOUND=true (bound the corpse).
+        assert "A_BOUND=false" in lines, out
+
+    def test_cross_host_deferred_dep_ordered_nonnil_unrelated_independent(self):
+        # Three deferred UI components on THREE different hosts:
+        #   A -> B (A holds a component ref to B; both deferred, diff hosts)
+        #   C  is UNRELATED and NEVER resolves (parked resolver coroutine).
+        # Dependency-aware batching must order B before A so A's Awake/Start
+        # see B NON-NIL (codex r3 MAJOR). AND the r2 property must hold: C
+        # (unrelated, never-resolving) must NOT stall A or B.
+        scenario = textwrap.dedent("""\
+            local events = {}
+
+            local A = {} ; A.__index = A
+            function A.new(_) return setmetatable({b = nil}, A) end
+            function A:Awake()
+                events.aAwakeB = self.b and self.b._tag or "nil"
+            end
+            function A:Start()
+                events.aStartB = self.b and self.b._tag or "nil"
+            end
+
+            local B = {} ; B.__index = B
+            function B.new(_) return setmetatable({_tag = "B"}, B) end
+            function B:Awake() events.bAwake = true end
+            function B:Start() events.bStart = true end
+
+            local C = {} ; C.__index = C
+            function C.new(_) return setmetatable({}, C) end
+            function C:Awake() events.cAwake = true end
+
+            local plan = {
+                modules = {
+                    a = {stem = "A", runtime_bearing = true, module_path = "x"},
+                    b = {stem = "B", runtime_bearing = true, module_path = "x"},
+                    c = {stem = "C", runtime_bearing = true, module_path = "x"},
+                },
+                scenes = {
+                    S = {
+                        instances = {
+                            {instance_id = "S:a", script_id = "a",
+                             game_object_id = "aId", active = true,
+                             enabled = true, config = {},
+                             instance_owner_is_ui = true},
+                            {instance_id = "S:b", script_id = "b",
+                             game_object_id = "bId", active = true,
+                             enabled = true, config = {},
+                             instance_owner_is_ui = true},
+                            {instance_id = "S:c", script_id = "c",
+                             game_object_id = "cId", active = true,
+                             enabled = true, config = {},
+                             instance_owner_is_ui = true},
+                        },
+                        references = {
+                            {["from"] = "S:a", field = "b", index = nil,
+                             target_kind = "component", target_ref = "S:b"},
+                        },
+                        -- lifecycle_order puts A's host group first in defer
+                        -- order; dependency ordering must still complete B
+                        -- before A despite this.
+                        lifecycle_order = {"S:a", "S:b", "S:c"},
+                    },
+                },
+                prefabs = {},
+                domain_overrides = {},
+            }
+
+            local services = servicesFor(plan, {a = A, b = B, c = C}, {})
+
+            -- Real-coroutine task.spawn so C's resolver can park indefinitely.
+            local realSpawn = {}
+            function realSpawn.spawn(fn, ...)
+                local co = coroutine.create(fn)
+                coroutine.resume(co, ...)
+                return co
+            end
+            services.task = setmetatable(realSpawn, {__index = services.task})
+
+            local aClone = {Name = "A", _sceneRuntimeId = "aId", _children = {}}
+            local bClone = {Name = "B", _sceneRuntimeId = "bId", _children = {}}
+            services.awaitUiHost = function(id)
+                if id == "aId" then return aClone end
+                if id == "bId" then return bClone end
+                -- Host C: never resolves -- park forever.
+                coroutine.yield()
+                return nil
+            end
+
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+
+            print("A_AWAKE_B=" .. tostring(events.aAwakeB))
+            print("A_START_B=" .. tostring(events.aStartB))
+            print("B_AWAKE=" .. tostring(events.bAwake))
+            print("C_AWAKE=" .. tostring(events.cAwake))
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        assert "DONE" in lines, out
+        # A depended on B -> B completed first -> A saw B non-nil at BOTH
+        # Awake and Start. Pre-fix (eventual back-patch only): nil at Awake.
+        assert "A_AWAKE_B=B" in lines, out
+        assert "A_START_B=B" in lines, out
+        assert "B_AWAKE=true" in lines, out
+        # r2 property preserved: C (unrelated, never-resolving) did NOT stall
+        # A or B; A and B completed. C itself never built.
+        assert "C_AWAKE=nil" in lines, out
+
+    def test_never_resolving_dependency_times_out_then_proceeds_nil(self):
+        # A depends on B, but B's host NEVER resolves (parked resolver). The
+        # dependency wait must TIME OUT and let A proceed with a nil ref + warn
+        # -- no infinite hang. (Harness: the iteration cap bounds the wait
+        # since the mock clock doesn't advance during task.wait.)
+        scenario = textwrap.dedent("""\
+            local events = {}
+
+            local A = {} ; A.__index = A
+            function A.new(_) return setmetatable({b = nil}, A) end
+            function A:Awake() events.aAwakeB = self.b and "set" or "nil" end
+            function A:Start() events.aStart = true end
+
+            local B = {} ; B.__index = B
+            function B.new(_) return setmetatable({_tag = "B"}, B) end
+            function B:Awake() events.bAwake = true end
+
+            local plan = {
+                modules = {
+                    a = {stem = "A", runtime_bearing = true, module_path = "x"},
+                    b = {stem = "B", runtime_bearing = true, module_path = "x"},
+                },
+                scenes = {
+                    S = {
+                        instances = {
+                            {instance_id = "S:a", script_id = "a",
+                             game_object_id = "aId", active = true,
+                             enabled = true, config = {},
+                             instance_owner_is_ui = true},
+                            {instance_id = "S:b", script_id = "b",
+                             game_object_id = "bId", active = true,
+                             enabled = true, config = {},
+                             instance_owner_is_ui = true},
+                        },
+                        references = {
+                            {["from"] = "S:a", field = "b", index = nil,
+                             target_kind = "component", target_ref = "S:b"},
+                        },
+                        lifecycle_order = {"S:a", "S:b"},
+                    },
+                },
+                prefabs = {},
+                domain_overrides = {},
+            }
+
+            local services = servicesFor(plan, {a = A, b = B}, {})
+
+            local realSpawn = {}
+            function realSpawn.spawn(fn, ...)
+                local co = coroutine.create(fn)
+                coroutine.resume(co, ...)
+                return co
+            end
+            services.task = setmetatable(realSpawn, {__index = services.task})
+            -- Shrink the wait so the harness iteration cap is reached fast.
+            -- (Use task.wait that returns immediately; the iteration cap is the
+            -- harness-safe bound the runtime applies.)
+
+            local aClone = {Name = "A", _sceneRuntimeId = "aId", _children = {}}
+            services.awaitUiHost = function(id)
+                if id == "aId" then return aClone end
+                -- Host B: never resolves.
+                coroutine.yield()
+                return nil
+            end
+
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+
+            print("A_AWAKE_B=" .. tostring(events.aAwakeB))
+            print("A_START=" .. tostring(events.aStart))
+            print("B_AWAKE=" .. tostring(events.bAwake))
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        # No hang (the 15s subprocess timeout would have killed it) AND A
+        # proceeded after the dependency timeout with a nil ref.
+        assert "DONE" in lines, out
+        assert "A_AWAKE_B=nil" in lines, out
+        assert "A_START=true" in lines, out
+        # B never built (its host never landed).
+        assert "B_AWAKE=nil" in lines, out
+
+
 class TestAwaitUiHostResolverDirect:
     """Fix-round-1 MAJOR #5 + test-coverage #6. Drive the REAL emitted
     ``awaitUiHost`` body inside a true coroutine harness, exercising the
