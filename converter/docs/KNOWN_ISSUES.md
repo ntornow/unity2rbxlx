@@ -166,21 +166,29 @@ deterministic lowering layer / host-runtime services (see
 `docs/design/camera-input-fidelity-plan.md` and the "deterministic lowering
 layer" section of `scene-runtime-contract.md`).
 
-### Player rig vs character binding (camera follows a possibly-mis-placed rig)
+### Player rig vs character binding — RESOLVED (generic player↔character binding)
 
-**Files:** `converter/converter/scene_runtime_*`, the converted `Player` controller.
+**Files:** `converter/converter/movement_facet_lowering.py`,
+`converter/converter/camera_facet_lowering.py`, `converter/runtime/scene_camera_input.luau`.
 
-In generic SimpleFPS, `Player:Move` logs *"called, but player currently has no
-character"* and bails, so the scene player `gameObject` never moves from its
-authored scene position. The PR #175 camera/input service sources the eye
-position from that rig (`self.gameObject`), so the camera's X/Z track the spawn
-but its **Y follows the rig** (observed ~-635 vs spawn Y~26). The deeper issue
-is that the converted "player" is a scene Model not bound to a moving Roblox
-character — a player/character-binding gap distinct from the (now-fixed) look bug.
+Resolved: in generic mode the player controller's movement and camera eye were bound
+to the *scene rig Part* (`self.gameObject`) instead of the Roblox character. Empirically
+(Studio repro): the rig had no collision, so the per-frame `PivotTo` + unbounded gravity
+sank it (camera Y ~-512) while the Roblox character never moved (`Humanoid.MoveDirection
+= (0,0,0)`). The earlier "Move logs no character and bails" framing was imprecise — the
+real mechanism was the rig binding (the *"Player:Move called, but player currently has no
+character"* line is a one-time Roblox **default-ControlModule** startup warning, pre-existing
+and benign, emitted before `SceneCameraInput` disables default controls — not the converted
+`Player:Move`, which uses `Humanoid:Move`).
 
-**Fix direction:** decide the canonical player representation in generic
-(scene rig vs Roblox character) and bind movement + camera eye to it
-consistently; likely part of the post-PR8 character/input config layer.
+**Fix (this change):** canonical player = the Roblox character (`Players.LocalPlayer.Character`).
+A deterministic, player-identified lowering (camera-facet ∩ ≥3-WASD ∩ `CharacterController`
+ref, unique → else fail-closed) retargets the controller's WASD method to drive the
+character's `Humanoid:Move` (physics/collision; no more sink) and emits `followCharacter=true`
+so `SceneCameraInput` sources the eye from the character's HumanoidRootPart. Verified on a
+real generic conversion in Studio: spawn-on-floor, WASD moves the character camera-relative,
+mouse yaw+pitch via the service, no new console errors. See
+`docs/design/camera-input-fidelity-plan.md`.
 
 ### Turret / HudControl have no generic fidelity home
 

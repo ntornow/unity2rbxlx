@@ -150,3 +150,14 @@ structural fingerprint (the good kind), but in the `run_packs` layer.
 - **Risk #3 — detection generality:** the lowering pass must fire across
   child-camera FPS shapes without false-positives on non-FPS scripts; gate on
   the multi-signal structural fingerprint, lexer-blanked, never `s.name`.
+
+## Follow-on landed: generic player↔character binding (movement + camera eye)
+The scope cap here kept the service to *turning* and the controller to *translation* — but
+left translation targeting the scene rig. The follow-on (`movement_facet_lowering.py` +
+`followCharacter` on `SceneCameraInput`) completes the "play correctly" PR5→PR7 gate: the
+identified player controller (camera-facet ∩ ≥3-WASD ∩ `CharacterController` ref, unique else
+fail-closed) drives `Humanoid:Move` on `Players.LocalPlayer.Character` and the service sources
+the eye from the character HRP (`followCharacter=true`). Verified in Studio on a real generic
+SimpleFPS conversion (WASD moves the character, mouse yaw+pitch via the E2E channel, eye follows
+the character). The scope cap is intact: translation stays in the controller, retargeted to the
+character; the service still owns only camera pose.
