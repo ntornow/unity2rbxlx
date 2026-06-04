@@ -368,6 +368,242 @@ class TestServerNoResolverOneShot:
         assert "Hud.Start" in lines, out
 
 
+class TestDeferredR2Fixes:
+    """Fix-round-2 findings (codex r2 + Claude r2):
+
+      * BLOCKING: a deferred component's OUTBOUND ``component``-kind ref to a
+        SYNCHRONOUSLY-built peer must resolve (mirror of the inbound bug). Pre
+        r2 it stayed nil forever (only ``builtByInstanceId`` was consulted).
+      * BLOCKING: per-host completion -- a host that never resolves must NOT
+        delay a host that resolves promptly (the prior global barrier stalled
+        every resolved peer up to the 10s timeout).
+      * MAJOR: planner ``enabled=false`` / ``tag`` must be reapplied in the
+        deferred path -- pre r2 an authored-disabled deferred UI woke ENABLED
+        (ran OnEnable/Start) and its tag never entered ``_byTag``.
+    """
+
+    def test_deferred_outbound_ref_to_sync_peer_resolves(self):
+        # A deferred UI ``Hud`` holds a serialized ref to a SYNCHRONOUSLY-built
+        # non-UI ``Manager``. Pre r2 the deferred wire pass only saw the
+        # batch-built set, so ``Hud.manager`` was nil at Start.
+        scenario = textwrap.dedent("""\
+            local events = {}
+
+            local Manager = {} ; Manager.__index = Manager
+            function Manager.new(_) return setmetatable({_tag = "MGR"}, Manager) end
+            function Manager:Awake() table.insert(events, "Manager.Awake") end
+            function Manager:Start() table.insert(events, "Manager.Start") end
+
+            local Hud = {} ; Hud.__index = Hud
+            function Hud.new(_) return setmetatable({manager = nil}, Hud) end
+            function Hud:Awake()
+                table.insert(events,
+                    "Hud.Awake manager=" .. tostring(self.manager and self.manager._tag))
+            end
+            function Hud:Start()
+                table.insert(events,
+                    "Hud.Start manager=" .. tostring(self.manager and self.manager._tag))
+            end
+
+            local plan = {
+                modules = {
+                    mgr = {stem = "Manager", runtime_bearing = true, module_path = "x"},
+                    hud = {stem = "Hud", runtime_bearing = true, module_path = "x"},
+                },
+                scenes = {
+                    A = {
+                        instances = {
+                            {instance_id = "A:m", script_id = "mgr",
+                             game_object_id = "mgrId", active = true,
+                             enabled = true, config = {}},
+                            {instance_id = "A:h", script_id = "hud",
+                             game_object_id = "hudId", active = true,
+                             enabled = true, config = {},
+                             instance_owner_is_ui = true},
+                        },
+                        -- Hud (deferred) -> Manager (synchronous peer).
+                        references = {
+                            {["from"] = "A:h", field = "manager", index = nil,
+                             target_kind = "component", target_ref = "A:m"},
+                        },
+                        lifecycle_order = {"A:m", "A:h"},
+                    },
+                },
+                prefabs = {},
+                domain_overrides = {},
+            }
+
+            -- Only the Manager host exists at boot; the Hud host misses.
+            local mgrGo = {Name = "Mgr", _sceneRuntimeId = "mgrId", _children = {}}
+            local services = servicesFor(plan, {mgr = Manager, hud = Hud}, {mgrId = mgrGo})
+            local hudClone = {Name = "HUD", _sceneRuntimeId = "hudId", _children = {}}
+            services.awaitUiHost = function(id)
+                if id == "hudId" then return hudClone end
+                return nil
+            end
+
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+
+            for _, e in ipairs(events) do print(e) end
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        assert "DONE" in lines, out
+        # BLOCKING: the deferred component's outbound ref to the sync peer is
+        # bound (pre r2: ``Hud.Awake manager=nil`` / ``Hud.Start manager=nil``).
+        assert "Hud.Awake manager=MGR" in lines, out
+        assert "Hud.Start manager=MGR" in lines, out
+
+    def test_disabled_deferred_does_not_run_onenable_and_tag_registered(self):
+        # A deferred UI component authored ``enabled=false`` with a ``tag``.
+        # Pre r2 it woke ENABLED (ran OnEnable/Start) and its tag never entered
+        # ``_byTag`` (findGameObjectsWithTag returned nothing).
+        scenario = textwrap.dedent("""\
+            local events = {}
+
+            local Hud = {} ; Hud.__index = Hud
+            function Hud.new(_) return setmetatable({}, Hud) end
+            function Hud:Awake() table.insert(events, "Hud.Awake") end
+            function Hud:OnEnable() table.insert(events, "Hud.OnEnable") end
+            function Hud:Start() table.insert(events, "Hud.Start") end
+
+            local plan = {
+                modules = {
+                    hud = {stem = "Hud", runtime_bearing = true, module_path = "x"},
+                },
+                scenes = {
+                    A = {
+                        instances = {
+                            {instance_id = "A:h", script_id = "hud",
+                             game_object_id = "hudId", active = true,
+                             enabled = false, tag = "HudTag", config = {},
+                             instance_owner_is_ui = true},
+                        },
+                        references = {},
+                        lifecycle_order = {"A:h"},
+                    },
+                },
+                prefabs = {},
+                domain_overrides = {},
+            }
+
+            local services = servicesFor(plan, {hud = Hud}, {})
+            local hudClone = {Name = "HUD", _sceneRuntimeId = "hudId", _children = {}}
+            services.awaitUiHost = function(id)
+                if id == "hudId" then return hudClone end
+                return nil
+            end
+
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+
+            local tagged = engine:findGameObjectsWithTag("HudTag")
+            print("TAGCOUNT=" .. tostring(#tagged))
+            for _, e in ipairs(events) do print(e) end
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        assert "DONE" in lines, out
+        # MAJOR: enabled=false honored -> Awake runs but OnEnable/Start do NOT.
+        assert "Hud.Awake" in lines, out
+        assert "Hud.OnEnable" not in lines, out
+        assert "Hud.Start" not in lines, out
+        # MAJOR: authored tag registered (pre r2: TAGCOUNT=0).
+        assert "TAGCOUNT=1" in lines, out
+
+    def test_resolved_host_completes_without_waiting_for_unresolved_peer(self):
+        # Two deferred components on DIFFERENT hosts. Host A resolves
+        # immediately; host B NEVER resolves (its resolver coroutine stays
+        # parked, like awaitUiHost waiting on a clone that never lands until
+        # the 10s timeout). With per-host completion, host A's component must
+        # Awake/Start WITHOUT waiting for B. Against the pre-r2 global barrier
+        # (remaining==0 across ALL pending), A would NOT complete until B's
+        # coroutine finished -- so this assertion fails pre-fix.
+        scenario = textwrap.dedent("""\
+            local events = {}
+
+            local HudA = {} ; HudA.__index = HudA
+            function HudA.new(_) return setmetatable({}, HudA) end
+            function HudA:Awake() table.insert(events, "HudA.Awake") end
+            function HudA:Start() table.insert(events, "HudA.Start") end
+
+            local HudB = {} ; HudB.__index = HudB
+            function HudB.new(_) return setmetatable({}, HudB) end
+            function HudB:Awake() table.insert(events, "HudB.Awake") end
+            function HudB:Start() table.insert(events, "HudB.Start") end
+
+            local plan = {
+                modules = {
+                    a = {stem = "HudA", runtime_bearing = true, module_path = "x"},
+                    b = {stem = "HudB", runtime_bearing = true, module_path = "x"},
+                },
+                scenes = {
+                    A = {
+                        instances = {
+                            {instance_id = "A:a", script_id = "a",
+                             game_object_id = "aId", active = true,
+                             enabled = true, config = {},
+                             instance_owner_is_ui = true},
+                            {instance_id = "A:b", script_id = "b",
+                             game_object_id = "bId", active = true,
+                             enabled = true, config = {},
+                             instance_owner_is_ui = true},
+                        },
+                        references = {},
+                        lifecycle_order = {"A:a", "A:b"},
+                    },
+                },
+                prefabs = {},
+                domain_overrides = {},
+            }
+
+            local services = servicesFor(plan, {a = HudA, b = HudB}, {})
+
+            -- Real-coroutine task.spawn: each resolver runs in its own thread
+            -- and may yield. Host B's resolver parks forever (never resumed),
+            -- modelling a clone that never lands within the test window.
+            local realSpawn = {}
+            function realSpawn.spawn(fn, ...)
+                local co = coroutine.create(fn)
+                coroutine.resume(co, ...)
+                return co
+            end
+            services.task = setmetatable(realSpawn, {__index = services.task})
+
+            local aClone = {Name = "A", _sceneRuntimeId = "aId", _children = {}}
+            services.awaitUiHost = function(id)
+                if id == "aId" then return aClone end
+                -- Host B: never resolves -- park this coroutine indefinitely.
+                coroutine.yield()
+                return nil
+            end
+
+            local engine = SceneRuntime.new(services, plan)
+            engine:start(nil)
+            runDeferred()
+
+            for _, e in ipairs(events) do print(e) end
+            print("DONE")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        lines = out.strip().splitlines()
+        assert "DONE" in lines, out
+        # Host A completed its full lifecycle WITHOUT waiting on host B.
+        assert "HudA.Awake" in lines, out
+        assert "HudA.Start" in lines, out
+        # Host B never resolved -> never built.
+        assert "HudB.Awake" not in lines, out
+        assert "HudB.Start" not in lines, out
+
+
 class TestAwaitUiHostResolverDirect:
     """Fix-round-1 MAJOR #5 + test-coverage #6. Drive the REAL emitted
     ``awaitUiHost`` body inside a true coroutine harness, exercising the

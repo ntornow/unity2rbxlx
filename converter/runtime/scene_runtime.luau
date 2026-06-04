@@ -214,6 +214,18 @@ function SceneRuntime.new(services, plan)
 	self._byName = {}       -- gameObjectName -> list[component]
 	self._byTag = {}        -- tag -> list[component]
 
+	-- Engine-level ``instance_id -> component`` registry. Populated by
+	-- BOTH the synchronous build passes (scene + prefab) AND the deferred
+	-- batch. The per-owner ``componentByInstanceId`` locals are discarded
+	-- when ``start()`` returns, so a deferred component completing late has
+	-- no other way to resolve a ``component``-kind outbound ref to a
+	-- SYNCHRONOUSLY-built peer (the symmetric mirror of the inbound
+	-- back-patch). instance_ids are planner-namespaced
+	-- (``<scene|prefab>:<file_id>``) so they're globally unique across
+	-- owners; the deferred wire pass resolves against the UNION of this
+	-- registry and the batch-built set.
+	self._componentByInstanceId = {}
+
 	-- Track which prefab instances we've spawned, keyed by clone
 	-- Instance (so ``destroy(clone)`` can find the descendants to tear
 	-- down without re-walking).
@@ -897,7 +909,16 @@ end
 
 function SceneRuntime:_wireReferences(refs, componentByInstanceId,
                                        crossDomainEdges, instanceById,
-                                       placement_id)
+                                       placement_id, targetResolveMap)
+	-- ``targetResolveMap`` (optional): when wiring a deferred-UI group, a
+	-- ``component``-kind ref's SOURCE must be in this group (gated by
+	-- ``componentByInstanceId``, the group-built set), but its TARGET may be
+	-- a SYNCHRONOUSLY-built peer or an earlier deferred group. Pass the
+	-- engine-level union map here so those outbound refs resolve instead of
+	-- silently staying nil (codex r2 BLOCKING -- the mirror of the inbound
+	-- back-patch). nil (sync/prefab callers) => resolve targets against
+	-- ``componentByInstanceId``, preserving prior behaviour.
+	local resolveMap = targetResolveMap or componentByInstanceId
 	-- ``instanceById`` is the planner's per-scene/prefab
 	-- instance_id -> instance row map, used to resolve a target's
 	-- ``script_id`` (and therefore its domain via plan.modules) even
@@ -918,7 +939,7 @@ function SceneRuntime:_wireReferences(refs, componentByInstanceId,
 		local sourceComp = componentByInstanceId[ref["from"]]
 		if sourceComp ~= nil then
 			local target = self:_resolveReferenceTarget(
-				ref, componentByInstanceId, placement_id)
+				ref, resolveMap, placement_id)
 			-- Cross-domain policy: if both source module and target
 			-- module have assigned non-legacy domains and they differ,
 			-- inject ``nil`` and surface the edge. Resolve via the plan
@@ -1752,6 +1773,7 @@ function SceneRuntime:_constructPrefabClone(clone, prefab, prefab_id, includeScr
 					"prefab", prefab_id)
 				if comp then
 					componentByInstanceId[inst.instance_id] = comp
+					self._componentByInstanceId[inst.instance_id] = comp
 					table.insert(componentList, comp)
 					-- Honor planner-supplied active/enabled/tag for prefab
 					-- instances exactly as the scene boot path does (R3-P1.1).
@@ -1901,6 +1923,32 @@ function SceneRuntime:_resolveDeferredUiInstances()
 	local resolver = self._services.awaitUiHost
 	local engine = self
 
+	-- Group deferred entries by host (``gameObjectId``). Each host group is
+	-- completed INDEPENDENTLY (codex r2 BLOCKING): the prior global barrier
+	-- waited for ``remaining == 0`` across ALL pending entries, so one
+	-- never-landing host stalled every already-resolved peer up to the 10s
+	-- timeout. Per-host completion means a host that resolves promptly
+	-- Awakes/Starts its own group right away, and a host that times out
+	-- drops only its own group.
+	--
+	-- WITHIN a host group, the components still complete together as ONE
+	-- ordered ``_runAwakeEnableStart`` mini-batch (r1 batching requirement):
+	-- same-GO ``GetComponent``-in-Awake and ``lifecycle_order`` are
+	-- preserved among same-host peers. Cross-host ordering is inherently
+	-- best-effort -- different hosts resolve at different times.
+	local groupOrder = {}
+	local groups = {}
+	for _, entry in ipairs(pending) do
+		local key = entry.gameObjectId
+		local group = groups[key]
+		if not group then
+			group = {}
+			groups[key] = group
+			table.insert(groupOrder, key)
+		end
+		table.insert(group, entry)
+	end
+
 	-- MAJOR (codex r1 #3): the defer branch is unconditional in the generic
 	-- runtime, but ``awaitUiHost`` is injected only on the CLIENT services
 	-- table. With no resolver (server domain, or any partition lacking the
@@ -1913,37 +1961,37 @@ function SceneRuntime:_resolveDeferredUiInstances()
 	-- as the pre-slice one-shot path did.
 	if not resolver then
 		local oneShot = self._services.workspaceFind
-		for _, entry in ipairs(pending) do
-			local goInst = oneShot and oneShot(entry.gameObjectId) or nil
-			entry.goInst = goInst
+		for _, key in ipairs(groupOrder) do
+			local group = groups[key]
+			local goInst = oneShot and oneShot(key) or nil
+			for _, entry in ipairs(group) do
+				entry.goInst = goInst
+			end
+			engine:_completeDeferredBatch(group)
 		end
-		engine:_completeDeferredBatch(pending)
 		return
 	end
 
-	-- Resolve every host clone first (each in its own coroutine so the
-	-- event-driven waits run concurrently and never block one another),
-	-- then complete the whole set as one batch via a barrier: each resolver
-	-- decrements ``remaining``; the last one to finish runs the batch.
+	-- Resolve each host clone in its own coroutine so the event-driven
+	-- waits run concurrently and never block one another. When a host
+	-- resolves, complete ITS group immediately as one mini-batch -- no
+	-- cross-host barrier.
 	local spawn = self._services.task and self._services.task.spawn
-	local remaining = #pending
-	local function onOneResolved()
-		remaining = remaining - 1
-		if remaining == 0 then
-			engine:_completeDeferredBatch(pending)
-		end
-	end
-	for _, entry in ipairs(pending) do
-		local function resolveOne()
-			entry.goInst = resolver(entry.gameObjectId)
-			onOneResolved()
+	for _, key in ipairs(groupOrder) do
+		local group = groups[key]
+		local function resolveGroup()
+			local goInst = resolver(key)
+			for _, entry in ipairs(group) do
+				entry.goInst = goInst
+			end
+			engine:_completeDeferredBatch(group)
 		end
 		if spawn then
-			spawn(resolveOne)
+			spawn(resolveGroup)
 		else
 			-- No task.spawn (harness without one): run inline. The resolver
 			-- is responsible for not yielding in that environment.
-			resolveOne()
+			resolveGroup()
 		end
 	end
 end
@@ -2009,6 +2057,16 @@ function SceneRuntime:_completeDeferredBatch(pending)
 			if comp then
 				entry.comp = comp
 				builtByInstanceId[inst.instance_id] = comp
+				-- MAJOR (codex r2): record in the engine-level registry so
+				-- this deferred component is visible to later groups'
+				-- outbound refs and inbound back-patches.
+				engine._componentByInstanceId[inst.instance_id] = comp
+				-- MAJOR (codex r2): reapply planner ``active``/``enabled``/
+				-- ``tag`` BEFORE ``_injectHostSurface``, matching the
+				-- synchronous scene/prefab paths. Without this an authored
+				-- ``enabled=false`` deferred UI woke ENABLED and ran
+				-- OnEnable/Start, and its tag never entered ``_byTag``.
+				engine:_applyPlannerFlagsAndTag(comp, inst, goInst)
 				table.insert(batch, comp)
 			end
 		end
@@ -2029,7 +2087,12 @@ function SceneRuntime:_completeDeferredBatch(pending)
 	-- owner (references list + byInstanceId + placement) so a multi-entry
 	-- batch wires every member's outbound refs in one pass per owner, with
 	-- the full set of built peers visible (intra-batch component refs
-	-- resolve to their freshly-built peer).
+	-- resolve to their freshly-built peer). The SOURCE gate stays
+	-- ``builtByInstanceId`` (only THIS group's components get wired), but
+	-- the TARGET resolve map is the engine-level union
+	-- (``_componentByInstanceId``) so an outbound ``component``-kind ref to a
+	-- SYNCHRONOUSLY-built peer (or an earlier deferred group) resolves --
+	-- the mirror of the inbound back-patch (codex r2 BLOCKING).
 	local wiredOwners = {}
 	for _, entry in ipairs(ordered) do
 		if entry.comp and entry.references and not wiredOwners[entry.references] then
@@ -2037,7 +2100,7 @@ function SceneRuntime:_completeDeferredBatch(pending)
 			engine:_wireReferences(
 				entry.references, builtByInstanceId,
 				engine._crossDomainEdges, entry.byInstanceId,
-				entry.placement_id)
+				entry.placement_id, engine._componentByInstanceId)
 		end
 	end
 
@@ -2195,6 +2258,7 @@ function SceneRuntime:start(domainFilter)
 						"scene", sceneKey)
 					if comp then
 						componentByInstanceId[instId] = comp
+						self._componentByInstanceId[instId] = comp
 						table.insert(lifecycleList, comp)
 						self:_applyPlannerFlagsAndTag(comp, inst, goInst)
 					end
