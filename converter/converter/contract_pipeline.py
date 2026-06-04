@@ -396,6 +396,17 @@ def transpile_with_contract(
     # carries forward.
     _apply_require_resolutions(transpilation.scripts, require_resolutions)
 
+    # Camera-facet lowering (allowlisted deterministic lowering pass, PR5):
+    # route a flattened first-person controller's look math onto the
+    # SceneCameraInput runtime service so generic-mode FPS games yaw, not just
+    # pitch. Structure-gated, never per-game; see camera_facet_lowering.py and
+    # docs/design/camera-input-fidelity-plan.md.
+    from converter.camera_facet_lowering import lower_camera_facet
+    lowered = lower_camera_facet(transpilation.scripts)
+    if lowered:
+        log.info("[contract] camera-facet lowering routed %d controller(s) "
+                 "to SceneCameraInput", lowered)
+
     # Aggregate fail-closed reasons. Verifier failures are recorded per
     # module via warnings; convert them to FailClosed rows here so the
     # orchestrator's caller has one place to read project status.
