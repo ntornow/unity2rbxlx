@@ -5230,17 +5230,30 @@ def _fix_turret_canonical_spatial_child(
 # Pack: fps_camera_yaw_from_player_pivot
 # ---------------------------------------------------------------------------
 #
+# LEGACY-ONLY pack. In generic scene-runtime mode the coherence layer is off
+# (the contract pipeline is an allowlist); the generic fix is the camera/input
+# runtime service + camera-facet lowering pass (see
+# docs/design/camera-input-fidelity-plan.md, PR5). This pack restores yaw for
+# LEGACY conversions (the default until PR7 and the post-PR7 escape hatch), and
+# is retired alongside the other FPS packs in PR8.
+#
 # Unity FPS rigs parent the camera UNDER the player transform: the player
 # yaws (``transform.Rotate`` around up) and the camera inherits that world
 # yaw through the transform hierarchy, while the camera's own local rotation
 # is pitch-only (``camRotation.x``).
 #
-# The C#->Luau transpiler FLATTENS that hierarchy. The converted controller
-# yaws the player object via ``PivotTo`` but then rebuilds the camera's WORLD
-# CFrame every frame as ``CFrame.new(pos) * CFrame.Angles(pitch, 0, 0)`` with
-# the yaw (Y) and roll (Z) components literally ``0``. The player turns; the
-# camera never inherits it. Symptom: you can pitch up/down but cannot yaw
-# left/right (``mouse_yaw_rotates_camera`` is the known-failing e2e fixture).
+# Root cause is NOT a transpiler "flattening" of the hierarchy (regular Unity
+# parent-child transforms ARE preserved as Roblox Model nesting + PivotTo).
+# Roblox's camera is ``workspace.CurrentCamera`` -- a SINGLETON that is not in
+# the workspace tree, so it can never be a transform-child of the player Model.
+# The Unity camera-child-of-player yaw inheritance therefore can't be expressed
+# as nesting and is re-derived in emitted code -- where the AI gets it wrong:
+# the converted controller yaws the player object via ``PivotTo`` but rebuilds
+# the camera's WORLD CFrame every frame as
+# ``CFrame.new(pos) * CFrame.Angles(pitch, 0, 0)`` with the yaw (Y) and roll
+# (Z) components literally ``0``. The player turns; the camera never inherits
+# it. Symptom: you can pitch up/down but cannot yaw left/right
+# (``mouse_yaw_rotates_camera`` is the known-failing e2e fixture).
 #
 # Fix: inject the yawing object's world rotation into the camera CFrame so it
 # inherits the player yaw, mirroring Unity's parent(yaw) -> child(pitch):

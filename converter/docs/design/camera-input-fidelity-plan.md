@@ -41,14 +41,29 @@ basis.
 
 ### C1 — Camera/input runtime service (`runtime/`, hand-written Luau)
 A deterministic module the host wires on the client. Responsibilities per the
-scope cap. Controller↔service API (to finalize in the slice):
+scope cap. **Frozen controller↔service API + ordering contract (pinned in
+Slice A, before either side is built):**
 - `service:configure({sensitivity, minPitch, maxPitch})`
+- `service:step(dt)` — reads mouse delta (+E2E channel), updates yaw+pitch,
+  yaws the player rig, composes `CurrentCamera.CFrame`.
 - `service:applyRecoil(deltaPitch)`  ← recoil from Shoot
-- `service:getYaw()` / `service:getLookCFrame()`  ← movement basis / raycast
-- service runs its own input→camera loop (reads mouse delta + E2E channel,
-  composes `CurrentCamera.CFrame`, yaws the player rig), like Roblox's own
-  camera scripts. Production-safe E2E channel (no-op when unset).
-The existing `CameraRigFollower` (rig→camera pivot) stays / folds in.
+- `service:getYawBasis()` / `service:getLookCFrame()`  ← movement basis / raycast
+- `service:onRespawn(cframe)` / `snapToRig()`  ← TakeDamage teleports the rig;
+  the service must be told or yaw-state desyncs from the rig after respawn.
+- Production-safe E2E channel (no-op when unset).
+
+**Ordering contract (the headline risk — see Risks).** `step(dt)` is called
+**in-band, where `Rotate` ran** in the controller's `Update`, so the existing
+per-frame order is preserved: `Shoot` (recoil → `applyRecoil`) → `step` (yaw
+applied to rig) → `Move` (reads `getYawBasis()`/the rig pivot). The service
+must NOT run a separate `RenderStepped`/`Heartbeat` loop that races the
+controller's `Update` (`SceneRuntime:_tick`) — that reintroduces one-frame
+yaw/move skew. Any RenderStepped smoothing for *rendering only* must not be
+the authoritative yaw source. The existing `CameraRigFollower` (rig→camera
+pivot, RenderStepped) stays for rig mirroring; authoritative look state is set
+in-band by `step`. Note: `CameraType = Scriptable` is set by the bootstrap
+(`pipeline.py:3594`), not the controller — the service/splice must not assume
+it owns that.
 
 ### C2 — Camera-facet lowering pass (generic allowlist, `contract_pipeline.py`)
 Deterministic, structural-fingerprint-gated (NOT `s.name`). Method-scoped
@@ -57,27 +72,49 @@ host API the AI may misuse):
 - Detect the camera-controller facet: binds `workspace.CurrentCamera` + the
   yaw-only `PivotTo` body turn + the pitch-only `CurrentCamera.CFrame` rebuild
   + pitch-state field.
-- Splice: replace the `Awake` camera bind + the `Rotate` look-math + the
-  pitch-state mutations (incl. recoil writes) with calls into the service.
-  Leave `Move`, `Shoot`, raycasts, ammo, events untouched.
-- Idempotent; twice-call + fires-on-real-shape + negative unit tests.
+- **Exact cut points (the controller is NOT left "untouched" — earlier draft
+  was self-contradictory):**
+  - `Rotate` look-math (yaw `PivotTo` + the pitch-only camera CFrame write +
+    the mouse-delta pitch accumulation/clamp) → replace with `self._cam:step(dt)`.
+  - `Shoot`'s recoil write (`self.camRotationX = self.camRotationX - 2`) →
+    `self._cam:applyRecoil(...)`. So `Shoot` IS touched, at that one line.
+  - **KEEP** the `Awake` `self.cam = workspace.CurrentCamera` bind as a
+    read-only alias — `Shoot`'s raycast reads `self.cam.CFrame` and
+    `weaponSlot = self.cam:GetChildren()[1]` resolves from it. Only the
+    controller-side camera *writes* are harmful; the read alias stays. (The
+    `weaponSlot`/camera-child resolution is a separate object-ref lowering
+    problem — `unity_instantiate`, FUTURE_IMPROVEMENTS — not this pass.)
+  - Leave `Move`, the raycast, ammo, events otherwise intact; `Move` reads
+    `self._cam:getYawBasis()` (or the rig pivot the service yawed).
+- Idempotent; twice-call + fires-on-real-shape + negative + **a
+  movement-facing test** (WASD basis still tracks look yaw after the splice).
 
 ## Slices
-- **A — Doc + decisions (this).** Design-doc edits (done: lowering-layer
-  principle + PR8 timing resolution) + this plan + legacy-pack decision +
-  scope-cap sign-off. **Gate A: Codex + Claude plan review, then user.**
-- **B — Runtime service (C1).** Build + host-side tests; finalize the
-  controller↔service API and the turn-vs-translate seam.
-- **C — Lowering pass (C2).** Structural detection + method-scoped splice +
-  unit tests; wire into the generic allowlist in `contract_pipeline.py`.
+Slices **A–D land in PR5** (the camera/input service is a prerequisite of the
+PR5→PR7 "play correctly" gate — see scene-runtime-contract.md). **E is PR8**
+(retirement only).
+- **A — Doc + decisions + frozen contract (this).** Design-doc edits (done:
+  lowering-layer principle + PR5/PR8 timing resolution) + this plan +
+  legacy-pack decision + scope-cap sign-off **+ FREEZE the controller↔service
+  API and the in-band ordering contract and the `onRespawn` hook** (pulled
+  forward from B — C can't be designed without the API frozen). **Gate A:
+  Codex + Claude plan review, then user.**
+- **B — Runtime service (C1).** Build against the frozen API + host-side tests
+  (pose composition, clamp, recoil, respawn, E2E channel, in-band `step`).
+- **C — Lowering pass (C2).** Structural detection + method-scoped splice at
+  the exact cut points + unit tests (incl. the movement-facing test); wire into
+  the generic allowlist in `contract_pipeline.py` (the allowlist orchestrator —
+  NOT `contract_verifier.py`).
 - **D — Integration + verify.** Generic SimpleFPS routes through the service;
   `/e2e-test SimpleFPS --generic` drives `mouse_yaw_rotates_camera` +
   `mouse_pitch_rotates_camera` and they PASS. Cache-based assemble — no API
   auth needed (verified workable this session). Update memory
   [[converted-fps-camera-yaw-lost]].
-- **E — Retirement (= PR8 scope, likely a separate effort).** Retire the 3 FPS
-  packs + `converter/scaffolding/` + `detect_fps_game`/`is_fps_game` *into* the
-  service so legacy and generic converge; rewrite skill 4a/4c as plan overrides.
+- **E — Retirement (= PR8 scope, separate effort).** Retire the **four** FPS
+  packs (`fps_camera_yaw_from_player_pivot`, `fps_camera_pitch_inversion`,
+  `fps_default_controls_off`, `fps_e2e_mouse_channel`) + `converter/scaffolding/`
+  + `detect_fps_game`/`is_fps_game` — their jobs already live in the PR5
+  service; rewrite skill 4a/4c as plan overrides.
 
 This effort = **A–D** (fix generic properly + the service + the pass). **E** is
 the larger roadmap retirement, gated on A–D proving the seam on SimpleFPS.
@@ -94,16 +131,22 @@ structural fingerprint (the good kind), but in the `run_packs` layer.
   service (Slice E retires it)."
 - Alternative: drop it now and accept legacy yaw stays broken until retirement.
 
-## Verification & risks
+## Verification & risks (ranked)
 - **Oracle:** the e2e gameplay fixtures are the behavioral net (no build-time
   behavioral check exists by design). `mouse_yaw` / `mouse_pitch` are the gates.
 - **Auth:** the lowering pass + service are cache-/auth-neutral (deterministic,
   post-transpile + hand-written runtime); cache-based `assemble` builds + e2e
   verifies without the (currently 403) cold-transpile API. Only prompt-teaching
   would need auth — and we are deliberately not relying on prompt for this.
-- **Risk — seam creep:** the service must not grow into locomotion/weapons.
-  Guard: the scope cap above + a test asserting the service module's public API
+- **Risk #1 — frame-order / temporal coupling (the headline technical risk).**
+  Today yaw is applied in `Rotate` *before* `Move` reads the pivot, *in the same
+  Update frame*, and recoil is applied *before* the raycast. A service on its
+  own loop would race that. Mitigation: the in-band `step(dt)` ordering contract
+  (C1) + a movement-facing test (C) + a recoil-before-raycast test. This
+  outranks detection generality — get the ordering contract right first.
+- **Risk #2 — seam creep:** the service must not grow into locomotion/weapons.
+  Guard: the scope cap + a test asserting the service module's public API
   surface stays within the capped list.
-- **Risk — detection generality:** the lowering pass must fire across
+- **Risk #3 — detection generality:** the lowering pass must fire across
   child-camera FPS shapes without false-positives on non-FPS scripts; gate on
   the multi-signal structural fingerprint, lexer-blanked, never `s.name`.

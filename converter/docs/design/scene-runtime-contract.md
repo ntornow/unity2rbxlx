@@ -195,12 +195,17 @@ statically recognizable but **not preventable by prompt + structural
 verifier alone** (prompt teaching is a hint, not enforcement). Those gaps
 get a deterministic home — a lowering pass and/or a host-runtime service —
 never a per-game pack. Planned additions to this layer: `unity_instantiate`
-object-ref lowering (see `FUTURE_IMPROVEMENTS.md`) and the camera/input
-facet lowering that backs the camera/input runtime service (PR8, below).
-A new allowlist entry must clear the bar: *deterministic, generic,
-anchored to a named stable primitive.* If it can only be expressed as
-identity-gated output-spelling repair, it is a pack and does not belong
-in generic.
+object-ref lowering (see `FUTURE_IMPROVEMENTS.md`) and the camera-facet
+lowering that backs the camera/input runtime service (PR5, above).
+A new allowlist entry must clear the bar: **deterministic; generic — gated
+on the STRUCTURE of a stable Unity→Roblox primitive (a single canonical
+token the prompt emits, e.g. `rbxassetid://` / `require("@scene_runtime/…")`,
+or a multi-signal structural fingerprint of a primitive's shape), NEVER on
+script identity (`s.name`); and the transform must be a faithful lowering of
+that primitive, not output-spelling chasing.** The distinguishing line from
+a coherence pack is *structure-gated vs identity-gated*, not "touches
+emitted Luau." If an entry can only be expressed as per-game,
+identity-gated repair, it is a pack and does not belong in generic.
 
 **Enforcement = verify + reprompt + fail-closed.** No mechanical
 relocation of module-scope side-effects (that's semantic rewriting).
@@ -665,10 +670,10 @@ landable (inert by default); PR3b onward form a chain.
 | PR3a | Runtime **contract**: additive `_GENERIC_RUNTIME_PROMPT` (legacy prompt byte-unchanged) covering full host surface (Pieces 1 + 6); `runtime_mode` threaded through transpiler; pre-transpile `ModuleScript` target switch for runtime-bearing MonoBehaviours; lexical verifier (incl. constructor-purity rule e) + reprompt + fail-closed; generic allowlist (asset-rewrite + stem-keyed require resolution + verifier; all legacy repair passes off, incl. `write_output` emit-time subphases). `--scene-runtime` flag at every front door; `generic` rejected at CLI until PR4. Default output byte-identical. Ends with **compliance spike** — trash-dash + SimpleFPS verifier pass rate (pre/post-reprompt) recorded; PR3b/PR4 don't start until rate clears agreed threshold. | PR1 | High |
 | PR3b | Packaging + execution partitioning (Piece 4's two sub-concerns): domain classifier (new generic-only table; per-instance UI-reference signal aggregation) → fills `scene_runtime.modules`; **reachability rule** (client require graph must not reach `ServerStorage`); **intra-class instance-domain-conflict fail-closed** (multi-context class without `domain_overrides` → legacy; with override → honor + emit displaced-instance report); `.scene-runtime-mode` stamp + mismatch guard at all front doors; `--clean` remediation flag; generic-only `scene_converter`/`ui_translator` changes (inactive retention, asset/prefab serialized-field child suppression). | PR3a (incl. passing gate) | Med |
 | PR4 | Host runtime (`runtime/scene_runtime.luau` + `SceneRuntimeClient/Server`) + Piece 6: component registry (with built-in fallback), `instantiatePrefab`, `addComponent`, global lookup registry, lifecycle-scoped scheduler, **lifecycle-scoped event wiring (`host.connect`)**, recursive destroy, cross-domain policy (v1: nil + log + UNCONVERTED.md), conversion-time cross-domain edge report, plan-sharding loader if needed. | PR3b | Med |
-| PR5 | `auto` mode + canary: trash-dash (state-machine, ~12 cross-domain edges expected) + SimpleFPS (~6–8 edges) + one cross-domain-heavy project (UI-controller / server-gameplay split — stresses Piece 6 policy + report) + one trigger/collision-driven project (regresses rule-(f) emission and the `host:connect`-in-`Awake` pattern, per Mode-semantics vector 3) + one multi-scene project under `generic`, MCP-verify, compare against legacy. | PR4 | Med |
+| PR5 | `auto` mode + canary: trash-dash (state-machine, ~12 cross-domain edges expected) + SimpleFPS (~6–8 edges) + one cross-domain-heavy project (UI-controller / server-gameplay split — stresses Piece 6 policy + report) + one trigger/collision-driven project (regresses rule-(f) emission and the `host:connect`-in-`Awake` pattern, per Mode-semantics vector 3) + one multi-scene project under `generic`, MCP-verify, compare against legacy. **Includes the minimal first-person camera/input runtime service + camera-facet lowering pass** — a hard prerequisite of the PR5→PR7 "play correctly" gate (SimpleFPS cannot yaw/pitch under generic without it). Scope-capped (see "Camera / input" under NOT in scope). | PR4 | Med |
 | PR6 | **Hard guard rail (lands before default flip):** `write_output` fails if runtime-bearing MonoBehaviours exist with no valid plan+host — generic/auto only; `--allow-nonplayable-output` escape. | PR5 | Low |
 | PR7 | **Flip default to `auto`:** legacy retained as per-run escape hatch. PR6 lands first so the guard rail protects the default before it flips. | PR6 | Med |
-| PR8 | **Land the minimal first-person camera/input runtime service + camera-facet lowering pass (the retirement target), THEN** retire FPS scaffolding + dependency web: `--scaffolding=fps`, `converter/scaffolding/`, `detect_fps_game`, `is_fps_game` and its `LockFirstPerson` camera wiring, three FPS coherence packs (`fps_camera_yaw_from_player_pivot`, `fps_camera_pitch_inversion`, `fps_default_controls_off`) — their jobs move into the service so generic SimpleFPS stays playable across the cut. Rewrite skill Phases 4a/4c as structured plan overrides. Service scope is capped (see "Camera / input" under NOT in scope). | PR7 | Med |
+| PR8 | **Retirement only** (the camera/input service already shipped in PR5, so generic SimpleFPS stays playable across the cut): retire FPS scaffolding + dependency web — `--scaffolding=fps`, `converter/scaffolding/`, `detect_fps_game`, `is_fps_game` and its `LockFirstPerson` camera wiring, and the four legacy FPS coherence packs (`fps_camera_yaw_from_player_pivot`, `fps_camera_pitch_inversion`, `fps_default_controls_off`, `fps_e2e_mouse_channel`) whose jobs now live in the service. Rewrite skill Phases 4a/4c as structured plan overrides. | PR7 | Med |
 
 **PR3a → PR3b/PR4 gate.** The verifier pass rate is the single biggest
 unquantified risk; PR4 is the largest build. PR3a ends with a compliance
@@ -756,8 +761,12 @@ compliance uncontaminated by the new classifier tables.
   policy fires at start. **PR5 → PR7 gate:** all five canaries must
   play correctly under `--scene-runtime=generic` (and route through
   `auto`'s generic branch with no fail-closed fallback) before PR7 is
-  cut — symmetric to PR3a → PR3b/PR4. Regression: legacy byte-identical
-  to pre-PR output (legacy prompt + cache key untouched).
+  cut — symmetric to PR3a → PR3b/PR4. **SimpleFPS "play correctly"
+  includes first-person look (yaw AND pitch), so the minimal camera/input
+  service + camera-facet lowering pass is a prerequisite of THIS gate** —
+  it lands in PR5, not PR8 (PR8 only retires the now-redundant legacy FPS
+  machinery). Regression: legacy byte-identical to pre-PR output (legacy
+  prompt + cache key untouched).
 - **PR6** — guard rail fires only under `generic`/`auto`; legacy +
   resume/preserved-script unaffected; `--allow-nonplayable-output` passes.
   Verified to land **before** PR7 by running PR7's test pre-PR6 and
@@ -790,29 +799,27 @@ compliance uncontaminated by the new classifier tables.
 ## NOT in scope (deferred)
 
 - **Camera / input platform-divergence** — split. The MonoBehaviour host
-  runtime ships first (Pieces 1–6) with no camera/input surface. But the
-  **minimal first-person camera/input fidelity service is a PR8
-  prerequisite, not a post-PR8 deferral** (see contradiction resolved
-  below): retiring the three FPS coherence packs (`fps_camera_yaw_from_player_pivot`,
-  `fps_camera_pitch_inversion`, `fps_default_controls_off`) requires their
-  jobs to have a generic home *first*, or generic SimpleFPS regresses to
-  non-yawing at the moment of retirement. Scope of the minimal service is
-  capped (camera pose composition world-yaw∘local-pitch, pitch clamp,
-  recoil API, default-controls-off + body-hide + spawn-snap, rig/viewmodel
-  anchoring, read-only `CurrentCamera.CFrame`, the E2E mouse channel) — it
-  must NOT absorb movement, weapon, or CharacterController logic ("owning
-  locomotion = rebuilding Unity"). The **broader** camera/input config
-  surface (full input remapping, camera modes beyond first-person,
-  third-person follow) stays deferred past PR8.
+  runtime ships first (Pieces 1–6) with no camera/input surface. The
+  **minimal first-person camera/input fidelity service lands in PR5** — it
+  is a prerequisite of the PR5→PR7 "play correctly" gate (SimpleFPS can't
+  yaw under generic without it), NOT a post-PR8 deferral. Scope of the
+  minimal service is capped (camera pose composition world-yaw∘local-pitch,
+  pitch clamp, recoil API, default-controls-off + body-hide + spawn-snap,
+  rig/viewmodel anchoring, read-only `CurrentCamera.CFrame`, the E2E mouse
+  channel) — it must NOT absorb movement, weapon, or CharacterController
+  logic ("owning locomotion = rebuilding Unity"). The **broader**
+  camera/input config surface (full input remapping, camera modes beyond
+  first-person, third-person follow) stays deferred past PR8.
 
   **Timing contradiction (resolved).** Earlier drafts said camera/input is
-  "a generic config layer after PR8," yet PR5/PR7 require SimpleFPS
-  *playable* under generic and PR8 retires the FPS scaffolding + three FPS
-  packs that currently provide first-person fidelity. Those cannot all
-  hold: retiring the packs after their replacement leaves a non-playable
-  gap. Since generic is intended to *replace* legacy, the resolution is
-  that the minimal first-person service lands **as the retirement target of
-  PR8** (the packs/scaffolding retire *into* it), not after it.
+  "a generic config layer after PR8," yet the PR5→PR7 gate requires
+  SimpleFPS *playable* under generic and PR8 retires the FPS scaffolding +
+  FPS packs that currently provide first-person fidelity. Those cannot all
+  hold: the fidelity replacement cannot land *after* the gate that already
+  demands it. Since generic is intended to *replace* legacy, the resolution
+  is that the minimal first-person service lands **in PR5 (before the gate)**;
+  **PR8 is retirement-only** — the legacy FPS scaffolding/packs retire
+  because their jobs already moved into the PR5 service.
 - **A bundled Luau AST parser** — verifier uses lexical detection; AST
   would only sharpen edge cases, separate evaluation.
 - **In-place scene transitions (`SceneManager.LoadScene`)** — one place
