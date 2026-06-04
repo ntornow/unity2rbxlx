@@ -76,6 +76,7 @@ function SceneCameraInput.acquire()
 			_minPitch = math.rad(-80),
 			_maxPitch = math.rad(80),
 			_eyeHeight = 1.5,
+			_followChar = false,
 			_initialized = false,
 		}, SceneCameraInput)
 	end
@@ -106,6 +107,10 @@ function SceneCameraInput:configure(opts)
 	if opts.minPitch ~= nil then self._minPitch = opts.minPitch end
 	if opts.maxPitch ~= nil then self._maxPitch = opts.maxPitch end
 	if opts.eyeHeight ~= nil then self._eyeHeight = opts.eyeHeight end
+	-- Opt-in (sticky): only the identified player controller sets this true, so
+	-- non-player camera rigs (drones/turrets) keep rig-following. Assigned only
+	-- when present, so a later plain configure cannot unset it.
+	if opts.followCharacter ~= nil then self._followChar = opts.followCharacter end
 	self:_ensureInit()
 	return self
 end
@@ -116,6 +121,15 @@ function SceneCameraInput:_rigPivot()
 	if rig.GetPivot then return rig:GetPivot() end
 	if rig.CFrame then return rig.CFrame end
 	return nil
+end
+
+-- Resolve the local player character's HumanoidRootPart for the camera eye
+-- when ``followCharacter`` is set. Re-resolved each call (no stale cache) so a
+-- respawn re-follows the new HRP; nil until the character exists.
+function SceneCameraInput:_playerRoot()
+	local lp = Players.LocalPlayer
+	local char = lp and lp.Character
+	return char and char:FindFirstChild("HumanoidRootPart") or nil
 end
 
 -- One-time client setup: take authoritative camera control + FPS mouse state +
@@ -193,11 +207,18 @@ function SceneCameraInput:step(dt)
 		self._sensitivity, self._minPitch, self._maxPitch
 	)
 
-	-- Yaw the rig so the body faces the view; movement basis lives in the rig
-	-- pivot (the controller's Move reads it unchanged). Eye = rig + eyeHeight.
+	-- Eye source. When followCharacter is set and the player character exists,
+	-- follow the character's HRP for the eye ONLY (the Humanoid owns the
+	-- character CFrame -- do NOT PivotTo it, that would fight locomotion).
+	-- Otherwise keep the base behavior byte-for-byte: yaw the rig so the body
+	-- faces the view (movement basis lives in the rig pivot, which the
+	-- controller's Move reads unchanged), eye = rig + eyeHeight; else camera pos.
 	local eyePos
+	local root = self._followChar and self:_playerRoot() or nil
 	local pivot = self:_rigPivot()
-	if pivot then
+	if root then
+		eyePos = root.Position + Vector3.new(0, self._eyeHeight, 0)
+	elseif pivot then
 		local rig = self._rig
 		if rig and rig.PivotTo then
 			rig:PivotTo(CFrame.new(pivot.Position) * CFrame.Angles(0, self._yaw, 0))
