@@ -3092,7 +3092,7 @@ class TestDeepAncestorActiveInHierarchy:
                 return None
 
         result = _walk_scene(
-            scene, "ns", _Stub(), {}, None, set(),
+            scene, "ns", _Stub(), {}, None, set(), set(),
         )
         rows = {row["instance_id"]: row for row in result["instances"]}
         assert "ns:11" in rows and "ns:22" in rows

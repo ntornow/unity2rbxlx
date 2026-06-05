@@ -104,7 +104,7 @@ class TestComponentClassPredicate:
             "    public void Start() {}\n"
             "}\n"
         ))
-        modules = _build_modules_table(_index_for([entry]), set())
+        modules = _build_modules_table(_index_for([entry]), set(), set())
         assert modules[guid]["is_component_class"] is False
 
     def test_helper_class_without_hooks_is_not_component(self, tmp_path):
@@ -114,7 +114,7 @@ class TestComponentClassPredicate:
             "    public static int Compute(int a) { return a; }\n"
             "}\n"
         ))
-        modules = _build_modules_table(_index_for([entry]), set())
+        modules = _build_modules_table(_index_for([entry]), set(), set())
         assert modules[guid]["is_component_class"] is False
 
     def test_direct_monobehaviour_is_component(self, tmp_path):
@@ -123,7 +123,7 @@ class TestComponentClassPredicate:
             "    void Awake() {}\n"
             "}\n"
         ))
-        modules = _build_modules_table(_index_for([entry]), set())
+        modules = _build_modules_table(_index_for([entry]), set(), set())
         assert modules[guid]["is_component_class"] is True
 
     def test_external_base_with_lifecycle_hook_is_component(self, tmp_path):
@@ -139,7 +139,7 @@ class TestComponentClassPredicate:
             "    void Start() {}\n"
             "}\n"
         ))
-        modules = _build_modules_table(_index_for([entry]), set())
+        modules = _build_modules_table(_index_for([entry]), set(), set())
         assert modules[guid]["is_component_class"] is True
 
     def test_external_base_without_hook_is_not_component(self, tmp_path):
@@ -150,7 +150,7 @@ class TestComponentClassPredicate:
             "    public void DoStuff() {}\n"
             "}\n"
         ))
-        modules = _build_modules_table(_index_for([entry]), set())
+        modules = _build_modules_table(_index_for([entry]), set(), set())
         assert modules[guid]["is_component_class"] is False
 
 

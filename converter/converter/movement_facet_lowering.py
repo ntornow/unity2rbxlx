@@ -10,19 +10,26 @@ gravity/collision/floor (required by the ``FloorMaterial`` spawn oracle and to
 kill the unbounded sink of the collision-less rig Part).
 
 This is a *lowering pass*, NOT a coherence pack: it is deterministic, gated on
-a structural fingerprint (never ``s.name`` / per-game identity), biased to
-PRECISION over coverage (the retarget is destructive, so it abstains when the
-positive evidence is weak), and the canonical movement body is fixed here, not
-in the AI prompt. See docs/design/camera-input-fidelity-plan.md and the
-generic player-binding design.
+structure (never ``s.name`` / per-game identity), biased to PRECISION over
+coverage (the retarget is destructive, so it abstains when the positive
+evidence is weak), and the canonical movement body is fixed here, not in the AI
+prompt. See docs/design/camera-input-fidelity-plan.md and the generic
+player-binding design.
 
-Player identity (``find_player_controllers``) requires ALL THREE structural
-signals on the script's own lexer-blanked source:
-  1. a Unity ``CharacterController`` reference -- the decisive avatar signal;
-  2. a camera facet (``camera_facet_lowering._find_look_method`` matches);
-  3. a WASD method (a colon-method reading >=3 distinct WASD key codes).
-If ZERO or MORE THAN ONE script satisfies all three, NOTHING is lowered
-(fail-closed): a split- or multi-controller game abstains rather than guess.
+Player IDENTITY is NOT derived here: ``find_player_controllers`` consumes the
+deterministic UPSTREAM Unity signal -- the planner's per-module
+``has_character_controller`` flag (a script co-located with a Unity
+``CharacterController`` component, the engine-level "this is the avatar"
+signal). This replaces the former 3-signal fingerprint of the *transpiled
+output*, which abstained silently whenever the AI emitted a valid-but-different
+shape (helper-wrapped WASD, an extra yaw term in the camera CFrame), silently
+decoupling camera/movement/character. The upstream signal is robust to AI
+transpile-shape variance. Fail-closed: 0 or >1 distinct CC-scripts => [].
+
+Because identity is upstream, the WASD method LOCATOR below runs only on the
+known-player script, so it can be broad (catch helper-wrapped reads) without
+risking a cross-script false positive: a colon-method reading >=3 distinct WASD
+key codes AND carrying a locomotion side-effect.
 
 Idempotent: the lowered body calls ``getYawBasis():VectorToWorldSpace`` +
 ``Humanoid:Move``, so a re-run detects the marker and skips.
@@ -31,41 +38,32 @@ Idempotent: the lowered body calls ``getYawBasis():VectorToWorldSpace`` +
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
-from converter import camera_facet_lowering
 from converter.camera_facet_lowering import _HasLuauSource, _METHOD_RE
 from converter.runtime_contract import (
     _extract_function_body,
     _strip_strings_and_comments,
 )
 
-# CharacterController reference: ``GetComponent("CharacterController")``. The
-# class name lives inside a string literal, so the lexer-blanker nulls its
-# bytes (quotes included) -- we can't match the full call on the stripped
-# source alone. So we locate the *code-level* ``GetComponent(`` on the STRIPPED
-# source (this excludes a call sitting inside a comment/string, acceptance 7),
-# anchoring the match END just after the ``(`` (NO ``\s*`` past it, so the
-# offset is stable regardless of the blanked arg), then confirm the RAW
-# argument starting at that offset is the ``CharacterController`` literal.
-#
-# The ``(?<![A-Za-z0-9_])`` lookbehind requires a non-identifier char before
-# ``GetComponent`` so ``TryGetComponent(`` / ``FooGetComponent(`` (a longer
-# identifier that merely ENDS with ``GetComponent``) does NOT count -- only a
-# real ``:GetComponent(`` / ``.GetComponent(`` method call satisfies the
-# signal.
-_GET_COMPONENT_RE = re.compile(r"(?<![A-Za-z0-9_])GetComponent\(")
-# Optional leading whitespace AND/OR a blanked-out inline comment (the strip
-# nulls comment bytes to spaces, so on the STRIPPED source a comment between
-# ``(`` and the string is just whitespace; on the RAW source it is real
-# comment text -- but we only ever ``match`` _CC_ARG_RE against the STRIPPED
-# source's offset on the RAW source, and the literal arg's quotes survive on
-# raw). ``\s*`` already absorbs the blanked comment run on the stripped side.
-_CC_ARG_RE = re.compile(r"""\s*['"]CharacterController['"]\s*\)""")
-
-# A WASD key read: ``IsKeyDown(Enum.KeyCode.W|A|S|D)``. Counted body-wide on
-# the lexer-blanked source; >=3 *distinct* letters identifies the move method.
+# A WASD key reference: ``Enum.KeyCode.W|A|S|D``. Counted body-wide on the
+# lexer-blanked source; >=3 *distinct* letters is the move-input signal. Unlike
+# the retired identity matcher, this does NOT require an inline ``IsKeyDown(``
+# wrapper -- the AI frequently factors the reads through a helper
+# (``self:_axis(Enum.KeyCode.D, Enum.KeyCode.A)``), where the key codes still
+# appear as literal args. Since this runs only on the upstream-identified
+# player script, the broader match cannot mis-fire on a non-player script.
 _WASD_RE = re.compile(
-    r"IsKeyDown\(\s*Enum\.KeyCode\.(?P<key>[WASD])\b\s*\)",
+    r"Enum\.KeyCode\.(?P<key>[WASD])\b",
+)
+
+# A locomotion side-effect: the move method DOES something with movement
+# (drives a Humanoid / jumps / pivots the rig / reads ground state). Required
+# alongside the WASD reads so a pure-input helper (``ReadMoveInput()`` that only
+# reads keys and returns a vector) cannot steal the match from the method that
+# actually moves the character (codex adversarial finding).
+_LOCOMOTION_RE = re.compile(
+    r":Move\(|\.Jump\b|:PivotTo\(|\.FloorMaterial\b",
 )
 
 
@@ -83,6 +81,10 @@ def _wasd_method_bodies(stripped: str) -> list[tuple[int, int, str | None]]:
             continue
         keys = {mm.group("key") for mm in _WASD_RE.finditer(body)}
         if len(keys) < 3:
+            continue
+        # Require a locomotion side-effect so a pure-input helper (reads WASD,
+        # returns a vector, no movement) can't be mistaken for the move method.
+        if not _LOCOMOTION_RE.search(body):
             continue
         # First identifier in the (already-passed) arg list, if any.
         close = stripped.find(")", m.end())
@@ -106,41 +108,49 @@ def _wasd_method_body(stripped: str):
     return bodies[0]
 
 
-def _has_character_controller_ref(src: str, stripped: str) -> bool:
-    """True iff a *code-level* ``GetComponent("CharacterController")`` appears.
-    ``GetComponent(`` is located on the lexer-blanked source (so a call inside
-    a comment/string never counts); the literal arg is confirmed on the RAW
-    source at the same 1:1 offset (the strip nulls string contents)."""
-    for m in _GET_COMPONENT_RE.finditer(stripped):
-        if _CC_ARG_RE.match(src, m.end()):
-            return True
-    return False
+def _script_stem(s: _HasLuauSource) -> str:
+    """The .cs file stem for a transpiled script -- the key that joins it to a
+    planner ``SceneRuntimeModule`` (which is keyed by GUID but carries
+    ``stem``). Prefer ``source_path`` (the canonical .cs path); fall back to
+    ``output_filename`` (``<stem>.luau``)."""
+    sp = getattr(s, "source_path", "") or ""
+    if sp:
+        return Path(sp).stem
+    of = getattr(s, "output_filename", "") or ""
+    return of[:-5] if of.endswith(".luau") else of
 
 
-def _is_player_controller(s: _HasLuauSource) -> bool:
-    """True iff ``s`` satisfies ALL THREE player signals (D5). Camera facet is
-    a BOOLEAN co-signal only -- its offsets are NOT carried into the edit."""
-    src = s.luau_source or ""
-    stripped = _strip_strings_and_comments(src)
-    # 1. CharacterController ref (code-level GetComponent only).
-    if not _has_character_controller_ref(src, stripped):
-        return False
-    # 2. Camera facet (boolean co-signal; offsets intentionally discarded).
-    if camera_facet_lowering._find_look_method(stripped) is None:
-        return False
-    # 3. WASD move method.
-    if _wasd_method_body(stripped) is None:
-        return False
-    return True
+def find_player_controllers(
+    scripts: list[_HasLuauSource],
+    modules: "dict[str, dict] | None" = None,
+) -> list[_HasLuauSource]:
+    """Return the UNIQUE player-controller script identified by the
+    deterministic UPSTREAM Unity signal -- the planner module flagged
+    ``has_character_controller`` (a script co-located with a Unity
+    ``CharacterController`` on a placed GameObject) -- mapped to its transpiled
+    script by file stem. Fail-closed (``[]``) when ZERO or MORE THAN ONE
+    distinct script carries the signal (a split-/multi-controller game abstains
+    rather than guess), or when the single flagged module can't be matched to
+    exactly one transpiled script.
 
-
-def find_player_controllers(scripts: list[_HasLuauSource]) -> list[_HasLuauSource]:
-    """Return the UNIQUE script satisfying camera-facet + >=3-WASD-method +
-    CharacterController-ref (on lexer-blanked source, never ``s.name``), or
-    ``[]`` if zero or more than one match (fail-closed). Must run BEFORE
-    ``lower_camera_facet`` (which erases the camera fingerprint signal 2 relies
-    on)."""
-    matches = [s for s in scripts if _is_player_controller(s)]
+    Identity is NO LONGER a fingerprint of the transpiled output: that abstained
+    silently the moment the AI emitted a valid-but-different shape (the systemic
+    failure this fix closes). ``modules`` is ``scene_runtime["modules"]``;
+    callers without it (legacy unit harnesses) get ``[]``."""
+    if not modules:
+        return []
+    cc_modules = [
+        m for m in modules.values()
+        if isinstance(m, dict) and m.get("has_character_controller")
+    ]
+    # Unique AND exclusive: exactly one distinct CC-bearing script is the
+    # player. 0 (non-FPS) or >1 (ambiguous) => fail closed.
+    if len(cc_modules) != 1:
+        return []
+    stem = cc_modules[0].get("stem") or ""
+    if not stem:
+        return []
+    matches = [s for s in scripts if _script_stem(s) == stem]
     if len(matches) != 1:
         return []
     return matches

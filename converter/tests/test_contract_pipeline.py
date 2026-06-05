@@ -220,8 +220,13 @@ class TestApplyRequireResolutions:
             reason="ok",
         )]
         _apply_require_resolutions([script], resolutions)
+        # The dotted service root is lowered to a self-contained
+        # game:GetService(...) expression -- a bare ``require(ReplicatedStorage
+        # .Foo)`` references an unbound global at module scope (the HudControl
+        # crash).
         assert script.luau_source == (
-            'local F = require(ReplicatedStorage.Foo)\nreturn {}\n'
+            'local F = require(game:GetService("ReplicatedStorage").Foo)\n'
+            'return {}\n'
         )
         assert "@scene_runtime" not in script.luau_source
 
@@ -265,8 +270,8 @@ class TestApplyRequireResolutions:
             RequireResolution("Foo.cs", "B", "ServerScriptService.B", "ok"),
         ]
         _apply_require_resolutions([script], resolutions)
-        assert "require(ReplicatedStorage.A)" in script.luau_source
-        assert "require(ServerScriptService.B)" in script.luau_source
+        assert 'require(game:GetService("ReplicatedStorage").A)' in script.luau_source
+        assert 'require(game:GetService("ServerScriptService").B)' in script.luau_source
         assert "@scene_runtime" not in script.luau_source
 
     def test_single_quotes_handled(self):
@@ -281,8 +286,45 @@ class TestApplyRequireResolutions:
             reason="ok",
         )]
         _apply_require_resolutions([script], resolutions)
-        assert "require(ReplicatedStorage.Foo)" in script.luau_source
+        assert 'require(game:GetService("ReplicatedStorage").Foo)' in script.luau_source
         assert "@scene_runtime" not in script.luau_source
+
+
+class TestServiceRootedRequireTarget:
+    """The dotted-path -> game:GetService(...) lowering that prevents an unbound
+    global at a top-level require (HudControl/HostilePlane/Explosive crash)."""
+
+    def test_bare_service_root_is_lowered(self):
+        from converter.contract_pipeline import _service_rooted_require_target
+        assert _service_rooted_require_target("ReplicatedStorage.Player") == (
+            'game:GetService("ReplicatedStorage").Player'
+        )
+        assert _service_rooted_require_target("ServerStorage.Foo") == (
+            'game:GetService("ServerStorage").Foo'
+        )
+
+    def test_nested_starterplayer_path(self):
+        from converter.contract_pipeline import _service_rooted_require_target
+        # StarterPlayer is the service; StarterPlayerScripts is its child.
+        assert _service_rooted_require_target(
+            "StarterPlayer.StarterPlayerScripts.Ctrl"
+        ) == 'game:GetService("StarterPlayer").StarterPlayerScripts.Ctrl'
+
+    def test_already_an_expression_is_unchanged(self):
+        from converter.contract_pipeline import (
+            _container_lookup_expr,
+            _service_rooted_require_target,
+        )
+        expr = _container_lookup_expr("Foo")
+        assert _service_rooted_require_target(expr) == expr
+        rooted = 'game:GetService("ReplicatedStorage").Bar'
+        assert _service_rooted_require_target(rooted) == rooted
+
+    def test_unknown_root_is_unchanged(self):
+        from converter.contract_pipeline import _service_rooted_require_target
+        # A non-service dotted root (e.g. a module already under a local) is not
+        # rewritten -- only known service roots are lowered.
+        assert _service_rooted_require_target("SomeLocal.Mod") == "SomeLocal.Mod"
 
 
 # ---------------------------------------------------------------------------

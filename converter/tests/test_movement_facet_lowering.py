@@ -1,15 +1,17 @@
 """Tests for the movement-facet lowering pass (generic allowlist).
 
-Identifies the unique player controller (camera-facet + WASD method +
-CharacterController ref) and whole-body-replaces its WASD movement onto the
-character's Humanoid:Move; parameterizes the camera pass to emit
-``followCharacter = true`` for that script. Structure-gated, deterministic,
-idempotent, fail-closed on ambiguity.
+Player IDENTITY comes from the deterministic UPSTREAM Unity signal -- the
+planner's per-module ``has_character_controller`` flag (a script co-located
+with a Unity ``CharacterController``), NOT a fingerprint of the transpiled
+output. Once identified, the WASD move method is LOCATED within that one script
+(>=3 distinct ``Enum.KeyCode.WASD`` refs -- inline OR helper-wrapped -- plus a
+locomotion side-effect) and whole-body-replaced onto the character's
+``Humanoid:Move``; the camera pass emits ``followCharacter = true`` for it.
 
-Fixtures use the VERBATIM daa09e post-transpile shape (Awake + Move) and the
-adversarial bypass cases, exercised through the REAL
-find_player_controllers -> lower_camera_facet -> lower_movement_facet ordering
-(not synthetic isolation).
+Fixtures cover BOTH the strict daa09e shape AND the real dde248 shape that
+defeated the retired fingerprint (helper-wrapped ``_axis(Enum.KeyCode.D, ...)``
+WASD + an extra yaw term in the camera CFrame), exercised through the REAL
+find_player_controllers -> lower_camera_facet -> lower_movement_facet ordering.
 """
 
 from __future__ import annotations
@@ -33,18 +35,42 @@ from converter.movement_facet_lowering import (  # noqa: E402
 
 
 class _S:
-    """Minimal TranspiledScript stand-in (carries ``luau_source``)."""
+    """Minimal TranspiledScript stand-in. ``source_path`` is what joins the
+    script to its planner module (by file stem); ``name`` is present to PROVE
+    identification never reads it (identity is the upstream module flag)."""
 
     def __init__(self, src: str, name: str = "Player") -> None:
         self.luau_source = src
-        # ``name`` is present to PROVE detection never reads it (signals are
-        # structural). A misleading name must not change identification.
         self.name = name
+        self.source_path = f"Assets/{name}.cs"
+        self.output_filename = f"{name}.luau"
 
 
-# --- Verbatim daa09e shapes ------------------------------------------------
+def _row(stem: str, has_cc: bool) -> dict:
+    return {
+        "stem": stem,
+        "class_name": stem,
+        "runtime_bearing": True,
+        "is_component_class": True,
+        "character_attached": False,
+        "is_loader": False,
+        "has_character_controller": has_cc,
+    }
 
-# Awake (Player.luau:83-96) -- carries GetComponent("CharacterController").
+
+def _modules(cc: tuple[str, ...] = (), plain: tuple[str, ...] = ()) -> dict:
+    """Build a ``scene_runtime.modules`` dict: ``cc`` stems carry the upstream
+    CharacterController flag (player candidates); ``plain`` stems do not."""
+    mods: dict[str, dict] = {}
+    for stem in cc:
+        mods[f"guid-{stem}"] = _row(stem, has_cc=True)
+    for stem in plain:
+        mods[f"guid-{stem}"] = _row(stem, has_cc=False)
+    return mods
+
+
+# --- Verbatim daa09e shapes (strict camera shape) --------------------------
+
 _AWAKE = textwrap.dedent("""\
     function Player:Awake()
         Player.instance = self.gameObject
@@ -55,8 +81,7 @@ _AWAKE = textwrap.dedent("""\
     end
 """)
 
-# Rotate (the camera-facet look method, PRE-lowering -- the flattened FPS
-# fingerprint _find_look_method matches: yaw-only body turn + pitch-only cam).
+# Rotate -- strict flattened FPS shape (yaw-only body turn + pitch-only cam).
 _ROTATE = textwrap.dedent("""\
     function Player:Rotate(dt)
         local UIS = game:GetService("UserInputService")
@@ -72,8 +97,7 @@ _ROTATE = textwrap.dedent("""\
     end
 """)
 
-# Move (Player.luau:143-179) verbatim -- WASD nested in ``if grounded``,
-# ``local disp`` then ``self.gameObject:PivotTo(self.gameObject:GetPivot() + disp)``.
+# Move -- WASD inline, ``self.gameObject:PivotTo`` locomotion.
 _MOVE = textwrap.dedent("""\
     function Player:Move(dt)
         local UIS = game:GetService("UserInputService")
@@ -113,17 +137,88 @@ def _player_src() -> str:
     )
 
 
+# --- The REAL dde248 shape that defeated the retired fingerprint -----------
+
+# Rotate -- the AI emitted an extra ``(basePivot - basePivot.Position)`` yaw
+# term between CFrame.new and CFrame.Angles, defeating the strict _CAM_PITCH_RE.
+# The broadened locator keys on GetMouseDelta() + camera ownership instead.
+_REAL_ROTATE = textwrap.dedent("""\
+    function Player:Rotate(dt)
+        local mouseDelta = self.uis:GetMouseDelta()
+        local yaw = self.sensitivity * dt * mouseDelta.X
+        self.gameObject:PivotTo(self.gameObject:GetPivot() * CFrame.Angles(0, -math.rad(yaw), 0))
+        local x = self.camRotation.X - mouseDelta.Y * self.sensitivity * dt
+        x = math.clamp(x, self.minAngle, self.maxAngle)
+        self.camRotation = Vector3.new(x, 0, 0)
+        local cam = workspace.CurrentCamera
+        if cam then
+            cam.CameraType = Enum.CameraType.Scriptable
+            local basePivot = self.gameObject:GetPivot()
+            cam.CFrame = CFrame.new(basePivot.Position) * (basePivot - basePivot.Position) * CFrame.Angles(-math.rad(x), 0, 0)
+        end
+    end
+""")
+
+# Move -- WASD factored through ``self:_axis(Enum.KeyCode.D, Enum.KeyCode.A)``
+# helpers (zero inline IsKeyDown literals), drives the Humanoid directly.
+_REAL_MOVE = textwrap.dedent("""\
+    function Player:Move(dt)
+        local humanoid = self.control
+        if not humanoid then
+            return
+        end
+        local grounded = humanoid.FloorMaterial ~= Enum.Material.Air
+        if grounded then
+            local h = self:_axis(Enum.KeyCode.D, Enum.KeyCode.A)
+            local v = self:_axis(Enum.KeyCode.W, Enum.KeyCode.S)
+            local localDir = Vector3.new(h, 0, -v)
+            self.moveDirection = self.gameObject:GetPivot():VectorToWorldSpace(localDir)
+            if self:_keyDown(Enum.KeyCode.Space) then
+                humanoid.Jump = true
+            end
+        end
+        if self.moveDirection.Magnitude > 0 then
+            humanoid:Move(self.moveDirection.Unit, false)
+        else
+            humanoid:Move(Vector3.zero, false)
+        end
+    end
+""")
+
+# The _axis / _keyDown helpers read keys through a VARIABLE -- they must NOT be
+# mistaken for the move method (no literal KeyCode refs, no locomotion).
+_HELPERS = textwrap.dedent("""\
+    function Player:_axis(posCode, negCode)
+        local a = 0
+        if self.uis:IsKeyDown(posCode) then a = a + 1 end
+        if self.uis:IsKeyDown(negCode) then a = a - 1 end
+        return a
+    end
+
+    function Player:_keyDown(code)
+        return self.uis:IsKeyDown(code)
+    end
+""")
+
+
+def _real_player_src() -> str:
+    return (
+        "local Player = {}\nPlayer.__index = Player\n\n"
+        + _AWAKE + "\n" + _REAL_ROTATE + "\n" + _REAL_MOVE + "\n" + _HELPERS
+        + "\nreturn Player\n"
+    )
+
+
 class TestPositive:
     def test_find_camera_movement_ordering(self) -> None:
-        """(1/10) Real find -> camera -> movement ordering on the daa09e shape."""
+        """Real identify -> camera -> movement ordering on the daa09e shape."""
         s = _S(_player_src())
         scripts = [s]
+        modules = _modules(cc=("Player",))
 
-        # 1. Identify the player (pre-lowering, camera fingerprint intact).
-        players = find_player_controllers(scripts)
+        players = find_player_controllers(scripts, modules)
         assert players == [s]
 
-        # 2. Camera lowering with follow=players emits followCharacter=true.
         assert lower_camera_facet(scripts, follow_character_paths=players) == 1
         assert (
             "self._cam:configure({rig = self.gameObject, followCharacter = true})"
@@ -131,22 +226,19 @@ class TestPositive:
         )
         assert ":step(dt)" in s.luau_source
 
-        # 3. Movement lowering replaces Move with the Humanoid:Move body.
         assert lower_movement_facet(players) == 1
         src = s.luau_source
         assert 'char:FindFirstChildOfClass("Humanoid")' in src
         assert "self._cam:getYawBasis():VectorToWorldSpace(Vector3.new(h, 0, -v))" in src
         assert "hum:Move(dir.Unit, false)" in src
         assert "hum:Move(Vector3.zero, false)" in src
-        # The vestigial rig PivotTo displacement is gone from Move.
         assert "self.gameObject:PivotTo(self.gameObject:GetPivot() + disp)" not in src
-        # Method header + param preserved.
         assert "function Player:Move(dt)" in src
 
     def test_lowered_move_has_lazy_cam_acquire_with_follow(self) -> None:
-        """(8) Lowered Move carries the lazy _cam acquire w/ followCharacter=true."""
+        """Lowered Move carries the lazy _cam acquire w/ followCharacter=true."""
         s = _S(_player_src())
-        players = find_player_controllers([s])
+        players = find_player_controllers([s], _modules(cc=("Player",)))
         lower_movement_facet(players)
         src = s.luau_source
         assert "if not self._cam then" in src
@@ -159,56 +251,73 @@ class TestPositive:
             in src
         )
 
-    def test_alias_displacement_still_lowered(self) -> None:
-        """(6) A player Move using a local ``pivot`` var IS lowered (detection
-        is by WASD reads, not the PivotTo literal)."""
-        alias_move = textwrap.dedent("""\
-            function Player:Move(dt)
-                local UIS = game:GetService("UserInputService")
-                local h = 0
-                if UIS:IsKeyDown(Enum.KeyCode.D) then h = h + 1 end
-                if UIS:IsKeyDown(Enum.KeyCode.A) then h = h - 1 end
-                local v = 0
-                if UIS:IsKeyDown(Enum.KeyCode.W) then v = v + 1 end
-                if UIS:IsKeyDown(Enum.KeyCode.S) then v = v - 1 end
-                local pivot = self.gameObject:GetPivot()
-                local disp = Vector3.new(h, 0, v)
-                self.gameObject:PivotTo(pivot + disp)
-            end
-        """)
-        src = (
-            "local Player = {}\nPlayer.__index = Player\n\n"
-            + _AWAKE + "\n" + _ROTATE + "\n" + alias_move + "\nreturn Player\n"
-        )
-        s = _S(src)
-        players = find_player_controllers([s])
+
+class TestRealShape:
+    """The dde248 shape that defeated the retired transpiled-output fingerprint:
+    helper-wrapped WASD + an extra yaw term in the camera CFrame. Upstream
+    identity + broadened locators must bind it END TO END."""
+
+    def test_real_shape_binds_camera_and_movement(self) -> None:
+        s = _S(_real_player_src())
+        scripts = [s]
+        modules = _modules(cc=("Player",))
+
+        # Upstream identity (NOT the transpiled fingerprint) selects the player.
+        players = find_player_controllers(scripts, modules)
         assert players == [s]
+
+        # Broadened camera locator finds Rotate despite the extra yaw term.
+        assert lower_camera_facet(scripts, follow_character_paths=players) == 1
+        assert (
+            "self._cam:configure({rig = self.gameObject, followCharacter = true})"
+            in s.luau_source
+        )
+        assert "self._cam:step(dt)" in s.luau_source
+        # The AI's camera math (extra yaw term) is gone -- routed to the service.
+        assert "(basePivot - basePivot.Position)" not in s.luau_source
+
+        # Broadened move locator finds Move despite helper-wrapped WASD.
         assert lower_movement_facet(players) == 1
-        assert "hum:Move(dir.Unit, false)" in s.luau_source
-        assert "self.gameObject:PivotTo(pivot + disp)" not in s.luau_source
+        src = s.luau_source
+        assert "hum:Move(dir.Unit, false)" in src
+        # The _axis/_keyDown helpers (no literal KeyCode, no locomotion) are
+        # untouched -- only the real move method was replaced.
+        assert "function Player:_axis(posCode, negCode)" in src
+        assert "function Player:_keyDown(code)" in src
+
+    def test_helper_is_not_mistaken_for_move_method(self) -> None:
+        """A pure-input helper (reads keys via a variable, no literal WASD, no
+        locomotion) must never be the located move method."""
+        # A script whose ONLY KeyCode literals live in _axis args inside Move,
+        # plus the helpers -> exactly ONE move method (Move), helpers excluded.
+        s = _S(_real_player_src())
+        players = find_player_controllers([s], _modules(cc=("Player",)))
+        assert lower_movement_facet(players) == 1
+        # _keyDown still returns the raw IsKeyDown read (untouched).
+        assert "return self.uis:IsKeyDown(code)" in s.luau_source
 
 
 class TestIdempotency:
     def test_twice_call_is_noop(self) -> None:
-        """(2) A second pass over the lowered source modifies 0 scripts."""
         s = _S(_player_src())
-        players = find_player_controllers([s])
+        players = find_player_controllers([s], _modules(cc=("Player",)))
         assert lower_movement_facet(players) == 1
         once = s.luau_source
-        # Re-identify on the lowered source + re-lower -> 0.
         assert lower_movement_facet(players) == 0
         assert s.luau_source == once
         assert once.count("hum:Move(dir.Unit, false)") == 1
 
+    def test_real_shape_twice_call_is_noop(self) -> None:
+        s = _S(_real_player_src())
+        players = find_player_controllers([s], _modules(cc=("Player",)))
+        assert lower_movement_facet(players) == 1
+        once = s.luau_source
+        assert lower_movement_facet(players) == 0
+        assert s.luau_source == once
+
     def test_idempotency_is_method_scoped_not_file_global(self) -> None:
-        """(Codex P2) An unrelated ``:Move(`` call ELSEWHERE in the file must
-        NOT suppress a needed first lowering. The pre-fix file-global guard
-        (`getYawBasis():VectorToWorldSpace` + any `:Move(` anywhere ->
-        early-return) would false-skip; the method-scoped guard lowers
-        correctly because the WASD method's OWN body has neither marker yet."""
-        # An UNLOWERED player whose Awake has a stray ``:Move(`` AND a stray
-        # ``getYawBasis():VectorToWorldSpace`` (e.g. from some other helper) --
-        # together they would trip a file-global idempotency scan.
+        """An unrelated ``:Move(`` ELSEWHERE must not suppress a needed first
+        lowering (method-scoped idempotency)."""
         decoy_awake = textwrap.dedent("""\
             function Player:Awake()
                 Player.instance = self.gameObject
@@ -223,84 +332,81 @@ class TestIdempotency:
             + decoy_awake + "\n" + _ROTATE + "\n" + _MOVE + "\nreturn Player\n"
         )
         s = _S(src)
-        players = find_player_controllers([s])
+        players = find_player_controllers([s], _modules(cc=("Player",)))
         assert players == [s]
-        # Method-scoped: the WASD Move body has no markers yet -> lowered.
         assert lower_movement_facet(players) == 1
         assert "hum:Move(dir.Unit, false)" in s.luau_source
-        # The decoy lines in Awake are untouched (only Move's body changed).
         assert "self.other:Move(basis)" in s.luau_source
 
 
-class TestNegative:
-    def test_vehicle_not_identified(self) -> None:
-        """(3) A Jeep:Move (WASD + self PivotTo, NO camera facet, NO
-        CharacterController) is not identified or lowered."""
-        jeep = textwrap.dedent("""\
-            local Jeep = {}
-            Jeep.__index = Jeep
+class TestUpstreamIdentity:
+    """Identity is the upstream ``has_character_controller`` module flag, mapped
+    to the transpiled script by stem -- never the transpiled-output shape."""
 
-            function Jeep:Move(dt)
-                local UIS = game:GetService("UserInputService")
-                local h = 0
-                if UIS:IsKeyDown(Enum.KeyCode.D) then h = h + 1 end
-                if UIS:IsKeyDown(Enum.KeyCode.A) then h = h - 1 end
-                local v = 0
-                if UIS:IsKeyDown(Enum.KeyCode.W) then v = v + 1 end
-                if UIS:IsKeyDown(Enum.KeyCode.S) then v = v - 1 end
-                local disp = Vector3.new(h, 0, v)
-                self.gameObject:PivotTo(self.gameObject:GetPivot() + disp)
-            end
-
-            return Jeep
-        """)
-        s = _S(jeep, name="Jeep")
-        before = s.luau_source
-        # Not identified -> the movement pass (driven by find's output) is a no-op.
+    def test_no_modules_abstains(self) -> None:
+        """Without the upstream signal there is no player (legacy harness)."""
+        s = _S(_player_src())
         assert find_player_controllers([s]) == []
-        assert lower_movement_facet(find_player_controllers([s])) == 0
-        assert s.luau_source == before
+        assert find_player_controllers([s], {}) == []
 
-    def test_drone_not_a_player(self) -> None:
-        """(4) Camera facet + WASD but NO CharacterController -> not a player;
-        movement untouched; followCharacter NOT emitted."""
-        drone_move = textwrap.dedent("""\
-            function Drone:Move(dt)
-                local UIS = game:GetService("UserInputService")
-                local h = 0
-                if UIS:IsKeyDown(Enum.KeyCode.D) then h = h + 1 end
-                if UIS:IsKeyDown(Enum.KeyCode.A) then h = h - 1 end
-                local v = 0
-                if UIS:IsKeyDown(Enum.KeyCode.W) then v = v + 1 end
-                if UIS:IsKeyDown(Enum.KeyCode.S) then v = v - 1 end
-                self.gameObject:PivotTo(self.gameObject:GetPivot() + Vector3.new(h, 0, v))
-            end
-        """)
-        # Camera facet present (Rotate), WASD present, but NO CharacterController.
-        rotate = _ROTATE.replace("Player:Rotate", "Drone:Rotate")
+    def test_unflagged_script_not_identified(self) -> None:
+        """A perfect-looking FPS controller that the planner did NOT flag (no
+        CharacterController on its GameObject) is not the player."""
+        s = _S(_player_src())
+        assert find_player_controllers([s], _modules(plain=("Player",))) == []
+        assert lower_movement_facet(
+            find_player_controllers([s], _modules(plain=("Player",)))
+        ) == 0
+        assert "hum:Move" not in s.luau_source
+
+    def test_two_cc_modules_fail_closed(self) -> None:
+        """Two distinct scripts flagged CharacterController -> ambiguous -> []
+        (one-camera-per-client; never guess)."""
+        a = _S(_player_src(), name="PlayerA")
+        b = _S(_player_src(), name="PlayerB")
+        modules = _modules(cc=("PlayerA", "PlayerB"))
+        assert find_player_controllers([a, b], modules) == []
+        assert lower_movement_facet(find_player_controllers([a, b], modules)) == 0
+        assert "hum:Move" not in a.luau_source
+        assert "hum:Move" not in b.luau_source
+
+    def test_flagged_module_with_no_matching_script_abstains(self) -> None:
+        """The CC-flagged module's stem doesn't match any transpiled script ->
+        fail closed (the pipeline surfaces player_unresolved)."""
+        s = _S(_player_src(), name="Player")
+        # Flag a DIFFERENT stem than the only script present.
+        assert find_player_controllers([s], _modules(cc=("OtherCtrl",))) == []
+
+    def test_name_is_never_read_for_identity(self) -> None:
+        """A misleadingly-named script is still identified purely by the upstream
+        flag matched on its source-path stem."""
+        s = _S(_player_src(), name="TotallyNotThePlayer")
+        # The module stem matches the source-path stem, not the .name attr.
+        players = find_player_controllers([s], _modules(cc=("TotallyNotThePlayer",)))
+        assert players == [s]
+
+
+class TestNonPlayerCamera:
+    def test_drone_camera_lowers_without_follow_when_no_player(self) -> None:
+        """A non-player camera rig (no CharacterController) still routes its look
+        method to the service, but followCharacter is omitted (no player)."""
+        drone_rotate = _ROTATE.replace("Player:Rotate", "Drone:Rotate")
         src = (
             "local Drone = {}\nDrone.__index = Drone\n\n"
-            + rotate + "\n" + drone_move + "\nreturn Drone\n"
+            + drone_rotate + "\nreturn Drone\n"
         )
         s = _S(src, name="Drone")
         scripts = [s]
-        players = find_player_controllers(scripts)
+        players = find_player_controllers(scripts, _modules(plain=("Drone",)))
         assert players == []
-        # Camera still lowers (drone is a camera rig) but followCharacter stays false.
         assert lower_camera_facet(scripts, follow_character_paths=players) == 1
-        assert "followCharacter = true" not in s.luau_source
+        assert "followCharacter" not in s.luau_source
         assert "self._cam:configure({rig = self.gameObject})" in s.luau_source
-        # Movement untouched.
-        assert lower_movement_facet(players) == 0
-        assert "hum:Move" not in s.luau_source
 
     def test_nonplayer_camera_emits_followfalse_when_player_exists(self) -> None:
-        """Phase-review stickiness fix: when a conversion has BOTH a player and a
-        non-player camera (drone), the drone's configure emits
-        ``followCharacter = false`` (explicit) so it can never inherit a stale
-        singleton ``true`` from the player. The player emits ``true``. (When NO
-        player exists the drone still omits the key — byte-identical — covered by
-        test_drone_not_a_player.)"""
+        """When a conversion has BOTH a player and a non-player camera, the
+        drone's configure emits an EXPLICIT followCharacter = false so it can't
+        inherit a stale singleton true; the player emits true."""
         drone_rotate = _ROTATE.replace("Player:Rotate", "Drone:Rotate")
         drone_src = (
             "local Drone = {}\nDrone.__index = Drone\n\n" + drone_rotate + "\nreturn Drone\n"
@@ -309,137 +415,36 @@ class TestNegative:
         drone = _S(drone_src, name="Drone")
         scripts = [player, drone]
 
-        players = find_player_controllers(scripts)
+        players = find_player_controllers(scripts, _modules(cc=("Player",), plain=("Drone",)))
         assert players == [player]
 
-        # Both camera-facet scripts lower; the flag is deterministic per script.
         assert lower_camera_facet(scripts, follow_character_paths=players) == 2
         assert "self._cam:configure({rig = self.gameObject, followCharacter = true})" in player.luau_source
         assert "self._cam:configure({rig = self.gameObject, followCharacter = false})" in drone.luau_source
-        # The drone must NOT carry true and must NOT silently omit the flag here.
         assert "followCharacter = true" not in drone.luau_source
-        assert "self._cam:configure({rig = self.gameObject})" not in drone.luau_source
 
-    def test_two_candidates_fail_closed(self) -> None:
-        """(5) TWO all-three scripts -> [] (fail-closed)."""
-        a = _S(_player_src(), name="PlayerA")
-        b = _S(_player_src(), name="PlayerB")
-        scripts = [a, b]
-        assert find_player_controllers(scripts) == []
-        # Nothing lowered for movement.
-        assert lower_movement_facet(find_player_controllers(scripts)) == 0
-        assert "hum:Move" not in a.luau_source
-        assert "hum:Move" not in b.luau_source
-
-    def test_split_controller_fail_closed(self) -> None:
-        """(5) Camera facet in script A, WASD in script B -> [] (no all-three
-        single script)."""
-        # Script A: camera facet + CharacterController, NO WASD method.
-        cam_only = (
-            "local CamCtl = {}\nCamCtl.__index = CamCtl\n\n"
-            + _AWAKE.replace("Player:Awake", "CamCtl:Awake")
-            + "\n" + _ROTATE.replace("Player:Rotate", "CamCtl:Rotate")
-            + "\nreturn CamCtl\n"
-        )
-        # Script B: WASD + CharacterController, NO camera facet.
-        wasd_only = textwrap.dedent("""\
-            local Mover = {}
-            Mover.__index = Mover
-
-            function Mover:Awake()
-                self.control = self:GetComponent("CharacterController")
-            end
-
-            function Mover:Move(dt)
-                local UIS = game:GetService("UserInputService")
-                local h = 0
-                if UIS:IsKeyDown(Enum.KeyCode.D) then h = h + 1 end
-                if UIS:IsKeyDown(Enum.KeyCode.A) then h = h - 1 end
-                local v = 0
-                if UIS:IsKeyDown(Enum.KeyCode.W) then v = v + 1 end
-                if UIS:IsKeyDown(Enum.KeyCode.S) then v = v - 1 end
-                self.gameObject:PivotTo(self.gameObject:GetPivot() + Vector3.new(h, 0, v))
-            end
-
-            return Mover
-        """)
-        a = _S(cam_only, name="CamCtl")
-        b = _S(wasd_only, name="Mover")
-        scripts = [a, b]
-        assert find_player_controllers(scripts) == []
-        assert lower_movement_facet(find_player_controllers(scripts)) == 0
-
-    def test_character_controller_in_comment_not_counted(self) -> None:
-        """(7) A CharacterController ref ONLY inside a comment does NOT count,
-        even with a real camera facet + real WASD method present (the
-        CharacterController gate is the sole signal that fails)."""
-        awake_commented_cc = textwrap.dedent("""\
-            function Player:Awake()
-                -- self:GetComponent("CharacterController") would go here someday
-                self.cam = workspace.CurrentCamera
-            end
-        """)
+    def test_nonplayer_camera_keeps_strict_shape(self) -> None:
+        """The broadened look locator is player-scoped: a NON-player script with
+        a broadened-only camera shape (GetMouseDelta + extra yaw term, no strict
+        pitch rebuild) is NOT lowered -- avoids false positives like a cutscene
+        camera in some other controller's Awake."""
+        broad_only = _REAL_ROTATE.replace("Player:Rotate", "Drone:Look")
         src = (
-            "local Player = {}\nPlayer.__index = Player\n\n"
-            + awake_commented_cc + "\n" + _ROTATE + "\n" + _MOVE + "\nreturn Player\n"
+            "local Drone = {}\nDrone.__index = Drone\n\n" + broad_only + "\nreturn Drone\n"
         )
-        s = _S(src, name="Player")
+        s = _S(src, name="Drone")
         before = s.luau_source
-        # Real camera facet + real WASD, but CharacterController only commented.
-        assert find_player_controllers([s]) == []
-        assert lower_movement_facet(find_player_controllers([s])) == 0
+        # No player; drone uses the STRICT locator, which the broadened-only
+        # shape does not match -> untouched.
+        assert lower_camera_facet([s], follow_character_paths=[]) == 0
         assert s.luau_source == before
 
-    def test_wasd_in_string_not_counted(self) -> None:
-        """(7) WASD reads ONLY inside a string do NOT count toward the move
-        method (real CharacterController + camera facet present)."""
-        fake_move = textwrap.dedent("""\
-            function Player:Move(dt)
-                local doc = "IsKeyDown(Enum.KeyCode.W) Enum.KeyCode.A Enum.KeyCode.S Enum.KeyCode.D"
-                return doc
-            end
-        """)
-        src = (
-            "local Player = {}\nPlayer.__index = Player\n\n"
-            + _AWAKE + "\n" + _ROTATE + "\n" + fake_move + "\nreturn Player\n"
-        )
-        s = _S(src, name="Player")
-        before = s.luau_source
-        # CharacterController (Awake) + camera facet (Rotate) real, but the only
-        # WASD reads are inside a string literal -> no WASD method -> not a player.
-        assert find_player_controllers([s]) == []
-        assert lower_movement_facet(find_player_controllers([s])) == 0
-        assert s.luau_source == before
 
-    def test_try_get_component_does_not_satisfy_cc_signal(self) -> None:
-        """(Codex P2) ``self:TryGetComponent("CharacterController")`` must NOT
-        satisfy the CharacterController signal -- the anchored regex requires a
-        non-identifier char before ``GetComponent(`` so the longer identifier
-        ``TryGetComponent`` (ending in ``GetComponent``) does not match. With a
-        real camera facet + real WASD present, the CC gate is the sole failing
-        signal, so the script is not a player and nothing is lowered."""
-        awake_try = textwrap.dedent("""\
-            function Player:Awake()
-                Player.instance = self.gameObject
-                self.control = self:TryGetComponent("CharacterController")
-                self.cam = workspace.CurrentCamera
-            end
-        """)
-        src = (
-            "local Player = {}\nPlayer.__index = Player\n\n"
-            + awake_try + "\n" + _ROTATE + "\n" + _MOVE + "\nreturn Player\n"
-        )
-        s = _S(src, name="Player")
-        before = s.luau_source
-        assert find_player_controllers([s]) == []
-        assert lower_movement_facet(find_player_controllers([s])) == 0
-        assert s.luau_source == before
-
-    def test_two_wasd_methods_fail_closed(self) -> None:
-        """(Codex P2) A script with TWO colon-methods each reading >=3 distinct
-        WASD keys is ambiguous -> fail closed: not identified as a player and
-        not lowered (consistent with abstain-on-ambiguity)."""
-        second_wasd = textwrap.dedent("""\
+class TestMoveLocatorFailClosed:
+    def test_two_move_methods_fail_closed(self) -> None:
+        """An identified player with TWO colon-methods each reading >=3 WASD keys
+        + locomotion is ambiguous -> the move locator abstains (0 lowered)."""
+        second = textwrap.dedent("""\
             function Player:MoveAlt(dt)
                 local UIS = game:GetService("UserInputService")
                 local h = 0
@@ -453,26 +458,69 @@ class TestNegative:
         """)
         src = (
             "local Player = {}\nPlayer.__index = Player\n\n"
-            + _AWAKE + "\n" + _ROTATE + "\n" + _MOVE + "\n" + second_wasd
+            + _AWAKE + "\n" + _ROTATE + "\n" + _MOVE + "\n" + second
             + "\nreturn Player\n"
         )
-        s = _S(src, name="Player")
-        before = s.luau_source
-        # Two WASD methods -> ambiguous -> not a player.
-        assert find_player_controllers([s]) == []
-        assert lower_movement_facet(find_player_controllers([s])) == 0
-        # Even if a caller force-passed the script, lowering refuses (fail-closed).
+        s = _S(src)
+        players = find_player_controllers([s], _modules(cc=("Player",)))
+        assert players == [s]
+        assert lower_movement_facet(players) == 0
+        # Even force-passed, lowering refuses on the ambiguous shape.
         assert lower_movement_facet([s]) == 0
+
+    def test_wasd_only_in_string_not_located(self) -> None:
+        """An identified player whose only WASD reads are inside a string literal
+        has no locatable move method (the locator scans lexer-blanked source)."""
+        fake_move = textwrap.dedent("""\
+            function Player:Move(dt)
+                local doc = "Enum.KeyCode.W Enum.KeyCode.A Enum.KeyCode.S Enum.KeyCode.D :Move("
+                return doc
+            end
+        """)
+        src = (
+            "local Player = {}\nPlayer.__index = Player\n\n"
+            + _AWAKE + "\n" + _ROTATE + "\n" + fake_move + "\nreturn Player\n"
+        )
+        s = _S(src)
+        before = s.luau_source
+        players = find_player_controllers([s], _modules(cc=("Player",)))
+        assert players == [s]
+        assert lower_movement_facet(players) == 0
+        assert s.luau_source == before
+
+    def test_pure_input_helper_not_located(self) -> None:
+        """A method that reads >=3 WASD keys but has NO locomotion side-effect (a
+        pure input reader) is not the move method -- the locomotion gate excludes
+        it, so a player with only such a method abstains."""
+        reader = textwrap.dedent("""\
+            function Player:ReadMoveInput()
+                local h = 0
+                if self.uis:IsKeyDown(Enum.KeyCode.D) then h = h + 1 end
+                if self.uis:IsKeyDown(Enum.KeyCode.A) then h = h - 1 end
+                local v = 0
+                if self.uis:IsKeyDown(Enum.KeyCode.W) then v = v + 1 end
+                if self.uis:IsKeyDown(Enum.KeyCode.S) then v = v - 1 end
+                return Vector3.new(h, 0, v)
+            end
+        """)
+        src = (
+            "local Player = {}\nPlayer.__index = Player\n\n"
+            + _AWAKE + "\n" + _ROTATE + "\n" + reader + "\nreturn Player\n"
+        )
+        s = _S(src)
+        before = s.luau_source
+        players = find_player_controllers([s], _modules(cc=("Player",)))
+        assert players == [s]
+        # No locomotion side-effect anywhere -> no move method located.
+        assert lower_movement_facet(players) == 0
         assert s.luau_source == before
 
 
-# --- Pipeline-invocation integration (acceptance #10) -----------------------
+# --- Pipeline-invocation integration ---------------------------------------
 
 
 class _PInfo:
-    """Minimal ``ScriptInfo`` stand-in for ``transpile_with_contract`` --
-    it reads only ``path``, ``class_name`` (via the planner join) and
-    ``referenced_types`` (unused here)."""
+    """Minimal ``ScriptInfo`` stand-in for ``transpile_with_contract``."""
 
     def __init__(self, path: Path, class_name: str) -> None:
         self.path = path
@@ -481,40 +529,27 @@ class _PInfo:
 
 
 class TestPipelineInvocation:
-    """Drives the REAL ``contract_pipeline.transpile_with_contract`` (not the
-    three lowering functions called by hand) so that a future edit deleting
-    the ``find_player_controllers -> lower_camera_facet(follow=...) ->
-    lower_movement_facet`` wiring would FAIL this test. ``transpile_scripts``
-    is stubbed to return the daa09e-shaped player so the test never hits the
-    API, but everything downstream (identify, camera lower, movement lower) is
-    the production path inside ``transpile_with_contract``."""
+    """Drives the REAL ``contract_pipeline.transpile_with_contract`` so a future
+    edit deleting the identity -> camera -> movement wiring FAILS here."""
 
-    def test_generic_pipeline_lowers_player_movement_and_follow(self) -> None:
+    def _run(self, luau_source: str):
         from converter import contract_pipeline
 
         player_path = Path("/proj/Assets/Player.cs")
         infos = [_PInfo(player_path, "Player")]
         scene_runtime = {
             "modules": {
-                "guid-player": {
-                    "stem": "Player",
-                    "class_name": "Player",
-                    "runtime_bearing": True,
-                    "is_component_class": True,
-                    "character_attached": False,
-                    "is_loader": False,
-                },
+                "guid-player": _row("Player", has_cc=True),
             },
             "scenes": {},
             "prefabs": {},
             "domain_overrides": {},
         }
-
         player_script = TranspiledScript(
             source_path=str(player_path),
             output_filename="Player.luau",
             csharp_source="",
-            luau_source=_player_src(),
+            luau_source=luau_source,
             strategy="ai",
             confidence=1.0,
             script_type="ModuleScript",
@@ -522,25 +557,19 @@ class TestPipelineInvocation:
         stub_result = TranspilationResult()
         stub_result.total_transpiled = 1
         stub_result.scripts.append(player_script)
-
         with patch(
             "converter.contract_pipeline.transpile_scripts",
             return_value=stub_result,
         ) as mock_transpile:
             result = contract_pipeline.transpile_with_contract(
-                "/proj",
-                infos,
-                scene_runtime=scene_runtime,
-                use_ai=False,
+                "/proj", infos, scene_runtime=scene_runtime, use_ai=False,
             )
+        assert mock_transpile.called
+        return result
 
-        assert mock_transpile.called, (
-            "transpile_with_contract must call transpile_scripts (stubbed)."
-        )
-
+    def test_generic_pipeline_lowers_player_movement_and_follow(self) -> None:
+        result = self._run(_player_src())
         lowered_src = result.transpilation.scripts[0].luau_source
-        # Movement was retargeted onto the Roblox character's Humanoid:Move --
-        # the vestigial rig PivotTo displacement is gone.
         assert "hum:Move(dir.Unit, false)" in lowered_src
         assert (
             "self._cam:getYawBasis():VectorToWorldSpace(Vector3.new(h, 0, -v))"
@@ -550,13 +579,64 @@ class TestPipelineInvocation:
             "self.gameObject:PivotTo(self.gameObject:GetPivot() + disp)"
             not in lowered_src
         )
-        # The player's camera ``configure`` carries followCharacter = true
-        # (proves find_player_controllers -> lower_camera_facet(follow=...) ran
-        # together in the pipeline, not just the movement pass).
         assert (
             "self._cam:configure({rig = self.gameObject, followCharacter = true})"
             in lowered_src
         )
-        # Camera look facet was routed to the service (step), not left as the
-        # AI's per-game pitch math.
         assert ":step(dt)" in lowered_src
+        # A cleanly-bound player surfaces no player-binding fail-closed rows.
+        kinds = {fc.kind for fc in result.fail_closed}
+        assert "player_move_unbound" not in kinds
+        assert "player_look_unbound" not in kinds
+
+    def test_generic_pipeline_binds_the_real_dde248_shape(self) -> None:
+        """End-to-end through the pipeline on the shape that broke in Studio."""
+        result = self._run(_real_player_src())
+        lowered_src = result.transpilation.scripts[0].luau_source
+        assert "hum:Move(dir.Unit, false)" in lowered_src
+        assert "self._cam:step(dt)" in lowered_src
+        assert "(basePivot - basePivot.Position)" not in lowered_src
+        kinds = {fc.kind for fc in result.fail_closed}
+        assert not (kinds & {
+            "player_ambiguous", "player_unresolved",
+            "player_move_unbound", "player_look_unbound",
+        })
+
+    def test_pipeline_surfaces_player_ambiguous(self) -> None:
+        """>1 CharacterController-bearing script -> a player_ambiguous row, and
+        nothing bound."""
+        from converter import contract_pipeline
+
+        infos = [
+            _PInfo(Path("/proj/Assets/PlayerA.cs"), "PlayerA"),
+            _PInfo(Path("/proj/Assets/PlayerB.cs"), "PlayerB"),
+        ]
+        scene_runtime = {
+            "modules": {
+                "guid-a": _row("PlayerA", has_cc=True),
+                "guid-b": _row("PlayerB", has_cc=True),
+            },
+            "scenes": {}, "prefabs": {}, "domain_overrides": {},
+        }
+        scripts = []
+        for stem in ("PlayerA", "PlayerB"):
+            scripts.append(TranspiledScript(
+                source_path=f"/proj/Assets/{stem}.cs",
+                output_filename=f"{stem}.luau",
+                csharp_source="",
+                luau_source=_player_src().replace("Player", stem),
+                strategy="ai", confidence=1.0, script_type="ModuleScript",
+            ))
+        stub = TranspilationResult()
+        stub.total_transpiled = 2
+        stub.scripts.extend(scripts)
+        with patch(
+            "converter.contract_pipeline.transpile_scripts", return_value=stub,
+        ):
+            result = contract_pipeline.transpile_with_contract(
+                "/proj", infos, scene_runtime=scene_runtime, use_ai=False,
+            )
+        kinds = {fc.kind for fc in result.fail_closed}
+        assert "player_ambiguous" in kinds
+        for sc in result.transpilation.scripts:
+            assert "hum:Move" not in sc.luau_source

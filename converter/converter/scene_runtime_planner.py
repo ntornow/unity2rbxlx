@@ -113,6 +113,19 @@ class SceneRuntimeModule(TypedDict, total=False):
     # regex in storage_classifier's decision tree.
     character_attached: bool
     is_loader: bool
+    # ``has_character_controller``: True when one or more of this script's
+    # placed instances is co-located on a GameObject that also carries a Unity
+    # ``CharacterController`` component (the engine-level "this is the player
+    # avatar" signal -- the same upstream fact scene_converter materializes as
+    # the ``_HasCharacterController`` Part attribute). Derived from the
+    # deterministic Unity object graph at topology-walk time, NOT from the
+    # non-deterministic transpiled output, so generic player identity is robust
+    # to AI transpile-shape variance. ``contract_pipeline`` consumes it to pick
+    # the player controller for the movement/camera facet lowerings
+    # (unique-and-exclusive: exactly one such script => the player; 0 or >1 =>
+    # fail closed). Default-absent on pre-existing artifacts; consumers read it
+    # with ``.get(..., False)`` (no invariant gates on it, so no backfill).
+    has_character_controller: bool
     domain: str
     container: str
     module_path: str
@@ -765,9 +778,21 @@ def _walk_scene(
     by_guid: dict[str, PrefabTemplate],
     unity_project_root: Path | None,
     runtime_bearing: set[str],
+    character_controller_scripts: set[str],
 ) -> SceneRuntimeScene:
     """Build the per-scene block. DFS through scene roots so
-    ``lifecycle_order`` follows the hierarchy."""
+    ``lifecycle_order`` follows the hierarchy.
+
+    ``character_controller_scripts`` accumulates the script ids of every
+    MonoBehaviour co-located on a GameObject that also carries a Unity
+    ``CharacterController`` -- the deterministic upstream player-avatar signal
+    (scene instances are always placed/live, so scene evidence always counts).
+    """
+    # Canonical CharacterController type set -- single source of truth shared
+    # with scene_converter (which stamps ``_HasCharacterController`` from the
+    # same set). Local import avoids a module-load cycle (scene_converter is a
+    # heavy importer); sys.modules caches it after the first walk.
+    from converter.scene_converter import _CHARACTER_CONTROLLER_TYPES
     instances: list[SceneRuntimeInstance] = []
     references: list[SceneRuntimeReference] = []
     lifecycle: list[str] = []
@@ -789,12 +814,18 @@ def _walk_scene(
     # into this set keep ``target_kind="component"`` because PR2 stamps
     # them with stable instance ids the host can look up directly.
     mono_component_fids: set[str] = set()
+    # GameObjects carrying a Unity CharacterController -- their co-located
+    # MonoBehaviours are player-controller candidates (see
+    # ``character_controller_scripts``).
+    cc_go_fids: set[str] = set()
     for go_fid, n in scene.all_nodes.items():
         for c in n.components:
             comp_fid_to_go_fid[c.file_id] = go_fid
             comp_fid_to_type[c.file_id] = c.component_type
             if c.component_type == "MonoBehaviour":
                 mono_component_fids.add(c.file_id)
+            if c.component_type in _CHARACTER_CONTROLLER_TYPES:
+                cc_go_fids.add(go_fid)
 
     def _visit(node: SceneNode) -> None:
         for comp in node.components:
@@ -804,6 +835,8 @@ def _walk_scene(
             if not script_id:
                 continue
             runtime_bearing.add(script_id)
+            if node.file_id in cc_go_fids:
+                character_controller_scripts.add(script_id)
             enabled_raw = comp.properties.get("m_Enabled", 1)
             enabled = bool(enabled_raw) if isinstance(enabled_raw, (int, bool)) else True
 
@@ -866,10 +899,20 @@ def _walk_prefab(
     by_guid: dict[str, PrefabTemplate],
     unity_project_root: Path | None,
     runtime_bearing: set[str],
+    character_controller_scripts: set[str],
+    collect_cc: bool,
 ) -> SceneRuntimePrefab:
     """Build the per-prefab block. Same shape as ``_walk_scene`` but the
     namespace is the stable prefab id, instances are prefab-local, and
-    intra-prefab refs resolve against the prefab's own nodes."""
+    intra-prefab refs resolve against the prefab's own nodes.
+
+    ``collect_cc`` gates ``character_controller_scripts`` accumulation: True
+    ONLY for prefab templates actually PLACED in a scene. An unplaced library
+    template never boots a player, so its CharacterController evidence must not
+    select a player (codex fail-open guard) -- counting it could spuriously
+    trip the unique-and-exclusive gate and abstain the real player.
+    """
+    from converter.scene_converter import _CHARACTER_CONTROLLER_TYPES
     instances: list[SceneRuntimeInstance] = []
     references: list[SceneRuntimeReference] = []
     lifecycle: list[str] = []
@@ -881,12 +924,15 @@ def _walk_prefab(
     comp_fid_to_go_fid: dict[str, str] = {}
     comp_fid_to_type: dict[str, str] = {}
     mono_component_fids: set[str] = set()
+    cc_go_fids: set[str] = set()
     for go_fid, n in template.all_nodes.items():
         for c in n.components:
             comp_fid_to_go_fid[c.file_id] = go_fid
             comp_fid_to_type[c.file_id] = c.component_type
             if c.component_type == "MonoBehaviour":
                 mono_component_fids.add(c.file_id)
+            if c.component_type in _CHARACTER_CONTROLLER_TYPES:
+                cc_go_fids.add(go_fid)
 
     def _visit(node: PrefabNode) -> None:
         for comp in node.components:
@@ -896,6 +942,8 @@ def _walk_prefab(
             if not script_id:
                 continue
             runtime_bearing.add(script_id)
+            if collect_cc and node.file_id in cc_go_fids:
+                character_controller_scripts.add(script_id)
             enabled_raw = comp.properties.get("m_Enabled", 1)
             enabled = bool(enabled_raw) if isinstance(enabled_raw, (int, bool)) else True
 
@@ -1013,6 +1061,7 @@ def _walk_scene_prefab_placements(
 def _build_modules_table(
     guid_index: GuidIndex | None,
     runtime_bearing: set[str],
+    character_controller_scripts: set[str],
 ) -> dict[str, SceneRuntimeModule]:
     """One row per ``.cs`` file in the project, keyed by canonical script
     id (the .cs GUID). Stem-keyed lookup happens at the resolver level
@@ -1085,6 +1134,7 @@ def _build_modules_table(
             # scene_converter's player-character walk.
             "is_loader": bool(REPLICATED_FIRST_HINTS.search(stem)),
             "character_attached": False,
+            "has_character_controller": script_guid in character_controller_scripts,
         }
 
     # Scripts attached at runtime but absent from the guid index (e.g.,
@@ -1101,6 +1151,7 @@ def _build_modules_table(
                 # Empty stem can't match the loader regex.
                 "is_loader": False,
                 "character_attached": False,
+                "has_character_controller": script_id in character_controller_scripts,
             }
 
     return modules
@@ -1565,12 +1616,17 @@ def plan_scene_runtime(
     prefabs_block: dict[str, SceneRuntimePrefab] = {}
     placements_block: list[SceneRuntimeScenePrefabPlacement] = []
     runtime_bearing: set[str] = set()
+    # Script ids co-located with a Unity CharacterController on a PLACED
+    # GameObject (scene-live or placed-prefab) -- the deterministic upstream
+    # player-avatar signal consumed by contract_pipeline. See
+    # ``SceneRuntimeModule.has_character_controller``.
+    character_controller_scripts: set[str] = set()
 
     for scene in parsed_scenes:
         namespace = _scene_namespace(scene, unity_project_root)
         scenes_block[namespace] = _walk_scene(
             scene, namespace, guid_index, by_guid,
-            unity_project_root, runtime_bearing,
+            unity_project_root, runtime_bearing, character_controller_scripts,
         )
         # Bug B tier 1: pre-placed prefab instances. The subplans they bind
         # to are built below; placements only need the stable prefab_id,
@@ -1579,6 +1635,9 @@ def plan_scene_runtime(
             scene, namespace, guid_index, by_guid, unity_project_root,
         ))
 
+    # Prefab CharacterController evidence counts ONLY for placed prefabs (codex
+    # fail-open guard): an unplaced library template never boots a player.
+    placed_prefab_ids = {p["prefab_id"] for p in placements_block}
     if prefab_library is not None:
         for template in prefab_library.prefabs:
             prefab_id = _prefab_stable_id(
@@ -1587,9 +1646,13 @@ def plan_scene_runtime(
             prefabs_block[prefab_id] = _walk_prefab(
                 template, prefab_id, guid_index, by_guid,
                 unity_project_root, runtime_bearing,
+                character_controller_scripts,
+                collect_cc=prefab_id in placed_prefab_ids,
             )
 
-    modules_block = _build_modules_table(guid_index, runtime_bearing)
+    modules_block = _build_modules_table(
+        guid_index, runtime_bearing, character_controller_scripts,
+    )
 
     return {
         "modules": modules_block,

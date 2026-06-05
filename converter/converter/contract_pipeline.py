@@ -235,6 +235,33 @@ def _container_lookup_expr(stem: str) -> str:
     )
 
 
+# Service roots a planner ``module_path`` can start with. A bare dotted path
+# like ``ReplicatedStorage.Player`` is NOT valid as a top-level
+# ``require(...)`` argument -- ``ReplicatedStorage`` is an unbound global at
+# module scope (no ``local ReplicatedStorage = game:GetService(...)`` precedes
+# it). Lowering the root to ``game:GetService("ReplicatedStorage")`` makes the
+# expression self-contained, matching ``_container_lookup_expr``'s shape.
+_REQUIRE_SERVICE_ROOTS = frozenset({
+    "ReplicatedStorage", "ServerStorage", "ServerScriptService",
+    "ReplicatedFirst", "StarterPlayer", "StarterGui", "Workspace",
+})
+
+
+def _service_rooted_require_target(target: str) -> str:
+    """Lower a bare service-rooted dotted ``module_path`` to a self-contained
+    ``game:GetService("<Service>").<rest>`` expression so it doesn't reference
+    an unbound global at a top-level ``require``. Targets that are already an
+    expression (``game:GetService(...)`` / ``_container_lookup_expr`` /
+    parenthesized) are returned unchanged."""
+    head = target.split(".", 1)[0]
+    if "(" in head or ":" in head:
+        return target
+    root, dot, rest = target.partition(".")
+    if dot and root in _REQUIRE_SERVICE_ROOTS:
+        return f'game:GetService("{root}").{rest}'
+    return target
+
+
 def resolve_requires(
     scripts: list[TranspiledScript],
     by_stem: dict[str, str],
@@ -310,6 +337,11 @@ def _apply_require_resolutions(
             continue
         src = script.luau_source
         for stem, target in rewrites.items():
+            # Lower a bare service-rooted dotted path to a self-contained
+            # ``game:GetService(...)`` expression so a top-level
+            # ``require(ReplicatedStorage.Foo)`` doesn't reference an unbound
+            # global (the HudControl/HostilePlane/Explosive crash).
+            target = _service_rooted_require_target(target)
             # Match the contract idiom in single OR double quotes; mirror
             # ``_RE_SCENE_RUNTIME_REQUIRE`` so the resolver and rewriter
             # never disagree about what counts as a require site.
@@ -401,15 +433,44 @@ def transpile_with_contract(
     # SceneCameraInput runtime service so generic-mode FPS games yaw, not just
     # pitch. Structure-gated, never per-game; see camera_facet_lowering.py and
     # docs/design/camera-input-fidelity-plan.md.
-    # Player identity is computed BEFORE camera lowering: lower_camera_facet
-    # erases the camera fingerprint that find_player_controllers' camera
-    # co-signal (_find_look_method) relies on, so the ORDER here is
-    # load-bearing -- identify first, then lower.
+    # Player identity comes from the DETERMINISTIC UPSTREAM Unity signal (the
+    # planner's per-module ``has_character_controller``), NOT a fingerprint of
+    # the transpiled output -- the latter abstained silently on AI shape
+    # variance, decoupling camera/movement/character (the systemic bug this
+    # closes). ``find_player_controllers`` fail-closes (``[]``) on 0 or >1
+    # distinct CC-scripts.
     from converter.movement_facet_lowering import (
         find_player_controllers,
         lower_movement_facet,
     )
-    players = find_player_controllers(transpilation.scripts)
+    players = find_player_controllers(transpilation.scripts, modules)
+    # Surface upstream player identity that did NOT cleanly bind, rather than
+    # abstaining silently. ``cc_module_count`` is the number of distinct
+    # CC-bearing scripts the planner saw on placed GameObjects.
+    cc_module_count = sum(
+        1 for m in modules.values()
+        if isinstance(m, dict) and m.get("has_character_controller")
+    )
+    player_fail_closed: list[FailClosed] = []
+    if cc_module_count > 1:
+        player_fail_closed.append(FailClosed(
+            kind="player_ambiguous",
+            detail=(
+                f"{cc_module_count} distinct scripts are co-located with a "
+                f"Unity CharacterController; the generic FPS binding is "
+                f"one-camera-per-client, so player identity is ambiguous and "
+                f"no controller was bound."
+            ),
+        ))
+    elif cc_module_count == 1 and not players:
+        player_fail_closed.append(FailClosed(
+            kind="player_unresolved",
+            detail=(
+                "the CharacterController-bearing module has no uniquely "
+                "matching transpiled script (stem mismatch / collision); the "
+                "player controller was not bound."
+            ),
+        ))
 
     from converter.camera_facet_lowering import lower_camera_facet
     lowered = lower_camera_facet(
@@ -425,6 +486,29 @@ def transpile_with_contract(
     if moved:
         log.info("[contract] movement-facet lowering retargeted %d player "
                  "controller(s) to the character Humanoid", moved)
+    # A player was identified upstream but a binding locator missed its rewrite
+    # site -- surface it loudly (the controller would run un-bound, the failure
+    # mode this fix exists to eliminate) instead of shipping a silent regression.
+    if players:
+        player = players[0]
+        if moved == 0:
+            player_fail_closed.append(FailClosed(
+                kind="player_move_unbound",
+                detail=(
+                    f"{Path(player.source_path).name}: player identified "
+                    f"upstream but no WASD movement method was located to "
+                    f"retarget onto the character Humanoid."
+                ),
+            ))
+        if "self._cam:step(" not in (player.luau_source or ""):
+            player_fail_closed.append(FailClosed(
+                kind="player_look_unbound",
+                detail=(
+                    f"{Path(player.source_path).name}: player identified "
+                    f"upstream but no look method was located to route onto "
+                    f"SceneCameraInput (camera will not follow the character)."
+                ),
+            ))
 
     # Child-index lowering (allowlisted deterministic lowering pass): the
     # transpiler flattens Unity ``transform.GetChild(n)`` to
@@ -457,7 +541,9 @@ def transpile_with_contract(
     # Aggregate fail-closed reasons. Verifier failures are recorded per
     # module via warnings; convert them to FailClosed rows here so the
     # orchestrator's caller has one place to read project status.
-    fail_closed: list[FailClosed] = []
+    # Player-binding rows (computed during the facet section above) lead so an
+    # un-bound player is the first thing the operator sees.
+    fail_closed: list[FailClosed] = list(player_fail_closed)
     # Surface stem collisions FIRST -- a colliding stem was never added to
     # the path sets, so the per-script verifier loop below can't flag it.
     # Without this surface the module silently disappears (codex P1 finding

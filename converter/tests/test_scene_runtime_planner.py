@@ -1320,3 +1320,155 @@ class TestBuildScriptIdByName:
         }
         idx = build_script_id_by_name([], modules)
         assert idx == {}
+
+
+# ---------------------------------------------------------------------------
+# has_character_controller -- the deterministic upstream player-avatar signal
+# (a script co-located with a Unity CharacterController on a PLACED GameObject).
+# ---------------------------------------------------------------------------
+
+def _cc() -> ComponentData:
+    """A Unity CharacterController component (the engine-level avatar signal)."""
+    return ComponentData(
+        component_type="CharacterController", file_id="900", properties={},
+    )
+
+
+class TestHasCharacterController:
+    def test_scene_cc_colocated_script_flagged(self, tmp_path: Path) -> None:
+        """A MonoBehaviour on a GameObject that also carries a CharacterController
+        is flagged; one on a plain GameObject is not."""
+        sdir = tmp_path / "Assets" / "Scripts"
+        sdir.mkdir(parents=True)
+        player_cs = sdir / "Player.cs"
+        player_cs.write_text("public class Player : MonoBehaviour { }")
+        enemy_cs = sdir / "Enemy.cs"
+        enemy_cs.write_text("public class Enemy : MonoBehaviour { }")
+        player_guid, enemy_guid = "a" * 32, "b" * 32
+        idx = _make_guid_index(tmp_path, {
+            player_guid: (player_cs, "script"),
+            enemy_guid: (enemy_cs, "script"),
+        })
+
+        player_node = _node("100", "Player", components=[
+            _cc(),
+            ComponentData(
+                component_type="MonoBehaviour", file_id="200",
+                properties=_mb_props(player_guid, go_fid="100"),
+            ),
+        ])
+        enemy_node = _node("300", "Enemy", components=[
+            ComponentData(
+                component_type="MonoBehaviour", file_id="400",
+                properties=_mb_props(enemy_guid, go_fid="300"),
+            ),
+        ])
+        scene = _scene(
+            tmp_path / "Assets" / "Scenes" / "Main.unity",
+            roots=[player_node, enemy_node],
+        )
+        artifact = plan_scene_runtime(
+            parsed_scenes=[scene], prefab_library=None,
+            guid_index=idx, unity_project_root=tmp_path,
+        )
+        mods = artifact["modules"]
+        assert mods[player_guid]["has_character_controller"] is True
+        assert mods[enemy_guid]["has_character_controller"] is False
+
+    def test_two_cc_scripts_both_flagged(self, tmp_path: Path) -> None:
+        """Two distinct scripts each co-located with a CharacterController are
+        BOTH flagged -- the pipeline then fail-closes on the ambiguity."""
+        sdir = tmp_path / "Assets" / "Scripts"
+        sdir.mkdir(parents=True)
+        a_cs, b_cs = sdir / "P1.cs", sdir / "P2.cs"
+        a_cs.write_text("public class P1 : MonoBehaviour { }")
+        b_cs.write_text("public class P2 : MonoBehaviour { }")
+        a_guid, b_guid = "1" * 32, "2" * 32
+        idx = _make_guid_index(tmp_path, {
+            a_guid: (a_cs, "script"), b_guid: (b_cs, "script"),
+        })
+        n1 = _node("10", "P1", components=[
+            _cc(), ComponentData(
+                component_type="MonoBehaviour", file_id="11",
+                properties=_mb_props(a_guid, go_fid="10")),
+        ])
+        n2 = _node("20", "P2", components=[
+            _cc(), ComponentData(
+                component_type="MonoBehaviour", file_id="21",
+                properties=_mb_props(b_guid, go_fid="20")),
+        ])
+        scene = _scene(
+            tmp_path / "Assets" / "Scenes" / "Main.unity", roots=[n1, n2],
+        )
+        artifact = plan_scene_runtime(
+            parsed_scenes=[scene], prefab_library=None,
+            guid_index=idx, unity_project_root=tmp_path,
+        )
+        mods = artifact["modules"]
+        assert mods[a_guid]["has_character_controller"] is True
+        assert mods[b_guid]["has_character_controller"] is True
+
+    def test_placed_prefab_cc_flagged_unplaced_not(self, tmp_path: Path) -> None:
+        """CharacterController evidence counts ONLY for PLACED prefabs: an
+        unplaced library template never boots a player, so its co-located script
+        must not be flagged (else it could spuriously trip the >1 gate)."""
+        sdir = tmp_path / "Assets" / "Scripts"
+        sdir.mkdir(parents=True)
+        placed_cs = sdir / "PlacedPlayer.cs"
+        placed_cs.write_text("public class PlacedPlayer : MonoBehaviour { }")
+        unplaced_cs = sdir / "UnplacedPlayer.cs"
+        unplaced_cs.write_text("public class UnplacedPlayer : MonoBehaviour { }")
+        placed_guid, unplaced_guid = "c" * 32, "d" * 32
+
+        def _cc_prefab(name: str, script_guid: str) -> PrefabTemplate:
+            prefab_abs = tmp_path / "Assets" / "Prefabs" / f"{name}.prefab"
+            prefab_abs.parent.mkdir(parents=True, exist_ok=True)
+            prefab_abs.touch()
+            root = PrefabNode(
+                name=name, file_id="1000", active=True, tag="Untagged",
+            )
+            root.components = [
+                _cc(),
+                ComponentData(
+                    component_type="MonoBehaviour", file_id="1100",
+                    properties=_mb_props(script_guid, go_fid="1000"),
+                ),
+            ]
+            return PrefabTemplate(
+                prefab_path=prefab_abs, name=name, root=root,
+                all_nodes={"1000": root},
+            )
+
+        placed_tmpl = _cc_prefab("PlacedPlayer", placed_guid)
+        unplaced_tmpl = _cc_prefab("UnplacedPlayer", unplaced_guid)
+        placed_prefab_guid = "ee" + "0" * 30
+        unplaced_prefab_guid = "ff" + "0" * 30
+        idx = _make_guid_index(tmp_path, {
+            placed_guid: (placed_cs, "script"),
+            unplaced_guid: (unplaced_cs, "script"),
+            placed_prefab_guid: (placed_tmpl.prefab_path, "prefab"),
+            unplaced_prefab_guid: (unplaced_tmpl.prefab_path, "prefab"),
+        })
+        lib = PrefabLibrary()
+        lib.prefabs.extend([placed_tmpl, unplaced_tmpl])
+        lib.by_guid[placed_prefab_guid] = placed_tmpl
+        lib.by_guid[unplaced_prefab_guid] = unplaced_tmpl
+
+        # Only the placed prefab is instantiated into the scene.
+        scene = ParsedScene(
+            scene_path=tmp_path / "Assets" / "Scenes" / "Main.unity",
+            prefab_instances=[PrefabInstanceData(
+                file_id="500",
+                source_prefab_guid=placed_prefab_guid,
+                source_prefab_file_id="0",
+                transform_parent_file_id="0",
+                modifications=[],
+            )],
+        )
+        artifact = plan_scene_runtime(
+            parsed_scenes=[scene], prefab_library=lib,
+            guid_index=idx, unity_project_root=tmp_path,
+        )
+        mods = artifact["modules"]
+        assert mods[placed_guid]["has_character_controller"] is True
+        assert mods[unplaced_guid]["has_character_controller"] is False
