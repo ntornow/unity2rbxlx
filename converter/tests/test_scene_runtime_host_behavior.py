@@ -1648,6 +1648,117 @@ class TestPrefabComponentReceivesGameObject:
         assert rc == 0, f"luau failed: {err}\n{out}"
         assert "OK" in out
 
+    def test_prefab_clone_component_binds_touch_signal_on_non_nil_gameobject(self):
+        """Slice 2.1 regression: a runtime-``instantiatePrefab``-spawned
+        clone's component must resolve a NON-nil touch part and bind its
+        ``connectGameObjectSignal`` (Touched) — the contact-damage
+        contract for a contact-damage prefab (e.g. a projectile that
+        damages on touch).
+
+        The sibling test above proves only that ``self.gameObject`` is
+        non-nil; its cloned child is a plain table, so ``getTouchPart``
+        would still return nil on it. The historic failure was downstream
+        of a non-nil gameObject too: the clone descendant lacked a
+        ``_SceneRuntimeId`` so it never resolved, ``self.gameObject`` was
+        nil, ``getTouchPart(nil)`` returned nil, and
+        ``connectGameObjectSignal`` warned ``no touch part on nil`` and
+        silently no-op'd — a runtime-spawned contact-damage prefab never
+        bound its Touched signal and never damaged anything.
+
+        Post-#145 the template descendants carry namespaced
+        ``_SceneRuntimeId`` stamps, so ``resolveCloneChild`` binds a
+        non-nil ``self.gameObject``. The converter-side stamping itself is
+        pinned by ``test_prefab_packages.py`` (PR2 follow-up §6); the
+        sibling ``test_prefab_clone_descendant_self_gameobject_*`` above
+        pins that the host wires a non-nil gameObject from those stamps.
+        This test pins the previously-uncovered DOWNSTREAM half: that the
+        bound clone component's ``self.gameObject`` resolves a real touch
+        part and ``connectGameObjectSignal`` actually connects + fires —
+        the contact-damage contract. The three layers together (stamp →
+        non-nil gameObject → touch binding) close the runtime-spawned
+        contact-damage path; this binding layer was the test gap.
+
+        Generic prefab-clone-binding contract — no game/prefab-specific
+        names. If a host-side regression resolves a non-BasePart or nil
+        gameObject for a clone, ``getTouchPart`` returns nil and this
+        warns ``no touch part`` with ``HIT 0`` — RED.
+        """
+        scenario = textwrap.dedent("""\
+            local connected = false
+            local hits = 0
+            local Foo = {} ; Foo.__index = Foo
+            function Foo.new(_) return setmetatable({}, Foo) end
+            function Foo:Awake()
+                -- Exactly what a contact-damage prefab's Awake does: bind
+                -- the GameObject's Touched through the host. With a non-nil
+                -- BasePart gameObject this resolves a real touch part.
+                local conn = self.host:connectGameObjectSignal(
+                    self.gameObject, "Touched", function(other) hits = hits + 1 end)
+                connected = conn ~= nil
+            end
+            local plan = {
+                modules = {foo = {stem = "Foo", runtime_bearing = true,
+                                  module_path = "x"}},
+                scenes = {},
+                prefabs = {
+                    ["pfb1"] = {
+                        name = "MyPrefab",
+                        instances = {{instance_id = "pfb1:1", script_id = "foo",
+                                      game_object_id = "pfb1:1", active = true,
+                                      enabled = true, config = {}}},
+                        references = {},
+                        lifecycle_order = {"pfb1:1"},
+                    },
+                },
+                domain_overrides = {},
+            }
+            -- Roblox-shaped BasePart clone child: ``IsA`` + a Touched
+            -- signal so ``getTouchPart`` passes it through (BasePart) and
+            -- ``connectGameObjectSignal`` connects on it. This is the
+            -- shape a real cloned prefab projectile root has.
+            local touchedSig = {_conns = {}}
+            function touchedSig:Connect(fn)
+                table.insert(self._conns, fn)
+                return {Disconnect = function() end}
+            end
+            function touchedSig:fire(...)
+                for _, fn in ipairs(self._conns) do fn(...) end
+            end
+            local childGo = {Name = "ClonedChild", _sceneRuntimeId = "pfb1:1",
+                             _children = {}, ClassName = "Part", Touched = touchedSig}
+            function childGo:IsA(class)
+                return class == "BasePart" or class == "Part"
+            end
+            local cloneInstance = {
+                Name = "Clone", _sceneRuntimeId = "clone",
+                _children = {["pfb1:1"] = childGo},
+            }
+            local services = servicesFor(plan, {foo = Foo}, {})
+            services.clonePrefabTemplate = function(prefabId, parent, cframe)
+                return cloneInstance
+            end
+            local engine = SceneRuntime.new(services, plan)
+            engine:instantiatePrefab("pfb1", nil, nil, nil)
+            runDeferred()
+            print(connected and "CONNECTED" or "NOCONN")
+            -- Fire the bound part's Touched — the damage path the binding gates.
+            touchedSig:fire({Name = "OtherPart"})
+            print("HIT " .. tostring(hits))
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "CONNECTED" in out, (
+            "runtime-spawned prefab clone component must bind "
+            "connectGameObjectSignal on a non-nil touch part "
+            f"(no 'no touch part on nil')\n{out}"
+        )
+        assert "no touch part" not in out, (
+            f"clone component resolved a nil gameObject/touch part\n{out}"
+        )
+        assert "HIT 1" in out, (
+            f"bound Touched signal did not fire the damage callback\n{out}"
+        )
+
     def test_prefab_clone_descendant_self_gameobject_after_template_sri(self):
         """PR2 follow-up §6 regression: a prefab subplan keys instances
         on ``game_object_id = "<prefab_id>:<file_id>"`` (planner output,
