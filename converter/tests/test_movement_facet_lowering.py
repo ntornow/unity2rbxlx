@@ -720,11 +720,12 @@ class TestPipelineInvocation:
 
         player_path = Path("/proj/Assets/Player.cs")
         infos = [_PInfo(player_path, "Player")]
-        # Module row WITHOUT the has_character_controller key (pre-fix shape).
+        # Module row WITHOUT has_character_controller AND without
+        # is_component_class (an artifact old enough to predate both) -- only
+        # runtime_bearing (present since PR1) is left to trip the guard.
         stale_row = {
             "stem": "Player", "class_name": "Player", "runtime_bearing": True,
-            "is_component_class": True, "character_attached": False,
-            "is_loader": False,
+            "character_attached": False, "is_loader": False,
         }
         scene_runtime = {
             "modules": {"guid-player": stale_row},

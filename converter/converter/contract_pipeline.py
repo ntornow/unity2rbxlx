@@ -459,8 +459,14 @@ def transpile_with_contract(
     # the operator re-plans instead of shipping an unbound player.
     dict_mods = [m for m in modules.values() if isinstance(m, dict)]
     signal_present = any("has_character_controller" in m for m in dict_mods)
-    has_components = any(m.get("is_component_class") for m in dict_mods)
-    if dict_mods and has_components and not signal_present:
+    # Gate on runtime_bearing too (present since PR1) so an artifact old enough
+    # to also predate ``is_component_class`` still trips the guard (codex
+    # re-review false-negative).
+    has_runnable = any(
+        m.get("is_component_class") or m.get("runtime_bearing")
+        for m in dict_mods
+    )
+    if dict_mods and has_runnable and not signal_present:
         player_fail_closed.append(FailClosed(
             kind="player_signal_absent",
             detail=(
