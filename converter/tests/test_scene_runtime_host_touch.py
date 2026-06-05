@@ -765,6 +765,144 @@ class TestConnectGameObjectSignalStay:
 
 
 # ---------------------------------------------------------------------------
+# host-surface wrapper -> engine routing (the seam the lowering lands on)
+# ---------------------------------------------------------------------------
+
+class TestHostSurfaceConnectStayWrapper:
+    """The lowered turret code emits ``self.host:connectGameObjectSignalStay(go, fn)``.
+
+    The slice-1.1/1.2 tests above call the engine method directly; these
+    drive the call through the real ``_makeHostSurface`` wrapper
+    (scene_runtime.luau ~728) — the exact shape the contract_pipeline
+    lowering produces — and prove BOTH the colon and dotted forms route to
+    the engine with the correct ``(owner, go, fn)`` mapping.
+
+    Load-bearing proof that this exercises the WRAPPER and not the engine
+    directly: the wrapper binds ``owner`` (captured at ``_makeHostSurface``
+    time) as the engine ``comp`` arg, and ``connect`` only arms the
+    Heartbeat subscription ``if _isGateOpen(comp)``. So if the wrapper's arg
+    mapping were wrong — passing the ``host`` table (whose ``_meta`` is nil
+    => gate closed) instead of ``owner``, or swapping the ``go``/``fn``
+    positions — the poll would never arm or ``getTouchPart(fn)`` would
+    resolve nil and ``fn`` would never fire. The negative-control test below
+    pins the owner binding directly.
+    """
+
+    def test_colon_form_routes_through_wrapper_and_fires(self):
+        scenario = textwrap.dedent("""\
+            local services, hb = stayServices(nil)
+            local engine = SceneRuntime.new(services, {})
+            local limb = newInstance{Name = "RightFoot", ClassName = "Part",
+                isa = {BasePart = true}}
+            installWorkspace({limb})
+            local trig = newInstance{Name = "Collider", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, Transparency = 1,
+                attrs = {_IsTriggerVolume = true}}
+            local body = newInstance{Name = "Turret", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, children = {trig}}
+            -- The owner the host is bound to; gate must be open.
+            local owner = {}
+            engine._meta[owner] = {activeInHierarchy = true, enabled = true}
+            local host = engine:_makeHostSurface(owner)
+            local hits = {}
+            -- COLON form, exactly as the lowered turret emits.
+            local conn = host:connectGameObjectSignalStay(body,
+                function(other) table.insert(hits, other) end)
+            print(conn ~= nil and "CONNECTED" or "NOCONN")
+            services.setClock(1); hb:fire(0.016)
+            print("HITS " .. tostring(#hits))
+            print((hits[1] == limb) and "ISLIMB" or "WRONGHIT")
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "CONNECTED" in out
+        assert "HITS 1" in out, f"colon-form wrapper did not route to engine\n{out}"
+        assert "ISLIMB" in out
+
+    def test_dotted_form_routes_through_wrapper_and_fires(self):
+        scenario = textwrap.dedent("""\
+            local services, hb = stayServices(nil)
+            local engine = SceneRuntime.new(services, {})
+            local limb = newInstance{Name = "LeftFoot", ClassName = "Part",
+                isa = {BasePart = true}}
+            installWorkspace({limb})
+            local trig = newInstance{Name = "Collider", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, Transparency = 1,
+                attrs = {_IsTriggerVolume = true}}
+            local body = newInstance{Name = "Turret", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, children = {trig}}
+            local owner = {}
+            engine._meta[owner] = {activeInHierarchy = true, enabled = true}
+            local host = engine:_makeHostSurface(owner)
+            local hits = {}
+            -- DOTTED form: host.connectGameObjectSignalStay(go, fn).
+            local conn = host.connectGameObjectSignalStay(body,
+                function(other) table.insert(hits, other) end)
+            print(conn ~= nil and "CONNECTED" or "NOCONN")
+            services.setClock(1); hb:fire(0.016)
+            print("HITS " .. tostring(#hits))
+            print((hits[1] == limb) and "ISLIMB" or "WRONGHIT")
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "CONNECTED" in out
+        assert "HITS 1" in out, f"dotted-form wrapper did not route to engine\n{out}"
+        assert "ISLIMB" in out
+
+    def test_wrapper_binds_owner_not_caller_comp_gate(self):
+        # Pins the load-bearing ``owner`` arg mapping: the wrapper passes the
+        # ``owner`` it was built for as the engine ``comp`` (NOT the host
+        # table, NOT a caller-supplied comp). Build the host for an owner
+        # whose gate is CLOSED (enabled=false); the colon form must still
+        # not throw, but the poll must NOT arm/fire — proving the wrapper
+        # threaded the real owner's gate through ``connect``. If the wrapper
+        # mis-passed comp (e.g. the host table, with no _meta entry), this
+        # would behave identically by accident, so we ALSO flip the SAME
+        # owner's gate open and rearm to prove the binding is that owner.
+        scenario = textwrap.dedent("""\
+            local services, hb = stayServices(nil)
+            local engine = SceneRuntime.new(services, {})
+            local limb = newInstance{Name = "Foot", ClassName = "Part",
+                isa = {BasePart = true}}
+            installWorkspace({limb})
+            local trig = newInstance{Name = "Collider", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, Transparency = 1,
+                attrs = {_IsTriggerVolume = true}}
+            local body = newInstance{Name = "Turret", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, children = {trig}}
+            local owner = {}
+            -- Gate CLOSED at arm time (disabled). Registered so _rearmSubs
+            -- can find the subs list keyed by this exact owner.
+            engine._meta[owner] = {activeInHierarchy = true, enabled = false}
+            local host = engine:_makeHostSurface(owner)
+            local hits = 0
+            host:connectGameObjectSignalStay(body, function() hits = hits + 1 end)
+            -- Gate closed => subscription not armed => no fire.
+            print("ARMED " .. tostring(hb:count()))
+            services.setClock(1); hb:fire(0.016)
+            print("WHILE_CLOSED " .. tostring(hits))
+            -- Open the SAME owner's gate and rearm: the sub keyed by ``owner``
+            -- must now arm and fire — proving the wrapper bound THIS owner.
+            engine._meta[owner].enabled = true
+            engine:_rearmSubs(owner)
+            print("REARMED " .. tostring(hb:count()))
+            services.setClock(2); hb:fire(0.016)
+            print("AFTER_OPEN " .. tostring(hits))
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "ARMED 0" in out, f"wrapper armed despite closed owner gate\n{out}"
+        assert "WHILE_CLOSED 0" in out
+        # Rearming the owner the wrapper bound proves the comp mapping is that
+        # owner (a sub keyed by the wrong comp would not be found by
+        # _rearmSubs(owner)).
+        assert "REARMED 1" in out, (
+            "wrapper did not key the subscription by the bound owner\n" + out
+        )
+        assert "AFTER_OPEN 1" in out
+
+
+# ---------------------------------------------------------------------------
 # playerFromTouch / isPlayerTouch
 # ---------------------------------------------------------------------------
 
