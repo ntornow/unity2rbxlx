@@ -199,11 +199,16 @@ end
 
 -- Stub ``workspace`` global with a settable ``GetPartsInPart`` result so
 -- the poll can be driven deterministically. Set ``workspace._overlap`` to
--- the list of overlapping parts a sweep returns.
+-- the list of overlapping parts a sweep returns. ``workspace._queriedPart``
+-- RECORDS the actual ``part`` argument every sweep was called with, so a
+-- test can prove the poll queried the ``getTouchPart``-RESOLVED volume (the
+-- marked trigger), not some other part.
 local function installWorkspace(parts)
     workspace = {
         _overlap = parts or {},
-        GetPartsInPart = function(self, _part)
+        _queriedPart = nil,
+        GetPartsInPart = function(self, part)
+            self._queriedPart = part
             return self._overlap
         end,
     }
@@ -280,6 +285,23 @@ class TestGetTouchPart:
         rc, out, err = _run(scenario)
         assert rc == 0, f"luau failed: {err}\n{out}"
         assert "MARKED" in out
+
+    def test_basepart_root_itself_marked_returns_self(self):
+        # MINOR-2: ``_findMarkedTriggerVolume`` checks ``go`` ITSELF before
+        # descendants — a BasePart go that is itself ``_IsTriggerVolume``
+        # marked resolves to itself (the marked-volume preference applies to
+        # the root, not only its children).
+        scenario = textwrap.dedent("""\
+            local engine = SceneRuntime.new(baseServices(nil), {})
+            local vol = newInstance{Name = "TriggerVol", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, Transparency = 1,
+                attrs = {_IsTriggerVolume = true}}
+            local got = engine:getTouchPart(vol)
+            print(got == vol and "SELF" or ("WRONG:" .. tostring(got and got.Name)))
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "SELF" in out
 
     def test_childless_basepart_still_passes_through(self):
         # Slice 1.1 Layer C regression: a BasePart go with NO marked
@@ -464,6 +486,114 @@ class TestConnectGameObjectSignalStay:
         assert "CONNECTED" in out
         assert "HITS 1" in out
         assert "ISLIMB" in out
+
+    def test_poll_queries_resolved_marked_trigger_not_body(self):
+        # Slice 1.1 CORE production claim: the poll must overlap-test the
+        # ``getTouchPart``-RESOLVED marked trigger volume (the 285-stud
+        # Collider), NOT the small visible body. The workspace mock records
+        # the actual ``part`` each sweep was called with; assert it is the
+        # MARKED volume, not the body. A getTouchPart/poll-wiring regression
+        # (poll querying the wrong part) turns this RED.
+        scenario = textwrap.dedent("""\
+            local services, hb = stayServices(nil)
+            local engine = SceneRuntime.new(services, {})
+            local limb = newInstance{Name = "Foot", ClassName = "Part",
+                isa = {BasePart = true}}
+            local ws = installWorkspace({limb})
+            -- The 285-stud detection volume: marked, invisible, CanTouch.
+            local trig = newInstance{Name = "Collider", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, Transparency = 1,
+                attrs = {_IsTriggerVolume = true}}
+            -- The small visible body that the go root is.
+            local body = newInstance{Name = "Turret", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, children = {trig}}
+            local comp = {}
+            engine._meta[comp] = {activeInHierarchy = true, enabled = true}
+            engine:connectGameObjectSignalStay(comp, body,
+                function() end)
+            services.setClock(1); hb:fire(0.016)
+            -- Prove the sweep queried the MARKED trigger, not the body.
+            if ws._queriedPart == trig then
+                print("QUERIED_MARKED")
+            elseif ws._queriedPart == body then
+                print("QUERIED_BODY")
+            else
+                print("QUERIED_OTHER:" .. tostring(ws._queriedPart and ws._queriedPart.Name))
+            end
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "QUERIED_MARKED" in out, (
+            "poll must query the getTouchPart-resolved MARKED trigger volume, "
+            f"not the body\n{out}"
+        )
+
+    def test_fail_soft_when_no_heartbeat_service(self):
+        # Heartbeat is optional across the runtime (the engine update loop
+        # guards ``if self._services.heartbeat``). When it is absent the poll
+        # must soft-fail (warn + nil) rather than hard-assert inside
+        # ``connect`` (``signal ~= nil``).
+        scenario = textwrap.dedent("""\
+            local services = baseServices(nil)
+            services.heartbeat = nil
+            local engine = SceneRuntime.new(services, {})
+            installWorkspace({})
+            local trig = newInstance{Name = "Collider", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true,
+                attrs = {_IsTriggerVolume = true}}
+            local body = newInstance{Name = "Turret", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, children = {trig}}
+            local comp = {}
+            engine._meta[comp] = {activeInHierarchy = true, enabled = true}
+            local ok, conn = pcall(function()
+                return engine:connectGameObjectSignalStay(comp, body,
+                    function() end)
+            end)
+            print(ok and "NOTHROW" or "THREW")
+            print(conn == nil and "NILCONN" or "GOTCONN")
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "NOTHROW" in out, f"absent heartbeat must not throw\n{out}"
+        assert "NILCONN" in out
+        assert "no heartbeat" in out
+
+    def test_gate_check_stops_callbacks_after_disable_mid_sweep(self):
+        # MAJOR-1: a callback that DISABLES the component (not destroys it)
+        # mid-iteration must stop further fn calls in the same sweep. The
+        # per-hit guard re-checks the lifecycle gate (``_isGateOpen``), not
+        # only ``_destroyed``.
+        scenario = textwrap.dedent("""\
+            local services, hb = stayServices(nil)
+            local engine = SceneRuntime.new(services, {})
+            local limbA = newInstance{Name = "A", ClassName = "Part",
+                isa = {BasePart = true}}
+            local limbB = newInstance{Name = "B", ClassName = "Part",
+                isa = {BasePart = true}}
+            installWorkspace({limbA, limbB})
+            local trig = newInstance{Name = "Collider", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true,
+                attrs = {_IsTriggerVolume = true}}
+            local body = newInstance{Name = "Turret", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, children = {trig}}
+            local comp = {}
+            engine._meta[comp] = {activeInHierarchy = true, enabled = true}
+            local hits = 0
+            engine:connectGameObjectSignalStay(comp, body, function(other)
+                hits = hits + 1
+                -- Disable (NOT destroy) mid-iteration after the first part.
+                engine._meta[comp].enabled = false
+            end)
+            services.setClock(1); hb:fire(0.016)
+            -- Only the first part fires; the gate re-check stops the rest.
+            print("HITS " .. tostring(hits))
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "HITS 1" in out, (
+            "a mid-sweep DISABLE must stop remaining callbacks (gate re-check)"
+            f"\n{out}"
+        )
 
     def test_throttle_skips_ticks_inside_interval(self):
         # Two Heartbeat ticks within the throttle window => only ONE sweep

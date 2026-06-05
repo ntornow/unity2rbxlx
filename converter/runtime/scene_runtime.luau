@@ -409,7 +409,7 @@ end
 -- match or nil. Lets ``getTouchPart`` prefer an explicit trigger volume
 -- over a bare BasePart ``go`` (e.g. a BasePart-root turret whose 285-stud
 -- ``Collider`` child is the real detection radius).
-local function _findMarkedTriggerVolume(go): any
+local function _findMarkedTriggerVolume(go): BasePart?
 	if go == nil then return nil end
 	if _isMarkedTriggerVolume(go) then return go end
 	if type(go.GetDescendants) ~= "function" then return nil end
@@ -537,10 +537,20 @@ function SceneRuntime:connectGameObjectSignalStay(comp, go, fn)
 			tostring(go)))
 		return nil
 	end
+	-- Heartbeat is optional across the runtime (the engine update loop
+	-- guards ``if self._services.heartbeat then ...``). Soft-fail here
+	-- rather than letting ``connect``'s ``signal ~= nil`` assert throw.
+	local heartbeat = self._services.heartbeat
+	if heartbeat == nil then
+		self._warn(string.format(
+			"[scene_runtime] connectGameObjectSignalStay: no heartbeat service for %s",
+			tostring(go)))
+		return nil
+	end
 	local engine = self
 	local nowFn = self._services.now or os.clock
 	local lastTick = 0
-	return self:connect(comp, self._services.heartbeat, function()
+	return self:connect(comp, heartbeat, function()
 		local now = nowFn()
 		if now - lastTick < _STAY_POLL_INTERVAL then return end
 		lastTick = now
@@ -551,8 +561,13 @@ function SceneRuntime:connectGameObjectSignalStay(comp, go, fn)
 		end)
 		if not ok or type(hits) ~= "table" then return end
 		for _, hit in ipairs(hits) do
-			-- Liveness/re-entrancy guard: ``fn`` may destroy ``comp``.
-			if engine._destroyed[comp] then return end
+			-- Liveness/re-entrancy + disable guard: ``fn`` may destroy OR
+			-- disable ``comp`` mid-sweep. The outer ``connect`` gate only
+			-- checks once per tick, so re-check the lifecycle gate before
+			-- each callback so a mid-sweep disable stops remaining hits.
+			if engine._destroyed[comp] or not engine:_isGateOpen(comp) then
+				return
+			end
 			fn(hit)
 		end
 	end)
