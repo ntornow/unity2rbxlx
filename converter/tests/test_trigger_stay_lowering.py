@@ -329,6 +329,51 @@ def test_balanced_go_expressions_still_lower() -> None:
         ), f"go={go!r} not preserved verbatim"
 
 
+def test_go_with_longstring_internal_touched_still_lowers() -> None:
+    """(FINDING 1) A BALANCED go whose first arg is a Luau long-bracket string
+    literal carrying an internal ``, "Touched",`` -- ``self:pick([[foo,
+    "Touched", bar]], x)`` -- is balanced (the ``[[ ... ]]`` payload is a
+    string, its contents skipped) and LOWERS (count 1). RED against the
+    pre-fix helper, which treated ``[[``/``]]`` as structural brackets and
+    judged it unbalanced -> false-abstain."""
+    go = 'self:pick([[foo, "Touched", bar]], x)'
+    src = textwrap.dedent(f"""\
+        function Turret:Awake()
+            -- OnTriggerStay(other)
+            self.host:connectGameObjectSignal({go}, "Touched", function(other)
+                self:_engage(other)
+            end)
+        end
+    """)
+    s = _S(src)
+    n = lower_trigger_stay([s])
+    assert n == 1
+    assert (
+        f"self.host:connectGameObjectSignalStay({go}, function(other)"
+        in s.luau_source
+    )
+
+
+def test_go_with_mismatched_delimiters_abstains() -> None:
+    """(FINDING 2) A go fragment whose brackets are present but of MISMATCHED
+    type (``self.parts(1]`` -- a ``(`` closed by a ``]``) is NOT balanced under
+    a type-matched stack, so the pass ABSTAINS (count 0, source unchanged).
+    RED against the single-counter helper, which let ``(`` and ``]`` net to
+    depth zero and wrongly accepted the fragment."""
+    src = textwrap.dedent("""\
+        function Turret:Awake()
+            -- OnTriggerStay(other)
+            self.host:connectGameObjectSignal(self.parts(1], "Touched", function(other) end)
+        end
+    """)
+    s = _S(src)
+    before = s.luau_source
+    n = lower_trigger_stay([s])
+    assert n == 0
+    assert s.luau_source == before
+    assert "connectGameObjectSignalStay" not in s.luau_source
+
+
 def test_binding_inside_long_string_is_not_lowered() -> None:
     """(FINDING 1) A binding inside a MULTI-LINE ``[[ ... ]]`` long string
     (opened on an earlier line, with a ``-- OnTriggerStay`` line inside the

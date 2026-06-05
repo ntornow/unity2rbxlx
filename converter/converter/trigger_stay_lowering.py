@@ -47,10 +47,19 @@ EXACT, BINDING-LOCAL match (BLOCKING design requirement):
     matches, so a second pass is a no-op.
 
 The matcher is string-span / structural (consistent with the other facet
-transforms). ``<go>`` is captured as the whole first argument (a name, an
-index, or a call -- not just ``self.gameObject``) and preserved verbatim.
-Two abstain guards stop a rewrite inside a Lua string/comment so source is
-never corrupted: ``_luau_pos_is_code`` skips short quoted strings and ``--``
+transforms). A line-local regex finds only the call HEAD
+(``self.host:connectGameObjectSignal(``); ``_find_touched_separator`` then scans
+forward for the first CODE-LEVEL ``, "Touched",`` separator -- skipping any
+``"Touched"`` buried inside the go expression's own short string, Luau
+long-bracket string, or ``--`` comment -- so ``<go>`` is the whole first
+argument (a name, an index, or a call -- not just ``self.gameObject``, and may
+itself carry a long-string literal) and is preserved verbatim. The captured
+``<go>`` is balance-checked (``_is_balanced_first_arg``: type-matched bracket
+stack + short/long-string aware) and the rewrite ABSTAINS on any unbalanced /
+mismatched fragment -- the safe degrade, never a corrupt rewrite.
+
+Two further abstain guards stop a rewrite whose HEAD itself sits inside a Lua
+string/comment: ``_luau_pos_is_code`` skips short quoted strings and ``--``
 line comments (line-local), and ``_luau_pos_in_long_bracket`` skips multi-line
 long-bracket strings (``[[ ... ]]``/``[=[ ... ]=]``) and block comments
 (``--[[ ... ]]``) opened on an earlier line.
@@ -66,43 +75,37 @@ class _HasLuauSource(Protocol):
     luau_source: str
 
 
-# Match the call head + first ``"Touched"`` argument of a GameObject-signal
-# binding:  ``self.host:connectGameObjectSignal(<go>, "Touched",``
+# Match the call HEAD up to (and including) the open paren of a GameObject-
+# signal binding:  ``self.host:connectGameObjectSignal(``
 #
 # Groups:
 #   indent = leading indentation on the call's own line (used to find line start)
-#   head   = receiver+method+open-paren+<go>+comma, e.g.
-#       ``self.host:connectGameObjectSignal(self.gameObject, ``  -- everything
-#       up to (and including) the comma+space before the "Touched" literal.
+#   head   = receiver+method+open-paren, e.g.
+#       ``self.host:connectGameObjectSignal(``
 #
-# ``<go>`` is captured NON-GREEDILY (``.+?``) as the minimal text up to the
-# ``, "Touched",`` separator. The anchor ``,\s*['"]Touched['"]`` forces the
-# capture to extend past any internal commas inside the go expression (a call
-# ``self:getTriggerPart()`` or an index ``self.parts[1]`` with a ``foo(a, b)``
-# subexpression is captured whole), so a local alias ``trigger``, an index,
-# or a call -- not just the contract default ``self.gameObject`` -- all match
-# and are preserved verbatim in the rewrite. Both ``:`` (method) and ``.``
-# (field) call forms are accepted. ``"Touched"`` may use single or double
-# quotes. The trailing ``,\s*`` is consumed so the rewrite drops the literal
-# AND its separator, leaving the function expression as the (now first) arg.
+# The ``<go>`` first argument and the ``, "Touched",`` separator are NO LONGER
+# matched by the regex -- they are found STRUCTURALLY by ``_find_touched_separator``
+# scanning from the open paren. A naive non-greedy ``.+? , "Touched",`` regex
+# anchors on the *first textual* ``"Touched"``, which can fall INSIDE the go
+# expression's own string literal (e.g. a long-bracket string ``[[foo,
+# "Touched", bar]]``) and truncate the go mid-string -> false-abstain. The
+# structural scan skips ``"Touched"`` occurrences that sit inside a short or
+# long string and anchors on the first CODE-LEVEL separator instead.
 #
-# NO ``re.DOTALL``: ``.`` excludes newlines, so the whole ``connect...(...,
-# "Touched",`` match stays on one physical line. The transpiler always emits
-# the ``<go>, "Touched",`` head on a single line; keeping ``.`` line-local
-# means the non-greedy ``<go>`` can never run past the binding's line to
-# swallow a ``"Touched"`` on some later line.
-_CONNECT_TOUCHED_RE = re.compile(
+# Both ``:`` (method) and ``.`` (field) call forms are accepted.
+_CONNECT_HEAD_RE = re.compile(
     r"""(?P<indent>[ \t]*)
         (?P<head>
             self\.host[:.]connectGameObjectSignal
             \s*\(\s*
-            (?P<go>.+?)                  # <go> -- minimal text up to ", \"Touched\","
-            \s*,\s*
         )
-        ['"]Touched['"]\s*,\s*           # the "Touched" arg + separator (dropped)
     """,
     re.VERBOSE,
 )
+
+# The ``"Touched"`` (single or double quoted) separator literal, used by the
+# structural scan to test a candidate code-level anchor.
+_TOUCHED_LITERAL_RE = re.compile(r"""['"]Touched['"]""")
 
 # The exact origin-comment token that gates the rewrite. Anchored to the start
 # of the comment body so ``OnTriggerStay`` matches but ``OnCollisionStay`` and
@@ -111,10 +114,16 @@ _CONNECT_TOUCHED_RE = re.compile(
 _STAY_COMMENT_RE = re.compile(r"^--\s*OnTriggerStay\b")
 
 
+# The closer expected on top of the bracket stack for each opener -- a
+# TYPE-MATCHED match, so a ``(`` cancelled by a ``]`` (``(1]``) is unbalanced.
+_BRACKET_CLOSER = {"(": ")", "[": "]", "{": "}"}
+
+
 def _is_balanced_first_arg(go: str) -> bool:
     """True if ``go`` is a *complete, balanced* first argument: all ``()``,
-    ``[]``, ``{}`` are balanced AND every quote is closed (no unterminated
-    string), with delimiters inside string literals ignored.
+    ``[]``, ``{}`` are balanced WITH MATCHING TYPES, every short quote is closed
+    (no unterminated string), and no Luau long-bracket string is left open --
+    delimiters inside string literals (short OR long) ignored.
 
     The widened ``.+?`` go-capture anchors on the *first* ``, "Touched",`` it
     sees. If the go expression itself contains an internal ``, "Touched",``
@@ -123,19 +132,29 @@ def _is_balanced_first_arg(go: str) -> bool:
     (``self:pick("foo"``). Rewriting that fragment drops the wrong ``"Touched"``
     and corrupts the call. Guarding on balance lets the real captures
     (``self.gameObject``, ``self.parts[1]``, ``self:getTriggerPart()``,
-    ``self:pick("Touched", x)``) through while the pathological internal-anchor
-    fragment -- which is necessarily unbalanced -- ABSTAINS (bias-to-abstain:
-    the safe degrade, never corrupt).
+    ``self:pick("Touched", x)``, ``self:pick([[foo, "Touched", bar]], x)``)
+    through while the pathological internal-anchor fragment -- which is
+    necessarily unbalanced -- ABSTAINS (bias-to-abstain: the safe degrade,
+    never corrupt).
+
+    Two correctness properties beyond a naive depth counter:
+      * Long-string aware: a Luau long-bracket literal (``[[ ... ]]`` and
+        leveled ``[=[ ... ]=]``) is a STRING -- its contents (including any
+        ``, "Touched",`` or stray brackets) are skipped, reusing
+        ``_long_bracket_open_level`` so a balanced go carrying a long-string
+        does not false-abstain. An UNCLOSED long string is unbalanced.
+      * Type-matched stack: each closer must match the most-recent opener's
+        type, so ``(1]`` is unbalanced rather than netting to depth zero.
     """
-    depth = 0
-    quote: str | None = None
+    stack: list[str] = []  # expected closers, innermost last
+    quote: str | None = None  # open short-quote char, or None
     i = 0
     n = len(go)
     while i < n:
         ch = go[i]
         if quote is not None:
-            # Inside a string: only a backslash-escape or the matching close
-            # quote is meaningful; bracket chars are literal text.
+            # Inside a short string: only a backslash-escape or the matching
+            # close quote is meaningful; bracket chars are literal text.
             if ch == "\\":
                 i += 2
                 continue
@@ -145,14 +164,26 @@ def _is_balanced_first_arg(go: str) -> bool:
             continue
         if ch in ("'", '"'):
             quote = ch
-        elif ch in ("(", "[", "{"):
-            depth += 1
+            i += 1
+            continue
+        if ch == "[":
+            # A ``[`` may open a Luau long-bracket string (``[[``/``[=[``); if
+            # so, skip its whole payload. A bare ``[`` (indexing) falls through
+            # to the bracket-stack push below.
+            level = _long_bracket_open_level(go, i)
+            if level is not None:
+                close = go.find("]" + "=" * level + "]", i + level + 2)
+                if close == -1:
+                    return False  # unterminated long string -> unbalanced
+                i = close + level + 2
+                continue
+        if ch in ("(", "[", "{"):
+            stack.append(_BRACKET_CLOSER[ch])
         elif ch in (")", "]", "}"):
-            depth -= 1
-            if depth < 0:
-                return False  # a close with no matching open
+            if not stack or stack.pop() != ch:
+                return False  # close with no/mismatched open
         i += 1
-    return depth == 0 and quote is None
+    return not stack and quote is None
 
 
 def _luau_pos_is_code(source: str, pos: int) -> bool:
@@ -258,6 +289,99 @@ def _long_bracket_open_level(source: str, i: int) -> int | None:
     return None
 
 
+def _find_touched_separator(source: str, start: int) -> int | None:
+    """Scan ``source`` from ``start`` (the char just after the call's open paren,
+    i.e. the first char of ``<go>``) for the first CODE-LEVEL ``, "Touched",``
+    argument separator. Return the index of the opening quote of that ``"Touched"``
+    literal, or ``None`` if no code-level separator is found on the binding's
+    physical line.
+
+    "Code-level" means NOT inside a short string, a Luau long-bracket string, or
+    a ``--`` comment (line OR ``--[=*[`` block). A naive first-textual-``"Touched"``
+    anchor (the old non-greedy regex) lands on a ``"Touched"`` buried inside the
+    go expression's own string/comment payload (e.g. a long-string first arg
+    ``[[foo, "Touched", bar]]``) and truncates the go mid-literal -> false-abstain
+    or, worse, the wrong separator. Skipping string/comment spans anchors on the
+    real separator instead.
+
+    The scan is LINE-LOCAL (stops at the first newline): the transpiler always
+    emits the ``connect...(<go>, "Touched",`` head on a single physical line, so
+    a separator on a later line would belong to a different binding.
+
+    NOTE: bracket depth is intentionally NOT tracked. The FIRST code-level
+    ``, "Touched",`` is taken as the separator even when it sits inside a nested
+    call (``self:pick(a, "Touched", x)``); the resulting prefix go is then
+    unbalanced and the caller's balance guard ABSTAINS. This bias-to-abstain on
+    an ambiguous nested ``, "Touched",`` is the safe degrade -- never a corrupt
+    rewrite -- and keeps the round-2 short-string case abstaining.
+    """
+    i = start
+    n = len(source)
+    while i < n:
+        ch = source[i]
+        if ch == "\n":
+            return None  # separator must be on the binding's own line
+        if ch == "-" and i + 1 < n and source[i + 1] == "-":
+            # ``--`` comment: a ``--[=*[`` block comment skips to its close;
+            # a plain line comment runs to end of line (-> no separator).
+            level = _long_bracket_open_level(source, i + 2)
+            if level is not None:
+                close = source.find("]" + "=" * level + "]", i + 2)
+                if close == -1:
+                    return None  # unterminated block comment -> no separator
+                i = close + level + 2
+                continue
+            return None  # line comment to EOL -> no code-level separator
+        if ch in ("'", '"'):
+            # Short quoted string: a CODE-LEVEL separator candidate is a quote
+            # that opens ``"Touched"`` immediately preceded by ``, ``. Test the
+            # separator pattern here before treating it as an opaque string.
+            sep = _TOUCHED_LITERAL_RE.match(source, i)
+            if sep is not None and _is_separator_context(source, start, i, sep.end()):
+                return i
+            # Otherwise skip the whole short string (honor escapes / EOL).
+            quote = ch
+            i += 1
+            while i < n:
+                c = source[i]
+                if c == "\\":
+                    i += 2
+                    continue
+                if c == quote or c == "\n":
+                    break
+                i += 1
+            i += 1
+            continue
+        if ch == "[":
+            level = _long_bracket_open_level(source, i)
+            if level is not None:
+                close = source.find("]" + "=" * level + "]", i + level + 2)
+                if close == -1:
+                    return None  # unterminated long string -> no separator
+                i = close + level + 2
+                continue
+        i += 1
+    return None
+
+
+def _is_separator_context(source: str, go_start: int, quote_pos: int, after: int) -> bool:
+    """True if the ``"Touched"`` literal at ``quote_pos..after`` is a genuine
+    ``, "Touched",`` ARGUMENT separator: preceded by ``,`` (after optional
+    whitespace, but not at the very start of ``<go>``) and followed by ``,``
+    (after optional whitespace). A bare ``"Touched"`` that is the WHOLE first
+    arg or a sub-argument (``pick("Touched", x)`` -> preceded by ``(``) is NOT a
+    separator."""
+    j = quote_pos - 1
+    while j >= go_start and source[j] in (" ", "\t"):
+        j -= 1
+    if j < go_start or source[j] != ",":
+        return False
+    k = after
+    while k < len(source) and source[k] in (" ", "\t"):
+        k += 1
+    return k < len(source) and source[k] == ","
+
+
 def _preceding_comment_line(source: str, line_start: int) -> str | None:
     """Return the stripped text of the LITERAL immediately-preceding physical
     line (the one ending at the newline just before ``line_start``), or ``None``
@@ -288,41 +412,67 @@ def rewrite_trigger_stay_source(source: str) -> tuple[str, int]:
     Returns ``(new_source, count)`` where ``count`` is the number of bindings
     rewritten (0 -> ``source`` returned unchanged)."""
     count = 0
+    out: list[str] = []
+    cursor = 0  # index in ``source`` up to which output has been emitted
 
-    def _repl(m: "re.Match[str]") -> str:
-        nonlocal count
-        # Skip matches that live inside a short string literal / ``--`` line
-        # comment (scanned line-locally) OR inside a multi-line long-bracket
-        # string / block comment opened on an earlier line (scanned from source
-        # start). Either => ABSTAIN, never corrupt the payload.
-        if not _luau_pos_is_code(source, m.start("head")):
-            return m.group(0)
-        if _luau_pos_in_long_bracket(source, m.start("head")):
-            return m.group(0)
-        # The binding's own line begins after the captured indent.
-        line_start = m.start("indent")
-        comment = _preceding_comment_line(source, line_start)
+    for m in _CONNECT_HEAD_RE.finditer(source):
+        head_start = m.start("head")
+        # Skip heads inside a short string literal / ``--`` line comment (scanned
+        # line-locally) OR inside a multi-line long-bracket string / block comment
+        # opened on an earlier line (scanned from source start). Either => leave
+        # untouched, never corrupt the payload.
+        if not _luau_pos_is_code(source, head_start):
+            continue
+        if _luau_pos_in_long_bracket(source, head_start):
+            continue
+        # The origin comment must be on the line immediately above the binding.
+        comment = _preceding_comment_line(source, m.start("indent"))
         if comment is None or not _STAY_COMMENT_RE.match(comment):
-            return m.group(0)
-        # The non-greedy ``<go>`` capture can anchor on an INTERNAL ``, "Touched",``
-        # inside the go expression, over-capturing a short unbalanced fragment.
+            continue
+        # Find the first CODE-LEVEL ``, "Touched",`` separator structurally (the
+        # regex no longer guesses it): ``go`` is everything between the open paren
+        # and that separator.
+        go_start = m.end("head")
+        sep_quote = _find_touched_separator(source, go_start)
+        if sep_quote is None:
+            continue  # no code-level "Touched" separator -> not this binding
+        go = source[go_start:sep_quote].rstrip()
+        # Trim the trailing ``,`` + whitespace that precedes the separator quote
+        # (``<go>, ``) so the balance check sees just the go expression.
+        go = go[:-1].rstrip() if go.endswith(",") else go
         # Only rewrite when the captured go is a balanced, complete first arg;
-        # otherwise ABSTAIN (return the match unchanged) -- never corrupt.
-        if not _is_balanced_first_arg(m.group("go")):
-            return m.group(0)
-        count += 1
-        # Drop ``"Touched", `` and rename the method to the Stay variant; the
-        # function expression that followed becomes the (now first) trailing
-        # argument, preserved verbatim by the regex consuming only up to it.
-        head = m.group("head").replace(
+        # otherwise ABSTAIN (leave the binding unchanged) -- never corrupt.
+        if not _is_balanced_first_arg(go):
+            continue
+        # Consume the separator: ``"Touched"`` + following ``,\s*`` so the rewrite
+        # drops the literal AND its separator, leaving the function expression as
+        # the (now first) trailing argument.
+        sep_end = _TOUCHED_LITERAL_RE.match(source, sep_quote)
+        assert sep_end is not None  # _find_touched_separator only returns a "Touched" pos
+        k = sep_end.end()
+        while k < len(source) and source[k] in (" ", "\t"):
+            k += 1
+        if k < len(source) and source[k] == ",":
+            k += 1
+        while k < len(source) and source[k] in (" ", "\t"):
+            k += 1
+        # Emit everything up to the head, the Stay-renamed head, then ``<go>``
+        # and its ``, `` separator (``source[go_start:sep_quote]``) verbatim, and
+        # resume the cursor AFTER the dropped ``"Touched", ``.
+        new_head = m.group("head").replace(
             "connectGameObjectSignal", "connectGameObjectSignalStay", 1,
         )
-        return m.group("indent") + head
+        out.append(source[cursor:m.start("indent")])
+        out.append(m.group("indent"))
+        out.append(new_head)
+        out.append(source[go_start:sep_quote])  # <go> + its ``, `` separator
+        cursor = k  # resume after the dropped ``"Touched", ``
+        count += 1
 
-    new_source = _CONNECT_TOUCHED_RE.sub(_repl, source)
     if count == 0:
         return source, 0
-    return new_source, count
+    out.append(source[cursor:])
+    return "".join(out), count
 
 
 def lower_trigger_stay(scripts: list[_HasLuauSource]) -> int:
