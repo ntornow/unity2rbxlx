@@ -1212,6 +1212,7 @@ The contract-compliant replacement for a **GameObject touch** is
 
 ```luau
 function Class:Awake()
+    -- OnTriggerEnter(other)
     self.host:connectGameObjectSignal(self.gameObject, "Touched", function(other)
         -- the body that used to live in OnTriggerEnter(other).
         local plr = self.host.playerFromTouch(other)
@@ -1220,6 +1221,8 @@ function Class:Awake()
     end)
 end
 ```
+
+ALWAYS emit a `-- OnTrigger<Phase>(other)` (or `-- OnCollision<Phase>(...)`) origin comment on the line **immediately above** each such binding, naming the exact Unity callback it came from (`OnTriggerEnter`, `OnTriggerExit`, `OnTriggerStay`, …). A deterministic post-pass keys on this comment to lower `OnTriggerStay` to its poll primitive (see below), so the comment is part of the contract, not decoration.
 
 - `self.gameObject` may be a **Model** (prefab placement) or a BasePart.
   `.Touched` is a BasePart-only signal and THROWS on a Model. NEVER write
@@ -1324,8 +1327,10 @@ The Unity → Roblox API mapping below covers patterns inside method bodies. Mod
 - `StartCoroutine(Routine())` → `self.host.startCoroutine(self, function() ... end)`.
 
 ### Trigger / collision / mouse (host:connectGameObjectSignal, never name-dispatch)
-- `OnTriggerEnter / Exit / Stay` → `self.host:connectGameObjectSignal(self.gameObject, "Touched", function(other) ... end)` in `Awake` (use `"TouchEnded"` for Exit). NEVER `self.host:connect(self.gameObject.Touched, ...)` — `self.gameObject` may be a Model and `.Touched` throws on a Model.
-- `OnCollisionEnter / Exit / Stay` → same shape; Roblox `.Touched` covers both unless code distinguishes by impulse.
+ALWAYS put a `-- OnTrigger<Phase>(other)` / `-- OnCollision<Phase>(...)` origin comment on the line immediately above each binding (it names the exact Unity callback and is contract-required — a deterministic post-pass keys on it).
+- `OnTriggerEnter` → `self.host:connectGameObjectSignal(self.gameObject, "Touched", function(other) ... end)` in `Awake`. `OnTriggerExit` → same call with `"TouchEnded"`. NEVER `self.host:connect(self.gameObject.Touched, ...)` — `self.gameObject` may be a Model and `.Touched` throws on a Model.
+- `OnTriggerStay` → `self.host:connectGameObjectSignalStay(self.gameObject, function(other) ... end)` in `Awake` — DISTINCT from Enter. Unity `OnTriggerStay` fires every physics frame the collider overlaps (a player standing inside the volume with no fresh contact edge), so it lowers to a polling primitive, NOT the `"Touched"` edge. (You may still emit the Enter-shaped `connectGameObjectSignal(self.gameObject, "Touched", …)` under a `-- OnTriggerStay(other)` comment; the deterministic post-pass rewrites that exact comment-keyed binding to `connectGameObjectSignalStay` for you. The origin comment is mandatory either way.)
+- `OnCollisionEnter / Exit / Stay` → `connectGameObjectSignal(self.gameObject, "Touched"/"TouchEnded", …)`; Roblox `.Touched` covers both unless code distinguishes by impulse. `OnCollisionStay` stays an edge (it is NOT lowered to the Stay poll — only `OnTriggerStay` is).
 - Player gate inside the callback: `local plr = self.host.playerFromTouch(other); if plr then ... end` (or `if self.host.isPlayerTouch(other) then`). NEVER `CollectionService:HasTag(other, "Player")` or `other.tag == "Player"` — `other` is a raw character limb, not the tagged character Model.
 - `OnMouse*` → `self.host:connect(self.gameObject.MouseClick / MouseEnter / MouseLeave, ...)` if the GameObject has a `ClickDetector`; otherwise log unsupported.
 
