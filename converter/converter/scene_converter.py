@@ -2314,7 +2314,13 @@ def _process_components(
                 if trigger_owns_part_size:
                     # No other Size authority on this node — size the Part
                     # to the trigger volume, hide it, and shape-hint Ball
-                    # for spherical triggers.
+                    # for spherical triggers. Mark it an explicit trigger
+                    # volume so the host's ``getTouchPart`` prefers it (and
+                    # the OnTriggerStay poll resolves the detection radius,
+                    # not a small visible body) regardless of the Part's name.
+                    if part.attributes is None:
+                        part.attributes = {}
+                    part.attributes["_IsTriggerVolume"] = True
                     part.size = (
                         max(part.size[0], trigger_size[0]),
                         max(part.size[1], trigger_size[1]),
@@ -2395,6 +2401,13 @@ def _process_components(
                     )
                     if ct == "SphereCollider":
                         trigger_child.shape = 0  # Ball
+                    # Mark the child an explicit trigger volume so the host's
+                    # ``getTouchPart`` prefers it over the visible parent body
+                    # (the OnTriggerStay poll must overlap-test the detection
+                    # radius, not the small mesh).
+                    if trigger_child.attributes is None:
+                        trigger_child.attributes = {}
+                    trigger_child.attributes["_IsTriggerVolume"] = True
                     part.children.append(trigger_child)
             else:
                 # Apply each collider against the original size to avoid

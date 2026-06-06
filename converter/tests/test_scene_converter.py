@@ -1651,6 +1651,154 @@ class TestTriggerVsMeshSizeAuthority:
         assert "_TriggerSizeX" not in attrs
 
 
+class TestIsTriggerVolumeStamp:
+    """Slice 1.1 Layer C: every trigger-collider-derived Part carries an
+    explicit ``_IsTriggerVolume=True`` marker so the host's
+    ``getTouchPart`` resolves the detection radius (not a small visible
+    body) regardless of the Part's name. Covers BOTH emission branches:
+    the standalone transparent trigger Part (``trigger_owns_part_size``)
+    and the synthetic ``TriggerZone`` child (visible-body + trigger node).
+    """
+
+    @staticmethod
+    def _fake_comp(component_type, properties):
+        c = type("FakeComp", (), {})()
+        c.component_type = component_type
+        c.properties = properties
+        return c
+
+    @staticmethod
+    def _fake_node(components, name="Node", mesh_guid=""):
+        n = type("FakeNode", (), {})()
+        n.name = name
+        n.components = list(components)
+        n.mesh_guid = mesh_guid
+        return n
+
+    def test_standalone_trigger_part_marked(self):
+        # Trigger is the ONLY sized component -> it owns the Part size and
+        # is the trigger volume itself; mark it.
+        from converter.scene_converter import _process_components
+        from core.roblox_types import RbxPart
+
+        part = RbxPart(name="Collider")
+        part.size = (0.05, 0.05, 0.05)
+        comps = [
+            self._fake_comp("SphereCollider",
+                            {"m_Radius": 5.0, "m_IsTrigger": 1}),
+        ]
+        _process_components(self._fake_node(comps, name="Collider"), part)
+        assert part.attributes.get("_IsTriggerVolume") is True, (
+            f"standalone trigger Part not marked: {part.attributes}"
+        )
+
+    def test_triggerzone_child_marked(self):
+        # Visible mesh + trigger on the same node -> a transparent
+        # ``TriggerZone`` child is emitted; it carries the marker.
+        from converter.scene_converter import _process_components
+        from core.roblox_types import RbxPart
+
+        part = RbxPart(name="Mine")
+        part.size = (1.153, 0.348, 1.250)
+        comps = [
+            self._fake_comp("MeshFilter", {}),
+            self._fake_comp("MeshRenderer", {}),
+            self._fake_comp("BoxCollider",
+                            {"m_Size": {"x": 0.323, "y": 0.098, "z": 0.350},
+                             "m_IsTrigger": 0}),
+            self._fake_comp("SphereCollider",
+                            {"m_Radius": 2.0, "m_IsTrigger": 1}),
+        ]
+        node = self._fake_node(comps, name="Mine", mesh_guid="abcd"*8)
+        _process_components(node, part)
+
+        tz = [c for c in part.children if c.name == "TriggerZone"]
+        assert len(tz) == 1, f"expected 1 TriggerZone child, got {len(tz)}"
+        assert tz[0].attributes.get("_IsTriggerVolume") is True, (
+            f"TriggerZone child not marked: {tz[0].attributes}"
+        )
+
+    def test_non_trigger_collider_not_marked(self):
+        # A physical (non-trigger) collider must NOT gain the marker —
+        # only trigger volumes are detection radii.
+        from converter.scene_converter import _process_components
+        from core.roblox_types import RbxPart
+
+        part = RbxPart(name="Wall")
+        comps = [
+            self._fake_comp("BoxCollider",
+                            {"m_Size": {"x": 1, "y": 1, "z": 1},
+                             "m_IsTrigger": 0}),
+        ]
+        _process_components(self._fake_node(comps, name="Wall"), part)
+        assert "_IsTriggerVolume" not in part.attributes, (
+            f"non-trigger collider wrongly marked: {part.attributes}"
+        )
+
+
+class TestScriptClassDiscoveryStamp:
+    """Slice 1.1 discovery-stamp regression guard (verify-only): a
+    MonoBehaviour's script class is stamped as ``_ScriptClass`` on the
+    GameObject's Part — the attribute the e2e fixture keys on to LOCATE the
+    turret node. Generic class-name stamping (NOT turret-specific).
+
+    This stamping is pre-existing (``_extract_monobehaviour_attributes`` ->
+    ``_process_components`` runs on the root node for both Parts and
+    Models, scene_converter.py ~4767). The test pins it so a refactor can't
+    silently drop the discovery key.
+    """
+
+    def test_monobehaviour_class_stamped_as_scriptclass(self):
+        import converter.scene_converter as sc
+        from core.roblox_types import RbxPart
+
+        class _GuidIndex:
+            def resolve(self, guid):
+                # Resolve the script GUID to a .cs path whose stem is the
+                # generic class name.
+                if guid == "turretguid":
+                    return Path("Assets/Scripts/Turret.cs")
+                return None
+
+        part = RbxPart(name="Turret")
+        sc._extract_monobehaviour_attributes(
+            {"m_Script": {"guid": "turretguid", "fileID": 11500000}},
+            part, guid_index=_GuidIndex(),
+        )
+        assert part.attributes.get("_ScriptClass") == "Turret", (
+            f"_ScriptClass discovery key not stamped: {part.attributes}"
+        )
+
+    def test_second_monobehaviour_gets_numbered_slot(self):
+        # Multiple MonoBehaviours on one GameObject each get a slot so the
+        # fixture's ``any _ScriptClass* == <class>`` match holds.
+        import converter.scene_converter as sc
+        from core.roblox_types import RbxPart
+
+        class _GuidIndex:
+            def resolve(self, guid):
+                return {
+                    "aguid": Path("Assets/A.cs"),
+                    "bguid": Path("Assets/Turret.cs"),
+                }.get(guid)
+
+        part = RbxPart(name="Node")
+        sc._extract_monobehaviour_attributes(
+            {"m_Script": {"guid": "aguid", "fileID": 11500000}},
+            part, guid_index=_GuidIndex(),
+        )
+        sc._extract_monobehaviour_attributes(
+            {"m_Script": {"guid": "bguid", "fileID": 11500000}},
+            part, guid_index=_GuidIndex(),
+        )
+        slots = {k: v for k, v in part.attributes.items()
+                 if k.startswith("_ScriptClass")}
+        assert "Turret" in slots.values(), (
+            f"second MonoBehaviour class missing from _ScriptClass slots: "
+            f"{slots}"
+        )
+
+
 class TestPrefabInstanceScaleNotDoubled:
     """A PrefabInstance must size its Part to the effective instance scale,
     not ``prefab_root.scale × instance_scale`` (which double-counts the

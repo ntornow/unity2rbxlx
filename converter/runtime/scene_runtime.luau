@@ -387,8 +387,42 @@ local function _looksLikeNamedTrigger(inst): boolean
 	return false
 end
 
--- ``getTouchPart(go) -> BasePart?``: resolve a representative part to
--- host a Touched/TouchEnded signal for a GameObject.
+-- Returns true when ``inst`` is a BasePart explicitly stamped by the
+-- converter as a trigger detection volume (``_IsTriggerVolume`` attribute)
+-- and can still receive touches. The converter stamps this on every
+-- trigger-collider-derived Part (the standalone transparent trigger Part
+-- and the synthetic ``TriggerZone`` child) so the host can resolve the
+-- detection radius without relying on name heuristics.
+local function _isMarkedTriggerVolume(inst): boolean
+	if not _isBasePart(inst) then return false end
+	if inst.CanTouch == false then return false end
+	if type(inst.GetAttribute) ~= "function" then return false end
+	local ok, marked = pcall(function()
+		return inst:GetAttribute("_IsTriggerVolume")
+	end)
+	return ok and marked == true
+end
+
+-- ``_findMarkedTriggerVolume(go) -> BasePart?``: scan ``go`` itself (when
+-- it is a BasePart) and its descendants (when it is a Model) for a
+-- ``_IsTriggerVolume``-marked BasePart with CanTouch. Returns the first
+-- match or nil. Lets ``getTouchPart`` prefer an explicit trigger volume
+-- over a bare BasePart ``go`` (e.g. a BasePart-root turret whose 285-stud
+-- ``Collider`` child is the real detection radius).
+local function _findMarkedTriggerVolume(go): BasePart?
+	if go == nil then return nil end
+	if _isMarkedTriggerVolume(go) then return go end
+	if type(go.GetDescendants) ~= "function" then return nil end
+	local ok, descendants = pcall(function() return go:GetDescendants() end)
+	if not ok or type(descendants) ~= "table" then return nil end
+	for _, d in ipairs(descendants) do
+		if _isMarkedTriggerVolume(d) then return d end
+	end
+	return nil
+end
+
+-- ``getTouchPart(go, preferTriggerVolume) -> BasePart?``: resolve a
+-- representative part to host a Touched/TouchEnded signal for a GameObject.
 --   * BasePart  -> itself.
 --   * Model     -> tiered descendant search:
 --       (1) a named trigger child (TriggerZone / *TouchDetector* /
@@ -398,8 +432,28 @@ end
 --       (3) the first BasePart descendant.
 --     PrimaryPart is never the primary key.
 --   * anything else / no part -> nil.
-function SceneRuntime:getTouchPart(go)
+--
+-- ``preferTriggerVolume`` (default false): when true, a converter-stamped
+-- ``_IsTriggerVolume`` volume on ``go`` (itself or a descendant) wins over
+-- the bare-BasePart passthrough and tier search -- so a BasePart-root turret
+-- resolves its detection-radius Collider child, not the small visible body.
+-- ONLY the OnTriggerStay proximity poll (``connectGameObjectSignalStay``)
+-- passes this; the shared edge resolver (``connectGameObjectSignal`` for
+-- ``Touched``/``TouchEnded`` -- OnTriggerEnter/Exit/OnCollision*) omits it so
+-- those callbacks keep binding to the physical body / original tier result.
+function SceneRuntime:getTouchPart(go, preferTriggerVolume)
 	if go == nil then return nil end
+	-- Stay-poll only: prefer an explicit, converter-stamped trigger volume
+	-- over any other resolution (including the bare-BasePart passthrough
+	-- below). A childless BasePart with no marked volume still falls through
+	-- to the passthrough, so the passthrough behavior is preserved. The edge
+	-- resolver passes nil/false here -> ORIGINAL pre-PR resolution.
+	if preferTriggerVolume then
+		local marked = _findMarkedTriggerVolume(go)
+		if marked ~= nil then
+			return marked
+		end
+	end
 	if _isBasePart(go) then
 		return go
 	end
@@ -457,6 +511,76 @@ function SceneRuntime:connectGameObjectSignal(comp, go, signalName, fn)
 		return nil
 	end
 	return self:connect(comp, signal, fn)
+end
+
+-- Throttle for the OnTriggerStay overlap poll (seconds between sweeps).
+-- One ``GetPartsInPart`` per turret per tick is bounded; ~0.13s is the
+-- per-frame analog of Unity's per-physics-frame OnTriggerStay without
+-- flooding the dispatch every Heartbeat.
+local _STAY_POLL_INTERVAL = 0.13
+
+-- ``connectGameObjectSignalStay(comp, go, fn) -> connection?``: generic
+-- host primitive emulating Unity ``OnTriggerStay``. Resolves the trigger
+-- volume via ``getTouchPart`` then arms a throttled overlap poll on the
+-- engine Heartbeat: every ~``_STAY_POLL_INTERVAL`` seconds it sweeps
+-- ``workspace:GetPartsInPart(triggerPart)`` and fires ``fn(hit)`` once per
+-- overlapping part (the per-frame analog of OnTriggerStay) -- so a player
+-- STANDING inside the volume (no ``.Touched`` edge) is still detected.
+--
+-- Routed through the lifecycle-tracked ``connect`` machinery (NOT
+-- ``invokeRepeating``/``_trackTask``): it disarms via ``_disarmSubs`` on
+-- disable/destroy and rearms via ``_rearmSubs`` on enable, gating on
+-- ``active && enabled`` like every other subscription. Iterates a stable
+-- snapshot of the overlap result and re-checks component liveness before
+-- each callback (``fn`` may destroy the component mid-iteration). Fails
+-- soft (warn + nil) when no trigger part resolves, mirroring
+-- ``connectGameObjectSignal``.
+function SceneRuntime:connectGameObjectSignalStay(comp, go, fn)
+	assert(type(fn) == "function",
+		"connectGameObjectSignalStay: fn must be function")
+	-- The proximity poll genuinely wants the large sight volume: prefer the
+	-- converter-stamped ``_IsTriggerVolume`` over the small visible body.
+	local part = self:getTouchPart(go, true)
+	if part == nil then
+		self._warn(string.format(
+			"[scene_runtime] connectGameObjectSignalStay: no touch part on %s",
+			tostring(go)))
+		return nil
+	end
+	-- Heartbeat is optional across the runtime (the engine update loop
+	-- guards ``if self._services.heartbeat then ...``). Soft-fail here
+	-- rather than letting ``connect``'s ``signal ~= nil`` assert throw.
+	local heartbeat = self._services.heartbeat
+	if heartbeat == nil then
+		self._warn(string.format(
+			"[scene_runtime] connectGameObjectSignalStay: no heartbeat service for %s",
+			tostring(go)))
+		return nil
+	end
+	local engine = self
+	local nowFn = self._services.now or os.clock
+	local lastTick = 0
+	return self:connect(comp, heartbeat, function()
+		local now = nowFn()
+		if now - lastTick < _STAY_POLL_INTERVAL then return end
+		lastTick = now
+		-- Snapshot the overlap result so a callback that mutates the
+		-- workspace mid-iteration can't reshape the list we're walking.
+		local ok, hits = pcall(function()
+			return workspace:GetPartsInPart(part)
+		end)
+		if not ok or type(hits) ~= "table" then return end
+		for _, hit in ipairs(hits) do
+			-- Liveness/re-entrancy + disable guard: ``fn`` may destroy OR
+			-- disable ``comp`` mid-sweep. The outer ``connect`` gate only
+			-- checks once per tick, so re-check the lifecycle gate before
+			-- each callback so a mid-sweep disable stops remaining hits.
+			if engine._destroyed[comp] or not engine:_isGateOpen(comp) then
+				return
+			end
+			fn(hit)
+		end
+	end)
 end
 
 -- ``playerFromTouch(other) -> Player?``: given the BasePart that fired a
@@ -610,6 +734,18 @@ function SceneRuntime:_makeHostSurface(owner)
 				return engine:connectGameObjectSignal(owner, arg2, arg3, arg4)
 			end
 			return engine:connectGameObjectSignal(owner, arg1, arg2, arg3)
+		end,
+		connectGameObjectSignalStay = function(arg1, arg2, arg3)
+			-- Colon: host:connectGameObjectSignalStay(go, fn)
+			--   arg1=host, arg2=go, arg3=fn
+			-- Dotted: host.connectGameObjectSignalStay(go, fn)
+			--   arg1=go, arg2=fn
+			-- The contract teaches the colon form; the subscription is
+			-- owned by ``owner`` so it tears down with the component.
+			if arg1 == host then
+				return engine:connectGameObjectSignalStay(owner, arg2, arg3)
+			end
+			return engine:connectGameObjectSignalStay(owner, arg1, arg2)
 		end,
 		playerFromTouch = function(arg1, arg2)
 			if arg1 == host then

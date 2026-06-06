@@ -439,6 +439,21 @@ def transpile_with_contract(
         log.info("[contract] child-index lowering resolved GetChild sites "
                  "in %d script(s) to the N-th spatial child", lowered_children)
 
+    # OnTriggerStay lowering (allowlisted deterministic lowering pass): the
+    # transpiler collapses Unity OnTriggerStay onto the same ``.Touched`` EDGE
+    # signal as OnTriggerEnter, so a player standing inside a turret's sight
+    # volume (no fresh Touched edge) is never detected. Rewrite the specific
+    # ``connectGameObjectSignal(go, "Touched", fn)`` binding whose immediately-
+    # preceding origin comment is ``-- OnTriggerStay`` to the host's STAY-poll
+    # primitive ``connectGameObjectSignalStay(go, fn)`` (slice 1.1). Comment-
+    # keyed + binding-local, NEVER per-game; OnTriggerEnter/Exit and the
+    # OnCollision* edge bindings are left untouched. See trigger_stay_lowering.py.
+    from converter.trigger_stay_lowering import lower_trigger_stay
+    lowered_stay = lower_trigger_stay(transpilation.scripts)
+    if lowered_stay:
+        log.info("[contract] OnTriggerStay lowering routed %d script(s) to "
+                 "the connectGameObjectSignalStay poll primitive", lowered_stay)
+
     # Aggregate fail-closed reasons. Verifier failures are recorded per
     # module via warnings; convert them to FailClosed rows here so the
     # orchestrator's caller has one place to read project status.
