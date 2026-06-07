@@ -162,3 +162,204 @@ Reworked the per-component deferral into a correct BATCHED deferral. Changes:
   fully event-driven dependency wait) was chosen as the pragmatic, testable
   shape; an event-driven rewrite is a possible future refinement, not needed
   for correctness.
+
+## --- Run: generic-converter-step1-player-20260607T091314 (Phase 1 / Gate 0) ---
+# Decisions — generic-converter Step 1 (player-embodiment authority)
+
+## D0 — precondition: untracked scratch in main tree (Mechanical)
+`git status --porcelain` non-empty: only untracked `.claude/` and `apikey_run`
+(no tracked modifications). A worktree-based /drive run creates the feature branch
+as a pure ref off `upstream/main` and does all work under $RUN_DIR — the main
+working tree is never checked out into or mutated. → PROCEED; untracked scratch is
+not at-risk work. Rationale logged per the precondition's own intent ("don't disturb
+the user's uncommitted work").
+
+## D1 — base ref (Mechanical)
+Branch off `upstream/main` @ 2cbed06 (includes PR #184 / Step-0 net), NOT local
+`main` or the fork's `origin/main` (lag risk per memory). featureBranch =
+drive/generic-converter-step1-player-20260607T091314.
+
+## D2 — acceptance target is concrete (Mechanical)
+Step-1 acceptance = the player-bind authority works on a FRESH cold conversion, THEN
+flip the Step-0 net:
+  - converter/verify_hook.py:35  REQUIRE_PLAYER_BIND False -> True
+  - .github/workflows/test.yml:434  REQUIRE_PLAYER_BIND "0" -> "1"
+  - converter/tests/test_verify_hook.py:166,342 assertions False -> True
+  - test_behavior_fixture_contract.py bind fixtures must pass under the flip
+The flip is the LAST act, only after C (host authority) demonstrably binds.
+
+## D3 — design.md is a distillation, not a re-derivation (Mechanical)
+Wrote $RUN_DIR/design.md as a faithful high-level restatement of the CONVERGED
+authoritative doc converter/docs/design/player-embodiment-authority-design.md.
+Did NOT re-derive or re-open any resolved decision.
+
+## D4 — 5-phase mapping of the doc's Gate0 + Slices 1-4 (Mechanical)
+Mapped the doc's "Slicing" + "Sequencing (strangler-fig)" 1:1 onto 5 strictly
+sequential phases: P1=Gate0 (primitives proof + reusable host-harness + shape-variance
+corpus), P2=Slice1 (host authority, A as fallback), P3=Slice2 (U1 + aim-read +
+respawn/teleport), P4=Slice3 (B backstop), P5=Slice4 (delete A + FLIP REQUIRE_PLAYER_BIND
+0->1 as the LAST act). No parallelization; each phase relies on the prior. This matches
+the prompt's suggested mapping and the doc's authoritative sequencing.
+
+## D5 — file-path nesting confirmed (Mechanical)
+Cited anchors live under a doubly-nested layout in base ref 2cbed06: pipeline code under
+converter/converter/ (scene_runtime_planner.py, autogen.py, movement_facet_lowering.py,
+camera_facet_lowering.py), runtime under converter/runtime/ (scene_runtime.luau,
+scene_camera_input.luau), and verify_hook.py + tests under converter/. The Step-0 net
+substrate (verify_hook.py REQUIRE_PLAYER_BIND=False, _camera_input_harness.py,
+test_camera_follow_math.py, test_tick_substrate.py) exists in 2cbed06 but NOT on the
+local HEAD 177e21d (pre-#184). The /drive run must branch off upstream/main @2cbed06 per D1.
+
+## D6 — zero open questions (Taste)
+Raised ZERO open questions. The doc records all six original open questions as RESOLVED,
+eng-review is CLEAR (0 new P1), and all cited anchors were confirmed present in 2cbed06.
+No gap found between the design doc and current upstream/main warranting a close call.
+
+## D7 — respawn narrowing; teleport non-load-bearing (Taste/architecture)
+Resolves codex BLOCKING (Phase 3 respawn not host-authoritative under U1 shadow-sync —
+the AI's respawn `PivotTo` is overwritten next frame, making correctness lean on
+paradigm B teaching the AI to call `teleport`, a forbidden rung-2b dependency). RESOLUTION:
+respawn is ALREADY server/engine-owned and deterministic (autogen `GameServer`
+CharacterAdded spawn at autogen.py:105 + engine SpawnLocation re-spawn on death — this
+path exists independent of the AI shape). C's respawn responsibility narrows to the
+per-player LIFECYCLE RESYNC: re-acquire the new character on `CharacterAdded` and resync
+camera/yaw/eye-follow — C-owned, deterministic, NO dependency on the AI's `PivotTo` and
+NO dependency on B. Programmatic mid-game `teleport(cf)` is a host helper that stays
+client-request/server-apply but is explicitly NON-LOAD-BEARING (a fidelity nicety):
+if the AI never calls it the stated goal still holds because respawn is server-owned.
+Phase 3 cold proof becomes "Shoot hits the crosshair; on death the CHARACTER respawns at
+the spawn point (server-owned) and the camera/yaw resyncs to the new character" — NOT
+"the AI's TakeDamage PivotTo moves the character."
+
+## D8 (revised) — Phase-2 proves C DOMINATES with A active; NO suppression (Taste/architecture)
+Resolves codex round-1 MAJOR (double-authority, only A-miss tested) AND codex round-2
+BLOCKING. My first cut (D8 v1) suppressed player-path A keyed on `has_character_controller`.
+Codex r2 showed that is WRONG: A is the mechanism that NEUTRALIZES the raw AI camera/move
+writes on A-hit shapes (the `dde248` raw output natively contains a direct camera write +
+`humanoid:Move(` — test_movement_facet_lowering.py:153/181). Suppressing A would EXPOSE
+those raw writes during Phases 2-3, before B's lexical rejects land in Phase 4 — so C would
+coexist with the RAW AI writes, not be single-authority. This also DEVIATED from the
+authoritative doc's own §Sequencing intent: "C proves it dominates on a cold shape WITH A
+still present, then A is removed." REVISED RESOLUTION: leave A ACTIVE (no suppression).
+Phase 1 Gate 0 proves C's pre/post camera writes + post-component `Humanoid:Move` dominate
+a competing mid-Update write by last-writer-wins. Phase 2 adds C with A active and proves C
+structurally DOMINATES on BOTH the A-miss `cold3a59` and the A-hit `dde248` shapes (final
+camera CFrame + Humanoid walk vector are C's each frame), whether the competing write is
+A's lowered call or the raw AI call. NOT a single-writer claim — multiple writes, C wins by
+ordering (downstream of Gate 0, so no new unproven assumption). B stays non-load-bearing
+(C dominates structurally, not via B). A's code is DELETED in Phase 5. This is codex's own
+"coexistence-proof on A-hit" fix option (the doc-faithful one).
+
+## D9 — C owns the SINGLE E2E mouse-channel read; reuse pure advance() not _readDelta (Taste/architecture)
+Resolves Claude round-3 MAJOR. SceneCameraInput._readDelta CONSUMES the E2E-channel ACK
+(consume-once on workspace attrs). With A active driving the singleton's step->_readDelta
+in-band on A-hit shapes, exactly one of {A,C} consumes the injected delta/frame; if A wins
+the ACK race C's yaw advances by 0 -> the A-hit dde248 dominance fixture flakes on pairs()
+order = green/red for the wrong reason. RESOLUTION: C reuses the PURE advance() helper
+(scene_camera_input.luau:53-61), NEVER step/_readDelta; C owns the SINGLE per-frame channel
+read in its pre-Update input snapshot. Add Gate-0 primitive (d): two readers in one frame,
+assert the channel is consumed exactly once and C is the consumer. No change to paradigm C /
+phase count / ordering. Also folded codex r3 MINOR: dominance claim scoped to
+CurrentCamera.CFrame + the character's Humanoid move-intent (raw rig PivotTo drift vestigial
+until Phase 3 U1); recoil-on-A-hit knowingly degraded until Phase 5 (fidelity floor).
+
+## Phase 1 detailed-design decisions (design-phase1.md)
+
+### PH1-D1 — extend existing harnesses, don't fork (Mechanical)
+Primitives (a),(b),(d) extend tests/_camera_input_harness.py; (b),(c) ride
+test_tick_substrate.py's _two_component_preamble. Only new harness vocabulary: an optional
+`extra_mock_setup` kwarg on camera_input_preamble + an always-present ordered `_attrWrites`
+log on workspace:SetAttribute (to assert "E2E acked exactly once, in order"). Default-empty
+=> the 5 existing test_camera_follow_math.py tests stay byte-identical (AC0 guards). Per the
+prompt's explicit "extend THAT harness's vocabulary" instruction.
+
+### PH1-D2 — model "reader C" as pure-advance channel snapshot, not a 2nd acquire() (Taste)
+SceneCameraInput.acquire() returns the sticky module singleton, so a 2nd acquire() can't model
+two independent readers. (d) models C as scenario-luau that snapshots the ONE workspace E2E
+channel + feeds SceneCameraInput._advance(...), and races it against the REAL cam:step/_readDelta
+(A). Anchors C's modeled behavior on the deterministic channel semantics (D9) and asserts
+HAPPENS-BEFORE (C precedes A) + OWNERSHIP (C advances; A sees zero) per followups Gate-0(d).
+
+### PH1-D3 — corpus shapes as checked-in fixture files (Taste)
+The cold3a59 raw Player.luau is NOT committed anywhere (git ls-files converter/output/ = 0
+rows; output/ is git-ignored). dde248 lives only as inline fragments in
+test_movement_facet_lowering.py. RESOLUTION: carry BOTH as permanent fixture files under
+tests/fixtures/player_shapes/ (dde248 assembled from the inline fragments; cold3a59
+reconstructed from the documented shape design-doc:31-33,203) + a README provenance + a
+pure-Python shape-fact guard (AC6) so the fixtures can't silently drift from the live
+transpiler shape (the source artifact can't be auto-re-derived).
+
+### PH1-D4 — _tick line-number correction (Mechanical, divergence)
+Real _tick is at scene_runtime.luau:2792 (Update pass pairs() at :2794), NOT :2656 as the
+design doc cites. followups.md's :2794 reference is correct. design-phase1.md cites the real
+lines.
+
+### PH1-D5 — shared-mock surface + actor-aware ack log (Structural, resolves dual-voice review)
+The tick harness (`_two_component_preamble`) installs NO `workspace.CurrentCamera` and NO
+Humanoid mock and takes only `writer_methods`/`reader_methods` — so AC2/AC3 (camera cell) and
+AC4 (Humanoid recorder) had no home, and §1.2's "no new helper / no signature change" claim
+was FALSE about there being no surface to specify. Resolutions (all applied to design-phase1.md):
+
+- SHARED-MOCK SURFACE (owned by slice 1.1, consumed by 1.2): declared in the scenario body
+  appended AFTER `_two_component_preamble` (verified `bus` is reachable from both the component
+  method strings and the trailing scenario luau in the real harness), so NO signature change.
+  AC2/AC3 use a plain shared `bus.cam = {CFrame = <init>}` cell — NOT real
+  `workspace.CurrentCamera` (the tick harness doesn't load the camera module; a bare table
+  models last-writer-wins). AC4 uses `bus.humanoid = {Move = function(self,v) table.insert(
+  bus.moves, v) end}` + `bus.moves = {}`. Component writes are mid-Update; host pre/post writes
+  are scenario luau OUTSIDE `heartbeat:fire`.
+
+- ACTOR-AWARE ACK LOG (AC5): `_attrWrites` entries become `{name, value, actor}`, stamped from
+  a chunk-level `workspace._currentActor` the scenario sets to "C" before C's manual ack and to
+  "A" before firing A's in-band `cam:step`. AC5(d-ii) asserts the FIRST `E2EMouseAckSeq` entry
+  has actor=="C". Reader C HAND-ROLLS the consume-once protocol (`_advance` is PURE, never
+  touches the channel; C replicates `_readDelta`'s read-seq/ack/read-delta then feeds
+  `_advance`; C never calls `_readDelta`). AC5(d-iii) seeds a NONZERO base mouse delta so A's
+  later `_readDelta` returns EXACTLY that base — proving A saw zero INJECTED delta, not merely
+  zero motion. C-before-A is deterministic by SOURCE ORDER (camera harness has no `pairs()`).
+
+- AC7 NON-VACUITY: mirror AC3/AC4 paired assertions — record the fixture's competing writes
+  RAN (dde248: mid cam-write == fixture-MID and `bus.humanoid:Move(fixture-MID)` recorded;
+  cold3a59: cam-write happened + ≥1 PivotTo) THEN assert C's POST wins. cold3a59 reuses ONLY
+  the camera-bracket actor, NOT the Humanoid:Move actor (the shape makes no Humanoid:Move).
+
+- §4: dropped "MAY run in parallel"; disjoint file ownership but HARD build-order 1.1 → 1.2.
+
+- cold3a59 MINORs: dropped the brittle negative ":Move( absent" guard (positives — PivotTo +
+  cam-write + GetMouseDelta-in-Update — are load-bearing); recorded that cold3a59's fidelity to
+  the lost original is UNVERIFIABLE (output/ git-ignored, artifact gone; AC6 guards post-hoc
+  edits only), and only the GENERIC PivotTo+cam-write-is-C-dominated shape is load-bearing.
+
+## D10 — dependent slice 1.2 branches from 1.1's converged tip, not phaseBaseSha (Mechanical)
+Slice 1.2's corpus test (test_player_shape_corpus.py, AC7) IMPORTS slice 1.1's harness extension
+(the bus.cam/bus.humanoid surface + extra_mock_setup/_attrWrites), and the phase design pins a HARD
+1.1->1.2 sequence (not parallel). Branching 1.2 from bare phaseBaseSha (2cbed06) would lack 1.1's
+harness changes -> 1.2's slice-local tests couldn't run green. So 1.2's worktree branches from the
+slice/.../1.1 converged tip. At assembly, merging 1.1 then 1.2 is clean (1.2 descends from 1.1).
+This is the correct flow for a hard-sequential dep whose later slice consumes the earlier's code.
+
+## D11 — phase-1 integration review reconciliation (Mechanical + 2 code P1s to slice 1.2)
+Phase-1 dual-voice integration review surfaced 4 findings. CLAUDE (doc-divergence, MAJOR x2): the
+design's "1.2 consumes 1.1's bus.* surface / hard 1.1->1.2 sequence" became stale when the AC7 fix
+made the corpus test load+execute the REAL fixtures (self-contained mock surface). Resolved by a doc
+edit (design-phase1.md §2.5 reconciliation): slices are independent; 1.1's bus.* is tick-internal.
+CODEX (2 real code P1s, routed to slice 1.2):
+  (1) test_player_shape_corpus.py pytestmark skipif is MODULE-level -> skips the pure-Python AC6 drift
+      guards when luau absent (design E6 requires AC6 always-on). Claude misread this as class-scoped;
+      verified against the artifact that codex is right. FIX: scope the skip to the AC7 class only.
+  (2) cold3a59 split-read contract unpinned: AC6 only checks GetMouseDelta appears in Update; AC7 only
+      checks net camera write. A drift where Rotate stops consuming pendingMouse still passes. FIX:
+      AC6 assert Rotate consumes self.pendingMouse + does not itself call GetMouseDelta; AC7 prove the
+      camera reflects the Update-cached delta (cache consumed, not raw-re-read).
+
+## D12 — ship Phase 1 alone as its own PR; defer phases 2-5 to a fresh /drive (User)
+User chose "Ship Phase 1 now as its own PR" at the phase-1 checkpoint. Phase 1 (Gate 0 — the
+build-time durability net: host-harness primitives a-d + shape-variance corpus dde248/cold3a59 +
+C-dominance proofs) is hardened on featureBranch, full fast suite 2706 passed, no-Any clean,
+REQUIRE_PLAYER_BIND still 0 (no product binding yet). This PR ships ONLY that net (test infra; no
+runtime/product code; no Studio needed to merge). Phases 2-5 (the self.host.player product authority,
+needing cold-Studio e2e on a fresh conversion) become a SEPARATE /drive run, building from the
+design refinements D7 (server-owned respawn; teleport non-load-bearing), D8 (prove C dominates with A
+ACTIVE, no suppression), D9 (C owns the single E2E read via pure advance()) — which must be propagated
+into converter/docs/design/player-embodiment-authority-design.md at the start of that run
+(update-design-doc-before-implementation). Carryforwards in followups.md.

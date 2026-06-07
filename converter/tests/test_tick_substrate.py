@@ -1,4 +1,4 @@
-"""Phase 1 (redesign) slice 1.2: pin the REAL ``_tick``
+"""Phase 1 (redesign) slice 1.1: pin the REAL ``_tick``
 cross-pass-visibility substrate in ``converter/runtime/scene_runtime.luau``.
 
 This is the substrate the Phase-2 camera authority rides on: the host
@@ -246,3 +246,117 @@ class TestFixedUpdateBetweenPasses:
         # LateUpdate pass.
         assert seq.index("Update") < seq.index("Fixed"), seq
         assert seq.index("Fixed") < seq.index("Late"), seq
+
+
+# --------------------------------------------------------------------------- #
+# Phase 1 slice 1.1 primitives (b)/(c): the host's pre-Update / post-LateUpdate
+# camera + Humanoid-move bracket dominates a competing mid-Update component
+# write by last-writer-wins. The shared-mock surface (``bus.cam`` /
+# ``bus.humanoid`` / ``bus.moves``) is declared in the SCENARIO BODY appended
+# after ``_two_component_preamble`` (NOT inside its format template, to avoid
+# brace-escaping); the component method strings close over ``bus`` (design §1.2).
+# This surface is tick-substrate-internal — it serves AC2-AC4 here; slice 1.2's
+# corpus test is SELF-CONTAINED and does NOT consume it (design §2.5).
+# --------------------------------------------------------------------------- #
+
+
+class TestHostCameraBracketDominates:
+    """The host writes ``bus.cam.CFrame`` BEFORE and AFTER the component pass
+    (scenario luau OUTSIDE ``heartbeat:fire`` — deterministic by source order,
+    edge E2). A pre-write must survive to a mid-Update raw read; a post-write
+    must win the frame over a competing mid-Update camera write."""
+
+    def test_prewrite_survives_to_mid_update_read(self):
+        """AC2 / primitive (b)-pre: a host pre-write is visible to a mid-Update
+        component read (the same-frame raw ``self.cam.CFrame`` read pattern)."""
+        scenario = _two_component_preamble(
+            writer_methods=(
+                "function Writer:Update(dt) bus.seenInUpdate = bus.cam.CFrame end"
+            ),
+            reader_methods="",
+        ) + textwrap.dedent("""\
+            bus.cam = {CFrame = "INIT"}
+            bus.seenInUpdate = "UNSET"
+            bus.cam.CFrame = "PRE"        -- host pre-Update write
+            services.heartbeat:fire(0.016)
+            print("seenInUpdate=" .. tostring(bus.seenInUpdate))
+            print("final=" .. tostring(bus.cam.CFrame))
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        # The mid-Update component read the host's pre-write (non-vacuous: not
+        # the stale INIT/UNSET value).
+        assert "seenInUpdate=PRE" in out, (
+            f"mid-Update read must see the host pre-write; got {out!r}"
+        )
+
+    def test_postwrite_wins_over_mid_update_camera_write(self):
+        """AC3 / primitive (b)-post: a host post-LateUpdate write wins the frame
+        over a competing mid-Update component camera write (non-vacuous: the mid
+        write actually ran — edge E5)."""
+        scenario = _two_component_preamble(
+            writer_methods=(
+                "function Writer:Update(dt)\n"
+                "    bus.cam.CFrame = 'MID'   -- competing mid-Update write\n"
+                "    bus.midRan = true\n"
+                "end"
+            ),
+            reader_methods="",
+        ) + textwrap.dedent("""\
+            bus.cam = {CFrame = "INIT"}
+            bus.midRan = false
+            services.heartbeat:fire(0.016)
+            local afterFire = bus.cam.CFrame   -- competing mid-write landed here
+            bus.cam.CFrame = "POST"        -- host post-LateUpdate write
+            print("midRan=" .. tostring(bus.midRan))
+            print("afterFire=" .. tostring(afterFire))
+            print("final=" .. tostring(bus.cam.CFrame))
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        # Non-vacuity: the competing mid-Update write actually ran.
+        assert "midRan=true" in out, f"competing mid write must run; {out!r}"
+        # Non-vacuity (stronger): the competing write actually landed in the
+        # shared camera cell before the host overwrote it.
+        assert "afterFire=MID" in out, (
+            f"mid-Update camera write must land in bus.cam.CFrame; got {out!r}"
+        )
+        # Last-writer-wins: the host post-write is the final value.
+        assert "final=POST" in out, (
+            f"host post-LateUpdate write must win the frame; got {out!r}"
+        )
+
+
+class TestHostHumanoidMoveBracketDominates:
+    """A mock Humanoid records every ``:Move(v)``. A component calls
+    ``bus.humanoid:Move(MID)`` in Update; the host calls
+    ``bus.humanoid:Move(POST)`` after the LateUpdate pass. The host's
+    post-component move is the last move-intent for the frame (non-vacuous: the
+    mid move was recorded first — edge E5)."""
+
+    def test_post_component_humanoid_move_overrides_mid_update_move(self):
+        """AC4 / primitive (c): post-component Humanoid:Move overrides the
+        mid-Update Move; ``bus.moves`` last == POST and MID was recorded first."""
+        scenario = _two_component_preamble(
+            writer_methods=(
+                "function Writer:Update(dt) bus.humanoid:Move('MID') end"
+            ),
+            reader_methods="",
+        ) + textwrap.dedent("""\
+            bus.moves = {}
+            bus.humanoid = {Move = function(self, v) table.insert(bus.moves, v) end}
+            services.heartbeat:fire(0.016)
+            bus.humanoid:Move("POST")      -- host post-LateUpdate move
+            for i, v in ipairs(bus.moves) do
+                print(string.format("MOVE%d=%s", i, tostring(v)))
+            end
+            print("LAST=" .. tostring(bus.moves[#bus.moves]))
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        # Non-vacuity: the mid-Update move was recorded first.
+        assert "MOVE1=MID" in out, f"mid-Update Move must run first; {out!r}"
+        # Last-call-wins: the host's post-component move is the final intent.
+        assert "LAST=POST" in out, (
+            f"host post-component Move must be the last move-intent; got {out!r}"
+        )

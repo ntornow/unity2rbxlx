@@ -46,3 +46,4 @@ busybee
 
 # AI coding assistant local state
 .context/
+converter/.tmp/

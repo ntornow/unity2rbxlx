@@ -143,3 +143,119 @@ def test_step_eye_tracks_position_input() -> None:
     assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
     # eyeHeight 1.5 added to Y; X/Z track the pivot exactly.
     assert "EYE=7.000,12.500,-3.000" in out, out
+
+
+# --------------------------------------------------------------------------- #
+# Phase 1 slice 1.1 primitives.
+# --------------------------------------------------------------------------- #
+
+
+def test_same_frame_multi_read_drains_to_zero() -> None:
+    """Primitive (a) / AC1: two same-frame reads of the mouse delta DRAIN — the
+    first read returns the queued delta, the second returns (0, 0) (the real
+    ``UserInputService:GetMouseDelta`` drains; a later phase must not assume a
+    second same-frame read returns the same delta — design §2 E1/AC1)."""
+    preamble = camera_input_preamble(mouse_deltas=[(3.0, -4.0)])
+    body = """
+        local cam = SceneCameraInput.acquire()
+        local dx1, dy1 = cam:_readDelta()
+        local dx2, dy2 = cam:_readDelta()
+        print(string.format("R1=%.3f,%.3f", dx1, dy1))
+        print(string.format("R2=%.3f,%.3f", dx2, dy2))
+    """
+    rc, out, err = run_camera_scenario(preamble, body)
+    assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
+    assert "R1=3.000,-4.000" in out, out
+    assert "R2=0.000,0.000" in out, out
+
+
+def test_e2e_channel_single_consumer_C_before_A_inband() -> None:
+    """Primitive (d) / AC5: the ONE E2E mouse channel is consumed exactly once,
+    happens-before-ordered, and ownership-attributed.
+
+    Inject ``E2EMouseSeq=1, DeltaX=5, DeltaY=-7`` plus a NONZERO base
+    ``mouse_deltas=[(2, 1)]`` so A's bare ``GetMouseDelta`` is distinguishable
+    from the injected delta. Reader C (scenario luau, ``_currentActor="C"``)
+    HAND-ROLLS the consume-once protocol (read ``E2EMouseSeq``; if
+    ``> E2EMouseAckSeq`` then ack + read ``E2EMouseDeltaX``/``Y``) and feeds the
+    result to the PURE ``SceneCameraInput._advance`` — C NEVER calls
+    ``_readDelta`` (design §1.1(iii) / D9). THEN (``_currentActor="A"``) the real
+    ``cam:step``/``_readDelta`` runs. Asserts:
+      (d-i)  C's advance produced a NON-ZERO yaw/pitch (C consumed the injected
+             delta);
+      (d-ii) exactly ONE ``E2EMouseAckSeq``->1 transition, FIRST writer == "C"
+             (C happens-before A);
+      (d-iii) A's REAL in-band ``cam:step(dt)`` path (which internally calls
+             ``_readDelta`` — the actual paradigm-A camera_facet emits
+             ``_cam:step``, NOT a bare ``_readDelta``) advances by EXACTLY the
+             raw base ``(2, 1)`` — ZERO injected (A saw the already-acked
+             channel, proving the channel ran). The post-C-ack
+             ``step``->``_readDelta`` branch is therefore actually exercised; a
+             ``step`` regression that re-acks / re-reads the same seq would make
+             A advance by base+injected and FAIL.
+    """
+    preamble = camera_input_preamble(mouse_deltas=[(2.0, 1.0)])
+    body = """
+        -- Seed the injected E2E channel under no particular actor.
+        workspace:SetAttribute("E2EMouseDeltaX", 5.0)
+        workspace:SetAttribute("E2EMouseDeltaY", -7.0)
+        workspace:SetAttribute("E2EMouseSeq", 1)
+
+        -- Reader C: hand-rolled consume-once against the ONE channel, tagged "C",
+        -- then feed the pure _advance. C NEVER calls _readDelta.
+        workspace._currentActor = "C"
+        local cdx, cdy = 0.0, 0.0
+        local seq = workspace:GetAttribute("E2EMouseSeq") or 0
+        if seq > (workspace:GetAttribute("E2EMouseAckSeq") or 0) then
+            workspace:SetAttribute("E2EMouseAckSeq", seq)
+            cdx = cdx + (workspace:GetAttribute("E2EMouseDeltaX") or 0)
+            cdy = cdy + (workspace:GetAttribute("E2EMouseDeltaY") or 0)
+        end
+        local cyaw, cpitch = SceneCameraInput._advance(
+            0.0, 0.0, cdx, cdy, 0.01, -10.0, 10.0)
+        print(string.format("CADV=%.3f,%.3f", cyaw, cpitch))
+
+        -- Reader A: the REAL in-band path, tagged "A". Drive the REAL
+        -- ``cam:step(dt)`` (the actual paradigm-A camera_facet path, which
+        -- internally calls _readDelta) -- NOT a bare _readDelta -- so the
+        -- post-C-ack step()->_readDelta branch is exercised. With a known
+        -- sensitivity (0.01), step's advance turns the delta A sees into a
+        -- yaw/pitch we can read off the composed look CFrame. A must see the
+        -- channel already consumed -> ONLY the raw base (2, 1).
+        workspace._currentActor = "A"
+        local cam = SceneCameraInput.acquire()
+        cam:configure({sensitivity = 0.01, minPitch = -10.0, maxPitch = 10.0})
+        cam._yaw = 0.0
+        cam._pitch = 0.0
+        cam:step(0.016)
+        local look = workspace.CurrentCamera.CFrame
+        local apitch, ayaw = look:ToEulerAnglesYXZ()
+        print(string.format("ALOOK=%.3f,%.3f", ayaw, apitch))
+
+        -- Scan the ordered ack log for E2EMouseAckSeq transitions to seq 1.
+        local ackCount = 0
+        local firstActor = "NONE"
+        for _, w in ipairs(workspace._attrWrites) do
+            if w.name == "E2EMouseAckSeq" and w.value == 1 then
+                ackCount = ackCount + 1
+                if firstActor == "NONE" then firstActor = w.actor end
+            end
+        end
+        print(string.format("ACKCOUNT=%d", ackCount))
+        print("FIRSTACTOR=" .. tostring(firstActor))
+    """
+    rc, out, err = run_camera_scenario(preamble, body)
+    assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
+    # (d-i) C consumed the injected delta -> non-zero yaw/pitch.
+    # yaw = 0 - 5*0.01 = -0.05; pitch = clamp(0 - (-7)*0.01) = 0.07.
+    assert "CADV=-0.050,0.070" in out, out
+    assert "CADV=0.000,0.000" not in out, out
+    # (d-iii) A's REAL step()->_readDelta advances by ONLY the raw base (2, 1) --
+    # ZERO injected. With sens 0.01: yaw = 0 - 2*0.01 = -0.02; pitch =
+    # clamp(0 - 1*0.01) = -0.01. Had step re-acked/re-read the same seq, A would
+    # have seen base+injected (7, -6) -> ALOOK=-0.070,0.060 -> FAIL.
+    assert "ALOOK=-0.020,-0.010" in out, out
+    assert "ALOOK=-0.070,0.060" not in out, out
+    # (d-ii) exactly one ack transition, FIRST writer is C (happens-before).
+    assert "ACKCOUNT=1" in out, out
+    assert "FIRSTACTOR=C" in out, out

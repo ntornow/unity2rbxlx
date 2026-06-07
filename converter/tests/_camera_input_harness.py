@@ -59,7 +59,9 @@ def _camera_service_loader() -> str:
     """)
 
 
-def camera_input_preamble(*, mouse_deltas: list[tuple[float, float]]) -> str:
+def camera_input_preamble(
+    *, mouse_deltas: list[tuple[float, float]], extra_mock_setup: str = ""
+) -> str:
     """Return a luau chunk that loads ``scene_camera_input.luau`` under mocks.
 
     The returned chunk:
@@ -76,7 +78,18 @@ def camera_input_preamble(*, mouse_deltas: list[tuple[float, float]]) -> str:
           ``_composeLook`` / ``_advance`` / ``step`` to run;
       (d) supports the E2E attribute channel — ``GetAttribute`` / ``SetAttribute``
           on ``workspace`` for ``E2EMouseSeq`` / ``E2EMouseDeltaX`` /
-          ``E2EMouseDeltaY`` / ``E2EMouseAckSeq``.
+          ``E2EMouseDeltaY`` / ``E2EMouseAckSeq``. ``workspace:SetAttribute``
+          additionally pushes an ACTOR-AWARE ordered entry
+          ``{name, value, actor}`` onto ``workspace._attrWrites`` (the actor is
+          the chunk-level ``workspace._currentActor``, defaulting to ``"?"``),
+          so a scenario can assert "consumed exactly once, in order, by whom"
+          (design §1.1(ii)). Both ``_attrWrites`` and ``_currentActor`` are
+          always present and unused by existing callers (AC0 / edge E7).
+
+    ``extra_mock_setup`` (default ``""``) is appended AFTER the mocks block and
+    BEFORE the camera-service loader runs, so a scenario can inject deterministic
+    ordering instrumentation against the live mock surface without forking the
+    preamble (design §1.1(i)).
 
     After the preamble, a scenario body sees ``SceneCameraInput`` as a top-level
     local and can call ``SceneCameraInput._readDelta`` /
@@ -189,15 +202,24 @@ def camera_input_preamble(*, mouse_deltas: list[tuple[float, float]]) -> str:
         function game:GetService(name) return _services[name] end
 
         -- workspace: CurrentCamera with a writable .CFrame + the E2E attribute
-        -- channel (GetAttribute / SetAttribute).
+        -- channel (GetAttribute / SetAttribute). SetAttribute also records an
+        -- ACTOR-AWARE ordered ack log so a scenario can assert "acked exactly
+        -- once, in order, by whom" (design §1.1(ii)). ``_currentActor`` defaults
+        -- to "?"; a scenario sets it to "C" / "A" before each actor's writes.
         local _attrs = {{}}
         local CurrentCamera = {{
             CameraType = nil,
             CFrame = CFrame.new(Vector3new(0, 0, 0)),
         }}
         workspace = {{CurrentCamera = CurrentCamera}}
+        workspace._currentActor = "?"
+        workspace._attrWrites = {{}}
         function workspace:GetAttribute(name) return _attrs[name] end
-        function workspace:SetAttribute(name, value) _attrs[name] = value end
+        function workspace:SetAttribute(name, value)
+            _attrs[name] = value
+            table.insert(workspace._attrWrites,
+                {{name = name, value = value, actor = workspace._currentActor}})
+        end
 
         -- task: scene_camera_input.luau only touches task.wait via CharacterAdded
         -- (never reached in headless scenarios), but define it so a future
@@ -207,7 +229,9 @@ def camera_input_preamble(*, mouse_deltas: list[tuple[float, float]]) -> str:
         end
     """)
     # Load the production module under the mocks above, via the shared loader.
-    return mocks + "\n" + _camera_service_loader()
+    # ``extra_mock_setup`` runs AFTER the mocks block and BEFORE the module
+    # loads, so a scenario can instrument the live surface (design §1.1(i)).
+    return mocks + "\n" + extra_mock_setup + "\n" + _camera_service_loader()
 
 
 def run_camera_scenario(preamble: str, body: str) -> tuple[int, str, str]:
