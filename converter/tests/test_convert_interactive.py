@@ -900,6 +900,115 @@ class TestAssembleWorkflowFidelity:
         )
 
 
+class TestAssembleVerifyFold:
+    """P1 #1: the slice-1.6 ``--verify`` result must be FOLDED into the single
+    assemble JSON object (the skill parser consumes exactly one top-level JSON
+    document). A boot/health verify FAILURE makes assemble fail (non-zero exit),
+    not report complete-then-fail, and must NOT mark the phase complete.
+    """
+
+    def _run_assemble_with_verify(self, monkeypatch, tmp_path, status):
+        import config as _config
+        monkeypatch.setattr(_config, "ROBLOX_API_KEY", "")
+        monkeypatch.setattr(_config, "ROBLOX_CREATOR_ID", None)
+
+        import convert_interactive
+        import smoke_test
+        import verify_hook
+        from smoke_test import SmokeTestReport
+
+        # Undo the conftest suite-wide disable so the real verify path runs;
+        # force Studio "available" and stub the actual smoke test.
+        monkeypatch.delenv("U2R_DISABLE_AUTO_VERIFY", raising=False)
+        monkeypatch.setattr(verify_hook, "studio_available", lambda: True)
+
+        report = SmokeTestReport(
+            status=status, wasd_works=True, mouse_moves_view=True,
+        )
+        monkeypatch.setattr(
+            smoke_test, "run_smoke_test", lambda **kw: report,
+        )
+
+        unity = tmp_path / "Project"
+        (unity / "Assets").mkdir(parents=True)
+        out = tmp_path / "out"
+        out.mkdir()
+        # resolve_verify_target needs a target rbxlx in the output dir.
+        (out / "main.rbxlx").write_text("<roblox/>")
+
+        class _Stub:
+            ESSENTIAL_PHASES = Pipeline.ESSENTIAL_PHASES
+            def __init__(self):
+                self.ctx = ConversionContext()
+            def _run_phase(self, phase):
+                if phase not in self.ctx.completed_phases:
+                    self.ctx.completed_phases.append(phase)
+            def run_through(self, target, *, skip=None, force_rerun=None, run_after=False):
+                return Pipeline.run_through(
+                    self, target, skip=skip, force_rerun=force_rerun,
+                    run_after=run_after,
+                )
+
+        monkeypatch.setattr(
+            convert_interactive, "_make_pipeline", lambda *a, **k: _Stub(),
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["assemble", str(unity), str(out), "--no-upload", "--verify"],
+            catch_exceptions=False,
+        )
+        return result, out
+
+    @staticmethod
+    def _parse_single_json(output: str) -> dict:
+        lines = output.splitlines()
+        start = next(
+            (i for i, ln in enumerate(lines) if ln.startswith("{")), None,
+        )
+        assert start is not None, f"no JSON in output:\n{output}"
+        # Must parse cleanly as ONE object from the first '{' to EOF — a second
+        # top-level object would make json.loads raise "Extra data".
+        return json.loads("\n".join(lines[start:]))
+
+    def test_pass_emits_one_json_with_verify_folded(
+        self, monkeypatch, tmp_path,
+    ):
+        result, out = self._run_assemble_with_verify(
+            monkeypatch, tmp_path, status="pass",
+        )
+        payload = self._parse_single_json(result.output)
+        assert payload["phase"] == "assemble"
+        assert payload["success"] is True
+        assert payload["verify"]["ran"] is True
+        assert payload["verify"]["success"] is True
+        assert payload["verify"]["status"] == "pass"
+        assert result.exit_code == 0
+        # Phase marked complete on success.
+        from convert_interactive import _load_skill_state
+        state = _load_skill_state(out)
+        assert "assemble" in state.get("completed_skill_phases", [])
+
+    def test_boot_health_failure_fails_assemble_and_does_not_complete(
+        self, monkeypatch, tmp_path,
+    ):
+        result, out = self._run_assemble_with_verify(
+            monkeypatch, tmp_path, status="fail",
+        )
+        payload = self._parse_single_json(result.output)
+        assert payload["phase"] == "assemble"
+        # Folded verify failure makes the WHOLE assemble fail (not complete).
+        assert payload["success"] is False
+        assert payload["verify"]["success"] is False
+        assert payload["verify"]["status"] == "fail"
+        assert result.exit_code == 1
+        # Phase NOT marked complete on a verify failure.
+        from convert_interactive import _load_skill_state
+        state = _load_skill_state(out)
+        assert "assemble" not in state.get("completed_skill_phases", [])
+
+
 # ---------------------------------------------------------------------------
 # validate — runs against already-transpiled .lua/.luau files on disk
 # ---------------------------------------------------------------------------

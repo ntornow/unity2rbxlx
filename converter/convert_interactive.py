@@ -130,6 +130,80 @@ def _emit(data: dict) -> None:
     click.echo(json.dumps(data, indent=2, default=str))
 
 
+def _compute_verify_result(
+    output_dir: Path,
+    *,
+    verify: bool | None,
+    verify_scene: str | None,
+) -> dict:
+    """Post-conversion ``--verify`` hook for the skill-facing assemble path.
+
+    Routes through the SAME shared ``verify_hook`` decision/resolution/verdict
+    as ``u2r.py convert`` (one verification entry point). Returns a plain dict
+    describing the verify outcome so the caller can FOLD it into the single
+    assemble JSON payload (the assemble command emits exactly one top-level JSON
+    object; a second object would break the skill's parser contract). The
+    platform/Studio gate runs BEFORE ``run_smoke_test`` (E1: non-macOS auto-mode
+    never calls it). The returned dict always carries a ``"success"`` key; the
+    caller folds boot/health FAILURE into the overall assemble success/exit. The
+    player-bind axis is documented-red at baseRef (non-fatal —
+    REQUIRE_PLAYER_BIND=0).
+    """
+    import verify_hook
+
+    if not verify_hook._should_verify(output_dir, verify=verify):
+        # E1: auto-off (no Studio / non-macOS / --no-verify). A skipped verify
+        # is not an assemble failure.
+        return {
+            "success": True, "ran": False,
+            "reason": "Studio verification skipped (no Studio at "
+                      "config.STUDIO_PATH, or not macOS). Run --verify on "
+                      "a Studio host, or rely on the cold-e2e CI gate.",
+        }
+
+    if not verify_hook.studio_available():  # E4: explicit --verify, no Studio.
+        return {
+            "success": False, "ran": False, "errors": [
+                "--verify requested but no Roblox Studio is available at "
+                f"config.STUDIO_PATH ({config.STUDIO_PATH}) on this platform.",
+            ],
+        }
+
+    target = verify_hook.resolve_verify_target(
+        output_dir, verify_scene=verify_scene,
+    )
+    if target is None:
+        return {
+            "success": False, "ran": False, "errors": [
+                f"--verify could not resolve a target .rbxlx in {output_dir}. "
+                "For a multi-scene conversion pass --verify-scene <name>.",
+            ],
+        }
+
+    from smoke_test import run_smoke_test
+
+    report = run_smoke_test(
+        rbxlx_path=target, output_dir=output_dir / "smoke_test",
+    )
+    boot_health_ok = not verify_hook.boot_health_failed(report.status)
+    bind_ok = report.wasd_works and report.mouse_moves_view
+    bind_required = verify_hook.REQUIRE_PLAYER_BIND
+    success = boot_health_ok and (bind_ok or not bind_required)
+
+    return {
+        "success": success,
+        "ran": True,
+        "rbxlx_path": str(target),
+        "status": report.status,
+        "boot_health_ok": boot_health_ok,
+        "wasd_works": report.wasd_works,
+        "mouse_moves_view": report.mouse_moves_view,
+        "player_bind_required": bind_required,
+        "player_bind_documented_red": (not bind_ok) and not bind_required,
+        "error_message": report.error_message,
+    }
+
+
 def _guard_scene_runtime_mode_or_emit(
     phase: str,
     output_dir: Path,
@@ -884,12 +958,25 @@ def validate(output_dir: str, write: bool) -> None:
 @click.option("--clean", is_flag=True,
               help="PR3b: wipe + re-stamp the output dir before "
               "assembling (mode-mismatch remediation).")
+@click.option("--verify/--no-verify", "verify", default=None,
+              help="After the rbxlx is written, run the NON-interactive "
+                   "Studio smoke test (boot + coarse WASD/mouse health "
+                   "check) via the same shared verify hook as u2r.py "
+                   "convert. Default: AUTO — on only on macOS with a "
+                   "resolvable Studio binary; off otherwise. Explicit "
+                   "--verify fails fast when no Studio resolves. NOT the "
+                   "interactive /e2e-test path.")
+@click.option("--verify-scene", type=str, default=None,
+              help="Which produced .rbxlx to smoke-test when --verify "
+                   "resolves on (default: main.rbxlx when present, else the "
+                   "single produced rbxlx).")
 def assemble(unity_project_path: str, output_dir: str,
              no_upload: bool, no_resolve: bool, retranspile: bool,
              api_key: str | None, creator_id: str | None,
              universe_id: int | None, place_id: int | None,
              scaffolding: str | None,
-             scene_runtime: str, clean: bool) -> None:
+             scene_runtime: str, clean: bool,
+             verify: bool | None, verify_scene: str | None) -> None:
     """Phase 4: upload assets, resolve, convert animations + scene, write .rbxlx."""
     # PR4: only ``auto`` is still rejected (PR5 turf).
     if scene_runtime == "auto":
@@ -1002,12 +1089,25 @@ def assemble(unity_project_path: str, output_dir: str,
         if rbxlx_path.exists() else 0.0
     )
 
-    _mark_skill_phase(out, "assemble", rbxlx_path=str(rbxlx_path))
-
     ctx = pipeline.ctx
+
+    # Post-conversion --verify hook (slice 1.6): route through the SAME shared
+    # verify_hook decision/resolution/verdict as u2r.py convert (ONE
+    # verification entry point). Run it BEFORE marking the phase complete and
+    # BEFORE the emit, then FOLD the result into the single assemble JSON object
+    # — the skill parser consumes exactly one top-level JSON document, so a
+    # second object would break that contract. A boot/health verify failure must
+    # make assemble FAIL (not mark complete-then-fail), so the phase is recorded
+    # complete only on overall success.
+    verify_result = _compute_verify_result(
+        out, verify=verify, verify_scene=verify_scene,
+    )
+    success = verify_result["success"]
+    if success:
+        _mark_skill_phase(out, "assemble", rbxlx_path=str(rbxlx_path))
     _emit({
         "phase": "assemble",
-        "success": True,
+        "success": success,
         "rbxlx_path": str(rbxlx_path),
         "rbxlx_size_mb": rbxlx_size_mb,
         "parts_written": ctx.converted_parts,
@@ -1015,7 +1115,10 @@ def assemble(unity_project_path: str, output_dir: str,
         "uploaded_assets": len(ctx.uploaded_assets),
         "asset_upload_errors": len(ctx.asset_upload_errors),
         "warnings": ctx.warnings[-5:] if ctx.warnings else [],
+        "verify": verify_result,
     })
+    if not success:
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------

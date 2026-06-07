@@ -21,6 +21,32 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "slow: marks tests as slow (deselect with '-m \"not slow\"')")
 
 
+@pytest.fixture(autouse=True)
+def _disable_auto_verify(monkeypatch):
+    """Default the slice-1.6 ``--verify`` auto-mode OFF across the suite.
+
+    ``u2r.py convert`` / ``convert_interactive assemble`` now auto-run the
+    non-interactive Studio smoke test when a Studio binary resolves on macOS.
+    Unstubbed, every ``convert`` test on a macOS dev box with Studio installed
+    would launch Studio.
+
+    The load-bearing disable is the ``U2R_DISABLE_AUTO_VERIFY=1`` env var:
+    ``verify_hook.studio_available`` honors it, and env vars inherit into child
+    processes, so this covers BOTH in-process CliRunner tests AND subprocess CLI
+    tests (``test_byte_equivalence``, ``test_integration`` run ``u2r.py convert``
+    / ``convert_interactive assemble`` via ``subprocess``) — a monkeypatch alone
+    only reaches in-process imports. The in-process ``studio_available`` stub is
+    kept too as belt-and-suspenders.
+
+    Tests that exercise the genuine auto-on path (``test_verify_hook``) undo both
+    overrides at function scope (env var unset + the real ``studio_available``).
+    """
+    import verify_hook
+
+    monkeypatch.setenv("U2R_DISABLE_AUTO_VERIFY", "1")
+    monkeypatch.setattr(verify_hook, "studio_available", lambda: False)
+
+
 @pytest.fixture
 def fixtures_dir() -> Path:
     return FIXTURES_DIR

@@ -65,6 +65,93 @@ def _enforce_scene_runtime_mode_supported(value: str) -> None:
         )
 
 
+def _run_verify_hook(
+    output_path: Path,
+    *,
+    verify: bool | None,
+    verify_scene: str | None,
+) -> None:
+    """Post-conversion ``--verify`` hook (slice 1.6).
+
+    Resolves the auto/opt-in rule via the shared ``verify_hook._should_verify``,
+    then (when on) runs the NON-interactive ``run_smoke_test`` on one resolved
+    rbxlx and folds its boot/health verdict into the convert exit status. The
+    platform/Studio check gates BEFORE ``run_smoke_test`` so non-macOS auto-mode
+    never calls it. Exits non-zero on a boot/health FAILURE; the player-bind
+    fields are documented-red at baseRef (non-fatal — REQUIRE_PLAYER_BIND=0).
+    """
+    import config
+    import verify_hook
+
+    if not verify_hook._should_verify(output_path, verify=verify):
+        # E1: auto-off (no Studio / non-macOS / --no-verify). Explicit --verify
+        # never reaches here — _should_verify returns True for it.
+        if verify is None:
+            click.echo(
+                "\n  Studio verification skipped (no Studio at "
+                "config.STUDIO_PATH, or not macOS). Run --verify on a Studio "
+                "host, or rely on the required cold-e2e CI gate."
+            )
+        return
+
+    # E4: explicit --verify with no Studio is a hard request → fail fast rather
+    # than silently report a false "verified".
+    if not verify_hook.studio_available():
+        click.echo(
+            "ERROR: --verify requested but no Roblox Studio is available at "
+            f"config.STUDIO_PATH ({config.STUDIO_PATH}) on this platform. "
+            "Run --verify on a macOS host with Studio installed, or drop "
+            "--verify to skip verification.",
+            err=True,
+        )
+        sys.exit(1)
+
+    target = verify_hook.resolve_verify_target(
+        output_path, verify_scene=verify_scene,
+    )
+    if target is None:
+        click.echo(
+            "ERROR: --verify could not resolve a target .rbxlx in "
+            f"{output_path}. For a multi-scene conversion pass "
+            "--verify-scene <name>.",
+            err=True,
+        )
+        sys.exit(1)
+
+    from smoke_test import format_report, run_smoke_test
+
+    click.echo(f"\n--- Verifying (smoke test): {target.name} ---")
+    report = run_smoke_test(rbxlx_path=target, output_dir=output_path / "smoke_test")
+    click.echo(format_report(report))
+
+    if verify_hook.boot_health_failed(report.status):
+        click.echo(
+            f"\n  Verification FAILED (boot/health): status={report.status}.",
+            err=True,
+        )
+        sys.exit(1)
+
+    # Documented-red bind axis: record but do not fail unless REQUIRE_PLAYER_BIND.
+    bind_ok = report.wasd_works and report.mouse_moves_view
+    if not bind_ok and not verify_hook.REQUIRE_PLAYER_BIND:
+        click.echo(
+            "\n  Verification: boot/health PASSED; player-bind "
+            f"(wasd_works={report.wasd_works}, "
+            f"mouse_moves_view={report.mouse_moves_view}) is documented-red "
+            "and NON-required in this phase (REQUIRE_PLAYER_BIND=0)."
+        )
+    elif not bind_ok:
+        click.echo(
+            f"\n  Verification FAILED (player-bind): "
+            f"wasd_works={report.wasd_works}, "
+            f"mouse_moves_view={report.mouse_moves_view}.",
+            err=True,
+        )
+        sys.exit(1)
+    else:
+        click.echo("\n  Verification PASSED (boot/health + player-bind).")
+
+
 def _scan_rbxl_collision_fidelity_targets(rbxl_path: Path) -> list[dict]:
     """Extract MeshParts whose ``CollisionFidelity`` is non-Default
     directly from a published ``.rbxl`` file. Used by ``u2r publish``
@@ -346,6 +433,21 @@ def main(verbose: bool) -> None:
                    "up low_confidence or excluded after override "
                    "application. Use for production runs; leave off for "
                    "iteration.")
+@click.option("--verify/--no-verify", "verify", default=None,
+              help="After the rbxlx is written, run the NON-interactive "
+                   "Studio smoke test (boot + coarse WASD/mouse health "
+                   "check) and fold its boot/health verdict into the exit "
+                   "status. Default: AUTO — on only on macOS with a "
+                   "resolvable Studio binary at config.STUDIO_PATH; off "
+                   "otherwise (headless Linux / plain CLI). Explicit "
+                   "--verify is a hard request: it fails fast when no "
+                   "Studio resolves. This is NOT the interactive /e2e-test "
+                   "path.")
+@click.option("--verify-scene", type=str, default=None,
+              help="Which produced .rbxlx to smoke-test when --verify "
+                   "resolves on. Default: main.rbxlx when present (multi-"
+                   "scene --scene all writes several), else the single "
+                   "produced rbxlx. Accepts a scene name or <name>.rbxlx.")
 def convert(
     unity_project: str,
     output: str,
@@ -364,6 +466,8 @@ def convert(
     clean: bool,
     networking: str,
     strict_classification: bool,
+    verify: bool | None,
+    verify_scene: str | None,
 ) -> None:
     """Convert a Unity project to a Roblox experience.
 
@@ -483,6 +587,7 @@ def convert(
         for scene_name, stats in pipeline.context.scenes_metadata.items():
             click.echo(f"  {scene_name}: {stats.get('parts', 0)} parts, {stats.get('scripts', 0)} scripts")
         click.echo(f"\n  Total scenes converted: {len(pipeline.context.scenes_metadata)}")
+        _run_verify_hook(output_path, verify=verify, verify_scene=verify_scene)
         return
 
     if scene:
@@ -506,6 +611,12 @@ def convert(
         click.echo(f"  Assets uploaded: {uploaded} ({errors} errors)")
     if pipeline.context.warnings:
         click.echo(f"  Warnings: {len(pipeline.context.warnings)}")
+
+    # Post-conversion --verify hook (slice 1.6): runs the non-interactive
+    # Studio smoke test on the produced rbxlx and folds its boot/health
+    # verdict into the exit status. Runs after the rbxlx is written and
+    # before publishing (so the publish-block early returns can't skip it).
+    _run_verify_hook(output_path, verify=verify, verify_scene=verify_scene)
 
     # Headless place publishing: generate Luau script, execute via Open Cloud,
     # and save the place to Roblox with proper mesh geometry embedded.

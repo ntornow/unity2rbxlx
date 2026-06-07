@@ -9,6 +9,14 @@ on:
     - cron: "0 19 * * *"
   workflow_dispatch:
 
+# CI convert steps have dedicated explicit smoke/boot gates (smoke-test, cold-e2e).
+# Disable `convert`'s post-conversion auto-verify (slice 1.6) workflow-wide so Studio
+# is launched ONCE via the explicit gate, not twice via two verdict paths (phase-1
+# integration review, codex). Only gates convert's AUTO hook — the explicit
+# `u2r.py smoke-test` step is unaffected.
+env:
+  U2R_DISABLE_AUTO_VERIFY: "1"
+
 jobs:
   fast:
     name: fast test suite
@@ -394,6 +402,242 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  cold-e2e:
+    name: cold (uncached, AI-on) e2e SimpleFPS generic Studio bind gate (self-hosted)
+    runs-on: [self-hosted, macOS, studio]
+    # REQUIRED PRE-MERGE GATE: runs on pull_request (in addition to the
+    # nightly schedule/workflow_dispatch) so a fresh-shape regression that
+    # only surfaces on a cold AI transpile is caught before merge, not days
+    # later in the nightly. Same fork gate as smoke-test: the self-hosted
+    # runner is registered to jiazou/unity2rbxlx only, so upstream PRs (no
+    # matching runner) skip this cleanly instead of queueing to the 24h max.
+    if: |
+      (github.event_name == 'pull_request'
+        || github.event_name == 'schedule'
+        || github.event_name == 'workflow_dispatch')
+      && github.repository == 'jiazou/unity2rbxlx'
+    needs: fast
+    timeout-minutes: 40
+    env:
+      # Path to the populated SimpleFPS Unity project on the self-hosted
+      # runner (same as smoke-test — checkout uses submodules: false).
+      UNITY_SIMPLEFPS_DIR: /Users/jiazou/workspace/unity-3d-simplefps
+      # PHASE-1 → PHASE-2 FLIP POINT. Default "0" in Phase 1: the player-bind
+      # axis (wasd_works / mouse_moves_view) is wired + recorded but
+      # documented-red (a clean-boot bind-absence is a ::warning::, NOT a gate
+      # failure) — there is no self.host.player authority yet to drive it.
+      # Phase 2 builds that authority and FLIPS this to "1" (the only change:
+      # this value 0→1, see the "Player-bind axis" step). At "1" a false bind
+      # field becomes ::error:: + non-zero exit, i.e. the required Phase-2
+      # acceptance gate. The BOOT/HEALTH axis is REQUIRED-GREEN regardless of
+      # this knob (it gates off u2r.py smoke-test's exit code below).
+      REQUIRE_PLAYER_BIND: "0"
+    defaults:
+      run:
+        working-directory: converter
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      # The self-hosted runner keeps its workspace between runs. If a prior
+      # run left the tree dirty (stale untracked output/, half-checked-out
+      # submodule dirs) actions/checkout's own clean can fall short. Reset +
+      # hard-clean here so a corrupted workspace self-heals instead of
+      # needing a manual wipe — the failure mode behind the 2026-05-15
+      # nightly, where checkout left the converter/ dir missing.
+      - name: Heal stale self-hosted workspace
+        working-directory: ${{ github.workspace }}
+        run: |
+          git reset --hard HEAD
+          git clean -ffdx
+          test -d converter || { echo "::error::converter/ missing after checkout"; exit 1; }
+
+      - name: Verify SimpleFPS source exists
+        run: |
+          if [ ! -d "$UNITY_SIMPLEFPS_DIR/Assets" ]; then
+            echo "::error::SimpleFPS Unity project not found at $UNITY_SIMPLEFPS_DIR"
+            exit 1
+          fi
+
+      - name: Install dependencies into shared venv
+        run: |
+          VENV="$HOME/.unity2rbxlx-venv"
+          if [ ! -x "$VENV/bin/python" ]; then
+            python3 -m venv "$VENV"
+          fi
+          "$VENV/bin/python" -m pip install --upgrade pip
+          "$VENV/bin/python" -m pip install -e ".[dev]"
+
+      - name: Cold (uncached, AI-on) generic convert
+        timeout-minutes: 35
+        run: |
+          # COLD = a FRESH AI transpile, NOT the lucky cached shape. This is
+          # the failure this gate exists to catch: a binding that "passes"
+          # only on a previously-cached AI shape and silently regresses the
+          # moment the transpiler emits a valid-but-different shape.
+          #
+          # Two caches must BOTH be busted for the convert to be genuinely
+          # cold (codex MAJOR / design §1, §E7):
+          #   1. The transpile-result files under the output dir's scripts/
+          #      (utils/script_cache.scripts_cache_intact reads
+          #      <output>/scripts/*.luau) — busted by wiping $OUT.
+          #   2. The AI RESPONSE cache at .cache/llm (config.py:137,
+          #      LLM_CACHE_ENABLED=True), keyed on the C# input + prompt hash
+          #      (code_transpiler.py:2332), 7-day TTL. This lives OUTSIDE the
+          #      output dir, so wiping $OUT alone leaves it warm → the AI
+          #      returns the SAME cached shape → NOT cold. Clearing it forces
+          #      a real fresh round-trip to the model.
+          # AI is left ON (no --no-ai): the nightly smoke-test runs --no-ai
+          # (deterministic rule-based) and never exercises the AI transpile at
+          # all, so it cannot catch a fresh-shape regression.
+          OUT="./output/SimpleFPS_cold_e2e"
+          rm -rf "$OUT"
+          rm -rf .cache/llm
+          "$HOME/.unity2rbxlx-venv/bin/python" u2r.py convert "$UNITY_SIMPLEFPS_DIR" \
+            -o "$OUT" \
+            --scene all \
+            --scene-runtime=generic \
+            --no-upload \
+            --no-resolve \
+            --skip-architecture-step
+
+      - name: Boot/health gate (required) + bounded launch retry
+        # Step-level cap so a hung Roblox Studio fails this step with a clear
+        # error instead of silently consuming the whole job budget (mirrors
+        # the smoke-test job's per-step Studio timeout).
+        timeout-minutes: 14
+        env:
+          SMOKE_OUT: smoke_output/SimpleFPS_cold_e2e
+        run: |
+          # --scene all writes per-scene rbxlx files; main.rbxlx is the
+          # gameplay scene (multi-scene SimpleFPS → main.rbxlx, NOT a unified
+          # converted_place.rbxlx). Absolute path: Studio launched from a
+          # non-interactive shell won't reliably resolve a relative rbxlx.
+          RBXLX="$PWD/output/SimpleFPS_cold_e2e/main.rbxlx"
+          if [ ! -f "$RBXLX" ]; then
+            echo "::error::Expected rbxlx not found: $RBXLX"
+            ls -la ./output/SimpleFPS_cold_e2e/ || true
+            exit 1
+          fi
+          REPORT="$PWD/$SMOKE_OUT/smoke_test_report.json"
+
+          # BOOT/HEALTH axis = u2r.py smoke-test's OWN exit code (it exits 1
+          # when SmokeTestReport.status != "pass", u2r.py:2158). We do NOT
+          # re-parse a status string to decide pass/fail (the real value is
+          # "pass", and re-deriving it is exactly where a "passed" typo would
+          # make the gate always-red). We read status ONLY to distinguish a
+          # launch/handshake FLAKE from a real boot failure (E2):
+          #   * report ABSENT after a non-zero exit  → run_smoke_test hit an
+          #     early error return (file-not-found / not-macOS / inject-failed
+          #     / Studio-failed-to-open, all status="error") and never wrote
+          #     the report → a launch/handshake failure → RETRY.
+          #   * report PRESENT, status="error"/"timeout" → Studio never gave a
+          #     clean handshake/completion → flake → RETRY.
+          #   * report PRESENT, status="fail" → Studio BOOTED and reported
+          #     script errors / a crash (a clean-boot-with-errors) → a REAL
+          #     gate failure → do NOT retry.
+          # Bounded at 1 retry (2 attempts total) so transport flake doesn't
+          # red a correct conversion while a real failure still fails fast.
+          MAX_ATTEMPTS=2
+          attempt=1
+          rc=0
+          while :; do
+            echo "cold-e2e boot/health-check on $RBXLX (attempt $attempt/$MAX_ATTEMPTS)"
+            rm -f "$REPORT"
+            rc=0
+            "$HOME/.unity2rbxlx-venv/bin/python" u2r.py smoke-test "$RBXLX" \
+              --output-dir "$PWD/$SMOKE_OUT" || rc=$?
+
+            if [ "$rc" -eq 0 ]; then
+              echo "Boot/health PASS (status=pass)."
+              break
+            fi
+
+            # Classify the non-zero exit.
+            if [ ! -f "$REPORT" ]; then
+              status="error"  # early return, no report written = launch failure
+            else
+              status="$("$HOME/.unity2rbxlx-venv/bin/python" -c \
+                "import json,sys; print(json.load(open('$REPORT')).get('status','unknown'))")"
+            fi
+            echo "smoke-test exit=$rc, status=$status"
+
+            case "$status" in
+              error|timeout)
+                if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+                  echo "::warning::Studio launch/handshake failure (status=$status) — retrying (E2)."
+                  attempt=$((attempt + 1))
+                  continue
+                fi
+                echo "::error::Studio launch/handshake failed after $MAX_ATTEMPTS attempts (status=$status)."
+                exit "$rc"
+                ;;
+              *)
+                # fail / unknown = clean-boot-with-errors → real failure.
+                echo "::error::Boot/health gate failed (status=$status) — real conversion/boot error, not retried."
+                exit "$rc"
+                ;;
+            esac
+          done
+
+      - name: Player-bind axis (REQUIRE_PLAYER_BIND knob — Phase-2 flip point)
+        # Documented-red in Phase 1 (REQUIRE_PLAYER_BIND=0): the player-bind
+        # signals are recorded + surfaced but a clean-boot bind-absence is a
+        # ::warning::, not a failure — there is no self.host.player authority
+        # yet to drive them. This step runs only after the BOOT/HEALTH gate
+        # above passed, so status is "pass" (Studio booted clean); a false
+        # wasd_works / mouse_moves_view here is "booted, bind-not-required",
+        # never a masked boot error (E3).
+        #
+        # >>> PHASE-2 FLIP: set the job-level env REQUIRE_PLAYER_BIND from
+        #     "0" → "1" (above). Nothing else in this file changes. At "1" a
+        #     false bind field below becomes ::error:: + exit 1, turning this
+        #     into the required Phase-2 acceptance gate. <<<
+        env:
+          SMOKE_OUT: smoke_output/SimpleFPS_cold_e2e
+        run: |
+          REPORT="$PWD/$SMOKE_OUT/smoke_test_report.json"
+          if [ ! -f "$REPORT" ]; then
+            echo "::error::smoke_test_report.json missing after a passing boot/health gate: $REPORT"
+            exit 1
+          fi
+          WASD="$("$HOME/.unity2rbxlx-venv/bin/python" -c \
+            "import json; print(str(json.load(open('$REPORT')).get('wasd_works',False)).lower())")"
+          MOUSE="$("$HOME/.unity2rbxlx-venv/bin/python" -c \
+            "import json; print(str(json.load(open('$REPORT')).get('mouse_moves_view',False)).lower())")"
+          echo "Player-bind axis: wasd_works=$WASD  mouse_moves_view=$MOUSE  (REQUIRE_PLAYER_BIND=$REQUIRE_PLAYER_BIND)"
+
+          fail=0
+          for pair in "wasd_works:$WASD" "mouse_moves_view:$MOUSE"; do
+            field="${pair%%:*}"; val="${pair##*:}"
+            if [ "$val" != "true" ]; then
+              if [ "$REQUIRE_PLAYER_BIND" = "1" ]; then
+                echo "::error::Player-bind required but $field=$val (Phase-2 require-bind gate)."
+                fail=1
+              else
+                echo "::warning::Player-bind $field=$val — documented-red in Phase 1 (REQUIRE_PLAYER_BIND=0); non-fatal."
+              fi
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Upload cold-e2e artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cold-e2e-SimpleFPS
+          path: |
+            converter/output/SimpleFPS_cold_e2e/*.rbxlx
+            converter/output/SimpleFPS_cold_e2e/conversion_report.json
+            converter/output/SimpleFPS_cold_e2e/scripts/
+            converter/smoke_output/SimpleFPS_cold_e2e/smoke_test_report.json
+            converter/smoke_output/SimpleFPS_cold_e2e/studio_screenshot.png
+          if-no-files-found: warn
+          retention-days: 14
+
   # Phase 5.3: AI-on convert-matrix variant. Runs the SimpleFPS conversion
   # with the AI transpiler enabled and asserts that non-empty
   # TranspiledScript.warnings is the only acceptable failure mode (i.e.
@@ -602,7 +846,7 @@ jobs:
     name: nightly summary
     runs-on: ubuntu-latest
     if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-    needs: [slow-unit-tests, convert-matrix, eval-regression, smoke-test, ai-convert-matrix, real-upload-smoke]
+    needs: [slow-unit-tests, convert-matrix, eval-regression, smoke-test, cold-e2e, ai-convert-matrix, real-upload-smoke]
     steps:
       - name: Check nightly job results
         run: |
@@ -610,6 +854,7 @@ jobs:
           echo "convert-matrix:     ${{ needs.convert-matrix.result }}"
           echo "eval-regression:    ${{ needs.eval-regression.result }}"
           echo "smoke-test:         ${{ needs.smoke-test.result }}"
+          echo "cold-e2e:           ${{ needs.cold-e2e.result }}"
           echo "ai-convert-matrix:  ${{ needs.ai-convert-matrix.result }}"
           echo "real-upload-smoke:  ${{ needs.real-upload-smoke.result }}"
           # smoke-test, ai-convert-matrix, and real-upload-smoke are

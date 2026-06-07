@@ -27,6 +27,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+import config
 from roblox.health_check_injector import inject_health_check
 from roblox.studio_log_parser import (
     find_new_log,
@@ -264,7 +265,12 @@ def run_smoke_test(
     return report
 
 
-STUDIO_BINARY = Path("/Applications/RobloxStudio.app/Contents/MacOS/RobloxStudio")
+# Single source of truth: the Studio binary is ``config.STUDIO_PATH`` (honors
+# the ROBLOX_STUDIO_PATH override). ``verify_hook.studio_available`` gates on the
+# same value, so the availability check and the launch always agree. Kept as a
+# module alias for back-compat; ``_open_studio`` reads ``config.STUDIO_PATH``
+# live so a test/runtime override of the config value applies to the launch.
+STUDIO_BINARY = config.STUDIO_PATH
 
 
 def _open_studio(rbxlx_path: Path) -> bool:
@@ -275,12 +281,13 @@ def _open_studio(rbxlx_path: Path) -> bool:
     protocol handler (``-protocolString file:// -protocolHandlerLaunch``)
     and opens Studio on the Start Page instead of the target place.
     """
-    if not STUDIO_BINARY.exists():
-        logger.error("Roblox Studio binary not found at %s", STUDIO_BINARY)
+    studio_binary = Path(config.STUDIO_PATH)
+    if not studio_binary.exists():
+        logger.error("Roblox Studio binary not found at %s", studio_binary)
         return False
     try:
         subprocess.Popen(
-            [str(STUDIO_BINARY), str(rbxlx_path)],
+            [str(studio_binary), str(rbxlx_path)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,

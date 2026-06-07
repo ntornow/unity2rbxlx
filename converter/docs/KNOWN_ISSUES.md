@@ -190,6 +190,43 @@ real generic conversion in Studio: spawn-on-floor, WASD moves the character came
 mouse yaw+pitch via the service, no new console errors. See
 `docs/design/camera-input-fidelity-plan.md`.
 
+### Player-bind Studio gate ships DOCUMENTED-RED (Phase 1) — flips to required in Phase 2
+
+**Files:** `.github/workflows/test.yml` (`cold-e2e` job), `converter/smoke_test.py`
+(`SmokeTestReport.wasd_works` / `.mouse_moves_view`), `converter/u2r.py`
+(`convert --verify`).
+
+Phase 1 ships the player-bind verification net as **documented-red**. The
+deterministic units are GREEN per-commit — the camera follow-math
+(`_readDelta` / `_composeLook` / `_advance` / `step` in `scene_camera_input.luau`,
+pinned by `tests/test_camera_follow_math.py`) and the `_tick` cross-pass
+substrate (in `scene_runtime.luau`, pinned by `tests/test_tick_substrate.py`).
+
+The Studio bind gate **records but does not require** the player-bind axis. On a
+fresh cold conversion the `cold-e2e` job runs `u2r.py smoke-test`, which boots
+the place and drives a coarse WASD + mouse window, writing `wasd_works` /
+`mouse_moves_view` to `smoke_test_report.json` (serialized via
+`asdict(SmokeTestReport)` in `smoke_test.py`). Two axes are gated separately:
+
+- **BOOT/HEALTH** — REQUIRED-GREEN always (a boot error fails the gate; never
+  masked as bind-absence).
+- **PLAYER-BIND** (`wasd_works` / `mouse_moves_view`) — gated by the job-level
+  `REQUIRE_PLAYER_BIND` env knob, default `"0"` in Phase 1. At `"0"` a clean-boot
+  bind-absence is a logged `::warning::`, NOT a failure (no `self.host.player`
+  authority drives the bind yet). The post-conversion `--verify` hook on
+  `u2r.py convert` folds only the boot/health verdict into the convert exit
+  status; the bind axis is non-fatal at baseRef.
+
+**The flip (Phase 2 — single named change, not a restructure):** Phase 2 builds
+`self.host.player` authority, then sets **`REQUIRE_PLAYER_BIND` `"0"` → `"1"`**
+in the `cold-e2e` job env in `.github/workflows/test.yml` (and in the shared
+`--verify`/`run_smoke_test` verdict-fold helper), plus adds the player-bind
+fixture IDs (`wasd_w_moves_forward`, `mouse_yaw_rotates_camera`,
+`shoot_fires_remote_or_bullet`, turret/door) to the required set the interactive
+`/e2e-test` rich-fixture run asserts. That one flag flip turns the
+documented-red bind axis into a hard pre-merge gate. The Layer-1 units stay
+GREEN and untouched across the flip.
+
 ### Turret / HudControl have no generic fidelity home
 
 **Files:** converted `Turret` (`GetPivot` on a `Sound` child, runtime error
