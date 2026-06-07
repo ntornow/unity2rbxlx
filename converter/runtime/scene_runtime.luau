@@ -759,6 +759,21 @@ function SceneRuntime:_makeHostSurface(owner)
 			end
 			return engine:isPlayerTouch(arg1)
 		end,
+		-- Public per-player read surface (P1-4/P2-G). A NARROW table closing
+		-- over ``engine`` — exposes ONLY the public ``getLookCFrame`` read so
+		-- Phase 3's Shoot raycast can reach ``self.host.player:getLookCFrame()``
+		-- without an interface change. It is NOT the raw SceneRuntime: internal
+		-- scheduling state (``engine._player`` / ``_services`` / the per-frame
+		-- brackets / ``start``) is NOT reachable through it, matching the
+		-- authoritative "dedicated embodiment object" boundary.
+		player = {
+			getLookCFrame = function(arg1)
+				-- Colon form ``host.player:getLookCFrame()`` -> arg1 = the
+				-- player table; dotted -> arg1 = nil. Either way dispatch the
+				-- engine's public method (no ``self``-dependent state here).
+				return engine:getLookCFrame()
+			end,
+		},
 	}
 	return host
 end
@@ -2786,6 +2801,12 @@ function SceneRuntime:start(domainFilter)
 	-- their PlayerGui clone resolves event-driven.
 	self:_resolveDeferredUiInstances()
 
+	-- Build the host-owned per-player embodiment authority (paradigm C).
+	-- Client-only + keyed on the upstream has_character_controller MODULE
+	-- signal; leaves ``self._player = nil`` (the _tick brackets no-op) on the
+	-- server or when identity is absent/ambiguous (fail-closed).
+	self:_initPlayerAuthority()
+
 	return crossDomainEdges
 end
 
@@ -3017,7 +3038,86 @@ function SceneRuntime:getLookCFrame()
 	return cam and cam.CFrame or CFrame.new()
 end
 
+-- Pre-Update bracket (runs OUTSIDE the component ``pairs()`` loop, BEFORE
+-- the Update pass). No-op when ``self._player == nil`` (server / no player).
+-- Boots once (idempotent), reads the SINGLE per-frame E2E input snapshot
+-- (D9 — before the lowered A controller's mid-pass ``_cam:step``->``_readDelta``
+-- can consume the channel), then writes the camera so a same-frame raw camera
+-- READ during the Update pass sees C's pose.
+function SceneRuntime:_playerPreTick(_dt)
+	if not self._player then return end
+	self:_playerBoot()
+	self:_playerReadInput()
+	self:_playerWriteCamera()
+end
+
+-- Post-LateUpdate bracket (runs OUTSIDE the component ``pairs()`` loop, AFTER
+-- the LateUpdate pass). No-op when ``self._player == nil``. Re-asserts the
+-- camera (last-writer over any component camera write this frame — D8) folding
+-- this frame's locomotion-driven eye position, then drives WASD->Move + the
+-- every-frame last-writer jump.
+function SceneRuntime:_playerPostTick(_dt)
+	if not self._player then return end
+	self:_playerWriteCamera()
+	self:_playerDriveLocomotion()
+end
+
+-- Per-player lifecycle init (P1-2/P1-5/P2-F). Called ONCE at the end of
+-- ``start()``. Builds ``self._player`` ONLY on the client side AND only when
+-- the upstream ``has_character_controller`` signal identifies EXACTLY ONE
+-- CC-bearing MODULE row over ``self._plan.modules`` (fail-closed otherwise):
+--   * ``self._services.isClient`` not truthy  -> leave ``self._player = nil``
+--     (the server never builds/drives the authority — the brackets no-op). The
+--     gate is the explicit ``isClient`` boolean the entrypoint stamps, NOT a
+--     ``RunService`` presence sniff (the server services table has no
+--     ``runService``, so a presence sniff would mis-treat it as a client).
+--   * 0 CC module rows -> no player (fail-closed silent; the build-time
+--     ``player_signal_absent`` fail-close already catches this at convert time).
+--   * >1 CC module rows -> warn + no player (ambiguous; mirrors the build-time
+--     ``player_ambiguous`` fail-close — one camera per client).
+--   * exactly 1 -> build the ``self._player`` state table (§1 shape).
+-- Identity counts distinct CC MODULE rows (NOT per-instance ``_meta`` — one
+-- CC module placed on N GameObjects is ONE row, not N), keyed ONLY on the
+-- deterministic upstream ``row.has_character_controller`` signal — NEVER an
+-- AI-output fingerprint (§3 guardrail).
+function SceneRuntime:_initPlayerAuthority()
+	self._player = nil
+	if not self._services.isClient then return end
+
+	local ccCount = 0
+	for _, row in pairs(self._plan.modules or {}) do
+		if type(row) == "table" and row.has_character_controller then
+			ccCount = ccCount + 1
+		end
+	end
+
+	if ccCount == 0 then
+		return
+	elseif ccCount > 1 then
+		self._warn(string.format(
+			"[scene-runtime] player-embodiment authority unbound: %d modules "
+			.. "carry has_character_controller (ambiguous; expected exactly "
+			.. "one). No player camera/locomotion authority bound.", ccCount))
+		return
+	end
+
+	self._player = {
+		_yaw = 0,
+		_pitch = 0,
+		_booted = false,
+		_jumpHeld = false,
+		_sensitivity = 0.0045,
+		_minPitch = math.rad(-80),
+		_maxPitch = math.rad(80),
+		_eyeHeight = 1.5,
+	}
+end
+
 function SceneRuntime:_tick(dt)
+	-- Host-owned player embodiment pre-Update bracket (no-op on server /
+	-- no player) — runs BEFORE the component pass so C's input snapshot +
+	-- camera write precede any component camera read this frame.
+	self:_playerPreTick(dt)
 	-- Update + LateUpdate every frame; FixedUpdate via fixed-step.
 	for comp, m in pairs(self._meta) do
 		if m.activeInHierarchy and m.enabled then
@@ -3038,6 +3138,9 @@ function SceneRuntime:_tick(dt)
 			self:_callMethod(comp, "LateUpdate", dt)
 		end
 	end
+	-- Host-owned player embodiment post-LateUpdate bracket — runs AFTER the
+	-- component pass so C is the LAST writer of camera + move + jump intent.
+	self:_playerPostTick(dt)
 end
 
 -- ---------------------------------------------------------------------

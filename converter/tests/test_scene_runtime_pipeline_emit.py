@@ -3,9 +3,11 @@
 Asserts the conversion-time wiring:
   * Subphase runs ONLY under ``ctx.scene_runtime_mode == "generic"``.
   * Subphase is a no-op when no runtime-bearing modules exist.
-  * Under generic with runtime-bearing modules, the four scripts land
-    (SceneRuntime, SceneRuntimePlan, SceneRuntimeClient,
-    SceneRuntimeServer) with correct parent paths.
+  * Under generic with runtime-bearing modules, the five scripts land
+    (SceneCameraInput, SceneRuntime, SceneRuntimePlan, SceneRuntimeClient,
+    SceneRuntimeServer) with correct parent paths — SceneCameraInput is
+    emitted UNCONDITIONALLY (P1-1/AC13), even when no script references it,
+    because the client entrypoint requires it for the player authority.
   * Re-running the subphase replaces existing copies rather than
     duplicating (idempotency for ``--phase write_output`` resumes).
   * Cross-domain edges are stamped onto ``ctx.scene_runtime`` and
@@ -104,18 +106,46 @@ class TestSubphaseGating:
             "generic mode with no runtime-bearing modules must skip emit"
         )
 
-    def test_generic_with_runtime_bearing_emits_four_scripts(self, tmp_path):
+    def test_generic_with_runtime_bearing_emits_five_scripts(self, tmp_path):
+        # P1-1/AC13: SceneCameraInput is emitted UNCONDITIONALLY alongside the
+        # host runtime (the client entrypoint requires it for the player
+        # authority), growing the emit set from 4 to 5.
         p = _make_pipeline_with_ctx(
             tmp_path, "generic", _runtime_bearing_plan(),
         )
         p._subphase_inject_scene_runtime()
         names = sorted(s.name for s in p.state.rbx_place.scripts)
         assert names == [
+            "SceneCameraInput",
             "SceneRuntime",
             "SceneRuntimeClient",
             "SceneRuntimePlan",
             "SceneRuntimeServer",
         ]
+
+    def test_scene_camera_input_emitted_with_no_camera_token(self, tmp_path):
+        # AC13: a generic runtime-bearing place whose scripts NEVER reference
+        # ``SceneCameraInput`` (no look-method lowered to it) STILL emits the
+        # SceneCameraInput ModuleScript — so the client entrypoint's
+        # unconditional ``require(WaitForChild("SceneCameraInput"))`` never
+        # stalls on a never-emitted module. Pins the real pipeline gate change.
+        p = _make_pipeline_with_ctx(
+            tmp_path, "generic", _runtime_bearing_plan(),
+        )
+        # Seed a pre-existing user script that does NOT mention the camera
+        # service — the only SceneCameraInput token in the place comes from
+        # the entrypoint require + the unconditional emit, never the gate.
+        p.state.rbx_place.scripts.append(RbxScript(
+            name="UserGameplay",
+            source="-- a controller with no look method to lower",
+            script_type="Script",
+        ))
+        p._subphase_inject_scene_runtime()
+        names = {s.name for s in p.state.rbx_place.scripts}
+        assert "SceneCameraInput" in names, (
+            "SceneCameraInput must emit unconditionally even with no "
+            f"camera-token script present; got {sorted(names)}"
+        )
 
     def test_parent_paths_set_correctly(self, tmp_path):
         p = _make_pipeline_with_ctx(

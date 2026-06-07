@@ -6262,28 +6262,32 @@ script.Disabled = true
             return
 
         # PR5 camera/input service: inject runtime/scene_camera_input.luau as a
-        # ReplicatedStorage ModuleScript when the camera-facet lowering pass
-        # routed a controller to it (the only consumer ``require``s
-        # "SceneCameraInput"). Allowlisted alongside the host runtime — a
+        # ReplicatedStorage ModuleScript UNCONDITIONALLY whenever the host
+        # runtime is emitted (P1-1). The SceneRuntimeClient entrypoint now
+        # ``require``s SceneCameraInput unconditionally (it reuses the camera
+        # service's pure pose helpers for the player-embodiment authority), so
+        # the prior lowering-gated ``any("SceneCameraInput" in s.source)``
+        # heuristic — which fired only when ``lower_camera_facet`` routed a
+        # controller to it — would leave the entrypoint's
+        # ``require(WaitForChild("SceneCameraInput"))`` stalling on a place with
+        # no look-method to lower. Emission only PLACES the ModuleScript; only a
+        # ``require`` executes it, so it is safe on the server too. A
         # deterministic lowering-layer library, not a coherence pack.
-        if any(
-            "SceneCameraInput" in (s.source or "")
-            for s in self.state.rbx_place.scripts
-        ):
-            cam_path = runtime_dir / "scene_camera_input.luau"
-            if cam_path.exists():
-                _replace_or_add(RbxScript(
-                    name="SceneCameraInput",
-                    source=cam_path.read_text(encoding="utf-8"),
-                    script_type="ModuleScript",
-                    parent_path="ReplicatedStorage",
-                ))
-            else:
-                log.warning(
-                    "[write_output] camera-facet lowering ran but %s is "
-                    "missing; converted FPS controllers will error on require",
-                    cam_path,
-                )
+        cam_path = runtime_dir / "scene_camera_input.luau"
+        if cam_path.exists():
+            _replace_or_add(RbxScript(
+                name="SceneCameraInput",
+                source=cam_path.read_text(encoding="utf-8"),
+                script_type="ModuleScript",
+                parent_path="ReplicatedStorage",
+            ))
+        else:
+            log.warning(
+                "[write_output] scene-runtime host emitted but %s is "
+                "missing; the client entrypoint's require(SceneCameraInput) "
+                "will stall and the player authority will not bind",
+                cam_path,
+            )
 
         # R2-P1.3 (contract resolution): rewrite asset/SO refs before
         # embedding the plan. Assets become ``rbxassetid://...``;

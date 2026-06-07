@@ -673,6 +673,14 @@ local PlayerGui = LocalPlayer and LocalPlayer:WaitForChild("PlayerGui", 10)
 local SceneRuntime = require(RS:WaitForChild("SceneRuntime"))
 local Plan = require(RS:WaitForChild("SceneRuntimePlan"))
 
+-- The host-owned player embodiment authority (paradigm C) reuses the camera
+-- service's vetted pure pose math via injected helpers — it never requires
+-- SceneCameraInput at the host's top-of-file (the host loads with no ``game``
+-- global). SceneCameraInput is emitted UNCONDITIONALLY alongside SceneRuntime
+-- (pipeline.py), so this require always resolves on the client.
+local SceneCameraInput = require(RS:WaitForChild("SceneCameraInput"))
+local UserInputService = game:GetService("UserInputService")
+
 local function workspaceFind(sceneRuntimeId)
     -- Linear scan; production builds may cache as needed. Hosts are
     -- stamped on the logical GameObject only (PR2), so this is
@@ -808,6 +816,15 @@ end
 local services = {
     task = task,
     warn = warn,
+    -- Player-embodiment authority (paradigm C) — CLIENT ONLY. ``isClient``
+    -- is the deterministic client/server discriminator the authority gates
+    -- on (NOT a RunService presence sniff); ``userInputService`` + the two
+    -- pure camera helpers reach the in-runtime authority via this table. The
+    -- SERVER table stamps ``isClient = false`` and omits these.
+    isClient = true,
+    userInputService = UserInputService,
+    cameraAdvance = SceneCameraInput._advance,
+    cameraComposeLook = SceneCameraInput._composeLook,
     resolveModule = resolveModule,
     workspaceFind = workspaceFind,
     awaitUiHost = awaitUiHost,
@@ -958,6 +975,11 @@ end
 local services = {
     task = task,
     warn = warn,
+    -- The server NEVER builds/drives the player-embodiment authority: the
+    -- explicit ``isClient = false`` flag makes ``_initPlayerAuthority`` leave
+    -- ``self._player = nil`` so the ``_tick`` brackets no-op. No UIS / camera
+    -- helpers are injected here (the client table carries them).
+    isClient = false,
     resolveModule = resolveModule,
     workspaceFind = workspaceFind,
     findFirstChildWhichIsA = function(inst, class)
