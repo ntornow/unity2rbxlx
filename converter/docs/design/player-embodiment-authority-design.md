@@ -218,11 +218,14 @@ reviewers required is preserved: C lands WITH A active (D8), A is deleted LAST.
   consume the E2E channel exactly once and C is the consumer (D9). `REQUIRE_PLAYER_BIND` still 0. No
   product binding code rides on an unproven assumption.
 - **Phase 2 — host authority, proving C DOMINATES with A still ACTIVE (D8).** `self.host.player`:
-  input snapshot (pure `advance()` channel read, D9) + pre/post camera + host locomotion + boot, from
-  `_tick` OUTSIDE the component loop, keyed on the deterministic upstream `_HasCharacterController`
-  identity carried into the runtime plan. **Prove C structurally dominates on BOTH the A-miss
-  `cold3a59` AND the A-hit `dde248` shapes** (final `CurrentCamera.CFrame` + the character's `Humanoid`
-  move-intent are C's each frame) — A NOT suppressed, NOT deleted. Cold-Studio: camera + WASD on the
+  input snapshot (pure `advance()` channel read, D9) + pre/post camera + host locomotion (WASD→`Humanoid:Move`
+  **+ jump→`Humanoid.Jump`/`:ChangeState(Jumping)`**) + boot, from `_tick` OUTSIDE the component loop, keyed
+  on the deterministic upstream `_HasCharacterController` identity carried into the runtime plan. **Prove C
+  structurally dominates on BOTH the A-miss `cold3a59` AND the A-hit `dde248` shapes** (final
+  `CurrentCamera.CFrame` + the character's `Humanoid` **move-intent AND jump-intent** are C's each frame) —
+  A NOT suppressed, NOT deleted. **Jump is explicitly C-owned: add a build-time jump-dominance assertion to
+  the shape corpus** so jump is never left implicitly riding the raw/legacy-A path that Phase 5 deletes (on
+  A-hit `dde248` the AI natively emits `humanoid.Jump = true`). Cold-Studio: camera + WASD + jump on the
   cold shape. (Raw rig `PivotTo` drift vestigial until Phase 3; recoil-on-A-hit degraded until Phase 5.)
 - **Phase 3 — U1 + aim-read + respawn lifecycle resync (D7).** Shadow-sync the rig to the character
   HRP; `getLookCFrame()` for `Shoot`; per-player **lifecycle resync** on `CharacterAdded` (re-acquire
@@ -271,7 +274,8 @@ Build-time signal must catch the #1 failure mode (frame ordering) WITHOUT a Stud
 1. **Shape-variance regression corpus (NEW, mandatory).** Check in the TWO real `Player.luau` shapes
    that broke the locators — the cached `dde248` (helper `_axis` + extra-yaw camera) AND the cold
    `cold3a59` (helper `_getAxis` + rig-`PivotTo` move + `Update`-cached `GetMouseDelta`) — as host-harness
-   fixtures, asserted to BIND under the authority (camera follows, WASD drives the Humanoid, Shoot reads
+   fixtures, asserted to BIND under the authority (camera follows, WASD drives the Humanoid, **jump drives
+   the Humanoid (C-owned jump-dominance, not the raw `humanoid.Jump`/legacy-A path)**, Shoot reads
    the live look). Every future "it broke on a new shape" adds its shape to the corpus. This is the
    regression guard the whole effort lacked (the e2e was the only net, run on lucky shapes).
 2. **Pre+post camera-write assertion (host harness).** Assert the authority writes `CurrentCamera.CFrame`
