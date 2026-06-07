@@ -239,7 +239,9 @@ reviewers required is preserved: C lands WITH A active (D8), A is deleted LAST.
   Delete `movement_facet_lowering` + the player path of `camera_facet_lowering` and the #182 locators.
   Flip the acceptance gate (`verify_hook.py:35` + `test.yml:434` + `test_verify_hook.py` +
   `test_behavior_fixture_contract.py`) as the **LAST act, only after C binds on a FRESH cold Studio
-  conversion**. Full cold e2e (turrets/doors/etc.) green.
+  conversion with camera + WASD + jump + shoot + respawn all C-owned** (so deleting A leaves NO
+  responsibility — incl. jump — implicitly owned by the removed paradigm). Full cold e2e
+  (turrets/doors/etc.) green.
 
 ## Verification discipline (the lesson this episode taught)
 NEVER call this done off a cached assemble. Every slice: cold (uncached) transpile → real-mesh
