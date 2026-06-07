@@ -173,6 +173,83 @@ class TestInitPlayerAuthorityIdentity:
 
 
 # ---------------------------------------------------------------------------
+# AC1+AC2 (SHIPPED boot path) — drive the REAL engine:start("client") wiring:
+# start() -> _initPlayerAuthority binds self._player, then the heartbeat ->
+# _tick -> _playerPreTick boot path flips _booted + applies camera/mouse
+# control. Every OTHER Phase-2 test calls _initPlayerAuthority directly or
+# seeds engine._player; this one is the ONLY test that exercises the wiring
+# start() and the heartbeat connection actually ship (so dropping the
+# start()->init call OR the heartbeat->_tick->boot hook is caught here).
+# ---------------------------------------------------------------------------
+
+class TestStartClientBootPath:
+
+    def test_start_client_binds_player_and_first_heartbeat_boots(self) -> None:
+        # SHIPPED PATH: build a SceneRuntime over a one-CC-module plan with the
+        # injected client services (isClient=true + the camera helpers + UIS),
+        # call engine:start("client") (which connects _tick to the heartbeat
+        # signal AND calls _initPlayerAuthority at its end), then FIRE the
+        # heartbeat once to drive the first real _tick. We assert:
+        #   (1) start() bound self._player from the upstream
+        #       has_character_controller MODULE-ROW signal (non-nil); AC1.
+        #   (2) before the first heartbeat the player is NOT booted; after the
+        #       first heartbeat -> _tick -> _playerPreTick -> _playerBoot it IS
+        #       booted AND camera/mouse control is applied (CameraType=Scriptable,
+        #       MouseBehavior=LockCenter, MouseIconEnabled=false). AC2/boot.
+        # Drives the REAL start() + heartbeat wiring — NOT _initPlayerAuthority
+        # directly and NOT a hand-seeded engine._player.
+        preamble = camera_input_preamble(mouse_deltas=[])
+        body = """
+            local plan = {
+                modules = {
+                    player = {stem = "Player", runtime_bearing = true,
+                              domain = "client",
+                              has_character_controller = true},
+                },
+                scenes = {},
+                prefabs = {},
+            }
+            local services = servicesFor(plan, {}, {})
+            services.isClient = true
+            services.userInputService = game:GetService("UserInputService")
+            services.players = game:GetService("Players")
+            services.cameraAdvance = SceneCameraInput._advance
+            services.cameraComposeLook = SceneCameraInput._composeLook
+
+            local engine = SceneRuntime.new(services, plan)
+
+            -- SHIPPED: start("client") connects _tick to the heartbeat AND
+            -- calls _initPlayerAuthority at its end.
+            engine:start("client")
+
+            -- AC1: start() bound the authority off the upstream signal.
+            print("BOUND=" .. tostring(engine._player ~= nil))
+            print("BOOTED_PRE=" .. tostring(engine._player and engine._player._booted))
+
+            -- Drive the FIRST real heartbeat -> _tick -> _playerPreTick -> boot.
+            services.heartbeat:fire(0.016)
+
+            print("BOOTED_POST=" .. tostring(engine._player and engine._player._booted))
+            print("CAMTYPE=" .. tostring(workspace.CurrentCamera.CameraType))
+            print("MOUSEBEHAVIOR=" .. tostring(game:GetService("UserInputService").MouseBehavior))
+            print("MOUSEICON=" .. tostring(game:GetService("UserInputService").MouseIconEnabled))
+        """
+        rc, out, err = run_camera_scenario(preamble, body)
+        assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
+        # AC1: the SHIPPED start() bound the player from the upstream
+        # has_character_controller signal (NOT seeded by the test).
+        assert "BOUND=true" in out, out
+        # Boot is deferred to the first heartbeat/_tick (start() only binds).
+        assert "BOOTED_PRE=false" in out, out
+        # First heartbeat -> _tick -> _playerPreTick -> _playerBoot flipped it.
+        assert "BOOTED_POST=true" in out, out
+        # ... and applied authoritative camera/mouse control.
+        assert "CAMTYPE=Scriptable" in out, out
+        assert "MOUSEBEHAVIOR=LockCenter" in out, out
+        assert "MOUSEICON=false" in out, out
+
+
+# ---------------------------------------------------------------------------
 # AC2 — pre/post camera-write ordering around the component pass + idempotency.
 # ---------------------------------------------------------------------------
 
@@ -250,38 +327,9 @@ class TestTickCameraBracketOrdering:
         # _playerPostTick is removed or scheduled before the LateUpdate pass.
         assert "FINAL=1.25" in out, out
 
-    def test_write_camera_twice_is_idempotent(self) -> None:
-        # E9: two _playerWriteCamera calls with unchanged state yield the same
-        # pose (both compose from the same yaw/pitch advanced once).
-        preamble = camera_input_preamble(mouse_deltas=[])
-        body = """
-            local plan = {modules = {}}
-            local services = servicesFor(plan, {}, {})
-            services.isClient = true
-            services.userInputService = game:GetService("UserInputService")
-            services.cameraAdvance = SceneCameraInput._advance
-            services.cameraComposeLook = SceneCameraInput._composeLook
-            local engine = SceneRuntime.new(services, plan)
-            engine._player = {
-                _yaw = 0.5, _pitch = 0.25,
-                _booted = true, _jumpHeld = false,
-                _sensitivity = 0.0045,
-                _minPitch = math.rad(-80), _maxPitch = math.rad(80),
-                _eyeHeight = 1.5,
-            }
-            engine:_playerWriteCamera()
-            local y1 = workspace.CurrentCamera.CFrame._yaw
-            local p1 = workspace.CurrentCamera.CFrame._pitch
-            engine:_playerWriteCamera()
-            local y2 = workspace.CurrentCamera.CFrame._yaw
-            local p2 = workspace.CurrentCamera.CFrame._pitch
-            print("SAME=" .. tostring(y1 == y2 and p1 == p2))
-            print("YAW=" .. tostring(y2))
-        """
-        rc, out, err = run_camera_scenario(preamble, body)
-        assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
-        assert "SAME=true" in out, out
-        assert "YAW=0.5" in out, out
+    # E9 twice-call idempotency is pinned at the unit level in
+    # test_player_authority.py::test_write_camera_twice_idempotent; the
+    # integration value here is the pre/post ORDERING above, not a second copy.
 
 
 # ---------------------------------------------------------------------------

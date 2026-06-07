@@ -325,16 +325,25 @@ def test_read_input_uses_injected_advance_not_camera_step() -> None:
     """D9 / §3 guardrail (static): the runtime's player-authority methods NEVER
     call ``SceneCameraInput:step`` / ``:_readDelta`` / ``:acquire`` /
     ``:configure``, and the selection/read path carries no AI-output substring
-    matcher. Grep the production runtime source directly."""
+    matcher. Grep the player-authority block of the production runtime source
+    directly (scoped to ``_playerBoot``..``_tick`` so an unrelated future
+    ``:configure(`` / ``:step(`` elsewhere in ``scene_runtime.luau`` cannot
+    false-fail this D9 guard)."""
     src = HOST_RUNTIME_PATH.read_text(encoding="utf-8")
+    # Scope to the player-authority methods (``_playerBoot`` through the method
+    # just before ``_tick``); the same slicing idiom as the AC8 boot guard.
+    block = src[
+        src.index("function SceneRuntime:_playerBoot()") :
+        src.index("function SceneRuntime:_tick(")
+    ]
     # The authority must reuse the INJECTED pure helper, never the singleton.
     for forbidden in (":step(", ":_readDelta(", ":acquire(", ":configure("):
-        assert forbidden not in src, (
+        assert forbidden not in block, (
             f"player authority must not call {forbidden!r} (D9)"
         )
     # The single per-frame channel read advances via the injected helper.
-    assert "self._services.cameraAdvance(" in src, src
-    assert "self._services.cameraComposeLook(" in src, src
+    assert "self._services.cameraAdvance(" in block, block
+    assert "self._services.cameraComposeLook(" in block, block
 
 
 # ---------------------------------------------------------------------------

@@ -575,6 +575,44 @@ class TestAutogenDoesNotClobberUserNamedScripts:
             "fresh emit must overwrite prior autogen body"
         )
 
+    def test_prior_autogen_scene_camera_input_is_replaced(self, tmp_path):
+        # P1-1/AC13 regression guard: the SceneCameraInput emit is now
+        # UNCONDITIONAL, but a rerun must REPLACE a stale prior-autogen copy
+        # with the current source rather than leaving the old body. (The
+        # SceneRuntime-replacement test pins this for SceneRuntime; without
+        # this, a stale SceneCameraInput could persist across a
+        # ``--phase write_output`` resume and the client entrypoint would
+        # require an outdated camera service.)
+        p = _make_pipeline_with_ctx(
+            tmp_path, "generic", _runtime_bearing_plan(),
+        )
+        # A prior autogen artifact carries the SceneCameraInput marker, so
+        # replacement is permitted (a user-owned same-name script without the
+        # marker would be preserved — covered by the SceneRuntime user-owned
+        # test; the marker gate is shared by ``_replace_or_add``).
+        prior = RbxScript(
+            name="SceneCameraInput",
+            source=(
+                "-- SceneCameraInput -- generic first-person camera/input "
+                "service (PR5).\nSTALE_CAMERA_BODY\n"
+            ),
+            script_type="ModuleScript",
+            parent_path="ReplicatedStorage",
+        )
+        p.state.rbx_place.scripts.append(prior)
+        p._subphase_inject_scene_runtime()
+        cam = [
+            s for s in p.state.rbx_place.scripts if s.name == "SceneCameraInput"
+        ]
+        assert len(cam) == 1, (
+            "stale autogen SceneCameraInput must be replaced exactly once, "
+            f"not duplicated; got: {[s.source[:40] for s in cam]}"
+        )
+        assert "STALE_CAMERA_BODY" not in cam[0].source, (
+            "rerun must overwrite the stale SceneCameraInput body with the "
+            "current source, not keep the prior copy"
+        )
+
 
 class TestAssetRefRewriteAndScriptableObjectsMap:
     """Codex round-2 P1.3 (contract resolution):
