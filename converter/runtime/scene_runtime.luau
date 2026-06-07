@@ -2951,6 +2951,63 @@ function SceneRuntime:_playerCharacterHRP()
 	return char and char:FindFirstChild("HumanoidRootPart") or nil
 end
 
+-- Drive the character's locomotion once per frame, AFTER the LateUpdate pass
+-- (the post bracket). WASD is camera-yaw-relative (same basis the lowered A
+-- body uses: ``CFrame.Angles(0, yaw, 0):VectorToWorldSpace(Vector3.new(h, 0,
+-- -v))`` with D/A -> +/-1 on h and W/S -> +/-1 on v) -> ``Humanoid:Move``.
+--
+-- JUMP (D-jump / E7 / P1-3 -- every-frame last-writer): the jump intent is
+-- WRITTEN EVERY frame as ``humanoid.Jump = risingEdge`` -- true ONLY on the
+-- frame Space transitions down, EXPLICITLY false otherwise. Because this runs
+-- in the post-LateUpdate bracket it OVERWRITES paradigm A's level-triggered
+-- ``hum.Jump = true`` (set mid-pass every grounded frame Space is held), so C
+-- is the LAST jump writer every frame: on a held Space frame 1 ends true (the
+-- press edge), frames 2+ end false -- one jump per press while still dominating
+-- A. ``:ChangeState(Jumping)`` fires ONLY on the rising edge. ``p._jumpHeld`` is
+-- the edge memory (NOT a write-suppressor: the Jump write happens every frame).
+--
+-- No character Humanoid yet -> no-op (E1). No-op when ``self._player == nil``.
+function SceneRuntime:_playerDriveLocomotion()
+	local p = self._player
+	if not p then return end
+
+	local players = self._services.players
+	local lp = players and players.LocalPlayer
+	local char = lp and lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not hum then return end
+
+	local uis = self._services.userInputService
+
+	-- WASD -> camera-yaw-relative move direction (mirrors the lowered A body's
+	-- yaw basis so C's move-intent matches the player's facing).
+	local h, v = 0, 0
+	if uis then
+		if uis:IsKeyDown(Enum.KeyCode.D) then h = h + 1 end
+		if uis:IsKeyDown(Enum.KeyCode.A) then h = h - 1 end
+		if uis:IsKeyDown(Enum.KeyCode.W) then v = v + 1 end
+		if uis:IsKeyDown(Enum.KeyCode.S) then v = v - 1 end
+	end
+	local dir = CFrame.Angles(0, p._yaw, 0):VectorToWorldSpace(
+		Vector3.new(h, 0, -v))
+	if dir.Magnitude > 0 then
+		hum:Move(dir.Unit, false)
+	else
+		hum:Move(Vector3.zero, false)
+	end
+
+	-- JUMP -- every-frame last-writer (E7/P1-3). Compute the rising edge, then
+	-- WRITE ``Jump`` every frame (true only on the edge) so C dominates A's
+	-- mid-pass ``hum.Jump = true``; ``ChangeState(Jumping)`` only on the edge.
+	local spaceDown = uis ~= nil and uis:IsKeyDown(Enum.KeyCode.Space) or false
+	local risingEdge = spaceDown and not p._jumpHeld
+	hum.Jump = risingEdge
+	if risingEdge then
+		hum:ChangeState(Enum.HumanoidStateType.Jumping)
+	end
+	p._jumpHeld = spaceDown
+end
+
 -- Read-only look for game logic (Phase 3 wires Shoot's raycast to this via
 -- ``host.player``). STUB in Phase 2: mirrors ``CurrentCamera.CFrame``
 -- whether or not ``self._player`` is bound (a no-player place still answers

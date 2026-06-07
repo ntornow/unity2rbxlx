@@ -444,6 +444,296 @@ def test_get_look_cframe_returns_current_camera_pose() -> None:
     assert "FALLBACK=true" in out, out
 
 
+# ---------------------------------------------------------------------------
+# Slice 2.2 — locomotion + jump (``_playerDriveLocomotion``).
+#
+# AC5 (unit half) — WASD drives camera-yaw-relative ``Humanoid:Move``.
+# AC6 (unit / D-jump / E7) — jump is the every-frame last-writer:
+#   ``humanoid.Jump = risingEdge`` is written EVERY frame (true ONLY on the
+#   press edge, false otherwise), ``:ChangeState(Jumping)`` on the edge only.
+#   Held Space across 2 frames -> frame 1 Jump=true + ChangeState once, frame 2
+#   Jump=false + NO second ChangeState. The frame-2 ``Jump=false`` proves C wins
+#   the every-frame write contest, not just the edge.
+# ---------------------------------------------------------------------------
+
+
+def _locomotion_setup(*, keys_down: str = "") -> str:
+    """Provision the locomotion mocks ``_playerDriveLocomotion`` reads:
+
+      * a ``Humanoid`` (``:Move`` records an ORDERED log; ``.Jump`` writes +
+        ``:ChangeState`` calls record into ordered logs) resolved off
+        ``LocalPlayer.Character:FindFirstChildOfClass("Humanoid")``;
+      * ``UserInputService:IsKeyDown`` keyed off a mutable ``_keysDown`` set the
+        scenario flips between frames (held Space across frames);
+      * ``Enum.KeyCode`` / ``Enum.HumanoidStateType`` + ``CFrame.Angles(...)
+        :VectorToWorldSpace`` (the camera-yaw-relative move basis) extended onto
+        the camera-harness mocks.
+
+    ``keys_down`` is a comma list of KeyCode names (e.g. ``"W,Space"``) held at
+    setup; a scenario mutates ``_keysDown[name]`` between frames.
+    """
+    initial = "".join(
+        f'        _keysDown["{k.strip()}"] = true\n'
+        for k in keys_down.split(",")
+        if k.strip()
+    )
+    return (
+        """
+        -- KeyCode / HumanoidStateType the runtime reads (extend the harness Enum).
+        Enum.KeyCode = {
+            W = "W", A = "A", S = "S", D = "D", Space = "Space",
+        }
+        Enum.HumanoidStateType = {Jumping = "Jumping"}
+
+        -- CFrame.Angles(0, yaw, 0):VectorToWorldSpace(v) -> rotate v about Y by
+        -- yaw (the camera-yaw-relative move basis). Returns a Vector3 with a
+        -- ``.Magnitude`` / ``.Unit`` the runtime branches on.
+        local _origAngles = CFrame.Angles
+        CFrame.Angles = function(x, y, z)
+            local cf = _origAngles(x, y, z)
+            cf._yawBasis = y or 0
+            function cf:VectorToWorldSpace(vec)
+                local yaw = self._yawBasis or 0
+                local cy, sy = math.cos(yaw), math.sin(yaw)
+                -- rotate (vx, vy, vz) about +Y by yaw.
+                local wx = vec.X * cy + vec.Z * sy
+                local wz = -vec.X * sy + vec.Z * cy
+                local out = Vector3.new(wx, vec.Y, wz)
+                local mag = math.sqrt(wx * wx + vec.Y * vec.Y + wz * wz)
+                out.Magnitude = mag
+                if mag > 0 then
+                    out.Unit = Vector3.new(wx / mag, vec.Y / mag, wz / mag)
+                else
+                    out.Unit = Vector3.new(0, 0, 0)
+                end
+                return out
+            end
+            return cf
+        end
+
+        -- Mutable held-key set + IsKeyDown on the harness UIS.
+        _keysDown = {}
+"""
+        + initial
+        + """
+        do
+            local uis = game:GetService("UserInputService")
+            function uis:IsKeyDown(code) return _keysDown[code] == true end
+        end
+
+        -- Humanoid with ordered Move / Jump / ChangeState logs.
+        _humLog = {moves = {}, jumps = {}, states = {}}
+        local humanoid = {}
+        function humanoid:IsA(c) return c == "Humanoid" end
+        function humanoid:Move(vec, relativeToCamera)
+            _humLog.moves[#_humLog.moves + 1] =
+                string.format("%.4f,%.4f,%.4f", vec.X, vec.Y, vec.Z)
+        end
+        function humanoid:ChangeState(state)
+            _humLog.states[#_humLog.states + 1] = tostring(state)
+        end
+        -- ``.Jump`` is recorded via __newindex on EVERY write. We must NOT
+        -- rawset it onto the table (that would let later writes hit the existing
+        -- key and bypass __newindex) -- the every-frame-write assertion needs
+        -- each write logged. Stash the live value in a sibling field instead.
+        setmetatable(humanoid, {
+            __newindex = function(t, k, val)
+                if k == "Jump" then
+                    _humLog.jumps[#_humLog.jumps + 1] = tostring(val)
+                    rawset(t, "_jumpValue", val)
+                else
+                    rawset(t, k, val)
+                end
+            end,
+        })
+        do
+            local char = {
+                FindFirstChildOfClass = function(_, cls)
+                    if cls == "Humanoid" then return humanoid end
+                    return nil
+                end,
+            }
+            game:GetService("Players").LocalPlayer.Character = char
+        end
+"""
+    )
+
+
+def test_drive_locomotion_wasd_is_camera_yaw_relative() -> None:
+    """AC5 (unit) — WASD drives ``Humanoid:Move`` with a camera-yaw-relative
+    direction. With yaw=0 and W held, the move dir is forward (-Z); with yaw
+    rotated 90deg the SAME W input rotates the world move dir, proving the move
+    basis follows the camera yaw (not a fixed world axis)."""
+    preamble = camera_input_preamble(mouse_deltas=[])
+    body = (
+        _build_authority_runtime()
+        + _locomotion_setup(keys_down="W")
+        + """
+        -- yaw = 0: W (v=+1) -> local (0,0,-1) -> world (0,0,-1) [forward].
+        p._yaw = 0
+        engine:_playerDriveLocomotion()
+        print("MOVE0=" .. _humLog.moves[#_humLog.moves])
+
+        -- yaw = +90deg: the SAME W input rotates the world move dir about +Y.
+        p._yaw = math.rad(90)
+        engine:_playerDriveLocomotion()
+        print("MOVE90=" .. _humLog.moves[#_humLog.moves])
+        print("NMOVES=" .. tostring(#_humLog.moves))
+    """
+    )
+    rc, out, err = run_camera_scenario(preamble, body)
+    assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
+    # yaw=0, W -> unit forward (0, 0, -1).
+    assert "MOVE0=0.0000,0.0000,-1.0000" in out, out
+    # yaw=90deg: rotating (0,0,-1) about +Y by 90deg -> (-1, 0, 0). The Z term
+    # rounds to a signed zero ("0.0000" / "-0.0000"); accept either sign.
+    m90 = re.search(r"MOVE90=(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)", out)
+    assert m90, out
+    assert float(m90.group(1)) == pytest.approx(-1.0, abs=1e-4), out
+    assert float(m90.group(2)) == pytest.approx(0.0, abs=1e-4), out
+    assert float(m90.group(3)) == pytest.approx(0.0, abs=1e-4), out
+    assert "NMOVES=2" in out, out
+
+
+def test_drive_locomotion_no_keys_moves_zero() -> None:
+    """AC5 (unit) — with no WASD held, ``Humanoid:Move`` is called with the zero
+    vector (the lowered A body's else-branch parity — the move is always issued,
+    so the character halts rather than coasting)."""
+    preamble = camera_input_preamble(mouse_deltas=[])
+    body = (
+        _build_authority_runtime()
+        + _locomotion_setup()
+        + """
+        engine:_playerDriveLocomotion()
+        print("MOVE=" .. _humLog.moves[#_humLog.moves])
+        print("NMOVES=" .. tostring(#_humLog.moves))
+    """
+    )
+    rc, out, err = run_camera_scenario(preamble, body)
+    assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
+    assert "MOVE=0.0000,0.0000,0.0000" in out, out
+    assert "NMOVES=1" in out, out
+
+
+def test_drive_locomotion_jump_held_space_single_fire_every_frame_write() -> None:
+    """AC6 (unit / D-jump / E7) — THE load-bearing assertion. Hold Space across
+    TWO frames:
+
+      * Frame 1 (rising edge): ``humanoid.Jump = true`` AND ``ChangeState
+        (Jumping)`` fires exactly ONCE.
+      * Frame 2 (Space STILL held, no longer the edge): ``humanoid.Jump = false``
+        is WRITTEN (the every-frame last-writer — this is what dominates A's
+        mid-pass ``hum.Jump = true``) and NO second ``ChangeState``.
+
+    The frame-2 ``Jump=false`` write (not merely an absent edge) is the proof
+    that C is the LAST jump writer EVERY frame, giving one-jump-per-press UX
+    while still overwriting A's per-frame ``true``."""
+    preamble = camera_input_preamble(mouse_deltas=[])
+    body = (
+        _build_authority_runtime()
+        + _locomotion_setup(keys_down="Space")
+        + """
+        -- Frame 1: Space held, rising edge (p._jumpHeld starts false).
+        engine:_playerDriveLocomotion()
+        print("JUMPS_F1=" .. table.concat(_humLog.jumps, ","))
+        print("STATES_F1=" .. table.concat(_humLog.states, ","))
+        print("HELD_F1=" .. tostring(p._jumpHeld))
+
+        -- Frame 2: Space STILL held (NOT the edge). C must STILL write Jump
+        -- (=false) and must NOT ChangeState again.
+        engine:_playerDriveLocomotion()
+        print("JUMPS_F2=" .. table.concat(_humLog.jumps, ","))
+        print("STATES_F2=" .. table.concat(_humLog.states, ","))
+    """
+    )
+    rc, out, err = run_camera_scenario(preamble, body)
+    assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
+    # Frame 1: the edge -> Jump=true written, ChangeState fired once.
+    assert "JUMPS_F1=true" in out, out
+    assert "STATES_F1=Jumping" in out, out
+    assert "HELD_F1=true" in out, out
+    # Frame 2: Space still held but past the edge -> Jump=false WRITTEN
+    # (every-frame last-writer), no SECOND ChangeState. Total jump writes = 2
+    # (true then false); total ChangeState = 1.
+    assert "JUMPS_F2=true,false" in out, out
+    assert "STATES_F2=Jumping" in out, out
+
+
+def test_drive_locomotion_jump_release_then_repress_fires_again() -> None:
+    """AC6 (unit) — releasing Space and pressing it again is a NEW rising edge:
+    a second ``ChangeState(Jumping)`` fires (one jump per press, repeatable).
+    Frames: hold -> release -> hold. Edges at frame 1 and frame 3 only."""
+    preamble = camera_input_preamble(mouse_deltas=[])
+    body = (
+        _build_authority_runtime()
+        + _locomotion_setup(keys_down="Space")
+        + """
+        engine:_playerDriveLocomotion()            -- frame 1: edge
+        _keysDown["Space"] = false
+        engine:_playerDriveLocomotion()            -- frame 2: released
+        _keysDown["Space"] = true
+        engine:_playerDriveLocomotion()            -- frame 3: NEW edge
+        print("JUMPS=" .. table.concat(_humLog.jumps, ","))
+        print("STATES=" .. table.concat(_humLog.states, ","))
+    """
+    )
+    rc, out, err = run_camera_scenario(preamble, body)
+    assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
+    # Every-frame write: true (edge), false (released), true (new edge).
+    assert "JUMPS=true,false,true" in out, out
+    # ChangeState only on the two rising edges (frames 1 and 3).
+    assert "STATES=Jumping,Jumping" in out, out
+
+
+def test_drive_locomotion_no_humanoid_noops() -> None:
+    """AC5/E1 — with no character Humanoid resolvable, ``_playerDriveLocomotion``
+    no-ops (no Move / Jump / ChangeState) and does not crash."""
+    preamble = camera_input_preamble(mouse_deltas=[])
+    # No _locomotion_setup -> LocalPlayer.Character stays nil (camera harness
+    # default) so FindFirstChildOfClass is never reachable. Provide the Enum +
+    # IsKeyDown the method reads BEFORE the humanoid resolution, to prove the
+    # no-op is the missing-humanoid guard, not a nil-index earlier.
+    body = (
+        _build_authority_runtime()
+        + """
+        Enum.KeyCode = {W="W", A="A", S="S", D="D", Space="Space"}
+        Enum.HumanoidStateType = {Jumping = "Jumping"}
+        do
+            local uis = game:GetService("UserInputService")
+            function uis:IsKeyDown(_code) return false end
+        end
+        local ok = pcall(function() engine:_playerDriveLocomotion() end)
+        print("NOHUM_OK=" .. tostring(ok))
+    """
+    )
+    rc, out, err = run_camera_scenario(preamble, body)
+    assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
+    assert "NOHUM_OK=true" in out, out
+
+
+def test_drive_locomotion_noop_when_player_nil() -> None:
+    """``_playerDriveLocomotion`` no-ops when ``self._player == nil`` (the
+    fail-closed server / no-player key)."""
+    preamble = camera_input_preamble(mouse_deltas=[])
+    body = (
+        _build_authority_runtime()
+        + _locomotion_setup(keys_down="W,Space")
+        + """
+        engine._player = nil
+        engine:_playerDriveLocomotion()
+        print("NILMOVES=" .. tostring(#_humLog.moves))
+        print("NILJUMPS=" .. tostring(#_humLog.jumps))
+        print("NILLOCOMOK=true")
+    """
+    )
+    rc, out, err = run_camera_scenario(preamble, body)
+    assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
+    # player nil -> early return before resolving the humanoid -> zero writes.
+    assert "NILMOVES=0" in out, out
+    assert "NILJUMPS=0" in out, out
+    assert "NILLOCOMOK=true" in out, out
+
+
 def test_methods_noop_when_player_nil() -> None:
     """Every authority method no-ops when ``self._player == nil`` (the
     fail-closed server / no-player key — the brackets that gate this land in
