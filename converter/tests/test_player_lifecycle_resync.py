@@ -61,6 +61,11 @@ pytestmark = pytest.mark.skipif(
 # ToEulerAnglesYXZ Y component.
 RESPAWN_YAW = 1.2345
 
+# A SECOND, distinct respawn facing for the superseding character (char B) in the
+# fast-respawn race test — must differ from RESPAWN_YAW so a stale char-A reseed
+# is detectable.
+SUPERSEDE_YAW = 1.1
+
 
 # ---------------------------------------------------------------------------
 # Lifecycle provisioning: a fireable LocalPlayer.CharacterAdded + a recording
@@ -578,7 +583,13 @@ def test_boot_with_existing_character_late_hrp_reseeds_yaw() -> None:
 
 def test_late_hrp_retry_noops_when_player_cleared() -> None:
     """The one-shot retry no-ops if ``self._player`` was cleared before the HRP
-    arrives (the player left mid-replication): no crash, no reseed attempt."""
+    arrives (the player left mid-replication): no crash, no reseed attempt.
+
+    Mutation-proving: prove a retry was ACTUALLY armed (``_lateHRPConn`` is live
+    before the player clears) AND that firing the late HRP after the clear takes
+    the no-player early-return path — it does NOT crash and does NOT reseed a
+    sentinel yaw written just before the fire. A version with no retry armed (or
+    one that reseeds despite the cleared authority) fails these assertions."""
     preamble = camera_input_preamble(mouse_deltas=[])
     body = (
         _build_authority_runtime()
@@ -590,14 +601,101 @@ def test_late_hrp_retry_noops_when_player_cleared() -> None:
         lp.Character = _lateChar
         lp.CharacterAdded:Fire(_lateChar)
 
+        -- A retry WAS armed (HRP absent at the immediate resync): the connection
+        -- is tracked live on the player authority.
+        print("ARMED=" .. tostring(engine._player._lateHRPConn ~= nil))
+
+        -- Sentinel yaw the cleared-authority retry must NOT overwrite.
+        engine._player._yaw = 0.5
         -- Authority gone before the HRP replicates.
+        local stalePlayer = engine._player
         engine._player = nil
         local ok = pcall(function()
             _lateChar.DescendantAdded:Fire(_lateHrp)
         end)
         print("OK=" .. tostring(ok))
+        -- The captured (now-detached) player's yaw was NOT reseeded — the retry
+        -- saw self._player == nil and bailed before the cameraYawOf reseed.
+        print(string.format("STALE_YAW=%.6f", stalePlayer._yaw))
+        -- One-shot still disconnected (the HRP-name match disconnects before the
+        -- no-player early return).
+        print("DISCONNECTS=" .. tostring(_lateRecord.disconnects or 0))
     """
     )
     rc, out, err = run_camera_scenario(preamble, body)
     assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
+    assert "ARMED=true" in out, out
     assert "OK=true" in out, out
+    # The cleared-authority retry bailed before the reseed: sentinel survives.
+    assert "STALE_YAW=0.500000" in out, out
+    assert "DISCONNECTS=1" in out, out
+
+
+# ---------------------------------------------------------------------------
+# Harden P1 — fast-respawn lifecycle race: a late-HRP retry armed for char A must
+# NOT stomp a SUPERSEDING char B's yaw. char A spawns WITHOUT an HRP (arms a
+# retry) → char B respawns WITH an HRP at SUPERSEDE_YAW and becomes the current
+# LocalPlayer.Character → char A's HRP finally arrives LATE → the stale char-A
+# retry must NOT overwrite char B's yaw. RED against 9aeee38 (the retry is not
+# tied to the current character and is never cancelled on re-arm).
+# ---------------------------------------------------------------------------
+
+def test_stale_previous_character_late_hrp_does_not_stomp_superseding_yaw() -> None:
+    preamble = camera_input_preamble(mouse_deltas=[])
+    body = (
+        _build_authority_runtime()
+        + _lifecycle_setup()
+        + _late_hrp_setup()
+        + f"""
+        -- char B: a SUPERSEDING character that respawns WITH its HRP present,
+        -- facing SUPERSEDE_YAW. Its own DescendantAdded is an inert stub (no late
+        -- HRP needed — the HRP is already there).
+        local charBHrp = {{
+            Name = "HumanoidRootPart",
+            CFrame = CFrame.new(Vector3.new(5, 0, 5))
+                * CFrame.Angles(0, {SUPERSEDE_YAW}, 0),
+            Position = Vector3.new(5, 0, 5),
+            IsA = function(_, c) return c == "BasePart" end,
+        }}
+        local charB = {{
+            FindFirstChild = function(_, name)
+                if name == "HumanoidRootPart" then return charBHrp end
+                return nil
+            end,
+            GetDescendants = function() return {{}} end,
+            DescendantAdded = {{Connect = function() return {{Disconnect = function() end}} end}},
+        }}
+
+        p._yaw = -9.0
+        engine:_playerBoot()
+        local lp = game:GetService("Players").LocalPlayer
+
+        -- char A spawns WITHOUT an HRP → immediate resync skips the yaw reseed and
+        -- arms a one-shot late-HRP retry for char A.
+        lp.Character = _lateChar
+        lp.CharacterAdded:Fire(_lateChar)
+        print("ARMED_A=" .. tostring(engine._player._lateHRPConn ~= nil))
+
+        -- char B respawns WITH its HRP → it becomes the current character and the
+        -- immediate resync reseeds the yaw to SUPERSEDE_YAW. The CharacterAdded
+        -- handler also CANCELS char A's pending retry (re-arm cancellation).
+        lp.Character = charB
+        lp.CharacterAdded:Fire(charB)
+        print(string.format("YAW_AFTER_B=%.6f", engine._player._yaw))
+
+        -- char A's HRP FINALLY arrives, late. The stale char-A retry must NOT
+        -- reseed (char A is no longer LocalPlayer.Character) — yaw STAYS char B's.
+        _lateChar.DescendantAdded:Fire(_lateHrp)
+        print(string.format("YAW_FINAL=%.6f", engine._player._yaw))
+    """
+    )
+    rc, out, err = run_camera_scenario(preamble, body)
+    assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
+    # char A armed a retry (HRP absent at its immediate resync).
+    assert "ARMED_A=true" in out, out
+    # char B's immediate resync set the yaw to SUPERSEDE_YAW.
+    assert f"YAW_AFTER_B={SUPERSEDE_YAW:.6f}" in out, out
+    # The decisive assertion (RED against 9aeee38): char A's late HRP did NOT
+    # stomp char B's yaw — it stays SUPERSEDE_YAW, NOT RESPAWN_YAW.
+    assert f"YAW_FINAL={SUPERSEDE_YAW:.6f}" in out, out
+    assert f"YAW_FINAL={RESPAWN_YAW:.6f}" not in out, out

@@ -2894,6 +2894,14 @@ function SceneRuntime:_playerBoot()
 		applyControls()
 		hideChar(lp.Character)
 		lp.CharacterAdded:Connect(function(char)
+			-- Fast-respawn race (harden P1): a NEW character supersedes any prior
+			-- char's pending late-HRP retry — cancel it before (re)acquiring, so an
+			-- earlier char's late HRP can never stomp this char's yaw. When this
+			-- char itself lacks an HRP, _playerArmLateHRPResync re-arms a fresh one.
+			local pp = self._player
+			if pp and pp._lateHRPConn then
+				pp._lateHRPConn:Disconnect(); pp._lateHRPConn = nil
+			end
 			-- IMMEDIATE yaw+camera resync FIRST, BEFORE the yield (D7/P1-b) --
 			-- so respawn yaw is correct the SAME frame (no stale-yaw frame).
 			-- If the HRP has not replicated yet the immediate yaw reseed is
@@ -3043,21 +3051,43 @@ end
 -- retry: the moment the HumanoidRootPart appears, reseed the yaw from its facing +
 -- re-assert the camera, then DISCONNECT. Event-driven (no yield, no top-require) to
 -- match the host model. No-op if the player authority is gone by the time it fires.
+--
+-- Fast-respawn lifecycle race (harden P1): a retry armed for char A must NOT stomp
+-- a SUPERSEDING char B's yaw. Two guards: (1) tie the retry to the char it was armed
+-- for — on HRP arrival only reseed when ``char`` is STILL ``LocalPlayer.Character``
+-- (else a newer char has superseded it; just disconnect). (2) Cancel the prior
+-- pending retry on re-arm: track the active retry connection on ``self._player``
+-- (like ``_heartbeatConn``) and disconnect any prior pending retry before arming the
+-- next, so only the newest char's retry can fire.
 function SceneRuntime:_playerArmLateHRPResync(char)
 	if not char or not char.DescendantAdded then return end
+	local p = self._player
+	if not p then return end
+	-- Cancel any prior pending late-HRP retry (an earlier char's): only the
+	-- newest char's retry should be live (guard 2).
+	if p._lateHRPConn then p._lateHRPConn:Disconnect(); p._lateHRPConn = nil end
 	local conn
 	conn = char.DescendantAdded:Connect(function(desc)
 		if not (desc and desc.Name == "HumanoidRootPart") then return end
 		if conn then conn:Disconnect(); conn = nil end
-		local p = self._player
-		if not p then return end
+		local pl = self._player
+		if not pl then return end
+		if pl._lateHRPConn == conn then pl._lateHRPConn = nil end
+		-- Tie the retry to the char it was armed for (guard 1): only reseed when
+		-- this char is STILL the current LocalPlayer.Character. If a newer char
+		-- superseded it (fast respawn), its late HRP must NOT overwrite the newer
+		-- char's yaw — just disconnect (done above).
+		local players = self._services.players
+		local lp = players and players.LocalPlayer
+		if not lp or lp.Character ~= char then return end
 		if desc.CFrame then
-			p._yaw = self._services.cameraYawOf(desc.CFrame)
+			pl._yaw = self._services.cameraYawOf(desc.CFrame)
 		end
 		-- Re-assert the camera so the corrected facing is visible the frame the
 		-- HRP arrives (mirrors the immediate resync's camera re-assert).
 		self:_playerWriteCamera()
 	end)
+	p._lateHRPConn = conn
 end
 
 -- Client teleport REQUEST (D7/D-P3-teleport, NON-load-bearing). Fires the
