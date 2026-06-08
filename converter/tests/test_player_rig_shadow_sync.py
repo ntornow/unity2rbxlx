@@ -91,11 +91,25 @@ _LOCOMOTION_MOCKS = """
 
 # ---------------------------------------------------------------------------
 # Shared luau snippet: provision a character whose HRP has a CFrame at a known
-# yaw, alias LocalPlayer.Character to it, build a SceneRuntime over a one-CC
-# plan, bind ``self._player`` via the REAL ``_initPlayerAuthority`` (so
-# ``_playerScriptId`` is captured from the upstream signal), then register a mock
-# rig Instance under that scriptId in ``_meta``. Returns luau that leaves
-# ``engine``, ``rig``, ``hrp`` in scope.
+# yaw, alias LocalPlayer.Character to it, then build the player component through
+# the REAL ``engine:start()`` path — NOT a fabricated ``_meta`` row.
+#
+# Building through ``start()`` drives the production identity machinery for real:
+#   * ``_buildComponent`` runs ``Player.new(config)`` and ``_register`` populates
+#     ``_componentsByGameObject`` / ``_byClass`` / ``_meta`` from the SAME source
+#     the production path uses;
+#   * ``_injectHostSurface`` binds ``comp.gameObject`` / ``comp.transform`` to the
+#     authored rig Instance and installs the live ``comp.GetComponent`` closure
+#     (peer-by-stem over ``_componentsByGameObject`` -> built-in fallback);
+#   * the rig Instance is a REAL registered ``instances`` entry, so the
+#     ``_SceneRuntimeId`` lookup path (``getInstanceId`` / ``workspaceFind``)
+#     resolves it.
+# So AC1b asserts on the SAME tables/closures a U2-style rebind would disturb —
+# the proof is non-vacuous (the rig is never hand-seeded into ``_meta``).
+#
+# Returns luau that leaves ``engine``, ``rig``, ``comp``, ``Comp``, ``hrp``,
+# ``rigYaw`` in scope. ``Comp`` is the Player module class table (so a scenario
+# may add ``function Comp:Update(...)`` — the metatable __index chains to it).
 # ---------------------------------------------------------------------------
 
 def _shadow_sync_setup(
@@ -107,10 +121,14 @@ def _shadow_sync_setup(
 ) -> str:
     # A mock rig Instance. A Model exposes ``PivotTo`` (records the last pivot
     # in ``_pivot``); a BasePart exposes a writable ``.CFrame``. Both start at a
-    # DISTINCT yaw so the rig-tracks-HRP assertion is non-vacuous.
+    # DISTINCT yaw so the rig-tracks-HRP assertion is non-vacuous. The rig is a
+    # REAL registered ``instances`` entry (``_sceneRuntimeId`` + ``_children``)
+    # so ``workspaceFind`` / ``getInstanceId`` resolve it (servicesFor installs
+    # the SetAttribute/GetAttribute mirror onto it).
     if rig_kind == "model":
         rig_decl = f"""
-            local rig = {{ _pivot = CFrame.new(Vector3.new(0,0,0)) }}
+            local rig = {{ Name = "Rig", _sceneRuntimeId = "go1", _children = {{}},
+                          _pivot = CFrame.new(Vector3.new(0,0,0)) }}
             rig._pivot._yaw = {rig_start_yaw}
             function rig:PivotTo(cf) self._pivot = cf end
             function rig:GetPivot() return self._pivot end
@@ -118,19 +136,46 @@ def _shadow_sync_setup(
         rig_yaw_expr = "rig._pivot._yaw"
     else:
         rig_decl = f"""
-            local rig = {{ CFrame = CFrame.new(Vector3.new(0,0,0)) }}
+            local rig = {{ Name = "Rig", _sceneRuntimeId = "go1", _children = {{}},
+                          CFrame = CFrame.new(Vector3.new(0,0,0)) }}
             rig.CFrame._yaw = {rig_start_yaw}
         """
         rig_yaw_expr = "rig.CFrame._yaw"
 
     return f"""
+        -- The authored rig Instance, declared BEFORE servicesFor so the
+        -- ``instances`` map can register it through the real workspaceFind /
+        -- getInstanceId / SetAttribute(_SceneRuntimeId) surface.
+        {rig_decl}
+
+        -- The REAL Player module: a class table with a new(config) constructor.
+        -- ``_register`` / ``_injectHostSurface`` bind the host surface +
+        -- GetComponent onto each instance of this class.
+        local Comp = {{}}
+        Comp.__index = Comp
+        function Comp.new(_config) return setmetatable({{}}, Comp) end
+
         local plan = {{
             modules = {{
                 {script_id} = {{stem = "Player", runtime_bearing = true,
+                          domain = "client", module_path = "Player",
                           has_character_controller = true}},
             }},
+            scenes = {{
+                A = {{
+                    instances = {{
+                        {{instance_id = "A:1", script_id = "{script_id}",
+                          game_object_id = "go1", active = true,
+                          enabled = true, config = {{}}}},
+                    }},
+                    references = {{}},
+                    lifecycle_order = {{"A:1"}},
+                }},
+            }},
+            prefabs = {{}},
+            domain_overrides = {{}},
         }}
-        local services = servicesFor(plan, {{}}, {{}})
+        local services = servicesFor(plan, {{{script_id} = Comp}}, {{go1 = rig}})
         services.isClient = true
         services.players = game:GetService("Players")
         services.userInputService = game:GetService("UserInputService")
@@ -138,7 +183,6 @@ def _shadow_sync_setup(
         services.cameraComposeLook = SceneCameraInput._composeLook
 
         local engine = SceneRuntime.new(services, plan)
-        engine:_initPlayerAuthority()
 
         -- Provision a character whose HRP carries a known-yaw CFrame and alias
         -- LocalPlayer.Character to it (``_playerCharacterHRP`` re-resolves
@@ -164,17 +208,17 @@ def _shadow_sync_setup(
         }}
         game:GetService("Players").LocalPlayer.Character = char
 
-        -- The authored rig Instance + its registered component under the player
-        -- scriptId (the deterministic key _playerRigInstances scans by).
-        {rig_decl}
-        local Comp = {{}}
-        Comp.__index = Comp
-        local comp = setmetatable({{}}, Comp)
-        engine._meta[comp] = {{
-            classTable = Comp, scriptId = "{script_id}",
-            gameObjectInstance = rig, gameObjectId = "go1", stem = "Player",
-            activeInHierarchy = true, enabled = true,
-        }}
+        -- Build the component THROUGH the real boot path: start() runs
+        -- new() -> _register -> _injectHostSurface (binding comp.gameObject +
+        -- GetComponent) and, at its end, _initPlayerAuthority (binding
+        -- self._player off the upstream has_character_controller signal).
+        engine:start(nil)
+        runDeferred()
+
+        -- The live registered component on the authored rig (the SAME object
+        -- _register inserted into _componentsByGameObject["go1"]). NOT a
+        -- hand-seeded _meta row.
+        local comp = engine._componentsByGameObject["go1"][1]
         local rigYaw = function() return {rig_yaw_expr} end
     """
 
@@ -268,24 +312,77 @@ class TestRigTracksHRP:
 
     def test_multiple_rig_instances_all_synced(self) -> None:
         # E8/P2-F: one player MODULE placed on >1 GameObject -> all N rig
-        # instances are shadow-synced to the one HRP.
+        # instances are shadow-synced to the one HRP. Both placements are built
+        # through the REAL start() path (a second scene instance of the SAME
+        # ``player`` module on ``go2``), so _playerRigInstances scans the real
+        # _meta the production _register populated — NOT a hand-seeded row.
         preamble = camera_input_preamble(mouse_deltas=[(0.0, 0.0)])
-        body = _shadow_sync_setup(rig_kind="model") + """
-            -- Second placement of the SAME player module on a second GO.
-            local rig2 = { _pivot = CFrame.new(Vector3.new(0,0,0)) }
+        body = """
+            local rig1 = { Name = "Rig1", _sceneRuntimeId = "go1", _children = {},
+                           _pivot = CFrame.new(Vector3.new(0,0,0)) }
+            rig1._pivot._yaw = 3.0
+            function rig1:PivotTo(cf) self._pivot = cf end
+            local rig2 = { Name = "Rig2", _sceneRuntimeId = "go2", _children = {},
+                           _pivot = CFrame.new(Vector3.new(0,0,0)) }
             rig2._pivot._yaw = 9.0
             function rig2:PivotTo(cf) self._pivot = cf end
-            local Comp2 = {}
-            Comp2.__index = Comp2
-            local comp2 = setmetatable({}, Comp2)
-            engine._meta[comp2] = {
-                classTable = Comp2, scriptId = "player",
-                gameObjectInstance = rig2, gameObjectId = "go2", stem = "Player",
-                activeInHierarchy = true, enabled = true,
+
+            local Comp = {}
+            Comp.__index = Comp
+            function Comp.new(_config) return setmetatable({}, Comp) end
+
+            local plan = {
+                modules = {
+                    player = {stem = "Player", runtime_bearing = true,
+                              domain = "client", module_path = "Player",
+                              has_character_controller = true},
+                },
+                scenes = {
+                    A = {
+                        instances = {
+                            {instance_id = "A:1", script_id = "player",
+                             game_object_id = "go1", active = true,
+                             enabled = true, config = {}},
+                            {instance_id = "A:2", script_id = "player",
+                             game_object_id = "go2", active = true,
+                             enabled = true, config = {}},
+                        },
+                        references = {},
+                        lifecycle_order = {"A:1", "A:2"},
+                    },
+                },
+                prefabs = {},
+                domain_overrides = {},
             }
+            local services = servicesFor(plan, {player = Comp}, {go1 = rig1, go2 = rig2})
+            services.isClient = true
+            services.players = game:GetService("Players")
+            services.userInputService = game:GetService("UserInputService")
+            services.cameraAdvance = SceneCameraInput._advance
+            services.cameraComposeLook = SceneCameraInput._composeLook
+
+            local engine = SceneRuntime.new(services, plan)
+
+            local hrpCF = CFrame.new(Vector3.new(0,0,0))
+            hrpCF._yaw = 1.25
+            local hrpPart = { CFrame = hrpCF, Position = Vector3.new(0,0,0) }
+            local char = {
+                FindFirstChild = function(_, name)
+                    if name == "HumanoidRootPart" then return hrpPart end
+                    return nil
+                end,
+                FindFirstChildOfClass = function(_, _cls) return nil end,
+                DescendantAdded = { Connect = function(_, _fn) return {Disconnect = function() end} end },
+                GetDescendants = function(_) return {} end,
+            }
+            game:GetService("Players").LocalPlayer.Character = char
+
+            engine:start(nil)
+            runDeferred()
+
             print("RIGCOUNT=" .. tostring(#engine:_playerRigInstances()))
             engine:_playerPreTick(0.016)
-            print("RIG1=" .. tostring(rigYaw()))
+            print("RIG1=" .. tostring(rig1._pivot._yaw))
             print("RIG2=" .. tostring(rig2._pivot._yaw))
         """
         rc, out, err = run_camera_scenario(preamble, body)
@@ -304,38 +401,56 @@ class TestRigTracksHRP:
 class TestIdentityPreserved:
 
     def test_registry_closures_resolve_after_sync(self) -> None:
+        # The component was built through the REAL ``start()`` path, so
+        # ``comp.gameObject`` / ``comp.GetComponent`` / the ``_SceneRuntimeId``
+        # lookup are the PRODUCTION surfaces (no hand-seeded tables). We drive
+        # each by EXECUTION and assert it still resolves the component on the
+        # AUTHORED rig after shadow-sync moved the rig's CFrame (U1, NOT U2:
+        # only position moved, identity is untouched — ``self.gameObject`` is
+        # never rebound to the character).
         preamble = camera_input_preamble(mouse_deltas=[(0.0, 0.0)])
         body = _shadow_sync_setup(rig_kind="model") + """
-            -- Register the component through the REAL registry so the by-class
-            -- and by-gameObject indexes are populated (U1 must not disturb them).
-            engine._componentsByGameObject["go1"] = {comp}
-            engine._byClass["Player"] = {comp}
-
-            -- Sanity: the component's gameObject identity is the authored rig.
-            local goBefore = engine._meta[comp].gameObjectInstance == rig
+            -- BEFORE the sync: the real injected host surface binds
+            -- comp.gameObject to the authored rig, and the real GetComponent
+            -- closure resolves the component on it.
+            local goBefore = comp.gameObject == rig
+            local getCompBefore = comp:GetComponent("Player") == comp
+            -- The _SceneRuntimeId-driven lookup: getInstanceId(comp.gameObject)
+            -- -> "go1" (stamped during boot) -> workspaceFind resolves the rig.
+            local idBefore = engine._services.getInstanceId(comp.gameObject)
+            local sriBefore = engine._services.workspaceFind(idBefore) == rig
 
             engine:_playerPreTick(0.016)
 
-            -- After shadow-sync (rig CFrame moved) the identity is UNCHANGED:
-            -- the meta still maps the component to the SAME rig Instance, and
-            -- the registry indexes still resolve it.
-            local goAfter = engine._meta[comp].gameObjectInstance == rig
-            local byGo = engine._componentsByGameObject["go1"][1] == comp
-            local byClass = engine._byClass["Player"][1] == comp
+            -- AFTER shadow-sync (rig CFrame MOVED): every identity surface still
+            -- resolves the SAME component on the SAME authored rig.
+            local goAfter = comp.gameObject == rig
+            -- GetComponent STILL resolves the component on the authored rig.
+            local getCompAfter = comp:GetComponent("Player") == comp
+            -- The _SceneRuntimeId lookup STILL maps the moved rig.
+            local idAfter = engine._services.getInstanceId(comp.gameObject)
+            local sriAfter = engine._services.workspaceFind(idAfter) == rig
             print("GO_BEFORE=" .. tostring(goBefore))
+            print("GETCOMP_BEFORE=" .. tostring(getCompBefore))
+            print("SRI_BEFORE=" .. tostring(sriBefore))
             print("GO_AFTER=" .. tostring(goAfter))
-            print("BY_GO=" .. tostring(byGo))
-            print("BY_CLASS=" .. tostring(byClass))
+            print("GETCOMP_AFTER=" .. tostring(getCompAfter))
+            print("SRI_AFTER=" .. tostring(sriAfter))
             -- The rig MOVED (its CFrame is the HRP's now) — only position, not
             -- identity.
             print("RIG_MOVED=" .. tostring(rigYaw() == 1.25))
         """
         rc, out, err = run_camera_scenario(preamble, body)
         assert rc == 0, f"scenario failed (rc={rc}): {err}\n{out}"
+        # Identity surfaces resolve BEFORE the sync (sanity).
         assert "GO_BEFORE=true" in out, out
+        assert "GETCOMP_BEFORE=true" in out, out
+        assert "SRI_BEFORE=true" in out, out
+        # ... and STILL resolve the component on the authored rig AFTER it moved
+        # (U1: identity preserved; a U2-style rebind/break would flip these).
         assert "GO_AFTER=true" in out, out
-        assert "BY_GO=true" in out, out
-        assert "BY_CLASS=true" in out, out
+        assert "GETCOMP_AFTER=true" in out, out
+        assert "SRI_AFTER=true" in out, out
         assert "RIG_MOVED=true" in out, out
 
 
