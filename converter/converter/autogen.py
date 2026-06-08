@@ -259,6 +259,28 @@ getItemRemote.OnServerEvent:Connect(function(player, pickupPart)
     pickupPart.Parent = nil
 end)
 
+-- Player teleport (paradigm C ``host.player:teleport(cf)``, NON-load-bearing,
+-- D7): the client REQUESTS a mid-game teleport; the server OWNS the character
+-- move. Declared + handled here in the tail (no shared-flag-funnel dependency,
+-- unlike PlayerShoot/PlayerGetItem). If the AI never calls it the remote simply
+-- never fires -- respawn (above) is unaffected (server-owned).
+local teleportRemote = Instance.new("RemoteEvent")
+teleportRemote.Name = "PlayerTeleport"
+teleportRemote.Parent = ReplicatedStorage
+
+-- The server applies the teleport ONLY to the REQUESTING player's own character
+-- (``player`` is the authenticated sender) -- a client can never move another
+-- player. Mirrors the server-owned spawn teleport (hrp.CFrame = ...).
+teleportRemote.OnServerEvent:Connect(function(player, cf)
+    if typeof(cf) ~= "CFrame" then return end
+    local char = player.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        hrp.CFrame = cf
+    end
+end)
+
 print("[GameServer] Initialized. Spawn point at", spawnCFrame.Position)
 '''
 
@@ -826,6 +848,14 @@ local services = {
     cameraAdvance = SceneCameraInput._advance,
     cameraComposeLook = SceneCameraInput._composeLook,
     cameraYawOf = SceneCameraInput._yawOf,
+    -- Client teleport-request remote (paradigm C ``host.player:teleport(cf)``,
+    -- NON-load-bearing, D7) — CLIENT ONLY; the server never requests, so the
+    -- server services table omits it. The GameServer creates this remote, so a
+    -- bounded WaitForChild resolves it on the client.
+    playerTeleportRemote = RS:WaitForChild("PlayerTeleport", 10),
+    -- CFrame type-guard for the teleport request (the host injects this rather
+    -- than calling the ``typeof`` builtin directly so the predicate is testable).
+    isCFrame = function(v) return typeof(v) == "CFrame" end,
     resolveModule = resolveModule,
     workspaceFind = workspaceFind,
     awaitUiHost = awaitUiHost,

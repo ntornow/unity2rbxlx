@@ -20,6 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from converter.autogen import (  # noqa: E402
+    generate_game_server_script,
     generate_scene_runtime_client_entrypoint,
     generate_scene_runtime_server_entrypoint,
 )
@@ -31,6 +32,10 @@ def _client_source() -> str:
 
 def _server_source() -> str:
     return generate_scene_runtime_server_entrypoint().source
+
+
+def _game_server_source() -> str:
+    return generate_game_server_script().source
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +80,22 @@ class TestClientEntrypoint:
             "client entrypoint must resolve UserInputService for the authority"
         )
 
+    def test_injects_player_teleport_remote(self) -> None:
+        # AC5a (D-P3-teleport): the host's _playerTeleport reads
+        # self._services.playerTeleportRemote and FireServers it, so the CLIENT
+        # table must emit it bound to the GameServer-created PlayerTeleport remote
+        # — CLIENT ONLY (the server never requests a teleport). Pin the emission
+        # on the source so the round-trip can't pass on a manually-seeded service.
+        src = _client_source()
+        assert 'playerTeleportRemote = RS:WaitForChild("PlayerTeleport"' in src, src
+
+    def test_injects_is_cframe_predicate(self) -> None:
+        # _playerTeleport guards via self._services.isCFrame (injected rather
+        # than a bare typeof builtin so the predicate is testable). Pin the
+        # client emission bound to typeof.
+        src = _client_source()
+        assert 'isCFrame = function(v) return typeof(v) == "CFrame" end' in src, src
+
 
 # ---------------------------------------------------------------------------
 # SERVER entrypoint — isClient=false, NO client helpers (E4/AC9).
@@ -114,3 +135,49 @@ class TestServerEntrypoint:
         # mentioning ``isClient = true`` doesn't false-trip this guard.
         src = _server_source()
         assert "isClient = true," not in src, src
+
+    def test_no_player_teleport_remote_service(self) -> None:
+        # The teleport REQUEST is client-only (the server applies, never
+        # requests), so the server services table must OMIT the remote AND its
+        # client-only CFrame predicate.
+        src = _server_source()
+        assert "playerTeleportRemote" not in src, src
+        assert "isCFrame" not in src, src
+
+
+# ---------------------------------------------------------------------------
+# GameServer — the PlayerTeleport RemoteEvent + its server-apply handler
+# (AC5a, D-P3-teleport). The server OWNS the character move.
+# ---------------------------------------------------------------------------
+
+class TestGameServerTeleport:
+
+    def test_creates_player_teleport_remote(self) -> None:
+        src = _game_server_source()
+        assert 'teleportRemote.Name = "PlayerTeleport"' in src, src
+        assert "teleportRemote.Parent = ReplicatedStorage" in src, src
+
+    def test_server_applies_teleport_to_requesting_character(self) -> None:
+        # The server-apply handler validates a CFrame and sets the REQUESTING
+        # player's own character HRP CFrame (server-owned move, mirrors the
+        # spawn teleport). It must read player.Character (the authenticated
+        # sender), not an arbitrary target.
+        src = _game_server_source()
+        assert "teleportRemote.OnServerEvent:Connect(function(player, cf)" in src, src
+        assert 'typeof(cf) ~= "CFrame"' in src, src
+        assert "local char = player.Character" in src, src
+        assert 'char:FindFirstChild("HumanoidRootPart")' in src, src
+        assert "hrp.CFrame = cf" in src, src
+
+    def test_teleport_remote_present_unconditionally(self) -> None:
+        # Like PlayerShoot/PlayerGetItem, the teleport remote ships whether or
+        # not the shared-flag funnel is included (it's not gated on a topology
+        # fact) — so a place that never wires the funnel still has it.
+        src_with = generate_game_server_script(
+            include_shared_flag_funnel=True
+        ).source
+        src_without = generate_game_server_script(
+            include_shared_flag_funnel=False
+        ).source
+        assert 'teleportRemote.Name = "PlayerTeleport"' in src_with
+        assert 'teleportRemote.Name = "PlayerTeleport"' in src_without
