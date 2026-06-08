@@ -2885,10 +2885,24 @@ function SceneRuntime:_playerBoot()
 		applyControls()
 		hideChar(lp.Character)
 		lp.CharacterAdded:Connect(function(char)
+			-- IMMEDIATE yaw+camera resync FIRST, BEFORE the yield (D7/P1-b) --
+			-- so respawn yaw is correct the SAME frame (no stale-yaw frame).
+			self:_playerResyncToCharacter(char)
+			-- DELAYED: controls-off + body-hide LEGITIMATELY need the yield --
+			-- applyControls needs PlayerScripts->PlayerModule (populated a frame
+			-- after CharacterAdded) and hideChar walks char:GetDescendants()
+			-- (fill in over the same window).
 			self._services.task.wait()
 			applyControls()
 			hideChar(char)
 		end)
+		-- Boot-with-existing-character (P2-a): if lp.Character already EXISTS at
+		-- boot (Studio test mode / fast spawn), CharacterAdded never fires for
+		-- it, so seed facing once via the SAME shared resync -- facing correct
+		-- from frame 0 (else _yaw stays at the init 0 until later input/respawn).
+		if lp.Character then
+			self:_playerResyncToCharacter(lp.Character)
+		end
 	end
 end
 
@@ -2970,6 +2984,31 @@ function SceneRuntime:_playerCharacterHRP()
 	local lp = players and players.LocalPlayer
 	local char = lp and lp.Character
 	return char and char:FindFirstChild("HumanoidRootPart") or nil
+end
+
+-- IMMEDIATE per-player lifecycle resync (D7), shared by the CharacterAdded
+-- handler AND the boot-with-existing-character path (§3.2/P2-a). Respawn itself
+-- is SERVER-OWNED (autogen GameServer CharacterAdded spawn + engine
+-- SpawnLocation); this is the CLIENT re-acquire: reseed yaw from the NEW
+-- character's facing, zero pitch (mirrors scene_camera_input.onRespawn), and
+-- re-assert the camera so it follows the NEW HRP THIS frame -- NO yield, so
+-- there is no stale-yaw frame (D-P3-resync-ordering/P1-b). NO dependency on the
+-- AI's ``PivotTo``, NO dependency on paradigm B. Guards a character with no HRP
+-- yet (E9): leaves yaw unchanged, still zeroes pitch + re-asserts the camera.
+function SceneRuntime:_playerResyncToCharacter(char)
+	local p = self._player
+	if not p then return end
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if hrp and hrp.CFrame then
+		-- Yaw reseed from the new character's facing via the INJECTED pure helper
+		-- (D-P3-resync-helper); no re-derived yaw math in scene_runtime.luau.
+		p._yaw = self._services.cameraYawOf(hrp.CFrame)
+	end
+	p._pitch = 0
+	-- _playerCharacterHRP re-resolves LocalPlayer.Character each call (no stale
+	-- cache, 2968), so _playerWriteCamera now follows the NEW HRP automatically;
+	-- re-assert the camera immediately so the resync is visible THIS frame.
+	self:_playerWriteCamera()
 end
 
 -- Drive the character's locomotion once per frame, AFTER the LateUpdate pass

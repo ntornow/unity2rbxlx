@@ -181,6 +181,9 @@ def _shadow_sync_setup(
         services.userInputService = game:GetService("UserInputService")
         services.cameraAdvance = SceneCameraInput._advance
         services.cameraComposeLook = SceneCameraInput._composeLook
+        -- Slice 3.3: _playerBoot's boot-reseed (_playerResyncToCharacter) reads
+        -- services.cameraYawOf when a character is present at boot.
+        services.cameraYawOf = SceneCameraInput._yawOf
 
         local engine = SceneRuntime.new(services, plan)
 
@@ -360,6 +363,8 @@ class TestRigTracksHRP:
             services.userInputService = game:GetService("UserInputService")
             services.cameraAdvance = SceneCameraInput._advance
             services.cameraComposeLook = SceneCameraInput._composeLook
+            -- Slice 3.3: boot-reseed reads services.cameraYawOf.
+            services.cameraYawOf = SceneCameraInput._yawOf
 
             local engine = SceneRuntime.new(services, plan)
 

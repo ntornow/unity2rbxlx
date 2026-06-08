@@ -89,6 +89,7 @@ local function yawOf(cframe)
 	local _, y = cframe:ToEulerAnglesYXZ()
 	return y
 end
+SceneCameraInput._yawOf = yawOf
 
 function SceneCameraInput:configure(opts)
 	opts = opts or {}

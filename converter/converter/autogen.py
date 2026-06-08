@@ -825,6 +825,7 @@ local services = {
     userInputService = UserInputService,
     cameraAdvance = SceneCameraInput._advance,
     cameraComposeLook = SceneCameraInput._composeLook,
+    cameraYawOf = SceneCameraInput._yawOf,
     resolveModule = resolveModule,
     workspaceFind = workspaceFind,
     awaitUiHost = awaitUiHost,

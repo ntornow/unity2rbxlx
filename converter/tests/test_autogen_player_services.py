@@ -61,6 +61,14 @@ class TestClientEntrypoint:
         assert "cameraAdvance = SceneCameraInput._advance" in src, src
         assert "cameraComposeLook = SceneCameraInput._composeLook" in src, src
 
+    def test_injects_camera_yaw_of(self) -> None:
+        # AC3-services-pin (D-P3-services-pin): the lifecycle resync reads
+        # self._services.cameraYawOf, so the CLIENT table must emit it bound to
+        # the exported SceneCameraInput._yawOf — anchoring the contract on the
+        # emitted source, not a manually-seeded harness fixture.
+        src = _client_source()
+        assert "cameraYawOf = SceneCameraInput._yawOf" in src, src
+
     def test_resolves_user_input_service(self) -> None:
         src = _client_source()
         assert 'game:GetService("UserInputService")' in src, (
@@ -96,6 +104,9 @@ class TestServerEntrypoint:
         assert "userInputService" not in src, src
         assert "cameraAdvance" not in src, src
         assert "cameraComposeLook" not in src, src
+        # AC3-services-pin: the SERVER table must OMIT cameraYawOf (the server
+        # never runs the lifecycle resync).
+        assert "cameraYawOf" not in src, src
 
     def test_isClient_true_not_present(self) -> None:
         # Guard against a copy/paste that stamps the client flag on the server.

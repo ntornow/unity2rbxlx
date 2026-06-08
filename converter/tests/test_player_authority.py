@@ -144,9 +144,23 @@ def _build_authority_runtime(
                 mkPart("Decal", "face"),
                 nonVisual,
             }
+            -- Boot-reseed (D-P3-boot-green): _playerBoot now calls
+            -- _playerResyncToCharacter(lp.Character) at the end, which reads
+            -- char:FindFirstChild("HumanoidRootPart") (via _playerCharacterHRP).
+            -- Provision an HRP-returning FindFirstChild (carrying a .CFrame /
+            -- .Position) so the boot-reseed neither nil-derefs nor changes the
+            -- AC8 assertions above (yaw reseed is a side write on _player).
+            local bootHrp = {
+                CFrame = CFrame.new(Vector3.new(3, 0, 4)),
+                Position = Vector3.new(3, 0, 4),
+            }
             local char = {
                 GetDescendants = function() return descendants end,
                 DescendantAdded = {Connect = function() return {Disconnect = function() end} end},
+                FindFirstChild = function(_, name)
+                    if name == "HumanoidRootPart" then return bootHrp end
+                    return nil
+                end,
             }
 
             local lp = game:GetService("Players").LocalPlayer
@@ -165,6 +179,10 @@ def _build_authority_runtime(
         services.players = game:GetService("Players")
         services.cameraAdvance = SceneCameraInput._advance
         services.cameraComposeLook = SceneCameraInput._composeLook
+        -- D-P3-boot-green: the boot-reseed (_playerResyncToCharacter) reads
+        -- self._services.cameraYawOf; inject it alongside the other helpers so
+        -- the existing AC8 boot test + the new boot-reseed are build-green.
+        services.cameraYawOf = SceneCameraInput._yawOf
 
         local engine = SceneRuntime.new(services, {{modules = {{}}}})
 
