@@ -39,9 +39,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from converter import code_transpiler  # noqa: E402
 from converter.code_transpiler import (  # noqa: E402
+    _ai_cache_key,
+    _ai_transpile,
     _format_contract_survivor_warning,
     _refresh_contract_warnings,
+    _save_cache,
+    _select_prompt,
     _verify_and_reprompt,
 )
 from converter.contract_pipeline import (  # noqa: E402
@@ -397,6 +402,87 @@ class TestCacheReplayFailOpen:
         )
         assert any(_is_post_reprompt_warning(w) for w in refreshed), (
             f"rule-(a) survivor must still fail closed on replay: {refreshed}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# AC5-cache-hit (DYNAMIC) -- drive the REAL ``_ai_transpile`` cache-HIT branch
+# end-to-end, proving the backend actually THREADS ``is_player_controller``
+# into ``_refresh_contract_warnings`` on replay. The tests above call the
+# refresh helper directly; this closes the wiring gap (a green helper test does
+# NOT prove the cache branch passes the flag) by seeding a real cache entry and
+# taking the hit.
+# ---------------------------------------------------------------------------
+
+class TestCacheHitThreadsPlayerFlag:
+
+    def _seed_and_hit(self, monkeypatch, tmp_path, *, source, is_player):
+        """Seed a lint-clean cache entry for ``source`` under the EXACT key
+        ``_ai_transpile`` computes, then call ``_ai_transpile`` so the cache
+        HIT branch (the only path that re-tags via ``_refresh_contract_warnings``)
+        runs. Returns the warnings the backend surfaced."""
+        monkeypatch.setattr(code_transpiler, "LLM_CACHE_DIR", str(tmp_path))
+        monkeypatch.setattr(code_transpiler, "LLM_CACHE_ENABLED", True)
+        # A cache HIT short-circuits BEFORE the API client is constructed
+        # (anthropic.Anthropic(...) at the post-cache path), so no network is
+        # reachable: if the flag-threading regressed such that the hit branch
+        # were skipped, _ai_transpile would fall through to the live API and
+        # raise -- which the test surfaces as a hard error, not a silent pass.
+        _system, prompt_hash = _select_prompt("generic")
+        key = _ai_cache_key(
+            csharp_source="csharp",
+            class_name="Player",
+            script_type="ModuleScript",
+            project_context="",
+            prompt_hash=prompt_hash,
+            model="claude-sonnet-4",
+        )
+        _save_cache(key, {"luau": source, "confidence": 0.9, "warnings": []})
+        _luau, _conf, warnings = _ai_transpile(
+            "csharp", "dummy-key", "claude-sonnet-4",
+            class_name="Player", script_type="ModuleScript",
+            project_context="", runtime_mode="generic",
+            is_player_controller=is_player,
+        )
+        return warnings
+
+    def test_cache_hit_threads_player_flag_fail_open(
+        self, monkeypatch, tmp_path,
+    ):
+        # The cached player Luau still trips p1. The cache-hit branch MUST run
+        # the player reject (flag threaded) and re-tag it -player (fail OPEN).
+        warnings = self._seed_and_hit(
+            monkeypatch, tmp_path, source=P1_CAMERA_WRITE, is_player=True,
+        )
+        assert any(
+            w.startswith("contract-verifier-player") for w in warnings
+        ), f"cache-hit branch did not thread the player flag / re-tag: {warnings}"
+        assert not any(_is_post_reprompt_warning(w) for w in warnings), (
+            f"cache-hit player reject wrongly fail-CLOSED: {warnings}"
+        )
+
+    def test_cache_hit_without_flag_does_not_run_player_reject(
+        self, monkeypatch, tmp_path,
+    ):
+        # NON-VACUOUS: the SAME cached camera-writing Luau, replayed as a
+        # NON-player (flag False), runs only rules a-h -> no player reject.
+        warnings = self._seed_and_hit(
+            monkeypatch, tmp_path, source=P1_CAMERA_WRITE, is_player=False,
+        )
+        assert not any("rule p1" in w for w in warnings), (
+            f"player reject ran on a non-player cache hit: {warnings}"
+        )
+
+    def test_cache_hit_rule_a_still_fails_closed(
+        self, monkeypatch, tmp_path,
+    ):
+        # The cache-hit branch still promotes a real contract (a) survivor to
+        # fail-closed -- only the player rejects fail open.
+        warnings = self._seed_and_hit(
+            monkeypatch, tmp_path, source=RULE_A_BROKEN, is_player=True,
+        )
+        assert any(_is_post_reprompt_warning(w) for w in warnings), (
+            f"rule-(a) survivor must fail closed on the cache hit: {warnings}"
         )
 
 

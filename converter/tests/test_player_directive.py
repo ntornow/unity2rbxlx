@@ -25,7 +25,10 @@ from converter.code_transpiler import (
     _PLAYER_CONTROLLER_DIRECTIVE,
     transpile_scripts,
 )
-from converter.contract_pipeline import _player_controller_paths
+from converter.contract_pipeline import (
+    _player_controller_paths,
+    transpile_with_contract,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -344,4 +347,152 @@ class TestFrozenPromptPreserved:
 
         assert player_ctx == f"{base_ctx}\n\n{_PLAYER_CONTROLLER_DIRECTIVE}", (
             "Player context changed by something other than the directive append."
+        )
+
+
+# ---------------------------------------------------------------------------
+# AC1 / AC7 (DYNAMIC) — drive the REAL transpile_with_contract handoff
+# (modules -> _player_controller_paths -> transpile_scripts -> _transpile_one)
+# rather than source-inspecting it, AND assert the AC7 downstream-dependent
+# cache-fanout MECHANISM: the player's transpiled Luau flows into a direct
+# dependent's `scoped` context (the channel that re-keys the dependent), while
+# the DIRECTIVE itself reaches only the player's context.
+# ---------------------------------------------------------------------------
+
+class TestTranspileWithContractDynamic:
+    """Closes the slice-4.1 P2: the handoff was only ``inspect.getsource``-d.
+    Here the directive targeting runs through the REAL pipeline seam with a
+    mocked backend, and the per-class ``project_context`` is captured live."""
+
+    _PLAYER_LUAU = "local Player = {}\nPlayer.MARK = 'PLAYER_OUTPUT_SENTINEL'\nreturn Player\n"
+
+    def _make_project(self, tmp_path: Path):
+        """``Player`` is the CC-bearing controller; ``HUD`` REFERENCES ``Player``
+        (a direct dependency) so the player's transpiled Luau lands in HUD's
+        scoped context — the AC7 fan-out channel."""
+        proj = tmp_path / "unity"
+        (proj / "Assets").mkdir(parents=True)
+        player = proj / "Assets" / "Player.cs"
+        player.write_text(
+            "using UnityEngine;\n"
+            "public class Player : MonoBehaviour { void Update() {} }\n"
+        )
+        hud = proj / "Assets" / "HUD.cs"
+        hud.write_text(
+            "using UnityEngine;\n"
+            "public class HUD : MonoBehaviour { Player p; void Update() {} }\n"
+        )
+        infos = [
+            _ScriptInfoStub(player, "Player"),
+            _ScriptInfoStub(hud, "HUD"),
+        ]
+        scene_runtime = {
+            "modules": {
+                "guid-player": {
+                    "stem": "Player", "class_name": "Player",
+                    "runtime_bearing": True, "is_component_class": True,
+                    "has_character_controller": True,
+                },
+                "guid-hud": {
+                    "stem": "HUD", "class_name": "HUD",
+                    "runtime_bearing": True, "is_component_class": True,
+                    "has_character_controller": False,
+                },
+            },
+            "scenes": {}, "prefabs": {}, "domain_overrides": {},
+        }
+        return proj, infos, scene_runtime
+
+    def _capture(self, monkeypatch, player_luau: str):
+        monkeypatch.setattr(code_transpiler, "_find_transpiler",
+                            lambda: "anthropic_api")
+        captured: dict[str, str] = {}
+
+        def fake_ai(csharp_source, api_key, model, class_name="",
+                    script_type="Script", project_context="",
+                    runtime_mode="legacy", is_player_controller=False):
+            captured[class_name] = project_context
+            luau = player_luau if class_name == "Player" else (
+                f"local {class_name} = {{}}\nreturn {class_name}\n"
+            )
+            return (luau, 0.9, [])
+
+        monkeypatch.setattr(code_transpiler, "_ai_transpile", fake_ai)
+        monkeypatch.setattr(code_transpiler, "_claude_cli_transpile",
+                            lambda *a, **k: ("", 0.0, []))
+        return captured
+
+    def test_directive_targets_player_through_real_pipeline(
+        self, tmp_path, monkeypatch,
+    ):
+        """AC1 dynamic: the directive reaches ONLY the player's context when
+        the targeting is computed by the REAL ``_player_controller_paths``
+        inside ``transpile_with_contract`` (NOT a hand-passed kwarg)."""
+        proj, infos, scene_runtime = self._make_project(tmp_path)
+        captured = self._capture(monkeypatch, self._PLAYER_LUAU)
+
+        transpile_with_contract(
+            unity_project_path=proj,
+            script_infos=infos,
+            scene_runtime=scene_runtime,
+            api_key="dummy",
+            use_ai=True,
+        )
+
+        assert _PLAYER_CONTROLLER_DIRECTIVE in captured["Player"], (
+            "directive did not reach the player via transpile_with_contract."
+        )
+        assert _PLAYER_CONTROLLER_DIRECTIVE not in captured["HUD"], (
+            "directive leaked into the non-player dependent."
+        )
+
+    def test_abstains_when_two_cc_modules_through_real_pipeline(
+        self, tmp_path, monkeypatch,
+    ):
+        """AC1b dynamic: with TWO ``has_character_controller`` modules the
+        helper abstains, so NO script gets the directive even though both are
+        flagged — proves the abstention rides the real handoff."""
+        proj, infos, scene_runtime = self._make_project(tmp_path)
+        scene_runtime["modules"]["guid-hud"]["has_character_controller"] = True
+        captured = self._capture(monkeypatch, self._PLAYER_LUAU)
+
+        transpile_with_contract(
+            unity_project_path=proj,
+            script_infos=infos,
+            scene_runtime=scene_runtime,
+            api_key="dummy",
+            use_ai=True,
+        )
+
+        for ctx in captured.values():
+            assert _PLAYER_CONTROLLER_DIRECTIVE not in ctx, (
+                "ambiguous (>1 CC) must abstain — no directive anywhere."
+            )
+
+    def test_player_output_flows_into_dependent_scoped_context(
+        self, tmp_path, monkeypatch,
+    ):
+        """AC7 fan-out MECHANISM: the player's transpiled Luau is inlined into
+        the dependent HUD's ``scoped`` context. THIS is the channel that
+        re-keys (and thus cold-re-transpiles) a downstream dependent when the
+        directive shifts the player's output — distinct from the directive
+        touching HUD's context (it does not; asserted above)."""
+        proj, infos, scene_runtime = self._make_project(tmp_path)
+        captured = self._capture(monkeypatch, self._PLAYER_LUAU)
+
+        transpile_with_contract(
+            unity_project_path=proj,
+            script_infos=infos,
+            scene_runtime=scene_runtime,
+            api_key="dummy",
+            use_ai=True,
+        )
+
+        # HUD depends on Player, so Player's already-transpiled Luau (sentinel)
+        # is embedded in HUD's prompt context. If the player's OUTPUT changes
+        # (e.g. because the directive re-transpiled it), HUD's context — hence
+        # its cache key — changes too: the bounded level-by-level fan-out.
+        assert "PLAYER_OUTPUT_SENTINEL" in captured["HUD"], (
+            "the player's transpiled Luau must flow into the dependent's "
+            "scoped context — the AC7 cache-fan-out channel."
         )
