@@ -35,6 +35,7 @@ Coverage:
 from __future__ import annotations
 
 import sys
+import types
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -52,6 +53,7 @@ from converter.code_transpiler import (  # noqa: E402
 from converter.contract_pipeline import (  # noqa: E402
     _is_contract_warning,
     _is_post_reprompt_warning,
+    transpile_with_contract,
 )
 from converter.runtime_contract import verify_module  # noqa: E402
 
@@ -515,3 +517,227 @@ class TestRejectGatedOnDeterministicIdentity:
         # A clean player script passes under both.
         assert verify_module(CLEAN_PLAYER, is_player_controller=False).ok
         assert verify_module(CLEAN_PLAYER, is_player_controller=True).ok
+
+
+# ---------------------------------------------------------------------------
+# AC2/AC3 (COLD-PATH END-TO-END) -- drive the REAL transpile_with_contract
+# chain (``_player_controller_paths -> transpile_scripts -> _transpile_one ->
+# _ai_transpile -> _verify_and_reprompt``) on a HAND-BROKEN player script and
+# prove the p1/p2 reject ACTUALLY FIRES through every seam at once.
+#
+# The helper tests above call ``verify_module`` / ``_verify_and_reprompt`` /
+# ``_refresh_contract_warnings`` DIRECTLY, and ``TestCacheHitThreadsPlayerFlag``
+# only drives the cache-HIT branch. NONE of them prove the COLD (cache-miss)
+# ``_ai_transpile -> _verify_and_reprompt`` thread: ``is_player_controller`` is
+# captured at the ``_ai_transpile`` call site (code_transpiler.py:325) AND
+# passed ONWARD into ``_verify_and_reprompt`` (:1852). A mutation dropping the
+# flag at EITHER seam leaves this test RED (the reject stops firing), while the
+# helper tests stay green -- which is exactly the coverage gap this closes.
+#
+# The mock is at the ``anthropic`` CLIENT boundary (not ``_ai_transpile``), so
+# the REAL ``_ai_transpile`` body runs end-to-end: cache miss -> client call
+# returns the hand-broken Luau -> lint clean -> ``_verify_and_reprompt`` runs
+# the player reject -> one-shot reprompt (also broken) -> the reject SURVIVES
+# and is surfaced under the fail-OPEN ``-player`` tag on the player's
+# ``TranspiledScript.warnings``.
+# ---------------------------------------------------------------------------
+
+class _FakeAnthropicMessages:
+    """Mimics ``client.messages`` -- ``create`` returns a canned response whose
+    single text block is the broken player Luau on BOTH the initial transpile
+    AND the one-shot reprompt, so the player reject SURVIVES (the reprompt
+    'fails to fix' it, matching the surviving-reject fail-open path).
+
+    Matching is by the requesting CLASS on the initial call (the user message
+    opens with ``Class: `<name>``` -- code_transpiler.py:1789) and by the broken
+    Luau's own SENTINEL on the reprompt call (the reprompt body embeds the
+    PREVIOUS broken Luau -- code_transpiler.py:1535-1536 -- but NOT the class
+    header). A non-matching call (e.g. HUD) returns a clean contract-compliant
+    table so only the player carries a reject. Counts calls so the test can
+    prove the cold path (not a cache hit) ran and the reprompt fired."""
+
+    _CLEAN = "local M = {}\nreturn M\n"
+
+    def __init__(self, player_class: str, player_luau: str, sentinel: str):
+        self._player_class = player_class
+        self._player_luau = player_luau
+        self._sentinel = sentinel
+        self.calls: list[str] = []
+
+    def create(self, *, model, max_tokens, system, messages):
+        user = messages[0]["content"]
+        self.calls.append(user)
+        # Initial call: keyed on the class header. Reprompt call: keyed on the
+        # broken Luau sentinel echoed back in the reprompt body. Either way the
+        # player keeps getting its broken Luau so the reject survives.
+        if f"`{self._player_class}`" in user or self._sentinel in user:
+            luau = self._player_luau
+        else:
+            luau = self._CLEAN
+        block = types.SimpleNamespace(text=luau)
+        return types.SimpleNamespace(content=[block])
+
+
+class _FakeAnthropicClient:
+    def __init__(self, *, api_key, messages):
+        self.api_key = api_key
+        self.messages = messages
+
+
+def _install_fake_anthropic(
+    monkeypatch, player_class: str, player_luau: str, sentinel: str,
+):
+    """Inject a fake ``anthropic`` module so the REAL ``_ai_transpile`` body
+    runs but ``anthropic.Anthropic(...).messages.create`` is the canned mock.
+    Returns the shared messages object (so the test can read ``.calls``)."""
+    msgs = _FakeAnthropicMessages(player_class, player_luau, sentinel)
+    fake_anthropic = types.ModuleType("anthropic")
+    fake_anthropic.Anthropic = (  # type: ignore[attr-defined]
+        lambda *, api_key: _FakeAnthropicClient(api_key=api_key, messages=msgs)
+    )
+    monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic)
+    # Keep the cold path hermetic: the hand-broken Luau is contract-broken but
+    # lint-CLEAN, so stub luau-analyze to report no syntax errors (the real
+    # tool may be absent in CI and would otherwise add noise warnings).
+    monkeypatch.setattr(code_transpiler, "_luau_syntax_check", lambda src: [])
+    return msgs
+
+
+class _ScriptInfoStub:
+    """Minimal ScriptInfo stand-in (mirrors test_player_directive.py)."""
+
+    def __init__(self, path: Path, class_name: str) -> None:
+        self.path = path
+        self.class_name = class_name
+        self.referenced_types: list[str] = []
+        self.suggested_type = "ModuleScript"
+        self.base_class = "MonoBehaviour"
+
+
+class TestColdPathRejectFiresEndToEnd:
+    """The full ``transpile_with_contract`` cold path, mocked only at the
+    anthropic client boundary, proves the player reject reaches through every
+    seam (directive + flag + verifier)."""
+
+    def _make_project(self, tmp_path: Path):
+        """``Player`` is the lone CC-bearing controller; ``HUD`` is a plain
+        component. ``_player_controller_paths`` resolves Player as the player
+        (exactly-one CC join). The fake backend returns the broken player Luau
+        for Player and a clean table for HUD."""
+        proj = tmp_path / "unity"
+        (proj / "Assets").mkdir(parents=True)
+        player = proj / "Assets" / "Player.cs"
+        player.write_text(
+            "using UnityEngine;\n"
+            "public class Player : MonoBehaviour { void Update() {} }\n"
+        )
+        hud = proj / "Assets" / "HUD.cs"
+        hud.write_text(
+            "using UnityEngine;\n"
+            "public class HUD : MonoBehaviour { void Update() {} }\n"
+        )
+        infos = [
+            _ScriptInfoStub(player, "Player"),
+            _ScriptInfoStub(hud, "HUD"),
+        ]
+        scene_runtime = {
+            "modules": {
+                "guid-player": {
+                    "stem": "Player", "class_name": "Player",
+                    "runtime_bearing": True, "is_component_class": True,
+                    "has_character_controller": True,
+                },
+                "guid-hud": {
+                    "stem": "HUD", "class_name": "HUD",
+                    "runtime_bearing": True, "is_component_class": True,
+                    "has_character_controller": False,
+                },
+            },
+            "scenes": {}, "prefabs": {}, "domain_overrides": {},
+        }
+        return proj, infos, scene_runtime
+
+    def _run(self, monkeypatch, tmp_path, broken_player_luau: str,
+             sentinel: str):
+        """Disable the LLM cache (force the COLD path -- a cache hit would
+        route through ``_refresh_contract_warnings``, not the
+        ``_ai_transpile -> _verify_and_reprompt`` seam this test guards), then
+        drive the real pipeline. ``sentinel`` is a distinctive substring of the
+        broken Luau used to keep returning it on the reprompt call (whose body
+        echoes the previous broken output but not the class header). Returns
+        ``(result, player_script, hud_script, msgs)``."""
+        monkeypatch.setattr(code_transpiler, "LLM_CACHE_ENABLED", False)
+        msgs = _install_fake_anthropic(
+            monkeypatch, "Player", broken_player_luau, sentinel,
+        )
+        proj, infos, scene_runtime = self._make_project(tmp_path)
+        result = transpile_with_contract(
+            unity_project_path=proj,
+            script_infos=infos,
+            scene_runtime=scene_runtime,
+            api_key="dummy-key",
+            use_ai=True,
+        )
+        player = next(
+            s for s in result.transpilation.scripts
+            if "Player" in s.output_filename
+        )
+        hud = next(
+            s for s in result.transpilation.scripts
+            if "HUD" in s.output_filename
+        )
+        return result, player, hud, msgs
+
+    def test_p1_reject_fires_through_cold_transpile_with_contract(
+        self, monkeypatch, tmp_path,
+    ):
+        result, player, hud, msgs = self._run(
+            monkeypatch, tmp_path, P1_CAMERA_WRITE,
+            sentinel="workspace.CurrentCamera.CFrame",
+        )
+        # The cold path was taken (initial + one-shot reprompt = 2 calls for
+        # the surviving player reject; HUD adds its own initial call). A cache
+        # hit would have made ZERO client calls.
+        assert len(msgs.calls) >= 2, (
+            f"cold path not exercised (calls={len(msgs.calls)})"
+        )
+        # The p1 reject ACTUALLY FIRED end-to-end: directive + flag + verifier
+        # all threaded through to surface the surviving player warning.
+        assert any(
+            w.startswith("contract-verifier-player") and "rule p1" in w
+            for w in player.warnings
+        ), (
+            "p1 reject did NOT fire through the cold transpile_with_contract "
+            f"chain: {player.warnings}"
+        )
+        # Non-load-bearing: it fails OPEN (never promotes to fail-closed).
+        assert not any(
+            _is_post_reprompt_warning(w) for w in player.warnings
+        ), f"cold-path player reject wrongly fail-CLOSED: {player.warnings}"
+        # The non-player (HUD) gets NO player reject.
+        assert not any(
+            "rule p1" in w or "rule p2" in w
+            or w.startswith("contract-verifier-player")
+            for w in hud.warnings
+        ), f"non-player HUD wrongly got a player reject: {hud.warnings}"
+
+    def test_p2_reject_fires_through_cold_transpile_with_contract(
+        self, monkeypatch, tmp_path,
+    ):
+        _result, player, hud, msgs = self._run(
+            monkeypatch, tmp_path, P2_HUMANOID_MOVE,
+            sentinel="Humanoid:Move(",
+        )
+        assert len(msgs.calls) >= 2
+        assert any(
+            w.startswith("contract-verifier-player") and "rule p2" in w
+            for w in player.warnings
+        ), (
+            "p2 reject did NOT fire through the cold transpile_with_contract "
+            f"chain: {player.warnings}"
+        )
+        assert not any(_is_post_reprompt_warning(w) for w in player.warnings)
+        assert not any(
+            "rule p2" in w or w.startswith("contract-verifier-player")
+            for w in hud.warnings
+        ), f"non-player HUD wrongly got a player reject: {hud.warnings}"
