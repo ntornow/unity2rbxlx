@@ -1,53 +1,53 @@
-"""Slice 2.4 — the LOAD-BEARING D8/D-jump corpus C-dominance proof, BY EXECUTION.
+"""Slice 2.4 (adapted, Phase 5) — the LOAD-BEARING D8/D-jump corpus
+C-dominance proof, BY EXECUTION, WITHOUT paradigm A.
 
 This is the proof the whole player-embodiment effort rests on: it does NOT
 string-match a modeled ``"POST"`` bracket (that is the Step-1a substrate proof,
-``test_player_shape_corpus.py``). Instead it:
+``test_player_shape_corpus.py``). Phase 5 DELETED paradigm A
+(``movement_facet_lowering.py`` whole module + the camera-facet PLAYER path), so
+in production BOTH player fixtures are genuinely **native (un-lowered)** — C is
+their only camera/move/jump writer. The mid-pass competitor is therefore the
+fixture's OWN NATIVE raw writes (the writes A used to neutralize), not a lowered
+shape. The proof:
 
-  1. Applies the REAL ``lower_camera_facet`` + ``lower_movement_facet`` passes to
-     BOTH ``cold3a59`` AND ``dde248`` THE PRODUCTION WAY
-     (``follow_character_paths=[the player script]`` — the only invocation
-     production uses, ``contract_pipeline.py:446,500-501``; NEVER without the
-     follow-set, which is the non-production strict-locator path the design
-     corrected). It ASSERTS each fixture's empirical lower-count as a
-     PRE-CONDITION (both → camera=1 AND move=1: both lower their look method to
-     ``self._cam:step``→``_readDelta`` and their WASD body to ``hum:Move`` +
-     ``hum.Jump = true``). A future lowerer change that silently flips a shape's
-     A behavior fails the precondition LOUDLY rather than passing vacuously.
+  1. Loads each fixture's NATIVE (un-lowered) Luau as the mid-pass competitor and
+     RUNS it under bus-backed mocks (modeled on ``test_player_shape_corpus.py``),
+     driving the REAL native competing writes AND the REAL ``_playerPreTick`` /
+     ``_playerPostTick`` brackets that ``SceneRuntime:_tick`` runs around the
+     component ``pairs()`` loop. The native ``Rotate`` / ``Move`` methods are
+     wired to the runtime's ``Update`` / ``LateUpdate`` lifecycle so they run
+     INSIDE the real ``_tick`` component pass, bracketed by the REAL host
+     authority.
 
-  2. ``loadstring``s + RUNS each lowered fixture's Luau under bus-backed mocks
-     (modeled on ``test_player_shape_corpus.py``), driving the REAL lowered A
-     competitor (``self._cam:step`` camera write + ``hum:Move`` / ``hum.Jump =
-     true`` mid-frame) AND the REAL ``_playerPreTick`` / ``_playerPostTick``
-     brackets that ``SceneRuntime:_tick`` runs around the component ``pairs()``
-     loop. The lowered ``Rotate`` / ``Move`` methods are wired to the runtime's
-     ``Update`` / ``LateUpdate`` lifecycle so they run INSIDE the real ``_tick``
-     component pass, bracketed by the REAL host authority.
+  2. Asserts C wins NON-VACUOUSLY by READING the FINAL recorded bus/log values
+     (the ordered ``CurrentCamera.CFrame`` write log, the ordered
+     ``Humanoid:Move`` log, the ordered ``Humanoid.Jump`` write log) — NOT by
+     string-matching the source. Non-vacuity is proven by giving C a distinctive
+     yaw (advanced via the E2E channel C acks first) and confirming (a) the
+     native competing write actually LANDED mid-pass (its entry is present in the
+     ordered log) and (b) the FINAL entry is C's.
 
-  3. Asserts C wins camera + move + jump NON-VACUOUSLY on BOTH shapes BY READING
-     the FINAL recorded bus/log values (the ordered ``CurrentCamera.CFrame``
-     write log, the ordered ``Humanoid:Move`` log, the ordered ``Humanoid.Jump``
-     write log) — NOT by string-matching the lowered source. Non-vacuity is
-     proven by giving C a distinctive yaw (advanced via the E2E channel C acks
-     first) and confirming (a) the lowered A write actually LANDED mid-pass
-     (its entry is present in the ordered log) and (b) the FINAL entry is C's.
-     Including the held-Space frame-2 jump last-writer (AC6.b): C's post-write
-     makes frame-2 ``Jump=false`` even though A wrote ``true`` mid-frame.
+  3. PER-FIXTURE surface (P1-b — verified against the fixture bytes; the
+     competitor is NOT uniform):
+       * ``cold3a59`` natively writes a raw ``cam.CFrame =`` (its ``Rotate``)
+         but its ``Move`` is a rig ``:PivotTo`` — it has NO ``Humanoid:Move`` /
+         no ``Jump`` to dominate. So cold3a59 proves CAMERA-surface dominance
+         ONLY (C is the last writer of the native ``cam.CFrame``).
+       * ``dde248`` natively writes a raw ``cam.CFrame =`` + ``humanoid:Move(``
+         + ``humanoid.Jump = true``. So dde248 proves CAMERA + MOVE + JUMP
+         dominance. The move/jump dominance proof RIDES dde248.
 
   4. AC4b raw-camera coverage: EXECUTES a SYNTHETIC raw-camera-writer component
      (its ``Update`` does ``workspace.CurrentCamera.CFrame = <junk>`` +
      ``CameraType = <junk>``) inside the REAL ``_tick`` ``pairs()`` loop with the
      REAL brackets, asserting C's write is the last writer of BOTH ``CFrame`` and
-     ``CameraType`` — recovering the §3 raw-``CurrentCamera``-survives coverage
-     WITHOUT omitting ``follow_character_paths``.
+     ``CameraType``. (Unchanged — it never used the lowerers.)
 
-  5. AC7: paradigm A is still ACTIVE (the lowered competitor actually runs — its
-     writes appear in the ordered logs; Phase 2 added NO suppression of the
-     movement/camera facet lowering).
+C-dominance over the camera surface on BOTH shapes, AND over move+jump on the
+move/jump-bearing shape (dde248), is proven WITHOUT A — this is the strangler-fig
+invariant: deleting A leaves no responsibility implicitly A-owned.
 
-The luau-sim classes skip cleanly without ``luau``; the pure-Python lower-count
-precondition is asserted inside each luau test (it gates the scenario), so the
-empirical fact is checked whenever the proof runs.
+The luau-sim classes skip cleanly without ``luau``.
 """
 
 from __future__ import annotations
@@ -58,8 +58,6 @@ from pathlib import Path
 
 import pytest
 
-from converter.camera_facet_lowering import lower_camera_facet
-from converter.movement_facet_lowering import lower_movement_facet
 from tests._camera_input_harness import (
     CAMERA_INPUT_PATH,
     camera_input_preamble,
@@ -70,7 +68,6 @@ HOST_RUNTIME_PATH = (
     Path(__file__).parent.parent / "runtime" / "scene_runtime.luau"
 )
 _FIXTURES = Path(__file__).parent / "fixtures" / "player_shapes"
-_FIXTURE_NAMES = ("cold3a59", "dde248")
 
 
 def _luau_available() -> bool:
@@ -86,40 +83,30 @@ pytestmark = pytest.mark.skipif(
 
 
 # --------------------------------------------------------------------------- #
-# REAL lowering — production path (follow_character_paths=[the player script]).
+# NATIVE fixture loading — Phase 5 deleted paradigm A, so the competitor is the
+# fixture's OWN un-lowered raw writes (no lowering pass).
 # --------------------------------------------------------------------------- #
 
 
 class _Script:
-    """Minimal ``_HasLuauSource`` for the lowerers (they read/write
-    ``luau_source`` only)."""
+    """Minimal ``_HasLuauSource`` holder (kept for callers that wrap a fixture
+    source as a script-like object; reads/writes ``luau_source`` only)."""
 
     def __init__(self, source: str) -> None:
         self.luau_source = source
 
 
-def _lower_fixture_production(name: str) -> tuple[str, int, int]:
-    """Apply the REAL camera + movement lowerers to a fixture THE PRODUCTION
-    WAY and return ``(lowered_source, camera_count, move_count)``.
-
-    Production (``contract_pipeline.py:499-501``) passes
-    ``follow_character_paths=players`` to ``lower_camera_facet`` and the player
-    script to ``lower_movement_facet`` — BOTH applied to the SAME script object,
-    so the returned source is the fully-lowered shape the runtime ships. NEVER
-    omits ``follow_character_paths`` (the non-production strict-locator path).
-    """
-    src = (_FIXTURES / f"{name}_player.luau").read_text(encoding="utf-8")
-    s = _Script(src)
-    camera = lower_camera_facet([s], follow_character_paths=[s])
-    move = lower_movement_facet([s])
-    return s.luau_source, camera, move
+def _native_fixture_source(name: str) -> str:
+    """Return the NATIVE (un-lowered) fixture source — the production shape after
+    paradigm A's deletion (C is its only camera/move/jump writer)."""
+    return (_FIXTURES / f"{name}_player.luau").read_text(encoding="utf-8")
 
 
 # --------------------------------------------------------------------------- #
 # Extra mock surface PORTED onto the camera-input harness (design §2.4 MINOR):
-#   * Vector3 Magnitude / Unit (C + lowered A read both in locomotion);
+#   * Vector3 Magnitude / Unit (C + native fixture read both in locomotion);
 #   * CFrame VectorToWorldSpace (getYawBasis():VectorToWorldSpace(...) — both
-#     the lowered A Move and C's _playerDriveLocomotion);
+#     the native Move and C's _playerDriveLocomotion);
 #   * Enum KeyCode (W/A/S/D/Space) + HumanoidStateType + Material;
 #   * a RECORDING CurrentCamera: every ``.CFrame`` / ``.CameraType`` write is
 #     appended to an ordered log (via __newindex on a backing table — NOT
@@ -128,15 +115,14 @@ def _lower_fixture_production(name: str) -> tuple[str, int, int]:
 #   * LocalPlayer.Character with a recording Humanoid (.Jump via a sibling
 #     _jumpValue field — NOT rawset, per the 2.2 gotcha — + an ordered :Move /
 #     .Jump / :ChangeState log) and a HumanoidRootPart (so C's eye is
-#     character-bound, non-vacuous);
+#     character-bound, non-vacuous). The recording Humanoid PROXY is exposed as
+#     ``workspace._humProxy`` so a native fixture whose ``Move`` reads
+#     ``self.control`` (the CharacterController/Humanoid) records onto the SAME
+#     ordered logs C writes to;
 #   * ReplicatedStorage:WaitForChild("SceneCameraInput") returning the REAL
-#     loaded SceneCameraInput module (so the lowered A's require + :step +
-#     getYawBasis run the REAL singleton, consuming the E2E channel);
+#     loaded SceneCameraInput module;
 #   * Space-down UIS (IsKeyDown(Space) true, W/D true so WASD is non-trivial).
-# The extra setup runs AFTER the base mocks and BEFORE the camera module loads,
-# so SceneCameraInput's module-load game:GetService still resolves the base
-# RunService/UIS/Players, and the lowered A's runtime require resolves the REAL
-# loaded module. KeyCodes are set true via a closure the test toggles per frame.
+# The extra setup runs AFTER the base mocks and BEFORE the camera module loads.
 # --------------------------------------------------------------------------- #
 
 
@@ -164,12 +150,12 @@ def _dominance_extra_setup(*, keys_down: list[str]) -> str:
 
         -- ---- CFrame VectorToWorldSpace (getYawBasis():VectorToWorldSpace) --
         -- A REAL yaw rotation (NOT identity): rotate the local WASD vector about
-        -- Y by the basis CFrame's accumulated ``_yaw``. This makes A's move
-        -- (basis = the A singleton's getYawBasis(), yaw 0 -- it lost the E2E ack)
-        -- NUMERICALLY DISTINCT from C's move (basis = CFrame.Angles(0, p._yaw, 0)
-        -- with C's E2E-advanced non-zero yaw). The rotated vector also carries
-        -- ``_srcYaw`` = the basis yaw that produced it, so the scenario can read
-        -- WHICH basis (A's 0 vs C's cYaw) wrote each ordered :Move entry.
+        -- Y by the basis CFrame's accumulated ``_yaw``. This makes the native
+        -- fixture's move (basis = the rig pivot, yaw 0) NUMERICALLY DISTINCT from
+        -- C's move (basis = CFrame.Angles(0, p._yaw, 0) with C's E2E-advanced
+        -- non-zero yaw). The rotated vector also carries ``_srcYaw`` = the basis
+        -- yaw that produced it, so the scenario can read WHICH basis (the
+        -- native fixture's 0 vs C's cYaw) wrote each ordered :Move entry.
         do
             local _cfmt = getmetatable(CFrame.new(Vector3.new(0, 0, 0)))
             -- __index is the metatable itself (CFramemt), so a method added
@@ -231,7 +217,7 @@ def _dominance_extra_setup(*, keys_down: list[str]) -> str:
         -- The recording Humanoid logs :Move(dir) (ordered), .Jump writes
         -- (ordered, via a sibling _jumpValue field - NOT rawset, 2.2 gotcha),
         -- and :ChangeState(state) (ordered). FloorMaterial set Grass so a
-        -- grounded check (if any survives lowering) passes.
+        -- grounded check (the native Move reads FloorMaterial ~= Air) passes.
         local humanoid = {FloorMaterial = "Material.Grass", _jumpValue = nil}
         humanoid._moveLog = {}
         humanoid._jumpLog = {}
@@ -239,8 +225,9 @@ def _dominance_extra_setup(*, keys_down: list[str]) -> str:
         local _humBacking = humanoid
         function humanoid:Move(dir, rel)
             -- Record the FULL move vector (its components + the basis yaw that
-            -- rotated it) so the scenario can prove WHICH writer (A's yaw-0 basis
-            -- vs C's yaw-cYaw basis) is the LAST :Move -- not merely count moves.
+            -- rotated it) so the scenario can prove WHICH writer (the native
+            -- fixture's yaw-0 basis vs C's yaw-cYaw basis) is the LAST :Move --
+            -- not merely count moves.
             table.insert(_humBacking._moveLog, {
                 x = dir.X, y = dir.Y, z = dir.Z, srcYaw = dir._srcYaw,
             })
@@ -263,8 +250,10 @@ def _dominance_extra_setup(*, keys_down: list[str]) -> str:
                 end
             end,
         })
-        -- expose the backing (logs + Move/ChangeState) to the scenario.
+        -- expose the backing (logs + Move/ChangeState) AND the proxy (so a
+        -- native fixture whose Move reads self.control records here too).
         workspace._humanoid = humanoid
+        workspace._humProxy = humProxy
 
         local hrp = {Position = Vector3.new(10, 0, 20)}
         local character = {}
@@ -289,13 +278,6 @@ def _dominance_extra_setup(*, keys_down: list[str]) -> str:
         end
 
         -- ---- ReplicatedStorage -> the REAL SceneCameraInput module --------
-        -- Wire ReplicatedStorage:WaitForChild("SceneCameraInput") to a
-        -- placeholder; the scenario body overrides ``require`` so require() on
-        -- it returns the REAL loaded SceneCameraInput module (its :step /
-        -- getYawBasis / _readDelta then run for real, consuming the E2E
-        -- channel). Nothing in the base module-load path touches
-        -- ReplicatedStorage (SceneCameraInput resolves only RunService / UIS /
-        -- Players at load).
         do
             local realGetService = game.GetService
             local RS = {}
@@ -315,9 +297,10 @@ def _dominance_extra_setup(*, keys_down: list[str]) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Scenario body builder: load the lowered fixture, register it as a component
-# whose Update -> lowered Rotate (camera) and LateUpdate -> lowered Move
-# (humanoid + jump), build the real authority, drive _tick frame(s).
+# Scenario body builder: load the NATIVE fixture, register it as a component
+# whose Update -> native Update+Rotate (camera) and LateUpdate -> native Move
+# (rig pivot for cold3a59; humanoid + jump for dde248), build the real
+# authority, drive _tick frame(s).
 # --------------------------------------------------------------------------- #
 
 
@@ -328,10 +311,10 @@ def _embed(source: str, tag: str) -> str:
     return f"[{delim}[\n{source}\n]{delim}]"
 
 
-def _dominance_body(*, lowered_source: str, frames: int) -> str:
+def _dominance_body(*, native_source: str, frames: int) -> str:
     """Build the scenario body that drives ``frames`` real ``_tick`` calls with
-    the lowered fixture component bracketed by the real authority."""
-    fixture_lit = _embed(lowered_source, "fixture")
+    the NATIVE fixture component bracketed by the real authority."""
+    fixture_lit = _embed(native_source, "fixture")
     template = textwrap.dedent("""\
         -- Make require() on the SceneCameraInput placeholder return the REAL
         -- loaded module (SceneCameraInput is the local the camera-service
@@ -344,36 +327,54 @@ def _dominance_body(*, lowered_source: str, frames: int) -> str:
             return _origRequire(target)
         end
 
-        -- Load the lowered fixture (returns the Player class table). It closes
+        -- STUDS_PER_METER: the cold3a59 native Move scales by it (line 46). It
+        -- is a transpiler-emitted module constant in production; seed it here.
+        if STUDS_PER_METER == nil then STUDS_PER_METER = 1 end
+
+        -- Load the NATIVE fixture (returns the Player class table). It closes
         -- over the ambient Vector3/CFrame/Enum/workspace globals.
         local PlayerChunk = assert(loadstring(
             "return (function() " .. __FIXTURE_LIT__ .. " end)()",
-            "lowered_fixture"))
-        local LoweredPlayer = PlayerChunk()
-        assert(type(LoweredPlayer) == "table",
-            "lowered fixture must return its module table")
+            "native_fixture"))
+        local NativePlayer = PlayerChunk()
+        assert(type(NativePlayer) == "table",
+            "native fixture must return its module table")
 
-        -- The lowered A controller instance: a fixture ``self`` carrying the
-        -- gameObject (the rig the camera service configures) + uis.
+        -- The native fixture instance: a fixture ``self`` carrying the
+        -- gameObject (rig), uis, the look-math fields the native Rotate reads,
+        -- and ``control`` = the recording Humanoid proxy (the native dde248 Move
+        -- reads self.control as the Humanoid; cold3a59 ignores it for moves).
         local rig = {}
         function rig:GetPivot() return CFrame.new(Vector3.new(0, 0, 0)) end
         function rig:PivotTo(_cf) end
-        local aComp = setmetatable({gameObject = rig,
-                                    uis = game:GetService("UserInputService")},
-                                   LoweredPlayer)
+        local aComp = setmetatable({
+            gameObject = rig,
+            uis = game:GetService("UserInputService"),
+            control = workspace._humProxy,
+            cam = workspace.CurrentCamera,
+            sensitivity = 1.0,
+            speed = 1.0,
+            minAngle = -80.0,
+            maxAngle = 80.0,
+            camRotation = Vector3.new(0, 0, 0),
+            camRotationX = 0,
+            moveDirection = Vector3.new(0, 0, 0),
+            pendingMouse = Vector3.new(0, 0, 0),
+        }, NativePlayer)
 
-        -- Map the lowered fixture's look/move methods onto the runtime
-        -- lifecycle the _tick pairs() loop drives: Update -> Rotate (the
-        -- lowered camera _cam:step competitor), LateUpdate -> Move (the lowered
-        -- humanoid :Move + .Jump competitor). cold3a59 also has its own
-        -- Update (the split-read cache); run it first so its cache populates.
+        -- Map the native fixture's look/move methods onto the runtime lifecycle
+        -- the _tick pairs() loop drives: Update -> (native Update +) Rotate (the
+        -- native camera competitor), LateUpdate -> Move (native rig-pivot move
+        -- for cold3a59 / native humanoid :Move + .Jump for dde248). cold3a59 has
+        -- its own Update (the split-read cache); run it first so its cache
+        -- populates before Rotate consumes it.
         local classTable = {}
         function classTable.Update(self, dt)
-            if LoweredPlayer.Update then LoweredPlayer.Update(self, dt) end
-            LoweredPlayer.Rotate(self, dt)
+            if NativePlayer.Update then NativePlayer.Update(self, dt) end
+            NativePlayer.Rotate(self, dt)
         end
         function classTable.LateUpdate(self, dt)
-            LoweredPlayer.Move(self, dt)
+            NativePlayer.Move(self, dt)
         end
 
         -- Build the real SceneRuntime over a ONE-CC-module plan so
@@ -392,25 +393,22 @@ def _dominance_body(*, lowered_source: str, frames: int) -> str:
         engine:_initPlayerAuthority()
         assert(engine._player ~= nil, "authority must bind on the CC module")
 
-        -- Register the lowered A component into the real component map so the
-        -- real _tick pairs() loop drives it (Update + LateUpdate), bracketed
-        -- by the REAL _playerPreTick / _playerPostTick.
+        -- Register the native component into the real component map so the real
+        -- _tick pairs() loop drives it (Update + LateUpdate), bracketed by the
+        -- REAL _playerPreTick / _playerPostTick.
         engine._meta[aComp] = {
             classTable = classTable, scriptId = "player",
             activeInHierarchy = true, enabled = true,
         }
 
         -- Drive ``frames`` real ticks. Before each, push the E2E channel so C's
-        -- _playerReadInput (pre-Update) acks the seq FIRST and the lowered A's
-        -- _cam:step->_readDelta (mid-Update) sees seq==ack and adds 0 (D9 race).
+        -- _playerReadInput (pre-Update) acks the seq FIRST and C's yaw advances
+        -- by a clearly non-zero amount.
         local FRAMES = __FRAMES__
         local SEQ = 0
         for f = 1, FRAMES do
             SEQ = SEQ + 1
             workspace:SetAttribute("E2EMouseSeq", SEQ)
-            -- A big deltaX so C's yaw advances by a clearly non-zero amount,
-            -- distinguishing C's camera write from A's (A's singleton yaw stays
-            -- 0 because it never wins the ack).
             workspace:SetAttribute("E2EMouseDeltaX", 1000.0)
             workspace:SetAttribute("E2EMouseDeltaY", 0.0)
             engine:_tick(0.016)
@@ -419,14 +417,12 @@ def _dominance_body(*, lowered_source: str, frames: int) -> str:
         -- Read the recorded logs. The final CurrentCamera.CFrame write is the
         -- last entry whose key == "CFrame".
         local camWrites = workspace._camWrites
-        local lastCamYaw, sawNonCYaw, anyCamWrite = nil, false, false
+        local lastCamYaw, anyCamWrite = nil, false
         local cYaw = engine._player._yaw
         for _, w in ipairs(camWrites) do
             if w.key == "CFrame" then
                 anyCamWrite = true
                 lastCamYaw = w.value._yaw
-                -- A's singleton wrote a CFrame whose yaw is NOT C's (0 vs cYaw).
-                if w.value._yaw ~= cYaw then sawNonCYaw = true end
             end
         end
 
@@ -437,13 +433,8 @@ def _dominance_body(*, lowered_source: str, frames: int) -> str:
 
         print("CYAW=" .. tostring(cYaw))
         print("ANYCAMWRITE=" .. tostring(anyCamWrite))
-        print("SAWNONCYAW=" .. tostring(sawNonCYaw))
         print("LASTCAMYAW=" .. tostring(lastCamYaw))
         print("MOVES=" .. tostring(#moveLog))
-        -- The FINAL ordered :Move entry MUST be C's (its basis yaw == C's _yaw,
-        -- non-zero), NOT A's (basis yaw 0). Print the last entry's basis yaw +
-        -- components and the first entry's basis yaw (A, mid-pass) so the test
-        -- proves C is the LAST move writer by VALUE, not by count.
         local lastMove = moveLog[#moveLog]
         local firstMove = moveLog[1]
         if lastMove then
@@ -458,10 +449,6 @@ def _dominance_body(*, lowered_source: str, frames: int) -> str:
         print("FIRSTJUMP=" .. tostring(jumpLog[1]))
         print("LASTJUMP=" .. tostring(jumpLog[#jumpLog]))
         print("STATES=" .. tostring(#stateLog))
-        -- Per-frame jump log slice: with N frames, A writes Jump=true once per
-        -- frame mid-LateUpdate and C writes once per frame post-LateUpdate, so
-        -- the log is [A_f1, C_f1, A_f2, C_f2, ...]. Print the C entries (even
-        -- indices) so the multi-frame last-writer is checkable.
         for i = 1, #jumpLog do
             print("JUMPLOG[" .. tostring(i) .. "]=" .. tostring(jumpLog[i]))
         end
@@ -472,149 +459,146 @@ def _dominance_body(*, lowered_source: str, frames: int) -> str:
 
 
 def _run_dominance(*, name: str, keys_down: list[str], frames: int):
-    """Lower a fixture the production way, ASSERT the lower-count precondition,
-    then run the real-authority dominance scenario. Returns (rc, out, err,
-    camera_count, move_count)."""
-    lowered_source, camera, move = _lower_fixture_production(name)
+    """Run the real-authority dominance scenario over the NATIVE fixture as the
+    mid-pass competitor. Returns (rc, out, err)."""
+    native_source = _native_fixture_source(name)
     preamble = camera_input_preamble(
         mouse_deltas=[(0.0, 0.0)] * (frames + 2),
         extra_mock_setup=_dominance_extra_setup(keys_down=keys_down),
     )
-    body = _dominance_body(lowered_source=lowered_source, frames=frames)
+    body = _dominance_body(native_source=native_source, frames=frames)
     rc, out, err = run_camera_scenario(preamble, body)
-    return rc, out, err, camera, move
+    return rc, out, err
 
 
 # --------------------------------------------------------------------------- #
-# AC4 + AC5 + AC6 + AC7 — corpus C-dominance on BOTH real post-lowering shapes.
+# Corpus C-dominance on BOTH NATIVE shapes, PER-FIXTURE surface (P1-b):
+#   * cold3a59 -> CAMERA-surface dominance only (no native Humanoid:Move/Jump);
+#   * dde248   -> CAMERA + MOVE + JUMP dominance.
 # --------------------------------------------------------------------------- #
 
 
 class TestCorpusDominanceByExecution:
 
-    @pytest.mark.parametrize("name", _FIXTURE_NAMES)
-    def test_lower_count_precondition(self, name: str) -> None:
-        # AC4 precondition (P1-1): on the PRODUCTION path BOTH fixtures lower
-        # IDENTICALLY — camera=1 (look method -> self._cam:step) AND move=1
-        # (WASD body -> hum:Move + hum.Jump=true). A future lowerer change that
-        # flips a shape's A behavior fails HERE, not vacuously downstream.
-        _src, camera, move = _lower_fixture_production(name)
-        assert (camera, move) == (1, 1), (
-            f"{name}: production-path lower-count must be camera=1/move=1 "
-            f"(both fixtures fully A-bound); got camera={camera} move={move}"
-        )
-
-    @pytest.mark.parametrize("name", _FIXTURE_NAMES)
-    def test_C_dominates_camera_and_move(self, name: str) -> None:
-        # AC4 (camera) + AC5 (move) + AC7 (A active): one frame, WASD held so the
-        # lowered A Move runs locomotion. C dominates BOTH the camera CFrame and
-        # the Humanoid move-intent BY EXECUTION, read off the ordered logs.
-        rc, out, err, camera, move = _run_dominance(
+    @pytest.mark.parametrize("name", ("cold3a59", "dde248"))
+    def test_C_dominates_camera(self, name: str) -> None:
+        # Camera-surface dominance on BOTH native shapes. WASD held so the native
+        # Move (rig pivot for cold3a59 / Humanoid:Move for dde248) runs alongside
+        # the native camera write. C dominates the camera CFrame BY EXECUTION,
+        # read off the ordered camera-write log.
+        rc, out, err = _run_dominance(
             name=name, keys_down=["W", "D"], frames=1)
-        assert (camera, move) == (1, 1), f"{name}: precondition drift"
         assert rc == 0, f"{name}: luau failed: {err}\n{out}"
 
-        # AC7 / non-vacuity: the lowered A camera competitor ACTUALLY ran and
-        # wrote the camera (its write is in the ordered log), AND it wrote a yaw
-        # that is NOT C's (A's singleton never won the E2E ack -> its yaw stayed
-        # 0, distinct from C's E2E-advanced yaw). A's :Move also ran.
+        # Non-vacuity: the native camera write ACTUALLY ran and wrote the camera
+        # (its write is in the ordered log) mid-pass.
         assert "ANYCAMWRITE=true" in out, f"{name}: no camera write logged\n{out}"
-        assert "SAWNONCYAW=true" in out, (
-            f"{name}: the lowered A camera write (a yaw != C's) must be present "
-            f"mid-pass — proves A is ACTIVE + dominance non-vacuous\n{out}"
-        )
-        assert "MOVES=2" in out, (
-            f"{name}: expect 2 Humanoid:Move per frame (lowered A mid-pass + C "
-            f"post-bracket); A active + C present\n{out}"
-        )
 
         cyaw = _grab(out, "CYAW=")
-        # C's yaw is non-zero (advanced by the E2E delta C acked) so every
-        # last-writer-is-C assertion below is NON-VACUOUS (not 0==0 with A
-        # coincidentally 0). Shared by the camera + move dominance proofs.
+        # C's yaw is non-zero (advanced by the E2E delta C acked) so the
+        # last-writer-is-C assertion is NON-VACUOUS (not 0==0).
         assert float(cyaw) != 0.0, (
             f"{name}: C's yaw must advance via the E2E channel C acks first; "
             f"got {cyaw} (D9 ACK race not exercised)\n{out}"
         )
 
-        # AC5 (MOVE dominance, last-writer BY VALUE): the lowered A :Move runs
-        # mid-pass with the A SINGLETON's yaw basis (yaw 0 -- A lost the E2E ack),
-        # so A's move vector carries srcYaw=0. C's _playerDriveLocomotion runs in
-        # the post bracket with CFrame.Angles(0, cYaw, 0), so its move vector
-        # carries srcYaw=cYaw (non-zero). With a NON-identity VectorToWorldSpace
-        # the two vectors are NUMERICALLY DISTINCT, so asserting the FINAL :Move
-        # entry's basis yaw == cYaw PROVES C is the LAST move writer (would FAIL
-        # if A's move ran last). A's mid-pass move is the FIRST entry (srcYaw=0).
-        first_move_yaw = _grab(out, "FIRSTMOVESRCYAW=")
-        assert float(first_move_yaw) == 0.0, (
-            f"{name}: A's mid-pass :Move must use the A-singleton yaw basis "
-            f"(0, lost the ack) — it is the FIRST move entry\n{out}"
-        )
-        last_move_yaw = _grab(out, "LASTMOVESRCYAW=")
-        assert float(last_move_yaw) == float(cyaw), (
-            f"{name}: final Humanoid:Move must be C's post-bracket move "
-            f"(basis yaw={cyaw}), NOT A's mid-pass move (basis yaw=0); got "
-            f"last-move basis yaw={last_move_yaw}\n{out}"
-        )
-        # And the final move vector is NUMERICALLY different from A's (proves the
-        # right value reached the Humanoid, not just the right writer order). For
-        # WASD W+D the local vector is (1,0,-1); A (yaw 0) -> X=1, C (yaw=cYaw) ->
-        # X = cos(cYaw) + (-1)*sin(cYaw) != 1 for any cYaw not a multiple of 2pi.
-        last_move_x = float(_grab(out, "LASTMOVEX="))
-        assert last_move_x != 1.0, (
-            f"{name}: C's move vector must differ NUMERICALLY from A's "
-            f"(A X=1 at yaw 0); got last-move X={last_move_x} — VectorToWorldSpace "
-            f"must be a real yaw rotation, not identity\n{out}"
-        )
-
-        # AC4 (camera dominance): the FINAL camera CFrame is C's (its E2E-
-        # advanced yaw), not A's mid-pass write.
+        # CAMERA dominance: the FINAL camera CFrame is C's (its E2E-advanced
+        # yaw), not the native raw write (rig-pivot yaw 0).
         last = _grab(out, "LASTCAMYAW=")
         assert float(last) == float(cyaw), (
             f"{name}: final CurrentCamera.CFrame must be C's post-write "
             f"(yaw={cyaw}); got last-writer yaw={last}\n{out}"
         )
 
-    @pytest.mark.parametrize("name", _FIXTURE_NAMES)
-    def test_C_dominates_jump_held_space_multiframe(self, name: str) -> None:
-        # AC6 (a)+(b) — the load-bearing jump proof. Hold Space across TWO
-        # frames. The lowered A Move writes Jump=true mid-LateUpdate EVERY frame;
-        # C's _playerDriveLocomotion (post-LateUpdate) is the LAST Jump writer
-        # each frame: frame 1 ends Jump=true (C's rising edge), frame 2 ends
-        # Jump=false (held, past the edge — C still the last writer over A's
-        # mid-pass true). Read off the ordered Jump log, NOT a string match.
-        rc, out, err, camera, move = _run_dominance(
-            name=name, keys_down=["W", "Space"], frames=2)
-        assert (camera, move) == (1, 1), f"{name}: precondition drift"
-        assert rc == 0, f"{name}: luau failed: {err}\n{out}"
+    def test_C_dominates_move_dde248(self) -> None:
+        # MOVE dominance rides dde248 (P1-b): its native Move calls
+        # ``humanoid:Move(`` so the native competitor is a real Humanoid:Move.
+        # cold3a59 has NO native Humanoid:Move (its move is a rig :PivotTo), so
+        # there is no move surface to dominate there.
+        rc, out, err = _run_dominance(
+            name="dde248", keys_down=["W", "D"], frames=1)
+        assert rc == 0, f"dde248: luau failed: {err}\n{out}"
 
-        # 4 Jump writes total: [A_f1=true, C_f1=true, A_f2=true, C_f2=false].
-        # A active (its true is present), C last each frame.
+        # The native Humanoid:Move ran mid-pass AND C's post-bracket move ran ->
+        # 2 ordered :Move entries (native mid-pass + C post-bracket).
+        assert "MOVES=2" in out, (
+            f"dde248: expect 2 Humanoid:Move per frame (native mid-pass + C "
+            f"post-bracket); native Move active + C present\n{out}"
+        )
+
+        cyaw = _grab(out, "CYAW=")
+        assert float(cyaw) != 0.0, (
+            f"dde248: C's yaw must advance via the E2E channel\n{out}"
+        )
+
+        # MOVE dominance, last-writer BY VALUE: the native :Move runs mid-pass
+        # with the rig-pivot yaw basis (yaw 0), so its move vector carries
+        # srcYaw=0 (the FIRST entry). C's _playerDriveLocomotion runs in the post
+        # bracket with CFrame.Angles(0, cYaw, 0), so its move vector carries
+        # srcYaw=cYaw (non-zero). Asserting the FINAL :Move entry's basis yaw ==
+        # cYaw PROVES C is the LAST move writer.
+        first_move_yaw = _grab(out, "FIRSTMOVESRCYAW=")
+        assert float(first_move_yaw) == 0.0, (
+            f"dde248: the native mid-pass :Move must use the rig-pivot yaw basis "
+            f"(0) — it is the FIRST move entry\n{out}"
+        )
+        last_move_yaw = _grab(out, "LASTMOVESRCYAW=")
+        assert float(last_move_yaw) == float(cyaw), (
+            f"dde248: final Humanoid:Move must be C's post-bracket move "
+            f"(basis yaw={cyaw}), NOT the native mid-pass move (basis yaw=0); "
+            f"got last-move basis yaw={last_move_yaw}\n{out}"
+        )
+        # And the final move vector is NUMERICALLY different from the native
+        # one. For WASD W+D the local vector is (1,0,-1); native (yaw 0) -> X=1,
+        # C (yaw=cYaw) -> X = cos(cYaw) + (-1)*sin(cYaw) != 1 for any cYaw not a
+        # multiple of 2pi.
+        last_move_x = float(_grab(out, "LASTMOVEX="))
+        assert last_move_x != 1.0, (
+            f"dde248: C's move vector must differ NUMERICALLY from the native's "
+            f"(native X=1 at yaw 0); got last-move X={last_move_x} — "
+            f"VectorToWorldSpace must be a real yaw rotation, not identity\n{out}"
+        )
+
+    def test_C_dominates_jump_held_space_multiframe_dde248(self) -> None:
+        # JUMP dominance rides dde248 (P1-b): its native Move writes
+        # ``humanoid.Jump = true`` on Space. cold3a59 has NO native jump writer.
+        # Hold Space across TWO frames. The native Move writes Jump=true
+        # mid-LateUpdate EVERY frame; C's _playerDriveLocomotion (post-LateUpdate)
+        # is the LAST Jump writer each frame: frame 1 ends Jump=true (C's rising
+        # edge), frame 2 ends Jump=false (held, past the edge — C still the last
+        # writer over the native mid-pass true). Read off the ordered Jump log.
+        rc, out, err = _run_dominance(
+            name="dde248", keys_down=["W", "Space"], frames=2)
+        assert rc == 0, f"dde248: luau failed: {err}\n{out}"
+
+        # 4 Jump writes total: [native_f1=true, C_f1=true, native_f2=true,
+        # C_f2=false]. Native Move active (its true is present), C last each frame.
         jumps = int(_grab(out, "JUMPS="))
         assert jumps == 4, (
-            f"{name}: expect 4 Jump writes (A+C each of 2 frames); got {jumps}\n{out}"
+            f"dde248: expect 4 Jump writes (native+C each of 2 frames); got "
+            f"{jumps}\n{out}"
         )
-        # A wrote true mid-pass (non-vacuous: A active).
+        # The native Move wrote true mid-pass (non-vacuous: native jump active).
         assert _grab(out, "JUMPLOG[1]=") == "true", (
-            f"{name}: lowered A must write Jump=true mid-pass frame 1\n{out}"
+            f"dde248: native Move must write Jump=true mid-pass frame 1\n{out}"
         )
         assert _grab(out, "JUMPLOG[3]=") == "true", (
-            f"{name}: lowered A must write Jump=true mid-pass frame 2\n{out}"
+            f"dde248: native Move must write Jump=true mid-pass frame 2\n{out}"
         )
         # C is the LAST writer each frame: frame 1 -> true (rising edge),
         # frame 2 -> false (held past the edge). The frame-2 false PROVES C wins
-        # even after the edge while A is still writing true (AC6.b).
+        # even after the edge while the native Move is still writing true.
         assert _grab(out, "JUMPLOG[2]=") == "true", (
-            f"{name}: C must be the last Jump writer frame 1 = true (edge)\n{out}"
+            f"dde248: C must be the last Jump writer frame 1 = true (edge)\n{out}"
         )
         assert _grab(out, "JUMPLOG[4]=") == "false", (
-            f"{name}: C must be the last Jump writer frame 2 = false (held past "
-            f"the edge, dominating A's mid-pass true) — AC6.b\n{out}"
+            f"dde248: C must be the last Jump writer frame 2 = false (held past "
+            f"the edge, dominating the native mid-pass true)\n{out}"
         )
         # ChangeState(Jumping) fires ONCE (the single rising edge), not every
         # frame — correct one-jump-per-press UX.
         assert _grab(out, "STATES=") == "1", (
-            f"{name}: ChangeState(Jumping) must fire once on the rising edge "
+            f"dde248: ChangeState(Jumping) must fire once on the rising edge "
             f"(one jump per held press)\n{out}"
         )
 
@@ -630,17 +614,17 @@ def _grab(out: str, prefix: str) -> str:
 # --------------------------------------------------------------------------- #
 # AC4b — C dominates an ACTUAL raw CurrentCamera write (the §3 abstain case),
 # via a SYNTHETIC raw-camera-writer component in the real _tick pairs() loop.
+# This never used the lowerers, so it is UNCHANGED by Phase 5.
 # --------------------------------------------------------------------------- #
 
 
 class TestRawCameraDominance:
 
     def test_C_dominates_synthetic_raw_camera_writer(self) -> None:
-        # AC4b: a synthetic component whose Update STOMPS workspace.CurrentCamera
-        # .CFrame (junk yaw) AND .CameraType (junk) — the §3 case the camera
-        # lowerer would ABSTAIN on. Driven inside the REAL _tick pairs() loop
-        # with the REAL brackets; C's post-write must be the LAST writer of BOTH
-        # CFrame and CameraType. Recovered WITHOUT omitting follow_character_paths.
+        # A synthetic component whose Update STOMPS workspace.CurrentCamera
+        # .CFrame (junk yaw) AND .CameraType (junk). Driven inside the REAL _tick
+        # pairs() loop with the REAL brackets; C's post-write must be the LAST
+        # writer of BOTH CFrame and CameraType.
         preamble = camera_input_preamble(
             mouse_deltas=[(0.0, 0.0)],
             extra_mock_setup=_dominance_extra_setup(keys_down=[]),

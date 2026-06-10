@@ -1,26 +1,22 @@
-"""Slice 2.6 (AC2.6.4) — C dominates the field-aliased-camera cold shape's RAW
-``self.cam.CFrame`` write, BY EXECUTION.
+"""Slice 2.6 (adapted, Phase 5) — C dominates the field-aliased-camera cold
+shape's RAW ``self.cam.CFrame`` write, BY EXECUTION, WITHOUT paradigm A.
 
 The slice-2.6 cold-Studio finding: a fresh AI transpile aliased the camera to a
 FIELD (``self.cam = workspace.CurrentCamera`` in ``Awake``; ``self.cam.CFrame =
-…`` in the look body), so paradigm A's camera-facet look-locator ABSTAINS — no
-``self._cam:step(`` is spliced and the RAW ``self.cam.CFrame`` write SURVIVES.
-The conversion-time ``player_look_unbound`` fail-closed (keyed on that A-locator
-fingerprint) used to abort the build before paradigm C ever ran; slice 2.6
-removed it because C binds the camera deterministically for every CC-identified
-player.
+…`` in the look body). This was ALWAYS the §3 raw-``CurrentCamera``-survives case:
+paradigm A's camera-facet look-locator ABSTAINED on it (the raw write survived
+regardless), so this proof never depended on A *succeeding*. Phase 5 DELETED
+paradigm A entirely, so the field-aliased raw ``self.cam.CFrame`` write IS the
+production competitor C dominates — there is no lowering pass.
 
 This module is the build-time PROOF that C drives THIS exact cold shape. It is
 the §3 raw-``CurrentCamera``-survives case driven by a REAL captured fixture
 (vs the synthetic raw-writer of ``test_player_corpus_dominance.py``'s AC4b):
 
-  1. Lower ``fieldcam_player.luau`` THE PRODUCTION WAY
-     (``follow_character_paths=[the script]``) and ASSERT the pre-condition
-     ``camera == 0`` (A's look-locator abstained → the raw ``self.cam.CFrame``
-     write SURVIVES) so a future locator change that silently starts lowering
-     this shape fails LOUDLY rather than passing vacuously.
+  1. Read ``fieldcam_player.luau`` as the NATIVE (un-lowered) production shape and
+     guard the shape-fact: the raw ``self.cam.CFrame =`` write is present.
 
-  2. ``loadstring`` + RUN the lowered fixture under the bus-backed corpus mocks
+  2. ``loadstring`` + RUN the native fixture under the bus-backed corpus mocks
      (reused from ``test_player_corpus_dominance``): ``Awake`` aliases
      ``self.cam`` to the recording ``workspace.CurrentCamera`` proxy, then
      ``Rotate`` (mapped onto the component ``Update`` pass) writes the raw
@@ -30,9 +26,9 @@ the §3 raw-``CurrentCamera``-survives case driven by a REAL captured fixture
   3. Assert C is the LAST writer of ``workspace.CurrentCamera.CFrame`` BY READING
      the ordered write log — ``self.cam`` aliases ``workspace.CurrentCamera``
      (the SAME object), so C's post-bracket ``_playerWriteCamera`` overwrites the
-     very cell A's raw write stomped. NON-VACUOUS: A's raw write (its distinctive
-     pivot-yaw) is present in the log mid-pass, and the FINAL entry is C's
-     E2E-advanced yaw.
+     very cell the native raw write stomped. NON-VACUOUS: the native raw write
+     (its distinctive pivot-yaw) is present in the log mid-pass, and the FINAL
+     entry is C's E2E-advanced yaw.
 
   4. Mutation guard: removing ``_playerPostTick`` from the driven tick makes the
      final write A's raw value → the dominance assertion goes RED (so the proof
@@ -47,8 +43,6 @@ from pathlib import Path
 
 import pytest
 
-from converter.camera_facet_lowering import lower_camera_facet
-from converter.movement_facet_lowering import lower_movement_facet
 from tests._camera_input_harness import (
     CAMERA_INPUT_PATH,
     camera_input_preamble,
@@ -56,7 +50,6 @@ from tests._camera_input_harness import (
 )
 from tests.test_player_corpus_dominance import (
     HOST_RUNTIME_PATH,
-    _Script,
     _dominance_extra_setup,
     _embed,
     _grab,
@@ -77,28 +70,22 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _lower_fieldcam_production() -> tuple[str, int, int]:
-    """Lower the fieldcam fixture THE PRODUCTION WAY and return
-    ``(lowered_source, camera_count, move_count)``. The camera count MUST be 0
-    here (A's look-locator abstains on the field-aliased camera → the raw
-    ``self.cam.CFrame`` write survives) — that abstention is the whole point of
-    this shape."""
-    src = (_FIXTURES / "fieldcam_player.luau").read_text(encoding="utf-8")
-    s = _Script(src)
-    camera = lower_camera_facet([s], follow_character_paths=[s])
-    move = lower_movement_facet([s])
-    return s.luau_source, camera, move
+def _native_fieldcam_source() -> str:
+    """Return the NATIVE (un-lowered) fieldcam fixture source. Phase 5 deleted
+    paradigm A, so the field-aliased ``self.cam.CFrame`` write is the production
+    shape's OWN raw competitor (C dominates it); there is no lowering pass."""
+    return (_FIXTURES / "fieldcam_player.luau").read_text(encoding="utf-8")
 
 
-def _fieldcam_body(*, lowered_source: str, post_tick: bool) -> str:
-    """Scenario body: load the lowered fieldcam fixture, alias self.cam to the
+def _fieldcam_body(*, native_source: str, post_tick: bool) -> str:
+    """Scenario body: load the native fieldcam fixture, alias self.cam to the
     recording CurrentCamera via its Awake, map Rotate onto the component Update
     pass, build the real authority, drive one tick.
 
     ``post_tick`` controls whether the post-LateUpdate bracket
     (``_playerPostTick``) runs — set False for the mutation kill (proves the
     dominance is C's POST write, not coincidence)."""
-    fixture_lit = _embed(lowered_source, "fixture")
+    fixture_lit = _embed(native_source, "fixture")
     # When post_tick is False we override _playerPostTick to a no-op AFTER the
     # authority is built, simulating its removal (the mutation kill).
     mutation = (
@@ -119,12 +106,12 @@ def _fieldcam_body(*, lowered_source: str, post_tick: bool) -> str:
 
         local PlayerChunk = assert(loadstring(
             "return (function() " .. __FIXTURE_LIT__ .. " end)()",
-            "lowered_fieldcam"))
-        local LoweredPlayer = PlayerChunk()
-        assert(type(LoweredPlayer) == "table",
-            "lowered fixture must return its module table")
+            "native_fieldcam"))
+        local NativePlayer = PlayerChunk()
+        assert(type(NativePlayer) == "table",
+            "native fixture must return its module table")
 
-        -- The lowered A controller instance. It carries the rig + uis + the
+        -- The native fixture instance. It carries the rig + uis + the
         -- look-math fields the raw Rotate reads (sensitivity / min/max pitch).
         local rig = {}
         function rig:GetPivot() return CFrame.new(Vector3.new(0, 0, 0)) end
@@ -135,7 +122,7 @@ def _fieldcam_body(*, lowered_source: str, post_tick: bool) -> str:
             sensitivity = 1.0,
             minAngle = -80.0,
             maxAngle = 80.0,
-        }, LoweredPlayer)
+        }, NativePlayer)
         -- GetComponent is a host-injected method the runtime provides on a real
         -- component; stub it so the fixture's Awake (which fetches AudioSource /
         -- CharacterController) runs. The look path only needs self.cam.
@@ -144,16 +131,16 @@ def _fieldcam_body(*, lowered_source: str, post_tick: bool) -> str:
         -- Awake aliases self.cam = workspace.CurrentCamera (the RECORDING proxy),
         -- so the raw ``self.cam.CFrame = …`` write in Rotate lands in the ordered
         -- camera-write log — the SAME cell C writes via workspace.CurrentCamera.
-        LoweredPlayer.Awake(aComp)
+        NativePlayer.Awake(aComp)
         assert(aComp.cam ~= nil,
             "Awake must alias self.cam to workspace.CurrentCamera")
 
-        -- Map the lowered fixture's Rotate (the raw self.cam.CFrame competitor)
+        -- Map the native fixture's Rotate (the raw self.cam.CFrame competitor)
         -- onto the component Update pass so the real _tick pairs() loop drives it
         -- bracketed by the REAL _playerPreTick / _playerPostTick.
         local classTable = {}
         function classTable.Update(self, dt)
-            LoweredPlayer.Rotate(self, dt)
+            NativePlayer.Rotate(self, dt)
         end
 
         local plan = {modules = {
@@ -204,49 +191,44 @@ def _fieldcam_body(*, lowered_source: str, post_tick: bool) -> str:
 
 
 def _run_fieldcam(*, post_tick: bool):
-    lowered_source, camera, move = _lower_fieldcam_production()
+    native_source = _native_fieldcam_source()
     preamble = camera_input_preamble(
         mouse_deltas=[(0.0, 0.0)] * 3,
         # Drive forward so the raw Rotate's clamp path executes; no keys needed
         # for the camera-write competitor itself.
         extra_mock_setup=_dominance_extra_setup(keys_down=[]),
     )
-    body = _fieldcam_body(lowered_source=lowered_source, post_tick=post_tick)
+    body = _fieldcam_body(native_source=native_source, post_tick=post_tick)
     rc, out, err = run_camera_scenario(preamble, body)
-    return rc, out, err, camera, move
+    return rc, out, err
 
 
 class TestFieldcamDominance:
 
-    def test_lower_count_precondition(self) -> None:
-        # AC2.6.4 precondition: A's camera look-locator ABSTAINS on the
-        # field-aliased shape (camera == 0 → the raw self.cam.CFrame write
-        # survives). Move still lowers (1). A future locator change that starts
-        # lowering this shape fails HERE, loudly.
-        _src, camera, move = _lower_fieldcam_production()
-        assert camera == 0, (
-            f"fieldcam: A's look-locator must ABSTAIN (raw self.cam.CFrame "
-            f"survives); got camera={camera}"
-        )
-        assert move == 1, f"fieldcam: WASD body should still lower; got move={move}"
-        assert "self.cam.CFrame =" in _src, (
-            "the raw field-aliased camera write must survive lowering"
+    def test_native_fieldcam_writes_raw_camera(self) -> None:
+        # The field-aliased native shape writes the camera through ``self.cam``
+        # (aliased to workspace.CurrentCamera in Awake). Phase 5 deleted paradigm
+        # A, so this raw write is the production competitor C must dominate — not
+        # a lowered ``self._cam:step`` splice. Guard the shape-fact: the raw
+        # ``self.cam.CFrame =`` write is present in the source.
+        src = _native_fieldcam_source()
+        assert "self.cam.CFrame =" in src, (
+            "the raw field-aliased camera write must be present in the fixture"
         )
 
     def test_C_dominates_raw_fieldcam_camera_write(self) -> None:
-        # AC2.6.4: C is the LAST writer of workspace.CurrentCamera.CFrame even
-        # though the field-aliased A Rotate stomped self.cam.CFrame (same object)
+        # C is the LAST writer of workspace.CurrentCamera.CFrame even though the
+        # field-aliased native Rotate stomped self.cam.CFrame (same object)
         # mid-Update. Read off the ordered write log, NOT a string match.
-        rc, out, err, camera, move = _run_fieldcam(post_tick=True)
-        assert camera == 0, "fieldcam: precondition drift (look-locator lowered)"
+        rc, out, err = _run_fieldcam(post_tick=True)
         assert rc == 0, f"luau failed: {err}\n{out}"
 
-        # Non-vacuity: the raw A camera write ACTUALLY landed mid-pass (a yaw
-        # that is NOT C's), AND C's E2E-advanced yaw is distinctive (non-zero).
+        # Non-vacuity: the raw native camera write ACTUALLY landed mid-pass (a
+        # yaw that is NOT C's), AND C's E2E-advanced yaw is distinctive (non-zero).
         assert "ANYCAMWRITE=true" in out, f"no camera write logged\n{out}"
         assert "SAWRAWWRITE=true" in out, (
             f"the raw self.cam.CFrame write (yaw != C's) must land mid-pass — "
-            f"proves A is ACTIVE + dominance non-vacuous\n{out}"
+            f"proves the native write is ACTIVE + dominance non-vacuous\n{out}"
         )
         cyaw = _grab(out, "CYAW=")
         assert float(cyaw) != 0.0, (
@@ -263,17 +245,17 @@ class TestFieldcamDominance:
         # Mutation kill: WITHOUT the post-LateUpdate bracket, the raw A
         # self.cam.CFrame write is the LAST writer → the dominance assertion
         # would go RED. Proves the proof above is C's POST write, not coincidence.
-        rc, out, err, camera, _move = _run_fieldcam(post_tick=False)
-        assert camera == 0, "fieldcam: precondition drift"
+        rc, out, err = _run_fieldcam(post_tick=False)
         assert rc == 0, f"luau failed: {err}\n{out}"
         cyaw = _grab(out, "CYAW=")
         last = _grab(out, "LASTCAMYAW=")
-        # With _playerPostTick neutralized, C is NOT the last writer — the raw A
-        # write (yaw != C's) wins. This is the kill the real test guards against.
+        # With _playerPostTick neutralized, C is NOT the last writer — the raw
+        # native write (yaw != C's) wins. This is the kill the real test guards
+        # against.
         assert float(last) != float(cyaw), (
-            f"mutation: with no _playerPostTick the raw A write must be last "
+            f"mutation: with no _playerPostTick the raw native write must be last "
             f"(last yaw {last} should NOT equal C's {cyaw})\n{out}"
         )
         assert "SAWRAWWRITE=true" in out, (
-            f"mutation: the raw A write must still land mid-pass\n{out}"
+            f"mutation: the raw native write must still land mid-pass\n{out}"
         )

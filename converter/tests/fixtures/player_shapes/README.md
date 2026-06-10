@@ -12,17 +12,24 @@ re-prove a hand-coded surrogate.
 
 ## Provenance — two origin runs (2026-06-05)
 
-| fixture | origin run | paradigm-A result |
-|---------|-----------|-------------------|
-| `dde248_player.luau` | the **cached** dde248 SimpleFPS transpile | **A-HIT** |
-| `cold3a59_player.luau` | the **cold / uncached** cold3a59 SimpleFPS re-transpile | **A-MISS** |
+> **Phase 5 note:** paradigm A (`movement_facet_lowering.py` + the camera-facet
+> PLAYER path) has been DELETED. There is no longer an "A-HIT" / "A-MISS"
+> distinction at conversion time — every CC-identified player is owned by
+> paradigm C, and these fixtures' **native raw writes** are the competitor C
+> dominates. The two shapes still differ in WHAT they natively write (below),
+> which is why the C-dominance proof is per-fixture.
+
+| fixture | origin run | native competing writes |
+|---------|-----------|--------------------------|
+| `dde248_player.luau` | the **cached** dde248 SimpleFPS transpile | raw `cam.CFrame =` + `humanoid:Move(` + `humanoid.Jump = true` |
+| `cold3a59_player.luau` | the **cold / uncached** cold3a59 SimpleFPS re-transpile | raw `cam.CFrame =` + rig `:PivotTo` move (NO `Humanoid:Move`/`Jump`) |
 
 The conversion `output/` directory is **git-ignored** — the raw `Player.luau`
 artifacts these came from are NOT committed anywhere in the repo. These two
 files are therefore the **permanent copies**; there is no auto-regeneration
 path (the source artifacts can't be re-derived deterministically).
 
-### `dde248_player.luau` — the A-HIT shape
+### `dde248_player.luau` — native CAMERA + MOVE + JUMP shape
 
 Assembled VERBATIM from the inline fragments already in
 `tests/test_movement_facet_lowering.py` (`_AWAKE`, `_REAL_ROTATE`, `_REAL_MOVE`,
@@ -30,14 +37,17 @@ Assembled VERBATIM from the inline fragments already in
 raw output contains, all at once:
   - a direct `cam.CFrame = …` camera write (in `Rotate`),
   - a `humanoid:Move(` call (in `Move`),
+  - a `humanoid.Jump = true` write (in `Move`, on Space),
   - `_axis(Enum.KeyCode.D, …)`-style helper-wrapped WASD.
 
-**Load-bearing:** paradigm A NEUTRALIZES these native writes (A lowers the
-camera write to the service `step` and the WASD move to a host
-`Humanoid:Move`). So on an A-hit shape the competition C must dominate is the
-*lowered* camera write + `Humanoid:Move` — proven here as last-writer-wins.
+**Load-bearing:** these native raw writes (camera + `Humanoid:Move` + `Jump`)
+ARE the mid-pass competitor C must dominate. The C-dominance proof
+(`test_player_corpus_dominance.py`) runs the native `Rotate`/`Move` inside the
+real `_tick` brackets and proves C is the last writer of the camera CFrame, the
+`Humanoid:Move`, and the `Jump` — i.e. dde248 carries the **CAMERA + MOVE +
+JUMP** dominance proof.
 
-### `cold3a59_player.luau` — the A-MISS shape
+### `cold3a59_player.luau` — native CAMERA shape (PivotTo move)
 
 **Reconstructed** from the documented shape (design doc lines 31-33, 203):
   - `_getAxis`-wrapped WASD,
@@ -53,9 +63,10 @@ the `Update` method body, and a rig `:PivotTo(` move; the "no `Humanoid:Move`"
 invariant is checked SCOPED to the `Move` method body only, so it is not brittle
 against an incidental `:Move(` elsewhere.
 
-This is the shape that abstained BOTH PR #182 player-binding locators
-(fail-closed, no bind), so paradigm A misses it and the native camera write +
-rig `PivotTo` survive un-lowered.
+Historically this was the shape that abstained BOTH PR #182 player-binding
+locators (provenance; the locators were removed in slice 2.6). Post-Phase-5 there
+is no A to "miss" — the native camera write + rig `PivotTo` are simply the
+production shape, and C owns the camera.
 
 **Fidelity caveat (load-bearing to state):** because `output/` is git-ignored
 and the original cold3a59 artifact is GONE, this fixture's fidelity to the
@@ -68,10 +79,11 @@ invariant **"a `PivotTo`-move + cam-write shape is C-dominated on the camera
 surface"** — exact byte-level fidelity to the original cold3a59 is NOT
 load-bearing.
 
-**Load-bearing:** rig-`PivotTo` move → A misses → the C-dominance assertion is
-camera-dominance + benign/vestigial rig `PivotTo` drift (present but NOT
-contesting the camera), **NOT** a `Humanoid:Move` race — the rig drift is
-deferred to Phase 3 U1.
+**Load-bearing:** the native move is a rig `:PivotTo` (NOT `Humanoid:Move`), so
+cold3a59 has NO native `Humanoid:Move`/`Jump` to dominate. Its C-dominance proof
+is **CAMERA-surface only** (C is the last writer of the native `cam.CFrame =`);
+the rig `PivotTo` is benign/vestigial drift (present but NOT contesting the
+camera), deferred to Phase 3 U1. The move/jump dominance proof rides dde248.
 
 ## Drift guard
 
