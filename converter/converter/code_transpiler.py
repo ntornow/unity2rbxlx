@@ -47,6 +47,12 @@ class TranspiledScript:
     warnings: list[str] = field(default_factory=list)
     flagged_for_review: bool = False
     script_type: str = "Script"  # Script, LocalScript, ModuleScript
+    # True when the transpiler INTENTIONALLY emitted an inert component stub
+    # (a Roblox-dead visual helper or an empty subclass of a dead base). The
+    # generic contract's stub_strategy fail-close trusts this stamp instead of
+    # recomputing the visual-only verdict (which lacks the project context the
+    # empty-subclass-of-dead-base decision needs). See contract_pipeline.
+    intentional_inert_stub: bool = False
 
 
 @dataclass
@@ -144,6 +150,32 @@ def transpile_scripts(
     project_context = _build_project_context(script_infos)
     serialized_field_refs = serialized_field_refs or {}
 
+    from converter.roblox_dead_modules import is_empty_subclass_of_dead_base
+
+    # Project class-name -> source resolver for the empty-subclass-of-dead-base
+    # check. Maps a class to its UNIQUE source; a name that is unknown or
+    # collides (multiple files declare it) resolves to None so the check
+    # abstains. Sources are read lazily + cached (only base classes are looked
+    # up, not every script).
+    _class_paths: dict[str, list[Path]] = {}
+    for _info in script_infos:
+        if getattr(_info, "class_name", ""):
+            _class_paths.setdefault(_info.class_name, []).append(_info.path)
+    _base_source_cache: dict[str, str | None] = {}
+
+    def _resolve_class_source(class_name: str) -> str | None:
+        if class_name in _base_source_cache:
+            return _base_source_cache[class_name]
+        paths = _class_paths.get(class_name, [])
+        src: str | None = None
+        if len(paths) == 1:
+            try:
+                src = paths[0].read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                src = None
+        _base_source_cache[class_name] = src
+        return src
+
     # Phase 1: Classify scripts and read source
     pending_scripts: list[tuple[Any, str, str]] = []  # (info, csharp_source, script_type)
     for info in script_infos:
@@ -155,30 +187,55 @@ def transpile_scripts(
             result.total_failed += 1
             continue
 
-        # Auto-stub visual/rendering scripts that can't work in Roblox.
-        if _is_visual_only_script(script_path, csharp_source):
-            # A visual-only component class (e.g. a water-shader
-            # MonoBehaviour) is still routed through the generic contract,
+        # Auto-stub scripts that can't work in Roblox: a visual/rendering
+        # helper, OR an empty subclass of a Roblox-dead base.
+        is_generic_component = (
+            runtime_mode == "generic" and script_path in generic_paths
+        )
+        visual_only = _is_visual_only_script(script_path, csharp_source)
+        # An empty subclass of a dead base (e.g. ``GerstnerDisplace : Displace
+        # {}`` where Displace is a dead water-shader) has no rendering API of
+        # its own, so it misses the visual-only gate -- but it is just as dead.
+        # AI-transpiling it emits inheritance wiring (a module-scope ``require``
+        # of the now-stubbed base + ``setmetatable``) that intermittently trips
+        # the generic runtime contract (rules a/b) and fail-closes the build.
+        # Inert-stub it deterministically instead. Generic component only: the
+        # inert stub preserves the component identity the verdict needs, and
+        # legacy mode has no contract to satisfy (so its output is unchanged).
+        empty_subclass_dead = (
+            is_generic_component
+            and not visual_only
+            and is_empty_subclass_of_dead_base(
+                csharp_source, _resolve_class_source,
+            )
+        )
+        if visual_only or empty_subclass_dead:
+            # A component class is still routed through the generic contract,
             # so its stub must be a VALID inert ModuleScript: an empty class
             # table the host can ``require`` + instantiate harmlessly. The
             # legacy ``print(...)`` form returns nil, which (a) fails the
-            # contract's return rule and (b) throws when the host requires
-            # it. Non-generic / non-component visual scripts keep the plain
-            # legacy stub.
-            is_generic_component = (
-                runtime_mode == "generic" and script_path in generic_paths
-            )
+            # contract's return rule and (b) throws when the host requires it.
+            # Non-generic / non-component visual scripts keep the plain legacy
+            # stub. ``intentional_inert_stub`` tells contract_pipeline this
+            # ModuleScript stub is deliberate (so it is not fail-closed as an
+            # AI-fallthrough stub).
             if is_generic_component:
-                luau_source = _inert_component_stub(
-                    script_path.stem, "Unity visual/rendering effect (no Roblox equivalent)",
+                reason = (
+                    "Unity visual/rendering effect (no Roblox equivalent)"
+                    if visual_only
+                    else "empty subclass of a Roblox-dead base "
+                    "(no Roblox equivalent)"
                 )
+                luau_source = _inert_component_stub(script_path.stem, reason)
                 stub_script_type = "ModuleScript"
+                intentional_inert = True
             else:
                 luau_source = (
                     f'-- {script_path.stem}: Unity visual/rendering effect '
                     f'(no Roblox equivalent)\nprint("{script_path.stem} loaded")'
                 )
                 stub_script_type = "Script"
+                intentional_inert = False
             result.scripts.append(TranspiledScript(
                 source_path=str(script_path),
                 output_filename=script_path.stem + ".luau",
@@ -187,10 +244,15 @@ def transpile_scripts(
                 strategy="stub",
                 confidence=1.0,
                 script_type=stub_script_type,
+                intentional_inert_stub=intentional_inert,
             ))
             result.total_transpiled += 1
             result.total_rule_based += 1
-            log.info("  %s: auto-stubbed (visual/rendering only)", script_path.name)
+            log.info(
+                "  %s: auto-stubbed (%s)", script_path.name,
+                "visual/rendering only" if visual_only
+                else "empty subclass of dead base",
+            )
             continue
 
         script_type = _classify_script_type(csharp_source, info)

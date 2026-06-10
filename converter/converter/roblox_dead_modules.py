@@ -50,6 +50,7 @@ the static mapping tables); the public functions are pure.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from converter.api_mappings import API_CALL_MAP, TYPE_MAP
@@ -593,6 +594,93 @@ def is_input_side_dead(csharp_source: str) -> bool:
     if not csharp_source_has_rendering_api(csharp_source):
         return False
     return measure_input_coverage(csharp_source).dead_leaning
+
+
+# A LITERAL empty subclass declaration: ``class Foo : Bar { }`` with nothing
+# but whitespace between the braces, where ``Bar`` is a BARE identifier. A
+# dotted base (``Ns.Bar``), a generic base (``Base<T>``), a generic derived
+# class (``Foo<T> : Bar``), or a multi-base list (``Foo : Bar, IBaz``) do NOT
+# match and so abstain. Comments are stripped before the match, so a
+# ``{ /* note */ }`` body still reads empty.
+_EMPTY_SUBCLASS_DECL = re.compile(r"\bclass\s+(\w+)\s*:\s*(\w+)\s*\{\s*\}")
+# Counts EVERY type-like declaration so a file mixing the empty subclass with
+# another type (incl. ``record`` / ``delegate``, which a class/struct/interface/
+# enum-only set would miss) abstains rather than stubbing away the sibling.
+_TYPE_DECL_KEYWORD = re.compile(
+    r"\b(?:class|struct|interface|enum|record|delegate)\b"
+)
+_PARTIAL_KEYWORD = re.compile(r"\bpartial\b")
+
+
+def _empty_subclass_base(csharp_source: str) -> str | None:
+    """The immediate base-class name of a LITERAL empty subclass
+    (``class X : Base {}`` -- only whitespace between the braces), else None.
+
+    Conservative -- abstains (None) unless ALL hold:
+      * the file declares EXACTLY ONE type and it is the matched empty subclass
+        (a file that also declares a non-empty type is not a pure empty
+        subclass);
+      * the base is a BARE identifier (a dotted ``Ns.Base`` could collapse to an
+        unrelated same-named class, and a generic base does not parse cleanly);
+      * the declaration is NOT ``partial`` (a partial class can carry behavior
+        in a sibling file this single-source view cannot see).
+    """
+    src = _strip_csharp_comments(csharp_source)
+    if _PARTIAL_KEYWORD.search(src):
+        return None
+    matches = _EMPTY_SUBCLASS_DECL.findall(src)
+    if len(matches) != 1:
+        return None
+    if len(_TYPE_DECL_KEYWORD.findall(src)) != 1:
+        return None
+    return matches[0][1]
+
+
+def is_empty_subclass_of_dead_base(
+    csharp_source: str,
+    resolve_class_source: Callable[[str], str | None],
+) -> bool:
+    """True iff ``csharp_source`` is a LITERAL empty subclass whose base chain
+    terminates in an ``is_input_side_dead`` ancestor.
+
+    ``resolve_class_source(name)`` returns the UNIQUE C# source for a project
+    class ``name``, or None when the name is unknown OR ambiguous (collides) --
+    in which case this abstains (False). The base chain is walked transitively
+    (``A : B``, ``B : C`` where only ``C`` is the rendering helper) with a cycle
+    guard; a base with a real (non-empty) body that is not itself input-side-
+    dead terminates the walk as NOT dead.
+
+    Conservative by construction: any unknown / colliding / cyclic base, a
+    generic base, or any non-empty subclass body yields False. An empty subclass
+    adds no Roblox behavior of its own -- only component identity, which the
+    inert stub preserves -- so inheriting the base's dead verdict is safe. This
+    is the input-side companion to the same destructive-stub safety contract as
+    ``is_input_side_dead`` (the decisive authority remains the output-side D3
+    verdict in ``classify_module_dead``).
+
+    KNOWN RESIDUAL (name-based, like the rest of the converter): resolution is
+    by UNQUALIFIED ``class_name``. A pathological project that BOTH imports a
+    same-named live type (``using Vendor.Graphics;`` providing ``WaterFx``) AND
+    has a unique project-local dead ``WaterFx`` would mis-bind the bare base to
+    the local dead class and inert-stub a live subclass. This needs a name
+    collision between a package type and a project-local dead class; the bundled
+    corpora have no such collision (verified). Disambiguating it requires real
+    C# symbol resolution, which the converter does not do anywhere -- a future
+    AST/symbol-aware pass could tighten it.
+    """
+    base = _empty_subclass_base(csharp_source)
+    seen: set[str] = set()
+    while base is not None:
+        if base in seen:
+            return False  # cycle -> abstain
+        seen.add(base)
+        base_source = resolve_class_source(base)
+        if base_source is None:
+            return False  # unknown / ambiguous -> abstain
+        if is_input_side_dead(base_source):
+            return True
+        base = _empty_subclass_base(base_source)
+    return False
 
 
 # ---------------------------------------------------------------------------

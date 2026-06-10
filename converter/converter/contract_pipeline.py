@@ -604,13 +604,24 @@ def transpile_with_contract(
         # contract on stub output; ``auto`` mode must treat this as a
         # fail-closed signal to fall back to legacy.
         #
-        # EXCEPTION: a visual-only script (water shader, particle visual)
-        # has no Roblox equivalent and is INTENTIONALLY stubbed -- in
-        # generic mode that stub is a contract-valid inert ModuleScript
-        # (see ``_inert_component_stub``), so it is a legitimate terminal
-        # state, not an AI failure. Only genuine fallthrough fails closed.
-        if script.strategy != "ai" and not _is_visual_only_script(
-            Path(script.source_path), script.csharp_source,
+        # EXCEPTION: an INTENTIONALLY inert-stubbed component (a visual-only
+        # water-shader / particle helper, OR an empty subclass of a dead base)
+        # is a contract-valid inert ModuleScript (see ``_inert_component_stub``),
+        # so it is a legitimate terminal state, not an AI failure. The
+        # transpiler stamps ``intentional_inert_stub`` for those -- trust the
+        # stamp (the empty-subclass verdict needs project context this site
+        # lacks; recomputing ``_is_visual_only_script`` here would miss it and
+        # turn a clean stub into a spurious stub_strategy fail-close). The
+        # ``_is_visual_only_script`` recompute is retained as a backstop for any
+        # stub path that predates the stamp. Only genuine fallthrough fails
+        # closed.
+        intentional_stub = getattr(script, "intentional_inert_stub", False)
+        if (
+            script.strategy != "ai"
+            and not intentional_stub
+            and not _is_visual_only_script(
+                Path(script.source_path), script.csharp_source,
+            )
         ):
             fail_closed.append(FailClosed(
                 kind="stub_strategy",
