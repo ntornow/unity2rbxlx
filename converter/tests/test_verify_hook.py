@@ -160,10 +160,10 @@ class TestBootHealthVerdict:
             assert verify_hook.boot_health_failed(status) is True
 
 
-def test_player_bind_documented_red_at_baseref():
-    # Phase-1 contract: the player-bind axis is NON-required (documented-red).
-    # Phase-2 flips this to True alongside REQUIRE_PLAYER_BIND=1 in CI.
-    assert verify_hook.REQUIRE_PLAYER_BIND is False
+def test_player_bind_required_after_phase5_flip():
+    # Phase-5 contract (Step-1b): paradigm C binds the player, so the player-bind
+    # axis is REQUIRED. Flipped True here alongside REQUIRE_PLAYER_BIND=1 in CI.
+    assert verify_hook.REQUIRE_PLAYER_BIND is True
 
 
 class TestStudioAvailableMatchesLaunchedBinary:
@@ -334,19 +334,40 @@ class TestRunVerifyHookCliWiring:
             u2r._run_verify_hook(tmp_path, verify=True, verify_scene=None)
         assert exc.value.code == 1
 
-    def test_documented_red_bind_passes_when_boot_health_green(
+    def test_required_bind_absent_exits_when_boot_health_green(
         self, monkeypatch, tmp_path,
     ):
         import u2r
 
-        assert verify_hook.REQUIRE_PLAYER_BIND is False
+        # Phase-5 contract: bind REQUIRED. Boot/health green but bind ABSENT
+        # -> SystemExit(1) (the acceptance gate; never a masked boot error, E3).
+        assert verify_hook.REQUIRE_PLAYER_BIND is True
         monkeypatch.setattr(verify_hook, "studio_available", lambda: True)
         (tmp_path / "main.rbxlx").write_text("x")
-        # Boot/health green but bind absent: documented-red -> NO SystemExit.
         monkeypatch.setattr(
             "smoke_test.run_smoke_test",
             lambda **kw: self._stub_report(
                 status="pass", wasd_works=False, mouse_moves_view=False,
+            ),
+        )
+        with pytest.raises(SystemExit) as exc:
+            u2r._run_verify_hook(tmp_path, verify=True, verify_scene=None)
+        assert exc.value.code == 1
+
+    def test_required_bind_present_passes_when_boot_health_green(
+        self, monkeypatch, tmp_path,
+    ):
+        import u2r
+
+        # Companion to the above (AC5.8): boot/health green AND bind PRESENT
+        # -> NO SystemExit (a fully C-bound player is the accepted state).
+        assert verify_hook.REQUIRE_PLAYER_BIND is True
+        monkeypatch.setattr(verify_hook, "studio_available", lambda: True)
+        (tmp_path / "main.rbxlx").write_text("x")
+        monkeypatch.setattr(
+            "smoke_test.run_smoke_test",
+            lambda **kw: self._stub_report(
+                status="pass", wasd_works=True, mouse_moves_view=True,
             ),
         )
         u2r._run_verify_hook(tmp_path, verify=True, verify_scene=None)

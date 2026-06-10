@@ -422,16 +422,14 @@ jobs:
       # Path to the populated SimpleFPS Unity project on the self-hosted
       # runner (same as smoke-test — checkout uses submodules: false).
       UNITY_SIMPLEFPS_DIR: /Users/jiazou/workspace/unity-3d-simplefps
-      # PHASE-1 → PHASE-2 FLIP POINT. Default "0" in Phase 1: the player-bind
-      # axis (wasd_works / mouse_moves_view) is wired + recorded but
-      # documented-red (a clean-boot bind-absence is a ::warning::, NOT a gate
-      # failure) — there is no self.host.player authority yet to drive it.
-      # Phase 2 builds that authority and FLIPS this to "1" (the only change:
-      # this value 0→1, see the "Player-bind axis" step). At "1" a false bind
-      # field becomes ::error:: + non-zero exit, i.e. the required Phase-2
-      # acceptance gate. The BOOT/HEALTH axis is REQUIRED-GREEN regardless of
-      # this knob (it gates off u2r.py smoke-test's exit code below).
-      REQUIRE_PLAYER_BIND: "0"
+      # FLIPPED "1" in Phase 5 (Step-1b): the player-bind axis (wasd_works /
+      # mouse_moves_view) is the required acceptance gate now that paradigm C
+      # binds the player on the deterministic upstream _HasCharacterController
+      # signal (verified C-owned on a fresh cold-Studio conversion with paradigm
+      # A deleted). At "1" a false bind field is ::error:: + non-zero exit. The
+      # BOOT/HEALTH axis is REQUIRED-GREEN regardless of this knob (it gates off
+      # u2r.py smoke-test's exit code below).
+      REQUIRE_PLAYER_BIND: "1"
     defaults:
       run:
         working-directory: converter
@@ -581,19 +579,13 @@ jobs:
             esac
           done
 
-      - name: Player-bind axis (REQUIRE_PLAYER_BIND knob — Phase-2 flip point)
-        # Documented-red in Phase 1 (REQUIRE_PLAYER_BIND=0): the player-bind
-        # signals are recorded + surfaced but a clean-boot bind-absence is a
-        # ::warning::, not a failure — there is no self.host.player authority
-        # yet to drive them. This step runs only after the BOOT/HEALTH gate
-        # above passed, so status is "pass" (Studio booted clean); a false
-        # wasd_works / mouse_moves_view here is "booted, bind-not-required",
-        # never a masked boot error (E3).
-        #
-        # >>> PHASE-2 FLIP: set the job-level env REQUIRE_PLAYER_BIND from
-        #     "0" → "1" (above). Nothing else in this file changes. At "1" a
-        #     false bind field below becomes ::error:: + exit 1, turning this
-        #     into the required Phase-2 acceptance gate. <<<
+      - name: Player-bind axis (REQUIRE_PLAYER_BIND knob — Phase-5 required gate)
+        # FLIPPED to required in Phase 5 (REQUIRE_PLAYER_BIND=1): paradigm C
+        # binds the player, so a clean-boot bind-absence is now an ::error:: +
+        # exit 1 (the acceptance gate), not a warning. This step runs only after
+        # the BOOT/HEALTH gate above passed, so status is "pass" (Studio booted
+        # clean); a false wasd_works / mouse_moves_view here is "booted but
+        # player not C-bound", never a masked boot error (E3).
         env:
           SMOKE_OUT: smoke_output/SimpleFPS_cold_e2e
         run: |
@@ -613,7 +605,7 @@ jobs:
             field="${pair%%:*}"; val="${pair##*:}"
             if [ "$val" != "true" ]; then
               if [ "$REQUIRE_PLAYER_BIND" = "1" ]; then
-                echo "::error::Player-bind required but $field=$val (Phase-2 require-bind gate)."
+                echo "::error::Player-bind required but $field=$val (Phase-5 require-bind gate)."
                 fail=1
               else
                 echo "::warning::Player-bind $field=$val — documented-red in Phase 1 (REQUIRE_PLAYER_BIND=0); non-fatal."

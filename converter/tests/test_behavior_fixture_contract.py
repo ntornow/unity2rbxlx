@@ -1,6 +1,6 @@
 """
 test_behavior_fixture_contract.py -- structural guard that the SimpleFPS
-behavior fixtures the Studio gate / Phase-2 require-bind flip depend on
+behavior fixtures the Studio gate / Phase-5 require-bind flip depend on
 stay present and schema-valid.
 
 This is a cheap, no-Studio unit (Phase-1 design §2.2c): a fixture
@@ -18,8 +18,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from tests.studio_behavior_driver import _project_path, main  # noqa: E402
 from tests.studio_behavior_runner import load_fixtures  # noqa: E402
 
-# The player-bind fixtures the Phase-2 REQUIRE_PLAYER_BIND flip will
-# require (design §2.2c "Real fixture IDs").
+# The player-bind fixtures the Phase-5 REQUIRE_PLAYER_BIND flip
+# requires (design §2.2c "Real fixture IDs").
 _PLAYER_BIND_IDS = frozenset({
     "wasd_w_moves_forward",
     "mouse_yaw_rotates_camera",
@@ -46,7 +46,7 @@ def test_validate_simplefps_passes():
 
 
 def test_player_bind_fixture_ids_present():
-    """The player-bind fixtures the Phase-2 flip requires are present."""
+    """The player-bind fixtures the Phase-5 flip requires are present."""
     ids = _simplefps_ids()
     missing = _PLAYER_BIND_IDS - ids
     assert not missing, f"player-bind fixtures missing from SimpleFPS: {sorted(missing)}"

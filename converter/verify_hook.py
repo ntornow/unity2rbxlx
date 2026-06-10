@@ -16,10 +16,12 @@ Off otherwise (headless Linux CI, the plain CLI path). The platform/Studio
 check gates BEFORE ``run_smoke_test`` is called, so non-macOS auto-mode never
 calls it and gets a spurious ``status="error"``.
 
-Documented-red bind axis: at baseRef there is no ``self.host.player`` authority,
-so the player-bind fields (``wasd_works`` / ``mouse_moves_view``) are recorded
-but NON-fatal — mirroring the CI gate's ``REQUIRE_PLAYER_BIND=0``. The Phase-2
-flip sets ``REQUIRE_PLAYER_BIND=1`` here and in the workflow.
+Player-bind acceptance gate: paradigm C binds the player on the deterministic
+upstream ``_HasCharacterController`` signal, so the player-bind fields
+(``wasd_works`` / ``mouse_moves_view``) are FATAL — an unbound player fails the
+hook. Flipped in Phase 5 (Step-1b) alongside ``REQUIRE_PLAYER_BIND=1`` in the
+workflow, after a fresh cold-Studio conversion proved camera+WASD+jump+shoot+
+respawn all C-owned with paradigm A deleted.
 """
 
 from __future__ import annotations
@@ -30,9 +32,11 @@ from pathlib import Path
 
 import config
 
-# Phase-1 documented-red: the player-bind axis is NON-fatal. Phase-2 flips this
-# to True (the single named change, mirroring REQUIRE_PLAYER_BIND 0->1 in CI).
-REQUIRE_PLAYER_BIND: bool = False
+# Player-bind acceptance gate — FLIPPED True in Phase 5 (Step-1b): paradigm C
+# binds the player (camera/WASD/jump/shoot/respawn) on the deterministic upstream
+# _HasCharacterController signal, verified C-owned on a fresh cold-Studio
+# conversion with paradigm A deleted. An unbound player now fails the hook.
+REQUIRE_PLAYER_BIND: bool = True
 
 
 def studio_available() -> bool:
