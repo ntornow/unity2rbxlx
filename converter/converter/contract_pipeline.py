@@ -448,21 +448,19 @@ def transpile_with_contract(
     _apply_require_resolutions(transpilation.scripts, require_resolutions)
 
     # Camera-facet lowering (allowlisted deterministic lowering pass, PR5):
-    # route a flattened first-person controller's look math onto the
-    # SceneCameraInput runtime service so generic-mode FPS games yaw, not just
-    # pitch. Structure-gated, never per-game; see camera_facet_lowering.py and
-    # docs/design/camera-input-fidelity-plan.md.
+    # route a flattened first-person DRONE/TURRET controller's look math onto
+    # the SceneCameraInput runtime service so generic-mode FPS games yaw, not
+    # just pitch. Structure-gated, never per-game; see camera_facet_lowering.py
+    # and docs/design/camera-input-fidelity-plan.md. The PLAYER is owned by
+    # paradigm C (the deterministic host authority in scene_runtime.luau, keyed
+    # on the upstream ``has_character_controller`` signal), so the player script
+    # is EXCLUDED from this pass (§3) -- it is never the camera/move writer here.
     # Player identity comes from the DETERMINISTIC UPSTREAM Unity signal (the
     # planner's per-module ``has_character_controller``), NOT a fingerprint of
     # the transpiled output -- the latter abstained silently on AI shape
     # variance, decoupling camera/movement/character (the systemic bug this
-    # closes). ``find_player_controllers`` fail-closes (``[]``) on 0 or >1
+    # closes). ``_player_controller_paths`` fail-closes (``∅``) on 0 or >1
     # distinct CC-scripts.
-    from converter.movement_facet_lowering import (
-        find_player_controllers,
-        lower_movement_facet,
-    )
-    players = find_player_controllers(transpilation.scripts, modules)
     # Surface upstream player identity that did NOT cleanly bind, rather than
     # abstaining silently. ``cc_module_count`` is the number of distinct
     # CC-bearing scripts the planner saw on placed GameObjects.
@@ -495,6 +493,16 @@ def transpile_with_contract(
                 "runtime (re-convert) so the signal is stamped."
             ),
         ))
+    # Re-source the player_unresolved fail-close on the POST-transpile
+    # intersection (P1-c): ``player_controller_paths`` is keyed off the
+    # PRE-transpile ``script_infos``; a player ``.cs`` that fails to read is
+    # dropped from ``transpilation.scripts`` but stays in ``script_infos``.
+    # Intersecting with the emitted paths restores the deleted
+    # ``find_player_controllers`` POST-transpile fail-close: a transpile-dropped
+    # player script => empty intersection => player_unresolved.
+    emitted_player_paths = player_controller_paths & {
+        Path(s.source_path) for s in transpilation.scripts
+    }
     if cc_module_count > 1:
         player_fail_closed.append(FailClosed(
             kind="player_ambiguous",
@@ -505,7 +513,7 @@ def transpile_with_contract(
                 f"no controller was bound."
             ),
         ))
-    elif cc_module_count == 1 and not players:
+    elif cc_module_count == 1 and not emitted_player_paths:
         player_fail_closed.append(FailClosed(
             kind="player_unresolved",
             detail=(
@@ -516,19 +524,18 @@ def transpile_with_contract(
         ))
 
     from converter.camera_facet_lowering import lower_camera_facet
+    # Exclude the player (keyed on the deterministic upstream identity) from
+    # camera-facet lowering -- paradigm C owns the player camera; this pass is
+    # drone/turret-only (P1-a). Filtering by ``player_controller_paths`` (not an
+    # AI fingerprint) means a strict-match player look method is never spliced.
     lowered = lower_camera_facet(
-        transpilation.scripts, follow_character_paths=players,
+        [s for s in transpilation.scripts
+         if Path(s.source_path) not in player_controller_paths]
     )
     if lowered:
         log.info("[contract] camera-facet lowering routed %d controller(s) "
                  "to SceneCameraInput", lowered)
 
-    # Movement-facet lowering: retarget the identified player controller's WASD
-    # method from the vestigial scene rig onto the character's Humanoid:Move.
-    moved = lower_movement_facet(players)
-    if moved:
-        log.info("[contract] movement-facet lowering retargeted %d player "
-                 "controller(s) to the character Humanoid", moved)
     # NOTE: paradigm C (the deterministic host authority in scene_runtime.luau,
     # keyed on the upstream ``has_character_controller`` signal) now binds BOTH
     # look and move for every CC-identified player, OUTSIDE the transpiled
