@@ -403,7 +403,14 @@ class TestTranspileWithContractDynamic:
         }
         return proj, infos, scene_runtime
 
-    def _capture(self, monkeypatch, player_luau: str):
+    def _capture(self, monkeypatch, player_luau: str,
+                 flags: dict[str, bool] | None = None):
+        """Capture the per-class ``project_context`` (returned) AND, when
+        ``flags`` is provided, the per-class backend ``is_player_controller``
+        kwarg into it. The directive append and the flag are threaded
+        INDEPENDENTLY in production (code_transpiler.py:303-323), so a
+        regression that drops/inverts the flag while still appending the
+        directive must be caught here — not only by the context substring."""
         monkeypatch.setattr(code_transpiler, "_find_transpiler",
                             lambda: "anthropic_api")
         captured: dict[str, str] = {}
@@ -412,6 +419,8 @@ class TestTranspileWithContractDynamic:
                     script_type="Script", project_context="",
                     runtime_mode="legacy", is_player_controller=False):
             captured[class_name] = project_context
+            if flags is not None:
+                flags[class_name] = is_player_controller
             luau = player_luau if class_name == "Player" else (
                 f"local {class_name} = {{}}\nreturn {class_name}\n"
             )
@@ -429,7 +438,8 @@ class TestTranspileWithContractDynamic:
         the targeting is computed by the REAL ``_player_controller_paths``
         inside ``transpile_with_contract`` (NOT a hand-passed kwarg)."""
         proj, infos, scene_runtime = self._make_project(tmp_path)
-        captured = self._capture(monkeypatch, self._PLAYER_LUAU)
+        flags: dict[str, bool] = {}
+        captured = self._capture(monkeypatch, self._PLAYER_LUAU, flags=flags)
 
         transpile_with_contract(
             unity_project_path=proj,
@@ -444,6 +454,17 @@ class TestTranspileWithContractDynamic:
         )
         assert _PLAYER_CONTROLLER_DIRECTIVE not in captured["HUD"], (
             "directive leaked into the non-player dependent."
+        )
+        # The directive append and the backend ``is_player_controller`` flag
+        # are threaded INDEPENDENTLY (code_transpiler.py:303-323). A regression
+        # that still appends the directive but drops/inverts the flag on the
+        # cold AI path must go RED here, not stay green on the context check.
+        assert flags["Player"] is True, (
+            "is_player_controller must be True for the player on the cold "
+            "AI path — production threads it alongside the directive."
+        )
+        assert flags["HUD"] is False, (
+            "is_player_controller must be False for the non-player (HUD)."
         )
 
     def test_abstains_when_two_cc_modules_through_real_pipeline(
