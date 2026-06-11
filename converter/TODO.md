@@ -8,6 +8,8 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
 
 ## Pipeline / runtime gaps
 
+- [ ] **P1 — Generic-mode SimpleFPS canary failures (dual-voice investigation 2026-06-11; NOT Step-1b regressions).** See `docs/design/scene-runtime-pr5-8-recut-plan.md` §"The canary failures" — the PR5 canary gate (SimpleFPS plays under generic). Slices: **T** turret child-index lowering from a stronger signal than AI-output text (turret won't spin/fire); **T-bullet** nil-parent→workspace default in the `instantiatePrefab` clone service (bullets never enter the DataModel); **R** generic `weaponSlot` rebind (rifle not held); **D** door dynamic-Animator-driver narrowing (`pr148-followups`); **H** HudControl client-domain rule. Highest leverage: Slice T (+ T-bullet) clears the turret. File:line evidence in the Step-1b run ledger.
+
 - [x] **P1 — Shared-flag name sanitization is unowned (pre-existing; surfaced by Phase 2b reframe, 2026-06-01).** FIXED 2026-06-02 (`fix/shared-flag-name-sanitization`, PR #165): canonical ASCII sanitizer applied at the runtime `"has" .. name` concat (emitted Luau `gsub("[^%w_]+","_")` from one constant in `core/flag_names.py`) at every writer + the Machine dynamic reader; `itemName`/`ItemType` kept RAW (gameplay payloads); scan made ASCII-explicit. See `docs/design/shared-flag-name-sanitization-brief.md`.
   The generator builds the shared-flag attribute name as `"has" .. itemName`
   with NO sanitization (`code_transpiler` `_GENERIC_RUNTIME_PROMPT`,
