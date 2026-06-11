@@ -112,6 +112,12 @@ the emitter and runtime both read.
 > tagged in the Maturity column. Scope note: `scene-runtime-architecture-ir.md` is *deployment topology*
 > and explicitly fences off "becoming a general semantic IR"; these relations are the semantic layer it
 > declines to own, governed by the same rule but admitted under this discipline.
+>
+> **HOW each relation is enforced** (the per-relation fact → output shape → enforcement-mode contract) lives in
+> [`gameplay-ir-obligation-schema.md`](gameplay-ir-obligation-schema.md). The durability rule it adds: a fact is
+> made *impossible to get wrong* (PRE-REWRITE / LOAD-BEARING TOKEN) or *loud when wrong* (FAIL-CLOSED VERIFIER) —
+> never silently repaired. Boundary: reference/identity/placement → no verifier; behavioral (#1) + bilateral
+> cross-script (#5/#6) → verifier mandatory.
 
 | # | Relation | Upstream signal | Mechanism (mode) | Retires | Maturity |
 |---|----------|-----------------|------------------|---------|----------|
@@ -123,9 +129,11 @@ the emitter and runtime both read.
 | 1 | **callback-kind** `callback(script,method)=TRIGGER_STAY` | the C# method signature `void OnTriggerStay(Collider)` | host schedules the stay-poll for that method | `trigger_stay_lowering` (keys on a `-- OnTriggerStay` comment), `trigger_stay_polling`+`v2` packs | **CANDIDATE** |
 | 2 | **child/path-ref** `child_ref(Turret,0)=GameObject#Base` | `transform.GetChild(0)`/`Find("Weapon")` vs the parsed prefab hierarchy | IR carries the resolved instance; no ordinal lookup emitted | `child_index_lowering`, `turret_canonical_spatial_child`, `unity_transform_child_index` | **CANDIDATE** (partial: Phase-3 verifier check B) |
 | 8 | **projectile/physics-semantics** `projectile(TurretBullet,launch=AddRelativeForce)` | the prefab is Instantiated + Rigidbody-launched (projectile-vs-recoil is indistinguishable at OUTPUT level) | route through a host projectile primitive (stud velocity + anti-gravity + raycast) | `bullet_physics_raycast` (rung-1, name-gated, absent from generic = coverage gap) | **CANDIDATE** (needs its own design) |
+| 9 | **dynamic-component-ref → driver-domain** `driver(Door.open)=client Animator MB` | a dynamic `GetComponent<Animator>()` (no serialized ref) + C# param-writes (`SetBool`/`SetTrigger`) matched to the clip's `observed_attribute` | resolve the driver → place the generated Anim script in the writer's domain; cross-domain verifier backstops | per-project animation-driver `domain_overrides`; the `animation_routing` serialized-only resolution gap | **CANDIDATE** (door-scoped, 2026-06-11 PR #188; other animation drivers fail for different reasons) |
 
-Workstream mapping: **#3, #4, #1, #2, #8 feed Workstream 1** (host runtime primitives — the player fix is
-#3+#4); **#5, #6 feed Workstream 2** (upstream contract synthesis); **#7 is built**.
+Workstream mapping: **#3, #4, #1, #2, #8, #9 feed Workstream 1** (host runtime primitives / placement — the player
+fix is #3+#4); **#5, #6 feed Workstream 2** (upstream contract synthesis); **#7 is built**. Enforcement contract
+for all relations: [`gameplay-ir-obligation-schema.md`](gameplay-ir-obligation-schema.md).
 
 ---
 
@@ -189,6 +197,7 @@ Two latent bugs the audit surfaced (both consumed by the player fix): `SceneCame
 | Generic-runtime MECHANISM (6-piece contract, modes, prompt, verifier rules) | `scene-runtime-contract.md` | authoritative (mechanism layer) |
 | Deployment-topology authority (domain/class/container/cross-domain edges) + the contract-verifier hook/boundary (the verifier CHECK SPECS live in the execution-log Phase 3 section) | `scene-runtime-architecture-ir.md` | **mostly shipped** (Phases 1/2a, 2b-core, Phase 3 verifier on upstream/main as of 2026-06-03); Phase-2b legacy-pack-retirement tail pending. Topology only. |
 | Phase ledger / per-slice status / testing / sequencing / revision history (Workstream 2 execution) | `scene-runtime-execution-log.md` | living status log (companion to the IR doc) |
+| Gameplay-IR relation **enforcement** (per-relation fact → output shape → mode: pre-rewrite / token / verifier) | `gameplay-ir-obligation-schema.md` | design-of-record (companion to §3 catalog) |
 | Domain classifier signal taxonomy | `scene-runtime-domain-signals.md` | in-flight |
 | Camera + embodiment (player↔character) | `camera-input-fidelity-plan.md` | mostly shipped (worked example for #3/#4) |
 | `self.host.player` embodiment authority (next runtime primitive) | `player-embodiment-authority-design.md` | converged, not built |
@@ -203,7 +212,7 @@ Two latent bugs the audit surfaced (both consumed by the player fix): `SceneCame
 
 ## 7. How these docs drive implementation + suggested order
 
-**Per-work-item workflow:** (1) start HERE — identify the relation (#1–#8), workstream, and rung, and
+**Per-work-item workflow:** (1) start HERE — identify the relation (#1–#9; #9 is candidate), workstream, and rung, and
 confirm the guardrail (*the fix must not add a rung-2b matcher for a rung-3 subsystem*); (2) go to the
 detail doc this points you to (Workstream-1 host primitive → `scene-runtime-contract.md` + the piece's
 design e.g. `player-embodiment-authority-design.md`; Workstream-2 contract synthesis →
