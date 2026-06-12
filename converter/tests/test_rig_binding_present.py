@@ -669,3 +669,163 @@ def test_review_r3_corpus_happy_path_still_discharges() -> None:
     assert "function Player:_resolveWeaponSlot()" in green.luau_source
     assert _rig_has_surviving_ordinal_write(green.luau_source, "weaponSlot") is False
     assert _rig_binding_discharged(green.luau_source, "weaponSlot", "WeaponSlot") is True
+
+
+# ---------------------------------------------------------------------------
+# Dual-voice REVIEW finding (round 4) — METHOD-SPAN block-balance. The
+# ``_rig_method_body_end`` scanner counted every ``then`` as a fresh opener but
+# ``end``/``until`` as the only closers, so an ``if ... elseif ... elseif ... end``
+# chain (multiple ``then``, ONE ``end``) over-counted openers and the span walked
+# PAST the foreign stub's closing ``end`` into later unrelated code — sweeping a
+# later decoy helper carrying the ``_MainCameraRig``/``FindFirstChild`` markers into
+# the "method body", false-discharging a FOREIGN stub (REOPENS the round-1 foreign-
+# stub closure). The fix mirrors S1's ``_structural_balance_ok``: ``elseif`` is a
+# CLOSER that cancels its own upcoming ``then`` (net 0 for the chain); ``else`` is a
+# pure +0. Each case below is RED against bb288b6 (the round-3 verifier).
+# ---------------------------------------------------------------------------
+def _foreign_stub_with_body(stub_body: str) -> str:
+    """The real lowered Player output with ONLY the resolver method BODY replaced by
+    ``stub_body`` (a foreign body, NO rig markers) AND a later DECOY helper carrying
+    the ``_MainCameraRig`` + ``FindFirstChild("WeaponSlot", true)`` markers spliced
+    before ``return Player``. The call sites + neutralized write stay intact, so the
+    ONLY thing preventing discharge is the span correctly ending at the foreign
+    stub's own ``end`` (not overrunning into the decoy)."""
+    green = _lower()
+    foreign = re.sub(
+        r"function Player:_resolveWeaponSlot\(\).*?\nend\n",
+        "function Player:_resolveWeaponSlot()\n" + stub_body + "end\n",
+        green.luau_source,
+        flags=re.S,
+    )
+    assert "function Player:_resolveWeaponSlot()" in foreign
+    assert "self:_resolveWeaponSlot()" in foreign  # call sites intact
+    assert "self.weaponSlot = nil" in foreign  # neutralized write intact
+    decoy = (
+        "function Player:DecoyHelper()\n"
+        "    local rig\n"
+        "    for _, m in workspace:GetDescendants() do\n"
+        '        if m:GetAttribute("_MainCameraRig") then rig = m end\n'
+        "    end\n"
+        '    return rig and rig:FindFirstChild("WeaponSlot", true)\n'
+        "end\n"
+    )
+    foreign = foreign.replace("return Player\n", decoy + "return Player\n")
+    # The decoy carries the markers the stub body lacks — proving the markers found
+    # by a span overrun would belong to the decoy, not the stub.
+    assert 'GetAttribute("_MainCameraRig")' in foreign
+    assert "DecoyHelper" in foreign
+    return foreign
+
+
+def test_review_r4_elseif_chain_stub_does_not_overrun_into_decoy() -> None:
+    """ROUND-4 BLOCKING — a foreign ``_resolveWeaponSlot`` stub whose body is an
+    ``if/elseif/elseif/end`` chain (3 ``then``, 1 ``end``) must NOT make the method-
+    span scanner over-count openers and walk past its closing ``end`` into the later
+    decoy helper. The span ends at the stub's own ``end`` -> the decoy's rig markers
+    are NOT in the method body -> the foreign stub FAILS CLOSED (discharged=False).
+    RED against bb288b6: the span overran, the decoy's markers were swept in, and
+    the foreign stub false-discharged True."""
+    foreign = _foreign_stub_with_body(
+        "    local x = 1\n"
+        "    if x == 1 then\n"
+        "        return nil\n"
+        "    elseif x == 2 then\n"
+        "        return nil\n"
+        "    elseif x == 3 then\n"
+        "        return nil\n"
+        "    end\n"
+        "    return nil\n"
+    )
+    assert _rig_binding_discharged(foreign, "weaponSlot", "WeaponSlot") is False
+    script = _rbx(
+        "Player",
+        foreign,
+        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+    )
+    assert len(_rig_rows([script])) == 1
+
+
+def test_review_r4_else_chain_stub_does_not_overrun_into_decoy() -> None:
+    """ROUND-4 — the ``else`` variant (``if ... then ... else ... end``): ``else``
+    follows no ``then``, so it is a pure +0 continuation. The single ``then`` + single
+    ``end`` already balance, so the span ends at the stub's ``end``; the decoy is not
+    swept in -> foreign stub fails closed."""
+    foreign = _foreign_stub_with_body(
+        "    local x = 1\n"
+        "    if x == 1 then\n"
+        "        return nil\n"
+        "    else\n"
+        "        return nil\n"
+        "    end\n"
+    )
+    assert _rig_binding_discharged(foreign, "weaponSlot", "WeaponSlot") is False
+    script = _rbx(
+        "Player",
+        foreign,
+        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+    )
+    assert len(_rig_rows([script])) == 1
+
+
+def test_review_r4_nested_if_for_while_function_stub_spans_correctly() -> None:
+    """ROUND-4 — nested ``if``/``for``/``while``/``function`` blocks inside the
+    foreign resolver body must each pair with their own ``end``, so the span ends at
+    the resolver's OWN closing ``end`` (not early on a nested ``end``, not late past
+    the file). A nested-block foreign stub still fails closed; the decoy is excluded."""
+    foreign = _foreign_stub_with_body(
+        "    local total = 0\n"
+        "    for i = 1, 3 do\n"
+        "        if i == 2 then\n"
+        "            total = total + i\n"
+        "        end\n"
+        "    end\n"
+        "    while total > 0 do\n"
+        "        total = total - 1\n"
+        "    end\n"
+        "    local function helper()\n"
+        "        return 0\n"
+        "    end\n"
+        "    return helper()\n"
+    )
+    assert _rig_binding_discharged(foreign, "weaponSlot", "WeaponSlot") is False
+    script = _rbx(
+        "Player",
+        foreign,
+        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+    )
+    assert len(_rig_rows([script])) == 1
+
+
+def test_review_r4_repeat_until_stub_spans_correctly() -> None:
+    """ROUND-4 — a ``repeat ... until`` block inside the foreign body
+    (``repeat`` opens, ``until`` closes — NOT ``end``) must balance so the span ends
+    at the resolver's own ``end``. Confirms the ``repeat``->``until`` pairing the
+    method-span scanner relies on still holds alongside the ``elseif`` fix."""
+    foreign = _foreign_stub_with_body(
+        "    local n = 0\n"
+        "    repeat\n"
+        "        n = n + 1\n"
+        "    until n >= 3\n"
+        "    return nil\n"
+    )
+    assert _rig_binding_discharged(foreign, "weaponSlot", "WeaponSlot") is False
+    script = _rbx(
+        "Player",
+        foreign,
+        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+    )
+    assert len(_rig_rows([script])) == 1
+
+
+def test_review_r4_corpus_with_real_resolver_body_still_discharges() -> None:
+    """ROUND-4 REGRESSION GUARD — S1's REAL resolver body contains an ``if``/``for``
+    + a ``for ... do ... end`` loop (multiple block keywords). The ``elseif`` fix
+    must NOT shorten the span before the real resolver's internal markers: the span
+    ends at the REAL resolver's closing ``end`` (recognizing its ``_MainCameraRig`` +
+    ``FindFirstChild`` markers as live code inside the body) -> the corpus happy-path
+    STILL discharges present=True."""
+    green = _lower()
+    assert "function Player:_resolveWeaponSlot()" in green.luau_source
+    assert _rig_binding_discharged(green.luau_source, "weaponSlot", "WeaponSlot") is True
+    script = _rbx("Player", green.luau_source, green.rig_binding)
+    assert _rig_rows([script]) == []

@@ -1106,8 +1106,16 @@ def _rig_method_body_end(source: str, decl_start: int) -> int:
     n = len(source)
     block = 0  # block-keyword nesting; the ``function`` declaration opens level 1
     seen_open = False
+    # Mirrors S1's proven ``_structural_balance_ok`` block-keyword set: ``function``/
+    # ``do``/``then``/``repeat`` OPEN a scope; ``end``/``until`` CLOSE it. ``elseif``
+    # is a CLOSER too — an ``if a then ... elseif b then ... end`` chain has multiple
+    # ``then`` openers but ONE ``end``, so ``elseif`` decrements to cancel its OWN
+    # upcoming ``then``'s increment (net 0 for the whole chain). ``else`` follows no
+    # ``then`` (pure +0 continuation), so it is not a token here. Without this,
+    # an ``elseif`` chain over-counts openers and the span overruns the method's
+    # closing ``end`` into later unrelated code (codex round-4 BLOCKING).
     opener_re = re.compile(r"\b(function|do|then|repeat)\b")
-    closer_re = re.compile(r"\b(end|until)\b")
+    closer_re = re.compile(r"\b(end|until|elseif)\b")
     while i < n:
         ch = source[i]
         # Skip Luau long-bracket comments/strings wholesale.
