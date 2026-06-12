@@ -20,6 +20,7 @@ Import-light (typed against ``RbxScript`` / ``TopologyArtifact``, no ``Any``).
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -81,6 +82,10 @@ def verify_contract(
     violations.extend(_check_consumer_compliance(topology, scripts))
     violations.extend(_check_component_availability(topology, scripts))
     violations.extend(_check_cross_domain_attribute(topology, scripts))
+    # FIX 5 ordering: the BINDING floor reports BEFORE the secondary ordinal
+    # floor (check D) — a dropped/reshaped rig binding is the real cause; the
+    # surviving ordinal it might leave behind is the downstream symptom.
+    violations.extend(_check_rig_binding_present(topology, scripts))
     violations.extend(_check_surviving_child_ordinal(topology, scripts))
     return ContractVerifierResult(violations=violations)
 
@@ -312,12 +317,23 @@ def stash_violations(
 #     have eliminated it -> a real regression). The non-promoting
 #     ``child_ordinal_coverage_gap`` info row (an unresolved/Phase-2 ref) is NOT
 #     in this set.
+#   * rig_binding_present: flipped — fact-based. Fires when an IR-declared rig
+#     retarget binding (the ``rig_binding`` carrier's ``field``/``child``) is NOT
+#     confirmed DISCHARGED by an INDEPENDENT scan of the final source (the lazy
+#     resolver method + rewritten reads + neutralized camera-child write), or when
+#     that scan DISAGREES with the lowering's ``present`` self-stamp (a mis-stamp /
+#     reverted edit / stale-resume carrier). SimpleFPS EXERCISES it (the Player rig
+#     binding); the corpus goes green at S2's fixture regen (which captures the
+#     discharged Player source + ``rig_binding present=True``), so per the
+#     admission rule the flip is admissible — until then the un-regenerated
+#     corpus fixture has no ``rig_binding`` carrier and ABSTAINS (None -> no row).
 FAIL_CLOSED_CHECKS: frozenset[str] = frozenset(
     {
         "consumer_compliance",
         "component_availability",
         "cross_domain_attribute",
         "child_ordinal_survivor",
+        "rig_binding_present",
     }
 )
 
@@ -702,4 +718,237 @@ def _check_surviving_child_ordinal(
                     identity=f"child_ordinal_coverage_gap:{script.name}",
                 )
             )
+    return violations
+
+
+# ---------------------------------------------------------------------------
+# Check — rig binding present (BINDING floor for the Camera.main rig retarget)
+# ---------------------------------------------------------------------------
+#
+# The post-transpile ``rifle_rig_retarget_lowering`` discharges an IR-declared
+# Camera.main->rig binding by editing the AI's emitted Luau (a per-instance lazy
+# resolver method + rewritten consumer reads + a neutralized camera-child write).
+# The AI is NOT trusted to preserve that seam, so a DROPPED/reshaped/reverted
+# binding must fail LOUD. This check is the FLOOR: it reads the deterministic
+# ``rig_binding`` carrier (``{field, child, present}``) ONLY for the IR ANCHOR
+# (``field``/``child``), then INDEPENDENTLY scans the final ``script.source`` to
+# confirm the binding actually landed — it does NOT trust the lowering's
+# ``present`` self-stamp as the gate (OPERATING.md: an actor's self-report is not
+# evidence the work happened). ``present`` is a cross-check; a stamp/scan
+# DISAGREEMENT also fails (catches a mis-stamp on a reverted edit or a
+# stale/forged carrier on a preserve/resume assemble where the lowering never
+# re-runs). ``rig_binding=None`` ABSTAINS (no rig fact -> no obligation), so
+# non-rifle scripts and pre-field fixtures emit nothing.
+
+
+# A valid Luau identifier (the shape a resolver-method-name suffix must satisfy).
+_RIG_LUAU_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _rig_method_suffix(child: str) -> str:
+    """A deterministic VALID-LUAU-IDENTIFIER suffix for the resolver method name
+    ``_resolve<suffix>``, derived ONLY from the IR ``child`` name — INDEPENDENT of
+    the lowering (mirrors ``rifle_rig_retarget_lowering._method_suffix`` so the
+    verifier reconstructs the same method name the lowering emitted, from the same
+    deterministic upstream signal, without importing/trusting the lowering's state).
+
+    A child that is already a valid identifier is used verbatim (the happy path);
+    otherwise illegal chars map to ``_`` and a short hash of the REAL name is
+    appended for collision resistance."""
+    if _RIG_LUAU_IDENT_RE.match(child):
+        return child
+    sanitized = re.sub(r"[^A-Za-z0-9_]", "_", child)
+    if not sanitized or not re.match(r"[A-Za-z_]", sanitized):
+        sanitized = "_" + sanitized
+    digest = hashlib.sha1(child.encode("utf-8")).hexdigest()[:8]
+    return f"{sanitized}_{digest}"
+
+
+# The non-yielding lifecycle methods the rewrite ABSTAINS on (it cannot land a
+# ``task.wait``-bearing resolver call under the synchronous build loop). A bare
+# ``self.<field>`` READ inside one of these is NOT a surviving consumer — the
+# yield-guard intentionally leaves it (it reads the neutralized ``nil`` safely),
+# so it does not count against discharge. Mirrors the lowering's closed list.
+_RIG_NON_YIELDING_LIFECYCLE: frozenset[str] = frozenset({"Awake", "Start"})
+
+# A code-level ``function <Class>:<method>(`` / ``function <Class>.<method>(``
+# declaration — used to read the class name and locate the nearest enclosing
+# method for the consumer-read check.
+_RIG_FUNCTION_METHOD_RE = re.compile(
+    r"\bfunction\s+([A-Za-z_]\w*)[:.]([A-Za-z_]\w*)\s*\("
+)
+
+# A surviving camera-child / positional-ordinal WRITE of the field: the RHS
+# textually carries a ``GetChild(n)`` / ``GetChildren()[n]`` positional access
+# (the camera-child ordinal shape the lowering should have neutralized to ``nil``).
+# Anchored on the deterministic ``field`` (the IR projection), code-position
+# guarded — NOT an arbitrary AI-output grep. Span-limited to the start of the RHS
+# (the assignment text up to the access) so it does not run across statements.
+_RIG_ORDINAL_WRITE_TAIL_RE = re.compile(
+    r":GetChildren\(\)\s*\[\s*\d+\s*\]|[:.]GetChild\(\s*\d+\s*\)"
+)
+
+
+def _rig_enclosing_method(source: str, pos: int) -> str | None:
+    """The method name of the nearest enclosing code-level
+    ``function <Class>:<method>(`` declaration before ``pos`` (None at module
+    scope)."""
+    method: str | None = None
+    for m in _RIG_FUNCTION_METHOD_RE.finditer(source):
+        if m.start() >= pos:
+            break
+        if not _luau_pos_is_code(source, m.start()):
+            continue
+        method = m.group(2)
+    return method
+
+
+def _rig_has_surviving_field_read(source: str, field: str) -> bool:
+    """True if a bare ``self.<field>`` consumer READ survives at a code position
+    in a YIELD-SAFE method — meaning the lowering did NOT rewrite it through the
+    resolver. Excludes (a) a member-tail ``self`` (``x.self.<field>``), (b) the
+    assignment LHS (``self.<field> =``, not ``==``), and (c) a read inside a
+    non-yielding lifecycle method (``Awake``/``Start``) — the yield-guard leaves
+    those reading the neutralized ``nil``, which is safe and not a consumer."""
+    pattern = re.compile(r"self\." + re.escape(field) + r"\b")
+    for m in pattern.finditer(source):
+        start = m.start()
+        if not _luau_pos_is_code(source, start):
+            continue
+        j = start - 1
+        while j >= 0 and source[j] in " \t":
+            j -= 1
+        if j >= 0 and source[j] == ".":
+            continue  # x.self.<field> -> not a bare read
+        a = m.end()
+        while a < len(source) and source[a] in " \t":
+            a += 1
+        if a < len(source) and source[a] == "=" and not (
+            a + 1 < len(source) and source[a + 1] == "="
+        ):
+            continue  # assignment LHS -> not a read
+        if _rig_enclosing_method(source, start) in _RIG_NON_YIELDING_LIFECYCLE:
+            continue  # non-yielding lifecycle read -> abstained, not a consumer
+        return True
+    return False
+
+
+def _rig_has_surviving_ordinal_write(source: str, field: str) -> bool:
+    """True if a code-position ``self.<field> = <... GetChild(n) | GetChildren()[n] ...>``
+    positional-ordinal WRITE survives — the camera-child shape the lowering should
+    have neutralized to ``nil``. Anchored on the deterministic ``field``; the RHS
+    is read up to the end of the logical line (newline at the top level), so a
+    later unrelated statement's ordinal does not leak in."""
+    assign_re = re.compile(r"self\." + re.escape(field) + r"\s*=(?!=)")
+    for m in assign_re.finditer(source):
+        if not _luau_pos_is_code(source, m.start()):
+            continue
+        rhs_start = m.end()
+        nl = source.find("\n", rhs_start)
+        rhs = source[rhs_start: nl if nl != -1 else len(source)]
+        if _RIG_ORDINAL_WRITE_TAIL_RE.search(rhs):
+            return True
+    return False
+
+
+def _rig_binding_discharged(source: str, field: str, child: str) -> bool:
+    """INDEPENDENT, code-position-aware derivation (the LOAD-BEARING authority):
+    is ``field``'s binding discharged via the rig retarget in THIS final source?
+    Derived from the SOURCE alone — anchored ONLY on the deterministic IR
+    ``field``/``child`` (NOT the lowering's ``present`` self-stamp, NOT an
+    arbitrary AI-output token, and it never REPAIRS). True IFF, over code positions:
+
+      (1) the injected per-instance resolver landed — the method
+          ``function <Class>:_resolve<suffix>(`` exists AND >=1
+          ``self:_resolve<suffix>(`` CALL exists AND NO bare ``self.<field>``
+          consumer READ survives (the reads were rewritten through the resolver);
+          AND
+      (2) the original ordinal/camera-child WRITE is gone — no surviving
+          ``self.<field> = <... GetChild(n) | GetChildren()[n] ...>`` assignment.
+
+    ``suffix`` is reconstructed from ``child`` by the same deterministic
+    sanitization the lowering uses, so the method name matches whatever the
+    lowering emitted (verbatim for a plain child name; a sanitized+hashed suffix
+    for a child with spaces/special chars). This is the §2 'loud-check-against-the-
+    fact' — it confirms the LOWERING's deterministic binding actually LANDED,
+    independent of the lowering's belief, so a mis-stamp / reverted edit / stale
+    resume carrier is caught."""
+    if not field or not child:
+        return False
+    suffix = _rig_method_suffix(child)
+    decl_re = re.compile(
+        r"\bfunction\s+[A-Za-z_]\w*[:.]_resolve" + re.escape(suffix) + r"\s*\("
+    )
+    call = f"self:_resolve{suffix}("
+    # (1a) the resolver METHOD declaration is present at a code position.
+    if not any(
+        _luau_pos_is_code(source, m.start()) for m in decl_re.finditer(source)
+    ):
+        return False
+    # (1b) >=1 ``self:_resolve<suffix>(`` CALL (distinct from the declaration —
+    # the declaration is ``function <Class>:_resolve<suffix>(``, not ``self:...``).
+    if not _rig_code_contains(source, call):
+        return False
+    # (1c) no surviving bare consumer READ of ``self.<field>``.
+    if _rig_has_surviving_field_read(source, field):
+        return False
+    # (2) the ordinal/camera-child WRITE was neutralized (no surviving positional
+    # ordinal write of the field).
+    if _rig_has_surviving_ordinal_write(source, field):
+        return False
+    return True
+
+
+def _rig_code_contains(source: str, token: str) -> bool:
+    """True if ``token`` appears at a code position (not in a comment/string)."""
+    idx = source.find(token)
+    while idx != -1:
+        if _luau_pos_is_code(source, idx):
+            return True
+        idx = source.find(token, idx + 1)
+    return False
+
+
+def _check_rig_binding_present(
+    topology: TopologyArtifact,
+    scripts: list[RbxScript],
+) -> list[ContractViolation]:
+    """Fail-closed assertion that every IR-declared rig-retarget binding was
+    DISCHARGED — derived INDEPENDENTLY from the final ``script.source``, NOT from
+    the lowering's ``present`` self-stamp. The carrier's ``field``/``child`` are
+    the deterministic IR ANCHOR (the resolver's projection of the upstream C#
+    field + parsed MainCamera-child); the check then SCANS the real final source
+    to confirm that anchored binding actually landed. ``present`` is a cross-check,
+    not the gate — PASS requires ``discharged AND stamp``; a stamp/scan
+    DISAGREEMENT also fails (catches a mis-stamp: a syntax-revert that reverted the
+    edit, or a stale/forged carrier on a preserve/resume assemble where the
+    lowering never re-ran). ``rig_binding=None`` ABSTAINS (no rig fact)."""
+    violations: list[ContractViolation] = []
+    for script in scripts:
+        rb = script.rig_binding
+        if not rb:
+            continue  # no rig fact -> abstain (pre-field fixtures, non-rifle scripts)
+        field = str(rb.get("field") or "")
+        child = str(rb.get("child") or "")
+        discharged = _rig_binding_discharged(script.source or "", field, child)  # INDEPENDENT
+        stamp = rb.get("present") is True
+        if discharged and stamp:
+            continue  # PASS — the independent scan AND the cross-check agree
+        violations.append(
+            ContractViolation(
+                check="rig_binding_present",
+                severity="warning",
+                script=script.name,
+                detail=(
+                    f"{script.name}: the IR-declared rig retarget binding "
+                    f"(field {field!r} -> _MainCameraRig child {child!r}) was NOT "
+                    f"confirmed in the lowered output "
+                    f"(source-scan discharged={discharged}, lowering-stamp={stamp}). "
+                    f"Either the deterministic rebind was dropped/reshaped/reverted, "
+                    f"or the carrier disagrees with the source (mis-stamp); the rifle "
+                    f"would bind to the wrong body or nil."
+                ),
+                identity=f"rig_binding_present:{script.name}:{field}",
+            )
+        )
     return violations
