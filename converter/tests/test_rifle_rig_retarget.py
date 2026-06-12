@@ -1674,3 +1674,100 @@ def test_r5_structural_balance_skips_block_comment_brackets(monkeypatch) -> None
         "return Player\n"
     )
     assert _structural_balance_ok(unbalanced) is False
+
+
+def test_r6_member_write_does_not_seed_bare_cam(tmp_path: Path) -> None:
+    # R6 BLOCKING (resolver:_canonical_receiver): ``other.cam = Camera.main.transform``
+    # is a member write on ANOTHER object — it must NOT seed the bare local ``cam``
+    # read at ``weaponSlot = cam.GetChild(0)`` (the GetChild's ``cam`` is a distinct
+    # local with no Camera.main binding live at the use site -> abstain).
+    src = (
+        "public class Player : MonoBehaviour {\n"
+        "  Transform cam; public Transform weaponSlot; Other other;\n"
+        "  void Awake() {\n"
+        "    other.cam = Camera.main.transform;\n"
+        "    weaponSlot = cam.GetChild(0);\n"
+        "  }\n}\n"
+    )
+    entry = _build(tmp_path, src, _fps_library())
+    assert entry is not None
+    assert entry.rig_facts == ()
+    assert entry.resolved_total == 0
+
+
+def test_r6_bare_local_seed_still_admits(tmp_path: Path) -> None:
+    # The legit bare-local seed (no member-access tail) still admits the fact.
+    src = (
+        "public class Player : MonoBehaviour {\n"
+        "  Transform cam; public Transform weaponSlot;\n"
+        "  void Awake() {\n"
+        "    cam = Camera.main.transform;\n"
+        "    weaponSlot = cam.GetChild(0);\n"
+        "  }\n}\n"
+    )
+    entry = _build(tmp_path, src, _fps_library())
+    assert entry is not None
+    assert entry.rig_facts == (
+        RigRootedRetargetFact(
+            field_name="weaponSlot", child_name="WeaponSlot", cam_receiver="cam"),
+    )
+    assert entry.resolved_total == 1
+
+
+def test_r6_line_comment_before_field_write_still_admits(tmp_path: Path) -> None:
+    # R6 MAJOR (resolver:_lhs_is_bare_field): a bare field write preceded by a
+    # ``// line comment`` must still admit — the comment is not a leading token, so
+    # the rig fact must NOT silently drop (else the rifle binding is not retargeted).
+    src = (
+        "public class Player : MonoBehaviour {\n"
+        "  public Transform weaponSlot;\n"
+        "  void Awake() {\n"
+        "    // pick the camera's first child as the weapon slot\n"
+        "    weaponSlot = Camera.main.transform.GetChild(0);\n"
+        "  }\n}\n"
+    )
+    entry = _build(tmp_path, src, _fps_library())
+    assert entry is not None
+    assert entry.rig_facts == (
+        RigRootedRetargetFact(
+            field_name="weaponSlot", child_name="WeaponSlot",
+            cam_receiver="Camera.main.transform"),
+    )
+    assert entry.resolved_total == 1
+
+
+def test_r6_block_comment_before_field_write_still_admits(tmp_path: Path) -> None:
+    # An inline ``/* block */`` comment between the prior statement and the field
+    # write is likewise skipped; the bare field write still admits.
+    src = (
+        "public class Player : MonoBehaviour {\n"
+        "  public Transform weaponSlot;\n"
+        "  void Awake() {\n"
+        "    DoSetup(); /* slot from camera rig */ weaponSlot = Camera.main.transform.GetChild(0);\n"
+        "  }\n}\n"
+    )
+    entry = _build(tmp_path, src, _fps_library())
+    assert entry is not None
+    assert entry.rig_facts == (
+        RigRootedRetargetFact(
+            field_name="weaponSlot", child_name="WeaponSlot",
+            cam_receiver="Camera.main.transform"),
+    )
+    assert entry.resolved_total == 1
+
+
+def test_r6_typed_local_after_comment_still_abstains(tmp_path: Path) -> None:
+    # Don't regress the round-5 typed-local allow-list: a typed-local declaration
+    # remains a leading TOKEN even when a comment precedes the statement, so it must
+    # still abstain (the field never persists on the instance -> not a rig fact).
+    src = (
+        "public class Player : MonoBehaviour {\n"
+        "  void Awake() {\n"
+        "    // local temp, not a field\n"
+        "    Transform weaponSlot = Camera.main.transform.GetChild(0);\n"
+        "  }\n}\n"
+    )
+    entry = _build(tmp_path, src, _fps_library())
+    assert entry is not None
+    assert entry.rig_facts == ()
+    assert entry.resolved_total == 0

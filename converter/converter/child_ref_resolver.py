@@ -704,6 +704,12 @@ def _canonical_receiver(source: str, recv: str, use_pos: int) -> str | None:
             break  # past the use site -> later bindings cannot be live here
         if not _cs_pos_is_code(source, m.start()):
             continue
+        # The seed LHS must be a BARE symbol, not the tail of a member access:
+        # ``other.cam = ...`` writes ANOTHER object's field, not the local ``cam``
+        # read at the GetChild. ``\b`` matches the boundary between a ``.`` member
+        # dot and ``cam``, so reject when the preceding char is that dot.
+        if m.start() > 0 and source[m.start() - 1] == ".":
+            continue
         nearest_start = m.start()
     if nearest_start == -1:
         return None  # no binding before the use site -> not seed-resolvable
@@ -729,6 +735,40 @@ def _canonical_receiver(source: str, recv: str, use_pos: int) -> str | None:
     if not _seed_dominates_use(source, nearest_start, use_pos):
         return None
     return _CAMERA_MAIN_TRANSFORM
+
+
+def _skip_ws_and_comments_back(source: str, pos: int) -> int:
+    """Walk ``pos`` backward over whitespace and C# comments, returning the index
+    just AFTER the nearest preceding CODE char (so ``source[k - 1]`` is that char,
+    or ``k == 0`` at start of file). A comment char is identified authoritatively
+    by ``_cs_pos_is_code`` (a from-start scan that correctly distinguishes a real
+    ``//``/``/* */`` comment from ``//`` text inside a string literal)."""
+    k = pos
+    while k > 0:
+        j = k - 1
+        prev = source[j]
+        if prev in " \t\r\n":
+            k -= 1
+            continue
+        # An INNER comment char is non-code per ``_cs_pos_is_code`` -> skip it.
+        if not _cs_pos_is_code(source, j):
+            k -= 1
+            continue
+        # ``_cs_pos_is_code`` (a from-start scan) classifies the OPENING char of a
+        # ``//``/``/*`` comment as code (it only enters the comment branch when
+        # ``i < pos``), so an opener slips through above. Recognize it explicitly:
+        # a ``/`` that starts a real comment (its inner char is non-code) is the
+        # comment delimiter, not a code token -> keep walking back.
+        if (
+            prev == "/"
+            and j + 1 < len(source)
+            and source[j + 1] in "/*"
+            and not _cs_pos_is_code(source, j + 1)
+        ):
+            k -= 1
+            continue
+        break
+    return k
 
 
 def _lhs_is_bare_field(source: str, field_start: int, full_lhs: str) -> str | None:
@@ -768,10 +808,11 @@ def _lhs_is_bare_field(source: str, field_start: int, full_lhs: str) -> str | No
         field = parts[1]
     else:
         return None  # x.weaponSlot / a.b.weaponSlot -> foreign member-access LHS
-    # Walk back over whitespace (incl. newlines) to the preceding non-blank char.
-    k = field_start
-    while k > 0 and source[k - 1] in " \t\r\n":
-        k -= 1
+    # Walk back over whitespace AND C# comments to the preceding code char. A
+    # comment between the prior statement and the field write (a ``// note`` line
+    # or an inline ``foo(); /* note */``) must not be mistaken for a leading token;
+    # otherwise a legitimate comment-preceded bare field write is wrongly rejected.
+    k = _skip_ws_and_comments_back(source, field_start)
     if k <= 0:
         return field  # start of file -> bare write
     if source[k - 1] in ";{}":
