@@ -40,6 +40,7 @@ from converter.contract_verifier import (  # noqa: E402
     FAIL_CLOSED_CHECKS,
     _check_rig_binding_present,
     _rig_binding_discharged,
+    _rig_has_surviving_ordinal_write,
     fail_closed_errors,
     verify_contract,
 )
@@ -382,3 +383,96 @@ def test_fix5_binding_floor_ordered_before_child_ordinal() -> None:
     ]
     if ord_rows:
         assert rig_idx < min(ord_rows)
+
+
+# ---------------------------------------------------------------------------
+# Dual-voice REVIEW findings (round 1) — 3 false-NEGATIVES that let the verifier
+# PASS when it must FAIL. Each is RED against 4a5aa84 (the pre-fix verifier).
+# ---------------------------------------------------------------------------
+import re  # noqa: E402
+
+
+def test_review_f1_foreign_resolver_stub_does_not_discharge() -> None:
+    """BLOCKING #1 — discharge must require the resolver method BODY to be the rig
+    resolver, not merely a same-named method. A FOREIGN stub (``return nil``) with
+    the discharged-looking call sites + a forged ``present=True`` must FAIL closed
+    (the stale/forged-resume threat model)."""
+    green = _lower()
+    # Replace ONLY the resolver method body with a foreign stub; keep the name, the
+    # rewritten call sites, and the neutralized write intact.
+    foreign_source = re.sub(
+        r"function Player:_resolveWeaponSlot\(\).*?\nend\n",
+        "function Player:_resolveWeaponSlot()\n    return nil\nend\n",
+        green.luau_source,
+        flags=re.S,
+    )
+    assert "function Player:_resolveWeaponSlot()" in foreign_source
+    assert "self:_resolveWeaponSlot()" in foreign_source  # call sites still present
+    assert 'GetAttribute("_MainCameraRig")' not in foreign_source  # body is foreign
+    # Scan-level: a foreign stub is NOT a discharge (pre-fix returned True = BUG).
+    assert _rig_binding_discharged(foreign_source, "weaponSlot", "WeaponSlot") is False
+    # Carrier forges present=True; the independent scan must STILL fire (fail-closed).
+    script = _rbx(
+        "Player",
+        foreign_source,
+        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+    )
+    assert len(_rig_rows([script])) == 1
+
+
+def test_review_f2_multiline_surviving_ordinal_write_is_detected() -> None:
+    """BLOCKING #2 (both voices) — the surviving-ordinal-write scan must be
+    continuation-aware. A multiline surviving camera-child write
+    (``self.weaponSlot =\\n  self.cam:GetChildren()[1]``) re-clobbers the field at
+    runtime, so it must be DETECTED -> NOT discharged -> the check fires."""
+    green = _lower()
+    # Inject a SURVIVING multiline camera-child ordinal write into the yielding
+    # GetRifle (a re-clobber the lowering's one-write neutralize missed).
+    multiline_source = green.luau_source.replace(
+        "return rifle\nend",
+        "self.weaponSlot =\n        self.cam:GetChildren()[1]\n    return rifle\nend",
+    )
+    assert "self.cam:GetChildren()[1]" in multiline_source
+    # Scan-level: the multiline write IS detected (pre-fix missed it -> True = BUG).
+    assert _rig_has_surviving_ordinal_write(multiline_source, "weaponSlot") is True
+    assert _rig_binding_discharged(multiline_source, "weaponSlot", "WeaponSlot") is False
+    script = _rbx(
+        "Player",
+        multiline_source,
+        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+    )
+    assert len(_rig_rows([script])) == 1
+
+
+def test_review_f3_resolver_only_in_long_bracket_does_not_discharge() -> None:
+    """BLOCKING #3 — a ``_resolve<suffix>`` method/call appearing ONLY inside a Luau
+    long-bracket literal (``[[ ]]``) must NOT count as live code -> NOT discharged.
+    The real code has a surviving bare read + no real resolver, so a binding that
+    only LOOKS discharged inside a string literal must fail closed."""
+    long_bracket_source = (
+        "local DOC = [[\n"
+        "function Player:_resolveWeaponSlot()\n"
+        '    return rig:FindFirstChild("WeaponSlot", true)\n'
+        "end\n"
+        "local x = self:_resolveWeaponSlot()\n"
+        "]]\n"
+        "function Player:Awake()\n"
+        "    self.weaponSlot = self.cam and self.cam:GetChildren()[1]\n"
+        "end\n"
+        "function Player:GetRifle()\n"
+        "    return pivotOf(self.weaponSlot)\n"
+        "end\n"
+        "return Player\n"
+    )
+    # The only resolver decl/call live inside the [[ ]] literal -> not live code ->
+    # the binding is genuinely absent in real code -> not discharged.
+    assert (
+        _rig_binding_discharged(long_bracket_source, "weaponSlot", "WeaponSlot")
+        is False
+    )
+    script = _rbx(
+        "Player",
+        long_bracket_source,
+        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+    )
+    assert len(_rig_rows([script])) == 1

@@ -28,6 +28,17 @@ from pathlib import Path
 
 from converter.child_index_lowering import _luau_pos_is_code
 from converter.scene_runtime_topology.build_topology import TopologyArtifact
+
+# Deterministic Luau code-position primitives (NOT lowering discharge-logic): the
+# long-bracket guards let the verifier exclude ``[[...]]`` / ``[=[...]=]`` /
+# ``--[[...]]`` strings/comments before counting tokens, the same way every other
+# code-position scan in the pipeline does. Importing the position primitives keeps
+# the verifier INDEPENDENT of the lowering's discharge state (it re-derives discharge
+# from the source itself) while sharing the canonical position arithmetic.
+from converter.trigger_stay_lowering import (
+    _long_bracket_open_level,
+    _luau_pos_in_long_bracket,
+)
 from core.roblox_types import RbxScript
 
 
@@ -789,6 +800,17 @@ _RIG_ORDINAL_WRITE_TAIL_RE = re.compile(
 )
 
 
+def _rig_pos_is_real_code(source: str, pos: int) -> bool:
+    """A position that is BOTH code (not in a short string / line-comment) AND NOT
+    inside a Luau long-bracket string/comment (``[[...]]`` / ``[=[...]=]`` /
+    ``--[[...]]``). The single code-position predicate every rig scan uses so a
+    token inside a long-bracket literal never counts as live code (codex BLOCKING:
+    a fake ``_resolve...`` token inside ``[[ ]]`` must not false-discharge)."""
+    return _luau_pos_is_code(source, pos) and not _luau_pos_in_long_bracket(
+        source, pos
+    )
+
+
 def _rig_enclosing_method(source: str, pos: int) -> str | None:
     """The method name of the nearest enclosing code-level
     ``function <Class>:<method>(`` declaration before ``pos`` (None at module
@@ -797,7 +819,7 @@ def _rig_enclosing_method(source: str, pos: int) -> str | None:
     for m in _RIG_FUNCTION_METHOD_RE.finditer(source):
         if m.start() >= pos:
             break
-        if not _luau_pos_is_code(source, m.start()):
+        if not _rig_pos_is_real_code(source, m.start()):
             continue
         method = m.group(2)
     return method
@@ -813,7 +835,7 @@ def _rig_has_surviving_field_read(source: str, field: str) -> bool:
     pattern = re.compile(r"self\." + re.escape(field) + r"\b")
     for m in pattern.finditer(source):
         start = m.start()
-        if not _luau_pos_is_code(source, start):
+        if not _rig_pos_is_real_code(source, start):
             continue
         j = start - 1
         while j >= 0 and source[j] in " \t":
@@ -833,21 +855,210 @@ def _rig_has_surviving_field_read(source: str, field: str) -> bool:
     return False
 
 
+_RIG_CONTINUATION_HEAD_RE = re.compile(
+    r"^(and|or|not|\.\.|[.:+\-*/%<>=~^#]|\bthen\b)"
+)
+_RIG_CONTINUATION_TAIL_RE = re.compile(
+    r"(\b(and|or|not)|\.\.|[.:+\-*/%<>=~^,({\[]|=)\s*$"
+)
+
+
+def _rig_line_continues(source: str, start: int, nl_pos: int) -> bool:
+    """True if the RHS logical expression continues past the newline at ``nl_pos``
+    (bracket depth 0): the text from ``start`` to ``nl_pos`` ends with a
+    binary/continuation operator, OR the next non-blank line begins with one.
+    Mirrors the lowering's ``_line_continues`` so the verifier's RHS span is
+    continuation-aware (codex BLOCKING: a multiline surviving ordinal write must be
+    spanned, not truncated at the first newline)."""
+    before = source[start:nl_pos]
+    if _RIG_CONTINUATION_TAIL_RE.search(before):
+        return True
+    j = nl_pos + 1
+    n = len(source)
+    while j < n and source[j] in " \t\r\n":
+        j += 1
+    if j >= n:
+        return False
+    return _RIG_CONTINUATION_HEAD_RE.match(source[j:j + 4]) is not None
+
+
+def _rig_statement_rhs_end(source: str, start: int) -> int:
+    """The end char index of the RHS expression beginning at ``start``, balanced
+    across (), [], {} and short strings, terminating at the end of the logical
+    statement (a code-level newline at bracket depth 0, or EOF). Multiline-aware so
+    a multi-line camera-child RHS is fully spanned. Mirrors the lowering's
+    ``_statement_rhs_end``."""
+    i = start
+    n = len(source)
+    depth = 0
+    while i < n:
+        ch = source[i]
+        if ch in "([{":
+            depth += 1
+            i += 1
+            continue
+        if ch in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            while i < n:
+                c = source[i]
+                if c == "\\":
+                    i += 2
+                    continue
+                if c == quote or c == "\n":
+                    break
+                i += 1
+            i += 1
+            continue
+        if ch == "\n" and depth == 0:
+            if _rig_line_continues(source, start, i):
+                i += 1
+                continue
+            break
+        if ch == "-" and i + 1 < n and source[i + 1] == "-" and depth == 0:
+            break  # a trailing comment -> RHS ends before it
+        i += 1
+    return i
+
+
 def _rig_has_surviving_ordinal_write(source: str, field: str) -> bool:
     """True if a code-position ``self.<field> = <... GetChild(n) | GetChildren()[n] ...>``
     positional-ordinal WRITE survives — the camera-child shape the lowering should
     have neutralized to ``nil``. Anchored on the deterministic ``field``; the RHS
-    is read up to the end of the logical line (newline at the top level), so a
-    later unrelated statement's ordinal does not leak in."""
+    is balanced to the END of the logical statement (multiline-aware), so a
+    multi-line camera-child RHS (``self.<field> =\\n  self.cam:GetChildren()[1]``)
+    is fully spanned and a later unrelated statement's ordinal does not leak in."""
     assign_re = re.compile(r"self\." + re.escape(field) + r"\s*=(?!=)")
     for m in assign_re.finditer(source):
-        if not _luau_pos_is_code(source, m.start()):
+        if not _rig_pos_is_real_code(source, m.start()):
             continue
+        # The ``=`` established we are mid-statement, so the value may begin on the
+        # NEXT line (``self.<field> =\n  self.cam:GetChildren()[1]``). Advance past
+        # leading whitespace/newlines to the first real RHS token before spanning,
+        # so a value-on-next-line write is not truncated at the leading newline.
         rhs_start = m.end()
-        nl = source.find("\n", rhs_start)
-        rhs = source[rhs_start: nl if nl != -1 else len(source)]
+        while rhs_start < len(source) and source[rhs_start] in " \t\r\n":
+            rhs_start += 1
+        rhs_end = _rig_statement_rhs_end(source, rhs_start)
+        rhs = source[rhs_start:rhs_end]
         if _RIG_ORDINAL_WRITE_TAIL_RE.search(rhs):
             return True
+    return False
+
+
+def _rig_method_body_end(source: str, decl_start: int) -> int:
+    """The char index just past the matching closing ``end`` of the
+    ``function ... _resolve<suffix>(`` method declared at ``decl_start`` (block-
+    keyword balanced over code positions, long-bracket strings/comments skipped
+    wholesale). EOF if the method is unterminated. Used to bound the rig-lookup
+    body scan to THIS method, so a marker elsewhere in the file does not satisfy a
+    foreign same-named stub."""
+    i = decl_start
+    n = len(source)
+    block = 0  # block-keyword nesting; the ``function`` declaration opens level 1
+    seen_open = False
+    opener_re = re.compile(r"\b(function|do|then|repeat)\b")
+    closer_re = re.compile(r"\b(end|until)\b")
+    while i < n:
+        ch = source[i]
+        # Skip Luau long-bracket comments/strings wholesale.
+        if ch == "-" and i + 1 < n and source[i + 1] == "-":
+            j = i + 2
+            level = _long_bracket_open_level(source, j)
+            if level is not None:
+                close = source.find("]" + "=" * level + "]", j)
+                i = n if close == -1 else close + level + 2
+                continue
+            nl = source.find("\n", j)
+            i = n if nl == -1 else nl + 1
+            continue
+        if ch == "[":
+            level = _long_bracket_open_level(source, i)
+            if level is not None:
+                close = source.find("]" + "=" * level + "]", i + level + 2)
+                i = n if close == -1 else close + level + 2
+                continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            while i < n and source[i] != quote:
+                if source[i] == "\\":
+                    i += 2
+                    continue
+                if source[i] == "\n":
+                    break
+                i += 1
+            i += 1
+            continue
+        if ch.isalpha() or ch == "_":
+            om = opener_re.match(source, i)
+            if om and (i == 0 or not (source[i - 1].isalnum() or source[i - 1] == "_")):
+                block += 1
+                seen_open = True
+                i = om.end()
+                continue
+            cm = closer_re.match(source, i)
+            if cm and (i == 0 or not (source[i - 1].isalnum() or source[i - 1] == "_")):
+                block -= 1
+                i = cm.end()
+                if seen_open and block == 0:
+                    return i
+                continue
+            # advance past the whole identifier so an embedded ``end`` substring
+            # (``send``/``endpoint``) is never matched as a keyword.
+            k = i
+            while k < n and (source[k].isalnum() or source[k] == "_"):
+                k += 1
+            i = k
+            continue
+        i += 1
+    return n
+
+
+def _rig_resolver_body_is_rig_lookup(source: str, suffix: str, child: str) -> bool:
+    """True if a code-position ``function <Class>:_resolve<suffix>(`` method exists
+    WHOSE BODY is the lowering's rig resolver — i.e. the distinctive
+    ``_MainCameraRig`` rig lookup appears as LIVE code inside that method's span:
+    BOTH ``:GetAttribute("_MainCameraRig")`` AND ``FindFirstChild("<child>", true)``
+    (the real S1 emit, anchored on the deterministic ``child``).
+
+    Codex BLOCKING: a FOREIGN same-named stub (``return nil`` / a wrong lookup) +
+    a forged/stale ``present=True`` must NOT count as discharged. Requiring the rig-
+    lookup body as live code inside the method span is the fail-closed floor — a
+    bare same-named method without that body does not discharge."""
+    decl_re = re.compile(
+        r"\bfunction\s+[A-Za-z_]\w*[:.]_resolve" + re.escape(suffix) + r"\s*\("
+    )
+    rig_attr = ':GetAttribute("_MainCameraRig")'
+    find_child = f'FindFirstChild("{child}", true)'
+    for m in decl_re.finditer(source):
+        if not _rig_pos_is_real_code(source, m.start()):
+            continue
+        body_end = _rig_method_body_end(source, m.start())
+        # The markers must each appear at a code position WITHIN this method body.
+        if _rig_span_code_contains(source, m.start(), body_end, rig_attr) and (
+            _rig_span_code_contains(source, m.start(), body_end, find_child)
+        ):
+            return True
+    return False
+
+
+def _rig_span_code_contains(
+    source: str, span_start: int, span_end: int, token: str
+) -> bool:
+    """True if ``token`` appears at a code position (not comment/string/long-
+    bracket) within ``[span_start, span_end)``."""
+    idx = source.find(token, span_start)
+    while idx != -1 and idx < span_end:
+        if _rig_pos_is_real_code(source, idx):
+            return True
+        idx = source.find(token, idx + 1)
     return False
 
 
@@ -859,8 +1070,9 @@ def _rig_binding_discharged(source: str, field: str, child: str) -> bool:
     arbitrary AI-output token, and it never REPAIRS). True IFF, over code positions:
 
       (1) the injected per-instance resolver landed — the method
-          ``function <Class>:_resolve<suffix>(`` exists AND >=1
-          ``self:_resolve<suffix>(`` CALL exists AND NO bare ``self.<field>``
+          ``function <Class>:_resolve<suffix>(`` exists WHOSE BODY is the rig
+          resolver (the distinctive ``_MainCameraRig`` lookup as LIVE code) AND
+          >=1 ``self:_resolve<suffix>(`` CALL exists AND NO bare ``self.<field>``
           consumer READ survives (the reads were rewritten through the resolver);
           AND
       (2) the original ordinal/camera-child WRITE is gone — no surviving
@@ -872,18 +1084,15 @@ def _rig_binding_discharged(source: str, field: str, child: str) -> bool:
     for a child with spaces/special chars). This is the §2 'loud-check-against-the-
     fact' — it confirms the LOWERING's deterministic binding actually LANDED,
     independent of the lowering's belief, so a mis-stamp / reverted edit / stale
-    resume carrier is caught."""
+    resume carrier (or a FOREIGN same-named stub) is caught."""
     if not field or not child:
         return False
     suffix = _rig_method_suffix(child)
-    decl_re = re.compile(
-        r"\bfunction\s+[A-Za-z_]\w*[:.]_resolve" + re.escape(suffix) + r"\s*\("
-    )
     call = f"self:_resolve{suffix}("
-    # (1a) the resolver METHOD declaration is present at a code position.
-    if not any(
-        _luau_pos_is_code(source, m.start()) for m in decl_re.finditer(source)
-    ):
+    # (1a) the resolver METHOD declaration is present at a code position AND its
+    # BODY is the rig resolver (the distinctive ``_MainCameraRig`` lookup as live
+    # code) — a foreign same-named stub does NOT discharge (codex BLOCKING).
+    if not _rig_resolver_body_is_rig_lookup(source, suffix, child):
         return False
     # (1b) >=1 ``self:_resolve<suffix>(`` CALL (distinct from the declaration —
     # the declaration is ``function <Class>:_resolve<suffix>(``, not ``self:...``).
@@ -900,10 +1109,11 @@ def _rig_binding_discharged(source: str, field: str, child: str) -> bool:
 
 
 def _rig_code_contains(source: str, token: str) -> bool:
-    """True if ``token`` appears at a code position (not in a comment/string)."""
+    """True if ``token`` appears at a code position (not in a comment/string and
+    NOT inside a Luau long-bracket literal — codex BLOCKING)."""
     idx = source.find(token)
     while idx != -1:
-        if _luau_pos_is_code(source, idx):
+        if _rig_pos_is_real_code(source, idx):
             return True
         idx = source.find(token, idx + 1)
     return False
