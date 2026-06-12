@@ -25,6 +25,10 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
+from converter.child_index_lowering import (
+    _luau_pos_is_code,
+    source_has_child_index,
+)
 from converter.scene_runtime_topology.build_topology import TopologyArtifact
 from core.roblox_types import RbxScript
 
@@ -80,6 +84,7 @@ def verify_contract(
     violations.extend(_check_consumer_compliance(topology, scripts))
     violations.extend(_check_component_availability(topology, scripts))
     violations.extend(_check_cross_domain_attribute(topology, scripts))
+    violations.extend(_check_surviving_child_ordinal(topology, scripts))
     return ContractVerifierResult(violations=violations)
 
 
@@ -305,8 +310,18 @@ def stash_violations(
 #     SimpleFPS alone has 0 edges, which is why a second project was needed.
 #     (Class-2 store-mismatch is a separate deferred backstop — see the design
 #     doc §"Phase 3" slice 4d.)
+#   * child_ordinal_survivor (D): flipped — fact-based. Fires ONLY on a surviving
+#     positional child ordinal in a FULLY-resolved script (the pre-rewrite should
+#     have eliminated it -> a real regression). The non-promoting
+#     ``child_ordinal_coverage_gap`` info row (an unresolved/Phase-2 ref) is NOT
+#     in this set.
 FAIL_CLOSED_CHECKS: frozenset[str] = frozenset(
-    {"consumer_compliance", "component_availability", "cross_domain_attribute"}
+    {
+        "consumer_compliance",
+        "component_availability",
+        "cross_domain_attribute",
+        "child_ordinal_survivor",
+    }
 )
 
 # Every promoted verifier error carries this prefix so the pipeline can REPLACE
@@ -528,4 +543,109 @@ def _check_cross_domain_attribute(
                 identity=f"cross_domain_attribute:{edge_id}",
             )
         )
+    return violations
+
+
+# ---------------------------------------------------------------------------
+# Check D — surviving child ordinal (FACT-BASED backstop for relation #2)
+# ---------------------------------------------------------------------------
+#
+# The generic-mode pre-rewrite (``child_ref_resolver``) resolves transform-rooted
+# ``transform.GetChild(n)`` to named ``Find("<name>")`` lookups before transpile,
+# stamping each script's ``{getchild_total, resolved_total}`` onto
+# ``RbxScript.child_ref_resolution``. Check D asserts AGAINST THAT FACT: for a
+# FULLY-resolved script the pre-rewrite should have eliminated every ordinal, so a
+# surviving positional ``GetChildren()[n]`` is a regression (fail-closed). A script
+# with no fact (pre-field fixture) or with ``resolved_total < getchild_total`` (a
+# genuinely-unresolvable ref, e.g. the Player ``cam = Camera.main.transform``)
+# ABSTAINS — never reds the corpus. Keyed on the deterministic resolver tally, not
+# a fragile C#-symbol->Luau-name match (the AI does not preserve the symbol names).
+
+# Two-line factored shape (E5): ``local v = X:GetChildren()`` then a later
+# ``v[<int>]`` positional index. The adjacent shape ``X:GetChildren()[n]`` is
+# covered by ``source_has_child_index``; this catches the across-lines factoring.
+_GETCHILDREN_ASSIGN_RE = re.compile(
+    r"\blocal\s+([A-Za-z_]\w*)\s*=\s*[A-Za-z_][\w.]*:GetChildren\(\)"
+)
+
+
+def _source_has_factored_child_ordinal(source: str) -> bool:
+    """True if ``source`` factors a positional GetChildren index across two
+    lines: ``local v = X:GetChildren()`` then a later ``v[<int>]`` index on the
+    captured identifier ``v``, both at real code positions."""
+    for m in _GETCHILDREN_ASSIGN_RE.finditer(source):
+        if not _luau_pos_is_code(source, m.start()):
+            continue
+        ident = m.group(1)
+        index_re = re.compile(r"\b" + re.escape(ident) + r"\s*\[\s*\d+\s*\]")
+        for im in index_re.finditer(source, m.end()):
+            if _luau_pos_is_code(source, im.start()):
+                return True
+    return False
+
+
+def _check_surviving_child_ordinal(
+    topology: TopologyArtifact,
+    scripts: list[RbxScript],
+) -> list[ContractViolation]:
+    """Backstop for relation #2 (child/path-ref), FACT-BASED.
+
+    Reads each script's ``child_ref_resolution`` dict with a None/absent guard.
+    A FULLY-resolved script (``getchild_total > 0 and resolved_total ==
+    getchild_total``) with a surviving positional ordinal -> ``warning``
+    ``child_ordinal_survivor`` (fail-closed). A script with the fact present but
+    ``resolved_total < getchild_total`` AND a surviving ordinal -> non-promoting
+    ``info`` ``child_ordinal_coverage_gap`` (a tracked Phase-2/3 gap). A script
+    with NO fact (absent/``None``) -> pure abstain (no row), so pre-field
+    fixtures load with zero count drift.
+    """
+    violations: list[ContractViolation] = []
+    for script in scripts:
+        r = script.child_ref_resolution
+        if not r:
+            continue  # no fact (pre-field fixture) — pure abstain, emit nothing
+        gt = r.get("getchild_total")
+        rt = r.get("resolved_total")
+        if gt is None or rt is None or gt <= 0:
+            continue
+        has_survivor = (
+            source_has_child_index(script.source)
+            or _source_has_factored_child_ordinal(script.source)
+        )
+        if not has_survivor:
+            continue
+        fully_resolved = rt == gt
+        if fully_resolved:
+            violations.append(
+                ContractViolation(
+                    check="child_ordinal_survivor",
+                    severity="warning",
+                    script=script.name,
+                    detail=(
+                        f"{script.name}: a positional child ordinal survived "
+                        f"the pre-rewrite in a fully-resolved script "
+                        f"(getchild_total={gt}, resolved_total={rt}); the "
+                        f"resolved Find(\"<name>\") lookup should have replaced "
+                        f"every GetChild(n) — this is a child-ref regression"
+                    ),
+                    identity=f"child_ordinal_survivor:{script.name}",
+                )
+            )
+        else:
+            violations.append(
+                ContractViolation(
+                    check="child_ordinal_coverage_gap",
+                    severity="info",
+                    script=script.name,
+                    detail=(
+                        f"{script.name}: a positional child ordinal survives on "
+                        f"an UNRESOLVED child ref (getchild_total={gt}, "
+                        f"resolved_total={rt}); the receiver does not root at the "
+                        f"host node (e.g. a foreign Camera.main.transform) so the "
+                        f"pre-rewrite could not name it — tracked coverage gap, "
+                        f"not a failure"
+                    ),
+                    identity=f"child_ordinal_coverage_gap:{script.name}",
+                )
+            )
     return violations

@@ -2033,6 +2033,14 @@ class Pipeline:
                 use_ai=_config.USE_AI_TRANSPILATION,
                 api_key=_config.ANTHROPIC_API_KEY,
                 serialized_field_refs=self.ctx.serialized_field_refs or None,
+                # Single-scene mode leaves ``all_parsed_scenes`` empty by design;
+                # fall back to ``[parsed_scene]`` (the pipeline-wide idiom) so a
+                # scene-hosted script's child refs still resolve.
+                parsed_scenes=(
+                    self.state.all_parsed_scenes or [self.state.parsed_scene]
+                ),
+                prefab_library=self.state.prefab_library,
+                guid_index=self.state.guid_index,
             )
             self.state.transpilation_result = contract_result.transpilation
             # Plumb contract telemetry to ctx so downstream consumers
@@ -2890,6 +2898,9 @@ return table.concat(allData, "\\n")'''
                     # original C# code-analysis decision.
                     intrinsic_script_type=ts.script_type,
                     source_path=ts.output_filename,
+                    # Generic-mode child-ref resolution tally (or None) for the
+                    # contract verifier's child-ordinal backstop.
+                    child_ref_resolution=ts.child_ref_resolution,
                 ))
 
         # Write animation scripts to output directory AND add to RbxPlace.

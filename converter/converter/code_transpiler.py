@@ -27,6 +27,11 @@ from config import (
     LLM_CACHE_TTL_SECONDS,
     TRANSPILATION_CONFIDENCE_THRESHOLD,
 )
+from converter.child_ref_resolver import (
+    ChildRefMap,
+    ChildRefScript,
+    prerewrite_child_index,
+)
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +58,12 @@ class TranspiledScript:
     # recomputing the visual-only verdict (which lacks the project context the
     # empty-subclass-of-dead-base decision needs). See contract_pipeline.
     intentional_inert_stub: bool = False
+    # Per-script child-ref resolution tally from the generic-mode pre-rewrite
+    # (``child_ref_resolver``): a JSON-native dict ``{"getchild_total": int,
+    # "resolved_total": int}`` or ``None``. Copied onto the produced
+    # ``RbxScript.child_ref_resolution`` so the contract verifier's child-ordinal
+    # backstop can assert against the fact. ``None`` outside generic mode.
+    child_ref_resolution: dict[str, int] | None = None
 
 
 @dataclass
@@ -115,6 +126,7 @@ def transpile_scripts(
     runtime_bearing_paths: frozenset[Path] | None = None,
     component_class_paths: frozenset[Path] | None = None,
     player_controller_paths: frozenset[Path] | None = None,
+    child_ref_map: ChildRefMap | None = None,
 ) -> TranspilationResult:
     """Transpile a list of C# scripts to Luau.
 
@@ -157,6 +169,15 @@ def transpile_scripts(
             ``project_context`` (paradigm B, NON-load-bearing). Defaults to an
             empty set (legacy callers / direct unit tests unaffected — the
             byte-identical no-directive context is preserved).
+        child_ref_map: Under ``runtime_mode="generic"`` the per-script
+            ``ChildRefScript`` map built by
+            ``child_ref_resolver.build_child_ref_map``. Each script's
+            ``transform``-rooted ``<recv>.GetChild(n)`` sites are PRE-REWRITTEN to
+            ``<recv>.Find("<name>")`` in ``csharp_source`` BEFORE it enters the
+            cache key / AI, and the per-script ``{getchild_total, resolved_total}``
+            tally is stamped onto each produced ``RbxScript.child_ref_resolution``.
+            ``None`` (default) for legacy callers / direct unit tests — no
+            pre-rewrite, no stamp.
 
     Returns:
         TranspilationResult with all transpiled scripts and summary counts.
@@ -205,6 +226,9 @@ def transpile_scripts(
 
     # Phase 1: Classify scripts and read source
     pending_scripts: list[tuple[Any, str, str]] = []  # (info, csharp_source, script_type)
+    # Per-script child-ref resolution entry (generic-only), keyed on str(info.path),
+    # carried to the TranspiledScript stamp below.
+    child_ref_by_path: dict[str, ChildRefScript] = {}
     for info in script_infos:
         script_path = info.path
         try:
@@ -213,6 +237,26 @@ def transpile_scripts(
             log.warning("Could not read script %s: %s", script_path, exc)
             result.total_failed += 1
             continue
+
+        # Generic-mode child-ref PRE-REWRITE: resolve transform-rooted
+        # GetChild(n) sites to named lookups in the C# BEFORE it enters the cache
+        # key / AI. Canonical-key lookup (resolved-first, raw fallback) mirrors
+        # ``_build_serialized_field_context``. Mutating ``csharp_source`` here is
+        # what the AI sees and what the cache keys on.
+        if runtime_mode == "generic" and child_ref_map:
+            try:
+                _canon_key = str(script_path.resolve())
+            except OSError:
+                _canon_key = str(script_path)
+            _child_ref_entry = (
+                child_ref_map.get(_canon_key)
+                or child_ref_map.get(str(script_path))
+            )
+            if _child_ref_entry is not None:
+                csharp_source, _ = prerewrite_child_index(
+                    csharp_source, _child_ref_entry,
+                )
+                child_ref_by_path[str(script_path)] = _child_ref_entry
 
         # Auto-stub scripts that can't work in Roblox: a visual/rendering
         # helper, OR an empty subclass of a Roblox-dead base.
@@ -263,6 +307,7 @@ def transpile_scripts(
                 )
                 stub_script_type = "Script"
                 intentional_inert = False
+            _stub_child_ref = child_ref_by_path.get(str(script_path))
             result.scripts.append(TranspiledScript(
                 source_path=str(script_path),
                 output_filename=script_path.stem + ".luau",
@@ -272,6 +317,14 @@ def transpile_scripts(
                 confidence=1.0,
                 script_type=stub_script_type,
                 intentional_inert_stub=intentional_inert,
+                child_ref_resolution=(
+                    {
+                        "getchild_total": _stub_child_ref.getchild_total,
+                        "resolved_total": _stub_child_ref.resolved_total,
+                    }
+                    if _stub_child_ref is not None
+                    else None
+                ),
             ))
             result.total_transpiled += 1
             result.total_rule_based += 1
@@ -499,6 +552,7 @@ def transpile_scripts(
 
         output_filename = info.path.stem + ".luau"
 
+        _child_ref_entry = child_ref_by_path.get(str(info.path))
         ts = TranspiledScript(
             source_path=str(info.path),
             output_filename=output_filename,
@@ -509,6 +563,14 @@ def transpile_scripts(
             warnings=warnings,
             flagged_for_review=flagged,
             script_type=script_type,
+            child_ref_resolution=(
+                {
+                    "getchild_total": _child_ref_entry.getchild_total,
+                    "resolved_total": _child_ref_entry.resolved_total,
+                }
+                if _child_ref_entry is not None
+                else None
+            ),
         )
         result.scripts.append(ts)
         result.total_transpiled += 1

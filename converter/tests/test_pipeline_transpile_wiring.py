@@ -167,6 +167,9 @@ class TestGenericModeRoutesThroughContractPipeline:
             "use_ai",
             "api_key",
             "serialized_field_refs",
+            "parsed_scenes",
+            "prefab_library",
+            "guid_index",
         }
         assert kwargs["script_infos"] == infos
         assert kwargs["scene_runtime"] is pipeline.ctx.scene_runtime

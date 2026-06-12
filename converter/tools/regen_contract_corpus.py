@@ -70,6 +70,9 @@ _FIELDS = (
     "parent_path",
     "source_path",
     "requires_part_parent",
+    # The child-ref resolution tally the check-D backstop reads. Without it the
+    # field is never copied into fixture.json and check D goes DEAD on the corpus.
+    "child_ref_resolution",
 )
 
 _FIXTURE_ROOT = _REPO / "tests" / "fixtures" / "contract_corpus"

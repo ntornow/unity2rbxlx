@@ -26,7 +26,6 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from converter.child_index_lowering import (  # noqa: E402
-    _UNITY_CHILD_HELPER,
     lower_child_index,
 )
 from converter.code_transpiler import (  # noqa: E402
@@ -218,12 +217,14 @@ _TURRET_PIPELINE_SRC = textwrap.dedent("""\
 
 class TestPipelineInvocation:
     """Drives the REAL ``contract_pipeline.transpile_with_contract`` (generic
-    mode) so a future edit that deletes/mis-threads/wrong-fields the
-    ``lower_child_index`` wiring would FAIL this test. ``transpile_scripts`` is
-    stubbed so the test never hits the API; everything downstream is the
-    production path inside ``transpile_with_contract``."""
+    mode). The post-transpile ``lower_child_index`` pass is RETIRED — child-ref
+    handling moved to the pre-transpile ``child_ref_resolver``, so the generic
+    path no longer lowers an emitted ``GetChildren()[n]`` ordinal. This test
+    pins that retirement: a surviving ``self.cam:GetChildren()[1]`` passes through
+    ``transpile_with_contract`` VERBATIM, with no ``__unityChild`` injection.
+    ``transpile_scripts`` is stubbed so the test never hits the API."""
 
-    def test_generic_pipeline_lowers_child_index_and_injects_helper(self) -> None:
+    def test_generic_pipeline_no_longer_lowers_child_index(self) -> None:
         from converter import contract_pipeline
 
         turret_path = Path("/proj/Assets/Turret.cs")
@@ -272,10 +273,10 @@ class TestPipelineInvocation:
             "transpile_with_contract must call transpile_scripts (stubbed)."
         )
 
-        lowered_src = result.transpilation.scripts[0].luau_source
-        # The flattened GetChild site was rewritten through the pipeline...
-        assert "self.cam:GetChildren()[1]" not in lowered_src
-        assert "__unityChild(self.cam, 1)" in lowered_src
-        # ...and the helper definition was injected (at a real code position).
-        assert "local function __unityChild(" in lowered_src
-        assert _UNITY_CHILD_HELPER.splitlines()[-2] in lowered_src
+        out_src = result.transpilation.scripts[0].luau_source
+        # The flattened GetChild site survives VERBATIM — the post-transpile
+        # lowering is retired; the pre-transpile resolver owns child refs now.
+        assert "self.cam:GetChildren()[1]" in out_src
+        # No __unityChild injection from the (removed) lowering pass.
+        assert "__unityChild(self.cam, 1)" not in out_src
+        assert "local function __unityChild(" not in out_src

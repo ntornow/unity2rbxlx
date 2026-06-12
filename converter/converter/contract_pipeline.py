@@ -38,12 +38,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict
 
+from converter.child_ref_resolver import build_child_ref_map
 from converter.code_transpiler import (
     TranspilationResult,
     TranspiledScript,
     _is_visual_only_script,
     transpile_scripts,
 )
+from core.unity_types import GuidIndex, ParsedScene, PrefabLibrary
 from unity.script_analyzer import ScriptInfo
 
 
@@ -376,6 +378,9 @@ def transpile_with_contract(
     use_ai: bool = True,
     max_concurrent: int = 10,
     serialized_field_refs: dict[str, dict[str, str]] | None = None,
+    parsed_scenes: list[ParsedScene] | None = None,
+    prefab_library: PrefabLibrary | None = None,
+    guid_index: GuidIndex | None = None,
 ) -> ContractPipelineResult:
     """Run the generic-runtime contract pipeline on ``script_infos``.
 
@@ -389,6 +394,10 @@ def transpile_with_contract(
         api_key: Anthropic API key (optional -- CLI backend works without).
         use_ai / max_concurrent / serialized_field_refs: forwarded to
             ``transpile_scripts``.
+        parsed_scenes / prefab_library / guid_index: the parsed Unity hierarchy
+            inputs the child-ref resolver consumes to build the per-script
+            ``ChildRefMap`` (resolving ``transform.GetChild(n)`` to named lookups
+            before transpile). ``None``/empty leaves the map empty (no pre-rewrite).
 
     Returns:
         ``ContractPipelineResult`` carrying the transpile output plus
@@ -421,6 +430,17 @@ def transpile_with_contract(
     # ``find_player_controllers``.
     player_controller_paths = _player_controller_paths(modules, script_infos)
 
+    # Single producer of the #2 child-ref facts: resolve transform-rooted
+    # GetChild(n) sites against the parsed hierarchy so the pre-rewrite emits
+    # named lookups before transpile (and stamps the resolved/total tally for the
+    # backstop). Empty when the parse inputs are absent -> no pre-rewrite.
+    child_ref_map = build_child_ref_map(
+        script_infos=script_infos,
+        parsed_scenes=parsed_scenes,
+        prefab_library=prefab_library,
+        guid_index=guid_index,
+    )
+
     transpilation = transpile_scripts(
         unity_project_path=unity_project_path,
         script_infos=script_infos,
@@ -432,6 +452,7 @@ def transpile_with_contract(
         runtime_bearing_paths=runtime_bearing_paths,
         component_class_paths=component_class_paths,
         player_controller_paths=player_controller_paths,
+        child_ref_map=child_ref_map,
     )
 
     # Build the stem-keyed require graph from the planner's modules table.
@@ -555,18 +576,15 @@ def transpile_with_contract(
     # (player_signal_absent / player_ambiguous / player_unresolved) key on C's
     # own identity and remain above.
 
-    # Child-index lowering (allowlisted deterministic lowering pass): the
-    # transpiler flattens Unity ``transform.GetChild(n)`` to
-    # ``<recv>:GetChildren()[n+1]``, which returns the injected non-spatial
-    # child (e.g. the AudioSource->Sound stamped at child index 0 of a Part),
-    # so a following ``:GetPivot()`` crashes. Resolve each such site to the
-    # N-th SPATIAL child instead. Structure-gated (the GetChildren()[literal]
-    # emission shape), never per-game; see child_index_lowering.py.
-    from converter.child_index_lowering import lower_child_index
-    lowered_children = lower_child_index(transpilation.scripts)
-    if lowered_children:
-        log.info("[contract] child-index lowering resolved GetChild sites "
-                 "in %d script(s) to the N-th spatial child", lowered_children)
+    # Child-index handling is now done by the pre-transpile child-ref resolver
+    # (``child_ref_resolver.build_child_ref_map`` + ``prerewrite_child_index``,
+    # threaded into ``transpile_scripts`` above): transform-rooted
+    # ``transform.GetChild(n)`` sites are resolved to named ``Find("<name>")``
+    # lookups in the C# BEFORE the AI sees them, so no positional ordinal reaches
+    # the output. The post-transpile ``lower_child_index`` pass is retired here;
+    # the contract verifier's child-ordinal backstop fail-closes on any survivor
+    # for a fully-resolved script. (``child_index_lowering.py`` stays — the
+    # legacy packs still use it, and the backstop reuses ``source_has_child_index``.)
 
     # OnTriggerStay lowering (allowlisted deterministic lowering pass): the
     # transpiler collapses Unity OnTriggerStay onto the same ``.Touched`` EDGE

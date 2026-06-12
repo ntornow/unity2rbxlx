@@ -138,6 +138,18 @@ class RbxScript:
     # safer than under-flagging — it just preserves the historical
     # guard behavior for more scripts.
     requires_part_parent: bool = False
+    # Per-script child-ref resolution tally stamped at transpile time by the
+    # generic-mode pre-rewrite (``child_ref_resolver``). A JSON-native dict with
+    # keys ``"getchild_total"`` / ``"resolved_total"`` (NOT a dataclass — it must
+    # survive ``json.dumps`` in the corpus regen, rehydrate as a plain dict via
+    # ``RbxScript(**s)`` in the corpus replay, and be stamped identically live).
+    # ``None`` for non-transpiled scripts and pre-existing fixtures without the
+    # field. The contract verifier's child-ordinal backstop reads it via
+    # ``.get(...)`` with an absent->abstain guard: a FULLY-resolved script
+    # (``getchild_total > 0 and resolved_total == getchild_total``) with a
+    # surviving positional ordinal is a regression (fail-closed); an unresolved
+    # script abstains (coverage gap).
+    child_ref_resolution: dict[str, int] | None = None
 
 
 @dataclass
