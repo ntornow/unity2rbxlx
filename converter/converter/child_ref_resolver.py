@@ -364,7 +364,9 @@ def _resolve_child(node: HostNode, ordinal: int) -> HostNode | None:
     return child
 
 
-def _build_symbol_table(source: str, host_node: HostNode) -> dict[str, HostNode]:
+def _build_symbol_table(
+    source: str, host_node: HostNode, *, gameobject_shadowed: bool
+) -> dict[str, HostNode]:
     """Build the per-script Transform-symbol table by local dataflow.
 
     Seed ``transform -> host_node`` (UNLESS a local/param shadows the inherited
@@ -375,7 +377,6 @@ def _build_symbol_table(source: str, host_node: HostNode) -> dict[str, HostNode]
     edge resolved once ``<recv>`` is in the table. A guard failure (E1–E3) drops
     the edge — its ``<sym>`` stays unresolved, so any later site on it abstains.
     """
-    gameobject_shadowed = _declares_shadow(source, "gameObject")
     transform_shadowed = _declares_shadow(source, "transform")
     # Collect pending edges (sym, recv, ordinal) from all three shapes, at code
     # positions only.
@@ -489,8 +490,10 @@ def _canon_key(path: Path) -> str:
 def _resolve_script(source: str, host_node: HostNode) -> ChildRefScript | None:
     """Resolve one script's GetChild sites against ``host_node``. Returns
     ``None`` when the script has NO GetChild site at all (absent from the map)."""
-    table = _build_symbol_table(source, host_node)
     gameobject_shadowed = _declares_shadow(source, "gameObject")
+    table = _build_symbol_table(
+        source, host_node, gameobject_shadowed=gameobject_shadowed
+    )
 
     facts: list[ChildRefFact] = []
     getchild_total = 0
