@@ -6,6 +6,7 @@
     "runtime_cross_domain_edges": 0
   },
   "expected_counts": {
+    "child_ordinal_coverage_gap": 1,
     "consumer_compliance": 1
   },
   "project": "SimpleFPS",
@@ -119,6 +120,10 @@
       "source_path": "PlaneBullet.luau"
     },
     {
+      "child_ref_resolution": {
+        "getchild_total": 1,
+        "resolved_total": 0
+      },
       "intrinsic_script_type": "ModuleScript",
       "name": "Player",
       "parent_path": "ReplicatedStorage",

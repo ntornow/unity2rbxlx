@@ -126,6 +126,41 @@ class TestContractCorpus:
             f"intended verifier change, re-run tools/regen_contract_corpus.py."
         )
 
+    def test_check_d_witnesses_abstain_seam(
+        self, fixture_path: Path, tmp_path: Path
+    ) -> None:
+        """The SimpleFPS Player entry carries ``child_ref_resolution {1,0}`` (a
+        surviving ``cam:GetChildren()[1]`` ordinal whose receiver is the foreign
+        ``Camera.main.transform``), so the LIVE hook must emit exactly one
+        non-promoting ``info`` ``child_ordinal_coverage_gap`` row attributed to
+        ``Player`` — proving the FT stamp -> verify -> abstain seam fires on real
+        captured corpus output, not just the synthetic unit test. Other fixtures
+        carry no such ref, so the seam is absent there."""
+        fx = self._load(fixture_path)
+        scripts = [RbxScript(**s) for s in fx["scripts"]]
+        rows = _run_hook(fx["topology"], scripts, tmp_path)
+        gaps = [r for r in rows if r["check"] == "child_ordinal_coverage_gap"]
+        has_player_stamp = any(
+            (s.child_ref_resolution or {}).get("getchild_total", 0) > 0
+            and (s.child_ref_resolution or {}).get("resolved_total", 0)
+            < (s.child_ref_resolution or {}).get("getchild_total", 0)
+            for s in scripts
+        )
+        if has_player_stamp:
+            assert [r["script"] for r in gaps] == ["Player"], (
+                f"{fixture_path.parent.name}: expected exactly one "
+                f"child_ordinal_coverage_gap row on Player, got "
+                f"{[(r['script'], r['severity']) for r in gaps]}"
+            )
+            assert all(r["severity"] == "info" for r in gaps), (
+                "coverage-gap row must be info-severity (never promoted)"
+            )
+        else:
+            assert gaps == [], (
+                f"{fixture_path.parent.name}: no partial child_ref_resolution "
+                f"stamp, so no coverage-gap row expected, got {gaps}"
+            )
+
     def test_coverage_matches_pinned(self, fixture_path: Path) -> None:
         """The pinned coverage facts match a fresh re-derivation — guards
         against a fixture whose scripts/topology shape silently changed so a
