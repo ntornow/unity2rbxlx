@@ -378,3 +378,181 @@ The §7 generic-converter Step-1 player-embodiment effort: paradigm C (`self.hos
 - **Phase 5** deleted `movement_facet_lowering.py` + the camera_facet PLAYER path (drone/turret strict path kept byte-identical) + the #182 locator residue; re-sourced the kept `player_unresolved` fail-close on the post-transpile `player_controller_paths ∩ emitted` intersection (D-P5-1); adapted the C-dominance corpus tests to drive the NATIVE un-lowered fixture per-fixture (cold3a59=camera, dde248=camera+move+jump) (D-P5-5); excluded the player from camera_facet lowering at the call site (D-P5-2 revised); FLIPPED `REQUIRE_PLAYER_BIND` 0→1 as the LAST act (slice 5.4) after a fresh cold-Studio conversion proved camera+WASD+jump+shoot+respawn all C-owned with A deleted.
 - **Cold-Studio verify caught 2 real player bugs** the build-time suite couldn't: `host.player:applyRecoil` advertised by the directive but never implemented (missing-method throw); then radians-vs-degrees (the AI's `applyRecoil(2)` slammed the camera to the 80° clamp). Both fixed (applyRecoil takes DEGREES; SceneCameraInput stays radians as its caller is the deterministic lowering pass).
 - Full effort dual-reviewed throughout (design 2 rounds caught 4 codex P1s; phase review caught a vacuous-camera-proof P1; the adversarial codex voice was load-bearing repeatedly). Full fast suite green at the flipped value (2868).
+
+## Run: pr5-generic-canary-20260611T160829 (Phase 1 — turret canary) 2026-06-12
+
+# Decisions — PR5 generic-mode SimpleFPS canary (PLAN stage)
+
+- Phase ordering T → R → D, Net folded into Phase 1 (not a standalone phase). §6 "Net first" + task pins
+  T-bullet and Net into the same phase as T; T is the only admitted/enforced relation, R/D are §3a candidates
+  with unresolved rules, so the durable foundation lands first.
+  Classification: Taste
+
+- T-bullet (autogen `clonePrefabTemplate` nil-parent→workspace) rides inside Phase 1 rather than its own phase
+  — required (with T) for the turret to actually fire; small, self-contained, no threading dependency.
+  Classification: Mechanical
+
+- The §2 PRE-REWRITE REPLACES the existing post-transpile `child_index_lowering.lower_child_index` output-shape
+  matcher; the matcher degrades to the fail-closed surviving-ordinal backstop. Keeping the matcher would
+  recreate the rung-2b fragility the enforcement contract forbids.
+  Classification: Taste
+
+- R (#2-dropped) and D (#9) sequenced after T because they consume Phase 1's threading + verifier surface and
+  each must resolve its own unresolved enforcement rule (§7.2, §7.4) in its own DESIGN stage — not resolved at
+  PLAN time.
+  Classification: Mechanical
+
+- The obligations blob is a normalization of already-derived parse/topology/analyzer facts threaded into the
+  prompt (§5), NOT a new semantic compiler IR (umbrella fences that off).
+  Classification: Mechanical
+
+- (design-review r1, codex BLOCKING) Relation #1 (turret OnTriggerStay) durable replacement DEFERRED from this
+  run. #1 is already satisfied for the corpus by the existing comment-keyed `trigger_stay_lowering` (turret
+  fires once Slice T fixes the crash; symptom catalog reproduces no trigger-stay failure). Task explicitly
+  scoped first slice to #2 + T-bullet. Durable #2+#1 proof (§6 INJECT + verifier, retiring the rung-2b lowering)
+  = tracked follow-on. SURFACED at Gate A (absorb-now vs defer is the human's call).
+  Classification: User-Challenge
+- (design-review r1, codex MAJOR) Backstop verifier framing tightened: fails the phase on ANY surviving ordinal
+  / unresolved child-ref path, not only the literal `GetChildren()[<int>]` shape; pre-rewrite defines §7.2
+  fallback for collisions/unnamed/past-end. Detailed rules at Phase 1 DESIGN.
+  Classification: Mechanical
+
+## Phase 1 DESIGN stage (2026-06-12)
+
+- (Phase 1 DESIGN, OQ1) Single obligations-blob producer: thread RAW parsed_scene/prefab_library/guid_index
+  only as far as the CONTRACT layer (`transpile_with_contract`), which calls the new single producer
+  `child_ref_resolver.build_child_ref_map(...)` and threads a flat typed `ChildRefMap`
+  (`dict[cs_path, dict[ordinal, child_name]]`) into `transpile_scripts` via a new `child_ref_map` kwarg
+  (mirrors `serialized_field_refs`). Keeps the transpiler free of Unity-parse-type imports; names the single
+  producer NOW (§5.3) without a from-scratch normalizer IR (umbrella-fenced). #1/#5/#6 add fields to the same
+  record later. Confirmed against real code: state.parsed_scene/prefab_library/guid_index all set before the
+  transpile phase; `csharp_source` is both the AI input and a cache-key field, so a pre-rewrite that mutates it
+  re-keys the cache automatically.
+  Classification: Taste
+
+- (Phase 1 DESIGN, OQ2) Backstop surviving-ordinal check lives in `contract_verifier.py` as a 4th check
+  `child_ordinal_survivor`, added to `FAIL_CLOSED_CHECKS` (promotes via the existing `fail_closed_errors` →
+  `ctx.errors` → `success=False`). It's the established fail-closed home, runs only on the generic path, and
+  operates on the right artifact (`RbxScript.source`). Detector reuses `child_index_lowering.source_has_child_index`
+  (code-position-aware) repurposed read-only fail-loud + a NEW two-line factored-shape detector. Adjacent-to-
+  pre-rewrite was rejected (would re-implement the verifier's promotion/stash plumbing).
+  Classification: Mechanical
+
+- (Phase 1 DESIGN) Pack disposition: retire the GENERIC-path role ONLY — remove the `lower_child_index` call in
+  `transpile_with_contract`; KEEP `child_index_lowering.py` and the two legacy packs (`unity_transform_child_index`,
+  `turret_canonical_spatial_child`) intact (legacy-only; generic skips run_packs). The schema §3 "Retires" column
+  = generic enforcement-of-record supersedes the fragile mechanism, NOT legacy code deletion (deleting regresses
+  legacy, forbidden).
+  Classification: Mechanical
+
+- (Phase 1 DESIGN) Pre-rewrite substitutes `transform.Find("<name>")` into the C# (the Unity API the AI already
+  transpiles to a Roblox named lookup), not hand-emitted Luau — keeps the pass a pure C# text substitution and
+  lets the AI own the C#→Luau mapping.
+  Classification: Taste
+
+## Phase 1 DESIGN — design-review revision (2026-06-12)
+
+- (Phase 1 DESIGN, review fix) F/T ownership split + F ∥ T parallelism. Slice F owns ALL of
+  `contract_pipeline.py` (incl. the `lower_child_index`-call removal at lines 565-566), `child_ref_resolver.py`
+  (both `build_child_ref_map` AND `prerewrite_child_index`), `code_transpiler.py`, `pipeline.py`, and the two
+  pinned-test updates (`test_pipeline_transpile_wiring.py` generic kwarg-set + `test_child_index_lowering.py`
+  `TestPipelineInvocation` flip). Slice T owns ONLY `contract_verifier.py` (check D) +
+  `test_contract_verifier_child_ordinal.py`. The earlier F→T-sequential framing (removal in T) was unsound
+  under the frozen-phaseBaseSha slice model (T's slice-local tests wouldn't contain F's removal). Since
+  `verify_contract(topology, scripts)` imports none of F's resolver and operates purely on `RbxScript.source`
+  (contract_verifier.py:58-83), T's backstop test is self-contained over synthetic RbxScripts → T no longer
+  deps F. New graph: `{F ∥ T ∥ T-bullet} → N`.
+  Classification: Mechanical
+
+- (Phase 1 DESIGN, review fix) Resolver consumes the FULL-FIDELITY `prefab_library.prefabs`
+  (`list[PrefabTemplate]`, walked from `template.root` over `.children`) and `parsed_scenes`
+  (`list[ParsedScene]` = `state.all_parsed_scenes`), NOT `prefab_library.by_name` — `by_name` is "last wins if
+  collision" (prefab_parser.py:542) and would drop duplicate-named prefabs. Mirrors
+  `extract_serialized_field_refs` (serialized_field_extractor.py:111-128). Imports are
+  `from core.unity_types import GuidIndex, ParsedScene, PrefabLibrary, PrefabNode, PrefabTemplate, SceneNode`
+  (package prefix `core.`, not `converter.core.`; GuidIndex lives in core.unity_types).
+  Classification: Mechanical
+
+- (Phase 1 DESIGN, review fix) ChildRefMap canonical key = `str(path.resolve())` on both producer
+  (guid_index.resolve() already returns resolved asset_path) and the §1.2 hook lookup, with a raw
+  `str(script_path)` fallback (mirrors `_build_serialized_field_context`'s dual lookup,
+  code_transpiler.py:744-746). Prevents a silent key-space miss (info.path is rglob-derived, un-resolved) that
+  would skip the pre-rewrite and leave the turret unfixed even though the backstop fails loud.
+  Classification: Mechanical
+
+- (Phase 1 DESIGN, review fix) Check D is generic-only WITHOUT a new flag: `_run_contract_verifier` →
+  `verify_contract` is reached only inside the topology branch, gated `scene_runtime_mode != "legacy"`
+  (pipeline.py:4722-4723), so legacy never feeds the verifier. Confirmed against real code (supersedes the
+  earlier "gate on a generic flag if needed" open item).
+  Classification: Mechanical
+
+- (Phase 1 DESIGN, review fix) AC(f) re-pointed: the A/B/C(+D) gate is testable only via
+  `test_contract_corpus.py` + `test_contract_verifier.py` (the tests that actually invoke `verify_contract`).
+  The earlier `TestGenericConversionEndToEnd` citation was green-for-the-wrong-reason — that e2e never calls
+  `_run_contract_verifier`/`verify_contract`.
+  Classification: Mechanical
+
+## Phase 1 DESIGN — round-2 review revision (2026-06-12)
+
+- (BLOCKING 1) Resolver call site threads `self.state.all_parsed_scenes or [self.state.parsed_scene]`, NOT bare
+  `all_parsed_scenes`. Confirmed against real code: single-scene parse (pipeline.py:875) leaves
+  `all_parsed_scenes` EMPTY by design (pipeline.py:138 docstring); the SimpleFPS turret lives in a single
+  scene, so the bare form would miss every scene-hosted script. The fallback is the established pipeline-wide
+  idiom (plan_scene_runtime:1017-1022, extract_assets:979, convert_animations:2114). Resolver skips `None`
+  scene entries so the pathological `[None]` (all-parse-failed) case is inert, not a crash. Prefab side reads
+  `prefab_library.prefabs` independently — unaffected.
+  Classification: Mechanical
+
+- (BLOCKING 2 / D5) MERGE Slice F (pre-rewrite/threading) + Slice T (backstop check D) + the SimpleFPS
+  corpus-fixture regen into ONE atomic Slice FT. Corpus investigation (real code): `test_contract_corpus.py`
+  loads `fixture.json`'s captured Luau `source` directly into `RbxScript` and drives the REAL `verify_contract`
+  (no re-transpile) — so check D fires on the frozen fixture `source`, and the committed SimpleFPS Turret/Player
+  entries carry surviving `GetChildren()[1]`. Adding check D + flipping `FAIL_CLOSED_CHECKS` reds the corpus gate
+  on the frozen phaseBaseSha. The fixture is regenerated by `tools/regen_contract_corpus.py`, which runs a REAL
+  generic conversion (run_all, line 108) and captures the transpiled `source` — so a clean fixture needs the
+  pre-rewrite live, and the regen tool itself refuses to write a fixture with any surviving check-D warning
+  (lines 125-142). Pre-rewrite ⟂ check D ⟂ regen are a three-way mutual dependency through the shared committed
+  corpus source; not slice-local green if split, and two slices editing the corpus/verifier risk conflict. New
+  graph: `{FT ∥ T-bullet} → N`. The earlier F∥T framing missed that the COMMITTED corpus test (not just T's
+  synthetic-RbxScript unit test) drives `verify_contract`.
+  Classification: Mechanical (forced by the frozen-base slice model + the proven corpus-gate coupling)
+
+## IMPLEMENT-stage divergence (Phase 1, slice FT) — turret chained GetChild + check-D scope
+Surfaced when FT met the REAL turret. Turret.cs: tBase=transform.GetChild(0); tWeapon=tBase.GetChild(0);
+tOrigin=tWeapon.GetChild(0) (chained property getters). Prefab nesting confirmed: Turret→Base→Weapon→Origin.
+Two gaps the 3 design-review rounds missed (they verified the mechanism, not the real turret/multi-phase corpus):
+1. Pre-rewrite resolves only hop 1 (transform.GetChild) — hops 2-3 abstain (non-transform receiver) → ordinals survive.
+2. Check D fail-closed-on-ANY-ordinal would RED the SimpleFPS corpus on BOTH the turret's chained hops AND
+   Player.cs `self.cam:GetChildren()[1]` (weaponSlot=cam.GetChild(0); cam=Camera.main.transform → Phase 2 #2-dropped).
+RECOMMENDED RESOLUTION (A): (a) extend the pre-rewrite to resolve the transform-ROOTED chain via local dataflow
+(turret Base/Weapon/Origin all → named lookups); (b) scope check D to ASSERT AGAINST THE IR FACT — fail-closed
+only on a surviving ordinal the resolver produced a fact for (turret hops guarded); ABSTAIN where no fact
+(Player cam ref → Phase 2 coverage gap, tracked not failed). Keeps §2 "loud-check-against-the-fact"; reverses
+codex r1's "fail on any ordinal" breadth (which false-positives on Phase 2/3 refs). PENDING user sign-off.
+
+USER SIGN-OFF (Gate, AskUserQuestion): RESOLUTION A chosen — chained/dataflow resolution (transform-rooted
+chain → named lookups) + check D ASSERTS THE IR FACT (fail-closed only where a resolved fact exists; abstain
+where no fact → Phase 2/3 coverage gaps tracked not failed). Classification: User-Challenge (resolved by user).
+
+### D6 (design revised against real code, post-sign-off) — RESOLUTION A mechanism locked
+Verified against the populated test_projects/SimpleFPS (submodule empty in the worktree — read main checkout):
+Turret.cs:37-48 chained block-bodied getters tBase=transform.GetChild(0)/tWeapon=tBase.GetChild(0)/
+tOrigin=tWeapon.GetChild(0); Turret.prefab Transform graph reconstructed = Turret→{Base→{Weapon→{Origin}},
+Collider}; ALL 3 hops resolve to Base/Weapon/Origin. Player.cs:90-91 cam=Camera.main.transform; weaponSlot=
+cam.GetChild(0) → foreign receiver → ABSTAIN.
+- Chained resolution: per-script Transform symbol table seeded transform↦host, fixpoint over local-var +
+  block-bodied + expression-bodied getter defs `<recv>.GetChild(n)`; receiver preserved, only .GetChild(n)→
+  .Find("<name>"). Tractable TEXTUALLY (no Roslyn) against the real block-getter syntax — confirmed.
+- Fact-based check D: resolver stamps {getchild_total,resolved_total} onto a NEW RbxScript.child_ref_resolution
+  field (the robust mechanism — verify_contract + the frozen-fixture corpus replay see ONLY RbxScript, so the
+  fact must ride on it; keyed on the deterministic resolver tally, NOT a fragile C#-symbol→Luau-name match).
+  fully_resolved := resolved_total==getchild_total>0. Fail-closed child_ordinal_survivor (warning) only in a
+  fully-resolved script (regression); abstain child_ordinal_coverage_gap (info, never promoted) otherwise.
+  Reverses codex-r1's "fail on ANY ordinal" breadth (false-positives on the shared corpus's Phase-2 cam ref).
+- Corpus stays GREEN after FT regen: Turret = named lookups + {3,3}; Player cam ordinal survives but UNFLAGGED
+  via {1,0}. Regen write-refusal keyed on `warning` only (fail_closed_errors filters severity), so the Player
+  info gap does not block the write.
+- Coverage limitation (accepted): a mixed resolved+unresolved script → check D abstains for the whole script
+  (loses backstop on the resolved site, already construction-safe). Corpus doesn't hit it.
+- Slice graph UNCHANGED {FT ∥ T-bullet}→N; FT now also owns core/roblox_types.py (the new field).
+  Supersedes the "fail on ANY surviving ordinal" MAJOR above. Classification: User-Challenge.
