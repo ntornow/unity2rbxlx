@@ -663,7 +663,7 @@ def test_p1_final_syntax_check_after_rewrites_stamps_false() -> None:
             _neutralize_assignment,
             _rewrite_field_reads,
         )
-        ns, inj = _inject_resolver_method(src, "Player", "WeaponSlot", "weaponSlot")
+        ns, inj = _inject_resolver_method(src, "Player", "WeaponSlot", "weaponSlot", "WeaponSlot")
         assert inj and syntax_errors_for_source(ns) == []  # post-inject parses
         ns, _ = _rewrite_field_reads(ns, "weaponSlot", "_resolveWeaponSlot")
         ns, _ = _neutralize_assignment(ns, "weaponSlot", "WeaponSlot")
@@ -882,7 +882,7 @@ def test_r3_fallback_validates_if_then_end_block_balance(monkeypatch) -> None:
         _structural_balance_ok,
     )
     assert _structural_balance_ok(src) is True
-    ns, inj = _inject_resolver_method(src, "Player", "WeaponSlot", "weaponSlot")
+    ns, inj = _inject_resolver_method(src, "Player", "WeaponSlot", "weaponSlot", "WeaponSlot")
     assert inj
     ns, _ = _rewrite_field_reads(ns, "weaponSlot", "_resolveWeaponSlot")
     ns, _ = _neutralize_assignment(ns, "weaponSlot", "WeaponSlot")
@@ -1055,3 +1055,164 @@ def test_r3_neutralize_anchor_requires_ordinal_child_access() -> None:
     out2, neutralized2 = _neutralize_assignment(src2, "weaponSlot", "WeaponSlot")
     assert neutralized2 is True
     assert "self.weaponSlot = nil" in out2
+
+
+# === round-4 P1 fixes =======================================================
+
+
+def test_r4_special_char_child_name_produces_valid_luau() -> None:
+    # R4 BLOCKING (lowering:107,196,678): a Roblox child name with a SPACE
+    # (``"Weapon Slot"``) must NOT be raw-spliced into a Luau method identifier
+    # (``self:_resolveWeapon Slot()`` is invalid). The method-name suffix is
+    # sanitized to a valid identifier while the rig LOOKUP still uses the REAL
+    # ``"Weapon Slot"`` string in ``FindFirstChild``.
+    s = _Script(_AI_PLAYER)
+    crm = _rig_map(field="weaponSlot", child="Weapon Slot")
+    lower_rifle_rig_retarget([s], crm)
+    out = s.luau_source
+    # No invalid identifier is ever emitted (no bare ``_resolveWeapon Slot``).
+    assert "_resolveWeapon Slot" not in out
+    # The rig lookup uses the LITERAL real child name string.
+    assert 'rig:FindFirstChild("Weapon Slot", true)' in out
+    # The carrier discharges True on the corpus shape with a spaced child name.
+    assert s.rig_binding is not None
+    assert s.rig_binding["present"] is True
+    assert s.rig_binding["child"] == "Weapon Slot"
+    # The emitted method-name identifier parses as valid Luau (if analyzer present).
+    if luau_analyze_path():
+        assert syntax_errors_for_source(out) == []
+
+
+def test_r4_special_char_method_suffix_is_valid_luau_identifier() -> None:
+    # The sanitized suffix is always a valid Luau identifier (generic — any
+    # special char). Distinct child names get distinct suffixes (collision-resistant).
+    from converter.rifle_rig_retarget_lowering import _LUAU_IDENT_RE, _method_suffix
+    for name in ("Weapon Slot", "Weapon-Slot", "1stSlot", "слот", "a.b", "Slot!"):
+        suffix = _method_suffix(name)
+        assert _LUAU_IDENT_RE.match(suffix), f"{name!r} -> {suffix!r} invalid"
+    # A valid identifier passes through verbatim (happy-path + idempotency).
+    assert _method_suffix("WeaponSlot") == "WeaponSlot"
+    # Two distinct names that sanitize alike get distinct suffixes.
+    assert _method_suffix("Weapon Slot") != _method_suffix("Weapon-Slot")
+
+
+def test_r4_preexisting_foreign_resolver_method_not_false_discharged() -> None:
+    # R4 BLOCKING (lowering:240,578): a PREEXISTING foreign ``_resolveWeaponSlot``
+    # method (body just ``return nil``) + a preexisting call, NO camera-child write,
+    # NO surviving consumer read. The OLD shape-only discharge (bare same-named
+    # method + call + no read + no camera-write) stamps present=True with the
+    # lowering having done NO work this run (modified=0, no own emit). Discharge must
+    # bind to the lowering's OWN emit: never a present=True with the FOREIGN method
+    # as the only resolver.
+    src = (
+        "function Player:_resolveWeaponSlot()\n"
+        "    return nil\n"  # FOREIGN body — not the lowering's emit
+        "end\n\n"
+        "function Player:GetRifle()\n"
+        "    return self:_resolveWeaponSlot()\n"  # a call already exists; no bare read
+        "end\n\n"
+        "return Player\n"
+    )
+    s = _Script(src)
+    n = lower_rifle_rig_retarget([s], _rig_map())
+    assert s.rig_binding is not None
+    own_emitted = 'm:GetAttribute("_MainCameraRig")' in s.luau_source
+    # INVARIANT: present=True ONLY if the lowering's OWN emit landed this run.
+    # A bare foreign method must never count as discharged.
+    if s.rig_binding["present"] is True:
+        assert own_emitted and n == 1  # re-injected the OWN method (real work)
+    else:
+        # Abstained: present=False, foreign method left, no own emit.
+        assert s.rig_binding["present"] is False
+        assert not own_emitted
+
+
+def test_r4_foreign_resolver_alone_is_not_own_emit() -> None:
+    # Unit: a foreign ``_resolveWeaponSlot`` (no own-emit body marker) is NOT
+    # recognized as the lowering's own method; the lowering's OWN emit IS.
+    from converter.rifle_rig_retarget_lowering import (
+        _has_own_resolver_method,
+        _resolver_method_text,
+    )
+    foreign = (
+        "function Player:_resolveWeaponSlot()\n"
+        "    return nil\n"
+        "end\n"
+    )
+    assert _has_own_resolver_method(foreign, "WeaponSlot") is False
+    own = _resolver_method_text("Player", "WeaponSlot", "weaponSlot", "WeaponSlot")
+    assert _has_own_resolver_method(own, "WeaponSlot") is True
+
+
+def test_r4_fallback_tail_scan_allows_trailing_comment(monkeypatch) -> None:
+    # R4 MINOR (lowering:762): the analyzer-absent fallback's post-return tail scan
+    # must be code-position aware — a COMMENT after ``return <Class>`` containing
+    # ``end``/``function`` as prose must NOT false-reject a valid source. Both the
+    # inline-comment form (``return Player -- ...``) and a following comment LINE.
+    import utils.luau_analyze as ula
+    monkeypatch.setattr(ula, "luau_analyze_path", lambda: None)
+    from converter.rifle_rig_retarget_lowering import _structural_balance_ok
+    inline = (
+        "function Player:GetRifle()\n"
+        "    return 1\n"
+        "end\n\n"
+        "return Player -- ends the function\n"
+    )
+    assert _structural_balance_ok(inline) is True
+    following_comment_line = (
+        "function Player:GetRifle()\n"
+        "    return 1\n"
+        "end\n\n"
+        "return Player\n"
+        "-- this is the end of the function module\n"
+    )
+    assert _structural_balance_ok(following_comment_line) is True
+    # A REAL code-level ``function``/``end`` after the return is still rejected.
+    broken = (
+        "return Player\n"
+        "function Player:Stray()\n"
+        "    return 2\n"
+        "end\n"
+    )
+    assert _structural_balance_ok(broken) is False
+
+
+def test_r4_typed_local_decl_abstains_field_write_admits(tmp_path: Path) -> None:
+    # R4 MAJOR (resolver:723,760): a C# TYPED LOCAL declaration
+    # ``Transform weaponSlot = Camera.main.transform.GetChild(0);`` must NOT be
+    # admitted as a rig fact (it would flip resolved_total + a bogus fail-closed
+    # path); only a bare FIELD write admits.
+    typed_local = (
+        "public class Player : MonoBehaviour {\n"
+        "  void Awake() {\n"
+        "    Transform weaponSlot = Camera.main.transform.GetChild(0);\n"
+        "  }\n}\n"
+    )
+    entry = _build(tmp_path, typed_local, _fps_library())
+    assert entry is not None
+    assert entry.rig_facts == ()  # typed local decl -> abstain
+    # The real FIELD write still admits.
+    field_write = (
+        "public class Player : MonoBehaviour {\n"
+        "  public Transform weaponSlot;\n"
+        "  void Awake() { weaponSlot = Camera.main.transform.GetChild(0); }\n}\n"
+    )
+    entry2 = _build(tmp_path, field_write, _fps_library())
+    assert entry2 is not None
+    assert entry2.rig_facts == (
+        RigRootedRetargetFact(field_name="weaponSlot", child_name="WeaponSlot"),
+    )
+
+
+def test_r4_var_local_decl_abstains(tmp_path: Path) -> None:
+    # ``var weaponSlot = Camera.main.transform.GetChild(0);`` — a ``var`` typed local
+    # is also a declaration -> abstain.
+    src = (
+        "public class Player : MonoBehaviour {\n"
+        "  void Awake() {\n"
+        "    var weaponSlot = Camera.main.transform.GetChild(0);\n"
+        "  }\n}\n"
+    )
+    entry = _build(tmp_path, src, _fps_library())
+    assert entry is not None
+    assert entry.rig_facts == ()

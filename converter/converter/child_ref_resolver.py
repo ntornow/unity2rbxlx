@@ -723,8 +723,16 @@ def _canonical_receiver(source: str, recv: str, use_pos: int) -> str | None:
 def _lhs_is_bare_field(source: str, field_start: int, full_lhs: str) -> str | None:
     """Given the matched LHS text ``full_lhs`` (group 1 of _CS_CAM_GETCHILD_RE)
     starting at ``field_start``, return the bare field name iff the LHS is a bare
-    field or a ``this.``-qualified field; else None (a FOREIGN member-access LHS
-    like ``x.weaponSlot`` is REJECTED — round-1 BLOCKING #2 / edge 11)."""
+    field WRITE or a ``this.``-qualified field write; else None.
+
+    REJECTED (abstain):
+      - a FOREIGN member-access LHS like ``x.weaponSlot`` (round-1 BLOCKING #2 /
+        edge 11) — a foreign ``.`` qualifier precedes the LHS; and
+      - a TYPED LOCAL DECLARATION like ``Transform weaponSlot = ...`` / ``var x = ...``
+        (round-4 MAJOR) — a leading type/`var` TOKEN precedes the field. A local
+        temp is NOT a rig fact (the field never persists on the instance), so
+        admitting it would flip ``resolved_total`` and create a bogus fail-closed
+        path for valid code."""
     parts = full_lhs.split(".")
     if len(parts) == 1:
         field = parts[0]
@@ -732,14 +740,21 @@ def _lhs_is_bare_field(source: str, field_start: int, full_lhs: str) -> str | No
         field = parts[1]
     else:
         return None  # x.weaponSlot / a.b.weaponSlot -> foreign member-access LHS
-    # Guard: the char immediately before the LHS must not be a ``.`` (a foreign
-    # qualifier the regex didn't capture, e.g. ``obj.weaponSlot`` where the regex
-    # started at ``weaponSlot``). Walk back over whitespace.
+    # Walk back over whitespace (incl. newlines) to the preceding non-blank char.
     k = field_start
-    while k > 0 and source[k - 1] in " \t":
+    while k > 0 and source[k - 1] in " \t\r\n":
         k -= 1
-    if k > 0 and source[k - 1] == ".":
+    if k <= 0:
+        return field  # start of file -> bare write
+    prev = source[k - 1]
+    if prev == ".":
         return None  # a foreign ``.`` qualifier precedes the LHS
+    # A preceding IDENTIFIER char means a leading token (a TYPE like ``Transform``
+    # or ``var``) immediately precedes the field -> a typed local DECLARATION, not a
+    # bare field write. C# statements terminate with ``;``/``{``/``}`` (or start of
+    # file), so a bare field write's preceding non-blank char is never a word char.
+    if prev.isalnum() or prev == "_":
+        return None  # typed local declaration -> abstain
     return field
 
 

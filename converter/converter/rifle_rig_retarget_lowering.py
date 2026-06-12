@@ -33,6 +33,7 @@ handed, the documented lowering side effect — like ``lower_trigger_stay``).
 
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 from typing import Protocol
@@ -62,8 +63,38 @@ _NON_YIELDING_LIFECYCLE_METHODS: frozenset[str] = frozenset({"Awake", "Start"})
 _FUNCTION_METHOD_RE = re.compile(r"\bfunction\s+([A-Za-z_]\w*)[:.]([A-Za-z_]\w*)\s*\(")
 
 # A code-level ``return <Ident>`` at module scope — the transpiler's module
-# epilogue. The resolver method is spliced immediately BEFORE this.
-_RETURN_IDENT_RE = re.compile(r"^[ \t]*return\s+([A-Za-z_]\w*)\s*$", re.MULTILINE)
+# epilogue. The resolver method is spliced immediately BEFORE this. An OPTIONAL
+# trailing line-comment is tolerated (``return Player -- module epilogue``) so a
+# commented epilogue is still recognized as the splice point AND its tail scan
+# stays code-position aware (round-4 MINOR).
+_RETURN_IDENT_RE = re.compile(
+    r"^[ \t]*return\s+([A-Za-z_]\w*)[ \t]*(?:--[^\n]*)?$", re.MULTILINE
+)
+
+# A valid Luau identifier (the shape a method-name suffix must satisfy before it
+# can be spliced into ``function <Class>:_resolve<suffix>()`` / ``self:_resolve<suffix>()``).
+_LUAU_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _method_suffix(child: str) -> str:
+    """A deterministic VALID-LUAU-IDENTIFIER suffix for the resolver method name
+    ``_resolve<suffix>``. A Roblox child name may contain spaces/special chars
+    (e.g. ``"Weapon Slot"``) that are illegal in a Luau identifier; the rig LOOKUP
+    still uses the REAL ``child`` string in ``FindFirstChild("<real name>", true)``,
+    so ONLY the Luau method identifier needs sanitizing.
+
+    If ``child`` is already a valid identifier, it is used verbatim (preserves the
+    happy-path emit + cross-run idempotency). Otherwise each illegal char is mapped
+    to ``_`` and a short hash of the REAL name is appended for collision resistance
+    (two distinct child names that sanitize to the same prefix get distinct
+    suffixes). The result always satisfies ``_LUAU_IDENT_RE``."""
+    if _LUAU_IDENT_RE.match(child):
+        return child
+    sanitized = re.sub(r"[^A-Za-z0-9_]", "_", child)
+    if not sanitized or not re.match(r"[A-Za-z_]", sanitized):
+        sanitized = "_" + sanitized
+    digest = hashlib.sha1(child.encode("utf-8")).hexdigest()[:8]
+    return f"{sanitized}_{digest}"
 
 
 def lower_rifle_rig_retarget(
@@ -104,17 +135,31 @@ def lower_rifle_rig_retarget(
         for fact in rig_facts:
             field = fact.field_name
             child = fact.child_name
-            method = f"_resolve{child}"
+            # The method-name suffix is a VALID Luau identifier derived from the
+            # child name (which may carry spaces/special chars); the rig LOOKUP
+            # still uses the real ``child`` string. The cache local ``_<field>Cache``
+            # splices ``field`` — a C# field name, always a valid identifier — but
+            # guard it too: if either can't yield a valid identifier, ABSTAIN (the
+            # carrier still stamps present=False so the verifier fail-closes loud).
+            suffix = _method_suffix(child)
+            if not _LUAU_IDENT_RE.match(field):
+                script.rig_binding = {
+                    "field": field,
+                    "child": child,
+                    "present": False,
+                }
+                continue
+            method = f"_resolve{suffix}"
             class_name = _read_class_name(script.luau_source)
             original = script.luau_source
             if class_name is not None:
                 new_src, injected = _inject_resolver_method(
-                    script.luau_source, class_name, child, field
+                    script.luau_source, class_name, child, field, suffix
                 )
                 if injected:
                     new_src, _reads = _rewrite_field_reads(new_src, field, method)
                     new_src, _neutralized = _neutralize_assignment(
-                        new_src, field, child
+                        new_src, field, suffix
                     )
                     # Re-check Luau syntax on the FINAL source AFTER ALL rewrites
                     # (inject + read-rewrite + neutralize) — a read-rewrite or a
@@ -124,7 +169,7 @@ def lower_rifle_rig_retarget(
                     # If the FINAL source fails to parse, abstain/revert.
                     if not _luau_syntax_ok(new_src):
                         script.luau_source = original  # never ship unloadable Luau
-                    elif _binding_discharged(new_src, field, child):
+                    elif _binding_discharged(new_src, field, suffix):
                         script.luau_source = new_src
                         changed = True
                     else:
@@ -138,7 +183,7 @@ def lower_rifle_rig_retarget(
             # reads + neutralized write actually landed. This re-stamps identically
             # on an idempotent second call (the method is already present) and
             # never stamps True off a reverted edit.
-            present = _binding_discharged(script.luau_source, field, child)
+            present = _binding_discharged(script.luau_source, field, suffix)
             script.rig_binding = {
                 "field": field,
                 "child": child,
@@ -193,14 +238,22 @@ def _last_module_return_span(source: str, class_name: str) -> tuple[int, int] | 
     return chosen
 
 
-def _resolver_method_text(class_name: str, child: str, field: str) -> str:
+def _resolver_method_text(
+    class_name: str, child: str, field: str, suffix: str
+) -> str:
     """The per-instance memoized resolver METHOD — a REAL rig-child Instance (or
     nil), bounded 30x0.1s retry, memoized on ``self._<field>Cache``. NO proxy,
-    NO module-level state. Ported from the legacy WeaponMount pack."""
+    NO module-level state. Ported from the legacy WeaponMount pack.
+
+    ``suffix`` is the VALID-LUAU-IDENTIFIER method-name suffix (``_resolve<suffix>``);
+    the rig LOOKUP uses the REAL ``child`` string in ``FindFirstChild``. The body
+    carries the lowering's OWN-EMIT marker (``-- _RIG_RETARGET_<suffix>``) and the
+    distinctive ``_MainCameraRig`` rig scan so discharge can bind to the lowering's
+    own emit, not a preexisting foreign method of the same name."""
     cache = f"_{field}Cache"
     return (
-        f"-- _RIG_RETARGET_{child} (auto-generated: Camera.main child-ref retargeted to the rig; per-instance, lazy-at-use)\n"
-        f"function {class_name}:_resolve{child}()\n"
+        f"-- _RIG_RETARGET_{suffix} (auto-generated: Camera.main child-ref retargeted to the rig; per-instance, lazy-at-use)\n"
+        f"function {class_name}:_resolve{suffix}()\n"
         f"    -- memoized per-instance; re-resolves if the cached slot was destroyed\n"
         f"    if self.{cache} and self.{cache}.Parent then\n"
         f"        return self.{cache}\n"
@@ -228,28 +281,29 @@ def _resolver_method_text(class_name: str, child: str, field: str) -> str:
 
 
 def _inject_resolver_method(
-    source: str, class_name: str, child: str, field: str
+    source: str, class_name: str, child: str, field: str, suffix: str
 ) -> tuple[str, bool]:
     """Inject the resolver method BEFORE the trailing ``return <Class>`` (so the
     module stays loadable), then a Luau syntax re-check. Returns
-    ``(new_source, injected)``. Idempotency: if the method is already present at a
-    code position, return ``(source, False)``. On a syntax-check failure, abstain
-    (return the pre-edit source, False)."""
-    # Idempotency: guard on the ACTUAL injected method's presence at a code
-    # position, NOT a comment-marker substring (round-1 MINOR #6).
-    method_decl = f"function {class_name}:_resolve{child}("
-    idx = source.find(method_decl)
-    while idx != -1:
-        if _luau_pos_is_code(source, idx) and not _luau_pos_in_long_bracket(source, idx):
-            return source, False  # already injected -> no re-inject
-        idx = source.find(method_decl, idx + 1)
+    ``(new_source, injected)``. Idempotency: if the LOWERING'S OWN resolver method
+    is already present at a code position, return ``(source, False)``. A preexisting
+    FOREIGN method of the same name (NOT the lowering's own emit) does NOT count as
+    already-injected — it is re-injected (the OWN-emit body is the authority, not
+    bare name presence). On a syntax-check failure, abstain (return the pre-edit
+    source, False)."""
+    # Idempotency: guard on the lowering's OWN injected method's presence at a code
+    # position (own-emit body match), NOT a bare same-named declaration (round-4
+    # BLOCKING: a foreign ``_resolve<Child>`` body of ``return nil`` must not be
+    # treated as already-injected).
+    if _has_own_resolver_method(source, suffix):
+        return source, False  # the lowering's own method already present -> no re-inject
 
     span = _last_module_return_span(source, class_name)
     if span is None:
         return source, False  # no module epilogue to splice before -> abstain
 
     ins_at = span[0]
-    method_text = _resolver_method_text(class_name, child, field)
+    method_text = _resolver_method_text(class_name, child, field, suffix)
     new_source = source[:ins_at] + method_text + source[ins_at:]
 
     if not _luau_syntax_ok(new_source):
@@ -474,12 +528,14 @@ _CAMERA_CHILD_RHS_RE = re.compile(
 
 
 def _neutralize_assignment(
-    source: str, field: str, child: str
+    source: str, field: str, suffix: str
 ) -> tuple[str, bool]:
     """Replace the RHS of the camera-child Awake write ``self.<field> = <rhs>``
     with ``nil``, FACT-ANCHORED on the camera-child RHS shape (not the first
     ``self.<field> =`` anywhere), multiline-aware. Abstain-safe (no-op if no
-    camera-child write exists). Returns ``(new_source, neutralized)``."""
+    camera-child write exists). ``suffix`` is the VALID-LUAU-IDENTIFIER method-name
+    suffix (only used in the rig-retarget comment). Returns
+    ``(new_source, neutralized)``."""
     assign_re = re.compile(r"self\." + re.escape(field) + r"\s*=(?!=)")
     for m in assign_re.finditer(source):
         if not _luau_pos_is_code(source, m.start()):
@@ -491,7 +547,7 @@ def _neutralize_assignment(
         rhs = source[rhs_start:rhs_end]
         if _CAMERA_CHILD_RHS_RE.search(rhs) is None:
             continue  # not the camera-child write -> leave it (e.g. a config)
-        comment = f" -- rig-retargeted: resolved lazily at use via _resolve{child}"
+        comment = f" -- rig-retargeted: resolved lazily at use via _resolve{suffix}"
         new_source = (
             source[:rhs_start] + " nil" + comment + source[rhs_end:]
         )
@@ -575,24 +631,31 @@ def _line_continues(source: str, start: int, nl_pos: int) -> bool:
     return _CONTINUATION_HEAD_RE.match(source[j:j + 4]) is not None
 
 
-def _binding_discharged(source: str, field: str, child: str) -> bool:
+def _binding_discharged(source: str, field: str, suffix: str) -> bool:
     """INDEPENDENT, code-position-aware derivation: is ``field``'s binding
     discharged via the rig retarget in THIS source? Mirrors the verifier's
     authority (S1b owns the verifier copy; this is the lowering's own re-derive so
     it never stamps ``present=True`` off a reverted edit).
 
+    ``suffix`` is the VALID-LUAU-IDENTIFIER method-name suffix (``_resolve<suffix>``).
+
     True IFF:
-      (1) the resolver method ``function <Class>:_resolve<Child>(`` exists AND
-          >=1 ``self:_resolve<Child>(`` call exists AND NO bare ``self.<field>``
+      (1) the LOWERING'S OWN resolver method ``function <Class>:_resolve<suffix>(``
+          (own-emit body, NOT a preexisting foreign same-named method) exists AND
+          >=1 ``self:_resolve<suffix>(`` call exists AND NO bare ``self.<field>``
           READ survives at a consumer; AND
       (2) the camera-child WRITE is gone — no surviving
           ``self.<field> = <... :GetChildren()[n] | :GetChild(n) | self.cam ...>``.
-    """
-    method_call = f"self:_resolve{child}("
-    # (1a) resolver METHOD declaration present at a code position.
-    if not _has_resolver_method(source, child):
+
+    Round-4 BLOCKING: condition (1a) requires the lowering's OWN emit, so a
+    preexisting foreign ``_resolve<suffix>`` method (e.g. body ``return nil``) that
+    the lowering never wrote this run cannot false-discharge ``present=True`` on an
+    unchanged source."""
+    method_call = f"self:_resolve{suffix}("
+    # (1a) the lowering's OWN resolver method is present at a code position.
+    if not _has_own_resolver_method(source, suffix):
         return False
-    # (1b) >=1 ``self:_resolve<Child>(`` CALL (distinct from the declaration).
+    # (1b) >=1 ``self:_resolve<suffix>(`` CALL (distinct from the declaration).
     if not _code_contains_token(source, method_call):
         return False
     # (1c) no surviving bare ``self.<field>`` READ (an assignment LHS is allowed —
@@ -614,16 +677,51 @@ def _code_contains_token(source: str, token: str) -> bool:
     return False
 
 
-def _has_resolver_method(source: str, child: str) -> bool:
-    """True if a code-position ``function <Class>:_resolve<Child>(`` declaration
-    exists."""
+# The lowering's OWN-EMIT body signature — the distinctive rig-scan line every
+# emitted resolver carries. A preexisting FOREIGN ``_resolve<suffix>`` method (e.g.
+# ``return nil``) will NOT contain it, so discharge / idempotency can bind to the
+# lowering's own emit rather than a bare same-named declaration (round-4 BLOCKING).
+_OWN_EMIT_BODY_MARKER = 'm:GetAttribute("_MainCameraRig")'
+
+
+def _has_own_resolver_method(source: str, suffix: str) -> bool:
+    """True if the LOWERING'S OWN ``function <Class>:_resolve<suffix>(`` method is
+    present at a code position — identified by the own-emit body signature
+    (``_OWN_EMIT_BODY_MARKER``) appearing inside the method body, NOT by the bare
+    declaration. A preexisting foreign same-named method (different body) returns
+    False."""
     pat = re.compile(
-        r"\bfunction\s+[A-Za-z_]\w*[:.]_resolve" + re.escape(child) + r"\s*\("
+        r"\bfunction\s+[A-Za-z_]\w*[:.]_resolve" + re.escape(suffix) + r"\s*\("
     )
     for m in pat.finditer(source):
-        if _luau_pos_is_code(source, m.start()) and not _luau_pos_in_long_bracket(source, m.start()):
-            return True
+        if not _luau_pos_is_code(source, m.start()):
+            continue
+        if _luau_pos_in_long_bracket(source, m.start()):
+            continue
+        # The body runs from the declaration to the NEXT code-level module ``function``
+        # (or EOF). The own-emit body marker must appear within it at a code position.
+        body_end = _next_module_function_start(source, m.end())
+        body = source[m.start():body_end]
+        marker_idx = body.find(_OWN_EMIT_BODY_MARKER)
+        while marker_idx != -1:
+            abs_idx = m.start() + marker_idx
+            if _luau_pos_is_code(source, abs_idx) and not _luau_pos_in_long_bracket(source, abs_idx):
+                return True
+            marker_idx = body.find(_OWN_EMIT_BODY_MARKER, marker_idx + 1)
     return False
+
+
+def _next_module_function_start(source: str, after: int) -> int:
+    """The char index of the next code-level ``function <Class>:<m>(`` declaration
+    at or after ``after``, or ``len(source)`` if none. Bounds a resolver method's
+    body for the own-emit body scan."""
+    for m in _FUNCTION_METHOD_RE.finditer(source, after):
+        if not _luau_pos_is_code(source, m.start()):
+            continue
+        if _luau_pos_in_long_bracket(source, m.start()):
+            continue
+        return m.start()
+    return len(source)
 
 
 def _has_surviving_field_read(source: str, field: str) -> bool:
@@ -764,7 +862,13 @@ def _structural_balance_ok(source: str) -> bool:
         if _luau_pos_is_code(source, m.start()) and not _luau_pos_in_long_bracket(source, m.start()):
             last_return_end = m.end()
     if last_return_end != -1:
-        tail = source[last_return_end:]
-        if re.search(r"\bfunction\b|\bend\b", tail):
-            return False
+        # CODE-POSITION-AWARE tail scan (round-4 MINOR): a trailing COMMENT after
+        # the module return (``return Player -- ends the function``) contains the
+        # words ``end``/``function`` as prose, NOT as code. A raw-text scan would
+        # false-reject it. Only a code-level ``function``/``end`` keyword after the
+        # return is the after-``return`` splice bug.
+        tail_re = re.compile(r"\bfunction\b|\bend\b")
+        for m in tail_re.finditer(source, last_return_end):
+            if _luau_pos_is_code(source, m.start()) and not _luau_pos_in_long_bracket(source, m.start()):
+                return False
     return True
