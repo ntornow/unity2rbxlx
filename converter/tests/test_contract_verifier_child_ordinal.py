@@ -15,9 +15,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import pytest  # noqa: E402
+
 from converter import contract_verifier  # noqa: E402
 from converter.contract_verifier import (  # noqa: E402
     FAIL_CLOSED_CHECKS,
+    _receiver_roots_at_engine_global,
     fail_closed_errors,
     verify_contract,
 )
@@ -256,6 +259,41 @@ def test_fully_resolved_only_global_survivor_does_not_fire() -> None:
     s = RbxScript(
         name="Turret",
         source="local g = workspace:GetChildren()[1]\nreturn g",
+        child_ref_resolution={"getchild_total": 1, "resolved_total": 1},
+    )
+    assert _check_d([s]) == []
+
+
+@pytest.mark.parametrize(
+    "receiver, is_global",
+    [
+        # Every root in _ENGINE_GLOBAL_ROOTS is excluded...
+        ("workspace.Folder", True),
+        ("game.Players.Foo", True),
+        ('game:GetService("Players").Foo', True),  # service-call root still roots at game
+        ("script.Parent", True),
+        ("Players.LocalPlayer", True),
+        # ...but a child-ref-plausible root (self / a local) is NOT excluded.
+        ("self.cam", False),
+        ("base", False),
+        ("origin.Parent", False),
+    ],
+)
+def test_engine_global_root_classification(receiver: str, is_global: bool) -> None:
+    assert _receiver_roots_at_engine_global(receiver) is is_global
+
+
+@pytest.mark.parametrize(
+    "global_recv",
+    ["game.Players", 'game:GetService("Players")', "script.Parent", "Players.Local"],
+)
+def test_each_engine_global_survivor_excluded_from_budget(global_recv: str) -> None:
+    # {1,1} fully-resolved: the only ordinal roots at a NON-workspace engine global
+    # -> excluded -> 0 counted survivors -> check D does NOT fire. Guards the
+    # game/Players/script roots beyond the workspace case above.
+    s = RbxScript(
+        name="Turret",
+        source=f"local g = {global_recv}:GetChildren()[1]\nreturn g",
         child_ref_resolution={"getchild_total": 1, "resolved_total": 1},
     )
     assert _check_d([s]) == []
