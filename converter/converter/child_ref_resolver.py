@@ -54,6 +54,20 @@ class ChildRefFact:
     child_name: str  # resolved authored child name (resolved-node.children[n].name)
 
 
+@dataclass(frozen=True)
+class RigRootedRetargetFact:
+    """One Camera.main-rooted child-ref RETARGET obligation, consumed POST-transpile.
+
+    Distinct from ChildRefFact (host-rooted, receiver-PRESERVING, pre-AI): this
+    fact's receiver (Camera.main.transform) points at the LIVE camera, but the
+    resolved child lives under the converted _MainCameraRig Model at runtime, so
+    the receiver is DISCARDED and the binding is retargeted to the rig. Consumed
+    by the post-transpile rifle_rig_retarget_lowering, NOT by prerewrite_child_index.
+    """
+    field_name: str  # the assignment LHS field ("weaponSlot"), from `<field> = cam.GetChild(n)`
+    child_name: str  # resolved authored child name under the MainCamera node ("WeaponSlot"), E1–E3 guarded
+
+
 # Per-script resolution outcome, keyed on the canonical .cs path key. Carries
 # the resolved facts (what the pre-rewrite rewrites) AND the per-script
 # resolved/total tally (what the backstop asserts against). A script with >= 1
@@ -62,7 +76,8 @@ class ChildRefFact:
 class ChildRefScript:
     facts: tuple[ChildRefFact, ...]  # one per RESOLVED site (rewrite targets)
     getchild_total: int  # all GetChild SITES seen in this script
-    resolved_total: int  # len(facts) == sites that produced a fact
+    resolved_total: int  # len(facts) + len(rig_facts) == sites that produced a fact
+    rig_facts: tuple[RigRootedRetargetFact, ...] = ()  # Camera.main-rooted retarget facts
 
 
 ChildRefMap = dict[str, ChildRefScript]  # {canonical_cs_path_str: ChildRefScript}
@@ -94,6 +109,24 @@ _CS_GETCHILD_GETTER_BLOCK_RE = re.compile(  # Transform x { get { return recv.Ge
 _CS_GETCHILD_GETTER_EXPR_RE = re.compile(  # Transform x => recv.GetChild(0);
     r"\bTransform\s+([A-Za-z_]\w*)\s*=>\s*"
     + _CS_RECV + r"\.GetChild\(\s*(\d+)\s*\)"
+)
+
+# Camera.main-rooted RETARGET assignment matcher (the rig path). Binds the WRITE
+# ``<field> = <camrecv>.GetChild(n)`` where ``<camrecv>`` chains to
+# ``Camera.main.transform``:
+#   group 1 = assignment LHS field (the bare ``<field>``; an optional ``this.``
+#             qualifier is consumed but NOT captured; a foreign member-access LHS
+#             like ``x.weaponSlot`` is rejected — see _resolve_rig_facts).
+#   group 2 = the receiver expression text (resolved to a canonical chain).
+#   group 3 = the ordinal n.
+# The LHS allows ONLY a bare field or a ``this.``-qualified field; a dotted
+# member-access LHS (``x.weaponSlot``) is excluded by requiring the char before
+# the field (after the optional ``this.``) to not be a foreign ``.`` qualifier —
+# enforced structurally in _resolve_rig_facts (the regex captures the tail field,
+# the resolver checks the head).
+_CS_CAM_GETCHILD_RE = re.compile(
+    r"([A-Za-z_][\w.]*)\s*=\s*"
+    r"([A-Za-z_][\w.]*)\.GetChild\(\s*(\d+)\s*\)"
 )
 
 
@@ -487,7 +520,147 @@ def _canon_key(path: Path) -> str:
         return str(path)
 
 
-def _resolve_script(source: str, host_node: HostNode) -> ChildRefScript | None:
+_CAMERA_MAIN_TRANSFORM = "Camera.main.transform"
+
+
+def _main_camera_node(
+    host_node: HostNode,
+    parsed_scenes: list[ParsedScene] | None,
+    prefab_library: PrefabLibrary | None,
+) -> HostNode | None:
+    """The UNIQUE parsed node tagged ``MainCamera`` in the scene/prefab the host
+    lives in. Returns None if absent or non-unique (>1) — abstain
+    (E-no-tag / E-non-unique).
+
+    Walks the SAME full-fidelity collections ``_node_by_cs_path`` walks
+    (``scene.all_nodes`` + every prefab template's node tree), filtering on
+    ``tag == "MainCamera"`` — the same upstream signal ``scene_converter`` uses to
+    stamp ``_MainCameraRig`` (mode-independent). ``host_node`` is unused for the
+    lookup itself (the tag is scene-/library-global), kept in the signature so a
+    future per-scene scoping can narrow without a call-site change."""
+    found: list[HostNode] = []
+    for scene in parsed_scenes or ():
+        if scene is None:
+            continue
+        for node in getattr(scene, "all_nodes", {}).values():
+            if getattr(node, "tag", "") == "MainCamera":
+                found.append(node)
+    if prefab_library is not None:
+        for template in getattr(prefab_library, "prefabs", []) or ():
+            nodes: list[PrefabNode] = []
+            _walk_prefab(getattr(template, "root", None), nodes)
+            for node in nodes:
+                if getattr(node, "tag", "") == "MainCamera":
+                    found.append(node)
+    if len(found) != 1:
+        return None  # zero -> E-no-tag; >1 -> E-non-unique; both abstain
+    return found[0]
+
+
+def _canonical_receiver(source: str, recv: str) -> str | None:
+    """Resolve the receiver-expression text ``recv`` (group 2 of
+    ``_CS_CAM_GETCHILD_RE``) to its canonical receiver chain for the rig path.
+
+    Returns the literal ``Camera.main.transform`` iff ``recv`` roots there —
+    either:
+      - the DIRECT form: ``recv`` is EXACTLY ``Camera.main.transform`` (so
+        ``weaponSlot = Camera.main.transform.GetChild(0)`` is admitted even with
+        no cam-symbol seed), OR
+      - a per-script SYMBOL whose seed definition is EXACTLY
+        ``<sym> = Camera.main.transform`` (one hop).
+    Returns None for any foreign chain (``enemy.cam``, ``other.cam.transform``, a
+    bare symbol with no such seed). EXACT match, NOT ``endswith``/substring."""
+    if recv == _CAMERA_MAIN_TRANSFORM:
+        return _CAMERA_MAIN_TRANSFORM
+    # ``recv`` must be a bare symbol (no dot) to be seed-resolvable; a dotted
+    # foreign chain (``enemy.cam``) is rejected outright.
+    if "." in recv:
+        return None
+    # One-hop seed lookup: ``<recv> = Camera.main.transform`` at a code position.
+    seed_re = re.compile(
+        r"\b" + re.escape(recv) + r"\s*=\s*"
+        + re.escape(_CAMERA_MAIN_TRANSFORM) + r"\b"
+    )
+    for m in seed_re.finditer(source):
+        if not _cs_pos_is_code(source, m.start()):
+            continue
+        # The RHS must be EXACTLY Camera.main.transform (not a longer chain like
+        # Camera.main.transform.parent). The matcher's ``\b`` after the literal
+        # already prevents ``...transformX``; reject a trailing ``.`` member.
+        end = m.end()
+        if end < len(source) and source[end] == ".":
+            continue  # longer chain -> not the exact one-hop seed
+        return _CAMERA_MAIN_TRANSFORM
+    return None
+
+
+def _lhs_is_bare_field(source: str, field_start: int, full_lhs: str) -> str | None:
+    """Given the matched LHS text ``full_lhs`` (group 1 of _CS_CAM_GETCHILD_RE)
+    starting at ``field_start``, return the bare field name iff the LHS is a bare
+    field or a ``this.``-qualified field; else None (a FOREIGN member-access LHS
+    like ``x.weaponSlot`` is REJECTED — round-1 BLOCKING #2 / edge 11)."""
+    parts = full_lhs.split(".")
+    if len(parts) == 1:
+        field = parts[0]
+    elif len(parts) == 2 and parts[0] == "this":
+        field = parts[1]
+    else:
+        return None  # x.weaponSlot / a.b.weaponSlot -> foreign member-access LHS
+    # Guard: the char immediately before the LHS must not be a ``.`` (a foreign
+    # qualifier the regex didn't capture, e.g. ``obj.weaponSlot`` where the regex
+    # started at ``weaponSlot``). Walk back over whitespace.
+    k = field_start
+    while k > 0 and source[k - 1] in " \t":
+        k -= 1
+    if k > 0 and source[k - 1] == ".":
+        return None  # a foreign ``.`` qualifier precedes the LHS
+    return field
+
+
+def _resolve_rig_facts(
+    source: str,
+    host_node: HostNode,
+    parsed_scenes: list[ParsedScene] | None,
+    prefab_library: PrefabLibrary | None,
+) -> list[RigRootedRetargetFact]:
+    """Resolve Camera.main-rooted ``<field> = <camrecv>.GetChild(n)`` RETARGET
+    writes to ``RigRootedRetargetFact(field_name, child_name)``. Each is admitted
+    iff the receiver roots EXACTLY at ``Camera.main.transform`` (host-XOR-rig,
+    exact-match) AND the MainCamera-tagged node is unique AND the n-th child
+    resolves under E1–E3. Pure; code-position-aware."""
+    rig_facts: list[RigRootedRetargetFact] = []
+    main_cam: HostNode | None = None
+    main_cam_looked_up = False
+    for m in _CS_CAM_GETCHILD_RE.finditer(source):
+        if not _cs_pos_is_code(source, m.start()):
+            continue
+        field = _lhs_is_bare_field(source, m.start(1), m.group(1))
+        if field is None:
+            continue  # foreign member-access LHS -> abstain
+        canon = _canonical_receiver(source, m.group(2))
+        if canon != _CAMERA_MAIN_TRANSFORM:
+            continue  # receiver does not root at Camera.main.transform -> abstain
+        ordinal = int(m.group(3))
+        if not main_cam_looked_up:
+            main_cam = _main_camera_node(host_node, parsed_scenes, prefab_library)
+            main_cam_looked_up = True
+        if main_cam is None:
+            continue  # E-no-tag / E-non-unique -> abstain
+        child = _resolve_child(main_cam, ordinal)
+        if child is None:
+            continue  # E1–E3 -> abstain
+        name = getattr(child, "name", "") or ""
+        rig_facts.append(RigRootedRetargetFact(field_name=field, child_name=name))
+    return rig_facts
+
+
+def _resolve_script(
+    source: str,
+    host_node: HostNode,
+    *,
+    parsed_scenes: list[ParsedScene] | None,
+    prefab_library: PrefabLibrary | None,
+) -> ChildRefScript | None:
     """Resolve one script's GetChild sites against ``host_node``. Returns
     ``None`` when the script has NO GetChild site at all (absent from the map)."""
     gameobject_shadowed = _declares_shadow(source, "gameObject")
@@ -506,8 +679,10 @@ def _resolve_script(source: str, host_node: HostNode) -> ChildRefScript | None:
         # (``Camera.main.transform.GetChild(0)``, ``foo.transform.GetChild(0)``,
         # or a ``gameObject.transform`` whose ``gameObject`` is shadowed by a
         # local/param) is NOT the script's own host — abstain (counts toward
-        # getchild_total, produces no fact) so the backstop treats it as a
-        # coverage gap.
+        # getchild_total, produces no host-rooted fact). At exactly this abstain
+        # point the rig path (below) admits the Camera.main -> MainCamera-tag
+        # retarget, so a Camera.main site that drops here as a host fact is
+        # re-captured as a rig fact (no double-count — edge 9/10).
         if _receiver_is_member_access(
             source, m.start(1), gameobject_shadowed=gameobject_shadowed
         ):
@@ -528,12 +703,17 @@ def _resolve_script(source: str, host_node: HostNode) -> ChildRefScript | None:
             )
         )
 
+    rig_facts = _resolve_rig_facts(
+        source, host_node, parsed_scenes, prefab_library
+    )
+
     if getchild_total == 0:
         return None
     return ChildRefScript(
         facts=tuple(facts),
         getchild_total=getchild_total,
-        resolved_total=len(facts),
+        resolved_total=len(facts) + len(rig_facts),
+        rig_facts=tuple(rig_facts),
     )
 
 
@@ -569,7 +749,11 @@ def build_child_ref_map(
             source = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        entry = _resolve_script(source, hosts[0])
+        entry = _resolve_script(
+            source, hosts[0],
+            parsed_scenes=parsed_scenes,
+            prefab_library=prefab_library,
+        )
         if entry is not None:
             result[key] = entry
     return result

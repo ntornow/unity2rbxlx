@@ -64,6 +64,15 @@ class TranspiledScript:
     # ``RbxScript.child_ref_resolution`` so the contract verifier's child-ordinal
     # backstop can assert against the fact. ``None`` outside generic mode.
     child_ref_resolution: dict[str, int] | None = None
+    # Per-script rig-retarget binding carrier from the generic-mode post-transpile
+    # ``rifle_rig_retarget_lowering``: a JSON-native dict
+    # ``{"field": str, "child": str, "present": bool}`` or ``None``. Copied onto
+    # the produced ``RbxScript.rig_binding`` so the contract verifier's
+    # binding-present fail-closed check (``_check_rig_binding_present``) can assert
+    # the IR-declared rig binding was discharged. ``None`` ONLY when the script has
+    # zero rig facts; a rig-fact-bearing script is NEVER ``None`` (default
+    # ``present=False``, flipped ``True`` only on confirmed discharge).
+    rig_binding: dict[str, object] | None = None
 
 
 @dataclass

@@ -601,6 +601,19 @@ def transpile_with_contract(
         log.info("[contract] OnTriggerStay lowering routed %d script(s) to "
                  "the connectGameObjectSignalStay poll primitive", lowered_stay)
 
+    # Rifle rig-retarget lowering: consume each Camera.main-rooted
+    # ``RigRootedRetargetFact`` (the resolver recorded it pre-transpile) by
+    # injecting a per-instance real-Instance resolver method, rewriting the
+    # consumer reads of ``self.<field>`` to call it, and neutralizing the AI's
+    # camera-child Awake write. Stamps the ``rig_binding`` carrier for the
+    # binding-present fail-closed verifier. Keys on the fact (deterministic
+    # upstream), NEVER on the AI's ordinal output shape or a per-game string.
+    from converter.rifle_rig_retarget_lowering import lower_rifle_rig_retarget
+    lowered_retarget = lower_rifle_rig_retarget(transpilation.scripts, child_ref_map)
+    if lowered_retarget:
+        log.info("[contract] rifle rig-retarget lowering rebound %d script(s) "
+                 "to the _MainCameraRig slot", lowered_retarget)
+
     # Aggregate fail-closed reasons. Verifier failures are recorded per
     # module via warnings; convert them to FailClosed rows here so the
     # orchestrator's caller has one place to read project status.
