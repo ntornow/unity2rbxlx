@@ -319,16 +319,29 @@ _BLOCK_TOKEN_RE = re.compile(
 )
 # A ``function`` whose parameter list contains a bare ``self`` parameter — a
 # nested closure that SHADOWS the method receiver (``function(self)`` /
-# ``function foo(self, x)``).
+# ``function foo(self, x)``). The optional name between ``function`` and ``(`` is
+# captured (group 1) so a ``local function self()`` (whose NAME is ``self``) is
+# also recognized as a shadow of the enclosing scope.
 _FUNCTION_SELF_PARAM_RE = re.compile(
-    r"\bfunction\b[^\(]*\(\s*([^)]*)\)"
+    r"\bfunction\b\s*([A-Za-z_][\w.:]*)?\s*\(\s*([^)]*)\)"
+)
+# The loop-variable list of a ``for`` header — everything between ``for`` and the
+# terminating ``in`` (generic ``for a, b in xs``) or ``=`` (numeric ``for i = ...``).
+# Group 1 is the comma-separated variable list; a ``self`` among them shadows the
+# receiver inside the loop BODY (which opens at the header's ``do``).
+_FOR_LOOPVARS_RE = re.compile(
+    r"\bfor\b\s*([A-Za-z_][\w,\s]*?)\s*(?:\bin\b|=)"
 )
 
 
 def _self_is_shadowed_at(source: str, pos: int) -> bool:
-    """True if the ``self`` token at ``pos`` resolves to a SHADOWED binding — a
-    ``local self`` or a ``function(... self ...)`` parameter that is NOT the
-    enclosing ``function <Class>:<method>()`` colon-receiver — in scope at ``pos``.
+    """True if the ``self`` token at ``pos`` resolves to a SHADOWED binding that is
+    NOT the enclosing ``function <Class>:<method>()`` colon-receiver — in scope at
+    ``pos``. Covers ALL Luau binding forms that introduce a ``self`` (codex round-3
+    BLOCKING): ``local self``, a function PARAMETER named ``self``
+    (``function(self)`` / ``function foo(self, x)``), a function NAMED ``self``
+    (``local function self()`` / ``function self()``), and a ``for``-loop VARIABLE
+    named ``self`` (``for self in`` / ``for _, self in`` / ``for self = ...``).
 
     Walks the lexical block structure outward from the nearest enclosing
     colon-method declaration to ``pos`` (code-position-aware), tracking block
@@ -351,6 +364,10 @@ def _self_is_shadowed_at(source: str, pos: int) -> bool:
     # the colon-method body itself (its ``self`` is the receiver).
     depth = 0
     shadow_depths: list[int] = []  # depths whose block introduced a ``self`` shadow
+    # A ``for`` header binding ``self`` introduces the shadow in the loop BODY,
+    # which opens at the header's ``do`` (depth+1). When such a header is seen,
+    # arm this flag so the NEXT ``do`` registers the shadow at the new depth.
+    for_self_pending = False
     i = method_body_start
     n = len(source)
     while i < pos:
@@ -367,19 +384,30 @@ def _self_is_shadowed_at(source: str, pos: int) -> bool:
             continue
         word = tok.group(1)
         if word == "function":
-            # Does this function declare a ``self`` parameter? If so, its BODY
-            # (depth+1) shadows the receiver.
+            # A ``function`` introduces TWO possible shadows:
+            #   - its NAME is ``self`` (``local function self()`` / ``function self()``)
+            #     -> shadows the ENCLOSING scope (current ``depth``); and/or
+            #   - it declares a ``self`` PARAMETER (``function(self)``) -> shadows
+            #     its own BODY (depth+1).
             fm = _FUNCTION_SELF_PARAM_RE.match(source, i)
-            params = fm.group(1) if fm else ""
-            has_self_param = any(
-                p.strip() == "self" for p in params.split(",")
-            )
+            fn_name = (fm.group(1) or "") if fm else ""
+            params = (fm.group(2) or "") if fm else ""
+            if fn_name == "self":
+                shadow_depths.append(depth)  # the function NAME shadows here
             depth += 1
+            has_self_param = any(p.strip() == "self" for p in params.split(","))
             if has_self_param:
-                shadow_depths.append(depth)
+                shadow_depths.append(depth)  # the parameter shadows the body
             i = (fm.end() if fm else tok.end())
             continue
-        if word in ("do", "then", "repeat"):
+        if word == "do":
+            depth += 1
+            if for_self_pending:
+                shadow_depths.append(depth)  # the for-loop var shadows the body
+                for_self_pending = False
+            i = tok.end()
+            continue
+        if word in ("then", "repeat"):
             depth += 1
             i = tok.end()
             continue
@@ -394,8 +422,18 @@ def _self_is_shadowed_at(source: str, pos: int) -> bool:
                 shadow_depths.append(depth)
             i = tok.end()
             continue
-        # ``if``/``for``/``while``/``elseif`` headers don't open the block until
-        # their ``do``/``then``; skip the keyword and continue.
+        if word == "for":
+            # Does the loop header bind a variable named ``self``? If so, arm the
+            # pending flag so the body (opened at the next ``do``) is a shadow.
+            fm = _FOR_LOOPVARS_RE.match(source, i)
+            if fm is not None and any(
+                v.strip() == "self" for v in fm.group(1).split(",")
+            ):
+                for_self_pending = True
+            i = tok.end()
+            continue
+        # ``if``/``while``/``elseif`` headers don't open the block until their
+        # ``do``/``then``; skip the keyword and continue.
         i = tok.end()
     # ``self`` at ``pos`` is shadowed iff a shadow was introduced at a depth still
     # open here.
@@ -418,15 +456,20 @@ def _enclosing_method(source: str, pos: int) -> str | None:
     return method
 
 
-# A camera-child RHS shape: the AI's positional ordinal / camera-rooted access the
-# resolver fact says this field was bound from (``self.cam:GetChildren()[n]`` /
-# ``...:GetChild(n)`` / a ``self.cam``-rooted member). The neutralizer anchors on
-# a ``self.<field> =`` whose RHS textually carries one of these — NOT an unrelated
-# ``self.<field> = <config>`` elsewhere (round-1 BLOCKING #3).
+# A camera-child RHS shape: the AI's positional ORDINAL child access the resolver
+# fact says this field was bound from (``self.cam:GetChildren()[n]`` /
+# ``...:GetChild(n)``). The neutralizer anchors on a ``self.<field> =`` whose RHS
+# textually carries ONE OF THESE ordinal accesses — NOT a bare ``self.cam`` mention
+# (a boolean/config RHS like ``self.cam and self.defaultSlot`` merely NAMES the
+# camera but performs no child lookup; neutralizing it to ``nil`` would be a
+# false-green — codex round-3 MAJOR). When the RHS carries no ordinal child access
+# the neutralizer ABSTAINS (leaves the write -> the verifier sees an
+# un-discharged binding). The leading ``[:.]`` requires the ordinal access to be
+# rooted on a RECEIVER expression (``cam:GetChild(n)`` / ``cam.GetChild(n)``), not
+# a bare ``GetChild(`` token inside a string the code-position gate already skips.
 _CAMERA_CHILD_RHS_RE = re.compile(
-    r":GetChildren\(\)\s*\[\s*\d+\s*\]"
-    r"|:GetChild\(\s*\d+\s*\)"
-    r"|\bself\.cam\b"
+    r"[:.]GetChildren\(\)\s*\[\s*\d+\s*\]"
+    r"|[:.]GetChild\(\s*\d+\s*\)"
 )
 
 
@@ -635,35 +678,82 @@ def _has_camera_child_write(source: str, field: str) -> bool:
 def _luau_syntax_ok(source: str) -> bool:
     """Luau loadability check on the lowered source. Uses ``luau-analyze`` (the
     project's authoritative checker, the same one the transpiler runs) when the
-    binary is installed; otherwise a structural balance check — enough to catch
-    the round-1 BLOCKING (a method spliced AFTER ``return <Class>`` leaves a
-    trailing ``function`` -> ``Expected <eof>, got 'function'``)."""
+    binary is installed; otherwise a conservative structural check that validates
+    bracket balance, block-keyword (``function``/``do``/``then``/``repeat`` vs
+    ``end``/``until``) balance, AND the module-epilogue invariant — fail-closing on
+    any construct it cannot confidently validate (codex round-3 BLOCKING: the
+    analyzer-absent path must be at least as strict about fail-closing as the
+    analyzer path, so a broken single-line-``if`` neutralize cannot stamp
+    present=True)."""
     from utils.luau_analyze import luau_analyze_path, syntax_errors_for_source
     if luau_analyze_path():
         return not syntax_errors_for_source(source)
     return _structural_balance_ok(source)
 
 
+# Block keywords for the analyzer-absent fallback. Each opener adds one scope
+# closed by ``end`` (or ``until`` for ``repeat``). ``if``/``while``/``for`` headers
+# do NOT open the block themselves — their ``then``/``do`` does — so they are NOT
+# openers here (counting them too would double-count). A bare ``then``/``do``
+# keyword is the opener we count.
+#
+# ``elseif`` is special: an ``if a then ... elseif b then ... end`` has TWO
+# ``then`` openers but ONE ``end``. The ``elseif`` itself is a +0 continuation, but
+# its own upcoming ``then`` would over-count, so ``elseif`` DECREMENTS to cancel
+# that ``then``'s increment (net 0 for the whole chain). ``else`` is a pure +0
+# continuation (no ``then`` follows it).
+_FALLBACK_BLOCK_OPENERS: frozenset[str] = frozenset({"function", "do", "then", "repeat"})
+_FALLBACK_BLOCK_CLOSERS: frozenset[str] = frozenset({"end", "until", "elseif"})
+_FALLBACK_BLOCK_TOKEN_RE = re.compile(
+    r"\b(function|do|then|repeat|end|until|elseif)\b"
+)
+
+
 def _structural_balance_ok(source: str) -> bool:
-    """Code-position bracket balance + ``function``/``end`` and ``do``/``end``
-    sanity. A conservative loadability proxy: returns False on the unbalanced
-    shape an after-``return`` splice would create."""
-    depth = 0
+    """Conservative, analyzer-absent loadability proxy. Validates, at code
+    positions only:
+      (1) bracket balance — ``(`` ``[`` ``{`` vs their closers, never negative;
+      (2) block-keyword balance — ``function``/``do``/``then``/``repeat`` openers
+          vs ``end``/``until`` closers, never negative, net zero (catches a
+          single-line-``if`` whose ``end`` was swallowed by a bad RHS span — the
+          ``then`` opener is left unclosed -> positive net -> FAIL); and
+      (3) the module epilogue ``return <Ident>`` is the LAST code statement (no
+          code-level ``function``/``end`` follows it — the after-``return`` splice
+          bug).
+    Returns False (fail-closed) on any imbalance. A genuinely ambiguous construct
+    surfaces as an imbalance here and fail-closes, never a silent pass."""
+    depth = 0  # bracket nesting
+    block = 0  # block-keyword nesting
     i = 0
     n = len(source)
     while i < n:
-        ch = source[i]
-        if not _luau_pos_is_code(source, i):
+        if not _luau_pos_is_code(source, i) or _luau_pos_in_long_bracket(source, i):
             i += 1
             continue
+        ch = source[i]
         if ch in "([{":
             depth += 1
-        elif ch in ")]}":
+            i += 1
+            continue
+        if ch in ")]}":
             depth -= 1
             if depth < 0:
                 return False
+            i += 1
+            continue
+        tok = _FALLBACK_BLOCK_TOKEN_RE.match(source, i)
+        if tok is not None:
+            word = tok.group(1)
+            if word in _FALLBACK_BLOCK_OPENERS:
+                block += 1
+            elif word in _FALLBACK_BLOCK_CLOSERS:
+                block -= 1
+                if block < 0:
+                    return False
+            i = tok.end()
+            continue
         i += 1
-    if depth != 0:
+    if depth != 0 or block != 0:
         return False
     # The module epilogue ``return <Ident>`` must be the LAST code statement: no
     # code-level ``function``/``end`` may follow it (the after-``return`` splice

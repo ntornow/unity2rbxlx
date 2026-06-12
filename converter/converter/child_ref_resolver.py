@@ -522,6 +522,91 @@ def _canon_key(path: Path) -> str:
 
 _CAMERA_MAIN_TRANSFORM = "Camera.main.transform"
 
+# C# control-flow keywords that, when they directly govern a braceless single
+# statement, make that statement CONDITIONAL (it does not unconditionally execute
+# on the straight-line path). A seed governed by one of these does NOT dominate a
+# later use outside its branch.
+_CS_CONDITIONAL_KEYWORDS: frozenset[str] = frozenset(
+    {"if", "else", "while", "for", "foreach", "case", "do"}
+)
+_CS_BRACELESS_GOVERNOR_RE = re.compile(r"([A-Za-z_]\w*)\s*$")
+
+
+def _seed_dominates_use(source: str, seed_start: int, use_pos: int) -> bool:
+    """True iff the seed assignment starting at ``seed_start`` dominates the
+    GetChild use at ``use_pos`` on the STRAIGHT-LINE path — i.e. the seed is in the
+    same block or an unconditional enclosing scope, NOT buried in a
+    conditional/dead branch that closes before the use (codex round-3 BLOCKING).
+
+    Conservative — ABSTAINS (returns False) whenever it cannot cheaply prove
+    dominance, so a false-admitted fact is impossible (a missed fact is safe):
+      (1) BRACE SCOPE: scanning code positions from ``seed_start`` to ``use_pos``,
+          the running ``{``/``}`` depth (relative to the seed) must never go
+          NEGATIVE — a ``}`` that closes a block open at the seed means the seed's
+          block ended before the use (``if (c) { cam = ...; } use``;
+          ``{ cam = ...; } use``).
+      (2) BRACELESS GOVERNOR: the seed statement must not be the single braceless
+          body of a control-flow keyword (``if (c) cam = ...; use``) — detected by
+          looking at the token immediately preceding the seed's statement (after
+          the governing ``)`` of an ``if``/``while``/``for`` header, or a bare
+          ``else``/``do``)."""
+    # (1) brace-depth scope check.
+    depth = 0
+    i = seed_start
+    while i < use_pos:
+        if not _cs_pos_is_code(source, i):
+            i += 1
+            continue
+        ch = source[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth < 0:
+                return False  # the seed's enclosing block closed before the use
+        i += 1
+    # (2) braceless single-statement governor check: walk back over whitespace from
+    # the seed to the preceding statement boundary. If the seed statement is
+    # directly governed by a braceless conditional, it does not dominate.
+    j = seed_start - 1
+    while j >= 0 and source[j] in " \t\r\n":
+        j -= 1
+    if j < 0:
+        return True  # start of file -> top-level straight-line
+    prev = source[j]
+    if prev in ";{}":
+        return True  # a clear statement/block boundary -> straight-line in scope
+    if prev == ")":
+        # The seed follows a ``)`` — it may be the braceless body of an
+        # ``if (...)``/``while (...)``/``for (...)`` header. Find the matching
+        # ``(`` and inspect the keyword before it.
+        bdepth = 0
+        k = j
+        while k >= 0:
+            if _cs_pos_is_code(source, k):
+                c = source[k]
+                if c == ")":
+                    bdepth += 1
+                elif c == "(":
+                    bdepth -= 1
+                    if bdepth == 0:
+                        break
+            k -= 1
+        if k < 0:
+            return False  # unbalanced -> cannot prove -> abstain
+        head = source[:k]
+        gm = _CS_BRACELESS_GOVERNOR_RE.search(head)
+        if gm is not None and gm.group(1) in _CS_CONDITIONAL_KEYWORDS:
+            return False  # braceless conditional body -> not dominating
+        return True
+    if prev.isalpha() or prev == "_":
+        # The seed follows a bare keyword (``else cam = ...;`` / ``do cam = ...``).
+        gm = _CS_BRACELESS_GOVERNOR_RE.search(source[: j + 1])
+        if gm is not None and gm.group(1) in _CS_CONDITIONAL_KEYWORDS:
+            return False
+        return True
+    return True
+
 
 def _owning_node_collection(
     host_node: HostNode,
@@ -625,6 +710,13 @@ def _canonical_receiver(source: str, recv: str, use_pos: int) -> str | None:
     end = m.end()
     if end < len(source) and source[end] == ".":
         return None  # longer chain -> not the exact one-hop seed
+    # SCOPE-AWARE (codex round-3 BLOCKING): order-nearest is not enough — the seed
+    # must DOMINATE the use site on the straight-line path. A seed buried in a
+    # dead/conditional block (``if (false) { cam = Camera.main.transform; }``) does
+    # NOT dominate ``weaponSlot = cam.GetChild(0)`` below it; abstain rather than
+    # admit a fact whose real receiver isn't Camera.main.
+    if not _seed_dominates_use(source, nearest_start, use_pos):
+        return None
     return _CAMERA_MAIN_TRANSFORM
 
 

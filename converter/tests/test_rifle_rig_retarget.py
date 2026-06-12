@@ -842,3 +842,216 @@ def test_p5_multi_rig_fact_per_script_fails_closed() -> None:
     assert "self.cam:GetChildren()[1]" in s.luau_source
     assert "self.cam:GetChildren()[2]" in s.luau_source
     assert "_resolveWeaponSlot" not in s.luau_source
+
+
+# === round-3 P1 fixes =======================================================
+
+
+def test_r3_fallback_validates_if_then_end_block_balance(monkeypatch) -> None:
+    # R3 P1 (codex BLOCKING, lowering:641): in an ANALYZER-ABSENT env the fallback
+    # ``_structural_balance_ok`` must validate ``if``/``then``/``end`` block balance.
+    # A single-line-``if`` neutralize whose RHS span swallows the closing ``end``
+    # produces UNLOADABLE Luau; the fallback must FAIL it -> revert -> present=False
+    # (NOT a stamp of present=True off the broken output). Force the fallback by
+    # making ``luau_analyze_path`` report the binary absent.
+    import utils.luau_analyze as ula
+    monkeypatch.setattr(ula, "luau_analyze_path", lambda: None)
+    src = (
+        "function Player:Awake()\n"
+        "    if self.cam then self.weaponSlot = self.cam:GetChildren()[1] end\n"
+        "end\n\n"
+        "function Player:GetRifle()\n"
+        "    return pivotOf(self.weaponSlot)\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    s = _Script(src)
+    n = lower_rifle_rig_retarget([s], _rig_map())
+    assert n == 0  # fallback caught the swallowed ``end`` -> abstained/reverted
+    assert s.rig_binding == {
+        "field": "weaponSlot", "child": "WeaponSlot", "present": False,
+    }
+    assert "self.cam:GetChildren()[1]" in s.luau_source  # reverted
+    assert "_resolveWeaponSlot" not in s.luau_source
+    # Direct proof the fallback rejects the broken FINAL shape but accepts the
+    # well-formed original (so the gate is the discriminator, not a blanket reject).
+    from converter.rifle_rig_retarget_lowering import (
+        _inject_resolver_method,
+        _neutralize_assignment,
+        _rewrite_field_reads,
+        _structural_balance_ok,
+    )
+    assert _structural_balance_ok(src) is True
+    ns, inj = _inject_resolver_method(src, "Player", "WeaponSlot", "weaponSlot")
+    assert inj
+    ns, _ = _rewrite_field_reads(ns, "weaponSlot", "_resolveWeaponSlot")
+    ns, _ = _neutralize_assignment(ns, "weaponSlot", "WeaponSlot")
+    assert _structural_balance_ok(ns) is False  # swallowed ``end`` caught
+
+
+def test_r3_fallback_accepts_well_formed_if_elseif_else() -> None:
+    # The stricter block-balance must NOT false-reject a well-formed if/elseif/else
+    # chain (TWO ``then`` openers but ONE ``end``) — ``elseif`` cancels its own
+    # ``then``. Guards against an over-strict fallback that would abstain on valid
+    # corpus Luau.
+    from converter.rifle_rig_retarget_lowering import _structural_balance_ok
+    well_formed = (
+        "function Player:GetRifle()\n"
+        "    if a then\n"
+        "        return 1\n"
+        "    elseif b then\n"
+        "        return 2\n"
+        "    else\n"
+        "        return 3\n"
+        "    end\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    assert _structural_balance_ok(well_formed) is True
+
+
+def test_r3_fallback_happy_path_still_loadable(monkeypatch) -> None:
+    # The stricter fallback must NOT regress the corpus happy path: with the
+    # analyzer forced absent, the well-formed corpus shape still discharges True.
+    import utils.luau_analyze as ula
+    monkeypatch.setattr(ula, "luau_analyze_path", lambda: None)
+    s = _Script(_AI_PLAYER)
+    n = lower_rifle_rig_retarget([s], _rig_map())
+    assert n == 1
+    assert s.rig_binding == {
+        "field": "weaponSlot", "child": "WeaponSlot", "present": True,
+    }
+
+
+def test_r3_seed_in_dead_conditional_block_abstains(tmp_path: Path) -> None:
+    # R3 P1 (codex BLOCKING, resolver:601): a ``cam = Camera.main.transform`` seed
+    # buried in a dead/conditional block does NOT dominate ``cam.GetChild(0)``
+    # below it, so its real receiver isn't Camera.main -> the resolver must ABSTAIN
+    # (no rig fact). Order-nearest is not enough; dominance is required.
+    src = (
+        "public class Player : MonoBehaviour {\n"
+        "  Transform cam; public Transform weaponSlot;\n"
+        "  void Awake() {\n"
+        "    if (false) { cam = Camera.main.transform; }\n"
+        "    weaponSlot = cam.GetChild(0);\n"
+        "  }\n}\n"
+    )
+    entry = _build(tmp_path, src, _fps_library())
+    assert entry is not None
+    assert entry.rig_facts == ()  # seed in a conditional block does not dominate
+
+
+def test_r3_seed_in_braceless_if_abstains(tmp_path: Path) -> None:
+    # The braceless single-statement conditional form is also caught.
+    src = (
+        "public class Player : MonoBehaviour {\n"
+        "  Transform cam; public Transform weaponSlot;\n"
+        "  void Awake() {\n"
+        "    if (cond) cam = Camera.main.transform;\n"
+        "    weaponSlot = cam.GetChild(0);\n"
+        "  }\n}\n"
+    )
+    entry = _build(tmp_path, src, _fps_library())
+    assert entry is not None
+    assert entry.rig_facts == ()
+
+
+def test_r3_straight_line_seed_still_admits(tmp_path: Path) -> None:
+    # The straight-line happy path (seed unconditionally dominates the use) STILL
+    # admits — the dominance gate doesn't over-abstain.
+    src = (
+        "public class Player : MonoBehaviour {\n"
+        "  Transform cam; public Transform weaponSlot;\n"
+        "  void Awake() {\n"
+        "    cam = Camera.main.transform;\n"
+        "    weaponSlot = cam.GetChild(0);\n"
+        "  }\n}\n"
+    )
+    entry = _build(tmp_path, src, _fps_library())
+    assert entry is not None
+    assert entry.rig_facts == (
+        RigRootedRetargetFact(field_name="weaponSlot", child_name="WeaponSlot"),
+    )
+
+
+def test_r3_shadow_local_function_self_not_rewritten() -> None:
+    # R3 P1 (codex BLOCKING, lowering:360): a ``local function self()`` NAMES a
+    # function ``self``, shadowing the colon-receiver in the enclosing scope. A
+    # ``self.weaponSlot`` read after it must NOT be rewritten (wrong object).
+    src = (
+        "function Player:GetRifle()\n"
+        "    local function self() return 1 end\n"
+        "    local x = self.weaponSlot\n"
+        "    return x\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    s = _Script(src)
+    lower_rifle_rig_retarget([s], _rig_map())
+    out = s.luau_source
+    assert "local x = self.weaponSlot" in out  # shadowed by the local function name
+    assert "self:_resolveWeaponSlot()" not in out
+
+
+def test_r3_shadow_for_loop_self_var_not_rewritten() -> None:
+    # The ``for _, self in ...`` loop-variable shadow form: a read inside the loop
+    # body binds the loop ``self``, not the receiver -> must NOT be rewritten.
+    src = (
+        "function Player:GetRifle()\n"
+        "    for _, self in ipairs(xs) do\n"
+        "        local x = self.weaponSlot\n"
+        "    end\n"
+        "    return 1\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    s = _Script(src)
+    lower_rifle_rig_retarget([s], _rig_map())
+    out = s.luau_source
+    assert "local x = self.weaponSlot" in out  # loop-var shadow -> left
+    assert "self:_resolveWeaponSlot()" not in out
+
+
+def test_r3_for_loop_self_does_not_block_real_receiver_read() -> None:
+    # The loop-var shadow must be scoped to the loop BODY only: a real receiver
+    # read OUTSIDE the loop is still rewritten (no over-abstain).
+    src = (
+        "function Player:GetRifle()\n"
+        "    for _, self in ipairs(xs) do\n"
+        "        local x = self.weaponSlot\n"
+        "    end\n"
+        "    return self.weaponSlot\n"
+        "end\n\n"
+        "return Player\n"
+    )
+    s = _Script(src)
+    lower_rifle_rig_retarget([s], _rig_map())
+    out = s.luau_source
+    assert "local x = self.weaponSlot" in out  # shadowed -> left
+    assert "return self:_resolveWeaponSlot()" in out  # real receiver -> rewritten
+
+
+def test_r3_neutralize_anchor_requires_ordinal_child_access() -> None:
+    # R3 P1 (codex MAJOR, lowering:426): a boolean RHS that merely MENTIONS
+    # ``self.cam`` but performs NO ordinal child lookup
+    # (``self.weaponSlot = self.cam and self.defaultSlot``) must NOT be neutralized
+    # to ``nil`` — that would be a false-green. The neutralizer must ABSTAIN.
+    from converter.rifle_rig_retarget_lowering import _neutralize_assignment
+    src = (
+        "function Player:Awake()\n"
+        "    self.weaponSlot = self.cam and self.defaultSlot\n"
+        "end\n"
+    )
+    out, neutralized = _neutralize_assignment(src, "weaponSlot", "WeaponSlot")
+    assert neutralized is False  # no ordinal child access -> abstain
+    assert out == src  # untouched
+    assert "self.weaponSlot = nil" not in out
+    # And the real ordinal RHS IS still neutralized (discriminator, not blanket).
+    src2 = (
+        "function Player:Awake()\n"
+        "    self.weaponSlot = self.cam:GetChildren()[1]\n"
+        "end\n"
+    )
+    out2, neutralized2 = _neutralize_assignment(src2, "weaponSlot", "WeaponSlot")
+    assert neutralized2 is True
+    assert "self.weaponSlot = nil" in out2
