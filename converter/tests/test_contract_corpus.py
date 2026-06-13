@@ -192,3 +192,54 @@ def test_corpus_exercises_every_flipped_check() -> None:
         "check C (cross_domain_attribute) unexercised — the corpus has no "
         "runtime client<->server edges; C's clean metric would be vacuous"
     )
+
+
+@pytest.mark.skipif(not _FIXTURES, reason="no contract-corpus fixtures committed yet")
+def test_corpus_exercises_rig_binding_present_check() -> None:
+    """The rig_binding_present FAIL_CLOSED check must be corpus-EXERCISED, not
+    vacuously green by abstain. ``rig_binding_present`` only fires when a script
+    carries a non-None ``rig_binding`` carrier; a future regen that dropped the
+    carrier (or that produced ``present=False``) would let the check silently
+    abstain green for the wrong reason. Assert the corpus carries at least one
+    DISCHARGED binding (``present=True``) AND that the carrier is backed by a
+    REAL discharge in the captured Luau — the injected per-instance resolver
+    method plus a rerouted consumer read — so a carrier-present-but-source-
+    undischarged regen is caught too. Generic: scans every fixture/script, keys
+    on the carrier's own field/child names (no game-specific hardcode)."""
+    discharged: list[tuple[str, str, dict]] = []
+    for fp in _FIXTURES:
+        fx = json.loads(fp.read_text(encoding="utf-8"))
+        for s in fx["scripts"]:
+            rb = s.get("rig_binding")
+            if isinstance(rb, dict) and rb.get("present") is True:
+                discharged.append((fp.parent.name, s["name"], s))
+
+    assert discharged, (
+        "rig_binding_present unexercised — no corpus script carries a "
+        "rig_binding with present=True, so the FAIL_CLOSED check abstains "
+        "green-for-the-wrong-reason. A regen must capture the discharged "
+        "Player binding (re-run tools/regen_contract_corpus.py)."
+    )
+
+    # Prove the discharge is REAL, not just a carrier flag: the captured source
+    # must contain the injected resolver method for the carrier's child AND a
+    # rerouted consumer read that calls it. Derive both names from the carrier
+    # so this stays generic (no hardcoded weaponSlot/WeaponSlot).
+    for project, script_name, s in discharged:
+        rb = s["rig_binding"]
+        child = rb.get("child")
+        src = s.get("source") or ""
+        resolver_def = f"function {script_name}:_resolve{child}("
+        resolver_call = f"self:_resolve{child}()"
+        assert resolver_def in src, (
+            f"{project}/{script_name}: rig_binding present=True but the injected "
+            f"resolver method ({resolver_def!r}) is absent from the captured "
+            f"source — carrier-present-but-undischarged; the lowering did not "
+            f"reroute the binding. Re-run tools/regen_contract_corpus.py."
+        )
+        assert resolver_call in src, (
+            f"{project}/{script_name}: rig_binding present=True and the resolver "
+            f"is defined, but no consumer read was rerouted to it "
+            f"({resolver_call!r} absent) — the discharge is vacuous. "
+            f"Re-run tools/regen_contract_corpus.py."
+        )
