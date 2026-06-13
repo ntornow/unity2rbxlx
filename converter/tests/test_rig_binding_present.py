@@ -1359,12 +1359,38 @@ def test_pathA_r3_computed_key_read_exact_fold_fails_closed() -> None:
         'local x = self["weapon"..suffix]',
     ],
 )
-def test_pathA_r3_dynamic_non_foldable_key_does_not_false_fail(dynamic_key: str) -> None:
-    """D-S1b-PATHA-r3 — a fully-dynamic / non-constant-foldable key (``self[someVar]``,
-    ``self[fn()]``, ``self["a"..var]``) is NOT provably the field, so flagging it would
-    false-fail unrelated table accesses. It must NOT block discharge — discharges
-    True (only the constant-foldable-to-exactly-``<field>`` case is a provable read)."""
+def test_pathA_r2_dynamic_self_index_read_fails_closed(dynamic_key: str) -> None:
+    """D-S1b-PATHA-r2 (UPDATED from r3) — a DYNAMIC ``self[<expr>]`` index whose key
+    the analyzer cannot decode to a static string (``self[someVar]``, ``self[fn()]``,
+    ``self["a"..var]``) COULD read ``<field>`` at runtime and was NOT rerouted (the
+    dot-form reroute only rewrites ``self.<field>``). The verifier cannot prove the
+    field is unread -> discharge FAILS CLOSED (a loud row). This SUPERSEDES the prior
+    r3 stance that such keys discharge True — codex r2 showed that stance let a real
+    surviving dynamic read slip through silently and, via the discharge-gated check-D
+    exemption, masked a live GetChildren write survivor."""
     src = _green_plus_boundary_read(dynamic_key)
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is False
+    assert len(_rig_rows([
+        _rbx("Player", src, {"field": "weaponSlot", "child": "WeaponSlot", "present": True})
+    ])) == 1
+
+
+@pytest.mark.parametrize(
+    "non_self_dynamic_key",
+    [
+        "local x = other[someVar]",
+        "local x = tbl[getKey()]",
+        'local x = arr["a"..var]',
+    ],
+)
+def test_pathA_r2_non_self_dynamic_index_does_not_false_fail(
+    non_self_dynamic_key: str,
+) -> None:
+    """D-S1b-PATHA-r2 SCOPE GUARD — the dynamic-index fail-closed is scoped to a
+    ``self`` receiver. A dynamic index of an UNRELATED table (``other[k]`` /
+    ``tbl[fn()]`` / ``arr["a"..var]``) is not a read of THIS instance's field and must
+    NOT block discharge — discharges True (no over-broadening to all bracket indexing)."""
+    src = _green_plus_boundary_read(non_self_dynamic_key)
     assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
     assert _rig_rows([
         _rbx("Player", src, {"field": "weaponSlot", "child": "WeaponSlot", "present": True})
@@ -1502,14 +1528,17 @@ def test_pathA_r4_unrelated_decoded_key_does_not_fail(unrelated_key: str) -> Non
     ]) == []
 
 
-def test_pathA_r4_dynamic_bracket_key_does_not_false_fail() -> None:
-    """D-S1b-PATHA-r4 FIX 1 — a fully-dynamic key ``self[k]`` decodes to None (not a
-    static string), so it is NOT provably the field and must NOT block discharge."""
+def test_pathA_r2_dynamic_self_bracket_key_fails_closed() -> None:
+    """D-S1b-PATHA-r2 (UPDATED from r4 FIX 1) — a fully-dynamic ``self[k]`` decodes to
+    None (not a static string), so the analyzer cannot prove it is NOT a read of
+    ``<field>``; the dot-form reroute did not rewrite it -> discharge FAILS CLOSED.
+    (Supersedes the r4 stance that ``self[k]`` discharges True — see
+    ``test_pathA_r2_dynamic_self_index_read_fails_closed`` for the rationale.)"""
     src = _green_plus_boundary_read("local x = self[k]")
-    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
-    assert _rig_rows([
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is False
+    assert len(_rig_rows([
         _rbx("Player", src, {"field": "weaponSlot", "child": "WeaponSlot", "present": True})
-    ]) == []
+    ])) == 1
 
 
 @pytest.mark.parametrize(
@@ -2594,3 +2623,153 @@ def test_inert_bound_forged_carrier_cannot_mask_a_different_lvalue_write() -> No
     # the exemption -> COUNTED, even though receiver+ordinal match the forged carrier.
     assert _count_surviving_child_ordinals(src, _CORPUS_EXEMPT) == 1
     assert _checkD_fires(_fr3_script(src, forged))
+
+
+# ===========================================================================
+# Dual-voice REVIEW round 2 (D-S1b-r2 BLOCKING) — DISCHARGE SOUNDNESS GAP on a
+# DYNAMIC self-index read. ``_rig_binding_discharged`` only caught STATIC reads
+# (dot-form ``self.<field>`` + decoded static-string bracket ``self["<field>"]``);
+# it MISSED a DYNAMIC ``self[k]`` where ``k`` is a computed expression that may
+# evaluate to the field name (``self["weapon".."Slot"]``; ``local k = ...; self[k]``).
+# Such a script false-PASSED discharge (the field IS read dynamically, un-rerouted)
+# AND, because check D's rig exemption is GATED on discharge, the exemption then
+# masked the surviving GetChildren WRITE to the field — a LIVE survivor slipped
+# through (``verify_contract`` -> [] at a10c76a). The fix makes discharge FAIL CLOSED
+# on any un-analyzable dynamic ``self[...]`` index. Each case below is RED against
+# a10c76a (the pre-fix verifier).
+# ===========================================================================
+
+# The lowered corpus base (resolver + rerouted reads + a SURVIVING dead-write to the
+# field) onto which the dynamic read is injected. The skipped-neutralize single-line-
+# if shape leaves ``self.weaponSlot = self.cam:GetChildren()[1]`` as a surviving WRITE
+# — the exact site check D would EXEMPT if the binding (wrongly) discharged.
+_R2_BASE_WITH_SURVIVING_WRITE = _lower(_SKIPPED_NEUTRALIZE_SINGLELINE_IF).luau_source
+
+
+def _r2_inject_dynamic_read(read_stmt: str) -> str:
+    """The lowered corpus base (resolver + reroute + surviving dead GetChildren write)
+    with a DYNAMIC ``self[...]`` field read injected into the yielding GetRifle."""
+    src = _R2_BASE_WITH_SURVIVING_WRITE.replace(
+        "function Player:GetRifle()\n",
+        "function Player:GetRifle()\n    " + read_stmt + "\n",
+        1,
+    )
+    assert read_stmt in src
+    # Sanity: the surviving dead GetChildren WRITE is present (the masking target).
+    assert "self.weaponSlot = self.cam:GetChildren()[1]" in src
+    return src
+
+
+@pytest.mark.parametrize(
+    "read_stmt",
+    [
+        'local x = self["weapon".."Slot"]',          # concat key (codex's exact repro)
+        'local k = "weapon".."Slot"\n    local x = self[k]',  # var-bound concat key
+    ],
+)
+def test_r2_dynamic_self_index_read_reds_full_verify_contract(read_stmt: str) -> None:
+    """D-S1b-r2 (codex's exact repro) — a discharged-LOOKING script (resolver + reroute,
+    NO static ``self.weaponSlot`` / ``self["weaponSlot"]`` read) that reads the field via
+    a DYNAMIC key must now: (1) NOT discharge (``_rig_binding_discharged`` -> False);
+    (2) FIRE ``rig_binding_present``; AND (3) because the exemption is discharge-gated,
+    NO LONGER exempt the surviving GetChildren WRITE -> ``verify_contract`` is NOT [].
+    The live survivor (the un-rerouted dynamic read + its now-counted write) is no
+    longer masked."""
+    src = _r2_inject_dynamic_read(read_stmt)
+    # (1) discharge is now fail-closed on the un-analyzable dynamic self-index.
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is False
+    script = _rbx_with_accounting(
+        "Player",
+        src,
+        _carrier(),  # well-formed carrier, present=True
+        getchild_total=1,
+        resolved_total=1,  # budget 0
+    )
+    res = verify_contract(_TOPOLOGY, [script])
+    checks = {v.check for v in res.violations}
+    # (2) the binding-present floor fires (the real un-rerouted read is surfaced).
+    assert "rig_binding_present" in checks
+    # (3) the discharge-gated check-D exemption does NOT apply -> the surviving
+    #     GetChildren WRITE is COUNTED, not masked: the live survivor reds too.
+    assert "child_ordinal_survivor" in checks
+    # The full contract is NOT empty — the live survivor is no longer masked (the
+    # codex repro returned [] at a10c76a).
+    assert res.violations != []
+
+
+def test_r2_dynamic_self_index_red_against_a10c76a() -> None:
+    """D-S1b-r2 pre-fix-RED proof (narrator-INDEPENDENT) — load the ACTUAL a10c76a
+    verifier blob from git and run codex's exact dynamic-read repro through ITS
+    ``verify_contract``. At a10c76a the binding false-DISCHARGES (the dynamic read was
+    missed) so the rig exemption masks the surviving write and ``verify_contract``
+    returns NO ``rig_binding_present`` AND NO ``child_ordinal_survivor`` (the [] codex
+    observed). The fixed verifier fires both. Proves the fix is load-bearing."""
+    import importlib.util
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parent.parent.parent  # worktree root
+    blob = subprocess.run(
+        ["git", "show", "a10c76a:converter/converter/contract_verifier.py"],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    old_path = Path(__file__).parent / "_old_cv_r2_a10c76a.py"
+    old_path.write_text(blob, encoding="utf-8")
+    try:
+        spec = importlib.util.spec_from_file_location("_old_cv_r2_a10c76a", str(old_path))
+        assert spec is not None and spec.loader is not None
+        old = importlib.util.module_from_spec(spec)
+        sys.modules["_old_cv_r2_a10c76a"] = old
+        spec.loader.exec_module(old)
+    finally:
+        old_path.unlink(missing_ok=True)
+
+    # The VARIABLE-BOUND key is the genuine gap: a10c76a's decode-then-compare path
+    # statically folds the inline ``"weapon".."Slot"`` concat (so it already caught the
+    # concat-literal form), but it CANNOT see through a ``local k = ...; self[k]`` — the
+    # key is a bare variable that decodes to None -> false-discharge there.
+    src = _r2_inject_dynamic_read('local k = "weapon".."Slot"\n    local x = self[k]')
+    script = _rbx_with_accounting(
+        "Player", src, _carrier(), getchild_total=1, resolved_total=1
+    )
+    # PRE-FIX (real a10c76a): the dynamic read is missed -> false-discharge -> the rig
+    # exemption masks the surviving write -> neither floor nor survivor fires.
+    old_res = old.verify_contract(_TOPOLOGY, [script])
+    old_checks = {v.check for v in old_res.violations}
+    assert old._rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True, (
+        "a10c76a must false-DISCHARGE the dynamic read (proving the gap)"
+    )
+    assert "rig_binding_present" not in old_checks
+    assert "child_ordinal_survivor" not in old_checks, (
+        "a10c76a's discharge-gated exemption must MASK the live survivor (the [] codex "
+        "reproduced) — proving the fix is load-bearing"
+    )
+    # POST-FIX: discharge fails closed; both the floor and the survivor fire.
+    new_res = verify_contract(_TOPOLOGY, [script])
+    new_checks = {v.check for v in new_res.violations}
+    assert "rig_binding_present" in new_checks
+    assert "child_ordinal_survivor" in new_checks
+
+
+def test_r2_corpus_dot_form_reads_still_discharge_and_exempt() -> None:
+    """D-S1b-r2 REGRESSION GUARD — the strengthened discharge must NOT regress the REAL
+    corpus shape: the Player reads the field via DOT-form ``self.weaponSlot`` (rerouted
+    by the lowering) with NO dynamic self-index. Discharge stays True, the binding-
+    present check is GREEN, and check D's dead-write exemption still applies (no
+    false positive on the discharged dead write)."""
+    lowered = _lower(_SKIPPED_NEUTRALIZE_SINGLELINE_IF)
+    # No dynamic self-index in the real corpus output.
+    assert _rig_binding_discharged(lowered.luau_source, "weaponSlot", "WeaponSlot") is True
+    script = _rbx_with_accounting(
+        "Player",
+        lowered.luau_source,
+        lowered.rig_binding,
+        getchild_total=1,
+        resolved_total=1,
+    )
+    res = verify_contract(_TOPOLOGY, [script])
+    checks = {v.check for v in res.violations}
+    assert "rig_binding_present" not in checks  # discharge stayed True
+    assert "child_ordinal_survivor" not in checks  # the dead-write exemption still applies

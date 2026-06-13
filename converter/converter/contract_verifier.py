@@ -1603,6 +1603,66 @@ def _rig_has_decoded_field_bracket_read(source: str, field: str) -> bool:
     return False
 
 
+def _rig_has_surviving_dynamic_self_index_read(source: str) -> bool:
+    """True if any code-position ``self[<expr>]`` bracket access survives as a READ
+    whose ``<expr>`` is NOT a single provably-static string literal the analyzer can
+    decode (a variable, a ``..`` concat with a non-literal operand, a call, any
+    computed key).
+
+    Why this fails discharge (codex r2 BLOCKING — dynamic-read discharge gap): the
+    dot-form read reroute ONLY rewrites ``self.<field>``; a STATIC ``self["<field>"]``
+    is separately decoded by ``_rig_has_decoded_field_bracket_read`` (already fails
+    discharge — correct). But a DYNAMIC ``self[k]`` (``self["weapon".."Slot"]``;
+    ``local k = ...; self[k]``) COULD read ``<field>`` at runtime and was NOT
+    rerouted — the verifier CANNOT decode the key, so it CANNOT prove the field is
+    unread. Fail CLOSED: any such surviving dynamic ``self`` index is a potential
+    surviving read of the field ⇒ discharge is NOT provable.
+
+    SCOPE is deliberately narrow:
+
+      * RECEIVER must be ``self`` (a bare ``self`` token immediately, modulo
+        whitespace, before the ``[``) — an unrelated ``other[k]`` / ``tbl[k]`` index
+        is not a read of THIS instance's field and is left alone (no over-broadening);
+      * a STATIC string key (``self["x"]``) decodes, so it is NOT dynamic and is
+        handled by the decoded-bracket path — only ``decode == None`` keys count here;
+      * an ASSIGNMENT LHS (``self[k] = v``) is a WRITE, not a read — a Tier-2-skipped
+        init-write may legitimately survive, so it does not fail discharge.
+
+    Code-position aware via ``_rig_bracket_key_spans`` (matches inside
+    strings/comments are already excluded) and fully GENERIC."""
+    proj = _rig_code_projection(source)
+    for open_idx, close_excl, interior in _rig_bracket_key_spans(source):
+        if _rig_decode_luau_string_key(interior) is not None:
+            continue  # static string key -> not dynamic (decoded path handles it)
+        if not _rig_index_receiver_is_self(proj, open_idx):
+            continue  # not a ``self[...]`` index -> unrelated, leave as-is
+        if _rig_pos_is_assignment_lhs(proj, close_excl):
+            continue  # WRITE LHS -> a Tier-2-skipped write may survive
+        return True
+    return False
+
+
+def _rig_index_receiver_is_self(proj: str, open_idx: int) -> bool:
+    """True if the ``[`` at ``open_idx`` indexes a bare ``self`` receiver — i.e. the
+    immediately-preceding CODE token (modulo whitespace, on the code projection
+    ``proj``) is the keyword ``self`` at a word boundary. Excludes ``myself[k]`` /
+    ``a.self[k]`` (the char before ``self`` must not be an identifier/``.`` char)."""
+    j = open_idx - 1
+    while j >= 0 and proj[j] in " \t\r\n":
+        j -= 1
+    # The 4 chars ending at j must be exactly ``self``.
+    if j < 3 or proj[j - 3:j + 1] != "self":
+        return False
+    # Word boundary before ``self``: not an identifier continuation and not a member
+    # access (``.self`` / ``a.self`` is a field named self, not the keyword).
+    before = j - 4
+    if before >= 0:
+        c = proj[before]
+        if c == "." or c == "_" or c.isalnum():
+            return False
+    return True
+
+
 # The resolver's own internal field of the form ``_<field>Cache`` (the memo). Its
 # token is ``_<field>Cache``, NOT a bare ``<field>`` field-access (the char before
 # ``<field>`` is ``_`` and after is ``C`` — no word boundary), so the
@@ -2069,7 +2129,13 @@ def _rig_binding_discharged(source: str, field: str, child: str) -> bool:
           receiver read (``<Class>.<field>`` / ``owner.<field>`` / a receiver-alias
           ``p.<field>``). This is the discharge gate (``_rig_has_surviving_field_
           consumption``); every surviving form FAILS CLOSED (the Path A generality
-          boundary — never silently passes).
+          boundary — never silently passes); AND
+      (3) **NO surviving DYNAMIC ``self[<expr>]`` index READ** — a computed key the
+          analyzer cannot decode to a static string (``self["weapon".."Slot"]``,
+          ``self[k]``) COULD read ``<field>`` at runtime and was NOT rerouted, so the
+          field is not provably unread (``_rig_has_surviving_dynamic_self_index_
+          read``) -> fail closed. (A static ``self["<field>"]`` is already covered by
+          (2)'s decoded-bracket path.)
 
     The 'no surviving camera-child ordinal WRITE' clause is DROPPED from the
     discharge gate (Path A re-anchor). On the 5 real RHS write shapes there may be
@@ -2105,6 +2171,12 @@ def _rig_binding_discharged(source: str, field: str, child: str) -> bool:
     # ``self["<field>"]``, or a NON-``self`` receiver read — each a fail-closed
     # boundary the read-reroute cannot safely rewrite.
     if _rig_has_surviving_field_consumption(source, field):
+        return False
+    # (3) no surviving DYNAMIC ``self[<expr>]`` index read (codex r2 BLOCKING): a
+    # computed key (``self["weapon".."Slot"]``, ``self[k]``) the analyzer cannot
+    # decode COULD read ``<field>`` and was NOT rerouted -> the field is not provably
+    # unread -> fail closed. (A static ``self["<field>"]`` is already caught by (2).)
+    if _rig_has_surviving_dynamic_self_index_read(source):
         return False
     return True
 
