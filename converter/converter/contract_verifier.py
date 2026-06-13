@@ -908,39 +908,30 @@ def _rig_has_computed_field_key(source: str, field: str) -> bool:
 # ``<field>`` is ``_`` and after is ``C`` — no word boundary), so the
 # ``_rig_field_token_re`` word-boundary scan never matches it. Kept as an explicit
 # exception only for robustness against a future cache-field rename.
-def _rig_is_resolver_internal_access(
-    source: str, start: int, end: int, suffix: str
-) -> bool:
-    """True if the field-access at ``[start, end)`` is part of the INJECTED
-    resolver's own internals — the ``_<field>Cache`` memo field OR any position
-    inside the injected ``_resolve<suffix>`` method body — so it is NOT a foreign
-    surviving consumption. (A REROUTED read became ``self:_resolve<suffix>()`` and
-    carries NO ``.<field>`` field-access, so it correctly does not reach here.)
-    ``suffix`` is the CHILD-derived resolver-method suffix the lowering emitted."""
+#
+# NOTE: there is deliberately NO method-body-span exemption. The injected resolver
+# body contains NO bare ``.<field>`` READ — it reads ``self._<field>Cache`` (the
+# memo, covered above) and ``FindFirstChild("<child>", true)`` (the CHILD name, not
+# the field). A body-span exemption keyed on the resolver-method NAME would
+# fail-OPEN: a forged source could plant a decoy ``function tbl:_resolve<suffix>()
+# ... owner.<field> ... end`` to hide a real surviving read. The discharge's
+# separate ``_rig_resolver_body_is_rig_lookup`` check still requires a real rig
+# resolver to be present.
+def _rig_is_resolver_internal_access(source: str, start: int, end: int) -> bool:
+    """True if the field-access at ``[start, end)`` is the INJECTED resolver's own
+    ``_<field>Cache`` memo field — so it is NOT a foreign surviving consumption. (A
+    REROUTED read became ``self:_resolve<suffix>()`` and carries NO ``.<field>``
+    field-access, so it correctly does not reach here.)"""
     # The ``_<field>Cache`` memo: a ``_`` immediately precedes the token and
     # ``Cache`` immediately follows it.
-    if (
+    return (
         start >= 1
         and source[start - 1] == "_"
         and source[end:end + 5] == "Cache"
-    ):
-        return True
-    # Inside the injected ``_resolve<suffix>`` method body.
-    decl_re = re.compile(
-        r"\bfunction\s+[A-Za-z_]\w*[:.]_resolve" + re.escape(suffix) + r"\s*\("
     )
-    for m in decl_re.finditer(source):
-        if not _rig_pos_is_real_code(source, m.start()):
-            continue
-        body_end = _rig_method_body_end(source, m.start())
-        if m.start() <= start < body_end:
-            return True
-    return False
 
 
-def _rig_has_surviving_field_consumption(
-    source: str, field: str, child: str
-) -> bool:
+def _rig_has_surviving_field_consumption(source: str, field: str) -> bool:
     """True if ANY surviving code-position field-access READ of the ``<field>``
     token survives that the lowering's dot-form READ reroute did NOT (and could not)
     safely rewrite — so the binding is NOT discharged. Path A re-anchor: this is the
@@ -963,17 +954,15 @@ def _rig_has_surviving_field_consumption(
       1. an ASSIGNMENT LHS (``<recv>.<field> =`` / ``<recv>["<field>"] =``, not
          ``==``) — a WRITE; a Tier-2-skipped init-write may legitimately survive
          (discharge is decoupled from neutralize);
-      2. the injected resolver's OWN internals — the ``_<field>Cache`` memo and any
-         occurrence inside the injected ``_resolve<suffix>`` method body. (A
-         rerouted read became ``self:_resolve<suffix>()`` and contains NO
-         ``.<field>`` field-access, so it correctly never matches.)
+      2. the injected resolver's OWN ``_<field>Cache`` memo. (A rerouted read became
+         ``self:_resolve<suffix>()`` and contains NO ``.<field>`` field-access, so it
+         correctly never matches.) There is deliberately NO method-body-span
+         exemption: it would fail-OPEN on a decoy ``_resolve<suffix>`` body planted
+         to hide a foreign ``.<field>`` read.
 
     The RECEIVER is ignored entirely (``self``, ``owner``, ``(owner)``,
     ``getOwner()``, ``owners[1]``, ``other.self``, parenthesized, aliased — ALL fail
     closed identically), closing the whole receiver-form class with no enumeration."""
-    # The resolver method is named for the CHILD (``_resolve<child-suffix>``), so the
-    # resolver-body exception keys on the child-derived suffix the lowering emitted.
-    suffix = _rig_method_suffix(child)
     # Position-preserving code projection (comment/string interiors blanked) so the
     # preceding-``.`` and assignment-LHS checks see CODE, not formatting or strings.
     proj = _rig_code_projection(source)
@@ -993,8 +982,8 @@ def _rig_has_surviving_field_consumption(
             continue  # not a dot member access (a bare identifier / write target name)
         if _rig_pos_is_assignment_lhs(proj, end):
             continue  # WRITE LHS -> a Tier-2-skipped write may survive
-        if _rig_is_resolver_internal_access(source, start, end, suffix):
-            continue  # the injected resolver's own internals
+        if _rig_is_resolver_internal_access(source, start, end):
+            continue  # the injected resolver's own ``_<field>Cache`` memo
         return True
 
     # (2) STRING-KEY bracket access: ``[ "<field>" ]`` / ``[ '<field>' ]``.
@@ -1417,7 +1406,7 @@ def _rig_binding_discharged(source: str, field: str, child: str) -> bool:
     # a dot-form ``self.<field>`` read (incl. lifecycle/shadowed), a bracket-index
     # ``self["<field>"]``, or a NON-``self`` receiver read — each a fail-closed
     # boundary the read-reroute cannot safely rewrite.
-    if _rig_has_surviving_field_consumption(source, field, child):
+    if _rig_has_surviving_field_consumption(source, field):
         return False
     return True
 

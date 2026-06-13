@@ -1243,3 +1243,44 @@ def test_pathA_r1_bracket_write_lhs_exception_still_discharges() -> None:
     discharge."""
     src = _green_plus_boundary_read('self["weaponSlot"] = somethingElse')
     assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
+    assert _rig_rows([
+        _rbx("Player", src, {"field": "weaponSlot", "child": "WeaponSlot", "present": True})
+    ]) == []
+
+
+def test_pathA_r2_decoy_resolver_body_does_not_exempt_foreign_read() -> None:
+    """D-S1b-PATHA-r2 — the resolver-body-span ACCESS exemption was dropped (kept
+    ONLY the ``_<field>Cache`` exemption). A forged source with the REAL resolver +
+    a ``self:_resolveWeaponSlot()`` call PLUS a DECOY balanced
+    ``function tbl:_resolveWeaponSlot() ... local y = owner.weaponSlot ... end`` body
+    must NOT hide the foreign ``owner.weaponSlot`` READ inside the decoy span — the
+    binding FAILS CLOSED (discharged=False). Pre-fix the method-body-span branch
+    exempted ANY ``.<field>`` access inside ANY ``_resolveWeaponSlot`` body keyed on
+    the method NAME alone -> fail-OPEN (RED against 56691bb)."""
+    green = _lower()
+    # The real resolver + call sites stay intact; inject a SECOND, decoy method with
+    # the same resolver NAME on a different receiver whose body reads the field off a
+    # FOREIGN receiver (``owner.weaponSlot``). It is LIVE code (not in a string),
+    # balanced, and would have been span-exempted by the dropped branch.
+    decoy_source = green.luau_source.replace(
+        "    return rifle\nend",
+        (
+            "    return rifle\nend\n"
+            "function Decoy:_resolveWeaponSlot()\n"
+            "    local y = owner.weaponSlot\n"
+            "    return y\nend"
+        ),
+        1,
+    )
+    assert "function Player:_resolveWeaponSlot()" in decoy_source  # real resolver
+    assert "self:_resolveWeaponSlot()" in decoy_source  # call sites
+    assert "function Decoy:_resolveWeaponSlot()" in decoy_source  # decoy body
+    assert "owner.weaponSlot" in decoy_source  # foreign surviving READ
+    # The foreign read inside the decoy body must NOT be exempted -> fail closed.
+    assert _rig_binding_discharged(decoy_source, "weaponSlot", "WeaponSlot") is False
+    script = _rbx(
+        "Player",
+        decoy_source,
+        {"field": "weaponSlot", "child": "WeaponSlot", "present": True},
+    )
+    assert len(_rig_rows([script])) == 1
