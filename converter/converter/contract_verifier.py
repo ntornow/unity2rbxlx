@@ -998,6 +998,24 @@ def _check_surviving_child_ordinal(
         # DIFFERENT-ordinal write (codex r3), a bare-``cam`` receiver, the direct
         # no-seed form, a READ survivor, a non-/un-discharged script, or any survivor
         # beyond the single credited write is NOT exempted and still fails closed.
+        #
+        # TRUST BOUNDARY (codex r3 adjudication — User-Challenge/Taste). The exemption
+        # TRUSTS the carrier's ``cam_receiver``/``cam_ordinal`` as the deterministic
+        # resolver-fact's proxy; it CANNOT re-derive them from the source (the source
+        # can't self-identify which GetChild site the resolver credited), exactly as
+        # ``field``/``child`` are trusted anchors above. A well-formed FORGED carrier
+        # (receiver+ordinal chosen to match a genuine survivor) could therefore exempt
+        # that survivor. The SECURITY BOUND is that the skip is gated on
+        # ``_site_is_discharged_rig_dead_write`` (the site is the WHOLE RHS of a
+        # ``self.<field> = ...`` WRITE) ANDed with independent discharge below
+        # (``_rig_binding_discharged`` -> no raw ``self.<field>`` READ survives). So the
+        # WORST a stale/forged carrier can do is mask an INERT dead write to an
+        # already-discharged field (dead code whose ``:GetChildren()`` result is
+        # discarded) — NEVER a live child-ref regression (a READ, or a write to a
+        # different lvalue, fails the gate and stays counted). Forging the carrier
+        # requires tampering the internal ``conversion_plan.json``, which the converter
+        # writes itself — out of threat model (an attacker who can edit it can edit the
+        # output Luau directly). See test_rig_binding_present.py §f-r3-INERT-BOUND.
         exempt: _RigDeadWriteExempt | None = None
         rb = script.rig_binding
         if rb:

@@ -2503,3 +2503,94 @@ def test_fr3_x_pre_fix_red_proof_receiver_blind_r8_masks() -> None:
         for v in old._check_surviving_child_ordinal(_TOPOLOGY, [s_iii])
     ), "the receiver-blind r8 exemption MUST mask the different-ordinal survivor"
     assert _checkD_fires(s_iii)  # r3 does not mask it
+
+
+# ===========================================================================
+# §4 (f-r3-INERT-BOUND) — codex r3 trust-boundary adjudication (User-Challenge/Taste).
+#
+# The check-D rig exemption ANCHORS on the carrier's cam_receiver/cam_ordinal, which
+# it TRUSTS as the deterministic resolver-fact's proxy (it cannot be re-derived from
+# the source — the source can't self-identify which GetChild site the resolver
+# credited; exactly as field/child are trusted anchors in FIX 1). Codex showed a
+# WELL-FORMED FORGED carrier (valid types, receiver+ordinal chosen to match a genuine
+# survivor) could exempt that survivor.
+#
+# The ADJUDICATED bound (NOT a behavioral silent-miss — these tests PROVE and DOCUMENT
+# the structural guarantee, they do not add impossible authentication): the exemption
+# only ever skips a site that BOTH
+#   (1) passes _site_is_discharged_rig_dead_write — i.e. the site is the WHOLE RHS of a
+#       ``self.<field> = ...`` assignment (a WRITE to the rig field), AND
+#   (2) is on a script whose binding is INDEPENDENTLY discharged
+#       (_rig_binding_discharged -> no raw ``self.<field>`` READ survives).
+# Therefore the masked site is ALWAYS a write to a field that is never read -> dead code
+# whose ``:GetChildren()`` result is DISCARDED -> functionally INERT. A forged carrier
+# can mask only an inert dead write, NEVER a live child-ref regression. (Forging the
+# carrier requires tampering the internal conversion_plan.json — out of threat model.)
+# ===========================================================================
+
+
+def test_inert_bound_forged_carrier_can_only_skip_a_self_field_write_site() -> None:
+    """INERT BOUND (i) — an attacker-CHOSEN ("forged") carrier whose cam_receiver +
+    cam_ordinal are picked to MATCH a genuine survivor can cause the exemption to skip
+    that survivor ONLY when the survivor is the WHOLE RHS of a ``self.<field> = ...``
+    WRITE on a DISCHARGED script. We prove the structural guarantee directly: the one
+    exempted survivor is a write-LHS to ``self.weaponSlot`` AND, because the script is
+    discharged, NO raw read of ``self.weaponSlot`` survives -> the skipped site is dead
+    code, functionally inert."""
+    # A discharged source whose surviving dead init-write IS the (attacker-known)
+    # credited shape. ``_discharged_with_write`` asserts discharge holds.
+    src = _discharged_with_write("self.weaponSlot = self.cam:GetChildren()[1]")
+    # The carrier is "forged" in the threat-model sense: cam_receiver/cam_ordinal are
+    # chosen to match the survivor. (Here they happen to equal the corpus values; the
+    # point is the verifier TRUSTS them, never re-derives them.)
+    forged = _carrier(cam_receiver="cam", cam_ordinal=0)
+    # (a) The exemption skips EXACTLY this one site (count drops to 0).
+    assert _count_surviving_child_ordinals(src, _CORPUS_EXEMPT) == 0
+    assert not _checkD_fires(_fr3_script(src, forged))
+    # (b) STRUCTURAL GUARANTEE — the exempted site's enclosing statement is a WRITE to
+    #     ``self.<field>`` (the LHS), the site being its whole RHS. Assert the credited
+    #     statement is present in exactly the ``self.weaponSlot = <site>`` write form.
+    assert "self.weaponSlot = self.cam:GetChildren()[1]" in src
+    # (c) INERT — the entry-gate required _rig_binding_discharged, so NO raw read of
+    #     ``self.<field>`` survives: the write target is never read -> dead code whose
+    #     :GetChildren() result is discarded. (boundary tests above prove discharge
+    #     fails closed the instant any raw read survives.)
+    assert _rig_binding_discharged(src, "weaponSlot", "WeaponSlot") is True
+
+
+def test_inert_bound_forged_carrier_cannot_mask_a_read_survivor() -> None:
+    """INERT BOUND (ii) — a forged carrier naming a receiver/ordinal that match a
+    survivor which is a READ (a consumption, NOT a ``self.<field> =`` write) CANNOT
+    cause the exemption to skip it: _site_is_discharged_rig_dead_write requires the
+    statement to OPEN with the ``self.<field>`` write-LHS, so a read survivor fails
+    clause (1) -> COUNTED. This is the load-bearing half of the bound — a forged
+    carrier can never mask a LIVE child-ref read regression."""
+    # A discharged script PLUS a surviving READ ordinal on the SAME receiver+ordinal the
+    # forged carrier names (``self.cam:GetChildren()[1]`` as an RHS the field never owns).
+    src = _discharged_with_write("self.weaponSlot = self.cam:GetChildren()[1]")
+    src = src.replace(
+        "function Player:GetRifle()\n",
+        "function Player:GetRifle()\n    local extra = self.cam:GetChildren()[1]\n",
+    )
+    # The forged carrier names EXACTLY this receiver+ordinal (cam / [1]).
+    forged = _carrier(cam_receiver="cam", cam_ordinal=0)
+    # The credited dead WRITE is exempted (one site), but the READ survivor — same
+    # receiver+ordinal — is NOT: a forged carrier cannot mask it. Net: 1 survivor.
+    assert _count_surviving_child_ordinals(src, _RigDeadWriteExempt(
+        field_name="weaponSlot", cam_receiver="cam", cam_ordinal=0
+    )) == 1
+    assert _checkD_fires(_fr3_script(src, forged))
+
+
+def test_inert_bound_forged_carrier_cannot_mask_a_different_lvalue_write() -> None:
+    """INERT BOUND (iii) — a forged carrier whose receiver/ordinal match a survivor that
+    is a WRITE to a DIFFERENT lvalue (``self.muzzle = self.cam:GetChildren()[1]``, NOT
+    ``self.<field>``) CANNOT mask it: the LHS gate (_rig_exempt_lhs_re on ``self.<field>``)
+    rejects a write whose lvalue is not the bound field -> COUNTED. The exemption is
+    bound to a write of the rig FIELD, never an arbitrary same-RHS write."""
+    src = _discharged_with_write("self.muzzle = self.cam:GetChildren()[1]")
+    forged = _carrier(cam_receiver="cam", cam_ordinal=0)
+    # The survivor writes ``self.muzzle`` (not ``self.weaponSlot``) -> LHS gate rejects
+    # the exemption -> COUNTED, even though receiver+ordinal match the forged carrier.
+    assert _count_surviving_child_ordinals(src, _CORPUS_EXEMPT) == 1
+    assert _checkD_fires(_fr3_script(src, forged))
