@@ -12,6 +12,16 @@
   "scripts": [
     {
       "intrinsic_script_type": "ModuleScript",
+      "name": "GerstnerDisplace",
+      "parent_path": "ReplicatedStorage",
+      "requires_part_parent": false,
+      "rig_binding": null,
+      "script_type": "ModuleScript",
+      "source": "local Displace = require(game:GetService(\"ReplicatedStorage\"):FindFirstChild(\"Displace\", true) or game:GetService(\"ServerStorage\"):FindFirstChild(\"Displace\", true))\n\nlocal GerstnerDisplace = {}\nGerstnerDisplace.__index = GerstnerDisplace\n\nfunction GerstnerDisplace.new(config)\n    setmetatable(GerstnerDisplace, { __index = Displace })\n    local self = Displace.new(config)\n    setmetatable(self, GerstnerDisplace)\n    return self\nend\n\nreturn GerstnerDisplace",
+      "source_path": "GerstnerDisplace.luau"
+    },
+    {
+      "intrinsic_script_type": "ModuleScript",
       "name": "WaterBase",
       "parent_path": "ReplicatedStorage",
       "requires_part_parent": false,
@@ -140,6 +150,8 @@
       "parent_path": "ReplicatedStorage",
       "requires_part_parent": false,
       "rig_binding": {
+        "cam_ordinal": 0,
+        "cam_receiver": "cam",
         "child": "WeaponSlot",
         "field": "weaponSlot",
         "present": true
@@ -181,16 +193,6 @@
       "script_type": "ModuleScript",
       "source": "local Class = {}\nClass.__index = Class\n\nfunction Class.new(config)\n    local self = setmetatable({}, Class)\n    self.fadeTime = config.fadeTime or 3\n    self.force = config.force or 60\n    self.damage = config.damage or 10\n    return self\nend\n\nfunction Class:getRb()\n    return self:GetComponent(\"Rigidbody\")\nend\n\nfunction Class:Awake()\n    self.host:connectGameObjectSignal(self.gameObject, \"Touched\", function(other)\n        local plr = self.host.playerFromTouch(other)\n        if not plr then return end\n        local char = plr.Character\n        if char then\n            local hum = char:FindFirstChildOfType(\"Humanoid\")\n            if hum then\n                hum:TakeDamage(self.damage)\n            end\n        end\n        self.host.destroy(self.gameObject)\n    end)\nend\n\nfunction Class:Start()\n    local rb = self:getRb()\n    local pivot = self.gameObject:GetPivot()\n    local impulse = pivot.LookVector * self.force\n    if rb then\n        rb:ApplyImpulse(impulse)\n    elseif self.gameObject:IsA(\"BasePart\") then\n        self.gameObject:ApplyImpulse(impulse)\n    end\n\n    task.delay(self.fadeTime, function()\n        self.host.destroy(self.gameObject)\n    end)\nend\n\nreturn Class",
       "source_path": "TurretBullet.luau"
-    },
-    {
-      "intrinsic_script_type": "ModuleScript",
-      "name": "GerstnerDisplace",
-      "parent_path": "ReplicatedStorage",
-      "requires_part_parent": false,
-      "rig_binding": null,
-      "script_type": "ModuleScript",
-      "source": "local Displace = require(game:GetService(\"ReplicatedStorage\"):FindFirstChild(\"Displace\", true) or game:GetService(\"ServerStorage\"):FindFirstChild(\"Displace\", true))\n\nlocal GerstnerDisplace = {}\nGerstnerDisplace.__index = GerstnerDisplace\n\nfunction GerstnerDisplace.new(config)\n    setmetatable(GerstnerDisplace, { __index = Displace })\n    local self = Displace.new(config)\n    setmetatable(self, GerstnerDisplace)\n    return self\nend\n\nreturn GerstnerDisplace",
-      "source_path": "GerstnerDisplace.luau"
     },
     {
       "intrinsic_script_type": "ModuleScript",

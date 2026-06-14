@@ -73,10 +73,15 @@ _FIELDS = (
     # The child-ref resolution tally the check-D backstop reads. Without it the
     # field is never copied into fixture.json and check D goes DEAD on the corpus.
     "child_ref_resolution",
-    # The rig-retarget binding carrier ({field, child, present}) the binding-present
-    # fail-closed check reads. Without it the field is never copied into fixture.json
-    # and rig_binding_present goes DEAD on the corpus (abstains green-for-the-wrong-
-    # reason instead of asserting the discharged Player binding).
+    # The rig-retarget binding carrier the binding-present fail-closed check reads.
+    # The captured dict carries ALL FIVE keys verbatim ({field, child, present,
+    # cam_receiver, cam_ordinal}); the latter two (REDESIGN r3) are check D's
+    # dead-write exemption anchor. Without "rig_binding" in _FIELDS the carrier is
+    # never copied into fixture.json and rig_binding_present goes DEAD on the corpus
+    # (abstains green-for-the-wrong-reason instead of asserting the discharged Player
+    # binding); and a dropped cam_receiver/cam_ordinal would silently revert check D's
+    # exemption to the field-only mask. The fixture assertion in
+    # test_contract_corpus.py confirms both keys land on the committed Player carrier.
     "rig_binding",
 )
 

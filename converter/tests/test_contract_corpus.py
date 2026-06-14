@@ -229,6 +229,26 @@ def test_corpus_exercises_rig_binding_present_check() -> None:
         rb = s["rig_binding"]
         child = rb.get("child")
         src = s.get("source") or ""
+        # REDESIGN r3: the carrier MUST carry the deterministic check-D exemption
+        # anchor on the committed fixture (BLOCKING #1 threading proof). A regen
+        # that dropped either key would silently revert the exemption to the
+        # field-only mask, so assert their presence + type here — a dropped key
+        # REDS the corpus test instead of regressing silently.
+        cam_receiver = rb.get("cam_receiver")
+        cam_ordinal = rb.get("cam_ordinal")
+        assert isinstance(cam_receiver, str) and cam_receiver != "", (
+            f"{project}/{script_name}: rig_binding.cam_receiver must be a non-empty "
+            f"str (the C# camera receiver text, the check-D exemption anchor), got "
+            f"{cam_receiver!r}. A dropped/empty cam_receiver reverts check D's "
+            f"dead-write exemption to the field-only mask. Re-run "
+            f"tools/regen_contract_corpus.py against the carrier-stamping pipeline."
+        )
+        assert isinstance(cam_ordinal, int) and not isinstance(cam_ordinal, bool), (
+            f"{project}/{script_name}: rig_binding.cam_ordinal must be an int (the "
+            f"credited GetChild(n) ordinal, the check-D exemption anchor), got "
+            f"{cam_ordinal!r}. A dropped cam_ordinal reverts check D's exemption to "
+            f"the field-only mask. Re-run tools/regen_contract_corpus.py."
+        )
         resolver_def = f"function {script_name}:_resolve{child}("
         resolver_call = f"self:_resolve{child}()"
         assert resolver_def in src, (
