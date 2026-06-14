@@ -2296,3 +2296,76 @@ def test_f2_no_mutual_mask_against_verifier_or_conservatism() -> None:
     # Note: when the verifier r3 predicate is absent (this slice branch), the
     # cross-scanner parity lands at phase integration (slice 1.2); the lowering's
     # no-mutual-mask conservatism asserted above is the safety property for now.
+
+
+# === (harden) module-scope-aware trailing-return detection ===================
+# Codex HARDEN BLOCKING: ``_last_module_return_span`` picked the LAST line-level
+# ``return <Class>`` regardless of block scope. A METHOD-LOCAL ``return <Class>``
+# (``function <Class>.new() return <Class> end``) that is the last occurrence — when
+# the module epilogue returns a different symbol — was chosen as the splice point,
+# nesting the resolver INSIDE the method (still valid Luau, so the syntax re-check
+# does not catch it) while stamping ``present=True`` off a misplaced splice.
+
+
+def test_harden_method_local_return_class_not_chosen_as_splice() -> None:
+    from converter.rifle_rig_retarget_lowering import (
+        _inject_resolver_method,
+        _last_module_return_span,
+    )
+
+    # The ONLY ``return Player`` is method-local; the module epilogue returns ``M``.
+    src = (
+        "local Player = {}\n"
+        "function Player.new(self)\n"
+        "    return Player\n"
+        "end\n"
+        "local M = Player\n"
+        "return M\n"
+    )
+    # Module-scope detection must reject the method-local return.
+    assert _last_module_return_span(src, "Player") is None
+    # -> injection abstains rather than splicing the resolver inside ``new``.
+    new_src, injected = _inject_resolver_method(src, "Player", "Camera", "cam", "Camera")
+    assert injected is False
+    assert new_src == src
+    assert "_resolveCamera" not in new_src
+
+
+def test_harden_module_epilogue_return_class_still_chosen() -> None:
+    # Regression guard: a genuine module-trailing ``return Player`` (with a benign
+    # method-local one before it) is still the splice point, before the final return.
+    from converter.rifle_rig_retarget_lowering import (
+        _inject_resolver_method,
+        _last_module_return_span,
+    )
+
+    src = (
+        "local Player = {}\n"
+        "function Player:GetSelf()\n"
+        "    return Player\n"
+        "end\n"
+        "return Player\n"
+    )
+    span = _last_module_return_span(src, "Player")
+    assert span is not None and span[0] == src.rindex("return Player")
+    new_src, injected = _inject_resolver_method(src, "Player", "Camera", "cam", "Camera")
+    assert injected is True
+    # The resolver is spliced BEFORE the final module return, not nested in GetSelf.
+    assert new_src.rstrip().endswith("return Player")
+    assert "end\n-- _RIG_RETARGET_Camera" in new_src
+
+
+def test_harden_module_level_do_end_then_return_not_misclassified() -> None:
+    # A module-level ``do … end`` block before the epilogue must not make the
+    # following ``return Player`` look function-local.
+    from converter.rifle_rig_retarget_lowering import _last_module_return_span
+
+    src = (
+        "local Player = {}\n"
+        "do\n"
+        "    local x = 1\n"
+        "end\n"
+        "return Player\n"
+    )
+    span = _last_module_return_span(src, "Player")
+    assert span is not None and span[0] == src.rindex("return Player")

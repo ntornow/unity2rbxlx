@@ -2127,19 +2127,46 @@ def _rig_method_body_end(source: str, decl_start: int) -> int:
     return n
 
 
+def _rig_module_class(source: str) -> str | None:
+    """The module's primary class name — the class of the FIRST code-level
+    ``function <Class>:<m>(`` / ``function <Class>.<m>(`` declaration. This is the
+    SAME derivation the lowering uses (``_read_class_name``) to choose the class the
+    resolver method is injected on, so the verifier binds the resolver to the exact
+    host class the lowering targeted. None if no method declaration is found."""
+    for m in _RIG_FUNCTION_METHOD_RE.finditer(source):
+        if not _rig_pos_is_real_code(source, m.start()):
+            continue
+        return m.group(1)
+    return None
+
+
 def _rig_resolver_body_is_rig_lookup(source: str, suffix: str, child: str) -> bool:
     """True if a code-position ``function <Class>:_resolve<suffix>(`` method exists
-    WHOSE BODY is the lowering's rig resolver — i.e. the distinctive
-    ``_MainCameraRig`` rig lookup appears as LIVE code inside that method's span:
-    BOTH ``:GetAttribute("_MainCameraRig")`` AND ``FindFirstChild("<child>", true)``
-    (the real S1 emit, anchored on the deterministic ``child``).
+    ON THE MODULE'S PRIMARY CLASS whose body is the lowering's rig resolver — i.e.
+    the distinctive ``_MainCameraRig`` rig lookup appears as LIVE code inside that
+    method's span: BOTH ``:GetAttribute("_MainCameraRig")`` AND
+    ``FindFirstChild("<child>", true)`` (the real S1 emit, anchored on the
+    deterministic ``child``).
 
     Codex BLOCKING: a FOREIGN same-named stub (``return nil`` / a wrong lookup) +
     a forged/stale ``present=True`` must NOT count as discharged. Requiring the rig-
     lookup body as live code inside the method span is the fail-closed floor — a
-    bare same-named method without that body does not discharge."""
+    bare same-named method without that body does not discharge.
+
+    Codex HARDEN BLOCKING: the method must also be declared on the module's PRIMARY
+    CLASS (the class the lowering injects on). A wrong-class same-named resolver
+    (``function Helper:_resolve<suffix>(`` carrying the real body) is NOT the host's
+    method — the rerouted ``self:_resolve<suffix>(`` calls bind to the host class,
+    not ``Helper`` — so it must NOT false-discharge."""
+    module_class = _rig_module_class(source)
+    if module_class is None:
+        return False  # no host class -> cannot have landed the resolver -> fail closed
     decl_re = re.compile(
-        r"\bfunction\s+[A-Za-z_]\w*[:.]_resolve" + re.escape(suffix) + r"\s*\("
+        r"\bfunction\s+("
+        + re.escape(module_class)
+        + r")[:.]_resolve"
+        + re.escape(suffix)
+        + r"\s*\("
     )
     rig_attr = ':GetAttribute("_MainCameraRig")'
     find_child = f'FindFirstChild("{child}", true)'

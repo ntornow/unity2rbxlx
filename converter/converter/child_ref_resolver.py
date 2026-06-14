@@ -546,7 +546,6 @@ _CAMERA_MAIN_TRANSFORM = "Camera.main.transform"
 _CS_CONDITIONAL_KEYWORDS: frozenset[str] = frozenset(
     {"if", "else", "while", "for", "foreach", "case", "do"}
 )
-_CS_BRACELESS_GOVERNOR_RE = re.compile(r"([A-Za-z_]\w*)\s*$")
 
 
 def _seed_dominates_use(source: str, seed_start: int, use_pos: int) -> bool:
@@ -582,23 +581,28 @@ def _seed_dominates_use(source: str, seed_start: int, use_pos: int) -> bool:
             if depth < 0:
                 return False  # the seed's enclosing block closed before the use
         i += 1
-    # (2) braceless single-statement governor check: walk back over whitespace from
-    # the seed to the preceding statement boundary. If the seed statement is
-    # directly governed by a braceless conditional, it does not dominate.
-    j = seed_start - 1
-    while j >= 0 and source[j] in " \t\r\n":
-        j -= 1
-    if j < 0:
+    # (2) braceless single-statement governor check: walk back over whitespace AND
+    # C# comments from the seed to the preceding statement boundary. If the seed
+    # statement is directly governed by a braceless conditional, it does not
+    # dominate.
+    #
+    # TRIVIA-ROBUST (codex harden BLOCKING): the back-walk MUST skip ``//``/``/* */``
+    # comments, not just whitespace. A comment between the governing header and the
+    # seed (``if (c) /*x*/ cam = ...`` / ``if (c) // n\n cam = ...``) otherwise lands
+    # ``prev`` on the comment delimiter, defeating the conditional detection and
+    # FALSE-ADMITTING a conditional seed as dominating.
+    k0 = _skip_ws_and_comments_back(source, seed_start)
+    if k0 <= 0:
         return True  # start of file -> top-level straight-line
-    prev = source[j]
+    prev = source[k0 - 1]
     if prev in ";{}":
         return True  # a clear statement/block boundary -> straight-line in scope
     if prev == ")":
         # The seed follows a ``)`` — it may be the braceless body of an
         # ``if (...)``/``while (...)``/``for (...)`` header. Find the matching
-        # ``(`` and inspect the keyword before it.
+        # ``(`` and inspect the keyword before it (trivia-aware).
         bdepth = 0
-        k = j
+        k = k0 - 1
         while k >= 0:
             if _cs_pos_is_code(source, k):
                 c = source[k]
@@ -611,18 +615,29 @@ def _seed_dominates_use(source: str, seed_start: int, use_pos: int) -> bool:
             k -= 1
         if k < 0:
             return False  # unbalanced -> cannot prove -> abstain
-        head = source[:k]
-        gm = _CS_BRACELESS_GOVERNOR_RE.search(head)
-        if gm is not None and gm.group(1) in _CS_CONDITIONAL_KEYWORDS:
+        if _preceding_governor_keyword(source, k) in _CS_CONDITIONAL_KEYWORDS:
             return False  # braceless conditional body -> not dominating
         return True
     if prev.isalpha() or prev == "_":
         # The seed follows a bare keyword (``else cam = ...;`` / ``do cam = ...``).
-        gm = _CS_BRACELESS_GOVERNOR_RE.search(source[: j + 1])
-        if gm is not None and gm.group(1) in _CS_CONDITIONAL_KEYWORDS:
+        if _preceding_governor_keyword(source, k0) in _CS_CONDITIONAL_KEYWORDS:
             return False
         return True
     return True
+
+
+def _preceding_governor_keyword(source: str, pos: int) -> str | None:
+    """The C# identifier/keyword token whose LAST char ends just before ``pos``
+    (skipping intervening whitespace + ``//``/``/* */`` comments). Used to read the
+    control-flow keyword that governs a braceless body — trivia between the keyword
+    and its ``(`` / body (``if /*x*/ (c) ...``) must not hide it. None if no
+    identifier token precedes ``pos``."""
+    k = _skip_ws_and_comments_back(source, pos)
+    end = k
+    while k >= 1 and (source[k - 1].isalnum() or source[k - 1] == "_"):
+        k -= 1
+    token = source[k:end]
+    return token or None
 
 
 def _owning_node_collection(
@@ -769,18 +784,20 @@ def _canonical_receiver(source: str, recv: str, use_pos: int) -> str | None:
     if nearest_start == -1:
         return None  # no binding before the use site -> not seed-resolvable
     # Is that nearest preceding binding EXACTLY ``<recv> = Camera.main.transform``?
-    seed_re = re.compile(
-        r"\b" + re.escape(recv) + r"\s*=\s*"
-        + re.escape(_CAMERA_MAIN_TRANSFORM) + r"\b"
-    )
-    m = seed_re.match(source, nearest_start)
-    if m is None:
+    # TRIVIA-ROBUST (codex harden — mirror the LHS round-5 discipline): the seed's
+    # ``<recv>``, ``=``, and the ``Camera.main.transform`` literal may be separated by
+    # ``//``/``/* */`` comments (``cam = /*c*/ Camera.main.transform``); skip trivia
+    # forward between tokens so a comment-split LEGIT seed is not false-REJECTED (a
+    # dropped rig fact -> the rifle silently fails to retarget). A non-camera RHS
+    # still returns None.
+    end = _match_exact_cam_seed_rhs(source, nearest_start, recv, use_pos)
+    if end is None:
         return None  # the live binding is something else (e.g. enemy.transform)
     # The RHS must be EXACTLY Camera.main.transform (not a longer chain like
-    # Camera.main.transform.parent). The matcher's ``\b`` after the literal
-    # already prevents ``...transformX``; reject a trailing ``.`` member.
-    end = m.end()
-    if end < len(source) and source[end] == ".":
+    # Camera.main.transform.parent). ``_match_exact_cam_seed_rhs`` already requires a
+    # word boundary after the literal; reject a trailing ``.`` member (trivia-aware).
+    tail = _skip_ws_and_comments_fwd(source, end)
+    if tail < len(source) and source[tail] == ".":
         return None  # longer chain -> not the exact one-hop seed
     # SCOPE-AWARE (codex round-3 BLOCKING): order-nearest is not enough — the seed
     # must DOMINATE the use site on the straight-line path. A seed buried in a
@@ -824,6 +841,68 @@ def _skip_ws_and_comments_back(source: str, pos: int) -> int:
             continue
         break
     return k
+
+
+def _skip_ws_and_comments_fwd(source: str, pos: int) -> int:
+    """Walk ``pos`` FORWARD over whitespace and C# ``//``/``/* */`` comments,
+    returning the index of the next CODE char (or ``len(source)`` at end). A comment
+    char is identified authoritatively by ``_cs_pos_is_code`` (a from-start scan that
+    distinguishes a real comment from ``//`` inside a string literal)."""
+    n = len(source)
+    k = pos
+    while k < n:
+        ch = source[k]
+        if ch in " \t\r\n":
+            k += 1
+            continue
+        # A comment OPENER (``//`` / ``/*``) is classified as code by
+        # ``_cs_pos_is_code`` at the opener itself; recognize it by the inner char
+        # being non-code, then skip the whole comment body (non-code positions).
+        if ch == "/" and k + 1 < n and source[k + 1] in "/*" and not _cs_pos_is_code(
+            source, k + 1
+        ):
+            k += 1
+            continue
+        # An inner comment char (already inside a comment) is non-code -> skip.
+        if not _cs_pos_is_code(source, k):
+            k += 1
+            continue
+        break
+    return k
+
+
+def _match_exact_cam_seed_rhs(
+    source: str, nearest_start: int, recv: str, use_pos: int
+) -> int | None:
+    """Match ``<recv>`` [trivia] ``=`` (not ``==``) [trivia]
+    ``Camera.main.transform`` starting at ``nearest_start``, skipping ``//``/``/* */``
+    comments and whitespace between every token. Returns the index just AFTER the
+    literal on a match (so the caller can inspect a trailing ``.`` member), else
+    None. The literal must end on a word boundary (no ``...transformX``)."""
+    n = len(source)
+    # ``<recv>`` token.
+    i = nearest_start
+    if source[i : i + len(recv)] != recv:
+        return None
+    i += len(recv)
+    if i < n and (source[i].isalnum() or source[i] == "_"):
+        return None  # ``recv`` is a prefix of a longer identifier
+    # ``=`` (reject ``==``).
+    i = _skip_ws_and_comments_fwd(source, i)
+    if i >= n or source[i] != "=" or (i + 1 < n and source[i + 1] == "="):
+        return None
+    i += 1
+    # ``Camera.main.transform`` literal.
+    i = _skip_ws_and_comments_fwd(source, i)
+    lit = _CAMERA_MAIN_TRANSFORM
+    if source[i : i + len(lit)] != lit:
+        return None
+    end = i + len(lit)
+    if end < n and (source[end].isalnum() or source[end] == "_"):
+        return None  # ``...transformX`` -> not the exact literal
+    if end > use_pos:
+        return None  # the seed must complete before the use site
+    return end
 
 
 def _lhs_is_bare_field(source: str, field_start: int, full_lhs: str) -> str | None:

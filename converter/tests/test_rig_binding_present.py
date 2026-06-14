@@ -2912,3 +2912,133 @@ def test_r2_corpus_dot_form_reads_still_discharge_and_exempt() -> None:
     checks = {v.check for v in res.violations}
     assert "rig_binding_present" not in checks  # discharge stayed True
     assert "child_ordinal_survivor" not in checks  # the dead-write exemption still applies
+
+
+# ===========================================================================
+# §5 (preserve/resume e2e) — the REAL conversion_plan.json save -> load -> restore
+# round-trip of the 5-key rig_binding carrier. A resumed assemble rehydrates scripts
+# from disk and must NOT silently lose the cam_receiver/cam_ordinal anchor check D's
+# dead-write exemption keys on — else a discharged dead init-write that the lowering
+# legitimately credited would re-fire as a child_ordinal_survivor on every resume.
+# Exercises the production loader ``Pipeline._load_rig_binding_for_rehydration`` (not a
+# hand-rolled parse), and proves a hypothetical 3-key LOAD filter breaks the thread.
+# ===========================================================================
+
+
+def _make_resume_pipeline(tmp_path: Path):
+    """A ``Pipeline`` whose output_dir is empty (a fresh resume target)."""
+    from converter.pipeline import Pipeline
+    from core.roblox_types import RbxPlace
+
+    project = tmp_path / "proj"
+    (project / "Assets").mkdir(parents=True)
+    output = tmp_path / "out"
+    output.mkdir(parents=True)
+    pipeline = Pipeline(
+        unity_project_path=project, output_dir=output, skip_upload=True
+    )
+    pipeline.state.rbx_place = RbxPlace()
+    return pipeline
+
+
+def test_rig_binding_persistence_roundtrip_preserves_checkD_anchor(
+    tmp_path: Path,
+) -> None:
+    """PRESERVE/RESUME e2e — a discharged carrier with a SURVIVING credited dead
+    init-write is SAVED to conversion_plan.json, LOADED back via the production
+    ``_load_rig_binding_for_rehydration``, RESTORED onto a rehydrated script, and the
+    check-D dead-write exemption still fires off the rehydrated carrier (so the resumed
+    assemble does NOT re-flag the inert dead write). All five carrier keys survive."""
+    import json
+
+    # A discharged source whose surviving dead init-write IS the credited shape — the
+    # exemption is LOAD-BEARING here (without the anchor, check D would count it).
+    src = _discharged_with_write("self.weaponSlot = self.cam:GetChildren()[1]")
+    carrier = _carrier(cam_receiver="cam", cam_ordinal=0)  # the 5-key carrier
+
+    pipeline = _make_resume_pipeline(tmp_path)
+    # SAVE: the rig_binding block of conversion_plan.json is exactly the per-script
+    # carrier map the write path persists (pipeline.py ~:4736).
+    (pipeline.output_dir / "conversion_plan.json").write_text(
+        json.dumps({"rig_binding": {"Player": carrier}}), encoding="utf-8"
+    )
+
+    # LOAD: the production loader.
+    loaded = pipeline._load_rig_binding_for_rehydration()
+    assert "Player" in loaded
+    rehydrated = loaded["Player"]
+    # All FIVE keys round-tripped (the anchor pair is the load-bearing addition).
+    assert rehydrated == carrier
+    assert rehydrated["cam_receiver"] == "cam"
+    assert rehydrated["cam_ordinal"] == 0
+
+    # RESTORE onto a rehydrated script + the child_ref_resolution accounting check D
+    # reads, then verify the rehydrated carrier anchors the exemption.
+    resumed = _fr3_script(src, rehydrated)
+    assert not _checkD_fires(resumed), (
+        "the rehydrated 5-key carrier must anchor check D's dead-write exemption on "
+        "a resumed assemble (the inert credited dead write must stay exempt)"
+    )
+
+    # PROOF the anchor is load-bearing — a hypothetical 3-key LOAD filter that dropped
+    # cam_receiver/cam_ordinal leaves check D unable to build the exemption -> the
+    # credited dead write re-fires as a survivor on every resume.
+    three_key = {k: rehydrated[k] for k in ("field", "child", "present")}
+    resumed_3key = _fr3_script(src, three_key)
+    assert _checkD_fires(resumed_3key), (
+        "a 3-key LOAD filter (no cam_receiver/cam_ordinal) must LOSE the exemption "
+        "anchor -> check D fires; this guards the 5-key threading through the loader"
+    )
+
+
+# ===========================================================================
+# §6 (harden) resolver body must be on the MODULE'S PRIMARY CLASS (codex HARDEN
+# BLOCKING): ``_rig_resolver_body_is_rig_lookup`` matched a ``function <AnyClass>:
+# _resolve<suffix>(`` with the rig-lookup body regardless of class. A FOREIGN-class
+# same-named resolver (``function Helper:_resolveCamera()`` carrying the real body)
+# is NOT the host's method — the rerouted ``self:_resolve<suffix>()`` calls bind to
+# the primary class, not ``Helper`` — so it must NOT false-discharge.
+# ===========================================================================
+
+
+def test_harden_wrong_class_resolver_does_not_discharge() -> None:
+    # Primary class is ``Player`` (its method decl comes FIRST). A FOREIGN ``Helper``
+    # carries the real resolver body, but there is NO genuine ``Player:_resolveCamera``;
+    # the rerouted call inside ``Player:Fire`` binds to ``Player`` (a nil method).
+    # Pre-fix this FALSE-DISCHARGED (the decl regex matched any class).
+    src = (
+        "local Player = {}\n"
+        "function Player:Fire()\n"
+        "    local c = self:_resolveCamera()\n"
+        "end\n"
+        "local Helper = {}\n"
+        "function Helper:_resolveCamera()\n"
+        "    local rig\n"
+        "    for _, m in workspace:GetDescendants() do\n"
+        '        if m:GetAttribute("_MainCameraRig") then rig = m end\n'
+        "    end\n"
+        '    return rig and rig:FindFirstChild("Camera", true)\n'
+        "end\n"
+        "return Player\n"
+    )
+    # The resolver is on ``Helper``, not the primary class ``Player`` -> NOT discharged.
+    assert _rig_binding_discharged(src, "cam", "Camera") is False
+
+
+def test_harden_host_class_resolver_still_discharges() -> None:
+    # Regression guard: the genuine on-host-class resolver still discharges True.
+    src = (
+        "local Player = {}\n"
+        "function Player:_resolveCamera()\n"
+        "    local rig\n"
+        "    for _, m in workspace:GetDescendants() do\n"
+        '        if m:GetAttribute("_MainCameraRig") then rig = m end\n'
+        "    end\n"
+        '    return rig and rig:FindFirstChild("Camera", true)\n'
+        "end\n"
+        "function Player:Fire()\n"
+        "    local c = self:_resolveCamera()\n"
+        "end\n"
+        "return Player\n"
+    )
+    assert _rig_binding_discharged(src, "cam", "Camera") is True

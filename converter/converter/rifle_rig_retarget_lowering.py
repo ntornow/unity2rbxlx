@@ -260,7 +260,16 @@ def _read_class_name(source: str) -> str | None:
 
 def _last_module_return_span(source: str, class_name: str) -> tuple[int, int] | None:
     """The (start, end) char span of the LAST code-level ``return <class_name>``
-    statement line at module scope. None if absent."""
+    statement line AT MODULE SCOPE. None if absent.
+
+    Module scope is the discriminator (codex harden BLOCKING): a method-local
+    ``return <class_name>`` (e.g. ``function <Class>.new() return <Class> end``)
+    matches ``_RETURN_IDENT_RE`` and can be the LAST occurrence when the module
+    epilogue returns a different symbol — splicing the resolver before it would
+    nest the method inside another function (still syntactically valid, so the
+    Luau re-check does NOT catch it), and stamp ``present=True`` off a misplaced
+    splice. Reject any return that lies inside a function body by checking it has
+    no enclosing colon-method."""
     chosen: tuple[int, int] | None = None
     for m in _RETURN_IDENT_RE.finditer(source):
         if m.group(1) != class_name:
@@ -269,8 +278,57 @@ def _last_module_return_span(source: str, class_name: str) -> tuple[int, int] | 
             continue
         if _luau_pos_in_long_bracket(source, m.start()):
             continue
+        if _return_is_inside_function_body(source, m.start()):
+            continue  # method-local return, NOT the module epilogue -> skip
         chosen = (m.start(), m.end())
     return chosen
+
+
+def _return_is_inside_function_body(source: str, pos: int) -> bool:
+    """True iff ``pos`` (a code-level ``return`` statement start) lies inside ANY
+    open ``function``…``end`` body at module scope — i.e. it is method-local, not
+    the module-level trailing return.
+
+    Tracks Luau block depth from the file start to ``pos`` using ``_BLOCK_TOKEN_RE``
+    (the same token grammar ``_self_is_shadowed_at`` walks): ``function``/``do``/
+    ``then``/``repeat`` open, ``end``/``until`` close. Only ``function`` openings
+    that are still unclosed at ``pos`` make the position function-local — but since
+    a bare ``do``/``then`` block can only appear INSIDE a function in transpiled
+    module bodies, any non-zero open depth at a module-epilogue return means the
+    return is not at module scope. We track a dedicated function-nesting counter so
+    a module-level ``do … end`` block (rare) does not misclassify."""
+    fn_depth = 0  # count of open ``function`` bodies (the load-bearing nesting)
+    block_depth = 0  # all block openers (function/do/then/repeat), to pair ``end``
+    fn_open_at_block_depth: list[int] = []  # block_depth at each open ``function``
+    i = 0
+    while i < pos:
+        if not _luau_pos_is_code(source, i) or _luau_pos_in_long_bracket(source, i):
+            i += 1
+            continue
+        tok = _BLOCK_TOKEN_RE.match(source, i)
+        if tok is None:
+            i += 1
+            continue
+        word = tok.group(1)
+        if word == "function":
+            block_depth += 1
+            fn_open_at_block_depth.append(block_depth)
+            fn_depth += 1
+            i = tok.end()
+            continue
+        if word in ("do", "then", "repeat"):
+            block_depth += 1
+            i = tok.end()
+            continue
+        if word in ("end", "until"):
+            if fn_open_at_block_depth and fn_open_at_block_depth[-1] == block_depth:
+                fn_open_at_block_depth.pop()
+                fn_depth -= 1
+            block_depth -= 1
+            i = tok.end()
+            continue
+        i = tok.end()
+    return fn_depth > 0
 
 
 def _resolver_method_text(
