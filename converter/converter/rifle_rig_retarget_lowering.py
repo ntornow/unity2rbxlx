@@ -296,7 +296,17 @@ def _return_is_inside_function_body(source: str, pos: int) -> bool:
     a bare ``do``/``then`` block can only appear INSIDE a function in transpiled
     module bodies, any non-zero open depth at a module-epilogue return means the
     return is not at module scope. We track a dedicated function-nesting counter so
-    a module-level ``do … end`` block (rare) does not misclassify."""
+    a module-level ``do … end`` block (rare) does not misclassify.
+
+    ``elseif`` is the load-bearing edge (round-1 harden regress): an
+    ``if a then … elseif b then … end`` chain has MULTIPLE ``then`` openers but ONE
+    ``end``. Each ``elseif``'s own upcoming ``then`` over-counts ``block_depth``, so
+    ``elseif`` DECREMENTS to cancel it (net 0 for the whole chain) — the same grammar
+    ``_FALLBACK_BLOCK_CLOSERS`` uses. Without this, any method containing an
+    if/elseif chain leaves ``block_depth`` permanently open, so a genuine
+    module-trailing ``return <Class>`` after it is misclassified as function-local
+    and the resolver is never injected. ``elseif`` never closes a ``function`` body,
+    so it does not touch ``fn_depth``."""
     fn_depth = 0  # count of open ``function`` bodies (the load-bearing nesting)
     block_depth = 0  # all block openers (function/do/then/repeat), to pair ``end``
     fn_open_at_block_depth: list[int] = []  # block_depth at each open ``function``
@@ -318,6 +328,12 @@ def _return_is_inside_function_body(source: str, pos: int) -> bool:
             continue
         if word in ("do", "then", "repeat"):
             block_depth += 1
+            i = tok.end()
+            continue
+        if word == "elseif":
+            # Cancels its own upcoming ``then`` increment (net 0 for the if/elseif
+            # chain). NEVER closes a ``function`` body, so leave ``fn_depth`` alone.
+            block_depth -= 1
             i = tok.end()
             continue
         if word in ("end", "until"):

@@ -476,6 +476,96 @@ def test_h1_no_module_return_abstains() -> None:
     assert "_resolveWeaponSlot" not in s.luau_source
 
 
+# A Player whose method bodies contain ``if/elseif/elseif/end`` chains BEFORE the
+# module-trailing ``return Player`` — the REAL transpiled-controller shape (the
+# corpus Player carries 7 ``elseif`` tokens). An ``if … elseif … then … end`` chain
+# has MULTIPLE ``then`` openers but ONE ``end``.
+_AI_PLAYER_ELSEIF = """\
+function Player:Awake()
+    self.cam = workspace.CurrentCamera
+    self.weaponSlot = self.cam and self.cam:GetChildren()[1]
+end
+
+function Player:Update(dt)
+    if self.state == 1 then
+        self.t = self.t + dt
+    elseif self.state == 2 then
+        self.t = 0
+    elseif self.state == 3 then
+        self.t = self.t - dt
+    else
+        self.t = nil
+    end
+    if dt > 0 then self.alive = true elseif dt < 0 then self.alive = false end
+end
+
+function Player:GetRifle()
+    local rifle = self.host.instantiatePrefab(self.riflePrefab, self.weaponSlot, pivotOf(self.weaponSlot))
+    if self.weaponSlot then rifle:PivotTo(pivotOf(self.weaponSlot)) end
+end
+
+return Player
+"""
+
+
+def test_h1_elseif_chain_before_module_return_still_discharges() -> None:
+    # REGRESSION (round-1 harden regress, both voices): ``_return_is_inside_function_body``
+    # walked block depth without handling ``elseif`` — each ``elseif``'s ``then``
+    # incremented depth with no matching ``end``, leaving any method with an
+    # if/elseif chain artificially "open" forever. A genuine module-trailing
+    # ``return Player`` after such a method was then misclassified as function-local
+    # and SKIPPED -> resolver never injected -> present=False on essentially every
+    # realistic transpiled controller. RED against the pre-fix (elseif-drift) code.
+    s = _Script(_AI_PLAYER_ELSEIF)
+    n = lower_rifle_rig_retarget([s], _rig_map())
+    assert n == 1
+    out = s.luau_source
+    # The resolver IS injected, BEFORE the module return.
+    assert out.count("function Player:_resolveWeaponSlot()") == 1
+    assert out.index("function Player:_resolveWeaponSlot()") < out.rindex("return Player")
+    assert out.rstrip().endswith("return Player")
+    # Consumer reads in GetRifle are rerouted; no bare read survives.
+    assert out.count("self:_resolveWeaponSlot()") == 4
+    assert "pivotOf(self.weaponSlot)" not in out
+    # Discharge re-derived from the final source -> present=True.
+    assert s.rig_binding == {
+        "field": "weaponSlot", "child": "WeaponSlot", "present": True,
+        "cam_receiver": "cam", "cam_ordinal": 0,
+    }
+
+
+def test_h1_elseif_module_return_span_is_module_scope() -> None:
+    # Focused unit test of the block-depth walk over elseif-bearing input: the
+    # module-trailing ``return Player`` after a method with an if/elseif/else chain
+    # is at MODULE scope (not function-local), while a return INSIDE such a method
+    # body is function-local. RED against the elseif-drift bug (which reported the
+    # module return as function-local -> _last_module_return_span returned None).
+    from converter.rifle_rig_retarget_lowering import (
+        _last_module_return_span,
+        _return_is_inside_function_body,
+    )
+    module_pos = _AI_PLAYER_ELSEIF.rindex("return Player")
+    assert _return_is_inside_function_body(_AI_PLAYER_ELSEIF, module_pos) is False
+    span = _last_module_return_span(_AI_PLAYER_ELSEIF, "Player")
+    assert span is not None
+    assert span[0] == module_pos
+    # A return INSIDE a method body after an elseif chain stays function-local.
+    method_local = (
+        "function Player.new()\n"
+        "    if a then x()\n"
+        "    elseif b then y()\n"
+        "    elseif c then z()\n"
+        "    end\n"
+        "    return Player\n"
+        "end\n"
+        "return Player\n"
+    )
+    inner_pos = method_local.index("return Player\nend")
+    assert _return_is_inside_function_body(method_local, inner_pos) is True
+    chosen = _last_module_return_span(method_local, "Player")
+    assert chosen is not None and chosen[0] > inner_pos
+
+
 def test_h3_neutralize_skips_on_ambiguity_two_same_field_writes() -> None:
     # D-P1-PATHA.tier2 SKIP-ON-AMBIGUITY: with MORE THAN ONE ``self.weaponSlot = ...``
     # write the "init" write cannot be UNIQUELY identified, so the Tier-2 neutralize
