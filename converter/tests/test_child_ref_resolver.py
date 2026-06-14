@@ -995,3 +995,84 @@ def test_verbatim_string_getchild_not_counted(tmp_path: Path) -> None:
         guid_index=_guid_index(cs),
     )
     assert str(cs.resolve()) not in m
+
+
+# ===========================================================================
+# Comment-trivia robustness of the C# admission/dominance guards (codex HARDEN
+# BLOCKING): the round-5 ``_skip_ws_and_comments_back`` discipline applied to the
+# seed-LHS guard must also cover ``_seed_dominates_use`` (a comment between a
+# braceless conditional header and its body was FALSE-ADMITTING the conditional
+# seed as dominating) and ``_canonical_receiver``'s exact-seed match (a comment in
+# the seed RHS was FALSE-REJECTING a legit camera seed -> a dropped rig fact).
+# ===========================================================================
+
+from converter.child_ref_resolver import (  # noqa: E402
+    _canonical_receiver,
+    _seed_dominates_use,
+)
+
+
+def test_dominates_braceless_conditional_with_block_comment_not_admitted() -> None:
+    # A comment between ``if (c)`` and the braceless seed must NOT defeat the
+    # conditional detection (pre-fix: lands ``prev`` on the comment delimiter ->
+    # falls through -> returns True -> false-admits the conditional seed).
+    src = "if (c) /*note*/ cam = X;\n weaponSlot = cam.GetChild(0);"
+    assert _seed_dominates_use(
+        src, src.index("cam = X"), src.index("weaponSlot")
+    ) is False
+
+
+def test_dominates_braceless_conditional_with_line_comment_not_admitted() -> None:
+    src = "if (c) // note\n cam = X;\n weaponSlot = cam.GetChild(0);"
+    assert _seed_dominates_use(
+        src, src.index("cam = X"), src.index("weaponSlot")
+    ) is False
+
+
+def test_dominates_comment_between_keyword_and_paren_not_admitted() -> None:
+    # ``if /*x*/ (c) seed`` — the comment is between the keyword and its ``(``; the
+    # governor-keyword read must still recover ``if``.
+    src = "if /*x*/ (c) cam = X;\n weaponSlot = cam.GetChild(0);"
+    assert _seed_dominates_use(
+        src, src.index("cam = X"), src.index("weaponSlot")
+    ) is False
+
+
+def test_dominates_legit_comment_before_straightline_seed_still_dominates() -> None:
+    # A comment before a STRAIGHT-LINE (non-conditional) seed must NOT be mistaken
+    # for a governor -> the seed still dominates.
+    src = "/*setup*/ cam = X;\n weaponSlot = cam.GetChild(0);"
+    assert _seed_dominates_use(
+        src, src.index("cam = X"), src.index("weaponSlot")
+    ) is True
+
+
+def test_canonical_receiver_comment_split_seed_still_admits() -> None:
+    # ``cam = /*c*/ Camera.main.transform`` — a comment between ``=`` and the literal
+    # must NOT false-REJECT the legit camera seed (pre-fix: ``\s*`` did not span the
+    # comment -> None -> the rig fact was silently dropped).
+    src = "cam = /*c*/ Camera.main.transform;\n w = cam.GetChild(0);"
+    assert _canonical_receiver(src, "cam", src.index("GetChild")) == (
+        "Camera.main.transform"
+    )
+
+
+def test_canonical_receiver_line_comment_split_seed_still_admits() -> None:
+    src = "cam = // x\n Camera.main.transform;\n w = cam.GetChild(0);"
+    assert _canonical_receiver(src, "cam", src.index("GetChild")) == (
+        "Camera.main.transform"
+    )
+
+
+def test_canonical_receiver_foreign_seed_with_trailing_comment_still_none() -> None:
+    # A foreign RHS plus a trailing comment that mentions the literal must NOT
+    # false-ADMIT (the comment is not code).
+    src = "cam = enemy.transform; // Camera.main.transform\n w = cam.GetChild(0);"
+    assert _canonical_receiver(src, "cam", src.index("GetChild")) is None
+
+
+def test_canonical_receiver_longer_chain_with_comment_still_none() -> None:
+    # ``Camera.main.transform /*c*/ .parent`` is a LONGER chain (trivia-aware tail
+    # check) -> NOT the exact one-hop seed.
+    src = "cam = Camera.main.transform /*c*/ .parent;\n w = cam.GetChild(0);"
+    assert _canonical_receiver(src, "cam", src.index("GetChild")) is None

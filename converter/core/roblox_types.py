@@ -150,6 +150,19 @@ class RbxScript:
     # surviving positional ordinal is a regression (fail-closed); an unresolved
     # script abstains (coverage gap).
     child_ref_resolution: dict[str, int] | None = None
+    # Per-script rig-retarget binding carrier (mirrors child_ref_resolution): a
+    # JSON-native dict ``{"field": str, "child": str, "present": bool,
+    # "cam_receiver": str, "cam_ordinal": int}`` that
+    # survives ``json.dumps`` in the corpus regen, rehydrates as a plain dict via
+    # ``RbxScript(**s)`` in the corpus replay, and is stamped identically live.
+    # ``None`` for non-transpiled scripts, pre-field fixtures, and scripts with no
+    # rig fact. The contract verifier's binding-present fail-closed check reads it
+    # via ``.get(...)`` with an absent->abstain guard, then INDEPENDENTLY scans the
+    # source (anchored on ``field``/``child``) to confirm discharge — ``present``
+    # is a cross-check, not the gate. ``cam_receiver``/``cam_ordinal`` (REDESIGN r3)
+    # are deterministic resolver-fact projections that anchor check D's dead-write
+    # exemption (slice 1.2); they are stamped regardless of discharge.
+    rig_binding: dict[str, object] | None = None
 
 
 @dataclass

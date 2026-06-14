@@ -73,6 +73,15 @@ _FIELDS = (
     # The child-ref resolution tally the check-D backstop reads. Without it the
     # field is never copied into fixture.json and check D goes DEAD on the corpus.
     "child_ref_resolution",
+    # The rig-retarget binding carrier the binding-present fail-closed check reads.
+    # The captured dict carries ALL FIVE keys verbatim ({field, child, present,
+    # cam_receiver, cam_ordinal}); cam_receiver/cam_ordinal are check D's dead-write
+    # exemption anchor. Without "rig_binding" in _FIELDS the carrier is never copied
+    # into fixture.json and rig_binding_present goes DEAD on the corpus (abstains
+    # green-for-the-wrong-reason instead of asserting the discharged Player binding).
+    # The fixture assertion in test_contract_corpus.py confirms both keys land on the
+    # committed Player carrier.
+    "rig_binding",
 )
 
 _FIXTURE_ROOT = _REPO / "tests" / "fixtures" / "contract_corpus"
@@ -91,8 +100,14 @@ def _capture(project: str, project_path: Path, networking: str) -> dict[str, obj
 
     def _wrap(self: Pipeline, scene_runtime: dict[str, object]) -> None:  # type: ignore[no-untyped-def]
         captured["topology"] = scene_runtime.get("topology", {})
+        # Omit a field when its captured value is None so an optional fact
+        # (child_ref_resolution, rig_binding) is ABSENT on the scripts that lack
+        # it — never serialized as a null spray. The verifier treats absent and
+        # null identically (both -> abstain), so this is a pure-serialization
+        # consistency choice that keeps the committed diff scoped to the scripts
+        # that actually carry the fact.
         captured["scripts"] = [
-            {f: getattr(s, f) for f in _FIELDS}
+            {f: v for f in _FIELDS if (v := getattr(s, f)) is not None}
             for s in (self.state.rbx_place.scripts or [])
         ]
         raise _CaptureDone

@@ -54,6 +54,37 @@ class ChildRefFact:
     child_name: str  # resolved authored child name (resolved-node.children[n].name)
 
 
+@dataclass(frozen=True)
+class RigRootedRetargetFact:
+    """One Camera.main-rooted child-ref RETARGET obligation, consumed POST-transpile.
+
+    Distinct from ChildRefFact (host-rooted, receiver-PRESERVING, pre-AI): this
+    fact's receiver (Camera.main.transform) points at the LIVE camera, but the
+    resolved child lives under the converted _MainCameraRig Model at runtime, so
+    the receiver is DISCARDED and the binding is retargeted to the rig. Consumed
+    by the post-transpile rifle_rig_retarget_lowering, NOT by prerewrite_child_index.
+
+    ``cam_receiver`` carries the EXACT camera receiver expression text the
+    admission resolved (the C# group-2 receiver of ``<field> = <camrecv>.GetChild(n)``,
+    e.g. ``cam`` for a seeded symbol or ``Camera.main.transform`` for the direct
+    form). Path A re-anchor: this is now an OPTIONAL Tier-2 refinement — the lowering
+    uses it ONLY to opportunistically pick the camera-child init-write to clean
+    (best-effort hygiene); it is NEVER required for the read-reroute discharge. Its
+    absence (the AI collapsed the RHS) is a SKIP, not a failure. Defaults to "".
+
+    REDESIGN r3 RE-PROMOTION: ``cam_receiver`` AND the new ``ordinal`` (the n in the
+    credited ``GetChild(n)``) are PROMOTED to LOAD-BEARING as the deterministic
+    upstream anchor for check D's dead-write exemption (stamped into the carrier as
+    ``cam_receiver``/``cam_ordinal`` — slice 1.2 consumes them). They remain NOT a
+    discharge condition. ``ordinal`` is in hand at every construction site
+    (``int(m.group(...))``); for an admitted fact ``cam_receiver`` is NEVER "".
+    """
+    field_name: str  # the assignment LHS field ("weaponSlot"), from `<field> = cam.GetChild(n)`
+    child_name: str  # resolved authored child name under the MainCamera node ("WeaponSlot"), E1-E3 guarded
+    cam_receiver: str = ""  # the C# group-2 camera receiver text (the lowering's RECEIVER ANCHOR)
+    ordinal: int = 0  # REDESIGN r3: the n in the credited GetChild(n); -> carrier cam_ordinal
+
+
 # Per-script resolution outcome, keyed on the canonical .cs path key. Carries
 # the resolved facts (what the pre-rewrite rewrites) AND the per-script
 # resolved/total tally (what the backstop asserts against). A script with >= 1
@@ -62,7 +93,8 @@ class ChildRefFact:
 class ChildRefScript:
     facts: tuple[ChildRefFact, ...]  # one per RESOLVED site (rewrite targets)
     getchild_total: int  # all GetChild SITES seen in this script
-    resolved_total: int  # len(facts) == sites that produced a fact
+    resolved_total: int  # len(facts) + len(rig_facts) == sites that produced a fact
+    rig_facts: tuple[RigRootedRetargetFact, ...] = ()  # Camera.main-rooted retarget facts
 
 
 ChildRefMap = dict[str, ChildRefScript]  # {canonical_cs_path_str: ChildRefScript}
@@ -94,6 +126,24 @@ _CS_GETCHILD_GETTER_BLOCK_RE = re.compile(  # Transform x { get { return recv.Ge
 _CS_GETCHILD_GETTER_EXPR_RE = re.compile(  # Transform x => recv.GetChild(0);
     r"\bTransform\s+([A-Za-z_]\w*)\s*=>\s*"
     + _CS_RECV + r"\.GetChild\(\s*(\d+)\s*\)"
+)
+
+# Camera.main-rooted RETARGET assignment matcher (the rig path). Binds the WRITE
+# ``<field> = <camrecv>.GetChild(n)`` where ``<camrecv>`` chains to
+# ``Camera.main.transform``:
+#   group 1 = assignment LHS field (the bare ``<field>``; an optional ``this.``
+#             qualifier is consumed but NOT captured; a foreign member-access LHS
+#             like ``x.weaponSlot`` is rejected — see _resolve_rig_facts).
+#   group 2 = the receiver expression text (resolved to a canonical chain).
+#   group 3 = the ordinal n.
+# The LHS allows ONLY a bare field or a ``this.``-qualified field; a dotted
+# member-access LHS (``x.weaponSlot``) is excluded by requiring the char before
+# the field (after the optional ``this.``) to not be a foreign ``.`` qualifier —
+# enforced structurally in _resolve_rig_facts (the regex captures the tail field,
+# the resolver checks the head).
+_CS_CAM_GETCHILD_RE = re.compile(
+    r"([A-Za-z_][\w.]*)\s*=\s*"
+    r"([A-Za-z_][\w.]*)\.GetChild\(\s*(\d+)\s*\)"
 )
 
 
@@ -487,7 +537,474 @@ def _canon_key(path: Path) -> str:
         return str(path)
 
 
-def _resolve_script(source: str, host_node: HostNode) -> ChildRefScript | None:
+_CAMERA_MAIN_TRANSFORM = "Camera.main.transform"
+
+# C# control-flow keywords that, when they directly govern a braceless single
+# statement, make that statement CONDITIONAL (it does not unconditionally execute
+# on the straight-line path). A seed governed by one of these does NOT dominate a
+# later use outside its branch.
+_CS_CONDITIONAL_KEYWORDS: frozenset[str] = frozenset(
+    {"if", "else", "while", "for", "foreach", "case", "do"}
+)
+
+
+def _seed_dominates_use(source: str, seed_start: int, use_pos: int) -> bool:
+    """True iff the seed assignment starting at ``seed_start`` dominates the
+    GetChild use at ``use_pos`` on the STRAIGHT-LINE path — i.e. the seed is in the
+    same block or an unconditional enclosing scope, NOT buried in a
+    conditional/dead branch that closes before the use (codex round-3 BLOCKING).
+
+    Conservative — ABSTAINS (returns False) whenever it cannot cheaply prove
+    dominance, so a false-admitted fact is impossible (a missed fact is safe):
+      (1) BRACE SCOPE: scanning code positions from ``seed_start`` to ``use_pos``,
+          the running ``{``/``}`` depth (relative to the seed) must never go
+          NEGATIVE — a ``}`` that closes a block open at the seed means the seed's
+          block ended before the use (``if (c) { cam = ...; } use``;
+          ``{ cam = ...; } use``).
+      (2) BRACELESS GOVERNOR: the seed statement must not be the single braceless
+          body of a control-flow keyword (``if (c) cam = ...; use``) — detected by
+          looking at the token immediately preceding the seed's statement (after
+          the governing ``)`` of an ``if``/``while``/``for`` header, or a bare
+          ``else``/``do``)."""
+    # (1) brace-depth scope check.
+    depth = 0
+    i = seed_start
+    while i < use_pos:
+        if not _cs_pos_is_code(source, i):
+            i += 1
+            continue
+        ch = source[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth < 0:
+                return False  # the seed's enclosing block closed before the use
+        i += 1
+    # (2) braceless single-statement governor check: walk back over whitespace AND
+    # C# comments from the seed to the preceding statement boundary. If the seed
+    # statement is directly governed by a braceless conditional, it does not
+    # dominate.
+    #
+    # TRIVIA-ROBUST (codex harden BLOCKING): the back-walk MUST skip ``//``/``/* */``
+    # comments, not just whitespace. A comment between the governing header and the
+    # seed (``if (c) /*x*/ cam = ...`` / ``if (c) // n\n cam = ...``) otherwise lands
+    # ``prev`` on the comment delimiter, defeating the conditional detection and
+    # FALSE-ADMITTING a conditional seed as dominating.
+    k0 = _skip_ws_and_comments_back(source, seed_start)
+    if k0 <= 0:
+        return True  # start of file -> top-level straight-line
+    prev = source[k0 - 1]
+    if prev in ";{}":
+        return True  # a clear statement/block boundary -> straight-line in scope
+    if prev == ")":
+        # The seed follows a ``)`` — it may be the braceless body of an
+        # ``if (...)``/``while (...)``/``for (...)`` header. Find the matching
+        # ``(`` and inspect the keyword before it (trivia-aware).
+        bdepth = 0
+        k = k0 - 1
+        while k >= 0:
+            if _cs_pos_is_code(source, k):
+                c = source[k]
+                if c == ")":
+                    bdepth += 1
+                elif c == "(":
+                    bdepth -= 1
+                    if bdepth == 0:
+                        break
+            k -= 1
+        if k < 0:
+            return False  # unbalanced -> cannot prove -> abstain
+        if _preceding_governor_keyword(source, k) in _CS_CONDITIONAL_KEYWORDS:
+            return False  # braceless conditional body -> not dominating
+        return True
+    if prev.isalpha() or prev == "_":
+        # The seed follows a bare keyword (``else cam = ...;`` / ``do cam = ...``).
+        if _preceding_governor_keyword(source, k0) in _CS_CONDITIONAL_KEYWORDS:
+            return False
+        return True
+    return True
+
+
+def _preceding_governor_keyword(source: str, pos: int) -> str | None:
+    """The C# identifier/keyword token whose LAST char ends just before ``pos``
+    (skipping intervening whitespace + ``//``/``/* */`` comments). Used to read the
+    control-flow keyword that governs a braceless body — trivia between the keyword
+    and its ``(`` / body (``if /*x*/ (c) ...``) must not hide it. None if no
+    identifier token precedes ``pos``."""
+    k = _skip_ws_and_comments_back(source, pos)
+    end = k
+    while k >= 1 and (source[k - 1].isalnum() or source[k - 1] == "_"):
+        k -= 1
+    token = source[k:end]
+    return token or None
+
+
+def _owning_node_collection(
+    host_node: HostNode,
+    parsed_scenes: list[ParsedScene] | None,
+    prefab_library: PrefabLibrary | None,
+) -> list[HostNode] | None:
+    """The full node list of the scene OR prefab template the ``host_node`` lives
+    in (matched by object identity). None if the host cannot be located in any
+    parsed collection (the caller then abstains — it cannot scope uniqueness)."""
+    for scene in parsed_scenes or ():
+        if scene is None:
+            continue
+        nodes = list(getattr(scene, "all_nodes", {}).values())
+        if any(node is host_node for node in nodes):
+            return nodes
+    if prefab_library is not None:
+        for template in getattr(prefab_library, "prefabs", []) or ():
+            nodes_p: list[PrefabNode] = []
+            _walk_prefab(getattr(template, "root", None), nodes_p)
+            if any(node is host_node for node in nodes_p):
+                return list(nodes_p)
+    return None
+
+
+def _main_camera_node(
+    host_node: HostNode,
+    parsed_scenes: list[ParsedScene] | None,
+    prefab_library: PrefabLibrary | None,
+) -> HostNode | None:
+    """The UNIQUE parsed node tagged ``MainCamera`` in the SCENE/PREFAB the host
+    lives in (scoped by ``host_node``'s owning collection — codex MAJOR). Returns
+    None if absent or non-unique (>1) WITHIN that scope — abstain
+    (E-no-tag / E-non-unique).
+
+    Filters on ``tag == "MainCamera"`` — the same upstream signal
+    ``scene_converter`` uses to stamp ``_MainCameraRig`` (mode-independent). The
+    uniqueness check is SCOPED to the host's owning scene/prefab, so an unrelated
+    MainCamera-tagged node in a DIFFERENT scene/prefab no longer suppresses the
+    fact (silent drop). If the host cannot be located in any parsed collection,
+    abstain (no scope to assert uniqueness within)."""
+    collection = _owning_node_collection(host_node, parsed_scenes, prefab_library)
+    if collection is None:
+        return None  # host not locatable -> cannot scope uniqueness -> abstain
+    found = [n for n in collection if getattr(n, "tag", "") == "MainCamera"]
+    if len(found) != 1:
+        return None  # zero -> E-no-tag; >1 -> E-non-unique; both abstain
+    return found[0]
+
+
+_THIS_TOKEN_RE = re.compile(r"this\Z")
+
+
+def _seed_lhs_is_bare_or_this(source: str, sym_start: int) -> bool:
+    """True iff the symbol matched at ``sym_start`` is the LHS of a BARE write
+    (``cam = ...``) or a ``this.``-qualified write (``this.cam = ...``), and NOT a
+    FOREIGN member access (``other.cam = ...`` / ``a.b.cam = ...``).
+
+    Mirrors the ``_lhs_is_bare_field`` "bare or ``this.`` only" discipline applied
+    to the GetChild LHS (round-1 BLOCKING #1): a seed assignment to a member field
+    of a foreign object is NOT a binding of the bare symbol used at the GetChild, so
+    it must not be admitted as a camera seed.
+
+    TRIVIA-ROBUST (phase-integration FINDING 1, UNSAFE direction): the "preceded by
+    ``.``" member-access check skips ALL C# trivia — spaces, tabs, NEWLINES, and
+    ``//``/``/* */`` comments — between the symbol and the preceding token, via
+    ``_skip_ws_and_comments_back``. Without it a foreign member-LHS seed split by a
+    comment or newline (``other.\ncam = ...`` / ``other./*c*/cam = ...``) false-admits
+    a non-camera binding as a camera seed (a bogus fact the verifier does NOT catch —
+    it ships a wrong retarget). Legit ``cam =`` / ``this.cam =`` / ``this . cam =`` /
+    ``this./*c*/cam =`` still ADMIT."""
+    # The nearest preceding CODE char before the symbol, skipping ALL trivia
+    # (whitespace incl. newlines + ``//``/``/* */`` comments). A member access
+    # ``obj./*c*/cam`` / ``obj.\ncam`` keeps the ``.`` as that preceding code token.
+    k = _skip_ws_and_comments_back(source, sym_start)
+    if k <= 0 or source[k - 1] != ".":
+        return True  # no leading ``.`` -> bare symbol write
+    # A dotted LHS: admit ONLY ``this.<sym>``. Walk back over the ``.`` (and any
+    # trivia before it) to the preceding identifier and require it EXACTLY ``this``.
+    k = _skip_ws_and_comments_back(source, k - 1)  # past the ``.`` to its code char
+    ident_end = k
+    while k >= 1 and (source[k - 1].isalnum() or source[k - 1] == "_"):
+        k -= 1
+    qualifier = source[k:ident_end]
+    if _THIS_TOKEN_RE.match(qualifier) is None:
+        return False  # ``other.cam`` / ``a.b.cam`` -> foreign member access
+    # ``this`` itself must not be a member tail (``foo.this.cam`` -> foreign): skip
+    # trivia before ``this`` and reject if a ``.`` precedes it.
+    p = _skip_ws_and_comments_back(source, k)
+    if p > 0 and source[p - 1] == ".":
+        return False
+    return True
+
+
+def _canonical_receiver(source: str, recv: str, use_pos: int) -> str | None:
+    """Resolve the receiver-expression text ``recv`` (group 2 of
+    ``_CS_CAM_GETCHILD_RE``) to its canonical receiver chain for the rig path,
+    AS SEEN AT the GetChild use site ``use_pos``.
+
+    Returns the literal ``Camera.main.transform`` iff ``recv`` roots there —
+    either:
+      - the DIRECT form: ``recv`` is EXACTLY ``Camera.main.transform`` (so
+        ``weaponSlot = Camera.main.transform.GetChild(0)`` is admitted even with
+        no cam-symbol seed), OR
+      - a per-script SYMBOL whose NEAREST PRECEDING binding before ``use_pos`` is
+        EXACTLY ``<sym> = Camera.main.transform`` (one hop, anchored to the use
+        site by scope/order — NOT any file-wide occurrence).
+    Returns None for any foreign chain (``enemy.cam``, ``other.cam.transform``, a
+    bare symbol with no such seed). EXACT match, NOT ``endswith``/substring.
+
+    Anchored to ``use_pos`` (codex BLOCKING): a later/unrelated
+    ``cam = Camera.main.transform`` after the GetChild does NOT admit when the
+    binding live AT the GetChild is foreign (``cam = enemy.transform``). The seed
+    is the LAST ``<sym> = <rhs>`` strictly before ``use_pos``; it admits iff that
+    nearest preceding binding is exactly ``Camera.main.transform``."""
+    if recv == _CAMERA_MAIN_TRANSFORM:
+        return _CAMERA_MAIN_TRANSFORM
+    # ``recv`` must be a bare symbol (no dot) to be seed-resolvable; a dotted
+    # foreign chain (``enemy.cam``) is rejected outright.
+    if "." in recv:
+        return None
+    # Find the NEAREST PRECEDING binding of ``recv`` before the use site — any
+    # ``<recv> = <rhs>`` (not ``==``) at a code position with start < use_pos.
+    # Whichever is last wins (it is the binding live at the GetChild line).
+    #
+    # SEED-LHS DISCIPLINE (round-1 BLOCKING #1 — mirror ``_lhs_is_bare_field``):
+    # the binding's LHS symbol must be a BARE symbol or a ``this.<recv>`` write —
+    # NOT a FOREIGN member access ``<other>.<recv>``. The ``\b`` after the ``.`` of
+    # ``other.cam`` lets ``any_assign_re`` (``\bcam\s*=``) match the ``cam`` token
+    # INSIDE ``other.cam``, so without this guard ``other.cam = Camera.main.transform``
+    # is mis-read as a bare-``cam`` seed and false-admits a foreign field as the
+    # camera receiver. A binding of a DIFFERENT lvalue (``other.cam``) is NOT a
+    # binding of the bare ``cam`` symbol used at the GetChild — skip it.
+    any_assign_re = re.compile(r"\b" + re.escape(recv) + r"\s*=(?!=)")
+    nearest_start = -1
+    for m in any_assign_re.finditer(source):
+        if m.start() >= use_pos:
+            break  # past the use site -> later bindings cannot be live here
+        if not _cs_pos_is_code(source, m.start()):
+            continue
+        if not _seed_lhs_is_bare_or_this(source, m.start()):
+            continue  # foreign member-access LHS (``other.cam =``) -> not this symbol
+        nearest_start = m.start()
+    if nearest_start == -1:
+        return None  # no binding before the use site -> not seed-resolvable
+    # Is that nearest preceding binding EXACTLY ``<recv> = Camera.main.transform``?
+    # TRIVIA-ROBUST (codex harden — mirror the LHS round-5 discipline): the seed's
+    # ``<recv>``, ``=``, and the ``Camera.main.transform`` literal may be separated by
+    # ``//``/``/* */`` comments (``cam = /*c*/ Camera.main.transform``); skip trivia
+    # forward between tokens so a comment-split LEGIT seed is not false-REJECTED (a
+    # dropped rig fact -> the rifle silently fails to retarget). A non-camera RHS
+    # still returns None.
+    end = _match_exact_cam_seed_rhs(source, nearest_start, recv, use_pos)
+    if end is None:
+        return None  # the live binding is something else (e.g. enemy.transform)
+    # The RHS must be EXACTLY Camera.main.transform (not a longer chain like
+    # Camera.main.transform.parent). ``_match_exact_cam_seed_rhs`` already requires a
+    # word boundary after the literal; reject a trailing ``.`` member (trivia-aware).
+    tail = _skip_ws_and_comments_fwd(source, end)
+    if tail < len(source) and source[tail] == ".":
+        return None  # longer chain -> not the exact one-hop seed
+    # SCOPE-AWARE (codex round-3 BLOCKING): order-nearest is not enough — the seed
+    # must DOMINATE the use site on the straight-line path. A seed buried in a
+    # dead/conditional block (``if (false) { cam = Camera.main.transform; }``) does
+    # NOT dominate ``weaponSlot = cam.GetChild(0)`` below it; abstain rather than
+    # admit a fact whose real receiver isn't Camera.main.
+    if not _seed_dominates_use(source, nearest_start, use_pos):
+        return None
+    return _CAMERA_MAIN_TRANSFORM
+
+
+def _skip_ws_and_comments_back(source: str, pos: int) -> int:
+    """Walk ``pos`` backward over whitespace and C# comments, returning the index
+    just AFTER the nearest preceding CODE char (so ``source[k - 1]`` is that char,
+    or ``k == 0`` at start of file). A comment char is identified authoritatively
+    by ``_cs_pos_is_code`` (a from-start scan that correctly distinguishes a real
+    ``//``/``/* */`` comment from ``//`` text inside a string literal)."""
+    k = pos
+    while k > 0:
+        j = k - 1
+        prev = source[j]
+        if prev in " \t\r\n":
+            k -= 1
+            continue
+        # An INNER comment char is non-code per ``_cs_pos_is_code`` -> skip it.
+        if not _cs_pos_is_code(source, j):
+            k -= 1
+            continue
+        # ``_cs_pos_is_code`` (a from-start scan) classifies the OPENING char of a
+        # ``//``/``/*`` comment as code (it only enters the comment branch when
+        # ``i < pos``), so an opener slips through above. Recognize it explicitly:
+        # a ``/`` that starts a real comment (its inner char is non-code) is the
+        # comment delimiter, not a code token -> keep walking back.
+        if (
+            prev == "/"
+            and j + 1 < len(source)
+            and source[j + 1] in "/*"
+            and not _cs_pos_is_code(source, j + 1)
+        ):
+            k -= 1
+            continue
+        break
+    return k
+
+
+def _skip_ws_and_comments_fwd(source: str, pos: int) -> int:
+    """Walk ``pos`` FORWARD over whitespace and C# ``//``/``/* */`` comments,
+    returning the index of the next CODE char (or ``len(source)`` at end). A comment
+    char is identified authoritatively by ``_cs_pos_is_code`` (a from-start scan that
+    distinguishes a real comment from ``//`` inside a string literal)."""
+    n = len(source)
+    k = pos
+    while k < n:
+        ch = source[k]
+        if ch in " \t\r\n":
+            k += 1
+            continue
+        # A comment OPENER (``//`` / ``/*``) is classified as code by
+        # ``_cs_pos_is_code`` at the opener itself; recognize it by the inner char
+        # being non-code, then skip the whole comment body (non-code positions).
+        if ch == "/" and k + 1 < n and source[k + 1] in "/*" and not _cs_pos_is_code(
+            source, k + 1
+        ):
+            k += 1
+            continue
+        # An inner comment char (already inside a comment) is non-code -> skip.
+        if not _cs_pos_is_code(source, k):
+            k += 1
+            continue
+        break
+    return k
+
+
+def _match_exact_cam_seed_rhs(
+    source: str, nearest_start: int, recv: str, use_pos: int
+) -> int | None:
+    """Match ``<recv>`` [trivia] ``=`` (not ``==``) [trivia]
+    ``Camera.main.transform`` starting at ``nearest_start``, skipping ``//``/``/* */``
+    comments and whitespace between every token. Returns the index just AFTER the
+    literal on a match (so the caller can inspect a trailing ``.`` member), else
+    None. The literal must end on a word boundary (no ``...transformX``)."""
+    n = len(source)
+    # ``<recv>`` token.
+    i = nearest_start
+    if source[i : i + len(recv)] != recv:
+        return None
+    i += len(recv)
+    if i < n and (source[i].isalnum() or source[i] == "_"):
+        return None  # ``recv`` is a prefix of a longer identifier
+    # ``=`` (reject ``==``).
+    i = _skip_ws_and_comments_fwd(source, i)
+    if i >= n or source[i] != "=" or (i + 1 < n and source[i + 1] == "="):
+        return None
+    i += 1
+    # ``Camera.main.transform`` literal.
+    i = _skip_ws_and_comments_fwd(source, i)
+    lit = _CAMERA_MAIN_TRANSFORM
+    if source[i : i + len(lit)] != lit:
+        return None
+    end = i + len(lit)
+    if end < n and (source[end].isalnum() or source[end] == "_"):
+        return None  # ``...transformX`` -> not the exact literal
+    if end > use_pos:
+        return None  # the seed must complete before the use site
+    return end
+
+
+def _lhs_is_bare_field(source: str, field_start: int, full_lhs: str) -> str | None:
+    """Given the matched LHS text ``full_lhs`` (group 1 of _CS_CAM_GETCHILD_RE)
+    starting at ``field_start``, return the bare field name iff the LHS is a bare
+    field WRITE or a ``this.``-qualified field write; else None.
+
+    REJECTED (abstain):
+      - a FOREIGN member-access LHS like ``x.weaponSlot`` (round-1 BLOCKING #2 /
+        edge 11) — a foreign ``.`` qualifier precedes the LHS; and
+      - a TYPED LOCAL DECLARATION like ``Transform weaponSlot = ...`` / ``var x = ...``
+        / a GENERIC ``List<Transform> weaponSlot = ...`` / an ARRAY ``Transform[]
+        weaponSlot = ...`` / a QUALIFIED-GENERIC
+        ``System.Collections.Generic.List<Transform> weaponSlot = ...`` (round-5
+        MAJOR) — a leading type TOKEN precedes the field. A local temp is NOT a rig
+        fact (the field never persists on the instance), so admitting it would flip
+        ``resolved_total`` and create a bogus fail-closed path for valid code.
+
+    A bare field write (``weaponSlot = ...`` / ``this.weaponSlot = ...``) is the
+    ONLY admitted shape. ALLOW-LIST BY TERMINATOR: a bare field write's preceding
+    non-blank char in C# is always a STATEMENT TERMINATOR (``;``/``{``/``}``) or
+    start-of-file; ANY other preceding char means a leading token precedes the field.
+    This is the FAIL-CLOSED choice: it ABSTAINS on every typed-local form — simple
+    (``Transform``), generic (``List<T>``, prev ``>``), array (``T[]``, prev ``]``),
+    qualified (``A.B.T``, prev ``.``), nullable (``Transform?``, prev ``?``), tuple
+    (``(T, int)``, prev ``)``), comment-separated (``T /*c*/``, prev ``/``) — none of
+    which a single-char REJECT-list could enumerate (codex round-5: ``Transform?`` /
+    ``(T,int)`` escaped a reject-list, and ``)``/``:`` are AMBIGUOUS between a tuple
+    type and an ``if (ok) x``). Over-abstaining a rare conditional/labeled camera
+    write (``if (ok) weaponSlot = ...``) is fail-closed-safe; ADMITTING a typed local
+    (a bogus rig fact -> a false fail-close on valid code) is not. The corpus write
+    is a plain statement, so this admits the happy-path and never a typed local."""
+    parts = full_lhs.split(".")
+    if len(parts) == 1:
+        field = parts[0]
+    elif len(parts) == 2 and parts[0] == "this":
+        field = parts[1]
+    else:
+        return None  # x.weaponSlot / a.b.weaponSlot -> foreign member-access LHS
+    # Walk back over whitespace AND C# comments to the preceding code char. A
+    # comment between the prior statement and the field write (a ``// note`` line
+    # or an inline ``foo(); /* note */``) must not be mistaken for a leading token;
+    # otherwise a legitimate comment-preceded bare field write is wrongly rejected.
+    k = _skip_ws_and_comments_back(source, field_start)
+    if k <= 0:
+        return field  # start of file -> bare write
+    if source[k - 1] in ";{}":
+        return field  # statement terminator precedes -> bare field write
+    return None  # any leading token (a type, a control-flow head) -> abstain
+
+
+def _resolve_rig_facts(
+    source: str,
+    host_node: HostNode,
+    parsed_scenes: list[ParsedScene] | None,
+    prefab_library: PrefabLibrary | None,
+) -> list[RigRootedRetargetFact]:
+    """Resolve Camera.main-rooted ``<field> = <camrecv>.GetChild(n)`` RETARGET
+    writes to ``RigRootedRetargetFact(field_name, child_name)``. Each is admitted
+    iff the receiver roots EXACTLY at ``Camera.main.transform`` (host-XOR-rig,
+    exact-match) AND the MainCamera-tagged node is unique AND the n-th child
+    resolves under E1–E3. Pure; code-position-aware."""
+    rig_facts: list[RigRootedRetargetFact] = []
+    main_cam: HostNode | None = None
+    main_cam_looked_up = False
+    for m in _CS_CAM_GETCHILD_RE.finditer(source):
+        if not _cs_pos_is_code(source, m.start()):
+            continue
+        field = _lhs_is_bare_field(source, m.start(1), m.group(1))
+        if field is None:
+            continue  # foreign member-access LHS -> abstain
+        canon = _canonical_receiver(source, m.group(2), m.start())
+        if canon != _CAMERA_MAIN_TRANSFORM:
+            continue  # receiver does not root at Camera.main.transform -> abstain
+        ordinal = int(m.group(3))
+        if not main_cam_looked_up:
+            main_cam = _main_camera_node(host_node, parsed_scenes, prefab_library)
+            main_cam_looked_up = True
+        if main_cam is None:
+            continue  # E-no-tag / E-non-unique -> abstain
+        child = _resolve_child(main_cam, ordinal)
+        if child is None:
+            continue  # E1–E3 -> abstain
+        name = getattr(child, "name", "") or ""
+        rig_facts.append(
+            RigRootedRetargetFact(
+                field_name=field,
+                child_name=name,
+                cam_receiver=m.group(2),
+                ordinal=ordinal,  # REDESIGN r3: credited GetChild(n) -> carrier cam_ordinal
+            )
+        )
+    return rig_facts
+
+
+def _resolve_script(
+    source: str,
+    host_node: HostNode,
+    *,
+    parsed_scenes: list[ParsedScene] | None,
+    prefab_library: PrefabLibrary | None,
+) -> ChildRefScript | None:
     """Resolve one script's GetChild sites against ``host_node``. Returns
     ``None`` when the script has NO GetChild site at all (absent from the map)."""
     gameobject_shadowed = _declares_shadow(source, "gameObject")
@@ -506,8 +1023,10 @@ def _resolve_script(source: str, host_node: HostNode) -> ChildRefScript | None:
         # (``Camera.main.transform.GetChild(0)``, ``foo.transform.GetChild(0)``,
         # or a ``gameObject.transform`` whose ``gameObject`` is shadowed by a
         # local/param) is NOT the script's own host — abstain (counts toward
-        # getchild_total, produces no fact) so the backstop treats it as a
-        # coverage gap.
+        # getchild_total, produces no host-rooted fact). At exactly this abstain
+        # point the rig path (below) admits the Camera.main -> MainCamera-tag
+        # retarget, so a Camera.main site that drops here as a host fact is
+        # re-captured as a rig fact (no double-count — edge 9/10).
         if _receiver_is_member_access(
             source, m.start(1), gameobject_shadowed=gameobject_shadowed
         ):
@@ -528,12 +1047,17 @@ def _resolve_script(source: str, host_node: HostNode) -> ChildRefScript | None:
             )
         )
 
+    rig_facts = _resolve_rig_facts(
+        source, host_node, parsed_scenes, prefab_library
+    )
+
     if getchild_total == 0:
         return None
     return ChildRefScript(
         facts=tuple(facts),
         getchild_total=getchild_total,
-        resolved_total=len(facts),
+        resolved_total=len(facts) + len(rig_facts),
+        rig_facts=tuple(rig_facts),
     )
 
 
@@ -569,7 +1093,11 @@ def build_child_ref_map(
             source = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        entry = _resolve_script(source, hosts[0])
+        entry = _resolve_script(
+            source, hosts[0],
+            parsed_scenes=parsed_scenes,
+            prefab_library=prefab_library,
+        )
         if entry is not None:
             result[key] = entry
     return result

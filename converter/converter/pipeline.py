@@ -2901,6 +2901,9 @@ return table.concat(allData, "\\n")'''
                     # Generic-mode child-ref resolution tally (or None) for the
                     # contract verifier's child-ordinal backstop.
                     child_ref_resolution=ts.child_ref_resolution,
+                    # Generic-mode rig-retarget binding carrier (or None) for the
+                    # contract verifier's binding-present fail-closed check.
+                    rig_binding=ts.rig_binding,
                 ))
 
         # Write animation scripts to output directory AND add to RbxPlace.
@@ -4405,6 +4408,7 @@ script.Disabled = true
 
         plan_lookup = self._load_storage_plan_for_rehydration()
         child_ref_lookup = self._load_child_ref_resolution_for_rehydration()
+        rig_binding_lookup = self._load_rig_binding_for_rehydration()
         luau_files = sorted(scripts_dir.rglob("*.luau"))
         from_plan = 0
         rehydrated = 0
@@ -4464,6 +4468,13 @@ script.Disabled = true
             crr = child_ref_lookup.get(name)
             if crr is not None:
                 script.child_ref_resolution = crr
+            # Restore the rig-retarget binding carrier so the binding-present
+            # fail-closed check has the IR anchor + discharge stamp on a
+            # preserve/resume assemble (else it would abstain on every rehydrated
+            # script). The check still INDEPENDENTLY scans ``source``.
+            rb = rig_binding_lookup.get(name)
+            if rb is not None:
+                script.rig_binding = rb
             self.state.rbx_place.scripts.append(script)
             rehydrated += 1
 
@@ -4572,6 +4583,66 @@ script.Disabled = true
                 out[name] = {"getchild_total": gt, "resolved_total": rt}
         return out
 
+    def _load_rig_binding_for_rehydration(
+        self,
+    ) -> dict[str, dict[str, object]]:
+        """Load the persisted per-script rig-retarget binding carrier from
+        ``conversion_plan.json`` into
+        ``name -> {field, child, present, cam_receiver, cam_ordinal}``.
+
+        Mirrors the ``child_ref_resolution`` rehydration. Returns ``{}`` on a
+        missing/malformed plan or a plan that pre-dates the field; a malformed row
+        is dropped (absent -> ``None`` -> the binding-present check abstains, the
+        same safe pre-field default). Validates ALL FIVE keys (str field/child, bool
+        present, str cam_receiver, int cam_ordinal) — a row missing/malformed on ANY
+        of the five is DROPPED to ``None`` (NEVER rehydrate a partial carrier that
+        would exempt blind in check D). The optional ``multi_fact`` flag, when
+        present, is preserved."""
+        plan_path = self.output_dir / "conversion_plan.json"
+        if not plan_path.exists():
+            return {}
+        import json as _json
+        try:
+            raw = _json.loads(plan_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            log.debug("[rehydrate] conversion_plan.json unreadable: %s", exc)
+            return {}
+        block = raw.get("rig_binding")
+        if not isinstance(block, dict):
+            return {}
+        out: dict[str, dict[str, object]] = {}
+        for name, rb in block.items():
+            if not isinstance(name, str) or not isinstance(rb, dict):
+                continue
+            field = rb.get("field")
+            child = rb.get("child")
+            present = rb.get("present")
+            cam_receiver = rb.get("cam_receiver")
+            cam_ordinal = rb.get("cam_ordinal")
+            # REDESIGN r3: ALL FIVE keys must be well-formed or the whole row is
+            # dropped (-> None -> abstain). A partial carrier would let check D's
+            # exemption anchor on a missing receiver/ordinal and exempt blind.
+            # ``bool`` is a subclass of ``int`` in Python, so reject a bool
+            # masquerading as cam_ordinal.
+            if not (isinstance(field, str) and isinstance(child, str)
+                    and isinstance(present, bool)
+                    and isinstance(cam_receiver, str)
+                    and isinstance(cam_ordinal, int)
+                    and not isinstance(cam_ordinal, bool)):
+                continue
+            row: dict[str, object] = {
+                "field": field,
+                "child": child,
+                "present": present,
+                "cam_receiver": cam_receiver,
+                "cam_ordinal": cam_ordinal,
+            }
+            multi_fact = rb.get("multi_fact")
+            if isinstance(multi_fact, bool):
+                row["multi_fact"] = multi_fact
+            out[name] = row
+        return out
+
     def _classify_storage(self) -> None:
         """Phase 4a.5: run the storage classifier on populated scripts.
 
@@ -4655,6 +4726,17 @@ script.Disabled = true
             s.name: s.child_ref_resolution
             for s in self.state.rbx_place.scripts
             if s.child_ref_resolution is not None
+        }
+
+        # Persist each script's rig-retarget binding carrier so a preserve/resume
+        # assemble that rehydrates from disk can restore the binding-present
+        # check's IR anchor + discharge stamp (without it the check would abstain
+        # on that path). Keyed by script name; ``None`` carriers are dropped
+        # (absent == no rig fact).
+        rig_binding: dict[str, dict[str, object]] = {
+            s.name: s.rig_binding
+            for s in self.state.rbx_place.scripts
+            if s.rig_binding is not None
         }
 
         # Animation routing (Phase 4.5): per-clip target + reason.
@@ -4820,6 +4902,7 @@ script.Disabled = true
                 "storage_plan": plan.to_dict(),
                 "script_paths": script_paths,
                 "child_ref_resolution": child_ref_resolution,
+                "rig_binding": rig_binding,
                 "animation_routing": animation_routing,
                 "scene_runtime": scene_runtime,
             }, indent=2),

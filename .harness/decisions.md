@@ -556,3 +556,1322 @@ cam.GetChild(0) → foreign receiver → ABSTAIN.
   (loses backstop on the resolved site, already construction-safe). Corpus doesn't hit it.
 - Slice graph UNCHANGED {FT ∥ T-bullet}→N; FT now also owns core/roblox_types.py (the new field).
   Supersedes the "fail on ANY surviving ordinal" MAJOR above. Classification: User-Challenge.
+
+
+## Run rifle-dropped-ref-20260612T064620 (2026-06-14/15) — Rifle #2-dropped weaponSlot rebind (Path A + r3 receiver-anchored check-D exemption)
+
+## PLAN-stage decisions — #2-dropped (rifle weaponSlot)
+
+- D1 [Taste] — §7.2 rebind rule: a dropped/abstained child-ref gets a deterministic by-name rebind iff its
+  receiver resolves to a UNIQUE parsed node via one upstream signal. Phase-1 covers transform-rooted; this slice
+  adds exactly one rooting source: Camera.main.transform → the unique MainCamera-tagged node. Generic, no hardcoded names.
+- D2 [Taste] — §2 mode: PRE-REWRITE-to-resolved (cam.GetChild(0)→cam.Find("WeaponSlot") via existing
+  prerewrite_child_index) PLUS a FAIL-CLOSED binding-present verifier (check-D sibling; asserts the IR-declared
+  binding's named lookup present in output; promoted via FAIL_CLOSED_CHECKS). Pre-rewrite = durable-by-construction
+  primary; verifier = loud-on-dropped floor.
+- D3 [Mechanical] — admission: ONE signal = MainCamera tag (unique, parse-time, already used at scene_converter
+  _MainCameraRig); ONE retired mechanism = AI's non-deterministic dropped/ordinal handling of the foreign receiver;
+  ONE real check = binding-present verifier. #2-dropped MEETS the umbrella admission criteria, modulo OQ1
+  (inject-vs-verify boundary) and OQ2 (receiver-rooting scope).
+
+---
+
+## PLAN-stage decisions v2 — SUPERSEDES v1 above (re-grounded after dual-voice design review)
+
+Both voices, verified against the real parse + on-`main` corpus fixture + PR#190 code, found the same three
+spine flaws in v1: wrong runtime target (receiver-preserving rewrite → nil); mis-shaped (not dropped) symptom;
+no separate verifier warranted (check D is the floor). v1's D1/D2/D3 are RETIRED; these replace them.
+
+- D1-v2 [Taste] — §7.2 rule = RETARGET (not preserve). A child-ref gets a deterministic rebind iff its receiver
+  resolves to a UNIQUE parsed node via one upstream signal. This slice adds exactly one rooting source:
+  Camera.main.transform → the unique MainCamera-tagged node, AND retargets the receiver — the rewrite REPLACES
+  the whole expression with a `_MainCameraRig`-rooted lookup, because `WeaponSlot` lives under the converted rig
+  Model at runtime, not under `workspace.CurrentCamera` (what the preserved `cam` transpiles to, api_mappings:248).
+  Multi-hop: cam → Camera.main.transform → MainCamera node → child[n] name → rig-rooted runtime lookup. Generic.
+- D2-v2 [Taste] — §2 mode = PRE-REWRITE only, NO verifier. Emit the resolved rig-rooted Luau directly (§2 "emits
+  the resolved Luau directly"), keyed on the deterministic _MainCameraRig/MainCamera-tag fact, not on AI output.
+  v1's binding-present verifier DROPPED: reference facts get no verifier (§4); no binding-IR producer exists
+  (§5.2); a present-named-lookup check = pack-in-disguise. Check D is the PRE-EXISTING regression floor —
+  resolving the fact flips resolved_total 0→1 → budget 0 → any surviving ordinal fails closed, no new check.
+- D3-v2 [Mechanical] — admission, corrected retired mechanism. ONE signal = MainCamera tag (stamps _MainCameraRig,
+  mode-independent). ONE retired mechanism = the legacy fps_rifle_pickup/WeaponMount pack
+  (script_coherence_packs.py:194/290/547) doing _MainCameraRig→FindFirstChild("WeaponSlot"), DISABLED in generic
+  (pipeline.py:2982) — so generic has NO rifle repair today (the real gap). ONE mechanism = the child_ref_resolver
+  RETARGET emit + check D (pre-existing) as floor. #2-mis-shaped (RETARGET variant) MEETS admission.
+
+Investigation result: _MainCameraRig IS present + referenceable in generic mode (stamped scene_converter.py
+2080/5126 on the MainCamera tag, mode-independent; CameraRigFollower injected pipeline.py:3486, mode-independent;
+generic skips only run_packs at 2982). No STOP-worthy gap. OQ1 (retarget code home) + OQ2 (scope) remain open
+close-calls for Gate A.
+
+---
+
+## PLAN-stage decisions v3 — SUPERSEDES v2 above (re-grounded after dual-voice design review round 2)
+
+Both voices verified v2's TARGET solid (_MainCameraRig is a mode-independent attribute; WeaponSlot lands under
+the rig; Camera.main abstains {1,0}; check D is the floor; D3 retired-mechanism = legacy WeaponMount pack). Both
+found the SAME two EMIT flaws. v2's D1/D2 are RETIRED; these replace them. D3 carries forward unchanged.
+
+- D1-v3 [Taste] — §7.2 rule = RETARGET emitted POST-transpile. A child-ref gets a deterministic rebind iff its
+  receiver resolves to a UNIQUE parsed node via one upstream signal. This slice adds one rooting source:
+  Camera.main.transform → the unique MainCamera-tagged node, AND retargets the receiver — but emitted as a
+  POST-transpile lowering, not the v2 pre-rewrite. Multi-hop: cam → Camera.main.transform → MainCamera node →
+  child[n] name (E1–E3) → field name (assignment LHS = weaponSlot) → post-transpile lowering replaces the RHS at
+  that field's assignment with a _MainCameraRig-rooted lookup (WeaponSlot lives under the rig Model at runtime,
+  not under workspace.CurrentCamera, api_mappings:248). Generic, no hardcoded names.
+
+- D2-v3 [Taste] — §2 mode = FACT-KEYED POST-TRANSPILE LOWERING, NO verifier. CORRECTS v2's FIX 1: v2 emitted the
+  rig lookup via prerewrite_child_index, which mutates csharp_source PRE-AI (code_transpiler.py:256) so the AI
+  re-processes the injected Luau → construction-safety defeated. v3 emits in a NEW post-transpile pass
+  (rifle_rig_retarget_lowering) wired into transpile_with_contract alongside lower_camera_facet (:564) /
+  lower_trigger_stay (:599), operating on TranspiledScript.luau_source AFTER transpile_scripts returns — the same
+  site where the retired lower_child_index ran (contract_pipeline.py:579-587) and where the legacy WeaponMount
+  pack proved the lookup (script_coherence_packs.py:547-551). Construction-safe because the AI's RHS is DISCARDED
+  + REPLACED deterministically post-AI (distinct from the turret's PRE-AI receiver-preserving pre-rewrite). The
+  lowering FACT-ANCHORS on the FIELD NAME from the resolver fact (self.weaponSlot = <rhs>), NOT the ordinal
+  output shape (not a pack-in-disguise). CORRECTS v2's FIX 2: the emitted RHS is a RACE-SAFE lazy getter
+  (__index proxy that re-resolves+memoizes on access), NOT a one-shot Awake scan — _MainCameraRig streams in late
+  (CameraRigFollower retries 30×0.1s, autogen.py:539; the pack looked up at equip-time, script_coherence_packs:547),
+  so a one-shot scan leaves self.weaponSlot permanently nil on slow/streaming clients. NO binding-present verifier
+  (reference facts get none, §4; no binding-IR producer, §5.2; present-named-lookup check = pack-in-disguise).
+  Check D is the pre-existing SHAPE regression floor (resolving the fact flips resolved_total 0→1 → budget 0 →
+  any surviving ordinal fails closed); it is a shape floor, not a rig-lookup-correctness witness — correctness
+  rests on the deterministic post-AI emit (which FIX 1 now guarantees).
+
+- D3 [Mechanical] — admission, UNCHANGED from v2. ONE signal = MainCamera tag (stamps _MainCameraRig,
+  mode-independent). ONE retired mechanism = legacy fps_rifle_pickup/WeaponMount pack
+  (script_coherence_packs.py:194/290/547), DISABLED in generic (pipeline.py:2982) — generic has NO rifle repair
+  today (the real gap). ONE mechanism = child_ref_resolver rig-rooted fact + post-transpile retarget lowering +
+  check D (pre-existing) as floor. #2-mis-shaped (RETARGET variant) MEETS admission.
+
+OQ1 (v2 retarget-code-home) is RESOLVED: post-transpile lowering, fact-anchored on the field name. The remaining
+open close-calls for Gate A: OQ1-v3 (emitted lazy shape — __index proxy vs method-getter+consumer-rewrite;
+recommend proxy) and OQ2 (receiver-rooting scope — Camera.main only; recommend defer broader). Both non-blocking.
+
+---
+
+## PLAN-stage decisions v4 — SUPERSEDES v3 above (re-grounded after dual-voice design review round 3)
+
+Both voices verified v3's TARGET + SITE + scope solid across three rounds (_MainCameraRig mode-independent
+attribute; WeaponSlot under the rig; post-transpile lowering site in transpile_with_contract composes with no
+ordering hazard; Camera.main abstains additively; check D is the floor; D3). Both found the SAME two EMIT flaws
+in v3. v3's D1/D2 are RETIRED; these replace them. D3 carries forward unchanged.
+
+- D1-v4 [Taste] — §7.2 rule = RETARGET emitted POST-transpile, binding a REAL Instance. Carries v3's rule (one
+  rooting source Camera.main.transform → MainCamera-tagged node; receiver RETARGET emitted as a post-transpile
+  lowering; multi-hop cam → Camera.main.transform → MainCamera node → child[n] name (E1–E3) → field name (LHS) →
+  post-transpile RHS replace). Refines the emit: the replacement RHS calls an injected REAL-Instance resolver
+  (not a proxy). Generic, no hardcoded names.
+
+- D2-v4 [Taste] — §2 mode = FACT-KEYED POST-TRANSPILE LOWERING, REAL-INSTANCE bounded-retry emit, NO verifier.
+  CORRECTS v3's FIX 1: v3 bound self.weaponSlot to a setmetatable({}, {__index=...}) PROXY TABLE — DROPPED, because
+  weaponSlot flows into rifle.Parent = self.weaponSlot (SetParent, api_mappings.py:54), the host instantiatePrefab
+  nil-guard clone.Parent = parent or workspace (scene_runtime.luau:2025), and weaponSlot:GetPivot(); a table is
+  truthy-not-Instance → .Parent = <table> raises "Instance expected, got table", the nil-guard is defeated, and
+  GetPivot gets the proxy as self. v4 ports the legacy pack's PROVEN real-Instance lookup (local slot = rig and
+  rig:FindFirstChild("WeaponSlot", true), script_coherence_packs.py:551) wrapped in CameraRigFollower's bounded
+  retry (for _ = 1, 30 do task.wait(0.1), autogen.py:539-547) + memoized, emitted as a resolver helper; the field
+  is rebound to self.weaponSlot = _resolveWeaponSlot() (a real Instance or nil — both valid for .Parent / nil-guard
+  / GetPivot). Yield context: the retry yields, so the resolve runs where the script can yield — the pack resolved
+  at equip-time in GetRifle() (script_coherence_packs.py:551); per-phase DESIGN reads the REAL transpiled
+  assignment/consumer sites and picks the yield-safe binding point. CORRECTS v3's FIX 2: REMOVE the over-strong
+  "no path by which a wrong-but-non-ordinal lookup is emitted" claim. The fact-anchor is field-name-only; on an
+  unexpected AI LHS shape the lowering abstains (safe); check D catches surviving ordinals (adjacent
+  _GETCHILDREN_INDEX_ANY_RE :567 AND two-line factored :580) but a non-ordinal non-field drift is a rare,
+  safe-direction SILENT miss (rifle on wrong body, no crash) — LOGGED honestly, not closed (no binding-present
+  verifier: §4 forbids on reference facts; no binding-IR producer, §5.2; present-named-lookup = pack-in-disguise).
+  Check D is the pre-existing SHAPE regression floor (resolved_total 0→1 → budget 0).
+
+- D3 [Mechanical] — admission, UNCHANGED from v2/v3. ONE signal = MainCamera tag (stamps _MainCameraRig,
+  mode-independent). ONE retired mechanism = legacy fps_rifle_pickup/WeaponMount pack
+  (script_coherence_packs.py:194/290/547), DISABLED in generic (pipeline.py:2982) — generic has NO rifle repair
+  today. ONE mechanism = child_ref_resolver rig-rooted fact + post-transpile retarget lowering + check D as floor.
+  #2-mis-shaped (RETARGET variant) MEETS admission.
+
+OQ1-v3 (emitted lazy shape) is RESOLVED: REAL rig-child Instance via bounded retry — the proxy is eliminated by a
+hard correctness constraint (SetParent/.Parent/:GetPivot require an Instance), not a taste call. The only Gate-A
+open question left is OQ2 (receiver-rooting scope — Camera.main only; recommend defer broader). The yield-site
+binding point is a per-phase DESIGN detail (read the real transpiled consumer sites), not a Gate-A open question.
+
+## GATE A APPROVED (2026-06-12)
+Design converged (4 dual-voice rounds). Scope: Camera.main→MainCamera-tag ONLY (user did not override the
+recommended narrow scope). Proceeding to implementation.
+
+---
+
+## DESIGN-stage decisions — Phase 1 (per-phase detailed design, against the real PR#190 surface)
+
+Authored in DESIGN against the worktree tip + the corpus fixture. Settles the interface shapes, the
+yield-safe bind site, and the slice breakdown for the single Phase-1. Full design: design-phase1.md.
+
+- D-P1-a [Taste] — Rig-rooted retarget fact = a SIBLING frozen dataclass
+  `RigRootedRetargetFact(field_name, child_name)`, NOT a `ChildRefFact` variant. ChildRefFact is
+  receiver-PRESERVING + consumed PRE-AI by prerewrite_child_index; the rig fact is receiver-DISCARDING +
+  consumed POST-AI by the lowering. Separate type keeps prerewrite_child_index from ever touching it (the
+  construction-safety boundary v2 violated). `ChildRefScript` gains `rig_facts: tuple[...] = ()`;
+  `resolved_total` counts host + rig facts so check D's budget flips Player {1,0}->{1,1}.
+
+- D-P1-b [Taste] — Yield-safe bind site = the §2.1 `task.spawn` back-fill resolver, anchored on the Awake
+  assignment. FORCED (not a toss-up): the AI placed `self.weaponSlot =` in Player:Awake() (fixture line 89);
+  Awake MUST NOT yield (scene_runtime.luau:2066 `start() never yields`); consumers are equip-time (GetRifle
+  :279/:282). The injected resolver does a NON-yielding first sweep at Awake and, on a miss, arms a
+  task.spawn'd 30x0.1s retry that BACK-FILLS self.weaponSlot when the rig streams in. Honors BOTH the runtime
+  invariant (Awake thread never yields) AND the SHARED CAVEAT (never "nil forever"; the back-fill IS the
+  late-bind, not a one-shot trust-CameraRigFollower sweep). One shape, correct in either scope placement.
+  The emitted binding is a REAL rig-child Instance (rig:FindFirstChild("WeaponSlot", true)) or nil — never a
+  proxy table (FIX 1 honored: .Parent / instantiatePrefab nil-guard / pivotOf all type-safe).
+
+- D-P1-c [Mechanical] — check D reused unchanged; fact-anchor residual logged not closed. No new verifier
+  (§4 reference-fact boundary). Resolver flip + RHS replacement make check D green by construction. The
+  non-ordinal-drift silent miss on the lowering's abstain path (edge 4b) is a rare safe-direction residual,
+  logged in followups (closing needs a binding-IR producer, §5.2).
+
+- D-P1-d [Mechanical] — Scope: Camera.main->MainCamera-tag ONLY (Gate A CONFIRMED, narrow scope not
+  overridden). Mechanism keys solely on the MainCamera tag + parsed child name + C# field name — generic,
+  no rifle/weaponSlot hardcode.
+
+Slice breakdown (3, sequential S1->S2->S3): S1 RESOLVER+LOWERING (resolver admit + new
+rifle_rig_retarget_lowering.py + wiring — one fact-lifecycle); S2 FIXTURE-REGEN + check-D greenness (atomic,
+corpus gate couples lowering output to check D); S3 NET/E2E witness + residual followup. No parallel seam —
+one producer->consumer->fixture->witness chain.
+
+---
+
+## DESIGN-stage decisions v2 — SUPERSEDES D-P1-b above (re-grounded after dual-voice phasedesign review)
+
+Both voices (Claude + codex) BLOCKING-agree the v1 `task.spawn` back-fill resolver is a correctness
+REGRESSION, not a fix: (1) it LOSES the equip race — the back-fill is a decoupled snapshot lagging the rig's
+arrival; a slow-stream client equips before the next poll, GetRifle sees self.weaponSlot==nil, the rifle is
+mis-placed for that one-shot equip, and the later back-fill cannot repair the already-spawned rifle; (2) the
+module-level _rigSlotPending + single-captured-self back-fill BREAKS multiplayer — a 2nd host instance is
+suppressed (pending==true) and back-filled into the first captured self, leaving instance-2 nil forever. The
+legacy WeaponMount pack proves the correct shape: resolve INLINE at the consumer (script_coherence_packs.py
+:547-562, immediately before PivotTo/Parent). Everything else in v1 stays CONFIRMED SOUND (sibling dataclass,
+resolved_total {1,0}->{1,1} budget flip, check D unchanged, the lowering hook, strict typing, generic
+projection, S1->S2->S3 acyclic + S2 atomic). D-P1-b is RETIRED; this replaces it. D-P1-a/c/d carry forward.
+
+- D-P1-b-v2 [Classification: Taste] — Bind site = CONSUMER-SIDE lazy resolve, per-instance, mirroring the
+  legacy WeaponMount pack. RETIRES the v1 task.spawn back-fill. The post-transpile lowering injects a
+  per-instance memoized resolver METHOD (function <Class>:_resolve<ChildName>()) that does the rig lookup
+  (scan workspace:GetDescendants() for the _MainCameraRig Model, then rig:FindFirstChild("<child>", true) — a
+  REAL Instance) with the bounded 30x0.1s retry, and REWRITES the consumer READS of self.<field> to call it
+  (self.<field> -> self:_resolve<ChildName>(), memoized on self._<field>Cache). The AI's Awake assignment RHS
+  is neutralized to nil. Fact-anchored on the deterministic field_name (the read sites), abstain-safe on an
+  unmatched AI shape (residual logged, not closed). RACE-SAFE AT USE: resolve+consume in one synchronous span
+  in the yielding GetRifle (real fixture reads at :279/:282); the bounded retry waits for a late rig RIGHT
+  THERE. PER-INSTANCE: cache on self, NO module-level _rigSlotPending/_rigSlotCache, NO cross-instance
+  suppression -> multiplayer-correct. REAL Instance or nil (never a proxy): .Parent / instantiatePrefab
+  nil-guard / pivotOf:GetPivot all type-safe. ADDS the crux acceptance test (codex MAJOR): a DETERMINISTIC
+  RACE test forcing Awake-miss -> rig appears -> equip -> assert rifle on the rig's WeaponSlot (the schedule
+  the back-fill failed and lazy-at-use passes by construction). Grounded: legacy pack :547-562; real fixture
+  Player Awake write :89 (non-yielding), GetRifle reads :279/:282 (yielding); pivotOf :13 expects a real
+  Instance. Collapses the v1 §1.3 yielding-Awake-helper and §2 dead-end alternatives -> ONE canonical emit.
+
+## ARCHITECTURE PIVOT (user decision, 2026-06-12) — post-transpile lowering → LOAD-BEARING TOKEN
+S1's implementation review (codex 3 BLOCKING + 2 MAJOR) confirmed the converged design's POST-TRANSPILE
+STRING-REWRITE of AI Luau output is the rung-2b AI-output-fingerprint fragility the generic effort exists to
+retire (every review round found another AI-output shape it mishandles). User chose the durable §2 LOAD-BEARING
+TOKEN mode: PRE-REWRITE the C# (deterministic, before the AI) so weaponSlot reads become a host helper call
+(e.g. host:rigChild("WeaponSlot")) the AI passes through verbatim, backed by ONE generic runtime helper that
+resolves _MainCameraRig→FindFirstChild(name,true) (real Instance, retry) at the yielding use site. Moves all
+string-manipulation to the deterministic C# INPUT (where the turret fix succeeded). Construction-safe; fails loud
+if the token survives unexpanded. SUPERSEDES the post-transpile lowering decisions (D2 of design.md v4 +
+design-phase1 consumer-side-lowering). Goal + target (_MainCameraRig WeaponSlot) UNCHANGED; only the §2 mechanism changes.
+Classification: User-Challenge (resolved by user).
+
+## PATH CORRECTION (user decision after codex token-vet, 2026-06-12)
+Token approach ABANDONED (codex: not more durable — relocates AI-trust fragility C#-ward; no precedent for
+trusting the AI to preserve a synthetic host call). REINSTATE the deterministic post-transpile lowering (the
+right mechanism — the AI-not-trusted, deterministically-lowered OnTriggerStay precedent) + FIX S1's 6 impl bugs +
+ADD a binding-present FAIL-CLOSED VERIFIER (schema §7.2/§3a "deterministic rebind-by-name + a verifier that the
+IR-declared binding is present"). §4-boundary reconciliation: a DROPPED/foreign-receiver retarget DOES warrant a
+verifier (unlike a host-rooted reference fact that's construction-safe via pre-rewrite) BECAUSE the lowering rides
+on AI output the AI isn't trusted to preserve — the verifier makes a dropped/reshaped binding fail LOUD instead of
+silently shipping a wrong rifle. This SUPERSEDES the design's rounds-2/3 "no verifier" decision.
+Classification: User-Challenge (resolved by user + codex).
+
+---
+
+## DESIGN-stage decisions v3 — rewrites design-phase1.md for the PATH CORRECTION (CHANGE 1 + CHANGE 2)
+
+Re-grounded against the worktree tip (contract_verifier.py check D + FAIL_CLOSED_CHECKS; trigger_stay_lowering.py;
+child_ref_resolver.py; the child_ref_resolution carrier thread TranspiledScript:66 → pipeline:2903 →
+RbxScript:152 → check D). The rounds-2/3 "no verifier" DESIGN decisions (D-P1-c v1, design-phase1 §1.5/§4) are
+RETIRED; D-P1-a/b carry forward unchanged. Two changes land in design-phase1.md.
+
+- D-P1-c-v2 [User-Challenge, resolved by user + codex] — CHANGE 1: ADD a binding-present FAIL-CLOSED VERIFIER
+  `_check_rig_binding_present` in contract_verifier.py, added to FAIL_CLOSED_CHECKS. Asserts the IR-declared rig
+  binding is DISCHARGED by reading a NEW `rig_binding` carrier (`{field, child, present}`) — the resolver's
+  deterministic field/child projections + the lowering's `present` discharge truth — NOT a Luau-string grep (that
+  would be a pack-in-disguise; mirrors how check D asserts against child_ref_resolution). Carrier thread:
+  resolver-fact → lowering stamps TranspiledScript.rig_binding → pipeline copies to RbxScript.rig_binding →
+  verifier (parallel to child_ref_resolution). §4-boundary reconciliation: a host-rooted reference fact is
+  construction-safe via pre-rewrite (no verifier); the rifle's DROPPED/foreign-receiver retarget CANNOT be
+  pre-rewritten construction-safe (Camera.main.transform points at the LIVE camera, not the rig Model holding
+  WeaponSlot), so the lowering rides untrusted post-AI output → the lowering+verifier is the FLOOR. A
+  dropped/reshaped/abstained binding (present=False) fail-closes LOUD. Closes the rounds-2/3 non-ordinal-drift
+  silent-miss residual for the dropped/reshaped case. SUPERSEDES the rounds-2/3 no-verifier decision.
+
+- D-P1-c-v2.coupling [Mechanical] — the neutralize/resolved_total DESYNC (codex-review-1.1 BLOCKING #3) is closed
+  by the carrier, NOT check D: resolved_total flips 0→1 pre-transpile, ordinal-neutralization happens
+  post-transpile in the lowering; a half-applied lowering would spuriously fire check D's child_ordinal_survivor.
+  The binding-present verifier (not check D) is the authority on "discharged" — the lowering stamps present=False
+  when it cannot anchor; the neutralize + discharge-stamp move TOGETHER, so a half-applied lowering can never
+  present as silently-green and check D never misattributes.
+
+- D-P1-d [Mechanical] — CHANGE 2: the 6 S1 impl bugs (codex-review-1.1) are now explicit interface/acceptance
+  requirements. (1) inject resolver BEFORE `return <Class>` + post-inject Luau syntax re-check (abstain on fail) —
+  never unloadable Luau. (2) Camera.main admission EXACT host-XOR-rig: direct Camera.main.transform.GetChild(0)
+  admitted with no cam-symbol seed; enemy.cam / longer foreign chains / member-access LHS REJECTED (no endswith,
+  no recv_tail-in-cam_symbols substring). (3) _neutralize_assignment fact-anchored to the camera-child write
+  (field + camera-child RHS shape), multiline-aware, abstain-safe, resolved_total-coupled. (4) _rewrite_field_reads
+  receiver/scope-aware (bare self.<field> only; not x.self.field, not shadowed self). (5) yield-context guard —
+  rewrite reads ONLY in yielding methods (resolver has task.wait); abstain on non-yielding Awake/Start; yield-safety
+  detected structurally. (6) idempotency guard = the injected method's actual presence, not `marker in source`.
+
+- D-P1-f [Mechanical] — SLICES re-cut to 4: S1 resolver+lowering+carrier+6-robustness; S1b binding-present
+  verifier (its OWN slice — distinct fail-closed-check concern with its own pre-fix-RED regression proof, deps S1's
+  carrier); S2 fixture-regen (captures rig_binding, must pass the now-flipped gate); S3 net+race+
+  dropped-binding-fails-loud(E2E)+residual. Strictly sequential S1→S1b→S2→S3 (producer→consumer→verifier→fixture→
+  witness). New acceptance items: (e) verifier RED-on-absent/GREEN-on-present + pre-fix-RED proof + fact-anchored-
+  not-grep; (h) the 6 robustness items incl. the desync-coupling test (h.3) and the yield-guard test (h.5) and the
+  unloadable-Luau syntax-check (h.1).
+
+## PAUSED at design→implement boundary (user, 2026-06-12) — API at-capacity
+Design CONVERGED (4 plan rounds + ~6 phase-design rounds incl. the token-vet detour + 2 verifier-independence
+corrections). Nothing implemented (S1's first attempt discarded at the path-pivot). Resume by re-running /drive
+on runId rifle-dropped-ref-20260612T064620 when the API is freer. The phase design is converged + fully specified;
+the next action is: freeze phaseBaseSha, dispatch S1 (resolver+lowering+carrier) per design-phase1.md §5.
+
+---
+
+## S1 IMPLEMENTATION notes (2026-06-12) — slice rifle-dropped-ref/1.1
+
+- **D-S1-impl-a [Mechanical] — path-notation drift, no contract change.** The slice
+  prompt's owned-file paths used a `converter/converter/...` prefix; the real tree is
+  `converter/...` (cwd=`converter/`, package on sys.path). All seams the design cited
+  matched the real code (`child_ref_resolver._resolve_script`/`build_child_ref_map`;
+  `code_transpiler.TranspiledScript`; `contract_pipeline.py:599` lowering zone with
+  `child_ref_map` in scope; `pipeline.py:2903` copy + the three child_ref_resolution
+  rehydration seams SAVE/LOAD/RESTORE; `core/roblox_types.RbxScript:152`). No redesign.
+
+- **D-S1-impl-b [Mechanical] — Luau loadability uses the project's real checker.** The
+  post-inject syntax re-check (`_inject_resolver_method`) calls
+  `utils.luau_analyze.syntax_errors_for_source` (the same `luau-analyze` the transpiler
+  runs) when the binary is installed, falling back to a structural bracket/`function`-
+  after-`return` balance proxy when it is not — so the after-`return` BLOCKING is caught
+  in both environments (luau-analyze IS installed here; verified it reds the after-return
+  splice). Acceptance c-i / h.1 tests skip the analyze assertion when the binary is absent.
+
+- **D-S1-impl-c [Mechanical] — discharge re-derived from the FINAL committed source on
+  EVERY call (incl. idempotent no-ops).** `lower_rifle_rig_retarget` stamps
+  `rig_binding.present` from `_binding_discharged(final_source, field, child)` AFTER the
+  edit attempt regardless of whether THIS call injected — so an idempotent second call
+  re-stamps `present=True` identically (the method is already present), and a reverted
+  inject never leaves `present=True`. `_has_surviving_field_read` excludes reads inside
+  the non-yielding lifecycle methods (`Awake`/`Start`) — the yield-guard intentionally
+  leaves those (they read the neutralized `nil` safely), so an abstained lifecycle read
+  does NOT count against discharge. `_statement_rhs_end` is continuation-aware (spans a
+  multiline `x and\n  y` RHS) for the multiline-neutralize requirement.
+
+---
+
+## S1 REVIEW-ROUND-2 fixes (2026-06-12) — slice rifle-dropped-ref/1.1 (5 P1s)
+
+Addressed all 5 P1s from `codex-review-1.1.md` + `review-1.1-2.md` (union). Round-2 commit
+on the slice branch.
+
+- **D-S1-r2-a [Mechanical] — P1: final Luau syntax re-check AFTER all rewrites.** Moved the
+  load-bearing syntax gate to the FINAL source (post inject + read-rewrite + neutralize), not
+  just post-inject. `_binding_discharged` is shape-only, so a neutralize that corrupts the
+  module (the design's `if self.cam then self.weaponSlot = ... end` — `_statement_rhs_end`
+  swallows the inline `end` into the RHS span, dropping the `if`'s closer) would stamp
+  present=True on unloadable Luau. The final gate reverts to original + stamps present=False.
+  Test `test_p1_final_syntax_check_after_rewrites_stamps_false` PROVES post-inject parses but
+  the FINAL source does not (so only the final gate catches it). NOTE: the `_statement_rhs_end`
+  end-keyword-swallow is a latent RHS-span bug; the syntax gate makes it fail-CLOSED (abstain),
+  which is correct — tightening the span to stop at a bare `end`/`then` keyword is a non-blocking
+  followup (logged), not required for fail-closed correctness.
+
+- **D-S1-r2-b [Mechanical] — P2: seed anchored to the GetChild use site.** Codex's repro
+  REPRODUCED (verified: `cam=enemy.transform; weaponSlot=cam.GetChild(0); ...; cam=Camera.main.transform`
+  admitted a rig fact pre-fix). `_canonical_receiver(source, recv, use_pos)` now resolves the
+  symbol to its NEAREST PRECEDING binding strictly before the GetChild position (the binding live
+  at the use site by scope/order), admitting iff that nearest binding is exactly
+  `Camera.main.transform`. A later/unrelated `cam = Camera.main.transform` after the GetChild, or
+  a rebind to a foreign receiver before it, no longer back-admits. Tests `test_p2_*`.
+
+- **D-S1-r2-c [Mechanical] — P3: shadowed-`self` guard (h.4 half).** New `_self_is_shadowed_at`
+  walks the lexical block structure from the enclosing `function <Class>:<method>(` to the read,
+  tracking block depth (`function`/`do`/`then`/`repeat`...`end`/`until`); a `local self` or a
+  `function(...self...)` parameter introduces a shadow at its depth that suppresses the rewrite
+  while that depth is open. Wired into BOTH `_rewrite_field_reads` (abstain) and
+  `_has_surviving_field_read` (a shadowed read is foreign, not a surviving consumer — so a mangle
+  can never report discharged=True via a shadowed read). Tests `test_p3_*`.
+
+- **D-S1-r2-d [Mechanical] — P4: MainCamera uniqueness scoped to the host's owning scene/prefab.**
+  `_main_camera_node` previously enforced GLOBAL uniqueness (an unrelated MainCamera in another
+  prefab/scene → >1 → silent drop). New `_owning_node_collection` locates the host's scene/prefab
+  by object identity and scopes the uniqueness check to THAT collection only (consistent with how
+  `_node_by_cs_path` scopes). If the host can't be located in any parsed collection, abstain (no
+  scope to assert uniqueness) — no silent global drop. In-scope non-uniqueness still abstains
+  (`test_p4_non_unique_within_owning_prefab_still_abstains`). Tests `test_p4_*`.
+
+- **D-S1-r2-e [Taste] — P5: >1 rig fact per script FAILS CLOSED (single-dict carrier kept).**
+  Per the 6 Decision Principles (minimal change, fail-closed, matches the design's §1.5 single-dict
+  contract + one-fact-per-script assumption): a script bearing >1 rig fact does NOT silently keep
+  the last fact's carrier. The lowering ABSTAINS on all edits and stamps a single overflow carrier
+  `{field, child, present:False, multi_fact:True}`, so the binding-present verifier (S1b) fails
+  LOUD on the unverifiable multi-binding script rather than shipping a partial discharge. Chose
+  this over re-architecting to a list (out of envelope — the corpus + design frame multi-fact as a
+  two-SCRIPTS case; a list carrier touches the verifier/regen/rehydration seams owned by S1b/S2).
+  Documented assumption: ONE rig fact per script (the corpus shape); a genuinely multi-binding
+  single script is fail-closed, not silently dropped. Test `test_p5_multi_rig_fact_per_script_fails_closed`.
+
+## Slice S1 — round-3 codex review fixes (unifying root cause: FAIL CLOSED on uncertainty)
+
+All four round-3 P1s shared one root: a decision point TRUSTED its own rewrite/admission instead of
+abstaining/stamping `present=False` on a shape it could not handle with certainty. Each fix biases to
+ABSTAIN (conservative — handles fewer shapes but never wrong); the corpus happy-path still works.
+
+- **D-S1-r3-a [Mechanical] — P1: analyzer-absent fallback validates block-keyword balance.**
+  `_structural_balance_ok` (the `_luau_syntax_ok` fallback when `luau-analyze` is absent) previously
+  validated only bracket balance + the after-`return` splice, NOT `if/then/end`. A single-line-`if`
+  neutralize whose RHS span swallows the closing `end` produced UNLOADABLE Luau yet stamped
+  `present=True`. Now counts block openers `{function,do,then,repeat}` vs closers `{end,until}` (never
+  negative, net zero), so a swallowed `end` fails-closed → revert → `present=False`. `elseif` is a
+  closer too (it cancels its own upcoming `then`'s increment) so a well-formed `if/elseif/else/end`
+  chain (TWO `then`, ONE `end`) is NOT false-rejected — caught in self-review as an over-abstain
+  regression and fixed before commit. Tests `test_r3_fallback_validates_if_then_end_block_balance`,
+  `test_r3_fallback_happy_path_still_loadable`, `test_r3_fallback_accepts_well_formed_if_elseif_else`.
+
+- **D-S1-r3-b [Mechanical] — P2: `_canonical_receiver` is now scope-aware (dominance), not just order-aware.**
+  New `_seed_dominates_use` gates seed admission: a `cam = Camera.main.transform` seed buried in a
+  dead/conditional block (`if(false){ cam=...; }` / braceless `if(c) cam=...;` / a `switch` case) does
+  NOT dominate `weaponSlot = cam.GetChild(0)` below it, so the resolver ABSTAINS (no rig fact). Proof:
+  (1) brace-depth from seed→use never goes negative (a `}` that closes the seed's block ⇒ out of scope);
+  (2) the seed statement is not the braceless single-statement body of a control-flow keyword
+  (`if/else/while/for/foreach/case/do`). Conservative — abstains whenever it cannot cheaply prove
+  dominance (a missed fact is safe; a false-admit is not). Straight-line happy path still admits.
+  Tests `test_r3_seed_in_dead_conditional_block_abstains`, `test_r3_seed_in_braceless_if_abstains`,
+  `test_r3_straight_line_seed_still_admits`.
+
+- **D-S1-r3-c [Mechanical] — P3: `_self_is_shadowed_at` covers ALL `self`-binding forms.**
+  Broadened beyond `local self` + `function(...self...)` param to also catch a function NAMED `self`
+  (`local function self()` / `function self()` → shadows the enclosing scope) and a `for`-loop VARIABLE
+  named `self` (`for self in` / `for _, self in` / `for self = ...` → shadows the loop body, registered
+  at the `do` that opens it). Foreign `self` reads in these forms are no longer rewritten and no longer
+  counted as discharged (mirror in `_has_surviving_field_read` inherited). Loop-var shadow is scoped to
+  the body only — a real receiver read outside the loop still rewrites. Tests
+  `test_r3_shadow_local_function_self_not_rewritten`, `test_r3_shadow_for_loop_self_var_not_rewritten`,
+  `test_r3_for_loop_self_does_not_block_real_receiver_read`.
+
+- **D-S1-r3-d [Mechanical] — P4: neutralize anchor requires an actual ordinal child access.**
+  `_CAMERA_CHILD_RHS_RE` dropped the bare `\bself\.cam\b` alternative; it now matches ONLY a real
+  ordinal child access (`[:.]GetChild(n)` / `[:.]GetChildren()[n]`). A boolean/config RHS that merely
+  mentions `self.cam` (`self.weaponSlot = self.cam and self.defaultSlot`) is no longer neutralized to
+  `nil` (which would be a false-green) — the neutralizer ABSTAINS, leaving the write for the verifier.
+  The corpus write `self.cam and self.cam:GetChildren()[1]` still carries the ordinal, so it still
+  neutralizes. Same regex backs `_has_camera_child_write`, so condition (2) of `_binding_discharged`
+  stays consistent. Test `test_r3_neutralize_anchor_requires_ordinal_child_access`.
+
+REVIEW NOTE: codex was non-functional this round (echoed the diff / read the full tree without producing
+a verdict, then errored on a narrowed read-only prompt — matches the documented codex-outage pattern).
+Substituted Claude self-adversarial review + a 20-case empirical sweep across all three fixed functions
+(balance / dominance / shadow), all passing in the safe direction; the second independent codex voice is
+recorded as OWED for this fix round.
+
+## Slice S1 — round-4 codex review fixes (root cause: FAIL CLOSED + bind to the deterministic source, not a downstream fingerprint)
+
+All four round-4 findings shared the round-3 root (trust a shape the code can't handle with
+certainty) PLUS the converter kernel: a load-bearing identity/discharge gate keyed on a downstream
+FINGERPRINT (a bare same-named method; a raw child-name splice) abstains silently or false-passes.
+Each fix re-anchors on the deterministic signal and biases to abstain; the corpus happy-path
+(SimpleFPS Player, child `WeaponSlot`) still discharges `present=True`.
+
+- **D-S1-r4-a [Mechanical] — BLOCKING: raw `child_name` spliced into Luau identifiers.**
+  A Roblox child name with a space/special char (`"Weapon Slot"`) raw-spliced into
+  `function <Class>:_resolve<child>()` / `self:_resolve<child>()` yields invalid Luau, and the
+  analyzer-absent `_structural_balance_ok` accepted it → `present=True` on broken code. New
+  `_method_suffix(child)` derives a VALID-Luau-identifier method-name suffix: a valid identifier
+  passes verbatim (happy-path + idempotency preserved); otherwise illegal chars → `_` plus an
+  8-hex sha1 of the REAL name (collision-resistant). The suffix is threaded through inject /
+  rewrite / discharge / neutralize-comment; the rig LOOKUP still uses the REAL `child` string in
+  `rig:FindFirstChild("<real name>", true)`. `field` (a C# identifier) is also identifier-guarded
+  (`_LUAU_IDENT_RE`) → abstain (`present=False`) if it can't yield a valid identifier. Tests
+  `test_r4_special_char_*`.
+
+- **D-S1-r4-b [Mechanical] — BLOCKING: preexisting same-named resolver false-discharges.**
+  A preexisting foreign `function <Class>:_resolve<Child>()` (body `return nil`) + a call made the
+  shape-only discharge report `present=True` with the lowering doing NO work this run (`modified=0`).
+  Discharge now binds to the lowering's OWN emit: new `_has_own_resolver_method` requires the
+  distinctive own-emit body marker (`m:GetAttribute("_MainCameraRig")`) inside the method body, not
+  a bare same-named declaration. Used by BOTH the idempotency guard in `_inject_resolver_method` (a
+  foreign method does NOT count as already-injected → the lowering re-injects its OWN) and
+  `_binding_discharged` (1a). So the foreign method alone never discharges; the only `present=True`
+  paths are (i) the lowering's own emit landed this run, or (ii) idempotent re-run over its own
+  prior output. Dropped the now-orphaned `_has_resolver_method`. Tests
+  `test_r4_preexisting_foreign_resolver_method_not_false_discharged`,
+  `test_r4_foreign_resolver_alone_is_not_own_emit`.
+
+- **D-S1-r4-c [Mechanical] — MAJOR: `_lhs_is_bare_field` admitted a typed local declaration.**
+  `Transform weaponSlot = Camera.main.transform.GetChild(0);` (a C# typed LOCAL) was admitted as a
+  rig fact (flipping `resolved_total`, a bogus fail-closed path for valid code). `_lhs_is_bare_field`
+  now walks back over whitespace (incl. newlines); a preceding IDENTIFIER char means a leading type
+  token (`Transform`/`var`) → typed local DECLARATION → abstain. A bare field write's preceding
+  non-blank char is always a statement terminator (`;`/`{`/`}`) or start-of-file, so the real field
+  write (and `this.`-qualified write) still admits. Tests
+  `test_r4_typed_local_decl_abstains_field_write_admits`, `test_r4_var_local_decl_abstains`.
+
+- **D-S1-r4-d [Mechanical] — MINOR: fallback tail scan false-rejected a trailing comment.**
+  `_structural_balance_ok`'s post-`return` tail scan was raw-text, false-rejecting a valid source
+  whose trailing comment after `return <Class>` carried `end`/`function` as prose. The scan is now
+  code-position-aware (`_luau_pos_is_code` per keyword match), and `_RETURN_IDENT_RE` tolerates an
+  optional trailing line-comment so a commented epilogue is still a valid splice point. A REAL
+  code-level `function`/`end` after the return is still rejected (the after-`return` splice bug).
+  Test `test_r4_fallback_tail_scan_allows_trailing_comment`.
+
+VERIFY: `tests/test_rifle_rig_retarget.py` 54 green; full `-m "not slow"` suite 3032 passed / 45
+skipped / 5 xfailed; no-Any gate pass. Each of the 7 new R4 tests proven RED against `2722219`
+production. Corpus happy-path (`WeaponSlot`) discharge `present=True` confirmed (incl. analyzer-absent).
+
+REVIEW NOTE: the independent second codex voice is recorded as OWED for this fix round (consistent
+with the round-3 codex-outage note); substituted Claude self-adversarial review + targeted empirical
+spot-checks (spaced-child idempotency/lookup, `_lhs_is_bare_field` four branches).
+
+## Slice S1 — round-5 review fixes (STRUCTURAL fix: stop the regex whack-a-mole, anchor the fact on the camera RECEIVER)
+
+Root cause across the 4 round-5 P1s + the dual-voice codex follow-ups: a load-bearing
+neutralize/discharge gate keyed on field+ordinal SHAPE (not the exact camera-rooted assignment) and
+analyzer-absent paths that fail-open. The structural fix carries the camera-receiver anchor ON THE
+FACT and makes every camera-ness decision a PROVEN property of the final Luau, biasing to abstain.
+
+- **D-S1-r5-a [Structural] — BLOCKING (lowering): neutralize/discharge now CAMERA-RECEIVER-anchored
+  via the fact.** `RigRootedRetargetFact` gained `cam_receiver` (the C# group-2 receiver text the
+  resolver admitted: a bare seeded symbol `cam`, or `Camera.main.transform`). The lowering builds a
+  `_CamAnchor` and neutralizes ONLY a write whose WHOLE RHS value IS a camera-rooted ordinal access
+  (`(<cam> and )* <camrecv>:GetChildren()[n]`, anchored `^...$`) whose `<camrecv>` is PROVABLY the
+  camera. "Provably camera": a canonical literal (`workspace.CurrentCamera`), OR a seeded symbol whose
+  NEAREST PRECEDING code-position binding is `<sym> = <canonical literal>` AND that binding REACHES the
+  use (`_binding_reaches_use`: no enclosing do/then/function block of the binding closes before the
+  use). A same-field ordinal on a non-camera receiver (`self.defaultSlots:GetChildren()[1]`), a
+  disjunction (`X or self.cam:...`), a FOREIGN `and` guard (`self.defaultSlots and self.cam:...`), a
+  param/loop-var `cam`, and a closed-scope / dead-branch seed all ABSTAIN -> present=False. Discharge
+  (2a) additionally requires the lowering's OWN neutralize marker (positive proof the camera write was
+  found+neutralized this run / idempotent over our own output), not merely "no camera write survives".
+  Tests `test_r5_neutralize_anchored_on_camera_receiver_not_field_ordinal`,
+  `test_r5_mixed_disjunction_rhs_is_not_neutralized`, `test_r5_camera_symbol_rebound_to_non_camera...`,
+  `test_r5_camera_symbol_as_param_or_loopvar_abstains`,
+  `test_r5_camera_binding_in_closed_or_dead_scope_does_not_dominate`.
+
+- **D-S1-r5-b [Structural] — BLOCKING (lowering): `_has_own_resolver_method` = STRUCTURAL equality to
+  the canonical emit, not a marker substring.** It compares the emitted method (its `function`-line
+  through closing `end`, line-normalized) to the exact `_resolver_method_text`. A FOREIGN same-named
+  method that merely uses `m:GetAttribute("_MainCameraRig")` as live code is NOT the own emit
+  (re-injected/abstained); idempotency over the byte-identical own output still holds. Tests
+  `test_r5_foreign_resolver_with_marker_is_not_own_emit`,
+  `test_r5_has_own_resolver_rejects_foreign_marker_body`.
+
+- **D-S1-r5-c [Structural] — MAJOR (resolver): `_lhs_is_bare_field` ALLOW-LIST by terminator.** A bare
+  field write is admitted ONLY when the preceding non-blank char is `;`/`{`/`}` or start-of-file. This
+  fail-closed choice ABSTAINS on EVERY typed-local form a single-char reject-list could not enumerate —
+  simple/generic(`>`)/array(`]`)/qualified(`.`)/nullable(`?`)/tuple(`)`)/comment-separated(`/`) — rather
+  than admit a bogus rig fact (a false fail-close on valid code). Over-abstaining a rare
+  conditional/labeled camera write is fail-closed-safe; the corpus write is a plain statement, so the
+  happy-path admits. Tests `test_r5_resolver_abstains_generic_array_qualified_typed_locals`,
+  `test_r5_lhs_abstains_on_every_typed_local_form`.
+
+- **D-S1-r5-d [Mechanical] — MAJOR (lowering): `_structural_balance_ok` skips long-bracket
+  comments/strings + line comments wholesale, fail-CLOSED on unterminated.** The analyzer-absent
+  fallback advances past `--[[ ]]` / `[[ ]]` / `[=[ ]=]` / `--` spans before counting brackets/keywords
+  (the `]]` closer no longer leaks as a code-level `]`), and returns False on an UNTERMINATED
+  long-bracket or a short string spanning a newline (invalid Luau). Tests
+  `test_r5_structural_balance_skips_block_comment_brackets`,
+  `test_r5_structural_balance_fails_closed_on_unterminated_long_bracket`.
+
+REVIEW: dual-voice — Claude self-adversarial + THREE codex `codex exec` rounds (R1 found 4 edges
+[receiver-name-only anchor, marker-substring own-emit, fallback fail-open, allow-list over-abstain]; R2
+found 4 more [mixed-RHS disjunction, param/loopvar symbol, stale-marker, typed-local reject-list
+escapes]; R3 found 3 [text-nearest no-dominance scan, foreign `and` guard, marker spoof]). Each round's
+findings drove a structural tightening; re-reviewed the corrected artifact each round. Two accepted
+RESIDUALS (pathological, not real-pipeline-reachable, the verifier S1b is the independent authority):
+(i) `_has_neutralized_write` marker spoof requires the AI to emit our EXACT suffixed marker (our
+deterministic post-transpile artifact the AI never emits) AND even then the output is a CORRECT retarget;
+(ii) a `if <runtime-cond> then cam = <canonical> end` seed whose condition is genuinely runtime-true is
+treated as reaching (only statically-closed/dead scopes abstain).
+
+VERIFY: `tests/test_rifle_rig_retarget.py` 65 green; full `-m "not slow"` 3043 passed / 45 skipped /
+5 xfailed; no-Any gate pass. The 4 original findings proven RED against `a16c964` at unit + full-pipeline
+level (F1 neutralize non-camera ordinal, F2 marker-substring own-emit, F3 generic typed-local admit, F4
+block-comment false-reject); the disjunction follow-up also RED. Corpus happy-path (`self.cam and
+self.cam:GetChildren()[1]`, child `WeaponSlot`) discharges present=True + idempotent byte-identical in
+BOTH analyzer-present and analyzer-absent modes.
+
+## Round 6 (slice 1.1, S1) — 2 codex review fixes (child_ref_resolver.py)
+- **P1 BLOCKING — `_canonical_receiver` member-access seed.** `\b<recv>\s*=` matched the tail
+  of `other.cam = Camera.main.transform`, seeding the bare local `cam`. Fix: in the nearest-binding
+  scan, reject a match whose immediately-preceding char is `.` (member-access dot). Bare-local seed
+  still admits; `other.cam = ...` now abstains (resolved_total=0).
+- **P1 MAJOR — `_lhs_is_bare_field` comment-blind walk-back.** It skipped only whitespace before the
+  LHS, so a `// line` or `/* block */` comment between the prior statement terminator and a bare field
+  write caused a false drop. Fix: new `_skip_ws_and_comments_back()` walks back over whitespace AND
+  comments, classified authoritatively by `_cs_pos_is_code` (with an explicit comment-OPENER `/`+`/`|`*`
+  recognizer, since the from-start scanner classifies an opener's first `/` as code). Comment-preceded
+  bare field writes (`//` and `/* */`) now admit; round-5 typed-local allow-list NOT regressed
+  (typed local after a comment still abstains).
+- **Verify:** test_rifle_rig_retarget.py 70 GREEN; resolver/corpus/rifle/child_ref suite 186 GREEN;
+  no-Any gate pass. 3 covering tests (member-write-seed, line-comment-admit, block-comment-admit)
+  proven RED against `e540b7c`; 2 guard tests (bare-local-admits, typed-local-after-comment-abstains)
+  green both pre/post. Corpus happy-path (SimpleFPS Player, `weaponSlot = self.cam and
+  self.cam:GetChildren()[1]`, child `WeaponSlot`) discharges present=True (corpus suite green).
+- D-S1-r7: revert net-negative round-6 member-dot seed filter (`_canonical_receiver`) per user; accept foreign-member (`other.cam`) false-admit as documented residual (xfailed test, netted by S1b independent verifier); restore legitimate `this.cam` field seed (regression fix). KEPT the round-6 comment-skip fix. No new C# regex/parsing.
+
+---
+
+## S1b IMPLEMENTATION notes (2026-06-12) — slice rifle-dropped-ref/1.2 (BINDING-PRESENT FAIL-CLOSED VERIFIER)
+
+- **D-S1b-impl-a [Mechanical] — INDEPENDENT scan re-derives the suffix from `child` alone; no `cam_receiver`/`anchor` available to the verifier.** S1's authoritative discharge (`_binding_discharged`) takes `(source, field, child, suffix, anchor)` — but the `rig_binding` carrier the verifier reads is only `{field, child, present[, multi_fact]}` (NO `cam_receiver`). Per §1.6, the verifier's `_rig_binding_discharged(source, field, child)` is DELIBERATELY simpler/independent than the lowering's self-check: it does NOT require the lowering's own-emit markers (`_has_neutralized_write` / structural method equality / camera-anchor) — those are the lowering's defense-in-depth self-derive. The verifier's §1.6 discharge is: (1a) `function <Class>:_resolve<suffix>(` exists at code pos, (1b) ≥1 `self:_resolve<suffix>(` call, (1c) no surviving bare `self.<field>` consumer READ (Awake/Start lifecycle reads + LHS + member-tail excluded — mirrors the lowering's yield-guard so an intentionally-abstained lifecycle read does not count), (2) no surviving `self.<field> = <...GetChild(n)|GetChildren()[n]...>` ordinal write (RHS span-limited to end-of-line). `suffix` reconstructed by `_rig_method_suffix(child)`, a verbatim copy of the lowering's `_method_suffix` contract (valid-ident verbatim, else sanitize+sha1-8) — keyed on the deterministic IR `child`, NOT imported from the lowering (so the verifier stays an independent authority, not a consumer of lowering state).
+
+- **D-S1b-impl-b [Mechanical] — `_luau_pos_is_code` is the only position guard imported (reuse, matches check D).** The verifier already imports `_luau_pos_is_code` from `child_index_lowering`; check D's `_count_surviving_child_ordinals` uses only that. I reused it (NOT `_luau_pos_in_long_bracket` from `trigger_stay_lowering`) to keep the verifier's import surface minimal and consistent with the existing checks. Sufficient: the transpiled module epilogue/method bodies are not inside long-bracket strings.
+
+- **D-S1b-impl-c [Mechanical] — independence is BIDIRECTIONAL: PASS requires `discharged AND stamp`.** A stamp/scan disagreement in EITHER direction fails: forged `present=True` + undischarged source (the e.iv FIX-1 load-bearing case — a syntax-revert or stale-resume carrier) AND discharged source + mis-stamped `present=False`. The detail row names both (`discharged=<bool>, lowering-stamp=<bool>`).
+
+- **D-S1b-coupling [Mechanical] — FAIL_CLOSED_CHECKS flip is admissible HERE; corpus stays GREEN (no S2 dependency to build).** Adding `rig_binding_present` to `FAIL_CLOSED_CHECKS` did NOT red the un-regenerated SimpleFPS corpus in this worktree: the committed pre-`rig_binding` fixture scripts have `rig_binding=None` → the check ABSTAINS (None → no row), so `test_contract_corpus.py` (9) stays green. The flip is correct per the design (S2's regen captures the discharged Player source + `rig_binding present=True`, EXERCISING the check green); no coordination needed — the flip is kept as the design wants and the corpus goes from ABSTAIN (now) to EXERCISE+GREEN (at S2). Verified: full `-m "not slow"` 3064 passed / 0 failed.
+
+- **VERIFY:** `tests/test_rig_binding_present.py` 16 GREEN (e.i RED+promote, e.ii GREEN, e.iii ABSTAIN×2, e.iv independence BOTH directions, e.v pre-fix-RED proof [monkeypatch the check → dropped binding sails through; PROVEN end-to-end at verify_contract level], e.vi fact-anchored-not-grep + different-field/child + unrelated-script-abstains); contract/verifier/corpus/rifle/rig suite 504 passed / 1 xfailed (pre-existing S1 residual); full `-m "not slow"` 3064 passed / 45 skipped / 6 xfailed; no-Any gate clean (carrier read as `dict[str, object]` via `str(...)`/`is True`). GREEN/discharged test sources produced by running S1's REAL lowering on the on-corpus shape (cam_receiver bare symbol `cam`), not a synthetic guess.
+
+## Slice 1.2 — dual-voice REVIEW round 1 (3 BLOCKING false-negatives addressed)
+
+- **D-S1b-r1-f1 [BLOCKING fixed] — discharge now requires the resolver method BODY to be the RIG resolver, not a same-named method.** `_rig_binding_discharged` (1a) previously accepted ANY code-position `function <Class>:_resolve<suffix>(` declaration. A FOREIGN stub (`return nil` / wrong lookup) + a forged/stale `present=True` discharged silently (defeating the stale/forged-resume threat model). FIX: new `_rig_resolver_body_is_rig_lookup(source, suffix, child)` confirms the distinctive `_MainCameraRig` rig lookup as LIVE code INSIDE the method's block-balanced span — BOTH `:GetAttribute("_MainCameraRig")` AND `FindFirstChild("<child>", true)` (the real S1 emit, anchored on the deterministic `child`). New `_rig_method_body_end` block-keyword-balances the method span (long brackets/strings skipped) so a marker elsewhere in the file can't satisfy a foreign stub. Generic (no `weaponSlot`/`WeaponSlot` hardcode). Test `test_review_f1_foreign_resolver_stub_does_not_discharge` — RED vs 4a5aa84 (pre-fix returned discharged=True), GREEN post-fix; genuine corpus shape still discharges.
+
+- **D-S1b-r1-f2 [BLOCKING fixed, both voices] — surviving-ordinal-write scan is now continuation-aware (multiline).** `_rig_has_surviving_ordinal_write` previously read the RHS only to the first `\n` (`source.find("\n")`), missing a multiline surviving write (`self.weaponSlot =\n  self.cam:GetChildren()[1]`) → discharged=True while a camera-child binding re-clobbers at runtime. FIX: replaced the single-line span with `_rig_statement_rhs_end`/`_rig_line_continues` (faithful re-impl of S1's `_statement_rhs_end`/`_line_continues` — bracket/string-balanced, `and`/`or`/`..`/operator continuation across newlines). Also skip leading whitespace/newlines after `=` so a value-on-the-next-line write is spanned (the `=` already establishes mid-statement). Test `test_review_f2_multiline_surviving_ordinal_write_is_detected` — RED vs 4a5aa84 (pre-fix `_rig_has_surviving_ordinal_write`→False), GREEN post-fix.
+
+- **D-S1b-r1-f3 [BLOCKING — stated mechanism does NOT reproduce; defense-in-depth applied].** Finding #3 claimed declaration/call detection counts fake `_resolve...` tokens inside `[[...]]`/`[=[...]=]`/`--[[...]]` long-bracket literals. VERIFIED EMPIRICALLY (exhaustive enumeration of all long-bracket forms incl. level-1/2 and comment/string variants + nesting/level-mismatch cases): `child_index_lowering._luau_pos_is_code` — which the verifier ALREADY imports and uses on every rig scan — correctly returns False for ALL positions inside long-bracket strings/comments (it scans from file start tracking long-bracket level, child_index_lowering.py:94–146). No false-positive position found; the F3 covering test PASSES against pre-fix code, confirming the bug as stated does not exist via that path. STILL APPLIED defense-in-depth: imported `_luau_pos_in_long_bracket`/`_long_bracket_open_level` (deterministic position primitives, NOT lowering discharge-logic — keeps the verifier independent) and added a `_rig_pos_is_real_code = is_code AND NOT in_long_bracket` predicate used by every rig scan, plus `_rig_code_contains` long-bracket exclusion. Regression test `test_review_f3_resolver_only_in_long_bracket_does_not_discharge` locks the correct non-discharge behavior. (Per audit-todo-framing-is-a-hypothesis: the stated mechanism was a hypothesis; the verified cause is "already-handled — defense-in-depth only.")
+
+- **VERIFY (r1):** `tests/test_rig_binding_present.py` 19 GREEN (16 original + 3 new); F1+F2 PROVEN RED against 4a5aa84 (pre-fix false-discharge), F3 passes both (mechanism doesn't reproduce); corpus happy-path STILL discharges (`test_real_lowering_discharges_corpus_shape` + driving S1's real `lower_rifle_rig_retarget` → `_rig_binding_discharged`=True). Subset `-k "contract or verifier or corpus or rifle or rig"` 507 passed / 1 xfailed; no-Any gate clean. Independence preserved (D-P1-c-v2): scan `script.source`, anchored on deterministic `field`/`child`, `present` cross-checked (PASS=discharged AND present), `rig_binding=None` abstains. Codex adversarial re-review of F3 dispatched (exit 0; prose verdict lost to a redirect rotation, but the structural question is fully settled by exhaustive enumeration).
+
+- **D-S1b-r2-f1 [BLOCKING fixed] — close the POSTFIX-continuation CLASS (not just `[`).** The round-1 continuation scan (`_rig_line_continues`/`_RIG_CONTINUATION_HEAD_RE`) admitted operator-led + `:`-led heads but NOT a `[` index continuation, so a surviving camera-child write split BEFORE the index (`self.weaponSlot = self.cam:GetChildren()\n    [1]`) stopped the RHS span at the newline → `_rig_has_surviving_ordinal_write` missed the live clobber → `_rig_binding_discharged`=True (fail-closed false-NEGATIVE; the binding re-clobbers at runtime). FIX: admit the full Luau postfix-continuation head class in `_RIG_CONTINUATION_HEAD_RE` — `[` (index), `(` (call), `.`/`:` (member/method) — closing the class so `(`/`.` don't whack-a-mole next round. Also made `_RIG_ORDINAL_WRITE_TAIL_RE` whitespace-tolerant at each postfix junction (`GetChildren\s*\(\s*\)\s*\[`, `GetChild\s*\(`) so the spanned access matches across the split newline. Tests `test_review_r2_split_before_index_surviving_write_is_detected` + `test_review_r2_split_before_getchild_call_is_detected` — RED vs 1ca1cbb (scan→False), GREEN post-fix; member-split + over-reach added.
+- **OVER-REACH TRADEOFF (flagged).** Admitting `(`/`[` as continuation heads risks a span swallowing a FOLLOWING statement that legitimately starts with `(`/`[` (the rare `a = b\n(f)()` ambiguity / a parenthesized-expression statement). GUARD: `_RIG_STATEMENT_BOUNDARY_RE` — a next line whose first token opens a new statement (`local`/`function`/`return`/`end`/`if`/`for`/`while`/`self.x =`/`name =`/...) stops the span. Where the boundary is genuinely ambiguous the scan KEEPS GOING by design — fail-closed: over-detecting a survivor → `discharged=False` → a violation row is the SAFE direction for this BINDING-floor verifier; a MISSED survivor is the unsafe direction. `test_review_r2_over_reach_guard_does_not_swallow_following_statement` locks that a neutralized `self.weaponSlot = nil` followed by `local other = somethingElse:GetChildren()[1]` STILL discharges True (the guard held, no false survivor).
+- **VERIFY (r2):** `tests/test_rig_binding_present.py` 23 GREEN (19 original + 4 new); split-before-index + split-before-call PROVEN RED against 1ca1cbb. Corpus happy-path STILL discharges present=True (`test_real_lowering_discharges_corpus_shape` + `test_e2_green`, driving S1's real `lower_rifle_rig_retarget`). Subset `-k "contract or verifier or corpus or rifle or rig"` 511 passed / 1 xfailed; no-Any gate clean. Independence/None-abstain/present cross-check semantics intact; generic. Commit f4f1e63.
+
+- **D-S1b-r3 [BLOCKING fixed] — STRUCTURAL code-projection normalization closes the surviving-write formatting CLASS.** Round-2 closed the split-before-postfix sub-class but left SIBLING members of the same surviving-ordinal-write detection class open (all fail-OPEN: `_rig_has_surviving_ordinal_write`→False / `_rig_binding_discharged`→True while a camera-child ordinal write survives — the load-bearing hole on the stale/forged `present=True` resume path where the source scan is the SOLE authority, acceptance e.iv): (a) whitespace at the receiver→`:`→method junction (`self.cam : GetChildren ( ) [ 1 ]`, `self.cam: GetChild(1)`) — the tail regex had no `\s*` there; (b) a `--` comment between tokens truncating the RHS span (`self.cam:GetChildren() -- gap\n [1]`, `self.cam -- gap\n :GetChildren()[1]`) — `_rig_statement_rhs_end` broke at `--`; (c) by implication string-key/`\r\n`. Per the user's directed approach (structural normalization over more non-converging junction regex): the scan's manual inline whitespace/comment/continuation handling has a long formatting tail. FIX: build a position-PRESERVING CODE PROJECTION of `script.source` (`_rig_code_projection`) — walk with the same state machine as `_luau_pos_is_code` (line/block comments, long strings, short strings) and blank every comment/string/long-bracket SPAN incl. its delimiters to spaces (newlines kept so the continuation + over-reach boundary machinery is unchanged); run the existing multiline-aware span on the projection, then whitespace-collapse the spanned RHS (`_rig_collapse_code_ws`) before a now-MINIMAL canonical tail pattern (`:GetChildren()[n]` / `:GetChild(n)`, no per-junction `\s*`). All whitespace/comment/line-split variants collapse to the one canonical access form → one match closes them all; tokens inside strings/comments are spaces → can't match. Kept `_RIG_STATEMENT_BOUNDARY_RE` fail-closed over-reach bias. INDEPENDENCE preserved: projection derived from `script.source`, anchored on deterministic `field`/`child`; `present` stays a cross-check only. CRITICAL non-regression: the legit resolver's INTERNAL `:GetChildren()`/`FindFirstChild`/`:GetAttribute("_MainCameraRig")` (inside `_resolveWeaponSlot`) + the neutralized `self.weaponSlot = nil` are NOT `self.<field> = <ordinal>` writes → NOT mis-detected; corpus happy-path still discharges True.
+- **VERIFY (r3):** `tests/test_rig_binding_present.py` 30 GREEN (23 prior + 7 new). 5 newly-closed holes PROVEN RED against f4f1e63 (whitespace-at-`:`-junction x2, `--`-comment-between-tokens x2, ordinal-inside-string false-detect); `\r\n` + corpus-happy-path are regression guards (green both pre/post — `\r\n` was already in the whitespace set, corpus must never flag). Corpus happy-path STILL discharges (`_rig_has_surviving_ordinal_write(green,...)`=False, `_rig_binding_discharged`=True, driving S1's real `lower_rifle_rig_retarget`). All prior findings stay closed (foreign-stub, multiline/postfix splits, long-bracket fake tokens, single-line). Subset `-k "contract or verifier or corpus or rifle or rig"` 518 passed / 1 xfailed; no-Any gate clean. Generic, no hardcoded game strings.
+
+## IMPLEMENT-stage decisions — slice 1.2 (S1b binding-present verifier)
+
+- D-S1b-r4 [Bug] — `_rig_method_body_end` (contract_verifier.py) method-span detection counted every `then` as a
+  fresh block opener but only `end`/`until` as closers, so an `if ... elseif ... elseif ... end` chain (multiple
+  `then`, ONE `end`) over-counted openers and the span walked PAST a foreign `_resolve<suffix>` stub's closing `end`
+  into later unrelated code — sweeping a later decoy helper carrying `:GetAttribute("_MainCameraRig")` +
+  `FindFirstChild("<child>", true)` into the "method body", so `_rig_resolver_body_is_rig_lookup` returned True and a
+  foreign stub false-discharged (REOPENED the round-1 foreign-stub closure). FIX: mirror S1's proven
+  `_structural_balance_ok` block-keyword set — `elseif` is a CLOSER that cancels its own upcoming `then`'s increment
+  (net 0 for the chain); `else` follows no `then` (pure +0, not a token). Audited the full block set: `function`/`do`/
+  `then`/`repeat` open; `end`/`until`/`elseif` close; `repeat`→`until` balanced. RED proof against bb288b6:
+  foreign elseif-stub + decoy false-discharged True; post-fix False. Corpus happy-path (real resolver body with
+  `if`/`for` + `for ... do ... end`) STILL discharges True. 35 tests green (5 new r4 cases), no-Any pass.
+
+## IMPLEMENT-stage decisions — slice 1.3 (S2 fixture regen) — REDESIGN
+
+- **D-S2-REDESIGN [BLOCKING — reality diverges from the design's fixture ground-truth].** S2 cannot reach
+  acceptance (f)+(g) against the REAL pipeline. Validated empirically (warm cache from main `.cache/llm`, TTL
+  refreshed into `/tmp/warm_cache_refreshed`; `CONTRACT_CORPUS_PROJECTS_ROOT`=main test_projects; S1+S1b code in
+  worktree). The `_FIELDS += "rig_binding"` edit landed and IS correct (the carrier now flows into capture). On the
+  real run:
+  - The resolver fact IS produced — `Player.rig_binding = {field:"weaponSlot", child:"WeaponSlot", present:False}`,
+    `child_ref_resolution = {1,1}` (resolver flipped it from the C# `weaponSlot = cam.GetChild(0)`, deterministic,
+    pre-transpile). Good.
+  - BUT the LOWERING ABSTAINS (`present=False`) and `_rig_binding_discharged`=False → `rig_binding_present/Player`
+    fires as a real (warning) violation → `regen_contract_corpus.py` REFUSES to write (correct fail-closed behavior).
+  - ROOT CAUSE: the design's §30 "Fixture ground truth" (the AI-emitted `self.weaponSlot = self.cam and
+    self.cam:GetChildren()[1]` camera-child write in Awake + 4 reads in GetRifle at :279/:282) is a STALE cache
+    snapshot (entry `2d27aaf6`, 9.6 days old). The LIVE cache key the current Player.cs + frozen prompt resolves to
+    is `28d60ee6` (0.6 days old, deterministically consulted+hit — verified by instrumenting `_load_cache`), whose
+    AI output is a DIFFERENT shape: `self.weaponSlot = self.gameObject` (the AI already collapsed the Camera.main
+    ordinal to a GameObject fallback, leaving only a `-- weaponSlot was cam.GetChild(0)` COMMENT and a single read
+    `local slot = self.weaponSlot or self.gameObject`). There is ZERO camera-child ordinal in the live AI output
+    code (the only `GetChild` token is inside a comment).
+  - The lowering+verifier are keyed on the camera-child AI-output SHAPE (`_neutralize_assignment` anchors a
+    `:GetChild(n)`/`:GetChildren()[n]`/`self.cam`-rooted RHS; the whole S1b discharge scan, hardened across rounds
+    r2-r4, anchors the same). On the live `self.gameObject` shape there is nothing to anchor → correct abstain →
+    fail-closed. This is the EXACT memory-documented fragility: *generic binding on non-deterministic AI-output
+    fingerprints abstains silently/loudly on a valid-but-different AI shape* (5 distinct cached Player transpiles
+    exist: `:GetChildren()[1]`, `FindFirstChildWhichIsA("BasePart") or gameObject`, `= gameObject`,
+    `= camChildren[1]`, multi-step `child`). The mechanism (resolver fact keyed on deterministic upstream C#) is
+    sound, but the lowering's discharge target is keyed on the AI output, which has drifted.
+  - WHY NOT just re-transpile Player.cs fresh: the `apikey`/`apikey_run` files are the ROBLOX Open Cloud key (upload),
+    NOT an Anthropic key; the regen tool runs cache-only by design (no Anthropic key passed). A fresh transpile would
+    (a) need an Anthropic key the harness lacks and (b) re-emit a NON-deterministic shape (could be any of the 5),
+    so it can't be relied on to produce the camera-child shape the lowering expects.
+  - DECISION OWED (phase design / S1): either (i) extend the lowering to ALSO discharge the `self.weaponSlot =
+    self.gameObject` degraded shape (anchor on the deterministic rig FACT + the `self.<field> = self.gameObject`
+    fallback write that the resolver fact says was a Camera.main ordinal, retargeting it to the rig regardless of the
+    AI's chosen fallback) — i.e. make the lowering's anchor the DETERMINISTIC FACT, not the AI ordinal shape; OR
+    (ii) re-baseline the design's fixture ground-truth + lowering anchor onto the live `28d60ee6` shape; OR (iii)
+    pin the corpus to a specific cached transpile (freeze entry `2d27aaf6` as the canonical SimpleFPS Player snapshot
+    and gate the cache so the live key resolves to it). (i) is the generic, durable fix (anchor on the upstream
+    signal, per the memory kernel); it is S1-scope, so S2 is blocked behind an S1 revision.
+  - The `_FIELDS += "rig_binding"` edit is RETAINED (correct, load-bearing, independent of the above). NOT committing
+    a fixture (would be a fabricated/non-real snapshot or a fail-closed-violating one).
+
+## DESIGN-stage decisions — Phase 1 Path A re-anchor (resolves D-S2-REDESIGN)
+
+These adopt option (i) from D-S2-REDESIGN — anchor the lowering's discharge on the deterministic fact, not the
+AI write shape. Dual-voice design-reviewed 3 rounds (`claude-design-review-s2-r2.md`/`-r3.md`,
+`codex-design-review-s2-r2.verdict.md`/`-r3.verdict.md`, proposal `design-s2-reanchor-proposal.md`) + user-approved
+2026-06-13 (D-P1-PATHA.review). Supersede the relevant clauses of D-P1-b / D-P1-c-v2.coupling / D-P1-d(3),(5).
+
+- **D-P1-PATHA.reanchor [Classification: User-Challenge → resolved] — RE-ANCHOR the rig retarget on the deterministic
+  fact via the consumer-side READ reroute; discharge := no raw `self.<field>` dot-form READ survives.** The write-shape
+  lowering anchored NEUTRALIZE + DISCHARGE on matching the camera-child ordinal WRITE in the AI output, but the real
+  pipeline emits 5+ distinct write shapes for this one field (`:GetChildren()[1]`, `self.gameObject`,
+  `__unityChild(self.cam,1)`, a multi-step `local children; children[1]`, a `FindFirstChild` fallback) — so it ABSTAINS
+  on real output and the rifle is never rebound (the exact `D-S2-REDESIGN` blocker). FIX: make the LOAD-BEARING contract
+  the fact-anchored consumer-READ reroute — inject the per-instance resolver (unchanged emit) and reroute every consumer
+  READ of `self.<field>` (dot-form) → `self:_resolve<Child>()`, EXCEPT in non-yielding lifecycle methods (`Awake`/`Start`)
+  where abstain. DISCHARGE := own-resolver present + ≥1 call + NO raw `self.<field>` dot-form read survives (outside
+  Awake/Start). RATIONALE: the READ access keys on the AI-STABLE member name (the AI preserves class-member identity
+  across all 5 shapes — empirically verified) where the old anchor keyed on the AI-VOLATILE value expression; this is the
+  memory kernel (anchor on the deterministic upstream signal, not an AI-output fingerprint). RHS-agnostic → fires on all
+  5 shapes. Empirically: on the real fixverify shape-3 output the read reroute discharges `present=True` (the old
+  write-anchored lowering returned modified=0/present=False).
+
+- **D-P1-PATHA.boundary [Taste — the generality mechanism, both voices required] — the verifier MUST FAIL CLOSED on the
+  forms the read-reroute cannot safely rewrite.** Path A's `self.<field>` dot-form scope is honest for the current OO
+  generic emitter ONLY if every unsupported form is loud, never silently wrong / fail-open. The verifier emits its OWN
+  violation row (never a blanket exempt, never silent) on: a raw field read in a NON-yielding lifecycle method
+  (`Awake`/`Start`) that would cache stale derived state; any NON-`self` receiver form (module-table `<Class>.<field>`,
+  `owner.<field>`, receiver-alias `local p = self; p.<field>`); any bracket-index `self["<field>"]`; and a shadowed-`self`
+  read (the verifier MIRRORS the lowering's shadow guard). This closes the codex fail-OPEN holes (`local p = self;
+  foo(p.weaponSlot)` and `self["weaponSlot"]` rewrote 0 / verifier missed them) and the Claude/codex silent-lifecycle-miss.
+  It is what makes Path A honestly GENERAL (proven fact-driven on `Hero`/`torchMount`/`TorchAnchor`) rather than
+  SimpleFPS-only. Module-table `<Class>.<field>` is DEAD-LEGACY (the current `_GENERIC_RUNTIME_PROMPT` mandates OO
+  `self.<field>`; the shape-4 artifact is 2026-05-02 pre-generic) — scoping it out loses nothing the current converter
+  emits; a future module-table mode would fail closed, a logged boundary. Scope stays `Camera.main`-rooted child refs
+  only (serialized Transform refs / non-main cameras / dynamic `GetChild(i)` / `Find()`-paths → out of scope, followups).
+  The aliased-read residual (a fully-aliased read with no surviving dot-form discharges True while the alias holds the
+  stale value) is a LOGGED followup, not a blocker — the real `GetRifle` does not alias.
+
+- **D-P1-PATHA.cam_receiver [Mechanical — demotion] — `cam_receiver` / the camera-child-RHS shape-matching is DEMOTED to
+  an optional Tier-2 refinement, NEVER required for success.** It is used ONLY to opportunistically pick the init-write to
+  clean in Tier-2 hygiene; its absence (the AI collapsed the RHS) is NOT a failure. The rounds-5–7 cam_receiver hardening
+  is no longer load-bearing and most of it is removed from S1. (The S1b ordinal-write scan likewise demotes to a best-effort
+  SECONDARY DIAGNOSTIC; the S1b read-scan hardening — code-projection, long-bracket exclusion, block-balance, resolver-body
+  verification — STAYS load-bearing.)
+
+- **D-P1-PATHA.tier2 [Mechanical] — Tier-2 init-write neutralize = SKIP-on-ambiguity, decoupled from discharge.**
+  Neutralize the init-write to `nil` ONLY when a unique dominating lifecycle init-write is deterministically provable; on
+  ambiguity SKIP (do not neutralize, do not fail). HARMLESS because Tier-1 (the read reroute) leaves no raw read surviving,
+  so the field's written value is never read — a leftover write is dead data (cosmetic AI-slop, one-line log). This
+  resolves OPEN Q3 toward SKIP (both voices: codex preferred SKIP given a semantic Tier-1; Claude's "fail/count on
+  ambiguity" concern is moot once the non-yielding-lifecycle read is itself a fail-closed boundary row — D-P1-PATHA.boundary
+  — so the abstained read can never silently see the stale write). Discharge is fully decoupled from neutralize, so the
+  BLOCKING #3 desync (D-P1-c-v2.coupling) is UNREACHABLE: discharge never touches the AI write shape or `resolved_total`.
+
+- **D-P1-PATHA.review [Process] — dual-voice design-reviewed 3 rounds + user-approved 2026-06-13.** Path A was reviewed
+  against Path B (B1 pre-rewrite token, B2 AI-instruction): B1 stays codex-vetoed (`codex-tokenvet-verdict.md` — relocates
+  AI-trust fragility to C#, no precedent for preserving a synthetic host call); B2 rejected (the AI already proves it
+  won't emit a deterministic binding — 5 cached shapes for one field — and the S1b verifier, shaped to the lowering's
+  resolver-method emit, would fail-closed FALSE-NEGATIVE on a correct-but-natural AI binding, so B2 has no coherent
+  backstop and pushes the correctness contract into non-deterministic AI output for every game). Both voices NET-recommend
+  Path A as the only path that BOTH deterministically resolves the real current SimpleFPS output AND generalizes
+  fact-drivenly. Slice impact: S1 SIMPLIFIED (read reroute load-bearing; neutralize Tier-2; cam_receiver optional), S1b
+  RE-ANCHORED (discharge=no-raw-read + the fail-closed boundary; read-scan hardening stays), S2 now FIRES on the real
+  shape (`present=True` RHS-agnostically), S3 e2e asserts the rifle seats on the rig slot on a REAL fresh conversion.
+
+## S1 PATH-A re-anchor IMPLEMENTATION — slice rifle-dropped-ref/1.1 (2026-06-13)
+
+- **D-S1-PATHA [Mechanical] — discharge DECOUPLED from neutralize; neutralize Tier-2 SKIP; cam_receiver
+  demoted.** Modified the converged epoch-1 S1 (at `314ba85`) in place per design-phase1.md §1.2/§5 (Path A).
+  - **CHANGE 1 — discharge re-anchored on the READ reroute.** `_binding_discharged(source, field, child,
+    suffix)` (dropped the `anchor` param) is now `(1a)` own resolver method present + `(1b)` >=1
+    `self:_resolve<suffix>(` call + `(1c)` NO raw `self.<field>` dot-form READ survives (outside Awake/Start).
+    The two neutralize conditions `(2a)`/`(2b)` (own neutralize marker present + no surviving camera-child
+    ordinal write) were REMOVED from the gate. So the 5 real AI write shapes (`:GetChildren()[1]`,
+    `self.gameObject`, `__unityChild(...)`, multi-step local, `FindFirstChild` fallback) all discharge
+    `present=True` via the read reroute — fixing the D-S2-REDESIGN abstain. PROVEN RED-vs-epoch-1: epoch-1
+    (`314ba85`) returns `modified=0`/`present=False` on the live `self.weaponSlot = self.gameObject` shape;
+    Path A returns `present=True` (empirically verified by loading the old module against the new test).
+  - **CHANGE 2 — neutralize demoted to Tier-2 best-effort, SKIP-on-ambiguity, decoupled.**
+    `_neutralize_assignment(source, field, suffix, cam_symbols)` neutralizes ONLY an unambiguous whole-RHS
+    camera-child ordinal access (canonical camera literal or a recorded `cam` symbol form); on any other shape
+    SKIP (no-op, never a failure, never affects `present`). The final `_luau_syntax_ok` gate still backstops a
+    corrupting neutralize. The whole-RHS / same-`and`-guard checks stay (keep it from clobbering a mixed
+    expression); the round-5–7 symbol-binding DOMINANCE proof was dropped (no longer load-bearing — a
+    mis-neutralize can't false-discharge now).
+  - **CHANGE 3 — cam_receiver / camera-RHS shape-matching demoted to optional.** `RigRootedRetargetFact.cam_receiver`
+    is KEPT on the fact (still produced by the resolver) but is now consumed ONLY by the Tier-2 neutralize to
+    opportunistically pick the write to clean.
+  - **REMOVED code (no longer load-bearing):** `_CamAnchor` dataclass; `_camera_anchor` (replaced by the
+    simpler `_camera_symbol_forms`); `_luau_symbol_is_camera` + `_binding_reaches_use` (the round-5 symbol
+    camera-proof / dominance machinery); `_has_neutralized_write` + `_has_camera_child_write` (used only by the
+    dropped discharge conditions 2a/2b); the `anchor` plumbing through the main loop and `_binding_discharged`.
+    `_rhs_is_camera_child` simplified to take `cam_symbols: frozenset[str]` and drop the dominance proof.
+    Confirmed zero external references to every removed symbol.
+  - **Tests (`test_rifle_rig_retarget.py`):** ADDED `test_b_pathA_self_gameobject_shape_discharges_present_true`
+    (the epoch-1-abstain case, RED-vs-epoch-1) + `test_b_neutralize_skipped_ambiguous_but_reads_rerouted_discharges`
+    + `test_r5_discharge_is_rhs_agnostic_across_write_shapes` (replaced the 5 deleted dominance tests).
+    REWROTE the coupled tests to the new contract: `test_h3_decoupling_present_always_equals_independent_scan`
+    (was `test_h3_desync_coupling_..._stamps_false`), `test_p1_single_line_if_neutralize_skips_whole_rhs_guard_still_discharges`,
+    `test_r3_fallback_validates_if_then_end_block_balance` tail. REMOVED the 5 epoch-1 r5 tests that asserted
+    discharge REQUIRES the ordinal-write neutralize (`test_r5_neutralize_anchored_on_camera_receiver_not_field_ordinal`,
+    `_camera_symbol_rebound_to_non_camera_in_luau_abstains`, `_mixed_disjunction_rhs_is_not_neutralized`,
+    `_camera_symbol_as_param_or_loopvar_abstains`, `_camera_binding_in_closed_or_dead_scope_does_not_dominate`).
+    KEPT the idempotency twice-call + yield-guard + shadowed-self + structural-balance + resolver-admission tests.
+  - **VERIFY:** `tests/test_rifle_rig_retarget.py` 68 passed / 1 xfailed; `-k "resolver or corpus or rifle or
+    child_ref"` 184 passed / 1 xfailed; full `-m "not slow"` 3046 passed / 45 skipped / 6 xfailed; no-Any gate
+    pass. (S1b verifier `test_rig_binding_present.py` lives in the 1.2 worktree, not this slice.)
+
+## S1 PATH-A review round 1 fix — slice rifle-dropped-ref/1.1 (2026-06-13)
+- D-S1-PATHA-r1 [Mechanical] — Tier-2 SKIP-on-ambiguity: `_neutralize_assignment` now collects ALL code-position `self.<field> = ` writes and neutralizes ONLY when there is EXACTLY ONE (the unique dominating init-write is provable) AND it is the unambiguous camera-child shape; >1 same-field write → SKIP (neutralize nothing, never clobber a later legit write). Discharge UNAFFECTED (decoupled — read-reroute keys `present`), so SKIP does not change `present=True`. Single-unique-write happy path still neutralizes. New test `test_h3_neutralize_skips_on_ambiguity_two_same_field_writes` (RED vs fe6e5a0: pre-fix neutralized the camera write) + `test_h3_single_unique_camera_write_still_neutralizes`; replaced the old `test_h3_neutralize_fact_anchored_skips_unrelated_config` (encoded the pre-fix neutralize-first bug). Verify: test_rifle_rig_retarget.py 69 passed/1 xfailed; resolver|corpus|rifle|child_ref subset 185 passed/1 xfailed; no-Any pass.
+
+## S1b PATH-A re-anchor — slice rifle-dropped-ref/1.2 (2026-06-13)
+- **D-S1b-PATHA [Mechanical] — discharge re-anchored to NO-RAW-CONSUMPTION (drop the surviving-WRITE gate) + ADD the fail-closed boundary.** `_rig_binding_discharged(source, field, child)` was (1a) own rig-resolver body present + (1b) >=1 `self:_resolve<suffix>(` call + (1c) no surviving bare dot-form `self.<field>` READ (lifecycle/shadowed EXEMPTED) AND (2) no surviving `self.<field> = <...GetChild(n)|GetChildren()[n]...>` ordinal WRITE. **Path A drops clause (2) from the gate** — a surviving init-WRITE no longer fails discharge (it is dead data once reads are rerouted), so all 5 real AI write shapes (`:GetChildren()[1]`, `self.gameObject`, `__unityChild(...)`, multi-step local, `FindFirstChild` fallback) discharge `present=True` via the read reroute (fixes the D-S2-REDESIGN abstain). `_rig_has_surviving_ordinal_write` + its round-1/2/3 hardening (code-projection, postfix-continuation, whitespace/comment tolerance) is KEPT as a best-effort SECONDARY DIAGNOSTIC scan only (no longer a PASS/FAIL gate).
+- **What CHANGED vs the surviving-write gate:** clause (1c)+(boundary) merged into a single load-bearing gate `_rig_has_surviving_field_consumption(source, field)` (replaces `_rig_has_surviving_field_read`). It now FAILS CLOSED on every form the dot-form read-reroute cannot safely rewrite — turning the would-be fail-OPEN holes into loud rows: (i) NON-`self` receiver read `<Class>.<field>` / `owner.<field>` / receiver-alias `p.<field>` (`_rig_nonself_read_re`, recv != "self"); (ii) bracket-index `self["<field>"]` (`_rig_bracket_read_re`); (iii) a raw `self.<field>` READ in a NON-yielding lifecycle method (`Awake`/`Start`) — the verifier does NOT inherit the lowering's lifecycle exemption (Path A: the init-write is only Tier-2-best-effort-neutralized, so a lifecycle read can cache stale state); (iv) a shadowed-`self` read — still textually `self.<field>`, so the dot-read scan (a) catches it (fails closed) without a separate shadow walk.
+- **KEPT (reused unchanged):** the INDEPENDENCE discipline (scan `script.source`, anchored on deterministic `field`/`child`; `present` cross-check; stamp/scan disagreement fails; `rig_binding=None` abstains), the code-projection (`_rig_code_projection`), long-bracket exclusion, block-balance method-span (`_rig_method_body_end` with the round-4 elseif fix), resolver-body verification (`_rig_resolver_body_is_rig_lookup`), `FAIL_CLOSED_CHECKS` membership, strict no-`Any`, generic (no `weaponSlot`/`WeaponSlot` hardcode — keyed on the carrier's `field`/`child`).
+- **Tests (`test_rig_binding_present.py`):** the 9 round-1/2/3 surviving-ordinal-WRITE tests REWRITTEN to the Path A contract — the write scan still DETECTS (`_rig_has_surviving_ordinal_write` is True, secondary diagnostic kept) but discharge is now True (dead write does not block). ADDED: `test_pathA_discharges_on_all_five_real_write_shapes` (parametrized × 5), `test_pathA_tier2_skipped_write_but_reads_rerouted_discharges_true`, the 4 boundary RED tests `test_e_boundary_{i_nonself_receiver_owner,i_receiver_alias,i_module_table,ii_bracket_index,iii_lifecycle_read,iv_shadowed_self_read}_fails_closed`, the generic `test_g_generic_different_game_torchmount_discharges_green`, and the narrator-INDEPENDENT pre-fix-RED proof `test_e_boundary_pre_fix_red_proof_against_real_5da0eab_blob` (loads the actual 5da0eab `contract_verifier.py` blob from git; non-self/bracket/lifecycle false-PASS there, fail closed under Path A). Shadowed-self proven a REGRESSION GUARD (`test_e_boundary_iv_shadowed_is_regression_guard_red_both_ways` — failed closed already at 5da0eab as a textual `self.<field>` dot read), NOT a newly-caught false-pass.
+- **VERIFY:** `tests/test_rig_binding_present.py` 50 passed; `-k "contract or verifier or corpus or rifle or rig"` 537 passed / 1 xfailed (pre-existing S1 residual); full `-m "not slow"` 3097 passed / 45 skipped / 6 xfailed; no-Any gate clean.
+
+## S1b PATH-A review round 1 fix — slice rifle-dropped-ref/1.2 (2026-06-13)
+- **D-S1b-PATHA-r1 [Mechanical] — receiver-AGNOSTIC surviving-field-access-read boundary REPLACES the receiver-shape blacklist.** Round-1 dual-voice BLOCKING: the boundary gate `_rig_has_surviving_field_consumption` was a BLACKLIST (`_rig_nonself_read_re` = single-token `<ident>.field`; `_rig_bracket_read_re` = bare `self["field"]`), so EXOTIC receivers EVADED it and false-passed an undischarged source (fail-OPEN): `(owner).field`, `getOwner().field`, `owners[1].field`, `other.self.field`, `(self)["field"]`, plus the whitespace/newline-dot `self .field` / `self.\nfield` and computed bracket keys. Replaced with ONE receiver-agnostic whitelist: discharge fails on ANY surviving code-position field-access READ of the `<field>` token — the token preceded (modulo whitespace/comments, via the code projection) by a `.` (dot member) OR appearing as a string key inside `[ "..." ]` / `[ '...' ]` OR a computed/concatenated key reconstructing the field (`_rig_has_computed_field_key`) — REGARDLESS of receiver, with exactly two known-good exceptions: (1) an assignment LHS (`_rig_pos_is_assignment_lhs` — a Tier-2-skipped WRITE may survive; discharge decoupled from neutralize) and (2) the injected resolver's own internals (`_<field>Cache` memo + any position inside the `_resolve<child-suffix>` method body, via `_rig_is_resolver_internal_access`). The RECEIVER is ignored entirely — closes the whole receiver-form class with no enumeration. New helpers: `_rig_field_token_re` (word-bounded `\b<field>\b`), `_rig_string_key_read_re`, `_rig_has_computed_field_key`, `_rig_pos_is_assignment_lhs`, `_rig_is_resolver_internal_access`. DROPPED: `_rig_nonself_read_re`, `_rig_bracket_read_re`. `_rig_has_surviving_field_consumption(source, field, child)` gained `child` (to key the resolver-body exception on the child-derived suffix the lowering emits).
+- **KEPT:** independence discipline, `_rig_code_projection` / `_rig_pos_is_real_code` / long-bracket / `_rig_method_body_end` block-balance, `_rig_resolver_body_is_rig_lookup`, the secondary-diagnostic `_rig_has_surviving_ordinal_write`, `FAIL_CLOSED_CHECKS`, strict no-`Any`, generic.
+- **Happy path preserved (verified end-to-end on the REAL lowering):** the corpus `self.weaponSlot` shape, all 5 RHS write shapes, the Tier-2-skipped write, and the generic `torchMount`/`TorchAnchor` case still discharge `present=True` (after the reroute there is NO surviving `.field` READ — only `_weaponSlotCache` + the `_resolve<suffix>` body + possibly a skipped write LHS). Write-LHS exception proven receiver-agnostic (`owner.weaponSlot = 5` and `self["weaponSlot"] = x` both still discharge True).
+- **Tests:** ADDED `test_pathA_r1_exotic_receiver_read_fails_closed` (parametrized × 8: the 5 exotic receivers + whitespace-dot + newline-dot + computed-bracket-key — each → discharge False + a loud row), the narrator-INDEPENDENT pre-fix-RED proof `test_pathA_r1_exotic_receivers_red_against_7b59488` (loads the ACTUAL 7b59488 blob from git; all 8 forms false-PASS there = discharged True, fail closed now), and the two write-LHS exception tests (`_nonself_write_lhs`, `_bracket_write_lhs`). KEPT all 50 prior tests.
+- **VERIFY:** `tests/test_rig_binding_present.py` 61 passed; `-k "contract or verifier or corpus or rifle or rig"` 548 passed / 1 xfailed (pre-existing S1 residual); no-Any gate clean. New sha `56691bb`.
+D-S1b-PATHA-r2: drop over-broad resolver-body-span access exemption; keep `_<field>Cache` only (decoy `_resolveWeaponSlot` body could hide a foreign `.<field>` read → fail-OPEN). RED-against-56691bb test added.
+- D-S1b-PATHA-r3: computed-key = exact constant-fold + LHS-exempt + no dynamic-key false-fail (`_rig_has_computed_field_key` flags a concatenated bracket key ONLY when string-literals-only fold to EXACTLY `<field>`, honors the assignment-LHS exception, and never flags a non-foldable dynamic key; exact-fold READ still fails closed).
+- D-S1b-PATHA-r4: full Luau string-literal DECODE for bracket keys + multi-assignment LHS.
+  - FIX 1 [BLOCKING] — bracket-key detection was RAW-TEXT-ONLY, so encoded string-literal keys that resolve to the field bypassed the fail-closed gate (fail-OPEN): `self[[weaponSlot]]` / `self[=[weaponSlot]=]` (long-bracket keys), `self["wea\x70onSlot"]` (hex), `self["wea\x70on".."Slot"]` (escape+concat) all DISCHARGED True at d51ae90 despite being surviving READs. Fix: new `_rig_decode_luau_string_key(expr) -> str | None` decodes the FINITE Luau string-literal grammar — short strings with full escape processing (`\xHH`, `\ddd`, `\u{...}`, `\n`/`\t`/… , `\z`, line continuations), long-bracket strings `[[…]]`/`[=[…]=]` (RAW, first-newline stripped), and `..` concatenations of these — then a UNIFIED `_rig_has_decoded_field_bracket_read` finds every code-position `[ … ]` access (`_rig_bracket_key_spans`/`_rig_find_bracket_close`, string/long-bracket/comment aware), decodes its key, and flags iff it equals `<field>` EXACTLY (write-LHS exempt). Subsumes + removes the old clean-literal matcher (`_rig_string_key_read_re`) AND the old computed-key folder (`_rig_constant_folds_to`/`_rig_has_computed_field_key`). A dynamic/non-static key decodes to None → never flagged (no false-fail).
+  - FIX 2 [MINOR] — write-LHS exception missed MULTI-ASSIGNMENT: `self.weaponSlot, other = …` / `self["weapon".."Slot"], other = …` have a `,` before the `=` → false-failed as READs. `_rig_pos_is_assignment_lhs` now also recognizes a multi-target list (`,`…bare-`=`, at bracket depth 0, not `==`) as an LHS WRITE.
+  - No regression: dot-form receiver-agnostic reads (8 exotic), literal `self["weaponSlot"]` read, decoy resolver body, `_<field>Cache` exemption, the 5 RHS write shapes + generic `torchMount`, resolver-body floor, independence/None-abstain — all intact (80 rig tests pass).
+  - Tests ADDED: `test_pathA_r4_encoded_key_read_fails_closed` (×4 encoded reads → fail closed), `_encoded_key_write_lhs_still_discharges`, `_unrelated_decoded_key_does_not_fail` (×2 — `someOther`, `preweaponSlotpost` substring), `_dynamic_bracket_key_does_not_false_fail`, `_multi_assignment_write_lhs_discharges` (×2 — dot + concat), and the narrator-INDEPENDENT `_encoded_reads_and_multi_writes_red_against_d51ae90` (loads the ACTUAL d51ae90 blob: encoded reads false-PASS there / fail closed now; multi-assignment writes false-FAIL there / discharge True now — both directions).
+  - VERIFY: `tests/test_rig_binding_present.py` 80 passed; `-k "contract or verifier or corpus or rifle or rig"` 567 passed / 1 xfailed (pre-existing S1 residual); no-Any gate clean.
+
+## S2 PATH-A fixture regen — slice rifle-dropped-ref/1.3 (2026-06-13) — DONE (resolves D-S2-REDESIGN)
+- **D-S2-PATHA [Mechanical] — the regen now FIRES on the real shape; Player `rig_binding present=True` captured.** Re-ran `tools/regen_contract_corpus.py SimpleFPS` on the REAL Path A pipeline (S1 read-reroute + S1b no-raw-read discharge, rebased into the 1.3 worktree at `68f944b`; the `_FIELDS += rig_binding` edit was already in place). Cache approach: copied the main checkout's `.cache/llm` to `/tmp/warm_cache_s2_pathA/llm` and TTL-refreshed every entry's `cached_at` to now (231 entries) so the live Player key deterministically hits `28d60ee6` (the `self.weaponSlot = self.gameObject` degraded shape — the exact D-S2-REDESIGN blocker). `CONTRACT_CORPUS_PROJECTS_ROOT`=main `test_projects/SimpleFPS`. (A handful of un-warmed water/explosion effect scripts re-transpiled live via the local `claude` CLI — not gameplay-load-bearing; Player hit the cache.)
+- **The Path A read-reroute DISCHARGED on the real `self.gameObject` shape** — exactly the abstain that D-S2-REDESIGN reported under the old write-anchored lowering. Captured Player: the consumer read `local slot = self.weaponSlot or self.gameObject` became `local slot = self:_resolveWeaponSlot() or self.gameObject`; the injected `function Player:_resolveWeaponSlot()` carries the `_MainCameraRig` scan + `_weaponSlotCache` memo; the init-write `self.weaponSlot = self.gameObject` survives as dead Tier-2 data (discharge keys on no-surviving-READ, RHS-agnostic). This is the proof the lowering anchored on the AI-STABLE member access, not the AI-VOLATILE write shape.
+- **Captured fixture (`tests/fixtures/contract_corpus/SimpleFPS/fixture.json`, 41 scripts):** Player `child_ref_resolution={getchild_total:1,resolved_total:1}` + `rig_binding={field:"weaponSlot",child:"WeaponSlot",present:True}`; Turret UNCHANGED `{3,3}` + `rig_binding=None` (no rig fact → abstains). `expected_counts={consumer_compliance:1}` (info-only). Independently re-verified the verdict: **0 warning violations**, no `rig_binding_present` row (the `FAIL_CLOSED_CHECKS` flip exercised + discharged green), no `child_ordinal_coverage_gap` row (check D no row, resolved). The fixture is a REAL pipeline capture, not hand-edited.
+- **VERIFY:** `tests/test_contract_corpus.py` 9 passed; `-k "corpus or contract or verifier or rifle or rig"` 567 passed / 1 xfailed (pre-existing S1 residual); `check_no_any.sh` pass. Committed to the slice branch as `c0c458e` (fixture only; `_FIELDS`/regen tool/`test_contract_corpus.py` needed no change).
+
+## S2 PATH-A round-1 review fixes — slice rifle-dropped-ref/1.3 (2026-06-13) — DONE (2 MAJOR)
+- **D-S2-PATHA-r1 [Mechanical] — committed fixture is now a Player-ONLY diff vs the pre-S2 baseline (d129b6a).** FINDING 1 (MAJOR claude): the prior c0c458e regen captured the WHOLE corpus fresh — 31 non-Player scripts' `source` drifted (non-deterministic transpile on un-warmed effect-script cache entries), shifting `coverage.getcomponent_sites` 23→20. FIX (option b): reconstructed the fixture as the d129b6a baseline with ONLY the Player entry updated to its REAL Path-A capture (source with the `self:_resolveWeaponSlot()` reroute + injected `function Player:_resolveWeaponSlot()` resolver + `_MainCameraRig` scan/`_weaponSlotCache` memo; `child_ref_resolution={1,1}`; `rig_binding={field:weaponSlot,child:WeaponSlot,present:true}`), `rig_binding=null` added to all other scripts (the intended new `_FIELDS` field, not drift). `expected_counts` + `coverage` were RE-DERIVED through the real `verify_contract` + `regen._coverage` (not hand-edited). Result: `getcomponent_sites=22` (the Player-only 2→1 delta from baseline 23, NOT the noisy 20), `expected_counts={consumer_compliance:1}` (the `child_ordinal_coverage_gap` legitimately drops because Player resolved {1,1}). `git diff d129b6a` now shows source/child_ref_resolution/non-null-rig_binding changes on Player ONLY; Turret unchanged `{3,3}`/null.
+- **D-S2-PATHA-r1.vacuity [Mechanical] — corpus anti-vacuity gate now asserts the `rig_binding_present` exercise.** FINDING 2 (MAJOR codex): `test_contract_corpus.py` proved A/B/C coverage but never asserted a non-None `rig_binding`, so a future regen dropping the carrier would let `rig_binding_present` abstain green (vacuous). FIX: added `test_corpus_exercises_rig_binding_present_check` — asserts ≥1 corpus script carries `rig_binding present=True` AND (discharge-is-real) that its captured source contains the injected `function <Class>:_resolve<Child>(` resolver method + a rerouted `self:_resolve<Child>()` consumer read. Generic: derives the method/child names from the carrier itself (no weaponSlot/WeaponSlot hardcode). PROVEN to FAIL when the Player carrier is nulled (tier-1: "unexercised") and when the carrier is present but the resolver is stripped from source (tier-2: "carrier-present-but-undischarged"); restored fixture green.
+- **VERIFY:** `tests/test_contract_corpus.py` 10 passed; `-k "corpus or contract or verifier or rifle or rig"` 568 passed / 1 xfailed (pre-existing S1 residual); `check_no_any.sh` pass. No game-specific hardcode in the regen tool (untouched). Committed to the slice branch (fixture + test only).
+
+## S3 NET/E2E review fixes — slice rifle-dropped-ref/1.4 (2026-06-13) — DONE (2 BLOCKING + 2 MAJOR + 1 MINOR)
+- **D-S3-r1.race [Mechanical] — the race witness now drives the REAL REWRITTEN CONSUMER, not the resolver in isolation.** P1 BLOCKING (both voices): the harness extracted only `Player:_resolveWeaponSlot()` and called it directly, so a regression that failed to reroute `GetRifle`'s `self.<field>` reads to `self:_resolveWeaponSlot()` still passed. FIX: `_lowered_resolver_and_consumer()` extracts BOTH the emitted resolver AND the REWRITTEN `GetRifle` (verbatim from the live lowering) and the luau harness now seats the rifle THROUGH the consumer's own rerouted reads (real `self.host.instantiatePrefab`/`pivotOf`/`PivotTo` stubs). Non-tautology PROVEN by `test_race_non_rerouted_consumer_fails_the_harness` (a hand-built raw-`self.weaponSlot` consumer reads nil → rifle never seats → returncode!=0).
+- **D-S3-r2.loud [Mechanical] — boundary "fails-loud" now asserts the REAL pipeline surface (`ctx.errors` + `success`), not a recomputed value.** P1 BLOCKING (both voices): `_run_pipeline_gate` recomputed `fail_closed_errors(verify_contract(...))` out-of-band, so a hook that stopped promoting rows to `ctx.errors` still passed. FIX: the gate now returns `PipelineGate{errors, success, rows}` read OFF `pipeline.ctx.errors` (filtered by `CONTRACT_ERROR_PREFIX`) and `success = len(pipeline.ctx.errors)==0` (pipeline.py:4340) — the real promotion the hook performs. Applied to BOTH boundary tests. PROVEN non-tautological by a mutation: monkeypatching the hook to skip the `ctx.errors.extend(promotable)` promotion makes both boundary tests FAIL.
+- **D-S3-r3.field [Mechanical] — `field` is now exercised parametrically (was hardcoded `weaponSlot`).** P1 MAJOR (codex): only `child` was behaviorally exercised; a field-name-hardcoding regression passed. FIX: a generic `gunSlot`/`GunMount` pair (distinct from SimpleFPS names) runs the SAME producer→lowering→verifier chain in `test_boundary_generic_field_factored_out_fails_closed_end_to_end` (RED, promoted error must contain THIS field+child) and `test_boundary_generic_discharged_binding_keys_on_field` (GREEN), plus the generic race variant. A field hardcode anywhere breaks one of the two (false RED or false PASS).
+- **D-S3-r4.producer [Mechanical] — the real resolver chain is now exercised in the fast path (was hand-fabricated facts).** P1 MAJOR (codex): all fast helpers fabricated `RigRootedRetargetFact`/`ChildRefScript` directly. FIX: `_resolve_real_rig_fact()` drives the real `build_child_ref_map` → `_resolve_script` → `_resolve_rig_facts` over a real `.cs` file + parsed `PrefabLibrary`/`GuidIndex` (MainCamera-tagged node), and the two generic boundary tests lower using the RESOLVER-produced `ChildRefScript` (not a hand-built fact). The race/single-shape boundary helpers keep hand-built facts (acceptable — the producer END is now covered by the generic tests).
+- **D-S3-r5.typing [Mechanical] — strict-typing gaps closed.** P1 MINOR: parameterized `subprocess.CompletedProcess[str]`; replaced the implicit-Any `_load_fixture_player() -> tuple[dict, dict]` with a `_PlayerFixture` TypedDict; the pipeline gate returns a `PipelineGate` TypedDict. `tools/check_no_any.sh` green.
+- **VERIFY:** `tests/test_rifle_rig_retarget_e2e.py` 13 passed / 1 slow-skip; chain `test_rifle_rig_retarget.py`+`test_rig_binding_present.py`+`test_contract_corpus.py` 159 passed / 1 xfailed; full fast suite 3141 passed / 45 skipped / 6 xfailed; `check_no_any.sh` pass. Committed to the slice branch (owned file only).
+
+---
+
+## Slice 1.2 — PHASE-INTEGRATION P1 fix: check D false positive on discharged-rig dead init-write
+
+**Classification:** Bug fix (fail-closed FALSE POSITIVE in a ship gate) — net-positive, scoped to slice-owned files only.
+
+**The P1:** `_check_surviving_child_ordinal` (check D) fired `child_ordinal_survivor` on the dead positional init-write ordinal (`self.weaponSlot = self.cam:GetChildren()[1]`) that survives when Path A's Tier-2 neutralize SKIPS the single-line-if write shape (one of the 5 real AI shapes; blessed by `test_rifle_rig_retarget.py:766`). The binding is fully discharged via the READ reroute and `_check_rig_binding_present` is GREEN, but the rig fact bumped `resolved_total` to 1 against `getchild_total=1` -> 0 unresolved-site budget, so the surviving dead write (count 1) exceeded the budget and fired the warning -> a correctly-converted game blocked at the fail-closed ship gate. Confirmed on REAL lowered output via `$RUN_DIR/repro_checkD_falsepos.py`.
+
+**The fix (rig-aware exemption, precise):**
+- New count helper `_rig_discharged_ordinal_write_exempt_count(source, field)` counts surviving `self.<field> = <recv>:GetChildren()[n]` write-LHS ordinal SITES — restricted to the EXACT `GetChildren()[n]` adjacent shape check D counts (new `_RIG_GETCHILDREN_WRITE_TAIL_RE`; the `GetChild(n)` form that `_RIG_ORDINAL_WRITE_TAIL_RE` also tolerates is NOT counted by check D, so it is excluded here to never over-subtract). Reuses the proven `_rig_code_projection` / `_rig_statement_rhs_end` / `_rig_collapse_code_ws` machinery the discharge scan uses.
+- In `_check_surviving_child_ordinal`, AFTER computing `survivors`, when the script's `rig_binding` is PRESENT (stamp `present is True`) AND `_rig_binding_discharged(source, field, child)` is True, subtract the exempt write count. A READ survivor, a non-/un-discharged-binding script, a factored chain, or any survivor beyond the dead write is NOT exempt and STILL fires. The dead write is "resolved-but-left-behind" (the rig fact already bumped resolved_total), not "unresolved" — the exemption reflects that.
+- Gated on `_rig_binding_discharged` (the load-bearing independent authority), so it agrees with the discharge gate's own write-LHS-exempt logic.
+
+**Generic:** keys on the carrier's `field`/`child`, no `weaponSlot`/`WeaponSlot` literals as load-bearing logic. Strict typing (no Any; gate green).
+
+**Tests (`test_rig_binding_present.py`):** the row-only test at :423 never ran the full verifier interaction (the coverage gap codex flagged). Added:
+- `test_checkD_no_false_positive_on_discharged_rig_dead_write` — drives REAL `lower_rifle_rig_retarget` on the skipped-neutralize single-line-if shape with REAL {getchild_total:1, resolved_total:1}, runs FULL `verify_contract` + check D directly, asserts present=True, NO `rig_binding_present`, NO `child_ordinal_survivor`.
+- `test_checkD_pre_fix_red_proof` — rebuilds the d51ae90 pre-fix verifier from git, proves ITS check D FIRES on this exact input (not a tautology).
+- Three precision guards: READ survivor + no rig STILL fires; READ survivor beyond the exempt dead write WITH a discharged rig STILL fires (exemption subtracts exactly one); UNDISCHARGED rig gets NO exemption.
+
+**Verification:** targeted suites (test_rig_binding_present + test_rifle_rig_retarget + test_contract_corpus) green; full fast suite 3132 passed / 45 skipped / 6 xfailed; `tools/check_no_any.sh` pass. (`test_rifle_rig_retarget_e2e.py` named in the directive does not exist in this worktree — not a slice-1.2 file.)
+
+## Slice 1.2 — round-6 P1 fix (site-aligned rig exemption)
+
+**Classification:** BUGFIX (close fail-closed-gate bypass via structural refactor).
+
+The round-5 rig exemption subtracted a SEPARATELY-computed count
+(`_rig_discharged_ordinal_write_exempt_count` via `_RIG_GETCHILDREN_WRITE_TAIL_RE`)
+from check D's survivor count. That counter applied NEITHER check D's engine-global
+receiver filter NOR its receiver-shape constraint, and matched EVERY same-field
+`GetChildren()[n]` write — so it could subtract a number larger than check D actually
+counted, silently swallowing a SEPARATE real `child_ordinal_survivor` on the same
+script (both adversarial voices confirmed end-to-end at 3a4231a).
+
+**Fix (structural, NOT another divergent regex):** the exemption is now applied
+SITE-ALIGNED *inside* `_count_surviving_child_ordinals(source, exempt_field=...)`.
+During the SAME `_GETCHILDREN_INDEX_ANY_RE` walk, AFTER the identical
+`_luau_pos_is_code` + `_receiver_roots_at_engine_global` filters that COUNT a site,
+AT MOST ONE site whose match position lands inside a `self.<field> =` write-LHS RHS
+span (`_rig_field_write_rhs_spans`) is skipped. There is no separately-computed
+number to subtract, so `exempt ⊆ counted-survivors` holds structurally — a site can
+only be skipped if it would otherwise have been counted; the `exempted < 1` cap
+bounds it to the single dead init-write. Dead `_rig_discharged_ordinal_write_exempt_count`
++ `_RIG_GETCHILDREN_WRITE_TAIL_RE` removed. Gating (`present` stamp AND independent
+`_rig_binding_discharged`) unchanged. Round-5 diagnostic
+`_rig_has_surviving_ordinal_write` kept (still used by tests; not the gate).
+
+**Tests added (real helpers/lowering, RED against 3a4231a):** engine-global dead
+write + separate survivor still fires; bracket-indexed-receiver variant; second
+same-field write still fires (only one exempt); round-6 pre-fix RED proof loading
+the 3a4231a blob. Kept: original single-survivor false-positive guard stays GREEN.
+
+**Verify:** targeted + full fast suite green (3136 passed); no-Any gate pass;
+`repro_checkD_falsepos.py` still prints `cd=False` (false positive gone).
+
+## Slice 1.2 — round-7 P1 fix (statement-anchored rig exemption)
+
+**Classification:** BUGFIX (close two fail-closed-gate masking bypasses via a structural
+re-anchor of the exemption's site identity — last fix round before the hard cap).
+
+Round-7 (both voices) found the round-6 site-aligned exemption still identified the dead
+init-write site by FORWARD TEXT-MATCHING from a loose `self.<field> =` substring
+(`_rig_field_write_rhs_spans`), re-opening the masking class through two mechanisms:
+(a) the RHS span ended at a depth-0 NEWLINE but not a Luau `;`, so `self.weaponSlot = nil ;
+local stray = foo:GetChildren()[1]` swallowed the genuine survivor (Claude); (b) the
+`self.<field> =` match was a SUBSTRING, so `myself.weaponSlot = ...` / `other.self.weaponSlot
+= ...` were taken as the exempt write (codex). Same root: forward span from a loose LHS.
+
+**Fix (structural inversion — exact statement-level identity, no divergent text-matcher):**
+the exemption is now decided PER COUNTED SITE by parsing the single Luau statement that
+PHYSICALLY CONTAINS that site. `_rig_statement_bounds` scans the position-preserving
+`_rig_code_projection` outward from the site to its statement boundaries — backward to a
+depth-0 `;` / non-continuation newline / un-matched bracket / block-opener keyword
+(`then`/`do`/`else`/`repeat`), forward to a depth-0 `;` / non-continuation newline /
+block-closer keyword (`end`/`else`/`elseif`/`until`), bracket-depth tracked, over the
+string/comment-blanked projection. `_site_is_discharged_rig_dead_write` exempts ONLY if
+that statement (1) OPENS with the STANDALONE lvalue `self.<field>` then a REAL `=`
+(`_rig_exempt_lhs_re`: char-before-`self` not ident/`.` rejects `myself`/`a.self`; field
+`(?!\w)` rejects the `weaponSlot`/`weaponSlotBackup` prefix collision; `(?<![<>~=])=(?!=)`
+rejects `==`/`<=`/`>=`/`~=`), AND (2) the GetChildren site is the WHOLE RHS — receiver flush
+at the RHS start (only whitespace before) and only whitespace to statement end (only
+whitespace after). So an arbitrary RHS that merely CONTAINS a GetChildren after/within an
+operand (`= nil or foo:Get...[1]`, `= a[1] + b[2]`) is NOT the dead write and is counted.
+Removed the superseded `_rig_field_write_rhs_spans` + `_pos_in_any_span` (no divergent
+text-matcher left to rot). Gating (`present` stamp AND independent `_rig_binding_discharged`)
+and the `< 1` cap unchanged. **Ambiguous-site fallback:** any statement that fails either
+gate (incl. an un-parseable shape, e.g. a one-line no-separator `... end`-bounded multi-stmt
+or a paren-wrapped RHS) is NOT exempted — it is COUNTED (fail closed; a false-positive is
+safe, a silent mask is not). Every uncertain case biases toward counting.
+
+**Dual-voice on a NEW codex finding (re-review of corrected artifact) — CORRECT BY DESIGN,
+no fix:** codex flagged that a discharged field's exempt shape in an UNRELATED method
+(`Rifle:DebugRefresh(holder) self.weaponSlot = holder:GetChildren()[1] end`) is exempted.
+The design-focused second voice confirmed this is correct by design: `_rig_binding_discharged`
+guarantees NO raw `self.<field>` READ survives ANYWHERE, so every `self.<field> = ...` write
+is dead data whose value nothing observes (consumers read `self._<field>Cache` via the
+resolver). The design doc (design-phase1.md:194-197,427,436) explicitly treats a surviving
+init-write as "dead data — harmless" and multiple same-field writes as the SKIP-on-ambiguity
+case. Counting it would be a FALSE POSITIVE blocking a valid conversion; the `< 1` cap keeps
+a SECOND same-field write firing. Not a slice-1.2 regression; design is the authority.
+
+**Tests (`test_rig_binding_present.py`, real helpers/lowering):** `;`-separated survivor
+still fires; `myself.`/`other.self.` substring-LHS still fire; `weaponSlot` vs
+`weaponSlotBackup` word-boundary both directions; comparison `==`/`<=`/`>=`/`~=` not
+exempted; two dead writes → only one exempt; codex RHS-identity guards (leading operand
+`nil or ...` and multi-operand `a[1]+b[2]` both counted; bare dead-write shapes
+simple/method/`if-then`/multiline still exempt); round-7 pre-fix RED proof loading the
+de8e7f9 blob (proves it MASKED both bypasses). Kept GREEN: the real false-positive case +
+SimpleFPS corpus.
+
+**Verify:** targeted suites (rig_binding_present + rifle_rig_retarget + contract_corpus) 178
+passed; full fast suite 3147 passed / 45 skipped / 6 xfailed; no-Any gate pass;
+`repro_checkD_falsepos.py` prints `cd=False` (false positive gone).
+
+---
+
+## Slice 1.1 (S1) — REDESIGN r3 delta: carrier gains cam_receiver + cam_ordinal (amends bae88c5)
+
+**What:** Promoted the resolver fact's deterministic identity into the `rig_binding` carrier so
+slice 1.2's check-D dead-write exemption can anchor on the EXACT credited site (deterministic
+upstream, not an AI-output fingerprint).
+
+1. **`RigRootedRetargetFact.ordinal: int`** — new field on the dataclass
+   (`child_ref_resolver.py`), populated from the in-hand `int(m.group(3))` at the single rig-fact
+   construction site (the design's :838/:876/:900 refs are the matcher offsets; there is exactly
+   ONE `RigRootedRetargetFact(...)` construction). `cam_receiver` was already present.
+2. **Carrier `cam_receiver` + `cam_ordinal`** — stamped from the fact on EVERY rig-fact-bearing
+   carrier (discharged `present=True`, abstained `present=False`, and the invalid-ident
+   `present=False`). Deterministic projections, stamped regardless of discharge / write shape.
+3. **multi-fact carrier → FULL 5-key** (`rifle_rig_retarget_lowering.py`): the `len(rig_facts)>1`
+   abstain carrier now stamps `{field,child,cam_receiver,cam_ordinal}` from the FIRST fact +
+   `present:False`+`multi_fact:True`, so it round-trips the 5-key LOAD validator and fails LOUD on
+   the resume path (a 2-key carrier would have been dropped → silent abstain).
+4. **Threading** — the `TranspiledScript→RbxScript` copy (`pipeline.py:2906`) copies the whole
+   dict, so the new keys ride along (verified). SAVE/RESTORE carry the full dict. **LOAD widened**:
+   `_load_rig_binding_for_rehydration` now reads+validates ALL FIVE keys
+   (`field:str, child:str, present:bool, cam_receiver:str, cam_ordinal:int`, with the
+   `bool`-is-not-`int` guard on cam_ordinal); a row missing/malformed on ANY key → dropped to
+   `None` (verifier abstains, the safe default) — NEVER a partial carrier. The optional
+   `multi_fact` flag is preserved when present. Docstrings updated on `TranspiledScript.rig_binding`
+   and `RbxScript.rig_binding`.
+5. **Tests** — updated all existing carrier-equality assertions to the 5-key shape; added 8 r3
+   tests: fact carries ordinal (non-zero GetChild(1)); carrier stamps non-default
+   cam_receiver/cam_ordinal from the fact; keys are RHS-agnostic across 3 write shapes; LOAD
+   round-trips all 5 keys; a `present:False` 5-key (multi_fact) carrier survives rehydrate to fire
+   loud; the pre-fix 3-key partial row is dropped to None; malformed cam_ordinal (str/bool/None/
+   float) and non-str cam_receiver each drop the row.
+
+**Verify:** `test_rifle_rig_retarget.py` 77 passed / 1 xfailed; full fast suite 3055 passed /
+45 skipped / 6 xfailed; no-Any gate pass. The new keys thread through the pipeline-copy AND the
+widened LOAD validator (both proven by tests).
+
+**Scope note:** check D's exemption itself + `test_rig_binding_present.py` are slice 1.2's; this
+slice only PROVIDES the anchor. 1.2's tests stayed green (they do not yet read the new keys).
+
+---
+
+## Slice 1.2 (S1b) — REDESIGN r3 rework: positively-anchored check-D dead-write exemption
+
+**Goal:** rework check D's rig-aware exemption from the round-8 receiver-UNCONSTRAINED
+statement-anchored skip (codex found it over-exempts a same-field write through a DIFFERENT
+receiver and at a DIFFERENT ordinal) to a TIGHT POSITIVE match of the EXACT credited site,
+anchored on the carrier's deterministic `cam_receiver` + `cam_ordinal` (slice 1.1 now provides
+them). AMEND of the existing binding-present verifier + statement-anchored machinery — both KEPT.
+
+**Decisions:**
+1. **Exemption spec** — added `_RigDeadWriteExempt(field_name, cam_receiver, cam_ordinal)` (frozen
+   dataclass). `_count_surviving_child_ordinals(source, exempt: _RigDeadWriteExempt | None)` replaces
+   the bare `exempt_field: str | None`. The per-site decision passes the matched receiver
+   (`m.group(1)`) + ordinal (`int(m.group(2)`) into the predicate — no re-parse.
+2. **`_site_is_discharged_rig_dead_write`** gains `site_receiver`, `site_ordinal`, `cam_receiver`,
+   `cam_ordinal`. The r7 statement identity (whole-RHS `self.<field> = <site>`) is RETAINED and
+   ANDed with two NEW anchors: (receiver) `site_receiver.strip() == f"self.{cam_receiver}"` — the
+   dot-form member ONLY, never a bare local; (ordinal) `site_ordinal == cam_ordinal + 1` (0-based
+   GetChild → 1-based GetChildren). Empty `field`/`cam_receiver` → False (fail closed).
+3. **Direct no-seed form is a SAFE false-positive** — `cam_receiver=="Camera.main.transform"` forms
+   no valid `self.<member>` (the resolver never emits `self.Camera.main.transform`), so the rig's own
+   write COUNTS (fail-closed, never a silent mask). Verified by test (vii).
+4. **Entry-point gate (`_check_surviving_child_ordinal`)** builds the spec from the carrier ONLY when
+   `field` AND `child` AND `cam_receiver` (non-empty) AND `cam_ordinal` is a real `int` (bool
+   excluded) AND `present is True` AND the INDEPENDENT `_rig_binding_discharged` re-derivation holds.
+   A 3-key (pre-fix / dropped-keys) carrier → no `cam_receiver` → NO exemption → fail closed.
+   At-most-one + site-aligned (`exempt ⊆ counted-survivors`) preserved.
+
+**How r3 closes the bypasses:** the receiver anchor closes codex r8 (a `self.muzzle:GetChildren()[2]`
+write no longer matches `self.cam`); the ordinal anchor closes codex r3 (`self.cam:GetChildren()[2]`
+≠ credited `[1]`); the bare-`cam` local is rejected (review MAJOR #3); the r7 `;`-span /
+substring-LHS protections are RETAINED (ANDed, not replaced). Every receiver/ordinal/form mismatch
+biases to COUNT.
+
+**Tests:** all existing carrier-equality assertions updated to the 5-key shape via a `_carrier(...)`
+helper; the r6/r7 statement-anchored unit tests updated to pass `_RigDeadWriteExempt` (receiver
+`self.cam`, ordinal 0) so they isolate their original discriminator; added §4 (f-r3) (i)-(x) driving
+the REAL helpers/`verify_contract` — exempt the credited write, STILL fire on different-receiver
+(r8) / different-ordinal (r3) / bare-receiver / second-write / READ / non-rig / undischarged, SAFE
+false-positive on the direct form, statement-anchored retained, a threading proof (rehydrated 5-key
+carrier anchors; dropped-keys carrier does not exempt), and a pre-fix RED proof against the actual
+91a19d4 receiver-blind r8 blob (masks ii+iii; r3 does not).
+
+**Verify:** `test_rig_binding_present.py` + `test_rifle_rig_retarget.py` 189 passed / 1 xfailed; full
+fast suite 3167 passed / 45 skipped / 6 xfailed; no-Any gate pass.
+
+---
+
+## Slice 1.2 (S1b) — check-D rig-exemption trust boundary (codex r3-review round 1, fix round; AMEND of caae810)
+
+**Classification:** User-Challenge / Taste — the trust-vs-authenticate boundary.
+
+**Finding (codex):** the check-D rig dead-write exemption anchors on the carrier's `cam_receiver`/`cam_ordinal`,
+which it TRUSTS (it does not — cannot — re-derive them from the source; the source can't self-identify which
+GetChild site the resolver credited, exactly as `field`/`child` are trusted anchors in FIX 1). Codex showed a
+WELL-FORMED FORGED carrier (valid types, receiver+ordinal chosen to match a genuine survivor) could exempt that
+survivor.
+
+**Adjudication (NOT a behavioral silent-miss — PROVE + DOCUMENT the bound, do not add impossible authentication):**
+the exemption only ever skips a site that BOTH (1) passes `_site_is_discharged_rig_dead_write` — the site is the
+WHOLE RHS of a `self.<field> = ...` assignment (a WRITE to the rig field) — AND (2) is on a script whose binding is
+INDEPENDENTLY discharged (`_rig_binding_discharged` -> no raw `self.<field>` READ survives). Therefore the masked
+site is ALWAYS a write to a field that is never read -> dead code whose `:GetChildren()` result is discarded ->
+functionally INERT. A forged carrier can mask only an inert dead write, NEVER a live child-ref regression. Forging
+the carrier requires tampering the internal `conversion_plan.json` — out of the converter's threat model (the
+converter writes that artifact itself; an attacker who can edit it can edit the output Luau directly).
+
+**Decision:** do NOT change the exemption's matching logic (it is correct) and do NOT attempt to authenticate
+`cam_receiver`/`cam_ordinal` against the source (impossible — the carrier is the only link to the fact). Instead:
+bound + document.
+
+**Changes:**
+- `contract_verifier.py` — added a TRUST BOUNDARY comment at the exemption entry-gate documenting the trust of the
+  carrier anchors as the resolver-fact proxy, the security bound (write-LHS gate + independent discharge -> worst
+  case is masking an inert dead write to an already-discharged field), and the conversion_plan.json forging note
+  (out of threat model).
+- `test_rig_binding_present.py` — added §f-r3-INERT-BOUND (3 tests): (i) a forged carrier matching a genuine
+  survivor can skip it ONLY when it is a `self.<field>` write on a discharged script (assert exempted site is a
+  write-LHS to `self.weaponSlot` and discharge holds so no read survives -> inert); (ii) a forged carrier CANNOT
+  mask a READ survivor (same receiver+ordinal as a read fails clause 1 -> COUNTED); (iii) a forged carrier CANNOT
+  mask a write to a DIFFERENT lvalue (`self.muzzle = ...` fails the `self.<field>` LHS gate -> COUNTED).
+
+**Verify:** `test_rig_binding_present.py` green; full fast suite no regressions; no-Any gate pass.
+
+## Slice 1.2 — round-2 BLOCKING fix (discharge soundness gap on dynamic self-index read)
+
+**Codex r2 BLOCKING (valid):** `_rig_binding_discharged` only caught STATIC reads (dot-form `self.<field>`
+and decoded static-string bracket `self["<field>"]`). It MISSED a DYNAMIC `self[k]` where `k` is a computed
+expression evaluating to the field name (a variable, a `..` concat with a non-literal operand, a call). Such a
+script false-DISCHARGED (the field IS read at runtime, un-rerouted), and because check D's rig exemption is
+GATED on discharge, the exemption then masked the surviving GetChildren WRITE to that field — a LIVE survivor
+slipped through (`verify_contract` -> [] at a10c76a).
+
+**Fix (FAIL-CLOSED on un-analyzable dynamic self-reads):** new `_rig_has_surviving_dynamic_self_index_read`
+(+ `_rig_index_receiver_is_self`) added as discharge clause (3) in `_rig_binding_discharged`. Any surviving
+code-position `self[<expr>]` index whose `<expr>` does NOT decode to a single static string literal
+(`_rig_decode_luau_string_key` -> None) is treated as a POTENTIAL surviving read the reroute did not rewrite ->
+discharge returns False. Scoped narrowly: receiver MUST be a standalone `self` (excludes `myself[k]` /
+`a.self[k]` / unrelated `other[k]`); a static-string key is already handled by clause (2); an assignment LHS
+(`self[k] = v`) is a WRITE, not a read, and does not fail discharge. Code-position-aware via
+`_rig_bracket_key_spans` (matches inside strings/comments excluded).
+
+**Why this is the right anchor:** strengthens the binding-present check (the real cause) AND, because the
+exemption is gated on `_rig_binding_discharged`, automatically prevents the exemption from masking a survivor
+on such a script — the INERT-BOUND invariant holds (discharge => no read in any analyzable form => the
+exempted write is genuinely dead).
+
+**Tests (test_rig_binding_present.py):** codex's exact repro (`self["weapon".."Slot"]` + var-bound
+`local k = ...; self[k]`) now reds the full `verify_contract` path (rig_binding_present fires AND
+child_ordinal_survivor fires -> violations != []); narrator-independent RED proof against the a10c76a blob
+(var-bound key false-discharges + masks there, fires here); scope guard (non-`self` dynamic index discharges
+True); corpus regression guard (real Player dot-form reads stay discharged + dead-write exemption still applies).
+Updated the prior r3/r4 dynamic-key tests that asserted the now-superseded fail-OPEN stance to assert
+fail-closed.
+
+**Verify:** test_rig_binding_present.py 122 passed; corpus+retarget+binding 208 passed/1 xfailed; full fast
+suite 3177 passed; no-Any gate pass.
+
+## [SLICE 1.2 r3 fix — normalize self-index receiver; close all parenthesized variants]
+Codex round-3 BLOCKING (valid): `_rig_has_surviving_dynamic_self_index_read` matched only a BARE
+`self` token immediately before `[`, so a parenthesized receiver `(self)[k]` / `( self )["weapon"..suffix]`
+(semantically identical to `self[k]` in Luau) passed discharge=True → a live dynamic field read slips →
+the check-D rig exemption could mask a live survivor. DECISION: rather than add one more literal pattern
+(per-form whack-a-mole), NORMALIZE the receiver in `_rig_index_receiver_is_self` — peel balanced
+`( ... )` parenthesization + whitespace (comments are already blanked in the code projection) and test
+whether the residual reduces to the keyword `self` at a word boundary. Closes `self[k]`, `(self)[k]`,
+`( self )[k]`, `((self))[k]`, `self [k]`, `self --c\n[k]` in one robust check. Kept gated to a self
+receiver: a call-suffix `getKey()[k]`, member `a.self[k]`, substring `myself[k]`, parenthesized non-self
+`(notself)[k]`, and unrelated `other[k]`/`t[k]` all reduce to a non-`self` residual and do NOT trip
+(no over-broadening). RESIDUAL (documented, not chased): fully data-flow dynamic reads — aliasing
+(`local s = self; s[k]`), `rawget(self, k)`, metatable `__index` — are an accepted residual (transpiler
+emits dot-form `self.<field>`, never aliased; static text analysis cannot prove "never read"). Logged in
+followups.md + an explicit xfail marker. Narrator-independent pre-fix RED proof against 5f36a38 (the
+bare-self matcher false-passed the parenthesized forms). All targeted suites + full fast suite green
+(3188 passed); no-Any gate clean.
+
+- slice 1.3 (S2 r3 fix): omit None-valued optional fields in regen capture (matching child_ref_resolution); dropped the 40 redundant `rig_binding: null` keys from the committed SimpleFPS fixture via deterministic null-key drop (full regen avoided per r1 FINDING 1 — drifts non-Player source). Fixture diff now Player-only; all corpus + fast suite green.
+
+## Slice 1.4 (S3 — net/e2e witness) — REDESIGN r3 AMEND (2026-06-14)
+
+Rebased the e2e witness onto the r3 5-key `rig_binding` carrier
+(`{field,child,present,cam_receiver,cam_ordinal}`).
+
+- Fixed the 3 failing carrier assertions (factored-out, generic factored-out,
+  generic discharged) to the 5-key shape. Generic tests read `cam_receiver`/
+  `cam_ordinal` OFF THE REAL FACT (`entry.rig_facts[0]`), not hardcoded, keeping
+  the assertions generic.
+- ADDED r3-specific end-to-end witnesses (new section 2b):
+  - `test_r3_check_d_does_not_false_positive_on_discharged_rig_dead_write` — the
+    ORIGINAL r1 BUG, proven GONE: a discharged binding whose credited dead ordinal
+    write survives (Tier-2 skip on the ambiguous single-line `if self.cam then ...`)
+    is EXEMPTED by check D (no `child_ordinal_survivor`, success stays clean).
+  - `test_r3_check_d_still_fires_on_non_credited_ordinal_survivor` — different
+    ordinal `[2]` (credited `[1]`) STILL fires (cam_ordinal anchor load-bearing).
+  - `test_r3_check_d_still_fires_on_different_receiver_survivor` — different
+    receiver `self.muzzle` STILL fires (cam_receiver anchor load-bearing, codex r8).
+  - `test_r3_check_d_exemption_anchors_on_generic_receiver_and_ordinal` — generic
+    `view`/ordinal 2 -> `[3]` exempt, stray `[4]` fires (no hardcoded cam/0).
+  - `test_e2e_captured_player_passes_real_pipeline_gate_not_blocked` — captured
+    Player carried with its REAL 5-key carrier + real budget through the REAL
+    `_run_pipeline_gate`; not blocked (r1 bug gone on the real shape).
+  - Captured-corpus carrier assertion widened to require non-empty str
+    `cam_receiver` + int `cam_ordinal` (the deterministic check-D anchor survives
+    the regen/rehydrate path).
+- Race/boundary/fresh-conversion witnesses retained; `@pytest.mark.slow` kept on
+  the full-conversion test. New driver `_lower_with_awake_write` runs the REAL
+  lowering (non-tautological — drives `lower_rifle_rig_retarget` + `verify_contract`).
+
+Verify: `test_rifle_rig_retarget_e2e.py` 18 pass / 1 slow-skip; chain
+(rifle/rig_binding/corpus/e2e) 238 pass; full fast suite 3207 pass; no-Any gate pass.
+
+## slice 1.4 (S3 e2e witness) — r3 fix round (round-3 BLOCKING)
+
+**Finding:** the r3 check-D anchor tests HAND-FABRICATED the rig_binding carrier
+(via `_lower_with_awake_write`'s hand-built `RigRootedRetargetFact`), so a
+regression where the lowering stops promoting `cam_receiver`/`cam_ordinal` from the
+resolver fact into the carrier would still PASS within the e2e (witness) slice.
+
+**Fix:** added a REAL-CHAIN end-to-end witness (no hand-built carrier, no hardcoded
+anchor) in `converter/tests/test_rifle_rig_retarget_e2e.py`:
+- `_lower_via_real_producer_with_survivor` drives the REAL producer
+  (`build_child_ref_map` -> `_resolve_rig_facts`) to compute the fact, then the REAL
+  `lower_rifle_rig_retarget` to STAMP `cam_receiver`/`cam_ordinal` FROM that fact
+  into the carrier, over an AI shape carrying a surviving credited dead write.
+- `test_r3_real_chain_check_d_exempts_promoted_anchor_end_to_end`: exemption fires,
+  survivor exempt, not blocked; asserts carrier anchor == fact values (promotion).
+- `test_r3_real_chain_check_d_fires_when_survivor_ordinal_diverges_from_promotion`
+  and `..._receiver_diverges...`: mutate the surviving site's ordinal/receiver away
+  from the promoted anchor -> check D FIRES (anchor read from the real carrier
+  discriminates).
+- `test_r3_real_chain_exemption_dies_if_promotion_drops_anchor_keys`: non-tautology
+  guard — strip the promoted keys -> exemption dies, check D fires.
+
+**Verified the guard is real:** garbling the lowering's final `cam_ordinal` stamp
+to `999` REDs the exemption witness (carrier != fact). Restored after.
+
+All existing e2e tests kept green. Chain green
+(`test_rifle_rig_retarget` + `test_rig_binding_present` + `test_contract_corpus` +
+`test_rifle_rig_retarget_e2e`: 242 passed). Full fast suite: 3211 passed, no
+regressions. no-Any gate: pass.
+
+## Slice 1.1 FIX-ROUND — phase-integration findings (commit 4997dcb)
+
+- F1 [BLOCKING fix] — seed qualification in `_canonical_receiver` (child_ref_resolver.py). The
+  foreign member-LHS seed `other.cam = Camera.main.transform; weaponSlot = cam.GetChild(0)`
+  false-admitted a rig fact: the `\b` after the `.` of `other.cam` let `any_assign_re`/`seed_re`
+  match the inner `cam` token. FIX: new `_seed_lhs_is_bare_or_this(source, sym_start)` — the
+  nearest-preceding-binding scan now admits a seed ONLY when its LHS is a BARE write or a
+  `this.<sym>` write (mirrors `_lhs_is_bare_field`'s "bare or this. only" discipline); a foreign
+  member access (`other.cam`, `a.b.cam`, `foo.this.cam`) is skipped — not a binding of the bare
+  symbol used at the GetChild. Removed the accepted-xfail residual on
+  `test_r6_member_write_does_not_seed_bare_cam`; it now asserts the fix. Added deep-member +
+  foreign-this-tail a-neg cases; legit bare `cam=` and `this.cam=` seeds still ADMIT.
+
+- F2 [MAJOR fix] — lowering↔verifier discharge parity (rifle_rig_retarget_lowering.py). The
+  lowering stamped `present=True` on boundary-form scripts the slice-1.2 verifier
+  (`_rig_binding_discharged`, design §1.6) fails closed on, leaving an edited source + a loud row
+  instead of a clean abstain. FIX: new `_has_unrewritable_boundary_read(source, field)` mirrors
+  the verifier's reject set — bracket `self["field"]`, dynamic `self[expr]` (incl. parenthesized),
+  non-`self` receiver (`<Class>.<field>`/`owner.<field>`/alias `p.<field>`), and a raw
+  `self.<field>` read in a non-yielding lifecycle method (Awake/Start). `_binding_discharged`
+  consults it and returns False → the lowering ABSTAINS (`present=False`, source unedited for the
+  reroute). Implemented FULL predicate parity (not just the minimal "abstain on any surviving
+  non-dot-form"). SHADOWED-`self` is deliberately NOT a boundary form: `self` there is a foreign
+  object, neutral, matching the verifier's shadow-guard mirror + the existing
+  `_has_surviving_field_read`/`test_p3_shadowed_self_mirror`. Pure-integer `self[1]` and a
+  different string key `self["other"]` are not boundary forms (no over-abstain). Clean dot-form
+  corpus reads still discharge `present=True`.
+
+- F2 test impact (1.1-owned) — `test_h5_yield_guard_abstains_in_awake_rewrites_in_getrifle` and
+  `test_h5_start_is_non_yielding` encoded the SUPERSEDED "Awake/Start raw read sees a safe nil,
+  still discharge" premise (design §1.6 / lines 194-198 dropped it). Updated both to assert the
+  new contract: a raw lifecycle read makes the lowering abstain (`n==0`, `present=False`, source
+  unedited). No 1.2/1.3/1.4-owned test needed changes — full fast suite green (3064 passed).
+
+## Slice 1.1 — round-4 review fix round (seed-trivia false-admit + no-mutual-mask) — 2026-06-14
+
+- **FINDING 1 (BLOCKING, UNSAFE — FIXED):** `_seed_lhs_is_bare_or_this` (child_ref_resolver.py)
+  skipped only spaces/tabs when testing whether the seed symbol was preceded by a member-access
+  `.`. A FOREIGN member-LHS seed split by a comment or newline (`other.\ncam = Camera.main.transform`
+  / `other./*c*/cam = ...`) thus false-ADMITTED — a non-camera binding silently retargeted to
+  `_MainCameraRig` (a bogus RigRootedRetargetFact the verifier does NOT catch → ships a wrong
+  retarget; the unsafe direction). **Fix:** the member-access check now skips ALL C# trivia
+  (spaces, tabs, NEWLINES, `//` line + `/* */` block comments) via the existing
+  `_skip_ws_and_comments_back` helper (authoritative `_cs_pos_is_code` comment classification),
+  both for the leading-`.` test AND the `this`-qualifier walk-back + its own member-tail
+  (`foo.this.cam`) guard. Legit `cam =` / `this.cam =` / `this . cam =` / `this./*c*/cam =`
+  still ADMIT. New tests: `test_f1_member_seed_{newline,block_comment,line_comment_and_newline,
+  tab_newline}_before_sym_rejected`, `test_f1_this_{dot_block_comment,spaced_dot}_seed_still_admits`,
+  and a direct-unit `test_f1_seed_lhs_helper_unit_trivia_forms` over the full trivia matrix.
+
+- **FINDING 2 (discharge-predicate desync — DOCUMENTED, fail-closed-safe; per-form parity NOT
+  pursued):** the lowering's `_binding_discharged` / `_has_unrewritable_boundary_read`
+  (rifle_rig_retarget_lowering.py) is a BEST-EFFORT HINT; the slice-1.2 verifier's
+  `_rig_binding_discharged` (run on the final output) is the SOLE discharge authority (design
+  §1.6 / FIX 1). The two text-scanners can DESYNC on a few boundary forms (`self[<int>]`,
+  shadowed-`self` dot-read, concat bracket key `self["weapon".."Slot"]`) where the lowering is
+  LENIENT and the verifier FIRES — the FAIL-CLOSED-SAFE direction (verifier stricter → binding
+  fails closed, never silent-wrong). All residual forms are NON-REACHABLE from the deterministic
+  dot-form transpiler, so per-form parity (brittle two-scanner mirroring) is INTENTIONALLY not
+  pursued. Documented in the `_binding_discharged` docstring.
+  - **CRITICAL SAFETY CHECK — no mutual-mask:** empirically, the only UNSAFE state (BOTH discharged
+    while a real surviving read exists) does NOT occur. Each boundary form either makes the
+    lowering ABSTAIN (`present=False` — `self[1]`, concat-key, and the dynamic/string-key/non-self
+    forms never produce a `self:_resolveWeaponSlot(` call, so discharge condition 1b fails) or, on
+    the clean dot-form, both discharge with no surviving read. New `test_f2_no_mutual_mask_against_
+    verifier_or_conservatism` drives the lowering over a 6-form boundary matrix and (when the
+    verifier predicate is importable at phase integration) cross-checks `_rig_binding_discharged`
+    asserting no mutual-mask + verifier-stricter desync; on this slice branch the verifier r3
+    predicate is NOT yet present (it lands in slice 1.2), so the test SKIPS the cross-scanner check
+    and instead asserts the lowering's own conservatism property (it can never be the masking party).
+
+- **Verify:** `tests/test_rifle_rig_retarget.py` green (94 passed); full fast suite
+  `pytest tests/ -m "not slow"` 3072 passed / 45 skipped / 5 xfailed; `tools/check_no_any.sh` pass.
+
+## HARDEN-FIX phase 1 (rig_binding) — codex 4 P1s (2026-06-14)
+
+Verified each of the 4 codex-harden P1s against the assembled phase; fixed the 3 that
+reproduced + added the missing e2e test. Each bug-fix has a test proven RED pre-fix.
+
+1. **`_last_module_return_span` not module-scope-aware (BLOCKING) — REPRODUCED + FIXED.**
+   `rifle_rig_retarget_lowering.py`. Repro: a script whose ONLY `return Player` is method-local
+   (`function Player.new() return Player end`) while the module epilogue returns a different
+   symbol (`return M`) — the lowering spliced the resolver INSIDE `new` (still valid Luau, so the
+   syntax re-check did NOT catch it) and stamped `present=True`. Fix: new `_return_is_inside_
+   function_body` tracks `function`/`do`/`then`/`repeat` nesting from file start; any return inside
+   an open function body is skipped, so only the MODULE-LEVEL trailing return is the splice point.
+   Abstains (injected=False, present=False) when no module-scope return exists. Tests:
+   `test_harden_method_local_return_class_not_chosen_as_splice` (+ epilogue-still-chosen +
+   module-level-do-end-not-misclassified regression guards).
+
+2. **`_rig_resolver_body_is_rig_lookup` not class-bound (BLOCKING) — claim A NOT reproduced,
+   claim B REPRODUCED + FIXED.** `contract_verifier.py`. Claim A (`return nil` body): does NOT
+   reproduce — the existing body check already requires BOTH `_MainCameraRig` + `FindFirstChild`
+   markers as live code, so a stub body is rejected. Claim B (wrong-class resolver): REPRODUCED —
+   a `function Helper:_resolveCamera()` carrying the real body false-greened (the decl regex matched
+   ANY class), while the rerouted `self:_resolve...()` calls bind to the primary class. Fix: new
+   `_rig_module_class` derives the module's primary class (first code-level method decl — the SAME
+   rule the lowering's `_read_class_name` uses); the resolver decl regex is now anchored to that
+   class. Test: `test_harden_wrong_class_resolver_does_not_discharge` (+ host-class-still-discharges).
+
+3. **C# admission guards skip whitespace but not comments (BLOCKING) — REPRODUCED + FIXED.**
+   `child_ref_resolver.py`. `_seed_dominates_use` (:552): a `//`/`/* */` comment between a braceless
+   conditional header and its seed (`if (c) /*x*/ cam = ...`) defeated the conditional detection →
+   FALSE-ADMITTED the conditional seed as dominating. Fix: route the back-walk through
+   `_skip_ws_and_comments_back` + new `_preceding_governor_keyword` (trivia-aware keyword read).
+   `_canonical_receiver` (:720): the exact-seed `\s*` regex FALSE-REJECTED a comment-split legit seed
+   (`cam = /*c*/ Camera.main.transform`) → silently dropped the rig fact (fail-closed-safe but a
+   correctness gap on valid input). Fix: new `_match_exact_cam_seed_rhs` + `_skip_ws_and_comments_fwd`
+   match the seed RHS skipping trivia between tokens; foreign/longer-chain/`==` still return None.
+   Removed now-unused `_CS_BRACELESS_GOVERNOR_RE`. Tests: 8 in `test_child_ref_resolver.py`
+   (dominates × 4, canonical_receiver × 4).
+
+4. **No e2e preserve/resume test for rig_binding persistence (MAJOR missing test) — ADDED.**
+   `test_rig_binding_present.py::test_rig_binding_persistence_roundtrip_preserves_checkD_anchor`:
+   builds a discharged carrier with a SURVIVING credited dead-write (exemption is load-bearing),
+   SAVEs the rig_binding block to conversion_plan.json, LOADs via the production
+   `Pipeline._load_rig_binding_for_rehydration`, RESTOREs onto a rehydrated script, asserts all 5
+   keys round-trip AND the rehydrated carrier still anchors check-D's exemption (no false re-fire on
+   resume). Proves a hypothetical 3-key LOAD filter (drops cam_receiver/cam_ordinal) loses the
+   anchor → check-D fires.
+
+**Verify:** full fast suite `pytest tests/ -m "not slow"` 3242 passed / 45 skipped / 6 xfailed;
+`tools/check_no_any.sh` pass. 4 new bug-fix tests proven RED against pre-fix code (stash-out).
+Slop deferred to /drive-finalize (no slop fixed here).
+
+## HARDEN-FIX (round-2) — phase 1 — elseif-drift regression closed
+
+- BLOCKING regression (both voices, end-to-end on the real SimpleFPS corpus Player, 7 `elseif`
+  tokens): round-1 harden's `_return_is_inside_function_body` walked block depth without handling
+  `elseif`. In Luau an `if … elseif … then … end` chain has MULTIPLE `then` openers but ONE `end`,
+  so each `elseif`'s `then` incremented `block_depth` with no matching close — any method with an
+  if/elseif chain stayed artificially "open", so a genuine module-trailing `return <Class>` after it
+  was misclassified function-local and SKIPPED → resolver not injected → `present=False` on
+  essentially every realistic transpiled controller. Pre-fix on the real corpus Player:
+  `_last_module_return_span=None`, `modified=0`, `present=False`. Post-fix: span found, `modified=1`,
+  resolver injected, reads rerouted, `present=True`.
+- FIX: in `_return_is_inside_function_body`, `elseif` DECREMENTS `block_depth` to cancel its own
+  upcoming `then` (net 0 for the if/elseif chain) and NEVER touches `fn_depth` — the same grammar
+  the file's `_FALLBACK_BLOCK_CLOSERS` already uses for `elseif`. Verified `if/then/end`,
+  `for/do/end`, `while/do/end`, `repeat/until`, nested `function`, and `else` stay balanced.
+- TESTS (close the gap): `test_h1_elseif_chain_before_module_return_still_discharges` drives the REAL
+  `lower_rifle_rig_retarget` on a Player whose methods carry `if/elseif/elseif/else/end` chains before
+  the module return → asserts resolver injected before the return, reads rerouted, `present=True`;
+  `test_h1_elseif_module_return_span_is_module_scope` is a focused unit test of
+  `_return_is_inside_function_body`/`_last_module_return_span` over elseif-bearing input (module-scope
+  return = False; method-local return after an elseif chain = True). Both proven RED against the
+  pre-fix (round-1) code via stash-out, green after.
+- SCOPE: fixed ONLY this regression + its tests; no other edits; slop deferred to /drive-finalize.
+- Verify: full fast suite `pytest tests/ -m "not slow"` → 3244 passed / 45 skipped / 6 xfailed;
+  `tools/check_no_any.sh` pass; new tests RED against pre-fix, green after. Changed files:
+  `converter/converter/rifle_rig_retarget_lowering.py`, `converter/tests/test_rifle_rig_retarget.py`.
+- 2026-06-14T08:42:05Z FINALIZE de-slop: removed verified-dead rig-ordinal-write chain from contract_verifier.py (_rig_has_surviving_ordinal_write + _rig_statement_rhs_end + _rig_collapse_code_ws + _rig_is_ident_char + _RIG_ORDINAL_WRITE_TAIL_RE; kept live _rig_code_projection/_rig_line_continues); pruned dead-only test + dead assertions from test_rig_binding_present.py; trimmed round-by-round counter-commentary docstrings (lowering header+_binding_discharged, contract_verifier exemption/discharge/bracket-key, pipeline rehydrate, regen_contract_corpus _FIELDS) and fixed stale test-name citation. No behavior change; 3243 passed/45 skipped, no-Any pass.
