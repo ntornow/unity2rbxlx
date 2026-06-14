@@ -2267,23 +2267,18 @@ def test_f2_no_mutual_mask_against_verifier_or_conservatism() -> None:
         residual_self_read = _has_surviving_field_read(final, "weaponSlot")
         if have_verifier and _verifier_discharged is not None:
             verifier_present = bool(
-                _verifier_discharged(final, "weaponSlot", "WeaponSlot", "WeaponSlot")
+                _verifier_discharged(final, "weaponSlot", "WeaponSlot")
             )
-            # The UNSAFE mutual-mask: both think discharged while there IS a read.
-            # (Here the boundary read is the non-dot form; "field actually read" is
-            # the presence of the boundary access we know each form carries.)
+            # Each _BOUNDARY_FORMS case carries a real surviving read of the field.
+            # The only UNSAFE state is a MUTUAL-MASK: BOTH the lowering AND the
+            # verifier report discharged while the field is actually read. A
+            # lowering-lenient / verifier-fires desync is fail-closed-safe by design
+            # (the verifier is the SOLE discharge authority, design §1.6/FIX 1) and
+            # is explicitly allowed — so we assert ONLY the absence of mutual-mask.
             assert not (lowering_present and verifier_present), (
-                f"MUTUAL-MASK on {label}: both discharged"
+                f"MUTUAL-MASK on {label}: both the lowering and the verifier report "
+                "discharged while the field is read"
             )
-            # And every desync must be verifier-stricter (fail-closed), never the
-            # reverse (lowering stricter is merely cosmetic; lowering-lenient while
-            # verifier fires is the safe design).
-            if lowering_present:
-                assert verifier_present, (
-                    f"{label}: lowering present but verifier also present is the "
-                    "only safe co-discharge; an UNSAFE state would be both present "
-                    "with a read"
-                )
         else:
             # No verifier on this branch (lands in slice 1.2; parity asserted at
             # phase integration). Conservatism property: the lowering ABSTAINS
