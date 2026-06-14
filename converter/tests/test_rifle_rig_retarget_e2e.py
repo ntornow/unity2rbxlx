@@ -621,8 +621,13 @@ def test_boundary_field_factored_out_of_reads_fails_closed_end_to_end(
         "return Player\n"  # no consumer read of self.weaponSlot anywhere
     )
     lowered = _lower(factored)
+    # REDESIGN r3 — the carrier is the 5-key shape: field/child/present PLUS the
+    # deterministic anchor cam_receiver (the C# camera symbol, "cam") + cam_ordinal
+    # (the 0-based GetChild ordinal). present=False: the field was factored out of
+    # every read so the read-reroute discharge could not fire (fail-closed).
     assert lowered.rig_binding == {
         "field": "weaponSlot", "child": "WeaponSlot", "present": False,
+        "cam_receiver": "cam", "cam_ordinal": 0,
     }
     script = RbxScript(
         name="Player", source=lowered.luau_source, rig_binding=lowered.rig_binding
@@ -712,6 +717,12 @@ def test_boundary_generic_field_factored_out_fails_closed_end_to_end(
     )
     assert entry.rig_facts and entry.rig_facts[0].field_name == field
     assert entry.rig_facts[0].child_name == child
+    # REDESIGN r3 — the resolver fact carries the deterministic anchor (the C#
+    # camera receiver text + the credited GetChild ordinal). Read it OFF THE FACT
+    # so the carrier assertion below stays generic (no hardcoded "cam"/0 logic).
+    fact = entry.rig_facts[0]
+    cam_receiver, cam_ordinal = fact.cam_receiver, fact.ordinal
+    assert cam_receiver, "an admitted fact must carry a non-empty cam_receiver"
 
     # An AI output that factored the field out of every read (no self.<field> read).
     factored = (
@@ -724,7 +735,12 @@ def test_boundary_generic_field_factored_out_fails_closed_end_to_end(
     s = _Script(factored, source_path=key)
     # Drive the REAL lowering using the REAL producer's ChildRefScript.
     lower_rifle_rig_retarget([s], {key: entry})
-    assert s.rig_binding == {"field": field, "child": child, "present": False}
+    # 5-key r3 carrier: present=False (read factored out), and the deterministic
+    # cam_receiver/cam_ordinal anchor threaded from the fact regardless of discharge.
+    assert s.rig_binding == {
+        "field": field, "child": child, "present": False,
+        "cam_receiver": cam_receiver, "cam_ordinal": cam_ordinal,
+    }
 
     script = RbxScript(
         name=class_name, source=s.luau_source, rig_binding=s.rig_binding
@@ -762,10 +778,16 @@ def test_boundary_generic_discharged_binding_keys_on_field(tmp_path: Path) -> No
     entry, key = _resolve_real_rig_fact(
         tmp_path, field=field, child=child, class_name=class_name
     )
+    fact = entry.rig_facts[0]
+    cam_receiver, cam_ordinal = fact.cam_receiver, fact.ordinal
     s = _Script(_ai_output_shape(class_name=class_name, field=field), source_path=key)
     lower_rifle_rig_retarget([s], {key: entry})
-    # Discharge keyed on the carrier's field/child.
-    assert s.rig_binding == {"field": field, "child": child, "present": True}
+    # Discharge keyed on the carrier's field/child; r3 5-key shape with the
+    # deterministic cam_receiver/cam_ordinal anchor carried from the fact.
+    assert s.rig_binding == {
+        "field": field, "child": child, "present": True,
+        "cam_receiver": cam_receiver, "cam_ordinal": cam_ordinal,
+    }
     assert f"self:_resolve{child}()" in s.luau_source
     # The consumer GetRifle's reads were rerouted (no raw self.<field> read in it).
     getrifle = re.search(
@@ -785,6 +807,194 @@ def test_boundary_generic_discharged_binding_keys_on_field(tmp_path: Path) -> No
         f"{rig_rows}"
     )
     assert not any("rig_binding_present" in e for e in fail_closed_errors(res))
+
+
+# ===========================================================================
+# 2b. REDESIGN r3 — receiver/ordinal-anchored check-D exemption, END-TO-END.
+# The original r1 bug: when the AI write IS a positional ordinal AND the Tier-2
+# neutralize SKIPS (ambiguity), the dead ordinal write SURVIVES; check D at budget
+# 0 fail-closed `child_ordinal_survivor` on a CORRECTLY discharged binding,
+# BLOCKING a valid rifle conversion. r3 EXEMPTS that one credited dead write —
+# POSITIVELY anchored on the carrier's `cam_receiver` + `cam_ordinal` (the
+# deterministic upstream identity), never a blanket field-only mask. These tests
+# drive the WHOLE producer/lowering/verifier chain: the carrier's 5-key shape is
+# the load-bearing anchor end-to-end.
+# ===========================================================================
+def _lower_with_awake_write(
+    awake_write: str,
+    *,
+    field: str = "weaponSlot",
+    child: str = "WeaponSlot",
+    cam_receiver: str = "cam",
+    ordinal: int = 0,
+) -> _Script:
+    """Run the REAL lowering over an AI-output shape whose Awake carries a SPECIFIC
+    camera-child write line (``awake_write``) — chosen so the Tier-2 neutralize
+    SKIPS on ambiguity, leaving a surviving positional ordinal write — and the
+    yielding GetRifle consumer reads (which the reroute discharges). The fact's
+    ``cam_receiver``/``ordinal`` are stamped into the carrier (the r3 anchor). The
+    consumer reads (NOT the Awake write) are what discharge; the Awake write here
+    is a READ-FREE single statement so discharge stays True with a survivor present."""
+    src = (
+        "local Player = {}\n"
+        "Player.__index = Player\n"
+        "function Player.new()\n"
+        "    local self = setmetatable({}, Player)\n"
+        "    return self\n"
+        "end\n"
+        "function Player:Awake()\n"
+        "    self.cam = workspace.CurrentCamera\n"
+        f"    {awake_write}\n"
+        "end\n"
+        "function Player:GetRifle()\n"
+        f"    local rifle = self.host.instantiatePrefab(self.riflePrefab, self.{field}, pivotOf(self.{field}))\n"
+        f"    if self.{field} then rifle:PivotTo(pivotOf(self.{field})) end\n"
+        "    return rifle\n"
+        "end\n"
+        "return Player\n"
+    )
+    s = _Script(src)
+    fact = RigRootedRetargetFact(
+        field_name=field, child_name=child, cam_receiver=cam_receiver, ordinal=ordinal
+    )
+    crs = ChildRefScript(
+        facts=(), getchild_total=1, resolved_total=1, rig_facts=(fact,)
+    )
+    lower_rifle_rig_retarget([s], {s.source_path: crs})
+    return s
+
+
+def _verify_budget0(script: RbxScript) -> object:
+    """Run the REAL verifier over ``script`` at check-D budget 0
+    (``{getchild_total:1, resolved_total:1}`` — the resolved Player)."""
+    script.child_ref_resolution = {"getchild_total": 1, "resolved_total": 1}
+    return verify_contract(_TOPOLOGY, [script])
+
+
+def test_r3_check_d_does_not_false_positive_on_discharged_rig_dead_write(
+    tmp_path: Path,
+) -> None:
+    """REDESIGN r3 (acceptance f-r3.i) END-TO-END — THE r1 BUG IS GONE. A discharged
+    rig binding whose credited dead ordinal write SURVIVES (Tier-2 neutralize
+    skipped on the ambiguous single-line ``if self.cam then ... end``) drives the
+    WHOLE chain: the lowering stamps ``present=True`` + the r3 anchor
+    (``cam_receiver``/``cam_ordinal``), and check D at budget 0 EXEMPTS that one
+    credited site — receiver ``self.cam`` AND ordinal ``cam_ordinal+1`` — so NO
+    ``child_ordinal_survivor`` fires and the conversion is NOT blocked. Pre-r3 (a
+    field-only / receiver-blind exemption) this fail-closed on a valid binding."""
+    s = _lower_with_awake_write(
+        "if self.cam then self.weaponSlot = self.cam:GetChildren()[1] end"
+    )
+    # Discharged via the read reroute, 5-key r3 carrier with the deterministic anchor.
+    rb = s.rig_binding
+    assert isinstance(rb, dict)
+    assert rb["present"] is True
+    assert rb["cam_receiver"] == "cam" and rb["cam_ordinal"] == 0
+    # The credited dead ordinal write genuinely SURVIVES (the false-positive trigger).
+    assert "self.cam:GetChildren()[1]" in s.luau_source, (
+        "the credited dead ordinal write must survive (Tier-2 skipped) for this "
+        "witness to exercise the exemption"
+    )
+    script = RbxScript(name="Player", source=s.luau_source, rig_binding=rb)
+    res = _verify_budget0(script)
+    survivor = [v for v in res.violations if v.check == "child_ordinal_survivor"]
+    assert survivor == [], (
+        "check D must EXEMPT the discharged rig's credited dead write (r1 bug "
+        f"fixed): got {[v.detail for v in survivor]}"
+    )
+    rig_rows = [v for v in res.violations if v.check == "rig_binding_present"]
+    assert rig_rows == [], f"a discharged binding must not fail the binding floor: {rig_rows}"
+    assert fail_closed_errors(res) == [], (
+        f"a discharged rig with a dead credited survivor must not fail closed: "
+        f"{fail_closed_errors(res)}"
+    )
+
+
+def test_r3_check_d_still_fires_on_non_credited_ordinal_survivor() -> None:
+    """REDESIGN r3 (acceptance f-r3.iii) END-TO-END — the exemption is the EXACT
+    credited site, NOT a blanket field-only mask. A SAME-receiver write at a
+    DIFFERENT ordinal (``self.cam:GetChildren()[2]`` when the credited init was
+    ``[1]``/ordinal 0) is a genuine survivor: ``k=2 != cam_ordinal+1=1`` ⇒ COUNTED
+    ⇒ check D fires ``child_ordinal_survivor`` and the conversion fails closed.
+    Proves the ``cam_ordinal`` anchor is load-bearing (a field-only r8 mask would
+    have FALSE-PASSED this — the silent-miss r3 closes)."""
+    s = _lower_with_awake_write(
+        "if self.cam then self.weaponSlot = self.cam:GetChildren()[2] end"
+    )
+    rb = s.rig_binding
+    assert isinstance(rb, dict) and rb["present"] is True and rb["cam_ordinal"] == 0
+    assert "self.cam:GetChildren()[2]" in s.luau_source
+    script = RbxScript(name="Player", source=s.luau_source, rig_binding=rb)
+    res = _verify_budget0(script)
+    survivor = [v for v in res.violations if v.check == "child_ordinal_survivor"]
+    assert survivor != [], (
+        "a non-credited (different-ordinal) survivor must STILL fire check D — the "
+        "exemption is the exact credited site, not a field-only mask"
+    )
+    assert any("child_ordinal_survivor" in e for e in fail_closed_errors(res))
+
+
+def test_r3_check_d_still_fires_on_different_receiver_survivor() -> None:
+    """REDESIGN r3 (acceptance f-r3.ii) END-TO-END — a SAME-field survivor through a
+    DIFFERENT receiver (``self.muzzle:GetChildren()[1]``, not the credited
+    ``self.cam``) is NOT the credited child-ref access ⇒ COUNTED ⇒ check D fires.
+    Proves the ``cam_receiver`` anchor is load-bearing (codex r8: a receiver-blind
+    exemption would have masked this genuine survivor)."""
+    s = _lower_with_awake_write(
+        "if self.cam then self.weaponSlot = self.muzzle:GetChildren()[1] end"
+    )
+    rb = s.rig_binding
+    assert isinstance(rb, dict) and rb["present"] is True and rb["cam_receiver"] == "cam"
+    assert "self.muzzle:GetChildren()[1]" in s.luau_source
+    script = RbxScript(name="Player", source=s.luau_source, rig_binding=rb)
+    res = _verify_budget0(script)
+    survivor = [v for v in res.violations if v.check == "child_ordinal_survivor"]
+    assert survivor != [], (
+        "a different-receiver survivor must STILL fire check D — the exemption "
+        "anchors on the carrier's cam_receiver, not the bare field"
+    )
+    assert any("child_ordinal_survivor" in e for e in fail_closed_errors(res))
+
+
+def test_r3_check_d_exemption_anchors_on_generic_receiver_and_ordinal(
+    tmp_path: Path,
+) -> None:
+    """REDESIGN r3 GENERIC (acceptance f-r3 / g-generic) — the exemption is keyed on
+    the carrier's ``cam_receiver``/``cam_ordinal`` projections, NOT hardcoded
+    ``cam``/0. A different camera symbol (``view``) and ordinal (``2``) credited by
+    the fact EXEMPT exactly the matching survivor ``self.view:GetChildren()[3]``
+    (``k = cam_ordinal+1 = 3``), while a stray ``self.view:GetChildren()[4]`` STILL
+    fires. Drives the same lowering+verifier chain end-to-end."""
+    s = _lower_with_awake_write(
+        "if self.view then self.weaponSlot = self.view:GetChildren()[3] end",
+        cam_receiver="view",
+        ordinal=2,
+    )
+    rb = s.rig_binding
+    assert isinstance(rb, dict)
+    assert rb["cam_receiver"] == "view" and rb["cam_ordinal"] == 2
+    assert rb["present"] is True
+    assert "self.view:GetChildren()[3]" in s.luau_source
+    script = RbxScript(name="Player", source=s.luau_source, rig_binding=rb)
+    res = _verify_budget0(script)
+    assert [v for v in res.violations if v.check == "child_ordinal_survivor"] == [], (
+        "the credited generic (view/ordinal 2 -> [3]) dead write must be exempted"
+    )
+    assert fail_closed_errors(res) == []
+
+    # The stray ordinal [4] on the SAME receiver is non-credited -> STILL fires.
+    stray = _lower_with_awake_write(
+        "if self.view then self.weaponSlot = self.view:GetChildren()[4] end",
+        cam_receiver="view",
+        ordinal=2,
+    )
+    stray_script = RbxScript(
+        name="Player", source=stray.luau_source, rig_binding=stray.rig_binding
+    )
+    stray_res = _verify_budget0(stray_script)
+    assert [v for v in stray_res.violations if v.check == "child_ordinal_survivor"] != [], (
+        "a stray non-credited ordinal on the credited receiver must STILL fire"
+    )
 
 
 # ===========================================================================
@@ -825,6 +1035,20 @@ def test_e2e_captured_conversion_rifle_binding_present_on_live_shape() -> None:
     child = rb.get("child")
     assert isinstance(field, str) and field, "carrier must carry a field projection"
     assert isinstance(child, str) and child, "carrier must carry a child projection"
+    # REDESIGN r3 — the captured carrier MUST carry the deterministic check-D anchor:
+    # cam_receiver (the C# camera receiver text, NEVER "" for an admitted fact) and
+    # cam_ordinal (the credited GetChild ordinal, an int). These are the load-bearing
+    # upstream identity the check-D exemption keys on; if the regen capture / rehydrate
+    # dropped either, the exemption silently reverts to the field-only r8 mask.
+    cam_receiver = rb.get("cam_receiver")
+    cam_ordinal = rb.get("cam_ordinal")
+    assert isinstance(cam_receiver, str) and cam_receiver, (
+        "the captured carrier must carry a non-empty cam_receiver (the deterministic "
+        f"r3 check-D anchor); got {cam_receiver!r}"
+    )
+    assert isinstance(cam_ordinal, int), (
+        f"the captured carrier must carry an int cam_ordinal; got {cam_ordinal!r}"
+    )
 
 
 @pytest.mark.skipif(
@@ -876,6 +1100,44 @@ def test_e2e_captured_conversion_independently_verifies_green() -> None:
         f"the captured discharged binding must verify clean, got {rig_rows}"
     )
     assert not any("rig_binding_present" in e for e in fail_closed_errors(res))
+
+
+@pytest.mark.skipif(
+    not _SIMPLEFPS_FIXTURE.exists(), reason="SimpleFPS corpus fixture not present"
+)
+def test_e2e_captured_player_passes_real_pipeline_gate_not_blocked(
+    tmp_path: Path,
+) -> None:
+    """REDESIGN r3 (acceptance f-r3 / g) END-TO-END — the captured live Player,
+    carried with its REAL 5-key ``rig_binding`` (incl. ``cam_receiver``/
+    ``cam_ordinal``) and its real ``child_ref_resolution`` budget, drives the REAL
+    ``Pipeline._run_contract_verifier`` gate and is NOT blocked: neither the rig
+    binding floor NOR check D (the r1 false-positive) lands an error on
+    ``ctx.errors`` -> conversion ``success`` stays True. This is the original r1
+    bug — the rifle conversion blocked by check D — proven GONE on the real
+    captured shape through the same hook the corpus gate uses."""
+    player = _load_fixture_player()
+    fx = json.loads(_SIMPLEFPS_FIXTURE.read_text(encoding="utf-8"))
+    raw = next(s for s in fx["scripts"] if s["name"] == "Player")
+    # Carry the captured child_ref_resolution budget so check D runs end-to-end.
+    crr = raw.get("child_ref_resolution")
+    assert isinstance(crr, dict), "the captured Player must carry child_ref_resolution"
+    script = RbxScript(
+        name="Player",
+        source=player["source"],
+        rig_binding=player["rig_binding"],
+        child_ref_resolution=crr,
+    )
+    gate = _run_pipeline_gate([script], tmp_path)
+    assert gate["success"] is True, (
+        "the captured discharged Player must NOT be blocked end-to-end (r1 bug "
+        f"fixed); got ctx.errors {gate['errors']}"
+    )
+    assert not any("child_ordinal_survivor" in e for e in gate["errors"]), (
+        f"check D must not false-positive on the captured discharged Player: "
+        f"{gate['errors']}"
+    )
+    assert not any("rig_binding_present" in e for e in gate["errors"])
 
 
 @pytest.mark.skipif(
