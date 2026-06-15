@@ -1875,3 +1875,79 @@ Slop deferred to /drive-finalize (no slop fixed here).
   `tools/check_no_any.sh` pass; new tests RED against pre-fix, green after. Changed files:
   `converter/converter/rifle_rig_retarget_lowering.py`, `converter/tests/test_rifle_rig_retarget.py`.
 - 2026-06-14T08:42:05Z FINALIZE de-slop: removed verified-dead rig-ordinal-write chain from contract_verifier.py (_rig_has_surviving_ordinal_write + _rig_statement_rhs_end + _rig_collapse_code_ws + _rig_is_ident_char + _RIG_ORDINAL_WRITE_TAIL_RE; kept live _rig_code_projection/_rig_line_continues); pruned dead-only test + dead assertions from test_rig_binding_present.py; trimmed round-by-round counter-commentary docstrings (lowering header+_binding_discharged, contract_verifier exemption/discharge/bracket-key, pipeline rehydrate, regen_contract_corpus _FIELDS) and fixed stale test-name citation. No behavior change; 3243 passed/45 skipped, no-Any pass.
+
+## Run: turret-projectile8-20260614T235948 (relation #8 — turret projectile/damage; 2026-06-15)
+
+
+## Run: turret-projectile8-20260614T235948 (relation #8 — turret projectile/damage; 2026-06-15)
+
+
+- **baseRef = upstream/main @ d624bd5** (latest, has the obligation-schema doc + 69 commits
+  newer than stale local main). Classification: Mechanical. Rationale: implement #8 against
+  current converter code; PRs target ntornow upstream.
+- **Carried the uncommitted design analysis as the opening commit** (4741861) on the feature
+  branch (TODO P0 turret entry + §8/§9 doc-row corrections). Classification: User-approved
+  (AskUserQuestion). 
+- **CORRECTED the damage mechanism from live evidence:** the live failure in the current
+  generic conversion is an INVALID `FindFirstChildOfType` API crash, not `Player:TakeDamage`→
+  curHealth (the analysis's variant). Both yield "no measured Humanoid damage". The damage fix
+  must be DETERMINISTIC (handle the AI-output non-determinism), per the obligation-schema /
+  upstream-source anchoring rule. Classification: Taste/architecture — confirm in design review.
+
+- **PIVOT (2026-06-15, user-directed + empirically validated): drop the projectile-specific design;
+  fix the GENERIC physics-unit mistranslation instead.** Root cause (live spike, physics-spike.md):
+  the bullet drops because Roblox mass is ~45x inflated (density formula ignores STUDS_PER_METER^3
+  volume scaling) + gravity is ~5.6x too strong for the scale (x20 vs geometry x3.571). The MOST
+  FAITHFUL conversion is a uniform similarity transform (lengths xSPM [done], mass x1, forces xSPM,
+  gravity xSPM). Chosen over mass-absorption variants because those distort mass (wrong momentum).
+  Fits the existing arch: unit-scaling is already AI-taught (prompt) + validator-checked; we extend
+  both to forces. No projectile classifier, no host primitive, no AI-output overwrite.
+  Classification: Taste/architecture (user-directed). Supersedes the 4-round projectile design
+  (archived in archive-projectile-v1/).
+
+- **DECISION (2026-06-15, user-chosen at the density-floor blocker): faithful launch via a GENERIC
+  HOST VELOCITY CORRECTION, not mass-fix-for-launch.** Roblox's density floor (0.01) makes
+  AssemblyMass==Unity_mass unreachable for large light parts (bullet min ~2.67, not 1.0), and at that
+  mass even SPM-scaled force gives only ~80 studs/s. So: a generic host pass corrects a force-launched
+  body's post-impulse velocity to the faithful Unity_speed x STUDS_PER_METER, sidestepping the floor.
+  Generic (all force-launched bodies, not bullet-specific); the AI still authors ApplyImpulse (host
+  corrects the OUTCOME, not the code). Classification: Taste/architecture (user-directed).
+  IMPLICATIONS for the design (REDESIGN needed):
+  * This SUBSUMES Phase 3's force-scaling (AI emits RAW force; the host velocity correction handles
+    the unit). Phase 3 likely reduces to the damage-API fix only.
+  * Mass correction (old Phase 1) becomes BEST-EFFORT / collision-momentum-only (floor-limited),
+    NOT the launch mechanism — lower priority, possibly deferred.
+  * The NEW central mechanism: a generic host velocity-correction for force-launched bodies. Open
+    design question for the redesign: how does the host detect "a body was just force-launched" and
+    know the faithful target (needs Unity_mass stamped + the raw impulse OR observing v_actual and
+    rescaling by (roblox_mass/Unity_mass)*SPM)? This is the riskiest unknown to spike.
+  * Gravity correction (Phase 2) unchanged.
+  => design.md (high-level) AND design-phase1.md must be reworked around this; re-run the dual-voice
+     design review on the reworked approach.
+
+- **REWORK to v3 (2026-06-15, fresh-session resume): faithful LAUNCH via a generic host
+  velocity-correction (option B implemented), density mass-correction DROPPED.** Spike
+  (physics-spike-v2-velocity-correction.md) proved the correction is MASS-AGNOSTIC
+  (factor=(m_rbx/m_unity)*SPM applied to the launch delta => v_target = impulse*SPM/m_unity, the
+  m_rbx cancels) so no density change is needed for the launch (corrected X=214.3 ≈ 60*SPM=214.26;
+  flew 287.7 studs). Detection is LIFECYCLE-TIED (sample v_before/v_after around Start on the
+  prefab-clone/Awake-Enable-Start seam), NOT a free-running jump watcher (spike: free-fall
+  false-fires under variable dt). New phase structure: P1=host velocity-correction (launch),
+  P2=damage-API fix (was P3's API half), P3=gravity (was P2, now fully independent). F16 GREEN =
+  P1 + P2; all three phases independent. Only the _UnityMass STAMP is kept from old-P1; force-scaling
+  (old-P3) subsumed by the host correction. Classification: Taste/architecture (user-directed B,
+  empirically validated). Supersedes the v2 unit-scaling design (archive-unitscale-v2/).
+
+- **Slice 1.5 dropped as a code slice (2026-06-15): `converter/output/` is GITIGNORED** (0 tracked
+  files), so the "fix the output script" half of the bug-fix protocol is a LOCAL regenerated artifact,
+  not committable code. The pipeline fix (slices 1.1-1.4) regenerates correct output on re-conversion.
+  Slice 1.5's acceptance moves to: A6 (integration no-regression) at the phase-1 integration review;
+  A7 (Studio e2e: bullet flies + damages) at the VERIFY stage — and full F16 needs Phase 2's damage-API
+  fix too, so the F16 e2e runs after Phase 2. Classification: right-sizing (gitignore reality).
+
+- **Phase 3 (scale-consistent gravity) SPLIT to a follow-up (2026-06-15, user-chosen at the Phase-3
+  scope gate).** F16 (the task goal) is delivered by Phases 1+2 (host impulse seam + valid damage API),
+  both hardened on the feature branch. Phase 3 is independent, off the F16 critical path, and the
+  widest-blast change (per-object gravity for every dynamic body in every game). Ship Phases 1+2 now;
+  Phase 3 becomes a separate effort with its own design/review/regression. Classification: User-approved
+  (AskUserQuestion) scope reduction.

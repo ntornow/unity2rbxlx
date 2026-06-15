@@ -452,3 +452,27 @@ pre-injection source. Mitigated by test_h1_elseif_* (drives real lowering on the
 corpus elseif shape). Optional hardening: add a committed test that reconstructs the
 raw (pre-injection) corpus Player source and re-runs the lowering, asserting
 present=True. reviewed-sha dcc7660.
+
+## Run: turret-projectile8-20260614T235948 (2026-06-15)
+
+
+## Run: turret-projectile8-20260614T235948 (2026-06-15)
+
+
+- (codex phasedesign1-r2 #5) TODO.md turret entry (:17-51) still states the OLD pre-pivot diagnosis
+  (projectile semantics: ApplyImpulse(60)+anti-gravity/raycast + damage surface). The run pivoted to
+  the unit-level root cause (mass 187 → AssemblyMass==m_Mass + force×SPM; see design.md + physics-spike.md).
+  Update the TODO turret entry to the unit-level diagnosis at ship (the ledger-promotion step).
+
+- (slice 1.1 harden) Add test coverage for the frozen-position-constraints anchored path
+  (m_Constraints & 0b111 == 0b111 -> not stamped) and assert unrelated attributes remain on the
+  outer Model after the geometry wrap. Codex MINOR on slice 1.1.
+
+- (Phase 3 — deferred from turret-projectile8, user-chosen) Scale-consistent gravity for dynamic
+  objects: unanchored non-character rigidbodies experience Unity_gravity × STUDS_PER_METER via a
+  per-ASSEMBLY runtime correction (keyed on stamped anchored/UseGravity/GravityScale), leaving the
+  player Humanoid on Roblox 196. Independent faithfulness (slow/long-range projectile arcs); the fast
+  turret bullet does NOT need it (live-verified). WIDE blast radius (every dynamic object, every game)
+  → its own design + review + corpus/canary regression + slow/long-range-arc acceptance. Design notes:
+  per-assembly (not per-part, to avoid fighting welded CoM); verify resting/sleeping behavior. See
+  design.md Phase 3 + archive for the original analysis.
