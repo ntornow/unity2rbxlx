@@ -1477,12 +1477,9 @@ class TestTemplateSceneRuntimeIdStamping:
         assert conv == "Assets/Prefabs/NoGuid.prefab"
 
     def test_prefab_stable_id_parity_project_root_none(self, tmp_path):
-        """When ``unity_project_root`` is None the two helpers now AGREE
-        (was xfail until the addressables Unit-1 3-way `_prefab_stable_id`
-        unification, D6c/D11). Both short-circuit to ``guid`` (no path
-        segment) — the planner no longer falls back to an absolute path.
-        Regression guard for the parity the resolved-name single-source
-        relies on."""
+        """``unity_project_root=None``: the converter and planner
+        ``_prefab_stable_id`` agree, both short-circuiting to ``guid`` with no
+        path segment (neither falls back to an absolute path)."""
         from converter.scene_converter import _prefab_stable_id as conv_stable
         from converter.scene_runtime_planner import (
             _prefab_stable_id as plan_stable,
@@ -1506,11 +1503,9 @@ class TestTemplateSceneRuntimeIdStamping:
         )
 
     def test_prefab_stable_id_parity_prefab_outside_root(self, tmp_path):
-        """Prefab outside the project root: the two helpers now AGREE
-        (was xfail until the Unit-1 3-way unification, D6c/D11). Both
-        skip the path segment the same way rather than the planner
-        falling back to an absolute path. Regression guard for the
-        out-of-tree / symlinked-layout asymmetry."""
+        """Prefab outside the project root: the converter and planner
+        ``_prefab_stable_id`` agree, both skipping the path segment rather
+        than the planner falling back to an absolute path."""
         from converter.scene_converter import _prefab_stable_id as conv_stable
         from converter.scene_runtime_planner import (
             _prefab_stable_id as plan_stable,
@@ -1548,10 +1543,9 @@ _RACCOON_ID = "2ae64d0eefab:Assets/Bundles/Characters/Raccoon/character.prefab"
 
 
 class TestGuid6Of:
-    """``_guid6_of`` must recognize ALL THREE prefab_id shapes — including the
-    colon-free BARE guid that ``canonical_prefab_id`` returns when
-    ``project_root is None`` (P2 logic bug: a colon-only check left two
-    colliding rootless ids both bare instead of ``base__guid6``)."""
+    """``_guid6_of`` recognizes all three prefab_id shapes, including the
+    colon-free bare guid ``canonical_prefab_id`` returns when
+    ``project_root is None``."""
 
     def test_colon_guid_id(self):
         assert _guid6_of(_CAT_ID) == "473ffa"
@@ -1764,10 +1758,9 @@ _ICON_GUID = "cafef00d00000000000000000000cccc"
 
 
 class TestSlice13EmitResolvedNames:
-    """Slice 1.3 — the emitter READS the planner's resolved Templates child
-    name (single source of truth, D8b), unions the addressable target set
-    (D14), reports ``referenced_but_missing`` on the BARE axis, and threads
-    the consumers (animation join D12, edge-9 collision guard)."""
+    """The emitter reads the planner's resolved Templates child names, unions
+    the addressable target set, reports ``referenced_but_missing`` on the bare
+    axis, and threads the consumers (animation join, collision guard)."""
 
     def _make_lib(self, tmp_path: Path):
         """Cat + Raccoon (both base ``character``, distinct hex guids) +
@@ -1796,10 +1789,9 @@ class TestSlice13EmitResolvedNames:
         return lib, gi, cat_id, rac_id, icon_id
 
     def _resolved(self, *pairs):
-        """Mimic what ``plan_scene_runtime`` would store: a resolved-name map
-        built by the SAME ``resolve_template_child_names`` the planner runs.
-        Driving the real resolver (not a hand-seeded map) keeps the test from
-        passing for the wrong reason."""
+        """Build the resolved-name map the same way ``plan_scene_runtime``
+        does — via the real ``resolve_template_child_names``, not a hand-seeded
+        map, so the test can't pass for the wrong reason."""
         return resolve_template_child_names(dict(pairs))
 
     def test_ac1_colliding_emits_two_distinct_resolved_names(self, tmp_path):
@@ -1854,8 +1846,8 @@ class TestSlice13EmitResolvedNames:
         assert m["total_prefabs"] == 3
 
     def test_addressable_only_emits_without_script_reference(self, tmp_path):
-        """A prefab whose bare name is NOT referenced by any script still
-        emits when it is in the addressable set (D14 union)."""
+        """A prefab whose bare name is not referenced by any script still
+        emits when it is in the addressable set."""
         lib, gi, cat_id, rac_id, icon_id = self._make_lib(tmp_path)
         resolved = self._resolved((cat_id, "character"), (rac_id, "character"))
         result = generate_prefab_packages(
@@ -1908,9 +1900,9 @@ class TestSlice13EmitResolvedNames:
         assert len(result.templates) == 2
 
     def test_miss_on_colliding_base_warns_and_skips(self, tmp_path, caplog):
-        """D15 MISS policy: a colliding base with NO resolved-name entry is
-        WARN+skipped (fail-soft, no raise, no wrong-template clone). The
-        unique sibling in the same run is unaffected."""
+        """A colliding base with no resolved-name entry is WARN+skipped
+        (fail-soft, no raise, no wrong-template clone); the unique sibling
+        in the same run is unaffected."""
         import logging
         lib, gi, cat_id, rac_id, icon_id = self._make_lib(tmp_path)
         # Resolved map MISSES both colliding ``character`` ids (defensive
@@ -1945,10 +1937,10 @@ class TestSlice13EmitResolvedNames:
 
 
 class TestSlice13AnimationJoinThreading:
-    """Slice 1.3 / D12 — the prefab-scoped animation join indexes templates by
-    the RESOLVED name. A non-colliding prefab (resolved==bare) attaches as
-    before; a colliding base is skipped + WARNed (the bare ``script_scopes``
-    key can't identify which resolved template — never misroute)."""
+    """The prefab-scoped animation join indexes templates by the resolved
+    name. A non-colliding prefab (resolved==bare) attaches as before; a
+    colliding base is skipped + WARNed (the bare ``script_scopes`` key can't
+    identify which resolved template — never misroute)."""
 
     def _make_pipeline(self, tmp_path: Path):
         from converter.pipeline import Pipeline
@@ -2058,11 +2050,10 @@ class TestSlice13AnimationJoinThreading:
     def test_ac9_mixed_guided_guidless_collision_skips_with_warn(
         self, tmp_path, caplog,
     ):
-        """D12 codex MAJOR-1: a colliding base where one prefab is guided
-        (resolves to ``character__473ffa``) and one is guid-less (stays bare
-        ``character``) leaves the BARE template present. The skip must fire on
-        collision membership ALONE — NOT misroute the driver onto that bare
-        template just because the key happens to be present."""
+        """A colliding base where one prefab is guided (``character__473ffa``)
+        and one is guid-less (stays bare ``character``) leaves the bare template
+        present. The skip must fire on collision membership alone, not misroute
+        the driver onto that bare template just because the key is present."""
         import logging
         from core.roblox_types import RbxPart, RbxScript
         from core.unity_types import PrefabLibrary
@@ -2116,10 +2107,10 @@ class TestSlice13AnimationJoinThreading:
 
 
 class TestSlice13VariantParentUniqueness:
-    """Slice 1.3 / D13 codex MAJOR-2 — variant chains are scoped OUT of the
-    resolved-name rename, but a bare ``VariantParentTemplate`` is only an
-    unambiguous handle while no two emitted prefabs share that parent BASE.
-    A collision among emitted variant parents must WARN (fail-soft)."""
+    """Variant chains are scoped out of the resolved-name rename, but a bare
+    ``VariantParentTemplate`` is only an unambiguous handle while no two
+    emitted prefabs share that parent base. A collision among emitted variant
+    parents must WARN (fail-soft)."""
 
     def test_colliding_variant_parent_base_warns(self, tmp_path, caplog):
         """Two emitted variants descend from parents whose bare names collide

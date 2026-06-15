@@ -1,12 +1,12 @@
 """
-prefab_id.py -- Single canonical prefab-id construction (Slice 1.2 / D11).
+prefab_id.py -- Single canonical prefab-id construction.
 
-The prefab ``prefab_id`` join key is produced in three places: the scene-runtime
+The ``prefab_id`` join key is produced in three places: the scene-runtime
 planner (subplan key), the scene converter (converter-time stamp), and the
-addressables resolver (``by_address``/``by_label`` -> prefab_id). They MUST agree
+addressables resolver (``by_address``/``by_label`` -> prefab_id). They must agree
 byte-for-byte or the resolver's addressable ids point at keys the host's
-``_plan.prefabs`` never holds. This module holds the ONE implementation all three
-delegate to (D6c / AC14).
+``_plan.prefabs`` never holds. This module holds the one implementation all three
+delegate to.
 """
 
 from __future__ import annotations

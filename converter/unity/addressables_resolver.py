@@ -151,12 +151,9 @@ def resolve_prefab_addressables(
         path = getattr(entry, "asset_path", None) if entry is not None else None
         if path is None or path.suffix != ".prefab":
             return None
-        # Delegate to the shared canonical-id core (Slice 1.2 / D11) so the
-        # addressable prefab_id is byte-identical with the planner /
-        # scene_converter ``_prefab_stable_id`` join key — INCLUDING the
-        # outside-root / no-project-root fallbacks. ``asset_path`` is the
-        # absolute, ``.resolve()``d prefab path; the core forward-slashes the
-        # project-relative segment, so a Windows-native skew can't occur.
+        # Shared canonical-id core so the addressable prefab_id is byte-
+        # identical with the planner / scene_converter ``_prefab_stable_id``
+        # join key, including the outside-root / no-project-root fallbacks.
         pid = canonical_prefab_id(guid, path, project_root)
         return pid if pid else None
 

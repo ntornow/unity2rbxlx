@@ -650,14 +650,11 @@ class Pipeline:
     ESSENTIAL_PHASES: frozenset[str] = frozenset({
         "parse", "extract_assets", "convert_materials",
         "transpile_scripts", "convert_animations", "convert_scene",
-        # Addressables Unit 1 (D8 / fact 10): ``plan_scene_runtime``
-        # builds the ``addressables`` block + the collision-conditional
-        # resolved ``template_name`` map. It must re-run on every resumed
-        # invocation so a ``--phase=write_output`` resume recomputes them
-        # fresh against the current ``prefab_library`` — never pairing a
-        # fresh library with a stale persisted map. The phase is
-        # read-only + idempotent, so making it essential has no unwanted
-        # side effect.
+        # ``plan_scene_runtime`` builds the ``addressables`` block + the
+        # resolved ``template_name`` map write_output consumes — it must
+        # re-run on resume so a ``--phase=write_output`` resume recomputes
+        # them against the current ``prefab_library`` rather than pairing a
+        # fresh library with a stale persisted map. Read-only + idempotent.
         "plan_scene_runtime",
         # Phase 2a slice 8: ``materialize_and_classify`` populates
         # ``state.rbx_place.scripts`` (in-memory) which write_output
@@ -1006,15 +1003,12 @@ class Pipeline:
         )
 
     def _build_addressables_block(self) -> PrefabAddressables | None:
-        """Parse the project's Addressables groups and narrow them to
-        instantiable prefab ids (D7 / D8 / fact 9).
+        """Parse the project's Addressables groups, narrowed to prefab ids.
 
-        Returns the ``PrefabAddressables`` (carrying ``by_address`` +
-        ``by_label`` + ``prefab_ids``) when the project has resolvable
-        addressable prefabs, else ``None`` (no GuidIndex, no
-        AddressableAssetsData dir, or no prefab-narrowed entries) so the
-        caller omits the block entirely — inert for non-Addressables
-        conversions.
+        Returns the ``PrefabAddressables`` (``by_address`` / ``by_label`` /
+        ``prefab_ids``) when the project has resolvable addressable prefabs,
+        else ``None`` (no GuidIndex, no AddressableAssetsData dir, or no
+        prefab entries) so the caller omits the block entirely.
         """
         from unity.addressables_resolver import (
             parse_addressables,
@@ -1078,12 +1072,10 @@ class Pipeline:
             unity_project_root=self.unity_project_path,
         )
 
-        # --- Addressables Unit 1 (Slice 1.2): resolver -> plan bridge ---
-        # Parse the project's Addressables groups and narrow them to
-        # instantiable prefab ids, then attach the block to the artifact
-        # (D7 / D8). This is the SINGLE source of truth for the resolved
-        # ``template_name`` map below; both happen before the artifact is
-        # frozen onto ``self.ctx.scene_runtime``.
+        # Parse the project's Addressables groups (narrowed to prefab ids) and
+        # attach the block to the artifact before it freezes onto
+        # ``self.ctx.scene_runtime``. The narrowed ids also feed the
+        # resolved-name pass below.
         resolved = self._build_addressables_block()
         addr_ids: set[str] = set()
         if resolved is not None:
@@ -1100,12 +1092,10 @@ class Pipeline:
                 resolved.skipped_non_prefab,
             )
 
-        # --- Resolved-name pass (single source of truth; D6/D8b/D14) ---
-        # Collision-conditionally re-key the on-disk Templates child name
-        # (== ``template_name``) over the EMITTED prefab set only, so a
-        # non-emitted same-base sibling never forces a suffix (fact 11).
-        # The emitter (Slice 1.3) READS these resolved names back; it does
-        # NOT recompute them.
+        # Resolved-name pass (single source of truth): collision-conditionally
+        # re-key the on-disk Templates child name (== ``template_name``) over the
+        # EMITTED prefab set only, so a non-emitted same-base sibling never
+        # forces a suffix. The emitter reads these back; it does not recompute.
         from converter.prefab_packages import (
             resolve_template_child_names,
             select_emitted_prefab_ids,
@@ -5920,9 +5910,9 @@ script.Disabled = true
             os.environ.get("U2R_LEGACY_PREFAB_PIVOT", "").lower()
             in {"1", "true", "yes"}
         )
-        # Single source of truth (D8b): read the RESOLVED Templates child names
-        # + the addressable emission target set from ``ctx.scene_runtime``,
-        # freshly recomputed by the now-essential ``plan_scene_runtime`` (D8).
+        # Read the resolved Templates child names + the addressable emission
+        # target set from ``ctx.scene_runtime`` (recomputed each run by the
+        # now-essential ``plan_scene_runtime``).
         scene_runtime = self.ctx.scene_runtime or {}
         resolved_template_names: dict[str, str] = {}
         for pid, sub in (scene_runtime.get("prefabs") or {}).items():
@@ -6030,23 +6020,14 @@ script.Disabled = true
             s.name: s for s in self.state.rbx_place.scripts
         }
 
-        # D12: ``script_scopes`` keys templates by the BARE prefab name, but the
-        # emitted templates now carry the RESOLVED (possibly suffixed) name. For
-        # a non-colliding prefab resolved == bare, so the direct lookup hits and
-        # the join is unchanged. For a COLLIDING base, the bare key cannot
-        # identify WHICH template the driver belongs to (identity was lost
-        # upstream — see D12), so we skip + WARN rather than misroute it onto an
-        # arbitrary colliding template. Bare bases that collide among emitted
-        # templates are reconstructed from the planner's resolved-name map.
-        #
-        # The skip is gated on collision membership ALONE — NOT on the bare key
-        # being absent from ``templates_by_name``. A mixed guided/guid-less
-        # collision (one prefab resolved to ``base__guid6`` while a sibling kept
-        # the bare ``base`` — e.g. ``character__473ffa`` + a guid-less
-        # ``character``) leaves the bare template PRESENT; gating on absence
-        # would then misroute ``Anim_character_*`` onto that arbitrary bare
-        # template. A colliding base is irrecoverable from a bare key either way,
-        # so skip+WARN unconditionally for any colliding base (D12).
+        # ``script_scopes`` keys templates by the BARE prefab name, but emitted
+        # templates carry the RESOLVED (possibly suffixed) name. A non-colliding
+        # base resolves to itself, so the direct lookup is unchanged; a colliding
+        # base can't identify which resolved template the driver belongs to, so
+        # skip + WARN rather than misroute it. The skip is gated on collision
+        # membership alone, not on the bare key being absent: a mixed guided /
+        # guid-less collision leaves the bare template present, where gating on
+        # absence would misroute onto it.
         colliding_bare_bases = self._colliding_emitted_bare_bases()
 
         from copy import copy as _shallow_copy
@@ -6081,15 +6062,13 @@ script.Disabled = true
             )
 
     def _colliding_emitted_bare_bases(self) -> set[str]:
-        """Bare prefab base names that COLLIDE among the emitted templates.
+        """Bare prefab base names that collide among the emitted templates.
 
-        Reconstructed from the planner's single-source-of-truth resolved-name
-        map (``ctx.scene_runtime["prefabs"][pid]["template_name"]``) paired with
-        each prefab's BARE base name from the library — keyed on the SAME
-        ``_prefab_stable_id`` the planner used (D8b/D14). A base is colliding
-        iff 2+ emitted prefabs share it; for those, the resolved name is
-        suffixed (``base__guid6``) so a bare ``script_scopes`` key can't pick
-        the right template (D12).
+        Counts bare names over the emitted set, keyed on the same
+        ``_prefab_stable_id`` the planner uses. A base is colliding iff 2+
+        emitted prefabs share it; for those the resolved name is suffixed
+        (``base__guid6``), so a bare ``script_scopes`` key can't pick the
+        right template.
         """
         scene_runtime = self.ctx.scene_runtime or {}
         prefab_library = self.state.prefab_library
@@ -6108,8 +6087,8 @@ script.Disabled = true
                         pid for pid in ids if isinstance(pid, str)
                     )
 
-        # Scope the collision domain to the EMITTED set (D14), NOT the full
-        # plan's ``prefabs`` block (which carries every parsed prefab).
+        # Scope the collision domain to the EMITTED set, not the full plan's
+        # ``prefabs`` block (which carries every parsed prefab).
         emitted_ids = select_emitted_prefab_ids(
             prefab_library,
             self.ctx.serialized_field_refs or None,

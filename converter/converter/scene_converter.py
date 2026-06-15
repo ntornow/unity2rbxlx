@@ -305,7 +305,7 @@ def _prefab_stable_id(
     """Stable ``prefab_id`` = ``"<guid>:<project-relative-path>"``.
 
     Delegates to ``unity.prefab_id.canonical_prefab_id`` (the same shared
-    core the planner and addressables resolver use, Slice 1.2 / D11) so a
+    core the planner and addressables resolver use) so a
     converter-time stamp produced by ``_convert_prefab_node`` matches
     the ``game_object_id`` PR1 emits for the same prefab template.
     Returns the empty string when neither a GUID nor a project-relative

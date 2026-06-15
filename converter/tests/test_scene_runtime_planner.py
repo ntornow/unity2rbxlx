@@ -1480,10 +1480,9 @@ class TestHasCharacterController:
 
 class TestPrefabStableIdThreeWayParity:
     """The planner ``_prefab_stable_id``, the emitter
-    ``scene_converter._prefab_stable_id``, and the resolver's
-    ``prefab_id_for`` must produce the BYTE-IDENTICAL id for the same
-    prefab (design fact 1 / AC14). Pins the load-bearing join key directly
-    rather than only catching skew at integration."""
+    ``scene_converter._prefab_stable_id``, and the resolver's ``prefab_id_for``
+    produce a byte-identical id for the same prefab, pinning the join key
+    directly rather than only catching skew at integration."""
 
     def _build(self, tmp_path: Path, rel: str, name: str, guid: str):
         from core.unity_types import PrefabLibrary
@@ -1539,10 +1538,9 @@ class TestPrefabStableIdThreeWayParity:
         return ids[0] if ids else None
 
     def test_outside_root_three_way_empty_string(self, tmp_path: Path):
-        """A prefab outside the project root: planner, emitter, AND the
-        resolver all skip it byte-identically — planner/emitter return ``""``
-        (skip-stamping) and the resolver drops the address (``None``). The
-        previously divergent path-based planner fallback is gone (D6c)."""
+        """A prefab outside the project root: planner, emitter, and resolver
+        all skip it byte-identically — planner/emitter return ``""``
+        (skip-stamping) and the resolver drops the address (``None``)."""
         from converter.scene_converter import _prefab_stable_id as conv_id
         from converter.scene_runtime_planner import _prefab_stable_id as plan_id
 
@@ -1572,11 +1570,9 @@ class TestPrefabStableIdThreeWayParity:
         assert res is None
 
     def test_project_root_none_three_way_guid_only(self, tmp_path: Path):
-        """project_root=None: planner, emitter, AND the resolver all
-        short-circuit to the bare guid (no path segment), byte-identical (D6c).
-        The resolver reaches the project_root=None branch via a guid_index
-        whose ``project_root`` is None — the same input ``canonical_prefab_id``
-        treats as root-less."""
+        """project_root=None: planner, emitter, and resolver all short-circuit
+        to the bare guid (no path segment), byte-identical. The resolver
+        reaches that branch via a guid_index whose ``project_root`` is None."""
         from types import SimpleNamespace
 
         from converter.scene_converter import _prefab_stable_id as conv_id
@@ -1779,19 +1775,12 @@ class TestPlanSceneRuntimeIsEssential:
     def test_resume_recomputes_addressables_over_stale_persisted_block(
         self, tmp_path: Path,
     ):
-        """AC8 (behavioral half). A ``--phase write_output`` resume re-runs
-        ``plan_scene_runtime`` (it is ESSENTIAL), so a STALE persisted
-        ``ctx.scene_runtime`` (a resolved-name/addressables block from a prior
-        run) is RECOMPUTED fresh — never paired stale with a fresh
-        ``prefab_library`` (codex-R2 hazard, D8). Then the real emitter, reading
-        the recomputed ``ctx.scene_runtime``, still emits the addressable
-        templates under the FRESH resolved names.
-
-        Drives the REAL ``Pipeline.plan_scene_runtime`` recompute + the REAL
-        ``generate_prefab_packages`` reading from ctx — proving recompute, not
-        stale reuse. If ``plan_scene_runtime`` reused the persisted block (or
-        were dropped from ESSENTIAL_PHASES so a resume never re-ran it), the
-        stale poison values would survive and these assertions would fail."""
+        """A ``--phase write_output`` resume re-runs ``plan_scene_runtime``
+        (it is ESSENTIAL), so a stale persisted ``ctx.scene_runtime`` block is
+        recomputed fresh rather than paired with a fresh ``prefab_library``;
+        the real emitter then emits the addressable templates under the fresh
+        resolved names. Drives the real recompute + the real
+        ``generate_prefab_packages`` so a reused stale block would fail it."""
         from converter.prefab_packages import generate_prefab_packages
 
         p = TestPlanSceneRuntimePipelineBridge()._make_pipeline(tmp_path)

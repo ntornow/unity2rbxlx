@@ -439,11 +439,9 @@ def _prefab_stable_id(
     this id shape); the GUID disambiguates while the path keeps the id
     legible in dumps.
 
-    Delegates to ``unity.prefab_id.canonical_prefab_id`` (Slice 1.2 / D11) so
-    the planner-side resolved-name map, the emitter-side ``prefab_namespace``,
-    and the resolver's ``prefab_id_for`` all join on the SAME key. The
-    outside-root / no-root fallback (guid-or-empty form, never the absolute-path
-    fallback of ``_relative_path_string``) lives in that shared core.
+    Delegates to ``unity.prefab_id.canonical_prefab_id`` — the shared core
+    the emitter and the addressables resolver also use, so every prefab_id
+    joins on the same key (including the outside-root / no-root fallback).
     """
     guid = ""
     if guid_index is not None:

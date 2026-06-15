@@ -825,13 +825,11 @@ local function resolveModule(scriptId, modulePath)
 end
 
 -- SceneRuntimePlan carries ``plan.prefabs[prefab_id].template_name``: the
--- RESOLVED Templates child name (Addressables Unit 1). The planner keys
--- both the on-disk Templates child name AND this ``template_name`` to the
--- SAME collision-conditional name — the bare prefab name when its base is
--- unique among emitted prefabs, ``base__guid6`` when 2+ emitted prefabs
--- share a base. So two prefabs that share a bare name in different folders
--- resolve to DISTINCT Templates entries; the bare-name lookup here is
--- correct only because the upstream re-key already disambiguated.
+-- resolved Templates child name (the bare prefab name, or ``base__guid6``
+-- when emitted prefabs collide on a base). The planner keys both the
+-- on-disk Templates child name and this field to the same resolved name, so
+-- prefabs that share a bare name in different folders resolve to distinct
+-- Templates entries.
 local function _resolveTemplate(prefabId)
     local prefab = (Plan.prefabs or {})[prefabId]
     local templateName = prefab and prefab.template_name
@@ -998,11 +996,9 @@ local function resolveModule(scriptId, modulePath)
 end
 
 -- See SceneRuntimeClient for the rationale: prefab templates live under
--- ReplicatedStorage.Templates keyed by their RESOLVED name (the bare
--- prefab name, or ``base__guid6`` when emitted prefabs collide on a base
--- name — Addressables Unit 1); the plan's ``template_name`` field carries
--- that same resolved name so the stable prefab_id bridges to the right
--- Templates child.
+-- ReplicatedStorage.Templates keyed by their resolved name (the bare prefab
+-- name, or ``base__guid6`` on a base collision); the plan's ``template_name``
+-- field carries that resolved name so the stable prefab_id bridges to it.
 local function _resolveTemplate(prefabId)
     local prefab = (Plan.prefabs or {})[prefabId]
     local templateName = prefab and prefab.template_name

@@ -111,12 +111,10 @@ class TestResolve:
         assert res.prefab_ids == set()
 
     def test_prefab_id_rel_is_posix_normalized(self, tmp_path):
-        """Slice 1.2 / D11: the resolver routes through the shared
-        ``canonical_prefab_id`` core, whose project-relative segment is always
-        ``.as_posix()`` forward-slashed — so the resolver prefab_id is
-        byte-identical with the planner / scene_converter ``_prefab_stable_id``
-        ids regardless of the host OS path separator. Driven via a REAL
-        ``GuidIndex`` + concrete ``asset_path`` (the production shape)."""
+        """The resolver routes through the shared ``canonical_prefab_id`` core,
+        whose project-relative segment is always ``.as_posix()`` forward-
+        slashed — so the resolver prefab_id is byte-identical with the planner /
+        scene_converter ids regardless of the host OS path separator."""
         idx = parse_addressables(_project(tmp_path, GROUP))
         gi = _guid_index(
             {"catguid": "Assets/Bundles/Characters/Cat/character.prefab"},

@@ -2022,14 +2022,12 @@ function SceneRuntime:_constructPrefabClone(clone, prefab, prefab_id, includeScr
 	return componentList
 end
 
--- Resolve an Addressables address (the human-facing string passed to
--- ``Addressables.InstantiateAsync``) to a concrete prefab_id via the
--- plan's ``addressables.by_address`` map (populated by the planner
--- bridge). Fail soft: an unknown / empty address warns and returns nil
--- so the caller drops the spawn rather than crashing. A multi-candidate
--- address picks the first id (resolver-deterministic order) + warns
--- (D9). ``by_label`` is emitted but NOT consumed here (Unit-2 concern,
--- D10).
+-- Resolve an Addressables address (the string passed to
+-- ``Addressables.InstantiateAsync``) to a concrete prefab_id via the plan's
+-- ``addressables.by_address`` map. Fail soft: an unknown / empty address warns
+-- and returns nil so the caller drops the spawn. A multi-candidate address
+-- picks the first id (resolver-deterministic order) + warns. ``by_label`` is
+-- emitted but not consumed here.
 function SceneRuntime:_resolveAddressToPrefabId(address)
 	-- Fail soft on a malformed addressables block: a truthy non-table
 	-- ``addressables`` (or ``by_address``) would otherwise raise on index.
