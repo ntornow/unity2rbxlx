@@ -47,3 +47,11 @@ def test_zero_gravity_field_survives_plan_emit() -> None:
     )
     assert "gravityDesiredBaseStuds" in script.source
     assert repr(0.0) in script.source
+
+
+def test_gravity_field_absent_when_not_stashed() -> None:
+    """When gravityDesiredBaseStuds is NOT stashed in scene_runtime, the emitted
+    plan ModuleScript does NOT carry the field (deterministic fallback: the client
+    hook then reads its `or DEFAULT` path). Pins the no-key companion of AC16."""
+    script = generate_scene_runtime_plan_module({"modules": {}})
+    assert "gravityDesiredBaseStuds" not in script.source

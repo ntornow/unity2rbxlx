@@ -124,6 +124,38 @@ def test_nonzero_z_warns(tmp_path: Path) -> None:
     assert any("non-uniform" in w for w in warnings)
 
 
+def test_malformed_unclosed_line_falls_back_to_default(tmp_path: Path) -> None:
+    """A malformed m_Gravity line (missing closing ``}``) must NOT span newlines
+    and mis-parse into the next inline map; it falls back to the 9.81 default.
+
+    Pre-fix the body matcher was ``[^}]*`` which spans newlines, so an unclosed
+    m_Gravity line would consume through to the first ``}`` on the following
+    ``m_ClothGravity`` line and return abs of THAT line's y (-9.81 here, but the
+    regression is the wrong-line read; we choose a distinctive cloth y so the
+    pre-fix code returns the cloth magnitude, not the default).
+    """
+    settings = tmp_path / "ProjectSettings"
+    settings.mkdir(parents=True)
+    # m_Gravity is missing its closing brace; m_ClothGravity below has a distinct
+    # magnitude. The fixed single-line matcher must NOT match the unclosed line
+    # (no ``}`` on it) -> falls back to the default.
+    (settings / "DynamicsManager.asset").write_text(
+        "%YAML 1.1\n"
+        "%TAG !u! tag:unity3d.com,2011:\n"
+        "--- !u!55 &1\n"
+        "PhysicsManager:\n"
+        "  m_Gravity: {x: 0, y: -20.0, z: 0\n"
+        "  m_ClothGravity: {x: 0, y: -77.0, z: 0}\n",
+        encoding="utf-8",
+    )
+    g = parse_project_gravity_y(tmp_path, warn=_silent)
+    # Fixed code: single-line matcher misses the unclosed line -> default.
+    # Pre-fix code: [^}]* spans the newline, captures "x: 0, y: -20.0, z: 0\n
+    # m_ClothGravity: {x: 0, y: -77.0, z: 0" -> first y in body is -20.0 ->
+    # would return 20.0 (mis-parse), NOT the default.
+    assert repr(g) == repr(DEFAULT_UNITY_GRAVITY_Y)
+
+
 def test_does_not_pick_up_cloth_gravity(tmp_path: Path) -> None:
     """m_ClothGravity (a sibling) must NOT be read as m_Gravity."""
     # m_Gravity has a distinctive magnitude; m_ClothGravity stays at -9.81.

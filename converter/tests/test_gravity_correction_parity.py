@@ -50,13 +50,21 @@ from converter.autogen import _GRAVITY_CORRECTION_HELPER_LUAU  # noqa: E402
 
 RUNTIME_PATH = Path(__file__).parent.parent / "runtime" / "scene_runtime.luau"
 
-# Stable anchors bounding the mirrored helper body inside scene_runtime.luau.
-# NOT fixed line numbers -- located by the upvalue-decl + ``do`` opener and the
-# upvalue-capture + ``end`` closer the mirror was deliberately wrapped in
-# (slice 1.3, D-1.3a). Anything between these anchors is the mirrored LOGIC
-# (incl. the mirror's own ``local TAG`` line, which the normalizer excludes).
-_MIRROR_OPEN = "local _gravityCorrectDynamicAssembly\ndo\n"
-_MIRROR_CLOSE = "\n\t_gravityCorrectDynamicAssembly = correctDynamicAssembly\nend\n"
+# Stable sentinel LINES bounding the mirrored helper body inside
+# scene_runtime.luau. NOT fixed line numbers and NOT exact-byte anchors -- they
+# are matched after ``splitlines()`` + ``strip()`` so the comparison is
+# WHITESPACE/INDENT-INSENSITIVE: a wrapper-only reindent (tabs<->spaces, a
+# changed ``do``-block depth) must NOT trip the hard-error path before the
+# helper-body line-for-line comparison runs. Located by the upvalue-decl + ``do``
+# opener and the upvalue-capture + ``end`` closer the mirror was deliberately
+# wrapped in (slice 1.3, D-1.3a). Anything between these sentinels is the
+# mirrored LOGIC (incl. the mirror's own ``local TAG`` line, which the normalizer
+# excludes). Matched on the stripped line content, so leading indentation of the
+# sentinels themselves is irrelevant.
+_MIRROR_OPEN_DECL = "local _gravityCorrectDynamicAssembly"
+_MIRROR_OPEN_DO = "do"
+_MIRROR_CLOSE_CAPTURE = "_gravityCorrectDynamicAssembly = correctDynamicAssembly"
+_MIRROR_CLOSE_END = "end"
 
 # Wrapper-only LOGIC lines present on the mirror side but NOT in the canonical
 # helper body (the canonical text gets its ``TAG`` from the surrounding server
@@ -84,19 +92,41 @@ def _normalized_logic_lines(text: str) -> list[str]:
 
 def _extract_mirror_body() -> str:
     """The raw text of the mirrored helper, between the stable ``do``/``end``
-    anchors. Robust to whitespace/comment drift inside the block; fails loudly
-    (the anchors are load-bearing) if the wrapper shape ever changes."""
+    sentinel LINES. Located indent-insensitively (each line ``strip()``-ed before
+    matching) so a wrapper-only reindent does NOT trip this hard-error path before
+    the helper-body comparison; fails loudly (the sentinels are load-bearing) only
+    if the wrapper SHAPE actually changed.
+
+    The opener is the ``local _gravityCorrectDynamicAssembly`` decl immediately
+    followed by a ``do`` line; the body runs up to (exclusive) the
+    ``_gravityCorrectDynamicAssembly = correctDynamicAssembly`` capture line. The
+    extracted body text preserves the original (indented) source lines so the
+    normalizer in ``_normalized_logic_lines`` still does the whitespace collapse.
+    """
     source = RUNTIME_PATH.read_text(encoding="utf-8")
-    try:
-        start = source.index(_MIRROR_OPEN) + len(_MIRROR_OPEN)
-        end = source.index(_MIRROR_CLOSE, start)
-    except ValueError as exc:  # pragma: no cover - anchor drift is a hard error
+    lines = source.splitlines()
+    stripped = [ln.strip() for ln in lines]
+
+    open_idx: int | None = None
+    for i in range(len(stripped) - 1):
+        if stripped[i] == _MIRROR_OPEN_DECL and stripped[i + 1] == _MIRROR_OPEN_DO:
+            open_idx = i + 2  # body starts after the ``do`` line
+            break
+
+    close_idx: int | None = None
+    if open_idx is not None:
+        for j in range(open_idx, len(stripped)):
+            if stripped[j] == _MIRROR_CLOSE_CAPTURE:
+                close_idx = j  # body ends BEFORE the capture line
+                break
+
+    if open_idx is None or close_idx is None:
         raise AssertionError(
             "could not locate the mirrored correctDynamicAssembly do/end block "
-            "in scene_runtime.luau via its stable anchors -- the slice-1.3 "
-            "wrapper shape changed; update the parity-test anchors deliberately"
-        ) from exc
-    return source[start:end]
+            "in scene_runtime.luau via its stable sentinel lines -- the slice-1.3 "
+            "wrapper shape changed; update the parity-test sentinels deliberately"
+        )
+    return "\n".join(lines[open_idx:close_idx])
 
 
 def _canonical_body_lines() -> list[str]:
@@ -113,11 +143,20 @@ def _mirror_body_lines() -> list[str]:
 
 
 def test_mirror_body_extraction_is_unambiguous() -> None:
-    """The stable anchors locate exactly one mirrored block and it is non-empty
-    (a precondition for the parity comparison having teeth)."""
+    """The stable sentinel lines locate exactly one mirrored block (indent-
+    insensitively) and it is non-empty (a precondition for the parity comparison
+    having teeth)."""
     source = RUNTIME_PATH.read_text(encoding="utf-8")
-    assert source.count(_MIRROR_OPEN) == 1
-    assert source.count(_MIRROR_CLOSE) == 1
+    stripped = [ln.strip() for ln in source.splitlines()]
+    # Exactly one opener (decl line immediately followed by a ``do`` line).
+    openers = sum(
+        1
+        for i in range(len(stripped) - 1)
+        if stripped[i] == _MIRROR_OPEN_DECL and stripped[i + 1] == _MIRROR_OPEN_DO
+    )
+    assert openers == 1, f"expected exactly one mirror opener, found {openers}"
+    captures = stripped.count(_MIRROR_CLOSE_CAPTURE)
+    assert captures == 1, f"expected exactly one mirror capture line, found {captures}"
     assert _mirror_body_lines(), "mirror body extracted empty"
 
 

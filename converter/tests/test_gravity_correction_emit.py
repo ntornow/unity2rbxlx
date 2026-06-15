@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import config as _config
 from converter.autogen import generate_gravity_correction_server_script
 from converter.pipeline import Pipeline
+from core.conversion_context import ConversionContext
 from core.roblox_types import RbxPart, RbxPlace, RbxScript
 from utils import luau_analyze
 
@@ -41,6 +42,35 @@ def _make_pipeline(tmp_path: Path) -> Pipeline:
     pipeline.state.rbx_place = RbxPlace()
     pipeline.ctx.scene_runtime_mode = "generic"
     pipeline.ctx.scene_runtime = {"gravityDesiredBaseStuds": 35.03}
+    return pipeline
+
+
+def _write_dynamics_manager(unity_project: Path, *, y: float) -> None:
+    """Write a real-shaped ProjectSettings/DynamicsManager.asset so
+    ``plan_scene_runtime`` parses an actual gravity scalar (not the default)."""
+    settings = unity_project / "ProjectSettings"
+    settings.mkdir(parents=True, exist_ok=True)
+    (settings / "DynamicsManager.asset").write_text(
+        "%YAML 1.1\n"
+        "%TAG !u! tag:unity3d.com,2011:\n"
+        "--- !u!55 &1\n"
+        "PhysicsManager:\n"
+        f"  m_Gravity: {{x: 0, y: {y}, z: 0}}\n",
+        encoding="utf-8",
+    )
+
+
+def _make_pipeline_with_real_gravity(tmp_path: Path, *, y: float) -> Pipeline:
+    """A pipeline whose Unity project carries a real DynamicsManager.asset and
+    whose stash is NOT pre-seeded -- so ``plan_scene_runtime`` is the producer."""
+    unity_project = tmp_path / "unity"
+    (unity_project / "Assets").mkdir(parents=True)
+    _write_dynamics_manager(unity_project, y=y)
+    output = tmp_path / "out"
+    output.mkdir()
+    pipeline = Pipeline(str(unity_project), str(output))
+    pipeline.state.rbx_place = RbxPlace()
+    pipeline.ctx.scene_runtime_mode = "generic"
     return pipeline
 
 
@@ -133,6 +163,53 @@ class TestBakedServerScript:
         src = generate_gravity_correction_server_script(35.03)
         errors = luau_analyze.syntax_errors_for_source(src)
         assert errors == [], errors
+
+
+# --------------------------------------------------------------------------
+# AC8c / AC8e -- the _UnityMass/_Rigidbody2D guard is present on BOTH scan
+# surfaces (boot sweep AND DescendantAdded) and is class-agnostic (NOT gated
+# on IsA("BasePart")).
+# --------------------------------------------------------------------------
+class TestBothScanSurfacesGuarded:
+    _GUARD = (
+        'd:GetAttribute("_UnityMass") ~= nil and '
+        'd:GetAttribute("_Rigidbody2D") == nil'
+    )
+
+    def _boot_and_added(self, src: str) -> tuple[str, str]:
+        """Split the emitted source into (boot-sweep region, DescendantAdded
+        region) so each surface is asserted independently. A guard dropped from
+        EITHER surface must fail the assertions below, not be masked by the other
+        surface still carrying it."""
+        boot_start = src.index("for _, d in workspace:GetDescendants()")
+        added_start = src.index("workspace.DescendantAdded:Connect")
+        assert boot_start < added_start, "boot sweep must precede the spawn hook"
+        return src[boot_start:added_start], src[added_start:]
+
+    def test_boot_sweep_carries_the_guard(self) -> None:
+        src = generate_gravity_correction_server_script(35.03)
+        boot, _ = self._boot_and_added(src)
+        assert self._GUARD in boot, "boot sweep dropped the _UnityMass/_Rigidbody2D guard"
+
+    def test_descendant_added_carries_the_guard(self) -> None:
+        src = generate_gravity_correction_server_script(35.03)
+        _, added = self._boot_and_added(src)
+        assert self._GUARD in added, (
+            "DescendantAdded path dropped the _UnityMass/_Rigidbody2D guard"
+        )
+
+    def test_scan_is_not_gated_by_isa_basepart(self) -> None:
+        """The scan selects on the _UnityMass attribute regardless of class
+        (a Model carrier S3/S6 must be admitted, then skipped via skip-if-anchored
+        inside the helper). A regression to IsA("BasePart") on the scan would
+        silently drop Model carriers, so neither surface may gate the descendant
+        ``d`` on IsA("BasePart") before the attribute test."""
+        src = generate_gravity_correction_server_script(35.03)
+        boot, added = self._boot_and_added(src)
+        for region, label in ((boot, "boot sweep"), (added, "DescendantAdded")):
+            assert 'd:IsA("BasePart")' not in region, (
+                f"{label} reverted to a BasePart-only scan (class-agnostic required)"
+            )
 
 
 # --------------------------------------------------------------------------
@@ -257,3 +334,54 @@ class TestStashRehydration:
             s for s in p.state.rbx_place.scripts if s.name == "SceneGravityCorrection"
         )
         assert "local DESIRED_G_STUDS_BASE = " + repr(stashed) in s.source
+
+    def test_real_producer_to_consumer_hop_same_pipeline(self, tmp_path: Path) -> None:
+        """AC16b real hop: drive the REAL producer (``plan_scene_runtime``) on the
+        SAME Pipeline that the consumer (``_subphase_inject_gravity_correction``)
+        runs on -- no manually-seeded stash. The server script must bake the
+        scalar parsed from the project's DynamicsManager.asset, proving the
+        producer→consumer wiring (not a stubbed dict read)."""
+        p = _make_pipeline_with_real_gravity(tmp_path, y=-12.5)
+        assert "gravityDesiredBaseStuds" not in p.ctx.scene_runtime, (
+            "guard: the stash must be empty BEFORE the producer runs"
+        )
+        # Producer: parses DynamicsManager.asset and stashes the scalar.
+        p.plan_scene_runtime()
+        expected = 12.5 * _config.STUDS_PER_METER
+        assert p.ctx.scene_runtime.get("gravityDesiredBaseStuds") == expected
+        # Consumer: reads the SAME ctx stash and bakes the literal.
+        p.state.rbx_place.workspace_parts = [_dynamic_part()]
+        p._subphase_inject_gravity_correction()
+        s = next(
+            s for s in p.state.rbx_place.scripts if s.name == "SceneGravityCorrection"
+        )
+        assert "local DESIRED_G_STUDS_BASE = " + repr(expected) in s.source
+
+    def test_stashed_scalar_survives_context_save_load_resume(
+        self, tmp_path: Path
+    ) -> None:
+        """AC16b resume: the stashed scalar survives a ConversionContext
+        save→load round-trip (the real serialization API), so a ``--phase``
+        resume rehydrates it and the consumer bakes the SAME value -- it is not
+        re-parsed and not lost across the serialize/deserialize boundary."""
+        p = _make_pipeline_with_real_gravity(tmp_path, y=-12.5)
+        p.plan_scene_runtime()
+        expected = 12.5 * _config.STUDS_PER_METER
+
+        # Serialize → deserialize via the real ConversionContext JSON API.
+        ctx_path = tmp_path / "conversion_context.json"
+        p.ctx.save(ctx_path)
+        rehydrated = ConversionContext.load(ctx_path)
+        assert rehydrated.scene_runtime.get("gravityDesiredBaseStuds") == expected
+
+        # A resumed pipeline consuming the rehydrated ctx bakes the SAME value.
+        resumed = _make_pipeline(tmp_path / "resume")
+        resumed.ctx.scene_runtime = rehydrated.scene_runtime
+        resumed.state.rbx_place.workspace_parts = [_dynamic_part()]
+        resumed._subphase_inject_gravity_correction()
+        s = next(
+            s
+            for s in resumed.state.rbx_place.scripts
+            if s.name == "SceneGravityCorrection"
+        )
+        assert "local DESIRED_G_STUDS_BASE = " + repr(expected) in s.source

@@ -30,7 +30,7 @@ DEFAULT_UNITY_GRAVITY_Y: float = 9.81
 # ``m_Gravity: {x: 0, y: -9.81, z: 0}`` -- a single inline-mapping line. The
 # ``m_Cloth*``/``m_ClothGravity`` siblings start with a different prefix, so the
 # bounded ``^\s*m_Gravity:`` anchor (start of the field name) does not collide.
-_GRAVITY_LINE_RE = re.compile(r"^\s*m_Gravity:\s*\{(?P<body>[^}]*)\}", re.MULTILINE)
+_GRAVITY_LINE_RE = re.compile(r"^\s*m_Gravity:\s*\{(?P<body>[^}\r\n]*)\}", re.MULTILINE)
 
 
 def _extract_component(body: str, axis: str) -> float | None:
