@@ -2216,10 +2216,8 @@ function SceneRuntime:_correctClonedDynamics(clone)
 	-- _UnityMass indistinguishably from a 3D one, so it is flagged + skipped).
 	-- Walks clone:GetDescendants() PLUS the clone ROOT itself (a clone whose root
 	-- IS a Model carrier is found by the root test, not the descendant walk).
-	-- Because Clone() yields a fully-materialized subtree BEFORE clone.Parent is
-	-- set, the representative part is present immediately -- no deferral needed for
-	-- resolution. A Model-carrier clone resolves an Anchored representative part
-	-- and is SKIPPED via skip-if-anchored, exactly as on the server.
+	-- A Model-carrier clone resolves an Anchored representative part and is
+	-- SKIPPED via skip-if-anchored, exactly as on the server.
 	-- Guard the Instance API before indexing (mirrors the applyImpulse:1515
 	-- indexability guard): a synthesized non-Instance clone (test harness, or a
 	-- service that returns a plain table) must not hard-error here.
@@ -2230,14 +2228,26 @@ function SceneRuntime:_correctClonedDynamics(clone)
 	end
 	local desiredBaseStuds = (self._plan and self._plan.gravityDesiredBaseStuds)
 		or (STUDS_PER_METER * DEFAULT_UNITY_GRAVITY_Y)
+	-- Defer the per-carrier correction one frame (same settle semantics as the
+	-- server spawn hook): on a welded multi-part (S4) clone the weld joints are
+	-- not final immediately after construction, so a synchronous read would take
+	-- AssemblyRootPart / AssemblyMass off a temporary part. The
+	-- _ScaleGravityCorrected tag keeps this exactly-once across the deferred
+	-- clone-site path AND the server DescendantAdded path (this file runs on the
+	-- server too); whichever defers first tags the root, the other no-ops.
+	local function correct(inst)
+		self._services.task.defer(function()
+			_gravityCorrectDynamicAssembly(inst, desiredBaseStuds)
+		end)
+	end
 	if clone:GetAttribute("_UnityMass") ~= nil
 		and clone:GetAttribute("_Rigidbody2D") == nil then
-		_gravityCorrectDynamicAssembly(clone, desiredBaseStuds)
+		correct(clone)
 	end
 	for _, d in ipairs(clone:GetDescendants()) do
 		if d:GetAttribute("_UnityMass") ~= nil
 			and d:GetAttribute("_Rigidbody2D") == nil then
-			_gravityCorrectDynamicAssembly(d, desiredBaseStuds)
+			correct(d)
 		end
 	end
 end

@@ -34,6 +34,18 @@ RUNTIME_PATH = Path(__file__).parent.parent / "runtime" / "scene_runtime.luau"
 SOURCE = RUNTIME_PATH.read_text(encoding="utf-8")
 
 
+def _method_body(name: str) -> str:
+    """The source span of one ``SceneRuntime:<name>`` method -- from its
+    ``function`` line to the next ``\\nfunction SceneRuntime:`` (or EOF).
+
+    Bounds on the actual method end rather than a fixed char window so the
+    assertions stay precise as the method's comments grow/shrink and never
+    bleed into the following method (addresses the +2000-window NIT)."""
+    start = SOURCE.index(f"function SceneRuntime:{name}(")
+    nxt = SOURCE.find("\nfunction SceneRuntime:", start + 1)
+    return SOURCE[start:nxt if nxt != -1 else len(SOURCE)]
+
+
 # ---------------------------------------------------------------------------
 # AC15 -- client clone-site hook present + correct (structural)
 # ---------------------------------------------------------------------------
@@ -55,8 +67,7 @@ def test_correct_cloned_dynamics_method_defined() -> None:
 
 def test_correct_cloned_dynamics_scans_root_and_descendants() -> None:
     """AC15(ii): scans clone:GetDescendants() AND tests the clone ROOT itself."""
-    method_idx = SOURCE.index("function SceneRuntime:_correctClonedDynamics(clone)")
-    body = SOURCE[method_idx:method_idx + 2000]
+    body = _method_body("_correctClonedDynamics")
     assert "clone:GetDescendants()" in body
     # The clone root itself is tested (a Model-carrier clone is found by the
     # root test, not the descendant walk).
@@ -66,8 +77,7 @@ def test_correct_cloned_dynamics_scans_root_and_descendants() -> None:
 def test_correct_cloned_dynamics_is_class_agnostic() -> None:
     """AC15(ii): selection is on _UnityMass presence REGARDLESS of class --
     NOT gated on IsA("BasePart")."""
-    method_idx = SOURCE.index("function SceneRuntime:_correctClonedDynamics(clone)")
-    body = SOURCE[method_idx:method_idx + 2000]
+    body = _method_body("_correctClonedDynamics")
     assert 'GetAttribute("_UnityMass") ~= nil' in body
     assert 'IsA("BasePart")' not in body
 
@@ -75,17 +85,64 @@ def test_correct_cloned_dynamics_is_class_agnostic() -> None:
 def test_correct_cloned_dynamics_reads_plan_scalar_with_default() -> None:
     """AC15(iii): reads self._plan.gravityDesiredBaseStuds, with the documented
     fallback (STUDS_PER_METER * DEFAULT_UNITY_GRAVITY_Y) when absent."""
-    method_idx = SOURCE.index("function SceneRuntime:_correctClonedDynamics(clone)")
-    body = SOURCE[method_idx:method_idx + 2000]
+    body = _method_body("_correctClonedDynamics")
     assert "self._plan.gravityDesiredBaseStuds" in body
     assert "STUDS_PER_METER * DEFAULT_UNITY_GRAVITY_Y" in body
 
 
 def test_correct_cloned_dynamics_calls_mirrored_helper() -> None:
     """AC15(iii): the hook calls the mirrored correctDynamicAssembly."""
-    method_idx = SOURCE.index("function SceneRuntime:_correctClonedDynamics(clone)")
-    body = SOURCE[method_idx:method_idx + 2000]
+    body = _method_body("_correctClonedDynamics")
     assert "_gravityCorrectDynamicAssembly(" in body
+
+
+def test_correct_cloned_dynamics_defers_correction_for_weld_settle() -> None:
+    """[MAJOR fix] The per-clone correction is routed through
+    self._services.task.defer (matching the server spawn-hook DescendantAdded
+    settle semantics) so a welded multi-part (S4) clone's AssemblyRootPart /
+    AssemblyMass are read AFTER the welds settle, NOT synchronously off a
+    temporary part. The _ScaleGravityCorrected tag then guarantees exactly-once
+    across the deferred clone-site path AND the server DescendantAdded path for a
+    server-side instantiatePrefab clone."""
+    body = _method_body("_correctClonedDynamics")
+    # The helper call is wrapped in a deferred closure (not invoked synchronously).
+    assert "self._services.task.defer(" in body
+    defer_idx = body.index("self._services.task.defer(")
+    helper_idx = body.index("_gravityCorrectDynamicAssembly(")
+    # The helper is invoked INSIDE the deferred closure, not before it.
+    assert defer_idx < helper_idx
+
+
+def test_runtime_has_no_blanket_workspace_descendantadded_gravity_sweep() -> None:
+    """[P2 fix] NEGATIVE invariant: the runtime must NOT wire a blanket
+    workspace.DescendantAdded-based gravity sweep (the rejected round-3 race).
+    The ONLY gravity correction surface in scene_runtime.luau is the clone-site
+    _correctClonedDynamics hook; a workspace-wide DescendantAdded gravity hook
+    would re-introduce the replication race the design explicitly rejected.
+
+    Scoped to gravity context (and to actual ``DescendantAdded:Connect`` WIRING,
+    not mere comment mentions) so it does not false-trigger on the unrelated
+    PlayerGui/character DescendantAdded hooks, nor on this method's own comments:
+    assert no DescendantAdded HANDLER in the runtime sits in proximity to the
+    gravity helper / tag."""
+    import re
+
+    gravity_markers = (
+        "_gravityCorrectDynamicAssembly",
+        "_ScaleGravityCorrected",
+        "gravityDesiredBaseStuds",
+        "correctDynamicAssembly",
+    )
+    # Only actual event WIRING (``...DescendantAdded:Connect(``), not comment
+    # mentions of the word -- a comment cannot install a sweep.
+    for m in re.finditer(r"DescendantAdded:Connect\b", SOURCE):
+        window = SOURCE[max(0, m.start() - 400):m.start() + 400]
+        for marker in gravity_markers:
+            assert marker not in window, (
+                "scene_runtime.luau wires a DescendantAdded-based gravity sweep "
+                f"(found {marker!r} near a DescendantAdded:Connect) -- the rejected "
+                "round-3 race; gravity correction must be the clone-site hook only"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -98,8 +155,7 @@ def test_client_hook_excludes_rigidbody2d_carriers() -> None:
     the same per-carrier 2D exclusion as the server surfaces. Covers both the
     non-wrapped (marker on the carrier) and mesh-wrapped (marker co-located on
     the inner carrier via the move-list) 2D bodies."""
-    method_idx = SOURCE.index("function SceneRuntime:_correctClonedDynamics(clone)")
-    body = SOURCE[method_idx:method_idx + 2000]
+    body = _method_body("_correctClonedDynamics")
     # Both the root test and the descendant walk gate on _Rigidbody2D == nil.
     assert body.count('GetAttribute("_Rigidbody2D") == nil') == 2
 
