@@ -1990,3 +1990,158 @@ class TestSlice13AnimationJoinThreading:
         assert any(
             "colliding base name" in r.message for r in caplog.records
         )
+
+    def test_ac9_mixed_guided_guidless_collision_skips_with_warn(
+        self, tmp_path, caplog,
+    ):
+        """D12 codex MAJOR-1: a colliding base where one prefab is guided
+        (resolves to ``character__473ffa``) and one is guid-less (stays bare
+        ``character``) leaves the BARE template present. The skip must fire on
+        collision membership ALONE — NOT misroute the driver onto that bare
+        template just because the key happens to be present."""
+        import logging
+        from core.roblox_types import RbxPart, RbxScript
+        from core.unity_types import PrefabLibrary
+        from converter.animation_converter import AnimationConversionResult
+        from converter.scene_converter import _prefab_stable_id
+
+        pipeline = self._make_pipeline(tmp_path)
+        # Cat is guided; Raccoon's path is NOT in the GuidIndex → guid-less id
+        # (`:Assets/.../character.prefab`), so it keeps the bare resolved name.
+        cat_path = tmp_path / "Assets/Bundles/Characters/Cat/character.prefab"
+        rac_path = tmp_path / "Assets/Bundles/Characters/Raccoon/character.prefab"
+        for p in (cat_path, rac_path):
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("")
+        cat = _real_prefab_template("character", prefab_path=cat_path, root_file_id="11")
+        rac = _real_prefab_template("character", prefab_path=rac_path, root_file_id="22")
+        lib = PrefabLibrary(prefabs=[cat, rac], by_guid={})
+        gi = _guid_index_multi(tmp_path, {_CAT_GUID: cat_path})  # raccoon absent
+        cat_id = _prefab_stable_id(cat, gi, {}, gi.project_root)
+        rac_id = _prefab_stable_id(rac, gi, {}, gi.project_root)
+
+        resolved = resolve_template_child_names({
+            cat_id: "character", rac_id: "character",
+        })
+        # The guid-less raccoon stays BARE; the guided cat is suffixed.
+        assert resolved[rac_id] == "character"
+        assert resolved[cat_id] == "character__473ffa"
+        self._seed(pipeline, lib, gi, resolved, {cat_id, rac_id})
+
+        pipeline.state.animation_result = AnimationConversionResult(
+            script_scopes={"Anim_character_Ctrl_Walk": "character"},
+        )
+        pipeline.state.rbx_place.scripts.append(
+            RbxScript(name="Anim_character_Ctrl_Walk", source="-- a",
+                      script_type="Script", parent_path="ServerScriptService"),
+        )
+        # Emitted templates: the suffixed cat AND the BARE raccoon (present!).
+        t_cat = RbxPart(name="character__473ffa", class_name="Model")
+        t_rac = RbxPart(name="character", class_name="Model")
+        pipeline.state.rbx_place.replicated_templates.extend([t_cat, t_rac])
+
+        with caplog.at_level(logging.WARNING, logger="converter.pipeline"):
+            pipeline._attach_prefab_scoped_animation_scripts_to_templates()
+
+        # The bare template must NOT receive the ambiguous driver.
+        assert t_cat.scripts == []
+        assert t_rac.scripts == [], "must not misroute onto the present bare template"
+        assert any(
+            "colliding base name" in r.message for r in caplog.records
+        )
+
+
+class TestSlice13VariantParentUniqueness:
+    """Slice 1.3 / D13 codex MAJOR-2 — variant chains are scoped OUT of the
+    resolved-name rename, but a bare ``VariantParentTemplate`` is only an
+    unambiguous handle while no two emitted prefabs share that parent BASE.
+    A collision among emitted variant parents must WARN (fail-soft)."""
+
+    def test_colliding_variant_parent_base_warns(self, tmp_path, caplog):
+        """Two emitted variants descend from parents whose bare names collide
+        (real parents ``Hero__473ffa`` / ``Hero__2ae64d``, both bare ``Hero``)
+        → the bare ``VariantParentTemplate`` ("Hero") is ambiguous → WARN."""
+        import logging
+        from core.unity_types import PrefabLibrary
+        from converter.scene_converter import _prefab_stable_id
+
+        hero_a_path = tmp_path / "Assets/A/Hero.prefab"
+        hero_b_path = tmp_path / "Assets/B/Hero.prefab"
+        blue_path = tmp_path / "Assets/A/HeroBlue.prefab"
+        green_path = tmp_path / "Assets/B/HeroGreen.prefab"
+        for p in (hero_a_path, hero_b_path, blue_path, green_path):
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("")
+        # Two distinct parent prefabs, SAME bare name ``Hero``.
+        hero_a = _real_prefab_template("Hero", prefab_path=hero_a_path, root_file_id="11")
+        hero_b = _real_prefab_template("Hero", prefab_path=hero_b_path, root_file_id="22")
+        blue = _real_prefab_template("HeroBlue", prefab_path=blue_path, root_file_id="33")
+        blue.is_variant = True
+        blue.source_prefab_guid = _CAT_GUID
+        green = _real_prefab_template("HeroGreen", prefab_path=green_path, root_file_id="44")
+        green.is_variant = True
+        green.source_prefab_guid = _RACCOON_GUID
+        # by_guid resolves each variant's source to a distinct ``Hero`` parent.
+        by_guid = {_CAT_GUID: hero_a, _RACCOON_GUID: hero_b}
+        lib = PrefabLibrary(prefabs=[hero_a, hero_b, blue, green], by_guid=by_guid)
+        gi = _guid_index_multi(tmp_path, {
+            _CAT_GUID: hero_a_path, _RACCOON_GUID: hero_b_path,
+            _ICON_GUID: blue_path, "deadbeef" + "0" * 24: green_path,
+        })
+        ids = {
+            _prefab_stable_id(p, gi, by_guid, gi.project_root)
+            for p in lib.prefabs
+        }
+        resolved = resolve_template_child_names({
+            pid: ("Hero" if "Hero.prefab" in pid else
+                  ("HeroBlue" if "HeroBlue" in pid else "HeroGreen"))
+            for pid in ids
+        })
+
+        with caplog.at_level(logging.WARNING, logger="converter.prefab_packages"):
+            generate_prefab_packages(
+                lib, None, guid_index=gi,
+                resolved_template_names=resolved,
+                addressable_prefab_ids=ids,
+            )
+        assert any(
+            "variant-parent base name" in r.message for r in caplog.records
+        ), "expected a D13 variant-parent collision WARN"
+
+    def test_unique_variant_parent_no_warn(self, tmp_path, caplog):
+        """A unique variant parent emits no WARN and correct bare metadata."""
+        import logging
+        from core.unity_types import PrefabLibrary
+        from converter.scene_converter import _prefab_stable_id
+
+        hero_path = tmp_path / "Assets/Hero.prefab"
+        blue_path = tmp_path / "Assets/HeroBlue.prefab"
+        for p in (hero_path, blue_path):
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("")
+        hero = _real_prefab_template("Hero", prefab_path=hero_path, root_file_id="11")
+        blue = _real_prefab_template("HeroBlue", prefab_path=blue_path, root_file_id="22")
+        blue.is_variant = True
+        blue.source_prefab_guid = _CAT_GUID
+        by_guid = {_CAT_GUID: hero}
+        lib = PrefabLibrary(prefabs=[hero, blue], by_guid=by_guid)
+        gi = _guid_index_multi(tmp_path, {
+            _CAT_GUID: hero_path, _ICON_GUID: blue_path,
+        })
+        hero_id = _prefab_stable_id(hero, gi, by_guid, gi.project_root)
+        blue_id = _prefab_stable_id(blue, gi, by_guid, gi.project_root)
+        resolved = resolve_template_child_names({
+            hero_id: "Hero", blue_id: "HeroBlue",
+        })
+
+        with caplog.at_level(logging.WARNING, logger="converter.prefab_packages"):
+            result = generate_prefab_packages(
+                lib, None, guid_index=gi,
+                resolved_template_names=resolved,
+                addressable_prefab_ids={hero_id, blue_id},
+            )
+        assert not any(
+            "variant-parent base name" in r.message for r in caplog.records
+        )
+        emitted_by_name = {t.name: t for t in result.templates}
+        assert emitted_by_name["HeroBlue"].attributes["VariantParentTemplate"] == "Hero"

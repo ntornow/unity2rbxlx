@@ -6038,15 +6038,21 @@ script.Disabled = true
         # upstream — see D12), so we skip + WARN rather than misroute it onto an
         # arbitrary colliding template. Bare bases that collide among emitted
         # templates are reconstructed from the planner's resolved-name map.
+        #
+        # The skip is gated on collision membership ALONE — NOT on the bare key
+        # being absent from ``templates_by_name``. A mixed guided/guid-less
+        # collision (one prefab resolved to ``base__guid6`` while a sibling kept
+        # the bare ``base`` — e.g. ``character__473ffa`` + a guid-less
+        # ``character``) leaves the bare template PRESENT; gating on absence
+        # would then misroute ``Anim_character_*`` onto that arbitrary bare
+        # template. A colliding base is irrecoverable from a bare key either way,
+        # so skip+WARN unconditionally for any colliding base (D12).
         colliding_bare_bases = self._colliding_emitted_bare_bases()
 
         from copy import copy as _shallow_copy
         attached = 0
         for script_name, template_name in anim.script_scopes.items():
-            if (
-                template_name not in templates_by_name
-                and template_name in colliding_bare_bases
-            ):
+            if template_name in colliding_bare_bases:
                 log.warning(
                     "[write_output] prefab-scoped animation %r targets "
                     "colliding base name %r; skipping (cannot identify which "

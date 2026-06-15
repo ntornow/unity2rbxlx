@@ -483,6 +483,29 @@ def generate_prefab_packages(
         _base_counts[_nm] = _base_counts.get(_nm, 0) + 1
     colliding_bare_bases = {b for b, c in _base_counts.items() if c > 1}
 
+    # D13 — variant-parent base-name uniqueness safety net. Variant chains are
+    # scoped OUT of the resolved-name rename (``VariantParentTemplate`` stays a
+    # BARE parent name so the runtime composer can find its source), but a bare
+    # parent name is only an unambiguous handle while no two emitted prefabs
+    # share that parent BASE. If two emitted prefabs descend from parents whose
+    # bare names collide (real parents ``Hero__473ffa`` / ``Hero__2ae64d``, both
+    # bare ``Hero``), the bare ``VariantParentTemplate`` ("Hero") can't pick the
+    # right source template → silently broken metadata. WARN (fail-soft, never
+    # crash a conversion); a real collision becomes a follow-up, not a silent
+    # Unit-1 break.
+    _colliding_variant_parents = sorted(
+        parent_name
+        for parent_name in set(variant_parent_by_name.values())
+        if parent_name in colliding_bare_bases
+    )
+    if _colliding_variant_parents:
+        log.warning(
+            "[prefab_packages] variant-parent base name(s) %s collide among "
+            "emitted prefabs; the bare VariantParentTemplate metadata is "
+            "ambiguous and may resolve the wrong source template (D13)",
+            _colliding_variant_parents,
+        )
+
     # Track the BARE base name of every emitted template so the
     # ``referenced_but_missing`` manifest compares against bare names, not the
     # RESOLVED (possibly suffixed) ``t.name`` (D15 fix). A colliding-but-emitted
