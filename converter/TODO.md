@@ -8,6 +8,104 @@ Priority: **P0** = blocks gameplay, **P1** = significant quality, **P2** = nice 
 
 ## Pipeline / runtime gaps
 
+> **Top two gameplay gaps to solve next (2026-06-15):** (1) the **door** (#9 animation
+> driver-domain, P0 below) and (2) the **turret projectile physics** (#8, P0 below). Both
+> block their e2e fixtures (F10, F16). The door is a client/server domain-split bug; the
+> turret is a generic-flow coverage gap (the legacy projectile primitive was never ported).
+> Neither is started in code.
+
+- [ ] **P0 (generic) — F16 turret never damages: bullet drops to ground (#8 projectile physics) + damage hits wrong health surface. Analyzed 2026-06-15 (Claude + Codex; static + rbxlx, live Studio owed).**
+  The turret kill-chain has FOUR stages; two fail, for unrelated reasons. **None is a client/server
+  problem** — Turret + TurretBullet + Player are all Rule-7 `domain:client` in single-player, so every
+  interaction is local (contrast the door #9, which IS a domain split).
+
+  1. **Targeting (fragile).** `Turret:Awake` connects an EDGE `Touched` (lowered from `OnTriggerStay`),
+     not the host stay-poll. Unity `OnTriggerStay` fires every frame in the sight volume; the edge only
+     re-checks the `angle<55° + LOS raycast` gate on a contact edge → misses already-inside / wrong-cone
+     edges. Host HAS `connectGameObjectSignalStay` (`scene_runtime.luau:538`) but the generated script
+     doesn't use it. This is relation **#1 (callback-kind TRIGGER_STAY)** — the comment-keyed lowering
+     ABSTAINED on the AI's combined `-- OnTriggerStay -> Touched ; OnTriggerExit -> TouchEnded` comment
+     shape. (Re-confirm on current main vs #181.)
+  2. **Firing (works).** `instantiatePrefab(self.turretBullet, workspace, tOrigin:GetPivot())` clones the
+     RS template, stamps a runtime placement id, builds components, runs `_runAwakeEnableStart`
+     (`scene_runtime.luau:2025-2053`). **The old "TurretBullet SRI gap" framing (PR #145 / the F16
+     handoff) is STALE — binding works; the failure is downstream.**
+  3. **Bullet physics — FIRST HARD FAILURE; bullet DROPS to the ground.** The runtime-cloned template
+     body is `TurretBullet_Mesh` **`Anchored=false`** (confirmed in the ReplicatedStorage template, not
+     the anchored scene leftovers). `GetComponent("Rigidbody")`→BasePart returns it, so
+     `rb:ApplyImpulse(LookVector * 60)` DOES apply — but `60` is the RAW Unity force (no ×STUDS_PER_METER),
+     there is NO anti-gravity, no muzzle push-out, no swept raycast. Net: a weak nudge dominated by
+     Roblox gravity (196) → the bullet arcs into the ground immediately and never reaches the player.
+     This is relation **#8 (projectile/physics-semantics)**: legacy had `bullet_physics_raycast` (stud
+     velocity + anti-gravity + raycast hit); generic SKIPS the coherence-pack layer → **coverage gap.
+     STRONGEST generic-refactor tie.** Needs its own design (§7.1 of the schema).
+  4. **Damage (independent failure; survives a stage-3 fix).** Even on a forced bullet↔player touch,
+     `TurretBullet.Awake` calls `findObjectOfType("Player"):TakeDamage(damage)`. `Player:TakeDamage`
+     (`Player.luau:332`) only decrements the component's internal `self.curHealth` + fires the HUD
+     `HealthUpdate` — it **never touches `Humanoid.Health`**. The F16 fixture asserts on `Humanoid.Health`,
+     so the hit isn't measured. CONTRAST: `Mine.luau:35` does `hum:TakeDamage` on the real Humanoid (which
+     is why F15 mine damage works). Same Unity `SendMessage("TakeDamage")`, AI-translated to DIFFERENT
+     targets — an AI-translation inconsistency + a fixture-vs-game-model mismatch, NOT generic-caused.
+     Fix EITHER: bullet damages the Humanoid like the mine, OR the game's health model is unified on
+     `Player.curHealth` and the fixture checks that.
+  **Order:** stage 3 is the first blocker but stage 4 is independent — fixing the projectile alone won't
+  turn F16 green. Schema cross-refs: §3 row 8 (projectile), §8 T-bullet row (corrected 2026-06-15).
+
+- [ ] **P0 (generic) — F10 door never opens: animation driver-domain unresolved → server fallback (pattern #9). Empirically reproduced 2026-06-14.**
+  Implements the **CANDIDATE** in `docs/design/generic-converter-architecture.md` §3 row 9
+  ("dynamic-component-ref → driver-domain"). Status was analysis-only (PR #188, 2026-06-11);
+  this entry adds the live repro + the precise fix site + nuances.
+
+  **Mechanism.** `animation_routing.resolve_driver` (Phase 1, merged `71b3355`/`0ffe3e2`/`989a2a4`)
+  resolves an animation's driver ONLY via the *serialized* Animator reference graph
+  (`target_component_type == "Animator"`). `Door.cs:14` accesses its Animator *dynamically* —
+  `transform.parent.Find("door").GetComponent<Animator>()` — then `doorAnim.SetBool("open", value)`
+  (line 37). No serialized field ⇒ 0 candidates ⇒ the `animation_drivers` entry
+  `…Door.prefab:door:open` lands `routing_status:"unresolved"`, `domain:"server"` (fallback).
+  So `Anim_Door_door_open` is emitted as a server `Script` in ServerScriptService and listens for
+  `open` on the SERVER door. But the Door *component* is `domain:"client"` (rule 7 single-player
+  default, all signals zero — `module_domain.py:1714`), so it writes `open` on the CLIENT door
+  instance. Client→server attribute writes don't replicate ⇒ the server animation never observes
+  `open` ⇒ the door never tweens (Anim_Door_door_open tweens +14.28 studs Y on `open`→true).
+
+  **Live proof** (Studio play, `output/e2e/2026-06-05…/conversion`, Beach.Door):
+  (1) hooked the server `TriggerZone.Touched` → fires 40× on a real walk (so the server DOES
+  see the contact — disproves the "server can't see client CFrame" hypothesis);
+  (2) a client walk/sweep sets the CLIENT door `open=true`, but the SERVER door `open` stays
+  `false` even with server-side `hasKey=true`; (3) the `Anim_Door_*` scripts live in
+  ServerScriptService, none on the client.
+
+  **Fix (pattern #9).** When serialized-ref resolution yields 0 candidates, run a C#/Luau
+  param-write narrowing pass: scan the scope's component sources for a write to the clip's
+  `observed_attribute` (`Animator.SetBool/SetTrigger/SetInteger` matching the param, or the
+  transpiled `SetAttribute("open", …)`); pick that component as the driver; inherit its domain
+  (→ client here). Then route the Anim script into the writer's domain.
+  - **Nuance 1 (placement):** the door anim is ONE scene-level script doing a `workspace`
+    search over all `door` parts. As a client driver, emit it as a single `LocalScript` in
+    `StarterPlayerScripts` (LocalScripts run there and the workspace search still works). Do NOT
+    prefab-clone a `LocalScript` into a workspace Model — LocalScripts don't execute in Workspace.
+  - **Nuance 2 (scope):** §3 row 9 warns "other animation drivers fail for different reasons"
+    — gate on real param-write evidence and ABSTAIN (keep server fallback) when ambiguous;
+    the Phase-3 cross-domain verifier backstops.
+
+  **Out of scope here (e2e harness, NOT converter):** the `SimpleFPS.behavior.json` fixtures are
+  also wrong. F10 `door_opens_with_key` teleports to `door_mesh.Position+2` ≈ y29.4, just ABOVE
+  the TriggerZone cube (center y18.5, top y29.2) → no contact; it needs a real walk into the
+  trigger (camera-aligned W-drive — `Player:Move` is camera-`_yaw`-relative, not character-facing).
+  F10 won't pass until pattern #9 lands AND the fixture walks in. See the next item for F15.
+
+- [ ] **P1 (e2e fixture) — F15 mine + F10 door fixtures contact-miss; mine is independently fixable. Verified 2026-06-14.**
+  Harness-only (`tests/fixtures/upload_snapshots/SimpleFPS.behavior.json`), no converter change.
+  Original setups single-teleport the player to a point that doesn't overlap the trigger (F15:
+  `mine.Position+3` hovers above the 0.87-tall mine; F10: above the door TriggerZone — see above).
+  **F15 fix (verified live):** Mine runs `domain:client` and client `Humanoid:TakeDamage` STICKS
+  in single-player (proved 100→75 held). A client-side swept `PivotTo` *through* the mine at
+  ground level fires the client `Touched` → `Explode` → `TakeDamage` (proved 100→90). Replace the
+  hover-teleport with a ground-level swept entry. F15 needs NO converter change and can land now.
+  Codex's earlier W-drive edit to these two fixtures is on the working tree (uncommitted) but has a
+  flaw — it refaces the character via `PivotTo(CFrame.lookAt)`, which is dead (movement is
+  camera-`_yaw`-relative, `scene_camera_input.luau:184,226`); revert/replace before using it.
+
 - [ ] **P1 — Generic-mode SimpleFPS canary failures (dual-voice investigation 2026-06-11; NOT Step-1b regressions).** See `docs/design/scene-runtime-pr5-8-recut-plan.md` §"The canary failures" — the PR5 canary gate (SimpleFPS plays under generic). Slices: **T** turret child-index lowering from a stronger signal than AI-output text (turret won't spin/fire); **T-bullet** nil-parent→workspace default in the `instantiatePrefab` clone service (bullets never enter the DataModel); **R** generic `weaponSlot` rebind (rifle not held); **D** door dynamic-Animator-driver narrowing (`pr148-followups`); **H** HudControl client-domain rule. Highest leverage: Slice T (+ T-bullet) clears the turret. File:line evidence in the Step-1b run ledger.
 
 - [x] **P1 — Shared-flag name sanitization is unowned (pre-existing; surfaced by Phase 2b reframe, 2026-06-01).** FIXED 2026-06-02 (`fix/shared-flag-name-sanitization`, PR #165): canonical ASCII sanitizer applied at the runtime `"has" .. name` concat (emitted Luau `gsub("[^%w_]+","_")` from one constant in `core/flag_names.py`) at every writer + the Machine dynamic reader; `itemName`/`ItemType` kept RAW (gameplay payloads); scan made ASCII-explicit. See `docs/design/shared-flag-name-sanitization-brief.md`.
