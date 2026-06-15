@@ -2176,6 +2176,9 @@ def _wrap_geometry_with_children_into_model(part: "RbxPart", node_name: str) -> 
     for _attr_key in list(part.attributes.keys()):
         if _attr_key.startswith("_Scale") or _attr_key in (
             "_MeshId", "_MeshFileId", "_TextureId", "_FbxImportScale",
+            # Phase 1 (relation #8): the physics lives on the inner BasePart, so the launch-velocity
+            # mass must travel with it (the host resolves it from the part's assembly).
+            "_UnityMass",
         ):
             inner.attributes[_attr_key] = part.attributes.pop(_attr_key)
     # Reset the outer to Model — visual properties now live on inner.
@@ -2786,6 +2789,12 @@ def _process_components(
     if has_rigidbody:
         anchored, can_collide, custom_phys = convert_rigidbody(rigidbody_props)
         part.anchored = anchored
+        # Phase 1 (relation #8): stamp the Unity mass so the runtime host can apply the faithful
+        # launch velocity Δv = (force / _UnityMass) * STUDS_PER_METER for a force-launched body,
+        # independent of the STUDS_PER_METER³-inflated Roblox mass. Dynamic bodies only — anchored /
+        # kinematic parts do not launch.
+        if not anchored:
+            part.attributes["_UnityMass"] = float(rigidbody_props.get("m_Mass", 1.0))
         # Only override can_collide if rigidbody says so.
         if not can_collide:
             part.can_collide = can_collide

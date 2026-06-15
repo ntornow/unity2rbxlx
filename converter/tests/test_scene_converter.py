@@ -2067,3 +2067,58 @@ class TestPickupPayloadStaysRaw:
             {"itemName": "Key"}, part, guid_index=None
         )
         assert part.attributes["itemName"] == "Key"
+
+
+class TestUnityMassStamp:
+    """Phase 1 (relation #8): dynamic rigidbodies are stamped with _UnityMass so the runtime
+    host can apply the faithful launch velocity. Anchored/kinematic bodies are not stamped."""
+
+    def _run(self, props):
+        from converter.scene_converter import _process_components
+        from core.roblox_types import RbxPart
+
+        class FakeComp:
+            component_type = "Rigidbody"
+            properties = props
+
+        class FakeNode:
+            name = "Body"
+            components = [FakeComp()]
+
+        part = RbxPart(name="Body")
+        _process_components(FakeNode(), part)
+        return part
+
+    def test_dynamic_rigidbody_stamps_unity_mass(self):
+        part = self._run({"m_Mass": 2.5})
+        assert part.anchored is False
+        assert part.attributes["_UnityMass"] == 2.5
+
+    def test_default_mass_is_one(self):
+        part = self._run({})  # m_Mass defaults to 1.0
+        assert part.attributes["_UnityMass"] == 1.0
+
+    def test_kinematic_rigidbody_not_stamped(self):
+        part = self._run({"m_IsKinematic": 1, "m_Mass": 2.5})
+        assert part.anchored is True
+        assert "_UnityMass" not in part.attributes
+
+    def test_wrapped_geometry_carries_unity_mass_to_inner(self):
+        """For wrapped geometry the physics lives on the inner BasePart, so _UnityMass must
+        travel onto the inner part (where the host resolves it via the assembly)."""
+        from converter.scene_converter import _wrap_geometry_with_children_into_model
+        from core.roblox_types import RbxPart
+
+        # Wrap triggers only with geometry AND a child transform.
+        part = RbxPart(name="Bullet", class_name="MeshPart")
+        part.mesh_id = "rbxassetid://123"
+        part.anchored = False
+        part.attributes["_UnityMass"] = 1.0
+        part.children.append(RbxPart(name="Muzzle"))
+        _wrap_geometry_with_children_into_model(part, "Bullet")
+        # part is now a Model; the inner geometry part (named "<node>_Mesh") is appended last.
+        assert part.class_name == "Model"
+        inner = next(c for c in part.children if c.name == "Bullet_Mesh")
+        # Stamp moved to the inner mesh part; outer Model no longer carries it.
+        assert inner.attributes.get("_UnityMass") == 1.0
+        assert "_UnityMass" not in part.attributes
