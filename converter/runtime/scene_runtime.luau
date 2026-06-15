@@ -2022,7 +2022,40 @@ function SceneRuntime:_constructPrefabClone(clone, prefab, prefab_id, includeScr
 	return componentList
 end
 
+-- Resolve an Addressables address (the human-facing string passed to
+-- ``Addressables.InstantiateAsync``) to a concrete prefab_id via the
+-- plan's ``addressables.by_address`` map (populated by the planner
+-- bridge). Fail soft: an unknown / empty address warns and returns nil
+-- so the caller drops the spawn rather than crashing. A multi-candidate
+-- address picks the first id (resolver-deterministic order) + warns
+-- (D9). ``by_label`` is emitted but NOT consumed here (Unit-2 concern,
+-- D10).
+function SceneRuntime:_resolveAddressToPrefabId(address)
+	local addr = (self._plan.addressables or {}).by_address or {}
+	local ids = addr[address]
+	if type(ids) ~= "table" or #ids == 0 then
+		self._warn(string.format(
+			"[scene_runtime] instantiatePrefab: no prefab for address %q",
+			tostring(address)))
+		return nil
+	end
+	if #ids > 1 then
+		self._warn(string.format(
+			"[scene_runtime] address %q resolves to %d prefabs; using %q",
+			tostring(address), #ids, tostring(ids[1])))
+	end
+	return ids[1]
+end
+
 function SceneRuntime:instantiatePrefab(prefab_id, parent, cframe, externalRefs)
+	-- ``prefab_id`` may be an Addressables address (e.g. "Trash Cat")
+	-- rather than a concrete prefab_id. If it is not a direct prefab key,
+	-- treat it as an address and resolve it; a nil resolution already
+	-- warned, so just drop the spawn.
+	if not (self._plan.prefabs or {})[prefab_id] then
+		prefab_id = self:_resolveAddressToPrefabId(prefab_id)
+		if not prefab_id then return nil end
+	end
 	local prefab = (self._plan.prefabs or {})[prefab_id]
 	if not prefab then
 		self._warn(string.format(
