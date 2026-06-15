@@ -681,6 +681,180 @@ class TestCrossDomainUiDeferredPlacedTargetHoldsThroughDeferredDrain:
 
 
 # ---------------------------------------------------------------------------
+# AC7 -- the UI-DEFERRED *SOURCE* sub-case (the finalize BLOCKING fix).
+#
+# The class above covers a cross-domain ref whose SOURCE wires at SCENE-BOOT (so
+# the target's ``_deferredInstanceIds`` marker is not yet set -> the ref takes
+# the gated ``_pendingPlacementRefs`` branch). This class covers the OTHER timing:
+# the SOURCE component is ITSELF UI-deferred, so its outbound refs wire LATE,
+# inside ``_completeDeferredBatch`` Pass 3a -- at which point a peer's deferred
+# marker CAN still be set. With two UI-deferred sources holding mutual
+# cross-domain refs (a dependency CYCLE the topo-sort cannot order target-first),
+# whichever group wires first sees the other's marker set and hits the
+# ``_deferredInstanceIds -> _inboundRefsToDeferred`` branch. That branch was
+# UNGATED, so a policy-nil'd cross-domain ref got recorded and Pass 3b
+# (``_completeDeferredBatch``) replayed it with NO domain recheck -> cross-domain
+# rebind. The fix gates that branch on ``not crossDomainNil`` (symmetric with the
+# ``_pendingPlacementRefs`` gate) so the policy-nil'd ref enters NEITHER queue.
+#
+# Drives the REAL host through ``start()`` + the deferred batches (nothing
+# stubbed). The same-domain (client->client) mutual-ref cycle is the regression
+# guard: it must STILL bind through the deferred ``_inboundRefsToDeferred`` path.
+# ---------------------------------------------------------------------------
+
+class TestCrossDomainUiDeferredSourceHoldsThroughDeferredDrain:
+
+    def _scenario(self, *, cross_domain: bool) -> str:
+        # Two UI-owned SCENE instances whose host clones MISS at synchronous boot
+        # (no entries in ``instances``) -> both DEFER. ``awaitUiHost`` lands each
+        # host late, in DISTINCT host groups (keyed by ``gameObjectId``). The two
+        # hold mutual ``component`` refs (``peer`` / ``back``) -> a dependency
+        # cycle, so the deferred topo-sort cannot order one strictly before the
+        # other; the group that wires first sees the other's deferred marker set.
+        #
+        # ``cross_domain``: when True the peer target is a SERVER module
+        # (client->server, policy-nil'd). When False both are CLIENT (same-domain
+        # control that MUST still bind through the deferred path).
+        peer_domain = "server" if cross_domain else "client"
+        peer_mark = "SRV" if cross_domain else "CLI"
+        return textwrap.dedent("""\
+            -- Source: a UI-deferred CLIENT scene component holding the ref.
+            local Src = {} ; Src.__index = Src
+            function Src.new(_) return setmetatable({mark="SRC"}, Src) end
+            -- Peer: a UI-deferred component the source references (server in the
+            -- cross-domain case, client in the same-domain control).
+            local Peer = {} ; Peer.__index = Peer
+            function Peer.new(_) return setmetatable({mark="__PEER_MARK__"}, Peer) end
+
+            local plan = {
+                modules = {
+                    src = {stem = "Src", runtime_bearing = true,
+                           module_path = "x", domain = "client"},
+                    peer = {stem = "Peer", runtime_bearing = true,
+                            module_path = "y", domain = "__PEER_DOMAIN__"},
+                },
+                scenes = {
+                    Main = {
+                        instances = {
+                            {instance_id = "Main:1", script_id = "src",
+                             game_object_id = "srcgo", active = true,
+                             enabled = true, config = {},
+                             instance_owner_is_ui = true},
+                            {instance_id = "Main:2", script_id = "peer",
+                             game_object_id = "peergo", active = true,
+                             enabled = true, config = {},
+                             instance_owner_is_ui = true},
+                        },
+                        references = {
+                            -- the ref under test: source -> peer.
+                            {["from"] = "Main:1", field = "peer", index = nil,
+                             target_kind = "component", target_ref = "Main:2",
+                             target_script_id = "peer", target_is_ui = false},
+                            -- reverse ref -> makes a dependency CYCLE so the topo
+                            -- sort cannot order ``peer``'s group before ``src``'s;
+                            -- whichever wires first sees the other's marker set.
+                            {["from"] = "Main:2", field = "back", index = nil,
+                             target_kind = "component", target_ref = "Main:1",
+                             target_script_id = "src", target_is_ui = false},
+                        },
+                        lifecycle_order = {"Main:1", "Main:2"},
+                    },
+                },
+                prefabs = {}, scene_prefab_placements = {}, domain_overrides = {},
+            }
+            -- Neither host clone exists at boot -> both UI-defer.
+            local instances = {}
+            local services = servicesFor(plan, {src = Src, peer = Peer}, instances)
+            -- Late host resolution: each host lands in its own group.
+            local srcClone = {Name = "SrcHost", _sceneRuntimeId = "srcgo", _children = {}}
+            local peerClone = {Name = "PeerHost", _sceneRuntimeId = "peergo", _children = {}}
+            services.awaitUiHost = function(id)
+                if id == "srcgo" then return srcClone end
+                if id == "peergo" then return peerClone end
+                return nil
+            end
+
+            local engine = SceneRuntime.new(services, plan)
+            -- Run BOTH domains so the (server, in the cross-domain case) peer IS
+            -- constructed + registered locally -- the deferred drain therefore
+            -- COULD rebind the source's ref if it had been queued.
+            local edges = engine:start(nil)
+            runDeferred()  -- flush deferred Starts + late UI batches
+
+            local srcComp = engine._componentByInstanceId["Main:1"]
+            assert(srcComp ~= nil, "source component must exist")
+            assert(engine._componentByInstanceId["Main:2"] ~= nil,
+                "peer component must be registered (drain could rebind)")
+
+            -- (b) the source's ref is in NEITHER back-patch queue when
+            -- cross-domain (policy-nil'd refs must never be queued).
+            local queued = false
+            for _, rec in ipairs(engine._pendingPlacementRefs or {}) do
+                if rec.field == "peer" then queued = true end
+            end
+            for _, rec in ipairs(engine._inboundRefsToDeferred or {}) do
+                if rec.field == "peer" then queued = true end
+            end
+
+            -- Re-drain explicitly to prove idempotence + that a leaked queue
+            -- entry WOULD rebind (the registered peer is present).
+            engine:_drainPendingPlacementRefs()
+
+            __ASSERT_BLOCK__
+            print("DONE")
+        """).replace("__PEER_MARK__", peer_mark) \
+            .replace("__PEER_DOMAIN__", peer_domain)
+
+    def test_cross_domain_ui_deferred_source_stays_nil(self):
+        # Cross-domain (client->server): the policy nil-injects at wire time, the
+        # ref is queued NOWHERE, and it stays nil after the deferred drain even
+        # though the server peer is registered locally.
+        scenario = self._scenario(cross_domain=True).replace(
+            "__ASSERT_BLOCK__", textwrap.dedent("""\
+                if srcComp.peer == nil then print("INJECT_NIL_OK") end
+                if not queued then print("NOT_QUEUED_OK") end
+                if srcComp.peer == nil then print("STAYS_NIL_AFTER_DRAIN") end
+                local edgeOk = false
+                for _, e in ipairs(edges) do
+                    if e.field == "peer" and e.from_domain == "client"
+                       and e.to_domain == "server" then edgeOk = true end
+                end
+                if edgeOk then print("EDGE_RECORDED") end
+            """))
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "INJECT_NIL_OK" in out, (
+            f"cross-domain ref must inject nil at wire; got:\n{out}")
+        assert "NOT_QUEUED_OK" in out, (
+            f"a policy-nil'd cross-domain ref from a UI-deferred SOURCE must NOT "
+            f"be recorded in _inboundRefsToDeferred (nor _pendingPlacementRefs); "
+            f"got:\n{out}")
+        assert "STAYS_NIL_AFTER_DRAIN" in out, (
+            f"cross-domain ref must stay nil after the deferred batch builds + "
+            f"registers the peer and Pass 3b / drain re-runs; got:\n{out}")
+        assert "EDGE_RECORDED" in out, (
+            f"cross-domain edge must be recorded; got:\n{out}")
+
+    def test_same_domain_ui_deferred_source_still_binds(self):
+        # Regression guard: a SAME-domain (client->client) ref from a UI-deferred
+        # source MUST still bind through the deferred _inboundRefsToDeferred /
+        # Pass-3b path -- the gate must not over-block legitimate refs.
+        scenario = self._scenario(cross_domain=False).replace(
+            "__ASSERT_BLOCK__", textwrap.dedent("""\
+                if type(srcComp.peer) == "table" and srcComp.peer.mark == "CLI" then
+                    print("SAME_DOMAIN_BOUND")
+                else
+                    print("SAME_DOMAIN_UNBOUND:" .. tostring(srcComp.peer))
+                end
+            """))
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "SAME_DOMAIN_BOUND" in out, (
+            f"a same-domain client->client ref from a UI-deferred source must "
+            f"still bind through the deferred drain; got:\n{out}")
+
+
+# ---------------------------------------------------------------------------
 # Fix #3 -- a stripped ref in an ARRAY SLOT (non-nil ``index``) is recorded into
 # ``_pendingPlacementRefs`` and bound via ``_assignFieldOnComponent`` at the
 # correct array index after the placed component registers. All other tests use

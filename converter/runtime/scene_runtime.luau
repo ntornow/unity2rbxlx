@@ -1296,7 +1296,8 @@ function SceneRuntime:_wireReferences(refs, componentByInstanceId,
 				if placement_id ~= nil and placement_id ~= "" then
 					scopedTarget = placement_id .. ":" .. ref.target_ref
 				end
-				if self._deferredInstanceIds
+				if not crossDomainNil
+				   and self._deferredInstanceIds
 				   and self._deferredInstanceIds[scopedTarget] then
 					self._inboundRefsToDeferred = self._inboundRefsToDeferred or {}
 					table.insert(self._inboundRefsToDeferred, {
