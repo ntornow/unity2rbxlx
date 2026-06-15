@@ -25,10 +25,11 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
 import yaml
 
-from unity.prefab_id import canonical_prefab_id
+from unity.prefab_ref import GuidIndexLike, prefab_id_for_guid
 
 logger = logging.getLogger(__name__)
 
@@ -143,28 +144,16 @@ def resolve_prefab_addressables(
     from the instantiate maps.
     """
     out = PrefabAddressables()
-    guid_to_entry = getattr(guid_index, "guid_to_entry", {})
-    project_root = getattr(guid_index, "project_root", None)
-
-    def prefab_id_for(guid: str) -> str | None:
-        entry = guid_to_entry.get(guid)
-        path = getattr(entry, "asset_path", None) if entry is not None else None
-        if path is None or path.suffix != ".prefab":
-            return None
-        # Shared canonical-id core so the addressable prefab_id is byte-
-        # identical with the planner / scene_converter ``_prefab_stable_id``
-        # join key, including the outside-root / no-project-root fallbacks.
-        pid = canonical_prefab_id(guid, path, project_root)
-        return pid if pid else None
+    gi = cast(GuidIndexLike, guid_index)
 
     for address, guids in index.by_address.items():
-        ids = [pid for pid in (prefab_id_for(g) for g in guids) if pid is not None]
+        ids = [pid for pid in (prefab_id_for_guid(g, gi) for g in guids) if pid is not None]
         out.skipped_non_prefab += len(guids) - len(ids)
         if ids:
             out.by_address[address] = ids
             out.prefab_ids.update(ids)
     for label, guids in index.by_label.items():
-        ids = [pid for pid in (prefab_id_for(g) for g in guids) if pid is not None]
+        ids = [pid for pid in (prefab_id_for_guid(g, gi) for g in guids) if pid is not None]
         if ids:
             out.by_label[label] = ids
             out.prefab_ids.update(ids)
