@@ -9,10 +9,18 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from typing import TYPE_CHECKING
 
 import yaml
 
+if TYPE_CHECKING:
+    from unity.guid_resolver import GuidIndex
+
 logger = logging.getLogger(__name__)
+
+# A ScriptableObject class stem must be a bare Luau/C# identifier to be safe
+# inside a generated string literal and a ``FindFirstChild`` lookup.
+_IDENT_RE = re.compile(r"^[A-Za-z_]\w*$")
 
 
 # Unity YAML document headers
@@ -96,9 +104,84 @@ def _value_to_lua(value: Any, indent: int = 1) -> str:
     return str(value)
 
 
-def convert_asset_file(asset_path: Path) -> ConvertedAsset | None:
+def _resolve_script_class_stem(
+    data_body: dict[str, object],
+    guid_index: GuidIndex | None,
+    asset_name: str,
+) -> str | None:
+    """Resolve the asset's backing ScriptableObject CLASS file stem from its
+    ``m_Script`` GUID. A ScriptableObject asset IS an instance of its class, so
+    the emitted module links its data to that class's methods. Returns ``None``
+    (→ bare ``return data``, the legacy behavior) when the GUID is absent,
+    doesn't resolve to a project ``.cs`` script, isn't a valid identifier, or
+    equals the asset's own module name (which would make the runtime
+    ``FindFirstChild`` self-resolve to the data module)."""
+    if guid_index is None:
+        return None
+    m_script = data_body.get("m_Script")
+    if not isinstance(m_script, dict):
+        return None
+    guid = m_script.get("guid")
+    if not isinstance(guid, str) or not guid:
+        return None
+    entry = getattr(guid_index, "guid_to_entry", {}).get(guid)
+    path = getattr(entry, "asset_path", None) if entry is not None else None
+    if path is None or path.suffix != ".cs":
+        return None
+    stem = path.stem
+    if not _IDENT_RE.match(stem) or stem == asset_name:
+        return None
+    return stem
+
+
+def _so_return_lines(class_stem: str | None) -> list[str]:
+    """Render the SO module's return statement. With a known class, wrap
+    ``data`` so unresolved field/method lookups fall through to the class table
+    (a ScriptableObject asset IS an instance of its class). The binding is:
+
+    - LAZY: resolved on the first missing-key access, not at module load, so a
+      class module that loads after this asset still binds (Roblox caches a
+      module's return value for the session — eager resolution would freeze an
+      early "not found" permanently).
+    - FAIL-OPEN: ``pcall(require)`` + table check, and only the SUCCESS is
+      memoized. A missing/broken class degrades to plain data (returns ``nil``
+      for the key) instead of erroring the whole asset module.
+
+    Falls back to bare ``return data`` when no class is resolved at build time
+    (pure-data / built-in classes), so a field-only SO never regresses."""
+    if not class_stem:
+        return ["return data"]
+    return [
+        "-- ScriptableObject asset = instance of its class; lazy, fail-open",
+        "-- method binding (see converter/scriptable_object_converter.py).",
+        "local _cls = nil",
+        "return setmetatable(data, {",
+        "\t__index = function(_, _key)",
+        "\t\tif _cls == nil then",
+        f'\t\t\tlocal _m = game:GetService("ReplicatedStorage"):FindFirstChild("{class_stem}", true)',
+        f'\t\t\t\tor game:GetService("ServerStorage"):FindFirstChild("{class_stem}", true)',
+        "\t\t\tif _m ~= nil then",
+        "\t\t\t\tlocal _ok, _mod = pcall(require, _m)",
+        '\t\t\t\tif _ok and type(_mod) == "table" then _cls = _mod end',
+        "\t\t\tend",
+        "\t\t\tif _cls == nil then return nil end  -- unresolved; don't memoize the miss",
+        "\t\tend",
+        "\t\treturn _cls[_key]",
+        "\tend,",
+        "})",
+    ]
+
+
+def convert_asset_file(
+    asset_path: Path,
+    guid_index: GuidIndex | None = None,
+) -> ConvertedAsset | None:
     """
     Convert a single Unity .asset file to a Luau ModuleScript.
+
+    When *guid_index* is supplied, the asset's backing ScriptableObject class
+    (its ``m_Script`` GUID) is linked so the asset's serialized data carries the
+    class's methods (``setmetatable(data, {__index = require(<class>)})``).
 
     Returns None if the file is not a valid ScriptableObject asset.
     """
@@ -140,23 +223,20 @@ def convert_asset_file(asset_path: Path) -> ConvertedAsset | None:
             continue  # handled separately
         user_fields[key] = value
 
-    if not user_fields:
-        return ConvertedAsset(
-            source_path=asset_path,
-            asset_name=asset_name,
-            luau_source=f"-- Auto-generated from {asset_path.name} (no user data fields)\nreturn {{}}\n",
-            field_count=0,
-            warnings=warnings,
-        )
+    # Link the data to its ScriptableObject class so method calls resolve. Done
+    # for the field-less case too: a class can carry methods with no serialized
+    # fields. Falls back to bare ``data`` when the class can't be resolved.
+    class_stem = _resolve_script_class_stem(data_body, guid_index, asset_name)
+    class_note = f" (class: {class_stem})" if class_stem else ""
+    data_literal = _value_to_lua(user_fields) if user_fields else "{}"
 
-    # Generate Luau source
     lines = [
         f"-- Auto-generated from {asset_path.name}",
-        f"-- ScriptableObject: {asset_name}",
+        f"-- ScriptableObject: {asset_name}{class_note}",
         "",
-        f"local data = {_value_to_lua(user_fields)}",
+        f"local data = {data_literal}",
         "",
-        "return data",
+        *_so_return_lines(class_stem),
         "",
     ]
 
@@ -169,12 +249,18 @@ def convert_asset_file(asset_path: Path) -> ConvertedAsset | None:
     )
 
 
-def convert_asset_files(unity_path: Path) -> AssetConversionResult:
+def convert_asset_files(
+    unity_path: Path,
+    guid_index: GuidIndex | None = None,
+) -> AssetConversionResult:
     """
     Discover and convert all .asset files in a Unity project.
 
     Args:
         unity_path: Root of the Unity project.
+        guid_index: Optional GUID index; when supplied, each asset's data is
+            linked to its backing ScriptableObject class so method calls
+            resolve (see ``convert_asset_file``).
 
     Returns:
         AssetConversionResult with converted ModuleScript sources.
@@ -187,7 +273,7 @@ def convert_asset_files(unity_path: Path) -> AssetConversionResult:
 
     for asset_file in assets_dir.rglob("*.asset"):
         result.total += 1
-        converted = convert_asset_file(asset_file)
+        converted = convert_asset_file(asset_file, guid_index)
         if converted:
             result.assets.append(converted)
             result.converted += 1

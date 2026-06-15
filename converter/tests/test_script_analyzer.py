@@ -170,3 +170,49 @@ class TestReferencedTypesGlobalLookupExclusion:
             "  }",
         )
         assert "GameManager" in refs
+
+
+class TestClassNameNotMatchedInComments:
+    """Regression: ``_RE_CLASS.search`` on RAW source matched the word after
+    the first ``class`` token *anywhere*, including doc-comment prose. The real
+    Trash Dash failure: ``/// This class allows us …`` -> class_name "allows".
+    Comments/strings are now stripped before the match.
+    """
+
+    def _info(self, tmp_path: Path, name: str, body: str):
+        cs = tmp_path / f"{name}.cs"
+        cs.write_text(body)
+        return analyze_script(cs)
+
+    def test_doc_comment_class_prose_is_ignored(self, tmp_path: Path):
+        info = self._info(
+            tmp_path, "Pooler",
+            "/// This class allows us to create multiple instances.\n"
+            "public class Pooler\n{\n}\n",
+        )
+        assert info.class_name == "Pooler"  # pre-fix: "allows"
+
+    def test_line_comment_class_prose_is_ignored(self, tmp_path: Path):
+        info = self._info(
+            tmp_path, "ShopList",
+            "// Base class for any list in the shop\n"
+            "public abstract class ShopList : MonoBehaviour\n{\n}\n",
+        )
+        assert info.class_name == "ShopList"  # pre-fix: "for"
+        assert info.base_class == "MonoBehaviour"
+
+    def test_abstract_class_prose_then_real_decl(self, tmp_path: Path):
+        info = self._info(
+            tmp_path, "Missions",
+            "/// Base abstract class used to define a mission.\n"
+            "public abstract class MissionBase\n{\n}\n",
+        )
+        assert info.class_name == "MissionBase"  # pre-fix: "used"
+
+    def test_string_literal_class_is_ignored(self, tmp_path: Path):
+        info = self._info(
+            tmp_path, "Greeter",
+            'const string msg = "class Imposter wins";\n'
+            "public class Greeter\n{\n}\n",
+        )
+        assert info.class_name == "Greeter"

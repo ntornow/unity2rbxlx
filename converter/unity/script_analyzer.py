@@ -21,6 +21,27 @@ log = logging.getLogger(__name__)
 _RE_CLASS = re.compile(
     r"(?:public\s+)?class\s+(\w+)(?:\s*:\s*(\w+))?",
 )
+
+# Comments and string/char literals must be stripped BEFORE the structural
+# regexes run: a doc-comment like ``/// This class allows us …`` or a string
+# ``"class Foo"`` is prose, not a declaration. ``.search`` returns the FIRST
+# ``class <word>`` it finds, so an un-stripped source makes the first comment
+# mentioning "class" win and ``class_name`` becomes an English word ("allows",
+# "for", "used"). Mirrors ``code_transpiler._strip_comments_and_strings``.
+_RE_COMMENTS_AND_STRINGS = re.compile(
+    r"//[^\n]*"            # line comment ( // and /// )
+    r"|/\*.*?\*/"          # block comment
+    r'|@"(?:""|[^"])*"'    # C# verbatim string
+    r'|"(?:\\.|[^"\\])*"'  # regular string
+    r"|'(?:\\.|[^'\\])*'",  # char literal
+    re.DOTALL,
+)
+
+
+def _strip_comments_and_strings(source: str) -> str:
+    """Blank out comments and literals (replace with a space to preserve token
+    boundaries) so declaration regexes can't match inside prose."""
+    return _RE_COMMENTS_AND_STRINGS.sub(" ", source)
 _RE_LIFECYCLE = re.compile(
     r"(?:void|IEnumerator)\s+(Awake|Start|Update|FixedUpdate|LateUpdate|"
     r"OnEnable|OnDisable|OnDestroy|OnCollisionEnter|OnCollisionExit|"
@@ -111,37 +132,46 @@ def analyze_script(script_path: str | Path) -> ScriptInfo:
         info.is_editor_script = "/Editor/" in rel
         info.is_test_script = "/Test" in rel
 
+    # Strip comments/strings ONCE and drive EVERY structural regex off the
+    # cleaned source. A doc-comment ("/// This class allows…") or a string
+    # literal must never be mistaken for a declaration, a lifecycle hook, or a
+    # type reference — ``referenced_types`` flows into ``pipeline.dependency_map``
+    # (→ storage_classifier / module_domain / build_topology), so a comment-hit
+    # type would mis-route a module. (Editor/test detection above keys on the
+    # path, not the source, so it stays on the raw read.)
+    decommented = _strip_comments_and_strings(source)
+
     # Extract class info. _RE_CLASS now matches base-less classes, so the
     # second capture group can be None — coerce to "" so existing equality
     # checks (`base_class == "MonoBehaviour"`, etc.) keep their semantics.
-    m = _RE_CLASS.search(source)
+    m = _RE_CLASS.search(decommented)
     if m:
         info.class_name = m.group(1)
         info.base_class = m.group(2) or ""
 
     # Extract lifecycle hooks
-    info.lifecycle_hooks = list({m.group(1) for m in _RE_LIFECYCLE.finditer(source)})
+    info.lifecycle_hooks = list({m.group(1) for m in _RE_LIFECYCLE.finditer(decommented)})
 
     # Extract Unity API usage
-    info.unity_apis_used = list({m.group(1) for m in _RE_UNITY_API.finditer(source)})
+    info.unity_apis_used = list({m.group(1) for m in _RE_UNITY_API.finditer(decommented)})
 
     # Extract serialized fields
     info.serialized_fields = [
-        (m.group(1), m.group(2)) for m in _RE_SERIALIZED_FIELD.finditer(source)
+        (m.group(1), m.group(2)) for m in _RE_SERIALIZED_FIELD.finditer(decommented)
     ]
 
     # Extract type references (field types, method parameter types, etc.)
     # Matches PascalCase identifiers used as types in declarations
     _type_refs: set[str] = set()
     # Field declarations: Type fieldName; or [Attr] Type fieldName;
-    for m2 in re.finditer(r'(?:private|public|protected|internal)\s+(?:readonly\s+)?([A-Z]\w+)\s+\w+', source):
+    for m2 in re.finditer(r'(?:private|public|protected|internal)\s+(?:readonly\s+)?([A-Z]\w+)\s+\w+', decommented):
         _type_refs.add(m2.group(1))
     # Serialized fields: [SerializeField] Type name
     for ft, _ in info.serialized_fields:
         if ft and ft[0].isupper():
             _type_refs.add(ft)
     # Constructor calls: new TypeName(
-    for m2 in re.finditer(r'\bnew\s+([A-Z]\w+)\s*\(', source):
+    for m2 in re.finditer(r'\bnew\s+([A-Z]\w+)\s*\(', decommented):
         _type_refs.add(m2.group(1))
     # Generic type args: List<TypeName>, Dictionary<K, TypeName>.
     # EXCLUDE the type arg of GLOBAL scene-lookup generics
@@ -159,13 +189,13 @@ def analyze_script(script_path: str | Path) -> ScriptInfo:
     # Capture the optional token immediately before ``<`` so we can tell a
     # global-lookup method (``FindObjectOfType<Foo>``) from a collection
     # type (``List<Foo>``) or a component lookup (``GetComponent<Foo>``).
-    for m2 in re.finditer(r'(\w+)?\s*<\s*([A-Z]\w+)', source):
+    for m2 in re.finditer(r'(\w+)?\s*<\s*([A-Z]\w+)', decommented):
         preceding = m2.group(1) or ""
         if preceding in _GLOBAL_LOOKUP_GENERIC_METHODS:
             continue
         _type_refs.add(m2.group(2))
     # Method parameters: (TypeName param, ...)
-    for m2 in re.finditer(r'[,(]\s*([A-Z]\w+)\s+\w+', source):
+    for m2 in re.finditer(r'[,(]\s*([A-Z]\w+)\s+\w+', decommented):
         _type_refs.add(m2.group(1))
     # Base class
     if info.base_class:
