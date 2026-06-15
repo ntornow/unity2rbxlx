@@ -1475,25 +1475,13 @@ class TestTemplateSceneRuntimeIdStamping:
         )
         assert conv == "Assets/Prefabs/NoGuid.prefab"
 
-    @pytest.mark.xfail(
-        reason=(
-            "latent: scene_converter._prefab_stable_id and "
-            "scene_runtime_planner._prefab_stable_id drift on "
-            "project_root=None. Converter returns just `guid`; planner "
-            "returns f'{guid}:{abs_path}'. See "
-            "docs/design/scene-runtime-pr2-followups.md §7."
-        ),
-        strict=True,
-    )
     def test_prefab_stable_id_parity_project_root_none(self, tmp_path):
-        """When ``unity_project_root`` is None the two helpers diverge
-        (xfail). The converter short-circuits to ``guid`` (no path
-        segment at all); the planner falls back to the absolute path
-        and emits ``f'{guid}:{abs_path}'``. Production never hits this
-        because the pipeline always supplies a project root, but the
-        helpers claim to mirror each other and this case violates that
-        claim. Fix belongs in a separate PR (constraint: do NOT change
-        either helper as part of PR #145; that's out of scope)."""
+        """When ``unity_project_root`` is None the two helpers now AGREE
+        (was xfail until the addressables Unit-1 3-way `_prefab_stable_id`
+        unification, D6c/D11). Both short-circuit to ``guid`` (no path
+        segment) — the planner no longer falls back to an absolute path.
+        Regression guard for the parity the resolved-name single-source
+        relies on."""
         from converter.scene_converter import _prefab_stable_id as conv_stable
         from converter.scene_runtime_planner import (
             _prefab_stable_id as plan_stable,
@@ -1516,25 +1504,12 @@ class TestTemplateSceneRuntimeIdStamping:
             f"project_root=None drift: conv={conv!r} plan={plan!r}"
         )
 
-    @pytest.mark.xfail(
-        reason=(
-            "latent: scene_converter._prefab_stable_id and "
-            "scene_runtime_planner._prefab_stable_id drift when the "
-            "prefab path is outside `unity_project_root`. Converter "
-            "returns ''; planner falls back to the absolute path and "
-            "emits f'{guid}:{abs_path}'. See "
-            "docs/design/scene-runtime-pr2-followups.md §7."
-        ),
-        strict=True,
-    )
     def test_prefab_stable_id_parity_prefab_outside_root(self, tmp_path):
-        """Prefab lives outside the project root (xfail). Converter
-        treats this like ``_scene_namespace`` outside-root (returns
-        '' to skip stamping); planner falls back to the absolute path.
-        Production never hits this because Unity prefabs always live
-        under ``Assets/``, but the asymmetry is a latent footgun for
-        out-of-tree assets or symlinked project layouts. Fix is
-        out-of-scope for PR #145."""
+        """Prefab outside the project root: the two helpers now AGREE
+        (was xfail until the Unit-1 3-way unification, D6c/D11). Both
+        skip the path segment the same way rather than the planner
+        falling back to an absolute path. Regression guard for the
+        out-of-tree / symlinked-layout asymmetry."""
         from converter.scene_converter import _prefab_stable_id as conv_stable
         from converter.scene_runtime_planner import (
             _prefab_stable_id as plan_stable,
