@@ -27,6 +27,18 @@ def test_dotted_self_gameobject_receiver_is_flagged():
     assert _im_rules(src), "self.gameObject:ApplyImpulse must be flagged"
 
 
+def test_whitespace_tolerant_forms_are_flagged():
+    for call in ("rb:ApplyImpulse(v)", "rb: ApplyImpulse(v)", "rb : ApplyImpulse (v)"):
+        src = f"function C:Start() local rb = self.rb; {call} end\nreturn C\n"
+        assert _im_rules(src), f"must flag whitespace form: {call!r}"
+
+
+def test_method_definition_is_not_flagged():
+    # A definition named ApplyImpulse is not a raw call — must not be flagged.
+    src = "function C:ApplyImpulse(v) self.x = v end\nreturn C\n"
+    assert not _im_rules(src), "function Class:ApplyImpulse(...) definition must not be flagged"
+
+
 def test_host_call_is_not_flagged():
     src = "function C:Start() self.host.applyImpulse(self.rb, Vector3.new(1,0,0)) end\nreturn C\n"
     assert not _im_rules(src), "the host call must NOT be flagged"

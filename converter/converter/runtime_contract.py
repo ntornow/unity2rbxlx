@@ -1132,12 +1132,19 @@ def _check_script_parent(stripped: str, source: str) -> list[Violation]:
 # lowercase-``a`` form so it is never matched either.
 # ---------------------------------------------------------------------------
 
-_RE_RAW_APPLY_IMPULSE = re.compile(r":ApplyImpulse\s*\(")
+# Whitespace-tolerant: Luau allows spaces around the ``:`` and before ``(``
+# (``rb:ApplyImpulse(``, ``rb : ApplyImpulse (``). ``ApplyImpulseAtPosition`` /
+# ``ApplyAngularImpulse`` have other chars after ``ApplyImpulse`` so ``\s*\(`` never matches them.
+_RE_RAW_APPLY_IMPULSE = re.compile(r":\s*ApplyImpulse\s*\(")
+# A method DEFINITION ``function X:ApplyImpulse(...)`` is not a call — don't flag it.
+_RE_FUNC_DEF_PREFIX = re.compile(r"function\s+[\w.]*$")
 
 
 def _check_raw_apply_impulse(stripped: str, source: str) -> list[Violation]:
     out: list[Violation] = []
     for m in _RE_RAW_APPLY_IMPULSE.finditer(stripped):
+        if _RE_FUNC_DEF_PREFIX.search(stripped[max(0, m.start() - 40):m.start()]):
+            continue  # ``function Class:ApplyImpulse(...)`` definition, not a call
         line = source.count("\n", 0, m.start()) + 1
         out.append(Violation(
             rule="im",
