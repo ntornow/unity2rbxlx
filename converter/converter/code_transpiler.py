@@ -1677,6 +1677,13 @@ def _contract_reprompt_user_message(
 
 _PLAYER_RULES: frozenset[str] = frozenset({"p1", "p2"})
 
+# Rules whose SURVIVING violation is NON-load-bearing -> fails OPEN. Each maps to a distinct
+# ``contract-verifier-<suffix>`` tag (a hyphen form that never matches ``_is_post_reprompt_warning``,
+# so it never promotes to a project fail-closed). p1/p2 = paradigm-B player rejects; im = a raw linear
+# ``:ApplyImpulse(`` that should route through ``self.host.applyImpulse`` (Phase 1, relation #8).
+_FAIL_OPEN_RULE_TAGS: dict[str, str] = {"p1": "player", "p2": "player", "im": "impulse"}
+_FAIL_OPEN_RULES: frozenset[str] = frozenset(_FAIL_OPEN_RULE_TAGS)
+
 
 def _format_contract_survivor_warning(violation) -> str:
     """Tag a SURVIVING verifier violation for the ``TranspiledScript``.
@@ -1691,9 +1698,10 @@ def _format_contract_survivor_warning(violation) -> str:
     the ``_refresh_contract_warnings`` cache-replay path so both fail open
     on a surviving player reject identically.
     """
-    if violation.rule in _PLAYER_RULES:
+    suffix = _FAIL_OPEN_RULE_TAGS.get(violation.rule)
+    if suffix is not None:
         return (
-            f"contract-verifier-player (rule {violation.rule}, "
+            f"contract-verifier-{suffix} (rule {violation.rule}, "
             f"line {violation.line}): {violation.message}"
         )
     return (
@@ -1808,7 +1816,7 @@ def _verify_and_reprompt(
     pre_warnings = [
         f"contract-verifier-pre (rule {v.rule}, line {v.line}): {v.message}"
         for v in initial.violations
-        if v.rule not in _PLAYER_RULES
+        if v.rule not in _FAIL_OPEN_RULES
     ]
 
     violations_text = _format_contract_violations(initial.violations)

@@ -210,6 +210,9 @@ def _is_contract_warning(w: str) -> bool:
     return (
         w.startswith("contract-verifier")
         and not w.startswith("contract-verifier-player")
+        # Phase 1 (relation #8): the ``im`` rule is NON-load-bearing (fails OPEN), like player
+        # rejects, so it must not perturb the compliance-spike contract stats either.
+        and not w.startswith("contract-verifier-impulse")
     )
 
 
