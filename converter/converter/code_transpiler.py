@@ -306,11 +306,21 @@ def transpile_scripts(
     ai_results: dict[str, tuple[str, float, list[str]]] = {}
 
     # Map every pending script to a unique stem so the dep-graph code has
-    # a stable key. Prefer the class name (keeps cross-reference matching
-    # idiomatic); when two scripts share one, disambiguate by appending a
-    # short path-based suffix so the second script still gets its own AI
-    # pass — silently dropping duplicates would regress to the pre-PR-4
-    # behaviour for legitimate cases like two Utils.cs in different dirs.
+    # a stable key. The stem is the FILE STEM — the single canonical module
+    # identity used everywhere else: the emitted ``<stem>.luau`` filename,
+    # the planner's ``by_stem`` require table (keyed on ``asset_path.stem``),
+    # and the generic prompt's contract (``@scene_runtime/<file-stem>``). It
+    # must NOT be ``info.class_name``: (1) ``class_name`` is a regex extract
+    # that can be wrong (a doc-comment ``/// This class allows…`` once yielded
+    # "allows"), and (2) even when correct it diverges from the filename for a
+    # multi-class file (``Missions.cs`` defines ``MissionBase``) — either way
+    # the AI is fed a stem that ``by_stem`` can't resolve, so the require
+    # fails closed at runtime. Cross-reference matching stays idiomatic
+    # regardless: ``_build_dependency_graph`` maps every class name to its
+    # file stem via ``_extract_class_names`` (so a ref to ``MissionBase``
+    # still resolves to ``Missions``). When two files share a stem (two
+    # ``Utils.cs`` in different dirs) we disambiguate by appending a short
+    # path-based suffix so the second script still gets its own AI pass.
     file_sources: dict[str, str] = {}
     info_by_stem: dict[str, tuple[Any, str, str]] = {}
     # Phase 3 needs to look up the AI result for each (info, csharp, type)
@@ -318,7 +328,7 @@ def transpile_scripts(
     # under, so remember stem-by-path here.
     stem_by_path: dict[str, str] = {}
     for info, csharp_source, script_type in pending_scripts:
-        base_stem = info.class_name or info.path.stem
+        base_stem = info.path.stem
         stem = base_stem
         if stem in file_sources:
             suffix = hashlib.sha1(str(info.path).encode()).hexdigest()[:6]
@@ -453,7 +463,10 @@ def transpile_scripts(
     # Use the disambiguated stem (path-keyed) so two scripts with the same
     # class name don't collide on lookup.
     for info, csharp_source, script_type in pending_scripts:
-        key = stem_by_path.get(str(info.path), info.class_name or str(info.path))
+        # ``stem_by_path`` always holds this path (populated above for every
+        # pending script); the default is purely defensive and must match the
+        # file-stem identity, NOT ``class_name`` (which can be a comment hit).
+        key = stem_by_path.get(str(info.path), info.path.stem)
         luau, confidence, warnings, strategy = "", 0.0, [], "rule_based"
 
         if key in ai_results:
@@ -769,7 +782,14 @@ def _build_project_context(script_infos: list[Any]) -> str:
             base = ""
             if hasattr(si, 'base_class') and si.base_class:
                 base = f" : {si.base_class}"
-            classes.append(f"  - {si.class_name}{base}")
+            # require() is keyed on the FILE STEM (the emitted ``<stem>.luau``),
+            # NOT the class name — they differ for a multi-class file
+            # (``MissionBase`` lives in ``Missions.cs``). Surface the stem so
+            # the AI emits ``@scene_runtime/Missions``, not
+            # ``@scene_runtime/MissionBase`` (which fails to resolve).
+            stem = si.path.stem
+            stem_hint = f"  (require as: {stem})" if stem != si.class_name else ""
+            classes.append(f"  - {si.class_name}{base}{stem_hint}")
 
     if not classes:
         return ""

@@ -341,3 +341,35 @@ class TestCodexFix2DuplicateStems:
         assert "void A()" in luau_by_source[str(f1)]
         assert "void B()" in luau_by_source[str(f2)]
         assert luau_by_source[str(f1)] != luau_by_source[str(f2)]
+
+
+class TestMultiClassFileResolvesToFileStem:
+    """Regression (Trash Dash generic): a reference to a SECONDARY class in a
+    multi-class file must resolve to the FILE STEM, not the class name — the
+    require graph + emitted ``<stem>.luau`` are file-stem keyed. ``Missions.cs``
+    defines ``MissionBase``/``PickupMission``; ``PlayerData`` referencing
+    ``MissionBase`` must depend on the ``Missions`` stem.
+    """
+
+    def test_secondary_class_ref_maps_to_file_stem(self):
+        file_sources = {
+            "Missions": (
+                "public abstract class MissionBase {}\n"
+                "public class PickupMission : MissionBase {}\n"
+            ),
+            "PlayerData": (
+                "public class PlayerData { MissionBase m; void f(){ new PickupMission(); } }"
+            ),
+        }
+        graph, class_to_stem = _build_dependency_graph(file_sources)
+        # Every declared class in Missions.cs maps to the "Missions" stem.
+        assert class_to_stem["MissionBase"] == "Missions"
+        assert class_to_stem["PickupMission"] == "Missions"
+        # PlayerData depends on the Missions MODULE (file stem), not "MissionBase".
+        assert graph["PlayerData"] == {"Missions"}
+
+    def test_class_in_comment_is_not_a_declared_name(self):
+        # _extract_class_names strips comments/strings, so a doc-comment can't
+        # register a phantom class that would shadow a real dependency edge.
+        src = "/// This class allows pooling.\npublic class Pooler {}\n"
+        assert _extract_class_names(src) == {"Pooler"}
