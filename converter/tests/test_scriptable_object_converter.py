@@ -5,7 +5,7 @@ to Luau ModuleScript conversion.
 
 from __future__ import annotations
 
-
+from pathlib import Path
 
 from converter.scriptable_object_converter import (
     AssetConversionResult,
@@ -127,7 +127,10 @@ class TestConvertAssetFile:
         result = convert_asset_file(f)
         assert result is not None
         assert result.field_count == 0
-        assert "no user data fields" in result.luau_source
+        # No user fields → an empty data table. Without a guid_index there is
+        # no class link, so it returns the bare data (legacy behavior).
+        assert "local data = {}" in result.luau_source
+        assert result.luau_source.rstrip().endswith("return data")
 
     def test_unity_object_reference_becomes_nil(self, tmp_path):
         f = tmp_path / "WithRef.asset"
@@ -229,3 +232,54 @@ class TestConvertAssetFiles:
     def test_result_type(self, tmp_path):
         result = convert_asset_files(tmp_path)
         assert isinstance(result, AssetConversionResult)
+
+
+class TestScriptableObjectClassLink:
+    """A ScriptableObject asset IS an instance of its class — its data module
+    links to the class so method calls (e.g. Load) resolve. Regression for the
+    Trash Dash ``m_ConsumableDatabase:Load()`` 'missing method' crash."""
+
+    from types import SimpleNamespace as _NS
+
+    def _idx(self, guid, cs_path):
+        from types import SimpleNamespace
+        entry = SimpleNamespace(asset_path=Path(cs_path))
+        return SimpleNamespace(guid_to_entry={guid: entry})
+
+    ASSET = (
+        "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n"
+        "--- !u!114 &11400000\n"
+        "MonoBehaviour:\n"
+        "  m_Script: {fileID: 11500000, guid: abc123, type: 3}\n"
+        "  m_Name: Consumables\n"
+        "  consumbales: []\n"
+    )
+
+    def test_links_to_class_when_guid_resolves(self, tmp_path):
+        f = tmp_path / "Consumables.asset"; f.write_text(self.ASSET, encoding="utf-8")
+        idx = self._idx("abc123", "/proj/Assets/ConsumableDatabase.cs")
+        src = convert_asset_file(f, idx).luau_source
+        assert 'FindFirstChild("ConsumableDatabase", true)' in src
+        # Lazy, fail-open binding (resolved on first miss; pcall + table check).
+        assert "setmetatable(data, {" in src
+        assert "__index = function" in src
+        assert "pcall(require, _m)" in src
+
+    def test_falls_back_to_bare_data_without_index(self, tmp_path):
+        f = tmp_path / "Consumables.asset"; f.write_text(self.ASSET, encoding="utf-8")
+        src = convert_asset_file(f).luau_source
+        assert "setmetatable" not in src
+        assert src.rstrip().endswith("return data")
+
+    def test_no_link_when_class_name_equals_asset_name(self, tmp_path):
+        # data module + class module would share a name → ambiguous FindFirstChild.
+        f = tmp_path / "Consumables.asset"; f.write_text(self.ASSET, encoding="utf-8")
+        idx = self._idx("abc123", "/proj/Assets/Consumables.cs")  # stem == asset m_Name
+        src = convert_asset_file(f, idx).luau_source
+        assert "setmetatable" not in src
+
+    def test_no_link_when_guid_points_to_non_script(self, tmp_path):
+        f = tmp_path / "Consumables.asset"; f.write_text(self.ASSET, encoding="utf-8")
+        idx = self._idx("abc123", "/proj/Assets/Some.prefab")  # not .cs
+        src = convert_asset_file(f, idx).luau_source
+        assert "setmetatable" not in src

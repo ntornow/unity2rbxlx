@@ -900,7 +900,9 @@ class Pipeline:
         # (possibly) wiped, so the disk layout matches the rbxlx.
         try:
             from converter.scriptable_object_converter import convert_asset_files
-            so_result = convert_asset_files(self.unity_project_path)
+            so_result = convert_asset_files(
+                self.unity_project_path, self.state.guid_index
+            )
             if so_result.converted:
                 self.state.scriptable_objects = so_result
                 log.info(
