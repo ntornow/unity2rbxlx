@@ -350,6 +350,23 @@ class TestPrefabRefResolution:
         src = convert_asset_file(f, idx).luau_source
         assert f'"{PICKUP_ID}"' in src
 
+    def test_two_key_prefab_ref_resolves_to_exact_id(self, tmp_path):
+        # The EXACT two-key {guid,fileID} ref shape (NO ``type`` key) must still
+        # hit ``_value_to_lua``'s detection ``set(keys) <= {fileID,guid,type}``
+        # and resolve. The prefab_ref unit tests bypass this glue-layer
+        # detection, so this is the only guard that a regression requiring
+        # ``type`` (e.g. ``== {fileID,guid,type}``) would surface — two-key refs
+        # would silently fall through to the dict arm and never resolve.
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        f = self._write_asset(
+            tmp_path,
+            f"  collectiblePrefab: {{guid: {PICKUP_GUID}, fileID: 184264}}\n",
+        )
+        src = convert_asset_file(f, idx).luau_source
+        assert f'"{PICKUP_ID}"' in src
+
     # --- Acceptance #2: non-prefab (sprite/mesh) stays nil ---------------
 
     def test_non_prefab_ref_stays_nil(self, tmp_path):
@@ -427,6 +444,31 @@ class TestPrefabRefResolution:
         src = convert_asset_file(f, idx).luau_source
         assert f'"{PICKUP_ID}"' in src
 
+    def test_nested_list_ref_counts(self, tmp_path):
+        # Drive a ``cloudPrefabs``-style list of refs (one prefab + one
+        # non-prefab) directly through ``_value_to_lua`` and assert the counter
+        # reflects the NESTED refs — proves ``counts`` survives the list
+        # recursion arm (:93). If that arm dropped ``counts``, resolved/skipped
+        # would stay 0.
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(
+            proj,
+            (PICKUP_GUID, PICKUP_REL, "prefab"),
+            ("e1a536f74c7ef384a8d7132148ace0c8", "Assets/UI/themeIcon.png", "texture"),
+        )
+        fields = {
+            "cloudPrefabs": [
+                {"fileID": 184264, "guid": PICKUP_GUID, "type": 3},
+                {"fileID": 21300036, "guid": "e1a536f74c7ef384a8d7132148ace0c8"},
+            ],
+        }
+        counts = RefResolveCounts()
+        out = _value_to_lua(fields, guid_index=idx, counts=counts)
+        assert f'"{PICKUP_ID}"' in out
+        assert counts.resolved == 1
+        assert counts.skipped == 1
+
     def test_nested_dict_ref_resolves(self, tmp_path):
         proj = tmp_path / "proj"
         proj.mkdir()
@@ -439,6 +481,26 @@ class TestPrefabRefResolution:
         )
         src = convert_asset_file(f, idx).luau_source
         assert f'"{PICKUP_ID}"' in src
+
+    def test_nested_dict_ref_counts(self, tmp_path):
+        # Drive a ``prefabList[].m_CachedAsset``-style nested dict ref directly
+        # through ``_value_to_lua`` and assert the counter reflects the nested
+        # ref — proves ``counts`` survives the dict-value recursion arms
+        # (:118 identifier-key, :120 bracketed-key). If those arms dropped
+        # ``counts``, resolved would stay 0.
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        fields = {
+            "prefabList": [
+                {"m_CachedAsset": {"fileID": 184264, "guid": PICKUP_GUID, "type": 3}},
+            ],
+        }
+        counts = RefResolveCounts()
+        out = _value_to_lua(fields, guid_index=idx, counts=counts)
+        assert f'"{PICKUP_ID}"' in out
+        assert counts.resolved == 1
+        assert counts.skipped == 0
 
     def test_non_identifier_key_dict_ref_resolves(self, tmp_path):
         # A nested dict whose key is NOT a valid Python identifier (hyphen, no
@@ -483,7 +545,11 @@ class TestPrefabRefResolution:
 
         proj = tmp_path / "proj"
         proj.mkdir()
-        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        idx = self._real_index(
+            proj,
+            (PICKUP_GUID, PICKUP_REL, "prefab"),
+            ("e1a536f74c7ef384a8d7132148ace0c8", "Assets/UI/themeIcon.png", "texture"),
+        )
         f = self._write_asset(
             tmp_path,
             f"  collectiblePrefab: {{fileID: 184264, guid: {PICKUP_GUID}, type: 3}}\n"
@@ -491,7 +557,13 @@ class TestPrefabRefResolution:
         )
         with caplog.at_level(logging.INFO, logger="converter.scriptable_object_converter"):
             convert_asset_file(f, idx)
-        assert "resolved to prefab ids" in caplog.text
+        # Assert the CONCRETE fixture counts and the asset name, not a generic
+        # substring — one prefab ref resolved, one non-prefab (sprite) kept nil.
+        # Swapped/hard-coded numbers or a wrong asset name would fail here.
+        assert (
+            "themeData.asset: 1 object-ref(s) resolved to prefab ids, 1 kept nil"
+            in caplog.text
+        )
 
     # --- belt-and-suspenders: real project parse, path-skipped -----------
 
