@@ -149,7 +149,15 @@ def resolve_prefab_addressables(
         if path is None or path.suffix != ".prefab":
             return None
         rel = getattr(entry, "relative_path", None)
-        rel_str = str(rel) if rel is not None else path.name
+        # ``.as_posix()`` keeps this byte-identical with the planner /
+        # scene_converter ``_prefab_stable_id`` ids (Slice 1.2 / D11);
+        # a Windows-native ``str(rel)`` would inject backslashes and skew
+        # the addressable prefab_id join. ``relative_path`` may already be
+        # a ``str`` (forward-slashed) or a ``Path``.
+        if rel is None:
+            rel_str = path.name
+        else:
+            rel_str = Path(rel).as_posix()
         return f"{guid}:{rel_str}"
 
     for address, guids in index.by_address.items():

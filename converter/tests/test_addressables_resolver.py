@@ -3,7 +3,7 @@ resolving addresses/labels to scene-runtime prefab ids."""
 
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 
 from unity.addressables_resolver import (
@@ -96,3 +96,28 @@ class TestResolve:
         res = resolve_prefab_addressables(idx, _guid_index({}))  # nothing resolves
         assert res.by_address == {}
         assert res.prefab_ids == set()
+
+    def test_prefab_id_rel_is_posix_normalized(self, tmp_path):
+        """Slice 1.2 / D11: ``prefab_id_for`` normalizes the rel via
+        ``.as_posix()`` so a Windows-native ``relative_path`` (backslashes)
+        does NOT skew the prefab_id away from the byte-identical id the
+        planner / scene_converter ``_prefab_stable_id`` produce (which are
+        always forward-slashed)."""
+        from types import SimpleNamespace
+
+        idx = parse_addressables(_project(tmp_path, GROUP))
+        # ``relative_path`` carries OS-native backslashes (PureWindowsPath
+        # round-trips to a backslashed str); the resolver must forward-slash it.
+        gi = SimpleNamespace(guid_to_entry={
+            "catguid": SimpleNamespace(
+                asset_path=PureWindowsPath(
+                    r"C:\proj\Assets\Bundles\Characters\Cat\character.prefab"),
+                relative_path=PureWindowsPath(
+                    r"Assets\Bundles\Characters\Cat\character.prefab"),
+            ),
+        })
+        res = resolve_prefab_addressables(idx, gi)
+        assert res.by_address["Trash Cat"] == [
+            "catguid:Assets/Bundles/Characters/Cat/character.prefab",
+        ]
+        assert "\\" not in next(iter(res.prefab_ids))

@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 from typing import Any, cast
 
 if TYPE_CHECKING:
+    from unity.addressables_resolver import PrefabAddressables
     from converter.scene_runtime_topology.build_topology import (
         TopologyArtifact,
     )
@@ -649,6 +650,15 @@ class Pipeline:
     ESSENTIAL_PHASES: frozenset[str] = frozenset({
         "parse", "extract_assets", "convert_materials",
         "transpile_scripts", "convert_animations", "convert_scene",
+        # Addressables Unit 1 (D8 / fact 10): ``plan_scene_runtime``
+        # builds the ``addressables`` block + the collision-conditional
+        # resolved ``template_name`` map. It must re-run on every resumed
+        # invocation so a ``--phase=write_output`` resume recomputes them
+        # fresh against the current ``prefab_library`` — never pairing a
+        # fresh library with a stale persisted map. The phase is
+        # read-only + idempotent, so making it essential has no unwanted
+        # side effect.
+        "plan_scene_runtime",
         # Phase 2a slice 8: ``materialize_and_classify`` populates
         # ``state.rbx_place.scripts`` (in-memory) which write_output
         # consumes — it must re-run on every resumed invocation so a
@@ -995,6 +1005,30 @@ class Pipeline:
             len(refs), total,
         )
 
+    def _build_addressables_block(self) -> PrefabAddressables | None:
+        """Parse the project's Addressables groups and narrow them to
+        instantiable prefab ids (D7 / D8 / fact 9).
+
+        Returns the ``PrefabAddressables`` (carrying ``by_address`` +
+        ``by_label`` + ``prefab_ids``) when the project has resolvable
+        addressable prefabs, else ``None`` (no GuidIndex, no
+        AddressableAssetsData dir, or no prefab-narrowed entries) so the
+        caller omits the block entirely — inert for non-Addressables
+        conversions.
+        """
+        from unity.addressables_resolver import (
+            parse_addressables,
+            resolve_prefab_addressables,
+        )
+
+        if self.state.guid_index is None:
+            return None
+        index = parse_addressables(self.unity_project_path)
+        resolved = resolve_prefab_addressables(index, self.state.guid_index)
+        if not resolved.by_address and not resolved.by_label:
+            return None
+        return resolved
+
     def plan_scene_runtime(self) -> None:
         """Phase: build the project-level ``scene_runtime`` artifact.
 
@@ -1043,6 +1077,60 @@ class Pipeline:
             guid_index=self.state.guid_index,
             unity_project_root=self.unity_project_path,
         )
+
+        # --- Addressables Unit 1 (Slice 1.2): resolver -> plan bridge ---
+        # Parse the project's Addressables groups and narrow them to
+        # instantiable prefab ids, then attach the block to the artifact
+        # (D7 / D8). This is the SINGLE source of truth for the resolved
+        # ``template_name`` map below; both happen before the artifact is
+        # frozen onto ``self.ctx.scene_runtime``.
+        resolved = self._build_addressables_block()
+        addr_ids: set[str] = set()
+        if resolved is not None:
+            artifact["addressables"] = {
+                "by_address": resolved.by_address,
+                "by_label": resolved.by_label,
+            }
+            addr_ids = set(resolved.prefab_ids)
+            log.info(
+                "[plan_scene_runtime] emitted addressables: %d addresses, "
+                "%d labels, %d skipped-non-prefab",
+                len(resolved.by_address),
+                len(resolved.by_label),
+                resolved.skipped_non_prefab,
+            )
+
+        # --- Resolved-name pass (single source of truth; D6/D8b/D14) ---
+        # Collision-conditionally re-key the on-disk Templates child name
+        # (== ``template_name``) over the EMITTED prefab set only, so a
+        # non-emitted same-base sibling never forces a suffix (fact 11).
+        # The emitter (Slice 1.3) READS these resolved names back; it does
+        # NOT recompute them.
+        from converter.prefab_packages import (
+            resolve_template_child_names,
+            select_emitted_prefab_ids,
+        )
+
+        prefabs_block = artifact["prefabs"]
+        if isinstance(prefabs_block, dict):
+            emitted = select_emitted_prefab_ids(
+                self.state.prefab_library,
+                self.ctx.serialized_field_refs or None,
+                addr_ids,
+                guid_index=self.state.guid_index,
+            )
+            bases: dict[str, str] = {}
+            for pid in emitted:
+                sub = prefabs_block.get(pid)
+                if isinstance(sub, dict):
+                    name = sub.get("template_name")
+                    if isinstance(name, str):
+                        bases[pid] = name
+            for pid, name in resolve_template_child_names(bases).items():
+                sub = prefabs_block.get(pid)
+                if isinstance(sub, dict):
+                    sub["template_name"] = name
+
         # Persist directly on the context; the structural type belongs to
         # the planner module (avoids a core→converter dependency).
         self.ctx.scene_runtime = dict(artifact)

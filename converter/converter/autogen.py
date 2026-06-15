@@ -635,9 +635,14 @@ def _plan_to_luau(plan: dict) -> str:
 # ``scriptable_objects`` is the R2-P1.3 guid -> dotted-DataModel-path map
 # the host's ScriptableObject ref resolver consults; populated by
 # ``_subphase_inject_scene_runtime`` before this encoder runs.
+#
+# ``addressables`` is the Unit-1 ``{by_address, by_label} -> [prefab_id]``
+# block ``SceneRuntime:_resolveAddressToPrefabId`` consults to map an
+# Addressables address (``"Trash Cat"``) to a concrete prefab_id before the
+# ``_plan.prefabs[prefab_id]`` guard; populated by ``plan_scene_runtime``.
 _PLAN_KEYS_FOR_HOST: tuple[str, ...] = (
     "modules", "scenes", "prefabs", "domain_overrides",
-    "scriptable_objects", "scene_prefab_placements",
+    "scriptable_objects", "scene_prefab_placements", "addressables",
 )
 
 
@@ -819,11 +824,14 @@ local function resolveModule(scriptId, modulePath)
     return nil
 end
 
--- SceneRuntimePlan carries ``plan.prefabs[prefab_id].template_name``
--- (R2-P1.2 resolution): the bare template name prefab_packages emitted
--- under ReplicatedStorage.Templates. Look up via that map so the
--- stable prefab_id resolves to the right Templates entry even when
--- two prefabs share a bare name in different folders.
+-- SceneRuntimePlan carries ``plan.prefabs[prefab_id].template_name``: the
+-- RESOLVED Templates child name (Addressables Unit 1). The planner keys
+-- both the on-disk Templates child name AND this ``template_name`` to the
+-- SAME collision-conditional name — the bare prefab name when its base is
+-- unique among emitted prefabs, ``base__guid6`` when 2+ emitted prefabs
+-- share a base. So two prefabs that share a bare name in different folders
+-- resolve to DISTINCT Templates entries; the bare-name lookup here is
+-- correct only because the upstream re-key already disambiguated.
 local function _resolveTemplate(prefabId)
     local prefab = (Plan.prefabs or {})[prefabId]
     local templateName = prefab and prefab.template_name
@@ -989,9 +997,12 @@ local function resolveModule(scriptId, modulePath)
     return nil
 end
 
--- See SceneRuntimeClient for the rationale: prefab templates live
--- under ReplicatedStorage.Templates keyed by bare prefab name; the
--- plan's ``template_name`` field bridges the stable prefab_id.
+-- See SceneRuntimeClient for the rationale: prefab templates live under
+-- ReplicatedStorage.Templates keyed by their RESOLVED name (the bare
+-- prefab name, or ``base__guid6`` when emitted prefabs collide on a base
+-- name — Addressables Unit 1); the plan's ``template_name`` field carries
+-- that same resolved name so the stable prefab_id bridges to the right
+-- Templates child.
 local function _resolveTemplate(prefabId)
     local prefab = (Plan.prefabs or {})[prefabId]
     local templateName = prefab and prefab.template_name

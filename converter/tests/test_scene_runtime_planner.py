@@ -1472,3 +1472,272 @@ class TestHasCharacterController:
         mods = artifact["modules"]
         assert mods[placed_guid]["has_character_controller"] is True
         assert mods[unplaced_guid]["has_character_controller"] is False
+
+
+# ---------------------------------------------------------------------------
+# Slice 1.2 — prefab_id 3-way parity (AC14 / D6c / D11)
+# ---------------------------------------------------------------------------
+
+class TestPrefabStableIdThreeWayParity:
+    """The planner ``_prefab_stable_id``, the emitter
+    ``scene_converter._prefab_stable_id``, and the resolver's
+    ``prefab_id_for`` must produce the BYTE-IDENTICAL id for the same
+    prefab (design fact 1 / AC14). Pins the load-bearing join key directly
+    rather than only catching skew at integration."""
+
+    def _build(self, tmp_path: Path, rel: str, name: str, guid: str):
+        from core.unity_types import PrefabLibrary
+        prefab_abs = tmp_path / rel
+        prefab_abs.parent.mkdir(parents=True, exist_ok=True)
+        prefab_abs.touch()
+        template = PrefabTemplate(
+            prefab_path=prefab_abs, name=name,
+            root=PrefabNode(name=name, file_id="1", active=True, tag="Untagged"),
+            all_nodes={},
+        )
+        lib = PrefabLibrary()
+        lib.prefabs.append(template)
+        lib.by_guid[guid] = template
+        idx = _make_guid_index(tmp_path, {guid: (prefab_abs, "prefab")})
+        return template, lib, idx
+
+    def test_inside_root_three_way_identical(self, tmp_path: Path):
+        from converter.scene_converter import _prefab_stable_id as conv_id
+        from converter.scene_runtime_planner import _prefab_stable_id as plan_id
+        from unity.addressables_resolver import resolve_prefab_addressables
+        from unity.addressables_resolver import AddressablesIndex
+
+        guid = "473ffa01" + "0" * 24
+        rel = "Assets/Bundles/Characters/Cat/character.prefab"
+        template, lib, idx = self._build(tmp_path, rel, "character", guid)
+
+        plan = plan_id(template, idx, lib.by_guid, tmp_path)
+        conv = conv_id(template, idx, lib.by_guid, tmp_path)
+        # Resolver side: build an index with this guid as an addressable
+        # prefab and confirm the prefab_id it derives matches.
+        index = AddressablesIndex()
+        index.by_address["Cat"] = [guid]
+        resolved = resolve_prefab_addressables(index, idx)
+        res = resolved.by_address["Cat"][0]
+
+        assert plan == conv == res == f"{guid}:{rel}"
+
+    def test_outside_root_three_way_empty_string(self, tmp_path: Path):
+        """A prefab outside the project root: planner and emitter both
+        return ``""`` (skip-stamping), byte-identical — the previously
+        divergent path-based planner fallback is gone (D6c)."""
+        from converter.scene_converter import _prefab_stable_id as conv_id
+        from converter.scene_runtime_planner import _prefab_stable_id as plan_id
+
+        project_root = tmp_path / "proj"
+        project_root.mkdir()
+        external = tmp_path / "external"
+        external.mkdir()
+        prefab_abs = external / "Loose.prefab"
+        prefab_abs.touch()
+        guid = "2ae64d0e" + "0" * 24
+        template = PrefabTemplate(
+            prefab_path=prefab_abs, name="Loose",
+            root=PrefabNode(name="Loose", file_id="1", active=True, tag="Untagged"),
+            all_nodes={},
+        )
+        from core.unity_types import PrefabLibrary
+        lib = PrefabLibrary()
+        lib.by_guid[guid] = template
+        idx = _make_guid_index(project_root, {guid: (prefab_abs, "prefab")})
+
+        plan = plan_id(template, idx, lib.by_guid, project_root)
+        conv = conv_id(template, idx, lib.by_guid, project_root)
+        assert plan == conv == ""
+
+    def test_project_root_none_three_way_guid_only(self, tmp_path: Path):
+        """project_root=None: planner and emitter both short-circuit to the
+        bare guid (no path segment), byte-identical (D6c)."""
+        from converter.scene_converter import _prefab_stable_id as conv_id
+        from converter.scene_runtime_planner import _prefab_stable_id as plan_id
+
+        guid = "1" * 32
+        rel = "Assets/Prefabs/NoRoot.prefab"
+        template, lib, idx = self._build(tmp_path, rel, "NoRoot", guid)
+
+        plan = plan_id(template, idx, lib.by_guid, None)
+        conv = conv_id(template, idx, lib.by_guid, None)
+        assert plan == conv == guid
+
+
+# ---------------------------------------------------------------------------
+# Slice 1.2 — pipeline bridge + resolved-name pass (AC3 / AC4 / AC5 / AC8)
+# ---------------------------------------------------------------------------
+
+_ADDR_GROUP = """\
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_Name: Characters
+  m_GroupName: Characters
+  m_SerializeEntries:
+  - m_GUID: {cat}
+    m_Address: Trash Cat
+    m_SerializedLabels:
+    - characters
+  - m_GUID: {raccoon}
+    m_Address: Rubbish Raccoon
+    m_SerializedLabels:
+    - characters
+"""
+
+
+class TestPlanSceneRuntimePipelineBridge:
+    """Drive the REAL ``Pipeline.plan_scene_runtime`` (bridge + resolved-name
+    pass) over a fixture project — AC3/AC4/AC5 + the AC8 resume guarantee."""
+
+    CAT_GUID = "473ffa01" + "0" * 24
+    RACCOON_GUID = "2ae64d0e" + "0" * 24
+    ICON_GUID = "abcdef00" + "0" * 24
+
+    def _make_pipeline(self, tmp_path: Path):
+        from converter.pipeline import Pipeline, PipelineState
+        from core.conversion_context import ConversionContext
+        from core.unity_types import PrefabLibrary
+
+        # --- Prefab files on disk ---
+        specs = {
+            self.CAT_GUID: ("Assets/Bundles/Characters/Cat/character.prefab", "character"),
+            self.RACCOON_GUID: ("Assets/Bundles/Characters/Raccoon/character.prefab", "character"),
+            self.ICON_GUID: ("Assets/Prefabs/IconConsumable.prefab", "IconConsumable"),
+        }
+        lib = PrefabLibrary()
+        guid_entries: dict[str, tuple[Path, str]] = {}
+        for guid, (rel, name) in specs.items():
+            prefab_abs = tmp_path / rel
+            prefab_abs.parent.mkdir(parents=True, exist_ok=True)
+            prefab_abs.touch()
+            template = PrefabTemplate(
+                prefab_path=prefab_abs, name=name,
+                root=PrefabNode(name=name, file_id="1", active=True, tag="Untagged"),
+                all_nodes={},
+            )
+            lib.prefabs.append(template)
+            lib.by_guid[guid] = template
+            guid_entries[guid] = (prefab_abs, "prefab")
+        idx = _make_guid_index(tmp_path, guid_entries)
+
+        # --- Addressables group (Cat + Raccoon only) ---
+        groups = tmp_path / "Assets" / "AddressableAssetsData" / "AssetGroups"
+        groups.mkdir(parents=True)
+        (groups / "Characters.asset").write_text(
+            _ADDR_GROUP.format(cat=self.CAT_GUID, raccoon=self.RACCOON_GUID),
+            encoding="utf-8",
+        )
+
+        p = Pipeline.__new__(Pipeline)
+        p.unity_project_path = tmp_path
+        p.ctx = ConversionContext(unity_project_path=str(tmp_path))
+        # IconConsumable is REFERENCED (not addressable) — drives the
+        # non-colliding bare-name leg of AC3.
+        p.ctx.serialized_field_refs = {
+            "some-go": {"icon": "IconConsumable"},
+        }
+        state = PipelineState()
+        state.prefab_library = lib
+        state.guid_index = idx
+        state.parsed_scene = None
+        state.all_parsed_scenes = []
+        p.state = state
+        return p
+
+    def test_resolved_names_and_addressables_block(self, tmp_path: Path):
+        p = self._make_pipeline(tmp_path)
+        p.plan_scene_runtime()
+        sr = p.ctx.scene_runtime
+
+        cat_id = f"{self.CAT_GUID}:Assets/Bundles/Characters/Cat/character.prefab"
+        raccoon_id = f"{self.RACCOON_GUID}:Assets/Bundles/Characters/Raccoon/character.prefab"
+        icon_id = f"{self.ICON_GUID}:Assets/Prefabs/IconConsumable.prefab"
+
+        prefabs = sr["prefabs"]
+        assert isinstance(prefabs, dict)
+
+        # AC3: colliding pair gets DISTINCT resolved template_names...
+        cat_name = prefabs[cat_id]["template_name"]
+        raccoon_name = prefabs[raccoon_id]["template_name"]
+        assert cat_name == "character__473ffa"
+        assert raccoon_name == "character__2ae64d"
+        assert cat_name != raccoon_name
+        # ...and the non-colliding referenced prefab stays BARE.
+        assert prefabs[icon_id]["template_name"] == "IconConsumable"
+
+        # AC4: addressables block present, list semantics, singleton for Cat.
+        addr = sr["addressables"]
+        assert addr["by_address"]["Trash Cat"] == [cat_id]
+        assert addr["by_address"]["Rubbish Raccoon"] == [raccoon_id]
+        assert set(addr["by_label"]["characters"]) == {cat_id, raccoon_id}
+
+    def test_no_addressables_block_when_no_groups(self, tmp_path: Path):
+        """No AddressableAssetsData dir → bridge returns None → no block,
+        and colliding prefabs that are NOT referenced/addressable are not
+        in the emitted set, so their template_name stays bare (edge 10/12)."""
+        p = self._make_pipeline(tmp_path)
+        import shutil
+        shutil.rmtree(tmp_path / "Assets" / "AddressableAssetsData")
+        p.plan_scene_runtime()
+        sr = p.ctx.scene_runtime
+        assert "addressables" not in sr
+        icon_id = f"{self.ICON_GUID}:Assets/Prefabs/IconConsumable.prefab"
+        # IconConsumable is referenced → emitted → unique → bare.
+        assert sr["prefabs"][icon_id]["template_name"] == "IconConsumable"
+        # Cat/Raccoon are neither referenced nor addressable now → NOT in
+        # the emitted set → their bare template_name is left untouched.
+        cat_id = f"{self.CAT_GUID}:Assets/Bundles/Characters/Cat/character.prefab"
+        assert sr["prefabs"][cat_id]["template_name"] == "character"
+
+    def test_planner_alone_leaves_bare_names(self, tmp_path: Path):
+        """The planner module (NOT the pipeline) must keep BARE template
+        names — the resolved-name pass lives in the pipeline, where the
+        addressable set is known (Slice 1.2 interface)."""
+        p = self._make_pipeline(tmp_path)
+        artifact = plan_scene_runtime(
+            parsed_scenes=[], prefab_library=p.state.prefab_library,
+            guid_index=p.state.guid_index, unity_project_root=tmp_path,
+        )
+        for sub in artifact["prefabs"].values():
+            assert sub["template_name"] in ("character", "IconConsumable")
+        # Both colliding prefabs still carry the BARE "character".
+        bare = [s["template_name"] for s in artifact["prefabs"].values()
+                if s["name"] == "character"]
+        assert bare == ["character", "character"]
+
+
+class TestPlanSceneRuntimeIsEssential:
+    """AC8 — the resume RECOMPUTE guarantee."""
+
+    def test_plan_scene_runtime_in_essential_phases(self):
+        from converter.pipeline import Pipeline
+        assert "plan_scene_runtime" in Pipeline.ESSENTIAL_PHASES
+
+
+class TestAddressablesReachesEmbeddedPlan:
+    """AC5 — ``addressables`` is in the host allowlist and renders into the
+    embedded ``SceneRuntimePlan`` ModuleScript."""
+
+    def test_addressables_in_plan_keys_for_host(self):
+        from converter.autogen import _PLAN_KEYS_FOR_HOST
+        assert "addressables" in _PLAN_KEYS_FOR_HOST
+
+    def test_block_renders_with_bracket_quoted_address(self):
+        from converter.autogen import generate_scene_runtime_plan_module
+        artifact = {
+            "modules": {}, "scenes": {}, "prefabs": {},
+            "domain_overrides": {}, "scriptable_objects": {},
+            "scene_prefab_placements": {},
+            "addressables": {
+                "by_address": {"Trash Cat": ["catid:Assets/Cat.prefab"]},
+                "by_label": {"characters": ["catid:Assets/Cat.prefab"]},
+            },
+        }
+        script = generate_scene_runtime_plan_module(artifact)
+        assert "addressables" in script.source
+        # Non-identifier key must be bracket-quoted.
+        assert '["Trash Cat"]' in script.source
+        assert "catid:Assets/Cat.prefab" in script.source
