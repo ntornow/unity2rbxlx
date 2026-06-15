@@ -1507,7 +1507,9 @@ function SceneRuntime:applyImpulse(part, force)
 	-- where m_unity is the convert-time ``_UnityMass`` stamp, resolved at the ASSEMBLY level so a
 	-- wrapped Model (outer Model + inner ``*_Mesh``) or a ``TriggerZone`` sibling still launches the
 	-- right body with the right mass.
-	if not part or not part:IsA("BasePart") then
+	-- Soft-return on any wrong-typed arg. Check indexability (table/userdata) BEFORE ``_isBasePart``
+	-- (which indexes ``inst.IsA``) so a bare number/string never hard-errors.
+	if (type(part) ~= "table" and type(part) ~= "userdata") or not _isBasePart(part) then
 		return
 	end
 	local target, mUnity = part, part:GetAttribute("_UnityMass")

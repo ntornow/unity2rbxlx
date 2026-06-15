@@ -83,3 +83,39 @@ class TestApplyImpulse:
         """)
         assert rc == 0, f"luau failed: {err}\n{out}"
         assert "A8_inner=214.26 queried=0.00" in out, out
+
+    def test_assembly_root_tier_resolution(self):
+        # Tier 2: _UnityMass is not on the queried part but on its AssemblyRootPart.
+        rc, out, err = _run_scenario(_MOCK + """
+        local root = mockPart({ _UnityMass = 1.0 })
+        local queried = mockPart({}, root)
+        SceneRuntime:applyImpulse(queried, 60)
+        print(string.format("ROOT_v=%.2f queried=%.2f", root.AssemblyLinearVelocity, queried.AssemblyLinearVelocity))
+        """)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "ROOT_v=214.26 queried=0.00" in out, out
+
+    def test_wrong_typed_arg_is_safe_noop(self):
+        # MAJOR fix: a non-Instance arg (number / table without IsA) must soft-return, not hard-error.
+        rc, out, err = _run_scenario(_MOCK + """
+        SceneRuntime:applyImpulse(42, 60)
+        SceneRuntime:applyImpulse({}, 60)
+        SceneRuntime:applyImpulse(nil, 60)
+        print("SAFE_OK")
+        """)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "SAFE_OK" in out, out
+
+    def test_host_wrapper_dotted_and_colon_dispatch(self):
+        # The self.host.applyImpulse wrapper routes both dotted and colon call forms to the engine.
+        rc, out, err = _run_scenario(_MOCK + """
+        local rt = setmetatable({}, SceneRuntime)
+        local host = rt:_makeHostSurface({})
+        local pdot = mockPart({ _UnityMass = 1.0 })
+        host.applyImpulse(pdot, 60)              -- dotted
+        local pcol = mockPart({ _UnityMass = 1.0 })
+        host:applyImpulse(pcol, 60)             -- colon (arg1 == host)
+        print(string.format("DOT_v=%.2f COL_v=%.2f", pdot.AssemblyLinearVelocity, pcol.AssemblyLinearVelocity))
+        """)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "DOT_v=214.26 COL_v=214.26" in out, out
