@@ -9,6 +9,8 @@ from pathlib import Path
 
 from converter.scriptable_object_converter import (
     AssetConversionResult,
+    RefResolveCounts,
+    _value_to_lua,
     convert_asset_file,
     convert_asset_files,
 )
@@ -283,3 +285,227 @@ class TestScriptableObjectClassLink:
         idx = self._idx("abc123", "/proj/Assets/Some.prefab")  # not .cs
         src = convert_asset_file(f, idx).luau_source
         assert "setmetatable" not in src
+
+
+# ---------------------------------------------------------------------------
+# SO object-ref -> prefab-id resolution at emit (Phase 2 / slice 2.1)
+# ---------------------------------------------------------------------------
+
+# The exact canonical prefab id (the scene_runtime.prefabs key Unit-1 holds).
+PICKUP_GUID = "16cac8b68c4ca6448baecd0680e025f6"
+PICKUP_REL = "Assets/Prefabs/Pickup.prefab"
+PICKUP_ID = f"{PICKUP_GUID}:{PICKUP_REL}"
+
+
+class TestPrefabRefResolution:
+    """SO object-ref fields that point at a ``.prefab`` resolve to the Unit-1
+    canonical prefab id (``"<guid>:<relative_path>"``) at SO-emit time;
+    non-prefab / unresolvable / no-index refs stay ``nil`` (fail-soft)."""
+
+    def _real_index(self, project_root: Path, *entries):
+        """Build a real ``GuidIndex`` (non-optional ``Path`` project_root) with
+        the given ``(guid, relative_path, kind)`` entries. A real project_root
+        under which ``asset_path`` lives is REQUIRED for the full
+        ``<guid>:<path>`` id (else canonical_prefab_id returns a bare guid —
+        edge case 9b — and the byte-match would pass for the wrong reason)."""
+        from core.unity_types import GuidEntry, GuidIndex
+
+        idx = GuidIndex(project_root=project_root)
+        for guid, rel, kind in entries:
+            rel_path = Path(rel)
+            abs_path = project_root / rel_path
+            abs_path.parent.mkdir(parents=True, exist_ok=True)
+            abs_path.write_text("# stub asset\n", encoding="utf-8")
+            idx.guid_to_entry[guid] = GuidEntry(
+                guid=guid,
+                asset_path=abs_path,
+                relative_path=rel_path,
+                kind=kind,
+            )
+        return idx
+
+    def _write_asset(self, tmp_path, body: str) -> Path:
+        text = (
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n"
+            "--- !u!114 &11400000\n"
+            "MonoBehaviour:\n"
+            "  m_Script: {fileID: 11500000, guid: 99999, type: 3}\n"
+            "  m_Name: themeData\n"
+            f"{body}"
+        )
+        f = tmp_path / "themeData.asset"
+        f.write_text(text, encoding="utf-8")
+        return f
+
+    # --- Acceptance #1: EXACT-id byte-match (real project_root) -----------
+
+    def test_prefab_ref_resolves_to_exact_id(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        f = self._write_asset(
+            tmp_path,
+            f"  collectiblePrefab: {{fileID: 184264, guid: {PICKUP_GUID}, type: 3}}\n",
+        )
+        src = convert_asset_file(f, idx).luau_source
+        assert f'"{PICKUP_ID}"' in src
+
+    # --- Acceptance #2: non-prefab (sprite/mesh) stays nil ---------------
+
+    def test_non_prefab_ref_stays_nil(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(
+            proj,
+            ("e1a536f74c7ef384a8d7132148ace0c8", "Assets/UI/themeIcon.png", "texture"),
+            ("0fd40b0b70fef064c9b7e20779b1f8ec", "Assets/Meshes/sky.fbx", "mesh"),
+        )
+        f = self._write_asset(
+            tmp_path,
+            "  themeIcon: {fileID: 21300036, guid: e1a536f74c7ef384a8d7132148ace0c8}\n"
+            "  skyMesh: {fileID: 4300002, guid: 0fd40b0b70fef064c9b7e20779b1f8ec}\n",
+        )
+        src = convert_asset_file(f, idx).luau_source
+        assert "Unity object reference" in src
+        assert "themeIcon = nil" in src
+        assert "skyMesh = nil" in src
+
+    # --- Acceptance #3: no-index stays nil -------------------------------
+
+    def test_no_index_keeps_prefab_ref_nil(self, tmp_path):
+        f = self._write_asset(
+            tmp_path,
+            f"  collectiblePrefab: {{fileID: 184264, guid: {PICKUP_GUID}, type: 3}}\n",
+        )
+        src = convert_asset_file(f).luau_source  # no guid_index
+        assert PICKUP_ID not in src
+        assert "collectiblePrefab = nil --[[(Unity object reference)]]" in src
+
+    # --- Acceptance #4: missing / all-zero / dangling guid stays nil -----
+
+    def test_fileid_only_ref_stays_nil(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        f = self._write_asset(tmp_path, "  someRef: {fileID: 0}\n")
+        src = convert_asset_file(f, idx).luau_source
+        assert "someRef = nil --[[(Unity object reference)]]" in src
+
+    def test_all_zero_guid_stays_nil(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        f = self._write_asset(
+            tmp_path,
+            "  someRef: {fileID: 0, guid: 00000000000000000000000000000000}\n",
+        )
+        src = convert_asset_file(f, idx).luau_source
+        assert "someRef = nil --[[(Unity object reference)]]" in src
+
+    def test_dangling_guid_stays_nil(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        f = self._write_asset(
+            tmp_path,
+            "  someRef: {fileID: 1, guid: deadbeefdeadbeefdeadbeefdeadbeef}\n",
+        )
+        src = convert_asset_file(f, idx).luau_source
+        assert "someRef = nil --[[(Unity object reference)]]" in src
+
+    # --- Acceptance #5: nested list + nested dict resolution --------------
+
+    def test_nested_list_ref_resolves(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        f = self._write_asset(
+            tmp_path,
+            "  cloudPrefabs:\n"
+            f"    - {{fileID: 184264, guid: {PICKUP_GUID}, type: 3}}\n",
+        )
+        src = convert_asset_file(f, idx).luau_source
+        assert f'"{PICKUP_ID}"' in src
+
+    def test_nested_dict_ref_resolves(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        f = self._write_asset(
+            tmp_path,
+            "  prefabList:\n"
+            "    - m_CachedAsset: "
+            f"{{fileID: 184264, guid: {PICKUP_GUID}, type: 3}}\n",
+        )
+        src = convert_asset_file(f, idx).luau_source
+        assert f'"{PICKUP_ID}"' in src
+
+    def test_non_identifier_key_dict_ref_resolves(self, tmp_path):
+        # A nested dict whose key is NOT a valid Python identifier (hyphen, no
+        # m_ prefix to strip) → emit takes the ``["<key>"] = ...`` arm (:120).
+        # Proves prefab-ref resolution threads through that recursion arm too.
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        f = self._write_asset(
+            tmp_path,
+            "  prefabMap:\n"
+            "    bad-key: "
+            f"{{fileID: 184264, guid: {PICKUP_GUID}, type: 3}}\n",
+        )
+        src = convert_asset_file(f, idx).luau_source
+        # Genuinely the non-identifier-key arm: bracketed-string key form.
+        assert f'["bad-key"] = "{PICKUP_ID}"' in src
+
+    # --- Acceptance #6: counters -----------------------------------------
+
+    def test_counts_tally_resolved_and_skipped(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(
+            proj,
+            (PICKUP_GUID, PICKUP_REL, "prefab"),
+            ("e1a536f74c7ef384a8d7132148ace0c8", "Assets/UI/themeIcon.png", "texture"),
+        )
+        fields = {
+            "collectiblePrefab": {"fileID": 184264, "guid": PICKUP_GUID, "type": 3},
+            "themeIcon": {"fileID": 21300036, "guid": "e1a536f74c7ef384a8d7132148ace0c8"},
+            "missionPopup": {"fileID": 0},
+        }
+        counts = RefResolveCounts()
+        out = _value_to_lua(fields, guid_index=idx, counts=counts)
+        assert f'"{PICKUP_ID}"' in out
+        assert counts.resolved == 1
+        assert counts.skipped == 2
+
+    def test_convert_asset_file_logs_counts(self, tmp_path, caplog):
+        import logging
+
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        idx = self._real_index(proj, (PICKUP_GUID, PICKUP_REL, "prefab"))
+        f = self._write_asset(
+            tmp_path,
+            f"  collectiblePrefab: {{fileID: 184264, guid: {PICKUP_GUID}, type: 3}}\n"
+            "  themeIcon: {fileID: 21300036, guid: e1a536f74c7ef384a8d7132148ace0c8}\n",
+        )
+        with caplog.at_level(logging.INFO, logger="converter.scriptable_object_converter"):
+            convert_asset_file(f, idx)
+        assert "resolved to prefab ids" in caplog.text
+
+    # --- belt-and-suspenders: real project parse, path-skipped -----------
+
+    def test_real_project_byte_match(self):
+        import pytest
+
+        real_root = Path("/Users/jiazou/workspace/trash-dash")
+        if not (real_root / "Assets" / "Prefabs" / "Pickup.prefab").exists():
+            pytest.skip("trash-dash source project not on disk")
+        from unity.guid_resolver import build_guid_index
+        from unity.prefab_ref import prefab_id_for_ref
+
+        idx = build_guid_index(real_root)
+        pid = prefab_id_for_ref(
+            {"guid": PICKUP_GUID, "fileID": 184264, "type": 3}, idx
+        )
+        assert pid == PICKUP_ID
