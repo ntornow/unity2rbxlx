@@ -2103,6 +2103,12 @@ class TestUnityMassStamp:
         assert part.anchored is True
         assert "_UnityMass" not in part.attributes
 
+    def test_frozen_position_constraints_not_stamped(self):
+        # All position axes frozen (m_Constraints & 0b111 == 0b111) -> anchored -> not a launchable body.
+        part = self._run({"m_Constraints": 7, "m_Mass": 2.5})
+        assert part.anchored is True
+        assert "_UnityMass" not in part.attributes
+
     def test_wrapped_geometry_carries_unity_mass_to_inner(self):
         """For wrapped geometry the physics lives on the inner BasePart, so _UnityMass must
         travel onto the inner part (where the host resolves it via the assembly)."""
