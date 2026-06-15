@@ -31,8 +31,10 @@ from core.unity_types import (
     PrefabNode,
     PrefabTemplate,
     SceneNode,
+    StrippedComponentRecord,
 )
 from converter.scene_runtime_planner import (
+    _resolve_stripped_refs,
     build_require_graph,
     build_script_id_by_name,
     derive_intrinsic_script_class,
@@ -1869,3 +1871,428 @@ class TestAddressablesReachesEmbeddedPlan:
         # Non-identifier key must be bracket-quoted.
         assert '["Trash Cat"]' in script.source
         assert "catid:Assets/Cat.prefab" in script.source
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 / Slice 3.2 — stripped-prefab-instance component-ref resolution
+# (post-pass ``_resolve_stripped_refs`` rewriting unresolvable rows in place).
+# AC2 (exact resolve + RED), AC5 (fail-closed), AC4 (no regression).
+# ---------------------------------------------------------------------------
+
+# Real Trash-Dash project (path-guarded — CI without the source skips).
+_TRASH_DASH = Path("/Users/jiazou/workspace/trash-dash")
+_TRASH_DASH_MAIN = _TRASH_DASH / "Assets" / "Scenes" / "Main.unity"
+
+
+class TestStrippedRefResolution:
+    """Slice 3.2 — the planner post-pass rewrites unresolvable stripped-MB
+    component refs to the runtime engine-union key, fail-closed."""
+
+    # The three deterministic upstream facts that make the bridge resolvable,
+    # reproducing the real Trash-Dash shape (LoadoutState.missionPopup ->
+    # MissionUI on a placed MissionPopup prefab instance).
+    _SCRIPT_GUID = "ffff" + "0" * 28        # MissionUI.cs guid (the source MB class)
+    _SRC_OBJ_FID = "114000011972273750"     # m_CorrespondingSourceObject.fileID
+    _PI_FID = "1822972501"                  # m_PrefabInstance.fileID (the placement)
+    _STRIPPED_FID = "137514649"             # scene-local stripped MB fileID
+    _PREFAB_GUID = "a53f" + "0" * 28
+
+    def _build(
+        self,
+        tmp_path: Path,
+        *,
+        # knobs for the fail-closed AC5 variants:
+        emit_placement: bool = True,
+        subplan_has_instance: bool = True,
+        script_guid_matches: bool = True,
+        source_prefab_guid_matches: bool = True,
+    ) -> tuple[list[ParsedScene], PrefabLibrary, GuidIndex]:
+        """Assemble parsed inputs reproducing the real stripped-ref shape.
+
+        - A scene with a ``LoadoutState`` MB whose ``missionPopup`` field is a
+          fileID-only ref to a stripped MB (``_STRIPPED_FID``).
+        - A scene ``PrefabInstance`` (``_PI_FID``) of MissionPopup.prefab ->
+          emits a placement.
+        - A MissionPopup prefab subplan containing a ``MissionUI`` MB at
+          component fileID ``_SRC_OBJ_FID``.
+        - ``scene.stripped_components`` carrying the bridge identity (as 3.1's
+          parser would).
+        """
+        scripts = tmp_path / "Assets" / "Scripts"
+        scripts.mkdir(parents=True, exist_ok=True)
+        loadout_cs = scripts / "LoadoutState.cs"
+        loadout_cs.write_text("public class LoadoutState : MonoBehaviour { }")
+        mission_cs = scripts / "MissionUI.cs"
+        mission_cs.write_text("public class MissionUI : MonoBehaviour { }")
+        # The prefab subplan's MB resolves to this guid; AC5 mismatch variant
+        # points the subplan at a DIFFERENT class so the fail-closed check fires.
+        subplan_script_guid = (
+            self._SCRIPT_GUID if script_guid_matches else ("dead" + "0" * 28)
+        )
+        if not script_guid_matches:
+            wrong_cs = scripts / "WrongClass.cs"
+            wrong_cs.write_text("public class WrongClass : MonoBehaviour { }")
+
+        loadout_guid = "100a" + "0" * 28
+        loadout_cs.write_text("public class LoadoutState : MonoBehaviour { }")
+
+        # Prefab template (MissionPopup) with a MissionUI MB at _SRC_OBJ_FID.
+        prefab_abs = tmp_path / "Assets" / "Prefabs" / "UI" / "MissionPopup.prefab"
+        prefab_abs.parent.mkdir(parents=True, exist_ok=True)
+        prefab_abs.touch()
+        prefab_root = PrefabNode(
+            name="MissionPopup", file_id="9000", active=True, tag="Untagged",
+        )
+        prefab_props = _mb_props(subplan_script_guid, go_fid="9000")
+        prefab_root.components = []
+        if subplan_has_instance:
+            prefab_root.components = [
+                ComponentData(
+                    component_type="MonoBehaviour", file_id=self._SRC_OBJ_FID,
+                    properties=prefab_props,
+                )
+            ]
+        template = PrefabTemplate(
+            prefab_path=prefab_abs, name="MissionPopup", root=prefab_root,
+            all_nodes={"9000": prefab_root},
+        )
+
+        guid_entries: dict[str, tuple[Path, str]] = {
+            loadout_guid: (loadout_cs, "script"),
+            self._SCRIPT_GUID: (mission_cs, "script"),
+            self._PREFAB_GUID: (prefab_abs, "prefab"),
+        }
+        if not script_guid_matches:
+            guid_entries[subplan_script_guid] = (
+                scripts / "WrongClass.cs", "script",
+            )
+        idx = _make_guid_index(tmp_path, guid_entries)
+
+        lib = PrefabLibrary()
+        lib.prefabs.append(template)
+        lib.by_guid[self._PREFAB_GUID] = template
+
+        # Scene: a LoadoutState MB whose missionPopup -> the stripped fileID.
+        loadout_go = _node("100", "LoadoutGO", components=[
+            ComponentData(
+                component_type="MonoBehaviour", file_id="110",
+                properties=_mb_props(
+                    loadout_guid, go_fid="100",
+                    extra={"missionPopup": {"fileID": self._STRIPPED_FID}},
+                ),
+            ),
+        ])
+        scene = _scene(
+            tmp_path / "Assets" / "Scenes" / "Main.unity",
+            roots=[loadout_go], all_nodes={"100": loadout_go},
+        )
+        # The fail-closed source-prefab-guid gate compares the placement's
+        # prefab guid (== ``_PREFAB_GUID``) against this recorded value. The
+        # mismatch variant points it at a DIFFERENT prefab guid so the gate
+        # fires even though the pi_fid + src_obj_fid + script_guid all line up.
+        recorded_source_guid = (
+            self._PREFAB_GUID if source_prefab_guid_matches
+            else ("beef" + "0" * 28)
+        )
+        scene.stripped_components = {
+            self._STRIPPED_FID: StrippedComponentRecord(
+                file_id=self._STRIPPED_FID, class_id=114,
+                source_object_file_id=self._SRC_OBJ_FID,
+                source_object_guid=recorded_source_guid,
+                prefab_instance_file_id=self._PI_FID,
+                script_guid=self._SCRIPT_GUID,
+            )
+        }
+        if emit_placement:
+            scene.prefab_instances = [PrefabInstanceData(
+                file_id=self._PI_FID,
+                source_prefab_guid=self._PREFAB_GUID,
+                source_prefab_file_id="0",
+                transform_parent_file_id="",
+                modifications=[],
+            )]
+        return [scene], lib, idx
+
+    def _missionpopup_row(self, artifact: dict) -> dict:
+        refs = artifact["scenes"]["Assets/Scenes/Main.unity"]["references"]
+        rows = [r for r in refs if r["field"] == "missionPopup"]
+        assert len(rows) == 1
+        return rows[0]
+
+    # --- AC2: exact resolve + RED proof -------------------------------------
+
+    def test_stripped_ref_resolves_to_engine_union_key(self, tmp_path: Path):
+        scenes, lib, idx = self._build(tmp_path)
+        artifact = plan_scene_runtime(
+            parsed_scenes=scenes, prefab_library=lib, guid_index=idx,
+            unity_project_root=tmp_path,
+        )
+        row = self._missionpopup_row(artifact)
+        prefab_id = f"{self._PREFAB_GUID}:Assets/Prefabs/UI/MissionPopup.prefab"
+        expected_ref = (
+            f"Assets/Scenes/Main.unity:{self._PI_FID}:"
+            f"{prefab_id}:{self._SRC_OBJ_FID}"
+        )
+        assert row["target_kind"] == "component"
+        assert row["target_ref"] == expected_ref
+        assert row["target_script_id"] == self._SCRIPT_GUID
+
+    def test_stripped_ref_is_unresolvable_fallback_without_postpass(
+        self, tmp_path: Path,
+    ):
+        """RED proof: with the post-pass skipped, the row stays the
+        unresolvable scene-local fallback ``<ns>:<stripped_fid>``."""
+        import converter.scene_runtime_planner as planner
+        scenes, lib, idx = self._build(tmp_path)
+        orig = planner._resolve_stripped_refs
+        planner._resolve_stripped_refs = lambda *a, **k: None  # type: ignore[assignment]
+        try:
+            artifact = plan_scene_runtime(
+                parsed_scenes=scenes, prefab_library=lib, guid_index=idx,
+                unity_project_root=tmp_path,
+            )
+        finally:
+            planner._resolve_stripped_refs = orig  # type: ignore[assignment]
+        row = self._missionpopup_row(artifact)
+        assert row["target_ref"] == (
+            f"Assets/Scenes/Main.unity:{self._STRIPPED_FID}"
+        )
+        assert "target_script_id" not in row
+
+    # --- AC5: fail-closed branches ------------------------------------------
+
+    def test_fail_closed_when_no_placement(self, tmp_path: Path):
+        scenes, lib, idx = self._build(tmp_path, emit_placement=False)
+        artifact = plan_scene_runtime(
+            parsed_scenes=scenes, prefab_library=lib, guid_index=idx,
+            unity_project_root=tmp_path,
+        )
+        row = self._missionpopup_row(artifact)
+        assert row["target_ref"] == (
+            f"Assets/Scenes/Main.unity:{self._STRIPPED_FID}"
+        )
+        assert "target_script_id" not in row
+
+    def test_fail_closed_when_subplan_lacks_instance(self, tmp_path: Path):
+        scenes, lib, idx = self._build(tmp_path, subplan_has_instance=False)
+        artifact = plan_scene_runtime(
+            parsed_scenes=scenes, prefab_library=lib, guid_index=idx,
+            unity_project_root=tmp_path,
+        )
+        row = self._missionpopup_row(artifact)
+        assert row["target_ref"] == (
+            f"Assets/Scenes/Main.unity:{self._STRIPPED_FID}"
+        )
+        assert "target_script_id" not in row
+
+    def test_fail_closed_when_script_guid_mismatch(self, tmp_path: Path):
+        scenes, lib, idx = self._build(tmp_path, script_guid_matches=False)
+        artifact = plan_scene_runtime(
+            parsed_scenes=scenes, prefab_library=lib, guid_index=idx,
+            unity_project_root=tmp_path,
+        )
+        row = self._missionpopup_row(artifact)
+        assert row["target_ref"] == (
+            f"Assets/Scenes/Main.unity:{self._STRIPPED_FID}"
+        )
+        assert "target_script_id" not in row
+
+    def test_fail_closed_when_source_prefab_guid_mismatch(self, tmp_path: Path):
+        """A stripped ref whose recorded ``source_object_guid`` does NOT match
+        the placement's prefab guid keeps the unresolvable fallback (the new
+        prefab-identity fail-closed gate fires)."""
+        scenes, lib, idx = self._build(
+            tmp_path, source_prefab_guid_matches=False,
+        )
+        artifact = plan_scene_runtime(
+            parsed_scenes=scenes, prefab_library=lib, guid_index=idx,
+            unity_project_root=tmp_path,
+        )
+        row = self._missionpopup_row(artifact)
+        assert row["target_ref"] == (
+            f"Assets/Scenes/Main.unity:{self._STRIPPED_FID}"
+        )
+        assert "target_script_id" not in row
+
+    # --- AC4: no regression on non-stripped refs ----------------------------
+
+    def test_peer_component_ref_untouched_by_postpass(self, tmp_path: Path):
+        """A normal peer-MonoBehaviour ref (NOT in stripped_components) is
+        resolved by the existing branch and never rewritten by the post-pass."""
+        scripts = tmp_path / "Assets" / "Scripts"
+        scripts.mkdir(parents=True, exist_ok=True)
+        cs_a = scripts / "Controller.cs"
+        cs_a.write_text("public class Controller : MonoBehaviour { }")
+        cs_b = scripts / "Helper.cs"
+        cs_b.write_text("public class Helper : MonoBehaviour { }")
+        idx = _make_guid_index(tmp_path, {
+            "aa" + "0" * 30: (cs_a, "script"),
+            "bb" + "0" * 30: (cs_b, "script"),
+        })
+        helper_go = _node("200", "HelperGo", components=[
+            ComponentData(
+                component_type="MonoBehaviour", file_id="210",
+                properties=_mb_props("bb" + "0" * 30, go_fid="200"),
+            ),
+        ])
+        ctrl_go = _node("10", "Ctrl", components=[
+            ComponentData(
+                component_type="MonoBehaviour", file_id="20",
+                properties=_mb_props(
+                    "aa" + "0" * 30, go_fid="10",
+                    extra={"helper": {"fileID": "210"}},
+                ),
+            ),
+        ])
+        scene = _scene(
+            tmp_path / "Assets" / "Scenes" / "Logic.unity",
+            roots=[ctrl_go, helper_go],
+            all_nodes={"10": ctrl_go, "200": helper_go},
+        )
+        # No stripped_components at all -> post-pass is a no-op on this scene.
+        artifact = plan_scene_runtime(
+            parsed_scenes=[scene], prefab_library=None,
+            guid_index=idx, unity_project_root=tmp_path,
+        )
+        refs = artifact["scenes"]["Assets/Scenes/Logic.unity"]["references"]
+        helper = [r for r in refs if r["field"] == "helper"]
+        assert len(helper) == 1
+        assert helper[0]["target_kind"] == "component"
+        assert helper[0]["target_ref"] == "Assets/Scenes/Logic.unity:210"
+        assert "target_script_id" not in helper[0]
+
+    def test_builtin_component_ref_untouched_by_postpass(self, tmp_path: Path):
+        """A built-in-component ref (resolves to a gameobject via the existing
+        branch) is never touched by the stripped post-pass."""
+        scripts = tmp_path / "Assets" / "Scripts"
+        scripts.mkdir(parents=True, exist_ok=True)
+        cs = scripts / "Mover.cs"
+        cs.write_text("public class Mover : MonoBehaviour { }")
+        idx = _make_guid_index(tmp_path, {"cc" + "0" * 30: (cs, "script")})
+        # GameObject 300 with a Rigidbody (component fid 310) and the Mover MB
+        # (fid 320) referencing that Rigidbody.
+        go = _node("300", "Body", components=[
+            ComponentData(
+                component_type="Rigidbody", file_id="310", properties={},
+            ),
+            ComponentData(
+                component_type="MonoBehaviour", file_id="320",
+                properties=_mb_props(
+                    "cc" + "0" * 30, go_fid="300",
+                    extra={"body": {"fileID": "310"}},
+                ),
+            ),
+        ])
+        scene = _scene(
+            tmp_path / "Assets" / "Scenes" / "Phys.unity",
+            roots=[go], all_nodes={"300": go},
+        )
+        artifact = plan_scene_runtime(
+            parsed_scenes=[scene], prefab_library=None,
+            guid_index=idx, unity_project_root=tmp_path,
+        )
+        refs = artifact["scenes"]["Assets/Scenes/Phys.unity"]["references"]
+        body = [r for r in refs if r["field"] == "body"]
+        assert len(body) == 1
+        # Built-in component -> gameobject kind with the owning GO id.
+        assert body[0]["target_kind"] == "gameobject"
+        assert body[0]["target_ref"] == "Assets/Scenes/Phys.unity:300"
+        assert body[0].get("target_component_type") == "Rigidbody"
+        assert "target_script_id" not in body[0]
+
+
+@pytest.mark.skipif(
+    not _TRASH_DASH_MAIN.exists(),
+    reason="trash-dash source project not on disk",
+)
+class TestStrippedRefRealPlan:
+    """AC2 real-plan assertion: drive ``plan_scene_runtime`` over the real
+    Trash-Dash parsed inputs and assert all 3 stripped-MB refs resolve to a
+    placement-scoped engine-union key whose suffix IS a prefab-local
+    instance_id in the bound subplan."""
+
+    def _real_artifact(self):
+        from unity.scene_parser import parse_scene
+        from unity.prefab_parser import parse_prefabs
+        from unity.guid_resolver import build_guid_index
+        idx = build_guid_index(_TRASH_DASH)
+        lib = parse_prefabs(_TRASH_DASH)
+        scene = parse_scene(_TRASH_DASH_MAIN)
+        artifact = plan_scene_runtime([scene], lib, idx, _TRASH_DASH)
+        return artifact
+
+    def test_missionpopup_resolves_to_design_pinned_key(self):
+        """The design's exact AC2 pin (LoadoutState ``869760749`` ->
+        stripped ``137514649`` -> placement ``1822972501``)."""
+        artifact = self._real_artifact()
+        refs = artifact["scenes"]["Assets/Scenes/Main.unity"]["references"]
+        row = next(
+            r for r in refs
+            if r["from"] == "Assets/Scenes/Main.unity:869760749"
+            and r["field"] == "missionPopup"
+        )
+        assert row["target_ref"] == (
+            "Assets/Scenes/Main.unity:1822972501:"
+            "a53fe2875371488408daf0df7d69a981:"
+            "Assets/Prefabs/UI/MissionPopup.prefab:114000011972273750"
+        )
+        assert row["target_script_id"] == "fff2f071f7335eb43a712a702b990041"
+
+    def test_all_three_stripped_refs_resolve_fail_closed(self):
+        """All 3 real stripped refs (137514649->MissionUI, 80306028->MissionUI,
+        926798345->HighscoreUI) resolve to the EXACT byte-exact engine-union
+        key ``<ns>:<pi_fid>:<prefab_id>:<src_fid>`` and target_script_id the
+        planner produces over the real Trash-Dash inputs."""
+        artifact = self._real_artifact()
+        refs = artifact["scenes"]["Assets/Scenes/Main.unity"]["references"]
+        prefabs = artifact["prefabs"]
+        # The 3 (from_instance, field) rows that cite a stripped fileID, each
+        # pinned to its EXACT resolved target_ref + target_script_id.
+        cases = [
+            (
+                "Assets/Scenes/Main.unity:869760749", "missionPopup",
+                "Assets/Scenes/Main.unity:1822972501:"
+                "a53fe2875371488408daf0df7d69a981:"
+                "Assets/Prefabs/UI/MissionPopup.prefab:114000011972273750",
+                "fff2f071f7335eb43a712a702b990041",
+            ),
+            (
+                "Assets/Scenes/Main.unity:455205752", "missionPopup",
+                "Assets/Scenes/Main.unity:80306026:"
+                "a53fe2875371488408daf0df7d69a981:"
+                "Assets/Prefabs/UI/MissionPopup.prefab:114000011972273750",
+                "fff2f071f7335eb43a712a702b990041",
+            ),
+            (
+                "Assets/Scenes/Main.unity:1815696064", "playerEntry",
+                "Assets/Scenes/Main.unity:972301424:"
+                "ac361d43768a861498da8046b83b94f5:"
+                "Assets/Prefabs/UI/Score.prefab:114000010752991706",
+                "1a6452b9bb1a07a45b7eb7869a8a49ab",
+            ),
+        ]
+        for src, field, expected_ref, expected_script_id in cases:
+            row = next(
+                r for r in refs if r["from"] == src and r["field"] == field
+            )
+            assert row["target_ref"] == expected_ref, (src, field)
+            assert row["target_script_id"] == expected_script_id, (src, field)
+            target = row["target_ref"]
+            # Resolved key shape: <ns>:<pi_fid>:<prefab_id>:<src_fid>.
+            # Split off the scene namespace + pi_fid prefix to recover the
+            # prefab-local instance_id, and assert it lives in the subplan.
+            parts = target.split(":")
+            assert parts[0] == "Assets/Scenes/Main.unity"
+            # prefab-local instance_id = everything after <ns>:<pi_fid>:
+            local_instance_id = ":".join(parts[2:])
+            # find the subplan that owns this instance_id + matching script_id
+            found = False
+            for subplan in prefabs.values():
+                for inst in subplan["instances"]:
+                    if inst["instance_id"] == local_instance_id:
+                        assert inst["script_id"] == row["target_script_id"]
+                        found = True
+                        break
+                if found:
+                    break
+            assert found, (src, field, target)
