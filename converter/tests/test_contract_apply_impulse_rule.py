@@ -34,9 +34,11 @@ def test_whitespace_tolerant_forms_are_flagged():
 
 
 def test_method_definition_is_not_flagged():
-    # A definition named ApplyImpulse is not a raw call — must not be flagged.
-    src = "function C:ApplyImpulse(v) self.x = v end\nreturn C\n"
-    assert not _im_rules(src), "function Class:ApplyImpulse(...) definition must not be flagged"
+    # A definition named ApplyImpulse is not a raw call — must not be flagged (incl. spaced form).
+    for defn in ("function C:ApplyImpulse(v) self.x = v end",
+                 "function C : ApplyImpulse(v) self.x = v end"):
+        src = f"{defn}\nreturn C\n"
+        assert not _im_rules(src), f"definition must not be flagged: {defn!r}"
 
 
 def test_host_call_is_not_flagged():

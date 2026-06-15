@@ -1136,8 +1136,9 @@ def _check_script_parent(stripped: str, source: str) -> list[Violation]:
 # (``rb:ApplyImpulse(``, ``rb : ApplyImpulse (``). ``ApplyImpulseAtPosition`` /
 # ``ApplyAngularImpulse`` have other chars after ``ApplyImpulse`` so ``\s*\(`` never matches them.
 _RE_RAW_APPLY_IMPULSE = re.compile(r":\s*ApplyImpulse\s*\(")
-# A method DEFINITION ``function X:ApplyImpulse(...)`` is not a call — don't flag it.
-_RE_FUNC_DEF_PREFIX = re.compile(r"function\s+[\w.]*$")
+# A method DEFINITION ``function X:ApplyImpulse(...)`` is not a call — don't flag it. The trailing
+# ``\s*`` tolerates the whitespace-legal ``function C : ApplyImpulse`` form (prefix ends ``function C ``).
+_RE_FUNC_DEF_PREFIX = re.compile(r"function\s+[\w.]*\s*$")
 
 
 def _check_raw_apply_impulse(stripped: str, source: str) -> list[Violation]:
