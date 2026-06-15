@@ -249,6 +249,18 @@ function SceneRuntime.new(services, plan)
 	-- ``host.destroy(parent)`` is idempotent.
 	self._destroyed = {}
 
+	-- Phase 3 (slice 3.3): scene-boot component refs whose target is a
+	-- placed-prefab clone that hasn't booted yet at scene-wire time. The
+	-- scene loop wires ALL scene refs before any placement boots, so a
+	-- LoadoutState.missionPopup ref to a stripped MissionUI on a prefab
+	-- instance resolves to nil synchronously. Record those here (gated on
+	-- NOT-cross-domain, see ``_wireReferences``) and drain them after the
+	-- placement boot loop AND at the end of each ``_completeDeferredBatch``
+	-- (the placed target may itself be UI-deferred). Each entry is
+	-- ``{source=, field=, index=, target_ref=}`` with ``target_ref`` already
+	-- the full engine-union key (``<placement>:<prefab>:<src_fid>``).
+	self._pendingPlacementRefs = nil
+
 	return self
 end
 
@@ -1103,6 +1115,79 @@ function SceneRuntime:_assignFieldOnComponent(instance, field, index, value)
 	arr[index + 1] = value
 end
 
+function SceneRuntime:_isPlacementScopedRef(target_ref)
+	-- Phase 3 (slice 3.3): a stripped-ref ``target_ref`` the planner resolved
+	-- is the engine-union key ``<placement_id>:<prefab>:<src_fid>``, whose
+	-- prefix is one of the scene's ``scene_prefab_placements`` placement_ids.
+	-- Membership is a cheap check against a memoized set of known
+	-- placement_ids: ``target_ref`` is placement-scoped iff some placement_id
+	-- is a prefix of it followed by the ``:`` separator. This narrows the
+	-- pending-queue to genuine load-order misses against PLACED prefabs and
+	-- excludes ordinary unresolved scene-local component ids.
+	if target_ref == nil or target_ref == "" then return false end
+	local placementIds = self._placementIdSet
+	if placementIds == nil then
+		placementIds = {}
+		for _, placement in ipairs(self._plan.scene_prefab_placements or {}) do
+			local pid = placement.placement_id
+			if pid ~= nil and pid ~= "" then
+				placementIds[pid] = true
+			end
+		end
+		self._placementIdSet = placementIds
+	end
+	for pid in pairs(placementIds) do
+		if target_ref == pid or
+		   string.sub(target_ref, 1, #pid + 1) == (pid .. ":") then
+			return true
+		end
+	end
+	return false
+end
+
+function SceneRuntime:_drainPendingPlacementRefs()
+	-- Phase 3 (slice 3.3): bind scene-boot component refs whose placed-prefab
+	-- target has now registered in ``_componentByInstanceId``. Idempotent --
+	-- bound records are removed, unresolved records are kept for a later call
+	-- (the placed target may itself be UI-deferred and register only inside a
+	-- later ``_completeDeferredBatch``). Dead-source records are dropped
+	-- (matches the ``_inboundRefsToDeferred`` drain).
+	if not self._pendingPlacementRefs then return end
+	local kept = {}
+	for _, rec in ipairs(self._pendingPlacementRefs) do
+		if self._meta[rec.source] ~= nil then        -- source still alive
+			local target = self._componentByInstanceId[rec.target_ref]
+			if target ~= nil then
+				self:_assignFieldOnComponent(
+					rec.source, rec.field, rec.index, target)
+			else
+				table.insert(kept, rec)              -- target not yet built
+			end
+		end
+		-- dead source: drop the record.
+	end
+	self._pendingPlacementRefs = (#kept > 0) and kept or nil
+
+	-- After the FINAL drain (no UI-deferred work still in flight), any still-
+	-- unresolved record is a genuinely-absent target (no placement / never
+	-- registered). Emit a WARN so the residual nil is observable. Gate on no
+	-- pending UI-deferred batches so the WARN does not fire prematurely while
+	-- a placed target is still waiting on its PlayerGui host clone.
+	if self._pendingPlacementRefs ~= nil
+	   and (self._deferredUiInstances == nil
+	        or #self._deferredUiInstances == 0)
+	   and self._inboundRefsToDeferred == nil then
+		for _, rec in ipairs(self._pendingPlacementRefs) do
+			local srcMeta = self._meta[rec.source]
+			self._warn(string.format(
+				"[scene_runtime] stripped-prefab ref %s.%s -> %s never "
+				.. "resolved (target not registered); leaving nil",
+				tostring(srcMeta and srcMeta.scriptId), tostring(rec.field),
+				tostring(rec.target_ref)))
+		end
+	end
+end
+
 function SceneRuntime:_wireReferences(refs, componentByInstanceId,
                                        crossDomainEdges, instanceById,
                                        placement_id, targetResolveMap)
@@ -1141,6 +1226,12 @@ function SceneRuntime:_wireReferences(refs, componentByInstanceId,
 			-- inject ``nil`` and surface the edge. Resolve via the plan
 			-- so the policy fires even when the target isn't locally
 			-- constructed (real boots only run one partition).
+			-- ``crossDomainNil`` records whether THIS ref was nil-injected by
+			-- the cross-domain POLICY (as opposed to a load-order miss). A
+			-- policy-nil'd ref must NOT enter ``_pendingPlacementRefs`` -- the
+			-- drain would otherwise rebind it once the placed component lands
+			-- and silently defeat the cross-domain gate (codex round-1 P1).
+			local crossDomainNil = false
 			if ref.target_kind == "component" then
 				local srcMeta = self._meta[sourceComp]
 				local tgtRow = instanceById and instanceById[ref.target_ref]
@@ -1148,6 +1239,16 @@ function SceneRuntime:_wireReferences(refs, componentByInstanceId,
 				local tgtScriptId
 				if tgtRow then
 					tgtScriptId = tgtRow.script_id
+				else
+					-- Phase 3 (slice 3.3): a placement-scoped target_ref
+					-- (``<placement>:<prefab>:<src_fid>``) never appears in the
+					-- scene-local ``instanceById``. The planner stamps
+					-- ``ref.target_script_id`` on rewritten stripped rows so the
+					-- cross-domain policy can still classify the target's domain
+					-- (codex Major 1 / D-P3-6).
+					tgtScriptId = ref.target_script_id
+				end
+				if tgtScriptId then
 					local tgtModule = modules[tgtScriptId]
 					tgtDomain = tgtModule and tgtModule.domain
 				end
@@ -1164,6 +1265,7 @@ function SceneRuntime:_wireReferences(refs, componentByInstanceId,
 						srcMeta.scriptId, srcMeta.domain, ref.field,
 						tostring(tgtScriptId), tgtDomain))
 					target = nil
+					crossDomainNil = true
 					if crossDomainEdges then
 						table.insert(crossDomainEdges, {
 							from_script = srcMeta.scriptId,
@@ -1202,6 +1304,27 @@ function SceneRuntime:_wireReferences(refs, componentByInstanceId,
 						field = ref.field,
 						index = ref.index,
 						target_ref = scopedTarget,
+					})
+				elseif not crossDomainNil
+				       and (placement_id == nil or placement_id == "")
+				       and self:_isPlacementScopedRef(ref.target_ref) then
+					-- Phase 3 (slice 3.3): a SCENE-BOOT (placement_id nil/empty)
+					-- component ref that resolved to nil and whose ``target_ref``
+					-- is a placement-scoped engine-union key
+					-- (``<placement>:<prefab>:<src_fid>``) is a LOAD-ORDER miss:
+					-- the placed-prefab clone hasn't booted yet (the scene loop
+					-- wires every scene ref BEFORE any placement boots). Queue it
+					-- for ``_drainPendingPlacementRefs``. Gated on NOT-cross-domain
+					-- so a policy-nil'd ref is never rebound (D-P3-6 / round-1 P1).
+					-- ``target_ref`` is already the full engine-union key (the
+					-- planner emits the resolved ``<placement>:<prefab>:<src_fid>``
+					-- for stripped refs), so it is NOT placement-scoped here.
+					self._pendingPlacementRefs = self._pendingPlacementRefs or {}
+					table.insert(self._pendingPlacementRefs, {
+						source = sourceComp,
+						field = ref.field,
+						index = ref.index,
+						target_ref = ref.target_ref,
 					})
 				end
 			end
@@ -2564,6 +2687,11 @@ function SceneRuntime:_completeDeferredBatch(pending)
 		end
 		engine._inboundRefsToDeferred = (#kept > 0) and kept or nil
 	end
+	-- Phase 3 (slice 3.3): a placed-prefab target that was itself UI-deferred
+	-- registers in ``_componentByInstanceId`` only now (inside this batch).
+	-- Drain again so a scene-boot ref to such a target binds. Idempotent --
+	-- already-bound records were removed by the post-placement drain.
+	engine:_drainPendingPlacementRefs()
 	-- Pass 3c: prefab-side externalRefs override matching wired fields,
 	-- mirroring ``_constructPrefabClone``'s post-wire override.
 	for _, entry in ipairs(ordered) do
@@ -2850,6 +2978,16 @@ function SceneRuntime:start(domainFilter)
 			self:_runAwakeEnableStart(componentList)
 		end
 	end
+
+	-- Phase 3 (slice 3.3): the placement boot loop has now registered every
+	-- placed-prefab component in ``_componentByInstanceId``. Drain scene-boot
+	-- component refs (e.g. LoadoutState.missionPopup) whose target is one of
+	-- those placed clones -- they resolved to nil at scene-wire time because
+	-- the placement hadn't booted yet. Runs synchronously before the
+	-- heartbeat connect and before any deferred Start fires, so the field is
+	-- set before its source's Start reads it. A target that is itself
+	-- UI-deferred is drained later by ``_completeDeferredBatch``.
+	self:_drainPendingPlacementRefs()
 
 	-- Step 6: update loops via heartbeat + fixed-step accumulator.
 	if self._services.heartbeat then
