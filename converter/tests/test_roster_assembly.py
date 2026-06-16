@@ -122,14 +122,17 @@ def test_ac8_no_game_specific_literal_in_changed_production_code():
     """AC8 — no game-specific roster label literal in ANY production file this
     slice changed (not just roster_assembly.py). The structural trigger is
     label-driven (by_label), so a hardcoded label would be a generality bug."""
-    # roster_assembly.py is entirely new → scan the whole file.
-    # The others are multi-purpose → scan only the roster-related additions.
+    # Scan EVERY changed production file WHOLE — a game-label literal may not
+    # appear anywhere in them. Verified none of these files carries such a
+    # literal pre-slice, so whole-file is strict without false-positives, and
+    # (unlike a "roster"-line-scoped grep) it cannot miss a label hardcoded on a
+    # non-"roster" line — the codex finding.
     targets: list[tuple[Path, bool]] = [
         (REPO_ROOT / "converter" / "roster_assembly.py", True),
-        (REPO_ROOT / "roblox" / "rbxlx_writer.py", False),
-        (REPO_ROOT / "roblox" / "luau_place_builder.py", False),
-        (REPO_ROOT / "core" / "roblox_types.py", False),
-        (REPO_ROOT / "converter" / "pipeline.py", False),
+        (REPO_ROOT / "roblox" / "rbxlx_writer.py", True),
+        (REPO_ROOT / "roblox" / "luau_place_builder.py", True),
+        (REPO_ROOT / "core" / "roblox_types.py", True),
+        (REPO_ROOT / "converter" / "pipeline.py", True),
     ]
     all_offenders: dict[str, list[str]] = {}
     for path, whole_file in targets:
