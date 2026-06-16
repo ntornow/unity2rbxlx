@@ -115,7 +115,40 @@ def _mk_artifact(
 def _mk_rbx_script(
     name: str, script_type: ScriptType = "Script",
 ) -> RbxScript:
-    return RbxScript(name=name, source="-- empty", script_type=script_type)
+    s = RbxScript(name=name, source="-- empty", script_type=script_type)
+    s.intrinsic_script_type = script_type
+    return s
+
+
+def _reach_kwargs(
+    modules: dict[str, object],
+    scripts: list[RbxScript],
+) -> dict[str, object]:
+    """Build the script-name/sid-space kwargs
+    ``derive_reachability_requirements`` now takes, the same way
+    ``_maybe_run_topology_prepass`` does."""
+    from converter.roblox_dead_modules import extract_require_edges
+    from converter.scene_runtime_planner import build_script_id_by_name
+
+    by_name = {s.name: s for s in scripts if s.name}
+    sid_by_name = build_script_id_by_name(
+        scripts, cast("dict[str, object]", modules),
+    )
+    script_by_sid = {
+        sid: by_name[name]
+        for name, sid in sid_by_name.items()
+        if name in by_name
+    }
+    known = frozenset(s.name for s in scripts if s.name)
+    edges = {
+        s.name: extract_require_edges(s.source, known)
+        for s in scripts if s.name
+    }
+    return {
+        "require_edges_by_name": edges,
+        "script_by_sid": script_by_sid,
+        "lifecycle_roles": {},
+    }
 
 
 def _failopen_sfc():
@@ -381,16 +414,20 @@ class TestTopologyEmissionShape:
             script_type="ModuleScript",
             parent_path="ServerStorage",
         )
-        hud_script = _mk_rbx_script("HudControl", "LocalScript")
+        hud_script = RbxScript(
+            name="HudControl",
+            source='require(script.Parent:FindFirstChild("HelperLib"))',
+            script_type="LocalScript",
+        )
+        hud_script.intrinsic_script_type = "LocalScript"
         scripts = [helper_script, hud_script]
-        dependency_map = {"HudControl": ["HelperLib"]}
 
         # Run the planner's classification (includes
-        # _apply_reachability_rule).
+        # _apply_reachability_rule). The client closure now seeds from
+        # the LocalScript entry + the emitted-require edge.
         classify_scene_runtime_domains(
             cast("dict", sr),
             scripts,
-            dependency_map=dependency_map,
         )
 
         # Phase 2a slice 10: ``reachability_required_container`` now
@@ -412,13 +449,12 @@ class TestTopologyEmissionShape:
         domain_results = infer_module_domains(
             cast("dict", sr),
             scripts,
-            dependency_map=dependency_map,
         )
         reqs = derive_reachability_requirements(
             cast("dict", sr),
             scripts,
             domain_results,
-            dependency_map=dependency_map,
+            **_reach_kwargs(sr["modules"], scripts),  # type: ignore[arg-type]
         )
 
         # Now build topology and assert invariant 10 passes (no abort).
@@ -493,14 +529,17 @@ class TestTopologyEmissionShape:
             script_type="ModuleScript",
             parent_path="ServerStorage",
         )
-        hud_script = _mk_rbx_script("HudControl", "LocalScript")
+        hud_script = RbxScript(
+            name="HudControl",
+            source='require(script.Parent:FindFirstChild("NoNameHelper"))',
+            script_type="LocalScript",
+        )
+        hud_script.intrinsic_script_type = "LocalScript"
         scripts = [helper_script, hud_script]
-        dependency_map = {"HudControl": ["NoNameHelper"]}
 
         classify_scene_runtime_domains(
             cast("dict", sr),
             scripts,
-            dependency_map=dependency_map,
         )
 
         # The helper stays in its pre-rule state — rule never fired
@@ -557,15 +596,23 @@ class TestTopologyEmissionShape:
             script_type="ModuleScript",
             parent_path="ServerStorage",
         )
-        hud_script = _mk_rbx_script("HudControl", "LocalScript")
+        # The emitted require keys by the SCRIPT NAME (file stem
+        # "Bootstrap"), the canonical emitted-require keyspace — NOT the
+        # C# class_name. This is exactly the keyspace the new closure
+        # runs in, so the class_name-vs-stem mismatch is structurally
+        # neutralized: the row joins to its script via the stem fallback
+        # in build_script_id_by_name.
+        hud_script = RbxScript(
+            name="HudControl",
+            source='require(script.Parent:FindFirstChild("Bootstrap"))',
+            script_type="LocalScript",
+        )
+        hud_script.intrinsic_script_type = "LocalScript"
         scripts = [helper_script, hud_script]
-        # dependency_map keys by class_name (the C# analyzer view).
-        dependency_map = {"HudControl": ["GameInit"]}
 
         classify_scene_runtime_domains(
             cast("dict", sr),
             scripts,
-            dependency_map=dependency_map,
         )
 
         # Rule should have fired: helper hoisted to ReplicatedStorage,
@@ -4459,8 +4506,26 @@ class TestSlice10ReachabilityRequirementsNormalization:
 
         # Scripts: helper-hoist starts in ServerStorage (gated);
         # helper-already-rs starts in ReplicatedStorage (non-gated).
-        client_script = _mk_rbx_script("ClientA", "LocalScript")
-        server_script = _mk_rbx_script("ServerA", "Script")
+        # Emitted-require edges (the new canonical closure source):
+        #   ClientA (LocalScript entry) -> NeedsHoist, AlreadyRS, Conflict
+        #   ServerA (server-domain Script) -> Conflict
+        def _req(*names: str) -> str:
+            return "\n".join(
+                f'require(script.Parent:FindFirstChild("{n}"))'
+                for n in names
+            )
+
+        client_script = RbxScript(
+            name="ClientA",
+            source=_req("NeedsHoist", "AlreadyRS", "Conflict"),
+            script_type="LocalScript",
+        )
+        client_script.intrinsic_script_type = "LocalScript"
+        server_script = RbxScript(
+            name="ServerA", source=_req("Conflict"),
+            script_type="Script",
+        )
+        server_script.intrinsic_script_type = "Script"
         helper_unconstrained = RbxScript(
             name="Unconstrained", source="-- u",
             script_type="ModuleScript",
@@ -4486,26 +4551,18 @@ class TestSlice10ReachabilityRequirementsNormalization:
             helper_unconstrained, helper_conflict,
             helper_hoist, helper_already_rs,
         ]
-        # dep_map by class_name:
-        # ClientA -> NeedsHoist, AlreadyRS, Conflict
-        # ServerA -> Conflict
-        dep_map = {
-            "ClientA": ["NeedsHoist", "AlreadyRS", "Conflict"],
-            "ServerA": ["Conflict"],
-        }
 
         # Real upstream: produce ``reachability_requirements`` the
         # way ``_maybe_run_topology_prepass`` does.
         domain_results = infer_module_domains(
             cast("dict", sr),
             scripts,
-            dependency_map=dep_map,
         )
         reqs = derive_reachability_requirements(
             cast("dict", sr),
             scripts,
             domain_results,
-            dependency_map=dep_map,
+            **_reach_kwargs(sr["modules"], scripts),  # type: ignore[arg-type]
         )
 
         # The producer should have classified:

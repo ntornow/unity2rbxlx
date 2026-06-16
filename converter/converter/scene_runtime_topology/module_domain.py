@@ -88,7 +88,7 @@ import logging
 import math
 import re
 from pathlib import Path
-from typing import Iterable, TypedDict, cast
+from typing import Iterable, Mapping, TypedDict, cast
 
 from core.roblox_types import RbxScript
 from core.unity_types import GuidIndex
@@ -1025,20 +1025,78 @@ def infer_module_domains(
     return out
 
 
+def _client_entry_seed_names(
+    script_by_sid: dict[str, RbxScript],
+    domain_results: dict[str, _DomainInferenceResult],
+    lifecycle_roles: dict[str, str],
+) -> set[str]:
+    """Return the set of client-entry script NAMES.
+
+    A script is a client ENTRY POINT (the seed of the client
+    require-reachability closure) when ANY of:
+      - its intrinsic class is ``LocalScript`` (a structural client
+        entry that auto-runs on the client), OR
+      - its gated lifecycle role is ``character_attached`` or ``loader``
+        (both roles only fire for ``script_class in {Script, LocalScript}``
+        AND ``domain == "client"`` — the gate is applied where the role
+        is computed, ``lifecycle_roles.py``), OR
+      - its intrinsic class is ``Script`` AND its inferred domain is
+        ``client`` AND that verdict is NOT low-confidence (the
+        ``low_confidence is False`` clause keeps a zero-signal
+        ``networking=none`` client default from seeding a server-only
+        require subtree into the client closure).
+
+    Pure: reads only the intrinsic script class, the domain verdict +
+    low_confidence flag, and the (already-gated) lifecycle role. Does
+    NOT read ``parent_path``. Does NOT mutate.
+    """
+    from converter.scene_runtime_planner import derive_intrinsic_script_class
+
+    seeds: set[str] = set()
+    for sid, script in script_by_sid.items():
+        if not script.name:
+            continue
+        cls = derive_intrinsic_script_class(script)
+        result = domain_results.get(sid)
+        domain = result["domain"] if result is not None else ""
+        low_confidence = (
+            result["low_confidence"] if result is not None else True
+        )
+        if cls == "LocalScript":
+            seeds.add(script.name)
+            continue
+        if lifecycle_roles.get(sid) in ("character_attached", "loader"):
+            seeds.add(script.name)
+            continue
+        if cls == "Script" and domain == "client" and low_confidence is False:
+            seeds.add(script.name)
+    return seeds
+
+
 def derive_reachability_requirements(
     scene_runtime: SceneRuntimeArtifact,
     scripts: Iterable[RbxScript],
     domain_results: dict[str, _DomainInferenceResult],
     *,
-    dependency_map: dict[str, list[str]] | None = None,
+    require_edges_by_name: dict[str, set[str]],
+    script_by_sid: dict[str, RbxScript],
+    lifecycle_roles: dict[str, str],
+    transpile_ran: bool = True,
 ) -> dict[str, str]:
-    """Return ``{script_id: required_container}`` for helpers that the
-    client require-graph reaches.
+    """Return ``{script_id: required_container}`` for helper MODULES
+    that the client require-graph reaches.
 
-    Pure: reads ``modules[*].class_name`` + ``modules[*].domain`` from
-    the freshly-inferred ``domain_results`` (NOT from the module rows,
-    which still carry stale domains until the finalizer runs). Does
-    NOT read ``parent_path``. Does NOT mutate anything.
+    Runs entirely in script-NAME / ``sid`` space: client/server seeds
+    are resolved to script names, the closure walks the canonical
+    emitted-require graph ``require_edges_by_name`` (name -> {name}),
+    and reached names are mapped back to ``script_id`` via the candidate
+    loop (which already holds both).
+
+    Pure: reads ``domain_results[*]["domain"]`` + ``["low_confidence"]``,
+    reads ``script_by_sid[sid].name`` +
+    ``derive_intrinsic_script_class(script_by_sid[sid])``, reads
+    ``lifecycle_roles[sid]``. Does NOT read ``parent_path``. Does NOT
+    mutate anything.
 
     Required-container value is either:
       - ``REPLICATED_STORAGE`` -- helper reached by client only; must
@@ -1048,62 +1106,56 @@ def derive_reachability_requirements(
         domain with ``fail_closed_reason="reachability_conflict"``.
 
     Helpers not in the map are unconstrained — storage_classifier's
-    legacy decision tree picks their container (slice 7 will route the
-    unconstrained ones via the topology decision tree).
+    legacy decision tree picks their container.
+
+    Resume gate: on a no-retranspile resume (``transpile_ran is False``)
+    or when the emitted-require graph is empty, return ``{}`` — the same
+    byte-identical legacy fallback the previous empty-``dependency_map``
+    guard produced.
     """
-    if not dependency_map:
+    if not transpile_ran or not require_edges_by_name:
         return {}
 
-    modules = scene_runtime.get("modules", {})
-    from converter.scene_runtime_planner import (
-        build_scripts_by_class_name,
-        compute_class_name_collisions,
-    )
-    scripts_list = list(scripts)
-    scripts_by_class = build_scripts_by_class_name(
-        scripts_list, cast("dict", modules),
-    )
-    colliding_class_names = compute_class_name_collisions(modules)
+    from converter.scene_runtime_planner import derive_intrinsic_script_class
 
-    client_classes: set[str] = set()
-    server_classes: set[str] = set()
-    class_to_script_id: dict[str, str] = {}
-    for script_id, module in modules.items():
-        class_name = module.get("class_name", "")
-        if not class_name:
+    modules = scene_runtime.get("modules", {})
+
+    domain_by_sid: dict[str, str] = {}
+    for sid, result in domain_results.items():
+        domain_by_sid[sid] = result["domain"]
+
+    client_seed_names = _client_entry_seed_names(
+        script_by_sid, domain_results, lifecycle_roles,
+    )
+    server_seed_names: set[str] = set()
+    for sid, _module in modules.items():
+        if domain_by_sid.get(sid) != "server":
             continue
-        if class_name in colliding_class_names:
+        script = script_by_sid.get(sid)
+        if script is None or not script.name:
             continue
-        class_to_script_id.setdefault(class_name, script_id)
-        # Read domain from domain_results, NOT from module["domain"] —
-        # the module rows haven't been stamped yet at the early prepass
-        # call site.
-        result = domain_results.get(script_id)
-        verdict = result["domain"] if result is not None else ""
-        if verdict == "client":
-            client_classes.add(class_name)
-        elif verdict == "server":
-            server_classes.add(class_name)
+        server_seed_names.add(script.name)
 
     requirements: dict[str, str] = {}
-    for helper_class, _script in scripts_by_class.items():
-        client_seeds = client_classes - {helper_class}
-        server_seeds = server_classes - {helper_class}
-        helper_reached_by_client = (
-            helper_class in _closure(client_seeds, dependency_map)
-        )
-        helper_reached_by_server = (
-            helper_class in _closure(server_seeds, dependency_map)
-        )
-        if not helper_reached_by_client:
+    for sid, _module in modules.items():
+        script = script_by_sid.get(sid)
+        if script is None:
             continue
-        module_id = class_to_script_id.get(helper_class)
-        if not module_id:
+        if derive_intrinsic_script_class(script) != "ModuleScript":
             continue
-        if helper_reached_by_server:
-            requirements[module_id] = "__excluded__"
+        name = script.name
+        reached_by_client = name in _closure(
+            client_seed_names - {name}, require_edges_by_name,
+        )
+        if not reached_by_client:
+            continue
+        reached_by_server = name in _closure(
+            server_seed_names - {name}, require_edges_by_name,
+        )
+        if reached_by_server:
+            requirements[sid] = "__excluded__"
         else:
-            requirements[module_id] = REPLICATED_STORAGE
+            requirements[sid] = REPLICATED_STORAGE
     return requirements
 
 
@@ -1112,6 +1164,8 @@ def finalize_topology_containers(
     scripts: Iterable[RbxScript],
     domain_results: dict[str, _DomainInferenceResult],
     reachability_requirements: dict[str, str],
+    *,
+    script_by_sid: dict[str, RbxScript],
 ) -> list[str]:
     """Late finalizer: mirror domain verdicts + container/module_path
     onto module rows after ``classify_storage`` has stamped final
@@ -1169,20 +1223,14 @@ def finalize_topology_containers(
             excluded.append(script_id)
 
     # Apply reachability decisions atomically (mirrors what the legacy
-    # ``_apply_reachability_rule`` did inline).
-    class_to_script_id: dict[str, str] = {}
-    for script_id, module in modules.items():
-        class_name = module.get("class_name", "")
-        if not class_name:
-            continue
-        class_to_script_id.setdefault(class_name, script_id)
-
+    # ``_apply_reachability_rule`` did inline). Resolve the row's script
+    # via ``script_by_sid`` (keyed on ``script_id``), NOT the class-name
+    # join — the class-name join silently dropped colliding rows (DD7).
     for script_id, requirement in reachability_requirements.items():
         module_row = modules.get(script_id)
         if module_row is None:
             continue
-        helper_class = module_row.get("class_name", "")
-        script = scripts_by_class.get(helper_class)
+        script = script_by_sid.get(script_id)
         if script is None:
             continue
 
@@ -1245,6 +1293,7 @@ def classify_scene_runtime_domains(
     guid_index: GuidIndex | None = None,
     networking: str = DEFAULT_NETWORKING_MODE,
     strict: bool = False,
+    transpile_ran: bool = True,
 ) -> DomainClassifierReport:
     """Populate ``domain`` / ``container`` / ``module_path`` /
     ``domain_signals`` on every runtime-bearing module in
@@ -1299,9 +1348,58 @@ def classify_scene_runtime_domains(
         guid_index=guid_index,
         networking=networking,
     )
+
+    # Build the script-name/sid-space inputs the reachability closure +
+    # the finalizer share, using the SAME recipes the pipeline uses (so
+    # the orchestrator path and the pipeline prepass path agree).
+    from converter.roblox_dead_modules import extract_require_edges
+    from converter.scene_runtime_planner import (
+        build_script_id_by_name,
+        derive_intrinsic_script_class,
+    )
+    from converter.scene_runtime_topology.lifecycle_roles import (
+        derive_module_lifecycle_role,
+    )
+
+    modules = scene_runtime.get("modules", {})
+    scripts_by_name: dict[str, RbxScript] = {
+        s.name: s for s in scripts_list if s.name
+    }
+    script_id_by_name = build_script_id_by_name(
+        scripts_list,
+        cast("dict[str, SceneRuntimeModule | dict[str, object]]", modules),
+    )
+    script_by_sid: dict[str, RbxScript] = {
+        sid: scripts_by_name[script_name]
+        for script_name, sid in script_id_by_name.items()
+        if script_name in scripts_by_name
+    }
+    lifecycle_roles: dict[str, str] = {}
+    for sid, row in modules.items():
+        script = script_by_sid.get(sid)
+        script_class = derive_intrinsic_script_class(script)
+        module_domain = (
+            domain_results[sid]["domain"] if sid in domain_results else ""
+        )
+        role = derive_module_lifecycle_role(
+            domain=module_domain,
+            script_class=script_class,
+            character_attached=bool(row.get("character_attached", False)),
+            is_loader=bool(row.get("is_loader", False)),
+        )
+        lifecycle_roles[sid] = role
+    known_names = frozenset(s.name for s in scripts_list if s.name)
+    require_edges_by_name: dict[str, set[str]] = {
+        s.name: extract_require_edges(s.source, known_names)
+        for s in scripts_list if s.name
+    }
+
     requirements = derive_reachability_requirements(
         scene_runtime, scripts_list, domain_results,
-        dependency_map=dependency_map,
+        require_edges_by_name=require_edges_by_name,
+        script_by_sid=script_by_sid,
+        lifecycle_roles=lifecycle_roles,
+        transpile_ran=transpile_ran,
     )
 
     # Late finalizer: stamp the early-inferred domains + reachability
@@ -1309,6 +1407,7 @@ def classify_scene_runtime_domains(
     # ``RbxScript.parent_path``. Returns the final excluded list.
     excluded = finalize_topology_containers(
         scene_runtime, scripts_list, domain_results, requirements,
+        script_by_sid=script_by_sid,
     )
 
     # Collect low_confidence + displaced from the early prepass results.
@@ -2043,7 +2142,7 @@ def _compute_network_behaviour_reachable(
 
 
 def _closure(
-    seeds: set[str], dependency_map: dict[str, list[str]],
+    seeds: set[str], dependency_map: Mapping[str, Iterable[str]],
 ) -> set[str]:
     """Transitive closure of ``seeds`` under ``dependency_map``."""
     visited: set[str] = set()

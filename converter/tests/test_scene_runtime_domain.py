@@ -304,18 +304,26 @@ class TestReachability:
             _mk_module("h", "Helper"),
         ])
         artifact = _mk_artifact(cast("dict[str, dict[str, object]]", modules))
+        client_a = RbxScript(
+            name="ClientA",
+            source='workspace.CurrentCamera.FieldOfView = 70\n'
+            'require(script.Parent:FindFirstChild("Helper"))',
+            script_type="LocalScript",
+        )
+        client_a.intrinsic_script_type = "LocalScript"
+        server_b = RbxScript(
+            name="ServerB",
+            source='evt:FireAllClients()\n'
+            'require(script.Parent:FindFirstChild("Helper"))',
+            script_type="Script",
+        )
+        server_b.intrinsic_script_type = "Script"
         scripts = [
-            _mk_script("ClientA", "workspace.CurrentCamera.FieldOfView = 70"),
-            _mk_script("ServerB", "evt:FireAllClients()"),
+            client_a,
+            server_b,
             _mk_script("Helper", "return {}", parent_path=SERVER_STORAGE),
         ]
-        dep_map = {
-            "ClientA": ["Helper"],
-            "ServerB": ["Helper"],
-        }
-        report = classify_scene_runtime_domains(
-            artifact, scripts, dependency_map=dep_map,
-        )
+        report = classify_scene_runtime_domains(artifact, scripts)
         assert artifact["modules"]["h"]["domain"] == "excluded"
         assert (artifact["modules"]["h"]["domain_signals"]
                 ["fail_closed_reason"]) == "reachability_conflict"
@@ -333,14 +341,18 @@ class TestReachability:
         helper_script = _mk_script(
             "Helper", "return {}", parent_path=SERVER_STORAGE,
         )
+        client_a = RbxScript(
+            name="ClientA",
+            source='Players.LocalPlayer.Character:WaitForChild()\n'
+            'require(script.Parent:FindFirstChild("Helper"))',
+            script_type="LocalScript",
+        )
+        client_a.intrinsic_script_type = "LocalScript"
         scripts = [
-            _mk_script("ClientA", "Players.LocalPlayer.Character:WaitForChild()"),
+            client_a,
             helper_script,
         ]
-        dep_map = {"ClientA": ["Helper"], "Helper": []}
-        classify_scene_runtime_domains(
-            artifact, scripts, dependency_map=dep_map,
-        )
+        classify_scene_runtime_domains(artifact, scripts)
         assert helper_script.parent_path == REPLICATED_STORAGE
         assert artifact["modules"]["h"]["container"] == REPLICATED_STORAGE
         # Phase 2a slice 10: the parallel planner-row audit signal
