@@ -42,15 +42,23 @@ from __future__ import annotations
 from typing import Literal, TypedDict, cast
 from urllib.parse import quote, unquote
 
+from core.unity_types import GuidIndex
+
 from converter.scene_runtime_planner import (
     SceneRuntimeArtifact,
     SceneRuntimePrefab,
     SceneRuntimeReference,
     SceneRuntimeScene,
 )
+from converter.scene_runtime_topology.animation_driver_analyzer import (
+    extract_animator_param_writes,
+)
 from converter.scene_runtime_topology.lifecycle_roles import (
     LifecycleRole,
     derive_module_lifecycle_role,
+)
+from converter.scene_runtime_topology.module_domain import (
+    _load_cs_source_preserving_strings,
 )
 
 
@@ -271,6 +279,8 @@ def resolve_driver(
     *,
     scope_kind: str,
     scope_ref: str,
+    guid_index: GuidIndex | None = None,
+    observed_attribute: str = "",
 ) -> tuple[str, str] | None:
     """Find THE MonoBehaviour in ``scope_ref`` that serializes an
     Animator reference, when exactly one candidate exists. Returns
@@ -312,8 +322,12 @@ def resolve_driver(
     references, instance_to_script = _iter_scope_references(
         scene_runtime, scope_kind, scope_ref,
     )
-    if not references:
-        return None
+    # NOTE: do NOT early-return on empty ``references``. An empty (or
+    # Animator-ref-free) reference list yields ``len(candidate_mbs) == 0``,
+    # which the Phase-2 0-ref narrowing pass (below) handles — the
+    # SimpleFPS Door has no serialized Animator ref but is still resolvable
+    # from its C# source. A non-existent scope returns an empty
+    # ``instance_to_script`` too, so Phase-2 finds no MBs → None.
     modules = cast(
         dict[str, dict[str, object]], scene_runtime.get("modules", {}),
     )
@@ -329,15 +343,80 @@ def resolve_driver(
         from_instance = ref.get("from", "")
         if from_instance:
             candidate_mbs.add(from_instance)
-    if len(candidate_mbs) != 1:
-        # 0 candidates → no driver; 2+ → ambiguous (Phase 2 narrowing
-        # will pick the actual writer). Both return None → caller
-        # stamps ``routing_status="unresolved"``.
+    if len(candidate_mbs) >= 2:
+        # 2+ distinct Animator-referencing MBs → ambiguous. Param-name
+        # matching can't establish animator identity (controller GUID +
+        # GO match), so Phase 2 does NOT run here (D11/DP4). Return None
+        # → caller stamps ``routing_status="unresolved"``.
         return None
+    if len(candidate_mbs) == 0:
+        # No serialized Animator ref pins a driver (the SimpleFPS Door
+        # runtime-getter case). Run the Phase-2 C#-source narrowing pass:
+        # match the clip's observed_attribute against each scope MB's
+        # Animator-param writes (D10/D12). Yields a unique driver or None.
+        return _narrow_driver_by_param_writes(
+            scope_script_ids=list(instance_to_script.values()),
+            modules=modules,
+            guid_index=guid_index,
+            observed_attribute=observed_attribute,
+        )
     from_instance = next(iter(candidate_mbs))
     driver_guid = instance_to_script.get(from_instance, "")
     if not driver_guid:
         return None
+    driver_module = modules.get(driver_guid, {})
+    driver_domain_obj = driver_module.get("domain", "")
+    driver_domain = driver_domain_obj if isinstance(driver_domain_obj, str) else ""
+    if driver_domain not in ("client", "server"):
+        return None
+    return driver_guid, driver_domain
+
+
+def _narrow_driver_by_param_writes(
+    *,
+    scope_script_ids: list[str],
+    modules: dict[str, dict[str, object]],
+    guid_index: GuidIndex | None,
+    observed_attribute: str,
+) -> tuple[str, str] | None:
+    """Phase-2 source narrowing (D10/D11/D12): when no serialized Animator
+    ref pins a driver, identify the scope MonoBehaviour whose C# writes the
+    clip's ``observed_attribute`` via ``Set*("<param>", …)`` on an
+    Animator-bound receiver. Returns ``(driver_module_guid, driver_domain)``
+    when EXACTLY ONE scope MB writes it, else ``None`` (server fallback).
+
+    Args:
+      scope_script_ids: every scope instance's ``script_id``
+        (``instance_to_script.values()``, D10/DP3 — NOT ``candidate_mbs``,
+        which is empty in the 0-ref case). Deduped here.
+      modules: ``scene_runtime.modules`` (for the matched MB's domain).
+      guid_index: resolves a script_id GUID to its on-disk .cs path.
+      observed_attribute: the clip's first Bool/Int/Trigger controller
+        param. Empty for autoplay clips (D12 fail-fast below).
+    """
+    # D12 fail-fast: autoplay clips (observed_attribute="") can never match
+    # a written param — reject before any source read.
+    if not observed_attribute:
+        return None
+    # No Unity project root → no C# source to read (unit-test default,
+    # edge case 7).
+    if guid_index is None:
+        return None
+    matched: list[str] = []
+    for script_id in dict.fromkeys(scope_script_ids):  # dedup, order-stable
+        if not script_id:
+            continue
+        src = _load_cs_source_preserving_strings(script_id, guid_index)
+        if not src:
+            continue
+        params = extract_animator_param_writes(src)
+        if observed_attribute in params:
+            matched.append(script_id)
+    if len(matched) != 1:
+        # 0 matches → no driver; ≥2 → ambiguous (multiple scope MBs write
+        # the same param). Both → None → server fallback preserved (D8).
+        return None
+    driver_guid = matched[0]
     driver_module = modules.get(driver_guid, {})
     driver_domain_obj = driver_module.get("domain", "")
     driver_domain = driver_domain_obj if isinstance(driver_domain_obj, str) else ""

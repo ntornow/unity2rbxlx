@@ -263,3 +263,76 @@ def test_corpus_exercises_rig_binding_present_check() -> None:
             f"({resolver_call!r} absent) — the discharge is vacuous. "
             f"Re-run tools/regen_contract_corpus.py."
         )
+
+
+# ===========================================================================
+# Key-check canonical-contract regression (door run, D9)
+# ===========================================================================
+
+_SIMPLEFPS_FIXTURE = _FIXTURE_ROOT / "SimpleFPS" / "fixture.json"
+
+
+@pytest.mark.skipif(
+    not _SIMPLEFPS_FIXTURE.exists(),
+    reason="SimpleFPS contract-corpus fixture not committed",
+)
+class TestDoorKeyCheckContract:
+    """Pins the door key-check writer+reader+funnel contract so it can't
+    silently regress (D9: the key-check already works on the current tree;
+    the door run's code change is animation routing, so this is a
+    standalone regression guard with NO production code).
+
+    The canonical store is the Player instance + its Character, written by
+    ``Player:_setSharedFlag``: it sets the ``hasKey`` Attribute on both the
+    Player and its Character AND fires the autogen ``PlayerSetSharedFlag``
+    RemoteEvent (server-replicated). The Door reads ``hasKey`` off the
+    touching player via ``plr:GetAttribute("hasKey")`` — same canonical
+    store the writer populates.
+    """
+
+    def _sources(self) -> dict[str, str]:
+        fx = json.loads(_SIMPLEFPS_FIXTURE.read_text(encoding="utf-8"))
+        return {
+            s["name"]: (s.get("source") or "")
+            for s in fx["scripts"]
+            if s.get("name")
+        }
+
+    def test_door_reads_haskey_attribute(self) -> None:
+        door = self._sources().get("Door", "")
+        assert door, "Door script missing from SimpleFPS fixture"
+        assert 'GetAttribute("hasKey")' in door, (
+            "Door no longer reads the canonical hasKey Attribute — the "
+            "key-check reader regressed (door can't tell the player holds "
+            "the key)."
+        )
+
+    def test_player_setsharedflag_writes_attr_and_fires_funnel(self) -> None:
+        player = self._sources().get("Player", "")
+        assert player, "Player script missing from SimpleFPS fixture"
+        # Writer half: the canonical Attribute mirror set on BOTH the
+        # Player and its Character (so a Character-scoped reader also sees
+        # it). One canonical writer, two replicating surfaces.
+        assert "_setSharedFlag" in player, (
+            "Player:_setSharedFlag funnel method removed — the canonical "
+            "shared-flag writer regressed."
+        )
+        assert "SetAttribute(flag" in player, (
+            "Player:_setSharedFlag no longer writes the shared flag as an "
+            "Attribute (plr/char SetAttribute) — writer regressed."
+        )
+        assert "Character" in player or "char" in player, (
+            "Player:_setSharedFlag no longer mirrors the flag onto the "
+            "Character — the Character-scoped read surface regressed."
+        )
+        # Funnel half: the authoritative server mirror via the autogen
+        # PlayerSetSharedFlag RemoteEvent.
+        assert "PlayerSetSharedFlag" in player, (
+            "Player:_setSharedFlag no longer references the "
+            "PlayerSetSharedFlag RemoteEvent — server funnel regressed."
+        )
+        assert "FireServer(flag" in player, (
+            "Player:_setSharedFlag no longer fires the shared-flag funnel "
+            "to the server (FireServer(flag, …)) — server replication "
+            "regressed."
+        )

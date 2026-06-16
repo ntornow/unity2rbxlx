@@ -598,13 +598,22 @@ _RE_USING_MIRROR = re.compile(
 # reporting and avoids accidentally splicing tokens across lines).
 # ---------------------------------------------------------------------------
 
-def _strip_cs_noise(src: str) -> str:
-    """Replace comments / string + char literals in ``src`` with spaces.
+def _strip_cs_noise(src: str, *, preserve_strings: bool = False) -> str:
+    """Replace comments (always) and string + char literals (unless
+    ``preserve_strings``) in ``src`` with spaces.
 
     Returns a same-length string (modulo trailing-NL invariants) so
     regex line/column reporting still maps roughly back to original
     source. Newlines are preserved verbatim so ``re.MULTILINE`` anchors
     line up with the original.
+
+    ``preserve_strings=True`` blanks ONLY comments — string + char
+    literals are emitted VERBATIM (``src[start:i]`` unchanged). Used by
+    the Animator-write parser (``animation_driver_analyzer``), whose
+    target param names live ONLY as string literals (e.g.
+    ``SetBool("open", …)``). Comment stripping is still wanted so a
+    ``// doorAnim.SetBool("open")`` comment can't match. The default
+    (``False``) preserves every existing caller's behavior (back-compat).
 
     Handles:
       - ``// line comments`` (terminated by newline).
@@ -674,8 +683,11 @@ def _strip_cs_noise(src: str) -> str:
                     i += 1
                     break
                 i += 1
-            for ch in src[start:i]:
-                out.append("\n" if ch == "\n" else " ")
+            if preserve_strings:
+                out.append(src[start:i])
+            else:
+                for ch in src[start:i]:
+                    out.append("\n" if ch == "\n" else " ")
             continue
         # Regular string or interpolated string: "..." or $"..."
         if c == "\"" or (c == "$" and nxt == "\""):
@@ -693,8 +705,11 @@ def _strip_cs_noise(src: str) -> str:
                     # Unterminated string: bail out at end-of-line.
                     break
                 i += 1
-            for sch in src[start:i]:
-                out.append("\n" if sch == "\n" else " ")
+            if preserve_strings:
+                out.append(src[start:i])
+            else:
+                for sch in src[start:i]:
+                    out.append("\n" if sch == "\n" else " ")
             continue
         # Char literal: '...' with `\` escapes.
         if c == "'":
@@ -711,8 +726,11 @@ def _strip_cs_noise(src: str) -> str:
                 if ch == "\n":
                     break
                 i += 1
-            for cch in src[start:i]:
-                out.append("\n" if cch == "\n" else " ")
+            if preserve_strings:
+                out.append(src[start:i])
+            else:
+                for cch in src[start:i]:
+                    out.append("\n" if cch == "\n" else " ")
             continue
         out.append(c)
         i += 1
@@ -1739,6 +1757,36 @@ def _classify_api_surface(source: str) -> str:
 # C# source loading
 # ---------------------------------------------------------------------------
 
+def _read_cs_text(
+    script_id: str, guid_index: GuidIndex | None,
+) -> str | None:
+    """Resolve ``script_id`` (a .cs file GUID) to its RAW on-disk text.
+
+    Returns ``None`` (no scrubbing applied) when:
+      - ``guid_index`` is ``None`` (tests, or pipelines without a
+        Unity project root),
+      - the script id isn't a real GUID known to the index,
+      - the resolved path isn't a .cs file,
+      - the file can't be read.
+
+    Shared read path for ``_load_cs_source`` and
+    ``_load_cs_source_preserving_strings`` (DP1) — one resolve/suffix/
+    read-error path, two scrub modes applied by the callers.
+    """
+    if guid_index is None or not script_id:
+        return None
+    try:
+        path: Path | None = guid_index.resolve(script_id)
+    except Exception:
+        return None
+    if path is None or path.suffix != ".cs":
+        return None
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
 def _load_cs_source(
     script_id: str, guid_index: GuidIndex | None,
 ) -> str:
@@ -1751,22 +1799,30 @@ def _load_cs_source(
       - the resolved path isn't a .cs file,
       - the file can't be read.
     """
-    if guid_index is None or not script_id:
-        return ""
-    try:
-        path: Path | None = guid_index.resolve(script_id)
-    except Exception:
-        return ""
-    if path is None or path.suffix != ".cs":
-        return ""
-    try:
-        raw = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    raw = _read_cs_text(script_id, guid_index)
+    if raw is None:
         return ""
     # Strip comments / string + char literals BEFORE returning so every
     # downstream regex pass sees only code tokens. Same-length output
     # keeps line/column anchors stable for re.MULTILINE.
     return _strip_cs_noise(raw)
+
+
+def _load_cs_source_preserving_strings(
+    script_id: str, guid_index: GuidIndex | None,
+) -> str:
+    """Like ``_load_cs_source`` but strips comments only (keeps string +
+    char literals VERBATIM) so the Animator-write parser
+    (``animation_driver_analyzer.extract_animator_param_writes``) can read
+    param names that live only as string literals (``SetBool("open", …)``).
+
+    Returns ``""`` on the same conditions as ``_load_cs_source``
+    (``None`` guid_index, unknown guid, non-.cs path, unreadable file).
+    """
+    raw = _read_cs_text(script_id, guid_index)
+    if raw is None:
+        return ""
+    return _strip_cs_noise(raw, preserve_strings=True)
 
 
 # ---------------------------------------------------------------------------
