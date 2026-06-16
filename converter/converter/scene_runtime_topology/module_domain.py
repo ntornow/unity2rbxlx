@@ -1035,16 +1035,29 @@ def _client_entry_seed_names(
     A script is a client ENTRY POINT (the seed of the client
     require-reachability closure) when ANY of:
       - its intrinsic class is ``LocalScript`` (a structural client
-        entry that auto-runs on the client), OR
+        entry that auto-runs on the client — definitively client by
+        type, so EXEMPT from the low_confidence gate), OR
       - its gated lifecycle role is ``character_attached`` or ``loader``
-        (both roles only fire for ``script_class in {Script, LocalScript}``
-        AND ``domain == "client"`` — the gate is applied where the role
-        is computed, ``lifecycle_roles.py``), OR
+        AND its inferred domain verdict is NOT low-confidence. The roles
+        only fire for ``script_class in {Script, LocalScript}`` AND
+        ``domain == "client"`` (the gate is applied where the role is
+        computed, ``lifecycle_roles.py``), but ``derive_module_lifecycle_role``
+        returns ``"loader"`` for a plain ``Script`` whenever the inferred
+        domain is ``client`` — and a zero-signal SERVER ``Script`` named
+        ``Bootstrap``/``Loader`` (``is_loader`` is a broad NAME regex) is
+        inferred ``client + low_confidence=True``. Without the
+        ``low_confidence is False`` gate such a row would seed and leak
+        its server-only require subtree into ReplicatedStorage, OR
       - its intrinsic class is ``Script`` AND its inferred domain is
         ``client`` AND that verdict is NOT low-confidence (the
         ``low_confidence is False`` clause keeps a zero-signal
         ``networking=none`` client default from seeding a server-only
         require subtree into the client closure).
+
+    Net rule: intrinsic ``LocalScript`` seeds unconditionally; otherwise
+    a script seeds only when ``low_confidence is False`` AND (role in
+    ``{loader, character_attached}`` OR (intrinsic ``Script`` AND
+    ``domain == "client"``)).
 
     Pure: reads only the intrinsic script class, the domain verdict +
     low_confidence flag, and the (already-gated) lifecycle role. Does
@@ -1065,10 +1078,15 @@ def _client_entry_seed_names(
         if cls == "LocalScript":
             seeds.add(script.name)
             continue
+        if low_confidence is not False:
+            # Every non-intrinsic-LocalScript arm requires a confident
+            # verdict — a low-confidence inference can mis-route a
+            # server-only subtree into the client closure.
+            continue
         if lifecycle_roles.get(sid) in ("character_attached", "loader"):
             seeds.add(script.name)
             continue
-        if cls == "Script" and domain == "client" and low_confidence is False:
+        if cls == "Script" and domain == "client":
             seeds.add(script.name)
     return seeds
 
@@ -1201,23 +1219,34 @@ def finalize_topology_containers(
 
     excluded: list[str] = []
 
+    def _stamp_base(script_id: str, module: SceneRuntimeModule) -> None:
+        # Prefer the sid-keyed script so a colliding ``class_name`` row
+        # (dropped by ``build_scripts_by_class_name``) still gets its
+        # container/module_path; fall back to the class-name join when
+        # the sid lookup misses (keeps non-colliding behavior identical).
+        script = script_by_sid.get(script_id)
+        if script is not None:
+            _stamp_container_and_path_from_script(module, script)
+        else:
+            _stamp_container_and_path(module, scripts_by_class)
+
     for script_id, module in modules.items():
         result = domain_results.get(script_id)
         if result is None:
             # No early inference for this row (shouldn't happen for a
             # legitimate caller, but be defensive).
-            _stamp_container_and_path(module, scripts_by_class)
+            _stamp_base(script_id, module)
             continue
 
         # Stamp domain + signals first.
         if not module.get("runtime_bearing"):
             module["domain"] = "helper"
-            _stamp_container_and_path(module, scripts_by_class)
+            _stamp_base(script_id, module)
             continue
 
         module["domain"] = result["domain"]
         module["domain_signals"] = result["signals"]
-        _stamp_container_and_path(module, scripts_by_class)
+        _stamp_base(script_id, module)
 
         if result["excluded"]:
             excluded.append(script_id)
@@ -2044,6 +2073,21 @@ def _stamp_container_and_path(
     dotted DataModel path the host runtime requires().
     """
     script = scripts_by_class.get(module.get("class_name", ""))
+    _stamp_container_and_path_from_script(module, script)
+
+
+def _stamp_container_and_path_from_script(
+    module: SceneRuntimeModule, script: RbxScript | None,
+) -> None:
+    """Stamp ``container`` / ``module_path`` from a directly-resolved
+    ``RbxScript`` (sid-aware path).
+
+    Carries the same body as the class-name-keyed
+    ``_stamp_container_and_path`` so a row whose ``class_name`` collides
+    with a sibling — and is therefore DROPPED by
+    ``build_scripts_by_class_name`` — still gets its container/module_path
+    when the caller can resolve the script by ``script_id``.
+    """
     if script is None:
         return
     container = script.parent_path or ""

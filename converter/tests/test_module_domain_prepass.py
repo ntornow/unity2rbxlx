@@ -331,6 +331,51 @@ class TestDeriveReachabilityRequirementsParity:
         )
         assert "g-srvmod" not in reqs
 
+    def test_low_confidence_loader_role_script_does_not_seed_server_subtree(
+        self,
+    ) -> None:
+        """Security regression (round 2, codex BLOCKING): a zero-signal
+        plain ``Script`` with a loader-NAME (``Bootstrap``) infers
+        ``domain==client + low_confidence==True``, and
+        ``derive_module_lifecycle_role`` returns role ``"loader"`` for it.
+        The lifecycle-role seed arm MUST gate on ``low_confidence is
+        False`` so this row does NOT seed — otherwise its server-only
+        require subtree (``ServerSecret``, which uses DataStoreService)
+        leaks into ReplicatedStorage.
+        """
+        modules = dict([
+            _mk_module("g-boot", "Bootstrap"),
+            _mk_module("g-secret", "ServerSecret"),
+        ])
+        artifact = _mk_artifact(modules)
+        scripts = [
+            # Bootstrap: a plain Script, no domain signal -> client +
+            # low_confidence. Its name trips the broad ``is_loader`` regex,
+            # so its lifecycle role is "loader".
+            _mk_script(
+                "Bootstrap", _require("ServerSecret"), script_type="Script",
+            ),
+            _mk_script(
+                "ServerSecret",
+                'game:GetService("DataStoreService")\nreturn {}',
+            ),
+        ]
+        domains = infer_module_domains(artifact, scripts)
+        assert domains["g-boot"]["domain"] == "client"
+        assert domains["g-boot"]["low_confidence"] is True
+        assert domains["g-secret"]["domain"] == "server"
+        reqs = derive_reachability_requirements(
+            artifact, scripts, domains,
+            require_edges_by_name=_edges(scripts),
+            script_by_sid=_by_sid(modules, scripts),
+            # The role arm would seed g-boot WITHOUT the low_confidence
+            # gate; pass the genuine "loader" role to exercise that arm.
+            lifecycle_roles={"g-boot": "loader"},
+        )
+        # The low-confidence loader must NOT seed: the server module gets
+        # NO reachability requirement and stays out of ReplicatedStorage.
+        assert "g-secret" not in reqs
+
     def test_server_domain_module_client_required_gets_rs_transitively(
         self,
     ) -> None:
@@ -381,13 +426,14 @@ class TestDeriveReachabilityRequirementsParity:
         assert reqs.get("g-srvdom") == REPLICATED_STORAGE
         assert reqs.get("g-deep") == "__excluded__"
 
-    def test_client_required_server_helper_not_a_seed_gets_rs(self) -> None:
-        """AC3 variant: a ModuleScript whose domain inference is server
-        but which is NOT itself a server-EXECUTION seed equivalent —
-        here only the client LocalScript seeds the closure and there is
-        no server Script seeding the helper, so the client-reached
-        server-domain helper + its deep dep both route to plain
-        ``REPLICATED_STORAGE`` (no both-sides conflict).
+    def test_client_required_low_conf_helper_not_a_seed_gets_rs(self) -> None:
+        """AC3 variant: a ModuleScript with NO domain signal — so it
+        infers client-default + low_confidence, NOT a server seed — that
+        is reached ONLY via the client LocalScript entry. Because no
+        server Script seeds it, the client-reached helper + its deep dep
+        both route to plain ``REPLICATED_STORAGE`` (no both-sides
+        conflict). (Despite the historical ``SrvHelper`` name this row
+        carries zero server signal; the name is incidental.)
         """
         modules = dict([
             _mk_module("g-entry", "LocalEntry2"),
@@ -407,6 +453,10 @@ class TestDeriveReachabilityRequirementsParity:
             _mk_script("Deep2", "return {}"),
         ]
         domains = infer_module_domains(artifact, scripts)
+        # Confirm the fixture is what the docstring claims: low-confidence
+        # client-default, not a server verdict.
+        assert domains["g-srvhelper"]["domain"] == "client"
+        assert domains["g-srvhelper"]["low_confidence"] is True
         reqs = derive_reachability_requirements(
             artifact, scripts, domains,
             require_edges_by_name=_edges(scripts),
@@ -580,6 +630,76 @@ class TestFinalizeTopologyContainersIdempotent:
         assert scripts[1].parent_path == REPLICATED_STORAGE
         # The non-reached colliding row stays put.
         assert scripts[2].parent_path == SERVER_STORAGE
+
+    def test_finalizer_excluded_collision_row_gets_container_and_path(
+        self,
+    ) -> None:
+        """Round 2, codex MAJOR: a class-name collision where BOTH a
+        client entry AND a server script require the SAME helper (UtilA)
+        -> the helper is reached from both sides -> ``__excluded__``. The
+        base container/module_path stamping must be sid-aware so the
+        colliding ``__excluded__`` row ends with ``domain=="excluded"``
+        AND a correct ``container``/``module_path`` (not empty). The
+        class-name join alone would have dropped the colliding row,
+        leaving it with no container/module_path.
+        """
+        modules: dict[str, dict[str, object]] = {
+            "g-entry": {
+                "stem": "Entry", "class_name": "Entry",
+                "runtime_bearing": True,
+            },
+            "g-srv": {
+                "stem": "Srv", "class_name": "Srv",
+                "runtime_bearing": True,
+            },
+            # UtilA / UtilB collide on class_name "Util" (distinct stems).
+            "g-util-a": {
+                "stem": "UtilA", "class_name": "Util",
+                "runtime_bearing": True,
+            },
+            "g-util-b": {
+                "stem": "UtilB", "class_name": "Util",
+                "runtime_bearing": True,
+            },
+        }
+        artifact = _mk_artifact(modules)
+        scripts = [
+            _mk_script(
+                "Entry", _require("UtilA"),
+                parent_path=STARTER_PLAYER_SCRIPTS,
+                script_type="LocalScript",
+            ),
+            # Server script (DataStoreService signal) ALSO requires UtilA
+            # -> both-sides reach -> UtilA becomes __excluded__.
+            _mk_script(
+                "Srv",
+                'game:GetService("DataStoreService")\n' + _require("UtilA"),
+                parent_path=SERVER_SCRIPT_SERVICE,
+                script_type="Script",
+            ),
+            _mk_script("UtilA", "return {}", parent_path=SERVER_STORAGE),
+            _mk_script("UtilB", "return {}", parent_path=SERVER_STORAGE),
+        ]
+        domains = infer_module_domains(artifact, scripts)
+        assert domains["g-srv"]["domain"] == "server"
+        by_sid = _by_sid(modules, scripts)
+        reqs = derive_reachability_requirements(
+            artifact, scripts, domains,
+            require_edges_by_name=_edges(scripts),
+            script_by_sid=by_sid,
+            lifecycle_roles={},
+        )
+        assert reqs.get("g-util-a") == "__excluded__"
+
+        finalize_topology_containers(
+            artifact, scripts, domains, reqs, script_by_sid=by_sid,
+        )
+        util_a = artifact["modules"]["g-util-a"]
+        assert util_a["domain"] == "excluded"
+        # The colliding __excluded__ row still gets its container +
+        # module_path (sid-aware base stamping), not empty.
+        assert util_a["container"] == SERVER_STORAGE
+        assert util_a["module_path"] == f"{SERVER_STORAGE}.UtilA"
 
 
 class TestNoParentPathInEarlyPrepass:
