@@ -346,10 +346,50 @@ class SceneRuntimeDisplacedInstance(TypedDict):
     inferred_domain: str
 
 
+class SceneRuntimeStaticChannel(TypedDict):
+    """One C#-derived ``static event`` lowered to a shared module-table field.
+
+    A C# ``public static event`` is a TYPE-level entity that must exist before
+    any instance ``Awake``. The converter lowers it to a BindableEvent stored on
+    the module table FIELD (``Player.AmmoUpdate``) that the producer fires and the
+    consumer reads. Because the producer's prefab-batch ``Awake`` can run AFTER a
+    consumer's scene-batch ``Awake``, the runtime pre-sets this field before any
+    ``Awake`` batch (``SceneRuntime:_ensureStaticEventChannels``) so the channel
+    instance is shared regardless of order. Every field here is derived from the
+    DETERMINISTIC C# ``static event`` declaration, never the AI-emitted Luau.
+
+    ``module_id``: the canonical script id (``.cs`` GUID) of the declaring class.
+    ``field_name``: the C# event member name = the Luau module-table field.
+    ``channel_name``: the BindableEvent name (same as ``field_name`` — the
+        converter's naming convention).
+    ``parent_path``: dotted DataModel path of the container the BindableEvent is
+        parented under (the declaring module's own container, e.g.
+        ``ReplicatedStorage`` for a client cross-script signal).
+    ``module_path``: dotted DataModel path the runtime ``require``s to reach the
+        module table whose field is set.
+    ``domain``: ``"client"`` | ``"server"`` — the channel is a same-domain
+        BindableEvent field on the shared VM; cross-domain signals route via
+        RemoteEvents and are NOT emitted here.
+    """
+
+    module_id: str
+    field_name: str
+    channel_name: str
+    parent_path: str
+    module_path: str
+    domain: str
+
+
 class SceneRuntimeArtifact(TypedDict, total=False):
     modules: dict[str, SceneRuntimeModule]
     scenes: dict[str, SceneRuntimeScene]
     prefabs: dict[str, SceneRuntimePrefab]
+    # C#-static-event channels the runtime pre-sets before any Awake batch so the
+    # producer + consumer share the BindableEvent field regardless of scene-vs-
+    # prefab Awake order. Populated by ``_subphase_inject_scene_runtime`` (generic
+    # mode, write_output) — AFTER storage-classify has stamped each module's final
+    # ``domain`` / ``container`` / ``module_path``. Same-domain only.
+    static_channels: list["SceneRuntimeStaticChannel"]
     # Operator-set ``script_id → "client" | "server"`` overrides. Read by
     # PR3b's domain classifier; PR1 just preserves whatever's there.
     domain_overrides: dict[str, str]
@@ -1590,6 +1630,64 @@ def _resolves_to_component(
         seen.add(current)
         current = base_by_class.get(current, "")
     return False
+
+
+def build_static_event_channels(
+    modules: dict[str, "SceneRuntimeModule | dict[str, object]"],
+    static_events_by_script_id: dict[str, list[str]],
+) -> list[SceneRuntimeStaticChannel]:
+    """Build the ``static_channels`` plan list from the deterministic C#
+    ``static event`` enumeration.
+
+    Pure function: for each script id that declares one or more C# static events
+    (``static_events_by_script_id``, surfaced by ``script_analyzer``), emit one
+    channel row per event member. Each channel pre-sets the module-table FIELD the
+    producer fires and the consumer reads, so the runtime can share the
+    BindableEvent instance before any ``Awake`` runs (regardless of scene-vs-
+    prefab order).
+
+    GATING (fail-closed, same-domain only):
+      * The module must be runtime-bearing and resolved to a concrete same-VM
+        domain (``client`` / ``server``) with a stamped ``module_path`` +
+        ``container``. A helper/excluded/unstamped module is SKIPPED — a static
+        field on an un-booted module has no consumer rendezvous here.
+      * ``parent_path`` = the module's own container (the BindableEvent lives
+        beside the module's ModuleScript). Cross-domain signals must route via
+        RemoteEvents (out of scope) — gating to a single resolved domain keeps the
+        pre-pass from masking a missing cross-domain bridge.
+
+    Deterministic over (modules, static_events_by_script_id): callable twice with
+    identical output (idempotent planning).
+    """
+    channels: list[SceneRuntimeStaticChannel] = []
+    for script_id in sorted(static_events_by_script_id):
+        events = static_events_by_script_id[script_id]
+        if not events:
+            continue
+        module = modules.get(script_id)
+        if not isinstance(module, dict):
+            continue
+        domain = module.get("domain")
+        if domain not in ("client", "server"):
+            continue
+        if not module.get("runtime_bearing"):
+            continue
+        module_path = module.get("module_path")
+        container = module.get("container")
+        if not isinstance(module_path, str) or not module_path:
+            continue
+        if not isinstance(container, str) or not container:
+            continue
+        for field_name in events:
+            channels.append({
+                "module_id": script_id,
+                "field_name": field_name,
+                "channel_name": field_name,
+                "parent_path": container,
+                "module_path": module_path,
+                "domain": domain,
+            })
+    return channels
 
 
 # ---------------------------------------------------------------------------

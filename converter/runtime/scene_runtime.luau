@@ -2786,6 +2786,63 @@ function SceneRuntime:_lifecycleOrderFor(entry)
 end
 
 -- ---------------------------------------------------------------------
+-- Static-event channel identity: pre-set module-table fields before Awake
+-- ---------------------------------------------------------------------
+
+-- For each planner ``static_channels`` entry on THIS side (domain matches the
+-- boot filter), require the declaring module and set ``mod[field_name]`` to a
+-- find-or-created BindableEvent named ``channel_name`` under ``parent_path`` —
+-- BEFORE any scene/prefab Awake batch. The AI's untouched inline
+-- ``Player.X = Player.X or (...)`` then short-circuits onto this instance, so the
+-- producer's ``:Fire`` and the consumer's ``if Player.X then ...:Connect`` resolve
+-- the SAME BindableEvent via the shared field regardless of Awake order.
+--
+-- Idempotent: ``findOrCreateChannel`` returns the existing instance on a name
+-- collision (no duplicate event); a re-set of an already-set field re-assigns the
+-- same instance (no duplicate connection). Same-domain only — the planner gates
+-- cross-domain signals out (they route via RemoteEvents).
+function SceneRuntime:_ensureStaticEventChannels(domainFilter)
+	local channels = self._plan.static_channels
+	if type(channels) ~= "table" then return end
+	local findOrCreateChannel = self._services.findOrCreateChannel
+	if type(findOrCreateChannel) ~= "function" then
+		-- No channel service wired (older entrypoint / harness without the
+		-- service): fail closed with a single diagnostic rather than silently
+		-- leaving consumers' Awake reads nil.
+		if #channels > 0 then
+			self._warn(
+				"[scene_runtime] static_channels present but no "
+				.. "findOrCreateChannel service; channel fields not pre-set")
+		end
+		return
+	end
+	for _, ch in ipairs(channels) do
+		-- Same-domain gate: a nil filter (harness) sets every channel; a
+		-- "client"/"server" filter sets only its side.
+		if (domainFilter == nil) or (ch.domain == domainFilter) then
+			local mod = self._services.resolveModule(ch.module_id, ch.module_path)
+			if type(mod) == "table" then
+				local event = findOrCreateChannel(ch.channel_name, ch.parent_path)
+				if event ~= nil then
+					mod[ch.field_name] = event
+				else
+					self._warn(string.format(
+						"[scene_runtime] static channel %q under %q could not "
+						.. "be created; consumer connects may be skipped",
+						tostring(ch.channel_name), tostring(ch.parent_path)))
+				end
+			else
+				self._warn(string.format(
+					"[scene_runtime] static channel module %q (path=%s) did not "
+					.. "resolve to a table; field %q not pre-set",
+					tostring(ch.module_id), tostring(ch.module_path),
+					tostring(ch.field_name)))
+			end
+		end
+	end
+end
+
+-- ---------------------------------------------------------------------
 -- Boot: read the plan, drive every scene's lifecycle
 -- ---------------------------------------------------------------------
 
@@ -2807,6 +2864,18 @@ function SceneRuntime:start(domainFilter)
 			end
 		end
 	end
+
+	-- Phase 0.5: pre-set C#-static-event channel FIELDS before ANY Awake batch.
+	-- A C# ``public static event`` lowers to a BindableEvent stored on the
+	-- module-table field the producer fires (``Player.AmmoUpdate``) and the
+	-- consumer reads. The producer's prefab-batch Awake can run AFTER a
+	-- consumer's scene-batch Awake (scene Awake at the per-scene loop below
+	-- precedes the prefab-placement Awake), so a consumer reading the field at
+	-- its Awake sees nil and skips its ``:Connect``. Setting the field here —
+	-- once, before any Awake — makes the producer's untouched
+	-- ``Player.X = Player.X or (...)`` short-circuit onto this same instance, so
+	-- producer + consumer share the channel regardless of Awake order.
+	self:_ensureStaticEventChannels(domainFilter)
 
 	local sceneOrder = {}
 	for sceneKey, _ in pairs(self._plan.scenes or {}) do

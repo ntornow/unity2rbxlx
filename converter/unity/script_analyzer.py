@@ -57,6 +57,26 @@ _RE_SERIALIZED_FIELD = re.compile(
     r"\[SerializeField\]\s*(?:private\s+)?(\w+)\s+(\w+)",
 )
 
+# C# ``static event`` declarations. A static event is a TYPE-level entity the
+# converter lowers to a module-table FIELD shared across every instance of the
+# class (the same cached require table). The member name — the LAST identifier
+# before the terminating ``;`` / ``=`` / ``{`` — is exactly the Luau field name
+# the producer assigns and the consumer reads (``Player.AmmoUpdate``), so this is
+# the DETERMINISTIC upstream signal the channel-identity fix anchors on. We match
+# ``[modifiers] static event <HandlerType[generic/qualified]> <Member>`` where the
+# ``static`` and ``event`` keywords co-occur (either order is legal C#); the
+# handler type is consumed non-greedily up to the member + a declaration
+# terminator so a qualified/generic handler (``EventHandler<Foo>``,
+# ``A.B.Handler``) still yields the bare member name. NEVER parse the emitted Luau.
+_RE_STATIC_EVENT = re.compile(
+    r"\bstatic\b"                  # the static modifier (anywhere in the modifier list)
+    r"(?:\s+(?:public|private|protected|internal|readonly|new|abstract))*"
+    r"\s+event\s+"                 # the event keyword
+    r"[\w<>\.,\s\[\]]+?"          # handler type (generic / qualified ok)
+    r"\b(\w+)\s*"                  # the event member name (captured)
+    r"(?:;|=|\{)",                 # declaration terminator
+)
+
 # GLOBAL scene-lookup generics whose type argument is NOT a dependency
 # edge at all: ``FindObjectOfType<T>()`` locates an ALREADY-EXISTING
 # instance of T somewhere in the scene. T's reachability/placement comes
@@ -114,6 +134,11 @@ class ScriptInfo:
     is_test_script: bool = False
     suggested_type: str = "Script"  # Script, LocalScript, ModuleScript
     referenced_types: list[str] = field(default_factory=list)  # Project types used
+    # ``public static event`` member names. Each is a TYPE-level event the
+    # converter lowers to a shared module-table FIELD (``Player.AmmoUpdate``);
+    # the member name IS the Luau field name. Deterministic upstream signal for
+    # the static-event channel-identity fix — never derived from the AI output.
+    static_events: list[str] = field(default_factory=list)
 
 
 def analyze_script(script_path: str | Path) -> ScriptInfo:
@@ -159,6 +184,17 @@ def analyze_script(script_path: str | Path) -> ScriptInfo:
     info.serialized_fields = [
         (m.group(1), m.group(2)) for m in _RE_SERIALIZED_FIELD.finditer(decommented)
     ]
+
+    # Extract ``public static event`` member names (declaration order, deduped).
+    # These are the deterministic upstream signal for the static-event channel-
+    # identity fix: the member name is the Luau module-table field the converter
+    # lowers the event to.
+    _seen_events: set[str] = set()
+    for m in _RE_STATIC_EVENT.finditer(decommented):
+        name = m.group(1)
+        if name and name not in _seen_events:
+            _seen_events.add(name)
+            info.static_events.append(name)
 
     # Extract type references (field types, method parameter types, etc.)
     # Matches PascalCase identifiers used as types in declarations

@@ -638,6 +638,11 @@ def _plan_to_luau(plan: dict) -> str:
 _PLAN_KEYS_FOR_HOST: tuple[str, ...] = (
     "modules", "scenes", "prefabs", "domain_overrides",
     "scriptable_objects", "scene_prefab_placements",
+    # Slice 1.1: the C#-static-event channels the runtime pre-sets before any
+    # Awake batch (``SceneRuntime:_ensureStaticEventChannels``). Without this in
+    # the host allowlist the embedded plan would elide the field and the channel
+    # pre-set would have nothing to set -> the (d) ordering bug resurfaces.
+    "static_channels",
     # Phase 1 (relation #8): the scale-faithful base gravity target (studs/s²),
     # stashed by ``plan_scene_runtime``. The client clone-site gravity hook reads
     # it off the embedded plan; without it here the filter would silently elide
@@ -824,6 +829,36 @@ local function resolveModule(scriptId, modulePath)
     return nil
 end
 
+-- Static-event channel identity (design-phase1.md §2A): find-or-create a
+-- BindableEvent named ``channelName`` under the dot-joined ``parentPath``
+-- container, so the host can pre-set the producer/consumer's shared module
+-- field before any Awake. ``parentPath`` is a DataModel container path
+-- (``"ReplicatedStorage"`` / ``"ServerScriptService"`` / ...); walk it the same
+-- way ``resolveModule`` walks a module path. Idempotent: an existing child of
+-- the right name+class is returned as-is (no duplicate event).
+local function findOrCreateChannel(channelName, parentPath)
+    if type(channelName) ~= "string" or channelName == "" then return nil end
+    if type(parentPath) ~= "string" or parentPath == "" then return nil end
+    local parts = string.split(parentPath, ".")
+    local node = game
+    for _, part in ipairs(parts) do
+        node = node:FindFirstChild(part)
+        if not node then return nil end
+    end
+    -- Find an EXISTING BindableEvent of this name (idempotent across re-starts).
+    -- A plain ``FindFirstChild`` could hit a same-named WRONG-class sibling and
+    -- then create a duplicate on every call; scan children for the right class.
+    for _, child in node:GetChildren() do
+        if child.Name == channelName and child:IsA("BindableEvent") then
+            return child
+        end
+    end
+    local event = Instance.new("BindableEvent")
+    event.Name = channelName
+    event.Parent = node
+    return event
+end
+
 -- SceneRuntimePlan carries ``plan.prefabs[prefab_id].template_name``
 -- (R2-P1.2 resolution): the bare template name prefab_packages emitted
 -- under ReplicatedStorage.Templates. Look up via that map so the
@@ -862,6 +897,7 @@ local services = {
     -- than calling the ``typeof`` builtin directly so the predicate is testable).
     isCFrame = function(v) return typeof(v) == "CFrame" end,
     resolveModule = resolveModule,
+    findOrCreateChannel = findOrCreateChannel,
     workspaceFind = workspaceFind,
     awaitUiHost = awaitUiHost,
     findFirstChildWhichIsA = function(inst, class)
@@ -994,6 +1030,32 @@ local function resolveModule(scriptId, modulePath)
     return nil
 end
 
+-- See SceneRuntimeClient for the rationale: find-or-create a BindableEvent
+-- named ``channelName`` under the dot-joined ``parentPath`` so the host can
+-- pre-set the producer/consumer's shared module field before any Awake.
+local function findOrCreateChannel(channelName, parentPath)
+    if type(channelName) ~= "string" or channelName == "" then return nil end
+    if type(parentPath) ~= "string" or parentPath == "" then return nil end
+    local parts = string.split(parentPath, ".")
+    local node = game
+    for _, part in ipairs(parts) do
+        node = node:FindFirstChild(part)
+        if not node then return nil end
+    end
+    -- Find an EXISTING BindableEvent of this name (idempotent across re-starts).
+    -- A plain ``FindFirstChild`` could hit a same-named WRONG-class sibling and
+    -- then create a duplicate on every call; scan children for the right class.
+    for _, child in node:GetChildren() do
+        if child.Name == channelName and child:IsA("BindableEvent") then
+            return child
+        end
+    end
+    local event = Instance.new("BindableEvent")
+    event.Name = channelName
+    event.Parent = node
+    return event
+end
+
 -- See SceneRuntimeClient for the rationale: prefab templates live
 -- under ReplicatedStorage.Templates keyed by bare prefab name; the
 -- plan's ``template_name`` field bridges the stable prefab_id.
@@ -1017,6 +1079,7 @@ local services = {
     -- helpers are injected here (the client table carries them).
     isClient = false,
     resolveModule = resolveModule,
+    findOrCreateChannel = findOrCreateChannel,
     workspaceFind = workspaceFind,
     findFirstChildWhichIsA = function(inst, class)
         -- ``GetComponent("Rigidbody")`` etc. should hit a built-in

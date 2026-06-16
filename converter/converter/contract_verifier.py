@@ -71,9 +71,16 @@ class ContractVerifierResult:
 def verify_contract(
     topology: TopologyArtifact,
     scripts: list[RbxScript],
+    static_events_by_script: dict[str, list[str]] | None = None,
 ) -> ContractVerifierResult:
     """Run the shadow-mode contract checks. Emits a smoke violation when
-    ``topology`` carries no ``modules`` block (the artifact never reached us)."""
+    ``topology`` carries no ``modules`` block (the artifact never reached us).
+
+    ``static_events_by_script`` maps an emitted script NAME (== the Luau module
+    table prefix) to the C# ``static event`` member names that module declares —
+    the deterministic upstream signal for the rendezvous check. Default None /
+    empty means "no static-event channels to verify" (the check abstains, no rows).
+    """
     violations: list[ContractViolation] = []
 
     if not topology.get("modules"):
@@ -98,7 +105,129 @@ def verify_contract(
     # surviving ordinal it might leave behind is the downstream symptom.
     violations.extend(_check_rig_binding_present(topology, scripts))
     violations.extend(_check_surviving_child_ordinal(topology, scripts))
+    violations.extend(
+        _check_static_event_rendezvous(scripts, static_events_by_script or {})
+    )
     return ContractVerifierResult(violations=violations)
+
+
+# ---------------------------------------------------------------------------
+# Check E — static-event channel rendezvous (fail-closed, design-phase1.md §2A)
+# ---------------------------------------------------------------------------
+#
+# The runtime pre-set (``SceneRuntime:_ensureStaticEventChannels``) only wires a
+# C# static-event channel if the AI emitted the CANONICAL ``<Module>.<Field>``
+# rendezvous. The runtime pre-set is load-bearing ONLY for the lazy-init guard
+# shape ``<Module>.<Field> = <Module>.<Field> or (...)``: that ``or`` SHORT-
+# CIRCUITS onto the pre-set instance, so producer + consumer share it regardless
+# of Awake order. Empirically (real LLM cache) the producer emission VARIES — the
+# create-expr after ``or`` is an IIFE / ``ensureEvent("X")`` / ``self:_makeEvent``
+# / etc. — but the LOAD-BEARING invariant is the ``X = X or`` guard, NOT the
+# create-expr shape.
+#
+# UNSAFE shapes the verifier must FAIL CLOSED on (each can defeat the field pre-set
+# — confirmed against the cache + a dual-voice adversarial pass):
+#   * UNCONDITIONAL reassignment ``X = Instance.new(...)`` / ``X = ensureEvent(...)``
+#     with NO ``or`` guard — overwrites the pre-set instance with a fresh one,
+#     disconnecting consumers already bound to the pre-set channel (safe ONLY if
+#     the create-expr happens to re-find the pre-set instance, which the verifier
+#     can't prove — so fail closed).
+#   * a LOCAL-HELPER producer (``self:_playerEvent("X")``) that NEVER assigns the
+#     field at all — the pre-set is dead.
+# The verifier therefore requires (i) a lazy-init ``X = X or`` guarded assignment
+# AND (ii) a real field read (``.Event`` / ``:Connect`` / ``:Fire`` / ``if X then``)
+# and records an ``static_event_unconverted`` warning otherwise (fail-closed: a
+# visible, recorded diagnostic, never a silent "assume repaired" abstain).
+#
+# Keyed on the DETERMINISTIC C# static-event list (``static_events_by_script``),
+# NOT a fingerprint of the AI output — so it can't silently miss a channel the AI
+# emitted in a shape the scan didn't anticipate.
+
+# String-literal stripping (in ADDITION to comments): the rendezvous scan must run
+# over CODE only. A string ``"Player.AmmoUpdate = ensureEvent(...)"`` is prose, not
+# a real assignment — leaving it in lets a doc-string / log line spuriously satisfy
+# the rendezvous (an adversarial false-NEGATIVE bypass). Blank to a space to keep
+# token boundaries. Long-bracket strings (``[[...]]`` / ``[=[...]=]``) are stripped
+# too. (Comments are stripped first by ``_strip_luau_comments``.)
+_RE_LUAU_STRINGS = re.compile(
+    r'"(?:\\.|[^"\\])*"'        # double-quoted
+    r"|'(?:\\.|[^'\\])*'"       # single-quoted
+    r"|\[(=*)\[.*?\]\1\]",      # long-bracket string
+    re.DOTALL,
+)
+
+
+def _strip_luau_code_only(source: str) -> str:
+    """Comments AND string literals removed, so the rendezvous scan sees only
+    real Luau code (a field reference inside a string/comment is prose)."""
+    return _RE_LUAU_STRINGS.sub(" ", _strip_luau_comments(source))
+
+
+def _check_static_event_rendezvous(
+    scripts: list[RbxScript],
+    static_events_by_script: dict[str, list[str]],
+) -> list[ContractViolation]:
+    """For each C#-declared static event ``<Module>.<Field>``, confirm the emitted
+    Luau across ALL scripts carries the load-bearing rendezvous: a lazy-init
+    GUARDED producer assignment ``<Module>.<Field> = <Module>.<Field> or ...`` AND
+    a real field read. A missing/unguarded assignment OR a missing read records a
+    fail-closed ``static_event_unconverted`` warning."""
+    if not static_events_by_script:
+        return []
+
+    # Concatenate every emitted script's CODE (comments + strings stripped) once —
+    # the producer (declaring module) and the consumer (a different module) can
+    # live in separate scripts, so the rendezvous is a project-wide property.
+    code_blobs: list[str] = []
+    for script in scripts:
+        src = script.source or ""
+        if src:
+            code_blobs.append(_strip_luau_code_only(src))
+    code = "\n".join(code_blobs)
+
+    violations: list[ContractViolation] = []
+    for module_name in sorted(static_events_by_script):
+        for field_name in static_events_by_script[module_name]:
+            ref = f"{module_name}.{field_name}"
+            ref_re = re.escape(ref)
+            # LOAD-BEARING producer shape: the lazy-init GUARD
+            # ``Module.Field = Module.Field or ...``. Only this guarantees the
+            # field short-circuits onto the runtime pre-set instance. The ``=``
+            # must not be a comparison (``==`` / ``~=`` / ``>=`` / ``<=``).
+            has_guarded_assignment = re.search(
+                rf"(?<![=~<>]){ref_re}\s*=(?!=)\s*{ref_re}\s+or\b", code,
+            ) is not None
+            # Read = a TRUE rendezvous use of the field: ``.Event`` / ``:Connect``
+            # / ``:Fire`` (subscribe/publish), or an ``if Module.Field then``
+            # guard. Deliberately EXCLUDES the bare ``Module.Field or`` lazy-init
+            # idiom (that RHS self-reference is part of the producer assignment).
+            has_read = re.search(
+                rf"{ref_re}\s*(?:\.Event|:Connect|:Fire|\s+then\b)",
+                code,
+            ) is not None
+            if has_guarded_assignment and has_read:
+                continue
+            missing = []
+            if not has_guarded_assignment:
+                missing.append("lazy-init guarded producer assignment "
+                               "(`X = X or ...`)")
+            if not has_read:
+                missing.append("consumer/producer field read")
+            violations.append(
+                ContractViolation(
+                    check="static_event_unconverted",
+                    severity="warning",
+                    script=module_name,
+                    detail=(
+                        f"C# static event {ref!r} did not lower to the canonical "
+                        f"module-field rendezvous (missing: {', '.join(missing)}). "
+                        f"The runtime channel pre-set cannot wire this channel — "
+                        f"producer + consumer will not share the BindableEvent."
+                    ),
+                    identity=f"static_event_unconverted:{ref}",
+                )
+            )
+    return violations
 
 
 # ---------------------------------------------------------------------------

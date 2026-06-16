@@ -4938,6 +4938,62 @@ script.Disabled = true
             plan_path.name,
         )
 
+    def _static_events_by_emitted_name(
+        self, scene_runtime: dict[str, object],
+    ) -> dict[str, list[str]]:
+        """Map each runtime-bearing module's EMITTED script name (the Luau module-
+        table prefix, e.g. ``Player`` in ``Player.AmmoUpdate``) to the C# ``static
+        event`` members it declares.
+
+        Deterministic upstream signal for the rendezvous verifier: enumerate the
+        C# ``static event`` declarations off the ``.cs`` source via the GUID, then
+        key by the module's join name (``module_path`` tail == ``RbxScript.name``,
+        else ``stem``) so the verifier can scan the emitted Luau for
+        ``<name>.<field>``. NEVER reads the AI output to decide WHICH channels
+        should exist.
+        """
+        from unity.script_analyzer import analyze_script
+
+        modules_obj = scene_runtime.get("modules")
+        if not isinstance(modules_obj, dict):
+            return {}
+        guid_index = getattr(self.state, "guid_index", None)
+        if guid_index is None:
+            return {}
+        result: dict[str, list[str]] = {}
+        for script_id, module in modules_obj.items():
+            if not isinstance(module, dict):
+                continue
+            # Apply the SAME same-domain gate as ``build_static_event_channels``
+            # so the verifier only demands a rendezvous for channels the runtime
+            # actually pre-sets. A helper/excluded/cross-domain/unstamped or
+            # non-runtime-bearing module gets NO channel, so flagging its static
+            # events would be spurious noise (dual-voice finding).
+            if module.get("domain") not in ("client", "server"):
+                continue
+            if not module.get("runtime_bearing"):
+                continue
+            module_path = module.get("module_path")
+            if not isinstance(module_path, str) or not module_path:
+                continue
+            cs_path = guid_index.resolve(script_id)
+            if cs_path is None or cs_path.suffix != ".cs":
+                continue
+            events = analyze_script(cs_path).static_events
+            if not events:
+                continue
+            name = module_path.rsplit(".", 1)[-1]
+            # Last-write-wins on a name collision would drop a channel; merge so
+            # two modules sharing an emitted name keep both event sets.
+            if name in result:
+                merged = result[name]
+                for ev in events:
+                    if ev not in merged:
+                        merged.append(ev)
+            else:
+                result[name] = list(events)
+        return result
+
     def _run_contract_verifier(self, scene_runtime: dict[str, object]) -> None:
         """Run the shadow-mode contract verifier and store the current run's
         violations on ``ctx.scene_runtime``.
@@ -4961,7 +5017,10 @@ script.Disabled = true
 
         topology = cast("TopologyArtifact", scene_runtime.get("topology", {}))
         scripts = list(self.state.rbx_place.scripts or [])
-        result = contract_verifier.verify_contract(topology, scripts)
+        static_events_by_script = self._static_events_by_emitted_name(scene_runtime)
+        result = contract_verifier.verify_contract(
+            topology, scripts, static_events_by_script,
+        )
 
         # REPLACE the rows (not append): ``ctx.scene_runtime`` persists + reloads
         # across a resume (conversion_context.json), so an append-only stash
@@ -6576,6 +6635,7 @@ script.Disabled = true
         # happen in-place on ``scene_runtime`` so the embedded plan
         # ModuleScript reflects the final shape.
         self._build_scriptable_object_module_map(scene_runtime)
+        self._build_static_event_channels(scene_runtime)
         self._rewrite_scene_runtime_asset_refs(scene_runtime)
 
         _replace_or_add(generate_scene_runtime_plan_module(
@@ -6682,6 +6742,54 @@ script.Disabled = true
             log.info(
                 "[write_output] scene-runtime generic: emitted %d "
                 "scriptable_object refs in plan map", len(so_map),
+            )
+
+    def _build_static_event_channels(
+        self, scene_runtime: dict[str, object],
+    ) -> None:
+        """Build ``scene_runtime.static_channels`` — the C#-static-event channels
+        the host runtime pre-sets before any ``Awake`` batch so a producer +
+        consumer share the same BindableEvent field regardless of scene-vs-prefab
+        Awake order (the (d) ordering bug, design-phase1.md §2A).
+
+        Source of truth: the DETERMINISTIC C# ``static event`` enumeration
+        (``script_analyzer.analyze_script(...).static_events``) keyed by the same
+        canonical script id the module rows use (the ``.cs`` GUID). NEVER the
+        AI-emitted Luau. Module ``domain`` / ``container`` / ``module_path`` are
+        read off the now-final module rows (storage-classify already ran), so this
+        must run in write_output, not the planner phase.
+
+        Idempotent: rebuilds the list every run from the same deterministic inputs.
+        """
+        from unity.script_analyzer import analyze_script
+        from converter.scene_runtime_planner import build_static_event_channels
+
+        modules_obj = scene_runtime.get("modules")
+        if not isinstance(modules_obj, dict):
+            return
+        guid_index = getattr(self.state, "guid_index", None)
+        if guid_index is None:
+            return
+
+        # Enumerate C# static events for every module that resolves to a .cs path.
+        static_events_by_script_id: dict[str, list[str]] = {}
+        for script_id in modules_obj:
+            cs_path = guid_index.resolve(script_id)
+            if cs_path is None or cs_path.suffix != ".cs":
+                continue
+            events = analyze_script(cs_path).static_events
+            if events:
+                static_events_by_script_id[script_id] = events
+
+        channels = build_static_event_channels(
+            modules_obj, static_events_by_script_id,
+        )
+        scene_runtime["static_channels"] = channels
+        if channels:
+            log.info(
+                "[write_output] scene-runtime generic: emitted %d "
+                "static-event channel(s) across %d module(s)",
+                len(channels), len(static_events_by_script_id),
             )
 
     def _rewrite_scene_runtime_asset_refs(

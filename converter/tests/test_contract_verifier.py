@@ -822,3 +822,149 @@ class TestFailClosedHookPromotion:
             "[contract-verifier:cross_domain_attribute]" in e
             for e in pipeline.ctx.errors
         )
+
+
+# ---------------------------------------------------------------------------
+# Check E — static-event channel rendezvous (Slice 1.1, criterion 7).
+# Keyed on the DETERMINISTIC C# static-event list, NOT an AI-output fingerprint.
+# A green result proves the check FIRES on a non-canonical producer, not that it
+# happened to match nothing.
+# ---------------------------------------------------------------------------
+
+
+def _scripts(*pairs: tuple[str, str]) -> list[RbxScript]:
+    return [
+        RbxScript(name=n, source=s, script_type="ModuleScript",
+                  parent_path="ReplicatedStorage")
+        for n, s in pairs
+    ]
+
+
+class TestStaticEventRendezvous:
+
+    def test_abstains_when_no_static_events(self):
+        scripts = _scripts(("Player", "local x = 1"))
+        result = verify_contract({"modules": {"a": {}}}, scripts, None)
+        assert not [v for v in result.violations
+                    if v.check == "static_event_unconverted"]
+        result2 = verify_contract({"modules": {"a": {}}}, scripts, {})
+        assert not [v for v in result2.violations
+                    if v.check == "static_event_unconverted"]
+
+    def test_canonical_lazy_init_guard_passes(self):
+        # The LOAD-BEARING shape: ``X = X or (...)`` (the ``or`` short-circuits
+        # onto the runtime pre-set instance). Covers the real cache create-exprs
+        # after the guard: IIFE and a find-or-create helper.
+        for producer in (
+            'Player.AmmoUpdate = Player.AmmoUpdate or '
+            '(function() local b = Instance.new("BindableEvent"); return b end)()',
+            'Player.AmmoUpdate = Player.AmmoUpdate or ensureEvent("AmmoUpdate")',
+        ):
+            scripts = _scripts(
+                ("Player", producer + "\nif Player.AmmoUpdate then "
+                 "Player.AmmoUpdate:Fire(self.curAmmo) end"),
+                ("HudControl", "if Player.AmmoUpdate then "
+                 "Player.AmmoUpdate.Event:Connect(f) end"),
+            )
+            result = verify_contract(
+                {"modules": {}}, scripts, {"Player": ["AmmoUpdate"]},
+            )
+            fired = [v for v in result.violations
+                     if v.check == "static_event_unconverted"]
+            assert not fired, f"guarded shape flagged: {producer!r} -> {fired}"
+
+    def test_unconditional_reassignment_fires_failclosed(self):
+        # ``X = ensureEvent("X")`` with NO ``or`` guard can OVERWRITE the runtime
+        # pre-set instance with a fresh one (dual-voice adversarial finding) —
+        # the verifier can't prove the create-expr re-finds the pre-set instance,
+        # so it must FAIL CLOSED rather than bless an overwrite.
+        scripts = _scripts(
+            ("Player", 'Player.AmmoUpdate = ensureEvent("AmmoUpdate")\n'
+             "if Player.AmmoUpdate then Player.AmmoUpdate:Fire(x) end"),
+        )
+        result = verify_contract(
+            {"modules": {}}, scripts, {"Player": ["AmmoUpdate"]},
+        )
+        fired = [v for v in result.violations
+                 if v.check == "static_event_unconverted"]
+        assert len(fired) == 1, "unconditional reassignment must fail closed"
+        assert "lazy-init guarded producer assignment" in fired[0].detail
+
+    def test_string_literal_rendezvous_does_not_bypass(self):
+        # Adversarial false-negative: the rendezvous tokens appearing only INSIDE
+        # string literals must NOT satisfy the check (strings are stripped).
+        scripts = _scripts(
+            ("Player",
+             'local doc = "Player.AmmoUpdate = Player.AmmoUpdate or x"\n'
+             'local log = "Player.AmmoUpdate:Connect stuff"'),
+        )
+        result = verify_contract(
+            {"modules": {}}, scripts, {"Player": ["AmmoUpdate"]},
+        )
+        fired = [v for v in result.violations
+                 if v.check == "static_event_unconverted"]
+        assert len(fired) == 1, "string-literal tokens must not bypass the check"
+
+    def test_noncanonical_local_helper_producer_fires_failclosed(self):
+        # The ``self:_playerEvent("AmmoUpdate")`` local-helper shape NEVER
+        # assigns ``Player.AmmoUpdate`` — the runtime pre-set is dead. The
+        # verifier MUST record an unconverted-channel diagnostic (fail-closed),
+        # not silently treat it as repaired.
+        scripts = _scripts(
+            ("Player", 'self:_playerEvent("AmmoUpdate").Event:Connect('
+             'function() end)'),
+        )
+        result = verify_contract(
+            {"modules": {}}, scripts, {"Player": ["AmmoUpdate"]},
+        )
+        fired = [v for v in result.violations
+                 if v.check == "static_event_unconverted"]
+        assert len(fired) == 1, fired
+        assert fired[0].severity == "warning"
+        assert fired[0].identity == "static_event_unconverted:Player.AmmoUpdate"
+        assert "lazy-init guarded producer assignment" in fired[0].detail
+
+    def test_missing_read_also_fires(self):
+        # Guarded assignment present but no read anywhere -> still non-canonical
+        # (no consumer rendezvous), fail closed.
+        scripts = _scripts(
+            ("Player", "Player.AmmoUpdate = Player.AmmoUpdate or makeEvent()"),
+        )
+        result = verify_contract(
+            {"modules": {}}, scripts, {"Player": ["AmmoUpdate"]},
+        )
+        fired = [v for v in result.violations
+                 if v.check == "static_event_unconverted"]
+        assert len(fired) == 1
+        assert "consumer/producer field read" in fired[0].detail
+
+    def test_lazy_init_self_or_is_not_a_consumer_read(self):
+        # ``Player.AmmoUpdate = Player.AmmoUpdate or makeEvent()`` is a producer
+        # assignment whose RHS self-reference is the lazy-init idiom, NOT a
+        # consumer rendezvous. With no real :Connect/:Fire/.Event/``then`` use,
+        # the channel has no subscriber -> fail closed.
+        scripts = _scripts(
+            ("Player", "Player.AmmoUpdate = Player.AmmoUpdate or makeEvent()"),
+        )
+        result = verify_contract(
+            {"modules": {}}, scripts, {"Player": ["AmmoUpdate"]},
+        )
+        fired = [v for v in result.violations
+                 if v.check == "static_event_unconverted"]
+        assert len(fired) == 1, "self-or must not satisfy the read requirement"
+        assert "consumer/producer field read" in fired[0].detail
+
+    def test_comparison_not_mistaken_for_assignment(self):
+        # ``if Player.AmmoUpdate == x`` is a comparison, not the producer
+        # assignment — must NOT satisfy the assignment requirement.
+        scripts = _scripts(
+            ("Player", "if Player.AmmoUpdate == nil then return end\n"
+             "Player.AmmoUpdate.Event:Connect(f)"),
+        )
+        result = verify_contract(
+            {"modules": {}}, scripts, {"Player": ["AmmoUpdate"]},
+        )
+        fired = [v for v in result.violations
+                 if v.check == "static_event_unconverted"]
+        assert len(fired) == 1, "comparison must not count as assignment"
+        assert "lazy-init guarded producer assignment" in fired[0].detail

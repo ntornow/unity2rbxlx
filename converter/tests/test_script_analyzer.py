@@ -216,3 +216,92 @@ class TestClassNameNotMatchedInComments:
             "public class Greeter\n{\n}\n",
         )
         assert info.class_name == "Greeter"
+
+
+class TestStaticEventEnumeration:
+    """Slice 1.1: ``analyze_script`` surfaces ``public static event`` member
+    names — the deterministic upstream signal for the static-event channel-
+    identity fix. The member name IS the Luau module-table field the converter
+    lowers the event to. NEVER derived from the AI Luau output.
+    """
+
+    def _info(self, tmp_path: Path, name: str, body: str):
+        cs = tmp_path / f"{name}.cs"
+        cs.write_text(body)
+        return analyze_script(cs)
+
+    def test_simplefps_player_four_static_events(self, tmp_path: Path):
+        info = self._info(
+            tmp_path, "Player",
+            "public class Player : MonoBehaviour\n{\n"
+            "    public delegate void HealthUpdateHandler(int curHealth);\n"
+            "    public static event HealthUpdateHandler HealthUpdate;\n"
+            "    public delegate void AmmoUpdateHandler(int curAmmo);\n"
+            "    public static event AmmoUpdateHandler AmmoUpdate;\n"
+            "    public delegate void ItemUpdateHandler(string itemName);\n"
+            "    public static event ItemUpdateHandler ItemUpdate;\n"
+            "    public delegate void PauseHandler(bool pause);\n"
+            "    public static event PauseHandler PauseEvent;\n"
+            "}\n",
+        )
+        assert info.static_events == [
+            "HealthUpdate", "AmmoUpdate", "ItemUpdate", "PauseEvent",
+        ]
+
+    def test_instance_event_excluded(self, tmp_path: Path):
+        # Only STATIC events are type-level shared fields; an instance event
+        # is per-object and must NOT surface.
+        info = self._info(
+            tmp_path, "A",
+            "public class A { public event Handler OnThing; }\n",
+        )
+        assert info.static_events == []
+
+    def test_static_modifier_either_order(self, tmp_path: Path):
+        for src in (
+            "public class A { public static event H Foo; }",
+            "public class A { static public event H Foo; }",
+        ):
+            info = self._info(tmp_path, "A", src)
+            assert info.static_events == ["Foo"], src
+
+    def test_generic_and_qualified_handler_types(self, tmp_path: Path):
+        info = self._info(
+            tmp_path, "A",
+            "public class A {\n"
+            "  public static event EventHandler<int> Generic;\n"
+            "  public static event System.Action Qualified;\n"
+            "}\n",
+        )
+        assert info.static_events == ["Generic", "Qualified"]
+
+    def test_event_with_initializer(self, tmp_path: Path):
+        info = self._info(
+            tmp_path, "A",
+            "public class A { public static event H Init = null; }",
+        )
+        assert info.static_events == ["Init"]
+
+    def test_comment_and_string_decoys_ignored(self, tmp_path: Path):
+        info = self._info(
+            tmp_path, "A",
+            "public class A {\n"
+            "  /* public static event H Fake; */\n"
+            '  string s = "public static event H AlsoFake;";\n'
+            "  public static event H Real;\n"
+            "}\n",
+        )
+        assert info.static_events == ["Real"]
+
+    def test_static_field_is_not_an_event(self, tmp_path: Path):
+        info = self._info(
+            tmp_path, "A",
+            "public class A { public static int count; }",
+        )
+        assert info.static_events == []
+
+    def test_no_static_events_default_empty(self, tmp_path: Path):
+        info = self._info(
+            tmp_path, "A", "public class A : MonoBehaviour { }",
+        )
+        assert info.static_events == []

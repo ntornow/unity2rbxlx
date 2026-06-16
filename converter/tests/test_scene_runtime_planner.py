@@ -1472,3 +1472,94 @@ class TestHasCharacterController:
         mods = artifact["modules"]
         assert mods[placed_guid]["has_character_controller"] is True
         assert mods[unplaced_guid]["has_character_controller"] is False
+
+
+# ---------------------------------------------------------------------------
+# Slice 1.1 — build_static_event_channels (criteria 4/5/6).
+# Pure builder over (modules, C#-static-event map). Generic: no game-specific
+# literals — the channel set is the C# enumeration, gated to same-domain
+# runtime-bearing modules with a stamped module_path/container.
+# ---------------------------------------------------------------------------
+
+from converter.scene_runtime_planner import build_static_event_channels  # noqa: E402
+
+
+class TestBuildStaticEventChannels:
+
+    def _modules(self) -> dict[str, dict[str, object]]:
+        return {
+            "guidPlayer": {
+                "runtime_bearing": True, "domain": "client",
+                "container": "ReplicatedStorage",
+                "module_path": "ReplicatedStorage.Player",
+            },
+            "guidServer": {
+                "runtime_bearing": True, "domain": "server",
+                "container": "ServerScriptService",
+                "module_path": "ServerScriptService.GameManager",
+            },
+            "guidHelper": {  # excluded: helper domain
+                "runtime_bearing": True, "domain": "helper",
+                "container": "ReplicatedStorage",
+                "module_path": "ReplicatedStorage.Helper",
+            },
+            "guidExcluded": {  # excluded: domain=excluded
+                "runtime_bearing": True, "domain": "excluded",
+                "container": "ServerStorage",
+                "module_path": "ServerStorage.Dead",
+            },
+            "guidUnstamped": {  # excluded: no module_path yet
+                "runtime_bearing": True, "domain": "client",
+            },
+            "guidNotBearing": {  # excluded: not runtime-bearing
+                "runtime_bearing": False, "domain": "client",
+                "container": "ReplicatedStorage",
+                "module_path": "ReplicatedStorage.Lib",
+            },
+        }
+
+    def test_emits_one_row_per_event_same_domain_only(self):
+        se = {
+            "guidPlayer": ["AmmoUpdate", "HealthUpdate"],
+            "guidServer": ["Tick"],
+            "guidHelper": ["HelperEv"],     # gated out (helper)
+            "guidExcluded": ["DeadEv"],      # gated out (excluded)
+            "guidUnstamped": ["NoPath"],     # gated out (no module_path)
+            "guidNotBearing": ["LibEv"],     # gated out (not runtime-bearing)
+        }
+        channels = build_static_event_channels(self._modules(), se)
+        got = {(c["module_id"], c["field_name"]) for c in channels}
+        assert got == {
+            ("guidPlayer", "AmmoUpdate"),
+            ("guidPlayer", "HealthUpdate"),
+            ("guidServer", "Tick"),
+        }
+
+    def test_row_shape_and_parent_path_is_container(self):
+        se = {"guidPlayer": ["AmmoUpdate"]}
+        [row] = build_static_event_channels(self._modules(), se)
+        assert row == {
+            "module_id": "guidPlayer",
+            "field_name": "AmmoUpdate",
+            "channel_name": "AmmoUpdate",
+            "parent_path": "ReplicatedStorage",
+            "module_path": "ReplicatedStorage.Player",
+            "domain": "client",
+        }
+
+    def test_idempotent(self):
+        se = {"guidPlayer": ["AmmoUpdate", "HealthUpdate"], "guidServer": ["Tick"]}
+        modules = self._modules()
+        first = build_static_event_channels(modules, se)
+        second = build_static_event_channels(modules, se)
+        assert first == second
+
+    def test_empty_event_list_emits_nothing(self):
+        channels = build_static_event_channels(self._modules(), {"guidPlayer": []})
+        assert channels == []
+
+    def test_unknown_module_id_skipped(self):
+        channels = build_static_event_channels(
+            self._modules(), {"guidGhost": ["X"]},
+        )
+        assert channels == []
