@@ -484,23 +484,33 @@ function SceneRuntime:getTouchPart(go, preferTriggerVolume)
 			return d
 		end
 	end
-	-- Tier 2: an invisible non-mesh trigger volume with CanTouch.
+	-- Tier 2: a converter-stamped trigger volume (``_IsTriggerVolume``).
+	-- Real Unity trigger colliders ARE explicitly marked by the converter, so
+	-- requiring the marker here (instead of guessing "any invisible non-mesh
+	-- CanTouch part") avoids binding the handler to an unmarked invisible
+	-- DECORATION -- e.g. a projectile's particle-emitter host part, which is
+	-- transparent + CanTouch but is NOT a trigger and never collides with the
+	-- target, so the colliding body pushes the victim while the damage handler
+	-- sits on a part that never touches them (the turret-bullet no-damage bug).
 	for _, d in ipairs(descendants) do
-		if _isBasePart(d)
-			and d.CanTouch ~= false
-			and (d.Transparency or 0) >= 0.99
-			and not d:IsA("MeshPart")
-		then
+		if _isMarkedTriggerVolume(d) then
 			return d
 		end
 	end
-	-- Tier 3: any BasePart descendant.
+	-- Tier 3: the colliding body if there is one, else any BasePart. A moving
+	-- projectile's damage Touched must sit on the part that physically contacts
+	-- the target (the CanCollide mesh), not an invisible co-located decoration.
+	local fallback = nil
 	for _, d in ipairs(descendants) do
 		if _isBasePart(d) then
-			return d
+			if d.CanCollide then
+				return d
+			elseif fallback == nil then
+				fallback = d
+			end
 		end
 	end
-	return nil
+	return fallback
 end
 
 -- ``connectGameObjectSignal(comp, go, signalName, fn) -> connection?``:
