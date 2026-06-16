@@ -500,7 +500,7 @@ class RbxRosterMember:
 @dataclass
 class RbxRoster:
     """All roster members for one Addressables label."""
-    # The by_label key (e.g. "characters"); the tag every member carries.
+    # The by_label key (e.g. ``<label>``); the tag every member carries.
     label: str
     members: list[RbxRosterMember] = field(default_factory=list)
 

@@ -86,15 +86,62 @@ def test_ac8_e1_empty_by_label_returns_empty():
     assert assemble_rosters({}, {}, set(), {}) == []
 
 
-def test_ac8_no_game_specific_literal_in_source():
-    """The producer module carries no 'characters'/Trash-Dash literal."""
-    src = (REPO_ROOT / "converter" / "roster_assembly.py").read_text()
-    lowered = src.lower()
-    assert "trash" not in lowered
-    assert "trash-dash" not in lowered
+import re  # noqa: E402
+
+# AC8 intent: NO game-specific roster label appears as a quoted string literal
+# anywhere in the new/changed PRODUCTION code (the trigger must be label-driven,
+# never a hardcoded label). Game-specific labels observed in the corpus this
+# converter is exercised against (Trash-Dash): "characters", "trash". These are
+# the literals that, if hardcoded, would break the generic contract.
+_GAME_LABEL_LITERAL = re.compile(
+    r"""['"](characters|consumables|trash[-_ ]?dash|trash)['"]""",
+    re.IGNORECASE,
+)
+
+# A line is part of THIS slice's roster additions if it mentions the roster
+# surface. Scoping the grep to these lines avoids false-positives on unrelated
+# pre-existing code (e.g. the StarterCharacterScripts container handling in
+# roblox_types.py, or any prior quoted token in a multi-purpose writer).
+_ROSTER_REGION = re.compile(r"roster", re.IGNORECASE)
+
+
+def _scan_roster_lines_for_game_literal(path: Path, whole_file: bool) -> list[str]:
+    """Return offending (lineno: text) for any game-specific roster label
+    literal in *path*. When *whole_file* is False, only lines belonging to the
+    roster additions (matched by ``_ROSTER_REGION``) are scanned."""
+    offenders: list[str] = []
+    for i, line in enumerate(path.read_text().splitlines(), start=1):
+        if not whole_file and not _ROSTER_REGION.search(line):
+            continue
+        if _GAME_LABEL_LITERAL.search(line):
+            offenders.append(f"{i}: {line.strip()}")
+    return offenders
+
+
+def test_ac8_no_game_specific_literal_in_changed_production_code():
+    """AC8 — no game-specific roster label literal in ANY production file this
+    slice changed (not just roster_assembly.py). The structural trigger is
+    label-driven (by_label), so a hardcoded label would be a generality bug."""
+    # roster_assembly.py is entirely new → scan the whole file.
+    # The others are multi-purpose → scan only the roster-related additions.
+    targets: list[tuple[Path, bool]] = [
+        (REPO_ROOT / "converter" / "roster_assembly.py", True),
+        (REPO_ROOT / "roblox" / "rbxlx_writer.py", False),
+        (REPO_ROOT / "roblox" / "luau_place_builder.py", False),
+        (REPO_ROOT / "core" / "roblox_types.py", False),
+        (REPO_ROOT / "converter" / "pipeline.py", False),
+    ]
+    all_offenders: dict[str, list[str]] = {}
+    for path, whole_file in targets:
+        offenders = _scan_roster_lines_for_game_literal(path, whole_file)
+        if offenders:
+            all_offenders[str(path.relative_to(REPO_ROOT))] = offenders
+    assert not all_offenders, (
+        "game-specific roster label literal(s) found in changed production "
+        f"code (AC8 violation): {all_offenders}"
+    )
     # The container default is a fixed generic literal, never a label/group.
     assert DEFAULT_ROSTER_CONTAINER == "RosterMembers"
-    assert "characters" not in lowered  # never a hardcoded label string
 
 
 # --- E2 — zero-member label ---------------------------------------------------
@@ -239,7 +286,56 @@ def test_ac3_single_match_field_presence():
     assert _collect(sr) == {"pidCat": "Cat"}
 
 
-def test_ac3_no_match_omitted():
+def test_ac3_rung1_field_presence_hit_wins_over_address_and_stem():
+    """Rung 1 (field-presence) takes precedence even when an address + stem
+    are also present for the prefab."""
+    sr = {
+        "prefabs": {"pidA": {
+            "template_name": "Cat_abc123",
+            "instances": [
+                {"instance_id": "pidA:1", "script_id": "g_char",
+                 "config": {"characterName": "FieldName"}},
+            ],
+        }},
+        "modules": {},
+        "addressables": {"by_address": {"AddrName": ["pidA"]}},
+    }
+    assert _collect(sr) == {"pidA": "FieldName"}
+
+
+def test_ac3_rung2_field_miss_falls_back_to_address():
+    """No instance carries characterName → fall back to the addressable address
+    bound to that prefab_id (inverse of by_address)."""
+    sr = {
+        "prefabs": {"pidA": {
+            "template_name": "Cat_abc123",
+            "instances": [
+                {"instance_id": "pidA:1", "script_id": "g1", "config": {"x": 1}},
+            ],
+        }},
+        "modules": {},
+        "addressables": {"by_address": {"AddrName": ["pidA"]}},
+    }
+    assert _collect(sr) == {"pidA": "AddrName"}
+
+
+def test_ac3_rung3_address_miss_falls_back_to_stem():
+    """No field, no address → fall back to the prefab/template stem."""
+    sr = {
+        "prefabs": {"pidA": {
+            "template_name": "Cat_abc123",
+            "instances": [
+                {"instance_id": "pidA:1", "script_id": "g1", "config": {"x": 1}},
+            ],
+        }},
+        "modules": {},
+        "addressables": {"by_address": {}},
+    }
+    assert _collect(sr) == {"pidA": "Cat_abc123"}
+
+
+def test_ac3_all_rungs_miss_omitted():
+    """No field, no address, no template_name → prefab omitted entirely."""
     sr = {"prefabs": {"pidA": {"instances": [
         {"instance_id": "pidA:1", "script_id": "g1", "config": {"x": 1}},
     ]}}, "modules": {}}
@@ -283,12 +379,30 @@ def test_ac3_remaining_tie_first_in_lifecycle_plus_warning(caplog):
     assert any("characterName" in rec.message for rec in caplog.records)
 
 
-def test_ac10_collect_non_str_characterName_omitted():
+def test_ac10_collect_non_str_characterName_omitted_when_no_fallback():
+    """A non-str field value skips rung 1; with no address/stem → omitted."""
     sr = {"prefabs": {"pidA": {"instances": [
         {"instance_id": "pidA:1", "script_id": "g1",
          "config": {"characterName": 42}},
     ]}}, "modules": {}}
     assert _collect(sr) == {}
+
+
+def test_ac10_non_str_field_falls_through_to_address():
+    """A non-str field value is skip-with-warning, then the chain continues to
+    the address rung (never coerced via str())."""
+    sr = {
+        "prefabs": {"pidA": {
+            "template_name": "Cat_abc123",
+            "instances": [
+                {"instance_id": "pidA:1", "script_id": "g1",
+                 "config": {"characterName": 42}},
+            ],
+        }},
+        "modules": {},
+        "addressables": {"by_address": {"AddrName": ["pidA"]}},
+    }
+    assert _collect(sr) == {"pidA": "AddrName"}
 
 
 def test_collect_empty_scene_runtime():
