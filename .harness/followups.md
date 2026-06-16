@@ -629,3 +629,59 @@ HANDOFF: [gravity] _Rigidbody2D attribute — stamped unconditionally at the Rig
 HANDOFF: [gravity] gravityDesiredBaseStuds — plan field (in _PLAN_KEYS_FOR_HOST) carrying
 |unity_g|*STUDS_PER_METER, parsed early in plan_scene_runtime from DynamicsManager m_Gravity (abs(y),
 9.81 default). Consumed by the client clone-site hook; baked into the server script.
+
+# === Run hud-values-generic-20260616T161253 (2026-06-16) ===
+
+## Phase-1 out-of-scope followups
+- Respawn / ResetOnSpawn re-clone rebind of instance.gameObject (scene_runtime.luau:2861-2863) — pull into
+  scope only if §5 instrumentation proves it is the lead blank-Total cause.
+- StarterGui-template-fallback observability: emit a warn if a PlayerGui-nil template write happens silently.
+- Cross-domain (server-producer / client-consumer) BindableEvent channels must route via RemoteEvents; the
+  event-channel pre-pass is gated to same-domain signals and must NOT mask a missing cross-domain bridge.
+
+## Slice 1.1 residuals (static-event channel identity) — non-blocking, dual-voice findings
+
+- **Verifier alias-read false-POSITIVE (fail-open noise).** `contract_verifier._check_static_event_rendezvous` accepts a read only in the direct forms `<M>.<F>.Event` / `:Connect` / `:Fire` / `if <M>.<F> then`. A valid aliased read `local ev = Player.AmmoUpdate; if ev then ev:Connect(...) end` warns spuriously. Fail-OPEN (a visible warning, not a blocked build); all real SimpleFPS shapes use direct reads. Broadening the read matcher risks re-opening the string-literal bypass — defer until a real project trips it.
+- **Multi-declarator `static event` surfaces only the last name.** `script_analyzer._RE_STATIC_EVENT` on `public static event H A, B;` captures `B` only; `A`'s channel is silently never pre-set. Rare C# idiom; a comma-split would fix it. No real test project uses it.
+- **`findOrCreateChannel` wrong-class collision (now mitigated, residual edge).** Hardened to scan children for an existing BindableEvent of the right name+class before creating. If a non-BindableEvent of the same name persists alongside, the channel BindableEvent coexists (no duplicate BindableEvent), but the AI producer's own `ensureEvent`-under-RS could still pick a different instance if its parent differs from the module's container. The cross-domain/cross-container divergence (AI parents under RS by name; pre-pass parents under the module container) is a Slice-1.2-or-later generality concern; SimpleFPS modules are in RS so they coincide.
+- **Slice 1.2 (host-resolution / blank-Total)** remains probe-gated per design §5/§6 — NOT in 1.1.
+
+## [slice 1.1 r3] Generic RS-name-lookup consumer + folderized channels
+The round-2 folderization moves a static-event BindableEvent under a per-module Folder. The real SimpleFPS
+consumer reads the module FIELD (unaffected), but a HYPOTHETICAL generic consumer that resolves the event by
+NAME under ReplicatedStorage (e.g. `ReplicatedStorage:WaitForChild("AmmoUpdate")`) would break. No corpus
+instance. Harden: extend the rendezvous verifier to also fail-closed on RS-name-lookup consumers of a
+folderized channel, or keep the channel discoverable by a stable name. (Also: regen the SimpleFPS contract
+corpus fixture — codex flagged it may diverge from the real emitted HudControl shape.)
+
+## [scope B] Health-bar fill (Unity Slider visual binding) — deferred
+Same lowering class as the Phase-2 Toggle→Checkmark binding: UpdatePlayerHealth sets SetAttribute("value")/
+("Value") with nothing resizing the Health fill ImageLabel. Build the Slider→fill side of the generic UI-control
+visual binding when health/damage is back in scope. (User deprioritized damage 2026-06-16.)
+
+## [phase2 design] Subagent authored against wrong base (concurrent-session branch move)
+The Phase-2 design subagent ran in the MAIN repo cwd (moved by a concurrent session to addressables@2892b00),
+NOT the design2 worktree (drive/RUNID@babdbcf). ui_translator.py (main fix site) is IDENTICAL across bases, so
+the core design holds; but scene_runtime.luau/autogen.py differ — the runtime-integration citations
+(_applyToggleGraphicBindings site, _PLAN_KEYS_FOR_HOST, workspaceFind SRI resolver) must be re-anchored against
+drive/RUNID at implement. LESSON: always pass subagents the explicit worktree path AND have them verify HEAD.
+
+## [FOLLOW-ON RUN] Item-pickup checkmark — generic Unity Toggle isOn->Checkmark visual binding
+Scoped out of this run (user chose A: ship Phase 1 alone). The detailed design + dual-voice review are ready:
+- Design: design-phase2.md (in this RUN_DIR). Core mechanism sound: capture the Toggle's serialized graphic
+  GameObject SceneRuntimeId + m_IsOn into a plan key; runtime pass resolves via workspaceFind SRI resolver,
+  connects GetAttributeChangedSignal("isOn")->graphic.Visible, applies initial m_IsOn. Anchored on the Unity
+  Toggle component + serialized graphic ref (generic, no node names). ui_translator.py:738 currently emits only
+  ToggleIsOn and drops the graphic ref.
+- Review findings to address (review-phasedesign2-1.md + codex-review-phasedesign2.md):
+  1. [BLOCKING] Need a NEW component-fileID->GameObject resolver in the parser (onClick m_Target stores
+     target_file_id RAW with zero readers; no component->GameObject map exists). Build the index from the parsed
+     scene; thread into _convert_ui_element. This is a real slice seam — NOT one slice.
+  2. [P1 codex] Binding must apply initial isOn->visibility BEFORE the Awake/OnEnable batches (the proposed
+     end-of-start() site is too late); hook before _runAwakeEnableStart in _completeDeferredBatch.
+  3. [P1 codex] Late-clone coverage isn't generic — a Toggle in a late-cloned ScreenGui with no deferred UI
+     component on its host never rebinds. Need a generic mechanism (e.g. PlayerGui.DescendantAdded watch).
+  4. Re-anchor all scene_runtime.luau/autogen.py line citations against the run base (base-drift).
+  5. Re-decode the SRI values from the real rbxlx before pinning acceptance tests.
+- Also covers health-fill (Slider) via the same lowering when health is back in scope.
+- FIRST: confirm the checkmark actually fails in Studio (collect an item) before building — not yet playtest-confirmed.

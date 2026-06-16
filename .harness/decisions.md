@@ -2492,3 +2492,64 @@ the only EMITTED gravity delta is the script + the `_Rigidbody2D` stamp + the pl
   bounce-to-Phase-1 boundary; and all Studio acceptance procedures (resting/auto-sleep gate, ±10% band
   around fall-rate ≈35.03, UseGravity=false float, server-force replication, ≥2000-body perf budget with
   bounce-to-Phase-1).
+
+# === Run hud-values-generic-20260616T161253 (2026-06-16) ===
+
+## [2026-06-16T08:19:46Z] Plan-stage review right-sized to dual-voice design review (not full autoplan gauntlet)
+**Decision:** Run the load-bearing dual-voice design review (Claude reviewer + codex exec on design.md)
+as the plan convergence gate; SKIP the full autoplan CEO→Design→DX product lenses.
+**Classification:** Mechanical (proportionality).
+**Rationale:** This is an internal converter bug-fix design (generic-mode HUD lifecycle + UI-control
+lowering). The CEO (strategy/market), Design (product UX), and DX (developer onboarding) lenses have
+near-zero signal for a pipeline fix; the Eng/soundness lens is what matters and is fully covered by the
+dual-voice design review. Right-size-at-design: review rigor matched to stakes.
+
+## [2026-06-16] Phase-1 detailed design — root-cause localization decisions
+- **D1 — Reframe (d) from "duplicate BindableEvent instances" to "Awake ORDERING race over a shared field."**
+  Both Player + HudControl are client-domain on one VM sharing the cached `Player` table (instances ARE shared);
+  the bug is HudControl:Awake (scene batch, scene_runtime.luau:3079) running BEFORE Player:Awake (prefab batch,
+  :3209) → reads nil `Player.*Update` → connects skipped. Kills Cur/Health/item updates. Root-cause correction.
+- **D2 — Build the (d) channel-identity fix UNCONDITIONALLY; gate the construction/host fix on runtime
+  instrumentation.** (d) decisive in code. Lead blank-`Total` (a static module, no event) is NOT static-decisive
+  — 3 surviving sub-mechanisms (Awake-never-runs / clone-descendants-absent-at-Awake / second-clone-visible);
+  one instrumented playtest (design-phase1.md §5) discriminates before writing host-resolution code.
+- **D3 — Default ONE slice** (shared boot-order contract, small, no fan-out). 2nd slice opens only if §5 shows
+  a respawn re-clone rebind (scene_runtime.luau:2861-2863, already a documented followup).
+- **D4 — Prefer runtime pre-pass (`event_channels` + `_ensureSharedEventChannels`) over transpile-time hoist**
+  unless implement step-0 finds the consumer reads the module FIELD (not an RS child), forcing producer-field
+  pre-set or a module-scope channel hoist. Deterministic lever over the byte-frozen AI prompt.
+- **Mechanism verdicts:** (b) clone-never-lands REFUTED (no warn); (a) module-never-constructs REFUTED static
+  (Player in RS → require resolves); (c) Awake-on-template REFUTED static (PlayerGui present → workspaceFind
+  never scans StarterGui); (d) ordering race CONFIRMED decisive.
+
+## [2026-06-16T09:04:08Z] Phase-1 fix mechanism (post dual-voice r1)
+- Reject runtime RS-child pre-pass (consumer reads module FIELD, not RS child — dead-end) AND naive module-scope hoist (generic contract forbids top-level side effects: code_transpiler.py:1325, runtime_contract.py).
+- Adopt: lower C# static events into a generated static `__ensureStaticChannels()` via a DETERMINISTIC contract_pipeline.py span-move; runtime invokes it before the Awake batches (contract-legal — runtime holds game). Planner flags modules with static channels (new schema).
+- Split Phase 1 into 2 slices: 1.1 channel-identity (offline-buildable now), 1.2 host-resolution/Total (gated on §5 Studio probe).
+
+## [2026-06-16] Slice 1.1 implementation decisions
+- **D1.1-a — C# static-event enumeration site:** `script_analyzer.analyze_script` (new `ScriptInfo.static_events: list[str]`), regex `_RE_STATIC_EVENT` over the decommented source. Member name = the last identifier in `public static event <HandlerType> <Member>;`. SimpleFPS Player.cs surfaces 4: HealthUpdate/AmmoUpdate/ItemUpdate/PauseEvent. Deterministic C# parse — never the AI Luau.
+- **D1.1-b — `static_channels` computed in `_subphase_inject_scene_runtime` (write_output, generic-only), NOT in `plan_scene_runtime`.** `field_name`/`channel_name` come from the C# member; `module_path`/`domain`/`container`(→parent_path) are only FINAL after storage-classify, which the planner phase predates. Mirrors `_build_scriptable_object_module_map`. Gated to same-domain (the channel is a same-VM BindableEvent field; cross-domain routes via RemoteEvents, out of scope). parent_path = the module's own container (RS for client cross-script) so the BindableEvent lives beside the module.
+- **D1.1-c — runtime find-or-create via a new `findOrCreateChannel(channelName, parentPath)` service** (autogen client+server tables), not direct `game` access in the runtime (the runtime is service-abstracted + harness-testable). `_ensureStaticEventChannels()` called from `start()` after Phase-0 module collection, before the scene loop. Sets `mod[field] = findOrCreateChannel(...)`; the AI's untouched `Player.X = Player.X or (...)` short-circuits. Idempotent: find-by-name returns the existing instance.
+- **D1.1-d — fail-closed rendezvous verifier = a new check in `contract_verifier.verify_contract` (3rd param `static_events_by_script`), keyed on the C# static-event list, NOT the AI Luau.** Fed by `pipeline._static_events_by_emitted_name`, which applies the SAME same-domain/runtime-bearing/stamped-module_path gate as the channel builder (so it never demands a rendezvous for a channel the runtime won't pre-set).
+- **D1.1-e — the verifier blesses ONLY the lazy-init GUARD shape `<Module>.<Field> = <Module>.<Field> or (...)` [post dual-voice r-impl].** EMPIRICAL (real LLM cache): the producer emission varies — `X = X or (IIFE)`, `X = X or ensureEvent("X")`, `X = ensureEvent("X")` (no `or`), `self:_playerEvent("X")` (local helper, no field assignment). The runtime field-pre-set is load-bearing ONLY when the producer's `or` SHORT-CIRCUITS onto the pre-set instance. An UNCONDITIONAL reassignment (`X = ensureEvent(...)` / `X = Instance.new(...)`) can OVERWRITE the pre-set instance with a fresh one and disconnect already-bound consumers (codex finding; `ensureEvent` happens to re-find under RS for SimpleFPS, but the verifier can't prove the create-expr re-finds the SAME name+parent generically) → fail-closed. The local-helper shape never assigns → fail-closed. The verifier ALSO strips string literals (not just comments) so a rendezvous inside `"..."` can't bypass (codex adversarial finding). Known lenient gaps (fail-OPEN noise, documented in followups, not fixed in 1.1): (1) an aliased read `local ev = X; ev:Connect(...)` warns spuriously; (2) a multi-declarator `static event H A, B;` surfaces only the last name.
+
+## [2026-06-16T11:22:14Z] Slice 1.1 converged (3 review rounds); codex r3 P1 overruled at integration
+Both round-2 P1s fixed (structured per-module channel identity + module-id-keyed verifier feed). codex r3
+raised a new P1 (consumer RS-name-lookup breaks folderization) — REFUTED against the real rbxlx (consumer
+reads the module field, not an RS lookup); overruled with evidence, residual logged to followups. Claude r3
+CONVERGED. Classification: refute-adversarial-finding-at-integration.
+
+## [2026-06-16T14:17:10Z] LIVE-PROBE root-cause refinement + scope decision (B)
+- Instrumented Studio probe (SimpleFPS-HUDPROBE.rbxlx) showed: HudControl:Awake RUNS on the live PlayerGui
+  clone; Module/Ammo/Total resolve; maxAmmo=250; Player.AmmoUpdate already set. User confirms **max ammo (Total)
+  renders DETERMINISTICALLY** → the designed "blank-Total / host-resolution" bug (Slice 1.2) is REFUTED. **Slice
+  1.2 DROPPED.** (Per OPERATING: reproduce the actual symptom live before building; found a real race but not
+  THE Total symptom.)
+- Confirmed-real remaining HUD bugs: (1) current-ammo (Cur) update path rides the scene-vs-prefab Awake
+  ORDERING RACE (nondeterministic — probe won it this run; design proved it loses on others) → **Slice 1.1**
+  (channel identity, CONVERGED) makes it deterministic. KEEP. (2) item-pickup **checkmarks never show**:
+  UpdatePlayerItems sets SetAttribute("isOn") with no reader driving Checkmark visibility = Unity Toggle→no
+  visual binding → **Phase 2**.
+- **Scope = (B):** Phase 1 (Slice 1.1, current-ammo determinism) + Phase 2 (generic Toggle isOn→Checkmark
+  visual binding). Health-fill (Slider→fill, same lowering class) DEFERRED to followups.
