@@ -478,6 +478,34 @@ class RbxWaterRegion:
 
 
 @dataclass
+class RbxRosterMember:
+    """One member of an Addressables label roster.
+
+    Emitted as a clonable, CollectionService-tagged, attributed instance under a
+    dedicated roster container Folder in ReplicatedStorage. Describes a SECOND
+    materialized instance derived from the ``ReplicatedStorage.Templates.<template_name>``
+    tree (deep-copied with fresh referents/unity_file_ids on the rbxlx path;
+    rebuilt as a distinct live subtree on the luau path) — the canonical
+    Templates child is NEVER tagged/mutated. Both emit paths materialize this
+    second instance identically.
+    """
+    # The ReplicatedStorage.Templates child to clone (== prefab_id→template_name).
+    template_name: str
+    # CollectionService tag == the by_label label (the canonical discovery key).
+    tag: str
+    # At minimum {"characterName": <str>} when resolvable. Scalar-only values.
+    attributes: dict[str, RbxAttrValue] = field(default_factory=dict)
+
+
+@dataclass
+class RbxRoster:
+    """All roster members for one Addressables label."""
+    # The by_label key (e.g. "characters"); the tag every member carries.
+    label: str
+    members: list[RbxRosterMember] = field(default_factory=list)
+
+
+@dataclass
 class RbxPlace:
     """Complete Roblox place data."""
     workspace_parts: list[RbxPart] = field(default_factory=list)
@@ -496,6 +524,15 @@ class RbxPlace:
     # at runtime. Each entry is a fully-converted RbxPart tree whose
     # name matches the Unity prefab's stem.
     replicated_templates: list[RbxPart] = field(default_factory=list)
+    # Addressables label rosters (Unit 4 / Phase 1). Each roster describes a
+    # second materialized instance per ``addressables.by_label`` member, emitted
+    # under a dedicated container Folder in ReplicatedStorage, CollectionService-
+    # tagged with the label and carrying identity attributes (e.g. characterName)
+    # — the surface ``CharacterDatabase.LoadDatabase`` reads via
+    # ``CollectionService:GetTagged(<label>)``. Consumed IDENTICALLY by both emit
+    # paths (rbxlx_writer + luau_place_builder); the canonical Templates child is
+    # never tagged/mutated.
+    rosters: list[RbxRoster] = field(default_factory=list)
     # Per-terrain FillBlock Luau bodies, consumed by ``luau_place_builder``
     # ONLY during headless publish (where the Open Cloud Luau Execution API
     # cannot set the ``SmoothGrid`` BinaryString). The rbxlx writer

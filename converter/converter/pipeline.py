@@ -6225,6 +6225,28 @@ script.Disabled = true
         # turret-fired bullets fall to the ground inert.
         self._attach_monobehaviour_scripts_to_templates()
 
+        # Addressables Unit 4 / Phase 1 — assemble the roster surface from
+        # ``addressables.by_label`` and extend the typed ``rosters`` channel.
+        # Both emit paths (rbxlx_writer + luau_place_builder) materialize a
+        # second, CollectionService-tagged, attributed instance per member under
+        # a dedicated ReplicatedStorage container. Trigger is structural (any
+        # label with >=1 emitted prefab) — no game-specific literal. Reuses
+        # ``resolved_template_names`` (prefab_id->template_name) and
+        # ``addr_block.by_label`` already in scope; no new resolver pass.
+        from converter.roster_assembly import assemble_rosters
+        by_label_raw = addr_block.get("by_label") or {}
+        if isinstance(by_label_raw, dict) and by_label_raw:
+            emitted_names = {
+                t.name for t in self.state.rbx_place.replicated_templates
+            }
+            rosters = assemble_rosters(
+                by_label=by_label_raw,
+                resolved_template_names=resolved_template_names,
+                emitted_template_names=emitted_names,
+                character_names=self._collect_character_names(scene_runtime),
+            )
+            self.state.rbx_place.rosters.extend(rosters)
+
         # Persist a small manifest under packages/ — closes the packages
         # half of Phase 4.11's disk-rewrite deferred item.
         try:
@@ -6237,6 +6259,86 @@ script.Disabled = true
             "ReplicatedStorage.Templates (%d in manifest)",
             len(result.templates), result.manifest.get("total_templates", 0),
         )
+
+    def _collect_character_names(
+        self, scene_runtime: dict[str, object]
+    ) -> dict[str, str]:
+        """Resolve prefab_id -> characterName for the roster surface (D5/P1).
+
+        Selects, per prefab, the instance whose ``config`` CONTAINS the key
+        ``characterName`` (FIELD-PRESENCE — the consumer's
+        ``GetAttribute("characterName")`` contract key, NOT a "Character" class
+        literal). Ties (multiple instances carrying ``characterName``) are broken
+        ONLY via ``modules[script_id]["class_name"]``; on remaining ties the
+        first-in-lifecycle instance is chosen and a warning logged. Every value
+        read is narrowed with ``isinstance(v, str)`` — a non-str characterName is
+        skipped-with-warning (never coerced, never Any), so that prefab_id is
+        omitted (the member is still tagged + clonable downstream).
+        """
+        out: dict[str, str] = {}
+        prefabs = scene_runtime.get("prefabs")
+        if not isinstance(prefabs, dict):
+            return out
+        modules = scene_runtime.get("modules")
+        modules_dict: dict[str, object] = modules if isinstance(modules, dict) else {}
+
+        for pid, sub in prefabs.items():
+            if not isinstance(pid, str) or not isinstance(sub, dict):
+                continue
+            instances = sub.get("instances")
+            if not isinstance(instances, list):
+                continue
+
+            # Field-presence candidates, in lifecycle/visit order.
+            candidates: list[dict[str, object]] = []
+            for inst in instances:
+                if not isinstance(inst, dict):
+                    continue
+                config = inst.get("config")
+                if isinstance(config, dict) and "characterName" in config:
+                    candidates.append(inst)
+
+            if not candidates:
+                continue
+
+            chosen = candidates[0]
+            if len(candidates) > 1:
+                # Tiebreak ONLY via the module class_name. A best-effort,
+                # never-primary signal (class_name may be "").
+                def _class_name(inst: dict[str, object]) -> str:
+                    sid = inst.get("script_id")
+                    if not isinstance(sid, str):
+                        return ""
+                    mod = modules_dict.get(sid)
+                    if isinstance(mod, dict):
+                        cn = mod.get("class_name")
+                        if isinstance(cn, str):
+                            return cn
+                    return ""
+
+                named = [c for c in candidates if _class_name(c)]
+                if len(named) == 1:
+                    chosen = named[0]
+                else:
+                    # Remaining tie: deterministic first-in-lifecycle + warn.
+                    log.warning(
+                        "[roster] prefab_id %s: %d instances carry "
+                        "'characterName' and the class_name tiebreak did not "
+                        "resolve to one — picking first-in-lifecycle (%r)",
+                        pid, len(candidates), candidates[0].get("instance_id"),
+                    )
+                    chosen = candidates[0]
+
+            config = chosen.get("config")
+            value = config.get("characterName") if isinstance(config, dict) else None
+            if isinstance(value, str):
+                out[pid] = value
+            else:
+                log.warning(
+                    "[roster] prefab_id %s: non-str characterName %r — omitting",
+                    pid, value,
+                )
+        return out
 
     def _attach_prefab_scoped_animation_scripts_to_templates(self) -> None:
         """Attach copies of prefab-scoped animation scripts under their
