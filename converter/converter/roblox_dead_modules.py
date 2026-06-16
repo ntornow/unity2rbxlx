@@ -380,6 +380,59 @@ def _strip_luau_comments_only(luau_source: str) -> str:
     return _LUAU_LINE_COMMENT.sub("", _LUAU_LONG_COMMENT.sub(" ", luau_source))
 
 
+def _luau_string_spans(luau_source: str) -> list[tuple[int, int]]:
+    """Return [start, end) index spans of every Luau string literal.
+
+    A single left-to-right scan over the (already comment-stripped) source,
+    mirroring the string-handling in ``_strip_luau_comments_and_strings``:
+    single-quote ``'...'``, double-quote ``"..."`` (with ``\\`` escapes), and
+    long-bracket ``[[...]]`` / ``[=[...]=]`` forms. Comments are NOT re-scanned
+    here -- callers pass a comment-stripped body -- but a ``--`` is still
+    skipped to end-of-line so a ``--`` inside surviving code is not mistaken for
+    a string delimiter.
+
+    Used to reject ``require(...)`` matches whose ``require`` KEYWORD sits
+    inside a string literal (a require text quoted in ``print('require(...)')``
+    is not a real edge). The require's own inner argument string
+    (``FindFirstChild("Name")``) is a separate, nested span and is NOT used to
+    reject -- only the require keyword's position matters.
+    """
+    spans: list[tuple[int, int]] = []
+    i = 0
+    n = len(luau_source)
+    while i < n:
+        ch = luau_source[i]
+        if luau_source.startswith("--", i):
+            end = luau_source.find("\n", i)
+            i = n if end == -1 else end
+            continue
+        if ch in ("'", '"'):
+            start = i
+            quote = ch
+            i += 1
+            while i < n and luau_source[i] != quote:
+                if luau_source[i] == "\\":
+                    i += 1
+                i += 1
+            i += 1
+            spans.append((start, min(i, n)))
+            continue
+        bracket = _LUAU_LONG_BRACKET_OPEN.match(luau_source, i)
+        if bracket is not None:
+            start = i
+            level = bracket.group(1)
+            close = "]" + level + "]"
+            end = luau_source.find(close, bracket.end())
+            i = n if end == -1 else end + len(close)
+            spans.append((start, i))
+            continue
+        i += 1
+    return spans
+
+
+_LUAU_LONG_BRACKET_OPEN = re.compile(r"\[(=*)\[")
+
+
 def has_genuine_roblox_effect(luau_source: str) -> bool:
     """HARD VETO test: does the post-coherence Luau body do anything real?
 
@@ -806,14 +859,29 @@ def extract_require_edges(luau_source: str, known_names: frozenset[str]) -> set[
     Strips comments only (NOT string literals) -- the module name lives inside a
     ``FindFirstChild("Name")`` string literal, so it must survive. Comments are
     blanked so a commented-out require does not register an edge.
+
+    A ``require(...)`` whose ``require`` KEYWORD itself sits inside a STRING
+    literal (e.g. the require text quoted in ``print('require(...)')``) is NOT a
+    real edge and is rejected -- the require's own nested argument string
+    (``FindFirstChild("Name")``) still survives because only the keyword's
+    position is tested, not the argument's.
     """
     code = _strip_luau_comments_only(luau_source)
+    string_spans = _luau_string_spans(code)
+
+    def _require_in_string(pos: int) -> bool:
+        return any(start <= pos < end for start, end in string_spans)
+
     edges: set[str] = set()
     for m in _REQUIRE_EDGE.finditer(code):
+        if _require_in_string(m.start()):
+            continue
         nm = m.group(1)
         if nm in known_names:
             edges.add(nm)
     for m in _REQUIRE_DOTTED.finditer(code):
+        if _require_in_string(m.start()):
+            continue
         # Match each dotted segment against known module names. The require
         # expression may name services / globals (``game``, ``workspace``,
         # ``ReplicatedStorage``) interleaved with the module name; only the

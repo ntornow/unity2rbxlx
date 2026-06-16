@@ -940,6 +940,43 @@ def test_waitforchild_require_shape_registers_edge():
     assert extract_require_edges(src, frozenset({"WaterBase"})) == {"WaterBase"}
 
 
+def test_require_inside_string_literal_is_not_an_edge():
+    """PH2 (phase-integration BLOCKING): a ``require(...)`` whose text sits
+    INSIDE a string literal is NOT a real edge. ``extract_require_edges``
+    stripped comments only, so the require text inside a quoted string
+    manufactured a false edge -- on the reachability security path this
+    pulled a server-only module into ReplicatedStorage with no real require.
+
+    Single-quoted outer string containing a double-quoted lookup arg.
+    FAILS pre-fix (string literals were not stripped).
+    """
+    src = 'print(\'require(script.Parent:FindFirstChild("Secret"))\')'
+    assert extract_require_edges(src, frozenset({"Secret"})) == set()
+
+
+def test_require_inside_double_quoted_string_is_not_an_edge():
+    """PH2 companion: a dotted ``require`` form quoted inside a
+    double-quoted string is also not an edge (the inner module-name segment
+    must not register)."""
+    src = "local msg = \"require(game.ReplicatedStorage.Secret)\""
+    assert extract_require_edges(src, frozenset({"Secret"})) == set()
+
+
+def test_require_inside_long_bracket_string_is_not_an_edge():
+    """PH2 companion: a ``require`` inside a long-bracket ``[[ ... ]]``
+    string literal is not an edge."""
+    src = 'local doc = [[require(script:WaitForChild("Secret"))]]'
+    assert extract_require_edges(src, frozenset({"Secret"})) == set()
+
+
+def test_real_require_with_string_arg_still_registers_after_string_strip():
+    """PH2 regression-of-the-regression: stripping outer string literals
+    must NOT drop a REAL require whose own argument is a string literal
+    (the module name lives inside ``FindFirstChild("Name")``)."""
+    src = 'local M = require(script.Parent:FindFirstChild("RealMod"))'
+    assert extract_require_edges(src, frozenset({"RealMod"})) == {"RealMod"}
+
+
 def test_waitforchild_edge_blocks_false_prune():
     """P1-c end-to-end: a LIVE module requiring a dead one via WaitForChild
     keeps the dead module inert (the edge is visible to the partitioner)."""

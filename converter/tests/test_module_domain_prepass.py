@@ -701,6 +701,154 @@ class TestFinalizeTopologyContainersIdempotent:
         assert util_a["container"] == SERVER_STORAGE
         assert util_a["module_path"] == f"{SERVER_STORAGE}.UtilA"
 
+    def test_string_literal_require_does_not_pull_server_module_to_rs(
+        self,
+    ) -> None:
+        """PH2 end-to-end (phase-integration BLOCKING): a client LocalScript
+        whose ONLY ``require("Secret")`` occurrence is inside a STRING
+        LITERAL must NOT manufacture a reachability edge -- so the
+        server-only ``Secret`` module gets NO reachability requirement and
+        is not hoisted into ReplicatedStorage.
+
+        FAILS pre-fix: ``extract_require_edges`` stripped comments only, so
+        the quoted require text produced a false edge and the prepass
+        returned ``{g-secret: REPLICATED_STORAGE}``.
+        """
+        modules: dict[str, dict[str, object]] = {
+            "g-client": {
+                "stem": "ClientA", "class_name": "ClientA",
+                "runtime_bearing": True,
+            },
+            "g-secret": {
+                "stem": "Secret", "class_name": "Secret",
+                "runtime_bearing": True,
+            },
+        }
+        artifact = _mk_artifact(modules)
+        client = _mk_script(
+            "ClientA",
+            'print(\'require(script.Parent:FindFirstChild("Secret"))\')',
+            parent_path=STARTER_PLAYER_SCRIPTS,
+            script_type="LocalScript",
+        )
+        secret = _mk_script(
+            "Secret",
+            'game:GetService("DataStoreService")\nreturn {}',
+            parent_path=SERVER_STORAGE,
+        )
+        scripts = [client, secret]
+        domains = infer_module_domains(artifact, scripts)
+        assert domains["g-secret"]["domain"] == "server"
+        by_sid = _by_sid(modules, scripts)
+        reqs = derive_reachability_requirements(
+            artifact, scripts, domains,
+            require_edges_by_name=_edges(scripts),
+            script_by_sid=by_sid,
+            lifecycle_roles={},
+        )
+        # No real require -> no reachability requirement -> stays server-only.
+        assert "g-secret" not in reqs
+
+    def test_excluded_stamp_survives_classify_storage_rs_hoist(self) -> None:
+        """PH1 (phase-integration BLOCKING): drive the REAL ordering
+        ``derive_reachability_requirements`` -> ``classify_storage`` ->
+        ``finalize_topology_containers``. ``classify_storage`` consumes the
+        ``__excluded__`` requirement FIRST and moves the helper to
+        ReplicatedStorage (client-visibility). By the time the finalizer
+        runs, ``parent_path`` is RS -- NOT a server container -- so the
+        old container-gated ``__excluded__`` branch SKIPPED the fail-closed
+        stamp, leaving ``domain=="helper"`` and ``excluded_modules==[]``.
+
+        The finalizer must stamp ``domain=="excluded"`` +
+        ``fail_closed_reason=="reachability_conflict"`` and return the row
+        in the excluded list REGARDLESS of the current container, while the
+        RS placement (owned by ``classify_storage``) is left intact.
+
+        FAILS pre-fix: with the container gate, the excluded stamp + report
+        are dropped because the module is already in RS.
+        """
+        from converter.storage_classifier import classify_storage
+
+        modules: dict[str, dict[str, object]] = {
+            "g-entry": {
+                "stem": "LocalEntry", "class_name": "LocalEntry",
+                "runtime_bearing": True,
+            },
+            "g-srv": {
+                "stem": "ServerSide", "class_name": "ServerSide",
+                "runtime_bearing": True,
+            },
+            "g-helper": {
+                "stem": "Helper", "class_name": "Helper",
+                "runtime_bearing": True,
+            },
+        }
+        artifact = _mk_artifact(modules)
+        entry = _mk_script(
+            "LocalEntry", _require("Helper"),
+            parent_path=STARTER_PLAYER_SCRIPTS,
+            script_type="LocalScript",
+        )
+        server = _mk_script(
+            "ServerSide",
+            'evt:FireAllClients()\n' + _require("Helper"),
+            parent_path=SERVER_SCRIPT_SERVICE,
+            script_type="Script",
+        )
+        helper = _mk_script(
+            "Helper", "return {}", parent_path=SERVER_STORAGE,
+        )
+        scripts = [entry, server, helper]
+        domains = infer_module_domains(artifact, scripts)
+        assert domains["g-srv"]["domain"] == "server"
+        by_sid = _by_sid(modules, scripts)
+        sid_by_name = {s.name: sid for sid, s in by_sid.items()}
+        reqs = derive_reachability_requirements(
+            artifact, scripts, domains,
+            require_edges_by_name=_edges(scripts),
+            script_by_sid=by_sid,
+            lifecycle_roles={},
+        )
+        assert reqs.get("g-helper") == "__excluded__"
+
+        # REAL ordering: classify_storage consumes reqs FIRST and hoists
+        # Helper to ReplicatedStorage.
+        inputs = _mk_topology_inputs(
+            reachability_requirements=reqs,
+            script_id_by_name=sid_by_name,
+        )
+        classify_storage([helper], topology_inputs=inputs)
+        assert helper.parent_path == REPLICATED_STORAGE
+
+        excluded = finalize_topology_containers(
+            artifact, scripts, domains, reqs, script_by_sid=by_sid,
+        )
+        helper_row = artifact["modules"]["g-helper"]
+        # RS placement preserved (client-visibility required + correct).
+        assert helper_row["container"] == REPLICATED_STORAGE
+        # Fail-closed semantics + report restored despite the RS container.
+        assert helper_row["domain"] == "excluded"
+        signals = cast("dict[str, object]", helper_row["domain_signals"])
+        assert signals["fail_closed_reason"] == "reachability_conflict"
+        assert "g-helper" in excluded
+
+
+def _mk_topology_inputs(**overrides: object) -> dict[str, object]:
+    """Local copy of the storage_classifier test helper -- a
+    ``TopologyInputs``-shaped plain dict for ``classify_storage`` with
+    empty defaults; the consumer reads it through ``__getitem__`` / ``.get``,
+    both of which work on a plain dict."""
+    base: dict[str, object] = {
+        "domains": {},
+        "reachability_requirements": {},
+        "lifecycle_roles": {},
+        "script_id_by_name": {},
+        "caller_graph": {},
+        "transpile_ran": True,
+    }
+    base.update(overrides)
+    return base
+
 
 class TestNoParentPathInEarlyPrepass:
     """Belt-and-suspenders: AST-walk ``module_domain.py`` and assert

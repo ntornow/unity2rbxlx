@@ -1264,14 +1264,19 @@ def finalize_topology_containers(
             continue
 
         if requirement == "__excluded__":
-            # Only mark as reachability_conflict if the helper is
-            # currently in a server-invisible container (i.e. the
-            # legacy rule would have actually fired). This preserves
-            # the exact predicate the legacy rule used: ``current_container
-            # in _SERVER_CONTAINERS_FOR_REACHABILITY``.
-            current_container = script.parent_path or ""
-            if current_container not in _SERVER_CONTAINERS_FOR_REACHABILITY:
-                continue
+            # A both-sides conflict is fail-closed REGARDLESS of the
+            # current container. ``classify_storage`` consumes the raw
+            # ``__excluded__`` requirement FIRST and hoists the module to
+            # ReplicatedStorage (client-visibility is required + correct),
+            # so by the time the finalizer runs the script's
+            # ``parent_path`` is already ReplicatedStorage -- NOT a server
+            # container. Gating the excluded-domain stamp on
+            # ``current_container in _SERVER_CONTAINERS_FOR_REACHABILITY``
+            # would therefore SKIP it and silently drop the fail-closed /
+            # no-instantiate semantics + the conflict report. Stamp the
+            # excluded domain + report unconditionally for ``__excluded__``;
+            # the RS placement is owned by ``classify_storage`` and left
+            # intact.
             module_row["domain"] = "excluded"
             signals = cast(
                 SceneRuntimeDomainSignals,
