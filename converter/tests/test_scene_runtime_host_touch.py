@@ -1085,3 +1085,140 @@ class TestPlayerNormalization:
         rc, out, err = _run(scenario)
         assert rc == 0, f"luau failed: {err}\n{out}"
         assert "NIL" in out
+
+
+# ---------------------------------------------------------------------------
+# connectGameObjectTriggerSignal (OnTriggerEnter/Exit edge -> marked volume)
+# ---------------------------------------------------------------------------
+
+class TestConnectGameObjectTriggerSignal:
+
+    def test_prefers_marked_trigger_volume_over_body(self):
+        # A BasePart-root mine with a marked _IsTriggerVolume child: the
+        # trigger-signal binding connects on the CHILD volume, not the body
+        # (fixes the mine fuse arming on the tiny body).
+        scenario = textwrap.dedent("""\
+            local engine = SceneRuntime.new(baseServices(nil), {})
+            local vol = newInstance{Name = "TriggerZone", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, Transparency = 1,
+                attrs = {_IsTriggerVolume = true}}
+            local body = newInstance{Name = "Mine", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, children = {vol}}
+            local comp = {}
+            engine._meta[comp] = {activeInHierarchy = true, enabled = true}
+            local hits = 0
+            local conn = engine:connectGameObjectTriggerSignal(comp, body,
+                "Touched", function(other) hits = hits + 1 end)
+            print(conn ~= nil and "CONNECTED" or "NOCONN")
+            -- Firing the BODY must NOT hit (handler is on the volume).
+            body.Touched:fire(newInstance{Name = "Limb", ClassName = "Part"})
+            print("BODYHITS " .. tostring(hits))
+            -- Firing the marked VOLUME hits.
+            vol.Touched:fire(newInstance{Name = "Limb", ClassName = "Part"})
+            print("VOLHITS " .. tostring(hits))
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "CONNECTED" in out
+        assert "BODYHITS 0" in out, f"trigger binding must NOT be on the body\n{out}"
+        assert "VOLHITS 1" in out, f"trigger binding must be on the marked volume\n{out}"
+
+    def test_degrades_to_body_when_no_marked_volume(self):
+        # A BasePart-root with NO marked volume: connectGameObjectTriggerSignal
+        # falls through to the identical passthrough -> binds the body.
+        scenario = textwrap.dedent("""\
+            local engine = SceneRuntime.new(baseServices(nil), {})
+            local body = newInstance{Name = "Plate", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true}
+            local comp = {}
+            engine._meta[comp] = {activeInHierarchy = true, enabled = true}
+            local hits = 0
+            local conn = engine:connectGameObjectTriggerSignal(comp, body,
+                "Touched", function(other) hits = hits + 1 end)
+            print(conn ~= nil and "CONNECTED" or "NOCONN")
+            body.Touched:fire(newInstance{Name = "Limb", ClassName = "Part"})
+            print("HITS " .. tostring(hits))
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "CONNECTED" in out
+        assert "HITS 1" in out, f"degrade must bind the body when no marked volume\n{out}"
+
+
+# ---------------------------------------------------------------------------
+# playersInRadius (deduped OverlapSphere -> players; over-damage fix)
+# ---------------------------------------------------------------------------
+
+class TestPlayersInRadius:
+
+    def test_dedups_multi_part_character_to_one_player(self):
+        # An R15-shaped character has many parts in the blast radius; each must
+        # resolve to the SAME player and be returned exactly ONCE (Unity hits a
+        # player once; the naive per-part loop would hit ~15-20x).
+        scenario = textwrap.dedent("""\
+            local hum = newInstance{Name = "Humanoid", ClassName = "Humanoid",
+                isa = {Humanoid = true}}
+            local character = newInstance{Name = "Char", ClassName = "Model",
+                isa = {Model = true}, children = {hum}}
+            local p1 = newInstance{Name = "Torso", ClassName = "Part", isa = {BasePart = true}}
+            local p2 = newInstance{Name = "Head", ClassName = "Part", isa = {BasePart = true}}
+            local p3 = newInstance{Name = "LeftArm", ClassName = "Part", isa = {BasePart = true}}
+            p1.Parent = character; p2.Parent = character; p3.Parent = character
+            local fakePlayer = {Name = "P1"}
+            local engine = SceneRuntime.new(
+                baseServices(newPlayers({[character] = fakePlayer})), {})
+            workspace = {GetPartBoundsInRadius = function(self, pos, r) return {p1, p2, p3} end}
+            local players = engine:playersInRadius(Vector3 and Vector3.new(0,0,0) or {}, 7)
+            print("COUNT " .. tostring(#players))
+            print((players[1] == fakePlayer) and "ISPLAYER" or "NOTPLAYER")
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "COUNT 1" in out, f"multi-part character must dedup to ONE player\n{out}"
+        assert "ISPLAYER" in out
+
+    def test_two_distinct_players_both_returned(self):
+        scenario = textwrap.dedent("""\
+            local function mkChar()
+                local hum = newInstance{Name = "Humanoid", ClassName = "Humanoid", isa = {Humanoid = true}}
+                local c = newInstance{Name = "Char", ClassName = "Model", isa = {Model = true}, children = {hum}}
+                local limb = newInstance{Name = "Torso", ClassName = "Part", isa = {BasePart = true}}
+                limb.Parent = c
+                return c, limb
+            end
+            local cA, limbA = mkChar()
+            local cB, limbB = mkChar()
+            local pA, pB = {Name = "A"}, {Name = "B"}
+            local engine = SceneRuntime.new(
+                baseServices(newPlayers({[cA] = pA, [cB] = pB})), {})
+            workspace = {GetPartBoundsInRadius = function(self, pos, r) return {limbA, limbB} end}
+            local players = engine:playersInRadius({}, 7)
+            print("COUNT " .. tostring(#players))
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "COUNT 2" in out, f"two distinct players must both be returned\n{out}"
+
+    def test_empty_when_no_players_overlap(self):
+        scenario = textwrap.dedent("""\
+            local crate = newInstance{Name = "Crate", ClassName = "Part", isa = {BasePart = true}}
+            local engine = SceneRuntime.new(baseServices(newPlayers({})), {})
+            workspace = {GetPartBoundsInRadius = function(self, pos, r) return {crate} end}
+            local players = engine:playersInRadius({}, 7)
+            print("COUNT " .. tostring(#players))
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "COUNT 0" in out, f"non-player parts must be excluded\n{out}"
+
+    def test_nil_args_return_empty(self):
+        scenario = textwrap.dedent("""\
+            local engine = SceneRuntime.new(baseServices(newPlayers({})), {})
+            local ok, players = pcall(function() return engine:playersInRadius(nil, nil) end)
+            print(ok and "NOTHROW" or "THREW")
+            print("COUNT " .. tostring(#players))
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "NOTHROW" in out
+        assert "COUNT 0" in out

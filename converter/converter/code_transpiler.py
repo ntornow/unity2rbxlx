@@ -1562,6 +1562,24 @@ ALWAYS put a `-- OnTrigger<Phase>(other)` / `-- OnCollision<Phase>(...)` origin 
   - `Physics.Raycast(o, d, 100)` → `workspace:Raycast(o, d.Unit * (100 * 3.571), params)`.
   - `Vector3.Distance(a,b) < r` → `(a - b).Magnitude < r * 3.571`.
 - Do NOT leave bare Unity-metre numbers in the emitted code.
+- **Players in a radius (damage / affect ALL players in a sphere).** When the
+  OverlapSphere loop exists to find or affect the PLAYERS in range — Unity's
+  `foreach (col in Physics.OverlapSphere(p, r)) if (col.tag == "Player") col.SendMessage("TakeDamage", dmg)`
+  — emit `for _, plr in self.host.playersInRadius(p, r * 3.571) do ... end`, which
+  returns each player exactly ONCE. Do NOT iterate `GetPartBoundsInRadius` +
+  `playerFromTouch` for this: a Roblox character is MANY parts (R15 ≈ 15-20), so
+  the naive per-part loop applies the effect ~15-20× per player (a 10-damage mine
+  instakills). Example:
+  ```
+  -- Unity: foreach(col in Physics.OverlapSphere(pos, 2)) if(col.tag=="Player") col.SendMessage("TakeDamage", dmg)
+  for _, plr in self.host.playersInRadius(pos, 2 * 3.571) do
+      local char = plr.Character
+      local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+      if humanoid then humanoid:TakeDamage(dmg) end
+  end
+  ```
+  Keep `GetPartBoundsInRadius` for NON-player spatial scans, or when the loop
+  needs the specific overlapping part/collider (not just the resolved player).
 
 ### Character speed (Unity m/s vs Roblox studs/s)
 - `humanoid.WalkSpeed = speed * 3.571` (configure ONCE on character bind).

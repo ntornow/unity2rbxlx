@@ -540,6 +540,40 @@ function SceneRuntime:connectGameObjectSignal(comp, go, signalName, fn)
 	return self:connect(comp, signal, fn)
 end
 
+-- ``connectGameObjectTriggerSignal(comp, go, signalName, fn) -> connection?``:
+-- the ``OnTriggerEnter``/``OnTriggerExit`` edge variant of
+-- ``connectGameObjectSignal``. Identical EXCEPT it resolves the part via
+-- ``getTouchPart(go, true)`` -- so a converter-stamped ``_IsTriggerVolume``
+-- volume (the trigger collider Unity's OnTrigger* fires on) wins over the
+-- small visible body. When ``go`` has NO marked volume the prefer-pass returns
+-- nil and ``getTouchPart`` falls through to the IDENTICAL passthrough/tier
+-- resolution as ``connectGameObjectSignal`` -- a safe degrade. The generic
+-- ``trigger_enter_lowering`` pass rewrites ``OnTriggerEnter``/``OnTriggerExit``-
+-- origin ``connectGameObjectSignal`` bindings to this method; ``OnCollision*``
+-- bindings keep ``connectGameObjectSignal`` (body-bound, so the projectile
+-- damage fix from PR #198 is untouched).
+function SceneRuntime:connectGameObjectTriggerSignal(comp, go, signalName, fn)
+	assert(type(fn) == "function",
+		"connectGameObjectTriggerSignal: fn must be function")
+	assert(type(signalName) == "string" and signalName ~= "",
+		"connectGameObjectTriggerSignal: signalName required")
+	local part = self:getTouchPart(go, true)
+	if part == nil then
+		self._warn(string.format(
+			"[scene_runtime] connectGameObjectTriggerSignal: no touch part on %s",
+			tostring(go)))
+		return nil
+	end
+	local signal = part[signalName]
+	if signal == nil then
+		self._warn(string.format(
+			"[scene_runtime] connectGameObjectTriggerSignal: %s has no %s signal",
+			tostring(part), tostring(signalName)))
+		return nil
+	end
+	return self:connect(comp, signal, fn)
+end
+
 -- Throttle for the OnTriggerStay overlap poll (seconds between sweeps).
 -- One ``GetPartsInPart`` per turret per tick is bounded; ~0.13s is the
 -- per-frame analog of Unity's per-physics-frame OnTriggerStay without
@@ -646,6 +680,40 @@ end
 -- gate.
 function SceneRuntime:isPlayerTouch(other)
 	return self:playerFromTouch(other) ~= nil
+end
+
+-- ``playersInRadius(pos, radius) -> {Player}``: the DEDUPED player set inside a
+-- sphere -- the faithful Roblox analog of Unity's
+-- ``Physics.OverlapSphere(pos, r)`` filtered to ``col.tag == "Player"``. Unity
+-- returns ONE collider per player, so a per-collider ``SendMessage`` hits each
+-- player once; Roblox ``GetPartBoundsInRadius`` returns the MANY parts of an
+-- R15 character, so the naive ``for col in cols do playerFromTouch(col) ...``
+-- loop damages each player ~15-20x. This resolves every overlapping part to its
+-- owning Player via the same character-ancestor walk as ``playerFromTouch`` and
+-- returns each DISTINCT player exactly once. Generic: any
+-- damage/affect-players-in-radius pattern uses it (the generic prompt steers
+-- the player-filtered OverlapSphere loop here). Returns an empty table when no
+-- players overlap. Non-player spatial scans keep ``GetPartBoundsInRadius``.
+function SceneRuntime:playersInRadius(pos, radius)
+	local result = {}
+	if pos == nil or radius == nil then return result end
+	-- Use the global ``workspace`` directly, mirroring the OnTriggerStay poll's
+	-- ``workspace:GetPartsInPart`` (the runtime does spatial queries on the live
+	-- workspace, not a service handle). Snapshot inside a pcall so a malformed
+	-- query can't throw out of a damage loop.
+	local ok, parts = pcall(function()
+		return workspace:GetPartBoundsInRadius(pos, radius)
+	end)
+	if not ok or type(parts) ~= "table" then return result end
+	local seen = {}
+	for _, part in ipairs(parts) do
+		local plr = self:playerFromTouch(part)
+		if plr ~= nil and not seen[plr] then
+			seen[plr] = true
+			result[#result + 1] = plr
+		end
+	end
+	return result
 end
 
 -- ---------------------------------------------------------------------
@@ -772,6 +840,17 @@ function SceneRuntime:_makeHostSurface(owner)
 			end
 			return engine:connectGameObjectSignal(owner, arg1, arg2, arg3)
 		end,
+		connectGameObjectTriggerSignal = function(arg1, arg2, arg3, arg4)
+			-- OnTriggerEnter/Exit edge variant -- prefers the marked trigger
+			-- volume. Same calling forms + owner-scoping as
+			-- connectGameObjectSignal.
+			--   Colon:  host:connectGameObjectTriggerSignal(go, signalName, fn)
+			--   Dotted: host.connectGameObjectTriggerSignal(go, signalName, fn)
+			if arg1 == host then
+				return engine:connectGameObjectTriggerSignal(owner, arg2, arg3, arg4)
+			end
+			return engine:connectGameObjectTriggerSignal(owner, arg1, arg2, arg3)
+		end,
 		connectGameObjectSignalStay = function(arg1, arg2, arg3)
 			-- Colon: host:connectGameObjectSignalStay(go, fn)
 			--   arg1=host, arg2=go, arg3=fn
@@ -795,6 +874,14 @@ function SceneRuntime:_makeHostSurface(owner)
 				return engine:isPlayerTouch(arg2)
 			end
 			return engine:isPlayerTouch(arg1)
+		end,
+		playersInRadius = function(arg1, arg2, arg3)
+			-- Colon:  host:playersInRadius(pos, radius) -> arg1=host, arg2=pos, arg3=radius
+			-- Dotted: host.playersInRadius(pos, radius) -> arg1=pos, arg2=radius
+			if arg1 == host then
+				return engine:playersInRadius(arg2, arg3)
+			end
+			return engine:playersInRadius(arg1, arg2)
 		end,
 		-- Public per-player read surface (P1-4/P2-G). A NARROW table closing
 		-- over ``engine`` — exposes ONLY the public ``getLookCFrame`` read so
