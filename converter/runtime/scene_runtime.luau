@@ -2791,8 +2791,10 @@ end
 
 -- For each planner ``static_channels`` entry on THIS side (domain matches the
 -- boot filter), require the declaring module and set ``mod[field_name]`` to a
--- find-or-created BindableEvent named ``channel_name`` under ``parent_path`` —
--- BEFORE any scene/prefab Awake batch. The AI's untouched inline
+-- find-or-created BindableEvent named ``channel_name`` (the bare C# field) under a
+-- PER-MODULE ``module_folder`` Folder under ``parent_path`` — BEFORE any
+-- scene/prefab Awake batch. The per-module Folder is the structured identity that
+-- keeps two classes' same-named static events DISTINCT. The AI's untouched inline
 -- ``Player.X = Player.X or (...)`` then short-circuits onto this instance, so the
 -- producer's ``:Fire`` and the consumer's ``if Player.X then ...:Connect`` resolve
 -- the SAME BindableEvent via the shared field regardless of Awake order.
@@ -2822,14 +2824,16 @@ function SceneRuntime:_ensureStaticEventChannels(domainFilter)
 		if (domainFilter == nil) or (ch.domain == domainFilter) then
 			local mod = self._services.resolveModule(ch.module_id, ch.module_path)
 			if type(mod) == "table" then
-				local event = findOrCreateChannel(ch.channel_name, ch.parent_path)
+				local event = findOrCreateChannel(
+					ch.channel_name, ch.parent_path, ch.module_folder)
 				if event ~= nil then
 					mod[ch.field_name] = event
 				else
 					self._warn(string.format(
-						"[scene_runtime] static channel %q under %q could not "
+						"[scene_runtime] static channel %q under %q/%q could not "
 						.. "be created; consumer connects may be skipped",
-						tostring(ch.channel_name), tostring(ch.parent_path)))
+						tostring(ch.channel_name), tostring(ch.parent_path),
+						tostring(ch.module_folder)))
 				end
 			else
 				self._warn(string.format(

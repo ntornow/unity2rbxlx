@@ -1536,29 +1536,34 @@ class TestBuildStaticEventChannels:
         }
 
     def test_row_shape_and_parent_path_is_container(self):
+        from converter.scene_runtime_planner import _module_channel_folder
         se = {"guidPlayer": ["AmmoUpdate"]}
         [row] = build_static_event_channels(self._modules(), se)
+        # channel_name is now the BARE field; the per-module identity lives in a
+        # ``module_folder`` (opaque, derived from the UNIQUE module_id), and the
+        # event is parented under it within the container.
+        expected_folder = _module_channel_folder(
+            "guidPlayer", "ReplicatedStorage.Player")
         assert row == {
             "module_id": "guidPlayer",
             "field_name": "AmmoUpdate",
-            # channel_name is namespaced per declaring module (``<stem>_<field>``)
-            # so the BindableEvent INSTANCE is unique per class. The Luau module
-            # FIELD stays the bare C# member name (``field_name``).
-            "channel_name": "Player_AmmoUpdate",
+            "channel_name": "AmmoUpdate",
+            "module_folder": expected_folder,
             "parent_path": "ReplicatedStorage",
             "module_path": "ReplicatedStorage.Player",
             "domain": "client",
         }
+        # The folder token is dot-free (the runtime splits parent_path on ".").
+        assert "." not in expected_folder
 
     def test_same_field_two_modules_same_container_distinct_channels(self):
         # P1 #1 — cross-class channel aliasing. Two DIFFERENT classes declaring
         # the SAME static-event member name in the SAME container must NOT alias
-        # onto one BindableEvent. The runtime parents/names the instance by
-        # ``channel_name``; if both rows carried the bare ``AmmoUpdate``,
-        # ``findOrCreateChannel`` would return ONE shared instance for both —
-        # silently cross-wiring unrelated class events. Each row's
-        # ``channel_name`` must therefore be DISTINCT (namespaced per module),
-        # while each row's ``field_name`` stays the bare member name.
+        # onto one BindableEvent. With the bare ``channel_name`` + a per-module
+        # ``module_folder``, each class's event lives under a DISTINCT folder, so
+        # ``findOrCreateChannel`` returns DISTINCT instances. Each row's
+        # ``field_name`` + ``channel_name`` stay the bare member name; the
+        # uniqueness is carried by ``module_folder``.
         modules = {
             "guidPlayer": {
                 "runtime_bearing": True, "domain": "client",
@@ -1573,12 +1578,52 @@ class TestBuildStaticEventChannels:
         }
         se = {"guidPlayer": ["AmmoUpdate"], "guidEnemy": ["AmmoUpdate"]}
         channels = build_static_event_channels(modules, se)
-        # Both keep the bare field name (the Luau module field is unchanged)…
+        # Both keep the bare field name AND the bare channel name…
         assert {c["field_name"] for c in channels} == {"AmmoUpdate"}
-        # …but the BindableEvent instance names are DISTINCT (no aliasing).
-        names = sorted(c["channel_name"] for c in channels)
-        assert names == ["Enemy_AmmoUpdate", "Player_AmmoUpdate"]
-        assert len(set(names)) == 2
+        assert {c["channel_name"] for c in channels} == {"AmmoUpdate"}
+        # …but the per-module folders (hence the full channel locations) are
+        # DISTINCT — no aliasing.
+        folders = sorted(c["module_folder"] for c in channels)
+        assert len(set(folders)) == 2
+        locations = {(c["parent_path"], c["module_folder"], c["channel_name"])
+                     for c in channels}
+        assert len(locations) == 2
+
+    def test_flat_concat_delimiter_ambiguity_distinct_channels(self):
+        # P1 #1 (the delimiter-ambiguity collision class) — a flat
+        # ``<stem>_<field>`` concat aliases ``stem="A_B",field="C"`` with
+        # ``stem="A",field="B_C"`` (both → ``A_B_C``). The structured per-module
+        # folder identity eliminates this entirely: each module gets a DISTINCT
+        # folder keyed on its UNIQUE module_id, so the two channels never collapse
+        # onto one location.
+        #
+        # RED on the old flat-concat: both rows carried ``channel_name="A_B_C"``
+        # under the same container → one shared BindableEvent.
+        modules = {
+            "guidAB": {
+                "runtime_bearing": True, "domain": "client",
+                "container": "ReplicatedStorage",
+                "module_path": "ReplicatedStorage.A_B",
+            },
+            "guidA": {
+                "runtime_bearing": True, "domain": "client",
+                "container": "ReplicatedStorage",
+                "module_path": "ReplicatedStorage.A",
+            },
+        }
+        se = {"guidAB": ["C"], "guidA": ["B_C"]}
+        channels = build_static_event_channels(modules, se)
+        assert len(channels) == 2
+        # The full channel LOCATIONS (parent_path, module_folder, channel_name)
+        # must be DISTINCT — the flat concat would have collapsed them.
+        locations = {(c["parent_path"], c["module_folder"], c["channel_name"])
+                     for c in channels}
+        assert len(locations) == 2, (
+            f"delimiter-ambiguous channels must not collide: {channels}")
+        # And the dot-free folder tokens are distinct (keyed on module_id).
+        folders = {c["module_folder"] for c in channels}
+        assert len(folders) == 2
+        assert all("." not in f for f in folders)
 
     def test_idempotent(self):
         se = {"guidPlayer": ["AmmoUpdate", "HealthUpdate"], "guidServer": ["Tick"]}

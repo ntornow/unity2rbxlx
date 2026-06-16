@@ -841,10 +841,14 @@ def _scripts(*pairs: tuple[str, str]) -> list[RbxScript]:
     ]
 
 
-def _decl(events: list[str], domain: str = "client") -> StaticEventDecl:
+def _decl(
+    events: list[str], domain: str = "client", name: str = "Player",
+) -> StaticEventDecl:
     # The producer domain defaults to ``client``; ``_scripts`` emits neutral
     # (ReplicatedStorage ModuleScript) scripts which a client producer reaches.
-    return StaticEventDecl(events=events, domain=domain)
+    # ``name`` is the EMITTED module name the verifier scans the Luau for; the feed
+    # dict is keyed by the UNIQUE module_id (== ``name`` in single-module tests).
+    return StaticEventDecl(name=name, events=events, domain=domain)
 
 
 class TestStaticEventRendezvous:
@@ -928,7 +932,8 @@ class TestStaticEventRendezvous:
                  if v.check == "static_event_unconverted"]
         assert len(fired) == 1, fired
         assert fired[0].severity == "warning"
-        assert fired[0].identity == "static_event_unconverted:Player.AmmoUpdate"
+        assert fired[0].identity == (
+            "static_event_unconverted:Player:Player.AmmoUpdate")
         assert "lazy-init guarded producer assignment" in fired[0].detail
 
     def test_missing_read_also_fires(self):
@@ -1039,7 +1044,8 @@ class TestStaticEventRendezvous:
         unconv = [v for v in result.violations
                   if v.check == "static_event_unconverted"]
         assert len(cross) == 1, "cross-domain consumer must fire a diagnostic"
-        assert cross[0].identity == "static_event_cross_domain:Player.AmmoUpdate"
+        assert cross[0].identity == (
+            "static_event_cross_domain:Player:Player.AmmoUpdate")
         assert not unconv, "should be cross-domain, not generic unconverted"
 
     def test_same_domain_consumer_passes(self):
@@ -1086,3 +1092,55 @@ class TestStaticEventRendezvous:
         fired = [v for v in result.violations
                  if v.check.startswith("static_event_")]
         assert not fired, f"neutral read should satisfy a server producer: {fired}"
+
+    def test_same_emitted_name_different_vm_broken_not_masked(self):
+        # P1 #2 — two PRODUCER modules lower to the SAME emitted name (``Player``)
+        # on DIFFERENT VMs: one CANONICAL (client, fully wired) and one BROKEN
+        # (server, no guarded assignment + no read). The feed is keyed by the
+        # UNIQUE module_id, so each is verified independently against its OWN
+        # reachable code — the canonical client ``Player`` does NOT satisfy the
+        # broken server ``Player`` (different VM, not in its reachable blob), so
+        # the broken module's diagnostic STILL fires.
+        #
+        # RED on the pre-fix same-tail merge: that merged both modules under the
+        # emitted name ``Player``, retained only the FIRST domain, and the
+        # canonical shape satisfied the (single, merged) check — masking the
+        # broken module entirely.
+        client_producer = RbxScript(
+            name="Player",
+            source="Player.AmmoUpdate = Player.AmmoUpdate or makeEvent()\n"
+                   "if Player.AmmoUpdate then Player.AmmoUpdate:Fire(x) end",
+            script_type="LocalScript",
+            parent_path="StarterPlayer.StarterPlayerScripts",
+        )
+        # The broken server ``Player`` emits NEITHER a guarded assignment NOR a
+        # read on the server VM (only an unrelated server line).
+        server_module = RbxScript(
+            name="Player",
+            source="local Player = {}\nreturn Player",
+            script_type="Script", parent_path="ServerScriptService",
+        )
+        feed = {
+            "guidPlayerClient": _decl(
+                ["AmmoUpdate"], domain="client", name="Player"),
+            "guidPlayerServer": _decl(
+                ["AmmoUpdate"], domain="server", name="Player"),
+        }
+        result = verify_contract(
+            {"modules": {}}, [client_producer, server_module], feed,
+        )
+        unconv = [v for v in result.violations
+                  if v.check == "static_event_unconverted"]
+        # The BROKEN server module's diagnostic must fire, keyed on its module_id
+        # (distinct identity, not collapsed onto the canonical client one).
+        assert any(
+            v.identity == "static_event_unconverted:guidPlayerServer:"
+                          "Player.AmmoUpdate"
+            for v in unconv
+        ), f"broken server Player must not be masked by canonical client: {unconv}"
+        # The canonical client module must NOT spuriously fire.
+        assert not any(
+            v.identity == "static_event_unconverted:guidPlayerClient:"
+                          "Player.AmmoUpdate"
+            for v in unconv
+        ), f"canonical client Player should pass: {unconv}"

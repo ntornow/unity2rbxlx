@@ -3810,16 +3810,21 @@ class TestStaticEventChannelIdentity:
         -- A shared find-or-create BindableEvent service: returns one stable
         -- instance per channel name (idempotent), mirroring production.
         local _channels = {}
-        services.findOrCreateChannel = function(name, parentPath)
-            if _channels[name] == nil then
+        services.findOrCreateChannel = function(name, parentPath, moduleFolder)
+            -- Key by the FULL channel location (parent/folder/name), mirroring the
+            -- real per-module Folder hierarchy — two channels with the same bare
+            -- name under DISTINCT folders are DISTINCT instances.
+            local key = tostring(parentPath) .. "/" .. tostring(moduleFolder)
+                .. "/" .. tostring(name)
+            if _channels[key] == nil then
                 local b = {Event = {}, _isChannelService = true}
                 b.Event.Connect = function(_, fn)
                     b._fn = fn ; return {Disconnect = function() end}
                 end
                 b.Fire = function(self, v) if self._fn then self._fn(v) end end
-                _channels[name] = b
+                _channels[key] = b
             end
-            return _channels[name]
+            return _channels[key]
         end
         local engine = SceneRuntime.new(services, plan)
         engine:start("client")
@@ -3853,7 +3858,8 @@ class TestStaticEventChannelIdentity:
         channels = (
             'static_channels = {'
             '{module_id = "prod", field_name = "Channel", '
-            'channel_name = "Channel", parent_path = "RS", '
+            'channel_name = "Channel", module_folder = "sec_Producer_aaaa", '
+            'parent_path = "RS", '
             'module_path = "RS.Producer", domain = "client"}},'
         )
         scenario = textwrap.dedent(
@@ -3881,18 +3887,21 @@ class TestStaticEventChannelIdentity:
                 scenes = {}, prefabs = {}, domain_overrides = {},
                 static_channels = {
                     {module_id = "prod", field_name = "Channel",
-                     channel_name = "Channel", parent_path = "RS",
+                     channel_name = "Channel",
+                     module_folder = "sec_Producer_aaaa", parent_path = "RS",
                      module_path = "RS.Producer", domain = "client"}},
             }
             local services = servicesFor(plan, {prod = Producer}, {})
             local _created = 0
             local _channels = {}
-            services.findOrCreateChannel = function(name)
-                if _channels[name] == nil then
+            services.findOrCreateChannel = function(name, parentPath, moduleFolder)
+                local key = tostring(parentPath) .. "/" .. tostring(moduleFolder)
+                    .. "/" .. tostring(name)
+                if _channels[key] == nil then
                     _created = _created + 1
-                    _channels[name] = {_id = name}
+                    _channels[key] = {_id = key}
                 end
-                return _channels[name]
+                return _channels[key]
             end
             local engine = SceneRuntime.new(services, plan)
             engine:_ensureStaticEventChannels("client")

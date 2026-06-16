@@ -810,6 +810,10 @@ class TestStaticChannelsFromCsAnalysis:
             assert c["parent_path"] == "ReplicatedStorage"
             assert c["module_path"] == "ReplicatedStorage.Player"
             assert c["domain"] == "client"
+            # The per-module folder is dot-free (parent_path is split on ".") and
+            # shared across one module's channels (same module_id → same folder).
+            assert "." not in c["module_folder"]
+        assert len({c["module_folder"] for c in channels}) == 1
 
     def test_channels_embedded_in_emitted_plan_module(self, tmp_path):
         """End-to-end through the full subphase: the emitted SceneRuntimePlan

@@ -44,9 +44,19 @@ from core.roblox_types import RbxScript
 
 @dataclass(frozen=True)
 class StaticEventDecl:
-    """One emitted module's C# ``static event`` declaration, with the producer's
+    """One PRODUCER MODULE's C# ``static event`` declaration, with the producer's
     VM/domain so the rendezvous check can require a SAME-DOMAIN consumer.
 
+    Keyed in the feed dict by the module's FULL UNIQUE identity (``module_id`` —
+    the ``.cs`` GUID / project-relative path), NOT the emitted-name tail. Two
+    different modules that lower to the SAME emitted name (e.g. two ``Player``
+    classes on different VMs) get SEPARATE decls and are verified INDEPENDENTLY, so
+    a canonical one cannot satisfy — and thereby mask — a different broken one (the
+    same-tail merge that previously retained only the first domain).
+
+    ``name``: the EMITTED module name (the Luau module-table prefix the producer
+        fires + the consumer reads, e.g. ``Player`` in ``Player.AmmoUpdate``). The
+        verifier scans the emitted Luau for ``<name>.<field>``.
     ``events``: the C# member names this module declares (== the Luau module-table
         field names the producer fires + the consumer reads).
     ``domain``: ``"client"`` | ``"server"`` — the producer module's resolved VM.
@@ -55,8 +65,18 @@ class StaticEventDecl:
         on the OTHER VM reads nil. The rendezvous is therefore satisfied only by a
         read reachable on the producer's VM; a cross-domain consumer needs a
         RemoteEvent bridge (out of scope) and must fail closed, not silently pass.
+
+    KNOWN BLIND SPOT (named non-guarantee): the rendezvous match is a regex over a
+    concatenated per-domain code blob, so two modules with the SAME emitted ``name``
+    on the SAME domain (or a canonical producer whose code is a NEUTRAL
+    ReplicatedStorage ModuleScript reachable by both VMs) are still
+    text-indistinguishable — one can satisfy the other within that shared blob. This
+    re-keying CLOSES the cross-VM masking (the reported finding) but does NOT close
+    same-domain/neutral same-name ambiguity; that needs a per-module producer-source
+    join (``RbxScript`` carries no script id today) and is scoped as a follow-on.
     """
 
+    name: str
     events: list[str]
     domain: str
 
@@ -90,16 +110,18 @@ class ContractVerifierResult:
 def verify_contract(
     topology: TopologyArtifact,
     scripts: list[RbxScript],
-    static_events_by_script: dict[str, StaticEventDecl] | None = None,
+    static_events_by_module: dict[str, StaticEventDecl] | None = None,
 ) -> ContractVerifierResult:
     """Run the shadow-mode contract checks. Emits a smoke violation when
     ``topology`` carries no ``modules`` block (the artifact never reached us).
 
-    ``static_events_by_script`` maps an emitted script NAME (== the Luau module
-    table prefix) to a ``StaticEventDecl`` (the C# ``static event`` member names
-    that module declares + the producer's resolved domain) — the deterministic
-    upstream signal for the rendezvous check. Default None /
-    empty means "no static-event channels to verify" (the check abstains, no rows).
+    ``static_events_by_module`` maps each producer module's UNIQUE ``module_id`` to
+    a ``StaticEventDecl`` (its emitted ``name``, the C# ``static event`` member
+    names it declares + the producer's resolved domain) — the deterministic
+    upstream signal for the rendezvous check. Keying by ``module_id`` (not the
+    emitted-name tail) verifies each producer independently so a canonical module
+    cannot mask a different same-named broken one. Default None / empty means "no
+    static-event channels to verify" (the check abstains, no rows).
     """
     violations: list[ContractViolation] = []
 
@@ -126,7 +148,7 @@ def verify_contract(
     violations.extend(_check_rig_binding_present(topology, scripts))
     violations.extend(_check_surviving_child_ordinal(topology, scripts))
     violations.extend(
-        _check_static_event_rendezvous(scripts, static_events_by_script or {})
+        _check_static_event_rendezvous(scripts, static_events_by_module or {})
     )
     return ContractVerifierResult(violations=violations)
 
@@ -159,9 +181,10 @@ def verify_contract(
 # and records an ``static_event_unconverted`` warning otherwise (fail-closed: a
 # visible, recorded diagnostic, never a silent "assume repaired" abstain).
 #
-# Keyed on the DETERMINISTIC C# static-event list (``static_events_by_script``),
-# NOT a fingerprint of the AI output — so it can't silently miss a channel the AI
-# emitted in a shape the scan didn't anticipate.
+# Keyed on the DETERMINISTIC C# static-event list (``static_events_by_module``,
+# per UNIQUE module_id), NOT a fingerprint of the AI output — so it can't silently
+# miss a channel the AI emitted in a shape the scan didn't anticipate, and a
+# canonical same-named module on one VM cannot mask a broken one on another.
 
 # String-literal stripping (in ADDITION to comments): the rendezvous scan must run
 # over CODE only. A string ``"Player.AmmoUpdate = ensureEvent(...)"`` is prose, not
@@ -219,17 +242,23 @@ def _script_vm_domain(script: RbxScript) -> str:
 
 def _check_static_event_rendezvous(
     scripts: list[RbxScript],
-    static_events_by_script: dict[str, StaticEventDecl],
+    static_events_by_module: dict[str, StaticEventDecl],
 ) -> list[ContractViolation]:
-    """For each C#-declared static event ``<Module>.<Field>``, confirm the emitted
-    Luau carries the load-bearing rendezvous WITHIN the producer's VM/domain: a
-    lazy-init GUARDED producer assignment ``<Module>.<Field> = <Module>.<Field> or
-    ...`` AND a real field read, BOTH reachable on the producer's side. A missing/
-    unguarded assignment OR a missing same-domain read records a fail-closed
-    ``static_event_unconverted`` warning; a read that exists ONLY on the OTHER VM
-    records a ``static_event_cross_domain`` diagnostic (needs a RemoteEvent bridge,
-    out of scope) rather than silently passing."""
-    if not static_events_by_script:
+    """For each PRODUCER MODULE's C#-declared static event ``<name>.<Field>``,
+    confirm the emitted Luau carries the load-bearing rendezvous WITHIN the
+    producer's VM/domain: a lazy-init GUARDED producer assignment ``<name>.<Field> =
+    <name>.<Field> or ...`` AND a real field read, BOTH reachable on the producer's
+    side. A missing/unguarded assignment OR a missing same-domain read records a
+    fail-closed ``static_event_unconverted`` warning; a read that exists ONLY on the
+    OTHER VM records a ``static_event_cross_domain`` diagnostic (needs a RemoteEvent
+    bridge, out of scope) rather than silently passing.
+
+    Iterates per UNIQUE ``module_id`` (the feed key), so two modules with the same
+    emitted ``name`` on DIFFERENT VMs are each scanned against their OWN reachable
+    code — a canonical one on one VM cannot satisfy a broken one on the other. The
+    diagnostic ``script`` + ``identity`` carry the ``module_id`` so the two are
+    distinct, non-colliding rows (operator-visible + dedup-stable)."""
+    if not static_events_by_module:
         return []
 
     # Bucket each script's CODE (comments + strings stripped) by the VM it runs on.
@@ -259,8 +288,9 @@ def _check_static_event_rendezvous(
     )
 
     violations: list[ContractViolation] = []
-    for module_name in sorted(static_events_by_script):
-        decl = static_events_by_script[module_name]
+    for module_id in sorted(static_events_by_module):
+        decl = static_events_by_module[module_id]
+        module_name = decl.name
         producer_domain = decl.domain if decl.domain in ("client", "server") \
             else "neutral"
         same_domain_code = _reachable_code(producer_domain)
@@ -307,7 +337,7 @@ def _check_static_event_rendezvous(
                     ContractViolation(
                         check="static_event_cross_domain",
                         severity="warning",
-                        script=module_name,
+                        script=f"{module_name} ({module_id})",
                         detail=(
                             f"C# static event {ref!r} has a {producer_domain}-side "
                             f"producer but its only field read is on the OTHER VM. "
@@ -316,7 +346,7 @@ def _check_static_event_rendezvous(
                             f"reads nil — a RemoteEvent bridge is required "
                             f"(out of scope)."
                         ),
-                        identity=f"static_event_cross_domain:{ref}",
+                        identity=f"static_event_cross_domain:{module_id}:{ref}",
                     )
                 )
                 continue
@@ -330,14 +360,14 @@ def _check_static_event_rendezvous(
                 ContractViolation(
                     check="static_event_unconverted",
                     severity="warning",
-                    script=module_name,
+                    script=f"{module_name} ({module_id})",
                     detail=(
                         f"C# static event {ref!r} did not lower to the canonical "
                         f"module-field rendezvous (missing: {', '.join(missing)}). "
                         f"The runtime channel pre-set cannot wire this channel — "
                         f"producer + consumer will not share the BindableEvent."
                     ),
-                    identity=f"static_event_unconverted:{ref}",
+                    identity=f"static_event_unconverted:{module_id}:{ref}",
                 )
             )
     return violations

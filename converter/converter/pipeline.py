@@ -4939,20 +4939,22 @@ script.Disabled = true
             plan_path.name,
         )
 
-    def _static_events_by_emitted_name(
+    def _static_events_by_module_id(
         self, scene_runtime: dict[str, object],
     ) -> "dict[str, StaticEventDecl]":
-        """Map each runtime-bearing module's EMITTED script name (the Luau module-
-        table prefix, e.g. ``Player`` in ``Player.AmmoUpdate``) to a
-        ``StaticEventDecl`` (the C# ``static event`` members it declares + the
+        """Map each runtime-bearing PRODUCER MODULE — keyed by its FULL UNIQUE
+        ``module_id`` (the ``modules`` dict key) — to a ``StaticEventDecl`` (its
+        emitted name, the C# ``static event`` members it declares, and the
         producer's resolved domain).
 
         Deterministic upstream signal for the rendezvous verifier: enumerate the
-        C# ``static event`` declarations off the ``.cs`` source via the GUID, then
-        key by the module's join name (``module_path`` tail == ``RbxScript.name``,
-        else ``stem``) so the verifier can scan the emitted Luau for
-        ``<name>.<field>`` WITHIN the producer's VM/domain. NEVER reads the AI
-        output to decide WHICH channels should exist.
+        C# ``static event`` declarations off the ``.cs`` source via the GUID. Keying
+        by ``module_id`` (NOT the emitted-name tail) is the P1#2 fix: two modules
+        that lower to the SAME emitted name (e.g. two ``Player`` classes on
+        different VMs) are kept SEPARATE and verified INDEPENDENTLY, so a canonical
+        one cannot mask a different broken one. ``decl.name`` carries the emitted
+        name the verifier scans the Luau for (``<name>.<field>``). NEVER reads the
+        AI output to decide WHICH channels should exist.
         """
         from converter.contract_verifier import StaticEventDecl
         from unity.script_analyzer import analyze_script
@@ -4987,23 +4989,15 @@ script.Disabled = true
             if not events:
                 continue
             name = module_path.rsplit(".", 1)[-1]
-            # Last-write-wins on a name collision would drop a channel; merge so
-            # two modules sharing an emitted name keep both event sets. A domain
-            # collision (two same-named modules on different VMs) keeps the FIRST
-            # domain — the rendezvous still scans that side + neutral, and a true
-            # cross-VM name clash is degenerate (distinct module_paths share a
-            # tail), surfaced as a missing-read diagnostic rather than masked.
-            if name in result:
-                prior = result[name]
-                merged = list(prior.events)
-                for ev in events:
-                    if ev not in merged:
-                        merged.append(ev)
-                result[name] = StaticEventDecl(events=merged, domain=prior.domain)
-            else:
-                result[name] = StaticEventDecl(
-                    events=list(events), domain=str(domain),
-                )
+            # Key by the UNIQUE ``module_id`` (``script_id``), not the emitted name
+            # tail: two modules that lower to the SAME ``name`` (two ``Player``
+            # classes on different VMs) each get their OWN decl and are verified
+            # independently, so a canonical producer cannot satisfy — and mask — a
+            # different broken one (the prior same-tail merge retained only the
+            # first domain). ``module_id`` is the dict key, so no collision here.
+            result[script_id] = StaticEventDecl(
+                name=name, events=list(events), domain=str(domain),
+            )
         return result
 
     def _run_contract_verifier(self, scene_runtime: dict[str, object]) -> None:
@@ -5029,9 +5023,9 @@ script.Disabled = true
 
         topology = cast("TopologyArtifact", scene_runtime.get("topology", {}))
         scripts = list(self.state.rbx_place.scripts or [])
-        static_events_by_script = self._static_events_by_emitted_name(scene_runtime)
+        static_events_by_module = self._static_events_by_module_id(scene_runtime)
         result = contract_verifier.verify_contract(
-            topology, scripts, static_events_by_script,
+            topology, scripts, static_events_by_module,
         )
 
         # REPLACE the rows (not append): ``ctx.scene_runtime`` persists + reloads

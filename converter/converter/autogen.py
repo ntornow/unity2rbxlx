@@ -830,32 +830,56 @@ local function resolveModule(scriptId, modulePath)
 end
 
 -- Static-event channel identity (design-phase1.md §2A): find-or-create a
--- BindableEvent named ``channelName`` under the dot-joined ``parentPath``
--- container, so the host can pre-set the producer/consumer's shared module
--- field before any Awake. ``parentPath`` is a DataModel container path
--- (``"ReplicatedStorage"`` / ``"ServerScriptService"`` / ...); walk it the same
--- way ``resolveModule`` walks a module path. Idempotent: an existing child of
--- the right name+class is returned as-is (no duplicate event).
-local function findOrCreateChannel(channelName, parentPath)
+-- BindableEvent named ``channelName`` (the bare C# field) under a PER-MODULE
+-- ``Folder`` named ``moduleFolder`` (an opaque module-unique token) under the
+-- dot-joined ``parentPath`` container, so the host can pre-set the
+-- producer/consumer's shared module field before any Awake. The per-module
+-- Folder is the STRUCTURED identity that keeps two classes' same-named static
+-- events DISTINCT without a collision-prone flat ``<stem>_<field>`` name.
+--
+-- ``parentPath`` is a DataModel container path (``"ReplicatedStorage"`` /
+-- ``"ServerScriptService"`` / ...) that must ALREADY EXIST — it is resolved
+-- STRICTLY (nil if any segment is missing) so a malformed path fails closed and
+-- the caller warns, rather than being silently synthesized into a junk tree. Only
+-- the terminal ``moduleFolder`` Folder + its BindableEvent are CREATED. Idempotent:
+-- an existing child of the right name+class is returned as-is (no duplicate).
+local function findOrCreateChannel(channelName, parentPath, moduleFolder)
     if type(channelName) ~= "string" or channelName == "" then return nil end
     if type(parentPath) ~= "string" or parentPath == "" then return nil end
+    if type(moduleFolder) ~= "string" or moduleFolder == "" then return nil end
     local parts = string.split(parentPath, ".")
     local node = game
     for _, part in ipairs(parts) do
         node = node:FindFirstChild(part)
         if not node then return nil end
     end
-    -- Find an EXISTING BindableEvent of this name (idempotent across re-starts).
-    -- A plain ``FindFirstChild`` could hit a same-named WRONG-class sibling and
-    -- then create a duplicate on every call; scan children for the right class.
+    -- Find-or-create the PER-MODULE Folder. Class-aware scan (a same-named
+    -- WRONG-class sibling must not be reused, or it breaks idempotency and the
+    -- BindableEvent parents under the wrong node).
+    local folder
     for _, child in node:GetChildren() do
+        if child.Name == moduleFolder and child:IsA("Folder") then
+            folder = child
+            break
+        end
+    end
+    if not folder then
+        folder = Instance.new("Folder")
+        folder.Name = moduleFolder
+        folder.Parent = node
+    end
+    -- Find an EXISTING BindableEvent of this name under the module folder
+    -- (idempotent across re-starts). A plain ``FindFirstChild`` could hit a
+    -- same-named WRONG-class sibling and then create a duplicate on every call;
+    -- scan children for the right class.
+    for _, child in folder:GetChildren() do
         if child.Name == channelName and child:IsA("BindableEvent") then
             return child
         end
     end
     local event = Instance.new("BindableEvent")
     event.Name = channelName
-    event.Parent = node
+    event.Parent = folder
     return event
 end
 
@@ -1030,29 +1054,47 @@ local function resolveModule(scriptId, modulePath)
     return nil
 end
 
--- See SceneRuntimeClient for the rationale: find-or-create a BindableEvent
--- named ``channelName`` under the dot-joined ``parentPath`` so the host can
--- pre-set the producer/consumer's shared module field before any Awake.
-local function findOrCreateChannel(channelName, parentPath)
+-- See SceneRuntimeClient for the rationale: find-or-create a BindableEvent named
+-- ``channelName`` (bare C# field) under a PER-MODULE ``Folder`` (``moduleFolder``)
+-- under the dot-joined ``parentPath`` so the host can pre-set the
+-- producer/consumer's shared module field before any Awake. ``parentPath`` must
+-- already exist (resolved STRICTLY, nil if missing — fail closed); only the
+-- terminal Folder + BindableEvent are created.
+local function findOrCreateChannel(channelName, parentPath, moduleFolder)
     if type(channelName) ~= "string" or channelName == "" then return nil end
     if type(parentPath) ~= "string" or parentPath == "" then return nil end
+    if type(moduleFolder) ~= "string" or moduleFolder == "" then return nil end
     local parts = string.split(parentPath, ".")
     local node = game
     for _, part in ipairs(parts) do
         node = node:FindFirstChild(part)
         if not node then return nil end
     end
-    -- Find an EXISTING BindableEvent of this name (idempotent across re-starts).
-    -- A plain ``FindFirstChild`` could hit a same-named WRONG-class sibling and
-    -- then create a duplicate on every call; scan children for the right class.
+    -- Find-or-create the PER-MODULE Folder (class-aware: a same-named wrong-class
+    -- sibling must not be reused).
+    local folder
     for _, child in node:GetChildren() do
+        if child.Name == moduleFolder and child:IsA("Folder") then
+            folder = child
+            break
+        end
+    end
+    if not folder then
+        folder = Instance.new("Folder")
+        folder.Name = moduleFolder
+        folder.Parent = node
+    end
+    -- Find an EXISTING BindableEvent of this name under the module folder
+    -- (idempotent across re-starts). Scan for the right class so a same-named
+    -- wrong-class sibling does not trigger a duplicate on every call.
+    for _, child in folder:GetChildren() do
         if child.Name == channelName and child:IsA("BindableEvent") then
             return child
         end
     end
     local event = Instance.new("BindableEvent")
     event.Name = channelName
-    event.Parent = node
+    event.Parent = folder
     return event
 end
 

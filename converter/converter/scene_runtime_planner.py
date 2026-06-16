@@ -20,6 +20,8 @@ this module implements.
 
 from __future__ import annotations
 
+import hashlib
+import re
 from pathlib import Path
 from typing import TypedDict, cast
 
@@ -358,16 +360,32 @@ class SceneRuntimeStaticChannel(TypedDict):
     instance is shared regardless of order. Every field here is derived from the
     DETERMINISTIC C# ``static event`` declaration, never the AI-emitted Luau.
 
-    ``module_id``: the canonical script id (``.cs`` GUID) of the declaring class.
+    ``module_id``: the canonical script id (``.cs`` GUID or project-relative
+        source path) of the declaring class. UNIQUE per module (it is the
+        ``modules`` dict key), so it is the structured identity the channel
+        hierarchy keys on.
     ``field_name``: the C# event member name = the Luau module-table field.
-    ``channel_name``: the BindableEvent INSTANCE name, namespaced per declaring
-        module (``<module_stem>_<field_name>``) so two classes' same-named static
-        events in the same container get DISTINCT instances (no cross-class
-        aliasing). The consumer reads the module FIELD (``field_name``), never the
-        BindableEvent name, so namespacing the instance doesn't affect rendezvous.
-    ``parent_path``: dotted DataModel path of the container the BindableEvent is
-        parented under (the declaring module's own container, e.g.
-        ``ReplicatedStorage`` for a client cross-script signal).
+    ``channel_name``: the BindableEvent INSTANCE name — the BARE ``field_name``.
+        The instance is made unique not by mangling this name but by parenting it
+        under a per-module ``Folder`` (``module_folder``), so two classes' same-
+        named static events get DISTINCT instances under DISTINCT folders (no
+        cross-class aliasing) AND no flat-concat keyspace collision (a flat
+        ``<stem>_<field>`` aliases ``stem="A_B",field="C"`` with
+        ``stem="A",field="B_C"``). The consumer reads the module FIELD
+        (``field_name``), never the BindableEvent name or its location, so the
+        structured location does not affect the rendezvous.
+    ``module_folder``: the OPAQUE, dot-free, collision-resistant token of a per-
+        module ``Folder`` created under ``parent_path``. Derived from the UNIQUE
+        ``module_id`` via a stable hash (NOT a lossy sanitization of the id, which
+        could re-collapse two distinct source-path ids — see
+        ``_module_channel_folder``). The runtime find-or-creates this one Folder
+        under the (strictly-resolved, must-already-exist) ``parent_path`` and
+        parents the BindableEvent under it.
+    ``parent_path``: dotted DataModel path of the (already-existing) container the
+        per-module Folder is created under (the declaring module's own container,
+        e.g. ``ReplicatedStorage`` for a client cross-script signal). The runtime
+        resolves this STRICTLY (fail-closed nil if any segment is missing) and only
+        creates the terminal ``module_folder`` Folder beneath it.
     ``module_path``: dotted DataModel path the runtime ``require``s to reach the
         module table whose field is set.
     ``domain``: ``"client"`` | ``"server"`` — the channel is a same-domain
@@ -378,6 +396,7 @@ class SceneRuntimeStaticChannel(TypedDict):
     module_id: str
     field_name: str
     channel_name: str
+    module_folder: str
     parent_path: str
     module_path: str
     domain: str
@@ -1635,6 +1654,29 @@ def _resolves_to_component(
     return False
 
 
+def _module_channel_folder(module_id: str, module_path: str) -> str:
+    """OPAQUE, dot-free, collision-resistant Folder name for a module's static-
+    event channels, keyed on the UNIQUE ``module_id``.
+
+    ``module_id`` is the canonical script id — a ``.cs`` GUID OR a project-relative
+    source path (per the scene-runtime contract), so it may contain ``/``, ``.``,
+    spaces. A LOSSY sanitization (replace each illegal char with ``_``) could
+    collapse two DISTINCT ids onto one Folder and re-introduce the cross-class
+    aliasing this folder structure exists to prevent. So the uniqueness is carried
+    by a full-id hash (never a sanitized prefix of the id); a readable stem prefix
+    is added purely for debuggability and does NOT carry identity.
+
+    The result contains no ``.`` (the runtime splits ``parent_path`` on ``.``) and
+    is a valid Roblox Instance ``Name``. Deterministic over ``module_id``.
+    """
+    digest = hashlib.sha1(module_id.encode("utf-8")).hexdigest()[:12]
+    stem = module_path.rsplit(".", 1)[-1]
+    # Readable, dot-free prefix (identity is the hash, so a collision here is
+    # harmless). Strip to alphanumerics/underscore; cap length.
+    safe_stem = re.sub(r"[^0-9A-Za-z_]", "", stem)[:32]
+    return f"sec_{safe_stem}_{digest}" if safe_stem else f"sec_{digest}"
+
+
 def build_static_event_channels(
     modules: dict[str, "SceneRuntimeModule | dict[str, object]"],
     static_events_by_script_id: dict[str, list[str]],
@@ -1682,21 +1724,25 @@ def build_static_event_channels(
         if not isinstance(container, str) or not container:
             continue
         # The BindableEvent INSTANCE identity must be unique PER MODULE, not per
-        # field name. Keying ``channel_name`` on the bare field would alias two
-        # different classes' same-named static events in the same container
-        # (``Player.AmmoUpdate`` and ``Enemy.AmmoUpdate`` both in
-        # ReplicatedStorage → one shared BindableEvent → unrelated events
-        # silently cross-wired). Namespace the channel name with the declaring
-        # module's stem so each class gets a DISTINCT instance. The Luau module
-        # FIELD stays the C# member name (``field_name``); only the runtime
-        # instance ``.Name`` / location is module-unique — the consumer reads the
-        # field, never the BindableEvent name, so the rendezvous is unaffected.
-        module_stem = module_path.rsplit(".", 1)[-1]
+        # field name, OR two different classes' same-named static events alias onto
+        # one shared event (``Player.AmmoUpdate`` and ``Enemy.AmmoUpdate`` both in
+        # ReplicatedStorage → unrelated events silently cross-wired). A flat
+        # ``<stem>_<field>`` concat is NOT a safe keyspace: it collides for two
+        # modules with the same stem AND has delimiter ambiguity
+        # (``stem="A_B",field="C"`` vs ``stem="A",field="B_C"`` both →
+        # ``A_B_C``). Use a STRUCTURED identity instead: each module's channels
+        # live under a per-module ``Folder`` keyed on the UNIQUE ``module_id`` (the
+        # ``modules`` dict key), and the BindableEvent is named the BARE
+        # ``field_name``. Distinct folders ⇒ distinct instances, with no concat
+        # keyspace. The Luau module FIELD stays the C# member name (``field_name``);
+        # the consumer reads the field, never the BindableEvent name or location.
+        module_folder = _module_channel_folder(script_id, module_path)
         for field_name in events:
             channels.append({
                 "module_id": script_id,
                 "field_name": field_name,
-                "channel_name": f"{module_stem}_{field_name}",
+                "channel_name": field_name,
+                "module_folder": module_folder,
                 "parent_path": container,
                 "module_path": module_path,
                 "domain": domain,
