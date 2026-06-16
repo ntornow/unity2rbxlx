@@ -118,8 +118,15 @@ def verify_module(
     # Phase 1 (relation #8): runs for EVERY generic module (not gated on player), but is
     # NON-load-bearing -- a surviving ``im`` reject fails OPEN (tagged ``contract-verifier-impulse``).
     violations.extend(_check_raw_apply_impulse(stripped, source))
-    # Phase 2 (relation #8): nonexistent FindFirstChildOfType -> fail-closed (an invalid API crashes).
-    violations.extend(_check_invalid_findfirstchildoftype(stripped, source))
+    # Slice 2.3 (relation #8): the narrow ``fc`` rule (nonexistent
+    # ``FindFirstChildOfType``) is RETIRED here. It lived on this transpile-time
+    # path, which the real bug routed around (mode/cache/route), so it shipped
+    # success=True. The universal provenance-gated net
+    # (``semantic_validators.nonexistent_roblox_method`` →
+    # ``roblox_call_validator.find_invalid_roblox_calls``) runs in ``write_output``
+    # on EVERY final script and is strictly broader (catches any hallucinated
+    # Roblox method, not just ``FindFirstChildOfType``), so it subsumes ``fc``.
+    # ``_check_invalid_findfirstchildoftype`` is no longer invoked.
     if is_player_controller:
         violations.extend(_check_player_camera_write(stripped, source))
         violations.extend(_check_player_humanoid_move(stripped, source))

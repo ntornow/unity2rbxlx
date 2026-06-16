@@ -1,56 +1,61 @@
-"""Phase 2 (relation #8) slice 2.2: the contract verifier flags the nonexistent
-``:FindFirstChildOfType(`` (rule ``fc``) and reprompts toward ``FindFirstChildOfClass``. Unlike the
-impulse rule, an invalid API CRASHES, so ``fc`` is LOAD-BEARING: a surviving violation gets the
-default ``contract-verifier `` tag and promotes to a project fail-closed.
+"""Slice 2.3: the narrow ``fc`` rule (nonexistent ``:FindFirstChildOfType(``) is
+RETIRED from the transpile-time ``verify_module`` path — it lived on a
+bypassable per-route path that shipped the real bug as success=True. The
+universal provenance-gated net (``roblox_call_validator.find_invalid_roblox_calls``,
+surfaced as the ``nonexistent_roblox_method`` semantic rule) subsumes it.
+
+This file's original intent ("FindFirstChildOfType must be caught") is migrated:
+- the OLD assertion (``verify_module`` emits rule ``fc``) is INVERTED to prove
+  retirement;
+- the catch-it intent moves to the net (and the full net suite lives in
+  ``test_roblox_call_net.py``).
 """
 
 from __future__ import annotations
 
 from converter.runtime_contract import verify_module
-from converter.code_transpiler import _format_contract_survivor_warning, _FAIL_OPEN_RULES
-from converter.contract_pipeline import _is_contract_warning, _is_post_reprompt_warning
+from converter.roblox_call_validator import find_invalid_roblox_calls
 
 
 def _fc(src: str):
     return [v for v in verify_module(src).violations if v.rule == "fc"]
 
 
-def test_findfirstchildoftype_is_flagged():
+def test_fc_rule_retired_from_verify_module():
+    # The real bullet shape that the old ``fc`` rule fired on.
     src = 'function C:OnHit(char) local h = char:FindFirstChildOfType("Humanoid"); h:TakeDamage(1) end\nreturn C\n'
-    assert _fc(src), "char:FindFirstChildOfType must be flagged (rule fc)"
+    assert not _fc(src), "rule fc is retired; verify_module must no longer emit it"
 
 
-def test_whitespace_forms_flagged():
-    for call in ('c:FindFirstChildOfType("Humanoid")', 'c: FindFirstChildOfType("Humanoid")',
-                 'c : FindFirstChildOfType ("Humanoid")'):
-        src = f"function C:OnHit(c) local h = {call} end\nreturn C\n"
-        assert _fc(src), f"must flag whitespace form: {call!r}"
+def test_bug_still_caught_by_the_net():
+    # The same hallucinated call is still caught — now by the universal net,
+    # tagged ``proven`` (the receiver ``char = plr.Character`` is Roblox-typed).
+    src = (
+        "function C:OnHit(plr)\n"
+        "    local char = plr.Character\n"
+        '    local h = char:FindFirstChildOfType("Humanoid")\n'
+        "    if h then h:TakeDamage(1) end\n"
+        "end\n"
+        "return C\n"
+    )
+    proven = [
+        c for c in find_invalid_roblox_calls(src)
+        if c["method"] == "FindFirstChildOfType"
+        and c["receiver_provenance"] == "proven"
+    ]
+    assert proven, "the net must catch the FindFirstChildOfType bug as proven"
 
 
-def test_valid_findfirstchildofclass_not_flagged():
-    src = 'function C:OnHit(char) local h = char:FindFirstChildOfClass("Humanoid") end\nreturn C\n'
-    assert not _fc(src), "the VALID FindFirstChildOfClass must NOT be flagged"
-
-
-def test_method_definition_not_flagged():
-    src = "function C:FindFirstChildOfType(t) return nil end\nreturn C\n"
-    assert not _fc(src), "a method definition must not be flagged"
-
-
-def test_long_receiver_method_definition_not_flagged():
-    # Regression (codex phase-2 BLOCKING): a definition with a receiver chain longer than the old
-    # 40-char lookback must still be recognized (a fail-closed false-positive would block conversion).
-    src = ("function ExtremelyLongNamespaceNameForTesting.ComponentClass:FindFirstChildOfType(t) "
-           "return nil end\nreturn C\n")
-    assert not _fc(src), "long-receiver definition must not be flagged"
-
-
-def test_fc_is_fail_closed():
-    src = 'function C:OnHit(c) local h = c:FindFirstChildOfType("Humanoid") end\nreturn C\n'
-    v = _fc(src)[0]
-    warning = _format_contract_survivor_warning(v)
-    # fc is NOT fail-open: it uses the default 'contract-verifier ' tag and promotes to fail-closed.
-    assert "fc" not in _FAIL_OPEN_RULES
-    assert warning.startswith("contract-verifier (rule fc"), warning
-    assert _is_post_reprompt_warning(warning), "fc must promote to project fail-closed"
-    assert _is_contract_warning(warning), "fc is a load-bearing contract warning"
+def test_valid_findfirstchildofclass_not_flagged_by_net():
+    src = (
+        "function C:OnHit(plr)\n"
+        "    local char = plr.Character\n"
+        '    local h = char:FindFirstChildOfClass("Humanoid")\n'
+        "end\n"
+        "return C\n"
+    )
+    bad = [
+        c for c in find_invalid_roblox_calls(src)
+        if c["method"] == "FindFirstChildOfClass"
+    ]
+    assert not bad, "the VALID FindFirstChildOfClass must NOT be flagged"

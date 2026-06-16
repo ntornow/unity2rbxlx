@@ -789,6 +789,70 @@ def _rule_hardcoded_camera_height(
 
 
 # ---------------------------------------------------------------------------
+# Rule 7: nonexistent_roblox_method  (the universal fail-closed net)
+# ---------------------------------------------------------------------------
+#
+# Delegates to the provenance-gated validator
+# (``roblox_call_validator.find_invalid_roblox_calls``), which is the ONE
+# universal detection point every final script passes through (via
+# ``run_semantic_validators(self._collect_all_scripts())`` in ``write_output``).
+# This subsumes the narrow transpile-time ``fc`` rule, which lived on a
+# bypassable per-route path.
+#
+# CRITICAL: the validator does its OWN string/comment handling and computes
+# line numbers from RAW offsets, so this rule reads the unmodified ``source``
+# (arg #2), NOT the runner's pre-stripped ``stripped_for_rule`` (arg #3). It is
+# therefore NOT in ``_RULES_NEEDING_STRINGS``.
+#
+# Proven invalids (the receiver is provably Roblox-typed, so the bad method
+# WILL error at runtime) are emitted as ``severity="error"`` — the write_output
+# promotion fail-closes on exactly these. Unproven invalids (the receiver might
+# not be Roblox-typed) are ``severity="warning"`` — report-only, never gating.
+
+
+def _rule_nonexistent_roblox_method(
+    script: "RbxScript", source: str, stripped: str,
+) -> list[SemanticIssue]:
+    from converter.roblox_call_validator import find_invalid_roblox_calls
+
+    issues: list[SemanticIssue] = []
+    for call in find_invalid_roblox_calls(source):
+        proven = call["receiver_provenance"] == "proven"
+        method = call["method"]
+        line_no = call["line"]
+        fix = call.get("suggested_fix")
+        if proven:
+            suggested_fix = (
+                f"``{method}`` is not a Roblox Instance method and will error "
+                "at runtime on a Roblox-typed receiver. "
+                + (f"Use ``{fix}``." if fix else "Use a real Roblox member.")
+            )
+        else:
+            suggested_fix = (
+                f"``{method}`` is not a known Roblox member; the receiver's "
+                "provenance is unproven, so this is report-only."
+            )
+        issues.append(
+            SemanticIssue(
+                severity="error" if proven else "warning",
+                rule="nonexistent_roblox_method",
+                script=script.name,
+                line=line_no,
+                snippet=_snippet_at(source, line_no),
+                explanation=(
+                    f"Call ``:{method}(`` invokes a method that is not a real "
+                    "Roblox member ("
+                    + ("PROVEN" if proven else "UNPROVEN")
+                    + " Roblox-typed receiver)."
+                ),
+                suggested_fix=suggested_fix,
+                confidence="high" if proven else "low",
+            )
+        )
+    return issues
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -805,6 +869,7 @@ _RULES: tuple[tuple[str, RuleFn], ...] = (
     ("attachment_as_render_parent", _rule_attachment_as_render_parent),
     ("camera_attached_no_per_frame", _rule_camera_attached_no_per_frame),
     ("hardcoded_camera_height", _rule_hardcoded_camera_height),
+    ("nonexistent_roblox_method", _rule_nonexistent_roblox_method),
 )
 
 
