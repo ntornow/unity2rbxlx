@@ -16,7 +16,8 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING
+from typing import Any, Literal
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -2136,10 +2137,25 @@ def _ai_transpile(
     # MODE-AGNOSTIC: the validator keys on provenance + corpus (mode-
     # independent), so this runs for legacy AND generic, closing the bypass
     # that defeated the narrow ``fc`` rule. Reuses the same API client.
+    # Runs LAST so it catches hallucinated calls introduced by any prior
+    # reprompt pass.
+    pre_repair = luau_source
     luau_source, repair_warnings = _repair_invalid_roblox_calls(
         luau_source, _api_reprompt,
     )
     warnings.extend(repair_warnings)
+
+    # If the repair changed the Luau, the contract warnings computed above
+    # are stale -- they describe the PRE-repair source. Recompute them on the
+    # repaired source so a warning about code the repair FIXED no longer
+    # fails-close downstream. Generic-only: contract-verifier tags only exist
+    # in generic mode. ``_refresh_contract_warnings`` preserves non-contract
+    # entries, including the ``roblox-call-survivor`` repair warnings.
+    if luau_source != pre_repair and runtime_mode == "generic":
+        warnings = _refresh_contract_warnings(
+            luau_source, warnings,
+            is_player_controller=is_player_controller,
+        )
 
     # AI transpilation gets a baseline confidence based on output quality.
     confidence = 0.75
@@ -2337,11 +2353,23 @@ def _claude_cli_transpile(
 
     # Bounded agentic repair of PROVEN hallucinated Roblox method calls.
     # MODE-AGNOSTIC (legacy AND generic) -- mirrors the ``_ai_transpile`` cold
-    # path. Reuses the CLI reprompt closure.
+    # path. Reuses the CLI reprompt closure. Runs LAST so it catches
+    # hallucinated calls introduced by any prior reprompt pass.
+    pre_repair = luau_source
     luau_source, repair_warnings = _repair_invalid_roblox_calls(
         luau_source, _cli_reprompt,
     )
     warnings.extend(repair_warnings)
+
+    # If the repair changed the Luau, the contract warnings computed above
+    # are stale -- recompute on the repaired source so a warning about code
+    # the repair FIXED no longer fails-close downstream. Generic-only;
+    # preserves non-contract entries (incl. ``roblox-call-survivor``).
+    if luau_source != pre_repair and runtime_mode == "generic":
+        warnings = _refresh_contract_warnings(
+            luau_source, warnings,
+            is_player_controller=is_player_controller,
+        )
 
     # Score confidence.
     confidence = 0.75

@@ -283,3 +283,161 @@ class TestCacheHitProvenInvalidReTranspiles:
             "a clean cached Luau must be served from cache, not re-transpiled"
         )
         assert luau == CLEAN
+
+
+# ---------------------------------------------------------------------------
+# Post-repair contract-warning recompute (P1): the Roblox-call repair runs
+# LAST, AFTER ``_verify_and_reprompt``. If the contract reprompt left a
+# surviving ``contract-verifier`` tag for code the repair then FIXED, that
+# stale warning must be recomputed away -- otherwise ``contract_pipeline``
+# fails-close a module that was actually repaired.
+# ---------------------------------------------------------------------------
+
+class _SplitMessages:
+    """``client.messages`` stub that answers the contract reprompt and the
+    repair reprompt DIFFERENTLY, keyed on the message content.
+
+    ``_verify_and_reprompt``'s message never says "DO NOT EXIST";
+    ``_repair_invalid_roblox_calls``'s message always does. So:
+      * the contract reprompt gets ``contract_reply`` (here: still broken,
+        so an ``fc`` ``contract-verifier`` survivor tag is recorded), and
+      * the repair reprompt gets ``repair_reply`` (here: the fixed bullet).
+    This is the exact race the P1 finding describes: a stale contract
+    survivor for a call the repair subsequently fixes.
+    """
+
+    def __init__(self, *, contract_reply: str, repair_reply: str) -> None:
+        self._contract_reply = contract_reply
+        self._repair_reply = repair_reply
+        self.calls: list[str] = []
+
+    def create(self, *, model, max_tokens, system, messages):
+        msg = messages[0]["content"]
+        self.calls.append(msg)
+        reply = self._repair_reply if "DO NOT EXIST" in msg else self._contract_reply
+        block = types.SimpleNamespace(text=reply)
+        return types.SimpleNamespace(content=[block])
+
+
+def _install_split_anthropic(
+    monkeypatch, *, contract_reply: str, repair_reply: str,
+) -> _SplitMessages:
+    msgs = _SplitMessages(contract_reply=contract_reply, repair_reply=repair_reply)
+    fake = types.ModuleType("anthropic")
+    fake.Anthropic = (  # type: ignore[attr-defined]
+        lambda *, api_key: _FakeClient(api_key=api_key, messages=msgs)
+    )
+    monkeypatch.setitem(sys.modules, "anthropic", fake)
+    monkeypatch.setattr(code_transpiler, "_luau_syntax_check", lambda src: [])
+    return msgs
+
+
+class TestPostRepairContractRecompute:
+
+    def test_stale_contract_survivor_cleared_after_repair_fix(
+        self, monkeypatch, tmp_path,
+    ):
+        # First output = BROKEN_BULLET (an ``fc`` contract violation on the
+        # hallucinated FindFirstChildOfType). The contract reprompt FAILS to
+        # fix it (returns BROKEN again) -> a surviving ``contract-verifier
+        # (rule fc...)`` tag is recorded. The repair reprompt THEN fixes the
+        # call (returns FIXED_BULLET). Post-fix, the final Luau is clean, so
+        # the recompute MUST drop the stale ``contract-verifier`` survivor.
+        monkeypatch.setattr(code_transpiler, "LLM_CACHE_DIR", str(tmp_path))
+        monkeypatch.setattr(code_transpiler, "LLM_CACHE_ENABLED", False)
+        _install_split_anthropic(
+            monkeypatch, contract_reply=BROKEN_BULLET, repair_reply=FIXED_BULLET,
+        )
+        # The very first model output is BROKEN_BULLET too.
+        monkeypatch.setattr(
+            code_transpiler, "_strip_code_fences", lambda s: s,
+        )
+
+        # Seed the FIRST (pre-reprompt) output by mocking the initial create
+        # to return BROKEN_BULLET: with cache disabled, _ai_transpile's first
+        # client.messages.create call is the initial transpile, which our
+        # split stub answers with contract_reply (no "DO NOT EXIST") = BROKEN.
+        luau, _conf, warnings = _ai_transpile(
+            "csharp", "dummy-key", "claude-sonnet-4",
+            class_name="Bullet", script_type="ModuleScript",
+            project_context="", runtime_mode="generic",
+        )
+
+        # Final Luau is repaired (clean).
+        assert _proven(luau) == [], f"final Luau still has proven invalids: {luau}"
+        # The stale fail-closed ``contract-verifier `` (space) survivor for the
+        # repaired ``fc`` call must be GONE after the recompute.
+        stale = [
+            w for w in warnings
+            if w.startswith("contract-verifier ")  # space = fail-closed survivor
+        ]
+        assert stale == [], (
+            f"stale contract-verifier survivor not recomputed away: {stale}"
+        )
+        # The repair survivor warnings (roblox-call-survivor) are non-contract
+        # and must be PRESERVED by the recompute -- here the fix succeeded so
+        # there is none, but assert no survivor leaked either way.
+        assert not any("roblox-call-survivor" in w for w in warnings), warnings
+
+    def test_recompute_invoked_on_final_source_when_repair_changes_luau(
+        self, monkeypatch, tmp_path,
+    ):
+        # Spy: when the repair changes the Luau in GENERIC mode, the recompute
+        # must run on the FINAL (repaired) source, not the pre-repair source.
+        monkeypatch.setattr(code_transpiler, "LLM_CACHE_DIR", str(tmp_path))
+        monkeypatch.setattr(code_transpiler, "LLM_CACHE_ENABLED", False)
+        monkeypatch.setattr(code_transpiler, "_strip_code_fences", lambda s: s)
+        _install_split_anthropic(
+            monkeypatch, contract_reply=BROKEN_BULLET, repair_reply=FIXED_BULLET,
+        )
+
+        seen_sources: list[str] = []
+        real_refresh = code_transpiler._refresh_contract_warnings
+
+        def _spy(luau_source, cached_warnings, is_player_controller=False):
+            seen_sources.append(luau_source)
+            return real_refresh(
+                luau_source, cached_warnings,
+                is_player_controller=is_player_controller,
+            )
+
+        monkeypatch.setattr(code_transpiler, "_refresh_contract_warnings", _spy)
+
+        _ai_transpile(
+            "csharp", "dummy-key", "claude-sonnet-4",
+            class_name="Bullet", script_type="ModuleScript",
+            project_context="", runtime_mode="generic",
+        )
+        # The post-repair recompute ran on the FIXED (repaired) source.
+        assert any(s.strip() == FIXED_BULLET.strip() for s in seen_sources), (
+            "recompute was not invoked on the repaired source: "
+            f"{seen_sources}"
+        )
+
+    def test_legacy_mode_skips_post_repair_recompute(
+        self, monkeypatch, tmp_path,
+    ):
+        # CONTRAST: in legacy mode there are no contract warnings to refresh,
+        # so the post-repair recompute must NOT run even when repair changes
+        # the Luau.
+        monkeypatch.setattr(code_transpiler, "LLM_CACHE_DIR", str(tmp_path))
+        monkeypatch.setattr(code_transpiler, "LLM_CACHE_ENABLED", False)
+        monkeypatch.setattr(code_transpiler, "_strip_code_fences", lambda s: s)
+        _install_split_anthropic(
+            monkeypatch, contract_reply=BROKEN_BULLET, repair_reply=FIXED_BULLET,
+        )
+
+        seen: list[str] = []
+        monkeypatch.setattr(
+            code_transpiler, "_refresh_contract_warnings",
+            lambda src, w, is_player_controller=False: (seen.append(src) or w),
+        )
+
+        _ai_transpile(
+            "csharp", "dummy-key", "claude-sonnet-4",
+            class_name="Bullet", script_type="ModuleScript",
+            project_context="", runtime_mode="legacy",
+        )
+        assert seen == [], (
+            "legacy mode must not invoke the contract-warning recompute"
+        )
