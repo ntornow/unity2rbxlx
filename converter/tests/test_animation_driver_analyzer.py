@@ -147,6 +147,66 @@ class TestExtractAnimatorParamWrites:
             {"SetBool", "SetTrigger", "SetFloat", "SetInteger"}
         )
 
+    def test_comment_split_write_still_extracts_after_strip(self) -> None:
+        """A ``// comment`` interleaved between receiver and ``.SetBool``
+        is blanked to spaces (newline kept) by the accessor; the DOTALL,
+        whitespace-tolerant write regex still matches across the gap →
+        ``{"open"}``. The comment cannot inject a spurious param."""
+        raw = (
+            "private Animator doorAnim { get { return null; } }\n"
+            "void F(){\n"
+            "  doorAnim // toggle the door\n"
+            '    .SetBool("open", value);\n'
+            "}\n"
+        )
+        stripped = _strip_cs_noise(raw, preserve_strings=True)
+        assert extract_animator_param_writes(stripped) == frozenset({"open"})
+
+    def test_quote_inside_line_comment_yields_no_param(self) -> None:
+        """A ``"`` inside a ``//`` line comment is blanked with the rest of
+        the comment → no spurious param/binding."""
+        raw = (
+            "[SerializeField] Animator anim;\n"
+            'void F(){ // anim.SetBool("open") was here\n'
+            "}\n"
+        )
+        stripped = _strip_cs_noise(raw, preserve_strings=True)
+        assert extract_animator_param_writes(stripped) == frozenset()
+
+    def test_double_slash_inside_preserved_string_is_not_a_comment(
+        self,
+    ) -> None:
+        """A ``//`` sequence INSIDE a preserved string literal must not be
+        treated as a comment — the whole string survives, so the param
+        ``a//b`` is extracted verbatim."""
+        raw = (
+            "[SerializeField] Animator anim;\n"
+            'void F(){ anim.SetBool("a//b", true); }\n'
+        )
+        stripped = _strip_cs_noise(raw, preserve_strings=True)
+        assert '"a//b"' in stripped  # string survived, // not a comment
+        assert extract_animator_param_writes(stripped) == frozenset({"a//b"})
+
+
+class TestStripPreserveStringsBackCompat:
+
+    def test_preserve_strings_false_is_byte_identical_to_default(
+        self,
+    ) -> None:
+        """Load-bearing back-compat: ``preserve_strings=False`` is
+        BYTE-IDENTICAL to the default (no kwarg) on a sample mixing
+        strings, char literals, line + block comments. Every existing
+        ``_strip_cs_noise`` caller relies on this default behavior."""
+        raw = (
+            'string s = "keep"; // line comment with "quote"\n'
+            "/* block\n"
+            ' comment */ char c = \'x\'; anim.SetBool("open", true);\n'
+            '@"verbatim ""inner"" string"\n'
+        )
+        explicit_false = _strip_cs_noise(raw, preserve_strings=False)
+        default = _strip_cs_noise(raw)
+        assert explicit_false == default
+
 
 # ---------------------------------------------------------------------------
 # _strip_cs_noise(preserve_strings=...) / _load_cs_source_preserving_strings

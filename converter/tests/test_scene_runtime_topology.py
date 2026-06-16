@@ -1754,6 +1754,86 @@ class TestPhase2SourceNarrowing:
         )
         assert result is None
 
+    def test_zero_ref_same_module_multiple_instances_dedup_resolves_once(
+        self, tmp_path: Path,
+    ) -> None:
+        """The SAME module placed by MULTIPLE instances in the 0-ref scope
+        is counted ONCE (dedup in ``_narrow_driver_by_param_writes`` via
+        ``dict.fromkeys``) → resolves to that single driver, NOT the
+        ``len(matched) != 1`` ambiguous-None branch (DP3)."""
+        prefab_id = "guid-dup:Assets/Prefabs/Dup.prefab"
+        sr = _mk_artifact(
+            modules={"guid-door": _mk_module("Door", "client")},
+            prefabs={
+                prefab_id: {
+                    "name": "Dup", "template_name": "Dup",
+                    # Two instances → ONE shared script_id (same MB class
+                    # placed twice). Without dedup this would yield two
+                    # matched script_ids → ambiguous-None.
+                    "instances": [
+                        {"instance_id": "P:1", "script_id": "guid-door",
+                         "game_object_id": "P:go-1", "active": True,
+                         "enabled": True, "config": {}},
+                        {"instance_id": "P:2", "script_id": "guid-door",
+                         "game_object_id": "P:go-2", "active": True,
+                         "enabled": True, "config": {}},
+                    ],
+                    "references": [],  # 0-ref → Phase-2 path
+                    "lifecycle_order": [],
+                },
+            },
+        )
+        idx = _mk_guid_index_with_sources(tmp_path, {
+            "guid-door": (
+                "private Animator doorAnim { get { return null; } }\n"
+                'void F(){ doorAnim.SetBool("open", value); }\n'
+            ),
+        })
+        result = resolve_driver(
+            sr, scope_kind="prefab", scope_ref=prefab_id,
+            guid_index=idx, observed_attribute="open",
+        )
+        assert result == ("guid-door", "client")
+
+    def test_zero_ref_matching_server_mb_stays_server(
+        self, tmp_path: Path,
+    ) -> None:
+        """A uniquely-matched driver whose module domain is ``server``
+        passes through as ``(guid, "server")`` — the resolver inherits the
+        MB's domain and does NOT force it to client (D8)."""
+        artifact, prefab_id = _mk_zero_ref_scope_artifact(
+            mbs={"guid-srv": "server"},
+        )
+        idx = _mk_guid_index_with_sources(tmp_path, {
+            "guid-srv": (
+                "private Animator anim { get { return null; } }\n"
+                'void F(){ anim.SetInteger("phase", n); }\n'
+            ),
+        })
+        result = resolve_driver(
+            artifact, scope_kind="prefab", scope_ref=prefab_id,
+            guid_index=idx, observed_attribute="phase",
+        )
+        assert result == ("guid-srv", "server")
+
+    def test_zero_ref_empty_guid_index_resolves_nothing_returns_none(
+        self, tmp_path: Path,
+    ) -> None:
+        """An empty (but constructed) ``GuidIndex`` resolves no guid →
+        ``_load_cs_source_preserving_strings`` returns "" for every scope
+        MB → no match → None. Distinct from ``guid_index=None`` (which
+        short-circuits earlier): here the index object exists but is empty."""
+        artifact, prefab_id = _mk_zero_ref_scope_artifact(
+            mbs={"guid-door": "client"},
+        )
+        empty_idx = GuidIndex(project_root=tmp_path)  # no guid_to_entry
+        assert empty_idx.resolve("guid-door") is None  # resolves nothing
+        result = resolve_driver(
+            artifact, scope_kind="prefab", scope_ref=prefab_id,
+            guid_index=empty_idx, observed_attribute="open",
+        )
+        assert result is None
+
 
 # ===========================================================================
 # CATEGORY 4: stable_id injectivity
