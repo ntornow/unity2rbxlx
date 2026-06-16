@@ -1,0 +1,134 @@
+"""Tests for the provenance-gated Roblox-call validator (slice 1.2).
+
+The load-bearing test is :func:`test_zero_proven_false_positives`: across the
+entire frozen fixture corpus of real converted output, the ONLY ``proven``
+invalid calls must be exactly the two ``FindFirstChildOfType`` bug sites. This
+encodes the design's correctness guarantee — do NOT loosen it to pass; fix the
+provenance logic (or escalate) if it breaks.
+"""
+
+from __future__ import annotations
+
+import glob
+import os
+
+from converter.roblox_call_validator import find_invalid_roblox_calls
+
+_FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "roblox_calls")
+
+# The two known bug sites (path suffix, method) — proven FindFirstChildOfType.
+_BUG_SITES = {
+    ("drive-door-generic/TurretBullet.luau", "FindFirstChildOfType"),
+    ("drive-door-generic/PlaneBullet.luau", "FindFirstChildOfType"),
+}
+
+
+def _all_fixture_files() -> list[str]:
+    return sorted(
+        glob.glob(os.path.join(_FIXTURE_DIR, "**", "*.luau"), recursive=True)
+    )
+
+
+def _rel(path: str) -> str:
+    return os.path.relpath(path, _FIXTURE_DIR)
+
+
+def test_fixture_corpus_is_present() -> None:
+    files = _all_fixture_files()
+    # drive-door-generic (42) + trash-dash (120).
+    assert len(files) >= 160, f"expected >=160 fixture scripts, got {len(files)}"
+
+
+def test_two_bug_sites_caught_as_proven() -> None:
+    """Both FindFirstChildOfType bug sites are flagged proven with the fix."""
+    found: set[tuple[str, str]] = set()
+    for path in _all_fixture_files():
+        src = open(path, encoding="utf-8").read()
+        for ic in find_invalid_roblox_calls(src):
+            if ic["method"] != "FindFirstChildOfType":
+                continue
+            assert ic["receiver_provenance"] == "proven", (
+                f"{_rel(path)}: FindFirstChildOfType should be proven"
+            )
+            assert ic["suggested_fix"] == "FindFirstChildWhichIsA", (
+                f"{_rel(path)}: expected suggested_fix"
+            )
+            found.add((_rel(path), ic["method"]))
+    assert found == _BUG_SITES, f"bug sites mismatch: {found}"
+
+
+def test_zero_proven_false_positives() -> None:
+    """LOAD-BEARING: the only proven invalids in the whole corpus are the 2 bugs.
+
+    Iterate every fixture, collect every ``proven`` InvalidCall, and assert the
+    set of (file, method) equals exactly the two bug sites. Any extra proven
+    invalid is a false positive (or a real new bug) and must be reported, not
+    suppressed.
+    """
+    proven: set[tuple[str, str]] = set()
+    for path in _all_fixture_files():
+        src = open(path, encoding="utf-8").read()
+        for ic in find_invalid_roblox_calls(src):
+            if ic["receiver_provenance"] == "proven":
+                proven.add((_rel(path), ic["method"]))
+    assert proven == _BUG_SITES, (
+        "proven invalids must be exactly the 2 bug sites; got: "
+        f"{sorted(proven)}"
+    )
+
+
+# --- Targeted inline-snippet unit tests ------------------------------------
+
+
+def _methods(src: str) -> list[tuple[str, str, str | None]]:
+    return [
+        (ic["method"], ic["receiver_provenance"], ic["suggested_fix"])
+        for ic in find_invalid_roblox_calls(src)
+    ]
+
+
+def test_plr_character_inline_proven() -> None:
+    out = _methods('plr.Character:FindFirstChildOfType("Humanoid")')
+    assert out == [("FindFirstChildOfType", "proven", "FindFirstChildWhichIsA")]
+
+
+def test_plr_character_aliased_proven() -> None:
+    src = 'local char = plr.Character\nchar:FindFirstChildOfType("Humanoid")'
+    out = _methods(src)
+    assert out == [("FindFirstChildOfType", "proven", "FindFirstChildWhichIsA")]
+
+
+def test_host_signal_call_skipped() -> None:
+    out = _methods("self.host:connectGameObjectSignal(a, b, c)")
+    assert out == []
+
+
+def test_host_dotted_call_skipped() -> None:
+    out = _methods("self.host.foo:Bar()")
+    assert out == []
+
+
+def test_host_result_receiver_not_proven() -> None:
+    src = 'local gm = self.host.findObjectOfType("GameManager")\ngm:RestartGame(5)'
+    out = find_invalid_roblox_calls(src)
+    assert len(out) == 1
+    assert out[0]["method"] == "RestartGame"
+    # Must NOT be proven — the receiver derives from a host result.
+    assert out[0]["receiver_provenance"] != "proven"
+
+
+def test_workspace_valid_method_no_invalid() -> None:
+    out = _methods('workspace:FindFirstChild("X")')
+    assert out == []
+
+
+def test_humanoid_takedamage_valid() -> None:
+    src = 'local humanoid = char:FindFirstChildWhichIsA("Humanoid")\nhumanoid:TakeDamage(10)'
+    out = _methods(src)
+    assert out == []
+
+
+def test_proven_char_getpivot_valid() -> None:
+    src = "local char = plr.Character\nchar:GetPivot()"
+    out = _methods(src)
+    assert out == []
