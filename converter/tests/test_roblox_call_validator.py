@@ -337,3 +337,49 @@ def test_workspace_bare_hallucinated_proven() -> None:
     """REGRESSION: bare ``workspace`` global -> proven (same root bug as script)."""
     out = _methods("workspace:FakeMethod()")
     assert out == [("FakeMethod", "proven", None)]
+
+
+# --- Method DEFINITIONS are not invalid calls (logic-bug fix) ----------------
+
+
+def test_method_definition_not_flagged() -> None:
+    """A ``function Foo:OnHit(other)`` DEFINITION is not a call — no issue.
+
+    Previously the scanner saw ``:OnHit(`` and emitted an (unproven) invalid
+    call for the method's own definition site. A definition is not a call to a
+    nonexistent method, so NEITHER a proven NOR an unproven issue may surface.
+    """
+    src = "function Player:OnHit(other)\n  return other\nend"
+    out = find_invalid_roblox_calls(src)
+    assert [ic for ic in out if ic["method"] == "OnHit"] == [], (
+        f"method definition OnHit must not be flagged: {out}"
+    )
+
+
+def test_dotted_method_definition_not_flagged() -> None:
+    """The dotted-receiver form ``function Foo.Bar:Baz()`` is also a definition."""
+    src = "function Foo.Bar:Baz()\nend"
+    out = find_invalid_roblox_calls(src)
+    assert [ic for ic in out if ic["method"] == "Baz"] == [], (
+        f"dotted method definition Baz must not be flagged: {out}"
+    )
+
+
+def test_method_def_does_not_over_skip_real_bug() -> None:
+    """A real proven bug on a separate line is STILL flagged (no over-skip).
+
+    The definition guard must not suppress a genuine invalid call that follows
+    the definition — here the proven ``FindFirstChildOfType`` bug.
+    """
+    src = (
+        "function Bullet:OnHit(plr)\n"
+        "  local char = plr.Character\n"
+        '  char:FindFirstChildOfType("Humanoid")\n'
+        "end"
+    )
+    out = find_invalid_roblox_calls(src)
+    bug = [ic for ic in out if ic["method"] == "FindFirstChildOfType"]
+    assert len(bug) == 1, f"the real bug must still be flagged: {out}"
+    assert bug[0]["receiver_provenance"] == "proven"
+    # And the definition itself produced no OnHit issue.
+    assert [ic for ic in out if ic["method"] == "OnHit"] == []

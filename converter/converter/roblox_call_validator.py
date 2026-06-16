@@ -96,6 +96,25 @@ _IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
 # receiver chain. Group 1 = method name.
 _CALL_RE = re.compile(r":(" + _IDENT + r")\s*\(")
 
+# A method DEFINITION ``function <receiver>:Name(...)`` is not a call to a
+# nonexistent method — don't flag it. The ``[\w.]*`` receiver allows the dotted
+# form ``function Foo.Bar:Baz(...)``; the trailing ``\s*`` tolerates the
+# whitespace-legal ``function C : Baz`` spelling. Mirrors
+# ``runtime_contract._is_method_def_call``. Matched against the text on the
+# current line BEFORE the ``:`` colon.
+_FUNC_DEF_PREFIX_RE = re.compile(r"\bfunction\s+[\w.]*\s*$")
+
+
+def _is_method_def(code: str, colon_idx: int) -> bool:
+    """True when the ``:Name(`` at ``colon_idx`` is a method DEFINITION.
+
+    ``code`` is a single (string/comment-stripped) line; ``colon_idx`` is the
+    index of the ``:``. A definition like ``function Foo:OnHit(other)`` (or
+    ``function Foo.Bar:Baz()``) is not a call to a nonexistent method, so the
+    scanner must skip it.
+    """
+    return _FUNC_DEF_PREFIX_RE.search(code[:colon_idx]) is not None
+
 
 def _strip_strings_and_comments(line: str) -> str:
     """Blank out Luau string literals and ``--`` comments on a single line.
@@ -491,6 +510,8 @@ def find_invalid_roblox_calls(luau_source: str) -> list[InvalidCall]:
         for m in _CALL_RE.finditer(code):
             method = m.group(1)
             colon_idx = m.start()
+            if _is_method_def(code, colon_idx):
+                continue  # ``function X:Name(...)`` definition, not a call
             receiver = _receiver_chain(code, colon_idx)
             if not receiver:
                 # Leading ``:`` continuation of a chain split across lines:
