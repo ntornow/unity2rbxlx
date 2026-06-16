@@ -124,6 +124,39 @@ def _contract_failure_errors(fail_closed: "list") -> list[str]:
     ]
 
 
+# Distinct prefix for the universal-net fail-closed promotion (Slice 2.3).
+# Mirrors the contract-verifier's ``CONTRACT_ERROR_PREFIX`` convention so a
+# ``materialize_and_classify`` resume can drop-prior-then-re-add the net's
+# rows in ``ctx.errors`` (append-only would duplicate across reruns).
+ROBLOX_CALL_ERROR_PREFIX = "[roblox-call:"
+
+
+def _roblox_call_net_errors(semantic_report: "object") -> list[str]:
+    """Render each PROVEN ``nonexistent_roblox_method`` semantic issue as a
+    fail-closed conversion-error string.
+
+    Pure: returns a fresh list, mutates nothing. Filters strictly to the
+    ``nonexistent_roblox_method`` rule's PROVEN issues (``severity == "error"``)
+    — unproven issues stay report-only and never gate. Each string is prefixed
+    with :data:`ROBLOX_CALL_ERROR_PREFIX` so the caller can replace (not
+    duplicate) the prior run's rows on a resume.
+    """
+    issues = getattr(semantic_report, "issues", None)
+    if not issues:
+        return []
+    out: list[str] = []
+    for issue in issues:
+        if getattr(issue, "rule", None) != "nonexistent_roblox_method":
+            continue
+        if getattr(issue, "severity", None) != "error":
+            continue
+        out.append(
+            f"{ROBLOX_CALL_ERROR_PREFIX} {issue.script}:{issue.line} "
+            f"{issue.snippet}]"
+        )
+    return out
+
+
 @dataclass
 class PipelineState:
     """Intermediate state passed between pipeline phases."""
@@ -2753,6 +2786,25 @@ return table.concat(allData, "\\n")'''
             )
             for rule, count in semantic_report.counts_by_rule.items():
                 log.info("[write_output]   %s: %d", rule, count)
+
+        # Slice 2.3 universal fail-closed net. The semantic report is
+        # report-only by default; here we promote the PROVEN
+        # ``nonexistent_roblox_method`` issues to ``ctx.errors`` so
+        # ``success = len(ctx.errors) == 0`` flips False rather than shipping
+        # a place whose hit-handler calls a hallucinated Roblox method (which
+        # errors at runtime). This is the ONE universal point every final
+        # script passes through — it does NOT depend on the transpile-time
+        # contract path (which the bug routed around).
+        #
+        # REPLACE the net-owned rows, don't append: ``ctx.errors`` persists +
+        # reloads across a ``materialize_and_classify`` resume, so a prior
+        # run's promotion would survive a now-clean rerun. Drop every prior
+        # ``[roblox-call:``-prefixed row FIRST, then re-add the current set.
+        self.ctx.errors[:] = [
+            e for e in self.ctx.errors
+            if not e.startswith(ROBLOX_CALL_ERROR_PREFIX)
+        ]
+        self.ctx.errors.extend(_roblox_call_net_errors(semantic_report))
 
         self._subphase_finalize_scripts_to_disk()
 
