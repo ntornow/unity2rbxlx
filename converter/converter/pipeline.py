@@ -4949,12 +4949,12 @@ script.Disabled = true
 
         Deterministic upstream signal for the rendezvous verifier: enumerate the
         C# ``static event`` declarations off the ``.cs`` source via the GUID. Keying
-        by ``module_id`` (NOT the emitted-name tail) is the P1#2 fix: two modules
-        that lower to the SAME emitted name (e.g. two ``Player`` classes on
-        different VMs) are kept SEPARATE and verified INDEPENDENTLY, so a canonical
-        one cannot mask a different broken one. ``decl.name`` carries the emitted
-        name the verifier scans the Luau for (``<name>.<field>``). NEVER reads the
-        AI output to decide WHICH channels should exist.
+        by ``module_id`` (NOT the emitted-name tail) keeps two modules that lower to
+        the SAME emitted name (e.g. two ``Player`` classes on different VMs)
+        SEPARATE and verified INDEPENDENTLY, so a canonical one cannot mask a
+        different broken one. ``decl.name`` carries the emitted name the verifier
+        scans the Luau for (``<name>.<field>``). NEVER reads the AI output to decide
+        WHICH channels should exist.
         """
         from converter.contract_verifier import StaticEventDecl
         from unity.script_analyzer import analyze_script
@@ -4973,7 +4973,7 @@ script.Disabled = true
             # so the verifier only demands a rendezvous for channels the runtime
             # actually pre-sets. A helper/excluded/cross-domain/unstamped or
             # non-runtime-bearing module gets NO channel, so flagging its static
-            # events would be spurious noise (dual-voice finding).
+            # events would be spurious noise.
             domain = module.get("domain")
             if domain not in ("client", "server"):
                 continue
@@ -4989,12 +4989,8 @@ script.Disabled = true
             if not events:
                 continue
             name = module_path.rsplit(".", 1)[-1]
-            # Key by the UNIQUE ``module_id`` (``script_id``), not the emitted name
-            # tail: two modules that lower to the SAME ``name`` (two ``Player``
-            # classes on different VMs) each get their OWN decl and are verified
-            # independently, so a canonical producer cannot satisfy — and mask — a
-            # different broken one (the prior same-tail merge retained only the
-            # first domain). ``module_id`` is the dict key, so no collision here.
+            # Key by the UNIQUE ``module_id`` (``script_id``), not the emitted
+            # ``name`` tail (see the docstring), so same-name modules stay distinct.
             result[script_id] = StaticEventDecl(
                 name=name, events=list(events), domain=str(domain),
             )

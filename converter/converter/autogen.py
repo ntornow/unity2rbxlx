@@ -638,10 +638,10 @@ def _plan_to_luau(plan: dict) -> str:
 _PLAN_KEYS_FOR_HOST: tuple[str, ...] = (
     "modules", "scenes", "prefabs", "domain_overrides",
     "scriptable_objects", "scene_prefab_placements",
-    # Slice 1.1: the C#-static-event channels the runtime pre-sets before any
-    # Awake batch (``SceneRuntime:_ensureStaticEventChannels``). Without this in
-    # the host allowlist the embedded plan would elide the field and the channel
-    # pre-set would have nothing to set -> the (d) ordering bug resurfaces.
+    # The C#-static-event channels the runtime pre-sets before any Awake batch
+    # (``SceneRuntime:_ensureStaticEventChannels``). Required in the host
+    # allowlist so the embedded plan preserves the channel data the runtime
+    # consumes (else the field is elided and the pre-set has nothing to set).
     "static_channels",
     # Phase 1 (relation #8): the scale-faithful base gravity target (studs/s²),
     # stashed by ``plan_scene_runtime``. The client clone-site gravity hook reads

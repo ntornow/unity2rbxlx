@@ -219,10 +219,10 @@ class TestClassNameNotMatchedInComments:
 
 
 class TestStaticEventEnumeration:
-    """Slice 1.1: ``analyze_script`` surfaces ``public static event`` member
-    names — the deterministic upstream signal for the static-event channel-
-    identity fix. The member name IS the Luau module-table field the converter
-    lowers the event to. NEVER derived from the AI Luau output.
+    """``analyze_script`` surfaces ``public static event`` member names — the
+    deterministic upstream signal for the static-event channel-identity fix. The
+    member name IS the Luau module-table field the converter lowers the event to.
+    NEVER derived from the AI Luau output.
     """
 
     def _info(self, tmp_path: Path, name: str, body: str):
@@ -276,7 +276,7 @@ class TestStaticEventEnumeration:
         assert info.static_events == ["Generic", "Qualified"]
 
     def test_multi_declarator_event(self, tmp_path: Path):
-        # P1 #2 — a SINGLE ``static event`` declaration may bind MULTIPLE members
+        # A SINGLE ``static event`` declaration may bind MULTIPLE members
         # via a comma list. ``public static event H Foo, Bar;`` declares BOTH
         # ``Foo`` AND ``Bar`` of type ``H``; the analyzer must surface every
         # member, not just the last (else the dropped member never reaches the

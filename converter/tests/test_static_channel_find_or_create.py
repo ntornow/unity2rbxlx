@@ -1,9 +1,9 @@
 """Drive the REAL ``findOrCreateChannel`` helper (extracted from the autogen host
 sources) against a fake DataModel.
 
-Slice 1.1 r2 (P1 #1): the helper now parents each channel's BindableEvent under a
-PER-MODULE ``Folder`` (``moduleFolder``) keyed on the unique module_id, with the
-event named the BARE field. This proves the real Luau:
+The helper parents each channel's BindableEvent under a PER-MODULE ``Folder``
+(``moduleFolder``) keyed on the unique module_id, with the event named the BARE
+field. This proves the real Luau:
   * find-or-creates exactly ONE Folder + ONE BindableEvent (idempotent twice-call),
   * keeps two same-bare-name channels under DISTINCT folders DISTINCT,
   * resolves ``parentPath`` STRICTLY — a missing base segment returns nil and does
@@ -152,8 +152,8 @@ def test_creates_one_folder_and_event_then_idempotent():
 
 
 def test_distinct_folders_keep_same_bare_name_distinct():
-    # P1 #1 core: two modules' channels share the bare name ``AmmoUpdate`` but live
-    # under DISTINCT per-module folders -> DISTINCT BindableEvents (no aliasing).
+    # Two modules' channels share the bare name ``AmmoUpdate`` but live under
+    # DISTINCT per-module folders -> DISTINCT BindableEvents (no aliasing).
     rc, out, err = _run_luau("""\
         local a = findOrCreateChannel("AmmoUpdate", "ReplicatedStorage", "sec_A")
         local b = findOrCreateChannel("AmmoUpdate", "ReplicatedStorage", "sec_B")

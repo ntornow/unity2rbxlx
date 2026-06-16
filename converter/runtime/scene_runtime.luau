@@ -2794,7 +2794,7 @@ end
 -- find-or-created BindableEvent named ``channel_name`` (the bare C# field) under a
 -- PER-MODULE ``module_folder`` Folder under ``parent_path`` — BEFORE any
 -- scene/prefab Awake batch. The per-module Folder is the structured identity that
--- keeps two classes' same-named static events DISTINCT. The AI's untouched inline
+-- keeps two classes' same-named static events DISTINCT. The producer's inline
 -- ``Player.X = Player.X or (...)`` then short-circuits onto this instance, so the
 -- producer's ``:Fire`` and the consumer's ``if Player.X then ...:Connect`` resolve
 -- the SAME BindableEvent via the shared field regardless of Awake order.

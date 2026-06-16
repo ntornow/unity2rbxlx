@@ -826,7 +826,7 @@ class TestFailClosedHookPromotion:
 
 
 # ---------------------------------------------------------------------------
-# Check E — static-event channel rendezvous (Slice 1.1, criterion 7).
+# Check E — static-event channel rendezvous.
 # Keyed on the DETERMINISTIC C# static-event list, NOT an AI-output fingerprint.
 # A green result proves the check FIRES on a non-canonical producer, not that it
 # happened to match nothing.
@@ -886,9 +886,9 @@ class TestStaticEventRendezvous:
 
     def test_unconditional_reassignment_fires_failclosed(self):
         # ``X = ensureEvent("X")`` with NO ``or`` guard can OVERWRITE the runtime
-        # pre-set instance with a fresh one (dual-voice adversarial finding) —
-        # the verifier can't prove the create-expr re-finds the pre-set instance,
-        # so it must FAIL CLOSED rather than bless an overwrite.
+        # pre-set instance with a fresh one — the verifier can't prove the
+        # create-expr re-finds the pre-set instance, so it must FAIL CLOSED rather
+        # than bless an overwrite.
         scripts = _scripts(
             ("Player", 'Player.AmmoUpdate = ensureEvent("AmmoUpdate")\n'
              "if Player.AmmoUpdate then Player.AmmoUpdate:Fire(x) end"),
@@ -936,25 +936,11 @@ class TestStaticEventRendezvous:
             "static_event_unconverted:Player:Player.AmmoUpdate")
         assert "lazy-init guarded producer assignment" in fired[0].detail
 
-    def test_missing_read_also_fires(self):
-        # Guarded assignment present but no read anywhere -> still non-canonical
-        # (no consumer rendezvous), fail closed.
-        scripts = _scripts(
-            ("Player", "Player.AmmoUpdate = Player.AmmoUpdate or makeEvent()"),
-        )
-        result = verify_contract(
-            {"modules": {}}, scripts, {"Player": _decl(["AmmoUpdate"])},
-        )
-        fired = [v for v in result.violations
-                 if v.check == "static_event_unconverted"]
-        assert len(fired) == 1
-        assert "consumer/producer field read" in fired[0].detail
-
     def test_lazy_init_self_or_is_not_a_consumer_read(self):
         # ``Player.AmmoUpdate = Player.AmmoUpdate or makeEvent()`` is a producer
         # assignment whose RHS self-reference is the lazy-init idiom, NOT a
-        # consumer rendezvous. With no real :Connect/:Fire/.Event/``then`` use,
-        # the channel has no subscriber -> fail closed.
+        # consumer rendezvous. A guarded assignment with no real
+        # :Connect/:Fire/.Event/``then`` use has no subscriber -> fail closed.
         scripts = _scripts(
             ("Player", "Player.AmmoUpdate = Player.AmmoUpdate or makeEvent()"),
         )
@@ -982,7 +968,7 @@ class TestStaticEventRendezvous:
         assert "lazy-init guarded producer assignment" in fired[0].detail
 
     def test_event_assignment_is_not_a_read(self):
-        # MINOR a — ``Player.AmmoUpdate.Event = bogus`` is an ASSIGNMENT to the
+        # ``Player.AmmoUpdate.Event = bogus`` is an ASSIGNMENT to the
         # BindableEvent's ``.Event`` member, NOT a consumer read. It must NOT
         # satisfy the read requirement (would let a non-subscribing producer-only
         # module spuriously pass). With a guarded assignment present but only this
@@ -1000,8 +986,8 @@ class TestStaticEventRendezvous:
         assert "consumer/producer field read" in fired[0].detail
 
     def test_event_comparison_still_counts_as_read(self):
-        # The MINOR-a tightening rejects ``.Event =`` (single equals) but must
-        # KEEP a ``.Event ==`` comparison as a legitimate read.
+        # The read scan rejects ``.Event =`` (single equals) but must KEEP a
+        # ``.Event ==`` comparison as a legitimate read.
         scripts = _scripts(
             ("Player", "Player.AmmoUpdate = Player.AmmoUpdate or makeEvent()\n"
              "if Player.AmmoUpdate.Event == nil then return end"),
@@ -1014,15 +1000,13 @@ class TestStaticEventRendezvous:
         assert not fired, ".Event == comparison should still count as a read"
 
     def test_cross_domain_consumer_fails_closed(self):
-        # P1 #3 — a CLIENT producer + SERVER consumer must NOT pass. The runtime
-        # pre-sets the channel only on the producer's (client) VM, so the server
-        # consumer reads nil. The rendezvous scan must bucket by VM: the read on
-        # the server-only script does NOT satisfy a client producer; instead a
-        # distinct ``static_event_cross_domain`` diagnostic fires (needs a
+        # A CLIENT producer + SERVER consumer must NOT pass. The producer (client)
+        # only ASSIGNS the field; the sole field READ (``:Connect``) is in the
+        # server consumer. The runtime pre-sets the channel only on the producer's
+        # (client) VM, so the server consumer reads nil. The rendezvous scan must
+        # bucket by VM: the server-only read does NOT satisfy a client producer;
+        # instead a distinct ``static_event_cross_domain`` diagnostic fires (needs a
         # RemoteEvent bridge, out of scope) — NOT a silent pass.
-        # The producer (client) only ASSIGNS the field; the sole field READ
-        # (``:Connect``) is in the server consumer. The runtime pre-set wires the
-        # channel only on the client VM, so the server read sees nil.
         producer = RbxScript(
             name="Player",
             source="Player.AmmoUpdate = Player.AmmoUpdate or makeEvent()",
@@ -1094,18 +1078,14 @@ class TestStaticEventRendezvous:
         assert not fired, f"neutral read should satisfy a server producer: {fired}"
 
     def test_same_emitted_name_different_vm_broken_not_masked(self):
-        # P1 #2 — two PRODUCER modules lower to the SAME emitted name (``Player``)
-        # on DIFFERENT VMs: one CANONICAL (client, fully wired) and one BROKEN
-        # (server, no guarded assignment + no read). The feed is keyed by the
-        # UNIQUE module_id, so each is verified independently against its OWN
-        # reachable code — the canonical client ``Player`` does NOT satisfy the
-        # broken server ``Player`` (different VM, not in its reachable blob), so
-        # the broken module's diagnostic STILL fires.
-        #
-        # RED on the pre-fix same-tail merge: that merged both modules under the
-        # emitted name ``Player``, retained only the FIRST domain, and the
-        # canonical shape satisfied the (single, merged) check — masking the
-        # broken module entirely.
+        # Two PRODUCER modules lower to the SAME emitted name (``Player``) on
+        # DIFFERENT VMs: one CANONICAL (client, fully wired) and one BROKEN (server,
+        # no guarded assignment + no read). The feed is keyed by the UNIQUE
+        # module_id, so each is verified independently against its OWN reachable
+        # code — the canonical client ``Player`` does NOT satisfy the broken server
+        # ``Player`` (different VM, not in its reachable blob), so the broken
+        # module's diagnostic STILL fires. (Guards against a same-emitted-name merge
+        # that would let the canonical module mask the broken one.)
         client_producer = RbxScript(
             name="Player",
             source="Player.AmmoUpdate = Player.AmmoUpdate or makeEvent()\n"

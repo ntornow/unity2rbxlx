@@ -3726,7 +3726,7 @@ class TestScenePrefabPlacementDeferredTiers:
 
 
 # ---------------------------------------------------------------------------
-# Static-event channel identity (Slice 1.1, criterion 1) — RED pre-fix.
+# Static-event channel identity (RED/GREEN ordering-race proof).
 #
 # A UI-owned CONSUMER boots in an early scene batch and reads the producer's
 # module FIELD at its Awake; the PRODUCER boots in a LATER batch and lazily
@@ -3877,8 +3877,8 @@ class TestStaticEventChannelIdentity:
         assert "CONSUMER_RECEIVED=42" in lines, out
 
     def test_idempotent_double_call_creates_no_duplicate(self):
-        """Criterion 6: calling the channel pre-pass twice must reuse the same
-        BindableEvent instance (find-or-create), not create a second one."""
+        """Calling the channel pre-pass twice must reuse the same BindableEvent
+        instance (find-or-create), not create a second one."""
         scenario = textwrap.dedent("""\
             local Producer = {} ; Producer.__index = Producer
             local plan = {

@@ -751,8 +751,8 @@ class TestAssetRefRewriteAndScriptableObjectsMap:
 
 
 # ---------------------------------------------------------------------------
-# Slice 1.1 — static_channels emitted from the REAL C# static-event analysis
-# (criterion 4: reproduce from source, not a hand-edited rbxlx).
+# static_channels emitted from the REAL C# static-event analysis
+# (reproduce from source, not a hand-edited rbxlx).
 # ---------------------------------------------------------------------------
 
 from tests._project_paths import SIMPLEFPS_PATH, is_populated  # noqa: E402

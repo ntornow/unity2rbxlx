@@ -51,8 +51,7 @@ class StaticEventDecl:
     the ``.cs`` GUID / project-relative path), NOT the emitted-name tail. Two
     different modules that lower to the SAME emitted name (e.g. two ``Player``
     classes on different VMs) get SEPARATE decls and are verified INDEPENDENTLY, so
-    a canonical one cannot satisfy — and thereby mask — a different broken one (the
-    same-tail merge that previously retained only the first domain).
+    a canonical one cannot satisfy — and thereby mask — a different broken one.
 
     ``name``: the EMITTED module name (the Luau module-table prefix the producer
         fires + the consumer reads, e.g. ``Player`` in ``Player.AmmoUpdate``). The
@@ -70,10 +69,9 @@ class StaticEventDecl:
     concatenated per-domain code blob, so two modules with the SAME emitted ``name``
     on the SAME domain (or a canonical producer whose code is a NEUTRAL
     ReplicatedStorage ModuleScript reachable by both VMs) are still
-    text-indistinguishable — one can satisfy the other within that shared blob. This
-    re-keying CLOSES the cross-VM masking (the reported finding) but does NOT close
-    same-domain/neutral same-name ambiguity; that needs a per-module producer-source
-    join (``RbxScript`` carries no script id today) and is scoped as a follow-on.
+    text-indistinguishable — one can satisfy the other within that shared blob.
+    Closing that needs a per-module producer-source join (``RbxScript`` carries no
+    script id today) and is scoped as a follow-on.
     """
 
     name: str
@@ -167,8 +165,7 @@ def verify_contract(
 # / etc. — but the LOAD-BEARING invariant is the ``X = X or`` guard, NOT the
 # create-expr shape.
 #
-# UNSAFE shapes the verifier must FAIL CLOSED on (each can defeat the field pre-set
-# — confirmed against the cache + a dual-voice adversarial pass):
+# UNSAFE shapes the verifier must FAIL CLOSED on (each can defeat the field pre-set):
 #   * UNCONDITIONAL reassignment ``X = Instance.new(...)`` / ``X = ensureEvent(...)``
 #     with NO ``or`` guard — overwrites the pre-set instance with a fresh one,
 #     disconnecting consumers already bound to the pre-set channel (safe ONLY if
@@ -189,7 +186,7 @@ def verify_contract(
 # String-literal stripping (in ADDITION to comments): the rendezvous scan must run
 # over CODE only. A string ``"Player.AmmoUpdate = ensureEvent(...)"`` is prose, not
 # a real assignment — leaving it in lets a doc-string / log line spuriously satisfy
-# the rendezvous (an adversarial false-NEGATIVE bypass). Blank to a space to keep
+# the rendezvous. Blank to a space to keep
 # token boundaries. Long-bracket strings (``[[...]]`` / ``[=[...]=]``) are stripped
 # too. (Comments are stripped first by ``_strip_luau_comments``.)
 _RE_LUAU_STRINGS = re.compile(
@@ -307,12 +304,12 @@ def _check_static_event_rendezvous(
             ) is not None
             # Read = a TRUE rendezvous use of the field: ``:Connect`` / ``:Fire``
             # (subscribe/publish), an ``if Module.Field then`` guard, or
-            # ``.Event`` USED as a read — NOT ``.Event = <x>`` (MINOR a: an
-            # assignment to ``.Event`` is not a consumer read; the negative
-            # lookahead ``(?!\s*=(?!=))`` rejects a single ``=`` while keeping a
-            # ``==`` comparison). Deliberately EXCLUDES the bare ``Module.Field
-            # or`` lazy-init idiom (that RHS self-reference is the producer
-            # assignment, not a consumer read).
+            # ``.Event`` USED as a read — NOT ``.Event = <x>`` (an assignment to
+            # ``.Event`` is not a consumer read; the negative lookahead
+            # ``(?!\s*=(?!=))`` rejects a single ``=`` while keeping a ``==``
+            # comparison). Deliberately EXCLUDES the bare ``Module.Field or``
+            # lazy-init idiom (that RHS self-reference is the producer assignment,
+            # not a consumer read).
             read_re = (
                 rf"{ref_re}\s*"
                 rf"(?:\.Event\b(?!\s*=(?!=))|:Connect\b|:Fire\b|\s+then\b)"

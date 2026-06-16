@@ -1475,7 +1475,7 @@ class TestHasCharacterController:
 
 
 # ---------------------------------------------------------------------------
-# Slice 1.1 — build_static_event_channels (criteria 4/5/6).
+# build_static_event_channels.
 # Pure builder over (modules, C#-static-event map). Generic: no game-specific
 # literals — the channel set is the C# enumeration, gated to same-domain
 # runtime-bearing modules with a stamped module_path/container.
@@ -1557,7 +1557,7 @@ class TestBuildStaticEventChannels:
         assert "." not in expected_folder
 
     def test_same_field_two_modules_same_container_distinct_channels(self):
-        # P1 #1 — cross-class channel aliasing. Two DIFFERENT classes declaring
+        # Cross-class channel aliasing: two DIFFERENT classes declaring
         # the SAME static-event member name in the SAME container must NOT alias
         # onto one BindableEvent. With the bare ``channel_name`` + a per-module
         # ``module_folder``, each class's event lives under a DISTINCT folder, so
@@ -1590,15 +1590,11 @@ class TestBuildStaticEventChannels:
         assert len(locations) == 2
 
     def test_flat_concat_delimiter_ambiguity_distinct_channels(self):
-        # P1 #1 (the delimiter-ambiguity collision class) — a flat
-        # ``<stem>_<field>`` concat aliases ``stem="A_B",field="C"`` with
-        # ``stem="A",field="B_C"`` (both → ``A_B_C``). The structured per-module
-        # folder identity eliminates this entirely: each module gets a DISTINCT
-        # folder keyed on its UNIQUE module_id, so the two channels never collapse
-        # onto one location.
-        #
-        # RED on the old flat-concat: both rows carried ``channel_name="A_B_C"``
-        # under the same container → one shared BindableEvent.
+        # Delimiter-ambiguity collision class: a flat ``<stem>_<field>`` concat
+        # aliases ``stem="A_B",field="C"`` with ``stem="A",field="B_C"`` (both →
+        # ``A_B_C``). The structured per-module folder identity eliminates this:
+        # each module gets a DISTINCT folder keyed on its UNIQUE module_id, so the
+        # two channels never collapse onto one location.
         modules = {
             "guidAB": {
                 "runtime_bearing": True, "domain": "client",
