@@ -1541,11 +1541,44 @@ class TestBuildStaticEventChannels:
         assert row == {
             "module_id": "guidPlayer",
             "field_name": "AmmoUpdate",
-            "channel_name": "AmmoUpdate",
+            # channel_name is namespaced per declaring module (``<stem>_<field>``)
+            # so the BindableEvent INSTANCE is unique per class. The Luau module
+            # FIELD stays the bare C# member name (``field_name``).
+            "channel_name": "Player_AmmoUpdate",
             "parent_path": "ReplicatedStorage",
             "module_path": "ReplicatedStorage.Player",
             "domain": "client",
         }
+
+    def test_same_field_two_modules_same_container_distinct_channels(self):
+        # P1 #1 — cross-class channel aliasing. Two DIFFERENT classes declaring
+        # the SAME static-event member name in the SAME container must NOT alias
+        # onto one BindableEvent. The runtime parents/names the instance by
+        # ``channel_name``; if both rows carried the bare ``AmmoUpdate``,
+        # ``findOrCreateChannel`` would return ONE shared instance for both —
+        # silently cross-wiring unrelated class events. Each row's
+        # ``channel_name`` must therefore be DISTINCT (namespaced per module),
+        # while each row's ``field_name`` stays the bare member name.
+        modules = {
+            "guidPlayer": {
+                "runtime_bearing": True, "domain": "client",
+                "container": "ReplicatedStorage",
+                "module_path": "ReplicatedStorage.Player",
+            },
+            "guidEnemy": {
+                "runtime_bearing": True, "domain": "client",
+                "container": "ReplicatedStorage",
+                "module_path": "ReplicatedStorage.Enemy",
+            },
+        }
+        se = {"guidPlayer": ["AmmoUpdate"], "guidEnemy": ["AmmoUpdate"]}
+        channels = build_static_event_channels(modules, se)
+        # Both keep the bare field name (the Luau module field is unchanged)…
+        assert {c["field_name"] for c in channels} == {"AmmoUpdate"}
+        # …but the BindableEvent instance names are DISTINCT (no aliasing).
+        names = sorted(c["channel_name"] for c in channels)
+        assert names == ["Enemy_AmmoUpdate", "Player_AmmoUpdate"]
+        assert len(set(names)) == 2
 
     def test_idempotent(self):
         se = {"guidPlayer": ["AmmoUpdate", "HealthUpdate"], "guidServer": ["Tick"]}

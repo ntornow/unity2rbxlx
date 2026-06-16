@@ -360,8 +360,11 @@ class SceneRuntimeStaticChannel(TypedDict):
 
     ``module_id``: the canonical script id (``.cs`` GUID) of the declaring class.
     ``field_name``: the C# event member name = the Luau module-table field.
-    ``channel_name``: the BindableEvent name (same as ``field_name`` — the
-        converter's naming convention).
+    ``channel_name``: the BindableEvent INSTANCE name, namespaced per declaring
+        module (``<module_stem>_<field_name>``) so two classes' same-named static
+        events in the same container get DISTINCT instances (no cross-class
+        aliasing). The consumer reads the module FIELD (``field_name``), never the
+        BindableEvent name, so namespacing the instance doesn't affect rendezvous.
     ``parent_path``: dotted DataModel path of the container the BindableEvent is
         parented under (the declaring module's own container, e.g.
         ``ReplicatedStorage`` for a client cross-script signal).
@@ -1678,11 +1681,22 @@ def build_static_event_channels(
             continue
         if not isinstance(container, str) or not container:
             continue
+        # The BindableEvent INSTANCE identity must be unique PER MODULE, not per
+        # field name. Keying ``channel_name`` on the bare field would alias two
+        # different classes' same-named static events in the same container
+        # (``Player.AmmoUpdate`` and ``Enemy.AmmoUpdate`` both in
+        # ReplicatedStorage → one shared BindableEvent → unrelated events
+        # silently cross-wired). Namespace the channel name with the declaring
+        # module's stem so each class gets a DISTINCT instance. The Luau module
+        # FIELD stays the C# member name (``field_name``); only the runtime
+        # instance ``.Name`` / location is module-unique — the consumer reads the
+        # field, never the BindableEvent name, so the rendezvous is unaffected.
+        module_stem = module_path.rsplit(".", 1)[-1]
         for field_name in events:
             channels.append({
                 "module_id": script_id,
                 "field_name": field_name,
-                "channel_name": field_name,
+                "channel_name": f"{module_stem}_{field_name}",
                 "parent_path": container,
                 "module_path": module_path,
                 "domain": domain,

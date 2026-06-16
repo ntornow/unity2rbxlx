@@ -12,6 +12,7 @@ from converter.contract_verifier import (  # noqa: E402
     FAIL_CLOSED_CHECKS,
     ContractViolation,
     ContractVerifierResult,
+    StaticEventDecl,
     _runtime_class_map,
     fail_closed_errors,
     stash_violations,
@@ -840,6 +841,12 @@ def _scripts(*pairs: tuple[str, str]) -> list[RbxScript]:
     ]
 
 
+def _decl(events: list[str], domain: str = "client") -> StaticEventDecl:
+    # The producer domain defaults to ``client``; ``_scripts`` emits neutral
+    # (ReplicatedStorage ModuleScript) scripts which a client producer reaches.
+    return StaticEventDecl(events=events, domain=domain)
+
+
 class TestStaticEventRendezvous:
 
     def test_abstains_when_no_static_events(self):
@@ -867,7 +874,7 @@ class TestStaticEventRendezvous:
                  "Player.AmmoUpdate.Event:Connect(f) end"),
             )
             result = verify_contract(
-                {"modules": {}}, scripts, {"Player": ["AmmoUpdate"]},
+                {"modules": {}}, scripts, {"Player": _decl(["AmmoUpdate"])},
             )
             fired = [v for v in result.violations
                      if v.check == "static_event_unconverted"]
@@ -883,7 +890,7 @@ class TestStaticEventRendezvous:
              "if Player.AmmoUpdate then Player.AmmoUpdate:Fire(x) end"),
         )
         result = verify_contract(
-            {"modules": {}}, scripts, {"Player": ["AmmoUpdate"]},
+            {"modules": {}}, scripts, {"Player": _decl(["AmmoUpdate"])},
         )
         fired = [v for v in result.violations
                  if v.check == "static_event_unconverted"]
@@ -899,7 +906,7 @@ class TestStaticEventRendezvous:
              'local log = "Player.AmmoUpdate:Connect stuff"'),
         )
         result = verify_contract(
-            {"modules": {}}, scripts, {"Player": ["AmmoUpdate"]},
+            {"modules": {}}, scripts, {"Player": _decl(["AmmoUpdate"])},
         )
         fired = [v for v in result.violations
                  if v.check == "static_event_unconverted"]
@@ -915,7 +922,7 @@ class TestStaticEventRendezvous:
              'function() end)'),
         )
         result = verify_contract(
-            {"modules": {}}, scripts, {"Player": ["AmmoUpdate"]},
+            {"modules": {}}, scripts, {"Player": _decl(["AmmoUpdate"])},
         )
         fired = [v for v in result.violations
                  if v.check == "static_event_unconverted"]
@@ -931,7 +938,7 @@ class TestStaticEventRendezvous:
             ("Player", "Player.AmmoUpdate = Player.AmmoUpdate or makeEvent()"),
         )
         result = verify_contract(
-            {"modules": {}}, scripts, {"Player": ["AmmoUpdate"]},
+            {"modules": {}}, scripts, {"Player": _decl(["AmmoUpdate"])},
         )
         fired = [v for v in result.violations
                  if v.check == "static_event_unconverted"]
@@ -947,7 +954,7 @@ class TestStaticEventRendezvous:
             ("Player", "Player.AmmoUpdate = Player.AmmoUpdate or makeEvent()"),
         )
         result = verify_contract(
-            {"modules": {}}, scripts, {"Player": ["AmmoUpdate"]},
+            {"modules": {}}, scripts, {"Player": _decl(["AmmoUpdate"])},
         )
         fired = [v for v in result.violations
                  if v.check == "static_event_unconverted"]
@@ -962,9 +969,120 @@ class TestStaticEventRendezvous:
              "Player.AmmoUpdate.Event:Connect(f)"),
         )
         result = verify_contract(
-            {"modules": {}}, scripts, {"Player": ["AmmoUpdate"]},
+            {"modules": {}}, scripts, {"Player": _decl(["AmmoUpdate"])},
         )
         fired = [v for v in result.violations
                  if v.check == "static_event_unconverted"]
         assert len(fired) == 1, "comparison must not count as assignment"
         assert "lazy-init guarded producer assignment" in fired[0].detail
+
+    def test_event_assignment_is_not_a_read(self):
+        # MINOR a — ``Player.AmmoUpdate.Event = bogus`` is an ASSIGNMENT to the
+        # BindableEvent's ``.Event`` member, NOT a consumer read. It must NOT
+        # satisfy the read requirement (would let a non-subscribing producer-only
+        # module spuriously pass). With a guarded assignment present but only this
+        # ``.Event =`` "read", the verifier must fail closed on the missing read.
+        scripts = _scripts(
+            ("Player", "Player.AmmoUpdate = Player.AmmoUpdate or makeEvent()\n"
+             "Player.AmmoUpdate.Event = bogus"),
+        )
+        result = verify_contract(
+            {"modules": {}}, scripts, {"Player": _decl(["AmmoUpdate"])},
+        )
+        fired = [v for v in result.violations
+                 if v.check == "static_event_unconverted"]
+        assert len(fired) == 1, ".Event assignment must not count as a read"
+        assert "consumer/producer field read" in fired[0].detail
+
+    def test_event_comparison_still_counts_as_read(self):
+        # The MINOR-a tightening rejects ``.Event =`` (single equals) but must
+        # KEEP a ``.Event ==`` comparison as a legitimate read.
+        scripts = _scripts(
+            ("Player", "Player.AmmoUpdate = Player.AmmoUpdate or makeEvent()\n"
+             "if Player.AmmoUpdate.Event == nil then return end"),
+        )
+        result = verify_contract(
+            {"modules": {}}, scripts, {"Player": _decl(["AmmoUpdate"])},
+        )
+        fired = [v for v in result.violations
+                 if v.check == "static_event_unconverted"]
+        assert not fired, ".Event == comparison should still count as a read"
+
+    def test_cross_domain_consumer_fails_closed(self):
+        # P1 #3 — a CLIENT producer + SERVER consumer must NOT pass. The runtime
+        # pre-sets the channel only on the producer's (client) VM, so the server
+        # consumer reads nil. The rendezvous scan must bucket by VM: the read on
+        # the server-only script does NOT satisfy a client producer; instead a
+        # distinct ``static_event_cross_domain`` diagnostic fires (needs a
+        # RemoteEvent bridge, out of scope) — NOT a silent pass.
+        # The producer (client) only ASSIGNS the field; the sole field READ
+        # (``:Connect``) is in the server consumer. The runtime pre-set wires the
+        # channel only on the client VM, so the server read sees nil.
+        producer = RbxScript(
+            name="Player",
+            source="Player.AmmoUpdate = Player.AmmoUpdate or makeEvent()",
+            script_type="LocalScript",
+            parent_path="StarterPlayer.StarterPlayerScripts",
+        )
+        consumer = RbxScript(
+            name="Hud",
+            source="if Player.AmmoUpdate then "
+                   "Player.AmmoUpdate.Event:Connect(f) end",
+            script_type="Script", parent_path="ServerScriptService",
+        )
+        result = verify_contract(
+            {"modules": {}}, [producer, consumer],
+            {"Player": _decl(["AmmoUpdate"], domain="client")},
+        )
+        cross = [v for v in result.violations
+                 if v.check == "static_event_cross_domain"]
+        unconv = [v for v in result.violations
+                  if v.check == "static_event_unconverted"]
+        assert len(cross) == 1, "cross-domain consumer must fire a diagnostic"
+        assert cross[0].identity == "static_event_cross_domain:Player.AmmoUpdate"
+        assert not unconv, "should be cross-domain, not generic unconverted"
+
+    def test_same_domain_consumer_passes(self):
+        # The same producer+consumer ON THE SAME VM (both client) is the canonical
+        # wired case — must PASS (proves the cross-domain gate isn't over-firing).
+        producer = RbxScript(
+            name="Player",
+            source="Player.AmmoUpdate = Player.AmmoUpdate or makeEvent()\n"
+                   "Player.AmmoUpdate:Fire(x)",
+            script_type="LocalScript",
+            parent_path="StarterPlayer.StarterPlayerScripts",
+        )
+        consumer = RbxScript(
+            name="Hud",
+            source="if Player.AmmoUpdate then "
+                   "Player.AmmoUpdate.Event:Connect(f) end",
+            script_type="LocalScript",
+            parent_path="StarterPlayer.StarterPlayerScripts",
+        )
+        result = verify_contract(
+            {"modules": {}}, [producer, consumer],
+            {"Player": _decl(["AmmoUpdate"], domain="client")},
+        )
+        fired = [v for v in result.violations
+                 if v.check.startswith("static_event_")]
+        assert not fired, f"same-domain rendezvous should pass: {fired}"
+
+    def test_neutral_modulescript_satisfies_either_producer(self):
+        # A consumer in a NEUTRAL container (ReplicatedStorage ModuleScript) is
+        # required by whichever VM boots it, so it satisfies a producer of EITHER
+        # domain — a server producer's read in a shared ModuleScript counts.
+        scripts = [
+            RbxScript(
+                name="Player",
+                source="Player.AmmoUpdate = Player.AmmoUpdate or makeEvent()\n"
+                       "if Player.AmmoUpdate then Player.AmmoUpdate:Fire(x) end",
+                script_type="ModuleScript", parent_path="ReplicatedStorage",
+            ),
+        ]
+        result = verify_contract(
+            {"modules": {}}, scripts,
+            {"Player": _decl(["AmmoUpdate"], domain="server")},
+        )
+        fired = [v for v in result.violations
+                 if v.check.startswith("static_event_")]
+        assert not fired, f"neutral read should satisfy a server producer: {fired}"

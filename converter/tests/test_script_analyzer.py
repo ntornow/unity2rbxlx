@@ -275,6 +275,27 @@ class TestStaticEventEnumeration:
         )
         assert info.static_events == ["Generic", "Qualified"]
 
+    def test_multi_declarator_event(self, tmp_path: Path):
+        # P1 #2 — a SINGLE ``static event`` declaration may bind MULTIPLE members
+        # via a comma list. ``public static event H Foo, Bar;`` declares BOTH
+        # ``Foo`` AND ``Bar`` of type ``H``; the analyzer must surface every
+        # member, not just the last (else the dropped member never reaches the
+        # channel plan or the rendezvous verifier — a silent fail).
+        info = self._info(
+            tmp_path, "A",
+            "public class A { public static event H Foo, Bar; }",
+        )
+        assert info.static_events == ["Foo", "Bar"]
+
+    def test_multi_declarator_generic_handler(self, tmp_path: Path):
+        # Generic/qualified handler type + multi-declarator: the handler-type
+        # capture must not swallow the declarator list.
+        info = self._info(
+            tmp_path, "A",
+            "public class A { public static event EventHandler<int> A1, B2, C3; }",
+        )
+        assert info.static_events == ["A1", "B2", "C3"]
+
     def test_event_with_initializer(self, tmp_path: Path):
         info = self._info(
             tmp_path, "A",

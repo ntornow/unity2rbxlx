@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 from typing import Any, cast
 
 if TYPE_CHECKING:
+    from converter.contract_verifier import StaticEventDecl
     from converter.scene_runtime_topology.build_topology import (
         TopologyArtifact,
     )
@@ -4940,18 +4941,20 @@ script.Disabled = true
 
     def _static_events_by_emitted_name(
         self, scene_runtime: dict[str, object],
-    ) -> dict[str, list[str]]:
+    ) -> "dict[str, StaticEventDecl]":
         """Map each runtime-bearing module's EMITTED script name (the Luau module-
-        table prefix, e.g. ``Player`` in ``Player.AmmoUpdate``) to the C# ``static
-        event`` members it declares.
+        table prefix, e.g. ``Player`` in ``Player.AmmoUpdate``) to a
+        ``StaticEventDecl`` (the C# ``static event`` members it declares + the
+        producer's resolved domain).
 
         Deterministic upstream signal for the rendezvous verifier: enumerate the
         C# ``static event`` declarations off the ``.cs`` source via the GUID, then
         key by the module's join name (``module_path`` tail == ``RbxScript.name``,
         else ``stem``) so the verifier can scan the emitted Luau for
-        ``<name>.<field>``. NEVER reads the AI output to decide WHICH channels
-        should exist.
+        ``<name>.<field>`` WITHIN the producer's VM/domain. NEVER reads the AI
+        output to decide WHICH channels should exist.
         """
+        from converter.contract_verifier import StaticEventDecl
         from unity.script_analyzer import analyze_script
 
         modules_obj = scene_runtime.get("modules")
@@ -4960,7 +4963,7 @@ script.Disabled = true
         guid_index = getattr(self.state, "guid_index", None)
         if guid_index is None:
             return {}
-        result: dict[str, list[str]] = {}
+        result: dict[str, StaticEventDecl] = {}
         for script_id, module in modules_obj.items():
             if not isinstance(module, dict):
                 continue
@@ -4969,7 +4972,8 @@ script.Disabled = true
             # actually pre-sets. A helper/excluded/cross-domain/unstamped or
             # non-runtime-bearing module gets NO channel, so flagging its static
             # events would be spurious noise (dual-voice finding).
-            if module.get("domain") not in ("client", "server"):
+            domain = module.get("domain")
+            if domain not in ("client", "server"):
                 continue
             if not module.get("runtime_bearing"):
                 continue
@@ -4984,14 +4988,22 @@ script.Disabled = true
                 continue
             name = module_path.rsplit(".", 1)[-1]
             # Last-write-wins on a name collision would drop a channel; merge so
-            # two modules sharing an emitted name keep both event sets.
+            # two modules sharing an emitted name keep both event sets. A domain
+            # collision (two same-named modules on different VMs) keeps the FIRST
+            # domain — the rendezvous still scans that side + neutral, and a true
+            # cross-VM name clash is degenerate (distinct module_paths share a
+            # tail), surfaced as a missing-read diagnostic rather than masked.
             if name in result:
-                merged = result[name]
+                prior = result[name]
+                merged = list(prior.events)
                 for ev in events:
                     if ev not in merged:
                         merged.append(ev)
+                result[name] = StaticEventDecl(events=merged, domain=prior.domain)
             else:
-                result[name] = list(events)
+                result[name] = StaticEventDecl(
+                    events=list(events), domain=str(domain),
+                )
         return result
 
     def _run_contract_verifier(self, scene_runtime: dict[str, object]) -> None:

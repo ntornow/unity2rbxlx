@@ -43,6 +43,25 @@ from core.roblox_types import RbxScript
 
 
 @dataclass(frozen=True)
+class StaticEventDecl:
+    """One emitted module's C# ``static event`` declaration, with the producer's
+    VM/domain so the rendezvous check can require a SAME-DOMAIN consumer.
+
+    ``events``: the C# member names this module declares (== the Luau module-table
+        field names the producer fires + the consumer reads).
+    ``domain``: ``"client"`` | ``"server"`` — the producer module's resolved VM.
+        The runtime pre-sets this channel ONLY on the producer's side
+        (``_ensureStaticEventChannels`` is domain-filtered), so a consumer running
+        on the OTHER VM reads nil. The rendezvous is therefore satisfied only by a
+        read reachable on the producer's VM; a cross-domain consumer needs a
+        RemoteEvent bridge (out of scope) and must fail closed, not silently pass.
+    """
+
+    events: list[str]
+    domain: str
+
+
+@dataclass(frozen=True)
 class ContractViolation:
     """One contract violation. ``identity`` is a stable cross-run dedup key so a
     ``materialize_and_classify`` resume replay does not double-count."""
@@ -71,14 +90,15 @@ class ContractVerifierResult:
 def verify_contract(
     topology: TopologyArtifact,
     scripts: list[RbxScript],
-    static_events_by_script: dict[str, list[str]] | None = None,
+    static_events_by_script: dict[str, StaticEventDecl] | None = None,
 ) -> ContractVerifierResult:
     """Run the shadow-mode contract checks. Emits a smoke violation when
     ``topology`` carries no ``modules`` block (the artifact never reached us).
 
     ``static_events_by_script`` maps an emitted script NAME (== the Luau module
-    table prefix) to the C# ``static event`` member names that module declares —
-    the deterministic upstream signal for the rendezvous check. Default None /
+    table prefix) to a ``StaticEventDecl`` (the C# ``static event`` member names
+    that module declares + the producer's resolved domain) — the deterministic
+    upstream signal for the rendezvous check. Default None /
     empty means "no static-event channels to verify" (the check abstains, no rows).
     """
     violations: list[ContractViolation] = []
@@ -163,55 +183,148 @@ def _strip_luau_code_only(source: str) -> str:
     return _RE_LUAU_STRINGS.sub(" ", _strip_luau_comments(source))
 
 
+def _script_vm_domain(script: RbxScript) -> str:
+    """The VM a script runs on, for the rendezvous SAME-DOMAIN gate.
+
+    ``"client"``  — a ``LocalScript`` (client VM only), or a script in a
+        client-only container.
+    ``"server"``  — a ``Script`` in a server-only container (``ServerStorage`` /
+        ``ServerScriptService``).
+    ``"neutral"`` — a ``ModuleScript`` (required by whichever VM ``require``s it),
+        or any script in a neutral container (``ReplicatedStorage``): reachable on
+        EITHER VM, so it satisfies a producer of either domain.
+
+    The runtime pre-sets a static-event channel ONLY on the producer's domain
+    (``_ensureStaticEventChannels`` is domain-filtered), so a consumer read counts
+    toward a producer's rendezvous only if it runs on a VM that side reaches —
+    i.e. the consumer's domain is the producer's domain or ``"neutral"``.
+    """
+    stype = script.script_type
+    parent = script.parent_path or ""
+    if stype == "LocalScript":
+        return "client"
+    family = _container_family(parent)
+    if stype == "Script" and family == "server":
+        return "server"
+    if family == "client":
+        return "client"
+    # A ModuleScript (shared require target) or a neutral/other container: counts
+    # for either VM. A server ModuleScript in ServerStorage would be "other"
+    # family here, but ModuleScripts are required by their booting entrypoint, so
+    # treating them as neutral cannot create a FALSE PASS — a server-only module's
+    # read still needs a producer that reaches it, and the producer-domain gate
+    # below requires the producer side, not the module's storage.
+    return "neutral"
+
+
 def _check_static_event_rendezvous(
     scripts: list[RbxScript],
-    static_events_by_script: dict[str, list[str]],
+    static_events_by_script: dict[str, StaticEventDecl],
 ) -> list[ContractViolation]:
     """For each C#-declared static event ``<Module>.<Field>``, confirm the emitted
-    Luau across ALL scripts carries the load-bearing rendezvous: a lazy-init
-    GUARDED producer assignment ``<Module>.<Field> = <Module>.<Field> or ...`` AND
-    a real field read. A missing/unguarded assignment OR a missing read records a
-    fail-closed ``static_event_unconverted`` warning."""
+    Luau carries the load-bearing rendezvous WITHIN the producer's VM/domain: a
+    lazy-init GUARDED producer assignment ``<Module>.<Field> = <Module>.<Field> or
+    ...`` AND a real field read, BOTH reachable on the producer's side. A missing/
+    unguarded assignment OR a missing same-domain read records a fail-closed
+    ``static_event_unconverted`` warning; a read that exists ONLY on the OTHER VM
+    records a ``static_event_cross_domain`` diagnostic (needs a RemoteEvent bridge,
+    out of scope) rather than silently passing."""
     if not static_events_by_script:
         return []
 
-    # Concatenate every emitted script's CODE (comments + strings stripped) once —
-    # the producer (declaring module) and the consumer (a different module) can
-    # live in separate scripts, so the rendezvous is a project-wide property.
-    code_blobs: list[str] = []
+    # Bucket each script's CODE (comments + strings stripped) by the VM it runs on.
+    # The runtime pre-sets a channel only on the producer's domain, so the producer
+    # assignment + the consumer read must both be reachable on THAT side; a "client"
+    # producer is satisfied by client+neutral scripts, "server" by server+neutral.
+    code_by_domain: dict[str, list[str]] = {"client": [], "server": [], "neutral": []}
     for script in scripts:
         src = script.source or ""
-        if src:
-            code_blobs.append(_strip_luau_code_only(src))
-    code = "\n".join(code_blobs)
+        if not src:
+            continue
+        code_by_domain[_script_vm_domain(script)].append(
+            _strip_luau_code_only(src)
+        )
+
+    def _reachable_code(producer_domain: str) -> str:
+        # Scripts the producer's VM can reach: its own domain + neutral (shared
+        # ModuleScripts / ReplicatedStorage requireable by either side).
+        blobs = list(code_by_domain.get(producer_domain, ()))
+        blobs.extend(code_by_domain["neutral"])
+        return "\n".join(blobs)
+
+    # All emitted code, regardless of domain — only used to DIAGNOSE a cross-domain
+    # consumer (a read that exists but NOT on the producer's side).
+    all_code = "\n".join(
+        blob for blobs in code_by_domain.values() for blob in blobs
+    )
 
     violations: list[ContractViolation] = []
     for module_name in sorted(static_events_by_script):
-        for field_name in static_events_by_script[module_name]:
+        decl = static_events_by_script[module_name]
+        producer_domain = decl.domain if decl.domain in ("client", "server") \
+            else "neutral"
+        same_domain_code = _reachable_code(producer_domain)
+        for field_name in decl.events:
             ref = f"{module_name}.{field_name}"
             ref_re = re.escape(ref)
             # LOAD-BEARING producer shape: the lazy-init GUARD
             # ``Module.Field = Module.Field or ...``. Only this guarantees the
             # field short-circuits onto the runtime pre-set instance. The ``=``
             # must not be a comparison (``==`` / ``~=`` / ``>=`` / ``<=``).
+            assign_re = rf"(?<![=~<>]){ref_re}\s*=(?!=)\s*{ref_re}\s+or\b"
             has_guarded_assignment = re.search(
-                rf"(?<![=~<>]){ref_re}\s*=(?!=)\s*{ref_re}\s+or\b", code,
+                assign_re, same_domain_code,
             ) is not None
-            # Read = a TRUE rendezvous use of the field: ``.Event`` / ``:Connect``
-            # / ``:Fire`` (subscribe/publish), or an ``if Module.Field then``
-            # guard. Deliberately EXCLUDES the bare ``Module.Field or`` lazy-init
-            # idiom (that RHS self-reference is part of the producer assignment).
-            has_read = re.search(
-                rf"{ref_re}\s*(?:\.Event|:Connect|:Fire|\s+then\b)",
-                code,
+            # Read = a TRUE rendezvous use of the field: ``:Connect`` / ``:Fire``
+            # (subscribe/publish), an ``if Module.Field then`` guard, or
+            # ``.Event`` USED as a read — NOT ``.Event = <x>`` (MINOR a: an
+            # assignment to ``.Event`` is not a consumer read; the negative
+            # lookahead ``(?!\s*=(?!=))`` rejects a single ``=`` while keeping a
+            # ``==`` comparison). Deliberately EXCLUDES the bare ``Module.Field
+            # or`` lazy-init idiom (that RHS self-reference is the producer
+            # assignment, not a consumer read).
+            read_re = (
+                rf"{ref_re}\s*"
+                rf"(?:\.Event\b(?!\s*=(?!=))|:Connect\b|:Fire\b|\s+then\b)"
+            )
+            has_same_domain_read = re.search(
+                read_re, same_domain_code,
             ) is not None
-            if has_guarded_assignment and has_read:
+            if has_guarded_assignment and has_same_domain_read:
+                continue
+            # The read may exist ONLY on the other VM (cross-domain): the producer
+            # fires on its side, the consumer reads on the other where the channel
+            # field is nil. That is a real missing-bridge bug, not "unconverted" —
+            # diagnose it distinctly so it isn't masked by a same-domain pass and
+            # isn't lumped with a missing-read-everywhere case.
+            has_read_anywhere = re.search(read_re, all_code) is not None
+            if (
+                has_guarded_assignment
+                and not has_same_domain_read
+                and has_read_anywhere
+            ):
+                violations.append(
+                    ContractViolation(
+                        check="static_event_cross_domain",
+                        severity="warning",
+                        script=module_name,
+                        detail=(
+                            f"C# static event {ref!r} has a {producer_domain}-side "
+                            f"producer but its only field read is on the OTHER VM. "
+                            f"The runtime pre-sets this BindableEvent channel only "
+                            f"on the producer's side, so the cross-domain consumer "
+                            f"reads nil — a RemoteEvent bridge is required "
+                            f"(out of scope)."
+                        ),
+                        identity=f"static_event_cross_domain:{ref}",
+                    )
+                )
                 continue
             missing = []
             if not has_guarded_assignment:
                 missing.append("lazy-init guarded producer assignment "
                                "(`X = X or ...`)")
-            if not has_read:
+            if not has_same_domain_read:
                 missing.append("consumer/producer field read")
             violations.append(
                 ContractViolation(

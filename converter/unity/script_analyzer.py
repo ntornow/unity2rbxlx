@@ -59,23 +59,27 @@ _RE_SERIALIZED_FIELD = re.compile(
 
 # C# ``static event`` declarations. A static event is a TYPE-level entity the
 # converter lowers to a module-table FIELD shared across every instance of the
-# class (the same cached require table). The member name — the LAST identifier
-# before the terminating ``;`` / ``=`` / ``{`` — is exactly the Luau field name
-# the producer assigns and the consumer reads (``Player.AmmoUpdate``), so this is
-# the DETERMINISTIC upstream signal the channel-identity fix anchors on. We match
-# ``[modifiers] static event <HandlerType[generic/qualified]> <Member>`` where the
-# ``static`` and ``event`` keywords co-occur (either order is legal C#); the
-# handler type is consumed non-greedily up to the member + a declaration
-# terminator so a qualified/generic handler (``EventHandler<Foo>``,
-# ``A.B.Handler``) still yields the bare member name. NEVER parse the emitted Luau.
+# class (the same cached require table). Each member name is exactly the Luau
+# field name the producer assigns and the consumer reads (``Player.AmmoUpdate``),
+# so this is the DETERMINISTIC upstream signal the channel-identity fix anchors
+# on. We match ``[modifiers] static event <HandlerType[generic/qualified]>
+# <declarator-list>`` where ``static`` and ``event`` co-occur (either order is
+# legal C#). A SINGLE declaration may bind MULTIPLE members:
+# ``public static event H Foo, Bar;`` declares both ``Foo`` AND ``Bar`` of type
+# ``H``. We therefore capture the handler type (group 1, the first type token —
+# generic/qualified allowed) and the WHOLE comma-separated declarator span up to
+# the terminator (group 2), and split the names in ``analyze_script``. NEVER parse
+# the emitted Luau.
 _RE_STATIC_EVENT = re.compile(
     r"\bstatic\b"                  # the static modifier (anywhere in the modifier list)
     r"(?:\s+(?:public|private|protected|internal|readonly|new|abstract))*"
     r"\s+event\s+"                 # the event keyword
-    r"[\w<>\.,\s\[\]]+?"          # handler type (generic / qualified ok)
-    r"\b(\w+)\s*"                  # the event member name (captured)
+    r"([\w<>\.\[\]]+(?:\s*<[^;{}]*>)?)"  # handler type (generic / qualified ok), group 1
+    r"\s+([\w\s,]+?)\s*"          # declarator list (one or more comma-separated names), group 2
     r"(?:;|=|\{)",                 # declaration terminator
 )
+# Split a captured declarator span (``Foo, Bar`` / ``Foo``) into member names.
+_RE_DECLARATOR = re.compile(r"\b\w+\b")
 
 # GLOBAL scene-lookup generics whose type argument is NOT a dependency
 # edge at all: ``FindObjectOfType<T>()`` locates an ALREADY-EXISTING
@@ -191,10 +195,14 @@ def analyze_script(script_path: str | Path) -> ScriptInfo:
     # lowers the event to.
     _seen_events: set[str] = set()
     for m in _RE_STATIC_EVENT.finditer(decommented):
-        name = m.group(1)
-        if name and name not in _seen_events:
-            _seen_events.add(name)
-            info.static_events.append(name)
+        # group(2) is the declarator list — one member (``Foo``) or a comma list
+        # (``Foo, Bar``). Split so EVERY member of a multi-declarator declaration
+        # reaches ``static_events`` (a single ``public static event H Foo, Bar;``
+        # declares both ``Foo`` and ``Bar``, not just the last).
+        for name in _RE_DECLARATOR.findall(m.group(2)):
+            if name and name not in _seen_events:
+                _seen_events.add(name)
+                info.static_events.append(name)
 
     # Extract type references (field types, method parameter types, etc.)
     # Matches PascalCase identifiers used as types in declarations
