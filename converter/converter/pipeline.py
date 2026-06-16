@@ -94,6 +94,80 @@ def _carry_unconverted(
     carrier.extend(entries)
 
 
+def _character_name_from_field(
+    pid: str,
+    sub: dict[str, object],
+    modules_dict: dict[str, object],
+) -> str | None:
+    """Rung 1 of the D5 characterName chain: select by FIELD-PRESENCE.
+
+    Returns the str value of the selected instance's ``config["characterName"]``,
+    or ``None`` when no instance carries the key (caller falls through to the
+    address/stem rungs) or the selected value is non-str (skip-with-warning,
+    then fall through — never coerced, never Any). Pure.
+
+    Selection: among the prefab's instances, the one whose ``config`` CONTAINS
+    the key ``characterName`` (the consumer's ``GetAttribute("characterName")``
+    contract key, NOT a class literal). Ties are broken ONLY via
+    ``modules[script_id]["class_name"]``; on remaining ties the first-in-
+    lifecycle instance is chosen and a warning logged.
+    """
+    instances = sub.get("instances")
+    if not isinstance(instances, list):
+        return None
+
+    # Field-presence candidates, in lifecycle/visit order.
+    candidates: list[dict[str, object]] = []
+    for inst in instances:
+        if not isinstance(inst, dict):
+            continue
+        config = inst.get("config")
+        if isinstance(config, dict) and "characterName" in config:
+            candidates.append(inst)
+
+    if not candidates:
+        return None
+
+    chosen = candidates[0]
+    if len(candidates) > 1:
+        # Tiebreak ONLY via the module class_name. A best-effort,
+        # never-primary signal (class_name may be "").
+        def _class_name(inst: dict[str, object]) -> str:
+            sid = inst.get("script_id")
+            if not isinstance(sid, str):
+                return ""
+            mod = modules_dict.get(sid)
+            if isinstance(mod, dict):
+                cn = mod.get("class_name")
+                if isinstance(cn, str):
+                    return cn
+            return ""
+
+        named = [c for c in candidates if _class_name(c)]
+        if len(named) == 1:
+            chosen = named[0]
+        else:
+            # Remaining tie: deterministic first-in-lifecycle + warn.
+            log.warning(
+                "[roster] prefab_id %s: %d instances carry "
+                "'characterName' and the class_name tiebreak did not "
+                "resolve to one — picking first-in-lifecycle (%r)",
+                pid, len(candidates), candidates[0].get("instance_id"),
+            )
+            chosen = candidates[0]
+
+    config = chosen.get("config")
+    value = config.get("characterName") if isinstance(config, dict) else None
+    if isinstance(value, str):
+        return value
+    log.warning(
+        "[roster] prefab_id %s: non-str characterName %r — falling back to "
+        "address/stem",
+        pid, value,
+    )
+    return None
+
+
 def _scene_needs_collision_recook(parts: list) -> bool:
     """Walk the part tree and return True if any MeshPart has a
     non-Default ``collision_fidelity`` set.
@@ -6225,6 +6299,28 @@ script.Disabled = true
         # turret-fired bullets fall to the ground inert.
         self._attach_monobehaviour_scripts_to_templates()
 
+        # Addressables Unit 4 / Phase 1 — assemble the roster surface from
+        # ``addressables.by_label`` and extend the typed ``rosters`` channel.
+        # Both emit paths (rbxlx_writer + luau_place_builder) materialize a
+        # second, CollectionService-tagged, attributed instance per member under
+        # a dedicated ReplicatedStorage container. Trigger is structural (any
+        # label with >=1 emitted prefab) — no game-specific literal. Reuses
+        # ``resolved_template_names`` (prefab_id->template_name) and
+        # ``addr_block.by_label`` already in scope; no new resolver pass.
+        from converter.roster_assembly import assemble_rosters
+        by_label_raw = addr_block.get("by_label") or {}
+        if isinstance(by_label_raw, dict) and by_label_raw:
+            emitted_names = {
+                t.name for t in self.state.rbx_place.replicated_templates
+            }
+            rosters = assemble_rosters(
+                by_label=by_label_raw,
+                resolved_template_names=resolved_template_names,
+                emitted_template_names=emitted_names,
+                character_names=self._collect_character_names(scene_runtime),
+            )
+            self.state.rbx_place.rosters.extend(rosters)
+
         # Persist a small manifest under packages/ — closes the packages
         # half of Phase 4.11's disk-rewrite deferred item.
         try:
@@ -6237,6 +6333,77 @@ script.Disabled = true
             "ReplicatedStorage.Templates (%d in manifest)",
             len(result.templates), result.manifest.get("total_templates", 0),
         )
+
+    def _collect_character_names(
+        self, scene_runtime: dict[str, object]
+    ) -> dict[str, str]:
+        """Resolve prefab_id -> characterName for the roster surface (D5/P1).
+
+        Full fallback chain, per prefab (D5/§1.2/AC3):
+
+        1. FIELD-PRESENCE — the instance whose ``config`` CONTAINS the key
+           ``characterName`` (the consumer's ``GetAttribute("characterName")``
+           contract key, NOT a "Character" class literal). Ties (multiple
+           instances carrying ``characterName``) are broken ONLY via
+           ``modules[script_id]["class_name"]``; on remaining ties the
+           first-in-lifecycle instance is chosen and a warning logged.
+        2. ADDRESSABLE ADDRESS — when no instance carries a usable str
+           ``characterName``, fall back to the addressable address bound to that
+           prefab_id (the inverse of ``addressables.by_address``).
+        3. PREFAB/TEMPLATE STEM — when there is no address either, fall back to
+           the prefab's resolved Templates child name (``template_name``).
+
+        Every value read is narrowed with ``isinstance(v, str)`` — a non-str
+        candidate is skipped-with-warning (never coerced, never Any) and the
+        chain continues to the next rung. A prefab with no usable value at any
+        rung is omitted (the member is still tagged + clonable downstream).
+        """
+        out: dict[str, str] = {}
+        prefabs = scene_runtime.get("prefabs")
+        if not isinstance(prefabs, dict):
+            return out
+        modules = scene_runtime.get("modules")
+        modules_dict: dict[str, object] = modules if isinstance(modules, dict) else {}
+
+        # Rung 2 source: invert ``addressables.by_address`` (address -> [pid])
+        # into prefab_id -> address. First-seen address wins for a pid under
+        # multiple addresses (deterministic; by_address preserves insertion).
+        address_by_pid: dict[str, str] = {}
+        addr_block = scene_runtime.get("addressables")
+        if isinstance(addr_block, dict):
+            by_address = addr_block.get("by_address")
+            if isinstance(by_address, dict):
+                for address, ids in by_address.items():
+                    if not isinstance(address, str):
+                        continue
+                    if not isinstance(ids, (list, tuple)):
+                        continue
+                    for pid in ids:
+                        if isinstance(pid, str) and pid not in address_by_pid:
+                            address_by_pid[pid] = address
+
+        for pid, sub in prefabs.items():
+            if not isinstance(pid, str) or not isinstance(sub, dict):
+                continue
+
+            # --- Rung 1: field-presence on the prefab's instances ------------
+            name = _character_name_from_field(pid, sub, modules_dict)
+
+            # --- Rung 2: addressable address bound to this prefab_id ---------
+            if name is None:
+                addr = address_by_pid.get(pid)
+                if isinstance(addr, str) and addr:
+                    name = addr
+
+            # --- Rung 3: the prefab/template file stem -----------------------
+            if name is None:
+                stem = sub.get("template_name")
+                if isinstance(stem, str) and stem:
+                    name = stem
+
+            if name is not None:
+                out[pid] = name
+        return out
 
     def _attach_prefab_scoped_animation_scripts_to_templates(self) -> None:
         """Attach copies of prefab-scoped animation scripts under their
