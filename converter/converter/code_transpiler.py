@@ -16,7 +16,12 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from converter.roblox_call_validator import InvalidCall
 
 from config import (
     ANTHROPIC_MODEL,
@@ -1877,6 +1882,104 @@ def _verify_and_reprompt(
     ]
 
 
+def _proven_invalid_roblox_calls(luau_source: str) -> list["InvalidCall"]:
+    """Proven (Roblox-receiver) hallucinated method calls in ``luau_source``.
+
+    Used by the cache-hit paths to decide whether a cached Luau must be
+    re-transpiled (so the cold repair runs), mirroring the syntax-error
+    cache invalidation.
+    """
+    from converter.roblox_call_validator import find_invalid_roblox_calls
+
+    return [
+        inv for inv in find_invalid_roblox_calls(luau_source)
+        if inv["receiver_provenance"] == "proven"
+    ]
+
+
+def _build_roblox_call_repair_message(
+    luau_source: str, proven_invalids: list["InvalidCall"],
+) -> str:
+    """Structured, corpus-grounded repair message for hallucinated calls.
+
+    For each PROVEN invalid call site, names the line, the offending
+    ``:Method(``, and the close-name corpus candidates with their signatures.
+    The model is asked to REGENERATE the corrected Luau (not a string patch).
+    """
+    from converter.roblox_api_corpus import signature, suggest_candidates
+
+    lines = [
+        "These method calls use Roblox methods that DO NOT EXIST and will "
+        "crash at runtime. Replace each with a real Roblox API method. "
+        "Return ONLY the corrected Luau.",
+        "",
+        "INVALID CALLS:",
+    ]
+    for inv in proven_invalids:
+        method = inv["method"]
+        lines.append(f"- line {inv['line']}: :{method}( is not a real Roblox method.")
+        candidates = suggest_candidates(method)
+        if candidates:
+            lines.append("  Did you mean one of:")
+            for cand in candidates:
+                sig = signature(cand)
+                lines.append(f"    * {sig if sig else cand}")
+    lines.append("")
+    lines.append("BROKEN LUAU SOURCE:")
+    lines.append(f"```luau\n{luau_source}\n```")
+    return "\n".join(lines)
+
+
+def _repair_invalid_roblox_calls(
+    luau_source: str,
+    reprompt_call: "Callable[[str], str | None]",
+    max_tries: int = 2,
+) -> tuple[str, list[str]]:
+    """Bounded agentic repair of PROVEN hallucinated Roblox method calls.
+
+    Runs ``find_invalid_roblox_calls`` and filters to ``proven`` provenance
+    (a hallucinated method on a provably-Roblox receiver). If none, returns
+    ``(luau_source, [])`` unchanged. Otherwise builds a structured,
+    corpus-grounded repair message and calls ``reprompt_call`` (a backend
+    closure returning corrected Luau or ``None``) to REGENERATE the code,
+    re-validating after each try, up to ``max_tries`` tries.
+
+    Mode-agnostic: the validator keys on provenance + corpus, which are
+    mode-independent, so this runs for legacy AND generic backends.
+
+    Returns ``(best_source, warnings)`` where ``warnings`` carry a
+    ``roblox-call-survivor (line N): <method>`` tag for any proven invalid
+    that survived. Survivors are INFORMATIONAL here -- the universal net
+    (slice 2.3) owns the fail-closed promotion; this helper never crashes
+    and never silently ships a clean verdict for a surviving invalid.
+
+    Pure-ish: the only side effect is calling the injected ``reprompt_call``.
+    """
+    proven = _proven_invalid_roblox_calls(luau_source)
+    if not proven:
+        return luau_source, []
+
+    best = luau_source
+    for _attempt in range(max_tries):
+        message = _build_roblox_call_repair_message(best, proven)
+        new_text = reprompt_call(message)
+        if not new_text:
+            break
+        new_luau = _strip_code_fences(new_text)
+        if not new_luau:
+            break
+        best = new_luau
+        proven = _proven_invalid_roblox_calls(best)
+        if not proven:
+            return best, []
+
+    warnings = [
+        f"roblox-call-survivor (line {inv['line']}): {inv['method']}"
+        for inv in proven
+    ]
+    return best, warnings
+
+
 def _ai_transpile(
     csharp_source: str,
     api_key: str,
@@ -1923,7 +2026,8 @@ def _ai_transpile(
         # Verify cached result passes lint — old caches may have syntax errors
         luau_cached = cached["luau"]
         cached_errors = _luau_syntax_check(luau_cached)
-        if not cached_errors:
+        cached_proven_invalids = _proven_invalid_roblox_calls(luau_cached)
+        if not cached_errors and not cached_proven_invalids:
             log.debug("AI transpilation cache hit for %s (lint clean)", cache_key[:12])
             cached_warnings = list(cached.get("warnings", []))
             # Generic-runtime contract verifier: re-run on cache hit so a
@@ -1937,6 +2041,11 @@ def _ai_transpile(
                     is_player_controller=is_player_controller,
                 )
             return luau_cached, cached["confidence"], cached_warnings
+        elif cached_proven_invalids and not cached_errors:
+            log.info(
+                "  [%s] Cache hit but %d proven-invalid Roblox call(s) — "
+                "re-transpiling", class_name, len(cached_proven_invalids),
+            )
         else:
             log.info("  [%s] Cache hit but %d syntax error(s) — re-transpiling",
                      class_name, len(cached_errors))
@@ -2022,6 +2131,15 @@ def _ai_transpile(
         is_player_controller=is_player_controller,
     )
     warnings.extend(contract_warnings)
+
+    # Bounded agentic repair of PROVEN hallucinated Roblox method calls.
+    # MODE-AGNOSTIC: the validator keys on provenance + corpus (mode-
+    # independent), so this runs for legacy AND generic, closing the bypass
+    # that defeated the narrow ``fc`` rule. Reuses the same API client.
+    luau_source, repair_warnings = _repair_invalid_roblox_calls(
+        luau_source, _api_reprompt,
+    )
+    warnings.extend(repair_warnings)
 
     # AI transpilation gets a baseline confidence based on output quality.
     confidence = 0.75
@@ -2126,7 +2244,8 @@ def _claude_cli_transpile(
         # Verify cached result passes lint — old caches may have syntax errors
         luau_cached = cached["luau"]
         cached_errors = _luau_syntax_check(luau_cached)
-        if not cached_errors:
+        cached_proven_invalids = _proven_invalid_roblox_calls(luau_cached)
+        if not cached_errors and not cached_proven_invalids:
             log.debug("Claude CLI cache hit for %s (lint clean)", cache_key[:12])
             cached_warnings = list(cached.get("warnings", []))
             if runtime_mode == "generic":
@@ -2135,6 +2254,11 @@ def _claude_cli_transpile(
                     is_player_controller=is_player_controller,
                 )
             return luau_cached, cached["confidence"], cached_warnings
+        elif cached_proven_invalids and not cached_errors:
+            log.info(
+                "  [%s] Cache hit but %d proven-invalid Roblox call(s) — "
+                "re-transpiling", class_name, len(cached_proven_invalids),
+            )
         else:
             log.info("  [%s] Cache hit but %d syntax error(s) — re-transpiling",
                      class_name, len(cached_errors))
@@ -2210,6 +2334,14 @@ def _claude_cli_transpile(
         is_player_controller=is_player_controller,
     )
     warnings.extend(contract_warnings)
+
+    # Bounded agentic repair of PROVEN hallucinated Roblox method calls.
+    # MODE-AGNOSTIC (legacy AND generic) -- mirrors the ``_ai_transpile`` cold
+    # path. Reuses the CLI reprompt closure.
+    luau_source, repair_warnings = _repair_invalid_roblox_calls(
+        luau_source, _cli_reprompt,
+    )
+    warnings.extend(repair_warnings)
 
     # Score confidence.
     confidence = 0.75
