@@ -629,3 +629,9 @@ HANDOFF: [gravity] _Rigidbody2D attribute — stamped unconditionally at the Rig
 HANDOFF: [gravity] gravityDesiredBaseStuds — plan field (in _PLAN_KEYS_FOR_HOST) carrying
 |unity_g|*STUDS_PER_METER, parsed early in plan_scene_runtime from DynamicsManager m_Gravity (abs(y),
 9.81 default). Consumed by the client clone-site hook; baked into the server script.
+
+## Run turret-bullet-damage-20260616T101918 (2026-06-16T08:27:13Z)
+
+self.gameObject.Parent:X() under-detection edge (self. skip precedes field promotion) — minor, design lists only self.gameObject. Consider hardening if a real conversion exercises it.
+
+- [Goodhart residual] validator proves a method EXISTS, not that it's semantically right; a real-but-wrong Roblox method passes. Out of scope; monitor.

@@ -2492,3 +2492,24 @@ the only EMITTED gravity delta is the script + the `_Rigidbody2D` stamp + the pl
   bounce-to-Phase-1 boundary; and all Studio acceptance procedures (resting/auto-sleep gate, ±10% band
   around fall-rate ≈35.03, UseGravity=false float, server-force replication, ≥2000-body perf budget with
   bounce-to-Phase-1).
+
+## Run turret-bullet-damage-20260616T101918 (2026-06-16T08:27:13Z) — turret bullets: damage instead of push
+
+- **Reported bug:** turret/plane bullets hit the player but deal no damage and shove them.
+- **Root cause:** AI transpiler emits a call to a NON-EXISTENT Roblox method
+  (`char:FindFirstChildOfType("Humanoid")`), syntactically valid so the luau-analyze gate
+  (syntax-only) misses it; it throws at runtime, aborting the Touched handler before both
+  TakeDamage and host.destroy(bullet) → no damage + lingering bullet shoves the player.
+- **Scope decision (user-driven):** fix the CLASS (hallucinated Roblox API calls), not just
+  the one name. Rejected: (a) one-off rewrite map (whack-a-mole); (b) typed analyzer
+  (spike: any-typed output defeats it, no luau-lsp/typedefs); (c) blunt name-matcher
+  (false-positives on valid custom/component methods).
+- **Chosen approach:** provenance-gated validator — a new semantic gate beside `_lint_and_fix`
+  that validates a method name against a vendored callable-only Roblox API corpus ONLY when the
+  receiver is provably a Roblox instance (workspace/game:GetService/Instance.new/.Parent/
+  .Character/FindFirstChild* + local-alias propagation; self/self.host/require skipped).
+  `.Parent`/`.Character` mark their result Roblox unconditionally (catches the bug). Invalid
+  call on a proven receiver → auto-fix (known pairs) or hard reprompt, FAIL-CLOSED if it
+  survives; unproven receiver → soft warning. Corpus = callable members only.
+- **User affirmed** the "list of proven Roblox APIs" (the corpus) as the backbone, paired with
+  the provenance gate for safety.
