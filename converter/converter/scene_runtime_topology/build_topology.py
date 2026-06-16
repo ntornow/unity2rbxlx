@@ -560,7 +560,7 @@ def build_topology(
         animation_drivers_block = preserved_animation_drivers
     else:
         animation_drivers_block = _build_animation_drivers_block(
-            scene_runtime, emitted_animations,
+            scene_runtime, emitted_animations, guid_index=guid_index,
         )
 
     artifact: TopologyArtifact = {
@@ -885,6 +885,8 @@ def _build_modules_block(
 def _build_animation_drivers_block(
     scene_runtime: SceneRuntimeArtifact,
     emitted_animations: list[EmittedAnimation],
+    *,
+    guid_index: GuidIndex | None = None,
 ) -> dict[str, AnimationDriverEntry]:
     """One AnimationDriverEntry per EmittedAnimation row, with explicit
     ``routing_status`` distinguishing resolved / unresolved / orphan.
@@ -917,6 +919,10 @@ def _build_animation_drivers_block(
         # the ORPHAN_SCOPE sentinel since scope_ref is empty.
         scope_segment = scope_ref if scope_ref else ORPHAN_SCOPE
         stable_id = compute_stable_id(scope_segment, ctrl_key, clip_disp)
+        # Hoisted above resolve_driver: the Phase-2 source-narrowing pass
+        # matches this clip param against each scope MB's Animator writes
+        # (D10/D12). Reused for build_animation_driver_entry below.
+        observed_attribute = row.get("observed_attribute", "")
 
         routing_status: AnimationRoutingStatus
         driver_module_guid: str
@@ -928,6 +934,7 @@ def _build_animation_drivers_block(
         else:
             resolved = resolve_driver(
                 scene_runtime, scope_kind=scope_kind, scope_ref=scope_ref,
+                guid_index=guid_index, observed_attribute=observed_attribute,
             )
             if resolved is None:
                 routing_status = "unresolved"
@@ -952,7 +959,6 @@ def _build_animation_drivers_block(
                     routing_status = "resolved"
                     domain = cast(AnimationDomain, driver_domain)
 
-        observed_attribute = row.get("observed_attribute", "")
         curve_paths_obj = row.get("curve_paths", [])
         curve_paths = (
             list(curve_paths_obj) if isinstance(curve_paths_obj, list) else []

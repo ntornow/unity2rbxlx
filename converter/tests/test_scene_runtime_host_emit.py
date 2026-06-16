@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -345,6 +346,107 @@ class TestEntrypointGenerators:
                 f"{gen.__name__} must resolve via the plan's "
                 f"template_name map (R2-P1.2)"
             )
+
+    @pytest.mark.skipif(not _luau_available(),
+                        reason="luau interpreter not installed")
+    def test_resolve_template_discriminates_colliding_character_prefabs(self):
+        """AC4 (the spike's central proof). Place BOTH ``character__473ffa``
+        (Cat) and ``character__2ae64d`` (Raccoon) as children under a
+        ``Templates`` folder, drive the REAL ``_resolveTemplate`` literal that
+        ``autogen`` emits into the entrypoints, and prove it resolves the Cat
+        prefab_id → the Cat child and the Raccoon prefab_id → the Raccoon child.
+        Unique resolved keys BEAT the bare-name collision (NOT first-wins).
+
+        Runs the actual emitted Luau (extracted from the generated client
+        entrypoint), not a reimplementation, so a regression in the real
+        ``Plan.prefabs[id].template_name → Templates:FindFirstChild`` bridge is
+        caught. MUST FAIL if both children shared the bare colliding name
+        ``character`` (proving this is a real guard, not a tautology)."""
+        src = generate_scene_runtime_client_entrypoint().source
+        body = _extract_lua_function(src, "_resolveTemplate")
+
+        cat_id = "473ffa01abcd:Assets/Bundles/Characters/Cat/character.prefab"
+        rac_id = "2ae64d0eefab:Assets/Bundles/Characters/Raccoon/character.prefab"
+
+        # A mock Roblox surface: ReplicatedStorage.Templates holds two children
+        # named by the RESOLVED (suffixed) names; Plan maps each prefab_id to
+        # its resolved template_name (single source of truth, what the planner
+        # stores). Each Templates child carries a marker so we can assert which
+        # one came back.
+        harness = textwrap.dedent(f"""\
+            local function makeChild(marker)
+                local c = {{ _marker = marker }}
+                return c
+            end
+            local templatesChildren = {{
+                ["character__473ffa"] = makeChild("CAT"),
+                ["character__2ae64d"] = makeChild("RACCOON"),
+            }}
+            local Templates = {{}}
+            function Templates:FindFirstChild(name)
+                return templatesChildren[name]
+            end
+            local RS = {{}}
+            function RS:FindFirstChild(name)
+                if name == "Templates" then return Templates end
+                return nil
+            end
+            local Plan = {{
+                prefabs = {{
+                    ["{cat_id}"] = {{ template_name = "character__473ffa" }},
+                    ["{rac_id}"] = {{ template_name = "character__2ae64d" }},
+                }},
+            }}
+
+            {body}
+
+            local cat = _resolveTemplate("{cat_id}")
+            local rac = _resolveTemplate("{rac_id}")
+            assert(cat ~= nil, "cat template resolved to nil")
+            assert(rac ~= nil, "raccoon template resolved to nil")
+            assert(cat._marker == "CAT",
+                "catId resolved to " .. tostring(cat._marker) .. " not CAT")
+            assert(rac._marker == "RACCOON",
+                "raccoonId resolved to " .. tostring(rac._marker) .. " not RACCOON")
+            assert(cat ~= rac, "colliding ids resolved to the SAME child")
+            print("ok")
+        """)
+        with tempfile.NamedTemporaryFile(
+            suffix=".luau", mode="w", delete=False,
+        ) as f:
+            f.write(harness)
+            wpath = f.name
+        try:
+            result = subprocess.run(
+                ["luau", wpath], capture_output=True, text=True, timeout=10,
+            )
+            assert result.returncode == 0, (
+                f"luau exec failed: stderr={result.stderr!r}, "
+                f"stdout={result.stdout!r}"
+            )
+            assert "ok" in result.stdout
+        finally:
+            Path(wpath).unlink(missing_ok=True)
+
+
+def _extract_lua_function(source: str, name: str) -> str:
+    """Slice the real ``local function <name>(...) ... end`` block out of an
+    emitted Luau source string by balanced block nesting, so the test drives
+    the ACTUAL emitted literal rather than a reimplementation. Lua blocks open
+    on ``function``/``do``/``then`` (the closing keyword of an ``if``) and close
+    on ``end``; ``elseif``/``else`` neither open nor close."""
+    import re as _re
+    marker = f"local function {name}("
+    start = source.index(marker)
+    depth = 0
+    for m in _re.finditer(r"\b(function|do|then|end)\b", source[start:]):
+        if m.group(1) in ("function", "do", "then"):
+            depth += 1
+        else:  # end
+            depth -= 1
+            if depth == 0:
+                return source[start:start + m.end()]
+    raise AssertionError(f"could not extract function {name!r}")
 
 
 # ---------------------------------------------------------------------------

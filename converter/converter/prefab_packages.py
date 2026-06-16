@@ -33,6 +33,7 @@ allowed for pure convenience helpers.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -129,6 +130,97 @@ def _collect_referenced_prefab_names(
             if isinstance(target, str) and not target.startswith("audio:"):
                 names.add(target)
     return names
+
+
+def _guid6_of(prefab_id: str) -> str | None:
+    """Return the first 6 hex chars of ``prefab_id``'s leading guid, or None.
+
+    A ``prefab_id`` is ``"<guid>:<rel>"`` or a colon-free bare guid. Returns
+    None when no guid can be detected (a colon-free path, or a non-hex head) —
+    the caller then keeps the bare name (cannot disambiguate).
+    """
+    head, sep, _rest = prefab_id.partition(":")
+    if sep:
+        if not head or not all(c in "0123456789abcdefABCDEF" for c in head):
+            return None
+        return head[:6]
+    # Colon-free: only a canonical 32-hex guid counts; a bare path does not.
+    if len(head) == 32 and all(c in "0123456789abcdefABCDEF" for c in head):
+        return head[:6]
+    return None
+
+
+def resolve_template_child_names(
+    prefab_bases: Mapping[str, str],
+) -> dict[str, str]:
+    """Resolve each prefab's on-disk Templates child name, disambiguating collisions.
+
+    The caller must pass only the EMITTED prefab set (``{prefab_id:
+    bare_template_name}``); scoping to it is load-bearing, so a non-emitted
+    same-base sibling never forces a suffix.
+
+    Returns ``{prefab_id: resolved_child_name}``: a base unique within the input
+    keeps its bare name; a base shared by 2+ prefabs becomes ``f"{base}__{guid6}"``
+    (or the bare name when the prefab_id has no guid to disambiguate by). Pure
+    and idempotent — a function of the input map alone.
+    """
+    by_base: dict[str, list[str]] = {}
+    for prefab_id, base in prefab_bases.items():
+        by_base.setdefault(base, []).append(prefab_id)
+
+    resolved: dict[str, str] = {}
+    for base, ids in by_base.items():
+        if len(ids) == 1:
+            resolved[ids[0]] = base
+            continue
+        for prefab_id in ids:
+            guid6 = _guid6_of(prefab_id)
+            # No guid → cannot disambiguate → keep the bare name.
+            resolved[prefab_id] = f"{base}__{guid6}" if guid6 else base
+    return resolved
+
+
+def select_emitted_prefab_ids(
+    prefab_library: PrefabLibrary | None,
+    serialized_field_refs: dict[str, dict[str, str]] | None,
+    addressable_prefab_ids: set[str] | None,
+    guid_index: GuidIndex | None = None,
+) -> set[str]:
+    """prefab_ids that will be emitted to ``ReplicatedStorage.Templates``.
+
+    The bare-name ``referenced`` selection (prefabs whose ``template.name`` is in
+    ``_collect_referenced_prefab_names``) unioned with ``addressable_prefab_ids``.
+    Shared by the planner (collision domain) and the emitter so the two target
+    sets never diverge. Each prefab_id is derived the same way the emitter does,
+    via ``scene_converter._prefab_stable_id``; ``guid_index`` is optional (omitted
+    → ids fall back to guid-less posix paths).
+    """
+    if prefab_library is None or not getattr(prefab_library, "prefabs", None):
+        return set(addressable_prefab_ids or set())
+
+    referenced = _collect_referenced_prefab_names(serialized_field_refs)
+
+    # Lazy import (mirrors generate_prefab_packages) to avoid a top-level
+    # scene_converter import cycle during pipeline setup.
+    from converter.scene_converter import _prefab_stable_id
+
+    by_guid = getattr(prefab_library, "by_guid", None) or {}
+    project_root = (
+        getattr(guid_index, "project_root", None) if guid_index else None
+    )
+
+    emitted: set[str] = set()
+    for template in prefab_library.prefabs:
+        name = getattr(template, "name", None)
+        if not name or name not in referenced:
+            continue
+        prefab_id = _prefab_stable_id(
+            template, guid_index, by_guid, project_root,
+        )
+        emitted.add(prefab_id)
+
+    emitted |= set(addressable_prefab_ids or set())
+    return emitted
 
 
 _BASEPART_CLASSES = (
@@ -253,6 +345,8 @@ def generate_prefab_packages(
     uploaded_assets: dict[str, str] | None = None,
     include_all: bool = False,
     legacy_prefab_pivot: bool = False,
+    resolved_template_names: Mapping[str, str] | None = None,
+    addressable_prefab_ids: set[str] | None = None,
 ) -> PrefabPackagesResult:
     """Build ``ReplicatedStorage.Templates`` entries from Unity prefabs.
 
@@ -268,6 +362,13 @@ def generate_prefab_packages(
         include_all: When True, emit every parsed prefab regardless of
             script references. Useful for tests; off by default so
             production runs don't bloat the rbxlx.
+        resolved_template_names: ``{prefab_id: resolved_child_name}`` computed
+            once by ``plan_scene_runtime``. The emitter reads the Templates
+            child name from this map rather than recomputing it; ``None`` /
+            empty (single-mode, no planner) → bare name fallback.
+        addressable_prefab_ids: prefab_ids referenced by the Addressables block,
+            unioned with the bare-name ``referenced`` selection (via
+            ``select_emitted_prefab_ids``) to form the emission target set.
 
     Returns:
         ``PrefabPackagesResult`` with the template parts, an optional
@@ -279,7 +380,8 @@ def generate_prefab_packages(
         return result
 
     referenced = _collect_referenced_prefab_names(serialized_field_refs)
-    target_set = referenced if not include_all else None
+    resolved_names: Mapping[str, str] = resolved_template_names or {}
+    addr_ids: set[str] = set(addressable_prefab_ids or set())
 
     # Lazy import to keep scene_converter out of this module's top-level
     # import graph (avoids circular-import risk during pipeline setup).
@@ -324,19 +426,55 @@ def generate_prefab_packages(
         if parent_name and child_name:
             variant_parent_by_name[child_name] = parent_name
 
+    # Emission target: bare-name ``referenced`` UNION the addressable prefab_ids.
+    # The bare leg stays a NAME test (not an id test): guid-less / single-mode
+    # collapses every prefab_id to one value, so an id-only test would over-emit.
+    def _is_emitted(name: str, prefab_id: str) -> bool:
+        if include_all:
+            return True
+        return name in referenced or prefab_id in addr_ids
+
+    # Bare base names that collide within the emitted set. On a resolved-name
+    # miss a colliding base can't bare-fallback (it would clone the wrong
+    # template), so it WARNs + skips; a unique base falls back harmlessly.
+    _base_counts: dict[str, int] = {}
+    for _tmpl in prefab_library.prefabs:
+        _nm = getattr(_tmpl, "name", None)
+        if not _nm:
+            continue
+        _ns = _prefab_stable_id(_tmpl, guid_index, by_guid, project_root)
+        if not _is_emitted(_nm, _ns):
+            continue
+        _base_counts[_nm] = _base_counts.get(_nm, 0) + 1
+    colliding_bare_bases = {b for b, c in _base_counts.items() if c > 1}
+
+    # Variant-parent base-name uniqueness check. ``VariantParentTemplate`` stays
+    # a BARE parent name (the runtime composer finds its source by it), which is
+    # unambiguous only while no two emitted prefabs share that parent base. If
+    # two do, the bare name can't pick the right source template → WARN (fail-
+    # soft, a real collision is a follow-up rather than a silent break).
+    _colliding_variant_parents = sorted(
+        parent_name
+        for parent_name in set(variant_parent_by_name.values())
+        if parent_name in colliding_bare_bases
+    )
+    if _colliding_variant_parents:
+        log.warning(
+            "[prefab_packages] variant-parent base name(s) %s collide among "
+            "emitted prefabs; the bare VariantParentTemplate metadata is "
+            "ambiguous and may resolve the wrong source template",
+            _colliding_variant_parents,
+        )
+
+    # Track the BARE base name of every emitted template so the
+    # ``referenced_but_missing`` manifest compares against bare names, not the
+    # RESOLVED (possibly suffixed) ``t.name`` (D15 fix). A colliding-but-emitted
+    # base would otherwise be falsely reported missing.
+    emitted_base_names: set[str] = set()
+
     for template in prefab_library.prefabs:
         name = getattr(template, "name", None)
         if not name:
-            continue
-        if target_set is not None and name not in target_set:
-            continue
-        root = getattr(template, "root", None)
-        if root is None:
-            result.unconverted.append({
-                "category": "prefab_package",
-                "item": name,
-                "reason": "no root node in parsed prefab",
-            })
             continue
         # Stable prefab namespace for ``_SceneRuntimeId`` stamping —
         # mirrors ``_convert_prefab_instance``'s ``prefab_namespace`` so
@@ -347,9 +485,36 @@ def generate_prefab_packages(
         # descendant and components boot with ``self.gameObject = nil``
         # (PR2 follow-up §6, observed as "no touch part on nil" at the
         # 1Hz turret-bullet spawn cadence in SimpleFPS).
+        #
+        # Computed before the skip check: emission unions the addressable
+        # prefab_ids, not just the bare ``referenced`` names.
         prefab_namespace = _prefab_stable_id(
             template, guid_index, by_guid, project_root,
         )
+        if not _is_emitted(name, prefab_namespace):
+            continue
+        # Read the Templates child name from the planner's
+        # ``resolved_template_names`` (do not recompute). On a miss, a unique
+        # base bare-falls-back; a colliding base WARNs + skips (bare-fallback
+        # would clone the wrong template).
+        child_name = resolved_names.get(prefab_namespace)
+        if child_name is None:
+            if name in colliding_bare_bases:
+                log.warning(
+                    "[prefab_packages] no resolved name for colliding prefab "
+                    "%r (id %r); skipping to avoid cloning the wrong template",
+                    name, prefab_namespace,
+                )
+                continue
+            child_name = name
+        root = getattr(template, "root", None)
+        if root is None:
+            result.unconverted.append({
+                "category": "prefab_package",
+                "item": name,
+                "reason": "no root node in parsed prefab",
+            })
+            continue
         try:
             part = _convert_prefab_node(
                 root,
@@ -379,9 +544,11 @@ def generate_prefab_packages(
         # emitted (the wrap uses the GameObject's name, which may
         # differ from the prefab asset name).
         original_root_name = getattr(part, "name", None)
-        # Force the top-level name to match the prefab name so
-        # WaitForChild(name) resolves.
-        part.name = name
+        # Name the top-level part the resolved Templates child name so
+        # ``WaitForChild(child_name)`` resolves and colliding bases stay
+        # distinct. For a non-colliding prefab ``child_name == name``.
+        part.name = child_name
+        emitted_base_names.add(name)
         # Prefab template pivot:
         # - Legacy (default-off, env ``U2R_LEGACY_PREFAB_PIVOT=1``):
         #   wipe to identity. Studio's runtime then falls back to the
@@ -459,24 +626,45 @@ def generate_prefab_packages(
             parent_path="ReplicatedStorage",
             source_path="packages/PrefabSpawner.luau",
         )
+    # Resolved child names actually emitted (possibly suffixed).
     emitted_names = {t.name for t in result.templates}
+    # Two colliding bases whose first-6 guid hex are equal would resolve to the
+    # SAME suffixed name → a real on-disk collision. Detect + log it.
+    if len(emitted_names) != len(result.templates):
+        name_counts: dict[str, int] = {}
+        for t in result.templates:
+            name_counts[t.name] = name_counts.get(t.name, 0) + 1
+        dupes = sorted(n for n, c in name_counts.items() if c > 1)
+        log.warning(
+            "[prefab_packages] post-resolve child-name collision among "
+            "emitted templates: %s — clones may resolve the wrong template",
+            dupes,
+        )
+    # ``referenced_but_missing`` and variant chains compare against the BARE
+    # base names of emitted templates, not the resolved (possibly suffixed)
+    # ``t.name`` — else a colliding-but-emitted base reports as missing.
     variant_chains = {
         name: parent
         for name, parent in variant_parent_by_name.items()
-        if name in emitted_names
+        if name in emitted_base_names
     }
     result.manifest = {
         "total_templates": len(result.templates),
+        "emitted_count": len(result.templates),
+        "total_prefabs": len(prefab_library.prefabs),
+        "addressable_referenced": len(addressable_prefab_ids or set()),
         "emitted_names": sorted(emitted_names),
-        "referenced_but_missing": sorted(referenced - emitted_names),
+        "referenced_but_missing": sorted(referenced - emitted_base_names),
         # Per emitted variant, the parent template name. Lets tools
         # and the runtime composer reconstruct the inheritance chain.
         "variant_chains": variant_chains,
     }
     log.info(
-        "[prefab_packages] emitted %d templates "
-        "(%d referenced, %d unconverted)",
-        len(result.templates), len(referenced), len(result.unconverted),
+        "[prefab_packages] emitted %d/%d templates "
+        "(%d referenced, %d addressable, %d unconverted)",
+        len(result.templates), len(prefab_library.prefabs),
+        len(referenced), len(addressable_prefab_ids or set()),
+        len(result.unconverted),
     )
     return result
 

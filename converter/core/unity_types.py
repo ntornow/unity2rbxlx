@@ -40,6 +40,24 @@ class PrefabInstanceData:
     removed_components: list[Any] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class StrippedComponentRecord:
+    """Identity of a stripped component document (a prefab-instance component
+    excluded from the parsed scene's documents) so the planner can bridge a
+    same-scene fileID-only reference back to the cloned component.
+
+    All fields are scene-local fileIDs / asset guids extracted from the
+    stripped doc; ``source_object_file_id`` is the prefab-local component
+    fileID that becomes the prefab-local instance_id in the subplan.
+    """
+    file_id: str             # scene-local stripped fileID (e.g. "137514649")
+    class_id: int            # 114 for MonoBehaviour (the only kind Phase 3 acts on)
+    source_object_file_id: str    # m_CorrespondingSourceObject.fileID -> prefab-local component fileID
+    source_object_guid: str       # m_CorrespondingSourceObject.guid -> the source .prefab guid
+    prefab_instance_file_id: str  # m_PrefabInstance.fileID -> the placement's pi fileID
+    script_guid: str              # m_Script.guid -> the MonoBehaviour class
+
+
 @dataclass
 class SceneNode:
     """A single GameObject in the Unity scene hierarchy."""
@@ -81,6 +99,11 @@ class ParsedScene:
     skybox_material_guid: str | None = None
     render_settings: dict[str, Any] = field(default_factory=dict)
     parse_warnings: list[str] = field(default_factory=list)
+    # scene-local stripped fileID -> identity record. Only classID 114
+    # (MonoBehaviour) records are populated in Phase 3; the planner consumes
+    # these to resolve same-scene fileID-only refs to stripped prefab-instance
+    # components. Empty for binary scenes (no YAML docs).
+    stripped_components: dict[str, StrippedComponentRecord] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

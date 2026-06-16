@@ -63,6 +63,7 @@ local function newInstance(spec)
     inst.ClassName = spec.ClassName or "Part"
     inst.Transparency = spec.Transparency
     inst.CanTouch = spec.CanTouch
+    inst.CanCollide = spec.CanCollide
     inst._children = spec.children or {}
     inst._isa = spec.isa or {}
     inst._attrs = spec.attrs or {}
@@ -390,6 +391,54 @@ class TestGetTouchPart:
             "edge getTouchPart must use original tier-1 named-trigger search, "
             f"not the _IsTriggerVolume mark\n{out}"
         )
+
+    def test_projectile_unmarked_invisible_decoration_does_not_steal_touch(self):
+        # Regression (turret-bullet no-damage): a projectile Model with a
+        # visible CanCollide=true body + an invisible, UNMARKED, CanTouch
+        # particle-host decoration ("Sparks") must bind Touched to the
+        # COLLIDING body, NOT the decoration. The old loose Tier-2 ("any
+        # invisible non-mesh CanTouch part") wrongly grabbed the decoration,
+        # so the body pushed the victim while the damage handler sat on a part
+        # that never touched them. RED against the loose-Tier-2 resolver.
+        scenario = textwrap.dedent("""\
+            local engine = SceneRuntime.new(baseServices(nil), {})
+            local sparks = newInstance{Name = "Sparks", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, CanCollide = false,
+                Transparency = 1}
+            local mesh = newInstance{Name = "TurretBullet_Mesh", ClassName = "MeshPart",
+                isa = {BasePart = true}, CanTouch = true, CanCollide = true,
+                Transparency = 0}
+            local model = newInstance{Name = "TurretBullet", ClassName = "Model",
+                isa = {Model = true}, children = {sparks, mesh}}
+            local got = engine:getTouchPart(model)
+            print(got == mesh and "MESH" or ("WRONG:" .. tostring(got and got.Name)))
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "MESH" in out, (
+            "damage Touched must bind to the colliding body, not the unmarked "
+            f"invisible decoration\n{out}"
+        )
+
+    def test_marked_trigger_still_wins_over_colliding_body(self):
+        # The fix must NOT regress real triggers: a Model with a CanCollide
+        # body AND a converter-stamped _IsTriggerVolume part resolves to the
+        # MARKED trigger (Tier-2 marker beats Tier-3 body) — door/mine/sight.
+        scenario = textwrap.dedent("""\
+            local engine = SceneRuntime.new(baseServices(nil), {})
+            local body = newInstance{Name = "Body", ClassName = "MeshPart",
+                isa = {BasePart = true}, CanTouch = true, CanCollide = true}
+            local trig = newInstance{Name = "Collider", ClassName = "Part",
+                isa = {BasePart = true}, CanTouch = true, CanCollide = false,
+                Transparency = 1, attrs = {_IsTriggerVolume = true}}
+            local model = newInstance{Name = "Door", ClassName = "Model",
+                isa = {Model = true}, children = {body, trig}}
+            local got = engine:getTouchPart(model)
+            print(got == trig and "TRIGGER" or ("WRONG:" .. tostring(got and got.Name)))
+        """)
+        rc, out, err = _run(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "TRIGGER" in out, f"marked trigger must still win\n{out}"
 
     def test_model_with_triggerzone_child(self):
         scenario = textwrap.dedent("""\

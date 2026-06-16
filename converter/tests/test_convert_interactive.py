@@ -200,6 +200,11 @@ class TestResumeVsRunThroughParity:
         assert Pipeline.ESSENTIAL_PHASES == frozenset({
             "parse", "extract_assets", "convert_materials",
             "transpile_scripts", "convert_animations", "convert_scene",
+            # Addressables Unit 1: ``plan_scene_runtime`` recomputes the
+            # addressables block + resolved ``template_name`` map fresh on
+            # every resume so a ``--phase=write_output`` resume never pairs a
+            # fresh prefab_library with a stale persisted map.
+            "plan_scene_runtime",
             # Phase 2a slice 8: ``materialize_and_classify`` populates
             # ``rbx_place.scripts`` in-memory; it must re-run on every
             # resumed invocation so a ``--phase=write_output`` resume

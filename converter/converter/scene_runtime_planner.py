@@ -39,7 +39,9 @@ from core.unity_types import (
     PrefabNode,
     PrefabTemplate,
     SceneNode,
+    StrippedComponentRecord,
 )
+from unity.prefab_id import canonical_prefab_id
 from unity.yaml_parser import ref_file_id, ref_guid
 
 
@@ -257,6 +259,13 @@ SceneRuntimeReference = TypedDict(
 # ``BoxCollider``, ``Button``, ``RectTransform``, ...).
 class SceneRuntimeReferenceExtra(TypedDict, total=False):
     target_component_type: str
+    # Phase 3 (stripped-prefab-instance refs): the resolved target's planner
+    # ``script_id`` (the .cs GUID). Stamped ONLY on rows the post-pass
+    # ``_resolve_stripped_refs`` rewrites to a placement-scoped engine-union
+    # key. The runtime reads it to classify the target's DOMAIN (cross-domain
+    # policy) — a placement-scoped key never appears in the scene-local
+    # ``instanceById``, so the target can't be classified by lookup.
+    target_script_id: str
 
 
 class SceneRuntimeScene(TypedDict):
@@ -437,6 +446,10 @@ def _prefab_stable_id(
     Bare name collides across folders (the design doc's whole reason for
     this id shape); the GUID disambiguates while the path keeps the id
     legible in dumps.
+
+    Delegates to ``unity.prefab_id.canonical_prefab_id`` — the shared core
+    the emitter and the addressables resolver also use, so every prefab_id
+    joins on the same key (including the outside-root / no-root fallback).
     """
     guid = ""
     if guid_index is not None:
@@ -448,8 +461,7 @@ def _prefab_stable_id(
             if t is template:
                 guid = g
                 break
-    rel = _relative_path_string(template.prefab_path, unity_project_root)
-    return f"{guid}:{rel}" if guid else rel
+    return canonical_prefab_id(guid, template.prefab_path, unity_project_root)
 
 
 def _script_id_for(
@@ -1593,6 +1605,112 @@ def _resolves_to_component(
 
 
 # ---------------------------------------------------------------------------
+# Phase 3: stripped-prefab-instance component-ref resolution (post-pass).
+# ---------------------------------------------------------------------------
+
+def _resolve_stripped_refs(
+    scenes_block: dict[str, SceneRuntimeScene],
+    prefabs_block: dict[str, SceneRuntimePrefab],
+    placements_block: list[SceneRuntimeScenePrefabPlacement],
+    parsed_scenes: list[ParsedScene],
+    modules_block: dict[str, SceneRuntimeModule],
+    unity_project_root: Path | None,
+) -> None:
+    """In-place rewrite of unresolvable stripped-MB component refs to the
+    runtime engine-union key. Mutates ``scenes_block[*].references`` rows.
+
+    Fail-CLOSED: only rewrites a row when EVERY link in the bridge is verified
+    — the prefab instance has an emitted placement, the placement's prefab guid
+    matches the stripped doc's recorded source-prefab guid, the bound subplan
+    contains the source-object instance_id, AND that instance's ``script_id``
+    resolves to the same ``.cs`` GUID the stripped doc's ``m_Script`` named.
+    When any link is missing the row is left as its unresolvable scene-local
+    fallback (identical to today's behaviour; the runtime leaves the field nil
+    + WARN).
+
+    The resolved ``target_ref`` is anchored on the deterministic upstream
+    ``m_CorrespondingSourceObject.fileID`` (→ prefab-local instance_id), never
+    on a fingerprint of generated output.
+    """
+    # Map each scene namespace to its ParsedScene so we can read
+    # ``stripped_components`` (the bridge identity recorded by the parser).
+    scene_by_ns: dict[str, ParsedScene] = {
+        _scene_namespace(scene, unity_project_root): scene
+        for scene in parsed_scenes
+    }
+
+    for namespace, scene_block in scenes_block.items():
+        parsed = scene_by_ns.get(namespace)
+        if parsed is None or not parsed.stripped_components:
+            continue
+        stripped: dict[str, StrippedComponentRecord] = parsed.stripped_components
+
+        # pi fileID -> (placement_id, prefab_id). The placement_id encodes the
+        # pi fileID as its suffix (``"<ns>:<pi_fid>"``), so this is a cheap
+        # parse of the placements filtered to this scene's namespace.
+        prefix = f"{namespace}:"
+        pi_fid_to_placement: dict[str, tuple[str, str]] = {}
+        for placement in placements_block:
+            placement_id = placement["placement_id"]
+            if not placement_id.startswith(prefix):
+                continue
+            pi_fid = placement_id[len(prefix):]
+            pi_fid_to_placement[pi_fid] = (placement_id, placement["prefab_id"])
+
+        for row in scene_block["references"]:
+            if row["target_kind"] != "component":
+                continue
+            stripped_fid = row["target_ref"].split(":")[-1]
+            rec = stripped.get(stripped_fid)
+            if rec is None:
+                continue  # not a stripped ref -> untouched (no regression)
+
+            placement = pi_fid_to_placement.get(rec.prefab_instance_file_id)
+            if placement is None:
+                continue  # no placement -> keep fallback (fail-soft)
+            placement_id, prefab_id = placement
+
+            # Fail-CLOSED on prefab identity: the placement's prefab guid (the
+            # guid segment of its ``prefab_id``, format ``"<guid>:<path>"``)
+            # MUST equal the stripped doc's recorded source-prefab guid
+            # (``m_CorrespondingSourceObject.guid``). Defends against a corrupt
+            # scene whose m_PrefabInstance points at a placement of a DIFFERENT
+            # prefab that happens to share a source-object fileID + script guid.
+            placement_prefab_guid = prefab_id.split(":", 1)[0]
+            if placement_prefab_guid != rec.source_object_guid:
+                continue  # prefab identity mismatch -> keep fallback
+
+            subplan = prefabs_block.get(prefab_id)
+            if subplan is None:
+                continue  # no subplan -> keep fallback (fail-soft)
+
+            local_instance_id = f"{prefab_id}:{rec.source_object_file_id}"
+            inst = next(
+                (i for i in subplan["instances"]
+                 if i["instance_id"] == local_instance_id),
+                None,
+            )
+            if inst is None:
+                continue  # source object isn't a planned MB -> fail-soft
+
+            # Fail-CLOSED: the subplan component's class MUST match the stripped
+            # doc's m_Script. The planner ``script_id`` IS the ``.cs`` GUID
+            # (``_script_id_for`` returns the raw GUID, the same key
+            # ``modules_block`` is keyed under), so this is direct GUID
+            # equality. Defends against the wrong-component-at-same-fileID case
+            # and non-flattened nested/variant content. Confirm the id resolves
+            # to a real module before trusting the equality.
+            if inst["script_id"] not in modules_block:
+                continue
+            if inst["script_id"] != rec.script_guid:
+                continue
+
+            # Verified bridge -> rewrite the row IN PLACE.
+            row["target_ref"] = f"{placement_id}:{local_instance_id}"
+            cast(dict[str, object], row)["target_script_id"] = inst["script_id"]
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -1652,6 +1770,16 @@ def plan_scene_runtime(
 
     modules_block = _build_modules_table(
         guid_index, runtime_bearing, character_controller_scripts,
+    )
+
+    # Phase 3 post-pass: rewrite unresolvable stripped-prefab-instance component
+    # refs to the runtime engine-union key. Runs here (after scenes_block,
+    # prefabs_block, placements_block AND modules_block are built) because it is
+    # the only point where the prefab subplans coexist with the scene refs, so it
+    # can fail-CLOSE on subplan-instance + script-guid verification.
+    _resolve_stripped_refs(
+        scenes_block, prefabs_block, placements_block, parsed_scenes,
+        modules_block, unity_project_root,
     )
 
     return {

@@ -8,10 +8,11 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 from typing import TYPE_CHECKING
 
 import yaml
+
+from unity.prefab_ref import prefab_id_for_ref, GuidIndexLike
 
 if TYPE_CHECKING:
     from unity.guid_resolver import GuidIndex
@@ -33,6 +34,13 @@ _SKIP_FIELDS = {
     "m_PrefabAsset", "m_GameObject", "m_Enabled", "m_EditorHideFlags",
     "m_EditorClassIdentifier", "m_Script",
 }
+
+
+@dataclass
+class RefResolveCounts:
+    """Tally of object-ref fields encountered while emitting one .asset."""
+    resolved: int = 0   # {guid,fileID} ref -> a .prefab id
+    skipped: int = 0    # non-prefab / fileID-only / missing-guid / no-index -> kept nil
 
 
 @dataclass
@@ -59,7 +67,12 @@ def _lua_escape_string(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
-def _value_to_lua(value: Any, indent: int = 1) -> str:
+def _value_to_lua(
+    value: object,
+    indent: int = 1,
+    guid_index: GuidIndexLike | None = None,
+    counts: RefResolveCounts | None = None,
+) -> str:
     """Convert a Python value to a Luau literal string."""
     prefix = "\t" * indent
     if value is None:
@@ -77,13 +90,20 @@ def _value_to_lua(value: Any, indent: int = 1) -> str:
             return "{}"
         items = []
         for item in value:
-            items.append(f"{prefix}\t{_value_to_lua(item, indent + 1)},")
+            items.append(f"{prefix}\t{_value_to_lua(item, indent + 1, guid_index, counts)},")
         return "{\n" + "\n".join(items) + f"\n{prefix}}}"
     if isinstance(value, dict):
         if not value:
             return "{}"
         # Check if it looks like a Unity object reference (fileID/guid)
         if set(value.keys()) <= {"fileID", "guid", "type"}:
+            pid = prefab_id_for_ref(value, guid_index) if guid_index is not None else None
+            if pid is not None:
+                if counts is not None:
+                    counts.resolved += 1
+                return f'"{_lua_escape_string(pid)}"'
+            if counts is not None:
+                counts.skipped += 1
             return "nil --[[(Unity object reference)]]"
         items = []
         for k, v in value.items():
@@ -95,9 +115,9 @@ def _value_to_lua(value: Any, indent: int = 1) -> str:
                 clean_key = k[2:]  # strip m_ prefix
             # Lua key formatting
             if isinstance(clean_key, str) and clean_key.isidentifier():
-                items.append(f"{prefix}\t{clean_key} = {_value_to_lua(v, indent + 1)},")
+                items.append(f"{prefix}\t{clean_key} = {_value_to_lua(v, indent + 1, guid_index, counts)},")
             else:
-                items.append(f'{prefix}\t["{_lua_escape_string(str(clean_key))}"] = {_value_to_lua(v, indent + 1)},')
+                items.append(f'{prefix}\t["{_lua_escape_string(str(clean_key))}"] = {_value_to_lua(v, indent + 1, guid_index, counts)},')
         if not items:
             return "{}"
         return "{\n" + "\n".join(items) + f"\n{prefix}}}"
@@ -228,7 +248,16 @@ def convert_asset_file(
     # fields. Falls back to bare ``data`` when the class can't be resolved.
     class_stem = _resolve_script_class_stem(data_body, guid_index, asset_name)
     class_note = f" (class: {class_stem})" if class_stem else ""
-    data_literal = _value_to_lua(user_fields) if user_fields else "{}"
+    counts = RefResolveCounts()
+    data_literal = (
+        _value_to_lua(user_fields, guid_index=guid_index, counts=counts)
+        if user_fields else "{}"
+    )
+    if counts.resolved or counts.skipped:
+        logger.info(
+            "[scriptable_object] %s: %d object-ref(s) resolved to prefab ids, %d kept nil",
+            asset_path.name, counts.resolved, counts.skipped,
+        )
 
     lines = [
         f"-- Auto-generated from {asset_path.name}",

@@ -21,6 +21,7 @@ from core.unity_types import (
     PrefabInstanceData,
     SceneNode,
     ParsedScene,
+    StrippedComponentRecord,
 )
 from unity.yaml_parser import (
     CID_GAME_OBJECT,
@@ -28,6 +29,7 @@ from unity.yaml_parser import (
     CID_RECT_TRANSFORM,
     CID_RENDER_SETTINGS,
     CID_PREFAB_INSTANCE,
+    CID_MONO_BEHAVIOUR,
     CID_MESH_FILTER,
     CID_MESH_RENDERER,
     CID_SKINNED_MESH_RENDERER,
@@ -67,7 +69,12 @@ def parse_scene(scene_path: str | Path) -> ParsedScene:
 
     raw_text = scene_path.read_text(encoding="utf-8", errors="replace")
     result = ParsedScene(scene_path=scene_path)
-    triples = parse_documents(raw_text, warnings_out=result.parse_warnings)
+    stripped_triples: list[tuple[int, str, dict]] = []
+    triples = parse_documents(
+        raw_text,
+        warnings_out=result.parse_warnings,
+        stripped_out=stripped_triples,
+    )
 
     result.raw_documents = [doc for _, _, doc in triples]
 
@@ -239,6 +246,32 @@ def parse_scene(scene_path: str | Path) -> ParsedScene:
             modifications=modifications,
             removed_components=removed,
         ))
+
+    # ------------------------------------------------------------------
+    # Pass 6b: Record stripped MonoBehaviour components
+    # ------------------------------------------------------------------
+    # Stripped prefab-instance MonoBehaviours are excluded from the parsed
+    # documents but carry the identity needed to bridge a same-scene
+    # fileID-only reference back to the cloned component. Only MonoBehaviours
+    # (CID 114) are reference targets the planner resolves.
+    for cid, fid, doc in stripped_triples:
+        if cid != CID_MONO_BEHAVIOUR:
+            continue
+        body = doc_body(doc)
+        cso = body.get("m_CorrespondingSourceObject", {}) or {}
+        pi = body.get("m_PrefabInstance", {}) or {}
+        scr = body.get("m_Script", {}) or {}
+        src_fid = ref_file_id(cso) or ""
+        if not src_fid:
+            continue
+        result.stripped_components[fid] = StrippedComponentRecord(
+            file_id=fid,
+            class_id=cid,
+            source_object_file_id=src_fid,
+            source_object_guid=ref_guid(cso) or "",
+            prefab_instance_file_id=ref_file_id(pi) or "",
+            script_guid=ref_guid(scr) or "",
+        )
 
     # ------------------------------------------------------------------
     # Pass 7: Extract RenderSettings

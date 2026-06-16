@@ -3723,3 +3723,324 @@ class TestScenePrefabPlacementDeferredTiers:
     )
     def test_binary_scene_placement_parent_resolution(self):
         pass
+
+
+# ---------------------------------------------------------------------------
+# Slice 1.4: Addressables host address resolution
+#   instantiatePrefab(address) -> _resolveAddressToPrefabId -> prefab_id.
+#   AC4 (resolved id discriminates colliding base names at the runtime),
+#   AC10 (end-to-end address -> clone of the right template),
+#   AC11 (multi-candidate + missing-address fail-soft).
+# ---------------------------------------------------------------------------
+
+
+class TestAddressableHostResolution:
+
+    def test_instantiate_prefab_resolves_address_to_prefab_id(self):
+        # AC10: by_address["Trash Cat"] = {catId}; prefabs[catId] present;
+        # instantiatePrefab("Trash Cat") resolves the address -> catId and
+        # clones the Cat template. The stub records the id it received,
+        # proving the RESOLVED catId (not the raw address) flows downstream.
+        scenario = textwrap.dedent("""\
+            local catId = "473ffa01:Assets/Bundles/Characters/Cat/character.prefab"
+            local plan = {
+                modules = {},
+                scenes = {},
+                prefabs = {
+                    [catId] = {
+                        name = "character",
+                        template_name = "character__473ffa",
+                        instances = {},
+                        references = {},
+                        lifecycle_order = {},
+                    },
+                },
+                addressables = {
+                    by_address = {["Trash Cat"] = {catId}},
+                    by_label = {},
+                },
+                domain_overrides = {},
+            }
+            local receivedId = nil
+            local cloneInstance = {
+                Name = "CatClone", _sceneRuntimeId = "clone", _children = {},
+            }
+            local services = servicesFor(plan, {}, {})
+            services.clonePrefabTemplate = function(prefabId, parent, cframe)
+                receivedId = prefabId
+                return cloneInstance
+            end
+            local engine = SceneRuntime.new(services, plan)
+            local clone = engine:instantiatePrefab("Trash Cat", nil, nil, nil)
+            runDeferred()
+            assert(clone == cloneInstance,
+                "address spawn must return the resolved clone")
+            assert(receivedId == catId,
+                "clonePrefabTemplate must receive the RESOLVED catId, got "
+                .. tostring(receivedId))
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+    def test_resolved_id_discriminates_colliding_template_names(self):
+        # AC4 (runtime leg): two prefabs share base name "character" but
+        # carry DISTINCT resolved template_names. The runtime resolves each
+        # address to its own prefab_id, whose subplan template_name is the
+        # unique suffixed name -- proving unique-key discrimination end to
+        # end at the runtime. (_resolveTemplate itself lives in the emitted
+        # entrypoint, not this module; the runtime-observable proof is that
+        # the resolved id selects the subplan carrying the right
+        # template_name, and the right id reaches clonePrefabTemplate.)
+        scenario = textwrap.dedent("""\
+            local catId = "473ffa01:Assets/Bundles/Characters/Cat/character.prefab"
+            local racId = "2ae64d0e:Assets/Bundles/Characters/Raccoon/character.prefab"
+            local plan = {
+                modules = {},
+                scenes = {},
+                prefabs = {
+                    [catId] = {name = "character",
+                              template_name = "character__473ffa",
+                              instances = {}, references = {}, lifecycle_order = {}},
+                    [racId] = {name = "character",
+                              template_name = "character__2ae64d",
+                              instances = {}, references = {}, lifecycle_order = {}},
+                },
+                addressables = {
+                    by_address = {
+                        ["Trash Cat"] = {catId},
+                        ["Trash Raccoon"] = {racId},
+                    },
+                    by_label = {},
+                },
+                domain_overrides = {},
+            }
+            local cloned = {}
+            local services = servicesFor(plan, {}, {})
+            services.clonePrefabTemplate = function(prefabId, parent, cframe)
+                cloned.lastId = prefabId
+                cloned.lastTemplateName = plan.prefabs[prefabId].template_name
+                return {Name = "C", _sceneRuntimeId = "c", _children = {}}
+            end
+            local engine = SceneRuntime.new(services, plan)
+
+            engine:instantiatePrefab("Trash Cat", nil, nil, nil)
+            assert(cloned.lastId == catId,
+                "Trash Cat must resolve to catId")
+            assert(cloned.lastTemplateName == "character__473ffa",
+                "Cat subplan must carry the Cat template_name, got "
+                .. tostring(cloned.lastTemplateName))
+
+            engine:instantiatePrefab("Trash Raccoon", nil, nil, nil)
+            assert(cloned.lastId == racId,
+                "Trash Raccoon must resolve to racId")
+            assert(cloned.lastTemplateName == "character__2ae64d",
+                "Raccoon subplan must carry the Raccoon template_name, got "
+                .. tostring(cloned.lastTemplateName))
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+    def test_direct_prefab_id_bypasses_address_resolution(self):
+        # A real prefab_id passed directly is a key in prefabs -> the
+        # address-indirection branch is skipped; the id flows unchanged.
+        scenario = textwrap.dedent("""\
+            local catId = "473ffa01:Assets/Bundles/Characters/Cat/character.prefab"
+            local plan = {
+                modules = {}, scenes = {},
+                prefabs = {
+                    [catId] = {name = "character",
+                              template_name = "character__473ffa",
+                              instances = {}, references = {}, lifecycle_order = {}},
+                },
+                addressables = {by_address = {}, by_label = {}},
+                domain_overrides = {},
+            }
+            local receivedId = nil
+            local services = servicesFor(plan, {}, {})
+            services.clonePrefabTemplate = function(prefabId, parent, cframe)
+                receivedId = prefabId
+                return {Name = "C", _sceneRuntimeId = "c", _children = {}}
+            end
+            local engine = SceneRuntime.new(services, plan)
+            local clone = engine:instantiatePrefab(catId, nil, nil, nil)
+            assert(clone ~= nil, "direct prefab_id must clone")
+            assert(receivedId == catId,
+                "direct prefab_id must pass through unchanged")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+    def test_multi_candidate_address_picks_first_and_warns(self):
+        # AC11: a 2-element by_address list -> _resolveAddressToPrefabId
+        # returns ids[1] (deterministic, D9) AND warns.
+        scenario = textwrap.dedent("""\
+            local idA = "aaaaaa:Assets/A/character.prefab"
+            local idB = "bbbbbb:Assets/B/character.prefab"
+            local plan = {
+                modules = {}, scenes = {},
+                prefabs = {
+                    [idA] = {name = "character", template_name = "character__aaaaaa",
+                             instances = {}, references = {}, lifecycle_order = {}},
+                    [idB] = {name = "character", template_name = "character__bbbbbb",
+                             instances = {}, references = {}, lifecycle_order = {}},
+                },
+                addressables = {by_address = {["Dup"] = {idA, idB}}, by_label = {}},
+                domain_overrides = {},
+            }
+            local services = servicesFor(plan, {}, {})
+            local engine = SceneRuntime.new(services, plan)
+            local picked = engine:_resolveAddressToPrefabId("Dup")
+            assert(picked == idA,
+                "multi-candidate address must pick ids[1], got " .. tostring(picked))
+            local warned = false
+            for _, line in ipairs(logs) do
+                if string.find(line, "resolves to 2 prefabs") then warned = true end
+            end
+            assert(warned, "multi-candidate must emit a 'resolves to N prefabs' warn")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+    def test_missing_address_returns_nil_and_warns(self):
+        # AC11: an absent address -> _resolveAddressToPrefabId returns nil
+        # + warns; an empty list does too.
+        scenario = textwrap.dedent("""\
+            local plan = {
+                modules = {}, scenes = {}, prefabs = {},
+                addressables = {by_address = {["Empty"] = {}}, by_label = {}},
+                domain_overrides = {},
+            }
+            local services = servicesFor(plan, {}, {})
+            local engine = SceneRuntime.new(services, plan)
+
+            local r1 = engine:_resolveAddressToPrefabId("Nope")
+            assert(r1 == nil, "absent address must resolve to nil")
+            local r2 = engine:_resolveAddressToPrefabId("Empty")
+            assert(r2 == nil, "empty list must resolve to nil")
+
+            local count = 0
+            for _, line in ipairs(logs) do
+                if string.find(line, "no prefab for address") then count = count + 1 end
+            end
+            assert(count == 2, "each missing/empty address must warn; got " .. count)
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+    def test_instantiate_prefab_unresolvable_address_returns_nil_no_raise(self):
+        # AC11: instantiatePrefab on an unresolvable address returns nil
+        # WITHOUT raising, and never reaches clonePrefabTemplate.
+        scenario = textwrap.dedent("""\
+            local plan = {
+                modules = {}, scenes = {}, prefabs = {},
+                addressables = {by_address = {}, by_label = {}},
+                domain_overrides = {},
+            }
+            local cloneCalled = false
+            local services = servicesFor(plan, {}, {})
+            services.clonePrefabTemplate = function(prefabId, parent, cframe)
+                cloneCalled = true
+                return {Name = "C", _sceneRuntimeId = "c", _children = {}}
+            end
+            local engine = SceneRuntime.new(services, plan)
+            local ok, result = pcall(function()
+                return engine:instantiatePrefab("Ghost", nil, nil, nil)
+            end)
+            assert(ok, "instantiatePrefab must not raise on unresolvable address: "
+                .. tostring(result))
+            assert(result == nil, "unresolvable address must return nil")
+            assert(not cloneCalled,
+                "clonePrefabTemplate must NOT be called for an unresolvable address")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+    def test_no_addressables_block_address_path_fails_soft(self):
+        # Edge-10: a plan with no addressables block (single-mode / no
+        # GuidIndex) -> an address-like arg that isn't a prefab key warns
+        # + returns nil, no crash.
+        scenario = textwrap.dedent("""\
+            local plan = {
+                modules = {}, scenes = {}, prefabs = {}, domain_overrides = {},
+            }
+            local services = servicesFor(plan, {}, {})
+            local engine = SceneRuntime.new(services, plan)
+            local r = engine:instantiatePrefab("Trash Cat", nil, nil, nil)
+            assert(r == nil, "missing addressables block must fail soft to nil")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+    def test_non_table_addressables_block_fails_soft_no_raise(self):
+        # D9 fail-soft: a TRUTHY non-table addressables value (e.g. 123)
+        # must NOT raise on index -> instantiatePrefab returns nil and
+        # never reaches clonePrefabTemplate.
+        scenario = textwrap.dedent("""\
+            local plan = {
+                modules = {}, scenes = {}, prefabs = {},
+                addressables = 123,
+                domain_overrides = {},
+            }
+            local cloneCalled = false
+            local services = servicesFor(plan, {}, {})
+            services.clonePrefabTemplate = function(prefabId, parent, cframe)
+                cloneCalled = true
+                return {Name = "C", _sceneRuntimeId = "c", _children = {}}
+            end
+            local engine = SceneRuntime.new(services, plan)
+            local ok, result = pcall(function()
+                return engine:instantiatePrefab("Trash Cat", nil, nil, nil)
+            end)
+            assert(ok, "non-table addressables must not raise: " .. tostring(result))
+            assert(result == nil, "non-table addressables must return nil")
+            assert(not cloneCalled,
+                "clonePrefabTemplate must NOT be called for a malformed block")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out
+
+    def test_non_table_by_address_fails_soft_no_raise(self):
+        # D9 fail-soft: a TRUTHY non-table by_address value (e.g. 123)
+        # must NOT raise on index -> instantiatePrefab returns nil and
+        # never reaches clonePrefabTemplate.
+        scenario = textwrap.dedent("""\
+            local plan = {
+                modules = {}, scenes = {}, prefabs = {},
+                addressables = {by_address = 123, by_label = {}},
+                domain_overrides = {},
+            }
+            local cloneCalled = false
+            local services = servicesFor(plan, {}, {})
+            services.clonePrefabTemplate = function(prefabId, parent, cframe)
+                cloneCalled = true
+                return {Name = "C", _sceneRuntimeId = "c", _children = {}}
+            end
+            local engine = SceneRuntime.new(services, plan)
+            local ok, result = pcall(function()
+                return engine:instantiatePrefab("Trash Cat", nil, nil, nil)
+            end)
+            assert(ok, "non-table by_address must not raise: " .. tostring(result))
+            assert(result == nil, "non-table by_address must return nil")
+            assert(not cloneCalled,
+                "clonePrefabTemplate must NOT be called for a malformed by_address")
+            print("OK")
+        """)
+        rc, out, err = _run_scenario(scenario)
+        assert rc == 0, f"luau failed: {err}\n{out}"
+        assert "OK" in out

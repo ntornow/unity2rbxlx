@@ -35,6 +35,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.roblox_types import ScriptType  # noqa: E402
+from core.unity_types import GuidIndex  # noqa: E402
 from converter.scene_runtime_planner import (  # noqa: E402
     SceneRuntimeArtifact,
 )
@@ -1547,6 +1548,294 @@ class TestRoutingStatusCoverage:
 
 
 # ===========================================================================
+# CATEGORY 3b: Phase-2 source-narrowing (0-ref) resolution (door run)
+# ===========================================================================
+
+
+def _mk_guid_index_with_sources(
+    tmp_path: Path, sources: dict[str, str],
+) -> GuidIndex:
+    """Build a real ``GuidIndex`` mapping each guid → an on-disk .cs file
+    whose contents are ``sources[guid]``. Used by the Phase-2 narrowing
+    tests (``resolve_driver`` reads C# source via the index).
+    """
+    from core.unity_types import GuidEntry
+    idx = GuidIndex(project_root=tmp_path)
+    for guid, text in sources.items():
+        p = tmp_path / f"{guid}.cs"
+        p.write_text(text, encoding="utf-8")
+        idx.guid_to_entry[guid] = GuidEntry(
+            guid=guid, asset_path=p, relative_path=Path(f"{guid}.cs"),
+            kind="script",
+        )
+    return idx
+
+
+def _mk_zero_ref_scope_artifact(
+    *,
+    mbs: dict[str, str],
+) -> tuple[SceneRuntimeArtifact, str]:
+    """One prefab with N MonoBehaviour instances and ZERO Animator
+    serialized references (the SimpleFPS Door 0-ref case). ``mbs`` maps
+    script_id → domain. Returns ``(artifact, prefab_id)``.
+    """
+    prefab_id = "guid-zr-prefab:Assets/Prefabs/ZeroRef.prefab"
+    instances = []
+    modules: dict[str, dict[str, object]] = {}
+    for i, (sid, domain) in enumerate(mbs.items(), start=1):
+        modules[sid] = _mk_module(f"MB{i}", domain, class_name=f"MB{i}")
+        instances.append({
+            "instance_id": f"P:{i}", "script_id": sid,
+            "game_object_id": f"P:go-{i}",
+            "active": True, "enabled": True, "config": {},
+        })
+    artifact = _mk_artifact(
+        modules=modules,
+        prefabs={
+            prefab_id: {
+                "name": "ZeroRef",
+                "template_name": "ZeroRef",
+                "instances": instances,
+                "references": [],  # ZERO Animator refs → candidate_mbs empty
+                "lifecycle_order": [],
+            },
+        },
+    )
+    return artifact, prefab_id
+
+
+class TestPhase2SourceNarrowing:
+    """``resolve_driver`` Phase-2 0-ref narrowing + ``_narrow_driver_by_param_writes``.
+
+    Refs: animation_routing.py (split ``len(candidate_mbs)`` branch +
+    ``_narrow_driver_by_param_writes``); animation_driver_analyzer.py;
+    module_domain._load_cs_source_preserving_strings. Decisions D10–D13,
+    DP3–DP5.
+    """
+
+    def test_zero_ref_matching_mb_resolves_client(self, tmp_path: Path) -> None:
+        """0-ref scope + the clip's ``observed_attribute`` written by a
+        client MB → ``(guid, "client")`` (the Door bug fix)."""
+        artifact, prefab_id = _mk_zero_ref_scope_artifact(
+            mbs={"guid-door": "client"},
+        )
+        idx = _mk_guid_index_with_sources(tmp_path, {
+            "guid-door": (
+                "private Animator doorAnim { get { return null; } }\n"
+                'void F(){ doorAnim.SetBool("open", value); }\n'
+            ),
+        })
+        result = resolve_driver(
+            artifact, scope_kind="prefab", scope_ref=prefab_id,
+            guid_index=idx, observed_attribute="open",
+        )
+        assert result == ("guid-door", "client")
+
+    def test_zero_ref_empty_observed_attribute_returns_none(
+        self, tmp_path: Path,
+    ) -> None:
+        """D12 fail-fast: autoplay clip (empty observed_attribute) → None,
+        BEFORE any source read."""
+        artifact, prefab_id = _mk_zero_ref_scope_artifact(
+            mbs={"guid-door": "client"},
+        )
+        idx = _mk_guid_index_with_sources(tmp_path, {
+            "guid-door": 'void F(){ doorAnim.SetBool("open", value); }\n',
+        })
+        result = resolve_driver(
+            artifact, scope_kind="prefab", scope_ref=prefab_id,
+            guid_index=idx, observed_attribute="",
+        )
+        assert result is None
+
+    def test_zero_ref_two_mbs_write_param_returns_none(
+        self, tmp_path: Path,
+    ) -> None:
+        """Two scope MBs both write the param → ambiguous → None (no
+        silent mis-selection)."""
+        artifact, prefab_id = _mk_zero_ref_scope_artifact(
+            mbs={"guid-a": "client", "guid-b": "server"},
+        )
+        write = (
+            "private Animator anim { get { return null; } }\n"
+            'void F(){ anim.SetBool("open", v); }\n'
+        )
+        idx = _mk_guid_index_with_sources(tmp_path, {
+            "guid-a": write, "guid-b": write,
+        })
+        result = resolve_driver(
+            artifact, scope_kind="prefab", scope_ref=prefab_id,
+            guid_index=idx, observed_attribute="open",
+        )
+        assert result is None
+
+    def test_zero_ref_guid_index_none_returns_none(self) -> None:
+        """No Unity root → no source → None (Phase-1-only behavior, edge 7)."""
+        artifact, prefab_id = _mk_zero_ref_scope_artifact(
+            mbs={"guid-door": "client"},
+        )
+        result = resolve_driver(
+            artifact, scope_kind="prefab", scope_ref=prefab_id,
+            guid_index=None, observed_attribute="open",
+        )
+        assert result is None
+
+    def test_two_serialized_refs_skip_phase2(self, tmp_path: Path) -> None:
+        """≥2 serialized Animator refs → ``len(candidate_mbs) >= 2`` →
+        return None WITHOUT running Phase-2 (D11/DP4). Even though both
+        MBs' source writes the param, Phase-2 never reads it."""
+        prefab_id = "guid-multi:Assets/Prefabs/Multi.prefab"
+        sr = _mk_artifact(
+            modules={
+                "guid-mb-a": _mk_module("DriverA", "client"),
+                "guid-mb-b": _mk_module("DriverB", "client"),
+                "guid-anim": _mk_module(
+                    "AnimTarget", "client", class_name="AnimTarget",
+                ),
+            },
+            prefabs={
+                prefab_id: {
+                    "name": "Multi", "template_name": "Multi",
+                    "instances": [
+                        {"instance_id": "P:1", "script_id": "guid-mb-a",
+                         "game_object_id": "P:go-1", "active": True,
+                         "enabled": True, "config": {}},
+                        {"instance_id": "P:2", "script_id": "guid-mb-b",
+                         "game_object_id": "P:go-2", "active": True,
+                         "enabled": True, "config": {}},
+                        {"instance_id": "P:3", "script_id": "guid-anim",
+                         "game_object_id": "P:go-3", "active": True,
+                         "enabled": True, "config": {}},
+                    ],
+                    "references": [
+                        {"from": "P:1", "field": "animator", "index": None,
+                         "target_kind": "component", "target_ref": "P:3",
+                         "target_is_ui": False,
+                         "target_component_type": "Animator"},
+                        {"from": "P:2", "field": "animator", "index": None,
+                         "target_kind": "component", "target_ref": "P:3",
+                         "target_is_ui": False,
+                         "target_component_type": "Animator"},
+                    ],
+                    "lifecycle_order": [],
+                },
+            },
+        )
+        write = (
+            "[SerializeField] Animator anim;\n"
+            'void F(){ anim.SetInteger("actionNumber", n); }\n'
+        )
+        idx = _mk_guid_index_with_sources(tmp_path, {
+            "guid-mb-a": write, "guid-mb-b": write,
+        })
+        result = resolve_driver(
+            sr, scope_kind="prefab", scope_ref=prefab_id,
+            guid_index=idx, observed_attribute="actionNumber",
+        )
+        assert result is None  # ≥2-ref branch: Phase-2 not run (D11)
+
+    def test_zero_ref_no_param_match_returns_none(
+        self, tmp_path: Path,
+    ) -> None:
+        """The clip's observed_attribute isn't written by any scope MB →
+        None → server fallback (D8)."""
+        artifact, prefab_id = _mk_zero_ref_scope_artifact(
+            mbs={"guid-door": "client"},
+        )
+        idx = _mk_guid_index_with_sources(tmp_path, {
+            "guid-door": (
+                "private Animator anim { get { return null; } }\n"
+                'void F(){ anim.SetBool("open", v); }\n'
+            ),
+        })
+        result = resolve_driver(
+            artifact, scope_kind="prefab", scope_ref=prefab_id,
+            guid_index=idx, observed_attribute="actionNumber",
+        )
+        assert result is None
+
+    def test_zero_ref_same_module_multiple_instances_dedup_resolves_once(
+        self, tmp_path: Path,
+    ) -> None:
+        """The SAME module placed by MULTIPLE instances in the 0-ref scope
+        is counted ONCE (dedup in ``_narrow_driver_by_param_writes`` via
+        ``dict.fromkeys``) → resolves to that single driver, NOT the
+        ``len(matched) != 1`` ambiguous-None branch (DP3)."""
+        prefab_id = "guid-dup:Assets/Prefabs/Dup.prefab"
+        sr = _mk_artifact(
+            modules={"guid-door": _mk_module("Door", "client")},
+            prefabs={
+                prefab_id: {
+                    "name": "Dup", "template_name": "Dup",
+                    # Two instances → ONE shared script_id (same MB class
+                    # placed twice). Without dedup this would yield two
+                    # matched script_ids → ambiguous-None.
+                    "instances": [
+                        {"instance_id": "P:1", "script_id": "guid-door",
+                         "game_object_id": "P:go-1", "active": True,
+                         "enabled": True, "config": {}},
+                        {"instance_id": "P:2", "script_id": "guid-door",
+                         "game_object_id": "P:go-2", "active": True,
+                         "enabled": True, "config": {}},
+                    ],
+                    "references": [],  # 0-ref → Phase-2 path
+                    "lifecycle_order": [],
+                },
+            },
+        )
+        idx = _mk_guid_index_with_sources(tmp_path, {
+            "guid-door": (
+                "private Animator doorAnim { get { return null; } }\n"
+                'void F(){ doorAnim.SetBool("open", value); }\n'
+            ),
+        })
+        result = resolve_driver(
+            sr, scope_kind="prefab", scope_ref=prefab_id,
+            guid_index=idx, observed_attribute="open",
+        )
+        assert result == ("guid-door", "client")
+
+    def test_zero_ref_matching_server_mb_stays_server(
+        self, tmp_path: Path,
+    ) -> None:
+        """A uniquely-matched driver whose module domain is ``server``
+        passes through as ``(guid, "server")`` — the resolver inherits the
+        MB's domain and does NOT force it to client (D8)."""
+        artifact, prefab_id = _mk_zero_ref_scope_artifact(
+            mbs={"guid-srv": "server"},
+        )
+        idx = _mk_guid_index_with_sources(tmp_path, {
+            "guid-srv": (
+                "private Animator anim { get { return null; } }\n"
+                'void F(){ anim.SetInteger("phase", n); }\n'
+            ),
+        })
+        result = resolve_driver(
+            artifact, scope_kind="prefab", scope_ref=prefab_id,
+            guid_index=idx, observed_attribute="phase",
+        )
+        assert result == ("guid-srv", "server")
+
+    def test_zero_ref_empty_guid_index_resolves_nothing_returns_none(
+        self, tmp_path: Path,
+    ) -> None:
+        """An empty (but constructed) ``GuidIndex`` resolves no guid →
+        ``_load_cs_source_preserving_strings`` returns "" for every scope
+        MB → no match → None. Distinct from ``guid_index=None`` (which
+        short-circuits earlier): here the index object exists but is empty."""
+        artifact, prefab_id = _mk_zero_ref_scope_artifact(
+            mbs={"guid-door": "client"},
+        )
+        empty_idx = GuidIndex(project_root=tmp_path)  # no guid_to_entry
+        assert empty_idx.resolve("guid-door") is None  # resolves nothing
+        result = resolve_driver(
+            artifact, scope_kind="prefab", scope_ref=prefab_id,
+            guid_index=empty_idx, observed_attribute="open",
+        )
+        assert result is None
+
+
+# ===========================================================================
 # CATEGORY 4: stable_id injectivity
 # ===========================================================================
 
@@ -1922,29 +2211,30 @@ def test_simplefps_topology_authority_contract_on_cold_conversion(
     topology authority ACTUALLY delivers — distinct from what Phase 2
     will deliver.
 
-    Phase 1's narrowing only resolves animation drivers whose owning
+    Phase-1's narrowing only resolves animation drivers whose owning
     MonoBehaviour has a serialized ``[SerializeField] Animator`` field
-    captured by the scene-runtime planner's reference walk
-    (``scene_runtime_planner._split_config_and_refs``). MBs that access
-    their Animator via a property / runtime getter (e.g.
+    captured by the scene-runtime planner's reference walk. MBs that
+    access their Animator via a property / runtime getter (e.g.
     ``transform.parent.Find("door").GetComponent<Animator>()`` in
-    SimpleFPS's Door.cs) have no serialized ref, so Phase 1's
-    ``resolve_driver`` (animation_routing.py:309-346) returns ``None``
-    and the driver lands ``routing_status="unresolved"`` with a
-    server-safe fallback placement. Phase 2's C#-source narrowing
-    closes that gap (design doc §Phase 2a + the resolver docstring).
+    SimpleFPS's Door.cs) have no serialized ref, so Phase-1 returns
+    ``None``. Phase-2's C#-source narrowing (door run) closes that gap:
+    it matches the clip's ``observed_attribute`` against each scope MB's
+    ``Set*("<param>")`` Animator writes and inherits the matching MB's
+    domain. Door.cs writes ``doorAnim.SetBool("open", …)``, so the Door
+    clips now resolve to Door's CLIENT domain (LocalScript in
+    StarterPlayer.StarterPlayerScripts).
 
-    Today SimpleFPS happens to have zero MBs with serialized Animator
-    fields — Door, HostilePlane, and PlaneHolder all use property /
-    runtime-getter access. So this test asserts the SAFETY-OF-FALLBACK
-    contract rather than the resolution contract:
+    HostilePlane / PlaneHolder stay UNRESOLVED + server: they are
+    autoplay clips with empty ``observed_attribute`` (D12 fail-fast), and
+    PlaneHolder's Machine.cs writes on a SERIALIZED Animator field so the
+    ≥1-candidate scope skips Phase-2 entirely (D11/DP4). This test asserts
+    both the resolution contract (Door) and the fallback contract
+    (HostilePlane/PlaneHolder):
 
       1. ``scene_runtime.topology`` block emitted under generic mode,
          with non-empty ``animation_drivers``.
       2. ``topology.modules`` includes Door with ``stem="Door"`` and
-         ``domain="client"`` — proves the v2 classifier sees Door as
-         client-domain even though the animation driver can't yet be
-         resolved to it.
+         ``domain="client"`` — the domain Phase-2 narrowing inherits.
       3. Every driver carries an EXPLICIT ``routing_status`` from
          ``{"resolved","unresolved","orphan"}`` — no ``__orphan__``
          sentinels (codex B1 fix).
@@ -1954,17 +2244,11 @@ def test_simplefps_topology_authority_contract_on_cold_conversion(
              ``StarterPlayer.StarterPlayerScripts``,
            * ``resolved + server → Script`` in ``ServerScriptService``,
            * ``unresolved / orphan → Script`` in
-             ``ServerScriptService`` (Phase 1's safe fallback).
-      5. Invariant 3 holds: no duplicate ``Anim_*`` names in
-         ``rbx_place.scripts`` (the topology artifact's ``stable_id``
-         keying makes the double-emission from
-         ``_attach_prefab_scoped_animation_scripts_to_templates`` +
-         ``_attach_monobehaviour_scripts_to_templates`` structurally
-         impossible).
-
-    When Phase 2 lands a serialized- or source-narrowed Door driver,
-    update this test to additionally assert Door's drivers go
-    resolved + client + LocalScript.
+             ``ServerScriptService`` (safe fallback).
+      5. Anim_Door_* resolve + client + LocalScript; Anim_HostilePlane_*
+         / Anim_PlaneHolder_* stay unresolved + server.
+      6. Invariant 3 holds: no duplicate ``Anim_*`` names in
+         ``rbx_place.scripts``.
     """
     import config
     old_ai = config.USE_AI_TRANSPILATION
@@ -2009,11 +2293,10 @@ def test_simplefps_topology_authority_contract_on_cold_conversion(
 
     # ------------------------------------------------------------------
     # Assertion 2: Door appears in topology.modules with stem='Door' and
-    # domain='client'. Phase 1 can't yet route Door's animation driver
-    # (property-based Animator access — Phase 2's job), but the
-    # classifier itself must still see Door as client-domain so once
-    # the narrowing extension lands the topology decision flips
-    # mechanically.
+    # domain='client'. Phase-2 source-narrowing routes Door's animation
+    # driver (property-based Animator access) to this client domain, so
+    # the classifier MUST see Door as client-domain for the narrowing to
+    # inherit the right domain (asserted resolved+client in Assertion 5).
     # ------------------------------------------------------------------
     door_modules = [
         (guid, entry) for guid, entry in modules_block.items()
@@ -2137,26 +2420,27 @@ def test_simplefps_topology_authority_contract_on_cold_conversion(
     # whatever the controller produces while still catching the
     # "family disappeared entirely" case.
     #
-    # Driver-status contract: each family MUST have ≥1 emitted row;
-    # EVERY row in that family MUST be ``routing_status="unresolved"``
-    # today (Phase 1 narrowing limit). Why per-family rather than
-    # global: only these 3 families are documented as the canonical
-    # SimpleFPS broken set (design doc §Phase 1 + scene-runtime-pr148-
-    # followups.md). Other autoplay clips a future SimpleFPS asset
-    # update might add can be either resolved or unresolved without
-    # invalidating Phase 1's contract — only the named families
-    # carry Phase 1's "intended-permanent-server" classification
-    # (HostilePlane/PlaneHolder) or "Phase-2-will-fix" classification
-    # (Door).
-    #
-    # When Phase 2 source-narrowing lands, change the ``"unresolved"``
-    # gate to ``"resolved"`` for the Door family AND assert
-    # LocalScript + StarterPlayer.StarterPlayerScripts placement.
-    # HostilePlane + PlaneHolder remain unresolved + server (their
-    # intended-permanent state — see followup doc).
+    # Driver-status contract (POST Phase-2 source-narrowing, door run):
+    # each family MUST have ≥1 emitted row.
+    #   * Anim_Door_*  → RESOLVED + client + LocalScript in
+    #     StarterPlayer.StarterPlayerScripts. Door's Animator is a runtime
+    #     getter (``transform.parent.Find("door").GetComponent<Animator>()``,
+    #     no serialized ref), so Phase-1 returns None; Phase-2's C#-source
+    #     narrowing matches the clip's observed_attribute ("open") against
+    #     Door.cs's ``doorAnim.SetBool("open", …)`` write and inherits
+    #     Door's client domain (D10–D13).
+    #   * Anim_HostilePlane_* / Anim_PlaneHolder_* → UNRESOLVED + server.
+    #     These are autoplay clips with empty observed_attribute (D12
+    #     fail-fast) — and PlaneHolder's ``Machine.cs`` writes
+    #     ``planeHolder.SetInteger("actionNumber")`` on a SERIALIZED
+    #     Animator field, so candidate_mbs is non-empty and Phase-2's
+    #     0-ref-only scoping (D11/DP4) never runs for it. Both guards keep
+    #     them on the intended-permanent server fallback (acceptance 10).
     # ------------------------------------------------------------------
-    _expected_unresolved_anim_prefixes = (
+    _expected_resolved_client_anim_prefixes = (
         "Anim_Door_",
+    )
+    _expected_unresolved_anim_prefixes = (
         "Anim_HostilePlane_",
         "Anim_PlaneHolder_",
     )
@@ -2165,6 +2449,42 @@ def test_simplefps_topology_authority_contract_on_cold_conversion(
         for sid, script_name in script_name_by_stable_id.items()
         if script_name
     }
+    for prefix in _expected_resolved_client_anim_prefixes:
+        family_scripts = [
+            s for s in rbx_place.scripts
+            if s.name and s.name.startswith(prefix)
+        ]
+        assert family_scripts, (
+            f"no Anim_* script with prefix {prefix!r} found in "
+            f"rbx_place.scripts — animation_converter regression "
+            f"(family disappeared from SimpleFPS output)"
+        )
+        for script in family_scripts:
+            sid = sid_by_script_name.get(script.name, "")
+            assert sid, (
+                f"{script.name}: no stable_id in emitted_animations — "
+                f"emit/artifact drift"
+            )
+            entry = drivers_block.get(sid, {})
+            assert entry.get("routing_status") == "resolved", (
+                f"{script.name}: routing_status="
+                f"{entry.get('routing_status')!r} (expected "
+                f"'resolved' — Phase-2 source-narrowing should match "
+                f"Door.cs doorAnim.SetBool(\"open\") to the clip's "
+                f"observed_attribute)"
+            )
+            assert entry.get("domain") == "client", (
+                f"{script.name}: domain={entry.get('domain')!r} "
+                f"(expected 'client' — inherited from Door's domain)"
+            )
+            assert script.script_type == "LocalScript", (
+                f"{script.name}: script_type={script.script_type!r} "
+                f"(expected 'LocalScript' — resolved client driver)"
+            )
+            assert script.parent_path == "StarterPlayer.StarterPlayerScripts", (
+                f"{script.name}: parent_path={script.parent_path!r} "
+                f"(expected 'StarterPlayer.StarterPlayerScripts')"
+            )
     for prefix in _expected_unresolved_anim_prefixes:
         family_scripts = [
             s for s in rbx_place.scripts
@@ -2185,10 +2505,9 @@ def test_simplefps_topology_authority_contract_on_cold_conversion(
             assert entry.get("routing_status") == "unresolved", (
                 f"{script.name}: routing_status="
                 f"{entry.get('routing_status')!r} (expected "
-                f"'unresolved' — Phase 1 narrowing limit. When Phase "
-                f"2 source-narrowing lands this assertion needs "
-                f"updating for the Door family; see "
-                f"scene-runtime-pr148-followups.md)"
+                f"'unresolved' — autoplay clip with empty "
+                f"observed_attribute (D12) / serialized-ref scope (D11); "
+                f"intended-permanent server fallback)"
             )
             assert script.script_type == "Script", (
                 f"{script.name}: script_type={script.script_type!r} "
