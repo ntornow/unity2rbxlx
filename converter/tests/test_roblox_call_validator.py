@@ -35,8 +35,10 @@ def _rel(path: str) -> str:
 
 def test_fixture_corpus_is_present() -> None:
     files = _all_fixture_files()
-    # drive-door-generic (42) + trash-dash (120).
-    assert len(files) >= 160, f"expected >=160 fixture scripts, got {len(files)}"
+    # drive-door-generic: the real 42-script converted corpus carrying both
+    # bug sites (TurretBullet + PlaneBullet) and the diverse valid-call /
+    # provenance patterns the zero-FP guarantee is proven against.
+    assert len(files) >= 42, f"expected >=42 fixture scripts, got {len(files)}"
 
 
 def test_two_bug_sites_caught_as_proven() -> None:

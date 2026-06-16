@@ -119,14 +119,13 @@ def verify_module(
     # NON-load-bearing -- a surviving ``im`` reject fails OPEN (tagged ``contract-verifier-impulse``).
     violations.extend(_check_raw_apply_impulse(stripped, source))
     # Slice 2.3 (relation #8): the narrow ``fc`` rule (nonexistent
-    # ``FindFirstChildOfType``) is RETIRED here. It lived on this transpile-time
-    # path, which the real bug routed around (mode/cache/route), so it shipped
-    # success=True. The universal provenance-gated net
-    # (``semantic_validators.nonexistent_roblox_method`` →
+    # ``FindFirstChildOfType``) is RETIRED -- it lived on this bypassable
+    # transpile-time path (mode/cache/route) and shipped the bug as success=True.
+    # The universal provenance-gated net
+    # (``semantic_validators.nonexistent_roblox_method`` ->
     # ``roblox_call_validator.find_invalid_roblox_calls``) runs in ``write_output``
-    # on EVERY final script and is strictly broader (catches any hallucinated
-    # Roblox method, not just ``FindFirstChildOfType``), so it subsumes ``fc``.
-    # ``_check_invalid_findfirstchildoftype`` is no longer invoked.
+    # on EVERY final script and catches any hallucinated Roblox method, so it
+    # subsumes ``fc``.
     if is_player_controller:
         violations.extend(_check_player_camera_write(stripped, source))
         violations.extend(_check_player_humanoid_move(stripped, source))
@@ -1172,42 +1171,6 @@ def _check_raw_apply_impulse(stripped: str, source: str) -> list[Violation]:
                 "scaling: a force-launched body barely moves against the inflated Roblox mass. "
                 "Route the linear impulse through ``self.host.applyImpulse(part, force)`` (the host "
                 "applies the faithful stud-scaled velocity); never call ``:ApplyImpulse(`` directly."
-            ),
-        ))
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Phase 2 (relation #8) -- nonexistent ``FindFirstChildOfType`` (rule ``fc``) -- LOAD-BEARING.
-#
-# ``FindFirstChildOfType`` is not a Roblox Instance method (an AI hallucination of Unity's type
-# lookup); the valid API is ``FindFirstChildOfClass("Humanoid")``. Calling it ERRORS at runtime, so a
-# converted hit-handler (bullet / explosion) that looks up the victim's Humanoid silently deals no
-# damage. Unlike the impulse rule (which only degrades), an invalid API CRASHES, so ``fc`` is NOT in
-# ``_FAIL_OPEN_RULE_TAGS`` -> a surviving ``fc`` gets the default ``contract-verifier `` tag and
-# promotes to a project FAIL-CLOSED (shipping a crash is worse than failing the conversion).
-#
-# Whitespace-tolerant; does NOT match the valid ``FindFirstChildOfClass``; the ``_RE_FUNC_DEF_PREFIX``
-# guard skips a ``function X:FindFirstChildOfType(...)`` definition (same as the impulse rule).
-# ---------------------------------------------------------------------------
-
-_RE_FINDFIRSTCHILDOFTYPE = re.compile(r":\s*FindFirstChildOfType\s*\(")
-
-
-def _check_invalid_findfirstchildoftype(stripped: str, source: str) -> list[Violation]:
-    out: list[Violation] = []
-    for m in _RE_FINDFIRSTCHILDOFTYPE.finditer(stripped):
-        if _is_method_def_call(stripped, m.start()):
-            continue  # ``function Class:FindFirstChildOfType(...)`` definition, not a call
-        line = source.count("\n", 0, m.start()) + 1
-        out.append(Violation(
-            rule="fc",
-            line=line,
-            message=(
-                "``FindFirstChildOfType`` is not a Roblox method — it errors at runtime, so a "
-                "hit-handler that looks up the victim's Humanoid deals no damage. Use "
-                "``FindFirstChildOfClass(\"Humanoid\")`` (or ``FindFirstChildWhichIsA`` for an "
-                "abstract base)."
             ),
         ))
     return out

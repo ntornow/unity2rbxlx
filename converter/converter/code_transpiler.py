@@ -1718,7 +1718,7 @@ def _format_contract_survivor_warning(violation) -> str:
     (``-player`` / ``-impulse``) -- it starts with ``contract-verifier-`` so it NEVER
     matches ``_is_post_reprompt_warning`` (which keys on the ``contract-verifier `` space
     / ``contract-verifier:`` colon forms) --> never promotes to a fail-closed -->
-    NON-load-bearing. Contract rules (a)-(h) and ``fc`` keep the ``contract-verifier ``
+    NON-load-bearing. Contract rules (a)-(h) keep the ``contract-verifier ``
     (space) tag and stay fail-closed. Shared between the cold ``_verify_and_reprompt``
     path and the ``_refresh_contract_warnings`` cache-replay path so both fail open on a
     surviving fail-open reject identically.
@@ -1768,7 +1768,7 @@ def _refresh_contract_warnings(
     cache-replay path exactly as on the cold path. The ``im`` rule (raw-impulse
     routing) rides this SAME fail-open path on every module (not gated on
     ``is_player_controller``) via its ``contract-verifier-impulse`` tag. Contract
-    rules (a)-(h) and ``fc`` keep the space tag and stay fail-closed.
+    rules (a)-(h) keep the space tag and stay fail-closed.
     """
     from converter.runtime_contract import verify_module
     non_contract = [
