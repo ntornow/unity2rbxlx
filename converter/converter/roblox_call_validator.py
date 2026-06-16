@@ -61,6 +61,21 @@ _PROVEN_ITER_METHODS: frozenset[str] = frozenset(
     {"GetChildren", "GetDescendants", "GetPartBoundsInRadius"}
 )
 
+# Host APIs that return a NON-Roblox component table (a peer MonoBehaviour
+# instance), NOT a real Roblox Instance. A local bound from one of these is
+# tracked as ``component`` provenance: its ``.Parent``/``.Character``/``.Instance``
+# field access must NOT be promoted to proven (the base is not Roblox-typed).
+# Confirmed against runtime/scene_runtime.luau:
+#   findObjectOfType -> _byClass[name][1] (a component instance)
+#   GetComponent     -> peer MonoBehaviour (or built-in fallback)
+#   addComponent     -> _buildComponent(...) result (a component)
+# Host APIs that DO return a Roblox Instance (playerFromTouch -> Player,
+# findGameObject(sWithTag) -> GameObject Instance, instantiatePrefab -> Instance)
+# are deliberately EXCLUDED so their ``.Parent``/``.Character`` stays proven.
+_COMPONENT_HOST_APIS: frozenset[str] = frozenset(
+    {"findObjectOfType", "getComponent", "GetComponent", "addComponent", "AddComponent"}
+)
+
 
 # --- Tokenizing -------------------------------------------------------------
 
@@ -178,6 +193,11 @@ def _receiver_chain(line: str, colon_idx: int) -> str:
 # --- Provenance classification ---------------------------------------------
 
 ProvLit = Literal["proven", "unproven"]
+# Tracked provenance of a local in the per-scope map. ``component`` is an
+# internal-only state (a non-Roblox host-component table); it never surfaces as
+# an :class:`InvalidCall` provenance — a component receiver classifies as
+# ``unproven`` at a call site, and it suppresses ``.Parent`` field-promotion.
+TrackLit = Literal["proven", "unproven", "component"]
 
 
 def _split_top_level(expr: str) -> list[str]:
@@ -211,11 +231,14 @@ def _split_top_level(expr: str) -> list[str]:
     return segs
 
 
-def _classify_receiver(expr: str, prov: dict[str, ProvLit]) -> ProvLit | None:
+def _classify_receiver(expr: str, prov: dict[str, TrackLit]) -> ProvLit | None:
     """Classify the provenance of a receiver chain.
 
     Returns ``"proven"``, ``"unproven"``, or ``None`` (meaning: SKIP this call
-    entirely — receiver is self/self.host/require, never emit).
+    entirely — receiver is self/self.host/require, never emit). A tracked
+    ``component`` local never returns ``proven``: as a bare receiver it is
+    ``unproven``, and it suppresses ``.Parent``/``.Character``/``.Instance``
+    field-promotion (the base is a non-Roblox component table).
     """
     expr = expr.strip()
     if not expr:
@@ -239,8 +262,16 @@ def _classify_receiver(expr: str, prov: dict[str, ProvLit]) -> ProvLit | None:
     # Find the position of the last top-level '.' or ':'.
     last_sep, last_name = _last_segment(expr)
 
-    # --- Unconditional proven-by-final-field: x.Parent / x.Character / x.Instance
+    # --- proven-by-final-field: x.Parent / x.Character / x.Instance ---
+    # Promote ONLY when the base is not a tracked component table. ``gm.Parent``
+    # where ``gm = self.host.findObjectOfType(...)`` (a component) stays
+    # unproven — the field name alone does not make a component-table base
+    # Roblox-typed. An untracked base still promotes (no evidence it's a
+    # component).
     if last_sep == "." and last_name in _PROVEN_FIELDS:
+        head = _split_top_level(expr)[0].strip()
+        if prov.get(head) == "component":
+            return "unproven"
         return "proven"
 
     # --- Proven-by-final-method-result: x:FindFirstChild*(...) etc. ---
@@ -249,7 +280,9 @@ def _classify_receiver(expr: str, prov: dict[str, ProvLit]) -> ProvLit | None:
 
     # --- Single bare identifier: look up tracked provenance ---
     if re.fullmatch(_IDENT, expr):
-        return prov.get(expr, "unproven")
+        tracked = prov.get(expr, "unproven")
+        # A component table is never a proven Roblox receiver.
+        return "unproven" if tracked == "component" else tracked
 
     # --- Roblox global origins ---
     head = segs[0].strip()
@@ -321,21 +354,49 @@ _FOR_IN_RE = re.compile(
 _FUNC_RE = re.compile(r"\bfunction\b")
 
 
-def _rhs_provenance(rhs: str, prov: dict[str, ProvLit]) -> ProvLit:
+def _rhs_provenance(rhs: str, prov: dict[str, TrackLit]) -> TrackLit:
     """Provenance of an assignment RHS (for binding a local).
 
     Distinct from ``_classify_receiver`` only in that a bare untracked identifier
     is ``unproven`` (not skipped) and self/require RHS yields ``unproven`` rather
-    than None — assignments always bind *some* provenance.
+    than None — assignments always bind *some* provenance. A call to a
+    component-returning host API binds ``component``.
     """
     rhs = rhs.strip()
     # ``a and a:Method()`` / ``a and a.Field`` guard form: take the part after
     # the last ``and`` (the real value), common in transpiled output.
     guard = _strip_and_guard(rhs)
+    if _is_component_host_call(guard):
+        return "component"
     res = _classify_receiver(guard, prov)
     if res is None:
         return "unproven"
     return res
+
+
+def _is_component_host_call(rhs: str) -> bool:
+    """True if ``rhs`` is a call to a component-returning host API.
+
+    Recognizes both call shapes the transpiler emits:
+      - ``self.host.findObjectOfType("X")`` / ``self.host.getComponent("X")``
+        (dotted access on ``self.host``)
+      - ``self:GetComponent("X")`` (colon-method on ``self``)
+    Token-aware: matches the API name as the final ``.``/``:`` segment of the
+    callee, immediately followed by ``(``. Receiver-instance host APIs
+    (playerFromTouch, findGameObject, instantiatePrefab) are excluded by the
+    :data:`_COMPONENT_HOST_APIS` allowlist.
+    """
+    rhs = rhs.strip()
+    sep, name = _last_segment(rhs)
+    if name not in _COMPONENT_HOST_APIS:
+        return False
+    # Must be an actual call (``name(`` somewhere after the segment) and the
+    # base must be a host surface (``self`` / ``self.host``), not an unrelated
+    # local that happens to share the method name.
+    if "(" not in rhs:
+        return False
+    head = _split_top_level(rhs)[0].strip()
+    return head in ("self", "self.host") or head.startswith("self")
 
 
 def _strip_and_guard(rhs: str) -> str:
@@ -362,7 +423,7 @@ def _strip_and_guard(rhs: str) -> str:
     return rhs
 
 
-def _loop_var_provenance(target: str, iterable: str) -> dict[str, ProvLit]:
+def _loop_var_provenance(target: str, iterable: str) -> dict[str, TrackLit]:
     """Provenance for variables bound by ``for <target> in <iterable> do``.
 
     Returns a {var: provenance} map for the loop body. Only the value var of a
@@ -374,7 +435,7 @@ def _loop_var_provenance(target: str, iterable: str) -> dict[str, ProvLit]:
         return {}
     # Targets: ``_, col`` (generic for) — the value is the SECOND name.
     names = [t.strip() for t in target.split(",")]
-    out: dict[str, ProvLit] = {}
+    out: dict[str, TrackLit] = {}
     if len(names) >= 2:
         val = names[1]
         if re.fullmatch(_IDENT, val):
@@ -401,7 +462,11 @@ def find_invalid_roblox_calls(luau_source: str) -> list[InvalidCall]:
     raw_lines = luau_source.split("\n")
     # Per-function-scope provenance map. We reset on each ``function`` keyword
     # (shallow scope tracking, as the design specifies — one function scope).
-    prov: dict[str, ProvLit] = {}
+    prov: dict[str, TrackLit] = {}
+    # Trailing receiver chain of the previous non-blank CODE line, used to
+    # resolve a ``\n  :Method()`` continuation whose line-local receiver is
+    # empty (FINDING 2 — a multiline chain must not downgrade proven->unproven).
+    prev_trailing_chain = ""
 
     for idx, raw in enumerate(raw_lines):
         line_no = idx + 1
@@ -419,6 +484,10 @@ def find_invalid_roblox_calls(luau_source: str) -> list[InvalidCall]:
             method = m.group(1)
             colon_idx = m.start()
             receiver = _receiver_chain(code, colon_idx)
+            if not receiver:
+                # Leading ``:`` continuation of a chain split across lines:
+                # classify against the previous code line's trailing chain.
+                receiver = prev_trailing_chain
             classification = _classify_receiver(receiver, prov)
             if classification is None:
                 continue  # self/self.host/require — excluded entirely
@@ -433,10 +502,33 @@ def find_invalid_roblox_calls(luau_source: str) -> list[InvalidCall]:
                 )
             )
 
+        # 3) Remember this line's trailing receiver chain for a possible
+        #    continuation on the next line. Only a non-blank code line that does
+        #    NOT itself end on a dangling separator updates it; a blank/comment
+        #    line preserves the prior anchor so a two-line gap still resolves.
+        if code.strip():
+            prev_trailing_chain = _trailing_chain(code)
+
     return results
 
 
-def _record_bindings(code: str, prov: dict[str, ProvLit]) -> None:
+def _trailing_chain(code: str) -> str:
+    """Return the receiver chain at the END of a code line (for continuations).
+
+    Walks left from the last non-space char, collecting the contiguous
+    dotted/indexed/called/``:method()`` chain — the expression a following
+    ``  :Method()`` continuation line attaches to. ``""`` if the line does not
+    end in such a chain.
+    """
+    end = len(code)
+    while end > 0 and code[end - 1].isspace():
+        end -= 1
+    if end == 0:
+        return ""
+    return _receiver_chain(code, end)
+
+
+def _record_bindings(code: str, prov: dict[str, TrackLit]) -> None:
     """Mutate ``prov`` with any local/loop bindings introduced on ``code``.
 
     Operates on a single (string/comment-stripped) line. Handles:

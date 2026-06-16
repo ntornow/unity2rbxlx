@@ -132,3 +132,96 @@ def test_proven_char_getpivot_valid() -> None:
     src = "local char = plr.Character\nchar:GetPivot()"
     out = _methods(src)
     assert out == []
+
+
+# --- FINDING 1: component-table base must NOT be promoted to proven ----------
+
+
+def test_component_base_parent_field_not_proven() -> None:
+    """``gm.Parent:CustomMethod()`` where gm is a component is NOT proven."""
+    src = (
+        'local gm = self.host.findObjectOfType("GameManager")\n'
+        "gm.Parent:CustomMethod()"
+    )
+    out = find_invalid_roblox_calls(src)
+    assert len(out) == 1
+    assert out[0]["method"] == "CustomMethod"
+    assert out[0]["receiver_provenance"] != "proven"
+
+
+def test_component_base_character_field_not_proven() -> None:
+    """``enemy.Character:Damage(5)`` where enemy is a getComponent is NOT proven."""
+    src = "local enemy = self.host.getComponent(self, Foo)\nenemy.Character:Damage(5)"
+    out = find_invalid_roblox_calls(src)
+    assert len(out) == 1
+    assert out[0]["method"] == "Damage"
+    assert out[0]["receiver_provenance"] != "proven"
+
+
+def test_self_getcomponent_base_not_proven() -> None:
+    """``c.Instance:Foo()`` where c is ``self:GetComponent(...)`` is NOT proven."""
+    src = 'local c = self:GetComponent("Rigidbody")\nc.Instance:Foo()'
+    out = find_invalid_roblox_calls(src)
+    assert len(out) == 1
+    assert out[0]["method"] == "Foo"
+    assert out[0]["receiver_provenance"] != "proven"
+
+
+def test_addcomponent_base_not_proven() -> None:
+    src = "local c = self.host.addComponent(go, id, cfg)\nc.Parent:Foo()"
+    out = find_invalid_roblox_calls(src)
+    assert len(out) == 1
+    assert out[0]["method"] == "Foo"
+    assert out[0]["receiver_provenance"] != "proven"
+
+
+def test_playerfromtouch_character_still_proven_regression() -> None:
+    """REGRESSION GUARD: playerFromTouch returns a Player (Roblox), NOT a
+    component, so ``plr.Character`` stays proven and the bug is still caught."""
+    src = (
+        "local plr = self.host.playerFromTouch(other)\n"
+        "local char = plr.Character\n"
+        'char:FindFirstChildOfType("Humanoid")'
+    )
+    out = find_invalid_roblox_calls(src)
+    assert len(out) == 1
+    assert out[0]["method"] == "FindFirstChildOfType"
+    assert out[0]["receiver_provenance"] == "proven"
+    assert out[0]["suggested_fix"] == "FindFirstChildWhichIsA"
+
+
+def test_untracked_base_parent_may_stay_proven() -> None:
+    """An UNtracked base (not a known component local) still promotes via the
+    field rule — only TRACKED component locals are de-promoted."""
+    out = _methods("node.Parent:CustomMethod()")
+    assert out == [("CustomMethod", "proven", None)]
+
+
+def test_findgameobject_base_still_proven() -> None:
+    """findGameObject returns a Roblox Instance (NOT a component) -> proven."""
+    src = 'local go = self.host.findGameObject("Door")\ngo.Parent:Custom()'
+    out = find_invalid_roblox_calls(src)
+    assert len(out) == 1
+    assert out[0]["receiver_provenance"] == "proven"
+
+
+# --- FINDING 2: multiline method chain must NOT downgrade proven->unproven ---
+
+
+def test_multiline_chain_stays_proven() -> None:
+    """A chain split across lines keeps the prior line's receiver provenance."""
+    src = 'workspace:FindFirstChild("X")\n  :FakeMethod()'
+    out = find_invalid_roblox_calls(src)
+    assert len(out) == 1
+    assert out[0]["method"] == "FakeMethod"
+    assert out[0]["receiver_provenance"] == "proven"
+
+
+def test_multiline_findfirstchildoftype_bug_proven() -> None:
+    """The multiline form of the bug site is still caught as proven."""
+    src = 'plr.Character\n  :FindFirstChildOfType("Humanoid")'
+    out = find_invalid_roblox_calls(src)
+    assert len(out) == 1
+    assert out[0]["method"] == "FindFirstChildOfType"
+    assert out[0]["receiver_provenance"] == "proven"
+    assert out[0]["suggested_fix"] == "FindFirstChildWhichIsA"
