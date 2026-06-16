@@ -2077,6 +2077,181 @@ function SceneRuntime:_constructPrefabClone(clone, prefab, prefab_id, includeScr
 	return componentList
 end
 
+-- ---------------------------------------------------------------------
+-- Slice 1.3: client clone-site scale-faithful gravity correction
+-- ---------------------------------------------------------------------
+-- Mirror of the canonical ``correctDynamicAssembly`` helper baked into the
+-- standalone ``SceneGravityCorrection`` server script
+-- (``autogen._GRAVITY_CORRECTION_HELPER_LUAU``, §1.5). A clone produced by
+-- ``instantiatePrefab`` is client-local (never replicated, never server-tagged),
+-- so the server's boot sweep / ``DescendantAdded`` surfaces never see it -- the
+-- client must correct its OWN clones at the clone site. The shared logic (force
+-- formula + skip-rules + ``_ScaleGravityCorrected`` tag + carrier-first fact
+-- resolution) is kept TOKEN-IDENTICAL to the canonical text; a parity test
+-- (slice 1.4) pins the two emission sites against drift. Only the wiring differs
+-- (a clone-site call here vs the server's boot sweep / spawn hook).
+--
+-- The mirrored text is embedded in a ``do`` block so its local ``factOf`` /
+-- ``correctDynamicAssembly`` / ``_isBasePart`` shadow nothing at module scope;
+-- ``correctDynamicAssembly`` is captured into a module-scope upvalue
+-- (``_gravityCorrectDynamicAssembly``) so ``_correctClonedDynamics`` can call it.
+local DEFAULT_UNITY_GRAVITY_Y = 9.81  -- |m_Gravity.y| Unity default (matches project_gravity.py)
+local _gravityCorrectDynamicAssembly
+do
+	local TAG = "_ScaleGravityCorrected"
+	local function _isBasePart(inst)
+		return (type(inst) == "table" or type(inst) == "userdata")
+			and inst:IsA("BasePart")
+	end
+
+	-- factOf: read attribute ``key`` off the carrier FIRST; only if ABSENT on the
+	-- carrier, walk ancestor Models for the first holder (D-P1.6 root-first, then
+	-- ancestor-Model walk). Covers S1/S5 (facts on the carrier) and S2 mesh-wrap
+	-- (UseGravity stayed on the OUTER Model while only _UnityMass moved to the
+	-- inner *_Mesh carrier). The fallback is gated PER-ATTRIBUTE on "absent on the
+	-- carrier", NOT on an owning-Model lookup being nil -- so a factless parent
+	-- container (S5) is never consulted before the carrier.
+	local function factOf(carrier, key)
+		local v = carrier:GetAttribute(key)
+		if v ~= nil then
+			return v
+		end
+		local owner = carrier:FindFirstAncestorWhichIsA("Model")
+		while owner do
+			local ov = owner:GetAttribute(key)
+			if ov ~= nil then
+				return ov
+			end
+			owner = owner:FindFirstAncestorWhichIsA("Model")
+		end
+		return nil
+	end
+
+	-- correctDynamicAssembly(carrier, desiredBaseStuds)
+	-- ``carrier`` is the instance the scan found carrying _UnityMass: a BasePart
+	-- (S1/S2/S4/S5) OR a Model carrier (S3/S6). Resolves a representative BasePart,
+	-- then its AssemblyRootPart, applies one compensating VectorForce, and tags the
+	-- root. Idempotent via the _ScaleGravityCorrected tag on the resolved root.
+	local function correctDynamicAssembly(carrier, desiredBaseStuds)
+		if type(carrier) ~= "table" and type(carrier) ~= "userdata" then
+			return
+		end
+		-- 0. resolve a representative BasePart from the carrier.
+		local representativePart
+		if _isBasePart(carrier) then
+			representativePart = carrier
+		elseif carrier:IsA("Model") then
+			-- Model carrier (S3 no-mesh-parent / S6 multi-sub-mesh): PrimaryPart,
+			-- else the first descendant BasePart. In TODAY's converter output these
+			-- descendants are Anchored (no own Rigidbody) so step 2 skips them.
+			representativePart = carrier.PrimaryPart
+				or carrier:FindFirstChildWhichIsA("BasePart", true)
+			if representativePart == nil then
+				-- No BasePart to resolve. Defensive one-shot skip WITHOUT tagging --
+				-- the body stays correctable if it later becomes resolvable. (A
+				-- Clone() yields a fully-materialized subtree before parenting, so
+				-- this is not a deferral mechanism.)
+				return
+			end
+		else
+			return
+		end
+		if not _isBasePart(representativePart) then
+			return
+		end
+		-- 1. resolve the assembly root (mirrors applyImpulse 1518-1532, but off the
+		--    representativePart since a Model carrier has no .AssemblyRootPart).
+		local root = representativePart.AssemblyRootPart or representativePart
+		-- 2. SKIP rules (each a no-op return BEFORE any VectorForce creation).
+		if root:GetAttribute(TAG) ~= nil then
+			return  -- already corrected (dedup across all surfaces)
+		end
+		if root.Anchored then
+			return  -- static geometry (also skips Model-carrier shapes S3/S6)
+		end
+		-- Humanoid / character rig: a Humanoid is never a BasePart ancestor, so use
+		-- the ancestor-Model-contains-Humanoid form (NOT FindFirstAncestorWhichIsA
+		-- ("Humanoid"), which is dead).
+		local ancestorModel = root:FindFirstAncestorWhichIsA("Model")
+		while ancestorModel do
+			if ancestorModel:FindFirstChildWhichIsA("Humanoid") then
+				return  -- character assembly -- leave on native gravity
+			end
+			ancestorModel = ancestorModel:FindFirstAncestorWhichIsA("Model")
+		end
+		local mass = root.AssemblyMass
+		if mass <= 0 then
+			return  -- SKIP WITHOUT TAGGING -- stays correctable if mass later valid
+		end
+		-- 3. read scale/skip facts CARRIER-FIRST then ancestor-Model walk (D-P1.6).
+		local useGravityAttr = factOf(carrier, "UseGravity")
+		-- GravityScale is a 2D-only fact (Rigidbody2D branch); DEAD for in-scope 3D
+		-- (always nil ⇒ 1.0). Kept defensively / self-documenting.
+		local gravityScaleAttr = factOf(carrier, "GravityScale")
+		local gravityScale = (useGravityAttr == false) and 0 or (gravityScaleAttr or 1.0)
+		local desiredStuds = desiredBaseStuds * gravityScale
+		-- 4. compensating force: net accel = g_live - force/mass = desiredStuds.
+		local force = mass * (workspace.Gravity - desiredStuds)
+		-- 5. one Attachment + VectorForce on the root (ApplyAtCenterOfMass, World).
+		local att = Instance.new("Attachment")
+		att.Parent = root
+		local vf = Instance.new("VectorForce")
+		vf.Attachment0 = att
+		vf.Force = Vector3.new(0, force, 0)
+		vf.RelativeTo = Enum.ActuatorRelativeTo.World
+		vf.ApplyAtCenterOfMass = true
+		vf.Parent = root
+		-- 6. tag the resolved root (dedup keyed on the physical assembly).
+		root:SetAttribute(TAG, true)
+	end
+
+	_gravityCorrectDynamicAssembly = correctDynamicAssembly
+end
+
+function SceneRuntime:_correctClonedDynamics(clone)
+	-- Correct each dynamic _UnityMass assembly in a freshly client-cloned prefab
+	-- subtree, mirroring the server's class-agnostic scan + 2D exclusion. Selects
+	-- on _UnityMass presence REGARDLESS of class (a BasePart S1/S2/S4 OR a Model
+	-- carrier S3/S6) AND _Rigidbody2D == nil (Physics2D OOS -- a 2D body carries
+	-- _UnityMass indistinguishably from a 3D one, so it is flagged + skipped).
+	-- Walks clone:GetDescendants() PLUS the clone ROOT itself (a clone whose root
+	-- IS a Model carrier is found by the root test, not the descendant walk).
+	-- A Model-carrier clone resolves an Anchored representative part and is
+	-- SKIPPED via skip-if-anchored, exactly as on the server.
+	-- Guard the Instance API before indexing (mirrors the applyImpulse:1515
+	-- indexability guard): a synthesized non-Instance clone (test harness, or a
+	-- service that returns a plain table) must not hard-error here.
+	if (type(clone) ~= "table" and type(clone) ~= "userdata")
+		or type(clone.GetAttribute) ~= "function"
+		or type(clone.GetDescendants) ~= "function" then
+		return
+	end
+	local desiredBaseStuds = (self._plan and self._plan.gravityDesiredBaseStuds)
+		or (STUDS_PER_METER * DEFAULT_UNITY_GRAVITY_Y)
+	-- Defer the per-carrier correction one frame (same settle semantics as the
+	-- server spawn hook): on a welded multi-part (S4) clone the weld joints are
+	-- not final immediately after construction, so a synchronous read would take
+	-- AssemblyRootPart / AssemblyMass off a temporary part. The
+	-- _ScaleGravityCorrected tag keeps this exactly-once across the deferred
+	-- clone-site path AND the server DescendantAdded path (this file runs on the
+	-- server too); whichever defers first tags the root, the other no-ops.
+	local function correct(inst)
+		self._services.task.defer(function()
+			_gravityCorrectDynamicAssembly(inst, desiredBaseStuds)
+		end)
+	end
+	if clone:GetAttribute("_UnityMass") ~= nil
+		and clone:GetAttribute("_Rigidbody2D") == nil then
+		correct(clone)
+	end
+	for _, d in ipairs(clone:GetDescendants()) do
+		if d:GetAttribute("_UnityMass") ~= nil
+			and d:GetAttribute("_Rigidbody2D") == nil then
+			correct(d)
+		end
+	end
+end
+
 function SceneRuntime:instantiatePrefab(prefab_id, parent, cframe, externalRefs)
 	local prefab = (self._plan.prefabs or {})[prefab_id]
 	if not prefab then
@@ -2106,6 +2281,9 @@ function SceneRuntime:instantiatePrefab(prefab_id, parent, cframe, externalRefs)
 	local componentList = self:_constructPrefabClone(
 		clone, prefab, prefab_id, nil, externalRefs, placement_id)
 	self:_runAwakeEnableStart(componentList)
+	-- Slice 1.3: correct each dynamic _UnityMass assembly in this client-local
+	-- clone (the server's boot sweep / DescendantAdded never sees a client clone).
+	self:_correctClonedDynamics(clone)
 	return clone
 end
 

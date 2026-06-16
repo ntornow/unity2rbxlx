@@ -92,6 +92,28 @@ class TestSubphaseOrderInvariant:
             )
 
 
+class TestGravityCorrectionSubphasePosition:
+    """AC13 (Phase 1, relation #8): ``_subphase_inject_gravity_correction`` must
+    be present in BOTH SUBPHASE_ORDER and the write_output call sequence,
+    positioned immediately AFTER ``_generate_prefab_packages`` (so the emit gate
+    can scan ``replicated_templates`` materialized there)."""
+
+    def test_present_in_subphase_order_after_prefab_packages(self) -> None:
+        order = list(Pipeline.SUBPHASE_ORDER)
+        assert "_subphase_inject_gravity_correction" in order
+        assert "_generate_prefab_packages" in order
+        assert order.index("_subphase_inject_gravity_correction") == (
+            order.index("_generate_prefab_packages") + 1
+        ), order
+
+    def test_present_in_write_output_call_sequence_after_prefab_packages(self) -> None:
+        calls = _parse_write_output_call_sequence()
+        assert "_subphase_inject_gravity_correction" in calls
+        assert calls.index("_subphase_inject_gravity_correction") == (
+            calls.index("_generate_prefab_packages") + 1
+        ), calls
+
+
 class TestSubphaseDocstrings:
     """Each extracted _subphase_* method must explain what it does so a
     future contributor can identify which subphase to touch when adding

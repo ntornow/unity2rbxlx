@@ -2179,6 +2179,12 @@ def _wrap_geometry_with_children_into_model(part: "RbxPart", node_name: str) -> 
             # Phase 1 (relation #8): the physics lives on the inner BasePart, so the launch-velocity
             # mass must travel with it (the host resolves it from the part's assembly).
             "_UnityMass",
+            # Phase 1 (relation #8): the 2D-exclusion discriminator must co-locate with _UnityMass on
+            # the inner carrier -- the per-carrier `_Rigidbody2D == nil` check (every runtime scan
+            # surface + the emit-gate) keys on the SAME instance the scan finds via _UnityMass. Left on
+            # the outer Model, a wrapped 2D body would present _UnityMass (inner) with no _Rigidbody2D
+            # and be falsely admitted as in-scope 3D.
+            "_Rigidbody2D",
         ):
             inner.attributes[_attr_key] = part.attributes.pop(_attr_key)
     # Reset the outer to Model — visual properties now live on inner.
@@ -2803,6 +2809,15 @@ def _process_components(
         # Store useGravity as attribute if disabled (scripts may need it)
         # Rigidbody: m_UseGravity (bool), Rigidbody2D: m_GravityScale (float)
         if "m_GravityScale" in rigidbody_props:
+            # Phase 1 (relation #8): this is the Rigidbody2D branch. Physics2D is
+            # OUT OF SCOPE for the scale-faithful gravity correction (a 3D
+            # DynamicsManager correction must not touch a 2D body). _UnityMass is
+            # stamped class-agnostically above (before this 2D/3D split), so
+            # _Rigidbody2D is the SOLE discriminator. Stamp it UNCONDITIONALLY --
+            # a default-scale 2D body (m_GravityScale == 1.0) sets neither
+            # GravityScale nor UseGravity, so nesting this under the != 1.0 check
+            # would leak default-scale 2D bodies into the 3D correction.
+            part.attributes["_Rigidbody2D"] = True
             gravity_scale = float(rigidbody_props.get("m_GravityScale", 1.0))
             if gravity_scale != 1.0:
                 part.attributes["GravityScale"] = gravity_scale

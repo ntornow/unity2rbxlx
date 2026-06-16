@@ -1951,3 +1951,544 @@ Slop deferred to /drive-finalize (no slop fixed here).
   widest-blast change (per-object gravity for every dynamic body in every game). Ship Phases 1+2 now;
   Phase 3 becomes a separate effort with its own design/review/regression. Classification: User-approved
   (AskUserQuestion) scope reduction.
+
+## ── Run: gravity-scale-correction-20260615T093547 (scale-consistent gravity, 2026-06-15) ──
+# Decisions — scale-consistent gravity (generic mode)
+
+- **Mechanism = per-assembly compensating upward VectorForce on the AssemblyRootPart**
+  (ApplyAtCenterOfMass, World space; force = AssemblyMass * (workspace.Gravity − desiredStudsAccel)).
+  Only realistic per-body lever; leaves characters and global gravity untouched.
+  Classification: Mechanical
+
+- **Per-ASSEMBLY, not per-part — one force per assembly root sized on AssemblyMass; skip welded
+  non-root parts.** A welded body has a single COM/AssemblyMass; per-part forces double-count.
+  Reuse the existing applyImpulse assembly-resolution precedent (scene_runtime.luau:1518-1532).
+  Classification: Mechanical
+
+- **Project gravity is EMITTED into the generic plan as a constant anchored on the deterministic
+  upstream Unity project g (9.81 default), NOT recovered from workspace.Gravity.** Verified that
+  generic mode never writes workspace.Gravity (grep of scene_runtime.luau + planner = zero); the
+  *20 form only exists in CharacterBridge:SetGravity which has zero runtime callers. The
+  recover-from-workspace formula is a frozen-9.81 trap that only coincidentally works at default g.
+  Classification: Mechanical (verified against real code)
+
+- **Boot-time correction loop lives in the SceneRuntime.new constructor** (scene_runtime.luau:153) —
+  generic-mode entry where plan + stamped instances are both available.
+  Classification: Taste
+
+- **UseGravity=false ⇒ full cancellation; GravityScale scales the target; anchored + Humanoid/
+  character assemblies skipped.** Reuses already-stamped facts (scene_converter.py:2790-2814); no
+  new classification surface.
+  Classification: Mechanical
+
+- **Gate on a concrete fall-rate invariant (net vertical accel ≈ |unity_g|*gravityScale*
+  STUDS_PER_METER within tolerance, mass-agnostic), not just a green unit suite.**
+  Classification: Mechanical
+
+- **Wide blast radius gets a dedicated Phase 2: corpus/canary regression + slow/long-range-arc
+  acceptance + resting/sleep/auto-sleep verification.** Every dynamic body in every game is
+  affected; green unit suite is insufficient.
+  Classification: Taste
+
+## [coordinator] Project-gravity source — parse DynamicsManager in Phase 1 (resolves design Open Question 1)
+Decision: Phase 1 parses Unity `ProjectSettings/DynamicsManager.asset` `m_Gravity` for the gravity
+magnitude (9.81 default when file/field absent) and emits it as a generic-plan constant, rather than
+shipping a frozen 9.81-default constant with no parse.
+Rationale: the task explicitly and repeatedly requires "the ACTUAL project gravity, not a frozen
+9.81"; shipping a 9.81-default-only constant would violate that explicit directive. The parse is a
+small bounded YAML read with a clean default fallback, and it makes the deterministic-upstream-source
+principle real. Magnitude only (free fall is world-down); non-uniform/2D/runtime gravity out of scope.
+Classification: User-Challenge (honors an explicit user directive over the planner's lean-to-defer).
+
+## [autoplan eng-review, Claude voice] Three design corrections before coding
+1. Placement (was BLOCKING): correction is a SERVER-ONLY post-assembly workspace:GetDescendants()
+   sweep, NOT a SceneRuntime.new constructor loop. Real code: constructor has no instances;
+   new()+start() run once per domain (double-apply risk); start() skips script-less dynamic props.
+   Server-only so VectorForce+Attachment replicate to clients. Classification: Mechanical (corrects error).
+2. Phasing (was MAJOR): resting/auto-sleep/drift Studio spike moves to PHASE 1 as a primitive-validity
+   gate (a constant VectorForce can invalidate the mechanism; can't be a Phase-2 regression). Mechanical.
+3. Gate honesty (was MAJOR): Phase-1 CI gate = STRUCTURAL (emitted Force.Y == formula); behavioral
+   fall-rate = Studio acceptance run from MAIN (no pytest physics integrator; Studio half can't run in
+   a subagent). Mechanical.
+Minor caveats folded into Approach: no clamp when desired>g (negative force correct); read
+workspace.Gravity (=196.2, rbxlx_writer.py:1464) at apply time; _UnityMass may not be on AssemblyRootPart.
+
+## [design-review r1, Codex voice] Two P1 corrections (architecture shift)
+- BLOCKING: gravity correction decoupled from the SceneRuntime host-runtime emit gate → a STANDALONE
+  generic SERVER script emitted to ServerScriptService whenever Workspace has dynamic _UnityMass parts.
+  Host runtime only emits with >=1 runtime-bearing module (pipeline.py:6295,6324); keying off it would
+  silently skip games with dynamic props but no scripts. Scalar baked into the script at gen time.
+  Classification: Mechanical (corrects error).
+- MAJOR: boot sweep + idempotent workspace.DescendantAdded spawn hook (tag _ScaleGravityCorrected per
+  AssemblyRootPart) to catch runtime-spawned prefab clones (instantiatePrefab). Mechanical.
+- MINOR: scalar = abs(m_Gravity.y) (Y-axis force), warn+fail-open on non-zero x/z. Mechanical.
+- MINOR: Phase 2 perf-budget failure may BOUNCE the mechanism back to Phase 1 (too-expensive
+  per-assembly forces = primitive failure, not regression). Mechanical.
+
+## [design-review r2, Codex voice] Two more P1 corrections (dual-domain + prefab-spanning emit)
+- BLOCKING: emit gate keys on dynamic _UnityMass across scene workspace UNION prefab templates,
+  emitted after _generate_prefab_packages() (write_output injects before replicated_templates
+  materialize: pipeline.py:2694 vs :6000). A workspace-only gate skips prefab-clone-only games. Mechanical.
+- MAJOR: correction emitted to BOTH domains (ServerScriptService + StarterPlayerScripts), tag-idempotent.
+  Key insight: a VectorForce is a persistent CHILD applied by whoever SIMULATES the part → invariant is
+  "exactly one tagged force per dynamic assembly". Server corrects+tags all it sees (replicates); client
+  corrects only untagged client-local clones (instantiatePrefab not domain-gated, scene_runtime.luau:2104).
+  Replaces the earlier server-only stance (left client-local clones at raw gravity). Mechanical.
+
+## [design-review r3, Claude voice] REVERT dual-domain → provably-safe server-only
+The dual-domain correction (server + client copies) added to fix r2's client-local MAJOR itself
+introduced 2 MAJORs (Claude r3): a replication race (client sees a server-replicated body before its
+tag lands → applies a 2nd force → ~2x too slow) and an unverified "whoever simulates = network owner"
+primitive assumption. Net-negative forward fix → reverted to server-only.
+Server-only is provably correct: a VectorForce is a persistent CHILD applied by whoever network-owns
+the part; the server creates exactly ONE replicated tagged force per assembly → applied correctly
+under server OR auto-assigned-client ownership, no race, no double-apply. KEPT from the rounds: the
+emit-gate-spans-prefab-templates fix (r2 BLOCKING, domain-independent) and abs(m_Gravity.y).
+Client-local clones → documented Out-of-scope limitation + follow-up (the ONE Gate-A confirm item).
+Classification: Mechanical (reverts a net-negative fix per the operating rule).
+
+## [design-review r4, Codex voice] Client-originated clones BROUGHT INTO SCOPE (race-free clone-site hook)
+Codex r4 (well-evidenced): client-local clones are a DEFAULT path, not an edge — --networking=none
+falls back to client (conversion_context.py:140) and corpus spawners (Turret/Mine/HostilePlane) are
+client-classified. So server-only would miss the common single-player case's runtime-spawned dynamics.
+Resolution: add a THIRD correction surface — a targeted hook at the runtime's client instantiatePrefab
+clone-site that corrects ONLY the clones the client itself creates (client-local by construction →
+never server-tagged → no race; this is the round-3 race avoided by keying on client-ORIGINATED clones,
+not a blanket client DescendantAdded). Shared correctDynamicAssembly helper across all three surfaces
+(server boot sweep, server DescendantAdded, client clone-site), tag-idempotent. Codex also CONFIRMED
+(not P1): network-ownership claim sound; emit-after-prefab-packages feasible.
+Classification: Mechanical (resolves a default-path P1 with the race-free targeted form).
+
+## [phase-1 detailed design] Interfaces, slice plan, and three real-code divergences
+- D-P1.1 Force = AssemblyMass*(workspace.Gravity − |g.y|*gravityScale*SPM), one VectorForce+Attachment
+  per AssemblyRootPart, ApplyAtCenterOfMass+World, no clamp. Mass-independent net accel. Mechanical.
+- D-P1.2 Project gravity parsed by NEW converter/converter/project_gravity.py via targeted m_Gravity-line
+  extraction (NOT yaml.safe_load — Unity %TAG !u! headers break full YAML; abs(y) only; 9.81 default).
+  Mechanical. (Divergence D2: no ProjectSettings parser exists today.)
+- D-P1.3 Standalone server script BAKES its own constant; the client clone-site hook reads the SAME
+  parsed value via a single NEW plan field `gravityDesiredBaseStuds`. Server script stays decoupled
+  from the plan (load-bearing); client hook already requires the plan. Taste. (Resolves divergence D3.)
+- D-P1.4 `_ScaleGravityCorrected` is a part Attribute on the AssemblyRootPart (not CollectionService) —
+  replicates with the instance, matches _UnityMass/_SceneRuntimeId convention, single dedup authority.
+  Mechanical.
+- D-P1.5 New subphase `_subphase_inject_gravity_correction` runs AFTER `_generate_prefab_packages`,
+  emits a `Script` to ServerScriptService (parent_path), idempotent via an autogen marker. Mechanical.
+- D-P1.6 Skip/scale facts (GravityScale/UseGravity) read at the ASSEMBLY level, NOT off the _UnityMass
+  part — mesh-wrap leaves these on the OUTER Model while only _UnityMass moves to the inner *_Mesh
+  (scene_converter.py:2176-2183). Mechanical. (Resolves divergence D1.)
+- D-P1.7 Canonical helper text = a Python constant `_GRAVITY_CORRECTION_HELPER_LUAU` in autogen.py,
+  mirrored into scene_runtime.luau, guarded by a parity structural test (prevents drift). Taste.
+- D-P1.8 Phase-1 slices run STRICTLY SERIAL (1.1→1.5): autogen.py + the subphase-order AST test are
+  touched by multiple slices, so serial keeps per-slice `owns:` disjoint. Mechanical.
+- D-P1.9 Stale-force-on-late-anchor accepted as a documented Phase-1 edge, no re-check wired —
+  anchored parts ignore forces, so the stale force is inert; re-check is over-design. Taste.
+- Divergence D4: a test (test_pipeline_write_output_subphases.py) pins write_output's AST call sequence
+  == SUBPHASE_ORDER, so the new subphase must be added to BOTH in the same slice (1.2 owns that edit).
+
+## [phase-1 detailed design, dual-voice review] Revisions for the unbuildable plan-field plumbing
+Both review voices (Claude + Codex) converged on ONE root problem: the client
+`gravityDesiredBaseStuds` plan-field plumbing was unbuildable as originally designed. Four corrections:
+
+- **D-P1.3 REVISED (early parse + plan stash + allowlist) — was BLOCKING (ordering).** The scalar must
+  be parsed EARLY in `plan_scene_runtime` (pipeline.py:998 — PHASE index 2, holds
+  `self.unity_project_path`, writes `self.ctx.scene_runtime` at line 1048) and STASHED into
+  `self.ctx.scene_runtime["gravityDesiredBaseStuds"]`, AND `"gravityDesiredBaseStuds"` added to
+  `_PLAN_KEYS_FOR_HOST` (autogen.py:638). Reason: the SceneRuntimePlan ModuleScript is emitted in
+  `_subphase_inject_scene_runtime` (pipeline.py:2694 → emit at 6451) via
+  `generate_scene_runtime_plan_module`, which serializes ONLY keys already present in the dict AND in
+  the `_PLAN_KEYS_FOR_HOST` allowlist (filter at line 654). A post-prefab gravity subphase parses the
+  scalar AFTER that emit, so the field would never reach the plan → client always falls back to frozen
+  9.81 (the exact D3 trap). The standalone server-script subphase reads the SAME stash to bake its
+  literal — ONE parse, two consumers, server script stays decoupled.
+  Classification: Mechanical (corrects a load-bearing ordering/allowlist bug; the cited early-parse
+  site is verified real in the worktree).
+
+- **D-P1.8 REVISED (re-slice to give the plan-field plumbing one owner) — was MAJOR (slice ownership).**
+  ALL parse + plan-field plumbing — `project_gravity.py` + the early `plan_scene_runtime` stash in
+  `pipeline.py` + the `_PLAN_KEYS_FOR_HOST` edit in `autogen.py` + the AC16 emit-survival test — is
+  now owned by ONE slice (1.1). The old split left the early stash and the allowlist edit unowned (a
+  required edit with no slice). `pipeline.py` and `autogen.py` are now each touched by exactly two
+  serialized slices (1.1 then 1.2), disjoint regions, one writer at a time. The client hook (1.3) only
+  READS the plan field, so it no longer touches `autogen.py` (removes the old 1.2/1.3 conflict).
+  Serial chain 1.1→1.2→1.3→1.4→1.5, no cycle.
+  Classification: Mechanical (corrects an ownership gap — a required edit was unowned).
+
+- **AC16 added (plan-emit-survival structural test) — was MAJOR (missing structural test).** A pure-
+  Python test asserts `generate_scene_runtime_plan_module({... "gravityDesiredBaseStuds": s ...})`
+  output INCLUDES the field (i.e. it survives `_PLAN_KEYS_FOR_HOST`), mirroring
+  `test_scene_runtime_host_emit.py::test_plan_module_embeds_scene_prefab_placements` and
+  `test_plan_emits_player_signal.py`. This is the load-bearing plan-emission hop; AC15 (mock-plan hook)
+  stubs the plan and does NOT cover the producer. Owned by slice 1.1.
+  Classification: Mechanical (closes a coverage gap on the load-bearing hop).
+
+- **D-P1.6 clarified (per-instance fact resolution) — was P2 (fact resolution).** The
+  `correctDynamicAssembly` helper must read `GravityScale`/`UseGravity` off the OWNING Model/assembly
+  instance (per D1: those facts do NOT travel to the inner `*_Mesh` BasePart; only `_UnityMass` does).
+  The applyImpulse precedent (scene_runtime.luau:1518-1532) walks for `_UnityMass` ONLY, so the helper
+  must NOT reuse that part as the fact source — bind `owningModel = root:FindFirstAncestorWhichIsA(
+  "Model") or root` and read the scale/skip attributes off it (falling back to the root for
+  non-mesh-wrapped bodies). `Anchored` stays read off `root` (a real BasePart property). AC8 extended
+  to assert facts on the outer Model are honored.
+  Classification: Mechanical (makes the fact-lookup instance explicit, per D1).
+
+## [phase-1 detailed design, dual-voice review r2] Two MAJOR P1 fixes (both verified vs real code)
+
+- **D-P1.6 RE-REVISED (fact resolution is ROOT-FIRST, not owning-Model-first) — was MAJOR (reads the
+  wrong instance).** The prior revision resolved `GravityScale`/`UseGravity`/`anchored` via
+  `root:FindFirstAncestorWhichIsA("Model") or root` (the parent CONTAINER Model). But the real code
+  stamps ALL rigidbody facts on the BODY PART ITSELF (scene_converter.py:2791/2808/2810/2814); ONLY
+  `_UnityMass` (+`_Scale*`/`_Mesh*`) moves to the inner `*_Mesh` on mesh-wrap (scene_converter.py:
+  2176-2183); and a parent-with-children becomes a `Model` container holding NO rigidbody facts
+  (scene_converter.py:1886). So a NON-wrapped dynamic part nested under a parent `Model` has its facts
+  on `root` — the owning-Model-first lookup read the empty parent container and silently fell back to
+  default gravity. FIX: read each fact off `root` FIRST; ONLY IF that attribute is absent on `root`,
+  walk ancestor `Model`s for the first holder (or a `Humanoid`). Fallback is gated per-attribute on
+  "absent on root", NOT on "owningModel lookup is nil". `Anchored` stays read off `root` (real
+  BasePart property). Updated: §1.5 helper fact-lookup, §0 anchor table (split into part-stamping +
+  Model-container + mesh-wrap-travel rows), D1 divergence note, AC8 (mesh-wrap shape), and ADDED AC8b
+  (non-wrapped-under-Model: facts on the part, parent container empty, no default fall-back). The
+  corrected rule covers BOTH shapes (facts on root for non-wrapped; on ancestor Model for mesh-wrap).
+  Classification: Mechanical (corrects the fact-resolution direction against verified real stamping).
+
+- **D-P1.10 Zero-gravity falsy bug in the server-side scalar consumer — was MAJOR.** The emit subphase
+  read `self.ctx.scene_runtime.get("gravityDesiredBaseStuds") or default`. In Python `0.0` is falsy,
+  so a valid project with `m_Gravity.y == 0` (zero gravity) fell through `or` to the 35.03 default and
+  baked the WRONG constant into the server `SceneGravityCorrection` script — breaking the "one parse,
+  two consumers" invariant (the client plan path preserves 0; the `or`-based server path would not).
+  FIX: use an explicit `is None` check in the Python emit subphase (NOT `or`):
+  `stashed = (...).get(key); desired = stashed if stashed is not None else default`. ADDED AC9 zero
+  parse case (`m_Gravity.y==0 ⇒ 0.0`, not the default) and AC10b (stashed `0.0` survives into the
+  emitted `DESIRED_G_STUDS_BASE == 0.0` constant — full-cancel, not 35.03). The Luau-side `or` (§1.6)
+  is FINE and unchanged — in Luau `0` is truthy, so the emitted/stashed `0` survives. Also folded the
+  prior round's non-blocking notes: assert `repr()`-formatted floats in structural tests (AC10/AC10b/
+  AC16 — the emit serializes floats via `repr`), and ADDED AC16b pinning resume-rehydration of the
+  stashed field across the producer→consumer subphase hop.
+  Classification: Mechanical (fixes a falsy-default data bug + adds the structural guards).
+
+## [phase-1 detailed design, dual-voice review r3] MAJOR P1: `_UnityMass` carrier can be a MODEL (S3), + full shape enumeration
+
+- **D-P1.11 Seed scan is CLASS-AGNOSTIC; helper handles the Model-carrier shape — was MAJOR (missed
+  carriers).** The three correction entrypoints (boot sweep, server `DescendantAdded`, client
+  clone-walk) filtered `_UnityMass` on `IsA("BasePart")`. But a Rigidbody on a no-mesh parent with
+  children becomes a `Model` CARRIER that carries `_UnityMass` AND `GravityScale`/`UseGravity`/
+  `anchored` directly on the Model: `_convert_node` sets `class_name="Model"` at scene_converter.py:1886
+  (children + no mesh) → `_process_components` (2024) stamps `_UnityMass` (2797), `GravityScale` (2808),
+  `UseGravity` (2810/2814), `anchored` (2791) on that `part` → `_wrap_geometry_with_children_into_model`
+  (2110) RETURNS EARLY at the 2141 guard (`_has_geometry` requires Part/MeshPart + mesh, 2137-2140), so
+  NOTHING moves to an inner `*_Mesh` and the facts stay ON THE MODEL. A BasePart-only scan misses that
+  assembly entirely → never corrected. FIX (verified vs the worktree real code at each step): (1) all
+  three entrypoints select on `inst:GetAttribute("_UnityMass") ~= nil` regardless of class; (2)
+  `correctDynamicAssembly` resolves a representative BasePart for a Model carrier (PrimaryPart, else
+  first descendant BasePart; DEFER without tagging if the Model has no BasePart descendant yet) then
+  that part's `AssemblyRootPart` (the applyImpulse precedent at scene_runtime.luau:1518-1532 assumes a
+  BasePart arg, so a Model carrier needs the extra representative-part hop); (3) facts resolve
+  CARRIER-FIRST then ancestor-`Model`-walk — for S3 the carrier Model holds both `_UnityMass` and facts;
+  (4) the `_ScaleGravityCorrected` tag lands on the resolved root so dedup is keyed on the physical
+  assembly. Added AC8c (Model-carrier server path) → slice 1.2, AC8d (Model-carrier client clone-site
+  path) → slice 1.3; edge cases 14 (Model carrier) + 15 (multi-part scale heterogeneity); §0b explicit
+  five-shape enumeration. Ownership map unchanged (1.2 owns the canonical helper text in autogen.py +
+  the server emit; 1.3 owns the scene_runtime.luau mirror; disjoint, serial 1.1→1.5, acyclic).
+  Classification: Mechanical (corrects a scan-class/root-resolution miss against verified real
+  stamping).
+
+- **Shape enumeration hardened (§0b) — addresses the recurring under-modeled-shape failure.** Every
+  real shape a dynamic `_UnityMass` assembly takes in converter output is enumerated and each stage of
+  the (scan → root-resolve → fact-resolve → skip-rules → tag) pipeline confirmed per shape, with the
+  fact/`_UnityMass` location verified against scene_converter.py:
+  - **S1 non-wrapped BasePart** — `_UnityMass` + facts BOTH on the BasePart (2797/2808/2810/2814; wrap
+    guard 2141 not hit, no children-needing-wrap). Scan: yes. Facts: on root.
+  - **S2 mesh-wrapped BasePart under Model** — `_UnityMass` MOVED to inner `*_Mesh` (2176-2183); facts
+    STAY on outer Model. Scan: yes (inner part). Facts: ancestor-Model walk.
+  - **S3 Model carrier** — `_UnityMass` + facts BOTH on the Model (1886 + 2024 + 2789-2814; wrap returns
+    early at 2141). Scan: yes ONLY because class-agnostic. Root: representative-BasePart hop. Facts: on
+    the carrier Model.
+  - **S4 welded multi-part assembly** — each member carries its own `_UnityMass` (2797 per part); all
+    resolve to one `AssemblyRootPart`; tag dedups to exactly one force (per-member scale heterogeneity a
+    documented limitation, edge 15).
+  - **S5 nested under a factless container Model** — inner carrier per S1/S3; the parent container (1886
+    case (a)) carries NO facts, so carrier-first correctly never reads the empty container before the
+    carrier.
+  Classification: Mechanical (enumerates the real input space so coverage is reviewer-checkable).
+
+## [phase-1 detailed design, dual-voice review r4] RE-SCOPE: correctable set = UNANCHORED BasePart-carriers; Model carriers correctly SKIPPED + test-harness fix
+
+Four MAJOR findings resolved by ONE re-scoping insight (fixes 2 MAJORs) + two independent fixes.
+
+- **THE RE-SCOPING INSIGHT (supersedes D-P1.11's "Model carrier IS corrected" framing).** A Model
+  carrier (S3 no-mesh-parent at scene_converter.py:1886; S6 multi-sub-mesh at 1923) stamps
+  `_UnityMass` + facts on the OUTER Model (2024 + 2789-2814), but its descendant BaseParts have NO own
+  Rigidbody so they emit **Anchored** (RbxPart defaults anchored=True at core/roblox_types.py:178;
+  Models emit no Anchored — luau_place_builder.py:478/553, rbxlx_writer.py:914-916; the no-rigidbody
+  branch at scene_converter.py:2815-2816 also sets anchored=True). So a Model-carrier's converted body
+  is **effectively STATIC — there is no free-fall to correct**, and the EXISTING skip-if-anchored rule
+  already handles it (resolve representative part → Anchored → skip, no force, NOT tagged). NO
+  Model-carrier correction machinery is needed or possible (correcting one needs a SEPARATE converter
+  change lowering the parent-Rigidbody state onto a real unanchored descendant BasePart — followups).
+  FIX: (1) re-scope the correctable set to UNANCHORED BasePart-carrier dynamic assemblies (S1/S2/S4/S5);
+  keep the scan CLASS-AGNOSTIC (`GetAttribute("_UnityMass") ~= nil` — cheap, and admits the future
+  follow-up automatically) but make explicit that a Model carrier (S3/S6) resolves an Anchored
+  representative and is SKIPPED; (2) replaced the S3/AC8c/8d "corrected" claims with the accurate
+  anchored-SKIP behavior (AC asserts a Model carrier gets NO force, on the structural/CI surface where
+  checkable); (3) acknowledged BOTH Model-carrier provenances in §0b (S3 1886 AND S6 1923/1940), both
+  stamping facts on the outer Model (2024/2789-2814) with anchored descendants → both skipped;
+  (4) documented the converter dynamic-carrier follow-up. This feature does NOT regress these carriers
+  (static today regardless of gravity).
+  Classification: Mechanical (right-sizing / scope correction — stops over-reaching on a
+  genuinely-separate edge case; verified against the real converter output shape).
+
+- **FIX A (test harness) — was MAJOR.** The behavioral-force ACs (AC1-8/8b/8c/8d/15) assumed the helper
+  could be EXECUTED in the repo's bare `luau` interpreter, but its only behavioral harness
+  (test_scene_runtime_host_behavior.py::_run_scenario, _harness_preamble lines 86-276) mocks ONLY the
+  host SERVICE surface (task/warn/workspaceFind/findFirstChildWhichIsA/signals/clone helpers) — NO
+  `workspace.Gravity`, NO `Instance.new`, NO `Vector3`, NO `Enum`, no injection seam. The force ACs are
+  thus unbuildable as behavioral tests, and no Roblox-API execution harness exists (must NOT be
+  invented). FIX: reclassify the force ACs as STRUCTURAL SOURCE assertions over the emitted Luau text
+  (force formula, class-agnostic `_UnityMass` scan, skip-rules, `_ScaleGravityCorrected` tag,
+  one-force-per-root) in the repo's existing `assert "<token>" in source` style
+  (test_scene_runtime_host_emit.py:70-98; test_plan_emits_player_signal.py). Pure-Python ACs (emit
+  gate, scalar parse, plan-field survival, zero-gravity, subphase order, parity, idempotency) stay real
+  pytest. Force-APPLICATION behavior (net accel, resting/auto-sleep, replication) moves to the Studio
+  acceptance §3.2 (run from MAIN), per the high-level CI-structural-vs-Studio-behavioral split.
+  Classification: Mechanical (corrects an unbuildable test classification against the real harness).
+
+- **FIX B (defer path) — was MAJOR (Claude) + Codex note.** The S3 defer-without-tag "DescendantAdded
+  re-fires for child parts" recovery was FALSE — child parts lack `_UnityMass` so the scan never
+  re-triggers on them. Since `Clone()` yields a fully-materialized subtree BEFORE parenting
+  (autogen.py:881/1035), the client clone-site hook resolves the representative immediately against the
+  complete subtree, and the boot sweep runs against the fully-assembled tree — no defer needed for part
+  PRESENCE (the deferred frame at edge #1 remains, but only for multi-part WELD settle). FIX: dropped
+  the unsound defer-recovery contract; kept at most a defensive one-shot skip with no false "will
+  retry" promise.
+  Classification: Mechanical (removes an unsound recovery contract).
+
+- **KEPT (verified clean, unchanged):** early stash in plan_scene_runtime; AC16 allowlist hop; Python
+  is-None zero-gravity consumer + AC10b; abs(m_Gravity.y); SUBPHASE_ORDER pin; RbxScript.parent_path
+  routing; the class-agnostic scan + Model→PrimaryPart/first-BasePart→AssemblyRootPart resolution;
+  root-first-then-ancestor fact resolution for S1/S2; the conflict-free acyclic re-slice. Re-checked:
+  the slice ownership map + no-cycle still hold — the re-scope REMOVES machinery and adds no files.
+
+## [phase-1 detailed design, scope-correctness revision] Two P1 fixes (2D exclusion + AssemblyMass skip-vs-tag)
+
+- **D-P1.12 (NEW) `Rigidbody2D` carriers EXCLUDED (Physics2D OOS); in-scope 3D contract is
+  `UseGravity` on/off with `GravityScale` treated as 1.0 — was MAJOR (2D scope hole).** Verified vs the
+  worktree: `_UnityMass` is stamped class-agnostically at scene_converter.py:2797 BEFORE the 2D/3D
+  split (both `Rigidbody` and `Rigidbody2D` feed one `rigidbody_props` at line 2475
+  `elif ct in ("Rigidbody", "Rigidbody2D")`), so the scan catches BOTH 2D and 3D bodies. The 2D/3D
+  discriminator is `scene_converter.py:2805`: `if "m_GravityScale" in rigidbody_props:` is the
+  **Rigidbody2D** branch (stamps `GravityScale` at 2808, `UseGravity=False` at 2810); the `else:` at
+  **2811** is the **3D Rigidbody** branch (stamps ONLY `UseGravity=False` at 2814, NEVER `GravityScale`
+  — source comment at 2804 confirms: "Rigidbody: m_UseGravity (bool), Rigidbody2D: m_GravityScale
+  (float)"). So the design's advertised "GravityScale=k scales the target" was actually the 2D path; a
+  3D DynamicsManager correction applied to a 2D body is unsound. FIX: (1) stamp `_Rigidbody2D=True` at
+  the 2805 Rigidbody2D branch (scene_converter.py, owned by slice 1.1 — a NEW single-owner file); the
+  3D `else` is left unflagged; (2) every runtime scan surface (boot sweep, server `DescendantAdded`,
+  client `_correctClonedDynamics`) AND the Python emit-gate predicate
+  (`_part_tree_has_dynamic_unitymass`) SKIP any `_Rigidbody2D` carrier (don't count it, don't correct
+  it); (3) the in-scope (3D) force contract reads `UseGravity` on/off (gravityScale = 0 off / 1.0 on);
+  the helper keeps a defensive `gravityScaleAttr or 1.0` read but it is DEAD for in-scope 3D (always
+  nil). Updated: top correctable-set scope, §0 anchor table (new 2D/3D-split + `_Rigidbody2D`-stamp
+  rows), §0b prose + per-stage coverage, §1.2 emit-gate predicate, §1.4 server scan surfaces, §1.5
+  force formula + fact-read prose, §1.6 client hook, edges 4/15 (reframed) + new edge 16, ACs 8e (skip
+  — server scan/emit-gate + client token) and 8f (the upstream stamp branch), AC7 (reframed to
+  UseGravity on/off), Studio S2 (gravityScale=1.0), §6 divergence D1b, slice 1.1 owns + ownership map.
+  Classification: Mechanical — scope correctness (keeps Physics2D genuinely out of scope; verified
+  against the real 2D/3D stamping branch).
+
+- **D-P1.13 (NEW) `AssemblyMass <= 0` is SKIP-WITHOUT-TAGGING (single behavior) — was minor
+  inconsistency.** The prior design said early-return skip in one place and "still tagged" in another. A
+  zero/negative-mass assembly yields `force = mass*(...)` = 0 (a harmless no-op), so applying gains
+  nothing; skip-without-tag keeps the body correctable if its mass later becomes valid. Aligned: helper
+  step 2, edge 11, and new AC5b — all to skip-without-tag. (The `UseGravity=false` full-cancel case,
+  edge 3, IS still tagged — it is corrected with a full-cancel force — a distinct case.)
+  Classification: Mechanical — resolves an internal inconsistency.
+
+- **Ownership map re-confirmed acyclic with `scene_converter.py` added.** `scene_converter.py` is owned
+  by exactly ONE slice (1.1) — single writer, no overlap; it adds NO new dependency edge (no consumer
+  slice; the runtime reads the stamped `_Rigidbody2D` attribute at RUNTIME, not at build time). Serial
+  chain unchanged: 1.1 → 1.2 → 1.3 → 1.4 → 1.5. `pipeline.py` + `autogen.py` still each touched by
+  exactly two serialized slices (1.1 then 1.2). No cycle.
+
+- **Phase-1 design revision (dual-voice P1): `_Rigidbody2D` added to the mesh-wrap move-list so the
+  2D-exclusion discriminator co-locates with `_UnityMass` on the inner carrier.** Root cause: the
+  per-carrier `_Rigidbody2D == nil` exclusion (every scan surface + the Python emit-gate) checks the
+  SAME instance the scan keys on (`_UnityMass`), but the mesh-wrap move-list
+  (`_wrap_geometry_with_children_into_model`, scene_converter.py:2176-2183) moved ONLY `_UnityMass`
+  (plus `_Scale*`/`_MeshId`/`_MeshFileId`/`_TextureId`/`_FbxImportScale`) to the inner `*_Mesh`,
+  leaving `_Rigidbody2D` on the outer Model. An S2 wrapped 2D body therefore presented an inner
+  carrier with `_UnityMass` but NO `_Rigidbody2D` → boot sweep, server DescendantAdded, client clone
+  correction, and `_part_tree_has_dynamic_unitymass` all misclassified it as in-scope 3D.
+  Fix: add `"_Rigidbody2D"` to the literal move-list tuple at scene_converter.py:2177-2182 (verified
+  contents: `_attr_key.startswith("_Scale")` PLUS `("_MeshId", "_MeshFileId", "_TextureId",
+  "_FbxImportScale", "_UnityMass")`, popped to `inner.attributes` at 2183) — owned by slice 1.1 which
+  already owns scene_converter.py (the `_Rigidbody2D` stamp), so no new ownership/cycle impact (single
+  writer, serial chain 1.1→1.5 unchanged). Design updated: §0 anchor rows, §0b S2 row + scan-coverage
+  bullet + correctable-set prose, §1.2 emit-gate docstring, edge 16, D1b, D-P1.12, AC8e (wrapped-2D
+  coverage on every surface + the emit-gate's wrapped-2D tree), AC8f (move-list co-location
+  regression-pin: wrap a 2D body, assert inner carries both `_UnityMass` and `_Rigidbody2D`), slice 1.1
+  scope + ownership map.
+  Classification: Mechanical
+
+## [design-review r7, Claude voice] Pin _Rigidbody2D stamp UNCONDITIONAL in the 2D branch + default-scale AC fixture
+The _Rigidbody2D stamp must be set UNCONDITIONALLY at the top of the `if "m_GravityScale" in
+rigidbody_props:` branch (scene_converter.py:2805), NOT nested under `if gravity_scale != 1.0`. A
+default-scale Rigidbody2D (m_GravityScale==1.0) stamps neither GravityScale nor UseGravity, so
+_Rigidbody2D is its SOLE discriminator from a 3D body; nesting would leak default-scale 2D into the 3D
+correction. AC8f's fixture must use m_GravityScale==1.0 (a !=1.0 fixture passes even with the buggy nested
+placement — green-test-for-the-wrong-reason). Classification: Mechanical (spec precision; my codex pd7
+said no-P1 but missed this — caught by the Claude voice).
+
+## [slice 1.1 implementation] Project-gravity parse + 2D discriminator + plan stash (DONE)
+- project_gravity.py: targeted m_Gravity-line regex anchored on `^\s*m_Gravity:` (does NOT collide
+  with m_ClothGravity), per-axis component extraction; returns abs(y); 9.81 default on missing
+  file/field; warn+fail-open to abs(y) on non-zero x/z. `warn` is an injectable callable (default
+  log.warning) so tests assert warnings without capturing logging. Never raises.
+- All cited real-code lines confirmed accurate in the worktree (scene_converter 2797/2805/2811,
+  move-list 2176-2183, pipeline plan_scene_runtime ~998-1048 w/ self.unity_project_path:Path +
+  self.ctx.scene_runtime at 1048, autogen _PLAN_KEYS_FOR_HOST 638, config.STUDS_PER_METER=3.571).
+  No drift; no REDESIGN.
+- config is imported in pipeline.py as `_config` (line 26); used `_config.STUDS_PER_METER`.
+- _plan_to_luau encodes float via repr(); zero (0.0) survives because the key is present in the dict
+  (the `if k in scene_runtime` filter passes) — verified by AC16 zero test.
+
+## [slice 1.2 implementation] Server gravity-correction script + emit subphase + gate (DONE)
+- autogen.py: `_GRAVITY_CORRECTION_HELPER_LUAU` canonical helper text constant + `generate_gravity_correction_server_script(desired_g_studs_base)` returning the baked Luau SOURCE STRING (boot sweep + DescendantAdded hook, class-agnostic _UnityMass scan with _Rigidbody2D==nil exclusion). The generator returns `str` (the pipeline wraps it in the RbxScript with parent_path) — design §1.4 signature is `-> str`; the RbxScript with parent_path="ServerScriptService" is built in the pipeline subphase per §1.3. Baked literal uses `repr(float(...))`.
+- pipeline.py: `_part_tree_has_dynamic_unitymass` (staticmethod, recursive over children; numeric-and-not-bool _UnityMass + _Rigidbody2D is None) and `_subphase_inject_gravity_correction` (reads 1.1 stash with `is None` guard, falls back to project_gravity.DEFAULT_UNITY_GRAVITY_Y * STUDS_PER_METER; idempotent _replace_or_add-style dedup on the autogen marker; user-named-script guard). Added to SUBPHASE_ORDER + write_output immediately after _generate_prefab_packages. Imported RbxPart into pipeline for the predicate annotation.
+- All cited anchors confirmed accurate in the worktree (SUBPHASE_ORDER 2557, write_output 2686, _generate_prefab_packages 5971, _subphase_inject_scene_runtime _replace_or_add marker pattern, RbxScript.parent_path/RbxPlace.scripts, scene_converter stamp@2820 + move-list@2181-2187, 1.1 stash@1060, _PLAN_KEYS_FOR_HOST@645). No drift; no REDESIGN.
+- AC13: the existing subphase-order test auto-extracts the call sequence and would pass on its own; added an explicit positional test class (TestGravityCorrectionSubphasePosition) asserting the subphase sits immediately after _generate_prefab_packages in BOTH SUBPHASE_ORDER and write_output.
+- Syntax smoke (AC10) uses utils.luau_analyze.syntax_errors_for_source (filters Roblox-API TypeErrors to SyntaxError only), skipif when luau-analyze absent.
+- Slice-local 42 tests green; full non-slow suite 3338 passed / 0 failed; no-Any gate pass.
+
+## [phase-2 detailed design] Canary surface, fixture strategy, Studio acceptance + perf bounce-back
+
+Decisive grounding (verified vs real code/fixtures): (a) the existing `contract_corpus` infra captures
+the WRONG artifact — `tools/regen_contract_corpus.py` aborts at `_run_contract_verifier` (BEFORE
+`write_output`/the gravity subphase) and captures only `{topology, scripts}`, never `workspace_parts`/
+`replicated_templates` or the `SceneGravityCorrection` script; (b) the bundled corpus has NO dynamic 3D
+bodies (MiniNet = 0 Rigidbody; SimpleFPS = unpopulated, `conftest.simplefps_project` skips); (c) the
+VectorForce+Attachment children are RUNTIME Luau instances, never serialized into the emitted place — so
+the only EMITTED gravity delta is the script + the `_Rigidbody2D` stamp + the plan field.
+
+- **D-P2.1 Gravity canary = a NEW targeted-delta pytest driving the REAL
+  `_subphase_inject_gravity_correction` against a constructed representative `RbxPlace`, NOT a new
+  `contract_corpus` fixture.** The contract-corpus capture point is upstream of the gravity emit (wrong
+  surface). Classification: Mechanical (verified against the capture point).
+- **D-P2.2 Canary fixture built IN-TEST (constructed post-stamp `RbxPlace`), not an on-disk Unity
+  project/submodule.** Bundled corpus has no dynamic 3D bodies; the gravity delta is downstream of the
+  deterministic `_UnityMass`/`_Rigidbody2D` stamping (already pinned upstream by Slice-1.1 tests), so a
+  constructed place is faithful AND always-runs in CI (no skip, no AI run). Classification: Mechanical /
+  right-sized.
+- **D-P2.3 Targeted before/after-DELTA assertions, NOT a frozen whole-place snapshot.** A golden
+  snapshot re-baselines on every unrelated converter change (review churn, over-design); targeted delta
+  pins exactly the surprise-break classes (appears-when-shouldn't / vanishes / mutates-tree /
+  wrong-scalar) at zero re-baseline cost. Classification: Taste / right-size.
+- **D-P2.4 The VectorForce+Attachment "instance-tree delta" is asserted in STUDIO (S2/S4), not in the
+  emitted place; CI pins the EMITTED delta (script + no-emit cases) AND that the part trees are
+  UNCHANGED by the subphase.** Forces are runtime-only (never in the rbxlx). Inherits Phase-1's
+  CI-emitted vs Studio-runtime blind spot. Classification: Mechanical.
+- **D-P2.5 Studio fall-rate tolerance = ±10 % around 35.03 studs/s² (= 9.81*3.571), with a
+  fall-distance cross-check; the ~5.6× corrected/uncorrected separation is the discriminator.** Tight
+  enough to separate corrected from default 196.2, loose enough to absorb integrator/sampling jitter.
+  Classification: Mechanical.
+- **D-P2.6 Perf budget = ≥2000 simultaneously-falling assemblies, sustained server `dt ≤ 1/30 s`; a
+  blown budget is a PRIMITIVE failure that BOUNCES the mechanism to Phase 1, NOT a Phase-2 patch.**
+  Symmetric with the resting/sleep gate; patching in Phase 2 would mask an unviable lever.
+  Classification: Mechanical (honors the phase boundary).
+- **D-P2.7 Slice 2.2 (on-disk GravityProps real-scene fixture) is CONDITIONAL on review.** Default is
+  the constructed place (2.1); the extra on-disk fixture is built only if review judges a constructed
+  `RbxPlace` insufficiently real. Classification: Taste / right-size (build on evidence of need).
+- **D-P2.8 No Phase-2 slice mutates a Phase-1 file** — the safety net reads Phase-1 producers only, so
+  it cannot regress the mechanism it guards. Classification: Mechanical.
+
+## Slice 1.3 (client clone-site gravity hook) — implementation decisions
+
+- **D-1.3a Mirrored helper embedded in a `do ... end` block, captured into a module-scope upvalue
+  `_gravityCorrectDynamicAssembly`.** scene_runtime.luau already has a module-level `_isBasePart`
+  (line 373) whose definition DIFFERS from the canonical helper's `_isBasePart`. To keep the canonical
+  text token-identical (slice 1.4 parity) without redefining/shadowing at module scope, the canonical
+  `factOf` + `correctDynamicAssembly` (+ their local `_isBasePart` and `local TAG`) are pasted verbatim
+  inside a `do` block; `correctDynamicAssembly` is captured into the upvalue the method calls. The
+  module's pre-existing `_isBasePart` is untouched.
+- **D-1.3b `_correctClonedDynamics` guards the clone's Instance API before indexing** (mirrors the
+  applyImpulse:1515 indexability guard): `type(clone) ~= table/userdata or type(clone.GetAttribute) ~=
+  function or type(clone.GetDescendants) ~= function -> return`. Without it the existing host-behavior
+  harness (which returns a plain-table fake clone from `clonePrefabTemplate`) hard-errored on
+  `clone:GetAttribute`. Production clones are always real Instances; this is defensive parity with the
+  existing applyImpulse guard, not new behavior.
+- **AC15/AC8d/AC8e/AC14 are STRUCTURAL source-token assertions** (per design FIX A — no Roblox-API
+  execution seam in standalone luau); the test file also runs a luau loadstring syntax smoke test on
+  the emitted scene_runtime.luau. Behavioral force application is the Studio acceptance (S2/S4).
+
+## [slice 1.3 review fixes] Defer clone-site correction (weld-settle) + pin negative invariant
+- **[MAJOR] Clone-site correction now DEFERRED.** `_correctClonedDynamics` routes each per-carrier
+  correction through `self._services.task.defer(...)` (a local `correct(inst)` closure) instead of
+  calling the helper synchronously. Mechanism CONFIRMED to match the server spawn-hook settle
+  semantics: the server `SceneGravityCorrection` DescendantAdded handler emits
+  `task.defer(function() correctDynamicAssembly(d, DESIRED_G_STUDS_BASE) end)`
+  (autogen.py:1305-1310); `self._services.task.defer` is the runtime's established deferral primitive,
+  already used by `_runAwakeEnableStart`'s Start-flush (scene_runtime.luau:1282) and mocked in the
+  host-behavior harness (test_scene_runtime_host_behavior.py:101). The deferred frame lets welds settle
+  on S4 multi-part clones before `AssemblyRootPart`/`AssemblyMass` are read; the `_ScaleGravityCorrected`
+  tag on the resolved root makes correction exactly-once across the deferred clone-site path AND the
+  server DescendantAdded path for a server-side instantiatePrefab clone (this file runs on both domains).
+  Did NOT add an isClient gate (the bonus): the runtime exposes no clean client/domain flag at the clone
+  site, and the defer + tag already yields exactly-once — the gate is unnecessary.
+- **[P2] Negative invariant pinned.** Added `test_runtime_has_no_blanket_workspace_descendantadded_
+  gravity_sweep` asserting no `DescendantAdded:Connect` handler in scene_runtime.luau sits near a
+  gravity marker (`_gravityCorrectDynamicAssembly`/`_ScaleGravityCorrected`/`gravityDesiredBaseStuds`/
+  `correctDynamicAssembly`). Scoped to actual `:Connect` WIRING (not comment mentions) and to gravity
+  context, so it doesn't false-trigger on the unrelated PlayerGui/character DescendantAdded hooks.
+- **[NIT, addressed]** Replaced the fragile `method_idx + 2000` test windows with a `_method_body()`
+  helper bounding on the next `\nfunction SceneRuntime:` (or EOF), so assertions stay precise and don't
+  bleed into the following method.
+- Helper text kept token-identical to autogen's `_GRAVITY_CORRECTION_HELPER_LUAU` (1.4 parity untouched
+  — only the method WRAPPING the helper call changed, not the helper). Luau loadstring smoke + the
+  scene_runtime host/apply-impulse/emit suites all green; no-Any gate pass.
+
+## [phase-2 detailed design, dual-voice review r1] Three MAJOR P1 fixes + right-size trim
+
+- **D-P2.10 No-emit cases re-framed on `_UnityMass` PRESENCE, not on anchored — was MAJOR.** The emit
+  gate (`_part_tree_has_dynamic_unitymass`, pipeline.py:6315) keys on numeric non-`_Rigidbody2D`
+  `_UnityMass` and never reads `anchored`; `_UnityMass` is stamped ONLY on unanchored bodies
+  (scene_converter.py:~2803, verified in the worktree). So anchored is a RUNTIME skip, not an emit-gate
+  concern. FIX: the canary's NO-EMIT cases are (a) a place with NO `_UnityMass` anywhere (P-abstain-none
+  — the all-anchored/static case is THIS) and (b) a `_Rigidbody2D`-only place (P-abstain-2d). An anchored
+  body becomes an `_UnityMass`-absent POSITIVE-emit-context sibling in P-mixed, proving the emit subphase
+  does NOT mutate the part tree. Removed all "all-anchored ⇒ no emit because anchored" framing.
+  Classification: Mechanical (corrects the gate semantics against verified real code).
+
+- **D-P2.11 Single representative fixture SPLIT into separate constructed places — was MAJOR
+  (internally impossible).** One fixture cannot be both mixed-workspace-dynamics (S1/S2/S4/S5 in
+  `workspace_parts`) AND prefab-template-only (dynamics only in `replicated_templates`, none in
+  workspace). FIX: build SEPARATE constructed `RbxPlace`s in-test (the `test_gravity_correction_emit.py`
+  pattern, NOT a shared fixture): P-mixed (multi-shape positive), P-prefab (prefab-template-only union,
+  C5), P-abstain-none (no `_UnityMass`), P-abstain-2d (`_Rigidbody2D`-only incl. mesh-wrapped 2D). Each
+  gets its own builder + assertion; no single `_assert_fixture_shapes(place)` proves all cases.
+  Classification: Mechanical (resolves the contradictory fixture contract).
+
+- **D-P2.12 Slice 2.2 (on-disk GravityProps real-scene fixture) DROPPED entirely + ownership fixed —
+  was MAJOR (over-build + non-disjoint + mis-ordered).** Old 2.1 and 2.2 both owned
+  `test_gravity_correction_canary.py` (not disjoint), and 2.2's `convert_scene → _subphase` re-prove
+  mis-ordered the pipeline (prefab templates exist only after `_generate_prefab_packages`). FIX: drop
+  2.2; the canary (2.1) driving `_subphase_inject_gravity_correction` directly with the
+  prefab-template-only place covers the scene ∪ prefab union without a real on-disk `convert_scene`
+  fixture. Phase 2 = {Slice 2.1 canary, Slice 2.2 Studio acceptance (renumbered from 2.3)}; ownership map
+  is now single-owner-per-file, disjoint, acyclic (2.2 deps 2.1; no Phase-1 file mutated).
+  Classification: Mechanical (corrects ownership/ordering) + Taste/right-size (drops the over-build).
+
+- **D-P2.13 Canary trimmed to its genuinely-new wide-blast-radius value — right-size (P2).** C1/C2/C5/
+  C6/C7/C8 substantially duplicated Phase-1's single-shape `test_gravity_correction_emit.py`. KEPT the
+  new value: C3 (script-name symmetric diff = only `SceneGravityCorrection` added vs a no-gravity
+  baseline), C4 (part-trees unchanged by the emit subphase), the multi-shape anti-vacuity assertion
+  (S1/S2/S4/S5 present + corrected in one place), the prefab-template-only union case (C5), and the two
+  `_UnityMass`-keyed no-emit cases. DROPPED the baked-scalar parse (C2), the mode gate (C7), and the
+  idempotent re-run (C8) — already pinned by Phase-1. The canary's PURPOSE is the wide-blast-radius
+  regression pin, not re-proving single-shape emit.
+  Classification: Taste / right-size (keep the new pin, drop the re-test).
+
+- **KEPT (verified true by both voices, unchanged):** corpus has no dynamic bodies (the canary brings
+  constructed places); `contract_corpus` captures only pre-`write_output` `{topology,scripts}` (the
+  canary drives the emit subphase directly); VectorForce/Attachment are runtime-Luau-only (CI pins the
+  emitted SCRIPT delta, Studio covers the force tree); the CI-vs-Studio AC split; the perf
+  bounce-to-Phase-1 boundary; and all Studio acceptance procedures (resting/auto-sleep gate, ±10% band
+  around fall-rate ≈35.03, UseGravity=false float, server-force replication, ≥2000-body perf budget with
+  bounce-to-Phase-1).

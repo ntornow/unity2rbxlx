@@ -476,3 +476,156 @@ present=True. reviewed-sha dcc7660.
   → its own design + review + corpus/canary regression + slow/long-range-arc acceptance. Design notes:
   per-assembly (not per-part, to avoid fighting welded CoM); verify resting/sleeping behavior. See
   design.md Phase 3 + archive for the original analysis.
+
+## ── Run: gravity-scale-correction-20260615T093547 (scale-consistent gravity, 2026-06-15) ──
+# Follow-ups — discovered during gravity-scale-correction planning
+
+- Converter never parses Unity's DynamicsManager project gravity — hardcodes 9.81/196.2 throughout
+  (component_converter.py:783, script_coherence_packs.py:3067). For full faithfulness on non-default
+  project gravity, add real DynamicsManager parsing to source the project-g constant. This design
+  ships a 9.81 default constant; mechanism is identical for a parsed value.
+
+- CharacterBridge:SetGravity (physics_bridge.luau:96) is effectively dead — zero runtime callers;
+  reachable only if transpiled C# calls it. Its workspace.Gravity = |g|*20 (196.2 at default) is
+  itself scale-unfaithful for dynamic bodies — the very bug this design fixes. Audit/remove or wire
+  properly in a separate cleanup.
+
+- Legacy (non-generic) scene-runtime mode may share the dynamic-body fall path with the same
+  ~5.6x-too-fast problem. This design is generic-only. If a later check confirms legacy is affected,
+  scope a parallel legacy correction (likely via coherence packs, since generic skips packs).
+
+## Phase-1 detailed-design notes (from design-review r1 Claude MINORs — P2, not blocking)
+- Pin the ACTUAL server-only gate in Phase-1 design: "gated like the placement-binding loop" is
+  imprecise — that loop is domain-filtered (runs both client+server). The real server-only lever is
+  the SERVER entrypoint (SceneRuntimeServer in ServerScriptService) running the sweep, OR an explicit
+  `domain == "server"` guard. Phase-1 design must specify the exact gate so the sweep runs ONCE.
+- The "server VectorForce replicates to clients" pillar is the one cross-context claim on engine
+  knowledge alone — confirm it in the Phase-1 resting/auto-sleep Studio spike (which runs anyway).
+
+## Phase-1 detailed-design note (design-review r2 Claude MINOR — P2)
+- The emit gate (dynamic-body scan that decides whether to emit the standalone gravity script) must
+  scan `replicated_templates` RECURSIVELY, not just `workspace_parts` — a spawn-only dynamic prop
+  has no workspace presence at emit time. Otherwise the runtime-clone gap reopens one level down
+  (script never emitted → DescendantAdded hook never installed). Pair with the DescendantAdded hook.
+
+## Follow-up: client-LOCAL dynamic prefab clones (deferred from gravity-correction)
+Client-script `instantiatePrefab` clones that never replicate to the server fall at raw Roblox
+gravity (the server-only correction can't see them). Narrow edge (client-spawned physics already
+doesn't replicate). If corpus evidence shows it matters: add a TARGETED hook on the client
+`instantiatePrefab`/`clonePrefabTemplate` path that corrects ONLY client-local instances (avoids the
+replication race a blanket client DescendantAdded would create). Do NOT reintroduce a blanket
+dual-domain DescendantAdded (net-negative: replication race + ownership double-force).
+
+## Phase-1 detailed-design notes (design-review r4 Claude P2s — not blocking)
+- DescendantAdded may fire before a multi-part clone's welds/AssemblyMass settle → defer the
+  per-clone correction a frame / wait for the assembly to settle before reading AssemblyMass.
+- A runtime anchor/weld transition can leave a stale correction force (e.g. a body later anchored
+  still carries its VectorForce). Consider re-checking on the relevant property changes, or accept
+  as a rare edge — decide in Phase-1 design.
+  RESOLVED (Phase-1 design): ACCEPT as a documented edge, no re-check wired — anchored parts ignore
+  forces in Roblox so the stale force is inert (D-P1.9). Revisit only if Phase-2 corpus shows drift.
+
+## Out-of-scope discoveries (Phase-1 detailed design)
+- The Phase-1 client clone-site hook adds ONE new plan field `gravityDesiredBaseStuds`
+  (generate_scene_runtime_plan_module). If a future phase wants the standalone server script to also
+  read from the plan (instead of baking its own constant), the field is already there — but do NOT
+  couple the server script to the plan (the decoupling is load-bearing for no-runtime games).
+- `project_gravity.py` parses ONLY abs(m_Gravity.y). The rest of the converter's 9.81/196.2 hardcodes
+  (component_converter.py:783, script_coherence_packs.py:3067) still assume default g — a project with
+  non-default gravity will now free-fall faithfully but other 9.81-derived conversions remain frozen.
+  Full sweep of the 9.81 hardcodes is a separate follow-up (already noted at top of this file).
+- Non-uniform gravity (m_Gravity.x/z != 0) and Physics2D gravity remain OOS; the parser warns + fails
+  open to abs(y). If a corpus game needs a non-down gravity vector, scope a vector-force variant.
+
+## Phase-1 IMPLEMENT notes (phasedesign review r2 — P2/MINOR, not blocking)
+- P2: a welded CROSS-Model assembly can resolve the wrong "owning Model" for GravityScale/UseGravity
+  lookup. Dominant single-body mesh-wrap case is correct; handle/》note the cross-Model case in the
+  helper (walk to the assembly root's owning Model, or read facts from the _UnityMass-stamped part's
+  nearest ancestor Model). Decide in IMPLEMENT.
+- MINOR: structural tests asserting the baked float must match Python repr() formatting (rbxlx_writer
+  serializes floats via repr at :587) — assert the repr form, not a hand-written literal.
+- MINOR: if resume rehydration of scene_runtime["gravityDesiredBaseStuds"] is relied on, pin it with an AC.
+
+## Phase-2 detailed-design out-of-scope discoveries
+- **Unify the `contract_corpus` capture to span `write_output` artifacts.** Today
+  `tools/regen_contract_corpus.py` aborts at `_run_contract_verifier` (captures only `{topology,
+  scripts}`), so it cannot snapshot `workspace_parts`/`replicated_templates` or emitted gravity/runtime
+  scripts. A future shared corpus surface that captures the post-`write_output` instance tree would let
+  the gravity canary (and others) replay a real end-to-end emit instead of a constructed place. Larger
+  infra change; out of scope for the gravity safety net.
+- **A real AI-driven end-to-end conversion of a dynamic-body game as a committed canary** (slow,
+  AI-cache dependent) is deferred. The constructed-place canary + the Studio acceptance cover the
+  emitted delta and the behavior without an AI run. Scope a real-conversion fixture only if a future
+  regression is traced to AI-output shape interacting with the gravity emit.
+- **Populate/initialize the SimpleFPS submodule (or add a small bundled dynamic-body project) for CI.**
+  SimpleFPS is an unpopulated submodule so `conftest.simplefps_project` skips — any SimpleFPS-keyed
+  gravity assertion would be vacuous in CI. The Phase-2 canary side-steps this with a constructed place;
+  if a future test genuinely needs a real dynamic-body scene in CI, populate the submodule or add a
+  tiny `corpus_projects/GravityProps` project (Slice 2.2, currently conditional).
+
+## Phase-1 detailed-design re-scope (dual-voice review — Model-carrier dynamics is a SEPARATE converter concern)
+- **Make no-mesh-parent / multi-sub-mesh Unity Rigidbodies actually DYNAMIC in the converter.**
+  Today a Rigidbody on a no-mesh parent with children (scene_converter.py:1886) or a multi-sub-mesh
+  lowering (1923) becomes a `Model` CARRIER: the `_UnityMass` + GravityScale/UseGravity/anchored facts
+  are stamped on the outer Model (2024 + 2789-2814), but the Model's descendant BaseParts have no own
+  Rigidbody so they are emitted **Anchored** (RbxPart.anchored default True, core/roblox_types.py:178).
+  The converted body is therefore effectively STATIC — it does not free-fall regardless of gravity.
+  FIX (separate converter change, NOT this feature): lower the parent-Rigidbody state (unanchored +
+  the mass) onto a representative descendant BasePart so the carrier's assembly actually simulates.
+  IMPACT on gravity correction: the scale-faithful gravity feature is already CLASS-AGNOSTIC in its
+  scan, so once such carriers become dynamic (their representative part unanchored) the existing
+  skip-if-anchored rule stops firing and the helper corrects them AUTOMATICALLY — no change to the
+  gravity feature is required. The gravity feature does NOT regress these carriers today (they are
+  static with or without it; the helper correctly skips them and does NOT tag them, so they remain
+  correctable the moment the converter makes them dynamic).
+
+## Phase-1 HARDEN targets (slice-1.1 review P2s — non-blocking, address in Stage 4.5)
+- project_gravity.py `_GRAVITY_LINE_RE`: `[^}]` matches newlines → constrain to `[^}\r\n]*` so a
+  malformed m_Gravity line (missing `}`) falls back to the 9.81 default instead of mis-parsing; add a
+  malformed-line regression test.
+- test_gravity_plan_field_emit.py (AC16): add the no-key companion case — assert `gravityDesiredBaseStuds`
+  is ABSENT from the emitted plan .source when not stashed (pins the deterministic fallback).
+
+## Phase-1 HARDEN targets (slice-1.2 review P2s — non-blocking, Stage 4.5)
+- test_gravity_correction_emit.py AC8c/AC8e: strengthen so BOTH scan surfaces (boot sweep + DescendantAdded)
+  are asserted guarded with the _UnityMass/_Rigidbody2D predicate, and the scan is NOT gated by IsA("BasePart")
+  (assert the predicate appears twice / class-agnostic). Pins against a BasePart-only or dropped-2D-check regression.
+- test_gravity_correction_emit.py AC16b: drive plan_scene_runtime() on the same Pipeline instance before
+  _subphase_inject_gravity_correction (real producer→consumer hop), not a manually-seeded dict; add a
+  context save/load round-trip if AC16b is meant to cover resume rehydration.
+
+## Phase-1 HARDEN target (slice-1.4 review P2 — non-blocking, Stage 4.5)
+- test_gravity_correction_parity.py: make the mirror-extraction anchors whitespace-insensitive (locate
+  open/close sentinels after splitlines()/strip() or via an indent-insensitive regex) so a wrapper-only
+  reindent doesn't trip the hard-error path before the helper-body comparison runs.
+
+## Phase-2 HARDEN target (slice-2.1 review P2 — non-blocking, Stage 4.5)
+- test_gravity_correction_canary.py _s4_welded_assembly: model the REAL welded-assembly representation
+  (RbxConstraint/WeldConstraint, whatever the converter emits for Unity FixedJoint) and assert the weld
+  relation in the anti-vacuity check, so the S4 shape is genuinely covered (not just two co-located parts).
+
+## Residuals after finalize (non-blocking, both voices agree no P1)
+- Aggregate test: add one CI test driving the full client chain (plan_scene_runtime stash →
+  generate_scene_runtime_plan_module emit → assert gravityDesiredBaseStuds present for the client
+  _correctClonedDynamics consumer). Currently covered in pieces + Studio acceptance.
+- Dead defensive `gravityScaleAttr or 1.0` read in the shared helper (both mirrored sites): dead for
+  in-scope 3D (GravityScale is 2D-only/excluded). Kept defensively; remove only if it ever earns its keep
+  (removal churns both parity sites + the parity token list).
+- S3/S6 Model-carrier dynamic bodies: anchored/static in today's converter output → not corrected (no
+  free-fall to correct). Making no-mesh-parent / multi-sub-mesh rigidbodies dynamic is separate converter work.
+
+## HANDOFF (cross-run contracts introduced this run — land in converter/docs/design before next run)
+HANDOFF: [gravity] SceneGravityCorrection — a standalone generic SERVER script emitted to
+ServerScriptService whenever the converted Workspace (scene ∪ prefab templates) has a dynamic 3D
+_UnityMass body; boot workspace:GetDescendants() sweep + deferred DescendantAdded; client
+instantiatePrefab clone-site hook in scene_runtime.luau. Shared correctDynamicAssembly helper
+(token-identical across autogen._GRAVITY_CORRECTION_HELPER_LUAU and the scene_runtime.luau mirror,
+pinned by test_gravity_correction_parity.py). Force.Y = AssemblyMass*(workspace.Gravity -
+|unity_g|*gravityScale*STUDS_PER_METER); _ScaleGravityCorrected tag = idempotency. Document in the
+scene-runtime contract doc before a future run touches the host runtime.
+HANDOFF: [gravity] _Rigidbody2D attribute — stamped unconditionally at the Rigidbody2D branch
+(scene_converter.py 2D branch) AND added to the mesh-wrap move-list so it co-locates with _UnityMass;
+2D bodies are EXCLUDED from gravity correction (Physics2D out of scope). Future 2D work keys off this.
+HANDOFF: [gravity] gravityDesiredBaseStuds — plan field (in _PLAN_KEYS_FOR_HOST) carrying
+|unity_g|*STUDS_PER_METER, parsed early in plan_scene_runtime from DynamicsManager m_Gravity (abs(y),
+9.81 default). Consumed by the client clone-site hook; baked into the server script.

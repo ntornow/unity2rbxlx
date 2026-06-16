@@ -35,7 +35,7 @@ from core.unity_types import (
     ParsedScene,
     PrefabLibrary,
 )
-from core.roblox_types import RbxPlace, RbxScript, ScriptType
+from core.roblox_types import RbxPart, RbxPlace, RbxScript, ScriptType
 from converter.animation_converter import AnimationConversionResult
 from converter.code_transpiler import TranspilationResult
 from converter.material_mapper import MaterialMapping
@@ -1046,6 +1046,21 @@ class Pipeline:
         # Persist directly on the context; the structural type belongs to
         # the planner module (avoids a core→converter dependency).
         self.ctx.scene_runtime = dict(artifact)
+
+        # Phase 1 (relation #8): parse the REAL project gravity ONCE, EARLY, and
+        # stash the scale-faithful base target accel (studs/s²). This MUST run
+        # here, before the SceneRuntimePlan ModuleScript is emitted in
+        # ``_subphase_inject_scene_runtime`` -- that emit serializes only keys
+        # already present in ``scene_runtime`` AND in ``_PLAN_KEYS_FOR_HOST``, so
+        # parsing later would never reach the plan (the client hook would fall
+        # back to a frozen 9.81). One parse, two consumers: the client reads it
+        # from the emitted plan field; the standalone server script reads the same
+        # stash to bake its literal.
+        from converter.project_gravity import parse_project_gravity_y
+        self.ctx.scene_runtime["gravityDesiredBaseStuds"] = (
+            parse_project_gravity_y(self.unity_project_path)
+            * _config.STUDS_PER_METER
+        )
 
         modules = artifact["modules"]
         runtime_bearing = sum(
@@ -2556,6 +2571,12 @@ return table.concat(allData, "\\n")'''
         # routing into the storage plan as an explicit decision.
         "_classify_late_appended_scripts",
         "_generate_prefab_packages",
+        # Phase 1 (relation #8): emit the standalone scale-faithful-gravity
+        # server script. Runs AFTER _generate_prefab_packages so the emit-gate
+        # can scan replicated_templates (materialized there) as well as scene
+        # workspace_parts -- a prefab-clone-only game has no dynamic part in
+        # workspace_parts but still needs the correction.
+        "_subphase_inject_gravity_correction",
         "_subphase_encode_terrain",
         "_subphase_inject_mesh_loader",
         "_subphase_patch_setup_sounds",
@@ -2694,6 +2715,7 @@ return table.concat(allData, "\\n")'''
         self._subphase_inject_scene_runtime()
         self._classify_late_appended_scripts()
         self._generate_prefab_packages()
+        self._subphase_inject_gravity_correction()
         self._subphase_encode_terrain()
         self._subphase_inject_mesh_loader()
 
@@ -6288,6 +6310,114 @@ script.Disabled = true
 
         if injected:
             log.info("[write_output] Injected %d runtime library modules", injected)
+
+    @staticmethod
+    def _part_tree_has_dynamic_unitymass(parts: Iterable[RbxPart]) -> bool:
+        """True if any RbxPart in the tree (recursive) carries a numeric
+        ``_UnityMass`` attribute AND is NOT a ``Rigidbody2D`` carrier.
+
+        ``_UnityMass`` is stamped on unanchored dynamic bodies
+        (scene_converter.py:2803) BEFORE the 2D/3D split, so it catches BOTH 3D
+        ``Rigidbody`` and ``Rigidbody2D`` bodies; a 2D carrier additionally
+        carries ``_Rigidbody2D=True`` (the scene_converter.py:2805 branch).
+        ``_Rigidbody2D`` is co-located with ``_UnityMass`` on the SAME RbxPart
+        for every carrier -- including the mesh-wrapped shape S2, where both
+        attributes move to the inner ``*_Mesh`` part via the move-list
+        (scene_converter.py:2181-2187) -- so this per-part check correctly skips a
+        wrapped 2D body. Physics2D is OUT OF SCOPE, so a part with ``_Rigidbody2D``
+        set does NOT count toward 'a (correctable, 3D) dynamic body exists' --
+        else a 2D-only game would emit the (3D) correction script with no
+        correctable body. Anchored/Humanoid filtering happens at runtime, not
+        here -- the gate decides ONLY whether to emit the script at all.
+        """
+        for part in parts:
+            attrs = part.attributes or {}
+            unity_mass = attrs.get("_UnityMass")
+            if isinstance(unity_mass, (int, float)) and not isinstance(
+                unity_mass, bool
+            ):
+                if attrs.get("_Rigidbody2D") is None:
+                    return True
+            if part.children and Pipeline._part_tree_has_dynamic_unitymass(
+                part.children
+            ):
+                return True
+        return False
+
+    def _subphase_inject_gravity_correction(self) -> None:
+        """Emit the standalone scale-faithful-gravity SERVER script whenever a
+        dynamic ``_UnityMass`` body exists in the scene workspace OR a prefab
+        template. Generic scene-runtime mode only. Decoupled from the
+        host-runtime emit gate (a game can have dynamic props and zero
+        runtime-bearing modules).
+
+        Phase 1 (relation #8): the standalone ``SceneGravityCorrection`` Script
+        bakes the scale-faithful base accel (``|unity_g.y| * STUDS_PER_METER``)
+        already parsed+stashed by ``plan_scene_runtime`` (one parse, two
+        consumers). Idempotent on ``--phase write_output`` resumes via the
+        autogen marker.
+        """
+        if self.ctx.scene_runtime_mode != "generic":
+            return
+        rbx_place = self.state.rbx_place
+        if rbx_place is None:
+            return
+
+        has_dynamic = (
+            self._part_tree_has_dynamic_unitymass(rbx_place.workspace_parts or [])
+            or self._part_tree_has_dynamic_unitymass(
+                rbx_place.replicated_templates or []
+            )
+        )
+        if not has_dynamic:
+            return
+
+        # Scalar source: the value stashed by ``plan_scene_runtime`` (§1.1). Use
+        # an explicit ``is None`` check, NOT ``or`` -- in Python ``0.0`` is falsy,
+        # so a valid zero-gravity project (m_Gravity.y == 0) must NOT fall through
+        # to the default. The client plan path preserves the stashed 0; the
+        # server path must too (one parse, two consumers).
+        from converter.project_gravity import DEFAULT_UNITY_GRAVITY_Y
+        stashed = (self.ctx.scene_runtime or {}).get("gravityDesiredBaseStuds")
+        desired = (
+            stashed
+            if stashed is not None
+            else (DEFAULT_UNITY_GRAVITY_Y * _config.STUDS_PER_METER)
+        )
+
+        from converter.autogen import generate_gravity_correction_server_script
+
+        source = generate_gravity_correction_server_script(float(desired))
+        marker = "-- SceneGravityCorrection (auto-generated; relation #8"
+
+        # Idempotency: drop any prior autogen ``SceneGravityCorrection`` (carries
+        # our marker), keep a user-owned same-name script, then append the fresh
+        # one. Mirrors ``_subphase_inject_scene_runtime``'s _replace_or_add.
+        new_scripts: list[RbxScript] = []
+        user_owned = False
+        for s in rbx_place.scripts:
+            if s.name != "SceneGravityCorrection":
+                new_scripts.append(s)
+                continue
+            if marker in (s.source or ""):
+                continue  # prior autogen artifact -- drop, re-emit fresh
+            new_scripts.append(s)
+            user_owned = True
+        if user_owned:
+            log.warning(
+                "[write_output] gravity correction: a non-autogen script named "
+                "'SceneGravityCorrection' already exists; skipping emit to "
+                "avoid clobbering user-owned content"
+            )
+            rbx_place.scripts = new_scripts
+            return
+        new_scripts.append(RbxScript(
+            name="SceneGravityCorrection",
+            source=source,
+            script_type="Script",
+            parent_path="ServerScriptService",
+        ))
+        rbx_place.scripts = new_scripts
 
     def _subphase_inject_scene_runtime(self) -> None:
         """PR4: emit the scene-runtime host runtime + plan + entrypoints.
