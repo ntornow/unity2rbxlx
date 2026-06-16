@@ -977,6 +977,108 @@ def test_real_require_with_string_arg_still_registers_after_string_strip():
     assert extract_require_edges(src, frozenset({"RealMod"})) == {"RealMod"}
 
 
+# ---------------------------------------------------------------------------
+# Round-4 BLOCKING: a ``--`` INSIDE a string literal must NOT be treated as a
+# comment. The old two-pass parser stripped ``--...`` to EOL BEFORE detecting
+# string spans, so a ``--`` inside any string TRUNCATED the line and suppressed
+# a LATER real ``require(...)`` edge -- dropping a live require-edge (the dead
+# partitioner then false-pruned a still-required helper / left a client-required
+# helper in ServerStorage). The single string-aware scanner fixes this for every
+# string form. Each test below FAILS pre-fix (real edge dropped -> set()).
+# ---------------------------------------------------------------------------
+
+
+def test_dashdash_in_double_quoted_string_keeps_later_require_same_line():
+    """A ``--`` inside a double-quoted string is string content, not a comment;
+    a real require LATER ON THE SAME LINE still registers."""
+    src = (
+        'local s = "-- not a comment"; '
+        "local M=require(game.ReplicatedStorage.Real)"
+    )
+    assert extract_require_edges(src, frozenset({"Real"})) == {"Real"}
+
+
+def test_dashdash_in_double_quoted_string_keeps_require_next_line():
+    """``--`` inside a double-quoted string does not swallow a require on the
+    NEXT line."""
+    src = (
+        'local s = "-- not a comment"\n'
+        "local M=require(game.ReplicatedStorage.Real)"
+    )
+    assert extract_require_edges(src, frozenset({"Real"})) == {"Real"}
+
+
+def test_dashdash_in_single_quoted_string_keeps_later_require_same_line():
+    """``--`` inside a single-quoted string is string content; a real require
+    later on the same line still registers."""
+    src = (
+        "local s = '-- not a comment' "
+        "local M=require(game.ReplicatedStorage.Real)"
+    )
+    assert extract_require_edges(src, frozenset({"Real"})) == {"Real"}
+
+
+def test_dashdash_in_single_quoted_string_keeps_require_next_line():
+    """``--`` inside a single-quoted string does not swallow a require on the
+    next line."""
+    src = (
+        "local s = '-- not a comment'\n"
+        "local M=require(game.ReplicatedStorage.Real)"
+    )
+    assert extract_require_edges(src, frozenset({"Real"})) == {"Real"}
+
+
+def test_dashdash_in_long_bracket_string_keeps_later_require_same_line():
+    """``--`` inside a ``[[ ... ]]`` long-bracket string is string content; a
+    real require later on the same line still registers."""
+    src = (
+        "local s=[[-- not a comment]] "
+        "local M=require(game.ReplicatedStorage.Real)"
+    )
+    assert extract_require_edges(src, frozenset({"Real"})) == {"Real"}
+
+
+def test_dashdash_in_long_bracket_string_keeps_require_next_line():
+    """``--`` inside a ``[[ ... ]]`` long-bracket string does not swallow a
+    require on the next line."""
+    src = (
+        "local s=[[-- not a comment]]\n"
+        "local M=require(game.ReplicatedStorage.Real)"
+    )
+    assert extract_require_edges(src, frozenset({"Real"})) == {"Real"}
+
+
+def test_dashdash_in_level_long_bracket_string_keeps_require_next_line():
+    """``--`` inside a leveled ``[=[ ... ]=]`` long-bracket string is string
+    content; a real require on the next line still registers."""
+    src = (
+        "local s=[=[-- not a comment]=]\n"
+        "local M=require(game.ReplicatedStorage.Real)"
+    )
+    assert extract_require_edges(src, frozenset({"Real"})) == {"Real"}
+
+
+def test_block_comment_containing_require_is_not_an_edge():
+    """A ``--[[ ... ]]`` BLOCK comment containing a ``require(...)`` is a
+    comment, not real code -- no edge. (The opener inside the block is comment
+    content, never a string.)"""
+    src = (
+        "--[[ local M=require(game.ReplicatedStorage.Real) ]]\n"
+        "local x = 1"
+    )
+    assert extract_require_edges(src, frozenset({"Real"})) == set()
+
+
+def test_level_block_comment_containing_require_is_not_an_edge():
+    """A leveled ``--[=[ ... ]=]`` block comment containing a ``require(...)``
+    is a comment -- no edge."""
+    src = (
+        "--[=[ local M=require(game.ReplicatedStorage.Real) ]=]\n"
+        "local x = 1"
+    )
+    assert extract_require_edges(src, frozenset({"Real"})) == set()
+
+
 def test_waitforchild_edge_blocks_false_prune():
     """P1-c end-to-end: a LIVE module requiring a dead one via WaitForChild
     keeps the dead module inert (the edge is visible to the partitioner)."""
