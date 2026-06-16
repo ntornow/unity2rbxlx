@@ -43,7 +43,7 @@ from converter.storage_classifier import (  # noqa: E402
     SERVER_STORAGE,
     STARTER_PLAYER_SCRIPTS,
 )
-from core.roblox_types import RbxScript  # noqa: E402
+from core.roblox_types import RbxScript, ScriptType  # noqa: E402
 
 
 def _mk_module(
@@ -58,8 +58,13 @@ def _mk_module(
 
 def _mk_script(
     name: str, source: str = "", parent_path: str | None = None,
+    script_type: str = "ModuleScript",
 ) -> RbxScript:
-    s = RbxScript(name=name, source=source, script_type="ModuleScript")
+    s = RbxScript(
+        name=name, source=source,
+        script_type=cast("ScriptType", script_type),
+    )
+    s.intrinsic_script_type = cast("ScriptType", script_type)
     s.parent_path = parent_path
     return s
 
@@ -73,6 +78,46 @@ def _mk_artifact(
         "prefabs": {},
         "domain_overrides": {},
     })
+
+
+def _require(name: str) -> str:
+    """Emitted-require Luau fragment that ``extract_require_edges`` reads
+    as an edge to ``name``."""
+    return f'require(script.Parent:FindFirstChild("{name}"))\n'
+
+
+def _edges(
+    scripts: list[RbxScript],
+) -> dict[str, set[str]]:
+    """Build the ``require_edges_by_name`` graph the prepass walks, the
+    same way ``_maybe_run_topology_prepass`` does."""
+    from converter.roblox_dead_modules import extract_require_edges
+
+    known = frozenset(s.name for s in scripts if s.name)
+    return {
+        s.name: extract_require_edges(s.source, known)
+        for s in scripts if s.name
+    }
+
+
+def _by_sid(
+    modules: dict[str, dict[str, object]],
+    scripts: list[RbxScript],
+) -> dict[str, RbxScript]:
+    """Build ``script_id -> RbxScript`` via the canonical join, the same
+    way ``_maybe_run_topology_prepass`` does."""
+    from converter.scene_runtime_planner import build_script_id_by_name
+
+    by_name = {s.name: s for s in scripts if s.name}
+    sid_by_name = build_script_id_by_name(
+        scripts,
+        cast("dict[str, object]", modules),
+    )
+    return {
+        sid: by_name[name]
+        for name, sid in sid_by_name.items()
+        if name in by_name
+    }
 
 
 class TestInferModuleDomainsPureness:
@@ -157,91 +202,9 @@ class TestInferModuleDomainsPureness:
 
 class TestDeriveReachabilityRequirementsParity:
     def test_client_only_helper_routes_to_replicated_storage(self) -> None:
-        """A helper required only by a client-domain module must surface
-        a ``REPLICATED_STORAGE`` requirement.
-        """
-        modules = dict([
-            _mk_module("g-client", "ClientA"),
-            _mk_module("g-helper", "Helper"),
-        ])
-        artifact = _mk_artifact(modules)
-        scripts = [
-            _mk_script("ClientA", "Players.LocalPlayer"),
-            _mk_script("Helper", "return {}"),
-        ]
-        dep_map = {"ClientA": ["Helper"]}
-        domains = infer_module_domains(
-            artifact, scripts, dependency_map=dep_map,
-        )
-        reqs = derive_reachability_requirements(
-            artifact, scripts, domains, dependency_map=dep_map,
-        )
-        assert reqs.get("g-helper") == REPLICATED_STORAGE
-
-    def test_both_sides_helper_marked_excluded(self) -> None:
-        """A helper required by BOTH client and server must be flagged
-        for exclusion (reachability_conflict).
-        """
-        modules = dict([
-            _mk_module("g-client", "ClientA"),
-            _mk_module("g-server", "ServerA"),
-            _mk_module("g-helper", "Helper"),
-        ])
-        artifact = _mk_artifact(modules)
-        scripts = [
-            _mk_script("ClientA", "Players.LocalPlayer"),
-            _mk_script("ServerA", ".OnServerEvent"),
-            _mk_script("Helper", "return {}"),
-        ]
-        dep_map = {"ClientA": ["Helper"], "ServerA": ["Helper"]}
-        domains = infer_module_domains(
-            artifact, scripts, dependency_map=dep_map,
-        )
-        reqs = derive_reachability_requirements(
-            artifact, scripts, domains, dependency_map=dep_map,
-        )
-        assert reqs.get("g-helper") == "__excluded__"
-
-    def test_unreached_helper_has_no_requirement(self) -> None:
-        """Helpers not in the client closure should not appear at all.
-        """
-        modules = dict([
-            _mk_module("g-server", "ServerA"),
-            _mk_module("g-helper", "Helper"),
-        ])
-        artifact = _mk_artifact(modules)
-        scripts = [
-            _mk_script("ServerA", ".OnServerEvent"),
-            _mk_script("Helper", "return {}"),
-        ]
-        dep_map = {"ServerA": ["Helper"]}
-        domains = infer_module_domains(
-            artifact, scripts, dependency_map=dep_map,
-        )
-        reqs = derive_reachability_requirements(
-            artifact, scripts, domains, dependency_map=dep_map,
-        )
-        assert "g-helper" not in reqs
-
-    def test_empty_dep_map_returns_empty(self) -> None:
-        """No dep_map => nothing reachable => empty requirements map.
-        Matches the legacy ``_apply_reachability_rule`` early-out.
-        """
-        modules = dict([_mk_module("g-client", "ClientA")])
-        artifact = _mk_artifact(modules)
-        scripts = [_mk_script("ClientA", "Players.LocalPlayer")]
-        domains = infer_module_domains(artifact, scripts)
-        reqs = derive_reachability_requirements(
-            artifact, scripts, domains, dependency_map=None,
-        )
-        assert reqs == {}
-
-
-class TestFinalizeTopologyContainersIdempotent:
-    def test_finalize_twice_produces_same_row(self) -> None:
-        """``finalize_topology_containers`` must be safely re-runnable
-        (PR1 invariant: classifier idempotency). Reachability hoist
-        path included.
+        """AC4: a helper module required only by a client ENTRY
+        (LocalScript) via an emitted require surfaces a
+        ``REPLICATED_STORAGE`` requirement.
         """
         modules = dict([
             _mk_module("g-client", "ClientA"),
@@ -250,19 +213,345 @@ class TestFinalizeTopologyContainersIdempotent:
         artifact = _mk_artifact(modules)
         scripts = [
             _mk_script(
-                "ClientA", "Players.LocalPlayer",
+                "ClientA", _require("Helper"), script_type="LocalScript",
+            ),
+            _mk_script("Helper", "return {}"),
+        ]
+        domains = infer_module_domains(artifact, scripts)
+        reqs = derive_reachability_requirements(
+            artifact, scripts, domains,
+            require_edges_by_name=_edges(scripts),
+            script_by_sid=_by_sid(modules, scripts),
+            lifecycle_roles={},
+        )
+        assert reqs.get("g-helper") == REPLICATED_STORAGE
+
+    def test_both_sides_helper_marked_excluded(self) -> None:
+        """AC1: a helper module required by BOTH a client LocalScript
+        entry AND a server Script must be flagged ``__excluded__``.
+        """
+        modules = dict([
+            _mk_module("g-client", "ClientA"),
+            _mk_module("g-server", "ServerA"),
+            _mk_module("g-helper", "Helper"),
+        ])
+        artifact = _mk_artifact(modules)
+        scripts = [
+            _mk_script(
+                "ClientA", _require("Helper"), script_type="LocalScript",
+            ),
+            _mk_script(
+                "ServerA", ".OnServerEvent\n" + _require("Helper"),
+                script_type="Script",
+            ),
+            _mk_script("Helper", "return {}"),
+        ]
+        domains = infer_module_domains(artifact, scripts)
+        reqs = derive_reachability_requirements(
+            artifact, scripts, domains,
+            require_edges_by_name=_edges(scripts),
+            script_by_sid=_by_sid(modules, scripts),
+            lifecycle_roles={},
+        )
+        assert reqs.get("g-helper") == "__excluded__"
+
+    def test_unreached_helper_has_no_requirement(self) -> None:
+        """AC5: a helper not in the client closure produces no entry.
+        """
+        modules = dict([
+            _mk_module("g-server", "ServerA"),
+            _mk_module("g-helper", "Helper"),
+        ])
+        artifact = _mk_artifact(modules)
+        scripts = [
+            _mk_script(
+                "ServerA", ".OnServerEvent\n" + _require("Helper"),
+                script_type="Script",
+            ),
+            _mk_script("Helper", "return {}"),
+        ]
+        domains = infer_module_domains(artifact, scripts)
+        reqs = derive_reachability_requirements(
+            artifact, scripts, domains,
+            require_edges_by_name=_edges(scripts),
+            script_by_sid=_by_sid(modules, scripts),
+            lifecycle_roles={},
+        )
+        assert "g-helper" not in reqs
+
+    def test_empty_edges_returns_empty(self) -> None:
+        """No emitted-require graph => nothing reachable => empty map.
+        Matches the legacy early-out.
+        """
+        modules = dict([_mk_module("g-client", "ClientA")])
+        artifact = _mk_artifact(modules)
+        scripts = [
+            _mk_script(
+                "ClientA", "Players.LocalPlayer", script_type="LocalScript",
+            ),
+        ]
+        domains = infer_module_domains(artifact, scripts)
+        reqs = derive_reachability_requirements(
+            artifact, scripts, domains,
+            require_edges_by_name={},
+            script_by_sid=_by_sid(modules, scripts),
+            lifecycle_roles={},
+        )
+        assert reqs == {}
+
+    def test_low_confidence_client_script_does_not_seed_server_subtree(
+        self,
+    ) -> None:
+        """AC2: a Script with inferred ``domain==client`` but
+        ``low_confidence==True`` (zero-signal ``networking=none``
+        fallback) is NOT a client seed, so a server-only module it
+        transitively requires gets NO reachability requirement.
+        """
+        modules = dict([
+            _mk_module("g-weak", "WeakClient"),
+            _mk_module("g-srvmod", "ServerMod"),
+        ])
+        artifact = _mk_artifact(modules)
+        # WeakClient: a plain Script with no strong signal -> the
+        # zero-signal fallback classifies it client+low_confidence.
+        scripts = [
+            _mk_script(
+                "WeakClient", _require("ServerMod"), script_type="Script",
+            ),
+            _mk_script("ServerMod", "return {}"),
+        ]
+        domains = infer_module_domains(artifact, scripts)
+        assert domains["g-weak"]["domain"] == "client"
+        assert domains["g-weak"]["low_confidence"] is True
+        reqs = derive_reachability_requirements(
+            artifact, scripts, domains,
+            require_edges_by_name=_edges(scripts),
+            script_by_sid=_by_sid(modules, scripts),
+            lifecycle_roles={},
+        )
+        assert "g-srvmod" not in reqs
+
+    def test_low_confidence_loader_role_script_does_not_seed_server_subtree(
+        self,
+    ) -> None:
+        """Security regression (round 2, codex BLOCKING): a zero-signal
+        plain ``Script`` with a loader-NAME (``Bootstrap``) infers
+        ``domain==client + low_confidence==True``, and
+        ``derive_module_lifecycle_role`` returns role ``"loader"`` for it.
+        The lifecycle-role seed arm MUST gate on ``low_confidence is
+        False`` so this row does NOT seed — otherwise its server-only
+        require subtree (``ServerSecret``, which uses DataStoreService)
+        leaks into ReplicatedStorage.
+        """
+        modules = dict([
+            _mk_module("g-boot", "Bootstrap"),
+            _mk_module("g-secret", "ServerSecret"),
+        ])
+        artifact = _mk_artifact(modules)
+        scripts = [
+            # Bootstrap: a plain Script, no domain signal -> client +
+            # low_confidence. Its name trips the broad ``is_loader`` regex,
+            # so its lifecycle role is "loader".
+            _mk_script(
+                "Bootstrap", _require("ServerSecret"), script_type="Script",
+            ),
+            _mk_script(
+                "ServerSecret",
+                'game:GetService("DataStoreService")\nreturn {}',
+            ),
+        ]
+        domains = infer_module_domains(artifact, scripts)
+        assert domains["g-boot"]["domain"] == "client"
+        assert domains["g-boot"]["low_confidence"] is True
+        assert domains["g-secret"]["domain"] == "server"
+        reqs = derive_reachability_requirements(
+            artifact, scripts, domains,
+            require_edges_by_name=_edges(scripts),
+            script_by_sid=_by_sid(modules, scripts),
+            # The role arm would seed g-boot WITHOUT the low_confidence
+            # gate; pass the genuine "loader" role to exercise that arm.
+            lifecycle_roles={"g-boot": "loader"},
+        )
+        # The low-confidence loader must NOT seed: the server module gets
+        # NO reachability requirement and stays out of ReplicatedStorage.
+        assert "g-secret" not in reqs
+
+    def test_server_domain_module_client_required_gets_rs_transitively(
+        self,
+    ) -> None:
+        """AC3 (cascade fix): a module with ``domain==server`` (e.g. a
+        DataStoreService signal) that a client LocalScript transitively
+        requires becomes client-visible — proving the domain-vs-placement
+        mismatch is fixed. The intermediate is ALSO a server seed (its
+        domain is server), so it + its deep helper are reached from both
+        sides -> ``__excluded__``; the storage classifier routes
+        ``__excluded__`` to ReplicatedStorage, so both are client-visible.
+        Deep transitive coverage is exercised (DeepHelper, not just the
+        direct require, gets a requirement).
+        """
+        modules = dict([
+            _mk_module("g-entry", "LocalEntry"),
+            _mk_module("g-srvdom", "ServerDomainMod"),
+            _mk_module("g-deep", "DeepHelper"),
+        ])
+        artifact = _mk_artifact(modules)
+        scripts = [
+            _mk_script(
+                "LocalEntry", _require("ServerDomainMod"),
+                script_type="LocalScript",
+            ),
+            # ServerDomainMod has a server-domain signal but is a
+            # ModuleScript required by the client entry.
+            _mk_script(
+                "ServerDomainMod",
+                "game:GetService(\"DataStoreService\")\n"
+                + _require("DeepHelper"),
+            ),
+            _mk_script("DeepHelper", "return {}"),
+        ]
+        domains = infer_module_domains(artifact, scripts)
+        assert domains["g-srvdom"]["domain"] == "server"
+        reqs = derive_reachability_requirements(
+            artifact, scripts, domains,
+            require_edges_by_name=_edges(scripts),
+            script_by_sid=_by_sid(modules, scripts),
+            lifecycle_roles={},
+        )
+        # Per-candidate self-exclusion: for candidate ServerDomainMod the
+        # only server seed is ITSELF, excluded from its own server
+        # closure -> not server-reached -> plain RS. DeepHelper IS reached
+        # by the server seed ServerDomainMod -> both-sides -> __excluded__.
+        # Both route to ReplicatedStorage at the storage classifier, so
+        # the cascade-fix property holds: neither is left server-only.
+        assert reqs.get("g-srvdom") == REPLICATED_STORAGE
+        assert reqs.get("g-deep") == "__excluded__"
+
+    def test_client_required_low_conf_helper_not_a_seed_gets_rs(self) -> None:
+        """AC3 variant: a ModuleScript with NO domain signal — so it
+        infers client-default + low_confidence, NOT a server seed — that
+        is reached ONLY via the client LocalScript entry. Because no
+        server Script seeds it, the client-reached helper + its deep dep
+        both route to plain ``REPLICATED_STORAGE`` (no both-sides
+        conflict). (Despite the historical ``SrvHelper`` name this row
+        carries zero server signal; the name is incidental.)
+        """
+        modules = dict([
+            _mk_module("g-entry", "LocalEntry2"),
+            _mk_module("g-srvhelper", "SrvHelper"),
+            _mk_module("g-deep", "Deep2"),
+        ])
+        artifact = _mk_artifact(modules)
+        scripts = [
+            _mk_script(
+                "LocalEntry2", _require("SrvHelper"),
+                script_type="LocalScript",
+            ),
+            # SrvHelper: a ModuleScript with no domain signal -> client
+            # default (low_confidence) -> NOT a server seed. It is reached
+            # only via the client entry.
+            _mk_script("SrvHelper", _require("Deep2")),
+            _mk_script("Deep2", "return {}"),
+        ]
+        domains = infer_module_domains(artifact, scripts)
+        # Confirm the fixture is what the docstring claims: low-confidence
+        # client-default, not a server verdict.
+        assert domains["g-srvhelper"]["domain"] == "client"
+        assert domains["g-srvhelper"]["low_confidence"] is True
+        reqs = derive_reachability_requirements(
+            artifact, scripts, domains,
+            require_edges_by_name=_edges(scripts),
+            script_by_sid=_by_sid(modules, scripts),
+            lifecycle_roles={},
+        )
+        assert reqs.get("g-srvhelper") == REPLICATED_STORAGE
+        assert reqs.get("g-deep") == REPLICATED_STORAGE
+
+    def test_transpile_ran_false_returns_empty(self) -> None:
+        """AC6: with ``transpile_ran=False`` the function returns ``{}``
+        even when ``RbxScript.source`` carries emitted requires on disk
+        (byte-identical resume contract).
+        """
+        modules = dict([
+            _mk_module("g-client", "ClientA"),
+            _mk_module("g-helper", "Helper"),
+        ])
+        artifact = _mk_artifact(modules)
+        scripts = [
+            _mk_script(
+                "ClientA", _require("Helper"), script_type="LocalScript",
+            ),
+            _mk_script("Helper", "return {}"),
+        ]
+        domains = infer_module_domains(artifact, scripts)
+        reqs = derive_reachability_requirements(
+            artifact, scripts, domains,
+            require_edges_by_name=_edges(scripts),
+            script_by_sid=_by_sid(modules, scripts),
+            lifecycle_roles={},
+            transpile_ran=False,
+        )
+        assert reqs == {}
+
+    def test_local_script_module_row_never_constrained(self) -> None:
+        """AC11: a LocalScript-backed module row that is in the client
+        closure (it's a seed) receives NO reachability requirement —
+        the candidate predicate restricts to intrinsic ``ModuleScript``,
+        so rule-3 never reroutes a LocalScript to ReplicatedStorage.
+        """
+        modules = dict([
+            _mk_module("g-hud", "Hud"),
+            _mk_module("g-helper", "Helper"),
+        ])
+        artifact = _mk_artifact(modules)
+        scripts = [
+            _mk_script(
+                "Hud", _require("Helper"), script_type="LocalScript",
+            ),
+            _mk_script("Helper", "return {}"),
+        ]
+        domains = infer_module_domains(artifact, scripts)
+        reqs = derive_reachability_requirements(
+            artifact, scripts, domains,
+            require_edges_by_name=_edges(scripts),
+            script_by_sid=_by_sid(modules, scripts),
+            lifecycle_roles={},
+        )
+        # The LocalScript row is a SEED, never a candidate.
+        assert "g-hud" not in reqs
+        # Its required helper IS a ModuleScript candidate -> RS.
+        assert reqs.get("g-helper") == REPLICATED_STORAGE
+
+
+class TestFinalizeTopologyContainersIdempotent:
+    def test_finalize_twice_produces_same_row(self) -> None:
+        """AC8: ``finalize_topology_containers`` must be safely
+        re-runnable (PR1 invariant: classifier idempotency). Reachability
+        hoist path included.
+        """
+        modules = dict([
+            _mk_module("g-client", "ClientA"),
+            _mk_module("g-helper", "Helper"),
+        ])
+        artifact = _mk_artifact(modules)
+        scripts = [
+            _mk_script(
+                "ClientA", _require("Helper"),
                 parent_path=STARTER_PLAYER_SCRIPTS,
+                script_type="LocalScript",
             ),
             _mk_script("Helper", "return {}", parent_path=SERVER_STORAGE),
         ]
-        dep_map = {"ClientA": ["Helper"]}
-        domains = infer_module_domains(
-            artifact, scripts, dependency_map=dep_map,
-        )
+        domains = infer_module_domains(artifact, scripts)
+        by_sid = _by_sid(modules, scripts)
         reqs = derive_reachability_requirements(
-            artifact, scripts, domains, dependency_map=dep_map,
+            artifact, scripts, domains,
+            require_edges_by_name=_edges(scripts),
+            script_by_sid=by_sid,
+            lifecycle_roles={},
         )
-        finalize_topology_containers(artifact, scripts, domains, reqs)
+        finalize_topology_containers(
+            artifact, scripts, domains, reqs, script_by_sid=by_sid,
+        )
         first_helper = dict(artifact["modules"]["g-helper"])
         first_helper_signals = dict(
             artifact["modules"]["g-helper"]["domain_signals"]
@@ -270,13 +559,295 @@ class TestFinalizeTopologyContainersIdempotent:
         first_helper_parent = scripts[1].parent_path
 
         # Run again; result must match.
-        finalize_topology_containers(artifact, scripts, domains, reqs)
+        finalize_topology_containers(
+            artifact, scripts, domains, reqs, script_by_sid=by_sid,
+        )
         assert dict(artifact["modules"]["g-helper"]) == first_helper
         assert (
             dict(artifact["modules"]["g-helper"]["domain_signals"])
             == first_helper_signals
         )
         assert scripts[1].parent_path == first_helper_parent
+
+    def test_finalizer_collision_case_routes_correct_row_by_sid(
+        self,
+    ) -> None:
+        """AC7: two modules sharing a ``class_name`` (distinct ``sid``s,
+        distinct stems) where one is in the client closure — the prepass
+        routes the reached one by ``sid`` and the finalizer mirrors
+        ``container``/``module_path``/``parent_path`` onto the CORRECT
+        row via ``script_by_sid`` (the class-name join would have dropped
+        BOTH colliding rows).
+        """
+        # Both helper rows share class_name "Util" but have distinct
+        # stems (file names) "UtilA" / "UtilB". script_by_sid joins on
+        # the stem fallback, so each sid resolves to its own script.
+        modules: dict[str, dict[str, object]] = {
+            "g-entry": {
+                "stem": "Entry", "class_name": "Entry",
+                "runtime_bearing": True,
+            },
+            "g-util-a": {
+                "stem": "UtilA", "class_name": "Util",
+                "runtime_bearing": True,
+            },
+            "g-util-b": {
+                "stem": "UtilB", "class_name": "Util",
+                "runtime_bearing": True,
+            },
+        }
+        artifact = _mk_artifact(modules)
+        scripts = [
+            _mk_script(
+                "Entry", _require("UtilA"),
+                parent_path=STARTER_PLAYER_SCRIPTS,
+                script_type="LocalScript",
+            ),
+            _mk_script("UtilA", "return {}", parent_path=SERVER_STORAGE),
+            _mk_script("UtilB", "return {}", parent_path=SERVER_STORAGE),
+        ]
+        domains = infer_module_domains(artifact, scripts)
+        by_sid = _by_sid(modules, scripts)
+        reqs = derive_reachability_requirements(
+            artifact, scripts, domains,
+            require_edges_by_name=_edges(scripts),
+            script_by_sid=by_sid,
+            lifecycle_roles={},
+        )
+        # Only the reached row (UtilA) gets a requirement.
+        assert reqs.get("g-util-a") == REPLICATED_STORAGE
+        assert "g-util-b" not in reqs
+
+        finalize_topology_containers(
+            artifact, scripts, domains, reqs, script_by_sid=by_sid,
+        )
+        # The CORRECT row is mirrored to ReplicatedStorage by sid.
+        assert artifact["modules"]["g-util-a"]["container"] == REPLICATED_STORAGE
+        assert (
+            artifact["modules"]["g-util-a"]["module_path"]
+            == "ReplicatedStorage.UtilA"
+        )
+        assert scripts[1].parent_path == REPLICATED_STORAGE
+        # The non-reached colliding row stays put.
+        assert scripts[2].parent_path == SERVER_STORAGE
+
+    def test_finalizer_excluded_collision_row_gets_container_and_path(
+        self,
+    ) -> None:
+        """Round 2, codex MAJOR: a class-name collision where BOTH a
+        client entry AND a server script require the SAME helper (UtilA)
+        -> the helper is reached from both sides -> ``__excluded__``. The
+        base container/module_path stamping must be sid-aware so the
+        colliding ``__excluded__`` row ends with ``domain=="excluded"``
+        AND a correct ``container``/``module_path`` (not empty). The
+        class-name join alone would have dropped the colliding row,
+        leaving it with no container/module_path.
+        """
+        modules: dict[str, dict[str, object]] = {
+            "g-entry": {
+                "stem": "Entry", "class_name": "Entry",
+                "runtime_bearing": True,
+            },
+            "g-srv": {
+                "stem": "Srv", "class_name": "Srv",
+                "runtime_bearing": True,
+            },
+            # UtilA / UtilB collide on class_name "Util" (distinct stems).
+            "g-util-a": {
+                "stem": "UtilA", "class_name": "Util",
+                "runtime_bearing": True,
+            },
+            "g-util-b": {
+                "stem": "UtilB", "class_name": "Util",
+                "runtime_bearing": True,
+            },
+        }
+        artifact = _mk_artifact(modules)
+        scripts = [
+            _mk_script(
+                "Entry", _require("UtilA"),
+                parent_path=STARTER_PLAYER_SCRIPTS,
+                script_type="LocalScript",
+            ),
+            # Server script (DataStoreService signal) ALSO requires UtilA
+            # -> both-sides reach -> UtilA becomes __excluded__.
+            _mk_script(
+                "Srv",
+                'game:GetService("DataStoreService")\n' + _require("UtilA"),
+                parent_path=SERVER_SCRIPT_SERVICE,
+                script_type="Script",
+            ),
+            _mk_script("UtilA", "return {}", parent_path=SERVER_STORAGE),
+            _mk_script("UtilB", "return {}", parent_path=SERVER_STORAGE),
+        ]
+        domains = infer_module_domains(artifact, scripts)
+        assert domains["g-srv"]["domain"] == "server"
+        by_sid = _by_sid(modules, scripts)
+        reqs = derive_reachability_requirements(
+            artifact, scripts, domains,
+            require_edges_by_name=_edges(scripts),
+            script_by_sid=by_sid,
+            lifecycle_roles={},
+        )
+        assert reqs.get("g-util-a") == "__excluded__"
+
+        finalize_topology_containers(
+            artifact, scripts, domains, reqs, script_by_sid=by_sid,
+        )
+        util_a = artifact["modules"]["g-util-a"]
+        assert util_a["domain"] == "excluded"
+        # The colliding __excluded__ row still gets its container +
+        # module_path (sid-aware base stamping), not empty.
+        assert util_a["container"] == SERVER_STORAGE
+        assert util_a["module_path"] == f"{SERVER_STORAGE}.UtilA"
+
+    def test_string_literal_require_does_not_pull_server_module_to_rs(
+        self,
+    ) -> None:
+        """PH2 end-to-end (phase-integration BLOCKING): a client LocalScript
+        whose ONLY ``require("Secret")`` occurrence is inside a STRING
+        LITERAL must NOT manufacture a reachability edge -- so the
+        server-only ``Secret`` module gets NO reachability requirement and
+        is not hoisted into ReplicatedStorage.
+
+        FAILS pre-fix: ``extract_require_edges`` stripped comments only, so
+        the quoted require text produced a false edge and the prepass
+        returned ``{g-secret: REPLICATED_STORAGE}``.
+        """
+        modules: dict[str, dict[str, object]] = {
+            "g-client": {
+                "stem": "ClientA", "class_name": "ClientA",
+                "runtime_bearing": True,
+            },
+            "g-secret": {
+                "stem": "Secret", "class_name": "Secret",
+                "runtime_bearing": True,
+            },
+        }
+        artifact = _mk_artifact(modules)
+        client = _mk_script(
+            "ClientA",
+            'print(\'require(script.Parent:FindFirstChild("Secret"))\')',
+            parent_path=STARTER_PLAYER_SCRIPTS,
+            script_type="LocalScript",
+        )
+        secret = _mk_script(
+            "Secret",
+            'game:GetService("DataStoreService")\nreturn {}',
+            parent_path=SERVER_STORAGE,
+        )
+        scripts = [client, secret]
+        domains = infer_module_domains(artifact, scripts)
+        assert domains["g-secret"]["domain"] == "server"
+        by_sid = _by_sid(modules, scripts)
+        reqs = derive_reachability_requirements(
+            artifact, scripts, domains,
+            require_edges_by_name=_edges(scripts),
+            script_by_sid=by_sid,
+            lifecycle_roles={},
+        )
+        # No real require -> no reachability requirement -> stays server-only.
+        assert "g-secret" not in reqs
+
+    def test_excluded_stamp_survives_classify_storage_rs_hoist(self) -> None:
+        """PH1 (phase-integration BLOCKING): drive the REAL ordering
+        ``derive_reachability_requirements`` -> ``classify_storage`` ->
+        ``finalize_topology_containers``. ``classify_storage`` consumes the
+        ``__excluded__`` requirement FIRST and moves the helper to
+        ReplicatedStorage (client-visibility). By the time the finalizer
+        runs, ``parent_path`` is RS -- NOT a server container -- so the
+        old container-gated ``__excluded__`` branch SKIPPED the fail-closed
+        stamp, leaving ``domain=="helper"`` and ``excluded_modules==[]``.
+
+        The finalizer must stamp ``domain=="excluded"`` +
+        ``fail_closed_reason=="reachability_conflict"`` and return the row
+        in the excluded list REGARDLESS of the current container, while the
+        RS placement (owned by ``classify_storage``) is left intact.
+
+        FAILS pre-fix: with the container gate, the excluded stamp + report
+        are dropped because the module is already in RS.
+        """
+        from converter.storage_classifier import classify_storage
+
+        modules: dict[str, dict[str, object]] = {
+            "g-entry": {
+                "stem": "LocalEntry", "class_name": "LocalEntry",
+                "runtime_bearing": True,
+            },
+            "g-srv": {
+                "stem": "ServerSide", "class_name": "ServerSide",
+                "runtime_bearing": True,
+            },
+            "g-helper": {
+                "stem": "Helper", "class_name": "Helper",
+                "runtime_bearing": True,
+            },
+        }
+        artifact = _mk_artifact(modules)
+        entry = _mk_script(
+            "LocalEntry", _require("Helper"),
+            parent_path=STARTER_PLAYER_SCRIPTS,
+            script_type="LocalScript",
+        )
+        server = _mk_script(
+            "ServerSide",
+            'evt:FireAllClients()\n' + _require("Helper"),
+            parent_path=SERVER_SCRIPT_SERVICE,
+            script_type="Script",
+        )
+        helper = _mk_script(
+            "Helper", "return {}", parent_path=SERVER_STORAGE,
+        )
+        scripts = [entry, server, helper]
+        domains = infer_module_domains(artifact, scripts)
+        assert domains["g-srv"]["domain"] == "server"
+        by_sid = _by_sid(modules, scripts)
+        sid_by_name = {s.name: sid for sid, s in by_sid.items()}
+        reqs = derive_reachability_requirements(
+            artifact, scripts, domains,
+            require_edges_by_name=_edges(scripts),
+            script_by_sid=by_sid,
+            lifecycle_roles={},
+        )
+        assert reqs.get("g-helper") == "__excluded__"
+
+        # REAL ordering: classify_storage consumes reqs FIRST and hoists
+        # Helper to ReplicatedStorage.
+        inputs = _mk_topology_inputs(
+            reachability_requirements=reqs,
+            script_id_by_name=sid_by_name,
+        )
+        classify_storage([helper], topology_inputs=inputs)
+        assert helper.parent_path == REPLICATED_STORAGE
+
+        excluded = finalize_topology_containers(
+            artifact, scripts, domains, reqs, script_by_sid=by_sid,
+        )
+        helper_row = artifact["modules"]["g-helper"]
+        # RS placement preserved (client-visibility required + correct).
+        assert helper_row["container"] == REPLICATED_STORAGE
+        # Fail-closed semantics + report restored despite the RS container.
+        assert helper_row["domain"] == "excluded"
+        signals = cast("dict[str, object]", helper_row["domain_signals"])
+        assert signals["fail_closed_reason"] == "reachability_conflict"
+        assert "g-helper" in excluded
+
+
+def _mk_topology_inputs(**overrides: object) -> dict[str, object]:
+    """Local copy of the storage_classifier test helper -- a
+    ``TopologyInputs``-shaped plain dict for ``classify_storage`` with
+    empty defaults; the consumer reads it through ``__getitem__`` / ``.get``,
+    both of which work on a plain dict."""
+    base: dict[str, object] = {
+        "domains": {},
+        "reachability_requirements": {},
+        "lifecycle_roles": {},
+        "script_id_by_name": {},
+        "caller_graph": {},
+        "transpile_ran": True,
+    }
+    base.update(overrides)
+    return base
 
 
 class TestNoParentPathInEarlyPrepass:
@@ -307,6 +878,7 @@ class TestNoParentPathInEarlyPrepass:
         target_funcs = {
             "infer_module_domains",
             "derive_reachability_requirements",
+            "_client_entry_seed_names",
         }
         # Helpers `infer_module_domains` reaches: `_classify_module`,
         # `_collect_signals`, `_apply_rule_table`, `_classify_api_surface`,
@@ -1168,15 +1740,13 @@ class TestSlice6OrchestratorByteParity:
         artifact = _mk_artifact(modules)
         scripts = [
             _mk_script(
-                "ClientA", "Players.LocalPlayer",
+                "ClientA", _require("Helper"),
                 parent_path=STARTER_PLAYER_SCRIPTS,
+                script_type="LocalScript",
             ),
             _mk_script("Helper", "return {}", parent_path=SERVER_STORAGE),
         ]
-        dep_map = {"ClientA": ["Helper"]}
-        classify_scene_runtime_domains(
-            artifact, scripts, dependency_map=dep_map,
-        )
+        classify_scene_runtime_domains(artifact, scripts)
         helper_row = artifact["modules"]["g-helper"]
         assert helper_row["container"] == REPLICATED_STORAGE
         assert helper_row["module_path"] == "ReplicatedStorage.Helper"

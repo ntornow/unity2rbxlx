@@ -254,6 +254,18 @@ function SceneRuntime.new(services, plan)
 	-- ``host.destroy(parent)`` is idempotent.
 	self._destroyed = {}
 
+	-- Phase 3 (slice 3.3): scene-boot component refs whose target is a
+	-- placed-prefab clone that hasn't booted yet at scene-wire time. The
+	-- scene loop wires ALL scene refs before any placement boots, so a
+	-- LoadoutState.missionPopup ref to a stripped MissionUI on a prefab
+	-- instance resolves to nil synchronously. Record those here (gated on
+	-- NOT-cross-domain, see ``_wireReferences``) and drain them after the
+	-- placement boot loop AND at the end of each ``_completeDeferredBatch``
+	-- (the placed target may itself be UI-deferred). Each entry is
+	-- ``{source=, field=, index=, target_ref=}`` with ``target_ref`` already
+	-- the full engine-union key (``<placement>:<prefab>:<src_fid>``).
+	self._pendingPlacementRefs = nil
+
 	return self
 end
 
@@ -472,23 +484,33 @@ function SceneRuntime:getTouchPart(go, preferTriggerVolume)
 			return d
 		end
 	end
-	-- Tier 2: an invisible non-mesh trigger volume with CanTouch.
+	-- Tier 2: a converter-stamped trigger volume (``_IsTriggerVolume``).
+	-- Real Unity trigger colliders ARE explicitly marked by the converter, so
+	-- requiring the marker here (instead of guessing "any invisible non-mesh
+	-- CanTouch part") avoids binding the handler to an unmarked invisible
+	-- DECORATION -- e.g. a projectile's particle-emitter host part, which is
+	-- transparent + CanTouch but is NOT a trigger and never collides with the
+	-- target, so the colliding body pushes the victim while the damage handler
+	-- sits on a part that never touches them (the turret-bullet no-damage bug).
 	for _, d in ipairs(descendants) do
-		if _isBasePart(d)
-			and d.CanTouch ~= false
-			and (d.Transparency or 0) >= 0.99
-			and not d:IsA("MeshPart")
-		then
+		if _isMarkedTriggerVolume(d) then
 			return d
 		end
 	end
-	-- Tier 3: any BasePart descendant.
+	-- Tier 3: the colliding body if there is one, else any BasePart. A moving
+	-- projectile's damage Touched must sit on the part that physically contacts
+	-- the target (the CanCollide mesh), not an invisible co-located decoration.
+	local fallback = nil
 	for _, d in ipairs(descendants) do
 		if _isBasePart(d) then
-			return d
+			if d.CanCollide then
+				return d
+			elseif fallback == nil then
+				fallback = d
+			end
 		end
 	end
-	return nil
+	return fallback
 end
 
 -- ``connectGameObjectSignal(comp, go, signalName, fn) -> connection?``:
@@ -512,6 +534,40 @@ function SceneRuntime:connectGameObjectSignal(comp, go, signalName, fn)
 	if signal == nil then
 		self._warn(string.format(
 			"[scene_runtime] connectGameObjectSignal: %s has no %s signal",
+			tostring(part), tostring(signalName)))
+		return nil
+	end
+	return self:connect(comp, signal, fn)
+end
+
+-- ``connectGameObjectTriggerSignal(comp, go, signalName, fn) -> connection?``:
+-- the ``OnTriggerEnter``/``OnTriggerExit`` edge variant of
+-- ``connectGameObjectSignal``. Identical EXCEPT it resolves the part via
+-- ``getTouchPart(go, true)`` -- so a converter-stamped ``_IsTriggerVolume``
+-- volume (the trigger collider Unity's OnTrigger* fires on) wins over the
+-- small visible body. When ``go`` has NO marked volume the prefer-pass returns
+-- nil and ``getTouchPart`` falls through to the IDENTICAL passthrough/tier
+-- resolution as ``connectGameObjectSignal`` -- a safe degrade. The generic
+-- ``trigger_enter_lowering`` pass rewrites ``OnTriggerEnter``/``OnTriggerExit``-
+-- origin ``connectGameObjectSignal`` bindings to this method; ``OnCollision*``
+-- bindings keep ``connectGameObjectSignal`` (body-bound, so the projectile
+-- damage fix from PR #198 is untouched).
+function SceneRuntime:connectGameObjectTriggerSignal(comp, go, signalName, fn)
+	assert(type(fn) == "function",
+		"connectGameObjectTriggerSignal: fn must be function")
+	assert(type(signalName) == "string" and signalName ~= "",
+		"connectGameObjectTriggerSignal: signalName required")
+	local part = self:getTouchPart(go, true)
+	if part == nil then
+		self._warn(string.format(
+			"[scene_runtime] connectGameObjectTriggerSignal: no touch part on %s",
+			tostring(go)))
+		return nil
+	end
+	local signal = part[signalName]
+	if signal == nil then
+		self._warn(string.format(
+			"[scene_runtime] connectGameObjectTriggerSignal: %s has no %s signal",
 			tostring(part), tostring(signalName)))
 		return nil
 	end
@@ -624,6 +680,40 @@ end
 -- gate.
 function SceneRuntime:isPlayerTouch(other)
 	return self:playerFromTouch(other) ~= nil
+end
+
+-- ``playersInRadius(pos, radius) -> {Player}``: the DEDUPED player set inside a
+-- sphere -- the faithful Roblox analog of Unity's
+-- ``Physics.OverlapSphere(pos, r)`` filtered to ``col.tag == "Player"``. Unity
+-- returns ONE collider per player, so a per-collider ``SendMessage`` hits each
+-- player once; Roblox ``GetPartBoundsInRadius`` returns the MANY parts of an
+-- R15 character, so the naive ``for col in cols do playerFromTouch(col) ...``
+-- loop damages each player ~15-20x. This resolves every overlapping part to its
+-- owning Player via the same character-ancestor walk as ``playerFromTouch`` and
+-- returns each DISTINCT player exactly once. Generic: any
+-- damage/affect-players-in-radius pattern uses it (the generic prompt steers
+-- the player-filtered OverlapSphere loop here). Returns an empty table when no
+-- players overlap. Non-player spatial scans keep ``GetPartBoundsInRadius``.
+function SceneRuntime:playersInRadius(pos, radius)
+	local result = {}
+	if pos == nil or radius == nil then return result end
+	-- Use the global ``workspace`` directly, mirroring the OnTriggerStay poll's
+	-- ``workspace:GetPartsInPart`` (the runtime does spatial queries on the live
+	-- workspace, not a service handle). Snapshot inside a pcall so a malformed
+	-- query can't throw out of a damage loop.
+	local ok, parts = pcall(function()
+		return workspace:GetPartBoundsInRadius(pos, radius)
+	end)
+	if not ok or type(parts) ~= "table" then return result end
+	local seen = {}
+	for _, part in ipairs(parts) do
+		local plr = self:playerFromTouch(part)
+		if plr ~= nil and not seen[plr] then
+			seen[plr] = true
+			result[#result + 1] = plr
+		end
+	end
+	return result
 end
 
 -- ---------------------------------------------------------------------
@@ -750,6 +840,17 @@ function SceneRuntime:_makeHostSurface(owner)
 			end
 			return engine:connectGameObjectSignal(owner, arg1, arg2, arg3)
 		end,
+		connectGameObjectTriggerSignal = function(arg1, arg2, arg3, arg4)
+			-- OnTriggerEnter/Exit edge variant -- prefers the marked trigger
+			-- volume. Same calling forms + owner-scoping as
+			-- connectGameObjectSignal.
+			--   Colon:  host:connectGameObjectTriggerSignal(go, signalName, fn)
+			--   Dotted: host.connectGameObjectTriggerSignal(go, signalName, fn)
+			if arg1 == host then
+				return engine:connectGameObjectTriggerSignal(owner, arg2, arg3, arg4)
+			end
+			return engine:connectGameObjectTriggerSignal(owner, arg1, arg2, arg3)
+		end,
 		connectGameObjectSignalStay = function(arg1, arg2, arg3)
 			-- Colon: host:connectGameObjectSignalStay(go, fn)
 			--   arg1=host, arg2=go, arg3=fn
@@ -773,6 +874,14 @@ function SceneRuntime:_makeHostSurface(owner)
 				return engine:isPlayerTouch(arg2)
 			end
 			return engine:isPlayerTouch(arg1)
+		end,
+		playersInRadius = function(arg1, arg2, arg3)
+			-- Colon:  host:playersInRadius(pos, radius) -> arg1=host, arg2=pos, arg3=radius
+			-- Dotted: host.playersInRadius(pos, radius) -> arg1=pos, arg2=radius
+			if arg1 == host then
+				return engine:playersInRadius(arg2, arg3)
+			end
+			return engine:playersInRadius(arg1, arg2)
 		end,
 		-- Public per-player read surface (P1-4/P2-G). A NARROW table closing
 		-- over ``engine`` — exposes ONLY the public ``getLookCFrame`` read so
@@ -1118,6 +1227,79 @@ function SceneRuntime:_assignFieldOnComponent(instance, field, index, value)
 	arr[index + 1] = value
 end
 
+function SceneRuntime:_isPlacementScopedRef(target_ref)
+	-- Phase 3 (slice 3.3): a stripped-ref ``target_ref`` the planner resolved
+	-- is the engine-union key ``<placement_id>:<prefab>:<src_fid>``, whose
+	-- prefix is one of the scene's ``scene_prefab_placements`` placement_ids.
+	-- Membership is a cheap check against a memoized set of known
+	-- placement_ids: ``target_ref`` is placement-scoped iff some placement_id
+	-- is a prefix of it followed by the ``:`` separator. This narrows the
+	-- pending-queue to genuine load-order misses against PLACED prefabs and
+	-- excludes ordinary unresolved scene-local component ids.
+	if target_ref == nil or target_ref == "" then return false end
+	local placementIds = self._placementIdSet
+	if placementIds == nil then
+		placementIds = {}
+		for _, placement in ipairs(self._plan.scene_prefab_placements or {}) do
+			local pid = placement.placement_id
+			if pid ~= nil and pid ~= "" then
+				placementIds[pid] = true
+			end
+		end
+		self._placementIdSet = placementIds
+	end
+	for pid in pairs(placementIds) do
+		if target_ref == pid or
+		   string.sub(target_ref, 1, #pid + 1) == (pid .. ":") then
+			return true
+		end
+	end
+	return false
+end
+
+function SceneRuntime:_drainPendingPlacementRefs()
+	-- Phase 3 (slice 3.3): bind scene-boot component refs whose placed-prefab
+	-- target has now registered in ``_componentByInstanceId``. Idempotent --
+	-- bound records are removed, unresolved records are kept for a later call
+	-- (the placed target may itself be UI-deferred and register only inside a
+	-- later ``_completeDeferredBatch``). Dead-source records are dropped
+	-- (matches the ``_inboundRefsToDeferred`` drain).
+	if not self._pendingPlacementRefs then return end
+	local kept = {}
+	for _, rec in ipairs(self._pendingPlacementRefs) do
+		if self._meta[rec.source] ~= nil then        -- source still alive
+			local target = self._componentByInstanceId[rec.target_ref]
+			if target ~= nil then
+				self:_assignFieldOnComponent(
+					rec.source, rec.field, rec.index, target)
+			else
+				table.insert(kept, rec)              -- target not yet built
+			end
+		end
+		-- dead source: drop the record.
+	end
+	self._pendingPlacementRefs = (#kept > 0) and kept or nil
+
+	-- After the FINAL drain (no UI-deferred work still in flight), any still-
+	-- unresolved record is a genuinely-absent target (no placement / never
+	-- registered). Emit a WARN so the residual nil is observable. Gate on no
+	-- pending UI-deferred batches so the WARN does not fire prematurely while
+	-- a placed target is still waiting on its PlayerGui host clone.
+	if self._pendingPlacementRefs ~= nil
+	   and (self._deferredUiInstances == nil
+	        or #self._deferredUiInstances == 0)
+	   and self._inboundRefsToDeferred == nil then
+		for _, rec in ipairs(self._pendingPlacementRefs) do
+			local srcMeta = self._meta[rec.source]
+			self._warn(string.format(
+				"[scene_runtime] stripped-prefab ref %s.%s -> %s never "
+				.. "resolved (target not registered); leaving nil",
+				tostring(srcMeta and srcMeta.scriptId), tostring(rec.field),
+				tostring(rec.target_ref)))
+		end
+	end
+end
+
 function SceneRuntime:_wireReferences(refs, componentByInstanceId,
                                        crossDomainEdges, instanceById,
                                        placement_id, targetResolveMap)
@@ -1156,6 +1338,12 @@ function SceneRuntime:_wireReferences(refs, componentByInstanceId,
 			-- inject ``nil`` and surface the edge. Resolve via the plan
 			-- so the policy fires even when the target isn't locally
 			-- constructed (real boots only run one partition).
+			-- ``crossDomainNil`` records whether THIS ref was nil-injected by
+			-- the cross-domain POLICY (as opposed to a load-order miss). A
+			-- policy-nil'd ref must NOT enter ``_pendingPlacementRefs`` -- the
+			-- drain would otherwise rebind it once the placed component lands
+			-- and silently defeat the cross-domain gate.
+			local crossDomainNil = false
 			if ref.target_kind == "component" then
 				local srcMeta = self._meta[sourceComp]
 				local tgtRow = instanceById and instanceById[ref.target_ref]
@@ -1163,6 +1351,16 @@ function SceneRuntime:_wireReferences(refs, componentByInstanceId,
 				local tgtScriptId
 				if tgtRow then
 					tgtScriptId = tgtRow.script_id
+				else
+					-- Phase 3 (slice 3.3): a placement-scoped target_ref
+					-- (``<placement>:<prefab>:<src_fid>``) never appears in the
+					-- scene-local ``instanceById``. The planner stamps
+					-- ``ref.target_script_id`` on rewritten stripped rows so the
+					-- cross-domain policy can still classify the target's domain
+					-- (codex Major 1 / D-P3-6).
+					tgtScriptId = ref.target_script_id
+				end
+				if tgtScriptId then
 					local tgtModule = modules[tgtScriptId]
 					tgtDomain = tgtModule and tgtModule.domain
 				end
@@ -1179,6 +1377,7 @@ function SceneRuntime:_wireReferences(refs, componentByInstanceId,
 						srcMeta.scriptId, srcMeta.domain, ref.field,
 						tostring(tgtScriptId), tgtDomain))
 					target = nil
+					crossDomainNil = true
 					if crossDomainEdges then
 						table.insert(crossDomainEdges, {
 							from_script = srcMeta.scriptId,
@@ -1209,7 +1408,8 @@ function SceneRuntime:_wireReferences(refs, componentByInstanceId,
 				if placement_id ~= nil and placement_id ~= "" then
 					scopedTarget = placement_id .. ":" .. ref.target_ref
 				end
-				if self._deferredInstanceIds
+				if not crossDomainNil
+				   and self._deferredInstanceIds
 				   and self._deferredInstanceIds[scopedTarget] then
 					self._inboundRefsToDeferred = self._inboundRefsToDeferred or {}
 					table.insert(self._inboundRefsToDeferred, {
@@ -1217,6 +1417,24 @@ function SceneRuntime:_wireReferences(refs, componentByInstanceId,
 						field = ref.field,
 						index = ref.index,
 						target_ref = scopedTarget,
+					})
+				elseif not crossDomainNil
+				       and (placement_id == nil or placement_id == "")
+				       and self:_isPlacementScopedRef(ref.target_ref) then
+					-- A scene-boot (placement_id nil/empty) component ref that
+					-- resolved to nil and whose ``target_ref`` is a full
+					-- engine-union key (``<placement>:<prefab>:<src_fid>``, as
+					-- the planner emits for stripped refs) is a LOAD-ORDER miss:
+					-- the placed-prefab clone hasn't booted yet (the scene loop
+					-- wires every scene ref before any placement boots). Queue it
+					-- for ``_drainPendingPlacementRefs``, gated on NOT-cross-domain
+					-- so a policy-nil'd ref is never rebound (D-P3-6).
+					self._pendingPlacementRefs = self._pendingPlacementRefs or {}
+					table.insert(self._pendingPlacementRefs, {
+						source = sourceComp,
+						field = ref.field,
+						index = ref.index,
+						target_ref = ref.target_ref,
 					})
 				end
 			end
@@ -2252,7 +2470,54 @@ function SceneRuntime:_correctClonedDynamics(clone)
 	end
 end
 
+-- Resolve an Addressables address (the string passed to
+-- ``Addressables.InstantiateAsync``) to a concrete prefab_id via the plan's
+-- ``addressables.by_address`` map. Fail soft: an unknown / empty address warns
+-- and returns nil so the caller drops the spawn. A multi-candidate address
+-- picks the first id (resolver-deterministic order) + warns. ``by_label`` is
+-- emitted but not consumed here.
+function SceneRuntime:_resolveAddressToPrefabId(address)
+	-- Fail soft on a malformed addressables block: a truthy non-table
+	-- ``addressables`` (or ``by_address``) would otherwise raise on index.
+	local addressables = self._plan.addressables
+	if addressables ~= nil and type(addressables) ~= "table" then
+		self._warn(string.format(
+			"[scene_runtime] instantiatePrefab: malformed addressables block (%s); no prefab for address %q",
+			type(addressables), tostring(address)))
+		return nil
+	end
+	local addr = (addressables or {}).by_address
+	if addr ~= nil and type(addr) ~= "table" then
+		self._warn(string.format(
+			"[scene_runtime] instantiatePrefab: malformed addressables.by_address (%s); no prefab for address %q",
+			type(addr), tostring(address)))
+		return nil
+	end
+	addr = addr or {}
+	local ids = addr[address]
+	if type(ids) ~= "table" or #ids == 0 then
+		self._warn(string.format(
+			"[scene_runtime] instantiatePrefab: no prefab for address %q",
+			tostring(address)))
+		return nil
+	end
+	if #ids > 1 then
+		self._warn(string.format(
+			"[scene_runtime] address %q resolves to %d prefabs; using %q",
+			tostring(address), #ids, tostring(ids[1])))
+	end
+	return ids[1]
+end
+
 function SceneRuntime:instantiatePrefab(prefab_id, parent, cframe, externalRefs)
+	-- ``prefab_id`` may be an Addressables address (e.g. "Trash Cat")
+	-- rather than a concrete prefab_id. If it is not a direct prefab key,
+	-- treat it as an address and resolve it; a nil resolution already
+	-- warned, so just drop the spawn.
+	if not (self._plan.prefabs or {})[prefab_id] then
+		prefab_id = self:_resolveAddressToPrefabId(prefab_id)
+		if not prefab_id then return nil end
+	end
 	local prefab = (self._plan.prefabs or {})[prefab_id]
 	if not prefab then
 		self._warn(string.format(
@@ -2750,6 +3015,11 @@ function SceneRuntime:_completeDeferredBatch(pending)
 		end
 		engine._inboundRefsToDeferred = (#kept > 0) and kept or nil
 	end
+	-- Phase 3 (slice 3.3): a placed-prefab target that was itself UI-deferred
+	-- registers in ``_componentByInstanceId`` only now (inside this batch).
+	-- Drain again so a scene-boot ref to such a target binds. Idempotent --
+	-- already-bound records were removed by the post-placement drain.
+	engine:_drainPendingPlacementRefs()
 	-- Pass 3c: prefab-side externalRefs override matching wired fields,
 	-- mirroring ``_constructPrefabClone``'s post-wire override.
 	for _, entry in ipairs(ordered) do
@@ -3109,6 +3379,16 @@ function SceneRuntime:start(domainFilter)
 			self:_runAwakeEnableStart(componentList)
 		end
 	end
+
+	-- Phase 3 (slice 3.3): the placement boot loop has now registered every
+	-- placed-prefab component in ``_componentByInstanceId``. Drain scene-boot
+	-- component refs (e.g. LoadoutState.missionPopup) whose target is one of
+	-- those placed clones -- they resolved to nil at scene-wire time because
+	-- the placement hadn't booted yet. Runs synchronously before the
+	-- heartbeat connect and before any deferred Start fires, so the field is
+	-- set before its source's Start reads it. A target that is itself
+	-- UI-deferred is drained later by ``_completeDeferredBatch``.
+	self:_drainPendingPlacementRefs()
 
 	-- Step 6: update loops via heartbeat + fixed-step accumulator.
 	if self._services.heartbeat then

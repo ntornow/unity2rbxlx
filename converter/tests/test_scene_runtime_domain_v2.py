@@ -695,11 +695,16 @@ class TestReachabilityHoist:
             "g-client": dict(_mk_module("g-client", "ClientA")[1]),
             "g-helper": dict(_mk_module("g-helper", "Helper")[1]),
         }
+        client_a = RbxScript(
+            name="ClientA",
+            source='Players.LocalPlayer\n'
+            'require(script.Parent:FindFirstChild("Helper"))',
+            script_type="LocalScript",
+        )
+        client_a.intrinsic_script_type = "LocalScript"
+        client_a.parent_path = STARTER_PLAYER_SCRIPTS
         scripts = [
-            _mk_script(
-                "ClientA", "Players.LocalPlayer",
-                parent_path=STARTER_PLAYER_SCRIPTS,
-            ),
+            client_a,
             _mk_script("Helper", "return {}", parent_path=helper_container),
         ]
         return modules, scripts
@@ -707,11 +712,8 @@ class TestReachabilityHoist:
     def test_hoist_from_server_storage_rewrites_module_path(self) -> None:
         modules, scripts = self._setup("ServerStorage")
         artifact = _mk_artifact(cast("dict[str, dict[str, object]]", modules))
-        # Helper is required from the client side.
-        dep_map = {"ClientA": ["Helper"]}
-        classify_scene_runtime_domains(
-            artifact, scripts, dependency_map=dep_map,
-        )
+        # Helper is required from the client entry (emitted require).
+        classify_scene_runtime_domains(artifact, scripts)
         helper_row = artifact["modules"]["g-helper"]
         assert helper_row["container"] == REPLICATED_STORAGE
         assert helper_row["module_path"] == "ReplicatedStorage.Helper"
@@ -727,10 +729,7 @@ class TestReachabilityHoist:
         # this case was silently ignored (only ServerStorage was checked).
         modules, scripts = self._setup(SERVER_SCRIPT_SERVICE)
         artifact = _mk_artifact(cast("dict[str, dict[str, object]]", modules))
-        dep_map = {"ClientA": ["Helper"]}
-        classify_scene_runtime_domains(
-            artifact, scripts, dependency_map=dep_map,
-        )
+        classify_scene_runtime_domains(artifact, scripts)
         helper_row = artifact["modules"]["g-helper"]
         assert helper_row["container"] == REPLICATED_STORAGE
         assert helper_row["module_path"] == "ReplicatedStorage.Helper"

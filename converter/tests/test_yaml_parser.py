@@ -247,3 +247,125 @@ class TestOrderedChildGoFids:
         }
         result = ordered_child_go_fids(xform, {"100": "go_a"})
         assert result == ["go_a"]
+
+
+# Synthetic Unity scene with one normal MonoBehaviour and one STRIPPED
+# prefab-instance MonoBehaviour, plus a PrefabInstance doc. Self-contained
+# (does not depend on the source project) so this gate runs in CI.
+STRIPPED_SCENE_YAML = """%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &900001
+GameObject:
+  m_Name: Holder
+  m_IsActive: 1
+--- !u!114 &900002
+MonoBehaviour:
+  m_GameObject: {fileID: 900001}
+  m_Name: NormalScript
+  m_Script: {fileID: 11500000, guid: aaaa1111aaaa1111aaaa1111aaaa1111, type: 3}
+--- !u!114 &137514649 stripped
+MonoBehaviour:
+  m_CorrespondingSourceObject: {fileID: 114000011972273750, guid: a53fe2875371488408daf0df7d69a981,
+    type: 3}
+  m_PrefabInstance: {fileID: 1822972501}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_Script: {fileID: 11500000, guid: fff2f071f7335eb43a712a702b990041, type: 3}
+  m_Name:
+--- !u!1001 &1822972501
+PrefabInstance:
+  m_SourcePrefab: {fileID: 100100000, guid: a53fe2875371488408daf0df7d69a981, type: 3}
+"""
+
+
+class TestStrippedOut:
+    def test_returned_triples_byte_identical_with_stripped_out(self):
+        # The returned result list must be unaffected by passing stripped_out.
+        without = parse_documents(STRIPPED_SCENE_YAML)
+        stripped: list = []
+        with_out = parse_documents(STRIPPED_SCENE_YAML, stripped_out=stripped)
+        assert with_out == without
+        # And the stripped fileID never enters the returned triples.
+        fids = {fid for _, fid, _ in with_out}
+        assert "137514649" not in fids
+
+    def test_stripped_out_captures_stripped_mb_triple(self):
+        stripped: list = []
+        parse_documents(STRIPPED_SCENE_YAML, stripped_out=stripped)
+        assert len(stripped) == 1
+        cid, fid, body = stripped[0]
+        assert cid == 114
+        assert fid == "137514649"
+        assert isinstance(body, dict)
+        mb = body["MonoBehaviour"]
+        assert mb["m_PrefabInstance"]["fileID"] == 1822972501
+
+    def test_stripped_out_default_none_no_capture(self):
+        # No exception, no capture, when stripped_out is omitted.
+        docs = parse_documents(STRIPPED_SCENE_YAML)
+        fids = {fid for _, fid, _ in docs}
+        assert "137514649" not in fids
+
+
+# Synthetic scene with an interior malformed (non-dict) document BEFORE a
+# stripped MonoBehaviour. Under a per-dict header counter the malformed doc
+# would shift every later doc onto the wrong header (the stripped MB leaks into
+# ``result`` with a wrong (cid, fid) and never reaches ``stripped_out``).
+# Position-stable pairing must keep each doc on its own header.
+MALFORMED_BEFORE_STRIPPED_YAML = """%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &1
+: : : not valid yaml mapping : :
+--- !u!114 &2
+MonoBehaviour:
+  m_Name: Real
+--- !u!114 &3 stripped
+MonoBehaviour:
+  m_PrefabInstance: {fileID: 9999}
+"""
+
+
+class TestPositionStablePairing:
+    def test_stripped_after_malformed_doc_captured_with_right_fileid(self):
+        # (a) the stripped MB is captured in stripped_out with the RIGHT fileID.
+        stripped: list = []
+        result = parse_documents(
+            MALFORMED_BEFORE_STRIPPED_YAML, stripped_out=stripped
+        )
+        assert len(stripped) == 1
+        cid, fid, body = stripped[0]
+        assert cid == 114
+        assert fid == "3"
+        assert body["MonoBehaviour"]["m_PrefabInstance"]["fileID"] == 9999
+
+        # (b) the stripped MB is NOT in result (under any fileID).
+        result_fids = {fid for _, fid, _ in result}
+        assert "3" not in result_fids
+
+        # (c) the non-stripped doc carries its CORRECT (cid, fid) despite the
+        # earlier malformed doc consuming its own header slot.
+        assert result == [(114, "2", {"MonoBehaviour": {"m_Name": "Real"}})]
+
+
+REAL_SCENE = Path("/Users/jiazou/workspace/trash-dash/Assets/Scenes/Main.unity")
+
+
+class TestStrippedOutRealScene:
+    def test_real_scene_stripped_mb_captured(self):
+        if not REAL_SCENE.exists():
+            import pytest
+            pytest.skip("real Trash-Dash scene not present")
+        raw = REAL_SCENE.read_text(encoding="utf-8", errors="replace")
+        stripped: list = []
+        without = parse_documents(raw)
+        with_out = parse_documents(raw, stripped_out=stripped)
+        # contract: returned triples byte-identical
+        assert with_out == without
+        captured = {fid for _, fid, _ in stripped}
+        assert "137514649" in captured
+        assert "80306028" in captured
+        assert "926798345" in captured
+        # the stripped fileIDs are NOT in the returned triples
+        result_fids = {fid for _, fid, _ in with_out}
+        assert "137514649" not in result_fids

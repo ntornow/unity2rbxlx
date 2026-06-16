@@ -596,13 +596,37 @@ def transpile_with_contract(
     # ``connectGameObjectSignal(go, "Touched", fn)`` binding whose immediately-
     # preceding origin comment is ``-- OnTriggerStay`` to the host's STAY-poll
     # primitive ``connectGameObjectSignalStay(go, fn)`` (slice 1.1). Comment-
-    # keyed + binding-local, NEVER per-game; OnTriggerEnter/Exit and the
-    # OnCollision* edge bindings are left untouched. See trigger_stay_lowering.py.
+    # keyed + binding-local, NEVER per-game; OnCollision* edge bindings are left
+    # untouched (body-bound). See trigger_stay_lowering.py. MUST run before the
+    # OnTriggerEnter lowering below: it renames OnTriggerStay bindings to
+    # ``connectGameObjectSignalStay`` (which the Enter pass's head regex does not
+    # match), so the two passes never contend for the same binding.
     from converter.trigger_stay_lowering import lower_trigger_stay
     lowered_stay = lower_trigger_stay(transpilation.scripts)
     if lowered_stay:
         log.info("[contract] OnTriggerStay lowering routed %d script(s) to "
                  "the connectGameObjectSignalStay poll primitive", lowered_stay)
+
+    # OnTriggerEnter/Exit lowering (allowlisted deterministic lowering pass): the
+    # transpiler collapses Unity OnTriggerEnter/Exit AND OnCollisionEnter/Exit
+    # onto the same ``.Touched``/``.TouchEnded`` edge, resolved via
+    # ``getTouchPart(go)`` -> the small visible BODY. That is correct for
+    # OnCollision* (the part a projectile hits, PR #198) but WRONG for the
+    # trigger phases: Unity OnTrigger* fire on the object's TRIGGER collider (the
+    # converter-stamped ``_IsTriggerVolume`` proximity volume), so a mine binds
+    # detection to its ~3-stud mesh instead of its ~7-stud trigger sphere and
+    # explodes-without-damage as the player walks clear. Rewrite the specific
+    # binding whose immediately-preceding origin comment is ``-- OnTriggerEnter``
+    # / ``-- OnTriggerExit`` to ``connectGameObjectTriggerSignal`` (resolves via
+    # ``getTouchPart(go, true)`` -> prefer the marked volume; safe degrade when
+    # none). Comment-keyed + binding-local, NEVER per-game; OnCollision* and
+    # OnTriggerStay bindings are left untouched. See trigger_enter_lowering.py.
+    from converter.trigger_enter_lowering import lower_trigger_enter
+    lowered_enter = lower_trigger_enter(transpilation.scripts)
+    if lowered_enter:
+        log.info("[contract] OnTriggerEnter/Exit lowering routed %d script(s) to "
+                 "the connectGameObjectTriggerSignal (marked-trigger) resolver",
+                 lowered_enter)
 
     # Rifle rig-retarget lowering: consume each Camera.main-rooted
     # ``RigRootedRetargetFact`` (the resolver recorded it pre-transpile) by

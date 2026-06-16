@@ -17,6 +17,7 @@ from typing import Any, cast
 
 if TYPE_CHECKING:
     from converter.contract_verifier import StaticEventDecl
+    from unity.addressables_resolver import PrefabAddressables
     from converter.scene_runtime_topology.build_topology import (
         TopologyArtifact,
     )
@@ -123,6 +124,39 @@ def _contract_failure_errors(fail_closed: "list") -> list[str]:
         f"scene-runtime contract failed closed ({fc.kind}): {fc.detail}"
         for fc in fail_closed
     ]
+
+
+# Distinct prefix for the universal-net fail-closed promotion (Slice 2.3).
+# Mirrors the contract-verifier's ``CONTRACT_ERROR_PREFIX`` convention so a
+# ``materialize_and_classify`` resume can drop-prior-then-re-add the net's
+# rows in ``ctx.errors`` (append-only would duplicate across reruns).
+ROBLOX_CALL_ERROR_PREFIX = "[roblox-call:"
+
+
+def _roblox_call_net_errors(semantic_report: "object") -> list[str]:
+    """Render each PROVEN ``nonexistent_roblox_method`` semantic issue as a
+    fail-closed conversion-error string.
+
+    Pure: returns a fresh list, mutates nothing. Filters strictly to the
+    ``nonexistent_roblox_method`` rule's PROVEN issues (``severity == "error"``)
+    — unproven issues stay report-only and never gate. Each string is prefixed
+    with :data:`ROBLOX_CALL_ERROR_PREFIX` so the caller can replace (not
+    duplicate) the prior run's rows on a resume.
+    """
+    issues = getattr(semantic_report, "issues", None)
+    if not issues:
+        return []
+    out: list[str] = []
+    for issue in issues:
+        if getattr(issue, "rule", None) != "nonexistent_roblox_method":
+            continue
+        if getattr(issue, "severity", None) != "error":
+            continue
+        out.append(
+            f"{ROBLOX_CALL_ERROR_PREFIX} {issue.script}:{issue.line} "
+            f"{issue.snippet}]"
+        )
+    return out
 
 
 @dataclass
@@ -650,6 +684,12 @@ class Pipeline:
     ESSENTIAL_PHASES: frozenset[str] = frozenset({
         "parse", "extract_assets", "convert_materials",
         "transpile_scripts", "convert_animations", "convert_scene",
+        # ``plan_scene_runtime`` builds the ``addressables`` block + the
+        # resolved ``template_name`` map write_output consumes — it must
+        # re-run on resume so a ``--phase=write_output`` resume recomputes
+        # them against the current ``prefab_library`` rather than pairing a
+        # fresh library with a stale persisted map. Read-only + idempotent.
+        "plan_scene_runtime",
         # Phase 2a slice 8: ``materialize_and_classify`` populates
         # ``state.rbx_place.scripts`` (in-memory) which write_output
         # consumes — it must re-run on every resumed invocation so a
@@ -996,6 +1036,27 @@ class Pipeline:
             len(refs), total,
         )
 
+    def _build_addressables_block(self) -> PrefabAddressables | None:
+        """Parse the project's Addressables groups, narrowed to prefab ids.
+
+        Returns the ``PrefabAddressables`` (``by_address`` / ``by_label`` /
+        ``prefab_ids``) when the project has resolvable addressable prefabs,
+        else ``None`` (no GuidIndex, no AddressableAssetsData dir, or no
+        prefab entries) so the caller omits the block entirely.
+        """
+        from unity.addressables_resolver import (
+            parse_addressables,
+            resolve_prefab_addressables,
+        )
+
+        if self.state.guid_index is None:
+            return None
+        index = parse_addressables(self.unity_project_path)
+        resolved = resolve_prefab_addressables(index, self.state.guid_index)
+        if not resolved.by_address and not resolved.by_label:
+            return None
+        return resolved
+
     def plan_scene_runtime(self) -> None:
         """Phase: build the project-level ``scene_runtime`` artifact.
 
@@ -1044,6 +1105,56 @@ class Pipeline:
             guid_index=self.state.guid_index,
             unity_project_root=self.unity_project_path,
         )
+
+        # Parse the project's Addressables groups (narrowed to prefab ids) and
+        # attach the block to the artifact before it freezes onto
+        # ``self.ctx.scene_runtime``. The narrowed ids also feed the
+        # resolved-name pass below.
+        resolved = self._build_addressables_block()
+        addr_ids: set[str] = set()
+        if resolved is not None:
+            artifact["addressables"] = {
+                "by_address": resolved.by_address,
+                "by_label": resolved.by_label,
+            }
+            addr_ids = set(resolved.prefab_ids)
+            log.info(
+                "[plan_scene_runtime] emitted addressables: %d addresses, "
+                "%d labels, %d skipped-non-prefab",
+                len(resolved.by_address),
+                len(resolved.by_label),
+                resolved.skipped_non_prefab,
+            )
+
+        # Resolved-name pass (single source of truth): collision-conditionally
+        # re-key the on-disk Templates child name (== ``template_name``) over the
+        # EMITTED prefab set only, so a non-emitted same-base sibling never
+        # forces a suffix. The emitter reads these back; it does not recompute.
+        from converter.prefab_packages import (
+            resolve_template_child_names,
+            select_emitted_prefab_ids,
+        )
+
+        prefabs_block = artifact["prefabs"]
+        if isinstance(prefabs_block, dict):
+            emitted = select_emitted_prefab_ids(
+                self.state.prefab_library,
+                self.ctx.serialized_field_refs or None,
+                addr_ids,
+                guid_index=self.state.guid_index,
+            )
+            bases: dict[str, str] = {}
+            for pid in emitted:
+                sub = prefabs_block.get(pid)
+                if isinstance(sub, dict):
+                    name = sub.get("template_name")
+                    if isinstance(name, str):
+                        bases[pid] = name
+            for pid, name in resolve_template_child_names(bases).items():
+                sub = prefabs_block.get(pid)
+                if isinstance(sub, dict):
+                    sub["template_name"] = name
+
         # Persist directly on the context; the structural type belongs to
         # the planner module (avoids a core→converter dependency).
         self.ctx.scene_runtime = dict(artifact)
@@ -1122,6 +1233,7 @@ class Pipeline:
             guid_index=self.state.guid_index,
             networking=networking,
             strict=True,
+            transpile_ran=False,  # pre-transpile dry-run (scripts=[] → inert)
         )
         if report["strict_violations"]:
             violations = "\n  - ".join(report["strict_violations"])
@@ -2754,6 +2866,25 @@ return table.concat(allData, "\\n")'''
             )
             for rule, count in semantic_report.counts_by_rule.items():
                 log.info("[write_output]   %s: %d", rule, count)
+
+        # Slice 2.3 universal fail-closed net. The semantic report is
+        # report-only by default; here we promote the PROVEN
+        # ``nonexistent_roblox_method`` issues to ``ctx.errors`` so
+        # ``success = len(ctx.errors) == 0`` flips False rather than shipping
+        # a place whose hit-handler calls a hallucinated Roblox method (which
+        # errors at runtime). This is the ONE universal point every final
+        # script passes through — it does NOT depend on the transpile-time
+        # contract path (which the bug routed around).
+        #
+        # REPLACE the net-owned rows, don't append: ``ctx.errors`` persists +
+        # reloads across a ``materialize_and_classify`` resume, so a prior
+        # run's promotion would survive a now-clean rerun. Drop every prior
+        # ``[roblox-call:``-prefixed row FIRST, then re-add the current set.
+        self.ctx.errors[:] = [
+            e for e in self.ctx.errors
+            if not e.startswith(ROBLOX_CALL_ERROR_PREFIX)
+        ]
+        self.ctx.errors.extend(_roblox_call_net_errors(semantic_report))
 
         self._subphase_finalize_scripts_to_disk()
 
@@ -4825,6 +4956,7 @@ script.Disabled = true
                 guid_index=self.state.guid_index,
                 networking=networking,
                 strict=strict,
+                transpile_ran=self.state.transpilation_result is not None,
             )
             scene_runtime["displaced_instances"] = report["displaced_instances"]
             scene_runtime["low_confidence_modules"] = report["low_confidence_modules"]
@@ -5126,6 +5258,7 @@ script.Disabled = true
         if self.state.rbx_place is None or not self.state.rbx_place.scripts:
             return None
 
+        from converter.roblox_dead_modules import extract_require_edges
         from converter.scene_runtime_domain import (
             derive_reachability_requirements,
             infer_module_domains,
@@ -5191,12 +5324,6 @@ script.Disabled = true
             dependency_map=self.state.dependency_map or None,
             guid_index=self.state.guid_index,
             networking=networking,
-        )
-        reqs = derive_reachability_requirements(
-            cast("SceneRuntimeArtifact", scene_runtime),
-            self.state.rbx_place.scripts,
-            domain_results,
-            dependency_map=self.state.dependency_map or None,
         )
         caller_graph = resolve_caller_graph(
             cast("SceneRuntimeArtifact", scene_runtime),
@@ -5288,6 +5415,31 @@ script.Disabled = true
                 is_loader=is_loader,
             )
             lifecycle_roles[sid] = role
+
+        # Canonical emitted-require graph (script.name -> {required
+        # script.name}), built ONCE over the post-transpile Luau bodies.
+        # The client/server reachability closure walks THIS graph (not
+        # the C# dependency_map), so injected post-transpile requires are
+        # captured. ``script_by_sid`` + ``lifecycle_roles`` (computed
+        # above) feed the seed predicate; all three are hoisted ABOVE the
+        # ``derive_reachability_requirements`` call below — a pure move,
+        # none depend on ``reqs``.
+        known_names = frozenset(
+            s.name for s in self.state.rbx_place.scripts if s.name
+        )
+        require_edges_by_name: dict[str, set[str]] = {
+            s.name: extract_require_edges(s.source, known_names)
+            for s in self.state.rbx_place.scripts if s.name
+        }
+        reqs = derive_reachability_requirements(
+            cast("SceneRuntimeArtifact", scene_runtime),
+            self.state.rbx_place.scripts,
+            domain_results,
+            require_edges_by_name=require_edges_by_name,
+            script_by_sid=script_by_sid,
+            lifecycle_roles=lifecycle_roles,
+            transpile_ran=self.state.transpilation_result is not None,
+        )
 
         # Phase 2b: cross-domain facts produced here so they share scope
         # with ``transpilation_result`` + ``script_id_by_name`` + the
@@ -6063,6 +6215,24 @@ script.Disabled = true
             os.environ.get("U2R_LEGACY_PREFAB_PIVOT", "").lower()
             in {"1", "true", "yes"}
         )
+        # Read the resolved Templates child names + the addressable emission
+        # target set from ``ctx.scene_runtime`` (recomputed each run by the
+        # now-essential ``plan_scene_runtime``).
+        scene_runtime = self.ctx.scene_runtime or {}
+        resolved_template_names: dict[str, str] = {}
+        for pid, sub in (scene_runtime.get("prefabs") or {}).items():
+            tname = sub.get("template_name") if isinstance(sub, dict) else None
+            if isinstance(tname, str):
+                resolved_template_names[pid] = tname
+        addressable_prefab_ids: set[str] = set()
+        addr_block = scene_runtime.get("addressables") or {}
+        for axis in ("by_address", "by_label"):
+            for ids in (addr_block.get(axis) or {}).values():
+                if isinstance(ids, (list, tuple, set)):
+                    addressable_prefab_ids.update(
+                        pid for pid in ids if isinstance(pid, str)
+                    )
+
         result = generate_prefab_packages(
             prefab_library=prefab_library,
             serialized_field_refs=self.ctx.serialized_field_refs or None,
@@ -6070,6 +6240,8 @@ script.Disabled = true
             material_mappings=self.state.material_mappings,
             uploaded_assets=self.ctx.uploaded_assets,
             legacy_prefab_pivot=legacy_pivot,
+            resolved_template_names=resolved_template_names,
+            addressable_prefab_ids=addressable_prefab_ids,
         )
 
         if not result.templates:
@@ -6153,9 +6325,27 @@ script.Disabled = true
             s.name: s for s in self.state.rbx_place.scripts
         }
 
+        # ``script_scopes`` keys templates by the BARE prefab name, but emitted
+        # templates carry the RESOLVED (possibly suffixed) name. A non-colliding
+        # base resolves to itself, so the direct lookup is unchanged; a colliding
+        # base can't identify which resolved template the driver belongs to, so
+        # skip + WARN rather than misroute it. The skip is gated on collision
+        # membership alone, not on the bare key being absent: a mixed guided /
+        # guid-less collision leaves the bare template present, where gating on
+        # absence would misroute onto it.
+        colliding_bare_bases = self._colliding_emitted_bare_bases()
+
         from copy import copy as _shallow_copy
         attached = 0
         for script_name, template_name in anim.script_scopes.items():
+            if template_name in colliding_bare_bases:
+                log.warning(
+                    "[write_output] prefab-scoped animation %r targets "
+                    "colliding base name %r; skipping (cannot identify which "
+                    "resolved template — D12)",
+                    script_name, template_name,
+                )
+                continue
             template = templates_by_name.get(template_name)
             script = scripts_by_name.get(script_name)
             if template is None or script is None:
@@ -6175,6 +6365,57 @@ script.Disabled = true
                 "script(s) under ReplicatedStorage.Templates.<Prefab>",
                 attached,
             )
+
+    def _colliding_emitted_bare_bases(self) -> set[str]:
+        """Bare prefab base names that collide among the emitted templates.
+
+        Counts bare names over the emitted set, keyed on the same
+        ``_prefab_stable_id`` the planner uses. A base is colliding iff 2+
+        emitted prefabs share it; for those the resolved name is suffixed
+        (``base__guid6``), so a bare ``script_scopes`` key can't pick the
+        right template.
+        """
+        scene_runtime = self.ctx.scene_runtime or {}
+        prefab_library = self.state.prefab_library
+        if prefab_library is None:
+            return set()
+
+        from converter.prefab_packages import select_emitted_prefab_ids
+        from converter.scene_converter import _prefab_stable_id
+
+        addr_block = scene_runtime.get("addressables") or {}
+        addressable_prefab_ids: set[str] = set()
+        for axis in ("by_address", "by_label"):
+            for ids in (addr_block.get(axis) or {}).values():
+                if isinstance(ids, (list, tuple, set)):
+                    addressable_prefab_ids.update(
+                        pid for pid in ids if isinstance(pid, str)
+                    )
+
+        # Scope the collision domain to the EMITTED set, not the full plan's
+        # ``prefabs`` block (which carries every parsed prefab).
+        emitted_ids = select_emitted_prefab_ids(
+            prefab_library,
+            self.ctx.serialized_field_refs or None,
+            addressable_prefab_ids,
+            guid_index=self.state.guid_index,
+        )
+
+        by_guid = getattr(prefab_library, "by_guid", None) or {}
+        guid_index = self.state.guid_index
+        project_root = (
+            getattr(guid_index, "project_root", None) if guid_index else None
+        )
+
+        base_counts: dict[str, int] = {}
+        for template in getattr(prefab_library, "prefabs", None) or []:
+            pid = _prefab_stable_id(template, guid_index, by_guid, project_root)
+            if pid not in emitted_ids:
+                continue
+            base = getattr(template, "name", None)
+            if base:
+                base_counts[base] = base_counts.get(base, 0) + 1
+        return {b for b, c in base_counts.items() if c > 1}
 
     def _attach_monobehaviour_scripts_to_templates(self) -> None:
         """Attach MonoBehaviour scripts under their prefab template parts.

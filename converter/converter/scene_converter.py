@@ -26,6 +26,7 @@ from core.unity_types import (
     SceneNode,
 )
 from converter.material_mapper import MaterialMapping
+from unity.prefab_id import canonical_prefab_id
 from unity.yaml_parser import doc_body, extract_vec3, parse_documents, ref_guid
 from core.roblox_types import (
     RbxCFrame,
@@ -303,7 +304,8 @@ def _prefab_stable_id(
 ) -> str:
     """Stable ``prefab_id`` = ``"<guid>:<project-relative-path>"``.
 
-    Mirrors ``scene_runtime_planner._prefab_stable_id`` (PR1) so a
+    Delegates to ``unity.prefab_id.canonical_prefab_id`` (the same shared
+    core the planner and addressables resolver use) so a
     converter-time stamp produced by ``_convert_prefab_node`` matches
     the ``game_object_id`` PR1 emits for the same prefab template.
     Returns the empty string when neither a GUID nor a project-relative
@@ -328,17 +330,9 @@ def _prefab_stable_id(
             if t is template:
                 guid = g
                 break
-    if unity_project_root is None:
-        return guid if guid else ""
-    try:
-        rel = prefab_path.resolve().relative_to(
-            unity_project_root.resolve(),
-        ).as_posix()
-    except ValueError:
-        # Prefab outside the project root — same posture as
-        # ``_scene_namespace`` for outside-root scenes.
-        return ""
-    return f"{guid}:{rel}" if guid else rel
+    # Shared canonical core (Slice 1.2 / D11): identical id math as the
+    # planner and the addressables resolver.
+    return canonical_prefab_id(guid, prefab_path, unity_project_root)
 
 
 # Cache for mesh vertical offsets: mesh_guid -> offset_studs.

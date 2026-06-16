@@ -534,6 +534,150 @@ class TestSlice7TopologyDecisionTree:
         plan = classify_storage([helper], topology_inputs=inputs)
         assert helper.parent_path == REPLICATED_STORAGE
 
+    def test_e2e_client_required_server_module_routes_to_rs(self) -> None:
+        """AC3 end-to-end: drive the REAL ``derive_reachability_requirements``
+        producer (a client LocalScript entry requiring a server-domain
+        ModuleScript via an emitted require) and feed its output through
+        ``classify_storage``. The server-domain module lands in
+        ReplicatedStorage — proving the cascade fix routes a
+        client-required server module client-visible.
+        """
+        from converter.roblox_dead_modules import extract_require_edges
+        from converter.scene_runtime_planner import build_script_id_by_name
+        from converter.scene_runtime_topology.module_domain import (
+            derive_reachability_requirements, infer_module_domains,
+        )
+
+        entry = RbxScript(
+            name="LocalEntry",
+            source='require(script.Parent:FindFirstChild("ServerMod"))',
+            script_type="LocalScript",
+        )
+        entry.intrinsic_script_type = "LocalScript"
+        server_mod = RbxScript(
+            name="ServerMod",
+            source='game:GetService("DataStoreService")\nreturn {}',
+            script_type="ModuleScript",
+        )
+        server_mod.parent_path = SERVER_STORAGE
+        scripts = [entry, server_mod]
+        modules: dict[str, object] = {
+            "g-entry": {
+                "stem": "LocalEntry", "class_name": "LocalEntry",
+                "runtime_bearing": True,
+            },
+            "g-srv": {
+                "stem": "ServerMod", "class_name": "ServerMod",
+                "runtime_bearing": True,
+            },
+        }
+        artifact = {
+            "modules": modules, "scenes": {}, "prefabs": {},
+            "domain_overrides": {},
+        }
+        domains = infer_module_domains(
+            artifact, scripts,  # type: ignore[arg-type]
+        )
+        assert domains["g-srv"]["domain"] == "server"
+        by_name = {s.name: s for s in scripts}
+        sid_by_name = build_script_id_by_name(scripts, modules)
+        by_sid = {sid: by_name[n] for n, sid in sid_by_name.items()}
+        known = frozenset(s.name for s in scripts)
+        edges = {
+            s.name: extract_require_edges(s.source, known) for s in scripts
+        }
+        reqs = derive_reachability_requirements(
+            artifact, scripts, domains,  # type: ignore[arg-type]
+            require_edges_by_name=edges,
+            script_by_sid=by_sid,
+            lifecycle_roles={},
+        )
+        # The real producer routes the server-domain module.
+        assert reqs.get("g-srv") == REPLICATED_STORAGE
+        inputs = _mk_topology_inputs(
+            reachability_requirements=reqs,
+            script_id_by_name=sid_by_name,
+        )
+        plan = classify_storage([server_mod], topology_inputs=inputs)
+        assert server_mod.parent_path == REPLICATED_STORAGE
+        assert server_mod.name in plan.shared_modules
+
+    def test_e2e_both_sides_module_routes_to_rs_excluded(self) -> None:
+        """AC1 end-to-end: a ModuleScript required by BOTH a client
+        LocalScript AND a server Script is produced as ``__excluded__``
+        by the real ``derive_reachability_requirements`` and routes to
+        ReplicatedStorage at ``classify_storage`` with the
+        reachability_conflict reason.
+        """
+        from converter.roblox_dead_modules import extract_require_edges
+        from converter.scene_runtime_planner import build_script_id_by_name
+        from converter.scene_runtime_topology.module_domain import (
+            derive_reachability_requirements, infer_module_domains,
+        )
+
+        entry = RbxScript(
+            name="LocalEntry",
+            source='require(script.Parent:FindFirstChild("Shared"))',
+            script_type="LocalScript",
+        )
+        entry.intrinsic_script_type = "LocalScript"
+        server = RbxScript(
+            name="ServerSide",
+            source='evt:FireAllClients()\n'
+            'require(script.Parent:FindFirstChild("Shared"))',
+            script_type="Script",
+        )
+        server.intrinsic_script_type = "Script"
+        shared = RbxScript(
+            name="Shared", source="return {}",
+            script_type="ModuleScript",
+        )
+        shared.parent_path = SERVER_STORAGE
+        scripts = [entry, server, shared]
+        modules: dict[str, object] = {
+            "g-entry": {
+                "stem": "LocalEntry", "class_name": "LocalEntry",
+                "runtime_bearing": True,
+            },
+            "g-server": {
+                "stem": "ServerSide", "class_name": "ServerSide",
+                "runtime_bearing": True,
+            },
+            "g-shared": {
+                "stem": "Shared", "class_name": "Shared",
+                "runtime_bearing": True,
+            },
+        }
+        artifact = {
+            "modules": modules, "scenes": {}, "prefabs": {},
+            "domain_overrides": {},
+        }
+        domains = infer_module_domains(
+            artifact, scripts,  # type: ignore[arg-type]
+        )
+        by_name = {s.name: s for s in scripts}
+        sid_by_name = build_script_id_by_name(scripts, modules)
+        by_sid = {sid: by_name[n] for n, sid in sid_by_name.items()}
+        known = frozenset(s.name for s in scripts)
+        edges = {
+            s.name: extract_require_edges(s.source, known) for s in scripts
+        }
+        reqs = derive_reachability_requirements(
+            artifact, scripts, domains,  # type: ignore[arg-type]
+            require_edges_by_name=edges,
+            script_by_sid=by_sid,
+            lifecycle_roles={},
+        )
+        assert reqs.get("g-shared") == "__excluded__"
+        inputs = _mk_topology_inputs(
+            reachability_requirements=reqs,
+            script_id_by_name=sid_by_name,
+        )
+        plan = classify_storage([shared], topology_inputs=inputs)
+        assert shared.parent_path == REPLICATED_STORAGE
+        reasons = {d["script"]: d["reason"] for d in plan.decisions}
+        assert "reachability_conflict" in reasons["Shared"]
+
     def test_module_with_server_only_callers_goes_server_storage(
         self,
     ) -> None:
