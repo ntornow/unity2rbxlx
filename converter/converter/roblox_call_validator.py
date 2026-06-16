@@ -278,13 +278,21 @@ def _classify_receiver(expr: str, prov: dict[str, TrackLit]) -> ProvLit | None:
     if last_sep == ":" and _is_proven_result_method(last_name):
         return "proven"
 
+    # --- Bare Roblox-global receivers (``workspace`` / ``script``) ---
+    # These are DataModel globals, not trackable locals, so they must be
+    # recognized BEFORE the bare-identifier tracked-lookup below — otherwise a
+    # bare ``workspace:Foo()`` / ``script:Foo()`` falls through to the default
+    # ``unproven`` (the tracked map has no entry for them).
+    if expr == "workspace" or expr == "script":
+        return "proven"
+
     # --- Single bare identifier: look up tracked provenance ---
     if re.fullmatch(_IDENT, expr):
         tracked = prov.get(expr, "unproven")
         # A component table is never a proven Roblox receiver.
         return "unproven" if tracked == "component" else tracked
 
-    # --- Roblox global origins ---
+    # --- Roblox global origins (dotted/indexed/called forms) ---
     head = segs[0].strip()
     if head == "workspace":
         return "proven"

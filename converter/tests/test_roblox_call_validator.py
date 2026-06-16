@@ -225,3 +225,115 @@ def test_multiline_findfirstchildoftype_bug_proven() -> None:
     assert out[0]["method"] == "FindFirstChildOfType"
     assert out[0]["receiver_provenance"] == "proven"
     assert out[0]["suggested_fix"] == "FindFirstChildWhichIsA"
+
+
+# --- Isolated provenance-origin coverage (each design-listed PROVEN origin) ---
+# The corpus zero-FP test exercises these against real usage; these isolated
+# unit tests pin each rule individually so a regression in one origin can't hide
+# behind another's coverage.
+
+
+def test_instance_new_result_proven() -> None:
+    """``Instance.new("Part")`` result is a Roblox instance -> proven."""
+    out = _methods('Instance.new("Part"):FakeMethod()')
+    assert out == [("FakeMethod", "proven", None)]
+
+
+def test_instance_new_aliased_proven() -> None:
+    """A local bound from ``Instance.new(...)`` is proven."""
+    src = 'local p = Instance.new("Part")\np:FakeMethod()'
+    out = _methods(src)
+    assert out == [("FakeMethod", "proven", None)]
+
+
+def test_instance_new_valid_method_no_invalid() -> None:
+    src = 'local p = Instance.new("Part")\np:Destroy()'
+    assert _methods(src) == []
+
+
+def test_getservice_result_proven() -> None:
+    """``game:GetService("Players")`` result is a Roblox service -> proven."""
+    out = _methods('game:GetService("Players"):FakeMethod()')
+    assert out == [("FakeMethod", "proven", None)]
+
+
+def test_getservice_aliased_proven() -> None:
+    src = 'local s = game:GetService("Players")\ns:FakeMethod()'
+    out = _methods(src)
+    assert out == [("FakeMethod", "proven", None)]
+
+
+def test_getservice_valid_method_no_invalid() -> None:
+    assert _methods('game:GetService("Players"):GetChildren()') == []
+
+
+def test_raycast_instance_field_proven() -> None:
+    """``workspace:Raycast(a,b).Instance`` is a Roblox instance -> proven."""
+    out = _methods("workspace:Raycast(a, b).Instance:FakeMethod()")
+    assert out == [("FakeMethod", "proven", None)]
+
+
+def test_raycast_instance_aliased_proven() -> None:
+    src = "local r = workspace:Raycast(a, b)\nr.Instance:FakeMethod()"
+    out = _methods(src)
+    assert out == [("FakeMethod", "proven", None)]
+
+
+def test_getchildren_loop_var_proven() -> None:
+    """A ``GetChildren()`` loop value var is proven."""
+    src = "for _, c in workspace:GetChildren() do c:FakeMethod() end"
+    out = _methods(src)
+    assert out == [("FakeMethod", "proven", None)]
+
+
+def test_getdescendants_loop_var_proven() -> None:
+    src = "for _, c in workspace:GetDescendants() do c:FakeMethod() end"
+    out = _methods(src)
+    assert out == [("FakeMethod", "proven", None)]
+
+
+def test_getpartboundsinradius_loop_var_proven() -> None:
+    src = "for _, c in workspace:GetPartBoundsInRadius(a, b) do c:FakeMethod() end"
+    out = _methods(src)
+    assert out == [("FakeMethod", "proven", None)]
+
+
+def test_loop_var_valid_method_no_invalid() -> None:
+    src = "for _, c in workspace:GetChildren() do c:Destroy() end"
+    assert _methods(src) == []
+
+
+def test_self_gameobject_proven() -> None:
+    """``self.gameObject`` is the script's GameObject (Roblox) -> proven."""
+    out = _methods("self.gameObject:FakeMethod()")
+    assert out == [("FakeMethod", "proven", None)]
+
+
+def test_self_gameobject_valid_method_no_invalid() -> None:
+    assert _methods("self.gameObject:GetChildren()") == []
+
+
+def test_script_proven() -> None:
+    """REGRESSION: bare ``script`` is a Roblox global -> proven.
+
+    Previously the bare-identifier tracked-lookup intercepted ``script`` (and
+    ``workspace``) before the global-origin branch, returning the default
+    ``unproven``.
+    """
+    out = _methods("script:FakeMethod()")
+    assert out == [("FakeMethod", "proven", None)]
+
+
+def test_script_parent_proven() -> None:
+    out = _methods("script.Parent:FakeMethod()")
+    assert out == [("FakeMethod", "proven", None)]
+
+
+def test_script_valid_method_no_invalid() -> None:
+    assert _methods("script:GetChildren()") == []
+
+
+def test_workspace_bare_hallucinated_proven() -> None:
+    """REGRESSION: bare ``workspace`` global -> proven (same root bug as script)."""
+    out = _methods("workspace:FakeMethod()")
+    assert out == [("FakeMethod", "proven", None)]
