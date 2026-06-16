@@ -8,8 +8,11 @@ over the snapshot, loaded once and cached at module scope.
 
 from __future__ import annotations
 
+import difflib
 import json
 from pathlib import Path
+from types import MappingProxyType
+from typing import Mapping
 
 _SNAPSHOT_PATH = Path(__file__).resolve().parent / "data" / "roblox_callable_members.json"
 
@@ -17,11 +20,19 @@ _SNAPSHOT_PATH = Path(__file__).resolve().parent / "data" / "roblox_callable_mem
 class _Corpus:
     """Immutable in-memory view of the snapshot."""
 
-    __slots__ = ("version", "members")
+    __slots__ = ("version", "members", "members_sorted", "signatures")
 
-    def __init__(self, version: str, members: frozenset[str]) -> None:
+    def __init__(
+        self,
+        version: str,
+        members: frozenset[str],
+        members_sorted: tuple[str, ...],
+        signatures: Mapping[str, str],
+    ) -> None:
         self.version = version
         self.members = members
+        self.members_sorted = members_sorted
+        self.signatures = signatures
 
 
 def _load_snapshot() -> _Corpus:
@@ -35,9 +46,23 @@ def _load_snapshot() -> _Corpus:
     raw_members = raw.get("callableMembers")
     if not isinstance(raw_members, list):
         raise ValueError(f"corpus snapshot has no 'callableMembers' list: {_SNAPSHOT_PATH}")
-    members = frozenset(m for m in raw_members if isinstance(m, str))
+    member_list = [m for m in raw_members if isinstance(m, str)]
+    members = frozenset(member_list)
+    members_sorted = tuple(sorted(members))
 
-    return _Corpus(version=version, members=members)
+    raw_signatures = raw.get("signatures")
+    signatures: dict[str, str] = {}
+    if isinstance(raw_signatures, dict):
+        for key, value in raw_signatures.items():
+            if isinstance(key, str) and isinstance(value, str):
+                signatures[key] = value
+
+    return _Corpus(
+        version=version,
+        members=members,
+        members_sorted=members_sorted,
+        signatures=MappingProxyType(signatures),
+    )
 
 
 # Load once at import; the snapshot is a committed, read-only data file.
@@ -52,3 +77,44 @@ def is_callable_member(name: str) -> bool:
 def corpus_version() -> str:
     """The ``apiDumpVersion`` recorded in the snapshot."""
     return _CORPUS.version
+
+
+def signature(name: str) -> str | None:
+    """Human-readable signature for a callable member, or None.
+
+    Returns None for a name that is not a real callable (so a hallucinated
+    method like ``FindFirstChildOfType`` yields None).
+    """
+    return _CORPUS.signatures.get(name)
+
+
+def _common_prefix_len(a: str, b: str) -> int:
+    """Number of leading characters ``a`` and ``b`` share."""
+    n = 0
+    for ca, cb in zip(a, b):
+        if ca != cb:
+            break
+        n += 1
+    return n
+
+
+def suggest_candidates(bad_name: str, k: int = 3) -> list[str]:
+    """Up to ``k`` valid callable names most similar to ``bad_name``, ranked.
+
+    Deterministic similarity: a longer shared leading prefix dominates (so a
+    typo'd ``FindFirstChildOf...`` lands next to the real ``FindFirstChild*``
+    family), with the difflib similarity ratio (inverse of edit distance) as the
+    tie-breaker and the name itself as a final stable tie-breaker. Pure: reads
+    only the already-loaded corpus.
+    """
+    if k <= 0:
+        return []
+
+    def rank_key(candidate: str) -> tuple[int, float, str]:
+        prefix = _common_prefix_len(bad_name, candidate)
+        ratio = difflib.SequenceMatcher(None, bad_name, candidate).ratio()
+        # Negate so ``sorted`` ascending yields best-first; name ascending last.
+        return (-prefix, -ratio, candidate)
+
+    ranked = sorted(_CORPUS.members_sorted, key=rank_key)
+    return ranked[:k]

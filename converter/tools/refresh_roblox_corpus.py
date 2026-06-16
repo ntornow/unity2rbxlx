@@ -19,8 +19,13 @@ Output: ``converter/converter/data/roblox_callable_members.json`` with shape
     {
       "apiDumpVersion": "<version>",
       "generatedFrom": "setup.rbxcdn.com API-Dump.json",
-      "callableMembers": ["...sorted unique..."]
+      "callableMembers": ["...sorted unique..."],
+      "signatures": {"<name>": "<name>(p: T, ...): ReturnT", ...}
     }
+
+``signatures`` maps each callable name to a single human-readable signature
+string. When a name appears on multiple classes with differing signatures, the
+first one (by ascending class name) is kept as a representative.
 
 The tool is idempotent and prints an add/removed diff vs the existing snapshot.
 
@@ -127,6 +132,77 @@ def extract_callable_members(dump: dict[str, object]) -> list[str]:
     return sorted(names)
 
 
+def _format_type(type_obj: object) -> str:
+    """Human-readable type name from a dump ``Type``/``ReturnType`` object.
+
+    The dump tags void returns with ``Name == "null"``; surface that as ``void``.
+    """
+    if isinstance(type_obj, dict):
+        name = type_obj.get("Name")
+        if isinstance(name, str) and name:
+            return "void" if name == "null" else name
+    return "unknown"
+
+
+def _format_signature(member: dict[str, object]) -> str:
+    """Build ``name(p1: T1, p2: T2): ReturnT`` from a Function member.
+
+    Pure: derives the string solely from ``member``.
+    """
+    name = member.get("Name")
+    name_str = name if isinstance(name, str) else "unknown"
+
+    params: list[str] = []
+    raw_params = member.get("Parameters")
+    if isinstance(raw_params, list):
+        for param in raw_params:
+            if not isinstance(param, dict):
+                continue
+            pname = param.get("Name")
+            pname_str = pname if isinstance(pname, str) and pname else "_"
+            params.append(f"{pname_str}: {_format_type(param.get('Type'))}")
+
+    return_t = _format_type(member.get("ReturnType"))
+    return f"{name_str}({', '.join(params)}): {return_t}"
+
+
+def extract_signatures(dump: dict[str, object]) -> dict[str, str]:
+    """Map each callable name to one representative human-readable signature.
+
+    When a name appears on multiple classes with differing signatures, the
+    first by ascending class name wins. Pure: derives the result solely from
+    ``dump`` (no I/O, no mutation).
+    """
+    classes = dump.get("Classes")
+    if not isinstance(classes, list):
+        raise CorpusFetchError("API dump has no 'Classes' list")
+
+    # (class_name, member_name) ordering makes the representative deterministic.
+    seen: dict[str, str] = {}
+    ordered: list[tuple[str, str, dict[str, object]]] = []
+    for cls in classes:
+        if not isinstance(cls, dict):
+            continue
+        cls_name = cls.get("Name")
+        cls_name_str = cls_name if isinstance(cls_name, str) else ""
+        members = cls.get("Members")
+        if not isinstance(members, list):
+            continue
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+            if member.get("MemberType") != _CALLABLE_MEMBER_TYPE:
+                continue
+            name = member.get("Name")
+            if isinstance(name, str) and name:
+                ordered.append((cls_name_str, name, member))
+
+    for cls_name_str, name, member in sorted(ordered, key=lambda t: (t[1], t[0])):
+        if name not in seen:
+            seen[name] = _format_signature(member)
+    return seen
+
+
 def _read_existing_members() -> list[str]:
     if not _SNAPSHOT_PATH.exists():
         return []
@@ -167,6 +243,9 @@ def refresh() -> Path:
     members = extract_callable_members(dump)
     print(f"extracted {len(members)} unique callable members")
 
+    signatures = extract_signatures(dump)
+    print(f"extracted {len(signatures)} unique signatures")
+
     old_members = _read_existing_members()
     _print_diff(old_members, members)
 
@@ -174,6 +253,7 @@ def refresh() -> Path:
         "apiDumpVersion": version,
         "generatedFrom": GENERATED_FROM,
         "callableMembers": members,
+        "signatures": signatures,
     }
     _SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
     _SNAPSHOT_PATH.write_text(

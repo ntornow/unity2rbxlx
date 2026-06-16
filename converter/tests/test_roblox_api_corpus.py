@@ -16,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from converter.roblox_api_corpus import (  # noqa: E402
     corpus_version,
     is_callable_member,
+    signature,
+    suggest_candidates,
 )
 
 _SNAPSHOT_PATH = (
@@ -107,3 +109,58 @@ def test_is_callable_member_api() -> None:
 def test_corpus_version_non_empty() -> None:
     assert corpus_version()
     assert isinstance(corpus_version(), str)
+
+
+def test_signatures_map_present_and_covers_witnesses() -> None:
+    raw = _load_raw()
+    sigs = raw["signatures"]
+    assert isinstance(sigs, dict)
+    assert sigs
+    missing = [m for m in _WITNESS_METHODS if m not in sigs]
+    assert not missing, f"signatures missing witness methods: {missing}"
+
+
+def test_signature_for_real_method() -> None:
+    sig = signature("FindFirstChildOfClass")
+    assert isinstance(sig, str)
+    assert sig
+    assert "FindFirstChildOfClass" in sig
+    # A real param must appear (the dump names it ``className``).
+    assert "(" in sig and ":" in sig
+    assert "className" in sig
+
+
+def test_signature_for_hallucinated_method_is_none() -> None:
+    assert signature("FindFirstChildOfType") is None
+
+
+def test_signature_for_unknown_name_is_none() -> None:
+    assert signature("Nonexistent") is None
+
+
+def test_suggest_candidates_ranks_real_family_top() -> None:
+    result = suggest_candidates("FindFirstChildOfType")
+    assert len(result) <= 3
+    assert "FindFirstChildOfClass" in result
+    assert "FindFirstChildWhichIsA" in result
+
+
+def test_suggest_candidates_respects_k() -> None:
+    result = suggest_candidates("FindFirstChildOfType", k=2)
+    assert len(result) <= 2
+    # The closest real method must still survive a tighter k.
+    assert "FindFirstChildOfClass" in result
+
+
+def test_suggest_candidates_includes_close_real_method() -> None:
+    result = suggest_candidates("ApplyImpulse")
+    assert result
+    # An exact/near match must surface itself or a real impulse method.
+    assert "ApplyImpulse" in result
+
+
+def test_suggest_candidates_garbage_input_is_bounded() -> None:
+    result = suggest_candidates("Xqzptv")
+    assert isinstance(result, list)
+    assert len(result) <= 3
+    assert all(is_callable_member(name) for name in result)
