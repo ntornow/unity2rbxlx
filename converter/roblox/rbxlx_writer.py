@@ -43,6 +43,7 @@ from roblox.materials import MATERIAL_NAME_TO_TOKEN, DEFAULT_MATERIAL_TOKEN
 from converter.roster_assembly import (
     ROSTER_TAG_MARKER as _ROSTER_TAG_MARKER,
     resolve_roster_container_name as _resolve_roster_container_name,
+    strip_member_scripts as _strip_member_scripts,
 )
 
 log = logging.getLogger(__name__)
@@ -871,6 +872,13 @@ def _materialize_roster_member(
     writer); ``member_attributes`` (e.g. characterName) merge into the root.
     """
     copied = copy.deepcopy(template)
+
+    # Strip the template's transpiled Script/LocalScript/ModuleScript children
+    # from the copy — a roster member is a clone-SOURCE, not a live actor, and
+    # those scripts are inert under RS (the host binds on workspace clones made
+    # from the canonical Templates, never on the roster copy). Avoids N x the
+    # template script source per N-member label.
+    _strip_member_scripts(copied)
 
     # Build the remap over every part in the copied subtree first, so a
     # constraint can resolve a sibling's new fid regardless of visit order.

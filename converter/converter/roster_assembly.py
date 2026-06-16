@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 
-from core.roblox_types import RbxAttrValue, RbxRoster, RbxRosterMember
+from core.roblox_types import RbxAttrValue, RbxPart, RbxRoster, RbxRosterMember
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +50,31 @@ def resolve_roster_container_name(reserved_names: set[str]) -> str:
     while f"{base}_{i}" in reserved_names:
         i += 1
     return f"{base}_{i}"
+
+
+def strip_member_scripts(copied_root: RbxPart) -> None:
+    """Strip every Script/LocalScript/ModuleScript from a roster-member copy.
+
+    Operates IN PLACE on a freshly deep-copied member tree the caller owns
+    (NOT a live template — the canonical ``Templates.<name>`` child is never
+    passed here). Walks the copied subtree and empties ``part.scripts`` on the
+    root and every descendant.
+
+    Why: a roster member is a ``copy.deepcopy`` of its template, and in a real
+    conversion templates carry transpiled Script children (attached by
+    ``_attach_monobehaviour_scripts_to_templates``). Both emit paths would
+    otherwise serialize those copied scripts under the ReplicatedStorage roster
+    container — N x the template script source per N-member label. They are
+    INERT (RS scripts don't auto-run; the host binds component scripts on the
+    *workspace* clones it makes from ``Templates``, never on the roster copy),
+    so a roster member — a clone-SOURCE, not a live actor — needs no scripts of
+    its own. Stripping removes the payload bloat while keeping behavior
+    identical (the canonical Templates scripts the consumer clones are
+    untouched).
+    """
+    copied_root.scripts = []
+    for child in getattr(copied_root, "children", None) or []:
+        strip_member_scripts(child)
 
 
 def assemble_rosters(

@@ -33,7 +33,10 @@ from core.roblox_types import (
     RbxUIElement,
 )
 from roblox.materials import MATERIAL_NAME_TO_TOKEN
-from converter.roster_assembly import resolve_roster_container_name
+from converter.roster_assembly import (
+    resolve_roster_container_name,
+    strip_member_scripts,
+)
 
 log = logging.getLogger(__name__)
 
@@ -657,6 +660,11 @@ def _emit_roster_members(
         b.block("do")
         # Build a SECOND instance (distinct live subtree) into the container.
         copied = copy.deepcopy(tmpl)
+        # Strip the template's transpiled Script children from the copy — a
+        # roster member is a clone-SOURCE, not a live actor; those scripts are
+        # inert under RS (the host binds on workspace clones, never on the
+        # roster copy). Parity with the rbxlx path; avoids N x script bloat.
+        strip_member_scripts(copied)
         # Merge identity attributes onto the root (the _RosterTag marker is NOT
         # emitted on the luau side — AddTag carries the label directly).
         copied.attributes = {**(copied.attributes or {}), **attrs}
