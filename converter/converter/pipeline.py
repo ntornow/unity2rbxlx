@@ -1232,6 +1232,7 @@ class Pipeline:
             guid_index=self.state.guid_index,
             networking=networking,
             strict=True,
+            transpile_ran=False,  # pre-transpile dry-run (scripts=[] → inert)
         )
         if report["strict_violations"]:
             violations = "\n  - ".join(report["strict_violations"])
@@ -4954,6 +4955,7 @@ script.Disabled = true
                 guid_index=self.state.guid_index,
                 networking=networking,
                 strict=strict,
+                transpile_ran=self.state.transpilation_result is not None,
             )
             scene_runtime["displaced_instances"] = report["displaced_instances"]
             scene_runtime["low_confidence_modules"] = report["low_confidence_modules"]
@@ -5195,6 +5197,7 @@ script.Disabled = true
         if self.state.rbx_place is None or not self.state.rbx_place.scripts:
             return None
 
+        from converter.roblox_dead_modules import extract_require_edges
         from converter.scene_runtime_domain import (
             derive_reachability_requirements,
             infer_module_domains,
@@ -5260,12 +5263,6 @@ script.Disabled = true
             dependency_map=self.state.dependency_map or None,
             guid_index=self.state.guid_index,
             networking=networking,
-        )
-        reqs = derive_reachability_requirements(
-            cast("SceneRuntimeArtifact", scene_runtime),
-            self.state.rbx_place.scripts,
-            domain_results,
-            dependency_map=self.state.dependency_map or None,
         )
         caller_graph = resolve_caller_graph(
             cast("SceneRuntimeArtifact", scene_runtime),
@@ -5357,6 +5354,31 @@ script.Disabled = true
                 is_loader=is_loader,
             )
             lifecycle_roles[sid] = role
+
+        # Canonical emitted-require graph (script.name -> {required
+        # script.name}), built ONCE over the post-transpile Luau bodies.
+        # The client/server reachability closure walks THIS graph (not
+        # the C# dependency_map), so injected post-transpile requires are
+        # captured. ``script_by_sid`` + ``lifecycle_roles`` (computed
+        # above) feed the seed predicate; all three are hoisted ABOVE the
+        # ``derive_reachability_requirements`` call below — a pure move,
+        # none depend on ``reqs``.
+        known_names = frozenset(
+            s.name for s in self.state.rbx_place.scripts if s.name
+        )
+        require_edges_by_name: dict[str, set[str]] = {
+            s.name: extract_require_edges(s.source, known_names)
+            for s in self.state.rbx_place.scripts if s.name
+        }
+        reqs = derive_reachability_requirements(
+            cast("SceneRuntimeArtifact", scene_runtime),
+            self.state.rbx_place.scripts,
+            domain_results,
+            require_edges_by_name=require_edges_by_name,
+            script_by_sid=script_by_sid,
+            lifecycle_roles=lifecycle_roles,
+            transpile_ran=self.state.transpilation_result is not None,
+        )
 
         # Phase 2b: cross-domain facts produced here so they share scope
         # with ``transpilation_result`` + ``script_id_by_name`` + the

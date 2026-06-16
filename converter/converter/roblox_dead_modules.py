@@ -330,54 +330,145 @@ _BOILERPLATE_PROP = frozenset({"__index", "new"})
 _INJECTED_PRIMARYPART_FIXUP = re.compile(r"FindFirstChildWhichIsA\(")
 
 
-def _strip_luau_comments_and_strings(luau_source: str) -> str:
-    """Blank out Luau comments + string literals so veto/effect detection does
-    not match inside ``print("Instance.new")`` or ``-- .Parent =`` comments.
+_LUAU_LONG_BRACKET_OPEN = re.compile(r"\[(=*)\[")
+
+
+@dataclass(frozen=True)
+class _LuauLex:
+    """Products of ONE string-aware left-to-right scan of a Luau body.
+
+    A single pass classifies every region as code / line-comment / block-comment
+    / quoted string / long-bracket string, so the three derived products stay
+    mutually consistent -- a ``--`` inside a string is never a comment, and a
+    quote / long-bracket opener inside a comment is never a string.
+
+    Attributes:
+        code_with_strings: source with COMMENTS blanked (to spaces, newlines
+            preserved so line-based detectors keep their line structure) but
+            STRING CONTENTS preserved verbatim. Same length as the input, so
+            ``string_spans`` index into it directly.
+        string_spans: [start, end) spans (into ``code_with_strings``) of every
+            string literal -- used to reject a ``require`` keyword that sits
+            inside a string.
+        code_no_strings: source with comments AND string contents blanked --
+            used by veto/effect detection so markers inside ``print("...")`` or
+            comments do not match.
     """
-    out: list[str] = []
+
+    code_with_strings: str
+    string_spans: tuple[tuple[int, int], ...]
+    code_no_strings: str
+
+
+def _scan_luau(luau_source: str) -> _LuauLex:
+    """Single string-aware scan producing all comment/string-derived products.
+
+    Lexical states honored, in match priority:
+      * block comment ``--[[ ... ]]`` / ``--[=[ ... ]=]`` (a real Luau construct;
+        ``--`` immediately followed by a long-bracket opener),
+      * line comment ``-- ... <EOL>``,
+      * long-bracket string ``[[ ... ]]`` / ``[=[ ... ]=]`` (level-matched),
+      * quoted string ``'...'`` / ``"..."`` with ``\\`` escapes.
+
+    A character's classification depends only on the state it is scanned IN, so
+    a ``--`` inside a string is plain string content and a quote inside a comment
+    is plain comment content. Output is built char-for-char (1:1 length) so the
+    recorded string spans index ``code_with_strings`` directly.
+    """
+    with_strings: list[str] = []
+    no_strings: list[str] = []
+    spans: list[tuple[int, int]] = []
     i = 0
     n = len(luau_source)
     while i < n:
         ch = luau_source[i]
-        # Long comment / long string [[ ... ]] (no level support needed here).
-        if luau_source.startswith("--[[", i):
-            end = luau_source.find("]]", i + 4)
-            i = n if end == -1 else end + 2
-            out.append(" ")
-            continue
+        # Block comment (must precede the line-comment + long-string checks:
+        # ``--[[`` is a block comment, not a line comment then a long string).
         if luau_source.startswith("--", i):
-            end = luau_source.find("\n", i)
-            i = n if end == -1 else end
-            out.append(" ")
+            bracket = _LUAU_LONG_BRACKET_OPEN.match(luau_source, i + 2)
+            if bracket is not None:
+                level = bracket.group(1)
+                close = "]" + level + "]"
+                found = luau_source.find(close, bracket.end())
+                end = n if found == -1 else found + len(close)
+            else:
+                found = luau_source.find("\n", i)
+                end = n if found == -1 else found  # keep the newline as code
+            # Blank the comment to spaces, preserving any newlines so line-based
+            # detectors keep their line structure.
+            for j in range(i, end):
+                blank = "\n" if luau_source[j] == "\n" else " "
+                with_strings.append(blank)
+                no_strings.append(blank)
+            i = end
             continue
+        # Long-bracket string ``[[ ... ]]`` / ``[=[ ... ]=]``.
+        bracket = _LUAU_LONG_BRACKET_OPEN.match(luau_source, i)
+        if bracket is not None:
+            level = bracket.group(1)
+            close = "]" + level + "]"
+            found = luau_source.find(close, bracket.end())
+            end = n if found == -1 else found + len(close)
+            start = len(with_strings)
+            for j in range(i, end):
+                with_strings.append(luau_source[j])
+                no_strings.append("\n" if luau_source[j] == "\n" else " ")
+            spans.append((start, len(with_strings)))
+            i = end
+            continue
+        # Quoted string ``'...'`` / ``"..."`` (honoring ``\\`` escapes).
         if ch in ("'", '"'):
             quote = ch
+            start = len(with_strings)
+            with_strings.append(ch)
+            no_strings.append(" ")
             i += 1
             while i < n and luau_source[i] != quote:
-                if luau_source[i] == "\\":
+                if luau_source[i] == "\\" and i + 1 < n:
+                    with_strings.append(luau_source[i])
+                    no_strings.append(" ")
                     i += 1
+                with_strings.append(luau_source[i])
+                no_strings.append(" ")
                 i += 1
-            i += 1
-            out.append('""')
+            if i < n:  # closing quote
+                with_strings.append(luau_source[i])
+                no_strings.append(" ")
+                i += 1
+            spans.append((start, len(with_strings)))
             continue
-        if luau_source.startswith("[[", i):
-            end = luau_source.find("]]", i + 2)
-            i = n if end == -1 else end + 2
-            out.append('""')
-            continue
-        out.append(ch)
+        # Plain code.
+        with_strings.append(ch)
+        no_strings.append(ch)
         i += 1
-    return "".join(out)
+    return _LuauLex(
+        code_with_strings="".join(with_strings),
+        string_spans=tuple(spans),
+        code_no_strings="".join(no_strings),
+    )
 
 
-_LUAU_LONG_COMMENT = re.compile(r"--\[\[.*?\]\]", re.DOTALL)
-_LUAU_LINE_COMMENT = re.compile(r"--[^\n]*")
+def _strip_luau_comments_and_strings(luau_source: str) -> str:
+    """Blank out Luau comments + string literals so veto/effect detection does
+    not match inside ``print("Instance.new")`` or ``-- .Parent =`` comments.
+    """
+    return _scan_luau(luau_source).code_no_strings
 
 
 def _strip_luau_comments_only(luau_source: str) -> str:
     """Blank Luau comments while preserving string literals (so a module name
     inside ``FindFirstChild("Name")`` survives for require-edge extraction)."""
-    return _LUAU_LINE_COMMENT.sub("", _LUAU_LONG_COMMENT.sub(" ", luau_source))
+    return _scan_luau(luau_source).code_with_strings
+
+
+def _luau_string_spans(luau_source: str) -> list[tuple[int, int]]:
+    """Return [start, end) index spans of every Luau string literal.
+
+    Spans index the COMMENT-STRIPPED-BUT-STRING-PRESERVED body
+    (``_strip_luau_comments_only``), so a caller that runs regexes over that body
+    can reject a ``require`` keyword whose position falls inside a string.
+    """
+    return list(_scan_luau(luau_source).string_spans)
 
 
 def has_genuine_roblox_effect(luau_source: str) -> bool:
@@ -806,14 +897,30 @@ def extract_require_edges(luau_source: str, known_names: frozenset[str]) -> set[
     Strips comments only (NOT string literals) -- the module name lives inside a
     ``FindFirstChild("Name")`` string literal, so it must survive. Comments are
     blanked so a commented-out require does not register an edge.
+
+    A ``require(...)`` whose ``require`` KEYWORD itself sits inside a STRING
+    literal (e.g. the require text quoted in ``print('require(...)')``) is NOT a
+    real edge and is rejected -- the require's own nested argument string
+    (``FindFirstChild("Name")``) still survives because only the keyword's
+    position is tested, not the argument's.
     """
-    code = _strip_luau_comments_only(luau_source)
+    lexed = _scan_luau(luau_source)
+    code = lexed.code_with_strings
+    string_spans = lexed.string_spans
+
+    def _require_in_string(pos: int) -> bool:
+        return any(start <= pos < end for start, end in string_spans)
+
     edges: set[str] = set()
     for m in _REQUIRE_EDGE.finditer(code):
+        if _require_in_string(m.start()):
+            continue
         nm = m.group(1)
         if nm in known_names:
             edges.add(nm)
     for m in _REQUIRE_DOTTED.finditer(code):
+        if _require_in_string(m.start()):
+            continue
         # Match each dotted segment against known module names. The require
         # expression may name services / globals (``game``, ``workspace``,
         # ``ReplicatedStorage``) interleaved with the module name; only the
