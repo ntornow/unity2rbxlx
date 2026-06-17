@@ -82,6 +82,16 @@ class TranspiledScript:
     # zero rig facts; a rig-fact-bearing script is NEVER ``None`` (default
     # ``present=False``, flipped ``True`` only on confirmed discharge).
     rig_binding: dict[str, object] | None = None
+    # Per-script roster-consumer binding carrier from the generic-mode
+    # post-transpile ``roster_consumer_lowering``: a JSON-native dict
+    # ``{"label": str, "receiver": str, "lowered": True}`` or ``None``. Stamped
+    # ONLY on a module re-lowered to read Phase 1's by_label tagged surface.
+    # Copied onto the produced ``RbxScript.roster_binding`` so the dead-module
+    # analysis can EXEMPT the (deterministically-inert) canonical body from the
+    # Roblox-dead set — it was re-lowered to read a live roster surface, so it is
+    # live by construction (NEW-FINDING-B). ``None`` for every non-re-lowered
+    # script.
+    roster_binding: dict[str, object] | None = None
 
 
 @dataclass

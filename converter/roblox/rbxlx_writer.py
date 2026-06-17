@@ -8,6 +8,7 @@ representation, producing a valid Roblox Studio-loadable document.
 from __future__ import annotations
 
 import base64
+import copy
 import logging
 import struct
 import xml.etree.ElementTree as ET
@@ -39,6 +40,11 @@ from core.roblox_types import (
     RbxVideoFrame,
 )
 from roblox.materials import MATERIAL_NAME_TO_TOKEN, DEFAULT_MATERIAL_TOKEN
+from converter.roster_assembly import (
+    ROSTER_TAG_MARKER as _ROSTER_TAG_MARKER,
+    resolve_roster_container_name as _resolve_roster_container_name,
+    strip_member_scripts as _strip_member_scripts,
+)
 
 log = logging.getLogger(__name__)
 
@@ -830,6 +836,88 @@ def _encode_attributes(attrs: dict[str, RbxAttrValue]) -> str:
     return base64.b64encode(bytes(buf)).decode('ascii')
 
 
+def _emit_collection_tags(props: ET.Element, tags: list[str]) -> None:
+    """Write the SOLE ``<BinaryString name="Tags">`` element for *props*.
+
+    This is the ONE canonical writer of ``name="Tags"`` in the file. ``tags`` is
+    the (already deduped, ordered) CollectionService tag list — the Unity tag
+    (from ``attributes["Tag"]``) and/or a roster label. The content is the
+    canonical Roblox encoding: the tag list joined by the NUL byte (``\\0``) as
+    UTF-8, base64-encoded. Called from the COMMON tail of ``_make_part`` so it
+    runs for EVERY part class incl. Model.
+    """
+    if not tags:
+        return
+    payload = "\0".join(tags).encode("utf-8")
+    elem = ET.SubElement(props, "BinaryString", name="Tags")
+    elem.text = base64.b64encode(payload).decode("ascii")
+
+
+def _materialize_roster_member(
+    template: RbxPart,
+    tag: str,
+    member_attributes: dict[str, RbxAttrValue],
+) -> RbxPart:
+    """Deep-copy *template* into an independent roster-member tree (D2/§1.4a).
+
+    Re-keys EVERY copied part's ``unity_file_id`` to a fresh-unique value via a
+    per-copy ``old_fid -> new_fid`` remap, and rewrites each intra-subtree
+    constraint's ``connected_body_file_id`` through that remap (a connected body
+    OUTSIDE the copied subtree is dropped — its Part1 abstains rather than
+    cross-link to the template). Because the writer mints a part's referent FROM
+    its ``unity_file_id``, fresh fids guarantee fresh-unique referents (no
+    duplicate referents, no cross-linked constraints). The source template is
+    NEVER mutated. The roster tag is carried on the ROOT only via the
+    ``_RosterTag`` marker attribute (unioned + stripped by the common-tail Tags
+    writer); ``member_attributes`` (e.g. characterName) merge into the root.
+    """
+    copied = copy.deepcopy(template)
+
+    # Strip the template's transpiled Script/LocalScript/ModuleScript children
+    # from the copy — a roster member is a clone-SOURCE, not a live actor, and
+    # those scripts are inert under RS (the host binds on workspace clones made
+    # from the canonical Templates, never on the roster copy). Avoids N x the
+    # template script source per N-member label.
+    _strip_member_scripts(copied)
+
+    # Build the remap over every part in the copied subtree first, so a
+    # constraint can resolve a sibling's new fid regardless of visit order.
+    remap: dict[str, str] = {}
+
+    def _collect(p: RbxPart) -> None:
+        old = getattr(p, "unity_file_id", None)
+        if old is not None:
+            old_s = str(old)
+            new_fid = f"roster::{uuid4().hex}"
+            remap[old_s] = new_fid
+            p.unity_file_id = new_fid
+        for child in getattr(p, "children", None) or []:
+            _collect(child)
+
+    _collect(copied)
+
+    # Rewrite intra-subtree constraint links; drop external ones.
+    def _rewrite_constraints(p: RbxPart) -> None:
+        for c in getattr(p, "constraints", None) or []:
+            old = getattr(c, "connected_body_file_id", "")
+            if old and str(old) in remap:
+                c.connected_body_file_id = remap[str(old)]
+            elif old:
+                # Connected body is outside the clonable member — abstain.
+                c.connected_body_file_id = ""
+        for child in getattr(p, "children", None) or []:
+            _rewrite_constraints(child)
+
+    _rewrite_constraints(copied)
+
+    # Apply identity attributes + the root-only roster-tag marker.
+    root_attrs: dict[str, RbxAttrValue] = dict(getattr(copied, "attributes", None) or {})
+    root_attrs.update(member_attributes)
+    root_attrs[_ROSTER_TAG_MARKER] = tag
+    copied.attributes = root_attrs
+    return copied
+
+
 def _make_part(parent_xml: ET.Element, part: RbxPart) -> None:
     """Recursively serialize a part and all of its children into *parent_xml*."""
     # Determine Item class
@@ -939,15 +1027,12 @@ def _make_part(parent_xml: ET.Element, part: RbxPart) -> None:
         if massless:
             _add_bool(props, "Massless", True)
 
-        # CollectionService Tags from Unity m_TagString
-        part_attrs = getattr(part, "attributes", {}) or {}
-        unity_tag = part_attrs.get("Tag", "")
-        if unity_tag and unity_tag != "Untagged":
-            # Roblox Tags property is a BinaryString containing the tag name
-            tags_elem = ET.SubElement(props, "BinaryString", name="Tags")
-            tags_elem.text = unity_tag
+        # CollectionService Tags are emitted ONCE in the common tail (next to
+        # AttributesSerialize) via _emit_collection_tags so the call runs for
+        # EVERY class incl. Model. See the common-tail block below.
 
         # CollisionGroup from Unity layer
+        part_attrs = getattr(part, "attributes", {}) or {}
         unity_layer = part_attrs.get("UnityLayer", 0)
         if unity_layer and int(unity_layer) != 0:
             _add_string(props, "CollisionGroup", f"UnityLayer{int(unity_layer)}")
@@ -1055,6 +1140,20 @@ def _make_part(parent_xml: ET.Element, part: RbxPart) -> None:
             all_attrs["_MetalnessMap"] = metalness_map
         if roughness_map and "rbxassetid" in roughness_map:
             all_attrs["_RoughnessMap"] = roughness_map
+
+    # --- CollectionService Tags (single canonical writer, common tail) ---
+    # Runs for EVERY class incl. Model. Union the Unity tag (m_TagString, via
+    # attributes["Tag"]) with the roster label marker (_RosterTag, root-only),
+    # dedup preserving order, and emit exactly one base64 NUL-delimited element.
+    # _RosterTag is a marker, not a real attribute — strip it before encoding.
+    _tags: list[str] = []
+    _unity_tag = all_attrs.get("Tag")
+    if isinstance(_unity_tag, str) and _unity_tag and _unity_tag != "Untagged":
+        _tags.append(_unity_tag)
+    _roster_tag = all_attrs.pop(_ROSTER_TAG_MARKER, None)
+    if isinstance(_roster_tag, str) and _roster_tag and _roster_tag not in _tags:
+        _tags.append(_roster_tag)
+    _emit_collection_tags(props, _tags)
 
     # Encode all attributes
     if all_attrs:
@@ -1428,6 +1527,26 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, int]:
     _pre_register(getattr(place, "replicated_templates", None) or [])
     _pre_register(getattr(place, "server_storage_parts", None) or [])
 
+    # Materialize roster members up front (deep-copy + fresh-fid re-key) so the
+    # pre-pass mints fresh-unique referents for the copies BEFORE emit — every
+    # referent in the document is unique, and intra-member constraints resolve
+    # within the copy (never cross-link to the source template). The copies are
+    # emitted later, under the dedicated container (after the Templates folder).
+    _templates_by_name: dict[str, RbxPart] = {
+        t.name: t for t in (getattr(place, "replicated_templates", None) or [])
+    }
+    _roster_member_parts: list[RbxPart] = []
+    for _roster in getattr(place, "rosters", None) or []:
+        for _member in getattr(_roster, "members", None) or []:
+            _tmpl = _templates_by_name.get(_member.template_name)
+            if _tmpl is None:
+                continue
+            _copy = _materialize_roster_member(
+                _tmpl, _member.tag, _member.attributes
+            )
+            _roster_member_parts.append(_copy)
+    _pre_register(_roster_member_parts)
+
     stats: dict[str, int] = {
         "parts_written": 0,
         "scripts_written": 0,
@@ -1698,6 +1817,15 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, int]:
         tname = getattr(tmpl, "name", None) or (tmpl.get("name") if isinstance(tmpl, dict) else None)
         if tname:
             _reserved_rs_names.add(tname)
+    # Resolve the dedicated roster-container name against every reserved RS name
+    # (Templates / ModuleScripts / templates / scriptable_objects/<Group>.luau),
+    # then reserve it so the RemoteEvent auto-create scan never mints a same-
+    # named RemoteEvent that would shadow it (D6/E11). Only when a roster member
+    # will actually be emitted.
+    _roster_container_name: str | None = None
+    if _roster_member_parts:
+        _roster_container_name = _resolve_roster_container_name(_reserved_rs_names)
+        _reserved_rs_names.add(_roster_container_name)
     _skip = _skip | _reserved_rs_names
     # Also skip names that scripts create as BindableEvents (not RemoteEvents)
     _bindable_names: set[str] = set()
@@ -1763,6 +1891,19 @@ def write_rbxlx(place: RbxPlace, output_path: Path) -> dict[str, int]:
         for template in replicated_templates:
             _make_part(templates_folder, template)
             stats["parts_written"] += _count_parts(template)
+
+    # ---- ReplicatedStorage roster container (Addressables Unit 4 / Phase 1) --
+    # A dedicated, reserved-name-deduped Folder holding the SECOND materialized
+    # instance per by_label member (deep-copied + re-keyed above). Each member
+    # root carries the _RosterTag marker → a base64 NUL-delimited Tags element
+    # via the common-tail writer; the canonical Templates child is untouched.
+    if _roster_member_parts and _roster_container_name is not None:
+        roster_folder, _ = _make_item(
+            replicated_storage, "Folder", _roster_container_name
+        )
+        for member_part in _roster_member_parts:
+            _make_part(roster_folder, member_part)
+            stats["parts_written"] += _count_parts(member_part)
 
     # ---- Lights / sounds (standalone, attached to place level) -----------
     standalone_lights: list[RbxLight] = getattr(place, "lights", None) or []
