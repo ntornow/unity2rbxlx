@@ -626,8 +626,13 @@ class TestAssetReferenceResolution:
             f"      m_CachedAsset: {{fileID: 184264, guid: {PICKUP_GUID}, type: 3}}\n",
         )
         src = convert_asset_file(f, idx).luau_source
-        # Each element collapsed to a bare string literal, not a struct.
-        assert f'"{PICKUP_ID}"' in src
+        # EVERY element collapsed to a bare string literal, not a struct and not
+        # a nil marker: both AssetReferences resolve to the same id, so the
+        # resolved-string literal must appear exactly twice and NO AssetReference
+        # nil marker may leak in. (A bare `"<id>" in src` would pass even if one
+        # element silently collapsed to `nil --[[(Unity AssetReference)]]`.)
+        assert src.count(f'"{PICKUP_ID}"') == 2
+        assert "nil --[[(Unity AssetReference)]]" not in src
         assert "AssetGUID" not in src
         assert "CachedAsset" not in src
 
@@ -818,3 +823,29 @@ class TestAssetReferenceResolution:
         )
         assert f'collectiblePrefab = "{PICKUP_ID}"' in out
         assert "AssetReference" not in out
+
+    def test_nil_markers_stay_distinct_per_arm(self, tmp_path):
+        # Regression pin: the two unresolved nil markers must stay DISTINCT post
+        # Phase 1. An UNRESOLVABLE legacy object-ref ({fileID,guid,type} whose
+        # guid is a non-prefab) emits the object-ref marker; an UNRESOLVABLE
+        # AssetReference ({m_AssetGUID, m_CachedAsset} on the same non-prefab
+        # guid) emits the AssetReference marker. Both arms exercised here against
+        # the REAL _value_to_lua / GuidIndex (no stubbed state); if a refactor
+        # collapsed the two markers to one string, exactly one of these arms
+        # would flip to the wrong literal and fail.
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        nonprefab = "e1a536f74c7ef384a8d7132148ace0c8"
+        idx = self._real_index(proj, (nonprefab, "Assets/UI/themeIcon.png", "texture"))
+        # Legacy object-ref arm -> object-ref nil marker, NOT the AssetReference one.
+        obj_out = _value_to_lua(
+            {"objRef": {"fileID": 21300036, "guid": nonprefab, "type": 3}},
+            guid_index=idx,
+        )
+        assert "objRef = nil --[[(Unity object reference)]]" in obj_out
+        assert "Unity AssetReference" not in obj_out
+        # AssetReference arm (same non-prefab guid) -> AssetReference nil marker,
+        # NOT the object-ref one.
+        ar_out = _value_to_lua({"arRef": self._assetref(nonprefab)}, guid_index=idx)
+        assert "arRef = nil --[[(Unity AssetReference)]]" in ar_out
+        assert "Unity object reference" not in ar_out
