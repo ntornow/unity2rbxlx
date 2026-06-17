@@ -39,7 +39,6 @@ def test_no_rows_for_single_consumer() -> None:
     rows = _roster_fail_closed(
         facts,
         {"characters": ["p"]},
-        {"addressables": {"by_label": {"characters": ["p"]}}},
         {"A.cs": _CS_ROSTER_LOADER},
     )
     assert rows == []
@@ -53,7 +52,6 @@ def test_roster_ambiguous_two_modules_one_label() -> None:
     rows = _roster_fail_closed(
         facts,
         {"characters": ["p"]},
-        {"addressables": {"by_label": {"characters": ["p"]}}},
         {"A.cs": _CS_ROSTER_LOADER, "B.cs": _CS_ROSTER_LOADER},
     )
     kinds = {r.kind for r in rows}
@@ -74,7 +72,6 @@ def test_roster_signal_absent_stale_artifact() -> None:
     rows = _roster_fail_closed(
         {},                       # find_roster_consumers abstained (by_label empty)
         {},                       # the stale artifact has no by_label surface
-        {},                       # scene_runtime carries no addressables block
         {"A.cs": _CS_ROSTER_LOADER},
     )
     kinds = {r.kind for r in rows}
@@ -86,7 +83,7 @@ def test_roster_signal_absent_stale_artifact() -> None:
 def test_no_signal_absent_when_no_csharp_loader() -> None:
     # No module loads an Addressables roster -> a non-roster game with a stale
     # artifact must NOT fire roster_signal_absent (no false positive).
-    rows = _roster_fail_closed({}, {}, {}, {"A.cs": _CS_NO_LOADER})
+    rows = _roster_fail_closed({}, {}, {"A.cs": _CS_NO_LOADER})
     assert rows == []
 
 
@@ -99,7 +96,6 @@ def test_no_signal_absent_on_healthy_path() -> None:
     rows = _roster_fail_closed(
         facts,
         {"characters": ["p"]},
-        {"addressables": {"by_label": {"characters": ["p"]}}},
         {"A.cs": _CS_ROSTER_LOADER},
     )
     kinds = {r.kind for r in rows}
@@ -107,5 +103,5 @@ def test_no_signal_absent_on_healthy_path() -> None:
 
 
 def test_empty_by_label_no_rows() -> None:
-    rows = _roster_fail_closed({}, {}, {}, {})
+    rows = _roster_fail_closed({}, {}, {})
     assert rows == []

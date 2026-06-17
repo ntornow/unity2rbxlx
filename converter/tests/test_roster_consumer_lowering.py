@@ -433,3 +433,72 @@ class TestAC8NoGameLiteral:
         region = _canonical_region("Roster", "widgets", None, None)
         assert "Character.new({ characterName = _key })" in region
         assert 'op:GetAttribute("characterName")' in region
+
+
+# ---------------------------------------------------------------------------
+# Generality — a NAMESPACED C# component type must lower to a valid Luau
+# identifier + require path (its LAST dotted segment), never the raw dotted
+# splice. Namespaced component types (My.Game.Character) are common across
+# Unity games; the raw splice would emit
+# ``local My.Game.Character = require(script.Parent.My.Game.Character)`` —
+# invalid Luau (a dotted local name) and a wrong require path.
+# ---------------------------------------------------------------------------
+
+class TestNamespacedComponentType:
+    def test_find_roster_consumers_captures_namespaced_type(self) -> None:
+        # The C# capture itself keeps the dotted form (the regex is [\w.]+);
+        # the normalization lives in the emitter, so the fact still carries
+        # the full namespaced name.
+        cs = (
+            "Addressables.LoadAssetsAsync<GameObject>(\"characters\", op => {\n"
+            "  var c = op.GetComponent<My.Game.Character>();\n"
+            "  m_Dict.Add(c.characterName, c);\n"
+            "});\n"
+        )
+        facts = find_roster_consumers({"X.cs": cs}, {"characters": ["p"]})
+        assert facts["X.cs"].component_type == "My.Game.Character"
+
+    def test_namespaced_type_lowers_to_last_segment_valid_luau(self) -> None:
+        # The emitted body must use the LAST dotted segment as the Luau local,
+        # the require child, and the constructor receiver — a valid identifier.
+        region = _canonical_region(
+            "Roster", "characters", "My.Game.Character", "characterName",
+        )
+        assert "local Character = require(script.Parent.Character)" in region
+        assert "Character.new({ characterName = _key })" in region
+        # RED against the pre-fix RAW splice: none of the dotted forms may
+        # appear (a dotted local name / multi-level require path is invalid).
+        assert "My.Game.Character" not in region
+        assert "local My.Game" not in region
+        assert "script.Parent.My.Game" not in region
+        # No dotted IDENTIFIER survives in any emitted local/require/constructor.
+        assert "local My." not in region
+        assert "require(script.Parent.My." not in region
+
+    def test_end_to_end_namespaced_consumer_emits_valid_body(self) -> None:
+        # Drive the full lowering with a namespaced fact: the re-lowered source
+        # uses ``Character`` everywhere the component is spliced, never the
+        # dotted type.
+        s = _Script("CharacterDatabase.cs", _drift_gettagged())
+        fact = RosterConsumerFact(
+            "CharacterDatabase.cs", "characters", "My.Game.Character",
+            "characterName",
+        )
+        n = lower_roster_consumers([s], {"CharacterDatabase.cs": fact})
+        assert n == 1
+        assert "local Character = require(script.Parent.Character)" in s.luau_source
+        assert "Character.new({ characterName = _key })" in s.luau_source
+        assert "My.Game.Character" not in s.luau_source
+
+    def test_simple_undotted_type_unchanged(self) -> None:
+        # The simple (undotted) case is unchanged by the normalization.
+        region = _canonical_region(
+            "Roster", "characters", "Character", "characterName",
+        )
+        assert "local Character = require(script.Parent.Character)" in region
+
+    def test_dots_only_or_trailing_dot_falls_back_to_default(self) -> None:
+        # A degenerate dotted string (no real last segment) falls back to the
+        # "Character" default rather than splicing an empty identifier.
+        region = _canonical_region("Roster", "characters", "Foo.", "characterName")
+        assert "local Character = require(script.Parent.Character)" in region

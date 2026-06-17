@@ -656,7 +656,7 @@ def transpile_with_contract(
     csharp_by_path = {s.source_path: s.csharp_source for s in transpilation.scripts}
     roster_facts = find_roster_consumers(csharp_by_path, by_label)
     roster_fail_closed = _roster_fail_closed(
-        roster_facts, by_label, scene_runtime, csharp_by_path,
+        roster_facts, by_label, csharp_by_path,
     )
     if not roster_fail_closed:
         try:
@@ -796,7 +796,6 @@ def transpile_with_contract(
 def _roster_fail_closed(
     roster_facts: dict[str, RosterConsumerFact],
     by_label: dict[str, list[str]],
-    scene_runtime: _SceneRuntimeArtifact,
     csharp_by_path: dict[str, str],
 ) -> list[FailClosed]:
     """Roster-consumer fail-closed rows (pure). Mirrors the player-binding

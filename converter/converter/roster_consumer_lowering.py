@@ -186,6 +186,22 @@ _DICT_LOCAL = "_roster_dict"
 _LOADED_LOCAL = "_roster_loaded"
 
 
+def _last_segment(component_type: str | None) -> str | None:
+    """The LAST dotted segment of a (possibly namespaced) component type.
+
+    PURE. ``"My.Game.Character" -> "Character"``, ``"Character" -> "Character"``.
+    Returns ``None`` for ``None`` or an empty/dots-only string so the caller
+    falls back to its ``"Character"`` default rather than splicing an empty (or
+    dotted) identifier. The transpiled Roblox modules are emitted by their stem,
+    so the last segment is both a valid Luau local name and the correct
+    ``script.Parent.<stem>`` require child.
+    """
+    if component_type is None:
+        return None
+    last = component_type.split(".")[-1]
+    return last or None
+
+
 def _canonical_region(
     receiver: str,
     label: str,
@@ -199,8 +215,17 @@ def _canonical_region(
     shapes (AC2) and deterministic across runs (AC7). No game/module literal is
     typed here: ``receiver`` is the located ``<N>``, the dict/loaded locals are
     pass-OWNED, and ``<C>``/``<K>``/``<L>`` are substituted from the fact.
+
+    ``component_type`` is normalized to its LAST dotted segment before it is
+    spliced into a Luau identifier (``local <C>``) and a require child
+    (``script.Parent.<C>``): a namespaced C# type ``My.Game.Character`` would
+    otherwise emit ``local My.Game.Character = require(script.Parent.My.Game.Character)``
+    — invalid Luau (a dotted local name) and a wrong require path (Roblox modules
+    are emitted by their stem, so ``script.Parent.Character`` is correct).
+    Namespaced component types are common across Unity games, so this is a
+    generality requirement. The simple, undotted case is unchanged.
     """
-    comp = component_type or "Character"
+    comp = _last_segment(component_type) or "Character"
     key = index_key or "characterName"
     return (
         f"local {_DICT_LOCAL} = nil\n"
