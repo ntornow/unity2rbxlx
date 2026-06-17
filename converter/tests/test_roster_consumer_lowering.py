@@ -267,7 +267,7 @@ class TestAC2CanonicalBodyAcrossDriftShapes:
         regions: set[str] = set()
         for make_shape in _ALL_DRIFT_SHAPES:
             s = _Script("CharacterDatabase.cs", make_shape())
-            n = lower_roster_consumers([s], _FACTS, "RosterMembers")
+            n = lower_roster_consumers([s], _FACTS)
             assert n == 1
             regions.add(_region_of(s.luau_source))
         assert len(regions) == 1, (
@@ -277,7 +277,7 @@ class TestAC2CanonicalBodyAcrossDriftShapes:
 
     def test_region_equals_canonical_render(self) -> None:
         s = _Script("CharacterDatabase.cs", _drift_gettagged())
-        lower_roster_consumers([s], _FACTS, "RosterMembers")
+        lower_roster_consumers([s], _FACTS)
         assert _region_of(s.luau_source) == _canonical_region(
             "CharacterDatabase", "characters", "Character", "characterName",
         )
@@ -287,7 +287,7 @@ class TestAC2CanonicalBodyAcrossDriftShapes:
         # emitted body uses the LOCATED <N>, not a hardcoded literal.
         s = _Script("Foo.cs", _drift_folder_findfirstchild(receiver="PrefabRoster"))
         facts = {"Foo.cs": RosterConsumerFact("Foo.cs", "characters", "Character", "characterName")}
-        lower_roster_consumers([s], facts, "RosterMembers")
+        lower_roster_consumers([s], facts)
         assert "function PrefabRoster.LoadDatabase()" in s.luau_source
         assert "function PrefabRoster.GetCharacter(" in s.luau_source
         assert "CharacterDatabase" not in s.luau_source
@@ -303,7 +303,7 @@ class TestAC2CanonicalBodyAcrossDriftShapes:
 class TestAC6GameObjectBindsTemplatesChild:
     def test_gameobject_resolves_templates_child_then_falls_back(self) -> None:
         s = _Script("CharacterDatabase.cs", _drift_gettagged())
-        lower_roster_consumers([s], _FACTS, "RosterMembers")
+        lower_roster_consumers([s], _FACTS)
         body = s.luau_source
         # The Templates folder is the script-bearing canonical source (NOT the
         # script-stripped roster member).
@@ -315,12 +315,12 @@ class TestAC6GameObjectBindsTemplatesChild:
 
     def test_accessories_is_empty_table(self) -> None:
         s = _Script("CharacterDatabase.cs", _drift_gettagged())
-        lower_roster_consumers([s], _FACTS, "RosterMembers")
+        lower_roster_consumers([s], _FACTS)
         assert "c.accessories = {}" in s.luau_source
 
     def test_component_wrapper_constructor_used(self) -> None:
         s = _Script("CharacterDatabase.cs", _drift_gettagged())
-        lower_roster_consumers([s], _FACTS, "RosterMembers")
+        lower_roster_consumers([s], _FACTS)
         assert "Character.new({ characterName = _key })" in s.luau_source
 
 
@@ -332,9 +332,9 @@ class TestAC7IdempotencyAndFailClosed:
     def test_twice_call_byte_identical(self) -> None:
         for make_shape in _ALL_DRIFT_SHAPES:
             s = _Script("CharacterDatabase.cs", make_shape())
-            lower_roster_consumers([s], _FACTS, "RosterMembers")
+            lower_roster_consumers([s], _FACTS)
             first = s.luau_source
-            lower_roster_consumers([s], _FACTS, "RosterMembers")
+            lower_roster_consumers([s], _FACTS)
             assert s.luau_source == first, (
                 "twice-call must yield byte-identical output (AC7 idempotency)"
             )
@@ -344,7 +344,7 @@ class TestAC7IdempotencyAndFailClosed:
         # no locatable LoadDatabase/GetCharacter -> fail closed (E-P2-2).
         s = _Script("CharacterDatabase.cs", "local M = {}\nreturn M\n")
         with pytest.raises(RosterUnresolved):
-            lower_roster_consumers([s], _FACTS, "RosterMembers")
+            lower_roster_consumers([s], _FACTS)
 
     def test_interleaved_require_helper_is_not_deleted(self) -> None:
         # A roster consumer with an UNRELATED require/helper local between the
@@ -365,7 +365,7 @@ class TestAC7IdempotencyAndFailClosed:
             "return CharacterDatabase\n"
         )
         s = _Script("CharacterDatabase.cs", body)
-        lower_roster_consumers([s], _FACTS, "RosterMembers")
+        lower_roster_consumers([s], _FACTS)
         # The unrelated require + helper survive the whole-region replace.
         assert "require(game.ReplicatedStorage.Signal)" in s.luau_source
         assert "local onLoaded = Signal.new()" in s.luau_source
@@ -377,14 +377,14 @@ class TestAC7IdempotencyAndFailClosed:
         assert "m_Loaded" not in s.luau_source
         # Idempotent on this shape too.
         first = s.luau_source
-        lower_roster_consumers([s], _FACTS, "RosterMembers")
+        lower_roster_consumers([s], _FACTS)
         assert s.luau_source == first
 
     def test_module_not_in_facts_is_untouched(self) -> None:
         # Generality gate (E-P2-6): a non-consumer is never rewritten.
         original = _drift_folder_findfirstchild()
         s = _Script("OtherModule.cs", original)
-        n = lower_roster_consumers([s], _FACTS, "RosterMembers")
+        n = lower_roster_consumers([s], _FACTS)
         assert n == 0
         assert s.luau_source == original
         assert s.roster_binding is None

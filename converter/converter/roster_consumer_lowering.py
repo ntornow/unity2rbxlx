@@ -432,17 +432,14 @@ class RosterUnresolved(Exception):
 def lower_roster_consumers(
     scripts: list[_HasSourceAndCarrier],
     facts: dict[str, RosterConsumerFact],
-    container_name: str,
 ) -> int:
     """Whole-region-replace the four public roster methods of each consumer in
     ``facts`` with the canonical object-graph body (reading Phase 1's tagged
     surface), and STAMP the ``roster_binding`` carrier.
 
-    Returns the number of modules re-lowered.
-
-    ``container_name`` is diagnostic only (the discovery key is the
-    CollectionService tag, not the container name) — it is NOT embedded in the
-    emitted body.
+    Returns the number of modules re-lowered. The discovery key is the
+    CollectionService tag (not the roster-container name), so the container name
+    is never needed here or embedded in the emitted body.
 
     Raises ``RosterUnresolved`` for a located fact whose LoadDatabase/GetCharacter
     anchors cannot be located (fail-closed, E-P2-2).

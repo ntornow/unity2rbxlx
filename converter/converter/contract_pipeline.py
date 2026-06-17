@@ -647,7 +647,6 @@ def transpile_with_contract(
         find_roster_consumers,
         lower_roster_consumers,
     )
-    from converter.roster_assembly import resolve_roster_container_name
     addressables = scene_runtime.get("addressables") or {}
     by_label_raw = addressables.get("by_label") or {}
     by_label: dict[str, list[str]] = {
@@ -660,12 +659,9 @@ def transpile_with_contract(
         roster_facts, by_label, scene_runtime, csharp_by_path,
     )
     if not roster_fail_closed:
-        # Diagnostic only -- the discovery key is the CollectionService tag, not
-        # the container name; the emitted body does not embed it.
-        container_name = resolve_roster_container_name(set())
         try:
             lowered_roster = lower_roster_consumers(
-                transpilation.scripts, roster_facts, container_name,
+                transpilation.scripts, roster_facts,
             )
         except RosterUnresolved as exc:
             # A located fact whose LoadDatabase/GetCharacter anchors could not be
